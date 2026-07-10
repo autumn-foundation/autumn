@@ -1431,7 +1431,14 @@ impl RequestBuilder {
         validator: RedirectValidator,
         timeout: Duration,
     ) -> Result<Response, ClientError> {
+        let original =
+            url::Url::parse(&self.url).map_err(|e| ClientError::InvalidUrl(e.to_string()))?;
         let mut current = self.url.clone();
+        // Threaded across hops so cross-origin header stripping (Fix A) and
+        // RFC method/body rewriting (Fix B) accumulate correctly.
+        let mut method = self.method.clone();
+        let mut headers = self.extra_headers.clone();
+        let mut body = self.body.clone();
         for hop in 0.. {
             // Pin only applies to the first hop's original target.
             let resolve = if hop == 0 {
@@ -1442,15 +1449,18 @@ impl RequestBuilder {
             } else {
                 None
             };
+            // On any post-origin hop, drop credential-bearing headers if the
+            // current target is cross-origin (stays stripped once stripped).
+            if hop > 0 {
+                strip_sensitive_headers_if_cross_origin(&mut headers, &original, &current)?;
+            }
             let client = build_oneshot_client(resolve, reqwest::redirect::Policy::none(), timeout)?;
-            // Only send the body on the first hop; a redirect drops it.
-            let body = if hop == 0 { self.body.as_ref() } else { None };
             let resp = send_one(
                 &client,
-                &self.method,
+                &method,
                 &current,
-                &self.extra_headers,
-                body,
+                &headers,
+                body.as_ref(),
                 &self.retry_policy,
             )
             .await?;
@@ -1464,6 +1474,8 @@ impl RequestBuilder {
             if !validator(&next) {
                 return Err(ClientError::RedirectRejected(next));
             }
+            // RFC 7231/7538 method+body rewriting before the next hop.
+            rewrite_after_redirect(resp.status(), &mut method, &mut body);
             current = next;
         }
         unreachable!("redirect loop is bounded by `max` and always returns")
@@ -1472,7 +1484,14 @@ impl RequestBuilder {
     /// Composed SSRF-safe send path (Features #1238 + #1239). Resolves and
     /// validates every hop, pins the connection, and rejects scheme downgrades.
     async fn send_ssrf_safe(self, timeout: Duration) -> Result<Response, ClientError> {
+        let original =
+            url::Url::parse(&self.url).map_err(|e| ClientError::InvalidUrl(e.to_string()))?;
         let mut current = self.url.clone();
+        // Threaded across hops so cross-origin header stripping (Fix A) and
+        // RFC method/body rewriting (Fix B) accumulate correctly.
+        let mut method = self.method.clone();
+        let mut headers = self.extra_headers.clone();
+        let mut body = self.body.clone();
         for hop in 0.. {
             // Resolve host → validated address (rejects if ANY resolved IP is
             // blocked), then pin so reqwest cannot re-resolve.
@@ -1483,13 +1502,17 @@ impl RequestBuilder {
                 reqwest::redirect::Policy::none(),
                 timeout,
             )?;
-            let body = if hop == 0 { self.body.as_ref() } else { None };
+            // On any post-origin hop, drop credential-bearing headers if the
+            // current target is cross-origin (stays stripped once stripped).
+            if hop > 0 {
+                strip_sensitive_headers_if_cross_origin(&mut headers, &original, &current)?;
+            }
             let resp = send_one(
                 &client,
-                &self.method,
+                &method,
                 &current,
-                &self.extra_headers,
-                body,
+                &headers,
+                body.as_ref(),
                 &self.retry_policy,
             )
             .await?;
@@ -1506,6 +1529,8 @@ impl RequestBuilder {
                     "https→http scheme downgrade on redirect to {next}"
                 )));
             }
+            // RFC 7231/7538 method+body rewriting before the next hop.
+            rewrite_after_redirect(resp.status(), &mut method, &mut body);
             current = next;
             // The next loop iteration re-resolves + re-validates `current`
             // before connecting, so a redirect to a blocked address is rejected
@@ -1660,6 +1685,64 @@ fn redirect_target(resp: &Response, base: &str) -> Result<Option<String>, Client
         .join(location)
         .map_err(|e| ClientError::InvalidUrl(e.to_string()))?;
     Ok(Some(joined.to_string()))
+}
+
+/// Strip credential-bearing headers when a redirect hop crosses origins.
+///
+/// If `current`'s origin (scheme + host + port, per [`url::Url::origin`])
+/// differs from the `original` request URL's origin, the `Authorization`,
+/// `Cookie`, and `Proxy-Authorization` headers are removed from `headers` so
+/// they are never forwarded to a cross-origin target (credential leak).
+/// Because the caller threads a single mutable `headers` map across hops, once
+/// these headers are stripped on any hop they stay stripped for the remainder
+/// of the chain — the safe, conservative behaviour.
+fn strip_sensitive_headers_if_cross_origin(
+    headers: &mut HeaderMap,
+    original: &url::Url,
+    current: &str,
+) -> Result<(), ClientError> {
+    let current_url =
+        url::Url::parse(current).map_err(|e| ClientError::InvalidUrl(e.to_string()))?;
+    if current_url.origin() != original.origin() {
+        headers.remove(reqwest::header::AUTHORIZATION);
+        headers.remove(reqwest::header::COOKIE);
+        headers.remove(reqwest::header::PROXY_AUTHORIZATION);
+    }
+    Ok(())
+}
+
+/// Apply RFC 7231 §6.4 / RFC 7538 method-and-body rewriting after receiving a
+/// redirect `status`, before issuing the next hop. Mutates `method` and `body`
+/// in place.
+///
+/// - **303 See Other**: switch to `GET` (a `HEAD` stays `HEAD`) and drop the body.
+/// - **301 Moved Permanently / 302 Found**: a `POST` becomes a bodyless `GET`;
+///   every other method (and its body) is preserved — matching prevailing
+///   browser behaviour.
+/// - **307 Temporary Redirect / 308 Permanent Redirect**: preserve the method
+///   **and** the body verbatim (the RFC-correct behaviour — the body must NOT
+///   be dropped).
+/// - Any other redirect status: leave method and body untouched.
+fn rewrite_after_redirect(
+    status: reqwest::StatusCode,
+    method: &mut Method,
+    body: &mut Option<Bytes>,
+) {
+    match status.as_u16() {
+        303 => {
+            if *method != Method::HEAD {
+                *method = Method::GET;
+            }
+            *body = None;
+        }
+        301 | 302 => {
+            if *method == Method::POST {
+                *method = Method::GET;
+                *body = None;
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Resolve `url`'s host to a single validated [`SocketAddr`], rejecting with
@@ -2838,6 +2921,14 @@ mod tests {
             .unwrap()
     }
 
+    fn redirect_307(location: String) -> axum::response::Response {
+        axum::response::Response::builder()
+            .status(307)
+            .header("location", location)
+            .body(axum::body::Body::empty())
+            .unwrap()
+    }
+
     // TEST 48: no_redirect returns the 3xx verbatim without following it.
     #[tokio::test]
     async fn no_redirect_returns_3xx_unfollowed() {
@@ -3173,5 +3264,214 @@ mod tests {
                 "{raw} should be rejected with InvalidUrl, got {result:?}"
             );
         }
+    }
+
+    // TEST 59: a cross-origin redirect (different port ⇒ different origin) must
+    // NOT forward credential-bearing request headers to the new origin. This is
+    // the manual-redirect-loop version of reqwest's built-in strip-on-cross-host
+    // behaviour, closing a credential-leak hole (Fix A).
+    #[tokio::test]
+    async fn follow_redirects_strips_sensitive_headers_cross_origin() {
+        use axum::{Router, routing::get};
+
+        let seen: Arc<Mutex<Option<HeaderMap>>> = Arc::new(Mutex::new(None));
+        let seen2 = seen.clone();
+        // Listener B records the headers it received (different port = different
+        // origin from A).
+        let b_addr = spawn(Router::new().route(
+            "/dst",
+            get(move |headers: HeaderMap| {
+                let slot = seen2.clone();
+                async move {
+                    *slot.lock().unwrap() = Some(headers);
+                    "ok"
+                }
+            }),
+        ))
+        .await;
+        let b_port = b_addr.port();
+
+        // Listener A 302-redirects onto B.
+        let a_addr = spawn(Router::new().route(
+            "/",
+            get(move || async move { redirect_302(format!("http://127.0.0.1:{b_port}/dst")) }),
+        ))
+        .await;
+
+        let resp = Client::new()
+            .get(format!("http://127.0.0.1:{}/", a_addr.port()))
+            .header("authorization", "secret")
+            .header("cookie", "session=abc")
+            .header("proxy-authorization", "Basic zzz")
+            .follow_redirects(3, |_| true)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status().as_u16(), 200);
+        let headers = seen
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("listener B must have been reached");
+        assert!(
+            headers.get("authorization").is_none(),
+            "authorization must be stripped on a cross-origin redirect"
+        );
+        assert!(
+            headers.get("cookie").is_none(),
+            "cookie must be stripped on a cross-origin redirect"
+        );
+        assert!(
+            headers.get("proxy-authorization").is_none(),
+            "proxy-authorization must be stripped on a cross-origin redirect"
+        );
+    }
+
+    // TEST 60: a SAME-origin redirect (relative `Location`, same host:port) must
+    // keep credential-bearing headers — stripping only applies across origins.
+    #[tokio::test]
+    async fn follow_redirects_keeps_sensitive_headers_same_origin() {
+        use axum::{Router, routing::get};
+
+        let seen: Arc<Mutex<Option<HeaderMap>>> = Arc::new(Mutex::new(None));
+        let seen2 = seen.clone();
+        let addr = spawn(
+            Router::new()
+                .route("/", get(|| async { redirect_302("/next".to_owned()) }))
+                .route(
+                    "/next",
+                    get(move |headers: HeaderMap| {
+                        let slot = seen2.clone();
+                        async move {
+                            *slot.lock().unwrap() = Some(headers);
+                            "ok"
+                        }
+                    }),
+                ),
+        )
+        .await;
+
+        let resp = Client::new()
+            .get(format!("http://127.0.0.1:{}/", addr.port()))
+            .header("authorization", "secret")
+            .follow_redirects(3, |_| true)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status().as_u16(), 200);
+        let headers = seen
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("/next must have been reached");
+        assert_eq!(
+            headers.get("authorization").and_then(|v| v.to_str().ok()),
+            Some("secret"),
+            "authorization must be preserved on a same-origin redirect"
+        );
+    }
+
+    // TEST 61: RFC 7231 §6.4.3 — a 302 in response to a POST rewrites the next
+    // hop to a bodyless GET (Fix B).
+    #[tokio::test]
+    async fn follow_redirects_302_post_becomes_get() {
+        use axum::{
+            Router,
+            routing::{any, post},
+        };
+
+        let seen: Arc<Mutex<Option<(String, Bytes)>>> = Arc::new(Mutex::new(None));
+        let seen2 = seen.clone();
+        // B records the method + body it actually received, for any verb.
+        let b_addr = spawn(Router::new().route(
+            "/dst",
+            any(move |method: Method, body: Bytes| {
+                let slot = seen2.clone();
+                async move {
+                    *slot.lock().unwrap() = Some((method.to_string(), body));
+                    "ok"
+                }
+            }),
+        ))
+        .await;
+        let b_port = b_addr.port();
+
+        let a_addr = spawn(Router::new().route(
+            "/",
+            post(move || async move { redirect_302(format!("http://127.0.0.1:{b_port}/dst")) }),
+        ))
+        .await;
+
+        let resp = Client::new()
+            .post(format!("http://127.0.0.1:{}/", a_addr.port()))
+            .text_body("payload")
+            .follow_redirects(3, |_| true)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status().as_u16(), 200);
+        let (method, body) = seen
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("listener B must have been reached");
+        assert_eq!(method, "GET", "302 must rewrite POST → GET");
+        assert!(body.is_empty(), "302 POST→GET must drop the request body");
+    }
+
+    // TEST 62: RFC 7231 §6.4.7 — a 307 preserves BOTH the method and the body
+    // across the redirect (the review bot's drop-body-every-hop snippet was
+    // wrong here) (Fix B).
+    #[tokio::test]
+    async fn follow_redirects_307_preserves_method_and_body() {
+        use axum::{
+            Router,
+            routing::{any, post},
+        };
+
+        let seen: Arc<Mutex<Option<(String, Bytes)>>> = Arc::new(Mutex::new(None));
+        let seen2 = seen.clone();
+        let b_addr = spawn(Router::new().route(
+            "/dst",
+            any(move |method: Method, body: Bytes| {
+                let slot = seen2.clone();
+                async move {
+                    *slot.lock().unwrap() = Some((method.to_string(), body));
+                    "ok"
+                }
+            }),
+        ))
+        .await;
+        let b_port = b_addr.port();
+
+        let a_addr = spawn(Router::new().route(
+            "/",
+            post(move || async move { redirect_307(format!("http://127.0.0.1:{b_port}/dst")) }),
+        ))
+        .await;
+
+        let resp = Client::new()
+            .post(format!("http://127.0.0.1:{}/", a_addr.port()))
+            .text_body("payload")
+            .follow_redirects(3, |_| true)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status().as_u16(), 200);
+        let (method, body) = seen
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("listener B must have been reached");
+        assert_eq!(method, "POST", "307 must preserve the POST method");
+        assert_eq!(
+            &body[..],
+            b"payload",
+            "307 must preserve the request body verbatim"
+        );
     }
 }
