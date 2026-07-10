@@ -449,17 +449,26 @@ pub fn plan_scaffold_with_options(
         };
         let base = f.name.strip_suffix("_id").unwrap_or(&f.name);
         let columns = super::model::model_string_columns(project_root, base);
-        if !columns.is_empty() && !columns.iter().any(|(c, _)| c == label) {
+        if !columns.iter().any(|(c, _)| c == label) {
+            // Covers both a wrong column name AND a target with no string
+            // columns at all — in the latter case there is nothing to fall back
+            // to, so the reference renders its raw id.
+            let detail = if columns.is_empty() {
+                format!("the '{base}' model has no string columns")
+            } else {
+                format!(
+                    "the '{base}' model's string columns are: {}",
+                    columns
+                        .iter()
+                        .map(|(c, _)| c.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            };
             plan.warn(format!(
-                "reference label '{label}' on '{}' is not a string column of the '{base}' \
-                 model; falling back to its default display column. Available string \
-                 columns: {}.",
-                f.name,
-                columns
-                    .iter()
-                    .map(|(c, _)| c.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
+                "reference label '{label}' on '{}' is not a usable string column ({detail}); \
+                 falling back to the default display column (its raw id when there is none).",
+                f.name
             ));
         }
     }
@@ -2864,16 +2873,22 @@ fn resolve_reference_display(project_root: &Path, field: &Field) -> Option<Refer
             // Explicit override names a real string column on the target — use
             // it, with its known nullability.
             (c.clone(), *n)
-        } else if columns.is_empty() {
-            // The target model isn't discoverable at scaffold time (not yet
-            // generated, unparseable, or a single-file `models.rs` layout we
-            // can't read), so the override can't be validated. Honor it as
-            // before (assume a non-null `String`), matching the "assume the
-            // table exists" posture the missing-target path already takes.
+        } else if field
+            .reference_table()
+            .is_some_and(|table| !super::model::model_file_exists(project_root, &table, base))
+        {
+            // The target model genuinely isn't discoverable (not yet generated,
+            // unparseable, or a single-file `models.rs` layout we can't read),
+            // so the override can't be validated. Honor it as before (assume a
+            // non-null `String`), matching the "assume the table exists" posture
+            // the missing-target path takes. Not reachable on the normal select
+            // path (missing targets are excluded upstream), but keeps the
+            // resolver correct for any other caller.
             (label.clone(), false)
         } else {
-            // The model IS discoverable and exposes string columns, but none is
-            // named `{label}` — a typo, or a non-string column. Emitting
+            // The model IS discoverable but `{label}` names no string column —
+            // a typo, a non-string column, or a model with NO string columns at
+            // all (e.g. `Post { id, count: i32 }` + `{label:count}`). Emitting
             // `select {table}::{label}` (loaded as `String`) would fail to
             // compile the generated app, so fall back to the heuristic display
             // column: generation still succeeds, and the plan carries a warning
@@ -3003,6 +3018,15 @@ fn render_changeset_form_inputs(
                     // that happens to permit an empty string (e.g. a max-only
                     // `length` rule) doesn't leave a blank required field with
                     // no client-side guard at all.
+                    //
+                    // Known limitation (#1750): the #1388 client-side HTML5
+                    // constraint attributes (`minlength`/`maxlength`,
+                    // `type="email"`/`url`) are only emitted on the standard
+                    // `form_for` path (`html5_constraint_spec`), not through
+                    // these cross-crate `autumn_web::form` htmx helpers, which
+                    // take no constraint params. Server-side `#[validate]` still
+                    // applies in `--live-validation`; only the static HTML5
+                    // hints are absent here.
                     if live_validation && validated.contains(&name.as_str()) {
                         let helper = if f.nullable {
                             "text_input_htmx"

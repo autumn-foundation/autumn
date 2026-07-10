@@ -134,6 +134,48 @@ fn invalid_label_override_falls_back_to_heuristic_and_warns() {
 }
 
 #[test]
+fn label_override_naming_a_non_string_column_falls_back_to_id_and_warns() {
+    // `Post` has only numeric columns, so an explicit `{label:count}` names a
+    // column that isn't (and can't be) a string display column. Trusting it
+    // would emit `select posts::count` loaded as `String` and fail to compile
+    // the generated app, so the resolver must fall back to id-only and warn.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    run_autumn_ok(tmp.path(), &["new", "bt-nonstring-label-app"]);
+    let project = tmp.path().join("bt-nonstring-label-app");
+    run_autumn_ok(&project, &["generate", "model", "Post", "count:i64"]);
+    let output = Command::new(autumn_bin())
+        .args([
+            "generate",
+            "scaffold",
+            "Comment",
+            "body:Text",
+            "post:references{label:count}",
+        ])
+        .current_dir(&project)
+        .output()
+        .expect("failed to run autumn");
+    assert!(
+        output.status.success(),
+        "scaffold with a non-string label must still succeed (graceful fallback)\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let routes = fs::read_to_string(project.join("src/routes/comments.rs")).unwrap();
+    assert!(
+        !routes.contains("posts::count"),
+        "must not select the non-string column as a label:\n{routes}"
+    );
+    assert!(
+        routes.contains(".select(posts::id)"),
+        "with no string column the loader must fall back to id-only:\n{routes}"
+    );
+    assert!(
+        stderr.contains("count") && stderr.contains("falling back"),
+        "the generator must warn that the non-string label was ignored:\n{stderr}"
+    );
+}
+
+#[test]
 fn falls_back_to_id_when_target_has_no_string_column() {
     // A `Post` with only numeric columns has no display column, so the loader
     // keeps the id as both value and label.
