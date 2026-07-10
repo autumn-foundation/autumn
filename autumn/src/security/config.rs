@@ -1175,12 +1175,15 @@ pub struct UploadConfig {
     /// 2. **Unrecognized but looks like markup** (leading `<…` after a BOM /
     ///    whitespace — HTML, SVG, XML) → always rejected (`400`), so scripts
     ///    or `<svg onload=…>` can't ride in under a spoofed declared type.
-    /// 3. **Unrecognized and not markup** (genuine text such as `text/plain`,
-    ///    `application/json`, `text/csv`, which have no magic bytes) → falls
-    ///    back to the **declared** content-type essence (media type without
-    ///    parameters), which must appear in the list. This is the only case
-    ///    where the declared header is trusted, and only to disambiguate among
-    ///    signature-less text formats.
+    /// 3. **Unrecognized and not markup** → the declared content-type essence
+    ///    (media type without parameters) is trusted **only** when it names a
+    ///    signature-less TEXT type (`text/*`, `application/json`,
+    ///    `application/csv`) that appears in the list. Binary/sniffable types
+    ///    (`image/*`, `application/pdf`, …) are always enforced strictly by
+    ///    magic bytes: unrecognizable bytes declaring such a type are rejected
+    ///    (`400`), since a genuine file of that type would have sniffed
+    ///    positively. This is the only case where the declared header is
+    ///    trusted, and only to disambiguate among signature-less text formats.
     #[serde(default)]
     pub allowed_mime_types: Vec<String>,
     /// When `true`, reject an uploaded file part if the client-declared

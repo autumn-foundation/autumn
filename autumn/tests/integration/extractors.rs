@@ -562,6 +562,31 @@ async fn multipart_short_file_rejected_when_allow_list_set() {
 
 #[cfg(feature = "multipart")]
 #[tokio::test]
+async fn multipart_unrecognized_binary_declared_png_is_rejected() {
+    let boundary = "X-BOUNDARY";
+    // Unrecognized, non-markup bytes declared as image/png. A genuine PNG would
+    // ALWAYS sniff positively, so unsniffable bytes claiming a binary type are
+    // definitionally a spoof. The declared-header fallback must NOT apply to
+    // binary/sniffable types — only to signature-less text — so this is a 400.
+    let body = single_file_multipart_body(
+        boundary,
+        "file",
+        "fake.png",
+        "image/png",
+        &[0x01, 0x02, 0x03, 0x04],
+    );
+
+    let config = autumn_web::security::UploadConfig {
+        allowed_mime_types: vec!["image/png".to_owned()],
+        ..autumn_web::security::UploadConfig::default()
+    };
+
+    let response = run_sniff_upload(config, body, boundary).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[cfg(feature = "multipart")]
+#[tokio::test]
 async fn multipart_empty_allow_list_passes_through() {
     let boundary = "X-BOUNDARY";
     let html = b"<!DOCTYPE html><script>alert(1)</script>";

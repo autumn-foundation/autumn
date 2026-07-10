@@ -133,6 +133,7 @@
 //! | `AUTUMN_SECURITY__UPLOAD__MAX_REQUEST_SIZE_BYTES` | `security.upload.max_request_size_bytes` | `usize` |
 //! | `AUTUMN_SECURITY__UPLOAD__MAX_FILE_SIZE_BYTES` | `security.upload.max_file_size_bytes` | `usize` |
 //! | `AUTUMN_SECURITY__UPLOAD__ALLOWED_MIME_TYPES` | `security.upload.allowed_mime_types` | comma-separated `String` |
+//! | `AUTUMN_SECURITY__UPLOAD__REJECT_ON_CONTENT_TYPE_MISMATCH` | `security.upload.reject_on_content_type_mismatch` | `bool` |
 //! | `AUTUMN_SECURITY__FORBIDDEN_RESPONSE` | `security.forbidden_response` | `"403"` or `"404"` |
 //! | `AUTUMN_SECURITY__ALLOW_UNAUTHORIZED_REPOSITORY_API` | `security.allow_unauthorized_repository_api` | `bool` |
 //! | `AUTUMN_SECURITY__SIGNING_SECRET` | `security.signing_secret.secret` | `String` |
@@ -3348,6 +3349,11 @@ impl AutumnConfig {
             env,
             "AUTUMN_SECURITY__UPLOAD__ALLOWED_MIME_TYPES",
             &mut self.security.upload.allowed_mime_types,
+        );
+        parse_env_bool(
+            env,
+            "AUTUMN_SECURITY__UPLOAD__REJECT_ON_CONTENT_TYPE_MISMATCH",
+            &mut self.security.upload.reject_on_content_type_mismatch,
         );
 
         // Authorization deny shape + repository-API escape hatch.
@@ -7083,6 +7089,18 @@ path = "/healthz"
         assert!(!config.actuator.sensitive);
         config.apply_env_overrides_with_env(&env);
         assert!(config.actuator.sensitive);
+    }
+
+    #[test]
+    fn env_override_upload_reject_on_content_type_mismatch() {
+        let env = MockEnv::new().with(
+            "AUTUMN_SECURITY__UPLOAD__REJECT_ON_CONTENT_TYPE_MISMATCH",
+            "true",
+        );
+        let mut config = AutumnConfig::default();
+        assert!(!config.security.upload.reject_on_content_type_mismatch);
+        config.apply_env_overrides_with_env(&env);
+        assert!(config.security.upload.reject_on_content_type_mismatch);
     }
 
     #[test]

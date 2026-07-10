@@ -299,17 +299,28 @@ fn truncate_for_error(value: &str) -> String {
     value.chars().take(MAX_CHARS).collect()
 }
 
+/// Types that legitimately have no magic-byte signature, so a content sniff of
+/// `None` is expected and the declared type may be trusted for the allow-list.
+/// Binary/sniffable types (image/*, application/pdf, …) are deliberately
+/// excluded: a genuine one always sniffs positively, so `None` for such a type
+/// means the declared header is spoofed.
+#[cfg(feature = "multipart")]
+fn is_signatureless_text_type(essence: &str) -> bool {
+    essence.starts_with("text/") || matches!(essence, "application/json" | "application/csv")
+}
+
 /// Enforce a MIME allow-list against a file part, using content sniffing as the
 /// primary signal. `infer` only recognizes binary formats by magic bytes; text
-/// formats (text/plain, application/json, text/csv, image/svg+xml, …) have no
-/// signature and always sniff to `None`. Precedence:
+/// formats (text/plain, application/json, text/csv, …) have no signature and
+/// always sniff to `None`. Precedence:
 ///
 /// 1. **Sniffed recognized** → must be in the list, else reject. Header ignored.
 /// 2. **Unrecognized + markup** (leading `<…`) → reject unconditionally, so
 ///    HTML/SVG/XML can't ride in under a spoofed declared type.
-/// 3. **Unrecognized + not markup** (genuine signature-less text) → fall back to
-///    the declared essence, which must be in the list. This is the only case
-///    where the declared header is trusted.
+/// 3. **Unrecognized + not markup** → the declared header is trusted ONLY when
+///    it names a signature-less TEXT type (see [`is_signatureless_text_type`])
+///    that is in the list. A declared binary/sniffable type on unrecognizable
+///    bytes is definitionally a spoof (a real one would have sniffed) → reject.
 #[cfg(feature = "multipart")]
 fn enforce_upload_allow_list(
     allowed: &[String],
@@ -332,21 +343,14 @@ fn enforce_upload_allow_list(
         return Err(crate::AutumnError::bad_request_msg(
             "upload rejected: unrecognized file content looks like markup",
         ));
-    } else {
-        match declared_essence {
-            Some(essence) if in_list(essence) => {}
-            Some(essence) => {
-                return Err(crate::AutumnError::bad_request_msg(format!(
-                    "upload content type not allowed: declared={}",
-                    truncate_for_error(essence)
-                )));
-            }
-            None => {
-                return Err(crate::AutumnError::bad_request_msg(
-                    "upload content type not allowed: no recognized or declared type",
-                ));
-            }
-        }
+    } else if !matches!(
+        declared_essence,
+        Some(essence) if is_signatureless_text_type(essence) && in_list(essence)
+    ) {
+        return Err(crate::AutumnError::bad_request_msg(format!(
+            "upload content type could not be verified from its content: declared={}",
+            declared_essence.map_or_else(String::new, truncate_for_error)
+        )));
     }
     Ok(())
 }
