@@ -543,11 +543,13 @@ async fn destroy_soft_parent_soft_deletes_soft_children() {
     );
 }
 
-/// #1369 P1 (hard parent + soft child): a NON-soft parent that `destroy`s a
-/// `#[soft_delete]` child. Because the parent is hard-deleted, the children must
-/// be HARD-deleted too (rows gone) — a soft-deleted child left pointing at a
-/// removed parent would violate the NOT NULL FK and be a semantic orphan. Assert
-/// zero surviving children, zero FK errors, parent gone.
+/// #1369 P1 (hard parent + soft child, incl. a PRE-soft-deleted child): a
+/// NON-soft parent that `destroy`s a `#[soft_delete]` child. Because the parent
+/// is hard-deleted, the children must be HARD-deleted too (rows gone) — even a
+/// child that was ALREADY soft-deleted (deleted_at set) whose NOT NULL FK still
+/// points at the parent. The parent-soft-gated live filter is dropped for a hard
+/// parent, so the cascade selects every physically-present child. Assert zero
+/// surviving children, zero FK errors, parent gone.
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn destroy_hard_parent_hard_deletes_soft_children() {
@@ -566,11 +568,18 @@ async fn destroy_hard_parent_hard_deletes_soft_children() {
         .await
         .unwrap();
     }
+    // Pre-soft-delete one child: its deleted_at is already set, but its NOT NULL
+    // FK still references the parent. This row must NOT be skipped by the live
+    // filter on a hard-parent cascade, or the parent DELETE would FK-fail.
+    diesel::sql_query("UPDATE dep_hard_soft_comments SET deleted_at = now() WHERE id = 2")
+        .execute(&mut conn)
+        .await
+        .unwrap();
 
     let repo = PgDepHardPostRepository::with_pool_untracked(pool.clone());
     repo.delete_by_id(11)
         .await
-        .expect("hard-parent cascade must not FK-error");
+        .expect("hard-parent cascade must not FK-error, even with a pre-soft-deleted child");
 
     // Parent gone.
     assert_eq!(
@@ -581,7 +590,7 @@ async fn destroy_hard_parent_hard_deletes_soft_children() {
         .await,
         0
     );
-    // Soft-delete children were HARD-deleted (rows gone), not left soft-deleted.
+    // All children HARD-deleted (rows gone), including the pre-soft-deleted one.
     assert_eq!(
         count(
             &mut conn,
@@ -589,6 +598,6 @@ async fn destroy_hard_parent_hard_deletes_soft_children() {
         )
         .await,
         0,
-        "a hard-deleted parent must hard-delete its soft-delete children (no orphans, no FK error)"
+        "a hard-deleted parent must hard-delete every physically-present soft-delete child (incl. pre-soft-deleted), leaving no orphan and no FK error"
     );
 }

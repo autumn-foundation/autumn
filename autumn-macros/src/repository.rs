@@ -1215,12 +1215,21 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         } else {
             quote! {}
         };
-        // Soft-delete-aware live-child filter for the id selection (only live
-        // children are destroyed; already soft-deleted rows are left as-is).
+        // Live-child filter (`AND deleted_at IS NULL`), gated on the PARENT's
+        // delete kind at runtime (#1369). The filter applies only when the parent
+        // is being soft-deleted: the parent row survives, so an already
+        // soft-deleted child is logically gone and would cause no FK problem, and
+        // a live-only selection is correct. When the parent is HARD-deleted the
+        // filter is dropped so the cascade (and the restrict EXISTS probe) operate
+        // on EVERY physically-present child row — otherwise a pre-soft-deleted
+        // child whose NOT NULL FK still points at the parent would survive the
+        // filter and make the subsequent hard parent DELETE fail (destroy) or slip
+        // past the existence check as a raw DB 500 instead of a 409 (restrict).
+        // Non-soft-delete children have no `deleted_at` column, so no filter ever.
         let destroy_live_filter = if config.soft_delete {
-            " AND \"deleted_at\" IS NULL"
+            quote! { if __parent_soft { " AND \"deleted_at\" IS NULL" } else { "" } }
         } else {
-            ""
+            quote! { "" }
         };
         // The mutation context (`ctx`) is referenced by the before_delete hook,
         // the version-history writer, and the commit-hook enqueue. Declare it —
@@ -13924,19 +13933,36 @@ mod tests {
     /// (which ends right before the always-generated `pub fn on_primary`), so
     /// assertions don't accidentally match the repository's OWN broadcast /
     /// commit-hook codegen emitted elsewhere in the output.
-    fn dependent_destroy_arm(generated: &str) -> &str {
+    fn dependent_helper_body(generated: &str) -> &str {
         // Anchor on the method *definition* — the bare name also appears at the
-        // parent's cascade *call* site inside `delete_by_id`.
+        // parent's cascade *call* site inside `delete_by_id`. Bound to the method
+        // (it ends right before the always-generated `pub fn on_primary`).
         let hstart = generated
             .find("pub async fn __autumn_apply_dependent_on_conn")
             .expect("dependent-apply helper definition present");
         let hrest = &generated[hstart..];
         let hend = hrest.find("pub fn on_primary").unwrap_or(hrest.len());
-        let helper = &hrest[..hend];
+        &hrest[..hend]
+    }
+
+    fn dependent_destroy_arm(generated: &str) -> &str {
+        let helper = dependent_helper_body(generated);
         let destroy_at = helper
             .find("DependentAction :: Destroy")
             .expect("destroy arm present");
         &helper[destroy_at..]
+    }
+
+    /// The `Restrict` match arm, bounded to before the `Nullify` arm so
+    /// assertions don't leak into the other arms.
+    fn dependent_restrict_arm(generated: &str) -> &str {
+        let helper = dependent_helper_body(generated);
+        let start = helper
+            .find("DependentAction :: Restrict")
+            .expect("restrict arm present");
+        let arm = &helper[start..];
+        let end = arm.find("DependentAction :: Nullify").unwrap_or(arm.len());
+        &arm[..end]
     }
 
     #[test]
@@ -14100,29 +14126,30 @@ mod tests {
     }
 
     #[test]
-    fn repository_macro_dependent_restrict_is_soft_delete_aware() {
-        // Finding 1: for a soft-delete child, the restrict EXISTS probe must
-        // carry the live filter so an already-soft-deleted child does not block
-        // the parent with a spurious 409.
+    fn repository_macro_dependent_restrict_live_filter_gated_on_parent_soft() {
+        // For a soft-delete child, the restrict EXISTS probe's live filter is
+        // gated on the PARENT's delete kind (`__parent_soft`): a soft parent
+        // keeps the filter (a logically-gone child shouldn't spuriously 409),
+        // but a HARD parent drops it so any physically-present FK-referencing
+        // child yields a clean 409 rather than a raw DB 500 on the parent DELETE.
         let generated = repository_macro(
             quote! { Comment, soft_delete, dependent(PgReplyRepository, fk = "comment_id", on_delete = restrict) },
             quote! { pub trait CommentRepository {} },
         )
         .to_string();
-        let start = generated
-            .find("__autumn_apply_dependent_on_conn")
-            .expect("helper present");
-        let helper = &generated[start..];
-        // The live filter is appended to the EXISTS probe format string. Token
-        // stringification renders the string literals with spaced-out escaped
-        // quotes, so match on the stable inner fragment.
+        let restrict_arm = dependent_restrict_arm(&generated);
         assert!(
-            helper.contains("SELECT EXISTS"),
-            "restrict must probe for existing children: {helper}"
+            restrict_arm.contains("SELECT EXISTS"),
+            "restrict must probe for existing children: {restrict_arm}"
+        );
+        // The live filter is a runtime `if __parent_soft { \" AND ...deleted_at.. IS NULL\" } else { \"\" }`.
+        assert!(
+            restrict_arm.contains("if __parent_soft"),
+            "soft-delete restrict probe's live filter must be gated on __parent_soft: {restrict_arm}"
         );
         assert!(
-            helper.contains("deleted_at") && helper.contains("IS NULL"),
-            "soft-delete restrict probe must exclude already-soft-deleted children (live filter): {helper}"
+            restrict_arm.contains("deleted_at") && restrict_arm.contains("IS NULL"),
+            "the soft-parent branch of the restrict probe must carry the live filter: {restrict_arm}"
         );
     }
 
@@ -14154,24 +14181,66 @@ mod tests {
 
     #[test]
     fn repository_macro_dependent_destroy_helper_is_soft_delete_aware() {
-        // AC3: a soft_delete child soft-deletes its rows on cascade and only
-        // selects live children.
+        // AC3: a soft_delete child soft-deletes its rows on cascade. The
+        // child-selection live filter is gated on the parent's delete kind
+        // (`__parent_soft`): kept for a soft parent, dropped for a hard parent so
+        // even a pre-soft-deleted child is hard-deleted (no surviving FK row).
         let generated = repository_macro(
             quote! { Comment, soft_delete, dependent(PgReplyRepository, fk = "comment_id", on_delete = destroy) },
             quote! { pub trait CommentRepository {} },
         )
         .to_string();
-        let start = generated
-            .find("__autumn_apply_dependent_on_conn")
-            .expect("helper present");
-        let helper = &generated[start..];
+        let destroy_arm = dependent_destroy_arm(&generated);
         assert!(
-            helper.contains("deleted_at"),
-            "soft_delete repo's destroy path must soft-delete (touch deleted_at): {helper}"
+            destroy_arm.contains("deleted_at"),
+            "soft_delete repo's destroy path must soft-delete (touch deleted_at): {destroy_arm}"
         );
         assert!(
-            helper.contains("IS NULL"),
-            "soft_delete repo's destroy path must select only live children: {helper}"
+            destroy_arm.contains("if __parent_soft"),
+            "the child-selection live filter must be gated on __parent_soft: {destroy_arm}"
+        );
+        assert!(
+            destroy_arm.contains("IS NULL"),
+            "the soft-parent branch must select only live children: {destroy_arm}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_dependent_live_filter_is_parent_soft_gated_not_child_only() {
+        // The live filter (`deleted_at IS NULL`) must be a RUNTIME choice keyed on
+        // `__parent_soft`, not baked in unconditionally for a soft_delete child.
+        // Both the destroy child-selection and the restrict EXISTS probe carry the
+        // gated form `if __parent_soft { \" AND ..deleted_at.. IS NULL\" } else { \"\" }`,
+        // so a hard parent delete operates on ALL physically-present children.
+        let generated = repository_macro(
+            quote! {
+                Comment, soft_delete,
+                dependent(PgReplyRepository, fk = "comment_id", on_delete = destroy),
+                dependent(PgFlagRepository, fk = "comment_id", on_delete = restrict)
+            },
+            quote! { pub trait CommentRepository {} },
+        )
+        .to_string();
+        let destroy_arm = dependent_destroy_arm(&generated);
+        let restrict_arm = dependent_restrict_arm(&generated);
+        // Gated form present in both arms.
+        assert!(
+            destroy_arm.contains("if __parent_soft") && destroy_arm.contains("else { \"\" }"),
+            "destroy live filter must be parent-soft-gated with an empty else: {destroy_arm}"
+        );
+        assert!(
+            restrict_arm.contains("if __parent_soft") && restrict_arm.contains("else { \"\" }"),
+            "restrict live filter must be parent-soft-gated with an empty else: {restrict_arm}"
+        );
+        // Sanity: a non-soft-delete child carries no live filter at all.
+        let non_soft = repository_macro(
+            quote! { Post, dependent(PgAwardRepository, fk = "post_id", on_delete = restrict) },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        assert!(
+            !non_soft.contains("deleted_at"),
+            "a non-soft-delete child must have no live filter"
         );
     }
 
