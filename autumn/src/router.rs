@@ -936,6 +936,15 @@ pub fn extract_path_params(path: &str) -> Vec<String> {
         };
 
         let inner = &after_brace[..end_rel];
+        // Handle nested/unbalanced braces (e.g. `"{{}"`, `"{a{b}"`): the
+        // segment between the first `{` and the first `}` may itself contain a
+        // stray `{`. The real parameter opens at the *last* `{` before the
+        // matching `}`, which guarantees the extracted name is brace-free
+        // rather than emitting a name that still contains a brace (#1721).
+        let inner = match inner.rfind('{') {
+            Some(pos) => &inner[pos + 1..],
+            None => inner,
+        };
         let name = inner.split(':').next().unwrap_or(inner).trim();
         if !name.is_empty() {
             out.push(name.to_owned());
@@ -5609,6 +5618,32 @@ enabled = true
     }
 
     #[cfg(feature = "openapi")]
+    #[test]
+    fn extract_path_params_handles_unbalanced_braces() {
+        // Regression for #1721: unbalanced/malformed braces must never yield a
+        // param name that still contains a brace character. On nested input the
+        // real parameter opens at the last `{` before the matching `}`, so the
+        // extracted name is always brace-free (and stray braces yield no
+        // spurious params).
+        for path in ["{{}", "{", "}", "{a{b}"] {
+            for name in super::extract_path_params(path) {
+                assert!(
+                    !name.contains('{') && !name.contains('}'),
+                    "param name should be brace-free for {path:?}: {name:?}"
+                );
+                assert!(
+                    !name.is_empty(),
+                    "param name should be non-empty for {path:?}"
+                );
+            }
+        }
+        // `"{{}"` yields no param (the inner segment is just a stray `{`).
+        assert!(super::extract_path_params("{{}").is_empty());
+        // `"{a{b}"` extracts the parameter that opens at the last `{`.
+        assert_eq!(super::extract_path_params("{a{b}"), vec!["b".to_owned()]);
+    }
+
+    #[cfg(feature = "openapi")]
     #[tokio::test]
     async fn openapi_merges_scoped_prefix_path_params() {
         use crate::openapi::{ApiDoc, OpenApiConfig};
@@ -8710,6 +8745,22 @@ mod proptests {
                 prop_assert!(!name.is_empty());
                 let has_brace = name.contains('{') || name.contains('}');
                 prop_assert!(!has_brace, "param name should be brace-free: {name:?}");
+            }
+        }
+
+        /// Brace-dense variant of the invariant above. `.*` makes brace
+        /// characters astronomically rare, so unbalanced-brace inputs like
+        /// `"{{}"` (the #1721 regression) only surface via lucky CI seeds. This
+        /// strategy draws exclusively from brace/colon/letter characters so
+        /// malformed braces are exercised on nearly every case, and a committed
+        /// regression seed (proptest-regressions/router.txt) pins `"{{}"`
+        /// deterministically.
+        #[test]
+        fn extract_path_params_brace_inputs_are_brace_free(path in "[{}a-z:]{0,6}") {
+            for name in extract_path_params(&path) {
+                prop_assert!(!name.is_empty());
+                let has_brace = name.contains('{') || name.contains('}');
+                prop_assert!(!has_brace, "param name should be brace-free for {path:?}: {name:?}");
             }
         }
     }
