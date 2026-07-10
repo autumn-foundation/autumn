@@ -3058,27 +3058,51 @@ impl RequestBuilder {
         // required. `oneshot` runs on this same task, so the task-local is
         // visible to the checkout. When the `db` feature is off there is no DB,
         // so the captured query list is simply empty.
+        //
+        // The response body is drained (`to_bytes`) *inside* the scope so that
+        // handlers returning a lazy or streaming body (`Sse`, `Body::from_stream`,
+        // …) which perform DB work when the stream is polled still record those
+        // body-time checkouts against this request's timings. `take_captured()`
+        // only runs after the body is fully collected, so nothing is missed.
         #[cfg(feature = "db")]
-        let (response, queries) = {
+        let (status, headers, body_bytes, queries) = {
             let timings = std::sync::Arc::new(crate::db::RequestDbTimings::with_capture());
-            let response = crate::db::REQUEST_DB_TIMINGS
-                .scope(std::sync::Arc::clone(&timings), service.oneshot(request))
-                .await
-                .expect("request failed");
-            (response, timings.take_captured())
+            let (status, headers, body_bytes) = crate::db::REQUEST_DB_TIMINGS
+                .scope(std::sync::Arc::clone(&timings), async move {
+                    let response = service.oneshot(request).await.expect("request failed");
+                    let status = response.status();
+                    let headers: Vec<(String, String)> = response
+                        .headers()
+                        .iter()
+                        .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_owned()))
+                        .collect();
+                    let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                        .await
+                        .expect("failed to read response body");
+                    (status, headers, body_bytes)
+                })
+                .await;
+            (status, headers, body_bytes, timings.take_captured())
         };
         #[cfg(not(feature = "db"))]
-        let (response, queries): (_, Vec<crate::inspector::QueryRecord>) = (
-            service.oneshot(request).await.expect("request failed"),
-            Vec::new(),
-        );
-
-        let status = response.status();
-        let headers: Vec<(String, String)> = response
-            .headers()
-            .iter()
-            .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_owned()))
-            .collect();
+        let (status, headers, body_bytes, queries): (
+            _,
+            _,
+            _,
+            Vec<crate::inspector::QueryRecord>,
+        ) = {
+            let response = service.oneshot(request).await.expect("request failed");
+            let status = response.status();
+            let headers: Vec<(String, String)> = response
+                .headers()
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_owned()))
+                .collect();
+            let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("failed to read response body");
+            (status, headers, body_bytes, Vec::new())
+        };
 
         // Fold every `Set-Cookie` from the response back into the jar so the
         // next request from the same client replays it. Cookies whose
@@ -3096,10 +3120,6 @@ impl RequestBuilder {
                 }
             }
         }
-
-        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .expect("failed to read response body");
 
         TestResponse {
             status,
@@ -4455,6 +4475,55 @@ mod tests {
         assert_eq!(resp.query_count(), 2);
         assert_eq!(resp.queries().len(), 2);
         assert_eq!(resp.queries()[0].sql, "SELECT 1");
+    }
+
+    /// Regression guard: the `REQUEST_DB_TIMINGS` capture scope must stay active
+    /// while a lazy/streaming response body is drained, so DB work performed
+    /// *during* body polling (as `Sse` / `Body::from_stream` handlers do) is
+    /// still counted. `service.oneshot` returns the response head without
+    /// polling the stream; `send()` drains the body with `to_bytes` — if that
+    /// drain happened after the scope closed, these body-time queries would be
+    /// recorded against an unset task-local and silently dropped, so
+    /// `query_count()` would under-report (here: read 0 instead of 3).
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    async fn query_capture_stays_active_while_draining_streaming_body() {
+        use futures::StreamExt as _;
+
+        // Each streamed chunk records a DB query when it is polled. The stream is
+        // lazy: nothing runs until `to_bytes` polls it inside `send()`.
+        async fn stream_handler() -> axum::response::Response {
+            let body_stream = futures::stream::iter(0..3).map(|_| {
+                crate::db::record_request_db_query(
+                    std::time::Duration::from_millis(1),
+                    Some("SELECT 1"),
+                );
+                Ok::<_, std::convert::Infallible>(bytes::Bytes::from_static(b"x"))
+            });
+            axum::response::Response::new(Body::from_stream(body_stream))
+        }
+
+        let router = axum::Router::new().route("/stream", axum::routing::get(stream_handler));
+        let resp = RequestBuilder {
+            router,
+            method: Method::GET,
+            uri: "/stream".to_owned(),
+            headers: Vec::new(),
+            body: Body::empty(),
+            cookie_jar: None,
+            clock: None,
+            n_plus_one_threshold: 5,
+        }
+        .send()
+        .await;
+
+        resp.assert_ok();
+        assert_eq!(
+            resp.query_count(),
+            3,
+            "body-time DB queries must be captured while the streaming body is \
+             drained inside the active capture scope"
+        );
     }
 
     #[test]
