@@ -130,6 +130,48 @@ pub(super) fn builtin_stories() -> Vec<Story> {
         },
         story! {
             "Display",
+            "Charts",
+            {
+                use autumn_web::widgets::{
+                    ChartConfig, bar_chart, bar_chart_with, line_chart, line_chart_with,
+                    sparkline, sparkline_with,
+                };
+
+                // A 30-point trend series, built with a loop (no env capture).
+                let owned: Vec<(String, f64)> = (0..30)
+                    .map(|day| {
+                        let label = format!("Day {}", day + 1);
+                        let swing = (f64::from(day) * 0.4).sin() * 10.0;
+                        let value = 20.0 + swing;
+                        (label, value)
+                    })
+                    .collect();
+                let trend: Vec<(&str, f64)> =
+                    owned.iter().map(|(l, v)| (l.as_str(), *v)).collect();
+
+                let weekly = [
+                    ("Mon", 3.0), ("Tue", 5.0), ("Wed", 4.0),
+                    ("Thu", 7.0), ("Fri", 6.0),
+                ];
+
+                maud::html! {
+                    // Compact inline trend — plain and configured variants:
+                    (sparkline(&weekly))
+                    (sparkline_with(&weekly, &ChartConfig::new().title("Weekly visits")))
+                    // Bars, with a caller axis override + table fallback:
+                    (bar_chart(&weekly))
+                    (bar_chart_with(
+                        &weekly,
+                        &ChartConfig::new().min(0.0).max(10.0).with_table(),
+                    ))
+                    // A 30-point line chart, auto-scaled and configured:
+                    (line_chart(&trend))
+                    (line_chart_with(&trend, &ChartConfig::new().title("30-day trend")))
+                }
+            }
+        },
+        story! {
+            "Display",
             "Stat card",
             {
                 use autumn_web::widgets::stat_card;

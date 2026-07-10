@@ -227,6 +227,7 @@ const EXPECTED_STORY_SLUGS: &[&str] = &[
     "badge",
     "breadcrumb",
     "card",
+    "charts",
     "confirm-action",
     "data-table",
     "hero",

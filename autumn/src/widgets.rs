@@ -3954,6 +3954,463 @@ pub fn infinite_feed(
     }
 }
 
+// ── charts: sparkline / bar_chart / line_chart (#1231) ──────────────────────
+
+/// Rendering options shared by [`sparkline_with`], [`bar_chart_with`], and
+/// [`line_chart_with`].
+///
+/// Build with [`ChartConfig::new`] and chain the setters. Every option is
+/// off/`None` by default: the chart auto-scales its axis from the data, uses a
+/// sensible default accessible name, and omits the table fallback.
+///
+/// Charts never emit a `style=` attribute — colors and strokes come from the
+/// `.autumn-chart__*` classes referencing design tokens, so they re-theme via
+/// `tokens.css` and survive a strict `style-src`/`nonce` CSP.
+#[cfg(feature = "maud")]
+#[derive(Debug, Clone, Default)]
+pub struct ChartConfig<'a> {
+    class: Option<&'a str>,
+    title: Option<&'a str>,
+    desc: Option<&'a str>,
+    min: Option<f64>,
+    max: Option<f64>,
+    table_fallback: bool,
+}
+
+#[cfg(feature = "maud")]
+impl<'a> ChartConfig<'a> {
+    /// A default config: auto-scaled axis, default accessible name, no table
+    /// fallback, no extra class.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Append an extra class to the root `autumn-chart` element (merged via the
+    /// framework's class helper).
+    #[must_use]
+    pub const fn class(mut self, class: &'a str) -> Self {
+        self.class = Some(class);
+        self
+    }
+
+    /// Set the accessible name — used for the `<svg>` `aria-label` and the
+    /// embedded `<title>`. Falls back to a per-kind default (`"Sparkline"`,
+    /// `"Bar chart"`, `"Line chart"`) when unset.
+    #[must_use]
+    pub const fn title(mut self, title: &'a str) -> Self {
+        self.title = Some(title);
+        self
+    }
+
+    /// Set the long description emitted as the SVG `<desc>`. Falls back to a
+    /// generated one-line summary of the series when unset.
+    #[must_use]
+    pub const fn desc(mut self, desc: &'a str) -> Self {
+        self.desc = Some(desc);
+        self
+    }
+
+    /// Override the axis minimum. When unset the minimum is taken from the data
+    /// (auto-scaling).
+    #[must_use]
+    pub const fn min(mut self, min: f64) -> Self {
+        self.min = Some(min);
+        self
+    }
+
+    /// Override the axis maximum. When unset the maximum is taken from the data
+    /// (auto-scaling).
+    #[must_use]
+    pub const fn max(mut self, max: f64) -> Self {
+        self.max = Some(max);
+        self
+    }
+
+    /// Also emit a visually-hidden `<table>` of the `(label, value)` data after
+    /// the chart, so assistive tech and no-CSS clients get the exact numbers.
+    #[must_use]
+    pub const fn with_table(mut self) -> Self {
+        self.table_fallback = true;
+        self
+    }
+}
+
+/// Format a computed SVG coordinate to at most three decimals, trimming
+/// trailing zeros so the output is compact and deterministic (raw `f64`
+/// `Display` produces long, noisy tails).
+#[cfg(feature = "maud")]
+fn fmt_coord(v: f64) -> String {
+    let s = format!("{v:.3}");
+    let trimmed = s.trim_end_matches('0').trim_end_matches('.');
+    if trimmed.is_empty() || trimmed == "-0" {
+        "0".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Format a data value for the visually-hidden table fallback — up to three
+/// decimals, trailing zeros trimmed.
+#[cfg(feature = "maud")]
+fn fmt_value(v: f64) -> String {
+    fmt_coord(v)
+}
+
+/// Resolve the `(min, max)` axis bounds: caller overrides win, otherwise the
+/// bounds are taken from the data. Guarantees `min <= max` even under
+/// contradictory overrides, so downstream scaling never divides by a negative
+/// span.
+#[cfg(feature = "maud")]
+fn resolve_bounds(points: &[(&str, f64)], config: &ChartConfig<'_>) -> (f64, f64) {
+    let mut data_min = f64::INFINITY;
+    let mut data_max = f64::NEG_INFINITY;
+    for (_, v) in points {
+        if v.is_finite() {
+            data_min = data_min.min(*v);
+            data_max = data_max.max(*v);
+        }
+    }
+    if !data_min.is_finite() {
+        // No finite data points: fall back to a unit range.
+        data_min = 0.0;
+        data_max = 1.0;
+    }
+    let mut min = config.min.unwrap_or(data_min);
+    let mut max = config.max.unwrap_or(data_max);
+    if max < min {
+        std::mem::swap(&mut min, &mut max);
+    }
+    (min, max)
+}
+
+/// Map a value to a `0.0..=1.0` fraction of the axis. Returns `0.5` when the
+/// span is zero (single point, all-equal values, or `min == max` override),
+/// avoiding a divide-by-zero and placing the datum at mid-height.
+#[cfg(feature = "maud")]
+fn norm_frac(v: f64, min: f64, max: f64) -> f64 {
+    let span = max - min;
+    if span <= 0.0 || !v.is_finite() {
+        0.5
+    } else {
+        ((v - min) / span).clamp(0.0, 1.0)
+    }
+}
+
+/// Compute the plotted `(x, y)` pixel coordinates for each point within a
+/// `w × h` viewBox, inset by `pad` on every edge.
+///
+/// The `usize`→`f64` index casts are exact for any realistic point count, and
+/// the geometry reads clearer as `base + frac * span` than as `mul_add`.
+#[cfg(feature = "maud")]
+#[allow(clippy::cast_precision_loss, clippy::suboptimal_flops)]
+fn chart_coords(
+    points: &[(&str, f64)],
+    width: f64,
+    height: f64,
+    pad: f64,
+    min: f64,
+    max: f64,
+) -> Vec<(f64, f64)> {
+    let n = points.len();
+    let usable_w = width - 2.0 * pad;
+    let usable_h = height - 2.0 * pad;
+    points
+        .iter()
+        .enumerate()
+        .map(|(i, (_, value))| {
+            let x = if n <= 1 {
+                width / 2.0
+            } else {
+                pad + (i as f64 / (n - 1) as f64) * usable_w
+            };
+            let frac = norm_frac(*value, min, max);
+            let y = pad + (1.0 - frac) * usable_h;
+            (x, y)
+        })
+        .collect()
+}
+
+/// The default accessible name / `<title>` per chart kind.
+#[cfg(feature = "maud")]
+fn chart_default_title(kind: &str) -> &'static str {
+    match kind {
+        "bar" => "Bar chart",
+        "line" => "Line chart",
+        _ => "Sparkline",
+    }
+}
+
+/// Build the SVG `<desc>` text: caller override, else a generated one-line
+/// summary (or `"No data"` for an empty series).
+#[cfg(feature = "maud")]
+fn chart_desc(points: &[(&str, f64)], config: &ChartConfig<'_>) -> String {
+    if let Some(desc) = config.desc {
+        return desc.to_string();
+    }
+    if points.is_empty() {
+        return "No data".to_string();
+    }
+    let (min, max) = resolve_bounds(points, config);
+    format!(
+        "{} data points, ranging from {} to {}.",
+        points.len(),
+        fmt_value(min),
+        fmt_value(max)
+    )
+}
+
+/// The visually-hidden `(label, value)` table fallback (AC #5).
+#[cfg(feature = "maud")]
+fn chart_table(points: &[(&str, f64)]) -> maud::Markup {
+    maud::html! {
+        table class="autumn-chart__table autumn-visually-hidden" {
+            thead { tr { th { "Label" } th { "Value" } } }
+            tbody {
+                @for (label, value) in points {
+                    tr {
+                        td { (label) }
+                        td { (fmt_value(*value)) }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Wrap chart `body` in the accessible `autumn-chart` root: a `<div>` carrying
+/// the kind modifier and merged class, an `<svg role="img">` whose first
+/// children are `<title>`/`<desc>`, and an optional table fallback.
+#[cfg(feature = "maud")]
+fn chart_root(
+    kind: &str,
+    view_box: &str,
+    points: &[(&str, f64)],
+    config: &ChartConfig<'_>,
+    body: &maud::Markup,
+) -> maud::Markup {
+    let root = merge_class(&format!("autumn-chart autumn-chart--{kind}"), config.class);
+    let label = config.title.unwrap_or_else(|| chart_default_title(kind));
+    let desc = chart_desc(points, config);
+    maud::html! {
+        div class=(root) {
+            svg class="autumn-chart__svg" viewBox=(view_box)
+                preserveAspectRatio="none" role="img" aria-label=(label)
+                focusable="false" {
+                title { (label) }
+                desc { (desc) }
+                (body)
+            }
+            @if config.table_fallback {
+                (chart_table(points))
+            }
+        }
+    }
+}
+
+/// Render a compact, single-series **sparkline** as inline SVG — a small trend
+/// line with no axes, ideal inline with text or inside a table cell.
+///
+/// Shorthand for [`sparkline_with`] with a default [`ChartConfig`]. See that
+/// function for axis overrides, an accessible name, and the table fallback.
+///
+/// # Example
+///
+/// ```rust
+/// use autumn_web::widgets::sparkline;
+///
+/// let html = sparkline(&[("Mon", 3.0), ("Tue", 5.0), ("Wed", 4.0)]).into_string();
+/// assert!(html.contains(r#"role="img""#));
+/// assert!(html.contains("autumn-chart--sparkline"));
+/// assert!(!html.contains("<script"));
+/// assert!(!html.contains("style="));
+/// ```
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn sparkline(points: &[(&str, f64)]) -> maud::Markup {
+    sparkline_with(points, &ChartConfig::default())
+}
+
+/// Render a sparkline with a [`ChartConfig`] (axis override, accessible name,
+/// table fallback). See [`sparkline`] for the common case.
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn sparkline_with(points: &[(&str, f64)], config: &ChartConfig<'_>) -> maud::Markup {
+    const W: f64 = 100.0;
+    const H: f64 = 30.0;
+    const PAD: f64 = 2.0;
+    let (min, max) = resolve_bounds(points, config);
+    let coords = chart_coords(points, W, H, PAD, min, max);
+    let body = maud::html! {
+        @if coords.len() == 1 {
+            circle class="autumn-chart__point" cx=(fmt_coord(coords[0].0))
+                cy=(fmt_coord(coords[0].1)) r="1.5" {}
+        } @else if coords.len() > 1 {
+            polyline class="autumn-chart__line" points=(polyline_points(&coords)) {}
+        }
+    };
+    chart_root("sparkline", "0 0 100 30", points, config, &body)
+}
+
+/// Join plotted coordinates into an SVG `points` attribute value
+/// (`"x1,y1 x2,y2 …"`). Built as a `String` so raw `f64` values are never
+/// interpolated directly into markup.
+#[cfg(feature = "maud")]
+fn polyline_points(coords: &[(f64, f64)]) -> String {
+    let mut s = String::new();
+    for (i, (x, y)) in coords.iter().enumerate() {
+        if i > 0 {
+            s.push(' ');
+        }
+        s.push_str(&fmt_coord(*x));
+        s.push(',');
+        s.push_str(&fmt_coord(*y));
+    }
+    s
+}
+
+/// Render a single-series **bar chart** as inline SVG.
+///
+/// Shorthand for [`bar_chart_with`] with a default [`ChartConfig`]. Each
+/// `(label, value)` becomes one `<rect>`; bar heights auto-scale from the data
+/// unless overridden via [`ChartConfig::min`] / [`ChartConfig::max`].
+///
+/// # Example
+///
+/// ```rust
+/// use autumn_web::widgets::bar_chart;
+///
+/// let html = bar_chart(&[("Q1", 12.0), ("Q2", 19.0), ("Q3", 7.0)]).into_string();
+/// assert!(html.contains("autumn-chart--bar"));
+/// assert!(html.contains("<rect"));
+/// assert!(!html.contains("style="));
+/// ```
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn bar_chart(series: &[(&str, f64)]) -> maud::Markup {
+    bar_chart_with(series, &ChartConfig::default())
+}
+
+/// Render a bar chart with a [`ChartConfig`]. See [`bar_chart`] for the common
+/// case.
+#[cfg(feature = "maud")]
+#[must_use]
+#[allow(clippy::cast_precision_loss, clippy::suboptimal_flops)]
+pub fn bar_chart_with(series: &[(&str, f64)], config: &ChartConfig<'_>) -> maud::Markup {
+    const W: f64 = 100.0;
+    const H: f64 = 40.0;
+    const PAD: f64 = 2.0;
+    let (min, max) = resolve_bounds(series, config);
+    let usable_h = H - 2.0 * PAD;
+    let n = series.len();
+    let body = maud::html! {
+        @if n > 0 {
+            @let slot = (W - 2.0 * PAD) / n as f64;
+            @let bar_w = slot * 0.7;
+            @for (i, (_, v)) in series.iter().enumerate() {
+                @let frac = norm_frac(*v, min, max);
+                @let bar_h = frac * usable_h;
+                @let x = PAD + i as f64 * slot + (slot - bar_w) / 2.0;
+                @let y = H - PAD - bar_h;
+                rect class="autumn-chart__bar" x=(fmt_coord(x)) y=(fmt_coord(y))
+                    width=(fmt_coord(bar_w)) height=(fmt_coord(bar_h)) {}
+            }
+        }
+    };
+    chart_root("bar", "0 0 100 40", series, config, &body)
+}
+
+/// Render a single-series **line chart** as inline SVG — a trend line with a
+/// marker at each data point.
+///
+/// Shorthand for [`line_chart_with`] with a default [`ChartConfig`]. The axis
+/// auto-scales from the data unless overridden.
+///
+/// # Example
+///
+/// A 30-point trend series (e.g. daily signups), rendered to accessible,
+/// script-free inline SVG:
+///
+/// ```rust
+/// use autumn_web::widgets::line_chart;
+///
+/// // Build 30 points with a loop — a smooth demo trend.
+/// let owned: Vec<(String, f64)> = (0..30)
+///     .map(|day| {
+///         let label = format!("Day {}", day + 1);
+///         let value = (day as f64 * 0.4).sin() * 10.0 + 20.0;
+///         (label, value)
+///     })
+///     .collect();
+/// let points: Vec<(&str, f64)> = owned.iter().map(|(l, v)| (l.as_str(), *v)).collect();
+///
+/// let html = line_chart(&points).into_string();
+/// assert!(html.contains(r#"role="img""#));
+/// assert!(html.contains("autumn-chart--line"));
+/// assert!(html.contains("<polyline"));
+/// // Pure inline SVG: no scripts, no inline styles, no external assets.
+/// assert!(!html.contains("<script"));
+/// assert!(!html.contains("style="));
+/// ```
+///
+/// ## Pairing with a grouped-aggregate query
+///
+/// Map the `Vec<(K, V)>` a repository grouped-aggregate returns into
+/// `(&str, f64)` chart points. `count_*` yields `i64`; `sum_*`/`avg_*` yield an
+/// `Option`, so coalesce with `.unwrap_or(0)` before converting:
+///
+/// ```rust,ignore
+/// use autumn_web::aggregate::DateBucket;
+/// use autumn_web::widgets::line_chart;
+///
+/// // A day-bucketed signup time series.
+/// let per_day: Vec<(chrono::NaiveDateTime, i64)> = repo
+///     .count_grouped_by_created_at()
+///     .bucket(DateBucket::Day)
+///     .filter_range(window_start, window_end)
+///     .load()
+///     .await?;
+///
+/// let labels: Vec<String> =
+///     per_day.iter().map(|(day, _)| day.format("%b %d").to_string()).collect();
+/// let points: Vec<(&str, f64)> = per_day
+///     .iter()
+///     .zip(&labels)
+///     .map(|((_, count), label)| (label.as_str(), *count as f64))
+///     .collect();
+/// let svg = line_chart(&points).into_string();
+///
+/// // For a nullable aggregate (sum/avg), coalesce the Option first:
+/// // let revenue: Vec<(chrono::NaiveDateTime, Option<i64>)> = ...;
+/// // let v = *value; let point = v.unwrap_or(0) as f64;
+/// ```
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn line_chart(series: &[(&str, f64)]) -> maud::Markup {
+    line_chart_with(series, &ChartConfig::default())
+}
+
+/// Render a line chart with a [`ChartConfig`]. See [`line_chart`] for the
+/// common case.
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn line_chart_with(series: &[(&str, f64)], config: &ChartConfig<'_>) -> maud::Markup {
+    const W: f64 = 100.0;
+    const H: f64 = 40.0;
+    const PAD: f64 = 3.0;
+    let (min, max) = resolve_bounds(series, config);
+    let coords = chart_coords(series, W, H, PAD, min, max);
+    let body = maud::html! {
+        @if coords.len() > 1 {
+            polyline class="autumn-chart__line" points=(polyline_points(&coords)) {}
+        }
+        @for (x, y) in &coords {
+            circle class="autumn-chart__point" cx=(fmt_coord(*x)) cy=(fmt_coord(*y)) r="1.5" {}
+        }
+    };
+    chart_root("line", "0 0 100 40", series, config, &body)
+}
+
 // ── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(all(test, feature = "maud"))]
@@ -5550,5 +6007,169 @@ mod tests {
     #[test]
     fn cta_style_default_is_primary() {
         assert_eq!(CtaStyle::default(), CtaStyle::Primary);
+    }
+
+    // ── charts (#1231) ─────────────────────────────────────────────────
+
+    #[test]
+    fn sparkline_is_accessible_inline_svg() {
+        let html = sparkline(&[("a", 1.0), ("b", 2.0), ("c", 1.5)]).into_string();
+        assert!(html.contains(r#"role="img""#), "{html}");
+        assert!(
+            html.contains("autumn-chart autumn-chart--sparkline"),
+            "{html}"
+        );
+        assert!(html.contains("autumn-chart__svg"), "{html}");
+        assert!(html.contains("<polyline"), "{html}");
+        assert!(html.contains("<title>Sparkline</title>"), "{html}");
+        assert!(html.contains("<desc>"), "{html}");
+    }
+
+    #[test]
+    fn bar_chart_emits_a_rect_per_datum() {
+        let html = bar_chart(&[("Q1", 3.0), ("Q2", 5.0), ("Q3", 4.0)]).into_string();
+        assert_eq!(html.matches("<rect").count(), 3, "{html}");
+        assert!(html.contains("autumn-chart--bar"), "{html}");
+        assert!(html.contains("autumn-chart__bar"), "{html}");
+    }
+
+    #[test]
+    fn line_chart_emits_polyline_and_points() {
+        let html = line_chart(&[("a", 1.0), ("b", 9.0), ("c", 4.0)]).into_string();
+        assert!(html.contains("autumn-chart--line"), "{html}");
+        assert!(html.contains("<polyline"), "{html}");
+        assert_eq!(html.matches("<circle").count(), 3, "{html}");
+    }
+
+    #[test]
+    fn charts_never_emit_script_or_inline_style() {
+        for html in [
+            sparkline(&[("a", 1.0), ("b", 2.0)]).into_string(),
+            bar_chart(&[("a", 1.0), ("b", 2.0)]).into_string(),
+            line_chart(&[("a", 1.0), ("b", 2.0)]).into_string(),
+        ] {
+            assert!(!html.contains("<script"), "no scripts: {html}");
+            assert!(!html.contains("style="), "no inline style: {html}");
+            assert!(!html.contains("http://"), "no external assets: {html}");
+        }
+    }
+
+    #[test]
+    fn chart_escapes_hostile_labels_in_table_fallback() {
+        let html = bar_chart_with(
+            &[("<script>alert(1)</script>", 5.0)],
+            &ChartConfig::new().with_table(),
+        )
+        .into_string();
+        assert!(html.contains("&lt;script&gt;"), "{html}");
+        assert!(!html.contains("<script>alert"), "{html}");
+    }
+
+    #[test]
+    fn empty_input_renders_valid_svg_without_panic() {
+        for html in [
+            sparkline(&[]).into_string(),
+            bar_chart(&[]).into_string(),
+            line_chart(&[]).into_string(),
+        ] {
+            assert!(html.contains(r#"role="img""#), "{html}");
+            assert!(html.contains("<desc>No data</desc>"), "{html}");
+            assert!(!html.contains("NaN"), "no NaN coordinates: {html}");
+            assert!(!html.contains("<script"), "{html}");
+        }
+    }
+
+    #[test]
+    fn single_point_does_not_divide_by_zero() {
+        let html = sparkline(&[("only", 7.0)]).into_string();
+        assert!(
+            html.contains("<circle"),
+            "single point renders a dot: {html}"
+        );
+        assert!(!html.contains("NaN"), "{html}");
+        // Centered horizontally, mid-height (span is zero).
+        assert!(html.contains(r#"cx="50""#), "{html}");
+    }
+
+    #[test]
+    fn all_equal_values_place_bars_at_mid_height() {
+        let html = bar_chart(&[("a", 4.0), ("b", 4.0), ("c", 4.0)]).into_string();
+        assert!(!html.contains("NaN"), "{html}");
+        // span == 0 → every bar is half the usable height (18 * 0.5 = 9).
+        assert_eq!(html.matches(r#"height="18""#).count(), 3, "{html}");
+    }
+
+    #[test]
+    fn negative_values_scale_without_panic() {
+        let html = line_chart(&[("a", -5.0), ("b", 0.0), ("c", 5.0)]).into_string();
+        assert!(!html.contains("NaN"), "{html}");
+        assert!(html.contains("<polyline"), "{html}");
+        // Min (-5) sits at the bottom, max (5) at the top of the inset area.
+        assert!(html.contains(r#"points="3,37"#), "min at bottom: {html}");
+    }
+
+    #[test]
+    fn explicit_axis_override_changes_coordinates() {
+        let data = [("a", 0.0), ("b", 5.0), ("c", 10.0)];
+        let auto = sparkline(&data).into_string();
+        let overridden =
+            sparkline_with(&data, &ChartConfig::new().min(0.0).max(100.0)).into_string();
+        assert_ne!(
+            auto, overridden,
+            "caller min/max override must move the plotted points"
+        );
+        // Under the 0..100 override the points compress toward the baseline
+        // (the auto-scaled chart puts the middle datum at y=15 instead).
+        assert!(overridden.contains("50,26.7"), "{overridden}");
+        assert!(auto.contains("50,15"), "{auto}");
+    }
+
+    #[test]
+    fn table_fallback_lists_labels_and_values() {
+        let html = line_chart_with(
+            &[("Mon", 3.0), ("Tue", 5.5)],
+            &ChartConfig::new().with_table(),
+        )
+        .into_string();
+        assert!(html.contains("autumn-chart__table"), "{html}");
+        assert!(html.contains("autumn-visually-hidden"), "{html}");
+        assert!(html.contains("<td>Mon</td>"), "{html}");
+        assert!(html.contains("<td>5.5</td>"), "{html}");
+    }
+
+    #[test]
+    fn config_title_and_desc_feed_accessibility() {
+        let html = sparkline_with(
+            &[("a", 1.0), ("b", 2.0)],
+            &ChartConfig::new()
+                .title("Weekly signups")
+                .desc("Signups per day for the last week"),
+        )
+        .into_string();
+        assert!(html.contains(r#"aria-label="Weekly signups""#), "{html}");
+        assert!(html.contains("<title>Weekly signups</title>"), "{html}");
+        assert!(
+            html.contains("<desc>Signups per day for the last week</desc>"),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn config_class_is_merged_onto_root() {
+        let html = bar_chart_with(&[("a", 1.0)], &ChartConfig::new().class("dashboard-widget"))
+            .into_string();
+        assert!(
+            html.contains("autumn-chart autumn-chart--bar dashboard-widget"),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn fmt_coord_trims_trailing_zeros() {
+        assert_eq!(fmt_coord(10.0), "10");
+        assert_eq!(fmt_coord(0.5), "0.5");
+        assert_eq!(fmt_coord(0.0), "0");
+        assert_eq!(fmt_coord(-0.0), "0");
+        assert_eq!(fmt_coord(1.2345), "1.234");
     }
 }
