@@ -2682,16 +2682,21 @@ pub fn confirm_action(
 // ── tabs ─────────────────────────────────────────────────────────────────
 
 /// Render a no-JavaScript tabs widget: a `tablist` strip plus its panels,
-/// from an ordered list of `(id, label, panel_body)` tuples.
+/// from an ordered list of `(id, label, panel_body)` tuples plus the id of
+/// the tab that should be active by default.
+///
+/// `active_id` selects the default-active tab/panel: `Some(panel_id)` that
+/// matches one of the panels makes that panel default-active; `None` (or an
+/// id that matches no panel) falls back to the first panel.
 ///
 /// Switching is pure CSS: each tab is an `<a href="#panel-id">` and each
 /// panel is targeted by `:target` in `input.css`, so URL fragments
-/// (`/settings#security`) select a tab with zero JavaScript. The first
-/// panel additionally carries `autumn-tabs__panel--active` so a panel is
-/// always visible even when no fragment is present, and the active-tab
-/// highlight tracks the actually-`:target`ed panel by position for up to
-/// the first 6 tabs (see `input.css` — ids are arbitrary caller strings, so
-/// this can only be done positionally in a shared stylesheet).
+/// (`/settings#security`) select a tab with zero JavaScript. The
+/// default-active panel additionally carries `autumn-tabs__panel--active` so
+/// a panel is always visible even when no fragment is present, and the
+/// active-tab highlight tracks the actually-`:target`ed panel by position for
+/// up to the first 6 tabs (see `input.css` — ids are arbitrary caller
+/// strings, so this can only be done positionally in a shared stylesheet).
 ///
 /// # CSS hooks
 ///
@@ -2711,8 +2716,9 @@ pub fn confirm_action(
 /// panel carries `role="tabpanel"`, `aria-labelledby` pointing at its tab's
 /// `id`, and `tabindex="0"` so it can receive keyboard focus directly.
 ///
-/// `aria-selected` reflects the *server's default selection* (the first
-/// tab) only. The server never sees the URL fragment (fragments aren't
+/// `aria-selected` reflects the *server's default selection* (the
+/// `active_id` tab, or the first tab) only. The server never sees the URL
+/// fragment (fragments aren't
 /// sent in HTTP requests), so it cannot know which tab a client-side
 /// `:target` navigation actually landed on — correcting `aria-selected` on
 /// navigation would require JavaScript, which this widget deliberately has
@@ -2761,28 +2767,44 @@ pub fn confirm_action(
 ///     ("security", "Security", html! { p { "Security settings" } }),
 ///     ("billing", "Billing", html! { p { "Billing settings" } }),
 /// ];
-/// let widget = tabs("settings-tabs", &panels).into_string();
+/// // Open on the "security" tab by default; pass `None` to default to the first.
+/// let widget = tabs("settings-tabs", Some("security"), &panels).into_string();
 /// assert!(widget.contains(r#"role="tablist""#));
 /// assert!(widget.contains(r#"aria-controls="security""#));
 /// assert!(widget.contains(r##"href="#billing""##));
 /// ```
 #[cfg(feature = "maud")]
 #[must_use]
-pub fn tabs(id: &str, panels: &[(&str, &str, maud::Markup)]) -> maud::Markup {
+pub fn tabs(
+    id: &str,
+    active_id: Option<&str>,
+    panels: &[(&str, &str, maud::Markup)],
+) -> maud::Markup {
     let tab_ids: Vec<String> = panels
         .iter()
         .map(|(panel_id, _, _)| format!("{id}-tab-{panel_id}"))
         .collect();
+    // Which panel is default-active. `Some(id)` that matches a panel selects
+    // it; `None` or an unknown id falls back to the first panel (the historic
+    // behavior). The chosen index only sets the server's *default* selection —
+    // `:target` deep-linking still overrides it in pure CSS.
+    let active_index = active_id
+        .and_then(|target| {
+            panels
+                .iter()
+                .position(|(panel_id, _, _)| *panel_id == target)
+        })
+        .unwrap_or(0);
     maud::html! {
         div id=(id) class="autumn-tabs" {
             div class="autumn-tabs__list" role="tablist" {
                 @for (i, (panel_id, label, _)) in panels.iter().enumerate() {
                     @let tab_class = merge_class(
                         "autumn-tabs__tab",
-                        (i == 0).then_some("autumn-tabs__tab--active"),
+                        (i == active_index).then_some("autumn-tabs__tab--active"),
                     );
                     a id=(tab_ids[i]) class=(tab_class) role="tab" href=(format!("#{panel_id}"))
-                        aria-controls=(panel_id) aria-selected=(if i == 0 { "true" } else { "false" }) {
+                        aria-controls=(panel_id) aria-selected=(if i == active_index { "true" } else { "false" }) {
                         (label)
                     }
                 }
@@ -2790,7 +2812,7 @@ pub fn tabs(id: &str, panels: &[(&str, &str, maud::Markup)]) -> maud::Markup {
             @for (i, (panel_id, _, body)) in panels.iter().enumerate() {
                 @let panel_class = merge_class(
                     "autumn-tabs__panel",
-                    (i == 0).then_some("autumn-tabs__panel--active"),
+                    (i == active_index).then_some("autumn-tabs__panel--active"),
                 );
                 section id=(panel_id) class=(panel_class) role="tabpanel"
                     aria-labelledby=(tab_ids[i]) tabindex="0" {
