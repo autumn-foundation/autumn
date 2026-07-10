@@ -185,12 +185,130 @@ pub async fn capture_matched_path_middleware(
     response
 }
 
+/// Compile-error overlay helpers, injected into [`live_reload_script_body`].
+///
+/// Kept as a standalone (non-`format!`) raw string so its many braces need no
+/// escaping. It renders arbitrary compiler output exclusively via `textContent`
+/// on `<pre>`/`<code>`/`<div>` nodes — never `innerHTML` — so it is XSS-safe and
+/// needs no inline scripting (CSP `script-src 'self'` compliant).
+///
+/// All styling is applied through individual CSSOM property assignments
+/// (`element.style.<prop> = value`) rather than literal `style` attributes.
+/// Styles set via the CSSOM are NOT governed by the CSP `style-src` directive
+/// (only literal `style` attributes, `<style>` blocks, and external stylesheets
+/// are), so the overlay renders correctly even under a strict nonce-based
+/// `style-src 'self' 'nonce-...'` policy — e.g. when a dev app enables
+/// `security.headers.csp_nonce`.
+const BUILD_ERROR_OVERLAY_JS: &str = r##"
+  const OVERLAY_ID = "__autumn_build_error";
+
+  function removeBuildErrorOverlay() {
+    const existing = document.getElementById(OVERLAY_ID);
+    if (existing) {
+      existing.remove();
+    }
+  }
+
+  function renderBuildErrorOverlay(buildError) {
+    if (!document.body) {
+      return;
+    }
+    let overlay = document.getElementById(OVERLAY_ID);
+    if (!overlay) {
+      overlay = document.createElement("div");
+      overlay.id = OVERLAY_ID;
+      overlay.style.position = "fixed";
+      overlay.style.top = "0";
+      overlay.style.right = "0";
+      overlay.style.bottom = "0";
+      overlay.style.left = "0";
+      overlay.style.zIndex = "2147483647";
+      overlay.style.overflow = "auto";
+      overlay.style.background = "rgba(12,12,16,0.97)";
+      overlay.style.color = "#f5f5f5";
+      overlay.style.fontFamily =
+        "ui-monospace,SFMono-Regular,Menlo,Consolas,monospace";
+      overlay.style.padding = "32px";
+      overlay.style.boxSizing = "border-box";
+      document.body.appendChild(overlay);
+    }
+    while (overlay.firstChild) {
+      overlay.removeChild(overlay.firstChild);
+    }
+
+    const panel = document.createElement("div");
+    panel.style.maxWidth = "960px";
+    panel.style.margin = "0 auto";
+
+    const banner = document.createElement("div");
+    banner.style.borderLeft = "4px solid #ff5f56";
+    banner.style.background = "#2a1416";
+    banner.style.color = "#ffb3ad";
+    banner.style.padding = "14px 18px";
+    banner.style.borderRadius = "6px";
+    banner.style.marginBottom = "20px";
+    banner.style.fontSize = "15px";
+    banner.style.fontWeight = "600";
+    banner.textContent = buildError.stale
+      ? "Build failed — you're viewing a stale page. Fix the errors below and save."
+      : "Build failed. Fix the errors below and save.";
+    panel.appendChild(banner);
+
+    const diagnostics = Array.isArray(buildError.diagnostics)
+      ? buildError.diagnostics
+      : [];
+    diagnostics.forEach((diag) => {
+      const item = document.createElement("div");
+      item.style.background = "#1a1a20";
+      item.style.border = "1px solid #33333c";
+      item.style.borderRadius = "6px";
+      item.style.padding = "16px 18px";
+      item.style.marginBottom = "16px";
+
+      const heading = document.createElement("div");
+      heading.style.color = "#ff8a80";
+      heading.style.fontSize = "14px";
+      heading.style.fontWeight = "700";
+      heading.style.marginBottom = "6px";
+      const codePrefix = diag.code ? "[" + diag.code + "] " : "";
+      heading.textContent = codePrefix + (diag.message || "");
+      item.appendChild(heading);
+
+      if (diag.file) {
+        const loc = document.createElement("div");
+        loc.style.color = "#9aa0a6";
+        loc.style.fontSize = "12px";
+        loc.style.marginBottom = "10px";
+        loc.textContent = diag.file + ":" + diag.line + ":" + diag.column;
+        item.appendChild(loc);
+      }
+
+      const pre = document.createElement("pre");
+      pre.style.margin = "0";
+      pre.style.whiteSpace = "pre-wrap";
+      pre.style.wordBreak = "break-word";
+      pre.style.fontSize = "13px";
+      pre.style.lineHeight = "1.5";
+      pre.style.color = "#e8e8e8";
+      const code = document.createElement("code");
+      code.textContent = diag.rendered || "";
+      pre.appendChild(code);
+      item.appendChild(pre);
+
+      panel.appendChild(item);
+    });
+
+    overlay.appendChild(panel);
+  }
+"##;
+
 fn live_reload_script_body() -> String {
     format!(
         r#"(() => {{
   const endpoint = "{LIVE_RELOAD_PATH}";
   let version = null;
   let polling = false;
+{BUILD_ERROR_OVERLAY_JS}
 
   function refreshStylesheets(nextVersion) {{
     let refreshed = 0;
@@ -224,6 +342,41 @@ fn live_reload_script_body() -> String {
       }}
 
       const state = await response.json();
+
+      // A failed rebuild is surfaced as a `build_error` payload. Show the
+      // overlay and RETURN without reloading — the stale binary keeps serving
+      // this page so the developer keeps their scroll position and context.
+      // Track the version so the next (green) build, which bumps the version
+      // and drops `build_error`, triggers a real reload below.
+      if (state.build_error) {{
+        // Only (re)build the overlay DOM when the build-error content actually
+        // changes. `renderBuildErrorOverlay` tears down and recreates the whole
+        // overlay subtree, which resets scroll position and clears any
+        // in-progress text selection. Since we poll every 700ms, rebuilding on
+        // an unchanged version would make the errors impossible to read or copy
+        // once they scroll. The recorded version lives on the overlay element
+        // (`data-autumn-build-error-version`) and survives across polls.
+        const existingOverlay = document.getElementById(OVERLAY_ID);
+        if (
+          existingOverlay &&
+          existingOverlay.dataset.autumnBuildErrorVersion === String(state.version)
+        ) {{
+          version = state.version;
+          return;
+        }}
+        renderBuildErrorOverlay(state.build_error);
+        const overlay = document.getElementById(OVERLAY_ID);
+        if (overlay) {{
+          overlay.dataset.autumnBuildErrorVersion = String(state.version);
+        }}
+        version = state.version;
+        return;
+      }}
+      // No build error: dismiss any overlay left over from a prior failure,
+      // then fall through to the normal version-change reload path so the
+      // recovered build reloads the page.
+      removeBuildErrorOverlay();
+
       if (version === null) {{
         version = state.version;
         return;
@@ -588,6 +741,137 @@ mod tests {
         // Assert valid JSON string containing expected structure
         assert!(body_str.contains(r#""version""#));
         assert!(body_str.contains(r#""kind""#));
+    }
+
+    #[tokio::test]
+    async fn live_reload_state_handler_passes_build_error_through() {
+        // The state file may now carry a `build_error` object (written by the
+        // CLI on a failed rebuild). The handler must return it verbatim so the
+        // browser client can render the compile-error overlay.
+        let tmp_file = tempfile::NamedTempFile::new().expect("failed to create temp file");
+        let content = r#"{"version":7,"kind":"full","build_error":{"stale":true,"diagnostics":[{"code":"E0425","message":"boom","file":"src/main.rs","line":3,"column":5,"rendered":"error[E0425]: boom"}]}}"#;
+        std::fs::write(tmp_file.path(), content).expect("failed to write to temp file");
+
+        temp_env::async_with_vars(
+            [
+                (DEV_RELOAD_ENV, Some("1")),
+                (
+                    DEV_RELOAD_STATE_ENV,
+                    Some(tmp_file.path().to_str().unwrap()),
+                ),
+            ],
+            async {
+                let response = super::live_reload_state_handler().await.into_response();
+                assert_eq!(response.status(), axum::http::StatusCode::OK);
+
+                let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                let body_str = std::str::from_utf8(&body_bytes).unwrap();
+
+                assert_eq!(body_str, content, "build_error must pass through verbatim");
+            },
+        )
+        .await;
+    }
+
+    #[test]
+    fn live_reload_script_body_renders_build_error_overlay_safely() {
+        // The polling client must render a compile-error overlay when the state
+        // carries a `build_error`, escaping arbitrary compiler output via
+        // `textContent` (never `innerHTML`) to stay XSS-safe and CSP-clean.
+        let js = live_reload_script_body();
+
+        assert!(
+            js.contains("__autumn_build_error"),
+            "overlay element id missing"
+        );
+        assert!(js.contains("build_error"), "build_error handling missing");
+        assert!(
+            js.contains("textContent"),
+            "diagnostics must be set via textContent"
+        );
+        assert!(
+            !js.contains("innerHTML"),
+            "diagnostics must not be rendered via innerHTML"
+        );
+
+        // CSP-safety: the overlay must style elements via CSSOM per-property
+        // assignments (`element.style.<prop> = value`), which are NOT governed
+        // by the CSP `style-src` directive. Literal `style` attributes,
+        // `cssText`, and `setAttribute("style", ...)` ARE blocked under a
+        // strict nonce-based `style-src 'self' 'nonce-...'` policy, so none of
+        // those may appear or the overlay renders unstyled on apps that enable
+        // `security.headers.csp_nonce`.
+        assert!(
+            !js.contains(r#"setAttribute("style""#),
+            "overlay must not set styles via a literal style attribute"
+        );
+        assert!(
+            !js.contains(".cssText"),
+            "overlay must not set styles via cssText"
+        );
+        assert!(
+            !js.contains(" style="),
+            "overlay markup must not contain an inline style= attribute"
+        );
+        assert!(
+            js.contains(".style."),
+            "overlay must apply styling via CSSOM .style.<prop> assignments"
+        );
+    }
+
+    #[test]
+    fn live_reload_script_body_guards_overlay_rebuild_by_version() {
+        // The overlay must only be rebuilt when the build-error content changes.
+        // Because `renderBuildErrorOverlay` tears down and recreates the overlay
+        // DOM (resetting scroll position and clearing text selection) and the
+        // client polls every 700ms, an unchanged `state.version` must NOT
+        // trigger a rebuild — otherwise a developer can never read or copy a
+        // scrolling error list. The guard records the rendered version on the
+        // overlay element and compares it against `state.version` before
+        // re-rendering.
+        let js = live_reload_script_body();
+
+        // The rendered version is recorded on the overlay element's dataset so
+        // it survives across polls.
+        assert!(
+            js.contains("dataset.autumnBuildErrorVersion"),
+            "overlay must record the rendered build-error version on its dataset"
+        );
+        // The build_error branch compares the recorded version against the
+        // freshly polled `state.version` before rebuilding.
+        assert!(
+            js.contains(
+                "existingOverlay.dataset.autumnBuildErrorVersion === String(state.version)"
+            ),
+            "overlay rebuild must be guarded by a version comparison"
+        );
+        // renderBuildErrorOverlay is still reachable for the first appearance
+        // and for genuinely new (version-bumped) failed builds.
+        assert!(
+            js.contains("renderBuildErrorOverlay(state.build_error)"),
+            "overlay must still render on first appearance / new build"
+        );
+    }
+
+    #[test]
+    fn build_error_overlay_is_gated_behind_dev_env() {
+        // The live-reload client (and thus the compile-error overlay) is only
+        // mounted when BOTH dev-reload env vars are present. Without them the
+        // middleware is disabled and nothing is served.
+        assert!(!is_enabled_with_env(&MockEnv::new()));
+        assert!(!is_enabled_with_env(
+            &MockEnv::new().with(DEV_RELOAD_ENV, "1")
+        ));
+
+        let enabled = MockEnv::new()
+            .with(DEV_RELOAD_ENV, "1")
+            .with(DEV_RELOAD_STATE_ENV, "state.json");
+        assert!(is_enabled_with_env(&enabled));
+
+        // When enabled, the served client carries the overlay logic.
+        assert!(live_reload_script_body().contains("__autumn_build_error"));
     }
 
     #[tokio::test]
