@@ -3330,6 +3330,7 @@ version = "0.1.0"
 dependencies = [
  "autumn-web",
  "example-e2e",
+ "maud",
  "tokio",
 ]
 

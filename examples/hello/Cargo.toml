@@ -6,6 +6,9 @@ publish = false
 
 [dependencies]
 autumn-web = { path = "../../autumn" }
+# The maud `html!` macro expands to `::maud::` paths, so any crate that calls it
+# needs `maud` as a direct dependency (used by the /flock WASM-island page).
+maud = { version = "0.27", features = ["axum"] }
 
 [dev-dependencies]
 example-e2e = { path = "../../example-e2e" }

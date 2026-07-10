@@ -1,0 +1,55 @@
+# Yew CSR "island" for the `hello` example — SPIKE (see docs/guide/wasm-islands.md).
+#
+# This crate ONLY builds for `wasm32-unknown-unknown`. It links `yew` (virtual
+# DOM) and cannot compile for the host target, so it is:
+#   * its OWN workspace root (the `[workspace]` table below), and
+#   * listed under `[workspace] exclude` in the repo-root Cargo.toml,
+# which together keep `cargo build/clippy --workspace` from ever building it
+# natively. It is intentionally NOT a workspace member.
+[workspace]
+
+[package]
+name = "autumn-island-flock"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "Yew CSR 'literary boids' island: flocking glyph-agents eat Autumn's own source (spike)"
+
+[lib]
+# cdylib: the `.wasm` artifact wasm-bindgen post-processes into an ES module.
+# rlib:   lets the crate be unit-tested / depended on as a normal library.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# CSR only — no `ssr` / `hydration`. Pure client-side mount into an existing
+# DOM element, which is all the island architecture needs.
+yew = { version = "0.21", default-features = false, features = ["csr"] }
+wasm-bindgen = "0.2"
+# js-sys: Math::random() drives all the simulation's stochasticity (no `rand`).
+js-sys = "0.3"
+# gloo-render: a thin, leak-free wrapper over requestAnimationFrame whose
+# `AnimationFrame` handle cancels the callback on drop — cleaner than hand-rolling
+# a self-rescheduling `Closure`.
+gloo-render = "0.2"
+
+[dependencies.web-sys]
+version = "0.3"
+# 2D canvas text animation: resolve the <canvas>, grab its 2D context, and draw
+# per-frame with fill_text / fill_rect. Window/Document/Element/HtmlElement round
+# out DOM access from the mount entry point.
+features = [
+    "Window",
+    "Document",
+    "Element",
+    "HtmlElement",
+    "HtmlCanvasElement",
+    "CanvasRenderingContext2d",
+]
+
+# Small release artifact: strip + size-optimize before wasm-opt.
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

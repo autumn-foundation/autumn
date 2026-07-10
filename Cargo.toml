@@ -4,7 +4,13 @@ members = ["autumn", "autumn-macros", "autumn-cli", "autumn-admin-plugin", "autu
 # `autumn` in as a path dependency. Excluding it keeps `cargo build/test
 # --workspace` (and the publish gate) untouched; `fuzz/Cargo.toml` is also its
 # own workspace root. It is intentionally NOT a member.
-exclude = ["fuzz"]
+#
+# `examples/island-flock` is a Yew CSR "island" SPIKE that ONLY builds
+# for wasm32-unknown-unknown (it links `yew` and cannot compile for the host
+# target). Excluding it keeps `cargo build/clippy --workspace` from ever
+# building it natively; it is its own workspace root too. Build it via
+# `examples/island-flock/build-island.sh`. See docs/guide/wasm-islands.md.
+exclude = ["fuzz", "examples/island-flock"]
 resolver = "3"
 
 # `cargo test --workspace` builds every example, plugin, integration test, and
