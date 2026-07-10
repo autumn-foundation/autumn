@@ -3660,6 +3660,7 @@ impl AutumnConfig {
             "AUTUMN_MAIL__MOUNT_UNSUBSCRIBE_ENDPOINT",
             &mut self.mail.mount_unsubscribe_endpoint,
         );
+        parse_env_bool(env, "AUTUMN_MAIL__INLINE_CSS", &mut self.mail.inline_css);
         if let Ok(val) = env.var("AUTUMN_MAIL__FILE_DIR") {
             self.mail.file_dir = PathBuf::from(val);
         }
@@ -9144,6 +9145,33 @@ path = "/api-spec.json"
         assert!(
             !config.mail.allow_in_process_deliver_later_in_production,
             "flag should default to false when env var is not set"
+        );
+    }
+
+    #[cfg(feature = "mail")]
+    #[test]
+    fn mail_inline_css_is_overridable_via_env() {
+        let env = MockEnv::new().with("AUTUMN_MAIL__INLINE_CSS", "true");
+
+        let mut config = AutumnConfig::default();
+        config.apply_mail_env_overrides_with_env(&env);
+
+        assert!(
+            config.mail.inline_css,
+            "AUTUMN_MAIL__INLINE_CSS=true should enable inline_css"
+        );
+    }
+
+    #[cfg(feature = "mail")]
+    #[test]
+    fn mail_inline_css_defaults_false() {
+        let env = MockEnv::new();
+        let mut config = AutumnConfig::default();
+        config.apply_mail_env_overrides_with_env(&env);
+
+        assert!(
+            !config.mail.inline_css,
+            "inline_css should default to false when env var is not set"
         );
     }
 
