@@ -964,11 +964,13 @@ pub fn remove_main_mod_declarations(existing: &str, names: &[&str]) -> String {
 ///
 /// Idempotent: a declaration already present (in any `mod x;` / `pub mod x;`
 /// form, with or without a preceding `#[path]` attribute) is left untouched,
-/// so repeated `generate` runs converge. No destroy-time removal is needed:
-/// `autumn destroy` only ever strips lines from `src/models/mod.rs` and
-/// `src/schema.rs` (never deletes the files themselves), so these `#[path]`
-/// targets always exist and an emptied module simply contributes nothing to
-/// the registry — exactly the pre-scaffold behavior.
+/// so repeated `generate` runs converge. The inverse
+/// [`unlink_models_from_seed_bin`] removes these injected declarations at
+/// destroy time — necessary because `autumn destroy` **deletes**
+/// `src/models/mod.rs` / `src/schema.rs` once its `ModDecl`/`SchemaTable`
+/// reverts empty them (destroying the last model), which would otherwise leave
+/// `seed.rs`'s `#[path]` links dangling at missing files and break
+/// `cargo check --bins` / `autumn seed`.
 #[must_use]
 pub fn link_models_into_seed_bin(existing: &str) -> String {
     // (module name, full declaration incl. its `#[path]` attribute)
@@ -1017,6 +1019,61 @@ pub fn link_models_into_seed_bin(existing: &str) -> String {
     }
     if !existing.ends_with('\n') && out.ends_with('\n') {
         out.pop();
+    }
+    out
+}
+
+/// Remove the `#[path]`-qualified `mod schema;` / `mod models;` declarations
+/// that [`link_models_into_seed_bin`] injected into `src/bin/seed.rs`, the
+/// destroy-time inverse of that link (issue #1718 follow-up).
+///
+/// `autumn destroy` deletes `src/schema.rs` and `src/models/mod.rs` once the
+/// last model's `SchemaTable`/`ModDecl` reverts empty them, so the seed
+/// binary's `#[path = "../schema.rs"] mod schema;` /
+/// `#[path = "../models/mod.rs"] mod models;` links would then point at missing
+/// files and fail `cargo check --bins`. This strips exactly those two injected
+/// two-line blocks (attribute + `mod` declaration), matched on trimmed content
+/// so only this generator's own `#[path]`-qualified form is touched — a
+/// hand-written plain `mod schema;` without the injected attribute is left
+/// alone. Idempotent: a block already absent is a no-op. Blank lines left at
+/// the removal seam are collapsed so the reverted file stays tidy.
+///
+/// This is gated by [`Revert::SeedBinLinks`]'s `owner_dir` (`src/models`) so it
+/// only runs when the *last* model is destroyed — destroying one of several
+/// models leaves the links in place, matching the surviving `models/mod.rs`.
+#[must_use]
+pub fn unlink_models_from_seed_bin(existing: &str) -> String {
+    // (attribute line, declaration line) for each injected block.
+    let blocks: [[&str; 2]; 2] = [
+        ["#[path = \"../schema.rs\"]", "mod schema;"],
+        ["#[path = \"../models/mod.rs\"]", "mod models;"],
+    ];
+    let mut lines: Vec<String> = existing.lines().map(str::to_owned).collect();
+    for [attr, decl] in blocks {
+        let mut i = 0;
+        while i + 1 < lines.len() {
+            if lines[i].trim() == attr && lines[i + 1].trim() == decl {
+                lines.drain(i..i + 2);
+            } else {
+                i += 1;
+            }
+        }
+    }
+    // Collapse runs of blank lines (and drop a leading blank) left where the
+    // blocks were removed, so the reverted file matches its pre-link shape.
+    let mut out_lines: Vec<String> = Vec::with_capacity(lines.len());
+    let mut prev_blank = true; // seed `true` so a leading blank line is dropped
+    for line in lines {
+        let is_blank = line.trim().is_empty();
+        if is_blank && prev_blank {
+            continue;
+        }
+        prev_blank = is_blank;
+        out_lines.push(line);
+    }
+    let mut out = out_lines.join("\n");
+    if !out.is_empty() && existing.ends_with('\n') {
+        out.push('\n');
     }
     out
 }
@@ -5251,6 +5308,56 @@ mod models;
 use autumn_web::seed::SeedContext;
 ";
         assert_eq!(link_models_into_seed_bin(existing), existing);
+    }
+
+    #[test]
+    fn unlink_seed_bin_removes_the_injected_path_qualified_mods() {
+        // Destroy-time inverse: a linked seed binary loses both injected
+        // declarations (and their `#[path]` attributes), keeping every original
+        // item, so nothing dangles at the deleted schema.rs/models/mod.rs.
+        let linked = link_models_into_seed_bin(SEED_BIN);
+        let unlinked = unlink_models_from_seed_bin(&linked);
+        assert!(
+            !unlinked.contains("mod schema;") && !unlinked.contains("mod models;"),
+            "both injected `mod` declarations must be gone:\n{unlinked}"
+        );
+        assert!(
+            !unlinked.contains("#[path = \"../schema.rs\"]")
+                && !unlinked.contains("#[path = \"../models/mod.rs\"]"),
+            "no dangling `#[path]` attributes may remain:\n{unlinked}"
+        );
+        // Original items survive.
+        assert!(
+            unlinked.contains("use autumn_web::seed::SeedContext;")
+                && unlinked.contains("async fn main() {}")
+                && unlinked.contains("//! Database seed binary."),
+            "the original seed-binary items must be preserved:\n{unlinked}"
+        );
+    }
+
+    #[test]
+    fn unlink_seed_bin_is_idempotent_and_noop_when_absent() {
+        // No injected declarations to remove from a bare seed binary.
+        assert_eq!(unlink_models_from_seed_bin(SEED_BIN), SEED_BIN);
+        let linked = link_models_into_seed_bin(SEED_BIN);
+        let once = unlink_models_from_seed_bin(&linked);
+        let twice = unlink_models_from_seed_bin(&once);
+        assert_eq!(
+            once, twice,
+            "re-unlinking an already-unlinked seed bin is a no-op"
+        );
+    }
+
+    #[test]
+    fn unlink_seed_bin_leaves_hand_written_plain_mod_untouched() {
+        // A plain `mod schema;` WITHOUT the injected `#[path]` attribute is the
+        // author's own module, not this generator's injection — never strip it.
+        let existing = "\
+//! seed
+mod schema;
+use autumn_web::seed::SeedContext;
+";
+        assert_eq!(unlink_models_from_seed_bin(existing), existing);
     }
 
     #[test]

@@ -87,6 +87,65 @@ fn project_without_seed_binary_leaves_no_seed_file() {
     );
 }
 
+#[test]
+fn destroying_the_last_model_removes_the_seed_links() {
+    let (_tmp, project) = seed_project("seed-destroy-last-app");
+    let seed = fs::read_to_string(project.join("src/bin/seed.rs")).unwrap();
+    assert!(
+        seed.contains("mod schema;") && seed.contains("mod models;"),
+        "precondition: generate must have linked the modules:\n{seed}"
+    );
+
+    // Destroying the only model empties and DELETES src/schema.rs and
+    // src/models/mod.rs, so the seed binary's `#[path]` links to them must be
+    // removed too — otherwise `cargo check --bins` fails on missing files.
+    run_autumn(&project, &["destroy", "scaffold", "Post", "title:String"]);
+
+    assert!(
+        !project.join("src/schema.rs").exists(),
+        "destroying the last model must delete src/schema.rs"
+    );
+    assert!(
+        !project.join("src/models/mod.rs").exists(),
+        "destroying the last model must delete src/models/mod.rs"
+    );
+    let seed = fs::read_to_string(project.join("src/bin/seed.rs")).unwrap();
+    assert!(
+        !seed.contains("mod schema;") && !seed.contains("mod models;"),
+        "seed.rs must not keep links to the deleted modules:\n{seed}"
+    );
+    assert!(
+        !seed.contains("#[path = \"../schema.rs\"]")
+            && !seed.contains("#[path = \"../models/mod.rs\"]"),
+        "seed.rs must not keep dangling #[path] attributes:\n{seed}"
+    );
+}
+
+#[test]
+fn destroying_one_of_several_models_keeps_the_seed_links() {
+    let (_tmp, project) = seed_project("seed-destroy-one-app");
+    // A second model gives src/models/ a survivor.
+    run_autumn(&project, &["generate", "model", "Comment", "body:Text"]);
+    // Destroy only Comment: Post's model file remains, so src/models/mod.rs and
+    // src/schema.rs survive — the seed links must be KEPT in lockstep.
+    run_autumn(&project, &["destroy", "model", "Comment", "body:Text"]);
+
+    assert!(
+        project.join("src/models/mod.rs").exists(),
+        "src/models/mod.rs must survive while Post remains"
+    );
+    assert!(
+        project.join("src/schema.rs").exists(),
+        "src/schema.rs must survive while Post remains"
+    );
+    let seed = fs::read_to_string(project.join("src/bin/seed.rs")).unwrap();
+    assert!(
+        seed.contains("#[path = \"../schema.rs\"]\nmod schema;")
+            && seed.contains("#[path = \"../models/mod.rs\"]\nmod models;"),
+        "seed links must be kept while another model still exists:\n{seed}"
+    );
+}
+
 /// Slow end-to-end check: the linked seed binary (plus the scaffolded model
 /// and schema it now pulls in) actually type-checks against this workspace's
 /// `autumn-web`. This is the compile-side proof that

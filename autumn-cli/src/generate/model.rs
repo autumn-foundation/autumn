@@ -259,7 +259,20 @@ fn plan_seed_bin_linking(plan: &mut Plan, project_root: &Path) {
     let existing = read_or_empty(&seed_path);
     let linked = link_models_into_seed_bin(&existing);
     if linked != existing {
-        plan.modify(seed_path, linked);
+        plan.modify(seed_path.clone(), linked);
+    }
+    // Record the destroy-time inverse regardless of whether THIS invocation had
+    // to inject (a later model reuses the same already-linked file): `autumn
+    // destroy` deletes `src/models/mod.rs` + `src/schema.rs` once the last
+    // model's reverts empty them, which would leave these `#[path]` links
+    // dangling at missing files. `owner_dir = src/models` gates the revert so it
+    // fires only when the last model is destroyed (no other model file remains),
+    // keeping the links while sibling models still live (issue #1718).
+    if seed_path.exists() {
+        plan.push_revert(crate::generate::emit::Revert::SeedBinLinks {
+            path: seed_path,
+            owner_dir: project_root.join("src").join("models"),
+        });
     }
 }
 
