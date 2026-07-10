@@ -6799,6 +6799,19 @@ async fn pg_recover_stale_claims(pool: &PgPool, visibility_timeout_ms: u64, stat
                 // the dead-letter alert for these rows. Emit it here — mirroring
                 // the other dead-letter sites — so genuine crashed-worker
                 // dead-letters still page the operator.
+                //
+                // Record the failure in the registry *before* alerting, exactly
+                // as the sibling stale-recovery route
+                // (`record_pg_lifecycle_after_ack`, `!ack_applied` branch) and
+                // every other dead-letter site do. The alert points operators
+                // at `/actuator/jobs`, which is backed by `JobRegistry::snapshot()`;
+                // without this, a crashed-worker dead-letter would page but not
+                // appear where the alert tells operators to look.
+                state.job_registry.record_failure(
+                    &row.name,
+                    "visibility timeout expired".to_owned(),
+                    true,
+                );
                 crate::alerts::notify_dead_lettered_job(
                     state,
                     &row.name,
@@ -12237,6 +12250,57 @@ mod tests {
                 "failed list must show the dead-lettered job"
             );
             assert_eq!(snapshot.running.total, 0);
+        }
+
+        #[test]
+        fn pg_maintenance_stale_recovery_records_dead_letter_in_registry() {
+            // `pg_recover_stale_claims` runs on a maintenance replica that did
+            // NOT execute the job: the worker that claimed it crashed on another
+            // process, so this process never called `record_start` for it and
+            // `in_flight` is 0 here. The maintenance loop still records the
+            // terminal failure in the registry *before* alerting — mirroring the
+            // sibling ack-resume route (`record_pg_lifecycle_after_ack`,
+            // `!ack_applied` branch) — so the crashed-worker dead-letter shows up
+            // in `JobRegistry::snapshot()`, the data behind `/actuator/jobs`
+            // where the alert points operators to look.
+            //
+            // The full `pg_recover_stale_claims` UPDATE ... RETURNING needs a
+            // live Postgres, so this exercises the exact registry recording the
+            // loop now performs for each stale-recovered `failed` row (and proves
+            // it is safe when this process never started the job).
+            let state = AppState::for_test().with_profile("dev");
+            state.job_registry().register("crashed_elsewhere");
+
+            // The two-line sequence the maintenance loop now runs per failed row.
+            state.job_registry().record_failure(
+                "crashed_elsewhere",
+                "visibility timeout expired".to_owned(),
+                true,
+            );
+            crate::alerts::notify_dead_lettered_job(
+                &state,
+                "crashed_elsewhere",
+                "visibility timeout expired",
+            );
+
+            let status = state.job_registry().snapshot()["crashed_elsewhere"].clone();
+            assert_eq!(
+                status.in_flight, 0,
+                "recording a dead-letter for a job this process never started must not underflow in_flight"
+            );
+            assert_eq!(
+                status.total_failures, 1,
+                "stale-recovered dead-letter must increment total_failures"
+            );
+            assert_eq!(
+                status.dead_letters, 1,
+                "stale-recovered dead-letter must appear in the /actuator/jobs dead-letter count"
+            );
+            assert_eq!(
+                status.last_error.as_deref(),
+                Some("visibility timeout expired"),
+                "snapshot must carry the stale-recovery reason as the last error"
+            );
         }
 
         #[test]
