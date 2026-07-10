@@ -161,14 +161,14 @@ impl Field {
                     out.push("url".to_owned());
                 }
             }
-            FieldKind::I32 | FieldKind::I64 | FieldKind::F32 | FieldKind::F64 => {
-                if c.min.is_some() || c.max.is_some() {
-                    let is_float = matches!(self.kind, FieldKind::F32 | FieldKind::F64);
-                    out.push(format!(
-                        "range({})",
-                        min_max_args(c.min.as_ref(), c.max.as_ref(), is_float)
-                    ));
-                }
+            FieldKind::I32 | FieldKind::I64 | FieldKind::F32 | FieldKind::F64
+                if c.min.is_some() || c.max.is_some() =>
+            {
+                let is_float = matches!(self.kind, FieldKind::F32 | FieldKind::F64);
+                out.push(format!(
+                    "range({})",
+                    min_max_args(c.min.as_ref(), c.max.as_ref(), is_float)
+                ));
             }
             _ => {}
         }
