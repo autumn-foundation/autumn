@@ -74,7 +74,7 @@ where
     S::Error: 'static,
     ResBody: HttpBody + Send + 'static,
 {
-    type Response = Response<LogContextBody<ResBody>>;
+    type Response = Response<LogContextBody<crate::current::CurrentActorBody<ResBody>>>;
     type Error = S::Error;
     type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
 
@@ -109,6 +109,12 @@ where
         // context installed, so any synchronous work a downstream layer performs
         // in its own `Service::call` (logging, `with_log_field`) is correlated
         // too — not just the async polling of the returned future.
+        //
+        // Note the deliberate asymmetry with the actor scope below: log context
+        // wraps this synchronous `call` (via `sync_scope`) *and* the async future,
+        // whereas `scope_request` wraps only the async future. No downstream
+        // synchronous `call` touches `Current`, so a future author must not add a
+        // synchronous `Current::set_actor` here expecting it to land.
         let inner = span
             .in_scope(|| context::sync_scope(ctx.clone(), || self.inner.call(req)))
             .instrument(span);
@@ -127,9 +133,17 @@ where
             async move {
                 let response = inner.await?;
                 let (parts, body) = response.into_parts();
+                // Capture the request's *resolved* actor scope (the auth layer has
+                // published the principal by now) and re-establish it on every
+                // streamed frame, so a lazy/SSE body's writes stay attributed to
+                // the request actor rather than falling back to SYSTEM_ACTOR.
+                // Wrapped inside the log-context body so both scopes are active
+                // during frame production, consistent with the tenant body wrap.
+                let actor_body =
+                    crate::current::CurrentActorBody::new(body, crate::current::current_scope());
                 Ok(Response::from_parts(
                     parts,
-                    LogContextBody::new(body, body_ctx),
+                    LogContextBody::new(actor_body, body_ctx),
                 ))
             },
         )))

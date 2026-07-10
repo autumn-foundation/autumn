@@ -31,7 +31,12 @@
 //! [`log::context::set_user_id`]: crate::log::context::set_user_id
 
 use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, RwLock};
+use std::task::{Context, Poll};
+
+use http_body::{Body as HttpBody, Frame, SizeHint};
+use pin_project_lite::pin_project;
 
 tokio::task_local! {
     /// The current request's actor scope. Holds a cheap-to-clone,
@@ -164,6 +169,67 @@ pub(crate) fn scope_request<F: Future>(
     CURRENT_ACTOR.scope(ActorScope::empty(), future)
 }
 
+/// Clone the current request's actor-scope handle, if a scope is in effect.
+///
+/// The returned handle is the same cheap-to-clone, interior-mutable storage the
+/// request scope holds, so re-entering it later — e.g. while producing a
+/// lazy/streaming response body after the request future has resolved — observes
+/// any actor the auth layer published during the request. Returns `None` outside
+/// a scope. Mirrors [`log::context::current`](crate::log::context::current).
+pub(crate) fn current_scope() -> Option<ActorScope> {
+    CURRENT_ACTOR.try_with(Clone::clone).ok()
+}
+
+pin_project! {
+    /// Response-body wrapper that re-establishes the request's current-actor
+    /// scope on every frame poll, so a `#[repository(versioned)]` write performed
+    /// while producing a lazy/streaming body (SSE, `Body::from_stream`) still
+    /// records the request's resolved actor instead of falling back to
+    /// `SYSTEM_ACTOR`. The sibling of [`LogContextBody`](crate::middleware::log_context)
+    /// and [`TenantPropagatingBody`](crate::tenancy::TenantPropagatingBody).
+    ///
+    /// Carries the **resolved** [`ActorScope`] handle captured when the response
+    /// was produced (shared, interior-mutable storage from the request), so any
+    /// actor the auth layer set during the request is visible while streaming.
+    pub struct CurrentActorBody<B> {
+        #[pin]
+        inner: B,
+        // `None` only when the body was wrapped outside any request scope, in
+        // which case poll_frame is a transparent pass-through (never panics).
+        scope: Option<ActorScope>,
+    }
+}
+
+impl<B> CurrentActorBody<B> {
+    pub(crate) const fn new(inner: B, scope: Option<ActorScope>) -> Self {
+        Self { inner, scope }
+    }
+}
+
+impl<B: HttpBody> HttpBody for CurrentActorBody<B> {
+    type Data = B::Data;
+    type Error = B::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let this = self.project();
+        match this.scope.clone() {
+            Some(scope) => CURRENT_ACTOR.sync_scope(scope, || this.inner.poll_frame(cx)),
+            None => this.inner.poll_frame(cx),
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -254,5 +320,24 @@ mod tests {
         // No tokio task-local scope in effect; must be inert, not panic.
         let _ = Current::actor();
         Current::set_actor("x");
+    }
+
+    #[tokio::test]
+    async fn captured_actor_scope_handle_is_reentrant() {
+        // Mirrors the streaming-body path: establish a request scope, let the
+        // auth layer publish the principal, and capture the interior-mutable
+        // scope handle while still inside the request.
+        let handle = scope_request(async {
+            Current::set_actor("streamed-user");
+            current_scope().expect("a scope is established here")
+        })
+        .await;
+
+        // The original request scope has now ended. Re-enter the captured handle
+        // from a DIFFERENT task-local frame (exactly what `CurrentActorBody` does
+        // on each `poll_frame`) and confirm the actor set during the request is
+        // still visible — so writes performed while streaming stay attributed.
+        let seen = CURRENT_ACTOR.sync_scope(handle, Current::actor);
+        assert_eq!(seen, Some("streamed-user".to_owned()));
     }
 }

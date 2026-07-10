@@ -787,15 +787,22 @@ mod tests {
 
     // ── MutationContext tests ───────────────────────────────────────
 
-    #[test]
-    fn mutation_context_auto_populates() {
-        let ctx = MutationContext::new(MutationOp::Create);
-        assert!(ctx.actor.is_none());
-        assert!(ctx.request_id.is_some());
-        // UUID v4 format: 8-4-4-4-12 = 36 chars
-        assert_eq!(ctx.request_id.as_ref().unwrap().len(), 36);
-        assert!(matches!(ctx.op, MutationOp::Create));
-        assert!(ctx.invalidate_keys.is_empty());
+    #[tokio::test]
+    async fn mutation_context_auto_populates() {
+        // Construct inside an (empty) request scope so `actor` is deterministically
+        // `None`: an in-scope read never consults the process-global default actor,
+        // which a concurrent test (`current::…default_actor_is_used_only_out_of_scope`)
+        // may transiently have set. Avoids a test-isolation race on that global.
+        crate::current::scope_request(async {
+            let ctx = MutationContext::new(MutationOp::Create);
+            assert!(ctx.actor.is_none());
+            assert!(ctx.request_id.is_some());
+            // UUID v4 format: 8-4-4-4-12 = 36 chars
+            assert_eq!(ctx.request_id.as_ref().unwrap().len(), 36);
+            assert!(matches!(ctx.op, MutationOp::Create));
+            assert!(ctx.invalidate_keys.is_empty());
+        })
+        .await;
     }
 
     #[test]
@@ -815,8 +822,13 @@ mod tests {
 
     #[tokio::test]
     async fn mutation_context_seeds_actor_from_ambient_scope() {
-        // Outside any actor scope the constructor yields `None` (unchanged).
-        assert!(MutationContext::new(MutationOp::Create).actor.is_none());
+        // Inside an (empty) request scope the constructor yields `None`
+        // deterministically — an in-scope read never consults the process-global
+        // default actor a concurrent test may transiently have set (isolation).
+        crate::current::scope_request(async {
+            assert!(MutationContext::new(MutationOp::Create).actor.is_none());
+        })
+        .await;
 
         // Inside `with_actor(...)` the constructor auto-populates the actor.
         crate::current::with_actor("u1", async {
