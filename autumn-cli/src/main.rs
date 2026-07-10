@@ -930,19 +930,100 @@ enum DbCommands {
         #[arg(long)]
         force: bool,
     },
+    /// Back up the configured database(s) to a timestamped, compressed artifact.
+    ///
+    /// Captures the control database plus every configured shard (or a single
+    /// `--shard`), resolving the connection exactly like `autumn migrate`. The
+    /// default `custom` format is compressed and integrity-checked with
+    /// `pg_restore --list` before success is reported; a partial/empty artifact
+    /// is removed and the command exits non-zero. For managed-Postgres apps the
+    /// bundled `pg_dump`/`pg_restore` are used — no externally installed tools.
+    ///
+    /// Artifacts are written to `<dir>/<profile>/<timestamp>/` (default
+    /// `./backups`), each run self-described by a `manifest.json`.
+    ///
+    /// # Scheduling recipe
+    ///
+    /// cron (daily 02:00, keep 7):
+    ///
+    ///   0 2 * * *  cd /srv/myapp && AUTUMN_ENV=prod autumn db backup --keep 7
+    ///
+    /// systemd timer:
+    ///
+    ///   # myapp-backup.service
+    ///   [Service]
+    ///   Type=oneshot
+    ///   Environment=AUTUMN_ENV=prod
+    ///   WorkingDirectory=/srv/myapp
+    ///   ExecStart=/usr/local/bin/autumn db backup --keep 7
+    ///
+    ///   # myapp-backup.timer
+    ///   [Timer]
+    ///   OnCalendar=*-*-* 02:00:00
+    ///   Persistent=true
+    ///   [Install]
+    ///   WantedBy=timers.target
+    // The scheduling recipe above is shell/unit-file text shown verbatim in
+    // `--help`; backticking every `KEY=value` token would leak into that output.
+    #[allow(clippy::doc_markdown)]
+    #[command(verbatim_doc_comment)]
+    Backup {
+        /// Resolve the connection through a profile overlay (see `db create`).
+        #[arg(long, value_name = "PROFILE")]
+        profile: Option<String>,
+        /// Directory to write backup run directories under (default: `./backups`).
+        #[arg(long, value_name = "DIR")]
+        dir: Option<std::path::PathBuf>,
+        /// Artifact format: `custom` (compressed, default) or `plain` (SQL text).
+        #[arg(long, value_name = "FORMAT", default_value = "custom")]
+        format: String,
+        /// Retention: keep only the newest N run directories, pruning older ones
+        /// after a successful backup so a schedule can't fill the disk.
+        #[arg(long, value_name = "N")]
+        keep: Option<usize>,
+        /// Back up only this shard (by configured name), mirroring `migrate --shard`.
+        #[arg(long, value_name = "NAME", conflicts_with = "control_only")]
+        shard: Option<String>,
+        /// Back up only the control database (skip shards).
+        #[arg(long)]
+        control_only: bool,
+    },
+    /// Restore the configured database(s) from a backup artifact.
+    ///
+    /// ARTIFACT is a backup run directory (with `manifest.json`) or a single
+    /// `.dump`/`.sql` file. Every artifact's integrity is verified before any
+    /// database is touched, and the restore is gated by the same production
+    /// guard as `autumn db drop` (refuses non-dev/test profiles without `--force`).
+    #[command(verbatim_doc_comment)]
+    Restore {
+        /// Path to the backup run directory or artifact file to restore.
+        #[arg(value_name = "ARTIFACT")]
+        artifact: std::path::PathBuf,
+        /// Resolve the connection through a profile overlay (see `db create`).
+        #[arg(long, value_name = "PROFILE")]
+        profile: Option<String>,
+        /// Allow the restore against a non-dev/test (e.g. production) profile.
+        #[arg(long)]
+        force: bool,
+        /// Restore only this shard from the artifact.
+        #[arg(long, value_name = "NAME")]
+        shard: Option<String>,
+    },
 }
 
 impl DbCommands {
     /// Translate a lifecycle subcommand (`create`/`drop`/`reset`) into the `db`
     /// module's command and the optional profile override the connection should
-    /// be resolved under. `pull` is dispatched separately (it does not map onto
-    /// [`db::DbCommand`]).
+    /// be resolved under. `pull`/`backup`/`restore` are dispatched separately
+    /// (they do not map onto [`db::DbCommand`]).
     fn into_command(self) -> (db::DbCommand, Option<String>) {
         match self {
             Self::Create { profile } => (db::DbCommand::Create, profile),
             Self::Drop { profile, force } => (db::DbCommand::Drop { force }, profile),
             Self::Reset { profile, force } => (db::DbCommand::Reset { force }, profile),
-            Self::Pull { .. } => unreachable!("db pull is dispatched before into_command"),
+            Self::Pull { .. } | Self::Backup { .. } | Self::Restore { .. } => {
+                unreachable!("db pull/backup/restore are dispatched before into_command")
+            }
         }
     }
 }
@@ -2223,6 +2304,45 @@ fn run_command(command: Commands) {
                 with_repository,
                 dry_run,
                 force,
+            }),
+            DbCommands::Backup {
+                profile,
+                dir,
+                format,
+                keep,
+                shard,
+                control_only,
+            } => {
+                let format = match db::backup::BackupFormat::parse(&format) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        eprintln!("\u{2717} {e}");
+                        std::process::exit(2);
+                    }
+                };
+                let target = match (shard, control_only) {
+                    (Some(name), _) => db::backup::TargetSelector::Shard(name),
+                    (None, true) => db::backup::TargetSelector::ControlOnly,
+                    (None, false) => db::backup::TargetSelector::All,
+                };
+                db::backup::run_backup(&db::backup::BackupArgs {
+                    profile,
+                    dir,
+                    format,
+                    keep,
+                    target,
+                });
+            }
+            DbCommands::Restore {
+                artifact,
+                profile,
+                force,
+                shard,
+            } => db::backup::run_restore(&db::backup::RestoreArgs {
+                artifact,
+                profile,
+                force,
+                shard,
             }),
             other => {
                 let (command, profile) = other.into_command();
@@ -4335,6 +4455,117 @@ mod tests {
         assert!(with_repository);
         assert!(dry_run);
         assert!(force);
+    }
+
+    #[test]
+    fn parse_db_backup_defaults() {
+        let cli = Cli::try_parse_from(["autumn", "db", "backup"]).unwrap();
+        let Commands::Db(DbCommands::Backup {
+            profile,
+            dir,
+            format,
+            keep,
+            shard,
+            control_only,
+        }) = cli.command
+        else {
+            panic!("expected db backup");
+        };
+        assert!(profile.is_none());
+        assert!(dir.is_none());
+        assert_eq!(format, "custom");
+        assert!(keep.is_none());
+        assert!(shard.is_none());
+        assert!(!control_only);
+    }
+
+    #[test]
+    fn parse_db_backup_with_all_flags() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "db",
+            "backup",
+            "--profile",
+            "prod",
+            "--dir",
+            "/var/backups",
+            "--format",
+            "plain",
+            "--keep",
+            "7",
+            "--shard",
+            "east",
+        ])
+        .unwrap();
+        let Commands::Db(DbCommands::Backup {
+            profile,
+            dir,
+            format,
+            keep,
+            shard,
+            control_only,
+        }) = cli.command
+        else {
+            panic!("expected db backup");
+        };
+        assert_eq!(profile.as_deref(), Some("prod"));
+        assert_eq!(dir.as_deref(), Some(std::path::Path::new("/var/backups")));
+        assert_eq!(format, "plain");
+        assert_eq!(keep, Some(7));
+        assert_eq!(shard.as_deref(), Some("east"));
+        assert!(!control_only);
+    }
+
+    #[test]
+    fn parse_db_backup_shard_conflicts_with_control_only() {
+        assert!(
+            Cli::try_parse_from([
+                "autumn",
+                "db",
+                "backup",
+                "--shard",
+                "east",
+                "--control-only",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn parse_db_restore_requires_artifact() {
+        assert!(Cli::try_parse_from(["autumn", "db", "restore"]).is_err());
+    }
+
+    #[test]
+    fn parse_db_restore_with_flags() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "db",
+            "restore",
+            "backups/prod/20260710T040506Z",
+            "--force",
+            "--profile",
+            "prod",
+            "--shard",
+            "east",
+        ])
+        .unwrap();
+        let Commands::Db(DbCommands::Restore {
+            artifact,
+            profile,
+            force,
+            shard,
+        }) = cli.command
+        else {
+            panic!("expected db restore");
+        };
+        assert_eq!(
+            artifact,
+            std::path::PathBuf::from("backups/prod/20260710T040506Z")
+        );
+        assert_eq!(profile.as_deref(), Some("prod"));
+        assert!(force);
+        assert_eq!(shard.as_deref(), Some("east"));
     }
 
     // ── autumn seed tests ──────────────────────────────────────────────────

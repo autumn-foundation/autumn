@@ -1,0 +1,1435 @@
+//! `autumn db backup` / `autumn db restore` — logical dump/restore for
+//! self-hosted, daemon, and single-binary Autumn deployments (issue #1595).
+//!
+//! These commands shell out to `pg_dump` / `pg_restore`, resolving the database
+//! URL(s) through the **exact same** code path as `autumn migrate` / the other
+//! `autumn db` commands ([`crate::migrate::resolve_primary_url`],
+//! [`crate::migrate::resolve_shard_database_urls_from_sources`]) so a backup
+//! captures precisely the databases the running app uses — control plus every
+//! configured shard — under the active profile/env overlay. The destructive
+//! `restore` is gated by the same production guard as `autumn db drop`
+//! ([`super::guard_destructive`]).
+//!
+//! # Artifact layout (S3-bolt-on friendly — issue #1619)
+//!
+//! A single `backup` run writes one self-describing *run directory*:
+//!
+//! ```text
+//! <dir>/<profile>/<timestamp>/
+//!     manifest.json          # version, created_at, profile, format, targets[]
+//!     control.dump           # pg_dump -Fc (default; compressed) — or control.sql (plain)
+//!     shard-<name>.dump      # one per configured shard
+//! ```
+//!
+//! The run directory is the atomic unit of both retention (`--keep N`) and any
+//! future offsite upload (#1619 can enumerate `manifest.json` and push the whole
+//! prefix). Nothing outside this directory is touched.
+//!
+//! # Zero-external-tools for managed Postgres (AC #2)
+//!
+//! [`PgTools::locate`] resolves `pg_dump`/`pg_restore` from, in order: an
+//! explicit `AUTUMN_PG_BIN_DIR`, the managed-Postgres bundle's `bin` directory
+//! (derived from `AUTUMN_MANAGED_PG_DATA_DIR`, which `autumn serve --bundled-pg`
+//! sets), then the `PATH`. A managed-pg daemon therefore needs no externally
+//! installed client tools.
+
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+use crate::migrate;
+
+/// Environment variable that pins the directory holding `pg_dump`/`pg_restore`.
+/// Highest precedence in [`PgTools::locate`]; lets an operator point at a
+/// specific client-tools install.
+const PG_BIN_DIR_ENV: &str = "AUTUMN_PG_BIN_DIR";
+
+/// The managed-Postgres data-dir env var (`autumn serve --bundled-pg` sets it).
+/// Mirrors `autumn_web::managed_pg::MANAGED_PG_DATA_DIR_ENV`; duplicated as a
+/// private constant so a backup can locate the bundled client binaries without
+/// depending on a managed-pg being constructed.
+const MANAGED_PG_DATA_DIR_ENV: &str = "AUTUMN_MANAGED_PG_DATA_DIR";
+
+/// Default directory (relative to the project root) that backup run directories
+/// are written under when `--dir` is not given.
+const DEFAULT_BACKUP_DIR: &str = "backups";
+
+/// Marker `pg_dump` writes at the very end of a *plain* SQL dump. Its presence
+/// is the integrity signal for plain-format artifacts (a truncated/partial dump
+/// will not contain it).
+const PLAIN_COMPLETE_MARKER: &str = "PostgreSQL database dump complete";
+
+/// Backup artifact format.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BackupFormat {
+    /// `pg_dump -Fc` custom archive — compressed, restored with `pg_restore`.
+    /// The default: compressed on disk and integrity-checkable via
+    /// `pg_restore --list`.
+    #[default]
+    Custom,
+    /// Plain `pg_dump` SQL text (uncompressed), restored with `psql`.
+    Plain,
+}
+
+impl BackupFormat {
+    /// The per-target artifact file extension for this format.
+    const fn extension(self) -> &'static str {
+        match self {
+            Self::Custom => "dump",
+            Self::Plain => "sql",
+        }
+    }
+
+    /// The `pg_dump` `--format` flag value for this format.
+    const fn pg_dump_format_flag(self) -> &'static str {
+        match self {
+            Self::Custom => "custom",
+            Self::Plain => "plain",
+        }
+    }
+
+    /// Parse the `--format` CLI value. Accepts the two documented spellings.
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "custom" | "c" => Ok(Self::Custom),
+            "plain" | "sql" | "p" => Ok(Self::Plain),
+            other => Err(format!(
+                "unknown backup format {other:?} (expected `custom` or `plain`)"
+            )),
+        }
+    }
+}
+
+/// Which databases a backup/restore run operates on. Mirrors
+/// [`crate::migrate::MigrateTarget`] so `--shard` / `--control-only` behave
+/// identically to `autumn migrate`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TargetSelector {
+    /// Control database plus every configured shard (the default).
+    All,
+    /// Only the control database.
+    ControlOnly,
+    /// A single shard, addressed by its configured name.
+    Shard(String),
+}
+
+/// Arguments for `autumn db backup`.
+#[derive(Debug, Clone)]
+pub struct BackupArgs {
+    /// Profile overlay to resolve the connection under (see `db create`).
+    pub profile: Option<String>,
+    /// Root directory for backup run directories (default: `./backups`).
+    pub dir: Option<PathBuf>,
+    /// Artifact format (default: custom/compressed).
+    pub format: BackupFormat,
+    /// Retention: keep only the newest N run directories for this profile,
+    /// pruning older ones after a successful backup. `None` disables pruning.
+    pub keep: Option<usize>,
+    /// Which databases to capture.
+    pub target: TargetSelector,
+}
+
+/// Arguments for `autumn db restore`.
+#[derive(Debug, Clone)]
+pub struct RestoreArgs {
+    /// Path to a backup run directory (or a single artifact file) to restore.
+    pub artifact: PathBuf,
+    /// Profile overlay to resolve the connection under.
+    pub profile: Option<String>,
+    /// Bypass the production guard (mirrors `autumn db drop --force`).
+    pub force: bool,
+    /// Restore only this shard from the artifact (mirrors `--shard`).
+    pub shard: Option<String>,
+}
+
+/// Failure modes for backup/restore. `Display` is credential-safe: no variant
+/// ever embeds a resolved URL (only parsed host/port/db), matching the rest of
+/// the `db` command family.
+#[derive(Debug)]
+pub enum BackupError {
+    /// No database URL could be resolved from config or environment.
+    NoUrl,
+    /// A named shard was requested but not found in the resolved topology.
+    UnknownShard { name: String, known: Vec<String> },
+    /// `pg_dump`/`pg_restore`/`psql` was not found on PATH or in a bundle.
+    ToolMissing { tool: String },
+    /// A shelled-out tool exited non-zero. Carries the tool name and a
+    /// credential-safe context string.
+    ToolFailed { tool: String, context: String },
+    /// A filesystem operation failed.
+    Io {
+        context: String,
+        source: std::io::Error,
+    },
+    /// A produced or supplied artifact failed its integrity check.
+    IntegrityFailed { detail: String },
+    /// The restore artifact path does not exist or has no recognizable layout.
+    BadArtifact { detail: String },
+    /// A destructive restore was refused because the active profile is
+    /// production and `--force` was not supplied.
+    ProductionRefused { profile: String },
+}
+
+impl std::fmt::Display for BackupError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoUrl => write!(
+                f,
+                "No database URL found.\n  Set database.primary_url (or database.url) in autumn.toml, \
+                 or set AUTUMN_DATABASE__PRIMARY_URL / AUTUMN_DATABASE__URL / DATABASE_URL."
+            ),
+            Self::UnknownShard { name, known } => {
+                let detail = if known.is_empty() {
+                    "No [[database.shards]] entries found in autumn.toml or environment.".to_owned()
+                } else {
+                    format!("Known shards: {}", known.join(", "))
+                };
+                write!(f, "Unknown shard {name:?}.\n  {detail}")
+            }
+            Self::ToolMissing { tool } => write!(
+                f,
+                "`{tool}` was not found.\n  Install the PostgreSQL client tools, set \
+                 {PG_BIN_DIR_ENV} to their directory, or run against a managed-Postgres app \
+                 (which bundles them)."
+            ),
+            Self::ToolFailed { tool, context } => {
+                write!(f, "`{tool}` failed: {context}")
+            }
+            Self::Io { context, source } => write!(f, "{context}: {source}"),
+            Self::IntegrityFailed { detail } => write!(
+                f,
+                "Backup integrity check failed: {detail}\n  The artifact was NOT reported as \
+                 successful; any partial files were removed."
+            ),
+            Self::BadArtifact { detail } => write!(f, "Cannot restore: {detail}"),
+            Self::ProductionRefused { profile } => write!(
+                f,
+                "Refusing to restore over the {profile:?} profile database.\n  \
+                 Re-run with --force if you really mean it (this overwrites data)."
+            ),
+        }
+    }
+}
+
+impl BackupError {
+    fn io(context: impl Into<String>) -> impl FnOnce(std::io::Error) -> Self {
+        let context = context.into();
+        move |source| Self::Io { context, source }
+    }
+}
+
+/// A single database captured by (or to be restored from) a backup run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedTarget {
+    /// Stable label: `"control"` or `"shard:<name>"`.
+    label: String,
+    /// The resolved connection URL (never printed).
+    url: String,
+}
+
+// ─── Entry points ───────────────────────────────────────────────────────────
+
+/// Entry point for `autumn db backup`. Prints a credential-safe message and
+/// exits non-zero on failure.
+pub fn run_backup(args: &BackupArgs) {
+    eprintln!("\u{1F342} autumn db backup\n");
+    if let Err(e) = backup(args) {
+        eprintln!("\u{2717} {e}");
+        std::process::exit(1);
+    }
+}
+
+/// Entry point for `autumn db restore`. Prints a credential-safe message and
+/// exits non-zero on failure.
+pub fn run_restore(args: &RestoreArgs) {
+    eprintln!("\u{1F342} autumn db restore\n");
+    if let Err(e) = restore(args) {
+        eprintln!("\u{2717} {e}");
+        std::process::exit(1);
+    }
+}
+
+// ─── Backup ─────────────────────────────────────────────────────────────────
+
+fn backup(args: &BackupArgs) -> Result<(), BackupError> {
+    let targets = resolve_targets(args.profile.as_deref(), &args.target)?;
+    let tools = PgTools::locate();
+    let pg_dump = tools.require("pg_dump")?;
+
+    let profile = migrate::effective_profile(args.profile.as_deref());
+    let root = backup_root(args.dir.as_deref(), &profile);
+    let run_name = run_dir_name(&now_utc());
+    let run_dir = root.join(&run_name);
+
+    std::fs::create_dir_all(&run_dir)
+        .map_err(BackupError::io(format!("creating {}", run_dir.display())))?;
+
+    // Everything below writes into `run_dir`. On ANY failure we remove the
+    // whole run directory so a partial/empty artifact is never left behind and
+    // never counted toward retention (AC #1).
+    let result = backup_into(&run_dir, &targets, args.format, &pg_dump, &profile);
+    if let Err(e) = result {
+        let _ = std::fs::remove_dir_all(&run_dir);
+        return Err(e);
+    }
+
+    eprintln!(
+        "\n\u{2713} Backup complete: {} ({} target(s), {} format).",
+        run_dir.display(),
+        targets.len(),
+        args.format.pg_dump_format_flag(),
+    );
+
+    // Retention runs only AFTER a verified-successful backup, so a failed run
+    // can never prune good history (AC #6).
+    if let Some(keep) = args.keep {
+        prune(&root, keep)?;
+    }
+    Ok(())
+}
+
+/// Dump every target into `run_dir`, verify each artifact, and write the
+/// manifest. Returns `Err` (leaving cleanup to the caller) on the first failure.
+fn backup_into(
+    run_dir: &Path,
+    targets: &[ResolvedTarget],
+    format: BackupFormat,
+    pg_dump: &Path,
+    profile: &str,
+) -> Result<(), BackupError> {
+    let mut manifest_targets = Vec::with_capacity(targets.len());
+    for target in targets {
+        let file_name = artifact_file_name(&target.label, format);
+        let out_path = run_dir.join(&file_name);
+        eprintln!(
+            "\u{2500}\u{2500} backing up {} \u{2500}\u{2500}",
+            target.label
+        );
+
+        let db = parsed_db_name(&target.url);
+        run_pg_dump(pg_dump, &target.url, &out_path, format, &db)?;
+        verify_artifact(&out_path, format, &db)?;
+        eprintln!("  \u{2713} {file_name} verified.");
+
+        manifest_targets.push(ManifestTarget {
+            label: target.label.clone(),
+            file: file_name,
+            database: db,
+        });
+    }
+
+    let manifest = Manifest {
+        autumn_version: env!("CARGO_PKG_VERSION").to_owned(),
+        created_at: now_utc().to_rfc3339(),
+        profile: profile.to_owned(),
+        format: format.pg_dump_format_flag().to_owned(),
+        targets: manifest_targets,
+    };
+    write_manifest(run_dir, &manifest)
+}
+
+/// Shell out to `pg_dump` for one target.
+fn run_pg_dump(
+    pg_dump: &Path,
+    url: &str,
+    out_path: &Path,
+    format: BackupFormat,
+    db: &str,
+) -> Result<(), BackupError> {
+    // `--no-owner`/`--no-privileges` keep the artifact portable across roles so
+    // a restore into a freshly-created database works without recreating the
+    // original owner/grants.
+    let status = Command::new(pg_dump)
+        .arg("--format")
+        .arg(format.pg_dump_format_flag())
+        .arg("--no-owner")
+        .arg("--no-privileges")
+        .arg("--file")
+        .arg(out_path)
+        .arg("--dbname")
+        .arg(url)
+        .status()
+        .map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => BackupError::ToolMissing {
+                tool: "pg_dump".to_owned(),
+            },
+            _ => BackupError::ToolFailed {
+                tool: "pg_dump".to_owned(),
+                context: format!("could not spawn for database {db:?}: {e}"),
+            },
+        })?;
+    if !status.success() {
+        return Err(BackupError::ToolFailed {
+            tool: "pg_dump".to_owned(),
+            context: format!(
+                "dump of database {db:?} exited {}",
+                exit_desc(status.code())
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// Verify a freshly-written artifact before it is counted as a success (AC #1).
+///
+/// * Custom: the file must be non-empty AND `pg_restore --list` must succeed
+///   with a non-empty archive table of contents.
+/// * Plain: the file must be non-empty AND end with `pg_dump`'s completion marker.
+fn verify_artifact(path: &Path, format: BackupFormat, db: &str) -> Result<(), BackupError> {
+    let len = std::fs::metadata(path)
+        .map_err(BackupError::io(format!("stat {}", path.display())))?
+        .len();
+    if len == 0 {
+        return Err(BackupError::IntegrityFailed {
+            detail: format!("dump of {db:?} is empty (0 bytes)"),
+        });
+    }
+    match format {
+        BackupFormat::Custom => {
+            let pg_restore = PgTools::locate().require("pg_restore")?;
+            verify_custom_archive(&pg_restore, path, db)
+        }
+        BackupFormat::Plain => verify_plain_dump(path, db),
+    }
+}
+
+/// Structural integrity check for a custom-format archive: `pg_restore --list`
+/// parses the archive's TOC and fails on a truncated/corrupt file.
+fn verify_custom_archive(pg_restore: &Path, path: &Path, db: &str) -> Result<(), BackupError> {
+    let output = Command::new(pg_restore)
+        .arg("--list")
+        .arg(path)
+        .output()
+        .map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => BackupError::ToolMissing {
+                tool: "pg_restore".to_owned(),
+            },
+            _ => BackupError::ToolFailed {
+                tool: "pg_restore".to_owned(),
+                context: format!("could not spawn to verify {db:?}: {e}"),
+            },
+        })?;
+    if !output.status.success() {
+        return Err(BackupError::IntegrityFailed {
+            detail: format!(
+                "`pg_restore --list` rejected the {db:?} archive ({})",
+                exit_desc(output.status.code())
+            ),
+        });
+    }
+    // A valid-but-empty TOC (no dumpable objects) still lists header comment
+    // lines; require at least one non-comment entry so a truly empty archive is
+    // caught.
+    let listing = String::from_utf8_lossy(&output.stdout);
+    if toc_entry_count(&listing) == 0 {
+        return Err(BackupError::IntegrityFailed {
+            detail: format!("the {db:?} archive contains no objects"),
+        });
+    }
+    Ok(())
+}
+
+/// Integrity check for a plain SQL dump: it must end with `pg_dump`'s completion
+/// marker, which is only written once the dump finished cleanly.
+fn verify_plain_dump(path: &Path, db: &str) -> Result<(), BackupError> {
+    let contents = std::fs::read_to_string(path)
+        .map_err(BackupError::io(format!("read {}", path.display())))?;
+    if plain_dump_is_complete(&contents) {
+        Ok(())
+    } else {
+        Err(BackupError::IntegrityFailed {
+            detail: format!(
+                "the {db:?} SQL dump is missing pg_dump's completion marker (likely truncated)"
+            ),
+        })
+    }
+}
+
+// ─── Restore ────────────────────────────────────────────────────────────────
+
+fn restore(args: &RestoreArgs) -> Result<(), BackupError> {
+    // Production guard — identical to `autumn db drop` (AC #4).
+    let profile = migrate::effective_profile(args.profile.as_deref());
+    super::guard_destructive(&profile, args.force).map_err(|_| BackupError::ProductionRefused {
+        profile: profile.clone(),
+    })?;
+
+    let plan = RestorePlan::discover(&args.artifact)?;
+    let format = plan.format;
+    let entries = plan.select(args.shard.as_deref())?;
+
+    let targets = resolve_targets_for_restore(args.profile.as_deref(), &entries)?;
+    let tools = PgTools::locate();
+
+    // Verify EVERY artifact before mutating ANY database (AC #4): refuse to
+    // start a destructive restore we can't finish.
+    for (entry, _url) in &targets {
+        let db = format!("(artifact) {}", entry.label);
+        verify_artifact(&plan.dir.join(&entry.file), format, &db)?;
+        eprintln!("  \u{2713} {} integrity verified.", entry.file);
+    }
+
+    for (entry, url) in &targets {
+        eprintln!(
+            "\u{2500}\u{2500} restoring {} \u{2500}\u{2500}",
+            entry.label
+        );
+        let artifact = plan.dir.join(&entry.file);
+        let db = parsed_db_name(url);
+        run_restore_one(&tools, url, &artifact, format, &db)?;
+        eprintln!("  \u{2713} restored {}.", entry.label);
+    }
+
+    eprintln!("\n\u{2713} Restore complete ({} target(s)).", targets.len());
+    Ok(())
+}
+
+/// Restore one artifact into one database.
+fn run_restore_one(
+    tools: &PgTools,
+    url: &str,
+    artifact: &Path,
+    format: BackupFormat,
+    db: &str,
+) -> Result<(), BackupError> {
+    match format {
+        BackupFormat::Custom => {
+            let pg_restore = tools.require("pg_restore")?;
+            // `--clean --if-exists` drops existing objects first so the restore
+            // is an overwrite, not a merge; `--no-owner` matches the dump flags.
+            let status = Command::new(&pg_restore)
+                .arg("--clean")
+                .arg("--if-exists")
+                .arg("--no-owner")
+                .arg("--dbname")
+                .arg(url)
+                .arg(artifact)
+                .status()
+                .map_err(|e| spawn_err("pg_restore", db, &e))?;
+            if !status.success() {
+                return Err(BackupError::ToolFailed {
+                    tool: "pg_restore".to_owned(),
+                    context: format!(
+                        "restore into database {db:?} exited {}",
+                        exit_desc(status.code())
+                    ),
+                });
+            }
+            Ok(())
+        }
+        BackupFormat::Plain => {
+            let psql = tools.require("psql")?;
+            let status = Command::new(&psql)
+                .arg("--set")
+                .arg("ON_ERROR_STOP=1")
+                .arg("--dbname")
+                .arg(url)
+                .arg("--file")
+                .arg(artifact)
+                .status()
+                .map_err(|e| spawn_err("psql", db, &e))?;
+            if !status.success() {
+                return Err(BackupError::ToolFailed {
+                    tool: "psql".to_owned(),
+                    context: format!(
+                        "restore into database {db:?} exited {}",
+                        exit_desc(status.code())
+                    ),
+                });
+            }
+            Ok(())
+        }
+    }
+}
+
+fn spawn_err(tool: &str, db: &str, e: &std::io::Error) -> BackupError {
+    match e.kind() {
+        std::io::ErrorKind::NotFound => BackupError::ToolMissing {
+            tool: tool.to_owned(),
+        },
+        _ => BackupError::ToolFailed {
+            tool: tool.to_owned(),
+            context: format!("could not spawn for database {db:?}: {e}"),
+        },
+    }
+}
+
+/// A restore artifact resolved to a directory + its manifest entries.
+struct RestorePlan {
+    /// Directory holding the artifact file(s).
+    dir: PathBuf,
+    /// Format of the artifacts.
+    format: BackupFormat,
+    /// The manifest targets to restore.
+    entries: Vec<ManifestTarget>,
+}
+
+impl RestorePlan {
+    /// Discover a restore plan from a user-supplied path. Accepts either a run
+    /// directory (containing `manifest.json`) or a single artifact file.
+    fn discover(path: &Path) -> Result<Self, BackupError> {
+        if path.is_dir() {
+            let manifest = read_manifest(path)?;
+            let format = BackupFormat::parse(&manifest.format).map_err(|detail| {
+                BackupError::BadArtifact {
+                    detail: format!("manifest has an invalid format: {detail}"),
+                }
+            })?;
+            return Ok(Self {
+                dir: path.to_path_buf(),
+                format,
+                entries: manifest.targets,
+            });
+        }
+        if path.is_file() {
+            // A bare artifact file: infer format from extension, treat it as a
+            // single control target.
+            let format = infer_format_from_path(path).ok_or_else(|| BackupError::BadArtifact {
+                detail: format!(
+                    "{} is neither a run directory nor a .dump/.sql artifact",
+                    path.display()
+                ),
+            })?;
+            let dir = path
+                .parent()
+                .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
+            let file = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            return Ok(Self {
+                dir,
+                format,
+                entries: vec![ManifestTarget {
+                    label: "control".to_owned(),
+                    file,
+                    database: String::new(),
+                }],
+            });
+        }
+        Err(BackupError::BadArtifact {
+            detail: format!("{} does not exist", path.display()),
+        })
+    }
+
+    /// Filter the plan's entries to a single shard when `--shard` is given.
+    fn select(&self, shard: Option<&str>) -> Result<Vec<ManifestTarget>, BackupError> {
+        let Some(shard) = shard else {
+            return Ok(self.entries.clone());
+        };
+        let wanted = format!("shard:{shard}");
+        let selected: Vec<ManifestTarget> = self
+            .entries
+            .iter()
+            .filter(|t| t.label == wanted)
+            .cloned()
+            .collect();
+        if selected.is_empty() {
+            let known: Vec<String> = self.entries.iter().map(|t| t.label.clone()).collect();
+            return Err(BackupError::UnknownShard {
+                name: shard.to_owned(),
+                known,
+            });
+        }
+        Ok(selected)
+    }
+}
+
+// ─── Target resolution (reuses the migrate URL-resolution path) ─────────────
+
+/// Resolve the databases a backup run should capture, reusing the SAME
+/// resolution `autumn migrate` uses so the set matches the running app exactly.
+fn resolve_targets(
+    profile: Option<&str>,
+    selector: &TargetSelector,
+) -> Result<Vec<ResolvedTarget>, BackupError> {
+    let control = migrate::resolve_primary_url(profile);
+    let table =
+        migrate::read_autumn_toml_table_with_profile(Some(&migrate::effective_profile(profile)));
+    let shards =
+        migrate::resolve_shard_database_urls_from_sources(|k| std::env::var(k), table.as_ref());
+    build_targets(control, shards, selector)
+}
+
+/// Pure target-selection logic, separated for unit testing. Mirrors
+/// `migrate::build_targets`'s control-first / shards-in-order shape.
+fn build_targets(
+    control: Option<String>,
+    shards: Vec<(String, String)>,
+    selector: &TargetSelector,
+) -> Result<Vec<ResolvedTarget>, BackupError> {
+    match selector {
+        TargetSelector::ControlOnly => control
+            .map(|url| {
+                vec![ResolvedTarget {
+                    label: "control".to_owned(),
+                    url,
+                }]
+            })
+            .ok_or(BackupError::NoUrl),
+        TargetSelector::Shard(name) => {
+            let Some((_, url)) = shards.iter().find(|(shard, _)| shard == name) else {
+                return Err(BackupError::UnknownShard {
+                    name: name.clone(),
+                    known: shards.into_iter().map(|(n, _)| n).collect(),
+                });
+            };
+            Ok(vec![ResolvedTarget {
+                label: format!("shard:{name}"),
+                url: url.clone(),
+            }])
+        }
+        TargetSelector::All => {
+            let mut targets = Vec::new();
+            if let Some(control_url) = control {
+                targets.push(ResolvedTarget {
+                    label: "control".to_owned(),
+                    url: control_url,
+                });
+            } else if shards.is_empty() {
+                return Err(BackupError::NoUrl);
+            }
+            for (name, url) in shards {
+                targets.push(ResolvedTarget {
+                    label: format!("shard:{name}"),
+                    url,
+                });
+            }
+            Ok(targets)
+        }
+    }
+}
+
+/// Resolve a live URL for each manifest entry a restore will write to, again
+/// via the migrate resolution path so restore hits the same databases.
+fn resolve_targets_for_restore(
+    profile: Option<&str>,
+    entries: &[ManifestTarget],
+) -> Result<Vec<(ManifestTarget, String)>, BackupError> {
+    let control = migrate::resolve_primary_url(profile);
+    let table =
+        migrate::read_autumn_toml_table_with_profile(Some(&migrate::effective_profile(profile)));
+    let shards =
+        migrate::resolve_shard_database_urls_from_sources(|k| std::env::var(k), table.as_ref());
+
+    let mut out = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let url = if entry.label == "control" {
+            control.clone().ok_or(BackupError::NoUrl)?
+        } else if let Some(shard_name) = entry.label.strip_prefix("shard:") {
+            shards
+                .iter()
+                .find(|(n, _)| n == shard_name)
+                .map(|(_, u)| u.clone())
+                .ok_or_else(|| BackupError::UnknownShard {
+                    name: shard_name.to_owned(),
+                    known: shards.iter().map(|(n, _)| n.clone()).collect(),
+                })?
+        } else {
+            return Err(BackupError::BadArtifact {
+                detail: format!(
+                    "manifest target has an unrecognized label {:?}",
+                    entry.label
+                ),
+            });
+        };
+        out.push((entry.clone(), url));
+    }
+    Ok(out)
+}
+
+// ─── Retention ──────────────────────────────────────────────────────────────
+
+/// Prune all but the newest `keep` run directories under `root`.
+fn prune(root: &Path, keep: usize) -> Result<(), BackupError> {
+    let mut runs = list_run_dirs(root)?;
+    runs.sort(); // ascending by timestamped name
+    let to_remove = plan_pruning(&runs, keep);
+    for name in &to_remove {
+        let path = root.join(name);
+        std::fs::remove_dir_all(&path)
+            .map_err(BackupError::io(format!("pruning {}", path.display())))?;
+        eprintln!("  \u{1F5D1} pruned old backup {name}");
+    }
+    if !to_remove.is_empty() {
+        eprintln!(
+            "  \u{2139} retention: kept newest {keep}, pruned {}.",
+            to_remove.len()
+        );
+    }
+    Ok(())
+}
+
+/// List run-directory names directly under `root`. Missing root => empty.
+fn list_run_dirs(root: &Path) -> Result<Vec<String>, BackupError> {
+    if !root.exists() {
+        return Ok(Vec::new());
+    }
+    let mut names = Vec::new();
+    for entry in
+        std::fs::read_dir(root).map_err(BackupError::io(format!("read {}", root.display())))?
+    {
+        let entry = entry.map_err(BackupError::io(format!("read entry in {}", root.display())))?;
+        if entry.path().is_dir() {
+            names.push(entry.file_name().to_string_lossy().into_owned());
+        }
+    }
+    Ok(names)
+}
+
+/// Pure retention rule: given run names sorted ascending (oldest first), return
+/// the names to remove so that only the newest `keep` remain. `keep == 0` is
+/// treated as `keep == 1` (never prune everything from a just-run backup).
+fn plan_pruning(sorted_runs: &[String], keep: usize) -> Vec<String> {
+    let keep = keep.max(1);
+    if sorted_runs.len() <= keep {
+        return Vec::new();
+    }
+    let remove_count = sorted_runs.len() - keep;
+    sorted_runs[..remove_count].to_vec()
+}
+
+// ─── pg tool location ───────────────────────────────────────────────────────
+
+/// Resolves Postgres client executables (`pg_dump`, `pg_restore`, `psql`)
+/// from an ordered list of candidate `bin` directories, falling back to the
+/// bare command name (PATH lookup).
+struct PgTools {
+    /// Candidate `bin` directories, highest priority first.
+    dirs: Vec<PathBuf>,
+}
+
+impl PgTools {
+    /// Build the locator from the environment: `AUTUMN_PG_BIN_DIR`, then the
+    /// managed-Postgres bundle's `bin` dir, then PATH.
+    fn locate() -> Self {
+        Self {
+            dirs: candidate_bin_dirs(
+                std::env::var_os(PG_BIN_DIR_ENV).map(PathBuf::from),
+                std::env::var_os(MANAGED_PG_DATA_DIR_ENV).map(PathBuf::from),
+            ),
+        }
+    }
+
+    /// Resolve a tool to a concrete path (a candidate dir that contains it) or
+    /// the bare name for PATH resolution.
+    fn resolve(&self, tool: &str) -> PathBuf {
+        resolve_tool_in(&self.dirs, tool)
+    }
+
+    /// Like [`Self::resolve`] but fails fast with [`BackupError::ToolMissing`]
+    /// when the tool is neither in a candidate dir nor on PATH.
+    fn require(&self, tool: &str) -> Result<PathBuf, BackupError> {
+        let resolved = self.resolve(tool);
+        // If we resolved to a concrete existing path, use it. Otherwise probe
+        // PATH by attempting `--version`; only then decide it's missing.
+        if resolved.is_absolute() {
+            return Ok(resolved);
+        }
+        if tool_on_path(tool) {
+            Ok(resolved)
+        } else {
+            Err(BackupError::ToolMissing {
+                tool: tool.to_owned(),
+            })
+        }
+    }
+}
+
+/// Build the ordered candidate `bin` directories for pg client tools. Pure over
+/// its inputs so the ordering/derivation is unit-testable.
+fn candidate_bin_dirs(
+    pg_bin_dir: Option<PathBuf>,
+    managed_data_dir: Option<PathBuf>,
+) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(dir) = pg_bin_dir {
+        dirs.push(dir);
+    }
+    if let Some(data_dir) = managed_data_dir {
+        // Managed Postgres extracts its binaries to `<data_dir_parent>/postgresql`
+        // (see `autumn_web::managed_pg`); the executables live under its `bin/`.
+        let install = data_dir.parent().unwrap_or(&data_dir).join("postgresql");
+        dirs.push(install.join("bin"));
+        // Some bundle layouts nest under a versioned subdirectory; include the
+        // install root so a shallow search can find `*/bin`.
+        dirs.extend(nested_bin_dirs(&install));
+    }
+    dirs
+}
+
+/// Find `*/bin` directories one level under `install` (managed-pg bundles that
+/// nest the toolchain under a version directory). Best-effort; empty if the
+/// directory can't be read.
+fn nested_bin_dirs(install: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(install) {
+        for entry in entries.flatten() {
+            if entry.path().is_dir() {
+                out.push(entry.path().join("bin"));
+            }
+        }
+    }
+    out
+}
+
+/// Resolve `tool` against candidate dirs: the first dir that actually contains
+/// the executable wins; otherwise return the bare name for PATH resolution.
+fn resolve_tool_in(dirs: &[PathBuf], tool: &str) -> PathBuf {
+    let exe = exe_name(tool);
+    for dir in dirs {
+        let candidate = dir.join(&exe);
+        if candidate.is_file() {
+            return candidate;
+        }
+    }
+    PathBuf::from(tool)
+}
+
+/// Platform executable file name for a bare tool name.
+fn exe_name(tool: &str) -> String {
+    if cfg!(windows) {
+        format!("{tool}.exe")
+    } else {
+        tool.to_owned()
+    }
+}
+
+/// Whether a bare tool name resolves on PATH (probed via `--version`).
+fn tool_on_path(tool: &str) -> bool {
+    Command::new(tool)
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+// ─── Manifest ───────────────────────────────────────────────────────────────
+
+/// One entry in a backup manifest.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct ManifestTarget {
+    /// Stable label: `"control"` or `"shard:<name>"`.
+    label: String,
+    /// Artifact file name within the run directory.
+    file: String,
+    /// The database name captured (credential-free; for humans).
+    #[serde(default)]
+    database: String,
+}
+
+/// Self-describing metadata for a backup run. Written as `manifest.json`; the
+/// contract #1619 (offsite upload) enumerates.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct Manifest {
+    /// autumn-cli version that produced the backup.
+    autumn_version: String,
+    /// RFC 3339 UTC timestamp.
+    created_at: String,
+    /// Effective profile the URLs were resolved under.
+    profile: String,
+    /// `"custom"` or `"plain"`.
+    format: String,
+    /// The databases captured.
+    targets: Vec<ManifestTarget>,
+}
+
+/// The manifest file name inside a run directory.
+const MANIFEST_FILE: &str = "manifest.json";
+
+fn write_manifest(run_dir: &Path, manifest: &Manifest) -> Result<(), BackupError> {
+    let json = serde_json::to_string_pretty(manifest).map_err(|e| BackupError::Io {
+        context: "serializing manifest".to_owned(),
+        source: std::io::Error::other(e),
+    })?;
+    let path = run_dir.join(MANIFEST_FILE);
+    std::fs::write(&path, json).map_err(BackupError::io(format!("writing {}", path.display())))
+}
+
+fn read_manifest(run_dir: &Path) -> Result<Manifest, BackupError> {
+    let path = run_dir.join(MANIFEST_FILE);
+    let json = std::fs::read_to_string(&path).map_err(|e| BackupError::BadArtifact {
+        detail: format!("{} has no readable {MANIFEST_FILE}: {e}", run_dir.display()),
+    })?;
+    serde_json::from_str(&json).map_err(|e| BackupError::BadArtifact {
+        detail: format!("{} is not a valid manifest: {e}", path.display()),
+    })
+}
+
+// ─── Path / naming helpers (pure) ───────────────────────────────────────────
+
+/// The root directory for a profile's backup run directories:
+/// `<dir or ./backups>/<profile>`.
+fn backup_root(dir: Option<&Path>, profile: &str) -> PathBuf {
+    let base = dir.map_or_else(|| PathBuf::from(DEFAULT_BACKUP_DIR), Path::to_path_buf);
+    base.join(sanitize_component(profile))
+}
+
+/// The run-directory name for a given instant: a sortable UTC timestamp.
+fn run_dir_name(now: &chrono::DateTime<chrono::Utc>) -> String {
+    now.format("%Y%m%dT%H%M%SZ").to_string()
+}
+
+/// The artifact file name for one target and format.
+fn artifact_file_name(label: &str, format: BackupFormat) -> String {
+    let ext = format.extension();
+    if label == "control" {
+        format!("control.{ext}")
+    } else if let Some(name) = label.strip_prefix("shard:") {
+        format!("shard-{}.{ext}", sanitize_component(name))
+    } else {
+        format!("{}.{ext}", sanitize_component(label))
+    }
+}
+
+/// Sanitize a string for safe use as a single path component.
+fn sanitize_component(s: &str) -> String {
+    let cleaned: String = s
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if cleaned.is_empty() {
+        "unnamed".to_owned()
+    } else {
+        cleaned
+    }
+}
+
+/// Infer a backup format from a file extension.
+fn infer_format_from_path(path: &Path) -> Option<BackupFormat> {
+    match path.extension().and_then(|e| e.to_str()) {
+        Some("dump") => Some(BackupFormat::Custom),
+        Some("sql") => Some(BackupFormat::Plain),
+        _ => None,
+    }
+}
+
+/// Parse just the database name out of a connection URL (credential-safe; used
+/// only for human-facing messages). Falls back to `"(database)"`.
+fn parsed_db_name(url: &str) -> String {
+    url::Url::parse(url)
+        .ok()
+        .and_then(|u| {
+            u.path_segments()
+                .and_then(|mut s| s.next().map(str::to_owned))
+        })
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "(database)".to_owned())
+}
+
+/// Count non-comment entries in a `pg_restore --list` TOC listing.
+fn toc_entry_count(listing: &str) -> usize {
+    listing
+        .lines()
+        .filter(|l| {
+            let t = l.trim();
+            !t.is_empty() && !t.starts_with(';')
+        })
+        .count()
+}
+
+/// Whether a plain SQL dump text contains `pg_dump`'s completion marker.
+fn plain_dump_is_complete(contents: &str) -> bool {
+    contents.contains(PLAIN_COMPLETE_MARKER)
+}
+
+/// A human description of a process exit code.
+fn exit_desc(code: Option<i32>) -> String {
+    code.map_or_else(|| "with a signal".to_owned(), |c| format!("with code {c}"))
+}
+
+/// Current UTC instant (indirection kept tiny so tests can reason about naming).
+fn now_utc() -> chrono::DateTime<chrono::Utc> {
+    chrono::Utc::now()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_parse_accepts_documented_spellings() {
+        assert_eq!(BackupFormat::parse("custom").unwrap(), BackupFormat::Custom);
+        assert_eq!(BackupFormat::parse("C").unwrap(), BackupFormat::Custom);
+        assert_eq!(BackupFormat::parse("plain").unwrap(), BackupFormat::Plain);
+        assert_eq!(BackupFormat::parse("sql").unwrap(), BackupFormat::Plain);
+        assert!(BackupFormat::parse("gzip").is_err());
+    }
+
+    #[test]
+    fn default_format_is_custom_compressed() {
+        assert_eq!(BackupFormat::default(), BackupFormat::Custom);
+        assert_eq!(BackupFormat::Custom.extension(), "dump");
+        assert_eq!(BackupFormat::Plain.extension(), "sql");
+    }
+
+    #[test]
+    fn backup_root_nests_under_profile() {
+        assert_eq!(
+            backup_root(None, "dev"),
+            PathBuf::from("backups").join("dev")
+        );
+        assert_eq!(
+            backup_root(Some(Path::new("/var/backups")), "prod"),
+            PathBuf::from("/var/backups").join("prod")
+        );
+    }
+
+    #[test]
+    fn run_dir_name_is_sortable_utc() {
+        use chrono::TimeZone as _;
+        let ts = chrono::Utc.with_ymd_and_hms(2026, 7, 10, 4, 5, 6).unwrap();
+        assert_eq!(run_dir_name(&ts), "20260710T040506Z");
+    }
+
+    #[test]
+    fn artifact_file_name_distinguishes_control_and_shards() {
+        assert_eq!(
+            artifact_file_name("control", BackupFormat::Custom),
+            "control.dump"
+        );
+        assert_eq!(
+            artifact_file_name("shard:us_east", BackupFormat::Custom),
+            "shard-us_east.dump"
+        );
+        assert_eq!(
+            artifact_file_name("shard:us east", BackupFormat::Plain),
+            "shard-us_east.sql"
+        );
+    }
+
+    #[test]
+    fn sanitize_component_replaces_unsafe_chars() {
+        assert_eq!(sanitize_component("us-east_1.a"), "us-east_1.a");
+        assert_eq!(sanitize_component("a/b:c"), "a_b_c");
+        assert_eq!(sanitize_component(""), "unnamed");
+        assert_eq!(sanitize_component("../etc"), ".._etc");
+    }
+
+    #[test]
+    fn build_targets_all_puts_control_first_then_shards() {
+        let targets = build_targets(
+            Some("postgres://localhost/app".to_owned()),
+            vec![
+                ("east".to_owned(), "postgres://localhost/east".to_owned()),
+                ("west".to_owned(), "postgres://localhost/west".to_owned()),
+            ],
+            &TargetSelector::All,
+        )
+        .unwrap();
+        let labels: Vec<&str> = targets.iter().map(|t| t.label.as_str()).collect();
+        assert_eq!(labels, ["control", "shard:east", "shard:west"]);
+    }
+
+    #[test]
+    fn build_targets_shard_only_shape_is_allowed() {
+        let targets = build_targets(
+            None,
+            vec![("east".to_owned(), "postgres://localhost/east".to_owned())],
+            &TargetSelector::All,
+        )
+        .unwrap();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].label, "shard:east");
+    }
+
+    #[test]
+    fn build_targets_all_with_no_url_errors() {
+        assert!(matches!(
+            build_targets(None, vec![], &TargetSelector::All),
+            Err(BackupError::NoUrl)
+        ));
+    }
+
+    #[test]
+    fn build_targets_control_only_ignores_shards() {
+        let targets = build_targets(
+            Some("postgres://localhost/app".to_owned()),
+            vec![("east".to_owned(), "postgres://localhost/east".to_owned())],
+            &TargetSelector::ControlOnly,
+        )
+        .unwrap();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].label, "control");
+    }
+
+    #[test]
+    fn build_targets_named_shard_selects_one() {
+        let targets = build_targets(
+            Some("postgres://localhost/app".to_owned()),
+            vec![
+                ("east".to_owned(), "postgres://localhost/east".to_owned()),
+                ("west".to_owned(), "postgres://localhost/west".to_owned()),
+            ],
+            &TargetSelector::Shard("west".to_owned()),
+        )
+        .unwrap();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].label, "shard:west");
+        assert_eq!(targets[0].url, "postgres://localhost/west");
+    }
+
+    #[test]
+    fn build_targets_unknown_shard_errors_with_known_list() {
+        let err = build_targets(
+            Some("postgres://localhost/app".to_owned()),
+            vec![("east".to_owned(), "postgres://localhost/east".to_owned())],
+            &TargetSelector::Shard("nope".to_owned()),
+        )
+        .unwrap_err();
+        match err {
+            BackupError::UnknownShard { name, known } => {
+                assert_eq!(name, "nope");
+                assert_eq!(known, vec!["east".to_owned()]);
+            }
+            other => panic!("expected UnknownShard, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plan_pruning_keeps_newest_n() {
+        let runs: Vec<String> = ["a", "b", "c", "d", "e"]
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect();
+        // keep 2 => remove the 3 oldest (a, b, c).
+        assert_eq!(
+            plan_pruning(&runs, 2),
+            vec!["a".to_owned(), "b".to_owned(), "c".to_owned()]
+        );
+        // keep >= len => remove nothing.
+        assert!(plan_pruning(&runs, 5).is_empty());
+        assert!(plan_pruning(&runs, 99).is_empty());
+    }
+
+    #[test]
+    fn plan_pruning_never_removes_everything_on_keep_zero() {
+        let runs: Vec<String> = ["a", "b"].iter().map(|s| (*s).to_owned()).collect();
+        // keep 0 is clamped to 1 so a just-taken backup survives.
+        assert_eq!(plan_pruning(&runs, 0), vec!["a".to_owned()]);
+    }
+
+    #[test]
+    fn candidate_bin_dirs_orders_override_then_managed() {
+        let dirs = candidate_bin_dirs(
+            Some(PathBuf::from("/opt/pg/bin")),
+            Some(PathBuf::from("/data/app/pg")),
+        );
+        assert_eq!(dirs[0], PathBuf::from("/opt/pg/bin"));
+        // Managed install bin is `<parent>/postgresql/bin`.
+        assert!(dirs.contains(&PathBuf::from("/data/app/postgresql/bin")));
+    }
+
+    #[test]
+    fn candidate_bin_dirs_empty_without_env() {
+        assert!(candidate_bin_dirs(None, None).is_empty());
+    }
+
+    #[test]
+    fn resolve_tool_in_falls_back_to_bare_name() {
+        // No candidate dir contains the tool => bare name for PATH lookup.
+        assert_eq!(
+            resolve_tool_in(&[PathBuf::from("/nonexistent")], "pg_dump"),
+            PathBuf::from("pg_dump")
+        );
+    }
+
+    #[test]
+    fn resolve_tool_in_prefers_existing_candidate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let exe = bin.join(exe_name("pg_dump"));
+        std::fs::write(&exe, b"#!/bin/sh\n").unwrap();
+        assert_eq!(resolve_tool_in(std::slice::from_ref(&bin), "pg_dump"), exe);
+    }
+
+    #[test]
+    fn toc_entry_count_ignores_comment_lines() {
+        let listing = "\
+;
+; Archive created at 2026-07-10
+;
+215; 1259 16385 TABLE public posts app
+216; 1259 16390 TABLE public comments app
+";
+        assert_eq!(toc_entry_count(listing), 2);
+    }
+
+    #[test]
+    fn toc_entry_count_zero_for_header_only() {
+        let listing = ";\n; only comments\n;\n";
+        assert_eq!(toc_entry_count(listing), 0);
+    }
+
+    #[test]
+    fn plain_dump_completion_marker_detected() {
+        assert!(plain_dump_is_complete(
+            "CREATE TABLE x();\n--\n-- PostgreSQL database dump complete\n--\n"
+        ));
+        assert!(!plain_dump_is_complete("CREATE TABLE x();\n-- truncated"));
+    }
+
+    #[test]
+    fn infer_format_from_extension() {
+        assert_eq!(
+            infer_format_from_path(Path::new("control.dump")),
+            Some(BackupFormat::Custom)
+        );
+        assert_eq!(
+            infer_format_from_path(Path::new("control.sql")),
+            Some(BackupFormat::Plain)
+        );
+        assert_eq!(infer_format_from_path(Path::new("control.txt")), None);
+    }
+
+    #[test]
+    fn parsed_db_name_is_credential_safe() {
+        let name = parsed_db_name("postgres://user:hunter2@db.example.com:6543/my_app");
+        assert_eq!(name, "my_app");
+        // Never leaks credentials.
+        assert!(!name.contains("hunter2"));
+        assert_eq!(parsed_db_name("not a url"), "(database)");
+    }
+
+    #[test]
+    fn restore_plan_select_filters_to_named_shard() {
+        let plan = RestorePlan {
+            dir: PathBuf::from("/x"),
+            format: BackupFormat::Custom,
+            entries: vec![
+                ManifestTarget {
+                    label: "control".to_owned(),
+                    file: "control.dump".to_owned(),
+                    database: "app".to_owned(),
+                },
+                ManifestTarget {
+                    label: "shard:east".to_owned(),
+                    file: "shard-east.dump".to_owned(),
+                    database: "east".to_owned(),
+                },
+            ],
+        };
+        let all = plan.select(None).unwrap();
+        assert_eq!(all.len(), 2);
+        let one = plan.select(Some("east")).unwrap();
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].label, "shard:east");
+        assert!(matches!(
+            plan.select(Some("nope")),
+            Err(BackupError::UnknownShard { .. })
+        ));
+    }
+
+    #[test]
+    fn manifest_round_trips_through_disk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manifest = Manifest {
+            autumn_version: "0.6.0".to_owned(),
+            created_at: "2026-07-10T04:05:06+00:00".to_owned(),
+            profile: "dev".to_owned(),
+            format: "custom".to_owned(),
+            targets: vec![ManifestTarget {
+                label: "control".to_owned(),
+                file: "control.dump".to_owned(),
+                database: "app".to_owned(),
+            }],
+        };
+        write_manifest(tmp.path(), &manifest).unwrap();
+        let read = read_manifest(tmp.path()).unwrap();
+        assert_eq!(read, manifest);
+    }
+
+    #[test]
+    fn errors_are_credential_safe() {
+        let e = BackupError::ProductionRefused {
+            profile: "prod".to_owned(),
+        };
+        let s = e.to_string();
+        assert!(s.contains("prod"));
+        assert!(!s.contains("postgres://"));
+    }
+
+    /// Docker/live-DB round-trip (AC #5). Ignored by default; run with a live
+    /// Postgres and the pg client tools available:
+    ///
+    /// ```text
+    /// DATABASE_URL=postgres://postgres:postgres@localhost:5432/autumn_backup_it \
+    ///   cargo test -p autumn-cli --lib -- --ignored backup_restore_round_trip
+    /// ```
+    ///
+    /// Proves seed → backup → drop rows → restore → row-level equality.
+    #[test]
+    #[ignore = "requires a live Postgres and pg_dump/pg_restore on PATH"]
+    fn backup_restore_round_trip() {
+        use diesel::connection::SimpleConnection as _;
+        use diesel::{Connection as _, PgConnection, RunQueryDsl as _, sql_query};
+
+        #[derive(diesel::QueryableByName)]
+        struct Count {
+            #[diesel(sql_type = diesel::sql_types::BigInt)]
+            n: i64,
+        }
+        #[derive(diesel::QueryableByName)]
+        struct Rt {
+            #[diesel(sql_type = diesel::sql_types::Integer)]
+            id: i32,
+            #[diesel(sql_type = diesel::sql_types::Text)]
+            name: String,
+        }
+
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("DATABASE_URL not set; skipping round-trip");
+            return;
+        };
+
+        // Seed a table with known rows.
+        let mut conn = PgConnection::establish(&url).expect("connect");
+        conn.batch_execute(
+            "DROP TABLE IF EXISTS backup_rt; \
+             CREATE TABLE backup_rt (id INT PRIMARY KEY, name TEXT NOT NULL); \
+             INSERT INTO backup_rt VALUES (1,'alpha'),(2,'beta'),(3,'gamma');",
+        )
+        .expect("seed");
+
+        // Backup (custom format) into a temp dir.
+        let tmp = tempfile::tempdir().unwrap();
+        let tools = PgTools::locate();
+        let pg_dump = tools.require("pg_dump").expect("pg_dump present");
+        let run_dir = tmp.path().join("run");
+        std::fs::create_dir_all(&run_dir).unwrap();
+        let targets = vec![ResolvedTarget {
+            label: "control".to_owned(),
+            url: url.clone(),
+        }];
+        backup_into(&run_dir, &targets, BackupFormat::Custom, &pg_dump, "dev")
+            .expect("backup succeeds and verifies");
+
+        // Simulate data loss.
+        conn.batch_execute("DELETE FROM backup_rt;")
+            .expect("delete");
+        let after_delete: Count = sql_query("SELECT COUNT(*) AS n FROM backup_rt")
+            .get_result(&mut conn)
+            .unwrap();
+        assert_eq!(after_delete.n, 0);
+
+        // Restore.
+        let artifact = run_dir.join("control.dump");
+        run_restore_one(&tools, &url, &artifact, BackupFormat::Custom, "dev")
+            .expect("restore succeeds");
+
+        // Row-level equality.
+        let rows: Vec<Rt> = sql_query("SELECT id, name FROM backup_rt ORDER BY id")
+            .load(&mut conn)
+            .unwrap();
+        let got: Vec<(i32, &str)> = rows.iter().map(|r| (r.id, r.name.as_str())).collect();
+        assert_eq!(got, vec![(1, "alpha"), (2, "beta"), (3, "gamma")]);
+
+        conn.batch_execute("DROP TABLE backup_rt;").ok();
+    }
+}
