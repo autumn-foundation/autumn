@@ -349,7 +349,26 @@ fn live_reload_script_body() -> String {
       // Track the version so the next (green) build, which bumps the version
       // and drops `build_error`, triggers a real reload below.
       if (state.build_error) {{
+        // Only (re)build the overlay DOM when the build-error content actually
+        // changes. `renderBuildErrorOverlay` tears down and recreates the whole
+        // overlay subtree, which resets scroll position and clears any
+        // in-progress text selection. Since we poll every 700ms, rebuilding on
+        // an unchanged version would make the errors impossible to read or copy
+        // once they scroll. The recorded version lives on the overlay element
+        // (`data-autumn-build-error-version`) and survives across polls.
+        const existingOverlay = document.getElementById(OVERLAY_ID);
+        if (
+          existingOverlay &&
+          existingOverlay.dataset.autumnBuildErrorVersion === String(state.version)
+        ) {{
+          version = state.version;
+          return;
+        }}
         renderBuildErrorOverlay(state.build_error);
+        const overlay = document.getElementById(OVERLAY_ID);
+        if (overlay) {{
+          overlay.dataset.autumnBuildErrorVersion = String(state.version);
+        }}
         version = state.version;
         return;
       }}
@@ -799,6 +818,40 @@ mod tests {
         assert!(
             js.contains(".style."),
             "overlay must apply styling via CSSOM .style.<prop> assignments"
+        );
+    }
+
+    #[test]
+    fn live_reload_script_body_guards_overlay_rebuild_by_version() {
+        // The overlay must only be rebuilt when the build-error content changes.
+        // Because `renderBuildErrorOverlay` tears down and recreates the overlay
+        // DOM (resetting scroll position and clearing text selection) and the
+        // client polls every 700ms, an unchanged `state.version` must NOT
+        // trigger a rebuild — otherwise a developer can never read or copy a
+        // scrolling error list. The guard records the rendered version on the
+        // overlay element and compares it against `state.version` before
+        // re-rendering.
+        let js = live_reload_script_body();
+
+        // The rendered version is recorded on the overlay element's dataset so
+        // it survives across polls.
+        assert!(
+            js.contains("dataset.autumnBuildErrorVersion"),
+            "overlay must record the rendered build-error version on its dataset"
+        );
+        // The build_error branch compares the recorded version against the
+        // freshly polled `state.version` before rebuilding.
+        assert!(
+            js.contains(
+                "existingOverlay.dataset.autumnBuildErrorVersion === String(state.version)"
+            ),
+            "overlay rebuild must be guarded by a version comparison"
+        );
+        // renderBuildErrorOverlay is still reachable for the first appearance
+        // and for genuinely new (version-bumped) failed builds.
+        assert!(
+            js.contains("renderBuildErrorOverlay(state.build_error)"),
+            "overlay must still render on first appearance / new build"
         );
     }
 
