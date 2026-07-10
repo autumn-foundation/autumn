@@ -4130,23 +4130,6 @@ fn norm_frac(v: f64, min: f64, max: f64) -> f64 {
     }
 }
 
-/// Map a value to a `0.0..=1.0` fraction for a **bar** height. Identical to
-/// [`norm_frac`] except for the degenerate zero-span domain (single point,
-/// all-equal values, or a `min == max` override): the `0.5` midline that suits a
-/// flat line would draw every bar at half height, implying nonzero magnitude for
-/// an all-zero series. Instead the fallback reads the shared value's sign — a
-/// non-positive value (including all-zero) yields `0.0` (no visible bar) and a
-/// positive value yields `1.0` (a full bar).
-#[cfg(feature = "maud")]
-fn bar_norm_frac(v: f64, min: f64, max: f64) -> f64 {
-    let span = max - min;
-    if span <= 0.0 {
-        if v.is_finite() && v > 0.0 { 1.0 } else { 0.0 }
-    } else {
-        norm_frac(v, min, max)
-    }
-}
-
 /// Compute the plotted `(x, y)` pixel coordinates for each point within a
 /// `w × h` viewBox, inset by `pad` on every edge.
 ///
@@ -4366,16 +4349,34 @@ pub fn bar_chart_with(series: &[(&str, f64)], config: &ChartConfig<'_>) -> maud:
     const PAD: f64 = 2.0;
     let (min, max) = resolve_bar_bounds(series, config);
     let usable_h = H - 2.0 * PAD;
+    let bottom = H - PAD;
+    let span = max - min;
+    // Bars diverge from the zero baseline: positive bars grow up from the zero
+    // line, negative bars grow down, and each bar's length is proportional to
+    // its magnitude. A degenerate span (`<= 0`, only reachable as an all-zero
+    // series once automatic bounds are zero-anchored) collapses every bar onto
+    // the baseline with zero height.
+    let zero_frac = if span > 0.0 {
+        ((0.0 - min) / span).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let y_zero = bottom - zero_frac * usable_h;
     let n = series.len();
     let body = maud::html! {
         @if n > 0 {
             @let slot = (W - 2.0 * PAD) / n as f64;
             @let bar_w = slot * 0.7;
             @for (i, (_, v)) in series.iter().enumerate() {
-                @let frac = bar_norm_frac(*v, min, max);
-                @let bar_h = frac * usable_h;
+                @let v_frac = if span > 0.0 && v.is_finite() {
+                    ((*v - min) / span).clamp(0.0, 1.0)
+                } else {
+                    zero_frac
+                };
+                @let y_v = bottom - v_frac * usable_h;
+                @let y = y_zero.min(y_v);
+                @let bar_h = (y_zero - y_v).abs();
                 @let x = PAD + i as f64 * slot + (slot - bar_w) / 2.0;
-                @let y = H - PAD - bar_h;
                 rect class="autumn-chart__bar" x=(fmt_coord(x)) y=(fmt_coord(y))
                     width=(fmt_coord(bar_w)) height=(fmt_coord(bar_h)) {}
             }
@@ -6242,6 +6243,73 @@ mod tests {
             heights[2]
         );
         assert!(html.contains(r#"height="0""#), "{html}");
+    }
+
+    #[test]
+    fn negative_bars_diverge_downward_largest_magnitude_is_tallest() {
+        // An all-negative series auto-resolves to bounds [-10, 0] (zero-anchored
+        // upper bound). Bars must grow DOWN from the zero line, with length
+        // proportional to |value| — so the largest-magnitude bar (-10) is the
+        // tallest, not collapsed to zero because it sits at the axis floor.
+        let html = bar_chart(&[("a", -10.0), ("b", -5.0)]).into_string();
+        assert!(!html.contains("NaN"), "{html}");
+        let heights = bar_heights(&html);
+        assert_eq!(heights.len(), 2, "{html}");
+        let (a, b) = (heights[0], heights[1]);
+        // -10 is the largest magnitude: it must be visible and TALLER than -5,
+        // never zero height.
+        assert!(a > 0.0, "largest-magnitude bar must be visible: {a}");
+        assert!(a > b, "|-10| taller than |-5|: {a} vs {b}");
+        // zero_frac = 1 (zero at the top). -10 -> full usable height (36).
+        assert!((a - 36.0).abs() < 1e-6, "-10 fills usable height: {a}");
+        // -5 -> half of full height (18).
+        assert!((b - 18.0).abs() < 1e-6, "-5 is half height: {b}");
+        assert!(
+            !html.contains(r#"height="0""#),
+            "no zero-height bar for a nonzero series: {html}"
+        );
+    }
+
+    /// Extract every `<rect>` `y="…"` value, in document (series) order.
+    #[cfg(test)]
+    fn bar_ys(html: &str) -> Vec<f64> {
+        html.match_indices(r#"y=""#)
+            .map(|(i, m)| {
+                let rest = &html[i + m.len()..];
+                let end = rest.find('"').unwrap();
+                rest[..end].parse::<f64>().unwrap()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn mixed_sign_bars_share_a_zero_baseline() {
+        // A mixed series [+10, -5] resolves to bounds [-5, 10]; the zero line
+        // sits 1/3 up from the bottom. The +10 bar must sit ABOVE the zero line
+        // and the -5 bar BELOW it, both meeting at the shared baseline y.
+        let html = bar_chart(&[("up", 10.0), ("down", -5.0)]).into_string();
+        assert!(!html.contains("NaN"), "{html}");
+        let heights = bar_heights(&html);
+        let ys = bar_ys(&html);
+        assert_eq!(heights.len(), 2, "{html}");
+        assert_eq!(ys.len(), 2, "{html}");
+        // Both bars have positive, visible height.
+        assert!(heights[0] > 0.0 && heights[1] > 0.0, "both visible: {html}");
+        // Shared zero line: bottom (H-PAD=38) - zero_frac*U. With min=-5, max=10,
+        // span=15, zero_frac = 5/15 = 1/3, U = 36 -> y_zero = 38 - 12 = 26.
+        let y_zero = 26.0;
+        // +10 bar: above the zero line, so its BOTTOM edge (y + height) meets it.
+        let up_bottom = ys[0] + heights[0];
+        assert!(
+            (up_bottom - y_zero).abs() < 1e-6,
+            "positive bar's bottom edge on the zero line: {up_bottom} vs {y_zero}"
+        );
+        // -5 bar: below the zero line, so its TOP edge (y) meets it.
+        assert!(
+            (ys[1] - y_zero).abs() < 1e-6,
+            "negative bar's top edge on the zero line: {} vs {y_zero}",
+            ys[1]
+        );
     }
 
     #[test]
