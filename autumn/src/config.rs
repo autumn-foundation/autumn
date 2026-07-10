@@ -3246,6 +3246,29 @@ impl AutumnConfig {
             "AUTUMN_AUTH__LOCKOUT__COOLOFF_SECS",
             &mut self.auth.lockout.cooloff_secs,
         );
+        parse_env(
+            env,
+            "AUTUMN_AUTH__PASSWORD__MIN_LENGTH",
+            &mut self.auth.password.min_length,
+        );
+        parse_env_bool(
+            env,
+            "AUTUMN_AUTH__PASSWORD__REJECT_COMMON",
+            &mut self.auth.password.reject_common,
+        );
+        if let Ok(val) = env.var("AUTUMN_AUTH__PASSWORD__BREACH_CHECK") {
+            match val.as_str() {
+                "off" => self.auth.password.breach_check = crate::auth::BreachCheck::Off,
+                "fail_open" => self.auth.password.breach_check = crate::auth::BreachCheck::FailOpen,
+                "fail_closed" => {
+                    self.auth.password.breach_check = crate::auth::BreachCheck::FailClosed;
+                }
+                other => eprintln!(
+                    "Warning: AUTUMN_AUTH__PASSWORD__BREACH_CHECK={other:?} is not valid \
+                     (expected off, fail_open, or fail_closed), ignoring"
+                ),
+            }
+        }
         #[cfg(feature = "oauth2")]
         {
             let provider_names: Vec<String> = self.auth.oauth2.providers.keys().cloned().collect();

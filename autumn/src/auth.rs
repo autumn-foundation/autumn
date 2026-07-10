@@ -73,6 +73,12 @@ use serde::Deserialize;
 #[cfg(feature = "oauth2")]
 use url::Url;
 
+pub mod password;
+pub use password::{
+    BreachCheck, PasswordConfig, PasswordFailure, PasswordPolicy, PasswordValidation,
+    validate_password,
+};
+
 // ── Password hashing ────────────────────────────────────────────
 
 /// Default bcrypt cost factor.
@@ -521,6 +527,20 @@ pub struct AuthConfig {
     /// ```
     #[serde(default)]
     pub sessions: SessionTrackingConfig,
+
+    /// Password policy: length, weak-password rejection, context-similarity,
+    /// and optional Have I Been Pwned (HIBP) breach checking.
+    ///
+    /// Configure in `autumn.toml`:
+    ///
+    /// ```toml
+    /// [auth.password]
+    /// min_length = 8
+    /// reject_common = true
+    /// breach_check = "off"  # "off" | "fail_open" | "fail_closed"
+    /// ```
+    #[serde(default)]
+    pub password: PasswordConfig,
 }
 
 /// Account lockout policy configuration.
@@ -1547,6 +1567,7 @@ impl Default for AuthConfig {
             lockout: LockoutConfig::default(),
             step_up: StepUpConfig::default(),
             sessions: SessionTrackingConfig::default(),
+            password: PasswordConfig::default(),
         }
     }
 }
