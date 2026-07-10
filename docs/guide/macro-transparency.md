@@ -378,6 +378,16 @@ consumed; nothing is left on the function.
   *above* `#[oauth2_callback]` is treated as standalone and silently dropped;
   put it *below* the callback instead (see
   [`#[oauth2_callback]`](#oauth2_callbackpath)).
+- **Only the standard HTTP route macros actually consume the metadata.** Being
+  listed in `ROUTE_ATTR_NAMES` only stops `#[api_doc]` from dropping *itself* as
+  standalone — it does **not** guarantee the paired macro reads the keys. Only
+  `#[get]`/`#[post]`/`#[put]`/`#[delete]`/`#[patch]` call `api_doc::extract` (in
+  `route.rs`) and fold the fields into their `ApiDoc`. `#[static_get]` and
+  `#[ws]` build their `ApiDoc` literal directly and never call
+  `api_doc::extract`, so an `#[api_doc(...)]` attached to a static route or
+  WebSocket handler is **silently discarded regardless of ordering** — the
+  OpenAPI entry keeps its defaults (and `#[ws]` stays `hidden`). Document those
+  endpoints with `OpenApiConfig::register_schema` instead.
 
 ### `#[autumn_web::main]`
 
@@ -1436,7 +1446,13 @@ anything from the surrounding environment is a compile error.
 ### `paths![]` (typed path helpers)
 
 Emits a `pub mod paths { … }` that re-exports each handler's typed path helper
-under its short name. Takes the same comma-separated handler list as `routes![]`.
+(`__autumn_path_*`) under its short name. Only the standard HTTP route macros —
+`#[get]`/`#[post]`/`#[put]`/`#[delete]`/`#[patch]` — emit that helper, so
+`paths![]` accepts **only** handlers annotated with those macros. Unlike
+`routes![]`, it does **not** accept `#[static_get]` or `#[ws]` handlers: those
+emit a route companion (and, for `static_get`, static metadata) but no
+`__autumn_path_*` helper, so listing one in `paths![]` fails to compile with an
+unresolved-import error.
 
 **You write:**
 
