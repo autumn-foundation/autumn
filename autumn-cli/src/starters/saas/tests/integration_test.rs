@@ -144,6 +144,8 @@ async fn db_client() -> TestClient {
             user_id      BIGINT      NOT NULL REFERENCES users (id) ON DELETE CASCADE,
             tenant_id    TEXT        NOT NULL,
             token_hash   TEXT        NOT NULL,
+            previous_token_hash TEXT NULL,
+            rotated_at   TIMESTAMPTZ NULL,
             expires_at   TIMESTAMPTZ NOT NULL,
             ip           TEXT        NOT NULL DEFAULT '',
             user_agent   TEXT        NOT NULL DEFAULT '',
@@ -166,10 +168,10 @@ async fn db_client() -> TestClient {
     // Drive tenancy through the middleware exactly as `autumn.toml` does.
     enable_tenancy(&mut config);
 
-    // Hand the remember middleware the shared pool, exactly as `main`'s startup
-    // hook does, and register the middleware layer so a remember cookie rotates
-    // into a session before the tenancy gate.
-    {{crate_name}}::remember::init_remember_pool(db.pool());
+    // Hand the remember middleware the shared pool and resolved config, exactly
+    // as `main`'s startup hook does, and register the middleware layer so a
+    // remember cookie rotates into a session before the tenancy gate.
+    {{crate_name}}::remember::init_remember_pool(db.pool(), autumn_web::auth::RememberConfig::default());
 
     TestApp::new()
         .routes(app_routes())
@@ -322,15 +324,24 @@ async fn tenants_are_isolated() {
     );
 }
 
-/// AC8 (issue #1397): the whole persistent remember-me lifecycle —
+/// AC8 (issue #1397): the whole persistent remember-me lifecycle, under the
+/// grace-window rotation model —
 ///   1. `POST /login` with `remember=on` sets BOTH a session cookie and a
-///      remember cookie;
+///      remember cookie (T0);
 ///   2. after a browser restart (session cookie dropped, remember cookie kept),
 ///      a protected route authenticates via the remember chain and ROTATES the
-///      remember cookie to a fresh value;
-///   3. replaying the ORIGINAL (rotated-out) cookie is detected as theft — the
-///      request is unauthorized and the whole chain is revoked, so even the
-///      rotated cookie no longer authenticates.
+///      remember cookie to a fresh value (T1);
+///   3. a SECOND restart rotates again (T2), pushing the ORIGINAL T0 out of the
+///      one-slot previous-token window — so replaying T0 can no longer be
+///      confused with a benign concurrent request;
+///   4. replaying the ORIGINAL T0 (matching neither current T2 nor previous T1)
+///      is detected as theft — the request is unauthorized and the whole chain
+///      is revoked, so even the latest rotated cookie (T2) no longer
+///      authenticates.
+///
+/// This demonstrates theft in a grace-INDEPENDENT way: an immediate replay of
+/// the just-rotated-out token is `Accept` (see the grace test below), so theft
+/// is proven by replaying a token that is two rotations stale.
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn remember_me_rotates_across_restart_and_detects_theft() {
@@ -365,20 +376,34 @@ async fn remember_me_rotates_across_restart_and_detects_theft() {
 
     // 2. Browser restart: the session cookie (no Max-Age) is cleared but the
     //    persistent remember cookie survives. A protected route must now
-    //    authenticate via the remember chain and rotate the cookie.
+    //    authenticate via the remember chain and rotate the cookie T0 → T1.
     client.log_out(); // clears only the session cookie
     let restart = client.get("/dashboard").send().await;
     restart.assert_ok();
-    let rotated_remember = named_cookie(&restart, "autumn.remember")
+    let rotated_once = named_cookie(&restart, "autumn.remember")
         .expect("a rotated request must set a fresh remember cookie");
     assert_ne!(
-        rotated_remember, original_remember,
+        rotated_once, original_remember,
         "the remember cookie must rotate on use"
     );
 
-    // 3. Theft: replay the ORIGINAL (now rotated-out) remember cookie with no
-    //    session cookie (an explicit `cookie` header bypasses the jar). It is a
-    //    known series with a stale token → theft: unauthorized, chain nuked.
+    // 3. Second restart: rotate again T1 → T2. Now the stored previous token is
+    //    T1, and the ORIGINAL T0 is beyond the one-slot grace window.
+    client.log_out();
+    let restart2 = client.get("/dashboard").send().await;
+    restart2.assert_ok();
+    let rotated_twice = named_cookie(&restart2, "autumn.remember")
+        .expect("a second rotated request must set another fresh remember cookie");
+    assert_ne!(
+        rotated_twice, rotated_once,
+        "the remember cookie must rotate again on the second use"
+    );
+
+    // 4. Theft: replay the ORIGINAL (two-rotations-stale) remember cookie with
+    //    no session cookie (an explicit `cookie` header bypasses the jar). It
+    //    matches neither the current nor the previous token → theft:
+    //    unauthorized, chain nuked.
+    client.log_out();
     let theft = client
         .get("/dashboard")
         .header("accept", "application/json")
@@ -387,12 +412,65 @@ async fn remember_me_rotates_across_restart_and_detects_theft() {
         .await;
     theft.assert_status(401);
 
-    // The chain was revoked, so even the *rotated* cookie no longer authenticates.
+    // The chain was revoked, so even the *latest* rotated cookie (T2) no longer
+    // authenticates.
     let after_theft = client
         .get("/dashboard")
         .header("accept", "application/json")
-        .header("cookie", &format!("autumn.remember={rotated_remember}"))
+        .header("cookie", &format!("autumn.remember={rotated_twice}"))
         .send()
         .await;
     after_theft.assert_status(401);
+}
+
+/// AC8 grace path (issue #1397): immediately replaying the just-rotated-out
+/// token — before any second rotation — is a benign concurrent request within
+/// the grace window (`Accept`), so it still authenticates and does NOT trip
+/// theft detection. This documents the intended concurrency behaviour that the
+/// theft test above deliberately steps around.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn remember_me_accepts_previous_token_within_grace() {
+    let client = db_client().await;
+
+    signup(&client, "grace@acme.test").await;
+    client.log_out();
+
+    // Log in with remember, capture T0.
+    let login = client
+        .post("/login")
+        .form("email=grace@acme.test&password=Tr0ubad0ur-Xy7-correct-horse&remember=on")
+        .send()
+        .await;
+    login.assert_status(303);
+    let original_remember = named_cookie(&login, "autumn.remember")
+        .expect("login with remember=on must set a remember cookie");
+
+    // Browser restart: one rotation T0 → T1.
+    client.log_out();
+    let restart = client.get("/dashboard").send().await;
+    restart.assert_ok();
+    let rotated_once = named_cookie(&restart, "autumn.remember")
+        .expect("a rotated request must set a fresh remember cookie");
+    assert_ne!(rotated_once, original_remember);
+
+    // Immediately replay the just-rotated-out T0 with no session. It is the
+    // stored previous token, still inside the grace window → Accept: the
+    // dashboard renders (authenticated) rather than 401.
+    client.log_out();
+    let within_grace = client
+        .get("/dashboard")
+        .header("cookie", &format!("autumn.remember={original_remember}"))
+        .send()
+        .await;
+    within_grace.assert_ok().assert_body_contains("Projects");
+
+    // The chain is intact, so the latest rotated cookie T1 still authenticates.
+    client.log_out();
+    client
+        .get("/dashboard")
+        .header("cookie", &format!("autumn.remember={rotated_once}"))
+        .send()
+        .await
+        .assert_ok();
 }

@@ -81,10 +81,11 @@ pub use password::{
 
 pub mod remember;
 pub use remember::{
-    RememberConfig, RememberCredential, RememberDecision, RememberRecord,
-    build_remember_clear_cookie, build_remember_cookie, constant_time_eq, evaluate_remember,
-    format_remember_cookie_value, generate_remember_credential, generate_token,
-    hash_remember_token, parse_remember_cookie_value, verify_remember_token,
+    DEFAULT_ROTATION_GRACE_SECS, RememberConfig, RememberCredential, RememberDecision,
+    RememberRecord, build_remember_clear_cookie, build_remember_cookie, constant_time_eq,
+    default_rotation_grace, evaluate_remember, format_remember_cookie_value,
+    generate_remember_credential, generate_token, hash_remember_token, parse_remember_cookie_value,
+    verify_remember_token,
 };
 
 // ── Password hashing ────────────────────────────────────────────

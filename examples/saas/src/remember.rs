@@ -26,8 +26,8 @@ use std::sync::OnceLock;
 
 use autumn_web::auth::{
     RememberConfig, RememberDecision, RememberRecord, build_remember_clear_cookie,
-    build_remember_cookie, evaluate_remember, generate_remember_credential, generate_token,
-    hash_remember_token, parse_remember_cookie_value,
+    build_remember_cookie, default_rotation_grace, evaluate_remember, generate_remember_credential,
+    generate_token, hash_remember_token, parse_remember_cookie_value,
 };
 use autumn_web::prelude::*;
 use autumn_web::reexports::axum::extract::Request;
@@ -45,14 +45,24 @@ use crate::schema::users;
 /// `main`) or by the integration-test harness. The remember middleware runs as
 /// a plain Tower layer with no access to `AppState`, so it checks out its
 /// connection from here.
-static REMEMBER_POOL: OnceLock<Pool<AsyncPgConnection>> = OnceLock::new();
+static REMEMBER_STATE: OnceLock<RememberMiddlewareState> = OnceLock::new();
 
-/// Install the shared pool the remember middleware checks connections out of.
+/// The process-wide state the remember middleware needs: the pool it checks
+/// connections out of plus the resolved `[auth.remember]` config, so
+/// `cookie_name`/`duration_secs`/`enabled` overrides in `autumn.toml` (or
+/// `AUTUMN_AUTH__REMEMBER__*`) are honoured instead of the compiled defaults
+/// (issue #1397.2).
+struct RememberMiddlewareState {
+    pool: Pool<AsyncPgConnection>,
+    config: RememberConfig,
+}
+
+/// Install the shared pool and resolved config the remember middleware uses.
 ///
 /// Idempotent: a second call is ignored, so a test that builds several clients
 /// against one shared database does not panic.
-pub fn init_remember_pool(pool: Pool<AsyncPgConnection>) {
-    let _ = REMEMBER_POOL.set(pool);
+pub fn init_remember_pool(pool: Pool<AsyncPgConnection>, config: RememberConfig) {
+    let _ = REMEMBER_STATE.set(RememberMiddlewareState { pool, config });
 }
 
 // ── Row types ────────────────────────────────────────────────────────────────
@@ -67,6 +77,13 @@ pub struct RememberToken {
     pub user_id: i64,
     pub tenant_id: String,
     pub token_hash: String,
+    /// SHA-256 of the token that was just rotated out, accepted during the
+    /// grace window so benign concurrent requests do not false-fire theft
+    /// detection (issue #1397).
+    pub previous_token_hash: Option<String>,
+    /// When the current token was minted (the last rotation). Bounds how long
+    /// `previous_token_hash` stays acceptable.
+    pub rotated_at: Option<chrono::DateTime<chrono::Utc>>,
     pub expires_at: chrono::DateTime<chrono::Utc>,
     pub ip: String,
     pub user_agent: String,
@@ -122,24 +139,34 @@ pub async fn find_remember_token(
         .optional()
 }
 
-/// Rotate a chain: overwrite the token hash, extend the sliding expiry, and
-/// stamp `last_used_at`.
+/// Atomically rotate a chain: move the current `token_hash` into
+/// `previous_token_hash`, install `new_hash`, stamp `rotated_at`/`last_used_at`,
+/// and extend the sliding expiry — but ONLY if the row still carries `old_hash`
+/// (compare-and-swap). Returns the number of rows affected (0 when a sibling
+/// request already rotated the chain, 1 on success), so the caller can detect a
+/// lost race and re-evaluate rather than silently double-rotating (issue #1397).
 pub async fn rotate_remember_token(
     conn: &mut AsyncPgConnection,
     series: &str,
+    old_hash: &str,
     new_hash: &str,
     new_expiry: chrono::DateTime<chrono::Utc>,
     now: chrono::DateTime<chrono::Utc>,
-) -> Result<(), diesel::result::Error> {
-    diesel::update(remember_tokens::table.find(series))
-        .set((
-            remember_tokens::token_hash.eq(new_hash),
-            remember_tokens::expires_at.eq(new_expiry),
-            remember_tokens::last_used_at.eq(now),
-        ))
-        .execute(conn)
-        .await?;
-    Ok(())
+) -> Result<usize, diesel::result::Error> {
+    diesel::update(
+        remember_tokens::table
+            .filter(remember_tokens::series.eq(series))
+            .filter(remember_tokens::token_hash.eq(old_hash)),
+    )
+    .set((
+        remember_tokens::previous_token_hash.eq(old_hash),
+        remember_tokens::token_hash.eq(new_hash),
+        remember_tokens::rotated_at.eq(now),
+        remember_tokens::expires_at.eq(new_expiry),
+        remember_tokens::last_used_at.eq(now),
+    ))
+    .execute(conn)
+    .await
 }
 
 /// Delete a single chain by series (the theft/logout revocation of one device).
@@ -233,12 +260,15 @@ fn append_set_cookie(response: &mut Response, value: &str) {
     }
 }
 
-/// Sliding expiry `duration_secs` in the future, guarding the `u64 → i64` cast.
+/// Sliding expiry `duration_secs` in the future, guarding the `u64 → i64` cast
+/// and saturating (rather than panicking) on an absurd configured duration.
 fn sliding_expiry(
     config: &RememberConfig,
     now: chrono::DateTime<chrono::Utc>,
 ) -> chrono::DateTime<chrono::Utc> {
-    now + chrono::Duration::seconds(i64::try_from(config.duration_secs).unwrap_or(2_592_000))
+    let secs = i64::try_from(config.duration_secs).unwrap_or(2_592_000);
+    now.checked_add_signed(chrono::Duration::seconds(secs))
+        .unwrap_or(chrono::DateTime::<chrono::Utc>::MAX_UTC)
 }
 
 // ── Issue on login ───────────────────────────────────────────────────────────
@@ -248,11 +278,11 @@ fn sliding_expiry(
 /// hash of the rotating token is stored.
 pub async fn issue_remember_cookie(
     conn: &mut AsyncPgConnection,
+    config: &RememberConfig,
     user_id: i64,
     tenant_id: &str,
     headers: &HeaderMap,
 ) -> AutumnResult<String> {
-    let config = RememberConfig::default();
     let cred = generate_remember_credential();
     let dev = device_info(headers);
     let row = NewRememberToken {
@@ -260,7 +290,7 @@ pub async fn issue_remember_cookie(
         user_id,
         tenant_id: tenant_id.to_owned(),
         token_hash: hash_remember_token(&cred.token),
-        expires_at: sliding_expiry(&config, chrono::Utc::now()),
+        expires_at: sliding_expiry(config, chrono::Utc::now()),
         ip: dev.ip,
         user_agent: dev.user_agent,
         ua_family: dev.ua_family,
@@ -271,7 +301,7 @@ pub async fn issue_remember_cookie(
         AutumnError::internal_server_error_msg(format!("Failed to persist remember token: {e}"))
     })?;
     Ok(build_remember_cookie(
-        &config,
+        config,
         &cred.series,
         &cred.token,
         request_is_secure(headers),
@@ -280,8 +310,11 @@ pub async fn issue_remember_cookie(
 
 /// Revoke the remember chain identified by the request's remember cookie (used
 /// by logout). No-op when the cookie is absent or malformed.
-pub async fn revoke_current_chain(conn: &mut AsyncPgConnection, headers: &HeaderMap) {
-    let config = RememberConfig::default();
+pub async fn revoke_current_chain(
+    conn: &mut AsyncPgConnection,
+    config: &RememberConfig,
+    headers: &HeaderMap,
+) {
     if let Some(value) = read_cookie(headers, &config.cookie_name)
         && let Some((series, _token)) = parse_remember_cookie_value(&value)
     {
@@ -291,18 +324,67 @@ pub async fn revoke_current_chain(conn: &mut AsyncPgConnection, headers: &Header
 
 /// The `Set-Cookie` value that clears the remember cookie in the browser.
 #[must_use]
-pub fn clear_remember_cookie() -> String {
-    build_remember_clear_cookie(&RememberConfig::default())
+pub fn clear_remember_cookie(config: &RememberConfig) -> String {
+    build_remember_clear_cookie(config)
 }
 
 // ── Consume on request (rotation + theft detection) ──────────────────────────
+
+/// Project a stored row into the pure [`RememberRecord`] the decision function
+/// evaluates.
+fn to_remember_record(r: &RememberToken) -> RememberRecord {
+    RememberRecord {
+        series: r.series.clone(),
+        token_hash: r.token_hash.clone(),
+        previous_token_hash: r.previous_token_hash.clone(),
+        rotated_at: r.rotated_at,
+        expires_at: r.expires_at,
+    }
+}
+
+/// Confirm the owning account still exists (a replayed cookie after an account
+/// deletion must not resurrect a session) and return its tenant.
+async fn confirm_account(conn: &mut AsyncPgConnection, user_id: i64) -> Option<String> {
+    users::table
+        .find(user_id)
+        .select(users::tenant_id)
+        .first(conn)
+        .await
+        .optional()
+        .ok()
+        .flatten()
+}
+
+/// Establish a real session for the chain's owner — the same shape the login
+/// handler writes, so the tenancy gate resolves the tenant.
+async fn establish_session(session: &Session, user_id: i64, tenant_id: &str) {
+    session.rotate_id().await;
+    session.insert("user_id", user_id.to_string()).await;
+    session.insert("tenant_id", tenant_id).await;
+}
+
+/// Proceed unauthenticated, clearing the remember cookie on the way out.
+async fn unauthenticated_clearing(
+    config: &RememberConfig,
+    request: Request,
+    next: Next,
+) -> Response {
+    let mut response = next.run(request).await;
+    append_set_cookie(&mut response, &clear_remember_cookie(config));
+    response
+}
 
 /// Global middleware: upgrade a request that has a valid remember cookie but no
 /// session into an authenticated one (rotating the token), or trip theft
 /// detection on a replayed cookie. Registered via `.layer(from_fn(..))` so it
 /// runs before the tenancy gate.
 pub async fn remember_me_middleware(session: Session, request: Request, next: Next) -> Response {
-    let config = RememberConfig::default();
+    // The resolved config + pool are stashed at startup; without them the
+    // middleware is inert.
+    let Some(mw_state) = REMEMBER_STATE.get() else {
+        return next.run(request).await;
+    };
+    let config = &mw_state.config;
 
     // Nothing to do when remember is disabled or the request is already
     // authenticated — the existing session wins.
@@ -318,10 +400,7 @@ pub async fn remember_me_middleware(session: Session, request: Request, next: Ne
         return next.run(request).await;
     };
 
-    let Some(pool) = REMEMBER_POOL.get() else {
-        return next.run(request).await;
-    };
-    let Ok(mut conn) = pool.get().await else {
+    let Ok(mut conn) = mw_state.pool.get().await else {
         return next.run(request).await;
     };
 
@@ -333,75 +412,100 @@ pub async fn remember_me_middleware(session: Session, request: Request, next: Ne
 
     let now = chrono::Utc::now();
     let secure = request_is_secure(request.headers());
-    let evaluated = record.as_ref().map(|r| RememberRecord {
-        series: r.series.clone(),
-        token_hash: r.token_hash.clone(),
-        expires_at: r.expires_at,
-    });
+    let grace = default_rotation_grace();
+    let evaluated = record.as_ref().map(to_remember_record);
 
-    match evaluate_remember(&token, evaluated.as_ref(), now) {
+    match evaluate_remember(&token, evaluated.as_ref(), now, grace) {
         RememberDecision::Rotate => {
             let row = record.expect("Rotate is only returned for a present record");
 
-            // Confirm the owning account still exists (a replayed cookie after
-            // an account deletion must not resurrect a session). The row is
-            // FK-cascaded, so a missing user means the chain is orphaned.
-            let tenant: Option<String> = users::table
-                .find(row.user_id)
-                .select(users::tenant_id)
-                .first(&mut *conn)
-                .await
-                .optional()
-                .ok()
-                .flatten();
-            let Some(tenant_id) = tenant else {
-                let _ = delete_remember_series(&mut conn, &series).await;
-                drop(conn);
-                let mut response = next.run(request).await;
-                append_set_cookie(&mut response, &clear_remember_cookie());
-                return response;
-            };
-
-            // Rotate the token and extend the sliding expiry BEFORE establishing
-            // the session, so the old cookie value can never be replayed.
+            // Atomic compare-and-swap rotation: only the request that still sees
+            // the current token wins. Extend the sliding expiry at the same time,
+            // BEFORE establishing the session, so the old cookie value can never
+            // be replayed.
             let new_token = generate_token();
             let new_hash = hash_remember_token(&new_token);
-            let new_expiry = sliding_expiry(&config, now);
-            if rotate_remember_token(&mut conn, &series, &new_hash, new_expiry, now)
-                .await
-                .is_err()
-            {
-                return next.run(request).await;
+            let new_expiry = sliding_expiry(config, now);
+            let affected = rotate_remember_token(
+                &mut conn,
+                &series,
+                &row.token_hash,
+                &new_hash,
+                new_expiry,
+                now,
+            )
+            .await
+            .unwrap_or(0);
+
+            if affected == 1 {
+                let Some(tenant_id) = confirm_account(&mut conn, row.user_id).await else {
+                    let _ = delete_remember_series(&mut conn, &series).await;
+                    drop(conn);
+                    return unauthenticated_clearing(config, request, next).await;
+                };
+                drop(conn);
+                establish_session(&session, row.user_id, &tenant_id).await;
+
+                let mut response = next.run(request).await;
+                append_set_cookie(
+                    &mut response,
+                    &build_remember_cookie(config, &series, &new_token, secure),
+                );
+                response
+            } else {
+                // Lost the race: a sibling request already rotated the chain.
+                // Re-select and re-evaluate the presented token against the new
+                // state before deciding.
+                let record2 = find_remember_token(&mut conn, &series).await.ok().flatten();
+                let evaluated2 = record2.as_ref().map(to_remember_record);
+                match evaluate_remember(&token, evaluated2.as_ref(), now, grace) {
+                    RememberDecision::Accept | RememberDecision::Rotate => {
+                        // Within grace (or somehow still current): authenticate
+                        // WITHOUT rotating again or re-cookieing — the browser
+                        // keeps its token, valid within the window.
+                        let Some(tenant_id) = confirm_account(&mut conn, row.user_id).await else {
+                            drop(conn);
+                            return unauthenticated_clearing(config, request, next).await;
+                        };
+                        drop(conn);
+                        establish_session(&session, row.user_id, &tenant_id).await;
+                        next.run(request).await
+                    }
+                    RememberDecision::Theft => {
+                        let _ = delete_remember_series(&mut conn, &series).await;
+                        drop(conn);
+                        unauthenticated_clearing(config, request, next).await
+                    }
+                    RememberDecision::Reject => {
+                        drop(conn);
+                        unauthenticated_clearing(config, request, next).await
+                    }
+                }
             }
+        }
+        RememberDecision::Accept => {
+            // A benign concurrent request presenting the just-rotated-out token
+            // within the grace window: authenticate without rotating or setting a
+            // new cookie.
+            let row = record.expect("Accept is only returned for a present record");
+            let Some(tenant_id) = confirm_account(&mut conn, row.user_id).await else {
+                drop(conn);
+                return unauthenticated_clearing(config, request, next).await;
+            };
             drop(conn);
-
-            // Establish a real session for the chain's owner — the same shape the
-            // login handler writes, so the tenancy gate resolves the tenant.
-            session.rotate_id().await;
-            session.insert("user_id", row.user_id.to_string()).await;
-            session.insert("tenant_id", &tenant_id).await;
-
-            let mut response = next.run(request).await;
-            append_set_cookie(
-                &mut response,
-                &build_remember_cookie(&config, &series, &new_token, secure),
-            );
-            response
+            establish_session(&session, row.user_id, &tenant_id).await;
+            next.run(request).await
         }
         RememberDecision::Theft => {
             // Replayed, rotated-out token for a known series: an attacker holds a
             // stale cookie. Nuke the whole chain and stay unauthenticated.
             let _ = delete_remember_series(&mut conn, &series).await;
             drop(conn);
-            let mut response = next.run(request).await;
-            append_set_cookie(&mut response, &clear_remember_cookie());
-            response
+            unauthenticated_clearing(config, request, next).await
         }
         RememberDecision::Reject => {
             drop(conn);
-            let mut response = next.run(request).await;
-            append_set_cookie(&mut response, &clear_remember_cookie());
-            response
+            unauthenticated_clearing(config, request, next).await
         }
     }
 }

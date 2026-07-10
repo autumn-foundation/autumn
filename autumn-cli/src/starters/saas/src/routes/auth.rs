@@ -113,9 +113,14 @@ pub async fn signup(
     }
     let validation = validate_password(&form.password, &policy, &[email.as_str()]).await;
     if !validation.is_valid() {
-        let message = validation
-            .first_message()
-            .unwrap_or_else(|| "Invalid password".to_owned());
+        // Show EVERY failure (e.g. both "too short" and "too common"), not just
+        // the first, so the user can fix all problems at once (issue #1345.6).
+        let messages = validation.messages();
+        let message = if messages.is_empty() {
+            "Invalid password".to_owned()
+        } else {
+            messages.join("\n")
+        };
         return Ok(signup_page(password_cfg.min_length, Some(&message)).into_response());
     }
 
@@ -223,10 +228,18 @@ pub async fn login(
     // the policy allows it, mint a rotating remember chain and attach its cookie
     // alongside the session cookie. Unticked → behaviour is unchanged.
     if form.remember.is_some() && state.config().auth.remember.enabled {
+        // Thread the resolved `[auth.remember]` config so cookie_name/duration
+        // overrides are honoured (issue #1397.2).
+        let remember_cfg = state.config().auth.remember.clone();
         // `Db` derefs to the underlying connection; `&mut *db` reborrows it.
-        let cookie =
-            crate::remember::issue_remember_cookie(&mut db, user.id, &user.tenant_id, &headers)
-                .await?;
+        let cookie = crate::remember::issue_remember_cookie(
+            &mut db,
+            &remember_cfg,
+            user.id,
+            &user.tenant_id,
+            &headers,
+        )
+        .await?;
         if let Ok(header_value) = HeaderValue::from_str(&cookie) {
             response.headers_mut().append(SET_COOKIE, header_value);
         }
@@ -238,11 +251,20 @@ pub async fn login(
 // ── Logout ───────────────────────────────────────────────────────────────────
 
 #[post("/logout")]
-pub async fn logout(session: Session, mut db: Db, headers: HeaderMap) -> AutumnResult<Response> {
+pub async fn logout(
+    session: Session,
+    State(state): State<AppState>,
+    mut db: Db,
+    headers: HeaderMap,
+) -> AutumnResult<Response> {
+    // Thread the resolved `[auth.remember]` config so an overridden cookie name
+    // is the one we revoke and clear (issue #1397.2).
+    let remember_cfg = state.config().auth.remember.clone();
+
     // Revoke this device's remember chain (issue #1397) before tearing the
     // session down, so a stolen remember cookie cannot re-establish a login
     // after logout. No-op when no remember cookie is present.
-    crate::remember::revoke_current_chain(&mut db, &headers).await;
+    crate::remember::revoke_current_chain(&mut db, &remember_cfg, &headers).await;
 
     // Clear the session contents and rotate the id so the old cookie cannot be
     // replayed.
@@ -250,7 +272,9 @@ pub async fn logout(session: Session, mut db: Db, headers: HeaderMap) -> AutumnR
     session.rotate_id().await;
 
     let mut response = Redirect::to("/").into_response();
-    if let Ok(header_value) = HeaderValue::from_str(&crate::remember::clear_remember_cookie()) {
+    if let Ok(header_value) =
+        HeaderValue::from_str(&crate::remember::clear_remember_cookie(&remember_cfg))
+    {
         response.headers_mut().append(SET_COOKIE, header_value);
     }
     Ok(response)

@@ -29,6 +29,8 @@ diesel::table! {
         user_id -> Int8,
         tenant_id -> Text,
         token_hash -> Text,
+        previous_token_hash -> Nullable<Text>,
+        rotated_at -> Nullable<Timestamptz>,
         expires_at -> Timestamptz,
         ip -> Text,
         user_agent -> Text,

@@ -27,7 +27,12 @@ async fn main() {
         .layer(from_fn({{crate_name}}::remember::remember_me_middleware))
         .on_startup(|state| async move {
             if let Some(pool) = state.pool() {
-                {{crate_name}}::remember::init_remember_pool(pool.clone());
+                // Hand the middleware the resolved `[auth.remember]` config too,
+                // so cookie_name/duration overrides are honoured (issue #1397.2).
+                {{crate_name}}::remember::init_remember_pool(
+                    pool.clone(),
+                    state.config().auth.remember.clone(),
+                );
             }
             Ok(())
         })
