@@ -29,6 +29,7 @@
 use std::fmt;
 use std::fmt::Write as _;
 use std::path::Path;
+use std::time::Duration;
 
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
@@ -46,6 +47,13 @@ const EMPTY_PAYLOAD_SHA256: &str =
 /// maximum) this covers a million objects — far beyond any backup prefix — while
 /// bounding a broken endpoint that never stops returning a continuation token.
 const MAX_LIST_PAGES: usize = 1000;
+/// Connect-phase timeout for the transfer client: fail fast on a dead host
+/// without bounding the total transfer duration.
+const TRANSFER_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+/// TCP-level inactivity guard (`TCP_USER_TIMEOUT`) for the transfer client:
+/// drop a stalled connection whose data stays unacknowledged this long, WITHOUT
+/// capping a healthy long-running multi-GB stream.
+const TRANSFER_STALL_TIMEOUT: Duration = Duration::from_secs(300);
 
 // ─── Credentials (never Debug/Display) ───────────────────────────────────────
 
@@ -408,13 +416,26 @@ impl S3Client {
         if let Some(endpoint) = &config.endpoint {
             validate_endpoint(endpoint)?;
         }
-        let http =
-            reqwest::blocking::Client::builder()
-                .build()
-                .map_err(|e| S3Error::Transport {
-                    op: "init",
-                    detail: e.to_string(),
-                })?;
+        let http = reqwest::blocking::Client::builder()
+            // reqwest's blocking default is a 30s TOTAL request timeout, which
+            // would abort a correctly-streaming multi-GB PUT/GET on a slow
+            // offsite link before it finishes. Disable the overall cap so long
+            // transfers aren't bounded by wall-clock…
+            .timeout(None)
+            // …but still fail fast on a dead/unreachable host…
+            .connect_timeout(TRANSFER_CONNECT_TIMEOUT)
+            // …and catch a stalled connection at the TCP layer WITHOUT capping
+            // total duration: TCP_USER_TIMEOUT drops the connection when sent
+            // data stays unacknowledged this long. reqwest 0.13's blocking
+            // builder has no per-read `read_timeout`, so this is the closest
+            // inactivity guard. Non-configurable sane constants (a configurable
+            // transfer timeout is a possible follow-up).
+            .tcp_user_timeout(TRANSFER_STALL_TIMEOUT)
+            .build()
+            .map_err(|e| S3Error::Transport {
+                op: "init",
+                detail: e.to_string(),
+            })?;
         Ok(Self {
             config,
             credentials,
@@ -1091,6 +1112,25 @@ mod tests {
             secret_access_key: "s".to_owned(),
         };
         assert!(S3Client::new(config, creds).is_err());
+    }
+
+    #[test]
+    fn client_builds_with_uncapped_transfer_timeouts() {
+        // The transfer client must construct with the overall timeout disabled
+        // (so multi-GB streams aren't capped) plus the connect/stall guards.
+        let config = S3Config {
+            bucket: "b".to_owned(),
+            region: "us-east-1".to_owned(),
+            endpoint: Some("https://minio.example:9000".to_owned()),
+            force_path_style: true,
+        };
+        let creds = S3Credentials {
+            access_key_id: "k".to_owned(),
+            secret_access_key: "s".to_owned(),
+        };
+        assert!(S3Client::new(config, creds).is_ok());
+        // Sanity-check the guard constants stay sane (fast connect, long stall).
+        assert!(TRANSFER_CONNECT_TIMEOUT < TRANSFER_STALL_TIMEOUT);
     }
 
     #[test]
