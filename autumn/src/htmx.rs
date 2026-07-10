@@ -508,6 +508,16 @@ impl maud::Render for HtmxFragments {
                 // in `.content` (empty `childNodes`), so the fragment would
                 // never land in the DOM (#1688). Element-replacing swaps keep
                 // the `<template>` carrier htmx unwraps by id.
+                //
+                // Because htmx inserts the carrier's direct `childNodes`, a
+                // fragment given to a positional swap must be a valid direct
+                // child of a `<div>`. Do NOT pass a bare `<tr>`/`<td>`/
+                // `<tbody>`/`<option>`/`<col>`: the HTML parser foster-parents
+                // those out of a `<div>`, so they vanish before htmx sees them.
+                // Table-row live swaps instead go through the element-replacing
+                // (`outerHTML` / `is_positional() == false`) path with the id on
+                // the row itself (see `channels.rs::sse_oob_envelope`); a
+                // positional table-row fragment API is a documented follow-up.
                 let carrier = if oob.strategy.is_positional() {
                     "div"
                 } else {
