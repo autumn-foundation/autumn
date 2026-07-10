@@ -1012,7 +1012,7 @@ async fn get_user(id: i64) -> AutumnResult<User> {
 ```rust
 async fn get_user(id: i64) -> AutumnResult<User> {
     static __AUTUMN_CACHE: OnceLock<MokaCache> = OnceLock::new();
-    let __autumn_moka = __AUTUMN_CACHE.get_or_init(|| MokaCache::new(100, Some(5m)));
+    let __autumn_moka = __AUTUMN_CACHE.get_or_init(|| MokaCache::new(100, Some(::core::time::Duration::from_secs(300))));
     // Prefer a process-wide shared backend (e.g. Redis) when registered,
     // else fall back to the per-function Moka store.
     let __autumn_cache = global_cache().unwrap_or(__autumn_moka);
