@@ -2164,10 +2164,17 @@ fn resolve_process_role_and_backend_from_sources<F>(
 where
     F: Fn(&str) -> Option<String>,
 {
+    // Mirror the runtime (`apply_role_env_overrides_with_env`): an invalid
+    // `AUTUMN_ROLE` env value is ignored and we fall through to the configured
+    // TOML `role`, rather than short-circuiting straight to `Combined`.
     let role = first_env(&env_var, &["AUTUMN_ROLE"])
-        .or_else(|| first_toml_string(table, &["role"]))
         .as_deref()
         .and_then(ProcessRole::from_env_value)
+        .or_else(|| {
+            first_toml_string(table, &["role"])
+                .as_deref()
+                .and_then(ProcessRole::from_env_value)
+        })
         .unwrap_or(ProcessRole::Combined);
 
     let jobs = table
@@ -4805,6 +4812,26 @@ foo = "bar"
         );
         assert_eq!(role, ProcessRole::Web);
         assert_eq!(backend, "postgres");
+    }
+
+    #[test]
+    fn resolve_process_role_falls_back_to_toml_when_env_role_invalid() {
+        // An invalid AUTUMN_ROLE must be ignored in favor of the configured
+        // TOML role, exactly like the runtime's apply_role_env_overrides_with_env.
+        let table: toml::Table =
+            toml::from_str("role = \"worker\"\n[jobs]\nbackend = \"local\"\n").expect("parse toml");
+        let (role, backend) = resolve_process_role_and_backend_from_sources(
+            |key| (key == "AUTUMN_ROLE").then(|| "garbage".to_owned()),
+            Some(&table),
+        );
+        assert_eq!(role, ProcessRole::Worker);
+        assert_eq!(backend, "local");
+
+        // ...and doctor therefore flags the split-on-local misconfiguration the
+        // runtime rejects at startup, instead of wrongly passing.
+        let result = check_split_topology_on_local(role, &backend);
+        assert_eq!(result.status, CheckStatus::Fail);
+        assert!(result.detail.unwrap_or_default().contains("worker"));
     }
 
     #[test]
