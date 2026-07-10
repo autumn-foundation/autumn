@@ -109,6 +109,7 @@ pub fn app() -> AppBuilder {
         cache_backend: None,
         #[cfg(feature = "reporting")]
         error_reporters: Vec::new(),
+        alert_channels: Vec::new(),
         #[cfg(feature = "openapi")]
         openapi: None,
         #[cfg(feature = "mcp")]
@@ -333,6 +334,12 @@ pub struct AppBuilder {
     /// the built-in [`LogReporter`](crate::reporting::LogReporter) is used.
     #[cfg(feature = "reporting")]
     pub(crate) error_reporters: Vec<Arc<dyn crate::reporting::ErrorReporter>>,
+    /// Operator-alert channels registered via [`AppBuilder::with_alert_channel`].
+    /// Combined with the built-in mail/webhook channels derived from
+    /// `[alerts]` config and installed onto `AppState` so the built-in
+    /// condition hooks can fan out to each. Empty means only config-derived
+    /// destinations are used. See [`crate::alerts`].
+    pub(crate) alert_channels: Vec<Arc<dyn crate::alerts::AlertChannel>>,
     /// `OpenAPI` generation configuration. When `Some`, the router mounts
     /// `/v3/api-docs` (serving `openapi.json`) and `/swagger-ui` (if the
     /// Swagger UI path is set). When `None`, no docs endpoints are mounted.
@@ -1860,6 +1867,48 @@ impl AppBuilder {
         self
     }
 
+    /// Register an operator-alert delivery channel.
+    ///
+    /// Alerts for the built-in conditions (dead-lettered jobs, Down health
+    /// indicators, 5xx-rate spikes, scheduled-task failures) are delivered to
+    /// every registered [`AlertChannel`](crate::alerts::AlertChannel) **plus**
+    /// the built-in mail/webhook channels derived from `[alerts]` config.
+    ///
+    /// This is the extension seam for additional transports (`PagerDuty`, Slack,
+    /// Discord — follow-up #1630): implement
+    /// [`AlertChannel`](crate::alerts::AlertChannel) and register it here. The
+    /// framework core never changes. Most apps need no code at all — configuring
+    /// an `email` and/or `webhook_url` under `[alerts]` is sufficient.
+    ///
+    /// ```rust,no_run
+    /// use autumn_web::alerts::{Alert, AlertChannel, AlertDeliveryError, AlertDeliveryFuture};
+    ///
+    /// struct PagerDuty;
+    /// impl AlertChannel for PagerDuty {
+    ///     fn name(&self) -> &'static str { "pagerduty" }
+    ///     fn deliver<'a>(&'a self, alert: &'a Alert) -> AlertDeliveryFuture<'a> {
+    ///         Box::pin(async move {
+    ///             let _ = (&alert.dedup_key, alert.severity);
+    ///             Ok::<(), AlertDeliveryError>(())
+    ///         })
+    ///     }
+    /// }
+    ///
+    /// # #[autumn_web::main]
+    /// # async fn main() {
+    /// autumn_web::app()
+    ///     .with_alert_channel(PagerDuty)
+    /// #   .routes(vec![])
+    /// #   ;
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn with_alert_channel<C: crate::alerts::AlertChannel>(mut self, channel: C) -> Self {
+        self.alert_channels
+            .push(Arc::new(channel) as Arc<dyn crate::alerts::AlertChannel>);
+        self
+    }
+
     /// Register a [`FlagStore`](crate::feature_flags::FlagStore) backend for
     /// feature-flag evaluation.
     ///
@@ -2601,6 +2650,7 @@ impl AppBuilder {
             cache_backend,
             #[cfg(feature = "reporting")]
             error_reporters,
+            alert_channels,
             #[cfg(feature = "openapi")]
             openapi,
             #[cfg(feature = "mcp")]
@@ -3038,6 +3088,12 @@ impl AppBuilder {
         state.insert_extension(crate::mail::MailPreviewRegistry::new(mail_previews));
         #[cfg(feature = "maud")]
         install_story_registry(&state, story_gallery);
+        // Operator alerts: build the built-in mail/webhook channels from
+        // `[alerts]` config, combine with any builder-registered channels, and
+        // start the background evaluation loop. No-op when nothing is
+        // configured. Installed after the mailer so the mail channel can bind
+        // to the live `Mailer` extension.
+        crate::alerts::install_from_config(&state, &config.alerts, alert_channels);
         if let Some(logger) = audit_logger {
             state.insert_extension::<crate::audit::AuditLogger>((*logger).clone());
         }
@@ -3737,6 +3793,7 @@ impl AppBuilder {
             cache_backend,
             #[cfg(feature = "reporting")]
             error_reporters,
+            alert_channels: _,
             #[cfg(feature = "openapi")]
             openapi,
             #[cfg(feature = "mcp")]
@@ -4971,6 +5028,7 @@ async fn execute_fixed_delay_task(
             state
                 .task_registry
                 .record_failure(&name, duration_ms, &error_str);
+            crate::alerts::notify_scheduled_task_failure(&state, &name, &error_str);
             tracing::warn!(task = %name, error = %error_str, "Task failed");
             send_ws_sys_task_msg(
                 &state,
@@ -5044,6 +5102,7 @@ async fn execute_cron_task(
             state
                 .task_registry
                 .record_failure(&name, duration_ms, &error_str);
+            crate::alerts::notify_scheduled_task_failure(&state, &name, &error_str);
             tracing::warn!(task = %name, error = %error_str, "Cron task failed");
             send_ws_sys_task_msg(
                 &state,

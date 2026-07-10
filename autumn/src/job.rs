@@ -3373,6 +3373,11 @@ async fn execute_local_job(
         state
             .job_registry
             .record_failure(&job.name, format!("unknown job '{}'", job.name), true);
+        crate::alerts::notify_dead_lettered_job(
+            state,
+            &job.name,
+            &format!("unknown job '{}'", job.name),
+        );
         job_admin.record_failure(&job.id, format!("unknown job '{}'", job.name));
         crate::job_tracking::settle_tracked_payload_as_failed(
             state,
@@ -3550,6 +3555,7 @@ async fn execute_local_job(
                 state
                     .job_registry
                     .record_failure(&job.name, error.clone(), true);
+                crate::alerts::notify_dead_lettered_job(state, &job.name, &error);
                 job_admin.record_failure(&job.id, error);
                 release_local_unique_hold(
                     coordination,
@@ -3565,6 +3571,7 @@ async fn execute_local_job(
             state
                 .job_registry
                 .record_failure(&job.name, error.clone(), true);
+            crate::alerts::notify_dead_lettered_job(state, &job.name, &error);
             job_admin.record_failure(&job.id, error);
             release_local_unique_hold(
                 coordination,
@@ -5308,6 +5315,7 @@ async fn recover_stale_redis_jobs(
                     state
                         .job_registry
                         .record_failure(&dead.name, error.clone(), true);
+                    crate::alerts::notify_dead_lettered_job(state, &dead.name, &error);
                     job_admin.record_failure(&dead.id, error);
                     // The worker that held this claim is gone and the job is
                     // now terminally dead-lettered — settle the tracked
@@ -5483,6 +5491,7 @@ async fn settle_failed_redis_job(
                     state
                         .job_registry
                         .record_failure(&dead.name, error.clone(), true);
+                    crate::alerts::notify_dead_lettered_job(state, &dead.name, &error);
                     job_admin.record_failure(&dead.id, error);
                 }
                 Ok(false) => tracing::warn!(
@@ -5518,6 +5527,7 @@ async fn dead_letter_panicked_redis_job(
             state
                 .job_registry
                 .record_failure(&dead.name, error.clone(), true);
+            crate::alerts::notify_dead_lettered_job(state, &dead.name, &error);
             job_admin.record_failure(&dead.id, error);
         }
         Ok(false) => tracing::warn!(
@@ -5546,6 +5556,7 @@ async fn dead_letter_invalid_redis_job(
     state
         .job_registry
         .record_failure(&record.name, error.to_owned(), true);
+    crate::alerts::notify_dead_lettered_job(state, &record.name, error);
     job_admin.record_failure(&record.id, error.to_owned());
     let mut dead = record.clone();
     clear_redis_claim(&mut dead);
@@ -5915,6 +5926,7 @@ fn record_pg_lifecycle_after_ack(
             state
                 .job_registry
                 .record_failure(job_name, error.to_owned(), true);
+            crate::alerts::notify_dead_lettered_job(state, job_name, error);
             job_admin.record_failure(job_id, error.to_owned());
         } else {
             // Non-terminal or successful outcome: decrement in_flight and
@@ -5944,6 +5956,7 @@ fn record_pg_lifecycle_after_ack(
             state
                 .job_registry
                 .record_failure(job_name, error.to_owned(), true);
+            crate::alerts::notify_dead_lettered_job(state, job_name, error);
             job_admin.record_failure(job_id, error.to_owned());
         }
     }

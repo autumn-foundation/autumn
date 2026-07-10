@@ -1075,6 +1075,15 @@ pub struct AutumnConfig {
     /// [`ObservabilityConfig`] and `docs/guide/observability/server-timing.md`.
     #[serde(default)]
     pub observability: ObservabilityConfig,
+
+    /// Operator alerts settings (`[alerts]` section in `autumn.toml`).
+    ///
+    /// Configure an operator email and/or a webhook URL to receive alerts for
+    /// built-in failure conditions (dead-lettered jobs, Down health indicators,
+    /// 5xx-rate spikes, scheduled-task failures) with zero application code.
+    /// See [`crate::alerts::AlertConfig`] and `docs/guide/operator-alerts.md`.
+    #[serde(default)]
+    pub alerts: crate::alerts::AlertConfig,
 }
 
 /// Observability configuration (`[observability]` section in `autumn.toml`).
@@ -2789,6 +2798,47 @@ impl AutumnConfig {
         self.apply_stories_env_overrides_with_env(env);
         self.apply_resilience_env_overrides_with_env(env);
         self.apply_time_zone_env_overrides_with_env(env);
+        self.apply_alerts_env_overrides_with_env(env);
+    }
+
+    fn apply_alerts_env_overrides_with_env(&mut self, env: &dyn Env) {
+        parse_env_bool(env, "AUTUMN_ALERTS__ENABLED", &mut self.alerts.enabled);
+        parse_env_option_string(env, "AUTUMN_ALERTS__EMAIL", &mut self.alerts.email);
+        parse_env_option_string(
+            env,
+            "AUTUMN_ALERTS__WEBHOOK_URL",
+            &mut self.alerts.webhook_url,
+        );
+        parse_env_option_string(
+            env,
+            "AUTUMN_ALERTS__WEBHOOK_SECRET",
+            &mut self.alerts.webhook_secret,
+        );
+        parse_env(
+            env,
+            "AUTUMN_ALERTS__DEDUP_WINDOW_SECS",
+            &mut self.alerts.dedup_window_secs,
+        );
+        parse_env(
+            env,
+            "AUTUMN_ALERTS__HEALTH_GRACE_SECS",
+            &mut self.alerts.health_grace_secs,
+        );
+        parse_env(
+            env,
+            "AUTUMN_ALERTS__ERROR_RATE_THRESHOLD",
+            &mut self.alerts.error_rate_threshold,
+        );
+        parse_env(
+            env,
+            "AUTUMN_ALERTS__ERROR_RATE_MIN_REQUESTS",
+            &mut self.alerts.error_rate_min_requests,
+        );
+        parse_env(
+            env,
+            "AUTUMN_ALERTS__EVAL_INTERVAL_SECS",
+            &mut self.alerts.eval_interval_secs,
+        );
     }
 
     fn apply_time_zone_env_overrides_with_env(&mut self, env: &dyn Env) {

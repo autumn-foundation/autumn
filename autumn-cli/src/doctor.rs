@@ -383,6 +383,57 @@ pub fn check_trusted_hosts_impl(hosts: &[String], is_production: bool) -> CheckR
     }
 }
 
+/// Check that an operator-alert destination is configured (issue #1610).
+///
+/// Operator alerts (dead-lettered jobs, Down health indicators, 5xx-rate
+/// spikes, scheduled-task failures) are only delivered when an `[alerts]`
+/// destination — an operator `email` and/or a `webhook_url` — is configured.
+///
+/// - **Production** (`is_production = true`): warns when neither is configured,
+///   so a deploy does not run silently blind to its own failures.
+/// - **Dev/test**: passes quietly (alerts are optional locally).
+///
+/// The returned check name is `"alert_destination"`.
+pub fn check_alert_destination_impl(
+    email_configured: bool,
+    webhook_configured: bool,
+    is_production: bool,
+) -> CheckResult {
+    if email_configured || webhook_configured {
+        return CheckResult {
+            name: "alert_destination",
+            status: CheckStatus::Pass,
+            detail: Some("operator alert destination configured".into()),
+            hint: None,
+        };
+    }
+    if is_production {
+        CheckResult {
+            name: "alert_destination",
+            status: CheckStatus::Warn,
+            detail: Some(
+                "no operator alert destination configured in production; failure conditions \
+                 (dead-lettered jobs, Down health indicators, 5xx spikes, scheduled-task \
+                 failures) will not be delivered anywhere"
+                    .into(),
+            ),
+            hint: Some(
+                "Set [alerts] email and/or webhook_url (or AUTUMN_ALERTS__EMAIL / \
+                 AUTUMN_ALERTS__WEBHOOK_URL). See docs/guide/operator-alerts.md",
+            ),
+        }
+    } else {
+        CheckResult {
+            name: "alert_destination",
+            status: CheckStatus::Pass,
+            detail: Some(
+                "no operator alert destination configured (optional outside production)".into(),
+            ),
+            hint: None,
+        }
+    }
+}
+
 /// Check a single `[auth.oauth2.<provider>]` entry for common misconfigurations.
 ///
 /// - In production (`is_production = true`): fails when `client_secret` is empty.
@@ -2515,6 +2566,54 @@ fn resolve_trusted_hosts() -> Vec<String> {
     parse_hosts(&table)
 }
 
+/// Resolve whether an operator-alert destination (email and/or webhook URL) is
+/// configured, from the environment or `autumn.toml` `[alerts]`.
+///
+/// Returns `(email_configured, webhook_configured)`.
+fn resolve_alert_destination() -> (bool, bool) {
+    let env_set = |name: &str| {
+        std::env::var(name)
+            .ok()
+            .is_some_and(|v| !v.trim().is_empty())
+    };
+    let mut email = env_set("AUTUMN_ALERTS__EMAIL");
+    let mut webhook = env_set("AUTUMN_ALERTS__WEBHOOK_URL");
+
+    if !(email && webhook) {
+        let table = read_autumn_toml_table().unwrap_or_default();
+        let profile = std::env::var("AUTUMN_ENV")
+            .ok()
+            .or_else(|| std::env::var("AUTUMN_PROFILE").ok())
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase();
+
+        let str_set = |root: &toml::Table, key: &str| {
+            root.get("alerts")
+                .and_then(|a| a.get(key))
+                .and_then(toml::Value::as_str)
+                .is_some_and(|s| !s.trim().is_empty())
+        };
+
+        let mut check = |root: &toml::Table| {
+            email = email || str_set(root, "email");
+            webhook = webhook || str_set(root, "webhook_url");
+        };
+
+        if !profile.is_empty()
+            && let Some(profile_table) = table
+                .get("profile")
+                .and_then(|v| v.get(&profile))
+                .and_then(toml::Value::as_table)
+        {
+            check(profile_table);
+        }
+        check(&table);
+    }
+
+    (email, webhook)
+}
+
 /// Resolve whether the active profile is production from the environment or
 /// `autumn.toml`.
 fn resolve_is_production() -> bool {
@@ -2628,6 +2727,7 @@ pub fn run(opts: DoctorOptions) {
     let rate_limit_key_strategy = resolve_rate_limit_key_strategy();
     let auth_extractor_mounted = resolve_auth_extractor_mounted();
     let compression_enabled = resolve_compression_enabled();
+    let (alert_email_configured, alert_webhook_configured) = resolve_alert_destination();
     let proxy_conflict_data = resolve_proxy_conflict_data();
     let (dotenv_has_example, dotenv_has_env, dotenv_uncovered) = resolve_dotenv_state();
 
@@ -2834,6 +2934,15 @@ pub fn run(opts: DoctorOptions) {
     // 12. Compression (warn in production when disabled)
     tasks.push(Box::new(move || {
         check_compression_impl(compression_enabled, is_production)
+    }));
+
+    // 12a. Operator alerts (warn in production when no destination configured)
+    tasks.push(Box::new(move || {
+        check_alert_destination_impl(
+            alert_email_configured,
+            alert_webhook_configured,
+            is_production,
+        )
     }));
 
     // 12b. Local-dev `.env` handling (warn on `.env.example` without `.env`,
@@ -4341,6 +4450,34 @@ pub struct Vault {
         let result = check_trusted_hosts_impl(&["example.com".to_owned(), "*".to_owned()], true);
         assert_eq!(result.name, "trusted_hosts");
         assert!(matches!(result.status, CheckStatus::Warn));
+    }
+
+    // ── check_alert_destination_impl (issue #1610) ───────────────────────────
+
+    #[test]
+    fn alert_destination_warns_in_production_when_none() {
+        let r = check_alert_destination_impl(false, false, true);
+        assert_eq!(r.name, "alert_destination");
+        assert!(matches!(r.status, CheckStatus::Warn));
+        assert!(r.hint.is_some());
+    }
+
+    #[test]
+    fn alert_destination_passes_in_production_with_email() {
+        let r = check_alert_destination_impl(true, false, true);
+        assert!(matches!(r.status, CheckStatus::Pass));
+    }
+
+    #[test]
+    fn alert_destination_passes_in_production_with_webhook() {
+        let r = check_alert_destination_impl(false, true, true);
+        assert!(matches!(r.status, CheckStatus::Pass));
+    }
+
+    #[test]
+    fn alert_destination_passes_in_dev_without_destination() {
+        let r = check_alert_destination_impl(false, false, false);
+        assert!(matches!(r.status, CheckStatus::Pass));
     }
 
     // ── compute_summary ──────────────────────────────────────────────────────

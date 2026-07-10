@@ -68,6 +68,13 @@ extern crate self as autumn_web;
 
 pub mod actuator;
 pub mod aggregate;
+/// Operator alerts for built-in failure conditions.
+///
+/// Connects built-in failure signals (dead-lettered jobs, Down health
+/// indicators, 5xx-rate spikes, scheduled-task failures) to the app's
+/// configured mailer and signed outbound webhook behind `[alerts]` config —
+/// with zero application code. See [`mod@alerts`].
+pub mod alerts;
 pub mod app;
 pub mod assets;
 pub mod audit;
