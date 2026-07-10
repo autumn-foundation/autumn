@@ -10935,8 +10935,8 @@ mod tests {
     // worker loop runs. On the in-process `local` backend the enqueue channel's
     // receiver lives on the (skipped) ingress task, so a web-role enqueue fails
     // with "channel closed" — which is precisely why a split web/worker topology
-    // must NOT use the local backend (enforced by `split_role_on_local_backend`
-    // + the startup guard). The durable-backend equivalent (a web replica
+    // must NOT use the local backend (enforced by
+    // `split_role_requires_durable_backend` + the startup guard). The durable-backend equivalent (a web replica
     // enqueues, a worker replica drains) is covered by the Docker-gated
     // `web_role_does_not_execute_jobs_while_worker_role_does` integration test.
     #[tokio::test]

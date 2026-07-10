@@ -2652,20 +2652,25 @@ impl AppBuilder {
             load_config_and_telemetry(config_loader_factory, telemetry_provider).await;
 
         // Process role selects which slice of the runtime this replica runs. A
-        // split role (web/worker) on the in-process `local` jobs backend cannot
-        // work: the web replica would enqueue into an in-memory queue no worker
-        // can drain, and a worker replica's in-memory queue starts empty. Reject
-        // it here — before any boot work — rather than in `validate()` so the
-        // doctor can still load the config. Combined role is always fine.
+        // split role (web/worker) requires a durable jobs backend the separate
+        // HTTP and worker processes can share. Any backend that isn't a
+        // recognized durable one (`postgres`/`redis`) — the in-process `local`
+        // queue, a typo, or a blank value — falls through to the per-process
+        // local runtime: the web replica would enqueue into an in-memory queue no
+        // worker can drain, and a worker replica's queue starts empty. Reject it
+        // here — before any boot work — rather than in `validate()` so the doctor
+        // can still load the config. Combined role is always fine.
         let role = config.role;
-        if crate::config::split_role_on_local_backend(role, &config.jobs.backend) {
+        if crate::config::split_role_requires_durable_backend(role, &config.jobs.backend) {
             tracing::error!(
                 role = role.as_str(),
                 jobs_backend = %config.jobs.backend,
-                "process role '{}' requires a durable jobs backend: the in-process \
-                 'local' backend cannot be shared across a split web/worker topology. \
+                "process role '{}' requires a durable jobs backend: backend '{}' is not \
+                 a recognized durable backend and falls through to the in-process 'local' \
+                 runtime, which cannot be shared across a split web/worker topology. \
                  Set jobs.backend = \"postgres\" or \"redis\", or run the combined role.",
                 role.as_str(),
+                config.jobs.backend,
             );
             #[cfg(feature = "managed-pg")]
             crate::managed_pg::emergency_stop_async().await;
@@ -3329,8 +3334,14 @@ impl AppBuilder {
             crate::repository_commit_hooks::set_global_channels(state.channels().clone());
         }
 
+        // Draining durable after-commit hook rows is background execution, so gate
+        // it on the process role exactly like the `#[job]` runtime above: a `web`
+        // replica must not claim/execute hook rows (that work belongs to the
+        // worker tier), while `worker`/`combined` replicas keep running it.
         #[cfg(feature = "db")]
-        if let Some(pool) = state.pool().cloned() {
+        if role.runs_workers()
+            && let Some(pool) = state.pool().cloned()
+        {
             #[cfg(feature = "ws")]
             {
                 let channels = state.channels().clone();
@@ -3347,9 +3358,13 @@ impl AppBuilder {
             );
         }
         // Repositories built over a shard pool (`with_pool`) enqueue durable
-        // commit hooks into that shard's queue table; drain each one too.
+        // commit hooks into that shard's queue table; drain each one too — again
+        // only on a role that runs workers, so a web replica leaves shard hook
+        // rows for the worker tier.
         #[cfg(feature = "db")]
-        if let Some(shards) = state.shards() {
+        if role.runs_workers()
+            && let Some(shards) = state.shards()
+        {
             for shard in shards.iter() {
                 #[cfg(feature = "ws")]
                 crate::repository_commit_hooks::start_repository_commit_hook_worker(
@@ -8039,6 +8054,27 @@ mod tests {
                     .find(task_worker)
                     .expect("task runner path should start repository hook worker"),
             "task runner startup must initialize jobs before repository commit hooks can enqueue them"
+        );
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn repository_commit_hook_workers_are_gated_on_worker_role() {
+        // Draining durable after-commit hook rows is background execution, so the
+        // primary-pool and shard commit-hook worker starts on the normal server
+        // path must both be guarded by `role.runs_workers()` — a web-role replica
+        // must not claim/execute hook rows (that work belongs to the worker tier).
+        let source = include_str!("app.rs").replace("\r\n", "\n");
+        let primary_gate =
+            "if role.runs_workers()\n            && let Some(pool) = state.pool().cloned()";
+        let shard_gate = "if role.runs_workers()\n            && let Some(shards) = state.shards()";
+        assert!(
+            source.contains(primary_gate),
+            "primary-pool commit-hook worker must be gated on role.runs_workers()"
+        );
+        assert!(
+            source.contains(shard_gate),
+            "shard commit-hook workers must be gated on role.runs_workers()"
         );
     }
 

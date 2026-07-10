@@ -1047,7 +1047,10 @@ fn write_mode_file(paths: &RuntimePaths, opts: &ServeOptions) {
     let mode = ModeFile {
         release: opts.release,
         profile: opts.profile.clone().or_else(env_profile),
-        role: opts.role.clone(),
+        // Persist the *effective* role: the explicit `--role`, else the
+        // `AUTUMN_ROLE` an env-selected daemon inherited, so a later bare
+        // `restart` recovers it instead of dropping back to combined.
+        role: effective_role_from(opts.role.clone(), std::env::var("AUTUMN_ROLE").ok()),
     };
     let Ok(toml) = toml::to_string(&mode) else {
         return;
@@ -1384,6 +1387,24 @@ fn env_profile() -> Option<String> {
                 .ok()
                 .filter(|s| !s.trim().is_empty())
         })
+}
+
+/// The effective process role to record for `restart` recovery: the explicit
+/// `--role` when set, else the `AUTUMN_ROLE` value the daemon selected via its
+/// environment (trimmed, blank treated as absent).
+///
+/// `AUTUMN_ROLE=worker autumn serve --daemon` picks the role through the env the
+/// child inherits, so `opts.role` is `None`; recording only `opts.role` would let
+/// a later bare `autumn serve restart` (from a shell without `AUTUMN_ROLE`)
+/// silently relaunch as the combined default. Separated from the env read so the
+/// precedence/normalization is unit-testable without mutating the process
+/// environment.
+fn effective_role_from(explicit: Option<String>, env_value: Option<String>) -> Option<String> {
+    explicit.or_else(|| {
+        env_value
+            .map(|v| v.trim().to_owned())
+            .filter(|v| !v.is_empty())
+    })
 }
 
 /// Resolve `(prestop_grace_secs, shutdown_timeout_secs)` with the app's layering
@@ -2093,5 +2114,35 @@ mod tests {
             Some("worker"),
             "restart must recover the persisted --role",
         );
+    }
+
+    #[test]
+    fn effective_role_prefers_flag_then_env() {
+        // `AUTUMN_ROLE=worker autumn serve --daemon` selects the role via the env
+        // the child inherits (so `opts.role` is None); write_mode_file records the
+        // effective role through this seam so a bare `serve restart` from a shell
+        // without `AUTUMN_ROLE` recovers it instead of relaunching as combined.
+        // The crate forbids `unsafe`, so this exercises the pure precedence/
+        // normalization core rather than mutating the real process environment.
+
+        // An explicit `--role` always wins over the environment.
+        assert_eq!(
+            effective_role_from(Some("web".to_owned()), Some("worker".to_owned())).as_deref(),
+            Some("web"),
+        );
+        // No flag: fall back to a non-blank `AUTUMN_ROLE`, trimmed — this is the
+        // env-selected-daemon case that `restart` must recover.
+        assert_eq!(
+            effective_role_from(None, Some("worker".to_owned())).as_deref(),
+            Some("worker"),
+        );
+        assert_eq!(
+            effective_role_from(None, Some("  worker  ".to_owned())).as_deref(),
+            Some("worker"),
+        );
+        // A blank or absent `AUTUMN_ROLE` leaves the role unset (combined default),
+        // so the CLI never records a bogus empty role.
+        assert_eq!(effective_role_from(None, Some("   ".to_owned())), None);
+        assert_eq!(effective_role_from(None, None), None);
     }
 }

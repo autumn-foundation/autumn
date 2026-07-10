@@ -1354,20 +1354,24 @@ fn check_database_topology_contract(
 /// Verify the selected process role is compatible with the jobs backend.
 ///
 /// A split web/worker role runs the HTTP tier and the job/scheduler tier in
-/// **separate processes**. The `local` jobs backend is an in-process, in-memory
-/// queue, so a web replica's enqueue never reaches a worker replica's queue.
-/// [`autumn_web::config::split_role_on_local_backend`] flags that invalid combo;
-/// the app itself rejects it at startup, and doctor surfaces it up front.
+/// **separate processes**, so it needs a durable jobs backend the two processes
+/// can share. Only the recognized durable backends (`postgres`/`redis`) qualify;
+/// any other value — the in-process `local` queue, a typo like `postgresql`, or a
+/// blank backend — falls through to the per-process local runtime, where a web
+/// replica's enqueue never reaches a worker replica's queue.
+/// [`autumn_web::config::split_role_requires_durable_backend`] flags that invalid
+/// combo; the app itself rejects it at startup, and doctor surfaces it up front.
 fn check_split_topology_on_local(role: ProcessRole, jobs_backend: &str) -> CheckResult {
     let backend = jobs_backend.trim();
-    if autumn_web::config::split_role_on_local_backend(role, jobs_backend) {
+    if autumn_web::config::split_role_requires_durable_backend(role, jobs_backend) {
         return CheckResult {
             name: "process_role_backend",
             status: CheckStatus::Fail,
             detail: Some(format!(
                 "role={} with jobs.backend=\"{backend}\": a split web/worker role needs a durable \
-                 (postgres/redis) jobs backend because `local` is in-process and cannot share a \
-                 job queue across the separate web and worker processes",
+                 (postgres/redis) jobs backend; \"{backend}\" is not a recognized durable backend \
+                 and falls through to the in-process `local` runtime, which cannot share a job \
+                 queue across the separate web and worker processes",
                 role.as_str(),
             )),
             hint: Some(
@@ -4781,6 +4785,42 @@ foo = "bar"
         let detail = result.detail.unwrap_or_default();
         assert!(detail.contains("role=web"), "got: {detail}");
         assert!(detail.contains("postgres"), "got: {detail}");
+    }
+
+    #[test]
+    fn split_topology_passes_for_worker_role_on_redis_backend() {
+        let result = check_split_topology_on_local(ProcessRole::Worker, "redis");
+        assert_eq!(result.status, CheckStatus::Pass);
+        let detail = result.detail.unwrap_or_default();
+        assert!(detail.contains("role=worker"), "got: {detail}");
+        assert!(detail.contains("redis"), "got: {detail}");
+    }
+
+    #[test]
+    fn split_topology_fails_on_web_role_with_backend_typo() {
+        // A typo like `postgresql` is not a recognized durable backend: it falls
+        // through to the in-process local runtime, so a split role must be
+        // rejected exactly as it is for the literal `local`.
+        let result = check_split_topology_on_local(ProcessRole::Web, "postgresql");
+        assert_eq!(result.status, CheckStatus::Fail);
+        let detail = result.detail.unwrap_or_default();
+        assert!(
+            detail.contains("web"),
+            "detail must name the role: {detail}"
+        );
+        assert!(
+            detail.contains("postgresql"),
+            "detail must name the offending backend: {detail}"
+        );
+        assert!(result.hint.unwrap_or_default().contains("postgres"));
+    }
+
+    #[test]
+    fn split_topology_fails_on_web_role_with_blank_backend() {
+        // A blank backend also falls through to the local runtime.
+        let result = check_split_topology_on_local(ProcessRole::Web, "");
+        assert_eq!(result.status, CheckStatus::Fail);
+        assert!(result.detail.unwrap_or_default().contains("web"));
     }
 
     #[test]

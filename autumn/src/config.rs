@@ -1660,16 +1660,24 @@ impl ProcessRole {
 }
 
 /// Whether a `role` / `jobs.backend` combination is invalid because a split
-/// role sits on the in-process `local` jobs backend.
+/// (web/worker) role sits on a non-durable jobs backend.
 ///
-/// The `local` backend is a per-process, in-memory queue: a [`Web`](ProcessRole::Web)
-/// replica would enqueue into a queue no separate worker can drain, and a
-/// [`Worker`](ProcessRole::Worker) replica's in-memory queue starts empty. Split
-/// topologies therefore require a durable backend (`postgres` or `redis`). The
-/// combined role is always fine because it enqueues and drains in one process.
+/// A split role runs the HTTP tier and the job/scheduler tier in **separate
+/// processes**, so it needs a jobs backend the two processes can share. Only the
+/// recognized durable backends [`start_runtime`](crate::job::start_runtime)
+/// dispatches to durably — exactly `"postgres"` or `"redis"` — qualify. Every
+/// other value (the in-process `"local"` queue, a typo like `"postgresql"`, or a
+/// blank backend) falls through to the per-process local runtime, where a
+/// [`Web`](ProcessRole::Web) replica would enqueue into a queue no separate
+/// worker can drain and a [`Worker`](ProcessRole::Worker) replica's queue starts
+/// empty. The match is intentionally exact (no trim/case-fold) so this guard and
+/// `start_runtime`'s dispatch agree precisely on which backends are durable.
+///
+/// The combined role is always valid because it enqueues and drains in one
+/// process. Returns `true` when the combination is **invalid**.
 #[must_use]
-pub fn split_role_on_local_backend(role: ProcessRole, jobs_backend: &str) -> bool {
-    role != ProcessRole::Combined && jobs_backend.trim().eq_ignore_ascii_case("local")
+pub fn split_role_requires_durable_backend(role: ProcessRole, jobs_backend: &str) -> bool {
+    role != ProcessRole::Combined && !matches!(jobs_backend, "postgres" | "redis")
 }
 
 /// Scheduled task coordination runtime configuration.
@@ -9932,20 +9940,52 @@ redirect_uri = "http://localhost:3000/auth/github/callback"
     }
 
     #[test]
-    fn split_role_on_local_backend_truth_table() {
-        // Combined is always fine (enqueues and drains in one process).
-        assert!(!split_role_on_local_backend(ProcessRole::Combined, "local"));
-        assert!(!split_role_on_local_backend(
+    fn split_role_requires_durable_backend_truth_table() {
+        // Combined is always fine (enqueues and drains in one process), even on
+        // the in-process local backend.
+        assert!(!split_role_requires_durable_backend(
+            ProcessRole::Combined,
+            "local"
+        ));
+        assert!(!split_role_requires_durable_backend(
             ProcessRole::Combined,
             "postgres"
         ));
-        // Split roles on the in-process local backend are invalid.
-        assert!(split_role_on_local_backend(ProcessRole::Web, "local"));
-        assert!(split_role_on_local_backend(ProcessRole::Worker, "local"));
-        assert!(split_role_on_local_backend(ProcessRole::Web, "LOCAL"));
-        // Split roles on durable backends are fine.
-        assert!(!split_role_on_local_backend(ProcessRole::Web, "postgres"));
-        assert!(!split_role_on_local_backend(ProcessRole::Worker, "redis"));
+        // Split roles on any backend that falls through to the per-process local
+        // runtime are invalid: the literal `local`, a typo like `postgresql`, a
+        // blank backend, or any other unknown value.
+        assert!(split_role_requires_durable_backend(
+            ProcessRole::Web,
+            "local"
+        ));
+        assert!(split_role_requires_durable_backend(
+            ProcessRole::Worker,
+            "local"
+        ));
+        assert!(split_role_requires_durable_backend(
+            ProcessRole::Web,
+            "postgresql"
+        ));
+        assert!(split_role_requires_durable_backend(ProcessRole::Web, ""));
+        assert!(split_role_requires_durable_backend(
+            ProcessRole::Web,
+            "unknown"
+        ));
+        // The match is exact (mirroring `start_runtime`'s dispatch), so a
+        // case-variant like `LOCAL` is likewise a non-durable fall-through.
+        assert!(split_role_requires_durable_backend(
+            ProcessRole::Web,
+            "LOCAL"
+        ));
+        // Split roles on the recognized durable backends are fine.
+        assert!(!split_role_requires_durable_backend(
+            ProcessRole::Web,
+            "postgres"
+        ));
+        assert!(!split_role_requires_durable_backend(
+            ProcessRole::Worker,
+            "redis"
+        ));
     }
 
     #[test]
