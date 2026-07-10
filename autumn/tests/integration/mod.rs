@@ -207,6 +207,8 @@ mod widgets_avatar;
 #[cfg(feature = "maud")]
 mod widgets_badge;
 #[cfg(feature = "maud")]
+mod widgets_charts;
+#[cfg(feature = "maud")]
 mod widgets_infinite_feed;
 mod widgets_modal;
 mod widgets_tabs;
