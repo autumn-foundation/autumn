@@ -147,12 +147,25 @@ impl PolicyContext {
         // `set_actor` sites) — without this, such a route's versioned writes
         // would fall back to `SYSTEM_ACTOR` even though a real user is in scope.
         //
-        // Only an *ambient* seed: it never overrides an explicit `AuditEvent`
-        // actor or a `before_*` hook's `ctx.actor`. `set_actor` is a no-op
-        // outside an established request scope, so this stays panic-safe for
-        // non-request callers (e.g. hand-rolled policy unit tests), and it never
-        // publishes for an anonymous session (guarded on `Some`).
-        if let Some(user_id) = &user_id {
+        // This session seed is only a *fallback*: it never overrides an
+        // already-established principal. If a stronger actor is already in scope
+        // — an API-token bearer, `RequireAuth`/`#[secured]`, or an explicit
+        // `with_actor(...)` scope — `Current::actor()` is already `Some`, so we
+        // skip the seed and the stronger actor wins (a request carrying both a
+        // bearer token and a session cookie stays attributed to the token
+        // principal). It also never overrides an explicit `AuditEvent` actor or a
+        // `before_*` hook's `ctx.actor`, which are applied downstream.
+        //
+        // In-request but with nothing yet published, the empty `CURRENT_ACTOR`
+        // scope makes `Current::actor()` return `None` (an in-scope unset does not
+        // consult the process default), so a pure policy+session route still gets
+        // seeded here. `set_actor` is a no-op outside an established request scope,
+        // so this stays panic-safe for non-request callers (e.g. hand-rolled
+        // policy unit tests), and it never publishes for an anonymous session
+        // (guarded on `Some`).
+        if crate::current::Current::actor().is_none()
+            && let Some(user_id) = &user_id
+        {
             crate::current::Current::set_actor(user_id.clone());
         }
 
@@ -1184,6 +1197,27 @@ mod tests {
             let c = PolicyContext::from_session(&session, "user_id").await;
             assert!(c.user_id.is_none());
             assert_eq!(crate::current::Current::actor(), None);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn from_session_does_not_override_existing_actor() {
+        // The session seed is only a fallback. When a stronger principal is
+        // already established — an API-token bearer, RequireAuth/#[secured], or an
+        // explicit `with_actor(...)` scope — `from_session` must NOT clobber it,
+        // even if the request also carries a session cookie for a different user.
+        crate::current::scope_request(async {
+            crate::current::Current::set_actor("token-principal".to_owned());
+            let session = session_with(Some("42"), Some("editor"));
+            let c = PolicyContext::from_session(&session, "user_id").await;
+            // The session user is still resolved into the context...
+            assert_eq!(c.user_id.as_deref(), Some("42"));
+            // ...but the already-established principal wins as the ambient actor.
+            assert_eq!(
+                crate::current::Current::actor(),
+                Some("token-principal".to_owned())
+            );
         })
         .await;
     }
