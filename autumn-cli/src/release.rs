@@ -49,7 +49,13 @@ impl std::str::FromStr for Target {
 
 #[derive(Clone, Copy)]
 pub enum ReleaseAction {
-    Init { force: bool, target: Target },
+    Init {
+        force: bool,
+        target: Target,
+        /// Scaffold a separate `worker` service (docker-compose target) that runs
+        /// the app's worker role alongside a web-only `app` service.
+        split_workers: bool,
+    },
 }
 
 pub fn run(action: ReleaseAction) {
@@ -61,13 +67,17 @@ pub fn run(action: ReleaseAction) {
     });
 
     match action {
-        ReleaseAction::Init { force, target } => {
+        ReleaseAction::Init {
+            force,
+            target,
+            split_workers,
+        } => {
             let project_name = read_project_name(&cwd).unwrap_or_else(|e| {
                 eprintln!("Error: {e}");
                 std::process::exit(1);
             });
 
-            match init(&cwd, &project_name, force, target) {
+            match init(&cwd, &project_name, force, target, split_workers) {
                 Ok(files) => {
                     for f in &files {
                         println!("  Created {f}");
@@ -197,6 +207,7 @@ pub fn init(
     project_name: &str,
     force: bool,
     target: Target,
+    split_workers: bool,
 ) -> Result<Vec<String>, ReleaseError> {
     let files = planned_files(target);
 
@@ -216,7 +227,10 @@ pub fn init(
 
     let mut created = Vec::new();
     for (name, template) in files {
-        fs::write(dir.join(name), render(template, project_name, embed))?;
+        fs::write(
+            dir.join(name),
+            render(template, project_name, embed, split_workers),
+        )?;
         created.push(name.to_string());
     }
     Ok(created)
@@ -244,7 +258,26 @@ fn project_has_embed_assets(dir: &Path) -> bool {
         .is_some_and(|features| features.contains_key("embed-assets"))
 }
 
-fn render(template: &str, project_name: &str, embed: bool) -> String {
+/// The extra `worker:` service block spliced into the docker-compose output when
+/// `--split-workers` is set. Runs the SAME image (`build: .`) and default
+/// entrypoint as the `app` service, but with `AUTUMN_ROLE=worker` so it runs the
+/// job workers + scheduler only. Shares the app's database URL, signing secret,
+/// and one-shot migration gate. Both tiers use the durable `postgres` jobs
+/// backend so the queue is shared across the separate web and worker processes
+/// (the in-process `local` backend can't span processes).
+const WORKER_SERVICE_BLOCK: &str = "\n  worker:\n    build: .\n    environment:\n      \
+AUTUMN_PROFILE: prod\n      AUTUMN_ROLE: worker\n      AUTUMN_JOBS__BACKEND: postgres\n      \
+AUTUMN_DATABASE__PRIMARY_URL: postgres://autumn:autumn@db:5432/{{project_name}}_prod\n      \
+AUTUMN_SECURITY__SIGNING_SECRET: \"${AUTUMN_SECURITY__SIGNING_SECRET:?set it first}\"\n    \
+depends_on:\n      db:\n        condition: service_healthy\n      migrate:\n        \
+condition: service_completed_successfully\n    restart: unless-stopped\n";
+
+/// The web-tier role env spliced into the `app` service when `--split-workers`
+/// is set: pin the app to the HTTP-only `web` role and the shared `postgres`
+/// jobs backend so enqueues land in the queue the worker process drains.
+const WEB_ROLE_ENV: &str = "\n      AUTUMN_ROLE: web\n      AUTUMN_JOBS__BACKEND: postgres";
+
+fn render(template: &str, project_name: &str, embed: bool, split_workers: bool) -> String {
     let (build_step, static_copy) = if embed {
         (
             "# Single-binary build: fingerprint static assets, then compile with the\n\
@@ -262,7 +295,18 @@ fn render(template: &str, project_name: &str, embed: bool) -> String {
             "COPY --chown=autumn:autumn --from=builder /app/static /app/static\n",
         )
     };
+    // Split-topology placeholders exist only in the docker-compose template, so
+    // these replacements are no-ops for the other files. Substitute them before
+    // `{{project_name}}` so the worker block's own `{{project_name}}` tokens are
+    // resolved by the shared replacement below.
+    let (worker_service, web_role_env) = if split_workers {
+        (WORKER_SERVICE_BLOCK, WEB_ROLE_ENV)
+    } else {
+        ("", "")
+    };
     template
+        .replace("{{worker_service}}", worker_service)
+        .replace("{{app_role_env}}", web_role_env)
         .replace("{{project_name}}", project_name)
         .replace(
             "{{rust_version}}",
@@ -314,7 +358,7 @@ mod tests {
     fn init_creates_dockerfile() {
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
-        init(&dir, "my-app", false, Target::Default).unwrap();
+        init(&dir, "my-app", false, Target::Default, false).unwrap();
         assert!(dir.join("Dockerfile").is_file(), "Dockerfile not created");
     }
 
@@ -322,7 +366,7 @@ mod tests {
     fn init_creates_dockerignore() {
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
-        init(&dir, "my-app", false, Target::Default).unwrap();
+        init(&dir, "my-app", false, Target::Default, false).unwrap();
         assert!(
             dir.join(".dockerignore").is_file(),
             ".dockerignore not created"
@@ -333,7 +377,7 @@ mod tests {
     fn init_creates_production_config_example() {
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
-        init(&dir, "my-app", false, Target::Default).unwrap();
+        init(&dir, "my-app", false, Target::Default, false).unwrap();
         assert!(
             dir.join("autumn.production.toml.example").is_file(),
             "autumn.production.toml.example not created"
@@ -344,7 +388,7 @@ mod tests {
     fn init_returns_list_of_created_files() {
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
-        let files = init(&dir, "my-app", false, Target::Default).unwrap();
+        let files = init(&dir, "my-app", false, Target::Default, false).unwrap();
         assert!(files.contains(&"Dockerfile".to_string()));
         assert!(files.contains(&".dockerignore".to_string()));
         assert!(files.contains(&"autumn.production.toml.example".to_string()));
@@ -356,7 +400,7 @@ mod tests {
     fn dockerfile_has_cargo_chef_stages() {
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
-        init(&dir, "my-app", false, Target::Default).unwrap();
+        init(&dir, "my-app", false, Target::Default, false).unwrap();
         let content = fs::read_to_string(dir.join("Dockerfile")).unwrap();
         assert!(
             content.contains("cargo-chef"),
@@ -376,7 +420,7 @@ mod tests {
     fn dockerfile_uses_declared_msrv_for_rust_build_image() {
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
-        init(&dir, "my-app", false, Target::Default).unwrap();
+        init(&dir, "my-app", false, Target::Default, false).unwrap();
         let content = fs::read_to_string(dir.join("Dockerfile")).unwrap();
         let msrv = option_env!("CARGO_PKG_RUST_VERSION").unwrap_or("1.88.0");
 
@@ -394,7 +438,7 @@ mod tests {
     fn dockerfile_has_three_stages() {
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
-        init(&dir, "my-app", false, Target::Default).unwrap();
+        init(&dir, "my-app", false, Target::Default, false).unwrap();
         let content = fs::read_to_string(dir.join("Dockerfile")).unwrap();
         let from_count = content.lines().filter(|l| l.starts_with("FROM ")).count();
         assert!(
@@ -407,7 +451,7 @@ mod tests {
     fn dockerfile_copies_production_config_as_runtime_autumn_toml() {
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
-        init(&dir, "my-app", false, Target::Default).unwrap();
+        init(&dir, "my-app", false, Target::Default, false).unwrap();
         let content = fs::read_to_string(dir.join("Dockerfile")).unwrap();
         assert!(
             content.contains("autumn.production.toml.example"),
@@ -420,7 +464,7 @@ mod tests {
     fn dockerfile_runtime_uses_debian_slim() {
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
-        init(&dir, "my-app", false, Target::Default).unwrap();
+        init(&dir, "my-app", false, Target::Default, false).unwrap();
         let content = fs::read_to_string(dir.join("Dockerfile")).unwrap();
         assert!(
             content.contains("debian:bookworm-slim"),
@@ -432,7 +476,7 @@ mod tests {
     fn dockerfile_runtime_installs_libpq_and_tini() {
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
-        init(&dir, "my-app", false, Target::Default).unwrap();
+        init(&dir, "my-app", false, Target::Default, false).unwrap();
         let content = fs::read_to_string(dir.join("Dockerfile")).unwrap();
         assert!(
             content.contains("libpq"),
@@ -455,7 +499,7 @@ mod tests {
         // its Docker build keeps working.
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
-        init(&dir, "my-app", false, Target::Default).unwrap();
+        init(&dir, "my-app", false, Target::Default, false).unwrap();
         let content = fs::read_to_string(dir.join("Dockerfile")).unwrap();
         assert!(
             content.contains("RUN cargo build --release"),
@@ -483,7 +527,7 @@ mod tests {
              [features]\nembed-assets = [\"autumn-web/embed-assets\"]\n",
         )
         .unwrap();
-        init(&dir, "my-app", false, Target::Default).unwrap();
+        init(&dir, "my-app", false, Target::Default, false).unwrap();
         let content = fs::read_to_string(dir.join("Dockerfile")).unwrap();
         assert!(
             content.contains("autumn build --embed"),
@@ -499,7 +543,7 @@ mod tests {
     fn dockerfile_copies_migrations() {
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
-        init(&dir, "my-app", false, Target::Default).unwrap();
+        init(&dir, "my-app", false, Target::Default, false).unwrap();
         let content = fs::read_to_string(dir.join("Dockerfile")).unwrap();
         assert!(
             content.contains("migrations"),
@@ -511,7 +555,7 @@ mod tests {
     fn dockerfile_defers_migrations_to_one_shot_primary_job() {
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
-        init(&dir, "my-app", false, Target::Default).unwrap();
+        init(&dir, "my-app", false, Target::Default, false).unwrap();
         let content = fs::read_to_string(dir.join("Dockerfile")).unwrap();
         assert!(
             !content.contains("auto_migrate_in_production = true"),
@@ -527,7 +571,7 @@ mod tests {
     fn dockerfile_installs_autumn_cli_for_migration_jobs() {
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
-        init(&dir, "my-app", false, Target::Default).unwrap();
+        init(&dir, "my-app", false, Target::Default, false).unwrap();
         let content = fs::read_to_string(dir.join("Dockerfile")).unwrap();
         assert!(
             content.contains("cargo install")
@@ -541,7 +585,7 @@ mod tests {
     fn dockerfile_installs_diesel_cli_for_migration_jobs() {
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
-        init(&dir, "my-app", false, Target::Default).unwrap();
+        init(&dir, "my-app", false, Target::Default, false).unwrap();
         let content = fs::read_to_string(dir.join("Dockerfile")).unwrap();
         assert!(
             content.contains("cargo install")
@@ -557,7 +601,7 @@ mod tests {
     fn dockerfile_has_healthcheck() {
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
-        init(&dir, "my-app", false, Target::Default).unwrap();
+        init(&dir, "my-app", false, Target::Default, false).unwrap();
         let content = fs::read_to_string(dir.join("Dockerfile")).unwrap();
         assert!(
             content.contains("HEALTHCHECK"),
@@ -573,7 +617,7 @@ mod tests {
     fn dockerfile_exposes_port_3000() {
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
-        init(&dir, "my-app", false, Target::Default).unwrap();
+        init(&dir, "my-app", false, Target::Default, false).unwrap();
         let content = fs::read_to_string(dir.join("Dockerfile")).unwrap();
         assert!(
             content.contains("EXPOSE 3000"),
@@ -585,7 +629,7 @@ mod tests {
     fn dockerfile_substitutes_project_name() {
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-blog");
-        init(&dir, "my-blog", false, Target::Default).unwrap();
+        init(&dir, "my-blog", false, Target::Default, false).unwrap();
         let content = fs::read_to_string(dir.join("Dockerfile")).unwrap();
         assert!(
             content.contains("my-blog"),
@@ -607,7 +651,7 @@ mod tests {
     fn dockerignore_excludes_target() {
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
-        init(&dir, "my-app", false, Target::Default).unwrap();
+        init(&dir, "my-app", false, Target::Default, false).unwrap();
         let content = fs::read_to_string(dir.join(".dockerignore")).unwrap();
         assert!(
             content.contains("target"),
@@ -619,7 +663,7 @@ mod tests {
     fn dockerignore_excludes_git() {
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
-        init(&dir, "my-app", false, Target::Default).unwrap();
+        init(&dir, "my-app", false, Target::Default, false).unwrap();
         let content = fs::read_to_string(dir.join(".dockerignore")).unwrap();
         assert!(content.contains(".git"), ".dockerignore must exclude .git");
     }
@@ -628,7 +672,7 @@ mod tests {
     fn dockerignore_excludes_node_modules() {
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
-        init(&dir, "my-app", false, Target::Default).unwrap();
+        init(&dir, "my-app", false, Target::Default, false).unwrap();
         let content = fs::read_to_string(dir.join(".dockerignore")).unwrap();
         assert!(
             content.contains("node_modules"),
@@ -640,7 +684,7 @@ mod tests {
     fn dockerignore_excludes_dist() {
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
-        init(&dir, "my-app", false, Target::Default).unwrap();
+        init(&dir, "my-app", false, Target::Default, false).unwrap();
         let content = fs::read_to_string(dir.join(".dockerignore")).unwrap();
         assert!(content.contains("dist"), ".dockerignore must exclude dist/");
     }
@@ -649,7 +693,7 @@ mod tests {
     fn dockerignore_excludes_master_key() {
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
-        init(&dir, "my-app", false, Target::Default).unwrap();
+        init(&dir, "my-app", false, Target::Default, false).unwrap();
         let content = fs::read_to_string(dir.join(".dockerignore")).unwrap();
         assert!(
             content.contains("/config/master.key") || content.contains("config/master.key"),
@@ -663,7 +707,7 @@ mod tests {
     fn production_config_template_documents_signing_secret_env_var() {
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
-        init(&dir, "my-app", false, Target::Default).unwrap();
+        init(&dir, "my-app", false, Target::Default, false).unwrap();
         let content = fs::read_to_string(dir.join("autumn.production.toml.example")).unwrap();
         assert!(
             content.contains("AUTUMN_SECURITY__SIGNING_SECRET"),
@@ -675,7 +719,7 @@ mod tests {
     fn production_config_template_documents_openssl_rand_command() {
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
-        init(&dir, "my-app", false, Target::Default).unwrap();
+        init(&dir, "my-app", false, Target::Default, false).unwrap();
         let content = fs::read_to_string(dir.join("autumn.production.toml.example")).unwrap();
         assert!(
             content.contains("openssl rand -hex 32"),
@@ -687,7 +731,7 @@ mod tests {
     fn production_config_template_mentions_signing_secrets_guide() {
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
-        init(&dir, "my-app", false, Target::Default).unwrap();
+        init(&dir, "my-app", false, Target::Default, false).unwrap();
         let content = fs::read_to_string(dir.join("autumn.production.toml.example")).unwrap();
         assert!(
             content.contains("signing-secrets.md"),
@@ -740,7 +784,7 @@ previous_secrets = []
     fn production_config_has_placeholder_db_url_not_real_credentials() {
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
-        init(&dir, "my-app", false, Target::Default).unwrap();
+        init(&dir, "my-app", false, Target::Default, false).unwrap();
         let content = fs::read_to_string(dir.join("autumn.production.toml.example")).unwrap();
         // Must have a DB URL entry
         assert!(
@@ -764,7 +808,7 @@ previous_secrets = []
     fn production_config_has_placeholder_for_project_name() {
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-blog");
-        init(&dir, "my-blog", false, Target::Default).unwrap();
+        init(&dir, "my-blog", false, Target::Default, false).unwrap();
         let content = fs::read_to_string(dir.join("autumn.production.toml.example")).unwrap();
         assert!(
             content.contains("my-blog"),
@@ -780,7 +824,7 @@ previous_secrets = []
     fn production_config_documents_port() {
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
-        init(&dir, "my-app", false, Target::Default).unwrap();
+        init(&dir, "my-app", false, Target::Default, false).unwrap();
         let content = fs::read_to_string(dir.join("autumn.production.toml.example")).unwrap();
         assert!(
             content.contains("port"),
@@ -795,7 +839,7 @@ previous_secrets = []
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         fs::write(dir.join("Dockerfile"), "existing content").unwrap();
-        let err = init(&dir, "my-app", false, Target::Default).unwrap_err();
+        let err = init(&dir, "my-app", false, Target::Default, false).unwrap_err();
         assert!(
             matches!(err, ReleaseError::FileExists(_)),
             "expected FileExists, got: {err}"
@@ -811,7 +855,7 @@ previous_secrets = []
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         fs::write(dir.join(".dockerignore"), "existing").unwrap();
-        let err = init(&dir, "my-app", false, Target::Default).unwrap_err();
+        let err = init(&dir, "my-app", false, Target::Default, false).unwrap_err();
         assert!(matches!(err, ReleaseError::FileExists(_)));
     }
 
@@ -820,7 +864,7 @@ previous_secrets = []
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         fs::write(dir.join("Dockerfile"), "old content").unwrap();
-        init(&dir, "my-app", true, Target::Default).unwrap();
+        init(&dir, "my-app", true, Target::Default, false).unwrap();
         let content = fs::read_to_string(dir.join("Dockerfile")).unwrap();
         assert_ne!(
             content, "old content",
@@ -834,7 +878,7 @@ previous_secrets = []
     fn fly_target_creates_fly_toml() {
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
-        init(&dir, "my-app", false, Target::Fly).unwrap();
+        init(&dir, "my-app", false, Target::Fly, false).unwrap();
         assert!(
             dir.join("fly.toml").is_file(),
             "fly.toml must be created for --target=fly"
@@ -845,7 +889,7 @@ previous_secrets = []
     fn fly_toml_references_dockerfile() {
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
-        init(&dir, "my-app", false, Target::Fly).unwrap();
+        init(&dir, "my-app", false, Target::Fly, false).unwrap();
         let content = fs::read_to_string(dir.join("fly.toml")).unwrap();
         assert!(
             content.contains("Dockerfile"),
@@ -857,7 +901,7 @@ previous_secrets = []
     fn fly_toml_has_app_name() {
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-blog");
-        init(&dir, "my-blog", false, Target::Fly).unwrap();
+        init(&dir, "my-blog", false, Target::Fly, false).unwrap();
         let content = fs::read_to_string(dir.join("fly.toml")).unwrap();
         assert!(
             content.contains("my-blog"),
@@ -873,7 +917,7 @@ previous_secrets = []
     fn fly_toml_has_liveness_probe() {
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
-        init(&dir, "my-app", false, Target::Fly).unwrap();
+        init(&dir, "my-app", false, Target::Fly, false).unwrap();
         let content = fs::read_to_string(dir.join("fly.toml")).unwrap();
         assert!(
             content.contains("path") && content.contains("/live"),
@@ -885,7 +929,7 @@ previous_secrets = []
     fn fly_toml_has_readiness_probe() {
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
-        init(&dir, "my-app", false, Target::Fly).unwrap();
+        init(&dir, "my-app", false, Target::Fly, false).unwrap();
         let content = fs::read_to_string(dir.join("fly.toml")).unwrap();
         assert!(
             content.contains("path") && content.contains("/ready"),
@@ -898,7 +942,7 @@ previous_secrets = []
     fn fly_toml_has_kill_timeout() {
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
-        init(&dir, "my-app", false, Target::Fly).unwrap();
+        init(&dir, "my-app", false, Target::Fly, false).unwrap();
         let content = fs::read_to_string(dir.join("fly.toml")).unwrap();
         assert!(
             content.contains("kill_timeout"),
@@ -915,7 +959,7 @@ previous_secrets = []
     fn fly_toml_has_metrics_endpoint() {
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
-        init(&dir, "my-app", false, Target::Fly).unwrap();
+        init(&dir, "my-app", false, Target::Fly, false).unwrap();
         let content = fs::read_to_string(dir.join("fly.toml")).unwrap();
         assert!(
             content.contains("[metrics]"),
@@ -935,7 +979,7 @@ previous_secrets = []
         // The template documents the opt-in pattern so DB users can uncomment it.
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
-        init(&dir, "my-app", false, Target::Fly).unwrap();
+        init(&dir, "my-app", false, Target::Fly, false).unwrap();
         let content = fs::read_to_string(dir.join("fly.toml")).unwrap();
         assert!(
             content.contains("autumn migrate"),
@@ -952,7 +996,7 @@ previous_secrets = []
     fn default_target_does_not_create_fly_toml() {
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
-        init(&dir, "my-app", false, Target::Default).unwrap();
+        init(&dir, "my-app", false, Target::Default, false).unwrap();
         assert!(
             !dir.join("fly.toml").exists(),
             "fly.toml must NOT be created for the default target"
@@ -965,7 +1009,7 @@ previous_secrets = []
     fn docker_compose_target_creates_docker_compose_yml() {
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
-        init(&dir, "my-app", false, Target::DockerCompose).unwrap();
+        init(&dir, "my-app", false, Target::DockerCompose, false).unwrap();
         assert!(
             dir.join("docker-compose.yml").is_file(),
             "docker-compose.yml must be created for --target=docker-compose"
@@ -976,7 +1020,7 @@ previous_secrets = []
     fn docker_compose_has_app_service() {
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
-        init(&dir, "my-app", false, Target::DockerCompose).unwrap();
+        init(&dir, "my-app", false, Target::DockerCompose, false).unwrap();
         let content = fs::read_to_string(dir.join("docker-compose.yml")).unwrap();
         assert!(
             content.contains("app:"),
@@ -988,7 +1032,7 @@ previous_secrets = []
     fn docker_compose_has_postgres_service() {
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
-        init(&dir, "my-app", false, Target::DockerCompose).unwrap();
+        init(&dir, "my-app", false, Target::DockerCompose, false).unwrap();
         let content = fs::read_to_string(dir.join("docker-compose.yml")).unwrap();
         assert!(
             content.contains("postgres") || content.contains("db:"),
@@ -1000,7 +1044,7 @@ previous_secrets = []
     fn docker_compose_app_depends_on_db() {
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
-        init(&dir, "my-app", false, Target::DockerCompose).unwrap();
+        init(&dir, "my-app", false, Target::DockerCompose, false).unwrap();
         let content = fs::read_to_string(dir.join("docker-compose.yml")).unwrap();
         assert!(
             content.contains("depends_on"),
@@ -1012,7 +1056,7 @@ previous_secrets = []
     fn docker_compose_app_requires_signing_secret_env() {
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
-        init(&dir, "my-app", false, Target::DockerCompose).unwrap();
+        init(&dir, "my-app", false, Target::DockerCompose, false).unwrap();
         let content = fs::read_to_string(dir.join("docker-compose.yml")).unwrap();
 
         assert!(
@@ -1027,7 +1071,7 @@ previous_secrets = []
     fn docker_compose_runs_one_shot_migration_before_app() {
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
-        init(&dir, "my-app", false, Target::DockerCompose).unwrap();
+        init(&dir, "my-app", false, Target::DockerCompose, false).unwrap();
         let content = fs::read_to_string(dir.join("docker-compose.yml")).unwrap();
 
         assert!(
@@ -1048,7 +1092,7 @@ previous_secrets = []
     fn docker_compose_substitutes_project_name() {
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-blog");
-        init(&dir, "my-blog", false, Target::DockerCompose).unwrap();
+        init(&dir, "my-blog", false, Target::DockerCompose, false).unwrap();
         let content = fs::read_to_string(dir.join("docker-compose.yml")).unwrap();
         assert!(
             content.contains("my-blog"),
@@ -1064,10 +1108,98 @@ previous_secrets = []
     fn default_target_does_not_create_docker_compose() {
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
-        init(&dir, "my-app", false, Target::Default).unwrap();
+        init(&dir, "my-app", false, Target::Default, false).unwrap();
         assert!(
             !dir.join("docker-compose.yml").exists(),
             "docker-compose.yml must NOT be created for the default target"
+        );
+    }
+
+    // ── --split-workers (opt-in split topology) ───────────────────────────────
+
+    #[test]
+    fn docker_compose_default_omits_worker_service() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::DockerCompose, false).unwrap();
+        let content = fs::read_to_string(dir.join("docker-compose.yml")).unwrap();
+        assert!(
+            !content.contains("worker:"),
+            "default docker-compose.yml must NOT scaffold a worker service: {content}"
+        );
+        assert!(
+            !content.contains("AUTUMN_ROLE"),
+            "default (combined) docker-compose.yml must not pin a process role: {content}"
+        );
+        // No leftover template placeholders.
+        assert!(
+            !content.contains("{{"),
+            "docker-compose.yml must not contain unsubstituted placeholders: {content}"
+        );
+    }
+
+    #[test]
+    fn docker_compose_split_workers_emits_worker_service() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::DockerCompose, true).unwrap();
+        let content = fs::read_to_string(dir.join("docker-compose.yml")).unwrap();
+
+        assert!(
+            content.contains("worker:"),
+            "--split-workers must scaffold a worker service: {content}"
+        );
+        // Worker runs the SAME image as the web/app service.
+        assert_eq!(
+            content.matches("build: .").count(),
+            3,
+            "app, worker, and migrate services must all build the same image: {content}"
+        );
+        assert!(
+            content.contains("AUTUMN_ROLE: worker"),
+            "worker service must run the worker role: {content}"
+        );
+        assert!(
+            content.contains("AUTUMN_ROLE: web"),
+            "app service must run the web role when split: {content}"
+        );
+        // Both tiers must use a durable jobs backend (not in-process `local`).
+        assert_eq!(
+            content.matches("AUTUMN_JOBS__BACKEND: postgres").count(),
+            2,
+            "both app and worker must share the durable postgres jobs backend: {content}"
+        );
+        // Worker shares the migration gate and signing secret.
+        assert!(
+            content.contains("condition: service_completed_successfully"),
+            "worker must wait for the one-shot migration job: {content}"
+        );
+        assert!(
+            content.contains(
+                r#"AUTUMN_SECURITY__SIGNING_SECRET: "${AUTUMN_SECURITY__SIGNING_SECRET:?set it first}""#
+            ),
+            "worker must pass the required signing secret like the app service: {content}"
+        );
+        // Placeholders (including the worker block's own project name) resolved.
+        assert!(
+            !content.contains("{{"),
+            "split docker-compose.yml must not contain unsubstituted placeholders: {content}"
+        );
+        assert!(
+            content.contains("my-app_prod"),
+            "worker DB URL must substitute the project name: {content}"
+        );
+    }
+
+    #[test]
+    fn split_workers_only_affects_docker_compose_output() {
+        // The split-topology flag is scoped to the compose file; the Dockerfile
+        // and other scaffolds are byte-for-byte identical regardless.
+        let default_dockerfile = render(templates::DOCKERFILE, "my-app", false, false);
+        let split_dockerfile = render(templates::DOCKERFILE, "my-app", false, true);
+        assert_eq!(
+            default_dockerfile, split_dockerfile,
+            "--split-workers must not change the Dockerfile"
         );
     }
 
@@ -1100,7 +1232,7 @@ previous_secrets = []
     fn production_config_disables_startup_migrations_by_default() {
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
-        init(&dir, "my-app", false, Target::Default).unwrap();
+        init(&dir, "my-app", false, Target::Default, false).unwrap();
         let content = fs::read_to_string(dir.join("autumn.production.toml.example")).unwrap();
         assert!(
             content.contains("auto_migrate_in_production = false"),

@@ -135,6 +135,8 @@ mod pg_tls;
 #[cfg(feature = "db")]
 mod preload_scoping;
 mod problem_details;
+#[cfg(feature = "redis")]
+mod process_role_worker_gating;
 mod query_count_asserts;
 mod range;
 mod rate_limit_pipeline;

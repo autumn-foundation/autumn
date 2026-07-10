@@ -3843,6 +3843,7 @@ mod tests {
             &runtime_state,
             &shutdown,
             &crate::config::JobConfig::default(),
+            true,
         )
         .expect("job runtime should start");
 
@@ -3919,6 +3920,7 @@ mod tests {
             &runtime_state,
             &shutdown,
             &crate::config::JobConfig::default(),
+            true,
         )
         .expect("job runtime should start");
 

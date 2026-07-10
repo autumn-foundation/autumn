@@ -257,6 +257,59 @@ Use Harvest when:
 - work should be coordinated across replicas
 - you are really describing a workflow, not a cron callback
 
+## Split web/worker topology
+
+The same image can run as two deployments: **web** replicas that serve HTTP and
+enqueue jobs, and **worker** replicas that drain jobs and run the scheduler.
+Pick the role per deployment with `AUTUMN_ROLE` — no app code or image changes.
+This is the standard "web tier + separately scaled worker tier" production shape
+(Rails/Sidekiq, Laravel Horizon, Django/Celery, Loco.rs `--worker`); scale,
+deploy, and drain each tier on its own.
+
+Requirements:
+
+- **A durable jobs backend** — `jobs.backend = "postgres"` or `"redis"`. The
+  `local` backend is in-process, so a web replica would enqueue where no worker
+  can drain. Autumn rejects a split role on `local` at startup and
+  `autumn doctor --strict` flags it. See
+  [Web and worker process roles](jobs.md#web-and-worker-process-roles).
+- **The same migration gate** — both tiers share one backend, so run the
+  dedicated migration job (below) once before either tier starts.
+- **Probes on the worker tier** — a `worker` replica serves no user routes but
+  still binds `/live`, `/ready`, `/startup`, and `/actuator/*`, so wire the same
+  liveness/readiness probes you use for web.
+
+Docker Compose sketch — one image, two roles, shared Postgres backend:
+
+```yaml
+services:
+  # db + migrate: as in the Migration Jobs section below — migrate runs once, first.
+
+  web:
+    image: my-app:latest
+    environment:
+      AUTUMN_ROLE: web
+      AUTUMN_DATABASE__PRIMARY_URL: postgres://app:secret@db:5432/app
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  worker:
+    image: my-app:latest
+    environment:
+      AUTUMN_ROLE: worker
+      AUTUMN_DATABASE__PRIMARY_URL: postgres://app:secret@db:5432/app
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+```
+
+On Kubernetes this is two `Deployment`s off the same image — one with
+`AUTUMN_ROLE=web`, one with `AUTUMN_ROLE=worker` — each with its own replica
+count and autoscaler, both pointing the readiness probe at `/ready` so the
+[rolling-deploy drain](#rolling-deploy-lifecycle) supervises worker rollouts the
+same way it does web.
+
 ## Migration Jobs
 
 For multi-replica deployments, do not rely on each web process racing to apply
@@ -835,6 +888,7 @@ Before calling an Autumn app "cloud ready", verify:
 - migrations run before web rollout via a dedicated migration job
 - destructive/irreversible migrations follow the expand/contract pattern
 - background jobs use the right runtime model
+- a split web/worker topology (`AUTUMN_ROLE=web` / `worker`) runs on a durable jobs backend (`postgres`/`redis`, never `local`), with worker replicas exposing `/live` + `/ready`
 - `autumn_jobs` has `traceparent` / `tracestate` columns if using the Postgres backend with `telemetry-otlp`
 - multi-replica write paths use `#[lock_version]` (optimistic) or `with_lock` (pessimistic) to prevent lost updates
 - the generated container image builds without manual template surgery

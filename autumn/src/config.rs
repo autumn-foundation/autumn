@@ -927,6 +927,13 @@ pub struct AutumnConfig {
     #[serde(default)]
     pub scheduler: SchedulerConfig,
 
+    /// Process role: which slice of the runtime this replica runs (web tier,
+    /// worker tier, or both). Defaults to [`ProcessRole::Combined`] so existing
+    /// single-process deployments are unaffected. Also settable via the flat
+    /// `AUTUMN_ROLE` env var.
+    #[serde(default)]
+    pub role: ProcessRole,
+
     /// Authentication settings.
     #[serde(default)]
     pub auth: crate::auth::AuthConfig,
@@ -1573,6 +1580,105 @@ impl SchedulerBackend {
             _ => None,
         }
     }
+}
+
+/// Process role: which slice of the framework runtime this replica runs.
+///
+/// The same binary can be deployed under different roles so a fleet can scale
+/// its HTTP tier independently of its background-work tier. The role is chosen
+/// by config (`role = "..."`) or the `AUTUMN_ROLE` env var only — application
+/// code never changes. The default, [`Combined`](ProcessRole::Combined),
+/// preserves today's single-process behavior exactly.
+///
+/// - [`Combined`](ProcessRole::Combined): serves HTTP **and** runs job workers
+///   + the cron scheduler (default).
+/// - [`Web`](ProcessRole::Web): serves HTTP and can still **enqueue** jobs, but
+///   runs no `#[job]` worker loops and no `#[scheduled]`/cron scheduler.
+/// - [`Worker`](ProcessRole::Worker): runs job workers + the cron scheduler and
+///   does **not** serve user routes, but still binds the HTTP listener to serve
+///   only the liveness/readiness probes and the actuator (so orchestrators can
+///   supervise it and `/actuator/jobs` works).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ProcessRole {
+    /// Serve HTTP and run background workers + scheduler (default; unchanged
+    /// single-process behavior).
+    #[serde(
+        alias = "all",
+        alias = "combined",
+        alias = "web_and_worker",
+        alias = "server_and_worker"
+    )]
+    #[default]
+    Combined,
+    /// Serve HTTP (and enqueue jobs) only — no worker loops, no scheduler.
+    #[serde(alias = "server", alias = "http")]
+    Web,
+    /// Run workers + scheduler only — probe/actuator HTTP only, no user routes.
+    #[serde(alias = "jobs", alias = "worker_only")]
+    Worker,
+}
+
+impl ProcessRole {
+    /// Parse an environment variable / flag value for process-role selection.
+    ///
+    /// Accepts (case-insensitive, trimmed): `combined`/`all`, `web`/`server`/
+    /// `http`, `worker`/`jobs`. Returns `None` for anything else so callers can
+    /// warn and keep the default.
+    #[must_use]
+    pub fn from_env_value(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "combined" | "all" | "web_and_worker" | "server_and_worker" => Some(Self::Combined),
+            "web" | "server" | "http" => Some(Self::Web),
+            "worker" | "jobs" | "worker_only" => Some(Self::Worker),
+            _ => None,
+        }
+    }
+
+    /// Stable lowercase identifier for the role (round-trips `from_env_value`).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Combined => "combined",
+            Self::Web => "web",
+            Self::Worker => "worker",
+        }
+    }
+
+    /// Whether this role serves user HTTP routes ([`Combined`](Self::Combined)
+    /// or [`Web`](Self::Web)).
+    #[must_use]
+    pub const fn serves_http(self) -> bool {
+        matches!(self, Self::Combined | Self::Web)
+    }
+
+    /// Whether this role runs background job workers and the cron scheduler
+    /// ([`Combined`](Self::Combined) or [`Worker`](Self::Worker)).
+    #[must_use]
+    pub const fn runs_workers(self) -> bool {
+        matches!(self, Self::Combined | Self::Worker)
+    }
+}
+
+/// Whether a `role` / `jobs.backend` combination is invalid because a split
+/// (web/worker) role sits on a non-durable jobs backend.
+///
+/// A split role runs the HTTP tier and the job/scheduler tier in **separate
+/// processes**, so it needs a jobs backend the two processes can share. Only the
+/// recognized durable backends [`start_runtime`](crate::job::start_runtime)
+/// dispatches to durably — exactly `"postgres"` or `"redis"` — qualify. Every
+/// other value (the in-process `"local"` queue, a typo like `"postgresql"`, or a
+/// blank backend) falls through to the per-process local runtime, where a
+/// [`Web`](ProcessRole::Web) replica would enqueue into a queue no separate
+/// worker can drain and a [`Worker`](ProcessRole::Worker) replica's queue starts
+/// empty. The match is intentionally exact (no trim/case-fold) so this guard and
+/// `start_runtime`'s dispatch agree precisely on which backends are durable.
+///
+/// The combined role is always valid because it enqueues and drains in one
+/// process. Returns `true` when the combination is **invalid**.
+#[must_use]
+pub fn split_role_requires_durable_backend(role: ProcessRole, jobs_backend: &str) -> bool {
+    role != ProcessRole::Combined && !matches!(jobs_backend, "postgres" | "redis")
 }
 
 /// Scheduled task coordination runtime configuration.
@@ -2664,6 +2770,7 @@ impl AutumnConfig {
         self.apply_channels_env_overrides_with_env(env);
         self.apply_jobs_env_overrides_with_env(env);
         self.apply_scheduler_env_overrides_with_env(env);
+        self.apply_role_env_overrides_with_env(env);
         self.apply_auth_env_overrides_with_env(env);
         self.apply_security_env_overrides_with_env(env);
         self.apply_bot_protection_env_overrides_with_env(env);
@@ -3195,6 +3302,18 @@ impl AutumnConfig {
             "AUTUMN_JOBS__TRACKING__ROUTE_ENABLED",
             &mut self.jobs.tracking.route_enabled,
         );
+    }
+
+    fn apply_role_env_overrides_with_env(&mut self, env: &dyn Env) {
+        if let Ok(val) = env.var("AUTUMN_ROLE") {
+            match ProcessRole::from_env_value(&val) {
+                Some(role) => self.role = role,
+                None => eprintln!(
+                    "Warning: AUTUMN_ROLE={val:?} is not valid \
+                     (expected combined, web, or worker), ignoring"
+                ),
+            }
+        }
     }
 
     fn apply_scheduler_env_overrides_with_env(&mut self, env: &dyn Env) {
@@ -9760,5 +9879,161 @@ redirect_uri = "http://localhost:3000/auth/github/callback"
             "message must name computed shards: {err}"
         );
         assert!(err.contains("s0"), "message must name stored shards: {err}");
+    }
+
+    // ── Process role (#1613) ────────────────────────────────────────────────
+
+    #[test]
+    fn process_role_default_is_combined() {
+        assert_eq!(ProcessRole::default(), ProcessRole::Combined);
+        assert_eq!(AutumnConfig::default().role, ProcessRole::Combined);
+    }
+
+    #[test]
+    fn process_role_from_env_value_accepts_aliases_case_insensitively() {
+        for v in [
+            "combined",
+            "COMBINED",
+            "  all ",
+            "web_and_worker",
+            "server_and_worker",
+        ] {
+            assert_eq!(
+                ProcessRole::from_env_value(v),
+                Some(ProcessRole::Combined),
+                "{v}"
+            );
+        }
+        for v in ["web", "Web", " SERVER ", "http"] {
+            assert_eq!(
+                ProcessRole::from_env_value(v),
+                Some(ProcessRole::Web),
+                "{v}"
+            );
+        }
+        for v in ["worker", "WORKER", " jobs ", "worker_only"] {
+            assert_eq!(
+                ProcessRole::from_env_value(v),
+                Some(ProcessRole::Worker),
+                "{v}"
+            );
+        }
+        for v in ["", "webby", "workers", "scheduler", "both"] {
+            assert_eq!(ProcessRole::from_env_value(v), None, "{v}");
+        }
+    }
+
+    #[test]
+    fn process_role_as_str_round_trips_through_from_env_value() {
+        for role in [ProcessRole::Combined, ProcessRole::Web, ProcessRole::Worker] {
+            assert_eq!(ProcessRole::from_env_value(role.as_str()), Some(role));
+        }
+    }
+
+    #[test]
+    fn process_role_serves_http_and_runs_workers_truth_table() {
+        assert!(ProcessRole::Combined.serves_http());
+        assert!(ProcessRole::Combined.runs_workers());
+        assert!(ProcessRole::Web.serves_http());
+        assert!(!ProcessRole::Web.runs_workers());
+        assert!(!ProcessRole::Worker.serves_http());
+        assert!(ProcessRole::Worker.runs_workers());
+    }
+
+    #[test]
+    fn process_role_deserializes_from_toml() {
+        let web: AutumnConfig = toml::from_str("role = \"web\"\n").expect("web role");
+        assert_eq!(web.role, ProcessRole::Web);
+        let worker: AutumnConfig = toml::from_str("role = \"worker\"\n").expect("worker role");
+        assert_eq!(worker.role, ProcessRole::Worker);
+        let combined: AutumnConfig =
+            toml::from_str("role = \"combined\"\n").expect("combined role");
+        assert_eq!(combined.role, ProcessRole::Combined);
+        // Serde alias also works.
+        let aliased: AutumnConfig = toml::from_str("role = \"all\"\n").expect("all alias");
+        assert_eq!(aliased.role, ProcessRole::Combined);
+        // Absent → default.
+        let absent: AutumnConfig = toml::from_str("").expect("empty config");
+        assert_eq!(absent.role, ProcessRole::Combined);
+    }
+
+    #[test]
+    fn split_role_requires_durable_backend_truth_table() {
+        // Combined is always fine (enqueues and drains in one process), even on
+        // the in-process local backend.
+        assert!(!split_role_requires_durable_backend(
+            ProcessRole::Combined,
+            "local"
+        ));
+        assert!(!split_role_requires_durable_backend(
+            ProcessRole::Combined,
+            "postgres"
+        ));
+        // Split roles on any backend that falls through to the per-process local
+        // runtime are invalid: the literal `local`, a typo like `postgresql`, a
+        // blank backend, or any other unknown value.
+        assert!(split_role_requires_durable_backend(
+            ProcessRole::Web,
+            "local"
+        ));
+        assert!(split_role_requires_durable_backend(
+            ProcessRole::Worker,
+            "local"
+        ));
+        assert!(split_role_requires_durable_backend(
+            ProcessRole::Web,
+            "postgresql"
+        ));
+        assert!(split_role_requires_durable_backend(ProcessRole::Web, ""));
+        assert!(split_role_requires_durable_backend(
+            ProcessRole::Web,
+            "unknown"
+        ));
+        // The match is exact (mirroring `start_runtime`'s dispatch), so a
+        // case-variant like `LOCAL` is likewise a non-durable fall-through.
+        assert!(split_role_requires_durable_backend(
+            ProcessRole::Web,
+            "LOCAL"
+        ));
+        // Split roles on the recognized durable backends are fine.
+        assert!(!split_role_requires_durable_backend(
+            ProcessRole::Web,
+            "postgres"
+        ));
+        assert!(!split_role_requires_durable_backend(
+            ProcessRole::Worker,
+            "redis"
+        ));
+    }
+
+    #[test]
+    fn autumn_role_env_override_sets_role() {
+        let env = MockEnv::new().with("AUTUMN_ROLE", "worker");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        assert_eq!(config.role, ProcessRole::Worker);
+
+        let env = MockEnv::new().with("AUTUMN_ROLE", "  WEB ");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        assert_eq!(config.role, ProcessRole::Web);
+    }
+
+    #[test]
+    fn autumn_role_env_override_ignores_invalid_value_keeping_default() {
+        let env = MockEnv::new().with("AUTUMN_ROLE", "nonsense");
+        // Start from a non-default to prove invalid values do not reset it and
+        // do not force it either — they leave the current value untouched.
+        let mut config = AutumnConfig {
+            role: ProcessRole::Worker,
+            ..Default::default()
+        };
+        config.apply_env_overrides_with_env(&env);
+        assert_eq!(config.role, ProcessRole::Worker);
+
+        // And from the default, an invalid value keeps Combined.
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        assert_eq!(config.role, ProcessRole::Combined);
     }
 }

@@ -277,7 +277,7 @@ async fn job_interceptor_intercepts_enqueue_and_execute() {
         handler: test_job_handler,
     };
 
-    job::start_runtime(vec![job_info], &state, &shutdown, &config).unwrap();
+    job::start_runtime(vec![job_info], &state, &shutdown, &config, true).unwrap();
 
     job::enqueue("test-job", json!({ "data": "hello" }))
         .await

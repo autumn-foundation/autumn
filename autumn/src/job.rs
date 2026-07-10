@@ -2912,6 +2912,7 @@ pub fn start_runtime(
     state: &AppState,
     shutdown: &tokio_util::sync::CancellationToken,
     config: &crate::config::JobConfig,
+    run_workers: bool,
 ) -> AutumnResult<()> {
     validate_unique_job_names(&jobs).map_err(|error| {
         AutumnError::internal_server_error(std::io::Error::other(format!(
@@ -2923,7 +2924,7 @@ pub fn start_runtime(
 
     match config.backend.as_str() {
         "local" => {
-            start_local_runtime(
+            start_local_runtime_inner(
                 jobs,
                 state,
                 shutdown,
@@ -2931,17 +2932,18 @@ pub fn start_runtime(
                 config.max_attempts,
                 config.initial_backoff_ms,
                 &config.queues,
+                run_workers,
             );
             Ok(())
         }
         "postgres" => {
             #[cfg(feature = "db")]
             {
-                start_postgres_runtime(jobs, state, shutdown, config)
+                start_postgres_runtime(jobs, state, shutdown, config, run_workers)
             }
             #[cfg(not(feature = "db"))]
             {
-                let _ = (jobs, state, shutdown, config);
+                let _ = (jobs, state, shutdown, config, run_workers);
                 Err(AutumnError::internal_server_error(std::io::Error::other(
                     "jobs.backend=postgres requested but db feature is disabled",
                 )))
@@ -2950,7 +2952,7 @@ pub fn start_runtime(
         "redis" => {
             #[cfg(feature = "redis")]
             {
-                start_redis_runtime(jobs, state, shutdown, config)
+                start_redis_runtime(jobs, state, shutdown, config, run_workers)
             }
             #[cfg(not(feature = "redis"))]
             {
@@ -2958,6 +2960,7 @@ pub fn start_runtime(
                 let _ = state;
                 let _ = shutdown;
                 let _ = config;
+                let _ = run_workers;
                 Err(AutumnError::internal_server_error(std::io::Error::other(
                     "jobs.backend=redis requested but redis feature is disabled",
                 )))
@@ -2965,7 +2968,7 @@ pub fn start_runtime(
         }
         other => {
             tracing::warn!(backend = %other, "unknown jobs backend; falling back to local backend");
-            start_local_runtime(
+            start_local_runtime_inner(
                 jobs,
                 state,
                 shutdown,
@@ -2973,6 +2976,7 @@ pub fn start_runtime(
                 config.max_attempts,
                 config.initial_backoff_ms,
                 &config.queues,
+                run_workers,
             );
             Ok(())
         }
@@ -3109,6 +3113,10 @@ impl LocalJobCoordination {
     }
 }
 
+/// Combined/worker-role local startup used by the in-crate test suites, which
+/// always run workers. The role-aware [`start_local_runtime_inner`] carries the
+/// `run_workers` gate for the production dispatch.
+#[cfg(test)]
 pub(crate) fn start_local_runtime(
     jobs: Vec<JobInfo>,
     state: &AppState,
@@ -3117,6 +3125,36 @@ pub(crate) fn start_local_runtime(
     default_max_attempts: u32,
     default_initial_backoff_ms: u64,
     queues_config: &crate::config::JobQueuesConfig,
+) {
+    start_local_runtime_inner(
+        jobs,
+        state,
+        shutdown,
+        workers,
+        default_max_attempts,
+        default_initial_backoff_ms,
+        queues_config,
+        true,
+    );
+}
+
+/// Local-backend startup with explicit worker gating.
+///
+/// `run_workers == false` (web role) installs the enqueue client but spawns no
+/// ingress/worker tasks, so `Jobs::enqueue` still works while zero `#[job]`
+/// loops run. The in-process `local` backend is non-durable, so a split role on
+/// it is rejected earlier at startup; this path only sees `run_workers == false`
+/// via direct calls in tests.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn start_local_runtime_inner(
+    jobs: Vec<JobInfo>,
+    state: &AppState,
+    shutdown: &tokio_util::sync::CancellationToken,
+    workers: usize,
+    default_max_attempts: u32,
+    default_initial_backoff_ms: u64,
+    queues_config: &crate::config::JobQueuesConfig,
+    run_workers: bool,
 ) {
     let job_admin = default_job_admin_backend_for_state(state);
     let per_job_settings = build_per_job_settings(&jobs);
@@ -3131,7 +3169,9 @@ pub(crate) fn start_local_runtime(
         }
     }
 
-    let worker_count = workers.max(1);
+    // Web role installs the enqueue client but drains nothing: bypass the
+    // `workers.max(1)` floor so zero worker loops run.
+    let worker_count = if run_workers { workers.max(1) } else { 0 };
     let (tx, mut rx) = tokio::sync::mpsc::channel::<QueuedJob>(1024);
     let coordination = Arc::new(LocalJobCoordination::default());
 
@@ -3172,8 +3212,9 @@ pub(crate) fn start_local_runtime(
 
     // Ingress task: own the channel receiver and route each job into its named
     // queue in the shared priority buffer. Retries and concurrency-unparked jobs
-    // re-enter here too, preserving their queue.
-    {
+    // re-enter here too, preserving their queue. Skipped when no workers run
+    // (web role) — there is nothing to drain the buffer it would fill.
+    if run_workers {
         let buffer = Arc::clone(&buffer);
         let shutdown = shutdown.clone();
         tokio::spawn(async move {
@@ -5661,6 +5702,7 @@ fn start_redis_runtime(
     state: &AppState,
     shutdown: &tokio_util::sync::CancellationToken,
     config: &crate::config::JobConfig,
+    run_workers: bool,
 ) -> Result<(), AutumnError> {
     let job_admin = JobAdminMemoryBackend::new();
     let url = config
@@ -5782,6 +5824,13 @@ fn start_redis_runtime(
                 .map(|c| Arc::new(c.resilience.clone())),
         },
     );
+
+    // Web role installs the enqueue client above but runs no worker loops:
+    // another (worker/combined) replica drains the durable Redis queue. Bypass
+    // the `workers.max(1)` floor so zero loops run.
+    if !run_workers {
+        return Ok(());
+    }
 
     let worker_count = config.workers.max(1);
     for _ in 0..worker_count {
@@ -7350,6 +7399,7 @@ fn start_postgres_runtime(
     state: &AppState,
     shutdown: &tokio_util::sync::CancellationToken,
     config: &crate::config::JobConfig,
+    run_workers: bool,
 ) -> AutumnResult<()> {
     let pool = state.pool().cloned().ok_or_else(|| {
         AutumnError::internal_server_error(std::io::Error::other(
@@ -7409,6 +7459,13 @@ fn start_postgres_runtime(
                 .map(|c| Arc::new(c.resilience.clone())),
         },
     );
+
+    // Web role installs the enqueue client above but runs no worker loops and
+    // no maintenance loop: another (worker/combined) replica drains the durable
+    // Postgres queue. Bypass the `workers.max(1)` floor so zero loops run.
+    if !run_workers {
+        return Ok(());
+    }
 
     let visibility_timeout_ms = config.postgres.visibility_timeout_ms;
     let worker_count = config.workers.max(1);
@@ -10842,6 +10899,7 @@ mod tests {
             &state,
             &shutdown,
             &crate::config::JobConfig::default(),
+            true,
         )
         .expect_err("duplicate job names should surface as init errors");
 
@@ -10852,6 +10910,129 @@ mod tests {
             "unexpected error: {error}"
         );
         assert!(global_job_client().is_none());
+    }
+
+    // ── Process role: worker gating (#1613) ─────────────────────────────────
+    //
+    // These exercise the `run_workers` flag threaded through `start_runtime` on
+    // the in-process `local` backend (no external infra needed). AC #1: a web
+    // replica (run_workers = false) must still install the enqueue client so
+    // `enqueue` works, but must run zero worker loops so an enqueued job is
+    // never executed; a combined/worker replica (run_workers = true) executes it.
+
+    static ROLE_GATING_JOB_RUNS: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
+    fn role_gating_counting_handler(
+        _state: AppState,
+        _payload: Value,
+    ) -> Pin<Box<dyn Future<Output = AutumnResult<()>> + Send + 'static>> {
+        ROLE_GATING_JOB_RUNS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Box::pin(async move { Ok(()) })
+    }
+
+    // The enqueue client is always installed (so `enqueue` is wired up), yet no
+    // worker loop runs. On the in-process `local` backend the enqueue channel's
+    // receiver lives on the (skipped) ingress task, so a web-role enqueue fails
+    // with "channel closed" — which is precisely why a split web/worker topology
+    // must NOT use the local backend (enforced by
+    // `split_role_requires_durable_backend` + the startup guard). The durable-backend equivalent (a web replica
+    // enqueues, a worker replica drains) is covered by the Docker-gated
+    // `web_role_does_not_execute_jobs_while_worker_role_does` integration test.
+    #[tokio::test]
+    async fn web_role_installs_enqueue_client_but_spawns_no_worker_loops() {
+        let _guard = global_job_runtime_test_lock().lock().await;
+        clear_global_job_client();
+        ROLE_GATING_JOB_RUNS.store(0, std::sync::atomic::Ordering::SeqCst);
+
+        let state = AppState::for_test().with_profile("dev");
+        let shutdown = tokio_util::sync::CancellationToken::new();
+
+        // Web role: run_workers = false.
+        start_runtime(
+            vec![JobInfo::new(
+                "role_gated",
+                1,
+                10,
+                role_gating_counting_handler,
+            )],
+            &state,
+            &shutdown,
+            &crate::config::JobConfig::default(),
+            false,
+        )
+        .expect("web-role job runtime should start");
+
+        // The enqueue client is installed even though zero workers run.
+        assert!(
+            global_job_client().is_some(),
+            "web role must install the enqueue client"
+        );
+
+        // No ingress/worker task holds the local channel receiver, so an enqueue
+        // onto the in-process backend fails — the very reason the local backend
+        // is disallowed for split roles.
+        let result = crate::job::enqueue("role_gated", serde_json::json!({})).await;
+        assert!(
+            result.is_err(),
+            "local backend cannot enqueue with zero workers (split roles must use \
+             a durable backend); got {result:?}"
+        );
+
+        // And nothing ever executes.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            ROLE_GATING_JOB_RUNS.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "web role must not execute jobs"
+        );
+
+        shutdown.cancel();
+        clear_global_job_client();
+    }
+
+    #[tokio::test]
+    async fn combined_role_runs_workers_and_executes_enqueued_jobs() {
+        let _guard = global_job_runtime_test_lock().lock().await;
+        clear_global_job_client();
+        ROLE_GATING_JOB_RUNS.store(0, std::sync::atomic::Ordering::SeqCst);
+
+        let state = AppState::for_test().with_profile("dev");
+        let shutdown = tokio_util::sync::CancellationToken::new();
+
+        // Combined/worker role: run_workers = true.
+        start_runtime(
+            vec![JobInfo::new(
+                "role_gated",
+                1,
+                10,
+                role_gating_counting_handler,
+            )],
+            &state,
+            &shutdown,
+            &crate::config::JobConfig::default(),
+            true,
+        )
+        .expect("combined-role job runtime should start");
+
+        crate::job::enqueue("role_gated", serde_json::json!({}))
+            .await
+            .expect("combined role should be able to enqueue");
+
+        // A worker loop drains and executes the job.
+        let executed = timeout(Duration::from_secs(2), async {
+            loop {
+                if ROLE_GATING_JOB_RUNS.load(std::sync::atomic::Ordering::SeqCst) >= 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(executed.is_ok(), "combined role must execute enqueued jobs");
+
+        shutdown.cancel();
+        clear_global_job_client();
     }
 
     #[tokio::test]
@@ -10881,6 +11062,7 @@ mod tests {
             &state,
             &shutdown,
             &config,
+            true,
         )
         .expect_err("redis backend must fail without the redis feature");
 
@@ -10924,6 +11106,7 @@ mod tests {
             &state,
             &shutdown,
             &config,
+            true,
         )
         .expect_err("redis backend must fail when its url is missing");
 
@@ -12329,6 +12512,7 @@ mod tests {
                 &state,
                 &shutdown,
                 &config,
+                true,
             )
             .expect_err("postgres backend must fail when no db pool is configured");
 

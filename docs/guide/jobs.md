@@ -149,6 +149,84 @@ visibility_timeout_ms = 30000
 - `redis`: Durable, Redis-backed queue for multi-replica workers. Higher
   throughput ceiling than `postgres` but adds Redis as an infrastructure dependency.
 
+## Web and worker process roles
+
+The same binary can run in one of three **process roles**, so you can scale the
+HTTP tier separately from the background-work tier without touching app code. No
+handler, `#[job]`, or `#[scheduled]` definition changes — only config or a flag.
+
+| Role | Serves user routes | Runs workers + scheduler | Enqueues jobs |
+|---|---|---|---|
+| `combined` (default) | Yes | Yes | Yes |
+| `web` | Yes | **No** | Yes |
+| `worker` | **No** (probes/actuator only) | Yes | Yes |
+
+- **`combined`** is the default and preserves today's single-process behavior:
+  it serves HTTP, drains `#[job]` workers, and runs the `#[scheduled]` cron.
+  Existing apps and `autumn dev` need zero changes.
+- **`web`** serves HTTP and still **enqueues** jobs, but runs no workers and no
+  scheduler, so background work never competes with request handling on a web
+  replica.
+- **`worker`** runs the workers and the cron scheduler against the shared
+  durable backend and does **not** serve user routes — but it still binds the
+  HTTP listener to expose only the liveness/readiness probes (`/live`, `/ready`,
+  `/startup`, `/health`) and the actuator (`/actuator/*`, including
+  `/actuator/jobs`), so an orchestrator can supervise it.
+
+### Selecting a role
+
+Three equivalent mechanisms:
+
+```bash
+# Environment variable — the usual container knob.
+AUTUMN_ROLE=web     # or: worker | combined
+```
+
+```toml
+# autumn.toml — top-level key.
+role = "worker"     # or: web | combined
+```
+
+```bash
+# CLI flag on the production server command.
+autumn serve --role worker   # or: --role web
+```
+
+### Split roles require a durable backend
+
+A split web/worker topology **requires a durable jobs backend**
+(`jobs.backend = "postgres"` or `"redis"`). The default `local` backend is an
+in-process, in-memory queue: a `web` replica would enqueue into its own memory,
+where no separate `worker` replica can ever drain it.
+
+Autumn rejects this combination at startup — a `web` or `worker` role on the
+`local` backend exits with a clear error rather than silently dropping work —
+and `autumn doctor --strict` reports it as a **Fail**. `combined` on `local` is
+always fine, because one process both enqueues and drains.
+
+```toml
+[jobs]
+backend = "postgres"   # or "redis"; required once role is "web" or "worker"
+```
+
+### Graceful drain on workers
+
+A `worker`-role process joins the same shutdown sequence as a web replica. On
+SIGTERM it stops claiming new jobs, gives in-flight jobs the configured drain
+window (`server.shutdown_timeout_secs` / `server.prestop_grace_secs`) to finish
+or be released back to the queue, then exits cleanly. Its `/ready` probe flips
+to `503` during the drain, so an orchestrator supervises a rolling worker deploy
+exactly as it would a web deploy. See
+[Rolling Deploy Lifecycle](cloud-native.md#rolling-deploy-lifecycle) for the
+full phase ordering.
+
+### Where job execution shows up
+
+`/actuator/jobs` and the admin dashboard attribute each job's execution to the
+process that actually ran it. In a split topology that is always a `worker`
+process — `web` replicas only enqueue, so handler execution, in-flight counts,
+and last-error data surface on the worker tier.
+
 ## Postgres delivery semantics
 
 The Postgres backend provides **at-least-once delivery**. Each job is a row in
@@ -252,8 +330,13 @@ a loud, documented condition — it is logged at startup (`WARN`) and the queue 
 appended at lowest priority so the job still drains instead of silently stalling.
 Add the queue to `[jobs] queues` to control its priority.
 
-> Out of scope (separate follow-ups): per-job-instance dynamic priority at
-> enqueue time, and per-queue concurrency caps / dedicated worker pools.
+> **Role-based scaling** — running a separately scaled worker tier that drains
+> all configured queues — is covered in
+> [Web and worker process roles](#web-and-worker-process-roles). Still out of
+> scope (separate follow-ups): per-job-instance dynamic priority at enqueue
+> time, and pinning specific queues to dedicated worker processes / per-queue
+> concurrency pools (#1623). Today a worker process drains all configured
+> queues.
 
 ## Uniqueness and concurrency limits
 

@@ -4,6 +4,7 @@
 //! reports each as ✅/⚠️/❌ with a one-line remediation hint, and exits with
 //! code 0 (all clear) or 1 (any failure detected).
 
+use autumn_web::config::ProcessRole;
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 
@@ -1397,6 +1398,47 @@ fn check_database_topology_contract(
     }
 }
 
+/// Verify the selected process role is compatible with the jobs backend.
+///
+/// A split web/worker role runs the HTTP tier and the job/scheduler tier in
+/// **separate processes**, so it needs a durable jobs backend the two processes
+/// can share. Only the recognized durable backends (`postgres`/`redis`) qualify;
+/// any other value — the in-process `local` queue, a typo like `postgresql`, or a
+/// blank backend — falls through to the per-process local runtime, where a web
+/// replica's enqueue never reaches a worker replica's queue.
+/// [`autumn_web::config::split_role_requires_durable_backend`] flags that invalid
+/// combo; the app itself rejects it at startup, and doctor surfaces it up front.
+fn check_split_topology_on_local(role: ProcessRole, jobs_backend: &str) -> CheckResult {
+    let backend = jobs_backend.trim();
+    if autumn_web::config::split_role_requires_durable_backend(role, jobs_backend) {
+        return CheckResult {
+            name: "process_role_backend",
+            status: CheckStatus::Fail,
+            detail: Some(format!(
+                "role={} with jobs.backend=\"{backend}\": a split web/worker role needs a durable \
+                 (postgres/redis) jobs backend; \"{backend}\" is not a recognized durable backend \
+                 and falls through to the in-process `local` runtime, which cannot share a job \
+                 queue across the separate web and worker processes",
+                role.as_str(),
+            )),
+            hint: Some(
+                "Set jobs.backend = \"postgres\" (or redis) for split web/worker roles, or run the combined role",
+            ),
+        };
+    }
+    let detail = if role == ProcessRole::Combined {
+        format!("role={}", role.as_str())
+    } else {
+        format!("role={}, jobs.backend={backend}", role.as_str())
+    };
+    CheckResult {
+        name: "process_role_backend",
+        status: CheckStatus::Pass,
+        detail: Some(detail),
+        hint: None,
+    }
+}
+
 fn check_replica_migration_versions(
     primary_latest: Option<&str>,
     replica_latest: Option<&str>,
@@ -2155,6 +2197,47 @@ where
     }
 }
 
+/// Resolve the selected process role and jobs backend from the same sources the
+/// runtime reads: the `AUTUMN_ROLE` / `AUTUMN_JOBS__BACKEND` env vars take
+/// precedence over the top-level `role` / `[jobs] backend` keys in the config
+/// table. Defaults to [`ProcessRole::Combined`] and the `"local"` backend.
+fn resolve_process_role_and_backend(table: Option<&toml::Table>) -> (ProcessRole, String) {
+    resolve_process_role_and_backend_from_sources(
+        |key| std::env::var(key).ok().filter(|value| !value.is_empty()),
+        table,
+    )
+}
+
+fn resolve_process_role_and_backend_from_sources<F>(
+    env_var: F,
+    table: Option<&toml::Table>,
+) -> (ProcessRole, String)
+where
+    F: Fn(&str) -> Option<String>,
+{
+    // Mirror the runtime (`apply_role_env_overrides_with_env`): an invalid
+    // `AUTUMN_ROLE` env value is ignored and we fall through to the configured
+    // TOML `role`, rather than short-circuiting straight to `Combined`.
+    let role = first_env(&env_var, &["AUTUMN_ROLE"])
+        .as_deref()
+        .and_then(ProcessRole::from_env_value)
+        .or_else(|| {
+            first_toml_string(table, &["role"])
+                .as_deref()
+                .and_then(ProcessRole::from_env_value)
+        })
+        .unwrap_or(ProcessRole::Combined);
+
+    let jobs = table
+        .and_then(|t| t.get("jobs"))
+        .and_then(toml::Value::as_table);
+    let backend = first_env(&env_var, &["AUTUMN_JOBS__BACKEND"])
+        .or_else(|| first_toml_string(jobs, &["backend"]))
+        .unwrap_or_else(|| "local".to_owned());
+
+    (role, backend)
+}
+
 fn first_env<F>(env_var: &F, keys: &[&str]) -> Option<String>
 where
     F: Fn(&str) -> Option<String>,
@@ -2536,6 +2619,7 @@ pub fn run(opts: DoctorOptions) {
         .and_then(|content| toml::from_str::<toml::Table>(content).ok())
         .or_else(read_autumn_toml_table);
     let db_topology = resolve_database_topology(toml_table.as_ref());
+    let (process_role, jobs_backend) = resolve_process_role_and_backend(toml_table.as_ref());
     let port = resolve_server_port();
     let tailwind = tailwind_enabled();
     let signing_secret = resolve_optional_signing_secret();
@@ -2573,6 +2657,12 @@ pub fn run(opts: DoctorOptions) {
     let topology_for_check = db_topology.clone();
     tasks.push(Box::new(move || {
         check_database_topology_contract(&topology_for_check, is_production)
+    }));
+
+    // 4b. Process role vs. jobs backend: a split web/worker role can't share the
+    // in-process `local` job queue across separate processes.
+    tasks.push(Box::new(move || {
+        check_split_topology_on_local(process_role, &jobs_backend)
     }));
 
     if let Some(url) = db_topology.primary_url.clone() {
@@ -4743,6 +4833,136 @@ foo = "bar"
 
         assert_eq!(result.status, CheckStatus::Warn);
         assert!(result.detail.unwrap_or_default().contains("primary"));
+    }
+
+    // ── process role vs. jobs backend ─────────────────────────────────────────
+
+    #[test]
+    fn split_topology_fails_on_web_role_with_local_backend() {
+        let result = check_split_topology_on_local(ProcessRole::Web, "local");
+        assert_eq!(result.status, CheckStatus::Fail);
+        let detail = result.detail.unwrap_or_default();
+        assert!(
+            detail.contains("web"),
+            "detail must name the role: {detail}"
+        );
+        assert!(
+            detail.contains("local"),
+            "detail must name the backend: {detail}"
+        );
+        assert!(result.hint.unwrap_or_default().contains("postgres"));
+    }
+
+    #[test]
+    fn split_topology_fails_on_worker_role_with_local_backend() {
+        let result = check_split_topology_on_local(ProcessRole::Worker, "local");
+        assert_eq!(result.status, CheckStatus::Fail);
+        assert!(result.detail.unwrap_or_default().contains("worker"));
+    }
+
+    #[test]
+    fn split_topology_passes_for_combined_role_on_local_backend() {
+        let result = check_split_topology_on_local(ProcessRole::Combined, "local");
+        assert_eq!(result.status, CheckStatus::Pass);
+        // Combined never splits, so the detail need not mention the backend.
+        assert_eq!(result.detail.as_deref(), Some("role=combined"));
+        assert!(result.hint.is_none());
+    }
+
+    #[test]
+    fn split_topology_passes_for_web_role_on_postgres_backend() {
+        let result = check_split_topology_on_local(ProcessRole::Web, "postgres");
+        assert_eq!(result.status, CheckStatus::Pass);
+        let detail = result.detail.unwrap_or_default();
+        assert!(detail.contains("role=web"), "got: {detail}");
+        assert!(detail.contains("postgres"), "got: {detail}");
+    }
+
+    #[test]
+    fn split_topology_passes_for_worker_role_on_redis_backend() {
+        let result = check_split_topology_on_local(ProcessRole::Worker, "redis");
+        assert_eq!(result.status, CheckStatus::Pass);
+        let detail = result.detail.unwrap_or_default();
+        assert!(detail.contains("role=worker"), "got: {detail}");
+        assert!(detail.contains("redis"), "got: {detail}");
+    }
+
+    #[test]
+    fn split_topology_fails_on_web_role_with_backend_typo() {
+        // A typo like `postgresql` is not a recognized durable backend: it falls
+        // through to the in-process local runtime, so a split role must be
+        // rejected exactly as it is for the literal `local`.
+        let result = check_split_topology_on_local(ProcessRole::Web, "postgresql");
+        assert_eq!(result.status, CheckStatus::Fail);
+        let detail = result.detail.unwrap_or_default();
+        assert!(
+            detail.contains("web"),
+            "detail must name the role: {detail}"
+        );
+        assert!(
+            detail.contains("postgresql"),
+            "detail must name the offending backend: {detail}"
+        );
+        assert!(result.hint.unwrap_or_default().contains("postgres"));
+    }
+
+    #[test]
+    fn split_topology_fails_on_web_role_with_blank_backend() {
+        // A blank backend also falls through to the local runtime.
+        let result = check_split_topology_on_local(ProcessRole::Web, "");
+        assert_eq!(result.status, CheckStatus::Fail);
+        assert!(result.detail.unwrap_or_default().contains("web"));
+    }
+
+    #[test]
+    fn resolve_process_role_prefers_env_over_toml() {
+        let table: toml::Table =
+            toml::from_str("role = \"web\"\n[jobs]\nbackend = \"local\"\n").expect("parse toml");
+        // Env overrides the toml `role`, and reads the jobs backend from toml.
+        let (role, backend) = resolve_process_role_and_backend_from_sources(
+            |key| (key == "AUTUMN_ROLE").then(|| "worker".to_owned()),
+            Some(&table),
+        );
+        assert_eq!(role, ProcessRole::Worker);
+        assert_eq!(backend, "local");
+    }
+
+    #[test]
+    fn resolve_process_role_defaults_to_combined_and_local() {
+        let (role, backend) = resolve_process_role_and_backend_from_sources(|_| None, None);
+        assert_eq!(role, ProcessRole::Combined);
+        assert_eq!(backend, "local");
+    }
+
+    #[test]
+    fn resolve_process_role_reads_backend_from_env() {
+        let table: toml::Table = toml::from_str("role = \"web\"\n").expect("parse toml");
+        let (role, backend) = resolve_process_role_and_backend_from_sources(
+            |key| (key == "AUTUMN_JOBS__BACKEND").then(|| "postgres".to_owned()),
+            Some(&table),
+        );
+        assert_eq!(role, ProcessRole::Web);
+        assert_eq!(backend, "postgres");
+    }
+
+    #[test]
+    fn resolve_process_role_falls_back_to_toml_when_env_role_invalid() {
+        // An invalid AUTUMN_ROLE must be ignored in favor of the configured
+        // TOML role, exactly like the runtime's apply_role_env_overrides_with_env.
+        let table: toml::Table =
+            toml::from_str("role = \"worker\"\n[jobs]\nbackend = \"local\"\n").expect("parse toml");
+        let (role, backend) = resolve_process_role_and_backend_from_sources(
+            |key| (key == "AUTUMN_ROLE").then(|| "garbage".to_owned()),
+            Some(&table),
+        );
+        assert_eq!(role, ProcessRole::Worker);
+        assert_eq!(backend, "local");
+
+        // ...and doctor therefore flags the split-on-local misconfiguration the
+        // runtime rejects at startup, instead of wrongly passing.
+        let result = check_split_topology_on_local(role, &backend);
+        assert_eq!(result.status, CheckStatus::Fail);
+        assert!(result.detail.unwrap_or_default().contains("worker"));
     }
 
     #[test]
