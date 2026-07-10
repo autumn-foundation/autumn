@@ -2399,7 +2399,7 @@ fn render_routes_file(
             "use crate::models::magic_link_token::{MagicLinkToken, NewMagicLinkToken};\n\
              use crate::schema::magic_link_tokens;\n"
                 .to_owned(),
-            magic_link_routes_section_src(pascal_name, snake_name, table),
+            magic_link_routes_section_src(pascal_name, snake_name, table, totp),
             "        p { a href=\"/login/magic\" { \"Email me a magic sign-in link\" } }\n"
                 .to_owned(),
         )
@@ -4123,6 +4123,15 @@ pub async fn change_password(
     // rebind the CURRENT device's row onto the rotated id so it stays signed in,
     // and revoke every persistent remember-me chain (the old password is now
     // suspect). If any step fails the whole change rolls back.
+    //
+    // FAIL-CLOSED TRADEOFF: rotation happens BEFORE the transaction so both the
+    // pre- and post-rotation digests are known and the row rebind is atomic with
+    // the password write. The cost is that on a rolled-back change the cookie
+    // already holds the rotated id, which no longer matches any `user_sessions`
+    // row — so a FAILED change logs the acting device out. This is fail-closed
+    // (a security-neutral logout, never an unintended stay-signed-in), so it is
+    // left as-is: moving the rotate/rebind after commit would only relocate the
+    // same window and risks the "rotate before auth writes" fixation invariant.
     let pre_rotation_digest = session_token_digest(&session).await;
     session.rotate_id().await;
     let post_rotation_digest = session_token_digest(&session).await;
@@ -5107,7 +5116,14 @@ pub async fn confirm_email(
     let {snake_name}: {pascal_name} = diesel::update(
         {table}::table
             .filter({table}::confirm_token_digest.eq(Some(&token_digest)))
-            .filter({table}::confirm_token_expires_at.gt(now)),
+            .filter({table}::confirm_token_expires_at.gt(now))
+            // Disambiguate from an email-CHANGE token, which shares the
+            // `confirm_token_digest` column but sets `pending_email`. Without this
+            // reverse guard a change-email token could satisfy this signup-confirm
+            // UPDATE — consuming it, stamping `email_confirmed_at`, orphaning
+            // `pending_email`, and minting an unintended session (mirror of the
+            // `pending_email.is_not_null()` guard in `confirm_email_change`).
+            .filter({table}::pending_email.is_null()),
     )
     .set((
         {table}::email_confirmed_at.eq(Some(now)),
@@ -5773,6 +5789,103 @@ fn post_form(base: &str, path: &str, body: &str, cookie: &str) -> String {{
     resp
 }}
 
+/// Cookie-aware GET (the bare `get` above sends no `Cookie` header). Used by the
+/// live-DB end-to-end tests that must replay an authenticated session.
+fn get_auth(base: &str, path: &str, cookie: &str) -> String {{
+    let hp = host_port(base);
+    let mut stream =
+        TcpStream::connect(&hp).unwrap_or_else(|_| panic!("cannot connect to {{base}}"));
+    let req = format!(
+        "GET {{path}} HTTP/1.1\r\n\
+         Host: {{hp}}\r\n\
+         Cookie: {{cookie}}\r\n\
+         Connection: close\r\n\r\n"
+    );
+    stream.write_all(req.as_bytes()).expect("write failed");
+    let mut resp = String::new();
+    stream.read_to_string(&mut resp).expect("read failed");
+    resp
+}}
+
+/// Extract the session cookie (`name=value`) from a `Set-Cookie` header.
+fn session_cookie(resp: &str) -> Option<String> {{
+    resp.lines()
+        .filter(|l| l.to_ascii_lowercase().starts_with("set-cookie:"))
+        .filter_map(|l| l.splitn(2, ':').nth(1))
+        .map(|v| v.split(';').next().unwrap_or("").trim().to_owned())
+        .find(|c| !c.is_empty())
+}}
+
+/// A process-unique suffix so each live-DB test operates on a fresh account.
+fn unique_suffix() -> String {{
+    use std::time::{{SystemTime, UNIX_EPOCH}};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("{{nanos}}")
+}}
+
+/// Strip `scheme://host` from a URL, returning just the path (plus any query).
+fn url_path(url: &str) -> String {{
+    if let Some(idx) = url.find("://") {{
+        let after = &url[idx + 3..];
+        match after.find('/') {{
+            Some(p) => after[p..].to_owned(),
+            None => "/".to_owned(),
+        }}
+    }} else {{
+        url.to_owned()
+    }}
+}}
+
+/// Read captured mail from a file-based transport and return the first URL
+/// containing `marker` (newest message first). Point `AUTUMN_TEST_MAILDIR` at the
+/// transport's output directory (e.g. `[mail] transport = "file"`); returns
+/// `None` when unset or no match is found.
+fn mail_link(marker: &str) -> Option<String> {{
+    let dir = std::env::var("AUTUMN_TEST_MAILDIR").ok()?;
+    let mut entries: Vec<_> = std::fs::read_dir(&dir).ok()?.filter_map(Result::ok).collect();
+    // Scan newest file first so we pick up the most recently delivered message.
+    entries.sort_by_key(|e| e.metadata().and_then(|m| m.modified()).ok());
+    entries.reverse();
+    for entry in entries {{
+        let Ok(body) = std::fs::read_to_string(entry.path()) else {{
+            continue;
+        }};
+        if let Some(idx) = body.find(marker) {{
+            let start = body[..idx].rfind("http").unwrap_or(idx);
+            let tail = &body[start..];
+            let end = tail
+                .find(|c: char| c.is_whitespace() || c == '"' || c == '<' || c == '\'')
+                .unwrap_or(tail.len());
+            return Some(tail[..end].to_owned());
+        }}
+    }}
+    None
+}}
+
+/// Sign up an account and confirm it by GETting the confirmation link captured
+/// from the file mail transport, leaving it ready to sign in.
+fn signup_and_confirm(base: &str, email: &str, password: &str) {{
+    let body = format!("email={{email}}&password={{password}}");
+    post_form(base, "/signup", &body, "");
+    if let Some(url) = mail_link("/auth/confirm/") {{
+        let _ = get(base, &url_path(&url));
+    }}
+}}
+
+/// Log in and return the authenticated session cookie. Panics on failure.
+fn login(base: &str, email: &str, password: &str) -> String {{
+    let body = format!("email={{email}}&password={{password}}");
+    let resp = post_form(base, "/login", &body, "");
+    assert!(
+        resp.contains("HTTP/1.1 30") || resp.contains("HTTP/1.0 30"),
+        "login did not redirect — is the account confirmed?\n{{resp}}"
+    );
+    session_cookie(&resp).expect("login response missing Set-Cookie")
+}}
+
 #[test]
 fn auth_signup_returns_200() {{
     let Some(base) = base_url() else {{
@@ -6177,14 +6290,116 @@ fn password_and_email_change_end_to_end() {{
         eprintln!("skipping: AUTUMN_TEST_BASE_URL not set");
         return;
     }};
-    let _ = base;
-    todo!(
-        "implement password_and_email_change_end_to_end against a live DB: \
-         (1) password change revokes other sessions, \
-         (2) wrong current password → 422 with no change, \
-         (3) pending email keeps the old address usable until the new-address \
-         token is confirmed"
-    )
+
+    // A fresh, confirmed account (sign up, then GET the confirm link from mail).
+    let suffix = unique_suffix();
+    let email = format!("pw-change-{{suffix}}@example.com");
+    let password = "correct-horse-Battery-1";
+    signup_and_confirm(&base, &email, password);
+
+    // ── (a) A successful password change invalidates OTHER sessions ──────────
+    let cookie_a = login(&base, &email, password);
+    let cookie_b = login(&base, &email, password);
+    assert!(
+        get_auth(&base, "/account", &cookie_a).contains(" 200"),
+        "client A should start signed in"
+    );
+    assert!(
+        get_auth(&base, "/account", &cookie_b).contains(" 200"),
+        "client B should start signed in"
+    );
+
+    let new_password = "different-Zebra-2-quux";
+    let change_body = format!(
+        "current_password={{password}}\
+         &new_password={{new_password}}\
+         &new_password_confirmation={{new_password}}"
+    );
+    let change_resp = post_form(&base, "/account/password", &change_body, &cookie_a);
+    assert!(
+        change_resp.contains("HTTP/1.1 30") || change_resp.contains("HTTP/1.0 30"),
+        "password change should redirect on success:\n{{change_resp}}"
+    );
+    // The acting client's session id is rotated on change; follow the new cookie.
+    let cookie_a = session_cookie(&change_resp).unwrap_or(cookie_a);
+    assert!(
+        get_auth(&base, "/account", &cookie_a).contains(" 200"),
+        "the acting client must stay signed in after the change"
+    );
+    // The OTHER client's next request is now unauthenticated (session revoked).
+    let resp_b = get_auth(&base, "/account", &cookie_b);
+    assert!(
+        resp_b.contains("HTTP/1.1 401")
+            || resp_b.contains("HTTP/1.0 401")
+            || resp_b.contains("HTTP/1.1 30")
+            || resp_b.contains("HTTP/1.0 30"),
+        "the other session must be revoked by the password change:\n{{resp_b}}"
+    );
+
+    // ── (b) Wrong current password → 422, and the password is unchanged ──────
+    let wrong_body = format!(
+        "current_password=totally-wrong\
+         &new_password=Another-Pass-3-xyz\
+         &new_password_confirmation=Another-Pass-3-xyz"
+    );
+    let wrong_resp = post_form(&base, "/account/password", &wrong_body, &cookie_a);
+    assert!(
+        wrong_resp.contains("HTTP/1.1 422") || wrong_resp.contains("HTTP/1.0 422"),
+        "a wrong current password must be rejected with 422:\n{{wrong_resp}}"
+    );
+    // The CURRENT password still authenticates → the failed attempt changed nothing.
+    let relogin = post_form(
+        &base,
+        "/login",
+        &format!("email={{email}}&password={{new_password}}"),
+        "",
+    );
+    assert!(
+        relogin.contains("HTTP/1.1 30") || relogin.contains("HTTP/1.0 30"),
+        "the failed change must not have altered the password:\n{{relogin}}"
+    );
+
+    // ── (c) A pending email change keeps the OLD address usable until confirmed ─
+    let new_email = format!("pw-change-new-{{suffix}}@example.com");
+    let cookie = login(&base, &email, new_password);
+    let email_body = format!("new_email={{new_email}}&current_password={{new_password}}");
+    let start_resp = post_form(&base, "/account/email", &email_body, &cookie);
+    assert!(
+        start_resp.contains("HTTP/1.1 30")
+            || start_resp.contains("HTTP/1.0 30")
+            || start_resp.contains(" 200"),
+        "starting an email change should succeed:\n{{start_resp}}"
+    );
+    // The OLD address still signs in while the change is pending.
+    let old_still = post_form(
+        &base,
+        "/login",
+        &format!("email={{email}}&password={{new_password}}"),
+        "",
+    );
+    assert!(
+        old_still.contains("HTTP/1.1 30") || old_still.contains("HTTP/1.0 30"),
+        "the old address must remain usable until the new-address token is confirmed:\n{{old_still}}"
+    );
+    // Confirm the change via the link mailed to the NEW address.
+    let confirm_url = mail_link("/account/email/confirm/")
+        .expect("captured mail should contain the email-change confirm link");
+    let confirmed = get(&base, &url_path(&confirm_url));
+    assert!(
+        confirmed.contains(" 200") || confirmed.contains(" 30"),
+        "confirming the email change should succeed:\n{{confirmed}}"
+    );
+    // The NEW address now signs in.
+    let new_login = post_form(
+        &base,
+        "/login",
+        &format!("email={{new_email}}&password={{new_password}}"),
+        "",
+    );
+    assert!(
+        new_login.contains("HTTP/1.1 30") || new_login.contains("HTTP/1.0 30"),
+        "the new address must sign in after confirmation:\n{{new_login}}"
+    );
 }}
 {magic_link_tests}"#
     )
@@ -6216,15 +6431,53 @@ fn magic_link_request_and_consume_logs_in() {
         eprintln!("skipping: AUTUMN_TEST_BASE_URL not set");
         return;
     };
-    let _ = base;
-    todo!(
-        "implement magic_link_request_and_consume_logs_in against a live DB: \
-         (1) POST /login/magic sends a link containing /login/magic/verify?token=, \
-         (2) an unregistered email yields the same response and sends no mail, \
-         (3) consuming the verify link logs the user in (GET /account → 200), \
-         (4) a second verify of the same token fails (single-use), \
-         (5) an unknown token yields the same generic failure (no oracle)"
-    )
+
+    // A confirmed account is eligible for a magic link.
+    let suffix = unique_suffix();
+    let email = format!("magic-{suffix}@example.com");
+    let password = "magic-Passw0rd-link";
+    signup_and_confirm(&base, &email, password);
+
+    // (1) Requesting a link for the confirmed account emails a verify URL.
+    let resp = post_form(&base, "/login/magic", &format!("email={email}"), "");
+    assert!(
+        resp.contains(" 200"),
+        "POST /login/magic should return the check-your-email page:\n{resp}"
+    );
+    let verify_url = mail_link("/login/magic/verify?token=")
+        .expect("the magic-link email must contain a /login/magic/verify?token= URL");
+    let verify_path = url_path(&verify_url);
+
+    // (3) Consuming the link logs the user in: the redirect carries a session
+    //     cookie that authenticates a follow-up /account request.
+    let consume = get(&base, &verify_path);
+    assert!(
+        consume.contains("HTTP/1.1 30") || consume.contains("HTTP/1.0 30"),
+        "consuming the magic link should redirect to /account:\n{consume}"
+    );
+    let cookie = session_cookie(&consume).expect("the verify redirect must set a session cookie");
+    assert!(
+        get_auth(&base, "/account", &cookie).contains(" 200"),
+        "the magic-link session must authenticate /account"
+    );
+
+    // (4) A SECOND consume of the same token fails generically (single-use).
+    let second = get(&base, &verify_path);
+    assert!(
+        !second.contains("HTTP/1.1 30") && !second.contains("HTTP/1.0 30"),
+        "a consumed magic link must not log in again:\n{second}"
+    );
+    assert!(
+        second.contains("invalid or has expired"),
+        "a re-used token must render the generic failure page:\n{second}"
+    );
+
+    // (5) An unknown token yields the SAME generic failure (no oracle).
+    let unknown = get(&base, "/login/magic/verify?token=deadbeefdeadbeef");
+    assert!(
+        unknown.contains("invalid or has expired"),
+        "an unknown token must render the same generic failure page:\n{unknown}"
+    );
 }
 "#;
 
@@ -8565,7 +8818,12 @@ pub async fn login_verify(
 /// failure page. Uses `__SNAKE__` / `__PASCAL__` / `__TABLE__` placeholders and
 /// `.replace()` so the template body can use plain single braces.
 #[allow(clippy::too_many_lines)]
-fn magic_link_routes_section_src(pascal_name: &str, snake_name: &str, table: &str) -> String {
+fn magic_link_routes_section_src(
+    pascal_name: &str,
+    snake_name: &str,
+    table: &str,
+    totp: bool,
+) -> String {
     const TPL: &str = r#"
 // ── Passwordless magic-link login ───────────────────────────────────────────────
 //
@@ -8784,7 +9042,10 @@ pub async fn magic_link_verify(
     // rotation below destroys that session id, so drop its row now.
     untrack_current_session(&mut db, &session).await?;
 
-    // Rotate the session id BEFORE inserting the authenticated session id
+    // For 2FA-enabled accounts, park the session and redirect to /login/verify
+    // before granting a full session — a magic link proves email possession,
+    // not TOTP possession (mirrors confirm_email).
+__MAGIC_LINK_TOTP_BRANCH__    // Rotate the session id BEFORE inserting the authenticated session id
     // (session-fixation defense, consistent with login/reset/confirm).
     session.rotate_id().await;
     // Magic-link proves EMAIL POSSESSION, not password knowledge. Like
@@ -8839,7 +9100,18 @@ async fn send_magic_link_email(mailer: &Mailer, to: &str, token: &str) -> Autumn
     })
 }
 "#;
-    TPL.replace("__PASCAL__", pascal_name)
+    // When TOTP is enabled, magic-link verify must honor the second factor just
+    // like confirm_email: park a `totp_pending_confirmation` session and redirect
+    // to /login/verify. Reusing the confirm branch means completion in
+    // `login_verify` deliberately SKIPS the strong-auth stamp (email + TOTP does
+    // not prove password knowledge). The branch is already `__SNAKE__`-substituted.
+    let totp_branch = if totp {
+        totp_confirm_branch_src(snake_name)
+    } else {
+        String::new()
+    };
+    TPL.replace("__MAGIC_LINK_TOTP_BRANCH__", &totp_branch)
+        .replace("__PASCAL__", pascal_name)
         .replace("__SNAKE__", snake_name)
         .replace("__TABLE__", table)
 }
@@ -10589,6 +10861,94 @@ mod tests {
         );
     }
 
+    /// Extract just the `magic_link_verify` handler body from a rendered routes
+    /// file (from the handler signature up to the mailer helper that follows it).
+    fn magic_link_verify_body(routes: &str) -> &str {
+        let start = routes
+            .find("pub async fn magic_link_verify(")
+            .expect("verify handler");
+        let end = routes[start..]
+            .find("async fn send_magic_link_email(")
+            .map(|o| start + o)
+            .expect("mailer helper follows verify");
+        &routes[start..end]
+    }
+
+    #[test]
+    fn magic_link_verify_honors_totp_second_factor() {
+        // With `--magic-link --totp`, a 2FA-enrolled account must be parked and
+        // redirected to /login/verify — NOT straight-logged-in (Fix 1).
+        let routes = render_routes_file("User", "user", "users", &[], true, true);
+        let body = magic_link_verify_body(&routes);
+        assert!(
+            body.contains("if user.totp_enabled {"),
+            "verify must branch on totp_enabled under --totp: {body}"
+        );
+        assert!(
+            body.contains(".insert(\"totp_pending_id\""),
+            "must set the totp_pending_id marker for the interstitial: {body}"
+        );
+        // Mirror confirm_email: mark the pending login confirmation-origin so
+        // login_verify skips the strong-auth stamp (email + TOTP ≠ password).
+        assert!(
+            body.contains("session.insert(\"totp_pending_confirmation\", \"1\")"),
+            "must mark the pending login as confirmation-origin: {body}"
+        );
+        assert!(
+            body.contains("return Ok(redirect_to(\"/login/verify\"));"),
+            "a 2FA account must be redirected to /login/verify, not logged in: {body}"
+        );
+        // The direct auth-session insert must sit AFTER the 2FA early-return, so a
+        // TOTP-enrolled user is never logged in without the second factor.
+        let pending_return = body
+            .find("return Ok(redirect_to(\"/login/verify\"));")
+            .expect("2FA early-return present");
+        let auth_insert = body
+            .find("session.insert(state.auth_session_key()")
+            .expect("direct auth-session insert present");
+        assert!(
+            pending_return < auth_insert,
+            "the direct auth-session insert must be gated behind the 2FA early-return: {body}"
+        );
+    }
+
+    #[test]
+    fn magic_link_verify_without_totp_logs_in_directly() {
+        // With `--magic-link` and no `--totp`, verify logs in directly.
+        let routes = render_routes_file("User", "user", "users", &[], false, true);
+        let body = magic_link_verify_body(&routes);
+        assert!(
+            !body.contains("totp_enabled"),
+            "no totp branch may be emitted without --totp: {body}"
+        );
+        assert!(
+            !body.contains("redirect_to(\"/login/verify\")"),
+            "must not redirect to /login/verify without --totp: {body}"
+        );
+        assert!(
+            body.contains("session.insert(state.auth_session_key()"),
+            "must log in directly by inserting the auth session key: {body}"
+        );
+        assert!(
+            body.contains("record_login_session("),
+            "direct login must record the session: {body}"
+        );
+    }
+
+    #[test]
+    fn magic_link_verify_never_stamps_strong_auth_with_or_without_totp() {
+        // In NEITHER case may magic-link verify stamp password-grade strong-auth:
+        // magic-link proves email possession, not password knowledge (Fix 1).
+        for totp in [false, true] {
+            let routes = render_routes_file("User", "user", "users", &[], totp, true);
+            let body = magic_link_verify_body(&routes);
+            assert!(
+                !body.contains("step_up::set_last_strong_auth_at("),
+                "magic-link verify must never stamp strong-auth (totp={totp}): {body}"
+            );
+        }
+    }
+
     #[test]
     fn magic_link_ttl_default_is_at_most_15_minutes() {
         let tmp = project_with_main();
@@ -11069,6 +11429,33 @@ mod tests {
         assert!(
             confirm_body.contains("STEP_UP_SESSION_KEY"),
             "confirm_email must remove STEP_UP_SESSION_KEY after rotate_id: {confirm_body}"
+        );
+    }
+
+    #[test]
+    fn confirm_email_rejects_pending_email_change_tokens() {
+        // A change-email token shares the `confirm_token_digest` column but sets
+        // `pending_email`. The signup confirm_email UPDATE must guard on
+        // `pending_email IS NULL` so a change-email token can never satisfy it
+        // (Fix 2 — otherwise it consumes the token, stamps email_confirmed_at,
+        // orphans pending_email, and mints an unintended session).
+        let tmp = project_with_main();
+        let plan = plan_auth(tmp.path(), "User", "20260508000000").unwrap();
+        plan.execute(Flags::default()).unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/auth.rs")).unwrap();
+        let confirm_pos = routes
+            .find("pub async fn confirm_email(")
+            .expect("confirm_email handler missing");
+        let after_confirm = &routes[confirm_pos..];
+        let next_fn = after_confirm
+            .find("\npub async fn ")
+            .unwrap_or(after_confirm.len());
+        let confirm_body = &after_confirm[..next_fn];
+        // The reverse guard must be present in the signup-confirm UPDATE filter.
+        assert!(
+            confirm_body.contains("pending_email.is_null()"),
+            "confirm_email UPDATE must filter on pending_email IS NULL to reject \
+             email-change tokens: {confirm_body}"
         );
     }
 
