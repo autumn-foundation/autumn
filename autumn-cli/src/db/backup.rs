@@ -53,6 +53,11 @@ const MANAGED_PG_DATA_DIR_ENV: &str = "AUTUMN_MANAGED_PG_DATA_DIR";
 /// are written under when `--dir` is not given.
 const DEFAULT_BACKUP_DIR: &str = "backups";
 
+/// Upper bound on same-timestamp run-directory disambiguation attempts before a
+/// backup gives up. Reaching this means ~1000 backups landed in the same second
+/// for one profile, which is pathological — surfacing an error beats looping.
+const MAX_RUN_DIR_ATTEMPTS: usize = 1000;
+
 /// Marker `pg_dump` writes at the very end of a *plain* SQL dump. Its presence
 /// is the integrity signal for plain-format artifacts (a truncated/partial dump
 /// will not contain it).
@@ -252,16 +257,15 @@ pub fn run_restore(args: &RestoreArgs) {
 
 fn backup(args: &BackupArgs) -> Result<(), BackupError> {
     let targets = resolve_targets(args.profile.as_deref(), &args.target)?;
-    let tools = PgTools::locate();
+    // Include the managed cluster's bundled tools (daemon/cron path, where
+    // AUTUMN_MANAGED_PG_DATA_DIR isn't inherited) so a managed backup needs zero
+    // external tools on PATH (issue #1595).
+    let tools = PgTools::locate_with_extra(managed_pg_data_dir());
     let pg_dump = tools.require("pg_dump")?;
 
     let profile = migrate::effective_profile(args.profile.as_deref());
     let root = backup_root(args.dir.as_deref(), &profile);
-    let run_name = run_dir_name(&now_utc());
-    let run_dir = root.join(&run_name);
-
-    std::fs::create_dir_all(&run_dir)
-        .map_err(BackupError::io(format!("creating {}", run_dir.display())))?;
+    let run_dir = create_unique_run_dir(&root, &run_dir_name(&now_utc()))?;
 
     // Everything below writes into `run_dir`. On ANY failure we remove the
     // whole run directory so a partial/empty artifact is never left behind and
@@ -343,35 +347,178 @@ fn pg_command(program: &Path, url: &str) -> (Command, String) {
     (cmd, safe_url)
 }
 
-/// Split a connection URL into a `(password-free URL, password)` pair. On a
-/// URL that can't be parsed (or has no password) the URL is returned unchanged
-/// with `None`, so behavior degrades to the previous "URL on the command line"
-/// path rather than failing.
+/// Split a connection string into a `(password-free connstring, password)`
+/// pair. Two libpq connection-string forms are handled — the URL form
+/// (`postgres://user:pw@host/db`) and the keyword/value form
+/// (`host=db user=app password=secret dbname=app`), both of which Autumn's
+/// config validation accepts. In either form the password is moved out of the
+/// string so the caller can hand it to `PGPASSWORD` instead of leaving it on the
+/// argv (visible via `ps` / `/proc/<pid>/cmdline`). A string that is neither a
+/// parseable URL nor recognizable keyword/value form — or that simply carries no
+/// password — is returned unchanged with `None`, so behavior degrades to the
+/// previous "connstring on the command line" path rather than failing.
 ///
-/// The returned password is **percent-decoded**: `Url::password()` yields the
-/// raw (still percent-encoded) userinfo, but `PGPASSWORD` is consumed by libpq
-/// as a literal string — it is *not* percent-decoded. A URL like
-/// `postgres://u:p%40ss@h/db` must set `PGPASSWORD=p@ss`, not `p%40ss`, or
-/// authentication fails. The username is intentionally left untouched: it stays
-/// in the password-free `--dbname` URL, where libpq decodes it as part of URI
-/// parsing, so double-decoding it (or moving it to an env var) would be wrong.
+/// For the URL form the returned password is **percent-decoded**:
+/// `Url::password()` yields the raw (still percent-encoded) userinfo, but
+/// `PGPASSWORD` is consumed by libpq as a literal string — it is *not*
+/// percent-decoded. A URL like `postgres://u:p%40ss@h/db` must set
+/// `PGPASSWORD=p@ss`, not `p%40ss`, or authentication fails. The username is
+/// intentionally left untouched: it stays in the password-free `--dbname` URL,
+/// where libpq decodes it as part of URI parsing, so double-decoding it (or
+/// moving it to an env var) would be wrong.
 fn split_password(url: &str) -> (String, Option<String>) {
-    url::Url::parse(url).map_or_else(
-        |_| (url.to_owned(), None),
-        |mut parsed| {
-            let password = parsed.password().map(|pw| {
-                percent_encoding::percent_decode_str(pw)
-                    .decode_utf8_lossy()
-                    .into_owned()
-            });
-            if password.is_some() {
-                // Clearing the password keeps the username, host, port, db, and
-                // any query parameters intact.
-                let _ = parsed.set_password(None);
+    if let Ok(mut parsed) = url::Url::parse(url) {
+        let password = parsed.password().map(|pw| {
+            percent_encoding::percent_decode_str(pw)
+                .decode_utf8_lossy()
+                .into_owned()
+        });
+        if password.is_some() {
+            // Clearing the password keeps the username, host, port, db, and
+            // any query parameters intact.
+            let _ = parsed.set_password(None);
+        }
+        return (parsed.to_string(), password);
+    }
+    // Not a URL: it may be libpq keyword/value form, where the password would
+    // otherwise ride along on argv.
+    split_password_kv(url)
+}
+
+/// Move any `password=...` out of a libpq keyword/value connection string,
+/// returning `(stripped connstring, password)`. When the input isn't
+/// recognizable keyword/value form, or carries no password, the ORIGINAL string
+/// is returned untouched with `None` so a password-less connstring is passed
+/// through unchanged.
+fn split_password_kv(conn: &str) -> (String, Option<String>) {
+    let Some(pairs) = parse_libpq_kv(conn) else {
+        return (conn.to_owned(), None);
+    };
+    let mut password = None;
+    let mut kept = Vec::with_capacity(pairs.len());
+    for (key, value) in pairs {
+        if key == "password" {
+            // Last one wins, matching libpq (later keywords override earlier).
+            password = Some(value);
+        } else {
+            kept.push((key, value));
+        }
+    }
+    if password.is_none() {
+        return (conn.to_owned(), None);
+    }
+    let rebuilt = kept
+        .into_iter()
+        .map(|(k, v)| format!("{k}={}", quote_libpq_value(&v)))
+        .collect::<Vec<_>>()
+        .join(" ");
+    (rebuilt, password)
+}
+
+/// Parse a libpq keyword/value connection string into `(keyword, value)` pairs.
+/// Applies libpq's unquoting rules: whitespace separates pairs and may surround
+/// `=`; a value may be single-quoted to contain spaces; and a backslash escapes
+/// the next character (so `\'` and `\\` yield a literal quote and backslash).
+/// Returns `None` when the string doesn't parse as keyword/value form (no
+/// `keyword=` token, a missing `=`, or an unterminated quote), so callers fall
+/// back to treating it opaquely.
+fn parse_libpq_kv(conn: &str) -> Option<Vec<(String, String)>> {
+    let chars: Vec<char> = conn.chars().collect();
+    let len = chars.len();
+    let mut i = 0;
+    let mut pairs = Vec::new();
+    loop {
+        while i < len && chars[i].is_whitespace() {
+            i += 1;
+        }
+        if i == len {
+            break;
+        }
+        // Keyword: runs up to the next whitespace or `=` (keywords aren't quoted).
+        let start = i;
+        while i < len && !chars[i].is_whitespace() && chars[i] != '=' {
+            i += 1;
+        }
+        if i == start {
+            return None;
+        }
+        let keyword: String = chars[start..i].iter().collect();
+        while i < len && chars[i].is_whitespace() {
+            i += 1;
+        }
+        if i == len || chars[i] != '=' {
+            return None;
+        }
+        i += 1; // consume '='
+        while i < len && chars[i].is_whitespace() {
+            i += 1;
+        }
+        // Value: single-quoted (may contain spaces) or bare (ends at whitespace).
+        let mut value = String::new();
+        if i < len && chars[i] == '\'' {
+            i += 1;
+            loop {
+                if i == len {
+                    return None; // unterminated quote
+                }
+                match chars[i] {
+                    '\\' => {
+                        i += 1;
+                        if i < len {
+                            value.push(chars[i]);
+                            i += 1;
+                        }
+                    }
+                    '\'' => {
+                        i += 1;
+                        break;
+                    }
+                    c => {
+                        value.push(c);
+                        i += 1;
+                    }
+                }
             }
-            (parsed.to_string(), password)
-        },
-    )
+        } else {
+            while i < len && !chars[i].is_whitespace() {
+                if chars[i] == '\\' {
+                    i += 1;
+                    if i < len {
+                        value.push(chars[i]);
+                        i += 1;
+                    }
+                } else {
+                    value.push(chars[i]);
+                    i += 1;
+                }
+            }
+        }
+        pairs.push((keyword, value));
+    }
+    (!pairs.is_empty()).then_some(pairs)
+}
+
+/// Re-serialize a libpq value, single-quoting and backslash-escaping it when it
+/// is empty or contains whitespace, a quote, or a backslash, so the rebuilt
+/// connection string round-trips back through [`parse_libpq_kv`] (and libpq).
+fn quote_libpq_value(value: &str) -> String {
+    let needs_quoting = value.is_empty()
+        || value
+            .chars()
+            .any(|c| c.is_whitespace() || c == '\'' || c == '\\');
+    if !needs_quoting {
+        return value.to_owned();
+    }
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('\'');
+    for c in value.chars() {
+        if c == '\'' || c == '\\' {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out.push('\'');
+    out
 }
 
 /// Build the `pg_dump` argument vector for one target. Pure over its inputs so
@@ -559,7 +706,9 @@ fn restore(args: &RestoreArgs) -> Result<(), BackupError> {
     let entries = plan.select(args.shard.as_deref())?;
 
     let targets = resolve_targets_for_restore(args.profile.as_deref(), &entries)?;
-    let tools = PgTools::locate();
+    // Same bundled-tool discovery as backup: a managed restore must also work
+    // with zero external tools on PATH (issue #1595).
+    let tools = PgTools::locate_with_extra(managed_pg_data_dir());
 
     // Verify EVERY artifact before mutating ANY database (AC #4): refuse to
     // start a destructive restore we can't finish.
@@ -765,6 +914,18 @@ fn managed_pg_fallback_url() -> Option<String> {
     crate::serve::managed_pg_env(None).and_then(|env| env.attach_url)
 }
 
+/// The managed-Postgres cluster's data dir, discovered via the SAME blessed
+/// helper as [`managed_pg_fallback_url`]. Used to locate the daemon's bundled
+/// `pg_dump`/`pg_restore`/`psql`: in the managed-daemon/cron path the backup
+/// process is NOT launched with `AUTUMN_MANAGED_PG_DATA_DIR` (only `autumn serve`
+/// sets it for its own children), so the env-var-driven tool locator can't find
+/// the extracted bundle. Feeding this data dir to the locator as a
+/// runtime-discovered candidate lets a managed backup run with zero external
+/// tools on PATH (issue #1595, AC #2). `None` when no managed cluster resolves.
+fn managed_pg_data_dir() -> Option<PathBuf> {
+    crate::serve::managed_pg_env(None).map(|env| env.data_dir)
+}
+
 /// Apply the managed-pg published URL as a fallback for the control URL. Pure
 /// over its inputs (the fallback is a closure, evaluated lazily) so the
 /// precedence — explicit config/env first, managed-pg published URL second — is
@@ -967,12 +1128,25 @@ impl PgTools {
     /// Build the locator from the environment: `AUTUMN_PG_BIN_DIR`, then the
     /// managed-Postgres bundle's `bin` dir, then PATH.
     pub fn locate() -> Self {
-        Self {
-            dirs: candidate_bin_dirs(
-                std::env::var_os(PG_BIN_DIR_ENV).map(PathBuf::from),
-                std::env::var_os(MANAGED_PG_DATA_DIR_ENV).map(PathBuf::from),
-            ),
-        }
+        Self::locate_with_extra(None)
+    }
+
+    /// Like [`Self::locate`] but also considers a runtime-discovered managed
+    /// Postgres data dir (e.g. from [`managed_pg_data_dir`]). The daemon/cron
+    /// backup path doesn't inherit `AUTUMN_MANAGED_PG_DATA_DIR`, so without this
+    /// the bundled client tools sitting next to the live cluster's data dir would
+    /// be invisible and `require` would wrongly report them missing (issue #1595).
+    /// The extra dir's derived `bin/` directories are appended after the
+    /// env-driven candidates, so an explicit `AUTUMN_PG_BIN_DIR`/env bundle still
+    /// wins.
+    pub fn locate_with_extra(managed_data_dir: Option<PathBuf>) -> Self {
+        let mut dirs = candidate_bin_dirs(
+            std::env::var_os(PG_BIN_DIR_ENV).map(PathBuf::from),
+            std::env::var_os(MANAGED_PG_DATA_DIR_ENV).map(PathBuf::from),
+        );
+        // Reuse the exact bundle-layout derivation for the runtime-discovered dir.
+        dirs.extend(candidate_bin_dirs(None, managed_data_dir));
+        Self { dirs }
     }
 
     /// Build a locator over an explicit list of candidate `bin` directories.
@@ -1140,6 +1314,49 @@ fn backup_root(dir: Option<&Path>, profile: &str) -> PathBuf {
 /// The run-directory name for a given instant: a sortable UTC timestamp.
 fn run_dir_name(now: &chrono::DateTime<chrono::Utc>) -> String {
     now.format("%Y%m%dT%H%M%SZ").to_string()
+}
+
+/// Create a fresh, uniquely-named run directory under `root`, starting from
+/// `base`. The leaf is created **exclusively** (`create_dir`, which fails if it
+/// already exists) so a run never reuses — and silently overwrites the
+/// `control.dump`/shards/`manifest.json` of — an earlier restore point. Two
+/// backups for the same profile in the same second (an overlapping cron run and
+/// a manual retry) would otherwise collide, since the name has only second
+/// precision; on collision we disambiguate with an incrementing `-N` suffix
+/// (`<base>`, `<base>-2`, `<base>-3`, …).
+///
+/// The suffixed names stay lexically sortable so retention ordering in
+/// [`list_run_dirs`]/[`prune`] is preserved: `<base>` sorts before `<base>-2`
+/// (it's a prefix), the `-N` variants sort among themselves, and every
+/// same-second variant shares the `…SSZ` prefix so it all sorts before the next
+/// second's `…S(S+1)Z`.
+fn create_unique_run_dir(root: &Path, base: &str) -> Result<PathBuf, BackupError> {
+    // The exclusive `create_dir` below won't create intermediate directories, so
+    // ensure the profile root exists first.
+    std::fs::create_dir_all(root)
+        .map_err(BackupError::io(format!("creating {}", root.display())))?;
+    for attempt in 1..=MAX_RUN_DIR_ATTEMPTS {
+        let name = if attempt == 1 {
+            base.to_owned()
+        } else {
+            format!("{base}-{attempt}")
+        };
+        let candidate = root.join(&name);
+        match std::fs::create_dir(&candidate) {
+            Ok(()) => return Ok(candidate),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => {
+                return Err(BackupError::io(format!("creating {}", candidate.display()))(e));
+            }
+        }
+    }
+    Err(BackupError::Io {
+        context: format!("creating a unique run directory under {}", root.display()),
+        source: std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!("exhausted {MAX_RUN_DIR_ATTEMPTS} same-timestamp attempts for {base:?}"),
+        ),
+    })
 }
 
 /// The artifact file name for one target and format.
@@ -1412,6 +1629,32 @@ mod tests {
     }
 
     #[test]
+    fn create_unique_run_dir_never_overwrites_same_timestamp() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("dev");
+        let base = "20260710T040506Z";
+
+        // Two backups for the same profile in the same second must NOT collide.
+        let first = create_unique_run_dir(&root, base).unwrap();
+        // Mark the first run so we can prove it isn't overwritten/reused.
+        std::fs::write(first.join(MANIFEST_FILE), b"{}").unwrap();
+
+        let second = create_unique_run_dir(&root, base).unwrap();
+
+        assert_ne!(first, second);
+        assert_eq!(first, root.join(base));
+        assert_eq!(second, root.join(format!("{base}-2")));
+        // The first run's artifact is untouched (no silent overwrite).
+        assert!(first.join(MANIFEST_FILE).is_file());
+        // The suffixed name still sorts after the base, preserving retention order.
+        assert!(base < format!("{base}-2").as_str());
+
+        // A third collision keeps incrementing.
+        let third = create_unique_run_dir(&root, base).unwrap();
+        assert_eq!(third, root.join(format!("{base}-3")));
+    }
+
+    #[test]
     fn plan_pruning_never_removes_everything_on_keep_zero() {
         let runs: Vec<String> = ["a", "b"].iter().map(|s| (*s).to_owned()).collect();
         // keep 0 is clamped to 1 so a just-taken backup survives.
@@ -1451,6 +1694,31 @@ mod tests {
         let exe = bin.join(exe_name("pg_dump"));
         std::fs::write(&exe, b"#!/bin/sh\n").unwrap();
         assert_eq!(resolve_tool_in(std::slice::from_ref(&bin), "pg_dump"), exe);
+    }
+
+    #[test]
+    fn managed_data_dir_candidate_locates_bundled_tools() {
+        // Simulate the managed-daemon layout: the cluster's data dir sits beside
+        // the extracted `postgresql/bin` bundle. In the daemon/cron path
+        // AUTUMN_MANAGED_PG_DATA_DIR isn't set, so the ONLY way to find these
+        // tools is by feeding the runtime-discovered data dir to the locator
+        // (issue #1595). Placing fake `pg_dump`/`pg_restore` there must let the
+        // locator resolve them by concrete path.
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("pgdata");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        // `candidate_bin_dirs` derives `<data_dir parent>/postgresql/bin`.
+        let bundle_bin = tmp.path().join("postgresql").join("bin");
+        std::fs::create_dir_all(&bundle_bin).unwrap();
+        let pg_dump = bundle_bin.join(exe_name("pg_dump"));
+        let pg_restore = bundle_bin.join(exe_name("pg_restore"));
+        std::fs::write(&pg_dump, b"#!/bin/sh\n").unwrap();
+        std::fs::write(&pg_restore, b"#!/bin/sh\n").unwrap();
+
+        let dirs = candidate_bin_dirs(None, Some(data_dir));
+        assert!(dirs.contains(&bundle_bin));
+        assert_eq!(resolve_tool_in(&dirs, "pg_dump"), pg_dump);
+        assert_eq!(resolve_tool_in(&dirs, "pg_restore"), pg_restore);
     }
 
     #[test]
@@ -1647,10 +1915,59 @@ mod tests {
         let (safe, pw) = split_password("postgres://user@localhost/app");
         assert_eq!(pw, None);
         assert_eq!(safe, "postgres://user@localhost/app");
-        // A non-URL degrades to passing the string through unchanged.
+        // A non-URL that isn't keyword/value form (no `keyword=`) degrades to
+        // passing the string through unchanged.
         let (safe, pw) = split_password("not a url");
         assert_eq!(pw, None);
         assert_eq!(safe, "not a url");
+    }
+
+    #[test]
+    fn split_password_strips_keyword_value_password() {
+        // libpq keyword/value form (which Autumn's config validation accepts):
+        // the password must move to PGPASSWORD, never staying on argv where `ps`
+        // could read it.
+        let (safe, pw) = split_password("host=db user=app password=secret dbname=app");
+        assert_eq!(pw.as_deref(), Some("secret"));
+        assert!(!safe.contains("password"));
+        assert!(!safe.contains("secret"));
+        // The remaining keywords are preserved for `--dbname`.
+        assert!(safe.contains("host=db"));
+        assert!(safe.contains("user=app"));
+        assert!(safe.contains("dbname=app"));
+        // And the stripped connstring still round-trips through the parser.
+        let reparsed = parse_libpq_kv(&safe).unwrap();
+        assert!(reparsed.iter().all(|(k, _)| k != "password"));
+    }
+
+    #[test]
+    fn split_password_handles_single_quoted_keyword_value() {
+        // A single-quoted value carries spaces and metacharacters; unquoting must
+        // yield the literal password for PGPASSWORD.
+        let (safe, pw) = split_password("host=db password='p a$s' dbname=app");
+        assert_eq!(pw.as_deref(), Some("p a$s"));
+        assert!(!safe.contains("p a$s"));
+        assert!(!safe.contains("password"));
+        assert!(safe.contains("host=db"));
+        assert!(safe.contains("dbname=app"));
+    }
+
+    #[test]
+    fn split_password_handles_escaped_quote_in_keyword_value() {
+        // Backslash escapes inside a quoted value: `\'` is a literal quote and
+        // `\\` a literal backslash.
+        let (_safe, pw) = split_password(r"host=db password='a\'b\\c'");
+        assert_eq!(pw.as_deref(), Some(r"a'b\c"));
+    }
+
+    #[test]
+    fn split_password_keyword_value_without_password_passes_through() {
+        // No `password=` token => the connstring is returned byte-for-byte with
+        // no PGPASSWORD, so nothing changes for password-less managed clusters.
+        let input = "host=db user=app dbname=app";
+        let (safe, pw) = split_password(input);
+        assert_eq!(pw, None);
+        assert_eq!(safe, input);
     }
 
     #[test]
