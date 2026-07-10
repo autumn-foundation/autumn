@@ -82,6 +82,37 @@ Wrap any of the above in `Option<…>` to make the column nullable
 (`Option<String>`, `Option<i64>`, `Option<NaiveDateTime>`, …). The generator
 emits both `NULL` in the migration SQL and `Nullable<T>` in `schema.rs`.
 
+### Validation and HTML5 constraints (`{…}` modifiers)
+
+Add a trailing `{…}` block to a field to declare constraints once and have
+them enforced on **both** sides — a server-side `#[validate(...)]` rule *and*
+the matching client-side HTML5 input attribute:
+
+```bash
+autumn generate scaffold Post \
+  'title:String{min=3,max=120}' \
+  'contact:String{email}' \
+  'homepage:String{url}' \
+  'age:i32{min=0,max=130}'
+```
+
+| Modifier                        | Applies to        | `#[validate(…)]`        | HTML5 attribute(s)        |
+| ------------------------------- | ----------------- | ----------------------- | ------------------------- |
+| `{min=N,max=N}` (String/Text)   | `String`/`Text`   | `length(min, max)`      | `minlength` / `maxlength` |
+| `{min=N,max=N}` (numeric)       | `i32`/`i64`/`f32`/`f64` | `range(min, max)` | `min` / `max` (`type="number"`) |
+| `{email}`                       | `String`/`Text`   | `email`                 | `type="email"`            |
+| `{url}`                         | `String`/`Text`   | `url`                   | `type="url"`              |
+
+The generated model field carries the `#[validate(...)]` attribute (so a bad
+submission is rejected through the existing changeset path as a **422 with
+inline per-field errors**, never a 500 or a silent store), and the generated
+form input carries the matching HTML5 attribute (so the browser blocks bad
+input before it hits the network). The `required` signal from a non-nullable
+column is preserved, and a rejected submission re-renders keeping the entered
+values. A misspelled modifier (e.g. `{maxx=5}`) fails the scaffold with an
+error naming the offending token. Quote the whole token in bash/zsh so the
+shell doesn't brace-expand the comma.
+
 Every generated table also includes:
 
 - `id BIGSERIAL PRIMARY KEY` (the `i64`-PK convention used everywhere else
@@ -108,6 +139,35 @@ If the referenced model doesn't exist yet (no `src/models/post.rs`, or a
 matching declaration in a single-file `src/models.rs`), the generator still
 scaffolds the column, constraint, and index — it just prints a warning that
 the referenced table is assumed to already exist.
+
+#### belongs_to dropdowns (populated from the parent)
+
+When the referenced model *does* exist, the scaffolded new/edit form renders
+the foreign key as a **populated `<select>`** — one `<option>` per parent row
+— instead of a text box demanding a raw numeric id, and the index/show views
+render the parent's **display value** rather than the raw `*_id` integer. No
+hand-editing required:
+
+```bash
+autumn generate model Post title:String
+autumn generate scaffold Comment body:Text post:references
+# → the new-comment form's "post" field is a dropdown of existing posts,
+#   labeled by each post's title; the comment index/show show the post title.
+```
+
+The **display column** is chosen by heuristic: a `name` or `title` column if
+present, otherwise the first `String`/`Text` column, falling back to the id
+only when the parent has no string column. Override it explicitly with a
+`{label:col}` modifier:
+
+```bash
+autumn generate scaffold Comment body:Text 'post:references{label:slug}'
+```
+
+A nullable reference (`post:references?`) renders a blank "— Unset —" first
+option so the selection can be cleared, and its index/show views render a dash
+when unset. (Index/show use a simple per-view fetch; the N+1-safe batched
+variant is issue #835.)
 
 `references` only supports the i64/BIGSERIAL primary-key convention. If the
 referenced model *is* found but was generated with `--id uuid`, the generator

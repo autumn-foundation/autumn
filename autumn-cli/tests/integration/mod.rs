@@ -7,6 +7,7 @@ mod generate_tauri_mobile_offline;
 mod i18n_check;
 mod migrate_down;
 mod repo_hygiene;
+mod scaffold_belongs_to;
 mod scaffold_form_for;
 mod scaffold_validation;
 mod seed_model_linking;

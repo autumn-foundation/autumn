@@ -5212,7 +5212,10 @@ async fn main() {}
     fn link_seed_bin_is_idempotent() {
         let once = link_models_into_seed_bin(SEED_BIN);
         let twice = link_models_into_seed_bin(&once);
-        assert_eq!(once, twice, "re-linking an already-linked seed bin is a no-op");
+        assert_eq!(
+            once, twice,
+            "re-linking an already-linked seed bin is a no-op"
+        );
     }
 
     #[test]

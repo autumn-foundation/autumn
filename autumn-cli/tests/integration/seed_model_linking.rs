@@ -30,10 +30,7 @@ fn seed_project(project_name: &str) -> (tempfile::TempDir, PathBuf) {
     let tmp = tempfile::tempdir().expect("tempdir");
     run_autumn(tmp.path(), &["new", project_name, "--with-seed"]);
     let project = tmp.path().join(project_name);
-    run_autumn(
-        &project,
-        &["generate", "scaffold", "Post", "title:String"],
-    );
+    run_autumn(&project, &["generate", "scaffold", "Post", "title:String"]);
     (tmp, project)
 }
 
@@ -62,10 +59,7 @@ fn scaffold_links_models_and_schema_into_seed_binary() {
 fn second_generate_does_not_duplicate_seed_links() {
     let (_tmp, project) = seed_project("seed-idempotent-app");
     // A second model must not re-inject the shared declarations.
-    run_autumn(
-        &project,
-        &["generate", "model", "Comment", "body:Text"],
-    );
+    run_autumn(&project, &["generate", "model", "Comment", "body:Text"]);
     let seed = fs::read_to_string(project.join("src/bin/seed.rs")).unwrap();
     assert_eq!(
         seed.matches("mod schema;").count(),
@@ -86,10 +80,7 @@ fn project_without_seed_binary_leaves_no_seed_file() {
     let tmp = tempfile::tempdir().expect("tempdir");
     run_autumn(tmp.path(), &["new", "no-seed-app"]);
     let project = tmp.path().join("no-seed-app");
-    run_autumn(
-        &project,
-        &["generate", "scaffold", "Post", "title:String"],
-    );
+    run_autumn(&project, &["generate", "scaffold", "Post", "title:String"]);
     assert!(
         !project.join("src/bin/seed.rs").exists(),
         "no seed binary must be created for a project generated without --with-seed"

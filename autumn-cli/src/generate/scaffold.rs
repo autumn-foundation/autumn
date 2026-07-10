@@ -508,6 +508,7 @@ pub fn plan_scaffold_with_options(
         plan.create(
             routes_dir.join(format!("{plural}.rs")),
             render_routes_file(
+                project_root,
                 &pascal_name,
                 &snake_name,
                 &plural,
@@ -1435,6 +1436,7 @@ fn render_model_form(
 )]
 #[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
 fn render_routes_file(
+    project_root: &Path,
     pascal_name: &str,
     snake_name: &str,
     plural: &str,
@@ -1509,6 +1511,15 @@ fn render_routes_file(
     // threads into the layout.
     let flash_arg = "flash_messages(&flash.consume().await)";
 
+    // Per-reference display resolution (issue #1146): the `<select>` options,
+    // index columns, and show rows render the parent's display column (a
+    // `name`/`title`/first-string heuristic, or an explicit `{label:col}`)
+    // instead of the raw foreign-key id. A reference whose target has no
+    // string column has no entry here and keeps rendering the id.
+    let reference_displays: BTreeMap<String, ReferenceDisplay> = reference_fields
+        .iter()
+        .filter_map(|f| resolve_reference_display(project_root, f).map(|d| (f.name.clone(), d)))
+        .collect();
     let model_form = render_model_form(pascal_name, fields, validations);
     // Enum fields need their generated Rust type in scope here — `into_new`
     // parses into it and the `From<&Row>` seed matches against its variants
@@ -1785,7 +1796,7 @@ fn render_routes_file(
             new_form_body,
             edit_form_body,
             render_form_for_helper(pascal_name, snake_name, fields, missing_reference_targets)
-                + &render_reference_option_loaders(&reference_fields, db_ty),
+                + &render_reference_option_loaders(&reference_fields, db_ty, &reference_displays),
         )
     };
     let form_model_impl = render_form_model_impl(pascal_name);
@@ -1950,11 +1961,34 @@ fn render_routes_file(
         String::new()
     };
 
-    // For non-live paths, generate the data_table columns and call.
+    // For non-live paths, generate the data_table columns and call. The
+    // sharded index uses the id-based columns (`columns_let`); the plain
+    // non-sharded index promotes displayable `references` columns to render
+    // the parent's label from a per-view label map (issue #1146,
+    // `index_columns_labeled` + `index_label_loads`). Sharded/live keep the id
+    // rendering — their connection shape (`ShardedDb`) / list markup (a `<ul>`
+    // of ids) don't take the plain `Db`-loaded map.
     let columns_let = if live {
         String::new()
     } else {
-        render_columns_vec(pascal_name, plural, fields)
+        render_columns_vec(pascal_name, plural, fields, &reference_displays, false)
+    };
+    let index_label_loads = if live || sharded {
+        String::new()
+    } else {
+        render_index_reference_label_loads(&reference_fields, &reference_displays)
+    };
+    // `mut db: Db` is only added to the plain index signature when there is at
+    // least one label map to load — otherwise it would be an unused extractor.
+    let index_db_param = if index_label_loads.is_empty() {
+        ""
+    } else {
+        "mut db: Db,\n    "
+    };
+    let index_columns_labeled = if index_label_loads.is_empty() {
+        columns_let.clone()
+    } else {
+        render_columns_vec(pascal_name, plural, fields, &reference_displays, true)
     };
     let table_render = if live {
         String::new()
@@ -1965,7 +1999,10 @@ fn render_routes_file(
     };
 
     let list_render = if live { &live_ul_render } else { &table_render };
-    let show_rows = render_show_property_rows(all_fields);
+    let show_rows = render_show_property_rows(all_fields, &reference_displays);
+    // The `show` handler pre-loads each displayable reference's parent label
+    // (issue #1146) before building its property rows.
+    let show_label_loads = render_show_reference_label_loads(all_fields, &reference_displays);
 
     let index_handler = if sharded {
         if live {
@@ -2048,10 +2085,10 @@ pub async fn index(
 pub async fn index(
     page_req: PageRequest,
     repo: Pg{pascal_name}Repository,
-    flash: Flash,
+    {index_db_param}flash: Flash,
 ) -> AutumnResult<Markup> {{
     let page_data: Page<{pascal_name}> = repo.page(&page_req).await?;
-{columns_let}    Ok({layout_fn}("{pascal_name} index", {cp_index}{flash_arg}, html! {{
+{index_label_loads}{index_columns_labeled}    Ok({layout_fn}("{pascal_name} index", {cp_index}{flash_arg}, html! {{
         h1 {{ "{pascal_name}s" }}
         a href="/{plural}/new" {{ "New {pascal_name}" }}
         {list_render}
@@ -2273,7 +2310,7 @@ pub async fn show(id: Path<{id_rust}>, mut db: {db_ty}, flash: Flash) -> AutumnR
         .first(&mut *db)
         .await
         .map_err(AutumnError::not_found)?;
-    let props: Vec<(&str, maud::Markup)> = vec![
+{show_label_loads}    let props: Vec<(&str, maud::Markup)> = vec![
 {show_rows}    ];
     Ok({layout_fn}(&format!("{pascal_name} #{{}}", row.id), {cp_show}{flash_arg}, html! {{
         h1 {{ "{pascal_name} #" (row.id) }}
@@ -2658,7 +2695,11 @@ fn render_form_for_helper(
 /// makes a human-friendly label is a display decision the generator can't
 /// know, so the generated doc comment tells the author where to swap in a
 /// real label column.
-fn render_reference_option_loaders(reference_fields: &[&Field], db_ty: &str) -> String {
+fn render_reference_option_loaders(
+    reference_fields: &[&Field],
+    db_ty: &str,
+    reference_displays: &BTreeMap<String, ReferenceDisplay>,
+) -> String {
     use std::fmt::Write as _;
     let mut out = String::new();
     for f in reference_fields {
@@ -2666,25 +2707,99 @@ fn render_reference_option_loaders(reference_fields: &[&Field], db_ty: &str) -> 
         let Some(table) = f.reference_table() else {
             continue;
         };
-        let _ = write!(
-            out,
-            "/// Load the `(value, label)` select options for the `{name}` reference —\n\
-             /// one option per `{table}` row, ordered by id (issue #1135).\n\
-             ///\n\
-             /// Labels are the row id rendered as a string: which `{table}` column makes\n\
-             /// a human-friendly label is a display decision the generator can't know —\n\
-             /// swap the `map` below to use a real label column.\n\
-             async fn {name}_select_options(db: &mut {db_ty}) -> AutumnResult<Vec<(String, String)>> {{\n    \
-             let ids: Vec<i64> = {table}::table\n        \
-             .select({table}::id)\n        \
-             .order({table}::id.asc())\n        \
-             .load(&mut **db)\n        \
-             .await?;\n    \
-             Ok(ids.into_iter().map(|id| (id.to_string(), id.to_string())).collect())\n\
-             }}\n\n"
-        );
+        match reference_displays.get(name) {
+            // A display column was resolved (issue #1146): load `(id, label)`
+            // pairs so the `<select>` shows a human-friendly value, not the
+            // raw id. A nullable display column coalesces to the id string.
+            Some(display) => {
+                let column = &display.column;
+                let (load_ty, label_expr) = if display.column_nullable {
+                    ("Option<String>", "label.unwrap_or_else(|| id.to_string())")
+                } else {
+                    ("String", "label")
+                };
+                let _ = write!(
+                    out,
+                    "/// Load the `(value, label)` select options for the `{name}` reference —\n\
+                     /// one option per `{table}` row (value = id, label = `{column}`), ordered\n\
+                     /// by id (issues #1135, #1146).\n\
+                     async fn {name}_select_options(db: &mut {db_ty}) -> AutumnResult<Vec<(String, String)>> {{\n    \
+                     let rows: Vec<(i64, {load_ty})> = {table}::table\n        \
+                     .select(({table}::id, {table}::{column}))\n        \
+                     .order({table}::id.asc())\n        \
+                     .load(&mut **db)\n        \
+                     .await?;\n    \
+                     Ok(rows.into_iter().map(|(id, label)| (id.to_string(), {label_expr})).collect())\n\
+                     }}\n\n"
+                );
+            }
+            // No string column to display (or the target model couldn't be
+            // parsed): fall back to the id as both value and label.
+            None => {
+                let _ = write!(
+                    out,
+                    "/// Load the `(value, label)` select options for the `{name}` reference —\n\
+                     /// one option per `{table}` row, ordered by id (issue #1135).\n\
+                     ///\n\
+                     /// `{table}` has no string column to label options with, so the id is\n\
+                     /// used as both value and label — swap the `map` below to use a real\n\
+                     /// label column once one exists.\n\
+                     async fn {name}_select_options(db: &mut {db_ty}) -> AutumnResult<Vec<(String, String)>> {{\n    \
+                     let ids: Vec<i64> = {table}::table\n        \
+                     .select({table}::id)\n        \
+                     .order({table}::id.asc())\n        \
+                     .load(&mut **db)\n        \
+                     .await?;\n    \
+                     Ok(ids.into_iter().map(|id| (id.to_string(), id.to_string())).collect())\n\
+                     }}\n\n"
+                );
+            }
+        }
     }
     out
+}
+
+/// How a `references` field's parent row should be *displayed* (issue #1146):
+/// the referenced `table`, the `column` whose value labels the parent, and
+/// whether that column is nullable (`Option<String>`).
+///
+/// Resolved from the referenced model at scaffold time via
+/// [`resolve_reference_display`] — an explicit `{label:col}` override, else a
+/// `name`/`title`/first-string-column heuristic. `None` (no entry) means the
+/// target has no string column, so the raw id is rendered as a fallback.
+#[derive(Debug, Clone)]
+struct ReferenceDisplay {
+    column: String,
+    column_nullable: bool,
+}
+
+/// Resolve the display column for a `references` field against its target
+/// model (issue #1146): an explicit `{label:col}` override wins; otherwise a
+/// `name`/`title` column is preferred, else the first `String`/`Text` column.
+/// Returns `None` when the target model has no string column (render the id).
+fn resolve_reference_display(project_root: &Path, field: &Field) -> Option<ReferenceDisplay> {
+    let base = field.name.strip_suffix("_id").unwrap_or(&field.name);
+    let columns = super::model::model_string_columns(project_root, base);
+    let (column, column_nullable) = if let Some(label) = &field.constraints.label {
+        // Explicit override: trust the author's column name, using its known
+        // nullability when we can see it (else assume a non-null String).
+        let nullable = columns
+            .iter()
+            .find(|(c, _)| c == label)
+            .is_some_and(|(_, n)| *n);
+        (label.clone(), nullable)
+    } else {
+        let chosen = columns
+            .iter()
+            .find(|(c, _)| c == "name")
+            .or_else(|| columns.iter().find(|(c, _)| c == "title"))
+            .or_else(|| columns.first())?;
+        (chosen.0.clone(), chosen.1)
+    };
+    Some(ReferenceDisplay {
+        column,
+        column_nullable,
+    })
 }
 
 /// Render the form inputs for a scaffold's `--live-validation` new/edit/
@@ -2944,7 +3059,13 @@ fn cell_value_expr(field: &Field) -> String {
 /// Includes an "Id" column, one column per scaffold field (title-cased header),
 /// and a trailing "Show" actions column. All columns are non-sortable — server-side
 /// ordering per-column is out of scope; dead sort links would be worse than none.
-fn render_columns_vec(pascal_name: &str, plural: &str, fields: &[Field]) -> String {
+fn render_columns_vec(
+    pascal_name: &str,
+    plural: &str,
+    fields: &[Field],
+    reference_displays: &BTreeMap<String, ReferenceDisplay>,
+    use_label_maps: bool,
+) -> String {
     use std::fmt::Write as _;
     let mut out = String::with_capacity(fields.len() * 150 + 300);
     let _ = writeln!(
@@ -2959,7 +3080,27 @@ fn render_columns_vec(pascal_name: &str, plural: &str, fields: &[Field]) -> Stri
     // One column per field
     for f in fields {
         let header = title_case(&f.name);
-        let cell_expr = cell_value_expr(f);
+        // A displayable `references` column renders the parent's label from
+        // the per-view `{name}_labels` map the handler loaded (issue #1146),
+        // instead of the raw foreign-key id. The closure borrows the map,
+        // which outlives the `columns` vec in the generated handler.
+        let cell_expr = if use_label_maps
+            && f.kind.is_reference()
+            && reference_displays.contains_key(&f.name)
+        {
+            let name = &f.name;
+            if f.nullable {
+                format!(
+                    "match &row.{name} {{ Some(v) => {name}_labels.get(&v.to_string()).map(String::as_str).unwrap_or(\"—\"), None => \"—\" }}"
+                )
+            } else {
+                format!(
+                    "{name}_labels.get(&row.{name}.to_string()).map(String::as_str).unwrap_or(\"—\")"
+                )
+            }
+        } else {
+            cell_value_expr(f)
+        };
         let _ = writeln!(
             out,
             "        autumn_web::widgets::Column::new(\"{header}\", |row: &{pascal_name}| maud::html! {{ ({cell_expr}) }}),"
@@ -2977,13 +3118,23 @@ fn render_columns_vec(pascal_name: &str, plural: &str, fields: &[Field]) -> Stri
 /// Emit the `vec![…]` body for the `props` binding in the `show` handler.
 ///
 /// Produces one `("Label", maud::html! { value_expr })` tuple per row:
-/// `id`, every DSL-declared field (humanized label), then `created_at`.
-fn render_show_property_rows(fields: &[Field]) -> String {
+/// `id`, every DSL-declared field (humanized label), then `created_at`. A
+/// `references` field with a resolved display (issue #1146) renders the
+/// pre-loaded `{name}_label` variable (the parent's display value) instead of
+/// the raw foreign-key id — see [`render_show_reference_label_loads`].
+fn render_show_property_rows(
+    fields: &[Field],
+    reference_displays: &BTreeMap<String, ReferenceDisplay>,
+) -> String {
     let mut out = String::with_capacity(fields.len() * 100 + 150);
     out.push_str("        (\"Id\", maud::html! { (row.id) }),\n");
     for f in fields {
         let label = humanize(&f.name);
-        let cell_expr = cell_value_expr(f);
+        let cell_expr = if f.kind.is_reference() && reference_displays.contains_key(&f.name) {
+            format!("{}_label", f.name)
+        } else {
+            cell_value_expr(f)
+        };
         out.push_str("        (\"");
         out.push_str(&label);
         out.push_str("\", maud::html! { (");
@@ -2991,6 +3142,81 @@ fn render_show_property_rows(fields: &[Field]) -> String {
         out.push_str(") }),\n");
     }
     out.push_str("        (\"Created at\", maud::html! { (row.created_at.to_string()) }),\n");
+    out
+}
+
+/// Emit the `let {name}_label: String = …;` bindings the `show` handler
+/// evaluates before building its `props`, one per `references` field with a
+/// resolved display column (issue #1146). Each does a single per-view lookup
+/// of the parent's display value (the batched variant is out of scope, #835),
+/// falling back to the id string if the parent row (or its display value) is
+/// missing. Empty when the resource has no displayable references.
+fn render_show_reference_label_loads(
+    fields: &[Field],
+    reference_displays: &BTreeMap<String, ReferenceDisplay>,
+) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    for f in fields {
+        let Some(display) = reference_displays.get(&f.name) else {
+            continue;
+        };
+        let Some(table) = f.reference_table() else {
+            continue;
+        };
+        let name = &f.name;
+        let column = &display.column;
+        // A nullable display column comes back as `Option<String>` and is
+        // flattened; a non-null one as `String`. Both coalesce to the id on a
+        // miss so the show page never renders a bare blank for a real FK.
+        let found_expr = if display.column_nullable {
+            format!(
+                "{table}::table.find(fk).select({table}::{column}).first::<Option<String>>(&mut *db).await.ok().flatten().unwrap_or_else(|| fk.to_string())"
+            )
+        } else {
+            format!(
+                "{table}::table.find(fk).select({table}::{column}).first::<String>(&mut *db).await.unwrap_or_else(|_| fk.to_string())"
+            )
+        };
+        if f.nullable {
+            let _ = writeln!(
+                out,
+                "    let {name}_label: String = match row.{name} {{ Some(fk) => {found_expr}, None => \"—\".to_string() }};"
+            );
+        } else {
+            let _ = writeln!(
+                out,
+                "    let {name}_label: String = {{ let fk = row.{name}; {found_expr} }};"
+            );
+        }
+    }
+    out
+}
+
+/// Emit the `let {name}_labels: HashMap<String, String> = …;` bindings the
+/// plain (non-sharded) `index` handler evaluates before building its data-table
+/// columns, one per `references` field with a resolved display column
+/// (issue #1146). Each reuses the field's `{name}_select_options` loader (a
+/// simple per-view fetch; the batched variant is out of scope, #835) to map
+/// each parent id string to its display label, which the column closures then
+/// look up per row. Empty when the resource has no displayable references.
+fn render_index_reference_label_loads(
+    reference_fields: &[&Field],
+    reference_displays: &BTreeMap<String, ReferenceDisplay>,
+) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    for f in reference_fields {
+        if !reference_displays.contains_key(&f.name) {
+            continue;
+        }
+        let name = &f.name;
+        let _ = writeln!(
+            out,
+            "    let {name}_labels: std::collections::HashMap<String, String> =\n        \
+             {name}_select_options(&mut db).await?.into_iter().collect();"
+        );
+    }
     out
 }
 
@@ -8202,14 +8428,16 @@ async fn main() {
                 nullable: false,
                 variants: Vec::new(),
                 unique: false,
-                constraints: Default::default(),            },
+                constraints: Default::default(),
+            },
             Field {
                 name: "author_id".to_string(),
                 kind: FieldKind::References,
                 nullable: true,
                 variants: Vec::new(),
                 unique: false,
-                constraints: Default::default(),            },
+                constraints: Default::default(),
+            },
         ];
         assert_eq!(
             fields[0].reference_table(),
@@ -8255,14 +8483,16 @@ async fn main() {
                 nullable: false,
                 variants: Vec::new(),
                 unique: false,
-                constraints: Default::default(),            },
+                constraints: Default::default(),
+            },
             Field {
                 name: "author_id".to_string(),
                 kind: FieldKind::References,
                 nullable: true,
                 variants: Vec::new(),
                 unique: false,
-                constraints: Default::default(),            },
+                constraints: Default::default(),
+            },
         ];
         let sql = render_reference_stub_tables_sql(&fields, "unrelated_table");
         assert_eq!(
@@ -8363,7 +8593,8 @@ async fn main() {
             nullable: false,
             variants: vec!["a".to_string(), "b".to_string()],
             unique: false,
-            constraints: Default::default(),        };
+            constraints: Default::default(),
+        };
         let weight = Field {
             name: "weight".to_string(),
             kind: FieldKind::Decimal {
@@ -8373,7 +8604,8 @@ async fn main() {
             nullable: false,
             variants: Vec::new(),
             unique: false,
-            constraints: Default::default(),        };
+            constraints: Default::default(),
+        };
         let fields = vec![status.clone(), weight];
         let sql = enum_rejection_insert_sql("items", &fields, &status, &BTreeMap::new());
         assert!(

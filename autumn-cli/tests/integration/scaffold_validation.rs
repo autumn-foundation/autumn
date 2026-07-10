@@ -173,7 +173,10 @@ fn unknown_constraint_modifier_fails_the_scaffold() {
     let tmp = tempfile::tempdir().expect("tempdir");
     run_autumn_ok(tmp.path(), &["new", "bad-modifier-app"]);
     let project = tmp.path().join("bad-modifier-app");
-    let output = run_autumn(&project, &["generate", "scaffold", "Post", "title:String{maxx=5}"]);
+    let output = run_autumn(
+        &project,
+        &["generate", "scaffold", "Post", "title:String{maxx=5}"],
+    );
     assert!(
         !output.status.success(),
         "an unknown modifier must fail the scaffold"
