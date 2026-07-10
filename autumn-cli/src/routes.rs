@@ -17,6 +17,7 @@ use crate::text_width::display_width;
 pub enum OutputFormat {
     Table,
     Json,
+    Postman,
 }
 
 impl std::str::FromStr for OutputFormat {
@@ -26,8 +27,9 @@ impl std::str::FromStr for OutputFormat {
         match s.to_lowercase().as_str() {
             "table" => Ok(Self::Table),
             "json" => Ok(Self::Json),
+            "postman" => Ok(Self::Postman),
             other => Err(format!(
-                "unknown format '{other}'; expected 'table' or 'json'"
+                "unknown format '{other}'; expected 'table', 'json', or 'postman'"
             )),
         }
     }
@@ -97,6 +99,7 @@ pub fn run(opts: &RoutesOptions<'_>) {
     match &opts.format {
         OutputFormat::Table => print_table(&routes),
         OutputFormat::Json => print_json(&routes),
+        OutputFormat::Postman => print_postman(&routes),
     }
 }
 
@@ -250,6 +253,53 @@ fn format_row(cells: &[String; 7], widths: &[usize; 7]) -> String {
 pub fn print_json(routes: &[RouteInfo]) {
     let json =
         serde_json::to_string_pretty(routes).unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}"));
+    println!("{json}");
+}
+
+pub fn generate_postman(routes: &[RouteInfo]) -> serde_json::Value {
+    let mut items = Vec::new();
+    for route in routes {
+        let name = format!("{} {}", route.method, route.path);
+        // Replace `{param}` with `:param` for Postman path variables
+        let url = format!(
+            "{{{{base_url}}}}{}",
+            route.path.replace('{', ":").replace('}', "")
+        );
+        let item = serde_json::json!({
+            "name": name,
+            "request": {
+                "method": route.method,
+                "header": [],
+                "url": {
+                    "raw": url,
+                    "host": ["{{base_url}}"],
+                    "path": route.path.trim_start_matches('/').split('/').map(|s| s.replace('{', ":").replace('}', "")).collect::<Vec<_>>()
+                }
+            },
+            "response": []
+        });
+        items.push(item);
+    }
+
+    serde_json::json!({
+        "info": {
+            "name": "Autumn Routes",
+            "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+        },
+        "item": items,
+        "variable": [
+            {
+                "key": "base_url",
+                "value": "http://localhost:3000",
+                "type": "string"
+            }
+        ]
+    })
+}
+
+pub fn print_postman(routes: &[RouteInfo]) {
+    let json = serde_json::to_string_pretty(&generate_postman(routes))
+        .unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}"));
     println!("{json}");
 }
 
@@ -630,6 +680,14 @@ mod tests {
         assert!(table.contains("cached(60s)"), "missing middleware label");
     }
 
+    #[test]
+    fn parse_output_format_postman() {
+        assert_eq!(
+            "postman".parse::<OutputFormat>().unwrap(),
+            OutputFormat::Postman
+        );
+    }
+
     // ── print_json ─────────────────────────────────────────────────────────
 
     #[test]
@@ -638,6 +696,30 @@ mod tests {
         let json_str = serde_json::to_string_pretty(&routes).unwrap();
         let parsed: Vec<RouteInfo> = serde_json::from_str(&json_str).unwrap();
         assert_eq!(parsed.len(), routes.len());
+    }
+
+    // ── generate_postman ───────────────────────────────────────────────────
+
+    #[test]
+    fn generate_postman_produces_valid_collection() {
+        let routes = sample_routes();
+        let collection = generate_postman(&routes);
+        assert_eq!(collection["info"]["name"], "Autumn Routes");
+        assert!(
+            collection["info"]["schema"]
+                .as_str()
+                .unwrap()
+                .contains("v2.1.0")
+        );
+        let items = collection["item"].as_array().unwrap();
+        assert_eq!(items.len(), routes.len());
+        assert_eq!(items[0]["request"]["method"], "GET");
+        assert_eq!(items[0]["request"]["url"]["raw"], "{{base_url}}/posts");
+        assert_eq!(items[2]["request"]["url"]["raw"], "{{base_url}}/posts/:id");
+        assert_eq!(
+            items[2]["request"]["url"]["path"],
+            serde_json::json!(["posts", ":id"])
+        );
     }
 
     // ── resolve_binary_from_metadata ──────────────────────────────────────
