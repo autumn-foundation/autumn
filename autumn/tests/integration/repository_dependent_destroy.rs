@@ -601,3 +601,85 @@ async fn destroy_hard_parent_hard_deletes_soft_children() {
         "a hard-deleted parent must hard-delete every physically-present soft-delete child (incl. pre-soft-deleted), leaving no orphan and no FK error"
     );
 }
+
+/// #1369 restrict ordering: `DepPost` declares `destroy(Comment)` BEFORE
+/// `restrict(Award)`, and `DepComment`'s `before_delete` increments a counter.
+/// When a restrict child (award) has rows, `delete_by_id` must return 409 and
+/// roll back WITHOUT ever firing the destroy child's `before_delete` — the
+/// restrict probe runs before any mutating dependent. Asserts: 409, the destroy
+/// hook counter did NOT move, and nothing was deleted.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn restrict_probes_before_destroy_fires_no_child_hooks() {
+    let (pool, _c) = setup_pool().await;
+    let mut conn = pool.get().await.expect("conn");
+
+    diesel::sql_query("INSERT INTO dep_posts (id, title) VALUES (21, 'guarded')")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    for i in 1..=3 {
+        diesel::sql_query(format!(
+            "INSERT INTO dep_comments (id, post_id, body) VALUES ({i}, 21, 'c{i}')"
+        ))
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    }
+    // A restrict child (award) with a row → the delete must be blocked.
+    diesel::sql_query("INSERT INTO dep_awards (id, post_id, name) VALUES (1, 21, 'gold')")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+
+    DESTROYED_COMMENTS.store(0, Ordering::SeqCst);
+
+    let repo = PgDepPostRepository::with_pool_untracked(pool.clone());
+    let err = repo
+        .delete_by_id(21)
+        .await
+        .expect_err("restrict child with rows must block the delete");
+    assert_eq!(
+        err.status(),
+        autumn_web::reexports::http::StatusCode::CONFLICT,
+        "a blocking restrict must surface a 409"
+    );
+
+    // The destroy child's before_delete hook must NOT have fired — the restrict
+    // probe runs before any mutating dependent, so no non-transactional side
+    // effect happened for a delete that never committed.
+    assert_eq!(
+        AtomicUsize::load(&DESTROYED_COMMENTS, Ordering::SeqCst),
+        0,
+        "restrict must be probed before destroy so the child before_delete hook never fires"
+    );
+
+    // Nothing was deleted (whole tx rolled back).
+    assert_eq!(
+        count(
+            &mut conn,
+            "SELECT COUNT(*) AS n FROM dep_posts WHERE id = 21"
+        )
+        .await,
+        1,
+        "the parent must survive a blocked delete"
+    );
+    assert_eq!(
+        count(
+            &mut conn,
+            "SELECT COUNT(*) AS n FROM dep_comments WHERE post_id = 21"
+        )
+        .await,
+        3,
+        "the destroy child rows must be untouched"
+    );
+    assert_eq!(
+        count(
+            &mut conn,
+            "SELECT COUNT(*) AS n FROM dep_awards WHERE post_id = 21"
+        )
+        .await,
+        1,
+        "the restrict child row must survive"
+    );
+}
