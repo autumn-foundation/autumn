@@ -29,7 +29,7 @@ pub struct FieldConstraints {
     /// `url` — `#[validate(url)]` + `type="url"`. `String`/`Text` only.
     pub url: bool,
     /// `label:col` — the `references` display column an index/show view and a
-    /// belongs_to `<select>` label render from (issue #1146). `references`
+    /// `belongs_to` `<select>` label render from (issue #1146). `references`
     /// only; never a `#[validate]`/HTML5 constraint.
     pub label: Option<String>,
 }
@@ -37,7 +37,7 @@ pub struct FieldConstraints {
 impl FieldConstraints {
     /// True when no constraint modifier was declared.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.min.is_none() && self.max.is_none() && !self.email && !self.url && self.label.is_none()
     }
 }
@@ -149,7 +149,10 @@ impl Field {
         match self.kind {
             FieldKind::String | FieldKind::Text => {
                 if c.min.is_some() || c.max.is_some() {
-                    out.push(format!("length({})", min_max_args(&c.min, &c.max, false)));
+                    out.push(format!(
+                        "length({})",
+                        min_max_args(c.min.as_ref(), c.max.as_ref(), false)
+                    ));
                 }
                 if c.email {
                     out.push("email".to_owned());
@@ -161,7 +164,10 @@ impl Field {
             FieldKind::I32 | FieldKind::I64 | FieldKind::F32 | FieldKind::F64 => {
                 if c.min.is_some() || c.max.is_some() {
                     let is_float = matches!(self.kind, FieldKind::F32 | FieldKind::F64);
-                    out.push(format!("range({})", min_max_args(&c.min, &c.max, is_float)));
+                    out.push(format!(
+                        "range({})",
+                        min_max_args(c.min.as_ref(), c.max.as_ref(), is_float)
+                    ));
                 }
             }
             _ => {}
@@ -472,6 +478,11 @@ pub fn sql_type_to_field_kind(udt_name: &str) -> Option<FieldKind> {
 /// # Errors
 /// Returns [`GenerateError::InvalidField`] if the token is malformed or the
 /// type is not in the supported set.
+#[allow(
+    clippy::too_many_lines,
+    reason = "a linear name→modifier→type→constraint parse; the early-return \
+              validation guards read more clearly inline than split across helpers"
+)]
 pub fn parse_field(token: &str) -> Result<Field, GenerateError> {
     let (name, rest) = token
         .split_once(':')
@@ -640,7 +651,7 @@ fn split_constraint_modifier(ty: &str) -> (&str, Option<&str>) {
 /// `range(…)` `#[validate]` attributes. `float` range bounds are emitted with
 /// a decimal point (`0` -> `0.0`) so the generated comparison type-checks
 /// against an `f32`/`f64` field.
-fn min_max_args(min: &Option<String>, max: &Option<String>, float: bool) -> String {
+fn min_max_args(min: Option<&String>, max: Option<&String>, float: bool) -> String {
     let fmt = |raw: &str| -> String {
         if float && !raw.contains(['.', 'e', 'E']) {
             format!("{raw}.0")
@@ -1138,6 +1149,10 @@ pub(super) fn is_rust_keyword(s: &str) -> bool {
 }
 
 #[cfg(test)]
+// Test inputs like `"title:String{min=3}"` / `"post:references{label:title}"`
+// are literal DSL tokens passed to `parse_field`, not format strings — the
+// `{…}` is the scaffold's own constraint-modifier syntax under test.
+#[allow(clippy::literal_string_with_formatting_args)]
 mod tests {
     use super::*;
 

@@ -4,7 +4,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-use super::dsl::{Field, FieldKind, IdType, parse_fields};
+use super::dsl::{Field, FieldConstraints, FieldKind, IdType, parse_fields};
 use super::emit::Plan;
 use super::naming::{pascal, pluralize, snake};
 use super::schema_edit::{
@@ -401,7 +401,7 @@ fn type_is_uuid(ty: &syn::Type) -> bool {
 /// (`Option<String>`).
 ///
 /// The scaffold generator uses this to pick a human-friendly display column
-/// for a `references` field (issue #1146): a belongs_to `<select>` and the
+/// for a `references` field (issue #1146): a `belongs_to` `<select>` and the
 /// index/show views render this column's value instead of the raw foreign-key
 /// id. Returns an empty vec when the model can't be located/parsed or has no
 /// string column — the caller then falls back to rendering the id, exactly the
@@ -620,7 +620,7 @@ pub(super) fn augment_fields_for_soft_delete(
         nullable: true,
         variants: Vec::new(),
         unique: false,
-        constraints: Default::default(),
+        constraints: FieldConstraints::default(),
     });
     Ok(std::borrow::Cow::Owned(augmented))
 }

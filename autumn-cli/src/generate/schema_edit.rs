@@ -12,7 +12,7 @@ use std::fmt::Write as _;
 
 use sha2::{Digest, Sha256};
 
-use super::dsl::{Field, FieldKind, IdType};
+use super::dsl::{Field, FieldConstraints, FieldKind, IdType};
 
 /// Append a `pub mod <name>;` line to a `mod.rs` file, returning the new
 /// contents. Idempotent: a second call with the same name is a no-op.
@@ -511,7 +511,7 @@ fn fields_with_existing_schema_columns(
                 nullable: false,
                 variants: Vec::new(),
                 unique: false,
-                constraints: Default::default(),
+                constraints: FieldConstraints::default(),
             });
         }
     }

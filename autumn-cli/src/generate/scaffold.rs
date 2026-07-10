@@ -2519,6 +2519,11 @@ fn render_form_model_impl(pascal_name: &str) -> String {
 ///   project, so there is no schema entry to load options from) keep the
 ///   derived numeric id input instead — the plan carries a warning saying
 ///   how to get the select.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one per-field match building the form_for builder calls plus the \
+              constrained-field/attachment append markup — a single cohesive template"
+)]
 fn render_form_for_helper(
     pascal_name: &str,
     snake_name: &str,
@@ -4591,6 +4596,7 @@ fn main_route_entries(
 mod tests {
     use super::*;
     use crate::generate::Flags;
+    use crate::generate::dsl::FieldConstraints;
     use std::fs;
     use tempfile::TempDir;
 
@@ -8428,7 +8434,7 @@ async fn main() {
                 nullable: false,
                 variants: Vec::new(),
                 unique: false,
-                constraints: Default::default(),
+                constraints: FieldConstraints::default(),
             },
             Field {
                 name: "author_id".to_string(),
@@ -8436,7 +8442,7 @@ async fn main() {
                 nullable: true,
                 variants: Vec::new(),
                 unique: false,
-                constraints: Default::default(),
+                constraints: FieldConstraints::default(),
             },
         ];
         assert_eq!(
@@ -8483,7 +8489,7 @@ async fn main() {
                 nullable: false,
                 variants: Vec::new(),
                 unique: false,
-                constraints: Default::default(),
+                constraints: FieldConstraints::default(),
             },
             Field {
                 name: "author_id".to_string(),
@@ -8491,7 +8497,7 @@ async fn main() {
                 nullable: true,
                 variants: Vec::new(),
                 unique: false,
-                constraints: Default::default(),
+                constraints: FieldConstraints::default(),
             },
         ];
         let sql = render_reference_stub_tables_sql(&fields, "unrelated_table");
@@ -8593,7 +8599,7 @@ async fn main() {
             nullable: false,
             variants: vec!["a".to_string(), "b".to_string()],
             unique: false,
-            constraints: Default::default(),
+            constraints: FieldConstraints::default(),
         };
         let weight = Field {
             name: "weight".to_string(),
@@ -8604,7 +8610,7 @@ async fn main() {
             nullable: false,
             variants: Vec::new(),
             unique: false,
-            constraints: Default::default(),
+            constraints: FieldConstraints::default(),
         };
         let fields = vec![status.clone(), weight];
         let sql = enum_rejection_insert_sql("items", &fields, &status, &BTreeMap::new());

@@ -2,11 +2,15 @@
 //! rules and client-side HTML5 input constraints from one declaration
 //! (issue #1388).
 
+// DSL tokens like `"contact:String{email}"` are literal scaffold inputs, not
+// format strings — the `{email}`/`{url}`/`{min=…}` is the modifier under test.
+#![allow(clippy::literal_string_with_formatting_args)]
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-fn autumn_bin() -> &'static str {
+const fn autumn_bin() -> &'static str {
     env!("CARGO_BIN_EXE_autumn")
 }
 

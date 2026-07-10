@@ -1,12 +1,16 @@
-//! belongs_to `references` fields render a populated `<select>` labeled by a
+//! `belongs_to` `references` fields render a populated `<select>` labeled by a
 //! display column, and index/show views render the parent's display value
 //! instead of the raw foreign-key id (issue #1146).
+
+// DSL tokens like `"post:references{label:slug}"` are literal scaffold inputs,
+// not format strings — the `{label:col}` is the modifier syntax under test.
+#![allow(clippy::literal_string_with_formatting_args)]
 
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-fn autumn_bin() -> &'static str {
+const fn autumn_bin() -> &'static str {
     env!("CARGO_BIN_EXE_autumn")
 }
 
@@ -154,7 +158,7 @@ fn nullable_reference_renders_dash_and_blank_option() {
     );
 }
 
-/// Slow end-to-end check: the belongs_to scaffold (display-column select
+/// Slow end-to-end check: the `belongs_to` scaffold (display-column select
 /// loader, index label map, show label load) type-checks against this
 /// workspace's `autumn-web`.
 ///

@@ -1519,7 +1519,7 @@ mod tests {
 
     #[test]
     fn round_trip_matches_greenfield_model_byte_for_byte() {
-        use crate::generate::dsl::{Field, sql_type_to_field_kind};
+        use crate::generate::dsl::{Field, FieldConstraints, sql_type_to_field_kind};
         use crate::generate::model::render_model_file_for_test;
 
         // Forward: the model `autumn generate model Post title:String body:Text
@@ -1531,7 +1531,7 @@ mod tests {
                 nullable: false,
                 variants: Vec::new(),
                 unique: false,
-                constraints: Default::default(),
+                constraints: FieldConstraints::default(),
             },
             Field {
                 name: "body".into(),
@@ -1539,7 +1539,7 @@ mod tests {
                 nullable: false,
                 variants: Vec::new(),
                 unique: false,
-                constraints: Default::default(),
+                constraints: FieldConstraints::default(),
             },
             Field {
                 name: "published".into(),
@@ -1547,7 +1547,7 @@ mod tests {
                 nullable: false,
                 variants: Vec::new(),
                 unique: false,
-                constraints: Default::default(),
+                constraints: FieldConstraints::default(),
             },
         ];
         let greenfield = render_model_file_for_test("Post", "posts", &fields);
