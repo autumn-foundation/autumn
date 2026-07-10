@@ -2637,25 +2637,58 @@ fn render_form_for_helper(
                         " required aria-required=\"true\""
                     };
                     let _ = write!(builder_calls, "\n        .exclude(\"{name}\")");
-                    let _ = write!(
-                        appends,
-                        "\n        .append(html! {{\n            \
-                         @let errors = changeset.errors_for(\"{name}\");\n            \
-                         div id=\"{name}-field\" class=\"autumn-field\" {{\n                \
-                         label for=\"{name}\" class=\"autumn-field__label\" {{ \"{label}\" }}\n                \
-                         input type=\"{input_type}\" id=\"{name}\" name=\"{name}\"\n                    \
-                         value=(changeset.field_value(\"{name}\").unwrap_or_default()){constraint_attrs}{required_attr}\n                    \
-                         class=(if errors.is_empty() {{ \"autumn-field__input\" }} else {{ \"autumn-field__input autumn-field__input--invalid\" }})\n                    \
-                         aria-invalid=(if errors.is_empty() {{ \"false\" }} else {{ \"true\" }})\n                    \
-                         aria-describedby=(if errors.is_empty() {{ \"\" }} else {{ \"{name}-error\" }});\n                \
-                         @if !errors.is_empty() {{\n                    \
-                         div id=\"{name}-error\" role=\"alert\" class=\"autumn-field__errors\" {{\n                        \
-                         @for error in errors {{ p class=\"autumn-field__error\" {{ (error) }} }}\n                    \
-                         }}\n                \
-                         }}\n            \
-                         }}\n        \
-                         }})"
-                    );
+                    if matches!(f.kind, FieldKind::Text) {
+                        // A `text` DSL column is a long-form field (Postgres
+                        // `TEXT`), so its constrained control is a `<textarea>`,
+                        // not a single-line `<input>` — the same element the
+                        // derived `FieldControl::Textarea` would pick. Only the
+                        // attributes a textarea honours carry over: the length
+                        // rules in `constraint_attrs` (`minlength`/`maxlength`)
+                        // and `required`; the input-only `type`/`min`/`max` are
+                        // dropped. The 422 re-render value is the element's text
+                        // content (not a `value=` attribute) so entered input
+                        // survives, matching `form::textarea_input`.
+                        let _ = write!(
+                            appends,
+                            "\n        .append(html! {{\n            \
+                             @let errors = changeset.errors_for(\"{name}\");\n            \
+                             div id=\"{name}-field\" class=\"autumn-field\" {{\n                \
+                             label for=\"{name}\" class=\"autumn-field__label\" {{ \"{label}\" }}\n                \
+                             textarea id=\"{name}\" name=\"{name}\"{constraint_attrs}{required_attr}\n                    \
+                             class=(if errors.is_empty() {{ \"autumn-field__input\" }} else {{ \"autumn-field__input autumn-field__input--invalid\" }})\n                    \
+                             aria-invalid=(if errors.is_empty() {{ \"false\" }} else {{ \"true\" }})\n                    \
+                             aria-describedby=(if errors.is_empty() {{ \"\" }} else {{ \"{name}-error\" }}) {{\n                        \
+                             (changeset.field_value(\"{name}\").unwrap_or_default())\n                    \
+                             }}\n                \
+                             @if !errors.is_empty() {{\n                    \
+                             div id=\"{name}-error\" role=\"alert\" class=\"autumn-field__errors\" {{\n                        \
+                             @for error in errors {{ p class=\"autumn-field__error\" {{ (error) }} }}\n                    \
+                             }}\n                \
+                             }}\n            \
+                             }}\n        \
+                             }})"
+                        );
+                    } else {
+                        let _ = write!(
+                            appends,
+                            "\n        .append(html! {{\n            \
+                             @let errors = changeset.errors_for(\"{name}\");\n            \
+                             div id=\"{name}-field\" class=\"autumn-field\" {{\n                \
+                             label for=\"{name}\" class=\"autumn-field__label\" {{ \"{label}\" }}\n                \
+                             input type=\"{input_type}\" id=\"{name}\" name=\"{name}\"\n                    \
+                             value=(changeset.field_value(\"{name}\").unwrap_or_default()){constraint_attrs}{required_attr}\n                    \
+                             class=(if errors.is_empty() {{ \"autumn-field__input\" }} else {{ \"autumn-field__input autumn-field__input--invalid\" }})\n                    \
+                             aria-invalid=(if errors.is_empty() {{ \"false\" }} else {{ \"true\" }})\n                    \
+                             aria-describedby=(if errors.is_empty() {{ \"\" }} else {{ \"{name}-error\" }});\n                \
+                             @if !errors.is_empty() {{\n                    \
+                             div id=\"{name}-error\" role=\"alert\" class=\"autumn-field__errors\" {{\n                        \
+                             @for error in errors {{ p class=\"autumn-field__error\" {{ (error) }} }}\n                    \
+                             }}\n                \
+                             }}\n            \
+                             }}\n        \
+                             }})"
+                        );
+                    }
                 }
             }
         }

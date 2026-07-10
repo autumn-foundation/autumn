@@ -170,6 +170,90 @@ fn preserved_value_binding_survives_422_rerender() {
     );
 }
 
+/// A `Text` DSL column is long-form (Postgres `TEXT`), so its constrained
+/// control must be a multi-line `<textarea>` — not the single-line `<input>`
+/// the `String` columns get — while still carrying the length/`required`
+/// constraints and re-filling on a 422.
+#[test]
+fn text_columns_render_constrained_textarea_not_input() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    run_autumn_ok(tmp.path(), &["new", "validate-textarea-app"]);
+    let project = tmp.path().join("validate-textarea-app");
+    run_autumn_ok(
+        &project,
+        &[
+            "generate",
+            "scaffold",
+            "Article",
+            "body:Text{min=10,max=5000}",
+            "notes:Option<Text>{max=1000}",
+        ],
+    );
+    let routes = fs::read_to_string(project.join("src/routes/articles.rs")).unwrap();
+
+    // Both text columns are excised from the derived render and re-appended.
+    for field in ["body", "notes"] {
+        assert!(
+            routes.contains(&format!(".exclude(\"{field}\")")),
+            "{field} must be excluded from the derived render:\n{routes}"
+        );
+        assert!(
+            routes.contains(&format!("textarea id=\"{field}\" name=\"{field}\"")),
+            "{field} must render a <textarea>:\n{routes}"
+        );
+    }
+
+    // A `text` column must never fall back to a single-line text `<input>`,
+    // and its length constraints must not be spelled with input-only `type`.
+    assert!(
+        !routes.contains("input type=\"text\" id=\"body\""),
+        "body must not render a single-line text input:\n{routes}"
+    );
+
+    // The non-nullable `body` carries the length rules + required, and its
+    // value is the element's text content, not a `value=` attribute.
+    let body_attrs = slice_textarea_attrs(&routes, "textarea id=\"body\" name=\"body\"");
+    assert!(
+        body_attrs.contains("minlength=\"10\"") && body_attrs.contains("maxlength=\"5000\""),
+        "body textarea must carry minlength/maxlength:\n{body_attrs}"
+    );
+    assert!(
+        body_attrs.contains("required aria-required=\"true\""),
+        "non-nullable body textarea must be required:\n{body_attrs}"
+    );
+    assert!(
+        routes.contains("(changeset.field_value(\"body\").unwrap_or_default())"),
+        "body textarea must re-fill from the changeset:\n{routes}"
+    );
+    assert!(
+        !routes.contains("value=(changeset.field_value(\"body\")"),
+        "body value must be textarea text content, not a value= attribute:\n{routes}"
+    );
+
+    // The nullable `notes` keeps only its maxlength — no required, no minlength.
+    let notes_attrs = slice_textarea_attrs(&routes, "textarea id=\"notes\" name=\"notes\"");
+    assert!(
+        notes_attrs.contains("maxlength=\"1000\""),
+        "notes textarea must carry maxlength:\n{notes_attrs}"
+    );
+    assert!(
+        !notes_attrs.contains("required") && !notes_attrs.contains("minlength"),
+        "nullable notes textarea must be neither required nor minlength-bound:\n{notes_attrs}"
+    );
+}
+
+/// Slice a textarea's field-specific attributes: from the `id`/`name` marker
+/// up to the shared `class=` skeleton, so an assertion can't match a sibling
+/// control's attributes.
+fn slice_textarea_attrs<'a>(routes: &'a str, marker: &str) -> &'a str {
+    let start = routes
+        .find(marker)
+        .unwrap_or_else(|| panic!("missing {marker} in:\n{routes}"));
+    let rest = &routes[start..];
+    let end = rest.find("class=").unwrap_or(rest.len());
+    &rest[..end]
+}
+
 #[test]
 fn unknown_constraint_modifier_fails_the_scaffold() {
     // AC5: a misspelled modifier fails loudly, naming the offending token,
