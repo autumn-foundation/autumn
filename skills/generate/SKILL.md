@@ -32,7 +32,7 @@ them; on 0.5.0 fall back to the documented manual alternative.
 | `migration` | `migration add_slug_to_posts` | Empty timestamped migration file |
 | `mailer` | `mailer User` | Mailer struct + email templates (generator appends `Mailer` → produces `UserMailer`) |
 | `task` | `task RecalculateCounts` | `#[task]` operational command |
-| `auth` | `auth User --oauth github,google` | Full auth scaffold (login/register/password reset/OAuth) |
+| `auth` | `auth User --oauth github,google` | Full auth scaffold (login/register/password reset/OAuth); **(trunk-dev)** also scaffolds a configurable password policy and persistent "remember me" login by default |
 | `admin` | `admin Post title:String body:Text` | Admin plugin resource page — fields must be supplied explicitly; generator does not read the model |
 | `system-test` | `system-test checkout_flow` | System test fixture (name must be `snake_case` or `PascalCase` — no hyphens) |
 | `pwa` | `pwa` | PWA scaffolding — manifest, service worker, offline shell, icons, route handlers, smoke test |
@@ -286,6 +286,23 @@ Next steps:
    background_color, and start_url.
 
 4. Run the smoke test: cargo test --features system-tests pwa_smoke
+```
+
+### auth (trunk-dev)
+```
+Next steps:
+1. `autumn generate auth User` now scaffolds a configurable password policy and
+   persistent "remember me" login automatically — no extra flag.
+   - Password policy `[auth.password]`: `min_length` (default 8),
+     `reject_common` (default true; bundled weak-password corpus), and
+     `breach_check` = off | fail_open | fail_closed (HIBP lookups). Enforced via
+     autumn_web::auth::PasswordConfig / PasswordPolicy.
+   - Remember-me `[auth.remember]`: `enabled` (default true), `duration_secs`,
+     `cookie_name` (default "autumn.remember"). The generator adds a
+     {snake}_remember_token model + table and wires the remember middleware.
+2. Run: autumn migrate   (applies the sessions + remember-token migrations)
+3. --oauth / --totp / --passkeys still apply; there is no --remember or
+   --password-policy flag — both are on by default (#1345, #1397).
 ```
 
 ## Flags

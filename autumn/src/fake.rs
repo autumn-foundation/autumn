@@ -9,11 +9,11 @@
 //! The generator can run in two modes:
 //!
 //! - **Deterministic**: when the `AUTUMN_FAKE_SEED` environment variable is set
-//!   to a `u64`, or when [`reseed`] is called explicitly, the process-global RNG
+//!   to a `u64`, or when [`reseed`](crate::fake::reseed) is called explicitly, the process-global RNG
 //!   is seeded from that value. The exact same sequence of calls then produces
 //!   the exact same values on every run — ideal for golden tests and
 //!   reproducible fixtures. In this mode time-based helpers such as
-//!   [`recent_datetime`] anchor to a fixed base instant rather than the wall
+//!   [`recent_datetime`](crate::fake::recent_datetime) anchor to a fixed base instant rather than the wall
 //!   clock, so even timestamps are reproducible.
 //! - **Random**: with no seed configured, the RNG is seeded from OS entropy and
 //!   output varies per run.
@@ -23,7 +23,7 @@
 //!
 //! # Why process-global (not thread-local)
 //!
-//! The generator is a single process-global RNG behind a [`Mutex`], **not** a
+//! The generator is a single process-global RNG behind a [`Mutex`](std::sync::Mutex), **not** a
 //! per-thread one. `#[autumn_web::main]` runs on a multi-thread tokio runtime,
 //! and a faked `create_many` awaits a pooled connection between rows, so the
 //! driving task freely migrates between worker threads mid-run. A thread-local

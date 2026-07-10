@@ -756,8 +756,14 @@ async fn principal_key_derives_from_session_without_global_principal_middleware(
         .build();
 
     // Establish two authenticated sessions (user_id = alice / bob) and capture
-    // each session cookie. TestClient has no cookie jar, so sessions stay
-    // isolated and we replay the exact cookie we want on each request.
+    // each session cookie, then replay the exact cookie we want on each request.
+    //
+    // `TestClient` carries a cookie jar, so we MUST `log_out()` between the two
+    // logins: otherwise the second login replays the first login's session
+    // cookie, reuses (and overwrites) that same server-side session, and both
+    // "distinct" cookies end up pointing at ONE session whose `user_id` is
+    // whichever login ran last. That collapses alice and bob onto a single
+    // principal bucket and makes the fresh principal spuriously 429 (#1725).
     let session_cookie = |set_cookie: &str| -> String {
         set_cookie
             .split(';')
@@ -773,6 +779,9 @@ async fn principal_key_derives_from_session_without_global_principal_middleware(
             .header("set-cookie")
             .expect("login must set a session cookie"),
     );
+
+    // Drop alice's jar cookie so bob's login mints a fresh, independent session.
+    client.log_out();
 
     let bob_login = client.get("/throttle-login-bob").send().await;
     bob_login.assert_status(200);

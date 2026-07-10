@@ -2967,6 +2967,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "flock"
+version = "0.1.0"
+dependencies = [
+ "autumn-web",
+ "example-e2e",
+ "maud",
+ "tokio",
+]
+
+[[package]]
 name = "fnv"
 version = "1.0.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"

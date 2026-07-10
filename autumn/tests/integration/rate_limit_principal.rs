@@ -644,6 +644,13 @@ async fn principal_strategy_keys_on_session_user_id() {
         .expect("must set cookie")
         .to_owned();
 
+    // Drop user-A's jar cookie before logging in user-B. `TestClient` carries a
+    // cookie jar, so without this the user-B login replays user-A's session
+    // cookie and overwrites that one shared session's `user_id`, collapsing both
+    // "distinct" users onto a single principal bucket — which spuriously 429s the
+    // fresh user (#1725). Explicit per-request cookies below still isolate them.
+    client.log_out();
+
     // 2. Log in user-B
     let resp_b = client.get("/login/user-b").send().await;
     resp_b.assert_ok();

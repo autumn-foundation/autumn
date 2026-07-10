@@ -193,7 +193,7 @@ pub(super) fn builtin_stories() -> Vec<Story> {
                     ("demo-security", "Security", maud::html! { p { "Security settings" } }),
                     ("demo-billing", "Billing", maud::html! { p { "Billing settings" } }),
                 ];
-                tabs("settings-tabs", &panels)
+                tabs("settings-tabs", None, &panels)
             }
         },
         story! {

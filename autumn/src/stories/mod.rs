@@ -549,6 +549,7 @@ fn render_story_detail(
                 section class="story-preview" { (rendered) }
                 (crate::widgets::tabs(
                     "story-tabs",
+                    None,
                     &[
                         (
                             "story-source",

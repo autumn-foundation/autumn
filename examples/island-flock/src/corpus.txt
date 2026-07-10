@@ -1,0 +1,186 @@
+//! ```rust,no_run
+//! use autumn_web::prelude::*;
+//!
+//! #[get("/")]
+//! async fn index() -> Markup {
+//!     html! { h1 { "Hello, Autumn!" } }
+//! }
+//!
+//! #[autumn_web::main]
+//! async fn main() {
+//!     autumn_web::app()
+//!         .routes(routes![index])
+//!         .run()
+//!         .await;
+//! }
+
+pub use crate::Redirect;
+/// Typed path helper extension trait (`.with_query()`).
+pub use crate::paths::PathExt;
+/// WebSocket route macro.
+#[cfg(feature = "ws")]
+pub use autumn_macros::ws;
+/// HTTP method route macros, main macro, and route collection.
+pub use autumn_macros::{
+    api_doc, authorize, cached, delete, event, feature_flag, get, job, jobs, listener, listeners,
+    main, oauth2_callback, one_off_tasks, patch, paths, post, put, routes, scheduled, secured,
+    service, static_get, static_routes, step_up, task, tasks, throttle,
+};
+#[cfg(feature = "mail")]
+pub use autumn_macros::{mail_previews, mailer, mailer_preview};
+
+// ── Rendering ────────────────────────────────────────────────────
+/// Resolve a logical static asset path to a fingerprinted URL in release builds.
+pub use crate::assets::asset_url;
+/// Render a `<script>` tag with SRI integrity for a named vendored JS dependency.
+
+use proc_macro2::{Span, TokenStream};
+use quote::{format_ident, quote};
+use syn::{FnArg, LitStr, ReturnType, Type};
+
+use crate::api_doc;
+use crate::idempotency_guard::block_has_replay_guard;
+use crate::parse;
+
+/// Core implementation shared by all route macros (`#[get]`, `#[post]`, etc.).
+///
+/// `http_method` is the uppercase method name (e.g., `"GET"`).
+/// `axum_fn` is the lowercase axum routing function name (e.g., `"get"`).
+#[allow(clippy::too_many_lines)]
+pub fn route_macro(
+    http_method: &str,
+    axum_fn: &str,
+    attr: TokenStream,
+    item: TokenStream,
+) -> TokenStream {
+    let route_args = match parse::parse_route_attr(attr) {
+        Ok(a) => a,
+        Err(err) => return err,
+    };
+    let path = route_args.path.clone();
+
+    let mut input_fn = match parse::parse_async_handler(item) {
+        Ok(f) => f,
+        Err(err) => return err,
+    };
+
+    // Extract #[intercept(LayerType)] attributes from the handler.
+
+#[allow(clippy::too_many_lines)]
+pub fn route_macro(
+    http_method: &str,
+    axum_fn: &str,
+    attr: TokenStream,
+    item: TokenStream,
+) -> TokenStream {
+    let route_args = match parse::parse_route_attr(attr) {
+        Ok(a) => a,
+        Err(err) => return err,
+    };
+    let path = route_args.path.clone();
+
+    let mut input_fn = match parse::parse_async_handler(item) {
+        Ok(f) => f,
+        Err(err) => return err,
+    };
+
+    // Extract #[intercept(LayerType)] attributes from the handler.
+    let interceptors = parse::extract_interceptors(&mut input_fn.attrs);
+
+    // Extract #[api_doc(...)] overrides before emitting the function, so
+    // the attribute doesn't leak onto the emitted fn definition and
+    // trigger an "unknown attribute" error.
+    let api_doc_attr = match api_doc::extract(&mut input_fn.attrs) {
+        Ok(v) => v,
+
+
+    let fn_name = &input_fn.sig.ident;
+    let route_info_name = format_ident!("__autumn_route_info_{}", fn_name);
+    let vis = &input_fn.vis;
+
+    // Determine the path-helper name: use `name = "..."` override when set,
+    // otherwise default to the handler function name.
+    let helper_ident = route_args.helper_ident(fn_name);
+    let path_helper_name = format_ident!("__autumn_path_{}", helper_ident);
+    let fn_name_alias = emit_fn_name_alias(
+        route_args.name_override.as_ref(),
+        fn_name,
+        &path_helper_name,
+    );
+
+    let method_const = format_ident!("{}", http_method); // e.g., GET
+    let routing_fn = format_ident!("{}", axum_fn); // e.g., get
+
+    // When #[feature_flag] is stacked, it prepends a gate parameter of type
+    // `__AutumnFlagGate_{handler_name}` to the handler inputs. Since route macros
+    // run before attribute macros lower down the chain, we must detect this attribute
+    // and manually propagate the gate parameter to the primitive wrapper so that
+    // the wrapper's call to the handler compiles.
+    let has_feature_flag_attr = input_fn.attrs.iter().any(|a| {
+        a.path()
+            .segments
+            .last()
+            .is_some_and(|s| s.ident == "feature_flag")
+    });
+    // Body guards that rewrite the handler's return type to `Response` (and
+    // inject hidden extractors): #[throttle], #[step_up], #[authorize], and
+    // #[secured]. This route macro is outermost, so when one of these guards is
+    // still present as an attribute it has not expanded yet — the signature we
+    // see here still declares the original primitive return type, but the guard
+    // will lower it to `Response`. Emitting the primitive `.to_string()` wrapper
+    // (which calls the handler with only the user's original args and stringifies
+
+/// Render a `<script>` tag with SRI integrity for a named vendored JS dependency.
+#[cfg(feature = "maud")]
+pub use crate::assets::javascript_include_tag;
+/// Cache a rendered Maud fragment keyed by `(identity, version)`.
+#[cfg(feature = "maud")]
+pub use crate::cache::{cache_fragment, cache_fragment_global};
+/// Maud HTML templating types.
+#[cfg(feature = "maud")]
+pub use maud::{Markup, PreEscaped, html};
+
+// ── Extractors ───────────────────────────────────────────────────
+/// Canary traffic-routing extractor (reads the `X-Canary` header).
+pub use crate::canary::CanaryRoute;
+/// Database connection extractor.
+#[cfg(feature = "db")]
+pub use crate::db::Db;
+/// Transaction isolation levels and retry options for [`crate::db::Db::tx_with`].
+#[cfg(feature = "db")]
+pub use crate::db::{IsolationLevel, TxOptions};
+/// Typed domain event bus publisher extractor. The `Event` trait it works with
+/// lives at [`crate::events::Event`] (kept out of the prelude to avoid clashing
+/// with [`crate::sse::Event`]).
+pub use crate::events::Events;
+/// Current request path extractor, for path-aware view helpers like `nav_link`.
+pub use crate::extract::CurrentPath;
+/// Form data extractor.
+pub use crate::extract::Form;
+
+//! | Layer | Crate | Purpose |
+//! |-------|-------|---------|
+//! | HTTP server | [Axum] | Routing, extractors, middleware |
+//! | HTML templates | [Maud] | Type-safe, compiled HTML via `html!` macro |
+//! | Database | [Diesel] | Async Postgres via `diesel-async` + deadpool |
+//! | Client interactivity | htmx | Embedded JS served from same-origin `/static/js/` routes |
+//! | Styling | Tailwind CSS | Downloaded + managed by `autumn-cli` |
+//!
+//! ## Modules
+//!
+//! - [`mod@app`] -- Application builder for configuring and launching the server.
+//! - [`config`] -- Layered configuration: defaults, `autumn.toml`, env overrides.
+//! - [`db`] -- Database connection pool and the [`Db`] request extractor.
+//! - [`error`] -- Framework error type ([`AutumnError`]) and result alias.
+//! - [`extract`] -- Re-exported Axum extractors ([`Form`],
+//!   [`Json`], [`Path`], [`Query`], and optional multipart support).
+//! - [`health`] -- Compatibility alias for readiness plus legacy health helpers.
+
+//! - [`middleware`] -- Built-in middleware (request IDs).
+//! - [`pagination`] -- Standardized `page`/`size` extractor and response wrapper.
+//! - [`prelude`] -- Glob import for the most common types.
+
+//!
+//! ## Zero-config defaults
+//!
+//! An Autumn app runs out of the box with no configuration file. Every
