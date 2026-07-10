@@ -600,6 +600,31 @@ pub fn notify_scheduled_task_failure(state: &AppState, task_name: &str, error: &
     let _ = alerter.notify(alert);
 }
 
+/// Recovery for condition (d): a previously-failing framework-scheduled task
+/// completed successfully. Called from the scheduler's success arms.
+///
+/// No-op when no alerter is installed. Uses the SAME dedup key as
+/// [`notify_scheduled_task_failure`] so the recovery clears an outstanding
+/// failure; the dedup gate ([`AlertDeduplicator::on_resolve`]) makes it a no-op
+/// when the failure key was never active, so a task that has only ever succeeded
+/// sends nothing.
+pub fn notify_scheduled_task_recovered(state: &AppState, task_name: &str) {
+    let Some(alerter) = alerter(state) else {
+        return;
+    };
+    let alert = Alert::recovery(
+        AlertCondition::ScheduledTaskFailure,
+        format!("scheduled_task_failure:{task_name}"),
+    )
+    .title(format!("Scheduled task '{task_name}' recovered"))
+    .summary(format!(
+        "The framework-scheduled task '{task_name}' completed successfully after a previous failure."
+    ))
+    .detail("task", task_name)
+    .build();
+    let _ = alerter.recover(alert);
+}
+
 // ── Config ──────────────────────────────────────────────────────────────────
 
 const fn default_alerts_enabled() -> bool {
@@ -920,12 +945,45 @@ pub fn install_from_config(
     }
     #[cfg(feature = "http-client")]
     if let Some(url) = config.webhook_url.as_ref().filter(|s| !s.trim().is_empty()) {
-        let client = crate::http_client::Client::from_state(state);
-        channels.push(Arc::new(WebhookAlertChannel::new(
-            client,
-            url.clone(),
-            config.webhook_secret.clone(),
-        )));
+        // Alert webhooks are ALWAYS signed: the operator guide documents receivers
+        // verifying the `Autumn-Signature` header. A configured webhook with no
+        // non-empty signing secret would send UNSIGNED requests that a documented
+        // receiver rejects (or accepts unauthenticated) — so refuse to register the
+        // channel and warn, mirroring the disabled-mail-transport skip above.
+        // Never send unsigned.
+        if let Some(secret) = config
+            .webhook_secret
+            .as_ref()
+            .filter(|s| !s.trim().is_empty())
+        {
+            let client = crate::http_client::Client::from_state(state);
+            channels.push(Arc::new(WebhookAlertChannel::new(
+                client,
+                url.clone(),
+                Some(secret.clone()),
+            )));
+        } else {
+            tracing::warn!(
+                "alerts: a webhook destination is configured but no `webhook_secret` is set; \
+                 alert webhooks are always signed, so no webhook alerts will be delivered. Set \
+                 [alerts] webhook_secret (or the AUTUMN_ALERTS__WEBHOOK_SECRET env var)."
+            );
+        }
+    }
+    // Without the `http-client` feature the webhook branch above is compiled out,
+    // so a webhook-only config would silently install no channels and deliver no
+    // alerts. Warn loudly so operators don't believe webhook alerts are active.
+    #[cfg(not(feature = "http-client"))]
+    if config
+        .webhook_url
+        .as_ref()
+        .is_some_and(|s| !s.trim().is_empty())
+    {
+        tracing::warn!(
+            "operator-alerts: a webhook destination is configured but the `http-client` feature \
+             is not enabled; no webhook alerts will be delivered. Enable the `http-client` \
+             feature or use an email destination."
+        );
     }
 
     channels.extend(extra_channels);

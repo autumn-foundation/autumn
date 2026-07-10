@@ -162,6 +162,133 @@ async fn repeated_condition_is_deduplicated_then_recovers() {
     assert_eq!(alerts[0].dedup_key, alerts[1].dedup_key);
 }
 
+/// Finding 2 (recovery): a scheduled task that fails, then succeeds, delivers a
+/// recovery notice; and a subsequent failure within the dedup window alerts
+/// again rather than being suppressed as if still failing. Proves the scheduler
+/// success arms clear the `scheduled_task_failure:{task}` dedup key.
+#[tokio::test]
+async fn scheduled_task_recovers_then_realerts_on_new_failure() {
+    let channel = CapturingChannel::default();
+    let alerter = Alerter::new(vec![Arc::new(channel.clone())], test_settings());
+
+    let client = TestApp::new()
+        .state_initializer(move |state| state.insert_extension(alerter.clone()))
+        .build();
+    let state = client.state();
+
+    // Fail → alert.
+    autumn_web::alerts::notify_scheduled_task_failure(state, "nightly_backup", "disk full");
+    wait_for(&channel, 1).await;
+
+    // Succeed → recovery notice for the same key.
+    autumn_web::alerts::notify_scheduled_task_recovered(state, "nightly_backup");
+    wait_for(&channel, 2).await;
+
+    // Fail again within the (900s) dedup window → must alert again, not be
+    // suppressed as if still failing (the success cleared the active key).
+    autumn_web::alerts::notify_scheduled_task_failure(state, "nightly_backup", "disk full again");
+    wait_for(&channel, 3).await;
+
+    let alerts = channel.alerts();
+    assert_eq!(
+        alerts.len(),
+        3,
+        "fail → recover → fail must produce trigger, resolve, trigger: {alerts:?}"
+    );
+    assert_eq!(alerts[0].event, AlertEventKind::Trigger);
+    assert_eq!(alerts[0].condition, AlertCondition::ScheduledTaskFailure);
+    assert_eq!(alerts[1].event, AlertEventKind::Resolve);
+    assert_eq!(alerts[1].severity, AlertSeverity::Recovery);
+    assert_eq!(alerts[2].event, AlertEventKind::Trigger);
+    // Stable dedup key correlates the whole lifecycle.
+    assert_eq!(alerts[0].dedup_key, "scheduled_task_failure:nightly_backup");
+    assert_eq!(alerts[0].dedup_key, alerts[1].dedup_key);
+    assert_eq!(alerts[1].dedup_key, alerts[2].dedup_key);
+}
+
+/// Recovery is a no-op when the task never failed: a success for a task with no
+/// outstanding failure delivers nothing (the dedup gate suppresses it), so a
+/// task that has only ever succeeded stays silent.
+#[tokio::test]
+async fn scheduled_task_recovery_without_prior_failure_is_silent() {
+    let channel = CapturingChannel::default();
+    let alerter = Alerter::new(vec![Arc::new(channel.clone())], test_settings());
+
+    let client = TestApp::new()
+        .state_initializer(move |state| state.insert_extension(alerter.clone()))
+        .build();
+
+    autumn_web::alerts::notify_scheduled_task_recovered(client.state(), "healthy_task");
+
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    assert!(
+        channel.alerts().is_empty(),
+        "a success with no outstanding failure must deliver no recovery: {:?}",
+        channel.alerts()
+    );
+}
+
+/// Finding 3: alert webhooks are ALWAYS signed, so a webhook destination with no
+/// signing secret must NOT register a webhook channel — sending unsigned would be
+/// rejected by receivers following the documented verification. With the webhook
+/// as the only destination, `install_from_config` installs no alerter at all.
+#[cfg(feature = "http-client")]
+#[tokio::test]
+async fn webhook_without_secret_does_not_register_channel() {
+    let client = TestApp::new().build();
+
+    let config = AlertConfig {
+        webhook_url: Some("https://alerts.example.com/hooks/autumn".to_owned()),
+        webhook_secret: None,
+        ..AlertConfig::default()
+    };
+    autumn_web::alerts::install_from_config(client.state(), &config, Vec::new());
+
+    assert!(
+        client.state().extension::<Alerter>().is_none(),
+        "a webhook destination with no signing secret must not install an (unsigned) channel"
+    );
+}
+
+/// Companion: a whitespace-only secret is treated as absent — still no channel.
+#[cfg(feature = "http-client")]
+#[tokio::test]
+async fn webhook_with_blank_secret_does_not_register_channel() {
+    let client = TestApp::new().build();
+
+    let config = AlertConfig {
+        webhook_url: Some("https://alerts.example.com/hooks/autumn".to_owned()),
+        webhook_secret: Some("   ".to_owned()),
+        ..AlertConfig::default()
+    };
+    autumn_web::alerts::install_from_config(client.state(), &config, Vec::new());
+
+    assert!(
+        client.state().extension::<Alerter>().is_none(),
+        "a blank signing secret must be treated as absent (no unsigned channel)"
+    );
+}
+
+/// Companion: a webhook destination WITH a non-empty secret registers the signed
+/// webhook channel, so an alerter is installed.
+#[cfg(feature = "http-client")]
+#[tokio::test]
+async fn webhook_with_secret_registers_channel() {
+    let client = TestApp::new().build();
+
+    let config = AlertConfig {
+        webhook_url: Some("https://alerts.example.com/hooks/autumn".to_owned()),
+        webhook_secret: Some("s3cr3t".to_owned()),
+        ..AlertConfig::default()
+    };
+    autumn_web::alerts::install_from_config(client.state(), &config, Vec::new());
+
+    assert!(
+        client.state().extension::<Alerter>().is_some(),
+        "a webhook destination with a signing secret must install the webhook channel"
+    );
+}
+
 /// AC #1/#2: the built-in mail channel reuses the app's configured `Mailer` and
 /// delivers the alert even to a suppressed address (alerts are security-class;
 /// `ignore_suppression()` is called on the builder).

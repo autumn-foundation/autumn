@@ -5016,6 +5016,7 @@ async fn execute_fixed_delay_task(
     {
         Ok(duration_ms) => {
             state.task_registry.record_success(&name, duration_ms);
+            crate::alerts::notify_scheduled_task_recovered(&state, &name);
             tracing::debug!(task = %name, "Task completed");
             send_ws_sys_task_msg(
                 &state,
@@ -5090,6 +5091,7 @@ async fn execute_cron_task(
     {
         Ok(duration_ms) => {
             state.task_registry.record_success(&name, duration_ms);
+            crate::alerts::notify_scheduled_task_recovered(&state, &name);
             tracing::debug!(task = %name, "Cron task completed");
             send_ws_sys_task_msg(
                 &state,

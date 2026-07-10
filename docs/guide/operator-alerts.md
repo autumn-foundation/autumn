@@ -25,10 +25,12 @@ notice when it clears.
 [alerts]
 email = "oncall@example.com"
 webhook_url = "https://alerts.example.com/hooks/autumn"
+webhook_secret = "…"   # required with webhook_url; prefer the env var below
 ```
 
 That's it. With a destination configured, a scaffolded app delivers an alert for
-every built-in condition below. Prefer environment variables for secrets and
+every built-in condition below. A `webhook_url` requires a `webhook_secret`
+(alerts are always signed). Prefer environment variables for secrets and
 per-environment destinations:
 
 ```bash
@@ -70,7 +72,8 @@ errors during a quiet period never trip a false alarm.
 enabled = true                 # master switch (default true)
 email = "oncall@example.com"   # operator email destination
 webhook_url = "https://…"      # signed webhook destination
-webhook_secret = "…"           # HMAC secret (prefer AUTUMN_ALERTS__WEBHOOK_SECRET)
+webhook_secret = "…"           # REQUIRED with webhook_url; alerts are always
+                               # signed (prefer AUTUMN_ALERTS__WEBHOOK_SECRET)
 
 # Deduplication
 dedup_window_secs = 900        # at most one notice per condition per 15 min
@@ -138,9 +141,16 @@ The webhook payload is JSON:
 }
 ```
 
-The webhook is signed exactly like Autumn's outbound webhooks: an
-`Autumn-Signature: t=<unix>,v1=<hmac-sha256>` header over `"<t>.<body>"` using
+Alert webhooks are **always signed**, exactly like Autumn's outbound webhooks:
+an `Autumn-Signature: t=<unix>,v1=<hmac-sha256>` header over `"<t>.<body>"` using
 `webhook_secret`. Verify it the same way you verify any Autumn outbound webhook.
+
+Because alerts are always signed, **`webhook_secret` is required** whenever a
+`webhook_url` is configured. Set it in `[alerts]` or, preferably, via the
+`AUTUMN_ALERTS__WEBHOOK_SECRET` environment variable (which overrides the file).
+If a `webhook_url` is configured but no non-empty `webhook_secret` resolves,
+Autumn logs a startup `warn` and **does not register the webhook channel** —
+it never sends unsigned requests that your receiver would reject.
 
 Email alerts are delivered through your configured mailer with the
 bounce/complaint **suppression list bypassed** — operator alerts are
