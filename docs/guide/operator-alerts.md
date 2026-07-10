@@ -159,6 +159,27 @@ actually healthy.
 
 ---
 
+## Limitations
+
+Deduplication is **process-local**: each replica keeps its own in-memory record
+of which conditions are currently firing. For the 5xx-rate and health-indicator
+conditions this is exactly right — each replica evaluates its own metrics and its
+alerts carry a host-scoped dedup key, so incidents stay separate per replica.
+
+There is one known gap for **scheduled-task recovery on multi-replica fleets**.
+A scheduled task is lease-coordinated across the fleet, so it can fail on one
+replica and later succeed on another after a leader handoff. Because the failure
+and the success were observed by different replicas — and the recovery is gated
+by the replica-local record of the failure — the replica that runs the success
+has no outstanding failure to clear, so the recovery notice is skipped and the
+original failure alert may linger until it ages out. **Single-VPS deployments
+(the common case) are unaffected**, since there is only one replica; only
+multi-replica fleets can hit this after a leader handoff. Cross-app or
+fleet-level alert aggregation and shared active-alert state are tracked as a
+follow-up (#1630) and are out of scope here.
+
+---
+
 ## What an alert contains
 
 Each alert states **what** failed, **when**, on **which host/replica**, and

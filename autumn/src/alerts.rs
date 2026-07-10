@@ -338,6 +338,30 @@ pub fn host_id() -> String {
         .unwrap_or_else(|| "unknown-host".to_owned())
 }
 
+/// Dedup key for the process-local **5xx-rate** condition, scoped to `host`.
+///
+/// The 5xx rate is evaluated from THIS process's local metrics, so every
+/// replica computes its own rate. The key is host-scoped so a consumer that
+/// correlates on `dedup_key` keeps each replica's incident separate: without
+/// the suffix, replica B's resolve would clear replica A's still-active
+/// incident and simultaneous spikes on different hosts would collapse into one
+/// condition. A trigger and its later resolve run in the SAME process, so
+/// `host_id()` yields an identical suffix and they still correlate.
+fn error_rate_dedup_key(host: &str) -> String {
+    format!("high_error_rate:5xx:{host}")
+}
+
+/// Dedup key for the process-local **health-indicator-down** condition, scoped
+/// to the specific `indicator` and to `host`.
+///
+/// Health is evaluated from THIS process's local indicator registry, so — like
+/// [`error_rate_dedup_key`] — the key is host-scoped so per-replica incidents
+/// stay distinct while a trigger and its later resolve (same process, same
+/// `host_id()`) still correlate.
+fn health_indicator_dedup_key(indicator: &str, host: &str) -> String {
+    format!("health_indicator_down:{indicator}:{host}")
+}
+
 // ── Delivery trait ──────────────────────────────────────────────────────────
 
 /// The future returned by [`AlertChannel::deliver`].
@@ -711,6 +735,18 @@ pub fn notify_scheduled_task_recovered(state: &AppState, task_name: &str) {
     let Some(alerter) = alerter(state) else {
         return;
     };
+    // KNOWN LIMITATION (multi-replica fleets): the `AlertDeduplicator` is
+    // process-local, so a recovery only clears an outstanding failure when it is
+    // emitted by the SAME replica that observed the failure. Scheduled tasks are
+    // lease-coordinated across the fleet, so the failure can be seen by replica A
+    // and the later success run by replica B after a leader handoff; B has no
+    // active `scheduled_task_failure:{task}` key locally, so `on_resolve`
+    // suppresses the resolve and A's failure alert is never cleared. This is why
+    // the scheduled-task key is deliberately NOT host-scoped (a global key is
+    // still the closest correlation available). A real fix needs shared
+    // active-alert state (Postgres/Redis) or an unconditional correlated resolve,
+    // both out of scope for #1610 (fleet-level alert aggregation is listed as a
+    // non-goal); tracked for the shared-alert-state follow-up (#1630).
     let alert = Alert::recovery(
         AlertCondition::ScheduledTaskFailure,
         format!("scheduled_task_failure:{task_name}"),
@@ -1190,7 +1226,10 @@ fn evaluate_error_rate(
     };
     #[allow(clippy::cast_precision_loss)]
     let rate = err_delta as f64 / req_delta as f64;
-    let key = "high_error_rate:5xx".to_owned();
+    // Host-scope the key: this rate is from the local process's metrics, so
+    // each replica must own its incident (see `error_rate_dedup_key`). The
+    // trigger and resolve below share this same `key`, so they still correlate.
+    let key = error_rate_dedup_key(&host_id());
     if rate >= settings.error_rate_threshold {
         let pct = rate * 100.0;
         let threshold_pct = settings.error_rate_threshold * 100.0;
@@ -1275,8 +1314,13 @@ async fn evaluate_health(
     let grace = chrono::Duration::from_std(settings.health_grace)
         .unwrap_or_else(|_| chrono::Duration::seconds(60));
 
+    let host = host_id();
     for result in &results {
-        let key = format!("health_indicator_down:{}", result.name);
+        // Host-scope the per-indicator key: health is evaluated from this
+        // process's local registry, so each replica owns its incident (see
+        // `health_indicator_dedup_key`). The trigger and resolve arms below
+        // share this same `key`, so they still correlate.
+        let key = health_indicator_dedup_key(&result.name, &host);
         match classify_health_transition(result.output.status) {
             HealthTransition::Down => {
                 let first = *down_since.entry(result.name.clone()).or_insert(now);
@@ -1642,6 +1686,58 @@ mod tests {
         let t = Alert::trigger(AlertCondition::DeadLetteredJob, key).build();
         let r = Alert::recovery(AlertCondition::DeadLetteredJob, key).build();
         assert_eq!(t.dedup_key, r.dedup_key);
+    }
+
+    // ── Host-scoped dedup keys for the process-local conditions (P2) ──────────
+    // The 5xx-rate and health-indicator-down conditions are evaluated from THIS
+    // process's local metrics/registry, so their dedup keys carry the host id:
+    // two replicas produce DIFFERENT keys (their incidents stay distinct), while
+    // a single replica's trigger and resolve — same process, same `host_id()` —
+    // produce the SAME key so a consumer still correlates them.
+
+    #[test]
+    fn error_rate_dedup_key_is_host_scoped() {
+        // Different hosts -> different keys (incidents stay separate per replica).
+        assert_ne!(
+            error_rate_dedup_key("replica-a"),
+            error_rate_dedup_key("replica-b"),
+            "two replicas must not share the 5xx dedup key"
+        );
+        // Same host -> the trigger and its later resolve (both in-process) match.
+        let host = "replica-a";
+        let trigger_key = error_rate_dedup_key(host);
+        let resolve_key = error_rate_dedup_key(host);
+        assert_eq!(
+            trigger_key, resolve_key,
+            "same-host trigger and resolve must correlate"
+        );
+        // The host is appended to the existing key format.
+        assert_eq!(trigger_key, "high_error_rate:5xx:replica-a");
+    }
+
+    #[test]
+    fn health_indicator_dedup_key_is_host_scoped() {
+        // Different hosts -> different keys for the same indicator.
+        assert_ne!(
+            health_indicator_dedup_key("db", "replica-a"),
+            health_indicator_dedup_key("db", "replica-b"),
+            "two replicas must not share a health dedup key for the same indicator"
+        );
+        // Different indicators on the same host also stay distinct.
+        assert_ne!(
+            health_indicator_dedup_key("db", "replica-a"),
+            health_indicator_dedup_key("cache", "replica-a"),
+        );
+        // Same host + indicator -> the trigger and its resolve match.
+        let host = "replica-a";
+        let trigger_key = health_indicator_dedup_key("db", host);
+        let resolve_key = health_indicator_dedup_key("db", host);
+        assert_eq!(
+            trigger_key, resolve_key,
+            "same-host trigger and resolve must correlate"
+        );
+        // The host is appended to the existing per-indicator key format.
+        assert_eq!(trigger_key, "health_indicator_down:db:replica-a");
     }
 
     // ── Fan-out (delivery to every channel) ──────────────────────────────────
