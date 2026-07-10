@@ -22,3 +22,26 @@ CREATE TABLE projects (
     created_at TIMESTAMP NOT NULL DEFAULT NOW()
 );
 CREATE INDEX idx_projects_tenant ON projects (tenant_id);
+
+-- Persistent "remember-me" login chains (issue #1397). One row per device
+-- login-chain, keyed by the stable opaque `series`; `token_hash` rotates on
+-- every use so replaying a rotated-out cookie is detected as theft. Only the
+-- SHA-256 hash of the current token is stored — never the raw token — so a
+-- database leak cannot be replayed as a remember cookie. `ON DELETE CASCADE`
+-- ties a chain's lifetime to its account.
+CREATE TABLE remember_tokens (
+    series       TEXT        PRIMARY KEY,
+    user_id      BIGINT      NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+    tenant_id    TEXT        NOT NULL,
+    token_hash   TEXT        NOT NULL,
+    expires_at   TIMESTAMPTZ NOT NULL,
+    ip           TEXT        NOT NULL DEFAULT '',
+    user_agent   TEXT        NOT NULL DEFAULT '',
+    ua_family    TEXT        NOT NULL DEFAULT '',
+    ua_os        TEXT        NOT NULL DEFAULT '',
+    ua_device    TEXT        NOT NULL DEFAULT '',
+    label        TEXT,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_used_at TIMESTAMPTZ
+);
+CREATE INDEX idx_remember_tokens_user ON remember_tokens (user_id);

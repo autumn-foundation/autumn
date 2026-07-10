@@ -7,6 +7,7 @@
 
 use autumn_web::auth::{hash_password, validate_password, verify_password};
 use autumn_web::prelude::*;
+use autumn_web::reexports::axum::http::{HeaderMap, HeaderValue, header::SET_COOKIE};
 use autumn_web::reexports::axum::response::Response;
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
@@ -27,6 +28,10 @@ pub struct SignupForm {
 pub struct LoginForm {
     pub email: String,
     pub password: String,
+    /// Present (`Some("on")`) when the "Remember me" checkbox is ticked; an
+    /// unchecked checkbox posts nothing, so this stays `None`.
+    #[serde(default)]
+    pub remember: Option<String>,
 }
 
 // bcrypt hash used as a dummy target when the email is not found, so the
@@ -156,6 +161,11 @@ pub async fn login_form() -> Markup {
                     input #password type="password" name="password" required
                           autocomplete="current-password" class="w-full border rounded px-3 py-2";
                 }
+                label class="flex items-center gap-2 text-sm text-gray-600" {
+                    input #remember type="checkbox" name="remember" value="on"
+                          class="rounded border-gray-300";
+                    "Remember me on this device"
+                }
                 button type="submit"
                        class="w-full bg-indigo-600 text-white py-2 rounded hover:bg-indigo-700" {
                     "Log in"
@@ -170,10 +180,12 @@ pub async fn login_form() -> Markup {
 
 #[post("/login")]
 pub async fn login(
+    State(state): State<AppState>,
     session: Session,
     mut db: Db,
+    headers: HeaderMap,
     Form(form): Form<LoginForm>,
-) -> AutumnResult<Redirect> {
+) -> AutumnResult<Response> {
     let email = form.email.trim().to_lowercase();
     // Reject over-long inputs before any DB query or bcrypt work — they can never
     // match a stored account and only waste CPU.
@@ -204,18 +216,44 @@ pub async fn login(
     }
 
     establish_session(&session, &user).await;
-    Ok(Redirect::to("/dashboard"))
+
+    let mut response = Redirect::to("/dashboard").into_response();
+
+    // Persistent "remember-me" opt-in (issue #1397): when the box is ticked and
+    // the policy allows it, mint a rotating remember chain and attach its cookie
+    // alongside the session cookie. Unticked → behaviour is unchanged.
+    if form.remember.is_some() && state.config().auth.remember.enabled {
+        // `Db` derefs to the underlying connection; `&mut *db` reborrows it.
+        let cookie =
+            crate::remember::issue_remember_cookie(&mut db, user.id, &user.tenant_id, &headers)
+                .await?;
+        if let Ok(header_value) = HeaderValue::from_str(&cookie) {
+            response.headers_mut().append(SET_COOKIE, header_value);
+        }
+    }
+
+    Ok(response)
 }
 
 // ── Logout ───────────────────────────────────────────────────────────────────
 
 #[post("/logout")]
-pub async fn logout(session: Session) -> Redirect {
+pub async fn logout(session: Session, mut db: Db, headers: HeaderMap) -> AutumnResult<Response> {
+    // Revoke this device's remember chain (issue #1397) before tearing the
+    // session down, so a stolen remember cookie cannot re-establish a login
+    // after logout. No-op when no remember cookie is present.
+    crate::remember::revoke_current_chain(&mut db, &headers).await;
+
     // Clear the session contents and rotate the id so the old cookie cannot be
     // replayed.
     session.clear().await;
     session.rotate_id().await;
-    Redirect::to("/")
+
+    let mut response = Redirect::to("/").into_response();
+    if let Ok(header_value) = HeaderValue::from_str(&crate::remember::clear_remember_cookie()) {
+        response.headers_mut().append(SET_COOKIE, header_value);
+    }
+    Ok(response)
 }
 
 /// Log a user in: rotate the session id (prevents fixation) and record the

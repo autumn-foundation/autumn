@@ -472,6 +472,13 @@ pub fn plan_auth_with_providers(
     );
     let session_mod_name = format!("{snake_name}_session");
     model_mod = add_mod_declaration(&model_mod, &session_mod_name);
+    // Persistent remember-me chains (issue #1397) live in their own model + table.
+    plan.create(
+        models_dir.join(format!("{snake_name}_remember_token.rs")),
+        render_remember_model_file(&pascal_name, &snake_name, &table),
+    );
+    let remember_mod_name = format!("{snake_name}_remember_token");
+    model_mod = add_mod_declaration(&model_mod, &remember_mod_name);
     plan.modify(model_mod_path.clone(), model_mod);
     plan.push_revert(crate::generate::emit::Revert::ModDecl {
         path: model_mod_path.clone(),
@@ -484,8 +491,12 @@ pub fn plan_auth_with_providers(
         });
     }
     plan.push_revert(crate::generate::emit::Revert::ModDecl {
-        path: model_mod_path,
+        path: model_mod_path.clone(),
         name: session_mod_name,
+    });
+    plan.push_revert(crate::generate::emit::Revert::ModDecl {
+        path: model_mod_path,
+        name: remember_mod_name,
     });
 
     // ── src/schema.rs entry ────────────────────────────────────────────────
@@ -562,6 +573,20 @@ pub fn plan_auth_with_providers(
             ),
         ));
     }
+    // Same guard for the remember-me helper table (issue #1397).
+    let rem_table_guard = remember_table_name(&snake_name);
+    if schema_has_table(&schema_existing, &rem_table_guard)
+        && !schema_has_table(&schema_existing, &table)
+    {
+        return Err(GenerateError::InvalidName(
+            name.to_owned(),
+            format!(
+                "this project already defines a `{rem_table_guard}` table, which the auth \
+                 starter needs for persistent remember-me login; rename or remove the \
+                 existing table first."
+            ),
+        ));
+    }
     let mut schema_new = append_schema_table(&schema_existing, &table, &auth_fields);
     if totp {
         let recovery_fields: Vec<super::dsl::Field> = [
@@ -589,6 +614,27 @@ pub fn plan_auth_with_providers(
     .map(|t| super::dsl::parse_field(t).expect("session field tokens are always valid"))
     .collect();
     schema_new = append_schema_table(&schema_new, &sess_table, &session_fields);
+    // Persistent "remember-me" login chains (issue #1397). Mirrors the sessions
+    // table shape: a synthetic `id` primary key plus a unique opaque `series`
+    // that is the stable per-device lookup key.
+    let rem_table = remember_table_name(&snake_name);
+    let remember_fields: Vec<super::dsl::Field> = [
+        "series:String",
+        "user_id:i64",
+        "token_hash:String",
+        "expires_at:NaiveDateTime",
+        "ip:String",
+        "user_agent:String",
+        "ua_family:String",
+        "ua_os:String",
+        "ua_device:String",
+        "label:Option<String>",
+        "last_used_at:Option<NaiveDateTime>",
+    ]
+    .iter()
+    .map(|t| super::dsl::parse_field(t).expect("remember field tokens are always valid"))
+    .collect();
+    schema_new = append_schema_table(&schema_new, &rem_table, &remember_fields);
     plan.modify(schema_path.clone(), schema_new);
     plan.push_revert(crate::generate::emit::Revert::SchemaTable {
         path: schema_path.clone(),
@@ -612,9 +658,16 @@ pub fn plan_auth_with_providers(
     }
     let sess_table_expected_block = append_schema_table("", &sess_table, &session_fields);
     plan.push_revert(crate::generate::emit::Revert::SchemaTable {
-        path: schema_path,
+        path: schema_path.clone(),
         table: sess_table,
         expected_block: sess_table_expected_block,
+    });
+    // Remember-me table is appended last, so it is reverted first (issue #1397).
+    let rem_table_expected_block = append_schema_table("", &rem_table, &remember_fields);
+    plan.push_revert(crate::generate::emit::Revert::SchemaTable {
+        path: schema_path,
+        table: rem_table,
+        expected_block: rem_table_expected_block,
     });
 
     // ── Auth routes ────────────────────────────────────────────────────────
@@ -1533,6 +1586,11 @@ fn sessions_table_name(snake_name: &str) -> String {
     format!("{snake_name}_sessions")
 }
 
+/// Table backing persistent "remember-me" login chains (issue #1397).
+fn remember_table_name(snake_name: &str) -> String {
+    format!("{snake_name}_remember_tokens")
+}
+
 fn render_migration_up(snake_name: &str, table: &str, totp: bool) -> String {
     // TOTP columns are inserted after password_digest so the column order
     // matches the generated model struct and `schema.rs` block.
@@ -1608,16 +1666,46 @@ fn render_migration_up(snake_name: &str, table: &str, totp: bool) -> String {
          \n\
          CREATE INDEX {sess_table}_user_id_idx ON {sess_table} (user_id);\n",
     );
+    // Persistent "remember-me" login chains (issue #1397): one row per device
+    // login-chain, keyed by the stable opaque `series`. `token_hash` rotates on
+    // every use so a replayed rotated-out cookie is detected as theft. Only the
+    // SHA-256 hash of the current token is stored — never the raw token — so a
+    // database leak cannot be replayed as a remember cookie.
+    let rem_table = remember_table_name(snake_name);
+    let _ = write!(
+        out,
+        "\n\
+         CREATE TABLE {rem_table} (\n\
+         \x20   id BIGSERIAL PRIMARY KEY,\n\
+         \x20   series TEXT NOT NULL UNIQUE,\n\
+         \x20   user_id BIGINT NOT NULL REFERENCES {table}(id) ON DELETE CASCADE,\n\
+         \x20   token_hash TEXT NOT NULL,\n\
+         \x20   expires_at TIMESTAMP NOT NULL,\n\
+         \x20   ip TEXT NOT NULL DEFAULT '',\n\
+         \x20   user_agent TEXT NOT NULL DEFAULT '',\n\
+         \x20   ua_family TEXT NOT NULL DEFAULT '',\n\
+         \x20   ua_os TEXT NOT NULL DEFAULT '',\n\
+         \x20   ua_device TEXT NOT NULL DEFAULT '',\n\
+         \x20   label TEXT NULL,\n\
+         \x20   last_used_at TIMESTAMP NULL,\n\
+         \x20   created_at TIMESTAMP NOT NULL DEFAULT NOW()\n\
+         );\n\
+         \n\
+         CREATE INDEX {rem_table}_user_id_idx ON {rem_table} (user_id);\n",
+    );
     out
 }
 
 fn render_migration_down(snake_name: &str, table: &str, totp: bool) -> String {
     // Drop the dependent tables first so the FK constraints are satisfied.
     let sess_table = sessions_table_name(snake_name);
+    let rem_table = remember_table_name(snake_name);
     if totp {
-        format!("DROP TABLE {sess_table};\nDROP TABLE recovery_codes;\nDROP TABLE {table};\n")
+        format!(
+            "DROP TABLE {rem_table};\nDROP TABLE {sess_table};\nDROP TABLE recovery_codes;\nDROP TABLE {table};\n"
+        )
     } else {
-        format!("DROP TABLE {sess_table};\nDROP TABLE {table};\n")
+        format!("DROP TABLE {rem_table};\nDROP TABLE {sess_table};\nDROP TABLE {table};\n")
     }
 }
 
@@ -1857,6 +1945,174 @@ impl {user_pascal} {{
     )
 }
 
+/// Render `src/models/{snake}_remember_token.rs` — the persistent remember-me
+/// chain row and its CRUD, plus a bulk-revocation method on the user model
+/// (issue #1397).
+///
+/// Only the SHA-256 hash of the current token is stored; the raw token lives
+/// only in the cookie. `series` is the stable per-device lookup key and
+/// `token_hash` rotates on every use so a replayed rotated-out cookie is
+/// detected as theft (see `routes/auth.rs::remember_me`).
+#[allow(clippy::too_many_lines)]
+fn render_remember_model_file(user_pascal: &str, user_snake: &str, user_table: &str) -> String {
+    let rem_table = remember_table_name(user_snake);
+    format!(
+        r#"//! Generated by `autumn generate auth`.
+//!
+//! Persistent "remember-me" login chains for {user_pascal} (issue #1397).
+//! Edit freely — once generated, this is ordinary user code.
+//!
+//! Security notes:
+//! - `token_hash` is the SHA-256 of the current rotating token; the raw token
+//!   is never stored, so a database leak cannot be replayed as a cookie.
+//! - `series` is stable across rotations for one device chain; `token_hash`
+//!   rotates on every use. Replaying a rotated-out token for a known series is
+//!   detected as theft and nukes the whole chain — see `routes/auth.rs`.
+
+use diesel::prelude::*;
+use diesel_async::RunQueryDsl;
+
+use crate::models::{user_snake}::{user_pascal};
+use crate::schema::{rem_table};
+
+#[autumn_web::model]
+pub struct {user_pascal}RememberToken {{
+    pub id: i64,
+    /// Stable, opaque per-device lookup key.
+    pub series: String,
+    // References {user_table}(id).
+    pub user_id: i64,
+    /// SHA-256 hash of the current rotating token (never the raw token).
+    pub token_hash: String,
+    pub expires_at: chrono::NaiveDateTime,
+    pub ip: String,
+    pub user_agent: String,
+    pub ua_family: String,
+    pub ua_os: String,
+    pub ua_device: String,
+    #[default]
+    pub label: Option<String>,
+    #[default]
+    pub last_used_at: Option<chrono::NaiveDateTime>,
+    #[default]
+    pub created_at: chrono::NaiveDateTime,
+}}
+
+impl {user_pascal}RememberToken {{
+    /// Absolute expiry as a UTC datetime, for `autumn_web::auth::evaluate_remember`.
+    /// `#[allow(dead_code)]`: used by `routes::auth::remember_me` once registered.
+    #[allow(dead_code)]
+    #[must_use]
+    pub fn expires_at_utc(&self) -> chrono::DateTime<chrono::Utc> {{
+        self.expires_at.and_utc()
+    }}
+}}
+
+/// Persist a new remember chain for a successful "remember me" login.
+pub async fn insert_remember_token(
+    conn: &mut impl diesel_async::AsyncConnection<Backend = diesel::pg::Pg>,
+    row: &New{user_pascal}RememberToken,
+) -> autumn_web::AutumnResult<()> {{
+    diesel::insert_into({rem_table}::table)
+        .values(row)
+        .execute(conn)
+        .await
+        .map_err(|e| {{
+            autumn_web::AutumnError::internal_server_error_msg(format!(
+                "Failed to persist remember token: {{e}}"
+            ))
+        }})?;
+    Ok(())
+}}
+
+/// Look a chain up by its stable series id.
+///
+/// `#[allow(dead_code)]`: used by `routes::auth::remember_me`, which is live
+/// once you register that middleware in `src/main.rs`.
+#[allow(dead_code)]
+pub async fn find_remember_token(
+    conn: &mut impl diesel_async::AsyncConnection<Backend = diesel::pg::Pg>,
+    series: &str,
+) -> autumn_web::AutumnResult<Option<{user_pascal}RememberToken>> {{
+    {rem_table}::table
+        .filter({rem_table}::series.eq(series))
+        .select({user_pascal}RememberToken::as_select())
+        .first(conn)
+        .await
+        .optional()
+        .map_err(|e| {{
+            autumn_web::AutumnError::internal_server_error_msg(format!(
+                "Failed to load remember token: {{e}}"
+            ))
+        }})
+}}
+
+/// Rotate a chain: overwrite the token hash, extend the sliding expiry, and
+/// stamp `last_used_at`.
+///
+/// `#[allow(dead_code)]`: used by `routes::auth::remember_me` once registered.
+#[allow(dead_code)]
+pub async fn rotate_remember_token(
+    conn: &mut impl diesel_async::AsyncConnection<Backend = diesel::pg::Pg>,
+    series: &str,
+    new_hash: &str,
+    new_expiry: chrono::NaiveDateTime,
+    now: chrono::NaiveDateTime,
+) -> autumn_web::AutumnResult<()> {{
+    diesel::update({rem_table}::table.filter({rem_table}::series.eq(series)))
+        .set((
+            {rem_table}::token_hash.eq(new_hash),
+            {rem_table}::expires_at.eq(new_expiry),
+            {rem_table}::last_used_at.eq(Some(now)),
+        ))
+        .execute(conn)
+        .await
+        .map_err(|e| {{
+            autumn_web::AutumnError::internal_server_error_msg(format!(
+                "Failed to rotate remember token: {{e}}"
+            ))
+        }})?;
+    Ok(())
+}}
+
+/// Delete a single chain by series (theft / this-device logout revocation).
+pub async fn delete_remember_series(
+    conn: &mut impl diesel_async::AsyncConnection<Backend = diesel::pg::Pg>,
+    series: &str,
+) -> autumn_web::AutumnResult<usize> {{
+    diesel::delete({rem_table}::table.filter({rem_table}::series.eq(series)))
+        .execute(conn)
+        .await
+        .map_err(|e| {{
+            autumn_web::AutumnError::internal_server_error_msg(format!(
+                "Failed to delete remember token: {{e}}"
+            ))
+        }})
+}}
+
+impl {user_pascal} {{
+    /// Revoke every remember chain for this account. Used on "sign out
+    /// everywhere else" and on credential change, where every persistent login
+    /// is suspect — a replayed remember cookie afterwards finds no row and is
+    /// rejected. Returns the number of chains revoked.
+    pub async fn revoke_all_remember_tokens(
+        &self,
+        conn: &mut impl diesel_async::AsyncConnection<Backend = diesel::pg::Pg>,
+    ) -> autumn_web::AutumnResult<usize> {{
+        diesel::delete({rem_table}::table.filter({rem_table}::user_id.eq(self.id)))
+            .execute(conn)
+            .await
+            .map_err(|e| {{
+                autumn_web::AutumnError::internal_server_error_msg(format!(
+                    "Failed to revoke remember tokens: {{e}}"
+                ))
+            }})
+    }}
+}}
+"#
+    )
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "Single auth-routes template — splitting fragments makes the template harder to read."
@@ -1869,6 +2125,7 @@ fn render_routes_file(
     totp: bool,
 ) -> String {
     let sess_table = sessions_table_name(snake_name);
+    let rem_table = remember_table_name(snake_name);
     let oauth_buttons = if providers.is_empty() {
         String::new()
     } else {
@@ -1942,7 +2199,11 @@ fn render_routes_file(
 //!   immediately — see `require_tracked_session` and
 //!   docs/guide/session-management.md.
 
-use autumn_web::auth::{{hash_password, verify_password}};
+use autumn_web::auth::{{
+    RememberConfig, RememberDecision, RememberRecord, build_remember_clear_cookie,
+    build_remember_cookie, evaluate_remember, generate_remember_credential, generate_token,
+    hash_password, hash_remember_token, parse_remember_cookie_value, verify_password,
+}};
 use autumn_web::extract::Query;
 use autumn_web::prelude::*;
 use axum::extract::Path;
@@ -1954,7 +2215,12 @@ use serde::Deserialize;
 
 use crate::models::{snake_name}::{{New{pascal_name}, {pascal_name}}};
 use crate::models::{snake_name}_session::{{New{pascal_name}Session, {pascal_name}Session}};
+use crate::models::{snake_name}_remember_token::{{
+    New{pascal_name}RememberToken, delete_remember_series, find_remember_token,
+    insert_remember_token, rotate_remember_token,
+}};
 use crate::schema::{sess_table};
+use crate::schema::{rem_table};
 use crate::schema::{table};
 {totp_imports}
 
@@ -1976,6 +2242,254 @@ fn layout(title: &str, content: Markup) -> Markup {{
 
 fn redirect_to(url: &str) -> Response {{
     axum::response::Redirect::to(url).into_response()
+}}
+
+// ── Persistent "remember-me" login (issue #1397) ─────────────────────────────
+//
+// A remember credential is a `(series, token)` pair (the Barry Jaspan rotating
+// scheme). On login-with-remember, `issue_remember_cookie` persists a
+// `{rem_table}` row (storing only the SHA-256 hash of the token) and sets the
+// cookie. On any request WITHOUT a session but WITH a remember cookie,
+// `remember_me` rotates the token, establishes a session, and re-sets the
+// cookie — or, on a replayed rotated-out token, trips theft detection and nukes
+// the chain. See docs/guide/session-management.md.
+//
+// REGISTER THE MIDDLEWARE: `remember_me` runs as a plain Tower layer with no
+// `AppState`, so it reads the pool from a process-wide handle. In `src/main.rs`,
+// hand it the pool at startup and add the layer:
+//
+//     use autumn_web::db::DbState as _;
+//     autumn_web::app()
+//         .routes(routes![/* … */])
+//         .layer(axum::middleware::from_fn(routes::auth::remember_me))
+//         .on_startup(|state| async move {{
+//             if let Some(pool) = state.pool() {{
+//                 routes::auth::init_remember_pool(pool.clone());
+//             }}
+//             Ok(())
+//         }})
+//         .run()
+//         .await;
+
+/// Process-wide handle to the database pool, populated at startup. The remember
+/// middleware runs as a plain Tower layer with no access to `AppState`, so it
+/// checks out its connection here.
+///
+/// `#[allow(dead_code)]`: this and `init_remember_pool`/`remember_me` are live
+/// once you register the middleware in `src/main.rs` (see the module header).
+#[allow(dead_code)]
+static REMEMBER_POOL: std::sync::OnceLock<
+    diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
+> = std::sync::OnceLock::new();
+
+/// Install the shared pool the remember middleware uses. Idempotent — a second
+/// call is ignored. Call this from a startup hook in `src/main.rs`.
+#[allow(dead_code)]
+pub fn init_remember_pool(
+    pool: diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
+) {{
+    let _ = REMEMBER_POOL.set(pool);
+}}
+
+/// The sliding expiry `duration_secs` in the future, as a naive UTC timestamp
+/// (the column type), guarding the `u64 → i64` cast.
+fn remember_expiry(config: &RememberConfig, now: chrono::DateTime<chrono::Utc>) -> chrono::NaiveDateTime {{
+    (now + chrono::Duration::seconds(i64::try_from(config.duration_secs).unwrap_or(2_592_000)))
+        .naive_utc()
+}}
+
+/// Whether to set the `Secure` cookie attribute — mirrors the session cookie by
+/// keying off the forwarded scheme (HTTPS in production behind a TLS proxy).
+fn remember_secure(headers: &axum::http::HeaderMap) -> bool {{
+    headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|proto| proto.eq_ignore_ascii_case("https"))
+}}
+
+/// Read a single cookie value by name out of the request `Cookie` header.
+fn read_cookie(headers: &axum::http::HeaderMap, name: &str) -> Option<String> {{
+    let cookies = headers.get(axum::http::header::COOKIE)?.to_str().ok()?;
+    for pair in cookies.split(';') {{
+        if let Some((k, v)) = pair.trim().split_once('=')
+            && k.trim() == name
+        {{
+            return Some(v.trim().to_owned());
+        }}
+    }}
+    None
+}}
+
+/// Append a `Set-Cookie` header (never replaces an existing one, so the rotated
+/// session cookie and the rotated remember cookie coexist on one response).
+fn append_set_cookie(response: &mut Response, value: &str) {{
+    if let Ok(header_value) = axum::http::HeaderValue::from_str(value) {{
+        response
+            .headers_mut()
+            .append(axum::http::header::SET_COOKIE, header_value);
+    }}
+}}
+
+/// Mint and persist a remember chain for a just-authenticated {snake_name},
+/// returning the `Set-Cookie` header the login handler attaches. Only the hash
+/// of the rotating token is stored.
+pub async fn issue_remember_cookie(
+    db: &mut Db,
+    {snake_name}_id: i64,
+    ip: std::net::IpAddr,
+    headers: &axum::http::HeaderMap,
+) -> AutumnResult<String> {{
+    let config = RememberConfig::default();
+    let cred = generate_remember_credential();
+    let user_agent = headers
+        .get(axum::http::header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .chars()
+        .take(512)
+        .collect::<String>();
+    let parsed = autumn_web::user_agent::parse_user_agent(&user_agent);
+    let row = New{pascal_name}RememberToken {{
+        series: cred.series.clone(),
+        user_id: {snake_name}_id,
+        token_hash: hash_remember_token(&cred.token),
+        expires_at: remember_expiry(&config, chrono::Utc::now()),
+        ip: ip.to_string(),
+        user_agent,
+        ua_family: parsed.family,
+        ua_os: parsed.os,
+        ua_device: parsed.device_class.to_string(),
+    }};
+    insert_remember_token(&mut **db, &row).await?;
+    Ok(build_remember_cookie(
+        &config,
+        &cred.series,
+        &cred.token,
+        remember_secure(headers),
+    ))
+}}
+
+/// Revoke the remember chain identified by the request's remember cookie (used
+/// by logout). No-op when the cookie is absent or malformed.
+async fn revoke_remember_from_cookie(db: &mut Db, headers: &axum::http::HeaderMap) {{
+    let config = RememberConfig::default();
+    if let Some(value) = read_cookie(headers, &config.cookie_name)
+        && let Some((series, _token)) = parse_remember_cookie_value(&value)
+    {{
+        let _ = delete_remember_series(&mut **db, &series).await;
+    }}
+}}
+
+/// Global middleware: upgrade a request that carries a valid remember cookie but
+/// no session into an authenticated one (rotating the token), or trip theft
+/// detection on a replayed rotated-out cookie. Register it in `src/main.rs`
+/// (see the module header above).
+#[allow(dead_code)]
+pub async fn remember_me(
+    session: Session,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {{
+    let config = RememberConfig::default();
+
+    // Already authenticated or remember disabled: the existing session wins.
+    if !config.enabled || session.get("{snake_name}_id").await.is_some() {{
+        return next.run(request).await;
+    }}
+
+    let Some(cookie_value) = read_cookie(request.headers(), &config.cookie_name) else {{
+        return next.run(request).await;
+    }};
+    // A malformed cookie is ignored (proceed unauthenticated) rather than 400.
+    let Some((series, token)) = parse_remember_cookie_value(&cookie_value) else {{
+        return next.run(request).await;
+    }};
+
+    let Some(pool) = REMEMBER_POOL.get() else {{
+        return next.run(request).await;
+    }};
+    let Ok(mut conn) = pool.get().await else {{
+        return next.run(request).await;
+    }};
+
+    let record = match find_remember_token(&mut *conn, &series).await {{
+        Ok(record) => record,
+        // A transient DB error must not authenticate — proceed unauthenticated.
+        Err(_) => return next.run(request).await,
+    }};
+
+    let now = chrono::Utc::now();
+    let secure = remember_secure(request.headers());
+    let evaluated = record.as_ref().map(|r| RememberRecord {{
+        series: r.series.clone(),
+        token_hash: r.token_hash.clone(),
+        expires_at: r.expires_at_utc(),
+    }});
+
+    match evaluate_remember(&token, evaluated.as_ref(), now) {{
+        RememberDecision::Rotate => {{
+            let row = record.expect("Rotate is only returned for a present record");
+
+            // Rotate the token and extend the sliding expiry BEFORE establishing
+            // the session, so the old cookie value can never be replayed.
+            let new_token = generate_token();
+            let new_hash = hash_remember_token(&new_token);
+            let new_expiry = remember_expiry(&config, now);
+            if rotate_remember_token(&mut *conn, &series, &new_hash, new_expiry, now.naive_utc())
+                .await
+                .is_err()
+            {{
+                return next.run(request).await;
+            }}
+            drop(conn);
+
+            // Establish a real session for the chain's owner — the same shape the
+            // login handler writes, so `require_tracked_session` accepts it.
+            session.rotate_id().await;
+            session.insert("{snake_name}_id", row.user_id.to_string()).await;
+            autumn_web::step_up::set_last_strong_auth_at(&session).await;
+
+            // Track the rotated-in login as an active session so it shows in the
+            // device list and can be revoked (issue #819 + #1397).
+            {{
+                let ip = request
+                    .extensions()
+                    .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+                    .map(|c| c.0.ip())
+                    .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+                if let Ok(mut db) = pool.get().await {{
+                    let session_row =
+                        build_session_row(&session, row.user_id, ip, request.headers()).await;
+                    let _ = diesel::insert_into({sess_table}::table)
+                        .values(&session_row)
+                        .execute(&mut *db)
+                        .await;
+                }}
+            }}
+
+            let mut response = next.run(request).await;
+            append_set_cookie(
+                &mut response,
+                &build_remember_cookie(&config, &series, &new_token, secure),
+            );
+            response
+        }}
+        RememberDecision::Theft => {{
+            // Replayed, rotated-out token for a known series → an attacker holds a
+            // stale cookie. Nuke the whole chain and stay unauthenticated.
+            let _ = delete_remember_series(&mut *conn, &series).await;
+            drop(conn);
+            let mut response = next.run(request).await;
+            append_set_cookie(&mut response, &build_remember_clear_cookie(&config));
+            response
+        }}
+        RememberDecision::Reject => {{
+            drop(conn);
+            let mut response = next.run(request).await;
+            append_set_cookie(&mut response, &build_remember_clear_cookie(&config));
+            response
+        }}
+    }}
 }}
 
 // ── Active session tracking (issue #819) ─────────────────────────────────────
@@ -2309,6 +2823,10 @@ pub async fn sessions_revoke_others(
     {snake_name}
         .revoke_other_sessions(&mut *db, &current_digest)
         .await?;
+    // Also revoke every persistent remember-me chain for this account (issue
+    // #1397): a "sign out everywhere" that left a live remember cookie behind
+    // would let a signed-out device silently auto-login again.
+    {snake_name}.revoke_all_remember_tokens(&mut *db).await?;
     sessions_after_mutation(&session, &mut db, &state, hx, csrf, csrf_field).await
 }}
 
@@ -2537,6 +3055,10 @@ pub async fn login_form(flash: Flash, csrf: Option<CsrfToken>, csrf_field: Optio
                 input type="password" name="password" required
                       autocomplete="current-password";
             }}
+            label {{
+                input type="checkbox" name="remember" value="on";
+                " Remember me on this device"
+            }}
             button type="submit" {{ "Log In" }}
         }}
         {oauth_buttons}
@@ -2550,6 +3072,10 @@ pub async fn login_form(flash: Flash, csrf: Option<CsrfToken>, csrf_field: Optio
 pub struct LoginForm {{
     pub email: String,
     pub password: String,
+    /// Present (`Some("on")`) when the "Remember me" checkbox is ticked; an
+    /// unchecked box posts nothing, so this stays `None` (issue #1397).
+    #[serde(default)]
+    pub remember: Option<String>,
 }}
 
 /// Extracts the client IP from `ConnectInfo` when present, or falls back to
@@ -2788,7 +3314,17 @@ pub async fn login(
     // Track this login as an active session (device list + revocation).
     record_login_session(&mut db, &session, {snake_name}.id, addr_ip, &headers).await?;
     flash.success("Logged in.").await;
-    Ok(redirect_to("/account"))
+
+    let mut response = redirect_to("/account");
+    // Persistent "remember-me" opt-in (issue #1397): when the box is ticked and
+    // policy allows it, mint a rotating remember chain and attach its cookie
+    // alongside the session cookie. Unticked → behaviour is unchanged.
+    if form.remember.is_some() && state.config().auth.remember.enabled {{
+        let cookie =
+            issue_remember_cookie(&mut db, {snake_name}.id, addr_ip, &headers).await?;
+        append_set_cookie(&mut response, &cookie);
+    }}
+    Ok(response)
 }}
 
 // ── Logout ────────────────────────────────────────────────────────────────────
@@ -2799,9 +3335,17 @@ pub async fn login(
 /// cannot be replayed after logout. The tracked `{sess_table}` row is removed
 /// too so the device disappears from the active-sessions list.
 #[post("/logout")]
-pub async fn logout(session: Session, mut db: Db, flash: Flash) -> AutumnResult<Response> {{
+pub async fn logout(
+    session: Session,
+    mut db: Db,
+    headers: axum::http::HeaderMap,
+    flash: Flash,
+) -> AutumnResult<Response> {{
     // Best-effort: the device must sign out even if the row delete hiccups.
     let _ = untrack_current_session(&mut db, &session).await;
+    // Revoke this device's remember chain (issue #1397) so a stolen remember
+    // cookie cannot re-establish a login after logout. No-op when absent.
+    revoke_remember_from_cookie(&mut db, &headers).await;
     // Invalidate the session: clear all data (drops the auth keys) and rotate
     // the id so the pre-logout cookie can no longer be replayed — the old id is
     // destroyed in the session store on save. This is equivalent to `destroy()`
@@ -2810,7 +3354,9 @@ pub async fn logout(session: Session, mut db: Db, flash: Flash) -> AutumnResult<
     session.clear().await;
     session.rotate_id().await;
     flash.info("You have been logged out.").await;
-    Ok(redirect_to("/login"))
+    let mut response = redirect_to("/login");
+    append_set_cookie(&mut response, &build_remember_clear_cookie(&RememberConfig::default()));
+    Ok(response)
 }}
 
 // ── Operator unlock ───────────────────────────────────────────────────────────
@@ -3456,6 +4002,15 @@ pub async fn reset_password(
                 .execute(conn)
                 .await?;
             }}
+            // Persistent remember-me chains are ALWAYS revoked on a credential
+            // change (issue #1397): the old password is compromised, so a
+            // replayed remember cookie must not re-establish a session — it will
+            // find no row and be rejected.
+            diesel::delete(
+                {rem_table}::table.filter({rem_table}::user_id.eq({snake_name}_id)),
+            )
+            .execute(conn)
+            .await?;
             diesel::insert_into({sess_table}::table)
                 .values(&new_session_row)
                 .execute(conn)

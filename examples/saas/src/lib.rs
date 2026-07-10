@@ -6,6 +6,7 @@
 //! integration tests in `tests/` can drive the real routes.
 
 pub mod models;
+pub mod remember;
 pub mod repositories;
 pub mod routes;
 pub mod schema;

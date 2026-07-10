@@ -11,6 +11,7 @@
 
 use autumn_web::config::AutumnConfig;
 use autumn_web::prelude::*;
+use autumn_web::reexports::axum::middleware::from_fn;
 use autumn_web::test::{TestApp, TestClient, TestDb};
 
 use saas::routes;
@@ -136,7 +137,26 @@ async fn db_client() -> TestClient {
         )",
     )
     .await;
-    db.execute_sql("TRUNCATE users, projects RESTART IDENTITY")
+    // Persistent "remember-me" chains (issue #1397).
+    db.execute_sql(
+        "CREATE TABLE IF NOT EXISTS remember_tokens (
+            series       TEXT        PRIMARY KEY,
+            user_id      BIGINT      NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+            tenant_id    TEXT        NOT NULL,
+            token_hash   TEXT        NOT NULL,
+            expires_at   TIMESTAMPTZ NOT NULL,
+            ip           TEXT        NOT NULL DEFAULT '',
+            user_agent   TEXT        NOT NULL DEFAULT '',
+            ua_family    TEXT        NOT NULL DEFAULT '',
+            ua_os        TEXT        NOT NULL DEFAULT '',
+            ua_device    TEXT        NOT NULL DEFAULT '',
+            label        TEXT,
+            created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            last_used_at TIMESTAMPTZ
+        )",
+    )
+    .await;
+    db.execute_sql("TRUNCATE users, projects, remember_tokens RESTART IDENTITY")
         .await;
 
     // The forms post normally; disable CSRF so the test does not have to scrape
@@ -146,10 +166,16 @@ async fn db_client() -> TestClient {
     // Drive tenancy through the middleware exactly as `autumn.toml` does.
     enable_tenancy(&mut config);
 
+    // Hand the remember middleware the shared pool, exactly as `main`'s startup
+    // hook does, and register the middleware layer so a remember cookie rotates
+    // into a session before the tenancy gate.
+    saas::remember::init_remember_pool(db.pool());
+
     TestApp::new()
         .routes(app_routes())
         .config(config)
         .with_db(db.pool())
+        .layer(from_fn(saas::remember::remember_me_middleware))
         .build()
 }
 
@@ -163,6 +189,22 @@ fn session_cookie(resp: &autumn_web::test::TestResponse) -> String {
         .next()
         .expect("cookie has a name=value pair")
         .to_owned()
+}
+
+/// Return the `name=value` value half of a named cookie from any of the
+/// response's `Set-Cookie` headers (a login with remember-me sets two).
+fn named_cookie(resp: &autumn_web::test::TestResponse, name: &str) -> Option<String> {
+    for (key, value) in &resp.headers {
+        if key.eq_ignore_ascii_case("set-cookie") {
+            let pair = value.split(';').next().unwrap_or("");
+            if let Some((cookie_name, cookie_value)) = pair.split_once('=')
+                && cookie_name.trim() == name
+            {
+                return Some(cookie_value.trim().to_owned());
+            }
+        }
+    }
+    None
 }
 
 /// Sign up a user and return their session cookie.
@@ -278,4 +320,79 @@ async fn tenants_are_isolated() {
         !globex_view.text().contains("Alpha"),
         "tenant isolation breached: Globex can see Acme's project"
     );
+}
+
+/// AC8 (issue #1397): the whole persistent remember-me lifecycle —
+///   1. `POST /login` with `remember=on` sets BOTH a session cookie and a
+///      remember cookie;
+///   2. after a browser restart (session cookie dropped, remember cookie kept),
+///      a protected route authenticates via the remember chain and ROTATES the
+///      remember cookie to a fresh value;
+///   3. replaying the ORIGINAL (rotated-out) cookie is detected as theft — the
+///      request is unauthorized and the whole chain is revoked, so even the
+///      rotated cookie no longer authenticates.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn remember_me_rotates_across_restart_and_detects_theft() {
+    let client = db_client().await;
+
+    // Seed a confirmed account. `signup` logs the browser in; drop that session
+    // so the next login is a clean "remember me" opt-in.
+    signup(&client, "remember@acme.test").await;
+    client.log_out();
+
+    // 1. Log in WITH the remember box ticked.
+    let login = client
+        .post("/login")
+        .form("email=remember@acme.test&password=Tr0ubad0ur-Xy7-correct-horse&remember=on")
+        .send()
+        .await;
+    login.assert_status(303);
+    let original_remember = named_cookie(&login, "autumn.remember")
+        .expect("login with remember=on must set a remember cookie");
+    assert!(
+        named_cookie(&login, "autumn.sid").is_some(),
+        "login must also set a session cookie"
+    );
+
+    // Sanity: the freshly-authenticated jar reaches the dashboard.
+    client
+        .get("/dashboard")
+        .send()
+        .await
+        .assert_ok()
+        .assert_body_contains("Projects");
+
+    // 2. Browser restart: the session cookie (no Max-Age) is cleared but the
+    //    persistent remember cookie survives. A protected route must now
+    //    authenticate via the remember chain and rotate the cookie.
+    client.log_out(); // clears only the session cookie
+    let restart = client.get("/dashboard").send().await;
+    restart.assert_ok();
+    let rotated_remember = named_cookie(&restart, "autumn.remember")
+        .expect("a rotated request must set a fresh remember cookie");
+    assert_ne!(
+        rotated_remember, original_remember,
+        "the remember cookie must rotate on use"
+    );
+
+    // 3. Theft: replay the ORIGINAL (now rotated-out) remember cookie with no
+    //    session cookie (an explicit `cookie` header bypasses the jar). It is a
+    //    known series with a stale token → theft: unauthorized, chain nuked.
+    let theft = client
+        .get("/dashboard")
+        .header("accept", "application/json")
+        .header("cookie", &format!("autumn.remember={original_remember}"))
+        .send()
+        .await;
+    theft.assert_status(401);
+
+    // The chain was revoked, so even the *rotated* cookie no longer authenticates.
+    let after_theft = client
+        .get("/dashboard")
+        .header("accept", "application/json")
+        .header("cookie", &format!("autumn.remember={rotated_remember}"))
+        .send()
+        .await;
+    after_theft.assert_status(401);
 }
