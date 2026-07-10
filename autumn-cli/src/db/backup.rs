@@ -347,11 +347,23 @@ fn pg_command(program: &Path, url: &str) -> (Command, String) {
 /// URL that can't be parsed (or has no password) the URL is returned unchanged
 /// with `None`, so behavior degrades to the previous "URL on the command line"
 /// path rather than failing.
+///
+/// The returned password is **percent-decoded**: `Url::password()` yields the
+/// raw (still percent-encoded) userinfo, but `PGPASSWORD` is consumed by libpq
+/// as a literal string — it is *not* percent-decoded. A URL like
+/// `postgres://u:p%40ss@h/db` must set `PGPASSWORD=p@ss`, not `p%40ss`, or
+/// authentication fails. The username is intentionally left untouched: it stays
+/// in the password-free `--dbname` URL, where libpq decodes it as part of URI
+/// parsing, so double-decoding it (or moving it to an env var) would be wrong.
 fn split_password(url: &str) -> (String, Option<String>) {
     url::Url::parse(url).map_or_else(
         |_| (url.to_owned(), None),
         |mut parsed| {
-            let password = parsed.password().map(str::to_owned);
+            let password = parsed.password().map(|pw| {
+                percent_encoding::percent_decode_str(pw)
+                    .decode_utf8_lossy()
+                    .into_owned()
+            });
             if password.is_some() {
                 // Clearing the password keeps the username, host, port, db, and
                 // any query parameters intact.
@@ -362,6 +374,42 @@ fn split_password(url: &str) -> (String, Option<String>) {
     )
 }
 
+/// Build the `pg_dump` argument vector for one target. Pure over its inputs so
+/// the flag composition (notably the format-conditional `--clean --if-exists`)
+/// is unit-testable without spawning `pg_dump`.
+///
+/// `--no-owner`/`--no-privileges` keep the artifact portable across roles so a
+/// restore into a freshly-created database works without recreating the
+/// original owner/grants.
+///
+/// For the **plain** format we additionally emit `--clean --if-exists`, so the
+/// SQL text carries `DROP ... IF EXISTS` before each `CREATE`. A plain restore
+/// just pipes the dump through `psql` under `ON_ERROR_STOP=1`; without the drops
+/// it aborts with `... already exists` when restoring over a database that still
+/// holds the schema (a post-data-loss or prod-overwrite drill). Baking the drops
+/// into the dump makes the restore idempotent and safe on both empty and
+/// populated databases. The **custom** format deliberately omits `--clean`:
+/// `pg_restore --clean --if-exists` performs the drops at restore time instead.
+fn pg_dump_args(format: BackupFormat, out_path: &Path, dbname: &str) -> Vec<std::ffi::OsString> {
+    use std::ffi::OsString;
+
+    let mut args: Vec<OsString> = vec![
+        "--format".into(),
+        format.pg_dump_format_flag().into(),
+        "--no-owner".into(),
+        "--no-privileges".into(),
+    ];
+    if matches!(format, BackupFormat::Plain) {
+        args.push("--clean".into());
+        args.push("--if-exists".into());
+    }
+    args.push("--file".into());
+    args.push(out_path.as_os_str().to_owned());
+    args.push("--dbname".into());
+    args.push(dbname.into());
+    args
+}
+
 /// Shell out to `pg_dump` for one target.
 fn run_pg_dump(
     pg_dump: &Path,
@@ -370,19 +418,9 @@ fn run_pg_dump(
     format: BackupFormat,
     db: &str,
 ) -> Result<(), BackupError> {
-    // `--no-owner`/`--no-privileges` keep the artifact portable across roles so
-    // a restore into a freshly-created database works without recreating the
-    // original owner/grants.
     let (mut cmd, safe_url) = pg_command(pg_dump, url);
     let status = cmd
-        .arg("--format")
-        .arg(format.pg_dump_format_flag())
-        .arg("--no-owner")
-        .arg("--no-privileges")
-        .arg("--file")
-        .arg(out_path)
-        .arg("--dbname")
-        .arg(&safe_url)
+        .args(pg_dump_args(format, out_path, &safe_url))
         .status()
         .map_err(|e| match e.kind() {
             std::io::ErrorKind::NotFound => BackupError::ToolMissing {
@@ -715,6 +753,29 @@ fn dotenv_env() -> autumn_web::dotenv::DotenvOsEnv {
     }
 }
 
+/// The managed-Postgres published cluster URL, used as a *fallback* control URL
+/// for bundled/daemon/single-binary apps (issue #1595). Such deployments often
+/// have no `DATABASE_URL` in env or `autumn.toml`; the running cluster instead
+/// publishes its URL for one-off CLI commands. This reuses the SAME blessed
+/// helper `autumn task`/`autumn build` use to attach to the serve daemon's
+/// cluster ([`crate::serve::managed_pg_env`]), which only yields a URL when a
+/// live, reachable cluster is published — so a backup can't attach to a dead or
+/// foreign endpoint. `None` when no managed cluster is available.
+fn managed_pg_fallback_url() -> Option<String> {
+    crate::serve::managed_pg_env(None).and_then(|env| env.attach_url)
+}
+
+/// Apply the managed-pg published URL as a fallback for the control URL. Pure
+/// over its inputs (the fallback is a closure, evaluated lazily) so the
+/// precedence — explicit config/env first, managed-pg published URL second — is
+/// unit-testable without a live cluster.
+fn resolve_control_url<Ff>(resolved: Option<String>, fallback: Ff) -> Option<String>
+where
+    Ff: FnOnce() -> Option<String>,
+{
+    resolved.or_else(fallback)
+}
+
 /// Resolve the databases a backup run should capture, reusing the SAME
 /// resolution `autumn migrate` uses so the set matches the running app exactly.
 fn resolve_targets(
@@ -729,8 +790,12 @@ fn resolve_targets(
     let table =
         migrate::read_autumn_toml_table_with_profile(Some(&migrate::effective_profile(profile)));
     let env = dotenv_env();
-    let control =
-        migrate::resolve_primary_database_url_from_sources(|k| env.var(k), table.as_ref());
+    // Explicit config/env wins; fall back to the managed-pg published URL for
+    // bundled/daemon apps that don't export a DATABASE_URL (issue #1595).
+    let control = resolve_control_url(
+        migrate::resolve_primary_database_url_from_sources(|k| env.var(k), table.as_ref()),
+        managed_pg_fallback_url,
+    );
     let shards = migrate::resolve_shard_database_urls_from_sources(|k| env.var(k), table.as_ref());
     build_targets(control, shards, selector)
 }
@@ -797,8 +862,13 @@ fn resolve_targets_for_restore(
     let table =
         migrate::read_autumn_toml_table_with_profile(Some(&migrate::effective_profile(profile)));
     let env = dotenv_env();
-    let control =
-        migrate::resolve_primary_database_url_from_sources(|k| env.var(k), table.as_ref());
+    // Same precedence as `resolve_targets`: explicit config/env first, then the
+    // managed-pg published URL so a restore into a bundled/daemon app resolves a
+    // live control URL without a manually exported DATABASE_URL (issue #1595).
+    let control = resolve_control_url(
+        migrate::resolve_primary_database_url_from_sources(|k| env.var(k), table.as_ref()),
+        managed_pg_fallback_url,
+    );
     let shards = migrate::resolve_shard_database_urls_from_sources(|k| env.var(k), table.as_ref());
 
     let mut out = Vec::with_capacity(entries.len());
@@ -1447,6 +1517,77 @@ mod tests {
     }
 
     #[test]
+    fn pg_dump_args_bake_clean_into_plain_only() {
+        let to_str = |args: &[std::ffi::OsString]| -> Vec<String> {
+            args.iter()
+                .map(|s| s.to_string_lossy().into_owned())
+                .collect()
+        };
+
+        // Plain dumps carry `--clean --if-exists` so the SQL includes
+        // `DROP ... IF EXISTS` and a `psql` restore is idempotent on a populated DB.
+        let plain = pg_dump_args(
+            BackupFormat::Plain,
+            Path::new("/backups/dev/run/control.sql"),
+            "postgres://user@db.example.com/my_app",
+        );
+        let plain = to_str(&plain);
+        assert!(plain.contains(&"--clean".to_owned()));
+        assert!(plain.contains(&"--if-exists".to_owned()));
+        assert!(
+            plain
+                .windows(2)
+                .any(|w| w[0] == "--format" && w[1] == "plain")
+        );
+        // The dbname URL and file are still passed.
+        assert!(
+            plain
+                .windows(2)
+                .any(|w| w[0] == "--dbname" && w[1] == "postgres://user@db.example.com/my_app")
+        );
+
+        // Custom dumps deliberately DON'T clean at dump time — `pg_restore
+        // --clean --if-exists` handles that at restore time.
+        let custom = pg_dump_args(
+            BackupFormat::Custom,
+            Path::new("/backups/dev/run/control.dump"),
+            "postgres://user@db.example.com/my_app",
+        );
+        let custom = to_str(&custom);
+        assert!(!custom.contains(&"--clean".to_owned()));
+        assert!(!custom.contains(&"--if-exists".to_owned()));
+        assert!(
+            custom
+                .windows(2)
+                .any(|w| w[0] == "--format" && w[1] == "custom")
+        );
+    }
+
+    #[test]
+    fn resolve_control_url_prefers_config_over_managed_pg_fallback() {
+        // When config/env resolves a URL, the managed-pg fallback must NOT be
+        // consulted (precedence + lazy evaluation).
+        let mut fallback_called = false;
+        let got = resolve_control_url(Some("postgres://cfg/db".to_owned()), || {
+            fallback_called = true;
+            Some("postgres://managed/db".to_owned())
+        });
+        assert_eq!(got.as_deref(), Some("postgres://cfg/db"));
+        assert!(
+            !fallback_called,
+            "managed-pg fallback must not run when config/env resolves a URL"
+        );
+
+        // When config/env yields nothing, the managed-pg published URL fills in.
+        let got = resolve_control_url(None, || Some("postgres://managed/db".to_owned()));
+        assert_eq!(got.as_deref(), Some("postgres://managed/db"));
+
+        // Neither source available => still None (surfaces as NoUrl upstream).
+        let got = resolve_control_url(None, || None);
+        assert_eq!(got, None);
+    }
+
+    #[test]
     fn infer_format_from_extension() {
         assert_eq!(
             infer_format_from_path(Path::new("control.dump")),
@@ -1476,6 +1617,29 @@ mod tests {
         assert!(!safe.contains("hunter2"));
         assert!(safe.contains("user@db.example.com"));
         assert!(safe.contains("/my_app"));
+    }
+
+    #[test]
+    fn split_password_percent_decodes_for_pgpassword() {
+        // Raw password contains `@`, `:`, `/`, and a space — all of which MUST be
+        // percent-encoded in the URL userinfo. libpq consumes PGPASSWORD as a
+        // literal (no percent-decoding), so `split_password` must hand back the
+        // DECODED bytes or authentication fails.
+        let raw = "p@ss:w/ord x";
+        let encoded = "p%40ss%3Aw%2Ford%20x";
+        let url = format!("postgres://user:{encoded}@db.example.com:6543/my_app");
+
+        let (safe, pw) = split_password(&url);
+        assert_eq!(pw.as_deref(), Some(raw));
+
+        // The password (encoded or decoded) never remains in the argv URL.
+        assert!(!safe.contains(encoded));
+        assert!(!safe.contains(raw));
+        // The username is preserved (libpq decodes it from the URI itself).
+        assert!(safe.contains("user@db.example.com"));
+        assert!(safe.contains("/my_app"));
+        // The password-free URL is still a VALID URL for `--dbname`.
+        assert!(url::Url::parse(&safe).is_ok());
     }
 
     #[test]
