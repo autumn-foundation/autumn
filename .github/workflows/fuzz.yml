@@ -51,7 +51,10 @@ jobs:
       - name: Fuzz ${{ matrix.target }} (30s burst, seeded from committed corpus)
         # Corpus dir defaults to fuzz/corpus/${{ matrix.target }}; -max_total_time
         # caps the run and -timeout flags any single input that hangs past 10s.
-        run: cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=30 -timeout=10
+        # Force the gnu host target: cargo-fuzz is installed as a musl-static binary
+        # (via install-action's cargo-binstall fallback) and would otherwise default to
+        # x86_64-unknown-linux-musl, where the ASAN build fails (sanitizer vs static libc).
+        run: cargo +nightly fuzz run ${{ matrix.target }} --target x86_64-unknown-linux-gnu -- -max_total_time=30 -timeout=10
       - name: Upload crash reproducers
         if: failure()
         uses: actions/upload-artifact@v7
