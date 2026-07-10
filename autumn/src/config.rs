@@ -1280,7 +1280,7 @@ const fn default_inspector_capacity() -> usize {
 }
 
 const fn default_inspector_n_plus_one_threshold() -> usize {
-    5
+    crate::inspector::DEFAULT_N_PLUS_ONE_THRESHOLD
 }
 
 /// Top-level `[http]` configuration section.

@@ -97,17 +97,91 @@ tokio::task_local! {
     pub(crate) static REQUEST_DB_TIMINGS: Arc<RequestDbTimings>;
 }
 
+tokio::task_local! {
+    /// Task-local sink for request-wide SQL query capture, independent of the
+    /// `Server-Timing` timing accumulator ([`REQUEST_DB_TIMINGS`]).
+    ///
+    /// Scoped by the test harness (`RequestBuilder::send`) around the whole
+    /// request so every instrumented statement is retained as a
+    /// [`crate::inspector::QueryRecord`] for `TestResponse` query-count / N+1
+    /// assertions. Kept as a separate task-local lane — not folded into
+    /// `RequestDbTimings` — so query capture is unaffected by how the
+    /// `Server-Timing` middleware scopes (and nests) its per-scope timing
+    /// accumulators. Absent in production, where the capture lane is never
+    /// scoped and nothing is retained.
+    #[cfg(feature = "db")]
+    pub(crate) static REQUEST_QUERY_CAPTURE: Arc<Mutex<Vec<crate::inspector::QueryRecord>>>;
+}
+
+/// Strip the trailing `-- binds: [...]` annotation that diesel's `DebugQuery`
+/// `Display` appends to a query's SQL text.
+///
+/// diesel-async feeds each real query into the `StartQuery` instrumentation
+/// event as a `DebugQuery` (see `diesel::debug_query` /
+/// `AsyncPgConnection::with_prepared_statement`), whose `Display` renders
+/// `"{sql} -- binds: {binds:?}"` — the format lives in
+/// `diesel::query_builder::debug_query::display`
+/// (`write!(f, "{query} -- binds: {debug_binds:?}")`). So the SQL text we
+/// materialise from `query.to_string()` is e.g.
+/// `SELECT * FROM books WHERE author_id = $1 -- binds: [1]`.
+///
+/// The per-row executions of an N+1 pattern share the same parameterised
+/// statement (`… WHERE author_id = $1`) and differ only in their bind values
+/// (`-- binds: [1]`, `-- binds: [2]`, …). If the capture path retained that
+/// annotation, [`crate::inspector::normalize_sql`] (which only collapses
+/// whitespace and lower-cases) would treat each per-row execution as a distinct
+/// template, so [`crate::inspector::detect_n_plus_one`] would never see the
+/// repetition and `assert_no_n_plus_one()` would miss the N+1 it exists to
+/// catch. Truncating at the `-- binds` marker leaves the parameterised
+/// statement — `$N` placeholders intact — so repeated per-row queries collapse
+/// to one template.
+///
+/// Robust to input without the marker (transaction-control SQL diesel runs via
+/// `batch_execute`, or synthetic test input): returns the input unchanged. Uses
+/// the last occurrence, since diesel always appends the annotation after the
+/// full statement.
+#[cfg(feature = "db")]
+fn strip_bind_annotation(sql: &str) -> &str {
+    sql.rfind("-- binds:")
+        .map_or(sql, |idx| sql[..idx].trim_end())
+}
+
 /// Record one instrumented DB query into the current request's
 /// [`REQUEST_DB_TIMINGS`], if any. No-op when the task-local is unset —
 /// which is the case whenever the `Server-Timing` middleware is disabled
 /// or the query runs outside a request (e.g. background job).
-pub(crate) fn record_request_db_query(elapsed: Duration) {
+pub(crate) fn record_request_db_query(elapsed: Duration, sql: Option<&str>) {
+    // Lane 1: the `Server-Timing` timing accumulator (count + cumulative time).
     let _ = REQUEST_DB_TIMINGS.try_with(|t| {
         let micros = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX);
         t.total_us.fetch_add(micros, Ordering::Relaxed);
         t.query_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     });
+
+    // Lane 2: request-wide SQL capture, independent of the timing lane. Only
+    // active when a test scoped `REQUEST_QUERY_CAPTURE`; a no-op otherwise
+    // (production, background jobs). The two `try_with` calls are independent —
+    // either lane may be active without the other — and no lock is held across
+    // an await.
+    #[cfg(feature = "db")]
+    if let Some(sql) = sql {
+        let _ = REQUEST_QUERY_CAPTURE.try_with(|sink| {
+            if let Ok(mut list) = sink.lock() {
+                list.push(crate::inspector::QueryRecord {
+                    // Store the parameterised statement WITHOUT diesel's per-row
+                    // `-- binds: [...]` annotation (the `$N` placeholders stay), so
+                    // repeated per-row queries normalise to the same template and
+                    // `detect_n_plus_one` can see the repetition. See
+                    // [`strip_bind_annotation`].
+                    sql: strip_bind_annotation(sql).to_owned(),
+                    params: Vec::new(),
+                    elapsed_ms: u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+                    location: String::new(),
+                });
+            }
+        });
+    }
 }
 
 /// Whether the current task is inside a [`REQUEST_DB_TIMINGS`] scope — i.e.
@@ -123,6 +197,20 @@ pub(crate) fn record_request_db_query(elapsed: Duration) {
 #[cfg(feature = "db")]
 pub(crate) fn request_db_timing_active() -> bool {
     REQUEST_DB_TIMINGS.try_with(|_| ()).is_ok()
+}
+
+/// Whether the current task is inside a [`REQUEST_QUERY_CAPTURE`] scope — i.e.
+/// whether the test harness (`RequestBuilder::send`) has scoped a capture sink
+/// around this request.
+///
+/// Mirrors [`request_db_timing_active`]: a cheap task-local probe that neither
+/// clones the `Arc` nor allocates. [`Db::checkout`] installs the
+/// [`RequestQueryTimer`] instrumentation when EITHER this lane or the timing
+/// lane is active, so query capture works even when `server_timing` is off (the
+/// common test case) and no `REQUEST_DB_TIMINGS` scope exists.
+#[cfg(feature = "db")]
+pub(crate) fn request_query_capture_active() -> bool {
+    REQUEST_QUERY_CAPTURE.try_with(|_| ()).is_ok()
 }
 
 /// diesel-async [`Instrumentation`](diesel::connection::Instrumentation)
@@ -183,8 +271,20 @@ pub(crate) fn request_db_timing_active() -> bool {
 #[cfg(feature = "db")]
 #[derive(Default, Debug)]
 pub(crate) struct RequestQueryTimer {
-    /// Start instant of the currently in-flight statement, if any.
-    started_at: Option<std::time::Instant>,
+    /// The currently in-flight statement (start instant + SQL text), if any.
+    pending: Option<PendingQuery>,
+}
+
+/// A statement whose `StartQuery` has fired but whose `FinishQuery` has not.
+///
+/// Holds the start instant (for latency) and the materialised SQL text (so a
+/// capturing accumulator can retain it). Queries on a single connection are
+/// strictly sequential, so a single slot suffices.
+#[cfg(feature = "db")]
+#[derive(Debug)]
+struct PendingQuery {
+    started_at: std::time::Instant,
+    sql: String,
 }
 
 #[cfg(feature = "db")]
@@ -221,15 +321,16 @@ impl RequestQueryTimer {
 
     /// Record the start of a statement.
     ///
-    /// Probes [`request_db_timing_active`] first: when no `REQUEST_DB_TIMINGS`
-    /// scope is active (the opted-out / off-request path) the timer does
-    /// nothing and — crucially — never invokes `sql`, so the caller's
-    /// `DebugQuery` `to_string()` allocation is skipped entirely. This is what
-    /// makes it safe to leave a `RequestQueryTimer` installed on a pooled
-    /// connection that a later opted-out request reuses: the stale timer is a
-    /// cheap bool-probe no-op, not a per-query allocator.
+    /// Probes both [`request_db_timing_active`] and
+    /// [`request_query_capture_active`] first: when NEITHER the timing
+    /// accumulator nor the capture sink is scoped (the opted-out / off-request
+    /// path) the timer does nothing and — crucially — never invokes `sql`, so
+    /// the caller's `DebugQuery` `to_string()` allocation is skipped entirely.
+    /// This is what makes it safe to leave a `RequestQueryTimer` installed on a
+    /// pooled connection that a later opted-out request reuses: the stale timer
+    /// is a cheap bool-probe no-op, not a per-query allocator.
     ///
-    /// When a scope *is* active, the SQL text is materialised and inspected:
+    /// When either lane *is* active, the SQL text is materialised and inspected:
     /// housekeeping / transaction-control statements (see
     /// [`Self::is_uncounted_statement`], e.g. the checkout `SET
     /// statement_timeout`) leave the slot empty so they are excluded from the
@@ -241,14 +342,27 @@ impl RequestQueryTimer {
     /// the start/finish accounting is unit-testable without constructing a
     /// (non-exhaustive, unstable-to-build) `InstrumentationEvent`.
     fn on_start(&mut self, now: std::time::Instant, sql: impl FnOnce() -> String) {
-        if !request_db_timing_active() {
-            self.started_at = None;
+        // Probe BOTH lanes: the timing accumulator (`server_timing`) and the
+        // query-capture sink (test harness). Either being active means the
+        // upcoming statement must be observed. When neither is scoped (the
+        // opted-out / off-request path) the timer does nothing and never
+        // invokes `sql`, so the caller's `DebugQuery` `to_string()` allocation
+        // is skipped — keeping a stale installed timer a cheap bool-probe no-op.
+        if !request_db_timing_active() && !request_query_capture_active() {
+            self.pending = None;
             return;
         }
-        self.started_at = if Self::is_uncounted_statement(&sql()) {
+        // Materialise the SQL once: it is needed both for the housekeeping
+        // filter and (when a test opted into capture) to retain the statement
+        // text at `on_finish`.
+        let sql = sql();
+        self.pending = if Self::is_uncounted_statement(&sql) {
             None
         } else {
-            Some(now)
+            Some(PendingQuery {
+                started_at: now,
+                sql,
+            })
         };
     }
 
@@ -256,8 +370,8 @@ impl RequestQueryTimer {
     /// elapsed time into the per-request accumulator. A `FinishQuery` without
     /// a matching `StartQuery` is ignored.
     fn on_finish(&mut self, now: std::time::Instant) {
-        if let Some(start) = self.started_at.take() {
-            record_request_db_query(now.saturating_duration_since(start));
+        if let Some(p) = self.pending.take() {
+            record_request_db_query(now.saturating_duration_since(p.started_at), Some(&p.sql));
         }
     }
 }
@@ -1922,11 +2036,13 @@ impl Db {
                 .min(PG_TIMEOUT_MAX_MS)
         });
 
-        // Install a fresh per-request query timer, but ONLY when a
-        // `REQUEST_DB_TIMINGS` scope is active — i.e. only for requests the
-        // `ServerTimingLayer` (enabled by `[observability] server_timing`) is
-        // measuring. Installed BEFORE the `SET statement_timeout` housekeeping
-        // statement below.
+        // Install a fresh per-request query timer, but ONLY when a query
+        // observer is active — EITHER a `REQUEST_DB_TIMINGS` scope (the
+        // `ServerTimingLayer`, enabled by `[observability] server_timing`) OR a
+        // `REQUEST_QUERY_CAPTURE` scope (the test harness capturing the SQL
+        // list, which runs with `server_timing` off). The timer feeds both
+        // lanes via `record_request_db_query`. Installed BEFORE the `SET
+        // statement_timeout` housekeeping statement below.
         //
         // `set_instrumentation` WHOLESALE REPLACES the connection's
         // instrumentation, so it must not run unconditionally: an application
@@ -1934,12 +2050,12 @@ impl Db {
         // `diesel::connection::set_default_instrumentation` (query logging,
         // tracing, metrics) would have it silently clobbered on the first
         // checkout and never restored — even when `server_timing` is disabled.
-        // Gating on `request_db_timing_active()` preserves the app's
-        // instrumentation whenever `server_timing` is off (the scope is never
-        // entered, so we never install), and only overwrites it for the
-        // duration the feature is measuring.
+        // Gating on `request_db_timing_active() || request_query_capture_active()`
+        // preserves the app's instrumentation whenever neither lane is scoped
+        // (no `server_timing`, no test capture — the production default), and
+        // only overwrites it for the duration a query observer is active.
         //
-        // Installing a *fresh* timer on every measured checkout also clears any
+        // Installing a *fresh* timer on every observed checkout also clears any
         // stale `RequestQueryTimer` a pooled connection carried from a prior
         // request (diesel-async's deadpool manager never resets instrumentation
         // on recycle), so a stale timer can never record the upcoming
@@ -1948,12 +2064,12 @@ impl Db {
         // `is_uncounted_statement` classifies as housekeeping) keeps that
         // statement out of the `Server-Timing` `db` count regardless. Any stale
         // timer left on a connection later reused by an opted-out request is a
-        // cheap no-op: `on_start` probes `request_db_timing_active()` before
-        // formatting or recording anything, so it never allocates off-scope.
+        // cheap no-op: `on_start` probes both lanes before formatting or
+        // recording anything, so it never allocates off-scope.
         #[cfg(feature = "db")]
         {
             use diesel_async::AsyncConnection as _;
-            if request_db_timing_active() {
+            if request_db_timing_active() || request_query_capture_active() {
                 conn.set_instrumentation(RequestQueryTimer::default());
             }
         }
@@ -2555,6 +2671,77 @@ mod tests {
                 "{sql:?} should be treated as a countable query"
             );
         }
+    }
+
+    /// Finding-1 regression: the capture path stores the parameterised
+    /// statement WITHOUT diesel's trailing `-- binds: [...]` annotation, so the
+    /// per-row executions of an N+1 pattern (which differ only in their bind
+    /// values) collapse to a single template and `detect_n_plus_one` catches
+    /// them. Without the strip, each `-- binds: [N]` would normalise to a
+    /// distinct template and the N+1 would go undetected. Locks the fix with no
+    /// live database.
+    #[cfg(feature = "db")]
+    #[test]
+    fn strip_bind_annotation_lets_detect_n_plus_one_see_per_row_repetition() {
+        use crate::inspector::{QueryRecord, detect_n_plus_one};
+
+        // Construct QueryRecords exactly as `record_request_db_query` does:
+        // the captured `sql` is diesel's `DebugQuery` `Display` output run
+        // through `strip_bind_annotation`.
+        fn record(diesel_display: &str) -> QueryRecord {
+            QueryRecord {
+                sql: strip_bind_annotation(diesel_display).to_owned(),
+                params: Vec::new(),
+                elapsed_ms: 1,
+                location: String::new(),
+            }
+        }
+
+        // The `-- binds:` marker (and the leading whitespace before it) is
+        // stripped; the `$N` placeholder is preserved.
+        assert_eq!(
+            strip_bind_annotation("SELECT * FROM books WHERE author_id = $1 -- binds: [1]"),
+            "SELECT * FROM books WHERE author_id = $1"
+        );
+        // Zero-bind annotation is stripped too.
+        assert_eq!(
+            strip_bind_annotation("SELECT * FROM authors -- binds: []"),
+            "SELECT * FROM authors"
+        );
+        // No marker (transaction-control / synthetic input) → unchanged.
+        assert_eq!(strip_bind_annotation("SELECT 1"), "SELECT 1");
+        assert_eq!(strip_bind_annotation("BEGIN"), "BEGIN");
+
+        // A classic N+1: one parent query, then the same per-row child query
+        // executed once per row with a different bind value each time.
+        let n_plus_one = vec![
+            record("SELECT * FROM authors -- binds: []"),
+            record("SELECT * FROM books WHERE author_id = $1 -- binds: [1]"),
+            record("SELECT * FROM books WHERE author_id = $1 -- binds: [2]"),
+            record("SELECT * FROM books WHERE author_id = $1 -- binds: [3]"),
+        ];
+        let warning = detect_n_plus_one(&n_plus_one, 3)
+            .expect("three identical per-row templates should trip the N+1 detector");
+        assert_eq!(
+            warning.count, 3,
+            "all three per-row executions collapse to a single template"
+        );
+        assert_eq!(
+            warning.sql_template, "select * from books where author_id = $1",
+            "the reported template is the parameterised statement, bind-free"
+        );
+
+        // Distinct query templates must NOT trip the detector, even at the
+        // same total query count.
+        let distinct = vec![
+            record("SELECT * FROM authors -- binds: []"),
+            record("SELECT * FROM books WHERE id = $1 -- binds: [1]"),
+            record("UPDATE users SET name = $1 WHERE id = $2 -- binds: [\"x\", 2]"),
+        ];
+        assert!(
+            detect_n_plus_one(&distinct, 3).is_none(),
+            "three distinct query templates must not be reported as N+1"
+        );
     }
 
     // ── after_commit tests ───────────────────────────────────────
