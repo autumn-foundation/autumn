@@ -712,31 +712,83 @@ fn parse_build_diagnostics(stdout: &[u8]) -> Vec<BuildDiagnostic> {
 /// Used by the watch loop so a failed rebuild can surface errors as a browser
 /// overlay; `serve` keeps using [`cargo_build`].
 fn cargo_build_capturing(package: Option<&str>) -> (bool, Vec<BuildDiagnostic>) {
+    use std::io::{BufRead, BufReader};
+
     let mut cmd = build_cargo_command(package, false);
     cmd.arg("--message-format=json");
+    // Pipe stdout so we can read structured JSON diagnostics line by line as the
+    // compiler emits them, while cargo's own progress/status output (the live
+    // "Compiling ..." lines) streams straight through on inherited stderr. This
+    // keeps the terminal responsive instead of freezing until the build ends.
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::inherit());
 
     eprintln!("  Compiling...");
-    let output = match cmd.output() {
-        Ok(output) => output,
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
         Err(e) => {
             eprintln!("  \u{2717} Failed to run cargo build: {e}");
             return (false, Vec::new());
         }
     };
 
-    let diagnostics = parse_build_diagnostics(&output.stdout);
-    // Echo the rendered diagnostics so the terminal still shows the errors
-    // (JSON message-format suppresses the usual human-readable stderr output).
-    for diagnostic in &diagnostics {
-        eprint!("{}", diagnostic.rendered);
+    // Accumulate raw stdout so `parse_build_diagnostics` can build the returned
+    // Vec once at the end. Error `rendered` blocks are echoed live in compiler
+    // order as their lines arrive, so each error appears exactly once and the
+    // final parse never re-prints them.
+    let mut buffer = String::new();
+    if let Some(stdout) = child.stdout.take() {
+        let reader = BufReader::new(stdout);
+        for line in reader.lines() {
+            let Ok(line) = line else {
+                // A read error mid-stream: stop consuming and fall back to
+                // whatever we captured so far rather than panicking.
+                break;
+            };
+            if let Some(rendered) = error_rendered_from_line(&line) {
+                eprint!("{rendered}");
+            }
+            buffer.push_str(&line);
+            buffer.push('\n');
+        }
     }
 
-    if output.status.success() {
-        eprintln!("  \u{2713} Build succeeded");
-        (true, diagnostics)
-    } else {
-        (false, diagnostics)
+    let diagnostics = parse_build_diagnostics(buffer.as_bytes());
+    match child.wait() {
+        Ok(status) if status.success() => {
+            eprintln!("  \u{2713} Build succeeded");
+            (true, diagnostics)
+        }
+        Ok(_) => (false, diagnostics),
+        Err(e) => {
+            eprintln!("  \u{2717} cargo build failed: {e}");
+            (false, diagnostics)
+        }
     }
+}
+
+/// If `line` is a single `cargo build --message-format=json` record that is a
+/// `compiler-message` at `error` level, return its `rendered` text so it can be
+/// echoed to the terminal the instant it arrives. Non-JSON lines, warnings, and
+/// other message kinds yield `None`. Mirrors the filtering in
+/// [`parse_build_diagnostics`] so the live echo and the returned diagnostics
+/// stay in agreement.
+fn error_rendered_from_line(line: &str) -> Option<String> {
+    let value = serde_json::from_str::<serde_json::Value>(line).ok()?;
+    if value.get("reason").and_then(serde_json::Value::as_str) != Some("compiler-message") {
+        return None;
+    }
+    let message = value.get("message")?;
+    if message.get("level").and_then(serde_json::Value::as_str) != Some("error") {
+        return None;
+    }
+    Some(
+        message
+            .get("rendered")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+    )
 }
 
 /// Run `cargo build` for the given package. Returns true on success.
