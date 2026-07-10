@@ -962,9 +962,10 @@ impl Client {
     /// This is the composed safe path for fetching **untrusted** URLs. Before
     /// connecting it resolves the host **once**, validates every resolved IP
     /// against the built-in SSRF deny-list ([`is_blocked_ip`]) and rejects the
-    /// request if *any* address is blocked. The connection is then pinned to a
-    /// validated address so reqwest cannot re-resolve the host (closing the
-    /// DNS-rebinding / TOCTOU window). Redirects are followed manually up to
+    /// request if *any* address is blocked. The connection is then pinned to the
+    /// full set of validated addresses so reqwest cannot re-resolve the host
+    /// (closing the DNS-rebinding / TOCTOU window) yet can still fall back across
+    /// them in order if the first is unreachable. Redirects are followed manually up to
     /// [`SSRF_SAFE_MAX_REDIRECTS`] hops, re-running resolve→validate→pin on each
     /// hop; a hop that downgrades the scheme from `https` to `http` is rejected
     /// as defence-in-depth.
@@ -1478,9 +1479,11 @@ impl RequestBuilder {
     }
 
     /// Compute the `(host, addr)` resolve override for a pinned request, if any.
-    fn pin_resolve(&self) -> Result<Option<(String, SocketAddr)>, ClientError> {
+    fn pin_resolve(&self) -> Result<Option<(String, Vec<SocketAddr>)>, ClientError> {
         match self.pin_addr {
-            Some(addr) => Ok(Some((host_of(&self.url)?, addr))),
+            // Single-address pin routed through the same set-based path as the
+            // multi-address SSRF-safe pin (a one-element slice).
+            Some(addr) => Ok(Some((host_of(&self.url)?, vec![addr]))),
             None => Ok(None),
         }
     }
@@ -1504,7 +1507,7 @@ impl RequestBuilder {
             // Pin only applies to the first hop's original target.
             let resolve = if hop == 0 {
                 match self.pin_addr {
-                    Some(addr) => Some((host_of(&current)?, addr)),
+                    Some(addr) => Some((host_of(&current)?, vec![addr])),
                     None => None,
                 }
             } else {
@@ -1579,12 +1582,13 @@ impl RequestBuilder {
         let mut headers = self.extra_headers.clone();
         let mut body = self.body.clone();
         for hop in 0.. {
-            // Resolve host → validated address (rejects if ANY resolved IP is
-            // blocked), then pin so reqwest cannot re-resolve.
-            let addr = resolve_and_validate(&current).await?;
+            // Resolve host → ALL validated addresses (rejects if ANY resolved IP
+            // is blocked), then pin the full set so reqwest cannot re-resolve but
+            // can still fall back across the validated addresses in order.
+            let addrs = resolve_and_validate(&current).await?;
             let host = host_of(&current)?;
             let client = build_oneshot_client(
-                Some((host, addr)),
+                Some((host, addrs)),
                 reqwest::redirect::Policy::none(),
                 timeout,
             )?;
@@ -1666,16 +1670,22 @@ const fn is_retryable_status(status: u16) -> bool {
 /// exact DNS-rebinding / SSRF window that pinning closes. Non-pinned callers
 /// (`resolve == None`) keep reqwest's default proxy behaviour untouched.
 fn build_oneshot_client(
-    resolve: Option<(String, SocketAddr)>,
+    resolve: Option<(String, Vec<SocketAddr>)>,
     policy: reqwest::redirect::Policy,
     timeout: Duration,
 ) -> Result<reqwest::Client, ClientError> {
     let mut builder = reqwest::ClientBuilder::new()
         .timeout(timeout)
         .redirect(policy);
-    if let Some((host, addr)) = resolve {
-        // A pinned request must never route through a re-resolving proxy.
-        builder = builder.no_proxy().resolve(&host, addr);
+    if let Some((host, addrs)) = resolve
+        && !addrs.is_empty()
+    {
+        // Pin to the FULL validated set: reqwest tries the addresses in order and
+        // falls back on connection failure, so an unreachable first address no
+        // longer dooms the request. Every pinned address was already validated,
+        // so the TOCTOU/SSRF guarantee is preserved. A pinned request must never
+        // route through a re-resolving proxy.
+        builder = builder.no_proxy().resolve_to_addrs(&host, &addrs);
     }
     builder.build().map_err(ClientError::Request)
 }
@@ -1852,14 +1862,35 @@ fn rewrite_after_redirect(
     }
 }
 
-/// Resolve `url`'s host to a single validated [`SocketAddr`], rejecting with
+/// Validate a set of resolved socket addresses against the built-in SSRF
+/// deny-list, failing closed.
+///
+/// Returns `Err(SsrfBlocked)` (naming the first blocked address) if **any**
+/// address's IP is blocked ([`is_blocked_ip`]); otherwise returns the whole set
+/// unchanged, preserving order. Factored out of [`resolve_and_validate`] as a
+/// pure, synchronous helper so the validation policy is unit-testable without
+/// real multi-record DNS.
+fn validate_resolved_addrs(addrs: Vec<SocketAddr>) -> Result<Vec<SocketAddr>, ClientError> {
+    for addr in &addrs {
+        if is_blocked_ip(addr.ip()) {
+            return Err(ClientError::SsrfBlocked(addr.ip().to_string()));
+        }
+    }
+    Ok(addrs)
+}
+
+/// Resolve `url`'s host to **all** validated [`SocketAddr`]s, rejecting with
 /// [`ClientError::SsrfBlocked`] if the host is (or resolves to) any blocked IP.
 ///
 /// IP-literal hosts (including decimal/octal/hex encodings, which the `url`
 /// crate normalises to an `Ipv4Addr` at parse time) are validated directly with
-/// no DNS lookup. Domain hosts are resolved once via `tokio::net::lookup_host`
-/// and rejected if **any** resolved address is blocked.
-async fn resolve_and_validate(url: &str) -> Result<SocketAddr, ClientError> {
+/// no DNS lookup. Domain hosts are resolved **once** via `tokio::net::lookup_host`
+/// (keeping the TOCTOU window closed) and rejected if **any** resolved address
+/// is blocked. Since the whole DNS response is rejected when any IP is blocked,
+/// it is safe to return the full validated set (order preserved) so a caller can
+/// pin all of them and let reqwest try them in order — an unreachable first
+/// address no longer dooms the request.
+async fn resolve_and_validate(url: &str) -> Result<Vec<SocketAddr>, ClientError> {
     let parsed = url::Url::parse(url).map_err(|e| ClientError::InvalidUrl(e.to_string()))?;
     // Explicit scheme allowlist (defence-in-depth): only http/https may be
     // resolved and connected on the safe path. Reject ftp://, gopher://,
@@ -1879,20 +1910,8 @@ async fn resolve_and_validate(url: &str) -> Result<SocketAddr, ClientError> {
         .ok_or_else(|| ClientError::InvalidUrl(format!("URL has no host: {url}")))?;
 
     match host {
-        url::Host::Ipv4(v4) => {
-            let ip = IpAddr::V4(v4);
-            if is_blocked_ip(ip) {
-                return Err(ClientError::SsrfBlocked(ip.to_string()));
-            }
-            Ok(SocketAddr::new(ip, port))
-        }
-        url::Host::Ipv6(v6) => {
-            let ip = IpAddr::V6(v6);
-            if is_blocked_ip(ip) {
-                return Err(ClientError::SsrfBlocked(ip.to_string()));
-            }
-            Ok(SocketAddr::new(ip, port))
-        }
+        url::Host::Ipv4(v4) => validate_resolved_addrs(vec![SocketAddr::new(IpAddr::V4(v4), port)]),
+        url::Host::Ipv6(v6) => validate_resolved_addrs(vec![SocketAddr::new(IpAddr::V6(v6), port)]),
         url::Host::Domain(name) => {
             let addrs: Vec<SocketAddr> = tokio::net::lookup_host((name, port))
                 .await
@@ -1903,13 +1922,9 @@ async fn resolve_and_validate(url: &str) -> Result<SocketAddr, ClientError> {
                     "DNS lookup for {name} returned no addresses"
                 )));
             }
-            // Reject if ANY resolved address is blocked (fail closed).
-            for addr in &addrs {
-                if is_blocked_ip(addr.ip()) {
-                    return Err(ClientError::SsrfBlocked(addr.ip().to_string()));
-                }
-            }
-            Ok(addrs[0])
+            // Reject if ANY resolved address is blocked (fail closed); otherwise
+            // return the whole validated set (order preserved from the lookup).
+            validate_resolved_addrs(addrs)
         }
     }
 }
@@ -3291,18 +3306,20 @@ mod tests {
     // structurally by the pin_to and follow_redirects tests. See the report.
     #[tokio::test]
     async fn resolve_and_validate_accepts_public_rejects_blocked() {
-        // Public literal with an explicit port → Ok, port preserved.
+        // Public literal with an explicit port → Ok, single-element validated
+        // set, port preserved.
         let ok = resolve_and_validate("http://8.8.8.8:8080/path")
             .await
             .unwrap();
         assert_eq!(
             ok,
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 8080)
+            vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 8080)]
         );
 
         // https default port is inferred.
         let ok_https = resolve_and_validate("https://1.1.1.1/").await.unwrap();
-        assert_eq!(ok_https.port(), 443);
+        assert_eq!(ok_https.len(), 1);
+        assert_eq!(ok_https[0].port(), 443);
 
         // Blocked literals and decimal-encoded loopback → SsrfBlocked.
         for raw in [
@@ -3317,6 +3334,40 @@ mod tests {
                 "{raw} should be SsrfBlocked, got {err:?}"
             );
         }
+    }
+
+    // TEST 56b: validate_resolved_addrs — the pure validation core shared by the
+    // resolve→validate step. A set of public addrs returns ALL of them in order;
+    // a set mixing a public and a blocked addr is rejected with SsrfBlocked; an
+    // all-public IPv6+IPv4 mix returns everything in order. This exercises the
+    // multi-record path (pin to ALL validated addresses) without needing real
+    // multi-record DNS.
+    #[test]
+    fn validate_resolved_addrs_returns_all_public_rejects_any_blocked() {
+        let v4 = |a, b, c, d, p| SocketAddr::new(IpAddr::V4(Ipv4Addr::new(a, b, c, d)), p);
+
+        // Two public addrs → Ok with BOTH returned, order preserved.
+        let two = vec![v4(1, 1, 1, 1, 443), v4(8, 8, 8, 8, 443)];
+        assert_eq!(validate_resolved_addrs(two.clone()).unwrap(), two);
+
+        // Public + blocked (10.0.0.1, RFC1918) → Err(SsrfBlocked).
+        let mixed = vec![v4(1, 1, 1, 1, 443), v4(10, 0, 0, 1, 443)];
+        assert!(
+            matches!(
+                validate_resolved_addrs(mixed),
+                Err(ClientError::SsrfBlocked(_))
+            ),
+            "a set containing a blocked address must be rejected"
+        );
+
+        // All-public IPv6 (2606:4700:4700::1111, Cloudflare) + IPv4 mix → Ok,
+        // all preserved in order.
+        let v6 = SocketAddr::new(
+            IpAddr::V6(Ipv6Addr::new(0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111)),
+            443,
+        );
+        let mix = vec![v6, v4(8, 8, 8, 8, 443)];
+        assert_eq!(validate_resolved_addrs(mix.clone()).unwrap(), mix);
     }
 
     // TEST 57: pin_to alone does NOT auto-follow a cross-host redirect. reqwest
