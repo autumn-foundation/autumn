@@ -658,9 +658,12 @@ pub fn check_alert_destination_impl(
             name: "alert_destination",
             status: CheckStatus::Warn,
             detail: Some(
-                "no operator alert destination configured in production; failure conditions \
-                 (dead-lettered jobs, Down health indicators, 5xx spikes, scheduled-task \
-                 failures) will not be delivered anywhere"
+                "no operator alert destination found in [alerts] config (email or webhook) in \
+                 production; if your app registers an alert channel in code via \
+                 AppBuilder::with_alert_channel, alerts will still be delivered and this warning \
+                 can be ignored (doctor is a config-only checker and cannot see code-registered \
+                 channels); otherwise failure conditions (dead-lettered jobs, Down health \
+                 indicators, 5xx spikes, scheduled-task failures) will not be delivered anywhere"
                     .into(),
             ),
             hint: Some(

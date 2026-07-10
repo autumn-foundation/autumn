@@ -57,6 +57,13 @@ the master switch: when `[alerts] enabled = false` (or
 will be delivered even though a destination is configured, because the runtime
 installs no alerter at all when alerting is disabled.
 
+`autumn doctor` is a config-only checker: it reads `autumn.toml` (and the
+`AUTUMN_ALERTS__*` environment) and cannot see alert channels registered in code
+with `AppBuilder::with_alert_channel`. If your app installs a custom
+[`AlertChannel`] that way, alerts are still delivered even though nothing appears
+under `[alerts]`, so the "no alert destination" warning is expected and can be
+safely ignored (including under `autumn doctor --strict`).
+
 ---
 
 ## Built-in conditions, defaults, and how to tune each
