@@ -1645,8 +1645,14 @@ mod tests {
             "first sub-threshold tick must not evaluate"
         );
         // Baselines must be untouched so progress is preserved.
-        assert_eq!(last_requests, 0, "sub-threshold tick must not reset baseline");
-        assert_eq!(last_5xx, 0, "sub-threshold tick must not reset 5xx baseline");
+        assert_eq!(
+            last_requests, 0,
+            "sub-threshold tick must not reset baseline"
+        );
+        assert_eq!(
+            last_5xx, 0,
+            "sub-threshold tick must not reset 5xx baseline"
+        );
 
         // Tick 2: total=8, 5xx=2 -> still below threshold (delta from 0 is 8).
         assert_eq!(
@@ -1673,7 +1679,10 @@ mod tests {
             sample_error_window(15, 3, &mut last_requests, &mut last_5xx, min_requests),
             None
         );
-        assert_eq!(last_requests, 12, "baseline held across the next sub-threshold tick");
+        assert_eq!(
+            last_requests, 12,
+            "baseline held across the next sub-threshold tick"
+        );
         assert_eq!(last_5xx, 3);
     }
 

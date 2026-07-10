@@ -4757,10 +4757,8 @@ pub struct Vault {
         // `[alerts] email` is set, but there is no `[mail] transport` — in a prod
         // profile that resolves to the `disabled` default, so the runtime installs
         // NO email alert channel. Doctor must NOT count the email and must warn.
-        let table: toml::Table =
-            toml::from_str("[alerts]\nemail = \"ops@example.com\"\n").unwrap();
-        let (email, webhook) =
-            resolve_alert_destination_from_sources(no_env, Some(&table), "prod");
+        let table: toml::Table = toml::from_str("[alerts]\nemail = \"ops@example.com\"\n").unwrap();
+        let (email, webhook) = resolve_alert_destination_from_sources(no_env, Some(&table), "prod");
         assert!(email, "the [alerts] email itself resolves as present");
         assert!(!webhook);
         // No env override, no `[mail] transport`, prod profile → "disabled".
@@ -4784,10 +4782,8 @@ pub struct Vault {
     fn alert_destination_email_with_usable_transport_passes_in_prod() {
         // Same email, but `[mail] transport = "smtp"` (a real, usable backend) →
         // the runtime installs the channel, so doctor counts the email and passes.
-        let table: toml::Table =
-            toml::from_str("[alerts]\nemail = \"ops@example.com\"\n").unwrap();
-        let (email, webhook) =
-            resolve_alert_destination_from_sources(no_env, Some(&table), "prod");
+        let table: toml::Table = toml::from_str("[alerts]\nemail = \"ops@example.com\"\n").unwrap();
+        let (email, webhook) = resolve_alert_destination_from_sources(no_env, Some(&table), "prod");
         let transport = resolve_effective_mail_transport(None, Some("smtp"), "prod");
         assert_eq!(transport, "smtp");
         let r = check_alert_destination_impl(true, email, webhook, transport != "disabled", true);
@@ -4806,8 +4802,7 @@ pub struct Vault {
             "[alerts]\nemail = \"ops@example.com\"\nwebhook_url = \"https://hooks.example/x\"\nwebhook_secret = \"s3cr3t\"\n[profile.prod.alerts]\nemail = \"\"\n",
         )
         .unwrap();
-        let (email, webhook) =
-            resolve_alert_destination_from_sources(no_env, Some(&table), "prod");
+        let (email, webhook) = resolve_alert_destination_from_sources(no_env, Some(&table), "prod");
         assert!(!email, "the prod profile cleared the email");
         assert!(webhook, "the signed webhook remains configured");
         // Mail transport disabled — irrelevant to the webhook path.

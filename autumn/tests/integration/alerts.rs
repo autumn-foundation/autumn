@@ -111,7 +111,10 @@ async fn dead_lettered_job_delivers_alert_to_configured_channel() {
 #[tokio::test]
 async fn where_to_look_honors_custom_actuator_prefix() {
     let channel = CapturingChannel::default();
-    let alerter = Alerter::new(vec![Arc::new(channel.clone())], settings_with_prefix("/_ops"));
+    let alerter = Alerter::new(
+        vec![Arc::new(channel.clone())],
+        settings_with_prefix("/_ops"),
+    );
 
     let client = TestApp::new()
         .state_initializer(move |state| state.insert_extension(alerter.clone()))
@@ -128,7 +131,11 @@ async fn where_to_look_honors_custom_actuator_prefix() {
     );
 
     // A scheduled-task failure uses the same prefix for its /tasks pointer.
-    autumn_web::alerts::notify_scheduled_task_failure(client.state(), "nightly_backup", "disk full");
+    autumn_web::alerts::notify_scheduled_task_failure(
+        client.state(),
+        "nightly_backup",
+        "disk full",
+    );
     wait_for(&channel, 2).await;
     let alerts = channel.alerts();
     assert_eq!(alerts[1].where_to_look, "/_ops/tasks");
