@@ -161,6 +161,31 @@ The committed tree here is the rendered form of the embedded starter; the
 
 ---
 
+## Excluded Examples
+
+Excluded examples are intentionally kept out of the workspace and the normal
+adoption path. They are not runnable Autumn servers, do not participate in
+workspace compilation or test validation, and never block a release. They exist
+to document spikes and specialised build targets.
+
+---
+
+### `examples/island-flock` — Yew WASM Island Spike
+
+<!-- catalog:example name=island-flock tier=excluded -->
+
+| Field | Value |
+|-------|-------|
+| **Persona** | Framework contributor prototyping client-side interactivity inside an Autumn page |
+| **Journey** | WASM island spike: compile a Yew CSR component to `wasm32-unknown-unknown` and mount it as an island in server-rendered HTML |
+| **Key capabilities** | Yew CSR component, `cdylib` crate, `wasm32-unknown-unknown` target, hand-rolled island bootstrap |
+| **Rationale for exclusion** | This is an exploratory spike, not a supported server example. It is a `cdylib` targeting `wasm32-unknown-unknown`, so it cannot compile as a normal workspace member and is listed under `exclude` in `Cargo.toml`. It has no HTTP server, no README quickstart, and no place in the Journey Map. |
+| **Build command** | `examples/island-flock/build-island.sh` |
+
+See `docs/guide/wasm-islands.md` for the design notes behind this spike.
+
+---
+
 ## Journey Map
 
 The table below maps each example to a distinct learning journey so evaluators
