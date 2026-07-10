@@ -657,6 +657,173 @@ async fn enabled_mail_transport_registers_email_channel() {
     );
 }
 
+/// A non-disabled mail transport that would `send` fine at the transport layer,
+/// used to isolate the address/`from` preconditions from the disabled-transport
+/// skip. `is_disabled` returns the trait default (`false`).
+#[cfg(feature = "mail")]
+#[derive(Clone, Default)]
+struct UsableTestTransport;
+
+#[cfg(feature = "mail")]
+impl autumn_web::mail::MailTransport for UsableTestTransport {
+    fn send<'a>(
+        &'a self,
+        _mail: autumn_web::mail::Mail,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<(), autumn_web::mail::MailError>> + Send + 'a>,
+    > {
+        Box::pin(async move { Ok(()) })
+    }
+}
+
+/// Regression: lettre parses `[alerts] email` only at SEND time, so a
+/// present-but-unparsable address (`not-an-address`, a `mailto:` URI) passes
+/// every earlier gate yet fails EVERY delivery with `MailError::InvalidAddress`.
+/// With a usable (non-disabled) transport, `install_from_config` must still SKIP
+/// the mail channel — and, with no other destination, install no alerter — rather
+/// than register a channel that can never deliver.
+#[cfg(feature = "mail")]
+#[tokio::test]
+async fn invalid_email_address_does_not_register_email_channel() {
+    use autumn_web::mail::Mailer;
+
+    for invalid in ["not-an-address", "mailto:oncall@example.com"] {
+        let mailer = Arc::new(Mailer::with_transport(UsableTestTransport));
+        assert!(!mailer.is_disabled(), "sanity: transport reports enabled");
+
+        // A usable, `from`-free transport, so the ONLY reason to skip is the
+        // malformed address.
+        let mut config_full = autumn_web::config::AutumnConfig::default();
+        config_full.mail.transport = autumn_web::mail::Transport::Log;
+
+        let client = TestApp::new()
+            .config(config_full)
+            .state_initializer(move |state| state.insert_extension((*mailer).clone()))
+            .build();
+
+        let config = AlertConfig {
+            email: Some(invalid.to_owned()),
+            ..AlertConfig::default()
+        };
+        autumn_web::alerts::install_from_config(client.state(), &config, Vec::new());
+
+        assert!(
+            client.state().extension::<Alerter>().is_none(),
+            "an invalid [alerts] email ({invalid}) must not install a mail channel"
+        );
+    }
+}
+
+/// Regression: the alert mail carries no per-message `from`, so it falls back to
+/// the mailer default (`[mail] from`). Under `transport = "smtp"` with no `[mail]
+/// from`, `lettre_message` fails with "mail from address is required" and every
+/// delivery fails. `install_from_config` must SKIP the mail channel — and, with
+/// no other destination, install no alerter.
+#[cfg(feature = "mail")]
+#[tokio::test]
+async fn smtp_transport_without_from_does_not_register_email_channel() {
+    use autumn_web::mail::Mailer;
+
+    let mailer = Arc::new(Mailer::with_transport(UsableTestTransport));
+    assert!(!mailer.is_disabled(), "sanity: transport reports enabled");
+
+    let mut config_full = autumn_web::config::AutumnConfig::default();
+    config_full.mail.transport = autumn_web::mail::Transport::Smtp;
+    // A host is required only so `TestApp` can build its throwaway config mailer;
+    // our `UsableTestTransport` mailer (inserted below) is what the alerter uses.
+    config_full.mail.smtp.host = Some("smtp.example.com".to_owned());
+    config_full.mail.from = None;
+
+    let client = TestApp::new()
+        .config(config_full)
+        .state_initializer(move |state| state.insert_extension((*mailer).clone()))
+        .build();
+
+    let config = AlertConfig {
+        email: Some("oncall@example.com".to_owned()),
+        ..AlertConfig::default()
+    };
+    autumn_web::alerts::install_from_config(client.state(), &config, Vec::new());
+
+    assert!(
+        client.state().extension::<Alerter>().is_none(),
+        "an SMTP transport with no [mail] from must not install a mail channel"
+    );
+}
+
+/// Companion: a valid address on an SMTP transport WITH a `[mail] from` set is a
+/// working destination, so `install_from_config` registers the mail channel.
+#[cfg(feature = "mail")]
+#[tokio::test]
+async fn smtp_transport_with_from_registers_email_channel() {
+    use autumn_web::mail::Mailer;
+
+    let mailer = Arc::new(Mailer::with_transport(UsableTestTransport));
+    assert!(!mailer.is_disabled(), "sanity: transport reports enabled");
+
+    let mut config_full = autumn_web::config::AutumnConfig::default();
+    config_full.mail.transport = autumn_web::mail::Transport::Smtp;
+    // A host is required only so `TestApp` can build its throwaway config mailer;
+    // our `UsableTestTransport` mailer (inserted below) is what the alerter uses.
+    config_full.mail.smtp.host = Some("smtp.example.com".to_owned());
+    config_full.mail.from = Some("alerts@example.com".to_owned());
+
+    let client = TestApp::new()
+        .config(config_full)
+        .state_initializer(move |state| state.insert_extension((*mailer).clone()))
+        .build();
+
+    let config = AlertConfig {
+        email: Some("oncall@example.com".to_owned()),
+        ..AlertConfig::default()
+    };
+    autumn_web::alerts::install_from_config(client.state(), &config, Vec::new());
+
+    assert!(
+        client.state().extension::<Alerter>().is_some(),
+        "a valid email on an SMTP transport with [mail] from must install the mail channel"
+    );
+}
+
+/// Regression (no over-gating): the `log` and `file` transports render `from`
+/// only when present and deliver without it, so a valid email on a `log`
+/// transport with NO `[mail] from` is a working destination —
+/// `install_from_config` must still register the mail channel. Only SMTP is
+/// blocked by a missing `from`.
+#[cfg(feature = "mail")]
+#[tokio::test]
+async fn log_transport_without_from_registers_email_channel() {
+    use autumn_web::mail::Mailer;
+
+    for transport in [
+        autumn_web::mail::Transport::Log,
+        autumn_web::mail::Transport::File,
+    ] {
+        let mailer = Arc::new(Mailer::with_transport(UsableTestTransport));
+        assert!(!mailer.is_disabled(), "sanity: transport reports enabled");
+
+        let mut config_full = autumn_web::config::AutumnConfig::default();
+        config_full.mail.transport = transport;
+        config_full.mail.from = None;
+
+        let client = TestApp::new()
+            .config(config_full)
+            .state_initializer(move |state| state.insert_extension((*mailer).clone()))
+            .build();
+
+        let config = AlertConfig {
+            email: Some("oncall@example.com".to_owned()),
+            ..AlertConfig::default()
+        };
+        autumn_web::alerts::install_from_config(client.state(), &config, Vec::new());
+
+        assert!(
+            client.state().extension::<Alerter>().is_some(),
+            "a {transport:?} transport with no [mail] from must still install the mail channel"
+        );
+    }
+}
+
 /// AC #1 (fan-out): every registered channel receives the alert.
 #[tokio::test]
 async fn alert_fans_out_to_every_channel() {

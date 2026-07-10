@@ -230,6 +230,18 @@ Email alerts are delivered through your configured mailer with the
 bounce/complaint **suppression list bypassed** — operator alerts are
 security-class and must never be silently dropped.
 
+Just as with webhooks, Autumn refuses to register a mail alert channel that
+could never deliver. It logs a startup `warn` and **does not register the mail
+channel** when the `[mail] transport` is `disabled` (it silently drops mail),
+when `[alerts] email` is not a valid address (lettre parses the recipient only
+when sending, so a malformed value like `not-an-address` or a `mailto:` URI
+would fail every delivery with an invalid-address error), or when the transport
+is `smtp` with no `[mail] from` (the alert mail carries no per-message `from`, so
+SMTP send fails with "mail from address is required"). The `log` and `file`
+transports deliver without a `from`, so they are never gated on it. These runtime
+skips mirror the `autumn doctor` warnings above, so doctor and the running app
+agree on which email destinations are usable.
+
 > Email alerts require the `mail` feature. If your binary is built without it, an
 > email-only `[alerts]` destination delivers nothing — Autumn logs a startup
 > `warn` in that case. Enable the `mail` feature or configure a `webhook_url`

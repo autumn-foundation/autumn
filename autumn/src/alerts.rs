@@ -1046,6 +1046,106 @@ fn is_absolute_http_url(url: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Whether `email` parses as the SAME lettre [`Mailbox`](lettre::message::Mailbox)
+/// the mail send path requires of every recipient.
+///
+/// The runtime's alert mail hands `[alerts] email` verbatim to
+/// `Mail::builder().to(...)`, and lettre parses the recipient only at SEND time —
+/// in [`parse_mailbox`](crate::mail)/`lettre_message`, not when the alert `Mail`
+/// is built. So a present-but-unparsable value like `not-an-address` or
+/// `mailto:oncall@example.com` passes every earlier gate yet fails EVERY delivery
+/// with `MailError::InvalidAddress`. Running the exact same `str::parse::<Mailbox>`
+/// here rejects such a value BEFORE the channel is registered, mirroring the
+/// disabled-transport / invalid-webhook skips and keeping the runtime in lock-step
+/// with `autumn-cli`'s `is_valid_bare_mailbox_doctor` (same validity notion) so
+/// doctor and the runtime agree on which addresses are usable.
+#[cfg(feature = "mail")]
+fn is_valid_alert_mailbox(email: &str) -> bool {
+    email.parse::<lettre::message::Mailbox>().is_ok()
+}
+
+/// Whether a mail transport actually needs a `from` address to deliver an alert.
+///
+/// Only `smtp` builds a real RFC 5322 message: `mail.rs`'s `lettre_message` errors
+/// with "mail from address is required" when `from` is absent, and it is reached
+/// solely from the SMTP transport. The `log` and `file` transports render `from`
+/// only when present and deliver without it; `disabled` is already skipped by the
+/// [`Mailer::is_disabled`](crate::mail::Mailer::is_disabled) guard. Mirrors
+/// `autumn-cli`'s `mail_transport_requires_from` so doctor and the runtime agree
+/// on which transports are blocked by a missing `from`.
+#[cfg(feature = "mail")]
+const fn mail_transport_requires_from(transport: crate::mail::Transport) -> bool {
+    matches!(transport, crate::mail::Transport::Smtp)
+}
+
+/// Resolve the built-in mail alert channel for a configured, non-empty `[alerts]
+/// email`, or `None` (after a dedicated `tracing::warn!`) when the mailer would
+/// deliver nothing at runtime.
+///
+/// Mirrors the disabled-transport / invalid-webhook skip-and-warn pattern in
+/// [`install_from_config`], skipping when:
+/// - the transport is the no-op disabled one (`Mailer::is_disabled`): it accepts
+///   and silently drops every message, so a registered channel would make an
+///   email-only prod config look active while delivering nothing;
+/// - the address is not a valid lettre [`Mailbox`](lettre::message::Mailbox):
+///   lettre parses `[alerts] email` only at SEND time, so a malformed value fails
+///   EVERY delivery with `MailError::InvalidAddress`;
+/// - the transport needs a `from` (SMTP) and no non-empty `[mail] from` resolves:
+///   the alert mail carries no per-message `from` and falls back to the mailer
+///   default, so SMTP send fails with "mail from address is required".
+///
+/// The resolved `[mail]` config is the faithful source for the last two
+/// preconditions: the framework builds this `Mailer` from `config.mail`
+/// (`Mailer::from_config`), so its transport kind and default `from` are exactly
+/// these fields — keeping the runtime skips in lock-step with doctor.
+#[cfg(feature = "mail")]
+fn build_mail_alert_channel(
+    state: &AppState,
+    mailer: Arc<crate::mail::Mailer>,
+    email: &str,
+) -> Option<Arc<dyn AlertChannel>> {
+    // TRIM the resolved address and treat the trimmed value as canonical (the
+    // caller already guaranteed it is non-empty after trimming): lettre parses
+    // the recipient at send time, so validate — and deliver to — the exact
+    // address the send path would parse.
+    let email_trimmed = email.trim();
+    if mailer.is_disabled() {
+        tracing::warn!(
+            "alerts: an operator email is configured but [mail] transport is disabled; \
+             no email alerts will be delivered. Set [mail] transport to a real backend \
+             or use a webhook destination."
+        );
+        return None;
+    }
+    if !is_valid_alert_mailbox(email_trimmed) {
+        tracing::warn!(
+            email = email_trimmed,
+            "alerts: the configured [alerts] email ({email_trimmed}) is not a valid email \
+             address; no email alerts will be delivered. Fix [alerts] email (or the \
+             AUTUMN_ALERTS__EMAIL env var)."
+        );
+        return None;
+    }
+    let mail_cfg = state.config().mail;
+    if mail_transport_requires_from(mail_cfg.transport)
+        && mail_cfg
+            .from
+            .as_deref()
+            .is_none_or(|from| from.trim().is_empty())
+    {
+        tracing::warn!(
+            "alerts: an operator email is configured but [mail] from is not set, so SMTP alert \
+             delivery will fail; no email alerts will be delivered. Set [mail] from (or the \
+             AUTUMN_MAIL__FROM env var) to a sender address, or use a webhook destination."
+        );
+        return None;
+    }
+    Some(Arc::new(MailAlertChannel::new(
+        mailer,
+        email_trimmed.to_owned(),
+    )))
+}
+
 /// Install the operator alerter from `config` plus any builder channels.
 ///
 /// Builds the built-in channels from `config`, combines them with any
@@ -1077,18 +1177,8 @@ pub fn install_from_config(
     #[cfg(feature = "mail")]
     if let Some(email) = config.email.as_ref().filter(|s| !s.trim().is_empty()) {
         if let Some(mailer) = state.extension::<crate::mail::Mailer>() {
-            // A `Mailer` backed by the disabled (no-op) transport accepts and
-            // silently drops every message, so registering a `MailAlertChannel`
-            // here would make an email-only prod config look active while
-            // delivering nothing. Warn and skip the dead channel instead.
-            if mailer.is_disabled() {
-                tracing::warn!(
-                    "alerts: an operator email is configured but [mail] transport is disabled; \
-                     no email alerts will be delivered. Set [mail] transport to a real backend \
-                     or use a webhook destination."
-                );
-            } else {
-                channels.push(Arc::new(MailAlertChannel::new(mailer, email.clone())));
+            if let Some(channel) = build_mail_alert_channel(state, mailer, email) {
+                channels.push(channel);
             }
         } else {
             tracing::warn!(
