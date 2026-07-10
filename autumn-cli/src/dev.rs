@@ -14,7 +14,7 @@
 //! unnecessary rebuilds.
 
 use notify_debouncer_mini::{DebouncedEventKind, new_debouncer};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -163,6 +163,36 @@ impl DevReloadState {
         self.write(kind)
     }
 
+    /// Bump the version and write a full-reload state carrying compiler
+    /// diagnostics so the browser client renders a compile-error overlay
+    /// instead of reloading into a broken/stale page.
+    ///
+    /// `stale` is true when a previously-built binary is still serving (the
+    /// browser is looking at a now-outdated page); false on a cold start where
+    /// no server is up yet. A subsequent [`Self::signal`] writes state with no
+    /// `build_error` field, which the client treats as "clear the overlay".
+    fn signal_build_error(
+        &mut self,
+        diagnostics: &[BuildDiagnostic],
+        stale: bool,
+    ) -> Result<(), String> {
+        self.version = self
+            .version
+            .checked_add(1)
+            .ok_or("live reload version overflowed")?;
+
+        let body = serde_json::json!({
+            "version": self.version,
+            "kind": "full",
+            "build_error": {
+                "diagnostics": diagnostics,
+                "stale": stale,
+            },
+        });
+        std::fs::write(&self.path, body.to_string())
+            .map_err(|e| format!("failed to write {}: {e}", self.path.display()))
+    }
+
     fn write(&self, kind: ReloadKind) -> Result<(), String> {
         let kind = match kind {
             ReloadKind::None | ReloadKind::Full => "full",
@@ -207,9 +237,19 @@ pub fn run(package: Option<&str>, show_config: bool) {
             None
         }
     };
-    // Initial build
-    if !cargo_build(package, false) {
+    // Initial build. There is no prior server here (cold start), so a browser
+    // overlay isn't reachable — the CLI doesn't know the app's port and no
+    // process is up to answer the state endpoint. We still record the failure
+    // in the state file (harmless, and dismissed by the first green build);
+    // the terminal errors remain the primary feedback for this case.
+    let (built, diagnostics) = cargo_build_capturing(package);
+    if !built {
         eprintln!("\u{2717} Initial build failed. Fix errors and save to retry.\n");
+        if let Some(state) = reload_state.as_mut()
+            && let Err(error) = state.signal_build_error(&diagnostics, false)
+        {
+            eprintln!("  Warning: live reload signal failed: {error}");
+        }
     }
 
     let binary = find_binary(package, false);
@@ -466,20 +506,34 @@ fn execute_plan(
     let mut applied_reload = ReloadKind::None;
 
     if plan.build {
-        stop_server(child);
+        // Build FIRST, with the old binary still running. Only tear it down
+        // once we have a fresh binary to replace it with — otherwise a failed
+        // rebuild would leave the app DOWN and the browser would see a
+        // connection-refused/stale page instead of a diagnostics overlay.
+        let (built, diagnostics) = cargo_build_capturing(package);
 
-        if cargo_build(package, false) {
+        if built {
+            stop_server(child);
             if restart_server(
                 package,
                 child,
                 reload_state.as_ref().map(|s| s.path()),
                 show_config,
             ) {
+                // A normal full reload clears any prior build-error overlay.
                 applied_reload = ReloadKind::Full;
             }
         } else {
             eprintln!("  \u{2717} Build failed. Waiting for changes...\n");
-            *child = None;
+            // Leave the (stale) binary running so it keeps answering the
+            // live-reload state endpoint; the browser then renders the overlay.
+            let stale = child.is_some();
+            if let Some(reload_state) = reload_state.as_mut()
+                && let Err(error) = reload_state.signal_build_error(&diagnostics, stale)
+            {
+                eprintln!("  Warning: live reload signal failed: {error}");
+            }
+            return;
         }
     } else {
         if plan.tailwind && tailwind_build() {
@@ -544,6 +598,145 @@ pub fn build_cargo_command(package: Option<&str>, release: bool) -> Command {
         cmd.args(["-p", pkg]);
     }
     cmd
+}
+
+/// A single compiler error extracted from `cargo build --message-format=json`.
+///
+/// Serialized into the live-reload state file so the browser overlay can
+/// render the failure without the CLI needing to talk to the app directly.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct BuildDiagnostic {
+    /// Error code (e.g. `E0425`), when the compiler assigned one.
+    code: Option<String>,
+    /// Primary human-readable message (`message.message`).
+    message: String,
+    /// File of the primary span, empty when the error has no primary span.
+    file: String,
+    /// 1-based line of the primary span (0 when absent).
+    line: u32,
+    /// 1-based column of the primary span (0 when absent).
+    column: u32,
+    /// Full multi-line rendered diagnostic (`message.rendered`).
+    rendered: String,
+}
+
+/// Parse `cargo build --message-format=json` stdout into ordered error
+/// diagnostics.
+///
+/// Keeps only `compiler-message` records at `error` level (warnings are out of
+/// scope) and preserves the compiler's emission order. Non-JSON lines and other
+/// message kinds (artifacts, build-finished) are skipped. Mirrors the JSON
+/// walking pattern used by [`crate::dev_loop_bench::cargo_executable_path`].
+fn parse_build_diagnostics(stdout: &[u8]) -> Vec<BuildDiagnostic> {
+    let text = String::from_utf8_lossy(stdout);
+    let mut diagnostics = Vec::new();
+
+    for line in text.lines() {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if value.get("reason").and_then(serde_json::Value::as_str) != Some("compiler-message") {
+            continue;
+        }
+        let Some(message) = value.get("message") else {
+            continue;
+        };
+        if message.get("level").and_then(serde_json::Value::as_str) != Some("error") {
+            continue;
+        }
+
+        let code = message
+            .get("code")
+            .and_then(|code| code.get("code"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+        let text_message = message
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        let rendered = message
+            .get("rendered")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+
+        let primary = message
+            .get("spans")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|spans| {
+                spans.iter().find(|span| {
+                    span.get("is_primary").and_then(serde_json::Value::as_bool) == Some(true)
+                })
+            });
+        let (file, line, column) = primary.map_or_else(
+            || (String::new(), 0, 0),
+            |span| {
+                let file = span
+                    .get("file_name")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                let line = span
+                    .get("line_start")
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|n| u32::try_from(n).ok())
+                    .unwrap_or(0);
+                let column = span
+                    .get("column_start")
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|n| u32::try_from(n).ok())
+                    .unwrap_or(0);
+                (file, line, column)
+            },
+        );
+
+        diagnostics.push(BuildDiagnostic {
+            code,
+            message: text_message,
+            file,
+            line,
+            column,
+            rendered,
+        });
+    }
+
+    diagnostics
+}
+
+/// Run `cargo build` for the given package while capturing compiler
+/// diagnostics as JSON.
+///
+/// Returns `(success, error_diagnostics)`. Diagnostics are echoed to stderr via
+/// their `rendered` form so the terminal experience matches a plain build.
+/// Used by the watch loop so a failed rebuild can surface errors as a browser
+/// overlay; `serve` keeps using [`cargo_build`].
+fn cargo_build_capturing(package: Option<&str>) -> (bool, Vec<BuildDiagnostic>) {
+    let mut cmd = build_cargo_command(package, false);
+    cmd.arg("--message-format=json");
+
+    eprintln!("  Compiling...");
+    let output = match cmd.output() {
+        Ok(output) => output,
+        Err(e) => {
+            eprintln!("  \u{2717} Failed to run cargo build: {e}");
+            return (false, Vec::new());
+        }
+    };
+
+    let diagnostics = parse_build_diagnostics(&output.stdout);
+    // Echo the rendered diagnostics so the terminal still shows the errors
+    // (JSON message-format suppresses the usual human-readable stderr output).
+    for diagnostic in &diagnostics {
+        eprint!("{}", diagnostic.rendered);
+    }
+
+    if output.status.success() {
+        eprintln!("  \u{2713} Build succeeded");
+        (true, diagnostics)
+    } else {
+        (false, diagnostics)
+    }
 }
 
 /// Run `cargo build` for the given package. Returns true on success.
@@ -1816,6 +2009,101 @@ mod tests {
         state.signal(ReloadKind::Full).expect("full signal");
         let body = std::fs::read_to_string(state.path()).expect("read full");
         assert_eq!(body, r#"{"kind":"full","version":2}"#);
+    }
+
+    #[test]
+    fn parse_build_diagnostics_extracts_errors_in_order_excluding_warnings() {
+        // A realistic `cargo build --message-format=json` stream: an artifact
+        // line, an error, a warning (must be excluded), a non-JSON line, a
+        // second error whose primary span is NOT the first span, and a
+        // build-finished line.
+        let stdout = concat!(
+            r#"{"reason":"compiler-artifact","target":{"name":"app"}}"#,
+            "\n",
+            r#"{"reason":"compiler-message","message":{"code":{"code":"E0425"},"level":"error","message":"cannot find value `foo` in this scope","rendered":"error[E0425]: cannot find value `foo`\n --> src/main.rs:3:5\n","spans":[{"file_name":"src/main.rs","line_start":3,"column_start":5,"is_primary":true}]}}"#,
+            "\n",
+            r#"{"reason":"compiler-message","message":{"code":null,"level":"warning","message":"unused variable: `x`","rendered":"warning: unused variable\n","spans":[{"file_name":"src/main.rs","line_start":9,"column_start":1,"is_primary":true}]}}"#,
+            "\n",
+            "   Compiling app v0.1.0 (not json)\n",
+            r#"{"reason":"compiler-message","message":{"code":{"code":"E0308"},"level":"error","message":"mismatched types","rendered":"error[E0308]: mismatched types\n --> src/lib.rs:12:9\n","spans":[{"file_name":"src/other.rs","line_start":1,"column_start":1,"is_primary":false},{"file_name":"src/lib.rs","line_start":12,"column_start":9,"is_primary":true}]}}"#,
+            "\n",
+            r#"{"reason":"build-finished","success":false}"#,
+            "\n",
+        );
+
+        let diags = parse_build_diagnostics(stdout.as_bytes());
+
+        assert_eq!(diags.len(), 2, "warnings and non-error lines excluded");
+        assert_eq!(
+            diags[0],
+            BuildDiagnostic {
+                code: Some("E0425".to_owned()),
+                message: "cannot find value `foo` in this scope".to_owned(),
+                file: "src/main.rs".to_owned(),
+                line: 3,
+                column: 5,
+                rendered: "error[E0425]: cannot find value `foo`\n --> src/main.rs:3:5\n"
+                    .to_owned(),
+            }
+        );
+        // Compiler order is preserved: E0425 first, then E0308.
+        assert_eq!(diags[1].code, Some("E0308".to_owned()));
+        assert_eq!(diags[1].message, "mismatched types");
+        // Primary span wins over the (earlier) non-primary span.
+        assert_eq!(diags[1].file, "src/lib.rs");
+        assert_eq!(diags[1].line, 12);
+        assert_eq!(diags[1].column, 9);
+    }
+
+    #[test]
+    fn dev_reload_state_signal_build_error_writes_and_full_clears() {
+        let reload_file = tempfile::NamedTempFile::new().expect("reload file");
+        let path = reload_file.path().to_path_buf();
+        let mut state = DevReloadState { path, version: 0 };
+
+        let diags = vec![BuildDiagnostic {
+            code: Some("E0425".to_owned()),
+            message: "cannot find value `foo`".to_owned(),
+            file: "src/main.rs".to_owned(),
+            line: 3,
+            column: 5,
+            rendered: "error[E0425]: cannot find value `foo`".to_owned(),
+        }];
+
+        state
+            .signal_build_error(&diags, true)
+            .expect("build error signal");
+        assert_eq!(state.version, 1, "build error bumps the version");
+
+        let body = std::fs::read_to_string(state.path()).expect("read build error");
+        let value: serde_json::Value = serde_json::from_str(&body).expect("valid json");
+        assert_eq!(value["version"], 1);
+        assert_eq!(value["kind"], "full");
+        assert_eq!(value["build_error"]["stale"], true);
+        assert_eq!(value["build_error"]["diagnostics"][0]["code"], "E0425");
+        assert_eq!(
+            value["build_error"]["diagnostics"][0]["file"],
+            "src/main.rs"
+        );
+        assert_eq!(value["build_error"]["diagnostics"][0]["line"], 3);
+        assert_eq!(value["build_error"]["diagnostics"][0]["column"], 5);
+        assert_eq!(
+            value["build_error"]["diagnostics"][0]["message"],
+            "cannot find value `foo`"
+        );
+
+        // A subsequent normal full signal must clear the build_error field so
+        // the browser overlay dismisses and the page reloads.
+        state.signal(ReloadKind::Full).expect("full signal");
+        assert_eq!(state.version, 2);
+        let body = std::fs::read_to_string(state.path()).expect("read cleared");
+        let value: serde_json::Value = serde_json::from_str(&body).expect("valid json");
+        assert!(
+            value.get("build_error").is_none(),
+            "a normal full signal must not carry a build_error field"
+        );
+        assert_eq!(value["version"], 2);
+        assert_eq!(value["kind"], "full");
     }
 
     #[test]
