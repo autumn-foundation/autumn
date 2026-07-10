@@ -545,16 +545,19 @@ pub fn check_alert_destination_impl(
     // alert `Mail` is built, so a present-but-unparsable address (e.g.
     // `not-an-address`) passes every earlier gate yet fails EVERY delivery at
     // runtime with `MailError::InvalidAddress`. An invalid address therefore
-    // does not count as a usable destination. Validity uses a BARE-mailbox check
-    // (`is_valid_bare_mailbox_doctor`) that matches what lettre accepts for a
-    // recipient — deliberately NOT `is_valid_mailto_address_doctor`, which strips
-    // a leading `mailto:` (correct for the `List-Unsubscribe` header but wrong
-    // here). The runtime hands `[alerts] email` verbatim to
-    // `Mail::builder().to(...)`, and lettre parses it as a bare mailbox at send
-    // time; a `mailto:` URI would fail EVERY delivery, so doctor must reject it.
+    // does not count as a usable destination. Validity is checked with the SAME
+    // lettre parser the runtime uses (`is_valid_alert_mailbox_doctor` runs
+    // `value.parse::<lettre::message::Mailbox>()`, exact parity with
+    // `autumn/src/alerts.rs`'s `is_valid_alert_mailbox`) — deliberately NOT
+    // `is_valid_mailto_address_doctor`, which strips a leading `mailto:` (correct
+    // for the `List-Unsubscribe` header but wrong here). This accepts everything
+    // lettre accepts, including RFC 5322 display-name forms like
+    // `Ops <ops@example.com>`, and rejects what lettre rejects: the runtime hands
+    // `[alerts] email` verbatim to `Mail::builder().to(...)`, so a `mailto:` URI
+    // would fail EVERY delivery and doctor must reject it too.
     let email_trimmed = email.trim();
     let email_configured = !email_trimmed.is_empty();
-    let email_valid = email_configured && is_valid_bare_mailbox_doctor(email_trimmed);
+    let email_valid = email_configured && is_valid_alert_mailbox_doctor(email_trimmed);
 
     // Whether a configured email would actually deliver. It needs a valid
     // address, a usable (non-disabled) transport AND — for transports that build
@@ -1000,40 +1003,33 @@ fn is_valid_mailto_address_doctor(value: &str) -> bool {
     }
 }
 
-/// Whether `value` is a syntactically valid **bare** recipient mailbox — a single
-/// `local@domain` with a dotted domain and no scheme prefix.
+/// Whether `value` parses as the SAME lettre [`Mailbox`](lettre::message::Mailbox)
+/// the alert mail send path requires of every recipient — EXACT parity with the
+/// runtime's `is_valid_alert_mailbox` (`autumn/src/alerts.rs`), which validates
+/// `[alerts] email` with `email.parse::<lettre::message::Mailbox>()`.
 ///
-/// This is DISTINCT from [`is_valid_mailto_address_doctor`], which accepts a
-/// leading `mailto:` (correct for the `[mail] unsubscribe_mailto`
-/// `List-Unsubscribe` header). The `[alerts] email` is handed verbatim to
-/// `Mail::builder().to(...)` and parsed by lettre as a bare recipient mailbox at
-/// SEND time (`parse_mailbox`/`lettre_message`); lettre does NOT strip a
-/// `mailto:` scheme, so `mailto:oncall@example.com` fails EVERY delivery with
-/// `MailError::InvalidAddress`. Reject the URI form here so doctor agrees with the
-/// SMTP path rather than passing a config that can never deliver.
-fn is_valid_bare_mailbox_doctor(value: &str) -> bool {
-    // Reject control characters and address delimiters anywhere in the value.
-    if value
-        .chars()
-        .any(|c| c.is_control() || matches!(c, '<' | '>' | ','))
-    {
-        return false;
-    }
-    // Note: no `mailto:` strip here — a bare recipient mailbox has no scheme.
-    let address = value.trim();
-    match address.split_once('@') {
-        Some((local, domain)) => {
-            !local.is_empty()
-                && !domain.is_empty()
-                && domain.contains('.')
-                && !address.contains(char::is_whitespace)
-                // A bare mailbox never contains `:` or `/`. This is what makes
-                // `mailto:oncall@example.com` (and any other scheme/URI form)
-                // INVALID — lettre would reject it as a recipient too.
-                && !address.contains([':', '/'])
-        }
-        None => false,
-    }
+/// The runtime hands `[alerts] email` verbatim to `Mail::builder().to(...)`, and
+/// lettre parses the recipient only at SEND time (`parse_mailbox`/`lettre_message`),
+/// not when the alert `Mail` is built. Reusing the exact same parser here means
+/// doctor accepts precisely what the runtime accepts — bare mailboxes
+/// (`ops@example.com`), `+`-addressing (`a+b@sub.example.co`) AND RFC 5322
+/// display-name forms (`Ops <ops@example.com>`) — instead of a hand-rolled
+/// approximation that was STRICTER than lettre and rejected valid display-name
+/// mailboxes, producing a false `autumn doctor --strict` failure on a config the
+/// runtime registers and delivers to fine.
+///
+/// A `mailto:` URI (e.g. `mailto:oncall@example.com`) is still rejected: lettre's
+/// parser treats the whole string as one mailbox and the `:` is not valid in a
+/// dot-atom local part, so it fails to parse — matching the runtime, where such a
+/// value fails EVERY delivery with `MailError::InvalidAddress`.
+///
+/// lettre is reachable from the CLI via `autumn_web`'s `mail`-gated re-export
+/// (`autumn_web::reexports::lettre`); `autumn-cli` enables that feature, so no
+/// direct `lettre` dependency is required.
+fn is_valid_alert_mailbox_doctor(value: &str) -> bool {
+    value
+        .parse::<autumn_web::reexports::lettre::message::Mailbox>()
+        .is_ok()
 }
 
 // ─── Pure helper functions (fully unit-testable) ──────────────────────────────
@@ -4852,20 +4848,49 @@ pub struct Vault {
     }
 
     #[test]
-    fn is_valid_bare_mailbox_rejects_mailto_uri_and_accepts_bare() {
+    fn is_valid_alert_mailbox_matches_lettre_and_accepts_display_name() {
         // Bare recipient mailboxes are accepted (this is what lettre parses at
         // send time for `[alerts] email`).
-        assert!(is_valid_bare_mailbox_doctor("oncall@example.com"));
-        assert!(is_valid_bare_mailbox_doctor("a+b@sub.example.co"));
-        // The `mailto:` URI form is REJECTED here (unlike the unsubscribe-mailto
+        assert!(is_valid_alert_mailbox_doctor("oncall@example.com"));
+        assert!(is_valid_alert_mailbox_doctor("a+b@sub.example.co"));
+        // RFC 5322 display-name form is ACCEPTED — the runtime's lettre parser
+        // accepts it and registers + delivers to it fine, so doctor must not
+        // reject it (the regression this fix addresses: a false `--strict`
+        // failure on a valid config).
+        assert!(is_valid_alert_mailbox_doctor("Ops <ops@example.com>"));
+        // The `mailto:` URI form is REJECTED (unlike the unsubscribe-mailto
         // validator): the runtime passes it verbatim to lettre, which rejects it
-        // as a bare recipient. Doctor must not pass a config that can't deliver.
-        assert!(!is_valid_bare_mailbox_doctor("mailto:oncall@example.com"));
+        // as a recipient. Doctor must not pass a config that can't deliver.
+        assert!(!is_valid_alert_mailbox_doctor("mailto:oncall@example.com"));
         // Other scheme/URI forms and malformed values stay rejected.
-        assert!(!is_valid_bare_mailbox_doctor("https://oncall@example.com"));
-        assert!(!is_valid_bare_mailbox_doctor("not-an-address"));
-        assert!(!is_valid_bare_mailbox_doctor("oncall example.com"));
-        assert!(!is_valid_bare_mailbox_doctor("oncall@localhost"));
+        assert!(!is_valid_alert_mailbox_doctor("https://oncall@example.com"));
+        assert!(!is_valid_alert_mailbox_doctor("not-an-address"));
+        assert!(!is_valid_alert_mailbox_doctor("oncall example.com"));
+        assert!(!is_valid_alert_mailbox_doctor(""));
+
+        // Exact parity with the runtime: doctor's check must agree with the very
+        // parser `autumn/src/alerts.rs`'s `is_valid_alert_mailbox` runs, for every
+        // case above. This is what keeps doctor from being stricter (or looser)
+        // than the SMTP send path.
+        for case in [
+            "oncall@example.com",
+            "a+b@sub.example.co",
+            "Ops <ops@example.com>",
+            "mailto:oncall@example.com",
+            "https://oncall@example.com",
+            "not-an-address",
+            "oncall example.com",
+            "",
+        ] {
+            let runtime_ok = case
+                .parse::<autumn_web::reexports::lettre::message::Mailbox>()
+                .is_ok();
+            assert_eq!(
+                is_valid_alert_mailbox_doctor(case),
+                runtime_ok,
+                "doctor and the runtime lettre parser must agree on {case:?}"
+            );
+        }
     }
 
     #[test]
