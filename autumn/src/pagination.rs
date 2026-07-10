@@ -141,6 +141,8 @@
 
 use axum::extract::FromRequestParts;
 use axum::http::request::Parts;
+use axum::http::{HeaderValue, header};
+use axum::response::{IntoResponse, Response};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
@@ -393,6 +395,27 @@ impl<T> Page<T> {
         }
     }
 
+    /// Paginate an already fully-materialized collection in memory.
+    ///
+    /// Used when every row must be loaded before the page window can be
+    /// applied — for example a list endpoint that filters each row through a
+    /// per-row authorization policy (the filter has to run in Rust, so a
+    /// SQL `LIMIT/OFFSET` can't bound the result on its own). The returned
+    /// [`Page`] carries the full `total_elements` (so `total_pages` and the
+    /// nav links are correct) but only the `request`-selected window in
+    /// `content`.
+    ///
+    /// Prefer [`Page::new`] with a SQL `LIMIT/OFFSET` + `COUNT(*)` whenever
+    /// the window can be pushed into the database.
+    #[must_use]
+    pub fn paginate_in_memory(all: Vec<T>, request: &PageRequest) -> Self {
+        let total = i64::try_from(all.len()).unwrap_or(i64::MAX);
+        let offset = usize::try_from(request.offset()).unwrap_or(usize::MAX);
+        let size = request.size() as usize;
+        let content: Vec<T> = all.into_iter().skip(offset).take(size).collect();
+        Self::new(content, total, request)
+    }
+
     /// Transform the content while preserving pagination metadata.
     ///
     /// Typical use: converting database rows into DTOs for JSON output
@@ -407,6 +430,73 @@ impl<T> Page<T> {
             has_next: self.has_next,
             has_previous: self.has_previous,
         }
+    }
+}
+
+/// Build an RFC 8288 `Link` header value for an offset [`Page`].
+///
+/// Uses *relative* query-only references (`<?page=2&size=20>`) which a client
+/// resolves against the request URL — so the response doesn't need to know its
+/// own mount path. `first` and `last` are always emitted (offset pagination
+/// always knows both bounds); `prev`/`next` only when they exist.
+fn page_link_header_value(page: u32, size: u32, total_pages: u32, has_next: bool) -> String {
+    let mut links: Vec<String> = Vec::with_capacity(4);
+    let rel = |target: u32, name: &str| format!("<?page={target}&size={size}>; rel=\"{name}\"");
+    links.push(rel(1, "first"));
+    if page > 1 {
+        links.push(rel(page - 1, "prev"));
+    }
+    if has_next {
+        links.push(rel(page + 1, "next"));
+    }
+    // For an empty collection `total_pages` is 0; clamp to 1 so the `last`
+    // link stays a valid 1-indexed page rather than `page=0`.
+    let last_page = total_pages.max(1);
+    links.push(rel(last_page, "last"));
+    links.join(", ")
+}
+
+impl<T> IntoResponse for Page<T>
+where
+    T: Serialize,
+{
+    fn into_response(self) -> Response {
+        // Snapshot the nav counters before `self` is moved into `Json`.
+        let (page, size, total_pages, has_next) =
+            (self.page, self.size, self.total_pages, self.has_next);
+        let mut response = axum::Json(self).into_response();
+        if let Ok(value) =
+            HeaderValue::from_str(&page_link_header_value(page, size, total_pages, has_next))
+        {
+            response.headers_mut().insert(header::LINK, value);
+        }
+        response
+    }
+}
+
+impl<T> IntoResponse for CursorPage<T>
+where
+    T: Serialize,
+{
+    fn into_response(self) -> Response {
+        // Only a `next` link is meaningful for keyset pagination — there is no
+        // cheap way back to `first`/`prev`/`last` without a full scan.
+        let next_link = self
+            .next_cursor
+            .as_ref()
+            .filter(|_| self.has_next)
+            .map(|token| {
+                let encoded: String =
+                    url::form_urlencoded::byte_serialize(token.as_bytes()).collect();
+                format!("<?cursor={encoded}&size={}>; rel=\"next\"", self.size)
+            });
+        let mut response = axum::Json(self).into_response();
+        if let Some(link) = next_link
+            && let Ok(value) = HeaderValue::from_str(&link)
+        {
+            response.headers_mut().insert(header::LINK, value);
+        }
+        response
     }
 }
 
@@ -1748,5 +1838,156 @@ mod tests {
 
         let res_signed = Cursor::encode_signed(&FailToSerialize, b"key");
         assert!(res_signed.is_err());
+    }
+
+    // ── IntoResponse + RFC 8288 Link headers ────────────────────
+
+    #[tokio::test]
+    async fn page_into_response_emits_envelope_and_link_headers() {
+        async fn handler() -> Page<u32> {
+            // Page 2 of 7 (137 items, size 20): prev + next both exist.
+            Page::new((21..=40).collect(), 137, &PageRequest::new(2, 20))
+        }
+        let app = Router::new().route("/items", get(handler));
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/items")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), StatusCode::OK);
+        let link = res
+            .headers()
+            .get(header::LINK)
+            .expect("Link header must be present")
+            .to_str()
+            .unwrap()
+            .to_owned();
+        assert!(link.contains("<?page=1&size=20>; rel=\"first\""), "{link}");
+        assert!(
+            link.contains("<?page=1&size=20>; rel=\"prev\""),
+            "prev must point to page 1: {link}"
+        );
+        assert!(link.contains("<?page=3&size=20>; rel=\"next\""), "{link}");
+        assert!(link.contains("<?page=7&size=20>; rel=\"last\""), "{link}");
+
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["page"], 2);
+        assert_eq!(json["size"], 20);
+        assert_eq!(json["total_elements"], 137);
+        assert_eq!(json["total_pages"], 7);
+        assert_eq!(json["content"].as_array().unwrap().len(), 20);
+    }
+
+    #[tokio::test]
+    async fn first_page_has_no_prev_link() {
+        async fn handler() -> Page<u32> {
+            Page::new((1..=20).collect(), 40, &PageRequest::new(1, 20))
+        }
+        let app = Router::new().route("/items", get(handler));
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/items")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let link = res
+            .headers()
+            .get(header::LINK)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+        assert!(
+            !link.contains("rel=\"prev\""),
+            "page 1 must not advertise prev: {link}"
+        );
+        assert!(link.contains("rel=\"next\""), "{link}");
+        assert!(link.contains("rel=\"first\""), "{link}");
+        assert!(link.contains("rel=\"last\""), "{link}");
+    }
+
+    #[test]
+    fn empty_page_last_link_clamps_to_one() {
+        // An empty collection has `total_pages == 0`. The `last` link must
+        // still target a valid 1-indexed page (`page=1`), never `page=0`.
+        let link = page_link_header_value(1, 20, 0, false);
+        assert!(
+            link.contains("<?page=1&size=20>; rel=\"last\""),
+            "last link must clamp to page 1 for an empty collection: {link}"
+        );
+        assert!(
+            !link.contains("page=0"),
+            "no link may reference the invalid page 0: {link}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cursor_page_emits_next_link_only() {
+        async fn handler() -> CursorPage<u32> {
+            // Over-fetch: request size 2, 3 rows returned → has_next, next_cursor set.
+            CursorPage::from_overfetched(vec![1, 2, 3], &CursorRequest::new(None, 2), |&n| n)
+        }
+        let app = Router::new().route("/feed", get(handler));
+        let res = app
+            .oneshot(Request::builder().uri("/feed").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let link = res
+            .headers()
+            .get(header::LINK)
+            .expect("cursor page with a next page must emit a Link")
+            .to_str()
+            .unwrap()
+            .to_owned();
+        assert!(link.contains("rel=\"next\""), "{link}");
+        assert!(
+            link.contains("cursor="),
+            "next link must carry the cursor token: {link}"
+        );
+        assert!(
+            !link.contains("rel=\"prev\""),
+            "keyset pagination has no prev: {link}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cursor_page_last_page_has_no_link() {
+        async fn handler() -> CursorPage<u32> {
+            // Fewer rows than the page size → last page, no next cursor.
+            CursorPage::from_overfetched(vec![1, 2], &CursorRequest::new(None, 5), |&n| n)
+        }
+        let app = Router::new().route("/feed", get(handler));
+        let res = app
+            .oneshot(Request::builder().uri("/feed").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert!(
+            res.headers().get(header::LINK).is_none(),
+            "last cursor page must not advertise a next link"
+        );
+    }
+
+    #[test]
+    fn paginate_in_memory_windows_and_counts() {
+        let all: Vec<u32> = (1..=25).collect();
+        let page = Page::paginate_in_memory(all, &PageRequest::new(2, 10));
+        assert_eq!(page.page, 2);
+        assert_eq!(page.size, 10);
+        assert_eq!(page.total_elements, 25);
+        assert_eq!(page.total_pages, 3);
+        assert_eq!(page.content, (11..=20).collect::<Vec<_>>());
+        assert!(page.has_next);
+        assert!(page.has_previous);
     }
 }

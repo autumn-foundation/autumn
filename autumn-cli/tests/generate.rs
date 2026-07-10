@@ -1136,14 +1136,34 @@ fn generate_scaffold_api_only() {
     // No HTML routes file
     assert!(!project.join("src/routes/posts.rs").is_file());
 
-    // Smoke test: real, in-process, DB-backed read test (issue #1023).
+    // Smoke test: real, in-process, DB-backed read test (issue #1023),
+    // paginated per issue #1237 — asserts the `Page` envelope + page 2 advance.
     let test = fs::read_to_string(project.join("tests/post.rs")).unwrap();
-    assert!(test.contains("posts_api_list_returns_ok_against_a_real_database"));
+    assert!(test.contains("posts_api_list_paginates_against_a_real_database"));
     assert!(test.contains("autumn_web::test::{TestApp, TestClient, TestDb}"));
     assert!(!test.contains("TcpStream"));
     assert!(!test.contains("AUTUMN_TEST_BASE_URL"));
     assert!(test.contains("#[ignore = \"requires Docker"));
     assert!(test.contains("/api/posts"));
+    assert!(
+        test.contains("PageRequest") && test.contains("Page::new"),
+        "the --api smoke test must paginate via the Page envelope: {test}"
+    );
+    assert!(
+        test.contains("page 2 must differ from page 1"),
+        "the --api smoke test must assert pages advance: {test}"
+    );
+    // Required-column seed drives 25 rows off a single `generate_series` and
+    // must not fall back to `INSERT ... DEFAULT VALUES` (which cannot satisfy
+    // the NOT NULL `title`/`published` columns).
+    assert!(
+        test.contains("FROM generate_series(1, 25) AS g"),
+        "required-column --api seed must use generate_series: {test}"
+    );
+    assert!(
+        !test.contains("INSERT INTO posts DEFAULT VALUES"),
+        "required-column --api seed must not fall back to DEFAULT VALUES: {test}"
+    );
 
     // `routes![]` registration.
     let main = fs::read_to_string(project.join("src/main.rs")).unwrap();
@@ -1448,7 +1468,16 @@ async fn generated_scaffold_serves_posts_index_and_json_api() {
         .expect("GET /api/posts failed");
     assert_eq!(response.status(), 200, "GET /api/posts status");
     let body = response.text().await.expect("GET /api/posts body");
-    assert_eq!(body.trim(), "[]", "empty JSON index body");
+    let envelope: serde_json::Value =
+        serde_json::from_str(body.trim()).expect("GET /api/posts must return a JSON Page envelope");
+    let content = envelope["content"]
+        .as_array()
+        .expect("Page envelope must carry a content array");
+    assert!(content.is_empty(), "empty JSON index body: {body}");
+    assert_eq!(
+        envelope["total_elements"], 0,
+        "empty JSON index total_elements"
+    );
 }
 
 #[test]

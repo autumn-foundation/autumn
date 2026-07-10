@@ -342,9 +342,15 @@ async fn scope_filters_repository_index_endpoint_to_owners_records() {
         .await;
 
     assert_eq!(response.status, StatusCode::OK);
-    let body: Vec<serde_json::Value> = serde_json::from_slice(&response.body).unwrap();
+    // #1237: the generated list endpoint now returns the paginated `Page`
+    // envelope; the filtered rows live under `content`.
+    let envelope: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+    let body = envelope["content"]
+        .as_array()
+        .expect("Page envelope must carry a content array");
     assert_eq!(body.len(), 2);
-    for note in &body {
+    assert_eq!(envelope["total_elements"], 2);
+    for note in body {
         assert_eq!(note["author_id"], 2);
     }
 }
@@ -367,7 +373,10 @@ async fn admin_scope_returns_all_records() {
         .await;
 
     assert_eq!(response.status, StatusCode::OK);
-    let body: Vec<serde_json::Value> = serde_json::from_slice(&response.body).unwrap();
+    let envelope: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+    let body = envelope["content"]
+        .as_array()
+        .expect("Page envelope must carry a content array");
     assert_eq!(body.len(), 2);
 }
 
@@ -535,9 +544,13 @@ async fn policy_without_scope_filters_index_via_can_show() {
         .await;
 
     assert_eq!(response.status, StatusCode::OK);
-    let body: Vec<serde_json::Value> = serde_json::from_slice(&response.body).unwrap();
+    let envelope: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+    let body = envelope["content"]
+        .as_array()
+        .expect("Page envelope must carry a content array");
     assert_eq!(body.len(), 2, "should only see bob's secrets");
-    for note in &body {
+    assert_eq!(envelope["total_elements"], 2);
+    for note in body {
         assert_eq!(note["author_id"], 2);
     }
 }
@@ -559,6 +572,10 @@ async fn policy_without_scope_returns_empty_when_no_records_pass_can_show() {
         .await;
 
     assert_eq!(response.status, StatusCode::OK);
-    let body: Vec<serde_json::Value> = serde_json::from_slice(&response.body).unwrap();
+    let envelope: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+    let body = envelope["content"]
+        .as_array()
+        .expect("Page envelope must carry a content array");
     assert!(body.is_empty());
+    assert_eq!(envelope["total_elements"], 0);
 }

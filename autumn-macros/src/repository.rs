@@ -10054,6 +10054,27 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         let mcp_delete_op = mcp_for("DELETE");
 
         let has_policy = config.policy_type.is_some();
+
+        // #1237: the generated JSON list endpoint paginates by default instead
+        // of streaming the whole table via `find_all()`. Offset pagination
+        // (`?page`/`?size` → `Page`) is the default; declaring `cursor_key`
+        // opts the endpoint into keyset/cursor mode (`?cursor`/`?size` →
+        // `CursorPage`) for large/append-only tables. Cursor mode only replaces
+        // the *plain* list path — a `scope`/`policy` list still paginates by
+        // offset so its per-row authorization filter (which must run in Rust)
+        // stays correct.
+        let use_cursor = config.cursor_key.is_some() && config.scope_type.is_none() && !has_policy;
+        let list_return_type = if use_cursor {
+            quote! { ::autumn_web::pagination::CursorPage<#model_name> }
+        } else {
+            quote! { ::autumn_web::pagination::Page<#model_name> }
+        };
+        let list_pager_arg = if use_cursor {
+            quote! { __autumn_cursor_req: ::autumn_web::pagination::CursorRequest, }
+        } else {
+            quote! { __autumn_page_req: ::autumn_web::pagination::PageRequest, }
+        };
+
         let policy_check_show = if has_policy {
             quote! {
                 ::autumn_web::authorization::__check_policy_scoped::<#model_name>(
@@ -10174,6 +10195,9 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         //    perf should also set `scope = SomeScope`.
         // 3. Neither: plain `repo.find_all()` (public list).
         let scope_list_body = if config.scope_type.is_some() {
+            // Scope filters at the SQL level, but the filtered set is still
+            // returned in full — window it in memory so the response stays
+            // bounded and carries the `Page` envelope + `Link` headers.
             quote! {
                 let __scope = __autumn_state
                     .scope::<#model_name>()
@@ -10187,9 +10211,12 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 ).await;
                 let mut __conn = repo.__autumn_acquire_read_conn().await?;
                 let records = __scope.list(&__ctx, &mut __conn).await?;
-                Ok(::autumn_web::prelude::Json(records))
+                Ok(::autumn_web::pagination::Page::paginate_in_memory(records, &__autumn_page_req))
             }
         } else if has_policy {
+            // Per-row policy checks must run in Rust, so every candidate row is
+            // loaded and filtered before the page window is applied. The
+            // response is still bounded to one page and self-describing.
             quote! {
                 let __policy = __autumn_state
                     .policy::<#model_name>()
@@ -10208,11 +10235,20 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         __filtered.push(__record);
                     }
                 }
-                Ok(::autumn_web::prelude::Json(__filtered))
+                Ok(::autumn_web::pagination::Page::paginate_in_memory(__filtered, &__autumn_page_req))
+            }
+        } else if use_cursor {
+            // Keyset/cursor mode (opted in via `cursor_key`): reuse the
+            // generated `cursor_page()` for O(1) page depth on append-only
+            // tables. Emits a cursor `Link: rel="next"`.
+            quote! {
+                repo.cursor_page(&__autumn_cursor_req).await
             }
         } else {
+            // Default: offset pagination via the generated `page()` — a single
+            // bounded `LIMIT/OFFSET` + `COUNT(*)`, never `find_all()`.
             quote! {
-                Ok(::autumn_web::prelude::Json(repo.find_all().await?))
+                repo.page(&__autumn_page_req).await
             }
         };
         // Inject session + state extractors when *either* a scope
@@ -10234,6 +10270,84 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         };
         let resource_type_name_lit = model_name.to_string();
         let api_path_lit = api_path.clone();
+
+        // #1237: OpenAPI for the paginated list operation — document the
+        // `page`/`size` (or `cursor`/`size`) query params and the `Page`
+        // (or `CursorPage`) response envelope, replacing the old bare array.
+        let list_schema_fn = format_ident!("__autumn_openapi_schemas_{prefix}_api_list");
+        let list_query_schema_name = if use_cursor {
+            "CursorRequest"
+        } else {
+            "PageRequest"
+        };
+        let list_response_schema_name = if use_cursor {
+            format!("{model_name}CursorPage")
+        } else {
+            format!("{model_name}Page")
+        };
+        let model_component_ref = format!("#/components/schemas/{model_name}");
+        // Runtime-inserted component schemas: the pagination request query
+        // object and the response envelope wrapping an array of the model.
+        let list_query_schema_json = if use_cursor {
+            quote! {
+                ::autumn_web::reexports::serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "cursor": { "type": "string", "description": "Opaque keyset cursor for the next page" },
+                        "size": { "type": "integer", "minimum": 1, "maximum": 100, "default": 20 }
+                    }
+                })
+            }
+        } else {
+            quote! {
+                ::autumn_web::reexports::serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "page": { "type": "integer", "minimum": 1, "default": 1 },
+                        "size": { "type": "integer", "minimum": 1, "maximum": 100, "default": 20 }
+                    }
+                })
+            }
+        };
+        let list_response_schema_json = if use_cursor {
+            quote! {
+                ::autumn_web::reexports::serde_json::json!({
+                    "type": "object",
+                    "required": ["content", "size", "has_next"],
+                    "properties": {
+                        "content": { "type": "array", "items": { "$ref": #model_component_ref } },
+                        "size": { "type": "integer" },
+                        "next_cursor": { "type": ["string", "null"] },
+                        "has_next": { "type": "boolean" }
+                    }
+                })
+            }
+        } else {
+            quote! {
+                ::autumn_web::reexports::serde_json::json!({
+                    "type": "object",
+                    "required": ["content", "page", "size", "total_elements", "total_pages", "has_next", "has_previous"],
+                    "properties": {
+                        "content": { "type": "array", "items": { "$ref": #model_component_ref } },
+                        "page": { "type": "integer" },
+                        "size": { "type": "integer" },
+                        "total_elements": { "type": "integer" },
+                        "total_pages": { "type": "integer" },
+                        "has_next": { "type": "boolean" },
+                        "has_previous": { "type": "boolean" }
+                    }
+                })
+            }
+        };
+        let list_schema_registration = quote! {
+            #[doc(hidden)]
+            #vis fn #list_schema_fn(
+                __autumn_reg: &mut ::autumn_web::openapi::SchemaRegistry,
+            ) {
+                __autumn_reg.insert(#list_query_schema_name, #list_query_schema_json);
+                __autumn_reg.insert(#list_response_schema_name, #list_response_schema_json);
+            }
+        };
 
         // Compile-time assertion: when the user writes
         // `policy = SomePolicy`, the generated code references the
@@ -10300,6 +10414,78 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             quote! {}
         };
 
+        // #1253: run the model's `#[validate(...)]` rules on the decoded write
+        // payload before it reaches the DB, returning a 422 Problem Details
+        // with the per-field `errors` map on failure. Uses autoref
+        // specialization (`MaybeValidate`) so a payload type that does not
+        // implement `validator::Validate` (e.g. a `NewModel` with no
+        // `#[validate]` fields, or a hand-written insert type) compiles to a
+        // no-op — no migration burden for existing repositories.
+        //
+        // `?`-flavoured for the plain `AutumnResult` handlers; the policy-backed
+        // handlers return `IdempotencyReplayOr`, so they get an explicit
+        // early-return that wraps the error in `Inner`.
+        let validate_new = quote! {
+            {
+                // Both traits must be in scope for autoref resolution to
+                // choose between them; exactly one is used for any concrete
+                // payload type, so the other is (correctly) unused.
+                #[allow(unused_imports)]
+                use ::autumn_web::validation::{
+                    MaybeValidateFallback as _, MaybeValidateViaValidator as _,
+                };
+                (&::autumn_web::validation::MaybeValidate(&new)).autumn_maybe_validate()?;
+            }
+        };
+        let validate_patch = quote! {
+            {
+                // Both traits must be in scope for autoref resolution to
+                // choose between them; exactly one is used for any concrete
+                // payload type, so the other is (correctly) unused.
+                #[allow(unused_imports)]
+                use ::autumn_web::validation::{
+                    MaybeValidateFallback as _, MaybeValidateViaValidator as _,
+                };
+                (&::autumn_web::validation::MaybeValidate(&patch)).autumn_maybe_validate()?;
+            }
+        };
+        let validate_new_idempotency = quote! {
+            {
+                // Both traits must be in scope for autoref resolution to
+                // choose between them; exactly one is used for any concrete
+                // payload type, so the other is (correctly) unused.
+                #[allow(unused_imports)]
+                use ::autumn_web::validation::{
+                    MaybeValidateFallback as _, MaybeValidateViaValidator as _,
+                };
+                if let ::core::result::Result::Err(err) =
+                    (&::autumn_web::validation::MaybeValidate(&new)).autumn_maybe_validate()
+                {
+                    return ::autumn_web::idempotency::IdempotencyReplayOr::Inner(
+                        ::core::result::Result::Err(err)
+                    );
+                }
+            }
+        };
+        let validate_patch_idempotency = quote! {
+            {
+                // Both traits must be in scope for autoref resolution to
+                // choose between them; exactly one is used for any concrete
+                // payload type, so the other is (correctly) unused.
+                #[allow(unused_imports)]
+                use ::autumn_web::validation::{
+                    MaybeValidateFallback as _, MaybeValidateViaValidator as _,
+                };
+                if let ::core::result::Result::Err(err) =
+                    (&::autumn_web::validation::MaybeValidate(&patch)).autumn_maybe_validate()
+                {
+                    return ::autumn_web::idempotency::IdempotencyReplayOr::Inner(
+                        ::core::result::Result::Err(err)
+                    );
+                }
+            }
+        };
+
         let create_return_type = if has_policy {
             quote! {
                 ::autumn_web::idempotency::IdempotencyReplayOr<
@@ -10331,6 +10517,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         );
                     }
                 };
+                #validate_new_idempotency
                 if let ::core::result::Result::Err(err) =
                     ::autumn_web::authorization::__check_policy_create_payload_scoped::<#model_name>(
                         &__autumn_state,
@@ -10365,6 +10552,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         } else {
             quote! {
                 #decode_create_payload
+                #validate_new
                 #policy_check_create_pre
                 let record = repo.save(&new).await?;
                 Ok((::autumn_web::reexports::http::StatusCode::CREATED, ::autumn_web::prelude::Json(record)))
@@ -10383,6 +10571,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         };
         let update_body = if has_policy {
             quote! {
+                #validate_patch_idempotency
                 let __existing = match repo.on_primary().find_by_id(id).await {
                     ::core::result::Result::Ok(::core::option::Option::Some(existing)) => existing,
                     ::core::result::Result::Ok(::core::option::Option::None) => {
@@ -10429,6 +10618,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
         } else {
             quote! {
+                #validate_patch
                 #policy_check_update_pre
                 let record = repo.update(id, &patch).await?;
                 Ok(::autumn_web::prelude::Json(record))
@@ -10573,10 +10763,13 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
             #vis async fn #list_fn(
                 #list_session_state_args
+                #list_pager_arg
                 repo: #pg_name,
-            ) -> ::autumn_web::AutumnResult<::autumn_web::prelude::Json<Vec<#model_name>>> {
+            ) -> ::autumn_web::AutumnResult<#list_return_type> {
                 #scope_list_body
             }
+
+            #list_schema_registration
 
             #[doc(hidden)]
             #vis fn #list_info() -> ::autumn_web::Route {
@@ -10596,17 +10789,19 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         path: #api_path,
                         operation_id: ::core::stringify!(#list_fn),
                         success_status: 200,
-                        response: ::core::option::Option::Some(
+                        query_schema: ::core::option::Option::Some(
                             ::autumn_web::openapi::SchemaEntry {
-                                name: "array",
-                                kind: ::autumn_web::openapi::SchemaKind::Array(
-                                    &::autumn_web::openapi::SchemaEntry {
-                                        name: ::core::stringify!(#model_name),
-                                        kind: ::autumn_web::openapi::SchemaKind::Ref,
-                                    }
-                                ),
+                                name: #list_query_schema_name,
+                                kind: ::autumn_web::openapi::SchemaKind::Ref,
                             }
                         ),
+                        response: ::core::option::Option::Some(
+                            ::autumn_web::openapi::SchemaEntry {
+                                name: #list_response_schema_name,
+                                kind: ::autumn_web::openapi::SchemaKind::Ref,
+                            }
+                        ),
+                        register_schemas: ::core::option::Option::Some(#list_schema_fn),
                         mcp_tool: #mcp_list_op,
                         ..::core::default::Default::default()
                     },
@@ -13422,6 +13617,192 @@ mod tests {
         assert!(
             !section.contains("on_primary"),
             "get handler reads must stay replica-eligible: {section}"
+        );
+    }
+
+    /// Extract the generated `<prefix>_api_list` handler function body from the
+    /// full macro output — bounded by the following generated item so
+    /// assertions don't accidentally match the always-present `find_all` trait
+    /// method or the sibling CRUD handlers.
+    fn list_handler_section(generated: &str) -> &str {
+        let start = generated
+            .find("async fn post_api_list")
+            .expect("list handler must be generated");
+        let rest = &generated[start..];
+        let end = rest
+            .find("fn __autumn_openapi_schemas_post_api_list")
+            .expect("list schema registration must follow the list handler");
+        &rest[..end]
+    }
+
+    #[test]
+    fn repository_macro_api_list_paginates_by_default() {
+        // #1237: the default JSON list endpoint paginates via `page()` instead
+        // of streaming the whole table with `find_all()`.
+        let generated = repository_macro(
+            quote! { Post, api = "/api/posts" },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        let section = list_handler_section(&generated);
+        assert!(
+            section.contains("__autumn_page_req : :: autumn_web :: pagination :: PageRequest"),
+            "list handler must accept a PageRequest: {section}"
+        );
+        assert!(
+            section.contains("repo . page (& __autumn_page_req)"),
+            "list handler must call repo.page(): {section}"
+        );
+        assert!(
+            section.contains(":: autumn_web :: pagination :: Page < Post >"),
+            "list handler must return a Page envelope: {section}"
+        );
+        assert!(
+            !section.contains("find_all"),
+            "default list handler must not call find_all(): {section}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_api_list_cursor_mode_uses_cursor_page() {
+        // #1237: declaring `cursor_key` opts the list endpoint into keyset mode,
+        // reusing the generated `cursor_page()` + `CursorPage`.
+        let generated = repository_macro(
+            quote! { Post, api = "/api/posts", cursor_key = created_at },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        let section = list_handler_section(&generated);
+        assert!(
+            section.contains("__autumn_cursor_req : :: autumn_web :: pagination :: CursorRequest"),
+            "cursor list handler must accept a CursorRequest: {section}"
+        );
+        assert!(
+            section.contains("repo . cursor_page (& __autumn_cursor_req)"),
+            "cursor list handler must call repo.cursor_page(): {section}"
+        );
+        assert!(
+            section.contains(":: autumn_web :: pagination :: CursorPage < Post >"),
+            "cursor list handler must return a CursorPage envelope: {section}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_api_list_documents_pagination_in_openapi() {
+        // #1237: OpenAPI describes the page/size query params and the Page
+        // response envelope for the list operation.
+        let generated = repository_macro(
+            quote! { Post, api = "/api/posts" },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("fn __autumn_openapi_schemas_post_api_list"),
+            "a register_schemas hook must be emitted for the list route"
+        );
+        assert!(
+            generated.contains("\"PostPage\""),
+            "list response must reference the PostPage envelope schema"
+        );
+        assert!(
+            generated.contains("\"total_pages\""),
+            "the Page envelope schema must document total_pages"
+        );
+        assert!(
+            generated.contains("\"page\"") && generated.contains("\"size\""),
+            "the query schema must document page and size params"
+        );
+    }
+
+    #[test]
+    fn repository_macro_api_create_validates_before_save() {
+        // #1253: create runs `#[validate]` rules (via autoref `MaybeValidate`)
+        // before the insert, returning 422 on failure.
+        let generated = repository_macro(
+            quote! { Post, api = "/api/posts" },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        let start = generated
+            .find("async fn post_api_create")
+            .expect("create handler must be generated");
+        let rest = &generated[start..];
+        let end = rest
+            .find("fn __autumn_route_info_post_api_create")
+            .unwrap_or(rest.len());
+        let section = &rest[..end];
+
+        let validate_at = section
+            .find("MaybeValidate")
+            .expect("create handler must validate the payload");
+        let save_at = section
+            .find("repo . save")
+            .expect("create handler must save");
+        assert!(
+            validate_at < save_at,
+            "validation must run before the insert: {section}"
+        );
+        assert!(
+            section.contains("autumn_maybe_validate"),
+            "create handler must call autumn_maybe_validate: {section}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_api_update_validates() {
+        // #1253: the update path applies the same validate-then-422 wiring.
+        let generated = repository_macro(
+            quote! { Post, api = "/api/posts" },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        let start = generated
+            .find("async fn post_api_update")
+            .expect("update handler must be generated");
+        let rest = &generated[start..];
+        let end = rest
+            .find("fn __autumn_route_info_post_api_update")
+            .unwrap_or(rest.len());
+        let section = &rest[..end];
+        assert!(
+            section.contains("MaybeValidate (& patch)"),
+            "update handler must validate the patch payload: {section}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_api_policy_create_validates_before_persist() {
+        // #1253 AC: the policy-backed create branch validates before persisting
+        // so authorization and validation both run.
+        let generated = repository_macro(
+            quote! { Post, api = "/api/posts", policy = PostPolicy },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        let start = generated
+            .find("async fn post_api_create")
+            .expect("create handler must be generated");
+        let rest = &generated[start..];
+        let end = rest
+            .find("fn __autumn_route_info_post_api_create")
+            .unwrap_or(rest.len());
+        let section = &rest[..end];
+
+        let validate_at = section
+            .find("MaybeValidate")
+            .expect("policy create handler must validate the payload");
+        let save_at = section
+            .find("repo . save")
+            .expect("policy create handler must save");
+        assert!(
+            validate_at < save_at,
+            "policy create must validate before persisting: {section}"
         );
     }
 
