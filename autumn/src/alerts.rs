@@ -1167,9 +1167,45 @@ fn evaluate_error_rate(
     }
 }
 
+/// How a health indicator's current status maps onto the alert state machine.
+///
+/// Factored out of [`evaluate_health`] so the three-way branch is unit-testable
+/// without an `AppState`/registry. The key subtlety: recovery must be gated on
+/// [`HealthStatus::is_healthy`], NOT merely `!= Down`. `OutOfService` is a
+/// non-`Down` status that is still UNHEALTHY (`/actuator/health` reports
+/// non-200), so treating it as "recovered" would emit a false recovery while the
+/// service is still degraded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HealthTransition {
+    /// Status is `Down`: run the grace-period trigger logic.
+    Down,
+    /// Status is genuinely healthy again (`is_healthy()`): clear tracking and
+    /// emit a recovery for any outstanding alert.
+    Recover,
+    /// Status is non-`Down` but still not healthy (e.g. `OutOfService`): hold
+    /// the active alert as-is — no recovery, and no new trigger (only `Down`
+    /// triggers, matching existing behavior).
+    Hold,
+}
+
+/// Classify a health indicator's status into the alert-state transition it
+/// drives. Uses [`HealthStatus::is_healthy`] (not `== Up`) so `Unknown` — which
+/// the actuator reports as healthy — recovers, while `OutOfService` holds.
+const fn classify_health_transition(status: crate::actuator::HealthStatus) -> HealthTransition {
+    if matches!(status, crate::actuator::HealthStatus::Down) {
+        HealthTransition::Down
+    } else if status.is_healthy() {
+        HealthTransition::Recover
+    } else {
+        HealthTransition::Hold
+    }
+}
+
 /// Condition (b): run all health indicators, track how long each has been
 /// `Down`, and alert once an indicator has stayed `Down` past the grace period.
-/// Recover when it reports healthy again.
+/// Recover only when it reports a genuinely healthy status again — a non-`Down`
+/// but still-unhealthy status (e.g. `OutOfService`) holds the active alert
+/// rather than emitting a false recovery.
 async fn evaluate_health(
     alerter: &Alerter,
     state: &AppState,
@@ -1183,41 +1219,54 @@ async fn evaluate_health(
 
     for result in &results {
         let key = format!("health_indicator_down:{}", result.name);
-        if result.output.status == crate::actuator::HealthStatus::Down {
-            let first = *down_since.entry(result.name.clone()).or_insert(now);
-            if now - first >= grace {
-                let secs = (now - first).num_seconds().max(0);
-                let alert = Alert::trigger(AlertCondition::HealthIndicatorDown, key)
-                    .title(format!("Health indicator '{}' is Down", result.name))
-                    .summary(format!(
-                        "Health indicator '{}' has reported Down for {secs}s, past the \
-                         {grace_secs}s grace period.",
-                        result.name,
-                        grace_secs = settings.health_grace.as_secs(),
-                    ))
-                    .where_to_look(actuator_where_to_look(
-                        &settings.actuator_prefix,
-                        AlertCondition::HealthIndicatorDown,
-                    ))
-                    .detail("indicator", result.name.clone())
-                    .detail("down_seconds", secs.to_string())
-                    .build();
-                let _ = alerter.notify(alert);
+        match classify_health_transition(result.output.status) {
+            HealthTransition::Down => {
+                let first = *down_since.entry(result.name.clone()).or_insert(now);
+                if now - first >= grace {
+                    let secs = (now - first).num_seconds().max(0);
+                    let alert = Alert::trigger(AlertCondition::HealthIndicatorDown, key)
+                        .title(format!("Health indicator '{}' is Down", result.name))
+                        .summary(format!(
+                            "Health indicator '{}' has reported Down for {secs}s, past the \
+                             {grace_secs}s grace period.",
+                            result.name,
+                            grace_secs = settings.health_grace.as_secs(),
+                        ))
+                        .where_to_look(actuator_where_to_look(
+                            &settings.actuator_prefix,
+                            AlertCondition::HealthIndicatorDown,
+                        ))
+                        .detail("indicator", result.name.clone())
+                        .detail("down_seconds", secs.to_string())
+                        .build();
+                    let _ = alerter.notify(alert);
+                }
             }
-        } else if down_since.remove(&result.name).is_some() {
-            let alert = Alert::recovery(AlertCondition::HealthIndicatorDown, key)
-                .title(format!("Health indicator '{}' recovered", result.name))
-                .summary(format!(
-                    "Health indicator '{}' is reporting healthy again.",
-                    result.name
-                ))
-                .where_to_look(actuator_where_to_look(
-                    &settings.actuator_prefix,
-                    AlertCondition::HealthIndicatorDown,
-                ))
-                .detail("indicator", result.name.clone())
-                .build();
-            let _ = alerter.recover(alert);
+            HealthTransition::Recover => {
+                // Only clear the down-tracking (and emit a recovery) when the
+                // indicator is genuinely healthy again. `recover` is itself gated
+                // by `on_resolve`, so it is a no-op unless an alert was active.
+                if down_since.remove(&result.name).is_some() {
+                    let alert = Alert::recovery(AlertCondition::HealthIndicatorDown, key)
+                        .title(format!("Health indicator '{}' recovered", result.name))
+                        .summary(format!(
+                            "Health indicator '{}' is reporting healthy again.",
+                            result.name
+                        ))
+                        .where_to_look(actuator_where_to_look(
+                            &settings.actuator_prefix,
+                            AlertCondition::HealthIndicatorDown,
+                        ))
+                        .detail("indicator", result.name.clone())
+                        .build();
+                    let _ = alerter.recover(alert);
+                }
+            }
+            HealthTransition::Hold => {
+                // Non-`Down` but still unhealthy (e.g. `OutOfService`): leave the
+                // active alert and `down_since` bookkeeping untouched so we do not
+                // emit a "recovered" alert while `/actuator/health` is non-healthy.
+            }
         }
     }
 }
@@ -1292,6 +1341,112 @@ mod tests {
         // Fresh trigger inside the original window still sends because the key
         // recovered in between.
         assert_eq!(d.on_trigger("k", ts(10)), DedupDecision::Send);
+    }
+
+    // ── Health-indicator recovery classification (P2: recover only when healthy)
+    // The three-way branch in `evaluate_health`: `Down` triggers, a genuinely
+    // healthy status recovers, and any other non-healthy status (`OutOfService`)
+    // holds the active alert instead of emitting a false recovery.
+
+    use crate::actuator::HealthStatus;
+
+    #[test]
+    fn health_down_status_drives_trigger_branch() {
+        assert_eq!(
+            classify_health_transition(HealthStatus::Down),
+            HealthTransition::Down
+        );
+    }
+
+    #[test]
+    fn healthy_statuses_recover() {
+        // `is_healthy()` treats both `Up` and `Unknown` as healthy, so both
+        // recover — the actuator reports 200 for either.
+        assert_eq!(
+            classify_health_transition(HealthStatus::Up),
+            HealthTransition::Recover
+        );
+        assert_eq!(
+            classify_health_transition(HealthStatus::Unknown),
+            HealthTransition::Recover
+        );
+    }
+
+    #[test]
+    fn out_of_service_holds_active_alert_instead_of_recovering() {
+        // `OutOfService` is non-`Down` but still UNHEALTHY: it must NOT recover.
+        assert!(!HealthStatus::OutOfService.is_healthy());
+        assert_eq!(
+            classify_health_transition(HealthStatus::OutOfService),
+            HealthTransition::Hold
+        );
+    }
+
+    /// Drive the exact `down_since` + deduplicator bookkeeping `evaluate_health`
+    /// performs for a single indicator across a status sequence, returning the
+    /// dedup decision for any recovery emitted on the final tick (`None` when no
+    /// recovery was attempted). Proves the recovery is gated on a genuinely
+    /// healthy status, not merely `!= Down`.
+    fn recovery_decision_for_sequence(statuses: &[HealthStatus]) -> Option<DedupDecision> {
+        let name = "db";
+        let key = format!("health_indicator_down:{name}");
+        let mut dedup = AlertDeduplicator::new(std::time::Duration::from_secs(900));
+        let mut down_since: HashMap<String, DateTime<Utc>> = HashMap::new();
+        // Zero grace period so a single `Down` tick alerts immediately.
+        let grace = chrono::Duration::seconds(0);
+        let mut last = None;
+        for (i, status) in statuses.iter().enumerate() {
+            last = None;
+            let now = ts(i as i64);
+            match classify_health_transition(*status) {
+                HealthTransition::Down => {
+                    let first = *down_since.entry(name.to_owned()).or_insert(now);
+                    if now - first >= grace {
+                        let _ = dedup.on_trigger(&key, now);
+                    }
+                }
+                HealthTransition::Recover => {
+                    if down_since.remove(name).is_some() {
+                        last = Some(dedup.on_resolve(&key));
+                    }
+                }
+                HealthTransition::Hold => {}
+            }
+        }
+        last
+    }
+
+    #[test]
+    fn down_then_out_of_service_does_not_recover() {
+        // Down (alert) → OutOfService: the alert stays active; no recovery emitted.
+        let decision =
+            recovery_decision_for_sequence(&[HealthStatus::Down, HealthStatus::OutOfService]);
+        assert_eq!(
+            decision, None,
+            "OutOfService after Down must NOT emit a recovery (service still unhealthy)"
+        );
+    }
+
+    #[test]
+    fn down_then_up_recovers() {
+        // Down (alert) → Up: a genuine recovery is emitted for the active key.
+        let decision = recovery_decision_for_sequence(&[HealthStatus::Down, HealthStatus::Up]);
+        assert_eq!(
+            decision,
+            Some(DedupDecision::Send),
+            "a genuinely healthy status after Down must emit a recovery"
+        );
+    }
+
+    #[test]
+    fn down_then_out_of_service_then_up_recovers_once() {
+        // The alert survives the OutOfService dip and recovers when finally Up.
+        let decision = recovery_decision_for_sequence(&[
+            HealthStatus::Down,
+            HealthStatus::OutOfService,
+            HealthStatus::Up,
+        ]);
+        assert_eq!(decision, Some(DedupDecision::Send));
     }
 
     // ── Severity classification ──────────────────────────────────────────────

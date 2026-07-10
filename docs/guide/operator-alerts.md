@@ -45,7 +45,11 @@ only counts when a usable `[mail] transport` is configured: the mailer defaults
 to `disabled` outside dev, and a disabled mailer installs no email alert channel
 (it silently drops mail), so doctor warns for an email paired with a disabled
 transport just as it does for a missing destination. Set `[mail] transport` to a
-real backend (`smtp`/`log`/`file`) or use a signed webhook.
+real backend (`smtp`/`log`/`file`) or use a signed webhook. Doctor also honours
+the master switch: when `[alerts] enabled = false` (or
+`AUTUMN_ALERTS__ENABLED=false`) in production it warns that no operator alerts
+will be delivered even though a destination is configured, because the runtime
+installs no alerter at all when alerting is disabled.
 
 ---
 
@@ -115,6 +119,13 @@ keeps firing it re-notifies at most once per window as a reminder. When a
 previously-alerted condition clears, **exactly one recovery notification** is
 sent (severity `recovery`, event `resolve`), carrying the same stable dedup key
 as its trigger so an incident manager can auto-resolve the correlated alert.
+
+For the **health-indicator Down** condition, "clears" means the indicator
+reports a genuinely healthy status again (`UP`, or `UNKNOWN` — both of which
+`/actuator/health` treats as healthy). A `Down` indicator that later reports
+`OUT_OF_SERVICE` is **not** a recovery: the service is still non-healthy, so the
+alert stays active and no false recovery is emitted until the indicator is
+actually healthy.
 
 ### Silencing a condition
 

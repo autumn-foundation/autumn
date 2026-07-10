@@ -397,23 +397,71 @@ pub fn check_trusted_hosts_impl(hosts: &[String], is_production: bool) -> CheckR
 /// it is `false` when the effective merged `[mail] transport` resolves to
 /// `disabled`. The webhook path is independent of the mailer.
 ///
-/// - **Production** (`is_production = true`): warns when no usable destination
-///   is configured, so a deploy does not run silently blind to its own
-///   failures. An email whose mail transport is disabled gets a dedicated,
-///   clearer warning rather than the generic "no destination" one.
+/// The `[alerts] enabled` master switch is honoured up front: when alerting is
+/// disabled the runtime (`alerts::install_from_config`) returns BEFORE
+/// installing any `Alerter`, so NO operator alerts are delivered regardless of a
+/// configured destination. In production that earns a dedicated warning (a
+/// deploy running blind), distinct from the "no destination" one; outside
+/// production it stays lenient like the rest of this check.
+///
+/// - **Production** (`is_production = true`): warns when alerting is disabled, or
+///   when no usable destination is configured, so a deploy does not run silently
+///   blind to its own failures. An email whose mail transport is disabled gets a
+///   dedicated, clearer warning rather than the generic "no destination" one.
 /// - **Dev/test**: passes quietly (alerts are optional locally).
 ///
 /// The returned check name is `"alert_destination"`.
-// Four independent config booleans (email present, webhook signed, mail
-// transport usable, production) each gate a distinct branch; grouping them into
-// enums would obscure rather than clarify the destination-resolution logic.
+// Five independent config booleans (alerting enabled, email present, webhook
+// signed, mail transport usable, production) each gate a distinct branch;
+// grouping them into enums would obscure rather than clarify the
+// destination-resolution logic.
 #[allow(clippy::fn_params_excessive_bools)]
 pub fn check_alert_destination_impl(
+    alerts_enabled: bool,
     email_configured: bool,
     webhook_configured: bool,
     mail_transport_usable: bool,
     is_production: bool,
 ) -> CheckResult {
+    // Master off switch: when `[alerts] enabled = false`, the runtime installs no
+    // alerter at all, so a configured destination is inert. Handle this BEFORE
+    // the destination gate — doctor must not pass on the strength of a
+    // configured-but-inert destination.
+    if !alerts_enabled {
+        if is_production {
+            // Name the disabled switch explicitly. Mention the (otherwise valid)
+            // destination when one is configured so the operator understands the
+            // deploy is blind despite it; keep the message accurate otherwise.
+            let has_destination = (email_configured && mail_transport_usable) || webhook_configured;
+            let detail = if has_destination {
+                "alerting is disabled ([alerts] enabled = false) in production, so no operator \
+                 alerts will be delivered — even though a destination is configured"
+            } else {
+                "alerting is disabled ([alerts] enabled = false) in production, so no operator \
+                 alerts will be delivered"
+            };
+            return CheckResult {
+                name: "alert_destination",
+                status: CheckStatus::Warn,
+                detail: Some(detail.into()),
+                hint: Some(
+                    "Set [alerts] enabled = true (or AUTUMN_ALERTS__ENABLED=true) to deliver \
+                     operator alerts, or remove the setting (it defaults to enabled). See \
+                     docs/guide/operator-alerts.md",
+                ),
+            };
+        }
+        return CheckResult {
+            name: "alert_destination",
+            status: CheckStatus::Pass,
+            detail: Some(
+                "operator alerting is disabled ([alerts] enabled = false) (optional outside \
+                 production)"
+                    .into(),
+            ),
+            hint: None,
+        };
+    }
     // Email only counts as a real destination when the mail transport can
     // actually send — mirroring the runtime, which skips MailAlertChannel when
     // `mailer.is_disabled()`.
@@ -2739,6 +2787,88 @@ where
     (email, webhook)
 }
 
+/// Resolve the effective `[alerts] enabled` master switch, mirroring the runtime
+/// config merge and the `AlertConfig::default().enabled` default of `true`.
+///
+/// The runtime's `alerts::install_from_config` returns before installing any
+/// `Alerter` when `enabled` is false, so doctor must consult it: an
+/// `enabled = false` prod config delivers NO operator alerts even with an
+/// `email`/signed-`webhook` populated.
+fn resolve_alert_enabled() -> bool {
+    // Mirror `resolve_alert_destination`'s profile selection and merged-table
+    // build so `enabled` resolves against the same effective config the runtime
+    // boots with (profile inline section + `autumn-{profile}.toml` layered in),
+    // env vars still highest priority.
+    let selected_input = std::env::var("AUTUMN_ENV")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .or_else(|| {
+            std::env::var("AUTUMN_PROFILE")
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+        })
+        .unwrap_or_default()
+        .trim()
+        .to_owned();
+    let normalized_profile = normalize_alert_profile(&selected_input);
+    // The merge flattens the active profile into the top-level `[alerts]`, so
+    // resolve against an EMPTY profile (mirroring `resolve_alert_destination`).
+    let merged = get_merged_toml_table_runtime(&normalized_profile, &selected_input);
+    resolve_alert_enabled_from_sources(|key| std::env::var(key).ok(), Some(&merged), "")
+}
+
+/// Resolve the effective `[alerts] enabled` flag under the same layer precedence
+/// the runtime config merge applies (env `AUTUMN_ALERTS__ENABLED` >
+/// `[profile.{profile}.alerts].enabled` > base `[alerts].enabled`), defaulting to
+/// `true` when unset — matching `AlertConfig::default().enabled`.
+///
+/// Env parsing mirrors the runtime's `parse_env_bool`: `true`/`1` enable,
+/// `false`/`0` disable, and any other value is ignored (falls through to the
+/// TOML layers). Split out from [`resolve_alert_enabled`] so the precedence is
+/// unit-testable without mutating process-global env/cwd state.
+fn resolve_alert_enabled_from_sources<F>(
+    env_var: F,
+    table: Option<&toml::Table>,
+    profile: &str,
+) -> bool
+where
+    F: Fn(&str) -> Option<String>,
+{
+    // 1. Env var — highest priority, mirroring runtime `parse_env_bool`. An
+    //    invalid value (not true/false/1/0) is ignored and falls through.
+    if let Some(val) = env_var("AUTUMN_ALERTS__ENABLED") {
+        match val.as_str() {
+            "true" | "1" => return true,
+            "false" | "0" => return false,
+            _ => {}
+        }
+    }
+    // 2. Profile-specific `[profile.{profile}.alerts].enabled`.
+    if !profile.is_empty()
+        && let Some(v) = table
+            .and_then(|t| t.get("profile"))
+            .and_then(|v| v.get(profile))
+            .and_then(toml::Value::as_table)
+            .and_then(|p| p.get("alerts"))
+            .and_then(toml::Value::as_table)
+            .and_then(|a| a.get("enabled"))
+            .and_then(toml::Value::as_bool)
+    {
+        return v;
+    }
+    // 3. Base `[alerts].enabled`.
+    if let Some(v) = table
+        .and_then(|t| t.get("alerts"))
+        .and_then(toml::Value::as_table)
+        .and_then(|a| a.get("enabled"))
+        .and_then(toml::Value::as_bool)
+    {
+        return v;
+    }
+    // 4. Unset everywhere → alerts enabled (mirrors `AlertConfig::default()`).
+    true
+}
+
 /// Resolve whether the active profile is production from the environment or
 /// `autumn.toml`.
 fn resolve_is_production() -> bool {
@@ -2853,6 +2983,7 @@ pub fn run(opts: DoctorOptions) {
     let auth_extractor_mounted = resolve_auth_extractor_mounted();
     let compression_enabled = resolve_compression_enabled();
     let (alert_email_configured, alert_webhook_configured) = resolve_alert_destination();
+    let alerts_enabled = resolve_alert_enabled();
     let proxy_conflict_data = resolve_proxy_conflict_data();
     let (dotenv_has_example, dotenv_has_env, dotenv_uncovered) = resolve_dotenv_state();
 
@@ -3071,6 +3202,7 @@ pub fn run(opts: DoctorOptions) {
     let mail_transport_usable = !mail_transport_disabled;
     tasks.push(Box::new(move || {
         check_alert_destination_impl(
+            alerts_enabled,
             alert_email_configured,
             alert_webhook_configured,
             mail_transport_usable,
@@ -4589,7 +4721,7 @@ pub struct Vault {
 
     #[test]
     fn alert_destination_warns_in_production_when_none() {
-        let r = check_alert_destination_impl(false, false, true, true);
+        let r = check_alert_destination_impl(true, false, false, true, true);
         assert_eq!(r.name, "alert_destination");
         assert!(matches!(r.status, CheckStatus::Warn));
         assert!(r.hint.is_some());
@@ -4597,19 +4729,19 @@ pub struct Vault {
 
     #[test]
     fn alert_destination_passes_in_production_with_email() {
-        let r = check_alert_destination_impl(true, false, true, true);
+        let r = check_alert_destination_impl(true, true, false, true, true);
         assert!(matches!(r.status, CheckStatus::Pass));
     }
 
     #[test]
     fn alert_destination_passes_in_production_with_webhook() {
-        let r = check_alert_destination_impl(false, true, true, true);
+        let r = check_alert_destination_impl(true, false, true, true, true);
         assert!(matches!(r.status, CheckStatus::Pass));
     }
 
     #[test]
     fn alert_destination_passes_in_dev_without_destination() {
-        let r = check_alert_destination_impl(false, false, true, false);
+        let r = check_alert_destination_impl(true, false, false, true, false);
         assert!(matches!(r.status, CheckStatus::Pass));
     }
 
@@ -4635,7 +4767,7 @@ pub struct Vault {
         let transport = resolve_effective_mail_transport(None, None, "prod");
         assert_eq!(transport, "disabled");
         let usable = transport != "disabled";
-        let r = check_alert_destination_impl(email, webhook, usable, true);
+        let r = check_alert_destination_impl(true, email, webhook, usable, true);
         assert!(
             matches!(r.status, CheckStatus::Warn),
             "email with a disabled mail transport delivers nothing → must warn in prod"
@@ -4658,7 +4790,7 @@ pub struct Vault {
             resolve_alert_destination_from_sources(no_env, Some(&table), "prod");
         let transport = resolve_effective_mail_transport(None, Some("smtp"), "prod");
         assert_eq!(transport, "smtp");
-        let r = check_alert_destination_impl(email, webhook, transport != "disabled", true);
+        let r = check_alert_destination_impl(true, email, webhook, transport != "disabled", true);
         assert!(
             matches!(r.status, CheckStatus::Pass),
             "email with a usable (smtp) transport is a valid destination in prod"
@@ -4679,7 +4811,7 @@ pub struct Vault {
         assert!(!email, "the prod profile cleared the email");
         assert!(webhook, "the signed webhook remains configured");
         // Mail transport disabled — irrelevant to the webhook path.
-        let r = check_alert_destination_impl(email, webhook, false, true);
+        let r = check_alert_destination_impl(true, email, webhook, false, true);
         assert!(
             matches!(r.status, CheckStatus::Pass),
             "a signed webhook is a valid destination regardless of mail transport"
@@ -4716,7 +4848,7 @@ pub struct Vault {
         );
 
         // And the surfaced doctor check warns in production for this config.
-        let r = check_alert_destination_impl(email, false, true, true);
+        let r = check_alert_destination_impl(true, email, false, true, true);
         assert!(matches!(r.status, CheckStatus::Warn));
     }
 
@@ -4783,7 +4915,7 @@ pub struct Vault {
             webhook,
             "webhook_url + webhook_secret must count as configured"
         );
-        let r = check_alert_destination_impl(email, webhook, true, true);
+        let r = check_alert_destination_impl(true, email, webhook, true, true);
         assert!(matches!(r.status, CheckStatus::Pass));
     }
 
@@ -4799,7 +4931,7 @@ pub struct Vault {
             !webhook,
             "a webhook_url with no signing secret is not a destination"
         );
-        let r = check_alert_destination_impl(email, webhook, true, true);
+        let r = check_alert_destination_impl(true, email, webhook, true, true);
         assert!(
             matches!(r.status, CheckStatus::Warn),
             "URL-without-secret in production must warn"
@@ -4821,7 +4953,7 @@ pub struct Vault {
             !webhook,
             "a prod-profile empty webhook_secret must clear the base secret"
         );
-        let r = check_alert_destination_impl(email, webhook, true, true);
+        let r = check_alert_destination_impl(true, email, webhook, true, true);
         assert!(matches!(r.status, CheckStatus::Warn));
 
         // And an empty AUTUMN_ALERTS__WEBHOOK_SECRET env var clears it just the same.
@@ -4875,7 +5007,7 @@ pub struct Vault {
             !email,
             "an autumn-prod.toml that clears [alerts].email must resolve as no destination"
         );
-        let r = check_alert_destination_impl(email, false, true, true);
+        let r = check_alert_destination_impl(true, email, false, true, true);
         assert!(
             matches!(r.status, CheckStatus::Warn),
             "a production deploy whose override file cleared the only alert channel must WARN"
@@ -4914,7 +5046,7 @@ pub struct Vault {
         let (email, webhook) = resolve_alert_destination_from_sources(no_env, Some(&merged), "");
         assert!(email);
         assert!(!webhook);
-        let r = check_alert_destination_impl(email, webhook, true, true);
+        let r = check_alert_destination_impl(true, email, webhook, true, true);
         assert!(matches!(r.status, CheckStatus::Pass));
     }
 
@@ -4937,7 +5069,7 @@ pub struct Vault {
             !webhook,
             "a webhook whose secret was cleared by the override file is not a signed destination"
         );
-        let r = check_alert_destination_impl(email, webhook, true, true);
+        let r = check_alert_destination_impl(true, email, webhook, true, true);
         assert!(matches!(r.status, CheckStatus::Warn));
 
         // With both left intact through the merged view, the webhook still counts.
@@ -4949,6 +5081,126 @@ pub struct Vault {
         assert!(
             webhook_ok,
             "url + secret through the merged view is a signed destination"
+        );
+    }
+
+    // ── [alerts] enabled master switch (issue #1610 follow-up) ────────────────
+    // The runtime `alerts::install_from_config` returns BEFORE installing any
+    // Alerter when `config.enabled` is false, so a prod deploy with alerting
+    // disabled delivers nothing even with a destination configured. Doctor must
+    // honour the same master switch (env > profile > base > default `true`).
+
+    #[test]
+    fn resolve_alert_enabled_defaults_true_when_unset() {
+        // No `enabled` key anywhere → the runtime default (`true`) applies.
+        let table: toml::Table = toml::from_str("[alerts]\nemail = \"ops@example.com\"\n").unwrap();
+        let enabled = resolve_alert_enabled_from_sources(no_env, Some(&table), "prod");
+        assert!(enabled);
+        // Nothing configured at all still defaults to enabled.
+        assert!(resolve_alert_enabled_from_sources(no_env, None, "prod"));
+    }
+
+    #[test]
+    fn resolve_alert_enabled_base_false_is_detected() {
+        let table: toml::Table =
+            toml::from_str("[alerts]\nenabled = false\nemail = \"ops@example.com\"\n").unwrap();
+        let enabled = resolve_alert_enabled_from_sources(no_env, Some(&table), "prod");
+        assert!(!enabled);
+    }
+
+    #[test]
+    fn resolve_alert_enabled_env_true_overrides_base_false() {
+        // Env parsing mirrors runtime `parse_env_bool`: "true"/"1" enable.
+        let env = |k: &str| (k == "AUTUMN_ALERTS__ENABLED").then(|| "true".to_owned());
+        let table: toml::Table = toml::from_str("[alerts]\nenabled = false\n").unwrap();
+        let enabled = resolve_alert_enabled_from_sources(env, Some(&table), "prod");
+        assert!(enabled);
+        let env1 = |k: &str| (k == "AUTUMN_ALERTS__ENABLED").then(|| "1".to_owned());
+        let enabled_one = resolve_alert_enabled_from_sources(env1, Some(&table), "prod");
+        assert!(enabled_one);
+    }
+
+    #[test]
+    fn resolve_alert_enabled_invalid_env_falls_through_to_toml() {
+        // A non-boolean env value is ignored (mirrors runtime), so the base
+        // `enabled = false` still wins.
+        let env = |k: &str| (k == "AUTUMN_ALERTS__ENABLED").then(|| "yes".to_owned());
+        let table: toml::Table = toml::from_str("[alerts]\nenabled = false\n").unwrap();
+        let enabled = resolve_alert_enabled_from_sources(env, Some(&table), "prod");
+        assert!(!enabled);
+    }
+
+    #[test]
+    fn resolve_alert_enabled_profile_false_overrides_base_true() {
+        // A profile-specific `enabled = false` disables under that profile while
+        // the base (empty-profile resolution) stays enabled.
+        let table: toml::Table = toml::from_str(
+            "[alerts]\nemail = \"ops@example.com\"\n[profile.prod.alerts]\nenabled = false\n",
+        )
+        .unwrap();
+        let under_profile = resolve_alert_enabled_from_sources(no_env, Some(&table), "prod");
+        assert!(!under_profile);
+        let under_base = resolve_alert_enabled_from_sources(no_env, Some(&table), "");
+        assert!(under_base);
+    }
+
+    #[test]
+    fn alert_disabled_at_base_in_prod_with_email_warns() {
+        // (a) `[alerts] enabled = false` at base, email set, production run → warn.
+        let table: toml::Table =
+            toml::from_str("[alerts]\nenabled = false\nemail = \"ops@example.com\"\n").unwrap();
+        let enabled = resolve_alert_enabled_from_sources(no_env, Some(&table), "prod");
+        let (email, webhook) = resolve_alert_destination_from_sources(no_env, Some(&table), "prod");
+        assert!(!enabled);
+        assert!(email, "the email itself is still configured");
+        let r = check_alert_destination_impl(enabled, email, webhook, true, true);
+        assert!(
+            matches!(r.status, CheckStatus::Warn),
+            "disabled alerting with a configured destination must warn in prod"
+        );
+        assert!(
+            r.detail.as_deref().is_some_and(|d| d.contains("disabled")),
+            "the warning must name the disabled master switch"
+        );
+    }
+
+    #[test]
+    fn alert_disabled_via_env_in_prod_warns() {
+        // (b) `AUTUMN_ALERTS__ENABLED=false` env override in production → warn,
+        // even though the base leaves alerting enabled with an email set.
+        let env = |k: &str| (k == "AUTUMN_ALERTS__ENABLED").then(|| "false".to_owned());
+        let table: toml::Table = toml::from_str("[alerts]\nemail = \"ops@example.com\"\n").unwrap();
+        let enabled = resolve_alert_enabled_from_sources(env, Some(&table), "prod");
+        let (email, webhook) = resolve_alert_destination_from_sources(no_env, Some(&table), "prod");
+        assert!(!enabled);
+        let r = check_alert_destination_impl(enabled, email, webhook, true, true);
+        assert!(matches!(r.status, CheckStatus::Warn));
+    }
+
+    #[test]
+    fn alert_enabled_default_true_preserves_existing_prod_pass() {
+        // (c) `enabled` unset → defaults true; a configured email + usable
+        // transport in prod still passes exactly as before this change.
+        let table: toml::Table = toml::from_str("[alerts]\nemail = \"ops@example.com\"\n").unwrap();
+        let enabled = resolve_alert_enabled_from_sources(no_env, Some(&table), "prod");
+        let (email, webhook) = resolve_alert_destination_from_sources(no_env, Some(&table), "prod");
+        assert!(enabled);
+        let r = check_alert_destination_impl(enabled, email, webhook, true, true);
+        assert!(matches!(r.status, CheckStatus::Pass));
+    }
+
+    #[test]
+    fn alert_disabled_in_dev_does_not_warn() {
+        // (d) Disabled in DEV stays lenient (no warning) like the rest of the check.
+        let table: toml::Table =
+            toml::from_str("[alerts]\nenabled = false\nemail = \"ops@example.com\"\n").unwrap();
+        let enabled = resolve_alert_enabled_from_sources(no_env, Some(&table), "dev");
+        let (email, webhook) = resolve_alert_destination_from_sources(no_env, Some(&table), "dev");
+        assert!(!enabled);
+        let r = check_alert_destination_impl(enabled, email, webhook, true, false);
+        assert!(
+            matches!(r.status, CheckStatus::Pass),
+            "dev-mode leniency: disabled alerting must not warn outside production"
         );
     }
 
