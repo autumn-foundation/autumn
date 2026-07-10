@@ -12,6 +12,47 @@ use crate::{
     ListResult, SelectOption,
 };
 
+// ── Grouped-aggregate roll-up over the audit trail (#1364) ──────────────────
+//
+// A typed `#[repository]` over `autumn_experiment_changes` so the per-experiment
+// audit-trail size is computed with the grouped-aggregate API
+// (`count_grouped_by_experiment().filter_eq(name)`) instead of a hand-written
+// `SELECT COUNT(*) … WHERE experiment = $1`. The repo is built here via
+// `with_pool_untracked`, which is pool-aware but pins `ReadRoute::Primary` (it
+// carries no request/`AppState` read-route context) — so this read runs on the
+// primary, NOT a replica. A request-scoped constructor would let the same query
+// route to a replica for free.
+
+diesel::table! {
+    autumn_experiment_changes (id) {
+        id -> diesel::sql_types::Int8,
+        experiment -> diesel::sql_types::Text,
+        mutation -> diesel::sql_types::Text,
+        actor -> diesel::sql_types::Nullable<diesel::sql_types::Text>,
+        changed_at -> diesel::sql_types::Timestamptz,
+    }
+}
+
+#[autumn_web::model(table = "autumn_experiment_changes")]
+pub struct ExperimentChange {
+    #[id]
+    pub id: i64,
+    #[indexed]
+    pub experiment: String,
+    pub mutation: String,
+    pub actor: Option<String>,
+    #[default]
+    pub changed_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[autumn_web::repository(ExperimentChange, table = "autumn_experiment_changes")]
+pub trait ExperimentChangeRepository {
+    /// COUNT(*) GROUP BY experiment → one `(experiment, count)` pair per
+    /// experiment; `.filter_eq(name)` narrows it to a single experiment's
+    /// audit-trail size.
+    fn count_grouped_by_experiment() -> Vec<(String, i64)>;
+}
+
 /// Admin panel model for A/B experiments.
 ///
 /// Register this model with the admin plugin to get an experiment management UI
@@ -496,14 +537,6 @@ impl AdminModel for ExperimentAdminModel {
                 });
             };
 
-            let count: i64 = diesel::sql_query(
-                "SELECT COUNT(*) FROM autumn_experiment_changes WHERE experiment = $1",
-            )
-            .bind::<diesel::sql_types::Text, _>(&name)
-            .get_result::<CountRow>(&mut conn)
-            .await
-            .map_or(0, |r| r.count);
-
             let offset = (page.saturating_sub(1)) * per_page;
             let entries: Vec<crate::AdminHistoryEntry> = diesel::sql_query(
                 "SELECT id, mutation AS op, actor, changed_at \
@@ -528,6 +561,29 @@ impl AdminModel for ExperimentAdminModel {
                 recorded_at: r.changed_at,
             })
             .collect();
+
+            // Release this handler's connection before the grouped-aggregate
+            // count checks out its own. `conn` is held for the name + entries
+            // lookups above, and on a single-connection pool (max_size = 1, no
+            // read replica) a second concurrent checkout would block until the
+            // pool timeout — deadlocking the history page. The count does not
+            // depend on `entries`, so running it last, after `conn` is dropped,
+            // keeps the two checkouts from overlapping.
+            drop(conn);
+
+            // Audit-trail size via the typed grouped-aggregate API (#1364):
+            // COUNT(*) GROUP BY experiment, scoped to this experiment. Grouping
+            // on the filtered column yields a single `(name, count)` row (or
+            // none when the experiment has no history). Errors degrade to 0,
+            // matching the previous raw-SQL `map_or(0, …)`.
+            let count: i64 = PgExperimentChangeRepository::with_pool_untracked(pool.clone())
+                .count_grouped_by_experiment()
+                .filter_eq(name.clone())
+                .load()
+                .await
+                .ok()
+                .and_then(|rows| rows.into_iter().next())
+                .map_or(0, |(_, c)| c);
 
             Ok(AdminHistoryPage {
                 entries,

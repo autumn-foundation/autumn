@@ -209,6 +209,14 @@ Next steps:
    .mail_previews(mail_previews![UserMailer])
 
 3. Preview at: http://localhost:3000/_autumn/mail (dev mode only)
+
+4. CSS inlining (issue #1254): the scaffolded `templates/mailers/<name>.html`
+   ships a `<style>` block with CSS classes, and the generated mailer calls
+   `.inline_css(true)`. At send time those `<style>` rules are rewritten onto the
+   elements as `style="…"` attributes so the mail renders styled in Gmail/Outlook
+   (which strip `<head>`/`<style>`). Author with classes; keep `.inline_css(true)`.
+   To default inlining on for every mailer instead, set `mail.inline_css = true`
+   in autumn.toml and drop the per-message call.
 ```
 
 ### task

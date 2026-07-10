@@ -142,3 +142,25 @@ jobs:
         run: ./scripts/check-msrv.sh
       - name: Check MSRV compiles
         run: cargo check --workspace
+
+  # Genuine loom model checks: the loom_models test binary uses loom::sync::*
+  # unconditionally, so loom::model() exhaustively explores thread interleavings
+  # here. We gate the binary with a NEUTRAL custom cfg (loom_models) rather than
+  # the conventional `--cfg loom`, because `--cfg loom` poisons the whole
+  # dependency tree — hyper-util/tokio ship their own `#[cfg(loom)]` type-swap
+  # paths that fail to compile. Release mode is loom's own recommendation, and
+  # the preemption budget + job timeout bound the state-space search.
+  loom:
+    name: Loom
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.7.8
+      - name: Run loom model checks
+        run: cargo test -p autumn-web --release --test loom_models
+        env:
+          RUSTFLAGS: "--cfg loom_models"
+          LOOM_MAX_PREEMPTIONS: "3"

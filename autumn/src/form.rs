@@ -579,6 +579,20 @@ fn decode_urlencoded_dropping_blank_optional_fields<T: serde::de::DeserializeOwn
     }
 }
 
+/// Fuzzing seam: run the `application/x-www-form-urlencoded` body decoder
+/// (including the blank-optional-field retry loop) over arbitrary bytes.
+/// Deserializes into a permissive `HashMap` so any well-formed pair shape is
+/// accepted and only panics (not decode errors) are of interest.
+///
+/// Compiled only under `--cfg fuzzing`; the published crate is unaffected.
+/// See `fuzz/fuzz_targets/body.rs`.
+#[cfg(fuzzing)]
+pub fn __fuzz_decode_urlencoded(bytes: &[u8]) {
+    let _ = decode_urlencoded_dropping_blank_optional_fields::<
+        std::collections::HashMap<String, String>,
+    >(bytes);
+}
+
 /// Decode `multipart/form-data` text fields and deserialize into `T`.
 ///
 /// File-upload fields are skipped (file storage is out of scope here).

@@ -15,9 +15,10 @@
 
 use crate::hooks::PostHooks;
 use crate::models::{
-    NewPost, NewSubreddit, Post, PostDraftExt, Subreddit, UpdatePost, UpdateSubreddit,
+    NewPost, NewSubreddit, NewVote, Post, PostDraftExt, Subreddit, UpdatePost, UpdateSubreddit,
+    UpdateVote, Vote,
 };
-use crate::schema::{posts, subreddits};
+use crate::schema::{posts, subreddits, votes};
 
 #[autumn_web::repository(Subreddit, api = "/api/subreddits")]
 pub trait SubredditRepository {
@@ -54,6 +55,20 @@ pub trait PostRepository {
 
     /// SELECT * FROM posts WHERE author_id = $1
     fn find_by_author_id(author_id: i64) -> Vec<Post>;
+}
+
+// Typed grouped aggregate (#1364): `sum_value_grouped_by_post_id` rolls the
+// votes table up to `SUM(value) GROUP BY post_id`, returning one
+// `(post_id, Option<sum>)` pair per post. The front-page "Top posts by votes"
+// leaderboard (`routes::posts::front_page`) chains
+// `.order_by_aggregate_desc().limit(5)` for a top-N roll-up in a single call —
+// a *read*, so it is replica-eligible via the repository's read route. Note the
+// score-maintenance path in `routes::votes` is deliberately NOT this API: score
+// upkeep is an atomic primary-side `UPDATE`, not a read-then-write.
+#[autumn_web::repository(Vote, table = "votes")]
+pub trait VoteRepository {
+    /// SUM(value) GROUP BY post_id -> `Vec<(post_id, Option<sum>)>`.
+    fn sum_value_grouped_by_post_id() -> Vec<(i64, Option<i64>)>;
 }
 
 #[derive(Clone, Debug)]

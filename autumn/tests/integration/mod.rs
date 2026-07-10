@@ -87,6 +87,8 @@ mod load_shed;
 #[cfg(feature = "mail")]
 mod mail;
 #[cfg(feature = "mail")]
+mod mail_css_inline;
+#[cfg(feature = "mail")]
 mod mail_layout;
 #[cfg(feature = "mail")]
 mod mail_macro;
@@ -109,6 +111,8 @@ mod mcp_streaming;
 mod middleware_introspection;
 mod middleware_pipeline;
 #[cfg(feature = "db")]
+mod migrate_checksum_proptest;
+#[cfg(feature = "db")]
 mod model_field_attrs;
 #[cfg(feature = "offline-sync")]
 mod offline_sync_conformance;
@@ -121,6 +125,7 @@ mod offline_sync_store;
 #[cfg(feature = "openapi")]
 mod openapi;
 mod pagination;
+mod pagination_cursor_proptest;
 mod path_helpers;
 #[cfg(feature = "db")]
 mod pg_tls;
@@ -145,6 +150,8 @@ mod repository_find_in_batches;
 mod repository_find_or_create_by;
 #[cfg(feature = "db")]
 mod repository_from_shard;
+#[cfg(feature = "db")]
+mod repository_grouped_aggregates;
 #[cfg(all(feature = "db", feature = "openapi"))]
 mod repository_openapi;
 #[cfg(feature = "db")]

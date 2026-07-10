@@ -88,6 +88,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the trio as the no-JS `tablist`/`tabpanel` switcher (issue #1316). Semantic
   `.autumn-toast*` / `.autumn-feed*` classes backed by the shipped `WIDGETS_CSS`
   stylesheet; all caller input HTML-escaped by Maud.
+- **fuzzing:** coverage-guided fuzz harness (cargo-fuzz / libFuzzer) over the
+  untrusted request-path parsing surface — idempotency-key, routing, headers,
+  session-cookie, and body decoders — wired into CI as a per-PR crash gate
+  (`fuzz.yml`, 30s/target seeded from the committed corpus) plus a nightly
+  corpus-persisting long-run (`fuzz-nightly.yml`, 300s/target); crash
+  reproducers upload as artifacts and the triage contract is documented in
+  `CONTRIBUTING.md`. Developer tooling with no agent-facing framework surface
+  (Closes #1637). [no-plugin]
+- **testing:** property-based (proptest) invariant tests for the parser/codec
+  surfaces, asserting round-trip and well-formedness invariants alongside the
+  fuzz harness. Test-only, no public API change. [no-plugin]
+- **mail:** automatic CSS inlining for HTML email (issue #1254). HTML bodies
+  authored with a `<style>` block and CSS classes are transformed at send time
+  so matching elements carry equivalent `style="…"` attributes in the delivered
+  message — the fix for Gmail/Outlook stripping `<head>`/`<style>`. Opt in per
+  message with `MailBuilder::inline_css(true)` or default it per environment via
+  `mail.inline_css = true` (`MailConfig::inline_css` / `MailerBuilder::inline_css`);
+  an explicit builder call wins over the config default in either direction, and
+  the default is off so existing apps are unaffected. Un-inlinable `@media`/
+  pseudo-class rules are preserved in a retained `<style>` block, text parts and
+  bodies with no `<style>` pass through unchanged, and inlining is idempotent.
+  Backed by the mature `css-inline` crate (gated behind the `mail` feature, with
+  its network/file stylesheet fetchers disabled — only embedded `<style>` CSS is
+  inlined). `autumn generate mailer` now scaffolds a `<style>`-block template and
+  a mailer that calls `.inline_css(true)`, demonstrating the happy path end to
+  end. On inliner failure `send` fails loudly, returning a typed
+  `MailError::CssInline` instead of delivering a corrupted body — the message is
+  not sent, so the body is never silently corrupted. Deferred/durable-queue
+  sends (`deliver_later`) freeze the originating mailer's inlining default onto
+  the message before it is persisted, so a worker consuming the queue with a
+  different default still honors the sender's decision (explicit per-message
+  overrides are preserved). The dev mail preview UI runs the same inlining pass
+  as `send`, so previews of `<style>`-block templates show the inlined
+  `style="…"` bodies strict clients actually receive rather than raw CSS.
 - **generator:** `autumn new` now generates a `README.md` at the project root
   (listed in the "Created …" output) with explicit prerequisites and a
   golden-path quickstart — configure the `[database]` block in `autumn.toml`
@@ -414,6 +448,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   through `across_tenants()` is rejected rather than silently writing to a single
   shard while matching rows on other shards go unseen. See the
   "Race-safe get-or-insert" section of the repositories guide.
+- **repository:** typed grouped aggregate queries (#1364) — declarative
+  `GROUP BY` roll-ups on a `#[repository]` trait. **Before:** dashboard
+  aggregates (a post's vote tally, an experiment's audit-trail size) were
+  hand-written raw `diesel::sql_query("SELECT … SUM/COUNT … GROUP BY …")`
+  strings that bypassed the repository's replica routing, tenant scoping, and
+  soft-delete filters and had to be re-typed for every widening cast.
+  **After:** declare the aggregate by method name with its pair return type —
+  `count_grouped_by_<col>() -> Vec<(K, i64)>` or
+  `sum_/avg_/min_/max_<num_col>_grouped_by_<col>() -> Vec<(K, Option<T>)>`
+  (`avg` rolls up to `Option<f64>`) — and the macro generates an inherent
+  method returning a lazy `GroupedAggregate<'_, K, V>` builder that yields one
+  `(group, aggregate)` pair per group. Chain `.order_by_aggregate_desc()` /
+  `.limit(n)` for top-N, `.filter_eq(v)` / `.filter_range(lo, hi)` to scope the
+  group column *before* aggregating, or `.bucket(DateBucket::{Day,Week,Month})`
+  for a `date_trunc` time series, then `.load().await`. Filter values are bound
+  as parameters (never interpolated); the query composes the same soft-delete +
+  tenant predicates as `count` and acquires its connection through the read
+  route, so replica routing and multi-tenancy come for free.
+  `sum`/`avg`/`min`/`max` are null-safe (an all-`NULL` group yields `None`, an
+  empty table an empty `Vec`) and are rejected on a sharded, tenant-scoped
+  repository used via `across_tenants()` rather than returning a
+  per-shard-partial answer. The reddit-clone vote tally and the admin
+  experiment-history count now use this instead of raw `SUM`/`COUNT` SQL.
+  Closes #1364. See "Grouped aggregate queries" in
+  `docs/guide/repositories.md`.
 - **widgets:** `flash_messages(&[FlashMessage])` (issue #1240) — an accessible
   renderer for consumed flash messages. Each banner is its own live region
   whose `role`/`aria-live` is chosen by severity (`Error`/`Warning` announce
@@ -982,6 +1041,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **idempotency:** the in-memory idempotency store no longer panics on extreme
+  TTL values. `Instant::now() + ttl` panics when the sum is not representable by
+  the platform clock, so a pathological configured or attacker-influenced TTL
+  (e.g. `Duration::MAX` / `Duration::from_secs(u64::MAX)`) could crash the
+  process; deadlines are now computed with a saturating helper that clamps to a
+  far-but-representable future.
 - **observability:** `Server-Timing` no longer miscounts pooled-connection reuse
   in the `db` metric. Connections are pooled and diesel-async's deadpool manager
   never resets a connection's instrumentation on recycle, so a connection that
