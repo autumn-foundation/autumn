@@ -4076,8 +4076,8 @@ fn resolve_bounds(points: &[(&str, f64)], config: &ChartConfig<'_>) -> (f64, f64
         data_min = 0.0;
         data_max = 1.0;
     }
-    let mut min = config.min.unwrap_or(data_min);
-    let mut max = config.max.unwrap_or(data_max);
+    let mut min = config.min.filter(|v| v.is_finite()).unwrap_or(data_min);
+    let mut max = config.max.filter(|v| v.is_finite()).unwrap_or(data_max);
     if max < min {
         std::mem::swap(&mut min, &mut max);
     }
@@ -4109,8 +4109,14 @@ fn resolve_bar_bounds(points: &[(&str, f64)], config: &ChartConfig<'_>) -> (f64,
         data_min = 0.0;
         data_max = 1.0;
     }
-    let mut min = config.min.unwrap_or_else(|| data_min.min(0.0));
-    let mut max = config.max.unwrap_or_else(|| data_max.max(0.0));
+    let mut min = config
+        .min
+        .filter(|v| v.is_finite())
+        .unwrap_or_else(|| data_min.min(0.0));
+    let mut max = config
+        .max
+        .filter(|v| v.is_finite())
+        .unwrap_or_else(|| data_max.max(0.0));
     if max < min {
         std::mem::swap(&mut min, &mut max);
     }
@@ -6335,6 +6341,48 @@ mod tests {
         // (the auto-scaled chart puts the middle datum at y=15 instead).
         assert!(overridden.contains("50,26.7"), "{overridden}");
         assert!(auto.contains("50,15"), "{auto}");
+    }
+
+    #[test]
+    fn non_finite_axis_override_is_ignored_no_nan_in_output() {
+        let data = [("a", 1.0), ("b", 2.0), ("c", 3.0)];
+        // A non-finite caller override (e.g. arriving from an upstream
+        // aggregate's `Option<f64>`) must be treated as UNSET: the auto-scaled
+        // bound is used instead, so the emitted SVG can never contain invalid
+        // coordinates like `NaN` / `inf` / `Infinity`.
+        let bad_configs = [
+            ChartConfig::new().max(f64::NAN),
+            ChartConfig::new().min(f64::INFINITY),
+            ChartConfig::new().min(f64::NEG_INFINITY),
+            ChartConfig::new().max(f64::INFINITY),
+        ];
+        let check = |name: &str, render: &dyn Fn(&ChartConfig<'_>) -> String| {
+            let auto = render(&ChartConfig::new());
+            for config in &bad_configs {
+                let overridden = render(config);
+                for needle in ["NaN", "inf", "Infinity"] {
+                    assert!(
+                        !overridden.contains(needle),
+                        "{name}: non-finite override leaked `{needle}` into SVG: {overridden}"
+                    );
+                }
+                // The non-finite override is ignored, so the geometry is
+                // identical to the un-overridden auto-scaled chart.
+                assert_eq!(
+                    auto, overridden,
+                    "{name}: non-finite override must be ignored (auto-scale used)"
+                );
+            }
+        };
+        check("sparkline", &|config| {
+            sparkline_with(&data, config).into_string()
+        });
+        check("line_chart", &|config| {
+            line_chart_with(&data, config).into_string()
+        });
+        check("bar_chart", &|config| {
+            bar_chart_with(&data, config).into_string()
+        });
     }
 
     #[test]
