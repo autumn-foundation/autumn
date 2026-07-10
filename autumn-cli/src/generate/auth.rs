@@ -2506,12 +2506,22 @@ async fn establish_remember_login(
     headers: &axum::http::HeaderMap,
 ) {{
     session.rotate_id().await;
-    // `rotate_id()` PRESERVES existing session data, so a stale step-up
-    // "recently did strong auth" claim from a prior authenticated state in this
-    // browser could survive into the restored session. Actively CLEAR it before
+    // `rotate_id()` PRESERVES existing session data, so ANY stale step-up /
+    // reauth elevation marker from a prior authenticated state in this browser
+    // could survive into the restored session. Actively CLEAR them ALL before
     // writing identity keys — a remember-cookie restore must never inherit a
-    // prior session's "sudo mode" (issue #833/#1397).
+    // prior session's "sudo mode", nor resume a mid-step-up elevated state.
+    // Two markers grant/advance elevation and must be dropped:
+    //   * `last_strong_auth_at` (STEP_UP_SESSION_KEY) — the "recently did strong
+    //     auth" claim that `#[step_up]` routes check.
+    //   * `reauth_pw_ok` — the reauth flow's "password already verified, awaiting
+    //     TOTP code" marker (valid ~10 min). Left behind, a restored session
+    //     could POST /reauth with only a TOTP/recovery code and mint a fresh
+    //     `last_strong_auth_at` WITHOUT re-entering the password, defeating this
+    //     downgrade. `rotate_id()` preserves it too, so clear it here as well.
+    // (issue #833/#1397).
     session.remove(autumn_web::step_up::STEP_UP_SESSION_KEY).await;
+    session.remove("reauth_pw_ok").await;
     // A remembered request must be fully authenticated for protected routes:
     // write the SAME identity keys login writes. `{snake_name}_id` powers the
     // identity extractors / tracked-session lookup, and the configured
