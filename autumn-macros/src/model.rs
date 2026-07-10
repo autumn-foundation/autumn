@@ -1729,11 +1729,21 @@ fn fake_expr_core(name: &str, ty: &syn::Type) -> Option<TokenStream> {
     let last = ty_last_ident(ty)?;
     match last.as_str() {
         "String" => Some(fake_string_expr(name)),
-        "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64" | "usize" | "isize" => {
+        "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64" | "u128" | "i128" | "usize"
+        | "isize" => {
             let cast = format_ident!("{last}");
             // Default numeric range covers the name-based hints (count/age/qty →
-            // small non-negative ints).
-            Some(quote! { (::autumn_web::fake::int_range(0, 1000) as #cast) })
+            // small non-negative ints). `int_range` works in `i64`, so pick an
+            // upper bound that both fits `i64` and stays inside the target type:
+            // for the narrow `i8`/`u8` types the default 1000 would overflow the
+            // `as` cast (`1000 as u8 == 232`, `1000 as i8 == -24`), so clamp to
+            // that type's own maximum. All wider types keep the 1000 default.
+            let hi: i64 = match last.as_str() {
+                "i8" => i64::from(i8::MAX),
+                "u8" => i64::from(u8::MAX),
+                _ => 1000,
+            };
+            Some(quote! { (::autumn_web::fake::int_range(0, #hi) as #cast) })
         }
         "f32" | "f64" => {
             let cast = format_ident!("{last}");
@@ -4189,6 +4199,15 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 self
             }
 
+            /// Alias for [`fake`](Self::fake): fill every field that was not
+            /// explicitly set with realistic fake data when building. Provided
+            /// so both spellings from the `.fake()`/`.fake_all()` API read
+            /// naturally (#1343 AC2).
+            #[must_use]
+            pub fn fake_all(self) -> Self {
+                self.fake()
+            }
+
             /// Build a [`#new_name`] instance from the current factory state.
             ///
             /// Does not touch the database. Use [`#factory_name::create`] to
@@ -4392,6 +4411,53 @@ pub fn pascal_to_snake(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Fake integer inference width safety (#1343 FIX4) ──────────────────
+
+    #[test]
+    fn fake_int_ranges_never_truncate_the_cast() {
+        // Narrow types must clamp the range to their own maximum so the `as`
+        // cast can't wrap (`1000 as u8 == 232`, `1000 as i8 == -24`).
+        let expr = |ty: syn::Type| {
+            fake_expr_core("count", &ty)
+                .expect("integer type should infer a fake expr")
+                .to_string()
+        };
+
+        let i8_expr = expr(syn::parse_quote!(i8));
+        assert!(i8_expr.contains("as i8"), "{i8_expr}");
+        assert!(
+            i8_expr.contains("127i64"),
+            "i8 must clamp to i8::MAX: {i8_expr}"
+        );
+
+        let u8_expr = expr(syn::parse_quote!(u8));
+        assert!(u8_expr.contains("as u8"), "{u8_expr}");
+        assert!(
+            u8_expr.contains("255i64"),
+            "u8 must clamp to u8::MAX: {u8_expr}"
+        );
+
+        // Wider types keep the default 1000 upper bound (all fit comfortably).
+        for wide in ["i16", "i32", "i64", "u16", "u32", "u64", "usize", "isize"] {
+            let ty: syn::Type = syn::parse_str(wide).unwrap();
+            let e = expr(ty);
+            assert!(e.contains(&format!("as {wide}")), "{e}");
+            assert!(e.contains("1000"), "{wide} should keep 1000 default: {e}");
+        }
+
+        // 128-bit widths are matched (previously fell through to Default 0).
+        let i128_expr = expr(syn::parse_quote!(i128));
+        assert!(
+            i128_expr.contains("as i128"),
+            "i128 must be matched: {i128_expr}"
+        );
+        let u128_expr = expr(syn::parse_quote!(u128));
+        assert!(
+            u128_expr.contains("as u128"),
+            "u128 must be matched: {u128_expr}"
+        );
+    }
 
     // ── Serde-rename resolution for FormField::value_name (#1135) ─────────
 

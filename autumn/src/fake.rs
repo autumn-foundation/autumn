@@ -9,7 +9,7 @@
 //! The generator can run in two modes:
 //!
 //! - **Deterministic**: when the `AUTUMN_FAKE_SEED` environment variable is set
-//!   to a `u64`, or when [`reseed`] is called explicitly, the thread-local RNG
+//!   to a `u64`, or when [`reseed`] is called explicitly, the process-global RNG
 //!   is seeded from that value. The exact same sequence of calls then produces
 //!   the exact same values on every run — ideal for golden tests and
 //!   reproducible fixtures. In this mode time-based helpers such as
@@ -20,8 +20,20 @@
 //!
 //! The RNG is [`rand_chacha::ChaCha8Rng`], chosen because ChaCha is portable and
 //! reproducible across platforms given the same seed.
+//!
+//! # Why process-global (not thread-local)
+//!
+//! The generator is a single process-global RNG behind a [`Mutex`], **not** a
+//! per-thread one. `#[autumn_web::main]` runs on a multi-thread tokio runtime,
+//! and a faked `create_many` awaits a pooled connection between rows, so the
+//! driving task freely migrates between worker threads mid-run. A thread-local
+//! RNG would let a freshly-touched thread lazily re-seed itself from the *same*
+//! `AUTUMN_FAKE_SEED` and restart the identical sequence — producing duplicate
+//! rows and destroying reproducibility under a seed. Drawing every value from
+//! one shared sequence keeps a seeded run deterministic and distinct no matter
+//! how tasks are scheduled across threads.
 
-use std::cell::RefCell;
+use std::sync::{Mutex, OnceLock, PoisonError};
 
 use chrono::{DateTime, Utc};
 use rand::{Rng, RngCore, SeedableRng};
@@ -29,7 +41,7 @@ use rand_chacha::ChaCha8Rng;
 use rust_decimal::Decimal;
 use uuid::Uuid;
 
-/// Per-thread generator state.
+/// Process-global generator state.
 struct FakeState {
     rng: ChaCha8Rng,
     /// True when the RNG was seeded deterministically (via `AUTUMN_FAKE_SEED` or
@@ -37,24 +49,25 @@ struct FakeState {
     deterministic: bool,
 }
 
-thread_local! {
-    static RNG: RefCell<Option<FakeState>> = const { RefCell::new(None) };
-}
+/// The one shared generator, initialized on first use. All threads and tasks
+/// draw from this single sequence so a seeded run is reproducible regardless of
+/// how work is scheduled across the multi-thread runtime.
+static RNG: OnceLock<Mutex<FakeState>> = OnceLock::new();
 
 /// The fixed base instant used by time helpers in deterministic mode.
 /// Chosen as `2024-01-01T00:00:00Z`.
 const DETERMINISTIC_BASE_EPOCH_SECS: i64 = 1_704_067_200;
 
-/// Ensure the thread-local generator is initialized, seeding it on first use.
+/// Get the process-global generator, initializing it on first use.
 ///
 /// Seeds deterministically from `AUTUMN_FAKE_SEED` when that env var parses as a
 /// `u64`; otherwise seeds from OS entropy.
-fn ensure_init(cell: &mut Option<FakeState>) {
-    if cell.is_none() {
+fn global() -> &'static Mutex<FakeState> {
+    RNG.get_or_init(|| {
         let seed = std::env::var("AUTUMN_FAKE_SEED")
             .ok()
             .and_then(|s| s.trim().parse::<u64>().ok());
-        *cell = Some(seed.map_or_else(
+        Mutex::new(seed.map_or_else(
             || FakeState {
                 rng: ChaCha8Rng::from_os_rng(),
                 deterministic: false,
@@ -63,39 +76,49 @@ fn ensure_init(cell: &mut Option<FakeState>) {
                 rng: ChaCha8Rng::seed_from_u64(seed),
                 deterministic: true,
             },
-        ));
-    }
+        ))
+    })
 }
 
-/// Run `f` with a mutable reference to the thread-local RNG.
+/// Lock the global state, recovering the inner value if a previous holder
+/// panicked (a poisoned RNG is not a correctness hazard — the bytes are still
+/// usable — so we never want to cascade a panic across unrelated draws).
+fn lock_state() -> std::sync::MutexGuard<'static, FakeState> {
+    global().lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Run `f` with a mutable reference to the process-global RNG.
 fn with_rng<R>(f: impl FnOnce(&mut ChaCha8Rng) -> R) -> R {
-    RNG.with(|cell| {
-        let mut borrow = cell.borrow_mut();
-        ensure_init(&mut borrow);
-        f(&mut borrow.as_mut().expect("rng initialized").rng)
-    })
+    let mut state = lock_state();
+    f(&mut state.rng)
 }
 
 /// Whether the generator is currently in deterministic mode.
 fn is_deterministic() -> bool {
-    RNG.with(|cell| {
-        let mut borrow = cell.borrow_mut();
-        ensure_init(&mut borrow);
-        borrow.as_ref().expect("rng initialized").deterministic
-    })
+    lock_state().deterministic
 }
 
-/// Force the thread-local generator into deterministic mode seeded from `seed`.
+/// Force the process-global generator into deterministic mode seeded from
+/// `seed`.
 ///
 /// After this call, a fixed sequence of generator calls yields a fixed sequence
-/// of values. Primarily intended for tests and reproducible fixtures.
+/// of values, across every thread and task in the process. Primarily intended
+/// for tests and reproducible fixtures.
 pub fn reseed(seed: u64) {
-    RNG.with(|cell| {
-        *cell.borrow_mut() = Some(FakeState {
-            rng: ChaCha8Rng::seed_from_u64(seed),
-            deterministic: true,
-        });
-    });
+    let mut state = lock_state();
+    state.rng = ChaCha8Rng::seed_from_u64(seed);
+    state.deterministic = true;
+}
+
+/// Serializes `reseed`-based tests so the process-global RNG is not reseeded by
+/// a concurrently-running test in the middle of another test's draw sequence.
+///
+/// Hold the returned guard for the duration of any test that reseeds and then
+/// asserts on the exact values drawn. Test-only; not part of the stable API.
+#[doc(hidden)]
+pub fn test_serial_guard() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    LOCK.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// Pick a random element from a non-empty static list.

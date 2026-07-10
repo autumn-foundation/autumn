@@ -201,7 +201,16 @@ pub fn run(profile: &str, package: Option<&str>, count: Option<usize>, model: Op
         }
     };
     if let Some((count, model)) = &fake_request {
-        eprintln!("  Faking: {count} row(s) of model `{model}`");
+        // Do not claim the rows were created: this command only *delegates* the
+        // request to the project's seed binary (via AUTUMN_SEED_COUNT/MODEL).
+        // Only a seed binary from a current scaffold — one that calls
+        // `autumn_web::seed::maybe_fake_seed` — actually performs the fake seed
+        // and reports the real inserted count itself.
+        eprintln!(
+            "  Requesting fake seed: {count} row(s) of model `{model}` \
+             (delegated to the seed binary; requires a seed binary from a \
+             current `autumn new` scaffold)"
+        );
     }
 
     // Determine the project directory: either the workspace member's root (when
@@ -236,10 +245,17 @@ pub fn run(profile: &str, package: Option<&str>, count: Option<usize>, model: Op
     cmd.env("AUTUMN_ENV", profile);
     cmd.env("AUTUMN_PROFILE", profile);
     // Forward the fake-seed request (if any) to the seed binary, which
-    // dispatches on these vars to `autumn_web::seed::fake_seed_model`.
+    // dispatches on these vars via `autumn_web::seed::maybe_fake_seed`. When no
+    // request was made, explicitly *remove* these vars from the child's
+    // environment so a stray ambient `AUTUMN_SEED_MODEL`/`AUTUMN_SEED_COUNT`
+    // inherited by this process can't silently trigger a fake seed the user did
+    // not ask for.
     if let Some((count, model)) = &fake_request {
         cmd.env("AUTUMN_SEED_COUNT", count.to_string());
         cmd.env("AUTUMN_SEED_MODEL", model);
+    } else {
+        cmd.env_remove("AUTUMN_SEED_COUNT");
+        cmd.env_remove("AUTUMN_SEED_MODEL");
     }
     // Run from the project directory so the seed binary's SeedContext reads
     // autumn.toml from the correct location (the package root, not the

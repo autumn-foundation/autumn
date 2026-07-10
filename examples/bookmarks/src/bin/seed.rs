@@ -60,19 +60,13 @@ async fn main() {
     let ctx =
         SeedContext::build().expect("failed to build seed context — is the database running?");
 
-    // `autumn seed --count N --model Bookmark` dispatch: generate N faked rows
-    // for the named model and return, skipping the default body below.
-    if let (Ok(model), Ok(count)) = (
-        std::env::var("AUTUMN_SEED_MODEL"),
-        std::env::var("AUTUMN_SEED_COUNT"),
-    ) {
-        let count: usize = count
-            .parse()
-            .expect("AUTUMN_SEED_COUNT must be a non-negative integer");
-        let inserted = autumn_web::seed::fake_seed_model(&model, count, ctx.pool())
-            .await
-            .expect("fake-seed failed");
-        println!("Inserted {inserted} faked `{model}` row(s).");
+    // `autumn seed --count N --model Bookmark` dispatch (owned by autumn-web):
+    // generate N faked rows for the named model and return, skipping the default
+    // body below. Returns `false` when no fake request was made.
+    if autumn_web::seed::maybe_fake_seed(ctx.pool())
+        .await
+        .expect("fake-seed failed")
+    {
         return;
     }
 

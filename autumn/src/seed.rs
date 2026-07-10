@@ -287,6 +287,14 @@ pub enum FakeSeedError {
         /// when none are registered).
         available: String,
     },
+
+    /// The `AUTUMN_SEED_COUNT` value forwarded by `autumn seed --count` did not
+    /// parse as a non-negative integer.
+    #[error("invalid AUTUMN_SEED_COUNT {value:?}: expected a non-negative integer")]
+    InvalidCount {
+        /// The raw `AUTUMN_SEED_COUNT` value that failed to parse.
+        value: String,
+    },
 }
 
 /// The names of every registered faked model, sorted, for diagnostics.
@@ -337,6 +345,45 @@ pub async fn fake_seed_model(
         requested: name.to_string(),
         available,
     })
+}
+
+/// Handle a fake-seed request forwarded by `autumn seed --count N --model M`, if
+/// one is present.
+///
+/// `autumn seed --count/--model` forwards the request as the
+/// `AUTUMN_SEED_COUNT` and `AUTUMN_SEED_MODEL` environment variables. This
+/// helper reads them and, when **both** are set, generates that many faked rows
+/// for the named model via [`fake_seed_model`] and prints a one-line summary.
+///
+/// The dispatch lives here — in versioned framework code — rather than being
+/// copied into every generated `src/bin/seed.rs`, so the scaffolded seed binary
+/// is a single call to this function. Fixes/extensions to the flag handling
+/// ship with autumn-web instead of requiring every project to re-scaffold.
+///
+/// Returns:
+/// - `Ok(true)` — a request was present and handled; the caller should return
+///   from its seed `main` without running its hand-written body.
+/// - `Ok(false)` — no request (neither var set); the caller runs its own body.
+///
+/// # Errors
+///
+/// Returns [`FakeSeedError::InvalidCount`] when `AUTUMN_SEED_COUNT` is set but
+/// does not parse as a non-negative integer, or [`FakeSeedError::UnknownModel`]
+/// when `AUTUMN_SEED_MODEL` names no registered `#[model]`.
+pub async fn maybe_fake_seed(pool: &Pool<AsyncPgConnection>) -> Result<bool, FakeSeedError> {
+    let (Ok(model), Ok(count)) = (
+        std::env::var("AUTUMN_SEED_MODEL"),
+        std::env::var("AUTUMN_SEED_COUNT"),
+    ) else {
+        return Ok(false);
+    };
+    let count: usize = count
+        .trim()
+        .parse()
+        .map_err(|_| FakeSeedError::InvalidCount { value: count })?;
+    let inserted = fake_seed_model(&model, count, pool).await?;
+    println!("Inserted {inserted} faked `{model}` row(s).");
+    Ok(true)
 }
 
 // ── #1343 AC4: fake-seeder registry test fixture ────────────────────────────
@@ -404,6 +451,58 @@ mod tests {
         assert!(
             msg.contains("DummyFakeSeederModel"),
             "error should list available registered models, got: {msg}"
+        );
+    }
+
+    // ── maybe_fake_seed dispatch (#1343 AC4 centralization) ────────────────
+
+    /// A lazily-built pool (deadpool does not connect until first use), so these
+    /// tests exercise `maybe_fake_seed`'s pre-connection branches without a live
+    /// database.
+    fn lazy_pool() -> Pool<AsyncPgConnection> {
+        crate::db::create_pool(&DatabaseConfig {
+            primary_url: Some("postgres://localhost/unused".to_string()),
+            ..DatabaseConfig::default()
+        })
+        .expect("pool builds")
+        .expect("url present => Some(pool)")
+    }
+
+    #[test]
+    fn maybe_fake_seed_returns_false_when_env_unset() {
+        let pool = lazy_pool();
+        temp_env::with_vars(
+            [
+                ("AUTUMN_SEED_MODEL", None::<&str>),
+                ("AUTUMN_SEED_COUNT", None::<&str>),
+            ],
+            || {
+                let handled = futures::executor::block_on(maybe_fake_seed(&pool))
+                    .expect("no request is not an error");
+                assert!(
+                    !handled,
+                    "with no fake request the caller must run its own seed body"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn maybe_fake_seed_errors_on_non_integer_count() {
+        let pool = lazy_pool();
+        temp_env::with_vars(
+            [
+                ("AUTUMN_SEED_MODEL", Some("DummyFakeSeederModel")),
+                ("AUTUMN_SEED_COUNT", Some("not-a-number")),
+            ],
+            || {
+                let err = futures::executor::block_on(maybe_fake_seed(&pool))
+                    .expect_err("a non-integer count must be an error, not a silent no-op");
+                assert!(
+                    matches!(err, FakeSeedError::InvalidCount { .. }),
+                    "expected InvalidCount, got: {err:?}"
+                );
+            },
         );
     }
 

@@ -51,6 +51,7 @@ mod fake_factory_tests {
 
     #[test]
     fn fake_fills_unset_fields() {
+        let _guard = fake::test_serial_guard();
         fake::reseed(1);
         let a = FakeArticle::factory().fake().build();
         assert!(!a.name.is_empty(), "name should be faked");
@@ -72,6 +73,7 @@ mod fake_factory_tests {
 
     #[test]
     fn explicit_override_wins_over_fake() {
+        let _guard = fake::test_serial_guard();
         fake::reseed(1);
         let a = FakeArticle::factory().fake().title("Fixed Title").build();
         assert_eq!(a.title, "Fixed Title", "explicit set must survive .fake()");
@@ -81,6 +83,7 @@ mod fake_factory_tests {
 
     #[test]
     fn explicit_override_regardless_of_call_order() {
+        let _guard = fake::test_serial_guard();
         fake::reseed(1);
         // `.fake()` before the setter.
         let a = FakeArticle::factory().fake().name("Alice").build();
@@ -93,6 +96,7 @@ mod fake_factory_tests {
 
     #[test]
     fn fake_is_deterministic_under_seed() {
+        let _guard = fake::test_serial_guard();
         fake::reseed(99);
         let a = FakeArticle::factory().fake().build();
         fake::reseed(99);
@@ -108,7 +112,24 @@ mod fake_factory_tests {
     }
 
     #[test]
+    fn fake_all_is_an_alias_for_fake() {
+        // `.fake_all()` (AC2 spelling) must behave identically to `.fake()`.
+        let _guard = fake::test_serial_guard();
+        fake::reseed(77);
+        let via_fake = FakeArticle::factory().fake().build();
+        fake::reseed(77);
+        let via_fake_all = FakeArticle::factory().fake_all().build();
+        assert_eq!(via_fake.name, via_fake_all.name);
+        assert_eq!(via_fake.email, via_fake_all.email);
+        assert_eq!(via_fake.title, via_fake_all.title);
+        assert_eq!(via_fake.body, via_fake_all.body);
+        assert_eq!(via_fake.score, via_fake_all.score);
+        assert_eq!(via_fake.bio, via_fake_all.bio);
+    }
+
+    #[test]
     fn build_many_with_fake_varies() {
+        let _guard = fake::test_serial_guard();
         fake::reseed(5);
         let rows = FakeArticle::factory().fake().build_many(30);
         assert_eq!(rows.len(), 30);
@@ -130,6 +151,7 @@ mod fake_factory_tests {
 
     #[test]
     fn fake_datetime_anchored_in_deterministic_mode() {
+        let _guard = fake::test_serial_guard();
         fake::reseed(3);
         let a = FakeArticle::factory().fake().build();
         // Deterministic mode anchors to 2024-01-01T00:00:00Z minus a <=30d offset.
@@ -176,7 +198,11 @@ mod fake_factory_tests {
     #[cfg(feature = "test-support")]
     #[tokio::test]
     #[ignore = "requires Docker (testcontainers)"]
+    // The serial guard is held across the DB `.await`s to keep this reseed run
+    // isolated from other reseed-based tests sharing the process-global RNG.
+    #[allow(clippy::await_holding_lock)]
     async fn create_many_persists_distinct_records() {
+        let _guard = fake::test_serial_guard();
         let db: &autumn_web::test::TestDb = autumn_web::test::TestDb::shared().await;
         setup_table(&db.pool()).await;
 

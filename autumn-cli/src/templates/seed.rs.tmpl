@@ -13,10 +13,12 @@
 //!   autumn seed --count 200 --model Post
 //!
 //! `autumn seed` forwards `--count`/`--model` as the `AUTUMN_SEED_COUNT` and
-//! `AUTUMN_SEED_MODEL` environment variables; the dispatcher below then routes
-//! to `autumn_web::seed::fake_seed_model`, which drives the model's factory
-//! `.fake().create_many(...)`. Any `#[autumn_web::model]` is registered
-//! automatically — no code change needed here.
+//! `AUTUMN_SEED_MODEL` environment variables; `autumn_web::seed::maybe_fake_seed`
+//! (called first below) then routes to `autumn_web::seed::fake_seed_model`, which
+//! drives the model's factory `.fake().create_many(...)`. Any
+//! `#[autumn_web::model]` is registered automatically — no code change needed
+//! here. Because the dispatch lives in autumn-web, upgrading the framework picks
+//! up any fixes without re-scaffolding this file.
 use autumn_web::seed::SeedContext;
 
 #[autumn_web::main]
@@ -24,20 +26,14 @@ async fn main() {
     let ctx = SeedContext::build()
         .expect("failed to build seed context — is the database running?");
 
-    // Fake-seed dispatch: when invoked as `autumn seed --count N --model M`,
-    // generate faked rows for that model and return, skipping the hand-written
-    // seed body below.
-    if let (Ok(model), Ok(count)) = (
-        std::env::var("AUTUMN_SEED_MODEL"),
-        std::env::var("AUTUMN_SEED_COUNT"),
-    ) {
-        let count: usize = count
-            .parse()
-            .expect("AUTUMN_SEED_COUNT must be a non-negative integer");
-        let inserted = autumn_web::seed::fake_seed_model(&model, count, ctx.pool())
-            .await
-            .expect("fake-seed failed");
-        println!("Inserted {inserted} faked `{model}` row(s).");
+    // Fake-seed dispatch (owned by autumn-web): when invoked as
+    // `autumn seed --count N --model M`, generate faked rows for that model and
+    // return, skipping the hand-written seed body below. Returns `false` when no
+    // fake request was made, so the normal seed runs.
+    if autumn_web::seed::maybe_fake_seed(ctx.pool())
+        .await
+        .expect("fake-seed failed")
+    {
         return;
     }
 
