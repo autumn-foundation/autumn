@@ -609,8 +609,7 @@ impl S3Client {
     /// when the endpoint does not echo a checksum, GET and rehash. Returns `Ok`
     /// only once the remote is proven to match the local bytes.
     pub fn put_and_verify(&self, key: &str, bytes: &[u8]) -> Result<(), S3Error> {
-        let digest = sha256_raw(bytes);
-        let checksum_b64 = base64_standard(&digest);
+        let checksum_b64 = sha256_base64(bytes);
         self.put_object(key, bytes, &checksum_b64)?;
         self.verify_uploaded(key, bytes.len() as u64, &checksum_b64)
     }
@@ -630,7 +629,7 @@ impl S3Client {
         }
         // Checksum absent on HEAD: prove equality by downloading and rehashing.
         let body = self.get_object(key)?;
-        let actual_b64 = base64_standard(&sha256_raw(&body));
+        let actual_b64 = sha256_base64(&body);
         if actual_b64 == expected_b64 {
             Ok(())
         } else {
