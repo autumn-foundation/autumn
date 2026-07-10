@@ -156,9 +156,11 @@ impl Response {
 /// [`Client::get_ssrf_safe`]. Ranges are checked explicitly (rather than via the
 /// unstable `IpAddr::is_global` family) so the code compiles on stable Rust.
 ///
-/// IPv4-mapped (`::ffff:a.b.c.d`) and the deprecated IPv4-compatible
-/// (`::a.b.c.d`) IPv6 forms are unwrapped and re-checked as IPv4, so encodings
-/// such as `::ffff:169.254.169.254` are correctly blocked.
+/// IPv6 addresses that embed an IPv4 via a transition mechanism — IPv4-mapped
+/// (`::ffff:a.b.c.d`), the deprecated IPv4-compatible (`::a.b.c.d`), NAT64
+/// (`64:ff9b::/96`), and 6to4 (`2002::/16`) — are unwrapped and re-checked as
+/// IPv4, so encodings such as `::ffff:169.254.169.254`,
+/// `64:ff9b::a9fe:a9fe`, and `2002:a9fe:a9fe::` are all correctly blocked.
 #[must_use]
 pub fn is_blocked_ip(ip: IpAddr) -> bool {
     match ip {
@@ -208,6 +210,10 @@ fn is_blocked_ipv4(ip: Ipv4Addr) -> bool {
     if a == 192 && b == 0 && c == 2 {
         return true;
     }
+    // 192.88.99.0/24 (6to4 anycast relay, RFC 3068 / RFC 7526)
+    if a == 192 && b == 88 && c == 99 {
+        return true;
+    }
     // 192.168.0.0/16
     if a == 192 && b == 168 {
         return true;
@@ -231,15 +237,51 @@ fn is_blocked_ipv4(ip: Ipv4Addr) -> bool {
     false
 }
 
-fn is_blocked_ipv6(ip: Ipv6Addr) -> bool {
-    // Unwrap IPv4-mapped (::ffff:a.b.c.d) and deprecated IPv4-compatible
-    // (::a.b.c.d) forms and re-check as IPv4. `to_ipv4` covers both, but we try
-    // the mapped form first for clarity.
+/// Extract any IPv4 address embedded in an IPv6 address via a transition
+/// mechanism, so the IPv4 SSRF policy can be re-applied to it:
+///
+/// - IPv4-mapped `::ffff:a.b.c.d`
+/// - deprecated IPv4-compatible `::a.b.c.d`
+/// - NAT64 well-known prefix `64:ff9b::/96` (RFC 6052) — e.g.
+///   `64:ff9b::a9fe:a9fe` decodes to `169.254.169.254`
+/// - 6to4 `2002::/16` (RFC 3056) — e.g. `2002:a9fe:a9fe::` embeds
+///   `169.254.169.254`
+///
+/// Returns `None` for a genuinely-native IPv6 address (no embedded v4). Using
+/// `octets()` avoids any lossy `u16 -> u8` casts.
+fn embedded_ipv4(ip: Ipv6Addr) -> Option<Ipv4Addr> {
     if let Some(v4) = ip.to_ipv4_mapped() {
-        return is_blocked_ipv4(v4);
+        return Some(v4);
     }
-    if let Some(v4) = ip.to_ipv4() {
-        return is_blocked_ipv4(v4);
+    let o = ip.octets();
+    // NAT64 64:ff9b::/96 — embedded IPv4 in the last 32 bits (octets 12..16),
+    // with octets 4..12 all zero.
+    if o[0] == 0x00
+        && o[1] == 0x64
+        && o[2] == 0xff
+        && o[3] == 0x9b
+        && o[4..12].iter().all(|&b| b == 0)
+    {
+        return Some(Ipv4Addr::new(o[12], o[13], o[14], o[15]));
+    }
+    // 6to4 2002::/16 — embedded IPv4 in bits 16..48 (octets 2..6).
+    if o[0] == 0x20 && o[1] == 0x02 {
+        return Some(Ipv4Addr::new(o[2], o[3], o[4], o[5]));
+    }
+    // Deprecated IPv4-compatible ::a.b.c.d (upper 96 bits zero).
+    ip.to_ipv4()
+}
+
+fn is_blocked_ipv6(ip: Ipv6Addr) -> bool {
+    // Block any private / loopback / link-local / metadata IPv4 that is
+    // tunnelled inside this v6 address (IPv4-mapped, IPv4-compatible, NAT64, or
+    // 6to4) by re-running the IPv4 policy on the embedded address. A public
+    // embedded IPv4 (e.g. 6to4 `2002:0808:0808::` == 8.8.8.8) is NOT blocked
+    // here — it falls through to the native v6 range checks below.
+    if let Some(v4) = embedded_ipv4(ip)
+        && is_blocked_ipv4(v4)
+    {
+        return true;
     }
 
     let segs = ip.segments();
@@ -257,6 +299,10 @@ fn is_blocked_ipv6(ip: Ipv6Addr) -> bool {
     }
     // fe80::/10 (link-local)
     if segs[0] & 0xffc0 == 0xfe80 {
+        return true;
+    }
+    // fec0::/10 (deprecated site-local — defence-in-depth)
+    if segs[0] & 0xffc0 == 0xfec0 {
         return true;
     }
     // ff00::/8 (multicast)
@@ -1068,6 +1114,15 @@ impl RequestBuilder {
     /// [`ClientError::TooManyRedirects`] (so `max == 0` turns the first `3xx`
     /// into an error). Routes the request through the custom one-shot-client
     /// send path, which bypasses the process-wide circuit breaker.
+    ///
+    /// **TOCTOU / rebinding limitation.** The `validator` receives the redirect
+    /// target as a *string* (not a resolved IP), and the subsequent connection
+    /// re-resolves that host via normal DNS. So a validator that inspects IP
+    /// literals sees only literal hosts, has a connect-time TOCTOU window
+    /// against a hostname that re-resolves between check and connect, and
+    /// provides no address pinning. When you need pinned, rebind-safe following
+    /// that validates every resolved IP and pins the connection per hop, use
+    /// [`Client::get_ssrf_safe`] instead.
     #[must_use]
     pub fn follow_redirects<F>(mut self, max: usize, validator: F) -> Self
     where
@@ -1086,6 +1141,13 @@ impl RequestBuilder {
     /// address the socket connects to is overridden. This protects against
     /// DNS-rebinding / TOCTOU attacks where a hostname re-resolves to a
     /// different (private) address between validation and connection.
+    ///
+    /// **Pinning applies to the initial connection only.** Redirects are **not**
+    /// followed: a `3xx` is returned to the caller verbatim (as if
+    /// [`no_redirect`](Self::no_redirect) were set) rather than being
+    /// auto-followed to a possibly-different host that would be re-resolved via
+    /// normal DNS, silently escaping the pin. If you need pinned, rebind-safe
+    /// per-hop following, use [`Client::get_ssrf_safe`] instead.
     ///
     /// Implemented via a one-shot `reqwest::ClientBuilder::resolve(host, addr)`
     /// scoped to this request. Note that reqwest ignores the **port** in the
@@ -1332,15 +1394,15 @@ impl RequestBuilder {
             return self.follow_loop(max, validator, timeout).await;
         }
 
-        // `None`: single one-shot request with Policy::none() so a 3xx is
-        // returned verbatim. `Default` (pin_to only): keep reqwest's built-in
-        // auto-follow but pin the initial host's resolution.
-        let policy = match self.redirect_mode {
-            RedirectMode::None => reqwest::redirect::Policy::none(),
-            RedirectMode::Default | RedirectMode::Follow { .. } => {
-                reqwest::redirect::Policy::default()
-            }
-        };
+        // Only `RedirectMode::None` (explicit `no_redirect`) and the pin-only
+        // `RedirectMode::Default` reach here (`Follow` and `ssrf_safe` returned
+        // above). Both use `Policy::none()`: a 3xx is returned to the caller
+        // verbatim rather than being auto-followed. Critically, for the
+        // pin-only path this stops reqwest from silently following a cross-host
+        // redirect and re-resolving the new host via normal DNS — which would
+        // defeat the pin. Callers who want to follow redirects while staying
+        // pinned/rebind-safe use `get_ssrf_safe` (or `follow_redirects`).
+        let policy = reqwest::redirect::Policy::none();
         let resolve = self.pin_resolve()?;
         let client = build_oneshot_client(resolve, policy, timeout)?;
         send_one(
@@ -1609,6 +1671,16 @@ fn redirect_target(resp: &Response, base: &str) -> Result<Option<String>, Client
 /// and rejected if **any** resolved address is blocked.
 async fn resolve_and_validate(url: &str) -> Result<SocketAddr, ClientError> {
     let parsed = url::Url::parse(url).map_err(|e| ClientError::InvalidUrl(e.to_string()))?;
+    // Explicit scheme allowlist (defence-in-depth): only http/https may be
+    // resolved and connected on the safe path. Reject ftp://, gopher://,
+    // file://, etc. here — before any DNS lookup or connection — rather than
+    // relying on reqwest to reject them after the fact.
+    let scheme = parsed.scheme();
+    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
+        return Err(ClientError::InvalidUrl(format!(
+            "unsupported URL scheme `{scheme}` (only http/https are allowed): {url}"
+        )));
+    }
     let port = parsed.port_or_known_default().ok_or_else(|| {
         ClientError::InvalidUrl(format!("URL has no port and unknown scheme: {url}"))
     })?;
@@ -2632,6 +2704,7 @@ mod tests {
             "172.16.5.4",      // private
             "192.0.0.1",       // IETF
             "192.0.2.5",       // TEST-NET-1
+            "192.88.99.1",     // 6to4 anycast relay
             "192.168.1.1",     // private
             "198.18.0.1",      // benchmarking
             "198.51.100.7",    // TEST-NET-2
@@ -2667,6 +2740,7 @@ mod tests {
             "fc00::1",                // ULA
             "ff02::1",                // multicast
             "2001:db8::1",            // documentation
+            "fec0::1",                // deprecated site-local
             "::ffff:169.254.169.254", // IPv4-mapped metadata
             "::ffff:127.0.0.1",       // IPv4-mapped loopback
         ];
@@ -2687,6 +2761,38 @@ mod tests {
             is_public_ip(public),
             "2606:4700:4700::1111 should be public"
         );
+    }
+
+    // TEST 46b: SSRF policy blocks private / metadata IPv4 tunnelled inside an
+    // IPv6 literal via NAT64 (64:ff9b::/96) and 6to4 (2002::/16), while leaving
+    // a genuinely-public embedded IPv4 (and native public v6) public.
+    #[test]
+    fn ssrf_policy_blocks_tunnelled_ipv4() {
+        let blocked = [
+            "64:ff9b::a9fe:a9fe", // NAT64 → 169.254.169.254 (cloud metadata)
+            "64:ff9b::7f00:1",    // NAT64 → 127.0.0.1 (loopback)
+            "2002:a9fe:a9fe::",   // 6to4  → 169.254.169.254
+            "2002:7f00:1::",      // 6to4  → 127.0.0.1
+            "2002:0a00:0001::",   // 6to4  → 10.0.0.1
+        ];
+        for s in blocked {
+            let ip: IpAddr = s.parse().unwrap();
+            assert!(is_blocked_ip(ip), "{s} should be blocked");
+            assert!(!is_public_ip(ip), "{s} should not be public");
+        }
+
+        // 192.88.99.0/24 (6to4 anycast relay) is blocked as a plain IPv4 literal.
+        let anycast: IpAddr = "192.88.99.1".parse().unwrap();
+        assert!(is_blocked_ip(anycast), "192.88.99.1 should be blocked");
+
+        // A 6to4 address embedding a genuinely-public IPv4 (8.8.8.8) stays
+        // public (the embedded v4 is public, so it falls through to the native
+        // v6 checks, which do not match 2002::/16). So does a native public v6.
+        for s in ["2002:0808:0808::", "2606:4700::1111"] {
+            let ip: IpAddr = s.parse().unwrap();
+            assert!(is_public_ip(ip), "{s} should be public");
+            assert!(!is_blocked_ip(ip), "{s} should not be blocked");
+        }
     }
 
     // TEST 47: the `url` crate normalises decimal/hex IP-literal hosts to Ipv4,
@@ -2999,6 +3105,72 @@ mod tests {
             assert!(
                 matches!(err, Err(ClientError::SsrfBlocked(_))),
                 "{raw} should be SsrfBlocked, got {err:?}"
+            );
+        }
+    }
+
+    // TEST 57: pin_to alone does NOT auto-follow a cross-host redirect. reqwest
+    // would otherwise re-resolve the new host via normal DNS, silently escaping
+    // the pin. The 302 must be returned verbatim and the onward target must
+    // never be connected to.
+    #[tokio::test]
+    async fn pin_to_does_not_follow_redirect_unpinned() {
+        use axum::{Router, routing::get};
+        use std::sync::atomic::AtomicBool;
+
+        // The redirect target that must never be reached.
+        let touched = Arc::new(AtomicBool::new(false));
+        let touched2 = touched.clone();
+        let onward = spawn(Router::new().route(
+            "/onward",
+            get(move || {
+                let t = touched2.clone();
+                async move {
+                    t.store(true, Ordering::SeqCst);
+                    "REACHED"
+                }
+            }),
+        ))
+        .await;
+        let onward_port = onward.port();
+
+        let start =
+            spawn(Router::new().route(
+                "/start",
+                get(move || async move {
+                    redirect_302(format!("http://127.0.0.1:{onward_port}/onward"))
+                }),
+            ))
+            .await;
+        let start_port = start.port();
+
+        let resp = Client::new()
+            .get(format!("http://127.0.0.1:{start_port}/start"))
+            .pin_to(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), start_port))
+            .send()
+            .await
+            .expect("pinned request should return the 302 unfollowed");
+
+        assert_eq!(
+            resp.status().as_u16(),
+            302,
+            "pin_to must return the redirect unfollowed"
+        );
+        assert!(
+            !touched.load(Ordering::SeqCst),
+            "pin_to must not silently follow the redirect onward"
+        );
+    }
+
+    // TEST 58: get_ssrf_safe rejects a non-http(s) scheme up front with
+    // InvalidUrl, before any DNS resolution or connection.
+    #[tokio::test]
+    async fn get_ssrf_safe_rejects_non_http_scheme() {
+        for raw in ["ftp://public.example/resource", "gopher://public.example/"] {
+            let result = Client::new().get_ssrf_safe(raw).send().await;
+            assert!(
+                matches!(result, Err(ClientError::InvalidUrl(_))),
+                "{raw} should be rejected with InvalidUrl, got {result:?}"
             );
         }
     }
