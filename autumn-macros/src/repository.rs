@@ -1129,10 +1129,19 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         } else {
             quote! {}
         };
-        // Version history / commit-hook enqueue only run when a row was actually
-        // mutated; bind the affected-row count only when that gate is needed so
-        // hook-free, unversioned repos emit no unused binding.
-        let dep_needs_post = config.versioned || commit_hooks_enabled;
+        // #1369 AC4: a child declared `broadcasts = true` WITHOUT `commit_hooks`
+        // (the scaffolded live path) publishes its OOB delete fragment inline in
+        // the normal `delete_by_id` wrapper. The cascade helper bypasses that
+        // wrapper, so it must emit the same inline delete broadcast per cascaded
+        // child — otherwise live clients keep a stale fragment for a destroyed
+        // child. Commit-hook children enqueue the broadcast durably as before
+        // (unchanged), so only the broadcasts-only case needs the inline emit.
+        let dep_needs_broadcast = config.broadcasts && !commit_hooks_enabled;
+        // Version history / commit-hook enqueue / inline broadcast only run when a
+        // row was actually mutated; bind the affected-row count only when that
+        // gate is needed so hook-free, unversioned, non-broadcasting repos emit no
+        // unused binding.
+        let dep_needs_post = config.versioned || commit_hooks_enabled || dep_needs_broadcast;
         let destroy_count_bind = if dep_needs_post {
             quote! { let __n }
         } else {
@@ -1234,11 +1243,87 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         } else {
             quote! {}
         };
+        // #1369 AC4: inline OOB delete broadcast for a broadcasts-only child,
+        // built from the child record we already hold (`__record`) so no
+        // pre-fetch is needed. Mirrors the inline delete broadcast the normal
+        // `delete_by_id` wrapper emits (static/dynamic topic, tenant scoping,
+        // custom `broadcast_render`), keyed on the destroyed child record.
+        let destroy_broadcast = if dep_needs_broadcast {
+            let base_topic = match generate_topic_format(
+                config
+                    .broadcast_topic
+                    .as_deref()
+                    .unwrap_or(&config.table_name),
+                &quote! { __broadcast_rec },
+            ) {
+                Ok(expr) => expr,
+                Err(err) => return err.to_compile_error(),
+            };
+            let topic_expr = if config.tenant_scoped {
+                quote! {
+                    ::std::format!(
+                        "tenant:{}:{}",
+                        ::autumn_web::tenancy::DisplayTenantId::tenant_id_str(
+                            &__broadcast_rec.tenant_id
+                        ),
+                        #base_topic
+                    )
+                }
+            } else {
+                base_topic
+            };
+            let model_prefix = to_snake_case(&config.model_name.to_string());
+            let dom_id_expr = if let Some(ref render_path) = config.broadcast_render {
+                quote! {
+                    ::autumn_web::htmx::extract_html_id(
+                        &{ #render_path(__broadcast_rec) }.into_string()
+                    )
+                    .unwrap_or_else(|| ::std::format!(
+                        "{}-{}",
+                        #model_prefix,
+                        ::autumn_web::repository::ModelPrimaryKey::primary_key_value(
+                            __broadcast_rec
+                        )
+                    ))
+                }
+            } else {
+                quote! {
+                    <#model_name as ::autumn_web::live::LiveFragment>::dom_id(__broadcast_rec)
+                }
+            };
+            quote! {
+                if let ::core::option::Option::Some(__channels) =
+                    ::autumn_web::__private::get_global_channels()
+                {
+                    let __broadcast_rec: &#model_name = &__record;
+                    let __del_topic = #topic_expr;
+                    let __del_id = #dom_id_expr;
+                    let __fragment = ::autumn_web::html! {};
+                    if let ::core::result::Result::Err(__err) = __channels
+                        .broadcast()
+                        .publish_oob(
+                            &__del_topic,
+                            &__del_id,
+                            &::autumn_web::htmx::OobSwap::Delete,
+                            &__fragment,
+                        )
+                    {
+                        ::autumn_web::reexports::tracing::warn!(
+                            error = %__err,
+                            "auto-broadcast dependent-destroy delete failed"
+                        );
+                    }
+                }
+            }
+        } else {
+            quote! {}
+        };
         let destroy_post_mutation = if dep_needs_post {
             quote! {
                 if __n != 0 {
                     #destroy_vh
                     #destroy_commit_enqueue
+                    #destroy_broadcast
                 }
             }
         } else {
@@ -13834,6 +13919,26 @@ mod tests {
         &rest[..end]
     }
 
+    /// Helper: slice the `Destroy` match arm of the generated
+    /// `__autumn_apply_dependent_on_conn` helper, bounded to the helper method
+    /// (which ends right before the always-generated `pub fn on_primary`), so
+    /// assertions don't accidentally match the repository's OWN broadcast /
+    /// commit-hook codegen emitted elsewhere in the output.
+    fn dependent_destroy_arm(generated: &str) -> &str {
+        // Anchor on the method *definition* — the bare name also appears at the
+        // parent's cascade *call* site inside `delete_by_id`.
+        let hstart = generated
+            .find("pub async fn __autumn_apply_dependent_on_conn")
+            .expect("dependent-apply helper definition present");
+        let hrest = &generated[hstart..];
+        let hend = hrest.find("pub fn on_primary").unwrap_or(hrest.len());
+        let helper = &hrest[..hend];
+        let destroy_at = helper
+            .find("DependentAction :: Destroy")
+            .expect("destroy arm present");
+        &helper[destroy_at..]
+    }
+
     #[test]
     fn parse_repo_args_parses_dependent_destroy() {
         let tokens: proc_macro2::TokenStream =
@@ -14153,6 +14258,54 @@ mod tests {
         assert!(
             helper.contains("before_delete"),
             "destroy path must fire the child's before_delete hook: {helper}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_dependent_destroy_emits_inline_broadcast_for_broadcasts_only_child() {
+        // AC4: a child declared `broadcasts = true` (without commit_hooks)
+        // publishes its OOB delete fragment inline in the normal delete path;
+        // the cascade helper must emit the SAME inline delete broadcast per
+        // cascaded child so live clients don't keep a stale fragment.
+        let generated = repository_macro(
+            quote! { Comment, broadcasts = true, dependent(PgReplyRepository, fk = "comment_id", on_delete = destroy) },
+            quote! { pub trait CommentRepository {} },
+        )
+        .to_string();
+        let destroy_arm = dependent_destroy_arm(&generated);
+        assert!(
+            destroy_arm.contains("publish_oob"),
+            "broadcasts-only child destroy must publish an inline OOB broadcast: {destroy_arm}"
+        );
+        assert!(
+            destroy_arm.contains("OobSwap :: Delete"),
+            "the inline cascade broadcast must be an OOB Delete: {destroy_arm}"
+        );
+        // A broadcasts-only child does not enqueue a durable commit hook.
+        assert!(
+            !destroy_arm.contains("enqueue_repository_commit_hook_on_conn"),
+            "a broadcasts-only child must not enqueue a durable commit hook: {destroy_arm}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_dependent_destroy_commit_hooks_child_enqueues_and_does_not_inline_broadcast()
+     {
+        // A commit_hooks child enqueues the durable hook (which carries the
+        // broadcast) and must NOT also emit the inline broadcast — no double emit.
+        let generated = repository_macro(
+            quote! { Comment, hooks = CommentHooks, commit_hooks = true, broadcasts = true, dependent(PgReplyRepository, fk = "comment_id", on_delete = destroy) },
+            quote! { pub trait CommentRepository {} },
+        )
+        .to_string();
+        let destroy_arm = dependent_destroy_arm(&generated);
+        assert!(
+            destroy_arm.contains("enqueue_repository_commit_hook_on_conn"),
+            "a commit_hooks child destroy must enqueue the durable commit hook: {destroy_arm}"
+        );
+        assert!(
+            !destroy_arm.contains("publish_oob"),
+            "a commit_hooks child must not also emit the inline broadcast (no double emit): {destroy_arm}"
         );
     }
 
