@@ -257,7 +257,7 @@ Like Spring Boot's `loggers` actuator endpoint, Autumn's logger levels reload
 live -- `LogLevels::set_logger_level(name, level)` flips a target's level at
 runtime (with `current_level()` / `logger_overrides()` to inspect), no restart
 required. And just as `/actuator/info` surfaces git/build info, Autumn's
-`/info` carries a `BuildProvenance` (git SHA plus build metadata) via
+`/actuator/info` carries a `BuildProvenance` (git SHA plus build metadata) via
 `build_provenance()`.
 
 ---
@@ -348,7 +348,7 @@ pub struct Post {
 | `model.save()`          | `diesel::insert_into(...).values(...)` |
 | `ModelSerializer`       | `#[derive(Serialize, Deserialize)]` (via serde) |
 | `.iterator()` / chunking | `repo.find_each(500)` / `repo.find_in_batches(1000)` (keyset) |
-| `get_or_create()`       | `repo.find_or_create_by_<field>().await` → `(Model, bool)` |
+| `get_or_create()`       | `repo.find_or_create_by_slug(slug, &new_post).await` → `(Model, bool)` |
 | `.values(...).annotate(Count(...))` | `repo.count_grouped_by_<col>().load().await` |
 
 `find_each` / `find_in_batches` stream rows in keyset (PK cursor) batches --
@@ -524,7 +524,7 @@ renders fields (and errors) bound to your model.
 | `post.destroy`              | `diesel::delete(posts::table.find(id))` |
 | `Post.count`                | `posts::table.count().get_result(&mut *db)` |
 | `Post.find_each` / `find_in_batches` | `repo.find_each(500)` / `repo.find_in_batches(1000)` (exact namesakes) |
-| `Post.find_or_create_by(...)` | `repo.find_or_create_by_<field>().await` → `(Model, bool)` |
+| `Post.find_or_create_by(...)` | `repo.find_or_create_by_slug(slug, &new_post).await` → `(Model, bool)` |
 | `Post.group(:x).count` / `.sum` | `repo.count_grouped_by_x()` / `repo.sum_y_grouped_by_x()` |
 | Callbacks (`before_save`)   | Mutation hooks (`#[repository(Post, hooks = MyHooks)]`) |
 
@@ -682,7 +682,7 @@ remember-me, and a query-count test assertion -- only a dev-mode N+1 inspector,
 | Data        | `#[state_machine(transitions(...))]` (on a `#[model]` String field)                  | AASM / Statesman gems                | `django-fsm`                         | `spatie/laravel-model-states`        | `Machinery`                          |
 | Data        | audit actor attribution (`VersionEntry.actor`, `Model::history(...)`)                | paper_trail (`whodunnit`)            | django-simple-history                | `owen-it/laravel-auditing`           | `ex_audit`                           |
 | Web         | `form_for(&changeset, action, method)`                                               | `form_for`, `form_with`              | `ModelForm`                          | `Form::model()` (LaravelCollective)  | `<.form for={@form}>`                |
-| Web         | `Download` + HTTP Range/206 (`Download::from_bytes(...)`, honors `Range`)            | `send_file`, `send_data`             | `FileResponse` (Range)               | `response()->download()`             | `send_download`                      |
+| Web         | `Download` + HTTP Range/206 (`Download::from_bytes(...).into_response_ranged(&headers).await`)            | `send_file`, `send_data`             | `FileResponse` (Range)               | `response()->download()`             | `send_download`                      |
 | Web         | `cache_for(Duration)` → `CacheControl` (defaults `private`)                          | `expires_in`, `fresh_when`           | `cache_control` decorator            | `Cache-Control` header               | `Plug.Conn` cache headers            |
 | Web         | `Feed::atom(...)`, `Feed::rss(...)` (impl `IntoResponse`)                            | `atom_feed` builder                  | `django.contrib.syndication`         | `spatie/laravel-feed`                | —                                    |
 | Web         | Server-Timing header (`[observability] server_timing = true`)                        | rack-mini-profiler (manual)          | manual                               | manual                               | manual                               |
@@ -727,7 +727,7 @@ remember-me, and a query-count test assertion -- only a dev-mode N+1 inspector,
 | Hot reload             | Spring DevTools        | Auto-reload           | `rails s`              | `autumn dev`                    |
 | Request inspector / N+1 detection | `rack-mini-profiler` + `bullet` | Django Debug Toolbar | `rack-mini-profiler` + `bullet` | `/_autumn/inspect` (dev only) |
 | Batched iteration      | N/A (JPA scroll)       | `.iterator()`         | `find_each` / `find_in_batches` | `repo.find_each(500)` / `repo.find_in_batches(1000)` |
-| Find-or-create         | `getOrSave`            | `get_or_create()`     | `find_or_create_by`    | `repo.find_or_create_by_<field>()` |
+| Find-or-create         | `getOrSave`            | `get_or_create()`     | `find_or_create_by`    | `repo.find_or_create_by_slug(slug, &new_post)` |
 | Env file loading       | `.env` (spring-dotenv) | `django-environ`      | `dotenv-rails`         | `.env` auto-load (dev/test)     |
 | Response cache headers | `@Cacheable` / `Cache-Control` | `cache_control` decorator | `expires_in` / `fresh_when` | `cache_for(Duration)` → `CacheControl` |
 | Model-bound form       | Thymeleaf `th:object`  | `ModelForm`           | `form_for` / `form_with` | `form_for(&changeset, action, method)` |
