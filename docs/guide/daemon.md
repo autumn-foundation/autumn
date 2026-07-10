@@ -213,6 +213,103 @@ A good drill: restore the latest backup into a scratch database, run
 `autumn doctor` / your smoke tests against it, then discard it. Confirming a
 backup restores cleanly is the only way to know it is real.
 
+### Offsite backups
+
+A backup on the same disk as the database is not disaster recovery: one failed
+drive takes the app and every backup with it. Point `autumn db backup` at an
+**S3-compatible** offsite destination (AWS S3, MinIO, Cloudflare R2, Backblaze
+B2, Garage) and it uploads each completed run **after** local integrity
+verification passes, then **verifies every remote object matches the local
+file** before reporting success. If the local backup succeeds but the upload
+fails, the command says so unambiguously and exits non-zero — the local artifact
+is left intact.
+
+Configure the destination in `autumn.toml` under `[backup.offsite]`. Credentials
+are supplied by **env-var indirection**: config names the environment variables
+the access key / secret are read from; the secret values never live in config,
+argv, logs, or error messages.
+
+```toml
+[backup.offsite]
+# Upload after every `autumn db backup`, without needing --upload:
+auto_upload = true
+# Key prefix inside the bucket (optional; objects are keyed
+# {prefix}/{profile}/{timestamp}/{file}):
+prefix = "db"
+# Independent remote retention: keep the newest N uploaded runs per profile,
+# pruning older ones only after a verified upload (never the just-uploaded run):
+keep = 30
+
+[backup.offsite.s3]
+bucket   = "myapp-db-offsite"
+region   = "auto"                       # R2 uses "auto"; MinIO ignores it
+endpoint = "https://<accountid>.r2.cloudflarestorage.com"
+force_path_style = true                 # required by MinIO / R2 / most self-hosted
+# Credentials by env-var indirection — names, not values:
+access_key_id_env     = "AUTUMN_OFFSITE_ACCESS_KEY_ID"
+secret_access_key_env = "AUTUMN_OFFSITE_SECRET_ACCESS_KEY"
+```
+
+Every setting also has an `AUTUMN_BACKUP__OFFSITE__*` environment override (e.g.
+`AUTUMN_BACKUP__OFFSITE__S3__BUCKET`) and honors profile overlays
+(`[profile.prod.backup.offsite]`), matching the rest of Autumn's config.
+
+By default the offsite destination must be **distinct** from the app's
+user-facing `[storage.s3]` bucket. Pointing both at the same bucket+endpoint
+requires the explicit opt-in `allow_shared_bucket = true`.
+
+```sh
+# Export the credentials the config names, then upload with the backup:
+export AUTUMN_OFFSITE_ACCESS_KEY_ID=...          # never committed
+export AUTUMN_OFFSITE_SECRET_ACCESS_KEY=...
+autumn db backup --upload --keep 7 --dir /var/backups/myapp
+
+# List what's offsite (timestamp, size, files) for the active profile:
+autumn db offsite list
+```
+
+`autumn doctor` includes an `offsite_backup` check that flags an unset bucket, a
+shared bucket without opt-in, or credentials that are not ready — without ever
+printing a credential value.
+
+**Scheduling.** Extend the cron / systemd recipe above with `--upload` (or set
+`auto_upload = true` and drop the flag):
+
+```cron
+0 2 * * *  cd /srv/myapp && AUTUMN_ENV=prod autumn db backup --upload --keep 7 --dir /var/backups/myapp
+```
+
+```ini
+# In the systemd unit's [Service] section, load the offsite credentials from a
+# root-only env file and add --upload to the backup command:
+EnvironmentFile=/etc/myapp/offsite.env
+ExecStart=/usr/local/bin/autumn db backup --upload --keep 7 --dir /var/backups/myapp
+```
+
+**Restore-from-offsite drill.** List the offsite runs, then restore one directly
+— it downloads the run to a temp directory and applies the **same** integrity
+verification and production `--force` guard as a local restore:
+
+```sh
+# See what's available offsite:
+autumn db offsite list
+
+# Restore the newest offsite run for a profile (into a scratch/dev DB):
+autumn db restore offsite:dev/latest
+
+# Or an explicit run, into production (this overwrites data):
+AUTUMN_ENV=prod autumn db restore offsite:prod/20260710T020000Z --force
+```
+
+**Encryption posture.** Transfers use **TLS in transit** (HTTPS to the S3
+endpoint). At rest, objects are protected by the **provider's server-side
+encryption** (enable SSE / bucket default encryption on your bucket). Uploads
+send `x-amz-checksum-sha256` so the endpoint validates payload integrity
+server-side. **Client-side backup encryption** (encrypting the artifact with a
+framework-managed key before it leaves the host) is a named follow-up — see the
+`autumn/src/encryption.rs` AES-256-GCM envelope — and is **not** applied by this
+slice.
+
 ## Out of scope
 
 SQLite as an app backend, in-process Postgres, and system-service installation

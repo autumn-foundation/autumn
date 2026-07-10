@@ -55,6 +55,7 @@ const KNOWN_TOML_SECTIONS: &[&str] = &[
     "security",
     "i18n",
     "storage",
+    "backup",
     "mail",
     "profile",
     "compression",
@@ -4089,6 +4090,13 @@ pub fn run(opts: DoctorOptions) {
         check_dotenv_impl(dotenv_has_example, dotenv_has_env, &dotenv_uncovered)
     }));
 
+    // 12c. Offsite backup config presence (issue #1619): informational when
+    //      unconfigured; flags an unset bucket, a shared bucket without opt-in,
+    //      or credentials that aren't ready. Never prints credential values.
+    tasks.push(Box::new(|| {
+        check_offsite_backup_impl(&resolve_offsite_backup_data())
+    }));
+
     // 13. System-test browser (warn if missing; not all projects use system tests)
     tasks.push(Box::new(check_system_test_browser));
 
@@ -4182,6 +4190,161 @@ pub fn check_compression_impl(compression_enabled: bool, is_production: bool) ->
         }),
         hint: None,
     }
+}
+
+/// Config-presence view of `[backup.offsite]` for [`check_offsite_backup_impl`].
+/// Holds only names/booleans — never a credential value.
+#[derive(Debug, Clone, Default)]
+pub struct OffsiteBackupData {
+    /// A `[backup.offsite]` section is present.
+    pub configured: bool,
+    /// The offsite bucket, when set.
+    pub bucket: Option<String>,
+    /// The configured access-key env var NAME (not value), when set.
+    pub access_key_env: Option<String>,
+    /// The configured secret-key env var NAME (not value), when set.
+    pub secret_key_env: Option<String>,
+    /// Whether the named access-key env var is actually present in the env.
+    pub access_key_env_set: bool,
+    /// Whether the named secret-key env var is actually present in the env.
+    pub secret_key_env_set: bool,
+    /// The offsite destination equals the app `[storage.s3]` bucket+endpoint and
+    /// `allow_shared_bucket` was not set.
+    pub shared_bucket_without_optin: bool,
+}
+
+/// Config-presence check for offsite backups (issue #1619). Never prints a
+/// credential VALUE — only env-var names and the bucket. This is config-key
+/// doctoring, not an alerting check.
+#[must_use]
+pub fn check_offsite_backup_impl(data: &OffsiteBackupData) -> CheckResult {
+    const NAME: &str = "offsite_backup";
+    if !data.configured {
+        return CheckResult {
+            name: NAME,
+            status: CheckStatus::Pass,
+            detail: Some(
+                "no offsite backup destination configured (a backup on the same disk as the \
+                 database is not disaster recovery)"
+                    .into(),
+            ),
+            hint: Some(
+                "Add a [backup.offsite] section (see docs) and run `autumn db backup --upload` \
+                 to keep a verified copy off the server.",
+            ),
+        };
+    }
+    let Some(bucket) = data.bucket.as_deref().filter(|b| !b.trim().is_empty()) else {
+        return CheckResult {
+            name: NAME,
+            status: CheckStatus::Fail,
+            detail: Some(
+                "[backup.offsite] is configured but backup.offsite.s3.bucket is unset".into(),
+            ),
+            hint: Some("Set backup.offsite.s3.bucket to the offsite bucket name."),
+        };
+    };
+    if data.shared_bucket_without_optin {
+        return CheckResult {
+            name: NAME,
+            status: CheckStatus::Fail,
+            detail: Some(format!(
+                "offsite bucket {bucket:?} is the same as the app [storage.s3] bucket at the \
+                 same endpoint, without opt-in"
+            )),
+            hint: Some(
+                "Point the offsite backup at a distinct bucket, or set \
+                 backup.offsite.allow_shared_bucket = true to acknowledge the shared bucket.",
+            ),
+        };
+    }
+    // Credential indirection: the env-var NAMES must be configured AND present.
+    let mut missing: Vec<&str> = Vec::new();
+    if data.access_key_env.as_deref().unwrap_or("").trim().is_empty() {
+        missing.push("backup.offsite.s3.access_key_id_env (name unset)");
+    } else if !data.access_key_env_set {
+        missing.push("access key env var is not set in the environment");
+    }
+    if data.secret_key_env.as_deref().unwrap_or("").trim().is_empty() {
+        missing.push("backup.offsite.s3.secret_access_key_env (name unset)");
+    } else if !data.secret_key_env_set {
+        missing.push("secret key env var is not set in the environment");
+    }
+    if !missing.is_empty() {
+        return CheckResult {
+            name: NAME,
+            status: CheckStatus::Warn,
+            detail: Some(format!(
+                "offsite bucket {bucket:?} configured, but credentials are not ready: {}",
+                missing.join("; ")
+            )),
+            hint: Some(
+                "Set backup.offsite.s3.access_key_id_env / secret_access_key_env to env var \
+                 names, and export those variables with the S3 access key / secret.",
+            ),
+        };
+    }
+    CheckResult {
+        name: NAME,
+        status: CheckStatus::Pass,
+        detail: Some(format!(
+            "offsite backups configured (bucket {bucket:?}, credentials via env-var indirection)"
+        )),
+        hint: None,
+    }
+}
+
+/// Resolve [`OffsiteBackupData`] from the loaded config (profile + env layered).
+/// Best-effort: any config load error yields "not configured".
+fn resolve_offsite_backup_data() -> OffsiteBackupData {
+    let Ok(cfg) = autumn_web::config::AutumnConfig::load() else {
+        return OffsiteBackupData::default();
+    };
+    let Some(offsite) = cfg.backup.offsite else {
+        return OffsiteBackupData::default();
+    };
+    let env_set = |name: &Option<String>| {
+        name.as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .is_some_and(|v| std::env::var(v).is_ok_and(|val| !val.is_empty()))
+    };
+    let bucket = offsite.s3.bucket.clone();
+    let endpoints_match = normalize_doctor_endpoint(offsite.s3.endpoint.as_deref())
+        == normalize_doctor_endpoint(cfg.storage.s3.endpoint.as_deref());
+    let same_bucket = bucket
+        .as_deref()
+        .map(str::trim)
+        .filter(|b| !b.is_empty())
+        .is_some_and(|ob| {
+            cfg.storage
+                .s3
+                .bucket
+                .as_deref()
+                .map(str::trim)
+                .filter(|b| !b.is_empty())
+                == Some(ob)
+        });
+    OffsiteBackupData {
+        configured: true,
+        bucket,
+        access_key_env: offsite.s3.access_key_id_env.clone(),
+        secret_key_env: offsite.s3.secret_access_key_env.clone(),
+        access_key_env_set: env_set(&offsite.s3.access_key_id_env),
+        secret_key_env_set: env_set(&offsite.s3.secret_access_key_env),
+        shared_bucket_without_optin: same_bucket
+            && endpoints_match
+            && !offsite.allow_shared_bucket,
+    }
+}
+
+/// Normalize an endpoint for the doctor shared-bucket comparison.
+fn normalize_doctor_endpoint(endpoint: Option<&str>) -> String {
+    endpoint
+        .unwrap_or("")
+        .trim()
+        .trim_end_matches('/')
+        .to_ascii_lowercase()
 }
 
 /// Resolve `.env` filesystem state for [`check_dotenv_impl`].
@@ -4895,6 +5058,78 @@ fn parse_pub_field_name(line: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn offsite_backup_pass_when_unconfigured() {
+        let r = check_offsite_backup_impl(&OffsiteBackupData::default());
+        assert_eq!(r.status, CheckStatus::Pass);
+        assert!(r.detail.unwrap().contains("not disaster recovery"));
+    }
+
+    #[test]
+    fn offsite_backup_fail_when_bucket_unset() {
+        let data = OffsiteBackupData {
+            configured: true,
+            ..Default::default()
+        };
+        let r = check_offsite_backup_impl(&data);
+        assert_eq!(r.status, CheckStatus::Fail);
+        assert!(r.detail.unwrap().contains("bucket is unset"));
+    }
+
+    #[test]
+    fn offsite_backup_fail_on_shared_bucket_without_optin() {
+        let data = OffsiteBackupData {
+            configured: true,
+            bucket: Some("shared".to_owned()),
+            shared_bucket_without_optin: true,
+            ..Default::default()
+        };
+        let r = check_offsite_backup_impl(&data);
+        assert_eq!(r.status, CheckStatus::Fail);
+        assert!(r.detail.unwrap().contains("same as the app"));
+    }
+
+    #[test]
+    fn offsite_backup_warn_when_credentials_not_ready() {
+        // Bucket set, env var names configured, but the vars aren't exported.
+        let data = OffsiteBackupData {
+            configured: true,
+            bucket: Some("offsite".to_owned()),
+            access_key_env: Some("OFF_KEY".to_owned()),
+            secret_key_env: Some("OFF_SECRET".to_owned()),
+            access_key_env_set: false,
+            secret_key_env_set: false,
+            shared_bucket_without_optin: false,
+        };
+        let r = check_offsite_backup_impl(&data);
+        assert_eq!(r.status, CheckStatus::Warn);
+        // Names the situation, never a credential value.
+        let detail = r.detail.unwrap();
+        assert!(detail.contains("credentials are not ready"));
+        assert!(!detail.contains("supersecret"));
+    }
+
+    #[test]
+    fn offsite_backup_pass_when_ready() {
+        let data = OffsiteBackupData {
+            configured: true,
+            bucket: Some("offsite".to_owned()),
+            access_key_env: Some("OFF_KEY".to_owned()),
+            secret_key_env: Some("OFF_SECRET".to_owned()),
+            access_key_env_set: true,
+            secret_key_env_set: true,
+            shared_bucket_without_optin: false,
+        };
+        let r = check_offsite_backup_impl(&data);
+        assert_eq!(r.status, CheckStatus::Pass);
+        assert!(r.detail.unwrap().contains("offsite backups configured"));
+    }
+
+    #[test]
+    fn known_toml_sections_includes_backup() {
+        assert!(KNOWN_TOML_SECTIONS.contains(&"backup"));
+    }
 
     #[test]
     fn model_private_columns_pass_when_none_flagged() {
