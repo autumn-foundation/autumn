@@ -1021,6 +1021,31 @@ impl AlertChannel for WebhookAlertChannel {
 
 // ── Wiring ──────────────────────────────────────────────────────────────────
 
+/// Whether `url` is a non-empty ABSOLUTE `http(s)` URL that the outbound HTTP
+/// client will actually dispatch.
+///
+/// This mirrors the runtime absoluteness rule in
+/// [`http_client::Client::build_request`](crate::http_client::Client): a request
+/// URL is dispatched verbatim only when it starts with `http://` or `https://`
+/// (both schemes accepted, no TLS requirement); anything else is treated as
+/// relative and resolved against a base-url alias — of which the alert webhook
+/// client has none, so a relative/malformed value fails `reqwest::Url::parse` at
+/// send time and every alert POST fails. Requiring a parseable URL with a
+/// non-empty host here rejects such values BEFORE the channel is registered, so
+/// a webhook that looks configured actually delivers. Kept in lock-step with
+/// `autumn-cli`'s `is_absolute_http_url_doctor` (same rule) so doctor and the
+/// runtime agree on which webhook URLs are usable.
+#[cfg(feature = "http-client")]
+fn is_absolute_http_url(url: &str) -> bool {
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        return false;
+    }
+    ::url::Url::parse(url)
+        .ok()
+        .and_then(|parsed| parsed.host_str().map(|h| !h.is_empty()))
+        .unwrap_or(false)
+}
+
 /// Install the operator alerter from `config` plus any builder channels.
 ///
 /// Builds the built-in channels from `config`, combines them with any
@@ -1084,23 +1109,48 @@ pub fn install_from_config(
         );
     }
     #[cfg(feature = "http-client")]
-    if let Some(url) = config.webhook_url.as_ref().filter(|s| !s.trim().is_empty()) {
-        // Alert webhooks are ALWAYS signed: the operator guide documents receivers
-        // verifying the `Autumn-Signature` header. A configured webhook with no
-        // non-empty signing secret would send UNSIGNED requests that a documented
-        // receiver rejects (or accepts unauthenticated) — so refuse to register the
-        // channel and warn, mirroring the disabled-mail-transport skip above.
-        // Never send unsigned.
-        if let Some(secret) = config
+    if let Some(raw_url) = config.webhook_url.as_ref().filter(|s| !s.trim().is_empty()) {
+        // TRIM the resolved webhook URL and treat the trimmed value as canonical:
+        // a copied env var commonly carries leading/trailing whitespace, and the
+        // runtime dispatch rule matches on `http://`/`https://` PREFIXES, so an
+        // untrimmed `"  https://…"` would never be treated as absolute and every
+        // POST would fail `reqwest::Url::parse`. Building the channel with the
+        // trimmed URL also keeps doctor (which trims + validates) and the runtime
+        // from disagreeing about whether the webhook is usable.
+        let url = raw_url.trim();
+        // Match the missing-secret check's trimming so the stored secret is the
+        // canonical, whitespace-free value used to sign.
+        let secret = config
             .webhook_secret
             .as_ref()
-            .filter(|s| !s.trim().is_empty())
-        {
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty());
+        // Reject an unusable webhook URL BEFORE registering the channel. Without
+        // this, a relative/malformed value (or one whose whitespace an app that
+        // doesn't run doctor never trims) installs a webhook channel that looks
+        // configured but fails EVERY delivery at `build_request`. Mirror the
+        // disabled-transport / missing-secret skip-and-warn pattern above.
+        if !is_absolute_http_url(url) {
+            tracing::warn!(
+                webhook_url = url,
+                "alerts: the configured [alerts] webhook_url ({url}) is not an absolute http(s) \
+                 URL (it must start with `http://` or `https://` and have a host); no webhook \
+                 alerts will be delivered. Fix [alerts] webhook_url (or the \
+                 AUTUMN_ALERTS__WEBHOOK_URL env var)."
+            );
+        } else if let Some(secret) = secret {
+            // Alert webhooks are ALWAYS signed: the operator guide documents
+            // receivers verifying the `Autumn-Signature` header. A configured
+            // webhook with no non-empty signing secret would send UNSIGNED
+            // requests that a documented receiver rejects (or accepts
+            // unauthenticated) — so refuse to register the channel and warn,
+            // mirroring the disabled-mail-transport skip above. Never send
+            // unsigned.
             let client = crate::http_client::Client::from_state(state);
             channels.push(Arc::new(WebhookAlertChannel::new(
                 client,
-                url.clone(),
-                Some(secret.clone()),
+                url.to_owned(),
+                Some(secret.to_owned()),
             )));
         } else {
             tracing::warn!(
@@ -1891,6 +1941,26 @@ mod tests {
             "baseline held across the next sub-threshold tick"
         );
         assert_eq!(last_5xx, 3);
+    }
+
+    #[cfg(feature = "http-client")]
+    #[test]
+    fn is_absolute_http_url_matches_runtime_absoluteness() {
+        // Both schemes are accepted (runtime dispatches either verbatim), with no
+        // TLS requirement and query/fragment allowed.
+        assert!(is_absolute_http_url(
+            "https://alerts.example.com/hooks/autumn"
+        ));
+        assert!(is_absolute_http_url(
+            "http://alerts.example.com/hooks/autumn"
+        ));
+        assert!(is_absolute_http_url("http://h.example.com:8080/x?a=1#f"));
+        // Relative / malformed / non-http / empty-host values are rejected.
+        assert!(!is_absolute_http_url("hooks.example/x"));
+        assert!(!is_absolute_http_url("/hooks/autumn"));
+        assert!(!is_absolute_http_url("ftp://h.example.com/x"));
+        assert!(!is_absolute_http_url("https://"));
+        assert!(!is_absolute_http_url(""));
     }
 
     #[test]

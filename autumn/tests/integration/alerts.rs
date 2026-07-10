@@ -414,6 +414,100 @@ async fn webhook_with_secret_registers_channel() {
     );
 }
 
+/// P2 finding: the RUNTIME path must reject an unusable webhook URL before
+/// registering the channel. A relative/malformed `webhook_url` (here
+/// `hooks.example/x`) — even WITH a secret — is not an absolute `http(s)` URL, so
+/// `http_client::Client::build_request` would never dispatch it (it has no
+/// base-url alias to resolve against) and every alert POST would fail
+/// `reqwest::Url::parse`. `install_from_config` must skip the channel and, with
+/// the webhook as the only destination, install no alerter at all — so the caller
+/// is unaffected.
+#[cfg(feature = "http-client")]
+#[tokio::test]
+async fn webhook_with_relative_url_does_not_register_channel() {
+    let client = TestApp::new().build();
+
+    let config = AlertConfig {
+        webhook_url: Some("hooks.example/x".to_owned()),
+        webhook_secret: Some("s3cr3t".to_owned()),
+        ..AlertConfig::default()
+    };
+    autumn_web::alerts::install_from_config(client.state(), &config, Vec::new());
+
+    assert!(
+        client.state().extension::<Alerter>().is_none(),
+        "a relative/malformed webhook_url must not install a non-delivering webhook channel"
+    );
+}
+
+/// P2 finding, whitespace case: a copied env var commonly carries leading/
+/// trailing whitespace. The URL is otherwise valid, so `install_from_config` must
+/// TRIM it, register the channel, and deliver to the TRIMMED URL. We prove the
+/// trimmed URL is the one actually dispatched by registering an HTTP mock at the
+/// clean path and asserting the delivered alert hits it exactly once — an
+/// untrimmed `"  https://…  "` would fail to match (and, under the mock, error as
+/// `NoMock`) so the mock would never be called.
+#[cfg(feature = "http-client")]
+#[tokio::test]
+async fn webhook_with_whitespace_padded_url_registers_and_uses_trimmed_url() {
+    let trimmed = "https://alerts.example.com/hooks/autumn";
+    let mut app = TestApp::new();
+    // The webhook channel names its client with the (trimmed) URL, so the mock's
+    // alias must equal that trimmed URL for the outbound POST to match.
+    let mock = app
+        .http_mock(trimmed)
+        .post("/hooks/autumn")
+        .respond_with_status(200);
+    let client = app.build();
+
+    let config = AlertConfig {
+        webhook_url: Some(format!("  {trimmed}  ")),
+        webhook_secret: Some("s3cr3t".to_owned()),
+        ..AlertConfig::default()
+    };
+    autumn_web::alerts::install_from_config(client.state(), &config, Vec::new());
+
+    // The channel must be installed despite the surrounding whitespace.
+    assert!(
+        client.state().extension::<Alerter>().is_some(),
+        "a whitespace-padded but valid webhook_url must install the webhook channel"
+    );
+
+    // Fire an alert and wait for the detached delivery task to POST to the mock.
+    autumn_web::alerts::notify_dead_lettered_job(client.state(), "reporting_job", "boom");
+    for _ in 0..100 {
+        if mock.call_count() >= 1 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    mock.expect_called(1);
+}
+
+/// Companion: BOTH `https://` and `http://` absolute URLs (with a secret) are
+/// usable destinations and must register the webhook channel — the runtime rule
+/// accepts either scheme, so the install path must too.
+#[cfg(feature = "http-client")]
+#[tokio::test]
+async fn webhook_with_absolute_http_and_https_urls_register_channel() {
+    for url in [
+        "https://alerts.example.com/hooks/autumn",
+        "http://alerts.example.com/hooks/autumn",
+    ] {
+        let client = TestApp::new().build();
+        let config = AlertConfig {
+            webhook_url: Some(url.to_owned()),
+            webhook_secret: Some("s3cr3t".to_owned()),
+            ..AlertConfig::default()
+        };
+        autumn_web::alerts::install_from_config(client.state(), &config, Vec::new());
+        assert!(
+            client.state().extension::<Alerter>().is_some(),
+            "an absolute {url} webhook must install the webhook channel"
+        );
+    }
+}
+
 /// AC #1/#2: the built-in mail channel reuses the app's configured `Mailer` and
 /// delivers the alert even to a suppressed address (alerts are security-class;
 /// `ignore_suppression()` is called on the builder).

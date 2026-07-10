@@ -219,6 +219,13 @@ If a `webhook_url` is configured but no non-empty `webhook_secret` resolves,
 Autumn logs a startup `warn` and **does not register the webhook channel** —
 it never sends unsigned requests that your receiver would reject.
 
+`webhook_url` must be an **absolute `http(s)` URL** — it has to start with
+`http://` or `https://` and include a host (surrounding whitespace, common when
+the value comes from a copied env var, is trimmed automatically). A relative or
+malformed value could never be dispatched, so Autumn logs a startup `warn` and
+**does not register the webhook channel** rather than installing one that looks
+configured but fails every delivery.
+
 Email alerts are delivered through your configured mailer with the
 bounce/complaint **suppression list bypassed** — operator alerts are
 security-class and must never be silently dropped.
