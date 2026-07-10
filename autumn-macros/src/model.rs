@@ -1788,6 +1788,10 @@ fn fake_string_expr(name: &str) -> TokenStream {
         || name.contains("text")
     {
         quote! { ::autumn_web::fake::paragraph() }
+    } else if name.contains("first_name") || name.contains("firstname") {
+        quote! { ::autumn_web::fake::first_name() }
+    } else if name.contains("last_name") || name.contains("lastname") || name.contains("surname") {
+        quote! { ::autumn_web::fake::last_name() }
     } else if name == "name" {
         quote! { ::autumn_web::fake::name() }
     } else if name.contains("title") || name.contains("name") {

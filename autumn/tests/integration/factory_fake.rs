@@ -22,6 +22,8 @@ mod fake_factory_tests {
         fake_articles (id) {
             id -> Int8,
             name -> Text,
+            first_name -> Text,
+            last_name -> Text,
             email -> Text,
             title -> Text,
             body -> Text,
@@ -38,6 +40,8 @@ mod fake_factory_tests {
         #[id]
         pub id: i64,
         pub name: String,
+        pub first_name: String,
+        pub last_name: String,
         pub email: String,
         pub title: String,
         pub body: String,
@@ -55,6 +59,14 @@ mod fake_factory_tests {
         fake::reseed(1);
         let a = FakeArticle::factory().fake().build();
         assert!(!a.name.is_empty(), "name should be faked");
+        assert!(
+            !a.first_name.is_empty(),
+            "first_name should be faked via fake::first_name()"
+        );
+        assert!(
+            !a.last_name.is_empty(),
+            "last_name should be faked via fake::last_name()"
+        );
         assert_eq!(a.email.matches('@').count(), 1, "email should be faked");
         assert!(!a.title.is_empty(), "title should be faked");
         assert!(!a.body.is_empty(), "body should be faked");
@@ -177,6 +189,8 @@ mod fake_factory_tests {
             "CREATE TABLE IF NOT EXISTS fake_articles (
                 id         BIGSERIAL PRIMARY KEY,
                 name       TEXT NOT NULL DEFAULT '',
+                first_name TEXT NOT NULL DEFAULT '',
+                last_name  TEXT NOT NULL DEFAULT '',
                 email      TEXT NOT NULL DEFAULT '',
                 title      TEXT NOT NULL DEFAULT '',
                 body       TEXT NOT NULL DEFAULT '',

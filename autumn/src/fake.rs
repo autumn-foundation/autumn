@@ -152,20 +152,27 @@ pub fn name() -> String {
 /// e.g. `"olivianguyen473"`.
 #[must_use]
 pub fn username() -> String {
-    let first = pick(FIRST_NAMES).to_ascii_lowercase();
-    let last = pick(LAST_NAMES).to_ascii_lowercase();
-    let n: u32 = with_rng(|r| r.random_range(0..1000));
-    format!("{first}{last}{n}")
+    // Draw both names and the digits under a single lock acquisition.
+    with_rng(|r| {
+        let first = FIRST_NAMES[r.random_range(0..FIRST_NAMES.len())].to_ascii_lowercase();
+        let last = LAST_NAMES[r.random_range(0..LAST_NAMES.len())].to_ascii_lowercase();
+        let n: u32 = r.random_range(0..1000);
+        format!("{first}{last}{n}")
+    })
 }
 
 /// A random email address containing exactly one `@`, e.g.
 /// `"olivia473@example.com"`.
 #[must_use]
 pub fn email() -> String {
-    let first = pick(FIRST_NAMES).to_ascii_lowercase();
-    let n: u32 = with_rng(|r| r.random_range(0..1000));
-    let domain = pick(DOMAINS);
-    format!("{first}{n}@{domain}")
+    // Local part (name + digits) and domain are drawn under one lock; the single
+    // `@` separator keeps exactly one `@` in the result.
+    with_rng(|r| {
+        let first = FIRST_NAMES[r.random_range(0..FIRST_NAMES.len())].to_ascii_lowercase();
+        let n: u32 = r.random_range(0..1000);
+        let domain = DOMAINS[r.random_range(0..DOMAINS.len())];
+        format!("{first}{n}@{domain}")
+    })
 }
 
 // ── Text ────────────────────────────────────────────────────────────────────
@@ -179,13 +186,20 @@ pub fn word() -> String {
 /// `n` space-joined lorem words. Returns an empty string when `n == 0`.
 #[must_use]
 pub fn words(n: usize) -> String {
-    let mut out = String::new();
-    for i in 0..n {
-        if i > 0 {
-            out.push(' ');
-        }
-        out.push_str(pick(LOREM));
+    if n == 0 {
+        return String::new();
     }
+    // Rough capacity: average lorem word (~6 chars) plus a joining space.
+    let mut out = String::with_capacity(n * 8);
+    // Build the whole string under a single lock acquisition.
+    with_rng(|r| {
+        for i in 0..n {
+            if i > 0 {
+                out.push(' ');
+            }
+            out.push_str(LOREM[r.random_range(0..LOREM.len())]);
+        }
+    });
     out
 }
 
@@ -220,7 +234,12 @@ pub fn paragraph() -> String {
 /// A random URL beginning with `"https://"`.
 #[must_use]
 pub fn url() -> String {
-    format!("https://{}/{}", pick(DOMAINS), pick(LOREM))
+    // Pick the domain and path segment under one lock acquisition.
+    with_rng(|r| {
+        let domain = DOMAINS[r.random_range(0..DOMAINS.len())];
+        let path = LOREM[r.random_range(0..LOREM.len())];
+        format!("https://{domain}/{path}")
+    })
 }
 
 /// A random boolean.
