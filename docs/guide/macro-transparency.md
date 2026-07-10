@@ -1003,10 +1003,15 @@ payload versioning (`version = N` / `upgrade = path`).
 
 **Handler arity & tracking:** the job function takes `async fn(AppState, Args)`
 or `async fn(AppState, Args, JobContext)`. The `enqueue_tracked` /
-`enqueue_tracked_for` helpers are **always** generated regardless of arity, but
-they are only *useful* when the handler takes the third `JobContext` argument —
-that's how the job reports progress and a terminal result/error that the tracked
-handle polls:
+`enqueue_tracked_for` helpers are **always** generated regardless of arity, and
+they return a `TrackedJobHandle` whose completion the runtime settles for *any*
+tracked job — two-argument handlers included. Whether or not the handler takes a
+`JobContext`, the runtime marks the record succeeded on success and failed on a
+terminal failure (last attempt or a panic), so callers can always poll the
+handle for completion. The optional third `JobContext` argument is only needed
+to report *progress* and/or a *custom* result/error payload (via
+`ctx.set_progress` / `ctx.set_result` / `ctx.set_user_error`); basic completion
+tracking needs no `JobContext`:
 
 ```rust
 #[job(name = "export_orders")]
