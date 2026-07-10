@@ -132,6 +132,14 @@ impl ChangePlan {
 struct DevReloadState {
     path: PathBuf,
     version: u64,
+    /// The build-error payload for the currently-broken Rust build, if any.
+    ///
+    /// When set, every ordinary [`Self::signal`] re-emits it so a non-build
+    /// reload (CSS/Tailwind/static save routed through the watch loop) keeps
+    /// the compile-error overlay up instead of dismissing it and reloading the
+    /// still-broken stale app. Only a green Rust build clears it, via
+    /// [`Self::signal_build_success`].
+    active_build_error: Option<(Vec<BuildDiagnostic>, bool)>,
 }
 
 impl DevReloadState {
@@ -142,7 +150,11 @@ impl DevReloadState {
                 .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
         }
 
-        let state = Self { path, version: 0 };
+        let state = Self {
+            path,
+            version: 0,
+            active_build_error: None,
+        };
         state.write(ReloadKind::Full)?;
         Ok(state)
     }
@@ -151,6 +163,14 @@ impl DevReloadState {
         &self.path
     }
 
+    /// Signal an ordinary reload (CSS/Tailwind/full). Bumps the version and
+    /// writes fresh state.
+    ///
+    /// If a Rust build is currently broken (`active_build_error` is `Some`),
+    /// the build-error payload is CARRIED FORWARD into the new state so the
+    /// overlay survives — a CSS/Tailwind/static save while the code doesn't
+    /// compile must not dismiss the overlay and reload the stale app. Only a
+    /// green Rust build ([`Self::signal_build_success`]) clears it.
     fn signal(&mut self, kind: ReloadKind) -> Result<(), String> {
         if kind == ReloadKind::None {
             return Ok(());
@@ -160,17 +180,27 @@ impl DevReloadState {
             .version
             .checked_add(1)
             .ok_or("live reload version overflowed")?;
-        self.write(kind)
+
+        if let Some((diagnostics, stale)) = self.active_build_error.as_ref() {
+            let (diagnostics, stale) = (diagnostics.clone(), *stale);
+            self.write_build_error(&diagnostics, stale)
+        } else {
+            self.write(kind)
+        }
     }
 
     /// Bump the version and write a full-reload state carrying compiler
     /// diagnostics so the browser client renders a compile-error overlay
     /// instead of reloading into a broken/stale page.
     ///
+    /// The payload is also stashed in `active_build_error` so subsequent
+    /// ordinary [`Self::signal`] calls carry it forward and keep the overlay
+    /// up until a green build clears it.
+    ///
     /// `stale` is true when a previously-built binary is still serving (the
-    /// browser is looking at a now-outdated page); false on a cold start where
-    /// no server is up yet. A subsequent [`Self::signal`] writes state with no
-    /// `build_error` field, which the client treats as "clear the overlay".
+    /// browser is looking at a now-outdated page); false on a cold start (or
+    /// on Windows, where the old binary must be stopped before rebuilding)
+    /// where no server is up yet.
     fn signal_build_error(
         &mut self,
         diagnostics: &[BuildDiagnostic],
@@ -181,6 +211,39 @@ impl DevReloadState {
             .checked_add(1)
             .ok_or("live reload version overflowed")?;
 
+        self.active_build_error = Some((diagnostics.to_vec(), stale));
+        self.write_build_error(diagnostics, stale)
+    }
+
+    /// Clear a previously-signaled build error after a GREEN Rust build, then
+    /// write ordinary reload state (with NO `build_error` field) so the client
+    /// dismisses the overlay and reloads into the freshly-built app.
+    ///
+    /// This is the ONLY path that clears the overlay: an ordinary
+    /// [`Self::signal`] carries an active build error forward instead.
+    fn signal_build_success(&mut self, kind: ReloadKind) -> Result<(), String> {
+        self.active_build_error = None;
+        // A successful build always warrants a reload to pick up the new
+        // binary, so treat `None` as a full reload rather than a no-op.
+        let kind = if kind == ReloadKind::None {
+            ReloadKind::Full
+        } else {
+            kind
+        };
+
+        self.version = self
+            .version
+            .checked_add(1)
+            .ok_or("live reload version overflowed")?;
+        self.write(kind)
+    }
+
+    /// Write full-reload state carrying a `build_error` payload.
+    fn write_build_error(
+        &self,
+        diagnostics: &[BuildDiagnostic],
+        stale: bool,
+    ) -> Result<(), String> {
         let body = serde_json::json!({
             "version": self.version,
             "kind": "full",
@@ -503,58 +566,83 @@ fn execute_plan(
     mut reload_state: Option<&mut DevReloadState>,
     show_config: bool,
 ) {
-    let mut applied_reload = ReloadKind::None;
-
     if plan.build {
-        // Build FIRST, with the old binary still running. Only tear it down
-        // once we have a fresh binary to replace it with — otherwise a failed
-        // rebuild would leave the app DOWN and the browser would see a
-        // connection-refused/stale page instead of a diagnostics overlay.
+        // The order of "stop old binary" vs. "cargo build" is platform-gated.
+        //
+        // On Unix/macOS, replacing a running binary file mid-build is safe
+        // (inode semantics), so we build FIRST with the old binary still
+        // serving. A failed rebuild then leaves the stale app up to answer the
+        // live-reload endpoint and render the diagnostics overlay.
+        //
+        // On Windows the running `target/debug/<app>.exe` is LOCKED while the
+        // process is alive, so `cargo build` can't relink over it (access
+        // denied / linker failure). There we must stop the old binary BEFORE
+        // building. The tradeoff: a failed Windows rebuild leaves the app down,
+        // so the overlay's stale-page serving isn't available and the client
+        // falls back to a normal reconnect (documented limitation).
+        let stop_before_build = cfg!(windows);
+
+        if stop_before_build {
+            stop_server(child);
+        }
+
         let (built, diagnostics) = cargo_build_capturing(package);
 
         if built {
-            stop_server(child);
+            if !stop_before_build {
+                stop_server(child);
+            }
             if restart_server(
                 package,
                 child,
                 reload_state.as_ref().map(|s| s.path()),
                 show_config,
-            ) {
-                // A normal full reload clears any prior build-error overlay.
-                applied_reload = ReloadKind::Full;
+            ) && let Some(reload_state) = reload_state.as_mut()
+                && let Err(error) = reload_state.signal_build_success(ReloadKind::Full)
+            {
+                // A green build is the only thing that clears the overlay.
+                eprintln!("  Warning: live reload signal failed: {error}");
             }
         } else {
             eprintln!("  \u{2717} Build failed. Waiting for changes...\n");
-            // Leave the (stale) binary running so it keeps answering the
-            // live-reload state endpoint; the browser then renders the overlay.
+            // On Unix the (stale) binary is still running, so it keeps
+            // answering the live-reload state endpoint and the browser renders
+            // the overlay. On Windows we already stopped it above, so nothing
+            // is serving: `child.is_some()` is false there and the client
+            // falls back to a normal reconnect.
             let stale = child.is_some();
             if let Some(reload_state) = reload_state.as_mut()
                 && let Err(error) = reload_state.signal_build_error(&diagnostics, stale)
             {
                 eprintln!("  Warning: live reload signal failed: {error}");
             }
-            return;
         }
-    } else {
-        if plan.tailwind && tailwind_build() {
-            applied_reload = applied_reload.max(ReloadKind::Css);
-        }
-
-        if plan.restart {
-            stop_server(child);
-            if restart_server(
-                package,
-                child,
-                reload_state.as_ref().map(|s| s.path()),
-                show_config,
-            ) {
-                applied_reload = ReloadKind::Full;
-            }
-        } else if plan.reload == ReloadKind::Full {
-            applied_reload = ReloadKind::Full;
-        }
+        return;
     }
 
+    let mut applied_reload = ReloadKind::None;
+
+    if plan.tailwind && tailwind_build() {
+        applied_reload = applied_reload.max(ReloadKind::Css);
+    }
+
+    if plan.restart {
+        stop_server(child);
+        if restart_server(
+            package,
+            child,
+            reload_state.as_ref().map(|s| s.path()),
+            show_config,
+        ) {
+            applied_reload = ReloadKind::Full;
+        }
+    } else if plan.reload == ReloadKind::Full {
+        applied_reload = ReloadKind::Full;
+    }
+
+    // Ordinary (non-build) reload. If a Rust build is still broken,
+    // `signal` carries the build-error overlay forward instead of dismissing
+    // it, so this CSS/Tailwind/static change doesn't reload the stale app.
     if let Some(reload_state) = reload_state.as_mut()
         && let Err(error) = reload_state.signal(applied_reload)
     {
@@ -2052,7 +2140,11 @@ mod tests {
     fn dev_reload_state_signal_writes_css_and_full_versions() {
         let reload_file = tempfile::NamedTempFile::new().expect("reload file");
         let path = reload_file.path().to_path_buf();
-        let mut state = DevReloadState { path, version: 0 };
+        let mut state = DevReloadState {
+            path,
+            version: 0,
+            active_build_error: None,
+        };
 
         state.signal(ReloadKind::Css).expect("css signal");
         let body = std::fs::read_to_string(state.path()).expect("read css");
@@ -2107,20 +2199,29 @@ mod tests {
         assert_eq!(diags[1].column, 9);
     }
 
-    #[test]
-    fn dev_reload_state_signal_build_error_writes_and_full_clears() {
-        let reload_file = tempfile::NamedTempFile::new().expect("reload file");
-        let path = reload_file.path().to_path_buf();
-        let mut state = DevReloadState { path, version: 0 };
-
-        let diags = vec![BuildDiagnostic {
+    /// A representative single-error diagnostic list for the build-error tests.
+    fn sample_build_diagnostics() -> Vec<BuildDiagnostic> {
+        vec![BuildDiagnostic {
             code: Some("E0425".to_owned()),
             message: "cannot find value `foo`".to_owned(),
             file: "src/main.rs".to_owned(),
             line: 3,
             column: 5,
             rendered: "error[E0425]: cannot find value `foo`".to_owned(),
-        }];
+        }]
+    }
+
+    #[test]
+    fn dev_reload_state_signal_build_error_writes_payload() {
+        let reload_file = tempfile::NamedTempFile::new().expect("reload file");
+        let path = reload_file.path().to_path_buf();
+        let mut state = DevReloadState {
+            path,
+            version: 0,
+            active_build_error: None,
+        };
+
+        let diags = sample_build_diagnostics();
 
         state
             .signal_build_error(&diags, true)
@@ -2143,26 +2244,107 @@ mod tests {
             value["build_error"]["diagnostics"][0]["message"],
             "cannot find value `foo`"
         );
+    }
 
-        // A subsequent normal full signal must clear the build_error field so
-        // the browser overlay dismisses and the page reloads.
+    #[test]
+    fn dev_reload_state_signal_carries_build_error_across_non_build_reloads() {
+        // P2 regression guard: once a Rust build is broken, an ordinary CSS
+        // (or other non-build) reload must NOT dismiss the overlay. It carries
+        // the build_error payload forward while still bumping the version so
+        // the client re-polls but stays on the overlay instead of reloading the
+        // stale app.
+        let reload_file = tempfile::NamedTempFile::new().expect("reload file");
+        let path = reload_file.path().to_path_buf();
+        let mut state = DevReloadState {
+            path,
+            version: 0,
+            active_build_error: None,
+        };
+
+        let diags = sample_build_diagnostics();
+        state
+            .signal_build_error(&diags, true)
+            .expect("build error signal");
+        assert_eq!(state.version, 1);
+
+        // A Tailwind/CSS save while Rust is broken.
+        state.signal(ReloadKind::Css).expect("css signal");
+        assert_eq!(state.version, 2, "carrying forward still bumps the version");
+        let body = std::fs::read_to_string(state.path()).expect("read carried");
+        let value: serde_json::Value = serde_json::from_str(&body).expect("valid json");
+        assert_eq!(value["version"], 2);
+        assert_eq!(value["kind"], "full", "build error state stays a full kind");
+        assert!(
+            value.get("build_error").is_some(),
+            "a non-build reload must carry the build_error forward"
+        );
+        assert_eq!(value["build_error"]["stale"], true);
+        assert_eq!(value["build_error"]["diagnostics"][0]["code"], "E0425");
+
+        // A plain full reload (e.g. a config-only restart) also carries it.
         state.signal(ReloadKind::Full).expect("full signal");
+        assert_eq!(state.version, 3);
+        let body = std::fs::read_to_string(state.path()).expect("read carried again");
+        let value: serde_json::Value = serde_json::from_str(&body).expect("valid json");
+        assert!(
+            value.get("build_error").is_some(),
+            "a plain full reload must also carry the build_error forward"
+        );
+    }
+
+    #[test]
+    fn dev_reload_state_signal_build_success_clears_overlay() {
+        // Only a green Rust build clears the overlay: the explicit
+        // success-clear drops the build_error field and bumps the version so
+        // the client dismisses the overlay and reloads the freshly-built app.
+        let reload_file = tempfile::NamedTempFile::new().expect("reload file");
+        let path = reload_file.path().to_path_buf();
+        let mut state = DevReloadState {
+            path,
+            version: 0,
+            active_build_error: None,
+        };
+
+        let diags = sample_build_diagnostics();
+        state
+            .signal_build_error(&diags, true)
+            .expect("build error signal");
+        assert_eq!(state.version, 1);
+
+        state
+            .signal_build_success(ReloadKind::Full)
+            .expect("success signal");
         assert_eq!(state.version, 2);
         let body = std::fs::read_to_string(state.path()).expect("read cleared");
         let value: serde_json::Value = serde_json::from_str(&body).expect("valid json");
         assert!(
             value.get("build_error").is_none(),
-            "a normal full signal must not carry a build_error field"
+            "a green build must clear the build_error field"
         );
         assert_eq!(value["version"], 2);
         assert_eq!(value["kind"], "full");
+
+        // After a green build, ordinary signals no longer carry an overlay.
+        state.signal(ReloadKind::Css).expect("css signal");
+        let body = std::fs::read_to_string(state.path()).expect("read post-clear");
+        let value: serde_json::Value = serde_json::from_str(&body).expect("valid json");
+        assert!(
+            value.get("build_error").is_none(),
+            "no overlay should persist once cleared by a green build"
+        );
+        assert_eq!(value["kind"], "css");
+        assert_eq!(value["version"], 3);
     }
 
     #[test]
     fn dev_reload_state_signal_none_is_noop() {
         let reload_file = tempfile::NamedTempFile::new().expect("reload file");
         let path = reload_file.path().to_path_buf();
-        let mut state = DevReloadState { path, version: 41 };
+        let mut state = DevReloadState {
+            path,
+            version: 41,
+            active_build_error: None,
+        };
 
         state.signal(ReloadKind::None).expect("noop signal");
         assert_eq!(state.version, 41);
@@ -2181,6 +2363,7 @@ mod tests {
         let mut state = DevReloadState {
             path,
             version: u64::MAX,
+            active_build_error: None,
         };
 
         let error = state

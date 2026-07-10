@@ -245,5 +245,21 @@ bound), so there is nothing for the browser to talk to. In that case the
 compiler errors are printed to the terminal as before. Once any successful
 build has started the server, subsequent failed rebuilds show the overlay.
 
+### Known limitation: Windows
+
+The stale-page serving described above is **not available on Windows**. Windows
+keeps the running `target/debug/<app>.exe` locked while the process is alive, so
+`cargo build` cannot relink over it. To rebuild at all, the dev orchestrator
+must stop the old binary *before* running `cargo build` on Windows (Unix/macOS
+build first and only stop once a fresh binary is ready).
+
+The consequence: on Windows a **failed** rebuild leaves the app already stopped,
+so there is no running server to answer the live-reload poll and paint the
+overlay. You get the compiler errors streamed to the terminal plus the client's
+normal reconnect behavior once a green build restarts the server. Unix and macOS
+get the full stale-page overlay experience. This is a documented, non-regressive
+platform limitation — Windows simply falls back to the pre-overlay terminal-only
+behavior for failed rebuilds.
+
 See [ADR 0006](../adr/0006-dev-error-overlay.md) for the design reasoning
 behind the dev overlays and their production guards.
