@@ -306,7 +306,9 @@ fn truncate_for_error(value: &str) -> String {
 /// means the declared header is spoofed.
 #[cfg(feature = "multipart")]
 fn is_signatureless_text_type(essence: &str) -> bool {
-    essence.starts_with("text/") || matches!(essence, "application/json" | "application/csv")
+    // Media types are case-insensitive, so normalize before comparing.
+    let lower = essence.to_ascii_lowercase();
+    lower.starts_with("text/") || matches!(lower.as_str(), "application/json" | "application/csv")
 }
 
 /// Enforce a MIME allow-list against a file part, using content sniffing as the
@@ -981,6 +983,24 @@ mod tests {
         assert_eq!(content_type_essence("  text/csv  "), "text/csv");
         assert_eq!(content_type_essence("application/json"), "application/json");
         assert_eq!(content_type_essence(""), "");
+    }
+
+    #[test]
+    fn is_signatureless_text_type_is_case_insensitive() {
+        // Media types are case-insensitive, so mixed-case declarations must be
+        // recognized as signature-less text.
+        assert!(is_signatureless_text_type("text/csv"));
+        assert!(is_signatureless_text_type("Text/Csv"));
+        assert!(is_signatureless_text_type("TEXT/PLAIN"));
+        assert!(is_signatureless_text_type("application/json"));
+        assert!(is_signatureless_text_type("Application/JSON"));
+        assert!(is_signatureless_text_type("application/csv"));
+        // Binary/sniffable types are never treated as signature-less text —
+        // the P1 fix must be preserved regardless of case.
+        assert!(!is_signatureless_text_type("image/png"));
+        assert!(!is_signatureless_text_type("Image/PNG"));
+        assert!(!is_signatureless_text_type("application/octet-stream"));
+        assert!(!is_signatureless_text_type("application/pdf"));
     }
 
     #[test]

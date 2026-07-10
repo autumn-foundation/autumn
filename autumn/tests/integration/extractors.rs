@@ -682,6 +682,28 @@ async fn multipart_genuine_csv_passes_via_declared_fallback() {
 
 #[cfg(feature = "multipart")]
 #[tokio::test]
+async fn multipart_mixed_case_text_type_passes_via_fallback() {
+    let boundary = "X-BOUNDARY";
+    // Media types are case-insensitive: a mixed-case declared `Text/Csv` must
+    // still be recognized as a signature-less text type and admitted via the
+    // declared-header fallback, matching the case-insensitive allow-list.
+    let body = single_file_multipart_body(boundary, "file", "data.csv", "Text/Csv", b"a,b\n1,2");
+
+    let config = autumn_web::security::UploadConfig {
+        allowed_mime_types: vec!["text/csv".to_owned()],
+        ..autumn_web::security::UploadConfig::default()
+    };
+
+    let response = run_sniff_upload(config, body, boundary).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let out = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(&out[..], b"none:7");
+}
+
+#[cfg(feature = "multipart")]
+#[tokio::test]
 async fn multipart_svg_rejected_even_when_declared_image() {
     let boundary = "X-BOUNDARY";
     // SVG is markup: the leading `<` must trip the markup guard (or be sniffed
