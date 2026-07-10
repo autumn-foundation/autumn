@@ -384,6 +384,7 @@ pub mod job_tracking;
 /// Safe, method-aware link helpers: [`links::link_to`] anchors and
 /// [`links::button_to`] CSRF-protected action buttons.
 pub mod links;
+pub mod payload_version;
 pub mod runtime_config;
 #[cfg(feature = "seed")]
 pub mod seed;

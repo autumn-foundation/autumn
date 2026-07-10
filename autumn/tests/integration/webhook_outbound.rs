@@ -54,6 +54,7 @@ async fn test_webhook_outbound_lifecycle() {
     let shutdown = tokio_util::sync::CancellationToken::new();
     let config = autumn_web::config::JobConfig::default();
     let job_info = JobInfo {
+        version: 1,
         name: "autumn_webhook_delivery".to_owned(),
         max_attempts: 1,
         initial_backoff_ms: 1,
@@ -150,6 +151,7 @@ async fn test_webhook_outbound_retries_and_dlq() {
     let shutdown = tokio_util::sync::CancellationToken::new();
     let config = autumn_web::config::JobConfig::default();
     let job_info = JobInfo {
+        version: 1,
         name: "autumn_webhook_delivery".to_owned(),
         max_attempts: 5,
         initial_backoff_ms: 1,
@@ -239,6 +241,7 @@ async fn test_webhook_outbound_failure_caps_deactivation() {
     let shutdown = tokio_util::sync::CancellationToken::new();
     let config = autumn_web::config::JobConfig::default();
     let job_info = JobInfo {
+        version: 1,
         name: "autumn_webhook_delivery".to_owned(),
         max_attempts: 5,
         initial_backoff_ms: 1,
@@ -320,6 +323,7 @@ async fn test_webhook_outbound_actuator_endpoints() {
     let shutdown = tokio_util::sync::CancellationToken::new();
     let config = autumn_web::config::JobConfig::default();
     let job_info = JobInfo {
+        version: 1,
         name: "autumn_webhook_delivery".to_owned(),
         max_attempts: 5,
         initial_backoff_ms: 1,

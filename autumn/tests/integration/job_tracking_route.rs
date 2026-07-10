@@ -46,6 +46,7 @@ struct TrackedGateJobPlugin;
 impl Plugin for TrackedGateJobPlugin {
     fn build(self, app: AppBuilder) -> AppBuilder {
         app.jobs(vec![JobInfo {
+            version: 1,
             name: "tracked_gate_job".to_string(),
             max_attempts: 1,
             initial_backoff_ms: 1,

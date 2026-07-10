@@ -92,6 +92,13 @@ pub struct JobInfo {
     pub uniqueness: Option<JobUniqueness>,
     /// In-flight concurrency cap; `None` means unbounded per-type concurrency.
     pub concurrency: Option<JobConcurrency>,
+    /// Declared payload schema version (issue #1205). Defaults to `1`. When it
+    /// is `> 1` every enqueue path wraps the args in the version envelope so a
+    /// deploy that changes the args struct can upgrade in-flight payloads. This
+    /// is threaded into `JobRuntimeSettings` so the name-keyed enqueue
+    /// chokepoints (including the transactional free functions) can wrap by
+    /// looking the version up from the registry.
+    pub version: u32,
     /// The async function that executes the job logic.
     pub handler: JobHandler,
 }
@@ -112,6 +119,7 @@ impl JobInfo {
             queue: "default".to_string(),
             uniqueness: None,
             concurrency: None,
+            version: 1,
             handler,
         }
     }
@@ -275,6 +283,10 @@ struct JobRuntimeSettings {
     queue: String,
     uniqueness: Option<JobUniqueness>,
     concurrency: Option<JobConcurrency>,
+    /// Declared payload schema version (issue #1205), copied from
+    /// [`JobInfo::version`]. `0` (the `Default`) and `1` both mean "unversioned"
+    /// so the enqueue chokepoints only wrap when `version > 1`.
+    version: u32,
 }
 
 #[cfg(test)]
@@ -1258,6 +1270,7 @@ fn is_final_attempt<T: PartialOrd>(attempt: &T, max_attempts: &T) -> bool {
 /// stable hash of the full canonicalized payload.
 fn job_unique_key(uniqueness: &JobUniqueness, payload: &Value) -> String {
     let (_, payload) = crate::job_tracking::split_tracked_payload(payload);
+    let (_, payload) = crate::payload_version::split_version(payload);
     if uniqueness.by.is_empty() {
         let mut canonical = String::new();
         write_canonical_json(payload, &mut canonical);
@@ -1283,6 +1296,7 @@ fn job_unique_key(uniqueness: &JobUniqueness, payload: &Value) -> String {
 /// payloads lacking the field share one scope.
 fn job_concurrency_scope(concurrency: &JobConcurrency, payload: &Value) -> Option<String> {
     let (_, payload) = crate::job_tracking::split_tracked_payload(payload);
+    let (_, payload) = crate::payload_version::split_version(payload);
     concurrency.key.as_ref().map(|field| {
         let mut scope = String::new();
         write_canonical_json(payload.get(field).unwrap_or(&Value::Null), &mut scope);
@@ -1292,6 +1306,7 @@ fn job_concurrency_scope(concurrency: &JobConcurrency, payload: &Value) -> Optio
 
 fn job_payload_identity(payload: &Value) -> (Option<String>, Option<String>) {
     let (_, payload) = crate::job_tracking::split_tracked_payload(payload);
+    let (_, payload) = crate::payload_version::split_version(payload);
     let principal = first_payload_string(payload, &["principal_id", "principal", "user_id"]);
     let correlation = first_payload_string(payload, &["correlation_id", "request_id"]);
     (principal, correlation)
@@ -2399,9 +2414,13 @@ impl JobClient {
         let res = if let Some(interceptor) = &self.interceptor {
             let interceptor = (*interceptor).clone();
             // `payload` is the tracked-envelope-wrapped value for a tracked
-            // job (see `enqueue_tracked_for`); app-registered interceptors
-            // must see the real args, matching what `intercept_execute` sees
-            // at run time, not the internal envelope.
+            // job (see `enqueue_tracked_for`); strip that internal envelope so
+            // app-registered interceptors see the payload as enqueued, matching
+            // what `intercept_execute` sees at run time. The schema-version
+            // envelope (issue #1205) is *not* stripped here: for a versioned
+            // job the interceptor observes `{__autumn_schema_version, args}`,
+            // and the built-in test recorder unwraps it via
+            // `payload_version::split_version` when comparing payloads.
             let (_, interceptor_payload) = crate::job_tracking::split_tracked_payload(&payload);
             run_enqueue_interceptor(
                 interceptor,
@@ -2542,6 +2561,12 @@ impl JobClient {
         // transaction has already committed — by then it's too late for the
         // caller to roll back on a rejected payload.
         crate::job_tracking::reject_reserved_envelope_marker(&payload)?;
+        // Apply the schema-version envelope (issue #1205) here — the one
+        // after-commit chokepoint — so all three `*_after_commit` typed-args
+        // entry points wrap. This runs BEFORE the deferred `enqueue_due` (which
+        // never wraps), and the generated `#[job]` methods never reach this
+        // chokepoint, so there is no double-wrap.
+        let payload = self.wrap_payload_version(&name, payload);
         let client = self.clone();
         // Keep a copy for the debug log in the eager path (name is moved into f_opt).
         let name_for_log = name.clone();
@@ -2584,6 +2609,21 @@ impl JobClient {
         }
 
         Ok(())
+    }
+
+    /// Wrap `payload` in the schema-version envelope (issue #1205) when the
+    /// named job declares `version > 1`, resolving the version from the
+    /// name-keyed runtime settings. A no-op (raw args passed through) for
+    /// unversioned jobs or an unregistered name — registration is validated
+    /// separately by each caller. Used by the transactional after-commit
+    /// chokepoint, whose typed-args entry points would otherwise store raw args.
+    fn wrap_payload_version(&self, name: &str, payload: Value) -> Value {
+        match self.per_job_settings.get(name) {
+            Some(settings) if settings.version > 1 => {
+                crate::payload_version::wrap(settings.version, payload)
+            }
+            _ => payload,
+        }
     }
 
     /// Mark a coalesced enqueue in the registry counters and admin record.
@@ -2763,6 +2803,19 @@ impl JobClient {
             self.default_initial_backoff_ms
         };
         let job_queue = normalize_queue_name(&settings.queue);
+        // Apply the schema-version envelope (issue #1205) here — the shared
+        // transactional-DB chokepoint for `enqueue_on_conn`, `enqueue_at_on_conn`,
+        // `enqueue_in_on_conn`, and `enqueue_in_tx` (plus any direct
+        // `JobClient::enqueue_on_conn*` call). The generated `#[job]` methods
+        // funnel through `enqueue`/`enqueue_due`, never here, so their
+        // already-wrapped payload can never be double-wrapped. Wrap before
+        // constraint resolution — the unique/concurrency keys strip the version
+        // envelope, so a v1 job and its versioned re-encoding still coalesce.
+        let payload = if settings.version > 1 {
+            crate::payload_version::wrap(settings.version, payload)
+        } else {
+            payload
+        };
         let constraints = ResolvedJobConstraints::for_payload(settings, &payload);
         let id = uuid::Uuid::new_v4().to_string();
 
@@ -7414,6 +7467,7 @@ fn build_per_job_settings(jobs: &[JobInfo]) -> HashMap<String, JobRuntimeSetting
                     queue: normalize_queue_name(&job.queue),
                     uniqueness: job.uniqueness.clone(),
                     concurrency: job.concurrency.clone(),
+                    version: job.version,
                 },
             )
         })
@@ -8174,6 +8228,7 @@ mod tests {
         let shutdown = tokio_util::sync::CancellationToken::new();
         start_local_runtime(
             vec![JobInfo {
+                version: 1,
                 name: "noop".to_string(),
                 max_attempts: 3,
                 initial_backoff_ms: 10,
@@ -8216,6 +8271,7 @@ mod tests {
         let shutdown = tokio_util::sync::CancellationToken::new();
         start_local_runtime(
             vec![JobInfo {
+                version: 1,
                 name: "delayed".to_string(),
                 max_attempts: 3,
                 initial_backoff_ms: 10,
@@ -8273,6 +8329,7 @@ mod tests {
         let shutdown = tokio_util::sync::CancellationToken::new();
         start_local_runtime(
             vec![JobInfo {
+                version: 1,
                 name: "past".to_string(),
                 max_attempts: 3,
                 initial_backoff_ms: 10,
@@ -8316,6 +8373,7 @@ mod tests {
         let shutdown = tokio_util::sync::CancellationToken::new();
         start_local_runtime(
             vec![JobInfo {
+                version: 1,
                 name: "cancelable".to_string(),
                 max_attempts: 3,
                 initial_backoff_ms: 10,
@@ -8493,6 +8551,7 @@ mod tests {
         let shutdown = tokio_util::sync::CancellationToken::new();
         start_local_runtime(
             vec![JobInfo {
+                version: 1,
                 name: "noop".to_string(),
                 max_attempts: 3,
                 initial_backoff_ms: 10,
@@ -8535,6 +8594,7 @@ mod tests {
         jobs.insert(
             "panic".to_string(),
             JobInfo {
+                version: 1,
                 name: "panic".to_string(),
                 max_attempts: 3,
                 initial_backoff_ms: 1,
@@ -8595,6 +8655,7 @@ mod tests {
         jobs.insert(
             "flaky".to_string(),
             JobInfo {
+                version: 1,
                 name: "flaky".to_string(),
                 max_attempts: 2,
                 initial_backoff_ms: 1,
@@ -8657,6 +8718,7 @@ mod tests {
         jobs.insert(
             "flaky".to_string(),
             JobInfo {
+                version: 1,
                 name: "flaky".to_string(),
                 max_attempts: 1,
                 initial_backoff_ms: 1,
@@ -8714,6 +8776,7 @@ mod tests {
         jobs.insert(
             "flaky".to_string(),
             JobInfo {
+                version: 1,
                 name: "flaky".to_string(),
                 max_attempts: 2,
                 initial_backoff_ms: 60_000,
@@ -8825,6 +8888,7 @@ mod tests {
     fn redis_retry_promotion_interval_uses_smallest_configured_backoff() {
         let jobs = vec![
             JobInfo {
+                version: 1,
                 name: "slow".to_string(),
                 max_attempts: 3,
                 initial_backoff_ms: 250,
@@ -8834,6 +8898,7 @@ mod tests {
                 handler: redis_counting_success_handler,
             },
             JobInfo {
+                version: 1,
                 name: "fast".to_string(),
                 max_attempts: 3,
                 initial_backoff_ms: 25,
@@ -8849,6 +8914,7 @@ mod tests {
 
         // Large retry backoffs must not delay one-shot delayed-job promotion.
         let slow_jobs = vec![JobInfo {
+            version: 1,
             name: "very_slow".to_string(),
             max_attempts: 3,
             initial_backoff_ms: 60_000,
@@ -9063,6 +9129,7 @@ mod tests {
         Arc::new(RwLock::new(HashMap::from([(
             "send_email".to_string(),
             JobInfo {
+                version: 1,
                 name: "send_email".to_string(),
                 max_attempts,
                 initial_backoff_ms: 1,
@@ -10700,6 +10767,7 @@ mod tests {
         let shutdown = tokio_util::sync::CancellationToken::new();
         start_local_runtime(
             vec![JobInfo {
+                version: 1,
                 name: "known".to_string(),
                 max_attempts: 3,
                 initial_backoff_ms: 10,
@@ -10751,6 +10819,7 @@ mod tests {
         let error = start_runtime(
             vec![
                 JobInfo {
+                    version: 1,
                     name: "dupe".to_string(),
                     max_attempts: 1,
                     initial_backoff_ms: 1,
@@ -10760,6 +10829,7 @@ mod tests {
                     handler: |_state, _payload| Box::pin(async move { Ok(()) }),
                 },
                 JobInfo {
+                    version: 1,
                     name: "dupe".to_string(),
                     max_attempts: 1,
                     initial_backoff_ms: 1,
@@ -10799,6 +10869,7 @@ mod tests {
 
         let error = start_runtime(
             vec![JobInfo {
+                version: 1,
                 name: "known".to_string(),
                 max_attempts: 1,
                 initial_backoff_ms: 1,
@@ -10841,6 +10912,7 @@ mod tests {
 
         let error = start_runtime(
             vec![JobInfo {
+                version: 1,
                 name: "known".to_string(),
                 max_attempts: 1,
                 initial_backoff_ms: 1,
@@ -11494,6 +11566,74 @@ mod tests {
 
         let (principal, _) = job_payload_identity(&wrapped);
         assert_eq!(principal.as_deref(), Some("user:7"));
+    }
+
+    #[test]
+    fn job_unique_key_and_identity_strip_the_version_envelope() {
+        // A v1 job (raw args) and its versioned re-encoding must hash
+        // identically so dedup still coalesces across a deploy that starts
+        // wrapping payloads.
+        let inner = serde_json::json!({"account_id": 42, "principal_id": "user:7"});
+        let versioned = crate::payload_version::wrap(2, inner.clone());
+
+        let uniqueness = JobUniqueness {
+            by: Vec::new(),
+            window: JobUniquenessWindow::Running,
+        };
+        assert_eq!(
+            job_unique_key(&uniqueness, &versioned),
+            job_unique_key(&uniqueness, &inner),
+            "the version envelope must not change the derived unique key"
+        );
+
+        let by_field = JobUniqueness {
+            by: vec!["account_id".to_string()],
+            window: JobUniquenessWindow::Running,
+        };
+        assert_eq!(
+            job_unique_key(&by_field, &versioned),
+            job_unique_key(&by_field, &inner)
+        );
+
+        let concurrency = JobConcurrency {
+            limit: 1,
+            key: Some("account_id".to_string()),
+        };
+        assert_eq!(
+            job_concurrency_scope(&concurrency, &versioned),
+            job_concurrency_scope(&concurrency, &inner)
+        );
+
+        let (principal, _) = job_payload_identity(&versioned);
+        assert_eq!(principal.as_deref(), Some("user:7"));
+
+        // Composition: a tracked + versioned payload strips both envelopes.
+        let tracked_versioned = crate::job_tracking::wrap_tracked_payload("h", &versioned);
+        assert_eq!(
+            job_unique_key(&uniqueness, &tracked_versioned),
+            job_unique_key(&uniqueness, &inner),
+            "tracked + versioned must strip both envelopes for key derivation"
+        );
+    }
+
+    #[test]
+    fn job_unique_key_hashes_whole_payload_when_marker_field_is_not_an_envelope() {
+        // A raw (unversioned) payload that legitimately carries a top-level
+        // `__autumn_schema_version` field is NOT a version envelope (Codex #1205
+        // collision fix): key derivation must hash the WHOLE object, so two such
+        // payloads differing only in a sibling field get distinct keys rather
+        // than both collapsing onto a stripped `args` subtree.
+        let uniqueness = JobUniqueness {
+            by: Vec::new(),
+            window: JobUniquenessWindow::Running,
+        };
+        let a = serde_json::json!({"__autumn_schema_version": 5, "other": 1});
+        let b = serde_json::json!({"__autumn_schema_version": 5, "other": 2});
+        assert_ne!(
+            job_unique_key(&uniqueness, &a),
+            job_unique_key(&uniqueness, &b),
+            "a marker field without the exact envelope shape must not be stripped"
+        );
     }
 
     #[tokio::test]
@@ -12177,6 +12317,7 @@ mod tests {
 
             let error = start_runtime(
                 vec![JobInfo {
+                    version: 1,
                     name: "test_job".to_string(),
                     max_attempts: 1,
                     initial_backoff_ms: 1,
@@ -13837,6 +13978,7 @@ mod tests {
             jobs.insert(
                 "noop".to_string(),
                 JobInfo {
+                    version: 1,
                     name: "noop".to_string(),
                     max_attempts: 1,
                     initial_backoff_ms: 0,
@@ -14506,6 +14648,7 @@ mod tests {
         let shutdown = tokio_util::sync::CancellationToken::new();
         start_local_runtime(
             vec![JobInfo {
+                version: 1,
                 name: "unique_cancelable".to_string(),
                 max_attempts: 1,
                 initial_backoff_ms: 10,
@@ -15009,6 +15152,7 @@ mod uniqueness_concurrency_tests {
 
     fn unique_job(name: &str, window: JobUniquenessWindow, handler: JobHandler) -> JobInfo {
         JobInfo {
+            version: 1,
             name: name.to_string(),
             max_attempts: 1,
             initial_backoff_ms: 1,
@@ -15423,6 +15567,7 @@ mod uniqueness_concurrency_tests {
         let shutdown = tokio_util::sync::CancellationToken::new();
         start_local_runtime(
             vec![JobInfo {
+                version: 1,
                 name: "unique_by_field".to_string(),
                 max_attempts: 1,
                 initial_backoff_ms: 1,
@@ -15503,6 +15648,7 @@ mod uniqueness_concurrency_tests {
         let shutdown = tokio_util::sync::CancellationToken::new();
         start_local_runtime(
             vec![JobInfo {
+                version: 1,
                 name: "recalculate".to_string(),
                 max_attempts: 1,
                 initial_backoff_ms: 1,
@@ -15587,6 +15733,7 @@ mod uniqueness_concurrency_tests {
         let shutdown = tokio_util::sync::CancellationToken::new();
         start_local_runtime(
             vec![JobInfo {
+                version: 1,
                 name: "per_account".to_string(),
                 max_attempts: 1,
                 initial_backoff_ms: 1,
@@ -15657,6 +15804,7 @@ mod uniqueness_concurrency_tests {
         let shutdown = tokio_util::sync::CancellationToken::new();
         start_local_runtime(
             vec![JobInfo {
+                version: 1,
                 name: "retry_conflict".to_string(),
                 max_attempts: 1,
                 initial_backoff_ms: 1,
@@ -15754,6 +15902,7 @@ mod uniqueness_concurrency_tests {
         let shutdown = tokio_util::sync::CancellationToken::new();
         start_local_runtime(
             vec![JobInfo {
+                version: 1,
                 name: "pending_retry".to_string(),
                 max_attempts: 2,
                 initial_backoff_ms: 400,
@@ -15850,6 +15999,7 @@ mod uniqueness_concurrency_tests {
         let shutdown = tokio_util::sync::CancellationToken::new();
         start_local_runtime(
             vec![JobInfo {
+                version: 1,
                 name: "dropped_pending_retry".to_string(),
                 max_attempts: 2,
                 initial_backoff_ms: 1,
@@ -15940,6 +16090,7 @@ mod uniqueness_concurrency_tests {
         let shutdown = tokio_util::sync::CancellationToken::new();
         start_local_runtime(
             vec![JobInfo {
+                version: 1,
                 name: "limited_failing".to_string(),
                 max_attempts: 1,
                 initial_backoff_ms: 1,
@@ -16017,6 +16168,7 @@ mod uniqueness_concurrency_tests {
         start_local_runtime(
             vec![
                 JobInfo {
+                    version: 1,
                     name: "bulk".to_string(),
                     max_attempts: 1,
                     initial_backoff_ms: 1,
@@ -16026,6 +16178,7 @@ mod uniqueness_concurrency_tests {
                     handler: priority_low_handler,
                 },
                 JobInfo {
+                    version: 1,
                     name: "urgent".to_string(),
                     max_attempts: 1,
                     initial_backoff_ms: 1,

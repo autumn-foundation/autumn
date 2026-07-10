@@ -152,6 +152,7 @@ impl EventRegistry {
                 queue: "default".to_string(),
                 uniqueness: None,
                 concurrency: None,
+                version: 1,
                 handler: listener.handler,
             })
             .collect()

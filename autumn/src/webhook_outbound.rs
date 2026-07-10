@@ -777,6 +777,7 @@ impl crate::plugin::Plugin for OutboundWebhookPlugin {
             queue: "default".to_string(),
             uniqueness: None,
             concurrency: None,
+            version: 1,
             handler: deliver_webhook_job,
         }])
     }

@@ -86,6 +86,7 @@ async fn test_reddit_registration_triggers_outbound_webhook() {
 
     let mut jobs = reddit_clone::jobs::registered_jobs();
     jobs.push(JobInfo {
+        version: 1,
         name: "autumn_webhook_delivery".to_owned(),
         max_attempts: 1,
         initial_backoff_ms: 1,
