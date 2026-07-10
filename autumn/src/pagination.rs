@@ -449,7 +449,10 @@ fn page_link_header_value(page: u32, size: u32, total_pages: u32, has_next: bool
     if has_next {
         links.push(rel(page + 1, "next"));
     }
-    links.push(rel(total_pages, "last"));
+    // For an empty collection `total_pages` is 0; clamp to 1 so the `last`
+    // link stays a valid 1-indexed page rather than `page=0`.
+    let last_page = total_pages.max(1);
+    links.push(rel(last_page, "last"));
     links.join(", ")
 }
 
@@ -1912,6 +1915,21 @@ mod tests {
         assert!(link.contains("rel=\"next\""), "{link}");
         assert!(link.contains("rel=\"first\""), "{link}");
         assert!(link.contains("rel=\"last\""), "{link}");
+    }
+
+    #[test]
+    fn empty_page_last_link_clamps_to_one() {
+        // An empty collection has `total_pages == 0`. The `last` link must
+        // still target a valid 1-indexed page (`page=1`), never `page=0`.
+        let link = page_link_header_value(1, 20, 0, false);
+        assert!(
+            link.contains("<?page=1&size=20>; rel=\"last\""),
+            "last link must clamp to page 1 for an empty collection: {link}"
+        );
+        assert!(
+            !link.contains("page=0"),
+            "no link may reference the invalid page 0: {link}"
+        );
     }
 
     #[tokio::test]

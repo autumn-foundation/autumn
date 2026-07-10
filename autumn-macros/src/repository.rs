@@ -10317,7 +10317,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     "properties": {
                         "content": { "type": "array", "items": { "$ref": #model_component_ref } },
                         "size": { "type": "integer" },
-                        "next_cursor": { "type": ["string", "null"] },
+                        "next_cursor": { "type": "string", "nullable": true },
                         "has_next": { "type": "boolean" }
                     }
                 })
