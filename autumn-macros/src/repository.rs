@@ -1257,9 +1257,12 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         }
                         // `AS dep_present` (not `AS exists`): `exists` is a
                         // Postgres reserved word and would need quoting.
+                        // The live filter makes `restrict` soft-delete-aware: an
+                        // already-soft-deleted child must not block the parent
+                        // with a 409 (it is no longer a live orphan).
                         let __q = format!(
-                            "SELECT EXISTS(SELECT 1 FROM \"{}\" WHERE \"{}\" = $1) AS dep_present",
-                            __table, __fk_column
+                            "SELECT EXISTS(SELECT 1 FROM \"{}\" WHERE \"{}\" = $1{}) AS dep_present",
+                            __table, __fk_column, #destroy_live_filter
                         );
                         let __row: __AutumnDepExists =
                             ::autumn_web::reexports::diesel::sql_query(__q)
@@ -13943,6 +13946,39 @@ mod tests {
         assert!(
             generated.contains("SELECT EXISTS"),
             "restrict must probe for existing children"
+        );
+        // Non-soft-delete child: the EXISTS probe carries no live filter
+        // (a non-soft-delete repository references `deleted_at` nowhere).
+        assert!(
+            !generated.contains("deleted_at"),
+            "a non-soft-delete restrict probe must not filter on deleted_at"
+        );
+    }
+
+    #[test]
+    fn repository_macro_dependent_restrict_is_soft_delete_aware() {
+        // Finding 1: for a soft-delete child, the restrict EXISTS probe must
+        // carry the live filter so an already-soft-deleted child does not block
+        // the parent with a spurious 409.
+        let generated = repository_macro(
+            quote! { Comment, soft_delete, dependent(PgReplyRepository, fk = "comment_id", on_delete = restrict) },
+            quote! { pub trait CommentRepository {} },
+        )
+        .to_string();
+        let start = generated
+            .find("__autumn_apply_dependent_on_conn")
+            .expect("helper present");
+        let helper = &generated[start..];
+        // The live filter is appended to the EXISTS probe format string. Token
+        // stringification renders the string literals with spaced-out escaped
+        // quotes, so match on the stable inner fragment.
+        assert!(
+            helper.contains("SELECT EXISTS"),
+            "restrict must probe for existing children: {helper}"
+        );
+        assert!(
+            helper.contains("deleted_at") && helper.contains("IS NULL"),
+            "soft-delete restrict probe must exclude already-soft-deleted children (live filter): {helper}"
         );
     }
 
