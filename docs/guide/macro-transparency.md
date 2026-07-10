@@ -710,30 +710,46 @@ has nothing to conflict on and concurrent callers can both insert.
 
 #### Grouped aggregates
 
-A declared aggregate method returns a lazy `GroupedAggregate<'_, K, V>` builder
-rather than running immediately. Chain the builder, then `.load().await`.
+Declare an aggregate as a trait method **named `<agg>_grouped_by_<column>`**
+whose return type is `Vec<(K, V)>`. The `_grouped_by_` segment is what marks the
+method as an aggregate (a plain `sum_total_by_status` is *not* recognized), and
+the declared pair type is how the macro bakes the concrete key/value SQL types.
+The generated inherent method takes no arguments and returns a lazy
+`GroupedAggregate<'_, K, V>` builder rather than the `Vec` — chain the builder,
+then `.load().await` to run it and get the `Vec<(K, V)>`.
+
+Supported names: `count_grouped_by_<col>` (value type must be `i64`) and
+`sum_`/`avg_`/`min_`/`max_<num_col>_grouped_by_<col>` (`avg` → `Option<f64>`;
+`sum`/`min`/`max` → `Option<T>`, since the group can be empty or all-`NULL`).
+The key `K` must be the group column's **non-nullable** Rust type.
 
 ```rust
 #[repository(Order)]
 pub trait OrderRepository {
-    fn sum_total_by_status(&self) -> GroupedAggregate<String, i64>;
+    fn sum_total_grouped_by_status() -> Vec<(String, Option<i64>)>;
+    fn count_grouped_by_created_at() -> Vec<(DateTime<Utc>, i64)>;
 }
 
 let top = repo
-    .sum_total_by_status()
+    .sum_total_grouped_by_status() // -> GroupedAggregate<'_, String, Option<i64>>
     .order_by_aggregate_desc()
     .limit(5)
     .filter_range(lo, hi)
     .load()
-    .await?;
+    .await?; // -> Vec<(String, Option<i64>)>
 
 // Time series:
-let daily = repo.count_by_created_at().bucket(DateBucket::Day).load().await?;
+let daily = repo
+    .count_grouped_by_created_at()
+    .bucket(DateBucket::Day)
+    .load()
+    .await?;
 ```
 
-Builder methods: `.order_by_aggregate_desc()`, `.limit(n)`, `.filter_eq(v)`,
-`.filter_range(lo, hi)`, `.bucket(DateBucket::Day)`. Filter values are bound
-(never interpolated). A `timestamptz` (`DateTime<Utc>`) bucket uses
+Builder methods: `.order_by_aggregate_desc()` / `.order_by_aggregate_asc()`,
+`.limit(n)`, `.filter_eq(v)`, `.filter_range(lo, hi)`, and `.bucket(bucket)`
+(`DateBucket::Day` / `Week` / `Month`). Filter values are bound (never
+interpolated). A `timestamptz` (`DateTime<Utc>`) bucket uses
 `date_trunc(.., 'UTC')` for timezone-stable buckets.
 
 **Gotchas:** `sum`/`avg`/`min`/`max` can't be merged across shards, so
