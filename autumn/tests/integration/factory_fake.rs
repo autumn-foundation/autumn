@@ -9,8 +9,6 @@ mod fake_factory_tests {
     use autumn_web::fake;
 
     #[cfg(feature = "test-support")]
-    use diesel::prelude::*;
-    #[cfg(feature = "test-support")]
     use diesel_async::AsyncPgConnection;
     #[cfg(feature = "test-support")]
     use diesel_async::RunQueryDsl;
