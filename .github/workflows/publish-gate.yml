@@ -177,7 +177,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.94.1
       - uses: Swatinem/rust-cache@v2
       - name: Install cargo-semver-checks
-        uses: taiki-e/install-action@cargo-semver-checks
+        # Pin @v2 and pass the tool explicitly. The bare @cargo-semver-checks tag form can
+        # resolve with an empty tool input and install nothing (broke the Fuzz
+        # jobs with `error: no such command: fuzz`). Keep the explicit tool: input.
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-semver-checks
       - name: Check public API SemVer compatibility
         # GITHUB_EVENT_NAME is set by the runner automatically, but pass it
         # explicitly so the script can distinguish PR (informational) from
@@ -278,7 +283,12 @@ jobs:
         with:
           fetch-depth: 0
       - name: Install git-cliff
-        uses: taiki-e/install-action@git-cliff
+        # Pin @v2 and pass the tool explicitly. The bare @git-cliff tag form can
+        # resolve with an empty tool input and install nothing (broke the Fuzz
+        # jobs with `error: no such command: fuzz`). Keep the explicit tool: input.
+        uses: taiki-e/install-action@v2
+        with:
+          tool: git-cliff
       - name: Generate release notes artifact
         run: |
           # CHANGELOG.md must be updated before tagging so the packaged crates
