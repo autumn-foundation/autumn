@@ -270,7 +270,7 @@ fn backup(args: &BackupArgs) -> Result<(), BackupError> {
     // Everything below writes into `run_dir`. On ANY failure we remove the
     // whole run directory so a partial/empty artifact is never left behind and
     // never counted toward retention (AC #1).
-    let result = backup_into(&run_dir, &targets, args.format, &pg_dump, &profile);
+    let result = backup_into(&run_dir, &targets, args.format, &pg_dump, &tools, &profile);
     if let Err(e) = result {
         let _ = std::fs::remove_dir_all(&run_dir);
         return Err(e);
@@ -298,6 +298,7 @@ fn backup_into(
     targets: &[ResolvedTarget],
     format: BackupFormat,
     pg_dump: &Path,
+    tools: &PgTools,
     profile: &str,
 ) -> Result<(), BackupError> {
     let mut manifest_targets = Vec::with_capacity(targets.len());
@@ -311,7 +312,7 @@ fn backup_into(
 
         let db = parsed_db_name(&target.url);
         run_pg_dump(pg_dump, &target.url, &out_path, format, &db)?;
-        verify_artifact(&out_path, format, &db)?;
+        verify_artifact(&out_path, format, &db, tools)?;
         eprintln!("  \u{2713} {file_name} verified.");
 
         manifest_targets.push(ManifestTarget {
@@ -595,7 +596,12 @@ fn run_pg_dump(
 /// * Custom: the file must be non-empty AND `pg_restore --list` must succeed
 ///   with a non-empty archive table of contents.
 /// * Plain: the file must be non-empty AND end with `pg_dump`'s completion marker.
-fn verify_artifact(path: &Path, format: BackupFormat, db: &str) -> Result<(), BackupError> {
+fn verify_artifact(
+    path: &Path,
+    format: BackupFormat,
+    db: &str,
+    tools: &PgTools,
+) -> Result<(), BackupError> {
     let len = std::fs::metadata(path)
         .map_err(BackupError::io(format!("stat {}", path.display())))?
         .len();
@@ -606,7 +612,12 @@ fn verify_artifact(path: &Path, format: BackupFormat, db: &str) -> Result<(), Ba
     }
     match format {
         BackupFormat::Custom => {
-            let pg_restore = PgTools::locate().require("pg_restore")?;
+            // Resolve `pg_restore` through the SAME locator the dump/restore step
+            // used (built via `locate_with_extra` with the runtime-discovered
+            // managed data dir). Re-locating with a bare `PgTools::locate()` here
+            // would miss the daemon/cron path's bundled binary and wrongly report
+            // it missing (issue #1595).
+            let pg_restore = tools.require("pg_restore")?;
             verify_custom_archive(&pg_restore, path, db)
         }
         BackupFormat::Plain => verify_plain_dump(path, db),
@@ -701,7 +712,7 @@ fn restore(args: &RestoreArgs) -> Result<(), BackupError> {
         profile: profile.clone(),
     })?;
 
-    let plan = RestorePlan::discover(&args.artifact)?;
+    let plan = RestorePlan::discover(&args.artifact, args.shard.as_deref())?;
     let format = plan.format;
     let entries = plan.select(args.shard.as_deref())?;
 
@@ -714,7 +725,7 @@ fn restore(args: &RestoreArgs) -> Result<(), BackupError> {
     // start a destructive restore we can't finish.
     for (entry, _url) in &targets {
         let db = format!("(artifact) {}", entry.label);
-        verify_artifact(&plan.dir.join(&entry.file), format, &db)?;
+        verify_artifact(&plan.dir.join(&entry.file), format, &db, &tools)?;
         eprintln!("  \u{2713} {} integrity verified.", entry.file);
     }
 
@@ -818,7 +829,14 @@ struct RestorePlan {
 impl RestorePlan {
     /// Discover a restore plan from a user-supplied path. Accepts either a run
     /// directory (containing `manifest.json`) or a single artifact file.
-    fn discover(path: &Path) -> Result<Self, BackupError> {
+    ///
+    /// For a bare single-file artifact there is no manifest to say which target
+    /// it belongs to, so the target is resolved from an explicit `--shard`
+    /// (`shard`) or, failing that, inferred from the backup writer's filename
+    /// convention (see [`single_file_target_label`]). This prevents a
+    /// `shard-<name>.dump` from being silently restored into the control
+    /// database.
+    fn discover(path: &Path, shard: Option<&str>) -> Result<Self, BackupError> {
         if path.is_dir() {
             let manifest = read_manifest(path)?;
             let format = BackupFormat::parse(&manifest.format).map_err(|detail| {
@@ -833,8 +851,10 @@ impl RestorePlan {
             });
         }
         if path.is_file() {
-            // A bare artifact file: infer format from extension, treat it as a
-            // single control target.
+            // A bare artifact file: infer format from extension, and resolve the
+            // restore target from `--shard` or the filename convention (never
+            // blindly `control`, which would corrupt the control DB with shard
+            // data).
             let format = infer_format_from_path(path).ok_or_else(|| BackupError::BadArtifact {
                 detail: format!(
                     "{} is neither a run directory nor a .dump/.sql artifact",
@@ -848,11 +868,12 @@ impl RestorePlan {
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_default();
+            let label = single_file_target_label(&file, shard)?;
             return Ok(Self {
                 dir,
                 format,
                 entries: vec![ManifestTarget {
-                    label: "control".to_owned(),
+                    label,
                     file,
                     database: String::new(),
                 }],
@@ -1393,6 +1414,44 @@ fn sanitize_component(s: &str) -> String {
     }
 }
 
+/// Resolve the restore target label for a *bare single-file* artifact (one with
+/// no accompanying manifest to name its target).
+///
+/// This is the inverse of [`artifact_file_name`]'s naming convention:
+/// * an explicit `--shard <name>` always wins (the file IS the artifact the user
+///   pointed at, so no manifest entry is required);
+/// * otherwise a `shard-<name>.*` file resolves to that shard, and a `control.*`
+///   file to the control database;
+/// * a `shard-*` file whose shard name can't be recovered is an error rather
+///   than a silent restore into control;
+/// * any other (user-renamed) file falls back to control — the backup writer
+///   only ever emits `control.*` / `shard-*`, so this path carries no shard
+///   cross-target hazard while preserving the historical single-file behavior.
+fn single_file_target_label(file: &str, shard: Option<&str>) -> Result<String, BackupError> {
+    if let Some(name) = shard {
+        return Ok(format!("shard:{name}"));
+    }
+    let stem = Path::new(file)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(file);
+    if stem == "control" {
+        return Ok("control".to_owned());
+    }
+    if let Some(shard_name) = stem.strip_prefix("shard-") {
+        if shard_name.is_empty() {
+            return Err(BackupError::BadArtifact {
+                detail: format!(
+                    "{file:?} looks like a shard artifact but its shard name is missing.\n  \
+                     Pass --shard <name>, or restore the run directory (with its manifest.json)."
+                ),
+            });
+        }
+        return Ok(format!("shard:{shard_name}"));
+    }
+    Ok("control".to_owned())
+}
+
 /// Infer a backup format from a file extension.
 fn infer_format_from_path(path: &Path) -> Option<BackupFormat> {
     match path.extension().and_then(|e| e.to_str()) {
@@ -1721,6 +1780,45 @@ mod tests {
         assert_eq!(resolve_tool_in(&dirs, "pg_restore"), pg_restore);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn verify_artifact_resolves_pg_restore_from_managed_tools() {
+        use std::os::unix::fs::PermissionsExt;
+        // Regression for the verify path re-locating with a bare `PgTools::locate()`
+        // instead of the threaded, managed-data-dir-aware tools (issue #1595). In
+        // the daemon/cron layout the bundled `pg_restore` sits in
+        // `<data_dir parent>/postgresql/bin` and is NOT on PATH, so it's reachable
+        // only through the managed-data-dir-derived candidate dirs. If verify still
+        // called `PgTools::locate()`, this archive would be reported as
+        // `pg_restore` missing.
+        let tmp = tempfile::tempdir().unwrap();
+        let bundle_bin = tmp.path().join("postgresql").join("bin");
+        std::fs::create_dir_all(&bundle_bin).unwrap();
+        // A fake `pg_restore` that prints a one-entry TOC for `--list`; a real or
+        // absent binary would reject this synthetic archive (or be missing), so a
+        // successful verify proves the bundled binary is the one that ran.
+        let pg_restore = bundle_bin.join("pg_restore");
+        std::fs::write(
+            &pg_restore,
+            "#!/bin/sh\necho ';'\necho '215; 1259 16385 TABLE public posts app'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&pg_restore, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let data_dir = tmp.path().join("pgdata");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        // Build the locator from the managed data dir exactly as `locate_with_extra`
+        // does (via `candidate_bin_dirs`), but without touching process env so the
+        // test is hermetic.
+        let tools = PgTools::with_dirs(candidate_bin_dirs(None, Some(data_dir)));
+
+        let archive = tmp.path().join("control.dump");
+        std::fs::write(&archive, b"PGDMP synthetic archive").unwrap();
+
+        verify_artifact(&archive, BackupFormat::Custom, "app", &tools)
+            .expect("verify resolves the bundled pg_restore and accepts the TOC");
+    }
+
     #[test]
     fn toc_entry_count_ignores_comment_lines() {
         let listing = "\
@@ -2000,6 +2098,81 @@ mod tests {
     }
 
     #[test]
+    fn single_file_target_label_infers_from_filename_convention() {
+        // control.* -> control.
+        assert_eq!(
+            single_file_target_label("control.dump", None).unwrap(),
+            "control"
+        );
+        assert_eq!(
+            single_file_target_label("control.sql", None).unwrap(),
+            "control"
+        );
+        // shard-<name>.* -> that shard (inference is authoritative: a bare shard
+        // dump is NEVER silently treated as control).
+        assert_eq!(
+            single_file_target_label("shard-east.dump", None).unwrap(),
+            "shard:east"
+        );
+        // An explicit --shard wins over the filename.
+        assert_eq!(
+            single_file_target_label("control.dump", Some("west")).unwrap(),
+            "shard:west"
+        );
+        // A shard-shaped name with no recoverable shard name errors rather than
+        // silently defaulting to control.
+        assert!(matches!(
+            single_file_target_label("shard-.dump", None),
+            Err(BackupError::BadArtifact { .. })
+        ));
+        // A user-renamed file (not produced by the backup writer) falls back to
+        // control, preserving the historical single-file behavior without a shard
+        // cross-target hazard.
+        assert_eq!(
+            single_file_target_label("mybackup.dump", None).unwrap(),
+            "control"
+        );
+    }
+
+    #[test]
+    fn discover_bare_shard_file_resolves_to_shard_not_control() {
+        // Regression: restoring `shard-east.dump` via the single-file path used to
+        // label it `control` unconditionally, silently restoring shard data into
+        // the control database.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("shard-east.dump");
+        std::fs::write(&path, b"x").unwrap();
+
+        let plan = RestorePlan::discover(&path, None).unwrap();
+        assert_eq!(plan.entries.len(), 1);
+        assert_eq!(plan.entries[0].label, "shard:east");
+        // The inferred label still selects cleanly with a matching --shard.
+        assert_eq!(plan.select(Some("east")).unwrap()[0].label, "shard:east");
+    }
+
+    #[test]
+    fn discover_bare_control_file_resolves_to_control() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("control.dump");
+        std::fs::write(&path, b"x").unwrap();
+
+        let plan = RestorePlan::discover(&path, None).unwrap();
+        assert_eq!(plan.entries[0].label, "control");
+    }
+
+    #[test]
+    fn discover_bare_file_honors_explicit_shard_flag() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Even a control-named bare file is redirected when the operator explicitly
+        // names a shard target.
+        let path = tmp.path().join("control.dump");
+        std::fs::write(&path, b"x").unwrap();
+
+        let plan = RestorePlan::discover(&path, Some("east")).unwrap();
+        assert_eq!(plan.entries[0].label, "shard:east");
+    }
+
+    #[test]
     fn manifest_round_trips_through_disk() {
         let tmp = tempfile::tempdir().unwrap();
         let manifest = Manifest {
@@ -2080,8 +2253,15 @@ mod tests {
             label: "control".to_owned(),
             url: url.clone(),
         }];
-        backup_into(&run_dir, &targets, BackupFormat::Custom, &pg_dump, "dev")
-            .expect("backup succeeds and verifies");
+        backup_into(
+            &run_dir,
+            &targets,
+            BackupFormat::Custom,
+            &pg_dump,
+            &tools,
+            "dev",
+        )
+        .expect("backup succeeds and verifies");
 
         // Simulate data loss.
         conn.batch_execute("DELETE FROM backup_rt;")
