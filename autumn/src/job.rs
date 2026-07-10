@@ -8888,6 +8888,7 @@ mod tests {
     fn redis_retry_promotion_interval_uses_smallest_configured_backoff() {
         let jobs = vec![
             JobInfo {
+                version: 1,
                 name: "slow".to_string(),
                 max_attempts: 3,
                 initial_backoff_ms: 250,
@@ -8897,6 +8898,7 @@ mod tests {
                 handler: redis_counting_success_handler,
             },
             JobInfo {
+                version: 1,
                 name: "fast".to_string(),
                 max_attempts: 3,
                 initial_backoff_ms: 25,
@@ -8912,6 +8914,7 @@ mod tests {
 
         // Large retry backoffs must not delay one-shot delayed-job promotion.
         let slow_jobs = vec![JobInfo {
+            version: 1,
             name: "very_slow".to_string(),
             max_attempts: 3,
             initial_backoff_ms: 60_000,
@@ -9126,6 +9129,7 @@ mod tests {
         Arc::new(RwLock::new(HashMap::from([(
             "send_email".to_string(),
             JobInfo {
+                version: 1,
                 name: "send_email".to_string(),
                 max_attempts,
                 initial_backoff_ms: 1,
@@ -10908,6 +10912,7 @@ mod tests {
 
         let error = start_runtime(
             vec![JobInfo {
+                version: 1,
                 name: "known".to_string(),
                 max_attempts: 1,
                 initial_backoff_ms: 1,
@@ -13973,6 +13978,7 @@ mod tests {
             jobs.insert(
                 "noop".to_string(),
                 JobInfo {
+                    version: 1,
                     name: "noop".to_string(),
                     max_attempts: 1,
                     initial_backoff_ms: 0,
