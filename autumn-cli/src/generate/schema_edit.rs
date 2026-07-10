@@ -1324,6 +1324,52 @@ fn insert_before_run_call(existing: &str, line_to_insert: &str) -> String {
     out
 }
 
+// ── Remember-me middleware wiring (issue #1397) ──────────────────────────────
+
+/// The Tower layer that consumes a remember cookie and rotates it into a
+/// session, auto-wired into the `AppBuilder` chain by `autumn generate auth`.
+const REMEMBER_LAYER_CALL: &str = ".layer(axum::middleware::from_fn(routes::auth::remember_me))";
+/// The startup hook that hands the remember middleware the pool + resolved
+/// `[auth.remember]` config.
+const REMEMBER_STARTUP_CALL: &str = ".on_startup(routes::auth::remember_me_startup)";
+
+/// Inject the remember-me middleware layer and its startup hook into the
+/// `AppBuilder` chain in `src/main.rs`, immediately before `.run()`.
+///
+/// Idempotent: a no-op when the layer is already present, and (like the jobs /
+/// mail-preview injectors) a no-op when no standalone `.run()` line can be found
+/// — a single-line builder chain is left untouched.
+#[must_use]
+pub fn add_remember_middleware_to_app(existing: &str) -> String {
+    if existing.contains(REMEMBER_LAYER_CALL) {
+        return existing.to_owned();
+    }
+    let with_startup = insert_before_run_call(existing, REMEMBER_STARTUP_CALL);
+    insert_before_run_call(&with_startup, REMEMBER_LAYER_CALL)
+}
+
+/// Inverse of [`add_remember_middleware_to_app`] (`autumn destroy`, issue #1048).
+///
+/// Removes the two injected builder-call lines (whatever indentation they
+/// carry), restoring `src/main.rs` exactly. A no-op when neither line is
+/// present.
+#[must_use]
+pub fn remove_remember_middleware_from_app(existing: &str) -> String {
+    let is_injected = |l: &str| {
+        let t = l.trim();
+        t == REMEMBER_LAYER_CALL || t == REMEMBER_STARTUP_CALL
+    };
+    if !existing.lines().any(is_injected) {
+        return existing.to_owned();
+    }
+    let kept: Vec<&str> = existing.lines().filter(|l| !is_injected(l)).collect();
+    let mut out = kept.join("\n");
+    if existing.ends_with('\n') && !out.is_empty() {
+        out.push('\n');
+    }
+    out
+}
+
 /// Insert `.mail_previews(mail_previews![mailer_type])` before `.run()`.
 fn insert_mail_previews_call(existing: &str, mailer_type: &str) -> String {
     insert_before_run_call(

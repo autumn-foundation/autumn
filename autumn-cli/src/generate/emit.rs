@@ -142,6 +142,10 @@ pub enum Revert {
     /// Remove the `[auth.webauthn]` stub block `autumn generate auth
     /// --passkeys` appended to `path` (`autumn.toml`).
     AuthWebauthnStub { path: PathBuf },
+    /// Remove the remember-me middleware layer + startup-hook calls
+    /// `autumn generate auth` injected into the `AppBuilder` chain in `path`
+    /// (`src/main.rs`) (issue #1397).
+    RememberMiddleware { path: PathBuf },
 }
 
 impl Revert {
@@ -162,7 +166,8 @@ impl Revert {
             | Self::SystemTestCargoPatch { path, .. }
             | Self::PwaMainRsInjection { path }
             | Self::AuthOAuthProviderStubs { path, .. }
-            | Self::AuthWebauthnStub { path } => path,
+            | Self::AuthWebauthnStub { path }
+            | Self::RememberMiddleware { path } => path,
         }
     }
 
@@ -188,7 +193,8 @@ impl Revert {
             | Self::SystemTestCargoPatch { .. }
             | Self::PwaMainRsInjection { .. }
             | Self::AuthOAuthProviderStubs { .. }
-            | Self::AuthWebauthnStub { .. } => None,
+            | Self::AuthWebauthnStub { .. }
+            | Self::RememberMiddleware { .. } => None,
         }
     }
 
@@ -215,7 +221,8 @@ impl Revert {
         use super::schema_edit::{
             remove_autumn_web_dev_dependency_feature, remove_autumn_web_feature, remove_job_entry,
             remove_jobs_registration_from_app, remove_mail_preview_from_app,
-            remove_mod_declaration, remove_routes_entries, remove_schema_table,
+            remove_mod_declaration, remove_remember_middleware_from_app, remove_routes_entries,
+            remove_schema_table,
         };
         match self {
             Self::ModDecl { name, .. } => remove_mod_declaration(content, name),
@@ -296,6 +303,7 @@ impl Revert {
                 )
             }
             Self::PwaMainRsInjection { .. } => super::pwa::remove_pwa_injection(content),
+            Self::RememberMiddleware { .. } => remove_remember_middleware_from_app(content),
             Self::AuthOAuthProviderStubs { providers, .. } => {
                 super::auth::remove_oauth_provider_stubs(content, providers)
             }

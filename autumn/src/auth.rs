@@ -73,6 +73,21 @@ use serde::Deserialize;
 #[cfg(feature = "oauth2")]
 use url::Url;
 
+pub mod password;
+pub use password::{
+    BreachCheck, PasswordConfig, PasswordFailure, PasswordPolicy, PasswordValidation,
+    validate_password,
+};
+
+pub mod remember;
+pub use remember::{
+    DEFAULT_ROTATION_GRACE_SECS, RememberConfig, RememberCredential, RememberDecision,
+    RememberRecord, build_remember_clear_cookie, build_remember_cookie, constant_time_eq,
+    default_rotation_grace, evaluate_remember, format_remember_cookie_value,
+    generate_remember_credential, generate_token, hash_remember_token, parse_remember_cookie_value,
+    verify_remember_token,
+};
+
 // ── Password hashing ────────────────────────────────────────────
 
 /// Default bcrypt cost factor.
@@ -549,6 +564,37 @@ pub struct AuthConfig {
     /// ```
     #[serde(default)]
     pub sessions: SessionTrackingConfig,
+
+    /// Password policy: length, weak-password rejection, context-similarity,
+    /// and optional Have I Been Pwned (HIBP) breach checking.
+    ///
+    /// Configure in `autumn.toml`:
+    ///
+    /// ```toml
+    /// [auth.password]
+    /// min_length = 8
+    /// reject_common = true
+    /// breach_check = "off"  # "off" | "fail_open" | "fail_closed"
+    /// ```
+    #[serde(default)]
+    pub password: PasswordConfig,
+
+    /// Persistent "remember-me" login policy (issue #1397).
+    ///
+    /// Controls the rotating, revocable remember-me tokens issued alongside a
+    /// session on login. Each credential is a `(series, token)` pair with the
+    /// token rotated on every use for theft detection.
+    ///
+    /// Configure in `autumn.toml`:
+    ///
+    /// ```toml
+    /// [auth.remember]
+    /// enabled = true             # issue remember cookies on login (default)
+    /// duration_secs = 2592000    # cookie lifetime in seconds (30 days)
+    /// cookie_name = "autumn.remember"
+    /// ```
+    #[serde(default)]
+    pub remember: RememberConfig,
 }
 
 /// Account lockout policy configuration.
@@ -1575,6 +1621,8 @@ impl Default for AuthConfig {
             lockout: LockoutConfig::default(),
             step_up: StepUpConfig::default(),
             sessions: SessionTrackingConfig::default(),
+            password: PasswordConfig::default(),
+            remember: RememberConfig::default(),
         }
     }
 }

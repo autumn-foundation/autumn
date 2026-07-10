@@ -22,7 +22,10 @@ maud = ["dep:maud"]
 htmx = []
 multipart = ["axum/multipart", "dep:infer"]
 tailwind = []
-http-client = ["dep:reqwest"]
+# `dep:sha1` is pulled in here because the password-policy breach check
+# (auth::password) needs SHA-1 for HIBP k-anonymity, and that path only exists
+# when an HTTP client is available.
+http-client = ["dep:reqwest", "dep:sha1"]
 oauth2 = ["http-client"]
 webauthn = ["dep:webauthn-rs"]
 openapi = ["dep:serde_yaml"]
