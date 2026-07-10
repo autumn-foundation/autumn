@@ -90,6 +90,16 @@ pub enum ClientError {
     /// while composing a custom (redirect / pin / SSRF-safe) request.
     #[error("invalid or unresolvable URL: {0}")]
     InvalidUrl(String),
+    /// [`pin_to`](RequestBuilder::pin_to) was combined with
+    /// [`follow_redirects`](RequestBuilder::follow_redirects) — an incompatible
+    /// pair. A single pinned `SocketAddr` only covers the first hop; later
+    /// redirect hops re-resolve via normal DNS, so following a cross-host `3xx`
+    /// would silently escape the pin and defeat its purpose. Use
+    /// [`Client::get_ssrf_safe`] for pinned, per-hop-revalidated redirect
+    /// following; `pin_to` alone (returns the `3xx` unfollowed); or
+    /// `follow_redirects` without `pin_to`.
+    #[error("{0}")]
+    IncompatiblePinRedirect(&'static str),
 }
 
 // ── Response ─────────────────────────────────────────────────────────────────
@@ -1198,11 +1208,20 @@ impl RequestBuilder {
     /// different (private) address between validation and connection.
     ///
     /// **Pinning applies to the initial connection only.** Redirects are **not**
-    /// followed: a `3xx` is returned to the caller verbatim (as if
+    /// followed under `pin_to`: a `3xx` is returned to the caller verbatim (as if
     /// [`no_redirect`](Self::no_redirect) were set) rather than being
     /// auto-followed to a possibly-different host that would be re-resolved via
     /// normal DNS, silently escaping the pin. If you need pinned, rebind-safe
     /// per-hop following, use [`Client::get_ssrf_safe`] instead.
+    ///
+    /// **Cannot be combined with [`follow_redirects`](Self::follow_redirects).**
+    /// Because the pin only covers the first hop while later hops would re-resolve
+    /// via DNS, chaining `pin_to` with `follow_redirects` (in either order) is
+    /// rejected at send time with [`ClientError::IncompatiblePinRedirect`] rather
+    /// than silently following a redirect off the pinned address. Use
+    /// [`Client::get_ssrf_safe`] for pinned, per-hop-revalidated redirect
+    /// following, `pin_to` alone (which returns the `3xx` unfollowed), or
+    /// `follow_redirects` without `pin_to`.
     ///
     /// Implemented via a one-shot `reqwest::ClientBuilder::resolve(host, addr)`
     /// scoped to this request. Note that reqwest ignores the **port** in the
@@ -1438,6 +1457,22 @@ impl RequestBuilder {
 
     /// Dispatch to the appropriate custom send path. Consumes `self`.
     async fn send_custom(self) -> Result<Response, ClientError> {
+        // Reject the incompatible `pin_to` + `follow_redirects` combination up
+        // front — deterministically, before issuing any request. A single pinned
+        // `SocketAddr` only applies to hop 0 of `follow_loop`; later hops resolve
+        // via normal DNS, so following a cross-host `3xx` would silently escape
+        // the pin and defeat its purpose. `get_ssrf_safe` never sets `pin_addr`,
+        // so its per-hop resolve→validate→pin path is unaffected by this guard.
+        if self.pin_addr.is_some() && matches!(self.redirect_mode, RedirectMode::Follow { .. }) {
+            return Err(ClientError::IncompatiblePinRedirect(
+                "pin_to cannot be combined with follow_redirects: the pin only \
+                 covers the first hop and later redirect hops re-resolve via DNS, \
+                 escaping the pin. Use get_ssrf_safe for pinned, per-hop-revalidated \
+                 redirect following; pin_to alone (which returns the 3xx unfollowed); \
+                 or follow_redirects without pin_to.",
+            ));
+        }
+
         let timeout = self
             .retry_policy
             .request_timeout
@@ -3681,6 +3716,70 @@ mod tests {
             follow3.ssrf_redirect_plan(),
             (true, 3),
             "follow_redirects(3, ..) must cap the safe path at 3 hops"
+        );
+    }
+
+    // TEST 64: pin_to + follow_redirects is rejected at send time with
+    // IncompatiblePinRedirect — deterministically, without touching the network.
+    // A single pinned SocketAddr only covers hop 0; later redirect hops re-resolve
+    // via normal DNS, so following would silently escape the pin.
+    #[tokio::test]
+    async fn pin_then_follow_redirects_is_rejected() {
+        let result = Client::new()
+            .get("http://example.com/")
+            .pin_to(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080))
+            .follow_redirects(2, |_| true)
+            .send()
+            .await;
+
+        assert!(
+            matches!(result, Err(ClientError::IncompatiblePinRedirect(_))),
+            "expected IncompatiblePinRedirect, got {result:?}"
+        );
+    }
+
+    // TEST 65: the rejection is order-independent — chaining follow_redirects
+    // before pin_to produces the same IncompatiblePinRedirect error.
+    #[tokio::test]
+    async fn follow_redirects_then_pin_is_rejected() {
+        let result = Client::new()
+            .get("http://example.com/")
+            .follow_redirects(2, |_| true)
+            .pin_to(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080))
+            .send()
+            .await;
+
+        assert!(
+            matches!(result, Err(ClientError::IncompatiblePinRedirect(_))),
+            "expected IncompatiblePinRedirect, got {result:?}"
+        );
+    }
+
+    // TEST 66: pin_to combined with no_redirect is NOT affected by the guard —
+    // the request proceeds and returns the 3xx verbatim (RedirectMode::None).
+    #[tokio::test]
+    async fn pin_with_no_redirect_is_allowed() {
+        use axum::{Router, routing::get};
+
+        let addr = spawn(Router::new().route(
+            "/start",
+            get(|| async { redirect_302("http://127.0.0.1:1/onward".to_owned()) }),
+        ))
+        .await;
+        let port = addr.port();
+
+        let resp = Client::new()
+            .get(format!("http://127.0.0.1:{port}/start"))
+            .pin_to(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port))
+            .no_redirect()
+            .send()
+            .await
+            .expect("pin_to + no_redirect must return the 3xx unfollowed, not error");
+
+        assert_eq!(
+            resp.status().as_u16(),
+            302,
+            "pin_to + no_redirect returns the redirect verbatim"
         );
     }
 }
