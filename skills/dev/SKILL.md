@@ -82,6 +82,12 @@ If the `mail` feature is enabled:
 recompiles + restarts automatically. Tailwind CSS is rebuilt on template
 changes.
 
+On trunk-dev (unreleased — not in the published 0.5.0 CLI), when a rebuild
+**fails** the browser renders the compiler diagnostics as a full-screen overlay
+(under a strict nonce-based CSP) instead of leaving a blank or stale page; it
+clears on the next successful rebuild (issue #1115). See
+`docs/guide/dev-error-overlay.md`.
+
 ## Common failures
 
 | Symptom | Fix |
