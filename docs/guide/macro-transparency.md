@@ -3,8 +3,32 @@
 Autumn relies on procedural macros to eliminate boilerplate. This guide shows
 you exactly what those macros generate so there are no surprises at runtime.
 
-Examples in this guide track the published Autumn 0.5.x line and Rust 1.88.0+
-as of 2026-06-04.
+Examples in this guide track the Autumn 0.6.x line and Rust 1.88.0+ as of
+2026-07-10.
+
+The code snippets are **illustrative**, not compiled doctests: the "what it
+expands to" blocks are hand-written conceptual expansions (the real output has
+more fully-qualified paths and hidden spans). To see the byte-for-byte truth,
+run `cargo expand` (see below). The macros themselves are covered by unit tests
+in `autumn-macros/src/*.rs` and by trybuild/integration tests.
+
+---
+
+## Contents
+
+- [Startup Log: What Did Autumn Configure?](#startup-log-what-did-autumn-configure)
+- [Using `cargo expand` to See Generated Code](#using-cargo-expand-to-see-generated-code)
+- **Macro-by-Macro Expansion Reference**
+  - [Routing & Handlers](#routing--handlers) — `#[get]`/`#[post]`/`#[put]`/`#[delete]`/`#[patch]`, `#[oauth2_callback]`, `routes![]`, `#[static_get]` + `static_routes![]`, `#[ws]`, `#[api_doc]`, `#[autumn_web::main]`
+  - [Models](#models) — `#[model]` and its field-level attributes
+  - [Repositories](#repositories) — `#[repository(Model)]` and its advanced surface
+  - [Services](#services) — `#[service]`
+  - [Background Work: Scheduled Tasks, Jobs, Events, Listeners, One-off Tasks](#background-work-scheduled-tasks-jobs-events-listeners-one-off-tasks) — `#[scheduled]` + `tasks![]`, `#[job]` + `jobs![]`, `#[event]`, `#[listener]` + `listeners![]`, `#[task]` + `one_off_tasks![]`, `#[cached]`
+  - [Guards & Rate Limiting](#guards--rate-limiting) — `#[secured]`, `#[authorize]`, `#[step_up]`, `#[feature_flag]`, `#[throttle]`
+  - [Mail](#mail) — `#[mailer]`, `#[mailer_preview]` + `mail_previews![]`, `#[inbound_mail]`
+  - [i18n, Stories & Path Helpers](#i18n-stories--path-helpers) — `t!`, `story!`, `paths![]`
+- [The Companion Function Pattern](#the-companion-function-pattern)
+- [Debugging Macro Issues](#debugging-macro-issues)
 
 ---
 
@@ -14,7 +38,7 @@ When your application starts, Autumn logs every decision it makes. A typical
 startup sequence looks like this:
 
 ```
-  INFO autumn: Autumn starting version="0.5.0" profile="dev"
+  INFO autumn: Autumn starting version="0.6.0" profile="dev"
   INFO autumn: Database pool configured max_connections=10
   INFO autumn: Registered task name="db_cleanup" schedule="every 5m"
   INFO autumn: Listening addr=127.0.0.1:3000
@@ -23,7 +47,7 @@ startup sequence looks like this:
 If you omit the database:
 
 ```
-  INFO autumn: Autumn starting version="0.5.0" profile="dev"
+  INFO autumn: Autumn starting version="0.6.0" profile="dev"
   INFO autumn: Database not configured
   INFO autumn: Listening addr=127.0.0.1:3000
 ```
@@ -50,7 +74,7 @@ AUTUMN_SHOW_CONFIG=1 cargo run
 This produces output like:
 
 ```
-  INFO autumn: Autumn starting version="0.5.0" profile="dev"
+  INFO autumn: Autumn starting version="0.6.0" profile="dev"
   INFO autumn: Registered routes:
     /            GET      -> index
     /todos       GET      -> list_todos
@@ -130,10 +154,19 @@ cargo expand routes::todos
 
 ## Macro-by-Macro Expansion Reference
 
-### `#[get("/path")]`, `#[post(...)]`, `#[put(...)]`, `#[delete(...)]`
+The macros below are grouped by concern. Every subsection follows the same
+shape: the macro syntax, *what you write*, *what it expands to (conceptually)*,
+its options, and gotchas.
+
+---
+
+## Routing & Handlers
+
+### `#[get("/path")]`, `#[post(...)]`, `#[put(...)]`, `#[delete(...)]`, `#[patch(...)]`
 
 Your handler function is kept unchanged. The macro adds a hidden companion
-function that returns route metadata.
+function that returns route metadata. All five share one implementation
+(`route::route_macro`), differing only in the HTTP method.
 
 **You write:**
 
@@ -153,15 +186,27 @@ pub fn __autumn_route_info_hello() -> ::autumn_web::route::Route {
         path: "/hello",
         handler: ::axum::routing::get(hello),
         name: "hello",
+        // ...plus OpenAPI `api_doc` metadata inferred from the signature
     }
 }
 ```
+
+`#[patch("/items/{id}")]` is identical, emitting `::http::Method::PATCH` and
+`::axum::routing::patch(...)`.
 
 If you add `#[intercept(MyLayer)]`, the handler is wrapped with `.layer()`:
 
 ```rust
 handler: ::axum::routing::get(hello).layer(MyLayer),
 ```
+
+### `#[oauth2_callback("/path")]`
+
+A convenience alias for `#[get(...)]`, intended for OAuth2/OIDC callback
+endpoints like `/auth/github/callback`. It calls the exact same
+`route::route_macro("GET", ...)`, so the expansion and companion
+(`__autumn_route_info_{name}`) are identical to `#[get]` — the different name
+is purely to signal intent at the call site.
 
 ### `routes![handler_a, handler_b]`
 
@@ -185,6 +230,132 @@ let all = vec![
 
 Module-qualified paths work: `routes![users::list, posts::create]` calls
 `users::__autumn_route_info_list()` and `posts::__autumn_route_info_create()`.
+
+`#[ws]` and `#[static_get]` handlers also produce a `__autumn_route_info_*`
+companion, so they can be listed in `routes![]` alongside plain route handlers.
+
+### `#[static_get("/path")]` + `static_routes![]`
+
+Generates both a route companion (same as `#[get]`) and a static metadata
+companion for build-time rendering.
+
+**You write:**
+
+```rust
+#[static_get("/about")]
+async fn about() -> Markup {
+    html! { h1 { "About" } }
+}
+```
+
+**Generates two companions:**
+
+```rust
+// Route (same as #[get])
+pub fn __autumn_route_info_about() -> Route { ... }
+
+// Static build metadata
+pub fn __autumn_static_meta_about() -> StaticRouteMeta {
+    StaticRouteMeta {
+        path: "/about",
+        name: "about",
+        revalidate: None,
+        params_fn: None,
+    }
+}
+```
+
+Collect the static metadata with `static_routes![about, ...]`, which calls the
+`__autumn_static_meta_*` companions (same collector pattern as `routes![]`).
+
+### `#[ws("/path")]`
+
+A WebSocket upgrade route built on a **two-function** pattern: your outer
+function runs at upgrade time (with normal extractors) and returns a value
+implementing `WsHandler` that owns the live socket.
+
+**You write:**
+
+```rust
+#[ws("/echo")]
+async fn echo(state: AppState) -> impl WsHandler {
+    |mut socket: WebSocket| async move {
+        while let Some(Ok(msg)) = socket.recv().await {
+            let _ = socket.send(msg).await;
+        }
+    }
+}
+```
+
+**Generates (alongside your function):**
+
+```rust
+// 1. Upgrade handler: extracts the upgrade + State<AppState> (+ any of your
+//    non-AppState params as extractors), calls your fn, then upgrades.
+#[doc(hidden)]
+async fn __autumn_ws_upgrade_echo(
+    __autumn_ws: ::autumn_web::ws::WebSocketUpgrade,
+    State(__autumn_state): State<::autumn_web::AppState>,
+) -> impl IntoResponse {
+    let __autumn_shutdown = __autumn_state.shutdown_token();
+    let handler = echo(__autumn_state.clone()).await;
+    __autumn_ws.on_upgrade(move |socket| async move {
+        ::autumn_web::ws::WsHandler::handle(handler, socket, __autumn_shutdown).await;
+    })
+}
+
+// 2. Route companion (registered as a GET upgrade) so routes![] just works.
+#[doc(hidden)]
+fn __autumn_route_info_echo() -> ::autumn_web::Route { /* method GET, hidden from OpenAPI */ }
+```
+
+- `AppState` parameters are supplied directly from the extracted app state;
+  every other parameter becomes an Axum extractor on the upgrade handler.
+- **Gotcha:** WebSocket routes are hidden from the generated OpenAPI spec by
+  default (there is no meaningful JSON body). Register schemas manually via
+  `OpenApiConfig::register_schema` if you need to document them.
+- **Gotcha:** `#[ws]` does *not* accept the per-route `timeout_ms` / `timeout =
+  "off"` attributes that `#[get]` etc. support. The inbound timeout only bounds
+  the pre-upgrade handshake (`RouteTimeout::Inherit`); the established socket
+  future runs on a separate task and is never polled under the deadline. Bound a
+  slow handshake with `tokio::time::timeout` inside the upgrade handler instead.
+
+### `#[api_doc(...)]`
+
+Enriches a route's auto-generated OpenAPI documentation with fields that can't
+be inferred from the signature. It does **not** stand alone: it folds its
+metadata into the *paired* route macro's `ApiDoc`. Applied without a route
+macro, it is a no-op.
+
+**You write:**
+
+```rust
+#[get("/users/{id}")]
+#[api_doc(summary = "Fetch a user by id", tag = "users")]
+async fn get_user(Path(id): Path<i32>) -> Json<User> {
+    // ...
+}
+```
+
+**Effect:** the `#[get]` companion's `ApiDoc { summary, tags, ... }` is
+populated from the `#[api_doc]` keys instead of the defaults. The attribute is
+consumed; nothing is left on the function.
+
+| Key | Type | Effect |
+|-----|------|--------|
+| `summary` | string | Short one-line description |
+| `description` | string | Longer multi-line description |
+| `tag` | string | Single OpenAPI tag for grouping |
+| `tags` | `[string, ...]` | Multiple OpenAPI tags |
+| `operation_id` | string | Override the default operation id |
+| `status` | integer | Success HTTP status code (defaults to `200`) |
+| `hidden` | flag / bool | Exclude the route from the generated spec |
+| `mcp` | flag / bool | Expose this endpoint as an MCP tool (`mcp = false` force-excludes it). Requires the `mcp` feature and a `mount_mcp` call. |
+
+- **Ordering is flexible:** `#[api_doc]` works whether it sits *above* or
+  *below* the route macro. Rust expands attribute macros outermost-first, so
+  when `#[api_doc]` runs first it detects the pending route attribute and hands
+  the metadata through rather than stripping itself.
 
 ### `#[autumn_web::main]`
 
@@ -217,6 +388,10 @@ fn main() {
         });
 }
 ```
+
+---
+
+## Models
 
 ### `#[model]`
 
@@ -276,6 +451,129 @@ pub trait PostDraftExt {
     fn title(&mut self) -> DraftField<'_, String>;
 }
 ```
+
+### `#[model]` field-level attributes
+
+Beyond `#[id]`, `#[default]`, `#[validate(...)]`, `#[indexed]`, and
+`#[lock_version]`, `#[model]` recognizes a set of framework field attributes.
+These are stripped from the emitted Diesel query struct (they'd confuse the
+derives) and instead drive extra generated code. The full recognized set is
+`id`, `indexed`, `validate`, `default`, `factory_assoc`, `lock_version`,
+`searchable`, `encrypted`, `private`, `normalize`, and `state_machine`, plus
+the association attributes `belongs_to` / `has_many` / `has_one`.
+
+#### `#[private]`
+
+Excludes the field from the model's `Serialize` impl (JSON responses) while
+keeping it a normal, queryable Rust field mapped to its column. Its `Debug` is
+redacted. The write path (`New*` / `Update*` / changeset) is unaffected, so a
+client can still *set* the value while never *reading* it back.
+
+```rust
+#[model(table = "users")]
+pub struct User {
+    #[id] pub id: i64,
+    pub email: String,
+    #[private] pub password_hash: String, // still SELECTed & filterable, never serialized
+}
+```
+
+**Gotcha:** `#[private]` only controls JSON serialization and `Debug`. The
+column is still selected and can be used in `find_by_*` queries — it is not a
+column-level access control.
+
+#### `#[encrypted]` / `#[encrypted(deterministic | randomized, admin_visible, versioned_ciphertext)]`
+
+Marks a `String` column as encrypted at rest (application-level AEAD).
+
+- **`#[encrypted]`** (bare) — **randomized** AEAD (the default). Ciphertext is
+  non-deterministic, so equality lookups on the column are impossible.
+- **`#[encrypted(deterministic)]`** — stable ciphertext for the same plaintext,
+  which *enables* equality filters (`find_by_*`) at the cost of leaking equality
+  (identical plaintexts share ciphertext).
+- **`admin_visible`** — decrypt the value in admin views and opt it back into
+  JSON serialization (encrypted fields are hidden from JSON by default).
+- **`versioned_ciphertext`** — store encrypted before/after ciphertext in the
+  version-history record (requires `versioned` on the repository).
+
+The generated `Debug` is redacting, and an `#[encrypted]` field is hidden from
+JSON unless `admin_visible` is set. Options are validated at compile time
+(`deterministic`, `randomized`, `admin_visible`, `versioned_ciphertext`).
+
+```rust
+#[model(table = "customers")]
+pub struct Customer {
+    #[id] pub id: i64,
+    #[encrypted(deterministic)] pub tax_id: String, // equality-searchable
+    #[encrypted] pub notes: String,                 // randomized, no lookups
+}
+```
+
+**Gotcha:** deterministic mode trades a real security property (equality
+leakage) for queryability — reach for it only when you must filter on the
+column. See [Attribute Encryption](./attribute-encryption.md).
+
+#### `#[normalize(trim, downcase, upcase, squish, with = path)]`
+
+Runs an ordered normalizer chain over the owned `String` before every insert
+and update. Built-ins (`trim`, `downcase`, `upcase`, `squish`) are
+`fn(&str) -> String` in `autumn_web::normalize`; `with = path` calls your own
+function with the same signature. Normalizers apply left-to-right.
+
+```rust
+#[model(table = "accounts")]
+pub struct Account {
+    #[id] pub id: i64,
+    #[normalize(trim, downcase)] pub email: String,
+}
+```
+
+**Gotcha:** `#[normalize]` is `String`-only — applying it to `Option<String>`
+or any non-`String` field is a compile error. A bare `#[normalize]` or empty
+`#[normalize()]` is also an error (it would be a silent no-op); list at least
+one normalizer.
+
+#### `#[state_machine(transitions(a -> b, b -> c: "guard"))]`
+
+Declares allowed state transitions for a `String` field. Per annotated field it
+emits three items on the model:
+
+```rust
+impl Post {
+    // 1. Hidden transition table (from, to, optional guard name)
+    #[doc(hidden)]
+    pub const __AUTUMN_SM_STATUS_TRANSITIONS:
+        &'static [(&'static str, &'static str, Option<&'static str>)] = &[ /* ... */ ];
+
+    // 2. Predicate — calls the guard method for guarded transitions
+    pub fn can_transition_status_to(&self, target: &str) -> bool { /* ... */ }
+
+    // 3. Attempt — Ok(new_state) or Err if undefined / guard rejects
+    pub fn transition_status_to(&self, target: &str) -> AutumnResult<String> { /* ... */ }
+}
+```
+
+A guarded transition (`draft -> published: "can_publish"`) calls your
+`self.can_publish()` method before allowing it.
+
+**Gotchas:** `String`-only; multiple `#[state_machine]` on one field is
+rejected; the guard name must be a plain Rust identifier (e.g. `can_ship`, not
+`"can ship"`); a raw-identifier field like `r#type` derives method names from
+the stripped name (`can_transition_type_to`). See
+[State Machines](./state-machines.md).
+
+#### Associations and search keys
+
+`#[belongs_to(Target, fk = ...)]`, `#[has_many(Target, fk = ..., through = join)]`,
+and `#[has_one(Target, fk = ...)]` declare relationships used by the eager-load
+and association helpers (the foreign key lives on *this* model for `belongs_to`,
+on the *target* for `has_many`/`has_one`; `through =` marks a many-to-many join
+table). `#[searchable]` marks a column for the full-text search surface, and
+`#[shard_key]` designates the sharding key on a sharded model.
+
+---
+
+## Repositories
 
 ### `#[repository(Model)]`
 
@@ -348,6 +646,139 @@ impl PostRepository for PgPostRepository {
 | `delete_by_`    | `diesel::delete(...).filter(col.eq(val))`|
 | `_and_`         | Joins multiple `.filter()` clauses       |
 
+The full set of `#[repository(...)]` options (the authoritative list is the
+attribute's own parse-error message) includes: `table = "..."`, `hooks = Type`,
+`commit_hooks = true`, `api = "/path"`, `mcp` / `mcp = "read"`, `policy = Type`,
+`scope = Type`, `cursor_key = field`, `cursor_key_type = Type`, `soft_delete`,
+`tenant_scoped`, `no_upsert_trait`, `searchable`, `versioned = true`,
+`no_versioned_record_impl`, `primary_reads`, `sharded`,
+`dependent(ChildRepository, fk = "...", on_delete = ...)`, `broadcasts = true`,
+`topic = "..."`, `render = fn`, and `container = "..."`.
+
+### `#[repository]` advanced surface
+
+#### Batched iteration: `find_in_batches` / `find_each`
+
+Generated for **every** repository. Both walk the whole table in bounded-memory
+chunks using a **primary-key keyset cursor** (`WHERE id > last ORDER BY id ASC
+LIMIT n`), never `LIMIT`/`OFFSET`, so deep iteration stays flat and is stable
+under concurrent inserts. Soft-delete filtering, tenant scoping, and read
+routing match `find_all`.
+
+```rust
+// Chunks of up to 1,000 rows:
+let mut batches = repo.find_in_batches(1_000); // -> FindInBatches<'_, Self>
+while let Some(chunk) = batches.next_batch().await? { // Option<Vec<Post>>
+    // process chunk, then drop it before requesting the next
+}
+
+// One row at a time (still fetched in batch_size chunks under the hood):
+let mut each = repo.find_each(500); // -> FindEach<'_, Self>
+while let Some(row) = each.next().await? { // Option<Post>
+    // ...
+}
+```
+
+**Gotchas:** `batch_size == 0` yields an error on every `next_batch()`. The
+cursor only advances on success, so retrying after an `Err` retries the same
+batch (`Ok(None)` always means completion). On a sharded + tenant-scoped repo,
+`across_tenants()` iteration is rejected — iterate each shard via `from_shard`.
+
+#### `find_or_create_by_<field>[_and_<field>...]`
+
+Declare a race-safe get-or-insert as a trait method taking the lookup
+parameters plus an extra `new` insert value; it returns `(Model, bool)` (the
+bool is `true` when a row was actually created).
+
+```rust
+#[repository(Tag)]
+pub trait TagRepository {
+    fn find_or_create_by_slug(slug: &str, new: NewTag) -> (Tag, bool);
+}
+```
+
+It does a read-path lookup first, then an `INSERT ... ON CONFLICT DO NOTHING` on
+the primary (so no `23505` unique-violation ever aborts the transaction); on a
+lost race it re-looks-up on the primary (read-your-writes). `after_create` /
+commit hooks fire only on the created path. Unlike `upsert_many`, it *is*
+generated on hooked repositories.
+
+**Gotchas:** `_or_` is unsupported (compile error — race-safety needs a single
+unique constraint, not a disjunction). It is only truly race-safe when the
+lookup columns match a unique constraint; without one, `ON CONFLICT DO NOTHING`
+has nothing to conflict on and concurrent callers can both insert.
+
+#### Grouped aggregates
+
+A declared aggregate method returns a lazy `GroupedAggregate<'_, K, V>` builder
+rather than running immediately. Chain the builder, then `.load().await`.
+
+```rust
+#[repository(Order)]
+pub trait OrderRepository {
+    fn sum_total_by_status(&self) -> GroupedAggregate<String, i64>;
+}
+
+let top = repo
+    .sum_total_by_status()
+    .order_by_aggregate_desc()
+    .limit(5)
+    .filter_range(lo, hi)
+    .load()
+    .await?;
+
+// Time series:
+let daily = repo.count_by_created_at().bucket(DateBucket::Day).load().await?;
+```
+
+Builder methods: `.order_by_aggregate_desc()`, `.limit(n)`, `.filter_eq(v)`,
+`.filter_range(lo, hi)`, `.bucket(DateBucket::Day)`. Filter values are bound
+(never interpolated). A `timestamptz` (`DateTime<Utc>`) bucket uses
+`date_trunc(.., 'UTC')` for timezone-stable buckets.
+
+**Gotchas:** `sum`/`avg`/`min`/`max` can't be merged across shards, so
+`across_tenants()` on a sharded repo is rejected. Grouping/filtering on an
+`#[encrypted]` column is rejected at runtime (the stored value is ciphertext).
+
+#### `dependent(...)` cascades
+
+`dependent(ChildRepository, fk = "col", on_delete = destroy | delete_all |
+nullify | restrict)` makes `delete_by_id` cascade into the child repository's
+delete path within one transaction (overriding the plain `delete_by_id`).
+
+**Gotcha:** the cascade is **single-level** — it applies this model's deletion
+to each directly-matched child but does *not* recurse into the child's own
+`dependent(...)` declarations, so grandchildren are not handled.
+
+#### `cursor_page` (keyset pagination)
+
+Only generated when you declare `cursor_key = field`.
+
+- **With `cursor_key_type = Type`** — a fully-typed, two-part `(key, id)` keyset
+  cursor: `WHERE (cursor_key < after_k) OR (cursor_key = after_k AND id <
+  after_id)`, ordered `(cursor_key DESC, id DESC)`. Always correct.
+- **Without `cursor_key_type`** — an `id`-only cursor (`WHERE id < after_id`).
+  Correct **only** when `cursor_key` values are monotonically correlated with
+  `id` (e.g. `created_at` on an auto-increment table). For non-monotonic data
+  (backfills, imports), implement `cursor_page` manually.
+
+See [Pagination](./pagination.md).
+
+#### Read-replica routing
+
+When `database.replica_url` is configured, generated read-only methods
+(`find_by_id`, `find_all`, `count`, `paginate`, `cursor_page`, derived
+`find_by_*`, search reads) acquire their connection from the replica pool;
+mutating methods always use the primary. Add `primary_reads` to pin a
+read-after-write-sensitive repository's reads to the primary, or call the
+generated `on_primary()` to pin a single call chain (read-your-writes).
+
+See [Repositories](./repositories.md).
+
+---
+
+## Services
+
 ### `#[service]`
 
 Generates a concrete struct and an Axum extractor from a trait with a `deps()`
@@ -389,7 +820,11 @@ impl FromRequestParts<AppState> for OrderServiceImpl {
 
 You implement the business methods on `OrderServiceImpl` yourself.
 
-### `#[scheduled(every = "5m")]`
+---
+
+## Background Work: Scheduled Tasks, Jobs, Events, Listeners, One-off Tasks
+
+### `#[scheduled(every = "5m")]` + `tasks![]`
 
 **You write:**
 
@@ -413,7 +848,198 @@ pub fn __autumn_task_info_cleanup() -> ::autumn_web::task::TaskInfo {
 }
 ```
 
-Collected via `tasks![cleanup]` (same pattern as `routes![]`).
+Collected via `tasks![cleanup]` (same pattern as `routes![]`). Also accepts
+`cron = "0 0 0 * * *"` for cron scheduling.
+
+### `#[job(...)]` + `jobs![]`
+
+Declares an on-demand background job. Generates a `{PascalName}Job` companion
+struct with typed enqueue helpers, plus a `__autumn_job_info_{fn}` companion
+that `jobs![]` collects.
+
+**You write:**
+
+```rust
+#[job(queue = "critical", max_attempts = 5)]
+async fn send_password_reset(state: AppState, args: ResetArgs) -> AutumnResult<()> {
+    Ok(())
+}
+```
+
+**Generates:**
+
+```rust
+pub struct SendPasswordResetJob;
+
+impl SendPasswordResetJob {
+    pub const NAME: &'static str = "send_password_reset";
+
+    pub async fn enqueue(args: ResetArgs) -> AutumnResult<()> { ... }
+    pub async fn enqueue_in(args: ResetArgs, delay: Duration) -> AutumnResult<()> { ... }
+    pub async fn enqueue_at(args: ResetArgs, when: DateTime<Utc>) -> AutumnResult<()> { ... }
+    pub async fn enqueue_tracked(args: ResetArgs) -> AutumnResult<TrackedJobHandle> { ... }
+    pub async fn enqueue_tracked_for(args: ResetArgs, owner: TrackedJobOwner)
+        -> AutumnResult<TrackedJobHandle> { ... }
+}
+
+#[doc(hidden)]
+pub fn __autumn_job_info_send_password_reset() -> JobInfo { /* name, queue, retries, handler */ }
+```
+
+Call it with `SendPasswordResetJob::enqueue(ResetArgs { .. }).await?`.
+
+Options: `queue`, `max_attempts`, `backoff_ms`, `name`; uniqueness
+(`unique` / `unique_by = "a,b"` / `unique_window = "pending"|"running"` /
+`unique_for_ms`); concurrency (`concurrency = N` / `concurrency_key`); and
+payload versioning (`version = N` / `upgrade = path`).
+
+**Handler arity & tracking:** the job function takes `async fn(AppState, Args)`
+or `async fn(AppState, Args, JobContext)`. The `enqueue_tracked` /
+`enqueue_tracked_for` helpers are **always** generated regardless of arity, but
+they are only *useful* when the handler takes the third `JobContext` argument —
+that's how the job reports progress and a terminal result/error that the tracked
+handle polls:
+
+```rust
+#[job(name = "export_orders")]
+async fn export_orders(state: AppState, args: ExportArgs, ctx: JobContext) -> AutumnResult<()> {
+    ctx.set_progress(50, Some("Rows 1200/5000")).await?;
+    ctx.set_result(serde_json::json!({ "download_url": "/blob/abc.csv" }));
+    Ok(())
+}
+
+let handle = ExportOrdersJob::enqueue_tracked(ExportArgs { account_id: 1 }).await?;
+println!("poll at {}", handle.status_path());
+```
+
+**Gotchas:** the handler must be `async` with exactly 2 or 3 args. `upgrade =`
+requires `version >= 2` (an upgrade hook only runs on an older stored payload).
+`unique = false` conflicts with any other uniqueness attribute. See
+[Jobs](./jobs.md) and [Operating Background Jobs](./operating-background-jobs.md).
+
+### `#[event]` / `#[event(name = "...")]`
+
+Marks a struct as a typed domain event.
+
+**You write:**
+
+```rust
+#[event]
+struct UserSignedUp { user_id: i64 }
+```
+
+**Generates:**
+
+```rust
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
+struct UserSignedUp { user_id: i64 }
+
+impl ::autumn_web::events::Event for UserSignedUp {
+    // Default name is module-qualified so two `Created` events in different
+    // modules never collide; `#[event(name = "user.signed_up")]` overrides it.
+    const NAME: &'static str = concat!(module_path!(), "::", "UserSignedUp");
+}
+```
+
+See [Events](./events.md).
+
+### `#[listener(EventType, ...)]` + `listeners![]`
+
+Declares an async listener reacting to a typed `#[event]`. Emits a
+`__autumn_listener_info_{fn}` companion that `listeners![]` collects.
+
+**You write:**
+
+```rust
+#[listener(UserSignedUp)]
+async fn send_welcome(state: AppState, event: UserSignedUp) -> AutumnResult<()> {
+    Ok(())
+}
+
+// Durable variant, enqueued onto the #[job] queue:
+#[listener(UserSignedUp, durable, max_attempts = 5, backoff_ms = 1000)]
+async fn seed_workspace(state: AppState, event: UserSignedUp) -> AutumnResult<()> {
+    Ok(())
+}
+```
+
+**Effect:** by default the listener runs **synchronously**, in-request, before
+the response (`DispatchMode::Sync`). Adding `durable` enqueues it onto the
+existing `#[job]` queue (`DispatchMode::Durable`, job name
+`__event_listener::{module}::{fn}`) so it survives restarts and inherits retry +
+DLQ semantics.
+
+**Gotchas:** the function must be `async fn(AppState, Event)` (exactly two
+args). `max_attempts` / `backoff_ms` only apply to `durable` listeners — using
+them on a sync listener is a compile error.
+
+### `#[task]` + `one_off_tasks![]`
+
+Declares a one-off operational script (a manually-invoked task, not scheduled).
+Emits a `__autumn_one_off_task_info_{fn}` companion collected by
+`one_off_tasks![]`.
+
+**You write:**
+
+```rust
+/// Backfill missing slugs.
+#[task]
+async fn backfill_slugs(repo: PgPostRepository) -> AutumnResult<()> {
+    Ok(())
+}
+```
+
+**Effect:** each parameter is resolved through `TaskExtractor` at run time; the
+first doc-comment line becomes the task's description; `#[task(name = "...")]`
+overrides the name (defaults to the function name).
+
+### `#[cached]`
+
+Wraps a function with an in-memory cache. Each annotated function gets its own
+`static` cache, keyed by a hash of the arguments.
+
+**You write:**
+
+```rust
+#[cached(ttl = "5m", max = 100, result)]
+async fn get_user(id: i64) -> AutumnResult<User> {
+    db.find(id).await
+}
+```
+
+**Expands to (conceptually):**
+
+```rust
+async fn get_user(id: i64) -> AutumnResult<User> {
+    static __AUTUMN_CACHE: OnceLock<MokaCache> = OnceLock::new();
+    let __autumn_moka = __AUTUMN_CACHE.get_or_init(|| MokaCache::new(100, Some(5m)));
+    // Prefer a process-wide shared backend (e.g. Redis) when registered,
+    // else fall back to the per-function Moka store.
+    let __autumn_cache = global_cache().unwrap_or(__autumn_moka);
+    let __autumn_key = make_cache_key(concat!(module_path!(), "::", "get_user"), &(id.clone(),));
+    if let Some(hit) = get_cached::<User>(__autumn_cache, &__autumn_key) {
+        return Ok(hit); // `result` mode caches only Ok values
+    }
+    let out = /* original body */;
+    // insert on success ...
+    out
+}
+```
+
+Options: `ttl` (duration string, e.g. `"5m"`), `max` (entry cap, default
+`10_000`, LRU eviction), and the `result` flag (cache only `Ok` values, pass
+`Err` through uncached).
+
+**Gotcha:** `#[cached]` cannot be applied to methods with a `self` receiver.
+See [Fragment Caching](./fragment-caching.md) and [Cache Stampede](./cache-stampede.md).
+
+---
+
+## Guards & Rate Limiting
+
+These attributes stack on top of a route macro and inject hidden extractors plus
+a pre-body check. They share a family resemblance: `#[secured]`, `#[authorize]`,
+`#[step_up]`, and `#[throttle]` all rewrite the handler to run a check first.
 
 ### `#[secured("role")]`
 
@@ -489,36 +1115,270 @@ async fn edit_post(
 - Coexists with `#[secured]`: stack both attributes when a route should
   require both authentication/role gating and a record-level check.
 
-### `#[static_get("/path")]`
+### `#[step_up]` / `#[step_up(max_age = "5m")]`
 
-Generates both a route companion (same as `#[get]`) and a static metadata
-companion for build-time rendering.
+Requires a *fresh* authentication (recent re-auth) before the handler runs — a
+step-up challenge for sensitive actions. Injects hidden extractors and prepends
+a freshness check.
 
 **You write:**
 
 ```rust
-#[static_get("/about")]
-async fn about() -> Markup {
-    html! { h1 { "About" } }
+#[post("/settings/delete-account")]
+#[step_up(max_age = "5m")]
+async fn delete_account(session: Session) -> AutumnResult<Redirect> {
+    // ...
 }
 ```
 
-**Generates two companions:**
+**Effect:** before the body runs, `__check_step_up_with_config` verifies the
+session authenticated within `max_age` (default 5 minutes if bare `#[step_up]`).
+On failure it returns a JSON `401`-style challenge for API clients or a redirect
+(honoring `Referer`) for browsers. `max_age` accepts `"5m"`, `"1h"`, `"30s"`,
+or a bare number of seconds.
+
+### `#[feature_flag("key", fallback = fn)]`
+
+Gates the entire route on a feature flag, evaluated inside a dedicated
+`FromRequestParts` gate struct so Axum short-circuits **before** body extractors
+(`Json`, `Form`) are consumed.
+
+**You write:**
 
 ```rust
-// Route (same as #[get])
-pub fn __autumn_route_info_about() -> Route { ... }
-
-// Static build metadata
-pub fn __autumn_static_meta_about() -> StaticRouteMeta {
-    StaticRouteMeta {
-        path: "/about",
-        name: "about",
-        revalidate: None,
-        params_fn: None,
-    }
+#[get("/beta")]
+#[feature_flag("beta_dashboard")]
+async fn beta_dashboard() -> Markup {
+    html! { h1 { "Beta!" } }
 }
 ```
+
+**Generates** a per-handler gate `__AutumnFlagGate_beta_dashboard` whose
+`FromRequestParts` impl returns `Err(response)` when the flag is disabled. The
+default rejection is `404 Not Found` (**fail-closed** — a disabled feature looks
+like it doesn't exist); a `fallback = my_handler` delegates to your handler
+instead:
+
+```rust
+#[get("/experimental")]
+#[feature_flag("experimental_feature", fallback = feature_disabled)]
+async fn experimental() -> Markup { html! { "Experimental" } }
+
+async fn feature_disabled() -> impl IntoResponse {
+    (StatusCode::NOT_FOUND, "Feature not available yet")
+}
+```
+
+See [Feature Flags](./feature-flags.md).
+
+### `#[throttle(...)]`
+
+A per-route rate-limit guard. Applies to **async functions only**. It injects
+several hidden extractors and prepends a runtime check that returns `429` early
+when over the limit.
+
+**You write:**
+
+```rust
+#[post("/login")]
+#[throttle(limit = 5, per = "1m", key = "ip")]
+async fn login() -> AutumnResult<&'static str> {
+    Ok("welcome back")
+}
+```
+
+**Effect (conceptually):** the macro rewrites the handler to return `Response`,
+injects hidden extractors (`State<AppState>`, `HeaderMap`,
+`Option<MatchedPath>`, connection peer, principal, session, exempt/replay
+markers), and prepends:
+
+```rust
+const __AUTUMN_THROTTLE_ROUTE_ID: &str = concat!(module_path!(), "::", "login");
+if let Err(resp) = ::autumn_web::security::__check_throttle(
+    &__autumn_state, __AUTUMN_THROTTLE_ROUTE_ID, /* matched path, spec, headers, peer, ... */
+).await {
+    return resp; // 429 Too Many Requests
+}
+// ... then the original body, coerced to a Response via IntoResponse
+```
+
+Forms:
+
+- `#[throttle(limit = N, per = "1m", key = "ip" | "principal" | "token")]` —
+  inline limiter (`key` optional; default strategy otherwise).
+- `#[throttle("named")]` — a named limiter defined under
+  `[security.rate_limit.named.named]` in config.
+
+**Gotcha (attribute ordering):** put the **route method attribute outermost**,
+above `#[throttle]`:
+
+```rust
+#[post("/login")]              // method attribute OUTERMOST
+#[throttle(limit = 5, per = "1m", key = "ip")]
+async fn login() -> Json<Session> { /* ... */ }
+```
+
+Both orders throttle correctly, but only method-outermost lets the route macro
+see the handler's real return type (`Json<Session>`) for OpenAPI response-schema
+generation. When `#[throttle]` expands first it rewrites the return type to
+`Response` (like the sibling `#[secured]` / `#[step_up]` / `#[authorize]`
+guards), and the `Json<T>` schema is lost from the generated document.
+
+**Gotcha (body extractors run first):** the throttle check runs after
+`FromRequestParts` extractors but *before* the body — however Axum parses body
+extractors (`Json` / `Form` / `Multipart`) before the check, so an over-limit
+client can still incur body parsing before its `429`. For hard pre-body
+protection, combine with the global limiter layer under `[security.rate_limit]`.
+
+**Runtime detail — `RateLimitEnvelopeCounted`:** this is **not** a macro. It's
+an internal marker struct (`autumn_web::security::rate_limit::RateLimitEnvelopeCounted`)
+set only on the MCP `tools/call` replay path to avoid double-charging a request
+whose enclosing `/mcp` envelope was already counted. Per-route `#[throttle]`
+buckets and the global layer still charge a request carrying it (use
+`RateLimitExempt` to bypass every limiter). It's mentioned here only because it
+lives next to the throttle machinery. See [Rate Limiting](./rate-limiting.md).
+
+---
+
+## Mail
+
+### `#[mailer]`
+
+Applied to an `impl` block. For each method that returns
+`autumn_web::mail::Mail` (via an `&self` receiver), it generates two delivery
+helpers alongside the template method: `send_{method}` (async, sends now) and
+`deliver_later_{method}` (enqueues delivery on the job queue).
+
+**You write:**
+
+```rust
+#[mailer]
+impl UserMailer {
+    fn welcome(&self, user: &User) -> Mail { /* build the Mail */ }
+}
+```
+
+**Generates** `UserMailer::send_welcome(...).await` and
+`UserMailer::deliver_later_welcome(...)` from your `welcome` template method.
+
+### `#[mailer_preview]` + `mail_previews![]`
+
+Registers zero-argument, synchronous `-> Mail` associated functions for the dev
+mail preview UI. Emits a `__autumn_mail_previews()` helper on the impl block;
+`mail_previews![UserMailer, ...]` collects them into a `Vec<MailPreview>`.
+
+**You write:**
+
+```rust
+#[mailer_preview]
+impl UserMailer {
+    fn preview_welcome() -> Mail { /* build a sample Mail */ }
+}
+
+let previews = mail_previews![UserMailer];
+```
+
+**Gotchas:** preview methods must be **synchronous**, **zero-arg** (not even
+`&self`), non-generic, and return `Mail`.
+
+### `#[inbound_mail(to = "...", processing = "...")]`
+
+Annotates an async inbound-mail handler. Generates a companion
+`{fn}_handler_info()` returning an `InboundMailHandlerInfo` ready to register on
+an `InboundMailRouter`.
+
+**You write:**
+
+```rust
+#[inbound_mail(to = "support@company.com")]
+async fn handle_support(email: InboundEmail) -> AutumnResult<()> {
+    tracing::info!(from = %email.from, "inbound support email");
+    Ok(())
+}
+
+// Registration:
+InboundMailRouter::new().handler(handle_support_handler_info())
+```
+
+Recipient matching: `to = "address@example.com"` (exact),
+`to = "replies+{token}@app.example"` (plus-address; token via
+`InboundEmail::plus_token()`), or `to = "prefix+*"` (local-part prefix).
+`processing = "sync" | "background"` (default `"background"`). See
+[Mail](./mail.md).
+
+---
+
+## i18n, Stories & Path Helpers
+
+### `t!` (i18n translate)
+
+Translates an i18n key, with **compile-time validation** that the key exists in
+the default locale's `.ftl` file.
+
+**You write:**
+
+```rust
+t!(locale, "welcome.title")
+t!(locale, "welcome.greeting", name = "Ada") // Fluent { $name } placeable
+```
+
+**Compile-time behavior:** the macro reads
+`$CARGO_MANIFEST_DIR/i18n/<default>.ftl` (default locale from
+`AUTUMN_I18N_DEFAULT_LOCALE`, default `"en"`). A missing key becomes a
+`compile_error!` pointing at the literal, with a "did you mean" suggestion for
+near-miss typos. If the `.ftl` file doesn't exist yet, the macro degrades to a
+pure runtime call so the build still succeeds. See [i18n](./i18n.md).
+
+### `story!` (widget gallery)
+
+Defines a widget story for the `/_stories` gallery:
+`story!{ "Group", "Name", { ... } }`. The brace block is **both** executed for
+the live render **and** captured byte-for-byte (comments and formatting
+included) as the displayed source, so the shown code is provably the code that
+rendered. The block must be a self-contained expression evaluating to
+`maud::Markup` — it is coerced to a plain `fn() -> Markup`, so capturing
+anything from the surrounding environment is a compile error.
+
+### `paths![]` (typed path helpers)
+
+Emits a `pub mod paths { … }` that re-exports each handler's typed path helper
+under its short name. Takes the same comma-separated handler list as `routes![]`.
+
+**You write:**
+
+```rust
+autumn_web::paths![show_post, create_post, posts::index];
+```
+
+**Expands to:**
+
+```rust
+pub mod paths {
+    pub use super::__autumn_path_show_post as show_post;
+    pub use super::__autumn_path_create_post as create_post;
+    pub use super::posts::__autumn_path_index as index;
+}
+```
+
+Callers then write `use crate::routes::paths;` and `paths::show_post(id)`
+instead of the internal `__autumn_path_show_post(id)`. See
+[Path Helpers](./path-helpers.md).
+
+### Collector macros at a glance
+
+Every attribute macro that emits a `__autumn_*` companion has a matching
+list macro that gathers them into a typed `Vec` for the app builder:
+
+| Collector | Gathers | Companion prefix |
+|-----------|---------|------------------|
+| `routes![]` | `Vec<Route>` | `__autumn_route_info_` |
+| `static_routes![]` | `Vec<StaticRouteMeta>` | `__autumn_static_meta_` |
+| `tasks![]` | `Vec<TaskInfo>` | `__autumn_task_info_` |
+| `jobs![]` | `Vec<JobInfo>` | `__autumn_job_info_` |
+| `listeners![]` | `Vec<ListenerInfo>` | `__autumn_listener_info_` |
+| `one_off_tasks![]` | `Vec<OneOffTaskInfo>` | `__autumn_one_off_task_info_` |
+| `mail_previews![]` | `Vec<MailPreview>` | `__autumn_mail_previews` |
+| `paths![]` | `pub mod paths` | `__autumn_path_` |
 
 ---
 
@@ -526,10 +1386,11 @@ pub fn __autumn_static_meta_about() -> StaticRouteMeta {
 
 All Autumn macros follow the same architectural pattern:
 
-1. **Your code stays untouched** (or minimally modified for `#[secured]`)
+1. **Your code stays untouched** (or minimally modified for guards like
+   `#[secured]` / `#[throttle]`)
 2. **A hidden `__autumn_*` companion function** is generated next to your code
-3. **A collection macro** (`routes![]`, `tasks![]`, `static_routes![]`) calls
-   those companions to build typed vectors
+3. **A collection macro** (`routes![]`, `tasks![]`, `jobs![]`,
+   `static_routes![]`, …) calls those companions to build typed vectors
 4. **The app builder** consumes those vectors at startup
 
 This means:
@@ -566,6 +1427,14 @@ async fn secret() -> &'static str { "hidden" }
 // Fix: add it to routes![]
 .routes(routes![secret])
 ```
+
+### "My `#[throttle]` route lost its OpenAPI response schema"
+
+Attribute ordering. Put the route method attribute **outermost**, above
+`#[throttle]` (and the sibling `#[secured]` / `#[step_up]` / `#[authorize]`
+guards). When a guard expands first it rewrites the return type to `Response`,
+so the route macro can no longer see the real `Json<T>` type for the generated
+OpenAPI document. Both orders still *enforce* the guard correctly.
 
 ### "cargo expand shows too much noise"
 
