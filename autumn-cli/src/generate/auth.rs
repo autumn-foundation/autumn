@@ -407,13 +407,32 @@ pub fn plan_auth(project_root: &Path, name: &str, timestamp: &str) -> Result<Pla
     plan_auth_with_providers(project_root, name, timestamp, &[], false)
 }
 
-#[allow(clippy::too_many_lines)]
 pub fn plan_auth_with_providers(
     project_root: &Path,
     name: &str,
     timestamp: &str,
     providers: &[String],
     totp: bool,
+) -> Result<Plan, GenerateError> {
+    plan_auth_with_providers_ex(project_root, name, timestamp, providers, totp, false)
+}
+
+/// Extended base scaffold that additionally threads the `--magic-link` flag
+/// (issue #1328) through the migration, model, schema, routes, docs, and tests.
+///
+/// `plan_auth_with_providers` delegates here with `magic_link = false` so all
+/// existing call sites keep their behaviour byte-for-byte.
+///
+/// # Errors
+/// Same as [`plan_auth`].
+#[allow(clippy::too_many_lines)]
+pub fn plan_auth_with_providers_ex(
+    project_root: &Path,
+    name: &str,
+    timestamp: &str,
+    providers: &[String],
+    totp: bool,
+    magic_link: bool,
 ) -> Result<Plan, GenerateError> {
     ensure_project_root(project_root)?;
     super::model::validate_resource_name(name)?;
@@ -443,11 +462,11 @@ pub fn plan_auth_with_providers(
         .join(format!("{timestamp}_create_{table}"));
     plan.create(
         mig_dir.join("up.sql"),
-        render_migration_up(&snake_name, &table, totp),
+        render_migration_up(&snake_name, &table, totp, magic_link),
     );
     plan.create(
         mig_dir.join("down.sql"),
-        render_migration_down(&snake_name, &table, totp),
+        render_migration_down(&snake_name, &table, totp, magic_link),
     );
 
     // ── Model ──────────────────────────────────────────────────────────────
@@ -480,6 +499,16 @@ pub fn plan_auth_with_providers(
     );
     let remember_mod_name = format!("{snake_name}_remember_token");
     model_mod = add_mod_declaration(&model_mod, &remember_mod_name);
+    // Passwordless magic-link tokens (issue #1328) live in their own model +
+    // table, mirroring the reset-token invariants: only the SHA-256 digest is
+    // stored, plus an expiry and a single-use `consumed_at` marker.
+    if magic_link {
+        plan.create(
+            models_dir.join("magic_link_token.rs"),
+            render_magic_link_token_model_file(&pascal_name, &table),
+        );
+        model_mod = add_mod_declaration(&model_mod, "magic_link_token");
+    }
     plan.modify(model_mod_path.clone(), model_mod);
     plan.push_revert(crate::generate::emit::Revert::ModDecl {
         path: model_mod_path.clone(),
@@ -495,6 +524,12 @@ pub fn plan_auth_with_providers(
         path: model_mod_path.clone(),
         name: session_mod_name,
     });
+    if magic_link {
+        plan.push_revert(crate::generate::emit::Revert::ModDecl {
+            path: model_mod_path.clone(),
+            name: "magic_link_token".to_owned(),
+        });
+    }
     plan.push_revert(crate::generate::emit::Revert::ModDecl {
         path: model_mod_path,
         name: remember_mod_name,
@@ -639,6 +674,13 @@ pub fn plan_auth_with_providers(
     .map(|t| super::dsl::parse_field(t).expect("remember field tokens are always valid"))
     .collect();
     schema_new = append_schema_table(&schema_new, &rem_table, &remember_fields);
+    // Passwordless magic-link tokens (issue #1328). Dedicated table mirroring
+    // the reset-token invariants: only the SHA-256 digest of the raw token is
+    // stored, plus an expiry and a single-use `consumed_at` marker.
+    let magic_link_fields: Vec<super::dsl::Field> = magic_link_token_fields();
+    if magic_link {
+        schema_new = append_schema_table(&schema_new, "magic_link_tokens", &magic_link_fields);
+    }
     plan.modify(schema_path.clone(), schema_new);
     plan.push_revert(crate::generate::emit::Revert::SchemaTable {
         path: schema_path.clone(),
@@ -666,19 +708,37 @@ pub fn plan_auth_with_providers(
         table: sess_table,
         expected_block: sess_table_expected_block,
     });
-    // Remember-me table is appended last, so it is reverted first (issue #1397).
+    // Remember-me table is appended last (before the optional magic-link table),
+    // so it is reverted just after it (issue #1397).
     let rem_table_expected_block = append_schema_table("", &rem_table, &remember_fields);
     plan.push_revert(crate::generate::emit::Revert::SchemaTable {
-        path: schema_path,
+        path: schema_path.clone(),
         table: rem_table,
         expected_block: rem_table_expected_block,
     });
+    // Magic-link table is appended last, so it is reverted first (issue #1328).
+    if magic_link {
+        let magic_link_expected_block =
+            append_schema_table("", "magic_link_tokens", &magic_link_fields);
+        plan.push_revert(crate::generate::emit::Revert::SchemaTable {
+            path: schema_path,
+            table: "magic_link_tokens".to_owned(),
+            expected_block: magic_link_expected_block,
+        });
+    }
 
     // ── Auth routes ────────────────────────────────────────────────────────
     let routes_dir = project_root.join("src").join("routes");
     plan.create(
         routes_dir.join("auth.rs"),
-        render_routes_file(&pascal_name, &snake_name, &table, providers, totp),
+        render_routes_file(
+            &pascal_name,
+            &snake_name,
+            &table,
+            providers,
+            totp,
+            magic_link,
+        ),
     );
     let route_mod_path = routes_dir.join("mod.rs");
     plan.modify(
@@ -694,7 +754,7 @@ pub fn plan_auth_with_providers(
     let tests_dir = project_root.join("tests");
     plan.create(
         tests_dir.join("auth.rs"),
-        render_tests_file(&pascal_name, &snake_name),
+        render_tests_file(&pascal_name, &snake_name, magic_link),
     );
     if totp {
         plan.create(
@@ -712,7 +772,7 @@ pub fn plan_auth_with_providers(
     let docs_dir = project_root.join("docs").join("guide");
     plan.create(
         docs_dir.join("authentication.md"),
-        render_docs_file(&pascal_name, totp),
+        render_docs_file(&pascal_name, totp, magic_link),
     );
     plan.create(docs_dir.join("gdpr-compliance.md"), render_gdpr_docs_file());
     plan.create(
@@ -728,7 +788,7 @@ pub fn plan_auth_with_providers(
             format!("missing {}", main_path.display()),
         ))
     })?;
-    let entries = auth_route_entries(totp);
+    let entries = auth_route_entries(totp, magic_link);
     let updated = update_main_rs(&main_existing, &["models", "routes", "schema"], &entries);
     // Auto-wire the remember-me middleware layer + startup hook into the
     // `AppBuilder` chain so a freshly generated app actually consumes the
@@ -816,7 +876,7 @@ pub fn plan_auth_with_options(
     timestamp: &str,
     oauth: &AuthOAuthOptions,
 ) -> Result<Plan, GenerateError> {
-    plan_auth_options_impl(project_root, name, timestamp, oauth, false, false)
+    plan_auth_options_impl(project_root, name, timestamp, oauth, false, false, false)
 }
 
 /// Compute the file actions for `autumn generate auth [--oauth …] [--totp]`.
@@ -834,7 +894,7 @@ pub fn plan_auth_full(
     oauth: &AuthOAuthOptions,
     totp: bool,
 ) -> Result<Plan, GenerateError> {
-    plan_auth_options_impl(project_root, name, timestamp, oauth, totp, false)
+    plan_auth_options_impl(project_root, name, timestamp, oauth, totp, false, false)
 }
 
 /// Compute the file actions for `autumn generate auth [--oauth …] [--totp] [--passkeys]`.
@@ -851,11 +911,41 @@ pub fn plan_auth_full_ex(
     totp: bool,
     passkeys: bool,
 ) -> Result<Plan, GenerateError> {
-    plan_auth_options_impl(project_root, name, timestamp, oauth, totp, passkeys)
+    plan_auth_options_impl(project_root, name, timestamp, oauth, totp, passkeys, false)
 }
 
-/// Shared implementation: base (optionally TOTP-aware, optionally passkey-aware)
-/// scaffold plus, when providers are supplied, the OAuth artifacts.
+/// Compute the file actions for
+/// `autumn generate auth [--oauth …] [--totp] [--passkeys] [--magic-link]`.
+///
+/// Extended version of [`plan_auth_full_ex`] that additionally supports
+/// passwordless email magic-link login (issue #1328). The magic-link scaffold
+/// is fully composable with `--oauth`, `--totp`, and `--passkeys`.
+///
+/// # Errors
+/// Same as [`plan_auth`].
+pub fn plan_auth_full_ex2(
+    project_root: &Path,
+    name: &str,
+    timestamp: &str,
+    oauth: &AuthOAuthOptions,
+    totp: bool,
+    passkeys: bool,
+    magic_link: bool,
+) -> Result<Plan, GenerateError> {
+    plan_auth_options_impl(
+        project_root,
+        name,
+        timestamp,
+        oauth,
+        totp,
+        passkeys,
+        magic_link,
+    )
+}
+
+/// Shared implementation: base (optionally TOTP-aware, optionally passkey-aware,
+/// optionally magic-link-aware) scaffold plus, when providers are supplied, the
+/// OAuth artifacts.
 #[allow(clippy::too_many_lines)]
 fn plan_auth_options_impl(
     project_root: &Path,
@@ -864,9 +954,18 @@ fn plan_auth_options_impl(
     oauth: &AuthOAuthOptions,
     totp: bool,
     passkeys: bool,
+    magic_link: bool,
 ) -> Result<Plan, GenerateError> {
-    // Start with the base auth plan with providers (and optional TOTP) applied.
-    let mut plan = plan_auth_with_providers(project_root, name, timestamp, &oauth.providers, totp)?;
+    // Start with the base auth plan with providers (and optional TOTP, and
+    // optional magic-link) applied.
+    let mut plan = plan_auth_with_providers_ex(
+        project_root,
+        name,
+        timestamp,
+        &oauth.providers,
+        totp,
+        magic_link,
+    )?;
 
     let pascal_name = pascal(name);
     let snake_name = snake(name);
@@ -1600,7 +1699,8 @@ fn remember_table_name(snake_name: &str) -> String {
     format!("{snake_name}_remember_tokens")
 }
 
-fn render_migration_up(snake_name: &str, table: &str, totp: bool) -> String {
+#[allow(clippy::too_many_lines)]
+fn render_migration_up(snake_name: &str, table: &str, totp: bool, magic_link: bool) -> String {
     // TOTP columns are inserted after password_digest so the column order
     // matches the generated model struct and `schema.rs` block.
     let totp_columns = if totp {
@@ -1705,19 +1805,47 @@ fn render_migration_up(snake_name: &str, table: &str, totp: bool) -> String {
          \n\
          CREATE INDEX {rem_table}_user_id_idx ON {rem_table} (user_id);\n",
     );
+    // Passwordless magic-link tokens (issue #1328): one row per issued link,
+    // keyed by the SHA-256 digest of the raw token. Only the digest is stored —
+    // the raw token appears only in the emailed link. `consumed_at` is the
+    // single-use marker; `expires_at` enforces the configurable TTL.
+    if magic_link {
+        let _ = write!(
+            out,
+            "\n\
+             CREATE TABLE magic_link_tokens (\n\
+             \x20   id BIGSERIAL PRIMARY KEY,\n\
+             \x20   user_id BIGINT NOT NULL REFERENCES {table}(id) ON DELETE CASCADE,\n\
+             \x20   token_digest TEXT NOT NULL UNIQUE,\n\
+             \x20   expires_at TIMESTAMP NOT NULL,\n\
+             \x20   consumed_at TIMESTAMP NULL,\n\
+             \x20   created_at TIMESTAMP NOT NULL DEFAULT NOW()\n\
+             );\n\
+             \n\
+             CREATE INDEX magic_link_tokens_user_id_idx ON magic_link_tokens (user_id);\n",
+        );
+    }
     out
 }
 
-fn render_migration_down(snake_name: &str, table: &str, totp: bool) -> String {
+fn render_migration_down(snake_name: &str, table: &str, totp: bool, magic_link: bool) -> String {
     // Drop the dependent tables first so the FK constraints are satisfied.
     let sess_table = sessions_table_name(snake_name);
     let rem_table = remember_table_name(snake_name);
+    // Magic-link tokens FK the user table, so drop them before it (issue #1328).
+    let magic_drop = if magic_link {
+        "DROP TABLE magic_link_tokens;\n"
+    } else {
+        ""
+    };
     if totp {
         format!(
-            "DROP TABLE {rem_table};\nDROP TABLE {sess_table};\nDROP TABLE recovery_codes;\nDROP TABLE {table};\n"
+            "{magic_drop}DROP TABLE {rem_table};\nDROP TABLE {sess_table};\nDROP TABLE recovery_codes;\nDROP TABLE {table};\n"
         )
     } else {
-        format!("DROP TABLE {rem_table};\nDROP TABLE {sess_table};\nDROP TABLE {table};\n")
+        format!(
+            "{magic_drop}DROP TABLE {rem_table};\nDROP TABLE {sess_table};\nDROP TABLE {table};\n"
+        )
     }
 }
 
@@ -2199,6 +2327,57 @@ impl {user_pascal} {{
     )
 }
 
+/// Field tokens for the `magic_link_tokens` table (issue #1328), shared by the
+/// schema append and its destroy revert so they stay byte-identical. `id` and
+/// `created_at` are added automatically by `append_schema_table`.
+fn magic_link_token_fields() -> Vec<super::dsl::Field> {
+    [
+        "user_id:i64",
+        "token_digest:String",
+        "expires_at:NaiveDateTime",
+        "consumed_at:Option<NaiveDateTime>",
+    ]
+    .iter()
+    .map(|t| super::dsl::parse_field(t).expect("magic-link field tokens are always valid"))
+    .collect()
+}
+
+/// Render `src/models/magic_link_token.rs` — the passwordless login-token row
+/// (issue #1328).
+///
+/// Mirrors the reset-token invariants: only the SHA-256 digest of the raw
+/// token is stored (`token_digest`), never the raw token. `consumed_at` is the
+/// single-use marker (set on the first successful verify), and `expires_at`
+/// enforces the configurable TTL. Unknown/expired/consumed tokens are all
+/// rejected with the same generic failure — see `routes/auth.rs`.
+fn render_magic_link_token_model_file(user_pascal: &str, user_table: &str) -> String {
+    format!(
+        r"//! Generated by `autumn generate auth --magic-link`.
+//!
+//! Passwordless magic-link login tokens for {user_pascal}. Edit freely.
+//! Security note: only the SHA-256 digest of each raw token is stored — never
+//! the raw token, which appears only in the emailed link. `consumed_at` marks a
+//! token as used so it cannot be replayed; `expires_at` enforces the TTL.
+
+use crate::schema::magic_link_tokens;
+
+#[autumn_web::model]
+pub struct MagicLinkToken {{
+    pub id: i64,
+    // References {user_table}(id).
+    pub user_id: i64,
+    pub token_digest: String,
+    pub expires_at: chrono::NaiveDateTime,
+    // Single-use marker: set to `now` on the first successful verify. A second
+    // verify of the same token finds it non-NULL and is rejected.
+    pub consumed_at: Option<chrono::NaiveDateTime>,
+    #[default]
+    pub created_at: chrono::NaiveDateTime,
+}}
+"
+    )
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "Single auth-routes template — splitting fragments makes the template harder to read."
@@ -2209,9 +2388,24 @@ fn render_routes_file(
     table: &str,
     providers: &[String],
     totp: bool,
+    magic_link: bool,
 ) -> String {
     let sess_table = sessions_table_name(snake_name);
     let rem_table = remember_table_name(snake_name);
+    // Passwordless magic-link login (issue #1328). All output is gated on the
+    // `--magic-link` flag so the flow composes with `--oauth`/`--totp`/`--passkeys`.
+    let (magic_link_imports, magic_link_section, magic_link_login_link) = if magic_link {
+        (
+            "use crate::models::magic_link_token::{MagicLinkToken, NewMagicLinkToken};\n\
+             use crate::schema::magic_link_tokens;\n"
+                .to_owned(),
+            magic_link_routes_section_src(pascal_name, snake_name, table),
+            "        p { a href=\"/login/magic\" { \"Email me a magic sign-in link\" } }\n"
+                .to_owned(),
+        )
+    } else {
+        (String::new(), String::new(), String::new())
+    };
     let oauth_buttons = if providers.is_empty() {
         String::new()
     } else {
@@ -2308,7 +2502,7 @@ use crate::models::{snake_name}_remember_token::{{
 use crate::schema::{sess_table};
 use crate::schema::{rem_table};
 use crate::schema::{table};
-{totp_imports}
+{totp_imports}{magic_link_imports}
 
 // ── Layout helpers ────────────────────────────────────────────────────────────
 
@@ -3336,7 +3530,7 @@ pub async fn login_form(flash: Flash, csrf: Option<CsrfToken>, csrf_field: Optio
         {oauth_buttons}
         p {{ a href="/signup" {{ "New here? Create an account" }} }}
         p {{ a href="/forgot-password" {{ "Forgot your password?" }} }}
-        p {{ a href="/auth/confirm/resend" {{ "Resend confirmation email" }} }}
+{magic_link_login_link}        p {{ a href="/auth/confirm/resend" {{ "Resend confirmation email" }} }}
     }}))
 }}
 
@@ -5512,12 +5706,20 @@ pub async fn admin_delete_account(
 
     Ok(redirect_to(&format!("/admin/{table}/{{user_id}}")).into_response())
 }}
-{totp_section}"##
+{totp_section}{magic_link_section}"##
     )
 }
 
 #[allow(clippy::too_many_lines)]
-fn render_tests_file(pascal_name: &str, _snake_name: &str) -> String {
+fn render_tests_file(pascal_name: &str, _snake_name: &str, magic_link: bool) -> String {
+    // Passwordless magic-link live-DB integration test (issue #1328, AC7).
+    // Emitted only under `--magic-link`; `#[ignore]`d so it compiles and passes
+    // out of the box, like the sibling live-DB tests in this file.
+    let magic_link_tests = if magic_link {
+        MAGIC_LINK_TESTS_SECTION
+    } else {
+        ""
+    };
     format!(
         r#"//! Request-level smoke tests for {pascal_name} auth, generated by `autumn generate auth`.
 //!
@@ -5984,9 +6186,47 @@ fn password_and_email_change_end_to_end() {{
          token is confirmed"
     )
 }}
-"#
+{magic_link_tests}"#
     )
 }
+
+/// Live-DB magic-link integration test appended to `tests/auth.rs` under
+/// `--magic-link` (issue #1328, AC7). Uses plain single braces — it is inserted
+/// verbatim into the `render_tests_file` output, not re-formatted.
+const MAGIC_LINK_TESTS_SECTION: &str = r#"
+/// Magic-link end-to-end (issue #1328, AC7). Against a live DB with a capturing
+/// mail transport, this asserts the request endpoint sends a link and that
+/// consuming that link logs the user in.
+///
+/// Outline (fill in with your HTTP client + mail capture once wired):
+///   1. POST /login/magic with a registered, confirmed email → 200
+///      "check your email", and the capturing mail transport receives one
+///      message whose body contains a `/login/magic/verify?token=…` URL.
+///   2. POST /login/magic with an UNREGISTERED email → the SAME 200 response
+///      and NO email is sent (non-enumerating).
+///   3. GET the captured verify URL → redirect to /account with a session
+///      cookie; a follow-up GET /account with that cookie returns 200.
+///   4. GET the same verify URL a SECOND time → generic failure (single-use).
+///   5. GET /login/magic/verify?token=deadbeef (unknown) → the SAME generic
+///      failure page (no oracle).
+#[test]
+#[ignore = "requires a live database and a capturing mail transport"]
+fn magic_link_request_and_consume_logs_in() {
+    let Some(base) = base_url() else {
+        eprintln!("skipping: AUTUMN_TEST_BASE_URL not set");
+        return;
+    };
+    let _ = base;
+    todo!(
+        "implement magic_link_request_and_consume_logs_in against a live DB: \
+         (1) POST /login/magic sends a link containing /login/magic/verify?token=, \
+         (2) an unregistered email yields the same response and sends no mail, \
+         (3) consuming the verify link logs the user in (GET /account → 200), \
+         (4) a second verify of the same token fails (single-use), \
+         (5) an unknown token yields the same generic failure (no oracle)"
+    )
+}
+"#;
 
 #[allow(clippy::too_many_lines)]
 /// Render `tests/auth_sessions.rs` — integration tests for active-session
@@ -6344,8 +6584,13 @@ them against a live server.
 }
 
 #[allow(clippy::too_many_lines)]
-fn render_docs_file(pascal_name: &str, totp: bool) -> String {
+fn render_docs_file(pascal_name: &str, totp: bool, magic_link: bool) -> String {
     let totp_docs = if totp { TOTP_DOCS_SECTION } else { "" };
+    let magic_link_docs = if magic_link {
+        MAGIC_LINK_DOCS_SECTION
+    } else {
+        ""
+    };
     format!(
         r#"# Authentication Guide
 
@@ -6716,7 +6961,7 @@ the generator re-run — the framework does not silently change behaviour.
 - **{pascal_name} fields**: Add display-name, avatar, or role fields to the
   `{pascal_name}` model and a new migration.
 
-{totp_docs}## When to Choose This Flow vs. Alternatives
+{totp_docs}{magic_link_docs}## When to Choose This Flow vs. Alternatives
 
 | Scenario | Recommendation |
 |----------|---------------|
@@ -6835,7 +7080,7 @@ in your application state.
     .to_owned()
 }
 
-fn auth_route_entries(totp: bool) -> Vec<String> {
+fn auth_route_entries(totp: bool, magic_link: bool) -> Vec<String> {
     let mut entries = vec![
         "routes::auth::signup_form".to_owned(),
         "routes::auth::signup".to_owned(),
@@ -6881,6 +7126,13 @@ fn auth_route_entries(totp: bool) -> Vec<String> {
             "routes::auth::two_factor_enable".to_owned(),
             "routes::auth::two_factor_confirm".to_owned(),
             "routes::auth::two_factor_disable".to_owned(),
+        ]);
+    }
+    if magic_link {
+        entries.extend([
+            "routes::auth::magic_link_request_form".to_owned(),
+            "routes::auth::magic_link_request".to_owned(),
+            "routes::auth::magic_link_verify".to_owned(),
         ]);
     }
     entries
@@ -8304,6 +8556,294 @@ pub async fn login_verify(
         .replace("__SESSTABLE__", &sessions_table_name(snake_name))
 }
 
+/// Render the passwordless magic-link login section appended to `routes/auth.rs`
+/// under `--magic-link` (issue #1328).
+///
+/// Emits the request form (`GET /login/magic`), the rate-limited request
+/// endpoint (`POST /login/magic`), the verify endpoint
+/// (`GET /login/magic/verify?token=…`), the mailer helper, and the generic
+/// failure page. Uses `__SNAKE__` / `__PASCAL__` / `__TABLE__` placeholders and
+/// `.replace()` so the template body can use plain single braces.
+#[allow(clippy::too_many_lines)]
+fn magic_link_routes_section_src(pascal_name: &str, snake_name: &str, table: &str) -> String {
+    const TPL: &str = r#"
+// ── Passwordless magic-link login ───────────────────────────────────────────────
+//
+// Generated by `autumn generate auth --magic-link` (issue #1328). Edit freely.
+//
+// Security properties:
+// - Tokens are 32-byte random values (`OsRng`); only their SHA-256 digest is
+//   persisted (`magic_link_tokens.token_digest`). The raw token appears only in
+//   the emailed link — never in the database, logs, or error reports.
+// - Single-use: `magic_link_verify` consumes the token atomically
+//   (`UPDATE … SET consumed_at = now WHERE consumed_at IS NULL AND expires_at > now
+//   RETURNING …`), so a second verify (or an expired/consumed/unknown token) all
+//   return the SAME generic failure page — no oracle.
+// - Non-enumerating: `POST /login/magic` always renders the same "check your
+//   email" response whether or not the address exists.
+// - Rate-limited per-IP by the `#[throttle]` guard and per-email by a DB cooldown.
+// - `magic_link_verify` rotates the session id BEFORE establishing the
+//   authenticated session (session-fixation defense).
+
+/// Configurable magic-link token TTL, in minutes. Default 15 (AC5: ≤ 15 min).
+///
+/// This is the knob to tune the link lifetime. To source it from configuration
+/// instead, read it from `state.config()` (see docs/guide/authentication.md).
+const MAGIC_LINK_TTL_MINUTES: i64 = 15;
+
+/// Per-email cooldown, in seconds. `POST /login/magic` skips minting a fresh
+/// token when an unexpired, unconsumed token was issued for the account within
+/// this window — throttling email-bombing a single address even from rotating
+/// IPs (the per-IP limit is enforced by `#[throttle]`).
+const MAGIC_LINK_EMAIL_COOLDOWN_SECONDS: i64 = 60;
+
+#[derive(Deserialize)]
+pub struct MagicLinkRequestForm {
+    pub email: String,
+}
+
+/// `GET /login/magic` — render the magic-link request form.
+#[get("/login/magic")]
+pub async fn magic_link_request_form(
+    csrf: Option<CsrfToken>,
+    csrf_field: Option<CsrfFormField>,
+) -> AutumnResult<Markup> {
+    Ok(layout("Sign in with a magic link", html! {
+        h1 { "Sign in with a magic link" }
+        p { "Enter your email and we'll send you a one-time sign-in link — no password required." }
+        form action="/login/magic" method="post" {
+            @if let Some(ref csrf) = csrf { input type="hidden" name=(csrf_field.as_ref().map_or("_csrf", |f| f.0.as_str())) value=(csrf.token()); }
+            div {
+                label { "Email" }
+                input type="email" name="email" required autocomplete="email";
+            }
+            button type="submit" { "Email me a link" }
+        }
+        p { a href="/login" { "Back to login" } }
+    }))
+}
+
+/// `POST /login/magic` — mint a token (only if the account exists) and email a
+/// sign-in link.
+///
+/// Non-enumerating (AC2): always returns the same "check your email" page
+/// whether or not the address is registered. Per-IP rate limiting is enforced
+/// by the `#[throttle]` guard (autumn's existing rate-limit middleware); a
+/// per-email DB cooldown (AC6) throttles email-bombing one address.
+#[post("/login/magic")]
+#[throttle(limit = 5, per = "1m", key = "ip")]
+pub async fn magic_link_request(
+    mut db: Db,
+    mailer: Mailer,
+    Form(form): Form<MagicLinkRequestForm>,
+) -> AutumnResult<Markup> {
+    // Fail fast when mail is not configured. This is independent of the address
+    // lookup, so it leaks nothing about which addresses exist.
+    if mailer.is_disabled() {
+        return Err(AutumnError::internal_server_error_msg(
+            "Magic-link login requires mail to be configured. \
+             Set [mail] transport in autumn.toml (e.g. transport = \"log\" for dev). \
+             The magic-link feature is unavailable until mail is set up.",
+        ));
+    }
+
+    let email = form.email.trim().to_lowercase();
+    let now = chrono::Utc::now().naive_utc();
+    // Record start time; the response is padded to a constant minimum below so
+    // an attacker cannot infer registration status from response latency.
+    let t0 = std::time::Instant::now();
+
+    // Non-enumerating: silently skip unknown addresses. Only confirmed accounts
+    // may receive a link — an unconfirmed account must confirm its email first.
+    let maybe___SNAKE__: Option<__PASCAL__> = __TABLE__::table
+        .filter(__TABLE__::email.eq(&email))
+        .filter(__TABLE__::email_confirmed_at.is_not_null())
+        .select(__PASCAL__::as_select())
+        .first(&mut *db)
+        .await
+        .ok();
+
+    if let Some(__SNAKE__) = maybe___SNAKE__ {
+        // Per-email cooldown (AC6): skip re-minting when an unexpired,
+        // unconsumed token was issued for this account within the window.
+        let cooldown_start = now - chrono::Duration::seconds(MAGIC_LINK_EMAIL_COOLDOWN_SECONDS);
+        let recent: i64 = magic_link_tokens::table
+            .filter(magic_link_tokens::user_id.eq(__SNAKE__.id))
+            .filter(magic_link_tokens::consumed_at.is_null())
+            .filter(magic_link_tokens::expires_at.gt(now))
+            .filter(magic_link_tokens::created_at.gt(cooldown_start))
+            .count()
+            .get_result(&mut *db)
+            .await
+            .unwrap_or(0);
+
+        if recent == 0 {
+            // Reuse the reset-token generator: 32-byte OsRng hex. Only the
+            // SHA-256 digest is stored; the raw token appears only in the link.
+            let raw_token = generate_reset_token();
+            let token_digest = sha256_hex(&raw_token);
+            let expires_at = now + chrono::Duration::minutes(MAGIC_LINK_TTL_MINUTES);
+            let new_token = NewMagicLinkToken {
+                user_id: __SNAKE__.id,
+                token_digest,
+                expires_at,
+                consumed_at: None,
+            };
+            // Persist the digest, then email the raw link. A mail failure is
+            // logged but never surfaced (stays non-enumerating).
+            if let Err(e) = diesel::insert_into(magic_link_tokens::table)
+                .values(&new_token)
+                .execute(&mut *db)
+                .await
+            {
+                tracing::error!("magic-link token insert failed: {e}");
+            } else if let Err(e) = send_magic_link_email(&mailer, &__SNAKE__.email, &raw_token).await {
+                tracing::error!("magic-link email failed: {e}");
+            }
+        }
+    }
+
+    // Pad to a constant minimum so hit and miss paths are timing-indistinguishable.
+    if let Some(remaining) = std::time::Duration::from_secs(1).checked_sub(t0.elapsed()) {
+        tokio::time::sleep(remaining).await;
+    }
+
+    Ok(layout("Check Your Email", html! {
+        h1 { "Check Your Email" }
+        p {
+            "If that address is registered, a one-time sign-in link is on its way. \
+             The link expires shortly and can be used only once."
+        }
+        p { a href="/login" { "Back to login" } }
+    }))
+}
+
+#[derive(Deserialize)]
+pub struct MagicLinkVerifyQuery {
+    pub token: String,
+}
+
+/// Generic magic-link failure page. Expired, consumed, unknown, and malformed
+/// tokens ALL render this identical page so nothing acts as an oracle (AC5).
+fn magic_link_invalid_page() -> Markup {
+    layout("Sign-in link invalid", html! {
+        h1 { "This sign-in link is invalid or has expired" }
+        p { "Magic sign-in links can be used once and expire quickly. Please request a new one." }
+        p { a href="/login/magic" { "Request a new link" } }
+        p { a href="/login" { "Back to login" } }
+    })
+}
+
+/// `GET /login/magic/verify?token=…` — validate the token and, on success,
+/// establish an authenticated session.
+///
+/// Single-use (AC5): an atomic `UPDATE … RETURNING` stamps `consumed_at` while
+/// filtering on `consumed_at IS NULL` and `expires_at > now`, so a second
+/// verify of the same token — or an expired / consumed / unknown token — matches
+/// zero rows and is rejected with the SAME generic failure (no oracle).
+#[get("/login/magic/verify")]
+pub async fn magic_link_verify(
+    mut db: Db,
+    State(state): State<AppState>,
+    session: Session,
+    MaybeClientIp(addr_ip): MaybeClientIp,
+    headers: axum::http::HeaderMap,
+    Query(query): Query<MagicLinkVerifyQuery>,
+) -> AutumnResult<Response> {
+    let token_digest = sha256_hex(&query.token);
+    let now = chrono::Utc::now().naive_utc();
+
+    // Atomic single-use consume. Only one concurrent verify can match.
+    let consumed: MagicLinkToken = match diesel::update(
+        magic_link_tokens::table
+            .filter(magic_link_tokens::token_digest.eq(&token_digest))
+            .filter(magic_link_tokens::consumed_at.is_null())
+            .filter(magic_link_tokens::expires_at.gt(now)),
+    )
+    .set(magic_link_tokens::consumed_at.eq(Some(now)))
+    .returning(MagicLinkToken::as_returning())
+    .get_result(&mut *db)
+    .await
+    {
+        Ok(row) => row,
+        // Expired / consumed / unknown all land here → identical generic failure.
+        Err(_) => return Ok(magic_link_invalid_page().into_response()),
+    };
+
+    // Load the account the token belongs to; a vanished account fails generically.
+    let Ok(__SNAKE__) = __TABLE__::table
+        .find(consumed.user_id)
+        .select(__PASCAL__::as_select())
+        .first::<__PASCAL__>(&mut *db)
+        .await
+    else {
+        return Ok(magic_link_invalid_page().into_response());
+    };
+
+    // This browser may already hold a tracked session for another account. The
+    // rotation below destroys that session id, so drop its row now.
+    untrack_current_session(&mut db, &session).await?;
+
+    // Rotate the session id BEFORE inserting the authenticated session id
+    // (session-fixation defense, consistent with login/reset/confirm).
+    session.rotate_id().await;
+    // Magic-link proves EMAIL POSSESSION, not password knowledge. Like
+    // `confirm_email`, it MUST NOT call `set_last_strong_auth_at`: doing so
+    // would let an emailed link grant password-grade step-up (sudo) freshness.
+    // Drop any step-up claim carried over from a previous login in this browser.
+    session.remove(autumn_web::step_up::STEP_UP_SESSION_KEY).await;
+    session.insert("__SNAKE___id", __SNAKE__.id.to_string()).await;
+    session.insert("__SNAKE___email", &__SNAKE__.email).await;
+    // Use the same session key checked by `#[secured]` / `#[authorize]`.
+    session.insert(state.auth_session_key(), __SNAKE__.id.to_string()).await;
+    // Track this login as an active session (device list + revocation).
+    record_login_session(&mut db, &session, __SNAKE__.id, addr_ip, &headers).await?;
+
+    Ok(redirect_to("/account"))
+}
+
+/// Send a passwordless magic-link email via the Autumn mailer.
+///
+/// Goes through the standard `Mail` builder so it inherits dev-mailbox preview,
+/// suppression-list gating, and templating (AC7). Suppression is intentionally
+/// NOT bypassed (`.ignore_suppression()` is not called).
+async fn send_magic_link_email(mailer: &Mailer, to: &str, token: &str) -> AutumnResult<()> {
+    // APP_BASE_URL must be the public URL of your app (e.g. https://example.com).
+    let base_url = std::env::var("APP_BASE_URL")
+        .unwrap_or_else(|_| "http://localhost:3000".to_owned());
+    let verify_url = format!("{base_url}/login/magic/verify?token={token}");
+    let mail = Mail::builder()
+        .to(to.to_owned())
+        .subject("Your sign-in link")
+        .html(html! {
+            p { "Click the link below to sign in. No password required." }
+            p { "This link expires in " (MAGIC_LINK_TTL_MINUTES) " minutes and can be used once." }
+            p { a href=(&verify_url) { "Sign in" } }
+            p { "If you did not request this, you can safely ignore this email." }
+        })
+        .text(format!(
+            "Sign in: {verify_url}\n\
+             This link expires in {MAGIC_LINK_TTL_MINUTES} minutes and can be used once.\n\
+             If you did not request this you can safely ignore this email."
+        ))
+        .build()
+        .map_err(|e| {
+            AutumnError::internal_server_error_msg(format!(
+                "Failed to build magic-link email: {e}"
+            ))
+        })?;
+    mailer.send(mail).await.map_err(|e| {
+        AutumnError::internal_server_error_msg(format!(
+            "Failed to send magic-link email: {e}"
+        ))
+    })
+}
+"#;
+    TPL.replace("__PASCAL__", pascal_name)
+        .replace("__SNAKE__", snake_name)
+        .replace("__TABLE__", table)
+}
+
 /// Markdown appended to `docs/guide/authentication.md` under `--totp`.
 const TOTP_DOCS_SECTION: &str = r#"## Two-Factor Authentication (TOTP)
 
@@ -8356,6 +8896,70 @@ the key invalidates existing enrollments.
 - **Rate-limiting / lockout** on repeated failed second-factor attempts is not
   included — add it before exposing 2FA to untrusted traffic.
 - WebAuthn / passkeys and SMS/email OTP are separate tracks.
+
+"#;
+
+/// Markdown appended to `docs/guide/authentication.md` under `--magic-link`.
+const MAGIC_LINK_DOCS_SECTION: &str = r#"## Passwordless Magic-Link Login
+
+Generated with `--magic-link` (issue #1328). Users can sign in with a one-time
+link emailed to their address — no password required. The flow is composable
+with `--oauth`, `--passkeys`, and `--totp` on the same model.
+
+### Routes
+
+| Method | Path | Handler | Auth |
+|--------|------|---------|------|
+| GET | `/login/magic` | `magic_link_request_form` | Public |
+| POST | `/login/magic` | `magic_link_request` | Public (rate-limited) |
+| GET | `/login/magic/verify?token=…` | `magic_link_verify` | Public |
+
+### How It Works
+
+1. The user submits their email to `POST /login/magic`.
+2. **If** the address belongs to a confirmed account, a random 32-byte token is
+   generated; only its SHA-256 digest, an expiry, and a `consumed_at` marker are
+   persisted in `magic_link_tokens`. The raw token is placed only in the emailed
+   verify link.
+3. The response is **always** the same "check your email" page whether or not the
+   address exists — so the endpoint cannot be used to enumerate accounts.
+4. The user clicks the link (`GET /login/magic/verify?token=…`). The token is
+   validated and atomically consumed; on success the session id is **rotated**
+   (session-fixation defense) and an authenticated session is established.
+
+### Configuration Knobs
+
+| Knob | Location | Default | Purpose |
+|------|----------|---------|---------|
+| `MAGIC_LINK_TTL_MINUTES` | const in `src/routes/auth.rs` | `15` | Link lifetime (TTL). Must be ≤ 15 min for a tight window; tune here, or wire it to `state.config()` to source from `autumn.toml`. |
+| `MAGIC_LINK_EMAIL_COOLDOWN_SECONDS` | const in `src/routes/auth.rs` | `60` | Per-email cooldown: suppresses re-minting a token for the same address within the window (email-bomb throttle). |
+| `#[throttle(limit = 5, per = "1m", key = "ip")]` | attribute on `POST /login/magic` | 5/min/IP | Per-IP rate limit via autumn's existing rate-limit middleware. |
+
+### Security Guarantees
+
+- **No account enumeration**: `POST /login/magic` returns an identical response
+  (and constant-time-padded latency) whether or not the address is registered.
+- **Digest-only storage**: only `sha256_hex(raw_token)` is stored; the raw token
+  lives only in the emailed link, never in the database, logs, or error reports.
+- **Single-use**: `magic_link_verify` consumes the token atomically
+  (`UPDATE … SET consumed_at = now WHERE consumed_at IS NULL AND expires_at > now`),
+  so a second verify of the same token fails.
+- **Generic failure (no oracle)**: expired, already-consumed, unknown, and
+  malformed tokens all render the same generic failure page.
+- **Configurable TTL**: tokens expire after `MAGIC_LINK_TTL_MINUTES` (default 15).
+- **Rate-limited**: per-IP (`#[throttle]`) and per-email (DB cooldown).
+- **Session-fixation defense**: the session id is rotated before the
+  authenticated session is established.
+- **Not a step-up factor**: magic-link proves email possession, not password
+  knowledge, so it does **not** stamp the step-up (sudo-mode) claim — `#[step_up]`
+  routes still require a fresh password reauth, consistent with email confirmation.
+- **Mailer integration**: the link is sent through the standard `Mail` builder,
+  inheriting dev-mailbox preview, suppression-list gating, and templating.
+
+### Not Included
+
+SMS/OTP, remember-device, and magic-link as a second factor are out of scope for
+this scaffold.
 
 "#;
 
@@ -9796,6 +10400,472 @@ mod tests {
         );
     }
 
+    // ── Magic-link login (issue #1328) ───────────────────────────────────────
+
+    /// Build a `--magic-link` plan (no oauth/totp/passkeys) over a fresh project.
+    fn magic_link_plan(path: &std::path::Path) -> Plan {
+        plan_auth_full_ex2(
+            path,
+            "User",
+            "20260508000000",
+            &AuthOAuthOptions::default(),
+            false,
+            false,
+            true,
+        )
+        .unwrap()
+    }
+
+    /// Execute a `--magic-link` plan and return the generated `routes/auth.rs`.
+    fn magic_link_routes(path: &std::path::Path) -> String {
+        magic_link_plan(path).execute(Flags::default()).unwrap();
+        fs::read_to_string(path.join("src/routes/auth.rs")).unwrap()
+    }
+
+    #[test]
+    fn magic_link_emits_request_email_verify_routes() {
+        let tmp = project_with_main();
+        let routes = magic_link_routes(tmp.path());
+        assert!(
+            routes.contains("#[get(\"/login/magic\")]"),
+            "must emit GET /login/magic request form: {routes}"
+        );
+        assert!(
+            routes.contains("#[post(\"/login/magic\")]"),
+            "must emit POST /login/magic request endpoint"
+        );
+        assert!(
+            routes.contains("#[get(\"/login/magic/verify\")]"),
+            "must emit GET /login/magic/verify endpoint"
+        );
+    }
+
+    #[test]
+    fn magic_link_post_route_is_throttled_per_ip() {
+        let tmp = project_with_main();
+        let routes = magic_link_routes(tmp.path());
+        // Method attribute outermost, #[throttle] inner, per the macro contract.
+        let post_pos = routes
+            .find("#[post(\"/login/magic\")]")
+            .expect("post attr present");
+        let after = &routes[post_pos..];
+        let throttle_rel = after.find("#[throttle(").expect("throttle attr present");
+        let handler_rel = after
+            .find("pub async fn magic_link_request(")
+            .expect("handler present");
+        assert!(
+            throttle_rel < handler_rel,
+            "#[throttle] must sit between #[post] and the handler (method attr outermost)"
+        );
+        assert!(
+            after[..handler_rel].contains("key = \"ip\""),
+            "throttle must key on ip for per-IP rate limiting"
+        );
+    }
+
+    #[test]
+    fn magic_link_request_is_non_enumerating() {
+        let tmp = project_with_main();
+        let routes = magic_link_routes(tmp.path());
+        let start = routes
+            .find("pub async fn magic_link_request(")
+            .expect("request handler");
+        let end = routes[start..]
+            .find("pub async fn magic_link_verify(")
+            .map_or(routes.len(), |o| start + o);
+        let body = &routes[start..end];
+        // Minting only happens inside the account-exists branch.
+        assert!(
+            body.contains("if let Some(user)"),
+            "token minting must be gated on the account existing: {body}"
+        );
+        // The final response is the same shared page regardless of existence.
+        assert!(
+            body.contains("If that address is registered"),
+            "must render the same non-enumerating check-your-email response: {body}"
+        );
+        // Constant-time padding so hit/miss are latency-indistinguishable.
+        assert!(
+            body.contains("tokio::time::sleep"),
+            "request handler must pad response time to avoid a timing oracle"
+        );
+    }
+
+    #[test]
+    fn magic_link_stores_only_token_digest() {
+        let tmp = project_with_main();
+        let routes = magic_link_routes(tmp.path());
+        assert!(
+            routes.contains("let token_digest = sha256_hex(&raw_token);"),
+            "only the SHA-256 digest of the raw token may be stored"
+        );
+        // The migration stores a digest column, never a raw-token column.
+        let up = fs::read_to_string(
+            tmp.path()
+                .join("migrations/20260508000000_create_users/up.sql"),
+        )
+        .unwrap();
+        assert!(
+            up.contains("token_digest TEXT NOT NULL UNIQUE"),
+            "magic_link_tokens must persist a unique token_digest: {up}"
+        );
+        assert!(
+            !up.contains("raw_token"),
+            "the raw token must never be a persisted column"
+        );
+    }
+
+    #[test]
+    fn magic_link_verify_does_not_stamp_step_up() {
+        let tmp = project_with_main();
+        let routes = magic_link_routes(tmp.path());
+        let start = routes
+            .find("pub async fn magic_link_verify(")
+            .expect("verify handler");
+        let end = routes[start..]
+            .find("async fn send_magic_link_email(")
+            .map(|o| start + o)
+            .expect("mailer helper follows verify");
+        let body = &routes[start..end];
+        // The explanatory comment mentions the name, so assert on the actual
+        // CALL form (with the `step_up::` path + open paren), not the bare name.
+        assert!(
+            !body.contains("step_up::set_last_strong_auth_at("),
+            "magic-link verify must NOT stamp step-up (proves email possession, \
+             not password knowledge): {body}"
+        );
+    }
+
+    #[test]
+    fn magic_link_verify_rotates_session_before_auth() {
+        let tmp = project_with_main();
+        let routes = magic_link_routes(tmp.path());
+        let start = routes
+            .find("pub async fn magic_link_verify(")
+            .expect("verify handler");
+        let end = routes[start..]
+            .find("async fn send_magic_link_email(")
+            .map(|o| start + o)
+            .expect("mailer helper follows verify");
+        let body = &routes[start..end];
+        let rotate = body
+            .find("session.rotate_id().await")
+            .expect("rotate present");
+        let auth_insert = body
+            .find("session.insert(state.auth_session_key()")
+            .expect("auth key insert present");
+        assert!(
+            rotate < auth_insert,
+            "session must be rotated BEFORE the authenticated session id is set \
+             (session-fixation defense)"
+        );
+    }
+
+    #[test]
+    fn magic_link_verify_is_single_use_and_generic_failure() {
+        let tmp = project_with_main();
+        let routes = magic_link_routes(tmp.path());
+        // Atomic consume: stamp consumed_at while filtering unconsumed + unexpired.
+        assert!(
+            routes.contains("magic_link_tokens::consumed_at.is_null()")
+                && routes.contains("magic_link_tokens::consumed_at.eq(Some(now))"),
+            "verify must atomically consume the token (single-use)"
+        );
+        // Expired/consumed/unknown all funnel to one generic failure page.
+        assert!(
+            routes.contains("fn magic_link_invalid_page()"),
+            "a single generic failure page must exist (no oracle)"
+        );
+    }
+
+    #[test]
+    fn magic_link_verify_accepts_query_token() {
+        let tmp = project_with_main();
+        let routes = magic_link_routes(tmp.path());
+        assert!(
+            routes.contains("pub struct MagicLinkVerifyQuery")
+                && routes.contains("Query(query): Query<MagicLinkVerifyQuery>"),
+            "verify must read the token from the ?token= query parameter (AC4)"
+        );
+    }
+
+    #[test]
+    fn magic_link_ttl_default_is_at_most_15_minutes() {
+        let tmp = project_with_main();
+        let routes = magic_link_routes(tmp.path());
+        assert!(
+            routes.contains("const MAGIC_LINK_TTL_MINUTES: i64 = 15;"),
+            "default TTL must be a documented const ≤ 15 minutes: {routes}"
+        );
+    }
+
+    #[test]
+    fn magic_link_email_goes_through_mail_builder_without_suppression_bypass() {
+        let tmp = project_with_main();
+        let routes = magic_link_routes(tmp.path());
+        assert!(
+            routes.contains("async fn send_magic_link_email(")
+                && routes.contains("Mail::builder()")
+                && routes.contains("/login/magic/verify?token="),
+            "the link must be sent via the Mail builder with a verify URL"
+        );
+        let start = routes
+            .find("async fn send_magic_link_email(")
+            .expect("mailer helper");
+        let body = &routes[start..];
+        assert!(
+            !body.contains("ignore_suppression"),
+            "magic-link email must inherit suppression-list gating (AC7)"
+        );
+    }
+
+    #[test]
+    fn magic_link_migration_creates_dedicated_table() {
+        let tmp = project_with_main();
+        magic_link_plan(tmp.path())
+            .execute(Flags::default())
+            .unwrap();
+        let up = fs::read_to_string(
+            tmp.path()
+                .join("migrations/20260508000000_create_users/up.sql"),
+        )
+        .unwrap();
+        assert!(
+            up.contains("CREATE TABLE magic_link_tokens"),
+            "must create a dedicated magic_link_tokens table: {up}"
+        );
+        assert!(
+            up.contains("consumed_at TIMESTAMP NULL")
+                && up.contains("expires_at TIMESTAMP NOT NULL"),
+            "table must carry single-use consumed_at + expiry columns"
+        );
+        let down = fs::read_to_string(
+            tmp.path()
+                .join("migrations/20260508000000_create_users/down.sql"),
+        )
+        .unwrap();
+        assert!(
+            down.contains("DROP TABLE magic_link_tokens;"),
+            "down migration must drop the table (clean reverse): {down}"
+        );
+        let schema = fs::read_to_string(tmp.path().join("src/schema.rs")).unwrap();
+        assert!(
+            schema.contains("magic_link_tokens (id)"),
+            "schema.rs must declare the magic_link_tokens table: {schema}"
+        );
+    }
+
+    #[test]
+    fn magic_link_model_file_created() {
+        let tmp = project_with_main();
+        magic_link_plan(tmp.path())
+            .execute(Flags::default())
+            .unwrap();
+        let model = fs::read_to_string(tmp.path().join("src/models/magic_link_token.rs")).unwrap();
+        assert!(
+            model.contains("pub struct MagicLinkToken")
+                && model.contains("pub token_digest: String")
+                && model.contains("pub consumed_at: Option<chrono::NaiveDateTime>"),
+            "magic_link_token model must mirror the reset-token invariants: {model}"
+        );
+        let model_mod = fs::read_to_string(tmp.path().join("src/models/mod.rs")).unwrap();
+        assert!(
+            model_mod.contains("magic_link_token"),
+            "models/mod.rs must declare the module"
+        );
+    }
+
+    #[test]
+    fn magic_link_routes_registered_in_main() {
+        let tmp = project_with_main();
+        magic_link_plan(tmp.path())
+            .execute(Flags::default())
+            .unwrap();
+        let main = fs::read_to_string(tmp.path().join("src/main.rs")).unwrap();
+        for handler in [
+            "routes::auth::magic_link_request_form",
+            "routes::auth::magic_link_request",
+            "routes::auth::magic_link_verify",
+        ] {
+            assert!(
+                main.contains(handler),
+                "main.rs must register {handler}: {main}"
+            );
+        }
+    }
+
+    #[test]
+    fn magic_link_adds_login_page_link() {
+        let tmp = project_with_main();
+        let routes = magic_link_routes(tmp.path());
+        assert!(
+            routes.contains("Email me a magic sign-in link"),
+            "login page must link to /login/magic when --magic-link is set"
+        );
+    }
+
+    #[test]
+    fn magic_link_docs_document_ttl_ratelimit_enumeration_and_single_use() {
+        let tmp = project_with_main();
+        magic_link_plan(tmp.path())
+            .execute(Flags::default())
+            .unwrap();
+        let docs = fs::read_to_string(tmp.path().join("docs/guide/authentication.md")).unwrap();
+        assert!(
+            docs.contains("Passwordless Magic-Link Login"),
+            "docs section"
+        );
+        assert!(
+            docs.contains("MAGIC_LINK_TTL_MINUTES"),
+            "docs must document the TTL knob"
+        );
+        assert!(
+            docs.contains("#[throttle(") && docs.contains("MAGIC_LINK_EMAIL_COOLDOWN_SECONDS"),
+            "docs must document per-IP + per-email rate limiting"
+        );
+        assert!(
+            docs.contains("enumerat"),
+            "docs must document the no-enumeration guarantee"
+        );
+        assert!(
+            docs.contains("Single-use")
+                || docs.contains("single-use")
+                || docs.contains("used once"),
+            "docs must document the single-use guarantee"
+        );
+    }
+
+    #[test]
+    fn magic_link_emits_ignored_live_db_test() {
+        let tmp = project_with_main();
+        magic_link_plan(tmp.path())
+            .execute(Flags::default())
+            .unwrap();
+        let tests = fs::read_to_string(tmp.path().join("tests/auth.rs")).unwrap();
+        assert!(
+            tests.contains("fn magic_link_request_and_consume_logs_in()")
+                && tests.contains("#[ignore"),
+            "an #[ignore]d live-DB magic-link test must be emitted (AC7): {tests}"
+        );
+    }
+
+    #[test]
+    fn without_magic_link_nothing_is_emitted() {
+        let tmp = project_with_main();
+        // Every optional flag OFF.
+        plan_auth(tmp.path(), "User", "20260508000000")
+            .unwrap()
+            .execute(Flags::default())
+            .unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/auth.rs")).unwrap();
+        assert!(
+            !routes.contains("/login/magic"),
+            "no magic-link routes without --magic-link"
+        );
+        assert!(
+            !routes.contains("MagicLinkToken"),
+            "no magic-link model references without --magic-link"
+        );
+        let up = fs::read_to_string(
+            tmp.path()
+                .join("migrations/20260508000000_create_users/up.sql"),
+        )
+        .unwrap();
+        assert!(
+            !up.contains("magic_link_tokens"),
+            "no magic_link_tokens table without --magic-link"
+        );
+        let main = fs::read_to_string(tmp.path().join("src/main.rs")).unwrap();
+        assert!(
+            !main.contains("magic_link"),
+            "no magic-link routes registered without --magic-link"
+        );
+        assert!(
+            !tmp.path().join("src/models/magic_link_token.rs").exists(),
+            "no magic-link model file without --magic-link"
+        );
+        let docs = fs::read_to_string(tmp.path().join("docs/guide/authentication.md")).unwrap();
+        assert!(
+            !docs.contains("Magic-Link"),
+            "no magic-link docs without --magic-link"
+        );
+    }
+
+    #[test]
+    fn magic_link_composes_with_totp_passkeys_and_oauth() {
+        let tmp = project_with_main();
+        fs::write(tmp.path().join("Cargo.toml"), template_shipped_cargo_toml()).unwrap();
+        fs::write(tmp.path().join("autumn.toml"), "[server]\nport = 3000\n").unwrap();
+        let oauth = AuthOAuthOptions {
+            providers: vec!["github".to_owned()],
+        };
+        plan_auth_full_ex2(
+            tmp.path(),
+            "User",
+            "20260508000000",
+            &oauth,
+            true,
+            true,
+            true,
+        )
+        .unwrap()
+        .execute(Flags::default())
+        .unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/auth.rs")).unwrap();
+        // Magic-link, TOTP, and password flows all coexist in auth.rs.
+        assert!(
+            routes.contains("#[get(\"/login/magic/verify\")]"),
+            "magic-link present"
+        );
+        assert!(
+            routes.contains("Two-factor authentication (TOTP)"),
+            "totp present"
+        );
+        // Passkeys and OAuth live in their own route files.
+        assert!(
+            tmp.path().join("src/routes/passkeys.rs").exists(),
+            "passkeys present"
+        );
+        assert!(
+            tmp.path().join("src/routes/oauth.rs").exists(),
+            "oauth present"
+        );
+        assert!(
+            tmp.path().join("src/models/magic_link_token.rs").exists(),
+            "magic-link model present alongside the others"
+        );
+    }
+
+    #[test]
+    fn generate_then_destroy_auth_with_magic_link_round_trips_to_original_project_state() {
+        let tmp = project_with_main();
+        let cargo_path = tmp.path().join("Cargo.toml");
+        fs::write(&cargo_path, template_shipped_cargo_toml()).unwrap();
+        let main_path = tmp.path().join("src/main.rs");
+        let original_cargo = fs::read_to_string(&cargo_path).unwrap();
+        let original_main = fs::read_to_string(&main_path).unwrap();
+
+        magic_link_plan(tmp.path())
+            .execute(Flags::default())
+            .unwrap();
+        assert!(tmp.path().join("src/models/magic_link_token.rs").exists());
+        assert!(
+            fs::read_to_string(tmp.path().join("src/schema.rs"))
+                .unwrap()
+                .contains("magic_link_tokens")
+        );
+
+        magic_link_plan(tmp.path())
+            .revert(Flags::default())
+            .unwrap();
+        assert!(!tmp.path().join("src/models").exists());
+        assert!(!tmp.path().join("src/routes").exists());
+        assert!(!tmp.path().join("src/schema.rs").exists());
+        assert!(!tmp.path().join("migrations").exists());
+        assert_eq!(fs::read_to_string(&main_path).unwrap(), original_main);
+        assert_eq!(fs::read_to_string(&cargo_path).unwrap(), original_cargo);
+    }
+
     // ── Plan structure ──────────────────────────────────────────────────────
 
     #[test]
@@ -10186,7 +11256,7 @@ mod tests {
 
     #[test]
     fn routes_file_uses_configured_auth_session_key_for_policy_identity() {
-        let routes = render_routes_file("Account", "account", "accounts", &[], false);
+        let routes = render_routes_file("Account", "account", "accounts", &[], false, false);
         assert!(
             routes.contains("State(state): State<AppState>"),
             "auth routes must receive AppState: {routes}"
@@ -10304,7 +11374,7 @@ mod tests {
 
     #[test]
     fn routes_file_has_change_password_and_email_handlers() {
-        let routes = render_routes_file("User", "user", "users", &[], false);
+        let routes = render_routes_file("User", "user", "users", &[], false, false);
         for needle in [
             "pub async fn change_password_form(",
             "pub async fn change_password(",
@@ -10336,7 +11406,7 @@ mod tests {
 
     #[test]
     fn change_password_post_carries_secured_and_step_up() {
-        let routes = render_routes_file("User", "user", "users", &[], false);
+        let routes = render_routes_file("User", "user", "users", &[], false, false);
         let pos = routes
             .find("pub async fn change_password(")
             .expect("change_password handler missing");
@@ -10360,7 +11430,7 @@ mod tests {
 
     #[test]
     fn change_email_post_carries_secured_and_step_up() {
-        let routes = render_routes_file("User", "user", "users", &[], false);
+        let routes = render_routes_file("User", "user", "users", &[], false, false);
         let pos = routes
             .find("pub async fn change_email(")
             .expect("change_email handler missing");
@@ -10382,7 +11452,7 @@ mod tests {
 
     #[test]
     fn change_password_verifies_current_rotates_and_revokes_others() {
-        let routes = render_routes_file("User", "user", "users", &[], false);
+        let routes = render_routes_file("User", "user", "users", &[], false, false);
         let body = handler_body(&routes, "change_password");
         assert!(
             body.contains("verify_password("),
@@ -10418,7 +11488,7 @@ mod tests {
 
     #[test]
     fn change_password_wrong_current_returns_422_and_no_update() {
-        let routes = render_routes_file("User", "user", "users", &[], false);
+        let routes = render_routes_file("User", "user", "users", &[], false, false);
         let body = handler_body(&routes, "change_password");
         // Wrong current password re-renders the form via form_unprocessable (422)
         // and returns BEFORE any password_digest update.
@@ -10440,7 +11510,7 @@ mod tests {
 
     #[test]
     fn change_email_guards_disabled_mail_first_and_stores_pending() {
-        let routes = render_routes_file("User", "user", "users", &[], false);
+        let routes = render_routes_file("User", "user", "users", &[], false, false);
         let body = handler_body(&routes, "change_email");
         // Disabled-mail guard must come before the DB session lookup, mirroring
         // forgot_password — so it fires unconditionally.
@@ -10479,7 +11549,7 @@ mod tests {
 
     #[test]
     fn confirm_email_change_swaps_address_and_stamps_confirmed() {
-        let routes = render_routes_file("User", "user", "users", &[], false);
+        let routes = render_routes_file("User", "user", "users", &[], false, false);
         let body = handler_body(&routes, "confirm_email_change");
         assert!(
             body.contains("pending_email.is_not_null()"),
@@ -10511,7 +11581,7 @@ mod tests {
 
     #[test]
     fn account_page_links_to_change_password_and_email() {
-        let routes = render_routes_file("User", "user", "users", &[], false);
+        let routes = render_routes_file("User", "user", "users", &[], false, false);
         let body = handler_body(&routes, "account");
         assert!(
             body.contains(r#"href="/account/password""#),
@@ -10525,7 +11595,7 @@ mod tests {
 
     #[test]
     fn change_email_confirm_uses_secured_only_on_get_forms() {
-        let routes = render_routes_file("User", "user", "users", &[], false);
+        let routes = render_routes_file("User", "user", "users", &[], false, false);
         // The GET form pages are #[secured] but NOT #[step_up].
         for form_fn in ["change_password_form", "change_email_form"] {
             let pos = routes

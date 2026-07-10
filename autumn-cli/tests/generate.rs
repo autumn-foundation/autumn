@@ -3471,6 +3471,114 @@ fn generated_auth_passkeys_cargo_checks() {
     );
 }
 
+// ── autumn generate auth --magic-link (issue #1328) ───────────────────────────
+
+#[test]
+fn generate_auth_magic_link_creates_expected_files() {
+    let (_tmp, project) = fresh_project("auth-magic-link-app");
+    run_autumn(&project, &["generate", "auth", "User", "--magic-link"]);
+
+    // Migration: dedicated magic_link_tokens table with single-use marker.
+    let up = fs::read_to_string(
+        fs::read_dir(project.join("migrations"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .find(|e| e.file_name().to_string_lossy().ends_with("_create_users"))
+            .unwrap()
+            .path()
+            .join("up.sql"),
+    )
+    .unwrap();
+    assert!(up.contains("CREATE TABLE magic_link_tokens"));
+    assert!(up.contains("token_digest TEXT NOT NULL UNIQUE"));
+    assert!(up.contains("consumed_at TIMESTAMP NULL"));
+
+    // Model file + module declaration.
+    assert!(project.join("src/models/magic_link_token.rs").exists());
+    let mod_rs = fs::read_to_string(project.join("src/models/mod.rs")).unwrap();
+    assert!(mod_rs.contains("pub mod magic_link_token;"));
+
+    // Routes: request/email/verify handlers + throttle.
+    let routes = fs::read_to_string(project.join("src/routes/auth.rs")).unwrap();
+    for needle in [
+        "#[get(\"/login/magic\")]",
+        "#[post(\"/login/magic\")]",
+        "#[get(\"/login/magic/verify\")]",
+        "#[throttle(",
+        "pub async fn magic_link_verify",
+        "async fn send_magic_link_email",
+    ] {
+        assert!(routes.contains(needle), "routes/auth.rs missing: {needle}");
+    }
+
+    // Routes registered in main.rs.
+    let main = fs::read_to_string(project.join("src/main.rs")).unwrap();
+    assert!(main.contains("routes::auth::magic_link_verify"));
+
+    // Docs document the flow.
+    let docs = fs::read_to_string(project.join("docs/guide/authentication.md")).unwrap();
+    assert!(docs.contains("Passwordless Magic-Link Login"));
+}
+
+#[test]
+fn generate_auth_without_magic_link_emits_no_magic_link_artifacts() {
+    let (_tmp, project) = fresh_project("auth-no-magic-link-app");
+    run_autumn(&project, &["generate", "auth", "User"]);
+    assert!(!project.join("src/models/magic_link_token.rs").exists());
+    let routes = fs::read_to_string(project.join("src/routes/auth.rs")).unwrap();
+    assert!(!routes.contains("/login/magic"));
+}
+
+/// Slow: scaffold `generate auth --magic-link` and `cargo check --tests` the
+/// result against the local `autumn-web` crate, proving the generated
+/// magic-link app and its test suite type-check with zero edits (issue #1328).
+#[test]
+#[ignore = "slow: cargo-checks a fresh project — run with `cargo test -p autumn-cli -- --ignored`"]
+fn generated_auth_magic_link_cargo_checks() {
+    let (_tmp, project) = fresh_project("auth-magic-link-build");
+    patch_generated_cargo_toml(&project);
+
+    run_autumn(&project, &["generate", "auth", "User", "--magic-link"]);
+
+    let check = Command::new("cargo")
+        .args(["check", "--tests"])
+        .current_dir(&project)
+        .output()
+        .unwrap();
+    assert!(
+        check.status.success(),
+        "cargo check on generated --magic-link auth failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&check.stdout),
+        String::from_utf8_lossy(&check.stderr),
+    );
+}
+
+/// Slow: prove `--magic-link` composes with `--totp` in a single generated app
+/// that still type-checks (issue #1328 composability AC1).
+#[test]
+#[ignore = "slow: cargo-checks a fresh project — run with `cargo test -p autumn-cli -- --ignored`"]
+fn generated_auth_magic_link_with_totp_cargo_checks() {
+    let (_tmp, project) = fresh_project("auth-magic-totp-build");
+    patch_generated_cargo_toml(&project);
+
+    run_autumn(
+        &project,
+        &["generate", "auth", "User", "--totp", "--magic-link"],
+    );
+
+    let check = Command::new("cargo")
+        .args(["check", "--tests"])
+        .current_dir(&project)
+        .output()
+        .unwrap();
+    assert!(
+        check.status.success(),
+        "cargo check on generated --totp --magic-link auth failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&check.stdout),
+        String::from_utf8_lossy(&check.stderr),
+    );
+}
+
 /// Slow: scaffold `generate auth --totp` and `cargo check --tests` the result
 /// against the local `autumn-web` crate, proving the generated 2FA app and its
 /// test suite type-check with zero edits (issue #799 success metric).
