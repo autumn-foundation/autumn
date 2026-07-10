@@ -1153,9 +1153,8 @@ fn default_rate_limit_redis_key_prefix() -> String {
 ///
 /// The `crate::extract::Multipart` extractor validates uploaded file parts by
 /// their actual content (magic bytes), **not** the spoofable client-declared
-/// `Content-Type` header. When `allowed_mime_types` is non-empty, the sniffed
-/// type must be present in the list; files that are too short, empty, or of an
-/// unrecognized type (sniffed type is unknown) are rejected deterministically.
+/// `Content-Type` header. See `allowed_mime_types` for the exact sniffed →
+/// markup-guard → declared-fallback precedence used when a list is configured.
 #[derive(Debug, Clone, Deserialize)]
 pub struct UploadConfig {
     /// Maximum total multipart request body size in bytes.
@@ -1166,21 +1165,35 @@ pub struct UploadConfig {
     pub max_file_size_bytes: usize,
     /// Optional allowed MIME types (e.g. `["image/png", "image/jpeg"]`).
     ///
-    /// Enforced against the **sniffed** (magic-byte) content type, never the
-    /// client-declared header. A file whose content type cannot be recognized
-    /// (too short, empty, or unknown format) is rejected when this list is
-    /// non-empty.
+    /// Enforced primarily against the **sniffed** (magic-byte) content type,
+    /// never blindly against the client-declared header. Because `infer` only
+    /// recognizes binary formats, the check applies this precedence for each
+    /// file part when the list is non-empty:
+    ///
+    /// 1. **Sniffed type recognized** → it must appear in the list, else the
+    ///    upload is rejected (`400`). The declared header is ignored.
+    /// 2. **Unrecognized but looks like markup** (leading `<…` after a BOM /
+    ///    whitespace — HTML, SVG, XML) → always rejected (`400`), so scripts
+    ///    or `<svg onload=…>` can't ride in under a spoofed declared type.
+    /// 3. **Unrecognized and not markup** (genuine text such as `text/plain`,
+    ///    `application/json`, `text/csv`, which have no magic bytes) → falls
+    ///    back to the **declared** content-type essence (media type without
+    ///    parameters), which must appear in the list. This is the only case
+    ///    where the declared header is trusted, and only to disambiguate among
+    ///    signature-less text formats.
     #[serde(default)]
     pub allowed_mime_types: Vec<String>,
     /// When `true`, reject an uploaded file part if the client-declared
     /// `Content-Type` header disagrees with the sniffed (magic-byte) content
     /// type. Default: `false`.
     ///
-    /// Behavior when enabled:
+    /// Behavior when enabled (comparison uses the declared essence — the media
+    /// type without parameters):
     /// - declared and sniffed both known but differ → reject (`400`)
     /// - declared known but content unrecognized (sniffed unknown) → reject
     ///   (`400`, the declared type cannot be verified)
-    /// - no declared header → skip the mismatch check (nothing to compare)
+    /// - no declared header → reject (`400`); omitting `Content-Type` must not
+    ///   silently bypass the mismatch check
     ///
     /// This is independent of `allowed_mime_types`; both checks apply when set.
     #[serde(default)]

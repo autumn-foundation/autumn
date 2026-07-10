@@ -222,45 +222,31 @@ impl Multipart {
             }
         }
 
-        let declared = field.content_type().map(str::to_owned);
-        let sniffed = sniff_content_type(&prefix);
-
-        // Allow-list enforcement against the SNIFFED type. A file whose content
-        // cannot be recognized (short/empty/unknown → sniffed is None) is
-        // rejected when an allow-list is configured.
-        if !self.config.allowed_mime_types.is_empty() {
-            let allowed = sniffed.as_ref().is_some_and(|s| {
-                self.config
-                    .allowed_mime_types
-                    .iter()
-                    .any(|allowed| allowed.eq_ignore_ascii_case(s))
-            });
-            if !allowed {
-                return Err(crate::AutumnError::bad_request_msg(format!(
-                    "upload content type not allowed: sniffed={sniffed:?}"
-                )));
-            }
+        // Never buffer past the per-file cap while sniffing: a single leading
+        // chunk larger than the limit is already a size violation.
+        if prefix.len() > self.config.max_file_size_bytes {
+            return Err(file_too_large_error(self.config.max_file_size_bytes));
         }
 
-        // Strict mismatch mode: the declared header must match the sniffed type.
-        if self.config.reject_on_content_type_mismatch
-            && let Some(declared) = declared.as_deref()
-        {
-            match sniffed.as_deref() {
-                Some(sniffed) if declared.eq_ignore_ascii_case(sniffed) => {}
-                Some(sniffed) => {
-                    return Err(crate::AutumnError::bad_request_msg(format!(
-                        "declared content type {declared:?} does not match sniffed \
-                         content type {sniffed:?}"
-                    )));
-                }
-                None => {
-                    return Err(crate::AutumnError::bad_request_msg(format!(
-                        "cannot verify declared content type {declared:?}: \
-                         file content is unrecognized"
-                    )));
-                }
-            }
+        let declared = field.content_type().map(str::to_owned);
+        // Compare on the type ESSENCE (media type without parameters), so a
+        // header like `image/png; charset=binary` matches sniffed `image/png`.
+        let declared_essence = declared.as_deref().map(content_type_essence);
+        let sniffed = sniff_content_type(&prefix);
+
+        // Enforce the allow-list (sniffed → markup-guard → declared fallback)
+        // and, when enabled, strict declared-vs-sniffed matching. See the
+        // helpers below for the exact rules.
+        if !self.config.allowed_mime_types.is_empty() {
+            enforce_upload_allow_list(
+                &self.config.allowed_mime_types,
+                &prefix,
+                declared_essence,
+                sniffed.as_deref(),
+            )?;
+        }
+        if self.config.reject_on_content_type_mismatch {
+            enforce_content_type_match(declared_essence, sniffed.as_deref())?;
         }
 
         Ok(Some(MultipartField {
@@ -277,6 +263,115 @@ impl Multipart {
 #[cfg(feature = "multipart")]
 fn sniff_content_type(prefix: &[u8]) -> Option<String> {
     infer::get(prefix).map(|kind| kind.mime_type().to_owned())
+}
+
+/// The essence of a content-type header — the media type without any
+/// parameters (e.g. `image/png` from `image/png; charset=binary`).
+#[cfg(feature = "multipart")]
+fn content_type_essence(raw: &str) -> &str {
+    raw.split(';').next().unwrap_or("").trim()
+}
+
+/// Whether the leading bytes look like textual markup (`<…`), after skipping a
+/// UTF-8 BOM and any leading ASCII whitespace. Catches HTML (`<!DOCTYPE`,
+/// `<html`, `<script`), SVG (`<svg`), and XML (`<?xml`) that `infer` cannot
+/// recognize by magic bytes, so they can never be admitted via the declared
+/// content-type fallback.
+#[cfg(feature = "multipart")]
+fn prefix_looks_like_markup(prefix: &[u8]) -> bool {
+    let bytes = prefix.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(prefix);
+    let trimmed = bytes
+        .iter()
+        .position(|byte| !byte.is_ascii_whitespace())
+        .map_or(&[][..], |idx| &bytes[idx..]);
+    trimmed.first() == Some(&b'<')
+}
+
+/// Bound a content-type value before echoing it into an error message, so a
+/// hostile client can't inflate responses with an arbitrarily long header.
+#[cfg(feature = "multipart")]
+fn truncate_for_error(value: &str) -> String {
+    const MAX_CHARS: usize = 128;
+    value.chars().take(MAX_CHARS).collect()
+}
+
+/// Enforce a MIME allow-list against a file part, using content sniffing as the
+/// primary signal. `infer` only recognizes binary formats by magic bytes; text
+/// formats (text/plain, application/json, text/csv, image/svg+xml, …) have no
+/// signature and always sniff to `None`. Precedence:
+///
+/// 1. **Sniffed recognized** → must be in the list, else reject. Header ignored.
+/// 2. **Unrecognized + markup** (leading `<…`) → reject unconditionally, so
+///    HTML/SVG/XML can't ride in under a spoofed declared type.
+/// 3. **Unrecognized + not markup** (genuine signature-less text) → fall back to
+///    the declared essence, which must be in the list. This is the only case
+///    where the declared header is trusted.
+#[cfg(feature = "multipart")]
+fn enforce_upload_allow_list(
+    allowed: &[String],
+    prefix: &[u8],
+    declared_essence: Option<&str>,
+    sniffed: Option<&str>,
+) -> crate::AutumnResult<()> {
+    let in_list = |value: &str| {
+        allowed
+            .iter()
+            .any(|entry| entry.eq_ignore_ascii_case(value))
+    };
+    if let Some(sniffed) = sniffed {
+        if !in_list(sniffed) {
+            return Err(crate::AutumnError::bad_request_msg(format!(
+                "upload content type not allowed: sniffed={sniffed}"
+            )));
+        }
+    } else if prefix_looks_like_markup(prefix) {
+        return Err(crate::AutumnError::bad_request_msg(
+            "upload rejected: unrecognized file content looks like markup",
+        ));
+    } else {
+        match declared_essence {
+            Some(essence) if in_list(essence) => {}
+            Some(essence) => {
+                return Err(crate::AutumnError::bad_request_msg(format!(
+                    "upload content type not allowed: declared={}",
+                    truncate_for_error(essence)
+                )));
+            }
+            None => {
+                return Err(crate::AutumnError::bad_request_msg(
+                    "upload content type not allowed: no recognized or declared type",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Strict declared-vs-sniffed matching (`reject_on_content_type_mismatch`).
+/// Comparison is on the declared essence. Omitting the header is itself a
+/// failure — otherwise an attacker could bypass the check by sending no
+/// `Content-Type`.
+#[cfg(feature = "multipart")]
+fn enforce_content_type_match(
+    declared_essence: Option<&str>,
+    sniffed: Option<&str>,
+) -> crate::AutumnResult<()> {
+    let Some(declared_essence) = declared_essence else {
+        return Err(crate::AutumnError::bad_request_msg(
+            "content-type mismatch check enabled but the upload declared no content type",
+        ));
+    };
+    match sniffed {
+        Some(sniffed) if declared_essence.eq_ignore_ascii_case(sniffed) => Ok(()),
+        Some(sniffed) => Err(crate::AutumnError::bad_request_msg(format!(
+            "declared content type {} does not match sniffed content type {sniffed}",
+            truncate_for_error(declared_essence)
+        ))),
+        None => Err(crate::AutumnError::bad_request_msg(format!(
+            "cannot verify declared content type {}: file content is unrecognized",
+            truncate_for_error(declared_essence)
+        ))),
+    }
 }
 
 #[cfg(feature = "multipart")]
@@ -866,6 +961,32 @@ mod tests {
     fn sniff_content_type_unknown_is_none() {
         assert_eq!(sniff_content_type(&[0x01, 0x02]), None);
         assert_eq!(sniff_content_type(&[]), None);
+    }
+
+    #[test]
+    fn content_type_essence_strips_parameters() {
+        assert_eq!(
+            content_type_essence("image/png; charset=binary"),
+            "image/png"
+        );
+        assert_eq!(content_type_essence("  text/csv  "), "text/csv");
+        assert_eq!(content_type_essence("application/json"), "application/json");
+        assert_eq!(content_type_essence(""), "");
+    }
+
+    #[test]
+    fn prefix_looks_like_markup_detects_leading_angle_bracket() {
+        assert!(prefix_looks_like_markup(b"<!DOCTYPE html>"));
+        assert!(prefix_looks_like_markup(b"<svg onload=alert(1)>"));
+        assert!(prefix_looks_like_markup(b"<?xml version=\"1.0\"?>"));
+        // Leading whitespace and a UTF-8 BOM are skipped.
+        assert!(prefix_looks_like_markup(b"   \n\t<html>"));
+        assert!(prefix_looks_like_markup(&[0xEF, 0xBB, 0xBF, b'<', b'a']));
+        // Genuine non-markup text and binary are not flagged.
+        assert!(!prefix_looks_like_markup(b"a,b\n1,2"));
+        assert!(!prefix_looks_like_markup(br#"{"a":1}"#));
+        assert!(!prefix_looks_like_markup(&[0x01, 0x02]));
+        assert!(!prefix_looks_like_markup(b""));
     }
 
     #[tokio::test]
