@@ -210,7 +210,7 @@ impl Multipart {
         // Buffer a bounded leading prefix (a few chunks at most) for sniffing,
         // preserving streaming: the rest of the field is still pulled lazily by
         // the consuming methods, which replay this prefix first.
-        let mut prefix: Vec<u8> = Vec::new();
+        let mut prefix: Vec<u8> = Vec::with_capacity(SNIFF_PREFIX_BYTES);
         while prefix.len() < SNIFF_PREFIX_BYTES {
             match field
                 .chunk()
@@ -228,10 +228,12 @@ impl Multipart {
             return Err(file_too_large_error(self.config.max_file_size_bytes));
         }
 
-        let declared = field.content_type().map(str::to_owned);
+        // Borrow the declared header rather than allocating: `declared_essence`
+        // only needs a slice, and the borrow of `field` ends before it is moved
+        // into the returned wrapper below.
         // Compare on the type ESSENCE (media type without parameters), so a
         // header like `image/png; charset=binary` matches sniffed `image/png`.
-        let declared_essence = declared.as_deref().map(content_type_essence);
+        let declared_essence = field.content_type().map(content_type_essence);
         let sniffed = sniff_content_type(&prefix);
 
         // Enforce the allow-list (sniffed → markup-guard → declared fallback)
@@ -242,11 +244,11 @@ impl Multipart {
                 &self.config.allowed_mime_types,
                 &prefix,
                 declared_essence,
-                sniffed.as_deref(),
+                sniffed,
             )?;
         }
         if self.config.reject_on_content_type_mismatch {
-            enforce_content_type_match(declared_essence, sniffed.as_deref())?;
+            enforce_content_type_match(declared_essence, sniffed)?;
         }
 
         Ok(Some(MultipartField {
@@ -259,10 +261,11 @@ impl Multipart {
 }
 
 /// Sniff the content type of a file from its leading bytes via magic-byte
-/// detection. Returns `None` when the format is unrecognized.
+/// detection. Returns `None` when the format is unrecognized. `infer` yields a
+/// `&'static str` media type, so no allocation is needed.
 #[cfg(feature = "multipart")]
-fn sniff_content_type(prefix: &[u8]) -> Option<String> {
-    infer::get(prefix).map(|kind| kind.mime_type().to_owned())
+fn sniff_content_type(prefix: &[u8]) -> Option<&'static str> {
+    infer::get(prefix).map(|kind| kind.mime_type())
 }
 
 /// The essence of a content-type header — the media type without any
@@ -417,7 +420,8 @@ pub struct MultipartField<'a> {
     /// first so the already-read prefix is not lost.
     prefix: Vec<u8>,
     /// Sniffed (magic-byte) content type, if the leading bytes were recognized.
-    sniffed_content_type: Option<String>,
+    /// `infer` returns a `&'static str`, so this stores the borrow directly.
+    sniffed_content_type: Option<&'static str>,
 }
 
 #[cfg(all(feature = "multipart", feature = "storage"))]
@@ -458,8 +462,8 @@ impl<'a> MultipartField<'a> {
     /// unrecognized. Prefer this over [`content_type`](Self::content_type),
     /// which returns the spoofable client-declared header.
     #[must_use]
-    pub fn sniffed_content_type(&self) -> Option<&str> {
-        self.sniffed_content_type.as_deref()
+    pub const fn sniffed_content_type(&self) -> Option<&str> {
+        self.sniffed_content_type
     }
 
     /// Uploaded file name (if this field represents a file).
@@ -580,7 +584,7 @@ impl<'a> MultipartField<'a> {
         // the client-declared header only when no sniffing occurred.
         let content_type = self
             .sniffed_content_type
-            .clone()
+            .map(str::to_owned)
             .or_else(|| self.inner.content_type().map(str::to_owned))
             .unwrap_or_else(|| "application/octet-stream".to_owned());
 
@@ -954,7 +958,7 @@ mod tests {
     #[test]
     fn sniff_content_type_recognizes_png() {
         let png = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00];
-        assert_eq!(sniff_content_type(&png).as_deref(), Some("image/png"));
+        assert_eq!(sniff_content_type(&png), Some("image/png"));
     }
 
     #[test]
