@@ -195,6 +195,15 @@ impl InspectorBuffer {
 
 // ── N+1 detector ─────────────────────────────────────────────────────────────
 
+/// Default N+1 detection threshold: the minimum number of structurally
+/// identical SQL statements in a single request before an N+1 warning fires.
+///
+/// Single source of truth shared by `dev.inspector_n_plus_one_threshold`'s
+/// config default and the `Default` impl of `crate::test::TestResponse`. A
+/// threshold of `0` disables detection, so directly-constructed responses must
+/// inherit this non-zero default rather than a zero-filled one.
+pub(crate) const DEFAULT_N_PLUS_ONE_THRESHOLD: usize = 5;
+
 /// Examine a query list and return a warning if any SQL template was issued
 /// ≥ `threshold` times. Returns `None` when below threshold, or when
 /// `threshold == 0`, or when `queries` is empty.

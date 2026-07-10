@@ -3224,7 +3224,11 @@ impl Default for TestResponse {
             queries: Vec::new(),
             request_method: String::new(),
             request_path: String::new(),
-            n_plus_one_threshold: 0,
+            // Inherit the detector's default (5) — not a zero-filled `0`, which
+            // `inspector::detect_n_plus_one` treats as DISABLED — so the
+            // documented `TestResponse { .. ..Default::default() }` construction
+            // still catches N+1 patterns.
+            n_plus_one_threshold: crate::inspector::DEFAULT_N_PLUS_ONE_THRESHOLD,
         }
     }
 }
@@ -4601,6 +4605,54 @@ mod tests {
         assert!(
             panic_message(err.as_ref()).contains("2 times"),
             "override fires at the explicit threshold"
+        );
+    }
+
+    #[test]
+    fn default_test_response_inherits_detector_threshold() {
+        // A directly-constructed `TestResponse` must inherit the shared detector
+        // default (5), not a zero-filled `0` — otherwise `..Default::default()`
+        // would silently DISABLE N+1 detection.
+        assert_eq!(
+            TestResponse::default().n_plus_one_threshold,
+            crate::inspector::DEFAULT_N_PLUS_ONE_THRESHOLD,
+        );
+    }
+
+    #[test]
+    fn default_constructed_response_catches_n_plus_one() {
+        // Build a response purely via the documented `{ .., ..Default::default() }`
+        // pattern (no explicit threshold). With a zero-filled default this passed
+        // silently (0 == DISABLED); with the detector default (5) it must panic on
+        // the normalized template repeated to the threshold.
+        let resp = TestResponse {
+            queries: [
+                "SELECT * FROM comments WHERE post_id = $1",
+                "SELECT  * FROM comments WHERE post_id = $1",
+                "select * from comments where post_id = $1",
+                "SELECT * FROM  comments WHERE post_id = $1",
+                "Select * From comments Where post_id = $1",
+            ]
+            .iter()
+            .map(|s| crate::inspector::QueryRecord {
+                sql: (*s).to_owned(),
+                params: Vec::new(),
+                elapsed_ms: 1,
+                location: String::new(),
+            })
+            .collect(),
+            ..Default::default()
+        };
+        let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            resp.assert_no_n_plus_one();
+        }))
+        .expect_err(
+            "a default-constructed TestResponse must inherit the non-zero detector \
+             threshold and fire on an N+1 pattern",
+        );
+        assert!(
+            panic_message(err.as_ref()).contains("select * from comments where post_id = $1"),
+            "reports the normalized SQL template",
         );
     }
 }
