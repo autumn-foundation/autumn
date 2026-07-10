@@ -1053,6 +1053,16 @@ enum ServeCommands {
     Restart,
 }
 
+impl From<ServeCommands> for serve::ServeAction {
+    fn from(cmd: ServeCommands) -> Self {
+        match cmd {
+            ServeCommands::Stop => Self::Stop,
+            ServeCommands::Status => Self::Status,
+            ServeCommands::Restart => Self::Restart,
+        }
+    }
+}
+
 /// Process role selector for `autumn serve --role`.
 ///
 /// Mirrors `autumn_web::config::ProcessRole`: `web` serves HTTP only, `worker`
@@ -1167,6 +1177,27 @@ enum MigrateCommands {
         #[arg(long = "force", value_name = "VERSION")]
         force: Option<String>,
     },
+}
+
+impl MigrateCommands {
+    fn into_action(self) -> migrate::MigrateAction {
+        match self {
+            Self::Status => migrate::MigrateAction::Status,
+            Self::Check => migrate::MigrateAction::Check,
+            Self::Down {
+                steps,
+                to,
+                yes_i_mean_prod,
+            } => migrate::MigrateAction::Down(migrate::DownArgs {
+                steps,
+                to,
+                yes_i_mean_prod,
+            }),
+            Self::Baseline { force } => migrate::MigrateAction::Baseline(migrate::BaselineArgs {
+                force_version: force,
+            }),
+        }
+    }
 }
 
 /// Subcommands for `autumn shard`.
@@ -2283,11 +2314,7 @@ fn run_command(command: Commands) {
             package,
             role,
         } => {
-            let action = action.map(|a| match a {
-                ServeCommands::Stop => serve::ServeAction::Stop,
-                ServeCommands::Status => serve::ServeAction::Status,
-                ServeCommands::Restart => serve::ServeAction::Restart,
-            });
+            let action = action.map(Into::into);
             serve::run(
                 action,
                 &serve::ServeOptions {
@@ -2313,25 +2340,7 @@ fn run_command(command: Commands) {
             profile,
             wait,
         } => {
-            let action = match action {
-                Some(MigrateCommands::Status) => migrate::MigrateAction::Status,
-                Some(MigrateCommands::Check) => migrate::MigrateAction::Check,
-                Some(MigrateCommands::Down {
-                    steps,
-                    to,
-                    yes_i_mean_prod,
-                }) => migrate::MigrateAction::Down(migrate::DownArgs {
-                    steps,
-                    to,
-                    yes_i_mean_prod,
-                }),
-                Some(MigrateCommands::Baseline { force }) => {
-                    migrate::MigrateAction::Baseline(migrate::BaselineArgs {
-                        force_version: force,
-                    })
-                }
-                None => migrate::MigrateAction::Run,
-            };
+            let action = action.map_or(migrate::MigrateAction::Run, MigrateCommands::into_action);
             let target = match (shard, control_only) {
                 (Some(name), _) => migrate::MigrateTarget::Shard(name),
                 (None, true) => migrate::MigrateTarget::ControlOnly,
