@@ -172,12 +172,18 @@ pub struct DepAward {
 #[autumn_web::repository(DepAward, table = "dep_awards")]
 pub trait DepAwardRepository {}
 
-// ── Soft-delete-aware destroy graph (AC3) ─────────────────────────────────────
+// ── AC3: both-soft destroy graph (soft parent + soft children) ────────────────
+//
+// The parent is `#[soft_delete]` too, so `delete_by_id` soft-deletes the parent
+// (row remains, FK stays valid) and the cascade soft-deletes the children — the
+// AC3 "parent soft-deleted, cascade still runs, live graph stays consistent"
+// case, satisfiable against real Postgres.
 
 diesel::table! {
     dep_soft_posts (id) {
         id -> Int8,
         title -> Text,
+        deleted_at -> Nullable<Timestamp>,
     }
 }
 
@@ -186,11 +192,13 @@ pub struct DepSoftPost {
     #[id]
     pub id: i64,
     pub title: String,
+    pub deleted_at: Option<chrono::NaiveDateTime>,
 }
 
 #[autumn_web::repository(
     DepSoftPost,
     table = "dep_soft_posts",
+    soft_delete,
     dependent(PgDepSoftCommentRepository, fk = "post_id", on_delete = destroy)
 )]
 pub trait DepSoftPostRepository {}
@@ -215,6 +223,55 @@ pub struct DepSoftComment {
 
 #[autumn_web::repository(DepSoftComment, table = "dep_soft_comments", soft_delete)]
 pub trait DepSoftCommentRepository {}
+
+// ── #1369 P1: hard parent + soft-delete child destroy graph ───────────────────
+//
+// A NON-soft parent that `destroy`s a `#[soft_delete]` child. Because the parent
+// is hard-deleted, the child must be HARD-deleted too (not merely soft-deleted),
+// otherwise a NOT NULL FK to the removed parent would be violated and the row
+// would be a semantic orphan. Locks in the P1 fix (child follows parent kind).
+
+diesel::table! {
+    dep_hard_posts (id) {
+        id -> Int8,
+        title -> Text,
+    }
+}
+
+#[autumn_web::model(table = "dep_hard_posts")]
+pub struct DepHardPost {
+    #[id]
+    pub id: i64,
+    pub title: String,
+}
+
+#[autumn_web::repository(
+    DepHardPost,
+    table = "dep_hard_posts",
+    dependent(PgDepHardSoftCommentRepository, fk = "post_id", on_delete = destroy)
+)]
+pub trait DepHardPostRepository {}
+
+diesel::table! {
+    dep_hard_soft_comments (id) {
+        id -> Int8,
+        post_id -> Int8,
+        body -> Text,
+        deleted_at -> Nullable<Timestamp>,
+    }
+}
+
+#[autumn_web::model(table = "dep_hard_soft_comments")]
+pub struct DepHardSoftComment {
+    #[id]
+    pub id: i64,
+    pub post_id: i64,
+    pub body: String,
+    pub deleted_at: Option<chrono::NaiveDateTime>,
+}
+
+#[autumn_web::repository(DepHardSoftComment, table = "dep_hard_soft_comments", soft_delete)]
+pub trait DepHardSoftCommentRepository {}
 
 // ── Row-count helpers ─────────────────────────────────────────────────────────
 
@@ -254,8 +311,10 @@ async fn setup_pool() -> (
         "CREATE TABLE dep_votes (id BIGSERIAL PRIMARY KEY, post_id BIGINT NOT NULL REFERENCES dep_posts(id), value INT NOT NULL)",
         "CREATE TABLE dep_bookmarks (id BIGSERIAL PRIMARY KEY, post_id BIGINT REFERENCES dep_posts(id), label TEXT NOT NULL)",
         "CREATE TABLE dep_awards (id BIGSERIAL PRIMARY KEY, post_id BIGINT NOT NULL REFERENCES dep_posts(id), name TEXT NOT NULL)",
-        "CREATE TABLE dep_soft_posts (id BIGSERIAL PRIMARY KEY, title TEXT NOT NULL)",
+        "CREATE TABLE dep_soft_posts (id BIGSERIAL PRIMARY KEY, title TEXT NOT NULL, deleted_at TIMESTAMP NULL)",
         "CREATE TABLE dep_soft_comments (id BIGSERIAL PRIMARY KEY, post_id BIGINT NOT NULL REFERENCES dep_soft_posts(id), body TEXT NOT NULL, deleted_at TIMESTAMP NULL)",
+        "CREATE TABLE dep_hard_posts (id BIGSERIAL PRIMARY KEY, title TEXT NOT NULL)",
+        "CREATE TABLE dep_hard_soft_comments (id BIGSERIAL PRIMARY KEY, post_id BIGINT NOT NULL REFERENCES dep_hard_posts(id), body TEXT NOT NULL, deleted_at TIMESTAMP NULL)",
     ] {
         diesel::sql_query(stmt)
             .execute(&mut conn)
@@ -281,6 +340,9 @@ fn dependent_repository_surface_is_generated() {
     assert_is_fn(PgDepBookmarkRepository::__autumn_apply_dependent_on_conn);
     assert_is_fn(PgDepAwardRepository::__autumn_apply_dependent_on_conn);
     assert_is_fn(PgDepSoftCommentRepository::__autumn_apply_dependent_on_conn);
+    assert_is_fn(<PgDepSoftPostRepository as DepSoftPostRepository>::delete_by_id);
+    assert_is_fn(<PgDepHardPostRepository as DepHardPostRepository>::delete_by_id);
+    assert_is_fn(PgDepHardSoftCommentRepository::__autumn_apply_dependent_on_conn);
 }
 
 // ── Tests (require Docker) ────────────────────────────────────────────────────
@@ -423,12 +485,14 @@ async fn restrict_blocks_delete_with_conflict_and_rolls_back() {
     );
 }
 
-/// AC3: when the child model is `#[soft_delete]`, a `dependent = destroy`
-/// cascade soft-deletes children (rows remain with `deleted_at` set) rather
-/// than hard-deleting them.
+/// AC3 (both-soft): a `#[soft_delete]` parent with a `dependent = destroy` on a
+/// `#[soft_delete]` child. `delete_by_id` soft-deletes the parent (row remains,
+/// FK stays valid) and the cascade soft-deletes the children — all rows remain
+/// with `deleted_at` set, no FK error. This is the AC3 "parent soft-deleted,
+/// cascade still runs so the live graph stays consistent" scenario.
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
-async fn destroy_is_soft_delete_aware_for_soft_delete_children() {
+async fn destroy_soft_parent_soft_deletes_soft_children() {
     let (pool, _c) = setup_pool().await;
     let mut conn = pool.get().await.expect("conn");
 
@@ -448,7 +512,17 @@ async fn destroy_is_soft_delete_aware_for_soft_delete_children() {
     let repo = PgDepSoftPostRepository::with_pool_untracked(pool.clone());
     repo.delete_by_id(9).await.expect("soft cascade delete");
 
-    // Rows still present (soft-deleted, not hard-deleted) with deleted_at set.
+    // Parent row remains (soft-deleted, FK targets stay valid).
+    assert_eq!(
+        count(
+            &mut conn,
+            "SELECT COUNT(*) AS n FROM dep_soft_posts WHERE id = 9 AND deleted_at IS NOT NULL"
+        )
+        .await,
+        1,
+        "a soft-delete parent row must remain with deleted_at set"
+    );
+    // Children remain (soft-deleted, not hard-deleted) with deleted_at set.
     assert_eq!(
         count(
             &mut conn,
@@ -456,7 +530,7 @@ async fn destroy_is_soft_delete_aware_for_soft_delete_children() {
         )
         .await,
         2,
-        "soft-delete children must not be hard-deleted"
+        "soft-delete children must not be hard-deleted when the parent is soft-deleted"
     );
     assert_eq!(
         count(
@@ -466,5 +540,55 @@ async fn destroy_is_soft_delete_aware_for_soft_delete_children() {
         .await,
         2,
         "each child must be soft-deleted (deleted_at set)"
+    );
+}
+
+/// #1369 P1 (hard parent + soft child): a NON-soft parent that `destroy`s a
+/// `#[soft_delete]` child. Because the parent is hard-deleted, the children must
+/// be HARD-deleted too (rows gone) — a soft-deleted child left pointing at a
+/// removed parent would violate the NOT NULL FK and be a semantic orphan. Assert
+/// zero surviving children, zero FK errors, parent gone.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn destroy_hard_parent_hard_deletes_soft_children() {
+    let (pool, _c) = setup_pool().await;
+    let mut conn = pool.get().await.expect("conn");
+
+    diesel::sql_query("INSERT INTO dep_hard_posts (id, title) VALUES (11, 'hard')")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    for i in 1..=3 {
+        diesel::sql_query(format!(
+            "INSERT INTO dep_hard_soft_comments (id, post_id, body) VALUES ({i}, 11, 'h{i}')"
+        ))
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    }
+
+    let repo = PgDepHardPostRepository::with_pool_untracked(pool.clone());
+    repo.delete_by_id(11)
+        .await
+        .expect("hard-parent cascade must not FK-error");
+
+    // Parent gone.
+    assert_eq!(
+        count(
+            &mut conn,
+            "SELECT COUNT(*) AS n FROM dep_hard_posts WHERE id = 11"
+        )
+        .await,
+        0
+    );
+    // Soft-delete children were HARD-deleted (rows gone), not left soft-deleted.
+    assert_eq!(
+        count(
+            &mut conn,
+            "SELECT COUNT(*) AS n FROM dep_hard_soft_comments WHERE post_id = 11"
+        )
+        .await,
+        0,
+        "a hard-deleted parent must hard-delete its soft-delete children (no orphans, no FK error)"
     );
 }

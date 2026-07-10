@@ -1138,16 +1138,30 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         } else {
             quote! { let _ }
         };
+        // #1369 P1: the child destroy cascade follows the *parent's* delete kind.
+        // A child is soft-deleted only when it is a `#[soft_delete]` model AND the
+        // parent is being soft-deleted (`__parent_soft`) — leaving the parent row
+        // present so the child FK stays valid. When the parent is hard-deleted, a
+        // soft-delete child must be hard-deleted too: a soft-deleted child left
+        // pointing at a hard-deleted parent is both FK-invalid (NOT NULL FK) and a
+        // semantic orphan. Non-soft-delete children are always hard-deleted.
         let destroy_mutation = if config.soft_delete {
             quote! {
-                let __now = ::autumn_web::reexports::chrono::Utc::now().naive_utc();
-                #destroy_count_bind = ::autumn_web::reexports::diesel::update(
-                    #table_ident::table.find(__cid).filter(#table_ident::deleted_at.is_null())
-                )
-                    .set(#table_ident::deleted_at.eq(::core::option::Option::Some(__now)))
-                    .execute(conn)
-                    .await
-                    .map_err(::autumn_web::AutumnError::from)?;
+                #destroy_count_bind = if __parent_soft {
+                    let __now = ::autumn_web::reexports::chrono::Utc::now().naive_utc();
+                    ::autumn_web::reexports::diesel::update(
+                        #table_ident::table.find(__cid).filter(#table_ident::deleted_at.is_null())
+                    )
+                        .set(#table_ident::deleted_at.eq(::core::option::Option::Some(__now)))
+                        .execute(conn)
+                        .await
+                        .map_err(::autumn_web::AutumnError::from)?
+                } else {
+                    ::autumn_web::reexports::diesel::delete(#table_ident::table.find(__cid))
+                        .execute(conn)
+                        .await
+                        .map_err(::autumn_web::AutumnError::from)?
+                };
             }
         } else {
             quote! {
@@ -1236,6 +1250,17 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             /// to this model's rows whose `__fk_column` equals `__parent_id`,
             /// on the caller's connection/transaction. Framework plumbing for
             /// `#[repository(..., dependent(...))]` (#1369); not a public API.
+            ///
+            /// `__parent_soft` is the parent repository's delete kind: `true`
+            /// when the parent is being soft-deleted, `false` when hard-deleted.
+            /// The `Destroy` action follows it so a soft-delete child is only
+            /// soft-deleted alongside a soft-deleted parent (see below).
+            ///
+            /// NOTE (#1369 scope / see #1702): the `Destroy` cascade is
+            /// single-level — it applies this model's mutation to each child but
+            /// does NOT recursively invoke the child's own `dependent(...)`
+            /// cascade, so grandchildren are not handled. #1369's target graph is
+            /// single-level; recursive/multi-level cascade is a tracked follow-up.
             #[doc(hidden)]
             pub async fn __autumn_apply_dependent_on_conn(
                 &self,
@@ -1243,6 +1268,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 __fk_column: &str,
                 __parent_id: i64,
                 __action: ::autumn_web::repository::DependentAction,
+                __parent_soft: bool,
             ) -> ::autumn_web::AutumnResult<()> {
                 use ::autumn_web::reexports::diesel::prelude::*;
                 use ::autumn_web::reexports::diesel_async::RunQueryDsl;
@@ -1306,6 +1332,10 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         ::core::result::Result::Ok(())
                     }
                     ::autumn_web::repository::DependentAction::Destroy => {
+                        // Single-level cascade (#1369 scope; recursion tracked in
+                        // #1702): each child's mutation is applied inline here; the
+                        // child's OWN `dependent(...)` cascade is NOT invoked, so
+                        // grandchildren are not recursively destroyed/nullified.
                         #destroy_register
                         #[derive(::autumn_web::reexports::diesel::QueryableByName)]
                         struct __AutumnDepId {
@@ -7719,6 +7749,14 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let delete_body = if config.dependents.is_empty() {
         delete_body
     } else {
+        // The parent's own delete kind (soft vs hard) drives the child `destroy`
+        // cascade (#1369 P1): a soft-delete child is only soft-deleted alongside
+        // a soft-deleted parent; a hard-deleted parent hard-deletes its children.
+        let parent_soft_lit = if config.soft_delete {
+            quote! { true }
+        } else {
+            quote! { false }
+        };
         let cascade_calls = config.dependents.iter().map(|dep| {
             let child_repo = &dep.child_repo;
             let fk = &dep.fk;
@@ -7733,6 +7771,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         #fk,
                         id,
                         ::autumn_web::repository::DependentAction::#action_variant,
+                        #parent_soft_lit,
                     )
                     .await?;
             }
@@ -14028,6 +14067,74 @@ mod tests {
         assert!(
             helper.contains("IS NULL"),
             "soft_delete repo's destroy path must select only live children: {helper}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_dependent_destroy_follows_parent_delete_kind() {
+        // #1369 P1: a soft_delete child's destroy branch must branch on
+        // `__parent_soft` — soft-deleting only when the parent is soft-deleted,
+        // and hard-deleting (a real `diesel::delete`) when the parent is
+        // hard-deleted, so a soft child never dangles off a hard-deleted parent.
+        let generated = repository_macro(
+            quote! { Comment, soft_delete, dependent(PgReplyRepository, fk = "comment_id", on_delete = destroy) },
+            quote! { pub trait CommentRepository {} },
+        )
+        .to_string();
+        let start = generated
+            .find("__autumn_apply_dependent_on_conn")
+            .expect("helper present");
+        let helper = &generated[start..];
+        // The helper takes the parent delete-kind flag and branches on it.
+        assert!(
+            helper.contains("__parent_soft"),
+            "destroy must thread the parent's delete kind (__parent_soft): {helper}"
+        );
+        assert!(
+            helper.contains("if __parent_soft"),
+            "soft_delete child destroy must branch on __parent_soft: {helper}"
+        );
+        // Both a soft mutation (UPDATE deleted_at) and a hard delete must be
+        // present in the destroy branch (one per parent-delete-kind arm).
+        let destroy_at = helper
+            .find("DependentAction :: Destroy")
+            .expect("destroy arm present");
+        let destroy_arm = &helper[destroy_at..];
+        assert!(
+            destroy_arm.contains("diesel :: update") && destroy_arm.contains("deleted_at"),
+            "destroy soft arm must UPDATE deleted_at: {destroy_arm}"
+        );
+        assert!(
+            destroy_arm.contains("diesel :: delete"),
+            "destroy hard arm (parent hard-deleted) must issue a real DELETE even for a soft_delete child: {destroy_arm}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_dependent_cascade_passes_parent_soft_flag() {
+        // The soft-delete parent passes `true`; a hard-delete parent passes
+        // `false`, so the child cascade can follow the parent's delete kind.
+        let soft_parent = repository_macro(
+            quote! { Post, soft_delete, dependent(PgCommentRepository, fk = "post_id", on_delete = destroy) },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        let soft_section = delete_by_id_section(&soft_parent);
+        assert!(
+            soft_section.contains("__autumn_apply_dependent_on_conn")
+                && soft_section.contains(", true ,"),
+            "a soft-delete parent must pass __parent_soft = true to the cascade: {soft_section}"
+        );
+        let hard_parent = repository_macro(
+            quote! { Post, dependent(PgCommentRepository, fk = "post_id", on_delete = destroy) },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        let hard_section = delete_by_id_section(&hard_parent);
+        assert!(
+            hard_section.contains("__autumn_apply_dependent_on_conn")
+                && hard_section.contains(", false ,"),
+            "a hard-delete parent must pass __parent_soft = false to the cascade: {hard_section}"
         );
     }
 
