@@ -47,6 +47,15 @@ fn test_settings() -> AlerterSettings {
 }
 
 fn settings_with_prefix(prefix: &str) -> AlerterSettings {
+    settings_with_prefix_sensitive(prefix, true)
+}
+
+fn settings_with_prefix_sensitive(prefix: &str, actuator_sensitive: bool) -> AlerterSettings {
+    // `actuator_sensitive` defaults to `true` for the prefix helper so the
+    // dead-lettered-job/scheduled-task alerts point straight at the (mounted)
+    // `/jobs` and `/tasks` endpoints — the behavior those tests assert. The
+    // `sensitive = false` fallback is covered explicitly by
+    // `sensitive_false_alerts_point_at_mounted_endpoint`.
     AlerterSettings {
         dedup_window: std::time::Duration::from_secs(900),
         health_grace: std::time::Duration::from_secs(60),
@@ -54,6 +63,7 @@ fn settings_with_prefix(prefix: &str) -> AlerterSettings {
         error_rate_min_requests: 20,
         eval_interval: std::time::Duration::from_secs(30),
         actuator_prefix: prefix.to_owned(),
+        actuator_sensitive,
     }
 }
 
@@ -163,6 +173,78 @@ async fn scheduled_task_failure_delivers_alert() {
     assert_eq!(alerts[0].condition, AlertCondition::ScheduledTaskFailure);
     assert_eq!(alerts[0].where_to_look, "/actuator/tasks");
     assert!(alerts[0].summary.contains("disk full"));
+}
+
+/// Code-review fix: the `/actuator/jobs` and `/actuator/tasks` endpoints are
+/// mounted ONLY when `[actuator] sensitive = true` (default `false`). With the
+/// default `sensitive = false`, the dead-lettered-job and scheduled-task-failure
+/// alerts must NOT point operators at those unmounted (404) endpoints — they must
+/// point at the always-mounted `/actuator/health` and hint that the richer
+/// endpoint needs `[actuator] sensitive = true`. With `sensitive = true` the
+/// alerts point straight at `/jobs` / `/tasks`.
+#[tokio::test]
+async fn sensitive_false_alerts_point_at_mounted_endpoint() {
+    // sensitive = false (the production default): fallback + hint, never a 404.
+    let channel = CapturingChannel::default();
+    let alerter = Alerter::new(
+        vec![Arc::new(channel.clone())],
+        settings_with_prefix_sensitive("/actuator", false),
+    );
+    let client = TestApp::new()
+        .state_initializer(move |state| state.insert_extension(alerter.clone()))
+        .build();
+
+    autumn_web::alerts::notify_dead_lettered_job(client.state(), "reporting_job", "boom");
+    autumn_web::alerts::notify_scheduled_task_failure(
+        client.state(),
+        "nightly_backup",
+        "disk full",
+    );
+    wait_for(&channel, 2).await;
+    let alerts = channel.alerts();
+    assert_eq!(alerts.len(), 2);
+
+    let dead = &alerts[0].where_to_look;
+    assert!(
+        !dead.starts_with("/actuator/jobs"),
+        "dead-letter alert must not link the unmounted /actuator/jobs: {dead}"
+    );
+    assert!(
+        dead.contains("/actuator/health") && dead.contains("[actuator] sensitive = true"),
+        "must point at /actuator/health and hint the sensitive requirement: {dead}"
+    );
+
+    let task = &alerts[1].where_to_look;
+    assert!(
+        !task.starts_with("/actuator/tasks"),
+        "scheduled-task alert must not link the unmounted /actuator/tasks: {task}"
+    );
+    assert!(
+        task.contains("/actuator/health") && task.contains("[actuator] sensitive = true"),
+        "must point at /actuator/health and hint the sensitive requirement: {task}"
+    );
+
+    // sensitive = true: the endpoints are mounted, so link them directly.
+    let channel2 = CapturingChannel::default();
+    let alerter2 = Alerter::new(
+        vec![Arc::new(channel2.clone())],
+        settings_with_prefix_sensitive("/actuator", true),
+    );
+    let client2 = TestApp::new()
+        .state_initializer(move |state| state.insert_extension(alerter2.clone()))
+        .build();
+
+    autumn_web::alerts::notify_dead_lettered_job(client2.state(), "reporting_job", "boom");
+    autumn_web::alerts::notify_scheduled_task_failure(
+        client2.state(),
+        "nightly_backup",
+        "disk full",
+    );
+    wait_for(&channel2, 2).await;
+    let alerts2 = channel2.alerts();
+    assert_eq!(alerts2.len(), 2);
+    assert_eq!(alerts2[0].where_to_look, "/actuator/jobs");
+    assert_eq!(alerts2[1].where_to_look, "/actuator/tasks");
 }
 
 /// AC #3: a sustained/repeating condition is deduplicated (bounded, not

@@ -68,10 +68,10 @@ look next** pointer.
 
 | Condition | Fires when | Where to look | Tuning knob (default) |
 |-----------|------------|---------------|-----------------------|
-| **Dead-lettered job** | a background job exhausts its retries and is dead-lettered | `/actuator/jobs` | always on |
+| **Dead-lettered job** | a background job exhausts its retries and is dead-lettered | `/actuator/jobs` † | always on |
 | **Health indicator Down** | a registered health indicator reports `Down` continuously past a grace period | `/actuator/health` | `health_grace_secs` (`60`) |
 | **High 5xx rate** | the rolling 5xx rate crosses a threshold | `/actuator/metrics` | `error_rate_threshold` (`0.05`), `error_rate_min_requests` (`20`) |
-| **Scheduled-task failure** | a framework-scheduled task (cron or fixed-delay — e.g. backup, cert-renewal) returns an error | `/actuator/tasks` | always on |
+| **Scheduled-task failure** | a framework-scheduled task (cron or fixed-delay — e.g. backup, cert-renewal) returns an error | `/actuator/tasks` † | always on |
 
 The "where to look" paths above assume the default actuator prefix. If you
 change `[actuator] prefix` (or set `AUTUMN_ACTUATOR__PREFIX`), each alert's
@@ -79,6 +79,16 @@ change `[actuator] prefix` (or set `AUTUMN_ACTUATOR__PREFIX`), each alert's
 `prefix = "/_ops"` a dead-lettered-job alert points at `/_ops/jobs` — so it
 always references the endpoint you actually mounted rather than a `/actuator/*`
 404.
+
+**† `/actuator/jobs` and `/actuator/tasks` require `[actuator] sensitive = true`.**
+Those two endpoints are mounted only when the sensitive actuator surface is
+enabled, and `[actuator] sensitive` defaults to `false` (off in production). When
+it is off, the dead-lettered-job and scheduled-task-failure alerts do **not** link
+those endpoints (they would 404); instead they point at the always-mounted
+`/actuator/health` and note that the richer `/jobs` (resp. `/tasks`) endpoint
+becomes available once you set `[actuator] sensitive = true`. `/actuator/health`
+and `/actuator/metrics` are always mounted, so the health and 5xx-rate alerts link
+them unconditionally.
 
 The 5xx-rate and health conditions are evaluated on a **background tick**
 (`eval_interval_secs`, default `30`) — never on the request path — so they add
@@ -171,7 +181,11 @@ The webhook payload is JSON:
 ```
 
 `where_to_look` uses your configured actuator prefix, so under a custom
-`[actuator] prefix` (e.g. `/_ops`) it reads `/_ops/jobs` instead.
+`[actuator] prefix` (e.g. `/_ops`) it reads `/_ops/jobs` instead. The example
+above shows the value with `[actuator] sensitive = true`; with the default
+`sensitive = false` this dead-lettered-job alert instead reads
+`/actuator/health (/actuator/jobs requires [actuator] sensitive = true)`, because
+`/actuator/jobs` is not mounted (see the table note above).
 
 Alert webhooks are **always signed**, exactly like Autumn's outbound webhooks:
 an `Autumn-Signature: t=<unix>,v1=<hmac-sha256>` header over `"<t>.<body>"` using

@@ -490,12 +490,16 @@ pub fn check_alert_destination_impl(
     // alert `Mail` is built, so a present-but-unparsable address (e.g.
     // `not-an-address`) passes every earlier gate yet fails EVERY delivery at
     // runtime with `MailError::InvalidAddress`. An invalid address therefore
-    // does not count as a usable destination. Validity reuses the same address
-    // check the mailer applies to `[mail] unsubscribe_mailto`
-    // (`is_valid_mailto_address_doctor`) so doctor and the mailer agree.
+    // does not count as a usable destination. Validity uses a BARE-mailbox check
+    // (`is_valid_bare_mailbox_doctor`) that matches what lettre accepts for a
+    // recipient — deliberately NOT `is_valid_mailto_address_doctor`, which strips
+    // a leading `mailto:` (correct for the `List-Unsubscribe` header but wrong
+    // here). The runtime hands `[alerts] email` verbatim to
+    // `Mail::builder().to(...)`, and lettre parses it as a bare mailbox at send
+    // time; a `mailto:` URI would fail EVERY delivery, so doctor must reject it.
     let email_trimmed = email.trim();
     let email_configured = !email_trimmed.is_empty();
-    let email_valid = email_configured && is_valid_mailto_address_doctor(email_trimmed);
+    let email_valid = email_configured && is_valid_bare_mailbox_doctor(email_trimmed);
 
     // Whether a configured email would actually deliver. It needs a valid
     // address, a usable (non-disabled) transport AND — for transports that build
@@ -910,6 +914,42 @@ fn is_valid_mailto_address_doctor(value: &str) -> bool {
                 && !domain.is_empty()
                 && domain.contains('.')
                 && !address.contains(char::is_whitespace)
+                && !address.contains([':', '/'])
+        }
+        None => false,
+    }
+}
+
+/// Whether `value` is a syntactically valid **bare** recipient mailbox — a single
+/// `local@domain` with a dotted domain and no scheme prefix.
+///
+/// This is DISTINCT from [`is_valid_mailto_address_doctor`], which accepts a
+/// leading `mailto:` (correct for the `[mail] unsubscribe_mailto`
+/// `List-Unsubscribe` header). The `[alerts] email` is handed verbatim to
+/// `Mail::builder().to(...)` and parsed by lettre as a bare recipient mailbox at
+/// SEND time (`parse_mailbox`/`lettre_message`); lettre does NOT strip a
+/// `mailto:` scheme, so `mailto:oncall@example.com` fails EVERY delivery with
+/// `MailError::InvalidAddress`. Reject the URI form here so doctor agrees with the
+/// SMTP path rather than passing a config that can never deliver.
+fn is_valid_bare_mailbox_doctor(value: &str) -> bool {
+    // Reject control characters and address delimiters anywhere in the value.
+    if value
+        .chars()
+        .any(|c| c.is_control() || matches!(c, '<' | '>' | ','))
+    {
+        return false;
+    }
+    // Note: no `mailto:` strip here — a bare recipient mailbox has no scheme.
+    let address = value.trim();
+    match address.split_once('@') {
+        Some((local, domain)) => {
+            !local.is_empty()
+                && !domain.is_empty()
+                && domain.contains('.')
+                && !address.contains(char::is_whitespace)
+                // A bare mailbox never contains `:` or `/`. This is what makes
+                // `mailto:oncall@example.com` (and any other scheme/URI form)
+                // INVALID — lettre would reject it as a recipient too.
                 && !address.contains([':', '/'])
         }
         None => false,
@@ -4668,6 +4708,23 @@ pub struct Vault {
     }
 
     #[test]
+    fn is_valid_bare_mailbox_rejects_mailto_uri_and_accepts_bare() {
+        // Bare recipient mailboxes are accepted (this is what lettre parses at
+        // send time for `[alerts] email`).
+        assert!(is_valid_bare_mailbox_doctor("oncall@example.com"));
+        assert!(is_valid_bare_mailbox_doctor("a+b@sub.example.co"));
+        // The `mailto:` URI form is REJECTED here (unlike the unsubscribe-mailto
+        // validator): the runtime passes it verbatim to lettre, which rejects it
+        // as a bare recipient. Doctor must not pass a config that can't deliver.
+        assert!(!is_valid_bare_mailbox_doctor("mailto:oncall@example.com"));
+        // Other scheme/URI forms and malformed values stay rejected.
+        assert!(!is_valid_bare_mailbox_doctor("https://oncall@example.com"));
+        assert!(!is_valid_bare_mailbox_doctor("not-an-address"));
+        assert!(!is_valid_bare_mailbox_doctor("oncall example.com"));
+        assert!(!is_valid_bare_mailbox_doctor("oncall@localhost"));
+    }
+
+    #[test]
     fn mail_unsubscribe_usage_with_both_url_and_mailto_warns_in_prod() {
         // base_url presence drives the suppression-backend warning even when a
         // mailto fallback is also configured.
@@ -5147,6 +5204,41 @@ pub struct Vault {
         assert!(
             matches!(r.status, CheckStatus::Pass),
             "a valid `+`-addressed, multi-label-domain email is a working destination"
+        );
+    }
+
+    #[test]
+    fn alert_destination_mailto_uri_email_warns_in_prod() {
+        // `[alerts] email = "mailto:oncall@example.com"` is handed verbatim to
+        // lettre, which rejects the `mailto:` URI as a bare recipient — so every
+        // send fails at runtime. A prior fix used the unsubscribe-mailto validator
+        // (which strips `mailto:` and returned true), letting doctor PASS a config
+        // that can never deliver. The bare-mailbox check must reject it and surface
+        // the dedicated invalid-email warning.
+        let r = check_alert_destination_impl(
+            true,
+            "mailto:oncall@example.com",
+            false,
+            true, // usable transport
+            true, // production
+            true, // [mail] from present
+            true, // smtp requires from
+        );
+        assert!(
+            matches!(r.status, CheckStatus::Warn),
+            "a mailto: URI alert email delivers nothing at runtime → must warn in prod"
+        );
+        assert!(
+            r.detail
+                .as_deref()
+                .is_some_and(|d| d.contains("not a valid email address")),
+            "the dedicated invalid-email warning must fire for the mailto: URI form"
+        );
+        assert!(
+            r.detail
+                .as_deref()
+                .is_some_and(|d| d.contains("mailto:oncall@example.com")),
+            "the warning should echo the offending value"
         );
     }
 

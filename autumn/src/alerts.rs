@@ -17,10 +17,15 @@
 //!
 //! | Condition | Fires when | Where to look |
 //! |-----------|------------|---------------|
-//! | [`AlertCondition::DeadLetteredJob`] | a background job exhausts its retries and is dead-lettered | `/actuator/jobs` |
+//! | [`AlertCondition::DeadLetteredJob`] | a background job exhausts its retries and is dead-lettered | `/actuator/jobs` † |
 //! | [`AlertCondition::HealthIndicatorDown`] | a registered health indicator reports `Down` past the grace period | `/actuator/health` |
 //! | [`AlertCondition::HighErrorRate`] | the rolling 5xx rate crosses the configured threshold | `/actuator/metrics` |
-//! | [`AlertCondition::ScheduledTaskFailure`] | a framework-scheduled task (backup, cert-renewal, cron/fixed-delay) fails | `/actuator/tasks` |
+//! | [`AlertCondition::ScheduledTaskFailure`] | a framework-scheduled task (backup, cert-renewal, cron/fixed-delay) fails | `/actuator/tasks` † |
+//!
+//! † `/actuator/jobs` and `/actuator/tasks` are mounted only when `[actuator]
+//! sensitive = true` (default `false`). When it is off, those two alerts point at
+//! the always-mounted `/actuator/health` instead and note that the richer
+//! endpoint needs `sensitive = true` (see [`sensitive_gated_where_to_look`]).
 //!
 //! # Delivery is a trait (extension point)
 //!
@@ -141,6 +146,39 @@ impl AlertCondition {
 /// [`AlertCondition::where_to_look`] byte-for-byte.
 fn actuator_where_to_look(prefix: &str, condition: AlertCondition) -> String {
     crate::actuator::actuator_route_path(prefix, condition.actuator_suffix())
+}
+
+/// Build the `where_to_look` pointer for a condition whose primary actuator
+/// endpoint is gated behind `[actuator] sensitive`.
+///
+/// The `/jobs` (dead-lettered-job) and `/tasks` (scheduled-task-failure)
+/// endpoints are mounted ONLY inside the `if sensitive` block of
+/// `actuator_router_with_prefix`, and `[actuator] sensitive` defaults to
+/// `false`. Pointing an alert at an unmounted endpoint would send operators to a
+/// 404, so:
+///
+/// * `sensitive == true`: the gated endpoint exists — point straight at it
+///   (`{prefix}/jobs`, `{prefix}/tasks`), reproducing the prior behavior.
+/// * `sensitive == false` (default): the gated endpoint is a 404 — point at the
+///   always-mounted `{prefix}/health` endpoint instead and append a short hint
+///   naming the richer, sensitive-gated endpoint and the setting that exposes it.
+///
+/// `/health` (not `/metrics`) is the fallback because the job/task counters live
+/// in the sensitive `/jobs` and `/tasks` registries; the HTTP `/metrics` snapshot
+/// carries request/status counters, not job/task state — so `/metrics` is no more
+/// informative here than the always-mounted `/health`.
+fn sensitive_gated_where_to_look(
+    prefix: &str,
+    condition: AlertCondition,
+    sensitive: bool,
+) -> String {
+    if sensitive {
+        actuator_where_to_look(prefix, condition)
+    } else {
+        let fallback = actuator_where_to_look(prefix, AlertCondition::HealthIndicatorDown);
+        let gated = actuator_where_to_look(prefix, condition);
+        format!("{fallback} ({gated} requires [actuator] sensitive = true)")
+    }
 }
 
 /// Severity class of an [`Alert`]. External routers (`PagerDuty` etc.) map this
@@ -459,10 +497,21 @@ pub struct AlerterSettings {
     /// operators are sent to the real actuator endpoint even when the prefix is
     /// customized. Stored raw; normalization happens in [`actuator_where_to_look`].
     pub actuator_prefix: String,
+    /// The effective `[actuator] sensitive` flag (default `false`). The `/jobs`
+    /// and `/tasks` actuator endpoints are mounted ONLY when this is `true`
+    /// (see `actuator_router_with_prefix`), so the dead-lettered-job and
+    /// scheduled-task-failure alerts point at them only when they exist and fall
+    /// back to an always-mounted endpoint otherwise (see
+    /// [`sensitive_gated_where_to_look`]).
+    pub actuator_sensitive: bool,
 }
 
 impl AlerterSettings {
-    fn from_config(config: &AlertConfig, actuator_prefix: String) -> Self {
+    fn from_config(
+        config: &AlertConfig,
+        actuator_prefix: String,
+        actuator_sensitive: bool,
+    ) -> Self {
         Self {
             dedup_window: std::time::Duration::from_secs(config.dedup_window_secs.max(1)),
             health_grace: std::time::Duration::from_secs(config.health_grace_secs),
@@ -470,6 +519,7 @@ impl AlerterSettings {
             error_rate_min_requests: config.error_rate_min_requests.max(1),
             eval_interval: std::time::Duration::from_secs(config.eval_interval_secs.max(1)),
             actuator_prefix,
+            actuator_sensitive,
         }
     }
 }
@@ -613,9 +663,10 @@ pub fn notify_dead_lettered_job(state: &AppState, job_name: &str, error: &str) {
     .summary(format!(
         "Background job '{job_name}' exhausted its retries and was moved to the dead-letter queue. Last error: {error}"
     ))
-    .where_to_look(actuator_where_to_look(
+    .where_to_look(sensitive_gated_where_to_look(
         &alerter.settings().actuator_prefix,
         AlertCondition::DeadLetteredJob,
+        alerter.settings().actuator_sensitive,
     ))
     .detail("job", job_name)
     .detail("error", error)
@@ -637,9 +688,10 @@ pub fn notify_scheduled_task_failure(state: &AppState, task_name: &str, error: &
     .summary(format!(
         "The framework-scheduled task '{task_name}' returned an error on its last run: {error}"
     ))
-    .where_to_look(actuator_where_to_look(
+    .where_to_look(sensitive_gated_where_to_look(
         &alerter.settings().actuator_prefix,
         AlertCondition::ScheduledTaskFailure,
+        alerter.settings().actuator_sensitive,
     ))
     .detail("task", task_name)
     .detail("error", error)
@@ -667,9 +719,10 @@ pub fn notify_scheduled_task_recovered(state: &AppState, task_name: &str) {
     .summary(format!(
         "The framework-scheduled task '{task_name}' completed successfully after a previous failure."
     ))
-    .where_to_look(actuator_where_to_look(
+    .where_to_look(sensitive_gated_where_to_look(
         &alerter.settings().actuator_prefix,
         AlertCondition::ScheduledTaskFailure,
+        alerter.settings().actuator_sensitive,
     ))
     .detail("task", task_name)
     .build();
@@ -1043,11 +1096,16 @@ pub fn install_from_config(
         return;
     }
 
-    // Capture the effective actuator prefix so every alert's `where_to_look`
-    // points at the real actuator endpoints even under a custom `[actuator]
-    // prefix`. The full config is installed on `state` before this runs.
-    let actuator_prefix = state.config().actuator.prefix;
-    let settings = AlerterSettings::from_config(config, actuator_prefix);
+    // Capture the effective actuator prefix AND the `sensitive` flag so every
+    // alert's `where_to_look` points at a REAL, mounted actuator endpoint: the
+    // prefix keeps custom-prefix deployments off `/actuator/*` 404s, and
+    // `sensitive` keeps the dead-lettered-job/scheduled-task alerts off the
+    // `/jobs` and `/tasks` endpoints, which are mounted only when `sensitive =
+    // true`. The full config is installed on `state` before this runs.
+    let actuator_cfg = state.config().actuator;
+    let actuator_sensitive = actuator_cfg.sensitive;
+    let actuator_prefix = actuator_cfg.prefix;
+    let settings = AlerterSettings::from_config(config, actuator_prefix, actuator_sensitive);
     let alerter = Alerter::new(channels, settings);
     state.insert_extension(alerter.clone());
     spawn_evaluation_loop(state.clone(), alerter);
@@ -1527,6 +1585,58 @@ mod tests {
     }
 
     #[test]
+    fn sensitive_gated_where_to_look_points_at_mounted_endpoint() {
+        // `sensitive = true`: `/jobs` and `/tasks` ARE mounted, so point at them.
+        assert_eq!(
+            sensitive_gated_where_to_look("/actuator", AlertCondition::DeadLetteredJob, true),
+            "/actuator/jobs"
+        );
+        assert_eq!(
+            sensitive_gated_where_to_look("/actuator", AlertCondition::ScheduledTaskFailure, true),
+            "/actuator/tasks"
+        );
+
+        // `sensitive = false` (the production default): `/jobs` and `/tasks` are
+        // NOT mounted (404). The pointer must NOT link them directly — it points
+        // at the always-mounted `/health` and names the setting that would expose
+        // the richer endpoint.
+        let dead =
+            sensitive_gated_where_to_look("/actuator", AlertCondition::DeadLetteredJob, false);
+        assert!(
+            !dead.starts_with("/actuator/jobs"),
+            "must not link the unmounted /jobs endpoint directly: {dead}"
+        );
+        assert!(
+            dead.contains("/actuator/health"),
+            "must point at the always-mounted /health endpoint: {dead}"
+        );
+        assert!(
+            dead.contains("/actuator/jobs") && dead.contains("[actuator] sensitive = true"),
+            "must hint that /jobs requires enabling [actuator] sensitive: {dead}"
+        );
+
+        let task =
+            sensitive_gated_where_to_look("/actuator", AlertCondition::ScheduledTaskFailure, false);
+        assert!(
+            !task.starts_with("/actuator/tasks"),
+            "must not link the unmounted /tasks endpoint directly: {task}"
+        );
+        assert!(
+            task.contains("/actuator/health"),
+            "must point at the always-mounted /health endpoint: {task}"
+        );
+        assert!(
+            task.contains("/actuator/tasks") && task.contains("[actuator] sensitive = true"),
+            "must hint that /tasks requires enabling [actuator] sensitive: {task}"
+        );
+
+        // The custom prefix flows through both the fallback and the hint.
+        let custom = sensitive_gated_where_to_look("/_ops", AlertCondition::DeadLetteredJob, false);
+        assert!(custom.contains("/_ops/health"));
+        assert!(custom.contains("/_ops/jobs"));
+    }
+
+    #[test]
     fn stable_dedup_key_survives_trigger_and_recovery() {
         let key = "dead_lettered_job:emailer";
         let t = Alert::trigger(AlertCondition::DeadLetteredJob, key).build();
@@ -1564,6 +1674,7 @@ mod tests {
             error_rate_min_requests: 20,
             eval_interval: std::time::Duration::from_secs(30),
             actuator_prefix: "/actuator".to_owned(),
+            actuator_sensitive: false,
         }
     }
 
