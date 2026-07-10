@@ -127,6 +127,41 @@ enum McpExpose {
     Read,
 }
 
+/// The `on_delete` action for a `dependent(...)` association (issue #1369).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DependentAction {
+    Destroy,
+    DeleteAll,
+    Nullify,
+    Restrict,
+}
+
+impl DependentAction {
+    /// The `::autumn_web::repository::DependentAction` variant token.
+    fn variant_ident(self) -> proc_macro2::Ident {
+        let name = match self {
+            Self::Destroy => "Destroy",
+            Self::DeleteAll => "DeleteAll",
+            Self::Nullify => "Nullify",
+            Self::Restrict => "Restrict",
+        };
+        format_ident!("{name}")
+    }
+}
+
+/// One `dependent(ChildRepository, fk = "col", on_delete = action)` clause on a
+/// `#[repository]`. Threads the cascade action from the parent repository's
+/// `delete_by_id` into the child repository's delete path.
+#[derive(Clone)]
+struct DependentSpec {
+    /// The child repository struct type (e.g. `PgCommentRepository`).
+    child_repo: syn::Path,
+    /// The foreign-key column on the child table referencing the parent id.
+    fk: String,
+    /// What to do with the children when the parent is deleted.
+    action: DependentAction,
+}
+
 #[allow(clippy::struct_excessive_bools)]
 struct RepoConfig {
     model_name: Ident,
@@ -179,6 +214,10 @@ struct RepoConfig {
     broadcast_render: Option<syn::Path>,
     broadcast_container: Option<String>,
     generated_internal_hooks: bool,
+    /// `dependent(...)` association clauses (issue #1369). When non-empty,
+    /// `delete_by_id` runs a transactional, soft-delete-aware, hook-firing
+    /// cascade over these child associations before deleting the parent.
+    dependents: Vec<DependentSpec>,
 }
 
 #[allow(clippy::too_many_lines)]
@@ -206,6 +245,7 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
     let mut broadcast_topic: Option<String> = None;
     let mut broadcast_render: Option<syn::Path> = None;
     let mut broadcast_container: Option<String> = None;
+    let mut dependents: Vec<DependentSpec> = Vec::new();
 
     syn::meta::parser(|meta| {
         // `hooks = Ident` must be checked before the catch-all model_name case,
@@ -322,12 +362,74 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
         } else if meta.path.is_ident("sharded") {
             sharded = true;
             Ok(())
+        } else if meta.path.is_ident("dependent") {
+            // `dependent(ChildRepository, fk = "col", on_delete = <action>)`
+            let mut child_repo: Option<syn::Path> = None;
+            let mut fk: Option<String> = None;
+            let mut action: Option<DependentAction> = None;
+            meta.parse_nested_meta(|nested| {
+                if nested.path.is_ident("fk") {
+                    let value: LitStr = nested.value()?.parse()?;
+                    fk = Some(value.value());
+                    Ok(())
+                } else if nested.path.is_ident("on_delete") || nested.path.is_ident("action") {
+                    let value: Ident = nested.value()?.parse()?;
+                    let parsed = match value.to_string().as_str() {
+                        "destroy" => DependentAction::Destroy,
+                        "delete_all" => DependentAction::DeleteAll,
+                        "nullify" => DependentAction::Nullify,
+                        "restrict" => DependentAction::Restrict,
+                        other => {
+                            return Err(syn::Error::new(
+                                value.span(),
+                                format!(
+                                    "unknown dependent action `{other}`; expected one of \
+                                     `destroy`, `delete_all`, `nullify`, `restrict`"
+                                ),
+                            ));
+                        }
+                    };
+                    action = Some(parsed);
+                    Ok(())
+                } else if child_repo.is_none()
+                    && (nested.input.peek(syn::Token![,]) || nested.input.is_empty())
+                {
+                    // The first bare path (no `= value`) is the child repository type.
+                    child_repo = Some(nested.path);
+                    Ok(())
+                } else {
+                    Err(nested.error(
+                        "expected `dependent(ChildRepository, fk = \"column\", \
+                         on_delete = destroy|delete_all|nullify|restrict)`",
+                    ))
+                }
+            })?;
+            let child_repo = child_repo.ok_or_else(|| {
+                meta.error(
+                    "dependent(...) requires a child repository type as its first argument, \
+                     e.g. dependent(PgCommentRepository, fk = \"post_id\", on_delete = destroy)",
+                )
+            })?;
+            let fk = fk.ok_or_else(|| {
+                meta.error("dependent(...) requires `fk = \"<child_fk_column>\"`")
+            })?;
+            let action = action.ok_or_else(|| {
+                meta.error(
+                    "dependent(...) requires `on_delete = destroy|delete_all|nullify|restrict`",
+                )
+            })?;
+            dependents.push(DependentSpec {
+                child_repo,
+                fk,
+                action,
+            });
+            Ok(())
         } else if meta.path.get_ident().is_some() && model_name.is_none() {
             model_name = Some(meta.path.get_ident().unwrap().clone());
             Ok(())
         } else {
             Err(meta.error(
-                "expected model name, table = \"...\", hooks = Type, commit_hooks = true, api = \"/path\", mcp, mcp = \"read\", policy = Type, scope = Type, cursor_key = field, cursor_key_type = Type, soft_delete, tenant_scoped, no_upsert_trait, searchable, versioned = true, no_versioned_record_impl, primary_reads, sharded, broadcasts = true, topic = \"...\", render = fn, or container = \"...\"",
+                "expected model name, table = \"...\", hooks = Type, commit_hooks = true, api = \"/path\", mcp, mcp = \"read\", policy = Type, scope = Type, cursor_key = field, cursor_key_type = Type, soft_delete, tenant_scoped, no_upsert_trait, searchable, versioned = true, no_versioned_record_impl, primary_reads, sharded, dependent(ChildRepository, fk = \"...\", on_delete = ...), broadcasts = true, topic = \"...\", render = fn, or container = \"...\"",
             ))
         }
     })
@@ -378,6 +480,7 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
         broadcast_render,
         broadcast_container,
         generated_internal_hooks,
+        dependents,
     })
 }
 
@@ -1003,6 +1106,394 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         quote! { .filter(#table_ident::deleted_at.is_null()) }
     } else {
         quote! {}
+    };
+
+    // ── #1369 dependent destroy/nullify ─────────────────────────────
+    //
+    // Every generated repository exposes an internal, connection-taking helper
+    // that applies a `DependentAction` to *this* model's rows selected by an
+    // arbitrary foreign-key column. It runs on the caller's connection (and
+    // therefore inside the caller's transaction), so a parent repository's
+    // `delete_by_id` can cascade to its children transactionally. The helper is
+    // generated for every repository (cheap, no callers when unused) so the
+    // parent side only needs the child repository *type* — it never has to know
+    // the child's Diesel schema module.
+    let dependent_child_helper = {
+        // Per-row DESTROY: mirror the repository delete path for one child id
+        // (`__cid`) on the caller's connection — load for-update (soft-delete
+        // aware), fire `before_delete`, apply the soft/hard delete mutation,
+        // record version history, and enqueue the durable commit hook. This is
+        // what makes `dependent = destroy` soft-delete-aware and hook-firing.
+        let destroy_before_delete = if config.hooks_type.is_some() {
+            quote! { self.hooks.before_delete(&mut ctx, &__record).await?; }
+        } else {
+            quote! {}
+        };
+        // #1369 AC4: a child declared `broadcasts = true` WITHOUT `commit_hooks`
+        // (the scaffolded live path) publishes its OOB delete fragment inline in
+        // the normal `delete_by_id` wrapper. The cascade helper bypasses that
+        // wrapper, so it must emit the same inline delete broadcast per cascaded
+        // child — otherwise live clients keep a stale fragment for a destroyed
+        // child. Commit-hook children enqueue the broadcast durably as before
+        // (unchanged), so only the broadcasts-only case needs the inline emit.
+        let dep_needs_broadcast = config.broadcasts && !commit_hooks_enabled;
+        // Version history / commit-hook enqueue / inline broadcast only run when a
+        // row was actually mutated; bind the affected-row count only when that
+        // gate is needed so hook-free, unversioned, non-broadcasting repos emit no
+        // unused binding.
+        let dep_needs_post = config.versioned || commit_hooks_enabled || dep_needs_broadcast;
+        let destroy_count_bind = if dep_needs_post {
+            quote! { let __n }
+        } else {
+            quote! { let _ }
+        };
+        // #1369 P1: the child destroy cascade follows the *parent's* delete kind.
+        // A child is soft-deleted only when it is a `#[soft_delete]` model AND the
+        // parent is being soft-deleted (`__parent_soft`) — leaving the parent row
+        // present so the child FK stays valid. When the parent is hard-deleted, a
+        // soft-delete child must be hard-deleted too: a soft-deleted child left
+        // pointing at a hard-deleted parent is both FK-invalid (NOT NULL FK) and a
+        // semantic orphan. Non-soft-delete children are always hard-deleted.
+        let destroy_mutation = if config.soft_delete {
+            quote! {
+                #destroy_count_bind = if __parent_soft {
+                    let __now = ::autumn_web::reexports::chrono::Utc::now().naive_utc();
+                    ::autumn_web::reexports::diesel::update(
+                        #table_ident::table.find(__cid).filter(#table_ident::deleted_at.is_null())
+                    )
+                        .set(#table_ident::deleted_at.eq(::core::option::Option::Some(__now)))
+                        .execute(conn)
+                        .await
+                        .map_err(::autumn_web::AutumnError::from)?
+                } else {
+                    ::autumn_web::reexports::diesel::delete(#table_ident::table.find(__cid))
+                        .execute(conn)
+                        .await
+                        .map_err(::autumn_web::AutumnError::from)?
+                };
+            }
+        } else {
+            quote! {
+                #destroy_count_bind = ::autumn_web::reexports::diesel::delete(#table_ident::table.find(__cid))
+                    .execute(conn)
+                    .await
+                    .map_err(::autumn_web::AutumnError::from)?;
+            }
+        };
+        let destroy_vh = if config.versioned {
+            vh_insert_ts(
+                table_name,
+                "delete",
+                true,
+                &quote! { __record },
+                None,
+                &quote! { conn },
+                model_name,
+            )
+        } else {
+            quote! {}
+        };
+        let destroy_commit_enqueue = if commit_hooks_enabled {
+            quote! {
+                let __autumn_commit_hook_record = __record.__autumn_commit_hook_to_value()?;
+                ::autumn_web::__private::enqueue_repository_commit_hook_on_conn(
+                    conn,
+                    Self::__autumn_repository_commit_hook_key(),
+                    "delete",
+                    ctx.idempotency_key.as_deref(),
+                    ::core::option::Option::None,
+                    &ctx,
+                    &__autumn_commit_hook_record,
+                )
+                .await?;
+            }
+        } else {
+            quote! {}
+        };
+        let destroy_register = if commit_hooks_enabled {
+            quote! { Self::__autumn_register_repository_commit_hooks(); }
+        } else {
+            quote! {}
+        };
+        // Live-child filter (`AND deleted_at IS NULL`), gated on the PARENT's
+        // delete kind at runtime (#1369). The filter applies only when the parent
+        // is being soft-deleted: the parent row survives, so an already
+        // soft-deleted child is logically gone and would cause no FK problem, and
+        // a live-only selection is correct. When the parent is HARD-deleted the
+        // filter is dropped so the cascade (and the restrict EXISTS probe) operate
+        // on EVERY physically-present child row — otherwise a pre-soft-deleted
+        // child whose NOT NULL FK still points at the parent would survive the
+        // filter and make the subsequent hard parent DELETE fail (destroy) or slip
+        // past the existence check as a raw DB 500 instead of a 409 (restrict).
+        // Non-soft-delete children have no `deleted_at` column, so no filter ever.
+        let destroy_live_filter = if config.soft_delete {
+            quote! { if __parent_soft { " AND \"deleted_at\" IS NULL" } else { "" } }
+        } else {
+            quote! { "" }
+        };
+        // The mutation context (`ctx`) is referenced by the before_delete hook,
+        // the version-history writer, and the commit-hook enqueue. Declare it —
+        // and import the hooks types — only when at least one of those is
+        // present, mirroring the no-hooks delete path so hook-free, unversioned
+        // repos emit no unused imports/bindings. `mut` is only required when a
+        // hook mutates it (before_delete); version-history reads it immutably.
+        let dep_ctx_needed = config.hooks_type.is_some() || dep_needs_post;
+        let dep_hooks_use = if config.hooks_type.is_some() {
+            quote! { use ::autumn_web::hooks::{MutationContext, MutationOp, MutationHooks}; }
+        } else if dep_ctx_needed {
+            quote! { use ::autumn_web::hooks::{MutationContext, MutationOp}; }
+        } else {
+            quote! {}
+        };
+        let destroy_ctx_decl = if config.hooks_type.is_some() {
+            quote! { let mut ctx = MutationContext::new(MutationOp::Delete); }
+        } else if dep_ctx_needed {
+            quote! { let ctx = MutationContext::new(MutationOp::Delete); }
+        } else {
+            quote! {}
+        };
+        // #1369 AC4: inline OOB delete broadcast for a broadcasts-only child,
+        // built from the child record we already hold (`__record`) so no
+        // pre-fetch is needed. Mirrors the inline delete broadcast the normal
+        // `delete_by_id` wrapper emits (static/dynamic topic, tenant scoping,
+        // custom `broadcast_render`), keyed on the destroyed child record.
+        // #1369 broadcast timing: do NOT publish the cascaded child's OOB delete
+        // mid-transaction. If a later dependent action or the parent mutation
+        // fails and the tx rolls back, a mid-tx publish can't be retracted and
+        // clients would drop a fragment for a child that still exists. Instead,
+        // accumulate (topic, dom_id) into `__ret_broadcasts` and hand them back to
+        // the parent, which publishes them only AFTER the tx commits (mirroring
+        // the normal inline delete broadcast, which effectively fires post-commit
+        // for that single op). Commit-hook children defer via the durable outbox
+        // and are unaffected (they never accumulate here — no double publish).
+        let destroy_broadcast = if dep_needs_broadcast {
+            let base_topic = match generate_topic_format(
+                config
+                    .broadcast_topic
+                    .as_deref()
+                    .unwrap_or(&config.table_name),
+                &quote! { __broadcast_rec },
+            ) {
+                Ok(expr) => expr,
+                Err(err) => return err.to_compile_error(),
+            };
+            let topic_expr = if config.tenant_scoped {
+                quote! {
+                    ::std::format!(
+                        "tenant:{}:{}",
+                        ::autumn_web::tenancy::DisplayTenantId::tenant_id_str(
+                            &__broadcast_rec.tenant_id
+                        ),
+                        #base_topic
+                    )
+                }
+            } else {
+                base_topic
+            };
+            let model_prefix = to_snake_case(&config.model_name.to_string());
+            let dom_id_expr = if let Some(ref render_path) = config.broadcast_render {
+                quote! {
+                    ::autumn_web::htmx::extract_html_id(
+                        &{ #render_path(__broadcast_rec) }.into_string()
+                    )
+                    .unwrap_or_else(|| ::std::format!(
+                        "{}-{}",
+                        #model_prefix,
+                        ::autumn_web::repository::ModelPrimaryKey::primary_key_value(
+                            __broadcast_rec
+                        )
+                    ))
+                }
+            } else {
+                quote! {
+                    <#model_name as ::autumn_web::live::LiveFragment>::dom_id(__broadcast_rec)
+                }
+            };
+            quote! {
+                {
+                    let __broadcast_rec: &#model_name = &__record;
+                    let __del_topic: ::std::string::String =
+                        ::std::string::ToString::to_string(&#topic_expr);
+                    let __del_id: ::std::string::String =
+                        ::std::string::ToString::to_string(&#dom_id_expr);
+                    __ret_broadcasts.push((__del_topic, __del_id));
+                }
+            }
+        } else {
+            quote! {}
+        };
+        // Declaration + return of the deferred-broadcast buffer for the Destroy
+        // arm. Only a broadcasts-only child accumulates; every other repo returns
+        // an empty buffer (zero-cost).
+        let destroy_ret_decl = if dep_needs_broadcast {
+            quote! {
+                let mut __ret_broadcasts: ::std::vec::Vec<(::std::string::String, ::std::string::String)> =
+                    ::std::vec::Vec::new();
+            }
+        } else {
+            quote! {}
+        };
+        let destroy_ret_value = if dep_needs_broadcast {
+            quote! { __ret_broadcasts }
+        } else {
+            quote! { ::std::vec::Vec::new() }
+        };
+        let destroy_post_mutation = if dep_needs_post {
+            quote! {
+                if __n != 0 {
+                    #destroy_vh
+                    #destroy_commit_enqueue
+                    #destroy_broadcast
+                }
+            }
+        } else {
+            quote! {}
+        };
+
+        quote! {
+            /// Apply a [`DependentAction`](::autumn_web::repository::DependentAction)
+            /// to this model's rows whose `__fk_column` equals `__parent_id`,
+            /// on the caller's connection/transaction. Framework plumbing for
+            /// `#[repository(..., dependent(...))]` (#1369); not a public API.
+            ///
+            /// `__parent_soft` is the parent repository's delete kind: `true`
+            /// when the parent is being soft-deleted, `false` when hard-deleted.
+            /// The `Destroy` action follows it so a soft-delete child is only
+            /// soft-deleted alongside a soft-deleted parent (see below).
+            ///
+            /// Returns the `(topic, dom_id)` OOB delete broadcasts accumulated for
+            /// `broadcasts = true` (non-commit-hook) children — the parent
+            /// publishes them only AFTER its transaction commits, so a rolled-back
+            /// cascade broadcasts nothing. Empty for every other configuration.
+            ///
+            /// NOTE (#1369 scope / see #1702): the `Destroy` cascade is
+            /// single-level — it applies this model's mutation to each child but
+            /// does NOT recursively invoke the child's own `dependent(...)`
+            /// cascade, so grandchildren are not handled. #1369's target graph is
+            /// single-level; recursive/multi-level cascade is a tracked follow-up.
+            #[doc(hidden)]
+            pub async fn __autumn_apply_dependent_on_conn(
+                &self,
+                conn: &mut ::autumn_web::reexports::diesel_async::AsyncPgConnection,
+                __fk_column: &str,
+                __parent_id: i64,
+                __action: ::autumn_web::repository::DependentAction,
+                __parent_soft: bool,
+            ) -> ::autumn_web::AutumnResult<
+                ::std::vec::Vec<(::std::string::String, ::std::string::String)>,
+            > {
+                use ::autumn_web::reexports::diesel::prelude::*;
+                use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                #dep_hooks_use
+                let __table: &str = #table_name;
+                match __action {
+                    ::autumn_web::repository::DependentAction::Restrict => {
+                        #[derive(::autumn_web::reexports::diesel::QueryableByName)]
+                        struct __AutumnDepExists {
+                            #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Bool)]
+                            dep_present: bool,
+                        }
+                        // `AS dep_present` (not `AS exists`): `exists` is a
+                        // Postgres reserved word and would need quoting.
+                        // The live filter makes `restrict` soft-delete-aware: an
+                        // already-soft-deleted child must not block the parent
+                        // with a 409 (it is no longer a live orphan).
+                        let __q = format!(
+                            "SELECT EXISTS(SELECT 1 FROM \"{}\" WHERE \"{}\" = $1{}) AS dep_present",
+                            __table, __fk_column, #destroy_live_filter
+                        );
+                        let __row: __AutumnDepExists =
+                            ::autumn_web::reexports::diesel::sql_query(__q)
+                                .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(__parent_id)
+                                .get_result::<__AutumnDepExists>(conn)
+                                .await
+                                .map_err(::autumn_web::AutumnError::from)?;
+                        if __row.dep_present {
+                            return ::core::result::Result::Err(
+                                ::autumn_web::AutumnError::conflict_msg(format!(
+                                    "cannot delete: dependent {} row(s) referencing this record \
+                                     via \"{}\".\"{}\" still exist (dependent = restrict)",
+                                    stringify!(#model_name), __table, __fk_column
+                                ))
+                            );
+                        }
+                        ::core::result::Result::Ok(::std::vec::Vec::new())
+                    }
+                    ::autumn_web::repository::DependentAction::Nullify => {
+                        let __q = format!(
+                            "UPDATE \"{}\" SET \"{}\" = NULL WHERE \"{}\" = $1",
+                            __table, __fk_column, __fk_column
+                        );
+                        ::autumn_web::reexports::diesel::sql_query(__q)
+                            .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(__parent_id)
+                            .execute(conn)
+                            .await
+                            .map_err(::autumn_web::AutumnError::from)?;
+                        ::core::result::Result::Ok(::std::vec::Vec::new())
+                    }
+                    ::autumn_web::repository::DependentAction::DeleteAll => {
+                        let __q = format!(
+                            "DELETE FROM \"{}\" WHERE \"{}\" = $1",
+                            __table, __fk_column
+                        );
+                        ::autumn_web::reexports::diesel::sql_query(__q)
+                            .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(__parent_id)
+                            .execute(conn)
+                            .await
+                            .map_err(::autumn_web::AutumnError::from)?;
+                        ::core::result::Result::Ok(::std::vec::Vec::new())
+                    }
+                    ::autumn_web::repository::DependentAction::Destroy => {
+                        // Single-level cascade (#1369 scope; recursion tracked in
+                        // #1702): each child's mutation is applied inline here; the
+                        // child's OWN `dependent(...)` cascade is NOT invoked, so
+                        // grandchildren are not recursively destroyed/nullified.
+                        #destroy_register
+                        #destroy_ret_decl
+                        #[derive(::autumn_web::reexports::diesel::QueryableByName)]
+                        struct __AutumnDepId {
+                            #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::BigInt)]
+                            id: i64,
+                        }
+                        let __q = format!(
+                            "SELECT id FROM \"{}\" WHERE \"{}\" = $1{} ORDER BY id",
+                            __table, __fk_column, #destroy_live_filter
+                        );
+                        let __ids: ::std::vec::Vec<__AutumnDepId> =
+                            ::autumn_web::reexports::diesel::sql_query(__q)
+                                .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(__parent_id)
+                                .load::<__AutumnDepId>(conn)
+                                .await
+                                .map_err(::autumn_web::AutumnError::from)?;
+                        for __row in __ids {
+                            let __cid = __row.id;
+                            // #1369: reload the EXACT id the (parent-soft-gated)
+                            // selection returned — do NOT re-apply `#sd_filter`
+                            // (`deleted_at IS NULL`) here. On a hard parent delete
+                            // the selection intentionally includes already
+                            // soft-deleted children (their FK still references the
+                            // parent), so a live-only reload would return `None`,
+                            // skip the hard delete, and leave the row to FK-fail
+                            // the parent DELETE. The id set is authoritative for
+                            // the parent kind; the row is locked with `for_update`.
+                            let __record = #table_ident::table.find(__cid)
+                                .for_update()
+                                .first::<#model_name>(conn)
+                                .await
+                                .optional()
+                                .map_err(::autumn_web::AutumnError::from)?;
+                            if let ::core::option::Option::Some(__record) = __record {
+                                #destroy_ctx_decl
+                                #destroy_before_delete
+                                #destroy_mutation
+                                #destroy_post_mutation
+                            }
+                        }
+                        ::core::result::Result::Ok(#destroy_ret_value)
+                    }
+                }
+            }
+        }
     };
 
     // Parse derived query methods from trait body
@@ -7363,6 +7854,318 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         quote! {}
     };
 
+    // ── #1369: transactional dependent cascade for delete_by_id ──────
+    //
+    // When the repository declares `dependent(...)` associations, override the
+    // default `delete_body` with one that (1) always opens a transaction, (2)
+    // loads and locks the parent, (3) applies every declared dependent action
+    // to the children on that same connection *before* deleting the parent, and
+    // (4) deletes the parent. Any error rolls the whole graph back. Children are
+    // removed/nullified before the parent delete so no FK/orphan can occur.
+    //
+    // This override is computed before the `cross_shard_write_guard` tuple below
+    // so the guard is prepended here too: on a sharded + tenant_scoped repo an
+    // `across_tenants()` delete is rejected rather than cascading across shards
+    // from a single routed connection (honoring the #1592/#1664/#1687 guards; a
+    // cascade cannot silently skip children living on other shards).
+    let delete_body = if config.dependents.is_empty() {
+        delete_body
+    } else {
+        // The parent's own delete kind (soft vs hard) drives the child `destroy`
+        // cascade (#1369 P1): a soft-delete child is only soft-deleted alongside
+        // a soft-deleted parent; a hard-deleted parent hard-deletes its children.
+        let parent_soft_lit = if config.soft_delete {
+            quote! { true }
+        } else {
+            quote! { false }
+        };
+        let cascade_calls = config.dependents.iter().map(|dep| {
+            let child_repo = &dep.child_repo;
+            let fk = &dep.fk;
+            let action_variant = dep.action.variant_ident();
+            quote! {
+                let __autumn_dep_repo = #child_repo::with_pool_untracked(
+                    ::core::clone::Clone::clone(&self.pool)
+                );
+                // Deferred delete broadcasts accumulate here; they are published
+                // only after the tx commits (see the post-commit region below).
+                __autumn_dep_broadcasts.extend(
+                    __autumn_dep_repo
+                        .__autumn_apply_dependent_on_conn(
+                            conn,
+                            #fk,
+                            id,
+                            ::autumn_web::repository::DependentAction::#action_variant,
+                            #parent_soft_lit,
+                        )
+                        .await?
+                );
+            }
+        });
+        let cascade_calls = quote! { #(#cascade_calls)* };
+
+        let tenant_id_setup = if config.tenant_scoped {
+            quote! {
+                let tenant_id = if self.across_tenants {
+                    ::core::option::Option::None
+                } else {
+                    let t = ::autumn_web::tenancy::CURRENT_TENANT
+                        .try_with(|t| t.clone()).ok().flatten()
+                        .ok_or_else(|| ::autumn_web::AutumnError::internal_server_error_msg(
+                            "Query scoped to tenant, but no tenant context was established"
+                        ))?;
+                    ::core::option::Option::Some(t)
+                };
+            }
+        } else {
+            quote! {}
+        };
+
+        // The parent record is loaded (and row-locked via `for_update`) to run
+        // the not-found check and to feed the before_delete hook / version
+        // history / commit-hook payload. When the parent has none of those, the
+        // load still runs (lock + not-found) but the binding is discarded so a
+        // hook-free parent emits no unused binding.
+        let parent_needs_record =
+            config.hooks_type.is_some() || config.versioned || commit_hooks_enabled;
+        let parent_record_bind = if parent_needs_record {
+            quote! { record }
+        } else {
+            quote! { _record }
+        };
+        let parent_load = if config.tenant_scoped {
+            quote! {
+                let __load_query = #table_ident::table.find(id) #sd_filter;
+                let #parent_record_bind = if let ::core::option::Option::Some(ref t) = tenant_id {
+                    __load_query.filter(#table_ident::tenant_id.eq(t)).for_update().first::<#model_name>(conn).await
+                } else {
+                    __load_query.for_update().first::<#model_name>(conn).await
+                }
+                .optional()
+                .map_err(::autumn_web::AutumnError::from)?
+                .ok_or_else(|| ::autumn_web::AutumnError::not_found_msg(
+                    format!("{} with id {} not found", stringify!(#model_name), id)
+                ))?;
+            }
+        } else {
+            quote! {
+                let #parent_record_bind = #table_ident::table.find(id) #sd_filter
+                    .for_update()
+                    .first::<#model_name>(conn)
+                    .await
+                    .optional()
+                    .map_err(::autumn_web::AutumnError::from)?
+                    .ok_or_else(|| ::autumn_web::AutumnError::not_found_msg(
+                        format!("{} with id {} not found", stringify!(#model_name), id)
+                    ))?;
+            }
+        };
+
+        let parent_mutation = if config.soft_delete {
+            let tenant_scoped_update = if config.tenant_scoped {
+                quote! {
+                    let __count = if let ::core::option::Option::Some(ref t) = tenant_id {
+                        ::autumn_web::reexports::diesel::update(
+                            #table_ident::table.find(id)
+                                .filter(#table_ident::deleted_at.is_null())
+                                .filter(#table_ident::tenant_id.eq(t))
+                        )
+                            .set(#table_ident::deleted_at.eq(::core::option::Option::Some(__now)))
+                            .execute(conn).await
+                    } else {
+                        ::autumn_web::reexports::diesel::update(
+                            #table_ident::table.find(id).filter(#table_ident::deleted_at.is_null())
+                        )
+                            .set(#table_ident::deleted_at.eq(::core::option::Option::Some(__now)))
+                            .execute(conn).await
+                    }
+                    .map_err(::autumn_web::AutumnError::from)?;
+                }
+            } else {
+                quote! {
+                    let __count = ::autumn_web::reexports::diesel::update(
+                        #table_ident::table.find(id).filter(#table_ident::deleted_at.is_null())
+                    )
+                        .set(#table_ident::deleted_at.eq(::core::option::Option::Some(__now)))
+                        .execute(conn).await
+                        .map_err(::autumn_web::AutumnError::from)?;
+                }
+            };
+            quote! {
+                let __now = ::autumn_web::reexports::chrono::Utc::now().naive_utc();
+                #tenant_scoped_update
+                if __count == 0 {
+                    return Err(::autumn_web::AutumnError::not_found_msg(
+                        format!("{} with id {} not found", stringify!(#model_name), id)
+                    ));
+                }
+            }
+        } else {
+            let delete_stmt = if config.tenant_scoped {
+                quote! {
+                    let __count = if let ::core::option::Option::Some(ref t) = tenant_id {
+                        ::autumn_web::reexports::diesel::delete(
+                            #table_ident::table.find(id).filter(#table_ident::tenant_id.eq(t))
+                        ).execute(conn).await
+                    } else {
+                        ::autumn_web::reexports::diesel::delete(#table_ident::table.find(id))
+                            .execute(conn).await
+                    }
+                    .map_err(::autumn_web::AutumnError::from)?;
+                }
+            } else {
+                quote! {
+                    let __count = ::autumn_web::reexports::diesel::delete(#table_ident::table.find(id))
+                        .execute(conn).await
+                        .map_err(::autumn_web::AutumnError::from)?;
+                }
+            };
+            quote! {
+                #delete_stmt
+                if __count == 0 {
+                    return Err(::autumn_web::AutumnError::not_found_msg(
+                        format!("{} with id {} not found", stringify!(#model_name), id)
+                    ));
+                }
+            }
+        };
+
+        let parent_before_delete = if config.hooks_type.is_some() {
+            quote! { self.hooks.before_delete(&mut ctx, &record).await?; }
+        } else {
+            quote! {}
+        };
+        let parent_vh = if config.versioned {
+            vh_insert_ts(
+                table_name,
+                "delete",
+                true,
+                &quote! { record },
+                None,
+                &quote! { conn },
+                model_name,
+            )
+        } else {
+            quote! {}
+        };
+        let (parent_register, parent_idempotency_setup, parent_commit_enqueue, _parent_kick) =
+            if commit_hooks_enabled {
+                (
+                    quote! { Self::__autumn_register_repository_commit_hooks(); },
+                    quote! {
+                        let mut __autumn_commit_hook_discriminator: ::core::option::Option<::std::string::String> =
+                            ::core::option::Option::None;
+                        if let ::core::option::Option::Some(__autumn_idempotency) = &self.idempotency {
+                            ctx.set_idempotency_key(__autumn_idempotency.scoped_key());
+                            __autumn_commit_hook_discriminator =
+                                ::core::option::Option::Some(__autumn_idempotency.next_mutation_discriminator());
+                        }
+                    },
+                    quote! {
+                        let __autumn_commit_hook_record = record.__autumn_commit_hook_to_value()?;
+                        ::autumn_web::__private::enqueue_repository_commit_hook_on_conn(
+                            conn,
+                            Self::__autumn_repository_commit_hook_key(),
+                            "delete",
+                            ctx.idempotency_key.as_deref(),
+                            __autumn_commit_hook_discriminator.as_deref(),
+                            &ctx,
+                            &__autumn_commit_hook_record,
+                        )
+                        .await?;
+                    },
+                    quote! { ::autumn_web::__private::kick_repository_commit_hook_dispatcher(&self.pool); },
+                )
+            } else {
+                (quote! {}, quote! {}, quote! {}, quote! {})
+            };
+
+        // `ctx` is referenced by the before_delete hook, the version-history
+        // writer, and the commit-hook enqueue/idempotency setup — declare it and
+        // import the hooks types only when at least one is present, so a
+        // hook-free, unversioned parent (dependents only) emits no unused
+        // import/binding. `mut` is only required when it is written (hook or
+        // idempotency setup); version-history reads it immutably.
+        let parent_ctx_needed = parent_needs_record;
+        let parent_ctx_mut = config.hooks_type.is_some() || commit_hooks_enabled;
+        let parent_hooks_use = if config.hooks_type.is_some() {
+            quote! { use ::autumn_web::hooks::{MutationContext, MutationOp, MutationHooks}; }
+        } else if parent_ctx_needed {
+            quote! { use ::autumn_web::hooks::{MutationContext, MutationOp}; }
+        } else {
+            quote! {}
+        };
+        let parent_ctx_decl = if parent_ctx_needed {
+            if parent_ctx_mut {
+                quote! { let mut ctx = MutationContext::new(MutationOp::Delete); }
+            } else {
+                quote! { let ctx = MutationContext::new(MutationOp::Delete); }
+            }
+        } else {
+            quote! {}
+        };
+        quote! {
+            use ::autumn_web::reexports::diesel::prelude::*;
+            use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+            use ::autumn_web::reexports::diesel_async::AsyncConnection;
+            use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
+            #parent_hooks_use
+
+            #parent_register
+            #tenant_id_setup
+            let mut conn = self.__autumn_acquire_conn().await?;
+            // Deferred OOB delete broadcasts for broadcasts-only cascaded children
+            // (#1369). Accumulated inside the tx and returned on commit, so a
+            // rollback drops them and no spurious client deletes are published.
+            let __autumn_dep_broadcasts: ::std::vec::Vec<(::std::string::String, ::std::string::String)> =
+                ::autumn_web::__private::scoped_transaction::<
+                    ::std::vec::Vec<(::std::string::String, ::std::string::String)>,
+                    ::autumn_web::AutumnError, _, _,
+                >(
+                    &mut *conn,
+                    |conn| {
+                        async move {
+                            let mut __autumn_dep_broadcasts: ::std::vec::Vec<(::std::string::String, ::std::string::String)> =
+                                ::std::vec::Vec::new();
+                            #parent_ctx_decl
+                            #parent_idempotency_setup
+
+                            #parent_load
+
+                            #parent_before_delete
+
+                            // Cascade to dependent children FIRST so the parent
+                            // delete never trips a foreign-key constraint and no
+                            // orphan can survive the transaction.
+                            #cascade_calls
+
+                            #parent_mutation
+
+                            #parent_vh
+
+                            #parent_commit_enqueue
+
+                            Ok(__autumn_dep_broadcasts)
+                        }
+                        .scope_boxed()
+                    },
+                )
+                .await?;
+            ::core::mem::drop(conn);
+            // Publish the cascaded children's OOB delete broadcasts only now that
+            // the transaction has committed (a rolled-back cascade published
+            // nothing). No-op when the buffer is empty / live channels are off.
+            ::autumn_web::repository::publish_deferred_dependent_broadcasts(__autumn_dep_broadcasts);
+            // Always kick the durable commit-hook dispatcher after a dependent
+            // delete: even when this parent has no commit hooks, a cascaded
+            // `dependent = destroy` child may have enqueued one in the same
+            // transaction. The kick is idempotent.
+            ::autumn_web::__private::kick_repository_commit_hook_dispatcher(&self.pool);
+
+            Ok(())
+        }
+    };
+
     let (
         save_body,
         update_body,
@@ -10697,6 +11500,15 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         fn save_many(&self, new: &[#new_name]) -> impl ::std::future::Future<Output = ::autumn_web::AutumnResult<Vec<#model_name>>> + Send;
         fn save_many_skip_invalid(&self, new: &[#new_name]) -> impl ::std::future::Future<Output = ::autumn_web::AutumnResult<(Vec<#model_name>, Vec<(usize, ::autumn_web::AutumnError)>)>> + Send;
         fn update_many(&self, ids: &[i64], changes: &#update_name) -> impl ::std::future::Future<Output = ::autumn_web::AutumnResult<Vec<#model_name>>> + Send;
+        /// Bulk-delete the given ids in one statement.
+        ///
+        /// NOTE (#1369 scope; see #1702): `dependent(...)` cascade actions are
+        /// NOT applied on this bulk path — AC2 scopes dependent actions to the
+        /// single-record `delete_by_id`/`destroy`. On a repository that declares
+        /// `dependent(...)`, `delete_many` issues a plain bulk parent
+        /// delete/soft-delete and does not cascade, so it can FK-fail or orphan
+        /// children. Callers who need the cascade must use `delete_by_id`. Bulk
+        /// cascade is a tracked follow-up.
         fn delete_many(&self, ids: &[i64]) -> impl ::std::future::Future<Output = ::autumn_web::AutumnResult<()>> + Send;
         #upsert_many_trait_method
     };
@@ -11671,6 +12483,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             #search_one_shard_helpers
             #with_pool_method
             #hook_support_methods
+            #dependent_child_helper
 
             /// Returns a clone of this repository whose generated read
             /// methods are pinned to the primary pool for the rest of the
@@ -13152,6 +13965,508 @@ mod tests {
         assert!(
             delete_pos < history_pos,
             "hooked versioned delete_many must record history after database deletion/update: {section}"
+        );
+    }
+
+    // ── #1369: dependent destroy/nullify ───────────────────────────
+
+    /// Helper: slice the generated `delete_by_id` trait-impl body (up to the
+    /// next `async fn`) so assertions target the parent delete path, not the
+    /// always-generated `__autumn_apply_dependent_on_conn` helper.
+    fn delete_by_id_section(generated: &str) -> &str {
+        let start = generated
+            .find("async fn delete_by_id")
+            .expect("repository must generate delete_by_id");
+        let rest = &generated[start + "async fn delete_by_id".len()..];
+        let end = rest.find("async fn ").map_or(rest.len(), |p| p);
+        &rest[..end]
+    }
+
+    /// Helper: slice the `Destroy` match arm of the generated
+    /// `__autumn_apply_dependent_on_conn` helper, bounded to the helper method
+    /// (which ends right before the always-generated `pub fn on_primary`), so
+    /// assertions don't accidentally match the repository's OWN broadcast /
+    /// commit-hook codegen emitted elsewhere in the output.
+    fn dependent_helper_body(generated: &str) -> &str {
+        // Anchor on the method *definition* — the bare name also appears at the
+        // parent's cascade *call* site inside `delete_by_id`. Bound to the method
+        // (it ends right before the always-generated `pub fn on_primary`).
+        let hstart = generated
+            .find("pub async fn __autumn_apply_dependent_on_conn")
+            .expect("dependent-apply helper definition present");
+        let hrest = &generated[hstart..];
+        let hend = hrest.find("pub fn on_primary").unwrap_or(hrest.len());
+        &hrest[..hend]
+    }
+
+    fn dependent_destroy_arm(generated: &str) -> &str {
+        let helper = dependent_helper_body(generated);
+        let destroy_at = helper
+            .find("DependentAction :: Destroy")
+            .expect("destroy arm present");
+        &helper[destroy_at..]
+    }
+
+    /// The `Restrict` match arm, bounded to before the `Nullify` arm so
+    /// assertions don't leak into the other arms.
+    fn dependent_restrict_arm(generated: &str) -> &str {
+        let helper = dependent_helper_body(generated);
+        let start = helper
+            .find("DependentAction :: Restrict")
+            .expect("restrict arm present");
+        let arm = &helper[start..];
+        let end = arm.find("DependentAction :: Nullify").unwrap_or(arm.len());
+        &arm[..end]
+    }
+
+    #[test]
+    fn parse_repo_args_parses_dependent_destroy() {
+        let tokens: proc_macro2::TokenStream =
+            r#"Post, dependent(PgCommentRepository, fk = "post_id", on_delete = destroy)"#
+                .parse()
+                .unwrap();
+        let config = parse_repo_args(tokens).unwrap();
+        assert_eq!(config.dependents.len(), 1, "one dependent spec expected");
+        let dep = &config.dependents[0];
+        assert_eq!(dep.fk, "post_id");
+        assert_eq!(dep.action, DependentAction::Destroy);
+        let child_repo = &dep.child_repo;
+        assert_eq!(
+            quote! { #child_repo }.to_string(),
+            "PgCommentRepository",
+            "child repo path must be captured"
+        );
+    }
+
+    #[test]
+    fn parse_repo_args_parses_all_dependent_actions_and_multiple_specs() {
+        let tokens: proc_macro2::TokenStream = r#"Post,
+            dependent(PgCommentRepository, fk = "post_id", on_delete = destroy),
+            dependent(PgVoteRepository, fk = "post_id", on_delete = delete_all),
+            dependent(PgBookmarkRepository, fk = "post_id", on_delete = nullify),
+            dependent(PgAwardRepository, fk = "post_id", on_delete = restrict)"#
+            .parse()
+            .unwrap();
+        let config = parse_repo_args(tokens).unwrap();
+        let actions: Vec<DependentAction> = config.dependents.iter().map(|d| d.action).collect();
+        assert_eq!(
+            actions,
+            vec![
+                DependentAction::Destroy,
+                DependentAction::DeleteAll,
+                DependentAction::Nullify,
+                DependentAction::Restrict,
+            ],
+            "all four actions parse and preserve declared order"
+        );
+    }
+
+    #[test]
+    fn parse_repo_args_rejects_unknown_dependent_action() {
+        let tokens: proc_macro2::TokenStream =
+            r#"Post, dependent(PgCommentRepository, fk = "post_id", on_delete = explode)"#
+                .parse()
+                .unwrap();
+        let Err(err) = parse_repo_args(tokens) else {
+            panic!("unknown action must be rejected");
+        };
+        assert!(
+            err.to_string().contains("unknown dependent action"),
+            "error should name the bad action: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_repo_args_dependent_requires_fk() {
+        let tokens: proc_macro2::TokenStream =
+            r"Post, dependent(PgCommentRepository, on_delete = destroy)"
+                .parse()
+                .unwrap();
+        let Err(err) = parse_repo_args(tokens) else {
+            panic!("missing fk must be rejected");
+        };
+        assert!(
+            err.to_string().contains("fk"),
+            "error should mention fk: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_repo_args_dependents_default_empty() {
+        let config = parse_repo_args("Post".parse().unwrap()).unwrap();
+        assert!(
+            config.dependents.is_empty(),
+            "no dependents unless declared (AC7: default unchanged)"
+        );
+    }
+
+    #[test]
+    fn repository_macro_always_generates_dependent_helper() {
+        // The connection-taking helper is generated for every repository so the
+        // parent side only needs the child repository *type*.
+        let generated =
+            repository_macro(quote! { Post }, quote! { pub trait PostRepository {} }).to_string();
+        assert!(
+            generated.contains("__autumn_apply_dependent_on_conn"),
+            "every repository must expose the dependent-apply helper"
+        );
+        assert!(
+            generated.contains("DependentAction"),
+            "helper must match on the DependentAction enum"
+        );
+    }
+
+    #[test]
+    fn repository_macro_without_dependents_delete_by_id_has_no_cascade() {
+        // AC7: default behavior unchanged — delete_by_id must not call the
+        // cascade helper when no dependents are declared.
+        let generated =
+            repository_macro(quote! { Post }, quote! { pub trait PostRepository {} }).to_string();
+        let section = delete_by_id_section(&generated);
+        assert!(
+            !section.contains("__autumn_apply_dependent_on_conn"),
+            "delete_by_id must not cascade when no dependent(...) is declared: {section}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_dependent_delete_cascades_inside_transaction_before_parent_delete() {
+        // AC2 + AC6: cascade runs inside a single scoped_transaction and before
+        // the parent DELETE (children removed first → no FK/orphan).
+        let generated = repository_macro(
+            quote! { Post, dependent(PgCommentRepository, fk = "post_id", on_delete = destroy) },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        let section = delete_by_id_section(&generated);
+        assert!(
+            section.contains("scoped_transaction"),
+            "dependent delete_by_id must open a transaction: {section}"
+        );
+        let cascade_pos = section
+            .find("__autumn_apply_dependent_on_conn")
+            .expect("dependent delete_by_id must call the cascade helper");
+        let parent_delete_pos = section
+            .find("diesel :: delete")
+            .expect("dependent delete_by_id must issue the parent DELETE");
+        assert!(
+            cascade_pos < parent_delete_pos,
+            "children must be cascaded before the parent DELETE: {section}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_dependent_helper_restrict_uses_conflict_error() {
+        // AC1 + AC5: restrict surfaces a typed 409 Conflict, not a 500.
+        let generated = repository_macro(
+            quote! { Post, dependent(PgAwardRepository, fk = "post_id", on_delete = restrict) },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        assert!(
+            generated.contains("conflict_msg"),
+            "restrict must produce a typed conflict error"
+        );
+        assert!(
+            generated.contains("SELECT EXISTS"),
+            "restrict must probe for existing children"
+        );
+        // Non-soft-delete child: the EXISTS probe carries no live filter
+        // (a non-soft-delete repository references `deleted_at` nowhere).
+        assert!(
+            !generated.contains("deleted_at"),
+            "a non-soft-delete restrict probe must not filter on deleted_at"
+        );
+    }
+
+    #[test]
+    fn repository_macro_dependent_restrict_live_filter_gated_on_parent_soft() {
+        // For a soft-delete child, the restrict EXISTS probe's live filter is
+        // gated on the PARENT's delete kind (`__parent_soft`): a soft parent
+        // keeps the filter (a logically-gone child shouldn't spuriously 409),
+        // but a HARD parent drops it so any physically-present FK-referencing
+        // child yields a clean 409 rather than a raw DB 500 on the parent DELETE.
+        let generated = repository_macro(
+            quote! { Comment, soft_delete, dependent(PgReplyRepository, fk = "comment_id", on_delete = restrict) },
+            quote! { pub trait CommentRepository {} },
+        )
+        .to_string();
+        let restrict_arm = dependent_restrict_arm(&generated);
+        assert!(
+            restrict_arm.contains("SELECT EXISTS"),
+            "restrict must probe for existing children: {restrict_arm}"
+        );
+        // The live filter is a runtime `if __parent_soft { \" AND ...deleted_at.. IS NULL\" } else { \"\" }`.
+        assert!(
+            restrict_arm.contains("if __parent_soft"),
+            "soft-delete restrict probe's live filter must be gated on __parent_soft: {restrict_arm}"
+        );
+        assert!(
+            restrict_arm.contains("deleted_at") && restrict_arm.contains("IS NULL"),
+            "the soft-parent branch of the restrict probe must carry the live filter: {restrict_arm}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_dependent_helper_nullify_sets_fk_null() {
+        let generated = repository_macro(
+            quote! { Post, dependent(PgBookmarkRepository, fk = "post_id", on_delete = nullify) },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        assert!(
+            generated.contains("= NULL WHERE"),
+            "nullify must UPDATE the child FK column to NULL"
+        );
+    }
+
+    #[test]
+    fn repository_macro_dependent_helper_delete_all_bulk_deletes() {
+        let generated = repository_macro(
+            quote! { Post, dependent(PgVoteRepository, fk = "post_id", on_delete = delete_all) },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        assert!(
+            generated.contains("DELETE FROM"),
+            "delete_all must issue a bulk DELETE"
+        );
+    }
+
+    #[test]
+    fn repository_macro_dependent_destroy_helper_is_soft_delete_aware() {
+        // AC3: a soft_delete child soft-deletes its rows on cascade. The
+        // child-selection live filter is gated on the parent's delete kind
+        // (`__parent_soft`): kept for a soft parent, dropped for a hard parent so
+        // even a pre-soft-deleted child is hard-deleted (no surviving FK row).
+        let generated = repository_macro(
+            quote! { Comment, soft_delete, dependent(PgReplyRepository, fk = "comment_id", on_delete = destroy) },
+            quote! { pub trait CommentRepository {} },
+        )
+        .to_string();
+        let destroy_arm = dependent_destroy_arm(&generated);
+        assert!(
+            destroy_arm.contains("deleted_at"),
+            "soft_delete repo's destroy path must soft-delete (touch deleted_at): {destroy_arm}"
+        );
+        assert!(
+            destroy_arm.contains("if __parent_soft"),
+            "the child-selection live filter must be gated on __parent_soft: {destroy_arm}"
+        );
+        assert!(
+            destroy_arm.contains("IS NULL"),
+            "the soft-parent branch must select only live children: {destroy_arm}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_dependent_live_filter_is_parent_soft_gated_not_child_only() {
+        // The live filter (`deleted_at IS NULL`) must be a RUNTIME choice keyed on
+        // `__parent_soft`, not baked in unconditionally for a soft_delete child.
+        // Both the destroy child-selection and the restrict EXISTS probe carry the
+        // gated form `if __parent_soft { \" AND ..deleted_at.. IS NULL\" } else { \"\" }`,
+        // so a hard parent delete operates on ALL physically-present children.
+        let generated = repository_macro(
+            quote! {
+                Comment, soft_delete,
+                dependent(PgReplyRepository, fk = "comment_id", on_delete = destroy),
+                dependent(PgFlagRepository, fk = "comment_id", on_delete = restrict)
+            },
+            quote! { pub trait CommentRepository {} },
+        )
+        .to_string();
+        let destroy_arm = dependent_destroy_arm(&generated);
+        let restrict_arm = dependent_restrict_arm(&generated);
+        // Gated form present in both arms.
+        assert!(
+            destroy_arm.contains("if __parent_soft") && destroy_arm.contains("else { \"\" }"),
+            "destroy live filter must be parent-soft-gated with an empty else: {destroy_arm}"
+        );
+        assert!(
+            restrict_arm.contains("if __parent_soft") && restrict_arm.contains("else { \"\" }"),
+            "restrict live filter must be parent-soft-gated with an empty else: {restrict_arm}"
+        );
+        // Sanity: a non-soft-delete child carries no live filter at all.
+        let non_soft = repository_macro(
+            quote! { Post, dependent(PgAwardRepository, fk = "post_id", on_delete = restrict) },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        assert!(
+            !non_soft.contains("deleted_at"),
+            "a non-soft-delete child must have no live filter"
+        );
+    }
+
+    #[test]
+    fn repository_macro_dependent_destroy_follows_parent_delete_kind() {
+        // #1369 P1: a soft_delete child's destroy branch must branch on
+        // `__parent_soft` — soft-deleting only when the parent is soft-deleted,
+        // and hard-deleting (a real `diesel::delete`) when the parent is
+        // hard-deleted, so a soft child never dangles off a hard-deleted parent.
+        let generated = repository_macro(
+            quote! { Comment, soft_delete, dependent(PgReplyRepository, fk = "comment_id", on_delete = destroy) },
+            quote! { pub trait CommentRepository {} },
+        )
+        .to_string();
+        let start = generated
+            .find("__autumn_apply_dependent_on_conn")
+            .expect("helper present");
+        let helper = &generated[start..];
+        // The helper takes the parent delete-kind flag and branches on it.
+        assert!(
+            helper.contains("__parent_soft"),
+            "destroy must thread the parent's delete kind (__parent_soft): {helper}"
+        );
+        assert!(
+            helper.contains("if __parent_soft"),
+            "soft_delete child destroy must branch on __parent_soft: {helper}"
+        );
+        // Both a soft mutation (UPDATE deleted_at) and a hard delete must be
+        // present in the destroy branch (one per parent-delete-kind arm).
+        let destroy_at = helper
+            .find("DependentAction :: Destroy")
+            .expect("destroy arm present");
+        let destroy_arm = &helper[destroy_at..];
+        assert!(
+            destroy_arm.contains("diesel :: update") && destroy_arm.contains("deleted_at"),
+            "destroy soft arm must UPDATE deleted_at: {destroy_arm}"
+        );
+        assert!(
+            destroy_arm.contains("diesel :: delete"),
+            "destroy hard arm (parent hard-deleted) must issue a real DELETE even for a soft_delete child: {destroy_arm}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_dependent_destroy_reload_does_not_filter_deleted_at() {
+        // #1369 (second live-filter site): the per-ID reload that fetches each
+        // selected child must NOT re-apply `deleted_at IS NULL`. The id-selection
+        // is already parent-soft-gated, so on a HARD parent delete it returns
+        // already-soft-deleted children too; a live-only reload would return
+        // `None`, skip the hard delete, and leave the FK to fail the parent
+        // DELETE. Assert the reload goes straight `find(__cid).for_update()` with
+        // no intervening `deleted_at` filter, even for a soft_delete child.
+        let generated = repository_macro(
+            quote! { Comment, soft_delete, dependent(PgReplyRepository, fk = "comment_id", on_delete = destroy) },
+            quote! { pub trait CommentRepository {} },
+        )
+        .to_string();
+        let destroy_arm = dependent_destroy_arm(&generated);
+        assert!(
+            destroy_arm.contains("find (__cid) . for_update"),
+            "the per-ID reload must load the selected id straight to for_update, \
+             with no deleted_at filter that could drop a pre-soft-deleted child: {destroy_arm}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_dependent_cascade_passes_parent_soft_flag() {
+        // The soft-delete parent passes `true`; a hard-delete parent passes
+        // `false`, so the child cascade can follow the parent's delete kind.
+        let soft_parent = repository_macro(
+            quote! { Post, soft_delete, dependent(PgCommentRepository, fk = "post_id", on_delete = destroy) },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        let soft_section = delete_by_id_section(&soft_parent);
+        assert!(
+            soft_section.contains("__autumn_apply_dependent_on_conn")
+                && soft_section.contains(", true ,"),
+            "a soft-delete parent must pass __parent_soft = true to the cascade: {soft_section}"
+        );
+        let hard_parent = repository_macro(
+            quote! { Post, dependent(PgCommentRepository, fk = "post_id", on_delete = destroy) },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        let hard_section = delete_by_id_section(&hard_parent);
+        assert!(
+            hard_section.contains("__autumn_apply_dependent_on_conn")
+                && hard_section.contains(", false ,"),
+            "a hard-delete parent must pass __parent_soft = false to the cascade: {hard_section}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_dependent_destroy_helper_fires_child_hooks() {
+        // AC4: destroy fires the child's before_delete lifecycle hook.
+        let generated = repository_macro(
+            quote! { Comment, hooks = CommentHooks, dependent(PgReplyRepository, fk = "comment_id", on_delete = destroy) },
+            quote! { pub trait CommentRepository {} },
+        )
+        .to_string();
+        let start = generated
+            .find("__autumn_apply_dependent_on_conn")
+            .expect("helper present");
+        let helper = &generated[start..];
+        assert!(
+            helper.contains("before_delete"),
+            "destroy path must fire the child's before_delete hook: {helper}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_dependent_destroy_defers_broadcast_to_post_commit() {
+        // AC4 + broadcast timing: a `broadcasts = true` (non-commit-hook) child
+        // must NOT publish mid-transaction — a rollback couldn't retract it.
+        // Instead the cascade *accumulates* (topic, dom_id) into a buffer, and
+        // the parent publishes them only AFTER the tx closure commits.
+        let generated = repository_macro(
+            quote! { Comment, broadcasts = true, dependent(PgReplyRepository, fk = "comment_id", on_delete = destroy) },
+            quote! { pub trait CommentRepository {} },
+        )
+        .to_string();
+        // Child side: the destroy arm ACCUMULATES, it does not publish mid-tx.
+        let destroy_arm = dependent_destroy_arm(&generated);
+        assert!(
+            destroy_arm.contains("__ret_broadcasts . push"),
+            "broadcasts-only child destroy must accumulate (topic, dom_id), not publish: {destroy_arm}"
+        );
+        assert!(
+            !destroy_arm.contains("publish_oob"),
+            "the child cascade must not publish an OOB broadcast mid-transaction: {destroy_arm}"
+        );
+        assert!(
+            !destroy_arm.contains("enqueue_repository_commit_hook_on_conn"),
+            "a broadcasts-only child must not enqueue a durable commit hook: {destroy_arm}"
+        );
+        // Parent side: the deferred broadcasts are published AFTER the tx closure
+        // (post-commit), i.e. after the connection is dropped.
+        let section = delete_by_id_section(&generated);
+        let tx_pos = section
+            .find("scoped_transaction")
+            .expect("dependent delete_by_id opens a transaction");
+        let drop_pos = section
+            .find("mem :: drop")
+            .expect("dependent delete_by_id drops the conn after the tx");
+        let publish_pos = section
+            .find("publish_deferred_dependent_broadcasts")
+            .expect("parent must publish deferred cascade broadcasts");
+        assert!(
+            tx_pos < drop_pos && drop_pos < publish_pos,
+            "deferred cascade broadcasts must be published AFTER the tx closure / conn drop (post-commit): {section}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_dependent_destroy_commit_hooks_child_enqueues_and_does_not_broadcast() {
+        // A commit_hooks child enqueues the durable hook (which carries the
+        // broadcast) and must NOT also accumulate/publish inline — no double emit.
+        let generated = repository_macro(
+            quote! { Comment, hooks = CommentHooks, commit_hooks = true, broadcasts = true, dependent(PgReplyRepository, fk = "comment_id", on_delete = destroy) },
+            quote! { pub trait CommentRepository {} },
+        )
+        .to_string();
+        let destroy_arm = dependent_destroy_arm(&generated);
+        assert!(
+            destroy_arm.contains("enqueue_repository_commit_hook_on_conn"),
+            "a commit_hooks child destroy must enqueue the durable commit hook: {destroy_arm}"
+        );
+        assert!(
+            !destroy_arm.contains("publish_oob")
+                && !destroy_arm.contains("__ret_broadcasts . push"),
+            "a commit_hooks child must not also accumulate/publish the inline broadcast (no double emit): {destroy_arm}"
         );
     }
 

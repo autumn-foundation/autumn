@@ -115,6 +115,74 @@ pub enum RepositoryError {
     },
 }
 
+/// How a parent's dependent children are handled when the parent is deleted.
+///
+/// Declared per association on the `#[repository]` macro via
+/// `dependent(ChildRepository, fk = "parent_fk", on_delete = <action>)`, and
+/// applied inside the parent's `delete_by_id` transaction so a parent delete
+/// never leaves orphaned child rows (issue #1369).
+///
+/// The cascade runs app-side (not via a DB `ON DELETE` constraint) so that
+/// soft-delete, lifecycle/commit hooks, and counter caches stay correct — a
+/// guarantee raw `ON DELETE CASCADE` cannot provide.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DependentAction {
+    /// Delete each child through the child repository's delete path, honoring
+    /// the child's soft-delete mode and firing its lifecycle/commit hooks.
+    Destroy,
+    /// Bulk hard-delete every child in a single `DELETE`, skipping per-row hooks.
+    DeleteAll,
+    /// Set the child's foreign-key column to `NULL` (the child rows survive,
+    /// detached from the deleted parent).
+    Nullify,
+    /// Refuse to delete the parent while any child exists, surfacing a typed
+    /// `409 Conflict` error instead of orphaning or cascading.
+    Restrict,
+}
+
+/// Publish a batch of deferred dependent-cascade OOB *delete* broadcasts,
+/// accumulated during a `dependent = destroy` cascade over `broadcasts = true`
+/// children and published **after** the parent transaction commits (#1369).
+///
+/// Each entry is `(topic, dom_id)`; the fragment is empty and the swap is
+/// [`OobSwap::Delete`](crate::htmx::OobSwap::Delete). Deferring to post-commit
+/// means a rolled-back cascade publishes nothing, so live clients are never told
+/// to remove a child that still exists. Commit-hook children defer via the
+/// durable outbox instead and are not routed through here.
+///
+/// Framework plumbing; not a public API. No-op when the live-channel /
+/// `maud` / `htmx` features are not built in (the buffer is always empty then).
+#[cfg(all(feature = "ws", feature = "maud", feature = "htmx"))]
+#[doc(hidden)]
+pub fn publish_deferred_dependent_broadcasts(broadcasts: Vec<(String, String)>) {
+    if broadcasts.is_empty() {
+        return;
+    }
+    if let Some(channels) = crate::__private::get_global_channels() {
+        let fragment = crate::html! {};
+        for (topic, dom_id) in &broadcasts {
+            if let Err(err) = channels.broadcast().publish_oob(
+                topic,
+                dom_id,
+                &crate::htmx::OobSwap::Delete,
+                &fragment,
+            ) {
+                tracing::warn!(
+                    error = %err,
+                    "auto-broadcast dependent-destroy delete failed"
+                );
+            }
+        }
+    }
+}
+
+/// No-op fallback when live broadcasting is not compiled in. The accumulation
+/// side only runs for `broadcasts = true` children (which require these
+/// features), so the buffer is always empty in this configuration.
+#[cfg(not(all(feature = "ws", feature = "maud", feature = "htmx")))]
+#[doc(hidden)]
+pub fn publish_deferred_dependent_broadcasts(_broadcasts: Vec<(String, String)>) {}
+
 /// Extension trait that provides a fallback `None` for model structs that do
 /// not have a `#[lock_version]` field — or that are defined manually without
 /// going through `#[model]`.
