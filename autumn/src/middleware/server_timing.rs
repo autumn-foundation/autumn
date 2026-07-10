@@ -81,32 +81,23 @@ type ScopedInner<F> = F;
 /// without `db` it is a no-op passing the future through untouched.
 #[cfg(feature = "db")]
 fn scope_inner<F: Future>(fut: F) -> (DbTimings, ScopedInner<F>) {
-    // Reuse an already-active `REQUEST_DB_TIMINGS` accumulator ONLY when it is
-    // a CAPTURING one; otherwise always construct a fresh accumulator.
+    // Always construct a FRESH per-scope accumulator. Each `ServerTimingLayer`
+    // scope measures only the DB queries that run under its own scope, so
+    // nested Server-Timing scopes stay isolated and never share counts.
     //
-    // In production/dev there is no outer scope, so this constructs a fresh
-    // non-capturing `RequestDbTimings::default()` — server-timing reads its own
-    // per-request counts. The test harness (`TestApp::send`) instead establishes
-    // an OUTER *capturing* scope (`with_capture()`) around the whole request; if
-    // we unconditionally scoped a fresh default here it would SHADOW that outer
-    // accumulator, so queries would record into the throwaway one and
-    // `take_captured()` would come back empty — silently zeroing query
-    // assertions on any test that also enables `server_timing`. Reusing the
-    // outer `Arc` in that case keeps both the query count AND the captured SQL
-    // list flowing into the accumulator the harness reads back.
+    // This isolation is load-bearing. When both `server_timing` and `mcp` are
+    // enabled, `ServerTimingLayer` nests `REQUEST_DB_TIMINGS` twice (the outer
+    // `/mcp` fallback envelope + the inner dispatch). If the inner scope reused
+    // the outer accumulator, the inner dispatch and the outer fallback would
+    // share DB counts and the fallback would re-emit the same `db` metric the
+    // MCP path already forwarded — double-emitting `db` for a DB-backed MCP
+    // tool call. A fresh accumulator per scope keeps each `db` metric correct.
     //
-    // The reuse is gated to CAPTURING outers (the test-capture case) on
-    // purpose. In production, when both `server_timing` and `mcp` are enabled,
-    // `ServerTimingLayer` nests `REQUEST_DB_TIMINGS` twice (outer `/mcp`
-    // envelope + inner dispatch); those production scopes are non-capturing, and
-    // reusing them would make the inner dispatch and outer fallback share DB
-    // counts — double-emitting the `db` metric for a DB-backed MCP tool call.
-    // Non-capturing outers must therefore stay isolated (fresh accumulator).
-    let timings = REQUEST_DB_TIMINGS
-        .try_with(|active| active.is_capturing().then(|| Arc::clone(active)))
-        .ok()
-        .flatten()
-        .unwrap_or_else(|| Arc::new(RequestDbTimings::default()));
+    // Request-wide SQL capture (the test harness's `TestResponse` assertions)
+    // rides a SEPARATE task-local lane — `crate::db::REQUEST_QUERY_CAPTURE` —
+    // scoped once around the whole request, so it is entirely unaffected by how
+    // this timing accumulator is scoped or nested here.
+    let timings = Arc::new(RequestDbTimings::default());
     // Scope the inner future so any DB query instrumentation that runs
     // during it can record into `timings` via the task-local. We keep a
     // clone of the Arc outside the scope to read back after poll.
@@ -437,52 +428,33 @@ mod tests {
         assert_eq!(v, "total;dur=1.000");
     }
 
-    /// Finding-2 regression: when a *capturing* `REQUEST_DB_TIMINGS` scope is
-    /// already active — as `TestApp::send` establishes around the whole request
-    /// via `with_capture()` — `scope_inner` must REUSE that accumulator rather
-    /// than shadow it with a fresh non-capturing default. Otherwise the
-    /// `ServerTimingLayer`'s inner scope would divert queries into a throwaway
-    /// accumulator and the harness's `take_captured()` / `query_count()` would
-    /// silently come back empty for any test that also enables `server_timing`.
+    /// P2 nested-isolation regression: with an active outer `REQUEST_DB_TIMINGS`
+    /// scope (as `ServerTimingLayer`'s outer `/mcp` fallback establishes when
+    /// both `server_timing` and `mcp` are enabled), `scope_inner` must build a
+    /// FRESH accumulator — NOT reuse the outer one. Sharing the accumulator
+    /// would make the inner dispatch and the outer fallback accumulate into the
+    /// same counts, so the fallback re-emits the same `db` metric the MCP path
+    /// already forwarded, double-emitting `db` for a DB-backed MCP tool call.
+    /// A distinct `Arc` per scope is what keeps each `db` metric correct.
     #[cfg(feature = "db")]
     #[tokio::test]
-    async fn scope_inner_reuses_active_capturing_outer_accumulator() {
-        let outer = Arc::new(RequestDbTimings::with_capture());
-        REQUEST_DB_TIMINGS
-            .scope(Arc::clone(&outer), async {
-                let (reused, _scope) = scope_inner(std::future::ready(()));
-                assert!(
-                    Arc::ptr_eq(&reused, &outer),
-                    "scope_inner must reuse the active capturing outer accumulator, not shadow it"
-                );
-            })
-            .await;
-    }
-
-    /// Production nested-MCP isolation guarantee: when the active outer
-    /// `REQUEST_DB_TIMINGS` scope is NON-capturing (the production/dev shape,
-    /// e.g. the `/mcp` envelope's outer scope), `scope_inner` must NOT reuse it
-    /// — it must build a FRESH accumulator so the inner dispatch and the outer
-    /// fallback keep separate DB counts and a DB-backed MCP tool call does not
-    /// double-emit the `db` metric.
-    #[cfg(feature = "db")]
-    #[tokio::test]
-    async fn scope_inner_does_not_reuse_noncapturing_outer_accumulator() {
+    async fn scope_inner_isolates_nested_scopes() {
         let outer = Arc::new(RequestDbTimings::default());
         REQUEST_DB_TIMINGS
             .scope(Arc::clone(&outer), async {
-                let (fresh, _scope) = scope_inner(std::future::ready(()));
+                let (inner, _scope) = scope_inner(std::future::ready(()));
                 assert!(
-                    !Arc::ptr_eq(&fresh, &outer),
-                    "scope_inner must isolate a non-capturing outer scope with a fresh accumulator"
+                    !Arc::ptr_eq(&inner, &outer),
+                    "nested scope_inner must isolate with a fresh accumulator, \
+                     not share the outer one (which would double-emit the db metric)"
                 );
             })
             .await;
     }
 
-    /// Complement to the reuse test: with NO active outer scope (the
-    /// production/dev path), `scope_inner` builds a fresh accumulator so
-    /// server-timing reads its own per-request counts — unchanged behavior.
+    /// With NO active outer scope (the production/dev path), `scope_inner`
+    /// builds a fresh accumulator so server-timing reads its own per-request
+    /// counts — unchanged behavior.
     #[cfg(feature = "db")]
     #[tokio::test]
     async fn scope_inner_creates_fresh_accumulator_off_scope() {
@@ -492,6 +464,56 @@ mod tests {
             0,
             "a fresh off-scope accumulator starts with no recorded queries"
         );
+    }
+
+    /// The P2 fix decouples query capture from the timing accumulator: capturing
+    /// rides `crate::db::REQUEST_QUERY_CAPTURE`, a task-local separate from the
+    /// nested `REQUEST_DB_TIMINGS` timing scopes. This reproduces the reported
+    /// scenario without a live database: with a capture sink scoped, record a
+    /// query under an INNER `scope_inner` timing scope nested inside an OUTER
+    /// one, and assert (a) the capture sink collects the query exactly once (no
+    /// duplication) and (b) the two nested timing accumulators are distinct
+    /// `Arc`s (no shared counts → no duplicate `db` metric).
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    async fn nested_scopes_do_not_duplicate_capture_and_stay_isolated() {
+        use std::sync::Mutex;
+        use std::time::Duration;
+
+        let capture = Arc::new(Mutex::new(Vec::new()));
+        crate::db::REQUEST_QUERY_CAPTURE
+            .scope(Arc::clone(&capture), async {
+                // Outer timing scope (e.g. the `/mcp` fallback envelope).
+                let (outer_timings, outer_scope) = scope_inner(async {
+                    // Inner timing scope (the dispatch layer) runs the query.
+                    let (inner_timings, inner_scope) = scope_inner(async {
+                        crate::db::record_request_db_query(
+                            Duration::from_micros(500),
+                            Some("SELECT * FROM books WHERE id = $1"),
+                        );
+                    });
+                    inner_scope.await;
+                    inner_timings
+                });
+                let inner_timings = outer_scope.await;
+                assert!(
+                    !Arc::ptr_eq(&outer_timings, &inner_timings),
+                    "nested timing scopes must be distinct Arcs (no shared counts)"
+                );
+            })
+            .await;
+
+        let captured = capture
+            .lock()
+            .map(|v| v.clone())
+            .expect("capture mutex poisoned");
+        assert_eq!(
+            captured.len(),
+            1,
+            "the query must be captured exactly once — no duplication across \
+             nested Server-Timing scopes"
+        );
+        assert_eq!(captured[0].sql, "SELECT * FROM books WHERE id = $1");
     }
 
     /// End-to-end coverage of the db-metric path without a live database:

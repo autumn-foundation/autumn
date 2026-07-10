@@ -3051,24 +3051,27 @@ impl RequestBuilder {
         let service =
             tower::Layer::layer(&crate::middleware::MethodOverrideLayer::new(), self.router);
 
-        // Drive the request under a per-request `REQUEST_DB_TIMINGS` capture
-        // scope so the connection-level `RequestQueryTimer` (installed at
-        // `Db::checkout` whenever this scope is active) records every SQL
-        // statement the handler issues — no manual `DbInterceptor` wiring
-        // required. `oneshot` runs on this same task, so the task-local is
-        // visible to the checkout. When the `db` feature is off there is no DB,
-        // so the captured query list is simply empty.
+        // Drive the request under a per-request `REQUEST_QUERY_CAPTURE` scope so
+        // the connection-level `RequestQueryTimer` (installed at `Db::checkout`
+        // whenever this capture lane is active) records every SQL statement the
+        // handler issues into the capture sink — no manual `DbInterceptor`
+        // wiring required. This lane is independent of the `Server-Timing`
+        // timing accumulator (`REQUEST_DB_TIMINGS`), so query capture is
+        // unaffected by however `ServerTimingLayer` scopes (and nests) its
+        // per-scope DB metrics. `oneshot` runs on this same task, so the
+        // task-local is visible to the checkout. When the `db` feature is off
+        // there is no DB, so the captured query list is simply empty.
         //
         // The response body is drained (`to_bytes`) *inside* the scope so that
         // handlers returning a lazy or streaming body (`Sse`, `Body::from_stream`,
         // …) which perform DB work when the stream is polled still record those
-        // body-time checkouts against this request's timings. `take_captured()`
-        // only runs after the body is fully collected, so nothing is missed.
+        // body-time checkouts into the capture sink. The sink is read only after
+        // the body is fully collected, so nothing is missed.
         #[cfg(feature = "db")]
         let (status, headers, body_bytes, queries) = {
-            let timings = std::sync::Arc::new(crate::db::RequestDbTimings::with_capture());
-            let (status, headers, body_bytes) = crate::db::REQUEST_DB_TIMINGS
-                .scope(std::sync::Arc::clone(&timings), async move {
+            let capture = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let (status, headers, body_bytes) = crate::db::REQUEST_QUERY_CAPTURE
+                .scope(std::sync::Arc::clone(&capture), async move {
                     let response = service.oneshot(request).await.expect("request failed");
                     let status = response.status();
                     let headers: Vec<(String, String)> = response
@@ -3082,7 +3085,8 @@ impl RequestBuilder {
                     (status, headers, body_bytes)
                 })
                 .await;
-            (status, headers, body_bytes, timings.take_captured())
+            let queries = capture.lock().map(|v| v.clone()).unwrap_or_default();
+            (status, headers, body_bytes, queries)
         };
         #[cfg(not(feature = "db"))]
         let (status, headers, body_bytes, queries): (
@@ -4477,10 +4481,10 @@ mod tests {
         assert_eq!(resp.queries()[0].sql, "SELECT 1");
     }
 
-    /// Regression guard: the `REQUEST_DB_TIMINGS` capture scope must stay active
+    /// Regression guard: the `REQUEST_QUERY_CAPTURE` scope must stay active
     /// while a lazy/streaming response body is drained, so DB work performed
     /// *during* body polling (as `Sse` / `Body::from_stream` handlers do) is
-    /// still counted. `service.oneshot` returns the response head without
+    /// still captured. `service.oneshot` returns the response head without
     /// polling the stream; `send()` drains the body with `to_bytes` — if that
     /// drain happened after the scope closed, these body-time queries would be
     /// recorded against an unset task-local and silently dropped, so

@@ -108,14 +108,13 @@ mod query_count_tests {
         resp.assert_max_queries(1).assert_no_n_plus_one();
     }
 
-    /// Finding-2 regression: with `observability.server_timing` enabled the
-    /// router installs `ServerTimingLayer`, whose inner `REQUEST_DB_TIMINGS`
-    /// scope previously SHADOWED the harness's outer capturing accumulator —
-    /// so `take_captured()` came back empty and query assertions silently
-    /// passed at zero. With `scope_inner` reusing the active outer accumulator,
-    /// capture still works AND the `Server-Timing` header is emitted: the flat
-    /// handler's single SELECT is both counted for the header and captured for
-    /// the assertions.
+    /// Regression: with `observability.server_timing` enabled the router
+    /// installs `ServerTimingLayer`, whose inner `REQUEST_DB_TIMINGS` timing
+    /// scope is independent of the harness's `REQUEST_QUERY_CAPTURE` lane. Query
+    /// capture rides that separate task-local, so it is unaffected by however
+    /// the Server-Timing layer scopes (and nests) its per-scope DB metric — the
+    /// flat handler's single SELECT is both counted for the `Server-Timing`
+    /// header AND captured (exactly once) for the assertions.
     #[tokio::test]
     #[ignore = "requires Docker (testcontainers)"]
     async fn server_timing_enabled_still_captures_queries() {
