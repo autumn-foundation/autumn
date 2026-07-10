@@ -201,6 +201,10 @@ pub enum BackupError {
     /// A non-split offsite operation (list / download / config load) failed.
     /// `detail` is credential-safe (S3 status/code, never secrets).
     Offsite { op: &'static str, detail: String },
+    /// An offsite restore was requested (`--offsite` or an `offsite:` prefix) but
+    /// the reference is malformed. Carries the bad reference (no secrets). The
+    /// restore MUST fail rather than fall through to a local artifact.
+    InvalidOffsiteRef { reference: String },
 }
 
 impl std::fmt::Display for BackupError {
@@ -269,6 +273,11 @@ impl std::fmt::Display for BackupError {
                  fixing the offsite destination."
             ),
             Self::Offsite { op, detail } => write!(f, "Offsite {op} failed: {detail}"),
+            Self::InvalidOffsiteRef { reference } => write!(
+                f,
+                "Invalid offsite reference {reference:?}.\n  Expected \
+                 offsite:<profile>/<timestamp|latest> (for example offsite:prod/latest)."
+            ),
         }
     }
 }
@@ -814,8 +823,12 @@ fn restore(args: &RestoreArgs) -> Result<(), BackupError> {
     // temp dir and hand it to the SAME RestorePlan::discover path so the
     // identical integrity-refusal + guard/`--force` protocol applies unchanged.
     let artifact_str = args.artifact.to_string_lossy();
+    // When offsite is indicated (flag or `offsite:` prefix) we commit to the
+    // offsite path: a malformed reference is an error, never a silent fall
+    // through to a same-named local artifact. `None` means offsite was not
+    // indicated at all, so a normal local restore proceeds.
     if let Some(oref) = resolve_offsite_ref(args.offsite, &artifact_str) {
-        return restore_from_offsite(args, &oref);
+        return restore_from_offsite(args, &oref?);
     }
 
     let plan = RestorePlan::discover(&args.artifact, args.shard.as_deref())?;
@@ -2204,15 +2217,25 @@ enum OffsiteSelector {
     Exact(String),
 }
 
-/// Resolve an offsite reference from the `--offsite` flag and the artifact
-/// string. An `offsite:` prefix implies offsite even without the flag; when the
-/// flag is set the artifact is treated as `<profile>/<ts|latest>` directly.
-fn resolve_offsite_ref(flag: bool, artifact: &str) -> Option<OffsiteRef> {
+/// Resolve an offsite reference when offsite restore is indicated. Returns:
+///
+/// * `None` — offsite is NOT indicated (no `--offsite` flag and no `offsite:`
+///   prefix); the caller routes to a normal LOCAL restore.
+/// * `Some(Ok(_))` — offsite is indicated and the reference parsed.
+/// * `Some(Err(_))` — offsite is indicated but the reference is malformed; the
+///   caller MUST surface the error and MUST NEVER fall through to local restore
+///   (otherwise `restore --offsite latest` could silently restore an unrelated
+///   local path named `latest` in the cwd).
+fn resolve_offsite_ref(flag: bool, artifact: &str) -> Option<Result<OffsiteRef, BackupError>> {
     let has_prefix = artifact.starts_with("offsite:");
     if !flag && !has_prefix {
         return None;
     }
-    parse_offsite_ref(artifact)
+    Some(
+        parse_offsite_ref(artifact).ok_or_else(|| BackupError::InvalidOffsiteRef {
+            reference: artifact.to_owned(),
+        }),
+    )
 }
 
 /// Parse `offsite:<profile>/<timestamp|latest>` (the `offsite:` prefix is
@@ -3400,13 +3423,55 @@ mod tests {
     }
 
     #[test]
-    fn resolve_offsite_ref_requires_flag_or_prefix() {
-        // A bare local path is not an offsite ref.
+    fn resolve_offsite_ref_routes_local_only_when_not_indicated() {
+        // (c) A bare local path with neither flag nor prefix routes to LOCAL
+        // restore (None), unchanged.
         assert!(resolve_offsite_ref(false, "backups/prod/20260710T040506Z").is_none());
-        // The `offsite:` prefix alone triggers it.
-        assert!(resolve_offsite_ref(false, "offsite:prod/latest").is_some());
-        // The `--offsite` flag reinterprets a bare `<profile>/<sel>` positional.
-        assert!(resolve_offsite_ref(true, "prod/latest").is_some());
+        assert!(resolve_offsite_ref(false, "latest").is_none());
+
+        // (d) Well-formed offsite refs parse (Some(Ok(_))).
+        let ok = resolve_offsite_ref(false, "offsite:prod/latest").unwrap();
+        assert_eq!(
+            ok.unwrap(),
+            OffsiteRef {
+                profile: "prod".to_owned(),
+                selector: OffsiteSelector::Latest,
+            }
+        );
+        let ok = resolve_offsite_ref(true, "prod/20260710T040506Z").unwrap();
+        assert_eq!(
+            ok.unwrap(),
+            OffsiteRef {
+                profile: "prod".to_owned(),
+                selector: OffsiteSelector::Exact("20260710T040506Z".to_owned()),
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_offsite_ref_errors_on_malformed_when_indicated() {
+        // (a) `--offsite` with a malformed ref (no `<profile>/`) must ERROR, not
+        // fall through to a local artifact named `latest`.
+        let err = resolve_offsite_ref(true, "latest").unwrap().unwrap_err();
+        assert!(matches!(err, BackupError::InvalidOffsiteRef { .. }));
+        let msg = err.to_string();
+        assert!(msg.contains("latest"));
+        assert!(msg.contains("offsite:<profile>/<timestamp|latest>"));
+
+        // (b) `offsite:` prefix with a malformed body must ERROR too.
+        assert!(matches!(
+            resolve_offsite_ref(false, "offsite:prod").unwrap(),
+            Err(BackupError::InvalidOffsiteRef { .. })
+        ));
+        assert!(matches!(
+            resolve_offsite_ref(false, "offsite:/latest").unwrap(),
+            Err(BackupError::InvalidOffsiteRef { .. })
+        ));
+        // Flag set but empty positional => still an offsite error, not local.
+        assert!(matches!(
+            resolve_offsite_ref(true, "").unwrap(),
+            Err(BackupError::InvalidOffsiteRef { .. })
+        ));
     }
 
     #[test]
