@@ -120,6 +120,18 @@ impl RequestDbTimings {
             .map(|mut g| g.take().unwrap_or_default())
             .unwrap_or_default()
     }
+
+    /// Whether this accumulator is capturing the full SQL query list — i.e.
+    /// was built via [`RequestDbTimings::with_capture`] (its `captured` field
+    /// holds `Some(vec)`) rather than the non-capturing [`Default`].
+    ///
+    /// Used by the `Server-Timing` middleware to distinguish the test
+    /// harness's capturing scope (which must be reused so captures survive)
+    /// from a production non-capturing `Server-Timing` scope (which must stay
+    /// isolated). Treats a poisoned lock as non-capturing.
+    pub(crate) fn is_capturing(&self) -> bool {
+        self.captured.lock().map(|g| g.is_some()).unwrap_or(false)
+    }
 }
 
 tokio::task_local! {

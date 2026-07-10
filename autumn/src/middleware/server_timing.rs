@@ -81,22 +81,32 @@ type ScopedInner<F> = F;
 /// without `db` it is a no-op passing the future through untouched.
 #[cfg(feature = "db")]
 fn scope_inner<F: Future>(fut: F) -> (DbTimings, ScopedInner<F>) {
-    // Reuse an already-active `REQUEST_DB_TIMINGS` accumulator when one is
-    // scoped in the current task; only fall back to a fresh one otherwise.
+    // Reuse an already-active `REQUEST_DB_TIMINGS` accumulator ONLY when it is
+    // a CAPTURING one; otherwise always construct a fresh accumulator.
     //
     // In production/dev there is no outer scope, so this constructs a fresh
-    // non-capturing `RequestDbTimings::default()` — identical to before, and
-    // server-timing reads its own per-request counts. But the test harness
-    // (`TestApp::send`) establishes an OUTER capturing scope around the whole
-    // request; if we unconditionally scoped a fresh default here it would
-    // SHADOW that outer accumulator, so queries would record into the throwaway
-    // one and `take_captured()` would come back empty — silently zeroing query
+    // non-capturing `RequestDbTimings::default()` — server-timing reads its own
+    // per-request counts. The test harness (`TestApp::send`) instead establishes
+    // an OUTER *capturing* scope (`with_capture()`) around the whole request; if
+    // we unconditionally scoped a fresh default here it would SHADOW that outer
+    // accumulator, so queries would record into the throwaway one and
+    // `take_captured()` would come back empty — silently zeroing query
     // assertions on any test that also enables `server_timing`. Reusing the
-    // outer `Arc` keeps both the query count AND the captured SQL list flowing
-    // into the accumulator the harness reads back.
+    // outer `Arc` in that case keeps both the query count AND the captured SQL
+    // list flowing into the accumulator the harness reads back.
+    //
+    // The reuse is gated to CAPTURING outers (the test-capture case) on
+    // purpose. In production, when both `server_timing` and `mcp` are enabled,
+    // `ServerTimingLayer` nests `REQUEST_DB_TIMINGS` twice (outer `/mcp`
+    // envelope + inner dispatch); those production scopes are non-capturing, and
+    // reusing them would make the inner dispatch and outer fallback share DB
+    // counts — double-emitting the `db` metric for a DB-backed MCP tool call.
+    // Non-capturing outers must therefore stay isolated (fresh accumulator).
     let timings = REQUEST_DB_TIMINGS
-        .try_with(Arc::clone)
-        .unwrap_or_else(|_| Arc::new(RequestDbTimings::default()));
+        .try_with(|active| active.is_capturing().then(|| Arc::clone(active)))
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| Arc::new(RequestDbTimings::default()));
     // Scope the inner future so any DB query instrumentation that runs
     // during it can record into `timings` via the task-local. We keep a
     // clone of the Arc outside the scope to read back after poll.
@@ -427,23 +437,44 @@ mod tests {
         assert_eq!(v, "total;dur=1.000");
     }
 
-    /// Finding-2 regression: when a `REQUEST_DB_TIMINGS` scope is already
-    /// active — as `TestApp::send` establishes around the whole request —
-    /// `scope_inner` must REUSE that accumulator rather than shadow it with a
-    /// fresh non-capturing default. Otherwise the `ServerTimingLayer`'s inner
-    /// scope would divert queries into a throwaway accumulator and the harness's
-    /// `take_captured()` / `query_count()` would silently come back empty for
-    /// any test that also enables `server_timing`.
+    /// Finding-2 regression: when a *capturing* `REQUEST_DB_TIMINGS` scope is
+    /// already active — as `TestApp::send` establishes around the whole request
+    /// via `with_capture()` — `scope_inner` must REUSE that accumulator rather
+    /// than shadow it with a fresh non-capturing default. Otherwise the
+    /// `ServerTimingLayer`'s inner scope would divert queries into a throwaway
+    /// accumulator and the harness's `take_captured()` / `query_count()` would
+    /// silently come back empty for any test that also enables `server_timing`.
     #[cfg(feature = "db")]
     #[tokio::test]
-    async fn scope_inner_reuses_active_outer_accumulator() {
-        let outer = Arc::new(RequestDbTimings::default());
+    async fn scope_inner_reuses_active_capturing_outer_accumulator() {
+        let outer = Arc::new(RequestDbTimings::with_capture());
         REQUEST_DB_TIMINGS
             .scope(Arc::clone(&outer), async {
                 let (reused, _scope) = scope_inner(std::future::ready(()));
                 assert!(
                     Arc::ptr_eq(&reused, &outer),
-                    "scope_inner must reuse the active outer accumulator, not shadow it"
+                    "scope_inner must reuse the active capturing outer accumulator, not shadow it"
+                );
+            })
+            .await;
+    }
+
+    /// Production nested-MCP isolation guarantee: when the active outer
+    /// `REQUEST_DB_TIMINGS` scope is NON-capturing (the production/dev shape,
+    /// e.g. the `/mcp` envelope's outer scope), `scope_inner` must NOT reuse it
+    /// — it must build a FRESH accumulator so the inner dispatch and the outer
+    /// fallback keep separate DB counts and a DB-backed MCP tool call does not
+    /// double-emit the `db` metric.
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    async fn scope_inner_does_not_reuse_noncapturing_outer_accumulator() {
+        let outer = Arc::new(RequestDbTimings::default());
+        REQUEST_DB_TIMINGS
+            .scope(Arc::clone(&outer), async {
+                let (fresh, _scope) = scope_inner(std::future::ready(()));
+                assert!(
+                    !Arc::ptr_eq(&fresh, &outer),
+                    "scope_inner must isolate a non-capturing outer scope with a fresh accumulator"
                 );
             })
             .await;
