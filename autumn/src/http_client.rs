@@ -969,6 +969,19 @@ impl Client {
     /// hop; a hop that downgrades the scheme from `https` to `http` is rejected
     /// as defence-in-depth.
     ///
+    /// The redirect count and per-hop validation honour a chained builder
+    /// override (the built-in resolve→validate→pin and scheme-downgrade guards
+    /// always apply):
+    ///
+    /// - by default, up to [`SSRF_SAFE_MAX_REDIRECTS`] hops are followed;
+    /// - a chained [`no_redirect`](RequestBuilder::no_redirect) returns the
+    ///   initial `3xx` verbatim — the initial URL is still resolved, validated
+    ///   and pinned, but no redirect is followed;
+    /// - a chained [`follow_redirects(max, validator)`](RequestBuilder::follow_redirects)
+    ///   caps following at `max` hops (so `max == 0` turns the first `3xx` into
+    ///   [`ClientError::TooManyRedirects`]) and additionally runs the caller's
+    ///   `validator(&next)` on every hop, on top of the built-in guards.
+    ///
     /// Like the test-mock path, this custom send path bypasses the process-wide
     /// circuit-breaker registry to avoid entangling per-URL SSRF fetches with
     /// the shared per-host breaker state.
@@ -1529,9 +1542,34 @@ impl RequestBuilder {
         unreachable!("redirect loop is bounded by `max` and always returns")
     }
 
+    /// Derive the SSRF-safe redirect plan `(follow, max)` from the builder's
+    /// [`RedirectMode`], so a chained `no_redirect()` / `follow_redirects(..)`
+    /// overrides the default hop cap on the SSRF-safe path:
+    ///
+    /// - [`RedirectMode::Default`] → `(true, SSRF_SAFE_MAX_REDIRECTS)`.
+    /// - [`RedirectMode::None`] (`no_redirect()`) → `(false, 0)` — the initial
+    ///   `3xx` is returned verbatim (the `max` is unused).
+    /// - [`RedirectMode::Follow { max, .. }`] (`follow_redirects(max, ..)`) →
+    ///   `(true, max)`. The caller's per-hop validator is pulled from
+    ///   `self.redirect_mode` separately inside the send loop.
+    const fn ssrf_redirect_plan(&self) -> (bool, usize) {
+        match &self.redirect_mode {
+            RedirectMode::Default => (true, SSRF_SAFE_MAX_REDIRECTS),
+            RedirectMode::None => (false, 0),
+            RedirectMode::Follow { max, .. } => (true, *max),
+        }
+    }
+
     /// Composed SSRF-safe send path (Features #1238 + #1239). Resolves and
     /// validates every hop, pins the connection, and rejects scheme downgrades.
+    ///
+    /// The follow/hop-cap behaviour comes from [`ssrf_redirect_plan`](Self::ssrf_redirect_plan),
+    /// so a chained `no_redirect()` / `follow_redirects(max, ..)` overrides the
+    /// default cap while every per-hop safety step (resolve→validate→pin,
+    /// https→http downgrade block, sensitive-header stripping, method/body
+    /// rewrite) still applies.
     async fn send_ssrf_safe(self, timeout: Duration) -> Result<Response, ClientError> {
+        let (follow, max) = self.ssrf_redirect_plan();
         let original =
             url::Url::parse(&self.url).map_err(|e| ClientError::InvalidUrl(e.to_string()))?;
         let mut current = self.url.clone();
@@ -1568,14 +1606,27 @@ impl RequestBuilder {
             let Some(next) = redirect_target(&resp, &current)? else {
                 return Ok(resp);
             };
-            if hop >= SSRF_SAFE_MAX_REDIRECTS {
-                return Err(ClientError::TooManyRedirects(SSRF_SAFE_MAX_REDIRECTS));
+            // Honour a chained `no_redirect()`: return the 3xx verbatim. The
+            // initial URL was still resolved / validated / pinned above.
+            if !follow {
+                return Ok(resp);
+            }
+            if hop >= max {
+                return Err(ClientError::TooManyRedirects(max));
             }
             // Defence-in-depth: reject an https→http downgrade on redirect.
             if scheme_is_https(&current)? && !scheme_is_https(&next)? {
                 return Err(ClientError::RedirectRejected(format!(
                     "https→http scheme downgrade on redirect to {next}"
                 )));
+            }
+            // Caller-supplied per-hop validator, present only in the
+            // `follow_redirects` override. It runs in ADDITION to the built-in
+            // resolve/validate/pin already applied at the top of the loop.
+            if let RedirectMode::Follow { validator, .. } = &self.redirect_mode
+                && !validator(&next)
+            {
+                return Err(ClientError::RedirectRejected(next));
             }
             // RFC 7231/7538 method+body rewriting before the next hop.
             rewrite_after_redirect(resp.status(), &mut method, &mut body);
@@ -1584,7 +1635,7 @@ impl RequestBuilder {
             // before connecting, so a redirect to a blocked address is rejected
             // there with `SsrfBlocked`.
         }
-        unreachable!("redirect loop is bounded by SSRF_SAFE_MAX_REDIRECTS")
+        unreachable!("redirect loop is bounded by the SSRF-safe redirect plan")
     }
 }
 
@@ -3540,6 +3591,45 @@ mod tests {
             &body[..],
             b"payload",
             "307 must preserve the request body verbatim"
+        );
+    }
+
+    // TEST 63: get_ssrf_safe derives its redirect follow/cap from the chained
+    // builder mode via ssrf_redirect_plan, so `no_redirect()` /
+    // `follow_redirects(max, ..)` override the SSRF-safe default hop cap.
+    //
+    // NOTE: the network-level follow behaviour of get_ssrf_safe cannot be
+    // exercised in-sandbox — the only reachable address here is loopback, which
+    // the SSRF guard blocks before connecting — so this deterministic unit test
+    // on the factored `ssrf_redirect_plan` helper stands in for it.
+    #[test]
+    fn ssrf_redirect_plan_honours_chained_override() {
+        let client = Client::new();
+
+        // Default get_ssrf_safe → follow up to the SSRF-safe hop cap.
+        let default = client.get_ssrf_safe("https://example.com/");
+        assert_eq!(
+            default.ssrf_redirect_plan(),
+            (true, SSRF_SAFE_MAX_REDIRECTS),
+            "default SSRF-safe path follows up to SSRF_SAFE_MAX_REDIRECTS"
+        );
+
+        // no_redirect() → do NOT follow.
+        let none = client.get_ssrf_safe("https://example.com/").no_redirect();
+        let (follow, _max) = none.ssrf_redirect_plan();
+        assert!(
+            !follow,
+            "no_redirect() must disable following on the safe path"
+        );
+
+        // follow_redirects(3, ..) → follow up to the caller's max.
+        let follow3 = client
+            .get_ssrf_safe("https://example.com/")
+            .follow_redirects(3, |_| true);
+        assert_eq!(
+            follow3.ssrf_redirect_plan(),
+            (true, 3),
+            "follow_redirects(3, ..) must cap the safe path at 3 hops"
         );
     }
 }
