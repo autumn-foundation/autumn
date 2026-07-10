@@ -1061,13 +1061,8 @@ impl DbCommands {
             Self::Create { profile } => (db::DbCommand::Create, profile),
             Self::Drop { profile, force } => (db::DbCommand::Drop { force }, profile),
             Self::Reset { profile, force } => (db::DbCommand::Reset { force }, profile),
-            Self::Pull { .. }
-            | Self::Backup { .. }
-            | Self::Restore { .. }
-            | Self::Offsite(_) => {
-                unreachable!(
-                    "db pull/backup/restore/offsite are dispatched before into_command"
-                )
+            Self::Pull { .. } | Self::Backup { .. } | Self::Restore { .. } | Self::Offsite(_) => {
+                unreachable!("db pull/backup/restore/offsite are dispatched before into_command")
             }
         }
     }
@@ -4696,7 +4691,10 @@ mod tests {
         ])
         .unwrap();
         let Commands::Db(DbCommands::Restore {
-            artifact, offsite, force, ..
+            artifact,
+            offsite,
+            force,
+            ..
         }) = cli.command
         else {
             panic!("expected db restore");

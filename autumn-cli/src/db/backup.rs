@@ -1755,7 +1755,7 @@ fn load_offsite(profile: &str) -> Result<Option<ResolvedOffsite>, BackupError> {
         auto_upload: offsite.auto_upload,
         allow_shared_bucket: offsite.allow_shared_bucket,
         access_key_id_env: offsite.s3.access_key_id_env.clone(),
-        secret_access_key_env: offsite.s3.secret_access_key_env.clone(),
+        secret_access_key_env: offsite.s3.secret_access_key_env,
         app_storage_bucket: cfg
             .storage
             .s3
@@ -1804,11 +1804,7 @@ fn normalize_endpoint(endpoint: Option<&str>) -> String {
 /// Normalize a configured key prefix: trim surrounding whitespace and slashes so
 /// object keys join cleanly (an empty prefix means "bucket root").
 fn normalize_offsite_prefix(prefix: Option<&str>) -> String {
-    prefix
-        .unwrap_or("")
-        .trim()
-        .trim_matches('/')
-        .to_owned()
+    prefix.unwrap_or("").trim().trim_matches('/').to_owned()
 }
 
 /// Join non-empty key segments with `/` (no leading/trailing slash).
@@ -1872,10 +1868,10 @@ fn upload_run(
     // Remote retention (AC #5): only after the just-uploaded run verified, and
     // never removing that run. A retention error is loud but non-fatal — the
     // verified offsite copy already exists.
-    if let Some(keep) = offsite.keep {
-        if let Err(e) = prune_remote(offsite, client, profile, run_id, keep) {
-            eprintln!("  \u{26A0} offsite retention skipped: {e}");
-        }
+    if let Some(keep) = offsite.keep
+        && let Err(e) = prune_remote(offsite, client, profile, run_id, keep)
+    {
+        eprintln!("  \u{26A0} offsite retention skipped: {e}");
     }
     Ok(())
 }
@@ -1886,7 +1882,10 @@ fn list_run_files(run_dir: &Path) -> Result<Vec<String>, BackupError> {
     for entry in std::fs::read_dir(run_dir)
         .map_err(BackupError::io(format!("read {}", run_dir.display())))?
     {
-        let entry = entry.map_err(BackupError::io(format!("read entry in {}", run_dir.display())))?;
+        let entry = entry.map_err(BackupError::io(format!(
+            "read entry in {}",
+            run_dir.display()
+        )))?;
         if entry.path().is_file() {
             files.push(entry.file_name().to_string_lossy().into_owned());
         }
@@ -2022,17 +2021,19 @@ fn group_offsite_objects(objects: &[s3::S3Object], list_prefix: &str) -> Vec<Off
 
 /// Render a run listing as a human table: timestamp, files (labels), size. Pure.
 fn format_offsite_listing(runs: &[OffsiteRun]) -> String {
+    use std::fmt::Write as _;
     let mut out = String::new();
-    out.push_str(&format!("{:<20}  {:>10}  FILES\n", "TIMESTAMP", "SIZE"));
+    let _ = writeln!(out, "{:<20}  {:>10}  FILES", "TIMESTAMP", "SIZE");
     for run in runs {
         let mut labels: Vec<&str> = run.files.iter().map(|(f, _)| f.as_str()).collect();
         labels.sort_unstable();
-        out.push_str(&format!(
-            "{:<20}  {:>10}  {}\n",
+        let _ = writeln!(
+            out,
+            "{:<20}  {:>10}  {}",
             run.run_id,
             human_size(run.total),
             labels.join(", "),
-        ));
+        );
     }
     out
 }
@@ -2134,7 +2135,8 @@ fn restore_from_offsite(args: &RestoreArgs, oref: &OffsiteRef) -> Result<(), Bac
         });
     }
 
-    let temp = tempfile::tempdir().map_err(BackupError::io("creating a temp dir for offsite restore"))?;
+    let temp =
+        tempfile::tempdir().map_err(BackupError::io("creating a temp dir for offsite restore"))?;
     for obj in &objects {
         let file = obj
             .key

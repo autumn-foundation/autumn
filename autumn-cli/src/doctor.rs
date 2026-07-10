@@ -4195,6 +4195,7 @@ pub fn check_compression_impl(compression_enabled: bool, is_production: bool) ->
 /// Config-presence view of `[backup.offsite]` for [`check_offsite_backup_impl`].
 /// Holds only names/booleans — never a credential value.
 #[derive(Debug, Clone, Default)]
+#[allow(clippy::struct_excessive_bools)] // a flat config-presence snapshot, not state
 pub struct OffsiteBackupData {
     /// A `[backup.offsite]` section is present.
     pub configured: bool,
@@ -4260,12 +4261,24 @@ pub fn check_offsite_backup_impl(data: &OffsiteBackupData) -> CheckResult {
     }
     // Credential indirection: the env-var NAMES must be configured AND present.
     let mut missing: Vec<&str> = Vec::new();
-    if data.access_key_env.as_deref().unwrap_or("").trim().is_empty() {
+    if data
+        .access_key_env
+        .as_deref()
+        .unwrap_or("")
+        .trim()
+        .is_empty()
+    {
         missing.push("backup.offsite.s3.access_key_id_env (name unset)");
     } else if !data.access_key_env_set {
         missing.push("access key env var is not set in the environment");
     }
-    if data.secret_key_env.as_deref().unwrap_or("").trim().is_empty() {
+    if data
+        .secret_key_env
+        .as_deref()
+        .unwrap_or("")
+        .trim()
+        .is_empty()
+    {
         missing.push("backup.offsite.s3.secret_access_key_env (name unset)");
     } else if !data.secret_key_env_set {
         missing.push("secret key env var is not set in the environment");
@@ -4332,9 +4345,7 @@ fn resolve_offsite_backup_data() -> OffsiteBackupData {
         secret_key_env: offsite.s3.secret_access_key_env.clone(),
         access_key_env_set: env_set(&offsite.s3.access_key_id_env),
         secret_key_env_set: env_set(&offsite.s3.secret_access_key_env),
-        shared_bucket_without_optin: same_bucket
-            && endpoints_match
-            && !offsite.allow_shared_bucket,
+        shared_bucket_without_optin: same_bucket && endpoints_match && !offsite.allow_shared_bucket,
     }
 }
 

@@ -4,14 +4,14 @@
 //! `base64`, and `hex`, so this module implements just enough of **AWS Signature
 //! Version 4** and the five S3 REST operations the offsite-backup flow needs —
 //! WITHOUT pulling `aws-sdk`/`tokio` into the CLI. It targets any S3-compatible
-//! endpoint (AWS, MinIO, Cloudflare R2, Backblaze B2, Garage) via a custom
+//! endpoint (AWS, `MinIO`, Cloudflare R2, Backblaze B2, Garage) via a custom
 //! `endpoint` + `force_path_style`.
 //!
 //! # Credential safety
 //!
 //! The access key / secret access key are read (by the caller) from the
 //! environment variables *named* by config and handed in as [`S3Credentials`].
-//! They are used only to derive the SigV4 signing key and the `Authorization`
+//! They are used only to derive the `SigV4` signing key and the `Authorization`
 //! header. They never appear in a URL, in `Debug`/`Display` output, in an error
 //! message, or in a log line — [`S3Credentials`] deliberately does not derive
 //! `Debug`, and [`S3Error`] carries only status codes and endpoint metadata.
@@ -22,10 +22,11 @@
 //! endpoint validates the payload server-side and rejects a corrupted upload.
 //! [`S3Client::verify_uploaded`] then HEADs the object and confirms the
 //! remote length (and checksum, when the endpoint echoes it) matches the local
-//! file; when the checksum header is absent (older MinIO), it falls back to a
+//! file; when the checksum header is absent (older `MinIO`), it falls back to a
 //! GET-and-rehash so verification is never a no-op.
 
 use std::fmt;
+use std::fmt::Write as _;
 
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
@@ -64,18 +65,18 @@ impl fmt::Debug for S3Credentials {
 // ─── Client configuration ────────────────────────────────────────────────────
 
 /// Connection settings for [`S3Client`]. Mirrors the reusable
-/// `StorageS3Config` shape (bucket/region/endpoint/force_path_style) but holds
+/// `StorageS3Config` shape (`bucket`/`region`/`endpoint`/`force_path_style`) but holds
 /// only what transfer needs, so this module stays decoupled from `autumn-web`.
 #[derive(Debug, Clone)]
 pub struct S3Config {
     /// Target bucket.
     pub bucket: String,
-    /// Region (SigV4 credential scope). R2 uses `auto`.
+    /// Region (`SigV4` credential scope). R2 uses `auto`.
     pub region: String,
     /// Custom endpoint (e.g. `https://minio.example:9000`). `None` => AWS
     /// (`https://{bucket}.s3.{region}.amazonaws.com`).
     pub endpoint: Option<String>,
-    /// Path-style addressing (`{endpoint}/{bucket}/{key}`). Required by MinIO /
+    /// Path-style addressing (`{endpoint}/{bucket}/{key}`). Required by `MinIO` /
     /// R2 / most self-hosted endpoints.
     pub force_path_style: bool,
 }
@@ -178,8 +179,7 @@ fn aws_uri_encode(s: &str, encode_slash: bool) -> String {
             }
             b'/' if !encode_slash => out.push('/'),
             _ => {
-                out.push('%');
-                out.push_str(&format!("{b:02X}"));
+                let _ = write!(out, "%{b:02X}");
             }
         }
     }
@@ -198,7 +198,7 @@ fn signed_headers_list(headers: &[Header]) -> String {
         .join(";")
 }
 
-/// Build the SigV4 canonical request string. `headers` MUST be sorted by
+/// Build the `SigV4` canonical request string. `headers` MUST be sorted by
 /// lowercase name; each value is trimmed. Pure over its inputs.
 fn canonical_request(
     method: &str,
@@ -209,20 +209,22 @@ fn canonical_request(
 ) -> String {
     let canonical_headers: String = headers
         .iter()
-        .map(|(name, value)| format!("{name}:{}\n", value.trim()))
-        .collect();
+        .fold(String::new(), |mut acc, (name, value)| {
+            let _ = writeln!(acc, "{name}:{}", value.trim());
+            acc
+        });
     let signed = signed_headers_list(headers);
     format!(
         "{method}\n{canonical_uri}\n{canonical_query}\n{canonical_headers}\n{signed}\n{payload_hash}"
     )
 }
 
-/// Build the SigV4 string-to-sign from the canonical-request hash.
+/// Build the `SigV4` string-to-sign from the canonical-request hash.
 fn string_to_sign(amz_date: &str, scope: &str, canonical_request_hash: &str) -> String {
     format!("{ALGORITHM}\n{amz_date}\n{scope}\n{canonical_request_hash}")
 }
 
-/// Derive the SigV4 signing key: a 4-stage HMAC chain over the secret.
+/// Derive the `SigV4` signing key: a 4-stage HMAC chain over the secret.
 fn signing_key(secret: &str, date: &str, region: &str) -> [u8; 32] {
     let k_date = hmac_sha256(format!("AWS4{secret}").as_bytes(), date.as_bytes());
     let k_region = hmac_sha256(&k_date, region.as_bytes());
@@ -288,7 +290,7 @@ fn xml_first(xml: &str, tag: &str) -> Option<String> {
 
 /// Parse a `ListBucketResult` body into `(objects, next_continuation_token)`.
 /// Hand-rolled to avoid adding an XML dependency to the CLI; handles the subset
-/// S3/MinIO/R2/B2/Garage emit for `list-type=2`.
+/// S3/`MinIO`/R2/B2/Garage emit for `list-type=2`.
 fn parse_list_objects(xml: &str) -> Result<(Vec<S3Object>, Option<String>), S3Error> {
     let mut objects = Vec::new();
     let mut rest = xml;
@@ -299,10 +301,13 @@ fn parse_list_objects(xml: &str) -> Result<(Vec<S3Object>, Option<String>), S3Er
         };
         let block = &after[..close];
         if let (Some(key), Some(size_str)) = (xml_first(block, "Key"), xml_first(block, "Size")) {
-            let size = size_str.trim().parse::<u64>().map_err(|_| S3Error::BadResponse {
-                op: "list",
-                detail: format!("non-numeric <Size> {size_str:?}"),
-            })?;
+            let size = size_str
+                .trim()
+                .parse::<u64>()
+                .map_err(|_| S3Error::BadResponse {
+                    op: "list",
+                    detail: format!("non-numeric <Size> {size_str:?}"),
+                })?;
             objects.push(S3Object {
                 key: xml_unescape(&key),
                 size,
@@ -310,9 +315,8 @@ fn parse_list_objects(xml: &str) -> Result<(Vec<S3Object>, Option<String>), S3Er
         }
         rest = &after[close + "</Contents>".len()..];
     }
-    let truncated = xml_first(xml, "IsTruncated")
-        .map(|v| v.trim().eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
+    let truncated =
+        xml_first(xml, "IsTruncated").is_some_and(|v| v.trim().eq_ignore_ascii_case("true"));
     let token = if truncated {
         xml_first(xml, "NextContinuationToken").map(|t| xml_unescape(t.trim()))
     } else {
@@ -344,7 +348,7 @@ pub struct S3Client {
     config: S3Config,
     credentials: S3Credentials,
     http: reqwest::blocking::Client,
-    /// Clock indirection so signing/tests are deterministic. Returns the SigV4
+    /// Clock indirection so signing/tests are deterministic. Returns the `SigV4`
     /// `x-amz-date` (`YYYYMMDDTHHMMSSZ`).
     now: fn() -> chrono::DateTime<chrono::Utc>,
 }
@@ -352,12 +356,13 @@ pub struct S3Client {
 impl S3Client {
     /// Build a client. Fails only if the TLS/HTTP stack can't be constructed.
     pub fn new(config: S3Config, credentials: S3Credentials) -> Result<Self, S3Error> {
-        let http = reqwest::blocking::Client::builder()
-            .build()
-            .map_err(|e| S3Error::Transport {
-                op: "init",
-                detail: e.to_string(),
-            })?;
+        let http =
+            reqwest::blocking::Client::builder()
+                .build()
+                .map_err(|e| S3Error::Transport {
+                    op: "init",
+                    detail: e.to_string(),
+                })?;
         Ok(Self {
             config,
             credentials,
@@ -366,7 +371,7 @@ impl S3Client {
         })
     }
 
-    /// The endpoint host[:port] used for the `Host` header and SigV4 signing.
+    /// The endpoint host[:port] used for the `Host` header and `SigV4` signing.
     fn host(&self) -> Result<String, S3Error> {
         let base = self.endpoint_base();
         let url = url::Url::parse(&base).map_err(|e| S3Error::Transport {
@@ -377,15 +382,15 @@ impl S3Client {
             op: "init",
             detail: "endpoint has no host".to_owned(),
         })?;
-        Ok(match url.port() {
-            Some(port) => format!("{host}:{port}"),
-            None => host.to_owned(),
-        })
+        Ok(url
+            .port()
+            .map_or_else(|| host.to_owned(), |port| format!("{host}:{port}")))
     }
 
     /// Scheme + authority for the endpoint (no path). For AWS this synthesizes
     /// the virtual-hosted bucket endpoint; for a custom endpoint it is used
     /// verbatim (path-style) or with the bucket as a host prefix.
+    #[allow(clippy::option_if_let_else)] // nested map_or_else closures read worse
     fn endpoint_base(&self) -> String {
         match &self.config.endpoint {
             Some(ep) => {
@@ -410,7 +415,7 @@ impl S3Client {
         }
     }
 
-    /// The canonical request path for `key` (SigV4 signs this exact string).
+    /// The canonical request path for `key` (`SigV4` signs this exact string).
     fn canonical_path(&self, key: &str) -> String {
         let key = key.trim_start_matches('/');
         if self.config.endpoint.is_some() && self.config.force_path_style {
@@ -432,7 +437,7 @@ impl S3Client {
     }
 
     /// Sign and send one request. `body` is the full payload (bodyless ops pass
-    /// `&[]`). `extra_headers` are additional signed headers (e.g. the PutObject
+    /// `&[]`). `extra_headers` are additional signed headers (e.g. the `PutObject`
     /// checksum). Returns the raw blocking response on 2xx, else an
     /// [`S3Error::Status`].
     fn send(
@@ -456,7 +461,7 @@ impl S3Client {
 
         // Assemble the signed header set, then sort by lowercase name.
         let mut headers: Vec<Header> = vec![
-            ("host".to_owned(), host.clone()),
+            ("host".to_owned(), host),
             ("x-amz-content-sha256".to_owned(), payload_hash.clone()),
             ("x-amz-date".to_owned(), amz_date.clone()),
         ];
@@ -532,15 +537,15 @@ impl S3Client {
     /// HEAD `key`, returning its length and (when echoed) checksum.
     pub fn head_object(&self, key: &str) -> Result<RemoteObjectInfo, S3Error> {
         let resp = self.send("head", reqwest::Method::HEAD, key, "", &[], &[])?;
-        let content_length =
-            resp.headers()
-                .get(reqwest::header::CONTENT_LENGTH)
-                .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.parse::<u64>().ok())
-                .ok_or_else(|| S3Error::BadResponse {
-                    op: "head",
-                    detail: "missing or invalid Content-Length".to_owned(),
-                })?;
+        let content_length = resp
+            .headers()
+            .get(reqwest::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok())
+            .ok_or_else(|| S3Error::BadResponse {
+                op: "head",
+                detail: "missing or invalid Content-Length".to_owned(),
+            })?;
         let checksum_sha256 = resp
             .headers()
             .get("x-amz-checksum-sha256")
@@ -658,7 +663,7 @@ pub fn sha256_base64(data: &[u8]) -> String {
 mod tests {
     use super::*;
 
-    /// The canonical AWS SigV4 "GET Object" example vector from the AWS docs
+    /// The canonical AWS `SigV4` "GET Object" example vector from the AWS docs
     /// (`Signature Calculations for the Authorization Header`). Proves the
     /// canonical request, string-to-sign, and final signature are correct.
     #[test]
@@ -694,8 +699,7 @@ mod tests {
         let scope = format!("{date}/{region}/{SERVICE}/{AWS4_REQUEST}");
         assert_eq!(scope, "20130524/us-east-1/s3/aws4_request");
 
-        let signature =
-            compute_signature(secret, date, region, amz_date, &scope, &canonical);
+        let signature = compute_signature(secret, date, region, amz_date, &scope, &canonical);
         // Expected signature for this exact canonical request, cross-checked
         // against an independent reference implementation of SigV4.
         assert_eq!(
@@ -714,7 +718,11 @@ mod tests {
 
     #[test]
     fn string_to_sign_shape() {
-        let sts = string_to_sign("20130524T000000Z", "20130524/us-east-1/s3/aws4_request", "abc");
+        let sts = string_to_sign(
+            "20130524T000000Z",
+            "20130524/us-east-1/s3/aws4_request",
+            "abc",
+        );
         assert_eq!(
             sts,
             "AWS4-HMAC-SHA256\n20130524T000000Z\n20130524/us-east-1/s3/aws4_request\nabc"
@@ -740,7 +748,7 @@ mod tests {
             content_length: 5,
             checksum_sha256: Some(expected.clone()),
         };
-        assert_eq!(verify_head(5, &expected, &info).unwrap(), true);
+        assert!(verify_head(5, &expected, &info).unwrap());
     }
 
     #[test]
@@ -778,7 +786,7 @@ mod tests {
             checksum_sha256: None,
         };
         // Length matches but no checksum => caller must GET-and-rehash.
-        assert_eq!(verify_head(5, &expected, &info).unwrap(), false);
+        assert!(!verify_head(5, &expected, &info).unwrap());
     }
 
     #[test]
@@ -806,11 +814,11 @@ mod tests {
 
     #[test]
     fn parse_list_objects_follows_truncation_token() {
-        let xml = r#"<ListBucketResult>
+        let xml = r"<ListBucketResult>
           <Contents><Key>a</Key><Size>1</Size></Contents>
           <IsTruncated>true</IsTruncated>
           <NextContinuationToken>tok123</NextContinuationToken>
-        </ListBucketResult>"#;
+        </ListBucketResult>";
         let (objects, next) = parse_list_objects(xml).unwrap();
         assert_eq!(objects.len(), 1);
         assert_eq!(next.as_deref(), Some("tok123"));

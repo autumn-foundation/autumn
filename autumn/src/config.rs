@@ -892,7 +892,7 @@ pub struct OffsiteBackupConfig {
     /// S3-compatible connection + credential-indirection settings. Reuses the
     /// same type as `[storage.s3]`, so it inherits `bucket` / `region` /
     /// `endpoint` / `force_path_style` and the `*_env` credential indirection
-    /// and works against MinIO / R2 / B2 / Garage.
+    /// and works against `MinIO` / R2 / B2 / Garage.
     #[serde(default)]
     pub s3: crate::storage::StorageS3Config,
 
@@ -4065,14 +4065,23 @@ impl AutumnConfig {
             "AUTUMN_BACKUP__OFFSITE__AUTO_UPLOAD",
             "AUTUMN_BACKUP__OFFSITE__ALLOW_SHARED_BUCKET",
         ];
-        if self.backup.offsite.is_none()
-            && !OFFSITE_ENV_KEYS.iter().any(|k| env.var(k).is_ok())
-        {
+        if self.backup.offsite.is_none() && !OFFSITE_ENV_KEYS.iter().any(|k| env.var(k).is_ok()) {
             return;
         }
-        let offsite = self.backup.offsite.get_or_insert_with(OffsiteBackupConfig::default);
-        parse_env_option_string(env, "AUTUMN_BACKUP__OFFSITE__S3__BUCKET", &mut offsite.s3.bucket);
-        parse_env_option_string(env, "AUTUMN_BACKUP__OFFSITE__S3__REGION", &mut offsite.s3.region);
+        let offsite = self
+            .backup
+            .offsite
+            .get_or_insert_with(OffsiteBackupConfig::default);
+        parse_env_option_string(
+            env,
+            "AUTUMN_BACKUP__OFFSITE__S3__BUCKET",
+            &mut offsite.s3.bucket,
+        );
+        parse_env_option_string(
+            env,
+            "AUTUMN_BACKUP__OFFSITE__S3__REGION",
+            &mut offsite.s3.region,
+        );
         parse_env_option_string(
             env,
             "AUTUMN_BACKUP__OFFSITE__S3__ENDPOINT",
@@ -4100,7 +4109,11 @@ impl AutumnConfig {
         );
         parse_env_option_string(env, "AUTUMN_BACKUP__OFFSITE__PREFIX", &mut offsite.prefix);
         parse_env_option(env, "AUTUMN_BACKUP__OFFSITE__KEEP", &mut offsite.keep);
-        parse_env_bool(env, "AUTUMN_BACKUP__OFFSITE__AUTO_UPLOAD", &mut offsite.auto_upload);
+        parse_env_bool(
+            env,
+            "AUTUMN_BACKUP__OFFSITE__AUTO_UPLOAD",
+            &mut offsite.auto_upload,
+        );
         parse_env_bool(
             env,
             "AUTUMN_BACKUP__OFFSITE__ALLOW_SHARED_BUCKET",
@@ -7813,7 +7826,10 @@ path = "/healthz"
             Some("https://minio.example.test")
         );
         // Credentials are indirected: config names the env vars, never the values.
-        assert_eq!(offsite.s3.access_key_id_env.as_deref(), Some("OFFSITE_KEY_ID"));
+        assert_eq!(
+            offsite.s3.access_key_id_env.as_deref(),
+            Some("OFFSITE_KEY_ID")
+        );
         assert_eq!(
             offsite.s3.secret_access_key_env.as_deref(),
             Some("OFFSITE_SECRET")
@@ -7855,9 +7871,15 @@ path = "/healthz"
         let offsite = config.backup.offsite.expect("materialized from env");
         assert_eq!(offsite.s3.bucket.as_deref(), Some("offsite"));
         assert_eq!(offsite.s3.region.as_deref(), Some("us-west-2"));
-        assert_eq!(offsite.s3.endpoint.as_deref(), Some("https://s3.offsite.test"));
+        assert_eq!(
+            offsite.s3.endpoint.as_deref(),
+            Some("https://s3.offsite.test")
+        );
         assert_eq!(offsite.s3.access_key_id_env.as_deref(), Some("OFF_KEY"));
-        assert_eq!(offsite.s3.secret_access_key_env.as_deref(), Some("OFF_SECRET"));
+        assert_eq!(
+            offsite.s3.secret_access_key_env.as_deref(),
+            Some("OFF_SECRET")
+        );
         assert!(offsite.s3.force_path_style);
         assert_eq!(offsite.prefix.as_deref(), Some("nightly"));
         assert_eq!(offsite.keep, Some(3));

@@ -77,17 +77,15 @@ async fn create_bucket(endpoint: &str, access: &str, secret: &str, region: &str,
     let date = now.format("%Y%m%d").to_string();
     let payload_hash = sha256_hex(b"");
     let url = url::Url::parse(endpoint).unwrap();
-    let host = match url.port() {
-        Some(p) => format!("{}:{p}", url.host_str().unwrap()),
-        None => url.host_str().unwrap().to_owned(),
-    };
-    let canonical_headers = format!(
-        "host:{host}\nx-amz-content-sha256:{payload_hash}\nx-amz-date:{amz_date}\n"
-    );
+    let host_str = url.host_str().unwrap().to_owned();
+    let host = url
+        .port()
+        .map_or_else(|| host_str.clone(), |p| format!("{host_str}:{p}"));
+    let canonical_headers =
+        format!("host:{host}\nx-amz-content-sha256:{payload_hash}\nx-amz-date:{amz_date}\n");
     let signed_headers = "host;x-amz-content-sha256;x-amz-date";
-    let canonical = format!(
-        "PUT\n/{bucket}\n\n{canonical_headers}\n{signed_headers}\n{payload_hash}"
-    );
+    let canonical =
+        format!("PUT\n/{bucket}\n\n{canonical_headers}\n{signed_headers}\n{payload_hash}");
     let scope = format!("{date}/{region}/s3/aws4_request");
     let sts = format!(
         "AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{}",
@@ -217,8 +215,7 @@ async fn offsite_backup_upload_then_restore_round_trips() {
     assert_eq!(before, 0, "rows should be gone before restore");
 
     // ── Restore from offsite (dev profile → no --force needed) ───────────────
-    let (_o, restore_err) =
-        run_autumn_ok(dir, &["db", "restore", "offsite:dev/latest"], &envs);
+    let (_o, restore_err) = run_autumn_ok(dir, &["db", "restore", "offsite:dev/latest"], &envs);
     assert!(
         restore_err.contains("Restore complete"),
         "restore should complete: {restore_err}"
