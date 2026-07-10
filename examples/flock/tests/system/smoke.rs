@@ -62,9 +62,13 @@ async fn flock_boots_and_serves_index() {
     // The island inserts its own `<canvas id="flock-canvas">` inside the
     // mount element; asserting the canvas exists *inside* the marker div
     // confirms the component body (not just the static wrapper) rendered.
-    page.expect_attribute("[data-autumn-island=\"flock\"] canvas", "id", "flock-canvas")
-        .await
-        .expect("island canvas mounted inside the marker element");
+    page.expect_attribute(
+        "[data-autumn-island=\"flock\"] canvas",
+        "id",
+        "flock-canvas",
+    )
+    .await
+    .expect("island canvas mounted inside the marker element");
     page.expect_no_console_errors()
         .await
         .expect("no console errors — wasm bundle fetched, init()'d, and mounted cleanly");
