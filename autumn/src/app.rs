@@ -8734,6 +8734,7 @@ mod tests {
 
         let builder = app()
             .jobs(vec![crate::job::JobInfo {
+                version: 1,
                 name: "startup-seed".to_string(),
                 max_attempts: 1,
                 initial_backoff_ms: 1,
@@ -8794,6 +8795,7 @@ mod tests {
 
         let error = initialize_job_runtime(
             vec![crate::job::JobInfo {
+                version: 1,
                 name: "startup-seed".to_string(),
                 max_attempts: 1,
                 initial_backoff_ms: 1,

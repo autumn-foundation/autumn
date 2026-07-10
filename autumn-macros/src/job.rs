@@ -347,6 +347,30 @@ pub fn job_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         },
     );
 
+    // Decode side (issue #1205). An opt-in (versioned) job decodes through the
+    // version-aware path, so a version/shape mismatch surfaces the precise
+    // `JobPayloadVersionError` naming the job type + versions. A default
+    // (unversioned) job keeps the exact pre-#1205 `from_value` path and error
+    // wording, guaranteeing zero behavior change for apps that never declare a
+    // version — and matching that its enqueue side stores raw args.
+    let decode_args = if should_wrap {
+        quote! {
+            let __autumn_upgrade: ::core::option::Option<::autumn_web::payload_version::UpgradeFn> = #upgrade_opt;
+            let args: #args_type = ::autumn_web::payload_version::decode_versioned(
+                #job_name,
+                #version,
+                __autumn_upgrade,
+                payload,
+            )
+                .map_err(|e| ::autumn_web::AutumnError::internal_server_error(::std::io::Error::other(e.to_string())))?;
+        }
+    } else {
+        quote! {
+            let args: #args_type = ::autumn_web::reexports::serde_json::from_value(payload)
+                .map_err(|e| ::autumn_web::AutumnError::internal_server_error(::std::io::Error::other(format!("job args deserialization failed: {e}"))))?;
+        }
+    };
+
     let handler_call = if takes_context {
         quote! { #fn_name(state, args, ::autumn_web::job::JobContext::current()).await }
     } else {
@@ -421,23 +445,10 @@ pub fn job_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 queue: #queue.to_string(),
                 uniqueness: #uniqueness,
                 concurrency: #concurrency,
+                version: #version,
                 handler: |state: ::autumn_web::AppState, payload: ::autumn_web::reexports::serde_json::Value| {
                     Box::pin(async move {
-                        // Version-aware decode (issue #1205): reads the stored
-                        // schema version (missing marker → 1), applies the
-                        // declared upgrade chain, then deserializes. A
-                        // version/shape mismatch surfaces the precise
-                        // `JobPayloadVersionError` (naming job type + versions)
-                        // rather than a generic serde error, so the dead-letter
-                        // record is self-diagnosing.
-                        let __autumn_upgrade: ::core::option::Option<::autumn_web::payload_version::UpgradeFn> = #upgrade_opt;
-                        let args: #args_type = ::autumn_web::payload_version::decode_versioned(
-                            #job_name,
-                            #version,
-                            __autumn_upgrade,
-                            payload,
-                        )
-                            .map_err(|e| ::autumn_web::AutumnError::internal_server_error(::std::io::Error::other(e.to_string())))?;
+                        #decode_args
                         #handler_call
                     })
                 },

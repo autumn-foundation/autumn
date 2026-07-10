@@ -336,3 +336,125 @@ async fn stale_version_without_upgrade_dead_letters_with_precise_error() {
 
     job::clear_global_job_client();
 }
+
+// ── Transactional enqueue paths must wrap too (Codex tx-enqueue P2, #1205) ────
+//
+// The version envelope was originally applied only in the 5 generated enqueue
+// methods; the transactional free functions serialized typed args raw. These
+// tests drive `enqueue_after_commit` (which needs no DB connection — outside a
+// tx it enqueues eagerly through the same chokepoint the connection-based
+// paths use). The `*_on_conn` / `enqueue_in_tx` variants share the
+// `enqueue_on_conn_due` chokepoint and are compile-verified; a Docker-gated DB
+// test is out of scope here.
+
+#[tokio::test]
+async fn after_commit_enqueue_wraps_versioned_job() {
+    let _guard = job::global_job_runtime_test_lock().lock().await;
+    job::clear_global_job_client();
+
+    let client = TestApp::new().plugin(VersionedJobsPlugin).build();
+
+    job::enqueue_after_commit(
+        "versioned_welcome",
+        VersionedWelcomeArgs {
+            user_id: 3,
+            greeting: "yo".into(),
+        },
+    )
+    .await
+    .unwrap();
+
+    let raw = &client.enqueued_jobs()[0].payload;
+    assert_eq!(
+        raw["__autumn_schema_version"],
+        json!(2),
+        "transactional enqueue must wrap an opt-in job: {raw}"
+    );
+    client.assert_job_enqueued_with(
+        "versioned_welcome",
+        json!({ "user_id": 3, "greeting": "yo" }),
+    );
+
+    job::clear_global_job_client();
+}
+
+#[tokio::test]
+async fn after_commit_default_job_stores_raw() {
+    let _guard = job::global_job_runtime_test_lock().lock().await;
+    job::clear_global_job_client();
+
+    let client = TestApp::new().plugin(VersionedJobsPlugin).build();
+
+    job::enqueue_after_commit("plain_job", PlainArgs { user_id: 1 })
+        .await
+        .unwrap();
+
+    let raw = &client.enqueued_jobs()[0].payload;
+    assert_eq!(
+        *raw,
+        json!({ "user_id": 1 }),
+        "default job stays raw via tx: {raw}"
+    );
+    assert!(
+        raw.get("__autumn_schema_version").is_none(),
+        "default job must not be wrapped: {raw}"
+    );
+
+    job::clear_global_job_client();
+}
+
+#[tokio::test]
+async fn after_commit_versioned_no_upgrade_decodes_at_current_version() {
+    let _guard = job::global_job_runtime_test_lock().lock().await;
+    job::clear_global_job_client();
+
+    let client = TestApp::new().plugin(VersionedJobsPlugin).build();
+
+    // strict_versioned is version 3 with no upgrade hook. Enqueued transactionally
+    // with current args, the marker must be stored so decode lands at v3 — not
+    // read as a missing-marker v1 and dead-lettered with "no upgrade path".
+    job::enqueue_after_commit("strict_versioned", PlainArgs { user_id: 9 })
+        .await
+        .unwrap();
+
+    let raw = &client.enqueued_jobs()[0].payload;
+    assert_eq!(
+        raw["__autumn_schema_version"],
+        json!(3),
+        "wrapped at v3: {raw}"
+    );
+
+    let report = client.perform_enqueued_jobs().await;
+    report.assert_all_succeeded();
+
+    job::clear_global_job_client();
+}
+
+#[tokio::test]
+async fn generated_method_wraps_exactly_once_no_double_wrap() {
+    let _guard = job::global_job_runtime_test_lock().lock().await;
+    job::clear_global_job_client();
+
+    let client = TestApp::new().plugin(VersionedJobsPlugin).build();
+
+    VersionedWelcomeJob::enqueue(VersionedWelcomeArgs {
+        user_id: 4,
+        greeting: "hi".into(),
+    })
+    .await
+    .unwrap();
+
+    let raw = &client.enqueued_jobs()[0].payload;
+    assert_eq!(raw["__autumn_schema_version"], json!(2));
+    assert_eq!(
+        raw.as_object().map(serde_json::Map::len),
+        Some(2),
+        "exactly a 2-key envelope, not nested: {raw}"
+    );
+    assert!(
+        raw["args"].get("__autumn_schema_version").is_none(),
+        "inner args must not itself be an envelope (no double wrap): {raw}"
+    );
+
+    job::clear_global_job_client();
+}

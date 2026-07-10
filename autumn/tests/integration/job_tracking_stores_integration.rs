@@ -28,6 +28,7 @@ fn noop_handler(
 
 fn noop_job_info() -> JobInfo {
     JobInfo {
+        version: 1,
         name: "noop".to_string(),
         max_attempts: 1,
         initial_backoff_ms: 1,

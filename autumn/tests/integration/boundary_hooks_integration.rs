@@ -267,6 +267,7 @@ async fn job_interceptor_intercepts_enqueue_and_execute() {
     let config = autumn_web::config::JobConfig::default();
 
     let job_info = JobInfo {
+        version: 1,
         name: "test-job".to_string(),
         max_attempts: 1,
         initial_backoff_ms: 1,

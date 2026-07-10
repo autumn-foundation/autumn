@@ -3831,6 +3831,7 @@ mod tests {
         let shutdown = tokio_util::sync::CancellationToken::new();
         crate::job::start_runtime(
             vec![crate::job::JobInfo {
+                version: 1,
                 name: "autumn_webhook_delivery".to_string(),
                 max_attempts: 1,
                 initial_backoff_ms: 1,
@@ -3906,6 +3907,7 @@ mod tests {
         let shutdown = tokio_util::sync::CancellationToken::new();
         crate::job::start_runtime(
             vec![crate::job::JobInfo {
+                version: 1,
                 name: "autumn_webhook_delivery".to_string(),
                 max_attempts: 1,
                 initial_backoff_ms: 1,

@@ -3726,6 +3726,7 @@ mod tests {
     impl crate::plugin::Plugin for CleanupJobPlugin {
         fn build(self, app: crate::app::AppBuilder) -> crate::app::AppBuilder {
             app.jobs(vec![crate::job::JobInfo {
+                version: 1,
                 name: "cleanup_probe".to_string(),
                 max_attempts: 1,
                 initial_backoff_ms: 1,
