@@ -2567,21 +2567,62 @@ fn resolve_trusted_hosts() -> Vec<String> {
 }
 
 /// Resolve whether an operator-alert destination (email and/or webhook URL) is
-/// configured, from the environment or `autumn.toml` `[alerts]`.
+/// configured, from the environment or the fully-merged effective `[alerts]` (base
+/// `autumn.toml` layered with the active profile's `[profile.{name}]` section and
+/// `autumn-{profile}.toml` override file, alias-normalized exactly as the runtime).
 ///
 /// Returns `(email_configured, webhook_configured)`.
 fn resolve_alert_destination() -> (bool, bool) {
-    let table = read_autumn_toml_table();
-    let profile = std::env::var("AUTUMN_ENV")
+    // Evaluate the SAME fully-merged effective config the runtime boots with, not
+    // just the raw base `autumn.toml`. The runtime config loader (a) normalizes
+    // profile aliases (`production` → `prod`, `development` → `dev`) and (b) layers
+    // the active profile's inline `[profile.{name}]` section plus its
+    // `autumn-{profile}.toml` override file over the base. Reading only the base
+    // `[alerts]` with a raw lower-cased profile string let doctor greenlight a prod
+    // deploy whose `autumn-prod.toml` (or `[profile.prod.alerts]`) CLEARED the
+    // destination — installing NO alert channel at runtime. Build the merged table
+    // through the runtime-mirroring loader and resolve against its flattened
+    // top-level `[alerts]`; env vars still take highest precedence.
+    //
+    // Profile selection mirrors `resolve_profile_input`: a blank/whitespace
+    // AUTUMN_ENV is ignored before falling back to AUTUMN_PROFILE, so a blank
+    // preferred var does not silently downgrade a prod selection to dev.
+    let selected_input = std::env::var("AUTUMN_ENV")
         .ok()
-        .or_else(|| std::env::var("AUTUMN_PROFILE").ok())
+        .filter(|v| !v.trim().is_empty())
+        .or_else(|| {
+            std::env::var("AUTUMN_PROFILE")
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+        })
         .unwrap_or_default()
         .trim()
-        .to_ascii_lowercase();
+        .to_owned();
+    let normalized_profile = normalize_alert_profile(&selected_input);
+    // The merge flattens the active profile's inline section and override file into
+    // the top-level `[alerts]`, so resolve against an EMPTY profile: `_from_sources`
+    // then reads only the effective top-level `[alerts]` (env vars still override).
+    // Passing the profile here would re-read the STALE raw `[profile.{name}.alerts]`
+    // section and ignore the higher-priority `autumn-{profile}.toml` layer.
+    let merged = get_merged_toml_table_runtime(&normalized_profile, &selected_input);
     // `.ok()` deliberately does NOT filter empty values: a set-but-empty env
     // var is a PRESENT higher-priority layer that CLEARS the destination,
     // distinct from an unset var (which falls through to the TOML layers).
-    resolve_alert_destination_from_sources(|key| std::env::var(key).ok(), table.as_ref(), &profile)
+    resolve_alert_destination_from_sources(|key| std::env::var(key).ok(), Some(&merged), "")
+}
+
+/// Normalize a raw profile input to the canonical name the runtime config loader
+/// uses, mirroring `autumn_web::config::normalize_profile_name`'s alias table
+/// (`production`/`PROD` → `prod`, `development`/`DEV` → `dev`; custom names keep
+/// their operator-specified spelling; blank stays blank). Kept in lock-step with
+/// the runtime so doctor merges the same profile sources the app will boot with.
+fn normalize_alert_profile(selected_input: &str) -> String {
+    match selected_input.trim().to_ascii_lowercase().as_str() {
+        "prod" | "production" => "prod".to_owned(),
+        "dev" | "development" => "dev".to_owned(),
+        "" => String::new(),
+        _ => selected_input.trim().to_owned(),
+    }
 }
 
 /// Resolve whether an email and/or webhook alert destination is configured,
@@ -4533,8 +4574,7 @@ pub struct Vault {
     #[test]
     fn resolve_alert_destination_base_email_is_detected() {
         let table: toml::Table = toml::from_str("[alerts]\nemail = \"dev@example.com\"\n").unwrap();
-        let (email, webhook) =
-            resolve_alert_destination_from_sources(no_env, Some(&table), "prod");
+        let (email, webhook) = resolve_alert_destination_from_sources(no_env, Some(&table), "prod");
         assert!(email, "base [alerts] email should resolve as configured");
         assert!(!webhook);
     }
@@ -4583,9 +4623,11 @@ pub struct Vault {
         )
         .unwrap();
         let env = |key: &str| (key == "AUTUMN_ALERTS__EMAIL").then(String::new);
-        let (email, webhook) =
-            resolve_alert_destination_from_sources(env, Some(&table), "prod");
-        assert!(!email, "empty AUTUMN_ALERTS__EMAIL must clear the base email");
+        let (email, webhook) = resolve_alert_destination_from_sources(env, Some(&table), "prod");
+        assert!(
+            !email,
+            "empty AUTUMN_ALERTS__EMAIL must clear the base email"
+        );
         assert!(webhook, "unset webhook env should fall through to base");
     }
 
@@ -4600,7 +4642,10 @@ pub struct Vault {
         };
         let (email, webhook) = resolve_alert_destination_from_sources(env, None, "prod");
         assert!(!email);
-        assert!(webhook, "env webhook should resolve as configured with no TOML");
+        assert!(
+            webhook,
+            "env webhook should resolve as configured with no TOML"
+        );
     }
 
     #[test]
@@ -4611,10 +4656,12 @@ pub struct Vault {
             "[alerts]\nwebhook_url = \"https://hooks.example/x\"\nwebhook_secret = \"s3cr3t\"\n",
         )
         .unwrap();
-        let (email, webhook) =
-            resolve_alert_destination_from_sources(no_env, Some(&table), "prod");
+        let (email, webhook) = resolve_alert_destination_from_sources(no_env, Some(&table), "prod");
         assert!(!email);
-        assert!(webhook, "webhook_url + webhook_secret must count as configured");
+        assert!(
+            webhook,
+            "webhook_url + webhook_secret must count as configured"
+        );
         let r = check_alert_destination_impl(email, webhook, true);
         assert!(matches!(r.status, CheckStatus::Pass));
     }
@@ -4625,8 +4672,7 @@ pub struct Vault {
         // so doctor must NOT count it and must warn in production.
         let table: toml::Table =
             toml::from_str("[alerts]\nwebhook_url = \"https://hooks.example/x\"\n").unwrap();
-        let (email, webhook) =
-            resolve_alert_destination_from_sources(no_env, Some(&table), "prod");
+        let (email, webhook) = resolve_alert_destination_from_sources(no_env, Some(&table), "prod");
         assert!(!email);
         assert!(
             !webhook,
@@ -4648,8 +4694,7 @@ pub struct Vault {
             "[alerts]\nwebhook_url = \"https://hooks.example/x\"\nwebhook_secret = \"s3cr3t\"\n[profile.prod.alerts]\nwebhook_secret = \"\"\n",
         )
         .unwrap();
-        let (email, webhook) =
-            resolve_alert_destination_from_sources(no_env, Some(&table), "prod");
+        let (email, webhook) = resolve_alert_destination_from_sources(no_env, Some(&table), "prod");
         assert!(!email);
         assert!(
             !webhook,
@@ -4665,6 +4710,124 @@ pub struct Vault {
         assert!(
             !webhook_env,
             "an empty AUTUMN_ALERTS__WEBHOOK_SECRET must clear the secret"
+        );
+    }
+
+    // ── merged-config view (issue #1610) ──────────────────────────────────────
+    // The wrapper now resolves against the fully-merged effective config the
+    // runtime boots with — base `autumn.toml` layered with `[profile.{name}]` and
+    // the `autumn-{profile}.toml` override file, alias-normalized — reading the
+    // flattened top-level `[alerts]` with an EMPTY profile. These tests build the
+    // merged table with the same `deep_merge` the runtime loader uses (the doctor
+    // bin deliberately avoids process-global cwd mutation, so the file merge is
+    // exercised through its merge primitive rather than real on-disk files).
+
+    #[test]
+    fn normalize_alert_profile_resolves_aliases() {
+        // Mirrors `autumn_web::config::normalize_profile_name`'s alias table so
+        // doctor merges the same profile sources the app will boot with.
+        assert_eq!(normalize_alert_profile("production"), "prod");
+        assert_eq!(normalize_alert_profile("PRODUCTION"), "prod");
+        assert_eq!(normalize_alert_profile("  prod "), "prod");
+        assert_eq!(normalize_alert_profile("development"), "dev");
+        assert_eq!(normalize_alert_profile("DEV"), "dev");
+        // Custom profiles keep their operator-specified spelling; blank stays blank.
+        assert_eq!(normalize_alert_profile("staging"), "staging");
+        assert_eq!(normalize_alert_profile(""), "");
+        assert_eq!(normalize_alert_profile("   "), "");
+    }
+
+    #[test]
+    fn resolve_alert_destination_merged_override_file_clears_base_email() {
+        // Base `autumn.toml` sets the only alert channel; an `autumn-prod.toml`
+        // override file CLEARS it with an empty string. `deep_merge` flattens the
+        // override over the base into the top-level `[alerts]`, exactly as
+        // `get_merged_toml_table_runtime` produces. Resolving against this flattened
+        // view with an EMPTY profile must see NO destination → doctor warns in prod.
+        let mut merged: toml::Table =
+            toml::from_str("[alerts]\nemail = \"dev@example.com\"\n").unwrap();
+        let override_file: toml::Table = toml::from_str("[alerts]\nemail = \"\"\n").unwrap();
+        deep_merge(&mut merged, &override_file);
+
+        let (email, _webhook) = resolve_alert_destination_from_sources(no_env, Some(&merged), "");
+        assert!(
+            !email,
+            "an autumn-prod.toml that clears [alerts].email must resolve as no destination"
+        );
+        let r = check_alert_destination_impl(email, false, true);
+        assert!(
+            matches!(r.status, CheckStatus::Warn),
+            "a production deploy whose override file cleared the only alert channel must WARN"
+        );
+    }
+
+    #[test]
+    fn resolve_alert_destination_merged_ignores_stale_profile_section() {
+        // The merged table still carries the ORIGINAL raw `[profile.prod.alerts]`
+        // (the base is deep-merged wholesale), but the override file already
+        // flattened the effective value onto the top-level `[alerts]`. Resolving
+        // with an EMPTY profile must read the flattened top-level, NOT the stale
+        // `[profile.prod.alerts]` — otherwise a non-empty stale section would
+        // spuriously mask a file-cleared destination and re-open the #1610 hole.
+        let mut merged: toml::Table = toml::from_str(
+            "[alerts]\nemail = \"dev@example.com\"\n[profile.prod.alerts]\nemail = \"ops@example.com\"\n",
+        )
+        .unwrap();
+        // autumn-prod.toml clears email; deep_merge flattens it onto top-level [alerts].
+        let override_file: toml::Table = toml::from_str("[alerts]\nemail = \"\"\n").unwrap();
+        deep_merge(&mut merged, &override_file);
+
+        let (email, _webhook) = resolve_alert_destination_from_sources(no_env, Some(&merged), "");
+        assert!(
+            !email,
+            "the flattened top-level [alerts] wins; a stale [profile.prod.alerts] must not mask a cleared destination"
+        );
+    }
+
+    #[test]
+    fn resolve_alert_destination_merged_base_email_survives_without_override() {
+        // No override / profile clear: the base email flows through the merged view
+        // and a production run passes.
+        let merged: toml::Table =
+            toml::from_str("[alerts]\nemail = \"ops@example.com\"\n").unwrap();
+        let (email, webhook) = resolve_alert_destination_from_sources(no_env, Some(&merged), "");
+        assert!(email);
+        assert!(!webhook);
+        let r = check_alert_destination_impl(email, webhook, true);
+        assert!(matches!(r.status, CheckStatus::Pass));
+    }
+
+    #[test]
+    fn resolve_alert_destination_merged_webhook_requires_both_url_and_secret() {
+        // Base configures a signed webhook (url + secret); the override file clears
+        // the SECRET. Through the flattened merged view the webhook is no longer a
+        // signed destination, so doctor must not count it and must warn in prod.
+        let mut merged: toml::Table = toml::from_str(
+            "[alerts]\nwebhook_url = \"https://hooks.example/x\"\nwebhook_secret = \"s3cr3t\"\n",
+        )
+        .unwrap();
+        let override_file: toml::Table =
+            toml::from_str("[alerts]\nwebhook_secret = \"\"\n").unwrap();
+        deep_merge(&mut merged, &override_file);
+
+        let (email, webhook) = resolve_alert_destination_from_sources(no_env, Some(&merged), "");
+        assert!(!email);
+        assert!(
+            !webhook,
+            "a webhook whose secret was cleared by the override file is not a signed destination"
+        );
+        let r = check_alert_destination_impl(email, webhook, true);
+        assert!(matches!(r.status, CheckStatus::Warn));
+
+        // With both left intact through the merged view, the webhook still counts.
+        let intact: toml::Table = toml::from_str(
+            "[alerts]\nwebhook_url = \"https://hooks.example/x\"\nwebhook_secret = \"s3cr3t\"\n",
+        )
+        .unwrap();
+        let (_e, webhook_ok) = resolve_alert_destination_from_sources(no_env, Some(&intact), "");
+        assert!(
+            webhook_ok,
+            "url + secret through the merged view is a signed destination"
         );
     }
 
