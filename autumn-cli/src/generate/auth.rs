@@ -2506,6 +2506,12 @@ async fn establish_remember_login(
     headers: &axum::http::HeaderMap,
 ) {{
     session.rotate_id().await;
+    // `rotate_id()` PRESERVES existing session data, so a stale step-up
+    // "recently did strong auth" claim from a prior authenticated state in this
+    // browser could survive into the restored session. Actively CLEAR it before
+    // writing identity keys — a remember-cookie restore must never inherit a
+    // prior session's "sudo mode" (issue #833/#1397).
+    session.remove(autumn_web::step_up::STEP_UP_SESSION_KEY).await;
     // A remembered request must be fully authenticated for protected routes:
     // write the SAME identity keys login writes. `{snake_name}_id` powers the
     // identity extractors / tracked-session lookup, and the configured
@@ -2517,9 +2523,10 @@ async fn establish_remember_login(
     // remember cookie is *not* strong authentication. Restoring a session from
     // it must not satisfy step-up "sudo mode" — otherwise a stolen/unattended
     // persistent cookie would silently pass `#[step_up]` routes (e.g. account
-    // deletion) with no password reauth. Leaving the claim absent/stale forces
-    // those routes to redirect to `/reauth` until the user re-enters their
-    // password (issue #833).
+    // deletion) with no password reauth. Because `rotate_id()` preserves data we
+    // additionally CLEAR any pre-existing claim above (defense against a prior
+    // fresh step-up surviving the restore), forcing those routes to redirect to
+    // `/reauth` until the user re-enters their password (issue #833).
     if let Ok(mut db) = pool.get().await {{
         let session_row = build_session_row(session, {snake_name}_id, ip, headers).await;
         let _ = diesel::insert_into({sess_table}::table)
