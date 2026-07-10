@@ -104,6 +104,19 @@ pub struct RememberRecord {
     pub series: String,
     /// Hex SHA-256 digest of the current token ([`hash_remember_token`]).
     pub token_hash: String,
+    /// Hex SHA-256 digest of the token that was **just rotated out**, if any.
+    ///
+    /// During the rotation grace window this previous token is still accepted
+    /// (as [`RememberDecision::Accept`], without triggering another rotation or
+    /// theft detection) so that benign concurrent requests — a single page load
+    /// firing many parallel sub-requests that all carry the same
+    /// not-yet-rotated token — do not false-fire theft detection when a sibling
+    /// request has already rotated the chain.
+    pub previous_token_hash: Option<String>,
+    /// When the **current** token was minted (i.e. the moment of the last
+    /// rotation). Combined with the grace duration this bounds how long the
+    /// [`previous_token_hash`](Self::previous_token_hash) stays acceptable.
+    pub rotated_at: Option<chrono::DateTime<chrono::Utc>>,
     /// Absolute expiry of this series.
     pub expires_at: chrono::DateTime<chrono::Utc>,
 }
@@ -115,6 +128,11 @@ pub enum RememberDecision {
     /// the stored hash, extends the expiry, sets a fresh cookie, and
     /// authenticates the user.
     Rotate,
+    /// The presented token is the **previous** token, still within the rotation
+    /// grace window — a benign concurrent request that arrived just after a
+    /// sibling request rotated the chain. Caller authenticates the user but does
+    /// **not** rotate again and does **not** treat this as theft.
+    Accept,
     /// A replayed / rotated-out token for a **known** series → theft. Caller
     /// deletes the whole chain for this series and treats the request as
     /// unauthenticated.
@@ -239,6 +257,23 @@ pub fn build_remember_clear_cookie(config: &RememberConfig) -> String {
     )
 }
 
+/// Default rotation grace window, in seconds.
+///
+/// After a token rotates, the just-rotated-out (previous) token stays
+/// acceptable for this long so that benign concurrent requests carrying the
+/// old token do not false-fire theft detection. This is the single source of
+/// truth for callers (e.g. the generated middleware).
+pub const DEFAULT_ROTATION_GRACE_SECS: i64 = 60;
+
+/// The default rotation grace window as a [`chrono::Duration`].
+///
+/// Convenience wrapper over [`DEFAULT_ROTATION_GRACE_SECS`] so callers share one
+/// source of truth for the grace window.
+#[must_use]
+pub const fn default_rotation_grace() -> chrono::Duration {
+    chrono::Duration::seconds(DEFAULT_ROTATION_GRACE_SECS)
+}
+
 /// Evaluate a presented remember token against the stored record for its series.
 ///
 /// This is the pure, deterministic core of the scheme (see the module docs).
@@ -248,12 +283,19 @@ pub fn build_remember_clear_cookie(config: &RememberConfig) -> String {
 /// - `record` is `None` → [`RememberDecision::Reject`].
 /// - `record.expires_at <= now` → [`RememberDecision::Reject`].
 /// - token matches the stored hash (constant-time) → [`RememberDecision::Rotate`].
+/// - else if the token matches the **previous** hash and `now - rotated_at <=
+///   grace` → [`RememberDecision::Accept`] (benign concurrent request within the
+///   rotation grace window).
 /// - otherwise (known, live series but wrong token) → [`RememberDecision::Theft`].
+///
+/// The secret-token comparisons go through [`verify_remember_token`]
+/// (constant-time); the non-secret grace-window bound is checked separately.
 #[must_use]
 pub fn evaluate_remember(
     presented_token: &str,
     record: Option<&RememberRecord>,
     now: chrono::DateTime<chrono::Utc>,
+    grace: chrono::Duration,
 ) -> RememberDecision {
     let Some(record) = record else {
         return RememberDecision::Reject;
@@ -262,10 +304,15 @@ pub fn evaluate_remember(
         return RememberDecision::Reject;
     }
     if verify_remember_token(presented_token, &record.token_hash) {
-        RememberDecision::Rotate
-    } else {
-        RememberDecision::Theft
+        return RememberDecision::Rotate;
     }
+    if let (Some(prev), Some(rotated_at)) = (&record.previous_token_hash, record.rotated_at)
+        && verify_remember_token(presented_token, prev)
+        && now - rotated_at <= grace
+    {
+        return RememberDecision::Accept;
+    }
+    RememberDecision::Theft
 }
 
 #[cfg(test)]
@@ -275,6 +322,11 @@ mod tests {
 
     fn ts(secs: i64) -> DateTime<Utc> {
         DateTime::from_timestamp(secs, 0).expect("valid timestamp")
+    }
+
+    /// A fixed 60-second grace window for the evaluation tests.
+    fn grace() -> chrono::Duration {
+        chrono::Duration::seconds(60)
     }
 
     #[test]
@@ -338,11 +390,74 @@ mod tests {
         let record = RememberRecord {
             series: "series-1".to_owned(),
             token_hash: hash_remember_token(token),
+            previous_token_hash: None,
+            rotated_at: None,
             expires_at: ts(2_000),
         };
         assert_eq!(
-            evaluate_remember(token, Some(&record), ts(1_000)),
+            evaluate_remember(token, Some(&record), ts(1_000), grace()),
             RememberDecision::Rotate
+        );
+    }
+
+    #[test]
+    fn evaluate_current_token_rotates_even_with_previous_present() {
+        // With a previous token recorded, the CURRENT token must still Rotate
+        // (not merely Accept).
+        let current = "current-token";
+        let record = RememberRecord {
+            series: "series-1".to_owned(),
+            token_hash: hash_remember_token(current),
+            previous_token_hash: Some(hash_remember_token("old-token")),
+            rotated_at: Some(ts(990)),
+            expires_at: ts(2_000),
+        };
+        assert_eq!(
+            evaluate_remember(current, Some(&record), ts(1_000), grace()),
+            RememberDecision::Rotate
+        );
+    }
+
+    #[test]
+    fn evaluate_previous_token_within_grace_is_accept() {
+        // A benign concurrent request: it presents the just-rotated-out token,
+        // and we are still inside the grace window since the rotation.
+        let previous = "just-rotated-out";
+        let record = RememberRecord {
+            series: "series-1".to_owned(),
+            token_hash: hash_remember_token("brand-new-token"),
+            previous_token_hash: Some(hash_remember_token(previous)),
+            rotated_at: Some(ts(1_000)),
+            expires_at: ts(2_000),
+        };
+        // 30s after rotation, grace is 60s → Accept.
+        assert_eq!(
+            evaluate_remember(previous, Some(&record), ts(1_030), grace()),
+            RememberDecision::Accept
+        );
+        // Exactly at the grace boundary (60s) is still inclusive → Accept.
+        assert_eq!(
+            evaluate_remember(previous, Some(&record), ts(1_060), grace()),
+            RememberDecision::Accept
+        );
+    }
+
+    #[test]
+    fn evaluate_previous_token_after_grace_is_theft() {
+        // Same previous token, but the grace window has elapsed → genuine
+        // replay of a rotated-out token → Theft.
+        let previous = "rotated-out-long-ago";
+        let record = RememberRecord {
+            series: "series-1".to_owned(),
+            token_hash: hash_remember_token("brand-new-token"),
+            previous_token_hash: Some(hash_remember_token(previous)),
+            rotated_at: Some(ts(1_000)),
+            expires_at: ts(2_000),
+        };
+        // 61s after rotation, grace is 60s → past the window → Theft.
+        assert_eq!(
+            evaluate_remember(previous, Some(&record), ts(1_061), grace()),
+            RememberDecision::Theft
         );
     }
 
@@ -351,10 +466,46 @@ mod tests {
         let record = RememberRecord {
             series: "series-1".to_owned(),
             token_hash: hash_remember_token("the-current-token"),
+            previous_token_hash: None,
+            rotated_at: None,
             expires_at: ts(2_000),
         };
         assert_eq!(
-            evaluate_remember("a-rotated-out-token", Some(&record), ts(1_000)),
+            evaluate_remember("a-rotated-out-token", Some(&record), ts(1_000), grace()),
+            RememberDecision::Theft
+        );
+    }
+
+    #[test]
+    fn evaluate_unknown_token_with_previous_present_is_theft() {
+        // A token that matches neither current nor previous → Theft, even
+        // within the grace window.
+        let record = RememberRecord {
+            series: "series-1".to_owned(),
+            token_hash: hash_remember_token("current-token"),
+            previous_token_hash: Some(hash_remember_token("previous-token")),
+            rotated_at: Some(ts(1_000)),
+            expires_at: ts(2_000),
+        };
+        assert_eq!(
+            evaluate_remember("some-unrelated-token", Some(&record), ts(1_010), grace()),
+            RememberDecision::Theft
+        );
+    }
+
+    #[test]
+    fn evaluate_wrong_token_no_previous_is_theft_not_accept() {
+        // A record with no previous token presenting a wrong token must be
+        // Theft — the Accept path requires a recorded previous hash.
+        let record = RememberRecord {
+            series: "series-1".to_owned(),
+            token_hash: hash_remember_token("the-current-token"),
+            previous_token_hash: None,
+            rotated_at: Some(ts(1_000)),
+            expires_at: ts(2_000),
+        };
+        assert_eq!(
+            evaluate_remember("wrong-token", Some(&record), ts(1_010), grace()),
             RememberDecision::Theft
         );
     }
@@ -362,7 +513,7 @@ mod tests {
     #[test]
     fn evaluate_unknown_series_is_reject() {
         assert_eq!(
-            evaluate_remember("whatever", None, ts(1_000)),
+            evaluate_remember("whatever", None, ts(1_000), grace()),
             RememberDecision::Reject
         );
     }
@@ -373,17 +524,28 @@ mod tests {
         let record = RememberRecord {
             series: "series-1".to_owned(),
             token_hash: hash_remember_token(token),
+            previous_token_hash: None,
+            rotated_at: None,
             expires_at: ts(1_000),
         };
         // now == expires_at → expired (expiry is inclusive).
         assert_eq!(
-            evaluate_remember(token, Some(&record), ts(1_000)),
+            evaluate_remember(token, Some(&record), ts(1_000), grace()),
             RememberDecision::Reject
         );
         // now strictly after expiry.
         assert_eq!(
-            evaluate_remember(token, Some(&record), ts(1_001)),
+            evaluate_remember(token, Some(&record), ts(1_001), grace()),
             RememberDecision::Reject
+        );
+    }
+
+    #[test]
+    fn default_rotation_grace_matches_constant() {
+        assert_eq!(DEFAULT_ROTATION_GRACE_SECS, 60);
+        assert_eq!(
+            default_rotation_grace(),
+            chrono::Duration::seconds(DEFAULT_ROTATION_GRACE_SECS)
         );
     }
 
