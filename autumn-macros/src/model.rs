@@ -4761,6 +4761,27 @@ mod tests {
     }
 
     #[test]
+    fn has_many_on_delete_destroy_directs_to_repository() {
+        // The `on_delete = <action>` spelling is an accepted alias for
+        // `dependent = <action>` and must be directed the same way (#1702).
+        let model: syn::Ident = syn::parse_quote!(Post);
+        let attrs: Vec<syn::Attribute> =
+            vec![syn::parse_quote!(#[has_many(Comment, on_delete = destroy)])];
+        let Err(err) = resolve_associations(&model, &attrs) else {
+            panic!("expected an error");
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("repository"),
+            "expected directed guidance toward the repository attribute, got: {msg}"
+        );
+        assert!(
+            msg.contains("#1702"),
+            "expected the issue reference #1702, got: {msg}"
+        );
+    }
+
+    #[test]
     fn has_many_dependent_unknown_action_is_rejected() {
         let model: syn::Ident = syn::parse_quote!(Post);
         let attrs: Vec<syn::Attribute> =
