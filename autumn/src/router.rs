@@ -931,22 +931,29 @@ pub fn extract_path_params(path: &str) -> Vec<String> {
 
     while let Some(start) = remaining.find('{') {
         let after_brace = &remaining[start + 1..];
+        // `{{` is an escaped literal brace (matchit renders `{{`/`}}` as literal
+        // `{`/`}`), not a parameter. Skip the escaped brace and continue,
+        // mirroring `autumn_macros::api_doc::extract_path_params`. The prior
+        // `rfind`-based variant dropped this branch and so injected a phantom
+        // param for valid escaped-brace routes (`{{hello}}` -> `hello`).
+        if let Some(rest) = after_brace.strip_prefix('{') {
+            remaining = rest;
+            continue;
+        }
         let Some(end_rel) = after_brace.find('}') else {
             break;
         };
 
         let inner = &after_brace[..end_rel];
-        // Handle nested/unbalanced braces (e.g. `"{{}"`, `"{a{b}"`): the
-        // segment between the first `{` and the first `}` may itself contain a
-        // stray `{`. The real parameter opens at the *last* `{` before the
-        // matching `}`, which guarantees the extracted name is brace-free
-        // rather than emitting a name that still contains a brace (#1721).
-        let inner = match inner.rfind('{') {
-            Some(pos) => &inner[pos + 1..],
-            None => inner,
-        };
+        // Isolate the parameter name from any `:constraint` suffix
+        // (`{id:[0-9]+}` -> `id`).
         let name = inner.split(':').next().unwrap_or(inner).trim();
-        if !name.is_empty() {
+        // Brace-free guard: only emit a name that is non-empty and contains no
+        // stray brace. On nested/unbalanced input the inner segment may still
+        // hold a `{` (e.g. `"{a{b}"` -> inner `"a{b"`); dropping such names
+        // keeps the emitted list brace-free, which the macro algorithm alone
+        // would not (#1721).
+        if !name.is_empty() && !name.contains('{') && !name.contains('}') {
             out.push(name.to_owned());
         }
 
@@ -5606,25 +5613,52 @@ enabled = true
     #[cfg(feature = "openapi")]
     #[test]
     fn extract_path_params_matches_macro_behavior() {
+        // Normal multi-param routes.
         assert_eq!(
             super::extract_path_params("/orgs/{org_id}/users/{id}"),
             vec!["org_id".to_owned(), "id".to_owned()]
         );
+        assert_eq!(
+            super::extract_path_params("/users/{id}/posts/{slug}"),
+            vec!["id".to_owned(), "slug".to_owned()]
+        );
         assert!(super::extract_path_params("/static").is_empty());
+
+        // `:constraint` suffixes are stripped to the bare name.
         assert_eq!(
             super::extract_path_params("/users/{id:[0-9]+}"),
             vec!["id".to_owned()]
         );
+        // Regex constraint containing its own braces still yields just `id`.
+        assert_eq!(
+            super::extract_path_params("{id:[0-9]{1,3}}"),
+            vec!["id".to_owned()]
+        );
+
+        // Escaped literal braces (`{{` / `}}`) are matchit literals, NOT
+        // params, and must emit nothing (mirrors the macro's escape skip).
+        assert!(super::extract_path_params("{{hello}}").is_empty());
+        assert_eq!(
+            super::extract_path_params("{{literal}}/{id}"),
+            vec!["id".to_owned()]
+        );
+
+        // #1721 unbalanced/malformed cases: no phantom or brace-carrying params.
+        assert!(super::extract_path_params("{{}").is_empty());
+        assert!(super::extract_path_params("{a{b}").is_empty());
+        assert!(super::extract_path_params("{").is_empty());
+        assert!(super::extract_path_params("}").is_empty());
+        assert!(super::extract_path_params("{}").is_empty());
     }
 
     #[cfg(feature = "openapi")]
     #[test]
     fn extract_path_params_handles_unbalanced_braces() {
         // Regression for #1721: unbalanced/malformed braces must never yield a
-        // param name that still contains a brace character. On nested input the
-        // real parameter opens at the last `{` before the matching `}`, so the
-        // extracted name is always brace-free (and stray braces yield no
-        // spurious params).
+        // param name that still contains a brace character. The brace-free
+        // guard drops any candidate whose inner segment retains a stray brace,
+        // so the emitted names are always non-empty and brace-free (and stray
+        // braces yield no spurious params).
         for path in ["{{}", "{", "}", "{a{b}"] {
             for name in super::extract_path_params(path) {
                 assert!(
@@ -5637,10 +5671,12 @@ enabled = true
                 );
             }
         }
-        // `"{{}"` yields no param (the inner segment is just a stray `{`).
+        // `"{{}"` yields no param: the leading `{{` is an escaped literal brace
+        // that is skipped, leaving only a stray `}`.
         assert!(super::extract_path_params("{{}").is_empty());
-        // `"{a{b}"` extracts the parameter that opens at the last `{`.
-        assert_eq!(super::extract_path_params("{a{b}"), vec!["b".to_owned()]);
+        // `"{a{b}"` yields no param: the inner segment `"a{b"` still holds a
+        // brace, so the brace-free guard drops it.
+        assert!(super::extract_path_params("{a{b}").is_empty());
     }
 
     #[cfg(feature = "openapi")]
