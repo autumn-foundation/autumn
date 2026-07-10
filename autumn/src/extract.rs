@@ -217,15 +217,16 @@ impl Multipart {
                 .await
                 .map_err(|err| multipart_error_to_error(&err))?
             {
-                Some(chunk) => prefix.extend_from_slice(&chunk),
+                Some(chunk) => {
+                    prefix.extend_from_slice(&chunk);
+                    // Reject as soon as the buffered prefix exceeds the per-file
+                    // cap, so an oversized leading chunk bails without reading on.
+                    if prefix.len() > self.config.max_file_size_bytes {
+                        return Err(file_too_large_error(self.config.max_file_size_bytes));
+                    }
+                }
                 None => break,
             }
-        }
-
-        // Never buffer past the per-file cap while sniffing: a single leading
-        // chunk larger than the limit is already a size violation.
-        if prefix.len() > self.config.max_file_size_bytes {
-            return Err(file_too_large_error(self.config.max_file_size_bytes));
         }
 
         // Borrow the declared header rather than allocating: `declared_essence`
@@ -511,14 +512,14 @@ impl<'a> MultipartField<'a> {
     /// Returns `413 Payload Too Large` if the field exceeds
     /// `security.upload.max_file_size_bytes`.
     pub async fn bytes_limited(mut self) -> crate::AutumnResult<Vec<u8>> {
-        let mut out = Vec::new();
-        // Replay any bytes already consumed during content sniffing first, and
-        // count them toward the size cap.
-        let mut read = self.prefix.len();
+        // Reuse the sniff prefix as the output buffer: it already holds exactly
+        // the leading bytes in order, so appending the inner stream after it
+        // reproduces the original byte sequence with no extra allocation.
+        let mut out = self.prefix;
+        let mut read = out.len();
         if read > self.max_file_size_bytes {
             return Err(file_too_large_error(self.max_file_size_bytes));
         }
-        out.append(&mut self.prefix);
         while let Some(chunk) = self
             .inner
             .chunk()
