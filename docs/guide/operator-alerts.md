@@ -61,8 +61,24 @@ installs no alerter at all when alerting is disabled.
 `AUTUMN_ALERTS__*` environment) and cannot see alert channels registered in code
 with `AppBuilder::with_alert_channel`. If your app installs a custom
 [`AlertChannel`] that way, alerts are still delivered even though nothing appears
-under `[alerts]`, so the "no alert destination" warning is expected and can be
-safely ignored (including under `autumn doctor --strict`).
+under `[alerts]`, so the "no alert destination" warning is expected.
+
+To make that pass — instead of ignoring the warning — declare the
+code-registered channel so `autumn doctor --strict` succeeds:
+
+```toml
+[alerts]
+custom_channel = true   # or AUTUMN_ALERTS__CUSTOM_CHANNEL=true
+```
+
+`custom_channel = true` tells doctor you register an alert channel in code via
+`AppBuilder::with_alert_channel`, suppressing the no-destination warning so a
+valid code-only deploy is not blocked by `--strict`. It is a doctor-only
+declaration: the runtime installs code-registered channels regardless of this
+flag, and it does **not** mask a *broken configured* destination — a malformed
+`[alerts] email`, an SMTP email with no `[mail] from`, a disabled mail transport,
+or a non-absolute `webhook_url` still warns. It suppresses only the pure "no
+destination configured" case.
 
 ---
 

@@ -819,6 +819,11 @@ pub struct AlertConfig {
     /// HMAC signing secret for the webhook destination. Prefer the
     /// `AUTUMN_ALERTS__WEBHOOK_SECRET` env var over committing it.
     pub webhook_secret: Option<String>,
+    /// Set true to tell `autumn doctor` you register an alert channel in code via
+    /// `AppBuilder::with_alert_channel`; suppresses the no-destination warning.
+    /// The runtime installs code-registered channels regardless of this flag.
+    #[serde(default)]
+    pub custom_channel: bool,
     /// At most one notification per condition per this many seconds.
     pub dedup_window_secs: u64,
     /// How long (seconds) an indicator must stay `Down` before it alerts.
@@ -839,6 +844,7 @@ impl Default for AlertConfig {
             email: None,
             webhook_url: None,
             webhook_secret: None,
+            custom_channel: false,
             dedup_window_secs: default_dedup_window_secs(),
             health_grace_secs: default_health_grace_secs(),
             error_rate_threshold: default_error_rate_threshold(),

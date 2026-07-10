@@ -495,6 +495,54 @@ fn alert_webhook_url_invalid_warning(url: &str) -> CheckResult {
     }
 }
 
+/// Resolve the production result when no `[alerts]` email/webhook destination is
+/// configured and no earlier value-validation warning fired.
+///
+/// When `custom_channel` is true the operator has DECLARED, via `[alerts]
+/// custom_channel = true` (or `AUTUMN_ALERTS__CUSTOM_CHANNEL`), that they register
+/// an alert channel in code with `AppBuilder::with_alert_channel`. The runtime
+/// installs code-registered channels regardless, so the destination is treated as
+/// present and the check passes — the sanctioned way to satisfy `autumn doctor
+/// --strict` for a code-only alert setup. Otherwise there is genuinely nowhere to
+/// deliver, so it warns and points at the flag. This runs AFTER every
+/// value-validation warning, so `custom_channel` only suppresses the pure "no
+/// destination configured" fall-through, never a broken *configured* destination.
+/// Extracted so [`check_alert_destination_impl`] stays under the line-count lint.
+fn alert_no_destination_in_production(custom_channel: bool) -> CheckResult {
+    if custom_channel {
+        return CheckResult {
+            name: "alert_destination",
+            status: CheckStatus::Pass,
+            detail: Some(
+                "no [alerts] email/webhook destination configured, but [alerts] \
+                 custom_channel = true declares a code-registered alert channel \
+                 (AppBuilder::with_alert_channel), which the runtime installs regardless"
+                    .into(),
+            ),
+            hint: None,
+        };
+    }
+    CheckResult {
+        name: "alert_destination",
+        status: CheckStatus::Warn,
+        detail: Some(
+            "no operator alert destination found in [alerts] config (email or webhook) in \
+             production; if your app registers an alert channel in code via \
+             AppBuilder::with_alert_channel, set [alerts] custom_channel = true (or \
+             AUTUMN_ALERTS__CUSTOM_CHANNEL=true) to declare that and silence this warning \
+             (doctor is a config-only checker and cannot see code-registered channels); \
+             otherwise failure conditions (dead-lettered jobs, Down health indicators, 5xx \
+             spikes, scheduled-task failures) will not be delivered anywhere"
+                .into(),
+        ),
+        hint: Some(
+            "Set [alerts] email and/or webhook_url (or AUTUMN_ALERTS__EMAIL / \
+             AUTUMN_ALERTS__WEBHOOK_URL); or if you register a channel in code, set [alerts] \
+             custom_channel = true. See docs/guide/operator-alerts.md",
+        ),
+    }
+}
+
 /// Dedicated production warning for the `[alerts] enabled = false` master switch:
 /// the runtime (`alerts::install_from_config`) returns BEFORE installing any
 /// `Alerter`, so NO operator alerts are delivered regardless of a configured
@@ -539,6 +587,7 @@ pub fn check_alert_destination_impl(
     is_production: bool,
     mail_from_present: bool,
     transport_requires_from: bool,
+    custom_channel: bool,
 ) -> CheckResult {
     // Presence and syntactic validity of the resolved `[alerts] email`. lettre
     // parses the recipient only at SEND time (`lettre_message`), not when the
@@ -657,23 +706,11 @@ pub fn check_alert_destination_impl(
         if !webhook_url_trimmed.is_empty() && !is_absolute_http_url_doctor(webhook_url_trimmed) {
             return alert_webhook_url_invalid_warning(webhook_url_trimmed);
         }
-        CheckResult {
-            name: "alert_destination",
-            status: CheckStatus::Warn,
-            detail: Some(
-                "no operator alert destination found in [alerts] config (email or webhook) in \
-                 production; if your app registers an alert channel in code via \
-                 AppBuilder::with_alert_channel, alerts will still be delivered and this warning \
-                 can be ignored (doctor is a config-only checker and cannot see code-registered \
-                 channels); otherwise failure conditions (dead-lettered jobs, Down health \
-                 indicators, 5xx spikes, scheduled-task failures) will not be delivered anywhere"
-                    .into(),
-            ),
-            hint: Some(
-                "Set [alerts] email and/or webhook_url (or AUTUMN_ALERTS__EMAIL / \
-                 AUTUMN_ALERTS__WEBHOOK_URL). See docs/guide/operator-alerts.md",
-            ),
-        }
+        // No config destination resolved. Either the operator has DECLARED a
+        // code-registered channel via `[alerts] custom_channel = true` (pass), or
+        // there is genuinely nowhere to deliver (warn). Extracted so this function
+        // stays under the line-count lint.
+        alert_no_destination_in_production(custom_channel)
     } else {
         CheckResult {
             name: "alert_destination",
@@ -3173,6 +3210,90 @@ where
     true
 }
 
+/// Resolve the effective `[alerts] custom_channel` flag the same way the runtime
+/// config merge and `AlertConfig::default().custom_channel` (default `false`)
+/// do.
+///
+/// This is a doctor-only declaration: when true, the operator asserts they
+/// register an alert channel in code via `AppBuilder::with_alert_channel`, so the
+/// no-destination warning is suppressed. The runtime installs code-registered
+/// channels regardless of this flag; it exists purely so `autumn doctor --strict`
+/// can pass a validly-configured code-only alert setup.
+fn resolve_alert_custom_channel() -> bool {
+    // Mirror `resolve_alert_enabled`'s profile selection and merged-table build so
+    // `custom_channel` resolves against the same effective config the runtime
+    // boots with, env vars still highest priority.
+    let selected_input = std::env::var("AUTUMN_ENV")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .or_else(|| {
+            std::env::var("AUTUMN_PROFILE")
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+        })
+        .unwrap_or_default()
+        .trim()
+        .to_owned();
+    let normalized_profile = normalize_alert_profile(&selected_input);
+    // The merge flattens the active profile into the top-level `[alerts]`, so
+    // resolve against an EMPTY profile (mirroring `resolve_alert_enabled`).
+    let merged = get_merged_toml_table_runtime(&normalized_profile, &selected_input);
+    resolve_alert_custom_channel_from_sources(|key| std::env::var(key).ok(), Some(&merged), "")
+}
+
+/// Resolve the effective `[alerts] custom_channel` flag under the same layer
+/// precedence the runtime config merge applies (env
+/// `AUTUMN_ALERTS__CUSTOM_CHANNEL` > `[profile.{profile}.alerts].custom_channel` >
+/// base `[alerts].custom_channel`), defaulting to `false` when unset — matching
+/// `AlertConfig::default().custom_channel`.
+///
+/// Env parsing mirrors the runtime's `parse_env_bool`: `true`/`1` enable,
+/// `false`/`0` disable, and any other value is ignored (falls through to the TOML
+/// layers). Split out from [`resolve_alert_custom_channel`] so the precedence is
+/// unit-testable without mutating process-global env/cwd state.
+fn resolve_alert_custom_channel_from_sources<F>(
+    env_var: F,
+    table: Option<&toml::Table>,
+    profile: &str,
+) -> bool
+where
+    F: Fn(&str) -> Option<String>,
+{
+    // 1. Env var — highest priority, mirroring runtime `parse_env_bool`. An
+    //    invalid value (not true/false/1/0) is ignored and falls through.
+    if let Some(val) = env_var("AUTUMN_ALERTS__CUSTOM_CHANNEL") {
+        match val.as_str() {
+            "true" | "1" => return true,
+            "false" | "0" => return false,
+            _ => {}
+        }
+    }
+    // 2. Profile-specific `[profile.{profile}.alerts].custom_channel`.
+    if !profile.is_empty()
+        && let Some(v) = table
+            .and_then(|t| t.get("profile"))
+            .and_then(|v| v.get(profile))
+            .and_then(toml::Value::as_table)
+            .and_then(|p| p.get("alerts"))
+            .and_then(toml::Value::as_table)
+            .and_then(|a| a.get("custom_channel"))
+            .and_then(toml::Value::as_bool)
+    {
+        return v;
+    }
+    // 3. Base `[alerts].custom_channel`.
+    if let Some(v) = table
+        .and_then(|t| t.get("alerts"))
+        .and_then(toml::Value::as_table)
+        .and_then(|a| a.get("custom_channel"))
+        .and_then(toml::Value::as_bool)
+    {
+        return v;
+    }
+    // 4. Unset everywhere → false (mirrors `AlertConfig::default()`).
+    false
+}
+
 /// Resolve whether the active profile is production from the environment or
 /// `autumn.toml`.
 fn resolve_is_production() -> bool {
@@ -3288,6 +3409,7 @@ pub fn run(opts: DoctorOptions) {
     let compression_enabled = resolve_compression_enabled();
     let (alert_email, alert_webhook_configured, alert_webhook_url) = resolve_alert_destination();
     let alerts_enabled = resolve_alert_enabled();
+    let alert_custom_channel = resolve_alert_custom_channel();
     let proxy_conflict_data = resolve_proxy_conflict_data();
     let (dotenv_has_example, dotenv_has_env, dotenv_uncovered) = resolve_dotenv_state();
 
@@ -3520,6 +3642,7 @@ pub fn run(opts: DoctorOptions) {
             is_production,
             mail_from_present,
             transport_requires_from,
+            alert_custom_channel,
         )
     }));
 
@@ -5113,7 +5236,7 @@ pub struct Vault {
 
     #[test]
     fn alert_destination_warns_in_production_when_none() {
-        let r = check_alert_destination_impl(true, "", false, "", true, true, true, true);
+        let r = check_alert_destination_impl(true, "", false, "", true, true, true, true, false);
         assert_eq!(r.name, "alert_destination");
         assert!(matches!(r.status, CheckStatus::Warn));
         assert!(r.hint.is_some());
@@ -5130,19 +5253,20 @@ pub struct Vault {
             true,
             true,
             true,
+            false,
         );
         assert!(matches!(r.status, CheckStatus::Pass));
     }
 
     #[test]
     fn alert_destination_passes_in_production_with_webhook() {
-        let r = check_alert_destination_impl(true, "", true, "", true, true, true, true);
+        let r = check_alert_destination_impl(true, "", true, "", true, true, true, true, false);
         assert!(matches!(r.status, CheckStatus::Pass));
     }
 
     #[test]
     fn alert_destination_passes_in_dev_without_destination() {
-        let r = check_alert_destination_impl(true, "", false, "", true, false, true, true);
+        let r = check_alert_destination_impl(true, "", false, "", true, false, true, true, false);
         assert!(matches!(r.status, CheckStatus::Pass));
     }
 
@@ -5175,6 +5299,7 @@ pub struct Vault {
             true,
             true,
             true,
+            false,
         );
         assert!(
             matches!(r.status, CheckStatus::Warn),
@@ -5208,6 +5333,7 @@ pub struct Vault {
             true,
             true,
             requires_from,
+            false,
         );
         assert!(
             matches!(r.status, CheckStatus::Pass),
@@ -5252,6 +5378,7 @@ pub struct Vault {
             true,
             mail_from_present,
             requires_from,
+            false,
         );
         assert!(
             matches!(r.status, CheckStatus::Pass),
@@ -5277,6 +5404,7 @@ pub struct Vault {
             true,
             mail_from_present,
             requires_from,
+            false,
         );
         assert!(
             matches!(r.status, CheckStatus::Warn),
@@ -5312,6 +5440,7 @@ pub struct Vault {
             true,
             mail_from_present,
             requires_from,
+            false,
         );
         assert!(
             matches!(r.status, CheckStatus::Pass),
@@ -5336,10 +5465,11 @@ pub struct Vault {
             "not-an-address",
             false,
             "",
-            true, // usable transport
-            true, // production
-            true, // [mail] from present
-            true, // smtp requires from
+            true,  // usable transport
+            true,  // production
+            true,  // [mail] from present
+            true,  // smtp requires from
+            false, // custom_channel
         );
         assert!(
             matches!(r.status, CheckStatus::Warn),
@@ -5372,6 +5502,7 @@ pub struct Vault {
             false, // dev
             true,
             true,
+            false,
         );
         assert!(
             matches!(r.status, CheckStatus::Pass),
@@ -5392,6 +5523,7 @@ pub struct Vault {
             true,
             true,
             true,
+            false,
         );
         assert!(
             matches!(r.status, CheckStatus::Pass),
@@ -5412,10 +5544,11 @@ pub struct Vault {
             "mailto:oncall@example.com",
             false,
             "",
-            true, // usable transport
-            true, // production
-            true, // [mail] from present
-            true, // smtp requires from
+            true,  // usable transport
+            true,  // production
+            true,  // [mail] from present
+            true,  // smtp requires from
+            false, // custom_channel
         );
         assert!(
             matches!(r.status, CheckStatus::Warn),
@@ -5448,6 +5581,7 @@ pub struct Vault {
             true,
             true,
             true,
+            false,
         );
         assert!(matches!(r.status, CheckStatus::Warn));
         assert!(
@@ -5472,7 +5606,7 @@ pub struct Vault {
         assert!(!email, "the prod profile cleared the email");
         assert!(webhook, "the signed webhook remains configured");
         // Mail transport disabled — irrelevant to the webhook path.
-        let r = check_alert_destination_impl(true, "", webhook, "", false, true, true, true);
+        let r = check_alert_destination_impl(true, "", webhook, "", false, true, true, true, false);
         assert!(
             matches!(r.status, CheckStatus::Pass),
             "a signed webhook is a valid destination regardless of mail transport"
@@ -5509,7 +5643,7 @@ pub struct Vault {
         );
 
         // And the surfaced doctor check warns in production for this config.
-        let r = check_alert_destination_impl(true, "", false, "", true, true, true, true);
+        let r = check_alert_destination_impl(true, "", false, "", true, true, true, true, false);
         assert!(matches!(r.status, CheckStatus::Warn));
     }
 
@@ -5576,7 +5710,7 @@ pub struct Vault {
             webhook,
             "webhook_url + webhook_secret must count as configured"
         );
-        let r = check_alert_destination_impl(true, "", webhook, "", true, true, true, true);
+        let r = check_alert_destination_impl(true, "", webhook, "", true, true, true, true, false);
         assert!(matches!(r.status, CheckStatus::Pass));
     }
 
@@ -5592,7 +5726,7 @@ pub struct Vault {
             !webhook,
             "a webhook_url with no signing secret is not a destination"
         );
-        let r = check_alert_destination_impl(true, "", webhook, "", true, true, true, true);
+        let r = check_alert_destination_impl(true, "", webhook, "", true, true, true, true, false);
         assert!(
             matches!(r.status, CheckStatus::Warn),
             "URL-without-secret in production must warn"
@@ -5614,7 +5748,7 @@ pub struct Vault {
             !webhook,
             "a prod-profile empty webhook_secret must clear the base secret"
         );
-        let r = check_alert_destination_impl(true, "", webhook, "", true, true, true, true);
+        let r = check_alert_destination_impl(true, "", webhook, "", true, true, true, true, false);
         assert!(matches!(r.status, CheckStatus::Warn));
 
         // And an empty AUTUMN_ALERTS__WEBHOOK_SECRET env var clears it just the same.
@@ -5647,6 +5781,7 @@ pub struct Vault {
             true,
             true,
             true,
+            false,
         );
         assert!(matches!(r.status, CheckStatus::Pass));
     }
@@ -5674,6 +5809,7 @@ pub struct Vault {
             true,
             true,
             true,
+            false,
         );
         assert!(matches!(r.status, CheckStatus::Pass));
     }
@@ -5704,6 +5840,7 @@ pub struct Vault {
             true,
             true,
             true,
+            false,
         );
         assert!(
             matches!(r.status, CheckStatus::Warn),
@@ -5729,6 +5866,7 @@ pub struct Vault {
             false, // dev
             true,
             true,
+            false,
         );
         assert!(matches!(r.status, CheckStatus::Pass));
     }
@@ -5774,7 +5912,7 @@ pub struct Vault {
             !email,
             "an autumn-prod.toml that clears [alerts].email must resolve as no destination"
         );
-        let r = check_alert_destination_impl(true, "", false, "", true, true, true, true);
+        let r = check_alert_destination_impl(true, "", false, "", true, true, true, true, false);
         assert!(
             matches!(r.status, CheckStatus::Warn),
             "a production deploy whose override file cleared the only alert channel must WARN"
@@ -5822,6 +5960,7 @@ pub struct Vault {
             true,
             true,
             true,
+            false,
         );
         assert!(matches!(r.status, CheckStatus::Pass));
     }
@@ -5845,7 +5984,7 @@ pub struct Vault {
             !webhook,
             "a webhook whose secret was cleared by the override file is not a signed destination"
         );
-        let r = check_alert_destination_impl(true, "", webhook, "", true, true, true, true);
+        let r = check_alert_destination_impl(true, "", webhook, "", true, true, true, true, false);
         assert!(matches!(r.status, CheckStatus::Warn));
 
         // With both left intact through the merged view, the webhook still counts.
@@ -5938,6 +6077,7 @@ pub struct Vault {
             true,
             true,
             true,
+            false,
         );
         assert!(
             matches!(r.status, CheckStatus::Warn),
@@ -5968,6 +6108,7 @@ pub struct Vault {
             true,
             true,
             true,
+            false,
         );
         assert!(matches!(r.status, CheckStatus::Warn));
     }
@@ -5990,6 +6131,7 @@ pub struct Vault {
             true,
             true,
             true,
+            false,
         );
         assert!(matches!(r.status, CheckStatus::Pass));
     }
@@ -6011,11 +6153,155 @@ pub struct Vault {
             false,
             true,
             true,
+            false,
         );
         assert!(
             matches!(r.status, CheckStatus::Pass),
             "dev-mode leniency: disabled alerting must not warn outside production"
         );
+    }
+
+    // ── [alerts] custom_channel declaration (issue #1610 follow-up) ───────────
+    // An app that delivers alerts ONLY via `AppBuilder::with_alert_channel`
+    // (code, not config) still triggered doctor's no-destination Warn, which
+    // `--strict` turns into exit 1. `[alerts] custom_channel = true` lets the
+    // operator DECLARE the code-registered channel so the pure no-destination
+    // fall-through passes — while a *broken configured* destination still warns.
+
+    #[test]
+    fn alert_destination_custom_channel_passes_in_prod_without_destination() {
+        // custom_channel = true + no email/webhook in prod → PASS (not Warn), so
+        // `autumn doctor --strict` succeeds for a code-only alert setup.
+        let r = check_alert_destination_impl(
+            true, "", false, "", true, true, true, true, /* custom_channel */ true,
+        );
+        assert!(
+            matches!(r.status, CheckStatus::Pass),
+            "custom_channel = true declares a code-registered channel → no-destination must pass"
+        );
+        assert!(
+            r.detail
+                .as_deref()
+                .is_some_and(|d| d.contains("custom_channel")),
+            "the pass detail should name the custom_channel declaration"
+        );
+    }
+
+    #[test]
+    fn alert_destination_without_custom_channel_still_warns_in_prod() {
+        // custom_channel = false (default) + no destination in prod → still Warn,
+        // preserving the pre-existing behavior; the warning now points at the flag.
+        let r = check_alert_destination_impl(
+            true, "", false, "", true, true, true, true, /* custom_channel */ false,
+        );
+        assert!(matches!(r.status, CheckStatus::Warn));
+        assert!(
+            r.detail
+                .as_deref()
+                .is_some_and(|d| d.contains("custom_channel")),
+            "the no-destination warning should mention the custom_channel escape hatch"
+        );
+    }
+
+    #[test]
+    fn alert_destination_custom_channel_does_not_mask_broken_webhook() {
+        // custom_channel = true but a CONFIGURED webhook_url is relative/invalid →
+        // STILL warns about the broken value. custom_channel only suppresses the
+        // pure "no destination configured" fall-through, never a misconfigured one.
+        let r = check_alert_destination_impl(
+            true,
+            "",
+            false, // relative URL is not a usable webhook, so webhook_configured is false
+            "not-a-url/hooks", // present but non-absolute → dedicated invalid warning
+            true,
+            true,
+            true,
+            true,
+            /* custom_channel */ true,
+        );
+        assert!(
+            matches!(r.status, CheckStatus::Warn),
+            "a broken configured webhook_url must still warn even with custom_channel = true"
+        );
+        assert!(
+            r.detail
+                .as_deref()
+                .is_some_and(|d| d.contains("not an absolute")),
+            "the broken-webhook warning must fire, not the custom_channel pass"
+        );
+    }
+
+    #[test]
+    fn resolve_alert_custom_channel_defaults_false_when_unset() {
+        let table: toml::Table = toml::from_str("[alerts]\nemail = \"ops@example.com\"\n").unwrap();
+        assert!(!resolve_alert_custom_channel_from_sources(
+            no_env,
+            Some(&table),
+            "prod"
+        ));
+        assert!(!resolve_alert_custom_channel_from_sources(
+            no_env, None, "prod"
+        ));
+    }
+
+    #[test]
+    fn resolve_alert_custom_channel_base_true_is_detected() {
+        let table: toml::Table = toml::from_str("[alerts]\ncustom_channel = true\n").unwrap();
+        assert!(resolve_alert_custom_channel_from_sources(
+            no_env,
+            Some(&table),
+            "prod"
+        ));
+    }
+
+    #[test]
+    fn resolve_alert_custom_channel_env_true_overrides_base_false() {
+        let table: toml::Table = toml::from_str("[alerts]\ncustom_channel = false\n").unwrap();
+        let env = |k: &str| (k == "AUTUMN_ALERTS__CUSTOM_CHANNEL").then(|| "true".to_owned());
+        assert!(resolve_alert_custom_channel_from_sources(
+            env,
+            Some(&table),
+            "prod"
+        ));
+        let env1 = |k: &str| (k == "AUTUMN_ALERTS__CUSTOM_CHANNEL").then(|| "1".to_owned());
+        assert!(resolve_alert_custom_channel_from_sources(
+            env1,
+            Some(&table),
+            "prod"
+        ));
+    }
+
+    #[test]
+    fn resolve_alert_custom_channel_env_resolves_and_passes() {
+        // End-to-end at the resolver + check boundary: env sets the flag true, and
+        // with no configured destination in prod the check passes.
+        let table: toml::Table = toml::from_str("[alerts]\nemail = \"ops@example.com\"\n").unwrap();
+        let env = |k: &str| (k == "AUTUMN_ALERTS__CUSTOM_CHANNEL").then(|| "true".to_owned());
+        let custom = resolve_alert_custom_channel_from_sources(env, Some(&table), "prod");
+        assert!(
+            custom,
+            "AUTUMN_ALERTS__CUSTOM_CHANNEL=true must resolve true"
+        );
+        let r = check_alert_destination_impl(true, "", false, "", true, true, true, true, custom);
+        assert!(matches!(r.status, CheckStatus::Pass));
+    }
+
+    #[test]
+    fn resolve_alert_custom_channel_profile_true_overrides_base_false() {
+        let table: toml::Table = toml::from_str(
+            "[alerts]\ncustom_channel = false\n[profile.prod.alerts]\ncustom_channel = true\n",
+        )
+        .unwrap();
+        assert!(resolve_alert_custom_channel_from_sources(
+            no_env,
+            Some(&table),
+            "prod"
+        ));
+        assert!(!resolve_alert_custom_channel_from_sources(
+            no_env,
+            Some(&table),
+            ""
+        ));
     }
 
     // ── compute_summary ──────────────────────────────────────────────────────

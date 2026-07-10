@@ -2822,6 +2822,11 @@ impl AutumnConfig {
             "AUTUMN_ALERTS__WEBHOOK_SECRET",
             &mut self.alerts.webhook_secret,
         );
+        parse_env_bool(
+            env,
+            "AUTUMN_ALERTS__CUSTOM_CHANNEL",
+            &mut self.alerts.custom_channel,
+        );
         parse_env(
             env,
             "AUTUMN_ALERTS__DEDUP_WINDOW_SECS",
