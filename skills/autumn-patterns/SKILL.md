@@ -82,7 +82,7 @@ the rest with realistic fake data inferred from each field's name + type:
 ```rust
 let post = Post::factory().title("Fixed").fake().build();  // NewPost, unset fields faked
 let posts = Post::factory().fake().build_many(10);         // Vec<NewPost>, each row re-drawn
-let saved = Post::factory().fake().create(&mut db).await?; // persist
+let saved = Post::factory().fake().create(&pool).await;    // persist (panics on failure)
 ```
 
 Generators live in `autumn_web::fake` (`name`, `email`, `sentence`,

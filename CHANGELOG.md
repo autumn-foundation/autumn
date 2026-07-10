@@ -1074,7 +1074,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `autumn_web::current` module carries a request-scoped actor
   (`Current::set_actor` / `Current::actor`, plus `Current::set_default_actor` for
   jobs and the scheduler); `VersionEntry.actor` now records the authenticated
-  user with no per-call plumbing, and stays `None` when unset (issue #1383).
+  user with no per-call plumbing, and falls back to `"system"` when unset — the
+  `_autumn_version_history.actor` column is `NOT NULL DEFAULT 'system'` and the
+  generated repository code substitutes `VersionEntry::SYSTEM_ACTOR` (issue #1383).
 - **auth:** configurable password policy and persistent "remember me" login, both
   scaffolded automatically by `autumn generate auth`. `[auth.password]`
   (`min_length`, `reject_common` against a bundled weak-password corpus,

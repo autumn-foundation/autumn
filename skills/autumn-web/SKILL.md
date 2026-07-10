@@ -466,7 +466,8 @@ create/update handlers validate the decoded payload before touching the DB:
 - **List** — `GET /api/posts?page=1&size=20` returns
   `{ content: [...], page, size, total_elements, total_pages, has_next,
   has_previous }` (`page` is 1-based, default 1; `size` clamped). Custom
-  handlers can use `filter.page()` / `filter.per_page()` / `filter.limit_offset()`.
+  handlers can use `filter.page()` / `filter.size()` / `filter.limit()` /
+  `filter.offset()`.
 - **Create/update** — the decoded write payload runs the model's
   `#[validate(...)]` rules first; on failure the handler returns **422 Problem
   Details** with a per-field `errors` map instead of inserting. Models without a
@@ -570,7 +571,9 @@ Current::set_actor(format!("user:{user_id}")); // ambient, task-local, request-s
 For jobs and the scheduler (no request scope), set a process-wide default with
 `Current::set_default_actor(...)`, or run a bounded scope via
 `autumn_web::current::with_actor(actor, async { ... })`. Unset → `actor` is
-`None` (prior behaviour) (#1383). See `docs/guide/version-history.md`.
+recorded as `"system"` — the `_autumn_version_history.actor` column is `NOT NULL
+DEFAULT 'system'` and the generated code falls back to `VersionEntry::SYSTEM_ACTOR`
+(#1383). See `docs/guide/version-history.md`.
 
 ## OAuth2/OIDC scaffolding
 
@@ -1375,7 +1378,8 @@ is intended and the fork risk is accepted.
 ### `autumn test` — isolated test DB (unreleased — trunk-dev, issue #1056)
 
 `autumn test` resolves the test DB URL with the same precedence as
-`autumn migrate` (autumn.toml → `AUTUMN_DATABASE__*` → `DATABASE_URL`), derives a
+`autumn migrate` (`AUTUMN_DATABASE__PRIMARY_URL` → `AUTUMN_DATABASE__URL` →
+`DATABASE_URL` → autumn.toml — env wins over TOML), derives a
 `_test`-suffixed name, creates it if missing, runs all pending app + framework
 migrations, exports `AUTUMN_ENV=test` + the resolved `DATABASE_URL`, then runs
 `cargo test` (exiting with its code). `--reset` drops and recreates the test DB
