@@ -1153,6 +1153,17 @@ fn generate_scaffold_api_only() {
         test.contains("page 2 must differ from page 1"),
         "the --api smoke test must assert pages advance: {test}"
     );
+    // Required-column seed drives 25 rows off a single `generate_series` and
+    // must not fall back to `INSERT ... DEFAULT VALUES` (which cannot satisfy
+    // the NOT NULL `title`/`published` columns).
+    assert!(
+        test.contains("FROM generate_series(1, 25) AS g"),
+        "required-column --api seed must use generate_series: {test}"
+    );
+    assert!(
+        !test.contains("INSERT INTO posts DEFAULT VALUES"),
+        "required-column --api seed must not fall back to DEFAULT VALUES: {test}"
+    );
 
     // `routes![]` registration.
     let main = fs::read_to_string(project.join("src/main.rs")).unwrap();
