@@ -1888,10 +1888,11 @@ fn upload_run(
     }
     for file in &files {
         let path = run_dir.join(file);
-        let bytes = std::fs::read(&path).map_err(|e| format!("reading {file}: {e}"))?;
         let key = offsite_object_key(&offsite.prefix, profile, run_id, file);
+        // Stream the file straight from disk (hash pre-pass + streamed body):
+        // a multi-GB dump is never read into memory.
         client
-            .put_and_verify(&key, &bytes)
+            .put_file_and_verify(&key, &path)
             .map_err(|e| format!("{file}: {e}"))?;
         eprintln!("  \u{2713} uploaded + verified {file}");
     }
@@ -2182,14 +2183,17 @@ fn restore_from_offsite(args: &RestoreArgs, oref: &OffsiteRef) -> Result<(), Bac
                 op: "download",
                 detail: format!("unexpected object key layout: {}", obj.key),
             })?;
-        let bytes = client
-            .get_object(&obj.key)
+        // Stream the object straight to disk (constant memory), so a multi-GB
+        // dump is never buffered while downloading for restore.
+        let dest = temp.path().join(file);
+        let mut out = std::fs::File::create(&dest)
+            .map_err(BackupError::io(format!("creating downloaded {file}")))?;
+        client
+            .download_object(&obj.key, &mut out)
             .map_err(|e| BackupError::Offsite {
                 op: "download",
                 detail: format!("{file}: {e}"),
             })?;
-        std::fs::write(temp.path().join(file), &bytes)
-            .map_err(BackupError::io(format!("writing downloaded {file}")))?;
         eprintln!("  \u{2913} downloaded {file}");
     }
 

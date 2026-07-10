@@ -18,15 +18,17 @@
 //!
 //! # Integrity (AC #2)
 //!
-//! [`S3Client::put_object`] sends `x-amz-checksum-sha256` so a compliant
-//! endpoint validates the payload server-side and rejects a corrupted upload.
-//! [`S3Client::verify_uploaded`] then HEADs the object and confirms the
-//! remote length (and checksum, when the endpoint echoes it) matches the local
-//! file; when the checksum header is absent (older `MinIO`), it falls back to a
-//! GET-and-rehash so verification is never a no-op.
+//! [`S3Client::put_file_and_verify`] streams the artifact as the PUT body and
+//! sends `x-amz-checksum-sha256` so a compliant endpoint validates the payload
+//! server-side and rejects a corrupted upload. It then HEADs the object and
+//! confirms the remote length (and checksum, when the endpoint echoes it)
+//! matches the local file; when the checksum header is absent (older `MinIO`),
+//! it falls back to a **streaming** GET-and-rehash so verification is never a
+//! no-op and never buffers a multi-GB object in memory.
 
 use std::fmt;
 use std::fmt::Write as _;
+use std::path::Path;
 
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
@@ -157,7 +159,9 @@ fn sha256_hex(data: &[u8]) -> String {
     hex::encode(hasher.finalize())
 }
 
-/// Raw SHA-256 digest of `data`.
+/// Raw SHA-256 digest of `data`. (Test helper; the streaming upload/verify paths
+/// hash incrementally via [`sha256_file`] / [`Sha256Writer`].)
+#[cfg(test)]
 fn sha256_raw(data: &[u8]) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(data);
@@ -363,6 +367,17 @@ pub struct S3Client {
     now: fn() -> chrono::DateTime<chrono::Utc>,
 }
 
+/// The body of a request. Bodyless ops use [`RequestBody::Empty`]; the artifact
+/// upload uses [`RequestBody::File`], which streams the file straight from disk
+/// as the request body (bounded memory) with a payload hash the caller computed
+/// in a single streaming pass — a multi-GB dump is never read into a `Vec`.
+enum RequestBody<'a> {
+    /// No body (GET/HEAD/DELETE).
+    Empty,
+    /// Stream this file as the body; `sha256_hex` is its precomputed payload hash.
+    File { path: &'a Path, sha256_hex: &'a str },
+}
+
 /// Reject a custom `endpoint` that carries a path prefix. `canonical_path` signs
 /// `/{bucket}/{key}` (path-style) or `/{key}` (virtual-hosted) — it does NOT
 /// know about an endpoint path segment (e.g. `https://gw.example/s3`), so the
@@ -473,10 +488,10 @@ impl S3Client {
         }
     }
 
-    /// Sign and send one request. `body` is the full payload (bodyless ops pass
-    /// `&[]`). `extra_headers` are additional signed headers (e.g. the `PutObject`
-    /// checksum). Returns the raw blocking response on 2xx, else an
-    /// [`S3Error::Status`].
+    /// Sign and send one request. `extra_headers` are additional signed headers
+    /// (e.g. the `PutObject` checksum). A [`RequestBody::File`] streams from disk
+    /// so a large upload never buffers in memory. Returns the raw blocking
+    /// response on 2xx, else an [`S3Error::Status`].
     fn send(
         &self,
         op: &'static str,
@@ -484,15 +499,14 @@ impl S3Client {
         key: &str,
         canonical_query: &str,
         extra_headers: &[Header],
-        body: &[u8],
+        body: &RequestBody<'_>,
     ) -> Result<reqwest::blocking::Response, S3Error> {
         let now = (self.now)();
         let amz_date = now.format("%Y%m%dT%H%M%SZ").to_string();
         let date = now.format("%Y%m%d").to_string();
-        let payload_hash = if body.is_empty() {
-            EMPTY_PAYLOAD_SHA256.to_owned()
-        } else {
-            sha256_hex(body)
+        let payload_hash = match body {
+            RequestBody::Empty => EMPTY_PAYLOAD_SHA256.to_owned(),
+            RequestBody::File { sha256_hex, .. } => (*sha256_hex).to_owned(),
         };
         let host = self.host()?;
 
@@ -539,8 +553,15 @@ impl S3Client {
         for (name, value) in extra_headers {
             req = req.header(name.as_str(), value.as_str());
         }
-        if !body.is_empty() {
-            req = req.body(body.to_vec());
+        if let RequestBody::File { path, .. } = body {
+            // Stream the file straight from disk. reqwest's blocking `Body`
+            // derives Content-Length from the file's metadata, so the object is
+            // sent with constant memory regardless of size.
+            let file = std::fs::File::open(*path).map_err(|e| S3Error::Transport {
+                op,
+                detail: format!("opening {} for upload: {e}", path.display()),
+            })?;
+            req = req.body(file);
         }
 
         let resp = req.send().map_err(|e| S3Error::Transport {
@@ -563,11 +584,30 @@ impl S3Client {
         }
     }
 
-    /// PUT `bytes` at `key`, sending `x-amz-checksum-sha256` (base64) so a
-    /// compliant endpoint validates the payload server-side.
-    pub fn put_object(&self, key: &str, bytes: &[u8], checksum_b64: &str) -> Result<(), S3Error> {
+    /// Stream the file at `path` to `key` as a PUT, sending `x-amz-checksum-sha256`
+    /// (base64) so a compliant endpoint validates the payload server-side.
+    /// `content_sha256_hex` is the file's hex payload hash (the caller computed
+    /// it in a single streaming pass) and the body streams from disk — the file
+    /// is never buffered in memory.
+    fn put_file(
+        &self,
+        key: &str,
+        path: &Path,
+        checksum_b64: &str,
+        content_sha256_hex: &str,
+    ) -> Result<(), S3Error> {
         let extra = vec![("x-amz-checksum-sha256".to_owned(), checksum_b64.to_owned())];
-        self.send("put", reqwest::Method::PUT, key, "", &extra, bytes)?;
+        self.send(
+            "put",
+            reqwest::Method::PUT,
+            key,
+            "",
+            &extra,
+            &RequestBody::File {
+                path,
+                sha256_hex: content_sha256_hex,
+            },
+        )?;
         Ok(())
     }
 
@@ -584,7 +624,7 @@ impl S3Client {
             key,
             "",
             &head_extra_headers(),
-            &[],
+            &RequestBody::Empty,
         )?;
         let content_length = resp
             .headers()
@@ -606,20 +646,39 @@ impl S3Client {
         })
     }
 
-    /// GET `key`, returning the full object body.
-    pub fn get_object(&self, key: &str) -> Result<Vec<u8>, S3Error> {
-        let resp = self.send("get", reqwest::Method::GET, key, "", &[], &[])?;
-        resp.bytes()
-            .map(|b| b.to_vec())
-            .map_err(|e| S3Error::Transport {
-                op: "get",
-                detail: e.to_string(),
-            })
+    /// GET `key`, streaming the response body straight into `writer` with
+    /// constant memory — used for restore downloads and the rehash-verify
+    /// fallback so a multi-GB object is never buffered in a `Vec`.
+    pub fn download_object(
+        &self,
+        key: &str,
+        mut writer: impl std::io::Write,
+    ) -> Result<(), S3Error> {
+        let mut resp = self.send(
+            "get",
+            reqwest::Method::GET,
+            key,
+            "",
+            &[],
+            &RequestBody::Empty,
+        )?;
+        std::io::copy(&mut resp, &mut writer).map_err(|e| S3Error::Transport {
+            op: "get",
+            detail: e.to_string(),
+        })?;
+        Ok(())
     }
 
     /// DELETE `key` (idempotent on S3).
     pub fn delete_object(&self, key: &str) -> Result<(), S3Error> {
-        self.send("delete", reqwest::Method::DELETE, key, "", &[], &[])?;
+        self.send(
+            "delete",
+            reqwest::Method::DELETE,
+            key,
+            "",
+            &[],
+            &RequestBody::Empty,
+        )?;
         Ok(())
     }
 
@@ -647,7 +706,14 @@ impl S3Client {
                 .collect::<Vec<_>>()
                 .join("&");
 
-            let resp = self.send("list", reqwest::Method::GET, "", &canonical_query, &[], &[])?;
+            let resp = self.send(
+                "list",
+                reqwest::Method::GET,
+                "",
+                &canonical_query,
+                &[],
+                &RequestBody::Empty,
+            )?;
             let body = resp.text().map_err(|e| S3Error::Transport {
                 op: "list",
                 detail: e.to_string(),
@@ -668,19 +734,28 @@ impl S3Client {
         })
     }
 
-    /// Upload `bytes` to `key` and verify the remote object matches (AC #2):
-    /// PUT with server-side checksum, HEAD, then compare length + checksum;
-    /// when the endpoint does not echo a checksum, GET and rehash. Returns `Ok`
-    /// only once the remote is proven to match the local bytes.
-    pub fn put_and_verify(&self, key: &str, bytes: &[u8]) -> Result<(), S3Error> {
-        let checksum_b64 = sha256_base64(bytes);
-        self.put_object(key, bytes, &checksum_b64)?;
-        self.verify_uploaded(key, bytes.len() as u64, &checksum_b64)
+    /// Stream the file at `path` to `key` and verify the remote object matches
+    /// (AC #2): a single streaming hash pre-pass computes the sha256 + length,
+    /// the file is streamed as the PUT body with a server-side checksum, then
+    /// HEAD confirms length + checksum (falling back to a streaming
+    /// GET-and-rehash when the endpoint omits the checksum). Memory stays bounded
+    /// regardless of file size. Returns `Ok` only once the remote is proven to
+    /// match the local file.
+    pub fn put_file_and_verify(&self, key: &str, path: &Path) -> Result<(), S3Error> {
+        let (digest, len) = sha256_file(path).map_err(|e| S3Error::Transport {
+            op: "put",
+            detail: format!("hashing {} for upload: {e}", path.display()),
+        })?;
+        let checksum_b64 = base64_standard(&digest);
+        let content_hex = hex::encode(digest);
+        self.put_file(key, path, &checksum_b64, &content_hex)?;
+        self.verify_uploaded(key, len, &checksum_b64)
     }
 
-    /// HEAD-verify (and GET-rehash-fallback) an already-uploaded object against
-    /// the expected length and base64 sha256. Split out so the comparison logic
-    /// is exercised by [`put_and_verify`] and directly testable.
+    /// HEAD-verify (and streaming GET-rehash fallback) an already-uploaded object
+    /// against the expected length and base64 sha256. Split out so the
+    /// comparison logic is exercised by [`put_file_and_verify`](Self::put_file_and_verify)
+    /// and directly testable.
     pub fn verify_uploaded(
         &self,
         key: &str,
@@ -691,9 +766,11 @@ impl S3Client {
         if verify_head(expected_len, expected_b64, &info)? {
             return Ok(());
         }
-        // Checksum absent on HEAD: prove equality by downloading and rehashing.
-        let body = self.get_object(key)?;
-        let actual_b64 = sha256_base64(&body);
+        // Checksum absent on HEAD: prove equality by streaming the object through
+        // a sha256 hasher (constant memory, never buffering the whole object).
+        let mut hasher = Sha256Writer::new();
+        self.download_object(key, &mut hasher)?;
+        let actual_b64 = base64_standard(&hasher.finalize());
         if actual_b64 == expected_b64 {
             Ok(())
         } else {
@@ -705,16 +782,64 @@ impl S3Client {
     }
 }
 
+/// A `std::io::Write` sink that feeds everything written into a running SHA-256
+/// digest, so an object can be hashed while streaming without buffering it.
+struct Sha256Writer {
+    hasher: Sha256,
+}
+
+impl Sha256Writer {
+    fn new() -> Self {
+        Self {
+            hasher: Sha256::new(),
+        }
+    }
+
+    fn finalize(self) -> [u8; 32] {
+        self.hasher.finalize().into()
+    }
+}
+
+impl std::io::Write for Sha256Writer {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.hasher.update(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Stream a file through SHA-256, returning its `(digest, byte length)` without
+/// loading it into memory. Reads in 64 KiB chunks.
+fn sha256_file(path: &Path) -> std::io::Result<([u8; 32], u64)> {
+    use std::io::Read as _;
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut total: u64 = 0;
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        total += u64::try_from(n).unwrap_or(u64::MAX);
+    }
+    Ok((hasher.finalize().into(), total))
+}
+
 /// Base64 (standard alphabet, padded) of `data`.
 fn base64_standard(data: &[u8]) -> String {
     use base64::Engine as _;
     base64::engine::general_purpose::STANDARD.encode(data)
 }
 
-/// Base64 standard-encode a hex-or-raw sha256 the caller already computed.
-/// Convenience for the backup module which computes the digest itself.
-#[must_use]
-pub fn sha256_base64(data: &[u8]) -> String {
+/// Base64 of SHA-256(`data`). Test helper for the verification unit tests; the
+/// streaming paths hash incrementally and base64 the digest directly.
+#[cfg(test)]
+fn sha256_base64(data: &[u8]) -> String {
     base64_standard(&sha256_raw(data))
 }
 
@@ -966,5 +1091,87 @@ mod tests {
             secret_access_key: "s".to_owned(),
         };
         assert!(S3Client::new(config, creds).is_err());
+    }
+
+    #[test]
+    fn sha256_writer_matches_one_shot_hash() {
+        use std::io::Write as _;
+        // Streaming the object through the Write sink (multiple chunks) yields the
+        // same digest as hashing the whole buffer — this is the rehash-verify path.
+        let mut w = Sha256Writer::new();
+        w.write_all(b"hello ").unwrap();
+        w.write_all(b"streamed ").unwrap();
+        w.write_all(b"world").unwrap();
+        assert_eq!(w.finalize(), sha256_raw(b"hello streamed world"));
+    }
+
+    #[test]
+    fn sha256_file_streams_length_and_digest() {
+        // A payload larger than the 64 KiB read buffer spans multiple chunks, so
+        // this exercises the streaming loop (constant memory) used before upload.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("blob.bin");
+        let data: Vec<u8> = (0..100_000u32)
+            .map(|i| u8::try_from(i % 256).unwrap())
+            .collect();
+        std::fs::write(&path, &data).unwrap();
+        let (digest, len) = sha256_file(&path).unwrap();
+        assert_eq!(len, u64::try_from(data.len()).unwrap());
+        assert_eq!(digest, sha256_raw(&data));
+    }
+
+    #[test]
+    fn download_object_streams_response_body_into_writer() {
+        use std::io::{Read as _, Write as _};
+        // A one-shot local HTTP server returns a canned body; `download_object`
+        // must stream it straight into the caller's writer.
+        let body = b"streamed-object-body-contents".to_vec();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let body_for_server = body.clone();
+        let server = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            // Consume the request headers so the client finishes sending.
+            let mut acc = Vec::new();
+            let mut buf = [0u8; 512];
+            loop {
+                let n = sock.read(&mut buf).unwrap();
+                if n == 0 {
+                    break;
+                }
+                acc.extend_from_slice(&buf[..n]);
+                if acc.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+                body_for_server.len()
+            );
+            sock.write_all(head.as_bytes()).unwrap();
+            sock.write_all(&body_for_server).unwrap();
+            sock.flush().unwrap();
+        });
+
+        let client = S3Client::new(
+            S3Config {
+                bucket: "b".to_owned(),
+                region: "us-east-1".to_owned(),
+                endpoint: Some(format!("http://127.0.0.1:{port}")),
+                force_path_style: true,
+            },
+            S3Credentials {
+                access_key_id: "k".to_owned(),
+                secret_access_key: "s".to_owned(),
+            },
+        )
+        .unwrap();
+
+        let mut sink: Vec<u8> = Vec::new();
+        client
+            .download_object("prefix/obj.dump", &mut sink)
+            .unwrap();
+        server.join().unwrap();
+        assert_eq!(sink, body);
     }
 }
