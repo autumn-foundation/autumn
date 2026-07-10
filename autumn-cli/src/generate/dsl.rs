@@ -788,16 +788,54 @@ fn parse_bound(value: &str, kind: FieldKind) -> Result<String, String> {
                 .map_err(|_| format!("length bound '{value}' must be a non-negative integer"))?;
             Ok(value.to_owned())
         }
-        FieldKind::I32 | FieldKind::I64 => {
-            value
-                .parse::<i64>()
-                .map_err(|_| format!("range bound '{value}' must be an integer"))?;
+        FieldKind::I32 => {
+            // Parse at the field's CONCRETE width, not a wider `i64`: a bound
+            // that overflows `i32` (e.g. `count:i32{max=3000000000}`) would
+            // otherwise be emitted verbatim as `#[validate(range(max = ...))]`
+            // on an `i32` field and fail to COMPILE the generated app. Reject
+            // it here with an actionable error instead (issue #1388 follow-up).
+            value.parse::<i32>().map_err(|_| {
+                format!(
+                    "range bound '{value}' must be an integer within the i32 range ({}..={})",
+                    i32::MIN,
+                    i32::MAX
+                )
+            })?;
             Ok(value.to_owned())
         }
-        FieldKind::F32 | FieldKind::F64 => {
-            value
+        FieldKind::I64 => {
+            value.parse::<i64>().map_err(|_| {
+                format!(
+                    "range bound '{value}' must be an integer within the i64 range ({}..={})",
+                    i64::MIN,
+                    i64::MAX
+                )
+            })?;
+            Ok(value.to_owned())
+        }
+        FieldKind::F32 => {
+            // Rust's float parse saturates overflow to ±∞ rather than erroring,
+            // so an out-of-`f32`-range literal would compile to a non-finite
+            // `#[validate(range(...))]` bound; reject non-finite explicitly.
+            let parsed = value
+                .parse::<f32>()
+                .map_err(|_| format!("range bound '{value}' must be a number"))?;
+            if !parsed.is_finite() {
+                return Err(format!(
+                    "range bound '{value}' is out of range for an f32 field (it overflows to a non-finite value)"
+                ));
+            }
+            Ok(value.to_owned())
+        }
+        FieldKind::F64 => {
+            let parsed = value
                 .parse::<f64>()
                 .map_err(|_| format!("range bound '{value}' must be a number"))?;
+            if !parsed.is_finite() {
+                return Err(format!(
+                    "range bound '{value}' is out of range for an f64 field (it overflows to a non-finite value)"
+                ));
+            }
             Ok(value.to_owned())
         }
         _ => Err(format!(
@@ -1679,6 +1717,46 @@ mod tests {
         let f = parse_field("age:i32{min=0,max=130}").unwrap();
         assert_eq!(f.kind, FieldKind::I32);
         assert_eq!(f.validation_attrs(), vec!["range(min = 0, max = 130)"]);
+    }
+
+    #[test]
+    fn i32_range_bound_within_range_is_accepted() {
+        let f = parse_field("count:i32{max=1000000}").unwrap();
+        assert_eq!(f.kind, FieldKind::I32);
+        assert_eq!(f.constraints.max.as_deref(), Some("1000000"));
+        assert_eq!(f.validation_attrs(), vec!["range(max = 1000000)"]);
+    }
+
+    #[test]
+    fn i32_range_bound_exceeding_i32_max_is_rejected() {
+        // `3000000000` > i32::MAX (~2.147e9): parsed at the field's concrete
+        // width so it fails generation with an actionable error rather than
+        // emitting `#[validate(range(max = 3000000000))]` on an `i32` field,
+        // which would fail to COMPILE the generated app.
+        let err = parse_field("count:i32{max=3000000000}").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("3000000000"), "must name the bad bound: {msg}");
+        assert!(msg.contains("i32"), "must name the field type: {msg}");
+        assert!(
+            msg.contains("2147483647"),
+            "must state the valid range: {msg}"
+        );
+    }
+
+    #[test]
+    fn i64_accepts_a_bound_that_would_overflow_i32() {
+        // The same literal is fine on an i64 field.
+        let f = parse_field("count:i64{max=3000000000}").unwrap();
+        assert_eq!(f.kind, FieldKind::I64);
+        assert_eq!(f.validation_attrs(), vec!["range(max = 3000000000)"]);
+    }
+
+    #[test]
+    fn f32_range_bound_overflowing_the_type_is_rejected() {
+        // Rust parses an out-of-f32-range literal to +∞ rather than erroring,
+        // so reject non-finite bounds explicitly.
+        let err = parse_field("ratio:f32{max=1e40}").unwrap_err();
+        assert!(err.to_string().contains("f32"), "{}", err);
     }
 
     #[test]

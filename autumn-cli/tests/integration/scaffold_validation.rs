@@ -303,6 +303,46 @@ fn unknown_constraint_modifier_fails_the_scaffold() {
     );
 }
 
+#[test]
+fn out_of_range_i32_bound_fails_the_scaffold() {
+    // `3000000000` > i32::MAX: emitting `#[validate(range(max = 3000000000))]`
+    // on an `i32` field would fail to COMPILE the generated app, so the
+    // generator must reject the bound up front with an actionable message.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    run_autumn_ok(tmp.path(), &["new", "oob-bound-app"]);
+    let project = tmp.path().join("oob-bound-app");
+    let output = run_autumn(
+        &project,
+        &["generate", "scaffold", "Post", "count:i32{max=3000000000}"],
+    );
+    assert!(
+        !output.status.success(),
+        "an out-of-range i32 bound must fail the scaffold"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("3000000000") && stderr.contains("i32"),
+        "the error must name the bad bound and the field type:\n{stderr}"
+    );
+}
+
+#[test]
+fn in_range_i32_bound_generates_and_type_checks_shape() {
+    // The happy path: a valid in-range i32 bound still emits the range rule.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    run_autumn_ok(tmp.path(), &["new", "in-range-bound-app"]);
+    let project = tmp.path().join("in-range-bound-app");
+    run_autumn_ok(
+        &project,
+        &["generate", "scaffold", "Post", "count:i32{max=1000000}"],
+    );
+    let model = fs::read_to_string(project.join("src/models/post.rs")).unwrap();
+    assert!(
+        model.contains("#[validate(range(max = 1000000))]"),
+        "a valid in-range bound must still emit its range rule:\n{model}"
+    );
+}
+
 /// Slow end-to-end check: the constrained scaffold (model `#[validate]` rules,
 /// validator dependency, HTML5-attributed form controls) type-checks against
 /// this workspace's `autumn-web`.
