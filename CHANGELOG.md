@@ -1040,7 +1040,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   general-purpose compression middleware to redo that work on every request.
 - **cli:** `autumn test` provisions and targets an isolated test database before
   running your suite — it resolves the test DB URL with the same precedence as
-  `autumn migrate` (autumn.toml → `AUTUMN_DATABASE__*` → `DATABASE_URL`), derives
+  `autumn migrate` (`AUTUMN_DATABASE__PRIMARY_URL` → `AUTUMN_DATABASE__URL` →
+  `DATABASE_URL` → `autumn.toml`), derives
   a `_test`-suffixed database name, creates it if missing, runs all pending app +
   framework migrations, exports `AUTUMN_ENV=test` and the resolved
   `DATABASE_URL`, then shells out to `cargo test` (exiting with its code).
