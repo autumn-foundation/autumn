@@ -103,7 +103,12 @@ as its trigger so an incident manager can auto-resolve the correlated alert.
 
 ### Silencing a condition
 
-- **Silence everything:** remove the destination, or set `enabled = false`.
+- **Silence everything:** set `enabled = false`. This is the master off switch
+  and silences **all** alerts — not just the built-in mail and webhook channels
+  but every custom [`AlertChannel`] registered with `with_alert_channel` too. No
+  channels are installed, the background evaluation loop is never started, and
+  the `notify_*` hooks become no-ops, so nothing is delivered anywhere.
+  (Removing the destination only silences the built-in channels.)
 - **Quiet the 5xx alert:** raise `error_rate_threshold` (e.g. `0.2`) or
   `error_rate_min_requests`.
 - **Tolerate flapping dependencies:** raise `health_grace_secs` so a brief blip
@@ -141,6 +146,11 @@ Email alerts are delivered through your configured mailer with the
 bounce/complaint **suppression list bypassed** — operator alerts are
 security-class and must never be silently dropped.
 
+> Email alerts require the `mail` feature. If your binary is built without it, an
+> email-only `[alerts]` destination delivers nothing — Autumn logs a startup
+> `warn` in that case. Enable the `mail` feature or configure a `webhook_url`
+> destination instead.
+
 The host/replica identity is read from `AUTUMN_REPLICA_ID`, falling back to
 `HOSTNAME`.
 
@@ -151,6 +161,10 @@ The host/replica identity is read from `AUTUMN_REPLICA_ID`, falling back to
 Delivery is a trait. Implement [`AlertChannel`] and register it — the built-in
 mail/webhook channels stay active alongside yours. This is the extension seam
 for additional transports; the framework core never changes.
+
+> Custom channels are still governed by the master switch: with
+> `enabled = false` your channel is not installed and receives nothing, exactly
+> like the built-in ones.
 
 ```rust,no_run
 use autumn_web::alerts::{Alert, AlertChannel, AlertDeliveryError, AlertDeliveryFuture};

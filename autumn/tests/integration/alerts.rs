@@ -10,8 +10,8 @@
 use std::sync::{Arc, Mutex};
 
 use autumn_web::alerts::{
-    Alert, AlertChannel, AlertCondition, AlertDeliveryError, AlertDeliveryFuture, AlertEventKind,
-    AlertSeverity, Alerter, AlerterSettings,
+    Alert, AlertChannel, AlertCondition, AlertConfig, AlertDeliveryError, AlertDeliveryFuture,
+    AlertEventKind, AlertSeverity, Alerter, AlerterSettings,
 };
 use autumn_web::test::TestApp;
 
@@ -244,6 +244,47 @@ async fn alert_fans_out_to_every_channel() {
     wait_for(&b, 1).await;
     assert_eq!(a.alerts().len(), 1);
     assert_eq!(b.alerts().len(), 1);
+}
+
+/// Master switch: `enabled = false` silences EVERYTHING, including a custom
+/// channel registered via the builder. `install_from_config` must install no
+/// alerter (so the `notify_*` hooks are no-ops) and must not deliver anything to
+/// the custom channel nor spawn the evaluation loop.
+#[tokio::test]
+async fn disabled_master_switch_silences_custom_channels() {
+    let channel = CapturingChannel::default();
+
+    let client = TestApp::new().build();
+
+    // A production-shaped config with alerting fully disabled, wired together
+    // with a custom channel exactly as `with_alert_channel` would surface it.
+    let config = AlertConfig {
+        enabled: false,
+        ..AlertConfig::default()
+    };
+    autumn_web::alerts::install_from_config(
+        client.state(),
+        &config,
+        vec![Arc::new(channel.clone())],
+    );
+
+    // With the master switch off, no alerter is installed onto state.
+    assert!(
+        client.state().extension::<Alerter>().is_none(),
+        "disabled alerting must not install an alerter (hooks stay no-ops)"
+    );
+
+    // Triggering a condition through the real seam delivers nothing.
+    autumn_web::alerts::notify_dead_lettered_job(client.state(), "reporting_job", "boom");
+    autumn_web::alerts::notify_scheduled_task_failure(client.state(), "nightly_backup", "boom");
+
+    // Give any (erroneously) spawned delivery task a chance to run.
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    assert!(
+        channel.alerts().is_empty(),
+        "custom channel must receive nothing when alerting is disabled: {:?}",
+        channel.alerts()
+    );
 }
 
 /// AC #6 (fail-safe): a channel that always errors never propagates the failure

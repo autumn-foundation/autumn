@@ -863,37 +863,57 @@ impl AlertChannel for WebhookAlertChannel {
 /// [`Alerter`] onto `state`, and starts the background evaluation loop for the
 /// health and 5xx-rate conditions.
 ///
-/// Does nothing (and installs nothing) when alerts are inactive
-/// ([`AlertConfig::is_active`] is `false`) *and* no extra channels were
-/// registered — so an app with no destination pays nothing.
+/// `config.enabled` is the master off switch. When it is `false` the *entire*
+/// alerting subsystem is silent: no built-in channels, no custom/extra channels
+/// registered via [`AppBuilder::with_alert_channel`](crate::app::AppBuilder::with_alert_channel),
+/// no background evaluation loop, and no [`Alerter`] installed onto `state` (so
+/// the `notify_*` hooks become no-ops). Nothing is installed either when
+/// alerting is enabled but there is no destination and no extra channel — so an
+/// app with no configured destination pays nothing.
 pub fn install_from_config(
     state: &AppState,
     config: &AlertConfig,
     extra_channels: Vec<Arc<dyn AlertChannel>>,
 ) {
+    // Master off switch: `enabled = false` silences EVERYTHING, including any
+    // custom channel registered via `with_alert_channel`. Install nothing, do
+    // not start the evaluation loop, and do not put an alerter onto `state`.
+    if !config.enabled {
+        return;
+    }
+
     let mut channels: Vec<Arc<dyn AlertChannel>> = Vec::new();
 
-    if config.enabled {
-        #[cfg(feature = "mail")]
-        if let Some(email) = config.email.as_ref().filter(|s| !s.trim().is_empty()) {
-            if let Some(mailer) = state.extension::<crate::mail::Mailer>() {
-                channels.push(Arc::new(MailAlertChannel::new(mailer, email.clone())));
-            } else {
-                tracing::warn!(
-                    "alerts: an operator email is configured but no mailer is installed; \
-                     configure [mail] to enable email alerts"
-                );
-            }
+    #[cfg(feature = "mail")]
+    if let Some(email) = config.email.as_ref().filter(|s| !s.trim().is_empty()) {
+        if let Some(mailer) = state.extension::<crate::mail::Mailer>() {
+            channels.push(Arc::new(MailAlertChannel::new(mailer, email.clone())));
+        } else {
+            tracing::warn!(
+                "alerts: an operator email is configured but no mailer is installed; \
+                 configure [mail] to enable email alerts"
+            );
         }
-        #[cfg(feature = "http-client")]
-        if let Some(url) = config.webhook_url.as_ref().filter(|s| !s.trim().is_empty()) {
-            let client = crate::http_client::Client::from_state(state);
-            channels.push(Arc::new(WebhookAlertChannel::new(
-                client,
-                url.clone(),
-                config.webhook_secret.clone(),
-            )));
-        }
+    }
+    // Without the `mail` feature the email branch above is compiled out, so an
+    // email-only config would silently install no channels and deliver no
+    // alerts. Warn loudly so operators don't believe email alerts are active.
+    #[cfg(not(feature = "mail"))]
+    if config.email.as_ref().is_some_and(|s| !s.trim().is_empty()) {
+        tracing::warn!(
+            "operator-alerts: an email destination is configured but the `mail` feature is not \
+             enabled; no email alerts will be delivered. Enable the `mail` feature or use a \
+             webhook destination."
+        );
+    }
+    #[cfg(feature = "http-client")]
+    if let Some(url) = config.webhook_url.as_ref().filter(|s| !s.trim().is_empty()) {
+        let client = crate::http_client::Client::from_state(state);
+        channels.push(Arc::new(WebhookAlertChannel::new(
+            client,
+            url.clone(),
+            config.webhook_secret.clone(),
+        )));
     }
 
     channels.extend(extra_channels);
