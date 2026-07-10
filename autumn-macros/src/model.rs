@@ -981,6 +981,37 @@ const NON_PATCH_VALIDATORS: &[&str] = &[
     "does_not_contain",
 ];
 
+/// `validator` validators whose `Patch<T>` per-field impl (in `autumn/src/hooks.rs`)
+/// delegates to `T`, but for which `validator` provides **no `impl … for
+/// Option<T>`** — so they cannot be enforced on an `Option<_>`-typed model
+/// field's `UpdateModel` `Patch<T>` field.
+///
+/// Background (#1719 / Codex P2): the `#[derive(Validate)]` on `NewModel`
+/// syntactically unwraps `Option<Inner>` and calls the validator on the inner
+/// `Inner` (e.g. `String`), so `#[validate(ip)] ip: Option<String>` compiles
+/// on create. But `UpdateModel`'s field is `Patch<Option<String>>`; the derive
+/// does NOT recognise `Patch<…>` as an `Option`, so it calls the validator on
+/// the whole `Patch<Option<String>>`. Our `impl<T: ValidateIp> ValidateIp for
+/// Patch<T>` then requires `Option<String>: ValidateIp`. In `validator` 0.20,
+/// `ValidateIp` is supplied ONLY by the blanket `impl<T: ToString> ValidateIp
+/// for T` (validation/ip.rs:13) — there is NO `impl ValidateIp for Option<T>`
+/// and `Option<String>` is not `ToString`/`Display`, so `Option<String>:
+/// ValidateIp` is unsatisfied and `UpdateModel` **fails to compile**.
+///
+/// The other per-field validators our `Patch<T>` block implements are NOT
+/// affected because `validator` 0.20 DOES ship an `Option<T>` impl for each:
+/// `length` (validation/length.rs:115), `range` (validation/range.rs:65),
+/// `email` (validation/email.rs:99), `url` (validation/urls.rs:56), `contains`
+/// (validation/contains.rs:15), and even `regex` (validation/regex.rs:76). So
+/// `ip` is the sole Option-incompatible validator in our supported set.
+///
+/// These are filtered from the PATCH path **only when the field is
+/// `Option<…>`-typed**: on a non-`Option` field (e.g. `#[validate(ip)] ip:
+/// String`) `Patch<String>: ValidateIp` holds via the `ToString` blanket, so
+/// `ip` must stay enforced on update there. On create, `ip` still runs for the
+/// `Option` field via the derive's `Option`-unwrap on `NewModel`.
+const OPTION_INCOMPATIBLE_VALIDATORS: &[&str] = &["ip"];
+
 /// Like [`validate_attrs`], but tailored for the `UpdateModel` `Patch<T>` fields
 /// (#1719): drop the nested validators that `Patch<T>` cannot enforce.
 ///
@@ -1011,11 +1042,26 @@ const NON_PATCH_VALIDATORS: &[&str] = &[
 /// through untouched, so a newly-supported declarative validator is never
 /// silently dropped.
 ///
+/// Additionally, when the model field is syntactically `Option<…>`, the
+/// [`OPTION_INCOMPATIBLE_VALIDATORS`] (e.g. `ip`) are ALSO dropped: `validator`
+/// ships no `impl … for Option<T>` for them, so `Patch<Option<T>>` would not
+/// implement the corresponding per-field trait and `UpdateModel` would fail to
+/// compile. They still run on create (the `NewModel` derive unwraps the
+/// `Option`) and remain enforced on non-`Option` update fields. See
+/// [`OPTION_INCOMPATIBLE_VALIDATORS`] for the full derivation.
+///
+/// `Option<…>` is detected the same way `validator` itself detects it — by the
+/// last path segment's ident being `Option` (via [`is_option_type`]) — which
+/// also matches fully-qualified `std::option::Option` / `core::option::Option`.
+/// Limitation: a type *alias* to `Option` is not detected (no worse than the
+/// derive's own behaviour, which also inspects the syntactic type).
+///
 /// Documented limitation: `custom`/`must_match`/`nested`/`required`/
 /// `does_not_contain`/etc. are enforced on create (via `NewModel`) but NOT on
 /// the PATCH update path; a follow-up may add merged-model validation for
 /// cross-field/custom rules.
 fn validate_attrs_for_patch(field: &Field) -> Vec<syn::Attribute> {
+    let field_is_option = is_option_type(&field.ty);
     let mut out = Vec::new();
     for attr in field.attrs.iter().filter(|a| a.path().is_ident("validate")) {
         let syn::Meta::List(list) = &attr.meta else {
@@ -1033,9 +1079,18 @@ fn validate_attrs_for_patch(field: &Field) -> Vec<syn::Attribute> {
         let kept: Vec<syn::Meta> = nested
             .into_iter()
             .filter(|m| {
-                !m.path()
-                    .get_ident()
-                    .is_some_and(|id| NON_PATCH_VALIDATORS.iter().any(|v| id == *v))
+                let Some(id) = m.path().get_ident() else {
+                    return true;
+                };
+                if NON_PATCH_VALIDATORS.iter().any(|v| id == *v) {
+                    return false;
+                }
+                // Option-incompatible validators (e.g. `ip`) only break the
+                // PATCH path on `Option<…>`-typed fields; keep them otherwise.
+                if field_is_option && OPTION_INCOMPATIBLE_VALIDATORS.iter().any(|v| id == *v) {
+                    return false;
+                }
+                true
             })
             .collect();
         if kept.is_empty() {
@@ -5521,6 +5576,103 @@ mod tests {
         assert!(
             upd_section.contains("length"),
             "UpdateDoc must keep the declarative `length` validator: {upd_section}"
+        );
+    }
+
+    #[test]
+    fn update_model_drops_ip_only_on_option_fields_new_model_keeps_all() {
+        // #1719 / Codex P2: `validator` provides no `impl ValidateIp for
+        // Option<T>` (only the `impl<T: ToString> ValidateIp for T` blanket),
+        // so `Patch<Option<String>>: ValidateIp` is unsatisfied and the
+        // generated `UpdateModel` would fail to compile for an `Option<String>`
+        // + `#[validate(ip)]` field. We therefore drop `ip` from the PATCH
+        // fields ONLY when the field is `Option<…>`, while:
+        //   * keeping `ip` on a non-`Option` field (`Patch<String>: ValidateIp`
+        //     holds via the `ToString` blanket),
+        //   * keeping `length` on the `Option` field (validator ships an
+        //     `Option<T>` impl for it, so it must NOT be over-filtered),
+        //   * keeping every validator on `NewModel` (its derive unwraps Option).
+        let output = model_macro(
+            TokenStream::new(),
+            quote! {
+                pub struct Server {
+                    #[id]
+                    pub id: i64,
+                    #[validate(ip, length(min = 1))]
+                    pub ip: Option<String>,
+                    #[validate(ip)]
+                    pub ip2: String,
+                    #[validate(length(min = 1))]
+                    pub name: Option<String>,
+                }
+            },
+        );
+        let generated = output.to_string();
+
+        // Slice the `NewServer` struct body (up to its closing brace).
+        let new_start = generated
+            .find("struct NewServer")
+            .expect("NewServer struct must be generated");
+        let new_end = new_start
+            + generated[new_start..]
+                .find('}')
+                .expect("NewServer struct must close");
+        let new_section = &generated[new_start..new_end];
+        // NewServer keeps `ip` on BOTH ip fields (the derive unwraps Option):
+        // the combined attr on the Option field and the bare attr on ip2.
+        assert!(
+            new_section.contains("validate (ip , length"),
+            "NewServer must keep the `ip` (and `length`) validator on the \
+             Option<String> field: {new_section}"
+        );
+        assert!(
+            new_section.contains("validate (ip)"),
+            "NewServer must keep the `ip` validator on the non-Option field: {new_section}"
+        );
+
+        // Slice the `UpdateServer` struct body (up to its closing brace).
+        let upd_start = generated
+            .find("struct UpdateServer")
+            .expect("UpdateServer struct must be generated");
+        let upd_end = upd_start
+            + generated[upd_start..]
+                .find('}')
+                .expect("UpdateServer struct must close");
+        let upd_section = &generated[upd_start..upd_end];
+
+        // A `#[validate(ip)]` attr renders as `validate (ip)`; the pre-fix
+        // combined attr on the Option field would render `validate (ip ,
+        // length (min = 1))`. After the fix, the ONLY surviving `ip` validator
+        // in UpdateServer is the non-Option `ip2` field, so `validate (ip`
+        // must appear exactly once.
+        assert_eq!(
+            upd_section.matches("validate (ip").count(),
+            1,
+            "UpdateServer must retain `ip` on ONLY the non-Option `ip2` field \
+             (the Option<String> `ip` field must drop it — no `impl ValidateIp \
+             for Option<T>`): {upd_section}"
+        );
+        // The retained one is exactly `validate (ip)` (bare), i.e. ip2's attr.
+        assert!(
+            upd_section.contains("validate (ip)"),
+            "UpdateServer's non-Option `ip2` field must RETAIN the `ip` \
+             validator (Patch<String>: ValidateIp holds via the ToString \
+             blanket): {upd_section}"
+        );
+        // The Option `ip` field's combined attr must NOT survive with `ip`.
+        assert!(
+            !upd_section.contains("validate (ip ,"),
+            "UpdateServer's Option<String> `ip` field must DROP the `ip` \
+             validator: {upd_section}"
+        );
+        // `length` on the Option fields must NOT be over-filtered (validator
+        // ships an `Option<T>` impl for it): both the `ip` field's leftover
+        // `length` and the `name` field's `length` remain.
+        assert_eq!(
+            upd_section.matches("length (min = 1)").count(),
+            2,
+            "UpdateServer must KEEP `length` on both Option fields (`ip` \
+             leftover after dropping ip, and `name`): {upd_section}"
         );
     }
 
