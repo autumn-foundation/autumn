@@ -2350,26 +2350,46 @@ pub async fn sessions_label(
 
 // ── Signup ────────────────────────────────────────────────────────────────────
 
-/// `GET /signup` — render the signup form.
-#[get("/signup")]
-pub async fn signup_form(csrf: Option<CsrfToken>, csrf_field: Option<CsrfFormField>) -> AutumnResult<Markup> {{
-    Ok(layout("Sign Up", html! {{
+/// Render the signup form, optionally with a validation error. The minimum
+/// password length is read from `[auth.password]` so the copy always matches
+/// the active policy.
+fn render_signup_form(
+    min_len: usize,
+    error: Option<&str>,
+    csrf: Option<&CsrfToken>,
+    csrf_field: Option<&CsrfFormField>,
+) -> Markup {{
+    layout("Sign Up", html! {{
         h1 {{ "Create an Account" }}
+        @if let Some(error) = error {{
+            p role="alert" {{ (error) }}
+        }}
         form action="/signup" method="post" {{
-            @if let Some(ref csrf) = csrf {{ input type="hidden" name=(csrf_field.as_ref().map_or("_csrf", |f| f.0.as_str())) value=(csrf.token()); }}
+            @if let Some(csrf) = csrf {{ input type="hidden" name=(csrf_field.map_or("_csrf", |f| f.0.as_str())) value=(csrf.token()); }}
             div {{
                 label {{ "Email" }}
                 input type="email" name="email" required autocomplete="email";
             }}
             div {{
-                label {{ "Password (8+ characters)" }}
+                label {{ "Password (" (min_len) "+ characters)" }}
                 input type="password" name="password" required
-                      autocomplete="new-password" minlength="8";
+                      autocomplete="new-password" minlength=(min_len);
             }}
             button type="submit" {{ "Sign Up" }}
         }}
         p {{ a href="/login" {{ "Already have an account? Log in" }} }}
-    }}))
+    }})
+}}
+
+/// `GET /signup` — render the signup form.
+#[get("/signup")]
+pub async fn signup_form(
+    State(state): State<AppState>,
+    csrf: Option<CsrfToken>,
+    csrf_field: Option<CsrfFormField>,
+) -> AutumnResult<Markup> {{
+    let min_len = state.config().auth.password.min_length;
+    Ok(render_signup_form(min_len, None, csrf.as_ref(), csrf_field.as_ref()))
 }}
 
 #[derive(Deserialize)]
@@ -2388,10 +2408,13 @@ pub struct SignupForm {{
 /// never shown when no mail will actually be sent.
 #[post("/signup")]
 pub async fn signup(
+    State(state): State<AppState>,
     mut db: Db,
     mailer: Mailer,
     session: Session,
     flash: Flash,
+    csrf: Option<CsrfToken>,
+    csrf_field: Option<CsrfFormField>,
     Form(form): Form<SignupForm>,
 ) -> AutumnResult<Response> {{
     // Fail fast: confirmation requires mail. Check before any DB work so the
@@ -2414,10 +2437,30 @@ pub async fn signup(
     }} else {{
         return Err(account_err());
     }}
-    if form.password.len() < 8 {{
-        return Err(AutumnError::unprocessable_msg(
-            "Password must be at least 8 characters.",
-        ));
+    // Enforce the configured password policy (length, weak-list, similarity to
+    // the supplied email, and optional HIBP breach check) instead of a bare
+    // length gate. On failure, re-render the form with the specific message at
+    // HTTP 200 rather than accepting a weak credential or returning an error page.
+    let password_cfg = state.config().auth.password;
+    let mut policy = password_cfg.policy();
+    if password_cfg.breach_check != autumn_web::auth::BreachCheck::Off {{
+        // Breach checking needs an HTTP client for the HIBP k-anonymity lookup;
+        // the default-off path never constructs one.
+        policy = policy.with_client(autumn_web::http_client::Client::new());
+    }}
+    let ctx = [email.as_str()];
+    let validation = autumn_web::auth::validate_password(&form.password, &policy, &ctx).await;
+    if !validation.is_valid() {{
+        let message = validation
+            .first_message()
+            .unwrap_or_else(|| "Invalid password.".to_owned());
+        return Ok(render_signup_form(
+            password_cfg.min_length,
+            Some(&message),
+            csrf.as_ref(),
+            csrf_field.as_ref(),
+        )
+        .into_response());
     }}
 
     let raw_confirm_token = generate_confirmation_token();
@@ -3260,26 +3303,49 @@ pub struct ResetPasswordQuery {{
     pub token: String,
 }}
 
+/// Render the reset-password form, optionally with a validation error. The
+/// minimum length reflects the active `[auth.password]` policy.
+fn render_reset_password_form(
+    token: &str,
+    min_len: usize,
+    error: Option<&str>,
+    csrf: Option<&CsrfToken>,
+    csrf_field: Option<&CsrfFormField>,
+) -> Markup {{
+    layout("Reset Password", html! {{
+        h1 {{ "Set a New Password" }}
+        @if let Some(error) = error {{
+            p role="alert" {{ (error) }}
+        }}
+        form action="/reset-password" method="post" {{
+            @if let Some(csrf) = csrf {{ input type="hidden" name=(csrf_field.map_or("_csrf", |f| f.0.as_str())) value=(csrf.token()); }}
+            input type="hidden" name="token" value=(token);
+            div {{
+                label {{ "New Password (" (min_len) "+ characters)" }}
+                input type="password" name="password" required
+                      autocomplete="new-password" minlength=(min_len);
+            }}
+            button type="submit" {{ "Set New Password" }}
+        }}
+    }})
+}}
+
 /// `GET /reset-password?token=<raw>` — render the reset-password form.
 #[get("/reset-password")]
 pub async fn reset_password_form(
+    State(state): State<AppState>,
     Query(query): Query<ResetPasswordQuery>,
     csrf: Option<CsrfToken>,
     csrf_field: Option<CsrfFormField>,
 ) -> AutumnResult<Markup> {{
-    Ok(layout("Reset Password", html! {{
-        h1 {{ "Set a New Password" }}
-        form action="/reset-password" method="post" {{
-            @if let Some(ref csrf) = csrf {{ input type="hidden" name=(csrf_field.as_ref().map_or("_csrf", |f| f.0.as_str())) value=(csrf.token()); }}
-            input type="hidden" name="token" value=(query.token);
-            div {{
-                label {{ "New Password (8+ characters)" }}
-                input type="password" name="password" required
-                      autocomplete="new-password" minlength="8";
-            }}
-            button type="submit" {{ "Set New Password" }}
-        }}
-    }}))
+    let min_len = state.config().auth.password.min_length;
+    Ok(render_reset_password_form(
+        &query.token,
+        min_len,
+        None,
+        csrf.as_ref(),
+        csrf_field.as_ref(),
+    ))
 }}
 
 #[derive(Deserialize)]
@@ -3300,12 +3366,32 @@ pub async fn reset_password(
     session: Session,
     MaybeClientIp(addr_ip): MaybeClientIp,
     headers: axum::http::HeaderMap,
+    csrf: Option<CsrfToken>,
+    csrf_field: Option<CsrfFormField>,
     Form(form): Form<ResetPasswordForm>,
 ) -> AutumnResult<Response> {{
-    if form.password.len() < 8 {{
-        return Err(AutumnError::unprocessable_msg(
-            "Password must be at least 8 characters.",
-        ));
+    // Enforce the configured password policy. The reset flow has no verified
+    // user identifier in scope at this point (the token is validated below), so
+    // no similarity context is supplied. On failure, re-render the form with the
+    // specific message at HTTP 200 rather than accepting a weak credential.
+    let password_cfg = state.config().auth.password;
+    let mut policy = password_cfg.policy();
+    if password_cfg.breach_check != autumn_web::auth::BreachCheck::Off {{
+        policy = policy.with_client(autumn_web::http_client::Client::new());
+    }}
+    let validation = autumn_web::auth::validate_password(&form.password, &policy, &[]).await;
+    if !validation.is_valid() {{
+        let message = validation
+            .first_message()
+            .unwrap_or_else(|| "Invalid password.".to_owned());
+        return Ok(render_reset_password_form(
+            &form.token,
+            password_cfg.min_length,
+            Some(&message),
+            csrf.as_ref(),
+            csrf_field.as_ref(),
+        )
+        .into_response());
     }}
 
     let token_digest = sha256_hex(&form.token);

@@ -169,7 +169,9 @@ fn session_cookie(resp: &autumn_web::test::TestResponse) -> String {
 async fn signup(client: &TestClient, email: &str) -> String {
     let resp = client
         .post("/signup")
-        .form(&format!("email={email}&password=password123"))
+        .form(&format!(
+            "email={email}&password=Tr0ubad0ur-Xy7-correct-horse"
+        ))
         .send()
         .await;
     resp.assert_status(303);
@@ -194,7 +196,7 @@ async fn signup_login_dashboard_returns_200() {
     // Logging back in lands on the same tenant dashboard.
     let login = client
         .post("/login")
-        .form("email=founder@acme.test&password=password123")
+        .form("email=founder@acme.test&password=Tr0ubad0ur-Xy7-correct-horse")
         .send()
         .await;
     login.assert_status(303);
@@ -205,6 +207,38 @@ async fn signup_login_dashboard_returns_200() {
         .send()
         .await
         .assert_ok();
+}
+
+/// A weak password (present in the bundled common-password corpus) is rejected
+/// at signup: the form re-renders with the policy error at HTTP 200 — not a
+/// redirect and not a 5xx — and no account is created, so a follow-up login
+/// attempt with those credentials is unauthorized.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn signup_rejects_weak_password() {
+    let client = db_client().await;
+
+    let resp = client
+        .post("/signup")
+        .form("email=weak@acme.test&password=password")
+        .send()
+        .await;
+    // Re-rendered form with the field error, not an accepted account (303) or a
+    // server error.
+    resp.assert_ok();
+    assert!(
+        resp.text().contains("too common"),
+        "expected the weak-password policy error in the re-rendered form, got: {}",
+        resp.text()
+    );
+
+    // No account was created, so logging in with those credentials fails.
+    let login = client
+        .post("/login")
+        .form("email=weak@acme.test&password=password")
+        .send()
+        .await;
+    login.assert_status(401);
 }
 
 #[tokio::test]

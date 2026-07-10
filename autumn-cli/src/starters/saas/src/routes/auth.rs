@@ -5,8 +5,9 @@
 //! for the user row. On success we store both `user_id` and `tenant_id` in the
 //! session; the dashboard reads `tenant_id` back to scope every query.
 
-use autumn_web::auth::{hash_password, verify_password};
+use autumn_web::auth::{hash_password, validate_password, verify_password};
 use autumn_web::prelude::*;
+use autumn_web::reexports::axum::response::Response;
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
 use serde::Deserialize;
@@ -34,13 +35,18 @@ const DUMMY_HASH: &str = "$2b$12$Ro0CUfOqk6cXEKf3dyaM7OhSCvnwM9s1Aw6lfLP2.GvpAfN
 
 // ── Signup ───────────────────────────────────────────────────────────────────
 
-#[get("/signup")]
-pub async fn signup_form() -> Markup {
+/// Render the signup form, optionally with a validation error. The minimum
+/// length reflects the active `[auth.password]` policy so the `minlength`
+/// attribute always matches what the handler enforces.
+fn signup_page(min_len: usize, error: Option<&str>) -> Markup {
     layout(
         "Sign up",
         false,
         html! {
             h1 class="text-2xl font-bold mb-6" { "Create your account" }
+            @if let Some(error) = error {
+                p class="mb-4 text-sm text-red-600" role="alert" { (error) }
+            }
             form action="/signup" method="post" class="space-y-4 bg-white rounded-lg shadow p-6 max-w-md" {
                 div {
                     label for="email" class="block text-sm font-medium mb-1" { "Email" }
@@ -49,7 +55,7 @@ pub async fn signup_form() -> Markup {
                 }
                 div {
                     label for="password" class="block text-sm font-medium mb-1" { "Password" }
-                    input #password type="password" name="password" required minlength="8"
+                    input #password type="password" name="password" required minlength=(min_len)
                           autocomplete="new-password" class="w-full border rounded px-3 py-2";
                 }
                 button type="submit"
@@ -64,12 +70,18 @@ pub async fn signup_form() -> Markup {
     )
 }
 
+#[get("/signup")]
+pub async fn signup_form(State(state): State<AppState>) -> Markup {
+    signup_page(state.config().auth.password.min_length, None)
+}
+
 #[post("/signup")]
 pub async fn signup(
+    State(state): State<AppState>,
     session: Session,
     mut db: Db,
     Form(form): Form<SignupForm>,
-) -> AutumnResult<Redirect> {
+) -> AutumnResult<Response> {
     let email = form.email.trim().to_lowercase();
     // Cap input lengths so an attacker cannot drive bcrypt/DB work with huge
     // payloads (254 is the RFC-5321 email maximum; 128 is a generous password cap).
@@ -78,10 +90,28 @@ pub async fn signup(
             "Enter a valid email address (max 254 characters)",
         ));
     }
-    if form.password.len() < 8 || form.password.len() > 128 {
+    if form.password.len() > 128 {
         return Err(AutumnError::unprocessable_msg(
-            "Password must be between 8 and 128 characters",
+            "Password must be at most 128 characters",
         ));
+    }
+    // Enforce the configured password policy (length, weak-list, similarity to
+    // the email, and optional HIBP breach check). On failure, re-render the form
+    // with the specific message at HTTP 200 rather than accepting a weak
+    // credential.
+    let password_cfg = state.config().auth.password;
+    let mut policy = password_cfg.policy();
+    if password_cfg.breach_check != autumn_web::auth::BreachCheck::Off {
+        // Breach checking needs an HTTP client for the HIBP k-anonymity lookup;
+        // the default-off path never constructs one.
+        policy = policy.with_client(autumn_web::http_client::Client::new());
+    }
+    let validation = validate_password(&form.password, &policy, &[email.as_str()]).await;
+    if !validation.is_valid() {
+        let message = validation
+            .first_message()
+            .unwrap_or_else(|| "Invalid password".to_owned());
+        return Ok(signup_page(password_cfg.min_length, Some(&message)).into_response());
     }
 
     // Each account gets its own isolated tenant; email is the unique identifier
@@ -103,7 +133,7 @@ pub async fn signup(
         .map_err(|_| AutumnError::unprocessable_msg("Could not create account"))?;
 
     establish_session(&session, &user).await;
-    Ok(Redirect::to("/dashboard"))
+    Ok(Redirect::to("/dashboard").into_response())
 }
 
 // ── Login ────────────────────────────────────────────────────────────────────
