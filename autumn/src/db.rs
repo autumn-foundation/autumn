@@ -128,6 +128,38 @@ tokio::task_local! {
     pub(crate) static REQUEST_DB_TIMINGS: Arc<RequestDbTimings>;
 }
 
+/// Strip the trailing `-- binds: [...]` annotation that diesel's `DebugQuery`
+/// `Display` appends to a query's SQL text.
+///
+/// diesel-async feeds each real query into the `StartQuery` instrumentation
+/// event as a `DebugQuery` (see `diesel::debug_query` /
+/// `AsyncPgConnection::with_prepared_statement`), whose `Display` renders
+/// `"{sql} -- binds: {binds:?}"` — the format lives in
+/// `diesel::query_builder::debug_query::display`
+/// (`write!(f, "{query} -- binds: {debug_binds:?}")`). So the SQL text we
+/// materialise from `query.to_string()` is e.g.
+/// `SELECT * FROM books WHERE author_id = $1 -- binds: [1]`.
+///
+/// The per-row executions of an N+1 pattern share the same parameterised
+/// statement (`… WHERE author_id = $1`) and differ only in their bind values
+/// (`-- binds: [1]`, `-- binds: [2]`, …). If the capture path retained that
+/// annotation, [`crate::inspector::normalize_sql`] (which only collapses
+/// whitespace and lower-cases) would treat each per-row execution as a distinct
+/// template, so [`crate::inspector::detect_n_plus_one`] would never see the
+/// repetition and `assert_no_n_plus_one()` would miss the N+1 it exists to
+/// catch. Truncating at the `-- binds` marker leaves the parameterised
+/// statement — `$N` placeholders intact — so repeated per-row queries collapse
+/// to one template.
+///
+/// Robust to input without the marker (transaction-control SQL diesel runs via
+/// `batch_execute`, or synthetic test input): returns the input unchanged. Uses
+/// the last occurrence, since diesel always appends the annotation after the
+/// full statement.
+fn strip_bind_annotation(sql: &str) -> &str {
+    sql.rfind("-- binds:")
+        .map_or(sql, |idx| sql[..idx].trim_end())
+}
+
 /// Record one instrumented DB query into the current request's
 /// [`REQUEST_DB_TIMINGS`], if any. No-op when the task-local is unset —
 /// which is the case whenever the `Server-Timing` middleware is disabled
@@ -147,7 +179,12 @@ pub(crate) fn record_request_db_query(elapsed: Duration, sql: Option<&str>) {
             && let Some(list) = g.as_mut()
         {
             list.push(crate::inspector::QueryRecord {
-                sql: sql.to_owned(),
+                // Store the parameterised statement WITHOUT diesel's per-row
+                // `-- binds: [...]` annotation (the `$N` placeholders stay), so
+                // repeated per-row queries normalise to the same template and
+                // `detect_n_plus_one` can see the repetition. See
+                // [`strip_bind_annotation`].
+                sql: strip_bind_annotation(sql).to_owned(),
                 params: Vec::new(),
                 elapsed_ms: u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
                 location: String::new(),
@@ -2620,6 +2657,76 @@ mod tests {
                 "{sql:?} should be treated as a countable query"
             );
         }
+    }
+
+    /// Finding-1 regression: the capture path stores the parameterised
+    /// statement WITHOUT diesel's trailing `-- binds: [...]` annotation, so the
+    /// per-row executions of an N+1 pattern (which differ only in their bind
+    /// values) collapse to a single template and `detect_n_plus_one` catches
+    /// them. Without the strip, each `-- binds: [N]` would normalise to a
+    /// distinct template and the N+1 would go undetected. Locks the fix with no
+    /// live database.
+    #[test]
+    fn strip_bind_annotation_lets_detect_n_plus_one_see_per_row_repetition() {
+        use crate::inspector::{QueryRecord, detect_n_plus_one};
+
+        // Construct QueryRecords exactly as `record_request_db_query` does:
+        // the captured `sql` is diesel's `DebugQuery` `Display` output run
+        // through `strip_bind_annotation`.
+        fn record(diesel_display: &str) -> QueryRecord {
+            QueryRecord {
+                sql: strip_bind_annotation(diesel_display).to_owned(),
+                params: Vec::new(),
+                elapsed_ms: 1,
+                location: String::new(),
+            }
+        }
+
+        // The `-- binds:` marker (and the leading whitespace before it) is
+        // stripped; the `$N` placeholder is preserved.
+        assert_eq!(
+            strip_bind_annotation("SELECT * FROM books WHERE author_id = $1 -- binds: [1]"),
+            "SELECT * FROM books WHERE author_id = $1"
+        );
+        // Zero-bind annotation is stripped too.
+        assert_eq!(
+            strip_bind_annotation("SELECT * FROM authors -- binds: []"),
+            "SELECT * FROM authors"
+        );
+        // No marker (transaction-control / synthetic input) → unchanged.
+        assert_eq!(strip_bind_annotation("SELECT 1"), "SELECT 1");
+        assert_eq!(strip_bind_annotation("BEGIN"), "BEGIN");
+
+        // A classic N+1: one parent query, then the same per-row child query
+        // executed once per row with a different bind value each time.
+        let n_plus_one = vec![
+            record("SELECT * FROM authors -- binds: []"),
+            record("SELECT * FROM books WHERE author_id = $1 -- binds: [1]"),
+            record("SELECT * FROM books WHERE author_id = $1 -- binds: [2]"),
+            record("SELECT * FROM books WHERE author_id = $1 -- binds: [3]"),
+        ];
+        let warning = detect_n_plus_one(&n_plus_one, 3)
+            .expect("three identical per-row templates should trip the N+1 detector");
+        assert_eq!(
+            warning.count, 3,
+            "all three per-row executions collapse to a single template"
+        );
+        assert_eq!(
+            warning.sql_template, "select * from books where author_id = $1",
+            "the reported template is the parameterised statement, bind-free"
+        );
+
+        // Distinct query templates must NOT trip the detector, even at the
+        // same total query count.
+        let distinct = vec![
+            record("SELECT * FROM authors -- binds: []"),
+            record("SELECT * FROM books WHERE id = $1 -- binds: [1]"),
+            record("UPDATE users SET name = $1 WHERE id = $2 -- binds: [\"x\", 2]"),
+        ];
+        assert!(
+            detect_n_plus_one(&distinct, 3).is_none(),
+            "three distinct query templates must not be reported as N+1"
+        );
     }
 
     // ── after_commit tests ───────────────────────────────────────

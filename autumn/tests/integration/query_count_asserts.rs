@@ -108,6 +108,61 @@ mod query_count_tests {
         resp.assert_max_queries(1).assert_no_n_plus_one();
     }
 
+    /// Finding-2 regression: with `observability.server_timing` enabled the
+    /// router installs `ServerTimingLayer`, whose inner `REQUEST_DB_TIMINGS`
+    /// scope previously SHADOWED the harness's outer capturing accumulator —
+    /// so `take_captured()` came back empty and query assertions silently
+    /// passed at zero. With `scope_inner` reusing the active outer accumulator,
+    /// capture still works AND the `Server-Timing` header is emitted: the flat
+    /// handler's single SELECT is both counted for the header and captured for
+    /// the assertions.
+    #[tokio::test]
+    #[ignore = "requires Docker (testcontainers)"]
+    async fn server_timing_enabled_still_captures_queries() {
+        use autumn_web::config::AutumnConfig;
+
+        let db = TestDb::shared().await;
+        setup(db).await;
+
+        let mut config = AutumnConfig {
+            profile: Some("test".into()),
+            ..AutumnConfig::default()
+        };
+        config.security.csrf.enabled = false;
+        // Force the Server-Timing layer on (off by default in the test profile).
+        config.observability.server_timing = Some(true);
+
+        let client = TestApp::new()
+            .config(config)
+            .routes(routes![posts_flat])
+            .with_db(db.pool())
+            .build();
+
+        let resp = client.get("/posts-flat").send().await;
+        resp.assert_ok();
+
+        // The Server-Timing layer is active: it must have stamped the header,
+        // including the `db` metric for the one counted query.
+        let server_timing = resp
+            .header("server-timing")
+            .expect("server_timing enabled must emit a Server-Timing header")
+            .to_owned();
+        assert!(
+            server_timing.contains("db;dur="),
+            "the db metric should surface the counted query: {server_timing:?}"
+        );
+
+        // Crucially, query CAPTURE must still work despite the layer's inner
+        // scope — this is the regression the reuse fix guards.
+        assert_eq!(
+            resp.query_count(),
+            1,
+            "server_timing must not zero out captured queries, got: {:?}",
+            resp.queries()
+        );
+        resp.assert_max_queries(1).assert_no_n_plus_one();
+    }
+
     #[tokio::test]
     #[ignore = "requires Docker (testcontainers)"]
     async fn n_plus_one_handler_trips_assertion() {

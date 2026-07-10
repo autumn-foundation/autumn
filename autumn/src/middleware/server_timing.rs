@@ -81,7 +81,22 @@ type ScopedInner<F> = F;
 /// without `db` it is a no-op passing the future through untouched.
 #[cfg(feature = "db")]
 fn scope_inner<F: Future>(fut: F) -> (DbTimings, ScopedInner<F>) {
-    let timings = Arc::new(RequestDbTimings::default());
+    // Reuse an already-active `REQUEST_DB_TIMINGS` accumulator when one is
+    // scoped in the current task; only fall back to a fresh one otherwise.
+    //
+    // In production/dev there is no outer scope, so this constructs a fresh
+    // non-capturing `RequestDbTimings::default()` — identical to before, and
+    // server-timing reads its own per-request counts. But the test harness
+    // (`TestApp::send`) establishes an OUTER capturing scope around the whole
+    // request; if we unconditionally scoped a fresh default here it would
+    // SHADOW that outer accumulator, so queries would record into the throwaway
+    // one and `take_captured()` would come back empty — silently zeroing query
+    // assertions on any test that also enables `server_timing`. Reusing the
+    // outer `Arc` keeps both the query count AND the captured SQL list flowing
+    // into the accumulator the harness reads back.
+    let timings = REQUEST_DB_TIMINGS
+        .try_with(Arc::clone)
+        .unwrap_or_else(|_| Arc::new(RequestDbTimings::default()));
     // Scope the inner future so any DB query instrumentation that runs
     // during it can record into `timings` via the task-local. We keep a
     // clone of the Arc outside the scope to read back after poll.
@@ -410,6 +425,42 @@ mod tests {
     fn build_header_value_zero_query_count_omits_db_even_with_ms() {
         let v = build_header_value(1.0, Some(0.0), 0, false);
         assert_eq!(v, "total;dur=1.000");
+    }
+
+    /// Finding-2 regression: when a `REQUEST_DB_TIMINGS` scope is already
+    /// active — as `TestApp::send` establishes around the whole request —
+    /// `scope_inner` must REUSE that accumulator rather than shadow it with a
+    /// fresh non-capturing default. Otherwise the `ServerTimingLayer`'s inner
+    /// scope would divert queries into a throwaway accumulator and the harness's
+    /// `take_captured()` / `query_count()` would silently come back empty for
+    /// any test that also enables `server_timing`.
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    async fn scope_inner_reuses_active_outer_accumulator() {
+        let outer = Arc::new(RequestDbTimings::default());
+        REQUEST_DB_TIMINGS
+            .scope(Arc::clone(&outer), async {
+                let (reused, _scope) = scope_inner(std::future::ready(()));
+                assert!(
+                    Arc::ptr_eq(&reused, &outer),
+                    "scope_inner must reuse the active outer accumulator, not shadow it"
+                );
+            })
+            .await;
+    }
+
+    /// Complement to the reuse test: with NO active outer scope (the
+    /// production/dev path), `scope_inner` builds a fresh accumulator so
+    /// server-timing reads its own per-request counts — unchanged behavior.
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    async fn scope_inner_creates_fresh_accumulator_off_scope() {
+        let (fresh, _scope) = scope_inner(std::future::ready(()));
+        assert_eq!(
+            fresh.query_count.load(Ordering::Relaxed),
+            0,
+            "a fresh off-scope accumulator starts with no recorded queries"
+        );
     }
 
     /// End-to-end coverage of the db-metric path without a live database:
