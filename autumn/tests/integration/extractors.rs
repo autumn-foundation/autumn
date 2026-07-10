@@ -216,10 +216,28 @@ async fn multipart_mime_allow_list_skips_non_file_fields() {
         Ok(format!("text={text_seen},file={file_seen}"))
     }
 
+    // The allow-list is enforced by CONTENT (magic bytes), not the declared
+    // header, and only for file parts. The non-file `title` field must bypass
+    // it entirely, while the genuine PNG file part is accepted by its sniffed
+    // type even though its declared header says octet-stream.
     let boundary = "X-BOUNDARY";
-    let payload = format!(
-        "--{boundary}\r\nContent-Disposition: form-data; name=\"title\"\r\n\r\nreport\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"hello.txt\"\r\nContent-Type: text/plain\r\n\r\nhello world\r\n--{boundary}--\r\n"
+    let mut payload: Vec<u8> = Vec::new();
+    payload.extend_from_slice(
+        format!("--{boundary}\r\nContent-Disposition: form-data; name=\"title\"\r\n\r\nreport\r\n")
+            .as_bytes(),
     );
+    payload.extend_from_slice(
+        format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; \
+             filename=\"real.png\"\r\nContent-Type: application/octet-stream\r\n\r\n"
+        )
+        .as_bytes(),
+    );
+    payload.extend_from_slice(&[
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44,
+        0x52,
+    ]);
+    payload.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
 
     let app = Router::new()
         .route("/", axum::routing::post(handler))
@@ -227,7 +245,7 @@ async fn multipart_mime_allow_list_skips_non_file_fields() {
             |mut req: axum::extract::Request, next: axum::middleware::Next| async move {
                 req.extensions_mut()
                     .insert(autumn_web::security::UploadConfig {
-                        allowed_mime_types: vec!["text/plain".to_owned()],
+                        allowed_mime_types: vec!["image/png".to_owned()],
                         ..autumn_web::security::UploadConfig::default()
                     });
                 next.run(req).await
@@ -343,4 +361,215 @@ async fn multipart_request_size_limit_returns_413() {
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+// ── Content-sniffing (magic-byte) MIME validation (issue #1354) ──────
+
+/// Build a multipart body for a single file part as raw bytes, since binary
+/// fixtures (PNG/JPEG) are not valid UTF-8.
+#[cfg(feature = "multipart")]
+fn single_file_multipart_body(
+    boundary: &str,
+    field_name: &str,
+    file_name: &str,
+    declared_content_type: &str,
+    file_bytes: &[u8],
+) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+    body.extend_from_slice(
+        format!(
+            "Content-Disposition: form-data; name=\"{field_name}\"; filename=\"{file_name}\"\r\n"
+        )
+        .as_bytes(),
+    );
+    body.extend_from_slice(format!("Content-Type: {declared_content_type}\r\n\r\n").as_bytes());
+    body.extend_from_slice(file_bytes);
+    body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+    body
+}
+
+#[cfg(feature = "multipart")]
+async fn sniff_handler(mut multipart: Multipart) -> autumn_web::AutumnResult<String> {
+    let field = multipart
+        .next_field()
+        .await?
+        .expect("expected one multipart field");
+    let sniffed = field.sniffed_content_type().unwrap_or("none").to_string();
+    let body = field.bytes_limited().await?;
+    Ok(format!("{sniffed}:{}", body.len()))
+}
+
+#[cfg(feature = "multipart")]
+async fn run_sniff_upload(
+    config: autumn_web::security::UploadConfig,
+    body: Vec<u8>,
+    boundary: &str,
+) -> axum::http::Response<Body> {
+    let app = Router::new()
+        .route("/", axum::routing::post(sniff_handler))
+        .layer(axum::middleware::from_fn(
+            move |mut req: axum::extract::Request, next: axum::middleware::Next| {
+                let config = config.clone();
+                async move {
+                    req.extensions_mut().insert(config);
+                    next.run(req).await
+                }
+            },
+        ));
+
+    app.oneshot(
+        Request::builder()
+            .method("POST")
+            .uri("/")
+            .header(
+                "content-type",
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(Body::from(body))
+            .unwrap(),
+    )
+    .await
+    .unwrap()
+}
+
+#[cfg(feature = "multipart")]
+fn png_fixture() -> Vec<u8> {
+    // PNG magic bytes + a bit more so `infer` recognizes it.
+    vec![
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44,
+        0x52,
+    ]
+}
+
+#[cfg(feature = "multipart")]
+fn jpeg_fixture() -> Vec<u8> {
+    vec![
+        0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46, 0x00, 0x01,
+    ]
+}
+
+#[cfg(feature = "multipart")]
+#[tokio::test]
+async fn multipart_spoofed_html_declared_png_is_rejected() {
+    let boundary = "X-BOUNDARY";
+    let html = b"<!DOCTYPE html><script>alert(1)</script>";
+    let body = single_file_multipart_body(boundary, "file", "evil.png", "image/png", html);
+
+    let config = autumn_web::security::UploadConfig {
+        allowed_mime_types: vec!["image/png".to_owned()],
+        ..autumn_web::security::UploadConfig::default()
+    };
+
+    let response = run_sniff_upload(config, body, boundary).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[cfg(feature = "multipart")]
+#[tokio::test]
+async fn multipart_genuine_png_passes() {
+    let boundary = "X-BOUNDARY";
+    let png = png_fixture();
+    // Deliberately declare a NON-png type to prove the client header is ignored.
+    let body = single_file_multipart_body(
+        boundary,
+        "file",
+        "real.png",
+        "application/octet-stream",
+        &png,
+    );
+
+    let config = autumn_web::security::UploadConfig {
+        allowed_mime_types: vec!["image/png".to_owned()],
+        ..autumn_web::security::UploadConfig::default()
+    };
+
+    let response = run_sniff_upload(config, body, boundary).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let out = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    // Verified type is exposed and full byte count preserved (prefix not lost).
+    assert_eq!(&out[..], format!("image/png:{}", png.len()).as_bytes());
+}
+
+#[cfg(feature = "multipart")]
+#[tokio::test]
+async fn multipart_mismatch_mode_rejects_when_declared_disagrees() {
+    let boundary = "X-BOUNDARY";
+    let png = png_fixture();
+    // Genuine PNG but declared image/jpeg. Both are individually allowed,
+    // yet strict mismatch mode must reject because declared != sniffed.
+    let body = single_file_multipart_body(boundary, "file", "real.png", "image/jpeg", &png);
+
+    let config = autumn_web::security::UploadConfig {
+        allowed_mime_types: vec!["image/png".to_owned(), "image/jpeg".to_owned()],
+        reject_on_content_type_mismatch: true,
+        ..autumn_web::security::UploadConfig::default()
+    };
+
+    let response = run_sniff_upload(config, body, boundary).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[cfg(feature = "multipart")]
+#[tokio::test]
+async fn multipart_short_file_rejected_when_allow_list_set() {
+    let boundary = "X-BOUNDARY";
+    // 2-byte file — too short for `infer` to recognize (sniffed = None).
+    let body = single_file_multipart_body(boundary, "file", "tiny.png", "image/png", &[0x01, 0x02]);
+
+    let config = autumn_web::security::UploadConfig {
+        allowed_mime_types: vec!["image/png".to_owned()],
+        ..autumn_web::security::UploadConfig::default()
+    };
+
+    let response = run_sniff_upload(config, body, boundary).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[cfg(feature = "multipart")]
+#[tokio::test]
+async fn multipart_empty_allow_list_passes_through() {
+    let boundary = "X-BOUNDARY";
+    let html = b"<!DOCTYPE html><script>alert(1)</script>";
+    // No allow-list, mismatch mode off: additive change must not reject.
+    let body = single_file_multipart_body(boundary, "file", "page.png", "image/png", html);
+
+    let config = autumn_web::security::UploadConfig::default();
+
+    let response = run_sniff_upload(config, body, boundary).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let out = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    // No sniff happened (empty allow-list, mismatch off) → sniffed = none,
+    // and the full body is still readable.
+    assert_eq!(&out[..], format!("none:{}", html.len()).as_bytes());
+}
+
+#[cfg(feature = "multipart")]
+#[tokio::test]
+async fn multipart_jpeg_allow_list_passes() {
+    let boundary = "X-BOUNDARY";
+    let jpeg = jpeg_fixture();
+    let body = single_file_multipart_body(
+        boundary,
+        "file",
+        "photo.bin",
+        "application/octet-stream",
+        &jpeg,
+    );
+
+    let config = autumn_web::security::UploadConfig {
+        allowed_mime_types: vec!["image/jpeg".to_owned()],
+        ..autumn_web::security::UploadConfig::default()
+    };
+
+    let response = run_sniff_upload(config, body, boundary).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let out = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(&out[..], format!("image/jpeg:{}", jpeg.len()).as_bytes());
 }
