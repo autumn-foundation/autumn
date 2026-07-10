@@ -1082,8 +1082,16 @@ pub struct AutumnConfig {
     /// built-in failure conditions (dead-lettered jobs, Down health indicators,
     /// 5xx-rate spikes, scheduled-task failures) with zero application code.
     /// See [`crate::alerts::AlertConfig`] and `docs/guide/operator-alerts.md`.
+    ///
+    /// Boxed so the large `[alerts]` struct is stored behind a pointer rather
+    /// than inline in `AutumnConfig`: `AutumnConfig` is held by value on the
+    /// `app().run()` stack frame across await points, and inlining
+    /// `AlertConfig` (many `Option<String>` destinations + tuning knobs) grew
+    /// that future past the `clippy::large_futures` threshold. `Box<T>` keeps
+    /// `Default`/`Deserialize` (both hold when `T` does), and field
+    /// reads/writes still work through `Deref`/`DerefMut`.
     #[serde(default)]
-    pub alerts: crate::alerts::AlertConfig,
+    pub alerts: Box<crate::alerts::AlertConfig>,
 }
 
 /// Observability configuration (`[observability]` section in `autumn.toml`).
