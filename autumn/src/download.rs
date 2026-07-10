@@ -1,6 +1,6 @@
 //! Typed file downloads as an [`IntoResponse`].
 //!
-//! [`Download`] turns owned bytes, an async byte stream, an [`AsyncRead`], or
+//! [`Download`] turns owned bytes, an async byte stream, an [`AsyncRead`](tokio::io::AsyncRead), or
 //! a stored [`Blob`](crate::storage::Blob) into an HTTP response with the
 //! right `Content-Disposition`, `Content-Type`, and (when known)
 //! `Content-Length` headers — without hand-rolling header strings in every
@@ -196,7 +196,7 @@ impl Download {
         }
     }
 
-    /// Build a download from any [`AsyncRead`], streaming its bytes.
+    /// Build a download from any [`AsyncRead`](tokio::io::AsyncRead), streaming its bytes.
     ///
     /// The reader is wrapped with [`tokio_util::io::ReaderStream`], so the
     /// bytes are transferred incrementally rather than buffered in memory.
@@ -391,7 +391,7 @@ impl Download {
     ///   always serves the full `200` and does not advertise `Accept-Ranges`.
     ///
     /// This is the documented path to a seekable media response; see the
-    /// [`range`](crate::range) module docs for a `#[secured]` video example.
+    /// [`range`] module docs for a `#[secured]` video example.
     // The method is `async` for the blob path (which awaits a ranged store
     // read); without the `storage` feature that arm is compiled out, leaving no
     // `.await`, but the signature stays stable across feature sets.

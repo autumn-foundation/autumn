@@ -3689,7 +3689,7 @@ fn unsubscribe_error_html(detail: &str) -> String {
 
 /// Bounce/complaint mail suppression list (issue #1247).
 ///
-/// Autumn already *detects* delivery failure: [`inbound_mail`] parses provider
+/// Autumn already *detects* delivery failure: `inbound_mail` parses provider
 /// bounce signals and spam complaints. This module closes the loop — it records
 /// the addresses that hard-bounced or complained and has [`Mailer::send`] skip
 /// them before transport, so a sending domain's reputation survives contact
@@ -3704,18 +3704,18 @@ fn unsubscribe_error_html(detail: &str) -> String {
 ///
 /// [`InMemorySuppressionStore`] is the zero-config default (process-local,
 /// lost on restart — perfect for a single instance, tests, and review apps).
-/// [`PgSuppressionStore`] (feature `db`) persists to a `mail_suppressions`
+/// [`PgSuppressionStore`](suppression::PgSuppressionStore) (feature `db`) persists to a `mail_suppressions`
 /// table for multi-instance deploys, mirroring the memory/durable split used
 /// by sessions and jobs. That table is **not** auto-created — provision it
-/// yourself (see [`PgSuppressionStore`]).
+/// yourself (see [`PgSuppressionStore`](suppression::PgSuppressionStore)).
 ///
 /// # Closing the loop
 ///
-/// Wire the provided [`record_inbound`] handler into the inbound router's
+/// Wire the provided `record_inbound` handler into the inbound router's
 /// `on_bounce` hook (or call [`SuppressionStore::suppress`] yourself) to turn a
 /// parsed provider bounce into a suppression entry. autumn's `on_spam` signal
 /// is an *inbound spam verdict*, not an outbound FBL complaint — see
-/// [`record_inbound`] for why routing it here is a safe no-op rather than
+/// `record_inbound` for why routing it here is a safe no-op rather than
 /// suppressing the wrong address.
 pub mod suppression {
     use std::future::Future;
@@ -3785,7 +3785,7 @@ pub mod suppression {
     }
 
     /// Cloneable handle to a [`SuppressionStore`] for storage on `AppState` and
-    /// attachment to a [`Mailer`].
+    /// attachment to a [`Mailer`](crate::mail::Mailer).
     #[derive(Clone)]
     pub struct SuppressionStoreHandle(Arc<dyn SuppressionStore>);
 
@@ -3884,7 +3884,7 @@ pub mod suppression {
     // ── Observability: a suppressed drop is never truly silent ───────────────
     static SUPPRESSED_SKIPS: AtomicU64 = AtomicU64::new(0);
 
-    /// Recipients [`Mailer::send`] has skipped as suppressed, process-wide.
+    /// Recipients [`Mailer::send`](crate::mail::Mailer::send) has skipped as suppressed, process-wide.
     ///
     /// Counted since startup. Pair with the structured `outcome =
     /// "skipped_suppressed"` log line emitted per skip.

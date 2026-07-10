@@ -2,7 +2,7 @@
 //! the keys defined in each `i18n/<locale>.ftl` (Fluent) file.
 //!
 //! autumn ships first-class Fluent i18n (`Locale::t("key")`, `t_with(...)`,
-//! and the [`t!`] macro), but the only signal that a key is missing from a
+//! and the `t!` macro), but the only signal that a key is missing from a
 //! locale is a *runtime* miss ([`Bundle::miss_count`] increments and a warning
 //! fires when a real user hits the page). This command surfaces those problems
 //! at build/CI time instead:
@@ -352,7 +352,7 @@ fn scan_stream(stream: &TokenStream, file: &str, result: &mut ScanResult) {
 
 /// Whether the identifier at `trees[i]` is preceded by a real `::` path
 /// separator — two consecutive `:` [`Punct`](TokenTree::Punct) tokens, the
-/// first (`trees[i - 2]`) joined to the second with [`Spacing::Joint`], which is
+/// first (`trees[i - 2]`) joined to the second with [`Spacing::Joint`](proc_macro2::Spacing::Joint), which is
 /// how `::` tokenizes.
 ///
 /// The caller has already confirmed `trees[i - 1]` is a `:` punct. A lone `:`

@@ -633,7 +633,7 @@ impl Subscriber {
 impl LocalChannelsBackend {
     /// Create a local backend with the given per-topic buffer capacity.
     ///
-    /// The replay ring buffer defaults to [`DEFAULT_REPLAY_CAPACITY`]. Use
+    /// The replay ring buffer defaults to `DEFAULT_REPLAY_CAPACITY`. Use
     /// [`LocalChannelsBackend::with_replay_capacity`] to override it.
     #[must_use]
     pub fn new(capacity: usize) -> Self {
