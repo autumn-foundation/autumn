@@ -125,6 +125,48 @@ fn resolve_fk_and_name(
 /// associations can target the same model without colliding (e.g.
 /// `#[has_many(Post, fk = author_id, name = authored)]` plus
 /// `#[has_many(Post, fk = approver_id, name = approved)]`).
+/// Diagnose a `dependent = <action>` / `on_delete = <action>` key on a model
+/// association attribute.
+///
+/// Faithfully wiring this model-declared spelling to the cascade machinery
+/// needs a runtime type-erased dispatch refactor (the model spelling names the
+/// child *model*, whereas the cascade needs the child *repository* type), so it
+/// is deferred (#1702). Until then we must not silently accept-and-ignore it:
+/// recognize the spelling, validate the action, and return a directed error —
+/// an unknown-action error for a bad spelling, otherwise guidance toward the
+/// repository-attribute cascade (or, on `#[belongs_to]`, that the key is
+/// meaningless there because the child foreign key lives on that side).
+fn dependent_attr_error(kind: AssocKind, key: &syn::Ident, action: &str) -> syn::Error {
+    if kind == AssocKind::BelongsTo {
+        return syn::Error::new_spanned(
+            key,
+            "`dependent`/`on_delete` is not valid on `#[belongs_to]`: the child \
+             foreign key lives on this (belongs_to) side, so there is no \
+             dependent to cascade — declare the cascade on the parent's \
+             `#[has_many]`/`#[has_one]` (and, for now, on the repository \
+             attribute) instead",
+        );
+    }
+    // Accept exactly the actions the repository-attribute `dependent(...)`
+    // parser accepts (see repository.rs).
+    match action {
+        "destroy" | "delete_all" | "nullify" | "restrict" => syn::Error::new_spanned(
+            key,
+            "`dependent = <action>` on `#[has_many]`/`#[has_one]` is not yet \
+             wired; declare the dependent cascade on the repository instead, \
+             e.g. `#[autumn_web::repository(Model, dependent(PgChildRepository, \
+             fk = \"...\", on_delete = <action>))]` (see issue #1702)",
+        ),
+        other => syn::Error::new_spanned(
+            key,
+            format!(
+                "unknown dependent action `{other}`; expected one of \
+                 `destroy`, `delete_all`, `nullify`, `restrict`"
+            ),
+        ),
+    }
+}
+
 fn parse_assoc_attr(
     attr: &syn::Attribute,
     kind: AssocKind,
@@ -160,6 +202,8 @@ fn parse_assoc_attr(
                     explicit_through = Some(value);
                 } else if key == "target_fk" {
                     explicit_target_fk = Some(value);
+                } else if key == "dependent" || key == "on_delete" {
+                    return Err(dependent_attr_error(kind, &key, &value));
                 } else {
                     return Err(syn::Error::new_spanned(
                         &key,
@@ -4617,6 +4661,105 @@ mod tests {
         let attrs: Vec<syn::Attribute> =
             vec![syn::parse_quote!(#[belongs_to(User, bogus = author_id)])];
         assert!(resolve_associations(&model, &attrs).is_err());
+    }
+
+    // ── `dependent` / `on_delete` on model associations (#1702) ──────────
+    // The full model-declared cascade wiring is deferred (it needs a
+    // runtime type-erased dispatch refactor). Until then the parser must
+    // RECOGNIZE the `dependent = <action>` / `on_delete = <action>` spelling,
+    // validate the action, and emit a DIRECTED error pointing users at the
+    // repository-attribute cascade — never silently accept-and-ignore it.
+
+    #[test]
+    fn has_many_dependent_destroy_directs_to_repository() {
+        let model: syn::Ident = syn::parse_quote!(Post);
+        let attrs: Vec<syn::Attribute> =
+            vec![syn::parse_quote!(#[has_many(Comment, dependent = destroy)])];
+        let Err(err) = resolve_associations(&model, &attrs) else {
+            panic!("expected an error");
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("repository"),
+            "expected directed guidance toward the repository attribute, got: {msg}"
+        );
+        assert!(
+            msg.contains("#1702"),
+            "expected the issue reference #1702, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn has_many_dependent_unknown_action_is_rejected() {
+        let model: syn::Ident = syn::parse_quote!(Post);
+        let attrs: Vec<syn::Attribute> =
+            vec![syn::parse_quote!(#[has_many(Comment, dependent = bogus)])];
+        let Err(err) = resolve_associations(&model, &attrs) else {
+            panic!("expected an error");
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("bogus"),
+            "expected the unknown action named, got: {msg}"
+        );
+        assert!(
+            msg.contains("destroy")
+                && msg.contains("delete_all")
+                && msg.contains("nullify")
+                && msg.contains("restrict"),
+            "expected the valid actions listed, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn has_one_dependent_nullify_directs_to_repository() {
+        let model: syn::Ident = syn::parse_quote!(User);
+        let attrs: Vec<syn::Attribute> =
+            vec![syn::parse_quote!(#[has_one(Profile, dependent = nullify)])];
+        let Err(err) = resolve_associations(&model, &attrs) else {
+            panic!("expected an error");
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("repository"),
+            "expected directed guidance toward the repository attribute, got: {msg}"
+        );
+        assert!(
+            msg.contains("#1702"),
+            "expected the issue reference #1702, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn belongs_to_dependent_is_rejected_as_meaningless() {
+        // The child FK lives on the belongs_to side, so there is no dependent
+        // to cascade — `dependent`/`on_delete` here is meaningless.
+        let model: syn::Ident = syn::parse_quote!(Post);
+        let attrs: Vec<syn::Attribute> =
+            vec![syn::parse_quote!(#[belongs_to(User, dependent = destroy)])];
+        let Err(err) = resolve_associations(&model, &attrs) else {
+            panic!("expected an error");
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("belongs_to"),
+            "expected a belongs_to-specific rejection, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn has_many_without_dependent_still_parses() {
+        // Regression guard: recognizing `dependent` must not disturb normal
+        // `#[has_many]` parsing.
+        let model: syn::Ident = syn::parse_quote!(Post);
+        let attrs: Vec<syn::Attribute> = vec![
+            syn::parse_quote!(#[has_many(Comment)]),
+            syn::parse_quote!(#[has_many(Comment, fk = "post_id")]),
+        ];
+        let assocs = resolve_associations(&model, &attrs).expect("parse ok");
+        assert_eq!(assocs.len(), 2);
+        assert_eq!(assocs[0].fk, "post_id");
+        assert_eq!(assocs[1].fk, "post_id");
     }
 
     #[test]
