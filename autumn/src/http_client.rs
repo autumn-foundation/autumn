@@ -285,6 +285,15 @@ fn is_blocked_ipv6(ip: Ipv6Addr) -> bool {
     }
 
     let segs = ip.segments();
+    // RFC 8215 local-use NAT64 prefix `64:ff9b:1::/48`: deny the whole prefix
+    // outright. Unlike the well-known `64:ff9b::/96` (where a public embedded
+    // IPv4 like 8.8.8.8 is legitimately allowed), this is a private/site-local
+    // NAT64 allocation with no legitimate public destination, and the RFC 6052
+    // embedding position varies with prefix length — a blanket deny is both
+    // simpler and strictly safer (e.g. `64:ff9b:1::a9fe:a9fe` == 169.254.169.254).
+    if segs[0] == 0x0064 && segs[1] == 0xff9b && segs[2] == 0x0001 {
+        return true;
+    }
     // :: (unspecified)
     if ip == Ipv6Addr::UNSPECIFIED {
         return true;
@@ -2852,9 +2861,13 @@ mod tests {
         let blocked = [
             "64:ff9b::a9fe:a9fe", // NAT64 → 169.254.169.254 (cloud metadata)
             "64:ff9b::7f00:1",    // NAT64 → 127.0.0.1 (loopback)
-            "2002:a9fe:a9fe::",   // 6to4  → 169.254.169.254
-            "2002:7f00:1::",      // 6to4  → 127.0.0.1
-            "2002:0a00:0001::",   // 6to4  → 10.0.0.1
+            // RFC 8215 local-use NAT64 `64:ff9b:1::/48` is denied outright.
+            "64:ff9b:1::a9fe:a9fe", // local-use NAT64 → 169.254.169.254
+            "64:ff9b:1::7f00:1",    // local-use NAT64 → 127.0.0.1
+            "64:ff9b:1::808:808",   // local-use NAT64 embedding public 8.8.8.8: still blocked
+            "2002:a9fe:a9fe::",     // 6to4  → 169.254.169.254
+            "2002:7f00:1::",        // 6to4  → 127.0.0.1
+            "2002:0a00:0001::",     // 6to4  → 10.0.0.1
         ];
         for s in blocked {
             let ip: IpAddr = s.parse().unwrap();
