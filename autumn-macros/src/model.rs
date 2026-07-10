@@ -966,6 +966,70 @@ fn validate_attrs(field: &Field) -> Vec<&syn::Attribute> {
         .collect()
 }
 
+/// `validator` validators that have NO `Patch<T>` per-field trait impl (or are
+/// struct-level / cross-field rules), so they cannot be enforced on the
+/// generated `UpdateModel` `Patch<T>` fields (see `validate_attrs_for_patch`).
+const NON_PATCH_VALIDATORS: &[&str] = &[
+    "custom",
+    "must_match",
+    "nested",
+    "required",
+    "credit_card",
+    "non_control_character",
+];
+
+/// Like [`validate_attrs`], but tailored for the `UpdateModel` `Patch<T>` fields
+/// (#1719): drop the nested validators that `Patch<T>` cannot enforce.
+///
+/// `NewModel` fields carry the bare `T` and derive `validator::Validate`
+/// directly, so they keep every validator verbatim. `UpdateModel` fields are
+/// `Patch<T>`, which only implements validator's per-field *declarative* traits
+/// (`length`, `email`, `url`, `range`, `contains`, `does_not_contain`, `ip`,
+/// `regex`, …). The validators in [`NON_PATCH_VALIDATORS`] (`custom`,
+/// `must_match`, `nested`, `required`, `credit_card`, `non_control_character`)
+/// have no `Patch<T>` impl, so propagating them verbatim would break
+/// `UpdateModel` compilation even though `NewModel` still compiles — a latent
+/// footgun for a user who adds e.g. `#[validate(custom(...))]` to a model field.
+///
+/// This is a *denylist* (not an allowlist): unknown/future validators pass
+/// through untouched, so a newly-supported declarative validator is never
+/// silently dropped.
+///
+/// Documented limitation: `custom`/`must_match`/`nested`/`required`/etc. are
+/// enforced on create (via `NewModel`) but NOT on the PATCH update path; a
+/// follow-up may add merged-model validation for cross-field/custom rules.
+fn validate_attrs_for_patch(field: &Field) -> Vec<syn::Attribute> {
+    let mut out = Vec::new();
+    for attr in field.attrs.iter().filter(|a| a.path().is_ident("validate")) {
+        let syn::Meta::List(list) = &attr.meta else {
+            // A bare `#[validate]` with no nested items — nothing to filter.
+            out.push(attr.clone());
+            continue;
+        };
+        let parser = syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated;
+        let Ok(nested) = parser.parse2(list.tokens.clone()) else {
+            // If the nested metas don't parse, fall back to verbatim
+            // pass-through rather than silently dropping validation.
+            out.push(attr.clone());
+            continue;
+        };
+        let kept: Vec<syn::Meta> = nested
+            .into_iter()
+            .filter(|m| {
+                !m.path()
+                    .get_ident()
+                    .is_some_and(|id| NON_PATCH_VALIDATORS.contains(&id.to_string().as_str()))
+            })
+            .collect();
+        if kept.is_empty() {
+            // Filtering emptied the `#[validate(...)]` — drop the attr entirely.
+            continue;
+        }
+        out.push(syn::parse_quote!(#[validate(#(#kept),*)]));
+    }
+    out
+}
+
 /// Filter out framework-specific attributes (`#[id]`, `#[indexed]`, `#[validate]`,
 /// `#[default]`, `#[factory_assoc]`, `#[lock_version]`, `#[searchable]`,
 /// `#[state_machine]`) that shouldn't be on the query struct
@@ -2838,8 +2902,11 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     //   `autumn/src/hooks.rs`), so a failing declarative rule (`length`, `email`,
     //   `url`, `range`, `contains`, …) on a `Set` value surfaces as a 422 on
     //   PATCH/PUT, while an absent (`Unchanged`/`Clear`) field is skipped —
-    //   mirroring the create path. Attributes pass through verbatim, exactly as
-    //   for `NewX`; only declarative validators appear on model fields.
+    //   mirroring the create path. Non-declarative/struct-level validators
+    //   (`custom`, `must_match`, `nested`, `required`, `credit_card`,
+    //   `non_control_character`) have no `Patch<T>` impl and are filtered out
+    //   here by `validate_attrs_for_patch` (they still run on `NewX`); see that
+    //   helper for the documented create-vs-update limitation.
     // - #[lock_version] field: plain required T (the client supplies the
     //   version they read; the framework increments it atomically)
     let mut update_fields: Vec<TokenStream> = fields_for_new
@@ -2847,7 +2914,11 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         .map(|f| {
             let ident = &f.ident;
             let ty = &f.ty;
-            let val_attrs = validate_attrs(f);
+            // #1719: `Patch<T>` only implements validator's per-field
+            // declarative traits, so non-declarative/struct-level validators
+            // (`custom`, `must_match`, `nested`, …) must be stripped here or the
+            // `UpdateModel` would fail to compile. `NewModel` keeps them all.
+            let val_attrs = validate_attrs_for_patch(f);
             quote! {
                 #(#val_attrs)*
                 #[serde(default)]
@@ -5286,6 +5357,62 @@ mod tests {
         assert!(
             generated.contains("normalize :: trim") && generated.contains("normalize :: downcase"),
             "must chain the trim+downcase builtins: {generated}"
+        );
+    }
+
+    #[test]
+    fn update_model_drops_non_declarative_validators_but_new_model_keeps_them() {
+        // #1719: `Patch<T>` implements validator's per-field declarative traits
+        // (length/email/…) but NOT `custom`/`must_match`/`nested`/etc. The
+        // `UpdateModel` fields must therefore drop the non-declarative validators
+        // (or they'd fail to compile), while the `NewModel` keeps every validator.
+        let output = model_macro(
+            TokenStream::new(),
+            quote! {
+                pub struct User {
+                    #[id]
+                    pub id: i64,
+                    #[validate(length(min = 1), custom(function = "v"))]
+                    pub name: String,
+                }
+            },
+        );
+        let generated = output.to_string();
+
+        // Slice the `NewUser` struct body (up to its closing brace).
+        let new_start = generated
+            .find("struct NewUser")
+            .expect("NewUser struct must be generated");
+        let new_end = new_start
+            + generated[new_start..]
+                .find('}')
+                .expect("NewUser struct must close");
+        let new_section = &generated[new_start..new_end];
+        assert!(
+            new_section.contains("length"),
+            "NewUser must keep the `length` validator: {new_section}"
+        );
+        assert!(
+            new_section.contains("custom"),
+            "NewUser must keep the `custom` validator: {new_section}"
+        );
+
+        // Slice the `UpdateUser` struct body (up to its closing brace).
+        let upd_start = generated
+            .find("struct UpdateUser")
+            .expect("UpdateUser struct must be generated");
+        let upd_end = upd_start
+            + generated[upd_start..]
+                .find('}')
+                .expect("UpdateUser struct must close");
+        let upd_section = &generated[upd_start..upd_end];
+        assert!(
+            upd_section.contains("length"),
+            "UpdateUser must keep the declarative `length` validator: {upd_section}"
+        );
+        assert!(
+            !upd_section.contains("custom"),
+            "UpdateUser must NOT carry the non-declarative `custom` validator: {upd_section}"
         );
     }
 
