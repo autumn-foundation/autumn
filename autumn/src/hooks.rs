@@ -54,6 +54,8 @@
 //! - [`MutationContext`] -- carries actor identity, request ID, and
 //!   timestamp into every hook invocation.
 
+use std::borrow::Cow;
+
 use serde::de::Deserializer;
 use serde::{Deserialize, Serialize};
 
@@ -422,6 +424,115 @@ impl<'de, T: Deserialize<'de>> Deserialize<'de> for Patch<T> {
     }
 }
 
+// ── `Patch<T>` validator per-field trait impls (#1719) ───────────────
+//
+// The `#[repository(api = ...)]` macro generates an `UpdateModel` whose mutable
+// fields are `Patch<T>`. So that the model's declarative `#[validate(...)]`
+// rules are enforced on PATCH/PUT (returning a 422 with the same per-field
+// error map as create), the generated `UpdateModel` derives
+// `validator::Validate` and carries the field `#[validate]` attributes. That
+// derive expands to per-field calls like `self.title.validate_length(..)`,
+// so `Patch<T>` must implement validator's per-field traits.
+//
+// These impls mirror validator's own `Option<T>` impls: an absent field
+// (`Unchanged`/`Clear`) is skipped — it behaves like `None` and always passes —
+// while `Set(v)` delegates to the inner value's rule. `Patch` is a local type,
+// so implementing these foreign traits raises no orphan-rule issue.
+//
+// Only the *declarative, single-field* validators are implemented.
+// `required`/`must_match`/`nested`/`custom` are intentionally omitted: they are
+// meaningless or ill-typed on a tri-state patch field. `ValidateDoesNotContain`
+// is deliberately NOT implemented here — validator provides it automatically via
+// its blanket `impl<T: ValidateContains> ValidateDoesNotContain for T`, which
+// covers `Patch<T>` through the `ValidateContains` impl below (a manual impl
+// would collide with that blanket). `ValidateCreditCard` (validator's `card`
+// feature) and `ValidateNonControlCharacter` (its `unic` feature) are not
+// exported under this workspace's `validator` feature set, so they are omitted.
+
+impl<T: validator::ValidateLength<u64>> validator::ValidateLength<u64> for Patch<T> {
+    fn length(&self) -> Option<u64> {
+        match self {
+            Self::Set(v) => validator::ValidateLength::length(v),
+            _ => None,
+        }
+    }
+}
+
+impl<N, T: validator::ValidateRange<N>> validator::ValidateRange<N> for Patch<T> {
+    fn greater_than(&self, max: N) -> Option<bool> {
+        match self {
+            Self::Set(v) => validator::ValidateRange::greater_than(v, max),
+            _ => None,
+        }
+    }
+
+    fn less_than(&self, min: N) -> Option<bool> {
+        match self {
+            Self::Set(v) => validator::ValidateRange::less_than(v, min),
+            _ => None,
+        }
+    }
+}
+
+impl<T: validator::ValidateEmail> validator::ValidateEmail for Patch<T> {
+    fn as_email_string(&self) -> Option<Cow<'_, str>> {
+        match self {
+            Self::Set(v) => validator::ValidateEmail::as_email_string(v),
+            _ => None,
+        }
+    }
+}
+
+impl<T: validator::ValidateUrl> validator::ValidateUrl for Patch<T> {
+    fn as_url_string(&self) -> Option<Cow<'_, str>> {
+        match self {
+            Self::Set(v) => validator::ValidateUrl::as_url_string(v),
+            _ => None,
+        }
+    }
+}
+
+impl<T: validator::ValidateContains> validator::ValidateContains for Patch<T> {
+    fn validate_contains(&self, needle: &str) -> bool {
+        match self {
+            Self::Set(v) => validator::ValidateContains::validate_contains(v, needle),
+            _ => true,
+        }
+    }
+}
+
+impl<T: validator::ValidateIp> validator::ValidateIp for Patch<T> {
+    fn validate_ipv4(&self) -> bool {
+        match self {
+            Self::Set(v) => validator::ValidateIp::validate_ipv4(v),
+            _ => true,
+        }
+    }
+
+    fn validate_ipv6(&self) -> bool {
+        match self {
+            Self::Set(v) => validator::ValidateIp::validate_ipv6(v),
+            _ => true,
+        }
+    }
+
+    fn validate_ip(&self) -> bool {
+        match self {
+            Self::Set(v) => validator::ValidateIp::validate_ip(v),
+            _ => true,
+        }
+    }
+}
+
+impl<T: validator::ValidateRegex> validator::ValidateRegex for Patch<T> {
+    fn validate_regex(&self, regex: impl validator::AsRegex) -> bool {
+        match self {
+            Self::Set(v) => validator::ValidateRegex::validate_regex(v, regex),
+            _ => true,
+        }
+    }
+}
+
 /// Per-field before/after diff accessor for mutation hooks.
 ///
 /// `FieldDiff<T>` holds the previous and proposed values for a single field,
@@ -708,6 +819,30 @@ mod tests {
     #[test]
     fn patch_into_option_unchanged() {
         assert_eq!(Patch::<i32>::Unchanged.into_option(), None);
+    }
+
+    // ── Patch validator-trait tests (#1719) ─────────────────────
+    //
+    // `Patch<T>` mirrors validator's `Option<T>` impls: an absent field
+    // (`Unchanged`/`Clear`) always passes; a `Set(v)` field delegates to the
+    // inner value's rule. This lets the generated `UpdateModel` derive
+    // `validator::Validate` and enforce `#[validate(...)]` on PATCH/PUT.
+
+    #[test]
+    fn patch_validate_length_set_delegates_to_inner() {
+        use validator::ValidateLength;
+        // `Set` with an empty string fails a `length(min = 1)` rule …
+        assert!(!Patch::Set(String::new()).validate_length(Some(1), None, None));
+        // … while a `Set` with a satisfying value passes.
+        assert!(Patch::Set(String::from("ok")).validate_length(Some(1), None, None));
+    }
+
+    #[test]
+    fn patch_validate_length_absent_passes() {
+        use validator::ValidateLength;
+        // Absent variants behave like `None`: the rule is skipped (passes).
+        assert!(Patch::<String>::Unchanged.validate_length(Some(1), None, None));
+        assert!(Patch::<String>::Clear.validate_length(Some(1), None, None));
     }
 
     // ── FieldDiff tests ──────────────────────────────────────────

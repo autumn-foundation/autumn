@@ -2788,8 +2788,14 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         .collect();
 
     // Build UpdateX fields:
-    // - Regular mutable fields: Patch<T> (no #[validate] — validation only
-    //   applies to NewX and the merged model)
+    // - Regular mutable fields: Patch<T>, propagating the field's `#[validate]`
+    //   attributes (#1719). The struct derives `validator::Validate` below, and
+    //   `Patch<T>` implements validator's per-field traits (see
+    //   `autumn/src/hooks.rs`), so a failing declarative rule (`length`, `email`,
+    //   `url`, `range`, `contains`, …) on a `Set` value surfaces as a 422 on
+    //   PATCH/PUT, while an absent (`Unchanged`/`Clear`) field is skipped —
+    //   mirroring the create path. Attributes pass through verbatim, exactly as
+    //   for `NewX`; only declarative validators appear on model fields.
     // - #[lock_version] field: plain required T (the client supplies the
     //   version they read; the framework increments it atomically)
     let mut update_fields: Vec<TokenStream> = fields_for_new
@@ -2797,7 +2803,9 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         .map(|f| {
             let ident = &f.ident;
             let ty = &f.ty;
+            let val_attrs = validate_attrs(f);
             quote! {
+                #(#val_attrs)*
                 #[serde(default)]
                 pub #ident: ::autumn_web::hooks::Patch<#ty>
             }
@@ -3957,6 +3965,7 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
         #[derive(#update_debug_derive Clone, Default)]
         #[derive(::serde::Serialize, ::serde::Deserialize)]
+        #validate_derive
         #vis struct #update_name {
             #(#update_fields,)*
         }
