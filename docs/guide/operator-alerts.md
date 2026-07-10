@@ -45,7 +45,13 @@ only counts when a usable `[mail] transport` is configured: the mailer defaults
 to `disabled` outside dev, and a disabled mailer installs no email alert channel
 (it silently drops mail), so doctor warns for an email paired with a disabled
 transport just as it does for a missing destination. Set `[mail] transport` to a
-real backend (`smtp`/`log`/`file`) or use a signed webhook. Doctor also honours
+real backend (`smtp`/`log`/`file`) or use a signed webhook. Email alerts also
+need a sender address: the alert mail carries no per-message `from`, so it uses
+the mailer default (`[mail] from`). With `transport = "smtp"` and no `[mail]
+from`, SMTP delivery fails with "mail from address is required", so doctor warns
+(in production) for an SMTP email destination with no `[mail] from` — set
+`[mail] from` (or `AUTUMN_MAIL__FROM`). The `log` and `file` transports deliver
+without a `from`, so they are not gated on it. Doctor also honours
 the master switch: when `[alerts] enabled = false` (or
 `AUTUMN_ALERTS__ENABLED=false`) in production it warns that no operator alerts
 will be delivered even though a destination is configured, because the runtime

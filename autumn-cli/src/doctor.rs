@@ -397,6 +397,17 @@ pub fn check_trusted_hosts_impl(hosts: &[String], is_production: bool) -> CheckR
 /// it is `false` when the effective merged `[mail] transport` resolves to
 /// `disabled`. The webhook path is independent of the mailer.
 ///
+/// An `email` destination ALSO needs a mail `from` address for transports that
+/// build a real RFC 5322 message: the runtime's alert mail
+/// (`MailAlertChannel`) sets no per-message `from`, so it falls back to the
+/// mailer default (`[mail] from`). Under `transport = "smtp"` with no `[mail]
+/// from`, delivery fails in `lettre_message` with "mail from address is
+/// required" — so an SMTP email with no `from` is not a working destination.
+/// `transport_requires_from` mirrors which transports actually enforce this:
+/// only `smtp` (the `log` and `file` transports render `from` only when present
+/// and deliver without it; `disabled` is already not usable). `mail_from_present`
+/// is `true` when the effective merged `[mail] from` resolves non-empty.
+///
 /// The `[alerts] enabled` master switch is honoured up front: when alerting is
 /// disabled the runtime (`alerts::install_from_config`) returns BEFORE
 /// installing any `Alerter`, so NO operator alerts are delivered regardless of a
@@ -406,15 +417,40 @@ pub fn check_trusted_hosts_impl(hosts: &[String], is_production: bool) -> CheckR
 ///
 /// - **Production** (`is_production = true`): warns when alerting is disabled, or
 ///   when no usable destination is configured, so a deploy does not run silently
-///   blind to its own failures. An email whose mail transport is disabled gets a
-///   dedicated, clearer warning rather than the generic "no destination" one.
+///   blind to its own failures. An email whose mail transport is disabled — or
+///   whose SMTP transport has no `[mail] from` — gets a dedicated, clearer
+///   warning rather than the generic "no destination" one.
 /// - **Dev/test**: passes quietly (alerts are optional locally).
 ///
 /// The returned check name is `"alert_destination"`.
-// Five independent config booleans (alerting enabled, email present, webhook
-// signed, mail transport usable, production) each gate a distinct branch;
-// grouping them into enums would obscure rather than clarify the
-// destination-resolution logic.
+/// Dedicated production warning for an email destination on an SMTP transport
+/// with no `[mail] from`: the runtime's alert mail carries no per-message
+/// `from`, so `lettre_message` fails with "mail from address is required" and
+/// nothing is delivered. Distinct from the disabled-transport and no-destination
+/// warnings. Extracted so [`check_alert_destination_impl`] stays under the
+/// line-count lint.
+fn alert_email_from_missing_warning() -> CheckResult {
+    CheckResult {
+        name: "alert_destination",
+        status: CheckStatus::Warn,
+        detail: Some(
+            "an operator alert email is configured but `[mail] from` is not set, so SMTP \
+             delivery will fail; the runtime's alert mail carries no per-message from and \
+             the mailer has no default from address to fall back to"
+                .into(),
+        ),
+        hint: Some(
+            "Set [mail] from (or AUTUMN_MAIL__FROM) to a sender address like \
+             alerts@example.com, or configure a signed webhook ([alerts] webhook_url + \
+             webhook_secret). See docs/guide/operator-alerts.md",
+        ),
+    }
+}
+
+// Seven independent config booleans (alerting enabled, email present, webhook
+// signed, mail transport usable, production, mail `from` present, transport
+// requires a `from`) each gate a distinct branch; grouping them into enums would
+// obscure rather than clarify the destination-resolution logic.
 #[allow(clippy::fn_params_excessive_bools)]
 pub fn check_alert_destination_impl(
     alerts_enabled: bool,
@@ -422,7 +458,17 @@ pub fn check_alert_destination_impl(
     webhook_configured: bool,
     mail_transport_usable: bool,
     is_production: bool,
+    mail_from_present: bool,
+    transport_requires_from: bool,
 ) -> CheckResult {
+    // Whether a configured email would actually deliver. It needs a usable
+    // (non-disabled) transport AND — for transports that build a real RFC 5322
+    // message (SMTP) — a non-empty `[mail] from`, because the runtime's alert
+    // mail carries no per-message `from` and falls back to the mailer default.
+    // `log`/`file` deliver without a `from`, so they do not need one.
+    let email_from_ok = mail_from_present || !transport_requires_from;
+    let email_destination = email_configured && mail_transport_usable && email_from_ok;
+
     // Master off switch: when `[alerts] enabled = false`, the runtime installs no
     // alerter at all, so a configured destination is inert. Handle this BEFORE
     // the destination gate — doctor must not pass on the strength of a
@@ -432,7 +478,7 @@ pub fn check_alert_destination_impl(
             // Name the disabled switch explicitly. Mention the (otherwise valid)
             // destination when one is configured so the operator understands the
             // deploy is blind despite it; keep the message accurate otherwise.
-            let has_destination = (email_configured && mail_transport_usable) || webhook_configured;
+            let has_destination = email_destination || webhook_configured;
             let detail = if has_destination {
                 "alerting is disabled ([alerts] enabled = false) in production, so no operator \
                  alerts will be delivered — even though a destination is configured"
@@ -462,10 +508,10 @@ pub fn check_alert_destination_impl(
             hint: None,
         };
     }
-    // Email only counts as a real destination when the mail transport can
-    // actually send — mirroring the runtime, which skips MailAlertChannel when
-    // `mailer.is_disabled()`.
-    let email_destination = email_configured && mail_transport_usable;
+    // `email_destination` (computed above) already folds in the usable-transport
+    // and `from` requirements — mirroring the runtime, which skips
+    // MailAlertChannel when `mailer.is_disabled()` and whose SMTP send fails
+    // without a `from`.
     if email_destination || webhook_configured {
         return CheckResult {
             name: "alert_destination",
@@ -475,6 +521,18 @@ pub fn check_alert_destination_impl(
         };
     }
     if is_production {
+        // An email is set on a usable transport that needs a `from` (SMTP), but
+        // no `[mail] from` is configured: the runtime's alert mail has no
+        // per-message `from`, so `lettre_message` fails with "mail from address
+        // is required" and nothing is delivered. Surface a dedicated warning
+        // distinct from both the disabled-transport and no-destination cases.
+        if email_configured
+            && mail_transport_usable
+            && transport_requires_from
+            && !mail_from_present
+        {
+            return alert_email_from_missing_warning();
+        }
         // An email is set but the mail transport is disabled: the runtime
         // installs no alert channel and delivers nothing. Surface a dedicated
         // warning that points at the real cause instead of the generic
@@ -2174,6 +2232,30 @@ fn resolve_mail_unsubscribe(table: Option<&toml::Table>) -> (Option<String>, Opt
     )
 }
 
+/// Resolve the effective `[mail] from` sender address, preferring an
+/// `AUTUMN_MAIL__FROM` env override over the merged `[mail].from` (mirroring the
+/// runtime's `AUTUMN_MAIL__*` precedence — a *present* env var wins even when
+/// blank, clearing the TOML value; only an *absent* env var falls back to TOML).
+/// Returns the trimmed non-empty value, or `None` when no usable `from` is set.
+fn resolve_mail_from(table: Option<&toml::Table>) -> Option<String> {
+    let mail = table
+        .and_then(|t| t.get("mail"))
+        .and_then(toml::Value::as_table);
+    std::env::var("AUTUMN_MAIL__FROM").map_or_else(
+        |_| {
+            mail.and_then(|m| m.get("from"))
+                .and_then(toml::Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(std::borrow::ToOwned::to_owned)
+        },
+        |value| {
+            let trimmed = value.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_owned())
+        },
+    )
+}
+
 /// Resolve the effective `unsubscribe_token_ttl_days`, mirroring the runtime
 /// precedence: `[mail].unsubscribe_token_ttl_days` (or the default of 30) is the
 /// base, and a present, *parseable* `AUTUMN_MAIL__UNSUBSCRIBE_TOKEN_TTL_DAYS`
@@ -2282,6 +2364,18 @@ fn resolve_effective_mail_transport(
     } else {
         "disabled".to_owned()
     }
+}
+
+/// Whether a mail transport actually requires a `from` address to deliver.
+///
+/// Only `smtp` builds a real RFC 5322 message: autumn-web's `lettre_message`
+/// errors with "mail from address is required" when `from` is absent, and it is
+/// reached solely from the SMTP transport. The `log` and `file` transports
+/// render `from` only when present and deliver without it; `disabled` delivers
+/// nothing at all (and is already treated as an unusable transport). Mirrors
+/// autumn-web `mail.rs`.
+fn mail_transport_requires_from(transport: &str) -> bool {
+    transport == "smtp"
 }
 
 fn resolve_database_topology(table: Option<&toml::Table>) -> DoctorDatabaseTopology {
@@ -3200,6 +3294,12 @@ pub fn run(opts: DoctorOptions) {
     //      `mailer.is_disabled()`: an email with a disabled transport installs
     //      no alert channel, so it must not count toward a valid destination.
     let mail_transport_usable = !mail_transport_disabled;
+    // Also gate the email destination on a resolved `[mail] from` for transports
+    // that require one (SMTP): the runtime's alert mail sets no per-message
+    // `from`, so an SMTP email with no `[mail] from` fails to deliver. Reuse the
+    // SAME merged config / effective transport the mail checks above resolved.
+    let mail_from_present = resolve_mail_from(Some(&merged_mail_toml)).is_some();
+    let transport_requires_from = mail_transport_requires_from(&effective_transport);
     tasks.push(Box::new(move || {
         check_alert_destination_impl(
             alerts_enabled,
@@ -3207,6 +3307,8 @@ pub fn run(opts: DoctorOptions) {
             alert_webhook_configured,
             mail_transport_usable,
             is_production,
+            mail_from_present,
+            transport_requires_from,
         )
     }));
 
@@ -4721,7 +4823,7 @@ pub struct Vault {
 
     #[test]
     fn alert_destination_warns_in_production_when_none() {
-        let r = check_alert_destination_impl(true, false, false, true, true);
+        let r = check_alert_destination_impl(true, false, false, true, true, true, true);
         assert_eq!(r.name, "alert_destination");
         assert!(matches!(r.status, CheckStatus::Warn));
         assert!(r.hint.is_some());
@@ -4729,19 +4831,19 @@ pub struct Vault {
 
     #[test]
     fn alert_destination_passes_in_production_with_email() {
-        let r = check_alert_destination_impl(true, true, false, true, true);
+        let r = check_alert_destination_impl(true, true, false, true, true, true, true);
         assert!(matches!(r.status, CheckStatus::Pass));
     }
 
     #[test]
     fn alert_destination_passes_in_production_with_webhook() {
-        let r = check_alert_destination_impl(true, false, true, true, true);
+        let r = check_alert_destination_impl(true, false, true, true, true, true, true);
         assert!(matches!(r.status, CheckStatus::Pass));
     }
 
     #[test]
     fn alert_destination_passes_in_dev_without_destination() {
-        let r = check_alert_destination_impl(true, false, false, true, false);
+        let r = check_alert_destination_impl(true, false, false, true, false, true, true);
         assert!(matches!(r.status, CheckStatus::Pass));
     }
 
@@ -4765,7 +4867,7 @@ pub struct Vault {
         let transport = resolve_effective_mail_transport(None, None, "prod");
         assert_eq!(transport, "disabled");
         let usable = transport != "disabled";
-        let r = check_alert_destination_impl(true, email, webhook, usable, true);
+        let r = check_alert_destination_impl(true, email, webhook, usable, true, true, true);
         assert!(
             matches!(r.status, CheckStatus::Warn),
             "email with a disabled mail transport delivers nothing → must warn in prod"
@@ -4786,10 +4888,121 @@ pub struct Vault {
         let (email, webhook) = resolve_alert_destination_from_sources(no_env, Some(&table), "prod");
         let transport = resolve_effective_mail_transport(None, Some("smtp"), "prod");
         assert_eq!(transport, "smtp");
-        let r = check_alert_destination_impl(true, email, webhook, transport != "disabled", true);
+        // SMTP requires a `from`; this happy path has one set, so it still passes.
+        let requires_from = mail_transport_requires_from(&transport);
+        let r = check_alert_destination_impl(
+            true,
+            email,
+            webhook,
+            transport != "disabled",
+            true,
+            true,
+            requires_from,
+        );
         assert!(
             matches!(r.status, CheckStatus::Pass),
             "email with a usable (smtp) transport is a valid destination in prod"
+        );
+    }
+
+    #[test]
+    fn mail_transport_requires_from_only_for_smtp() {
+        // Only SMTP builds an RFC 5322 message (`lettre_message`), which errors
+        // without a `from`. `log`/`file` render `from` only when present and
+        // deliver without it; `disabled` delivers nothing at all.
+        assert!(mail_transport_requires_from("smtp"));
+        assert!(!mail_transport_requires_from("log"));
+        assert!(!mail_transport_requires_from("file"));
+        assert!(!mail_transport_requires_from("disabled"));
+    }
+
+    // ── email destination requires a mail `from` for SMTP (issue #1610) ───────
+    // The runtime's `MailAlertChannel` builds alert mail with NO per-message
+    // `from`, so it falls back to the mailer default (`[mail] from`). Under
+    // `transport = "smtp"` with no `[mail] from`, delivery fails in
+    // autumn-web's `lettre_message` with "mail from address is required". Doctor
+    // mirrors this: an SMTP email with no `from` is not a working destination.
+    // `log`/`file` deliver without a `from`, so they must NOT be over-gated.
+
+    #[test]
+    fn alert_destination_email_smtp_with_from_passes_in_prod() {
+        // (a) email + smtp + a `[mail] from` set → the runtime installs a channel
+        // that can send, so doctor counts the email and passes in prod.
+        let transport = resolve_effective_mail_transport(None, Some("smtp"), "prod");
+        assert_eq!(transport, "smtp");
+        let requires_from = mail_transport_requires_from(&transport);
+        assert!(requires_from, "smtp must be flagged as requiring a from");
+        let mail_from_present = true;
+        let r = check_alert_destination_impl(
+            true,
+            true,
+            false,
+            transport != "disabled",
+            true,
+            mail_from_present,
+            requires_from,
+        );
+        assert!(
+            matches!(r.status, CheckStatus::Pass),
+            "email + smtp + [mail] from is a valid destination in prod"
+        );
+    }
+
+    #[test]
+    fn alert_destination_email_smtp_without_from_warns_in_prod() {
+        // (b) email + smtp + NO `[mail] from` → SMTP delivery fails with "mail
+        // from address is required", so doctor must NOT count the email and must
+        // warn with the dedicated `from` message (distinct from the
+        // disabled-transport and no-destination warnings).
+        let transport = resolve_effective_mail_transport(None, Some("smtp"), "prod");
+        let requires_from = mail_transport_requires_from(&transport);
+        let mail_from_present = false;
+        let r = check_alert_destination_impl(
+            true,
+            true,
+            false,
+            transport != "disabled",
+            true,
+            mail_from_present,
+            requires_from,
+        );
+        assert!(
+            matches!(r.status, CheckStatus::Warn),
+            "email on smtp with no [mail] from delivers nothing → must warn in prod"
+        );
+        assert!(
+            r.detail
+                .as_deref()
+                .is_some_and(|d| d.contains("`[mail] from` is not set")),
+            "the dedicated warning must name the missing [mail] from as the cause"
+        );
+    }
+
+    #[test]
+    fn alert_destination_email_log_transport_without_from_still_passes() {
+        // (c) email + `log` transport + NO `[mail] from` → the log transport
+        // renders `from` only when present and delivers without it, so a missing
+        // `from` must NOT down-grade the destination. Do not over-gate.
+        let transport = resolve_effective_mail_transport(None, Some("log"), "prod");
+        assert_eq!(transport, "log");
+        let requires_from = mail_transport_requires_from(&transport);
+        assert!(
+            !requires_from,
+            "log must NOT be flagged as requiring a from"
+        );
+        let mail_from_present = false;
+        let r = check_alert_destination_impl(
+            true,
+            true,
+            false,
+            transport != "disabled",
+            true,
+            mail_from_present,
+            requires_from,
+        );
+        assert!(
+            matches!(r.status, CheckStatus::Pass),
+            "email on a log transport delivers without a from → must not warn"
         );
     }
 
@@ -4806,7 +5019,7 @@ pub struct Vault {
         assert!(!email, "the prod profile cleared the email");
         assert!(webhook, "the signed webhook remains configured");
         // Mail transport disabled — irrelevant to the webhook path.
-        let r = check_alert_destination_impl(true, email, webhook, false, true);
+        let r = check_alert_destination_impl(true, email, webhook, false, true, true, true);
         assert!(
             matches!(r.status, CheckStatus::Pass),
             "a signed webhook is a valid destination regardless of mail transport"
@@ -4843,7 +5056,7 @@ pub struct Vault {
         );
 
         // And the surfaced doctor check warns in production for this config.
-        let r = check_alert_destination_impl(true, email, false, true, true);
+        let r = check_alert_destination_impl(true, email, false, true, true, true, true);
         assert!(matches!(r.status, CheckStatus::Warn));
     }
 
@@ -4910,7 +5123,7 @@ pub struct Vault {
             webhook,
             "webhook_url + webhook_secret must count as configured"
         );
-        let r = check_alert_destination_impl(true, email, webhook, true, true);
+        let r = check_alert_destination_impl(true, email, webhook, true, true, true, true);
         assert!(matches!(r.status, CheckStatus::Pass));
     }
 
@@ -4926,7 +5139,7 @@ pub struct Vault {
             !webhook,
             "a webhook_url with no signing secret is not a destination"
         );
-        let r = check_alert_destination_impl(true, email, webhook, true, true);
+        let r = check_alert_destination_impl(true, email, webhook, true, true, true, true);
         assert!(
             matches!(r.status, CheckStatus::Warn),
             "URL-without-secret in production must warn"
@@ -4948,7 +5161,7 @@ pub struct Vault {
             !webhook,
             "a prod-profile empty webhook_secret must clear the base secret"
         );
-        let r = check_alert_destination_impl(true, email, webhook, true, true);
+        let r = check_alert_destination_impl(true, email, webhook, true, true, true, true);
         assert!(matches!(r.status, CheckStatus::Warn));
 
         // And an empty AUTUMN_ALERTS__WEBHOOK_SECRET env var clears it just the same.
@@ -5002,7 +5215,7 @@ pub struct Vault {
             !email,
             "an autumn-prod.toml that clears [alerts].email must resolve as no destination"
         );
-        let r = check_alert_destination_impl(true, email, false, true, true);
+        let r = check_alert_destination_impl(true, email, false, true, true, true, true);
         assert!(
             matches!(r.status, CheckStatus::Warn),
             "a production deploy whose override file cleared the only alert channel must WARN"
@@ -5041,7 +5254,7 @@ pub struct Vault {
         let (email, webhook) = resolve_alert_destination_from_sources(no_env, Some(&merged), "");
         assert!(email);
         assert!(!webhook);
-        let r = check_alert_destination_impl(true, email, webhook, true, true);
+        let r = check_alert_destination_impl(true, email, webhook, true, true, true, true);
         assert!(matches!(r.status, CheckStatus::Pass));
     }
 
@@ -5064,7 +5277,7 @@ pub struct Vault {
             !webhook,
             "a webhook whose secret was cleared by the override file is not a signed destination"
         );
-        let r = check_alert_destination_impl(true, email, webhook, true, true);
+        let r = check_alert_destination_impl(true, email, webhook, true, true, true, true);
         assert!(matches!(r.status, CheckStatus::Warn));
 
         // With both left intact through the merged view, the webhook still counts.
@@ -5148,7 +5361,7 @@ pub struct Vault {
         let (email, webhook) = resolve_alert_destination_from_sources(no_env, Some(&table), "prod");
         assert!(!enabled);
         assert!(email, "the email itself is still configured");
-        let r = check_alert_destination_impl(enabled, email, webhook, true, true);
+        let r = check_alert_destination_impl(enabled, email, webhook, true, true, true, true);
         assert!(
             matches!(r.status, CheckStatus::Warn),
             "disabled alerting with a configured destination must warn in prod"
@@ -5168,7 +5381,7 @@ pub struct Vault {
         let enabled = resolve_alert_enabled_from_sources(env, Some(&table), "prod");
         let (email, webhook) = resolve_alert_destination_from_sources(no_env, Some(&table), "prod");
         assert!(!enabled);
-        let r = check_alert_destination_impl(enabled, email, webhook, true, true);
+        let r = check_alert_destination_impl(enabled, email, webhook, true, true, true, true);
         assert!(matches!(r.status, CheckStatus::Warn));
     }
 
@@ -5180,7 +5393,7 @@ pub struct Vault {
         let enabled = resolve_alert_enabled_from_sources(no_env, Some(&table), "prod");
         let (email, webhook) = resolve_alert_destination_from_sources(no_env, Some(&table), "prod");
         assert!(enabled);
-        let r = check_alert_destination_impl(enabled, email, webhook, true, true);
+        let r = check_alert_destination_impl(enabled, email, webhook, true, true, true, true);
         assert!(matches!(r.status, CheckStatus::Pass));
     }
 
@@ -5192,7 +5405,7 @@ pub struct Vault {
         let enabled = resolve_alert_enabled_from_sources(no_env, Some(&table), "dev");
         let (email, webhook) = resolve_alert_destination_from_sources(no_env, Some(&table), "dev");
         assert!(!enabled);
-        let r = check_alert_destination_impl(enabled, email, webhook, true, false);
+        let r = check_alert_destination_impl(enabled, email, webhook, true, false, true, true);
         assert!(
             matches!(r.status, CheckStatus::Pass),
             "dev-mode leniency: disabled alerting must not warn outside production"
