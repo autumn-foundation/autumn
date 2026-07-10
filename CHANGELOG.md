@@ -1067,8 +1067,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **repository:** `#[repository(...)]` associations can now declare a
   `dependent(ChildRepository, fk = "col", on_delete = …)` cascade, so deleting a
   parent handles its children in one transaction —
-  `on_delete = destroy` (soft-delete-aware, fires child hooks) `| delete_all |
-  nullify | restrict` (probes for referencing rows before mutating and errors if
+  `on_delete` = `destroy` (soft-delete-aware, fires child hooks) | `delete_all` |
+  `nullify` | `restrict` (probes for referencing rows before mutating and errors if
   any still exist) (issue #1369).
 - **audit:** version/audit writes are auto-attributed to the current actor. A new
   `autumn_web::current` module carries a request-scoped actor
