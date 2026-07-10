@@ -5,7 +5,10 @@ version.workspace = true
 publish = false
 
 [dependencies]
-autumn-web = { path = "../../autumn", features = ["openapi"] }
+# `seed` enables `autumn_web::seed` (SeedContext + the fake-seeder registry) so
+# `src/bin/seed.rs` can do a one-line faked seed and answer
+# `autumn seed --count N --model Bookmark`.
+autumn-web = { path = "../../autumn", features = ["openapi", "seed"] }
 chrono = { version = "0.4", features = ["serde"] }
 diesel = { version = "2", features = ["postgres", "chrono"] }
 diesel-async = { version = "0.9", features = ["postgres"] }

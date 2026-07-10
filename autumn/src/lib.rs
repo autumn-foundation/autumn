@@ -391,6 +391,50 @@ pub mod payload_version;
 pub mod runtime_config;
 #[cfg(feature = "seed")]
 pub mod seed;
+
+// ── #1343 AC4: fake-seeder registration forwarding ──────────────────────────
+//
+// `#[model]` emits a call to `autumn_web::__autumn_register_fake_seeder!` for
+// every model so `autumn seed --count N --model M` can find and run the model's
+// factory without the user editing `src/bin/seed.rs`. The registration must
+// exist *exactly* when `autumn_web::seed::FakeSeeder` and the db-backed
+// `create_many` do — i.e. when this crate is built with the `seed` feature.
+//
+// A downstream `#[cfg(feature = "seed")]` in the emitted code would test the
+// *application* crate's features, not autumn-web's, so it can't be used
+// directly. Instead we forward through a `#[macro_export]` macro whose two
+// cfg-gated definitions are resolved against *autumn-web's* features at the
+// point autumn-web is compiled: the real `inventory::submit!` when `seed` is on,
+// and a no-op otherwise. This keeps models compiling unchanged when seeding is
+// disabled (e.g. autumn-web's own default-feature test build).
+
+/// Register a model's factory as a CLI-callable fake seeder (internal; invoked
+/// by `#[model]`). Expands to an `inventory::submit!` of a
+/// [`seed::FakeSeeder`](crate::seed::FakeSeeder).
+#[cfg(feature = "seed")]
+#[macro_export]
+#[doc(hidden)]
+macro_rules! __autumn_register_fake_seeder {
+    ($model:ty, $name:expr) => {
+        $crate::reexports::inventory::submit! {
+            $crate::seed::FakeSeeder {
+                model: $name,
+                run: |__pool, __count| ::std::boxed::Box::pin(async move {
+                    <$model>::factory().fake().create_many(__count, __pool).await.len()
+                }),
+            }
+        }
+    };
+}
+
+/// No-op fake-seeder registration (internal): emitted when autumn-web is built
+/// without the `seed` feature, so `#[model]` compiles unchanged.
+#[cfg(not(feature = "seed"))]
+#[macro_export]
+#[doc(hidden)]
+macro_rules! __autumn_register_fake_seeder {
+    ($model:ty, $name:expr) => {};
+}
 /// Widget story gallery (issue #1526).
 ///
 /// Browsable `/_stories` UI plus a CI anti-rot registry of zero-arg widget

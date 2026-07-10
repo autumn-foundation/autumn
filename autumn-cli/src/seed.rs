@@ -22,6 +22,30 @@ pub enum SeedError {
 
     #[error("pending migrations detected; run `autumn migrate` before `autumn seed`")]
     PendingMigrations,
+
+    #[error(
+        "`--count` and `--model` must be used together: pass both to generate \
+         faked rows (e.g. `autumn seed --count 200 --model Post`), or neither \
+         to run the project seed binary"
+    )]
+    IncompleteFakeFlags,
+}
+
+/// Resolve the `--count`/`--model` pair into the fake-seed request, if any.
+///
+/// - Both absent → `Ok(None)`: preserve today's behavior (run the seed binary).
+/// - Both present → `Ok(Some((count, model)))`: forward to the seed binary so
+///   it generates faked rows for that model.
+/// - Exactly one present → [`SeedError::IncompleteFakeFlags`].
+fn resolve_fake_request(
+    count: Option<usize>,
+    model: Option<&str>,
+) -> Result<Option<(usize, String)>, SeedError> {
+    match (count, model) {
+        (None, None) => Ok(None),
+        (Some(count), Some(model)) => Ok(Some((count, model.to_owned()))),
+        _ => Err(SeedError::IncompleteFakeFlags),
+    }
 }
 
 /// Returns `true` if the seed binary source file exists at `path`.
@@ -159,9 +183,26 @@ fn check_pending_migrations(database_url: &str, migrations_dir: &str) -> Result<
 }
 
 /// Entry point for `autumn seed`.
-pub fn run(profile: &str, package: Option<&str>) {
+///
+/// When both `count` and `model` are supplied, the seed binary is asked (via the
+/// `AUTUMN_SEED_COUNT`/`AUTUMN_SEED_MODEL` environment variables) to generate
+/// that many faked rows for the named model instead of running its hand-written
+/// seed body. Supplying only one of the two is an error; supplying neither
+/// preserves the original behavior (run the project seed binary).
+pub fn run(profile: &str, package: Option<&str>, count: Option<usize>, model: Option<&str>) {
     eprintln!("\u{1F342} autumn seed\n");
     eprintln!("  Profile: {profile}");
+
+    let fake_request = match resolve_fake_request(count, model) {
+        Ok(req) => req,
+        Err(e) => {
+            eprintln!("\u{2717} {e}");
+            std::process::exit(1);
+        }
+    };
+    if let Some((count, model)) = &fake_request {
+        eprintln!("  Faking: {count} row(s) of model `{model}`");
+    }
 
     // Determine the project directory: either the workspace member's root (when
     // --package is given) or the current working directory.
@@ -194,6 +235,12 @@ pub fn run(profile: &str, package: Option<&str>) {
     }
     cmd.env("AUTUMN_ENV", profile);
     cmd.env("AUTUMN_PROFILE", profile);
+    // Forward the fake-seed request (if any) to the seed binary, which
+    // dispatches on these vars to `autumn_web::seed::fake_seed_model`.
+    if let Some((count, model)) = &fake_request {
+        cmd.env("AUTUMN_SEED_COUNT", count.to_string());
+        cmd.env("AUTUMN_SEED_MODEL", model);
+    }
     // Run from the project directory so the seed binary's SeedContext reads
     // autumn.toml from the correct location (the package root, not the
     // workspace root).
@@ -256,6 +303,46 @@ mod tests {
         assert!(
             msg.contains("pending"),
             "error should mention pending migrations, got: {msg}"
+        );
+    }
+
+    // ── resolve_fake_request (--count / --model, #1343 AC4) ─────────────────
+
+    #[test]
+    fn resolve_fake_request_none_when_both_absent() {
+        assert_eq!(resolve_fake_request(None, None), Ok(None));
+    }
+
+    #[test]
+    fn resolve_fake_request_some_when_both_present() {
+        assert_eq!(
+            resolve_fake_request(Some(200), Some("Post")),
+            Ok(Some((200, "Post".to_string())))
+        );
+    }
+
+    #[test]
+    fn resolve_fake_request_errors_on_count_without_model() {
+        assert_eq!(
+            resolve_fake_request(Some(200), None),
+            Err(SeedError::IncompleteFakeFlags)
+        );
+    }
+
+    #[test]
+    fn resolve_fake_request_errors_on_model_without_count() {
+        assert_eq!(
+            resolve_fake_request(None, Some("Post")),
+            Err(SeedError::IncompleteFakeFlags)
+        );
+    }
+
+    #[test]
+    fn incomplete_fake_flags_error_is_actionable() {
+        let msg = SeedError::IncompleteFakeFlags.to_string();
+        assert!(
+            msg.contains("--count") && msg.contains("--model"),
+            "error should mention both flags, got: {msg}"
         );
     }
 

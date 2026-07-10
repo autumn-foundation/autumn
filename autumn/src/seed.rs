@@ -20,6 +20,40 @@
 //!     println!("Seed complete (profile: {})", ctx.profile());
 //! }
 //! ```
+//!
+//! # Faking data (issue #1343)
+//!
+//! Any `#[autumn_web::model]` gets a factory whose `.fake()` fills unset fields
+//! with realistic data. Populate 100+ rows in a single line to exercise
+//! pagination and search:
+//!
+//! ```no_run
+//! use autumn_web::seed::SeedContext;
+//!
+//! autumn_web::reexports::diesel::table! {
+//!     posts (id) { id -> Int8, title -> Text, body -> Text }
+//! }
+//!
+//! #[autumn_web::model(table = "posts")]
+//! struct Post {
+//!     #[id]
+//!     id: i64,
+//!     title: String,
+//!     body: String,
+//! }
+//!
+//! #[tokio::main]
+//! async fn main() {
+//!     let ctx = SeedContext::build().expect("seed context");
+//!
+//!     // 200 faked posts, each with distinct fake title/body:
+//!     Post::factory().fake().create_many(200, ctx.pool()).await;
+//! }
+//! ```
+//!
+//! The same registry powers `autumn seed --count 200 --model Post`, which drives
+//! a model's factory by name (via [`fake_seed_model`]) without editing the seed
+//! binary at all.
 
 use std::path::Path;
 
@@ -27,6 +61,7 @@ use crate::config::DatabaseConfig;
 use crate::db::create_pool;
 use diesel_async::AsyncPgConnection;
 use diesel_async::pooled_connection::deadpool::{Object, Pool};
+use futures::future::BoxFuture;
 
 /// Error type returned by [`SeedContext`] operations.
 #[derive(Debug, thiserror::Error)]
@@ -108,6 +143,16 @@ impl SeedContext {
     #[must_use]
     pub fn profile(&self) -> &str {
         &self.profile
+    }
+
+    /// Returns the underlying connection pool.
+    ///
+    /// Useful for APIs that take a `&Pool<AsyncPgConnection>` directly, such as
+    /// factory `create_many(count, pool)` and
+    /// [`fake_seed_model`](crate::seed::fake_seed_model).
+    #[must_use]
+    pub const fn pool(&self) -> &Pool<AsyncPgConnection> {
+        &self.pool
     }
 
     /// Acquires a pooled database connection.
@@ -205,9 +250,162 @@ fn first_database_url(database: Option<&toml::Value>) -> Option<String> {
     None
 }
 
+// ── #1343 AC4: model-name → factory fake-seeder registry ────────────────────
+//
+// The `autumn` CLI cannot name a project's generated model types directly, so
+// each `#[model]` registers a `FakeSeeder` via `inventory` (see the
+// `__autumn_register_fake_seeder!` forwarding macro in `lib.rs`). A seed binary
+// (or `autumn seed --count N --model M`) then looks a model up by name and runs
+// its factory's `.fake().create_many(count, pool)`, all without editing
+// `src/bin/seed.rs`.
+
+/// A registered model factory that `fake_seed_model` can drive by name.
+///
+/// One is submitted per `#[model]` (through the internal
+/// `__autumn_register_fake_seeder!` macro) when autumn-web is built with the
+/// `seed` feature. Collected at link time via [`inventory`].
+pub struct FakeSeeder {
+    /// The model's type name, e.g. `"Post"`. Matched case-insensitively.
+    pub model: &'static str,
+    /// Insert `count` faked rows via the model's factory and return how many
+    /// were inserted.
+    pub run: fn(&Pool<AsyncPgConnection>, usize) -> BoxFuture<'_, usize>,
+}
+
+inventory::collect!(FakeSeeder);
+
+/// Error returned by [`fake_seed_model`] when the requested model is not a
+/// registered faked model.
+#[derive(Debug, thiserror::Error)]
+pub enum FakeSeedError {
+    /// No registered `#[model]` matched the requested name.
+    #[error("unknown model {requested:?}; available faked models: {available}")]
+    UnknownModel {
+        /// The `--model` value that did not match any registered model.
+        requested: String,
+        /// Comma-separated list of registered model names (or a placeholder
+        /// when none are registered).
+        available: String,
+    },
+}
+
+/// The names of every registered faked model, sorted, for diagnostics.
+#[must_use]
+pub fn registered_fake_models() -> Vec<&'static str> {
+    let mut names: Vec<&'static str> = inventory::iter::<FakeSeeder>
+        .into_iter()
+        .map(|s| s.model)
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+    names
+}
+
+/// Find the registered [`FakeSeeder`] whose model name matches `name`
+/// (case-insensitive), if any. Pool-free so the lookup can be unit-tested
+/// without a live database.
+fn find_fake_seeder(name: &str) -> Option<&'static FakeSeeder> {
+    inventory::iter::<FakeSeeder>
+        .into_iter()
+        .find(|s| s.model.eq_ignore_ascii_case(name))
+}
+
+/// Generate and insert `count` faked rows for the model named `name`
+/// (case-insensitive), using that model's factory `.fake().create_many(...)`.
+///
+/// Returns the number of rows inserted.
+///
+/// # Errors
+///
+/// Returns [`FakeSeedError::UnknownModel`] when no registered `#[model]`
+/// matches `name`. The error lists the available model names.
+pub async fn fake_seed_model(
+    name: &str,
+    count: usize,
+    pool: &Pool<AsyncPgConnection>,
+) -> Result<usize, FakeSeedError> {
+    if let Some(seeder) = find_fake_seeder(name) {
+        return Ok((seeder.run)(pool, count).await);
+    }
+    let available = registered_fake_models();
+    let available = if available.is_empty() {
+        "(none registered)".to_string()
+    } else {
+        available.join(", ")
+    };
+    Err(FakeSeedError::UnknownModel {
+        requested: name.to_string(),
+        available,
+    })
+}
+
+// ── #1343 AC4: fake-seeder registry test fixture ────────────────────────────
+//
+// Register a dummy model so the registry-lookup tests below have a known entry
+// to find without depending on any other crate's `#[model]`s. The `run` closure
+// never touches the pool (the lookup tests never invoke it), so it is safe to
+// leave a placeholder body.
+#[cfg(test)]
+inventory::submit! {
+    FakeSeeder {
+        model: "DummyFakeSeederModel",
+        run: |_pool, count| ::std::boxed::Box::pin(async move { count }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── fake-seeder registry (#1343 AC4) ───────────────────────────────────
+
+    #[test]
+    fn registry_collects_submitted_seeder() {
+        assert!(
+            registered_fake_models().contains(&"DummyFakeSeederModel"),
+            "expected the submitted dummy seeder to be collected via inventory, \
+             got: {:?}",
+            registered_fake_models()
+        );
+    }
+
+    #[test]
+    fn find_fake_seeder_is_case_insensitive() {
+        assert!(find_fake_seeder("DummyFakeSeederModel").is_some());
+        assert!(
+            find_fake_seeder("dummyfakeseedermodel").is_some(),
+            "lookup should be case-insensitive"
+        );
+        assert_eq!(
+            find_fake_seeder("DummyFakeSeederModel").unwrap().model,
+            "DummyFakeSeederModel"
+        );
+    }
+
+    #[test]
+    fn find_fake_seeder_returns_none_for_unknown() {
+        assert!(find_fake_seeder("NoSuchModelXYZ").is_none());
+    }
+
+    #[test]
+    fn unknown_model_error_lists_available_models() {
+        // Build the error the way `fake_seed_model` does for an unknown name,
+        // without needing a live pool.
+        let available = registered_fake_models().join(", ");
+        let err = FakeSeedError::UnknownModel {
+            requested: "NoSuchModelXYZ".to_string(),
+            available,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("NoSuchModelXYZ"),
+            "error should name the requested model, got: {msg}"
+        );
+        assert!(
+            msg.contains("DummyFakeSeederModel"),
+            "error should list available registered models, got: {msg}"
+        );
+    }
 
     // ── resolve_profile ────────────────────────────────────────────────────
 

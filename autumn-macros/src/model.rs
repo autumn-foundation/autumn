@@ -4241,6 +4241,15 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
         }
 
+        // ── #1343 AC4: fake-seeder registration ─────────────────────────
+        // Register this model's factory so `autumn seed --count N --model M`
+        // (and any seed binary) can generate faked rows by name, without the
+        // user editing `src/bin/seed.rs`. The forwarding macro expands to an
+        // `inventory::submit!` only when autumn-web is built with the `seed`
+        // feature (which implies `db`, and hence `create_many`); otherwise it
+        // expands to nothing, so models compile unchanged when seeding is off.
+        ::autumn_web::__autumn_register_fake_seeder!(#name, stringify!(#name));
+
         // ── Durable commit-hook codec ───────────────────────────────────
         // Hidden durable commit-hook codec. These methods serialize fields
         // individually so public serde visibility attributes do not drop
