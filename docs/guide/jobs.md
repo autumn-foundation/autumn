@@ -379,11 +379,136 @@ Add the queue to `[jobs] queues` to control its priority.
 
 > **Role-based scaling** — running a separately scaled worker tier that drains
 > all configured queues — is covered in
-> [Web and worker process roles](#web-and-worker-process-roles). Still out of
-> scope (separate follow-ups): per-job-instance dynamic priority at enqueue
-> time, and pinning specific queues to dedicated worker processes / per-queue
-> concurrency pools (#1623). Today a worker process drains all configured
-> queues.
+> [Web and worker process roles](#web-and-worker-process-roles).
+
+## Per-queue worker pools, caps, and pinning
+
+By default every worker process draws from one shared pool of `jobs.workers`
+slots and drains all configured queues. Three config-only knobs (no application
+code changes) let you carve that pool up per queue and dedicate worker processes
+to specific queues.
+
+### Dedicated capacity and per-queue caps
+
+Extend the weighted `[jobs.queues]` table so a queue's value is a table instead
+of a bare weight. Two per-queue controls are available:
+
+- `reserved = N` — **dedicated slots** that no other queue may ever consume. A
+  flood on another queue can never starve this one: `N` of the process's worker
+  slots are always available to it.
+- `concurrency = N` — a **hard cap**: this queue may occupy at most `N` of the
+  process's worker slots at once, so a bulk queue can never take more than its
+  configured share.
+
+```toml
+[jobs]
+workers = 8
+
+[jobs.queues]
+# `critical` keeps 2 slots reserved for it at all times — a slow flood on
+# `bulk` can never delay a password-reset email.
+critical = { weight = 4, reserved = 2 }
+# `bulk` is capped at 4 of the 8 slots, so re-indexing never monopolizes the
+# process.
+bulk = { weight = 1, concurrency = 4 }
+# A bare integer is still just a weight (no cap, no reservation).
+default = 2
+```
+
+The bare-integer form (`critical = 4`) and the strict array form
+(`queues = ["critical", "default", "low"]`) keep working unchanged; a queue with
+neither `reserved` nor `concurrency` behaves exactly as before. Slots are
+accounted **per process**: total capacity is always `jobs.workers`, and the
+reserved/cap rules only redistribute how those slots are shared between queues.
+
+The accounting is enforced on every backend (local, Redis, Postgres): before a
+worker claims a job it restricts itself to the queues that currently have a free
+slot, so a queue at its cap — or whose only free slots are reserved for another
+queue — is skipped rather than blocked behind.
+
+### Pinning a worker tier to a subset of queues
+
+Combine per-queue pools with [process roles](#web-and-worker-process-roles) to
+dedicate an entire worker tier to a subset of queues. Set `jobs.pin` (or the
+`AUTUMN_JOBS__PIN` environment variable, comma-separated) to the queues that
+process should claim:
+
+```toml
+# A worker replica dedicated to latency-sensitive work.
+# `role` is a TOP-LEVEL key (AutumnConfig.role) and must appear before any
+# `[table]` header — equivalently, set `AUTUMN_ROLE=worker` in the environment.
+role = "worker"
+
+[jobs]
+backend = "redis"
+pin = ["critical"]
+```
+
+```bash
+# Same thing via env — handy for a separate deployment of the same image.
+AUTUMN_JOBS__PIN=bulk,default
+```
+
+A pinned process **never** claims jobs from queues outside its subset, on both
+the Postgres and Redis backends. Weighted/strict ordering is preserved *within*
+the pinned subset. An empty/unset `pin` (the default) keeps today's behavior:
+the process drains every configured queue from the single shared pool.
+
+### Zero-coverage guard
+
+If pinning leaves a configured queue with **no** worker coverage anywhere —
+e.g. you pin every worker to `critical` but still enqueue to `bulk` — those jobs
+would silently accumulate. Autumn diagnoses this loudly:
+
+The **runtime startup warning is the authoritative check**: a worker process
+that pins to a subset logs a `WARN` at startup naming the configured queues it
+does not cover (and an `ERROR` if the pin matches no queue on its effective
+schedule at all, so the process would claim nothing). This runs *inside the
+app*, against the job registry and the real effective schedule, so it knows both
+the `[jobs.queues]` config **and** any queues declared solely via
+`#[job(queue = "…")]` — and diagnoses a genuinely uncovered queue loudly at
+boot.
+
+`autumn doctor --strict` **does not fail** on queue coverage — it reports
+coverage **informationally** (a `jobs_queue_coverage` line that always passes).
+It prints what the pinned tier claims, which configured queues it does not
+claim, and any pinned queues absent from `[jobs.queues]`. Why it can only
+report, not enforce: doctor is **config-only and per-process**. It sees only
+**one** process, so it cannot know what sibling worker tiers drain — a multi-tier
+deployment where each pinned tier omits queues covered by other tiers (one
+process `AUTUMN_JOBS__PIN=critical`, another `AUTUMN_JOBS__PIN=bulk,default`) is
+legitimate. And it inspects only `[jobs.queues]` (plus the implicit `default`
+queue), so it cannot see a queue declared solely via `#[job(queue = "…")]`,
+which the runtime appends to the effective schedule and drains. Any hard-fail
+doctor asserted on coverage would therefore false-positive on a valid
+deployment, which is exactly why enforcement lives in the runtime warning above.
+
+Ensuring every queue is drained by some tier remains the operator's
+responsibility: make sure some process (an unpinned worker tier, or one pinned
+to those queues) covers every queue you enqueue to.
+
+### Observability
+
+The actuator jobs endpoint (`<actuator-prefix>/jobs`) reports per-queue queue
+depth and the age of the oldest still-waiting job under a `queues` key, in
+addition to the existing per-job-type gauges under `jobs`:
+
+```json
+{
+  "jobs": { "send_password_reset": { "queued": 0, "in_flight": 1, "...": 0 } },
+  "queues": { "critical": { "depth": 3, "oldest_waiting_age_ms": 1200 } }
+}
+```
+
+On durable backends (Postgres/Redis) with multiple processes, these per-queue
+gauges — like the existing per-job-type gauges — reflect enqueue/start events
+observed in the local process, so an enqueue-only `web` replica shows work it
+doesn't drain; treat them as per-process approximations. Authoritative
+cluster-wide queue depth is tracked as future work (composes with the metrics
+in #1378).
+
+> Still out of scope (separate follow-up): per-job-instance dynamic priority at
+> enqueue time.
 
 ## Uniqueness and concurrency limits
 

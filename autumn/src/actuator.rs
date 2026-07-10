@@ -737,10 +737,44 @@ impl JobStatus {
     }
 }
 
+/// Per-queue observability gauges for the actuator jobs endpoint (issue #1623,
+/// AC7): approximate queue depth and the age of the oldest still-waiting job.
+///
+/// Like the per-job [`JobStatus`] gauges, these reflect enqueue/start events
+/// observed **in this process**; on the durable backends a queue also drained
+/// by other replicas reads as this replica's share of the traffic.
+#[derive(Debug, Clone, Serialize)]
+pub struct QueueStatus {
+    /// Approximate jobs waiting to run on this queue.
+    pub depth: u64,
+    /// Age in milliseconds of the oldest still-waiting job on this queue
+    /// (`0` when the queue is empty).
+    pub oldest_waiting_age_ms: u64,
+}
+
+/// Per-queue depth/age bookkeeping backing [`QueueStatus`].
+#[derive(Default)]
+struct QueueGaugeState {
+    /// Job name → the queue it drains from.
+    name_to_queue: HashMap<String, String>,
+    /// Queue → ready-at timestamps (epoch ms) of jobs still waiting to start.
+    /// A mark whose ready-at is in the future belongs to a scheduled (delayed)
+    /// job that is not yet claimable, so it is excluded from ready depth/age
+    /// until its ready-at time passes.
+    waiting: HashMap<String, std::collections::VecDeque<u64>>,
+}
+
+fn now_epoch_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+}
+
 /// Registry of ad-hoc jobs and their runtime status.
 #[derive(Clone)]
 pub struct JobRegistry {
     inner: Arc<RwLock<HashMap<String, JobStatus>>>,
+    queues: Arc<RwLock<QueueGaugeState>>,
 }
 
 impl JobRegistry {
@@ -749,6 +783,7 @@ impl JobRegistry {
     pub fn new() -> Self {
         Self {
             inner: Arc::new(RwLock::new(HashMap::new())),
+            queues: Arc::new(RwLock::new(QueueGaugeState::default())),
         }
     }
 
@@ -759,11 +794,92 @@ impl JobRegistry {
         }
     }
 
-    /// Record that a new job instance was enqueued.
+    /// Register a job name and the queue it drains from, so per-queue depth and
+    /// oldest-waiting-age gauges (AC7) can be attributed to the right queue.
+    pub fn register_on_queue(&self, name: &str, queue: &str) {
+        self.register(name);
+        if let Ok(mut guard) = self.queues.write() {
+            guard
+                .name_to_queue
+                .insert(name.to_string(), queue.to_string());
+            guard.waiting.entry(queue.to_string()).or_default();
+        }
+    }
+
+    /// The queue a job name drains from (defaults to `default`).
+    fn queue_for(&self, name: &str) -> String {
+        self.queues
+            .read()
+            .ok()
+            .and_then(|g| g.name_to_queue.get(name).cloned())
+            .unwrap_or_else(|| "default".to_string())
+    }
+
+    /// Snapshot per-queue depth and oldest-waiting-job age.
+    #[must_use]
+    pub fn queue_snapshot(&self) -> HashMap<String, QueueStatus> {
+        let now = now_epoch_ms();
+        self.queues
+            .read()
+            .map(|g| {
+                g.waiting
+                    .iter()
+                    .map(|(queue, waiting)| {
+                        // Count only marks whose ready-at time has arrived; a
+                        // future ready-at is a scheduled job that is not yet
+                        // claimable and must not read as ready backlog.
+                        let mut depth = 0u64;
+                        let mut oldest_ready_at: Option<u64> = None;
+                        for ready_at in waiting {
+                            if *ready_at <= now {
+                                depth += 1;
+                                oldest_ready_at =
+                                    Some(oldest_ready_at.map_or(*ready_at, |o| o.min(*ready_at)));
+                            }
+                        }
+                        let oldest_waiting_age_ms =
+                            oldest_ready_at.map_or(0, |ts| now.saturating_sub(ts));
+                        (
+                            queue.clone(),
+                            QueueStatus {
+                                depth,
+                                oldest_waiting_age_ms,
+                            },
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Record that a new job instance was enqueued and is immediately runnable.
     pub fn record_enqueue(&self, name: &str) {
+        self.record_enqueue_at(name, now_epoch_ms());
+    }
+
+    /// Record a delayed enqueue whose job only becomes claimable at
+    /// `ready_at_ms` (epoch ms). Until that instant the job is tracked as
+    /// scheduled rather than ready queue depth, so future-dated jobs enqueued
+    /// via `enqueue_in`/`enqueue_at` do not inflate `queues.<name>.depth` or
+    /// `oldest_waiting_age_ms` (which would fire false backlog alerts).
+    pub fn record_enqueue_scheduled(&self, name: &str, ready_at_ms: u64) {
+        self.record_enqueue_at(name, ready_at_ms);
+    }
+
+    /// Shared enqueue bookkeeping: bump the per-name `queued` counter and push a
+    /// per-queue waiting mark stamped with the job's ready-at time.
+    fn record_enqueue_at(&self, name: &str, ready_at_ms: u64) {
         if let Ok(mut guard) = self.inner.write() {
             let status = guard.entry(name.to_string()).or_insert(JobStatus::empty());
             status.queued = status.queued.saturating_add(1);
+        }
+        let queue = self.queue_for(name);
+        if let Ok(mut guard) = self.queues.write() {
+            guard
+                .waiting
+                .entry(queue)
+                .or_default()
+                .push_back(ready_at_ms);
         }
     }
 
@@ -771,13 +887,36 @@ impl JobRegistry {
     ///
     /// Reverses the `record_enqueue` bookkeeping for the coalesced instance
     /// and bumps the deduplication counter.
-    pub fn record_deduplicated(&self, name: &str) {
+    ///
+    /// `had_enqueue_mark` says whether this coalesced job previously pushed a
+    /// per-queue waiting mark (via `record_enqueue`/`record_enqueue_scheduled`).
+    /// Only then is a mark popped: retry-dedup paths coalesce a job that already
+    /// left the ready set at start time and never re-recorded an enqueue, so
+    /// popping there would steal a *different* waiting job's mark and under-report
+    /// that queue's depth. Every pop must correspond to a prior push.
+    ///
+    /// `was_scheduled` says which category the coalesced enqueue recorded: a
+    /// delayed enqueue (`record_enqueue_scheduled`, future ready-at) pushed a
+    /// *scheduled* mark, an immediate one (`record_enqueue`) a *ready* mark. The
+    /// removal must target that same category — otherwise a delayed duplicate's
+    /// dedup could pop a co-queued *ready* job's mark, reporting queue depth 0
+    /// while ready work is still waiting (and vice versa). Mirrors the
+    /// category-aware cancel path (`record_cancel`/`record_cancel_scheduled`).
+    /// Ignored when `had_enqueue_mark` is false (no mark is popped).
+    pub fn record_deduplicated(&self, name: &str, had_enqueue_mark: bool, was_scheduled: bool) {
         if let Ok(mut guard) = self.inner.write()
             && let Some(status) = guard.get_mut(name)
         {
             status.queued = status.queued.saturating_sub(1);
             status.total_deduplicated = status.total_deduplicated.saturating_add(1);
         }
+        if !had_enqueue_mark {
+            return;
+        }
+        // The coalesced enqueue never runs; drop its waiting mark from the SAME
+        // ready/scheduled category it recorded (prefer_ready = !was_scheduled),
+        // so it cannot steal a co-queued mark from the other category.
+        self.pop_waiting(name, !was_scheduled);
     }
 
     /// Record that a job is parked waiting on a free concurrency slot.
@@ -819,6 +958,7 @@ impl JobRegistry {
             status.queued = status.queued.saturating_sub(1);
             status.in_flight = status.in_flight.saturating_add(1);
         }
+        self.pop_waiting(name, true);
     }
 
     /// Record that a queued job was canceled before execution.
@@ -827,6 +967,44 @@ impl JobRegistry {
             && let Some(status) = guard.get_mut(name)
         {
             status.queued = status.queued.saturating_sub(1);
+        }
+        self.pop_waiting(name, true);
+    }
+
+    /// Record that a scheduled (delayed) job was canceled before its ready time.
+    ///
+    /// Unlike [`Self::record_cancel`], this removes a *scheduled* waiting mark
+    /// (ready-at still in the future) so canceling a not-yet-runnable job does
+    /// not consume a ready job's mark and under-report queue depth.
+    pub fn record_cancel_scheduled(&self, name: &str) {
+        if let Ok(mut guard) = self.inner.write()
+            && let Some(status) = guard.get_mut(name)
+        {
+            status.queued = status.queued.saturating_sub(1);
+        }
+        self.pop_waiting(name, false);
+    }
+
+    /// Drop one waiting mark for this job's queue (its wait is over).
+    ///
+    /// `prefer_ready` picks which mark to remove when the queue holds a mix of
+    /// ready and still-scheduled marks: a starting/canceled ready job removes an
+    /// already-claimable mark, while a canceled scheduled job removes a future
+    /// one. If no mark in the preferred category exists we fall back to the
+    /// oldest mark so every enqueue still has a matching removal (no leak).
+    fn pop_waiting(&self, name: &str, prefer_ready: bool) {
+        let queue = self.queue_for(name);
+        let now = now_epoch_ms();
+        if let Ok(mut guard) = self.queues.write()
+            && let Some(waiting) = guard.waiting.get_mut(&queue)
+        {
+            let idx = waiting
+                .iter()
+                .position(|ready_at| (*ready_at <= now) == prefer_ready)
+                .or(if waiting.is_empty() { None } else { Some(0) });
+            if let Some(idx) = idx {
+                waiting.remove(idx);
+            }
         }
     }
 
@@ -2892,7 +3070,8 @@ pub(crate) async fn jobs_endpoint<S: ProvideActuatorState + Send + Sync + 'stati
     State(state): State<S>,
 ) -> Json<serde_json::Value> {
     let jobs = state.job_registry().snapshot();
-    Json(serde_json::json!({ "jobs": jobs }))
+    let queues = state.job_registry().queue_snapshot();
+    Json(serde_json::json!({ "jobs": jobs, "queues": queues }))
 }
 
 #[cfg(feature = "http-client")]
@@ -3522,6 +3701,270 @@ mod tests {
         let snap8 = registry2.snapshot();
         assert!(snap8.is_empty());
     }
+
+    #[test]
+    fn job_registry_tracks_per_queue_depth_and_oldest_age() {
+        let registry = JobRegistry::new();
+        registry.register_on_queue("reset_email", "critical");
+        registry.register_on_queue("reindex", "bulk");
+
+        // Enqueue two on `critical`, one on `bulk`.
+        registry.record_enqueue("reset_email");
+        registry.record_enqueue("reset_email");
+        registry.record_enqueue("reindex");
+
+        let queues = registry.queue_snapshot();
+        assert_eq!(queues.get("critical").unwrap().depth, 2);
+        assert_eq!(queues.get("bulk").unwrap().depth, 1);
+        // After a real (small) interval, the oldest waiting job's age is
+        // strictly positive — the snapshot measures elapsed wait time.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        assert!(
+            registry
+                .queue_snapshot()
+                .get("critical")
+                .unwrap()
+                .oldest_waiting_age_ms
+                > 0,
+            "a job waiting for ~5ms must report a positive age"
+        );
+
+        // Starting a critical job drops the queue depth.
+        registry.record_start("reset_email");
+        assert_eq!(registry.queue_snapshot().get("critical").unwrap().depth, 1);
+
+        // Draining everything leaves depth 0 and age 0.
+        registry.record_start("reset_email");
+        registry.record_start("reindex");
+        let drained = registry.queue_snapshot();
+        assert_eq!(drained.get("critical").unwrap().depth, 0);
+        assert_eq!(drained.get("critical").unwrap().oldest_waiting_age_ms, 0);
+        assert_eq!(drained.get("bulk").unwrap().depth, 0);
+    }
+
+    #[test]
+    fn future_scheduled_jobs_do_not_inflate_ready_queue_depth() {
+        let registry = JobRegistry::new();
+        registry.register_on_queue("nightly_report", "reports");
+        registry.register_on_queue("send_email", "reports");
+
+        // A job scheduled for the future is not yet claimable, so it must not
+        // count toward ready queue depth or age the queue: future-dated jobs
+        // enqueued via enqueue_in/enqueue_at were reporting phantom backlog and
+        // could trip false autoscaling/alerting on /actuator/jobs.
+        let far_future = now_epoch_ms() + 60_000;
+        registry.record_enqueue_scheduled("nightly_report", far_future);
+
+        let scheduled_only = registry.queue_snapshot();
+        let reports = scheduled_only
+            .get("reports")
+            .expect("reports queue tracked");
+        assert_eq!(
+            reports.depth, 0,
+            "a future-scheduled job is not ready backlog"
+        );
+        assert_eq!(
+            reports.oldest_waiting_age_ms, 0,
+            "a future-scheduled job must not age the ready queue"
+        );
+
+        // A due-now enqueue on the same queue still counts immediately.
+        registry.record_enqueue("send_email");
+        assert_eq!(
+            registry.queue_snapshot().get("reports").unwrap().depth,
+            1,
+            "an immediately-runnable job still counts toward ready depth"
+        );
+
+        // Once a scheduled job's ready time has passed it joins ready depth and
+        // contributes to oldest-waiting age.
+        let already_ready = now_epoch_ms().saturating_sub(5);
+        registry.record_enqueue_scheduled("nightly_report", already_ready);
+        let promoted = registry.queue_snapshot();
+        assert_eq!(
+            promoted.get("reports").unwrap().depth,
+            2,
+            "a scheduled job counts once its ready time has passed"
+        );
+        assert!(
+            promoted.get("reports").unwrap().oldest_waiting_age_ms > 0,
+            "a job whose ready time has passed contributes to oldest-waiting age"
+        );
+
+        // Starting the two ready jobs leaves only the still-future scheduled
+        // mark, which reports as no ready backlog.
+        registry.record_start("send_email");
+        registry.record_start("nightly_report");
+        let drained = registry.queue_snapshot();
+        assert_eq!(
+            drained.get("reports").unwrap().depth,
+            0,
+            "with both ready jobs started only the future mark remains, counting as 0"
+        );
+        assert_eq!(
+            drained.get("reports").unwrap().oldest_waiting_age_ms,
+            0,
+            "a lone future-scheduled mark ages nothing"
+        );
+    }
+
+    #[test]
+    fn canceling_a_scheduled_job_preserves_a_coqueued_ready_mark() {
+        // Reproduces the durable admin-cancel gap: when an operator cancels a
+        // still-scheduled (delayed) job that shares a queue with a ready job,
+        // the cancel must remove the *scheduled* waiting mark, not the ready
+        // one. Popping the ready mark (via the ready removal path) would report
+        // the queue depth one too low while the ready job is still waiting.
+        let registry = JobRegistry::new();
+        registry.register_on_queue("nightly_report", "reports");
+        registry.register_on_queue("send_email", "reports");
+
+        // One ready job and one future-scheduled job share the queue; only the
+        // ready job counts toward ready depth.
+        registry.record_enqueue("send_email");
+        let far_future = now_epoch_ms() + 60_000;
+        registry.record_enqueue_scheduled("nightly_report", far_future);
+        assert_eq!(
+            registry.queue_snapshot().get("reports").unwrap().depth,
+            1,
+            "only the ready job counts toward ready depth"
+        );
+
+        // Cancel the scheduled job (the durable backend signals this because it
+        // removed the job from its delayed set). The scheduled removal path must
+        // consume the future mark and leave the ready job's mark intact.
+        registry.record_cancel_scheduled("nightly_report");
+        assert_eq!(
+            registry.queue_snapshot().get("reports").unwrap().depth,
+            1,
+            "canceling the scheduled job must not steal the co-queued ready job's mark"
+        );
+
+        // The surviving ready job still drains to zero — exactly one mark left,
+        // so no scheduled mark leaked.
+        registry.record_start("send_email");
+        assert_eq!(
+            registry.queue_snapshot().get("reports").unwrap().depth,
+            0,
+            "starting the ready job drains the queue; the scheduled mark was the one removed"
+        );
+    }
+
+    #[test]
+    fn canceling_a_ready_job_removes_a_ready_mark() {
+        // No-regression companion: canceling a ready (immediately-runnable) job
+        // removes a ready mark, so the queue depth drops by exactly one.
+        let registry = JobRegistry::new();
+        registry.register_on_queue("send_email", "mail");
+
+        registry.record_enqueue("send_email");
+        registry.record_enqueue("send_email");
+        assert_eq!(registry.queue_snapshot().get("mail").unwrap().depth, 2);
+
+        registry.record_cancel("send_email");
+        assert_eq!(
+            registry.queue_snapshot().get("mail").unwrap().depth,
+            1,
+            "canceling a ready job removes exactly one ready mark"
+        );
+
+        registry.record_start("send_email");
+        assert_eq!(registry.queue_snapshot().get("mail").unwrap().depth, 0);
+    }
+
+    #[test]
+    fn retry_dedup_without_enqueue_mark_keeps_real_duplicate_waiting() {
+        let registry = JobRegistry::new();
+        registry.register_on_queue("send_email", "mail");
+
+        // A real duplicate is enqueued and waiting: its per-queue mark is present.
+        registry.record_enqueue("send_email");
+        assert_eq!(registry.queue_snapshot().get("mail").unwrap().depth, 1);
+
+        // A retry that failed and coalesced into that duplicate never re-recorded
+        // an enqueue mark, so its dedup must NOT pop the real duplicate's waiting
+        // mark (doing so would report depth 0 while work is still waiting).
+        registry.record_deduplicated("send_email", false, false);
+        assert_eq!(
+            registry.queue_snapshot().get("mail").unwrap().depth,
+            1,
+            "retry-dedup with no prior enqueue mark must not steal a waiting duplicate's mark"
+        );
+
+        // A normal enqueue→dedup pair (the coalesced job DID record an enqueue
+        // mark) still nets to zero: its own mark is removed, no leak.
+        registry.record_enqueue("send_email");
+        assert_eq!(registry.queue_snapshot().get("mail").unwrap().depth, 2);
+        registry.record_deduplicated("send_email", true, false);
+        assert_eq!(
+            registry.queue_snapshot().get("mail").unwrap().depth,
+            1,
+            "a normal coalesced enqueue removes exactly its own mark (no leak)"
+        );
+
+        // The surviving real duplicate still drains normally.
+        registry.record_start("send_email");
+        assert_eq!(registry.queue_snapshot().get("mail").unwrap().depth, 0);
+    }
+
+    #[test]
+    fn deduplicating_a_scheduled_duplicate_preserves_a_coqueued_ready_mark() {
+        // Reproduces the dedup category gap (sibling of the #965 cancel fix):
+        // when a delayed (scheduled) duplicate coalesces on a queue that also
+        // holds a ready job, the dedup must remove the *scheduled* waiting mark,
+        // not the ready one. The failing order is "delayed duplicate enqueued
+        // first, ready job second": the old unconditional `pop_back` removed the
+        // most-recent (ready) mark, reporting ready depth 0 while ready work was
+        // still waiting.
+        let registry = JobRegistry::new();
+        registry.register_on_queue("nightly_report", "reports");
+        registry.register_on_queue("send_email", "reports");
+
+        // The delayed duplicate records a future (scheduled) mark FIRST...
+        let far_future = now_epoch_ms() + 60_000;
+        registry.record_enqueue_scheduled("nightly_report", far_future);
+        // ...then a ready job enqueues on the same queue (its mark is the most
+        // recent). Recorded a few ms in the past so it deterministically ages.
+        let already_ready = now_epoch_ms().saturating_sub(5);
+        registry.record_enqueue_scheduled("send_email", already_ready);
+
+        let before = registry.queue_snapshot();
+        assert_eq!(
+            before.get("reports").unwrap().depth,
+            1,
+            "only the ready job counts toward ready depth"
+        );
+        assert!(
+            before.get("reports").unwrap().oldest_waiting_age_ms > 0,
+            "the ready job ages the queue before the dedup"
+        );
+
+        // The delayed duplicate coalesces: it recorded a scheduled enqueue mark
+        // (had_enqueue_mark = true, was_scheduled = true), so the removal must
+        // consume the future mark and leave the ready job's mark intact. Under
+        // the old `pop_back` this stole the ready mark (depth 0) — the RED case.
+        registry.record_deduplicated("nightly_report", true, true);
+        let after = registry.queue_snapshot();
+        assert_eq!(
+            after.get("reports").unwrap().depth,
+            1,
+            "deduplicating the scheduled duplicate must not steal the ready job's mark"
+        );
+        assert!(
+            after.get("reports").unwrap().oldest_waiting_age_ms > 0,
+            "the ready job's mark is preserved, so it still ages the queue"
+        );
+
+        // The surviving ready job drains to zero — exactly one mark remained, so
+        // the scheduled mark was the one removed (no leak).
+        registry.record_start("send_email");
+        assert_eq!(
+            registry.queue_snapshot().get("reports").unwrap().depth,
+            0,
+            "starting the ready job drains the queue; the scheduled mark was removed"
+        );
+    }
+
     use axum::body::Body;
     use axum::http::Request;
     use tower::ServiceExt;

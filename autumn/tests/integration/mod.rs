@@ -138,6 +138,8 @@ mod problem_details;
 #[cfg(feature = "redis")]
 mod process_role_worker_gating;
 mod query_count_asserts;
+#[cfg(feature = "redis")]
+mod queue_dedicated_capacity;
 mod range;
 mod rate_limit_pipeline;
 mod rate_limit_principal;

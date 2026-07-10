@@ -1439,6 +1439,114 @@ fn check_split_topology_on_local(role: ProcessRole, jobs_backend: &str) -> Check
     }
 }
 
+/// Queue-pinning coverage report (issue #1623, AC6). When `jobs.pin` is set,
+/// each process only claims jobs from the pinned queues. This check is
+/// **INFORMATIONAL-ONLY**: it always returns [`CheckStatus::Pass`] and never
+/// Warns or Fails, so `--strict` can never promote it. A config-only,
+/// per-process `doctor` CLI structurally cannot soundly hard-fail on coverage —
+/// it can't see sibling worker tiers (a valid multi-tier subset pin) and can't
+/// see `#[job(queue = "…")]`-declared queues (which the runtime appends to the
+/// effective schedule and drains), so any hard-fail it asserts false-positives
+/// on valid deployments. The authoritative zero-coverage guard is instead the
+/// runtime startup warning (`warn_pinned_uncovered_queues` in
+/// `autumn/src/job.rs`), which has the job registry and the real effective
+/// schedule. This check only reports, for operator awareness, what this process
+/// claims and which queues it does not.
+///
+/// Gated on the resolved [`ProcessRole`]: a web-only role
+/// ([`runs_workers`](ProcessRole::runs_workers) `== false`) runs zero job
+/// workers, so queue-pinning coverage is irrelevant to it — it passes with a
+/// not-applicable note and never evaluates the pin.
+fn check_queue_coverage(
+    role: ProcessRole,
+    configured_queues: &[String],
+    pin: &[String],
+) -> CheckResult {
+    // Web-only role: runs no job workers at all, so queue pinning cannot leave a
+    // queue uncovered *in this process* — the check is not applicable. Do not
+    // evaluate pin/empty-schedule; this must never fail `--strict`.
+    if !role.runs_workers() {
+        return CheckResult {
+            name: "jobs_queue_coverage",
+            status: CheckStatus::Pass,
+            detail: Some(
+                "web-only role runs no job workers; queue pinning not applicable".to_string(),
+            ),
+            hint: None,
+        };
+    }
+
+    // Unpinned (empty/absent pin): the process drains every configured queue.
+    if pin.is_empty() {
+        return CheckResult {
+            name: "jobs_queue_coverage",
+            status: CheckStatus::Pass,
+            detail: Some("no jobs.pin; drains all configured queues".to_string()),
+            hint: None,
+        };
+    }
+
+    let known: std::collections::HashSet<&str> =
+        configured_queues.iter().map(String::as_str).collect();
+    let pinned: std::collections::HashSet<&str> = pin.iter().map(String::as_str).collect();
+
+    // INFORMATIONAL-ONLY. A config-only, per-process `doctor` run structurally
+    // cannot soundly hard-fail on queue coverage, so this check NEVER returns
+    // Warn/Fail (and `--strict` can never promote it):
+    //   * It sees only ONE process and cannot know what sibling worker tiers
+    //     drain, so a subset pin may be a valid multi-tier deployment.
+    //   * It reads only `[jobs.queues]` and cannot see `#[job(queue = "…")]`-
+    //     declared queues, which the runtime appends to the effective schedule
+    //     and drains — so a pin to a queue absent from `[jobs.queues]` is not
+    //     necessarily an empty schedule.
+    // The authoritative zero-coverage guard is the runtime startup warning
+    // (`warn_pinned_uncovered_queues` in autumn/src/job.rs), which has the job
+    // registry and the real effective schedule. Here we only report, for
+    // operator awareness: (a) configured queues this pin does not claim, and
+    // (b) pinned queues absent from `[jobs.queues]` (possibly job-declared).
+    let unclaimed: Vec<&str> = configured_queues
+        .iter()
+        .map(String::as_str)
+        .filter(|q| !pinned.contains(q))
+        .collect();
+    let unknown_pinned: Vec<&str> = pin
+        .iter()
+        .map(String::as_str)
+        .filter(|q| !known.contains(q))
+        .collect();
+
+    let mut parts: Vec<String> = Vec::new();
+    if unclaimed.is_empty() {
+        parts.push(format!(
+            "jobs.pin={pin:?} claims every configured queue {configured_queues:?}"
+        ));
+    } else {
+        parts.push(format!(
+            "jobs.pin={pin:?} does not claim configured queue(s): {} — ensure another \
+             worker tier covers them (doctor sees only this process and cannot verify \
+             topology-wide coverage)",
+            unclaimed.join(", ")
+        ));
+    }
+    if !unknown_pinned.is_empty() {
+        parts.push(format!(
+            "pinned queue(s) not in [jobs.queues]: {} — these may be #[job(queue = \"…\")]-\
+             declared queues that the runtime drains (doctor is config-only and cannot verify)",
+            unknown_pinned.join(", ")
+        ));
+    }
+    parts.push(
+        "informational only: the runtime startup warning is the authoritative queue-coverage check"
+            .to_string(),
+    );
+    CheckResult {
+        name: "jobs_queue_coverage",
+        status: CheckStatus::Pass,
+        detail: Some(parts.join("; ")),
+        hint: None,
+    }
+}
+
 fn check_replica_migration_versions(
     primary_latest: Option<&str>,
     replica_latest: Option<&str>,
@@ -2238,6 +2346,79 @@ where
     (role, backend)
 }
 
+/// Resolve the configured queue names and the effective `jobs.pin` for the
+/// zero-coverage guard (#1623). `jobs.queues` may be a TOML array (strict) or a
+/// `name = weight|table` map (weighted); either way we only need the names.
+/// `AUTUMN_JOBS__PIN` (comma-separated) overrides the TOML `jobs.pin` array,
+/// mirroring the runtime env override.
+fn resolve_queues_and_pin(table: Option<&toml::Table>) -> (Vec<String>, Vec<String>) {
+    // Do NOT drop empty env values here: a *present but empty* `AUTUMN_JOBS__PIN`
+    // is an explicit override that clears the pin (see the pin-resolution logic
+    // below and #2290). `std::env::var(key).ok()` returns `Some("")` for a
+    // present-but-empty var and `None` for an absent one, mirroring the
+    // runtime's `if let Ok(val) = env.var(...)` presence check.
+    resolve_queues_and_pin_from_sources(|key| std::env::var(key).ok(), table)
+}
+
+fn resolve_queues_and_pin_from_sources<F>(
+    env_var: F,
+    table: Option<&toml::Table>,
+) -> (Vec<String>, Vec<String>)
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let jobs = table
+        .and_then(|t| t.get("jobs"))
+        .and_then(toml::Value::as_table);
+
+    let mut queues =
+        jobs.and_then(|j| j.get("queues"))
+            .map_or_else(Vec::new, |value| match value {
+                toml::Value::Array(items) => items
+                    .iter()
+                    .filter_map(toml::Value::as_str)
+                    .map(str::to_owned)
+                    .collect(),
+                toml::Value::Table(map) => map.keys().cloned().collect(),
+                _ => Vec::new(),
+            });
+    // When `[jobs.queues]` is omitted the runtime still creates the implicit
+    // `default` queue (`JobQueuesConfig::default()` == a single `"default"`
+    // queue). Mirror that here so the coverage check can flag `default` as
+    // uncovered when a zero-config app is pinned to some other queue — instead
+    // of seeing no configured queues and silently passing (#1623).
+    if queues.is_empty() {
+        queues.push("default".to_owned());
+    }
+
+    // A PRESENT `AUTUMN_JOBS__PIN` (even empty) is an explicit override, matching
+    // the runtime's `apply_jobs_env_overrides_with_env`: it does
+    // `if let Ok(val) = env.var("AUTUMN_JOBS__PIN") { self.jobs.pin = val.split(',')…filter(non-empty)… }`,
+    // so an empty string clears the pin entirely (the process becomes unpinned
+    // and drains every queue). Only when the env var is *absent* do we fall back
+    // to the TOML `jobs.pin` (#2290).
+    let toml_pin = || {
+        jobs.and_then(|j| j.get("pin"))
+            .and_then(toml::Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(toml::Value::as_str)
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let pin = env_var("AUTUMN_JOBS__PIN").map_or_else(toml_pin, |csv| {
+        csv.split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .collect()
+    });
+
+    (queues, pin)
+}
+
 fn first_env<F>(env_var: &F, keys: &[&str]) -> Option<String>
 where
     F: Fn(&str) -> Option<String>,
@@ -2663,6 +2844,30 @@ pub fn run(opts: DoctorOptions) {
     // in-process `local` job queue across separate processes.
     tasks.push(Box::new(move || {
         check_split_topology_on_local(process_role, &jobs_backend)
+    }));
+
+    // 4c. Queue pinning zero-coverage guard (#1623): warn if jobs.pin leaves a
+    // configured queue with no worker coverage anywhere in the topology. Build
+    // from the merged active-profile table (base autumn.toml + [profile.<env>]
+    // + autumn-<env>.toml) exactly like the runtime config loader — and like the
+    // sibling profile-aware doctor checks (proxy conflict, mail unsubscribe) —
+    // so profile-specific `jobs.queues` / `jobs.pin` layers are honored instead
+    // of only the top-level `[jobs]` section.
+    let (queue_canonical, queue_selected, _) = resolve_active_profiles();
+    let merged_jobs_toml = get_merged_toml_table_runtime(&queue_canonical, &queue_selected);
+    let (configured_queues, jobs_pin) = resolve_queues_and_pin(Some(&merged_jobs_toml));
+    // Resolve the process role for THIS check from the SAME merged active-profile
+    // table the queues/pin come from — not the raw top-level `toml_table` that
+    // feeds `process_role` above. A `role` set only under `[profile.<env>]` /
+    // `autumn-<env>.toml` (e.g. a web replica in prod) is invisible to the raw
+    // table, so the raw-table role would resolve to `Combined`, the web-role
+    // skip-gate would never fire, and `doctor --strict` could wrongly warn/fail
+    // on queue coverage for a process that runs no job workers. Precedence
+    // mirrors the runtime exactly (`AUTUMN_ROLE` env > merged-table `role` >
+    // `Combined`), reusing the shared resolver on the merged table.
+    let (queue_coverage_role, _) = resolve_process_role_and_backend(Some(&merged_jobs_toml));
+    tasks.push(Box::new(move || {
+        check_queue_coverage(queue_coverage_role, &configured_queues, &jobs_pin)
     }));
 
     if let Some(url) = db_topology.primary_url.clone() {
@@ -4932,6 +5137,453 @@ foo = "bar"
         let (role, backend) = resolve_process_role_and_backend_from_sources(|_| None, None);
         assert_eq!(role, ProcessRole::Combined);
         assert_eq!(backend, "local");
+    }
+
+    #[test]
+    fn queue_coverage_passes_when_pin_unset() {
+        let result = check_queue_coverage(
+            ProcessRole::Combined,
+            &["critical".into(), "low".into()],
+            &[],
+        );
+        assert_eq!(result.status, CheckStatus::Pass);
+    }
+
+    #[test]
+    fn queue_coverage_passes_when_pin_covers_all_queues() {
+        let queues = vec!["critical".to_string(), "low".to_string()];
+        let pin = vec!["critical".to_string(), "low".to_string()];
+        assert_eq!(
+            check_queue_coverage(ProcessRole::Combined, &queues, &pin).status,
+            CheckStatus::Pass
+        );
+    }
+
+    #[test]
+    fn queue_coverage_passes_for_valid_subset_pin() {
+        // REVISED for the queue-coverage redesign (#1461): a subset pin that
+        // still claims at least one known queue is a legitimate multi-tier
+        // deployment, not a failure. It passes and reports the unclaimed queues
+        // as informational detail (must NOT fail `--strict`).
+        let queues = vec!["critical".to_string(), "low".to_string()];
+        let pin = vec!["critical".to_string()];
+        let result = check_queue_coverage(ProcessRole::Combined, &queues, &pin);
+        assert_eq!(result.status, CheckStatus::Pass);
+        assert!(result.detail.unwrap().contains("low"));
+    }
+
+    #[test]
+    fn queue_coverage_passes_for_web_role_even_with_failing_pin() {
+        // A web-only replica (`AUTUMN_ROLE=web` / `role = "web"`) runs ZERO job
+        // workers, so queue-pinning coverage is irrelevant to it: doctor must not
+        // fail `--strict` on queue coverage for a web tier. Use a pin that would
+        // otherwise Warn on a worker-bearing role — an empty effective schedule
+        // (pin references only unknown queues). The gate on
+        // `ProcessRole::runs_workers()` makes the web role Pass regardless.
+        let queues = vec!["default".to_string()];
+        let pin = vec!["critical".to_string()]; // matches no known queue → would Warn on a worker
+
+        // Web role: coverage is not applicable → Pass, and `--strict` stays green.
+        let web = check_queue_coverage(ProcessRole::Web, &queues, &pin);
+        assert_eq!(web.status, CheckStatus::Pass);
+        assert!(
+            web.detail
+                .as_deref()
+                .unwrap_or_default()
+                .contains("web-only role"),
+            "web-role detail should explain the check is not applicable: {:?}",
+            web.detail
+        );
+        let web_summary = Summary {
+            passed: 1,
+            warned: 0,
+            failed: 0,
+        };
+        assert_eq!(exit_code(&web_summary, true), 0);
+
+        // Sanity: the SAME pin on a worker-bearing role is now INFORMATIONAL-ONLY
+        // — it Passes and never fails `--strict`. doctor is config-only and
+        // per-process, so it cannot prove a genuine zero-coverage gap; the
+        // authoritative check is the runtime startup warning.
+        let worker = check_queue_coverage(ProcessRole::Worker, &queues, &pin);
+        assert_eq!(worker.status, CheckStatus::Pass);
+        let worker_summary = Summary {
+            passed: 1,
+            warned: 0,
+            failed: 0,
+        };
+        assert_eq!(exit_code(&worker_summary, true), 0);
+
+        // Combined behaves like Worker here (also runs workers).
+        assert_eq!(
+            check_queue_coverage(ProcessRole::Combined, &queues, &pin).status,
+            CheckStatus::Pass
+        );
+    }
+
+    #[test]
+    fn resolve_queues_zero_config_uses_implicit_default_queue() {
+        // No `[jobs.queues]`: the runtime still creates the implicit `default`
+        // queue, so doctor must resolve it too (#1623).
+        let table: toml::Table = toml::from_str("[jobs]\npin = [\"critical\"]\n").expect("parse");
+        let (queues, pin) = resolve_queues_and_pin_from_sources(|_| None, Some(&table));
+        assert_eq!(queues, vec!["default"]);
+        assert_eq!(pin, vec!["critical"]);
+    }
+
+    #[test]
+    fn queue_coverage_reports_default_when_zero_config_app_is_pinned_elsewhere() {
+        // A zero-config app's only configured queue is the implicit `default`.
+        // Pinning to `critical` (not in [jobs.queues]) is now INFORMATIONAL-ONLY:
+        // doctor is config-only and cannot know whether `critical` is a
+        // `#[job(queue = "critical")]`-declared queue that the runtime appends to
+        // the effective schedule and drains, nor whether a sibling worker tier
+        // covers `default`. So the check PASSES (never fails `--strict`) and
+        // reports both facts. The authoritative zero-coverage guard is the
+        // runtime startup warning (`warn_pinned_uncovered_queues`).
+        //
+        // RED→GREEN: before this change this case Warned and failed `--strict`;
+        // now a pin to a config-unknown (job-declared) queue Passes.
+        let table: toml::Table = toml::from_str("[jobs]\npin = [\"critical\"]\n").expect("parse");
+        let (queues, pin) = resolve_queues_and_pin_from_sources(|_| None, Some(&table));
+        let result = check_queue_coverage(ProcessRole::Combined, &queues, &pin);
+        assert_eq!(result.status, CheckStatus::Pass);
+        let detail = result.detail.unwrap();
+        // Reports that configured `default` is not claimed by this pin...
+        assert!(
+            detail.contains("default"),
+            "detail should name the unclaimed configured queue: {detail}"
+        );
+        // ...and that pinned `critical` is not in [jobs.queues] and may be
+        // job-declared / drained by the runtime.
+        assert!(
+            detail.contains("critical"),
+            "detail should name the config-unknown pinned queue: {detail}"
+        );
+        assert!(
+            detail.contains("job(queue"),
+            "detail should note the pinned queue may be #[job(queue=…)]-declared: {detail}"
+        );
+        // Informational only → `--strict` stays green.
+        let summary = Summary {
+            passed: 1,
+            warned: 0,
+            failed: 0,
+        };
+        assert_eq!(exit_code(&summary, true), 0);
+    }
+
+    #[test]
+    fn queue_coverage_passes_for_zero_config_app_without_pin() {
+        // No pin on a zero-config app: `default` is drained, no false positive.
+        let table: toml::Table = toml::from_str("").expect("parse");
+        let (queues, pin) = resolve_queues_and_pin_from_sources(|_| None, Some(&table));
+        assert_eq!(queues, vec!["default"]);
+        assert!(pin.is_empty());
+        assert_eq!(
+            check_queue_coverage(ProcessRole::Combined, &queues, &pin).status,
+            CheckStatus::Pass
+        );
+    }
+
+    #[test]
+    fn queue_coverage_honors_profile_layer_jobs_config() {
+        // Regression for the #1623 review finding: when queue config is
+        // profile-specific, the coverage check must read the merged
+        // active-profile table (base + `[profile.<env>]` + `autumn-<env>.toml`)
+        // exactly like the runtime — not just the raw top-level `[jobs]`.
+        //
+        // Scenario: base `autumn.toml` has no top-level `[jobs]`; the prod
+        // profile pins `critical` while declaring `critical` + `bulk` queues,
+        // leaving `bulk` uncovered.
+        let base: toml::Table = toml::from_str(
+            "[profile.prod.jobs]\npin = [\"critical\"]\nqueues = [\"critical\", \"bulk\"]\n",
+        )
+        .expect("parse toml");
+
+        // Resolving from the raw top-level table sees no `[jobs]` at all, so it
+        // falls back to the implicit `default` queue with no pin — proving that
+        // WITHOUT merging the profile layer doctor never observes the profile's
+        // `jobs.pin`/`jobs.queues`.
+        let (raw_queues, raw_pin) = resolve_queues_and_pin_from_sources(|_| None, Some(&base));
+        assert_eq!(raw_queues, vec!["default"]);
+        assert!(raw_pin.is_empty());
+        assert_eq!(
+            check_queue_coverage(ProcessRole::Combined, &raw_queues, &raw_pin).status,
+            CheckStatus::Pass
+        );
+
+        // Merge the active `[profile.prod]` layer the same way
+        // `get_merged_toml_table_runtime` does, then resolve: the prod
+        // `jobs.queues` / `jobs.pin` are now honored. Under the queue-coverage
+        // redesign (#1461) pinning `critical` (a KNOWN queue) is a valid,
+        // non-empty subset schedule, so the check PASSES and reports the
+        // unclaimed `bulk` as informational detail (never fails `--strict`).
+        // Asserting the detail names `bulk` proves the profile layer's queues
+        // were actually merged and read.
+        let mut merged = toml::Table::new();
+        deep_merge(&mut merged, &base);
+        for profile_name in inline_profile_lookup_names("prod") {
+            if let Some(prof) = base
+                .get("profile")
+                .and_then(toml::Value::as_table)
+                .and_then(|p| p.get(profile_name))
+                .and_then(toml::Value::as_table)
+            {
+                deep_merge(&mut merged, prof);
+            }
+        }
+        let (queues, pin) = resolve_queues_and_pin_from_sources(|_| None, Some(&merged));
+        assert_eq!(queues, vec!["critical", "bulk"]);
+        assert_eq!(pin, vec!["critical"]);
+        let result = check_queue_coverage(ProcessRole::Combined, &queues, &pin);
+        assert_eq!(result.status, CheckStatus::Pass);
+        assert!(result.detail.unwrap().contains("bulk"));
+        // A valid subset pin must NOT fail `--strict`.
+        let summary = Summary {
+            passed: 1,
+            warned: 0,
+            failed: 0,
+        };
+        assert_eq!(exit_code(&summary, true), 0);
+    }
+
+    #[test]
+    fn queue_coverage_resolves_web_role_from_profile_layer() {
+        // Regression for the doctor.rs:2843 P2: the queue-coverage check reads
+        // `jobs.queues`/`jobs.pin` from the MERGED active-profile table, but the
+        // `role` it was gated on came from the RAW top-level table. A `role`
+        // declared only under `[profile.prod]` (with AUTUMN_ENV=prod) was missed,
+        // so a web replica was treated as `Combined` — the web-role skip-gate
+        // never fired and a pin matching no known queue wrongly Warned/Failed
+        // `--strict`. The fix resolves the role from the SAME merged table.
+        //
+        // Scenario: base `autumn.toml` has no top-level `role`; the prod profile
+        // sets `role = "web"` and pins a queue that matches nothing configured
+        // (an empty effective schedule that would Warn on a worker-bearing role).
+        let base: toml::Table = toml::from_str(
+            "[profile.prod]\nrole = \"web\"\n[profile.prod.jobs]\npin = [\"ghost\"]\nqueues = [\"critical\"]\n",
+        )
+        .expect("parse toml");
+
+        // BEFORE (bug): resolving the role from the RAW top-level table sees no
+        // `role`, so it defaults to `Combined`. A worker-bearing role with a pin
+        // that matches no known queue Warns → `--strict` fails. This is exactly
+        // the false failure the fix eliminates.
+        let (raw_role, _) = resolve_process_role_and_backend_from_sources(|_| None, Some(&base));
+        assert_eq!(raw_role, ProcessRole::Combined);
+        let (raw_queues, raw_pin) = resolve_queues_and_pin_from_sources(|_| None, Some(&base));
+        let raw_result = check_queue_coverage(raw_role, &raw_queues, &raw_pin);
+        // (raw table also misses the profile's queues/pin, but the load-bearing
+        // point is the role: Combined runs workers, so the gate does not skip.)
+        assert!(raw_role.runs_workers());
+        let _ = raw_result;
+
+        // AFTER (fix): merge the active `[profile.prod]` layer the same way
+        // `get_merged_toml_table_runtime` does, then resolve the role from the
+        // merged table. The prod `role = "web"` is now honored.
+        let mut merged = toml::Table::new();
+        deep_merge(&mut merged, &base);
+        for profile_name in inline_profile_lookup_names("prod") {
+            if let Some(prof) = base
+                .get("profile")
+                .and_then(toml::Value::as_table)
+                .and_then(|p| p.get(profile_name))
+                .and_then(toml::Value::as_table)
+            {
+                deep_merge(&mut merged, prof);
+            }
+        }
+        let (merged_role, _) =
+            resolve_process_role_and_backend_from_sources(|_| None, Some(&merged));
+        assert_eq!(
+            merged_role,
+            ProcessRole::Web,
+            "role must be resolved from the merged profile layer"
+        );
+        assert!(!merged_role.runs_workers());
+
+        // The web role runs no workers, so the coverage check skips the pin
+        // evaluation entirely and PASSES even though the pin matches no queue.
+        let (queues, pin) = resolve_queues_and_pin_from_sources(|_| None, Some(&merged));
+        let result = check_queue_coverage(merged_role, &queues, &pin);
+        assert_eq!(result.status, CheckStatus::Pass);
+        assert!(
+            result
+                .detail
+                .as_deref()
+                .unwrap_or_default()
+                .contains("web-only role"),
+            "web-role coverage detail should explain the check is skipped: {:?}",
+            result.detail
+        );
+        let summary = Summary {
+            passed: 1,
+            warned: 0,
+            failed: 0,
+        };
+        assert_eq!(exit_code(&summary, true), 0);
+
+        // AUTUMN_ROLE env still wins over the merged-table role (runtime
+        // precedence): a `worker` override on the same config runs workers. The
+        // pin matching no configured queue is now INFORMATIONAL-ONLY → Pass; the
+        // runtime startup warning is the authoritative coverage check.
+        let (env_role, _) = resolve_process_role_and_backend_from_sources(
+            |key| (key == "AUTUMN_ROLE").then(|| "worker".to_owned()),
+            Some(&merged),
+        );
+        assert_eq!(env_role, ProcessRole::Worker);
+        assert_eq!(
+            check_queue_coverage(env_role, &queues, &pin).status,
+            CheckStatus::Pass,
+        );
+    }
+
+    #[test]
+    fn queue_coverage_web_role_from_top_level_role_still_passes() {
+        // No-regression companion: a top-level (non-profile) `role = "web"` must
+        // still resolve to `Web` and skip the coverage check — the profile-aware
+        // fix must not break the common flat-config case.
+        let table: toml::Table =
+            toml::from_str("role = \"web\"\n[jobs]\npin = [\"ghost\"]\nqueues = [\"critical\"]\n")
+                .expect("parse toml");
+        let (role, _) = resolve_process_role_and_backend_from_sources(|_| None, Some(&table));
+        assert_eq!(role, ProcessRole::Web);
+        let (queues, pin) = resolve_queues_and_pin_from_sources(|_| None, Some(&table));
+        let result = check_queue_coverage(role, &queues, &pin);
+        assert_eq!(result.status, CheckStatus::Pass);
+        let summary = Summary {
+            passed: 1,
+            warned: 0,
+            failed: 0,
+        };
+        assert_eq!(exit_code(&summary, true), 0);
+    }
+
+    #[test]
+    fn queue_coverage_worker_role_from_profile_with_empty_schedule_is_informational() {
+        // A prod `role = "worker"` (worker-bearing) resolved from the profile
+        // layer, with a pin matching no queue in [jobs.queues], is now
+        // INFORMATIONAL-ONLY: doctor cannot see `#[job(queue=…)]`-declared queues
+        // or sibling tiers, so it PASSES (never fails `--strict`) and reports the
+        // gap. The authoritative guard is the runtime startup warning.
+        let base: toml::Table = toml::from_str(
+            "[profile.prod]\nrole = \"worker\"\n[profile.prod.jobs]\npin = [\"ghost\"]\nqueues = [\"critical\"]\n",
+        )
+        .expect("parse toml");
+        let mut merged = toml::Table::new();
+        deep_merge(&mut merged, &base);
+        for profile_name in inline_profile_lookup_names("prod") {
+            if let Some(prof) = base
+                .get("profile")
+                .and_then(toml::Value::as_table)
+                .and_then(|p| p.get(profile_name))
+                .and_then(toml::Value::as_table)
+            {
+                deep_merge(&mut merged, prof);
+            }
+        }
+        let (role, _) = resolve_process_role_and_backend_from_sources(|_| None, Some(&merged));
+        assert_eq!(role, ProcessRole::Worker);
+        let (queues, pin) = resolve_queues_and_pin_from_sources(|_| None, Some(&merged));
+        let result = check_queue_coverage(role, &queues, &pin);
+        assert_eq!(result.status, CheckStatus::Pass);
+        let summary = Summary {
+            passed: 1,
+            warned: 0,
+            failed: 0,
+        };
+        assert_eq!(exit_code(&summary, true), 0);
+    }
+
+    #[test]
+    fn queue_coverage_passes_for_multi_tier_subset_pins() {
+        // #1461: a multi-tier deployment intentionally splits queues across
+        // worker tiers (e.g. one process pins `critical`, another pins
+        // `bulk,default`). Each tier's subset pin is legitimate and must NOT
+        // fail `--strict`, and a single doctor run cannot see sibling tiers.
+        let queues = vec![
+            "critical".to_string(),
+            "bulk".to_string(),
+            "default".to_string(),
+        ];
+
+        // Critical tier: pins only `critical`; the other queues are covered by
+        // another tier. Passes, and the informational detail names them.
+        let critical_tier =
+            check_queue_coverage(ProcessRole::Combined, &queues, &["critical".to_string()]);
+        assert_eq!(critical_tier.status, CheckStatus::Pass);
+        let detail = critical_tier.detail.unwrap();
+        assert!(detail.contains("bulk"), "detail should list bulk: {detail}");
+        assert!(
+            detail.contains("default"),
+            "detail should list default: {detail}"
+        );
+
+        // Bulk tier: pins `bulk,default`; also a valid subset → Pass.
+        let bulk_tier = check_queue_coverage(
+            ProcessRole::Combined,
+            &queues,
+            &["bulk".to_string(), "default".to_string()],
+        );
+        assert_eq!(bulk_tier.status, CheckStatus::Pass);
+
+        // Neither tier warns, so `--strict` stays green.
+        let summary = Summary {
+            passed: 1,
+            warned: 0,
+            failed: 0,
+        };
+        assert_eq!(exit_code(&summary, true), 0);
+    }
+
+    #[test]
+    fn resolve_queues_empty_pin_env_overrides_toml_pin() {
+        // #2290: a PRESENT but empty `AUTUMN_JOBS__PIN` is an explicit override
+        // that clears the pin (process unpinned, drains every queue), mirroring
+        // the runtime's `if let Ok(val) = env.var("AUTUMN_JOBS__PIN")` semantics.
+        // Doctor must NOT fall back to the TOML `jobs.pin` in that case.
+        let table: toml::Table = toml::from_str("[jobs]\npin = [\"critical\"]\n").expect("parse");
+        let (queues, pin) = resolve_queues_and_pin_from_sources(
+            |key| (key == "AUTUMN_JOBS__PIN").then(String::new),
+            Some(&table),
+        );
+        assert_eq!(queues, vec!["default"]);
+        assert!(pin.is_empty(), "empty env pin must clear the TOML pin");
+        let result = check_queue_coverage(ProcessRole::Combined, &queues, &pin);
+        assert_eq!(result.status, CheckStatus::Pass);
+        // Previously this false-failed (fell back to `pin=[critical]` →
+        // empty-schedule Warn); now it passes cleanly under `--strict`.
+        let summary = Summary {
+            passed: 1,
+            warned: 0,
+            failed: 0,
+        };
+        assert_eq!(exit_code(&summary, true), 0);
+    }
+
+    #[test]
+    fn resolve_queues_and_pin_reads_array_queues_and_toml_pin() {
+        let table: toml::Table =
+            toml::from_str("[jobs]\nqueues = [\"critical\", \"low\"]\npin = [\"critical\"]\n")
+                .expect("parse toml");
+        let (queues, pin) = resolve_queues_and_pin_from_sources(|_| None, Some(&table));
+        assert_eq!(queues, vec!["critical", "low"]);
+        assert_eq!(pin, vec!["critical"]);
+    }
+
+    #[test]
+    fn resolve_queues_and_pin_reads_table_queue_names_and_env_pin() {
+        let table: toml::Table =
+            toml::from_str("[jobs.queues]\ncritical = 4\nlow = 1\n").expect("parse toml");
+        let (mut queues, pin) = resolve_queues_and_pin_from_sources(
+            |key| (key == "AUTUMN_JOBS__PIN").then(|| "critical, low".to_owned()),
+            Some(&table),
+        );
+        queues.sort();
+        assert_eq!(queues, vec!["critical", "low"]);
+        // Env pin overrides (there is no TOML pin here).
+        assert_eq!(pin, vec!["critical", "low"]);
     }
 
     #[test]
