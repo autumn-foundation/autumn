@@ -2513,7 +2513,13 @@ async fn establish_remember_login(
     // it a remember-cookie restore would rotate the token but still 401.
     session.insert("{snake_name}_id", {snake_name}_id.to_string()).await;
     session.insert(auth_session_key, {snake_name}_id.to_string()).await;
-    autumn_web::step_up::set_last_strong_auth_at(session).await;
+    // Intentionally do NOT stamp `set_last_strong_auth_at` here: a long-lived
+    // remember cookie is *not* strong authentication. Restoring a session from
+    // it must not satisfy step-up "sudo mode" — otherwise a stolen/unattended
+    // persistent cookie would silently pass `#[step_up]` routes (e.g. account
+    // deletion) with no password reauth. Leaving the claim absent/stale forces
+    // those routes to redirect to `/reauth` until the user re-enters their
+    // password (issue #833).
     if let Ok(mut db) = pool.get().await {{
         let session_row = build_session_row(session, {snake_name}_id, ip, headers).await;
         let _ = diesel::insert_into({sess_table}::table)
