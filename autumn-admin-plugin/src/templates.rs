@@ -4,7 +4,7 @@
 //! The design mirrors the actuator UI: system-ui font, Tailwind-ish
 //! color palette, clean cards with subtle shadows.
 
-use autumn_web::flash::{FlashMessage, flash_message_divs};
+use autumn_web::flash::{FLASH_CSS, FlashMessage, flash_messages};
 use autumn_web::job::{
     JobAdminPage, JobAdminRecord, JobAdminSnapshot, JobAdminStatus, JobScheduleSummary,
 };
@@ -29,23 +29,12 @@ use crate::traits::{
 const HTMX_JS_PATH: &str = "/static/js/htmx.min.js";
 const HTMX_CSRF_JS_PATH: &str = "/static/js/autumn-htmx-csrf.js";
 const TOKENS_CSS: &str = include_str!("tokens.css");
-const FLASH_CSS: &str = "\
-.flash {
-    padding: 0.75rem 1rem;
-    border-radius: 0.375rem;
-    margin-bottom: 1rem;
-    font-size: 0.875rem;
-}
-.flash-success { background: var(--success-light); color: var(--success); border: 1px solid var(--success); }
-.flash-error { background: var(--danger-light); color: var(--danger); border: 1px solid var(--danger); }
-.flash-warning { background: var(--warning-light); color: var(--warning); border: 1px solid var(--warning); }
-.flash-info { background: var(--primary-light); color: var(--primary); border: 1px solid var(--primary); }
-";
 
 // ── CSS ─────────────────────────────────────────────────────────────
 
 /// Admin-specific styles that build on the plugin's shared tokens
-/// ([`TOKENS_CSS`]) and flash styles ([`FLASH_CSS`]).
+/// ([`TOKENS_CSS`]) and the framework's shared flash styles
+/// ([`autumn_web::flash::FLASH_CSS`]).
 const ADMIN_CSS: &str = "
     /* Skip-to-content link: visually hidden at rest, revealed on keyboard focus. */
     .admin-skip-link {
@@ -499,7 +488,7 @@ pub fn admin_layout(
                     }
                     // Main content landmark
                     main id="admin-main" class="admin-main" {
-                        (flash_message_divs(messages))
+                        (flash_messages(messages))
                         (content)
                     }
                 }
@@ -4410,5 +4399,58 @@ mod tests {
         // nav_bar's own collapse-behind-a-hamburger UX, so the toggle must
         // never become visible even once autumn-widgets.js unhides it.
         assert!(ADMIN_CSS.contains(".autumn-nav__toggle"), "{ADMIN_CSS}");
+    }
+
+    // ── Flash rendering via shared helper (#1240) ─────────────────────────
+
+    #[test]
+    fn admin_layout_renders_flash_via_shared_helper() {
+        use autumn_web::flash::FlashLevel;
+
+        let registry = AdminRegistry::new();
+        let messages = [
+            FlashMessage {
+                level: FlashLevel::Success,
+                message: "Saved!".into(),
+            },
+            FlashMessage {
+                level: FlashLevel::Error,
+                message: "Boom".into(),
+            },
+        ];
+        let html = admin_layout(
+            &registry,
+            None,
+            "Title",
+            "/admin",
+            "/actuator",
+            "tok",
+            "X-CSRF-Token",
+            &messages,
+            true,
+            &html! {},
+        )
+        .into_string();
+
+        // Shared flash_messages() markup: grouped container + semantic
+        // per-level classes.
+        assert!(html.contains("autumn-flash-group"), "{html}");
+        assert!(html.contains("autumn-flash--success"), "{html}");
+        assert!(html.contains("autumn-flash--error"), "{html}");
+        assert!(html.contains("Saved!") && html.contains("Boom"), "{html}");
+
+        // Severity-driven live-region semantics come from the shared helper:
+        // Success → polite status, Error → assertive alert.
+        assert!(html.contains(r#"role="status""#), "{html}");
+        assert!(html.contains(r#"aria-live="polite""#), "{html}");
+        assert!(html.contains(r#"role="alert""#), "{html}");
+        assert!(html.contains(r#"aria-live="assertive""#), "{html}");
+
+        // The old hand-rolled `flash flash-<level>` banner markup is gone.
+        assert!(!html.contains("flash flash-"), "{html}");
+
+        // The shared flash stylesheet is inlined so the migrated banners are
+        // actually styled (this selector only exists in the shared FLASH_CSS).
+        assert!(html.contains(".autumn-flash-group{"), "{html}");
     }
 }
