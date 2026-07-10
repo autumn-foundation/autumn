@@ -75,7 +75,7 @@ async fn redis_backend_persists_tracked_job_and_expires_it() {
 
     let state = AppState::for_test().with_profile("dev");
     let shutdown = tokio_util::sync::CancellationToken::new();
-    job::start_runtime(vec![noop_job_info()], &state, &shutdown, &config)
+    job::start_runtime(vec![noop_job_info()], &state, &shutdown, &config, true)
         .expect("start redis-backed job runtime");
 
     let handle = job::enqueue_tracked("noop", serde_json::json!({}))
@@ -188,7 +188,7 @@ async fn postgres_backend_persists_tracked_job_and_expires_it() {
         .with_profile("dev")
         .with_pool(pool.clone());
     let shutdown = tokio_util::sync::CancellationToken::new();
-    job::start_runtime(vec![noop_job_info()], &state, &shutdown, &config)
+    job::start_runtime(vec![noop_job_info()], &state, &shutdown, &config, true)
         .expect("start postgres-backed job runtime");
 
     let handle = job::enqueue_tracked("noop", serde_json::json!({}))

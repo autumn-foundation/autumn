@@ -370,6 +370,33 @@ pub fn try_build_router_inner(
     Ok(router.with_state(state))
 }
 
+/// Build a probe-only router for the [`Worker`](crate::config::ProcessRole::Worker)
+/// process role.
+///
+/// A worker replica runs job workers and the cron scheduler but serves no user
+/// routes. It still binds the HTTP listener so orchestrators can supervise it,
+/// exposing **only** the framework liveness/readiness/startup/health probes
+/// (per `config.health.*`) and the actuator (`/actuator/*`, so `/actuator/jobs`
+/// works). This mirrors how [`try_build_router_with_static_inner`] finalizes the
+/// full router — same startup barrier and `with_state` — so probe/actuator
+/// behavior is identical, only the user route table is absent.
+///
+/// # Errors
+///
+/// Returns [`RouterBuildError`] when the actuator prefix collides with a probe
+/// path (the same guard the full build path applies).
+pub fn try_build_probe_only_router(
+    config: &AutumnConfig,
+    state: AppState,
+) -> Result<axum::Router, RouterBuildError> {
+    let barrier_state = state.clone();
+    let (mounted_probe_paths, router) =
+        mount_probe_endpoints(axum::Router::<AppState>::new(), config);
+    let router = mount_actuator_endpoints(router, config, &mounted_probe_paths)?;
+    let router = router.with_state(state);
+    Ok(apply_startup_barrier(router, config, &barrier_state))
+}
+
 /// Prepared MCP exposure carried through `build_router_pre_state`: the mount
 /// path, the derived tool catalog, and the optional whole-endpoint auth layer.
 #[cfg(feature = "mcp")]
@@ -4151,6 +4178,48 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(legacy.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// Worker-role (#1613) probe-only router: exposes the framework probes and
+    /// the actuator, but no user routes. A sample user path 404s.
+    #[tokio::test]
+    async fn probe_only_router_mounts_probes_and_actuator_but_no_user_routes() {
+        let config = AutumnConfig::default();
+        let app = try_build_probe_only_router(&config, test_state())
+            .expect("probe-only router should build");
+
+        // Probe + actuator paths respond.
+        for path in [
+            config.health.live_path.as_str(),
+            config.health.ready_path.as_str(),
+            config.health.startup_path.as_str(),
+            config.health.path.as_str(),
+            "/actuator/health",
+            "/actuator/info",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_ne!(
+                response.status(),
+                StatusCode::NOT_FOUND,
+                "probe-only router should serve {path}"
+            );
+        }
+
+        // A made-up user route is absent (probe-only router has no user table).
+        let missing = app
+            .oneshot(
+                Request::builder()
+                    .uri("/definitely-not-a-user-route")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
     }
 
     /// The framework-owned widget stylesheet (#1215) is served the same way

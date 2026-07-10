@@ -2651,6 +2651,27 @@ impl AppBuilder {
         let (mut config, telemetry_guard) =
             load_config_and_telemetry(config_loader_factory, telemetry_provider).await;
 
+        // Process role selects which slice of the runtime this replica runs. A
+        // split role (web/worker) on the in-process `local` jobs backend cannot
+        // work: the web replica would enqueue into an in-memory queue no worker
+        // can drain, and a worker replica's in-memory queue starts empty. Reject
+        // it here — before any boot work — rather than in `validate()` so the
+        // doctor can still load the config. Combined role is always fine.
+        let role = config.role;
+        if crate::config::split_role_on_local_backend(role, &config.jobs.backend) {
+            tracing::error!(
+                role = role.as_str(),
+                jobs_backend = %config.jobs.backend,
+                "process role '{}' requires a durable jobs backend: the in-process \
+                 'local' backend cannot be shared across a split web/worker topology. \
+                 Set jobs.backend = \"postgres\" or \"redis\", or run the combined role.",
+                role.as_str(),
+            );
+            #[cfg(feature = "managed-pg")]
+            crate::managed_pg::emergency_stop_async().await;
+            std::process::exit(1);
+        }
+
         #[cfg(feature = "mail")]
         if mount_unsubscribe_endpoint {
             config.mail.mount_unsubscribe_endpoint = true;
@@ -3130,34 +3151,44 @@ impl AppBuilder {
                 merge_routers.push(axum_router);
             }
         }
-        let router = crate::router::try_build_router_with_static_inner(
-            all_routes,
-            &config,
-            state.clone(),
-            dist_ref,
-            crate::router::RouterContext {
-                exception_filters,
-                scoped_groups,
-                merge_routers,
-                nest_routers,
-                custom_layers,
-                static_gate_layers,
-                #[cfg(feature = "maud")]
-                error_page_renderer,
-                session_store,
-                // Respect the [openapi] profile gate: if disabled in config,
-                // suppress the endpoint even when .openapi(...) was called.
-                #[cfg(feature = "openapi")]
-                openapi: if config.openapi_runtime.enabled {
-                    openapi
-                } else {
-                    None
+        // Worker role does not serve user routes: build a probe-only router that
+        // exposes just the framework liveness/readiness probes and the actuator,
+        // so orchestrators can supervise the process and `/actuator/jobs` works.
+        // Web and combined roles build the full application router. All the
+        // route/router-context inputs assembled above are simply dropped in the
+        // worker branch.
+        let router_build = if role.serves_http() {
+            crate::router::try_build_router_with_static_inner(
+                all_routes,
+                &config,
+                state.clone(),
+                dist_ref,
+                crate::router::RouterContext {
+                    exception_filters,
+                    scoped_groups,
+                    merge_routers,
+                    nest_routers,
+                    custom_layers,
+                    static_gate_layers,
+                    #[cfg(feature = "maud")]
+                    error_page_renderer,
+                    session_store,
+                    // Respect the [openapi] profile gate: if disabled in config,
+                    // suppress the endpoint even when .openapi(...) was called.
+                    #[cfg(feature = "openapi")]
+                    openapi: if config.openapi_runtime.enabled {
+                        openapi
+                    } else {
+                        None
+                    },
+                    #[cfg(feature = "mcp")]
+                    mcp,
                 },
-                #[cfg(feature = "mcp")]
-                mcp,
-            },
-        )
-        .unwrap_or_else(|error| {
+            )
+        } else {
+            crate::router::try_build_probe_only_router(&config, state.clone())
+        };
+        let router = router_build.unwrap_or_else(|error| {
             tracing::error!(error = %error, "Failed to build router");
             exit_stop_managed_pg();
             std::process::exit(1);
@@ -3277,7 +3308,13 @@ impl AppBuilder {
         let prestop_grace = config.server.prestop_grace_secs;
         let server_shutdown = tokio_util::sync::CancellationToken::new();
 
-        if let Err(error) = initialize_job_runtime(jobs, &state, &server_shutdown, &config.jobs) {
+        if let Err(error) = initialize_job_runtime(
+            jobs,
+            &state,
+            &server_shutdown,
+            &config.jobs,
+            role.runs_workers(),
+        ) {
             tracing::error!(error = %error, "job runtime initialization failed");
             // Post-DB failure: `process::exit` skips `on_shutdown`, so stop any
             // managed Postgres before bailing.
@@ -3542,7 +3579,10 @@ impl AppBuilder {
         }
 
         if !state.probes().is_shutting_down() {
-            if !tasks.is_empty() {
+            // Web role runs no cron scheduler (workers/combined only). Skipping
+            // the scheduler must not regress readiness: mark_startup_complete and
+            // signal_serve_ready below still run.
+            if role.runs_workers() && !tasks.is_empty() {
                 let res = start_task_scheduler_with_config(
                     tasks,
                     &state,
@@ -4476,7 +4516,8 @@ impl AppBuilder {
         finalize_event_bus(listeners, &mut jobs, &state);
 
         let task_shutdown = tokio_util::sync::CancellationToken::new();
-        if let Err(error) = initialize_job_runtime(jobs, &state, &task_shutdown, &config.jobs) {
+        if let Err(error) = initialize_job_runtime(jobs, &state, &task_shutdown, &config.jobs, true)
+        {
             eprintln!("job runtime initialization failed: {error}");
             #[cfg(feature = "managed-pg")]
             crate::managed_pg::emergency_stop_async().await;
@@ -5205,12 +5246,13 @@ fn initialize_job_runtime(
     state: &AppState,
     shutdown: &tokio_util::sync::CancellationToken,
     config: &crate::config::JobConfig,
+    run_workers: bool,
 ) -> crate::AutumnResult<()> {
     crate::job::clear_global_job_client();
     if jobs.is_empty() {
         Ok(())
     } else {
-        crate::job::start_runtime(jobs, state, shutdown, config)
+        crate::job::start_runtime(jobs, state, shutdown, config, run_workers)
     }
 }
 
@@ -7972,9 +8014,12 @@ mod tests {
     #[test]
     fn repository_commit_hook_worker_starts_after_job_runtime_initialization() {
         let source = include_str!("app.rs").replace("\r\n", "\n");
-        let server_init = "initialize_job_runtime(jobs, &state, &server_shutdown, &config.jobs)";
+        let server_init = "initialize_job_runtime(
+            jobs,
+            &state,
+            &server_shutdown,";
         let server_worker = "start_repository_commit_hook_worker(\n                pool,\n                server_shutdown.child_token(),\n            );";
-        let task_init = "initialize_job_runtime(jobs, &state, &task_shutdown, &config.jobs)";
+        let task_init = "initialize_job_runtime(jobs, &state, &task_shutdown, &config.jobs, true)";
         let task_worker = "start_repository_commit_hook_worker(\n                pool,\n                task_shutdown.child_token(),\n            );";
 
         assert!(
@@ -8011,8 +8056,11 @@ mod tests {
             .expect("task runner path should exist");
         let server_source = &source[server_start..build_mode_start];
         let task_source = &source[task_start..];
-        let server_init = "initialize_job_runtime(jobs, &state, &server_shutdown, &config.jobs)";
-        let task_init = "initialize_job_runtime(jobs, &state, &task_shutdown, &config.jobs)";
+        let server_init = "initialize_job_runtime(
+            jobs,
+            &state,
+            &server_shutdown,";
+        let task_init = "initialize_job_runtime(jobs, &state, &task_shutdown, &config.jobs, true)";
         let server_initializer = server_source
             .find("run_state_initializers(state_initializers, &state);")
             .expect("normal server path should run state initializers");
@@ -8755,6 +8803,7 @@ mod tests {
             &state,
             &shutdown,
             &crate::config::JobConfig::default(),
+            true,
         )
         .expect("job runtime should initialize before startup hooks");
 
@@ -8807,6 +8856,7 @@ mod tests {
             &state,
             &shutdown,
             &config,
+            true,
         )
         .expect_err("redis init errors should abort startup");
 

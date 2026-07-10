@@ -1,4 +1,4 @@
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 
 mod assets;
 mod build;
@@ -175,6 +175,10 @@ enum Commands {
         /// Package to run (for workspaces)
         #[arg(short, long)]
         package: Option<String>,
+        /// Process role: web serves HTTP only, worker runs jobs+scheduler only,
+        /// combined (default) does both.
+        #[arg(long, value_enum)]
+        role: Option<ServeRole>,
     },
     /// Download and configure external tools (Tailwind CSS)
     Setup {
@@ -958,6 +962,29 @@ enum ServeCommands {
     Restart,
 }
 
+/// Process role selector for `autumn serve --role`.
+///
+/// Mirrors `autumn_web::config::ProcessRole`: `web` serves HTTP only, `worker`
+/// runs job workers + the cron scheduler only, and `combined` (the default)
+/// does both. The chosen role is forwarded to the app binary via `AUTUMN_ROLE`.
+#[derive(Clone, Copy, ValueEnum)]
+enum ServeRole {
+    Combined,
+    Web,
+    Worker,
+}
+
+impl ServeRole {
+    /// Stable lowercase identifier forwarded to the app via `AUTUMN_ROLE`.
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Combined => "combined",
+            Self::Web => "web",
+            Self::Worker => "worker",
+        }
+    }
+}
+
 /// Subcommands for `autumn migrate`.
 #[derive(Subcommand)]
 enum MigrateCommands {
@@ -1499,6 +1526,13 @@ enum ReleaseCommands {
         /// Deployment target: fly | docker-compose (omit for bare Dockerfile).
         #[arg(long, value_name = "TARGET")]
         target: Option<String>,
+        /// Scaffold a separate worker-role service in the generated
+        /// docker-compose.yml (opt-in split topology). The `app` service runs
+        /// the web role and a new `worker` service runs jobs+scheduler, both on
+        /// the shared `postgres` jobs backend. Only affects `--target
+        /// docker-compose`; the default output is a single combined service.
+        #[arg(long)]
+        split_workers: bool,
     },
 }
 
@@ -2156,6 +2190,7 @@ fn run_command(command: Commands) {
             release,
             bundled_pg,
             package,
+            role,
         } => {
             let action = action.map(|a| match a {
                 ServeCommands::Stop => serve::ServeAction::Stop,
@@ -2173,6 +2208,9 @@ fn run_command(command: Commands) {
                     // Normal start: the child inherits this shell's env. Only
                     // `restart` sets this, to restore a lost profile.
                     profile: None,
+                    // Forwarded to the app binary via `AUTUMN_ROLE`. `None` lets
+                    // the child pick its default (combined) or read its own env.
+                    role: role.map(|r| r.as_str().to_owned()),
                 },
             );
         }
@@ -2837,14 +2875,22 @@ fn run_routes_command(
 
 fn run_release_command(cmd: ReleaseCommands) {
     match cmd {
-        ReleaseCommands::Init { force, target } => {
+        ReleaseCommands::Init {
+            force,
+            target,
+            split_workers,
+        } => {
             let t = target.as_deref().map_or(release::Target::Default, |s| {
                 s.parse().unwrap_or_else(|e| {
                     eprintln!("autumn release init: {e}");
                     std::process::exit(1);
                 })
             });
-            release::run(release::ReleaseAction::Init { force, target: t });
+            release::run(release::ReleaseAction::Init {
+                force,
+                target: t,
+                split_workers,
+            });
         }
     }
 }
@@ -4722,7 +4768,7 @@ mod tests {
     #[test]
     fn parse_release_init_defaults() {
         let cli = Cli::try_parse_from(["autumn", "release", "init"]).unwrap();
-        let Commands::Release(ReleaseCommands::Init { force, target }) = cli.command else {
+        let Commands::Release(ReleaseCommands::Init { force, target, .. }) = cli.command else {
             panic!("expected release init");
         };
         assert!(!force);
@@ -4732,7 +4778,7 @@ mod tests {
     #[test]
     fn parse_release_init_with_force() {
         let cli = Cli::try_parse_from(["autumn", "release", "init", "--force"]).unwrap();
-        let Commands::Release(ReleaseCommands::Init { force, target }) = cli.command else {
+        let Commands::Release(ReleaseCommands::Init { force, target, .. }) = cli.command else {
             panic!("expected release init");
         };
         assert!(force);
@@ -4742,7 +4788,7 @@ mod tests {
     #[test]
     fn parse_release_init_with_fly_target() {
         let cli = Cli::try_parse_from(["autumn", "release", "init", "--target", "fly"]).unwrap();
-        let Commands::Release(ReleaseCommands::Init { force, target }) = cli.command else {
+        let Commands::Release(ReleaseCommands::Init { force, target, .. }) = cli.command else {
             panic!("expected release init");
         };
         assert!(!force);
@@ -4763,11 +4809,43 @@ mod tests {
     fn parse_release_init_force_and_target() {
         let cli = Cli::try_parse_from(["autumn", "release", "init", "--force", "--target", "fly"])
             .unwrap();
-        let Commands::Release(ReleaseCommands::Init { force, target }) = cli.command else {
+        let Commands::Release(ReleaseCommands::Init { force, target, .. }) = cli.command else {
             panic!("expected release init");
         };
         assert!(force);
         assert_eq!(target.as_deref(), Some("fly"));
+    }
+
+    #[test]
+    fn parse_release_init_split_workers_defaults_false() {
+        let cli = Cli::try_parse_from(["autumn", "release", "init"]).unwrap();
+        let Commands::Release(ReleaseCommands::Init { split_workers, .. }) = cli.command else {
+            panic!("expected release init");
+        };
+        assert!(!split_workers, "split_workers must default to false");
+    }
+
+    #[test]
+    fn parse_release_init_with_split_workers() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "release",
+            "init",
+            "--target",
+            "docker-compose",
+            "--split-workers",
+        ])
+        .unwrap();
+        let Commands::Release(ReleaseCommands::Init {
+            target,
+            split_workers,
+            ..
+        }) = cli.command
+        else {
+            panic!("expected release init");
+        };
+        assert_eq!(target.as_deref(), Some("docker-compose"));
+        assert!(split_workers, "--split-workers must set the flag");
     }
 
     #[test]

@@ -53,6 +53,10 @@ pub struct ServeOptions {
     /// restore the original daemon's profile when the restart shell doesn't have
     /// one.
     pub profile: Option<String>,
+    /// Process role forwarded to the app binary via `AUTUMN_ROLE` (`"web"`,
+    /// `"worker"`, or `"combined"`). `None` leaves the child to resolve its own
+    /// role from its environment/config (defaulting to combined).
+    pub role: Option<String>,
 }
 
 /// How long to wait for a freshly-spawned daemon to become reachable.
@@ -196,11 +200,21 @@ fn run_unix(action: Option<ServeAction>, opts: &ServeOptions) -> i32 {
                     |a| a.profile.clone(),
                 )
             });
+            // Preserve the original daemon's process role: an explicit `--role` on
+            // *this* restart wins, otherwise restore what the running daemon
+            // recorded. The role lives only in the `serve.mode` marker (not the
+            // address file), so a bare `restart` doesn't silently drop the daemon
+            // back to the combined default.
+            let keep_role = opts
+                .role
+                .clone()
+                .or_else(|| recorded_mode.as_ref().and_then(|m| m.role.clone()));
             let daemon_opts = ServeOptions {
                 daemon: true,
                 bundled_pg: keep_managed,
                 release: keep_release,
                 profile: keep_profile,
+                role: keep_role,
                 ..opts.clone()
             };
             // Stop using the *recovered* mode, not the bare restart flags: when
@@ -636,6 +650,12 @@ fn base_command(binary: &Path, paths: Option<&RuntimePaths>, opts: &ServeOptions
     {
         cmd.env(MANAGED_PG_DATA_DIR_ENV, paths.pg_data_dir());
     }
+    // Select the process role for the spawned app. A worker-role daemon still
+    // binds its socket/port for liveness probes, so the daemon plumbing above
+    // needs no special-casing — just forward the role the app reads at startup.
+    if let Some(role) = &opts.role {
+        cmd.env("AUTUMN_ROLE", role);
+    }
     // Restore an explicit profile (set by `restart`) so the relaunched daemon
     // loads the same config as the original even when the restart shell didn't
     // set `AUTUMN_ENV`.
@@ -1015,6 +1035,11 @@ struct ModeFile {
     /// The explicit profile (`AUTUMN_ENV`/`AUTUMN_PROFILE`) the daemon used.
     #[serde(default)]
     profile: Option<String>,
+    /// The process role (`AUTUMN_ROLE`) the daemon was started with, recorded so
+    /// `restart` can restore it. `None` when the daemon ran the default combined
+    /// role (or for mode files written before this field existed).
+    #[serde(default)]
+    role: Option<String>,
 }
 
 /// Write the `serve.mode` marker (`0600`). Best-effort.
@@ -1022,6 +1047,7 @@ fn write_mode_file(paths: &RuntimePaths, opts: &ServeOptions) {
     let mode = ModeFile {
         release: opts.release,
         profile: opts.profile.clone().or_else(env_profile),
+        role: opts.role.clone(),
     };
     let Ok(toml) = toml::to_string(&mode) else {
         return;
@@ -1987,5 +2013,85 @@ mod tests {
         // Non-numeric content is ignored rather than misread.
         std::fs::write(paths.ready_file(), "not-a-number").expect("write ready");
         assert_eq!(child_reported_budget(&paths), None);
+    }
+
+    fn serve_opts_with_role(role: Option<&str>) -> ServeOptions {
+        ServeOptions {
+            package: None,
+            daemon: false,
+            release: false,
+            bundled_pg: false,
+            profile: None,
+            role: role.map(str::to_owned),
+        }
+    }
+
+    /// Look up the value the command would set for `key`, if any. `get_envs`
+    /// yields `(key, Some(value))` for sets and `(key, None)` for removals.
+    fn env_value(cmd: &Command, key: &str) -> Option<String> {
+        cmd.get_envs().find_map(|(k, v)| {
+            (k == std::ffi::OsStr::new(key))
+                .then(|| v.map(|v| v.to_string_lossy().into_owned()))
+                .flatten()
+        })
+    }
+
+    #[test]
+    fn base_command_forwards_role_env() {
+        for role in ["web", "worker", "combined"] {
+            let opts = serve_opts_with_role(Some(role));
+            let cmd = base_command(Path::new("/bin/true"), None, &opts);
+            assert_eq!(
+                env_value(&cmd, "AUTUMN_ROLE").as_deref(),
+                Some(role),
+                "serve --role {role} must forward AUTUMN_ROLE={role} to the app binary",
+            );
+        }
+    }
+
+    #[test]
+    fn base_command_omits_role_env_by_default() {
+        let opts = serve_opts_with_role(None);
+        let cmd = base_command(Path::new("/bin/true"), None, &opts);
+        // With no explicit role the CLI must not set AUTUMN_ROLE, so the child
+        // resolves its own role from its environment/config (combined default).
+        assert!(
+            cmd.get_envs()
+                .all(|(k, _)| k != std::ffi::OsStr::new("AUTUMN_ROLE")),
+            "no --role must leave AUTUMN_ROLE unset for the app binary",
+        );
+    }
+
+    #[test]
+    fn mode_file_role_defaults_none_for_legacy_files() {
+        // Mode files written before the `role` field omit it; parsing must not
+        // fail and must default to None (the daemon ran the combined role).
+        let legacy = "release = true\nprofile = \"prod\"\n";
+        let parsed: ModeFile = toml::from_str(legacy).expect("parse legacy mode file");
+        assert_eq!(parsed.role, None);
+        assert!(parsed.release);
+        assert_eq!(parsed.profile.as_deref(), Some("prod"));
+    }
+
+    #[test]
+    fn write_mode_file_persists_role_for_restart_recovery() {
+        // A `serve --role worker` start must persist the role into `serve.mode`
+        // so a bare `serve restart` can recover it (mirroring the profile path)
+        // instead of silently dropping back to the combined default.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = RuntimePaths::from_base(dir.path(), "p");
+        paths.ensure_dirs().expect("dirs");
+        let opts = serve_opts_with_role(Some("worker"));
+        write_mode_file(&paths, &opts);
+
+        // Recover exactly as `restart`'s `running_daemon_mode` would: read and
+        // parse the marker, then take its role.
+        let contents = std::fs::read_to_string(paths.mode_file()).expect("read mode file");
+        let recovered: ModeFile = toml::from_str(&contents).expect("parse mode file");
+        assert_eq!(
+            recovered.role.as_deref(),
+            Some("worker"),
+            "restart must recover the persisted --role",
+        );
     }
 }
