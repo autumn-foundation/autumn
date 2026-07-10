@@ -323,6 +323,12 @@ group column with `IS NOT NULL`), so the `NULL` group is omitted rather than
 deserialized into the non-nullable `K`. Nullable **value** columns are fine — an
 all-`NULL` group simply yields `(key, None)`.
 
+Grouped aggregates are **not** available on an `#[encrypted(...)]` column (as the
+group key or as an aggregated value): the stored value is ciphertext, so grouping
+would return ciphertext keys and `.filter_eq(..)` would compare plaintext against
+ciphertext and match nothing. Such a method returns an error at call time — use a
+raw query, or group on a non-encrypted column.
+
 ### Builder chain
 
 - `.order_by_aggregate_desc()` / `.order_by_aggregate_asc()` — order by the

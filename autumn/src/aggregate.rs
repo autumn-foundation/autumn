@@ -60,6 +60,15 @@
 //! omitted rather than deserialized into the non-nullable `K`. Nullable
 //! **value** columns are fine — an all-`NULL` group yields `(key, None)`.
 //!
+//! ## Encrypted columns
+//!
+//! Grouped aggregates are **not** available on an `#[encrypted(...)]` column
+//! (neither as the group key nor as an aggregated value): the column stores
+//! ciphertext, so grouping would return ciphertext keys and `.filter_eq(..)`
+//! would compare plaintext against ciphertext and match nothing. A method that
+//! groups on (or aggregates over) an encrypted column returns an error at call
+//! time. Use a raw query instead, or group on a non-encrypted column.
+//!
 //! ## Scoping
 //!
 //! The generated query composes the repository's soft-delete filter, tenant

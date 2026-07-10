@@ -619,6 +619,9 @@ struct GroupedAggregateSpec {
     agg_sql_expr: String,
     /// The group column name (quoted-identifier-safe bare name).
     group_col: String,
+    /// The aggregated numeric column name, if any (`None` for `count`). Guarded
+    /// against at-rest encryption alongside the group column (#1364).
+    value_col: Option<String>,
     /// When set, generation emits a `compile_error!` with this message instead
     /// of a method.
     error: Option<String>,
@@ -1067,6 +1070,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 let mut value_sql_type = quote! { () };
                 let mut agg_sql_expr = String::new();
                 let mut group_col = String::new();
+                let mut value_col: Option<String> = None;
 
                 match (parsed, declared_pair) {
                     (None, _) => {
@@ -1085,6 +1089,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     }
                     (Some((kind, num_col, gcol)), Some((k, v))) => {
                         group_col = gcol;
+                        value_col.clone_from(&num_col);
                         let value_inner = option_inner_type(&v).unwrap_or(&v).clone();
 
                         // Numeric-column presence must match the aggregate, and
@@ -1232,6 +1237,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     value_sql_type,
                     agg_sql_expr,
                     group_col,
+                    value_col,
                     error,
                 });
                 continue;
@@ -8504,6 +8510,58 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             let value_sql_type = &spec.value_sql_type;
             let agg_expr = &spec.agg_sql_expr;
             let group_col_q = format!("\"{}\"", spec.group_col);
+
+            // #1364 encryption correctness: grouped aggregates cannot operate on
+            // an at-rest `#[encrypted(...)]` column. The stored value is
+            // ciphertext, so grouping would return ciphertext keys deserialized
+            // into the declared key type, and `.filter_eq(plaintext)` would bind
+            // plaintext against a ciphertext column and match nothing (the
+            // `find_by` path avoids this by routing string params through the
+            // registry encoder; this raw-SQL path cannot). Whether a column is
+            // encrypted is only known at runtime — the mode is declared on the
+            // model, which the repository macro cannot see (see
+            // `encode_derived_query_param`) — so this is a runtime guard against
+            // the SAME registry the `find_by` surface consults, not a
+            // `compile_error!`. It rejects only columns that are actually
+            // encrypted, so non-encrypted grouping (e.g. `count_grouped_by_kind`
+            // on a plain `String`) is unchanged. The escape hatch is a raw query.
+            let enc_guard = {
+                let fn_name_str = spec.fn_ident.to_string();
+                let group_col_raw = spec.group_col.as_str();
+                let mut checks: Vec<TokenStream> = vec![quote! {
+                    if ::autumn_web::encryption::is_encrypted_column(#table_name, #group_col_raw) {
+                        return ::core::result::Result::Err(
+                            ::autumn_web::AutumnError::internal_server_error_msg(
+                                ::std::format!(
+                                    "`{m}`: grouped aggregates are not supported on the encrypted \
+                                     column `{c}` (its stored value is ciphertext; grouping/filtering \
+                                     would compare or return ciphertext). Use a raw query, or group on \
+                                     a non-encrypted column.",
+                                    m = #fn_name_str, c = #group_col_raw,
+                                )
+                            )
+                        );
+                    }
+                }];
+                if let Some(value_col_raw) = spec.value_col.as_deref() {
+                    checks.push(quote! {
+                        if ::autumn_web::encryption::is_encrypted_column(#table_name, #value_col_raw) {
+                            return ::core::result::Result::Err(
+                                ::autumn_web::AutumnError::internal_server_error_msg(
+                                    ::std::format!(
+                                        "`{m}`: grouped aggregates are not supported on the encrypted \
+                                         column `{c}` (its stored value is ciphertext; grouping/filtering \
+                                         would compare or return ciphertext). Use a raw query, or group on \
+                                         a non-encrypted column.",
+                                        m = #fn_name_str, c = #value_col_raw,
+                                    )
+                                )
+                            );
+                        }
+                    });
+                }
+                quote! { #(#checks)* }
+            };
             // #1364 timezone correctness: only a `timestamptz` (`DateTime<Utc>`)
             // bucket key gets the UTC-pinning 3-arg `date_trunc` zone argument.
             // A `NaiveDateTime` (`timestamp`) key keeps the plain 2-arg form
@@ -8533,6 +8591,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 use ::autumn_web::reexports::diesel::prelude::*;
                                 use ::autumn_web::reexports::diesel_async::RunQueryDsl;
 
+                                #enc_guard
                                 #cross_shard_guard
                                 #tenant_resolve
 
@@ -12401,6 +12460,52 @@ mod tests {
         assert!(
             generated.contains("nullable group keys are unsupported"),
             "compile_error must explain nullable group keys are unsupported: {generated}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_grouped_aggregate_guards_encrypted_columns() {
+        // §1364 encryption correctness: whether a column is `#[encrypted(...)]`
+        // is declared on the model and is only known at runtime (the repository
+        // macro sees the trait, not the model's fields — see
+        // `encode_derived_query_param`), so a `compile_error!` cannot name the
+        // encrypted column. Instead the generated grouped-aggregate method emits
+        // a runtime guard against the SAME `is_encrypted_column` registry the
+        // `find_by` surface consults, rejecting both the group column and the
+        // aggregated numeric column before running any SQL. It fires only for
+        // columns that are actually encrypted, so non-encrypted grouping is
+        // unchanged (asserted separately by the other grouped-aggregate tests,
+        // whose generated bodies never early-return).
+        let generated = repository_macro(
+            quote! { Event, table = "events" },
+            quote! {
+                pub trait EventRepository {
+                    fn sum_secret_grouped_by_email() -> Vec<(String, Option<i64>)>;
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("is_encrypted_column"),
+            "grouped aggregate must guard against encrypted columns at runtime: {generated}"
+        );
+        // Both the group column and the aggregated value column are guarded.
+        assert!(
+            generated.contains("\"email\""),
+            "guard must check the group column `email`: {generated}"
+        );
+        assert!(
+            generated.contains("\"secret\""),
+            "guard must check the aggregated value column `secret`: {generated}"
+        );
+        assert!(
+            generated.contains("not supported on the encrypted"),
+            "guard message must name the encrypted-column restriction: {generated}"
+        );
+        assert!(
+            generated.contains("Use a raw query"),
+            "guard message must point to the raw-SQL escape hatch: {generated}"
         );
     }
 
