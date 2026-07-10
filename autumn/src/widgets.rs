@@ -4097,6 +4097,23 @@ fn norm_frac(v: f64, min: f64, max: f64) -> f64 {
     }
 }
 
+/// Map a value to a `0.0..=1.0` fraction for a **bar** height. Identical to
+/// [`norm_frac`] except for the degenerate zero-span domain (single point,
+/// all-equal values, or a `min == max` override): the `0.5` midline that suits a
+/// flat line would draw every bar at half height, implying nonzero magnitude for
+/// an all-zero series. Instead the fallback reads the shared value's sign — a
+/// non-positive value (including all-zero) yields `0.0` (no visible bar) and a
+/// positive value yields `1.0` (a full bar).
+#[cfg(feature = "maud")]
+fn bar_norm_frac(v: f64, min: f64, max: f64) -> f64 {
+    let span = max - min;
+    if span <= 0.0 {
+        if v.is_finite() && v > 0.0 { 1.0 } else { 0.0 }
+    } else {
+        norm_frac(v, min, max)
+    }
+}
+
 /// Compute the plotted `(x, y)` pixel coordinates for each point within a
 /// `w × h` viewBox, inset by `pad` on every edge.
 ///
@@ -4322,7 +4339,7 @@ pub fn bar_chart_with(series: &[(&str, f64)], config: &ChartConfig<'_>) -> maud:
             @let slot = (W - 2.0 * PAD) / n as f64;
             @let bar_w = slot * 0.7;
             @for (i, (_, v)) in series.iter().enumerate() {
-                @let frac = norm_frac(*v, min, max);
+                @let frac = bar_norm_frac(*v, min, max);
                 @let bar_h = frac * usable_h;
                 @let x = PAD + i as f64 * slot + (slot - bar_w) / 2.0;
                 @let y = H - PAD - bar_h;
@@ -6106,11 +6123,28 @@ mod tests {
     }
 
     #[test]
-    fn all_equal_values_place_bars_at_mid_height() {
+    fn all_equal_positive_values_render_full_height_bars() {
         let html = bar_chart(&[("a", 4.0), ("b", 4.0), ("c", 4.0)]).into_string();
         assert!(!html.contains("NaN"), "{html}");
-        // span == 0 → every bar is half the usable height (18 * 0.5 = 9).
-        assert_eq!(html.matches(r#"height="18""#).count(), 3, "{html}");
+        // Degenerate span (all-equal positive): read as full-magnitude bars, so
+        // every bar spans the full usable height (H - 2*PAD = 40 - 4 = 36), not
+        // the 0.5 midline that suits a flat line.
+        assert_eq!(html.matches(r#"height="36""#).count(), 3, "{html}");
+        assert!(!html.contains(r#"height="18""#), "not half height: {html}");
+    }
+
+    #[test]
+    fn all_zero_bars_render_zero_height() {
+        // All-zero (zero-activity) series: the degenerate-span midline would draw
+        // misleading half-height bars. Instead the bars must have zero height.
+        let html = bar_chart(&[("a", 0.0), ("b", 0.0)]).into_string();
+        assert!(!html.contains("NaN"), "{html}");
+        assert_eq!(html.matches(r#"height="0""#).count(), 2, "{html}");
+        // No positive-height bar rect (in particular, no half-height 18).
+        assert!(
+            !html.contains(r#"height="18""#),
+            "no half-height bars: {html}"
+        );
     }
 
     #[test]
