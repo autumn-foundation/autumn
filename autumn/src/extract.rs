@@ -181,7 +181,7 @@ impl Multipart {
     /// Returns [`crate::AutumnError`] when multipart parsing fails or the
     /// field MIME type is not allowed by config.
     pub async fn next_field(&mut self) -> crate::AutumnResult<Option<MultipartField<'_>>> {
-        let Some(field) = self
+        let Some(mut field) = self
             .inner
             .next_field()
             .await
@@ -190,30 +190,197 @@ impl Multipart {
             return Ok(None);
         };
 
-        // Only enforce MIME allow-lists for file parts. Regular form
-        // fields often omit `Content-Type`.
-        if field.file_name().is_some() && !self.config.allowed_mime_types.is_empty() {
-            let Some(content_type) = field.content_type().map(str::to_owned) else {
-                return Err(crate::AutumnError::bad_request_msg(
-                    "missing content type on uploaded file",
-                ));
-            };
-            if !self
-                .config
-                .allowed_mime_types
-                .iter()
-                .any(|allowed| allowed.eq_ignore_ascii_case(&content_type))
+        // Only file parts carry uploadable content worth validating. Regular
+        // form fields often omit `Content-Type` and are never sniffed.
+        //
+        // We sniff whenever an allow-list is configured OR strict
+        // mismatch-rejection is enabled — either check needs the actual
+        // (magic-byte) content type rather than the spoofable client header.
+        let needs_sniff = field.file_name().is_some()
+            && (!self.config.allowed_mime_types.is_empty()
+                || self.config.reject_on_content_type_mismatch);
+
+        if !needs_sniff {
+            return Ok(Some(MultipartField::new(
+                field,
+                self.config.max_file_size_bytes,
+            )));
+        }
+
+        // Buffer a bounded leading prefix (a few chunks at most) for sniffing,
+        // preserving streaming: the rest of the field is still pulled lazily by
+        // the consuming methods, which replay this prefix first.
+        let mut prefix: Vec<u8> = Vec::with_capacity(SNIFF_PREFIX_BYTES);
+        while prefix.len() < SNIFF_PREFIX_BYTES {
+            match field
+                .chunk()
+                .await
+                .map_err(|err| multipart_error_to_error(&err))?
             {
-                return Err(crate::AutumnError::bad_request_msg(format!(
-                    "unsupported upload content type: {content_type}"
-                )));
+                Some(chunk) => {
+                    prefix.extend_from_slice(&chunk);
+                    // Reject as soon as the buffered prefix exceeds the per-file
+                    // cap, so an oversized leading chunk bails without reading on.
+                    if prefix.len() > self.config.max_file_size_bytes {
+                        return Err(file_too_large_error(self.config.max_file_size_bytes));
+                    }
+                }
+                None => break,
             }
+        }
+
+        // Borrow the declared header rather than allocating: `declared_essence`
+        // only needs a slice, and the borrow of `field` ends before it is moved
+        // into the returned wrapper below.
+        // Compare on the type ESSENCE (media type without parameters), so a
+        // header like `image/png; charset=binary` matches sniffed `image/png`.
+        let declared_essence = field.content_type().map(content_type_essence);
+        let sniffed = sniff_content_type(&prefix);
+
+        // Enforce the allow-list (sniffed → markup-guard → declared fallback)
+        // and, when enabled, strict declared-vs-sniffed matching. See the
+        // helpers below for the exact rules.
+        if !self.config.allowed_mime_types.is_empty() {
+            enforce_upload_allow_list(
+                &self.config.allowed_mime_types,
+                &prefix,
+                declared_essence,
+                sniffed,
+            )?;
+        }
+        if self.config.reject_on_content_type_mismatch {
+            enforce_content_type_match(declared_essence, sniffed)?;
         }
 
         Ok(Some(MultipartField {
             inner: field,
             max_file_size_bytes: self.config.max_file_size_bytes,
+            prefix,
+            sniffed_content_type: sniffed,
         }))
+    }
+}
+
+/// Sniff the content type of a file from its leading bytes via magic-byte
+/// detection. Returns `None` when the format is unrecognized. `infer` yields a
+/// `&'static str` media type, so no allocation is needed.
+#[cfg(feature = "multipart")]
+fn sniff_content_type(prefix: &[u8]) -> Option<&'static str> {
+    infer::get(prefix).map(|kind| kind.mime_type())
+}
+
+/// The essence of a content-type header — the media type without any
+/// parameters (e.g. `image/png` from `image/png; charset=binary`).
+#[cfg(feature = "multipart")]
+fn content_type_essence(raw: &str) -> &str {
+    raw.split(';').next().unwrap_or("").trim()
+}
+
+/// Whether the leading bytes look like textual markup (`<…`), after skipping a
+/// UTF-8 BOM and any leading ASCII whitespace. Catches HTML (`<!DOCTYPE`,
+/// `<html`, `<script`), SVG (`<svg`), and XML (`<?xml`) that `infer` cannot
+/// recognize by magic bytes, so they can never be admitted via the declared
+/// content-type fallback.
+#[cfg(feature = "multipart")]
+fn prefix_looks_like_markup(prefix: &[u8]) -> bool {
+    let bytes = prefix.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(prefix);
+    let trimmed = bytes
+        .iter()
+        .position(|byte| !byte.is_ascii_whitespace())
+        .map_or(&[][..], |idx| &bytes[idx..]);
+    trimmed.first() == Some(&b'<')
+}
+
+/// Bound a content-type value before echoing it into an error message, so a
+/// hostile client can't inflate responses with an arbitrarily long header.
+#[cfg(feature = "multipart")]
+fn truncate_for_error(value: &str) -> String {
+    const MAX_CHARS: usize = 128;
+    value.chars().take(MAX_CHARS).collect()
+}
+
+/// Types that legitimately have no magic-byte signature, so a content sniff of
+/// `None` is expected and the declared type may be trusted for the allow-list.
+/// Binary/sniffable types (image/*, application/pdf, …) are deliberately
+/// excluded: a genuine one always sniffs positively, so `None` for such a type
+/// means the declared header is spoofed.
+#[cfg(feature = "multipart")]
+fn is_signatureless_text_type(essence: &str) -> bool {
+    // Media types are case-insensitive, so normalize before comparing.
+    let lower = essence.to_ascii_lowercase();
+    lower.starts_with("text/") || matches!(lower.as_str(), "application/json" | "application/csv")
+}
+
+/// Enforce a MIME allow-list against a file part, using content sniffing as the
+/// primary signal. `infer` only recognizes binary formats by magic bytes; text
+/// formats (text/plain, application/json, text/csv, …) have no signature and
+/// always sniff to `None`. Precedence:
+///
+/// 1. **Sniffed recognized** → must be in the list, else reject. Header ignored.
+/// 2. **Unrecognized + markup** (leading `<…`) → reject unconditionally, so
+///    HTML/SVG/XML can't ride in under a spoofed declared type.
+/// 3. **Unrecognized + not markup** → the declared header is trusted ONLY when
+///    it names a signature-less TEXT type (see [`is_signatureless_text_type`])
+///    that is in the list. A declared binary/sniffable type on unrecognizable
+///    bytes is definitionally a spoof (a real one would have sniffed) → reject.
+#[cfg(feature = "multipart")]
+fn enforce_upload_allow_list(
+    allowed: &[String],
+    prefix: &[u8],
+    declared_essence: Option<&str>,
+    sniffed: Option<&str>,
+) -> crate::AutumnResult<()> {
+    let in_list = |value: &str| {
+        allowed
+            .iter()
+            .any(|entry| entry.eq_ignore_ascii_case(value))
+    };
+    if let Some(sniffed) = sniffed {
+        if !in_list(sniffed) {
+            return Err(crate::AutumnError::bad_request_msg(format!(
+                "upload content type not allowed: sniffed={sniffed}"
+            )));
+        }
+    } else if prefix_looks_like_markup(prefix) {
+        return Err(crate::AutumnError::bad_request_msg(
+            "upload rejected: unrecognized file content looks like markup",
+        ));
+    } else if !matches!(
+        declared_essence,
+        Some(essence) if is_signatureless_text_type(essence) && in_list(essence)
+    ) {
+        return Err(crate::AutumnError::bad_request_msg(format!(
+            "upload content type could not be verified from its content: declared={}",
+            declared_essence.map_or_else(String::new, truncate_for_error)
+        )));
+    }
+    Ok(())
+}
+
+/// Strict declared-vs-sniffed matching (`reject_on_content_type_mismatch`).
+/// Comparison is on the declared essence. Omitting the header is itself a
+/// failure — otherwise an attacker could bypass the check by sending no
+/// `Content-Type`.
+#[cfg(feature = "multipart")]
+fn enforce_content_type_match(
+    declared_essence: Option<&str>,
+    sniffed: Option<&str>,
+) -> crate::AutumnResult<()> {
+    let Some(declared_essence) = declared_essence else {
+        return Err(crate::AutumnError::bad_request_msg(
+            "content-type mismatch check enabled but the upload declared no content type",
+        ));
+    };
+    match sniffed {
+        Some(sniffed) if declared_essence.eq_ignore_ascii_case(sniffed) => Ok(()),
+        Some(sniffed) => Err(crate::AutumnError::bad_request_msg(format!(
+            "declared content type {} does not match sniffed content type {sniffed}",
+            truncate_for_error(declared_essence)
+        ))),
+        None => Err(crate::AutumnError::bad_request_msg(format!(
+            "cannot verify declared content type {}: file content is unrecognized",
+            truncate_for_error(declared_essence)
+        ))),
     }
 }
 
@@ -243,16 +410,32 @@ where
     }
 }
 
+/// Number of leading bytes buffered for magic-byte content sniffing.
+///
+/// `infer` only needs a small header prefix to recognize a format, so we read
+/// at most this many bytes (a few chunks) and never buffer the whole upload.
+#[cfg(feature = "multipart")]
+const SNIFF_PREFIX_BYTES: usize = 512;
+
 /// A multipart field wrapper that provides safe streaming helpers.
 #[cfg(feature = "multipart")]
 pub struct MultipartField<'a> {
     inner: axum::extract::multipart::Field<'a>,
     max_file_size_bytes: usize,
+    /// Leading bytes already consumed from `inner` during content sniffing.
+    /// Empty when no sniffing occurred. Consuming methods must emit these
+    /// first so the already-read prefix is not lost.
+    prefix: Vec<u8>,
+    /// Sniffed (magic-byte) content type, if the leading bytes were recognized.
+    /// `infer` returns a `&'static str`, so this stores the borrow directly.
+    sniffed_content_type: Option<&'static str>,
 }
 
 #[cfg(all(feature = "multipart", feature = "storage"))]
 struct MultipartFieldStreamState<'a> {
     inner: axum::extract::multipart::Field<'a>,
+    /// Sniffed prefix bytes to emit before draining `inner`. Taken once.
+    prefix: Option<bytes::Bytes>,
     total: usize,
     max: usize,
     errored: bool,
@@ -261,10 +444,33 @@ struct MultipartFieldStreamState<'a> {
 #[cfg(feature = "multipart")]
 #[allow(clippy::elidable_lifetime_names)]
 impl<'a> MultipartField<'a> {
+    /// Wrap a raw multipart field with no sniffed prefix (the common path for
+    /// non-file parts or when no content validation is configured).
+    const fn new(inner: axum::extract::multipart::Field<'a>, max_file_size_bytes: usize) -> Self {
+        Self {
+            inner,
+            max_file_size_bytes,
+            prefix: Vec::new(),
+            sniffed_content_type: None,
+        }
+    }
+
     /// Field name from the multipart form.
     #[must_use]
     pub fn name(&self) -> Option<&str> {
         self.inner.name()
+    }
+
+    /// The sniffed (magic-byte) content type of this field, if it was
+    /// validated by content and the format was recognized.
+    ///
+    /// Returns `None` when no sniffing occurred (non-file part, or no
+    /// allow-list / mismatch policy configured) or the content was
+    /// unrecognized. Prefer this over [`content_type`](Self::content_type),
+    /// which returns the spoofable client-declared header.
+    #[must_use]
+    pub const fn sniffed_content_type(&self) -> Option<&str> {
+        self.sniffed_content_type
     }
 
     /// Uploaded file name (if this field represents a file).
@@ -312,8 +518,14 @@ impl<'a> MultipartField<'a> {
     /// Returns `413 Payload Too Large` if the field exceeds
     /// `security.upload.max_file_size_bytes`.
     pub async fn bytes_limited(mut self) -> crate::AutumnResult<Vec<u8>> {
-        let mut out = Vec::new();
-        let mut read = 0usize;
+        // Reuse the sniff prefix as the output buffer: it already holds exactly
+        // the leading bytes in order, so appending the inner stream after it
+        // reproduces the original byte sequence with no extra allocation.
+        let mut out = self.prefix;
+        let mut read = out.len();
+        if read > self.max_file_size_bytes {
+            return Err(file_too_large_error(self.max_file_size_bytes));
+        }
         while let Some(chunk) = self
             .inner
             .chunk()
@@ -375,17 +587,28 @@ impl<'a> MultipartField<'a> {
         'a: 'b,
     {
         let key = key.into();
+        // Persist the VERIFIED (sniffed) type when available, falling back to
+        // the client-declared header only when no sniffing occurred.
         let content_type = self
-            .inner
-            .content_type()
-            .map_or_else(|| "application/octet-stream".to_owned(), str::to_owned);
+            .sniffed_content_type
+            .map(str::to_owned)
+            .or_else(|| self.inner.content_type().map(str::to_owned))
+            .unwrap_or_else(|| "application/octet-stream".to_owned());
+
+        let prefix = if self.prefix.is_empty() {
+            None
+        } else {
+            Some(bytes::Bytes::from(self.prefix))
+        };
 
         // Adapt the multipart chunk iterator into the trait's
         // `ByteStream`, enforcing the per-file size cap as we go so we
         // never buffer the whole upload in memory and large files flow
-        // straight through to the store's streaming path.
+        // straight through to the store's streaming path. Any sniffed prefix
+        // is replayed as the first chunk so it is not lost.
         let state = MultipartFieldStreamState {
             inner: self.inner,
+            prefix,
             total: 0,
             max: self.max_file_size_bytes,
             errored: false,
@@ -394,6 +617,18 @@ impl<'a> MultipartField<'a> {
         let stream = futures::stream::unfold(state, |mut state| async move {
             if state.errored {
                 return None;
+            }
+            if let Some(prefix) = state.prefix.take() {
+                state.total = state.total.saturating_add(prefix.len());
+                if state.total > state.max {
+                    let err = crate::storage::BlobStoreError::PayloadTooLarge(format!(
+                        "uploaded file exceeds limit of {} bytes",
+                        state.max,
+                    ));
+                    state.errored = true;
+                    return Some((Err(err), state));
+                }
+                return Some((Ok(prefix), state));
             }
             match state.inner.chunk().await {
                 Ok(Some(chunk)) => {
@@ -448,6 +683,19 @@ impl<'a> MultipartField<'a> {
             .map_err(crate::AutumnError::internal_server_error)?;
 
         let mut written = 0usize;
+        // Write any sniffed prefix bytes first so they are not lost, counting
+        // them toward the per-file cap.
+        if !self.prefix.is_empty() {
+            written += self.prefix.len();
+            if written > self.max_file_size_bytes {
+                drop(file);
+                let _ = tokio::fs::remove_file(path).await;
+                return Err(file_too_large_error(self.max_file_size_bytes));
+            }
+            file.write_all(&self.prefix)
+                .await
+                .map_err(crate::AutumnError::internal_server_error)?;
+        }
         while let Some(chunk) = self
             .inner
             .chunk()
@@ -535,10 +783,7 @@ mod tests {
             .unwrap();
         let field = multipart.next_field().await.unwrap().unwrap();
 
-        let wrapper = MultipartField {
-            inner: field,
-            max_file_size_bytes: 100,
-        };
+        let wrapper = MultipartField::new(field, 100);
 
         let bytes = wrapper.bytes_limited().await.unwrap();
         assert_eq!(bytes, b"hello");
@@ -557,10 +802,7 @@ mod tests {
             .unwrap();
         let field = multipart.next_field().await.unwrap().unwrap();
 
-        let wrapper = MultipartField {
-            inner: field,
-            max_file_size_bytes: 5,
-        };
+        let wrapper = MultipartField::new(field, 5);
 
         let err = wrapper.bytes_limited().await.unwrap_err();
         assert_eq!(err.status(), http::StatusCode::PAYLOAD_TOO_LARGE);
@@ -579,10 +821,7 @@ mod tests {
             .unwrap();
         let field = multipart.next_field().await.unwrap().unwrap();
 
-        let wrapper = MultipartField {
-            inner: field,
-            max_file_size_bytes: 100,
-        };
+        let wrapper = MultipartField::new(field, 100);
 
         let dir = tempfile::tempdir().unwrap();
         let file_path = dir.path().join("out.txt");
@@ -607,10 +846,7 @@ mod tests {
             .unwrap();
         let field = multipart.next_field().await.unwrap().unwrap();
 
-        let wrapper = MultipartField {
-            inner: field,
-            max_file_size_bytes: 4,
-        };
+        let wrapper = MultipartField::new(field, 4);
 
         let dir = tempfile::tempdir().unwrap();
         let file_path = dir.path().join("out_large.txt");
@@ -638,10 +874,7 @@ mod tests {
             .unwrap();
         let field = multipart.next_field().await.unwrap().unwrap();
 
-        let wrapper = MultipartField {
-            inner: field,
-            max_file_size_bytes: 100,
-        };
+        let wrapper = MultipartField::new(field, 100);
 
         let root = tempfile::tempdir().unwrap();
         let store = LocalBlobStore::new(
@@ -679,10 +912,7 @@ mod tests {
             .unwrap();
         let field = multipart.next_field().await.unwrap().unwrap();
 
-        let wrapper = MultipartField {
-            inner: field,
-            max_file_size_bytes: 4, // "blob content" is 12 bytes
-        };
+        let wrapper = MultipartField::new(field, 4); // "blob content" is 12 bytes
 
         let root = tempfile::tempdir().unwrap();
         let store = LocalBlobStore::new(
@@ -719,10 +949,7 @@ mod tests {
             .unwrap();
         let field = multipart.next_field().await.unwrap().unwrap();
 
-        let wrapper = MultipartField {
-            inner: field,
-            max_file_size_bytes: 100,
-        };
+        let wrapper = MultipartField::new(field, 100);
 
         assert_eq!(wrapper.name(), Some("custom_name"));
         assert_eq!(wrapper.file_name(), Some("custom_file.png"));
@@ -733,6 +960,100 @@ mod tests {
 
         let not_tighter = tighter.with_max_bytes(200);
         assert_eq!(not_tighter.max_file_size_bytes, 50); // should not relax
+    }
+
+    #[test]
+    fn sniff_content_type_recognizes_png() {
+        let png = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00];
+        assert_eq!(sniff_content_type(&png), Some("image/png"));
+    }
+
+    #[test]
+    fn sniff_content_type_unknown_is_none() {
+        assert_eq!(sniff_content_type(&[0x01, 0x02]), None);
+        assert_eq!(sniff_content_type(&[]), None);
+    }
+
+    #[test]
+    fn content_type_essence_strips_parameters() {
+        assert_eq!(
+            content_type_essence("image/png; charset=binary"),
+            "image/png"
+        );
+        assert_eq!(content_type_essence("  text/csv  "), "text/csv");
+        assert_eq!(content_type_essence("application/json"), "application/json");
+        assert_eq!(content_type_essence(""), "");
+    }
+
+    #[test]
+    fn is_signatureless_text_type_is_case_insensitive() {
+        // Media types are case-insensitive, so mixed-case declarations must be
+        // recognized as signature-less text.
+        assert!(is_signatureless_text_type("text/csv"));
+        assert!(is_signatureless_text_type("Text/Csv"));
+        assert!(is_signatureless_text_type("TEXT/PLAIN"));
+        assert!(is_signatureless_text_type("application/json"));
+        assert!(is_signatureless_text_type("Application/JSON"));
+        assert!(is_signatureless_text_type("application/csv"));
+        // Binary/sniffable types are never treated as signature-less text —
+        // the P1 fix must be preserved regardless of case.
+        assert!(!is_signatureless_text_type("image/png"));
+        assert!(!is_signatureless_text_type("Image/PNG"));
+        assert!(!is_signatureless_text_type("application/octet-stream"));
+        assert!(!is_signatureless_text_type("application/pdf"));
+    }
+
+    #[test]
+    fn prefix_looks_like_markup_detects_leading_angle_bracket() {
+        assert!(prefix_looks_like_markup(b"<!DOCTYPE html>"));
+        assert!(prefix_looks_like_markup(b"<svg onload=alert(1)>"));
+        assert!(prefix_looks_like_markup(b"<?xml version=\"1.0\"?>"));
+        // Leading whitespace and a UTF-8 BOM are skipped.
+        assert!(prefix_looks_like_markup(b"   \n\t<html>"));
+        assert!(prefix_looks_like_markup(&[0xEF, 0xBB, 0xBF, b'<', b'a']));
+        // Genuine non-markup text and binary are not flagged.
+        assert!(!prefix_looks_like_markup(b"a,b\n1,2"));
+        assert!(!prefix_looks_like_markup(br#"{"a":1}"#));
+        assert!(!prefix_looks_like_markup(&[0x01, 0x02]));
+        assert!(!prefix_looks_like_markup(b""));
+    }
+
+    #[tokio::test]
+    async fn next_field_exposes_sniffed_content_type_for_genuine_png() {
+        // Genuine PNG bytes declared as octet-stream: the extractor must
+        // recognize the real type from magic bytes and expose it.
+        let mut body: Vec<u8> = Vec::new();
+        body.extend_from_slice(
+            b"--boundary\r\nContent-Disposition: form-data; name=\"file\"; \
+              filename=\"real.png\"\r\nContent-Type: application/octet-stream\r\n\r\n",
+        );
+        body.extend_from_slice(&[
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+            0x44, 0x52,
+        ]);
+        body.extend_from_slice(b"\r\n--boundary--\r\n");
+
+        let req = Request::builder()
+            .header("content-type", "multipart/form-data; boundary=boundary")
+            .body(axum::body::Body::from(body))
+            .unwrap();
+
+        let inner = axum::extract::Multipart::from_request(req, &())
+            .await
+            .unwrap();
+        let mut multipart = Multipart {
+            inner,
+            config: crate::security::config::UploadConfig {
+                allowed_mime_types: vec!["image/png".to_owned()],
+                ..crate::security::config::UploadConfig::default()
+            },
+        };
+
+        let field = multipart.next_field().await.unwrap().unwrap();
+        assert_eq!(field.sniffed_content_type(), Some("image/png"));
+        // The prefix bytes consumed during sniffing are not lost.
+        let bytes = field.bytes_limited().await.unwrap();
+        assert_eq!(bytes.len(), 16);
     }
 }
 

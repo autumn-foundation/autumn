@@ -20,7 +20,7 @@ flash = []
 cache-moka = ["dep:moka"]
 maud = ["dep:maud"]
 htmx = []
-multipart = ["axum/multipart"]
+multipart = ["axum/multipart", "dep:infer"]
 tailwind = []
 http-client = ["dep:reqwest"]
 oauth2 = ["http-client"]
@@ -218,6 +218,7 @@ secrecy = { version = "0.10.3", features = ["serde"] }
 lru = "0.18.0"
 hmac = "0.12"
 sha2 = "0.10"
+infer = { version = "0.16", optional = true }
 sha1 = { version = "0.10", optional = true }
 rsa = { version = "0.9", default-features = false, features = ["std", "pem"], optional = true }
 aes-gcm = "0.10"

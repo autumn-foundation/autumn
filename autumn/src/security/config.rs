@@ -54,6 +54,7 @@
 //! | `AUTUMN_SECURITY__UPLOAD__MAX_REQUEST_SIZE_BYTES` | `security.upload.max_request_size_bytes` | `usize` |
 //! | `AUTUMN_SECURITY__UPLOAD__MAX_FILE_SIZE_BYTES` | `security.upload.max_file_size_bytes` | `usize` |
 //! | `AUTUMN_SECURITY__UPLOAD__ALLOWED_MIME_TYPES` | `security.upload.allowed_mime_types` | comma-separated `String` |
+//! | `AUTUMN_SECURITY__UPLOAD__REJECT_ON_CONTENT_TYPE_MISMATCH` | `security.upload.reject_on_content_type_mismatch` | `bool` |
 //! | `AUTUMN_SECURITY__WEBHOOKS__REPLAY__BACKEND` | `security.webhooks.replay.backend` | `memory` / `redis` |
 //! | `AUTUMN_SECURITY__WEBHOOKS__REPLAY__REDIS__URL` | `security.webhooks.replay.redis.url` | `String` |
 //! | `AUTUMN_SECURITY__WEBHOOKS__REPLAY__REDIS__KEY_PREFIX` | `security.webhooks.replay.redis.key_prefix` | `String` |
@@ -1143,8 +1144,17 @@ fn default_rate_limit_redis_key_prefix() -> String {
 /// - `max_request_size_bytes`: global request body cap (enforced by middleware)
 /// - `max_file_size_bytes`: per-file cap for `crate::extract::Multipart` helpers
 /// - `allowed_mime_types`: optional MIME-type allow list for uploaded parts
+/// - `reject_on_content_type_mismatch`: strict mode that rejects when the
+///   client-declared `Content-Type` disagrees with the sniffed content
 ///
 /// Leave `allowed_mime_types` empty to allow any content type.
+///
+/// # Content sniffing
+///
+/// The `crate::extract::Multipart` extractor validates uploaded file parts by
+/// their actual content (magic bytes), **not** the spoofable client-declared
+/// `Content-Type` header. See `allowed_mime_types` for the exact sniffed →
+/// markup-guard → declared-fallback precedence used when a list is configured.
 #[derive(Debug, Clone, Deserialize)]
 pub struct UploadConfig {
     /// Maximum total multipart request body size in bytes.
@@ -1154,8 +1164,43 @@ pub struct UploadConfig {
     #[serde(default = "default_max_file_size_bytes")]
     pub max_file_size_bytes: usize,
     /// Optional allowed MIME types (e.g. `["image/png", "image/jpeg"]`).
+    ///
+    /// Enforced primarily against the **sniffed** (magic-byte) content type,
+    /// never blindly against the client-declared header. Because `infer` only
+    /// recognizes binary formats, the check applies this precedence for each
+    /// file part when the list is non-empty:
+    ///
+    /// 1. **Sniffed type recognized** → it must appear in the list, else the
+    ///    upload is rejected (`400`). The declared header is ignored.
+    /// 2. **Unrecognized but looks like markup** (leading `<…` after a BOM /
+    ///    whitespace — HTML, SVG, XML) → always rejected (`400`), so scripts
+    ///    or `<svg onload=…>` can't ride in under a spoofed declared type.
+    /// 3. **Unrecognized and not markup** → the declared content-type essence
+    ///    (media type without parameters) is trusted **only** when it names a
+    ///    signature-less TEXT type (`text/*`, `application/json`,
+    ///    `application/csv`) that appears in the list. Binary/sniffable types
+    ///    (`image/*`, `application/pdf`, …) are always enforced strictly by
+    ///    magic bytes: unrecognizable bytes declaring such a type are rejected
+    ///    (`400`), since a genuine file of that type would have sniffed
+    ///    positively. This is the only case where the declared header is
+    ///    trusted, and only to disambiguate among signature-less text formats.
     #[serde(default)]
     pub allowed_mime_types: Vec<String>,
+    /// When `true`, reject an uploaded file part if the client-declared
+    /// `Content-Type` header disagrees with the sniffed (magic-byte) content
+    /// type. Default: `false`.
+    ///
+    /// Behavior when enabled (comparison uses the declared essence — the media
+    /// type without parameters):
+    /// - declared and sniffed both known but differ → reject (`400`)
+    /// - declared known but content unrecognized (sniffed unknown) → reject
+    ///   (`400`, the declared type cannot be verified)
+    /// - no declared header → reject (`400`); omitting `Content-Type` must not
+    ///   silently bypass the mismatch check
+    ///
+    /// This is independent of `allowed_mime_types`; both checks apply when set.
+    #[serde(default)]
+    pub reject_on_content_type_mismatch: bool,
 }
 
 impl Default for UploadConfig {
@@ -1164,6 +1209,7 @@ impl Default for UploadConfig {
             max_request_size_bytes: default_max_request_size_bytes(),
             max_file_size_bytes: default_max_file_size_bytes(),
             allowed_mime_types: Vec::new(),
+            reject_on_content_type_mismatch: false,
         }
     }
 }
