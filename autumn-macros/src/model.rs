@@ -966,9 +966,11 @@ fn validate_attrs(field: &Field) -> Vec<&syn::Attribute> {
         .collect()
 }
 
-/// `validator` validators that have NO `Patch<T>` per-field trait impl (or are
-/// struct-level / cross-field rules), so they cannot be enforced on the
-/// generated `UpdateModel` `Patch<T>` fields (see `validate_attrs_for_patch`).
+/// `validator` validators that cannot be soundly enforced on the generated
+/// `UpdateModel` `Patch<T>` fields: either they have NO `Patch<T>` per-field
+/// trait impl (struct-level / cross-field rules), or their `Patch<T>` impl
+/// inverts our absent-field skip semantics (`does_not_contain`). See
+/// `validate_attrs_for_patch` for the full rationale.
 const NON_PATCH_VALIDATORS: &[&str] = &[
     "custom",
     "must_match",
@@ -976,6 +978,7 @@ const NON_PATCH_VALIDATORS: &[&str] = &[
     "required",
     "credit_card",
     "non_control_character",
+    "does_not_contain",
 ];
 
 /// Like [`validate_attrs`], but tailored for the `UpdateModel` `Patch<T>` fields
@@ -984,20 +987,34 @@ const NON_PATCH_VALIDATORS: &[&str] = &[
 /// `NewModel` fields carry the bare `T` and derive `validator::Validate`
 /// directly, so they keep every validator verbatim. `UpdateModel` fields are
 /// `Patch<T>`, which only implements validator's per-field *declarative* traits
-/// (`length`, `email`, `url`, `range`, `contains`, `does_not_contain`, `ip`,
-/// `regex`, …). The validators in [`NON_PATCH_VALIDATORS`] (`custom`,
-/// `must_match`, `nested`, `required`, `credit_card`, `non_control_character`)
-/// have no `Patch<T>` impl, so propagating them verbatim would break
-/// `UpdateModel` compilation even though `NewModel` still compiles — a latent
-/// footgun for a user who adds e.g. `#[validate(custom(...))]` to a model field.
+/// (`length`, `email`, `url`, `range`, `contains`, `ip`, `regex`, …). The
+/// validators in [`NON_PATCH_VALIDATORS`] (`custom`, `must_match`, `nested`,
+/// `required`, `credit_card`, `non_control_character`) have no `Patch<T>` impl,
+/// so propagating them verbatim would break `UpdateModel` compilation even
+/// though `NewModel` still compiles — a latent footgun for a user who adds e.g.
+/// `#[validate(custom(...))]` to a model field.
+///
+/// `does_not_contain` is also filtered, for a subtler reason: it does compile
+/// on `Patch<T>` (validator supplies it via the blanket
+/// `impl<T: ValidateContains> ValidateDoesNotContain for T`, defined as
+/// `!validate_contains(...)`), but that inverts our skip semantics. Our
+/// `ValidateContains for Patch<T>` returns `true` for an absent field so
+/// `contains` is *skipped*; the blanket flips that to `false`, so an OMITTED
+/// `does_not_contain` field would spuriously *fail* with 422. Since one
+/// `ValidateContains` value can't satisfy both skip directions (and coherence
+/// blocks a direct `ValidateDoesNotContain for Patch<T>` impl), we drop
+/// `does_not_contain` from the PATCH path and enforce it on create only.
+/// `contains` itself stays on the PATCH path — its absent→pass behaviour is
+/// correct.
 ///
 /// This is a *denylist* (not an allowlist): unknown/future validators pass
 /// through untouched, so a newly-supported declarative validator is never
 /// silently dropped.
 ///
-/// Documented limitation: `custom`/`must_match`/`nested`/`required`/etc. are
-/// enforced on create (via `NewModel`) but NOT on the PATCH update path; a
-/// follow-up may add merged-model validation for cross-field/custom rules.
+/// Documented limitation: `custom`/`must_match`/`nested`/`required`/
+/// `does_not_contain`/etc. are enforced on create (via `NewModel`) but NOT on
+/// the PATCH update path; a follow-up may add merged-model validation for
+/// cross-field/custom rules.
 fn validate_attrs_for_patch(field: &Field) -> Vec<syn::Attribute> {
     let mut out = Vec::new();
     for attr in field.attrs.iter().filter(|a| a.path().is_ident("validate")) {
@@ -5434,6 +5451,76 @@ mod tests {
         assert!(
             !upd_section.contains("custom"),
             "UpdateUser must NOT carry the non-declarative `custom` validator: {upd_section}"
+        );
+    }
+
+    #[test]
+    fn update_model_drops_does_not_contain_but_new_model_keeps_it() {
+        // #1719 follow-up: `does_not_contain` reaches `Patch<T>` through
+        // validator's blanket `impl<T: ValidateContains> ValidateDoesNotContain`,
+        // which computes `!validate_contains(...)`. Our `ValidateContains for
+        // Patch<T>` returns `true` for an absent field (so `contains` passes),
+        // which inverts to `false` for `does_not_contain` — an OMITTED patch
+        // field would then spuriously fail with 422. So `does_not_contain` must
+        // be dropped from the `UpdateModel` `Patch<T>` fields (enforced on create
+        // via `NewModel` only), while `contains`/`length` must be RETAINED.
+        let output = model_macro(
+            TokenStream::new(),
+            quote! {
+                pub struct Doc {
+                    #[id]
+                    pub id: i64,
+                    #[validate(length(min = 1), contains(pattern = "ok"), does_not_contain(pattern = "bad"))]
+                    pub name: String,
+                }
+            },
+        );
+        let generated = output.to_string();
+
+        // Slice the `NewDoc` struct body (up to its closing brace).
+        let new_start = generated
+            .find("struct NewDoc")
+            .expect("NewDoc struct must be generated");
+        let new_end = new_start
+            + generated[new_start..]
+                .find('}')
+                .expect("NewDoc struct must close");
+        let new_section = &generated[new_start..new_end];
+        assert!(
+            new_section.contains("does_not_contain"),
+            "NewDoc must keep the `does_not_contain` validator: {new_section}"
+        );
+        assert!(
+            new_section.contains("contains"),
+            "NewDoc must keep the `contains` validator: {new_section}"
+        );
+        assert!(
+            new_section.contains("length"),
+            "NewDoc must keep the `length` validator: {new_section}"
+        );
+
+        // Slice the `UpdateDoc` struct body (up to its closing brace).
+        let upd_start = generated
+            .find("struct UpdateDoc")
+            .expect("UpdateDoc struct must be generated");
+        let upd_end = upd_start
+            + generated[upd_start..]
+                .find('}')
+                .expect("UpdateDoc struct must close");
+        let upd_section = &generated[upd_start..upd_end];
+        assert!(
+            !upd_section.contains("does_not_contain"),
+            "UpdateDoc must NOT carry `does_not_contain` (inverts the Patch skip \
+             value into a spurious 422 for omitted fields): {upd_section}"
+        );
+        // Not over-filtered: `contains` and `length` are still valid on Patch<T>.
+        assert!(
+            upd_section.contains("contains"),
+            "UpdateDoc must keep the declarative `contains` validator: {upd_section}"
+        );
+        assert!(
+            upd_section.contains("length"),
+            "UpdateDoc must keep the declarative `length` validator: {upd_section}"
         );
     }
 
