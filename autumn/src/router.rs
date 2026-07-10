@@ -8789,8 +8789,9 @@ mod proptests {
         /// `"{{}"` (the #1721 regression) only surface via lucky CI seeds. This
         /// strategy draws exclusively from brace/colon/letter characters so
         /// malformed braces are exercised on nearly every case, and a committed
-        /// regression seed (proptest-regressions/router.txt) pins `"{{}"`
-        /// deterministically.
+        /// regression seed (proptest-regressions/router.txt) pins a brace-dense
+        /// input (which replays to `"{{iw:}"` under this strategy) that trips the
+        /// pre-fix brace-in-name bug deterministically.
         #[test]
         fn extract_path_params_brace_inputs_are_brace_free(path in "[{}a-z:]{0,6}") {
             for name in extract_path_params(&path) {
