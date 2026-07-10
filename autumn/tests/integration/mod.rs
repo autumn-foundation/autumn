@@ -132,6 +132,7 @@ mod pg_tls;
 #[cfg(feature = "db")]
 mod preload_scoping;
 mod problem_details;
+mod query_count_asserts;
 mod range;
 mod rate_limit_pipeline;
 mod rate_limit_principal;

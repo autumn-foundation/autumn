@@ -427,8 +427,8 @@ mod tests {
         let timings = Arc::new(RequestDbTimings::default());
         REQUEST_DB_TIMINGS
             .scope(Arc::clone(&timings), async {
-                crate::db::record_request_db_query(Duration::from_micros(1_500));
-                crate::db::record_request_db_query(Duration::from_micros(2_500));
+                crate::db::record_request_db_query(Duration::from_micros(1_500), None);
+                crate::db::record_request_db_query(Duration::from_micros(2_500), None);
             })
             .await;
 

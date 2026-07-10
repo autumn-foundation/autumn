@@ -89,6 +89,37 @@ pub(crate) struct RequestDbTimings {
     pub(crate) total_us: AtomicU64,
     /// Number of instrumented DB queries this request performed.
     pub(crate) query_count: std::sync::atomic::AtomicUsize,
+    /// Opt-in capture of the full SQL query list for this request.
+    ///
+    /// `None` (the `Default`) means capture is **off**: the production
+    /// `Server-Timing` path constructs `RequestDbTimings::default()` and pays
+    /// nothing beyond the count/time bumps. The test harness opts in via
+    /// [`RequestDbTimings::with_capture`], which sets `Some(Vec::new())` so a
+    /// [`crate::inspector::QueryRecord`] is retained per counted statement and
+    /// surfaced to `TestResponse` for query-count / N+1 assertions.
+    pub(crate) captured: std::sync::Mutex<Option<Vec<crate::inspector::QueryRecord>>>,
+}
+
+impl RequestDbTimings {
+    /// Construct an accumulator that additionally captures the full SQL query
+    /// list. Used by the test harness so `TestResponse` can assert on the
+    /// queries a request issued; the production `Server-Timing` path uses
+    /// [`Default`] and captures nothing.
+    pub(crate) fn with_capture() -> Self {
+        Self {
+            captured: std::sync::Mutex::new(Some(Vec::new())),
+            ..Self::default()
+        }
+    }
+
+    /// Swap out and return the captured query list, leaving `None` behind.
+    /// Returns an empty vec when capture was off or the lock was poisoned.
+    pub(crate) fn take_captured(&self) -> Vec<crate::inspector::QueryRecord> {
+        self.captured
+            .lock()
+            .map(|mut g| g.take().unwrap_or_default())
+            .unwrap_or_default()
+    }
 }
 
 tokio::task_local! {
@@ -101,12 +132,27 @@ tokio::task_local! {
 /// [`REQUEST_DB_TIMINGS`], if any. No-op when the task-local is unset —
 /// which is the case whenever the `Server-Timing` middleware is disabled
 /// or the query runs outside a request (e.g. background job).
-pub(crate) fn record_request_db_query(elapsed: Duration) {
+pub(crate) fn record_request_db_query(elapsed: Duration, sql: Option<&str>) {
     let _ = REQUEST_DB_TIMINGS.try_with(|t| {
         let micros = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX);
         t.total_us.fetch_add(micros, Ordering::Relaxed);
         t.query_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // Retain the statement text only when a test opted into capture (see
+        // `RequestDbTimings::with_capture`). A poisoned lock or capture-off
+        // (`None`) accumulator simply skips this — the count/time bumps above
+        // are unaffected.
+        if let Some(sql) = sql
+            && let Ok(mut g) = t.captured.lock()
+            && let Some(list) = g.as_mut()
+        {
+            list.push(crate::inspector::QueryRecord {
+                sql: sql.to_owned(),
+                params: Vec::new(),
+                elapsed_ms: u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+                location: String::new(),
+            });
+        }
     });
 }
 
@@ -183,8 +229,20 @@ pub(crate) fn request_db_timing_active() -> bool {
 #[cfg(feature = "db")]
 #[derive(Default, Debug)]
 pub(crate) struct RequestQueryTimer {
-    /// Start instant of the currently in-flight statement, if any.
-    started_at: Option<std::time::Instant>,
+    /// The currently in-flight statement (start instant + SQL text), if any.
+    pending: Option<PendingQuery>,
+}
+
+/// A statement whose `StartQuery` has fired but whose `FinishQuery` has not.
+///
+/// Holds the start instant (for latency) and the materialised SQL text (so a
+/// capturing accumulator can retain it). Queries on a single connection are
+/// strictly sequential, so a single slot suffices.
+#[cfg(feature = "db")]
+#[derive(Debug)]
+struct PendingQuery {
+    started_at: std::time::Instant,
+    sql: String,
 }
 
 #[cfg(feature = "db")]
@@ -242,13 +300,20 @@ impl RequestQueryTimer {
     /// (non-exhaustive, unstable-to-build) `InstrumentationEvent`.
     fn on_start(&mut self, now: std::time::Instant, sql: impl FnOnce() -> String) {
         if !request_db_timing_active() {
-            self.started_at = None;
+            self.pending = None;
             return;
         }
-        self.started_at = if Self::is_uncounted_statement(&sql()) {
+        // Materialise the SQL once: it is needed both for the housekeeping
+        // filter and (when a test opted into capture) to retain the statement
+        // text at `on_finish`.
+        let sql = sql();
+        self.pending = if Self::is_uncounted_statement(&sql) {
             None
         } else {
-            Some(now)
+            Some(PendingQuery {
+                started_at: now,
+                sql,
+            })
         };
     }
 
@@ -256,8 +321,8 @@ impl RequestQueryTimer {
     /// elapsed time into the per-request accumulator. A `FinishQuery` without
     /// a matching `StartQuery` is ignored.
     fn on_finish(&mut self, now: std::time::Instant) {
-        if let Some(start) = self.started_at.take() {
-            record_request_db_query(now.saturating_duration_since(start));
+        if let Some(p) = self.pending.take() {
+            record_request_db_query(now.saturating_duration_since(p.started_at), Some(&p.sql));
         }
     }
 }

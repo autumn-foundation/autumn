@@ -73,6 +73,7 @@
 //!           </tbody>
 //!         </table>
 //!     "#.to_vec(),
+//!     ..Default::default()
 //! };
 //!
 //! resp.assert_ok()
@@ -2628,6 +2629,14 @@ impl TestClient {
         PerformedJobs { outcomes }
     }
 
+    /// The app's configured N+1 detection threshold
+    /// (`dev.inspector_n_plus_one_threshold`), threaded into every
+    /// [`RequestBuilder`] so the resulting [`TestResponse`] can default
+    /// [`TestResponse::assert_no_n_plus_one`] to it.
+    fn n_plus_one_threshold(&self) -> usize {
+        self.state.config().dev.inspector_n_plus_one_threshold
+    }
+
     /// Start building a GET request.
     #[must_use]
     pub fn get(&self, uri: &str) -> RequestBuilder {
@@ -2637,6 +2646,7 @@ impl TestClient {
             uri,
             self.cookie_jar.clone(),
             Some(self.state.clock.clone()),
+            self.n_plus_one_threshold(),
         )
     }
 
@@ -2649,6 +2659,7 @@ impl TestClient {
             uri,
             self.cookie_jar.clone(),
             Some(self.state.clock.clone()),
+            self.n_plus_one_threshold(),
         )
     }
 
@@ -2661,6 +2672,7 @@ impl TestClient {
             uri,
             self.cookie_jar.clone(),
             Some(self.state.clock.clone()),
+            self.n_plus_one_threshold(),
         )
     }
 
@@ -2673,6 +2685,7 @@ impl TestClient {
             uri,
             self.cookie_jar.clone(),
             Some(self.state.clock.clone()),
+            self.n_plus_one_threshold(),
         )
     }
 
@@ -2685,6 +2698,7 @@ impl TestClient {
             uri,
             self.cookie_jar.clone(),
             Some(self.state.clock.clone()),
+            self.n_plus_one_threshold(),
         )
     }
 
@@ -2697,6 +2711,7 @@ impl TestClient {
             uri,
             self.cookie_jar.clone(),
             Some(self.state.clock.clone()),
+            self.n_plus_one_threshold(),
         )
     }
 
@@ -2911,6 +2926,10 @@ pub struct RequestBuilder {
     /// The originating client's clock, used to evaluate `Expires` when folding
     /// `Set-Cookie` back into the jar. `None` falls back to [`chrono::Utc::now`].
     clock: Option<std::sync::Arc<dyn crate::time::ClockSource>>,
+    /// Default N+1 detection threshold (`dev.inspector_n_plus_one_threshold`),
+    /// propagated to the resulting [`TestResponse`] so
+    /// [`TestResponse::assert_no_n_plus_one`] can honour the app's config.
+    n_plus_one_threshold: usize,
 }
 
 impl RequestBuilder {
@@ -2920,6 +2939,7 @@ impl RequestBuilder {
         uri: &str,
         cookie_jar: CookieJar,
         clock: Option<std::sync::Arc<dyn crate::time::ClockSource>>,
+        n_plus_one_threshold: usize,
     ) -> Self {
         Self {
             router,
@@ -2929,6 +2949,7 @@ impl RequestBuilder {
             body: Body::empty(),
             cookie_jar: Some(cookie_jar),
             clock,
+            n_plus_one_threshold,
         }
     }
 
@@ -2979,6 +3000,12 @@ impl RequestBuilder {
     /// Fire the request through the full middleware pipeline and return
     /// a [`TestResponse`].
     pub async fn send(self) -> TestResponse {
+        // Captured for failure messages and the N+1 default threshold on the
+        // resulting `TestResponse`.
+        let request_method = self.method.to_string();
+        let request_path = self.uri.clone();
+        let n_plus_one_threshold = self.n_plus_one_threshold;
+
         let mut builder = Request::builder().method(self.method).uri(&self.uri);
 
         // Replay the cookie jar: compose a `Cookie` header from stored cookies
@@ -3023,7 +3050,28 @@ impl RequestBuilder {
         // unconditionally.
         let service =
             tower::Layer::layer(&crate::middleware::MethodOverrideLayer::new(), self.router);
-        let response = service.oneshot(request).await.expect("request failed");
+
+        // Drive the request under a per-request `REQUEST_DB_TIMINGS` capture
+        // scope so the connection-level `RequestQueryTimer` (installed at
+        // `Db::checkout` whenever this scope is active) records every SQL
+        // statement the handler issues — no manual `DbInterceptor` wiring
+        // required. `oneshot` runs on this same task, so the task-local is
+        // visible to the checkout. When the `db` feature is off there is no DB,
+        // so the captured query list is simply empty.
+        #[cfg(feature = "db")]
+        let (response, queries) = {
+            let timings = std::sync::Arc::new(crate::db::RequestDbTimings::with_capture());
+            let response = crate::db::REQUEST_DB_TIMINGS
+                .scope(std::sync::Arc::clone(&timings), service.oneshot(request))
+                .await
+                .expect("request failed");
+            (response, timings.take_captured())
+        };
+        #[cfg(not(feature = "db"))]
+        let (response, queries): (_, Vec<crate::inspector::QueryRecord>) = (
+            service.oneshot(request).await.expect("request failed"),
+            Vec::new(),
+        );
 
         let status = response.status();
         let headers: Vec<(String, String)> = response
@@ -3057,6 +3105,10 @@ impl RequestBuilder {
             status,
             headers,
             body: body_bytes.to_vec(),
+            queries,
+            request_method,
+            request_path,
+            n_plus_one_threshold,
         }
     }
 }
@@ -3074,8 +3126,10 @@ impl RequestBuilder {
 ///     .assert_body_contains("Alice");
 /// ```
 ///
-/// Fields are public so you can construct a `TestResponse` directly in unit
-/// tests that don't need a full HTTP round-trip:
+/// The `status`, `headers`, and `body` fields are public so you can construct a
+/// `TestResponse` directly in unit tests that don't need a full HTTP
+/// round-trip. Fill the remaining (query-capture) fields with
+/// `..Default::default()`:
 ///
 /// ```rust
 /// use autumn_web::test::TestResponse;
@@ -3088,6 +3142,7 @@ impl RequestBuilder {
 ///         ("x-request-id".into(), "abc-123".into()),
 ///     ],
 ///     body: br#"{"name":"Alice"}"#.to_vec(),
+///     ..Default::default()
 /// };
 ///
 /// resp.assert_ok()
@@ -3096,6 +3151,23 @@ impl RequestBuilder {
 ///
 /// assert_eq!(resp.header("x-request-id"), Some("abc-123"));
 /// ```
+///
+/// # Query-count and N+1 assertions
+///
+/// When the response was produced by [`RequestBuilder::send`] against a
+/// database-backed app, every SQL statement the handler issued is captured
+/// automatically (no manual interceptor wiring). Assert on it with
+/// [`TestResponse::query_count`], [`TestResponse::assert_max_queries`], and
+/// [`TestResponse::assert_no_n_plus_one`]:
+///
+/// ```rust,no_run
+/// # async fn ex(client: autumn_web::test::TestClient) {
+/// client.get("/posts").send().await
+///     .assert_ok()
+///     .assert_max_queries(3)   // fails, naming GET /posts, if > 3 queries ran
+///     .assert_no_n_plus_one(); // fails if a query repeats >= the dev threshold
+/// # }
+/// ```
 pub struct TestResponse {
     /// HTTP status code.
     pub status: StatusCode,
@@ -3103,6 +3175,34 @@ pub struct TestResponse {
     pub headers: Vec<(String, String)>,
     /// Raw response body bytes.
     pub body: Vec<u8>,
+    /// SQL queries captured while handling the request, in execution order.
+    ///
+    /// Populated automatically by [`RequestBuilder::send`] for
+    /// database-backed apps; empty for directly-constructed responses or when
+    /// the `db` feature is disabled. Prefer the [`TestResponse::queries`]
+    /// accessor for reading.
+    pub queries: Vec<crate::inspector::QueryRecord>,
+    /// HTTP method of the originating request, for assertion failure messages.
+    pub request_method: String,
+    /// Path of the originating request, for assertion failure messages.
+    pub request_path: String,
+    /// Default N+1 threshold (`dev.inspector_n_plus_one_threshold`) used by
+    /// [`TestResponse::assert_no_n_plus_one`].
+    pub n_plus_one_threshold: usize,
+}
+
+impl Default for TestResponse {
+    fn default() -> Self {
+        Self {
+            status: StatusCode::OK,
+            headers: Vec::new(),
+            body: Vec::new(),
+            queries: Vec::new(),
+            request_method: String::new(),
+            request_path: String::new(),
+            n_plus_one_threshold: 0,
+        }
+    }
 }
 
 impl TestResponse {
@@ -3461,6 +3561,109 @@ impl TestResponse {
             ),
         }
         self
+    }
+
+    // ── Database query assertions (#1262) ──────────────────────
+
+    /// Number of SQL queries the request issued.
+    ///
+    /// Captured automatically by [`RequestBuilder::send`] for database-backed
+    /// apps; `0` for directly-constructed responses or when the `db` feature
+    /// is disabled.
+    #[must_use]
+    pub const fn query_count(&self) -> usize {
+        self.queries.len()
+    }
+
+    /// The SQL queries the request issued, in execution order.
+    ///
+    /// Lets a test assert on specific normalized SQL. Empty for
+    /// directly-constructed responses or when the `db` feature is disabled.
+    #[must_use]
+    pub fn queries(&self) -> &[crate::inspector::QueryRecord] {
+        &self.queries
+    }
+
+    /// A per-query listing for assertion failure messages: one line per query
+    /// (`#N  <elapsed>ms  <sql>`), followed by repetition counts per
+    /// normalized statement so the offending pattern is obvious.
+    fn query_report(&self) -> String {
+        use std::collections::BTreeMap;
+        use std::fmt::Write as _;
+        let mut out = String::new();
+        for (i, q) in self.queries.iter().enumerate() {
+            let _ = write!(
+                out,
+                "\n  #{n:<3} {ms:>4}ms  {sql}",
+                n = i + 1,
+                ms = q.elapsed_ms,
+                sql = q.sql,
+            );
+        }
+        // Counts per normalized statement (stable, sorted for determinism).
+        let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+        for q in &self.queries {
+            *counts
+                .entry(q.sql.split_whitespace().collect::<Vec<_>>().join(" "))
+                .or_insert(0) += 1;
+        }
+        if counts.len() != self.queries.len() {
+            out.push_str("\n  ── counts per statement ──");
+            for (sql, count) in &counts {
+                let _ = write!(out, "\n  {count}x  {sql}");
+            }
+        }
+        out
+    }
+
+    /// Assert the request issued at most `n` SQL queries.
+    ///
+    /// Passes when `query_count() <= n`. Panics otherwise with a message
+    /// naming the request (method + path), the expected and actual counts, and
+    /// the full query list.
+    #[track_caller]
+    pub fn assert_max_queries(&self, n: usize) -> &Self {
+        let actual = self.queries.len();
+        assert!(
+            actual <= n,
+            "assert_max_queries failed for {method} {path}: expected <= {n} queries, issued {actual}.{report}",
+            method = self.request_method,
+            path = self.request_path,
+            report = self.query_report(),
+        );
+        self
+    }
+
+    /// Assert the request contains no N+1 query pattern, using the app's
+    /// configured `dev.inspector_n_plus_one_threshold` (default 5).
+    ///
+    /// Reuses [`crate::inspector::detect_n_plus_one`]. Panics, naming the
+    /// request and the offending normalized query + repetition count, when a
+    /// single normalized statement was issued at least `threshold` times.
+    ///
+    /// Use [`TestResponse::assert_no_n_plus_one_with_threshold`] to override
+    /// the threshold explicitly.
+    #[track_caller]
+    pub fn assert_no_n_plus_one(&self) -> &Self {
+        self.assert_no_n_plus_one_with_threshold(self.n_plus_one_threshold)
+    }
+
+    /// Like [`TestResponse::assert_no_n_plus_one`] but with an explicit
+    /// repetition `threshold` instead of the configured default.
+    #[track_caller]
+    pub fn assert_no_n_plus_one_with_threshold(&self, threshold: usize) -> &Self {
+        match crate::inspector::detect_n_plus_one(&self.queries, threshold) {
+            Some(w) => panic!(
+                "assert_no_n_plus_one failed for {method} {path}: query repeated {count} times \
+                 (threshold {threshold}):\n  {sql}{report}",
+                method = self.request_method,
+                path = self.request_path,
+                count = w.count,
+                sql = w.sql_template,
+                report = self.query_report(),
+            ),
+            None => self,
+        }
     }
 }
 
@@ -4212,6 +4415,119 @@ mod tests {
             "framework security headers must wrap method-override rejections; \
              observed headers: {:?}",
             response.headers
+        );
+    }
+
+    // ── #1262: query-count / N+1 assertions (pure, no Postgres) ─────────
+    //
+    // These exercise the assertion *logic* on a directly-constructed
+    // `TestResponse`, so they run in the always-on CI lane without a database
+    // — the framework self-test that guarantees the assertions actually fire.
+
+    fn resp_with_queries(sqls: &[&str], threshold: usize) -> TestResponse {
+        TestResponse {
+            queries: sqls
+                .iter()
+                .map(|s| crate::inspector::QueryRecord {
+                    sql: (*s).to_owned(),
+                    params: Vec::new(),
+                    elapsed_ms: 1,
+                    location: String::new(),
+                })
+                .collect(),
+            request_method: "GET".to_owned(),
+            request_path: "/posts".to_owned(),
+            n_plus_one_threshold: threshold,
+            ..Default::default()
+        }
+    }
+
+    fn panic_message(err: &(dyn std::any::Any + Send)) -> String {
+        err.downcast_ref::<String>()
+            .cloned()
+            .or_else(|| err.downcast_ref::<&str>().map(|s| (*s).to_owned()))
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn query_count_and_queries_reflect_captured_list() {
+        let resp = resp_with_queries(&["SELECT 1", "SELECT 2"], 5);
+        assert_eq!(resp.query_count(), 2);
+        assert_eq!(resp.queries().len(), 2);
+        assert_eq!(resp.queries()[0].sql, "SELECT 1");
+    }
+
+    #[test]
+    fn assert_max_queries_passes_at_boundary() {
+        // len == n is within budget and must not panic.
+        resp_with_queries(&["SELECT 1", "SELECT 2"], 5).assert_max_queries(2);
+    }
+
+    #[test]
+    fn assert_max_queries_panics_when_exceeded() {
+        let resp = resp_with_queries(&["SELECT 1", "SELECT 2", "SELECT 3"], 5);
+        let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            resp.assert_max_queries(2);
+        }))
+        .expect_err("assert_max_queries must panic when the query count exceeds the limit");
+        let msg = panic_message(err.as_ref());
+        assert!(
+            msg.contains("GET /posts"),
+            "message names the request: {msg}"
+        );
+        assert!(
+            msg.contains("issued 3"),
+            "message reports the actual count: {msg}"
+        );
+        assert!(msg.contains("<= 2"), "message reports the limit: {msg}");
+    }
+
+    #[test]
+    fn assert_no_n_plus_one_passes_for_distinct_queries() {
+        // Three distinct statements: no normalized template repeats.
+        resp_with_queries(&["SELECT 1", "SELECT 2", "SELECT 3"], 2).assert_no_n_plus_one();
+    }
+
+    #[test]
+    fn assert_no_n_plus_one_panics_on_repetition() {
+        // Same statement modulo whitespace/case, repeated `threshold` times.
+        let resp = resp_with_queries(
+            &[
+                "SELECT * FROM comments WHERE post_id = $1",
+                "SELECT  * FROM comments WHERE post_id = $1",
+                "select * from comments where post_id = $1",
+            ],
+            3,
+        );
+        let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            resp.assert_no_n_plus_one();
+        }))
+        .expect_err("assert_no_n_plus_one must panic on an N+1 pattern");
+        let msg = panic_message(err.as_ref());
+        assert!(msg.contains("GET /posts"), "names the request: {msg}");
+        assert!(
+            msg.contains("3 times"),
+            "reports the repetition count: {msg}"
+        );
+        assert!(
+            msg.contains("select * from comments where post_id = $1"),
+            "reports the normalized SQL template: {msg}"
+        );
+    }
+
+    #[test]
+    fn assert_no_n_plus_one_with_threshold_overrides_default() {
+        // Two identical queries; the configured default threshold (10) does not
+        // fire, but an explicit override of 2 does.
+        let resp = resp_with_queries(&["SELECT 1", "SELECT 1"], 10);
+        resp.assert_no_n_plus_one(); // default threshold 10 -> passes
+        let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            resp.assert_no_n_plus_one_with_threshold(2);
+        }))
+        .expect_err("an explicit threshold override must be honoured");
+        assert!(
+            panic_message(err.as_ref()).contains("2 times"),
+            "override fires at the explicit threshold"
         );
     }
 }
