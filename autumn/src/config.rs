@@ -876,8 +876,12 @@ pub struct BackupConfig {
     /// Offsite upload destination (`[backup.offsite]`). `None` (the default)
     /// means no offsite destination is configured; `autumn db backup --upload`
     /// then errors with configuration guidance rather than silently no-op'ing.
+    ///
+    /// Boxed so an unconfigured `[backup]` costs one pointer rather than the full
+    /// [`OffsiteBackupConfig`] inline: `AutumnConfig` is held across awaits in the
+    /// app-run future, and keeping this field small avoids bloating that future.
     #[serde(default)]
-    pub offsite: Option<OffsiteBackupConfig>,
+    pub offsite: Option<Box<OffsiteBackupConfig>>,
 }
 
 /// `[backup.offsite]` — an S3-compatible offsite backup destination (issue #1619).
@@ -4071,7 +4075,7 @@ impl AutumnConfig {
         let offsite = self
             .backup
             .offsite
-            .get_or_insert_with(OffsiteBackupConfig::default);
+            .get_or_insert_with(|| Box::new(OffsiteBackupConfig::default()));
         parse_env_option_string(
             env,
             "AUTUMN_BACKUP__OFFSITE__S3__BUCKET",

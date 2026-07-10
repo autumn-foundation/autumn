@@ -1716,6 +1716,8 @@ fn load_offsite(profile: &str) -> Result<Option<ResolvedOffsite>, BackupError> {
     let Some(offsite) = cfg.backup.offsite else {
         return Ok(None);
     };
+    // Unbox once so the field moves/reads below are identical to an owned value.
+    let offsite = *offsite;
     let bucket = offsite
         .s3
         .bucket
