@@ -520,34 +520,34 @@ impl Alerter {
         if self.inner.channels.is_empty() {
             return;
         }
-        let inner = Arc::clone(&self.inner);
-        let run = async move {
-            for channel in &inner.channels {
+        // Dispatch is best-effort: with a Tokio runtime handle we spawn one
+        // detached task *per channel* so a slow or hanging channel never blocks
+        // delivery to the others; with no handle available (unlikely from a hook
+        // site) the alert is logged and skipped, never blocking the caller.
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            tracing::warn!("no tokio runtime available for alert dispatch; skipping");
+            return;
+        };
+        let alert = Arc::new(alert);
+        for channel in &self.inner.channels {
+            let channel = Arc::clone(channel);
+            let alert = Arc::clone(&alert);
+            handle.spawn(async move {
+                let name = channel.name();
                 match channel.deliver(&alert).await {
                     Ok(()) => tracing::debug!(
-                        channel = channel.name(),
+                        channel = name,
                         dedup_key = %alert.dedup_key,
                         "operator alert delivered"
                     ),
                     Err(error) => tracing::error!(
-                        channel = channel.name(),
+                        channel = name,
                         dedup_key = %alert.dedup_key,
                         error = %error,
                         "operator alert delivery failed; app continues serving"
                     ),
                 }
-            }
-        };
-        // Dispatch is best-effort: with a Tokio runtime handle we spawn a
-        // detached task; with no handle available (unlikely from a hook site)
-        // the alert is logged and skipped, never blocking the caller.
-        match tokio::runtime::Handle::try_current() {
-            Ok(handle) => {
-                handle.spawn(run);
-            }
-            Err(_) => {
-                tracing::warn!("no tokio runtime available for alert dispatch; skipping");
-            }
+            });
         }
     }
 }
@@ -935,9 +935,37 @@ fn spawn_evaluation_loop(state: AppState, alerter: Alerter) {
     });
 }
 
+/// Advance the 5xx sampling window for one tick.
+///
+/// Returns `Some((req_delta, err_delta))` — and advances the baseline counters
+/// — only when the accumulated request delta has reached `min_requests`, i.e.
+/// when a real evaluation should happen. When the tick is still below the
+/// threshold it returns `None` and leaves the baselines **untouched**, so a
+/// low-traffic app whose per-tick traffic never reaches `min_requests` keeps
+/// accumulating requests across ticks instead of resetting every tick. The
+/// window therefore measures "since the last evaluation" rather than "since the
+/// last tick."
+const fn sample_error_window(
+    total: u64,
+    s5xx: u64,
+    last_requests: &mut u64,
+    last_5xx: &mut u64,
+    min_requests: u64,
+) -> Option<(u64, u64)> {
+    let req_delta = total.saturating_sub(*last_requests);
+    if req_delta < min_requests {
+        // Leave baselines untouched so counts accumulate across ticks.
+        return None;
+    }
+    let err_delta = s5xx.saturating_sub(*last_5xx);
+    *last_requests = total;
+    *last_5xx = s5xx;
+    Some((req_delta, err_delta))
+}
+
 /// Condition (c): compute the 5xx rate over the requests seen since the last
-/// tick and compare to the threshold. Reads existing cumulative counters — the
-/// request path is untouched.
+/// evaluation and compare to the threshold. Reads existing cumulative counters
+/// — the request path is untouched.
 fn evaluate_error_rate(
     alerter: &Alerter,
     state: &AppState,
@@ -948,14 +976,15 @@ fn evaluate_error_rate(
     let snap = state.metrics().snapshot();
     let total = snap.http.requests_total;
     let s5xx = snap.http.by_status.s5xx;
-    let req_delta = total.saturating_sub(*last_requests);
-    let err_delta = s5xx.saturating_sub(*last_5xx);
-    *last_requests = total;
-    *last_5xx = s5xx;
-
-    if req_delta < settings.error_rate_min_requests {
+    let Some((req_delta, err_delta)) = sample_error_window(
+        total,
+        s5xx,
+        last_requests,
+        last_5xx,
+        settings.error_rate_min_requests,
+    ) else {
         return;
-    }
+    };
     #[allow(clippy::cast_precision_loss)]
     let rate = err_delta as f64 / req_delta as f64;
     let key = "high_error_rate:5xx".to_owned();
@@ -1244,6 +1273,54 @@ mod tests {
         assert!(c.is_active());
         c.enabled = false;
         assert!(!c.is_active(), "disabled -> inactive even with destination");
+    }
+
+    #[test]
+    fn sub_threshold_ticks_accumulate_until_window_crosses_min_requests() {
+        // min_requests = 10; each tick adds 4 requests (below threshold) with
+        // 1 new 5xx. Baselines must NOT reset on the sub-threshold ticks so the
+        // requests accumulate until the summed window finally crosses 10.
+        let min_requests = 10;
+        let mut last_requests = 0;
+        let mut last_5xx = 0;
+
+        // Tick 1: total=4, 5xx=1 -> below threshold, no evaluation.
+        assert_eq!(
+            sample_error_window(4, 1, &mut last_requests, &mut last_5xx, min_requests),
+            None,
+            "first sub-threshold tick must not evaluate"
+        );
+        // Baselines must be untouched so progress is preserved.
+        assert_eq!(last_requests, 0, "sub-threshold tick must not reset baseline");
+        assert_eq!(last_5xx, 0, "sub-threshold tick must not reset 5xx baseline");
+
+        // Tick 2: total=8, 5xx=2 -> still below threshold (delta from 0 is 8).
+        assert_eq!(
+            sample_error_window(8, 2, &mut last_requests, &mut last_5xx, min_requests),
+            None,
+            "second sub-threshold tick must not evaluate"
+        );
+        assert_eq!(last_requests, 0);
+        assert_eq!(last_5xx, 0);
+
+        // Tick 3: total=12, 5xx=3 -> accumulated delta 12 >= 10, evaluate now
+        // over the whole accumulated window (12 requests, 3 errors).
+        assert_eq!(
+            sample_error_window(12, 3, &mut last_requests, &mut last_5xx, min_requests),
+            Some((12, 3)),
+            "window must evaluate once summed requests cross the threshold"
+        );
+        // Only now do the baselines advance to the evaluated point.
+        assert_eq!(last_requests, 12, "baseline advances only after evaluation");
+        assert_eq!(last_5xx, 3);
+
+        // Next sub-threshold tick starts a fresh accumulation from 12.
+        assert_eq!(
+            sample_error_window(15, 3, &mut last_requests, &mut last_5xx, min_requests),
+            None
+        );
+        assert_eq!(last_requests, 12, "baseline held across the next sub-threshold tick");
+        assert_eq!(last_5xx, 3);
     }
 
     #[test]
