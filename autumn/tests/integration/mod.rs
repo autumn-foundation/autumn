@@ -180,6 +180,8 @@ mod security;
 mod seo;
 mod server_timing;
 #[cfg(feature = "db")]
+mod shard_across_tenants_no_shard_set;
+#[cfg(feature = "db")]
 mod shard_map_guard;
 #[cfg(feature = "db")]
 mod sharding_across_tenants;
