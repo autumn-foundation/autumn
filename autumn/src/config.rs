@@ -3269,6 +3269,21 @@ impl AutumnConfig {
                 ),
             }
         }
+        parse_env_bool(
+            env,
+            "AUTUMN_AUTH__REMEMBER__ENABLED",
+            &mut self.auth.remember.enabled,
+        );
+        parse_env(
+            env,
+            "AUTUMN_AUTH__REMEMBER__DURATION_SECS",
+            &mut self.auth.remember.duration_secs,
+        );
+        parse_env_string(
+            env,
+            "AUTUMN_AUTH__REMEMBER__COOKIE_NAME",
+            &mut self.auth.remember.cookie_name,
+        );
         #[cfg(feature = "oauth2")]
         {
             let provider_names: Vec<String> = self.auth.oauth2.providers.keys().cloned().collect();
