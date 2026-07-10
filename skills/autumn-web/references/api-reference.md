@@ -1,8 +1,11 @@
-# autumn-web 0.5.0 API Reference
+# autumn-web API Reference (published 0.5.0 + trunk-dev)
 
 Use this file as a quick map for public names, features, dependency versions,
-and config keys. Source of truth is the workspace at version 0.5.0; verify
-against current source when exact code matters.
+and config keys. Verify against current source when exact code matters.
+
+Version identity: crates.io serves **0.5.0** (the latest published release);
+the `trunk-dev` workspace is versioned **0.6.0 (unpublished)**. Entries marked
+**(unreleased)** exist on trunk-dev but NOT in the published 0.5.0 crates.
 
 ## Published crates
 
@@ -15,7 +18,8 @@ against current source when exact code matters.
 | `autumn-storage-s3` | `autumn-storage-s3/` | S3-compatible `BlobStore` plugin |
 | `autumn-cache-redis` | `autumn-cache-redis/` | Redis cache plugin |
 
-All publishable crates share `[workspace.package].version = "0.5.0"`.
+All publishable crates share the `[workspace.package]` version and release
+together (`0.5.0` published; `0.6.0` on trunk-dev, unpublished).
 
 ## Top-level exports
 
@@ -46,7 +50,47 @@ All publishable crates share `[workspace.package].version = "0.5.0"`.
 - `Multipart` (`multipart`)
 - `Flash`, `FlashLevel`, `FlashMessage` (`flash`)
 - `Broadcast`, `Channels`, `ChannelsBackend`, `LocalChannelsBackend`,
-  `ChannelMessage`, `ChannelStats` (`ws`)
+  `ChannelMessage`, `ChannelStats` (`ws`) — in tests, opt in with
+  `TestApp::record_broadcasts()` and assert with `TestClient::broadcasts()` /
+  `broadcasts_on(topic)` / `assert_broadcast(topic, predicate)` /
+  `assert_broadcast_count(topic, n)` / `assert_no_broadcasts(topic)`
+  (`RecordedBroadcast` exposes `.topic()` / `.payload()`)
+- Resumable SSE **(unreleased — trunk-dev, issue #1356)**:
+  `sse::stream_resumable(&state, topic, last_event_id: Option<u64>)` — automatic
+  monotonic per-topic event ids + `Last-Event-ID` replay from a bounded
+  per-topic ring buffer, with a `gap` sentinel (`event: gap`,
+  `data: {"gap":true}`) on buffer overflow; `sse::last_event_id(&headers)` and
+  the `sse::LastEventId(Option<u64>)` extractor read the inbound header;
+  `Channels::resume(topic, last_event_id) -> ResumeHandle` (fields
+  `subscriber`, `replay: Vec<SequencedMessage { id, message }>`, `gap`,
+  `next_live_id`, `resumable`); `ChannelsBackend::resume` has a live-only
+  default (Redis) overridden by `LocalChannelsBackend`;
+  `LocalChannelsBackend::with_replay_capacity(capacity, replay_capacity)`.
+  Retention is `channels.replay_buffer` (default `256`). The existing id-less
+  `sse::stream` / `sse::stream_authorized` / `sse::from_subscriber` are
+  unchanged.
+- `TestClient` auth helpers: it carries a cookie jar that persists each
+  response's `Set-Cookie` and replays it on later requests, so a real
+  `POST /login` → `GET /dashboard` flow needs no manual header threading.
+  `client.acting_as(user_id).await` (alias `login_as`) mints an authenticated
+  session directly — writing the configured `auth.session_key` (default
+  `user_id`) — so a `#[secured]` / `Auth` route returns its real success status
+  without hitting the login endpoint; it sets identity only, so roles/scopes
+  still run. `client.log_out()` clears the session cookie so secured routes
+  reject again. Requires `TestApp::build()` with the default in-memory session
+  backend; panics for `from_router` clients.
+- `TestClient` job recorder: on by default for every `TestApp::build()` client
+  (no `with_job_interceptor` opt-in), it captures every enqueue — across
+  `enqueue`, `enqueue_after_commit`, and `enqueue_in_tx` — as a `RecordedJob`
+  (`.name()` / `.payload()`). Read them with `client.enqueued_jobs()` and assert
+  with `assert_job_enqueued(name)` / `assert_job_enqueued_with(name, payload)` /
+  `assert_no_jobs_enqueued()`. `client.perform_enqueued_jobs().await` drains the
+  queue and dispatches each captured job through its registered handler,
+  returning a `PerformedJobs` report (`.assert_all_succeeded()`, `.failures()`,
+  `.outcomes()`) that surfaces per-job handler errors — including payloads that
+  fail the real deserialization round-trip — rather than swallowing them. The
+  recorder is per-`TestApp` and composes ahead of any `with_job_interceptor`;
+  `enqueued_jobs` / `perform_enqueued_jobs` panic for `from_router` clients.
 - `Locale`, `t!` (`i18n`)
 - OAuth2/OIDC config, provider presets, callback helpers, and identity values
   (`oauth2`)
@@ -74,16 +118,311 @@ All publishable crates share `[workspace.package].version = "0.5.0"`.
 | `paths![...]` | Typed route path helper module |
 | `#[mailer]`, `#[mailer_preview]`, `mail_previews![...]` | Mail helpers (`mail`) |
 | `t!(...)` | Compile-time checked translation lookup (`i18n`) |
+| `#[feature_flag]` | Feature-flag definition |
+| `#[inbound_mail]` | Inbound mail handler |
+| `#[step_up]` | Step-up authentication guard |
+| `#[throttle]` | Per-route rate limit — inline (`limit`/`per`/`key`) or named (`#[throttle("login")]`) (**unreleased**) |
+| `#[event]`, `#[listener]`, `listeners![...]` | Typed domain event bus (**unreleased**) — publish via the `Events` extractor, register with `.listeners(...)` |
 
 `#[model]` also recognizes `#[belongs_to]` / `#[has_many]` / `#[has_one]`
-struct-level attributes for declarative associations with batched eager
+struct-level attributes (**unreleased** — trunk-dev, not in published 0.5.0)
+for declarative associations with batched eager
 preloading (`Model::preload()`, `repo.preload(records, spec)`); these are
 consumed by `#[model]` itself, not separately-registered proc macros.
-`#[has_many(Target, through = join_table)]` declares a many-to-many
-association through a join table, adding `add_{singular}` /
+`#[has_many(Target, through = join_table)]` declares a
+many-to-many association through a join table, adding `add_{singular}` /
 `remove_{singular}` / `set_{plural}` mutation helpers to the generated
 `#[repository]`. See the `#[model]` doc comment in `autumn-macros/src/lib.rs`
 and `docs/adr/0008-associations-and-eager-loading.md`.
+
+`#[model]` also consumes the `#[state_machine(transitions(from -> to,
+from -> to: "guard", ...))]` field attribute on `String` fields, generating
+`can_transition_{field}_to(&self, &str) -> bool`,
+`transition_{field}_to(&self, &str) -> AutumnResult<String>`, and a
+`__AUTUMN_SM_{FIELD}_TRANSITIONS` edge-list constant. See
+`docs/guide/state-machines.md`.
+
+`#[model]` field attributes for column privacy and canonicalization
+(**unreleased** — trunk-dev, not in published 0.5.0):
+
+- `#[private]` (issue #1374) — excludes the column from the model's `Serialize`
+  impl so it never appears in `Json` output, the auto-generated `--api`
+  list/show endpoints, or any `serde_json::to_value(&model)`. The field stays a
+  normal, queryable column and the **write** path is unaffected — `NewX` /
+  `UpdateX` / `Changeset` still bind it, so a client can *set* a password but
+  never read the hash back. `#[encrypted]` columns are `#[private]` in JSON by
+  default (ciphertext/plaintext must not leak); opt back in with the existing
+  `#[encrypted(admin_visible)]` knob. `#[private]` affects only serialization —
+  the column still appears in `FormModel::form_fields()` (you must be able to
+  *set* it). `autumn doctor` warns (`model_private_columns`) when a
+  sensitively-named column (`password`, `token`, `secret`, `*_hash`) is not
+  marked `#[private]`.
+- `#[normalize(trim, downcase, upcase, squish, with = path::to::fn)]` (issue
+  #1379) — canonicalizes a `String` column, composing normalizers
+  left-to-right. Built-ins live in `autumn_web::normalize`
+  (`trim`/`downcase`/`upcase`/`squish`); `with = path` calls a user
+  `fn(&str) -> String`. Runs on the **write** path (`save`/`save_many` insert;
+  `update` via `UpdateDraft::from_patch`) *before* the `before_create` /
+  `before_update` hooks and the DB write, and on derived `#[repository]`
+  `find_by_`/`count_by_` lookups (so `find_by_email("  FOO@X.com ")` matches the
+  stored `foo@x.com` row). Built-ins are idempotent; composing
+  `#[normalize(downcase)]` with a `unique` column yields case-insensitive
+  uniqueness. Non-`String` fields are a compile error (mirrors `#[encrypted]`).
+  Generated hooks: `impl autumn_web::normalize::Normalize` on the model and
+  `NewX`; `impl autumn_web::normalize::NormalizedModel` (`normalize_lookup`) on
+  every model.
+
+## Repository-generated methods (`#[repository]`)
+
+Published 0.5.0: `find_by_id`, `find_all`, `count`, `exists_by_id`, `save`,
+`update`, `delete_by_id`, derived `find_by_*`/`count_by_*`/`exists_by_*`,
+`page(&PageRequest)`, `cursor_page(&CursorRequest)` (with `cursor_key =` /
+`cursor_key_type =` attr keys), bulk `save_many` / `save_many_skip_invalid` /
+`update_many` / `delete_many` / `upsert_many` (compile error on hooked repos),
+`with_lock`, `on_primary()`. Attr keys: `api =`, `policy =`,
+`scope =`, `primary_reads`, `soft_delete`, `tenant_scoped`, `hooks =`,
+`mcp` / `mcp = "read"`.
+
+**(unreleased)**: `preload(records, spec)` (declarative associations);
+`from_shard(&ShardedDb)`; `with_pool_untracked` (new on
+trunk-dev — published 0.5.0 repositories have no pool constructor);
+`find_in_batches(batch_size)` / `find_each(batch_size)` — bounded-memory
+whole-table iteration on every repository via a primary-key keyset cursor
+(`WHERE id > last ORDER BY id ASC LIMIT batch_size`, never `LIMIT`/`OFFSET`).
+Handle types live in `autumn_web::batches`: `FindInBatches`
+(`next_batch().await? -> Option<Vec<Model>>`), `FindEach`
+(`next().await? -> Option<Model>`), and the macro-implemented `BatchSource`
+trait. Inherits soft-delete/tenant-scoping/read-routing like `find_all`;
+errors are retryable (keyset cursor advances only on success — `Ok(None)`
+always means completion); `batch_size == 0` is an error; `batch_size` is not
+clamped to `MAX_PAGE_SIZE`; sharded repositories reject cross-shard
+`across_tenants()` iteration like `cursor_page`. See "Batched iteration" in
+`docs/guide/pagination.md`.
+
+**(unreleased)** — `find_or_create_by_<field>[_and_<field>...]`: declare
+`fn find_or_create_by_slug(slug: String);` (lookup fields only) in the
+`#[repository]` trait to generate an inherent
+`find_or_create_by_slug(&self, slug: String, new: &NewModel) ->
+AutumnResult<(Model, bool)>` — a race-safe get-or-insert returning the model
+plus a `created` flag (#1382). Looks up on the read path first (replica-eligible,
+tenant/soft-delete aware); if absent, inserts on the primary with `ON CONFLICT DO
+NOTHING`, so under concurrency exactly one row is created, exactly one caller
+sees `created == true`, and no `23505` unique-violation escapes (the loser
+re-reads its own write and returns `(row, false)`). `before_create` /
+`after_create` and the durable commit-hook queue fire only on the created path,
+and — unlike `upsert_many` — the method IS generated on hooked repositories.
+Requires a unique constraint covering the lookup column(s); `_or_` is rejected
+(it would span constraints). See "Race-safe get-or-insert" in
+`docs/guide/repositories.md`.
+
+**(unreleased)** — typed grouped aggregate queries (#1364): declare
+`fn count_grouped_by_<col>() -> Vec<(K, i64)>` or
+`fn <sum|avg|min|max>_<num_col>_grouped_by_<col>() -> Vec<(K, Option<T>)>`
+(`avg` → `Option<f64>`) in the `#[repository]` trait — the pair return type is
+**required** (the macro reads the key/value SQL types from it). Each becomes an
+inherent method returning a lazy `GroupedAggregate<'_, K, V>` builder that
+yields one `(group, aggregate)` pair per group; nothing runs until the terminal
+`.load().await -> AutumnResult<Vec<(K, V)>>`. Chain
+`.order_by_aggregate_desc()` / `.order_by_aggregate_asc()` + `.limit(n)` for
+top-N, `.filter_eq(v)` / `.filter_range(lo, hi)` to scope the group column
+*before* aggregating (bound as params, inclusive range), or
+`.bucket(autumn_web::aggregate::DateBucket::{Day,Week,Month})` for a
+`date_trunc` time series keyed by bucket start. `sum`/`avg`/`min`/`max` are
+null-safe (all-`NULL` group → `None`, empty table → empty `Vec`). Inherits
+soft-delete + tenant scoping + read routing like `count`; a sharded,
+tenant-scoped repo used via `across_tenants()` rejects the aggregate rather than
+returning a per-shard-partial answer. `DateBucket` and the `GroupedAggregate`
+builder live in `autumn_web::aggregate`. See "Grouped aggregate queries" in
+`docs/guide/repositories.md`.
+
+## Db transactions
+
+- `Db::tx(f)` — READ COMMITTED, one attempt (published 0.5.0).
+- `Db::tx_with(opts: TxOptions, f) -> Result<T, AutumnError>`
+  (**unreleased**) — closure gets `&mut AsyncPgConnection`; auto-retries
+  SQLSTATE 40001 with capped exponential backoff.
+- `autumn_web::db::IsolationLevel` {`ReadCommitted` (default),
+  `RepeatableRead`, `Serializable`}; `TxOptions` builders
+  `::read_committed()` / `::repeatable_read()` / `::serializable()` +
+  `.read_only()` / `.deferrable()` / `.max_attempts(n)` /
+  `.initial_backoff(d)` / `.max_backoff(d)`; retrying constructors default
+  to 5 attempts.
+
+## Form helpers (`autumn_web::form`)
+
+Free functions rendering changeset-aware, accessible inputs:
+
+- Published 0.5.0: `form_tag`, `method_input`, `text_input`,
+  `text_input_htmx`; `Changeset`-bound methods (`form.form_tag(...)`,
+  `form.text_input(...)`).
+- **(unreleased)**: `checkbox_input`, `number_input`, `date_input`,
+  `datetime_input`, `select_input`.
+- **(unreleased — trunk-dev, not in published 0.5.0)**: `form_for(&changeset,
+  action, method) -> FormFor` whole-form builder. Renders the opening
+  `<form>` (audited CSRF injection + hidden `_method` override, as
+  `form_tag`), one pre-filled control with inline errors per
+  `FormModel::form_fields()` entry, and a submit button. `FormFor` builder
+  methods: `.csrf(token)`, `.csrf_field_name(name)` (default `"_csrf"`),
+  `.exclude(field)`, `.override_field(field, FieldControl)`,
+  `.override_label(field, label)` (repeat calls on one field: last wins),
+  `.append(markup)` (extra markup before the submit button),
+  `.submit_label(label)` (default `"Save"`), `.multipart()`, `.render()`.
+  `FormModel` (`fn form_fields() -> Vec<FormField>`) is implemented by
+  `#[model]` for the same user-editable columns as `NewX`; hand-written
+  impls build `FormField::new(name, label, control, required)` and use
+  `.with_value_name(serialized_key)` when the data type serde-renames the
+  field (the derive resolves `rename`/`rename_all` automatically —
+  `value_name` affects only value pre-fill; input `name`/`id`, error
+  lookup, and builder matching keep the Rust identifier).
+  `FieldControl` variants (`#[non_exhaustive]`): `Text`, `Textarea`,
+  `Password`, `Number { step: Option<String> }`, `Checkbox`, `Date`,
+  `DateTime`, `Select { options: Vec<(String, String)> }`, `File` (any
+  `File` field ⇒ `enctype="multipart/form-data"`).
+  Decode-side contracts handled by the `#[model]`-generated `NewX`:
+  non-nullable `bool` columns are `#[serde(default)]` (unchecked checkbox ⇒
+  `false`); datetime columns attach `deserialize_datetime_local_utc[_option]`
+  / `deserialize_datetime_local_local[_option]` /
+  `deserialize_naive_datetime_local[_option]` (offsetless `datetime-local`
+  values decode; RFC 3339 still accepted). `DateTime` columns with a zone
+  other than `Utc`/`Local` render as `Text` (RFC 3339 string), not a picker.
+
+## View widgets and UI (all unreleased — trunk-dev only)
+
+- `autumn_web::widgets`: `card(&body, &CardConfig)`,
+  `stat_card(label, value, link)`, `tabs(id, &[(id, label, markup)])`,
+  `modal(id, title, &body, &ModalConfig)`, `modal_trigger`,
+  `modal_close_button`, `confirm_action(...)`.
+- `autumn_web::widgets` display atoms: `badge(label, BadgeVariant)` /
+  `badge_with(..., &BadgeConfig)` / `status_tag(label)` with
+  `BadgeVariant::{Neutral,Info,Success,Warning,Danger}` and
+  `BadgeVariant::for_label(&str)` (deterministic color); `avatar(name,
+  &AvatarConfig)` with `AvatarSize::{Small,Medium,Large}` (image or
+  colored-initials fallback); `alert(AlertVariant, body)` / `alert_with(...,
+  &AlertConfig)` with `AlertVariant::{Info,Success,Warning,Error}` and
+  `error_summary(&Changeset) -> Option<Markup>`. All prelude re-exported.
+- `autumn_web::widgets` feedback atoms: `toast(message, AlertVariant)` /
+  `toast_in(region_id, message, AlertVariant)` / `toast_region(id)` +
+  `DEFAULT_TOAST_REGION_ID` — transient htmx toast appended out-of-band
+  (`hx-swap-oob="beforeend:#<region-id>"`), CSS-only auto-dismiss (no JS).
+  `toast_region` is a persistent `aria-live="polite"` region; non-error toasts
+  inherit its politeness (no own `role`/`aria-live`) while `Error` announces
+  assertively via its own `role="alert"` (reuses the `AlertVariant` color
+  lane). `infinite_feed(items, next_cursor, &FeedConfig)` /
+  `feed_page(items, next_cursor, &FeedConfig)` with `FeedMode::{Reveal,Button}`
+  — htmx infinite-scroll / "Load more" feed from a `CursorPage`: one cursored
+  `hx-get` sentinel appends the next page in place (no reload, no duplicate
+  rows), progressive `<a href>` fallback; `feed_page` is the per-page append
+  fragment. All prelude re-exported.
+- `autumn_web::flash::{flash_messages, flash_messages_with,
+  FlashMessagesConfig}` — accessible flash-banner renderer (per-severity
+  `role`/`aria-live`, `autumn-flash--<level>` classes, empty renders nothing,
+  optional no-JS dismiss). Prelude re-exported.
+- `autumn_web::links`: `link_to`, `link_to_with`, `button_to(label, href,
+  Method, csrf_token)`, `button_to_with(..., &ButtonToOptions)`.
+- `autumn_web::ui::pagination`: `pagination_nav(&Page, &PagerOptions)`,
+  `cursor_pagination_nav(&CursorPage, &PagerOptions)`, `PagerOptions::new(base)
+  .query(qs).hx_target(sel).hx_push_url()` (prelude re-exports).
+- `autumn_web::ui::{WIDGETS_CSS, WIDGETS_CSS_PATH}` widget stylesheet.
+
+## Cache read-through (unreleased)
+
+`autumn_web::cache::{get_or_compute, get_or_compute_with,
+GetOrComputeOptions, CacheFillError, jittered_ttl}` — single-flight fills,
+optional `.distributed_fill_lock(true)` / `.stale_while_revalidate(grace)`.
+
+## Downloads (unreleased)
+
+`autumn_web::download::Download` — a typed file-download `IntoResponse`.
+
+- Constructors: `Download::from_bytes(impl Into<Bytes>)` (sets
+  `Content-Length`), `Download::from_stream(stream)` (an async
+  `Stream<Item = Result<Bytes, std::io::Error>>`), `Download::from_async_read(reader)`
+  (any `tokio::io::AsyncRead`), and `Download::from_blob(&store, key).await?`
+  (streams a stored blob via `BlobStore::get_stream` without buffering; sets
+  `Content-Length` and a default content-type from blob metadata; requires the
+  `storage` feature).
+- Setters (chained, `#[must_use]`): `.filename(name)`, `.content_type(ct)`,
+  `.inline()` (defaults to `attachment`).
+- Sets `Content-Disposition` (RFC 5987 `filename*=UTF-8''…` for non-ASCII
+  names, sanitized against header injection), resolves `Content-Type` in the
+  order explicit `.content_type()` → filename extension → blob metadata →
+  `application/octet-stream`, and sets `Content-Length` when known.
+- One-expression example (behind `#[secured]`):
+  `Ok(Download::from_blob(&store, key).await?.filename("report.pdf"))`.
+- Additive `BlobStore::get_stream(key) -> ByteStream<'static>` streams an
+  object's bytes; `LocalBlobStore` overrides it to stream from disk, other
+  backends inherit a buffering default.
+
+### Range / 206 Partial Content (unreleased)
+
+`autumn_web::range` — reusable HTTP `Range` (RFC 7233) parsing + response
+building, wired into `Download` and the embedded static-asset path.
+
+- `range::resolve(&HeaderMap, total, Option<Validator>) -> RangeResolution`
+  parses `Range: bytes=N-` / `N-M` / `-N` against a known `total`, returning
+  `RangeResolution::{Full, Partial{start,end,total}, Unsatisfiable{total}}`
+  (`start`/`end` inclusive). Invalid/unparseable ranges and non-`bytes` units
+  return `Full` (serve the whole representation with `200`).
+- `range::partial_bytes_response(&RangeResolution, Bytes)` builds the response:
+  `206` + `Content-Range: bytes start-end/total` + `Content-Length` for a
+  partial, `200` + `Accept-Ranges: bytes` for full, `416` +
+  `Content-Range: bytes */total` for unsatisfiable. Helpers:
+  `content_range_value`, `unsatisfied_content_range`, `set_accept_ranges`.
+- **Multi-range** (`bytes=0-50,100-150`) is collapsed deterministically to the
+  first satisfiable sub-range as a well-formed single-range `206` (no
+  `multipart/byteranges`).
+- **`If-Range`** (strong `ETag` or `Last-Modified` HTTP-date) via `Validator`:
+  a stale/absent validator falls back to the full `200`.
+- `Download::into_response_ranged(&headers).await` is the request-aware entry
+  point that returns `206`/`416` and advertises `Accept-Ranges: bytes` on the
+  `200`/`206`/`416` for range-capable bodies. The plain `IntoResponse` cannot
+  see the request, always serves the full `200`, and therefore does **not**
+  advertise `Accept-Ranges` (only `into_response_ranged` can honor a `Range`).
+  Add `.etag(..)` / `.last_modified(..)` to supply the `If-Range` validator.
+  Opaque `from_stream`/`from_async_read` bodies are not seekable: always full
+  `200`, never `Accept-Ranges`.
+- Blob range path fetches only the requested slice via the additive
+  `BlobStore::get_range(key, start, end) -> ByteStream<'static>`
+  (`LocalBlobStore` seeks + takes off disk; other backends inherit a buffering
+  default) — a seek in a large video never buffers the whole object.
+
+## Jobs additions
+
+- Published 0.5.0 `#[job]` keys: `name`, `max_attempts`, `backoff_ms`,
+  `unique`, `unique_by`, `unique_window`, `unique_for_ms`, `concurrency`,
+  `concurrency_key`.
+- **(unreleased)**: `queue = "name"` + `[jobs] queues` strict-priority list or
+  `[jobs.queues]` weight table; tracked jobs (`job::enqueue_tracked`,
+  `enqueue_tracked_for`, `TrackedJobHandle`, optional third `JobContext`
+  handler arg, `GET /_autumn/jobs/{token}`, `jobs.tracking.*` config).
+
+## Distributed locks (unreleased — trunk-dev)
+
+- `autumn_web::lock::Lock` (prelude: `Lock`, `LockGuard`, `LockError`; `db`
+  feature). Named, cluster-wide Postgres advisory lock for
+  run-once-across-replicas work.
+- Build: `Lock::new(pool, "name")`, `Lock::from_state(&state, "name")` (primary
+  pool), `.with_poll_interval(dur)`. Key helper: `distributed_lock_key(name) ->
+  i64` (namespaced under `DISTRIBUTED_LOCK_DOMAIN = "autumn:lock:v1"`).
+- Acquire: `try_lock() -> Option<LockGuard>`, `lock()`, `lock_timeout(dur)`
+  (`LockError::Timeout`). Closures: `with(f)`, `with_timeout(dur, f)`,
+  `try_with(f) -> Option<T>`. For run-once (must-not-run-twice) work use
+  `try_with`/`try_lock` and skip on `None`; blocking `with`/`with_timeout`
+  *serialize* — every waiter eventually runs, so they are not run-once.
+  Auto-releases on scope end / `?` / panic;
+  `LockGuard::release().await` releases explicitly. `LockError::PoolUnavailable`
+  / `Timeout` map to `503`.
+- Non-goals: not fair, not a lease, not row-level (`with_lock`), Postgres only.
+
+## Auth additions
+
+- Published 0.5.0: `autumn generate auth` session management (`{user}_sessions`
+  table, `sessions()` / `revoke_session` / `revoke_other_sessions` /
+  `revoke_all_sessions`, `/account/sessions` page, `[auth.sessions]` config).
+- **(unreleased)**: scoped service tokens — `IssueTokenSpec`,
+  `issue_scoped_api_token`, `#[secured(scopes = [...])]`,
+  `PolicyContext::has_scope/has_any_scope/has_all_scopes`, `autumn token
+  issue --name/--scope/--expires-at | list | rotate`, admin `TokenAdminModel`.
 
 ## Prelude contents
 
@@ -141,6 +480,9 @@ and `docs/adr/0008-associations-and-eager-loading.md`.
 | `with_audit_sink(sink)` | Structured audit sink |
 | `policy::<R, P>(policy)`, `scope::<R, S>(scope)` | Repository authorization |
 | `plugin(plugin)`, `plugins(tuple)` | Plugin install |
+| `listeners(listeners![...])` | Event listeners (**unreleased**) |
+| `static_gate(layer)`, `has_static_gate::<L>()`, `get_static_gate_types()` | Static pre-render gating middleware (**unreleased**) |
+| `with_shard_router(router)` | Sharding router (**unreleased**) |
 | `run()` | Start server |
 
 ## Cargo features
@@ -279,6 +621,60 @@ Endpoint builders:
 - `raw_body() -> &[u8]`
 - `json<T>() -> Result<T, serde_json::Error>`
 
+## Feeds (Atom/RSS)
+
+`autumn_web::feed` renders syndication feeds and returns them straight from a
+`#[get]` handler:
+
+- `feed::Feed` — channel builder. `Feed::atom(title, site_link, self_link)` and
+  `Feed::rss(title, site_link, self_link)` (same signature) pick the format;
+  chain `.author(..)`, `.description(..)`, `.updated(DateTime<Utc>)`,
+  `.entry(FeedEntry)`, `.entries(iter)`.
+- `feed::FeedEntry` — per-item builder. `FeedEntry::new(id, title, link)` plus
+  `.summary(..)`, `.content(..)`, `.published(DateTime<Utc>)`,
+  `.updated(DateTime<Utc>)`.
+- `Feed` implements `IntoResponse`, setting `Content-Type: application/atom+xml`
+  (Atom) or `application/rss+xml` (RSS), UTF-8, and XML-escaping every text
+  field. `Feed::render() -> String` returns the raw XML.
+- `Feed::conditional(&headers) -> Response` reuses the `etag` module: it
+  computes the feed's ETag (also available via `Feed::etag()`) and returns a
+  `304 Not Modified` when the request's `If-None-Match` matches, otherwise the
+  full `200` feed. See `docs/guide/conditional-get.md`. The `blog` example
+  wires a `/feed.xml` route this way.
+
+## Cache-Control freshness (`etag::cache_for` / `CacheControl`)
+
+Declarative per-handler `Cache-Control` header (unreleased — issue #1344).
+While `fresh_when` handles *revalidation* (is a cached copy still valid?),
+`cache_for` handles *freshness* (how long may a copy be reused before
+revalidating?). Both are re-exported from the prelude.
+
+- `etag::cache_for(ttl: Duration) -> CacheControl` — starts a directive with
+  `max-age=ttl`, defaulting to `private`.
+- Attach it two ways: as a tuple with any body via `IntoResponseParts` —
+  `(cache_for(dur).public(), html!{ … })` — or `CacheControl::wrap(response)`
+  for a single expression. Either way the header is **inserted** (replacing any
+  prior value), so exactly one `Cache-Control` is emitted.
+- Chainable directives: `public()` / `private()`, `max_age(d)`, `s_maxage(d)`,
+  `stale_while_revalidate(d)`, `no_store()`, `no_cache()`, `must_revalidate()`,
+  `immutable()`. Durations render as whole seconds.
+- `CacheControl::header_value() -> String` renders the deterministic,
+  byte-for-byte value. Ordering: `no-store` alone if set, otherwise visibility,
+  `no-cache`, `max-age`, `s-maxage`, `stale-while-revalidate`,
+  `must-revalidate`, `immutable`.
+- **`max-age` vs `s-maxage`**: `max-age` applies to every cache (browser
+  included); `s-maxage` overrides it for **shared** caches (CDN/proxy) only.
+- **`Vary`**: only mark a personalized page `public` alongside a matching
+  `Vary` (e.g. `Vary: Cookie`) so a shared cache never serves one user's page
+  to another — otherwise keep it `private`/`no_store`.
+- **Default-private safety**: `public` is an explicit opt-in, so dropping
+  `cache_for(..)` onto a secured/authenticated handler can't silently publish
+  it to a shared cache.
+- Composes with `fresh_when`:
+  `fresh_when(&headers, etag).or(cache_for(dur).public().wrap(markup))` — the
+  freshness directives ride the `200` and the preserved `304`. See
+  `docs/guide/conditional-get.md`.
+
 ## Config layering and env keys
 
 Layering order, lowest to highest:
@@ -297,6 +693,15 @@ Profile selection precedence:
 3. `--profile <name>`
 4. `AUTUMN_IS_DEBUG` auto-detection from the macro
 
+`.env` auto-loading (unreleased — trunk-dev): a project-root `.env` file is a
+local-dev feeder for the env-var layer (6), not a new precedence tier. On
+startup Autumn injects `.env` values into the process environment only for keys
+that are still unset, so a real environment variable of the same name always
+wins. Files load in order `.env` → `.env.local` → `.env.{profile}` →
+`.env.{profile}.local`, and earlier files (and real env vars) win. Auto-loaded
+in `dev`/`test`; skipped in `prod` unless `AUTUMN_DOTENV=1` (set `AUTUMN_DOTENV=0`
+to disable it anywhere). A malformed `.env` fails loudly at startup.
+
 Frequently used env keys:
 
 | Env | Config field |
@@ -308,6 +713,7 @@ Frequently used env keys:
 | `AUTUMN_SESSION__BACKEND` | `session.backend` |
 | `AUTUMN_SESSION__REDIS__URL` | `session.redis.url` |
 | `AUTUMN_CHANNELS__BACKEND` | `channels.backend` |
+| `AUTUMN_CHANNELS__REPLAY_BUFFER` | `channels.replay_buffer` (unreleased — trunk-dev) |
 | `AUTUMN_JOBS__BACKEND` | `jobs.backend` |
 | `AUTUMN_JOBS__REDIS__URL` | `jobs.redis.url` |
 | `AUTUMN_SCHEDULER__BACKEND` | `scheduler.backend` |
@@ -318,6 +724,7 @@ Frequently used env keys:
 | `AUTUMN_MAIL__ALLOW_IN_PROCESS_DELIVER_LATER_IN_PRODUCTION` | `mail.allow_in_process_deliver_later_in_production` |
 | `AUTUMN_STORAGE__BACKEND` | `storage.backend` |
 | `AUTUMN_CACHE__BACKEND` | `cache.backend` |
+| `AUTUMN_OBSERVABILITY__SERVER_TIMING` | `observability.server_timing` (unreleased — trunk-dev) — bool; `Server-Timing` response header opt-in. Defaults on in `dev`/`development`, off elsewhere. See `docs/guide/observability/server-timing.md`. |
 
 ## reexports module
 

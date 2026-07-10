@@ -2498,6 +2498,7 @@ pub fn run(opts: DoctorOptions) {
     let auth_extractor_mounted = resolve_auth_extractor_mounted();
     let compression_enabled = resolve_compression_enabled();
     let proxy_conflict_data = resolve_proxy_conflict_data();
+    let (dotenv_has_example, dotenv_has_env, dotenv_uncovered) = resolve_dotenv_state();
 
     // ── Phase 2: build tasks in display order ────────────────────────────────
     let mut tasks: Vec<Task> = Vec::new();
@@ -2695,6 +2696,12 @@ pub fn run(opts: DoctorOptions) {
         check_compression_impl(compression_enabled, is_production)
     }));
 
+    // 12b. Local-dev `.env` handling (warn on `.env.example` without `.env`,
+    //      or a present-but-ungitignored `.env`).
+    tasks.push(Box::new(move || {
+        check_dotenv_impl(dotenv_has_example, dotenv_has_env, &dotenv_uncovered)
+    }));
+
     // 13. System-test browser (warn if missing; not all projects use system tests)
     tasks.push(Box::new(check_system_test_browser));
 
@@ -2708,6 +2715,14 @@ pub fn run(opts: DoctorOptions) {
             has_auth_starter,
             &unregistered.iter().map(String::as_str).collect::<Vec<_>>(),
         )
+    }));
+
+    // 15. Model column privacy (issue #1374): warn when a `#[model]` has a
+    //     sensitively-named column (password/token/secret/*_hash) that is not
+    //     marked `#[private]`, so it would leak into JSON responses.
+    tasks.push(Box::new(|| {
+        let found = resolve_unprivate_sensitive_columns();
+        check_model_private_columns_impl(&found)
     }));
 
     // ── Phase 3: spawn all tasks concurrently ────────────────────────────────
@@ -2777,6 +2792,203 @@ pub fn check_compression_impl(compression_enabled: bool, is_production: bool) ->
             "response compression is enabled".into()
         } else {
             "response compression is disabled (off by default; use CDN or enable explicitly)".into()
+        }),
+        hint: None,
+    }
+}
+
+/// Resolve `.env` filesystem state for [`check_dotenv_impl`].
+///
+/// Returns `(has_env_example, has_env, uncovered_secret_files)`, where the last
+/// element lists every always-secret dotenv file present in the project root
+/// (`.env`, `.env.local`, and any `.env.<profile>.local`) that the project's
+/// `.gitignore` does NOT cover. Committable `.env.<profile>` (non-local) files
+/// are intentionally excluded from the secret set — they follow the Vite/Next
+/// convention of being safe to commit — so doctor never flags them.
+fn resolve_dotenv_state() -> (bool, bool, Vec<String>) {
+    let has_env_example = std::path::Path::new(".env.example").exists();
+    let has_env = std::path::Path::new(".env").exists();
+    let gitignore = std::fs::read_to_string(".gitignore").unwrap_or_default();
+    let uncovered = present_secret_dotenv_files(std::path::Path::new("."))
+        .into_iter()
+        .filter(|name| !gitignore_covers(&gitignore, name))
+        .collect();
+    (has_env_example, has_env, uncovered)
+}
+
+/// Enumerate the always-secret dotenv files present in `dir`: the root `.env`,
+/// `.env.local`, and any `.env.<profile>.local`. Returned sorted for stable
+/// output. Committable `.env.<profile>` (non-local) files are excluded — see
+/// [`is_secret_dotenv_filename`].
+fn present_secret_dotenv_files(dir: &std::path::Path) -> Vec<String> {
+    let mut files = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.filter_map(Result::ok) {
+            if !entry.path().is_file() {
+                continue;
+            }
+            if let Some(name) = entry.file_name().to_str()
+                && is_secret_dotenv_filename(name)
+            {
+                files.push(name.to_owned());
+            }
+        }
+    }
+    files.sort();
+    files
+}
+
+/// Whether `name` is an always-secret dotenv file the loader can auto-load:
+/// `.env`, `.env.local`, or a `.env.<profile>.local` variant.
+///
+/// A non-local `.env.<profile>` (e.g. `.env.dev`) is committable by convention
+/// and returns `false`, as does the `.env.example` template.
+fn is_secret_dotenv_filename(name: &str) -> bool {
+    // Everything after the mandatory `.env` prefix.
+    let Some(rest) = name.strip_prefix(".env") else {
+        return false;
+    };
+    match rest {
+        // Bare `.env` and the root `.env.local` are always secret.
+        "" | ".local" => true,
+        // `.env.<profile>.local` — a per-profile local override. `rest` here is
+        // `.<profile>.local`; require a leading `.`, a `local` final segment,
+        // and at least two `.` separators so `<profile>` is a real segment
+        // (excludes committable non-local `.env.<profile>` files).
+        _ => {
+            rest.starts_with('.')
+                && rest.rsplit('.').next() == Some("local")
+                && rest.matches('.').count() >= 2
+        }
+    }
+}
+
+/// Whether a `.gitignore` body ignores a project-root file named `filename`.
+///
+/// Git-ignore semantics, restricted to the cases needed for root-level dotenv
+/// files: comment (`#…`) and blank lines are skipped; every other line is a
+/// pattern matched against the file's basename, where `*` matches any run of
+/// non-`/` characters (including empty). A leading `!` marks a negation that
+/// **re-includes** a previously excluded file. An optional leading `**/` (match
+/// in any directory) then an optional leading `/` (anchor to the repository
+/// root) are accepted and stripped before matching. A pattern that still
+/// contains a `/` after stripping those prefixes — or ends in `/`
+/// (directory-only) — is a path/dir pattern that cannot match a bare root-level
+/// file and is skipped.
+///
+/// Per gitignore precedence, the **last** matching pattern decides: patterns
+/// are evaluated top-to-bottom while tracking a running ignored state, so
+/// `.env*` followed by `!.env` correctly reports `.env` as NOT covered, and
+/// `!.env` followed by `.env` reports it as covered.
+fn gitignore_covers(contents: &str, filename: &str) -> bool {
+    let mut ignored = false;
+    for line in contents.lines() {
+        let entry = line.trim();
+        if entry.is_empty() || entry.starts_with('#') {
+            continue;
+        }
+        // A leading `!` re-includes (un-ignores) a matching file.
+        let (negation, body) = entry
+            .strip_prefix('!')
+            .map_or((false, entry), |rest| (true, rest));
+        let pattern = body.strip_prefix("**/").unwrap_or(body);
+        let pattern = pattern.strip_prefix('/').unwrap_or(pattern);
+        if pattern.ends_with('/') || pattern.contains('/') {
+            continue;
+        }
+        if glob_matches_basename(pattern, filename) {
+            // Last match wins: a normal pattern ignores, a `!` negation
+            // re-includes.
+            ignored = !negation;
+        }
+    }
+    ignored
+}
+
+/// Match a basename glob against `text`, anchored at both ends. The only special
+/// character is `*`, which matches any run of characters (including empty).
+fn glob_matches_basename(pattern: &str, text: &str) -> bool {
+    let p: Vec<char> = pattern.chars().collect();
+    let t: Vec<char> = text.chars().collect();
+    // Iterative wildcard match with backtracking on the most recent `*`.
+    let (mut pi, mut ti) = (0_usize, 0_usize);
+    let mut star: Option<usize> = None;
+    let mut star_ti = 0_usize;
+    while ti < t.len() {
+        if pi < p.len() && p[pi] == t[ti] {
+            pi += 1;
+            ti += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star = Some(pi);
+            star_ti = ti;
+            pi += 1;
+        } else if let Some(s) = star {
+            pi = s + 1;
+            star_ti += 1;
+            ti = star_ti;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
+    pi == p.len()
+}
+
+/// Check that project-root `.env` handling is set up safely.
+///
+/// - Any always-secret dotenv file (`.env`, `.env.local`, `.env.<profile>.local`)
+///   present but NOT gitignore-covered → Warn, naming the offending file(s).
+///   This security finding takes priority: it is surfaced even when
+///   `.env.example` exists without a root `.env` (so the copy-the-template hint
+///   can never hide an ungitignored, committable secret file).
+/// - `.env.example` present but no `.env` → Warn (developer likely needs to
+///   copy the template).
+/// - otherwise → Pass.
+///
+/// Warn-only by design (never Fail), consistent with the skill doc.
+pub fn check_dotenv_impl(
+    has_env_example: bool,
+    has_env: bool,
+    uncovered_secret_files: &[String],
+) -> CheckResult {
+    // Security first: an ungitignored always-secret dotenv file risks committing
+    // secrets and must never be hidden behind the copy-the-template hint, so
+    // check it before the `.env.example`-without-`.env` case. When both apply,
+    // lead with the security issue and still mention copying the template.
+    if !uncovered_secret_files.is_empty() {
+        let mut detail = format!(
+            "{} present but not gitignored — you risk committing secrets",
+            uncovered_secret_files.join(", ")
+        );
+        if has_env_example && !has_env {
+            detail.push_str("; also copy `.env.example` to `.env` to get started");
+        }
+        return CheckResult {
+            name: "dotenv",
+            status: CheckStatus::Warn,
+            detail: Some(detail),
+            hint: Some(
+                "Add your local .env files to .gitignore (e.g. `.env`, `.env.local`, `.env.*.local`)",
+            ),
+        };
+    }
+    if has_env_example && !has_env {
+        return CheckResult {
+            name: "dotenv",
+            status: CheckStatus::Warn,
+            detail: Some("`.env.example` is present but no `.env` exists".into()),
+            hint: Some("Copy `.env.example` to `.env` and fill in local values"),
+        };
+    }
+    CheckResult {
+        name: "dotenv",
+        status: CheckStatus::Pass,
+        detail: Some(if has_env {
+            "`.env` handling looks correct".into()
+        } else {
+            ".env not configured".into()
         }),
         hint: None,
     }
@@ -3129,11 +3341,304 @@ pub fn check_gdpr_export_registration_impl(
     }
 }
 
+// ─── Model column privacy (#1374) ───────────────────────────────────────────
+
+/// A `#[model]` column whose name looks sensitive but is not marked
+/// `#[private]`. Input to [`check_model_private_columns_impl`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnprivateSensitiveColumn {
+    pub model: String,
+    pub column: String,
+}
+
+/// The sensitive-name heuristic shared with the `#[model]` macro: matches
+/// `password`, `token`, `secret` anywhere, or a `hash` / `_hash` suffix.
+pub fn column_name_is_sensitive(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower.contains("password")
+        || lower.contains("token")
+        || lower.contains("secret")
+        || lower.ends_with("_hash")
+        || lower == "hash"
+}
+
+/// Warn when a `#[model]` column matches the sensitive-name heuristic but is
+/// not marked `#[private]` (issue #1374 AC).
+///
+/// Pure and injectable for tests; a warning (never a hard failure) so it can't
+/// break an existing build.
+pub fn check_model_private_columns_impl(found: &[UnprivateSensitiveColumn]) -> CheckResult {
+    if found.is_empty() {
+        return CheckResult {
+            name: "model_private_columns",
+            status: CheckStatus::Pass,
+            detail: Some("no sensitively-named model columns are missing `#[private]`".into()),
+            hint: None,
+        };
+    }
+    let lines: Vec<String> = found
+        .iter()
+        .map(|c| {
+            format!(
+                "{}.{} looks sensitive but is not marked `#[private]` (it will serialize into JSON responses)",
+                c.model, c.column
+            )
+        })
+        .collect();
+    CheckResult {
+        name: "model_private_columns",
+        status: CheckStatus::Warn,
+        detail: Some(lines.join("\n")),
+        hint: Some(
+            "Mark sensitive columns `#[private]` so they never leak into `Json`/`--api` \
+             responses; the field stays writable and queryable.",
+        ),
+    }
+}
+
+/// Scan the project's `src/` for `#[model]` structs and return the sensitively
+/// named columns that are not marked `#[private]`. Returns an empty list when
+/// there is no `src/` directory or nothing is flagged.
+fn resolve_unprivate_sensitive_columns() -> Vec<UnprivateSensitiveColumn> {
+    let mut found = Vec::new();
+    for path in glob_rs_files(std::path::Path::new("src")) {
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            scan_source_for_unprivate_sensitive_columns(&content, &mut found);
+        }
+    }
+    found
+}
+
+/// Line-based scanner: for each `#[model]`-annotated struct, flag `pub <name>:`
+/// fields whose name is sensitive and that are not immediately preceded by a
+/// `#[private]` (or `#[encrypted]`, which is private-in-JSON by default)
+/// attribute. Deliberately lightweight (no full parse) — consistent with the
+/// other `autumn doctor` source heuristics.
+/// Whether an attribute line applies the `#[model]` macro, including the
+/// path-qualified forms `#[autumn_web::model(...)]` and `#[macros::model]`.
+/// Matches when the attribute path's last `::`-segment is `model`.
+fn attr_line_is_model(line: &str) -> bool {
+    let Some(rest) = line.trim_start().strip_prefix("#[") else {
+        return false;
+    };
+    // The attribute path runs up to the first argument list, close bracket,
+    // whitespace, or comma (e.g. `autumn_web::model` in `#[autumn_web::model(...)]`).
+    let path = rest
+        .split(|c: char| c == '(' || c == ']' || c == ',' || c.is_whitespace())
+        .next()
+        .unwrap_or("");
+    !path.is_empty() && path.rsplit("::").next() == Some("model")
+}
+
+fn scan_source_for_unprivate_sensitive_columns(
+    content: &str,
+    found: &mut Vec<UnprivateSensitiveColumn>,
+) {
+    let lines: Vec<&str> = content.lines().collect();
+    let mut i = 0;
+    while i < lines.len() {
+        if !attr_line_is_model(lines[i]) {
+            i += 1;
+            continue;
+        }
+        // Find the struct name (the `struct X` line) and the opening brace.
+        let mut j = i + 1;
+        let mut model_name: Option<String> = None;
+        while j < lines.len() {
+            let t = lines[j].trim_start();
+            if let Some(rest) = t
+                .strip_prefix("pub struct ")
+                .or_else(|| t.strip_prefix("struct "))
+            {
+                model_name = rest
+                    .split(|c: char| c == '{' || c == '(' || c.is_whitespace())
+                    .next()
+                    .filter(|name| !name.is_empty())
+                    .map(str::to_owned);
+                break;
+            }
+            j += 1;
+        }
+        let Some(model_name) = model_name else {
+            i += 1;
+            continue;
+        };
+        // Walk the struct body until the matching closing brace at column 0-ish.
+        let mut k = j + 1;
+        let mut field_is_private = false;
+        while k < lines.len() {
+            let t = lines[k].trim();
+            if t.starts_with('}') {
+                // Closing brace terminates the struct even when followed by a
+                // trailing comment (`} // User`) or a semicolon (`};`).
+                break;
+            }
+            if t.starts_with("#[private") || t.starts_with("#[encrypted") {
+                field_is_private = true;
+            } else if let Some(field) = parse_pub_field_name(t) {
+                if column_name_is_sensitive(&field) && !field_is_private {
+                    found.push(UnprivateSensitiveColumn {
+                        model: model_name.clone(),
+                        column: field,
+                    });
+                }
+                // Reset the attribute flag after consuming a field line.
+                field_is_private = false;
+            }
+            k += 1;
+        }
+        i = k + 1;
+    }
+}
+
+/// Extract the field name from a `pub <name>: <ty>,` struct-field line, or
+/// `None` if the line is not a field declaration.
+fn parse_pub_field_name(line: &str) -> Option<String> {
+    let rest = line.strip_prefix("pub ")?;
+    let colon = rest.find(':')?;
+    let name = rest[..colon].trim();
+    if name.is_empty() || !name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+        return None;
+    }
+    Some(name.to_owned())
+}
+
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn model_private_columns_pass_when_none_flagged() {
+        let r = check_model_private_columns_impl(&[]);
+        assert_eq!(r.status, CheckStatus::Pass);
+    }
+
+    #[test]
+    fn model_private_columns_warn_lists_offenders() {
+        let found = vec![
+            UnprivateSensitiveColumn {
+                model: "User".into(),
+                column: "password_hash".into(),
+            },
+            UnprivateSensitiveColumn {
+                model: "ApiKey".into(),
+                column: "secret".into(),
+            },
+        ];
+        let r = check_model_private_columns_impl(&found);
+        assert_eq!(r.status, CheckStatus::Warn);
+        let detail = r.detail.unwrap();
+        assert!(detail.contains("User.password_hash"));
+        assert!(detail.contains("ApiKey.secret"));
+    }
+
+    #[test]
+    fn sensitive_name_heuristic_matches_expected() {
+        assert!(column_name_is_sensitive("password_hash"));
+        assert!(column_name_is_sensitive("reset_token"));
+        assert!(column_name_is_sensitive("api_secret"));
+        assert!(column_name_is_sensitive("password"));
+        assert!(!column_name_is_sensitive("email"));
+        assert!(!column_name_is_sensitive("display_name"));
+    }
+
+    #[test]
+    fn scan_flags_unprivate_sensitive_columns_only() {
+        let src = r"
+#[model]
+pub struct User {
+    #[id]
+    pub id: i64,
+    pub email: String,
+    pub password_hash: String,
+    #[private]
+    pub reset_token: String,
+}
+";
+        let mut found = Vec::new();
+        scan_source_for_unprivate_sensitive_columns(src, &mut found);
+        assert_eq!(
+            found.len(),
+            1,
+            "only password_hash should be flagged: {found:?}"
+        );
+        assert_eq!(found[0].model, "User");
+        assert_eq!(found[0].column, "password_hash");
+    }
+
+    #[test]
+    fn scan_terminates_struct_on_brace_with_trailing_tokens() {
+        // The closing brace may be followed by a trailing comment (`} // User`)
+        // or a semicolon (`};`); the scan must still stop at the struct end and
+        // not swallow following declarations.
+        for closing in ["} // User", "};", "}  // trailing"] {
+            let src = format!(
+                "#[model]\npub struct User {{\n    #[id]\n    pub id: i64,\n    pub password_hash: String,\n{closing}\npub struct Other {{\n    pub api_secret: String,\n}}\n"
+            );
+            let mut found = Vec::new();
+            scan_source_for_unprivate_sensitive_columns(&src, &mut found);
+            assert_eq!(
+                found.len(),
+                1,
+                "closing line `{closing}` must terminate the struct: {found:?}"
+            );
+            assert_eq!(found[0].model, "User");
+            assert_eq!(found[0].column, "password_hash");
+        }
+    }
+
+    #[test]
+    fn scan_treats_encrypted_as_private_in_json() {
+        let src = r"
+#[model]
+pub struct Vault {
+    #[id]
+    pub id: i64,
+    #[encrypted]
+    pub api_secret: String,
+}
+";
+        let mut found = Vec::new();
+        scan_source_for_unprivate_sensitive_columns(src, &mut found);
+        assert!(
+            found.is_empty(),
+            "encrypted columns are private-in-JSON: {found:?}"
+        );
+    }
+
+    #[test]
+    fn scan_matches_path_qualified_model_attributes() {
+        // Path-qualified forms (`#[autumn_web::model]`, `#[macros::model]`) must
+        // be scanned like the bare `#[model]` — otherwise the privacy heuristic
+        // silently does nothing for files that use them.
+        for attr in [
+            "#[autumn_web::model]",
+            "#[macros::model]",
+            "#[model(table = \"users\")]",
+        ] {
+            let src = format!(
+                "{attr}\npub struct User {{\n    #[id]\n    pub id: i64,\n    pub password_hash: String,\n}}\n"
+            );
+            let mut found = Vec::new();
+            scan_source_for_unprivate_sensitive_columns(&src, &mut found);
+            assert_eq!(
+                found.len(),
+                1,
+                "path-qualified `{attr}` must be scanned and flag password_hash: {found:?}"
+            );
+            assert_eq!(found[0].column, "password_hash");
+        }
+
+        // A helper self-check: only attributes whose last segment is `model`.
+        assert!(attr_line_is_model("#[autumn_web::model(table = \"x\")]"));
+        assert!(attr_line_is_model("  #[macros::model]"));
+        assert!(attr_line_is_model("#[model]"));
+        assert!(!attr_line_is_model("#[models]"));
+        assert!(!attr_line_is_model("#[model_config]"));
+        assert!(!attr_line_is_model("pub struct User {"));
+    }
 
     #[test]
     fn test_recursive_toml_validation() {
@@ -4602,6 +5107,174 @@ redirect_uri = "http://localhost/callback"
             "expected Pass in dev profile, got {:?}",
             result.status
         );
+    }
+
+    // ── check_dotenv ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn dotenv_warns_when_example_present_without_env() {
+        let result = check_dotenv_impl(true, false, &[]);
+        assert_eq!(result.name, "dotenv");
+        assert!(
+            matches!(result.status, CheckStatus::Warn),
+            "expected Warn, got {:?}",
+            result.status
+        );
+        assert!(result.detail.as_deref().unwrap().contains(".env.example"));
+    }
+
+    #[test]
+    fn dotenv_warns_when_env_present_but_not_gitignored() {
+        let result = check_dotenv_impl(true, true, &[".env".to_owned()]);
+        assert_eq!(result.name, "dotenv");
+        assert!(
+            matches!(result.status, CheckStatus::Warn),
+            "expected Warn, got {:?}",
+            result.status
+        );
+        let detail = result.detail.as_deref().unwrap();
+        assert!(detail.contains("not gitignored"), "got: {detail:?}");
+        assert!(detail.contains(".env"), "got: {detail:?}");
+    }
+
+    #[test]
+    fn dotenv_warns_when_env_local_present_but_not_gitignored() {
+        // A `.env.local` with no root `.env` must still warn: the loader reads
+        // it and it is always secret.
+        let result = check_dotenv_impl(false, false, &[".env.local".to_owned()]);
+        assert_eq!(result.name, "dotenv");
+        assert!(
+            matches!(result.status, CheckStatus::Warn),
+            "expected Warn, got {:?}",
+            result.status
+        );
+        assert!(
+            result.detail.as_deref().unwrap().contains(".env.local"),
+            "detail should name the offending file: {:?}",
+            result.detail
+        );
+    }
+
+    #[test]
+    fn dotenv_uncovered_secret_takes_priority_over_missing_env() {
+        // Combined case: `.env.example` present, no root `.env`, and a present
+        // `.env.local` that is NOT gitignored. The ungitignored-secret warning
+        // must win (naming the file) rather than being hidden behind the
+        // copy-the-template hint.
+        let result = check_dotenv_impl(true, false, &[".env.local".to_owned()]);
+        assert_eq!(result.name, "dotenv");
+        assert!(
+            matches!(result.status, CheckStatus::Warn),
+            "expected Warn, got {:?}",
+            result.status
+        );
+        let detail = result.detail.as_deref().unwrap();
+        assert!(
+            detail.contains(".env.local"),
+            "detail must name the uncovered secret file: {detail:?}"
+        );
+        assert!(
+            detail.contains("not gitignored"),
+            "detail must lead with the security issue: {detail:?}"
+        );
+        // The gitignore hint is the actionable one for the security issue.
+        assert!(
+            result.hint.unwrap().contains(".gitignore"),
+            "hint should point at .gitignore: {:?}",
+            result.hint
+        );
+    }
+
+    #[test]
+    fn dotenv_warns_when_profile_local_present_but_not_gitignored() {
+        let result = check_dotenv_impl(false, false, &[".env.dev.local".to_owned()]);
+        assert!(
+            matches!(result.status, CheckStatus::Warn),
+            "expected Warn, got {:?}",
+            result.status
+        );
+        assert!(
+            result.detail.as_deref().unwrap().contains(".env.dev.local"),
+            "got: {:?}",
+            result.detail
+        );
+    }
+
+    #[test]
+    fn dotenv_passes_when_all_present_secret_files_gitignored() {
+        // No uncovered secret files → Pass, even with a root `.env` present.
+        let result = check_dotenv_impl(true, true, &[]);
+        assert_eq!(result.name, "dotenv");
+        assert!(
+            matches!(result.status, CheckStatus::Pass),
+            "expected Pass, got {:?}",
+            result.status
+        );
+    }
+
+    #[test]
+    fn dotenv_passes_when_nothing_configured() {
+        let result = check_dotenv_impl(false, false, &[]);
+        assert_eq!(result.name, "dotenv");
+        assert!(
+            matches!(result.status, CheckStatus::Pass),
+            "expected Pass, got {:?}",
+            result.status
+        );
+    }
+
+    #[test]
+    fn is_secret_dotenv_filename_classifies_local_vs_committable() {
+        assert!(is_secret_dotenv_filename(".env"));
+        assert!(is_secret_dotenv_filename(".env.local"));
+        assert!(is_secret_dotenv_filename(".env.dev.local"));
+        assert!(is_secret_dotenv_filename(".env.production.local"));
+        // Committable per-profile (non-local) files are NOT secret.
+        assert!(!is_secret_dotenv_filename(".env.dev"));
+        assert!(!is_secret_dotenv_filename(".env.production"));
+        // The template is not itself a secret.
+        assert!(!is_secret_dotenv_filename(".env.example"));
+        assert!(!is_secret_dotenv_filename("env.local"));
+    }
+
+    #[test]
+    fn gitignore_covers_truth_table() {
+        // `.env` covers `.env` but NOT `.env.local`.
+        assert!(gitignore_covers(".env\n", ".env"));
+        assert!(!gitignore_covers(".env\n", ".env.local"));
+        // `.env.*` covers `.env.local` but NOT `.env`.
+        assert!(gitignore_covers(".env.*\n", ".env.local"));
+        assert!(!gitignore_covers(".env.*\n", ".env"));
+        // `.env*` covers both.
+        assert!(gitignore_covers(".env*\n", ".env"));
+        assert!(gitignore_covers(".env*\n", ".env.local"));
+        // `*.local` and `.env.*.local` cover `.env.dev.local`.
+        assert!(gitignore_covers("*.local\n", ".env.dev.local"));
+        assert!(gitignore_covers(".env.*.local\n", ".env.dev.local"));
+        // `.env.example` covers neither `.env` nor `.env.local`.
+        assert!(!gitignore_covers(".env.example\n", ".env"));
+        assert!(!gitignore_covers(".env.example\n", ".env.local"));
+        // `**/.env` covers `.env`.
+        assert!(gitignore_covers("**/.env\n", ".env"));
+        // Leading `/` anchor and surrounding whitespace.
+        assert!(gitignore_covers("/target\n.env\n", ".env"));
+        assert!(gitignore_covers("  .env  \n", ".env"));
+        // Comment, blank, and negation lines never count as coverage.
+        assert!(!gitignore_covers("# .env\n\n", ".env"));
+        assert!(!gitignore_covers("!.env\n", ".env"));
+        assert!(!gitignore_covers("", ".env"));
+        // A path pattern in a subdirectory does not cover a root-level file.
+        assert!(!gitignore_covers("config/.env\n", ".env"));
+        // A directory-only pattern does not cover a regular file.
+        assert!(!gitignore_covers(".env/\n", ".env"));
+        // Last-match-wins with `!` negations (gitignore precedence): a `!.env`
+        // re-include after a broader ignore means `.env` is NOT covered.
+        assert!(!gitignore_covers(".env*\n!.env\n", ".env"));
+        assert!(!gitignore_covers(".env\n!.env\n", ".env"));
+        // `.env*` still covers a sibling the negation does not re-include.
+        assert!(gitignore_covers(".env*\n!.env\n", ".env.local"));
+        // Order matters: a later ignore re-covers a file an earlier `!` freed.
+        assert!(gitignore_covers("!.env\n.env\n", ".env"));
     }
 
     #[test]

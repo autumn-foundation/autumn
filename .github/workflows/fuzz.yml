@@ -1,0 +1,56 @@
+name: Fuzz
+
+# Per-PR crash gate: run every cargo-fuzz target for a short, bounded burst on
+# each push/PR to trunk & trunk-dev (same triggers as ci.yml). This is NOT a
+# coverage-maximizing run — it seeds from the committed corpus under
+# fuzz/corpus/<target> and re-plays it plus a few seconds of new mutations, so a
+# reproducer that already lives in the corpus (or is easy to rediscover) fails
+# the PR fast. The nightly long-run (fuzz-nightly.yml) does the deep search.
+#
+# On a crash cargo-fuzz exits non-zero and writes the minimized reproducer to
+# fuzz/artifacts/<target>/; the upload-artifact step (if: failure()) captures it
+# so the input can be pulled down and replayed locally with
+#   cargo +nightly fuzz run <target> fuzz/artifacts/<target>/<crash-file>
+
+on:
+  push:
+    branches: [trunk, trunk-dev]
+  pull_request:
+    branches: [trunk, trunk-dev]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  fuzz:
+    name: Fuzz (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [idempotency, routing, headers, session, body]
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install nightly toolchain
+        uses: dtolnay/rust-toolchain@nightly
+      - name: Install cargo-fuzz
+        uses: taiki-e/install-action@cargo-fuzz
+      - uses: Swatinem/rust-cache@v2.7.8
+        with:
+          workspaces: fuzz
+      - name: Fuzz ${{ matrix.target }} (30s burst, seeded from committed corpus)
+        # Corpus dir defaults to fuzz/corpus/${{ matrix.target }}; -max_total_time
+        # caps the run and -timeout flags any single input that hangs past 10s.
+        run: cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=30 -timeout=10
+      - name: Upload crash reproducers
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: fuzz/artifacts/**
+          if-no-files-found: ignore

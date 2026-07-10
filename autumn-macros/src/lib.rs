@@ -45,7 +45,9 @@ mod service;
 mod static_route;
 mod static_routes_macro;
 mod step_up;
+mod story_macro;
 mod tasks_macro;
+mod throttle;
 mod ws;
 
 use proc_macro::TokenStream;
@@ -286,6 +288,20 @@ pub fn mailer_preview(attr: TokenStream, item: TokenStream) -> TokenStream {
 #[proc_macro]
 pub fn mail_previews(input: TokenStream) -> TokenStream {
     mail_previews_macro::mail_previews_macro(input.into()).into()
+}
+
+/// Define a widget story for the `/_stories` gallery:
+/// `story!{ "Group", "Name", { ... } }`.
+///
+/// The brace-delimited block is **both** executed for the live render and
+/// captured byte-for-byte (comments and formatting included) as the displayed
+/// source snippet, so the shown code is provably the code that rendered. The
+/// block must be a self-contained expression evaluating to `maud::Markup`:
+/// it is coerced to a plain `fn() -> Markup`, so capturing anything from the
+/// surrounding environment is a compile error.
+#[proc_macro]
+pub fn story(input: TokenStream) -> TokenStream {
+    story_macro::story_macro(input.into()).into()
 }
 
 /// Attribute macro for Autumn database models.
@@ -659,6 +675,67 @@ pub fn secured(attr: TokenStream, item: TokenStream) -> TokenStream {
 #[proc_macro_attribute]
 pub fn step_up(attr: TokenStream, item: TokenStream) -> TokenStream {
     step_up::step_up_macro(attr.into(), item.into()).into()
+}
+
+/// Apply a per-route rate limit to a handler.
+///
+/// The handler is guarded by an additional rate limiter that composes with
+/// (and, for the annotated route, is stricter than) the global limiter
+/// configured under `[security.rate_limit]`. Requests denied by either
+/// limiter respond with `429 Too Many Requests` including a `Retry-After`
+/// header and the standard `x-ratelimit-*` headers.
+///
+/// # Forms
+///
+/// - `#[throttle(limit = 5, per = "1m")]` — inline limit; keying strategy
+///   matches the global limiter.
+/// - `#[throttle(limit = 5, per = "1m", key = "ip" | "principal" | "token")]`
+///   — inline limit with an explicit key strategy override.
+/// - `#[throttle("login")]` — reference a named limiter defined in
+///   `[security.rate_limit.named.login]`.
+///
+/// # Example
+///
+/// ```ignore
+/// use autumn_web::prelude::*;
+///
+/// #[post("/login")]
+/// #[throttle(limit = 5, per = "1m", key = "ip")]
+/// async fn login() -> AutumnResult<&'static str> {
+///     Ok("welcome back")
+/// }
+/// ```
+///
+/// # Limitations
+///
+/// Like the sibling `#[secured]` / `#[step_up]` guards it mirrors, the throttle
+/// check runs inside the handler after `FromRequestParts` extractors, but body
+/// extractors (`Json` / `Form` / `Multipart`) are parsed by Axum *before* the
+/// throttle check, so an over-limit client can still incur request-body parsing
+/// before receiving its `429`. For hard pre-body protection, combine with the
+/// global limiter layer under `[security.rate_limit]`.
+///
+/// # Attribute ordering
+///
+/// Place the route method attribute (`#[get]` / `#[post]` / …) *above*
+/// `#[throttle]`, i.e. method attribute outermost:
+///
+/// ```ignore
+/// #[post("/login")]           // method attribute outermost
+/// #[throttle(limit = 5, per = "1m", key = "ip")]
+/// async fn login() -> Json<Session> { /* … */ }
+/// ```
+///
+/// Both orders enforce throttling correctly (including idempotency-replay
+/// accounting). However, only the method-attribute-outermost order lets the
+/// route macro see the handler's real return type for `OpenAPI` response-schema
+/// generation. When `#[throttle]` expands first it rewrites the return type to
+/// `Response` (like the sibling `#[secured]` / `#[step_up]` / `#[authorize]`
+/// guards), so a `Json<T>` response schema would be lost from the generated
+/// `OpenAPI` document.
+#[proc_macro_attribute]
+pub fn throttle(attr: TokenStream, item: TokenStream) -> TokenStream {
+    throttle::throttle_macro(attr.into(), item.into()).into()
 }
 
 /// Gate a route handler on a named feature flag.

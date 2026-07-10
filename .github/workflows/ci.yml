@@ -19,7 +19,7 @@ jobs:
     name: Lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -38,7 +38,7 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Free disk space (Linux)
         if: runner.os == 'Linux'
         run: |
@@ -74,13 +74,18 @@ jobs:
           cargo test -p autumn-cli --test flags -- --ignored
           cargo test -p autumn-cli --test config -- --ignored
           cargo test -p autumn-cli --test experiments -- --ignored
+          # offline-sync is not a default feature, so the workspace test run
+          # above compiles these out; run them (plus the Docker-gated PG
+          # conformance suite) here.
+          cargo test -p autumn-web --features offline-sync --test integration_tests offline_sync
+          cargo test -p autumn-web --features offline-sync --test integration_tests -- --ignored offline_sync_pg
 
   coverage:
     name: Coverage
     needs: test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Free disk space
         run: |
           # llvm-cov instrumentation roughly doubles target/ size, so the
@@ -120,7 +125,7 @@ jobs:
           cargo llvm-cov --no-report -p autumn-cli --test experiments -- --ignored
           cargo llvm-cov report --lcov --output-path lcov.info
       - name: Upload to Codecov
-        uses: codecov/codecov-action@v6
+        uses: codecov/codecov-action@v7
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: lcov.info
@@ -130,10 +135,32 @@ jobs:
     name: MSRV (1.88.0)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2.7.8
       - name: Check MSRV alignment
         run: ./scripts/check-msrv.sh
       - name: Check MSRV compiles
         run: cargo check --workspace
+
+  # Genuine loom model checks: the loom_models test binary uses loom::sync::*
+  # unconditionally, so loom::model() exhaustively explores thread interleavings
+  # here. We gate the binary with a NEUTRAL custom cfg (loom_models) rather than
+  # the conventional `--cfg loom`, because `--cfg loom` poisons the whole
+  # dependency tree — hyper-util/tokio ship their own `#[cfg(loom)]` type-swap
+  # paths that fail to compile. Release mode is loom's own recommendation, and
+  # the preemption budget + job timeout bound the state-space search.
+  loom:
+    name: Loom
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.7.8
+      - name: Run loom model checks
+        run: cargo test -p autumn-web --release --test loom_models
+        env:
+          RUSTFLAGS: "--cfg loom_models"
+          LOOM_MAX_PREEMPTIONS: "3"

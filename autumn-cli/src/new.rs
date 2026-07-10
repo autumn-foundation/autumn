@@ -10,6 +10,7 @@ use autumn_web::credentials::{MasterKey, encrypt};
 
 mod templates {
     pub const CARGO_TOML: &str = include_str!("templates/Cargo.toml.tmpl");
+    pub const README: &str = include_str!("templates/README.md.tmpl");
     pub const MAIN_RS: &str = include_str!("templates/main.rs.tmpl");
     pub const AUTUMN_TOML: &str = include_str!("templates/autumn.toml.tmpl");
     pub const DOCKERFILE: &str = include_str!("templates/Dockerfile.tmpl");
@@ -18,6 +19,7 @@ mod templates {
     pub const INPUT_CSS: &str = include_str!("templates/input.css.tmpl");
     pub const TAILWIND_CONFIG: &str = include_str!("templates/tailwind.config.js.tmpl");
     pub const GITIGNORE: &str = include_str!("templates/gitignore.tmpl");
+    pub const ENV_EXAMPLE: &str = include_str!("templates/env.example.tmpl");
     pub const SEED_RS: &str = include_str!("templates/seed.rs.tmpl");
     pub const SEED_CARGO_TOML: &str = include_str!("templates/seed_Cargo.toml.tmpl");
     pub const INTEGRATION_TEST: &str = include_str!("templates/tests/integration_test.rs.tmpl");
@@ -214,6 +216,11 @@ fn generate_inner(
     );
     fs::write(project_dir.join("Cargo.toml"), cargo_toml)?;
 
+    fs::write(
+        project_dir.join("README.md"),
+        render_readme(render(templates::README), opts, &vars),
+    )?;
+
     let mut main_rs = if opts.with_i18n {
         inject_i18n(&render(templates::MAIN_RS))
     } else {
@@ -275,6 +282,10 @@ fn generate_inner(
         render(templates::TAILWIND_CONFIG),
     )?;
     fs::write(project_dir.join(".gitignore"), render(templates::GITIGNORE))?;
+    fs::write(
+        project_dir.join(".env.example"),
+        render(templates::ENV_EXAMPLE),
+    )?;
     fs::write(project_dir.join("migrations/.gitkeep"), "")?;
 
     scaffold_vendor_assets(&project_dir)?;
@@ -389,6 +400,7 @@ fn scaffold_credentials(project_dir: &Path, name: &str) -> Result<(), NewError> 
 fn print_scaffold_summary(name: &str, opts: GenerateOptions) {
     println!("  Created {name}/");
     println!("  Created {name}/Cargo.toml");
+    println!("  Created {name}/README.md");
     println!("  Created {name}/autumn.toml");
     println!("  Created {name}/Dockerfile");
     println!("  Created {name}/.dockerignore");
@@ -400,6 +412,7 @@ fn print_scaffold_summary(name: &str, opts: GenerateOptions) {
     println!("  Created {name}/static/css/input.css");
     println!("  Created {name}/tailwind.config.js");
     println!("  Created {name}/.gitignore");
+    println!("  Created {name}/.env.example");
     println!("  Created {name}/rust-toolchain.toml");
     println!("  Created {name}/rustfmt.toml");
     println!("  Created {name}/clippy.toml");
@@ -512,6 +525,204 @@ const DAEMON_NO_DB_FEATURES: &[&str] = &[
     "http-client",
     "reporting",
 ];
+
+/// Anchor: first line of the DB-specific prerequisites/steps block in
+/// `README.md.tmpl` (the `- **A reachable Postgres**` bullet). Everything from
+/// here up to [`README_TAIL_ANCHOR`] is the default DB-first golden path and is
+/// swapped out for daemon / bundled-Postgres app shapes.
+const README_DB_BODY_ANCHOR: &str = "- **A reachable Postgres**";
+/// Anchor: start of the shared CLI-reference tail in `README.md.tmpl`.
+const README_TAIL_ANCHOR: &str = "## CLI reference";
+/// The CLI-reference row documenting `autumn migrate`, stripped from the daemon
+/// / bundled-Postgres READMEs (a DB-free daemon has no migrations to apply, and
+/// a bundled-Postgres daemon applies them automatically inside the process).
+const README_MIGRATE_ROW: &str = "| `autumn migrate` | Apply pending database migrations. |\n";
+/// The CLI-reference row documenting `autumn generate scaffold`, stripped from
+/// the **DB-free daemon** README only. `generate scaffold` emits Diesel
+/// models/repositories/migrations and re-enables `db-diesel2-postgres`, so the
+/// code it produces cannot compile in a `--daemon` scaffold (which disables the
+/// `db` feature). The bundled-Postgres shape keeps the `db` feature, so the verb
+/// stays valid there and this row is retained.
+const README_SCAFFOLD_ROW: &str = "| `autumn generate scaffold <Name> field:Type …` | Scaffold a CRUD resource — model, migration, routes, and views. |\n";
+/// The project-layout row documenting the `migrations/` directory, stripped from
+/// the DB-free daemon README (that scaffold has no migrations directory).
+const README_MIGRATIONS_LAYOUT_ROW: &str =
+    "| `migrations/` | Diesel migrations — one directory per migration. |\n";
+
+/// Render the project README, tailoring the golden path to the app shape and
+/// appending flag-specific sections.
+///
+/// The template body is the default **DB-first** golden path (configure
+/// `[database]`, `autumn migrate`, `autumn dev`). For the daemon app shapes the
+/// DB-bootstrap block is swapped for prose that matches what the scaffold
+/// actually produces:
+///
+/// * `--daemon` builds with **no** database (the `db` feature is off and
+///   migrations are stripped), so it must not tell users to install `libpq`,
+///   configure Postgres, or run `autumn migrate` — it runs via `autumn serve`.
+/// * `--bundled-pg` embeds and manages its own Postgres, so there is no external
+///   server to configure and migrations apply automatically — it runs via
+///   `autumn serve --bundled-pg`.
+///
+/// `render_template` only substitutes the four fixed `{{…}}` tokens, so the
+/// flag-aware quickstart notes are built here in Rust rather than gated inside
+/// the template. Text produced here must not introduce any new `{{…}}` token —
+/// `no_unsubstituted_placeholders` walks the generated tree and would flag it
+/// (crate/project names are interpolated from `vars`, not left as tokens).
+fn render_readme(rendered: String, opts: GenerateOptions, vars: &TemplateVars<'_>) -> String {
+    // `--bundled-pg` implies `with_daemon`, so test it first.
+    let mut readme = if opts.with_bundled_pg {
+        // Bundled Postgres keeps the `db` feature, so `generate scaffold` and the
+        // `migrations/` layout stay valid — only the hand-run `migrate` row goes.
+        rewrite_readme_body(&rendered, &bundled_pg_readme_body(vars), false)
+    } else if opts.with_daemon {
+        // Pure DB-free daemon: also strip the DB-coupled CLI/layout rows.
+        rewrite_readme_body(&rendered, &daemon_readme_body(vars), true)
+    } else {
+        rendered
+    };
+    if opts.with_i18n {
+        readme.push_str(
+            "\n## Internationalization (i18n)\n\
+             \n\
+             This project was generated with `--with-i18n`. Fluent translations\n\
+             live in `i18n/en.ftl`; add more locales by dropping additional files\n\
+             like `i18n/es.ftl`. Reach translations from your handlers by taking a\n\
+             `Locale` extractor and passing it to the `t!()` macro — e.g.\n\
+             `t!(locale, \"welcome.title\")` — and use the `[i18n]` block in\n\
+             `autumn.toml` to set the default and supported locales. See\n\
+             `docs/guide/i18n.md` for the full guide.\n",
+        );
+    }
+    if opts.with_seed {
+        readme.push_str(
+            "\n## Seed data\n\
+             \n\
+             This project was generated with `--with-seed`. Edit `src/bin/seed.rs`\n\
+             to insert representative data, then seed the database (after applying\n\
+             migrations):\n\
+             \n\
+             ```sh\n\
+             autumn migrate && autumn seed\n\
+             ```\n",
+        );
+    }
+    readme
+}
+
+/// Replace the default DB-first golden-path block (from
+/// [`README_DB_BODY_ANCHOR`] up to [`README_TAIL_ANCHOR`]) with `new_body`, then
+/// drop the CLI-reference `autumn migrate` row — neither daemon shape runs it by
+/// hand. `new_body` supplies the app-shape-specific prerequisites and run steps.
+///
+/// When `db_free` is set (the pure `--daemon` shape, which disables the `db`
+/// feature), the DB-coupled CLI/layout rows are stripped too: `generate scaffold`
+/// (it emits Diesel code that needs the disabled `db` feature) and the
+/// `migrations/` layout row (no migrations directory exists). The
+/// bundled-Postgres shape keeps `db`, so it passes `db_free = false` and retains
+/// those rows.
+fn rewrite_readme_body(rendered: &str, new_body: &str, db_free: bool) -> String {
+    let start = rendered.find(README_DB_BODY_ANCHOR).unwrap_or_else(|| {
+        panic!(
+            "README.md.tmpl anchor not found: {README_DB_BODY_ANCHOR:?} — the template and \
+             render_readme have drifted out of sync"
+        )
+    });
+    let tail = rendered.find(README_TAIL_ANCHOR).unwrap_or_else(|| {
+        panic!(
+            "README.md.tmpl anchor not found: {README_TAIL_ANCHOR:?} — the template and \
+             render_readme have drifted out of sync"
+        )
+    });
+    let spliced = format!("{}{}{}", &rendered[..start], new_body, &rendered[tail..]);
+    // The daemon shapes have no hand-run migration step; drop the reference row
+    // so the CLI table stays consistent with the golden path above it.
+    let mut out = spliced.replace(README_MIGRATE_ROW, "");
+    if db_free {
+        // The DB-free daemon disables the `db` feature, so `generate scaffold`
+        // would emit code that cannot compile, and there is no `migrations/`
+        // directory. Drop both rows so the reference matches what actually works.
+        out = out.replace(README_SCAFFOLD_ROW, "");
+        out = out.replace(README_MIGRATIONS_LAYOUT_ROW, "");
+    }
+    out
+}
+
+/// DB-free daemon (`--daemon`) golden-path body: no Postgres, no `libpq`, no
+/// migrations — the app runs via `autumn serve`.
+fn daemon_readme_body(vars: &TemplateVars<'_>) -> String {
+    format!(
+        "\n### 2. Run the server\n\
+         \n\
+         This project was generated with `--daemon`: it builds with **no** database — the\n\
+         `db` feature is off and there are no migrations — so there is no Postgres to\n\
+         install, no database client library to link, and nothing in `autumn.toml` to\n\
+         configure. Run it locally with:\n\
+         \n\
+         ```sh\n\
+         autumn dev\n\
+         ```\n\
+         \n\
+         Then visit **http://localhost:3000** — you should get a `200` with\n\
+         \"Welcome to {project}!\". Health endpoints are auto-mounted at `/health`\n\
+         and `/actuator/health`.\n\
+         \n\
+         For production, `autumn serve --daemon` supervises it in the background as a\n\
+         managed daemon (`autumn serve status`, `autumn serve stop`, and `autumn serve\n\
+         restart` manage the process). Unlike `autumn dev`, the daemon binds a private\n\
+         **Unix domain socket**, not a TCP port — so it is *not* reachable at\n\
+         `http://localhost:3000`. Run `autumn serve status` to print its socket address;\n\
+         see `docs/guide/daemon.md` for the socket transport and lifecycle details.\n\
+         \n\
+         Need a database later? Re-enable `autumn-web`'s default features (turn the\n\
+         `db` feature back on) in `Cargo.toml` to unlock the database-backed\n\
+         workflow — migrations and CRUD scaffolding — that the default (non-daemon)\n\
+         starter documents.\n\
+         \n\
+         ",
+        project = vars.project_name,
+    )
+}
+
+/// Bundled/managed-Postgres daemon (`--bundled-pg`) golden-path body: the app
+/// owns its Postgres and auto-applies migrations, so there is no external server
+/// to configure — it runs via `autumn serve --bundled-pg`. It keeps the `db`
+/// feature, so `libpq` is still linked at build time.
+fn bundled_pg_readme_body(vars: &TemplateVars<'_>) -> String {
+    format!(
+        "- **The PostgreSQL client library (`libpq`).** This starter keeps the `db`\n\
+         \x20 feature, so the binary links `libpq` at build time — install it with your\n\
+         \x20 package manager (e.g. `libpq-dev` on Debian/Ubuntu, `libpq` via Homebrew on\n\
+         \x20 macOS).\n\
+         \n\
+         ### 2. Run the server\n\
+         \n\
+         This project was generated with `--bundled-pg`: it embeds and manages its own\n\
+         Postgres. You do **not** install a server, edit the `[database]` block, or run\n\
+         migrations by hand — the app provisions the cluster on startup and applies the\n\
+         embedded migrations automatically (see the `[database]` note in `autumn.toml`).\n\
+         Run it locally with:\n\
+         \n\
+         ```sh\n\
+         autumn dev\n\
+         ```\n\
+         \n\
+         Then visit **http://localhost:3000** — you should get a `200` with\n\
+         \"Welcome to {project}!\". Health endpoints are auto-mounted at `/health`\n\
+         and `/actuator/health`.\n\
+         \n\
+         For production, `autumn serve --bundled-pg` supervises the app and its managed\n\
+         Postgres in the background as a daemon (`autumn serve status`, `autumn serve stop`,\n\
+         and `autumn serve restart` manage the process). Unlike `autumn dev`, the daemon\n\
+         binds a private **Unix domain socket**, not a TCP port — so it is *not* reachable\n\
+         at `http://localhost:3000`. Run `autumn serve status` to print its socket address;\n\
+         see `docs/guide/daemon.md` for the socket transport, lifecycle, and bundled-Postgres\n\
+         details.\n\
+         \n\
+         ",
+        project = vars.project_name,
+    )
+}
 
 fn render_cargo_toml(
     opts: GenerateOptions,
@@ -718,6 +929,7 @@ mod tests {
 
         let p = tmp.path().join("test-app");
         assert!(p.join("Cargo.toml").is_file());
+        assert!(p.join("README.md").is_file());
         assert!(p.join("src/main.rs").is_file());
         assert!(p.join("autumn.toml").is_file());
         assert!(p.join("Dockerfile").is_file());
@@ -730,6 +942,7 @@ mod tests {
         );
         assert!(p.join("build.rs").is_file());
         assert!(p.join(".gitignore").is_file());
+        assert!(p.join(".env.example").is_file());
         assert!(p.join("static/css/input.css").is_file());
         assert!(p.join("tailwind.config.js").is_file());
         assert!(p.join("migrations/.gitkeep").is_file());
@@ -858,12 +1071,15 @@ mod tests {
         // to a new row if the row itself is allowed to wrap. Without flex-wrap
         // on the enhanced root, the opened mobile menu squeezes/overflows onto
         // the same row as the brand and toggle instead of appearing below them.
-        let rule_body = css_rule_body(templates::INPUT_CSS, ".autumn-nav--enhanced {");
+        //
+        // This rule now ships from the framework itself (#1215), not the
+        // per-project input.css.tmpl — assert against the shared stylesheet.
+        let css = autumn_web::ui::WIDGETS_COMPONENT_CSS;
+        let rule_body = css_rule_body(css, ".autumn-nav--enhanced {");
         assert!(
             rule_body.contains("flex-wrap"),
             "the mobile media query must set flex-wrap on .autumn-nav--enhanced itself \
-             so .autumn-nav__collapse's basis-full can actually start a new row, got:\n{}",
-            templates::INPUT_CSS
+             so .autumn-nav__collapse's basis-full can actually start a new row, got:\n{css}"
         );
     }
 
@@ -894,13 +1110,16 @@ mod tests {
         // against — the two lists just stack vertically as ordinary block
         // children instead of sitting side by side with trailing pinned to
         // the far right, as nav_bar's trailing-slot design intends.
-        let rule_body = css_rule_body(templates::INPUT_CSS, ".autumn-nav__collapse {");
+        //
+        // This rule now ships from the framework itself (#1215), not the
+        // per-project input.css.tmpl — assert against the shared stylesheet.
+        let css = autumn_web::ui::WIDGETS_COMPONENT_CSS;
+        let rule_body = css_rule_body(css, ".autumn-nav__collapse {");
         assert!(
             rule_body.contains("flex") && !rule_body.contains("flex-col"),
             "the base (non-mobile) .autumn-nav__collapse rule must be a flex row \
              so .autumn-nav__items--trailing's ml-auto can push it to the right \
-             edge of the nav, got:\n{}",
-            templates::INPUT_CSS
+             edge of the nav, got:\n{css}"
         );
     }
 
@@ -934,6 +1153,32 @@ mod tests {
         assert!(content.contains("/target"));
         assert!(content.contains("static/css/autumn.css"));
         assert!(!content.contains("static/autumn/"));
+        // `.env` (and local variants) are gitignored, but the committable
+        // `.env.example` template is not.
+        assert!(content.lines().any(|l| l.trim() == ".env"));
+        assert!(!content.lines().any(|l| l.trim() == ".env.example"));
+    }
+
+    #[test]
+    fn scaffolds_env_example_and_gitignores_env() {
+        let tmp = TempDir::new().unwrap();
+        generate("dotenv-check", tmp.path()).unwrap();
+        let p = tmp.path().join("dotenv-check");
+
+        // `.env.example` is scaffolded and documents the DB URL env key.
+        let example = fs::read_to_string(p.join(".env.example")).unwrap();
+        assert!(
+            example.contains("AUTUMN_DATABASE__URL"),
+            ".env.example must document AUTUMN_DATABASE__URL:\n{example}"
+        );
+        // crate_name token is substituted into the example URL.
+        assert!(example.contains("dotenv_check"), "got:\n{example}");
+
+        // `.gitignore` ignores `.env` but the committable `.env.example` remains
+        // in the project (and is not ignored).
+        let gitignore = fs::read_to_string(p.join(".gitignore")).unwrap();
+        assert!(gitignore.lines().any(|l| l.trim() == ".env"));
+        assert!(p.join(".env.example").is_file());
     }
 
     #[test]
@@ -945,6 +1190,43 @@ mod tests {
         assert!(content.contains("cargo:rerun-if-changed=static/css/input.css"));
         assert!(content.contains("cargo:rerun-if-changed=target/autumn/tailwindcss"));
         assert!(content.contains("cargo:rerun-if-env-changed=PATH"));
+    }
+
+    #[test]
+    fn generated_build_rs_bakes_build_and_git_provenance() {
+        // AC #4 of issue #1242: apps created by `autumn new` capture build + git
+        // provenance with zero developer action — the generated build.rs emits
+        // the AUTUMN_BUILD_* env vars that `#[autumn_web::main]` reads.
+        let tmp = TempDir::new().unwrap();
+        generate("provenance-check", tmp.path()).unwrap();
+
+        let content = fs::read_to_string(tmp.path().join("provenance-check/build.rs")).unwrap();
+        assert!(content.contains("emit_build_provenance"));
+        assert!(content.contains("cargo:rustc-env=AUTUMN_BUILD_TIMESTAMP="));
+        assert!(content.contains("cargo:rustc-env=AUTUMN_BUILD_GIT_SHA="));
+        assert!(content.contains("cargo:rustc-env=AUTUMN_BUILD_GIT_SHA_SHORT="));
+        assert!(content.contains("cargo:rustc-env=AUTUMN_BUILD_GIT_BRANCH="));
+        assert!(content.contains("cargo:rustc-env=AUTUMN_BUILD_GIT_DIRTY="));
+        // Best-effort git: never fails the build outside a checkout.
+        assert!(content.contains("rev-parse"));
+        // Re-run when HEAD *moves* (commit/amend/reset all rewrite logs/HEAD),
+        // not only when HEAD/index files change.
+        assert!(content.contains("logs/HEAD"));
+        // Gitdir is resolved by asking git itself, so nested/monorepo apps whose
+        // package root has no `.git` still register the parent checkout's rerun
+        // triggers. `--git-common-dir` covers linked worktrees where `logs/HEAD`
+        // lives in the common dir.
+        assert!(content.contains("--git-dir"));
+        assert!(content.contains("--git-common-dir"));
+        // Linked worktrees: `--amend`/`reset` rewrites the per-worktree reflog
+        // (`<git-dir>/logs/HEAD`) but not the shared common-dir reflog, so the
+        // generated build.rs must watch the per-worktree reflog too — otherwise
+        // Cargo never re-runs after an amend in a worktree and `/actuator/info`
+        // reports a stale SHA.
+        assert!(content.contains("git_dir.join(\"logs/HEAD\")"));
+        // Reproducible builds: honor and watch SOURCE_DATE_EPOCH.
+        assert!(content.contains("SOURCE_DATE_EPOCH"));
+        assert!(content.contains("cargo:rerun-if-env-changed=SOURCE_DATE_EPOCH"));
     }
 
     #[test]
@@ -961,6 +1243,78 @@ mod tests {
                 entry.display()
             );
         }
+    }
+
+    #[test]
+    fn daemon_readme_has_no_unsubstituted_placeholders() {
+        // The daemon / bundled-pg README bodies are built in Rust (not the
+        // template), so guard them against reintroducing `{{…}}` tokens.
+        for opts in [daemon_opts(), bundled_pg_opts()] {
+            let tmp = TempDir::new().unwrap();
+            generate_with("ph-daemon-app", tmp.path(), opts).unwrap();
+            let readme = fs::read_to_string(tmp.path().join("ph-daemon-app/README.md")).unwrap();
+            assert!(
+                !readme.contains("{{"),
+                "unsubstituted placeholder in daemon/bundled README (opts {opts:?}):\n{readme}"
+            );
+        }
+    }
+
+    #[test]
+    fn daemon_readme_drops_db_bootstrap() {
+        // A DB-free daemon must not tell users to run migrations or configure a
+        // database; it runs via `autumn serve`.
+        let tmp = TempDir::new().unwrap();
+        generate_with("daemon-readme", tmp.path(), daemon_opts()).unwrap();
+        let readme = fs::read_to_string(tmp.path().join("daemon-readme/README.md")).unwrap();
+        assert!(!readme.contains("autumn migrate"), "got:\n{readme}");
+        assert!(!readme.contains("libpq"), "got:\n{readme}");
+        assert!(readme.contains("autumn serve"), "got:\n{readme}");
+        // Project name still substituted.
+        assert!(readme.contains("daemon-readme"), "got:\n{readme}");
+    }
+
+    #[test]
+    fn bundled_pg_readme_documents_managed_db() {
+        // A bundled-pg daemon manages its own Postgres and auto-applies
+        // migrations; it runs via `autumn serve --bundled-pg`.
+        let tmp = TempDir::new().unwrap();
+        generate_with("bundled-readme", tmp.path(), bundled_pg_opts()).unwrap();
+        let readme = fs::read_to_string(tmp.path().join("bundled-readme/README.md")).unwrap();
+        assert!(!readme.contains("autumn migrate"), "got:\n{readme}");
+        assert!(
+            readme.contains("autumn serve --bundled-pg"),
+            "got:\n{readme}"
+        );
+    }
+
+    #[test]
+    fn default_readme_db_bootstrap_does_not_dead_end_on_release_init() {
+        // Finding 1: the default golden path must bootstrap a local Postgres
+        // with `docker run` (which always works), not lead with
+        // `release init --target docker-compose` (which file-errors on a fresh
+        // scaffold). The AC-required pointer is still present for deployment.
+        let tmp = TempDir::new().unwrap();
+        generate("dockerrun-app", tmp.path()).unwrap();
+        let readme = fs::read_to_string(tmp.path().join("dockerrun-app/README.md")).unwrap();
+        assert!(
+            readme.contains("docker run") && readme.contains("postgres:16"),
+            "default README must offer a `docker run … postgres:16` DB bootstrap, got:\n{readme}"
+        );
+        // Codex P2: the runnable `docker run -d …` helper must appear exactly once
+        // (in step 2), not be duplicated in the prerequisites — a second identical
+        // command dead-ends on a `{crate}-pg` container-name-in-use error.
+        assert_eq!(
+            readme.matches("docker run -d").count(),
+            1,
+            "default README must contain the runnable `docker run -d …` helper exactly once, \
+             got:\n{readme}"
+        );
+        assert!(
+            readme.contains("autumn release init --target docker-compose"),
+            "default README must still point at `release init --target docker-compose`, \
+             got:\n{readme}"
+        );
     }
 
     #[test]

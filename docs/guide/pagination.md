@@ -185,6 +185,97 @@ module docs for the full signing API.
 
 ---
 
+## Batched iteration (server-side, bounded memory)
+
+Cursor pagination shapes an HTTP *response*. When you instead need to touch
+*every* row of a table from inside a `#[autumn_web::task]`, a scheduled sweep,
+or a job — a backfill, a counter-cache recompute, a re-encryption pass — reach
+for **batched iteration** instead of `find_all()`. `find_all()` materializes
+the whole table into one `Vec` (a 1 M-row table is an instant OOM); the batched
+iterators walk the table in bounded-size chunks with flat memory.
+
+Every `#[repository]` generates two methods:
+
+- `find_in_batches(batch_size)` — yields successive `Vec<Model>` chunks of at
+  most `batch_size` rows.
+- `find_each(batch_size)` — yields one `Model` at a time, still fetching under
+  the hood in `batch_size`-sized batches.
+
+Iteration is keyset-based (primary-key ascending: `WHERE id > last ORDER BY id
+ASC LIMIT batch_size`), not `LIMIT`/`OFFSET`, so deep iteration never degrades
+and is stable under concurrent inserts. At most one `batch_size` chunk of
+models is resident at a time — memory is `O(batch_size)`, never `O(table)`.
+Unlike a `cursor_page` request, `batch_size` is **not** clamped to
+`MAX_PAGE_SIZE` (100); pass whatever fits your memory budget.
+
+Batched iteration inherits the repository's soft-delete filter (trashed rows
+are skipped, matching `find_all`) and its read routing (a replica-routed repo
+iterates off the replica, a `primary_reads` repo off the primary), so backfills
+read off a replica with no extra ceremony. An error mid-iteration surfaces as
+an `AutumnResult` error on the failing batch, and errors are **retryable**:
+the keyset cursor only advances on success, so calling `next_batch()` again
+retries the same batch with no duplicated or skipped rows — `Ok(None)` always
+means the table is exhausted, never a swallowed failure.
+
+Iteration ends at the first short batch (fewer than `batch_size` rows); rows
+inserted after that point are not seen by the current handle — start a new
+iteration to pick them up (matching Rails' `find_each`).
+
+### `find_each` in a task — per-row update
+
+```rust
+#[autumn_web::task(name = "backfill-slugs")]
+pub async fn backfill_slugs(repo: PgPostRepository) -> AutumnResult<()> {
+    let mut each = repo.find_each(500);
+    while let Some(post) = each.next().await? {
+        let slug = slugify(&post.title);
+        repo.update(
+            post.id,
+            &UpdatePost {
+                slug: Patch::Set(slug),
+                ..Default::default()
+            },
+        )
+        .await?;
+    }
+    Ok(())
+}
+```
+
+Register it with `.one_off_tasks(one_off_tasks![tasks::backfill_slugs])` and run
+`autumn task backfill-slugs` (see the [tasks guide](./tasks.md)).
+
+### `find_in_batches` + `upsert_many` — recompute loop
+
+Pair batched reads with the bulk writes from
+[`upsert_many`](./repositories.md) to recompute a whole table with flat memory
+on both the read and write side (`upsert_many` takes existing `&[Model]`
+values and writes them back; `save_many` takes `&[NewModel]` and would insert
+duplicates here):
+
+```rust
+let mut batches = repo.find_in_batches(1_000);
+while let Some(chunk) = batches.next_batch().await? {
+    let recomputed: Vec<Account> = chunk
+        .into_iter()
+        .map(|mut account| {
+            account.balance = recompute_balance(&account);
+            account
+        })
+        .collect();
+    repo.upsert_many(&recomputed).await?; // O(batch_size) memory, not O(table)
+}
+```
+
+Note: `upsert_many` is not generated on repositories with hooks configured —
+use per-row `update` there.
+
+A `batch_size` of `0` returns an error rather than spinning. On a **sharded**
+repository, cross-shard `across_tenants()` iteration is rejected (mirroring
+`cursor_page`); iterate each shard separately via `from_shard(...)` instead.
+
+---
+
 ## Offset vs cursor: decision guide
 
 | Question | Use offset | Use cursor |

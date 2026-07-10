@@ -39,6 +39,12 @@ fn compile_fail_tests() {
 
     #[cfg(feature = "db")]
     t.compile_fail("tests/compile-fail/repository_bulk_upsert_many_hooks.rs");
+
+    // `story!` blocks must be zero-arg pure functions: the block is coerced
+    // to a plain `fn() -> Markup`, so environment capture cannot compile
+    // (issue #1526).
+    #[cfg(feature = "maud")]
+    t.compile_fail("tests/compile-fail/story_captures_environment.rs");
 }
 
 #[test]

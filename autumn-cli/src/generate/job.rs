@@ -18,7 +18,7 @@ use super::naming::{pascal, snake};
 use super::schema_edit::{
     add_jobs_registration_to_app, add_mod_declaration, augment_registered_jobs, update_main_rs,
 };
-use super::{Flags, GenerateError, ensure_project_root, read_or_empty};
+use super::{GenerateError, ensure_project_root, read_or_empty};
 
 /// Cargo dependencies always required by generated job files.
 const JOB_DEPS_BASE: &[(&str, &str)] = &[("serde", "{ version = \"1\", features = [\"derive\"] }")];
@@ -115,7 +115,15 @@ pub fn plan_job(project_root: &Path, name: &str, fields: &[String]) -> Result<Pl
     let existing_mod = read_or_empty(&mod_path);
     let with_mod_decl = add_mod_declaration(&existing_mod, &snake_name);
     let with_aggregator = augment_registered_jobs(&with_mod_decl, &job_entry);
-    plan.modify(mod_path, with_aggregator);
+    plan.modify(mod_path.clone(), with_aggregator);
+    plan.push_revert(crate::generate::emit::Revert::ModDecl {
+        path: mod_path.clone(),
+        name: snake_name,
+    });
+    plan.push_revert(crate::generate::emit::Revert::JobEntry {
+        path: mod_path,
+        entry: job_entry,
+    });
 
     // ── src/main.rs: add mod jobs; and .jobs(…) ───────────────────────────
     let main_path = project_root.join("src").join("main.rs");
@@ -127,7 +135,15 @@ pub fn plan_job(project_root: &Path, name: &str, fields: &[String]) -> Result<Pl
     })?;
     let with_mod = update_main_rs(&main_existing, &["jobs"], &[]);
     let updated_main = add_jobs_registration_to_app(&with_mod);
-    plan.modify(main_path, updated_main);
+    plan.modify(main_path.clone(), updated_main);
+    // `mod jobs;` is a shared infrastructure declaration (see
+    // `emit::sync_main_rs_mod_declarations`) — only the `.jobs(...)` call is
+    // reverted here, and only once no other job file remains (a sibling job
+    // still listed in the shared `jobs![...]` needs this call to actually run).
+    plan.push_revert(crate::generate::emit::Revert::JobsRegistration {
+        path: main_path,
+        owner_dir: project_root.join("src").join("jobs"),
+    });
 
     // ── Cargo.toml: ensure serde (always) plus uuid/chrono/decimal if used ──
     if parsed_fields.iter().any(|f| f.kind.is_decimal()) {
@@ -145,7 +161,12 @@ pub fn plan_job(project_root: &Path, name: &str, fields: &[String]) -> Result<Pl
             &["db-diesel2-postgres", "serde"],
         );
     }
-    super::model::plan_cargo_deps(&mut plan, project_root, &job_deps(&parsed_fields));
+    super::model::plan_cargo_deps(
+        &mut plan,
+        project_root,
+        &job_deps(&parsed_fields),
+        &project_root.join("src/jobs"),
+    );
 
     Ok(plan)
 }
@@ -224,27 +245,10 @@ mod {snake_name}_job_tests {{
     )
 }
 
-/// CLI entry point.
-pub fn run(name: &str, fields: &[String], flags: Flags) {
-    let cwd = match std::env::current_dir() {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!("Error: cannot determine current directory: {e}");
-            std::process::exit(1);
-        }
-    };
-    match plan_job(&cwd, name, fields).and_then(|p| p.execute(flags)) {
-        Ok(()) => {}
-        Err(e) => {
-            eprintln!("Error: {e}");
-            std::process::exit(1);
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::generate::Flags;
     use std::fs;
     use tempfile::TempDir;
 
@@ -274,6 +278,74 @@ async fn main() {
         .await;
 }
 "#
+    }
+
+    #[test]
+    fn generate_then_destroy_job_round_trips_to_original_project_state() {
+        let tmp = project_with_main(default_main());
+        let cargo_path = tmp.path().join("Cargo.toml");
+        let main_path = tmp.path().join("src/main.rs");
+        let original_cargo = fs::read_to_string(&cargo_path).unwrap();
+        let original_main = fs::read_to_string(&main_path).unwrap();
+
+        let plan = plan_job(tmp.path(), "SendWelcomeEmail", &[]).unwrap();
+        plan.execute(Flags::default()).unwrap();
+        assert!(tmp.path().join("src/jobs/send_welcome_email.rs").exists());
+        assert!(main_path.exists());
+        assert!(fs::read_to_string(&main_path).unwrap().contains(".jobs("));
+
+        let destroy_plan = plan_job(tmp.path(), "SendWelcomeEmail", &[]).unwrap();
+        destroy_plan.revert(Flags::default()).unwrap();
+
+        assert!(!tmp.path().join("src/jobs/send_welcome_email.rs").exists());
+        assert!(!tmp.path().join("src/jobs/mod.rs").exists());
+        assert_eq!(fs::read_to_string(&main_path).unwrap(), original_main);
+        assert_eq!(fs::read_to_string(&cargo_path).unwrap(), original_cargo);
+    }
+
+    #[test]
+    fn destroying_one_of_two_jobs_keeps_the_jobs_registration_call() {
+        let tmp = project_with_main(default_main());
+        let main_path = tmp.path().join("src/main.rs");
+
+        plan_job(tmp.path(), "SendWelcomeEmail", &[])
+            .unwrap()
+            .execute(Flags::default())
+            .unwrap();
+        plan_job(tmp.path(), "SendGoodbyeEmail", &[])
+            .unwrap()
+            .execute(Flags::default())
+            .unwrap();
+        assert!(fs::read_to_string(&main_path).unwrap().contains(".jobs("));
+
+        // Destroying one job alone must NOT strip the `.jobs(...)` call —
+        // the surviving job's `jobs![...]` entry still needs it to actually run.
+        plan_job(tmp.path(), "SendWelcomeEmail", &[])
+            .unwrap()
+            .revert(Flags::default())
+            .unwrap();
+
+        assert!(!tmp.path().join("src/jobs/send_welcome_email.rs").exists());
+        assert!(tmp.path().join("src/jobs/send_goodbye_email.rs").exists());
+        let main_after = fs::read_to_string(&main_path).unwrap();
+        assert!(
+            main_after.contains(".jobs(jobs::registered_jobs())"),
+            "the .jobs(...) call must survive — the surviving job still needs it to run: {main_after}"
+        );
+        let mod_after = fs::read_to_string(tmp.path().join("src/jobs/mod.rs")).unwrap();
+        assert!(mod_after.contains("send_goodbye_email"));
+        assert!(!mod_after.contains("send_welcome_email"));
+
+        // Now destroy the last remaining job — the call must finally go too.
+        plan_job(tmp.path(), "SendGoodbyeEmail", &[])
+            .unwrap()
+            .revert(Flags::default())
+            .unwrap();
+        assert!(!tmp.path().join("src/jobs/send_goodbye_email.rs").exists());
+        assert!(
+            !fs::read_to_string(&main_path).unwrap().contains(".jobs("),
+            "the .jobs(...) call must be removed once no job needs it anymore"
+        );
     }
 
     // ── RED: plan assertions ─────────────────────────────────────────────

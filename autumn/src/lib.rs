@@ -67,11 +67,14 @@
 extern crate self as autumn_web;
 
 pub mod actuator;
+pub mod aggregate;
 pub mod app;
 pub mod assets;
 pub mod audit;
 pub mod auth;
 pub mod authorization;
+pub mod batches;
+pub mod build_info;
 pub mod cache;
 #[cfg(feature = "ws")]
 pub mod channels;
@@ -86,11 +89,14 @@ pub mod config;
 pub mod credentials;
 #[cfg(feature = "db")]
 pub mod db;
+pub mod dotenv;
+pub mod download;
 pub mod encryption;
 pub mod error;
 #[cfg(feature = "maud")]
 pub mod error_pages;
 pub mod extract;
+pub mod feed;
 /// View-layer value formatting helpers (currency, delimited numbers,
 /// pluralize, truncate, relative/absolute dates) for Maud templates.
 ///
@@ -102,6 +108,7 @@ pub mod hooks;
 #[cfg(feature = "i18n")]
 pub mod i18n;
 pub mod idempotency;
+pub mod range;
 pub mod seo;
 /// Translation lookup macro with compile-time key validation.
 ///
@@ -120,6 +127,7 @@ pub mod maintenance;
 pub mod managed_pg;
 #[cfg(feature = "db")]
 pub mod migrate;
+pub(crate) mod pg_conn_str;
 pub mod plugin;
 pub mod plugin_conformance;
 pub mod probe;
@@ -214,6 +222,14 @@ pub use repository::RepositoryError;
 #[cfg(feature = "db")]
 pub mod read_your_writes;
 
+/// Offline-first local SQLite store and background sync engine for
+/// occasionally-connected apps (e.g. Tauri mobile).
+///
+/// See the [`sync`] module documentation for the architecture (change
+/// tracking, tombstoning, conflict resolution) and wiring examples.
+#[cfg(feature = "offline-sync")]
+pub mod sync;
+
 /// Automatic record version history for `#[repository]` writes.
 ///
 /// See [`version_history`] module documentation for the full API.
@@ -229,6 +245,48 @@ pub use version_history::{
 /// defined routes, middleware, and state, and building the final `axum::Router`
 /// that will handle incoming HTTP requests.
 pub(crate) mod router;
+
+/// Fuzzing-only re-export surface.
+///
+/// Compiled only when the crate is built with `--cfg fuzzing` (as cargo-fuzz
+/// does for the workspace-root `fuzz/` crate). It re-exports otherwise-private
+/// or `pub(crate)` request-path parsing seams so the fuzz targets can drive
+/// them over raw untrusted bytes. Everything here is guarded by `#[cfg(fuzzing)]`
+/// so normal builds — and `cargo package` output — are byte-identical.
+///
+/// Not part of the public API; no stability guarantees.
+#[cfg(fuzzing)]
+#[doc(hidden)]
+pub mod __fuzz {
+    // Routing / path-parameter extraction (functions are `pub` inside the
+    // `pub(crate)` `router` module).
+    pub use crate::router::{
+        extract_host_without_port, join_nested_path, path_matches_route_prefix,
+    };
+    // `extract_path_params` only exists under the `openapi` feature (it backs
+    // spec-URL generation); the `fuzz/` crate enables `openapi` so this routing
+    // seam is present when fuzzing.
+    #[cfg(feature = "openapi")]
+    pub use crate::router::extract_path_params;
+
+    // Trusted-proxy / `X-Forwarded-*` header parsing.
+    pub use crate::security::trusted_proxies::{
+        __fuzz_parse_forwarded_ip as parse_forwarded_ip,
+        __fuzz_parse_trusted_proxy as parse_trusted_proxy,
+        __fuzz_resolve_forwarded as resolve_forwarded,
+    };
+
+    // Cookie / signed-session decode.
+    pub use crate::session::__fuzz_decode_cookie as decode_cookie;
+
+    // Body handling: form-urlencoded (always) + inbound-mail MIME (feature-gated).
+    pub use crate::form::__fuzz_decode_urlencoded as decode_urlencoded_form;
+    #[cfg(feature = "inbound-mail")]
+    pub use crate::inbound_mail::{
+        __fuzz_parse_address_list as parse_address_list, __fuzz_parse_generic as parse_generic,
+        __fuzz_parse_ses as parse_ses,
+    };
+}
 
 #[cfg(feature = "db")]
 pub use hooks::{
@@ -254,6 +312,7 @@ pub mod htmx;
 /// `ws`, `maud`, and `htmx` features.
 #[cfg(all(feature = "htmx", feature = "maud"))]
 pub mod live;
+pub mod lock;
 pub mod log;
 pub(crate) mod logging;
 /// Project typed JSON endpoints as Model Context Protocol (MCP) tools so AI
@@ -328,6 +387,12 @@ pub mod links;
 pub mod runtime_config;
 #[cfg(feature = "seed")]
 pub mod seed;
+/// Widget story gallery (issue #1526).
+///
+/// Browsable `/_stories` UI plus a CI anti-rot registry of zero-arg widget
+/// render examples.
+#[cfg(feature = "maud")]
+pub mod stories;
 pub mod task;
 pub mod telemetry;
 pub mod ui;
@@ -349,6 +414,7 @@ pub use form::ChangesetForm;
 /// Trait implemented for all `validator::Validate` types to produce a [`Changeset`].
 pub use form::IntoChangeset;
 pub mod data;
+pub mod normalize;
 pub mod validation;
 pub mod webhook;
 #[cfg(feature = "http-client")]
@@ -361,6 +427,8 @@ pub mod ws;
 /// This module is semver-exempt. Do not use it directly.
 #[doc(hidden)]
 pub mod __private {
+    #[cfg(feature = "db")]
+    pub use crate::db::scoped_transaction;
     #[cfg(all(feature = "db", feature = "ws"))]
     pub use crate::repository_commit_hooks::CURRENT_CHANNELS;
     #[cfg(feature = "db")]
@@ -425,6 +493,11 @@ pub use app::{ApiVersion, RegisteredApiVersions};
 /// connection. See [`db::Db`] for full documentation and examples.
 #[cfg(feature = "db")]
 pub use db::Db;
+
+/// Transaction options (isolation level + retry policy) and the savepoint
+/// helper for [`Db::tx_with`]. See [`db::TxOptions`].
+#[cfg(feature = "db")]
+pub use db::{IsolationLevel, TxOptions, savepoint};
 
 /// Framework error type and result alias.
 ///
@@ -591,6 +664,12 @@ pub use autumn_macros::mailer_preview;
 /// }
 /// ```
 pub use autumn_macros::main;
+/// Author a widget story for the `/_stories` gallery:
+/// `story!{ "Group", "Name", { ... } }`.
+///
+/// Also available as [`stories::story`], the macro's module home.
+#[cfg(feature = "maud")]
+pub use autumn_macros::story;
 
 /// Derive Diesel and Serde traits for a database model struct.
 ///
@@ -941,6 +1020,35 @@ pub use autumn_macros::secured;
 /// }
 /// ```
 pub use autumn_macros::step_up;
+
+/// Apply a per-route rate limit that composes with the global limiter.
+///
+/// # Forms
+///
+/// - `#[throttle(limit = 5, per = "1m")]` — inline limit; keying strategy
+///   matches the global limiter (`[security.rate_limit]`).
+/// - `#[throttle(limit = 5, per = "1m", key = "ip" | "principal" | "token")]`
+///   — inline limit with an explicit key strategy.
+/// - `#[throttle("login")]` — reference a named limiter defined in
+///   `[security.rate_limit.named.login]`.
+///
+/// Requests denied by the per-route bucket receive `429 Too Many Requests`
+/// with a `Retry-After` header and the standard `x-ratelimit-*` headers.
+/// [`RateLimitExempt`](crate::security::RateLimitExempt) still bypasses the
+/// per-route throttle.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use autumn_web::prelude::*;
+///
+/// #[post("/login")]
+/// #[throttle(limit = 5, per = "1m", key = "ip")]
+/// async fn login() -> AutumnResult<&'static str> {
+///     Ok("welcome back")
+/// }
+/// ```
+pub use autumn_macros::throttle;
 
 /// Gate a route handler on a named feature flag. If the flag is disabled for
 /// the current actor the handler responds with `404 Not Found` (default) or

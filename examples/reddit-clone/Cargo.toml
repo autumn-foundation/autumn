@@ -13,7 +13,7 @@ bytes = "1"
 tokio-stream = { workspace = true }
 chrono = { version = "0.4", features = ["serde"] }
 diesel = { version = "2", features = ["postgres", "chrono", "serde_json"] }
-diesel-async = { version = "0.8", features = ["postgres"] }
+diesel-async = { version = "0.9", features = ["postgres"] }
 pq-sys = { version = "0.7", features = ["bundled_without_openssl"] }
 redis = { version = "1.2", features = ["aio", "tokio-comp"] }
 diesel_migrations = "2"
@@ -34,7 +34,10 @@ uuid = { version = "1", features = ["v4"] }
 [dev-dependencies]
 autumn-web = { path = "../../autumn", features = ["test-support"] }
 autumn-storage-s3 = { path = "../../autumn-storage-s3" }
-aws-sdk-s3 = "1"
+# default-features = false to avoid re-enabling aws-sdk-s3's legacy hyper 0.14 /
+# rustls 0.21 connector stack workspace-wide (features are additive); see the
+# aws-sdk-s3 entry in autumn-storage-s3/Cargo.toml for details.
+aws-sdk-s3 = { version = "1", default-features = false, features = ["sigv4a", "default-https-client", "rt-tokio"] }
 temp-env = { version = "0.3.6", features = ["async_closure"] }
 tempfile = "3"
 testcontainers = { workspace = true }

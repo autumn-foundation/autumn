@@ -9,7 +9,7 @@ autumn-web = { path = "../../autumn", features = ["i18n", "oauth2"] }
 autumn-admin-plugin = { path = "../../autumn-admin-plugin" }
 chrono = { version = "0.4", features = ["serde"] }
 diesel = { version = "2", features = ["postgres", "chrono"] }
-diesel-async = { version = "0.8", features = ["postgres"] }
+diesel-async = { version = "0.9", features = ["postgres"] }
 pq-sys = { version = "0.7", features = ["bundled_without_openssl"] }
 diesel_migrations = "2"
 maud = { version = "0.27", features = ["axum"] }

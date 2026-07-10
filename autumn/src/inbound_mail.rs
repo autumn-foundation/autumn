@@ -399,6 +399,27 @@ pub struct InboundEmail {
     /// bounce.  Never derived from forwarded message headers so that a sender
     /// cannot spoof bounce routing by injecting that header into their email.
     pub is_bounce: bool,
+    /// The provider-reported address that hard-bounced (e.g. Mailgun's
+    /// `X-Mailgun-Bounced-Address` form field). Present only on bounce webhooks;
+    /// this is the *failed recipient*, distinct from `to` (which carries the
+    /// app's own inbound address on a bounce). Feeds the mail suppression list
+    /// (issue #1247) via
+    /// [`suppression::record_inbound`](crate::mail::suppression::record_inbound).
+    pub bounced_address: Option<String>,
+    /// The outbound recipient who filed a spam **complaint** (a feedback-loop /
+    /// FBL event), as reported by the provider. Mirrors [`bounced_address`]:
+    /// present only when the parsed payload carries a genuine complainant
+    /// address, and — like `bounced_address` — never derived from `to` (which
+    /// on an inbound webhook is the app's own inbound address, not the
+    /// complainer). `None` for the current [`InboundMailProvider`] parsers,
+    /// which surface an inbound *spam verdict* (`X-Mailgun-Sflag`) rather than
+    /// an outbound FBL complaint; feeds
+    /// [`suppression::record_inbound`](crate::mail::suppression::record_inbound)
+    /// with [`SuppressionReason::Complaint`](crate::mail::suppression::SuppressionReason::Complaint)
+    /// when a future/provider-specific parser populates it.
+    ///
+    /// [`bounced_address`]: Self::bounced_address
+    pub complained_address: Option<String>,
 }
 
 impl InboundEmail {
@@ -922,10 +943,12 @@ pub(crate) fn parse_mailgun(
 
     // Bounce detection: only trust the provider's top-level webhook field, never
     // forwarded message headers (which a sender could forge).
-    let is_bounce = form
+    let bounced_address = form
         .get("X-Mailgun-Bounced-Address")
         .or_else(|| form.get("x-mailgun-bounced-address"))
-        .is_some();
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty());
+    let is_bounce = bounced_address.is_some();
     let final_headers = headers;
 
     let spam_score = form
@@ -985,6 +1008,12 @@ pub(crate) fn parse_mailgun(
             .unwrap_or_default(),
         plus_token: None,
         is_bounce,
+        bounced_address,
+        // Mailgun's inbound/spam-verdict payload carries no genuine outbound
+        // complainant address (`X-Mailgun-Sflag` is an inbound spam score, not
+        // an FBL complaint), so this stays `None`. A provider-specific
+        // complaint parser would populate it.
+        complained_address: None,
     })
 }
 
@@ -1119,6 +1148,31 @@ pub(crate) fn parse_generic(
         }
     }
     Ok(parse_rfc5322(raw_body))
+}
+
+// ── Fuzzing seams ───────────────────────────────────────────────────────────
+// `#[cfg(fuzzing)]` wrappers exposing the inbound-mail parsing surface to the
+// `fuzz/` crate: SNS/SES JSON parsing, the RFC 5322 / MIME body parser (via the
+// unsigned `parse_generic` path), and address-list parsing. Compiled out of all
+// normal builds. See `fuzz/fuzz_targets/body.rs`.
+
+/// Fuzzing seam: parse an SES-via-SNS notification body.
+#[cfg(fuzzing)]
+pub fn __fuzz_parse_ses(body: &[u8]) {
+    let _ = parse_ses(&Bytes::copy_from_slice(body));
+}
+
+/// Fuzzing seam: parse a generic RFC 5322 / MIME raw body (no signature check),
+/// exercising `parse_rfc5322` including its multi-part MIME handling.
+#[cfg(fuzzing)]
+pub fn __fuzz_parse_generic(body: &[u8]) {
+    let _ = parse_generic(Bytes::copy_from_slice(body), None, &HeaderMap::new());
+}
+
+/// Fuzzing seam: parse an RFC 5322 address list.
+#[cfg(fuzzing)]
+pub fn __fuzz_parse_address_list(value: &str) {
+    let _ = parse_address_list(value);
 }
 
 /// Minimal RFC 5322 parser.
@@ -1265,6 +1319,8 @@ fn parse_rfc5322(raw: Bytes) -> InboundEmail {
         raw,
         plus_token: None,
         is_bounce: false,
+        bounced_address: None,
+        complained_address: None,
     }
 }
 
@@ -2753,6 +2809,8 @@ mod tests {
             raw: Bytes::new(),
             plus_token: None,
             is_bounce: false,
+            bounced_address: None,
+            complained_address: None,
         };
         assert_eq!(email.primary_recipient(), Some("first@x.com"));
     }
@@ -2920,6 +2978,8 @@ mod tests {
             raw: Bytes::new(),
             plus_token: None,
             is_bounce: false,
+            bounced_address: None,
+            complained_address: None,
         };
         assert!(email.primary_recipient().is_none());
     }

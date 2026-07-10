@@ -50,6 +50,41 @@ fn read_workspace_manifest(root: &Path) -> toml::Value {
     toml::from_str(&root_manifest).expect("workspace Cargo.toml should parse as TOML")
 }
 
+fn parse_semver_triple(version: &str) -> Option<(u64, u64, u64)> {
+    let mut parts = version.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let patch = parts.next()?.parse().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((major, minor, patch))
+}
+
+/// The version the first-run docs pin is the latest *published* autumn-cli
+/// release, which can lag the (unreleased) workspace version between releases
+/// (PR #1622). The README quickstart is the source of truth for that pin —
+/// the same convention `scripts/check-quickstart.sh` uses — so parse it from
+/// there and hold every other first-run doc to it.
+fn published_cli_version(readme: &str) -> String {
+    readme
+        .lines()
+        .find_map(|line| {
+            line.trim()
+                .strip_prefix("cargo install autumn-cli --version ")
+        })
+        .and_then(|rest| rest.split_whitespace().next())
+        .map_or_else(
+            || {
+                panic!(
+                    "README.md must pin the published CLI install command \
+                     `cargo install autumn-cli --version <x.y.z>`"
+                )
+            },
+            str::to_owned,
+        )
+}
+
 fn read_docs_once(root: &Path) -> Vec<(&'static str, String)> {
     FIRST_RUN_DOCS
         .iter()
@@ -144,13 +179,39 @@ fn workspace_test_profile_keeps_ci_artifacts_bounded() {
 fn first_run_docs_match_current_release_line() {
     let root = workspace_root();
     let root_toml = read_workspace_manifest(&root);
-    let current_version = workspace_package_value(&root_toml, "version");
-    let current_series = current_version
-        .rsplit_once('.')
-        .map_or(current_version.as_str(), |(series, _)| series);
+    let workspace_version = workspace_package_value(&root_toml, "version");
     let rust_version = workspace_package_value(&root_toml, "rust-version");
-    let current_health_json = format!(r#"{{ "status": "ok", "version": "{current_version}" }}"#);
     let docs = read_docs_once(&root);
+
+    // The first-run docs pin the latest *published* release, parsed from the
+    // README quickstart. Validate the pin so this test still catches a
+    // malformed or future-dated pin: it must be a plain x.y.z semver and must
+    // not be newer than the (possibly unreleased) workspace version.
+    let readme = docs
+        .iter()
+        .find(|(doc, _)| *doc == "README.md")
+        .map(|(_, content)| content)
+        .expect("README.md should be included in FIRST_RUN_DOCS");
+    let published_version = published_cli_version(readme);
+    let published_triple = parse_semver_triple(&published_version).unwrap_or_else(|| {
+        panic!(
+            "README.md pins a malformed autumn-cli version `{published_version}`; expected x.y.z"
+        )
+    });
+    let workspace_triple = parse_semver_triple(&workspace_version).unwrap_or_else(|| {
+        panic!("workspace.package.version `{workspace_version}` should be x.y.z")
+    });
+    assert!(
+        published_triple <= workspace_triple,
+        "README.md pins autumn-cli {published_version}, which is newer than the workspace \
+         version {workspace_version}; the quickstart must pin the latest published release",
+    );
+
+    let published_series = published_version
+        .rsplit_once('.')
+        .map_or(published_version.as_str(), |(series, _)| series);
+    let published_health_json =
+        format!(r#"{{ "status": "ok", "version": "{published_version}" }}"#);
 
     for (doc, content) in &docs {
         for stale in [
@@ -190,26 +251,26 @@ fn first_run_docs_match_current_release_line() {
         if content.contains("cargo install autumn-cli") {
             assert!(
                 content.contains(&format!(
-                    "cargo install autumn-cli --version {current_version}"
+                    "cargo install autumn-cli --version {published_version}"
                 )),
-                "{doc} must show the published CLI install command for autumn-cli {current_version}"
+                "{doc} must show the published CLI install command for autumn-cli {published_version}"
             );
         }
 
         if content.contains("autumn-web =") {
             assert!(
-                content.contains(&format!("autumn-web = \"{current_series}\""))
-                    || content.contains(&format!("autumn-web = \"{current_version}\""))
-                    || content.contains(&format!("version = \"{current_series}\""))
-                    || content.contains(&format!("version = \"{current_version}\"")),
-                "{doc} must show the current autumn-web release line ({current_series} or {current_version})",
+                content.contains(&format!("autumn-web = \"{published_series}\""))
+                    || content.contains(&format!("autumn-web = \"{published_version}\""))
+                    || content.contains(&format!("version = \"{published_series}\""))
+                    || content.contains(&format!("version = \"{published_version}\"")),
+                "{doc} must show the published autumn-web release line ({published_series} or {published_version})",
             );
         }
 
         if content.contains(r#""status": "ok""#) {
             assert!(
-                content.contains(&current_health_json),
-                "{doc} must show the current JSON health version {current_version}"
+                content.contains(&published_health_json),
+                "{doc} must show the published JSON health version {published_version}"
             );
         }
     }
@@ -224,9 +285,23 @@ fn first_run_docs_match_current_release_line() {
         "docs-smoke must expect the root page generated by `autumn new smoke-app`"
     );
     assert!(
-        docs_smoke.contains(&current_health_json),
-        "docs-smoke must show the exact health JSON with version {current_version}"
+        docs_smoke.contains(&published_health_json),
+        "docs-smoke must show the exact health JSON with version {published_version}"
     );
+}
+
+#[test]
+fn published_cli_version_parses_readme_quickstart_pin() {
+    let readme = "## Quickstart\n\n```bash\n# Install the published CLI\ncargo install autumn-cli --version 0.5.0\n```\n";
+    assert_eq!(published_cli_version(readme), "0.5.0");
+}
+
+#[test]
+fn semver_triple_parser_rejects_malformed_pins() {
+    assert_eq!(parse_semver_triple("0.5.0"), Some((0, 5, 0)));
+    assert_eq!(parse_semver_triple("0.5"), None);
+    assert_eq!(parse_semver_triple("0.5.0.1"), None);
+    assert_eq!(parse_semver_triple("0.5.x"), None);
 }
 
 #[test]
@@ -463,8 +538,8 @@ fn semver_script_checks_optional_features_with_pinned_rustdoc_toolchain() {
         .unwrap_or_else(|err| panic!("failed to read {}: {err}", script_path.display()));
 
     assert!(
-        script.contains(r#"semver_toolchain="${AUTUMN_SEMVER_RUST_VERSION:-1.92.0}""#),
-        "{} must pin the semver rustdoc toolchain to Rust 1.92.0 by default",
+        script.contains(r#"semver_toolchain="${AUTUMN_SEMVER_RUST_VERSION:-1.94.1}""#),
+        "{} must pin the semver rustdoc toolchain to Rust 1.94.1 by default",
         script_path.display(),
     );
     assert!(
@@ -492,8 +567,8 @@ fn semver_script_checks_optional_features_with_pinned_rustdoc_toolchain() {
         .and_then(|job| job.split("\n  # ---").next())
         .unwrap_or_else(|| panic!("{} must define a semver job", workflow_path.display()));
     assert!(
-        semver_job.contains("dtolnay/rust-toolchain@1.92.0"),
-        "{} semver job must install the pinned Rust 1.92.0 toolchain",
+        semver_job.contains("dtolnay/rust-toolchain@1.94.1"),
+        "{} semver job must install the pinned Rust 1.94.1 toolchain",
         workflow_path.display(),
     );
     assert!(

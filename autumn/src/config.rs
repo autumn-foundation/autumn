@@ -13,6 +13,17 @@
 //! An Autumn application runs with zero configuration -- every field
 //! has a sensible default value. Override only what you need.
 //!
+//! # Local-dev `.env` files
+//!
+//! A project-root `.env` file is a **local-dev feeder for the highest layer**
+//! (the `AUTUMN_*` env-var layer) -- it does *not* add a new precedence tier.
+//! Values parsed from `.env` populate env-layer keys that are still unset; a
+//! real environment variable of the same name always wins. Auto-loaded in the
+//! `dev` and `test` profiles and ignored in `prod` unless `AUTUMN_DOTENV=1`.
+//! Files load in order `.env` -> `.env.local` -> `.env.{profile}` ->
+//! `.env.{profile}.local`, and earlier files (and real env vars) win. See the
+//! [`dotenv`](crate::dotenv) module.
+//!
 //! # Profiles
 //!
 //! Profiles are resolved in precedence order:
@@ -42,6 +53,7 @@
 //! | `AUTUMN_SERVER__SHUTDOWN_TIMEOUT_SECS` | `server.shutdown_timeout_secs` | `u64` |
 //! | `AUTUMN_SERVER__PRESTOP_GRACE_SECS` | `server.prestop_grace_secs` | `u64` |
 //! | `AUTUMN_SERVER__TIMEOUTS__REQUEST_TIMEOUT_MS` | `server.timeouts.request_timeout_ms` | `u64` |
+//! | `AUTUMN_SERVER__MAX_CONCURRENT_REQUESTS` | `server.max_concurrent_requests` | `usize` |
 //! | `AUTUMN_DATABASE__URL` | `database.url` | `String` |
 //! | `AUTUMN_DATABASE__PRIMARY_URL` | `database.primary_url` | `String` |
 //! | `AUTUMN_DATABASE__REPLICA_URL` | `database.replica_url` | `String` |
@@ -94,6 +106,7 @@
 //! | `AUTUMN_SESSION__REDIS__KEY_PREFIX` | `session.redis.key_prefix` | `String` |
 //! | `AUTUMN_CHANNELS__BACKEND` | `channels.backend` | `in_process` / `redis` |
 //! | `AUTUMN_CHANNELS__CAPACITY` | `channels.capacity` | `usize` |
+//! | `AUTUMN_CHANNELS__REPLAY_BUFFER` | `channels.replay_buffer` | `usize` |
 //! | `AUTUMN_CHANNELS__REDIS__URL` | `channels.redis.url` | `String` |
 //! | `AUTUMN_CHANNELS__REDIS__KEY_PREFIX` | `channels.redis.key_prefix` | `String` |
 //! | `AUTUMN_JOBS__BACKEND` | `jobs.backend` | `local` / `postgres` / `redis` |
@@ -130,7 +143,9 @@
 //! | `AUTUMN_DEV__INSPECTOR_PATH` | `dev.inspector_path` | `String` |
 //! | `AUTUMN_DEV__INSPECTOR_CAPACITY` | `dev.inspector_capacity` | `usize` |
 //! | `AUTUMN_DEV__INSPECTOR_N_PLUS_ONE_THRESHOLD` | `dev.inspector_n_plus_one_threshold` | `usize` |
+//! | `AUTUMN_OBSERVABILITY__SERVER_TIMING` | `observability.server_timing` | `bool` |
 //! | `AUTUMN_COMPRESSION__ENABLED` | `compression.enabled` | `bool` |
+//! | `AUTUMN_STORIES__ENABLED` | `stories.enabled` | `bool` |
 //! | `AUTUMN_AUTH__LOCKOUT__ENABLED` | `auth.lockout.enabled` | `bool` |
 //! | `AUTUMN_AUTH__LOCKOUT__THRESHOLD` | `auth.lockout.threshold` | `i32` |
 //! | `AUTUMN_AUTH__LOCKOUT__WINDOW_SECS` | `auth.lockout.window_secs` | `u64` |
@@ -282,6 +297,12 @@ pub(crate) fn resolve_profile(env: &dyn Env) -> String {
 }
 
 /// Resolve the raw profile selector value (before normalization).
+///
+/// The env-var keys consulted here (`AUTUMN_ENV`, `AUTUMN_PROFILE`,
+/// `AUTUMN_IS_DEBUG`) are the profile *selectors*; they are deliberately
+/// excluded from the `.env` overlay (see [`crate::dotenv`]'s
+/// `PROFILE_SELECTOR_KEYS`) so a `.env` file cannot switch the active profile.
+/// Keep the two lists in sync.
 fn resolve_profile_input(env: &dyn Env) -> String {
     // 1. Preferred env var
     if let Ok(profile) = env.var("AUTUMN_ENV") {
@@ -809,6 +830,10 @@ pub enum ConfigError {
     /// The credentials file exists but could not be decrypted.
     #[error("credentials error: {0}")]
     Credentials(String),
+
+    /// A project-root `.env` file exists but could not be read or parsed.
+    #[error("dotenv error: {0}")]
+    Dotenv(String),
 }
 
 /// Top-level framework configuration.
@@ -967,6 +992,15 @@ pub struct AutumnConfig {
     #[serde(default)]
     pub dev: DevConfig,
 
+    /// Widget story gallery settings (`[stories]` section in `autumn.toml`).
+    ///
+    /// Off by default; opt-in per profile (e.g. `[profile.dev.stories]
+    /// enabled = true` for a dev-only gallery, or a prod profile for a
+    /// public showcase). See `docs/guide/stories.md`.
+    #[cfg(feature = "maud")]
+    #[serde(default)]
+    pub stories: crate::stories::StoriesConfig,
+
     /// Error-reporting settings (`[reporting]` section in `autumn.toml`).
     ///
     /// Controls delivery of panic + 5xx [`ErrorEvent`](crate::reporting::ErrorEvent)s
@@ -1025,6 +1059,71 @@ pub struct AutumnConfig {
     /// ```
     #[serde(default)]
     pub seo: SeoConfig,
+
+    /// Observability settings (`[observability]` section in `autumn.toml`).
+    ///
+    /// Controls opt-in framework-emitted telemetry that supplements the
+    /// access log — currently the `Server-Timing` response header. See
+    /// [`ObservabilityConfig`] and `docs/guide/observability/server-timing.md`.
+    #[serde(default)]
+    pub observability: ObservabilityConfig,
+}
+
+/// Observability configuration (`[observability]` section in `autumn.toml`).
+///
+/// Controls opt-in telemetry that supplements the default access log.
+///
+/// # Server-Timing header
+///
+/// When `server_timing = true`, Autumn emits a W3C-conformant
+/// [`Server-Timing`](https://www.w3.org/TR/server-timing/) header on every
+/// non-streaming response with at minimum a `total` metric (whole-request
+/// wall time, matching the access-log `duration_ms`) and a `db` metric
+/// summarising cumulative query time plus a query count (`db;dur=…;desc="N queries"`)
+/// when at least one query ran during the request.
+///
+/// The default is **off in production** and **on in the `dev` profile**;
+/// leave the field unset for that behavior, or pin it to `true` / `false`
+/// explicitly. Requires opt-in in prod because timings can leak
+/// infrastructure detail to anonymous clients.
+///
+/// # Example
+///
+/// ```toml
+/// # Force on in a staging profile where dev-team browsers inspect timings.
+/// [observability]
+/// server_timing = true
+/// ```
+///
+/// ```toml
+/// # Force off during a dev-profile perf comparison against production.
+/// [observability]
+/// server_timing = false
+/// ```
+#[derive(Debug, Clone, Default, Deserialize, serde::Serialize)]
+pub struct ObservabilityConfig {
+    /// Emit the `Server-Timing` response header on served requests.
+    ///
+    /// `None` (unset) means the effective value follows the profile default:
+    /// on in `dev`/`development`, off everywhere else. `Some(true)` or
+    /// `Some(false)` pin the choice explicitly.
+    #[serde(default)]
+    pub server_timing: Option<bool>,
+}
+
+/// Resolve the effective value of `[observability] server_timing` for a
+/// given [`AutumnConfig`].
+///
+/// The rules are:
+/// - Explicit `Some(true)` / `Some(false)` in config or env → returned as-is.
+/// - `None` (unset) → `true` iff the active profile is `"dev"` or
+///   `"development"`, otherwise `false`. This keeps production off by
+///   default so timings never leak to anonymous clients without opt-in.
+pub(crate) fn server_timing_enabled(cfg: &AutumnConfig) -> bool {
+    if let Some(explicit) = cfg.observability.server_timing {
+        return explicit;
+    }
+    matches!(cfg.profile.as_deref(), Some("dev" | "development"))
 }
 
 /// SEO configuration (`[seo]` section in `autumn.toml`).
@@ -1308,6 +1407,13 @@ pub struct ChannelConfig {
     /// Per-topic broadcast ring buffer capacity.
     #[serde(default = "default_channel_capacity")]
     pub capacity: usize,
+    /// Per-topic replay ring buffer capacity (`N`).
+    ///
+    /// Number of most-recent events retained per topic for `Last-Event-ID`
+    /// replay via [`crate::sse::stream_resumable`]. Memory is `O(N)` per topic
+    /// regardless of throughput.
+    #[serde(default = "default_channel_replay_buffer")]
+    pub replay_buffer: usize,
     /// Redis backend options.
     #[serde(default)]
     pub redis: ChannelRedisConfig,
@@ -1318,6 +1424,7 @@ impl Default for ChannelConfig {
         Self {
             backend: ChannelBackend::default(),
             capacity: default_channel_capacity(),
+            replay_buffer: default_channel_replay_buffer(),
             redis: ChannelRedisConfig::default(),
         }
     }
@@ -1345,6 +1452,10 @@ impl Default for ChannelRedisConfig {
 
 const fn default_channel_capacity() -> usize {
     32
+}
+
+const fn default_channel_replay_buffer() -> usize {
+    256
 }
 
 fn default_channels_redis_prefix() -> String {
@@ -2184,7 +2295,23 @@ impl AutumnConfig {
     /// Panics if the internally-built TOML table fails to re-serialize
     /// (should never happen with well-formed profile defaults).
     pub fn load() -> Result<Self, ConfigError> {
-        Self::load_with_env(&OsEnv)
+        // Feed a project-root `.env` into the `AUTUMN_*` env layer before
+        // resolving config from the real environment. Rather than mutating the
+        // process environment, `.env` values are layered *under* the real
+        // environment via an overlay `Env`, so a real env var always wins. A
+        // malformed `.env` fails loudly here rather than silently skipping
+        // developer-provided values.
+        let base = OsEnv;
+        let profile = resolve_profile(&base);
+        // Resolve `.env` from the same base directory config uses for
+        // `autumn.toml` (AUTUMN_MANIFEST_DIR when set, else the process CWD),
+        // so a binary launched from outside its crate root reads the `.env`
+        // next to its config instead of the process working directory.
+        let dir = crate::dotenv::dotenv_base_dir(&base);
+        let vars = crate::dotenv::resolve_dotenv_vars(&dir, &profile, &base)
+            .map_err(|e| ConfigError::Dotenv(e.to_string()))?;
+        let env = crate::dotenv::DotenvEnv::new(&base, vars);
+        Self::load_with_env(&env)
     }
 
     /// Load configuration with profile-aware layering, using a provided
@@ -2541,6 +2668,7 @@ impl AutumnConfig {
         self.apply_bot_protection_env_overrides_with_env(env);
         self.apply_idempotency_env_overrides_with_env(env);
         self.apply_dev_env_overrides_with_env(env);
+        self.apply_observability_env_overrides_with_env(env);
         self.apply_compression_env_overrides_with_env(env);
         self.apply_actuator_env_overrides_with_env(env);
         #[cfg(feature = "reporting")]
@@ -2549,6 +2677,8 @@ impl AutumnConfig {
         self.apply_storage_env_overrides_with_env(env);
         #[cfg(feature = "mail")]
         self.apply_mail_env_overrides_with_env(env);
+        #[cfg(feature = "maud")]
+        self.apply_stories_env_overrides_with_env(env);
         self.apply_resilience_env_overrides_with_env(env);
         self.apply_time_zone_env_overrides_with_env(env);
     }
@@ -2599,6 +2729,19 @@ impl AutumnConfig {
             "AUTUMN_COMPRESSION__ENABLED",
             &mut self.compression.enabled,
         );
+    }
+
+    fn apply_observability_env_overrides_with_env(&mut self, env: &dyn Env) {
+        parse_env_option_bool(
+            env,
+            "AUTUMN_OBSERVABILITY__SERVER_TIMING",
+            &mut self.observability.server_timing,
+        );
+    }
+
+    #[cfg(feature = "maud")]
+    fn apply_stories_env_overrides_with_env(&mut self, env: &dyn Env) {
+        parse_env_bool(env, "AUTUMN_STORIES__ENABLED", &mut self.stories.enabled);
     }
 
     fn apply_actuator_env_overrides_with_env(&mut self, env: &dyn Env) {
@@ -2681,6 +2824,11 @@ impl AutumnConfig {
             env,
             "AUTUMN_SERVER__UNIX_SOCKET",
             &mut self.server.unix_socket,
+        );
+        parse_env_option(
+            env,
+            "AUTUMN_SERVER__MAX_CONCURRENT_REQUESTS",
+            &mut self.server.max_concurrent_requests,
         );
     }
 
@@ -2989,6 +3137,11 @@ impl AutumnConfig {
             env,
             "AUTUMN_CHANNELS__CAPACITY",
             &mut self.channels.capacity,
+        );
+        parse_env(
+            env,
+            "AUTUMN_CHANNELS__REPLAY_BUFFER",
+            &mut self.channels.replay_buffer,
         );
         parse_env_option_string(
             env,
@@ -3507,6 +3660,7 @@ impl AutumnConfig {
             "AUTUMN_MAIL__MOUNT_UNSUBSCRIBE_ENDPOINT",
             &mut self.mail.mount_unsubscribe_endpoint,
         );
+        parse_env_bool(env, "AUTUMN_MAIL__INLINE_CSS", &mut self.mail.inline_css);
         if let Ok(val) = env.var("AUTUMN_MAIL__FILE_DIR") {
             self.mail.file_dir = PathBuf::from(val);
         }
@@ -3669,6 +3823,32 @@ pub struct ServerConfig {
     /// Configured via `AUTUMN_SERVER__UNIX_SOCKET`. Default: `None` (TCP).
     #[serde(default)]
     pub unix_socket: Option<String>,
+
+    /// Ceiling on concurrent in-flight requests (admission control / load
+    /// shedding). `None` or `0` (the default) disables the ceiling — today's
+    /// unlimited behavior — so no existing application silently changes
+    /// throughput.
+    ///
+    /// Once this many requests are admitted and still in flight, additional
+    /// requests receive an immediate `503 Service Unavailable` with a
+    /// `Retry-After` header, before the handler runs or the request body is
+    /// read. This bounds total concurrent work (and therefore memory) under
+    /// a traffic spike or a slow dependency, trading a fast, clean "try
+    /// another replica" signal for the alternative — admitted requests
+    /// piling up unbounded until the process is OOM-killed.
+    ///
+    /// Liveness/readiness/health probe routes (`health.*` paths and the
+    /// actuator prefix) are never shed, so a merely-busy replica is not
+    /// killed by its orchestrator.
+    ///
+    /// A reasonable starting point is the number of worker threads times a
+    /// small multiple (e.g. 2-4x), sized to keep admitted-request tail
+    /// latency stable under the expected peak concurrency; tune based on
+    /// observed `autumn_requests_shed_total` and per-route latency.
+    ///
+    /// Configured via `AUTUMN_SERVER__MAX_CONCURRENT_REQUESTS`.
+    #[serde(default)]
+    pub max_concurrent_requests: Option<usize>,
 }
 
 /// Behavior when a configured read replica is unavailable or stale.
@@ -3931,7 +4111,9 @@ pub struct DatabaseConfig {
     /// Compatibility alias for the primary/write role. New multi-role
     /// deployments should prefer [`primary_url`](Self::primary_url).
     ///
-    /// Must start with `postgres://` or `postgresql://` when present.
+    /// When present, must start with `postgres://` or `postgresql://`, or be
+    /// a libpq-style keyword/value connection string
+    /// (`host=db user=app dbname=app sslmode=require`).
     #[serde(default)]
     pub url: Option<String>,
 
@@ -4326,7 +4508,7 @@ impl DatabaseConfig {
     ///
     /// # Errors
     ///
-    /// Returns a validation error if a URL has an invalid scheme or a
+    /// Returns a validation error if a connection string is malformed or a
     /// shard declaration is malformed.
     pub fn validate(&self) -> Result<(), ConfigError> {
         for (field, url) in [
@@ -4335,8 +4517,7 @@ impl DatabaseConfig {
             ("database.replica_url", self.replica_url.as_deref()),
         ] {
             if let Some(url) = url
-                && !url.starts_with("postgres://")
-                && !url.starts_with("postgresql://")
+                && !is_pg_connection_string(url)
             {
                 let label = if field == "database.url" {
                     "database URL"
@@ -4344,7 +4525,9 @@ impl DatabaseConfig {
                     field
                 };
                 return Err(ConfigError::Validation(format!(
-                    "Invalid {label}: must start with postgres:// or postgresql://, got {url:?}"
+                    "Invalid {label}: must start with postgres:// or postgresql://, or be a \
+                     keyword/value connection string \
+                     (e.g. \"host=db user=app dbname=app sslmode=require\"), got {url:?}"
                 )));
             }
         }
@@ -4385,12 +4568,13 @@ impl DatabaseConfig {
                 ("replica_url", shard.replica_url.as_deref()),
             ] {
                 if let Some(url) = url
-                    && !url.starts_with("postgres://")
-                    && !url.starts_with("postgresql://")
+                    && !is_pg_connection_string(url)
                 {
                     return Err(ConfigError::Validation(format!(
                         "Invalid database.shards[{idx}].{field}: must start with \
-                         postgres:// or postgresql://, got {url:?}"
+                         postgres:// or postgresql://, or be a keyword/value \
+                         connection string \
+                         (e.g. \"host=db user=app dbname=app sslmode=require\"), got {url:?}"
                     )));
                 }
             }
@@ -4398,6 +4582,16 @@ impl DatabaseConfig {
         self.resolved_slot_map()?;
         Ok(())
     }
+}
+
+/// Whether `s` is an acceptable Postgres connection string: a
+/// `postgres://`/`postgresql://` URL, or a libpq-style keyword/value string
+/// (`host=db user=app sslmode=require`) — recognized with the SAME parser
+/// the pool's TLS module uses ([`crate::pg_conn_str`]), so every string the
+/// pool supports also passes config validation (issue #1585 review: the
+/// keyword form was rejected here before ever reaching the pool).
+fn is_pg_connection_string(s: &str) -> bool {
+    crate::pg_conn_str::is_url(s) || crate::pg_conn_str::is_keyword_value(s)
 }
 
 /// Logging configuration.
@@ -4983,6 +5177,7 @@ impl Default for ServerConfig {
             prestop_grace_secs: default_prestop_grace(),
             timeouts: RequestTimeoutsConfig::default(),
             unix_socket: None,
+            max_concurrent_requests: None,
         }
     }
 }
@@ -5111,7 +5306,24 @@ impl TomlEnvConfigLoader {
 
 impl ConfigLoader for TomlEnvConfigLoader {
     async fn load(&self) -> Result<AutumnConfig, ConfigError> {
-        AutumnConfig::load_with_env(&OsEnv)
+        // Feed a project-root `.env` into the `AUTUMN_*` env layer before
+        // resolving config from the real environment. Rather than mutating the
+        // process environment (unsound on a live multi-threaded runtime), `.env`
+        // values are layered *under* the real environment via an overlay `Env`,
+        // so a real env var always wins. The sync file IO in `resolve_dotenv_vars`
+        // is fine on the async path. A malformed `.env` fails loudly here rather
+        // than silently skipping developer-provided values.
+        let base = OsEnv;
+        let profile = resolve_profile(&base);
+        // Resolve `.env` from the same base directory config uses for
+        // `autumn.toml` (AUTUMN_MANIFEST_DIR when set, else the process CWD),
+        // so a binary launched from outside its crate root reads the `.env`
+        // next to its config instead of the process working directory.
+        let dir = crate::dotenv::dotenv_base_dir(&base);
+        let vars = crate::dotenv::resolve_dotenv_vars(&dir, &profile, &base)
+            .map_err(|e| ConfigError::Dotenv(e.to_string()))?;
+        let env = crate::dotenv::DotenvEnv::new(&base, vars);
+        AutumnConfig::load_with_env(&env)
     }
 }
 
@@ -5245,8 +5457,12 @@ pub struct TenancyConfig {
     pub jwt_claim: String,
 
     /// JWT secret key used to verify the JWT signature.
+    ///
+    /// Stored as a [`secrecy::SecretString`] so the raw value is redacted
+    /// from `Debug` output and zeroized on drop. Call
+    /// [`secrecy::ExposeSecret::expose_secret`] at the point of use.
     #[serde(default)]
-    pub jwt_secret: Option<String>,
+    pub jwt_secret: Option<secrecy::SecretString>,
 
     /// Expected JWT issuer to validate.
     #[serde(default)]
@@ -7264,6 +7480,7 @@ path = "/healthz"
 
         assert_eq!(config.channels.backend, ChannelBackend::InProcess);
         assert_eq!(config.channels.capacity, 32);
+        assert_eq!(config.channels.replay_buffer, 256);
         assert_eq!(config.channels.redis.key_prefix, "autumn:channels");
         assert!(config.channels.redis.url.is_none());
     }
@@ -7273,6 +7490,7 @@ path = "/healthz"
         let env = MockEnv::new()
             .with("AUTUMN_CHANNELS__BACKEND", "redis")
             .with("AUTUMN_CHANNELS__CAPACITY", "128")
+            .with("AUTUMN_CHANNELS__REPLAY_BUFFER", "512")
             .with("AUTUMN_CHANNELS__REDIS__URL", "redis://channels:6379/4")
             .with("AUTUMN_CHANNELS__REDIS__KEY_PREFIX", "myapp:channels");
         let mut config = AutumnConfig::default();
@@ -7281,6 +7499,7 @@ path = "/healthz"
 
         assert_eq!(config.channels.backend, ChannelBackend::Redis);
         assert_eq!(config.channels.capacity, 128);
+        assert_eq!(config.channels.replay_buffer, 512);
         assert_eq!(
             config.channels.redis.url.as_deref(),
             Some("redis://channels:6379/4")
@@ -7368,6 +7587,65 @@ path = "/healthz"
         let mut target = "old".to_string();
         parse_env_string(&env, "SOME_STR", &mut target);
         assert_eq!(target, "val");
+    }
+
+    // ── server_timing_enabled resolver tests ────────────────────
+
+    fn cfg_with_profile(profile: Option<&str>) -> AutumnConfig {
+        AutumnConfig {
+            profile: profile.map(str::to_owned),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn server_timing_defaults_on_in_dev_profile() {
+        let cfg = cfg_with_profile(Some("dev"));
+        assert!(server_timing_enabled(&cfg));
+
+        let cfg = cfg_with_profile(Some("development"));
+        assert!(server_timing_enabled(&cfg));
+    }
+
+    #[test]
+    fn server_timing_defaults_off_in_prod_and_test_profiles() {
+        let cfg = cfg_with_profile(Some("prod"));
+        assert!(!server_timing_enabled(&cfg));
+
+        let cfg = cfg_with_profile(Some("production"));
+        assert!(!server_timing_enabled(&cfg));
+
+        let cfg = cfg_with_profile(Some("test"));
+        assert!(!server_timing_enabled(&cfg));
+
+        let cfg = cfg_with_profile(None);
+        assert!(!server_timing_enabled(&cfg));
+    }
+
+    #[test]
+    fn server_timing_explicit_config_overrides_profile_default() {
+        let mut cfg = cfg_with_profile(Some("prod"));
+        cfg.observability.server_timing = Some(true);
+        assert!(server_timing_enabled(&cfg));
+
+        let mut cfg = cfg_with_profile(Some("dev"));
+        cfg.observability.server_timing = Some(false);
+        assert!(!server_timing_enabled(&cfg));
+    }
+
+    #[test]
+    fn server_timing_env_override_wires_into_dispatcher() {
+        let env = MockEnv::new().with("AUTUMN_OBSERVABILITY__SERVER_TIMING", "true");
+        let mut config = cfg_with_profile(Some("prod"));
+        config.apply_env_overrides_with_env(&env);
+        assert_eq!(config.observability.server_timing, Some(true));
+        assert!(server_timing_enabled(&config));
+
+        let env = MockEnv::new().with("AUTUMN_OBSERVABILITY__SERVER_TIMING", "false");
+        let mut config = cfg_with_profile(Some("dev"));
+        config.apply_env_overrides_with_env(&env);
+        assert_eq!(config.observability.server_timing, Some(false));
+        assert!(!server_timing_enabled(&config));
     }
 
     #[test]
@@ -7559,6 +7837,54 @@ path = "/healthz"
         );
     }
 
+    // ── server.max_concurrent_requests (#1006) ────────────────────
+
+    #[test]
+    fn server_config_defaults_max_concurrent_requests_none() {
+        // Default must preserve today's unlimited behavior — no existing app
+        // silently changes throughput.
+        let config = AutumnConfig::default();
+        assert!(config.server.max_concurrent_requests.is_none());
+    }
+
+    #[test]
+    fn max_concurrent_requests_parses_from_toml() {
+        let config: AutumnConfig = toml::from_str(
+            r"
+            [server]
+            max_concurrent_requests = 64
+            ",
+        )
+        .expect("config with server.max_concurrent_requests should parse");
+        assert_eq!(config.server.max_concurrent_requests, Some(64));
+    }
+
+    #[test]
+    fn env_override_server_max_concurrent_requests() {
+        let env = MockEnv::new().with("AUTUMN_SERVER__MAX_CONCURRENT_REQUESTS", "128");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        assert_eq!(config.server.max_concurrent_requests, Some(128));
+    }
+
+    #[test]
+    fn env_override_invalid_max_concurrent_requests_ignored() {
+        let env = MockEnv::new().with("AUTUMN_SERVER__MAX_CONCURRENT_REQUESTS", "not_a_number");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        assert!(config.server.max_concurrent_requests.is_none());
+    }
+
+    #[test]
+    fn env_override_empty_max_concurrent_requests_clears_to_none() {
+        // parse_env_option's documented convention: empty string clears to None.
+        let env = MockEnv::new().with("AUTUMN_SERVER__MAX_CONCURRENT_REQUESTS", "");
+        let mut config = AutumnConfig::default();
+        config.server.max_concurrent_requests = Some(64);
+        config.apply_env_overrides_with_env(&env);
+        assert!(config.server.max_concurrent_requests.is_none());
+    }
+
     // ── Log env override tests ───────────────────────────────────
 
     #[test]
@@ -7706,6 +8032,78 @@ path = "/healthz"
     fn validate_accepts_no_url() {
         let config = DatabaseConfig::default();
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_keyword_value_connection_strings() {
+        // The pool's TLS support parses libpq keyword/value strings, so
+        // validation must let them through (issue #1585 review) — including
+        // quoted values and whitespace around `=`.
+        for url in [
+            "host=db user=app dbname=app",
+            "host=db user=app sslmode=require",
+            "host=db sslmode = require",
+            "host=db password='p w' sslmode='verify-full'",
+            "host=db password=https://looks-like-a-url sslmode=require",
+        ] {
+            let config = DatabaseConfig {
+                url: Some(url.to_owned()),
+                ..Default::default()
+            };
+            assert!(
+                config.validate().is_ok(),
+                "keyword/value string must validate: {url}"
+            );
+        }
+        // primary_url and shard URLs accept the same forms.
+        let config = DatabaseConfig {
+            primary_url: Some("host=db user=app sslmode=require".to_owned()),
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok());
+        let config = DatabaseConfig {
+            primary_url: Some("postgres://db-control/app".to_owned()),
+            shards: vec![ShardConfig {
+                name: "s0".to_owned(),
+                primary_url: "host=db-shard0 user=app dbname=app".to_owned(),
+                replica_url: None,
+                slots: None,
+                primary_pool_size: None,
+                replica_pool_size: None,
+                replica_fallback: None,
+            }],
+            ..Default::default()
+        };
+        assert!(
+            config.validate().is_ok(),
+            "shard URLs accept the keyword form too: {:?}",
+            config.validate()
+        );
+    }
+
+    #[test]
+    fn validate_still_rejects_garbage_connection_strings() {
+        for url in [
+            "mysql://localhost/test",
+            "mysql://localhost/test?a=b",
+            "not a connection string",
+            "localhost",
+            "host=",
+            "host='unterminated",
+        ] {
+            let config = DatabaseConfig {
+                url: Some(url.to_owned()),
+                ..Default::default()
+            };
+            let err = config
+                .validate()
+                .expect_err(&format!("garbage must be rejected: {url:?}"))
+                .to_string();
+            assert!(
+                err.contains("must start with postgres:// or postgresql://"),
+                "the error must stay clear about accepted forms, got: {err}"
+            );
+        }
     }
 
     // ── Profile tests ──────────────────────────────────────────
@@ -8747,6 +9145,33 @@ path = "/api-spec.json"
         assert!(
             !config.mail.allow_in_process_deliver_later_in_production,
             "flag should default to false when env var is not set"
+        );
+    }
+
+    #[cfg(feature = "mail")]
+    #[test]
+    fn mail_inline_css_is_overridable_via_env() {
+        let env = MockEnv::new().with("AUTUMN_MAIL__INLINE_CSS", "true");
+
+        let mut config = AutumnConfig::default();
+        config.apply_mail_env_overrides_with_env(&env);
+
+        assert!(
+            config.mail.inline_css,
+            "AUTUMN_MAIL__INLINE_CSS=true should enable inline_css"
+        );
+    }
+
+    #[cfg(feature = "mail")]
+    #[test]
+    fn mail_inline_css_defaults_false() {
+        let env = MockEnv::new();
+        let mut config = AutumnConfig::default();
+        config.apply_mail_env_overrides_with_env(&env);
+
+        assert!(
+            !config.mail.inline_css,
+            "inline_css should default to false when env var is not set"
         );
     }
 
