@@ -58,7 +58,9 @@ mod events_integration;
 #[cfg(feature = "db")]
 mod experiments_pg_integration;
 mod extractors;
+mod factory_fake;
 mod factory_integration;
+mod fake_generators;
 mod feature_flags_integration;
 mod feed;
 mod form_for_derive;

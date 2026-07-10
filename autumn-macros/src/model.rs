@@ -1650,6 +1650,143 @@ fn factory_assoc_type(field: &Field) -> Option<syn::Ident> {
     None
 }
 
+/// The identifier of a type's last path segment (e.g. `String`, `i64`,
+/// `DateTime`, `Uuid`), if the type is a simple path type.
+fn ty_last_ident(ty: &syn::Type) -> Option<String> {
+    if let syn::Type::Path(tp) = ty {
+        tp.path.segments.last().map(|s| s.ident.to_string())
+    } else {
+        None
+    }
+}
+
+/// The identifier of the first generic type argument of a path type's last
+/// segment (e.g. `Utc` for `DateTime<Utc>`, `String` for `Vec<String>`).
+fn ty_last_generic_ident(ty: &syn::Type) -> Option<String> {
+    if let syn::Type::Path(tp) = ty {
+        let seg = tp.path.segments.last()?;
+        if let syn::PathArguments::AngleBracketed(args) = &seg.arguments {
+            for arg in &args.args {
+                if let syn::GenericArgument::Type(inner) = arg {
+                    return ty_last_ident(inner);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// The inner type `T` of an `Option<T>`, if `ty` is an `Option`.
+fn option_inner_type(ty: &syn::Type) -> Option<&syn::Type> {
+    if let syn::Type::Path(tp) = ty {
+        let seg = tp.path.segments.last()?;
+        if seg.ident != "Option" {
+            return None;
+        }
+        if let syn::PathArguments::AngleBracketed(args) = &seg.arguments {
+            for arg in &args.args {
+                if let syn::GenericArgument::Type(inner) = arg {
+                    return Some(inner);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Infer the fake-data expression for a factory field when `.fake()` is active.
+///
+/// Selection order (per issue #1343):
+/// 1. **Name-based rules** — for `String` targets, the field identifier
+///    (case-insensitive, `contains` unless noted) picks a specialized generator
+///    (`email`, `url`, `title`, `body`, `slug`, …). Numeric/temporal/decimal
+///    fields already map cleanly from their type, so name hints for them
+///    coincide with the type fallback and need no special-casing.
+/// 2. **Type fallback** — the Rust type of the field maps to the natural
+///    generator (`String` → `sentence()`, integers → `int_range`, `bool` →
+///    `boolean()`, `Decimal` → `decimal()`, `DateTime` → `recent_datetime()`,
+///    `Uuid` → `uuid()`, …).
+/// 3. `Option<T>` wraps the inner expression in `Some(..)`.
+///
+/// Returns `None` when no sensible fake value can be produced — the caller then
+/// leaves the field at its `Default::default()` value. This function must NEVER
+/// emit an expression that fails to compile: when unsure, return `None`.
+fn fake_expr_for_field(ident: &syn::Ident, ty: &syn::Type) -> Option<TokenStream> {
+    let raw = ident.to_string();
+    let name = raw.strip_prefix("r#").unwrap_or(&raw).to_ascii_lowercase();
+
+    // Option<T>: fake the inner value, wrap in Some.
+    if let Some(inner) = option_inner_type(ty) {
+        let inner_expr = fake_expr_core(&name, inner)?;
+        return Some(quote! { ::core::option::Option::Some(#inner_expr) });
+    }
+
+    fake_expr_core(&name, ty)
+}
+
+/// Core inference over a non-`Option` target type. See [`fake_expr_for_field`].
+fn fake_expr_core(name: &str, ty: &syn::Type) -> Option<TokenStream> {
+    let last = ty_last_ident(ty)?;
+    match last.as_str() {
+        "String" => Some(fake_string_expr(name)),
+        "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64" | "usize" | "isize" => {
+            let cast = format_ident!("{last}");
+            // Default numeric range covers the name-based hints (count/age/qty →
+            // small non-negative ints).
+            Some(quote! { (::autumn_web::fake::int_range(0, 1000) as #cast) })
+        }
+        "f32" | "f64" => {
+            let cast = format_ident!("{last}");
+            Some(quote! { (::autumn_web::fake::decimal_f64() as #cast) })
+        }
+        "bool" => Some(quote! { ::autumn_web::fake::boolean() }),
+        "Decimal" => Some(quote! { ::autumn_web::fake::decimal() }),
+        "Uuid" => Some(quote! { ::autumn_web::fake::uuid() }),
+        // `recent_datetime()` yields `DateTime<Utc>`, so only fake a `DateTime`
+        // whose timezone parameter is `Utc`. Other zones (e.g. `Local`,
+        // `FixedOffset`) fall through to Default to avoid a type mismatch.
+        "DateTime" if ty_last_generic_ident(ty).as_deref() == Some("Utc") => {
+            Some(quote! { ::autumn_web::fake::recent_datetime() })
+        }
+        "NaiveDateTime" => Some(quote! { ::autumn_web::fake::recent_datetime().naive_utc() }),
+        "NaiveDate" => Some(quote! { ::autumn_web::fake::recent_datetime().date_naive() }),
+        _ => None,
+    }
+}
+
+/// Choose a string generator from the field name (name-based rules for #1343).
+fn fake_string_expr(name: &str) -> TokenStream {
+    if name.contains("email") {
+        quote! { ::autumn_web::fake::email() }
+    } else if name == "username" || name.contains("user_name") {
+        quote! { ::autumn_web::fake::username() }
+    } else if name.contains("url") || name.contains("link") || name.contains("website") {
+        quote! { ::autumn_web::fake::url() }
+    } else if name.contains("slug") {
+        quote! {{
+            let __autumn_slug = ::autumn_web::fake::words(3);
+            __autumn_slug
+                .split_whitespace()
+                .collect::<::std::vec::Vec<&str>>()
+                .join("-")
+        }}
+    } else if name.contains("body")
+        || name.contains("content")
+        || name.contains("description")
+        || name.contains("summary")
+        || name.contains("bio")
+        || name.contains("text")
+    {
+        quote! { ::autumn_web::fake::paragraph() }
+    } else if name == "name" {
+        quote! { ::autumn_web::fake::name() }
+    } else if name.contains("title") || name.contains("name") {
+        quote! { ::autumn_web::fake::words(3) }
+    } else {
+        quote! { ::autumn_web::fake::sentence() }
+    }
+}
+
 /// Validate that every `#[factory_assoc(...)]` attribute contains a valid Ident.
 ///
 /// Returns a compile error token stream on the first malformed attribute so the
@@ -3205,6 +3342,10 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         .flat_map(|f| {
             let ident = f.ident.as_ref().unwrap();
             let ty = &f.ty;
+            // The field-name string recorded in `__autumn_set` when this setter
+            // runs, so `.fake()` skips explicitly-set fields. Must match the
+            // string used by the build/create fake bindings below.
+            let field_lit = ident.to_string();
 
             factory_assoc_type(f).map_or_else(
                 // Normal field: a single setter that assigns directly.
@@ -3213,6 +3354,7 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         #[must_use]
                         pub fn #ident(mut self, val: impl ::core::convert::Into<#ty>) -> Self {
                             self.#ident = val.into();
+                            self.__autumn_set.insert(#field_lit);
                             self
                         }
                     }]
@@ -3223,6 +3365,7 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         #[must_use]
                         pub fn #ident(mut self, val: impl ::core::convert::Into<#ty>) -> Self {
                             self.#ident = ::core::option::Option::Some(val.into());
+                            self.__autumn_set.insert(#field_lit);
                             self
                         }
                     };
@@ -3240,6 +3383,7 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         #[must_use]
                         pub fn #assoc_snake(mut self, val: &#assoc_type) -> Self {
                             self.#ident = ::core::option::Option::Some(val.__autumn_pk());
+                            self.__autumn_set.insert(#field_lit);
                             self
                         }
                     };
@@ -3249,37 +3393,73 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         })
         .collect();
 
-    // build() — assemble NewX.
-    // - Normal fields:  `{ident}: self.{ident}`
-    // - Assoc fields:   `{ident}: self.{ident}.unwrap_or_default()`
-    let factory_build_fields: Vec<TokenStream> = fields_for_new
+    // Per-field value bindings for NON-assoc fields, honoring `.fake()`.
+    //
+    // When the factory is in `.fake()` mode and the field was NOT explicitly set
+    // via its setter, draw a fake value inferred from the field name/type;
+    // otherwise use the value already stored on the factory. Each binding is a
+    // `let {ident} = …;` so both `build()` and `create()` can construct the
+    // record with struct-shorthand (`NewX { {ident}, … }`).
+    //
+    // `.clone()` (rather than moving `self.{ident}`) is required because the
+    // fake branch reads `self.__autumn_fake`/`self.__autumn_set` and the value
+    // is only conditionally consumed. All `NewX` field types are `Clone`.
+    let factory_value_bindings: Vec<TokenStream> = fields_for_new
         .iter()
+        .filter(|f| factory_assoc_type(f).is_none())
         .map(|f| {
-            let ident = &f.ident;
-            if factory_assoc_type(f).is_some() {
-                quote! { #ident: self.#ident.unwrap_or_default() }
-            } else {
-                quote! { #ident: self.#ident }
-            }
+            let ident = f.ident.as_ref().unwrap();
+            let field_lit = ident.to_string();
+            fake_expr_for_field(ident, &f.ty).map_or_else(
+                // No fake expression available for this type: leave the value
+                // as-is (its Default when `.fake()` was requested).
+                || {
+                    quote! {
+                        let #ident = ::core::clone::Clone::clone(&self.#ident);
+                    }
+                },
+                |fake_expr| {
+                    quote! {
+                        let #ident = if self.__autumn_fake
+                            && !self.__autumn_set.contains(#field_lit)
+                        {
+                            #fake_expr
+                        } else {
+                            ::core::clone::Clone::clone(&self.#ident)
+                        };
+                    }
+                },
+            )
+        })
+        .collect();
+
+    // build(): assoc fields resolve to their supplied value or `Default`.
+    let build_assoc_bindings: Vec<TokenStream> = fields_for_new
+        .iter()
+        .filter_map(|f| {
+            factory_assoc_type(f)?;
+            let ident = f.ident.as_ref().unwrap();
+            Some(quote! {
+                let #ident = self.#ident.unwrap_or_default();
+            })
         })
         .collect();
 
     // create() — auto-resolve assoc fields, then insert.
     //
-    // For each assoc field, emit a `let __resolved_{ident}` that either uses the
-    // supplied value or auto-creates the associated model via its factory.
+    // For each assoc field, bind `{ident}` to either the supplied value or an
+    // auto-created associated model's primary key.
     //
-    // A thread-local depth counter guards against cyclic associations: if the
+    // A task-local depth counter guards against cyclic associations: if the
     // chain exceeds 32 levels the factory panics with a clear message rather than
     // overflowing the stack.
-    let assoc_resolutions: Vec<TokenStream> = fields_for_new
+    let create_assoc_bindings: Vec<TokenStream> = fields_for_new
         .iter()
         .filter_map(|f| {
             let assoc_type = factory_assoc_type(f)?;
             let ident = f.ident.as_ref().unwrap();
-            let resolved = format_ident!("__resolved_{ident}");
             Some(quote! {
-                let #resolved = match self.#ident {
+                let #ident = match self.#ident {
                     ::core::option::Option::Some(id) => id,
                     ::core::option::Option::None => {
                         #assoc_type::factory().create(pool).await.__autumn_pk()
@@ -3289,17 +3469,12 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         })
         .collect();
 
-    // NewX construction inside create() uses resolved values for assoc fields.
-    let create_build_fields: Vec<TokenStream> = fields_for_new
+    // Struct-shorthand field list for `NewX { … }` (local bindings named to match).
+    let new_construct_fields: Vec<TokenStream> = fields_for_new
         .iter()
         .map(|f| {
             let ident = f.ident.as_ref().unwrap();
-            if factory_assoc_type(f).is_some() {
-                let resolved = format_ident!("__resolved_{ident}");
-                quote! { #ident: #resolved }
-            } else {
-                quote! { #ident: self.#ident }
-            }
+            quote! { #ident }
         })
         .collect();
 
@@ -3308,10 +3483,11 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         use ::autumn_web::reexports::diesel::prelude::*;
         use ::autumn_web::reexports::diesel_async::RunQueryDsl;
 
-        #(#assoc_resolutions)*
+        #(#factory_value_bindings)*
+        #(#create_assoc_bindings)*
 
         let new_record = #new_name {
-            #(#create_build_fields,)*
+            #(#new_construct_fields,)*
         };
         let mut conn = pool
             .get()
@@ -3380,6 +3556,33 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             ) -> #name {
                 #create_inner_body
             }
+        }
+    };
+
+    // create_many() — persist `count` records, cloning the factory per row so
+    // each iteration takes the same create() path. Under `.fake()`, every row
+    // re-draws its fake fields, yielding distinct rows (and distinct DB-assigned
+    // primary keys). Mirrors `create`'s signature exactly (returns Vec<#name>).
+    let factory_create_many_method = quote! {
+        /// Insert `count` records built from this factory and return them.
+        ///
+        /// The factory is cloned for each row, so with `.fake()` each record
+        /// gets freshly-generated field values. Without `.fake()` the records
+        /// are identical apart from database-assigned primary keys.
+        ///
+        /// Panics if any insert fails.
+        pub async fn create_many(
+            self,
+            count: usize,
+            pool: &::autumn_web::reexports::diesel_async::pooled_connection::deadpool::Pool<
+                ::autumn_web::reexports::diesel_async::AsyncPgConnection,
+            >,
+        ) -> ::std::vec::Vec<#name> {
+            let mut out = ::std::vec::Vec::with_capacity(count);
+            for _ in 0..count {
+                out.push(::core::clone::Clone::clone(&self).create(pool).await);
+            }
+            out
         }
     };
 
@@ -3949,12 +4152,22 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         #[derive(Debug, Clone)]
         #vis struct #factory_name {
             #(#factory_struct_fields,)*
+            /// Names of fields the caller explicitly set via a setter. `.fake()`
+            /// skips these so explicit overrides always win. (#1343)
+            #[doc(hidden)]
+            pub __autumn_set: ::std::collections::HashSet<&'static str>,
+            /// Whether `.fake()` was requested. When true, unset fields are
+            /// filled with generated data at `build()`/`create()` time. (#1343)
+            #[doc(hidden)]
+            pub __autumn_fake: bool,
         }
 
         impl ::core::default::Default for #factory_name {
             fn default() -> Self {
                 Self {
                     #(#factory_default_fields,)*
+                    __autumn_set: ::std::collections::HashSet::new(),
+                    __autumn_fake: false,
                 }
             }
         }
@@ -3962,18 +4175,48 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         impl #factory_name {
             #(#factory_setters)*
 
+            /// Fill every field that was not explicitly set with realistic
+            /// fake data when building. The value is inferred from each field's
+            /// name and type (see `autumn_web::fake`).
+            ///
+            /// This only flips a flag — values are drawn at `build()`/`create()`
+            /// time, so each build produces fresh, varied rows. Set
+            /// `AUTUMN_FAKE_SEED` (or call `autumn_web::fake::reseed`) for
+            /// reproducible output.
+            #[must_use]
+            pub fn fake(mut self) -> Self {
+                self.__autumn_fake = true;
+                self
+            }
+
             /// Build a [`#new_name`] instance from the current factory state.
             ///
             /// Does not touch the database. Use [`#factory_name::create`] to
             /// also persist the record.
             #[must_use]
             pub fn build(self) -> #new_name {
+                #(#factory_value_bindings)*
+                #(#build_assoc_bindings)*
                 #new_name {
-                    #(#factory_build_fields,)*
+                    #(#new_construct_fields,)*
                 }
             }
 
+            /// Build `count` [`#new_name`] instances. With `.fake()` each row is
+            /// re-drawn, so text fields vary across the batch. Without `.fake()`
+            /// the rows are identical copies of the factory state.
+            #[must_use]
+            pub fn build_many(self, count: usize) -> ::std::vec::Vec<#new_name> {
+                let mut out = ::std::vec::Vec::with_capacity(count);
+                for _ in 0..count {
+                    out.push(::core::clone::Clone::clone(&self).build());
+                }
+                out
+            }
+
             #factory_create_method
+
+            #factory_create_many_method
         }
 
         impl #name {
