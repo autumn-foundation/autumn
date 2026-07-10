@@ -128,6 +128,33 @@ fn form_inputs_carry_matching_html5_constraints() {
 }
 
 #[test]
+fn constrained_float_fields_keep_step_any() {
+    // A constrained float must keep `step="any"` so browsers don't default to
+    // `step="1"` and reject fractional input like `0.5` that the server-side
+    // range validator and the `f64` type accept (issue #1388 — the client and
+    // server constraints must agree). Matches the unconstrained float control.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    run_autumn_ok(tmp.path(), &["new", "validate-float-step-app"]);
+    let project = tmp.path().join("validate-float-step-app");
+    run_autumn_ok(
+        &project,
+        &["generate", "scaffold", "Reading", "ratio:f64{min=0,max=1}"],
+    );
+    let routes = fs::read_to_string(project.join("src/routes/readings.rs")).unwrap();
+    assert!(
+        routes.contains("type=\"number\" id=\"ratio\""),
+        "the constrained float must render as a number input:\n{routes}"
+    );
+    let ratio_input = slice_input(&routes, "id=\"ratio\" name=\"ratio\"");
+    assert!(
+        ratio_input.contains("min=\"0\"")
+            && ratio_input.contains("max=\"1\"")
+            && ratio_input.contains("step=\"any\""),
+        "constrained float must carry min/max AND step=any:\n{ratio_input}"
+    );
+}
+
+#[test]
 fn required_only_on_non_nullable_constrained_fields() {
     let (_tmp, project) = constrained_project("validate-required-app");
     let routes = fs::read_to_string(project.join("src/routes/posts.rs")).unwrap();

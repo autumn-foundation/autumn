@@ -91,6 +91,49 @@ fn label_override_selects_the_named_column() {
 }
 
 #[test]
+fn invalid_label_override_falls_back_to_heuristic_and_warns() {
+    // `Post` exposes `title` (heuristic display) but no `slug`; an explicit
+    // `{label:slug}` names a column the model doesn't have. Trusting it would
+    // emit `select posts::slug` (loaded as `String`) and fail to compile the
+    // generated app, so the resolver falls back to the `title` heuristic and
+    // the generator warns instead of hard-failing.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    run_autumn_ok(tmp.path(), &["new", "bt-bad-label-app"]);
+    let project = tmp.path().join("bt-bad-label-app");
+    run_autumn_ok(&project, &["generate", "model", "Post", "title:String"]);
+    let output = Command::new(autumn_bin())
+        .args([
+            "generate",
+            "scaffold",
+            "Comment",
+            "body:Text",
+            "post:references{label:slug}",
+        ])
+        .current_dir(&project)
+        .output()
+        .expect("failed to run autumn");
+    assert!(
+        output.status.success(),
+        "scaffold with an invalid label must still succeed (graceful fallback)\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let routes = fs::read_to_string(project.join("src/routes/comments.rs")).unwrap();
+    assert!(
+        routes.contains(".select((posts::id, posts::title))"),
+        "an invalid label must fall back to the `title` heuristic column:\n{routes}"
+    );
+    assert!(
+        !routes.contains("posts::slug"),
+        "the generated routes must not reference the nonexistent `slug` column:\n{routes}"
+    );
+    assert!(
+        stderr.contains("slug") && stderr.contains("falling back"),
+        "the generator must warn that the invalid label was ignored:\n{stderr}"
+    );
+}
+
+#[test]
 fn falls_back_to_id_when_target_has_no_string_column() {
     // A `Post` with only numeric columns has no display column, so the loader
     // keeps the id as both value and label.

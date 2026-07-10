@@ -432,6 +432,37 @@ pub fn plan_scaffold_with_options(
             ));
         }
     }
+    // An explicit `{label:col}` override that names a column the target model
+    // doesn't expose as a string would generate a `select {table}::{col}`
+    // (loaded as `String`) that fails to compile the generated app. The display
+    // resolver falls back to the heuristic display column in that case
+    // (see `resolve_reference_display`), so warn the author their label was
+    // ignored rather than silently swapping it. Skipped for a missing target
+    // (already warned above) and when the model isn't discoverable (the
+    // override can't be validated, so it's honored as-is).
+    for f in form_fields.iter().filter(|f| f.kind.is_reference()) {
+        if missing_reference_targets.contains(&f.name) {
+            continue;
+        }
+        let Some(label) = &f.constraints.label else {
+            continue;
+        };
+        let base = f.name.strip_suffix("_id").unwrap_or(&f.name);
+        let columns = super::model::model_string_columns(project_root, base);
+        if !columns.is_empty() && !columns.iter().any(|(c, _)| c == label) {
+            plan.warn(format!(
+                "reference label '{label}' on '{}' is not a string column of the '{base}' \
+                 model; falling back to its default display column. Available string \
+                 columns: {}.",
+                f.name,
+                columns
+                    .iter()
+                    .map(|(c, _)| c.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+    }
 
     // Repository file under `src/repositories/<snake>.rs`
     let repos_dir = project_root.join("src").join("repositories");
@@ -2818,21 +2849,39 @@ struct ReferenceDisplay {
 fn resolve_reference_display(project_root: &Path, field: &Field) -> Option<ReferenceDisplay> {
     let base = field.name.strip_suffix("_id").unwrap_or(&field.name);
     let columns = super::model::model_string_columns(project_root, base);
-    let (column, column_nullable) = if let Some(label) = &field.constraints.label {
-        // Explicit override: trust the author's column name, using its known
-        // nullability when we can see it (else assume a non-null String).
-        let nullable = columns
-            .iter()
-            .find(|(c, _)| c == label)
-            .is_some_and(|(_, n)| *n);
-        (label.clone(), nullable)
-    } else {
-        let chosen = columns
+    // The `name`/`title`/first-string-column heuristic, reused both when no
+    // explicit label is given and when an explicit one has to be discarded.
+    let heuristic = || {
+        columns
             .iter()
             .find(|(c, _)| c == "name")
             .or_else(|| columns.iter().find(|(c, _)| c == "title"))
-            .or_else(|| columns.first())?;
-        (chosen.0.clone(), chosen.1)
+            .or_else(|| columns.first())
+            .map(|(c, n)| (c.clone(), *n))
+    };
+    let (column, column_nullable) = if let Some(label) = &field.constraints.label {
+        if let Some((c, n)) = columns.iter().find(|(c, _)| c == label) {
+            // Explicit override names a real string column on the target — use
+            // it, with its known nullability.
+            (c.clone(), *n)
+        } else if columns.is_empty() {
+            // The target model isn't discoverable at scaffold time (not yet
+            // generated, unparseable, or a single-file `models.rs` layout we
+            // can't read), so the override can't be validated. Honor it as
+            // before (assume a non-null `String`), matching the "assume the
+            // table exists" posture the missing-target path already takes.
+            (label.clone(), false)
+        } else {
+            // The model IS discoverable and exposes string columns, but none is
+            // named `{label}` — a typo, or a non-string column. Emitting
+            // `select {table}::{label}` (loaded as `String`) would fail to
+            // compile the generated app, so fall back to the heuristic display
+            // column: generation still succeeds, and the plan carries a warning
+            // (emitted in `execute`) telling the author the label was ignored.
+            heuristic()?
+        }
+    } else {
+        heuristic()?
     };
     Some(ReferenceDisplay {
         column,
@@ -3013,8 +3062,10 @@ fn decimal_step(scale: u32) -> String {
 ///
 /// `String`/`Text`: `min`/`max` -> `minlength`/`maxlength`, `email` ->
 /// `type="email"`, `url` -> `type="url"`. Numeric: `min`/`max` -> `min`/`max`
-/// on a `type="number"` input. Returned attribute string is space-prefixed and
-/// ready to splice straight into the generated maud `input`.
+/// on a `type="number"` input, and float (`f32`/`f64`) fields also carry
+/// `step="any"` so fractional input isn't rejected client-side. Returned
+/// attribute string is space-prefixed and ready to splice straight into the
+/// generated maud `input`.
 fn html5_constraint_spec(field: &Field) -> Option<(&'static str, String)> {
     use std::fmt::Write as _;
     let c = &field.constraints;
@@ -3035,12 +3086,34 @@ fn html5_constraint_spec(field: &Field) -> Option<(&'static str, String)> {
                 "text"
             }
         }
-        FieldKind::I32 | FieldKind::I64 | FieldKind::F32 | FieldKind::F64 => {
+        FieldKind::I32 | FieldKind::I64 => {
             if let Some(min) = &c.min {
                 let _ = write!(attrs, " min=\"{min}\"");
             }
             if let Some(max) = &c.max {
                 let _ = write!(attrs, " max=\"{max}\"");
+            }
+            "number"
+        }
+        FieldKind::F32 | FieldKind::F64 => {
+            if let Some(min) = &c.min {
+                let _ = write!(attrs, " min=\"{min}\"");
+            }
+            if let Some(max) = &c.max {
+                let _ = write!(attrs, " max=\"{max}\"");
+            }
+            // A constrained float must keep `step="any"` — the same step the
+            // unconstrained float control (`FieldControl::Number { step: "any" }`)
+            // emits. Without it browsers default a `type="number"` input to
+            // `step="1"` and reject fractional input like `0.5` for
+            // `ratio:f64{min=0,max=1}` client-side, even though the server-side
+            // `range` validator and the `f64` type accept it (issue #1388's
+            // "client and server agree"). Only emitted when the field is
+            // actually constrained (min/max present, so `attrs` is non-empty);
+            // otherwise the early-return below keeps the field in the derived
+            // render rather than needlessly excising it.
+            if !attrs.is_empty() {
+                let _ = write!(attrs, " step=\"any\"");
             }
             "number"
         }
