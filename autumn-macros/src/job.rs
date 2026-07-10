@@ -156,6 +156,17 @@ fn validate_job_attrs(result: &mut JobAttrs) -> syn::Result<()> {
             "concurrency_key requires concurrency = N",
         ));
     }
+    // An `upgrade` hook is only ever invoked when the stored version is *older*
+    // than the current one, i.e. `version >= 2`. With `version` unset (1) the
+    // decode path never enters the upgrade loop, so the hook would be dead code
+    // while enqueue still paid to wrap the payload — a silent footgun. Reject it.
+    if result.upgrade.is_some() && result.version.unwrap_or(1) < 2 {
+        return Err(syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "`upgrade` requires `version >= 2` (an upgrade hook only runs when a \
+             stored payload is older than the current version)",
+        ));
+    }
     let uniqueness_configured = result.unique_by.is_some()
         || result.unique_window.is_some()
         || result.unique_for_ms.is_some();
@@ -457,8 +468,8 @@ mod tests {
 
     #[test]
     fn parses_version_and_upgrade_attrs() {
-        let attrs = parse(quote! { version = 2, upgrade = crate::jobs::upgrade_welcome })
-            .expect("parse");
+        let attrs =
+            parse(quote! { version = 2, upgrade = crate::jobs::upgrade_welcome }).expect("parse");
         assert_eq!(attrs.version, Some(2));
         let upgrade = attrs.upgrade.expect("upgrade path parsed");
         assert!(quote!(#upgrade).to_string().contains("upgrade_welcome"));
@@ -469,7 +480,29 @@ mod tests {
         let attrs = parse(quote! { name = "j" }).expect("parse");
         assert_eq!(attrs.version, None);
         assert!(attrs.upgrade.is_none());
-        assert!(parse(quote! { version = 0 }).is_err(), "zero version rejected");
+        assert!(
+            parse(quote! { version = 0 }).is_err(),
+            "zero version rejected"
+        );
+    }
+
+    #[test]
+    fn upgrade_requires_version_at_least_2() {
+        // An upgrade hook only fires when a stored payload is older than the
+        // current version, so `upgrade` without `version >= 2` is dead code and
+        // must be a compile error rather than a silent no-op.
+        let err = parse(quote! { upgrade = crate::jobs::up })
+            .err()
+            .expect("upgrade without version must be rejected");
+        assert!(err.to_string().contains("version >= 2"), "{err}");
+
+        let err = parse(quote! { version = 1, upgrade = crate::jobs::up })
+            .err()
+            .expect("upgrade with version = 1 must be rejected");
+        assert!(err.to_string().contains("version >= 2"), "{err}");
+
+        // version >= 2 with an upgrade hook is accepted.
+        assert!(parse(quote! { version = 2, upgrade = crate::jobs::up }).is_ok());
     }
 
     #[test]

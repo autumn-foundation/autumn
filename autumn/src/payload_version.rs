@@ -164,6 +164,18 @@ enum VersionErrorKind {
 /// stored version, and the expected version, so a dead-lettered job is
 /// self-diagnosing. Detect it in an already-stringified error with
 /// [`is_payload_version_error`].
+///
+/// # Retry behavior (follow-up)
+///
+/// A version mismatch is a *deterministic* failure — retrying the same stored
+/// bytes can never succeed. The job framework's execution outcome today only
+/// distinguishes ordinary failures (retried until `max_attempts`) from panics
+/// (dead-lettered immediately); there is no per-error "non-retryable" signal a
+/// handler can raise. So a version-mismatch job currently burns its retry
+/// budget with backoff before dead-lettering with this (precise) error. Routing
+/// it straight to the dead-letter table would require a new `JobExecutionOutcome`
+/// variant threaded through all three backends' retry decisions — deferred as a
+/// follow-up rather than built here.
 #[derive(Debug)]
 pub struct JobPayloadVersionError {
     job_type: String,
@@ -239,11 +251,24 @@ impl std::fmt::Display for JobPayloadVersionError {
                 Ok(())
             }
             VersionErrorKind::DecodeFailed => {
-                write!(
-                    f,
-                    "job \"{job_type}\": stored payload version {stored_version} does not match the \
-                     current args shape for expected version {expected_version}"
-                )?;
+                // When the stored and expected versions match (the common
+                // un-versioned case, both 1), naming "expected version 1" —
+                // a version the user never declared — reads as noise, so drop
+                // that clause. The `ERROR_SENTINEL` prefix is preserved either
+                // way so `is_payload_version_error` still matches.
+                if stored_version == expected_version {
+                    write!(
+                        f,
+                        "job \"{job_type}\": stored payload version {stored_version} does not match \
+                         the current args shape"
+                    )?;
+                } else {
+                    write!(
+                        f,
+                        "job \"{job_type}\": stored payload version {stored_version} does not match \
+                         the current args shape for expected version {expected_version}"
+                    )?;
+                }
                 if let Some(source) = source {
                     write!(f, ": {source}")?;
                 }

@@ -2402,9 +2402,13 @@ impl JobClient {
         let res = if let Some(interceptor) = &self.interceptor {
             let interceptor = (*interceptor).clone();
             // `payload` is the tracked-envelope-wrapped value for a tracked
-            // job (see `enqueue_tracked_for`); app-registered interceptors
-            // must see the real args, matching what `intercept_execute` sees
-            // at run time, not the internal envelope.
+            // job (see `enqueue_tracked_for`); strip that internal envelope so
+            // app-registered interceptors see the payload as enqueued, matching
+            // what `intercept_execute` sees at run time. The schema-version
+            // envelope (issue #1205) is *not* stripped here: for a versioned
+            // job the interceptor observes `{__autumn_schema_version, args}`,
+            // and the built-in test recorder unwraps it via
+            // `payload_version::split_version` when comparing payloads.
             let (_, interceptor_payload) = crate::job_tracking::split_tracked_payload(&payload);
             run_enqueue_interceptor(
                 interceptor,

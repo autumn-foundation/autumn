@@ -164,7 +164,9 @@ fn upgrade_versioned_welcome(
     from: u32,
     mut value: Value,
 ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
-    if from == 1 && let Some(obj) = value.as_object_mut() {
+    if from == 1
+        && let Some(obj) = value.as_object_mut()
+    {
         obj.entry("greeting".to_string())
             .or_insert_with(|| json!("hi"));
     }
