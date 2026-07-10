@@ -1467,7 +1467,16 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 .map_err(::autumn_web::AutumnError::from)?;
                         for __row in __ids {
                             let __cid = __row.id;
-                            let __record = #table_ident::table.find(__cid) #sd_filter
+                            // #1369: reload the EXACT id the (parent-soft-gated)
+                            // selection returned — do NOT re-apply `#sd_filter`
+                            // (`deleted_at IS NULL`) here. On a hard parent delete
+                            // the selection intentionally includes already
+                            // soft-deleted children (their FK still references the
+                            // parent), so a live-only reload would return `None`,
+                            // skip the hard delete, and leave the row to FK-fail
+                            // the parent DELETE. The id set is authoritative for
+                            // the parent kind; the row is locked with `for_update`.
+                            let __record = #table_ident::table.find(__cid)
                                 .for_update()
                                 .first::<#model_name>(conn)
                                 .await
@@ -14326,6 +14335,28 @@ mod tests {
         assert!(
             destroy_arm.contains("diesel :: delete"),
             "destroy hard arm (parent hard-deleted) must issue a real DELETE even for a soft_delete child: {destroy_arm}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_dependent_destroy_reload_does_not_filter_deleted_at() {
+        // #1369 (second live-filter site): the per-ID reload that fetches each
+        // selected child must NOT re-apply `deleted_at IS NULL`. The id-selection
+        // is already parent-soft-gated, so on a HARD parent delete it returns
+        // already-soft-deleted children too; a live-only reload would return
+        // `None`, skip the hard delete, and leave the FK to fail the parent
+        // DELETE. Assert the reload goes straight `find(__cid).for_update()` with
+        // no intervening `deleted_at` filter, even for a soft_delete child.
+        let generated = repository_macro(
+            quote! { Comment, soft_delete, dependent(PgReplyRepository, fk = "comment_id", on_delete = destroy) },
+            quote! { pub trait CommentRepository {} },
+        )
+        .to_string();
+        let destroy_arm = dependent_destroy_arm(&generated);
+        assert!(
+            destroy_arm.contains("find (__cid) . for_update"),
+            "the per-ID reload must load the selected id straight to for_update, \
+             with no deleted_at filter that could drop a pre-soft-deleted child: {destroy_arm}"
         );
     }
 
