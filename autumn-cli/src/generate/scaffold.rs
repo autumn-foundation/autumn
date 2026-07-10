@@ -223,13 +223,21 @@ pub fn plan_scaffold_with_options(
         // `autumn new`). If it's missing, fail early with an actionable message
         // rather than emitting routes that reference a nonexistent layout.
         let main_for_layout_check = project_root.join("src").join("main.rs");
-        let main_src = std::fs::read_to_string(&main_for_layout_check).map_err(|_| {
-            GenerateError::Io(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                format!("missing {}", main_for_layout_check.display()),
-            ))
-        })?;
-        if !main_src.contains("pub fn layout") {
+        let main_src = match std::fs::read_to_string(&main_for_layout_check) {
+            Ok(src) => src,
+            // `main.rs` genuinely absent: surface the actionable message below by
+            // treating it as an empty source (no `pub fn layout` present).
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            // Any other io error (e.g. PermissionDenied) must preserve its
+            // original `ErrorKind` + OS message rather than being masked.
+            Err(e) => return Err(GenerateError::Io(e)),
+        };
+        // Match `layout` as a complete token so decoys like `pub fn layout_sidebar`
+        // or `pub fn layout_admin` do not satisfy the shared-layout requirement.
+        let is_shared_layout = main_src.contains("pub fn layout(")
+            || main_src.contains("pub fn layout<")
+            || main_src.contains("pub fn layout ");
+        if !is_shared_layout {
             return Err(GenerateError::Config(
                 "`autumn generate scaffold` requires a shared `pub fn layout` in src/main.rs \
                  so the generated views can render through `crate::layout`. Run this inside an \
@@ -4191,10 +4199,23 @@ async fn main() {
 
     #[test]
     fn plan_errors_when_main_rs_missing() {
+        // A genuinely absent `src/main.rs` (NotFound) surfaces the same
+        // actionable shared-layout Config error as a layout-less main.rs, rather
+        // than a raw Io "missing" error — it points the user at `autumn new` /
+        // `--api`. Non-NotFound io errors (e.g. PermissionDenied) still preserve
+        // their original `ErrorKind` via `GenerateError::Io`.
         let tmp = TempDir::new().unwrap();
         fs::write(tmp.path().join("Cargo.toml"), "").unwrap();
         let err = plan_scaffold(tmp.path(), "Post", &[], "20260427000000").unwrap_err();
-        assert!(matches!(err, GenerateError::Io(_)));
+        match err {
+            GenerateError::Config(msg) => {
+                assert!(
+                    msg.contains("pub fn layout") && msg.contains("autumn new"),
+                    "missing main.rs must yield the actionable shared-layout error: {msg}"
+                );
+            }
+            other => panic!("expected an actionable Config error, got: {other:?}"),
+        }
     }
 
     #[test]
@@ -5375,6 +5396,49 @@ async fn main() {
                 assert!(
                     msg.contains("pub fn layout") && msg.contains("autumn new"),
                     "error must be actionable about the missing shared layout: {msg}"
+                );
+            }
+            other => panic!("expected an actionable Config error, got: {other:?}"),
+        }
+    }
+
+    /// Issue #1130, AC 4: a decoy `pub fn layout_sidebar` (a name that merely
+    /// starts with `layout`) must NOT satisfy the shared-layout check — only a
+    /// real 4-arg `pub fn layout(...)` counts. Scaffolding against such an app
+    /// still fails with the actionable Config error.
+    #[test]
+    fn scaffold_with_decoy_layout_prefix_errors() {
+        let decoy_main = r#"use autumn_web::prelude::*;
+
+pub fn layout_sidebar(title: &str) -> maud::Markup {
+    maud::html! { title { (title) } }
+}
+
+#[get("/")]
+async fn index() -> &'static str { "ok" }
+
+#[autumn_web::main]
+async fn main() {
+    autumn_web::app()
+        .routes(routes![index])
+        .run()
+        .await;
+}
+"#;
+        let tmp = project_with_main(decoy_main);
+        let err = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &["title:String".into()],
+            "20260427000000",
+        )
+        .unwrap_err();
+        match err {
+            GenerateError::Config(msg) => {
+                assert!(
+                    msg.contains("pub fn layout") && msg.contains("autumn new"),
+                    "a `layout_sidebar` decoy must not satisfy the shared-layout \
+                     check; error must stay actionable: {msg}"
                 );
             }
             other => panic!("expected an actionable Config error, got: {other:?}"),
