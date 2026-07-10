@@ -158,9 +158,10 @@ impl Response {
 ///
 /// IPv6 addresses that embed an IPv4 via a transition mechanism — IPv4-mapped
 /// (`::ffff:a.b.c.d`), the deprecated IPv4-compatible (`::a.b.c.d`), NAT64
-/// (`64:ff9b::/96`), and 6to4 (`2002::/16`) — are unwrapped and re-checked as
-/// IPv4, so encodings such as `::ffff:169.254.169.254`,
-/// `64:ff9b::a9fe:a9fe`, and `2002:a9fe:a9fe::` are all correctly blocked.
+/// (`64:ff9b::/96`), 6to4 (`2002::/16`), and the SIIT IPv4-translated prefix
+/// (`::ffff:0:0:0/96`) — are unwrapped and re-checked as IPv4, so encodings
+/// such as `::ffff:169.254.169.254`, `64:ff9b::a9fe:a9fe`, `2002:a9fe:a9fe::`,
+/// and `::ffff:0:169.254.169.254` are all correctly blocked.
 #[must_use]
 pub fn is_blocked_ip(ip: IpAddr) -> bool {
     match ip {
@@ -246,12 +247,34 @@ fn is_blocked_ipv4(ip: Ipv4Addr) -> bool {
 ///   `64:ff9b::a9fe:a9fe` decodes to `169.254.169.254`
 /// - 6to4 `2002::/16` (RFC 3056) — e.g. `2002:a9fe:a9fe::` embeds
 ///   `169.254.169.254`
+/// - SIIT "IPv4-translated" prefix `::ffff:0:0:0/96` (RFC 6052) — e.g.
+///   `::ffff:0:169.254.169.254` decodes to `169.254.169.254`. Note this is a
+///   DIFFERENT segment layout from IPv4-mapped `::ffff:0:0/96` (here
+///   `segments()[4] == 0xffff && segments()[5] == 0`, whereas IPv4-mapped has
+///   `segments()[5] == 0xffff`), so it is NOT caught by `to_ipv4_mapped()`.
 ///
 /// Returns `None` for a genuinely-native IPv6 address (no embedded v4). Using
 /// `octets()` avoids any lossy `u16 -> u8` casts.
 fn embedded_ipv4(ip: Ipv6Addr) -> Option<Ipv4Addr> {
     if let Some(v4) = ip.to_ipv4_mapped() {
         return Some(v4);
+    }
+    let segs = ip.segments();
+    // SIIT IPv4-translated `::ffff:0:0:0/96` (RFC 6052): 64 zero bits, then
+    // 0xffff, then 16 zero bits, then the IPv4 in the last 32 bits. Distinct
+    // from IPv4-mapped `::ffff:0:0/96` (segment[5] == 0xffff) — here
+    // segment[4] == 0xffff and segment[5] == 0 — so `to_ipv4_mapped()` above
+    // does NOT catch it. Decode it so the embedded IPv4 is re-checked by the
+    // IPv4 policy (e.g. `::ffff:0:169.254.169.254` must be blocked).
+    if segs[0] == 0
+        && segs[1] == 0
+        && segs[2] == 0
+        && segs[3] == 0
+        && segs[4] == 0xffff
+        && segs[5] == 0
+    {
+        let o = ip.octets();
+        return Some(Ipv4Addr::new(o[12], o[13], o[14], o[15]));
     }
     let o = ip.octets();
     // NAT64 64:ff9b::/96 — embedded IPv4 in the last 32 bits (octets 12..16),
@@ -274,8 +297,9 @@ fn embedded_ipv4(ip: Ipv6Addr) -> Option<Ipv4Addr> {
 
 fn is_blocked_ipv6(ip: Ipv6Addr) -> bool {
     // Block any private / loopback / link-local / metadata IPv4 that is
-    // tunnelled inside this v6 address (IPv4-mapped, IPv4-compatible, NAT64, or
-    // 6to4) by re-running the IPv4 policy on the embedded address. A public
+    // tunnelled inside this v6 address (IPv4-mapped, IPv4-compatible, NAT64,
+    // 6to4, or SIIT IPv4-translated `::ffff:0:0:0/96`) by re-running the IPv4
+    // policy on the embedded address. A public
     // embedded IPv4 (e.g. 6to4 `2002:0808:0808::` == 8.8.8.8) is NOT blocked
     // here — it falls through to the native v6 range checks below.
     if let Some(v4) = embedded_ipv4(ip)
@@ -948,6 +972,14 @@ impl Client {
     /// Like the test-mock path, this custom send path bypasses the process-wide
     /// circuit-breaker registry to avoid entangling per-URL SSRF fetches with
     /// the shared per-host breaker state.
+    ///
+    /// **Env proxies are bypassed.** Each pinned per-hop client is built with
+    /// `.no_proxy()`, so `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` are ignored
+    /// and the socket connects directly to the validated/pinned address. This is
+    /// required for the pin to hold: reqwest checks proxy interception before the
+    /// connector where the `resolve()` override applies, so a configured proxy
+    /// would otherwise receive the request and re-resolve the host — reopening
+    /// the DNS-rebinding / SSRF window this API closes.
     #[must_use]
     pub fn get_ssrf_safe(&self, url: impl Into<String>) -> RequestBuilder {
         let mut builder = self.build_request(Method::GET, url.into());
@@ -1165,6 +1197,13 @@ impl RequestBuilder {
     /// does for addresses obtained by resolving that same URL). Routes the
     /// request through the custom one-shot-client send path, which bypasses the
     /// process-wide circuit breaker.
+    ///
+    /// **Env proxies are bypassed.** The pinned client is built with
+    /// `.no_proxy()`, so `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` are ignored
+    /// and the socket connects directly to `addr`. This is required for the pin
+    /// to hold: reqwest checks proxy interception before the connector where the
+    /// `resolve()` override applies, so a configured proxy would otherwise
+    /// receive the request and re-resolve the host — defeating the pin.
     #[must_use]
     pub const fn pin_to(mut self, addr: SocketAddr) -> Self {
         self.pin_addr = Some(addr);
@@ -1566,6 +1605,15 @@ const fn is_retryable_status(status: u16) -> bool {
 
 /// Build a one-shot `reqwest::Client` for the custom send path, with the given
 /// redirect policy, per-request timeout, and optional DNS `resolve` override.
+///
+/// **Proxy bypass on pinned clients.** When a `resolve` override is present the
+/// client is built with `.no_proxy()` so the request connects DIRECTLY to the
+/// validated/pinned address. reqwest evaluates proxy interception (from
+/// `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY`) BEFORE the connector where the
+/// `resolve()` override applies, so a configured env proxy would otherwise send
+/// the request to the proxy — which re-resolves the target host, reopening the
+/// exact DNS-rebinding / SSRF window that pinning closes. Non-pinned callers
+/// (`resolve == None`) keep reqwest's default proxy behaviour untouched.
 fn build_oneshot_client(
     resolve: Option<(String, SocketAddr)>,
     policy: reqwest::redirect::Policy,
@@ -1575,7 +1623,8 @@ fn build_oneshot_client(
         .timeout(timeout)
         .redirect(policy);
     if let Some((host, addr)) = resolve {
-        builder = builder.resolve(&host, addr);
+        // A pinned request must never route through a re-resolving proxy.
+        builder = builder.no_proxy().resolve(&host, addr);
     }
     builder.build().map_err(ClientError::Request)
 }
@@ -2868,6 +2917,11 @@ mod tests {
             "2002:a9fe:a9fe::",     // 6to4  → 169.254.169.254
             "2002:7f00:1::",        // 6to4  → 127.0.0.1
             "2002:0a00:0001::",     // 6to4  → 10.0.0.1
+            // SIIT IPv4-translated `::ffff:0:0:0/96` (RFC 6052): segment[4] ==
+            // 0xffff, segment[5] == 0, IPv4 in the last 32 bits. Distinct from
+            // IPv4-mapped `::ffff:0:0/96`, so must be decoded and re-checked.
+            "::ffff:0:169.254.169.254", // SIIT → 169.254.169.254 (cloud metadata)
+            "::ffff:0:127.0.0.1",       // SIIT → 127.0.0.1 (loopback)
         ];
         for s in blocked {
             let ip: IpAddr = s.parse().unwrap();
@@ -2882,7 +2936,10 @@ mod tests {
         // A 6to4 address embedding a genuinely-public IPv4 (8.8.8.8) stays
         // public (the embedded v4 is public, so it falls through to the native
         // v6 checks, which do not match 2002::/16). So does a native public v6.
-        for s in ["2002:0808:0808::", "2606:4700::1111"] {
+        // A SIIT IPv4-translated address embedding a genuinely-public IPv4
+        // (8.8.8.8) stays public — the decoded v4 is public, so it falls
+        // through to the native v6 checks, which do not match it.
+        for s in ["2002:0808:0808::", "2606:4700::1111", "::ffff:0:8.8.8.8"] {
             let ip: IpAddr = s.parse().unwrap();
             assert!(is_public_ip(ip), "{s} should be public");
             assert!(!is_blocked_ip(ip), "{s} should not be blocked");
