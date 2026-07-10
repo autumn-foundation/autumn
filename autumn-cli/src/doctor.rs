@@ -1219,7 +1219,7 @@ fn check_pg_client_tools_impl(missing: &[&str]) -> CheckResult {
         CheckResult {
             name: "pg_client_tools",
             status: CheckStatus::Pass,
-            detail: Some("pg_dump and pg_restore found on PATH".into()),
+            detail: Some("pg_dump and pg_restore found".into()),
             hint: None,
         }
     } else {
@@ -1227,7 +1227,7 @@ fn check_pg_client_tools_impl(missing: &[&str]) -> CheckResult {
             name: "pg_client_tools",
             status: CheckStatus::Warn,
             detail: Some(format!(
-                "{} not found on PATH; `autumn db backup` / `autumn db restore` need it",
+                "{} not found (checked AUTUMN_PG_BIN_DIR, the managed-Postgres bundle, and PATH); `autumn db backup` / `autumn db restore` need it",
                 missing.join(", ")
             )),
             hint: Some(
@@ -1242,20 +1242,21 @@ fn check_pg_client_tools_impl(missing: &[&str]) -> CheckResult {
 /// [`check_pending_migrations`]: a soft warning (managed-Postgres apps bundle
 /// these and not every project runs backups), never a hard failure.
 fn check_pg_client_tools() -> CheckResult {
-    let missing: Vec<&str> = ["pg_dump", "pg_restore"]
-        .into_iter()
-        .filter(|tool| !pg_tool_on_path(tool))
-        .collect();
-    check_pg_client_tools_impl(&missing)
+    // Reuse `db backup`/`restore`'s own locator so doctor honours the exact same
+    // precedence (`AUTUMN_PG_BIN_DIR`, then the managed-Postgres bundle, then
+    // PATH) and never drifts from what those commands actually resolve.
+    check_pg_client_tools_with(&crate::db::backup::PgTools::locate())
 }
 
-/// Whether a pg client tool resolves on PATH (probed via `--version`).
-fn pg_tool_on_path(tool: &str) -> bool {
-    std::process::Command::new(tool)
-        .arg("--version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+/// Compute the pg-client-tools check result for a given (already-configured)
+/// locator. Split from [`check_pg_client_tools`] so the discovery/resolution
+/// path is unit-testable against an explicit `bin` directory.
+fn check_pg_client_tools_with(tools: &crate::db::backup::PgTools) -> CheckResult {
+    let missing: Vec<&str> = ["pg_dump", "pg_restore"]
+        .into_iter()
+        .filter(|tool| tools.require(tool).is_err())
+        .collect();
+    check_pg_client_tools_impl(&missing)
 }
 
 /// Read the `rust-version` MSRV from the nearest workspace/package `Cargo.toml`.
@@ -3579,6 +3580,30 @@ mod tests {
         assert!(detail.contains("pg_dump"));
         assert!(detail.contains("pg_restore"));
         assert!(r.hint.unwrap().contains("AUTUMN_PG_BIN_DIR"));
+    }
+
+    /// Regression: doctor must honour the same tool-discovery precedence as
+    /// `db backup`/`restore`. When the tools are reachable via a candidate `bin`
+    /// directory (e.g. `AUTUMN_PG_BIN_DIR` or the managed-pg bundle) rather than
+    /// PATH, `check_pg_client_tools` must not raise a false warning. Exercised
+    /// through `db backup`'s own locator so doctor and backup can't drift.
+    #[test]
+    fn pg_client_tools_pass_when_found_via_bin_dir() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let bin = temp.path();
+        for tool in ["pg_dump", "pg_restore"] {
+            let name = if cfg!(windows) {
+                format!("{tool}.exe")
+            } else {
+                tool.to_owned()
+            };
+            std::fs::write(bin.join(name), b"").expect("write fake tool");
+        }
+
+        let tools = crate::db::backup::PgTools::with_dirs(vec![bin.to_path_buf()]);
+        let r = check_pg_client_tools_with(&tools);
+        assert_eq!(r.status, CheckStatus::Pass);
+        assert!(r.hint.is_none());
     }
 
     #[test]

@@ -467,9 +467,36 @@ fn verify_custom_archive(pg_restore: &Path, path: &Path, db: &str) -> Result<(),
 /// Integrity check for a plain SQL dump: it must end with `pg_dump`'s completion
 /// marker, which is only written once the dump finished cleanly.
 fn verify_plain_dump(path: &Path, db: &str) -> Result<(), BackupError> {
-    let contents = std::fs::read_to_string(path)
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut file =
+        std::fs::File::open(path).map_err(BackupError::io(format!("open {}", path.display())))?;
+    let len = file
+        .metadata()
+        .map_err(BackupError::io(format!("stat {}", path.display())))?
+        .len();
+
+    // A 0-byte dump can't contain the completion marker: it's truncated/incomplete.
+    if len == 0 {
+        return Err(BackupError::IntegrityFailed {
+            detail: format!("the {db:?} SQL dump is empty (likely truncated)"),
+        });
+    }
+
+    // The completion marker is on the final line, so only the dump's tail needs to
+    // be read — avoid loading a potentially multi-GB dump into memory. Read the
+    // last ~1 KiB (clamped to the file size for tiny files).
+    let read_len = len.min(1024);
+    let offset = -i64::try_from(read_len).expect("read_len is at most 1024");
+    file.seek(SeekFrom::End(offset))
+        .map_err(BackupError::io(format!("seek {}", path.display())))?;
+    let mut tail = Vec::with_capacity(read_len as usize);
+    file.take(read_len)
+        .read_to_end(&mut tail)
         .map_err(BackupError::io(format!("read {}", path.display())))?;
-    if plain_dump_is_complete(&contents) {
+    let tail = String::from_utf8_lossy(&tail);
+
+    if plain_dump_is_complete(&tail) {
         Ok(())
     } else {
         Err(BackupError::IntegrityFailed {
@@ -861,7 +888,7 @@ fn plan_pruning(sorted_runs: &[String], keep: usize) -> Vec<String> {
 /// Resolves Postgres client executables (`pg_dump`, `pg_restore`, `psql`)
 /// from an ordered list of candidate `bin` directories, falling back to the
 /// bare command name (PATH lookup).
-struct PgTools {
+pub struct PgTools {
     /// Candidate `bin` directories, highest priority first.
     dirs: Vec<PathBuf>,
 }
@@ -869,13 +896,21 @@ struct PgTools {
 impl PgTools {
     /// Build the locator from the environment: `AUTUMN_PG_BIN_DIR`, then the
     /// managed-Postgres bundle's `bin` dir, then PATH.
-    fn locate() -> Self {
+    pub fn locate() -> Self {
         Self {
             dirs: candidate_bin_dirs(
                 std::env::var_os(PG_BIN_DIR_ENV).map(PathBuf::from),
                 std::env::var_os(MANAGED_PG_DATA_DIR_ENV).map(PathBuf::from),
             ),
         }
+    }
+
+    /// Build a locator over an explicit list of candidate `bin` directories.
+    /// Test-only seam so callers (e.g. the `doctor` check) can exercise the
+    /// discovery/resolution path without mutating the process environment.
+    #[cfg(test)]
+    pub const fn with_dirs(dirs: Vec<PathBuf>) -> Self {
+        Self { dirs }
     }
 
     /// Resolve a tool to a concrete path (a candidate dir that contains it) or
@@ -886,7 +921,7 @@ impl PgTools {
 
     /// Like [`Self::resolve`] but fails fast with [`BackupError::ToolMissing`]
     /// when the tool is neither in a candidate dir nor on PATH.
-    fn require(&self, tool: &str) -> Result<PathBuf, BackupError> {
+    pub fn require(&self, tool: &str) -> Result<PathBuf, BackupError> {
         let resolved = self.resolve(tool);
         // If we resolved to a concrete existing path, use it. Otherwise probe
         // PATH by attempting `--version`; only then decide it's missing.
@@ -1061,7 +1096,10 @@ fn sanitize_component(s: &str) -> String {
             }
         })
         .collect();
-    if cleaned.is_empty() {
+    // Reject components that would resolve to the current/parent directory (or
+    // nothing at all): joining `"."`/`".."`/`""` onto the backup root enables
+    // directory traversal out of it.
+    if cleaned.is_empty() || cleaned == "." || cleaned == ".." {
         "unnamed".to_owned()
     } else {
         cleaned
@@ -1177,6 +1215,17 @@ mod tests {
         assert_eq!(sanitize_component("a/b:c"), "a_b_c");
         assert_eq!(sanitize_component(""), "unnamed");
         assert_eq!(sanitize_component("../etc"), ".._etc");
+    }
+
+    #[test]
+    fn sanitize_component_rejects_traversal_components() {
+        // A normal name is untouched...
+        assert_eq!(sanitize_component("shard1"), "shard1");
+        // ...but bare `.`, `..`, and empty (which would join to the current or
+        // parent directory, escaping the backup root) fall back to "unnamed".
+        assert_eq!(sanitize_component("."), "unnamed");
+        assert_eq!(sanitize_component(".."), "unnamed");
+        assert_eq!(sanitize_component(""), "unnamed");
     }
 
     #[test]
@@ -1358,6 +1407,43 @@ mod tests {
             "CREATE TABLE x();\n--\n-- PostgreSQL database dump complete\n--\n"
         ));
         assert!(!plain_dump_is_complete("CREATE TABLE x();\n-- truncated"));
+    }
+
+    #[test]
+    fn verify_plain_dump_reads_only_tail() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        // A complete dump whose body is far larger than the 1 KiB tail window
+        // still verifies — the marker is on the final line and only the tail is
+        // read.
+        let complete = tmp.path().join("complete.sql");
+        let mut body = "CREATE TABLE x();\n".repeat(4096);
+        body.push_str("--\n-- PostgreSQL database dump complete\n--\n");
+        std::fs::write(&complete, &body).unwrap();
+        assert!(verify_plain_dump(&complete, "db").is_ok());
+
+        // A dump missing the marker is flagged as an integrity failure, even
+        // when the body far exceeds the tail window.
+        let truncated = tmp.path().join("truncated.sql");
+        std::fs::write(&truncated, "CREATE TABLE x();\n".repeat(4096)).unwrap();
+        assert!(matches!(
+            verify_plain_dump(&truncated, "db"),
+            Err(BackupError::IntegrityFailed { .. })
+        ));
+
+        // A tiny (sub-1 KiB) complete dump verifies: the read window clamps to
+        // the file size instead of seeking before the start.
+        let tiny = tmp.path().join("tiny.sql");
+        std::fs::write(&tiny, "-- PostgreSQL database dump complete\n").unwrap();
+        assert!(verify_plain_dump(&tiny, "db").is_ok());
+
+        // A 0-byte dump can't hold the marker: truncated/incomplete.
+        let empty = tmp.path().join("empty.sql");
+        std::fs::write(&empty, b"").unwrap();
+        assert!(matches!(
+            verify_plain_dump(&empty, "db"),
+            Err(BackupError::IntegrityFailed { .. })
+        ));
     }
 
     #[test]
