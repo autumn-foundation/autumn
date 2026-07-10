@@ -10602,7 +10602,6 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         };
         let update_body = if has_policy {
             quote! {
-                #validate_patch_idempotency
                 let __existing = match repo.on_primary().find_by_id(id).await {
                     ::core::result::Result::Ok(::core::option::Option::Some(existing)) => existing,
                     ::core::result::Result::Ok(::core::option::Option::None) => {
@@ -10630,6 +10629,14 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         ::core::result::Result::Err(err)
                     );
                 }
+                // #1719 follow-up (Codex P2): validate the patch only after the
+                // existence load (404) and the `__check_policy_scoped` gate
+                // (403), so a policy-gated PUT/PATCH with an invalid body still
+                // reports missing/unauthorized before unprocessable. Validation
+                // is a pure check on the already-decoded `patch` and, like the
+                // policy gate above, sits before the pure `__replay_response`
+                // read, so it cannot affect idempotency replay semantics.
+                #validate_patch_idempotency
                 if let ::core::option::Option::Some(response) =
                     ::autumn_web::idempotency::__replay_response(&__autumn_idempotency_replay)
                 {
@@ -13899,6 +13906,41 @@ mod tests {
         assert!(
             section.contains("MaybeValidate (& patch)"),
             "update handler must validate the patch payload: {section}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_api_policy_update_validates_after_policy_check() {
+        // #1719 follow-up: on the policy-backed update handler, payload
+        // validation (422) must run *after* the existence load (404) and the
+        // `__check_policy_scoped` authorization gate (403), so a policy-gated
+        // PUT/PATCH with an invalid body still returns 404/403 before 422.
+        // Validation-first here regressed the ordering (Codex P2).
+        let generated = repository_macro(
+            quote! { Post, api = "/api/posts", policy = PostPolicy },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        let start = generated
+            .find("async fn post_api_update")
+            .expect("policy update handler must be generated");
+        let rest = &generated[start..];
+        let end = rest
+            .find("fn __autumn_route_info_post_api_update")
+            .unwrap_or(rest.len());
+        let section = &rest[..end];
+
+        let policy_at = section
+            .find("__check_policy_scoped")
+            .expect("policy update handler must run the scoped policy check");
+        let validate_at = section
+            .find("autumn_maybe_validate")
+            .expect("policy update handler must validate the patch payload");
+        assert!(
+            policy_at < validate_at,
+            "policy check (403) and existence load (404) must run before \
+             patch validation (422): {section}"
         );
     }
 
