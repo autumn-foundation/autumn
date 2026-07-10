@@ -1038,6 +1038,89 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bodies (computed once per process, not per request) when the client's
   `Accept-Encoding` accepts them, instead of relying solely on the
   general-purpose compression middleware to redo that work on every request.
+- **cli:** `autumn test` provisions and targets an isolated test database before
+  running your suite — it resolves the test DB URL with the same precedence as
+  `autumn migrate` (autumn.toml → `AUTUMN_DATABASE__*` → `DATABASE_URL`), derives
+  a `_test`-suffixed database name, creates it if missing, runs all pending app +
+  framework migrations, exports `AUTUMN_ENV=test` and the resolved
+  `DATABASE_URL`, then shells out to `cargo test` (exiting with its code).
+  `--reset` drops and recreates the test DB first, and trailing `-- <args>` are
+  forwarded to the harness (`autumn test -- --nocapture`). Refuses to run against
+  a non-`_test` database (issue #1056).
+- **test:** `TestResponse::query_count()` and
+  `TestResponse::assert_max_queries(n)` turn the `Server-Timing` query counter
+  into a test assertion, so you can pin a route's SQL budget and catch N+1
+  regressions — chained after a request, `assert_max_queries` panics naming the
+  route when the observed count exceeds `n` (issue #1262).
+- **widgets:** server-rendered, accessible, zero-JavaScript SVG chart helpers in
+  `autumn_web::widgets` (all prelude re-exported, with `/_stories` gallery
+  entries) — `sparkline`, `bar_chart` (bars anchored at zero), and `line_chart`,
+  each with a `_with` variant taking a `ChartConfig` builder (`.title(...)`,
+  `.min(...)`/`.max(...)` axis override, accessible name) (issue #1231).
+- **jobs:** opt-in versioned job payloads with an upgrade path — annotate a
+  handler with `#[job(version = N, upgrade = ...)]` to wrap its args in an
+  `{ "__autumn_schema_version": N, "args": … }` envelope, and the `upgrade` hook
+  (`fn(u32, Value) -> Result<Value, E>`) migrates older stored payloads on the
+  fly so rolling deploys drain the old queue instead of dead-lettering. Jobs with
+  no version are stored raw (zero behaviour change); runtime helpers live in
+  `autumn_web::payload_version` (issue #1205).
+- **repository:** `#[repository(...)]` associations can now declare a
+  `dependent(ChildRepository, fk = "col", on_delete = …)` cascade, so deleting a
+  parent handles its children in one transaction —
+  `on_delete = destroy` (soft-delete-aware, fires child hooks) `| delete_all |
+  nullify | restrict` (probes for referencing rows before mutating and errors if
+  any still exist) (issue #1369).
+- **audit:** version/audit writes are auto-attributed to the current actor. A new
+  `autumn_web::current` module carries a request-scoped actor
+  (`Current::set_actor` / `Current::actor`, plus `Current::set_default_actor` for
+  jobs and the scheduler); `VersionEntry.actor` now records the authenticated
+  user with no per-call plumbing, and stays `None` when unset (issue #1383).
+- **auth:** configurable password policy and persistent "remember me" login, both
+  scaffolded automatically by `autumn generate auth`. `[auth.password]`
+  (`min_length`, `reject_common` against a bundled weak-password corpus,
+  `breach_check` = `off` | `fail_open` | `fail_closed` HIBP lookups) is enforced
+  via `autumn_web::auth::PasswordConfig`/`PasswordPolicy`; `[auth.remember]`
+  (`enabled`, `duration_secs`, `cookie_name`) issues selector/verifier remember
+  cookies backed by a `{user}_remember_tokens` table (issues #1345, #1397).
+- **api:** generated `#[repository(api = ...)]` JSON list endpoints now return a
+  page envelope — `content`, `page`, `size`, `total_elements`, `total_pages`,
+  `has_next`, `has_previous` — driven by `?page=`/`?size=` query params, and
+  create/update handlers validate the decoded payload against the model's
+  `#[validate(...)]` rules before hitting the database, returning **422 Problem
+  Details** with a per-field `errors` map. Payloads without `Validate` compile to
+  a no-op via the autoref `MaybeValidate` specialization (issues #1237, #1253).
+- **cli:** first-class `autumn db backup` and `autumn db restore` with retention.
+  `db backup [--dir DIR] [--format custom|plain] [--keep N] [--shard NAME]
+  [--control-only]` dumps the control DB and every shard into
+  `<dir>/<profile>/<timestamp>/` with a `manifest.json`, integrity-checks each
+  artifact with `pg_restore --list` before reporting success, and `--keep N`
+  prunes to the newest N runs. `db restore <ARTIFACT> [--shard NAME] [--force]`
+  verifies every artifact before touching a database and is gated by the same
+  production guard as `db drop` (issue #1595).
+- **security:** multipart uploads are validated by magic bytes rather than the
+  spoofable client `Content-Type` — the extractor sniffs the real content type
+  whenever an `allowed_content_types` allow-list is configured or strict mode is
+  on. Set `security.upload.reject_on_content_type_mismatch = true` to reject a
+  declared-vs-sniffed mismatch (or an unsniffable declared-binary upload) as a
+  spoof (issue #1354).
+- **app:** web/worker process roles for independent scaling — a process `role`
+  (`combined` | `web` | `worker`), set via `role = "…"` in config or the
+  `AUTUMN_ROLE` env var, selects whether it serves HTTP, runs job workers + the
+  cron scheduler, or both (`combined`, the default, is unchanged; `web` can still
+  enqueue jobs). Run with `autumn serve --role web|worker|combined`, and
+  `release init --split-workers` splices a dedicated `worker:` service into the
+  generated docker-compose output. A split (non-combined) role requires a
+  `postgres`/`redis` jobs backend, since an in-memory queue can't cross processes
+  (issue #1613).
+- **test:** fake-data factories for models plus bulk seed generation. A new
+  `autumn_web::fake` module exposes deterministic fake generators (`name`,
+  `email`, `sentence`, `int_range`, `uuid`, … seeded via `AUTUMN_FAKE_SEED` or
+  `reseed`), and `#[model]` now generates a `{Model}Factory` with per-field
+  setters, `.fake()`/`.fake_all()` to fill unset fields with realistic data
+  inferred from field name + type, and `.build`/`.build_many`/`.create`/
+  `.create_many`. `autumn seed --count N --model <Name>` (used together)
+  generates and inserts N faked rows via the model's factory instead of running
+  the hand-written seed body (issue #1343).
 
 ### Fixed
 
@@ -1185,6 +1268,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **workspace:** `Cargo.lock` is now committed to the repository (it was
   previously gitignored) so builds are reproducible and dependency updates
   are reviewable.
+- **dev:** `autumn dev` now renders a full-screen browser overlay carrying the
+  compiler diagnostics when a rebuild fails, instead of leaving a blank or stale
+  page — injected under the strict nonce-based CSP and cleared on the next
+  successful rebuild (issue #1115).
 
 ### Fixed
 

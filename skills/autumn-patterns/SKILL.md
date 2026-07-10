@@ -60,6 +60,37 @@ async fn create_post_returns_redirect() {
 Always use `TestApp` in tests — never spin up a real server or hit a live
 database in unit tests.
 
+### Assert a route's query budget — catch N+1 (trunk-dev)
+
+Pin the SQL a route is allowed to run so an accidental N+1 fails the test:
+
+```rust
+client.get("/posts").send().await
+    .assert_status(200)
+    .assert_max_queries(3);   // panics naming the route if the count exceeds 3
+```
+
+`TestResponse::query_count()` returns the observed count (from the
+`Server-Timing` query counter); `assert_max_queries(n)` chains and returns
+`&Self` (issue #1262).
+
+### Fake-data factories and bulk seeding (trunk-dev)
+
+Don't hand-build model fixtures. `#[model]` generates a `{Model}Factory`; fill
+the rest with realistic fake data inferred from each field's name + type:
+
+```rust
+let post = Post::factory().title("Fixed").fake().build();  // NewPost, unset fields faked
+let posts = Post::factory().fake().build_many(10);         // Vec<NewPost>, each row re-drawn
+let saved = Post::factory().fake().create(&mut db).await?; // persist
+```
+
+Generators live in `autumn_web::fake` (`name`, `email`, `sentence`,
+`int_range`, `uuid`, …); seed deterministically with `AUTUMN_FAKE_SEED` or
+`autumn_web::fake::reseed(seed)`. For bulk data outside tests,
+`autumn seed --count N --model <Name>` (both flags together) inserts N faked rows
+via the model's factory (issue #1343). See `docs/guide/seeding.md`.
+
 ## Repository design
 
 Prefer free functions over a repository struct unless `#[repository]` is

@@ -356,6 +356,24 @@ See `examples/reddit-clone` (`Post` ↔ `Tag` via `post_tags`) for a full
 worked example, and `docs/adr/0008-associations-and-eager-loading.md` for
 the design.
 
+Deleting a parent can cascade to its children in one transaction — declare
+`dependent(...)` on the parent's `#[repository]` instead of hand-writing the
+child cleanup **(unreleased — trunk-dev)**:
+
+```rust
+#[autumn_web::repository(Post,
+    dependent(CommentRepository, fk = "post_id", on_delete = destroy))]
+pub trait PostRepository {}
+```
+
+`on_delete` = `destroy` (soft-delete-aware, fires each child's hooks — does
+**not** recurse into the child's own `dependent`) | `delete_all` (bulk delete,
+no child hooks) | `nullify` (set the FK null) | `restrict` (probe for
+referencing rows *before* mutating; errors `cannot delete: dependent N row(s) …`
+if any still exist). The generated `delete_by_id` loads and locks the parent,
+applies every declared action, then deletes the parent — all in a single
+transaction (Part of #1369). See `docs/guide/repositories.md`.
+
 ### Model state machines — `#[state_machine]`
 
 **Never hand-roll status-transition validation.** Declare valid transitions on
@@ -440,6 +458,22 @@ Read routing: with `database.replica_url` set, all generated reads use the
 replica automatically; writes always hit the primary. See
 `docs/guide/repositories.md` and `docs/guide/pagination.md`.
 
+### JSON API endpoints — page envelope + write validation (unreleased — trunk-dev)
+
+A `#[repository(api = "/api/posts")]` list endpoint returns a page envelope, and
+create/update handlers validate the decoded payload before touching the DB:
+
+- **List** — `GET /api/posts?page=1&size=20` returns
+  `{ content: [...], page, size, total_elements, total_pages, has_next,
+  has_previous }` (`page` is 1-based, default 1; `size` clamped). Custom
+  handlers can use `filter.page()` / `filter.per_page()` / `filter.limit_offset()`.
+- **Create/update** — the decoded write payload runs the model's
+  `#[validate(...)]` rules first; on failure the handler returns **422 Problem
+  Details** with a per-field `errors` map instead of inserting. Models without a
+  `Validate` derive compile to a no-op via the autoref `MaybeValidate`
+  specialization (no migration burden), and this applies to plain and
+  policy-backed handlers (#1237, #1253). See `docs/guide/pagination.md`.
+
 ### Transactions
 
 `Db::tx(f)` runs a READ COMMITTED transaction. On trunk-dev
@@ -518,6 +552,25 @@ export AUTUMN_SECURITY__SIGNING_SECRET="$(openssl rand -hex 32)"
 
 For rotation, set `[security.signing_secret].previous_secrets` until old
 cookies, CSRF tokens, flash state, and signed storage URLs expire.
+
+### Audit actor attribution (unreleased — trunk-dev)
+
+Version/audit writes are auto-attributed to the current actor — no per-call
+plumbing. The log-context middleware opens an empty actor scope per request; set
+the authenticated user once and every `VersionEntry.actor` (via
+`MutationContext::actor`) records it:
+
+```rust
+use autumn_web::current::Current;
+
+Current::set_actor(format!("user:{user_id}")); // ambient, task-local, request-scoped
+// any repository mutation in this request now records this actor on its VersionEntry
+```
+
+For jobs and the scheduler (no request scope), set a process-wide default with
+`Current::set_default_actor(...)`, or run a bounded scope via
+`autumn_web::current::with_actor(actor, async { ... })`. Unset → `actor` is
+`None` (prior behaviour) (#1383). See `docs/guide/version-history.md`.
 
 ## OAuth2/OIDC scaffolding
 
@@ -730,6 +783,14 @@ coalesced enqueue is a no-op `Ok(())`.
   `set_result(json)` / `set_user_error(msg)`; poll `GET /_autumn/jobs/{token}`
   (JSON or self-polling htmx fragment). Config: `jobs.tracking.ttl_secs`
   (default 24h), `jobs.tracking.route_enabled`.
+- **Versioned payloads**: opt into a payload schema version with
+  `#[job(version = N, upgrade = upgrade_fn)]`. Autumn wraps the args in an
+  `{ "__autumn_schema_version": N, "args": … }` envelope; the `upgrade` hook
+  (`fn(u32, serde_json::Value) -> Result<Value, E>`) runs only for older stored
+  payloads, so a rolling deploy drains the old queue instead of dead-lettering.
+  A job with no `version` is stored raw (zero behaviour change). Helpers:
+  `autumn_web::payload_version::{split_version, wrap}` (Closes #1205). See
+  `docs/guide/jobs.md`.
 
 **(unreleased)** Events & listeners — a typed domain event bus so one action
 can fan out without inline coupling: `#[event]` on a struct, publish via the
@@ -809,6 +870,20 @@ serve-stale; `cache::jittered_ttl(base, fraction)` de-synchronizes mass
 expiry. A failed fill never poisons the key. See
 `docs/guide/cache-stampede.md`.
 
+**(unreleased)** Upload content-type validation — multipart uploads are
+validated by **magic bytes**, not the spoofable client `Content-Type`. The
+`Multipart` extractor sniffs the real type (`sniff_content_type`) whenever an
+`allowed_content_types` allow-list is configured or strict mode is on. Reject
+spoofs with:
+
+```toml
+[security.upload]
+reject_on_content_type_mismatch = true  # declared-vs-sniffed mismatch (or an
+                                        # unsniffable declared-binary) → rejected
+```
+
+(env `AUTUMN_SECURITY__UPLOAD__REJECT_ON_CONTENT_TYPE_MISMATCH`) (#1354).
+
 ## View helpers and widgets (unreleased — trunk-dev, not in published 0.5.0)
 
 Trunk-dev ships framework view widgets — prefer these over hand-rolled Maud
@@ -819,6 +894,7 @@ for the common cases:
 | `link_to(label, href)` / `link_to_with(..., &LinkToOptions)` | Escaped GET anchors; auto `rel="noopener"` on `target="_blank"` |
 | `button_to(label, href, Method, csrf_token)` / `button_to_with` | Single-button form for state-changing actions; CSRF is a required arg; non-GET emits hidden `_method` override |
 | `card(&body, &CardConfig::new().title("..."))` / `stat_card(label, value, link)` | Titled panels and metric tiles (`autumn_web::widgets`, prelude re-export) |
+| `sparkline(&points)` / `bar_chart(&series)` / `line_chart(&series)` (+ `_with(&ChartConfig)`) | Server-rendered, accessible, zero-JS **SVG charts** from `&[(&str, f64)]` (`/_stories` gallery). `bar_chart` anchors bars at zero; `ChartConfig::new().title(...).min(...).max(...)` sets an axis override / accessible name (#1231) |
 | `tabs(id, &[(id, label, markup)])` | No-JS CSS-only tab switcher (`docs/guide/tabs.md`) |
 | `modal(id, title, &body, &ModalConfig)` / `confirm_action(...)` | Native `<dialog>` confirm for destructive actions — replaces `hx-confirm`/`window.confirm()` |
 | `badge(label, BadgeVariant::for_label(status))` / `status_tag(label)` | Semantic status pill; `BadgeVariant` = `Neutral`/`Info`/`Success`/`Warning`/`Danger`, `for_label` picks a deterministic color; `badge_with`/`BadgeConfig` set `title`/`aria-label`. Composes inside a `data_table` cell |
@@ -979,6 +1055,25 @@ Use `AUTUMN_SECTION__FIELD` for env overrides, for example
 `AUTUMN_DATABASE__PRIMARY_URL`, `AUTUMN_JOBS__BACKEND`,
 `AUTUMN_SECURITY__SIGNING_SECRET`, and
 `AUTUMN_SECURITY__WEBHOOKS__REPLAY__BACKEND`.
+
+### Process roles — web/worker split (unreleased — trunk-dev)
+
+Scale HTTP and background work independently by giving a process a **role** (no
+app-code change) via `role = "web"|"worker"|"combined"` in config or the
+`AUTUMN_ROLE` env var:
+
+| Role | Serves HTTP | Runs workers + scheduler |
+|---|---|---|
+| `combined` (default) | yes | yes — unchanged behaviour |
+| `web` | yes (can still enqueue jobs) | no |
+| `worker` | no (probe-only router) | yes |
+
+- Run a specific tier: `autumn serve --role web|worker|combined`.
+- A split (non-`combined`) role **requires a `postgres`/`redis` jobs backend** —
+  an in-memory queue can't cross processes.
+- `release init --split-workers` splices a dedicated `worker:` service into the
+  generated **docker-compose** output and sets the web-tier role on the `app`
+  service (#1613). See `docs/guide/cloud-native.md`.
 
 ## Observability defaults
 
@@ -1210,6 +1305,11 @@ autumn generate tauri            # desktop sidecar project (cargo tauri build)
 autumn generate plugin my-plugin # installable/conformant plugin crate
 autumn token issue service:ci --name ci --scope posts:write   # scoped tokens; also list, rotate
 autumn i18n check                # compare t!/t(...) keys vs i18n/*.ftl; --strict, --format json
+autumn test                      # provision/target an isolated *_test DB, migrate, then cargo test
+autumn test --reset -- --nocapture   # drop+recreate the test DB; forward args to the harness
+autumn db backup --keep 7        # dump control DB + shards to ./backups/<profile>/<ts>/; db restore <artifact> reverses it
+autumn seed --count 50 --model Post  # generate+insert 50 faked rows via the model's factory (both flags together)
+autumn serve --role worker       # run only workers + scheduler (web/worker split); also --role web|combined
 ```
 
 `autumn i18n check` scans `**/*.rs` for string-literal keys passed to
@@ -1271,6 +1371,28 @@ applied migration's state as `ok`, `changed`, or `unrecorded`. Use
 legacy migrations applied before the checksum feature existed; use
 `autumn migrate baseline --force <version>` only when a deliberate edit
 is intended and the fork risk is accepted.
+
+### `autumn test` — isolated test DB (unreleased — trunk-dev, issue #1056)
+
+`autumn test` resolves the test DB URL with the same precedence as
+`autumn migrate` (autumn.toml → `AUTUMN_DATABASE__*` → `DATABASE_URL`), derives a
+`_test`-suffixed name, creates it if missing, runs all pending app + framework
+migrations, exports `AUTUMN_ENV=test` + the resolved `DATABASE_URL`, then runs
+`cargo test` (exiting with its code). `--reset` drops and recreates the test DB
+first; trailing `-- <args>` forward to the harness. It refuses to run against a
+non-`_test` database.
+
+### `autumn db backup` / `db restore` (unreleased — trunk-dev, issue #1595)
+
+`autumn db backup [--dir DIR] [--format custom|plain] [--keep N] [--shard NAME]
+[--control-only]` dumps the control DB and every shard to
+`<dir>/<profile>/<timestamp>/` (default `./backups`) with a `manifest.json`,
+integrity-checks each artifact with `pg_restore --list` before reporting success
+(a partial artifact is removed and the command exits non-zero), and `--keep N`
+prunes to the newest N runs. `autumn db restore <ARTIFACT> [--shard NAME]
+[--force]` verifies every artifact before touching a database and is gated by the
+same production guard as `db drop` (refuses non-dev/test without `--force`). See
+`docs/guide/deployment.md`.
 
 `autumn destroy` mirrors `autumn generate` argument-for-argument and never
 touches a database — it only reverses generated files/migrations.
