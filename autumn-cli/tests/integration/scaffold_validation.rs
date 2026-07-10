@@ -269,6 +269,47 @@ fn text_columns_render_constrained_textarea_not_input() {
     );
 }
 
+/// A `Text{email}` / `Text{url}` field is type-dependent and inherently
+/// single-line: a `<textarea>` can't carry `type="email"`/`type="url"`, so the
+/// standard `form_for` path must render an `<input type="email|url">` (not a
+/// textarea) or the DSL/doc-promised client-side format validation is lost.
+#[test]
+fn text_email_and_url_render_typed_input_not_textarea() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    run_autumn_ok(tmp.path(), &["new", "validate-text-email-app"]);
+    let project = tmp.path().join("validate-text-email-app");
+    run_autumn_ok(
+        &project,
+        &[
+            "generate",
+            "scaffold",
+            "Contact",
+            "email_addr:Text{email}",
+            "site:Text{url}",
+        ],
+    );
+    let routes = fs::read_to_string(project.join("src/routes/contacts.rs")).unwrap();
+
+    assert!(
+        routes.contains("type=\"email\" id=\"email_addr\""),
+        "a Text{{email}} field must render a typed email input:\n{routes}"
+    );
+    assert!(
+        routes.contains("type=\"url\" id=\"site\""),
+        "a Text{{url}} field must render a typed url input:\n{routes}"
+    );
+    // Neither may be a <textarea> (which can't carry type=email/url).
+    assert!(
+        !routes.contains("textarea id=\"email_addr\"") && !routes.contains("textarea id=\"site\""),
+        "type-dependent Text controls must not be textareas:\n{routes}"
+    );
+    // The 422 value is carried via the `value=` attribute (input, not content).
+    assert!(
+        routes.contains("value=(changeset.field_value(\"email_addr\").unwrap_or_default())"),
+        "the typed input must re-fill via a value= attribute:\n{routes}"
+    );
+}
+
 /// Slice a textarea's field-specific attributes: from the `id`/`name` marker
 /// up to the shared `class=` skeleton, so an assertion can't match a sibling
 /// control's attributes.

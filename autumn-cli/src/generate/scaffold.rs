@@ -2677,11 +2677,15 @@ fn render_form_for_helper(
                         " required aria-required=\"true\""
                     };
                     let _ = write!(builder_calls, "\n        .exclude(\"{name}\")");
-                    if matches!(f.kind, FieldKind::Text) {
-                        // A `text` DSL column is a long-form field (Postgres
-                        // `TEXT`), so its constrained control is a `<textarea>`,
-                        // not a single-line `<input>` — the same element the
-                        // derived `FieldControl::Textarea` would pick. Only the
+                    if matches!(f.kind, FieldKind::Text) && input_type == "text" {
+                        // A `text` DSL column with a length/plain constraint is a
+                        // long-form field (Postgres `TEXT`), so its control is a
+                        // `<textarea>`, not a single-line `<input>` — the same
+                        // element the derived `FieldControl::Textarea` would pick.
+                        // (A `text{email}`/`text{url}` field has `input_type` ==
+                        // `email`/`url`, which a textarea can't carry — those
+                        // inherently single-line, type-dependent controls take the
+                        // `<input type="…">` branch below instead.) Only the
                         // attributes a textarea honours carry over: the length
                         // rules in `constraint_attrs` (`minlength`/`maxlength`)
                         // and `required`; the input-only `type`/`min`/`max` are

@@ -742,11 +742,23 @@ fn parse_field_constraints(body: &str, kind: FieldKind) -> Result<FieldConstrain
         ));
     }
     if let (Some(min), Some(max)) = (&c.min, &c.max) {
-        let (lo, hi): (f64, f64) = (
-            min.parse().map_err(|_| "min must be a number".to_owned())?,
-            max.parse().map_err(|_| "max must be a number".to_owned())?,
-        );
-        if lo > hi {
+        // Compare at the field's CONCRETE width, never via `f64`: a large `i64`
+        // pair such as `{min=9007199254740993,max=9007199254740992}` would
+        // otherwise round to the same float and slip past this check, emitting
+        // an impossible `range(min > max)` that rejects every submitted value
+        // instead of failing generation here. Each bound already passed
+        // `parse_bound` for `kind`, so these re-parses succeed exactly.
+        let inverted = match kind {
+            FieldKind::String | FieldKind::Text => {
+                matches!((min.parse::<u64>(), max.parse::<u64>()), (Ok(lo), Ok(hi)) if lo > hi)
+            }
+            FieldKind::I32 | FieldKind::I64 => {
+                matches!((min.parse::<i64>(), max.parse::<i64>()), (Ok(lo), Ok(hi)) if lo > hi)
+            }
+            // `f32`/`f64`: `f64` compares `f32` values exactly, so this is lossless.
+            _ => matches!((min.parse::<f64>(), max.parse::<f64>()), (Ok(lo), Ok(hi)) if lo > hi),
+        };
+        if inverted {
             return Err(format!("min ({min}) cannot be greater than max ({max})"));
         }
     }
@@ -1757,6 +1769,29 @@ mod tests {
         // so reject non-finite bounds explicitly.
         let err = parse_field("ratio:f32{max=1e40}").unwrap_err();
         assert!(err.to_string().contains("f32"), "{}", err);
+    }
+
+    #[test]
+    fn i64_min_greater_than_max_beyond_f64_precision_is_rejected() {
+        // `min` is exactly one greater than `max`, but both round to the same
+        // `f64` (they exceed 2^53). Comparing at the concrete `i64` width must
+        // still catch the inversion, rather than emitting an impossible
+        // `range(min > max)` that rejects every submitted value.
+        let err = parse_field("count:i64{min=9007199254740993,max=9007199254740992}").unwrap_err();
+        assert!(
+            err.to_string().contains("cannot be greater than"),
+            "must report the inverted range: {err}"
+        );
+    }
+
+    #[test]
+    fn i64_valid_large_range_is_accepted() {
+        let f = parse_field("count:i64{min=1,max=9007199254740992}").unwrap();
+        assert_eq!(f.kind, FieldKind::I64);
+        assert_eq!(
+            f.validation_attrs(),
+            vec!["range(min = 1, max = 9007199254740992)"]
+        );
     }
 
     #[test]
