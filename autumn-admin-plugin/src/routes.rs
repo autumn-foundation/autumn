@@ -1691,6 +1691,34 @@ mod tests {
     }
 
     #[test]
+    fn coerce_form_fields_converts_blank_optional_json_to_null() {
+        // A blank submission on a nullable JSON column clears to NULL rather
+        // than silently storing `Value::String("")` (which `serde_json::from_str`
+        // can't parse, so the raw empty string would otherwise be persisted).
+        // The null-coercion short-circuit runs before the JSON parse arm.
+        let fields = vec![AdminField::new("settings", AdminFieldKind::Json).optional()];
+
+        let out = coerce_form_fields(json!({"settings": ""}), &fields);
+        assert_eq!(out, json!({"settings": null}));
+
+        let out = coerce_form_fields(json!({"settings": "   "}), &fields);
+        assert_eq!(out, json!({"settings": null}));
+
+        // A non-blank optional JSON submission still parses normally.
+        let out = coerce_form_fields(json!({"settings": "{\"published\":true}"}), &fields);
+        assert_eq!(out, json!({"settings": {"published": true}}));
+    }
+
+    #[test]
+    fn coerce_form_fields_keeps_blank_required_json_as_empty_string() {
+        // Required columns keep the empty string rather than clearing to NULL,
+        // matching the required-text convention.
+        let fields = vec![AdminField::new("settings", AdminFieldKind::Json)];
+        let out = coerce_form_fields(json!({"settings": ""}), &fields);
+        assert_eq!(out, json!({"settings": ""}));
+    }
+
+    #[test]
     fn coerce_form_fields_keeps_blank_required_text_as_empty_string() {
         // Required columns keep the empty string rather than clearing to NULL.
         let fields = vec![AdminField::new("token", AdminFieldKind::Text)];

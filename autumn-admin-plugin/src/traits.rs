@@ -46,8 +46,12 @@ impl AdminFieldKind {
     /// storing an empty string (which fails validation for nullable
     /// Uuid/decimal columns and silently stores `""` for strings).
     ///
-    /// `Boolean`/`Hidden`/`Password`/`Json` are excluded: their empty
-    /// submissions are handled elsewhere or are not meaningfully "blank".
+    /// `Json` joins them: an empty submission can't be parsed by
+    /// `serde_json::from_str`, so without this it would silently persist the
+    /// raw `""` rather than clearing a nullable JSON column to `NULL`.
+    ///
+    /// `Boolean`/`Hidden`/`Password` are excluded: their empty submissions are
+    /// handled elsewhere or are not meaningfully "blank".
     #[must_use]
     pub const fn blank_submission_is_null(&self) -> bool {
         matches!(
@@ -59,6 +63,7 @@ impl AdminFieldKind {
                 | Self::Text
                 | Self::TextArea
                 | Self::Select(_)
+                | Self::Json
         )
     }
 }
