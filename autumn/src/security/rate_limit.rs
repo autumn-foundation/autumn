@@ -3395,6 +3395,113 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn check_throttle_session_principal_is_isolated_per_app_and_per_principal() {
+        // Deterministic isolation guard for the flaky-throttle class (#1725):
+        // a `#[throttle(key = "principal")]` route deriving its principal from
+        // the verified session must key EACH principal (and each app) on its own
+        // bucket — never silently collapse onto the shared client IP, and never
+        // inherit a neighbouring app's drained bucket. The CI flake was
+        // thread-contention-shaped; this reproduces the SAME invariant
+        // deterministically (no threads) by pre-draining one app's principal
+        // bucket and proving the untouched principal / app is unaffected.
+        use std::collections::HashMap;
+        let session_for = |user: &str| {
+            let mut data = HashMap::new();
+            data.insert("user_id".to_owned(), user.to_owned());
+            crate::session::Session::new_for_test(format!("sid-{user}"), data)
+        };
+        let app_a = crate::AppState::for_test();
+        let app_b = crate::AppState::for_test();
+        assert_ne!(app_a.app_id(), app_b.app_id());
+
+        let headers = axum::http::HeaderMap::new();
+        // A single shared client IP: if the throttle ever fell back to IP keying
+        // (derivation failing), the distinct principals below would collide here.
+        let peer: SocketAddr = "203.0.113.7:1234".parse().unwrap();
+        let route = "test::check_throttle_session_principal_isolation";
+        let spec = || ThrottleSpec::Inline {
+            limit: 1,
+            per_secs: 60,
+            key: Some(KeyStrategy::AuthenticatedPrincipal),
+        };
+        let alice = session_for("alice");
+        let bob = session_for("bob");
+
+        // app A, principal "alice" (derived from the session, NO RateLimitPrincipal
+        // extension): first request consumes the token, second is denied.
+        let a1 = __check_throttle(
+            &app_a,
+            route,
+            None,
+            spec(),
+            &headers,
+            Some(peer),
+            None,
+            Some(&alice),
+            false,
+        )
+        .await;
+        assert!(a1.is_ok(), "alice first request must succeed");
+        let a2 = __check_throttle(
+            &app_a,
+            route,
+            None,
+            spec(),
+            &headers,
+            Some(peer),
+            None,
+            Some(&alice),
+            false,
+        )
+        .await;
+        assert_eq!(
+            a2.expect_err("alice second request must be denied")
+                .status(),
+            StatusCode::TOO_MANY_REQUESTS,
+        );
+
+        // app A, principal "bob": a DISTINCT session principal on the SAME client
+        // IP must get its OWN bucket and still succeed — proving the throttle keyed
+        // on the derived session principal, not the shared peer IP.
+        let bob_req = __check_throttle(
+            &app_a,
+            route,
+            None,
+            spec(),
+            &headers,
+            Some(peer),
+            None,
+            Some(&bob),
+            false,
+        )
+        .await;
+        assert!(
+            bob_req.is_ok(),
+            "a distinct session principal must get its own bucket, not fall back to the shared IP",
+        );
+
+        // app B, principal "alice": an INDEPENDENTLY built app must not inherit
+        // app A's drained "alice" bucket — this is the per-app isolation that makes
+        // cross-test registry bleed impossible.
+        let b1 = __check_throttle(
+            &app_b,
+            route,
+            None,
+            spec(),
+            &headers,
+            Some(peer),
+            None,
+            Some(&alice),
+            false,
+        )
+        .await;
+        assert!(
+            b1.is_ok(),
+            "an independent app must have its own principal bucket, unaffected by app A",
+        );
+    }
+
+    #[tokio::test]
     async fn check_throttle_no_identifiable_peer_bypasses_limiter() {
         // In-process caller without ConnectInfo (SSG, some tests): bypass.
         // Unique route_id isolates this test from parallel siblings.
