@@ -22,6 +22,18 @@
 //! sees no churn. A missing `__autumn_schema_version` therefore always reads as
 //! version 1 (existing un-versioned rows read as v1).
 //!
+//! **Strict envelope detection.** To keep that promise even for apps whose raw
+//! args legitimately contain a top-level `__autumn_schema_version` field (via
+//! `#[serde(rename = "…")]` or hand-built JSON), a value is treated as an
+//! envelope *only* when it is an object with **exactly** two keys —
+//! `__autumn_schema_version` (a JSON integer `>= 1`) and `args`. Anything else
+//! is passed through as raw args. One residual ambiguity remains and is
+//! accepted: a raw payload whose shape is *exactly*
+//! `{ "__autumn_schema_version": <int>, "args": <any> }` is indistinguishable
+//! from a real envelope. That is the same fundamental limit any in-band envelope
+//! scheme has, and far tighter than a "any object carrying the marker key"
+//! check would be.
+//!
 //! # Composition with the tracked-payload envelope
 //!
 //! The tracked-job envelope (`job_tracking::wrap_tracked_payload`) and this
@@ -89,19 +101,38 @@ pub fn wrap(version: u32, args: Value) -> Value {
     Value::Object(obj)
 }
 
-/// Read the stored schema version, treating a missing/invalid marker as
-/// [`DEFAULT_VERSION`].
+/// Read the stored schema version, treating anything that is not an exact
+/// version envelope as [`DEFAULT_VERSION`].
 #[must_use]
 pub fn read_version(value: &Value) -> u32 {
-    marker_version(value).unwrap_or(DEFAULT_VERSION)
+    as_version_envelope(value).map_or(DEFAULT_VERSION, |(version, _)| version)
 }
 
-fn marker_version(value: &Value) -> Option<u32> {
-    value
-        .as_object()?
+/// The single shape predicate all read paths funnel through.
+///
+/// Recognizes `value` as a version envelope **only** when it is a JSON object
+/// with *exactly* two keys — `__autumn_schema_version` (a JSON integer that
+/// fits `u32` and is `>= 1`) and `args`. Any other shape (marker missing,
+/// non-integer marker, no `args`, or extra keys) is **not** an envelope, so a
+/// raw args payload that merely happens to contain a top-level
+/// `__autumn_schema_version` field is passed through untouched.
+///
+/// The exactly-two-keys requirement is safe because version detection always
+/// runs *after* the tracked envelope is stripped (see the module docs): a real
+/// versioned payload is exactly `{__autumn_schema_version, args}` at this layer,
+/// and [`wrap`] produces exactly those two keys.
+fn as_version_envelope(value: &Value) -> Option<(u32, &Value)> {
+    let obj = value.as_object()?;
+    if obj.len() != 2 {
+        return None;
+    }
+    let version = obj
         .get(VERSION_MARKER)?
         .as_u64()
         .and_then(|v| u32::try_from(v).ok())
+        .filter(|&v| v >= DEFAULT_VERSION)?;
+    let args = obj.get(VERSION_ARGS_KEY)?;
+    Some((version, args))
 }
 
 /// Borrowing counterpart of [`strip_version`].
@@ -111,26 +142,20 @@ fn marker_version(value: &Value) -> Option<u32> {
 /// needs to read fields off the inner args without consuming the payload.
 #[must_use]
 pub fn split_version(value: &Value) -> (u32, &Value) {
-    static NULL_ARGS: Value = Value::Null;
-    let Some(version) = marker_version(value) else {
-        return (DEFAULT_VERSION, value);
-    };
-    let inner = value
-        .as_object()
-        .and_then(|obj| obj.get(VERSION_ARGS_KEY))
-        .unwrap_or(&NULL_ARGS);
-    (version, inner)
+    as_version_envelope(value).unwrap_or((DEFAULT_VERSION, value))
 }
 
 /// Owning counterpart of [`split_version`].
 ///
 /// If `value` is a version envelope, removes and returns `(version,
-/// inner_args)`; otherwise `(DEFAULT_VERSION, value)` unchanged. Agrees with
-/// [`split_version`] on a malformed envelope (marker present, `args` missing):
-/// both report an empty (`Value::Null`) inner payload.
+/// inner_args)`; otherwise `(DEFAULT_VERSION, value)` unchanged. Mirrors
+/// [`split_version`]'s exact-shape detection, so the two never disagree on
+/// whether a given value is an envelope.
 #[must_use]
 pub fn strip_version(value: Value) -> (u32, Value) {
-    let Some(version) = marker_version(&value) else {
+    // Detect on a borrow first so the strict predicate lives in one place; only
+    // consume `obj` once we know it is a real envelope.
+    let Some((version, _)) = as_version_envelope(&value) else {
         return (DEFAULT_VERSION, value);
     };
     match value {
@@ -138,7 +163,7 @@ pub fn strip_version(value: Value) -> (u32, Value) {
             let inner = obj.remove(VERSION_ARGS_KEY).unwrap_or(Value::Null);
             (version, inner)
         }
-        // Unreachable: `marker_version` only returns `Some` for objects.
+        // Unreachable: `as_version_envelope` only returns `Some` for objects.
         other => (version, other),
     }
 }
@@ -415,15 +440,67 @@ mod tests {
     }
 
     #[test]
-    fn split_and_strip_agree_on_malformed_envelope() {
-        // Marker present but no `args` field: both report Null inner args.
-        let malformed = json!({ VERSION_MARKER: 2 });
-        let (sv, si) = split_version(&malformed);
-        assert_eq!(sv, 2);
-        assert_eq!(si, &Value::Null);
-        let (tv, ti) = strip_version(malformed);
-        assert_eq!(tv, 2);
-        assert_eq!(ti, Value::Null);
+    fn marker_without_args_is_not_an_envelope() {
+        // Marker present but no `args` field (only one key): NOT an envelope, so
+        // the whole object passes through as raw args at version 1. (Codex #1205
+        // collision fix: strict exact-shape detection.)
+        let raw = json!({ VERSION_MARKER: 5, "other": 1 });
+        assert_eq!(read_version(&raw), DEFAULT_VERSION);
+        let (sv, si) = split_version(&raw);
+        assert_eq!(sv, DEFAULT_VERSION);
+        assert_eq!(si, &raw);
+        let (tv, ti) = strip_version(raw.clone());
+        assert_eq!(tv, DEFAULT_VERSION);
+        assert_eq!(ti, raw);
+    }
+
+    #[test]
+    fn extra_keys_alongside_marker_and_args_is_not_an_envelope() {
+        // Three keys: a real envelope has exactly two, so this is raw args.
+        let raw = json!({ VERSION_MARKER: 5, "args": { "x": 1 }, "extra": 2 });
+        assert_eq!(read_version(&raw), DEFAULT_VERSION);
+        assert_eq!(split_version(&raw), (DEFAULT_VERSION, &raw));
+        assert_eq!(strip_version(raw.clone()), (DEFAULT_VERSION, raw));
+    }
+
+    #[test]
+    fn non_integer_marker_is_not_an_envelope() {
+        // Marker present with the right sibling key but a string value: raw.
+        let raw = json!({ VERSION_MARKER: "v3", "args": { "x": 1 } });
+        assert_eq!(read_version(&raw), DEFAULT_VERSION);
+        assert_eq!(split_version(&raw), (DEFAULT_VERSION, &raw));
+        assert_eq!(strip_version(raw.clone()), (DEFAULT_VERSION, raw));
+    }
+
+    #[test]
+    fn raw_payload_with_marker_field_decodes_whole_object() {
+        // A raw args struct that legitimately carries a top-level
+        // `__autumn_schema_version` field must deserialize as-is, not as a
+        // stripped envelope subtree — the "zero behavior change" guarantee.
+        #[derive(Debug, Deserialize, PartialEq, Eq)]
+        struct Raw {
+            #[serde(rename = "__autumn_schema_version")]
+            marker: u32,
+            other: i64,
+        }
+        let raw = json!({ "__autumn_schema_version": 5, "other": 7 });
+        let decoded: Raw = decode_versioned("j", 1, None, raw).unwrap();
+        assert_eq!(
+            decoded,
+            Raw {
+                marker: 5,
+                other: 7
+            }
+        );
+    }
+
+    #[test]
+    fn exact_two_key_envelope_is_detected() {
+        // The real envelope shape still matches and round-trips.
+        let env = wrap(3, json!({ "x": 1 }));
+        assert_eq!(read_version(&env), 3);
+        assert_eq!(split_version(&env), (3, &json!({ "x": 1 })));
+        assert_eq!(strip_version(env), (3, json!({ "x": 1 })));
     }
 
     #[derive(Debug, Deserialize, PartialEq, Eq)]

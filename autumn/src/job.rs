@@ -11551,6 +11551,26 @@ mod tests {
         );
     }
 
+    #[test]
+    fn job_unique_key_hashes_whole_payload_when_marker_field_is_not_an_envelope() {
+        // A raw (unversioned) payload that legitimately carries a top-level
+        // `__autumn_schema_version` field is NOT a version envelope (Codex #1205
+        // collision fix): key derivation must hash the WHOLE object, so two such
+        // payloads differing only in a sibling field get distinct keys rather
+        // than both collapsing onto a stripped `args` subtree.
+        let uniqueness = JobUniqueness {
+            by: Vec::new(),
+            window: JobUniquenessWindow::Running,
+        };
+        let a = serde_json::json!({"__autumn_schema_version": 5, "other": 1});
+        let b = serde_json::json!({"__autumn_schema_version": 5, "other": 2});
+        assert_ne!(
+            job_unique_key(&uniqueness, &a),
+            job_unique_key(&uniqueness, &b),
+            "a marker field without the exact envelope shape must not be stripped"
+        );
+    }
+
     #[tokio::test]
     async fn deduplicated_tracked_enqueue_fails_new_token_with_duplicate_message() {
         let _guard = global_job_runtime_test_lock().lock().await;
