@@ -89,7 +89,13 @@ unsafe_code = "forbid"
 # targets (which pull `autumn` in as a path dependency). Declaring it here keeps
 # the `#[cfg(fuzzing)]` seams in the source from tripping the `unexpected_cfgs`
 # lint under `-D warnings` in normal (non-fuzzing) workspace builds.
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
+#
+# `loom_models` is set (via `RUSTFLAGS="--cfg loom_models"`) only when building
+# the isolated `autumn/tests/loom_models.rs` loom model-checking binary; a
+# neutral custom cfg is used instead of the usual `--cfg loom` so the flag does
+# not poison dependency crates (hyper-util/tokio) that carry their own
+# `#[cfg(loom)]` paths.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)', 'cfg(loom_models)'] }
 
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }
