@@ -188,8 +188,11 @@ pub async fn __check_secured_with_key(
         ));
     };
 
-    // Tag the request-scoped log context (#1169) with the authenticated user
-    // so every subsequent event automatically carries `user_id`.
+    // Publish the authenticated principal as the request's current actor
+    // (#1383) so generated repository/audit writes auto-attribute to it, and
+    // tag the request-scoped log context (#1169) with the same user so every
+    // subsequent event automatically carries `user_id`.
+    crate::current::Current::set_actor(user_id.clone());
     crate::log::context::set_user_id(user_id);
 
     // Check authorization: if roles are specified, the session's "role"
@@ -392,9 +395,11 @@ where
                 // "authenticated_principal" works without an extra middleware shim.
                 req.extensions_mut()
                     .insert(crate::security::RateLimitPrincipal(user_id.clone()));
-                // Tag the request-scoped log context (#1169) so handler logs for
-                // middleware-authenticated requests carry `user_id` too, matching
-                // the `#[secured]` path.
+                // Publish the authenticated principal as the request's current
+                // actor (#1383) and tag the request-scoped log context (#1169)
+                // so handler logs for middleware-authenticated requests carry
+                // `user_id` too, matching the `#[secured]` path.
+                crate::current::Current::set_actor(user_id.clone());
                 crate::log::context::set_user_id(user_id);
                 inner.call(req).await
             } else {
@@ -2216,6 +2221,10 @@ where
                     // `#[secured(scopes = …)]` gate and `PolicyContext`
                     // scope-aware helpers read this extension.
                     req.extensions_mut().insert(ApiTokenScopes(scopes));
+                    // Publish the token's principal as the request's current
+                    // actor (#1383) so generated repository/audit writes
+                    // auto-attribute to it.
+                    crate::current::Current::set_actor(principal_id.clone());
                     req.extensions_mut().insert(ApiTokenPrincipal(principal_id));
                     inner.call(req).await
                 }

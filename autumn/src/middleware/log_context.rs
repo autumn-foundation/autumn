@@ -117,14 +117,22 @@ where
         // poll: a lazy/streaming body (SSE, `Body::from_stream`) is produced
         // after this future resolves, otherwise dropping the context before any
         // stream code runs. Mirrors `TenantPropagatingBody`.
-        Box::pin(context::scoped(ctx, async move {
-            let response = inner.await?;
-            let (parts, body) = response.into_parts();
-            Ok(Response::from_parts(
-                parts,
-                LogContextBody::new(body, body_ctx),
-            ))
-        }))
+        //
+        // Also establish an empty current-actor scope (#1383) for the whole
+        // request so the auth layer can publish the resolved principal via
+        // `Current::set_actor` after the request future has started, and the
+        // generated repository/audit writes read it ambiently.
+        Box::pin(crate::current::scope_request(context::scoped(
+            ctx,
+            async move {
+                let response = inner.await?;
+                let (parts, body) = response.into_parts();
+                Ok(Response::from_parts(
+                    parts,
+                    LogContextBody::new(body, body_ctx),
+                ))
+            },
+        )))
     }
 }
 

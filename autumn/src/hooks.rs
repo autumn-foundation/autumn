@@ -114,13 +114,20 @@ pub struct MutationContext {
 impl MutationContext {
     /// Create a new context for the given operation.
     ///
-    /// Auto-populates `now` with `Utc::now()` and `request_id` with a
-    /// freshly generated UUID v4.
+    /// Auto-populates `now` with `Utc::now()`, `request_id` with a freshly
+    /// generated UUID v4, and `actor` from the ambient
+    /// [`Current::actor`](crate::current::Current::actor) (the authenticated
+    /// principal when inside a request; `None` otherwise).
     #[must_use]
     pub fn new(op: MutationOp) -> Self {
         Self {
             op,
-            actor: None,
+            // Seed the actor from the ambient request-scoped current actor so
+            // generated writes auto-attribute to the authenticated principal
+            // with zero per-call wiring. `None` outside any scope, preserving
+            // the previous behavior. A `before_*` hook still overrides this,
+            // since hooks run after construction.
+            actor: crate::current::Current::actor(),
             request_id: Some(uuid::Uuid::new_v4().to_string()),
             now: chrono::Utc::now(),
             invalidate_keys: Vec::new(),
@@ -804,6 +811,19 @@ mod tests {
         let mut ctx = MutationContext::new(MutationOp::Update);
         ctx.actor = Some("user-123".into());
         assert_eq!(ctx.actor.as_deref(), Some("user-123"));
+    }
+
+    #[tokio::test]
+    async fn mutation_context_seeds_actor_from_ambient_scope() {
+        // Outside any actor scope the constructor yields `None` (unchanged).
+        assert!(MutationContext::new(MutationOp::Create).actor.is_none());
+
+        // Inside `with_actor(...)` the constructor auto-populates the actor.
+        crate::current::with_actor("u1", async {
+            let ctx = MutationContext::new(MutationOp::Create);
+            assert_eq!(ctx.actor.as_deref(), Some("u1"));
+        })
+        .await;
     }
 
     #[test]

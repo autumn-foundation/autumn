@@ -141,6 +141,8 @@ mod raw_router_escape_hatch;
 #[cfg(feature = "db")]
 mod read_your_writes_routing;
 #[cfg(feature = "db")]
+mod repository_audit_actor;
+#[cfg(feature = "db")]
 mod repository_authorization;
 #[cfg(feature = "db")]
 mod repository_bulk_operations;
