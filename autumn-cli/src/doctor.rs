@@ -470,16 +470,71 @@ fn alert_email_invalid_warning(email: &str) -> CheckResult {
     }
 }
 
-// Six independent config booleans (alerting enabled, webhook signed, mail
-// transport usable, production, mail `from` present, transport requires a
-// `from`) plus the resolved `[alerts] email` each gate a distinct branch;
-// grouping them into enums would obscure rather than clarify the
-// destination-resolution logic.
-#[allow(clippy::fn_params_excessive_bools)]
+/// Dedicated production warning for a present-but-non-absolute `[alerts]
+/// webhook_url`: the runtime's HTTP client (`http_client::Client::build_request`)
+/// dispatches a URL verbatim only when it starts with `http://` or `https://`,
+/// otherwise treating it as a path to join onto a base-url alias the alert
+/// webhook never has — so a relative value like `hooks.example/x` fails EVERY
+/// signed POST. Distinct from the missing-secret, invalid-email, and
+/// no-destination warnings, and it names the offending value.
+fn alert_webhook_url_invalid_warning(url: &str) -> CheckResult {
+    CheckResult {
+        name: "alert_destination",
+        status: CheckStatus::Warn,
+        detail: Some(format!(
+            "`[alerts] webhook_url` (\"{url}\") is not an absolute http(s) URL, so alert \
+             delivery will fail; the runtime's HTTP client only sends a URL starting with \
+             http:// or https://, and a relative value has no base URL to resolve against, so \
+             every signed webhook POST fails to send"
+        )),
+        hint: Some(
+            "Set [alerts] webhook_url (or AUTUMN_ALERTS__WEBHOOK_URL) to an absolute URL like \
+             https://alerts.example.com/hooks/autumn, or configure an email destination \
+             ([alerts] email). See docs/guide/operator-alerts.md",
+        ),
+    }
+}
+
+/// Dedicated production warning for the `[alerts] enabled = false` master switch:
+/// the runtime (`alerts::install_from_config`) returns BEFORE installing any
+/// `Alerter`, so NO operator alerts are delivered regardless of a configured
+/// destination. Mentions the (otherwise valid) destination when one is present so
+/// the operator understands the deploy is blind despite it. Extracted so
+/// [`check_alert_destination_impl`] stays under the line-count lint.
+fn alert_disabled_in_production_warning(has_destination: bool) -> CheckResult {
+    let detail = if has_destination {
+        "alerting is disabled ([alerts] enabled = false) in production, so no operator \
+         alerts will be delivered — even though a destination is configured"
+    } else {
+        "alerting is disabled ([alerts] enabled = false) in production, so no operator \
+         alerts will be delivered"
+    };
+    CheckResult {
+        name: "alert_destination",
+        status: CheckStatus::Warn,
+        detail: Some(detail.into()),
+        hint: Some(
+            "Set [alerts] enabled = true (or AUTUMN_ALERTS__ENABLED=true) to deliver \
+             operator alerts, or remove the setting (it defaults to enabled). See \
+             docs/guide/operator-alerts.md",
+        ),
+    }
+}
+
+// Six independent config booleans (alerting enabled, webhook is a usable signed
+// destination, mail transport usable, production, mail `from` present, transport
+// requires a `from`) plus the resolved `[alerts] email` and `[alerts]
+// webhook_url` strings each gate a distinct branch; grouping them into enums
+// would obscure rather than clarify the destination-resolution logic. The raw
+// `webhook_url` is used only to name a present-but-non-absolute value in its
+// dedicated warning — `webhook_configured` already folds in absoluteness and the
+// signing-secret requirement.
+#[allow(clippy::fn_params_excessive_bools, clippy::too_many_arguments)]
 pub fn check_alert_destination_impl(
     alerts_enabled: bool,
     email: &str,
     webhook_configured: bool,
+    webhook_url: &str,
     mail_transport_usable: bool,
     is_production: bool,
     mail_from_present: bool,
@@ -518,24 +573,7 @@ pub fn check_alert_destination_impl(
             // Name the disabled switch explicitly. Mention the (otherwise valid)
             // destination when one is configured so the operator understands the
             // deploy is blind despite it; keep the message accurate otherwise.
-            let has_destination = email_destination || webhook_configured;
-            let detail = if has_destination {
-                "alerting is disabled ([alerts] enabled = false) in production, so no operator \
-                 alerts will be delivered — even though a destination is configured"
-            } else {
-                "alerting is disabled ([alerts] enabled = false) in production, so no operator \
-                 alerts will be delivered"
-            };
-            return CheckResult {
-                name: "alert_destination",
-                status: CheckStatus::Warn,
-                detail: Some(detail.into()),
-                hint: Some(
-                    "Set [alerts] enabled = true (or AUTUMN_ALERTS__ENABLED=true) to deliver \
-                     operator alerts, or remove the setting (it defaults to enabled). See \
-                     docs/guide/operator-alerts.md",
-                ),
-            };
+            return alert_disabled_in_production_warning(email_destination || webhook_configured);
         }
         return CheckResult {
             name: "alert_destination",
@@ -603,6 +641,18 @@ pub fn check_alert_destination_impl(
                      docs/guide/operator-alerts.md",
                 ),
             };
+        }
+        // A webhook URL is set but is not an absolute http(s) URL: the runtime's
+        // HTTP client dispatches a URL verbatim only when it starts with
+        // `http://`/`https://`, and an alert webhook has no base-url alias to join
+        // a relative value onto — so every signed POST fails to send. Surface a
+        // dedicated warning naming the offending value, distinct from the
+        // missing-secret ("no destination") and email cases. `webhook_configured`
+        // is already false here (it requires an absolute URL), so this only fires
+        // when there is no other working destination.
+        let webhook_url_trimmed = webhook_url.trim();
+        if !webhook_url_trimmed.is_empty() && !is_absolute_http_url_doctor(webhook_url_trimmed) {
+            return alert_webhook_url_invalid_warning(webhook_url_trimmed);
         }
         CheckResult {
             name: "alert_destination",
@@ -891,6 +941,33 @@ fn is_valid_https_base_url_doctor(url: &str) -> bool {
         && parsed.password().is_none()
         && parsed.query().is_none()
         && parsed.fragment().is_none()
+}
+
+/// Whether `url` is an absolute http(s) URL that the runtime's HTTP client would
+/// actually dispatch — the exact absoluteness rule an `[alerts] webhook_url`
+/// must satisfy to deliver.
+///
+/// `autumn_web`'s `http_client::Client::build_request` sends a URL verbatim ONLY
+/// when it starts with `http://` or `https://`; any other string is treated as a
+/// path to be joined onto a base-url alias, and an alert webhook (posted via
+/// `named(&url).post(&url)`) has no such alias, so a relative value like
+/// `hooks.example/x` fails EVERY signed send. Mirror that rule byte-for-byte:
+/// accept BOTH schemes (the runtime does not require TLS, so neither do we) and
+/// additionally require the URL to parse with a non-empty host — a value such as
+/// `https://` or `http:///path` carries the prefix yet reqwest cannot send it.
+///
+/// Deliberately MORE permissive than [`is_valid_https_base_url_doctor`]
+/// (https-only; forbids query/fragment/userinfo): a webhook URL is a full
+/// endpoint the runtime posts as-is, so rejecting `http://` or a query string
+/// here would warn about configs that deliver fine — a false positive.
+fn is_absolute_http_url_doctor(url: &str) -> bool {
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        return false;
+    }
+    ::url::Url::parse(url)
+        .ok()
+        .and_then(|parsed| parsed.host_str().map(|h| !h.is_empty()))
+        .unwrap_or(false)
 }
 
 /// Mirror of `autumn_web`'s `is_valid_mailto_address` (see above).
@@ -2839,11 +2916,13 @@ fn resolve_trusted_hosts() -> Vec<String> {
 /// `autumn.toml` layered with the active profile's `[profile.{name}]` section and
 /// `autumn-{profile}.toml` override file, alias-normalized exactly as the runtime).
 ///
-/// Returns `(email, webhook_configured)`, where `email` is the RAW resolved
-/// `[alerts] email` value (empty when unset/cleared) so the caller can check
-/// both its presence and its syntactic validity — an invalid address delivers
-/// nothing at runtime.
-fn resolve_alert_destination() -> (String, bool) {
+/// Returns `(email, webhook_configured, webhook_url)`, where `email` and
+/// `webhook_url` are the RAW resolved `[alerts] email` / `[alerts] webhook_url`
+/// values (empty when unset/cleared) so the caller can check both their presence
+/// and their syntactic validity — an invalid address, or a non-absolute webhook
+/// URL, delivers nothing at runtime. `webhook_configured` already folds in the
+/// URL absoluteness and signing-secret requirements.
+fn resolve_alert_destination() -> (String, bool, String) {
     // Evaluate the SAME fully-merged effective config the runtime boots with, not
     // just the raw base `autumn.toml`. The runtime config loader (a) normalizes
     // profile aliases (`production` → `prod`, `development` → `dev`) and (b) layers
@@ -2894,7 +2973,19 @@ fn resolve_alert_destination() -> (String, bool) {
             .unwrap_or("")
             .to_owned()
     });
-    (email, webhook)
+    // Surface the RAW resolved webhook URL (not just presence) under the same
+    // env > merged-base precedence, so the destination check can name a
+    // present-but-non-absolute value in its dedicated warning. `webhook` (above)
+    // already gates on this URL being absolute AND the secret resolving.
+    let webhook_url = std::env::var("AUTUMN_ALERTS__WEBHOOK_URL").unwrap_or_else(|_| {
+        merged
+            .get("alerts")
+            .and_then(|a| a.get("webhook_url"))
+            .and_then(toml::Value::as_str)
+            .unwrap_or("")
+            .to_owned()
+    });
+    (email, webhook, webhook_url)
 }
 
 /// Normalize a raw profile input to the canonical name the runtime config loader
@@ -2921,10 +3012,12 @@ fn normalize_alert_profile(selected_input: &str) -> String {
 /// Layers, highest first: env var, `[profile.{profile}.alerts]`, base
 /// `[alerts]`. Only a layer that omits the key entirely falls through.
 ///
-/// A webhook counts as configured only when BOTH `webhook_url` and
-/// `webhook_secret` resolve non-empty under this precedence — mirroring the
-/// runtime, which never registers an unsigned webhook channel — so a webhook URL
-/// with a missing or cleared secret is not a destination.
+/// A webhook counts as configured only when `webhook_url` resolves to a
+/// non-empty ABSOLUTE http(s) URL AND `webhook_secret` resolves non-empty under
+/// this precedence — mirroring the runtime, which never registers an unsigned
+/// webhook channel and whose HTTP client cannot dispatch a relative URL — so a
+/// webhook URL with a missing/cleared secret, or a non-absolute URL, is not a
+/// destination.
 ///
 /// Split out from [`resolve_alert_destination`] so the precedence logic is unit
 /// testable without mutating process-global env/cwd state.
@@ -2950,38 +3043,52 @@ where
         .and_then(|t| t.get("alerts"))
         .and_then(toml::Value::as_table);
 
-    let resolve = |env_key: &str, key: &str| -> bool {
-        // 1. Env var — highest priority. Set-and-empty clears; unset falls through.
+    // Resolve the RAW winning value for a key under the same layer precedence,
+    // stopping at (not falling through) the first PRESENT layer — a present layer
+    // wins even when its value is empty (an explicit clear). Returns an empty
+    // string when no layer sets the key.
+    let resolve_value = |env_key: &str, key: &str| -> String {
+        // 1. Env var — highest priority. Present (even empty) is terminal.
         if let Some(val) = env_var(env_key) {
-            return !val.trim().is_empty();
+            return val;
         }
         // 2. Profile-specific `[profile.{profile}.alerts].{key}`.
         if let Some(v) = profile_alerts
             .and_then(|t| t.get(key))
             .and_then(toml::Value::as_str)
         {
-            return !v.trim().is_empty();
+            return v.to_owned();
         }
         // 3. Base `[alerts].{key}`.
         if let Some(v) = base_alerts
             .and_then(|t| t.get(key))
             .and_then(toml::Value::as_str)
         {
-            return !v.trim().is_empty();
+            return v.to_owned();
         }
-        false
+        String::new()
     };
+    let resolve =
+        |env_key: &str, key: &str| -> bool { !resolve_value(env_key, key).trim().is_empty() };
 
     let email = resolve("AUTUMN_ALERTS__EMAIL", "email");
-    // A webhook destination requires BOTH a URL and a signing secret to be a real
-    // destination: the runtime (`alerts::install_from_config`) refuses to register
-    // an unsigned webhook channel, so a URL with a missing/cleared secret installs
-    // NO channel. Count the webhook only when both resolve non-empty under the same
-    // per-field precedence, so doctor agrees with runtime (URL-without-secret is
-    // NOT a destination → in production with no other destination, doctor warns).
-    let webhook_url = resolve("AUTUMN_ALERTS__WEBHOOK_URL", "webhook_url");
+    // A webhook destination requires a well-formed URL AND a signing secret to be
+    // a real destination:
+    //   * The runtime (`alerts::install_from_config`) refuses to register an
+    //     unsigned webhook channel, so a URL with a missing/cleared secret
+    //     installs NO channel.
+    //   * The runtime's HTTP client (`http_client::Client::build_request`) only
+    //     dispatches a URL that starts with `http://`/`https://`; a relative value
+    //     (which an alert webhook can never resolve against a base-url alias) fails
+    //     EVERY signed POST. So a present-but-non-absolute URL is not a working
+    //     destination either.
+    // Count the webhook only when the resolved URL is a non-empty ABSOLUTE http(s)
+    // URL AND the secret resolves non-empty, under the same per-field precedence —
+    // so doctor agrees with runtime (URL-without-secret, or a relative URL, is NOT
+    // a destination → in production with no other destination, doctor warns).
+    let webhook_url = resolve_value("AUTUMN_ALERTS__WEBHOOK_URL", "webhook_url");
     let webhook_secret = resolve("AUTUMN_ALERTS__WEBHOOK_SECRET", "webhook_secret");
-    let webhook = webhook_url && webhook_secret;
+    let webhook = is_absolute_http_url_doctor(webhook_url.trim()) && webhook_secret;
     (email, webhook)
 }
 
@@ -3180,7 +3287,7 @@ pub fn run(opts: DoctorOptions) {
     let rate_limit_key_strategy = resolve_rate_limit_key_strategy();
     let auth_extractor_mounted = resolve_auth_extractor_mounted();
     let compression_enabled = resolve_compression_enabled();
-    let (alert_email, alert_webhook_configured) = resolve_alert_destination();
+    let (alert_email, alert_webhook_configured, alert_webhook_url) = resolve_alert_destination();
     let alerts_enabled = resolve_alert_enabled();
     let proxy_conflict_data = resolve_proxy_conflict_data();
     let (dotenv_has_example, dotenv_has_env, dotenv_uncovered) = resolve_dotenv_state();
@@ -3409,6 +3516,7 @@ pub fn run(opts: DoctorOptions) {
             alerts_enabled,
             &alert_email,
             alert_webhook_configured,
+            &alert_webhook_url,
             mail_transport_usable,
             is_production,
             mail_from_present,
@@ -4708,6 +4816,39 @@ pub struct Vault {
     }
 
     #[test]
+    fn is_absolute_http_url_doctor_matches_runtime_absoluteness() {
+        // Runtime (`http_client::Client::build_request`) treats a URL as absolute
+        // iff it starts with `http://` or `https://`. Accept BOTH schemes — the
+        // runtime does not require TLS for a webhook, so neither may doctor
+        // (rejecting `http://` would be a false-positive warning).
+        assert!(is_absolute_http_url_doctor(
+            "https://alerts.example.com/hooks"
+        ));
+        assert!(is_absolute_http_url_doctor(
+            "http://alerts.example.com/hooks"
+        ));
+        // A query string / userinfo / non-standard port is fine: the runtime posts
+        // the URL verbatim, so doctor must not reject what delivers (unlike the
+        // stricter https-base-url validator).
+        assert!(is_absolute_http_url_doctor(
+            "https://user@h.example.com/x?a=1"
+        ));
+        assert!(is_absolute_http_url_doctor("http://h.example.com:8080/x"));
+        // Relative values never carry the scheme prefix runtime requires, and an
+        // alert webhook has no base-url alias to resolve them against.
+        assert!(!is_absolute_http_url_doctor("hooks.example/x"));
+        assert!(!is_absolute_http_url_doctor("/hooks/autumn"));
+        assert!(!is_absolute_http_url_doctor("alerts.example.com"));
+        assert!(!is_absolute_http_url_doctor(""));
+        // Non-http(s) schemes are not dispatched by the client as absolute here.
+        assert!(!is_absolute_http_url_doctor("ftp://h.example.com/x"));
+        assert!(!is_absolute_http_url_doctor("ws://h.example.com/x"));
+        // Carries the prefix but has no host reqwest can send to.
+        assert!(!is_absolute_http_url_doctor("https://"));
+        assert!(!is_absolute_http_url_doctor("http://"));
+    }
+
+    #[test]
     fn is_valid_bare_mailbox_rejects_mailto_uri_and_accepts_bare() {
         // Bare recipient mailboxes are accepted (this is what lettre parses at
         // send time for `[alerts] email`).
@@ -4944,7 +5085,7 @@ pub struct Vault {
 
     #[test]
     fn alert_destination_warns_in_production_when_none() {
-        let r = check_alert_destination_impl(true, "", false, true, true, true, true);
+        let r = check_alert_destination_impl(true, "", false, "", true, true, true, true);
         assert_eq!(r.name, "alert_destination");
         assert!(matches!(r.status, CheckStatus::Warn));
         assert!(r.hint.is_some());
@@ -4952,20 +5093,28 @@ pub struct Vault {
 
     #[test]
     fn alert_destination_passes_in_production_with_email() {
-        let r =
-            check_alert_destination_impl(true, "ops@example.com", false, true, true, true, true);
+        let r = check_alert_destination_impl(
+            true,
+            "ops@example.com",
+            false,
+            "",
+            true,
+            true,
+            true,
+            true,
+        );
         assert!(matches!(r.status, CheckStatus::Pass));
     }
 
     #[test]
     fn alert_destination_passes_in_production_with_webhook() {
-        let r = check_alert_destination_impl(true, "", true, true, true, true, true);
+        let r = check_alert_destination_impl(true, "", true, "", true, true, true, true);
         assert!(matches!(r.status, CheckStatus::Pass));
     }
 
     #[test]
     fn alert_destination_passes_in_dev_without_destination() {
-        let r = check_alert_destination_impl(true, "", false, true, false, true, true);
+        let r = check_alert_destination_impl(true, "", false, "", true, false, true, true);
         assert!(matches!(r.status, CheckStatus::Pass));
     }
 
@@ -4993,6 +5142,7 @@ pub struct Vault {
             true,
             "ops@example.com",
             webhook,
+            "",
             usable,
             true,
             true,
@@ -5025,6 +5175,7 @@ pub struct Vault {
             true,
             "ops@example.com",
             webhook,
+            "",
             transport != "disabled",
             true,
             true,
@@ -5068,6 +5219,7 @@ pub struct Vault {
             true,
             "ops@example.com",
             false,
+            "",
             transport != "disabled",
             true,
             mail_from_present,
@@ -5092,6 +5244,7 @@ pub struct Vault {
             true,
             "ops@example.com",
             false,
+            "",
             transport != "disabled",
             true,
             mail_from_present,
@@ -5126,6 +5279,7 @@ pub struct Vault {
             true,
             "ops@example.com",
             false,
+            "",
             transport != "disabled",
             true,
             mail_from_present,
@@ -5153,6 +5307,7 @@ pub struct Vault {
             true,
             "not-an-address",
             false,
+            "",
             true, // usable transport
             true, // production
             true, // [mail] from present
@@ -5184,6 +5339,7 @@ pub struct Vault {
             true,
             "not-an-address",
             false,
+            "",
             true,
             false, // dev
             true,
@@ -5199,8 +5355,16 @@ pub struct Vault {
     fn alert_destination_valid_plus_addressing_passes_in_prod() {
         // A perfectly valid address using `+` sub-addressing and a multi-label
         // domain must NOT be rejected — the validity check must not over-reject.
-        let r =
-            check_alert_destination_impl(true, "a+b@sub.example.co", false, true, true, true, true);
+        let r = check_alert_destination_impl(
+            true,
+            "a+b@sub.example.co",
+            false,
+            "",
+            true,
+            true,
+            true,
+            true,
+        );
         assert!(
             matches!(r.status, CheckStatus::Pass),
             "a valid `+`-addressed, multi-label-domain email is a working destination"
@@ -5219,6 +5383,7 @@ pub struct Vault {
             true,
             "mailto:oncall@example.com",
             false,
+            "",
             true, // usable transport
             true, // production
             true, // [mail] from present
@@ -5250,6 +5415,7 @@ pub struct Vault {
             false, // alerting disabled
             "not-an-address",
             false,
+            "",
             true,
             true,
             true,
@@ -5278,7 +5444,7 @@ pub struct Vault {
         assert!(!email, "the prod profile cleared the email");
         assert!(webhook, "the signed webhook remains configured");
         // Mail transport disabled — irrelevant to the webhook path.
-        let r = check_alert_destination_impl(true, "", webhook, false, true, true, true);
+        let r = check_alert_destination_impl(true, "", webhook, "", false, true, true, true);
         assert!(
             matches!(r.status, CheckStatus::Pass),
             "a signed webhook is a valid destination regardless of mail transport"
@@ -5315,7 +5481,7 @@ pub struct Vault {
         );
 
         // And the surfaced doctor check warns in production for this config.
-        let r = check_alert_destination_impl(true, "", false, true, true, true, true);
+        let r = check_alert_destination_impl(true, "", false, "", true, true, true, true);
         assert!(matches!(r.status, CheckStatus::Warn));
     }
 
@@ -5382,7 +5548,7 @@ pub struct Vault {
             webhook,
             "webhook_url + webhook_secret must count as configured"
         );
-        let r = check_alert_destination_impl(true, "", webhook, true, true, true, true);
+        let r = check_alert_destination_impl(true, "", webhook, "", true, true, true, true);
         assert!(matches!(r.status, CheckStatus::Pass));
     }
 
@@ -5398,7 +5564,7 @@ pub struct Vault {
             !webhook,
             "a webhook_url with no signing secret is not a destination"
         );
-        let r = check_alert_destination_impl(true, "", webhook, true, true, true, true);
+        let r = check_alert_destination_impl(true, "", webhook, "", true, true, true, true);
         assert!(
             matches!(r.status, CheckStatus::Warn),
             "URL-without-secret in production must warn"
@@ -5420,7 +5586,7 @@ pub struct Vault {
             !webhook,
             "a prod-profile empty webhook_secret must clear the base secret"
         );
-        let r = check_alert_destination_impl(true, "", webhook, true, true, true, true);
+        let r = check_alert_destination_impl(true, "", webhook, "", true, true, true, true);
         assert!(matches!(r.status, CheckStatus::Warn));
 
         // And an empty AUTUMN_ALERTS__WEBHOOK_SECRET env var clears it just the same.
@@ -5431,6 +5597,112 @@ pub struct Vault {
             !webhook_env,
             "an empty AUTUMN_ALERTS__WEBHOOK_SECRET must clear the secret"
         );
+    }
+
+    #[test]
+    fn resolve_alert_destination_absolute_webhook_url_with_secret_passes() {
+        // An absolute https URL + secret is a real destination: the runtime's HTTP
+        // client dispatches it and the signed POST is deliverable → prod passes.
+        let table: toml::Table = toml::from_str(
+            "[alerts]\nwebhook_url = \"https://hooks.example/x\"\nwebhook_secret = \"s3cr3t\"\n",
+        )
+        .unwrap();
+        let (email, webhook) = resolve_alert_destination_from_sources(no_env, Some(&table), "prod");
+        assert!(!email);
+        assert!(webhook, "absolute https webhook_url + secret is configured");
+        let r = check_alert_destination_impl(
+            true,
+            "",
+            webhook,
+            "https://hooks.example/x",
+            true,
+            true,
+            true,
+            true,
+        );
+        assert!(matches!(r.status, CheckStatus::Pass));
+    }
+
+    #[test]
+    fn resolve_alert_destination_absolute_http_webhook_url_with_secret_passes() {
+        // Runtime treats `http://…` as absolute too (it does not require TLS), so
+        // doctor must accept it — rejecting it would be a false-positive warning.
+        let table: toml::Table = toml::from_str(
+            "[alerts]\nwebhook_url = \"http://hooks.example/x\"\nwebhook_secret = \"s3cr3t\"\n",
+        )
+        .unwrap();
+        let (_email, webhook) =
+            resolve_alert_destination_from_sources(no_env, Some(&table), "prod");
+        assert!(
+            webhook,
+            "an absolute http:// webhook_url + secret must count, matching runtime"
+        );
+        let r = check_alert_destination_impl(
+            true,
+            "",
+            webhook,
+            "http://hooks.example/x",
+            true,
+            true,
+            true,
+            true,
+        );
+        assert!(matches!(r.status, CheckStatus::Pass));
+    }
+
+    #[test]
+    fn resolve_alert_destination_relative_webhook_url_is_not_configured_and_warns() {
+        // A relative `webhook_url` (no scheme) + secret: the runtime's HTTP client
+        // only dispatches URLs starting with http(s)://, and an alert webhook has
+        // no base-url alias to resolve a relative value against, so EVERY signed
+        // POST fails. doctor must NOT count it and must emit its DEDICATED warning
+        // naming the value in production — not the generic "no destination" one.
+        let table: toml::Table = toml::from_str(
+            "[alerts]\nwebhook_url = \"hooks.example/x\"\nwebhook_secret = \"s3cr3t\"\n",
+        )
+        .unwrap();
+        let (email, webhook) = resolve_alert_destination_from_sources(no_env, Some(&table), "prod");
+        assert!(!email);
+        assert!(
+            !webhook,
+            "a relative webhook_url is not an absolute http(s) URL, so it is not a destination"
+        );
+        let r = check_alert_destination_impl(
+            true,
+            "",
+            webhook,
+            "hooks.example/x",
+            true,
+            true,
+            true,
+            true,
+        );
+        assert!(
+            matches!(r.status, CheckStatus::Warn),
+            "a relative webhook_url in production must warn"
+        );
+        let detail = r.detail.unwrap_or_default();
+        assert!(
+            detail.contains("not an absolute http(s) URL") && detail.contains("hooks.example/x"),
+            "the warning must name the offending value and its cause, got: {detail}"
+        );
+    }
+
+    #[test]
+    fn alert_destination_relative_webhook_url_is_lenient_in_dev() {
+        // Outside production the check stays lenient — a malformed webhook URL is
+        // not fatal locally, so it passes quietly like the rest of this check.
+        let r = check_alert_destination_impl(
+            true,
+            "",
+            false,
+            "hooks.example/x",
+            true,
+            false, // dev
+            true,
+            true,
+        );
+        assert!(matches!(r.status, CheckStatus::Pass));
     }
 
     // ── merged-config view (issue #1610) ──────────────────────────────────────
@@ -5474,7 +5746,7 @@ pub struct Vault {
             !email,
             "an autumn-prod.toml that clears [alerts].email must resolve as no destination"
         );
-        let r = check_alert_destination_impl(true, "", false, true, true, true, true);
+        let r = check_alert_destination_impl(true, "", false, "", true, true, true, true);
         assert!(
             matches!(r.status, CheckStatus::Warn),
             "a production deploy whose override file cleared the only alert channel must WARN"
@@ -5513,8 +5785,16 @@ pub struct Vault {
         let (email, webhook) = resolve_alert_destination_from_sources(no_env, Some(&merged), "");
         assert!(email);
         assert!(!webhook);
-        let r =
-            check_alert_destination_impl(true, "ops@example.com", webhook, true, true, true, true);
+        let r = check_alert_destination_impl(
+            true,
+            "ops@example.com",
+            webhook,
+            "",
+            true,
+            true,
+            true,
+            true,
+        );
         assert!(matches!(r.status, CheckStatus::Pass));
     }
 
@@ -5537,7 +5817,7 @@ pub struct Vault {
             !webhook,
             "a webhook whose secret was cleared by the override file is not a signed destination"
         );
-        let r = check_alert_destination_impl(true, "", webhook, true, true, true, true);
+        let r = check_alert_destination_impl(true, "", webhook, "", true, true, true, true);
         assert!(matches!(r.status, CheckStatus::Warn));
 
         // With both left intact through the merged view, the webhook still counts.
@@ -5625,6 +5905,7 @@ pub struct Vault {
             enabled,
             "ops@example.com",
             webhook,
+            "",
             true,
             true,
             true,
@@ -5654,6 +5935,7 @@ pub struct Vault {
             enabled,
             "ops@example.com",
             webhook,
+            "",
             true,
             true,
             true,
@@ -5675,6 +5957,7 @@ pub struct Vault {
             enabled,
             "ops@example.com",
             webhook,
+            "",
             true,
             true,
             true,
@@ -5695,6 +5978,7 @@ pub struct Vault {
             enabled,
             "ops@example.com",
             webhook,
+            "",
             true,
             false,
             true,
