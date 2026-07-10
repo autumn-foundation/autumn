@@ -1,8 +1,8 @@
+use autumn_web::idempotency::IdempotencyRecord;
+use autumn_web::idempotency::IdempotencyStore;
+use autumn_web::idempotency::MemoryIdempotencyStore;
 use proptest::prelude::*;
 use std::time::Duration;
-use autumn_web::idempotency::MemoryIdempotencyStore;
-use autumn_web::idempotency::IdempotencyStore;
-use autumn_web::idempotency::IdempotencyRecord;
 
 proptest! {
     #[test]
