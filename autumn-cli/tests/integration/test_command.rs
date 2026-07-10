@@ -23,6 +23,13 @@ fn run_autumn(dir: &Path, args: &[&str], envs: &[(&str, &str)]) -> (String, Stri
     let output = Command::new(autumn_bin())
         .args(args)
         .current_dir(dir)
+        // Clear any inherited database URL vars so resolution depends only on
+        // `envs` — otherwise a machine/CI that exports `DATABASE_URL` would leak
+        // a real URL into the "no URL configured" case. Explicit `envs` below
+        // still win, since they are applied after these removals.
+        .env_remove("DATABASE_URL")
+        .env_remove("AUTUMN_DATABASE__URL")
+        .env_remove("AUTUMN_DATABASE__PRIMARY_URL")
         .envs(envs.iter().copied())
         .output()
         .expect("failed to run autumn");
@@ -189,14 +196,36 @@ async fn test_create_if_missing_is_idempotent_and_preserves_data() {
     let dir = tmp.path();
     write_cargo_fixture(dir, true);
 
-    // First run creates + migrates + runs.
+    // First run creates + migrates + runs. `keepdata_test` is already
+    // test-shaped, so the derived URL is exactly `url`.
     run_autumn_ok(dir, &["test"], &envs);
+
+    // Write a sentinel row into the migrated `widgets` table (created by the
+    // fixture migration). If the second run recreated or dropped the database,
+    // this row would vanish.
+    let sentinel = "sentinel-preserve-me";
+    crate::common::execute_params(&url, "INSERT INTO widgets (name) VALUES ($1)", &[&sentinel])
+        .await;
 
     // Second run (no --reset) must leave the existing database intact: the
     // create step reports the idempotent "already exists" notice.
     let (stdout, stderr) = run_autumn_ok(dir, &["test"], &envs);
     let combined = format!("{stdout}{stderr}");
     assert!(combined.contains("already exists"), "output: {combined}");
+
+    // The sentinel row survived — proving the database (and its data) was
+    // preserved rather than recreated.
+    let survived = crate::common::query_one_text(
+        &url,
+        "SELECT name FROM widgets WHERE name = $1",
+        &[&sentinel],
+    )
+    .await;
+    assert_eq!(
+        survived.as_deref(),
+        Some(sentinel),
+        "sentinel row was lost — the database was not preserved",
+    );
 }
 
 #[tokio::test]

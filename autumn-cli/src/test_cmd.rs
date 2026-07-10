@@ -14,7 +14,10 @@
 //!   4. Runs all pending app + framework migrations against it, reusing the
 //!      existing `autumn migrate` path (no separate migration engine).
 //!   5. Shells out to `cargo test` with `AUTUMN_ENV=test` and the resolved
-//!      test `DATABASE_URL` exported, forwarding any trailing arguments.
+//!      test `DATABASE_URL` exported, forwarding any trailing arguments to the
+//!      test harness after a `--` separator (mirroring `cargo test -- <args>`),
+//!      so `autumn test -- --nocapture some_test` runs
+//!      `cargo test -- --nocapture some_test`.
 //!
 //! The command refuses to run against a database whose name cannot be made
 //! test-shaped, mirroring the production-safety guardrails of `autumn migrate`
@@ -77,11 +80,11 @@ pub fn run(reset: bool, cargo_args: &[String]) -> ! {
     run_step("migrate", &["migrate"], &test_url);
 
     // 5. Shell out to `cargo test` with the test environment exported and the
-    //    trailing args forwarded verbatim, then exit with its exact code.
+    //    trailing args forwarded to the test harness after `--`, then exit with
+    //    its exact code.
     eprintln!("\u{2500}\u{2500} cargo test \u{2500}\u{2500}");
     let status = Command::new("cargo")
-        .arg("test")
-        .args(cargo_args)
+        .args(cargo_test_args(cargo_args))
         .env("AUTUMN_ENV", "test")
         .env("DATABASE_URL", &test_url)
         .env("AUTUMN_DATABASE__PRIMARY_URL", &test_url)
@@ -98,6 +101,24 @@ pub fn run(reset: bool, cargo_args: &[String]) -> ! {
             std::process::exit(1);
         }
     }
+}
+
+/// Build the arguments passed to `cargo`, forwarding the user's trailing args to
+/// the test *harness* (libtest) after a `--` separator — mirroring
+/// `cargo test -- <harness-args>`.
+///
+/// clap strips the leading `--` from `autumn test -- --nocapture some_test`, so
+/// `user_args` arrives as `["--nocapture", "some_test"]`. Passing those straight
+/// to `cargo test` would make cargo reject `--nocapture` as an unknown flag; the
+/// `--` separator must be reinserted so they reach the harness instead. When
+/// there are no user args, plain `cargo test` (no trailing `--`) is emitted.
+fn cargo_test_args(user_args: &[String]) -> Vec<String> {
+    let mut args = vec!["test".to_owned()];
+    if !user_args.is_empty() {
+        args.push("--".to_owned());
+        args.extend(user_args.iter().cloned());
+    }
+    args
 }
 
 /// Run one provisioning step by self-invoking the `autumn` binary with the test
@@ -219,6 +240,26 @@ fn decode_percent(segment: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cargo_test_args_empty_input_is_plain_test() {
+        assert_eq!(cargo_test_args(&[]), vec!["test".to_owned()]);
+    }
+
+    #[test]
+    fn cargo_test_args_forwards_harness_args_after_separator() {
+        let user = vec!["--nocapture".to_owned(), "some_test".to_owned()];
+        assert_eq!(
+            cargo_test_args(&user),
+            vec!["test", "--", "--nocapture", "some_test"]
+        );
+    }
+
+    #[test]
+    fn cargo_test_args_forwards_single_filter_after_separator() {
+        let user = vec!["my_filter".to_owned()];
+        assert_eq!(cargo_test_args(&user), vec!["test", "--", "my_filter"]);
+    }
 
     #[test]
     fn is_test_db_name_accepts_test_and_underscore_test() {

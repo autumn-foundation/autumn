@@ -248,8 +248,9 @@ enum Commands {
     ///      given (a bare `…/myapp` targets `…/myapp_test`).
     ///   2. Create the database if missing (existing data is left intact).
     ///   3. Run all pending app + framework migrations against it.
-    ///   4. Shell out to `cargo test`, forwarding trailing args, and exit with
-    ///      its exit code (a failing suite fails the command).
+    ///   4. Shell out to `cargo test`, forwarding trailing args to the test
+    ///      harness after `--` (like `cargo test -- <args>`), and exit with its
+    ///      exit code (a failing suite fails the command).
     ///
     /// `--reset` drops and recreates the database first (clean slate for schema
     /// drift). The command refuses to run against a non-test database name.
@@ -267,8 +268,9 @@ enum Commands {
         /// data is left intact).
         #[arg(long)]
         reset: bool,
-        /// Arguments forwarded verbatim to `cargo test`, e.g.
-        /// `autumn test -- --nocapture some_test`.
+        /// Arguments forwarded to the test harness after `--` (mirroring
+        /// `cargo test -- <args>`), e.g. `autumn test -- --nocapture some_test`
+        /// runs `cargo test -- --nocapture some_test`.
         #[arg(
             value_name = "CARGO_TEST_ARGS",
             trailing_var_arg = true,
