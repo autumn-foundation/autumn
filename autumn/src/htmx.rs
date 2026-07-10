@@ -317,6 +317,37 @@ impl OobSwap {
             }
         }
     }
+
+    /// Whether this OOB swap is *positional* — i.e. htmx inserts the carrier
+    /// element's own child nodes at the target (`beforebegin` / `afterbegin` /
+    /// `beforeend` / `afterend`) rather than swapping the carrier element itself
+    /// (`true` / `outerHTML` by id).
+    ///
+    /// This matters for the carrier tag: htmx's positional insert loop iterates
+    /// the carrier's `childNodes`, but an `HTMLTemplateElement` keeps its
+    /// children in `.content` (a `DocumentFragment`), so `template.childNodes`
+    /// is empty and htmx would append nothing. Positional swaps must therefore
+    /// use a plain `<div>` carrier — whose real children live in `childNodes` —
+    /// while element-replacing swaps keep the `<template>` carrier (#1688).
+    #[must_use]
+    const fn is_positional(&self) -> bool {
+        match self {
+            Self::BeforeBegin | Self::AfterBegin | Self::BeforeEnd | Self::AfterEnd => true,
+            Self::Target(method, _) => matches!(
+                method,
+                OobMethod::BeforeBegin
+                    | OobMethod::AfterBegin
+                    | OobMethod::BeforeEnd
+                    | OobMethod::AfterEnd
+            ),
+            Self::True
+            | Self::OuterHTML
+            | Self::InnerHTML
+            | Self::Delete
+            | Self::Custom(_)
+            | Self::Raw => false,
+        }
+    }
 }
 
 #[cfg(feature = "maud")]
@@ -472,11 +503,25 @@ impl maud::Render for HtmxFragments {
                 w.push_str(rendered);
             } else {
                 let value = oob.strategy.format_value(&oob.id);
-                w.push_str("<template hx-swap-oob=\"");
+                // Positional swaps must use a `<div>` carrier: htmx inserts the
+                // carrier's `childNodes`, and a `<template>` keeps its children
+                // in `.content` (empty `childNodes`), so the fragment would
+                // never land in the DOM (#1688). Element-replacing swaps keep
+                // the `<template>` carrier htmx unwraps by id.
+                let carrier = if oob.strategy.is_positional() {
+                    "div"
+                } else {
+                    "template"
+                };
+                w.push('<');
+                w.push_str(carrier);
+                w.push_str(" hx-swap-oob=\"");
                 escape_attribute(w, &value);
                 w.push_str("\">");
                 w.push_str(rendered);
-                w.push_str("</template>");
+                w.push_str("</");
+                w.push_str(carrier);
+                w.push('>');
             }
         }
     }
@@ -857,10 +902,80 @@ mod tests {
                 .contains("<template hx-swap-oob=\"true\"><div id=\"badge\">3</div></template>"),
             "got: {body_str}"
         );
+        // Positional swaps (#1688) use a <div> carrier — NOT a <template> —
+        // because htmx inserts the carrier's childNodes, which are empty for a
+        // <template> (its children live in .content).
         assert!(
-            body_str
-                .contains("<template hx-swap-oob=\"beforeend:#list\"><li>new item</li></template>"),
+            body_str.contains("<div hx-swap-oob=\"beforeend:#list\"><li>new item</li></div>"),
             "got: {body_str}"
+        );
+        assert!(
+            !body_str.contains("<template hx-swap-oob=\"beforeend"),
+            "positional swap must not emit a <template> carrier: {body_str}"
+        );
+    }
+
+    /// Regression for #1688: a positional OOB swap must emit a carrier whose own
+    /// `childNodes` htmx can iterate and insert. This models htmx's positional
+    /// insert (which reads `carrier.childNodes`, empty for a `<template>` since
+    /// its children live in `.content`) rather than only asserting the string.
+    #[cfg(feature = "maud")]
+    #[tokio::test]
+    async fn htmx_fragments_positional_oob_uses_div_carrier_with_real_children() {
+        use axum::response::IntoResponse;
+        use maud::Render;
+
+        // Render each positional strategy and confirm the carrier is a <div>
+        // (whose childNodes are the fragment) and never a <template>.
+        for (strategy, value) in [
+            (OobSwap::BeforeEnd, "beforeend:#list"),
+            (OobSwap::AfterBegin, "afterbegin:#list"),
+            (OobSwap::BeforeBegin, "beforebegin:#list"),
+            (OobSwap::AfterEnd, "afterend:#list"),
+        ] {
+            let fragment = maud::html! { li { "row" } };
+            let rendered = HtmxFragments::oob_only()
+                .oob_with_strategy("list", strategy, fragment)
+                .render()
+                .into_string();
+
+            let open = format!("<div hx-swap-oob=\"{value}\">");
+            assert!(
+                rendered.starts_with(&open) && rendered.ends_with("</div>"),
+                "positional swap {value:?} must use a <div> carrier: {rendered}"
+            );
+            assert!(
+                !rendered.contains("<template"),
+                "positional swap {value:?} must not use a <template> carrier: {rendered}"
+            );
+
+            // Model htmx's positional insert: the nodes it appends are the
+            // carrier's *direct children* (the text between the carrier's open
+            // and close tags). For this <div> carrier those children are the
+            // rendered fragment; a <template> carrier would expose no childNodes
+            // here and htmx would append nothing.
+            let children = rendered
+                .strip_prefix(&open)
+                .and_then(|s| s.strip_suffix("</div>"))
+                .expect("carrier open/close tags");
+            assert_eq!(
+                children, "<li>row</li>",
+                "the <div> carrier's childNodes must be the fragment htmx inserts",
+            );
+        }
+
+        // outerHTML/by-id (`true`) swaps still use the <template> carrier that
+        // htmx unwraps — this is deliberately unchanged.
+        let response = HtmxFragments::oob_only()
+            .oob("badge", maud::html! { div id="badge" { "3" } })
+            .into_response();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_str = String::from_utf8(body.to_vec()).unwrap();
+        assert_eq!(
+            body_str,
+            "<template hx-swap-oob=\"true\"><div id=\"badge\">3</div></template>"
         );
     }
 
