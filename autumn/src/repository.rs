@@ -160,10 +160,13 @@ pub fn publish_deferred_dependent_broadcasts(broadcasts: Vec<(String, String)>) 
     }
     if let Some(channels) = crate::__private::get_global_channels() {
         let fragment = crate::html! {};
-        for (topic, dom_id) in &broadcasts {
+        // Consume the buffer so the owned (topic, dom_id) strings move straight
+        // into the publish call (no needless clone, and the `Vec` is consumed —
+        // avoiding `clippy::needless_pass_by_value`).
+        for (topic, dom_id) in broadcasts {
             if let Err(err) = channels.broadcast().publish_oob(
-                topic,
-                dom_id,
+                &topic,
+                &dom_id,
                 &crate::htmx::OobSwap::Delete,
                 &fragment,
             ) {

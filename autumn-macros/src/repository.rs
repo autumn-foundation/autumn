@@ -7893,7 +7893,16 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         } else {
             quote! { false }
         };
-        let cascade_calls = config.dependents.iter().map(|dep| {
+        // #1369 restrict ordering: probe every `restrict` dependent BEFORE
+        // running any mutating dependent (`destroy`/`delete_all`/`nullify`).
+        // Mutating actions fire child `before_delete` hooks (counters, cache
+        // invalidation, external calls) that are NOT commit hooks — a later
+        // `restrict` 409 rolls back the DB but cannot retract those side effects.
+        // Hoisting all restrict probes ahead of the mutating pass means a blocked
+        // delete never touches a child hook. Per-action semantics are unchanged;
+        // only the order within the single transaction changes. `restrict` probes
+        // keep their parent-soft gating and short-circuit via `AutumnError`.
+        let emit_cascade_call = |dep: &DependentSpec| {
             let child_repo = &dep.child_repo;
             let fk = &dep.fk;
             let action_variant = dep.action.variant_ident();
@@ -7915,8 +7924,26 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         .await?
                 );
             }
-        });
-        let cascade_calls = quote! { #(#cascade_calls)* };
+        };
+        let restrict_calls: ::std::vec::Vec<_> = config
+            .dependents
+            .iter()
+            .filter(|dep| dep.action == DependentAction::Restrict)
+            .map(&emit_cascade_call)
+            .collect();
+        let mutating_calls: ::std::vec::Vec<_> = config
+            .dependents
+            .iter()
+            .filter(|dep| dep.action != DependentAction::Restrict)
+            .map(&emit_cascade_call)
+            .collect();
+        let cascade_calls = quote! {
+            // Phase 1: probe all `restrict` dependents first — a 409 here rolls
+            // back before any mutating action fires a child hook.
+            #(#restrict_calls)*
+            // Phase 2: mutating dependents in declaration order.
+            #(#mutating_calls)*
+        };
 
         let tenant_id_setup = if config.tenant_scoped {
             quote! {
@@ -14547,6 +14574,42 @@ mod tests {
         assert!(
             cascade_pos < parent_delete_pos,
             "children must be cascaded before the parent DELETE: {section}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_dependent_restrict_probes_before_mutating_actions() {
+        // #1369 restrict ordering: even when a mutating dependent (destroy) is
+        // declared BEFORE a `restrict` dependent, the generated delete_by_id must
+        // run ALL restrict probes before ANY mutating apply call — so a 409 rolls
+        // back before a child `before_delete` side effect ever fires.
+        let generated = repository_macro(
+            quote! {
+                Post,
+                dependent(PgCommentRepository, fk = "post_id", on_delete = destroy),
+                dependent(PgVoteRepository, fk = "post_id", on_delete = delete_all),
+                dependent(PgAwardRepository, fk = "post_id", on_delete = restrict),
+                dependent(PgBadgeRepository, fk = "post_id", on_delete = restrict)
+            },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        let section = delete_by_id_section(&generated);
+        // Every restrict apply call must precede every mutating apply call. The
+        // apply calls pass the action as `DependentAction :: <Variant>`.
+        let last_restrict = section
+            .rfind("DependentAction :: Restrict")
+            .expect("restrict apply calls must be emitted");
+        let first_mutating = section
+            .find("DependentAction :: Destroy")
+            .into_iter()
+            .chain(section.find("DependentAction :: DeleteAll"))
+            .chain(section.find("DependentAction :: Nullify"))
+            .min()
+            .expect("mutating apply calls must be emitted");
+        assert!(
+            last_restrict < first_mutating,
+            "all restrict probes must be hoisted ahead of the first mutating apply call: {section}"
         );
     }
 
