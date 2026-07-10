@@ -318,34 +318,36 @@ impl OobSwap {
         }
     }
 
-    /// Whether this OOB swap is *positional* — i.e. htmx inserts the carrier
-    /// element's own child nodes at the target (`beforebegin` / `afterbegin` /
-    /// `beforeend` / `afterend`) rather than swapping the carrier element itself
-    /// (`true` / `outerHTML` by id).
+    /// Whether htmx applies this swap by iterating the carrier element's own
+    /// child nodes — true for the *positional* swaps (`beforebegin` /
+    /// `afterbegin` / `beforeend` / `afterend`) **and** for `innerHTML`, which
+    /// all route through the same insert loop over `carrier.childNodes`. Only
+    /// the element-replacing swaps (`true` / `outerHTML` by id) unwrap the
+    /// carrier by id instead, so they return `false`.
     ///
-    /// This matters for the carrier tag: htmx's positional insert loop iterates
-    /// the carrier's `childNodes`, but an `HTMLTemplateElement` keeps its
-    /// children in `.content` (a `DocumentFragment`), so `template.childNodes`
-    /// is empty and htmx would append nothing. Positional swaps must therefore
+    /// This matters for the carrier tag: htmx's insert loop iterates the
+    /// carrier's `childNodes`, but an `HTMLTemplateElement` keeps its children
+    /// in `.content` (a `DocumentFragment`), so `template.childNodes` is empty
+    /// and htmx would append nothing. Child-node-inserting swaps must therefore
     /// use a plain `<div>` carrier — whose real children live in `childNodes` —
     /// while element-replacing swaps keep the `<template>` carrier (#1688).
     #[must_use]
-    const fn is_positional(&self) -> bool {
+    const fn inserts_child_nodes(&self) -> bool {
         match self {
-            Self::BeforeBegin | Self::AfterBegin | Self::BeforeEnd | Self::AfterEnd => true,
+            Self::InnerHTML
+            | Self::BeforeBegin
+            | Self::AfterBegin
+            | Self::BeforeEnd
+            | Self::AfterEnd => true,
             Self::Target(method, _) => matches!(
                 method,
-                OobMethod::BeforeBegin
+                OobMethod::InnerHTML
+                    | OobMethod::BeforeBegin
                     | OobMethod::AfterBegin
                     | OobMethod::BeforeEnd
                     | OobMethod::AfterEnd
             ),
-            Self::True
-            | Self::OuterHTML
-            | Self::InnerHTML
-            | Self::Delete
-            | Self::Custom(_)
-            | Self::Raw => false,
+            Self::True | Self::OuterHTML | Self::Delete | Self::Custom(_) | Self::Raw => false,
         }
     }
 }
@@ -384,7 +386,10 @@ struct OobFragment {
 /// let rendered = response.render().into_string();
 /// assert!(rendered.contains("<div>Task created successfully!</div>"));
 /// assert!(rendered.contains("<template hx-swap-oob=\"true\"><div id=\"flash-message\""));
-/// assert!(rendered.contains("<template hx-swap-oob=\"innerHTML:#task-count\"><span>5</span></template>"));
+/// // htmx inserts the carrier's child nodes for `innerHTML`, so the carrier
+/// // must be a `<div>` — a `<template>`'s children live in `.content`, giving
+/// // empty `childNodes`, so nothing would land in the DOM.
+/// assert!(rendered.contains("<div hx-swap-oob=\"innerHTML:#task-count\"><span>5</span></div>"));
 /// ```
 #[derive(Debug, Clone)]
 pub struct HtmxFragments {
@@ -503,22 +508,24 @@ impl maud::Render for HtmxFragments {
                 w.push_str(rendered);
             } else {
                 let value = oob.strategy.format_value(&oob.id);
-                // Positional swaps must use a `<div>` carrier: htmx inserts the
-                // carrier's `childNodes`, and a `<template>` keeps its children
-                // in `.content` (empty `childNodes`), so the fragment would
-                // never land in the DOM (#1688). Element-replacing swaps keep
-                // the `<template>` carrier htmx unwraps by id.
+                // Child-node-inserting swaps must use a `<div>` carrier: htmx
+                // inserts the carrier's `childNodes` for the positional swaps
+                // (beforebegin/afterbegin/beforeend/afterend) *and* for
+                // `innerHTML`, and a `<template>` keeps its children in
+                // `.content` (empty `childNodes`), so the fragment would never
+                // land in the DOM (#1688). Element-replacing swaps (`true` /
+                // `outerHTML` by id) keep the `<template>` carrier htmx unwraps.
                 //
                 // Because htmx inserts the carrier's direct `childNodes`, a
-                // fragment given to a positional swap must be a valid direct
-                // child of a `<div>`. Do NOT pass a bare `<tr>`/`<td>`/
-                // `<tbody>`/`<option>`/`<col>`: the HTML parser foster-parents
-                // those out of a `<div>`, so they vanish before htmx sees them.
+                // fragment given to such a swap must be a valid direct child of
+                // a `<div>`. Do NOT pass a bare `<tr>`/`<td>`/`<tbody>`/
+                // `<option>`/`<col>`: the HTML parser foster-parents those out
+                // of a `<div>`, so they vanish before htmx sees them.
                 // Table-row live swaps instead go through the element-replacing
-                // (`outerHTML` / `is_positional() == false`) path with the id on
-                // the row itself (see `channels.rs::sse_oob_envelope`); a
+                // (`outerHTML` / `inserts_child_nodes() == false`) path with the
+                // id on the row itself (see `channels.rs::sse_oob_envelope`); a
                 // positional table-row fragment API is a documented follow-up.
-                let carrier = if oob.strategy.is_positional() {
+                let carrier = if oob.strategy.inserts_child_nodes() {
                     "div"
                 } else {
                     "template"
@@ -987,6 +994,59 @@ mod tests {
             body_str,
             "<template hx-swap-oob=\"true\"><div id=\"badge\">3</div></template>"
         );
+    }
+
+    /// Regression (same class as #1688): an `innerHTML` OOB swap must also emit
+    /// a `<div>` carrier, not a `<template>`. htmx's `innerHTML` swap is
+    /// non-inline and iterates the carrier's `childNodes` (only `outerHTML` /
+    /// `true` unwrap the carrier by id), so a `<template>` carrier — whose
+    /// children live in `.content` — would insert nothing at runtime. This
+    /// mirrors `channels.rs::sse_oob_envelope`, which already wraps `innerHTML`
+    /// in a `<div>`.
+    #[cfg(feature = "maud")]
+    #[tokio::test]
+    async fn htmx_fragments_inner_html_oob_uses_div_carrier_with_real_children() {
+        use maud::Render;
+
+        // Both the shorthand `InnerHTML` and the targeted
+        // `Target(InnerHTML, …)` strategy must use a <div> carrier.
+        for (strategy, value) in [
+            (OobSwap::InnerHTML, "innerHTML:#count"),
+            (
+                OobSwap::Target(OobMethod::InnerHTML, "#count".to_string()),
+                "innerHTML:#count",
+            ),
+        ] {
+            let fragment = maud::html! { span { "5" } };
+            let rendered = HtmxFragments::oob_only()
+                .oob_with_strategy("count", strategy, fragment)
+                .render()
+                .into_string();
+
+            let open = format!("<div hx-swap-oob=\"{value}\">");
+            assert!(
+                rendered.starts_with(&open) && rendered.ends_with("</div>"),
+                "innerHTML swap {value:?} must use a <div> carrier: {rendered}"
+            );
+            assert!(
+                !rendered.contains("<template"),
+                "innerHTML swap {value:?} must not use a <template> carrier: {rendered}"
+            );
+
+            // Model htmx's innerHTML insert: the nodes it appends are the
+            // carrier's *direct children* (the text between the carrier's open
+            // and close tags). For this <div> carrier those children are the
+            // rendered fragment; a <template> carrier would expose no childNodes
+            // here and htmx would insert nothing.
+            let children = rendered
+                .strip_prefix(&open)
+                .and_then(|s| s.strip_suffix("</div>"))
+                .expect("carrier open/close tags");
+            assert_eq!(
+                children, "<span>5</span>",
+                "the <div> carrier's childNodes must be the fragment htmx inserts",
+            );
+        }
     }
 
     #[cfg(feature = "maud")]

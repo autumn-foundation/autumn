@@ -4,4 +4,4 @@
 #
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
-cc 1ebcbef9e2a58e1c052a29632bcda2cd0fe4b6b51a32457fc64212a85f98d4e1 # shrinks to path = "{{}"
+cc 1ebcbef9e2a58e1c052a29632bcda2cd0fe4b6b51a32457fc64212a85f98d4e1 # brace-dense input (replays to path = "{{iw:}") exercising the #1721 brace-in-name bug
