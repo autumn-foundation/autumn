@@ -600,15 +600,19 @@ fn alert_disabled_in_production_warning(has_destination: bool) -> CheckResult {
     }
 }
 
-// Five independent config booleans (alerting enabled, webhook is a usable signed
-// destination, mail transport usable, production, transport requires a `from`)
-// plus the resolved `[alerts] email`, `[alerts] webhook_url`, and `[mail] from`
-// strings each gate a distinct branch; grouping them into enums would obscure
-// rather than clarify the destination-resolution logic. The raw `webhook_url` is
-// used only to name a present-but-non-absolute value in its dedicated warning —
-// `webhook_configured` already folds in absoluteness and the signing-secret
-// requirement — and `mail_from` likewise names a present-but-invalid sender in
-// its dedicated warning while its presence+validity gate the email destination.
+// Independent config booleans (alerting enabled, webhook is a usable signed
+// destination, mail transport usable, production, transport requires a `from`,
+// a native transport is configured) plus the resolved `[alerts] email`, `[alerts]
+// webhook_url`, and `[mail] from` strings each gate a distinct branch; grouping
+// them into enums would obscure rather than clarify the destination-resolution
+// logic. The raw `webhook_url` is used only to name a present-but-non-absolute
+// value in its dedicated warning — `webhook_configured` already folds in
+// absoluteness and the signing-secret requirement — and `mail_from` likewise
+// names a present-but-invalid sender in its dedicated warning while its
+// presence+validity gate the email destination. `native_transport_configured`
+// (a PagerDuty routing key or a Slack/Discord webhook URL) counts as a
+// destination the same way the runtime's `AlertConfig::has_destination` does; its
+// delivery-worthiness is validated separately by `check_alert_transports_impl`.
 #[allow(clippy::fn_params_excessive_bools, clippy::too_many_arguments)]
 pub fn check_alert_destination_impl(
     alerts_enabled: bool,
@@ -620,6 +624,7 @@ pub fn check_alert_destination_impl(
     mail_from: &str,
     transport_requires_from: bool,
     custom_channel: bool,
+    native_transport_configured: bool,
 ) -> CheckResult {
     // Presence and syntactic validity of the resolved `[alerts] email`. lettre
     // parses the recipient only at SEND time (`lettre_message`), not when the
@@ -669,7 +674,9 @@ pub fn check_alert_destination_impl(
             // Name the disabled switch explicitly. Mention the (otherwise valid)
             // destination when one is configured so the operator understands the
             // deploy is blind despite it; keep the message accurate otherwise.
-            return alert_disabled_in_production_warning(email_destination || webhook_configured);
+            return alert_disabled_in_production_warning(
+                email_destination || webhook_configured || native_transport_configured,
+            );
         }
         return CheckResult {
             name: "alert_destination",
@@ -686,7 +693,13 @@ pub fn check_alert_destination_impl(
     // and `from` requirements — mirroring the runtime, which skips
     // MailAlertChannel when `mailer.is_disabled()` and whose SMTP send fails
     // without a `from`.
-    if email_destination || webhook_configured {
+    // A native transport (PagerDuty / Slack / Discord) counts as a destination
+    // exactly as the runtime's `AlertConfig::has_destination` does — the runtime
+    // registers the channel for a native-only config, so doctor must not warn
+    // "no destination". The transports' own delivery-worthiness (routing-key
+    // shape, absolute-https URL) is validated separately by
+    // `check_alert_transports_impl`.
+    if email_destination || webhook_configured || native_transport_configured {
         return CheckResult {
             name: "alert_destination",
             status: CheckStatus::Pass,
@@ -779,6 +792,141 @@ pub fn check_alert_destination_impl(
             hint: None,
         }
     }
+}
+
+/// Whether `url` is a non-empty ABSOLUTE `https` URL with a host — the form the
+/// Slack and Discord webhook endpoints require. Slack and Discord only expose
+/// `https` webhook endpoints, so a plaintext `http://` (or relative) value will
+/// not deliver. Stricter than [`is_absolute_http_url_doctor`], which also accepts
+/// `http://`.
+fn is_absolute_https_url_doctor(url: &str) -> bool {
+    url.starts_with("https://")
+        && ::url::Url::parse(url)
+            .ok()
+            .and_then(|parsed| parsed.host_str().map(|h| !h.is_empty()))
+            .unwrap_or(false)
+}
+
+/// Check that configured native alert transports (`PagerDuty` / Slack / Discord,
+/// issue #1630) carry the config values they need to deliver.
+///
+/// Mirrors the runtime `alerts::native_transport_channels`, which registers a
+/// transport only when its required config is usable and otherwise skips it with
+/// a warning:
+/// - **`PagerDuty`** needs a non-blank `pagerduty_routing_key`; a
+///   `pagerduty_routing_key` containing embedded whitespace is malformed (a
+///   copy-paste error), and a set-but-non-absolute `pagerduty_url` override is
+///   never dispatched by the SSRF-hardened HTTP client. A `pagerduty_url` set
+///   with no routing key configures nothing.
+/// - **Slack / Discord** need an absolute `https` webhook URL: the HTTP client
+///   cannot dispatch a relative value, and both providers only expose `https`
+///   endpoints, so a plaintext `http://` URL will not deliver.
+///
+/// Production warns on any of the above; dev/test passes quietly (these
+/// transports are optional locally). Returns the first problem found so the
+/// operator gets one actionable message. The returned check name is
+/// `"alert_transports"`.
+#[must_use]
+pub fn check_alert_transports_impl(
+    pagerduty_routing_key: &str,
+    pagerduty_url: &str,
+    slack_webhook_url: &str,
+    discord_webhook_url: &str,
+    is_production: bool,
+) -> CheckResult {
+    const NAME: &str = "alert_transports";
+    let pd_key = pagerduty_routing_key.trim();
+    let pd_url = pagerduty_url.trim();
+    let slack = slack_webhook_url.trim();
+    let discord = discord_webhook_url.trim();
+
+    let pass = |detail: &str| CheckResult {
+        name: NAME,
+        status: CheckStatus::Pass,
+        detail: Some(detail.to_owned()),
+        hint: None,
+    };
+    let warn = |detail: String, hint: &'static str| CheckResult {
+        name: NAME,
+        status: CheckStatus::Warn,
+        detail: Some(detail),
+        hint: Some(hint),
+    };
+
+    let configured =
+        !pd_key.is_empty() || !pd_url.is_empty() || !slack.is_empty() || !discord.is_empty();
+    if !is_production {
+        return pass(if configured {
+            "native alert transports configured (validated in production mode)"
+        } else {
+            "no native alert transports configured (optional outside production)"
+        });
+    }
+
+    // PagerDuty: routing key must be present and well-formed; the URL override,
+    // when set, must be absolute; a URL with no routing key delivers nothing.
+    if !pd_key.is_empty() && pd_key.contains(char::is_whitespace) {
+        return warn(
+            format!(
+                "`[alerts] pagerduty_routing_key` (\"{pd_key}\") contains whitespace, so it is a \
+                 malformed Events API v2 routing key and PagerDuty will reject the event"
+            ),
+            "Set [alerts] pagerduty_routing_key (or AUTUMN_ALERTS__PAGERDUTY_ROUTING_KEY) to your \
+             integration's routing key with no surrounding or embedded whitespace. See \
+             docs/guide/operator-alerts.md",
+        );
+    }
+    if pd_key.is_empty() && !pd_url.is_empty() {
+        return warn(
+            "`[alerts] pagerduty_url` is set but no `pagerduty_routing_key` is configured, so no \
+             PagerDuty events will be delivered"
+                .to_owned(),
+            "Set [alerts] pagerduty_routing_key (or AUTUMN_ALERTS__PAGERDUTY_ROUTING_KEY), or \
+             remove pagerduty_url. See docs/guide/operator-alerts.md",
+        );
+    }
+    if !pd_key.is_empty() && !pd_url.is_empty() && !is_absolute_http_url_doctor(pd_url) {
+        return warn(
+            format!(
+                "`[alerts] pagerduty_url` (\"{pd_url}\") is not an absolute http(s) URL, so the \
+                 SSRF-hardened HTTP client cannot dispatch it and no PagerDuty events will be \
+                 delivered"
+            ),
+            "Set [alerts] pagerduty_url (or AUTUMN_ALERTS__PAGERDUTY_URL) to an absolute URL like \
+             https://events.pagerduty.com/v2/enqueue, or remove it to use the default. See \
+             docs/guide/operator-alerts.md",
+        );
+    }
+    if !slack.is_empty() && !is_absolute_https_url_doctor(slack) {
+        return warn(
+            format!(
+                "`[alerts] slack_webhook_url` (\"{slack}\") is not an absolute https URL, so no \
+                 Slack alerts will be delivered; Slack only exposes https incoming-webhook \
+                 endpoints and the HTTP client cannot dispatch a relative value"
+            ),
+            "Set [alerts] slack_webhook_url (or AUTUMN_ALERTS__SLACK_WEBHOOK_URL) to your Slack \
+             incoming-webhook URL (https://hooks.slack.com/services/…). See \
+             docs/guide/operator-alerts.md",
+        );
+    }
+    if !discord.is_empty() && !is_absolute_https_url_doctor(discord) {
+        return warn(
+            format!(
+                "`[alerts] discord_webhook_url` (\"{discord}\") is not an absolute https URL, so no \
+                 Discord alerts will be delivered; use the Slack-compatible endpoint \
+                 (https://discord.com/api/webhooks/…/slack)"
+            ),
+            "Set [alerts] discord_webhook_url (or AUTUMN_ALERTS__DISCORD_WEBHOOK_URL) to your \
+             Discord webhook's Slack-compatible URL (append /slack). See \
+             docs/guide/operator-alerts.md",
+        );
+    }
+
+    pass(if configured {
+        "configured native alert transports (PagerDuty/Slack/Discord) look deliverable"
+    } else {
+        "no native alert transports configured"
+    })
 }
 
 /// Check that a configured `[alerts] error_rate_threshold` is a usable 5xx rate
@@ -3524,6 +3672,67 @@ where
     true
 }
 
+/// Resolve the effective native-transport config strings (`pagerduty_routing_key`,
+/// `pagerduty_url`, `slack_webhook_url`, `discord_webhook_url`) the runtime boots
+/// with (issue #1630), honouring the same env `>` merged-base precedence as
+/// [`resolve_alert_destination`]: a PRESENT `AUTUMN_ALERTS__*` env var (even
+/// empty) wins and is terminal; otherwise the merged top-level `[alerts]` value
+/// is used (empty when unset). Returned as raw strings so
+/// [`check_alert_transports_impl`] can both validate and name a bad value.
+fn resolve_alert_transports() -> (String, String, String, String) {
+    let selected_input = std::env::var("AUTUMN_ENV")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .or_else(|| {
+            std::env::var("AUTUMN_PROFILE")
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+        })
+        .unwrap_or_default()
+        .trim()
+        .to_owned();
+    let normalized_profile = normalize_alert_profile(&selected_input);
+    let merged = get_merged_toml_table_runtime(&normalized_profile, &selected_input);
+    let read = |env_key: &str, key: &str| -> String {
+        std::env::var(env_key).unwrap_or_else(|_| {
+            merged
+                .get("alerts")
+                .and_then(|a| a.get(key))
+                .and_then(toml::Value::as_str)
+                .unwrap_or("")
+                .to_owned()
+        })
+    };
+    (
+        read(
+            "AUTUMN_ALERTS__PAGERDUTY_ROUTING_KEY",
+            "pagerduty_routing_key",
+        ),
+        read("AUTUMN_ALERTS__PAGERDUTY_URL", "pagerduty_url"),
+        read("AUTUMN_ALERTS__SLACK_WEBHOOK_URL", "slack_webhook_url"),
+        read("AUTUMN_ALERTS__DISCORD_WEBHOOK_URL", "discord_webhook_url"),
+    )
+}
+
+/// Whether any native alert transport (`PagerDuty` routing key, Slack or Discord
+/// webhook URL) is configured — the SAME predicate the runtime's
+/// `AlertConfig::has_destination` uses (non-empty after trim).
+///
+/// Counting this as a destination keeps doctor's `alert_destination` gate in
+/// lock-step with the runtime, which registers a native channel (and so
+/// `has_destination()`/`is_active()` return true) for a native-only config;
+/// without it a valid `pagerduty_routing_key`-only production config would fail
+/// `autumn doctor --strict` with a spurious "no operator alert destination".
+fn native_alert_transport_configured(
+    pagerduty_routing_key: &str,
+    slack_webhook_url: &str,
+    discord_webhook_url: &str,
+) -> bool {
+    !pagerduty_routing_key.trim().is_empty()
+        || !slack_webhook_url.trim().is_empty()
+        || !discord_webhook_url.trim().is_empty()
+}
+
 /// Resolve the effective `[alerts] custom_channel` flag the same way the runtime
 /// config merge and `AlertConfig::default().custom_channel` (default `false`)
 /// do.
@@ -3814,6 +4023,8 @@ pub fn run(opts: DoctorOptions) {
     let alerts_enabled = resolve_alert_enabled();
     let alert_custom_channel = resolve_alert_custom_channel();
     let alert_error_rate_threshold = resolve_alert_error_rate_threshold();
+    let (alert_pd_routing_key, alert_pd_url, alert_slack_url, alert_discord_url) =
+        resolve_alert_transports();
     let proxy_conflict_data = resolve_proxy_conflict_data();
     let (dotenv_has_example, dotenv_has_env, dotenv_uncovered) = resolve_dotenv_state();
 
@@ -4063,6 +4274,16 @@ pub fn run(opts: DoctorOptions) {
     // / effective transport the mail checks above resolved.
     let mail_from = resolve_mail_from(Some(&merged_mail_toml)).unwrap_or_default();
     let transport_requires_from = mail_transport_requires_from(&effective_transport);
+    // A native transport (PagerDuty / Slack / Discord) counts as a configured
+    // destination exactly as the runtime's `AlertConfig::has_destination` does, so
+    // a native-only config does not trip the "no operator alert destination"
+    // warning that would fail `autumn doctor --strict` while the runtime happily
+    // registers the channel.
+    let alert_native_configured = native_alert_transport_configured(
+        &alert_pd_routing_key,
+        &alert_slack_url,
+        &alert_discord_url,
+    );
     tasks.push(Box::new(move || {
         check_alert_destination_impl(
             alerts_enabled,
@@ -4074,6 +4295,7 @@ pub fn run(opts: DoctorOptions) {
             &mail_from,
             transport_requires_from,
             alert_custom_channel,
+            alert_native_configured,
         )
     }));
 
@@ -4082,6 +4304,21 @@ pub fn run(opts: DoctorOptions) {
     //       default). Warn in production so the operator fixes the config.
     tasks.push(Box::new(move || {
         check_alert_error_rate_threshold_impl(&alert_error_rate_threshold, is_production)
+    }));
+
+    // 12a3. Native alert transports (issue #1630): a configured PagerDuty /
+    //       Slack / Discord destination must carry the values it needs to
+    //       deliver (a well-formed routing key, an absolute pagerduty_url, an
+    //       absolute https Slack/Discord webhook URL). Warn in production so a
+    //       transport that *looks* configured actually pages.
+    tasks.push(Box::new(move || {
+        check_alert_transports_impl(
+            &alert_pd_routing_key,
+            &alert_pd_url,
+            &alert_slack_url,
+            &alert_discord_url,
+            is_production,
+        )
     }));
 
     // 12b. Local-dev `.env` handling (warn on `.env.example` without `.env`,
@@ -6051,10 +6288,78 @@ pub struct Vault {
             "noreply@example.com",
             true,
             false,
+            false,
         );
         assert_eq!(r.name, "alert_destination");
         assert!(matches!(r.status, CheckStatus::Warn));
         assert!(r.hint.is_some());
+    }
+
+    #[test]
+    fn alert_destination_passes_in_production_with_native_transport_only() {
+        // A native transport (PagerDuty routing key, or a Slack/Discord webhook)
+        // is a valid destination: the runtime registers the channel and
+        // `has_destination()` returns true, so doctor must NOT warn "no operator
+        // alert destination" — otherwise a native-only prod config fails
+        // `--strict` while it delivers fine at runtime. The only destination here
+        // is the native transport (email/webhook/custom all absent).
+        let r = check_alert_destination_impl(
+            true,  // alerts_enabled
+            "",    // email
+            false, // webhook_configured
+            "",    // webhook_url
+            true,  // mail_transport_usable
+            true,  // is_production
+            "noreply@example.com",
+            true,  // transport_requires_from
+            false, // custom_channel
+            true,  // native_transport_configured
+        );
+        assert!(
+            matches!(r.status, CheckStatus::Pass),
+            "a native-transport-only config must pass the destination gate"
+        );
+        assert!(
+            !r.detail
+                .as_deref()
+                .unwrap_or_default()
+                .contains("no operator alert destination"),
+            "must not warn about a missing destination when a native transport is configured"
+        );
+        // Sanity: with the native flag off and nothing else configured, the same
+        // production config DOES warn — proving the flag is what flips the gate.
+        let off = check_alert_destination_impl(
+            true,
+            "",
+            false,
+            "",
+            true,
+            true,
+            "noreply@example.com",
+            true,
+            false,
+            false,
+        );
+        assert!(matches!(off.status, CheckStatus::Warn));
+    }
+
+    #[test]
+    fn native_alert_transport_configured_matches_runtime_predicate() {
+        // Mirrors AlertConfig::has_destination for native transports: any of the
+        // three configs present (non-empty after trim) counts.
+        assert!(!native_alert_transport_configured("", "", ""));
+        assert!(!native_alert_transport_configured("  ", "\t", " "));
+        assert!(native_alert_transport_configured("R0UT1NGKEY", "", ""));
+        assert!(native_alert_transport_configured(
+            "",
+            "https://hooks.slack.com/services/x",
+            ""
+        ));
+        assert!(native_alert_transport_configured(
+            "",
+            "",
+            "https://discord.com/api/webhooks/x/slack"
+        ));
     }
 
     #[test]
@@ -6068,6 +6373,7 @@ pub struct Vault {
             true,
             "noreply@example.com",
             true,
+            false,
             false,
         );
         assert!(matches!(r.status, CheckStatus::Pass));
@@ -6085,6 +6391,7 @@ pub struct Vault {
             "noreply@example.com",
             true,
             false,
+            false,
         );
         assert!(matches!(r.status, CheckStatus::Pass));
     }
@@ -6100,6 +6407,7 @@ pub struct Vault {
             false,
             "noreply@example.com",
             true,
+            false,
             false,
         );
         assert!(matches!(r.status, CheckStatus::Pass));
@@ -6135,6 +6443,7 @@ pub struct Vault {
             "noreply@example.com",
             true,
             false,
+            false,
         );
         assert!(
             matches!(r.status, CheckStatus::Warn),
@@ -6168,6 +6477,7 @@ pub struct Vault {
             true,
             "noreply@example.com",
             requires_from,
+            false,
             false,
         );
         assert!(
@@ -6214,6 +6524,7 @@ pub struct Vault {
             mail_from,
             requires_from,
             false,
+            false,
         );
         assert!(
             matches!(r.status, CheckStatus::Pass),
@@ -6239,6 +6550,7 @@ pub struct Vault {
             true,
             mail_from,
             requires_from,
+            false,
             false,
         );
         assert!(
@@ -6276,6 +6588,7 @@ pub struct Vault {
             mail_from,
             requires_from,
             false,
+            false,
         );
         assert!(
             matches!(r.status, CheckStatus::Pass),
@@ -6306,6 +6619,7 @@ pub struct Vault {
             true,
             "not-a-mailbox",
             requires_from,
+            false,
             false,
         );
         assert!(
@@ -6338,6 +6652,7 @@ pub struct Vault {
             "Ops <ops@example.com>",
             requires_from,
             false,
+            false,
         );
         assert!(
             matches!(r.status, CheckStatus::Pass),
@@ -6360,6 +6675,7 @@ pub struct Vault {
             false, // dev
             "not-a-mailbox",
             requires_from,
+            false,
             false,
         );
         assert!(
@@ -6386,6 +6702,7 @@ pub struct Vault {
             true,
             "not-a-mailbox",
             requires_from,
+            false,
             false,
         );
         assert!(
@@ -6416,6 +6733,7 @@ pub struct Vault {
             "noreply@example.com", // [mail] from present
             true,                  // smtp requires from
             false,                 // custom_channel
+            false,
         );
         assert!(
             matches!(r.status, CheckStatus::Warn),
@@ -6449,6 +6767,7 @@ pub struct Vault {
             "noreply@example.com",
             true,
             false,
+            false,
         );
         assert!(
             matches!(r.status, CheckStatus::Pass),
@@ -6469,6 +6788,7 @@ pub struct Vault {
             true,
             "noreply@example.com",
             true,
+            false,
             false,
         );
         assert!(
@@ -6495,6 +6815,7 @@ pub struct Vault {
             "noreply@example.com", // [mail] from present
             true,                  // smtp requires from
             false,                 // custom_channel
+            false,
         );
         assert!(
             matches!(r.status, CheckStatus::Warn),
@@ -6527,6 +6848,7 @@ pub struct Vault {
             true,
             "noreply@example.com",
             true,
+            false,
             false,
         );
         assert!(matches!(r.status, CheckStatus::Warn));
@@ -6561,6 +6883,7 @@ pub struct Vault {
             true,
             "noreply@example.com",
             true,
+            false,
             false,
         );
         assert!(
@@ -6608,6 +6931,7 @@ pub struct Vault {
             true,
             "noreply@example.com",
             true,
+            false,
             false,
         );
         assert!(matches!(r.status, CheckStatus::Warn));
@@ -6686,6 +7010,7 @@ pub struct Vault {
             "noreply@example.com",
             true,
             false,
+            false,
         );
         assert!(matches!(r.status, CheckStatus::Pass));
     }
@@ -6711,6 +7036,7 @@ pub struct Vault {
             true,
             "noreply@example.com",
             true,
+            false,
             false,
         );
         assert!(
@@ -6743,6 +7069,7 @@ pub struct Vault {
             true,
             "noreply@example.com",
             true,
+            false,
             false,
         );
         assert!(matches!(r.status, CheckStatus::Warn));
@@ -6778,6 +7105,7 @@ pub struct Vault {
             "noreply@example.com",
             true,
             false,
+            false,
         );
         assert!(matches!(r.status, CheckStatus::Pass));
     }
@@ -6805,6 +7133,7 @@ pub struct Vault {
             true,
             "noreply@example.com",
             true,
+            false,
             false,
         );
         assert!(matches!(r.status, CheckStatus::Pass));
@@ -6837,6 +7166,7 @@ pub struct Vault {
             "noreply@example.com",
             true,
             false,
+            false,
         );
         assert!(
             matches!(r.status, CheckStatus::Warn),
@@ -6862,6 +7192,7 @@ pub struct Vault {
             false, // dev
             "noreply@example.com",
             true,
+            false,
             false,
         );
         assert!(matches!(r.status, CheckStatus::Pass));
@@ -6918,6 +7249,7 @@ pub struct Vault {
             "noreply@example.com",
             true,
             false,
+            false,
         );
         assert!(
             matches!(r.status, CheckStatus::Warn),
@@ -6967,6 +7299,7 @@ pub struct Vault {
             "noreply@example.com",
             true,
             false,
+            false,
         );
         assert!(matches!(r.status, CheckStatus::Pass));
     }
@@ -6999,6 +7332,7 @@ pub struct Vault {
             true,
             "noreply@example.com",
             true,
+            false,
             false,
         );
         assert!(matches!(r.status, CheckStatus::Warn));
@@ -7094,6 +7428,7 @@ pub struct Vault {
             "noreply@example.com",
             true,
             false,
+            false,
         );
         assert!(
             matches!(r.status, CheckStatus::Warn),
@@ -7125,6 +7460,7 @@ pub struct Vault {
             "noreply@example.com",
             true,
             false,
+            false,
         );
         assert!(matches!(r.status, CheckStatus::Warn));
     }
@@ -7148,6 +7484,7 @@ pub struct Vault {
             "noreply@example.com",
             true,
             false,
+            false,
         );
         assert!(matches!(r.status, CheckStatus::Pass));
     }
@@ -7169,6 +7506,7 @@ pub struct Vault {
             false,
             "noreply@example.com",
             true,
+            false,
             false,
         );
         assert!(
@@ -7198,6 +7536,7 @@ pub struct Vault {
             "noreply@example.com",
             true,
             /* custom_channel */ true,
+            false,
         );
         assert!(
             matches!(r.status, CheckStatus::Pass),
@@ -7225,6 +7564,7 @@ pub struct Vault {
             "noreply@example.com",
             true,
             /* custom_channel */ false,
+            false,
         );
         assert!(matches!(r.status, CheckStatus::Warn));
         assert!(
@@ -7250,6 +7590,7 @@ pub struct Vault {
             "noreply@example.com",
             true,
             /* custom_channel */ true,
+            false,
         );
         assert!(
             matches!(r.status, CheckStatus::Warn),
@@ -7324,6 +7665,7 @@ pub struct Vault {
             "noreply@example.com",
             true,
             custom,
+            false,
         );
         assert!(matches!(r.status, CheckStatus::Pass));
     }
@@ -7467,6 +7809,121 @@ pub struct Vault {
             check_alert_error_rate_threshold_impl(&raw, true).status,
             CheckStatus::Pass
         ));
+    }
+
+    // ── check_alert_transports_impl (issue #1630) ────────────────────────────
+    // A configured native transport (PagerDuty / Slack / Discord) must carry the
+    // values it needs to deliver. Production warns on a malformed routing key, a
+    // non-absolute pagerduty_url, or a non-absolute-https Slack/Discord URL; dev
+    // passes quietly (these transports are optional locally).
+
+    #[test]
+    fn alert_transports_none_configured_passes() {
+        let r = check_alert_transports_impl("", "", "", "", true);
+        assert!(matches!(r.status, CheckStatus::Pass));
+    }
+
+    #[test]
+    fn alert_transports_all_valid_pass() {
+        let r = check_alert_transports_impl(
+            "R0UT1NGKEY0000000000000000000000",
+            "https://events.pagerduty.com/v2/enqueue",
+            "https://hooks.slack.com/services/T/B/x",
+            "https://discord.com/api/webhooks/1/abc/slack",
+            true,
+        );
+        assert!(matches!(r.status, CheckStatus::Pass), "{:?}", r.detail);
+        assert_eq!(r.name, "alert_transports");
+    }
+
+    #[test]
+    fn alert_transports_malformed_routing_key_warns_in_prod() {
+        let r = check_alert_transports_impl("bad key with spaces", "", "", "", true);
+        assert!(matches!(r.status, CheckStatus::Warn));
+        assert!(
+            r.detail
+                .as_deref()
+                .is_some_and(|d| d.contains("routing key")),
+            "must name the malformed routing key"
+        );
+    }
+
+    #[test]
+    fn alert_transports_pagerduty_url_without_key_warns() {
+        let r = check_alert_transports_impl(
+            "",
+            "https://events.pagerduty.com/v2/enqueue",
+            "",
+            "",
+            true,
+        );
+        assert!(matches!(r.status, CheckStatus::Warn));
+        assert!(
+            r.detail
+                .as_deref()
+                .is_some_and(|d| d.contains("routing_key"))
+        );
+    }
+
+    #[test]
+    fn alert_transports_non_absolute_pagerduty_url_warns() {
+        let r = check_alert_transports_impl(
+            "R0UT1NGKEY",
+            "events.pagerduty.com/v2/enqueue",
+            "",
+            "",
+            true,
+        );
+        assert!(matches!(r.status, CheckStatus::Warn));
+    }
+
+    #[test]
+    fn alert_transports_non_https_slack_url_warns() {
+        // Plaintext http is rejected — Slack only exposes https endpoints.
+        let r = check_alert_transports_impl("", "", "http://hooks.slack.com/services/x", "", true);
+        assert!(matches!(r.status, CheckStatus::Warn));
+        assert!(
+            r.detail
+                .as_deref()
+                .is_some_and(|d| d.contains("slack_webhook_url"))
+        );
+    }
+
+    #[test]
+    fn alert_transports_relative_discord_url_warns() {
+        let r = check_alert_transports_impl("", "", "", "/webhooks/x/slack", true);
+        assert!(matches!(r.status, CheckStatus::Warn));
+        assert!(
+            r.detail
+                .as_deref()
+                .is_some_and(|d| d.contains("discord_webhook_url"))
+        );
+    }
+
+    #[test]
+    fn alert_transports_invalid_is_lenient_outside_prod() {
+        // Every invalid case passes quietly in dev, like the other alert checks.
+        let r = check_alert_transports_impl(
+            "bad key",
+            "not-a-url",
+            "http://hooks.slack.com/x",
+            "/relative",
+            false,
+        );
+        assert!(matches!(r.status, CheckStatus::Pass));
+    }
+
+    #[test]
+    fn is_absolute_https_url_doctor_requires_https_and_host() {
+        assert!(is_absolute_https_url_doctor(
+            "https://hooks.slack.com/services/x"
+        ));
+        assert!(!is_absolute_https_url_doctor(
+            "http://hooks.slack.com/services/x"
+        ));
+        assert!(!is_absolute_https_url_doctor("hooks.slack.com/x"));
+        assert!(!is_absolute_https_url_doctor("https://"));
+        assert!(!is_absolute_https_url_doctor(""));
     }
 
     // ── compute_summary ──────────────────────────────────────────────────────

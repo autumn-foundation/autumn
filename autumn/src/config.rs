@@ -3057,6 +3057,44 @@ impl AutumnConfig {
             "AUTUMN_ALERTS__WEBHOOK_SECRET",
             &mut self.alerts.webhook_secret,
         );
+        parse_env_option_string(
+            env,
+            "AUTUMN_ALERTS__PAGERDUTY_ROUTING_KEY",
+            &mut self.alerts.pagerduty_routing_key,
+        );
+        parse_env_option_string(
+            env,
+            "AUTUMN_ALERTS__PAGERDUTY_URL",
+            &mut self.alerts.pagerduty_url,
+        );
+        parse_env_option_string(
+            env,
+            "AUTUMN_ALERTS__SLACK_WEBHOOK_URL",
+            &mut self.alerts.slack_webhook_url,
+        );
+        parse_env_option_string(
+            env,
+            "AUTUMN_ALERTS__DISCORD_WEBHOOK_URL",
+            &mut self.alerts.discord_webhook_url,
+        );
+        // Per-channel severity routing (`all` / `critical`). `AlertRouting`'s
+        // `FromStr` accepts the same spellings as the TOML/serde path; an invalid
+        // value is logged and ignored by `parse_env`, leaving the current value.
+        parse_env(
+            env,
+            "AUTUMN_ALERTS__PAGERDUTY_SEVERITIES",
+            &mut self.alerts.pagerduty_severities,
+        );
+        parse_env(
+            env,
+            "AUTUMN_ALERTS__SLACK_SEVERITIES",
+            &mut self.alerts.slack_severities,
+        );
+        parse_env(
+            env,
+            "AUTUMN_ALERTS__DISCORD_SEVERITIES",
+            &mut self.alerts.discord_severities,
+        );
         parse_env_bool(
             env,
             "AUTUMN_ALERTS__CUSTOM_CHANNEL",
@@ -6866,6 +6904,39 @@ pool_size = 7
 
         assert_eq!(config.time_zone.identifier, "America/New_York");
         assert!(config.time_zone.validate().is_ok());
+    }
+
+    #[test]
+    fn alerts_severities_env_overrides_apply() {
+        // Per-channel severity routing must be controllable via the documented
+        // AUTUMN_ALERTS__*_SEVERITIES overrides, using the same `all`/`critical`
+        // value parsing the TOML/file path uses.
+        let env = MockEnv::new()
+            .with("AUTUMN_ALERTS__SLACK_SEVERITIES", "critical")
+            .with("AUTUMN_ALERTS__PAGERDUTY_SEVERITIES", "all")
+            .with("AUTUMN_ALERTS__DISCORD_SEVERITIES", "critical");
+        let mut config = AutumnConfig::default();
+        // Defaults are `All` for every channel.
+        assert_eq!(
+            config.alerts.slack_severities,
+            crate::alerts::AlertRouting::All
+        );
+
+        config.apply_env_overrides_with_env(&env);
+
+        assert_eq!(
+            config.alerts.slack_severities,
+            crate::alerts::AlertRouting::Critical,
+            "AUTUMN_ALERTS__SLACK_SEVERITIES=critical must set the Slack channel routing"
+        );
+        assert_eq!(
+            config.alerts.discord_severities,
+            crate::alerts::AlertRouting::Critical
+        );
+        assert_eq!(
+            config.alerts.pagerduty_severities,
+            crate::alerts::AlertRouting::All
+        );
     }
 
     #[test]

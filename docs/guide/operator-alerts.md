@@ -147,6 +147,18 @@ webhook_url = "https://…"      # signed webhook destination
 webhook_secret = "…"           # REQUIRED with webhook_url; alerts are always
                                # signed (prefer AUTUMN_ALERTS__WEBHOOK_SECRET)
 
+# Native provider transports (see "Native alerting transports" below)
+pagerduty_routing_key = "…"    # PagerDuty Events API v2 routing key
+                               # (prefer AUTUMN_ALERTS__PAGERDUTY_ROUTING_KEY)
+pagerduty_url = "https://events.pagerduty.com/v2/enqueue"  # override for a
+                               # PagerDuty-Events-compatible endpoint (optional)
+pagerduty_severities = "all"   # "all" (default) or "critical"
+slack_webhook_url = "https://hooks.slack.com/services/…"   # Slack incoming webhook
+slack_severities = "all"       # "all" (default) or "critical"
+discord_webhook_url = "https://discord.com/api/webhooks/…/slack"  # Discord (Slack-
+                               # compatible endpoint — append /slack)
+discord_severities = "all"     # "all" (default) or "critical"
+
 # Deduplication
 dedup_window_secs = 900        # at most one notice per condition per 15 min
 
@@ -240,8 +252,9 @@ has no outstanding failure to clear, so the recovery notice is skipped and the
 original failure alert may linger until it ages out. **Single-VPS deployments
 (the common case) are unaffected**, since there is only one replica; only
 multi-replica fleets can hit this after a leader handoff. Cross-app or
-fleet-level alert aggregation and shared active-alert state are tracked as a
-follow-up (#1630) and are out of scope here.
+fleet-level alert aggregation and shared active-alert state remain a separate
+future follow-up (the native PagerDuty/Slack/Discord transports do not change
+this process-local behaviour) and are out of scope here.
 
 ---
 
@@ -317,11 +330,126 @@ The host/replica identity is read from `AUTUMN_REPLICA_ID`, falling back to
 
 ---
 
-## Adding your own destination (PagerDuty, Slack, Discord, …)
+## Native alerting transports (PagerDuty, Slack, Discord)
 
-Delivery is a trait. Implement [`AlertChannel`] and register it — the built-in
-mail/webhook channels stay active alongside yours. This is the extension seam
-for additional transports; the framework core never changes.
+Autumn delivers its built-in alerts natively to the paging and chat tools most
+teams already run — **config-only, zero app code**. Add a routing key or a
+webhook URL under `[alerts]` and the provider is wired up, correlated, and
+fail-safe, alongside any email/webhook destination.
+
+All three use the SSRF-hardened outbound HTTP client and deliver off the request
+path exactly like the built-in webhook: a provider outage or a rejected event
+never affects request serving and adds no request latency; failures are logged.
+
+### PagerDuty (and PagerDuty-Events-compatible pagers)
+
+```toml
+[alerts]
+pagerduty_routing_key = "…"    # prefer AUTUMN_ALERTS__PAGERDUTY_ROUTING_KEY
+```
+
+Each alert is delivered as a **PagerDuty Events API v2** event correlated on the
+alert's stable `dedup_key`, so a repeating condition folds into a **single
+incident** instead of a page storm. When the condition clears, Autumn sends a
+`resolve` event with the same `dedup_key` and the incident **auto-resolves**. A
+firing alert maps to PagerDuty severity `critical`; the event carries the
+summary, source (host/replica), timestamp, condition component, and the alert's
+`where_to_look` plus structured details in `custom_details`.
+
+Point `pagerduty_url` at a PagerDuty-Events-compatible enqueue endpoint offered
+by another paging service to reuse this same channel:
+
+```toml
+pagerduty_url = "https://events.eu.pagerduty.com/v2/enqueue"
+```
+
+### Slack (and Discord via its Slack-compatible endpoint)
+
+```toml
+[alerts]
+slack_webhook_url  = "https://hooks.slack.com/services/T…/B…/…"
+discord_webhook_url = "https://discord.com/api/webhooks/…/…/slack"   # append /slack
+```
+
+The Slack channel posts a human-readable message carrying the required fields —
+what failed, when, on which host/replica, and where to look next — plus any
+structured details. **Discord** is supported through its **Slack-compatible
+webhook endpoint**: append `/slack` to a Discord webhook URL and Autumn sends
+the exact same payload dialect, so one message format covers both chat tools.
+
+Both webhook URLs must be **absolute `https` URLs** (Slack and Discord only
+expose `https` endpoints). A relative or non-`https` value is skipped with a
+startup `warn`, and `autumn doctor` flags it in production.
+
+### Multiple destinations fan out
+
+Every configured destination receives the same alert. Set a PagerDuty routing
+key **and** a Slack webhook and a critical condition pages the on-call phone and
+posts to the incident channel simultaneously; add the generic webhook and email
+and all four fire.
+
+### Per-channel severity routing
+
+Each native destination declares which severities it receives via its
+`*_severities` key — `"all"` (the default) or `"critical"`:
+
+```toml
+[alerts]
+pagerduty_routing_key = "…"
+pagerduty_severities  = "all"       # page on failure AND auto-resolve
+slack_webhook_url     = "https://hooks.slack.com/services/…"
+slack_severities      = "critical"  # notify chat on failure, stay quiet on recovery
+```
+
+A channel set to `"critical"` receives only firing (`critical`) alerts;
+recovery/informational (`recovery`) alerts are **verifiably not delivered** to
+it. The recommended pattern is to page a human on critical conditions while a
+chat channel merely notifies. Leave **PagerDuty on `"all"`** (the default) so the
+`resolve` event reaches it and incidents auto-resolve — setting it to
+`"critical"` suppresses the resolve and incidents stay open until they age out.
+
+Severity routing applies only to Autumn's built-in transports; a custom
+[`AlertChannel`] you register in code receives every severity unless it overrides
+`accepts_severity`.
+
+### Verify wiring before an incident: `autumn alert test`
+
+Fire a synthetic alert through every configured outbound-HTTP channel and see
+per-channel success or an actionable error — before you are relying on it:
+
+```bash
+autumn alert test                 # every configured channel
+autumn alert test --channel slack # just one (pagerduty | slack | discord | webhook)
+```
+
+It reads your effective `[alerts]` config (env vars and profiles honoured) and
+uses the same channel implementations the server installs, so a green run proves
+the real delivery path. (Email is validated by `autumn doctor` and a real send,
+since it needs a configured mailer.)
+
+### Acknowledge / resolve stance
+
+This is a **one-directional** integration: Autumn → provider. Acknowledging or
+resolving an incident **in the provider** does not silence Autumn's re-alerts —
+Autumn's own dedup / re-alert windows (`dedup_window_secs`) bound notification
+volume, and an Autumn-side recovery is what emits the `resolve` event. Inbound
+ack/resolve synchronization (provider → Autumn silencing) is out of scope.
+
+### Unsupported providers: the generic webhook fallback
+
+A provider without native support (Opsgenie's own API, Microsoft Teams, Telegram,
+SMS, …) is served either by its PagerDuty-Events- or Slack-compatible endpoint
+where offered, or by the **generic signed webhook** (`webhook_url` +
+`webhook_secret`, documented above) pointed at a small translation shim, or by a
+custom [`AlertChannel`] in code (next section).
+
+---
+
+## Adding your own destination (a custom `AlertChannel`)
+
+PagerDuty, Slack, and Discord are built in (above); this seam is for **any other
+sink**. Delivery is a trait: implement [`AlertChannel`] and register it — the
+built-in channels stay active alongside yours. The framework core never changes.
 
 > Custom channels are still governed by the master switch: with
 > `enabled = false` your channel is not installed and receives nothing, exactly

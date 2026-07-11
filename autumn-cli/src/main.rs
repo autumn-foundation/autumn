@@ -1,5 +1,6 @@
 use clap::{Parser, Subcommand, ValueEnum};
 
+mod alert;
 mod assets;
 mod build;
 mod canary;
@@ -442,6 +443,10 @@ enum Commands {
     /// Simulate a signed webhook request to the local application.
     #[command(subcommand, verbatim_doc_comment)]
     Webhook(WebhookCommands),
+
+    /// Fire a synthetic operator alert through configured delivery channels.
+    #[command(subcommand)]
+    Alert(AlertCommands),
     /// Issue and revoke API bearer tokens backed by the `api_tokens` table.
     ///
     /// Requires the `api_tokens` table to exist. Run `autumn migrate` first;
@@ -1385,7 +1390,24 @@ enum CanaryCommands {
     Status,
 }
 
-/// Subcommands for `autumn token`.
+/// Subcommands for `autumn alert`.
+#[derive(Subcommand)]
+enum AlertCommands {
+    /// Send a synthetic test alert through each configured delivery channel and
+    /// report per-channel success or an actionable error (issue #1630).
+    ///
+    /// Exercises the outbound-HTTP transports the runtime installs —
+    /// `PagerDuty`, Slack, Discord, and the generic signed webhook — using the
+    /// exact same channel implementations, so a green run proves real wiring
+    /// before an incident. Reads the effective `[alerts]` config (env vars and
+    /// profiles honoured, just like the server).
+    Test {
+        /// Only fire through the named channel (pagerduty, slack, discord,
+        /// webhook). Omit to fire through every configured channel.
+        #[arg(long)]
+        channel: Option<String>,
+    },
+}
 
 #[derive(Subcommand)]
 enum WebhookCommands {
@@ -2586,6 +2608,7 @@ fn run_command(command: Commands) {
             secret,
             payload,
         }) => webhook::run_sim(&provider, &url, &secret, &payload),
+        Commands::Alert(AlertCommands::Test { channel }) => alert::run_test(channel.as_deref()),
         Commands::Seed {
             profile,
             package,
