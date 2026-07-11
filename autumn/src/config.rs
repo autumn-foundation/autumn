@@ -5859,6 +5859,11 @@ pub struct TenancyConfig {
     /// logins. When `None`, the underlying authorization error is returned.
     #[serde(default)]
     pub login_redirect: Option<String>,
+
+    /// Soft per-tenant memory quota, in bytes, for in-process tenant cells.
+    /// `0` disables the quota (unlimited).
+    #[serde(default)]
+    pub quota_bytes: usize,
 }
 
 fn default_tenancy_source() -> String {
@@ -5891,6 +5896,7 @@ impl Default for TenancyConfig {
             base_domain: None,
             public_paths: Vec::new(),
             login_redirect: None,
+            quota_bytes: 0,
         }
     }
 }

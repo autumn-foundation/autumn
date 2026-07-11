@@ -380,6 +380,7 @@ pub mod step_up;
 #[cfg(feature = "storage")]
 pub mod storage;
 pub mod tenancy;
+pub mod tenant_cell;
 pub mod time;
 pub mod time_zone;
 pub mod user_agent;
@@ -560,6 +561,8 @@ pub use db::{IsolationLevel, TxOptions, savepoint};
 /// [`AutumnResult<T>`] is `Result<T, AutumnError>`.
 /// See the [`error`] module for details.
 pub use error::{AutumnError, AutumnResult};
+
+pub use tenant_cell::{QuotaExceeded, TenantCell, TenantCellRegistry};
 
 /// Paginated list response wrapper with navigation metadata.
 ///

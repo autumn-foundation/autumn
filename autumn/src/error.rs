@@ -204,6 +204,15 @@ where
             }
         }
 
+        // A per-tenant memory quota breach is a soft, retryable resource limit,
+        // so it maps to 503 Service Unavailable rather than a 500.
+        if any_err
+            .downcast_ref::<crate::tenant_cell::QuotaExceeded>()
+            .is_some()
+        {
+            status = StatusCode::SERVICE_UNAVAILABLE;
+        }
+
         Self {
             inner: Box::new(err),
             status,

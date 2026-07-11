@@ -453,14 +453,25 @@ pub async fn tenancy_middleware(
 
     let request = Request::from_parts(parts, body);
     let tenant_id_clone = tenant_id.clone();
+
+    // Bind a per-tenant memory cell for the request lifecycle. The registry is
+    // lazily registered in the app state's extension map on first use.
+    let registry = state.extension_or_insert_with(crate::tenant_cell::TenantCellRegistry::new);
+    let cell = registry.get_or_create(&tenant_id, config.tenancy.quota_bytes);
+    let cell_for_body = Some(std::sync::Arc::clone(&cell));
+
     let response = CURRENT_TENANT
-        .scope(Some(tenant_id), next.run(request))
+        .scope(
+            Some(tenant_id),
+            crate::tenant_cell::CURRENT_TENANT_CELL.scope(Some(cell), next.run(request)),
+        )
         .await;
 
     let (parts, body) = response.into_parts();
     let wrapped = TenantPropagatingBody {
         inner: body,
         tenant_id: tenant_id_clone,
+        cell: cell_for_body,
     };
     Response::from_parts(parts, axum::body::Body::new(wrapped))
 }
@@ -473,6 +484,7 @@ pin_project! {
         #[pin]
         pub inner: B,
         pub tenant_id: String,
+        pub cell: Option<std::sync::Arc<crate::tenant_cell::TenantCell>>,
     }
 }
 
@@ -489,7 +501,10 @@ where
     ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
         let this = self.project();
         let tenant_id = this.tenant_id.clone();
-        CURRENT_TENANT.sync_scope(Some(tenant_id), || this.inner.poll_frame(cx))
+        let cell = this.cell.clone();
+        CURRENT_TENANT.sync_scope(Some(tenant_id), || {
+            crate::tenant_cell::CURRENT_TENANT_CELL.sync_scope(cell, || this.inner.poll_frame(cx))
+        })
     }
 
     fn is_end_stream(&self) -> bool {

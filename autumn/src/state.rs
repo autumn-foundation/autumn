@@ -241,6 +241,36 @@ impl AppState {
             .and_then(|value| Arc::downcast::<T>(value).ok())
     }
 
+    /// Fetch the extension of type `T`, inserting `f()`'s result if absent.
+    /// Atomic get-or-insert under the write lock: concurrent callers share one
+    /// value. Used to lazily register process-wide registries.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal extension map mutex is poisoned.
+    pub fn extension_or_insert_with<T>(&self, f: impl FnOnce() -> T) -> Arc<T>
+    where
+        T: Any + Send + Sync + 'static,
+    {
+        if let Some(existing) = self.extension::<T>() {
+            return existing;
+        }
+        let mut map = self
+            .extensions
+            .write()
+            .expect("app state extension lock poisoned");
+        if let Some(existing) = map
+            .get(&TypeId::of::<T>())
+            .cloned()
+            .and_then(|value| Arc::downcast::<T>(value).ok())
+        {
+            return existing;
+        }
+        let arc = Arc::new(f());
+        map.insert(TypeId::of::<T>(), arc.clone() as Arc<dyn Any + Send + Sync>);
+        arc
+    }
+
     /// Returns the registered error reporters, if any were installed via
     /// [`AppBuilder::with_error_reporter`](crate::app::AppBuilder::with_error_reporter).
     ///
