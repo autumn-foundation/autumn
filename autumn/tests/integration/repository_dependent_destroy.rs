@@ -172,6 +172,35 @@ pub struct DepAward {
 #[autumn_web::repository(DepAward, table = "dep_awards")]
 pub trait DepAwardRepository {}
 
+// ── #1738: model-declared `#[has_many(dependent = ...)]` cascade ──────────────
+//
+// The SAME cascade as `DepPost` above, but declared on the MODEL struct via
+// `#[has_many(Child, dependent = <action>)]` instead of the repository
+// attribute. The parent repository declares NO `dependent(...)`, so the cascade
+// is driven at run time by `ModelDepPost::dependents()`, resolving each child
+// repository through the `Pg{Child}Repository` naming convention (`DepComment`
+// → `PgDepCommentRepository`, etc.). Reuses the existing child tables/repos via
+// an explicit `fk = "post_id"` (the default would infer `model_dep_post_id`).
+//
+// `dependent = nullify` is intentionally omitted here: a nullify child has a
+// NULLABLE foreign key, and `#[has_many]` preload codegen does not yet support
+// a nullable child FK (it groups children into a `HashMap<i64, _>` keyed by the
+// non-`Option` FK). That is a pre-existing preload limitation, independent of
+// the cascade dispatch; tracked as a #1738 follow-up. destroy/delete_all/
+// restrict all target non-null-FK children and cascade from the model side.
+#[autumn_web::model(table = "dep_posts")]
+#[has_many(DepComment, fk = "post_id", name = md_comments, dependent = destroy)]
+#[has_many(DepVote, fk = "post_id", name = md_votes, dependent = delete_all)]
+#[has_many(DepAward, fk = "post_id", name = md_awards, dependent = restrict)]
+pub struct ModelDepPost {
+    #[id]
+    pub id: i64,
+    pub title: String,
+}
+
+#[autumn_web::repository(ModelDepPost, table = "dep_posts")]
+pub trait ModelDepPostRepository {}
+
 // ── AC3: both-soft destroy graph (soft parent + soft children) ────────────────
 //
 // The parent is `#[soft_delete]` too, so `delete_by_id` soft-deletes the parent
@@ -509,6 +538,16 @@ fn dependent_repository_surface_is_generated() {
     // Hooks-path bulk cascade branch (#1740): a hooked parent with a dependent.
     assert_is_fn(<PgDepHookedPostRepository as DepHookedPostRepository>::delete_many);
     assert_is_fn(<PgDepHookedPostRepository as DepHookedPostRepository>::delete_by_id);
+    // #1738: the model-declared `#[has_many(dependent = ...)]` parent's
+    // `delete_by_id` monomorphizes — proving the runtime `RuntimeDependentSpec`
+    // dispatch (fn-pointer thunks into each child's cascade leaf executor, wired
+    // from the model side with no repository-attribute `dependent(...)`)
+    // type-checks against the same four cascade actions.
+    assert_is_fn(<PgModelDepPostRepository as ModelDepPostRepository>::delete_by_id);
+    // The model exposes its runtime dependent specs (inherent shadow of
+    // `AutumnDependents::dependents`): destroy + delete_all + restrict.
+    assert_is_fn(ModelDepPost::dependents);
+    assert_eq!(ModelDepPost::dependents().len(), 3);
 }
 
 // ── Tests (require Docker) ────────────────────────────────────────────────────
@@ -1073,5 +1112,145 @@ async fn restrict_probes_before_destroy_fires_no_child_hooks() {
         .await,
         1,
         "the restrict child row must survive"
+    );
+}
+
+// ── #1738: model-declared cascade produces the same behavior ──────────────────
+
+/// #1738 primary AC: `#[has_many(Child, dependent = <action>)]` declared on the
+/// MODEL (no repository-attribute `dependent(...)`) produces the same
+/// transactional cascade the repository-attribute form produces. Deleting a
+/// `ModelDepPost` destroys its comments (firing their hooks) and bulk-deletes
+/// its votes — driven entirely by the runtime `ModelDepPost::dependents()`
+/// dispatch resolving `PgDepCommentRepository` / `PgDepVoteRepository` by
+/// convention. (No awards are inserted, since the model also declares
+/// `restrict(DepAward)`, exercised separately below.)
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn model_declared_dependent_cascades_like_repository_attribute() {
+    let (pool, _c) = setup_pool().await;
+    let mut conn = pool.get().await.expect("conn");
+
+    diesel::sql_query("INSERT INTO dep_posts (id, title) VALUES (31, 'model-side')")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    for i in 1..=3 {
+        diesel::sql_query(format!(
+            "INSERT INTO dep_comments (id, post_id, body) VALUES ({}, 31, 'c{i}')",
+            100 + i
+        ))
+        .execute(&mut conn)
+        .await
+        .unwrap();
+        diesel::sql_query(format!(
+            "INSERT INTO dep_votes (id, post_id, value) VALUES ({}, 31, 1)",
+            100 + i
+        ))
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    }
+
+    DESTROYED_COMMENTS.store(0, Ordering::SeqCst);
+
+    let repo = PgModelDepPostRepository::with_pool_untracked(pool.clone());
+    repo.delete_by_id(31)
+        .await
+        .expect("model-declared cascade delete must not FK-error");
+
+    assert_eq!(
+        count(
+            &mut conn,
+            "SELECT COUNT(*) AS n FROM dep_posts WHERE id = 31"
+        )
+        .await,
+        0,
+        "parent gone"
+    );
+    // destroy: comments hard-deleted, and each fired its before_delete hook.
+    assert_eq!(
+        count(
+            &mut conn,
+            "SELECT COUNT(*) AS n FROM dep_comments WHERE post_id = 31"
+        )
+        .await,
+        0,
+        "destroy child rows removed via the model-declared cascade"
+    );
+    assert_eq!(
+        AtomicUsize::load(&DESTROYED_COMMENTS, Ordering::SeqCst),
+        3,
+        "each destroyed comment fired its before_delete hook (child lifecycle honored)"
+    );
+    // delete_all: votes bulk-removed.
+    assert_eq!(
+        count(
+            &mut conn,
+            "SELECT COUNT(*) AS n FROM dep_votes WHERE post_id = 31"
+        )
+        .await,
+        0,
+        "delete_all child rows removed via the model-declared cascade"
+    );
+}
+
+/// #1738: model-declared `restrict` preserves the typed 409 + rollback, exactly
+/// as the repository-attribute form does. An award (restrict child) blocks the
+/// `ModelDepPost` delete, and the transaction rolls back leaving every row.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn model_declared_restrict_blocks_with_conflict_and_rolls_back() {
+    let (pool, _c) = setup_pool().await;
+    let mut conn = pool.get().await.expect("conn");
+
+    diesel::sql_query("INSERT INTO dep_posts (id, title) VALUES (32, 'guarded-model')")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    diesel::sql_query("INSERT INTO dep_comments (id, post_id, body) VALUES (201, 32, 'c')")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    diesel::sql_query("INSERT INTO dep_awards (id, post_id, name) VALUES (11, 32, 'gold')")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+
+    DESTROYED_COMMENTS.store(0, Ordering::SeqCst);
+
+    let repo = PgModelDepPostRepository::with_pool_untracked(pool.clone());
+    let err = repo
+        .delete_by_id(32)
+        .await
+        .expect_err("model-declared restrict child must block the delete");
+    assert_eq!(
+        err.status(),
+        autumn_web::reexports::http::StatusCode::CONFLICT,
+        "a blocking model-declared restrict must surface a 409"
+    );
+    // Restrict probed before destroy → the comment's before_delete never fired.
+    assert_eq!(
+        AtomicUsize::load(&DESTROYED_COMMENTS, Ordering::SeqCst),
+        0,
+        "restrict must be probed before destroy in the model-declared cascade too"
+    );
+    assert_eq!(
+        count(
+            &mut conn,
+            "SELECT COUNT(*) AS n FROM dep_posts WHERE id = 32"
+        )
+        .await,
+        1,
+        "the parent must survive a blocked model-declared delete"
+    );
+    assert_eq!(
+        count(
+            &mut conn,
+            "SELECT COUNT(*) AS n FROM dep_comments WHERE post_id = 32"
+        )
+        .await,
+        1,
+        "the destroy child rows must be untouched after a blocked delete"
     );
 }
