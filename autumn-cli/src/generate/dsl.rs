@@ -7,6 +7,41 @@
 use super::GenerateError;
 use super::naming;
 
+/// The constraint modifiers a field carried in a trailing `{…}` block
+/// (`title:String{min=3,max=120}`, `contact:String{email}`,
+/// `age:i32{min=0,max=130}`, `post:references{label:title}`).
+///
+/// These fan out to BOTH a server-side `#[validate(…)]` rule (issue #1388,
+/// see [`Field::validation_attrs`]) and a matching client-side HTML5
+/// constraint on the generated form input, from a single declaration.
+/// `label` is the odd one out: it's a `references`-only display-column
+/// override (issue #1146) with no `#[validate]`/HTML5 fan-out.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FieldConstraints {
+    /// `min=N`. For `String`/`Text` this is a `length` minimum; for numeric
+    /// fields it is a `range` minimum. Stored as the raw numeric token.
+    pub min: Option<String>,
+    /// `max=N`. `length` maximum (`String`/`Text`) or `range` maximum
+    /// (numeric). Stored as the raw numeric token.
+    pub max: Option<String>,
+    /// `email` — `#[validate(email)]` + `type="email"`. `String`/`Text` only.
+    pub email: bool,
+    /// `url` — `#[validate(url)]` + `type="url"`. `String`/`Text` only.
+    pub url: bool,
+    /// `label:col` — the `references` display column an index/show view and a
+    /// `belongs_to` `<select>` label render from (issue #1146). `references`
+    /// only; never a `#[validate]`/HTML5 constraint.
+    pub label: Option<String>,
+}
+
+impl FieldConstraints {
+    /// True when no constraint modifier was declared.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.min.is_none() && self.max.is_none() && !self.email && !self.url && self.label.is_none()
+    }
+}
+
 /// A single field parsed from the command line.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Field {
@@ -25,6 +60,9 @@ pub struct Field {
     /// INDEX` in the migration instead of the plain, non-unique `--index`
     /// output (see [`super::schema_edit::unique_index_sql`]).
     pub unique: bool,
+    /// Constraint modifiers from a trailing `{…}` block (issue #1388 /
+    /// #1146). Empty ([`FieldConstraints::is_empty`]) for a bare `name:Type`.
+    pub constraints: FieldConstraints,
 }
 
 impl Field {
@@ -92,6 +130,49 @@ impl Field {
     #[must_use]
     pub const fn sql_nullability(&self) -> &'static str {
         if self.nullable { "NULL" } else { "NOT NULL" }
+    }
+
+    /// The server-side `#[validate(…)]` argument list this field's
+    /// constraint modifiers (issue #1388) fan out to — e.g.
+    /// `["length(min = 3, max = 120)"]`, `["email"]`, `["range(min = 0, max = 130)"]`.
+    ///
+    /// `String`/`Text` fields map `min`/`max` to `length` and honor
+    /// `email`/`url`; numeric fields map `min`/`max` to `range`. Float
+    /// (`f32`/`f64`) range bounds are emitted with a decimal point so the
+    /// generated comparison type-checks against the field's own type. Every
+    /// other kind (and the `references`-only `label`) contributes nothing.
+    /// Empty when the field declared no fan-out constraints.
+    #[must_use]
+    pub fn validation_attrs(&self) -> Vec<String> {
+        let c = &self.constraints;
+        let mut out = Vec::new();
+        match self.kind {
+            FieldKind::String | FieldKind::Text => {
+                if c.min.is_some() || c.max.is_some() {
+                    out.push(format!(
+                        "length({})",
+                        min_max_args(c.min.as_ref(), c.max.as_ref(), false)
+                    ));
+                }
+                if c.email {
+                    out.push("email".to_owned());
+                }
+                if c.url {
+                    out.push("url".to_owned());
+                }
+            }
+            FieldKind::I32 | FieldKind::I64 | FieldKind::F32 | FieldKind::F64
+                if c.min.is_some() || c.max.is_some() =>
+            {
+                let is_float = matches!(self.kind, FieldKind::F32 | FieldKind::F64);
+                out.push(format!(
+                    "range({})",
+                    min_max_args(c.min.as_ref(), c.max.as_ref(), is_float)
+                ));
+            }
+            _ => {}
+        }
+        out
     }
 
     /// For a [`FieldKind::References`] field, the referenced table name —
@@ -397,6 +478,11 @@ pub fn sql_type_to_field_kind(udt_name: &str) -> Option<FieldKind> {
 /// # Errors
 /// Returns [`GenerateError::InvalidField`] if the token is malformed or the
 /// type is not in the supported set.
+#[allow(
+    clippy::too_many_lines,
+    reason = "a linear name→modifier→type→constraint parse; the early-return \
+              validation guards read more clearly inline than split across helpers"
+)]
 pub fn parse_field(token: &str) -> Result<Field, GenerateError> {
     let (name, rest) = token
         .split_once(':')
@@ -408,20 +494,22 @@ pub fn parse_field(token: &str) -> Result<Field, GenerateError> {
     let name = name.trim();
     // A trailing `:unique` modifier marks the column for a `CREATE UNIQUE
     // INDEX` in the migration (issue #1032), e.g. `email:String:unique`.
-    // None of the DSL's type tokens contain a literal colon, so splitting
-    // once more off the end is unambiguous.
+    // Split it off the *end* first: a `references` `{label:col}` constraint
+    // modifier (issue #1146) also contains a colon, but it lives inside the
+    // trailing `{…}` block, so stripping a literal `:unique` suffix — never
+    // the colon inside the braces — stays unambiguous. Any other stray
+    // colon outside the braces is caught as an unknown modifier below.
+    let rest = rest.trim();
     let (ty, unique) = match rest.rsplit_once(':') {
-        Some((ty, modifier)) if modifier.trim() == "unique" => (ty.trim(), true),
-        Some((_, modifier)) => {
-            return Err(GenerateError::InvalidField {
-                token: token.to_owned(),
-                reason: format!(
-                    "unknown field modifier '{}'; the only supported modifier is 'unique'",
-                    modifier.trim()
-                ),
-            });
-        }
-        None => (rest.trim(), false),
+        // A trailing `:unique` (whitespace-tolerant) is the UNIQUE-index
+        // modifier. Its colon is always the last one — a `references`
+        // `{label:col}` colon sits *inside* the braces before it, so
+        // `rsplit_once` never mistakes the label colon for `:unique`.
+        Some((before, modifier)) if modifier.trim() == "unique" => (before.trim(), true),
+        // Any other trailing `:segment` (including a label colon inside a
+        // `{…}` block) is left on `ty` for the constraint/type parsing below
+        // to interpret or reject — not an error yet.
+        _ => (rest, false),
     };
 
     if name.is_empty() {
@@ -455,6 +543,7 @@ pub fn parse_field(token: &str) -> Result<Field, GenerateError> {
             nullable,
             variants,
             unique,
+            constraints: FieldConstraints::default(),
         });
     }
 
@@ -470,13 +559,57 @@ pub fn parse_field(token: &str) -> Result<Field, GenerateError> {
             nullable,
             variants: Vec::new(),
             unique,
+            constraints: FieldConstraints::default(),
         });
     }
 
-    let (kind, nullable) = parse_type(ty).ok_or_else(|| GenerateError::InvalidField {
+    // Fall-through: a scalar / `references` type, optionally carrying a
+    // trailing `{…}` constraint-modifier block (issue #1388 validation +
+    // HTML5 constraints; issue #1146 `references` `{label:col}`). `enum{…}`
+    // and `decimal{…}` were handled above — their braces are part of the
+    // *type*, so they never reach this generic modifier split.
+    let (base_ty, modifier_body) = split_constraint_modifier(ty);
+
+    // A leftover `{` means an unbalanced brace block (e.g. a shell that
+    // brace-expanded `String{min=3,max=120}` into two arguments, leaving a
+    // fragment like `String{min=3`). Any leftover `:` outside the braces is a
+    // stray trailing modifier (the only supported one, `:unique`, was already
+    // consumed above; a `references` label colon lives inside the braces).
+    if base_ty.contains('{') {
+        return Err(GenerateError::InvalidField {
+            token: token.to_owned(),
+            reason: format!(
+                "malformed constraint modifier in '{ty}' (unbalanced braces). If you typed \
+                 this in bash or zsh, quote the whole token so the shell doesn't brace-expand \
+                 it, e.g. 'title:String{{min=3,max=120}}'."
+            ),
+        });
+    }
+    if let Some((_, bad)) = base_ty.rsplit_once(':') {
+        return Err(GenerateError::InvalidField {
+            token: token.to_owned(),
+            reason: format!(
+                "unknown field modifier '{}'; the only bare modifier is 'unique' — other \
+                 constraints go in a trailing `{{…}}` block (e.g. 'title:String{{min=3,max=120}}')",
+                bad.trim()
+            ),
+        });
+    }
+
+    let (kind, nullable) = parse_type(base_ty).ok_or_else(|| GenerateError::InvalidField {
         token: token.to_owned(),
-        reason: format!("unsupported type '{ty}'. Supported: {SUPPORTED_TYPES}"),
+        reason: format!("unsupported type '{base_ty}'. Supported: {SUPPORTED_TYPES}"),
     })?;
+
+    let constraints = match modifier_body {
+        Some(body) => {
+            parse_field_constraints(body, kind).map_err(|reason| GenerateError::InvalidField {
+                token: token.to_owned(),
+                reason,
+            })?
+        }
+        None => FieldConstraints::default(),
+    };
 
     // `references` fields always end in `_id` — `post:references` resolves to
     // the column `post_id`. Tolerate an already-suffixed name (`post_id:references`)
@@ -493,7 +626,303 @@ pub fn parse_field(token: &str) -> Result<Field, GenerateError> {
         nullable,
         variants: Vec::new(),
         unique,
+        constraints,
     })
+}
+
+/// Split a scalar/`references` type token into its base type and the body of a
+/// trailing `{…}` constraint-modifier block, if present. `("String{min=3}",)`
+/// -> `("String", Some("min=3"))`; a token with no (or an unbalanced) block
+/// yields `(ty, None)` — the caller then rejects a leftover `{` as malformed.
+fn split_constraint_modifier(ty: &str) -> (&str, Option<&str>) {
+    let ty = ty.trim();
+    if let Some(open) = ty.find('{')
+        && ty.ends_with('}')
+    {
+        let close = ty.len() - 1;
+        if close > open {
+            return (ty[..open].trim_end(), Some(ty[open + 1..close].trim()));
+        }
+    }
+    (ty, None)
+}
+
+/// Format the `min = …, max = …` argument list shared by `length(…)` and
+/// `range(…)` `#[validate]` attributes. `float` range bounds are emitted with
+/// a decimal point (`0` -> `0.0`) so the generated comparison type-checks
+/// against an `f32`/`f64` field.
+fn min_max_args(min: Option<&String>, max: Option<&String>, float: bool) -> String {
+    let fmt = |raw: &str| -> String {
+        if float && !raw.contains(['.', 'e', 'E']) {
+            format!("{raw}.0")
+        } else {
+            raw.to_owned()
+        }
+    };
+    let mut args = Vec::with_capacity(2);
+    if let Some(min) = min {
+        args.push(format!("min = {}", fmt(min)));
+    }
+    if let Some(max) = max {
+        args.push(format!("max = {}", fmt(max)));
+    }
+    args.join(", ")
+}
+
+/// Ensure a reparsed float's shortest-round-trip string is a valid Rust *float*
+/// literal for a `#[validate(range(...))]` bound and the HTML5 `min`/`max`
+/// attributes: a whole-number value (`1` from `1`/`+1`/`1.0`, or `1000` from
+/// `1e3`) must carry a decimal point (`1.0`), since a bare integer literal is
+/// not accepted where an `f32`/`f64` bound is expected. Values that already
+/// contain `.`/`e`/`E` (`0.5`, `1.5e3`) are left as-is. Input is assumed finite
+/// (the caller rejects `inf`/`NaN`).
+fn canonical_float_literal(reparsed: &str) -> String {
+    if reparsed.contains(['.', 'e', 'E']) {
+        reparsed.to_owned()
+    } else {
+        format!("{reparsed}.0")
+    }
+}
+
+/// Parse the body of a `{…}` constraint-modifier block against the field's
+/// `kind` (issue #1388 validation + HTML5 constraints; issue #1146
+/// `references` `{label:col}`).
+///
+/// Supported per kind:
+/// - `String`/`Text`: `min=N`, `max=N` (length bounds, non-negative
+///   integers), `email`, `url`.
+/// - `i32`/`i64`/`f32`/`f64`: `min=N`, `max=N` (range bounds).
+/// - `references`: `label:col` (or `label=col`) — the display column.
+///
+/// Every other kind (and every unknown key/flag) is rejected with a message
+/// naming the offending token, so a misspelling like `{maxx=5}` fails the
+/// scaffold loudly rather than being silently dropped (issue #1388 AC5).
+fn parse_field_constraints(body: &str, kind: FieldKind) -> Result<FieldConstraints, String> {
+    let mut c = FieldConstraints::default();
+    if body.is_empty() {
+        return Err(
+            "empty constraint block `{}` — remove the braces or add a constraint \
+             (e.g. `{min=3,max=120}`, `{email}`, `{label:title}`)"
+                .to_owned(),
+        );
+    }
+
+    let string_like = matches!(kind, FieldKind::String | FieldKind::Text);
+    let numeric = matches!(
+        kind,
+        FieldKind::I32 | FieldKind::I64 | FieldKind::F32 | FieldKind::F64
+    );
+    let is_reference = kind.is_reference();
+
+    for raw in body.split(',') {
+        let tok = raw.trim();
+        if tok.is_empty() {
+            return Err("empty constraint (stray comma) in the `{…}` block".to_owned());
+        }
+        // `label:col` (references display column) uses a colon; every other
+        // key/value pair uses `=`. Bare tokens (`email`, `url`) have neither.
+        if let Some((key, value)) = tok.split_once('=') {
+            parse_constraint_kv(&mut c, key.trim(), value.trim(), kind)?;
+        } else if let Some((key, value)) = tok.split_once(':') {
+            if key.trim() == "label" {
+                set_label_constraint(&mut c, value.trim(), is_reference)?;
+            } else {
+                return Err(unknown_constraint_message(key.trim(), kind));
+            }
+        } else {
+            match tok {
+                "email" | "url" => {
+                    if !string_like {
+                        return Err(format!(
+                            "the `{tok}` constraint only applies to String/Text fields"
+                        ));
+                    }
+                    if tok == "email" {
+                        c.email = true;
+                    } else {
+                        c.url = true;
+                    }
+                }
+                _ => return Err(unknown_constraint_message(tok, kind)),
+            }
+        }
+    }
+
+    // `email` and `url` are mutually exclusive format validators: emitting both
+    // `#[validate(email)]` and `#[validate(url)]` makes the field unwritable (a
+    // valid email fails `url` and vice versa), and the HTML5 renderer can only
+    // pick one `type`. Reject the pair rather than silently choosing a winner,
+    // which would change the author's intent (issue #1388).
+    if c.email && c.url {
+        return Err(
+            "the `email` and `url` constraints are mutually exclusive — a value can't satisfy \
+             both; keep only one"
+                .to_owned(),
+        );
+    }
+
+    // Cross-check the combination against the kind: length/range bounds need a
+    // string or numeric field, and require min <= max when both are present.
+    if (c.min.is_some() || c.max.is_some()) && !string_like && !numeric {
+        return Err(format!(
+            "min/max constraints are not supported for {} fields",
+            kind.rust_type()
+        ));
+    }
+    if let (Some(min), Some(max)) = (&c.min, &c.max) {
+        // Compare at the field's CONCRETE width, never via `f64`: a large `i64`
+        // pair such as `{min=9007199254740993,max=9007199254740992}` would
+        // otherwise round to the same float and slip past this check, emitting
+        // an impossible `range(min > max)` that rejects every submitted value
+        // instead of failing generation here. Each bound already passed
+        // `parse_bound` for `kind`, so these re-parses succeed exactly.
+        let inverted = match kind {
+            FieldKind::String | FieldKind::Text => {
+                matches!((min.parse::<u64>(), max.parse::<u64>()), (Ok(lo), Ok(hi)) if lo > hi)
+            }
+            FieldKind::I32 | FieldKind::I64 => {
+                matches!((min.parse::<i64>(), max.parse::<i64>()), (Ok(lo), Ok(hi)) if lo > hi)
+            }
+            // `f32`/`f64`: `f64` compares `f32` values exactly, so this is lossless.
+            _ => matches!((min.parse::<f64>(), max.parse::<f64>()), (Ok(lo), Ok(hi)) if lo > hi),
+        };
+        if inverted {
+            return Err(format!("min ({min}) cannot be greater than max ({max})"));
+        }
+    }
+
+    Ok(c)
+}
+
+/// Handle a `key=value` constraint token (`min=`, `max=`, or a `=`-spelled
+/// `label=`).
+fn parse_constraint_kv(
+    c: &mut FieldConstraints,
+    key: &str,
+    value: &str,
+    kind: FieldKind,
+) -> Result<(), String> {
+    match key {
+        "min" | "max" => {
+            let bound = parse_bound(value, kind)?;
+            if key == "min" {
+                c.min = Some(bound);
+            } else {
+                c.max = Some(bound);
+            }
+            Ok(())
+        }
+        "label" => set_label_constraint(c, value, kind.is_reference()),
+        _ => Err(unknown_constraint_message(key, kind)),
+    }
+}
+
+/// Validate and normalize a `min=`/`max=` bound for `kind`: a length bound on
+/// a `String`/`Text` field must be a non-negative integer; a range bound on a
+/// numeric field must be a valid number.
+fn parse_bound(value: &str, kind: FieldKind) -> Result<String, String> {
+    // Every arm returns the CANONICAL reparsed value, never the raw user token:
+    // the stored bound is spliced verbatim into both `#[validate(range/length(…))]`
+    // and the HTML5 `min`/`max`/`minlength`/`maxlength` attributes, so a token
+    // that parses but isn't a valid Rust literal (`.5`, `+1`, `007`, `1.`) would
+    // otherwise fail to COMPILE the generated app. Reparsing at the field's
+    // concrete type and re-`to_string()`-ing yields a literal that is always
+    // valid and value-preserving (issue #1388 follow-up).
+    match kind {
+        FieldKind::String | FieldKind::Text => {
+            let n = value
+                .parse::<u64>()
+                .map_err(|_| format!("length bound '{value}' must be a non-negative integer"))?;
+            Ok(n.to_string())
+        }
+        FieldKind::I32 => {
+            // Parse at the field's CONCRETE width, not a wider `i64`: a bound
+            // that overflows `i32` (e.g. `count:i32{max=3000000000}`) would
+            // otherwise be emitted as `#[validate(range(max = ...))]` on an
+            // `i32` field and fail to COMPILE the generated app.
+            let n = value.parse::<i32>().map_err(|_| {
+                format!(
+                    "range bound '{value}' must be an integer within the i32 range ({}..={})",
+                    i32::MIN,
+                    i32::MAX
+                )
+            })?;
+            Ok(n.to_string())
+        }
+        FieldKind::I64 => {
+            let n = value.parse::<i64>().map_err(|_| {
+                format!(
+                    "range bound '{value}' must be an integer within the i64 range ({}..={})",
+                    i64::MIN,
+                    i64::MAX
+                )
+            })?;
+            Ok(n.to_string())
+        }
+        FieldKind::F32 => {
+            // Rust's float parse saturates overflow to ±∞ rather than erroring,
+            // so an out-of-`f32`-range literal would compile to a non-finite
+            // bound; reject non-finite explicitly, then canonicalize.
+            let parsed = value
+                .parse::<f32>()
+                .map_err(|_| format!("range bound '{value}' must be a number"))?;
+            if !parsed.is_finite() {
+                return Err(format!(
+                    "range bound '{value}' is out of range for an f32 field (it overflows to a non-finite value)"
+                ));
+            }
+            Ok(canonical_float_literal(&parsed.to_string()))
+        }
+        FieldKind::F64 => {
+            let parsed = value
+                .parse::<f64>()
+                .map_err(|_| format!("range bound '{value}' must be a number"))?;
+            if !parsed.is_finite() {
+                return Err(format!(
+                    "range bound '{value}' is out of range for an f64 field (it overflows to a non-finite value)"
+                ));
+            }
+            Ok(canonical_float_literal(&parsed.to_string()))
+        }
+        _ => Err(format!(
+            "min/max constraints are not supported for {} fields",
+            kind.rust_type()
+        )),
+    }
+}
+
+/// Set the `references` display-column override, rejecting `label` on a
+/// non-`references` field and a label that isn't a valid `snake_case` column.
+fn set_label_constraint(
+    c: &mut FieldConstraints,
+    value: &str,
+    is_reference: bool,
+) -> Result<(), String> {
+    if !is_reference {
+        return Err("the `label` constraint only applies to `references` fields".to_owned());
+    }
+    if !is_valid_ident(value) {
+        return Err(format!(
+            "reference label column '{value}' is not a valid snake_case identifier"
+        ));
+    }
+    c.label = Some(value.to_owned());
+    Ok(())
+}
+
+/// A per-kind "unknown constraint" message that names the offending token and
+/// lists what the kind *does* accept (issue #1388 AC5).
+fn unknown_constraint_message(token: &str, kind: FieldKind) -> String {
+    let accepted = match kind {
+        FieldKind::String | FieldKind::Text => "min=N, max=N, email, url",
+        FieldKind::I32 | FieldKind::I64 | FieldKind::F32 | FieldKind::F64 => "min=N, max=N",
+        FieldKind::References => "label:col",
+        _ => "(none — this field type takes no constraint modifiers)",
+    };
+    format!(
+        "unknown constraint '{token}' for {} fields; supported: {accepted}",
+        kind.rust_type()
+    )
 }
 
 /// Parse an `enum{a,b,c}` (optionally `Option<enum{a,b,c}>`) type token.
@@ -804,6 +1233,10 @@ pub(super) fn is_rust_keyword(s: &str) -> bool {
 }
 
 #[cfg(test)]
+// Test inputs like `"title:String{min=3}"` / `"post:references{label:title}"`
+// are literal DSL tokens passed to `parse_field`, not format strings — the
+// `{…}` is the scaffold's own constraint-modifier syntax under test.
+#[allow(clippy::literal_string_with_formatting_args)]
 mod tests {
     use super::*;
 
@@ -1297,6 +1730,257 @@ mod tests {
             SUPPORTED_TYPES.contains("references"),
             "SUPPORTED_TYPES must list references"
         );
+    }
+
+    // ── constraint modifiers (issue #1388 validation + #1146 label) ─────────
+
+    #[test]
+    fn parse_string_length_constraint() {
+        let f = parse_field("title:String{min=3,max=120}").unwrap();
+        assert_eq!(f.name, "title");
+        assert_eq!(f.kind, FieldKind::String);
+        assert_eq!(f.constraints.min.as_deref(), Some("3"));
+        assert_eq!(f.constraints.max.as_deref(), Some("120"));
+        assert_eq!(f.validation_attrs(), vec!["length(min = 3, max = 120)"]);
+    }
+
+    #[test]
+    fn parse_string_email_constraint() {
+        let f = parse_field("contact:String{email}").unwrap();
+        assert!(f.constraints.email);
+        assert_eq!(f.validation_attrs(), vec!["email"]);
+    }
+
+    #[test]
+    fn parse_string_url_constraint() {
+        let f = parse_field("homepage:String{url}").unwrap();
+        assert!(f.constraints.url);
+        assert_eq!(f.validation_attrs(), vec!["url"]);
+    }
+
+    #[test]
+    fn email_and_url_together_are_rejected() {
+        // Both format validators on one field make it unwritable (a valid email
+        // fails `url` and vice versa), so the pair is rejected at parse time
+        // rather than silently picking a winner.
+        let err = parse_field("contact:String{email,url}").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("mutually exclusive"),
+            "must explain the conflict: {msg}"
+        );
+        assert!(msg.contains("contact"), "must name the field: {msg}");
+    }
+
+    #[test]
+    fn parse_numeric_range_constraint() {
+        let f = parse_field("age:i32{min=0,max=130}").unwrap();
+        assert_eq!(f.kind, FieldKind::I32);
+        assert_eq!(f.validation_attrs(), vec!["range(min = 0, max = 130)"]);
+    }
+
+    #[test]
+    fn i32_range_bound_within_range_is_accepted() {
+        let f = parse_field("count:i32{max=1000000}").unwrap();
+        assert_eq!(f.kind, FieldKind::I32);
+        assert_eq!(f.constraints.max.as_deref(), Some("1000000"));
+        assert_eq!(f.validation_attrs(), vec!["range(max = 1000000)"]);
+    }
+
+    #[test]
+    fn i32_range_bound_exceeding_i32_max_is_rejected() {
+        // `3000000000` > i32::MAX (~2.147e9): parsed at the field's concrete
+        // width so it fails generation with an actionable error rather than
+        // emitting `#[validate(range(max = 3000000000))]` on an `i32` field,
+        // which would fail to COMPILE the generated app.
+        let err = parse_field("count:i32{max=3000000000}").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("3000000000"), "must name the bad bound: {msg}");
+        assert!(msg.contains("i32"), "must name the field type: {msg}");
+        assert!(
+            msg.contains("2147483647"),
+            "must state the valid range: {msg}"
+        );
+    }
+
+    #[test]
+    fn i64_accepts_a_bound_that_would_overflow_i32() {
+        // The same literal is fine on an i64 field.
+        let f = parse_field("count:i64{max=3000000000}").unwrap();
+        assert_eq!(f.kind, FieldKind::I64);
+        assert_eq!(f.validation_attrs(), vec!["range(max = 3000000000)"]);
+    }
+
+    #[test]
+    fn f32_range_bound_overflowing_the_type_is_rejected() {
+        // Rust parses an out-of-f32-range literal to +∞ rather than erroring,
+        // so reject non-finite bounds explicitly.
+        let err = parse_field("ratio:f32{max=1e40}").unwrap_err();
+        assert!(err.to_string().contains("f32"), "{}", err);
+    }
+
+    #[test]
+    fn i64_min_greater_than_max_beyond_f64_precision_is_rejected() {
+        // `min` is exactly one greater than `max`, but both round to the same
+        // `f64` (they exceed 2^53). Comparing at the concrete `i64` width must
+        // still catch the inversion, rather than emitting an impossible
+        // `range(min > max)` that rejects every submitted value.
+        let err = parse_field("count:i64{min=9007199254740993,max=9007199254740992}").unwrap_err();
+        assert!(
+            err.to_string().contains("cannot be greater than"),
+            "must report the inverted range: {err}"
+        );
+    }
+
+    #[test]
+    fn i64_valid_large_range_is_accepted() {
+        let f = parse_field("count:i64{min=1,max=9007199254740992}").unwrap();
+        assert_eq!(f.kind, FieldKind::I64);
+        assert_eq!(
+            f.validation_attrs(),
+            vec!["range(min = 1, max = 9007199254740992)"]
+        );
+    }
+
+    #[test]
+    fn float_leading_dot_bound_is_canonicalized_to_a_valid_literal() {
+        // `.5` parses as a number but is not a valid Rust float literal; the
+        // stored/emitted bound must be `0.5`, and a whole-number float bound
+        // must carry a decimal point (`1` -> `1.0`).
+        let f = parse_field("ratio:f64{min=.5,max=1}").unwrap();
+        assert_eq!(f.constraints.min.as_deref(), Some("0.5"));
+        assert_eq!(f.constraints.max.as_deref(), Some("1.0"));
+        assert_eq!(f.validation_attrs(), vec!["range(min = 0.5, max = 1.0)"]);
+    }
+
+    #[test]
+    fn integer_signed_and_zero_padded_bounds_are_canonicalized() {
+        // `+1` and `007` parse but aren't the literal we want to splice; the
+        // stored/emitted bound must be the canonical decimal (`1`, `7`).
+        let f = parse_field("count:i32{min=+1,max=007}").unwrap();
+        assert_eq!(f.constraints.min.as_deref(), Some("1"));
+        assert_eq!(f.constraints.max.as_deref(), Some("7"));
+        assert_eq!(f.validation_attrs(), vec!["range(min = 1, max = 7)"]);
+    }
+
+    #[test]
+    fn integer_bounds_within_range_are_emitted_verbatim() {
+        // Regression: ordinary in-range integer bounds are unchanged.
+        assert_eq!(
+            parse_field("age:i32{min=0,max=130}")
+                .unwrap()
+                .validation_attrs(),
+            vec!["range(min = 0, max = 130)"]
+        );
+    }
+
+    #[test]
+    fn parse_float_range_constraint_emits_decimal_literals() {
+        // An integer bound on an f64 field must be emitted with a decimal
+        // point, or the generated `#[validate(range(...))]` comparison fails
+        // to type-check against the f64 field.
+        let f = parse_field("ratio:f64{min=0,max=1}").unwrap();
+        assert_eq!(f.validation_attrs(), vec!["range(min = 0.0, max = 1.0)"]);
+    }
+
+    #[test]
+    fn parse_min_only_constraint() {
+        let f = parse_field("title:String{min=3}").unwrap();
+        assert_eq!(f.constraints.min.as_deref(), Some("3"));
+        assert_eq!(f.constraints.max, None);
+        assert_eq!(f.validation_attrs(), vec!["length(min = 3)"]);
+    }
+
+    #[test]
+    fn parse_reference_label_constraint() {
+        let f = parse_field("post:references{label:title}").unwrap();
+        assert_eq!(f.name, "post_id");
+        assert_eq!(f.kind, FieldKind::References);
+        assert_eq!(f.constraints.label.as_deref(), Some("title"));
+        // `references` never fans out to a `#[validate]` rule.
+        assert!(f.validation_attrs().is_empty());
+    }
+
+    #[test]
+    fn reference_label_does_not_break_unique_detection() {
+        // The colon inside `{label:title}` must not be mistaken for a
+        // `:unique` modifier split.
+        let f = parse_field("post:references{label:title}").unwrap();
+        assert!(!f.unique);
+    }
+
+    #[test]
+    fn constraint_composes_with_unique_modifier() {
+        let f = parse_field("email:String{email}:unique").unwrap();
+        assert!(f.unique);
+        assert!(f.constraints.email);
+    }
+
+    #[test]
+    fn bare_unique_modifier_still_parses() {
+        let f = parse_field("email:String:unique").unwrap();
+        assert!(f.unique);
+        assert!(f.constraints.is_empty());
+    }
+
+    #[test]
+    fn unknown_constraint_modifier_is_rejected_by_name() {
+        // AC5: a misspelled modifier fails loudly, naming the token.
+        let err = parse_field("title:String{maxx=5}").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("maxx"), "must name the bad token: {msg}");
+    }
+
+    #[test]
+    fn email_constraint_on_numeric_field_is_rejected() {
+        let err = parse_field("age:i32{email}").unwrap_err();
+        assert!(err.to_string().contains("email"));
+    }
+
+    #[test]
+    fn label_constraint_on_non_reference_is_rejected() {
+        let err = parse_field("title:String{label:foo}").unwrap_err();
+        assert!(err.to_string().contains("references"));
+    }
+
+    #[test]
+    fn min_greater_than_max_is_rejected() {
+        let err = parse_field("title:String{min=10,max=3}").unwrap_err();
+        assert!(err.to_string().contains("min"));
+    }
+
+    #[test]
+    fn non_integer_length_bound_is_rejected() {
+        let err = parse_field("title:String{max=abc}").unwrap_err();
+        assert!(err.to_string().contains("abc"));
+    }
+
+    #[test]
+    fn constraint_on_unconstrainable_kind_is_rejected() {
+        // A bool field takes no `{…}` modifiers.
+        let err = parse_field("active:bool{min=0}").unwrap_err();
+        assert!(err.to_string().contains("not supported") || err.to_string().contains("bool"));
+    }
+
+    #[test]
+    fn empty_constraint_block_is_rejected() {
+        let err = parse_field("title:String{}").unwrap_err();
+        assert!(err.to_string().contains("empty"));
+    }
+
+    #[test]
+    fn nullable_string_with_constraint_parses() {
+        let f = parse_field("bio:Option<String>{max=200}").unwrap();
+        assert!(f.nullable);
+        assert_eq!(f.constraints.max.as_deref(), Some("200"));
+        assert_eq!(f.validation_attrs(), vec!["length(max = 200)"]);
+    }
+
+    #[test]
+    fn bare_field_has_empty_constraints() {
+        let f = parse_field("title:String").unwrap();
+        assert!(f.constraints.is_empty());
+        assert!(f.validation_attrs().is_empty());
     }
 
     #[test]

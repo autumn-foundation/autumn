@@ -432,6 +432,49 @@ pub fn plan_scaffold_with_options(
             ));
         }
     }
+    // An explicit `{label:col}` override that names a column the target model
+    // doesn't expose as a string would generate a `select {table}::{col}`
+    // (loaded as `String`) that fails to compile the generated app. The display
+    // resolver falls back to the heuristic display column in that case
+    // (see `resolve_reference_display`), so warn the author their label was
+    // ignored rather than silently swapping it. Skipped for a missing target
+    // (already warned above) and when the model isn't discoverable (the
+    // override can't be validated, so it's honored as-is).
+    for f in form_fields.iter().filter(|f| f.kind.is_reference()) {
+        if missing_reference_targets.contains(&f.name) {
+            continue;
+        }
+        let Some(label) = &f.constraints.label else {
+            continue;
+        };
+        let base = f.name.strip_suffix("_id").unwrap_or(&f.name);
+        // Self-ref-aware: a self-reference's columns come from the in-flight
+        // fields, so `Category category:references{label:name}` doesn't warn
+        // that the not-yet-on-disk model "has no string columns".
+        let columns = target_string_columns(project_root, f, &plural, &form_fields);
+        if !columns.iter().any(|(c, _)| c == label) {
+            // Covers both a wrong column name AND a target with no string
+            // columns at all — in the latter case there is nothing to fall back
+            // to, so the reference renders its raw id.
+            let detail = if columns.is_empty() {
+                format!("the '{base}' model has no string columns")
+            } else {
+                format!(
+                    "the '{base}' model's string columns are: {}",
+                    columns
+                        .iter()
+                        .map(|(c, _)| c.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            };
+            plan.warn(format!(
+                "reference label '{label}' on '{}' is not a usable string column ({detail}); \
+                 falling back to the default display column (its raw id when there is none).",
+                f.name
+            ));
+        }
+    }
 
     // Repository file under `src/repositories/<snake>.rs`
     let repos_dir = project_root.join("src").join("repositories");
@@ -508,6 +551,7 @@ pub fn plan_scaffold_with_options(
         plan.create(
             routes_dir.join(format!("{plural}.rs")),
             render_routes_file(
+                project_root,
                 &pascal_name,
                 &snake_name,
                 &plural,
@@ -1326,6 +1370,21 @@ fn render_model_form(
                     | FieldKind::Decimal { .. }
                     | FieldKind::References
             )
+            // A numeric field carrying a `{min,max}` range constraint (issue
+            // #1388) must keep its NATIVE type on the form struct, not the
+            // String representation below: `validator`'s `range` rule only
+            // applies to numeric types, so `#[validate(range(...))]` on a
+            // `String` field fails to compile — and the whole point of the
+            // constraint is that the range is rejected server-side through the
+            // changeset (a 422 with an inline error), which needs the rule on
+            // the form the changeset validates. The `T::default()` pre-fill
+            // trade-off the String representation avoids is moot here: the
+            // field is `required` and range-bounded, so a deliberate value is
+            // forced anyway.
+            && !(matches!(
+                f.kind,
+                FieldKind::I32 | FieldKind::I64 | FieldKind::F32 | FieldKind::F64
+            ) && (f.constraints.min.is_some() || f.constraints.max.is_some()))
         {
             // Represented as a `String` on the form, exactly like a required
             // enum/datetime field: `T::default()` for these kinds (`0`, the nil
@@ -1420,6 +1479,7 @@ fn render_model_form(
 )]
 #[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
 fn render_routes_file(
+    project_root: &Path,
     pascal_name: &str,
     snake_name: &str,
     plural: &str,
@@ -1439,23 +1499,28 @@ fn render_routes_file(
     let update_columns = render_update_columns(plural, fields);
     let nullable_field_match = render_nullable_field_match(fields);
     let has_attachments = has_attachment_fields(fields);
-    // `references` columns render as a `<select>` of the referenced table's
-    // ids (issue #1135 AC 2: "enum/references→select"). The options are
-    // runtime data, so the handlers that render the form load them and pass
-    // them into the shared `{snake}_form_for` helper. `--live-validation`
-    // keeps the old per-field emission (no `form_for`), so no options are
-    // loaded there. Columns in `missing_reference_targets` (their referenced
-    // model — and therefore its `src/schema.rs` entry — isn't in the project)
-    // are left out entirely: no loader, no schema import, no Select override,
-    // so they fall back to the derived numeric id input and the generated
-    // file still compiles (the caller warned about the downgrade).
+    // Every PRESENT `references` field (its target model — and so its
+    // `src/schema.rs` entry — is in the project; `missing_reference_targets`
+    // excludes the rest, which the caller already warned about and which fall
+    // back to a numeric id). This drives the issue #1146 parent-DISPLAY
+    // rendering on index/show, which is generator-emitted *view* markup
+    // (`posts::table.find(fk).select(posts::title)`), independent of the form
+    // control — so it applies in `--live-validation` mode too.
+    let display_reference_fields: Vec<&Field> = fields
+        .iter()
+        .filter(|f| f.kind.is_reference() && !missing_reference_targets.contains(&f.name))
+        .collect();
+    // The subset that also renders an in-FORM `<select>` of the referenced
+    // table's ids (issue #1135 AC 2) plus its runtime option loaders.
+    // `--live-validation` renders the form through the per-field path (no
+    // `form_for`, and `select_input` takes only static options, so a
+    // runtime-option belongs_to `<select>` can't be wired through it without
+    // the same cross-crate form-helper change #1750 tracks): skip the dropdown
+    // + loaders there, but KEEP the index/show display rendering above.
     let reference_fields: Vec<&Field> = if live_validation {
         Vec::new()
     } else {
-        fields
-            .iter()
-            .filter(|f| f.kind.is_reference() && !missing_reference_targets.contains(&f.name))
-            .collect()
+        display_reference_fields.clone()
     };
     let has_reference_selects = !reference_fields.is_empty();
 
@@ -1494,6 +1559,19 @@ fn render_routes_file(
     // threads into the layout.
     let flash_arg = "flash_messages(&flash.consume().await)";
 
+    // Per-reference display resolution (issue #1146): the `<select>` options,
+    // index columns, and show rows render the parent's display column (a
+    // `name`/`title`/first-string heuristic, or an explicit `{label:col}`)
+    // instead of the raw foreign-key id. A reference whose target has no
+    // string column has no entry here and keeps rendering the id. Resolved from
+    // the display-scoped set so it's populated in `--live-validation` too.
+    let reference_displays: BTreeMap<String, ReferenceDisplay> = display_reference_fields
+        .iter()
+        .filter_map(|f| {
+            resolve_reference_display(project_root, f, plural, all_fields)
+                .map(|d| (f.name.clone(), d))
+        })
+        .collect();
     let model_form = render_model_form(pascal_name, fields, validations);
     // Enum fields need their generated Rust type in scope here — `into_new`
     // parses into it and the `From<&Row>` seed matches against its variants
@@ -1725,7 +1803,15 @@ fn render_routes_file(
              }}\n    \
              }})"
         );
-        (new_form_body, edit_form_body, String::new())
+        // The in-form belongs_to `<select>` is deferred in `--live-validation`
+        // (#1750), but the referenced-row option loaders are still emitted: the
+        // issue #1146 index parent-label map is built by collecting each
+        // `{name}_select_options(...)` into a `HashMap` (see
+        // `render_index_reference_label_loads`), so the loaders are a live
+        // dependency of the restored index display, not dead code.
+        let option_loaders =
+            render_reference_option_loaders(&display_reference_fields, db_ty, &reference_displays);
+        (new_form_body, edit_form_body, option_loaders)
     } else {
         // Reference selects: load the referenced ids before rendering and
         // thread them into the shared helper (issue #1135, AC 2
@@ -1770,7 +1856,7 @@ fn render_routes_file(
             new_form_body,
             edit_form_body,
             render_form_for_helper(pascal_name, snake_name, fields, missing_reference_targets)
-                + &render_reference_option_loaders(&reference_fields, db_ty),
+                + &render_reference_option_loaders(&reference_fields, db_ty, &reference_displays),
         )
     };
     let form_model_impl = render_form_model_impl(pascal_name);
@@ -1935,11 +2021,43 @@ fn render_routes_file(
         String::new()
     };
 
-    // For non-live paths, generate the data_table columns and call.
+    // For non-live paths, generate the data_table columns and call. Both the
+    // plain AND sharded index promote displayable `references` columns to
+    // render the parent's label from a per-view label map (issue #1146,
+    // `index_columns_labeled` + `index_label_loads`): the sharded index handler
+    // already threads a `ShardedDb`, its `{name}_select_options` loaders are
+    // generated with `db_ty` (= `ShardedDb`), and the sharded `show` handler
+    // already loads labels through the same connection — so the index reuses
+    // that mechanism rather than falling back to raw ids. Only the `--live` SSE
+    // list (a `<ul>` of ids, no data-table) keeps id rendering.
     let columns_let = if live {
         String::new()
     } else {
-        render_columns_vec(pascal_name, plural, fields)
+        render_columns_vec(pascal_name, plural, fields, &reference_displays, false)
+    };
+    let index_label_loads = if live {
+        String::new()
+    } else {
+        render_index_reference_label_loads(&display_reference_fields, &reference_displays)
+    };
+    // The plain index gains `mut db: Db` only when there is a label map to load
+    // (otherwise an unused extractor); the sharded index always has a
+    // `ShardedDb` (for `from_shard`), promoted to `mut` when it must also run
+    // the loader.
+    let index_db_param = if index_label_loads.is_empty() {
+        ""
+    } else {
+        "mut db: Db,\n    "
+    };
+    let sharded_index_db = if index_label_loads.is_empty() {
+        "db: ShardedDb"
+    } else {
+        "mut db: ShardedDb"
+    };
+    let index_columns_labeled = if index_label_loads.is_empty() {
+        columns_let
+    } else {
+        render_columns_vec(pascal_name, plural, fields, &reference_displays, true)
     };
     let table_render = if live {
         String::new()
@@ -1950,7 +2068,10 @@ fn render_routes_file(
     };
 
     let list_render = if live { &live_ul_render } else { &table_render };
-    let show_rows = render_show_property_rows(all_fields);
+    let show_rows = render_show_property_rows(all_fields, &reference_displays);
+    // The `show` handler pre-loads each displayable reference's parent label
+    // (issue #1146) before building its property rows.
+    let show_label_loads = render_show_reference_label_loads(all_fields, &reference_displays);
 
     let index_handler = if sharded {
         if live {
@@ -1986,12 +2107,12 @@ pub async fn index(
 #[get("/{plural}")]
 pub async fn index(
     page_req: PageRequest,
-    db: ShardedDb,
+    {sharded_index_db},
     flash: Flash,
 ) -> AutumnResult<Markup> {{
     let repo = Pg{pascal_name}Repository::from_shard(&db);
     let page_data: Page<{pascal_name}> = repo.page(&page_req).await?;
-{columns_let}    Ok({layout_fn}("{pascal_name} index", {cp_index}{flash_arg}, html! {{
+{index_label_loads}{index_columns_labeled}    Ok({layout_fn}("{pascal_name} index", {cp_index}{flash_arg}, html! {{
         h1 {{ "{pascal_name}s" }}
         a href="/{plural}/new" {{ "New {pascal_name}" }}
         {list_render}
@@ -2033,10 +2154,10 @@ pub async fn index(
 pub async fn index(
     page_req: PageRequest,
     repo: Pg{pascal_name}Repository,
-    flash: Flash,
+    {index_db_param}flash: Flash,
 ) -> AutumnResult<Markup> {{
     let page_data: Page<{pascal_name}> = repo.page(&page_req).await?;
-{columns_let}    Ok({layout_fn}("{pascal_name} index", {cp_index}{flash_arg}, html! {{
+{index_label_loads}{index_columns_labeled}    Ok({layout_fn}("{pascal_name} index", {cp_index}{flash_arg}, html! {{
         h1 {{ "{pascal_name}s" }}
         a href="/{plural}/new" {{ "New {pascal_name}" }}
         {list_render}
@@ -2062,15 +2183,16 @@ pub async fn index(
             .to_owned()
     };
 
-    // Schema imports: the resource's own table, plus — when reference selects
-    // are rendered — each referenced table so its ids can be loaded for the
-    // select options. Only targets that are actually present in the project
-    // reach this point (`reference_fields` already excludes
-    // `missing_reference_targets`): importing a table whose `diesel::table!`
-    // entry doesn't exist in `src/schema.rs` would fail to compile, and a
-    // missing target has always been a warning, not an error.
+    // Schema imports: the resource's own table, plus each referenced table so
+    // its rows can be loaded — for the form select options AND for the
+    // index/show parent-display label loads (issue #1146), which is why this
+    // uses the display-scoped set (populated even in `--live-validation`, where
+    // the form select is skipped but the display loads remain). Only present
+    // targets reach here (`missing_reference_targets` excluded): importing a
+    // table whose `diesel::table!` entry doesn't exist would fail to compile,
+    // and a missing target has always been a warning, not an error.
     let schema_import = {
-        let mut extra_tables: BTreeSet<String> = reference_fields
+        let mut extra_tables: BTreeSet<String> = display_reference_fields
             .iter()
             .filter_map(|f| f.reference_table())
             .collect();
@@ -2258,7 +2380,7 @@ pub async fn show(id: Path<{id_rust}>, mut db: {db_ty}, flash: Flash) -> AutumnR
         .first(&mut *db)
         .await
         .map_err(AutumnError::not_found)?;
-    let props: Vec<(&str, maud::Markup)> = vec![
+{show_label_loads}    let props: Vec<(&str, maud::Markup)> = vec![
 {show_rows}    ];
     Ok({layout_fn}(&format!("{pascal_name} #{{}}", row.id), {cp_show}{flash_arg}, html! {{
         h1 {{ "{pascal_name} #" (row.id) }}
@@ -2467,6 +2589,11 @@ fn render_form_model_impl(pascal_name: &str) -> String {
 ///   project, so there is no schema entry to load options from) keep the
 ///   derived numeric id input instead — the plan carries a warning saying
 ///   how to get the select.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one per-field match building the form_for builder calls plus the \
+              constrained-field/attachment append markup — a single cohesive template"
+)]
 fn render_form_for_helper(
     pascal_name: &str,
     snake_name: &str,
@@ -2562,7 +2689,82 @@ fn render_form_for_helper(
                     "\n        .override_field(\"{name}\", autumn_web::form::FieldControl::Select {{ options: {name}_select }})"
                 );
             }
-            _ => {}
+            // A `String`/`Text`/numeric field carrying DSL constraint
+            // modifiers (issue #1388) needs HTML5 attributes the derived
+            // `FieldControl` can't express (`minlength`/`maxlength`,
+            // `min`/`max`, `type="email"`/`type="url"`). Exclude it from the
+            // derived render and append an equivalent control that carries the
+            // constraints — the same `.exclude()` + `.append()` escape hatch
+            // the attachment arm uses. The value is re-filled from the
+            // changeset so the 422 re-render keeps entered input, and the
+            // inline-error/ARIA skeleton matches the derived controls.
+            _ => {
+                if let Some((input_type, constraint_attrs)) = html5_constraint_spec(f) {
+                    let label = humanize_label(name);
+                    let required_attr = if f.nullable {
+                        ""
+                    } else {
+                        " required aria-required=\"true\""
+                    };
+                    let _ = write!(builder_calls, "\n        .exclude(\"{name}\")");
+                    if matches!(f.kind, FieldKind::Text) && input_type == "text" {
+                        // A `text` DSL column with a length/plain constraint is a
+                        // long-form field (Postgres `TEXT`), so its control is a
+                        // `<textarea>`, not a single-line `<input>` — the same
+                        // element the derived `FieldControl::Textarea` would pick.
+                        // (A `text{email}`/`text{url}` field has `input_type` ==
+                        // `email`/`url`, which a textarea can't carry — those
+                        // inherently single-line, type-dependent controls take the
+                        // `<input type="…">` branch below instead.) Only the
+                        // attributes a textarea honours carry over: the length
+                        // rules in `constraint_attrs` (`minlength`/`maxlength`)
+                        // and `required`; the input-only `type`/`min`/`max` are
+                        // dropped. The 422 re-render value is the element's text
+                        // content (not a `value=` attribute) so entered input
+                        // survives, matching `form::textarea_input`.
+                        let _ = write!(
+                            appends,
+                            "\n        .append(html! {{\n            \
+                             @let errors = changeset.errors_for(\"{name}\");\n            \
+                             div id=\"{name}-field\" class=\"autumn-field\" {{\n                \
+                             label for=\"{name}\" class=\"autumn-field__label\" {{ \"{label}\" }}\n                \
+                             textarea id=\"{name}\" name=\"{name}\"{constraint_attrs}{required_attr}\n                    \
+                             class=(if errors.is_empty() {{ \"autumn-field__input\" }} else {{ \"autumn-field__input autumn-field__input--invalid\" }})\n                    \
+                             aria-invalid=(if errors.is_empty() {{ \"false\" }} else {{ \"true\" }})\n                    \
+                             aria-describedby=(if errors.is_empty() {{ \"\" }} else {{ \"{name}-error\" }}) {{\n                        \
+                             (changeset.field_value(\"{name}\").unwrap_or_default())\n                    \
+                             }}\n                \
+                             @if !errors.is_empty() {{\n                    \
+                             div id=\"{name}-error\" role=\"alert\" class=\"autumn-field__errors\" {{\n                        \
+                             @for error in errors {{ p class=\"autumn-field__error\" {{ (error) }} }}\n                    \
+                             }}\n                \
+                             }}\n            \
+                             }}\n        \
+                             }})"
+                        );
+                    } else {
+                        let _ = write!(
+                            appends,
+                            "\n        .append(html! {{\n            \
+                             @let errors = changeset.errors_for(\"{name}\");\n            \
+                             div id=\"{name}-field\" class=\"autumn-field\" {{\n                \
+                             label for=\"{name}\" class=\"autumn-field__label\" {{ \"{label}\" }}\n                \
+                             input type=\"{input_type}\" id=\"{name}\" name=\"{name}\"\n                    \
+                             value=(changeset.field_value(\"{name}\").unwrap_or_default()){constraint_attrs}{required_attr}\n                    \
+                             class=(if errors.is_empty() {{ \"autumn-field__input\" }} else {{ \"autumn-field__input autumn-field__input--invalid\" }})\n                    \
+                             aria-invalid=(if errors.is_empty() {{ \"false\" }} else {{ \"true\" }})\n                    \
+                             aria-describedby=(if errors.is_empty() {{ \"\" }} else {{ \"{name}-error\" }});\n                \
+                             @if !errors.is_empty() {{\n                    \
+                             div id=\"{name}-error\" role=\"alert\" class=\"autumn-field__errors\" {{\n                        \
+                             @for error in errors {{ p class=\"autumn-field__error\" {{ (error) }} }}\n                    \
+                             }}\n                \
+                             }}\n            \
+                             }}\n        \
+                             }})"
+                        );
+                    }
+                }
+            }
         }
     }
     format!(
@@ -2605,7 +2807,11 @@ fn render_form_for_helper(
 /// makes a human-friendly label is a display decision the generator can't
 /// know, so the generated doc comment tells the author where to swap in a
 /// real label column.
-fn render_reference_option_loaders(reference_fields: &[&Field], db_ty: &str) -> String {
+fn render_reference_option_loaders(
+    reference_fields: &[&Field],
+    db_ty: &str,
+    reference_displays: &BTreeMap<String, ReferenceDisplay>,
+) -> String {
     use std::fmt::Write as _;
     let mut out = String::new();
     for f in reference_fields {
@@ -2613,25 +2819,160 @@ fn render_reference_option_loaders(reference_fields: &[&Field], db_ty: &str) -> 
         let Some(table) = f.reference_table() else {
             continue;
         };
-        let _ = write!(
-            out,
-            "/// Load the `(value, label)` select options for the `{name}` reference —\n\
-             /// one option per `{table}` row, ordered by id (issue #1135).\n\
-             ///\n\
-             /// Labels are the row id rendered as a string: which `{table}` column makes\n\
-             /// a human-friendly label is a display decision the generator can't know —\n\
-             /// swap the `map` below to use a real label column.\n\
-             async fn {name}_select_options(db: &mut {db_ty}) -> AutumnResult<Vec<(String, String)>> {{\n    \
-             let ids: Vec<i64> = {table}::table\n        \
-             .select({table}::id)\n        \
-             .order({table}::id.asc())\n        \
-             .load(&mut **db)\n        \
-             .await?;\n    \
-             Ok(ids.into_iter().map(|id| (id.to_string(), id.to_string())).collect())\n\
-             }}\n\n"
-        );
+        match reference_displays.get(name) {
+            // A display column was resolved (issue #1146): load `(id, label)`
+            // pairs so the `<select>` shows a human-friendly value, not the
+            // raw id. A nullable display column coalesces to the id string.
+            Some(display) => {
+                let column = &display.column;
+                let (load_ty, label_expr) = if display.column_nullable {
+                    ("Option<String>", "label.unwrap_or_else(|| id.to_string())")
+                } else {
+                    ("String", "label")
+                };
+                let _ = write!(
+                    out,
+                    "/// Load the `(value, label)` select options for the `{name}` reference —\n\
+                     /// one option per `{table}` row (value = id, label = `{column}`), ordered\n\
+                     /// by id (issues #1135, #1146).\n\
+                     async fn {name}_select_options(db: &mut {db_ty}) -> AutumnResult<Vec<(String, String)>> {{\n    \
+                     let rows: Vec<(i64, {load_ty})> = {table}::table\n        \
+                     .select(({table}::id, {table}::{column}))\n        \
+                     .order({table}::id.asc())\n        \
+                     .load(&mut **db)\n        \
+                     .await?;\n    \
+                     Ok(rows.into_iter().map(|(id, label)| (id.to_string(), {label_expr})).collect())\n\
+                     }}\n\n"
+                );
+            }
+            // No string column to display (or the target model couldn't be
+            // parsed): fall back to the id as both value and label.
+            None => {
+                let _ = write!(
+                    out,
+                    "/// Load the `(value, label)` select options for the `{name}` reference —\n\
+                     /// one option per `{table}` row, ordered by id (issue #1135).\n\
+                     ///\n\
+                     /// `{table}` has no string column to label options with, so the id is\n\
+                     /// used as both value and label — swap the `map` below to use a real\n\
+                     /// label column once one exists.\n\
+                     async fn {name}_select_options(db: &mut {db_ty}) -> AutumnResult<Vec<(String, String)>> {{\n    \
+                     let ids: Vec<i64> = {table}::table\n        \
+                     .select({table}::id)\n        \
+                     .order({table}::id.asc())\n        \
+                     .load(&mut **db)\n        \
+                     .await?;\n    \
+                     Ok(ids.into_iter().map(|id| (id.to_string(), id.to_string())).collect())\n\
+                     }}\n\n"
+                );
+            }
+        }
     }
     out
+}
+
+/// How a `references` field's parent row should be *displayed* (issue #1146):
+/// the referenced `table`, the `column` whose value labels the parent, and
+/// whether that column is nullable (`Option<String>`).
+///
+/// Resolved from the referenced model at scaffold time via
+/// [`resolve_reference_display`] — an explicit `{label:col}` override, else a
+/// `name`/`title`/first-string-column heuristic. `None` (no entry) means the
+/// target has no string column, so the raw id is rendered as a fallback.
+#[derive(Debug, Clone)]
+struct ReferenceDisplay {
+    column: String,
+    column_nullable: bool,
+}
+
+/// The `(name, nullable)` string (`String`/`Text`) columns of a `references`
+/// field's target (issue #1146). For a **self-reference** (the target table is
+/// the model being generated right now) there is no `src/models/<x>.rs` on disk
+/// yet, so the columns come from the in-flight `own_fields`; every other target
+/// is read from disk via [`super::model::model_string_columns`].
+fn target_string_columns(
+    project_root: &Path,
+    field: &Field,
+    self_plural: &str,
+    own_fields: &[Field],
+) -> Vec<(String, bool)> {
+    if field.reference_table().as_deref() == Some(self_plural) {
+        own_fields
+            .iter()
+            .filter(|f| matches!(f.kind, FieldKind::String | FieldKind::Text))
+            .map(|f| (f.name.clone(), f.nullable))
+            .collect()
+    } else {
+        let base = field.name.strip_suffix("_id").unwrap_or(&field.name);
+        super::model::model_string_columns(project_root, base)
+    }
+}
+
+/// Resolve the display column for a `references` field against its target
+/// model (issue #1146): an explicit `{label:col}` override wins; otherwise a
+/// `name`/`title` column is preferred, else the first `String`/`Text` column.
+/// Returns `None` when the target model has no string column (render the id).
+///
+/// A **self-reference** (the target table is the model being generated right
+/// now — e.g. `Category category:references`) has no `src/models/<x>.rs` on
+/// disk yet, so its display column is resolved from the in-flight `own_fields`
+/// (the columns being generated this invocation) rather than the filesystem.
+/// References to OTHER models still resolve via the on-disk lookup.
+fn resolve_reference_display(
+    project_root: &Path,
+    field: &Field,
+    self_plural: &str,
+    own_fields: &[Field],
+) -> Option<ReferenceDisplay> {
+    let base = field.name.strip_suffix("_id").unwrap_or(&field.name);
+    let is_self_ref = field.reference_table().as_deref() == Some(self_plural);
+    let columns = target_string_columns(project_root, field, self_plural, own_fields);
+    // The `name`/`title`/first-string-column heuristic, reused both when no
+    // explicit label is given and when an explicit one has to be discarded.
+    let heuristic = || {
+        columns
+            .iter()
+            .find(|(c, _)| c == "name")
+            .or_else(|| columns.iter().find(|(c, _)| c == "title"))
+            .or_else(|| columns.first())
+            .map(|(c, n)| (c.clone(), *n))
+    };
+    let (column, column_nullable) = if let Some(label) = &field.constraints.label {
+        if let Some((c, n)) = columns.iter().find(|(c, _)| c == label) {
+            // Explicit override names a real string column on the target — use
+            // it, with its known nullability.
+            (c.clone(), *n)
+        } else if !is_self_ref
+            && field
+                .reference_table()
+                .is_some_and(|table| !super::model::model_file_exists(project_root, &table, base))
+        {
+            // The target model genuinely isn't discoverable (not yet generated,
+            // unparseable, or a single-file `models.rs` layout we can't read),
+            // so the override can't be validated. Honor it as before (assume a
+            // non-null `String`), matching the "assume the table exists" posture
+            // the missing-target path takes. Not reachable on the normal select
+            // path (missing targets are excluded upstream), but keeps the
+            // resolver correct for any other caller. A self-reference IS
+            // discoverable (via `own_fields`), so it never takes this branch.
+            (label.clone(), false)
+        } else {
+            // The model IS discoverable but `{label}` names no string column —
+            // a typo, a non-string column, or a model with NO string columns at
+            // all (e.g. `Post { id, count: i32 }` + `{label:count}`). Emitting
+            // `select {table}::{label}` (loaded as `String`) would fail to
+            // compile the generated app, so fall back to the heuristic display
+            // column: generation still succeeds, and the plan carries a warning
+            // (emitted in `execute`) telling the author the label was ignored.
+            heuristic()?
+        }
+    } else {
+        heuristic()?
+    };
+    Some(ReferenceDisplay {
+        column,
+        column_nullable,
+    })
 }
 
 /// Render the form inputs for a scaffold's `--live-validation` new/edit/
@@ -2748,6 +3089,15 @@ fn render_changeset_form_inputs(
                     // that happens to permit an empty string (e.g. a max-only
                     // `length` rule) doesn't leave a blank required field with
                     // no client-side guard at all.
+                    //
+                    // Known limitation (#1750): the #1388 client-side HTML5
+                    // constraint attributes (`minlength`/`maxlength`,
+                    // `type="email"`/`url`) are only emitted on the standard
+                    // `form_for` path (`html5_constraint_spec`), not through
+                    // these cross-crate `autumn_web::form` htmx helpers, which
+                    // take no constraint params. Server-side `#[validate]` still
+                    // applies in `--live-validation`; only the static HTML5
+                    // hints are absent here.
                     if live_validation && validated.contains(&name.as_str()) {
                         let helper = if f.nullable {
                             "text_input_htmx"
@@ -2801,6 +3151,78 @@ fn decimal_step(scale: u32) -> String {
     decimal_literal_at_scale(scale, 1)
 }
 
+/// The HTML5 `<input>` type and constraint-attribute string a field's DSL
+/// constraint modifiers (issue #1388) render to, or `None` when the field has
+/// no HTML5 fan-out (so the derived `FieldControl` already renders it right).
+///
+/// `String`/`Text`: `min`/`max` -> `minlength`/`maxlength`, `email` ->
+/// `type="email"`, `url` -> `type="url"`. Numeric: `min`/`max` -> `min`/`max`
+/// on a `type="number"` input, and float (`f32`/`f64`) fields also carry
+/// `step="any"` so fractional input isn't rejected client-side. Returned
+/// attribute string is space-prefixed and ready to splice straight into the
+/// generated maud `input`.
+fn html5_constraint_spec(field: &Field) -> Option<(&'static str, String)> {
+    use std::fmt::Write as _;
+    let c = &field.constraints;
+    let mut attrs = String::new();
+    let input_type = match field.kind {
+        FieldKind::String | FieldKind::Text => {
+            if let Some(min) = &c.min {
+                let _ = write!(attrs, " minlength=\"{min}\"");
+            }
+            if let Some(max) = &c.max {
+                let _ = write!(attrs, " maxlength=\"{max}\"");
+            }
+            if c.email {
+                "email"
+            } else if c.url {
+                "url"
+            } else {
+                "text"
+            }
+        }
+        FieldKind::I32 | FieldKind::I64 => {
+            if let Some(min) = &c.min {
+                let _ = write!(attrs, " min=\"{min}\"");
+            }
+            if let Some(max) = &c.max {
+                let _ = write!(attrs, " max=\"{max}\"");
+            }
+            "number"
+        }
+        FieldKind::F32 | FieldKind::F64 => {
+            if let Some(min) = &c.min {
+                let _ = write!(attrs, " min=\"{min}\"");
+            }
+            if let Some(max) = &c.max {
+                let _ = write!(attrs, " max=\"{max}\"");
+            }
+            // A constrained float must keep `step="any"` — the same step the
+            // unconstrained float control (`FieldControl::Number { step: "any" }`)
+            // emits. Without it browsers default a `type="number"` input to
+            // `step="1"` and reject fractional input like `0.5` for
+            // `ratio:f64{min=0,max=1}` client-side, even though the server-side
+            // `range` validator and the `f64` type accept it (issue #1388's
+            // "client and server agree"). Only emitted when the field is
+            // actually constrained (min/max present, so `attrs` is non-empty);
+            // otherwise the early-return below keeps the field in the derived
+            // render rather than needlessly excising it.
+            if !attrs.is_empty() {
+                let _ = write!(attrs, " step=\"any\"");
+            }
+            "number"
+        }
+        _ => return None,
+    };
+    // Nothing to add over the derived control: a plain `text`/`number` with no
+    // constraint attributes is exactly what `form_for` already renders, so
+    // don't excise-and-reappend it (which would only reorder the field).
+    if attrs.is_empty() && input_type != "email" && input_type != "url" {
+        return None;
+    }
+    Some((input_type, attrs))
+}
+
 /// Produce the cell-body expression for a `data_table` column closure.
 ///
 /// Every arm must evaluate to a type that implements `maud::Render` (`&str`,
@@ -2843,7 +3265,13 @@ fn cell_value_expr(field: &Field) -> String {
 /// Includes an "Id" column, one column per scaffold field (title-cased header),
 /// and a trailing "Show" actions column. All columns are non-sortable — server-side
 /// ordering per-column is out of scope; dead sort links would be worse than none.
-fn render_columns_vec(pascal_name: &str, plural: &str, fields: &[Field]) -> String {
+fn render_columns_vec(
+    pascal_name: &str,
+    plural: &str,
+    fields: &[Field],
+    reference_displays: &BTreeMap<String, ReferenceDisplay>,
+    use_label_maps: bool,
+) -> String {
     use std::fmt::Write as _;
     let mut out = String::with_capacity(fields.len() * 150 + 300);
     let _ = writeln!(
@@ -2858,7 +3286,27 @@ fn render_columns_vec(pascal_name: &str, plural: &str, fields: &[Field]) -> Stri
     // One column per field
     for f in fields {
         let header = title_case(&f.name);
-        let cell_expr = cell_value_expr(f);
+        // A displayable `references` column renders the parent's label from
+        // the per-view `{name}_labels` map the handler loaded (issue #1146),
+        // instead of the raw foreign-key id. The closure borrows the map,
+        // which outlives the `columns` vec in the generated handler.
+        let cell_expr = if use_label_maps
+            && f.kind.is_reference()
+            && reference_displays.contains_key(&f.name)
+        {
+            let name = &f.name;
+            if f.nullable {
+                format!(
+                    "match &row.{name} {{ Some(v) => {name}_labels.get(&v.to_string()).map(String::as_str).unwrap_or(\"—\"), None => \"—\" }}"
+                )
+            } else {
+                format!(
+                    "{name}_labels.get(&row.{name}.to_string()).map(String::as_str).unwrap_or(\"—\")"
+                )
+            }
+        } else {
+            cell_value_expr(f)
+        };
         let _ = writeln!(
             out,
             "        autumn_web::widgets::Column::new(\"{header}\", |row: &{pascal_name}| maud::html! {{ ({cell_expr}) }}),"
@@ -2876,13 +3324,23 @@ fn render_columns_vec(pascal_name: &str, plural: &str, fields: &[Field]) -> Stri
 /// Emit the `vec![…]` body for the `props` binding in the `show` handler.
 ///
 /// Produces one `("Label", maud::html! { value_expr })` tuple per row:
-/// `id`, every DSL-declared field (humanized label), then `created_at`.
-fn render_show_property_rows(fields: &[Field]) -> String {
+/// `id`, every DSL-declared field (humanized label), then `created_at`. A
+/// `references` field with a resolved display (issue #1146) renders the
+/// pre-loaded `{name}_label` variable (the parent's display value) instead of
+/// the raw foreign-key id — see [`render_show_reference_label_loads`].
+fn render_show_property_rows(
+    fields: &[Field],
+    reference_displays: &BTreeMap<String, ReferenceDisplay>,
+) -> String {
     let mut out = String::with_capacity(fields.len() * 100 + 150);
     out.push_str("        (\"Id\", maud::html! { (row.id) }),\n");
     for f in fields {
         let label = humanize(&f.name);
-        let cell_expr = cell_value_expr(f);
+        let cell_expr = if f.kind.is_reference() && reference_displays.contains_key(&f.name) {
+            format!("{}_label", f.name)
+        } else {
+            cell_value_expr(f)
+        };
         out.push_str("        (\"");
         out.push_str(&label);
         out.push_str("\", maud::html! { (");
@@ -2890,6 +3348,81 @@ fn render_show_property_rows(fields: &[Field]) -> String {
         out.push_str(") }),\n");
     }
     out.push_str("        (\"Created at\", maud::html! { (row.created_at.to_string()) }),\n");
+    out
+}
+
+/// Emit the `let {name}_label: String = …;` bindings the `show` handler
+/// evaluates before building its `props`, one per `references` field with a
+/// resolved display column (issue #1146). Each does a single per-view lookup
+/// of the parent's display value (the batched variant is out of scope, #835),
+/// falling back to the id string if the parent row (or its display value) is
+/// missing. Empty when the resource has no displayable references.
+fn render_show_reference_label_loads(
+    fields: &[Field],
+    reference_displays: &BTreeMap<String, ReferenceDisplay>,
+) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    for f in fields {
+        let Some(display) = reference_displays.get(&f.name) else {
+            continue;
+        };
+        let Some(table) = f.reference_table() else {
+            continue;
+        };
+        let name = &f.name;
+        let column = &display.column;
+        // A nullable display column comes back as `Option<String>` and is
+        // flattened; a non-null one as `String`. Both coalesce to the id on a
+        // miss so the show page never renders a bare blank for a real FK.
+        let found_expr = if display.column_nullable {
+            format!(
+                "{table}::table.find(fk).select({table}::{column}).first::<Option<String>>(&mut *db).await.ok().flatten().unwrap_or_else(|| fk.to_string())"
+            )
+        } else {
+            format!(
+                "{table}::table.find(fk).select({table}::{column}).first::<String>(&mut *db).await.unwrap_or_else(|_| fk.to_string())"
+            )
+        };
+        if f.nullable {
+            let _ = writeln!(
+                out,
+                "    let {name}_label: String = match row.{name} {{ Some(fk) => {found_expr}, None => \"—\".to_string() }};"
+            );
+        } else {
+            let _ = writeln!(
+                out,
+                "    let {name}_label: String = {{ let fk = row.{name}; {found_expr} }};"
+            );
+        }
+    }
+    out
+}
+
+/// Emit the `let {name}_labels: HashMap<String, String> = …;` bindings the
+/// plain (non-sharded) `index` handler evaluates before building its data-table
+/// columns, one per `references` field with a resolved display column
+/// (issue #1146). Each reuses the field's `{name}_select_options` loader (a
+/// simple per-view fetch; the batched variant is out of scope, #835) to map
+/// each parent id string to its display label, which the column closures then
+/// look up per row. Empty when the resource has no displayable references.
+fn render_index_reference_label_loads(
+    reference_fields: &[&Field],
+    reference_displays: &BTreeMap<String, ReferenceDisplay>,
+) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    for f in reference_fields {
+        if !reference_displays.contains_key(&f.name) {
+            continue;
+        }
+        let name = &f.name;
+        let _ = writeln!(
+            out,
+            "    let {name}_labels: std::collections::HashMap<String, String> =\n        \
+             {name}_select_options(&mut db).await?.into_iter().collect();"
+        );
+    }
     out
 }
 
@@ -4264,6 +4797,7 @@ fn main_route_entries(
 mod tests {
     use super::*;
     use crate::generate::Flags;
+    use crate::generate::dsl::FieldConstraints;
     use std::fs;
     use tempfile::TempDir;
 
@@ -8101,6 +8635,7 @@ async fn main() {
                 nullable: false,
                 variants: Vec::new(),
                 unique: false,
+                constraints: FieldConstraints::default(),
             },
             Field {
                 name: "author_id".to_string(),
@@ -8108,6 +8643,7 @@ async fn main() {
                 nullable: true,
                 variants: Vec::new(),
                 unique: false,
+                constraints: FieldConstraints::default(),
             },
         ];
         assert_eq!(
@@ -8154,6 +8690,7 @@ async fn main() {
                 nullable: false,
                 variants: Vec::new(),
                 unique: false,
+                constraints: FieldConstraints::default(),
             },
             Field {
                 name: "author_id".to_string(),
@@ -8161,6 +8698,7 @@ async fn main() {
                 nullable: true,
                 variants: Vec::new(),
                 unique: false,
+                constraints: FieldConstraints::default(),
             },
         ];
         let sql = render_reference_stub_tables_sql(&fields, "unrelated_table");
@@ -8262,6 +8800,7 @@ async fn main() {
             nullable: false,
             variants: vec!["a".to_string(), "b".to_string()],
             unique: false,
+            constraints: FieldConstraints::default(),
         };
         let weight = Field {
             name: "weight".to_string(),
@@ -8272,6 +8811,7 @@ async fn main() {
             nullable: false,
             variants: Vec::new(),
             unique: false,
+            constraints: FieldConstraints::default(),
         };
         let fields = vec![status.clone(), weight];
         let sql = enum_rejection_insert_sql("items", &fields, &status, &BTreeMap::new());

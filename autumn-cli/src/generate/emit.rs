@@ -146,6 +146,14 @@ pub enum Revert {
     /// `autumn generate auth` injected into the `AppBuilder` chain in `path`
     /// (`src/main.rs`) (issue #1397).
     RememberMiddleware { path: PathBuf },
+    /// Remove the `#[path]`-qualified `mod schema;` / `mod models;` links
+    /// `generate model`/`scaffold` injected into `path` (`src/bin/seed.rs`)
+    /// via [`super::schema_edit::link_models_into_seed_bin`] (issue #1718) —
+    /// but only once `owner_dir` (`src/models`) has no other model file left
+    /// in it, i.e. the LAST model is being destroyed and `src/models/mod.rs` /
+    /// `src/schema.rs` (the link targets) are themselves removed. Destroying
+    /// one of several models keeps the links, matching the surviving modules.
+    SeedBinLinks { path: PathBuf, owner_dir: PathBuf },
 }
 
 impl Revert {
@@ -167,7 +175,8 @@ impl Revert {
             | Self::PwaMainRsInjection { path }
             | Self::AuthOAuthProviderStubs { path, .. }
             | Self::AuthWebauthnStub { path }
-            | Self::RememberMiddleware { path } => path,
+            | Self::RememberMiddleware { path }
+            | Self::SeedBinLinks { path, .. } => path,
         }
     }
 
@@ -179,9 +188,9 @@ impl Revert {
     /// where the pushing generator has no single owning directory).
     fn owner_dir(&self) -> Option<&Path> {
         match self {
-            Self::CargoDeps { owner_dir, .. } | Self::JobsRegistration { owner_dir, .. } => {
-                Some(owner_dir)
-            }
+            Self::CargoDeps { owner_dir, .. }
+            | Self::JobsRegistration { owner_dir, .. }
+            | Self::SeedBinLinks { owner_dir, .. } => Some(owner_dir),
             Self::CargoAutumnWebFeature { owner_dir, .. }
             | Self::CargoAutumnWebDevFeature { owner_dir, .. } => owner_dir.as_deref(),
             Self::ModDecl { .. }
@@ -308,6 +317,7 @@ impl Revert {
                 super::auth::remove_oauth_provider_stubs(content, providers)
             }
             Self::AuthWebauthnStub { .. } => super::auth::remove_webauthn_stub(content),
+            Self::SeedBinLinks { .. } => super::schema_edit::unlink_models_from_seed_bin(content),
         }
     }
 }

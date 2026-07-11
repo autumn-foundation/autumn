@@ -182,7 +182,7 @@ fn scaffold_references_column_overrides_to_select_and_loads_options() {
 
     // Issue #1135 AC 2: "references→select". The derive maps the `i64` FK
     // column to a number input; the scaffold promotes it to a select whose
-    // options are the referenced table's ids, loaded at render time by the
+    // options are the referenced table's rows, loaded at render time by the
     // controller and threaded through the shared helper.
     assert!(
         routes.contains(
@@ -200,9 +200,12 @@ fn scaffold_references_column_overrides_to_select_and_loads_options() {
         ),
         "the controller must have an options loader: {routes}"
     );
+    // Issue #1146: `Post` has a `title:String` column, so the loader selects
+    // the id + the display column (a `name`/`title` heuristic), labeling each
+    // option by the parent's title rather than its raw id.
     assert!(
-        routes.contains(".select(posts::id)"),
-        "the loader must query the referenced table's ids: {routes}"
+        routes.contains(".select((posts::id, posts::title))"),
+        "the loader must query the referenced table's id + display column: {routes}"
     );
     // Every form-rendering site loads the options: the new_form and edit_form
     // GET handlers plus the create/update 422 re-render branches.
