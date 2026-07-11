@@ -83,9 +83,22 @@ fn update_model_compiles_and_validates_expected_fields() {
         "an empty `name` (Option length column) must fail validation on update"
     );
 
-    // Documented tradeoff: `ip` is dropped from the Option `ip` patch field, so
-    // an invalid value there is NOT caught on the update path (it is still
-    // enforced on create, where the derive unwraps the Option).
+    // Documented tradeoff (#1751): `ip` is dropped from the Option `ip` patch
+    // field, so an invalid value there is NOT caught on the update path (it is
+    // still enforced on create, where the derive unwraps the Option).
+    //
+    // This is a genuine trait-coherence wall under `validator` 0.20, not an
+    // oversight. Enforcing `ip` on `Patch<Option<S>>` would require an
+    // `impl ValidateIp for Patch<Option<S>>`, but that overlaps the existing
+    // generic `impl<T: ValidateIp> ValidateIp for Patch<T>` (hooks.rs) and is
+    // rejected with E0119 ("conflicting implementations of trait `ValidateIp`
+    // for type `Patch<Option<_>>`"). The only escapes — removing the generic
+    // blanket in favour of concrete per-type impls (a public regression: it
+    // would drop `Patch<IpAddr>`/`Patch<&str>`/… support), or unstable
+    // specialization — are worse than the gap. A clean fix needs the
+    // merged-model validation redesign (validate the effective concrete value
+    // after the patch is applied), deferred to a follow-up. This assertion
+    // therefore LOCKS the current create-only behaviour on purpose.
     let unenforced_ip = UpdatePatchIpHost {
         ip: Patch::Set(Some("not-an-ip".to_string())),
         ip2: Patch::Unchanged,
@@ -93,6 +106,7 @@ fn update_model_compiles_and_validates_expected_fields() {
     };
     assert!(
         unenforced_ip.validate().is_ok(),
-        "`ip` is intentionally not enforced on the Option<String> update field"
+        "`ip` is intentionally not enforced on the Option<String> update field \
+         (E0119 coherence wall; see #1751)"
     );
 }

@@ -5583,6 +5583,94 @@ mod tests {
     }
 
     #[test]
+    fn update_model_drops_every_non_patch_validator_but_new_model_keeps_them() {
+        // #1751 (residual long tail of #1742/#1719): lock in that the FULL
+        // `NON_PATCH_VALIDATORS` denylist — not just `custom` — is stripped from
+        // the generated `UpdateModel` `Patch<T>` fields while `NewModel` keeps
+        // every one. These four are enforced on create only and are genuinely
+        // unfixable on the PATCH path without the merged-model redesign:
+        //   * `must_match` / `nested` — cross-field / struct-level; no single-
+        //     field `Patch<T>` trait exists for them.
+        //   * `credit_card` (`ValidateCreditCard`) / `non_control_character`
+        //     (`ValidateNonControlCharacter`) — not exported under this
+        //     workspace's `validator` feature set, so no `Patch<T>` impl can be
+        //     written without enabling new features (out of scope for a latent
+        //     case).
+        // This is pure token-level filtering (`model_macro` does not compile the
+        // output), so the combination need not be semantically valid — only that
+        // each validator ident is dropped from the patch struct.
+        let output = model_macro(
+            TokenStream::new(),
+            quote! {
+                pub struct Signup {
+                    #[id]
+                    pub id: i64,
+                    #[validate(
+                        length(min = 1),
+                        must_match(other = "confirm"),
+                        nested,
+                        credit_card,
+                        non_control_character
+                    )]
+                    pub password: String,
+                    pub confirm: String,
+                }
+            },
+        );
+        let generated = output.to_string();
+
+        // Slice the `NewSignup` struct body (up to its closing brace).
+        let new_start = generated
+            .find("struct NewSignup")
+            .expect("NewSignup struct must be generated");
+        let new_end = new_start
+            + generated[new_start..]
+                .find('}')
+                .expect("NewSignup struct must close");
+        let new_section = &generated[new_start..new_end];
+        for kept in [
+            "length",
+            "must_match",
+            "nested",
+            "credit_card",
+            "non_control_character",
+        ] {
+            assert!(
+                new_section.contains(kept),
+                "NewSignup must keep the `{kept}` validator (enforced on create): {new_section}"
+            );
+        }
+
+        // Slice the `UpdateSignup` struct body (up to its closing brace).
+        let upd_start = generated
+            .find("struct UpdateSignup")
+            .expect("UpdateSignup struct must be generated");
+        let upd_end = upd_start
+            + generated[upd_start..]
+                .find('}')
+                .expect("UpdateSignup struct must close");
+        let upd_section = &generated[upd_start..upd_end];
+        // The lone declarative validator is retained on the patch field.
+        assert!(
+            upd_section.contains("length"),
+            "UpdateSignup must keep the declarative `length` validator: {upd_section}"
+        );
+        // Every non-declarative validator is stripped from the patch field.
+        for dropped in [
+            "must_match",
+            "nested",
+            "credit_card",
+            "non_control_character",
+        ] {
+            assert!(
+                !upd_section.contains(dropped),
+                "UpdateSignup must NOT carry the non-Patch `{dropped}` validator \
+                 (would break UpdateModel compilation / has no Patch<T> impl): {upd_section}"
+            );
+        }
+    }
+
+    #[test]
     fn update_model_drops_does_not_contain_but_new_model_keeps_it() {
         // #1719 follow-up: `does_not_contain` reaches `Patch<T>` through
         // validator's blanket `impl<T: ValidateContains> ValidateDoesNotContain`,
@@ -5592,6 +5680,12 @@ mod tests {
         // field would then spuriously fail with 422. So `does_not_contain` must
         // be dropped from the `UpdateModel` `Patch<T>` fields (enforced on create
         // via `NewModel` only), while `contains`/`length` must be RETAINED.
+        //
+        // #1751: a hand-written `ValidateDoesNotContain for Patch<T>` (which would
+        // let us keep it with correct skip semantics) is impossible — it collides
+        // with validator's blanket `impl<T: ValidateContains> ValidateDoesNotContain
+        // for T` (E0119: `Patch<T>` already impls `ValidateContains`). So the
+        // create-only filtering below is a genuine coherence wall, not a stopgap.
         let output = model_macro(
             TokenStream::new(),
             quote! {
