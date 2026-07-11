@@ -1825,7 +1825,10 @@ fn auto_upload_probe(profile: &str) -> bool {
     // The profile-aware dotenv overlay covers BOTH the real env and `.env.<p>`
     // (a real env var wins inside the overlay), matching P2 #6.
     let env = dotenv_env_for_profile(profile);
-    let table = migrate::read_autumn_toml_table_with_profile(Some(profile));
+    // Read `autumn.toml` from the config/manifest dir (AUTUMN_MANIFEST_DIR),
+    // matching where the full loader + the dotenv overlay look — so an installed/
+    // daemon launch with a different CWD still sees `auto_upload` (P2 #15).
+    let table = migrate::read_autumn_toml_table_with_profile_from_config_dir(Some(profile));
     auto_upload_from_sources(|k| env.var(k).ok(), table.as_ref())
 }
 
@@ -1876,7 +1879,12 @@ fn load_offsite(profile: &str) -> Result<Option<LoadedOffsite>, BackupError> {
     // Real env + `.env.<profile>` overlay (profile-aware, P2 #6); merged TOML
     // (base + `[profile.<p>]`) — neither decrypts credentials nor validates.
     let env = dotenv_env_for_profile(profile);
-    let table = migrate::read_autumn_toml_table_with_profile(Some(profile));
+    // Read `autumn.toml` from the config/manifest dir (AUTUMN_MANIFEST_DIR),
+    // matching the full loader + dotenv overlay — so an installed/daemon launch
+    // whose CWD differs from the config dir still finds the offsite destination
+    // (and enforces the distinct-bucket guard) instead of reporting it
+    // unconfigured (P2 #15).
+    let table = migrate::read_autumn_toml_table_with_profile_from_config_dir(Some(profile));
     resolve_loaded_offsite(table.as_ref(), &env, profile)
 }
 
@@ -3499,6 +3507,40 @@ mod tests {
         let env_junk =
             |k: &str| (k == "AUTUMN_BACKUP__OFFSITE__AUTO_UPLOAD").then(|| "yesplease".to_owned());
         assert!(auto_upload_from_sources(env_junk, Some(&toml_true)));
+    }
+
+    #[test]
+    fn offsite_resolves_from_config_dir_table_not_cwd() {
+        // P2 #15: an installed/daemon launch keeps autumn.toml in the config dir
+        // (a different CWD). Reading from that dir — as the offsite loaders now do
+        // via read_autumn_toml_table_with_profile_from_config_dir — must surface
+        // both auto_upload and the offsite destination. Proven hermetically by
+        // reading a temp config dir directly (this test's CWD has no such file).
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("autumn.toml"),
+            "[backup.offsite]\n\
+             auto_upload = true\n\
+             prefix = \"db\"\n\
+             [backup.offsite.s3]\n\
+             bucket = \"offsite-bucket\"\n\
+             region = \"us-east-1\"\n\
+             endpoint = \"https://minio.example:9000\"\n\
+             force_path_style = true\n\
+             access_key_id_env = \"OFFSITE_KEY\"\n\
+             secret_access_key_env = \"OFFSITE_SECRET\"\n",
+        )
+        .unwrap();
+        let table = migrate::read_autumn_toml_table_with_profile_in(tmp.path(), Some("dev"));
+        // auto_upload is read from the config-dir table (env has nothing).
+        assert!(auto_upload_from_sources(|_| None, table.as_ref()));
+        // And the offsite destination resolves from that same table (no CWD file).
+        let env = autumn_web::config::MockEnv::new();
+        let loaded = resolve_loaded_offsite(table.as_ref(), &env, "dev").unwrap();
+        assert!(
+            loaded.is_some(),
+            "offsite must resolve from the config-dir autumn.toml"
+        );
     }
 
     #[test]
