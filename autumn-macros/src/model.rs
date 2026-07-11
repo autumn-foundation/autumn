@@ -279,11 +279,18 @@ fn resolve_associations(
 }
 
 /// The singular form used to derive a many-to-many association's mutation
-/// helper names (`add_{singular}`, `remove_{singular}`), mirroring the
-/// codebase's naive `{target}s` pluralization in reverse: strip a trailing
-/// `s` if present.
-fn m2m_mutation_singular(assoc_name: &str) -> &str {
-    assoc_name.strip_suffix('s').unwrap_or(assoc_name)
+/// helper names (`add_{singular}`, `remove_{singular}`).
+///
+/// Derived from the association's *target type* name (its `pascal_to_snake`),
+/// **not** by de-pluralizing the accessor name. A type's singular comes from
+/// the type — `Category` → `category`, `Person` → `person` — independent of
+/// how its plural accessor is spelled. This keeps the smart-pluralized
+/// accessor name (`categories`, `people`) while still yielding correct helpers
+/// (`add_category`, `add_person`). De-pluralizing the accessor by stripping a
+/// trailing `s` regressed here once the accessor started using the smart
+/// pluralizer (#1753): `categories` → `categorie`, `people` → `people`.
+fn m2m_mutation_singular(target: &syn::Ident) -> String {
+    pascal_to_snake(&target.to_string())
 }
 
 /// Reject a model whose many-to-many associations would generate colliding
@@ -291,21 +298,22 @@ fn m2m_mutation_singular(assoc_name: &str) -> &str {
 /// associations that both derive `add_tag`), rather than emitting a trait
 /// with duplicate method definitions.
 fn check_m2m_mutation_name_collisions(assocs: &[Association]) -> syn::Result<()> {
-    let mut seen: std::collections::HashMap<&str, &syn::Ident> = std::collections::HashMap::new();
+    let mut seen: std::collections::HashMap<String, &syn::Ident> = std::collections::HashMap::new();
     for assoc in assocs {
         if assoc.through.is_none() {
             continue;
         }
-        let singular = m2m_mutation_singular(&assoc.name);
-        if let Some(_prev) = seen.insert(singular, &assoc.target) {
+        let singular = m2m_mutation_singular(&assoc.target);
+        if seen.insert(singular.clone(), &assoc.target).is_some() {
             return Err(syn::Error::new_spanned(
                 &assoc.target,
                 format!(
-                    "many-to-many association `{}` would generate a mutation \
-                     helper `add_{singular}`/`remove_{singular}` that collides \
-                     with another `through =` association on this model; \
-                     disambiguate with `name = ...`",
-                    assoc.name
+                    "many-to-many association `{}` (target `{}`) would generate \
+                     mutation helpers `add_{singular}`/`remove_{singular}` that \
+                     collide with another `through =` association to the same \
+                     target on this model; a model may declare at most one \
+                     many-to-many association per target type",
+                    assoc.name, assoc.target,
                 ),
             ));
         }
@@ -727,7 +735,7 @@ fn emit_association_items(
                     // traits are both in scope.
                     let mutation_trait_ident =
                         format_ident!("{model_ident}{}Mutations", pascal_case(&assoc.name));
-                    let singular = m2m_mutation_singular(&assoc.name);
+                    let singular = m2m_mutation_singular(target);
                     let add_ident = format_ident!("add_{singular}");
                     let remove_ident = format_ident!("remove_{singular}");
                     let set_ident = format_ident!("set_{}", assoc.name);
@@ -5069,14 +5077,101 @@ mod tests {
 
     #[test]
     fn m2m_colliding_mutation_method_names_rejected() {
-        // `tags` and `name = tag` both derive an `add_tag` helper — reject at
+        // The mutation-helper singular comes from the *target type*, so two
+        // `through =` associations to the same target both derive an `add_tag`
+        // helper — even with a distinct `name = ...` (which only renames the
+        // accessor/trait, not the target-derived `add_`/`remove_`). Reject at
         // macro time rather than emitting a trait with duplicate methods.
         let model: syn::Ident = syn::parse_quote!(Post);
         let attrs: Vec<syn::Attribute> = vec![
             syn::parse_quote!(#[has_many(Tag, through = post_tags)]),
-            syn::parse_quote!(#[has_many(Label, through = post_labels, name = tag)]),
+            syn::parse_quote!(#[has_many(Tag, through = featured_post_tags, name = featured_tags)]),
         ];
         assert!(resolve_associations(&model, &attrs).is_err());
+    }
+
+    #[test]
+    fn m2m_mutation_singular_derives_from_target_type() {
+        // #1753 regression (Codex): the m2m mutation-helper singular must come
+        // from the *target type* (`pascal_to_snake`), not by stripping a
+        // trailing `s` from the smart-pluralized accessor name. Otherwise
+        // irregular plurals produce broken helpers: `categories` → `categorie`
+        // (should be `category`), `people` → `people` (should be `person`).
+        let category: syn::Ident = syn::parse_quote!(Category); // -ies class
+        let person: syn::Ident = syn::parse_quote!(Person); // irregular class
+        let comment: syn::Ident = syn::parse_quote!(Comment); // plain class
+        assert_eq!(m2m_mutation_singular(&category), "category");
+        assert_eq!(m2m_mutation_singular(&person), "person");
+        assert_eq!(m2m_mutation_singular(&comment), "comment");
+    }
+
+    #[test]
+    fn model_macro_m2m_mutation_helper_singular_uses_target_for_irregular_plurals() {
+        // End-to-end #1753 guard: a `through =` association to an
+        // irregular-plural target keeps the smart-pluralized accessor/`set_`
+        // name (`categories`) while the `add_`/`remove_` helpers use the
+        // target type's singular (`category`), never the broken de-pluralized
+        // accessor (`categorie`).
+        let generated = model_macro(
+            quote! {},
+            quote! {
+                #[has_many(Category, through = post_categories)]
+                pub struct Post {
+                    #[id]
+                    pub id: i64,
+                    pub title: String,
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("add_category"),
+            "expected add_category helper, got: {generated}"
+        );
+        assert!(
+            generated.contains("remove_category"),
+            "expected remove_category helper"
+        );
+        assert!(
+            !generated.contains("add_categorie"),
+            "must not emit the broken de-pluralized `add_categorie`"
+        );
+        assert!(
+            generated.contains("set_categories"),
+            "the set_ (replace-all) helper keeps the smart plural accessor name"
+        );
+    }
+
+    #[test]
+    fn model_macro_m2m_mutation_helper_singular_uses_target_for_irregular_person() {
+        // `Person` → accessor `people`; the `add_`/`remove_` helpers must use
+        // the target singular `person`, not the (unchanged-by-strip-`s`)
+        // `people`.
+        let generated = model_macro(
+            quote! {},
+            quote! {
+                #[has_many(Person, through = team_people)]
+                pub struct Team {
+                    #[id]
+                    pub id: i64,
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("add_person"),
+            "expected add_person helper, got: {generated}"
+        );
+        assert!(
+            generated.contains("remove_person"),
+            "expected remove_person helper"
+        );
+        assert!(
+            !generated.contains("add_people"),
+            "must not emit the broken `add_people`"
+        );
     }
 
     // ── Many-to-many codegen shape (#1324) ────────────────────────────────
