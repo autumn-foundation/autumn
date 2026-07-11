@@ -599,15 +599,19 @@ fn alert_disabled_in_production_warning(has_destination: bool) -> CheckResult {
     }
 }
 
-// Five independent config booleans (alerting enabled, webhook is a usable signed
-// destination, mail transport usable, production, transport requires a `from`)
-// plus the resolved `[alerts] email`, `[alerts] webhook_url`, and `[mail] from`
-// strings each gate a distinct branch; grouping them into enums would obscure
-// rather than clarify the destination-resolution logic. The raw `webhook_url` is
-// used only to name a present-but-non-absolute value in its dedicated warning —
-// `webhook_configured` already folds in absoluteness and the signing-secret
-// requirement — and `mail_from` likewise names a present-but-invalid sender in
-// its dedicated warning while its presence+validity gate the email destination.
+// Independent config booleans (alerting enabled, webhook is a usable signed
+// destination, mail transport usable, production, transport requires a `from`,
+// a native transport is configured) plus the resolved `[alerts] email`, `[alerts]
+// webhook_url`, and `[mail] from` strings each gate a distinct branch; grouping
+// them into enums would obscure rather than clarify the destination-resolution
+// logic. The raw `webhook_url` is used only to name a present-but-non-absolute
+// value in its dedicated warning — `webhook_configured` already folds in
+// absoluteness and the signing-secret requirement — and `mail_from` likewise
+// names a present-but-invalid sender in its dedicated warning while its
+// presence+validity gate the email destination. `native_transport_configured`
+// (a PagerDuty routing key or a Slack/Discord webhook URL) counts as a
+// destination the same way the runtime's `AlertConfig::has_destination` does; its
+// delivery-worthiness is validated separately by `check_alert_transports_impl`.
 #[allow(clippy::fn_params_excessive_bools, clippy::too_many_arguments)]
 pub fn check_alert_destination_impl(
     alerts_enabled: bool,
@@ -619,6 +623,7 @@ pub fn check_alert_destination_impl(
     mail_from: &str,
     transport_requires_from: bool,
     custom_channel: bool,
+    native_transport_configured: bool,
 ) -> CheckResult {
     // Presence and syntactic validity of the resolved `[alerts] email`. lettre
     // parses the recipient only at SEND time (`lettre_message`), not when the
@@ -668,7 +673,9 @@ pub fn check_alert_destination_impl(
             // Name the disabled switch explicitly. Mention the (otherwise valid)
             // destination when one is configured so the operator understands the
             // deploy is blind despite it; keep the message accurate otherwise.
-            return alert_disabled_in_production_warning(email_destination || webhook_configured);
+            return alert_disabled_in_production_warning(
+                email_destination || webhook_configured || native_transport_configured,
+            );
         }
         return CheckResult {
             name: "alert_destination",
@@ -685,7 +692,13 @@ pub fn check_alert_destination_impl(
     // and `from` requirements — mirroring the runtime, which skips
     // MailAlertChannel when `mailer.is_disabled()` and whose SMTP send fails
     // without a `from`.
-    if email_destination || webhook_configured {
+    // A native transport (PagerDuty / Slack / Discord) counts as a destination
+    // exactly as the runtime's `AlertConfig::has_destination` does — the runtime
+    // registers the channel for a native-only config, so doctor must not warn
+    // "no destination". The transports' own delivery-worthiness (routing-key
+    // shape, absolute-https URL) is validated separately by
+    // `check_alert_transports_impl`.
+    if email_destination || webhook_configured || native_transport_configured {
         return CheckResult {
             name: "alert_destination",
             status: CheckStatus::Pass,
@@ -3700,6 +3713,25 @@ fn resolve_alert_transports() -> (String, String, String, String) {
     )
 }
 
+/// Whether any native alert transport (`PagerDuty` routing key, Slack or Discord
+/// webhook URL) is configured — the SAME predicate the runtime's
+/// `AlertConfig::has_destination` uses (non-empty after trim).
+///
+/// Counting this as a destination keeps doctor's `alert_destination` gate in
+/// lock-step with the runtime, which registers a native channel (and so
+/// `has_destination()`/`is_active()` return true) for a native-only config;
+/// without it a valid `pagerduty_routing_key`-only production config would fail
+/// `autumn doctor --strict` with a spurious "no operator alert destination".
+fn native_alert_transport_configured(
+    pagerduty_routing_key: &str,
+    slack_webhook_url: &str,
+    discord_webhook_url: &str,
+) -> bool {
+    !pagerduty_routing_key.trim().is_empty()
+        || !slack_webhook_url.trim().is_empty()
+        || !discord_webhook_url.trim().is_empty()
+}
+
 /// Resolve the effective `[alerts] custom_channel` flag the same way the runtime
 /// config merge and `AlertConfig::default().custom_channel` (default `false`)
 /// do.
@@ -4241,6 +4273,16 @@ pub fn run(opts: DoctorOptions) {
     // / effective transport the mail checks above resolved.
     let mail_from = resolve_mail_from(Some(&merged_mail_toml)).unwrap_or_default();
     let transport_requires_from = mail_transport_requires_from(&effective_transport);
+    // A native transport (PagerDuty / Slack / Discord) counts as a configured
+    // destination exactly as the runtime's `AlertConfig::has_destination` does, so
+    // a native-only config does not trip the "no operator alert destination"
+    // warning that would fail `autumn doctor --strict` while the runtime happily
+    // registers the channel.
+    let alert_native_configured = native_alert_transport_configured(
+        &alert_pd_routing_key,
+        &alert_slack_url,
+        &alert_discord_url,
+    );
     tasks.push(Box::new(move || {
         check_alert_destination_impl(
             alerts_enabled,
@@ -4252,6 +4294,7 @@ pub fn run(opts: DoctorOptions) {
             &mail_from,
             transport_requires_from,
             alert_custom_channel,
+            alert_native_configured,
         )
     }));
 
@@ -5877,10 +5920,78 @@ pub struct Vault {
             "noreply@example.com",
             true,
             false,
+            false,
         );
         assert_eq!(r.name, "alert_destination");
         assert!(matches!(r.status, CheckStatus::Warn));
         assert!(r.hint.is_some());
+    }
+
+    #[test]
+    fn alert_destination_passes_in_production_with_native_transport_only() {
+        // A native transport (PagerDuty routing key, or a Slack/Discord webhook)
+        // is a valid destination: the runtime registers the channel and
+        // `has_destination()` returns true, so doctor must NOT warn "no operator
+        // alert destination" — otherwise a native-only prod config fails
+        // `--strict` while it delivers fine at runtime. The only destination here
+        // is the native transport (email/webhook/custom all absent).
+        let r = check_alert_destination_impl(
+            true,  // alerts_enabled
+            "",    // email
+            false, // webhook_configured
+            "",    // webhook_url
+            true,  // mail_transport_usable
+            true,  // is_production
+            "noreply@example.com",
+            true,  // transport_requires_from
+            false, // custom_channel
+            true,  // native_transport_configured
+        );
+        assert!(
+            matches!(r.status, CheckStatus::Pass),
+            "a native-transport-only config must pass the destination gate"
+        );
+        assert!(
+            !r.detail
+                .as_deref()
+                .unwrap_or_default()
+                .contains("no operator alert destination"),
+            "must not warn about a missing destination when a native transport is configured"
+        );
+        // Sanity: with the native flag off and nothing else configured, the same
+        // production config DOES warn — proving the flag is what flips the gate.
+        let off = check_alert_destination_impl(
+            true,
+            "",
+            false,
+            "",
+            true,
+            true,
+            "noreply@example.com",
+            true,
+            false,
+            false,
+        );
+        assert!(matches!(off.status, CheckStatus::Warn));
+    }
+
+    #[test]
+    fn native_alert_transport_configured_matches_runtime_predicate() {
+        // Mirrors AlertConfig::has_destination for native transports: any of the
+        // three configs present (non-empty after trim) counts.
+        assert!(!native_alert_transport_configured("", "", ""));
+        assert!(!native_alert_transport_configured("  ", "\t", " "));
+        assert!(native_alert_transport_configured("R0UT1NGKEY", "", ""));
+        assert!(native_alert_transport_configured(
+            "",
+            "https://hooks.slack.com/services/x",
+            ""
+        ));
+        assert!(native_alert_transport_configured(
+            "",
+            "",
+            "https://discord.com/api/webhooks/x/slack"
+        ));
     }
 
     #[test]
@@ -5894,6 +6005,7 @@ pub struct Vault {
             true,
             "noreply@example.com",
             true,
+            false,
             false,
         );
         assert!(matches!(r.status, CheckStatus::Pass));
@@ -5911,6 +6023,7 @@ pub struct Vault {
             "noreply@example.com",
             true,
             false,
+            false,
         );
         assert!(matches!(r.status, CheckStatus::Pass));
     }
@@ -5926,6 +6039,7 @@ pub struct Vault {
             false,
             "noreply@example.com",
             true,
+            false,
             false,
         );
         assert!(matches!(r.status, CheckStatus::Pass));
@@ -5961,6 +6075,7 @@ pub struct Vault {
             "noreply@example.com",
             true,
             false,
+            false,
         );
         assert!(
             matches!(r.status, CheckStatus::Warn),
@@ -5994,6 +6109,7 @@ pub struct Vault {
             true,
             "noreply@example.com",
             requires_from,
+            false,
             false,
         );
         assert!(
@@ -6040,6 +6156,7 @@ pub struct Vault {
             mail_from,
             requires_from,
             false,
+            false,
         );
         assert!(
             matches!(r.status, CheckStatus::Pass),
@@ -6065,6 +6182,7 @@ pub struct Vault {
             true,
             mail_from,
             requires_from,
+            false,
             false,
         );
         assert!(
@@ -6102,6 +6220,7 @@ pub struct Vault {
             mail_from,
             requires_from,
             false,
+            false,
         );
         assert!(
             matches!(r.status, CheckStatus::Pass),
@@ -6132,6 +6251,7 @@ pub struct Vault {
             true,
             "not-a-mailbox",
             requires_from,
+            false,
             false,
         );
         assert!(
@@ -6164,6 +6284,7 @@ pub struct Vault {
             "Ops <ops@example.com>",
             requires_from,
             false,
+            false,
         );
         assert!(
             matches!(r.status, CheckStatus::Pass),
@@ -6186,6 +6307,7 @@ pub struct Vault {
             false, // dev
             "not-a-mailbox",
             requires_from,
+            false,
             false,
         );
         assert!(
@@ -6212,6 +6334,7 @@ pub struct Vault {
             true,
             "not-a-mailbox",
             requires_from,
+            false,
             false,
         );
         assert!(
@@ -6242,6 +6365,7 @@ pub struct Vault {
             "noreply@example.com", // [mail] from present
             true,                  // smtp requires from
             false,                 // custom_channel
+            false,
         );
         assert!(
             matches!(r.status, CheckStatus::Warn),
@@ -6275,6 +6399,7 @@ pub struct Vault {
             "noreply@example.com",
             true,
             false,
+            false,
         );
         assert!(
             matches!(r.status, CheckStatus::Pass),
@@ -6295,6 +6420,7 @@ pub struct Vault {
             true,
             "noreply@example.com",
             true,
+            false,
             false,
         );
         assert!(
@@ -6321,6 +6447,7 @@ pub struct Vault {
             "noreply@example.com", // [mail] from present
             true,                  // smtp requires from
             false,                 // custom_channel
+            false,
         );
         assert!(
             matches!(r.status, CheckStatus::Warn),
@@ -6353,6 +6480,7 @@ pub struct Vault {
             true,
             "noreply@example.com",
             true,
+            false,
             false,
         );
         assert!(matches!(r.status, CheckStatus::Warn));
@@ -6387,6 +6515,7 @@ pub struct Vault {
             true,
             "noreply@example.com",
             true,
+            false,
             false,
         );
         assert!(
@@ -6434,6 +6563,7 @@ pub struct Vault {
             true,
             "noreply@example.com",
             true,
+            false,
             false,
         );
         assert!(matches!(r.status, CheckStatus::Warn));
@@ -6512,6 +6642,7 @@ pub struct Vault {
             "noreply@example.com",
             true,
             false,
+            false,
         );
         assert!(matches!(r.status, CheckStatus::Pass));
     }
@@ -6537,6 +6668,7 @@ pub struct Vault {
             true,
             "noreply@example.com",
             true,
+            false,
             false,
         );
         assert!(
@@ -6569,6 +6701,7 @@ pub struct Vault {
             true,
             "noreply@example.com",
             true,
+            false,
             false,
         );
         assert!(matches!(r.status, CheckStatus::Warn));
@@ -6604,6 +6737,7 @@ pub struct Vault {
             "noreply@example.com",
             true,
             false,
+            false,
         );
         assert!(matches!(r.status, CheckStatus::Pass));
     }
@@ -6631,6 +6765,7 @@ pub struct Vault {
             true,
             "noreply@example.com",
             true,
+            false,
             false,
         );
         assert!(matches!(r.status, CheckStatus::Pass));
@@ -6663,6 +6798,7 @@ pub struct Vault {
             "noreply@example.com",
             true,
             false,
+            false,
         );
         assert!(
             matches!(r.status, CheckStatus::Warn),
@@ -6688,6 +6824,7 @@ pub struct Vault {
             false, // dev
             "noreply@example.com",
             true,
+            false,
             false,
         );
         assert!(matches!(r.status, CheckStatus::Pass));
@@ -6744,6 +6881,7 @@ pub struct Vault {
             "noreply@example.com",
             true,
             false,
+            false,
         );
         assert!(
             matches!(r.status, CheckStatus::Warn),
@@ -6793,6 +6931,7 @@ pub struct Vault {
             "noreply@example.com",
             true,
             false,
+            false,
         );
         assert!(matches!(r.status, CheckStatus::Pass));
     }
@@ -6825,6 +6964,7 @@ pub struct Vault {
             true,
             "noreply@example.com",
             true,
+            false,
             false,
         );
         assert!(matches!(r.status, CheckStatus::Warn));
@@ -6920,6 +7060,7 @@ pub struct Vault {
             "noreply@example.com",
             true,
             false,
+            false,
         );
         assert!(
             matches!(r.status, CheckStatus::Warn),
@@ -6951,6 +7092,7 @@ pub struct Vault {
             "noreply@example.com",
             true,
             false,
+            false,
         );
         assert!(matches!(r.status, CheckStatus::Warn));
     }
@@ -6974,6 +7116,7 @@ pub struct Vault {
             "noreply@example.com",
             true,
             false,
+            false,
         );
         assert!(matches!(r.status, CheckStatus::Pass));
     }
@@ -6995,6 +7138,7 @@ pub struct Vault {
             false,
             "noreply@example.com",
             true,
+            false,
             false,
         );
         assert!(
@@ -7024,6 +7168,7 @@ pub struct Vault {
             "noreply@example.com",
             true,
             /* custom_channel */ true,
+            false,
         );
         assert!(
             matches!(r.status, CheckStatus::Pass),
@@ -7051,6 +7196,7 @@ pub struct Vault {
             "noreply@example.com",
             true,
             /* custom_channel */ false,
+            false,
         );
         assert!(matches!(r.status, CheckStatus::Warn));
         assert!(
@@ -7076,6 +7222,7 @@ pub struct Vault {
             "noreply@example.com",
             true,
             /* custom_channel */ true,
+            false,
         );
         assert!(
             matches!(r.status, CheckStatus::Warn),
@@ -7150,6 +7297,7 @@ pub struct Vault {
             "noreply@example.com",
             true,
             custom,
+            false,
         );
         assert!(matches!(r.status, CheckStatus::Pass));
     }

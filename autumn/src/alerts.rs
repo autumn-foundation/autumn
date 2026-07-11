@@ -226,6 +226,23 @@ impl AlertRouting {
     }
 }
 
+impl std::str::FromStr for AlertRouting {
+    type Err = ();
+
+    /// Parse the same `all` / `critical` spellings the `[alerts]` TOML/serde path
+    /// accepts (see the `#[serde(rename_all = "snake_case")]` above), so the
+    /// `AUTUMN_ALERTS__*_SEVERITIES` env overrides and the config file agree on
+    /// the accepted values. Any other value is rejected (the env-override layer
+    /// then logs and ignores it, leaving the existing value).
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "all" => Ok(Self::All),
+            "critical" => Ok(Self::Critical),
+            _ => Err(()),
+        }
+    }
+}
+
 /// Whether this alert opens (trigger) or closes (resolve) a condition. This is
 /// the field an incident manager keys on to auto-resolve a correlated alert.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -2833,6 +2850,21 @@ mod tests {
         assert_eq!(all.r, AlertRouting::All);
         let crit: Holder = toml::from_str(r#"r = "critical""#).expect("parse critical");
         assert_eq!(crit.r, AlertRouting::Critical);
+    }
+
+    #[test]
+    fn routing_from_str_matches_toml_spellings() {
+        // The env-override path parses via FromStr; it must accept exactly the
+        // same `all` / `critical` spellings the TOML/serde path does, and reject
+        // anything else (the env layer then logs+ignores, keeping the default).
+        assert_eq!("all".parse::<AlertRouting>(), Ok(AlertRouting::All));
+        assert_eq!(
+            "critical".parse::<AlertRouting>(),
+            Ok(AlertRouting::Critical)
+        );
+        assert!("warning".parse::<AlertRouting>().is_err());
+        assert!("All".parse::<AlertRouting>().is_err());
+        assert!("".parse::<AlertRouting>().is_err());
     }
 
     // ── Native transport payloads (#1630) ────────────────────────────────────
