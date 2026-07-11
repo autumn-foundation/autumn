@@ -11,8 +11,8 @@ const MIGRATIONS: EmbeddedMigrations = embed_migrations!();
 static EMBEDDED_STATIC: autumn_web::include_dir::Dir = autumn_web::embed_static!();
 
 // `flash` carries one-shot notices set with `flash.success(...)` before a
-// redirect. Pass `flash.render().await` from your handlers; it renders any
-// pending messages (and clears them) and is harmless when empty.
+// redirect. Pass `flash_messages(&flash.consume().await)` from your handlers;
+// it renders any pending messages (and clears them) and is harmless when empty.
 //
 // `current_path` (from the `CurrentPath` extractor) lets nav_bar mark the
 // link matching the current page with `aria-current="page"`.
@@ -53,7 +53,7 @@ pub fn layout(title: &str, current_path: &str, flash: maud::Markup, content: mau
 
 #[get("/")]
 async fn index(flash: Flash, path: CurrentPath) -> maud::Markup {
-    layout("Welcome", path.as_str(), flash.render().await, maud::html! {
+    layout("Welcome", path.as_str(), flash_messages(&flash.consume().await), maud::html! {
         h1 { "Welcome to {{project_name}}!" }
         p { "Edit " code { "src/main.rs" } " to get started." }
     })
