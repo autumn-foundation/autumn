@@ -26,7 +26,20 @@ async fn charge_handler() -> Result<StatusCode, autumn_web::AutumnError> {
     Ok(StatusCode::OK)
 }
 
+/// A protected route whose handler never touches the tenant cell. It must not
+/// cause a registry entry to be created for the request's tenant.
+async fn noop_handler() -> StatusCode {
+    StatusCode::OK
+}
+
 fn build_app() -> Router {
+    build_app_with_state().0
+}
+
+/// Same wiring as [`build_app`] but also returns the shared [`AppState`] so a
+/// test can inspect the process-wide `TenantCellRegistry` afterwards. The
+/// registry lives in the state's extension map, which every clone shares.
+fn build_app_with_state() -> (Router, AppState) {
     let state = AppState::for_test();
 
     let mut config = autumn_web::config::AutumnConfig::default();
@@ -36,22 +49,28 @@ fn build_app() -> Router {
     config.tenancy.quota_bytes = 1000;
     state.insert_extension(config);
 
-    Router::new()
+    let app = Router::new()
         .route("/charge", post(charge_handler))
+        .route("/noop", post(noop_handler))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             autumn_web::tenancy::tenancy_middleware,
         ))
-        .with_state(state)
+        .with_state(state.clone());
+    (app, state)
 }
 
-fn charge_request(tenant: &str) -> axum::http::Request<axum::body::Body> {
+fn request_for(uri: &str, tenant: &str) -> axum::http::Request<axum::body::Body> {
     axum::http::Request::builder()
         .method("POST")
-        .uri("/charge")
+        .uri(uri)
         .header("x-tenant-id", tenant)
         .body(axum::body::Body::empty())
         .expect("valid request")
+}
+
+fn charge_request(tenant: &str) -> axum::http::Request<axum::body::Body> {
+    request_for("/charge", tenant)
 }
 
 /// tenant-a's second request pushes accumulated scratch to 1200 > 1000 and must
@@ -91,5 +110,55 @@ async fn over_quota_tenant_gets_503_others_proceed() {
         res.status(),
         StatusCode::OK,
         "tenant-b is independent and must not be affected by tenant-a"
+    );
+}
+
+/// A protected route whose handler never touches the tenant cell must NOT
+/// create a registry entry, even across many distinct tenant ids. Cells are
+/// materialized lazily on first access via `current_tenant_cell()`, so a route
+/// that never allocates leaves the registry empty regardless of tenant id. Only
+/// a request that actually charges through the cell creates its entry.
+#[tokio::test]
+async fn lazy_cells_no_registry_growth_for_untouched_routes() {
+    let (app, state) = build_app_with_state();
+
+    // Drive the non-allocating route with several DIFFERENT tenant ids.
+    for tenant in ["alpha", "beta", "gamma", "delta"] {
+        let res = app
+            .clone()
+            .oneshot(request_for("/noop", tenant))
+            .await
+            .expect("noop request completes");
+        assert_eq!(res.status(), StatusCode::OK, "noop route returns 200");
+    }
+
+    // The registry may be lazily inserted into the state (one process-wide
+    // handle), but it must hold NO cells: no route touched tenant memory.
+    let registry = state.extension::<autumn_web::tenant_cell::TenantCellRegistry>();
+    assert!(
+        registry.is_none_or(|r| r.is_empty()),
+        "non-allocating routes must not create tenant cells"
+    );
+
+    // A route that DOES charge via current_tenant_cell() materializes exactly
+    // one cell, for that tenant only.
+    let res = app
+        .clone()
+        .oneshot(charge_request("alpha"))
+        .await
+        .expect("charge request completes");
+    assert_eq!(res.status(), StatusCode::OK, "charge route returns 200");
+
+    let registry = state
+        .extension::<autumn_web::tenant_cell::TenantCellRegistry>()
+        .expect("registry exists after a charging request");
+    assert_eq!(
+        registry.len(),
+        1,
+        "exactly one cell is materialized for the tenant that allocated"
+    );
+    assert!(
+        registry.get("alpha").is_some(),
+        "the materialized cell belongs to the allocating tenant"
     );
 }

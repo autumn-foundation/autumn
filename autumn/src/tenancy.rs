@@ -454,16 +454,25 @@ pub async fn tenancy_middleware(
     let request = Request::from_parts(parts, body);
     let tenant_id_clone = tenant_id.clone();
 
-    // Bind a per-tenant memory cell for the request lifecycle. The registry is
-    // lazily registered in the app state's extension map on first use.
+    // Bind a lazily-materializing handle to the tenant's memory cell for the
+    // request lifecycle. The registry itself is lazily registered in the app
+    // state's extension map on first use, but building a handle does NOT create
+    // a cell: the cell is materialized only when a handler (or a streaming body)
+    // first accesses it via `current_tenant_cell()`. Requests to routes that
+    // never touch tenant memory therefore leave the registry untouched, even
+    // with request-controlled tenant ids.
     let registry = state.extension_or_insert_with(crate::tenant_cell::TenantCellRegistry::new);
-    let cell = registry.get_or_create(&tenant_id, config.tenancy.quota_bytes);
-    let cell_for_body = Some(std::sync::Arc::clone(&cell));
+    let handle = crate::tenant_cell::TenantCellHandle::new(
+        (*registry).clone(),
+        tenant_id.clone(),
+        config.tenancy.quota_bytes,
+    );
+    let handle_for_body = Some(handle.clone());
 
     let response = CURRENT_TENANT
         .scope(
             Some(tenant_id),
-            crate::tenant_cell::CURRENT_TENANT_CELL.scope(Some(cell), next.run(request)),
+            crate::tenant_cell::CURRENT_TENANT_CELL.scope(Some(handle), next.run(request)),
         )
         .await;
 
@@ -471,7 +480,7 @@ pub async fn tenancy_middleware(
     let wrapped = TenantPropagatingBody {
         inner: body,
         tenant_id: tenant_id_clone,
-        cell: cell_for_body,
+        handle: handle_for_body,
     };
     Response::from_parts(parts, axum::body::Body::new(wrapped))
 }
@@ -484,7 +493,7 @@ pin_project! {
         #[pin]
         pub inner: B,
         pub tenant_id: String,
-        pub cell: Option<std::sync::Arc<crate::tenant_cell::TenantCell>>,
+        pub handle: Option<crate::tenant_cell::TenantCellHandle>,
     }
 }
 
@@ -501,9 +510,9 @@ where
     ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
         let this = self.project();
         let tenant_id = this.tenant_id.clone();
-        let cell = this.cell.clone();
+        let handle = this.handle.clone();
         CURRENT_TENANT.sync_scope(Some(tenant_id), || {
-            crate::tenant_cell::CURRENT_TENANT_CELL.sync_scope(cell, || this.inner.poll_frame(cx))
+            crate::tenant_cell::CURRENT_TENANT_CELL.sync_scope(handle, || this.inner.poll_frame(cx))
         })
     }
 

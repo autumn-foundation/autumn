@@ -85,15 +85,21 @@ fn scratch_accounting() {
     let registry = TenantCellRegistry::new();
     let cell = registry.get_or_create("t", 0);
 
+    // A new key is charged its own allocation capacity in addition to the value.
+    // The key is short, so its contribution is small and stable across ops on
+    // the same key (which don't re-charge the key).
+    let kc = String::from("k").capacity();
+
     cell.scratch_insert("k", vec![0u8; 500])
         .expect("insert under unlimited quota");
-    assert_eq!(cell.tracked_bytes(), 500);
+    assert_eq!(cell.tracked_bytes(), kc + 500);
     assert_eq!(cell.scratch_get("k"), Some(vec![0u8; 500]));
 
-    // Replacing "k" with a larger value nets to the new size (500 -> 800).
+    // Replacing "k" with a larger value nets to the new value size (500 -> 800);
+    // the stored key is unchanged, so only the value delta is charged.
     cell.scratch_insert("k", vec![1u8; 800])
         .expect("replace value under unlimited quota");
-    assert_eq!(cell.tracked_bytes(), 800);
+    assert_eq!(cell.tracked_bytes(), kc + 800);
     assert_eq!(cell.scratch_get("k"), Some(vec![1u8; 800]));
 
     let removed = cell.scratch_remove("k");
@@ -139,6 +145,9 @@ fn density_smoke_thousand_cells() {
     const CELLS: usize = 1000;
     const BUF: usize = 16;
 
+    // Each cell is charged its value buffer plus the "buf" key's capacity.
+    let kc = String::from("buf").capacity();
+
     let registry = TenantCellRegistry::new();
     for i in 0..CELLS {
         let cell = registry.get_or_create(&format!("tenant-{i}"), 0);
@@ -147,7 +156,7 @@ fn density_smoke_thousand_cells() {
     }
 
     assert_eq!(registry.len(), CELLS);
-    assert_eq!(registry.total_tracked_bytes(), CELLS * BUF);
+    assert_eq!(registry.total_tracked_bytes(), CELLS * (BUF + kc));
     println!(
         "size_of::<TenantCell>() = {} bytes (fixed per-cell handle overhead)",
         std::mem::size_of::<autumn_web::tenant_cell::TenantCell>()
@@ -172,28 +181,63 @@ fn scratch_insert_replace_accounts_net_delta() {
     let reg = autumn_web::tenant_cell::TenantCellRegistry::new();
     let cell = reg.get_or_create("t", 1000);
 
+    // The single short key "k" is charged its capacity once (on the first,
+    // new-key insert). Every later op below reuses that same key, so it is never
+    // re-charged; the value deltas are what this test exercises. `kc` accounts
+    // for that fixed key contribution so the value math stays exact.
+    let kc = String::from("k").capacity();
+
     cell.scratch_insert("k", vec![0u8; 800]).unwrap();
-    assert_eq!(cell.tracked_bytes(), 800);
+    assert_eq!(cell.tracked_bytes(), kc + 800);
 
     // Replace with same size: net 0. Must NOT error even though 800 + 800 > 1000.
     cell.scratch_insert("k", vec![0u8; 800]).unwrap();
-    assert_eq!(cell.tracked_bytes(), 800);
+    assert_eq!(cell.tracked_bytes(), kc + 800);
 
-    // Grow to exactly the quota (net delta +200).
-    cell.scratch_insert("k", vec![0u8; 1000]).unwrap();
+    // Grow to exactly the quota (key + value == 1000).
+    cell.scratch_insert("k", vec![0u8; 1000 - kc]).unwrap();
     assert_eq!(cell.tracked_bytes(), 1000);
 
     // Shrink releases the delta.
     cell.scratch_insert("k", vec![0u8; 100]).unwrap();
-    assert_eq!(cell.tracked_bytes(), 100);
+    assert_eq!(cell.tracked_bytes(), kc + 100);
 
     // A genuine over-quota insert on a NEW key still fails and leaves state intact.
     cell.scratch_insert("k", vec![0u8; 900]).unwrap();
-    assert_eq!(cell.tracked_bytes(), 900);
+    assert_eq!(cell.tracked_bytes(), kc + 900);
     let err = cell.scratch_insert("j", vec![0u8; 200]).unwrap_err();
     assert_eq!(err.quota, 1000);
-    assert_eq!(err.in_use, 900);
-    assert_eq!(cell.tracked_bytes(), 900);
+    assert_eq!(err.in_use, kc + 900);
+    assert_eq!(cell.tracked_bytes(), kc + 900);
+}
+
+/// Scratch accounting must charge the stored `String` key's allocation
+/// capacity in addition to the value, so a large unique/user-derived key counts
+/// against the quota and is released on removal. A genuinely new key is charged
+/// for `key.capacity() + value.capacity()`; a huge key on an empty value is now
+/// rejected by the quota even though only the value was charged before.
+#[test]
+fn scratch_insert_accounts_key_capacity() {
+    let reg = autumn_web::tenant_cell::TenantCellRegistry::new();
+    let cell = reg.get_or_create("t", 1000);
+
+    // Empty value but a large key: the key allocation must be charged.
+    let key = "k".repeat(500); // String capacity >= 500
+    let key_cap = key.capacity();
+    cell.scratch_insert(key.clone(), Vec::new()).unwrap();
+    assert_eq!(cell.tracked_bytes(), key_cap);
+    assert!(cell.tracked_bytes() >= 500);
+
+    // Removing releases the key allocation back to zero.
+    let _ = cell.scratch_remove(&key);
+    assert_eq!(cell.tracked_bytes(), 0);
+
+    // A huge unique key on an empty value is now rejected by the quota
+    // (it was accepted when only value capacity was charged).
+    let big_key = "x".repeat(5000);
+    let err = cell.scratch_insert(big_key, Vec::new()).unwrap_err();
+    assert_eq!(err.quota, 1000);
+    assert_eq!(cell.tracked_bytes(), 0);
 }
 
 /// Scratch accounting must charge a value's allocation *capacity*, not its
@@ -206,12 +250,14 @@ fn scratch_insert_accounts_capacity_not_length() {
     let cell = reg.get_or_create("t", 1000);
 
     // A Vec with large spare capacity but small length must be charged its
-    // capacity — the cell owns the whole allocation.
+    // capacity — the cell owns the whole allocation. The short key "k" adds its
+    // own (small) capacity on this new-key insert.
+    let kc = String::from("k").capacity();
     let mut v = Vec::with_capacity(800);
     v.extend_from_slice(&[0u8; 8]); // len 8, capacity >= 800
     let cap = v.capacity();
     cell.scratch_insert("k", v).unwrap();
-    assert_eq!(cell.tracked_bytes(), cap);
+    assert_eq!(cell.tracked_bytes(), kc + cap);
     assert!(cell.tracked_bytes() >= 800);
 
     // Removing releases the full capacity back to zero.

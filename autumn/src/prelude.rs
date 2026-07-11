@@ -167,7 +167,7 @@ pub use crate::error::{AutumnError, AutumnResult};
 
 // ── Tenancy ─────────────────────────────────────────────────────
 /// Per-tenant in-process memory accounting cells and registry.
-pub use crate::tenant_cell::{TenantCell, TenantCellRegistry};
+pub use crate::tenant_cell::{TenantCell, TenantCellHandle, TenantCellRegistry};
 
 // ── Pagination ──────────────────────────────────────────────────
 /// Pagination primitives — offset and cursor extractors and wrappers.

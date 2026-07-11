@@ -218,14 +218,18 @@ impl TenantCell {
     /// Store `value` in the tenant's scratch buffer under `key`, charging only
     /// the *net* byte delta against the quota when replacing an existing entry.
     ///
-    /// Accounting is by the value's allocation *capacity* (the bytes the cell
-    /// actually owns), not its length, so a `Vec` with large spare capacity or a
-    /// buffer truncated after decoding is still charged for the whole
-    /// allocation it keeps resident.
+    /// Accounting covers both the stored `String` key and the value `Vec`
+    /// allocation *capacity* (the bytes the cell actually owns), not their
+    /// lengths, so a large unique/user-derived key or a `Vec` with large spare
+    /// capacity is charged for the whole allocation it keeps resident.
     ///
-    /// Replacing a key reserves at most `new_cap - old_cap` bytes (releasing the
-    /// difference when the value shrinks), so a same-size or shrinking replace
-    /// can never transiently overshoot the quota and spuriously fail.
+    /// The key's capacity is charged only when a *new* key is inserted (and
+    /// released on removal). Replacing an existing key leaves the stored key
+    /// untouched — [`HashMap::insert`](std::collections::HashMap::insert) keeps
+    /// the original key and only swaps the value — so a replace charges just the
+    /// value-capacity delta (`new_cap - old_cap`), releasing the difference when
+    /// the value shrinks. A same-size or shrinking replace can therefore never
+    /// transiently overshoot the quota and spuriously fail.
     ///
     /// # Errors
     ///
@@ -241,17 +245,27 @@ impl TenantCell {
         value: Vec<u8>,
     ) -> Result<(), QuotaExceeded> {
         let key = key.into();
-        let new_cap = value.capacity();
+        let new_val_cap = value.capacity();
         let mut scratch = self
             .inner
             .scratch
             .lock()
             .expect("tenant cell scratch lock poisoned");
-        let old_cap = scratch.get(&key).map_or(0, Vec::capacity);
-        if new_cap > old_cap {
-            self.inner.reserve(new_cap - old_cap)?;
-        } else if new_cap < old_cap {
-            self.inner.release(old_cap - new_cap);
+        match scratch.get(&key).map(Vec::capacity) {
+            // Key already present: `insert` keeps the stored key and swaps the
+            // value, so only the value-capacity delta is charged. The freshly
+            // built `key` String is dropped.
+            Some(old_val_cap) => {
+                if new_val_cap > old_val_cap {
+                    self.inner.reserve(new_val_cap - old_val_cap)?;
+                } else if new_val_cap < old_val_cap {
+                    self.inner.release(old_val_cap - new_val_cap);
+                }
+            }
+            // Genuinely new key: charge the key allocation as well as the value.
+            None => {
+                self.inner.reserve(key.capacity() + new_val_cap)?;
+            }
         }
         scratch.insert(key, value);
         drop(scratch);
@@ -275,25 +289,29 @@ impl TenantCell {
 
     /// Remove the scratch value for `key`, releasing its bytes.
     ///
-    /// Releases the value's full allocation *capacity* (the bytes the cell
-    /// owned), matching how [`scratch_insert`](Self::scratch_insert) charged it.
+    /// Releases both the stored `String` key and the value `Vec`'s full
+    /// allocation *capacity* (the bytes the cell owned), matching how
+    /// [`scratch_insert`](Self::scratch_insert) charged them on a new-key
+    /// insert.
     ///
     /// # Panics
     ///
     /// Panics if the tenant cell's scratch lock is poisoned.
     #[must_use = "the removed scratch value is returned; bind it or `let _ =` it"]
     pub fn scratch_remove(&self, key: &str) -> Option<Vec<u8>> {
-        let removed = {
+        // `remove_entry` recovers the stored key too, so its allocation is
+        // released alongside the value's.
+        let (removed_key, removed_val) = {
             let mut scratch = self
                 .inner
                 .scratch
                 .lock()
                 .expect("tenant cell scratch lock poisoned");
-            scratch.remove(key)
-        };
-        let removed = removed?;
-        self.inner.release(removed.capacity());
-        Some(removed)
+            scratch.remove_entry(key)
+        }?;
+        self.inner
+            .release(removed_key.capacity() + removed_val.capacity());
+        Some(removed_val)
     }
 }
 
@@ -425,14 +443,75 @@ impl TenantCellRegistry {
     }
 }
 
-tokio::task_local! {
-    /// The [`TenantCell`] bound to the current request, if tenancy is enabled and
-    /// a registry is present. Mirrors [`crate::tenancy::CURRENT_TENANT`].
-    pub static CURRENT_TENANT_CELL: Option<Arc<TenantCell>>;
+/// A lazily-materializing reference to a tenant's cell.
+///
+/// Binding a handle does NOT create a registry entry; the cell is created on
+/// first access, so requests that never touch tenant memory leave the registry
+/// untouched. The handle is cheap to clone (a registry `Arc` plus the tenant id
+/// and its quota), which lets the tenancy middleware scope it into a task-local
+/// without eagerly allocating a cell for every protected request.
+#[derive(Clone)]
+pub struct TenantCellHandle {
+    registry: TenantCellRegistry,
+    tenant_id: String,
+    quota_bytes: usize,
 }
 
-/// Returns the [`TenantCell`] bound to the current request, if any.
+impl fmt::Debug for TenantCellHandle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // The registry is a process-wide shared handle; summarise it by size
+        // rather than recursing into every resident cell.
+        f.debug_struct("TenantCellHandle")
+            .field("tenant_id", &self.tenant_id)
+            .field("quota_bytes", &self.quota_bytes)
+            .field("registry_cells", &self.registry.len())
+            .finish()
+    }
+}
+
+impl TenantCellHandle {
+    /// Create a handle for `tenant_id` backed by `registry`, with the soft
+    /// `quota_bytes` to apply if and when the cell is materialized. Building the
+    /// handle does not touch the registry.
+    #[must_use]
+    pub const fn new(registry: TenantCellRegistry, tenant_id: String, quota_bytes: usize) -> Self {
+        Self {
+            registry,
+            tenant_id,
+            quota_bytes,
+        }
+    }
+
+    /// Materialize (get-or-create) the tenant's cell in the registry, creating
+    /// the registry entry on first access.
+    #[must_use]
+    pub fn cell(&self) -> Arc<TenantCell> {
+        self.registry
+            .get_or_create(&self.tenant_id, self.quota_bytes)
+    }
+
+    /// The tenant id this handle resolves to.
+    #[must_use]
+    pub fn tenant_id(&self) -> &str {
+        &self.tenant_id
+    }
+}
+
+tokio::task_local! {
+    /// A lazily-materializing [`TenantCellHandle`] for the current request, if
+    /// tenancy is enabled and a registry is present. Binding the handle does not
+    /// create a cell; the cell is materialized on first access via
+    /// [`current_tenant_cell`]. Mirrors [`crate::tenancy::CURRENT_TENANT`].
+    pub static CURRENT_TENANT_CELL: Option<TenantCellHandle>;
+}
+
+/// Returns the current request's [`TenantCell`], creating it in the registry on
+/// first access (lazy). Returns `None` if tenancy is disabled or no handle is
+/// bound to the current task.
 #[must_use]
 pub fn current_tenant_cell() -> Option<Arc<TenantCell>> {
-    CURRENT_TENANT_CELL.try_with(Clone::clone).ok().flatten()
+    CURRENT_TENANT_CELL
+        .try_with(|h| h.as_ref().map(TenantCellHandle::cell))
+        .ok()
+        .flatten()
 }

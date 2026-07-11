@@ -562,7 +562,7 @@ pub use db::{IsolationLevel, TxOptions, savepoint};
 /// See the [`error`] module for details.
 pub use error::{AutumnError, AutumnResult};
 
-pub use tenant_cell::{QuotaExceeded, TenantCell, TenantCellRegistry};
+pub use tenant_cell::{QuotaExceeded, TenantCell, TenantCellHandle, TenantCellRegistry};
 
 /// Paginated list response wrapper with navigation metadata.
 ///
