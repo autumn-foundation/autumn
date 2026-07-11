@@ -298,6 +298,13 @@ harness = false
 name = "integration_tests"
 path = "tests/integration_tests.rs"
 
+# Isolated: sets process-wide proxy env vars (HTTP_PROXY/HTTPS_PROXY/ALL_PROXY)
+# to verify pinned SSRF-safe clients bypass env proxies. Cannot share the
+# consolidated binary — those vars would race the inline network tests.
+[[test]]
+name = "ssrf_proxy_bypass"
+path = "tests/ssrf_proxy_bypass.rs"
+
 # Isolated: installs the process-global tracing subscriber (issue #1044), a
 # process-wide side-effect that cannot share the consolidated binary.
 [[test]]
