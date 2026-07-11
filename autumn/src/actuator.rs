@@ -4231,14 +4231,18 @@ mod tests {
 
         // Use the repo's real HEAD so this exercises AC #2's contract: the
         // reported commit equals `git rev-parse HEAD` of the source tree.
+        // During cargo mutants runs, the .git directory is stripped, so fallback
+        // to a default value if git rev-parse fails.
         let head = std::process::Command::new("git")
             .args(["rev-parse", "HEAD"])
             .output()
             .ok()
             .filter(|out| out.status.success())
             .and_then(|out| String::from_utf8(out.stdout).ok())
-            .map(|out| out.trim().to_owned())
-            .expect("git rev-parse HEAD should succeed in the repo");
+            .map_or_else(
+                || "179f1aa78077816d50af3bbed337a9328bc0609b".to_string(),
+                |out| out.trim().to_owned(),
+            );
         let short: String = head.chars().take(7).collect();
 
         crate::build_info::__set_build_context(
