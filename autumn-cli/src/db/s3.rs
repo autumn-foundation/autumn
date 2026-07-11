@@ -53,6 +53,11 @@ const TRANSFER_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// TCP-level inactivity guard (`TCP_USER_TIMEOUT`) for the transfer client:
 /// drop a stalled connection whose data stays unacknowledged this long, WITHOUT
 /// capping a healthy long-running multi-GB stream.
+///
+/// Linux-only: `TCP_USER_TIMEOUT` (and reqwest's `tcp_user_timeout` builder
+/// method) exist only on Linux. On macOS/Windows the transfer client relies on
+/// `connect_timeout` + the disabled overall timeout instead.
+#[cfg(target_os = "linux")]
 const TRANSFER_STALL_TIMEOUT: Duration = Duration::from_secs(300);
 
 // ─── Credentials (never Debug/Display) ───────────────────────────────────────
@@ -416,26 +421,28 @@ impl S3Client {
         if let Some(endpoint) = &config.endpoint {
             validate_endpoint(endpoint)?;
         }
-        let http = reqwest::blocking::Client::builder()
+        let builder = reqwest::blocking::Client::builder()
             // reqwest's blocking default is a 30s TOTAL request timeout, which
             // would abort a correctly-streaming multi-GB PUT/GET on a slow
             // offsite link before it finishes. Disable the overall cap so long
             // transfers aren't bounded by wall-clock…
             .timeout(None)
-            // …but still fail fast on a dead/unreachable host…
-            .connect_timeout(TRANSFER_CONNECT_TIMEOUT)
-            // …and catch a stalled connection at the TCP layer WITHOUT capping
-            // total duration: TCP_USER_TIMEOUT drops the connection when sent
-            // data stays unacknowledged this long. reqwest 0.13's blocking
-            // builder has no per-read `read_timeout`, so this is the closest
-            // inactivity guard. Non-configurable sane constants (a configurable
-            // transfer timeout is a possible follow-up).
-            .tcp_user_timeout(TRANSFER_STALL_TIMEOUT)
-            .build()
-            .map_err(|e| S3Error::Transport {
-                op: "init",
-                detail: e.to_string(),
-            })?;
+            // …but still fail fast on a dead/unreachable host.
+            .connect_timeout(TRANSFER_CONNECT_TIMEOUT);
+        // Catch a stalled connection at the TCP layer WITHOUT capping total
+        // duration: TCP_USER_TIMEOUT drops the connection when sent data stays
+        // unacknowledged this long. reqwest 0.13's blocking builder has no
+        // per-read `read_timeout`, so this is the closest inactivity guard — but
+        // the option (and reqwest's `tcp_user_timeout` method) are Linux-only, so
+        // it's gated to Linux; other platforms rely on connect_timeout + the
+        // disabled overall timeout. Non-configurable sane constants (a
+        // configurable transfer timeout is a possible follow-up).
+        #[cfg(target_os = "linux")]
+        let builder = builder.tcp_user_timeout(TRANSFER_STALL_TIMEOUT);
+        let http = builder.build().map_err(|e| S3Error::Transport {
+            op: "init",
+            detail: e.to_string(),
+        })?;
         Ok(Self {
             config,
             credentials,
@@ -1130,6 +1137,8 @@ mod tests {
         };
         assert!(S3Client::new(config, creds).is_ok());
         // Sanity-check the guard constants stay sane (fast connect, long stall).
+        // The stall guard is Linux-only (TCP_USER_TIMEOUT).
+        #[cfg(target_os = "linux")]
         assert!(TRANSFER_CONNECT_TIMEOUT < TRANSFER_STALL_TIMEOUT);
     }
 
