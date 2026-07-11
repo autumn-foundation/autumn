@@ -965,17 +965,17 @@ enum DbCommands {
     /// systemd timer:
     ///
     ///   # myapp-backup.service
-    ///   [Service]
+    ///   `[Service]`
     ///   Type=oneshot
     ///   Environment=AUTUMN_ENV=prod
     ///   WorkingDirectory=/srv/myapp
     ///   ExecStart=/usr/local/bin/autumn db backup --keep 7
     ///
     ///   # myapp-backup.timer
-    ///   [Timer]
+    ///   `[Timer]`
     ///   OnCalendar=*-*-* 02:00:00
     ///   Persistent=true
-    ///   [Install]
+    ///   `[Install]`
     ///   WantedBy=timers.target
     // The scheduling recipe above is shell/unit-file text shown verbatim in
     // `--help`; backticking every `KEY=value` token would leak into that output.
