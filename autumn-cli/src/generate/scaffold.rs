@@ -448,7 +448,10 @@ pub fn plan_scaffold_with_options(
             continue;
         };
         let base = f.name.strip_suffix("_id").unwrap_or(&f.name);
-        let columns = super::model::model_string_columns(project_root, base);
+        // Self-ref-aware: a self-reference's columns come from the in-flight
+        // fields, so `Category category:references{label:name}` doesn't warn
+        // that the not-yet-on-disk model "has no string columns".
+        let columns = target_string_columns(project_root, f, &plural, &form_fields);
         if !columns.iter().any(|(c, _)| c == label) {
             // Covers both a wrong column name AND a target with no string
             // columns at all — in the latter case there is nothing to fall back
@@ -1564,7 +1567,10 @@ fn render_routes_file(
     // the display-scoped set so it's populated in `--live-validation` too.
     let reference_displays: BTreeMap<String, ReferenceDisplay> = display_reference_fields
         .iter()
-        .filter_map(|f| resolve_reference_display(project_root, f).map(|d| (f.name.clone(), d)))
+        .filter_map(|f| {
+            resolve_reference_display(project_root, f, plural, all_fields)
+                .map(|d| (f.name.clone(), d))
+        })
         .collect();
     let model_form = render_model_form(pascal_name, fields, validations);
     // Enum fields need their generated Rust type in scope here — `into_new`
@@ -2870,13 +2876,48 @@ struct ReferenceDisplay {
     column_nullable: bool,
 }
 
+/// The `(name, nullable)` string (`String`/`Text`) columns of a `references`
+/// field's target (issue #1146). For a **self-reference** (the target table is
+/// the model being generated right now) there is no `src/models/<x>.rs` on disk
+/// yet, so the columns come from the in-flight `own_fields`; every other target
+/// is read from disk via [`super::model::model_string_columns`].
+fn target_string_columns(
+    project_root: &Path,
+    field: &Field,
+    self_plural: &str,
+    own_fields: &[Field],
+) -> Vec<(String, bool)> {
+    if field.reference_table().as_deref() == Some(self_plural) {
+        own_fields
+            .iter()
+            .filter(|f| matches!(f.kind, FieldKind::String | FieldKind::Text))
+            .map(|f| (f.name.clone(), f.nullable))
+            .collect()
+    } else {
+        let base = field.name.strip_suffix("_id").unwrap_or(&field.name);
+        super::model::model_string_columns(project_root, base)
+    }
+}
+
 /// Resolve the display column for a `references` field against its target
 /// model (issue #1146): an explicit `{label:col}` override wins; otherwise a
 /// `name`/`title` column is preferred, else the first `String`/`Text` column.
 /// Returns `None` when the target model has no string column (render the id).
-fn resolve_reference_display(project_root: &Path, field: &Field) -> Option<ReferenceDisplay> {
+///
+/// A **self-reference** (the target table is the model being generated right
+/// now — e.g. `Category category:references`) has no `src/models/<x>.rs` on
+/// disk yet, so its display column is resolved from the in-flight `own_fields`
+/// (the columns being generated this invocation) rather than the filesystem.
+/// References to OTHER models still resolve via the on-disk lookup.
+fn resolve_reference_display(
+    project_root: &Path,
+    field: &Field,
+    self_plural: &str,
+    own_fields: &[Field],
+) -> Option<ReferenceDisplay> {
     let base = field.name.strip_suffix("_id").unwrap_or(&field.name);
-    let columns = super::model::model_string_columns(project_root, base);
+    let is_self_ref = field.reference_table().as_deref() == Some(self_plural);
+    let columns = target_string_columns(project_root, field, self_plural, own_fields);
     // The `name`/`title`/first-string-column heuristic, reused both when no
     // explicit label is given and when an explicit one has to be discarded.
     let heuristic = || {
@@ -2892,9 +2933,10 @@ fn resolve_reference_display(project_root: &Path, field: &Field) -> Option<Refer
             // Explicit override names a real string column on the target — use
             // it, with its known nullability.
             (c.clone(), *n)
-        } else if field
-            .reference_table()
-            .is_some_and(|table| !super::model::model_file_exists(project_root, &table, base))
+        } else if !is_self_ref
+            && field
+                .reference_table()
+                .is_some_and(|table| !super::model::model_file_exists(project_root, &table, base))
         {
             // The target model genuinely isn't discoverable (not yet generated,
             // unparseable, or a single-file `models.rs` layout we can't read),
@@ -2902,7 +2944,8 @@ fn resolve_reference_display(project_root: &Path, field: &Field) -> Option<Refer
             // non-null `String`), matching the "assume the table exists" posture
             // the missing-target path takes. Not reachable on the normal select
             // path (missing targets are excluded upstream), but keeps the
-            // resolver correct for any other caller.
+            // resolver correct for any other caller. A self-reference IS
+            // discoverable (via `own_fields`), so it never takes this branch.
             (label.clone(), false)
         } else {
             // The model IS discoverable but `{label}` names no string column —

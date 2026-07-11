@@ -287,6 +287,54 @@ fn live_validation_keeps_parent_display_on_index_and_show() {
 }
 
 #[test]
+fn self_reference_resolves_display_from_in_flight_fields() {
+    // A self-reference (`category:references` on Category → the `categories`
+    // table being generated right now) has no `src/models/category.rs` on disk
+    // yet, so the #1146 display column must resolve from the IN-FLIGHT fields —
+    // `categories::name`, not the raw id. Nullable self-ref (`references?`).
+    let tmp = tempfile::tempdir().expect("tempdir");
+    run_autumn_ok(tmp.path(), &["new", "self-ref-app"]);
+    let project = tmp.path().join("self-ref-app");
+    run_autumn_ok(
+        &project,
+        &[
+            "generate",
+            "scaffold",
+            "Category",
+            "name:String",
+            "category:references?",
+        ],
+    );
+    let routes = fs::read_to_string(project.join("src/routes/categories.rs")).unwrap();
+
+    // Option loader selects the in-flight `name` display column (not id-only).
+    assert!(
+        routes.contains(".select((categories::id, categories::name))"),
+        "self-ref option loader must select the in-flight `name` column:\n{routes}"
+    );
+    // Show loads + renders the parent's `name`.
+    assert!(
+        routes.contains("categories::table.find(fk).select(categories::name)"),
+        "self-ref show must load the parent `name` display value:\n{routes}"
+    );
+    // Index builds the parent-label map.
+    assert!(
+        routes.contains("let category_id_labels: std::collections::HashMap<String, String>"),
+        "self-ref index must build the parent-label map:\n{routes}"
+    );
+    // Must NOT fall back to raw-id labeling.
+    assert!(
+        !routes.contains("(id.to_string(), id.to_string())"),
+        "self-ref must not fall back to raw-id labeling:\n{routes}"
+    );
+    // Nullable self-ref: the unset FK renders a dash on show/index.
+    assert!(
+        routes.contains("None => \"—\".to_string()"),
+        "nullable self-ref must handle the None case:\n{routes}"
+    );
+}
+
+#[test]
 fn nullable_reference_renders_dash_and_blank_option() {
     let (_tmp, routes) =
         belongs_to_routes("bt-nullable-app", &["title:String"], "post:references?");
