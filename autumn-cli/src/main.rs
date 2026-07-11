@@ -1868,6 +1868,14 @@ enum GenerateCommands {
         /// Maud templates with navigator.credentials JS, and integration tests.
         #[arg(long)]
         passkeys: bool,
+        /// Scaffold passwordless email magic-link login (off by default).
+        /// Adds a `magic_link_tokens` table, request → email → verify routes
+        /// (`/login/magic`, `/login/magic/verify`), a rate-limited request
+        /// endpoint, single-use SHA-256-digest tokens with a configurable TTL,
+        /// and generated integration tests. Composable with `--oauth`,
+        /// `--passkeys`, and `--totp`.
+        #[arg(long = "magic-link")]
+        magic_link: bool,
         /// Print the file plan and exit without writing anything.
         #[arg(long)]
         dry_run: bool,
@@ -3342,18 +3350,20 @@ fn run_generate_command(cmd: GenerateCommands, mode: ApplyMode) {
             oauth,
             totp,
             passkeys,
+            magic_link,
             dry_run,
             force,
         } => {
             let oauth_options = generate::auth::AuthOAuthOptions { providers: oauth };
             let timestamp = generate::timestamp_now();
-            let plan = generate::auth::plan_auth_full_ex(
+            let plan = generate::auth::plan_auth_full_ex2(
                 &resolve_cwd(),
                 &name,
                 &timestamp,
                 &oauth_options,
                 totp,
                 passkeys,
+                magic_link,
             );
             apply_plan(plan, generate::Flags { dry_run, force }, mode);
         }
@@ -6573,6 +6583,29 @@ mod tests {
             panic!("wrong variant");
         };
         assert!(!passkeys, "passkeys must default to off");
+    }
+
+    #[test]
+    fn parse_generate_auth_magic_link_flag() {
+        let cli =
+            Cli::try_parse_from(["autumn", "generate", "auth", "User", "--magic-link"]).unwrap();
+        let Commands::Generate(GenerateCommands::Auth {
+            name, magic_link, ..
+        }) = cli.command
+        else {
+            panic!("wrong variant");
+        };
+        assert_eq!(name, "User");
+        assert!(magic_link, "--magic-link must set the magic_link flag");
+    }
+
+    #[test]
+    fn generate_auth_magic_link_defaults_off() {
+        let cli = Cli::try_parse_from(["autumn", "generate", "auth", "User"]).unwrap();
+        let Commands::Generate(GenerateCommands::Auth { magic_link, .. }) = cli.command else {
+            panic!("wrong variant");
+        };
+        assert!(!magic_link, "magic_link must default to off");
     }
 
     #[test]
