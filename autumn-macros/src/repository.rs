@@ -1336,10 +1336,79 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         } else {
             quote! {}
         };
+        // #1739 grandchild recursion: within the Destroy arm, after selecting a
+        // child row but before removing it, recurse into THIS model's own
+        // `dependent(...)` cascade keyed on the child's id, so grandchildren (and
+        // deeper) are destroyed/nullified inside the SAME transaction. Only
+        // `destroy` recurses: `delete_all` stays single-level (#1739 scope), and
+        // `nullify`/`restrict` remove no rows that could themselves own children.
+        // Restrict grandchildren are probed before mutating ones (mirroring the
+        // single-record restrict-first ordering); a restrict 409 anywhere in the
+        // tree rolls the whole transaction back. Cycle guard: `__visited` holds
+        // every (table, id) already on the destroy path; an already-seen row is
+        // skipped (see the per-row guard in the loop), so self-/mutual-referential
+        // graphs terminate rather than looping forever.
+        let has_dependents = !config.dependents.is_empty();
+        // The grandchildren follow this child's delete kind: a soft-delete child
+        // is only soft-deleted when its parent is (`__parent_soft`), so its own
+        // children inherit `__parent_soft`; a non-soft-delete child is always hard
+        // deleted, so its children cascade as a hard delete (`false`).
+        let child_soft_for_grandchildren = if config.soft_delete {
+            quote! { __parent_soft }
+        } else {
+            quote! { false }
+        };
+        let emit_grandchild_call = |dep: &DependentSpec| {
+            let child_repo = &dep.child_repo;
+            let fk = &dep.fk;
+            let action_variant = dep.action.variant_ident();
+            quote! {
+                {
+                    let __autumn_gc_repo = #child_repo::with_pool_untracked(
+                        ::core::clone::Clone::clone(&self.pool)
+                    );
+                    // The helper already returns a boxed `dyn Future` (see its
+                    // definition), so the recursive edge is type-erased and this
+                    // call needs no further boxing. The connection and visited set
+                    // are reborrowed; the future is awaited immediately so it never
+                    // outlives `__autumn_gc_repo`.
+                    __ret_broadcasts.extend(
+                        __autumn_gc_repo.__autumn_apply_dependent_on_conn(
+                            conn,
+                            #fk,
+                            __cid,
+                            ::autumn_web::repository::DependentAction::#action_variant,
+                            #child_soft_for_grandchildren,
+                            __visited,
+                        ).await?
+                    );
+                }
+            }
+        };
+        let grandchild_restrict_calls: ::std::vec::Vec<_> = config
+            .dependents
+            .iter()
+            .filter(|dep| dep.action == DependentAction::Restrict)
+            .map(&emit_grandchild_call)
+            .collect();
+        let grandchild_mutating_calls: ::std::vec::Vec<_> = config
+            .dependents
+            .iter()
+            .filter(|dep| dep.action != DependentAction::Restrict)
+            .map(&emit_grandchild_call)
+            .collect();
+        let grandchild_cascade = quote! {
+            #(#grandchild_restrict_calls)*
+            #(#grandchild_mutating_calls)*
+        };
+
         // Declaration + return of the deferred-broadcast buffer for the Destroy
-        // arm. Only a broadcasts-only child accumulates; every other repo returns
-        // an empty buffer (zero-cost).
-        let destroy_ret_decl = if dep_needs_broadcast {
+        // arm. A broadcasts-only child accumulates its own OOB delete fragments;
+        // additionally, when this repo has dependents (#1739), grandchild cascades
+        // return their broadcasts here to propagate up to the top-level parent for
+        // post-commit publishing. Repos with neither return an empty buffer.
+        let needs_ret_buffer = dep_needs_broadcast || has_dependents;
+        let destroy_ret_decl = if needs_ret_buffer {
             quote! {
                 let mut __ret_broadcasts: ::std::vec::Vec<(::std::string::String, ::std::string::String)> =
                     ::std::vec::Vec::new();
@@ -1347,7 +1416,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         } else {
             quote! {}
         };
-        let destroy_ret_value = if dep_needs_broadcast {
+        let destroy_ret_value = if needs_ret_buffer {
             quote! { __ret_broadcasts }
         } else {
             quote! { ::std::vec::Vec::new() }
@@ -1378,24 +1447,47 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             /// Returns the `(topic, dom_id)` OOB delete broadcasts accumulated for
             /// `broadcasts = true` (non-commit-hook) children — the parent
             /// publishes them only AFTER its transaction commits, so a rolled-back
-            /// cascade broadcasts nothing. Empty for every other configuration.
+            /// cascade broadcasts nothing. Grandchild cascades (#1739) propagate
+            /// their broadcasts up through this same buffer. Empty for a repo with
+            /// no dependents and no broadcasting children.
             ///
-            /// NOTE (#1369 scope / see #1702): the `Destroy` cascade is
-            /// single-level — it applies this model's mutation to each child but
-            /// does NOT recursively invoke the child's own `dependent(...)`
-            /// cascade, so grandchildren are not handled. #1369's target graph is
-            /// single-level; recursive/multi-level cascade is a tracked follow-up.
+            /// #1739: the `Destroy` cascade is recursive — for each destroyed
+            /// child it invokes the child's OWN `dependent(...)` cascade against
+            /// the same connection, so grandchildren (and deeper) are handled in
+            /// one transaction. `__visited` carries the (table, id) rows already on
+            /// the destroy path; an already-seen row is skipped, so self- and
+            /// mutual-referential graphs terminate. `delete_all` remains
+            /// single-level by design (#1739 scope).
+            // #1739: returns an explicitly boxed `dyn Future` rather than being an
+            // `async fn`. The Destroy cascade is recursive and, for a self- or
+            // mutual-referential `dependent(...)` graph, calls back into an
+            // `__autumn_apply_dependent_on_conn` of this same type. An `async fn`'s
+            // anonymous future cannot then be proven `Send` (the auto-trait check
+            // is circular: the future's `Send`-ness depends on itself), so the
+            // whole cascade — and every `delete_by_id` that drives it — would fail
+            // its `+ Send` bound. Returning a `Pin<Box<dyn Future + Send>>` erases
+            // the recursive edge behind a trait object whose `Send` is axiomatic,
+            // breaking the cycle while keeping the cascade `Send`.
             #[doc(hidden)]
-            pub async fn __autumn_apply_dependent_on_conn(
-                &self,
-                conn: &mut ::autumn_web::reexports::diesel_async::AsyncPgConnection,
-                __fk_column: &str,
+            pub fn __autumn_apply_dependent_on_conn<'__dep>(
+                &'__dep self,
+                conn: &'__dep mut ::autumn_web::reexports::diesel_async::AsyncPgConnection,
+                __fk_column: &'__dep str,
                 __parent_id: i64,
                 __action: ::autumn_web::repository::DependentAction,
                 __parent_soft: bool,
-            ) -> ::autumn_web::AutumnResult<
-                ::std::vec::Vec<(::std::string::String, ::std::string::String)>,
-            > {
+                // #1739: (table, id) rows already entered on the destroy path —
+                // threaded through the recursion to break self-/mutual-referential
+                // cycles. See the Destroy arm's cycle guard below.
+                __visited: &'__dep mut ::std::collections::HashSet<(&'static str, i64)>,
+            ) -> ::std::pin::Pin<::std::boxed::Box<
+                dyn ::std::future::Future<
+                    Output = ::autumn_web::AutumnResult<
+                        ::std::vec::Vec<(::std::string::String, ::std::string::String)>,
+                    >,
+                > + ::core::marker::Send + '__dep,
+            >> {
+                ::std::boxed::Box::pin(async move {
                 use ::autumn_web::reexports::diesel::prelude::*;
                 use ::autumn_web::reexports::diesel_async::RunQueryDsl;
                 #dep_hooks_use
@@ -1458,10 +1550,12 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         ::core::result::Result::Ok(::std::vec::Vec::new())
                     }
                     ::autumn_web::repository::DependentAction::Destroy => {
-                        // Single-level cascade (#1369 scope; recursion tracked in
-                        // #1702): each child's mutation is applied inline here; the
-                        // child's OWN `dependent(...)` cascade is NOT invoked, so
-                        // grandchildren are not recursively destroyed/nullified.
+                        // Recursive cascade (#1739): each child row's mutation is
+                        // applied inline, and BEFORE that mutation this repo's own
+                        // `dependent(...)` cascade is invoked against the child id,
+                        // so grandchildren (and deeper) are destroyed/nullified
+                        // within the same transaction. A `__visited` (table, id)
+                        // set breaks self-/mutual-referential cycles.
                         #destroy_register
                         #destroy_ret_decl
                         #[derive(::autumn_web::reexports::diesel::QueryableByName)]
@@ -1481,6 +1575,14 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 .map_err(::autumn_web::AutumnError::from)?;
                         for __row in __ids {
                             let __cid = __row.id;
+                            // #1739 cycle guard: skip a (table, id) already on the
+                            // current destroy path. `insert` returns false when the
+                            // row is already present, so a self- or mutual-reference
+                            // (e.g. a grandchild pointing back at an ancestor) is not
+                            // re-entered and the traversal terminates.
+                            if !__visited.insert((#table_name, __cid)) {
+                                continue;
+                            }
                             // #1369: reload the EXACT id the (parent-soft-gated)
                             // selection returned — do NOT re-apply `#sd_filter`
                             // (`deleted_at IS NULL`) here. On a hard parent delete
@@ -1499,6 +1601,11 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             if let ::core::option::Option::Some(__record) = __record {
                                 #destroy_ctx_decl
                                 #destroy_before_delete
+                                // #1739: cascade this child's OWN dependents
+                                // (grandchildren) before removing the child row, so
+                                // a hard delete never leaves an FK-dangling
+                                // grandchild and never FK-fails the child delete.
+                                #grandchild_cascade
                                 #destroy_mutation
                                 #destroy_post_mutation
                             }
@@ -1506,6 +1613,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         ::core::result::Result::Ok(#destroy_ret_value)
                     }
                 }
+                })
             }
         }
     };
@@ -7932,6 +8040,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             id,
                             ::autumn_web::repository::DependentAction::#action_variant,
                             #parent_soft_lit,
+                            &mut __autumn_visited,
                         )
                         .await?
                 );
@@ -7950,6 +8059,13 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             .map(&emit_cascade_call)
             .collect();
         let cascade_calls = quote! {
+            // #1739 cycle guard: one visited (table, id) set for the whole
+            // cascade, seeded with this parent row so a grandchild that references
+            // an ancestor terminates instead of looping. Threaded by-ref into
+            // every `__autumn_apply_dependent_on_conn` call (direct + recursive).
+            let mut __autumn_visited: ::std::collections::HashSet<(&'static str, i64)> =
+                ::std::collections::HashSet::new();
+            __autumn_visited.insert((#table_name, id));
             // Phase 1: probe all `restrict` dependents first — a 409 here rolls
             // back before any mutating action fires a child hook.
             #(#restrict_calls)*
@@ -14629,7 +14745,7 @@ mod tests {
         // parent's cascade *call* site inside `delete_by_id`. Bound to the method
         // (it ends right before the always-generated `pub fn on_primary`).
         let hstart = generated
-            .find("pub async fn __autumn_apply_dependent_on_conn")
+            .find("pub fn __autumn_apply_dependent_on_conn")
             .expect("dependent-apply helper definition present");
         let hrest = &generated[hstart..];
         let hend = hrest.find("pub fn on_primary").unwrap_or(hrest.len());

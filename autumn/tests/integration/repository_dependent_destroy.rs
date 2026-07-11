@@ -273,6 +273,108 @@ pub struct DepHardSoftComment {
 #[autumn_web::repository(DepHardSoftComment, table = "dep_hard_soft_comments", soft_delete)]
 pub trait DepHardSoftCommentRepository {}
 
+// ── #1739: three-level grandchild destroy graph (Post → Comment → Reply) ──────
+//
+// Both `Dep3Post` and `Dep3Comment` declare `dependent = destroy`. Deleting a
+// post must recurse: destroy its comments AND each comment's replies, in one
+// transaction, leaving zero orphaned grandchildren. This is the exact #1739
+// acceptance graph.
+
+diesel::table! {
+    dep3_posts (id) {
+        id -> Int8,
+        title -> Text,
+    }
+}
+
+#[autumn_web::model(table = "dep3_posts")]
+pub struct Dep3Post {
+    #[id]
+    pub id: i64,
+    pub title: String,
+}
+
+#[autumn_web::repository(
+    Dep3Post,
+    table = "dep3_posts",
+    dependent(PgDep3CommentRepository, fk = "post_id", on_delete = destroy)
+)]
+pub trait Dep3PostRepository {}
+
+diesel::table! {
+    dep3_comments (id) {
+        id -> Int8,
+        post_id -> Int8,
+        body -> Text,
+    }
+}
+
+#[autumn_web::model(table = "dep3_comments")]
+pub struct Dep3Comment {
+    #[id]
+    pub id: i64,
+    pub post_id: i64,
+    pub body: String,
+}
+
+#[autumn_web::repository(
+    Dep3Comment,
+    table = "dep3_comments",
+    dependent(PgDep3ReplyRepository, fk = "comment_id", on_delete = destroy)
+)]
+pub trait Dep3CommentRepository {}
+
+diesel::table! {
+    dep3_replies (id) {
+        id -> Int8,
+        comment_id -> Int8,
+        body -> Text,
+    }
+}
+
+#[autumn_web::model(table = "dep3_replies")]
+pub struct Dep3Reply {
+    #[id]
+    pub id: i64,
+    pub comment_id: i64,
+    pub body: String,
+}
+
+#[autumn_web::repository(Dep3Reply, table = "dep3_replies")]
+pub trait Dep3ReplyRepository {}
+
+// ── #1739 cycle guard: a self-referential `destroy` dependent ─────────────────
+//
+// `dep_nodes.parent_id` references `dep_nodes.id`, and the repository declares a
+// `dependent = destroy` back onto itself. This is the self-referential cycle the
+// visited-set guard must survive: deleting a node destroys its children, which
+// recurse into THEIR children, etc.  Even with cyclic data (a descendant whose
+// FK points back at an ancestor) the traversal must terminate rather than
+// looping forever or overflowing the (boxed) recursive future.
+
+diesel::table! {
+    dep_nodes (id) {
+        id -> Int8,
+        parent_id -> Nullable<Int8>,
+        name -> Text,
+    }
+}
+
+#[autumn_web::model(table = "dep_nodes")]
+pub struct DepNode {
+    #[id]
+    pub id: i64,
+    pub parent_id: Option<i64>,
+    pub name: String,
+}
+
+#[autumn_web::repository(
+    DepNode,
+    table = "dep_nodes",
+    dependent(PgDepNodeRepository, fk = "parent_id", on_delete = destroy)
+)]
+pub trait DepNodeRepository {}
+
 // ── Row-count helpers ─────────────────────────────────────────────────────────
 
 #[derive(diesel::QueryableByName)]
@@ -315,6 +417,15 @@ async fn setup_pool() -> (
         "CREATE TABLE dep_soft_comments (id BIGSERIAL PRIMARY KEY, post_id BIGINT NOT NULL REFERENCES dep_soft_posts(id), body TEXT NOT NULL, deleted_at TIMESTAMP NULL)",
         "CREATE TABLE dep_hard_posts (id BIGSERIAL PRIMARY KEY, title TEXT NOT NULL)",
         "CREATE TABLE dep_hard_soft_comments (id BIGSERIAL PRIMARY KEY, post_id BIGINT NOT NULL REFERENCES dep_hard_posts(id), body TEXT NOT NULL, deleted_at TIMESTAMP NULL)",
+        "CREATE TABLE dep3_posts (id BIGSERIAL PRIMARY KEY, title TEXT NOT NULL)",
+        "CREATE TABLE dep3_comments (id BIGSERIAL PRIMARY KEY, post_id BIGINT NOT NULL REFERENCES dep3_posts(id), body TEXT NOT NULL)",
+        "CREATE TABLE dep3_replies (id BIGSERIAL PRIMARY KEY, comment_id BIGINT NOT NULL REFERENCES dep3_comments(id), body TEXT NOT NULL)",
+        // Self-referential FK: parent_id references the same table. The FK is
+        // DEFERRABLE INITIALLY DEFERRED so a *cyclic* component can be hard-deleted
+        // within one transaction (the constraint is checked at COMMIT, by which
+        // point every row in the cycle is gone). ON DELETE has no DB-level cascade
+        // — the framework cascade is what must clear the whole component.
+        "CREATE TABLE dep_nodes (id BIGSERIAL PRIMARY KEY, parent_id BIGINT REFERENCES dep_nodes(id) DEFERRABLE INITIALLY DEFERRED, name TEXT NOT NULL)",
     ] {
         diesel::sql_query(stmt)
             .execute(&mut conn)
@@ -343,6 +454,14 @@ fn dependent_repository_surface_is_generated() {
     assert_is_fn(<PgDepSoftPostRepository as DepSoftPostRepository>::delete_by_id);
     assert_is_fn(<PgDepHardPostRepository as DepHardPostRepository>::delete_by_id);
     assert_is_fn(PgDepHardSoftCommentRepository::__autumn_apply_dependent_on_conn);
+    // #1739: the grandchild graph and the self-referential cycle repo both
+    // monomorphize — proving the recursive (boxed-future) cascade codegen
+    // type-checks, including a repository that cascades onto its own type.
+    assert_is_fn(<PgDep3PostRepository as Dep3PostRepository>::delete_by_id);
+    assert_is_fn(PgDep3CommentRepository::__autumn_apply_dependent_on_conn);
+    assert_is_fn(PgDep3ReplyRepository::__autumn_apply_dependent_on_conn);
+    assert_is_fn(<PgDepNodeRepository as DepNodeRepository>::delete_by_id);
+    assert_is_fn(PgDepNodeRepository::__autumn_apply_dependent_on_conn);
 }
 
 // ── Tests (require Docker) ────────────────────────────────────────────────────
@@ -436,6 +555,112 @@ async fn deleting_parent_cascades_and_leaves_no_orphans() {
     // AC4: each destroyed comment fired its before_delete hook.
     // (UFCS: `RunQueryDsl` is in scope, so disambiguate from diesel's `.load`.)
     assert_eq!(AtomicUsize::load(&DESTROYED_COMMENTS, Ordering::SeqCst), 3);
+}
+
+/// #1739: deleting a `Dep3Post` with `dependent(Comment, destroy)` where
+/// `Comment` has `dependent(Reply, destroy)` must recurse — leaving zero
+/// `Dep3Reply` (grandchild) rows and zero orphaned comments, in one
+/// transaction, with no FK error.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn deleting_parent_recurses_into_grandchildren() {
+    let (pool, _c) = setup_pool().await;
+    let mut conn = pool.get().await.expect("conn");
+
+    diesel::sql_query("INSERT INTO dep3_posts (id, title) VALUES (1, 'p')")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    // 2 comments, each with 2 replies → 4 grandchildren.
+    for c in 1..=2 {
+        diesel::sql_query(format!(
+            "INSERT INTO dep3_comments (id, post_id, body) VALUES ({c}, 1, 'c{c}')"
+        ))
+        .execute(&mut conn)
+        .await
+        .unwrap();
+        for r in 1..=2 {
+            let rid = c * 10 + r;
+            diesel::sql_query(format!(
+                "INSERT INTO dep3_replies (id, comment_id, body) VALUES ({rid}, {c}, 'r{rid}')"
+            ))
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        }
+    }
+
+    let repo = PgDep3PostRepository::with_pool_untracked(pool.clone());
+    repo.delete_by_id(1)
+        .await
+        .expect("recursive cascade must not FK-error");
+
+    assert_eq!(
+        count(
+            &mut conn,
+            "SELECT COUNT(*) AS n FROM dep3_posts WHERE id = 1"
+        )
+        .await,
+        0,
+        "parent gone"
+    );
+    assert_eq!(
+        count(&mut conn, "SELECT COUNT(*) AS n FROM dep3_comments").await,
+        0,
+        "all comments (children) destroyed"
+    );
+    assert_eq!(
+        count(&mut conn, "SELECT COUNT(*) AS n FROM dep3_replies").await,
+        0,
+        "#1739: all replies (grandchildren) must be recursively destroyed — zero left"
+    );
+}
+
+/// #1739 cycle guard: a self-referential `destroy` cascade over a cyclic graph
+/// (a descendant whose `parent_id` points back at an ancestor) must terminate,
+/// not infinite-loop, and remove the whole reachable component in one tx.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn self_referential_destroy_terminates_on_cycle() {
+    let (pool, _c) = setup_pool().await;
+    let mut conn = pool.get().await.expect("conn");
+
+    // Chain 1 → 2 → 3, then create a cycle by pointing 1's parent at 3.
+    // (Insert with NULL parents first to satisfy the FK, then wire the edges.)
+    for id in 1..=3 {
+        diesel::sql_query(format!(
+            "INSERT INTO dep_nodes (id, parent_id, name) VALUES ({id}, NULL, 'n{id}')"
+        ))
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    }
+    // 2's parent = 1, 3's parent = 2, 1's parent = 3 → a 3-cycle.
+    diesel::sql_query("UPDATE dep_nodes SET parent_id = 1 WHERE id = 2")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    diesel::sql_query("UPDATE dep_nodes SET parent_id = 2 WHERE id = 3")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    diesel::sql_query("UPDATE dep_nodes SET parent_id = 3 WHERE id = 1")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+
+    let repo = PgDepNodeRepository::with_pool_untracked(pool.clone());
+    // Must return (not hang / overflow). The visited-set guard breaks the cycle.
+    repo.delete_by_id(1)
+        .await
+        .expect("self-referential cascade over a cycle must terminate without error");
+
+    // The entire cyclic component is reachable from node 1 and removed.
+    assert_eq!(
+        count(&mut conn, "SELECT COUNT(*) AS n FROM dep_nodes").await,
+        0,
+        "#1739 cycle guard: the whole reachable cyclic component is destroyed, no rows left"
+    );
 }
 
 /// AC5: `dependent = restrict` blocks the delete with a typed 409 Conflict when
