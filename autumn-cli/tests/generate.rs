@@ -3151,8 +3151,8 @@ fn generate_auth_in_fresh_project_creates_expected_files() {
         routes.matches("session.insert(\"user_id\"").count(),
         4,
         "User auth routes should only write user_id as the generated account id key \
-         (the four session-establishment points: issue_remember_cookie, login, \
-         reset_password, confirm_email)"
+         (login, reset_password, confirm_email, and the remember-me restore path \
+         establish_remember_login, which must set the same identity keys as a fresh login)"
     );
     assert!(
         routes.contains("email.split_once('@')"),
