@@ -6577,10 +6577,13 @@ const MAGIC_LINK_TESTS_SECTION: &str = r#"
 ///      message whose body contains a `/login/magic/verify?token=…` URL.
 ///   2. POST /login/magic with an UNREGISTERED email → the SAME 200 response
 ///      and NO email is sent (non-enumerating).
-///   3. GET the captured verify URL → redirect to /account with a session
-///      cookie; a follow-up GET /account with that cookie returns 200.
-///   4. GET the same verify URL a SECOND time → generic failure (single-use).
-///   5. GET /login/magic/verify?token=deadbeef (unknown) → the SAME generic
+///   3. GET the captured verify URL → a 200 "Confirm sign-in" page (the token is
+///      NOT consumed on GET, so scanners/prefetch bots can't burn the link).
+///   4. POST /login/magic/verify with that token → redirect to /account with a
+///      session cookie; a follow-up GET /account with that cookie returns 200.
+///   5. POST /login/magic/verify with the SAME token again → generic failure
+///      (single-use).
+///   6. POST /login/magic/verify?token=deadbeef (unknown) → the SAME generic
 ///      failure page (no oracle).
 #[test]
 #[ignore = "requires a live database and a capturing mail transport"]
@@ -6605,13 +6608,28 @@ fn magic_link_request_and_consume_logs_in() {
     let verify_url = mail_link("/login/magic/verify?token=")
         .expect("the magic-link email must contain a /login/magic/verify?token= URL");
     let verify_path = url_path(&verify_url);
+    // The raw token from the emailed link; the confirm form POSTs it back.
+    let token = verify_url
+        .rsplit("token=")
+        .next()
+        .expect("verify URL must carry a token= query")
+        .to_owned();
 
-    // (3) Consuming the link logs the user in: the redirect carries a session
-    //     cookie that authenticates a follow-up /account request.
-    let consume = get(&base, &verify_path);
+    // (3) GETting the link renders a "Confirm sign-in" page and does NOT consume
+    //     the token — a scanner that only follows the GET can't burn the link.
+    let confirm = get(&base, &verify_path);
+    assert!(
+        confirm.contains(" 200"),
+        "GET verify must render the confirm page, not redirect/consume:\n{confirm}"
+    );
+
+    // (4) POSTing the confirmation consumes the token and logs the user in: the
+    //     redirect carries a session cookie that authenticates a follow-up
+    //     /account request.
+    let consume = post_form(&base, "/login/magic/verify", &format!("token={token}"), "");
     assert!(
         consume.contains("HTTP/1.1 30") || consume.contains("HTTP/1.0 30"),
-        "consuming the magic link should redirect to /account:\n{consume}"
+        "POSTing the magic-link confirmation should redirect to /account:\n{consume}"
     );
     let cookie = session_cookie(&consume).expect("the verify redirect must set a session cookie");
     assert!(
@@ -6619,8 +6637,8 @@ fn magic_link_request_and_consume_logs_in() {
         "the magic-link session must authenticate /account"
     );
 
-    // (4) A SECOND consume of the same token fails generically (single-use).
-    let second = get(&base, &verify_path);
+    // (5) A SECOND POST of the same token fails generically (single-use).
+    let second = post_form(&base, "/login/magic/verify", &format!("token={token}"), "");
     assert!(
         !second.contains("HTTP/1.1 30") && !second.contains("HTTP/1.0 30"),
         "a consumed magic link must not log in again:\n{second}"
@@ -6630,8 +6648,13 @@ fn magic_link_request_and_consume_logs_in() {
         "a re-used token must render the generic failure page:\n{second}"
     );
 
-    // (5) An unknown token yields the SAME generic failure (no oracle).
-    let unknown = get(&base, "/login/magic/verify?token=deadbeefdeadbeef");
+    // (6) An unknown token yields the SAME generic failure (no oracle).
+    let unknown = post_form(
+        &base,
+        "/login/magic/verify",
+        "token=deadbeefdeadbeef",
+        "",
+    );
     assert!(
         unknown.contains("invalid or has expired"),
         "an unknown token must render the same generic failure page:\n{unknown}"
@@ -7545,6 +7568,7 @@ fn auth_route_entries(totp: bool, magic_link: bool) -> Vec<String> {
         entries.extend([
             "routes::auth::magic_link_request_form".to_owned(),
             "routes::auth::magic_link_request".to_owned(),
+            "routes::auth::magic_link_verify_form".to_owned(),
             "routes::auth::magic_link_verify".to_owned(),
         ]);
     }
@@ -9069,13 +9093,21 @@ fn magic_link_routes_section_src(
 // - Tokens are 32-byte random values (`OsRng`); only their SHA-256 digest is
 //   persisted (`magic_link_tokens.token_digest`). The raw token appears only in
 //   the emailed link — never in the database, logs, or error reports.
-// - Single-use: `magic_link_verify` consumes the token atomically
+// - Scanner-safe verify: `GET /login/magic/verify?token=…` NEVER consumes the
+//   token — it only renders a "Confirm sign-in" page whose form POSTs the token
+//   back. Email link-scanners / prefetch bots that merely follow the GET can no
+//   longer burn a single-use link before the human clicks. Consumption happens
+//   in `POST /login/magic/verify` (`magic_link_verify`).
+// - Single-use: `magic_link_verify` (the POST) consumes the token atomically
 //   (`UPDATE … SET consumed_at = now WHERE consumed_at IS NULL AND expires_at > now
 //   RETURNING …`), so a second verify (or an expired/consumed/unknown token) all
-//   return the SAME generic failure page — no oracle.
+//   return the SAME generic failure page — no oracle. The GET confirm page is
+//   rendered identically regardless of token validity, so it is not an oracle either.
 // - Non-enumerating: `POST /login/magic` always renders the same "check your
 //   email" response whether or not the address exists.
 // - Rate-limited per-IP by the `#[throttle]` guard and per-email by a DB cooldown.
+//   The `POST /login/magic/verify` consume route is likewise per-IP throttled to
+//   bound token brute-forcing.
 // - `magic_link_verify` rotates the session id BEFORE establishing the
 //   authenticated session (session-fixation defense).
 
@@ -9217,6 +9249,11 @@ pub struct MagicLinkVerifyQuery {
     pub token: String,
 }
 
+#[derive(Deserialize)]
+pub struct MagicLinkVerifyForm {
+    pub token: String,
+}
+
 /// Generic magic-link failure page. Expired, consumed, unknown, and malformed
 /// tokens ALL render this identical page so nothing acts as an oracle (AC5).
 fn magic_link_invalid_page() -> Markup {
@@ -9228,23 +9265,59 @@ fn magic_link_invalid_page() -> Markup {
     })
 }
 
-/// `GET /login/magic/verify?token=…` — validate the token and, on success,
-/// establish an authenticated session.
+/// `GET /login/magic/verify?token=…` — render a "Confirm sign-in" page WITHOUT
+/// consuming the token.
+///
+/// Email link-scanners and prefetch/preview bots follow the GET before the human
+/// clicks; if the GET consumed the single-use token, those bots would burn the
+/// link. So the GET is side-effect-free: it just echoes the token into a hidden
+/// field of a form that POSTs back to `/login/magic/verify`, where the token is
+/// actually consumed. The page is rendered IDENTICALLY regardless of whether the
+/// token is valid, expired, or unknown — the POST surfaces the generic failure —
+/// so the confirm page is not an oracle.
+#[get("/login/magic/verify")]
+pub async fn magic_link_verify_form(
+    flash: Flash,
+    csrf: Option<CsrfToken>,
+    csrf_field: Option<CsrfFormField>,
+    Query(query): Query<MagicLinkVerifyQuery>,
+) -> AutumnResult<Markup> {
+    let flash_html = flash.render().await;
+    Ok(layout("Confirm sign-in", html! {
+        (flash_html)
+        h1 { "Confirm sign-in" }
+        p { "Click the button below to finish signing in to your account." }
+        form action="/login/magic/verify" method="post" {
+            @if let Some(ref csrf) = csrf { input type="hidden" name=(csrf_field.as_ref().map_or("_csrf", |f| f.0.as_str())) value=(csrf.token()); }
+            input type="hidden" name="token" value=(query.token);
+            button type="submit" { "Sign in" }
+        }
+        p { a href="/login" { "Back to login" } }
+    }))
+}
+
+/// `POST /login/magic/verify` — validate the token and, on success, establish an
+/// authenticated session. This is where the single-use token is consumed (the
+/// GET above only renders the confirmation page, so link-scanners can't burn it).
 ///
 /// Single-use (AC5): an atomic `UPDATE … RETURNING` stamps `consumed_at` while
 /// filtering on `consumed_at IS NULL` and `expires_at > now`, so a second
 /// verify of the same token — or an expired / consumed / unknown token — matches
 /// zero rows and is rejected with the SAME generic failure (no oracle).
-#[get("/login/magic/verify")]
+///
+/// A light per-IP `#[throttle]` (mirroring `POST /login/magic`) bounds token
+/// brute-forcing; a legitimate user only POSTs this route once per link.
+#[post("/login/magic/verify")]
+#[throttle(limit = 5, per = "1m", key = "ip")]
 pub async fn magic_link_verify(
     mut db: Db,
     State(state): State<AppState>,
     session: Session,
     MaybeClientIp(addr_ip): MaybeClientIp,
     headers: axum::http::HeaderMap,
-    Query(query): Query<MagicLinkVerifyQuery>,
+    Form(form): Form<MagicLinkVerifyForm>,
 ) -> AutumnResult<Response> {
-    let token_digest = sha256_hex(&query.token);
+    let token_digest = sha256_hex(&form.token);
     let now = chrono::Utc::now().naive_utc();
 
     // Atomic single-use consume. Only one concurrent verify can match.
@@ -9438,7 +9511,8 @@ with `--oauth`, `--passkeys`, and `--totp` on the same model.
 |--------|------|---------|------|
 | GET | `/login/magic` | `magic_link_request_form` | Public |
 | POST | `/login/magic` | `magic_link_request` | Public (rate-limited) |
-| GET | `/login/magic/verify?token=…` | `magic_link_verify` | Public |
+| GET | `/login/magic/verify?token=…` | `magic_link_verify_form` | Public |
+| POST | `/login/magic/verify` | `magic_link_verify` | Public (rate-limited) |
 
 ### How It Works
 
@@ -9449,9 +9523,16 @@ with `--oauth`, `--passkeys`, and `--totp` on the same model.
    verify link.
 3. The response is **always** the same "check your email" page whether or not the
    address exists — so the endpoint cannot be used to enumerate accounts.
-4. The user clicks the link (`GET /login/magic/verify?token=…`). The token is
-   validated and atomically consumed; on success the session id is **rotated**
-   (session-fixation defense) and an authenticated session is established.
+4. The user clicks the link (`GET /login/magic/verify?token=…`). This renders a
+   lightweight **"Confirm sign-in"** page and does **not** consume the token —
+   so email link-scanners / prefetch bots that merely follow the GET can't burn
+   the single-use link before the human clicks. The page is rendered identically
+   whether the token is valid, expired, or unknown (no oracle).
+5. Submitting that form (`POST /login/magic/verify`) is where the token is
+   validated and **atomically consumed**; on success the session id is
+   **rotated** (session-fixation defense) and an authenticated session is
+   established. Expired / consumed / unknown tokens all render the same generic
+   failure page.
 
 ### Configuration Knobs
 
@@ -9459,7 +9540,7 @@ with `--oauth`, `--passkeys`, and `--totp` on the same model.
 |------|----------|---------|---------|
 | `MAGIC_LINK_TTL_MINUTES` | const in `src/routes/auth.rs` | `15` | Link lifetime (TTL). Must be ≤ 15 min for a tight window; tune here, or wire it to `state.config()` to source from `autumn.toml`. |
 | `MAGIC_LINK_EMAIL_COOLDOWN_SECONDS` | const in `src/routes/auth.rs` | `60` | Per-email cooldown: suppresses re-minting a token for the same address within the window (email-bomb throttle). |
-| `#[throttle(limit = 5, per = "1m", key = "ip")]` | attribute on `POST /login/magic` | 5/min/IP | Per-IP rate limit via autumn's existing rate-limit middleware. |
+| `#[throttle(limit = 5, per = "1m", key = "ip")]` | attribute on `POST /login/magic` and `POST /login/magic/verify` | 5/min/IP | Per-IP rate limit via autumn's existing rate-limit middleware (request minting + token brute-force bound). |
 
 ### Security Guarantees
 
@@ -9467,11 +9548,16 @@ with `--oauth`, `--passkeys`, and `--totp` on the same model.
   (and constant-time-padded latency) whether or not the address is registered.
 - **Digest-only storage**: only `sha256_hex(raw_token)` is stored; the raw token
   lives only in the emailed link, never in the database, logs, or error reports.
-- **Single-use**: `magic_link_verify` consumes the token atomically
+- **Scanner-safe verify**: `GET /login/magic/verify` only renders a "Confirm
+  sign-in" page and NEVER consumes the token — email link-scanners / prefetch
+  bots that follow the GET can't burn the single-use link. Consumption happens on
+  the `POST` when the human clicks "Sign in".
+- **Single-use**: `magic_link_verify` (the `POST`) consumes the token atomically
   (`UPDATE … SET consumed_at = now WHERE consumed_at IS NULL AND expires_at > now`),
   so a second verify of the same token fails.
 - **Generic failure (no oracle)**: expired, already-consumed, unknown, and
-  malformed tokens all render the same generic failure page.
+  malformed tokens all render the same generic failure page; the GET confirm page
+  is likewise rendered identically regardless of token validity.
 - **Configurable TTL**: tokens expire after `MAGIC_LINK_TTL_MINUTES` (default 15).
 - **Rate-limited**: per-IP (`#[throttle]`) and per-email (DB cooldown).
 - **Session-fixation defense**: the session id is rotated before the
@@ -10962,7 +11048,70 @@ mod tests {
         );
         assert!(
             routes.contains("#[get(\"/login/magic/verify\")]"),
-            "must emit GET /login/magic/verify endpoint"
+            "must emit GET /login/magic/verify endpoint (renders confirm page)"
+        );
+        assert!(
+            routes.contains("#[post(\"/login/magic/verify\")]"),
+            "must emit POST /login/magic/verify endpoint (consumes token)"
+        );
+    }
+
+    #[test]
+    fn magic_link_verify_get_renders_confirm_without_consuming() {
+        // Scanner-safety: the GET verify handler renders a "Confirm sign-in" page
+        // and must NOT consume the token or establish a session. Consumption +
+        // login lives entirely in the POST handler.
+        let tmp = project_with_main();
+        let routes = magic_link_routes(tmp.path());
+
+        // GET handler body: from its signature up to the POST consume handler.
+        let get_start = routes
+            .find("pub async fn magic_link_verify_form(")
+            .expect("GET confirm handler present");
+        let get_end = routes[get_start..]
+            .find("pub async fn magic_link_verify(")
+            .map(|o| get_start + o)
+            .expect("POST verify handler follows the GET form");
+        let get_body = &routes[get_start..get_end];
+        assert!(
+            !get_body.contains("magic_link_tokens::consumed_at.eq(Some(now))"),
+            "GET verify must NOT consume the token: {get_body}"
+        );
+        assert!(
+            !get_body.contains("session.insert(state.auth_session_key()"),
+            "GET verify must NOT establish an authenticated session: {get_body}"
+        );
+        // It renders a POST-back confirmation form carrying the token.
+        assert!(
+            get_body.contains("form action=\"/login/magic/verify\" method=\"post\"")
+                && get_body.contains("name=\"token\" value=(query.token)"),
+            "GET verify must render a form that POSTs the token back: {get_body}"
+        );
+
+        // POST handler body: it DOES consume + establish the session.
+        let post_body = magic_link_verify_body(&routes);
+        assert!(
+            post_body.contains("magic_link_tokens::consumed_at.eq(Some(now))"),
+            "POST verify must consume the token: {post_body}"
+        );
+        assert!(
+            post_body.contains("session.insert(state.auth_session_key()"),
+            "POST verify must establish an authenticated session: {post_body}"
+        );
+        // The POST consume route is per-IP throttled to bound token brute-forcing.
+        let post_attr = routes
+            .find("#[post(\"/login/magic/verify\")]")
+            .expect("POST verify attr present");
+        let after = &routes[post_attr..];
+        let throttle_rel = after
+            .find("#[throttle(")
+            .expect("POST verify throttle attr present");
+        let handler_rel = after
+            .find("pub async fn magic_link_verify(")
+            .expect("POST verify handler present");
+        assert!(
+            throttle_rel < handler_rel && after[..handler_rel].contains("key = \"ip\""),
+            "POST verify must carry a per-IP #[throttle] between the method attr and handler: {after}"
         );
     }
 
@@ -11460,6 +11609,7 @@ mod tests {
         for handler in [
             "routes::auth::magic_link_request_form",
             "routes::auth::magic_link_request",
+            "routes::auth::magic_link_verify_form",
             "routes::auth::magic_link_verify",
         ] {
             assert!(
