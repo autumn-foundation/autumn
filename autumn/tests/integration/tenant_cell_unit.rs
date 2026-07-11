@@ -195,3 +195,34 @@ fn scratch_insert_replace_accounts_net_delta() {
     assert_eq!(err.in_use, 900);
     assert_eq!(cell.tracked_bytes(), 900);
 }
+
+/// Scratch accounting must charge a value's allocation *capacity*, not its
+/// length — the cell owns the whole allocation, so a `Vec` with large spare
+/// capacity (or a buffer truncated after decoding) must count its capacity
+/// against the quota.
+#[test]
+fn scratch_insert_accounts_capacity_not_length() {
+    let reg = autumn_web::tenant_cell::TenantCellRegistry::new();
+    let cell = reg.get_or_create("t", 1000);
+
+    // A Vec with large spare capacity but small length must be charged its
+    // capacity — the cell owns the whole allocation.
+    let mut v = Vec::with_capacity(800);
+    v.extend_from_slice(&[0u8; 8]); // len 8, capacity >= 800
+    let cap = v.capacity();
+    cell.scratch_insert("k", v).unwrap();
+    assert_eq!(cell.tracked_bytes(), cap);
+    assert!(cell.tracked_bytes() >= 800);
+
+    // Removing releases the full capacity back to zero.
+    let _ = cell.scratch_remove("k");
+    assert_eq!(cell.tracked_bytes(), 0);
+
+    // An over-capacity empty Vec is now rejected by the quota (it was accepted
+    // when accounting by len()).
+    let big = Vec::<u8>::with_capacity(5000); // len 0, capacity >= 5000
+    let err = cell.scratch_insert("k", big).unwrap_err();
+    assert_eq!(err.quota, 1000);
+    assert!(err.requested >= 5000);
+    assert_eq!(cell.tracked_bytes(), 0);
+}

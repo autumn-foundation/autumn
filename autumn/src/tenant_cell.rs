@@ -218,7 +218,12 @@ impl TenantCell {
     /// Store `value` in the tenant's scratch buffer under `key`, charging only
     /// the *net* byte delta against the quota when replacing an existing entry.
     ///
-    /// Replacing a key reserves at most `new_len - old_len` bytes (releasing the
+    /// Accounting is by the value's allocation *capacity* (the bytes the cell
+    /// actually owns), not its length, so a `Vec` with large spare capacity or a
+    /// buffer truncated after decoding is still charged for the whole
+    /// allocation it keeps resident.
+    ///
+    /// Replacing a key reserves at most `new_cap - old_cap` bytes (releasing the
     /// difference when the value shrinks), so a same-size or shrinking replace
     /// can never transiently overshoot the quota and spuriously fail.
     ///
@@ -236,17 +241,17 @@ impl TenantCell {
         value: Vec<u8>,
     ) -> Result<(), QuotaExceeded> {
         let key = key.into();
-        let new_len = value.len();
+        let new_cap = value.capacity();
         let mut scratch = self
             .inner
             .scratch
             .lock()
             .expect("tenant cell scratch lock poisoned");
-        let old_len = scratch.get(&key).map_or(0, Vec::len);
-        if new_len > old_len {
-            self.inner.reserve(new_len - old_len)?;
-        } else if new_len < old_len {
-            self.inner.release(old_len - new_len);
+        let old_cap = scratch.get(&key).map_or(0, Vec::capacity);
+        if new_cap > old_cap {
+            self.inner.reserve(new_cap - old_cap)?;
+        } else if new_cap < old_cap {
+            self.inner.release(old_cap - new_cap);
         }
         scratch.insert(key, value);
         drop(scratch);
@@ -270,6 +275,9 @@ impl TenantCell {
 
     /// Remove the scratch value for `key`, releasing its bytes.
     ///
+    /// Releases the value's full allocation *capacity* (the bytes the cell
+    /// owned), matching how [`scratch_insert`](Self::scratch_insert) charged it.
+    ///
     /// # Panics
     ///
     /// Panics if the tenant cell's scratch lock is poisoned.
@@ -284,7 +292,7 @@ impl TenantCell {
             scratch.remove(key)
         };
         let removed = removed?;
-        self.inner.release(removed.len());
+        self.inner.release(removed.capacity());
         Some(removed)
     }
 }
