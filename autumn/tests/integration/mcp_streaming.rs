@@ -381,12 +381,34 @@ async fn first_progress_arrives_before_the_slow_tool_completes() {
     }
     let first_at = first_at.expect("a first frame");
     let done_at = done_at.expect("a completion frame carrying the slow tail");
-    // Assert ORDERING, not a fixed wall-clock budget: the first signal must
-    // arrive strictly before completion. This holds no matter how slow or
-    // loaded the runner is, because the 300ms tail is produced only after the
-    // first frame is already on the wire.
+    // Cheap ordering check documents intent, but on its own it is too weak: a
+    // buffered regression that stalled the inner handler until it finished would
+    // still emit the `started` progress frame and the final `done` frame as two
+    // back-to-back outer chunks *after* the sleep, and `first_at < done_at`
+    // would still pass even though no signal arrived before the slow tail.
     assert!(
         first_at < done_at,
         "first signal must precede completion (first at {first_at:?}, done at {done_at:?})"
+    );
+    // The real discriminator is the GAP: the handler sleeps 300ms between the
+    // first frame and the `done` frame, so a genuinely streamed response forces
+    // at least ~300ms between the two timestamps, while a buffered response
+    // collapses that gap to ~0.
+    //
+    // Why asserting a floor (>= 250ms) is robust and NOT runner-flaky: the gap
+    // is dominated by the handler's fixed `tokio::time::sleep`, which is a
+    // FLOOR, never a ceiling. `tokio::time::sleep` never fires early, and a
+    // slow/loaded runner only pushes *both* timestamps later together, keeping
+    // the gap >= the sleep. A buffered regression is the only thing that drives
+    // the gap toward zero. Do NOT "simplify" this back to bare ordering, and do
+    // NOT reintroduce an absolute ceiling like `first_at < 250ms` — that would
+    // be the runner-sensitive assertion this test was de-flaked to remove.
+    let gap = done_at.saturating_sub(first_at);
+    assert!(
+        gap >= Duration::from_millis(250),
+        "progress must arrive before the slow tail completes: gap between first \
+         frame and done was {gap:?}, expected >= 250ms (handler sleeps 300ms \
+         between progress and completion; a near-zero gap means the response was \
+         buffered rather than streamed)"
     );
 }
