@@ -125,6 +125,48 @@ fn resolve_fk_and_name(
 /// associations can target the same model without colliding (e.g.
 /// `#[has_many(Post, fk = author_id, name = authored)]` plus
 /// `#[has_many(Post, fk = approver_id, name = approved)]`).
+/// Diagnose a `dependent = <action>` / `on_delete = <action>` key on a model
+/// association attribute.
+///
+/// Faithfully wiring this model-declared spelling to the cascade machinery
+/// needs a runtime type-erased dispatch refactor (the model spelling names the
+/// child *model*, whereas the cascade needs the child *repository* type), so it
+/// is deferred (#1702). Until then we must not silently accept-and-ignore it:
+/// recognize the spelling, validate the action, and return a directed error —
+/// an unknown-action error for a bad spelling, otherwise guidance toward the
+/// repository-attribute cascade (or, on `#[belongs_to]`, that the key is
+/// meaningless there because the child foreign key lives on that side).
+fn dependent_attr_error(kind: AssocKind, key: &syn::Ident, action: &str) -> syn::Error {
+    if kind == AssocKind::BelongsTo {
+        return syn::Error::new_spanned(
+            key,
+            "`dependent`/`on_delete` is not valid on `#[belongs_to]`: the child \
+             foreign key lives on this (belongs_to) side, so there is no \
+             dependent to cascade — declare the cascade on the parent's \
+             `#[has_many]`/`#[has_one]` (and, for now, on the repository \
+             attribute) instead",
+        );
+    }
+    // Accept exactly the actions the repository-attribute `dependent(...)`
+    // parser accepts (see repository.rs).
+    match action {
+        "destroy" | "delete_all" | "nullify" | "restrict" => syn::Error::new_spanned(
+            key,
+            "`dependent = <action>` on `#[has_many]`/`#[has_one]` is not yet \
+             wired; declare the dependent cascade on the repository instead, \
+             e.g. `#[autumn_web::repository(Model, dependent(PgChildRepository, \
+             fk = \"...\", on_delete = <action>))]` (see issue #1702)",
+        ),
+        other => syn::Error::new_spanned(
+            key,
+            format!(
+                "unknown dependent action `{other}`; expected one of \
+                 `destroy`, `delete_all`, `nullify`, `restrict`"
+            ),
+        ),
+    }
+}
+
 fn parse_assoc_attr(
     attr: &syn::Attribute,
     kind: AssocKind,
@@ -160,6 +202,8 @@ fn parse_assoc_attr(
                     explicit_through = Some(value);
                 } else if key == "target_fk" {
                     explicit_target_fk = Some(value);
+                } else if key == "dependent" || key == "on_delete" {
+                    return Err(dependent_attr_error(kind, &key, &value));
                 } else {
                     return Err(syn::Error::new_spanned(
                         &key,
@@ -920,6 +964,151 @@ fn validate_attrs(field: &Field) -> Vec<&syn::Attribute> {
         .iter()
         .filter(|a| a.path().is_ident("validate"))
         .collect()
+}
+
+/// `validator` validators that cannot be soundly enforced on the generated
+/// `UpdateModel` `Patch<T>` fields: either they have NO `Patch<T>` per-field
+/// trait impl (struct-level / cross-field rules), or their `Patch<T>` impl
+/// inverts our absent-field skip semantics (`does_not_contain`). See
+/// `validate_attrs_for_patch` for the full rationale.
+const NON_PATCH_VALIDATORS: &[&str] = &[
+    "custom",
+    "must_match",
+    "nested",
+    "credit_card",
+    "non_control_character",
+    "does_not_contain",
+];
+
+/// `validator` validators whose `Patch<T>` per-field impl (in `autumn/src/hooks.rs`)
+/// delegates to `T`, but for which `validator` provides **no `impl … for
+/// Option<T>`** — so they cannot be enforced on an `Option<_>`-typed model
+/// field's `UpdateModel` `Patch<T>` field.
+///
+/// Background (#1719 / Codex P2): the `#[derive(Validate)]` on `NewModel`
+/// syntactically unwraps `Option<Inner>` and calls the validator on the inner
+/// `Inner` (e.g. `String`), so `#[validate(ip)] ip: Option<String>` compiles
+/// on create. But `UpdateModel`'s field is `Patch<Option<String>>`; the derive
+/// does NOT recognise `Patch<…>` as an `Option`, so it calls the validator on
+/// the whole `Patch<Option<String>>`. Our `impl<T: ValidateIp> ValidateIp for
+/// Patch<T>` then requires `Option<String>: ValidateIp`. In `validator` 0.20,
+/// `ValidateIp` is supplied ONLY by the blanket `impl<T: ToString> ValidateIp
+/// for T` (validation/ip.rs:13) — there is NO `impl ValidateIp for Option<T>`
+/// and `Option<String>` is not `ToString`/`Display`, so `Option<String>:
+/// ValidateIp` is unsatisfied and `UpdateModel` **fails to compile**.
+///
+/// The other per-field validators our `Patch<T>` block implements are NOT
+/// affected because `validator` 0.20 DOES ship an `Option<T>` impl for each:
+/// `length` (validation/length.rs:115), `range` (validation/range.rs:65),
+/// `email` (validation/email.rs:99), `url` (validation/urls.rs:56), `contains`
+/// (validation/contains.rs:15), and even `regex` (validation/regex.rs:76). So
+/// `ip` is the sole Option-incompatible validator in our supported set.
+///
+/// These are filtered from the PATCH path **only when the field is
+/// `Option<…>`-typed**: on a non-`Option` field (e.g. `#[validate(ip)] ip:
+/// String`) `Patch<String>: ValidateIp` holds via the `ToString` blanket, so
+/// `ip` must stay enforced on update there. On create, `ip` still runs for the
+/// `Option` field via the derive's `Option`-unwrap on `NewModel`.
+const OPTION_INCOMPATIBLE_VALIDATORS: &[&str] = &["ip"];
+
+/// Like [`validate_attrs`], but tailored for the `UpdateModel` `Patch<T>` fields
+/// (#1719): drop the nested validators that `Patch<T>` cannot enforce.
+///
+/// `NewModel` fields carry the bare `T` and derive `validator::Validate`
+/// directly, so they keep every validator verbatim. `UpdateModel` fields are
+/// `Patch<T>`, which only implements validator's per-field *declarative* traits
+/// (`length`, `email`, `url`, `range`, `contains`, `ip`, `regex`, `required`,
+/// …). The validators in [`NON_PATCH_VALIDATORS`] (`custom`, `must_match`,
+/// `nested`, `credit_card`, `non_control_character`) have no `Patch<T>` impl,
+/// so propagating them verbatim would break `UpdateModel` compilation even
+/// though `NewModel` still compiles — a latent footgun for a user who adds e.g.
+/// `#[validate(custom(...))]` to a model field.
+///
+/// `required` is deliberately NOT in the denylist (#1719 / Codex P2): it must
+/// propagate so the `UpdateModel` rejects an explicit `null` on a required
+/// field. `Patch<T>` implements `ValidateRequired` with tri-state semantics
+/// (`Unchanged` skips, `Clear`/`Set(None)` fail); see the impl in
+/// `autumn/src/hooks.rs`. `required` is only sensible on `Option`-typed fields,
+/// whose patch field is `Patch<Option<T>>` and satisfies the impl's
+/// `Option<T>: ValidateRequired` bound. (`required` on a non-`Option` field
+/// never compiles even on `NewModel`, since `validator` supplies
+/// `ValidateRequired` only for `Option<T>`, so no filtering is needed for it.)
+///
+/// `does_not_contain` is also filtered, for a subtler reason: it does compile
+/// on `Patch<T>` (validator supplies it via the blanket
+/// `impl<T: ValidateContains> ValidateDoesNotContain for T`, defined as
+/// `!validate_contains(...)`), but that inverts our skip semantics. Our
+/// `ValidateContains for Patch<T>` returns `true` for an absent field so
+/// `contains` is *skipped*; the blanket flips that to `false`, so an OMITTED
+/// `does_not_contain` field would spuriously *fail* with 422. Since one
+/// `ValidateContains` value can't satisfy both skip directions (and coherence
+/// blocks a direct `ValidateDoesNotContain for Patch<T>` impl), we drop
+/// `does_not_contain` from the PATCH path and enforce it on create only.
+/// `contains` itself stays on the PATCH path — its absent→pass behaviour is
+/// correct.
+///
+/// This is a *denylist* (not an allowlist): unknown/future validators pass
+/// through untouched, so a newly-supported declarative validator is never
+/// silently dropped.
+///
+/// Additionally, when the model field is syntactically `Option<…>`, the
+/// [`OPTION_INCOMPATIBLE_VALIDATORS`] (e.g. `ip`) are ALSO dropped: `validator`
+/// ships no `impl … for Option<T>` for them, so `Patch<Option<T>>` would not
+/// implement the corresponding per-field trait and `UpdateModel` would fail to
+/// compile. They still run on create (the `NewModel` derive unwraps the
+/// `Option`) and remain enforced on non-`Option` update fields. See
+/// [`OPTION_INCOMPATIBLE_VALIDATORS`] for the full derivation.
+///
+/// `Option<…>` is detected the same way `validator` itself detects it — by the
+/// last path segment's ident being `Option` (via [`is_option_type`]) — which
+/// also matches fully-qualified `std::option::Option` / `core::option::Option`.
+/// Limitation: a type *alias* to `Option` is not detected (no worse than the
+/// derive's own behaviour, which also inspects the syntactic type).
+///
+/// Documented limitation: `custom`/`must_match`/`nested`/`does_not_contain`/etc.
+/// are enforced on create (via `NewModel`) but NOT on the PATCH update path; a
+/// follow-up may add merged-model validation for cross-field/custom rules.
+/// (`required` IS enforced on the PATCH path via the tri-state `Patch<T>` impl.)
+fn validate_attrs_for_patch(field: &Field) -> Vec<syn::Attribute> {
+    let field_is_option = is_option_type(&field.ty);
+    let mut out = Vec::new();
+    for attr in field.attrs.iter().filter(|a| a.path().is_ident("validate")) {
+        let syn::Meta::List(list) = &attr.meta else {
+            // A bare `#[validate]` with no nested items — nothing to filter.
+            out.push(attr.clone());
+            continue;
+        };
+        let parser = syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated;
+        let Ok(nested) = parser.parse2(list.tokens.clone()) else {
+            // If the nested metas don't parse, fall back to verbatim
+            // pass-through rather than silently dropping validation.
+            out.push(attr.clone());
+            continue;
+        };
+        let kept: Vec<syn::Meta> = nested
+            .into_iter()
+            .filter(|m| {
+                let Some(id) = m.path().get_ident() else {
+                    return true;
+                };
+                if NON_PATCH_VALIDATORS.iter().any(|v| id == *v) {
+                    return false;
+                }
+                // Option-incompatible validators (e.g. `ip`) only break the
+                // PATCH path on `Option<…>`-typed fields; keep them otherwise.
+                if field_is_option && OPTION_INCOMPATIBLE_VALIDATORS.iter().any(|v| id == *v) {
+                    return false;
+                }
+                true
+            })
+            .collect();
+        if kept.is_empty() {
+            // Filtering emptied the `#[validate(...)]` — drop the attr entirely.
+            continue;
+        }
+        out.push(syn::parse_quote!(#[validate(#(#kept),*)]));
+    }
+    out
 }
 
 /// Filter out framework-specific attributes (`#[id]`, `#[indexed]`, `#[validate]`,
@@ -2788,8 +2977,19 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         .collect();
 
     // Build UpdateX fields:
-    // - Regular mutable fields: Patch<T> (no #[validate] — validation only
-    //   applies to NewX and the merged model)
+    // - Regular mutable fields: Patch<T>, propagating the field's `#[validate]`
+    //   attributes (#1719). The struct derives `validator::Validate` below, and
+    //   `Patch<T>` implements validator's per-field traits (see
+    //   `autumn/src/hooks.rs`), so a failing declarative rule (`length`, `email`,
+    //   `url`, `range`, `contains`, …) on a `Set` value surfaces as a 422 on
+    //   PATCH/PUT, while an absent (`Unchanged`/`Clear`) field is skipped —
+    //   mirroring the create path. `required` is the one non-skip rule: its
+    //   `Patch<T>` impl fails `Clear`/`Set(None)` so a PATCH can't null a
+    //   required column. Non-declarative/struct-level validators (`custom`,
+    //   `must_match`, `nested`, `credit_card`, `non_control_character`) have no
+    //   `Patch<T>` impl and are filtered out here by `validate_attrs_for_patch`
+    //   (they still run on `NewX`); see that helper for the documented
+    //   create-vs-update limitation.
     // - #[lock_version] field: plain required T (the client supplies the
     //   version they read; the framework increments it atomically)
     let mut update_fields: Vec<TokenStream> = fields_for_new
@@ -2797,7 +2997,13 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         .map(|f| {
             let ident = &f.ident;
             let ty = &f.ty;
+            // #1719: `Patch<T>` only implements validator's per-field
+            // declarative traits, so non-declarative/struct-level validators
+            // (`custom`, `must_match`, `nested`, …) must be stripped here or the
+            // `UpdateModel` would fail to compile. `NewModel` keeps them all.
+            let val_attrs = validate_attrs_for_patch(f);
             quote! {
+                #(#val_attrs)*
                 #[serde(default)]
                 pub #ident: ::autumn_web::hooks::Patch<#ty>
             }
@@ -3957,6 +4163,7 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
         #[derive(#update_debug_derive Clone, Default)]
         #[derive(::serde::Serialize, ::serde::Deserialize)]
+        #validate_derive
         #vis struct #update_name {
             #(#update_fields,)*
         }
@@ -4610,6 +4817,126 @@ mod tests {
         assert!(resolve_associations(&model, &attrs).is_err());
     }
 
+    // ── `dependent` / `on_delete` on model associations (#1702) ──────────
+    // The full model-declared cascade wiring is deferred (it needs a
+    // runtime type-erased dispatch refactor). Until then the parser must
+    // RECOGNIZE the `dependent = <action>` / `on_delete = <action>` spelling,
+    // validate the action, and emit a DIRECTED error pointing users at the
+    // repository-attribute cascade — never silently accept-and-ignore it.
+
+    #[test]
+    fn has_many_dependent_destroy_directs_to_repository() {
+        let model: syn::Ident = syn::parse_quote!(Post);
+        let attrs: Vec<syn::Attribute> =
+            vec![syn::parse_quote!(#[has_many(Comment, dependent = destroy)])];
+        let Err(err) = resolve_associations(&model, &attrs) else {
+            panic!("expected an error");
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("repository"),
+            "expected directed guidance toward the repository attribute, got: {msg}"
+        );
+        assert!(
+            msg.contains("#1702"),
+            "expected the issue reference #1702, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn has_many_on_delete_destroy_directs_to_repository() {
+        // The `on_delete = <action>` spelling is an accepted alias for
+        // `dependent = <action>` and must be directed the same way (#1702).
+        let model: syn::Ident = syn::parse_quote!(Post);
+        let attrs: Vec<syn::Attribute> =
+            vec![syn::parse_quote!(#[has_many(Comment, on_delete = destroy)])];
+        let Err(err) = resolve_associations(&model, &attrs) else {
+            panic!("expected an error");
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("repository"),
+            "expected directed guidance toward the repository attribute, got: {msg}"
+        );
+        assert!(
+            msg.contains("#1702"),
+            "expected the issue reference #1702, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn has_many_dependent_unknown_action_is_rejected() {
+        let model: syn::Ident = syn::parse_quote!(Post);
+        let attrs: Vec<syn::Attribute> =
+            vec![syn::parse_quote!(#[has_many(Comment, dependent = bogus)])];
+        let Err(err) = resolve_associations(&model, &attrs) else {
+            panic!("expected an error");
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("bogus"),
+            "expected the unknown action named, got: {msg}"
+        );
+        assert!(
+            msg.contains("destroy")
+                && msg.contains("delete_all")
+                && msg.contains("nullify")
+                && msg.contains("restrict"),
+            "expected the valid actions listed, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn has_one_dependent_nullify_directs_to_repository() {
+        let model: syn::Ident = syn::parse_quote!(User);
+        let attrs: Vec<syn::Attribute> =
+            vec![syn::parse_quote!(#[has_one(Profile, dependent = nullify)])];
+        let Err(err) = resolve_associations(&model, &attrs) else {
+            panic!("expected an error");
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("repository"),
+            "expected directed guidance toward the repository attribute, got: {msg}"
+        );
+        assert!(
+            msg.contains("#1702"),
+            "expected the issue reference #1702, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn belongs_to_dependent_is_rejected_as_meaningless() {
+        // The child FK lives on the belongs_to side, so there is no dependent
+        // to cascade — `dependent`/`on_delete` here is meaningless.
+        let model: syn::Ident = syn::parse_quote!(Post);
+        let attrs: Vec<syn::Attribute> =
+            vec![syn::parse_quote!(#[belongs_to(User, dependent = destroy)])];
+        let Err(err) = resolve_associations(&model, &attrs) else {
+            panic!("expected an error");
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("belongs_to"),
+            "expected a belongs_to-specific rejection, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn has_many_without_dependent_still_parses() {
+        // Regression guard: recognizing `dependent` must not disturb normal
+        // `#[has_many]` parsing.
+        let model: syn::Ident = syn::parse_quote!(Post);
+        let attrs: Vec<syn::Attribute> = vec![
+            syn::parse_quote!(#[has_many(Comment)]),
+            syn::parse_quote!(#[has_many(Comment, fk = "post_id")]),
+        ];
+        let assocs = resolve_associations(&model, &attrs).expect("parse ok");
+        assert_eq!(assocs.len(), 2);
+        assert_eq!(assocs[0].fk, "post_id");
+        assert_eq!(assocs[1].fk, "post_id");
+    }
+
     #[test]
     fn name_override_disambiguates_same_target() {
         // Two has_many to the same target, distinguished by `name =`.
@@ -5134,6 +5461,282 @@ mod tests {
         assert!(
             generated.contains("normalize :: trim") && generated.contains("normalize :: downcase"),
             "must chain the trim+downcase builtins: {generated}"
+        );
+    }
+
+    #[test]
+    fn update_model_drops_non_declarative_validators_but_new_model_keeps_them() {
+        // #1719: `Patch<T>` implements validator's per-field declarative traits
+        // (length/email/…) but NOT `custom`/`must_match`/`nested`/etc. The
+        // `UpdateModel` fields must therefore drop the non-declarative validators
+        // (or they'd fail to compile), while the `NewModel` keeps every validator.
+        let output = model_macro(
+            TokenStream::new(),
+            quote! {
+                pub struct User {
+                    #[id]
+                    pub id: i64,
+                    #[validate(length(min = 1), custom(function = "v"))]
+                    pub name: String,
+                }
+            },
+        );
+        let generated = output.to_string();
+
+        // Slice the `NewUser` struct body (up to its closing brace).
+        let new_start = generated
+            .find("struct NewUser")
+            .expect("NewUser struct must be generated");
+        let new_end = new_start
+            + generated[new_start..]
+                .find('}')
+                .expect("NewUser struct must close");
+        let new_section = &generated[new_start..new_end];
+        assert!(
+            new_section.contains("length"),
+            "NewUser must keep the `length` validator: {new_section}"
+        );
+        assert!(
+            new_section.contains("custom"),
+            "NewUser must keep the `custom` validator: {new_section}"
+        );
+
+        // Slice the `UpdateUser` struct body (up to its closing brace).
+        let upd_start = generated
+            .find("struct UpdateUser")
+            .expect("UpdateUser struct must be generated");
+        let upd_end = upd_start
+            + generated[upd_start..]
+                .find('}')
+                .expect("UpdateUser struct must close");
+        let upd_section = &generated[upd_start..upd_end];
+        assert!(
+            upd_section.contains("length"),
+            "UpdateUser must keep the declarative `length` validator: {upd_section}"
+        );
+        assert!(
+            !upd_section.contains("custom"),
+            "UpdateUser must NOT carry the non-declarative `custom` validator: {upd_section}"
+        );
+    }
+
+    #[test]
+    fn update_model_drops_does_not_contain_but_new_model_keeps_it() {
+        // #1719 follow-up: `does_not_contain` reaches `Patch<T>` through
+        // validator's blanket `impl<T: ValidateContains> ValidateDoesNotContain`,
+        // which computes `!validate_contains(...)`. Our `ValidateContains for
+        // Patch<T>` returns `true` for an absent field (so `contains` passes),
+        // which inverts to `false` for `does_not_contain` — an OMITTED patch
+        // field would then spuriously fail with 422. So `does_not_contain` must
+        // be dropped from the `UpdateModel` `Patch<T>` fields (enforced on create
+        // via `NewModel` only), while `contains`/`length` must be RETAINED.
+        let output = model_macro(
+            TokenStream::new(),
+            quote! {
+                pub struct Doc {
+                    #[id]
+                    pub id: i64,
+                    #[validate(length(min = 1), contains(pattern = "ok"), does_not_contain(pattern = "bad"))]
+                    pub name: String,
+                }
+            },
+        );
+        let generated = output.to_string();
+
+        // Slice the `NewDoc` struct body (up to its closing brace).
+        let new_start = generated
+            .find("struct NewDoc")
+            .expect("NewDoc struct must be generated");
+        let new_end = new_start
+            + generated[new_start..]
+                .find('}')
+                .expect("NewDoc struct must close");
+        let new_section = &generated[new_start..new_end];
+        assert!(
+            new_section.contains("does_not_contain"),
+            "NewDoc must keep the `does_not_contain` validator: {new_section}"
+        );
+        assert!(
+            new_section.contains("contains"),
+            "NewDoc must keep the `contains` validator: {new_section}"
+        );
+        assert!(
+            new_section.contains("length"),
+            "NewDoc must keep the `length` validator: {new_section}"
+        );
+
+        // Slice the `UpdateDoc` struct body (up to its closing brace).
+        let upd_start = generated
+            .find("struct UpdateDoc")
+            .expect("UpdateDoc struct must be generated");
+        let upd_end = upd_start
+            + generated[upd_start..]
+                .find('}')
+                .expect("UpdateDoc struct must close");
+        let upd_section = &generated[upd_start..upd_end];
+        assert!(
+            !upd_section.contains("does_not_contain"),
+            "UpdateDoc must NOT carry `does_not_contain` (inverts the Patch skip \
+             value into a spurious 422 for omitted fields): {upd_section}"
+        );
+        // Not over-filtered: `contains` and `length` are still valid on Patch<T>.
+        assert!(
+            upd_section.contains("contains"),
+            "UpdateDoc must keep the declarative `contains` validator: {upd_section}"
+        );
+        assert!(
+            upd_section.contains("length"),
+            "UpdateDoc must keep the declarative `length` validator: {upd_section}"
+        );
+    }
+
+    #[test]
+    fn update_model_retains_required_on_patch_fields() {
+        // #1719 / Codex P2: `required` MUST propagate to the `UpdateModel`
+        // `Patch<Option<T>>` fields. A PATCH/PUT sending explicit JSON `null`
+        // deserializes to `Patch::Clear`; if `required` were dropped the update
+        // would silently write SQL `NULL`, violating the model's `required`
+        // contract (create still rejects `None`). The tri-state
+        // `impl ValidateRequired for Patch<T>` (autumn/src/hooks.rs) enforces it:
+        // `Unchanged` skips, `Clear`/`Set(None)` fail (422). So both `NewUser`
+        // and `UpdateUser` must carry `required`.
+        let output = model_macro(
+            TokenStream::new(),
+            quote! {
+                pub struct User {
+                    #[id]
+                    pub id: i64,
+                    #[validate(required)]
+                    pub nickname: Option<String>,
+                }
+            },
+        );
+        let generated = output.to_string();
+
+        // Slice the `NewUser` struct body (up to its closing brace).
+        let new_start = generated
+            .find("struct NewUser")
+            .expect("NewUser struct must be generated");
+        let new_end = new_start
+            + generated[new_start..]
+                .find('}')
+                .expect("NewUser struct must close");
+        let new_section = &generated[new_start..new_end];
+        assert!(
+            new_section.contains("required"),
+            "NewUser must keep the `required` validator: {new_section}"
+        );
+
+        // Slice the `UpdateUser` struct body (up to its closing brace).
+        let upd_start = generated
+            .find("struct UpdateUser")
+            .expect("UpdateUser struct must be generated");
+        let upd_end = upd_start
+            + generated[upd_start..]
+                .find('}')
+                .expect("UpdateUser struct must close");
+        let upd_section = &generated[upd_start..upd_end];
+        assert!(
+            upd_section.contains("required"),
+            "UpdateUser must RETAIN the `required` validator so a PATCH sending \
+             `null` (Patch::Clear) is rejected with 422: {upd_section}"
+        );
+    }
+
+    #[test]
+    fn update_model_drops_ip_only_on_option_fields_new_model_keeps_all() {
+        // #1719 / Codex P2: `validator` provides no `impl ValidateIp for
+        // Option<T>` (only the `impl<T: ToString> ValidateIp for T` blanket),
+        // so `Patch<Option<String>>: ValidateIp` is unsatisfied and the
+        // generated `UpdateModel` would fail to compile for an `Option<String>`
+        // + `#[validate(ip)]` field. We therefore drop `ip` from the PATCH
+        // fields ONLY when the field is `Option<…>`, while:
+        //   * keeping `ip` on a non-`Option` field (`Patch<String>: ValidateIp`
+        //     holds via the `ToString` blanket),
+        //   * keeping `length` on the `Option` field (validator ships an
+        //     `Option<T>` impl for it, so it must NOT be over-filtered),
+        //   * keeping every validator on `NewModel` (its derive unwraps Option).
+        let output = model_macro(
+            TokenStream::new(),
+            quote! {
+                pub struct Server {
+                    #[id]
+                    pub id: i64,
+                    #[validate(ip, length(min = 1))]
+                    pub ip: Option<String>,
+                    #[validate(ip)]
+                    pub ip2: String,
+                    #[validate(length(min = 1))]
+                    pub name: Option<String>,
+                }
+            },
+        );
+        let generated = output.to_string();
+
+        // Slice the `NewServer` struct body (up to its closing brace).
+        let new_start = generated
+            .find("struct NewServer")
+            .expect("NewServer struct must be generated");
+        let new_end = new_start
+            + generated[new_start..]
+                .find('}')
+                .expect("NewServer struct must close");
+        let new_section = &generated[new_start..new_end];
+        // NewServer keeps `ip` on BOTH ip fields (the derive unwraps Option):
+        // the combined attr on the Option field and the bare attr on ip2.
+        assert!(
+            new_section.contains("validate (ip , length"),
+            "NewServer must keep the `ip` (and `length`) validator on the \
+             Option<String> field: {new_section}"
+        );
+        assert!(
+            new_section.contains("validate (ip)"),
+            "NewServer must keep the `ip` validator on the non-Option field: {new_section}"
+        );
+
+        // Slice the `UpdateServer` struct body (up to its closing brace).
+        let upd_start = generated
+            .find("struct UpdateServer")
+            .expect("UpdateServer struct must be generated");
+        let upd_end = upd_start
+            + generated[upd_start..]
+                .find('}')
+                .expect("UpdateServer struct must close");
+        let upd_section = &generated[upd_start..upd_end];
+
+        // A `#[validate(ip)]` attr renders as `validate (ip)`; the pre-fix
+        // combined attr on the Option field would render `validate (ip ,
+        // length (min = 1))`. After the fix, the ONLY surviving `ip` validator
+        // in UpdateServer is the non-Option `ip2` field, so `validate (ip`
+        // must appear exactly once.
+        assert_eq!(
+            upd_section.matches("validate (ip").count(),
+            1,
+            "UpdateServer must retain `ip` on ONLY the non-Option `ip2` field \
+             (the Option<String> `ip` field must drop it — no `impl ValidateIp \
+             for Option<T>`): {upd_section}"
+        );
+        // The retained one is exactly `validate (ip)` (bare), i.e. ip2's attr.
+        assert!(
+            upd_section.contains("validate (ip)"),
+            "UpdateServer's non-Option `ip2` field must RETAIN the `ip` \
+             validator (Patch<String>: ValidateIp holds via the ToString \
+             blanket): {upd_section}"
+        );
+        // The Option `ip` field's combined attr must NOT survive with `ip`.
+        assert!(
+            !upd_section.contains("validate (ip ,"),
+            "UpdateServer's Option<String> `ip` field must DROP the `ip` \
+             validator: {upd_section}"
+        );
+        // `length` on the Option fields must NOT be over-filtered (validator
+        // ships an `Option<T>` impl for it): both the `ip` field's leftover
+        // `length` and the `name` field's `length` remain.
+        assert_eq!(
+            upd_section.matches("length (min = 1)").count(),
+            2,
+            "UpdateServer must KEEP `length` on both Option fields (`ip` \
+             leftover after dropping ip, and `name`): {upd_section}"
         );
     }
 

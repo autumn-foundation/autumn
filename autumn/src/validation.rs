@@ -317,6 +317,42 @@ mod tests {
     }
 
     #[test]
+    fn update_patch_field_validates_via_derive() {
+        // #1719: a generated `UpdateModel` derives `validator::Validate` and
+        // carries `#[validate(...)]` on `Patch<T>` fields. A `Set` value runs
+        // the rule (and surfaces a per-field error keyed by the field name),
+        // while an absent (`Unchanged`/`Clear`) field is skipped.
+        use crate::hooks::Patch;
+
+        #[derive(validator::Validate)]
+        struct UpdatePost {
+            #[validate(length(min = 1))]
+            title: Patch<String>,
+        }
+
+        // `Set("")` violates `length(min = 1)` → 422-shaped field error map.
+        let bad = UpdatePost {
+            title: Patch::Set(String::new()),
+        };
+        let errors = validator::Validate::validate(&bad).unwrap_err();
+        let map = validation_errors_to_map(&errors);
+        assert!(map.contains_key("title"));
+        assert_eq!(map["title"][0], "validation failed: length");
+
+        // Absent field → rule skipped → passes.
+        let unchanged = UpdatePost {
+            title: Patch::Unchanged,
+        };
+        assert!(validator::Validate::validate(&unchanged).is_ok());
+
+        // `Set` with a satisfying value → passes.
+        let good = UpdatePost {
+            title: Patch::Set("hello".into()),
+        };
+        assert!(validator::Validate::validate(&good).is_ok());
+    }
+
+    #[test]
     fn validate_ext_ok() {
         #[derive(validator::Validate)]
         struct GoodInput {

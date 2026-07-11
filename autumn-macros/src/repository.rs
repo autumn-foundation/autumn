@@ -9153,17 +9153,21 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // of scope per #1395); a single routed shard iterates normally.
     let batch_cross_shard_guard = if config.sharded && config.tenant_scoped {
         quote! {
+            // Reject on the runtime `across_tenants` flag alone — independent of
+            // whether a live shard set (`__autumn_shards`) is loaded. Gating on
+            // `__autumn_shards.is_some()` missed the no-shard-set case (e.g. a
+            // repo built via `with_pool_untracked`, where `__autumn_shards` is
+            // `None`), which slipped past the guard and silently streamed a
+            // PARTIAL result over only the current pool (#1692).
             if self.across_tenants {
-                if self.__autumn_shards.is_some() {
-                    return ::core::result::Result::Err(
-                        ::autumn_web::AutumnError::bad_request_msg(
-                            "cross-shard batched iteration is not supported: \
-                             across_tenants() cannot fan find_in_batches/\
-                             find_each out across shards; iterate each shard \
-                             separately via from_shard(...) instead"
-                        )
-                    );
-                }
+                return ::core::result::Result::Err(
+                    ::autumn_web::AutumnError::bad_request_msg(
+                        "cross-shard batched iteration is not supported: \
+                         across_tenants() cannot fan find_in_batches/\
+                         find_each out across shards; iterate each shard \
+                         separately via from_shard(...) instead"
+                    )
+                );
             }
         }
     } else {
@@ -10598,7 +10602,6 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         };
         let update_body = if has_policy {
             quote! {
-                #validate_patch_idempotency
                 let __existing = match repo.on_primary().find_by_id(id).await {
                     ::core::result::Result::Ok(::core::option::Option::Some(existing)) => existing,
                     ::core::result::Result::Ok(::core::option::Option::None) => {
@@ -10626,6 +10629,14 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         ::core::result::Result::Err(err)
                     );
                 }
+                // #1719 follow-up (Codex P2): validate the patch only after the
+                // existence load (404) and the `__check_policy_scoped` gate
+                // (403), so a policy-gated PUT/PATCH with an invalid body still
+                // reports missing/unauthorized before unprocessable. Validation
+                // is a pure check on the already-decoded `patch` and, like the
+                // policy gate above, sits before the pure `__replay_response`
+                // read, so it cannot affect idempotency replay semantics.
+                #validate_patch_idempotency
                 if let ::core::option::Option::Some(response) =
                     ::autumn_web::idempotency::__replay_response(&__autumn_idempotency_replay)
                 {
@@ -11621,14 +11632,30 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         let base = count_impl;
         let dispatch = quote! {
             // Fan out before acquiring a parent-shard connection (see find_all).
+            // count is legitimately mergeable across shards, so with a shard set
+            // present we sum per-shard counts. Without one (e.g. a repo built via
+            // `with_pool_untracked`, where `__autumn_shards` is `None`), an
+            // across-tenant count would bind a NULL tenant predicate and silently
+            // return a PARTIAL result over only the current pool, so we reject
+            // rather than fall through to the single-pool count (#1692).
             if self.across_tenants {
-                if let ::core::option::Option::Some(ref __shards) = self.__autumn_shards {
-                    let __counts = __shards.fan_out_shards(|__shard| {
-                        let __sub = self.__autumn_for_shard(__shard);
-                        async move { __sub.__autumn_count_one_shard().await }
-                    }).await?;
-                    return ::core::result::Result::Ok(__counts.into_iter().sum());
-                }
+                let ::core::option::Option::Some(ref __shards) = self.__autumn_shards else {
+                    return ::core::result::Result::Err(
+                        ::autumn_web::AutumnError::bad_request_msg(
+                            "cross-shard count requires a configured shard set: \
+                             across_tenants() cannot fan count out across shards \
+                             without a shard set (the repository was built \
+                             without shard context, e.g. via \
+                             with_pool_untracked); build it with shard context \
+                             instead"
+                        )
+                    );
+                };
+                let __counts = __shards.fan_out_shards(|__shard| {
+                    let __sub = self.__autumn_for_shard(__shard);
+                    async move { __sub.__autumn_count_one_shard().await }
+                }).await?;
+                return ::core::result::Result::Ok(__counts.into_iter().sum());
             }
             let mut conn = self.__autumn_acquire_read_conn().await?;
             #base
@@ -13297,6 +13324,86 @@ mod tests {
     }
 
     #[test]
+    fn repository_macro_find_in_batches_rejects_across_tenants_without_shard_set() {
+        // §1692: a sharded + tenant-scoped `find_in_batches`/`find_each` must
+        // reject `across_tenants()` batched iteration purely on the runtime
+        // `across_tenants` flag — NOT on a live shard set being present. Gating on
+        // `__autumn_shards.is_some()` missed the no-shard-set case (e.g. a repo
+        // built via `with_pool_untracked`, where `__autumn_shards` is `None`),
+        // which slipped past the guard and silently streamed a PARTIAL result over
+        // only the current pool instead of rejecting.
+        let generated = repository_macro(
+            quote! { Post, tenant_scoped, sharded },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        // Isolate the generated `fetch_batch_after` body so the assertions below
+        // target the batch guard specifically.
+        let pos = generated
+            .find("async fn fetch_batch_after")
+            .expect("sharded+tenant_scoped batched iteration must be generated");
+        let section = &generated[pos..];
+
+        // The rejection guard must be present in the batch body.
+        assert!(
+            section.contains("cross-shard batched iteration is not supported"),
+            "sharded+tenant_scoped find_in_batches must reject across_tenants: {section}"
+        );
+        // The guard must key off the runtime `across_tenants` flag.
+        assert!(
+            section.contains("across_tenants"),
+            "batch guard must reference the across_tenants flag: {section}"
+        );
+        // The guard condition must NOT depend on a shard set being loaded —
+        // `__autumn_shards.is_some()` gating is exactly the no-shard-set hole this
+        // fix closes. Check the tokens up to the rejection so we assert on the
+        // guard condition, not on unrelated fan-out code elsewhere.
+        let guard_end = section
+            .find("cross-shard batched iteration is not supported")
+            .expect("rejection message must be present");
+        let guard_cond = &section[..guard_end];
+        assert!(
+            !guard_cond.contains("__autumn_shards . is_some")
+                && !guard_cond.contains("__autumn_shards.is_some"),
+            "batch guard condition must not depend on __autumn_shards being Some: {guard_cond}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_count_rejects_across_tenants_without_shard_set() {
+        // §1692: a sharded + tenant-scoped `count` fans out across shards when a
+        // shard set is loaded (count is legitimately mergeable). But when
+        // `across_tenants()` is set and NO shard set is configured (e.g. a repo
+        // built via `with_pool_untracked`, where `__autumn_shards` is `None`), the
+        // old `if let Some(..)` gate fell through to a single-pool count and
+        // silently returned a PARTIAL result. It must instead reject.
+        let generated = repository_macro(
+            quote! { Post, tenant_scoped, sharded },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        // Isolate the generated `count` dispatch body.
+        let pos = generated
+            .find("async fn count")
+            .expect("sharded+tenant_scoped count must be generated");
+        let section = &generated[pos..pos + 900];
+
+        // The fan-out path (shard set present) must be preserved.
+        assert!(
+            section.contains("fan_out_shards"),
+            "sharded+tenant_scoped count must still fan out across shards: {section}"
+        );
+        // The no-shard-set case must reject rather than fall through to a
+        // single-pool count.
+        assert!(
+            section.contains("cross-shard count requires a configured shard set"),
+            "sharded+tenant_scoped count must reject across_tenants without a shard set: {section}"
+        );
+    }
+
+    #[test]
     fn repository_macro_grouped_aggregate_excludes_null_group_keys() {
         // §1364: because the declared key type is non-nullable (and `Option<K>`
         // is a compile error), a NULL group would fail to deserialize at
@@ -13799,6 +13906,41 @@ mod tests {
         assert!(
             section.contains("MaybeValidate (& patch)"),
             "update handler must validate the patch payload: {section}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_api_policy_update_validates_after_policy_check() {
+        // #1719 follow-up: on the policy-backed update handler, payload
+        // validation (422) must run *after* the existence load (404) and the
+        // `__check_policy_scoped` authorization gate (403), so a policy-gated
+        // PUT/PATCH with an invalid body still returns 404/403 before 422.
+        // Validation-first here regressed the ordering (Codex P2).
+        let generated = repository_macro(
+            quote! { Post, api = "/api/posts", policy = PostPolicy },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        let start = generated
+            .find("async fn post_api_update")
+            .expect("policy update handler must be generated");
+        let rest = &generated[start..];
+        let end = rest
+            .find("fn __autumn_route_info_post_api_update")
+            .unwrap_or(rest.len());
+        let section = &rest[..end];
+
+        let policy_at = section
+            .find("__check_policy_scoped")
+            .expect("policy update handler must run the scoped policy check");
+        let validate_at = section
+            .find("autumn_maybe_validate")
+            .expect("policy update handler must validate the patch payload");
+        assert!(
+            policy_at < validate_at,
+            "policy check (403) and existence load (404) must run before \
+             patch validation (422): {section}"
         );
     }
 

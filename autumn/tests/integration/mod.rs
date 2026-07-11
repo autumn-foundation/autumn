@@ -181,6 +181,8 @@ mod security;
 mod seo;
 mod server_timing;
 #[cfg(feature = "db")]
+mod shard_across_tenants_no_shard_set;
+#[cfg(feature = "db")]
 mod shard_map_guard;
 #[cfg(feature = "db")]
 mod sharding_across_tenants;
@@ -206,6 +208,7 @@ mod throttle_route;
 mod time_zone_integration;
 mod transactional_test_integration;
 mod tx_isolation_retry_integration;
+mod validate_patch_option_ip;
 mod webhook_outbound;
 #[cfg(feature = "maud")]
 mod widget_css_coverage;
