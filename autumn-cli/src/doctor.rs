@@ -4330,19 +4330,19 @@ fn resolve_offsite_backup_data() -> OffsiteBackupData {
     let bucket = offsite.s3.bucket.clone();
     let endpoints_match = normalize_doctor_endpoint(offsite.s3.endpoint.as_deref())
         == normalize_doctor_endpoint(cfg.storage.s3.endpoint.as_deref());
-    let same_bucket = bucket
-        .as_deref()
-        .map(str::trim)
-        .filter(|b| !b.is_empty())
-        .is_some_and(|ob| {
-            cfg.storage
-                .s3
-                .bucket
-                .as_deref()
-                .map(str::trim)
-                .filter(|b| !b.is_empty())
-                == Some(ob)
-        });
+    // P2 #17 (doctor twin of the runtime P2 #16 guard): the app's `[storage.s3]`
+    // bucket only counts as the shared-storage destination when the RESOLVED
+    // storage backend is actually S3. A stale `[storage.s3]` bucket left in config
+    // while the app runs on the local/disabled backend is inert — it is not where
+    // the app writes blobs — so it must not trip the shared-bucket failure (which
+    // would false-fail `autumn doctor --strict`).
+    let storage_is_s3 = cfg.storage.backend == autumn_web::storage::StorageBackend::S3;
+    let shares_app_bucket = offsite_shares_active_app_bucket(
+        storage_is_s3,
+        bucket.as_deref(),
+        cfg.storage.s3.bucket.as_deref(),
+        endpoints_match,
+    );
     OffsiteBackupData {
         configured: true,
         bucket,
@@ -4356,8 +4356,32 @@ fn resolve_offsite_backup_data() -> OffsiteBackupData {
             denv.as_ref(),
             offsite.s3.secret_access_key_env.as_deref(),
         ),
-        shared_bucket_without_optin: same_bucket && endpoints_match && !offsite.allow_shared_bucket,
+        shared_bucket_without_optin: shares_app_bucket && !offsite.allow_shared_bucket,
     }
+}
+
+/// Whether the offsite destination shares the app's ACTIVE S3 storage bucket
+/// (P2 #17, doctor twin of the runtime P2 #16 guard). The app's `[storage.s3]`
+/// bucket counts only when `storage_is_s3` (the resolved backend is S3); a stale
+/// bucket on a local/disabled backend is inert and never a shared-bucket
+/// conflict. When active, the buckets must match (trimmed, non-empty) AND the
+/// endpoints must be equivalent. Pure for credential-safe unit testing.
+fn offsite_shares_active_app_bucket(
+    storage_is_s3: bool,
+    offsite_bucket: Option<&str>,
+    app_bucket: Option<&str>,
+    endpoints_match: bool,
+) -> bool {
+    fn trimmed(b: Option<&str>) -> Option<&str> {
+        b.map(str::trim).filter(|s| !s.is_empty())
+    }
+    if !storage_is_s3 {
+        return false;
+    }
+    matches!(
+        (trimmed(offsite_bucket), trimmed(app_bucket)),
+        (Some(a), Some(b)) if a == b
+    ) && endpoints_match
 }
 
 /// Whether the environment variable NAMED by `name` is present and non-empty in
@@ -5121,6 +5145,57 @@ mod tests {
         let r = check_offsite_backup_impl(&data);
         assert_eq!(r.status, CheckStatus::Fail);
         assert!(r.detail.unwrap().contains("same as the app"));
+    }
+
+    #[test]
+    fn doctor_shared_bucket_only_flags_when_storage_backend_is_s3() {
+        // P2 #17 (doctor twin of P2 #16): a stale [storage.s3] bucket equal to the
+        // offsite bucket must NOT be flagged as shared unless the backend is S3 —
+        // otherwise `autumn doctor --strict` false-fails on a local/disabled app.
+
+        // backend=local/disabled (storage_is_s3=false): inert bucket, never shared
+        // — even with an identical bucket name and matching endpoints.
+        assert!(!offsite_shares_active_app_bucket(
+            false,
+            Some("shared"),
+            Some("shared"),
+            true
+        ));
+        // Feeding that into the check: not shared → no --strict failure.
+        let local_data = OffsiteBackupData {
+            configured: true,
+            bucket: Some("shared".to_owned()),
+            access_key_env: Some("K".to_owned()),
+            secret_key_env: Some("S".to_owned()),
+            access_key_env_set: true,
+            secret_key_env_set: true,
+            shared_bucket_without_optin: false, // gated off by backend != S3
+        };
+        assert_ne!(
+            check_offsite_backup_impl(&local_data).status,
+            CheckStatus::Fail
+        );
+
+        // backend=s3 (storage_is_s3=true): same bucket + same endpoint → shared.
+        assert!(offsite_shares_active_app_bucket(
+            true,
+            Some("shared"),
+            Some("shared"),
+            true
+        ));
+        // Different bucket, or mismatched endpoint, is NOT shared even on S3.
+        assert!(!offsite_shares_active_app_bucket(
+            true,
+            Some("offsite"),
+            Some("appbucket"),
+            true
+        ));
+        assert!(!offsite_shares_active_app_bucket(
+            true,
+            Some("shared"),
+            Some("shared"),
+            false
+        ));
     }
 
     #[test]
