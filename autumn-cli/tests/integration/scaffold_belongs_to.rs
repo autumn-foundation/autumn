@@ -223,6 +223,67 @@ fn index_view_renders_parent_label_via_loaded_map() {
     );
 }
 
+/// `autumn new` + `generate model Post title:String` + `generate scaffold
+/// Comment body:Text post:references --sharded`, returning `comments.rs`.
+fn belongs_to_sharded_routes(name: &str) -> (tempfile::TempDir, String) {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    run_autumn_ok(tmp.path(), &["new", name]);
+    let project = tmp.path().join(name);
+    run_autumn_ok(&project, &["generate", "model", "Post", "title:String"]);
+    run_autumn_ok(
+        &project,
+        &[
+            "generate",
+            "scaffold",
+            "Comment",
+            "body:Text",
+            "post:references",
+            "--sharded",
+        ],
+    );
+    let routes = fs::read_to_string(project.join("src/routes/comments.rs")).unwrap();
+    (tmp, routes)
+}
+
+#[test]
+fn sharded_index_renders_parent_label_via_loaded_map() {
+    // Issue #1146's index parent-display (a `<select>`-free VIEW concern) must
+    // survive `--sharded` too: the sharded index handler already threads a
+    // `ShardedDb` (for `from_shard`) and the `{name}_select_options` loader is
+    // generated against that same connection type, so the index reuses the
+    // label map rather than falling back to the raw FK id.
+    let (_tmp, routes) = belongs_to_sharded_routes("bt-sharded-index-app");
+
+    // Sharded handler stays sharded: ShardedDb extractor (promoted to `mut`
+    // because it must run the loader) + from_shard, never a bare `Db`.
+    assert!(
+        routes.contains("mut db: ShardedDb"),
+        "sharded index must take a mutable ShardedDb extractor:\n{routes}"
+    );
+    assert!(
+        routes.contains("PgCommentRepository::from_shard(&db)"),
+        "sharded index must still build its repo via from_shard(&db):\n{routes}"
+    );
+    assert!(
+        !routes.contains("mut db: Db"),
+        "sharded index must not fall back to a bare Db extractor:\n{routes}"
+    );
+    // The parent-label map is loaded and the index column looks the label up —
+    // identical to the non-sharded path.
+    assert!(
+        routes.contains("let post_id_labels: std::collections::HashMap<String, String>"),
+        "sharded index must load a parent-label map:\n{routes}"
+    );
+    assert!(
+        routes.contains("post_id_select_options(&mut db).await?"),
+        "the sharded label map must be built from the ShardedDb-aware loader:\n{routes}"
+    );
+    assert!(
+        routes.contains("post_id_labels.get(&row.post_id.to_string())"),
+        "the sharded index column must look the label up from the map:\n{routes}"
+    );
+}
+
 #[test]
 fn live_validation_keeps_parent_display_on_index_and_show() {
     // Issue #1146's index/show parent-display rendering is generator-emitted

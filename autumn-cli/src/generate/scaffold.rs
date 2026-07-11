@@ -2021,32 +2021,41 @@ fn render_routes_file(
         String::new()
     };
 
-    // For non-live paths, generate the data_table columns and call. The
-    // sharded index uses the id-based columns (`columns_let`); the plain
-    // non-sharded index promotes displayable `references` columns to render
-    // the parent's label from a per-view label map (issue #1146,
-    // `index_columns_labeled` + `index_label_loads`). Sharded/live keep the id
-    // rendering — their connection shape (`ShardedDb`) / list markup (a `<ul>`
-    // of ids) don't take the plain `Db`-loaded map.
+    // For non-live paths, generate the data_table columns and call. Both the
+    // plain AND sharded index promote displayable `references` columns to
+    // render the parent's label from a per-view label map (issue #1146,
+    // `index_columns_labeled` + `index_label_loads`): the sharded index handler
+    // already threads a `ShardedDb`, its `{name}_select_options` loaders are
+    // generated with `db_ty` (= `ShardedDb`), and the sharded `show` handler
+    // already loads labels through the same connection — so the index reuses
+    // that mechanism rather than falling back to raw ids. Only the `--live` SSE
+    // list (a `<ul>` of ids, no data-table) keeps id rendering.
     let columns_let = if live {
         String::new()
     } else {
         render_columns_vec(pascal_name, plural, fields, &reference_displays, false)
     };
-    let index_label_loads = if live || sharded {
+    let index_label_loads = if live {
         String::new()
     } else {
         render_index_reference_label_loads(&display_reference_fields, &reference_displays)
     };
-    // `mut db: Db` is only added to the plain index signature when there is at
-    // least one label map to load — otherwise it would be an unused extractor.
+    // The plain index gains `mut db: Db` only when there is a label map to load
+    // (otherwise an unused extractor); the sharded index always has a
+    // `ShardedDb` (for `from_shard`), promoted to `mut` when it must also run
+    // the loader.
     let index_db_param = if index_label_loads.is_empty() {
         ""
     } else {
         "mut db: Db,\n    "
     };
+    let sharded_index_db = if index_label_loads.is_empty() {
+        "db: ShardedDb"
+    } else {
+        "mut db: ShardedDb"
+    };
     let index_columns_labeled = if index_label_loads.is_empty() {
-        columns_let.clone()
+        columns_let
     } else {
         render_columns_vec(pascal_name, plural, fields, &reference_displays, true)
     };
@@ -2098,12 +2107,12 @@ pub async fn index(
 #[get("/{plural}")]
 pub async fn index(
     page_req: PageRequest,
-    db: ShardedDb,
+    {sharded_index_db},
     flash: Flash,
 ) -> AutumnResult<Markup> {{
     let repo = Pg{pascal_name}Repository::from_shard(&db);
     let page_data: Page<{pascal_name}> = repo.page(&page_req).await?;
-{columns_let}    Ok({layout_fn}("{pascal_name} index", {cp_index}{flash_arg}, html! {{
+{index_label_loads}{index_columns_labeled}    Ok({layout_fn}("{pascal_name} index", {cp_index}{flash_arg}, html! {{
         h1 {{ "{pascal_name}s" }}
         a href="/{plural}/new" {{ "New {pascal_name}" }}
         {list_render}
