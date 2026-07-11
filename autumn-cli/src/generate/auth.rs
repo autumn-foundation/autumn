@@ -9240,6 +9240,17 @@ pub async fn magic_link_verify(
     // rotation below destroys that session id, so drop its row now.
     untrack_current_session(&mut db, &session).await?;
 
+    // Magic-link proves EMAIL POSSESSION, not password knowledge. Drop any
+    // `reauth_pw_ok` "password already verified, awaiting TOTP" marker left by an
+    // unfinished /reauth in this browser BEFORE parking (TOTP) or promoting
+    // (direct) the session — otherwise a later /reauth POST could skip the
+    // password and mint a fresh step-up claim off an email-only login. This is
+    // cleared here (before the 2FA branch, which returns early) so BOTH the
+    // parked-pending and direct paths are covered, mirroring
+    // `establish_remember_login` (issue #833/#1397). Plain string key, so a
+    // magic-link-only build (no --totp) still compiles.
+    session.remove("reauth_pw_ok").await;
+
     // For 2FA-enabled accounts, park the session and redirect to /login/verify
     // before granting a full session — a magic link proves email possession,
     // not TOTP possession (mirrors confirm_email).
@@ -11198,6 +11209,62 @@ mod tests {
         assert!(
             !body.contains("totp_pending"),
             "magic-link-only build must not reference TOTP pending keys: {body}"
+        );
+    }
+
+    #[test]
+    fn magic_link_verify_clears_reauth_pw_ok_before_parking_and_promoting() {
+        // Magic-link proves EMAIL possession, not password knowledge. An
+        // unfinished /reauth in this browser may have left a `reauth_pw_ok`
+        // "password already verified" marker; `rotate_id()` preserves it. If it
+        // survived a magic-link login, a later /reauth POST could skip the
+        // password and mint a fresh step-up claim off an email-only login. Verify
+        // the marker is scrubbed on BOTH the parked (TOTP) and direct paths,
+        // mirroring `establish_remember_login` (issue #833/#1397).
+        const REMOVE: &str = "session.remove(\"reauth_pw_ok\").await;";
+
+        // Under --totp the marker must be dropped BEFORE the 2FA early-return
+        // parks the session (which returns before the direct-path cleanup).
+        let routes_totp = render_routes_file("User", "user", "users", &[], true, true);
+        let body_totp = magic_link_verify_body(&routes_totp);
+        assert!(
+            body_totp.contains(REMOVE),
+            "magic-link verify must clear reauth_pw_ok under --totp: {body_totp}"
+        );
+        let remove_at = body_totp
+            .find(REMOVE)
+            .expect("reauth_pw_ok scrub present under --totp");
+        let park_return = body_totp
+            .find("return Ok(redirect_to(\"/login/verify\"));")
+            .expect("2FA early-return present");
+        assert!(
+            remove_at < park_return,
+            "reauth_pw_ok must be cleared BEFORE the session is parked: {body_totp}"
+        );
+        let auth_insert_totp = body_totp
+            .find("session.insert(state.auth_session_key()")
+            .expect("direct auth-session insert present");
+        assert!(
+            remove_at < auth_insert_totp,
+            "reauth_pw_ok must be cleared BEFORE the direct-path promotion: {body_totp}"
+        );
+
+        // Without --totp the direct path must ALSO scrub the marker before it
+        // promotes the session, and use a plain string key so the magic-link-only
+        // build still compiles (no TOTP-only session-key reference).
+        let routes = render_routes_file("User", "user", "users", &[], false, true);
+        let body = magic_link_verify_body(&routes);
+        assert!(
+            body.contains(REMOVE),
+            "magic-link verify must clear reauth_pw_ok without --totp: {body}"
+        );
+        let remove_at = body.find(REMOVE).expect("reauth_pw_ok scrub present");
+        let auth_insert = body
+            .find("session.insert(state.auth_session_key()")
+            .expect("auth key insert present");
+        assert!(
+            remove_at < auth_insert,
+            "reauth_pw_ok must be cleared BEFORE the auth key insert: {body}"
         );
     }
 
