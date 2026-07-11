@@ -5433,13 +5433,50 @@ async fn update_redis_blocked_gauges(
 #[cfg(feature = "redis")]
 const REDIS_QUEUE_DEPTH_SURVEY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// Maximum records sampled per queue (and from the due-delayed set) when
-/// tallying the per-job-type `queued` gauge, matching the blocked survey's
-/// bounded `MGET` approach so the survey stays cheap on deep queues. Per-queue
-/// `depth` still comes from the exact `LLEN`, so only the per-name tally is
-/// bounded.
+/// Maximum records sampled per queue when tallying the per-job-type `queued`
+/// gauge, matching the blocked survey's bounded `MGET` approach so the survey
+/// stays cheap on deep queues. Per-queue `depth` still comes from the exact
+/// `LLEN`, so only the per-name tally is bounded for queue lists.
+///
+/// This same value doubles as the **page size** (not a hard cap) for the
+/// due-delayed ZSET scan: that scan pages through the entire ready backlog one
+/// `REDIS_QUEUE_DEPTH_SAMPLE`-sized window at a time so per-queue depth,
+/// per-name, and oldest-age stay exact across a large delayed/retry burst,
+/// while per-page memory stays bounded to a single page.
 #[cfg(feature = "redis")]
 const REDIS_QUEUE_DEPTH_SAMPLE: isize = 1024;
+
+/// Safety bound on the total number of due-delayed entries scanned in a single
+/// queue-depth survey. The due scan pages through the ready backlog exactly
+/// (see [`REDIS_QUEUE_DEPTH_SAMPLE`]); this cap (64 pages) keeps a pathological
+/// burst from turning that scan into an unbounded hammer on Redis. If the scan
+/// reaches this cap with a full final page (more may remain), it stops and logs
+/// a single `warn!` so the reported depth is never silently truncated.
+#[cfg(feature = "redis")]
+const REDIS_QUEUE_DEPTH_DUE_SCAN_CAP: usize = 65_536;
+
+/// Fold a page of due-delayed records into the running per-queue depth/oldest
+/// and per-name tallies. Pure and I/O-free (the async survey does the Redis
+/// `ZRANGEBYSCORE`/`MGET`/JSON parse and feeds parsed rows here), so the
+/// multi-page counting can be unit-tested directly.
+///
+/// Each record is `(queue, name, ready_at_ms)`; `ready_at_ms` is the ZSET score
+/// (ready-at time) already clamped to `u64`, or `None` when unavailable.
+#[cfg(feature = "redis")]
+fn fold_due_delayed_records(
+    records: impl IntoIterator<Item = (String, String, Option<u64>)>,
+    per_queue: &mut HashMap<String, (u64, Option<u64>)>,
+    per_name: &mut HashMap<String, u64>,
+) {
+    for (queue, name, ready_at) in records {
+        *per_name.entry(name).or_insert(0) += 1;
+        let entry = per_queue.entry(queue).or_insert((0, None));
+        entry.0 = entry.0.saturating_add(1);
+        if let Some(ts) = ready_at {
+            entry.1 = Some(entry.1.map_or(ts, |cur| cur.min(ts)));
+        }
+    }
+}
 
 /// Survey the durable Redis store for both actuator gauge families (issue
 /// #1752): per-queue ready `depth` + oldest-waiting age, and per-job-type
@@ -5524,42 +5561,95 @@ async fn update_redis_queue_depth_gauges(
 
     // Due-delayed entries (scheduled/retry jobs whose ready-at has arrived but
     // that a worker has not yet promoted to a queue list) are ready backlog too.
-    // Only entries scored `<= now` count; the score is the ready-at time.
-    let due: Vec<(String, f64)> = redis::cmd("ZRANGEBYSCORE")
-        .arg(delayed_key)
-        .arg("-inf")
-        .arg(now)
-        .arg("WITHSCORES")
-        .arg("LIMIT")
-        .arg(0)
-        .arg(REDIS_QUEUE_DEPTH_SAMPLE)
-        .query_async(connection)
-        .await?;
-    if !due.is_empty() {
-        let keys: Vec<String> = due
-            .iter()
-            .map(|(id, _)| redis_record_key(record_prefix, id))
-            .collect();
-        let bodies: Vec<Option<String>> =
-            redis::cmd("MGET").arg(keys).query_async(connection).await?;
-        let scores: HashMap<String, f64> = due.into_iter().collect();
-        for body in bodies.into_iter().flatten() {
-            if let Ok(record) = serde_json::from_str::<RedisJobRecord>(&body) {
-                // ZSET scores are ready-at in ms; clamp the f64 back to u64.
-                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-                let ready_at = scores.get(&record.id).map(|s| s.max(0.0) as u64);
-                *per_name.entry(record.name.clone()).or_insert(0) += 1;
-                let entry = per_queue.entry(record.queue.clone()).or_insert((0, None));
-                entry.0 = entry.0.saturating_add(1);
-                if let Some(ts) = ready_at {
-                    entry.1 = Some(entry.1.map_or(ts, |cur| cur.min(ts)));
-                }
-            }
-        }
-    }
+    survey_due_delayed_gauges(
+        connection,
+        delayed_key,
+        record_prefix,
+        now,
+        &mut per_queue,
+        &mut per_name,
+    )
+    .await?;
 
     state.job_registry.set_queue_depth_gauges(&per_queue);
     state.job_registry.set_queued_counts(&per_name);
+    Ok(())
+}
+
+/// Fold the whole due-delayed (`score <= now`) ZSET backlog into the running
+/// per-queue depth/oldest and per-name tallies.
+///
+/// Pages through the due range one `REDIS_QUEUE_DEPTH_SAMPLE`-sized window at a
+/// time (rather than sampling only the first page) so per-queue depth, per-name,
+/// and oldest-age are exact across a large delayed/retry backlog while per-page
+/// memory stays bounded to a single page. `ZRANGEBYSCORE` returns ascending by
+/// score, so the very first entry is the global minimum ready-at and the running
+/// `.min()` in [`fold_due_delayed_records`] keeps oldest-age exact regardless of
+/// paging. Total scanned entries are capped at `REDIS_QUEUE_DEPTH_DUE_SCAN_CAP`;
+/// hitting the cap with a full final page emits a single `warn!` rather than
+/// silently under-counting.
+#[cfg(feature = "redis")]
+async fn survey_due_delayed_gauges(
+    connection: &mut redis::aio::ConnectionManager,
+    delayed_key: &str,
+    record_prefix: &str,
+    now: u64,
+    per_queue: &mut HashMap<String, (u64, Option<u64>)>,
+    per_name: &mut HashMap<String, u64>,
+) -> Result<(), redis::RedisError> {
+    let page_size = REDIS_QUEUE_DEPTH_SAMPLE.max(1).cast_unsigned();
+    let mut offset: isize = 0;
+    let mut scanned: usize = 0;
+    loop {
+        // Only entries scored `<= now` count; the score is the ready-at time.
+        let due: Vec<(String, f64)> = redis::cmd("ZRANGEBYSCORE")
+            .arg(delayed_key)
+            .arg("-inf")
+            .arg(now)
+            .arg("WITHSCORES")
+            .arg("LIMIT")
+            .arg(offset)
+            .arg(REDIS_QUEUE_DEPTH_SAMPLE)
+            .query_async(connection)
+            .await?;
+        let page_len = due.len();
+        if !due.is_empty() {
+            let keys: Vec<String> = due
+                .iter()
+                .map(|(id, _)| redis_record_key(record_prefix, id))
+                .collect();
+            let bodies: Vec<Option<String>> =
+                redis::cmd("MGET").arg(keys).query_async(connection).await?;
+            let scores: HashMap<String, f64> = due.into_iter().collect();
+            let records = bodies.into_iter().flatten().filter_map(|body| {
+                serde_json::from_str::<RedisJobRecord>(&body)
+                    .ok()
+                    .map(|record| {
+                        // ZSET scores are ready-at in ms; clamp the f64 to u64.
+                        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                        let ready_at = scores.get(&record.id).map(|s| s.max(0.0) as u64);
+                        (record.queue, record.name, ready_at)
+                    })
+            });
+            fold_due_delayed_records(records, per_queue, per_name);
+        }
+        scanned += page_len;
+        // A short page means the due range is exhausted — stop cleanly.
+        if page_len < page_size {
+            break;
+        }
+        // Full final page at the safety bound: stop, but disclose the possible
+        // under-count rather than silently truncating.
+        if scanned >= REDIS_QUEUE_DEPTH_DUE_SCAN_CAP {
+            tracing::warn!(
+                scanned,
+                cap = REDIS_QUEUE_DEPTH_DUE_SCAN_CAP,
+                "due-delayed queue-depth scan truncated at cap; reported ready depth may under-count"
+            );
+            break;
+        }
+        offset += REDIS_QUEUE_DEPTH_SAMPLE;
+    }
     Ok(())
 }
 
@@ -17033,6 +17123,61 @@ mod uniqueness_concurrency_tests {
             ("q".to_string(), "c".to_string(), 1_u64, None),
         ]);
         assert_eq!(none_age.per_queue["q"], (4, Some(7_000)));
+    }
+
+    #[cfg(feature = "redis")]
+    #[test]
+    fn fold_due_delayed_records_counts_all_pages_across_queues() {
+        // Build a due backlog larger than one page (REDIS_QUEUE_DEPTH_SAMPLE =
+        // 1024) spread across three queues, then fold it page-by-page exactly as
+        // the paginated survey loop does. This proves per-queue depth, per-name,
+        // and oldest-age stay exact across a multi-page scan rather than being
+        // capped at the first 1024-record sample.
+        const TOTAL: usize = 2500;
+        let queues = ["alpha", "beta", "gamma"];
+        let mut records: Vec<(String, String, Option<u64>)> = Vec::with_capacity(TOTAL);
+        let mut expected_depth: HashMap<String, u64> = HashMap::new();
+        let mut expected_oldest: HashMap<String, u64> = HashMap::new();
+        let mut expected_name: HashMap<String, u64> = HashMap::new();
+        for i in 0..TOTAL {
+            let queue = queues[i % queues.len()];
+            let name = format!("job_{}", i % 5);
+            // Descending ready-at so each queue's minimum lands at its highest
+            // index — deep in a later page — exercising the cross-page min.
+            let ready_at = (TOTAL - i) as u64;
+            records.push((queue.to_string(), name.clone(), Some(ready_at)));
+            *expected_depth.entry(queue.to_string()).or_insert(0) += 1;
+            let slot = expected_oldest.entry(queue.to_string()).or_insert(ready_at);
+            *slot = (*slot).min(ready_at);
+            *expected_name.entry(name).or_insert(0) += 1;
+        }
+
+        let mut per_queue: HashMap<String, (u64, Option<u64>)> = HashMap::new();
+        let mut per_name: HashMap<String, u64> = HashMap::new();
+
+        let page_size = REDIS_QUEUE_DEPTH_SAMPLE.max(1).cast_unsigned();
+        assert!(TOTAL > page_size, "test must span multiple pages");
+        for page in records.chunks(page_size) {
+            fold_due_delayed_records(page.iter().cloned(), &mut per_queue, &mut per_name);
+        }
+
+        for queue in queues {
+            let (depth, oldest) = per_queue[queue];
+            assert_eq!(depth, expected_depth[queue], "exact depth for {queue}");
+            assert_eq!(
+                oldest,
+                Some(expected_oldest[queue]),
+                "exact oldest ready-at for {queue}"
+            );
+        }
+        assert_eq!(
+            per_queue.values().map(|(d, _)| *d).sum::<u64>(),
+            TOTAL as u64,
+            "every due record counted exactly once across all pages"
+        );
+        for (name, count) in &expected_name {
+            assert_eq!(per_name[name], *count, "exact per-name count for {name}");
+        }
     }
 
     // ── local backend: uniqueness ────────────────────────────────────────────
