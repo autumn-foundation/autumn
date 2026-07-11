@@ -3743,6 +3743,28 @@ fn collect_declared_queues(jobs_by_name: &Arc<RwLock<HashMap<String, JobInfo>>>)
     queues
 }
 
+/// The full set of queue names this worker actually drains: the configured
+/// `[jobs.queues]` plus every `#[job(queue = "…")]`-declared queue the runtime
+/// appends to the effective schedule at lowest priority (#1756).
+///
+/// This is the ground-truth "must be drained" set that a fleet manifest emits so
+/// a topology-aware `autumn doctor --strict` coverage check sees exactly what the
+/// runtime drains — never a stale config-only view that false-positives on
+/// job-declared queues. It reuses [`QueueSchedule::effective`] and
+/// [`collect_declared_queues`] so it can never drift from the real drain plan.
+///
+/// follow-up (#1756): expose this through an `autumn jobs manifest` subcommand
+/// that writes these names to the manifest path doctor consumes; today an app can
+/// emit them itself (or declare them inline under `[jobs.fleet]`).
+#[cfg_attr(not(test), allow(dead_code))]
+fn effective_drained_queues(
+    cfg: &crate::config::JobQueuesConfig,
+    jobs_by_name: &Arc<RwLock<HashMap<String, JobInfo>>>,
+) -> Vec<String> {
+    let declared = collect_declared_queues(jobs_by_name);
+    QueueSchedule::effective(cfg, &declared).0.names()
+}
+
 const LOCAL_QUEUE_WARN_THRESHOLD: usize = 10_000;
 
 /// Shared, priority-ordered job buffer for the in-process backend.
@@ -5404,6 +5426,188 @@ async fn update_redis_blocked_gauges(
     Ok(())
 }
 
+/// Cadence for the durable Redis queue-depth/`queued` gauge survey (issue
+/// #1752). Slower than the 1s blocked survey because it scans every queue list
+/// (LLEN + a bounded LRANGE/MGET tally) plus the due-delayed ZSET; the interval
+/// doubles as the actuator gauge cache TTL.
+#[cfg(feature = "redis")]
+const REDIS_QUEUE_DEPTH_SURVEY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Maximum records sampled per queue (and from the due-delayed set) when
+/// tallying the per-job-type `queued` gauge, matching the blocked survey's
+/// bounded `MGET` approach so the survey stays cheap on deep queues. Per-queue
+/// `depth` still comes from the exact `LLEN`, so only the per-name tally is
+/// bounded.
+#[cfg(feature = "redis")]
+const REDIS_QUEUE_DEPTH_SAMPLE: isize = 1024;
+
+/// Survey the durable Redis store for both actuator gauge families (issue
+/// #1752): per-queue ready `depth` + oldest-waiting age, and per-job-type
+/// `queued` depth. Mirrors [`update_redis_blocked_gauges`]'s MGET-and-tally
+/// approach so the `jobs`/`queues` gauges are backend-derived and authoritative
+/// on every replica — including enqueue-only web replicas that never pop.
+///
+/// Per-queue `depth` is the exact `LLEN` of each queue list plus any due
+/// (ready-at `<= now`) entries still parked in the delayed ZSET; oldest-waiting
+/// age comes from the tail record's enqueue time (enqueue `LPUSH`es to the head
+/// and claim `RPOP`s from the tail, so the tail is the next job to run) and/or
+/// the min due-delayed score. The per-name `queued` tally reads a bounded sample
+/// of records per queue.
+#[cfg(feature = "redis")]
+async fn update_redis_queue_depth_gauges(
+    connection: &mut redis::aio::ConnectionManager,
+    key_prefix: &str,
+    queue_names: &[String],
+    delayed_key: &str,
+    record_prefix: &str,
+    state: &AppState,
+) -> Result<(), redis::RedisError> {
+    let now = now_unix_ms();
+    let mut per_queue: HashMap<String, (u64, Option<u64>)> = HashMap::new();
+    let mut per_name: HashMap<String, u64> = HashMap::new();
+
+    for queue in queue_names {
+        let list_key = redis_queue_key(key_prefix, queue);
+        let len: u64 = redis::cmd("LLEN")
+            .arg(&list_key)
+            .query_async(connection)
+            .await?;
+        let mut oldest_ready_at: Option<u64> = None;
+        if len > 0 {
+            // The oldest still-waiting job is at the tail (LPUSH head / RPOP
+            // tail), so its enqueue time is the queue's oldest-waiting age.
+            let oldest_id: Option<String> = redis::cmd("LINDEX")
+                .arg(&list_key)
+                .arg(-1)
+                .query_async(connection)
+                .await?;
+            if let Some(id) = oldest_id {
+                let body: Option<String> = redis::cmd("GET")
+                    .arg(redis_record_key(record_prefix, &id))
+                    .query_async(connection)
+                    .await?;
+                if let Some(record) = body
+                    .as_deref()
+                    .and_then(|b| serde_json::from_str::<RedisJobRecord>(b).ok())
+                {
+                    oldest_ready_at = record.enqueued_at_ms;
+                }
+            }
+            // Bounded per-name tally from the head of the list (consistent with
+            // the blocked survey's sampling).
+            let ids: Vec<String> = redis::cmd("LRANGE")
+                .arg(&list_key)
+                .arg(0)
+                .arg(REDIS_QUEUE_DEPTH_SAMPLE - 1)
+                .query_async(connection)
+                .await?;
+            if !ids.is_empty() {
+                let keys: Vec<String> = ids
+                    .iter()
+                    .map(|id| redis_record_key(record_prefix, id))
+                    .collect();
+                let bodies: Vec<Option<String>> =
+                    redis::cmd("MGET").arg(keys).query_async(connection).await?;
+                for body in bodies.into_iter().flatten() {
+                    if let Ok(record) = serde_json::from_str::<RedisJobRecord>(&body) {
+                        *per_name.entry(record.name).or_insert(0) += 1;
+                    }
+                }
+            }
+        }
+        let entry = per_queue.entry(queue.clone()).or_insert((0, None));
+        entry.0 = entry.0.saturating_add(len);
+        if let Some(ts) = oldest_ready_at {
+            entry.1 = Some(entry.1.map_or(ts, |cur| cur.min(ts)));
+        }
+    }
+
+    // Due-delayed entries (scheduled/retry jobs whose ready-at has arrived but
+    // that a worker has not yet promoted to a queue list) are ready backlog too.
+    // Only entries scored `<= now` count; the score is the ready-at time.
+    let due: Vec<(String, f64)> = redis::cmd("ZRANGEBYSCORE")
+        .arg(delayed_key)
+        .arg("-inf")
+        .arg(now)
+        .arg("WITHSCORES")
+        .arg("LIMIT")
+        .arg(0)
+        .arg(REDIS_QUEUE_DEPTH_SAMPLE)
+        .query_async(connection)
+        .await?;
+    if !due.is_empty() {
+        let keys: Vec<String> = due
+            .iter()
+            .map(|(id, _)| redis_record_key(record_prefix, id))
+            .collect();
+        let bodies: Vec<Option<String>> =
+            redis::cmd("MGET").arg(keys).query_async(connection).await?;
+        let scores: HashMap<String, f64> = due.into_iter().collect();
+        for body in bodies.into_iter().flatten() {
+            if let Ok(record) = serde_json::from_str::<RedisJobRecord>(&body) {
+                // ZSET scores are ready-at in ms; clamp the f64 back to u64.
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let ready_at = scores.get(&record.id).map(|s| s.max(0.0) as u64);
+                *per_name.entry(record.name.clone()).or_insert(0) += 1;
+                let entry = per_queue.entry(record.queue.clone()).or_insert((0, None));
+                entry.0 = entry.0.saturating_add(1);
+                if let Some(ts) = ready_at {
+                    entry.1 = Some(entry.1.map_or(ts, |cur| cur.min(ts)));
+                }
+            }
+        }
+    }
+
+    state.job_registry.set_queue_depth_gauges(&per_queue);
+    state.job_registry.set_queued_counts(&per_name);
+    Ok(())
+}
+
+/// Read-only survey loop that refreshes the actuator queue-depth/`queued`
+/// gauges from Redis on a fixed interval (issue #1752).
+///
+/// Spawned on **every** role — including enqueue-only web replicas that run no
+/// worker loop — so the `/actuator/jobs` gauges reflect the shared durable
+/// backlog rather than a web replica's ever-growing local enqueue marks. The
+/// survey interval doubles as the gauge cache TTL.
+#[cfg(feature = "redis")]
+fn spawn_redis_queue_depth_survey(
+    client: &redis::Client,
+    state: AppState,
+    shutdown: tokio_util::sync::CancellationToken,
+    key_prefix: String,
+    queue_names: Vec<String>,
+    delayed_key: String,
+    record_prefix: String,
+) -> Result<(), AutumnError> {
+    let mut connection =
+        new_redis_connection_manager(client, "jobs redis queue-depth survey connection manager")?;
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(REDIS_QUEUE_DEPTH_SURVEY_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    if let Err(error) = update_redis_queue_depth_gauges(
+                        &mut connection,
+                        &key_prefix,
+                        &queue_names,
+                        &delayed_key,
+                        &record_prefix,
+                        &state,
+                    )
+                    .await
+                    {
+                        tracing::warn!(error = %error, "redis queue-depth survey failed");
+                    }
+                }
+                () = shutdown.cancelled() => break,
+            }
+        }
+    });
+    Ok(())
+}
+
 #[cfg(feature = "redis")]
 fn expected_claim_args(record: &RedisJobRecord) -> Option<(&str, u64)> {
     Some((record.claimed_by.as_deref()?, record.claimed_at_ms?))
@@ -6360,6 +6564,10 @@ fn start_redis_runtime(
         .iter()
         .map(|queue| redis_queue_key(&config.redis.key_prefix, queue))
         .collect();
+    // Full queue-name set (before pinning) for the actuator queue-depth survey:
+    // web replicas serve /actuator/jobs for every queue, so the survey must
+    // cover all of them, not just this process's pinned worker subset (#1752).
+    let survey_queue_names: Vec<String> = schedule.names();
     // Queue pinning (#1623, AC3): this worker process only drains the pinned
     // subset. Warn about any configured queue left uncovered (AC6).
     let uncovered = schedule.retain_pinned(&config.pin);
@@ -6438,6 +6646,21 @@ fn start_redis_runtime(
                 .map(|c| Arc::new(c.resilience.clone())),
         },
     );
+
+    // Backend-derived actuator gauges (issue #1752): survey Redis for per-queue
+    // depth/age and per-job-type `queued` on a fixed interval. Spawned for ALL
+    // roles — before the web-role early return below — so an enqueue-only web
+    // replica reports the true shared backlog instead of its own ever-growing
+    // local enqueue marks.
+    spawn_redis_queue_depth_survey(
+        &client,
+        state.clone(),
+        shutdown.clone(),
+        config.redis.key_prefix.clone(),
+        survey_queue_names,
+        delayed_key.clone(),
+        record_prefix.clone(),
+    )?;
 
     // Web role installs the enqueue client above but runs no worker loops:
     // another (worker/combined) replica drains the durable Redis queue. Bypass
@@ -7156,6 +7379,43 @@ async fn pg_claim_next_job(
     })
 }
 
+/// Aggregated durable job gauges surveyed from the backend (issue #1752): the
+/// two `/actuator/jobs` gauge families derived from one pass over the ready
+/// enqueued rows.
+#[cfg(feature = "db")]
+#[derive(Debug, Default)]
+struct SurveyedJobGauges {
+    /// Queue → (ready depth, oldest ready-at epoch ms).
+    per_queue: HashMap<String, (u64, Option<u64>)>,
+    /// Job name → ready `queued` depth.
+    per_name: HashMap<String, u64>,
+}
+
+/// Fold surveyed `(queue, name, ready-count, oldest ready-at ms)` rows into the
+/// per-queue and per-job-type actuator gauges.
+///
+/// Pure (no I/O) so the row→gauge mapping is unit-testable without a live
+/// backend. Callers pass rows already filtered to ready work (`run_at <= now`
+/// on Postgres); this only sums the per-queue and per-name depths and keeps the
+/// oldest ready-at per queue.
+#[cfg(feature = "db")]
+fn aggregate_surveyed_job_gauges<I>(rows: I) -> SurveyedJobGauges
+where
+    I: IntoIterator<Item = (String, String, u64, Option<u64>)>,
+{
+    let mut gauges = SurveyedJobGauges::default();
+    for (queue, name, count, oldest_ready_at) in rows {
+        let queue_entry = gauges.per_queue.entry(queue).or_insert((0, None));
+        queue_entry.0 = queue_entry.0.saturating_add(count);
+        if let Some(ts) = oldest_ready_at {
+            queue_entry.1 = Some(queue_entry.1.map_or(ts, |cur| cur.min(ts)));
+        }
+        let name_entry = gauges.per_name.entry(name).or_insert(0);
+        *name_entry = name_entry.saturating_add(count);
+    }
+    gauges
+}
+
 /// Row shape for per-name aggregate count queries.
 #[cfg(feature = "db")]
 #[derive(diesel::QueryableByName)]
@@ -7201,6 +7461,67 @@ async fn pg_update_concurrency_blocked_gauges(pool: &PgPool, state: &AppState) {
         }
         Err(error) => {
             tracing::warn!(error = %error, "postgres blocked-concurrency survey failed");
+        }
+    }
+}
+
+/// Row shape for the per-(queue, name) ready-depth survey.
+#[cfg(feature = "db")]
+#[derive(diesel::QueryableByName)]
+struct PgQueueDepthRow {
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    queue: String,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    name: String,
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    count: i64,
+    /// `MIN(run_at)` of the group as epoch milliseconds, `NULL` for an empty
+    /// group (never returned by a `GROUP BY` with matching rows, but modelled
+    /// nullable for safety).
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::BigInt>)]
+    oldest_run_at_ms: Option<i64>,
+}
+
+/// Survey ready (claimable) enqueued jobs grouped by queue and name and publish
+/// both actuator gauge families from the durable store (issue #1752).
+///
+/// One `GROUP BY queue, name` query (backed by `idx_autumn_jobs_queue_ready`)
+/// feeds: per-queue ready depth + oldest-waiting age (the `queues` family) and
+/// per-job-type `queued` depth (the `jobs` family). This makes the
+/// `/actuator/jobs` gauges backend-derived and authoritative on every replica —
+/// including enqueue-only web replicas, which previously reported ever-growing
+/// phantom depth from their local enqueue marks.
+#[cfg(feature = "db")]
+async fn pg_update_queue_depth_gauges(pool: &PgPool, state: &AppState) {
+    use diesel_async::RunQueryDsl as _;
+
+    let Ok(mut conn) = pool.get().await else {
+        return;
+    };
+    let rows = diesel::sql_query(
+        "SELECT queue, name, COUNT(*) AS count, \
+                CAST(EXTRACT(EPOCH FROM MIN(run_at)) * 1000 AS BIGINT) AS oldest_run_at_ms \
+         FROM autumn_jobs \
+         WHERE status = 'enqueued' AND run_at <= NOW() \
+         GROUP BY queue, name",
+    )
+    .load::<PgQueueDepthRow>(&mut *conn)
+    .await;
+    match rows {
+        Ok(rows) => {
+            let gauges = aggregate_surveyed_job_gauges(rows.into_iter().map(|row| {
+                (
+                    row.queue,
+                    row.name,
+                    u64::try_from(row.count).unwrap_or(0),
+                    row.oldest_run_at_ms.and_then(|ms| u64::try_from(ms).ok()),
+                )
+            }));
+            state.job_registry.set_queue_depth_gauges(&gauges.per_queue);
+            state.job_registry.set_queued_counts(&gauges.per_name);
+        }
+        Err(error) => {
+            tracing::warn!(error = %error, "postgres queue-depth survey failed");
         }
     }
 }
@@ -7628,6 +7949,33 @@ async fn pg_maintenance_loop(
             }
             _ = tracking_cleanup_interval.tick() => {
                 pg_cleanup_expired_tracking_rows(&pool).await;
+            }
+            () = shutdown.cancelled() => break,
+        }
+    }
+}
+
+/// Dedicated read-only survey task: refreshes the actuator queue-depth and
+/// per-job-type `queued` gauges from the durable store on a fixed interval.
+///
+/// Spawned on **every** role — including enqueue-only web replicas that run no
+/// worker or maintenance loop (issue #1752) — so the `/actuator/jobs` gauges on
+/// a web replica reflect the shared durable backlog rather than that process's
+/// local enqueue marks (which only grow, since it never pops). The survey
+/// interval doubles as the gauge cache TTL: the endpoint reads the last surveyed
+/// snapshot and never queries the backend per request.
+#[cfg(feature = "db")]
+async fn pg_queue_depth_survey_loop(
+    pool: PgPool,
+    state: AppState,
+    shutdown: tokio_util::sync::CancellationToken,
+) {
+    let mut interval = tokio::time::interval(PG_MAINTENANCE_INTERVAL);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            _ = interval.tick() => {
+                pg_update_queue_depth_gauges(&pool, &state).await;
             }
             () = shutdown.cancelled() => break,
         }
@@ -8278,6 +8626,20 @@ fn start_postgres_runtime(
                 .map(|c| Arc::new(c.resilience.clone())),
         },
     );
+
+    // Backend-derived actuator gauges (issue #1752): survey the durable store
+    // for per-queue depth/age and per-job-type `queued` on a fixed interval.
+    // Spawned for ALL roles — before the web-role early return below — so an
+    // enqueue-only web replica reports the true shared backlog instead of its
+    // own ever-growing local enqueue marks.
+    {
+        let pool = pool.clone();
+        let state = state.clone();
+        let shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            pg_queue_depth_survey_loop(pool, state, shutdown).await;
+        });
+    }
 
     // Web role installs the enqueue client above but runs no worker loops and
     // no maintenance loop: another (worker/combined) replica drains the durable
@@ -16611,6 +16973,68 @@ mod uniqueness_concurrency_tests {
         assert_eq!(JobAdminStatus::Deduplicated.label(), "deduplicated");
     }
 
+    #[cfg(feature = "db")]
+    #[test]
+    fn aggregate_surveyed_job_gauges_maps_rows_to_both_families() {
+        // Empty survey → empty gauges (a fully-drained backend reports nothing,
+        // and the setters then reset every known queue/name to 0).
+        let empty = aggregate_surveyed_job_gauges(std::iter::empty());
+        assert!(empty.per_queue.is_empty());
+        assert!(empty.per_name.is_empty());
+
+        // Single queue, single name.
+        let single = aggregate_surveyed_job_gauges([(
+            "critical".to_string(),
+            "reset_email".to_string(),
+            3_u64,
+            Some(1_000_u64),
+        )]);
+        assert_eq!(single.per_queue["critical"], (3, Some(1_000)));
+        assert_eq!(single.per_name["reset_email"], 3);
+
+        // Multi-queue, multi-name: per-queue depth sums every name on the queue,
+        // the per-name family stays split by name, and the oldest ready-at per
+        // queue is the MIN across its groups.
+        let multi = aggregate_surveyed_job_gauges([
+            (
+                "critical".to_string(),
+                "reset_email".to_string(),
+                2_u64,
+                Some(5_000_u64),
+            ),
+            (
+                "critical".to_string(),
+                "send_sms".to_string(),
+                4_u64,
+                Some(2_000_u64),
+            ),
+            (
+                "bulk".to_string(),
+                "reindex".to_string(),
+                1_u64,
+                Some(9_000_u64),
+            ),
+        ]);
+        assert_eq!(
+            multi.per_queue["critical"],
+            (6, Some(2_000)),
+            "queue depth sums both names; oldest ready-at is the earliest group"
+        );
+        assert_eq!(multi.per_queue["bulk"], (1, Some(9_000)));
+        assert_eq!(multi.per_name["reset_email"], 2);
+        assert_eq!(multi.per_name["send_sms"], 4);
+        assert_eq!(multi.per_name["reindex"], 1);
+
+        // A missing oldest ready-at (None) does not clobber a present one and
+        // leaves the queue's age unset when every group is None.
+        let none_age = aggregate_surveyed_job_gauges([
+            ("q".to_string(), "a".to_string(), 1_u64, None),
+            ("q".to_string(), "b".to_string(), 2_u64, Some(7_000_u64)),
+            ("q".to_string(), "c".to_string(), 1_u64, None),
+        ]);
+        assert_eq!(none_age.per_queue["q"], (4, Some(7_000)));
+    }
+
     // ── local backend: uniqueness ────────────────────────────────────────────
 
     static UNIQUE_BURST_CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -17653,6 +18077,38 @@ mod queue_schedule_tests {
         let declared = vec!["default".to_string(), "critical".to_string()];
         let (_schedule, warnings) = QueueSchedule::effective(&cfg, &declared);
         assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn effective_drained_queues_appends_job_declared_queues() {
+        // The manifest ground-truth set (#1756): configured queues PLUS every
+        // `#[job(queue = "…")]`-declared queue the runtime appends to the drain
+        // plan. A topology-aware `doctor --strict` consuming this set must see
+        // the job-declared `email` so it never false-fails when a tier pins it.
+        fn handler(
+            _state: AppState,
+            _payload: Value,
+        ) -> Pin<Box<dyn Future<Output = AutumnResult<()>> + Send + 'static>> {
+            Box::pin(async move { Ok(()) })
+        }
+        let mut jobs = HashMap::new();
+        jobs.insert(
+            "emailer".to_string(),
+            JobInfo {
+                version: 1,
+                name: "emailer".to_string(),
+                max_attempts: 1,
+                initial_backoff_ms: 1,
+                queue: "email".to_string(),
+                uniqueness: None,
+                concurrency: None,
+                handler,
+            },
+        );
+        let registry = Arc::new(RwLock::new(jobs));
+        let cfg = JobQueuesConfig::strict_list(["critical"]);
+        let drained = effective_drained_queues(&cfg, &registry);
+        assert_eq!(drained, vec!["critical".to_string(), "email".to_string()]);
     }
 
     // ── Queue pinning (#1623, AC3/AC4) ──────────────────────────────────────
