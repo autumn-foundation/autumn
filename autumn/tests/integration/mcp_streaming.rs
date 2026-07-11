@@ -355,18 +355,78 @@ async fn first_progress_arrives_before_the_slow_tool_completes() {
     let start = std::time::Instant::now();
     let response = tower::ServiceExt::oneshot(router, request).await.unwrap();
     let mut body = response.into_body().into_data_stream();
-    // Pull the first non-empty chunk.
-    let mut first_at = None;
-    while let Some(chunk) = body.next().await {
-        let bytes = chunk.unwrap();
-        if !bytes.is_empty() {
-            first_at = Some(start.elapsed());
-            break;
+    // Record when the first streamed signal arrives versus when the completion
+    // frame (carrying the slow tail's "done" payload) arrives. The handler
+    // sleeps 300ms *between* emitting the first event and the final one, so the
+    // "done" bytes cannot exist until that tail elapses: an incrementally
+    // streamed response necessarily surfaces the first frame ahead of
+    // completion, while a buffered response would collapse both into one chunk.
+    //
+    // The 30s bound wrapping this read loop is a generous hang-guard, mirroring
+    // the hang-guards elsewhere in this PR: if a regression drops the final MCP
+    // progress/result frame while leaving the SSE response OPEN (e.g. via
+    // keep-alives), `body.next().await` would otherwise dangle waiting for a
+    // `done` frame that never arrives, hanging until the suite-wide timeout
+    // instead of failing locally here. It is a FLOOR-not-ceiling value: the read
+    // loop finishes in ~300ms under normal load (gated only on the handler's
+    // fixed sleep, never on load-sensitive scheduling), so this bound only ever
+    // trips on a genuine never-arrives hang — never on a merely slow runner.
+    let (first_at, done_at) = tokio::time::timeout(Duration::from_secs(30), async {
+        let mut first_at = None;
+        let mut done_at = None;
+        let mut buf = String::new();
+        while let Some(chunk) = body.next().await {
+            let bytes = chunk.unwrap();
+            if bytes.is_empty() {
+                continue;
+            }
+            let at = start.elapsed();
+            if first_at.is_none() {
+                first_at = Some(at);
+            }
+            buf.push_str(&String::from_utf8_lossy(&bytes));
+            if buf.contains("done") {
+                done_at = Some(at);
+                break;
+            }
         }
-    }
-    let elapsed = first_at.expect("a first frame");
+        (first_at, done_at)
+    })
+    .await
+    .expect(
+        "MCP stream never delivered a `done` frame within the hang-guard \
+         (final frame dropped while SSE stayed open?)",
+    );
+    let first_at = first_at.expect("a first frame");
+    let done_at = done_at.expect("a completion frame carrying the slow tail");
+    // Cheap ordering check documents intent, but on its own it is too weak: a
+    // buffered regression that stalled the inner handler until it finished would
+    // still emit the `started` progress frame and the final `done` frame as two
+    // back-to-back outer chunks *after* the sleep, and `first_at < done_at`
+    // would still pass even though no signal arrived before the slow tail.
     assert!(
-        elapsed < Duration::from_millis(250),
-        "first signal should precede the 300ms tail; took {elapsed:?}"
+        first_at < done_at,
+        "first signal must precede completion (first at {first_at:?}, done at {done_at:?})"
+    );
+    // The real discriminator is the GAP: the handler sleeps 300ms between the
+    // first frame and the `done` frame, so a genuinely streamed response forces
+    // at least ~300ms between the two timestamps, while a buffered response
+    // collapses that gap to ~0.
+    //
+    // Why asserting a floor (>= 250ms) is robust and NOT runner-flaky: the gap
+    // is dominated by the handler's fixed `tokio::time::sleep`, which is a
+    // FLOOR, never a ceiling. `tokio::time::sleep` never fires early, and a
+    // slow/loaded runner only pushes *both* timestamps later together, keeping
+    // the gap >= the sleep. A buffered regression is the only thing that drives
+    // the gap toward zero. Do NOT "simplify" this back to bare ordering, and do
+    // NOT reintroduce an absolute ceiling like `first_at < 250ms` — that would
+    // be the runner-sensitive assertion this test was de-flaked to remove.
+    let gap = done_at.saturating_sub(first_at);
+    assert!(
+        gap >= Duration::from_millis(250),
+        "progress must arrive before the slow tail completes: gap between first \
+         frame and done was {gap:?}, expected >= 250ms (handler sleeps 300ms \
+         between progress and completion; a near-zero gap means the response was \
+         buffered rather than streamed)"
     );
 }

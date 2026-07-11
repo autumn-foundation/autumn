@@ -318,6 +318,13 @@ async fn different_keys_do_not_coalesce() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn swr_serves_stale_and_refreshes_in_background() {
+    // Floor-not-ceiling hang-guard for the two waits below (refresh-notify and
+    // publish-visibility poll). Deliberately generous: it must never trip on a
+    // slow/oversubscribed runner — only on a genuine never-publishes hang. A
+    // real windows-latest run starved the detached refresh past 30s (PR #1764),
+    // so this is set well above any plausible scheduling-starvation window.
+    const HANG_GUARD: Duration = Duration::from_secs(120);
+
     let _guard = METRICS_LOCK.lock().await;
     let cache = fresh_cache();
     let key = unique_key("swr_serves_stale_and_refreshes_in_background");
@@ -342,12 +349,23 @@ async fn swr_serves_stale_and_refreshes_in_background() {
     // the grace period).
     tokio::time::sleep(Duration::from_millis(80)).await;
 
+    // A deterministic signal the background refresh's fill closure fires the
+    // moment it finishes computing the new value. Waiting on this — rather than
+    // a fixed wall-clock timeout — absorbs however long a slow/loaded runner
+    // takes to schedule and run the detached background task.
+    let refresh_done = Arc::new(tokio::sync::Notify::new());
+
     let start = std::time::Instant::now();
     let fc = fill_count.clone();
+    let done = refresh_done.clone();
     let v: String = get_or_compute_with(&cache, &key, opts.clone(), move || async move {
         fc.fetch_add(1, Ordering::SeqCst);
         tokio::time::sleep(Duration::from_millis(200)).await;
-        Ok::<String, String>("v2".to_string())
+        let out = Ok::<String, String>("v2".to_string());
+        // Publication (`insert_cached`) happens synchronously right after this
+        // closure returns; signal now that the compute is done.
+        done.notify_one();
+        out
     })
     .await
     .unwrap();
@@ -361,8 +379,46 @@ async fn swr_serves_stale_and_refreshes_in_background() {
         "serving stale must not wait on the slow background refresh, took {elapsed:?}"
     );
 
-    // Poll until the background refresh completes and the fresh value is visible.
-    let refreshed = tokio::time::timeout(Duration::from_secs(2), async {
+    // Wait deterministically for the background refresh to finish computing —
+    // no wall-clock ceiling on the load-sensitive scheduling + 200ms compute.
+    // (`notify_one` stores a permit if it fires before this await, so there is
+    // no lost-wakeup even when the background task wins the race.)
+    //
+    // The timeout here is a generous hang-guard, mirroring the bound on the
+    // publish loop below: it exists only to convert a genuine never-fires hang
+    // (e.g. the detached refresh task is dropped when the global refresh
+    // semaphore is exhausted, or a regression stops it ever reaching the fill
+    // closure) into a clean test failure instead of dangling until the CI
+    // runner's global timeout. It is deliberately NOT a tight, schedule-
+    // sensitive value, so it never reintroduces load-dependent flakiness.
+    tokio::time::timeout(HANG_GUARD, refresh_done.notified())
+        .await
+        .expect("background refresh never signalled completion (task dropped or never started)");
+
+    // Confirm the refreshed value becomes visible, by POLLING (re-read, short
+    // sleep, repeat) rather than reading once — never collapse this back to a
+    // single-shot read or a tight ceiling.
+    //
+    // WHY A POLL IS REQUIRED: the `Notify` above is fired from *inside* the
+    // fill closure, but publication (`finish_fill` -> `insert_cached`) runs in
+    // product code *after* the closure returns, on the detached refresh task —
+    // concurrently with this woken test task. So the instant we wake on the
+    // notify, "v2" may not yet be visible to a fresh read; and until the stale
+    // "v1" envelope ages past `ttl + stale_while_revalidate` (~10s) each read
+    // instead blocks as a single-flight waiter on that same detached task's
+    // channel. Either way, test progress is coupled to the detached refresh
+    // being *scheduled* to run its publish — which a heavily oversubscribed CI
+    // runner can starve for many seconds (a real windows-latest run starved it
+    // past 30s; see PR #1764).
+    //
+    // WHY THE 120s BOUND IS A FLOOR, NOT A CEILING: under any sane load this
+    // converges in well under a second (the refresh computes in 200ms), so 120s
+    // must never trip on a merely slow/loaded runner — it exists solely to turn
+    // a genuine "publish never happens" bug (dropped/hung refresh task) into a
+    // clean failure instead of dangling until the job-level timeout. It is
+    // deliberately generous precisely so it is not schedule-sensitive; do not
+    // shrink it back toward the observed starvation window.
+    let refreshed = tokio::time::timeout(HANG_GUARD, async {
         loop {
             let fc = fill_count.clone();
             let v: String = get_or_compute_with(&cache, &key, opts.clone(), move || async move {
@@ -374,11 +430,11 @@ async fn swr_serves_stale_and_refreshes_in_background() {
             if v == "v2" {
                 break v;
             }
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            tokio::time::sleep(Duration::from_millis(25)).await;
         }
     })
     .await
-    .expect("background refresh must eventually publish the new value");
+    .expect("background refresh must publish the new value after it finishes computing");
     assert_eq!(refreshed, "v2");
 
     let after = read_through_metrics().snapshot();
