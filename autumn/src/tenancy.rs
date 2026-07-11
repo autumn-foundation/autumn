@@ -1,3 +1,23 @@
+//! Multi-tenancy support using task-local variables.
+//!
+//! In a multi-tenant application, operations often need to be scoped to a specific
+//! tenant to ensure data isolation. This module provides mechanisms to track and
+//! extract the "current tenant" safely across asynchronous boundaries.
+//!
+//! ## Task-local storage
+//!
+//! We use `tokio::task_local!` to store the `CURRENT_TENANT`. This ensures that
+//! the tenant ID is intrinsically linked to the async task processing the request,
+//! making it accessible anywhere in the call stack without needing to pass it
+//! manually as an argument to every function.
+//!
+//! ## Middleware and Extractors
+//!
+//! - **Middleware**: Intercepts requests, determines the tenant (e.g., from a subdomain
+//!   or header), and sets the `CURRENT_TENANT` for the scope of the request handler.
+//! - **Extractor**: Handlers can use the `Tenant` extractor to retrieve the ID directly:
+//!   `async fn my_handler(Tenant(tenant_id): Tenant)`.
+
 use axum::{
     extract::State,
     http::Request,

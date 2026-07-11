@@ -1,3 +1,42 @@
+//! Framework interceptors for low-level services like jobs and mail.
+//!
+//! While HTTP middleware operates on the request/response lifecycle, interceptors
+//! hook into internal framework components to observe, modify, or block actions
+//! before they occur. They are useful for cross-cutting concerns like telemetry,
+//! logging, authorization checks, or testing assertions.
+//!
+//! Currently supported interceptors:
+//!
+//! - `MailInterceptor`: Intercept outgoing emails before they are sent.
+//! - [`JobInterceptor`]: Intercept background jobs before they are enqueued.
+//! - `OAuth2Interceptor`: Intercept OAuth2 authentication flows (if enabled).
+//!
+//! ## Examples
+//!
+//! Implementing a simple job logger:
+//!
+//! ```rust
+//! use autumn_web::interceptor::JobInterceptor;
+//! use std::pin::Pin;
+//! use std::future::Future;
+//!
+//! struct JobLogger;
+//!
+//! impl JobInterceptor for JobLogger {
+//!     fn intercept_enqueue<'a>(
+//!         &'a self,
+//!         name: &'a str,
+//!         payload: &'a serde_json::Value,
+//!         next: Pin<Box<dyn Future<Output = Result<(), autumn_web::job::JobError>> + Send + 'a>>,
+//!     ) -> Pin<Box<dyn Future<Output = Result<(), autumn_web::job::JobError>> + Send + 'a>> {
+//!         Box::pin(async move {
+//!             println!("Enqueuing job {} with payload {:?}", name, payload);
+//!             next.await
+//!         })
+//!     }
+//! }
+//! ```
+
 #[cfg(feature = "oauth2")]
 use std::sync::Arc;
 

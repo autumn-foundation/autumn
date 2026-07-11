@@ -1,3 +1,37 @@
+//! Idempotency middleware to prevent double-processing on retried requests.
+//!
+//! Idempotency ensures that making multiple identical requests has the same effect
+//! as making a single request. This is crucial for APIs that mutate state, such as
+//! creating a payment or submitting a form, to prevent duplicate actions when a client
+//! retries a request due to a network timeout or failure.
+//!
+//! ## How it works
+//!
+//! Clients include an `Idempotency-Key` HTTP header with a unique value (e.g., a UUID)
+//! in their request.
+//!
+//! - **First request**: The middleware caches the final response associated with the key.
+//! - **Subsequent requests**: If the middleware sees the same `Idempotency-Key` within
+//!   the retention period, it intercepts the request and returns the cached response
+//!   immediately, adding an `X-Idempotent-Replayed: true` header to indicate the
+//!   response was replayed.
+//!
+//! ## Examples
+//!
+//! The middleware is typically applied to specific routes:
+//!
+//! ```rust
+//! use axum::{routing::post, Router};
+//! use autumn_web::idempotency::IdempotencyLayer;
+//! use std::time::Duration;
+//!
+//! let layer = IdempotencyLayer::new(Duration::from_secs(3600));
+//!
+//! let app = Router::new()
+//!     .route("/payments", post(|| async { "Payment processed" }))
+//!     .layer(layer);
+//! ```
+
 use bytes::Bytes;
 use futures::StreamExt as FuturesStreamExt;
 
