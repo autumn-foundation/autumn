@@ -5554,15 +5554,21 @@ async fn dead_letter_invalid_redis_job(
     error: &str,
     job_admin: &JobAdminMemoryBackend,
 ) {
-    state
-        .job_registry
-        .record_failure(&record.name, error.to_owned(), true);
-    crate::alerts::notify_dead_lettered_job(state, &record.name, &record.id, error);
-    job_admin.record_failure(&record.id, error.to_owned());
     let mut dead = record.clone();
     clear_redis_claim(&mut dead);
     dead.last_error = Some(error.to_owned());
-    let _ = dead_letter_redis_job(connection, worker_config, record, &dead).await;
+    // Only record the failure / page the operator once the job is actually
+    // moved to the dead queue. If the move errors or the claim changed
+    // (`Ok(false)`), the job was NOT dead-lettered, so alerting here would be a
+    // false page — mirror the sibling redis dead-letter paths that gate all of
+    // this on the confirmed `Ok(true)` result.
+    if dead_letter_redis_job(connection, worker_config, record, &dead).await == Ok(true) {
+        state
+            .job_registry
+            .record_failure(&record.name, error.to_owned(), true);
+        crate::alerts::notify_dead_lettered_job(state, &record.name, &record.id, error);
+        job_admin.record_failure(&record.id, error.to_owned());
+    }
     crate::job_tracking::settle_tracked_payload_as_failed(
         state,
         &record.payload,
