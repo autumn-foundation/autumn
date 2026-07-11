@@ -274,6 +274,25 @@ fn parse_assoc_attr(
             "`target_fk = <column>` requires `through = <join_table>`",
         ));
     }
+    if explicit_through.is_some() && dependent.is_some() {
+        // A `through = <join_table>` association's `fk` names a column on the
+        // *join table*, not on the target model. The emitted cascade calls the
+        // target repository's `__autumn_apply_dependent_on_conn`, whose SQL
+        // treats `fk` as a column on the target table — so the cascade would
+        // hit e.g. `tags.post_id` (nonexistent) instead of the join table.
+        // Reject the combination directed rather than silently mis-cascading.
+        // (Generating a real join-table cascade is a possible future
+        // enhancement; a clean reject is the correct minimal behavior.)
+        return Err(syn::Error::new_spanned(
+            &target,
+            "`dependent`/`on_delete` cascade is not supported on a `through = \
+             <join_table>` (many-to-many) association: its foreign key names a \
+             column on the join table, not on the target model, so the cascade \
+             would delete/nullify the wrong rows — remove `dependent`/\
+             `on_delete`, or declare the cascade on a model that maps the join \
+             table directly",
+        ));
+    }
 
     let (fk, derived_name) =
         resolve_fk_and_name(kind, model_ident, &target, explicit_fk.as_deref());
@@ -5212,6 +5231,41 @@ mod tests {
         let has_one: Vec<syn::Attribute> =
             vec![syn::parse_quote!(#[has_one(Profile, through = post_profiles)])];
         assert!(resolve_associations(&model, &has_one).is_err());
+    }
+
+    #[test]
+    fn dependent_on_through_association_is_rejected() {
+        // A `through = <join_table>` association's fk names a column on the
+        // join table, not on the target model, so the emitted cascade would
+        // call the target repo's `__autumn_apply_dependent_on_conn` with a
+        // column that does not exist there (e.g. `tags.post_id`) — deleting /
+        // nullifying the wrong rows. Reject the combination directed rather
+        // than silently mis-cascading (Codex P2).
+        let model: syn::Ident = syn::parse_quote!(Post);
+        let attrs: Vec<syn::Attribute> =
+            vec![syn::parse_quote!(#[has_many(Tag, through = post_tags, dependent = destroy)])];
+        let Err(err) = resolve_associations(&model, &attrs) else {
+            panic!("expected an error");
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("through"),
+            "expected a through-specific rejection, got: {msg}"
+        );
+        assert!(
+            msg.contains("dependent") || msg.contains("on_delete"),
+            "expected the cascade key named, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn on_delete_on_through_association_is_rejected() {
+        // The `on_delete =` alias is rejected on a `through =` association for
+        // the same reason as `dependent =` (Codex P2).
+        let model: syn::Ident = syn::parse_quote!(Post);
+        let attrs: Vec<syn::Attribute> =
+            vec![syn::parse_quote!(#[has_many(Tag, through = post_tags, on_delete = nullify)])];
+        assert!(resolve_associations(&model, &attrs).is_err());
     }
 
     #[test]
