@@ -6,7 +6,7 @@
 
 use autumn_web::config::ProcessRole;
 use serde::Serialize;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 // ── Signing secret validation constants (mirrored from autumn-web) ────────────
 
@@ -2075,6 +2075,123 @@ fn check_queue_coverage(
     }
 }
 
+/// A declared fleet topology (#1756): the `jobs.pin` of every worker tier in the
+/// deployment. Each inner `Vec` is one tier's pin; an **empty** inner `Vec` is an
+/// *unpinned* tier that drains every queue. Declared by the operator under
+/// `[jobs.fleet] tiers = [["critical"], ["bulk", "default"]]`.
+///
+/// This is the input that makes a `--strict` hard-fail SOUND: with every tier's
+/// pin known, doctor reasons about **topology-wide** (union) coverage instead of
+/// a single process, so a valid multi-tier subset split is no longer mistaken for
+/// a gap. Absent this declaration the coverage check stays informational-only.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct FleetTopology {
+    tiers: Vec<Vec<String>>,
+}
+
+impl FleetTopology {
+    /// At least one declared tier runs job workers. A topology with no tiers
+    /// declares nothing coverable, so it cannot prove a gap.
+    const fn runs_any_worker(&self) -> bool {
+        !self.tiers.is_empty()
+    }
+
+    /// `true` when any tier is unpinned (empty pin) — such a tier drains every
+    /// queue, so union coverage is total.
+    fn has_unpinned_tier(&self) -> bool {
+        self.tiers.iter().any(Vec::is_empty)
+    }
+
+    /// The union of all pinned queue names across every tier.
+    fn pinned_union(&self) -> BTreeSet<String> {
+        self.tiers.iter().flatten().cloned().collect()
+    }
+}
+
+/// Topology-aware queue-coverage check (#1756). Restores a **sound** `--strict`
+/// hard-fail on top of the informational-only per-process report.
+///
+/// When the operator declares the fleet topology (`[jobs.fleet] tiers`) — and,
+/// via a jobs manifest or inline list, the compiled `#[job(queue = "…")]` set —
+/// doctor can PROVE a genuine zero-coverage gap: it computes the queues that must
+/// be drained (configured `[jobs.queues]` ∪ job-declared) and the queues covered
+/// by the union of all tier pins, then FAILS only if some needed queue is drained
+/// by no tier anywhere. This has zero false positives on valid deployments:
+///
+/// * a valid multi-tier subset split (one tier `critical`, another
+///   `bulk,default`) has full union coverage → Pass;
+/// * a queue named in a pin but absent from `[jobs.queues]` (a job-declared
+///   queue) is in the needed set only when the manifest surfaces it, and is
+///   covered by the pinning tier either way → never a false fail.
+///
+/// **Regression guard:** when no fleet topology is declared (`fleet == None`)
+/// this delegates verbatim to the informational-only [`check_queue_coverage`],
+/// so absent the topology input the check behaves exactly as it does today.
+fn check_queue_coverage_topology(
+    role: ProcessRole,
+    configured_queues: &[String],
+    pin: &[String],
+    declared_queues: &[String],
+    fleet: Option<&FleetTopology>,
+) -> CheckResult {
+    // No topology declared → informational-only, exactly as today. The hard-fail
+    // only activates once the operator supplies the topology that makes coverage
+    // provable, so existing deployments never regress.
+    let Some(fleet) = fleet.filter(|f| f.runs_any_worker()) else {
+        return check_queue_coverage(role, configured_queues, pin);
+    };
+
+    // Needed = configured `[jobs.queues]` ∪ job-declared queues. Declared queues
+    // only ADD to the needed set, so a missing/partial manifest can only shrink
+    // it — never manufacture a gap (keeps the check zero-false-positive).
+    let needed: BTreeSet<String> = configured_queues
+        .iter()
+        .chain(declared_queues.iter())
+        .cloned()
+        .collect();
+
+    // Covered = union of every tier's pin. An unpinned tier drains everything, so
+    // union coverage is total.
+    let gap: Vec<String> = if fleet.has_unpinned_tier() {
+        Vec::new()
+    } else {
+        let covered = fleet.pinned_union();
+        needed
+            .iter()
+            .filter(|q| !covered.contains(*q))
+            .cloned()
+            .collect()
+    };
+
+    let tier_count = fleet.tiers.len();
+    if gap.is_empty() {
+        CheckResult {
+            name: "jobs_queue_coverage",
+            status: CheckStatus::Pass,
+            detail: Some(format!(
+                "declared fleet topology ({tier_count} tier(s)) drains every needed queue {:?} \
+                 (configured + #[job(queue)]-declared); coverage is provable topology-wide",
+                needed.iter().collect::<Vec<_>>()
+            )),
+            hint: None,
+        }
+    } else {
+        CheckResult {
+            name: "jobs_queue_coverage",
+            status: CheckStatus::Fail,
+            detail: Some(format!(
+                "declared fleet topology ({tier_count} tier(s)) leaves queue(s) {} drained by no \
+                 worker tier; jobs enqueued to them will accumulate forever",
+                gap.join(", ")
+            )),
+            hint: Some(
+                "Add the uncovered queue(s) to a tier's jobs.pin in [jobs.fleet].tiers, or run an \
+                 unpinned tier that drains everything",
+            ),
+        }
+    }
+}
+
 fn check_replica_migration_versions(
     primary_latest: Option<&str>,
     replica_latest: Option<&str>,
@@ -2983,6 +3100,101 @@ where
     (queues, pin)
 }
 
+/// Resolve the declared fleet topology (#1756) from `[jobs.fleet] tiers`. Each
+/// entry is one worker tier's pin (a TOML array of queue names); an empty array
+/// is an unpinned tier that drains every queue. Returns `None` when the section
+/// is absent or declares no tiers, keeping the coverage check informational-only.
+///
+/// Chosen as a config section (rather than a repeatable CLI flag) because doctor
+/// already resolves `jobs.queues` / `jobs.pin` from the merged active-profile
+/// table, so the topology lives beside them, is profile-aware, and is checked
+/// into the repo as one source of truth for the fleet.
+fn resolve_fleet_topology(table: Option<&toml::Table>) -> Option<FleetTopology> {
+    let fleet = table
+        .and_then(|t| t.get("jobs"))
+        .and_then(toml::Value::as_table)
+        .and_then(|j| j.get("fleet"))
+        .and_then(toml::Value::as_table)?;
+    let tiers: Vec<Vec<String>> = fleet
+        .get("tiers")
+        .and_then(toml::Value::as_array)?
+        .iter()
+        .filter_map(toml::Value::as_array)
+        .map(|tier| {
+            tier.iter()
+                .filter_map(toml::Value::as_str)
+                .map(str::to_owned)
+                .collect::<Vec<String>>()
+        })
+        .collect();
+    if tiers.is_empty() {
+        return None;
+    }
+    Some(FleetTopology { tiers })
+}
+
+/// Resolve the compiled `#[job(queue = "…")]`-declared queue set for the
+/// coverage check (#1756), so doctor's view of "queues that must be drained"
+/// matches what the runtime actually drains. Two sources, in precedence order:
+///
+/// 1. `[jobs.fleet] manifest = "path"` — a jobs manifest the app emits (reusing
+///    `effective_drained_queues` on the runtime side), a TOML file with a
+///    `queues = [...]` array. This is the ground-truth set the runtime drains.
+/// 2. `[jobs.fleet] declared_queues = ["…"]` — an inline list the operator
+///    maintains by hand (the MVP path when no manifest is emitted).
+///
+/// Returns an empty `Vec` when neither is present; an unknown declared set only
+/// shrinks the needed set, so it can never cause a false failure.
+fn resolve_declared_queues(table: Option<&toml::Table>) -> Vec<String> {
+    resolve_declared_queues_from_sources(|p| std::fs::read_to_string(p).ok(), table)
+}
+
+fn resolve_declared_queues_from_sources<F>(read_file: F, table: Option<&toml::Table>) -> Vec<String>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let Some(fleet) = table
+        .and_then(|t| t.get("jobs"))
+        .and_then(toml::Value::as_table)
+        .and_then(|j| j.get("fleet"))
+        .and_then(toml::Value::as_table)
+    else {
+        return Vec::new();
+    };
+
+    // 1. A jobs manifest the app emits: TOML `queues = [...]`.
+    if let Some(path) = fleet.get("manifest").and_then(toml::Value::as_str)
+        && let Some(contents) = read_file(path)
+        && let Ok(manifest) = toml::from_str::<toml::Table>(&contents)
+    {
+        let queues: Vec<String> = manifest
+            .get("queues")
+            .and_then(toml::Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(toml::Value::as_str)
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !queues.is_empty() {
+            return queues;
+        }
+    }
+
+    // 2. Inline declared-queues list (MVP).
+    fleet
+        .get("declared_queues")
+        .and_then(toml::Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(toml::Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn first_env<F>(env_var: &F, keys: &[&str]) -> Option<String>
 where
     F: Fn(&str) -> Option<String>,
@@ -3870,8 +4082,22 @@ pub fn run(opts: DoctorOptions) {
     // mirrors the runtime exactly (`AUTUMN_ROLE` env > merged-table `role` >
     // `Combined`), reusing the shared resolver on the merged table.
     let (queue_coverage_role, _) = resolve_process_role_and_backend(Some(&merged_jobs_toml));
+    // Topology/registry inputs (#1756) that let the coverage check restore a
+    // SOUND `--strict` hard-fail: the declared fleet topology (all worker tiers'
+    // pins) and the compiled `#[job(queue)]` set (from a jobs manifest or an
+    // inline list). Absent both, `check_queue_coverage_topology` delegates to the
+    // informational-only per-process report, so existing deployments never
+    // regress.
+    let fleet_topology = resolve_fleet_topology(Some(&merged_jobs_toml));
+    let declared_queues = resolve_declared_queues(Some(&merged_jobs_toml));
     tasks.push(Box::new(move || {
-        check_queue_coverage(queue_coverage_role, &configured_queues, &jobs_pin)
+        check_queue_coverage_topology(
+            queue_coverage_role,
+            &configured_queues,
+            &jobs_pin,
+            &declared_queues,
+            fleet_topology.as_ref(),
+        )
     }));
 
     if let Some(url) = db_topology.primary_url.clone() {
@@ -8088,6 +8314,288 @@ foo = "bar"
             failed: 0,
         };
         assert_eq!(exit_code(&summary, true), 0);
+    }
+
+    // ── #1756: sound, topology/registry-aware `--strict` hard-fail ──────────────
+
+    #[test]
+    fn topology_absent_delegates_to_informational_pass() {
+        // Regression guard: with NO fleet topology declared the topology-aware
+        // check must behave exactly like the informational-only per-process
+        // report — a subset pin Passes and never fails `--strict`.
+        let queues = vec!["critical".to_string(), "bulk".to_string()];
+        let pin = vec!["critical".to_string()];
+        let result = check_queue_coverage_topology(
+            ProcessRole::Combined,
+            &queues,
+            &pin,
+            &[],  // no declared queues
+            None, // no fleet topology → informational fallback
+        );
+        assert_eq!(result.status, CheckStatus::Pass);
+        // Same detail the informational-only path produces (names the unclaimed).
+        assert!(result.detail.unwrap().contains("bulk"));
+        let summary = Summary {
+            passed: 1,
+            warned: 0,
+            failed: 0,
+        };
+        assert_eq!(exit_code(&summary, true), 0);
+    }
+
+    #[test]
+    fn topology_with_full_union_coverage_passes() {
+        // The union of all declared tiers covers every needed queue → Pass.
+        let queues = vec![
+            "critical".to_string(),
+            "bulk".to_string(),
+            "default".to_string(),
+        ];
+        let fleet = FleetTopology {
+            tiers: vec![
+                vec!["critical".to_string()],
+                vec!["bulk".to_string(), "default".to_string()],
+            ],
+        };
+        let result = check_queue_coverage_topology(
+            ProcessRole::Combined,
+            &queues,
+            &["critical".to_string()],
+            &[],
+            Some(&fleet),
+        );
+        assert_eq!(result.status, CheckStatus::Pass, "{:?}", result.detail);
+        let summary = Summary {
+            passed: 1,
+            warned: 0,
+            failed: 0,
+        };
+        assert_eq!(exit_code(&summary, true), 0);
+    }
+
+    #[test]
+    fn topology_valid_multi_tier_subset_split_does_not_fail() {
+        // The #1746 false-positive case: two tiers split the queues between them.
+        // A single process sees only its own pin (`critical`), which looks like a
+        // gap — but with the fleet topology declared the union covers everything,
+        // so `--strict` must NOT fail.
+        let queues = vec![
+            "critical".to_string(),
+            "bulk".to_string(),
+            "default".to_string(),
+        ];
+        let fleet = FleetTopology {
+            tiers: vec![
+                vec!["critical".to_string()],
+                vec!["bulk".to_string(), "default".to_string()],
+            ],
+        };
+        // Run doctor as the critical tier (pin = critical): still Pass.
+        let result = check_queue_coverage_topology(
+            ProcessRole::Worker,
+            &queues,
+            &["critical".to_string()],
+            &[],
+            Some(&fleet),
+        );
+        assert_ne!(
+            result.status,
+            CheckStatus::Fail,
+            "a valid multi-tier subset split must not fail: {:?}",
+            result.detail
+        );
+        assert_eq!(result.status, CheckStatus::Pass);
+    }
+
+    #[test]
+    fn topology_with_genuine_gap_fails_strict() {
+        // A configured queue drained by NO declared tier is a provable gap → Fail,
+        // which `--strict` promotes to exit 1.
+        let queues = vec![
+            "critical".to_string(),
+            "bulk".to_string(),
+            "default".to_string(),
+        ];
+        let fleet = FleetTopology {
+            // No tier drains `bulk`.
+            tiers: vec![vec!["critical".to_string()], vec!["default".to_string()]],
+        };
+        let result = check_queue_coverage_topology(
+            ProcessRole::Worker,
+            &queues,
+            &["critical".to_string()],
+            &[],
+            Some(&fleet),
+        );
+        assert_eq!(result.status, CheckStatus::Fail, "{:?}", result.detail);
+        assert!(
+            result.detail.unwrap().contains("bulk"),
+            "the failure must name the uncovered queue"
+        );
+        assert!(result.hint.is_some());
+        let summary = Summary {
+            passed: 0,
+            warned: 0,
+            failed: 1,
+        };
+        assert_eq!(exit_code(&summary, true), 1);
+    }
+
+    #[test]
+    fn topology_unpinned_tier_covers_everything() {
+        // An unpinned tier (empty pin) drains every queue, so union coverage is
+        // total even when other tiers are narrow subsets → Pass.
+        let queues = vec!["critical".to_string(), "bulk".to_string()];
+        let fleet = FleetTopology {
+            tiers: vec![
+                vec!["critical".to_string()],
+                Vec::new(), // unpinned tier: drains everything
+            ],
+        };
+        let result = check_queue_coverage_topology(
+            ProcessRole::Worker,
+            &queues,
+            &["critical".to_string()],
+            &[],
+            Some(&fleet),
+        );
+        assert_eq!(result.status, CheckStatus::Pass, "{:?}", result.detail);
+    }
+
+    #[test]
+    fn topology_job_declared_queue_pinned_but_absent_from_config_passes() {
+        // The #1756 blindspot RESOLVED, not failed: a queue named in a tier's pin
+        // that is a `#[job(queue = "email")]`-declared queue (absent from
+        // [jobs.queues]) must Pass. With the declared set surfaced, `email` is in
+        // the needed set AND covered by the pinning tier → no gap; even without
+        // the declared set it is simply not needed → no gap.
+        let queues = vec!["default".to_string()];
+        let declared = vec!["email".to_string()];
+        let fleet = FleetTopology {
+            tiers: vec![vec!["default".to_string(), "email".to_string()]],
+        };
+        let result = check_queue_coverage_topology(
+            ProcessRole::Worker,
+            &queues,
+            &["default".to_string(), "email".to_string()],
+            &declared,
+            Some(&fleet),
+        );
+        assert_eq!(result.status, CheckStatus::Pass, "{:?}", result.detail);
+
+        // And with the declared set UNKNOWN (empty), still Pass — the job-declared
+        // pin never manufactures a gap.
+        let result_no_manifest = check_queue_coverage_topology(
+            ProcessRole::Worker,
+            &queues,
+            &["default".to_string(), "email".to_string()],
+            &[],
+            Some(&fleet),
+        );
+        assert_eq!(
+            result_no_manifest.status,
+            CheckStatus::Pass,
+            "{:?}",
+            result_no_manifest.detail
+        );
+    }
+
+    #[test]
+    fn topology_declared_gap_on_job_declared_queue_fails() {
+        // Once the declared set is known, a job-declared queue that NO tier drains
+        // is a provable gap the runtime would strand → Fail. This is the blindspot
+        // being *resolved* (surfaced as a real gap), not a false positive.
+        let queues = vec!["default".to_string()];
+        let declared = vec!["email".to_string()];
+        let fleet = FleetTopology {
+            // No tier pins `email`.
+            tiers: vec![vec!["default".to_string()]],
+        };
+        let result = check_queue_coverage_topology(
+            ProcessRole::Worker,
+            &queues,
+            &["default".to_string()],
+            &declared,
+            Some(&fleet),
+        );
+        assert_eq!(result.status, CheckStatus::Fail, "{:?}", result.detail);
+        assert!(result.detail.unwrap().contains("email"));
+    }
+
+    #[test]
+    fn topology_empty_tiers_stays_informational() {
+        // A `[jobs.fleet]` with no tiers declares nothing coverable, so it must
+        // not fail — it falls back to informational Pass.
+        let queues = vec!["critical".to_string(), "bulk".to_string()];
+        let fleet = FleetTopology { tiers: Vec::new() };
+        let result = check_queue_coverage_topology(
+            ProcessRole::Worker,
+            &queues,
+            &["critical".to_string()],
+            &[],
+            Some(&fleet),
+        );
+        assert_eq!(result.status, CheckStatus::Pass, "{:?}", result.detail);
+    }
+
+    #[test]
+    fn resolve_fleet_topology_reads_tiers_array() {
+        let table: toml::Table =
+            toml::from_str("[jobs.fleet]\ntiers = [[\"critical\"], [\"bulk\", \"default\"], []]\n")
+                .expect("parse toml");
+        let fleet = resolve_fleet_topology(Some(&table)).expect("topology declared");
+        assert_eq!(
+            fleet.tiers,
+            vec![
+                vec!["critical".to_string()],
+                vec!["bulk".to_string(), "default".to_string()],
+                Vec::<String>::new(),
+            ]
+        );
+        assert!(fleet.has_unpinned_tier());
+    }
+
+    #[test]
+    fn resolve_fleet_topology_absent_is_none() {
+        let table: toml::Table =
+            toml::from_str("[jobs]\nqueues = [\"critical\"]\n").expect("parse toml");
+        assert!(resolve_fleet_topology(Some(&table)).is_none());
+        // Present but empty tiers → still None (nothing declared).
+        let empty: toml::Table = toml::from_str("[jobs.fleet]\ntiers = []\n").expect("parse toml");
+        assert!(resolve_fleet_topology(Some(&empty)).is_none());
+    }
+
+    #[test]
+    fn resolve_declared_queues_reads_inline_list_and_manifest() {
+        // Inline list (MVP).
+        let inline: toml::Table = toml::from_str(
+            "[jobs.fleet]\ntiers = [[\"default\"]]\ndeclared_queues = [\"email\", \"sms\"]\n",
+        )
+        .expect("parse toml");
+        let declared = resolve_declared_queues_from_sources(|_| None, Some(&inline));
+        assert_eq!(declared, vec!["email".to_string(), "sms".to_string()]);
+
+        // Emitted manifest takes precedence over the inline list.
+        let with_manifest: toml::Table = toml::from_str(
+            "[jobs.fleet]\nmanifest = \"target/jobs-manifest.toml\"\ndeclared_queues = [\"stale\"]\n",
+        )
+        .expect("parse toml");
+        let declared_from_manifest = resolve_declared_queues_from_sources(
+            |path| {
+                (path == "target/jobs-manifest.toml")
+                    .then(|| "queues = [\"critical\", \"email\"]\n".to_string())
+            },
+            Some(&with_manifest),
+        );
+        assert_eq!(
+            declared_from_manifest,
+            vec!["critical".to_string(), "email".to_string()]
+        );
+
+        // No `[jobs.fleet]` → empty.
+        let none: toml::Table =
+            toml::from_str("[jobs]\nqueues = [\"critical\"]\n").expect("parse toml");
+        assert!(resolve_declared_queues_from_sources(|_| None, Some(&none)).is_empty());
     }
 
     #[test]
