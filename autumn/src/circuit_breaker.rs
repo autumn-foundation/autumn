@@ -1,3 +1,49 @@
+//! Circuit breaker pattern for protecting upstream dependencies from cascading failures.
+//!
+//! A circuit breaker acts as a proxy for operations that might fail. It monitors
+//! for failures and, once a certain threshold is reached, it "trips" and blocks
+//! further calls to the failing service for a period of time, allowing it to recover.
+//!
+//! ## States
+//!
+//! The circuit breaker operates in three states:
+//!
+//! - **CLOSED**: Normal operation. Requests are allowed through. If the failure rate
+//!   exceeds the configured threshold, it transitions to OPEN.
+//! - **OPEN**: Failing operation. Requests are immediately rejected (fast-fail) without
+//!   being sent to the upstream service. After the `open_duration` elapses, it
+//!   transitions to HALF-OPEN.
+//! - **HALF-OPEN**: Recovery mode. A limited number of trial requests are allowed through.
+//!   If they succeed, it transitions to CLOSED. If they fail, it reverts to OPEN.
+//!
+//! ## Examples
+//!
+//! Creating a circuit breaker with a custom policy:
+//!
+//! ```rust
+//! use autumn_web::circuit_breaker::{CircuitBreaker, CircuitBreakerPolicy};
+//! use std::time::Duration;
+//!
+//! let policy = CircuitBreakerPolicy {
+//!     failure_ratio_threshold: 0.5,
+//!     sample_window: Duration::from_secs(60),
+//!     minimum_sample_count: 10,
+//!     open_duration: Duration::from_secs(30),
+//!     half_open_trial_count: 3,
+//! };
+//!
+//! let breaker = CircuitBreaker::new("my_service", policy);
+//! ```
+//!
+//! Managing circuit breakers with a registry:
+//!
+//! ```rust
+//! use autumn_web::circuit_breaker::{CircuitBreakerRegistry, CircuitBreakerPolicy};
+//!
+//! let registry = CircuitBreakerRegistry::new();
+//! let breaker = registry.get_or_create("my_service", CircuitBreakerPolicy::default());
+//! ```
+
 #![allow(
     clippy::missing_panics_doc,
     clippy::missing_errors_doc,
