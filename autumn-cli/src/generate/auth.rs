@@ -4331,6 +4331,28 @@ pub async fn change_email(
         return invalid();
     }}
 
+    // Reserve availability BEFORE minting a token, sending mail, or storing any
+    // pending state. If the address already belongs to ANOTHER account (we already
+    // excluded the caller's own address above), short-circuit to the SAME generic
+    // "check your email" response: do NOT email that third party a confirmation
+    // link, and do NOT persist a pending change the later confirm could never apply
+    // (it would collide on `email`'s unique index). Non-enumerating — the caller
+    // cannot tell a taken address from an available one. Swallow lookup errors like
+    // the reset flow so a transient DB error never becomes an existence oracle.
+    let already_taken = {table}::table
+        .filter({table}::email.eq(&new_email))
+        .select({pascal_name}::as_select())
+        .first::<{pascal_name}>(&mut *db)
+        .await
+        .ok()
+        .is_some();
+    if already_taken {{
+        flash
+            .info("Check your new email address for a confirmation link.")
+            .await;
+        return Ok(redirect_to("/account"));
+    }}
+
     // Mint a fresh single-use token; only the SHA-256 digest is stored. A second
     // change request overwrites `pending_email` and re-mints the token, so the
     // prior pending change is superseded (AC4).
@@ -9098,7 +9120,7 @@ __MAGIC_LINK_TOTP_BRANCH__    // Rotate the session id BEFORE inserting the auth
     // would let an emailed link grant password-grade step-up (sudo) freshness.
     // Drop any step-up claim carried over from a previous login in this browser.
     session.remove(autumn_web::step_up::STEP_UP_SESSION_KEY).await;
-    session.insert("__SNAKE___id", __SNAKE__.id.to_string()).await;
+__MAGIC_LINK_CLEAR_PENDING__    session.insert("__SNAKE___id", __SNAKE__.id.to_string()).await;
     session.insert("__SNAKE___email", &__SNAKE__.email).await;
     // Use the same session key checked by `#[secured]` / `#[authorize]`.
     session.insert(state.auth_session_key(), __SNAKE__.id.to_string()).await;
@@ -9155,7 +9177,14 @@ async fn send_magic_link_email(mailer: &Mailer, to: &str, token: &str) -> Autumn
     } else {
         String::new()
     };
+    // `rotate_id()` preserves session data, so the DIRECT (non-2FA) login path must
+    // scrub any abandoned pending-2FA / parked-reset handoff left in this browser
+    // before writing the auth keys — otherwise `/login/verify` could resume it under
+    // the freshly authenticated session (mirrors password login / reset). Gated on
+    // `--totp` so a magic-link-only app never references TOTP-only session keys.
+    let clear_pending = if totp { totp_clear_pending_src() } else { "" };
     TPL.replace("__MAGIC_LINK_TOTP_BRANCH__", &totp_branch)
+        .replace("__MAGIC_LINK_CLEAR_PENDING__", clear_pending)
         .replace("__PASCAL__", pascal_name)
         .replace("__SNAKE__", snake_name)
         .replace("__TABLE__", table)
@@ -10995,6 +11024,53 @@ mod tests {
     }
 
     #[test]
+    fn magic_link_verify_clears_stale_totp_pending_under_totp() {
+        // Direct (non-2FA) magic-link login rotates the session id, which PRESERVES
+        // session data. An abandoned `totp_pending_*` / parked-reset handoff left in
+        // this browser from a prior `/login/verify` would otherwise survive and could
+        // be resumed under the freshly authenticated session. Mirror the
+        // `totp_clear_pending` scrub password login / reset perform, BEFORE the auth
+        // keys are written.
+        let routes = render_routes_file("User", "user", "users", &[], true, true);
+        let body = magic_link_verify_body(&routes);
+        for key in [
+            "session.remove(\"totp_pending_id\").await;",
+            "session.remove(\"totp_pending_reset_digest\").await;",
+            "session.remove(\"totp_pending_reset_token\").await;",
+            "session.remove(\"totp_pending_secret\").await;",
+            "session.remove(\"totp_pending_confirmation\").await;",
+        ] {
+            assert!(
+                body.contains(key),
+                "magic-link direct login must clear stale pending state ({key}): {body}"
+            );
+        }
+        // The scrub must run BEFORE the authenticated session key is written.
+        let clear = body
+            .find("session.remove(\"totp_pending_id\").await;")
+            .expect("pending-id scrub present");
+        let auth_insert = body
+            .find("session.insert(state.auth_session_key()")
+            .expect("auth key insert present");
+        assert!(
+            clear < auth_insert,
+            "pending-state cleanup must precede the auth key insert: {body}"
+        );
+    }
+
+    #[test]
+    fn magic_link_verify_without_totp_omits_pending_cleanup() {
+        // A magic-link-only build (no --totp) must not reference the TOTP-only
+        // pending session keys at all — there is no /login/verify handoff to scrub.
+        let routes = render_routes_file("User", "user", "users", &[], false, true);
+        let body = magic_link_verify_body(&routes);
+        assert!(
+            !body.contains("totp_pending"),
+            "magic-link-only build must not reference TOTP pending keys: {body}"
+        );
+    }
+
+    #[test]
     fn magic_link_ttl_default_is_at_most_15_minutes() {
         let tmp = project_with_main();
         let routes = magic_link_routes(tmp.path());
@@ -11994,10 +12070,43 @@ mod tests {
             body.contains("send_email_change_notice"),
             "must send a change-notice to the old address"
         );
-        // Old address stays valid: the handler must NOT touch users::email here.
+        // Old address stays valid: the request handler must NOT SWAP the active
+        // address here (only the later confirm sets `email`). A read-only
+        // availability filter that references `users::email.eq(&new_email)` is fine;
+        // the swap is uniquely the `.set` form with a trailing comma.
         assert!(
-            !body.contains("users::email.eq"),
+            !body.contains("email.eq(&new_email),"),
             "change_email request must NOT swap the active address"
+        );
+    }
+
+    #[test]
+    fn change_email_prechecks_availability_before_sending() {
+        // If the requested address already belongs to ANOTHER account, the handler
+        // must short-circuit to the SAME generic "check your email" response
+        // WITHOUT emailing that third party and WITHOUT storing a doomed pending
+        // change (the later confirm would collide on email's unique index). The
+        // availability check must therefore run BEFORE both the mail send and the
+        // pending-state persist. Non-enumerating: the caller cannot distinguish a
+        // taken address from an available one.
+        let routes = render_routes_file("User", "user", "users", &[], false, false);
+        let body = handler_body(&routes, "change_email");
+        let precheck = body
+            .find("users::email.eq(&new_email)")
+            .expect("must look up whether the new address is already taken");
+        let send = body
+            .find("send_email_change_confirmation")
+            .expect("must send the confirmation mail");
+        let persist = body
+            .find("pending_email.eq(Some(&new_email))")
+            .expect("must persist the pending change");
+        assert!(
+            precheck < send,
+            "availability check must precede the confirmation mail send: {body}"
+        );
+        assert!(
+            precheck < persist,
+            "availability check must precede the pending-state persist: {body}"
         );
     }
 
