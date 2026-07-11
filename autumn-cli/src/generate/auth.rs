@@ -2408,6 +2408,30 @@ pub struct MagicLinkToken {{
     )
 }
 
+/// Magic-link cleanup injected into a credential-change transaction (issues
+/// #1328 hardening): when the account's password or email is changed, delete the
+/// user's outstanding `magic_link_tokens` in the SAME transaction so a link
+/// minted/intercepted before the change cannot sign the account in afterwards
+/// (magic-link auth matches an unconsumed, unexpired token, keyed by user id and
+/// independent of the changed credential). Emitted only under `--magic-link` —
+/// the table exists only then — and empty otherwise. Assumes a `user_id` binding
+/// (`let {snake}_id = {snake}.id;`) and a `conn` transaction handle are in scope,
+/// matching the `change_password` / `confirm_email_change` transactions.
+fn magic_link_credential_clear_txn_src(snake_name: &str) -> String {
+    const TPL: &str = r"            // Invalidate any outstanding magic-link login tokens in the SAME
+            // transaction: a link minted before this credential change must not
+            // sign the account in afterwards (magic-link auth matches an
+            // unconsumed, unexpired token, keyed by user id and independent of
+            // the changed credential).
+            diesel::delete(
+                magic_link_tokens::table.filter(magic_link_tokens::user_id.eq(__SNAKE___id)),
+            )
+            .execute(conn)
+            .await?;
+";
+    TPL.replace("__SNAKE__", snake_name)
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "Single auth-routes template — splitting fragments makes the template harder to read."
@@ -2435,6 +2459,18 @@ fn render_routes_file(
         )
     } else {
         (String::new(), String::new(), String::new())
+    };
+    // Magic-link token cleanup spliced into the `change_password` (#7) and
+    // `confirm_email_change` (#10) credential-change transactions. Gated on
+    // `--magic-link` so the `magic_link_tokens` reference only appears when the
+    // table (and its import) exist.
+    let (magic_link_change_password_clear, magic_link_email_change_clear) = if magic_link {
+        (
+            magic_link_credential_clear_txn_src(snake_name),
+            magic_link_credential_clear_txn_src(snake_name),
+        )
+    } else {
+        (String::new(), String::new())
     };
     let oauth_buttons = if providers.is_empty() {
         String::new()
@@ -4162,6 +4198,14 @@ pub async fn change_password(
     // (a security-neutral logout, never an unintended stay-signed-in), so it is
     // left as-is: moving the rotate/rebind after commit would only relocate the
     // same window and risks the "rotate before auth writes" fixation invariant.
+    //
+    // Revoking every OTHER tracked session is the standard response to a
+    // credential change, but it honours the same opt-out the reset/TOTP/passkey
+    // credential-change paths read ([auth.sessions].revoke_on_credential_change).
+    // When that flag is false we still rotate + rebind the CURRENT session (so
+    // this device stays signed in on a fresh id) and still clear reset/magic-link
+    // tokens — only the other-device sign-out is skipped.
+    let revoke_other_sessions_in_txn = state.config().auth.sessions.revoke_on_credential_change;
     let pre_rotation_digest = session_token_digest(&session).await;
     session.rotate_id().await;
     let post_rotation_digest = session_token_digest(&session).await;
@@ -4181,14 +4225,17 @@ pub async fn change_password(
                 .execute(conn)
                 .await?;
             // Revoke every OTHER session (all rows whose digest is not this
-            // device's pre-rotation digest), then rebind this device.
-            diesel::delete(
-                {sess_table}::table
-                    .filter({sess_table}::user_id.eq({snake_name}_id))
-                    .filter({sess_table}::token_digest.ne(&pre_rotation_digest)),
-            )
-            .execute(conn)
-            .await?;
+            // device's pre-rotation digest) unless the opt-out is set, then
+            // always rebind this device onto the rotated id below.
+            if revoke_other_sessions_in_txn {{
+                diesel::delete(
+                    {sess_table}::table
+                        .filter({sess_table}::user_id.eq({snake_name}_id))
+                        .filter({sess_table}::token_digest.ne(&pre_rotation_digest)),
+                )
+                .execute(conn)
+                .await?;
+            }}
             diesel::update(
                 {sess_table}::table.filter({sess_table}::token_digest.eq(&pre_rotation_digest)),
             )
@@ -4200,7 +4247,7 @@ pub async fn change_password(
             )
             .execute(conn)
             .await?;
-            Ok(())
+{magic_link_change_password_clear}            Ok(())
         }})
         .await
         .map_err(|e| {{
@@ -4431,34 +4478,50 @@ pub async fn confirm_email_change(
     // Consume atomically: the UPDATE re-filters on the digest so two concurrent
     // requests with the same token cannot both apply (the second matches zero
     // rows). Swapping the address here also enforces email uniqueness — a
-    // collision surfaces as the same generic error, revealing nothing.
-    let rows = diesel::update(
-        {table}::table
-            .find({snake_name}.id)
-            .filter({table}::confirm_token_digest.eq(Some(&token_digest))),
-    )
-    .set((
-        {table}::email.eq(&new_email),
-        {table}::pending_email.eq(None::<String>),
-        {table}::confirm_token_digest.eq(None::<String>),
-        {table}::confirm_token_expires_at.eq(None::<chrono::NaiveDateTime>),
-        {table}::email_confirmed_at.eq(Some(now)),
-        // Invalidate any outstanding reset token: a link sent to the OLD mailbox
-        // before this change must not be usable to reset the account after it has
-        // moved to the new address.
-        {table}::reset_token_digest.eq(None::<String>),
-        {table}::reset_token_expires_at.eq(None::<chrono::NaiveDateTime>),
-    ))
-    .execute(&mut *db)
-    .await
-    .map_err(|_| generic())?;
+    // collision surfaces as the same generic error, revealing nothing. The whole
+    // mutation runs in one transaction so the magic-link cleanup below commits
+    // atomically with the address swap (or rolls back together on any failure).
+    let {snake_name}_id = {snake_name}.id;
+    // Keep a copy for the success page; the original is moved into the txn.
+    let new_email_display = new_email.clone();
+    let rows = (*db)
+        .transaction::<_, diesel::result::Error, _>(async move |conn| {{
+            let rows = diesel::update(
+                {table}::table
+                    .find({snake_name}_id)
+                    .filter({table}::confirm_token_digest.eq(Some(&token_digest))),
+            )
+            .set((
+                {table}::email.eq(&new_email),
+                {table}::pending_email.eq(None::<String>),
+                {table}::confirm_token_digest.eq(None::<String>),
+                {table}::confirm_token_expires_at.eq(None::<chrono::NaiveDateTime>),
+                {table}::email_confirmed_at.eq(Some(now)),
+                // Invalidate any outstanding reset token: a link sent to the OLD
+                // mailbox before this change must not be usable to reset the
+                // account after it has moved to the new address.
+                {table}::reset_token_digest.eq(None::<String>),
+                {table}::reset_token_expires_at.eq(None::<chrono::NaiveDateTime>),
+            ))
+            .execute(conn)
+            .await?;
+            // Lost single-use race (token already consumed): nothing matched, so
+            // commit the no-op and leave the winner's magic-link cleanup intact.
+            // The same generic error is surfaced below.
+            if rows == 0 {{
+                return Ok(0);
+            }}
+{magic_link_email_change_clear}            Ok(rows)
+        }})
+        .await
+        .map_err(|_| generic())?;
     if rows == 0 {{
         return Err(generic());
     }}
 
     Ok(layout("Email Address Updated", html! {{
         h1 {{ "Email Address Updated" }}
-        p {{ "Your email address has been changed to " (new_email) "." }}
+        p {{ "Your email address has been changed to " (new_email_display) "." }}
         p {{ a href="/account" {{ "← Back to account" }} }}
     }})
     .into_response())
@@ -12039,6 +12102,79 @@ mod tests {
     }
 
     #[test]
+    fn change_password_clears_magic_link_tokens_only_when_enabled() {
+        // #7: a magic link minted before the password change must not sign the
+        // account in afterwards, so the credential-change transaction deletes the
+        // user's outstanding magic_link_tokens — but only under --magic-link (the
+        // table exists only then).
+        let with = render_routes_file("User", "user", "users", &[], false, true);
+        let body = handler_body(&with, "change_password");
+        assert!(
+            body.contains(
+                "magic_link_tokens::table.filter(magic_link_tokens::user_id.eq(user_id))"
+            ),
+            "with --magic-link, change_password must delete the user's magic_link_tokens"
+        );
+        // The delete must sit inside the credential-change transaction (before the
+        // final `Ok(())`), alongside the reset-token clear.
+        let clear_pos = body
+            .find("magic_link_tokens::table.filter")
+            .expect("magic-link delete present");
+        let rem_pos = body
+            .find("user_remember_tokens::table")
+            .expect("remember-chain delete present");
+        assert!(
+            rem_pos < clear_pos,
+            "magic-link delete belongs inside the same transaction as the other revocations"
+        );
+
+        let without = render_routes_file("User", "user", "users", &[], false, false);
+        let body_without = handler_body(&without, "change_password");
+        assert!(
+            !body_without.contains("magic_link_tokens"),
+            "without --magic-link, change_password must not reference magic_link_tokens"
+        );
+    }
+
+    #[test]
+    fn change_password_gates_other_session_revocation_on_opt_out() {
+        // #8: the other-device sign-out honours
+        // [auth.sessions].revoke_on_credential_change, mirroring the
+        // reset/TOTP/passkey paths — but the current session is always rebound and
+        // reset tokens are always cleared regardless of the flag.
+        let routes = render_routes_file("User", "user", "users", &[], false, false);
+        let body = handler_body(&routes, "change_password");
+        assert!(
+            body.contains("state.config().auth.sessions.revoke_on_credential_change"),
+            "change_password must read the revoke_on_credential_change opt-out"
+        );
+        // The OTHER-session delete is gated on the captured flag.
+        let flag_pos = body
+            .find("let revoke_other_sessions_in_txn =")
+            .expect("must capture the revocation flag");
+        let gate_pos = body
+            .find("if revoke_other_sessions_in_txn {")
+            .expect("other-session delete must be gated on the flag");
+        let other_delete_pos = body
+            .find("user_sessions::token_digest.ne")
+            .expect("other-session delete present");
+        assert!(
+            flag_pos < gate_pos && gate_pos < other_delete_pos,
+            "the other-session delete must sit inside `if revoke_other_sessions_in_txn`"
+        );
+        // The current session is ALWAYS rebound onto the rotated id (not gated).
+        assert!(
+            body.contains("token_digest.eq(&post_rotation_digest)"),
+            "change_password must always rebind the current session onto the rotated id"
+        );
+        // Reset tokens are cleared unconditionally (not inside the gate).
+        assert!(
+            body.contains("reset_token_digest.eq(None::<String>)"),
+            "reset tokens must be cleared regardless of the opt-out"
+        );
+    }
+
+    #[test]
     fn change_email_guards_disabled_mail_first_and_stores_pending() {
         let routes = render_routes_file("User", "user", "users", &[], false, false);
         let body = handler_body(&routes, "change_email");
@@ -12160,6 +12296,40 @@ mod tests {
         assert!(
             body.contains("reset_token_expires_at.eq(None::<chrono::NaiveDateTime>)"),
             "confirm_email_change must clear reset_token_expires_at"
+        );
+    }
+
+    #[test]
+    fn confirm_email_change_clears_magic_link_tokens_only_when_enabled() {
+        // #10: a magic link sent to the OLD mailbox before the change must not
+        // sign the account in after the address moves, so the confirmation
+        // transaction deletes the user's outstanding magic_link_tokens — gated on
+        // --magic-link.
+        let with = render_routes_file("User", "user", "users", &[], false, true);
+        let body = handler_body(&with, "confirm_email_change");
+        assert!(
+            body.contains(
+                "magic_link_tokens::table.filter(magic_link_tokens::user_id.eq(user_id))"
+            ),
+            "with --magic-link, confirm_email_change must delete the user's magic_link_tokens"
+        );
+        // The cleanup runs in the same transaction as the address swap.
+        let swap_pos = body
+            .find("users::email.eq(&new_email")
+            .expect("address swap present");
+        let clear_pos = body
+            .find("magic_link_tokens::table.filter")
+            .expect("magic-link delete present");
+        assert!(
+            swap_pos < clear_pos,
+            "magic-link delete must follow the address swap in the same transaction"
+        );
+
+        let without = render_routes_file("User", "user", "users", &[], false, false);
+        let body_without = handler_body(&without, "confirm_email_change");
+        assert!(
+            !body_without.contains("magic_link_tokens"),
+            "without --magic-link, confirm_email_change must not reference magic_link_tokens"
         );
     }
 
