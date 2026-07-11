@@ -47,6 +47,17 @@ const EMPTY_PAYLOAD_SHA256: &str =
 /// maximum) this covers a million objects — far beyond any backup prefix — while
 /// bounding a broken endpoint that never stops returning a continuation token.
 const MAX_LIST_PAGES: usize = 1000;
+/// Artifacts larger than this upload via multipart. A single `PutObject` is
+/// capped at 5 GiB by S3, so a large production dump must be sent in parts.
+const MULTIPART_THRESHOLD: u64 = 64 * 1024 * 1024; // 64 MiB
+/// Default target part size for multipart uploads. With 64 MiB parts and S3's
+/// 10 000-part limit the largest object is ≈ 640 GiB; larger files transparently
+/// grow the part size (see [`effective_part_size`]).
+const MULTIPART_PART_SIZE: u64 = 64 * 1024 * 1024; // 64 MiB
+/// S3's minimum part size (every part except the last).
+const S3_MIN_PART_SIZE: u64 = 5 * 1024 * 1024; // 5 MiB
+/// S3's maximum number of parts in one multipart upload.
+const S3_MAX_PARTS: u64 = 10_000;
 /// Connect-phase timeout for the transfer client: fail fast on a dead host
 /// without bounding the total transfer duration.
 const TRANSFER_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -367,6 +378,89 @@ fn parse_error_code(xml: &str) -> Option<String> {
     xml_first(xml, "Code")
 }
 
+// ─── Multipart helpers (pure, unit-tested) ────────────────────────────────────
+
+/// Build a `SigV4` canonical query string from `(key, value)` pairs: each key and
+/// value AWS-URI-encoded (slash encoded), pairs sorted by encoded key. A
+/// value-less flag (e.g. `uploads`) encodes as `key=`.
+fn canonical_query(params: &[(&str, &str)]) -> String {
+    let mut encoded: Vec<(String, String)> = params
+        .iter()
+        .map(|(k, v)| (aws_uri_encode(k, true), aws_uri_encode(v, true)))
+        .collect();
+    encoded.sort_by(|a, b| a.0.cmp(&b.0));
+    encoded
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
+/// Number of parts a `len`-byte object splits into at `part_size` bytes/part.
+const fn multipart_part_count(len: u64, part_size: u64) -> u64 {
+    if part_size == 0 {
+        return 0;
+    }
+    len.div_ceil(part_size)
+}
+
+/// Resolve the part size actually used for a `len`-byte file from the `configured`
+/// target. Floors at S3's 5 MiB minimum, and grows the part size when `len` at the
+/// configured size would exceed S3's 10 000-part limit so the plan always fits.
+fn effective_part_size(len: u64, configured: u64) -> u64 {
+    // Smallest part size that keeps the part count within S3_MAX_PARTS.
+    let min_for_parts = len.div_ceil(S3_MAX_PARTS).max(1);
+    configured.max(min_for_parts).max(S3_MIN_PART_SIZE)
+}
+
+/// Build the `CompleteMultipartUpload` request body from `(part_number, etag)`
+/// pairs (already in ascending part order).
+fn build_complete_multipart_xml(parts: &[(u32, String)]) -> String {
+    let mut xml = String::from("<CompleteMultipartUpload>");
+    for (number, etag) in parts {
+        let _ = write!(
+            xml,
+            "<Part><PartNumber>{number}</PartNumber><ETag>{}</ETag></Part>",
+            xml_escape(etag)
+        );
+    }
+    xml.push_str("</CompleteMultipartUpload>");
+    xml
+}
+
+/// Classify a `CompleteMultipartUpload` response body. S3 returns HTTP 200 even
+/// when assembly fails, embedding an `<Error>` in the body — so success requires
+/// a `CompleteMultipartUploadResult` element. Returns `Err(code)` (the S3
+/// `<Code>`, or a placeholder) on a 200-with-error body.
+fn classify_complete_response(body: &str) -> Result<(), String> {
+    if body.contains("<CompleteMultipartUploadResult") {
+        return Ok(());
+    }
+    Err(parse_error_code(body).unwrap_or_else(|| "UnrecognizedCompleteResponse".to_owned()))
+}
+
+/// Minimal XML entity escaping for text placed inside an element (`ETag` values).
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+/// Read up to `buf.len()` bytes, looping over short reads so a full part is
+/// assembled even when the underlying reader returns data in small pieces.
+/// Returns the number of bytes read (0 only at EOF).
+fn read_up_to(reader: &mut impl std::io::Read, buf: &mut [u8]) -> std::io::Result<usize> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        let n = reader.read(&mut buf[filled..])?;
+        if n == 0 {
+            break;
+        }
+        filled += n;
+    }
+    Ok(filled)
+}
+
 // ─── The client ──────────────────────────────────────────────────────────────
 
 /// A synchronous S3-compatible client. Cheap to clone-construct; holds a
@@ -375,6 +469,13 @@ pub struct S3Client {
     config: S3Config,
     credentials: S3Credentials,
     http: reqwest::blocking::Client,
+    /// Files larger than this upload via multipart (default
+    /// [`MULTIPART_THRESHOLD`]); overridable for tests via
+    /// [`with_multipart_params`](Self::with_multipart_params).
+    multipart_threshold: u64,
+    /// Target part size for multipart uploads (default [`MULTIPART_PART_SIZE`]);
+    /// the effective size is floored/grown per file by [`effective_part_size`].
+    multipart_part_size: u64,
     /// Clock indirection so signing/tests are deterministic. Returns the `SigV4`
     /// `x-amz-date` (`YYYYMMDDTHHMMSSZ`).
     now: fn() -> chrono::DateTime<chrono::Utc>,
@@ -389,6 +490,9 @@ enum RequestBody<'a> {
     Empty,
     /// Stream this file as the body; `sha256_hex` is its precomputed payload hash.
     File { path: &'a Path, sha256_hex: &'a str },
+    /// An in-memory body (a multipart part chunk, or a small XML request body
+    /// like `CompleteMultipartUpload`). The payload hash is computed inline.
+    Bytes(&'a [u8]),
 }
 
 /// Reject a custom `endpoint` that carries a path prefix. `canonical_path` signs
@@ -447,8 +551,22 @@ impl S3Client {
             config,
             credentials,
             http,
+            multipart_threshold: MULTIPART_THRESHOLD,
+            multipart_part_size: MULTIPART_PART_SIZE,
             now: chrono::Utc::now,
         })
+    }
+
+    /// Override the multipart threshold and target part size (both in bytes).
+    /// Used by tests / the `AUTUMN_OFFSITE_MULTIPART_PART_SIZE_BYTES` escape hatch
+    /// to exercise the multipart path on small files without a multi-GB fixture.
+    /// The part size is still floored to S3's 5 MiB minimum and grown as needed
+    /// by [`effective_part_size`] at upload time.
+    #[must_use]
+    pub const fn with_multipart_params(mut self, threshold: u64, part_size: u64) -> Self {
+        self.multipart_threshold = threshold;
+        self.multipart_part_size = part_size;
+        self
     }
 
     /// The endpoint host[:port] used for the `Host` header and `SigV4` signing.
@@ -535,6 +653,7 @@ impl S3Client {
         let payload_hash = match body {
             RequestBody::Empty => EMPTY_PAYLOAD_SHA256.to_owned(),
             RequestBody::File { sha256_hex, .. } => (*sha256_hex).to_owned(),
+            RequestBody::Bytes(bytes) => sha256_hex(bytes),
         };
         let host = self.host()?;
 
@@ -581,15 +700,21 @@ impl S3Client {
         for (name, value) in extra_headers {
             req = req.header(name.as_str(), value.as_str());
         }
-        if let RequestBody::File { path, .. } = body {
-            // Stream the file straight from disk. reqwest's blocking `Body`
-            // derives Content-Length from the file's metadata, so the object is
-            // sent with constant memory regardless of size.
-            let file = std::fs::File::open(*path).map_err(|e| S3Error::Transport {
-                op,
-                detail: format!("opening {} for upload: {e}", path.display()),
-            })?;
-            req = req.body(file);
+        match body {
+            RequestBody::Empty => {}
+            RequestBody::File { path, .. } => {
+                // Stream the file straight from disk. reqwest's blocking `Body`
+                // derives Content-Length from the file's metadata, so the object
+                // is sent with constant memory regardless of size.
+                let file = std::fs::File::open(*path).map_err(|e| S3Error::Transport {
+                    op,
+                    detail: format!("opening {} for upload: {e}", path.display()),
+                })?;
+                req = req.body(file);
+            }
+            RequestBody::Bytes(bytes) => {
+                req = req.body(bytes.to_vec());
+            }
         }
 
         let resp = req.send().map_err(|e| S3Error::Transport {
@@ -770,14 +895,218 @@ impl S3Client {
     /// regardless of file size. Returns `Ok` only once the remote is proven to
     /// match the local file.
     pub fn put_file_and_verify(&self, key: &str, path: &Path) -> Result<(), S3Error> {
-        let (digest, len) = sha256_file(path).map_err(|e| S3Error::Transport {
+        let len = std::fs::metadata(path)
+            .map_err(|e| S3Error::Transport {
+                op: "put",
+                detail: format!("stat {} for upload: {e}", path.display()),
+            })?
+            .len();
+        if len > self.multipart_threshold {
+            return self.put_file_multipart(key, path, len);
+        }
+        let (digest, hashed_len) = sha256_file(path).map_err(|e| S3Error::Transport {
             op: "put",
             detail: format!("hashing {} for upload: {e}", path.display()),
         })?;
         let checksum_b64 = base64_standard(&digest);
         let content_hex = hex::encode(digest);
         self.put_file(key, path, &checksum_b64, &content_hex)?;
-        self.verify_uploaded(key, len, &checksum_b64)
+        self.verify_uploaded(key, hashed_len, &checksum_b64)
+    }
+
+    /// Upload `path` to `key` as an S3 multipart upload: `CreateMultipartUpload`,
+    /// then one `UploadPart` per [`effective_part_size`] chunk (streamed a part at
+    /// a time — memory stays bounded to one part), then `CompleteMultipartUpload`.
+    /// On ANY failure before completion the in-progress upload is aborted
+    /// (`AbortMultipartUpload`) so no orphaned parts accrue storage cost.
+    ///
+    /// Integrity: a multipart object's `ETag` is a hash-of-part-hashes, NOT the
+    /// object's sha256, so verification can't compare `ETag`s. Instead the whole
+    /// file is hashed in the same streaming pass that uploads it, then the remote
+    /// object is verified via HEAD `Content-Length` + (checksum or GET-and-rehash)
+    /// exactly like the single-PUT path — never size alone.
+    fn put_file_multipart(&self, key: &str, path: &Path, len: u64) -> Result<(), S3Error> {
+        let part_size = effective_part_size(len, self.multipart_part_size);
+        // Defensive: effective_part_size grows the part size to keep the plan
+        // within S3's 10 000-part cap, so this should never trip — but fail loud
+        // before starting an upload that can't complete rather than mid-stream.
+        let part_count = multipart_part_count(len, part_size);
+        if part_count > S3_MAX_PARTS {
+            return Err(S3Error::BadResponse {
+                op: "create-multipart",
+                detail: format!(
+                    "artifact needs {part_count} parts at {part_size} bytes/part, \
+                     over S3's {S3_MAX_PARTS}-part limit"
+                ),
+            });
+        }
+        let upload_id = self.create_multipart_upload(key)?;
+        match self.upload_parts_and_complete(key, path, len, part_size, &upload_id) {
+            Ok(whole_b64) => {
+                // Completion succeeded: the object now exists. Do NOT abort.
+                // Verify the assembled object matches the streamed-hash of the
+                // local file (HEAD length + checksum, else GET-and-rehash).
+                self.verify_uploaded(key, len, &whole_b64)
+            }
+            Err(err) => {
+                // Best-effort abort; surface the ORIGINAL upload error regardless
+                // of whether the abort itself succeeds.
+                let _ = self.abort_multipart_upload(key, &upload_id);
+                Err(err)
+            }
+        }
+    }
+
+    /// Stream `path` in `part_size` chunks, uploading each as a numbered part and
+    /// feeding every byte into a whole-file SHA-256. Returns the base64 sha256 of
+    /// the entire file once `CompleteMultipartUpload` succeeds. One part is held
+    /// in memory at a time.
+    fn upload_parts_and_complete(
+        &self,
+        key: &str,
+        path: &Path,
+        len: u64,
+        part_size: u64,
+        upload_id: &str,
+    ) -> Result<String, S3Error> {
+        let mut file = std::fs::File::open(path).map_err(|e| S3Error::Transport {
+            op: "upload-part",
+            detail: format!("opening {} for upload: {e}", path.display()),
+        })?;
+        let cap = usize::try_from(part_size).unwrap_or(usize::MAX);
+        let mut buf = vec![0u8; cap];
+        let mut whole = Sha256Writer::new();
+        let mut parts: Vec<(u32, String)> = Vec::new();
+        let mut part_number: u32 = 1;
+        let mut uploaded: u64 = 0;
+        loop {
+            let n = read_up_to(&mut file, &mut buf).map_err(|e| S3Error::Transport {
+                op: "upload-part",
+                detail: format!("reading {} for upload: {e}", path.display()),
+            })?;
+            if n == 0 {
+                break;
+            }
+            let chunk = &buf[..n];
+            {
+                use std::io::Write as _;
+                whole
+                    .write_all(chunk)
+                    .expect("Sha256Writer::write is infallible");
+            }
+            let etag = self.upload_part(key, upload_id, part_number, chunk)?;
+            parts.push((part_number, etag));
+            uploaded += u64::try_from(n).unwrap_or(0);
+            part_number = part_number
+                .checked_add(1)
+                .ok_or_else(|| S3Error::BadResponse {
+                    op: "upload-part",
+                    detail: "part count overflow".to_owned(),
+                })?;
+        }
+        if uploaded != len {
+            return Err(S3Error::Transport {
+                op: "upload-part",
+                detail: format!("read {uploaded} bytes but file length is {len}"),
+            });
+        }
+        self.complete_multipart_upload(key, upload_id, &parts)?;
+        Ok(base64_standard(&whole.finalize()))
+    }
+
+    /// `CreateMultipartUpload` (`POST /{key}?uploads=`). Returns the `UploadId`.
+    fn create_multipart_upload(&self, key: &str) -> Result<String, S3Error> {
+        let query = canonical_query(&[("uploads", "")]);
+        let resp = self.send(
+            "create-multipart",
+            reqwest::Method::POST,
+            key,
+            &query,
+            &[],
+            &RequestBody::Empty,
+        )?;
+        let body = resp.text().map_err(|e| S3Error::Transport {
+            op: "create-multipart",
+            detail: e.to_string(),
+        })?;
+        xml_first(&body, "UploadId").ok_or_else(|| S3Error::BadResponse {
+            op: "create-multipart",
+            detail: "CreateMultipartUpload response had no <UploadId>".to_owned(),
+        })
+    }
+
+    /// `UploadPart` (`PUT /{key}?partNumber=n&uploadId=...`). Sends the chunk as
+    /// an in-memory body; returns the part's `ETag` (needed to complete).
+    fn upload_part(
+        &self,
+        key: &str,
+        upload_id: &str,
+        part_number: u32,
+        chunk: &[u8],
+    ) -> Result<String, S3Error> {
+        let pn = part_number.to_string();
+        let query = canonical_query(&[("partNumber", &pn), ("uploadId", upload_id)]);
+        let resp = self.send(
+            "upload-part",
+            reqwest::Method::PUT,
+            key,
+            &query,
+            &[],
+            &RequestBody::Bytes(chunk),
+        )?;
+        resp.headers()
+            .get(reqwest::header::ETAG)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned)
+            .ok_or_else(|| S3Error::BadResponse {
+                op: "upload-part",
+                detail: format!("UploadPart {part_number} response had no ETag"),
+            })
+    }
+
+    /// `CompleteMultipartUpload` (`POST /{key}?uploadId=...`). S3 can return HTTP
+    /// 200 with an *error* body (the connection stays open while parts assemble),
+    /// so success is confirmed by inspecting the body, not just the status.
+    fn complete_multipart_upload(
+        &self,
+        key: &str,
+        upload_id: &str,
+        parts: &[(u32, String)],
+    ) -> Result<(), S3Error> {
+        let query = canonical_query(&[("uploadId", upload_id)]);
+        let xml = build_complete_multipart_xml(parts);
+        let resp = self.send(
+            "complete-multipart",
+            reqwest::Method::POST,
+            key,
+            &query,
+            &[],
+            &RequestBody::Bytes(xml.as_bytes()),
+        )?;
+        let body = resp.text().map_err(|e| S3Error::Transport {
+            op: "complete-multipart",
+            detail: e.to_string(),
+        })?;
+        classify_complete_response(&body).map_err(|code| S3Error::Status {
+            op: "complete-multipart",
+            status: 200,
+            code: Some(code),
+        })
+    }
+
+    /// `AbortMultipartUpload` (`DELETE /{key}?uploadId=...`). Best-effort cleanup
+    /// of a failed upload's parts.
+    fn abort_multipart_upload(&self, key: &str, upload_id: &str) -> Result<(), S3Error> {
+        let query = canonical_query(&[("uploadId", upload_id)]);
+        self.send(
+            "abort-multipart",
+            reqwest::Method::DELETE,
+            key,
+            &query,
+            &[],
+            &RequestBody::Empty,
+        )?;
+        Ok(())
     }
 
     /// HEAD-verify (and streaming GET-rehash fallback) an already-uploaded object
@@ -1222,5 +1551,172 @@ mod tests {
             .unwrap();
         server.join().unwrap();
         assert_eq!(sink, body);
+    }
+
+    #[test]
+    fn multipart_part_count_divides_ceiling() {
+        assert_eq!(multipart_part_count(0, 5), 0);
+        assert_eq!(multipart_part_count(5, 5), 1);
+        assert_eq!(multipart_part_count(6, 5), 2);
+        // ~12 MiB at a 5 MiB part size → 3 parts (the Docker round-trip's shape).
+        let twelve_mib = 12 * 1024 * 1024;
+        let five_mib = 5 * 1024 * 1024;
+        assert_eq!(multipart_part_count(twelve_mib, five_mib), 3);
+    }
+
+    #[test]
+    fn effective_part_size_floors_at_s3_minimum() {
+        // A tiny configured part size is floored to S3's 5 MiB minimum.
+        assert_eq!(
+            effective_part_size(100 * 1024 * 1024, 1024),
+            S3_MIN_PART_SIZE
+        );
+    }
+
+    #[test]
+    fn effective_part_size_keeps_a_valid_configured_size() {
+        let part = 8 * 1024 * 1024;
+        assert_eq!(effective_part_size(64 * 1024 * 1024, part), part);
+    }
+
+    #[test]
+    fn effective_part_size_grows_to_fit_part_cap() {
+        // A file so large that the configured part size would exceed 10 000 parts
+        // must transparently grow the part size to stay within the cap.
+        let configured = S3_MIN_PART_SIZE;
+        // 10 001 parts' worth of bytes at the minimum size.
+        let len = (S3_MAX_PARTS + 1) * S3_MIN_PART_SIZE;
+        let eff = effective_part_size(len, configured);
+        assert!(
+            eff > configured,
+            "part size should grow past the configured floor"
+        );
+        assert!(
+            multipart_part_count(len, eff) <= S3_MAX_PARTS,
+            "grown part size must keep the plan within S3's 10 000-part cap"
+        );
+    }
+
+    #[test]
+    fn build_complete_multipart_xml_lists_parts_in_order() {
+        let parts = vec![
+            (1u32, "\"etag-one\"".to_owned()),
+            (2u32, "\"etag-two\"".to_owned()),
+        ];
+        let xml = build_complete_multipart_xml(&parts);
+        assert_eq!(
+            xml,
+            "<CompleteMultipartUpload>\
+             <Part><PartNumber>1</PartNumber><ETag>\"etag-one\"</ETag></Part>\
+             <Part><PartNumber>2</PartNumber><ETag>\"etag-two\"</ETag></Part>\
+             </CompleteMultipartUpload>"
+        );
+    }
+
+    #[test]
+    fn build_complete_multipart_xml_escapes_etag() {
+        let parts = vec![(1u32, "a&b<c".to_owned())];
+        let xml = build_complete_multipart_xml(&parts);
+        assert!(xml.contains("<ETag>a&amp;b&lt;c</ETag>"));
+    }
+
+    #[test]
+    fn canonical_query_encodes_and_sorts() {
+        // Flag-only param encodes as `key=`; pairs sort by encoded key.
+        assert_eq!(canonical_query(&[("uploads", "")]), "uploads=");
+        assert_eq!(
+            canonical_query(&[("partNumber", "2"), ("uploadId", "abc/def")]),
+            "partNumber=2&uploadId=abc%2Fdef"
+        );
+    }
+
+    #[test]
+    fn classify_complete_response_accepts_result_body() {
+        let ok = r#"<?xml version="1.0"?><CompleteMultipartUploadResult>\
+            <Location>http://x</Location><ETag>"abc-3"</ETag>\
+            </CompleteMultipartUploadResult>"#;
+        assert!(classify_complete_response(ok).is_ok());
+    }
+
+    #[test]
+    fn classify_complete_response_detects_200_with_error_body() {
+        // S3 returns 200 then an <Error> body when assembly fails; we must treat
+        // that as a failure and surface the <Code>.
+        let err = "<Error><Code>InternalError</Code><Message>oops</Message></Error>";
+        assert_eq!(
+            classify_complete_response(err).unwrap_err(),
+            "InternalError"
+        );
+    }
+
+    #[test]
+    fn classify_complete_response_rejects_unrecognized_body() {
+        assert_eq!(
+            classify_complete_response("garbage").unwrap_err(),
+            "UnrecognizedCompleteResponse"
+        );
+    }
+
+    #[test]
+    fn parse_upload_id_from_create_response() {
+        let body = r#"<?xml version="1.0" encoding="UTF-8"?>
+        <InitiateMultipartUploadResult>
+          <Bucket>b</Bucket>
+          <Key>db/prod/x.dump</Key>
+          <UploadId>VXBsb2FkSUQtMTIz</UploadId>
+        </InitiateMultipartUploadResult>"#;
+        assert_eq!(
+            xml_first(body, "UploadId").as_deref(),
+            Some("VXBsb2FkSUQtMTIz")
+        );
+    }
+
+    #[test]
+    fn read_up_to_fills_across_short_reads() {
+        // A reader that hands back one byte at a time must still fill the buffer.
+        struct DribbleReader<'a> {
+            data: &'a [u8],
+            pos: usize,
+        }
+        impl std::io::Read for DribbleReader<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if self.pos >= self.data.len() || buf.is_empty() {
+                    return Ok(0);
+                }
+                buf[0] = self.data[self.pos];
+                self.pos += 1;
+                Ok(1)
+            }
+        }
+        let mut r = DribbleReader {
+            data: b"abcdef",
+            pos: 0,
+        };
+        let mut buf = [0u8; 4];
+        assert_eq!(read_up_to(&mut r, &mut buf).unwrap(), 4);
+        assert_eq!(&buf, b"abcd");
+        let mut rest = [0u8; 4];
+        assert_eq!(read_up_to(&mut r, &mut rest).unwrap(), 2);
+        assert_eq!(&rest[..2], b"ef");
+    }
+
+    #[test]
+    fn with_multipart_params_overrides_defaults() {
+        let client = S3Client::new(
+            S3Config {
+                bucket: "b".to_owned(),
+                region: "us-east-1".to_owned(),
+                endpoint: Some("https://minio.example:9000".to_owned()),
+                force_path_style: true,
+            },
+            S3Credentials {
+                access_key_id: "k".to_owned(),
+                secret_access_key: "s".to_owned(),
+            },
+        )
+        .unwrap()
+        .with_multipart_params(5 * 1024 * 1024, 5 * 1024 * 1024);
+        assert_eq!(client.multipart_threshold, 5 * 1024 * 1024);
+        assert_eq!(client.multipart_part_size, 5 * 1024 * 1024);
     }
 }

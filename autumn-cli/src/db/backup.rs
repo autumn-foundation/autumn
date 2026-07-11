@@ -1677,10 +1677,30 @@ impl ResolvedOffsite {
             });
         }
         let creds = self.resolve_credentials()?;
-        S3Client::new(self.s3.clone(), creds).map_err(|e| BackupError::Offsite {
+        let client = S3Client::new(self.s3.clone(), creds).map_err(|e| BackupError::Offsite {
             op: "connect",
             detail: e.to_string(),
+        })?;
+        // Test/ops escape hatch: shrink the multipart threshold and part size so
+        // the multipart path can be exercised (or tuned) without a multi-GB
+        // fixture. The value is a target part size in bytes; both threshold and
+        // part size are set to it (the client re-floors to S3's 5 MiB minimum).
+        Ok(match self.multipart_part_size_override() {
+            Some(bytes) => client.with_multipart_params(bytes, bytes),
+            None => client,
         })
+    }
+
+    /// Read the `AUTUMN_OFFSITE_MULTIPART_PART_SIZE_BYTES` override (profile-aware,
+    /// so a `.env.<profile>` value is honored). A blank/unparseable value is
+    /// ignored (falls back to the client defaults).
+    fn multipart_part_size_override(&self) -> Option<u64> {
+        use autumn_web::config::Env as _;
+        let env = dotenv_env_for_profile(&self.profile);
+        env.var("AUTUMN_OFFSITE_MULTIPART_PART_SIZE_BYTES")
+            .ok()
+            .and_then(|v: String| v.trim().parse::<u64>().ok())
+            .filter(|&n| n > 0)
     }
 
     /// Resolve the access key / secret from the environment variables NAMED by
