@@ -9111,17 +9111,17 @@ fn magic_link_routes_section_src(
 // - `magic_link_verify` rotates the session id BEFORE establishing the
 //   authenticated session (session-fixation defense).
 
-/// Configurable magic-link token TTL, in minutes. Default 15 (AC5: ≤ 15 min).
-///
-/// This is the knob to tune the link lifetime. To source it from configuration
-/// instead, read it from `state.config()` (see docs/guide/authentication.md).
-const MAGIC_LINK_TTL_MINUTES: i64 = 15;
-
-/// Per-email cooldown, in seconds. `POST /login/magic` skips minting a fresh
-/// token when an unexpired, unconsumed token was issued for the account within
-/// this window — throttling email-bombing a single address even from rotating
-/// IPs (the per-IP limit is enforced by `#[throttle]`).
-const MAGIC_LINK_EMAIL_COOLDOWN_SECONDS: i64 = 60;
+// Magic-link token TTL and per-email cooldown are sourced from `autumn.toml`
+// via `state.config().auth.magic_link` (see docs/guide/authentication.md):
+//
+//   [auth.magic_link]
+//   ttl_minutes = 15          # link lifetime; keep ≤ 15 min for a tight window (AC5)
+//   email_cooldown_secs = 60  # per-email re-mint cooldown (email-bomb throttle)
+//
+// The documented defaults (15 min TTL, 60s cooldown) apply when the section is
+// omitted — see `MagicLinkConfig` in the `autumn-web` crate. Keep `ttl_minutes`
+// at 15 or less: a magic link is a bearer credential, so a tight expiry window
+// bounds the blast radius of a leaked link.
 
 #[derive(Deserialize)]
 pub struct MagicLinkRequestForm {
@@ -9161,6 +9161,7 @@ pub async fn magic_link_request_form(
 pub async fn magic_link_request(
     mut db: Db,
     mailer: Mailer,
+    State(state): State<AppState>,
     Form(form): Form<MagicLinkRequestForm>,
 ) -> AutumnResult<Markup> {
     // Fail fast when mail is not configured. This is independent of the address
@@ -9175,6 +9176,10 @@ pub async fn magic_link_request(
 
     let email = form.email.trim().to_lowercase();
     let now = chrono::Utc::now().naive_utc();
+    // Sourced from `[auth.magic_link]` in autumn.toml (defaults: 15 min TTL, 60s
+    // cooldown). Keep `ttl_minutes` ≤ 15 for a tight link-lifetime window.
+    let ttl_minutes = state.config().auth.magic_link.ttl_minutes;
+    let email_cooldown_secs = state.config().auth.magic_link.email_cooldown_secs;
     // Record start time; the response is padded to a constant minimum below so
     // an attacker cannot infer registration status from response latency.
     let t0 = std::time::Instant::now();
@@ -9192,7 +9197,7 @@ pub async fn magic_link_request(
     if let Some(__SNAKE__) = maybe___SNAKE__ {
         // Per-email cooldown (AC6): skip re-minting when an unexpired,
         // unconsumed token was issued for this account within the window.
-        let cooldown_start = now - chrono::Duration::seconds(MAGIC_LINK_EMAIL_COOLDOWN_SECONDS);
+        let cooldown_start = now - chrono::Duration::seconds(email_cooldown_secs);
         let recent: i64 = magic_link_tokens::table
             .filter(magic_link_tokens::user_id.eq(__SNAKE__.id))
             .filter(magic_link_tokens::consumed_at.is_null())
@@ -9208,7 +9213,7 @@ pub async fn magic_link_request(
             // SHA-256 digest is stored; the raw token appears only in the link.
             let raw_token = generate_reset_token();
             let token_digest = sha256_hex(&raw_token);
-            let expires_at = now + chrono::Duration::minutes(MAGIC_LINK_TTL_MINUTES);
+            let expires_at = now + chrono::Duration::minutes(ttl_minutes);
             let new_token = NewMagicLinkToken {
                 user_id: __SNAKE__.id,
                 token_digest,
@@ -9223,7 +9228,7 @@ pub async fn magic_link_request(
                 .await
             {
                 tracing::error!("magic-link token insert failed: {e}");
-            } else if let Err(e) = send_magic_link_email(&mailer, &__SNAKE__.email, &raw_token).await {
+            } else if let Err(e) = send_magic_link_email(&mailer, &__SNAKE__.email, &raw_token, ttl_minutes).await {
                 tracing::error!("magic-link email failed: {e}");
             }
         }
@@ -9388,7 +9393,12 @@ __MAGIC_LINK_CLEAR_PENDING__    session.insert("__SNAKE___id", __SNAKE__.id.to_s
 /// Goes through the standard `Mail` builder so it inherits dev-mailbox preview,
 /// suppression-list gating, and templating (AC7). Suppression is intentionally
 /// NOT bypassed (`.ignore_suppression()` is not called).
-async fn send_magic_link_email(mailer: &Mailer, to: &str, token: &str) -> AutumnResult<()> {
+async fn send_magic_link_email(
+    mailer: &Mailer,
+    to: &str,
+    token: &str,
+    ttl_minutes: i64,
+) -> AutumnResult<()> {
     // APP_BASE_URL must be the public URL of your app (e.g. https://example.com).
     let base_url = std::env::var("APP_BASE_URL")
         .unwrap_or_else(|_| "http://localhost:3000".to_owned());
@@ -9398,13 +9408,13 @@ async fn send_magic_link_email(mailer: &Mailer, to: &str, token: &str) -> Autumn
         .subject("Your sign-in link")
         .html(html! {
             p { "Click the link below to sign in. No password required." }
-            p { "This link expires in " (MAGIC_LINK_TTL_MINUTES) " minutes and can be used once." }
+            p { "This link expires in " (ttl_minutes) " minutes and can be used once." }
             p { a href=(&verify_url) { "Sign in" } }
             p { "If you did not request this, you can safely ignore this email." }
         })
         .text(format!(
             "Sign in: {verify_url}\n\
-             This link expires in {MAGIC_LINK_TTL_MINUTES} minutes and can be used once.\n\
+             This link expires in {ttl_minutes} minutes and can be used once.\n\
              If you did not request this you can safely ignore this email."
         ))
         .build()
@@ -9536,10 +9546,22 @@ with `--oauth`, `--passkeys`, and `--totp` on the same model.
 
 ### Configuration Knobs
 
+The TTL and per-email cooldown are read from `autumn.toml` via `state.config()`,
+so you can tune them without editing the generated handler:
+
+```toml
+[auth.magic_link]
+ttl_minutes = 15          # link lifetime; keep ≤ 15 min for a tight window
+email_cooldown_secs = 60  # per-email re-mint cooldown (email-bomb throttle)
+```
+
+Both keys are optional; omitting the `[auth.magic_link]` section applies the
+documented defaults below.
+
 | Knob | Location | Default | Purpose |
 |------|----------|---------|---------|
-| `MAGIC_LINK_TTL_MINUTES` | const in `src/routes/auth.rs` | `15` | Link lifetime (TTL). Must be ≤ 15 min for a tight window; tune here, or wire it to `state.config()` to source from `autumn.toml`. |
-| `MAGIC_LINK_EMAIL_COOLDOWN_SECONDS` | const in `src/routes/auth.rs` | `60` | Per-email cooldown: suppresses re-minting a token for the same address within the window (email-bomb throttle). |
+| `auth.magic_link.ttl_minutes` | `[auth.magic_link]` in `autumn.toml` (via `state.config()`) | `15` | Link lifetime (TTL) in minutes. Keep ≤ 15 min for a tight window — a magic link is a bearer credential, so a short expiry bounds the blast radius of a leaked link. |
+| `auth.magic_link.email_cooldown_secs` | `[auth.magic_link]` in `autumn.toml` (via `state.config()`) | `60` | Per-email cooldown in seconds: suppresses re-minting a token for the same address within the window (email-bomb throttle). |
 | `#[throttle(limit = 5, per = "1m", key = "ip")]` | attribute on `POST /login/magic` and `POST /login/magic/verify` | 5/min/IP | Per-IP rate limit via autumn's existing rate-limit middleware (request minting + token brute-force bound). |
 
 ### Security Guarantees
@@ -9558,7 +9580,8 @@ with `--oauth`, `--passkeys`, and `--totp` on the same model.
 - **Generic failure (no oracle)**: expired, already-consumed, unknown, and
   malformed tokens all render the same generic failure page; the GET confirm page
   is likewise rendered identically regardless of token validity.
-- **Configurable TTL**: tokens expire after `MAGIC_LINK_TTL_MINUTES` (default 15).
+- **Configurable TTL**: tokens expire after `auth.magic_link.ttl_minutes`
+  (default 15), sourced from `autumn.toml` via `state.config()`.
 - **Rate-limited**: per-IP (`#[throttle]`) and per-email (DB cooldown).
 - **Session-fixation defense**: the session id is rotated before the
   authenticated session is established.
@@ -11514,12 +11537,24 @@ mod tests {
     }
 
     #[test]
-    fn magic_link_ttl_default_is_at_most_15_minutes() {
+    fn magic_link_ttl_is_config_sourced_with_15_minute_default() {
         let tmp = project_with_main();
         let routes = magic_link_routes(tmp.path());
+        // TTL is now sourced from autumn.toml via state.config(), not a const.
         assert!(
-            routes.contains("const MAGIC_LINK_TTL_MINUTES: i64 = 15;"),
-            "default TTL must be a documented const ≤ 15 minutes: {routes}"
+            routes.contains("state.config().auth.magic_link.ttl_minutes"),
+            "TTL must be sourced from state.config().auth.magic_link: {routes}"
+        );
+        // The documented default (15) and the ≤ 15-minute guidance must survive
+        // the move to config so operators keep the tight-window recommendation.
+        assert!(
+            routes.contains("ttl_minutes = 15") && routes.contains("≤ 15 min"),
+            "generated docs/comments must keep the 15-minute default and ≤ 15 min guidance: {routes}"
+        );
+        // The per-email cooldown is likewise config-sourced.
+        assert!(
+            routes.contains("state.config().auth.magic_link.email_cooldown_secs"),
+            "per-email cooldown must be sourced from state.config().auth.magic_link: {routes}"
         );
     }
 
@@ -11641,11 +11676,11 @@ mod tests {
             "docs section"
         );
         assert!(
-            docs.contains("MAGIC_LINK_TTL_MINUTES"),
-            "docs must document the TTL knob"
+            docs.contains("auth.magic_link.ttl_minutes"),
+            "docs must document the config-sourced TTL knob"
         );
         assert!(
-            docs.contains("#[throttle(") && docs.contains("MAGIC_LINK_EMAIL_COOLDOWN_SECONDS"),
+            docs.contains("#[throttle(") && docs.contains("auth.magic_link.email_cooldown_secs"),
             "docs must document per-IP + per-email rate limiting"
         );
         assert!(

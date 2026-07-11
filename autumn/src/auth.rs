@@ -595,6 +595,21 @@ pub struct AuthConfig {
     /// ```
     #[serde(default)]
     pub remember: RememberConfig,
+
+    /// Passwordless magic-link login policy (issue #1737).
+    ///
+    /// Controls the one-time sign-in link lifetime and the per-email re-mint
+    /// cooldown for the routes emitted by `autumn generate auth --magic-link`.
+    ///
+    /// Configure in `autumn.toml`:
+    ///
+    /// ```toml
+    /// [auth.magic_link]
+    /// ttl_minutes = 15          # link lifetime; keep ≤ 15 min for a tight window
+    /// email_cooldown_secs = 60  # per-email re-mint cooldown (email-bomb throttle)
+    /// ```
+    #[serde(default)]
+    pub magic_link: MagicLinkConfig,
 }
 
 /// Account lockout policy configuration.
@@ -726,6 +741,55 @@ impl Default for SessionTrackingConfig {
         Self {
             revoke_on_credential_change: true,
             last_seen_update_secs: default_last_seen_update_secs(),
+        }
+    }
+}
+
+/// Passwordless magic-link login configuration (issue #1737).
+///
+/// Read from the `[auth.magic_link]` section of `autumn.toml`. Consumed by the
+/// routes emitted by `autumn generate auth --magic-link` via `state.config()`.
+/// All fields have safe production defaults.
+///
+/// ```toml
+/// [auth.magic_link]
+/// ttl_minutes = 15          # default
+/// email_cooldown_secs = 60  # default
+/// ```
+#[derive(Debug, Clone, Copy, serde::Deserialize)]
+pub struct MagicLinkConfig {
+    /// One-time sign-in link lifetime, in minutes (default: `15`).
+    ///
+    /// Keep this at `15` or less: a magic link is a bearer credential, so a
+    /// tight expiry window bounds the blast radius of a leaked link (e.g. via a
+    /// forwarded email or a shared inbox). Raise it only with that tradeoff in
+    /// mind.
+    #[serde(default = "default_magic_link_ttl_minutes")]
+    pub ttl_minutes: i64,
+
+    /// Per-email cooldown, in seconds (default: `60`).
+    ///
+    /// `POST /login/magic` skips minting a fresh token when an unexpired,
+    /// unconsumed token was already issued for the account within this window —
+    /// throttling email-bombing a single address even from rotating IPs (the
+    /// per-IP limit is enforced separately by `#[throttle]`).
+    #[serde(default = "default_magic_link_email_cooldown_secs")]
+    pub email_cooldown_secs: i64,
+}
+
+const fn default_magic_link_ttl_minutes() -> i64 {
+    15
+}
+
+const fn default_magic_link_email_cooldown_secs() -> i64 {
+    60
+}
+
+impl Default for MagicLinkConfig {
+    fn default() -> Self {
+        Self {
+            ttl_minutes: default_magic_link_ttl_minutes(),
+            email_cooldown_secs: default_magic_link_email_cooldown_secs(),
         }
     }
 }
@@ -1623,6 +1687,7 @@ impl Default for AuthConfig {
             sessions: SessionTrackingConfig::default(),
             password: PasswordConfig::default(),
             remember: RememberConfig::default(),
+            magic_link: MagicLinkConfig::default(),
         }
     }
 }
