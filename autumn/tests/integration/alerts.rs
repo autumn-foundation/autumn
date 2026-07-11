@@ -95,6 +95,7 @@ async fn dead_lettered_job_delivers_alert_to_configured_channel() {
     autumn_web::alerts::notify_dead_lettered_job(
         client.state(),
         "reporting_job",
+        "job-abc-123",
         "connection refused after 5 attempts",
     );
 
@@ -105,12 +106,63 @@ async fn dead_lettered_job_delivers_alert_to_configured_channel() {
     assert_eq!(alert.condition, AlertCondition::DeadLetteredJob);
     assert_eq!(alert.severity, AlertSeverity::Critical);
     assert_eq!(alert.event, AlertEventKind::Trigger);
+    // The dedup key stays scoped to the job TYPE (not the instance id) so a mass
+    // failure of one job type yields a bounded number of alerts (AC #3).
     assert_eq!(alert.dedup_key, "dead_lettered_job:reporting_job");
     // AC #4: states what, where to look, and on which host.
     assert_eq!(alert.where_to_look, "/actuator/jobs");
     assert!(alert.title.contains("reporting_job"));
+    // The bounded alert still names a concrete failed instance so the operator
+    // knows a specific job to look at: the id appears in the title, summary, and
+    // the structured `job_id` detail.
+    assert!(alert.title.contains("job-abc-123"));
+    assert!(alert.summary.contains("job-abc-123"));
+    assert_eq!(
+        alert.details.get("job_id").map(String::as_str),
+        Some("job-abc-123")
+    );
     assert!(alert.summary.contains("connection refused"));
     assert!(!alert.host.is_empty());
+}
+
+/// AC #3 (bounded, per JOB TYPE): two DISTINCT instances of the SAME job name
+/// that dead-letter within the dedup window collapse into ONE alert — the dedup
+/// key is scoped to the job type (`dead_lettered_job:{job_name}`), NOT the
+/// instance id, so a mass failure of one job type never floods the operator with
+/// one alert per failed job. The single delivered alert still names a concrete
+/// representative failed instance (the first one observed) so the operator has a
+/// job id to look at; the full set is visible at `/actuator/jobs`.
+#[tokio::test]
+async fn distinct_ids_of_same_job_dedup_to_one_bounded_alert() {
+    let channel = CapturingChannel::default();
+    let alerter = Alerter::new(vec![Arc::new(channel.clone())], test_settings());
+
+    let client = TestApp::new()
+        .state_initializer(move |state| state.insert_extension(alerter))
+        .build();
+
+    // Two different job instances of the SAME job name fail within the window.
+    autumn_web::alerts::notify_dead_lettered_job(client.state(), "reporting_job", "job-1", "boom");
+    autumn_web::alerts::notify_dead_lettered_job(client.state(), "reporting_job", "job-2", "boom");
+
+    // Give any (erroneously) dispatched second delivery a chance to arrive.
+    wait_for(&channel, 1).await;
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+
+    let alerts = channel.alerts();
+    assert_eq!(
+        alerts.len(),
+        1,
+        "distinct instances of the same job type must dedup to one bounded alert: {alerts:?}"
+    );
+    // Still keyed on the job TYPE, and it names the first (representative) id.
+    assert_eq!(alerts[0].dedup_key, "dead_lettered_job:reporting_job");
+    assert_eq!(
+        alerts[0].details.get("job_id").map(String::as_str),
+        Some("job-1"),
+        "the bounded alert names the first observed failed instance"
+    );
+    assert!(alerts[0].title.contains("job-1"));
 }
 
 /// Finding 2: an alert's `where_to_look` must honor the configured `[actuator]
@@ -130,7 +182,7 @@ async fn where_to_look_honors_custom_actuator_prefix() {
         .state_initializer(move |state| state.insert_extension(alerter))
         .build();
 
-    autumn_web::alerts::notify_dead_lettered_job(client.state(), "reporting_job", "boom");
+    autumn_web::alerts::notify_dead_lettered_job(client.state(), "reporting_job", "job-1", "boom");
 
     wait_for(&channel, 1).await;
     let alerts = channel.alerts();
@@ -194,7 +246,7 @@ async fn sensitive_false_alerts_point_at_mounted_endpoint() {
         .state_initializer(move |state| state.insert_extension(alerter))
         .build();
 
-    autumn_web::alerts::notify_dead_lettered_job(client.state(), "reporting_job", "boom");
+    autumn_web::alerts::notify_dead_lettered_job(client.state(), "reporting_job", "job-1", "boom");
     autumn_web::alerts::notify_scheduled_task_failure(
         client.state(),
         "nightly_backup",
@@ -234,7 +286,7 @@ async fn sensitive_false_alerts_point_at_mounted_endpoint() {
         .state_initializer(move |state| state.insert_extension(alerter2))
         .build();
 
-    autumn_web::alerts::notify_dead_lettered_job(client2.state(), "reporting_job", "boom");
+    autumn_web::alerts::notify_dead_lettered_job(client2.state(), "reporting_job", "job-1", "boom");
     autumn_web::alerts::notify_scheduled_task_failure(
         client2.state(),
         "nightly_backup",
@@ -474,7 +526,7 @@ async fn webhook_with_whitespace_padded_url_registers_and_uses_trimmed_url() {
     );
 
     // Fire an alert and wait for the detached delivery task to POST to the mock.
-    autumn_web::alerts::notify_dead_lettered_job(client.state(), "reporting_job", "boom");
+    autumn_web::alerts::notify_dead_lettered_job(client.state(), "reporting_job", "job-1", "boom");
     for _ in 0..100 {
         if mock.call_count() >= 1 {
             break;
@@ -838,7 +890,7 @@ async fn alert_fans_out_to_every_channel() {
         .state_initializer(move |state| state.insert_extension(alerter))
         .build();
 
-    autumn_web::alerts::notify_dead_lettered_job(client.state(), "widget_job", "boom");
+    autumn_web::alerts::notify_dead_lettered_job(client.state(), "widget_job", "job-1", "boom");
 
     wait_for(&a, 1).await;
     wait_for(&b, 1).await;
@@ -875,7 +927,7 @@ async fn disabled_master_switch_silences_custom_channels() {
     );
 
     // Triggering a condition through the real seam delivers nothing.
-    autumn_web::alerts::notify_dead_lettered_job(client.state(), "reporting_job", "boom");
+    autumn_web::alerts::notify_dead_lettered_job(client.state(), "reporting_job", "job-1", "boom");
     autumn_web::alerts::notify_scheduled_task_failure(client.state(), "nightly_backup", "boom");
 
     // Give any (erroneously) spawned delivery task a chance to run.

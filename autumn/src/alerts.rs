@@ -675,7 +675,15 @@ pub fn alerter(state: &AppState) -> Option<Arc<Alerter>> {
 
 /// Condition (a): a background job was dead-lettered. Called from the job
 /// backends' dead-letter sites. No-op when no alerter is installed.
-pub fn notify_dead_lettered_job(state: &AppState, job_name: &str, error: &str) {
+///
+/// The dedup key is scoped to `job_name` (NOT `job_id`) **by design**: during a
+/// mass failure of one job type the operator gets a bounded number of alerts —
+/// at most one per failing job type per dedup window (AC #3) — rather than one
+/// per dead-lettered instance. So that the bounded alert does not hide which
+/// concrete job failed, the specific `job_id` is threaded into the alert's
+/// human-facing title/summary and its `job_id` detail; the full set of
+/// dead-lettered jobs remains visible at the `/actuator/jobs` endpoint.
+pub fn notify_dead_lettered_job(state: &AppState, job_name: &str, job_id: &str, error: &str) {
     let Some(alerter) = alerter(state) else {
         return;
     };
@@ -683,9 +691,9 @@ pub fn notify_dead_lettered_job(state: &AppState, job_name: &str, error: &str) {
         AlertCondition::DeadLetteredJob,
         format!("dead_lettered_job:{job_name}"),
     )
-    .title(format!("Job '{job_name}' was dead-lettered"))
+    .title(format!("Job '{job_name}' (id {job_id}) was dead-lettered"))
     .summary(format!(
-        "Background job '{job_name}' exhausted its retries and was moved to the dead-letter queue. Last error: {error}"
+        "Background job '{job_name}' (id {job_id}) exhausted its retries and was moved to the dead-letter queue. Last error: {error}"
     ))
     .where_to_look(sensitive_gated_where_to_look(
         &alerter.settings().actuator_prefix,
@@ -693,6 +701,7 @@ pub fn notify_dead_lettered_job(state: &AppState, job_name: &str, error: &str) {
         alerter.settings().actuator_sensitive,
     ))
     .detail("job", job_name)
+    .detail("job_id", job_id)
     .detail("error", error)
     .build();
     let _ = alerter.notify(alert);

@@ -172,6 +172,25 @@ reports a genuinely healthy status again (`UP`, or `UNKNOWN` — both of which
 alert stays active and no false recovery is emitted until the indicator is
 actually healthy.
 
+### Dead-lettered jobs: bounded per job type
+
+The **dead-lettered-job** condition is deduplicated **per job type** — its dedup
+key is `dead_lettered_job:{job_name}`, scoped to the job's name, not the
+individual job instance. So when many instances of the *same* job type
+dead-letter within the dedup window (a mass failure — a dependency outage
+dead-lettering every `reporting_job` in the queue), you receive a **bounded
+number of alerts** (at most one per job type per window) rather than one alert
+per failed job. This deliberately protects a single-VPS operator from being
+flooded during an incident.
+
+So the bounded alert never hides *which* job failed, it names a concrete,
+representative failed instance: the specific job's id appears in the alert title
+and summary (`Job 'reporting_job' (id job-abc-123) was dead-lettered: …`) and in
+the structured `job_id` detail field. The **full set** of dead-lettered jobs —
+every instance, not just the one named in the alert — is always visible at the
+`/actuator/jobs` endpoint (the alert's "where to look next" pointer), so start
+from the named id and consult `/actuator/jobs` for the complete list.
+
 ### Silencing a condition
 
 - **Silence everything:** set `enabled = false`. This is the master off switch
@@ -221,12 +240,12 @@ The webhook payload is JSON:
   "condition": "dead_lettered_job",
   "severity": "critical",
   "event": "trigger",
-  "title": "Job 'reporting_job' was dead-lettered",
-  "summary": "Background job 'reporting_job' exhausted its retries …",
+  "title": "Job 'reporting_job' (id job-abc-123) was dead-lettered",
+  "summary": "Background job 'reporting_job' (id job-abc-123) exhausted its retries …",
   "timestamp": "2026-07-10T12:00:00Z",
   "host": "web-7c9f",
   "where_to_look": "/actuator/jobs",
-  "details": { "job": "reporting_job", "error": "connection refused" }
+  "details": { "job": "reporting_job", "job_id": "job-abc-123", "error": "connection refused" }
 }
 ```
 

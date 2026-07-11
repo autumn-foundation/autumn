@@ -3376,6 +3376,7 @@ async fn execute_local_job(
         crate::alerts::notify_dead_lettered_job(
             state,
             &job.name,
+            &job.id,
             &format!("unknown job '{}'", job.name),
         );
         job_admin.record_failure(&job.id, format!("unknown job '{}'", job.name));
@@ -3555,7 +3556,7 @@ async fn execute_local_job(
                 state
                     .job_registry
                     .record_failure(&job.name, error.clone(), true);
-                crate::alerts::notify_dead_lettered_job(state, &job.name, &error);
+                crate::alerts::notify_dead_lettered_job(state, &job.name, &job.id, &error);
                 job_admin.record_failure(&job.id, error);
                 release_local_unique_hold(
                     coordination,
@@ -3571,7 +3572,7 @@ async fn execute_local_job(
             state
                 .job_registry
                 .record_failure(&job.name, error.clone(), true);
-            crate::alerts::notify_dead_lettered_job(state, &job.name, &error);
+            crate::alerts::notify_dead_lettered_job(state, &job.name, &job.id, &error);
             job_admin.record_failure(&job.id, error);
             release_local_unique_hold(
                 coordination,
@@ -5315,7 +5316,7 @@ async fn recover_stale_redis_jobs(
                     state
                         .job_registry
                         .record_failure(&dead.name, error.clone(), true);
-                    crate::alerts::notify_dead_lettered_job(state, &dead.name, &error);
+                    crate::alerts::notify_dead_lettered_job(state, &dead.name, &dead.id, &error);
                     job_admin.record_failure(&dead.id, error);
                     // The worker that held this claim is gone and the job is
                     // now terminally dead-lettered — settle the tracked
@@ -5491,7 +5492,7 @@ async fn settle_failed_redis_job(
                     state
                         .job_registry
                         .record_failure(&dead.name, error.clone(), true);
-                    crate::alerts::notify_dead_lettered_job(state, &dead.name, &error);
+                    crate::alerts::notify_dead_lettered_job(state, &dead.name, &dead.id, &error);
                     job_admin.record_failure(&dead.id, error);
                 }
                 Ok(false) => tracing::warn!(
@@ -5527,7 +5528,7 @@ async fn dead_letter_panicked_redis_job(
             state
                 .job_registry
                 .record_failure(&dead.name, error.clone(), true);
-            crate::alerts::notify_dead_lettered_job(state, &dead.name, &error);
+            crate::alerts::notify_dead_lettered_job(state, &dead.name, &dead.id, &error);
             job_admin.record_failure(&dead.id, error);
         }
         Ok(false) => tracing::warn!(
@@ -5556,7 +5557,7 @@ async fn dead_letter_invalid_redis_job(
     state
         .job_registry
         .record_failure(&record.name, error.to_owned(), true);
-    crate::alerts::notify_dead_lettered_job(state, &record.name, error);
+    crate::alerts::notify_dead_lettered_job(state, &record.name, &record.id, error);
     job_admin.record_failure(&record.id, error.to_owned());
     let mut dead = record.clone();
     clear_redis_claim(&mut dead);
@@ -5971,7 +5972,7 @@ fn record_pg_lifecycle_after_ack(
             state
                 .job_registry
                 .record_failure(job_name, error.to_owned(), true);
-            crate::alerts::notify_dead_lettered_job(state, job_name, error);
+            crate::alerts::notify_dead_lettered_job(state, job_name, job_id, error);
             job_admin.record_failure(job_id, error.to_owned());
         }
     }
@@ -6723,6 +6724,8 @@ async fn pg_ack_dead_letter(
 #[derive(diesel::QueryableByName)]
 struct PgStaleRecoveryRow {
     #[diesel(sql_type = diesel::sql_types::Text)]
+    id: String,
+    #[diesel(sql_type = diesel::sql_types::Text)]
     name: String,
     #[diesel(sql_type = diesel::sql_types::Text)]
     payload: String,
@@ -6795,7 +6798,7 @@ async fn pg_recover_stale_claims(pool: &PgPool, visibility_timeout_ms: u64, stat
            FOR UPDATE SKIP LOCKED \
            LIMIT 100 \
          ) \
-         RETURNING name, payload::TEXT AS payload, status",
+         RETURNING id, name, payload::TEXT AS payload, status",
     )
     .bind::<diesel::sql_types::BigInt, _>(i64::try_from(visibility_timeout_ms).unwrap_or(i64::MAX))
     .get_results::<PgStaleRecoveryRow>(&mut *conn)
@@ -6830,6 +6833,7 @@ async fn pg_recover_stale_claims(pool: &PgPool, visibility_timeout_ms: u64, stat
                 crate::alerts::notify_dead_lettered_job(
                     state,
                     &row.name,
+                    &row.id,
                     "visibility timeout expired",
                 );
                 let payload = serde_json::from_str::<Value>(&row.payload).unwrap_or(Value::Null);
@@ -12298,6 +12302,7 @@ mod tests {
             crate::alerts::notify_dead_lettered_job(
                 &state,
                 "crashed_elsewhere",
+                "job-crashed-elsewhere-1",
                 "visibility timeout expired",
             );
 
@@ -12550,6 +12555,7 @@ mod tests {
             crate::alerts::notify_dead_lettered_job(
                 &state,
                 "slow_resumer",
+                &job_id,
                 "visibility timeout expired",
             );
 
