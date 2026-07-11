@@ -3554,7 +3554,12 @@ pub(crate) fn start_local_runtime_inner(
     // Queue pinning (#1623): restrict this process to the pinned subset and warn
     // loudly about any configured queue the pin leaves without coverage (AC6).
     let uncovered = schedule.retain_pinned(pin);
-    warn_pinned_uncovered_queues(&uncovered, pin, schedule.names().is_empty());
+    // Only worker/combined roles claim queues, so gate the coverage warning on
+    // `run_workers`: a web replica (run_workers == false) drains nothing by
+    // design and must not warn about queues it will never claim (#1623).
+    if should_warn_pin_coverage(run_workers, pin) {
+        warn_pinned_uncovered_queues(&uncovered, pin, schedule.names().is_empty());
+    }
     let pin_active = !pin.is_empty();
     // Per-queue caps / dedicated slots (#1623): the shared slot accounting core.
     // Filter the limits to the queues this process actually drains after pinning
@@ -3683,6 +3688,18 @@ pub(crate) fn start_local_runtime_inner(
             }
         });
     }
+}
+
+/// Whether this process should evaluate queue-pin coverage and emit the AC6
+/// startup diagnostic (issue #1623). Only worker/combined roles
+/// (`run_workers == true`) claim queues, so a web replica (`run_workers ==
+/// false`) runs zero workers and intentionally covers nothing — it must never
+/// warn about queues it will not drain. An empty `pin` restricts nothing, so
+/// there is likewise no coverage gap to report. Mirrors the doctor web-role
+/// skip; since doctor queue-coverage is informational-only, this runtime guard
+/// is the authoritative AC6 check.
+const fn should_warn_pin_coverage(run_workers: bool, pin: &[String]) -> bool {
+    run_workers && !pin.is_empty()
 }
 
 /// Startup zero-coverage guard for queue pinning (issue #1623, AC6). Emits a
@@ -6328,7 +6345,13 @@ fn start_redis_runtime(
     // Queue pinning (#1623, AC3): this worker process only drains the pinned
     // subset. Warn about any configured queue left uncovered (AC6).
     let uncovered = schedule.retain_pinned(&config.pin);
-    warn_pinned_uncovered_queues(&uncovered, &config.pin, schedule.names().is_empty());
+    // Only worker/combined roles claim queues, so gate the coverage warning on
+    // `run_workers` (this runs before the `if !run_workers { return }` guard
+    // below): a web replica drains nothing by design and must not warn about
+    // queues it will never claim (#1623).
+    if should_warn_pin_coverage(run_workers, &config.pin) {
+        warn_pinned_uncovered_queues(&uncovered, &config.pin, schedule.names().is_empty());
+    }
     // Filter limits to the pinned subset so reservations/caps for queues served
     // by other replicas don't consume this process's shared slots (#1623).
     let mut limits = QueueLimits::from_config(&config.queues);
@@ -8158,7 +8181,13 @@ fn start_postgres_runtime(
     // Queue pinning (#1623, AC3): restrict this worker process to the pinned
     // subset and warn about any configured queue left uncovered (AC6).
     let uncovered = schedule.retain_pinned(&config.pin);
-    warn_pinned_uncovered_queues(&uncovered, &config.pin, schedule.names().is_empty());
+    // Only worker/combined roles claim queues, so gate the coverage warning on
+    // `run_workers` (this runs before the `if !run_workers { return }` guard
+    // below): a web replica drains nothing by design and must not warn about
+    // queues it will never claim (#1623).
+    if should_warn_pin_coverage(run_workers, &config.pin) {
+        warn_pinned_uncovered_queues(&uncovered, &config.pin, schedule.names().is_empty());
+    }
     // Filter limits to the pinned subset so reservations/caps for queues served
     // by other replicas don't consume this process's shared slots (#1623).
     let mut limits = QueueLimits::from_config(&config.queues);
@@ -17496,6 +17525,28 @@ mod queue_schedule_tests {
             uncovered,
             vec!["critical".to_string(), "default".to_string()]
         );
+    }
+
+    #[test]
+    fn pin_coverage_warning_gated_on_worker_role() {
+        // #1623 follow-up: a web replica (run_workers == false) runs zero job
+        // workers and claims no queues, so it must never evaluate pin coverage
+        // or emit the AC6 startup warning — even with a non-empty jobs.pin that
+        // would warn on a worker/combined role. Mirrors the doctor web-role
+        // skip; since doctor coverage is informational-only this runtime guard
+        // is the authoritative AC6 check.
+        let pin = vec!["critical".to_string()];
+        assert!(
+            !should_warn_pin_coverage(false, &pin),
+            "web role (run_workers=false) must not warn about pin coverage"
+        );
+        assert!(
+            should_warn_pin_coverage(true, &pin),
+            "worker/combined role with a pin still evaluates coverage (AC6)"
+        );
+        // An empty pin leaves nothing uncovered, so no role warns.
+        assert!(!should_warn_pin_coverage(true, &[]));
+        assert!(!should_warn_pin_coverage(false, &[]));
     }
 
     #[test]
