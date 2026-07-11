@@ -50,8 +50,14 @@ need a sender address: the alert mail carries no per-message `from`, so it uses
 the mailer default (`[mail] from`). With `transport = "smtp"` and no `[mail]
 from`, SMTP delivery fails with "mail from address is required", so doctor warns
 (in production) for an SMTP email destination with no `[mail] from` — set
-`[mail] from` (or `AUTUMN_MAIL__FROM`). The `log` and `file` transports deliver
-without a `from`, so they are not gated on it. Doctor also honours
+`[mail] from` (or `AUTUMN_MAIL__FROM`). The `from` must also be a *valid* mailbox:
+the runtime parses `[mail] from` at boot and refuses to start when it is set to an
+unparsable value like `not-a-mailbox`, so doctor warns (in production) for a
+present-but-invalid `[mail] from` on an SMTP transport — naming the offending
+value — to catch it before deploy rather than via a boot crash. Display-name
+senders such as `Ops <ops@example.com>` are accepted (they parse fine). The `log`
+and `file` transports deliver without a `from`, so they are not gated on it.
+Doctor also honours
 the master switch: when `[alerts] enabled = false` (or
 `AUTUMN_ALERTS__ENABLED=false`) in production it warns that no operator alerts
 will be delivered even though a destination is configured, because the runtime
