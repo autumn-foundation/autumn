@@ -1356,6 +1356,7 @@ pub mod test;
 /// Dependency-free HTML parser + CSS-selector matcher backing the structural
 /// HTML assertions on [`test::TestResponse`].
 mod test_html;
+pub use config::ProcessRole;
 pub use state::AppState;
 
 #[cfg(test)]

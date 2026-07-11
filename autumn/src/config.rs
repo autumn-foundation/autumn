@@ -111,6 +111,7 @@
 //! | `AUTUMN_CHANNELS__REDIS__KEY_PREFIX` | `channels.redis.key_prefix` | `String` |
 //! | `AUTUMN_JOBS__BACKEND` | `jobs.backend` | `local` / `postgres` / `redis` |
 //! | `AUTUMN_JOBS__WORKERS` | `jobs.workers` | `usize` |
+//! | `AUTUMN_JOBS__PIN` | `jobs.pin` | comma-separated queue names |
 //! | `AUTUMN_JOBS__MAX_ATTEMPTS` | `jobs.max_attempts` | `u32` |
 //! | `AUTUMN_JOBS__INITIAL_BACKOFF_MS` | `jobs.initial_backoff_ms` | `u64` |
 //! | `AUTUMN_JOBS__REDIS__URL` | `jobs.redis.url` | `String` |
@@ -1941,6 +1942,14 @@ pub struct JobConfig {
     /// (probabilistic fair draining that never starves lower queues).
     #[serde(default)]
     pub queues: JobQueuesConfig,
+    /// Queues this process is pinned to. Empty (default) = claim every
+    /// configured/declared queue (today's behavior). When non-empty, this
+    /// worker process only ever claims jobs from queues in this set — on every
+    /// backend — so a worker tier can be dedicated to a subset of queues
+    /// (issue #1623, AC3). Names outside the configured/declared topology are
+    /// ignored. Set from `AUTUMN_JOBS__PIN` (comma-separated) too.
+    #[serde(default)]
+    pub pin: Vec<String>,
     /// Redis backend options.
     #[serde(default)]
     pub redis: JobRedisConfig,
@@ -1961,6 +1970,7 @@ impl Default for JobConfig {
             max_attempts: default_job_max_attempts(),
             initial_backoff_ms: default_job_backoff_ms(),
             queues: JobQueuesConfig::default(),
+            pin: Vec::new(),
             redis: JobRedisConfig::default(),
             postgres: JobPostgresConfig::default(),
             tracking: JobTrackingConfig::default(),
@@ -1968,7 +1978,8 @@ impl Default for JobConfig {
     }
 }
 
-/// A single named queue and its draining weight.
+/// A single named queue and its draining weight, plus optional per-queue
+/// worker-pool controls.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JobQueue {
     /// Queue name, as declared by `#[job(queue = "...")]`.
@@ -1976,6 +1987,27 @@ pub struct JobQueue {
     /// Relative draining weight (used only for weighted draining; `1` for the
     /// strict-priority list form).
     pub weight: u32,
+    /// Optional hard cap on how many of the process's worker slots this queue
+    /// may occupy at once. `None` = uncapped (may use the whole shared pool).
+    /// Lets a bulk queue never exceed its configured share (issue #1623, AC2).
+    pub concurrency: Option<usize>,
+    /// Optional number of worker slots dedicated to this queue that no other
+    /// queue may consume. `None`/`0` = no reservation. Guarantees a queue keeps
+    /// making progress even while another queue floods (issue #1623, AC1).
+    pub reserved: Option<usize>,
+}
+
+impl JobQueue {
+    /// A weight-only queue (no per-queue caps or reservations).
+    #[must_use]
+    pub fn new(name: impl Into<String>, weight: u32) -> Self {
+        Self {
+            name: name.into(),
+            weight,
+            concurrency: None,
+            reserved: None,
+        }
+    }
 }
 
 /// Worker queue drain configuration parsed from `[jobs] queues`.
@@ -2003,10 +2035,7 @@ impl JobQueuesConfig {
     #[must_use]
     pub fn single_default() -> Self {
         Self {
-            queues: vec![JobQueue {
-                name: "default".to_string(),
-                weight: 1,
-            }],
+            queues: vec![JobQueue::new("default", 1)],
             strict: true,
         }
     }
@@ -2020,10 +2049,7 @@ impl JobQueuesConfig {
     {
         let queues: Vec<JobQueue> = names
             .into_iter()
-            .map(|name| JobQueue {
-                name: name.into(),
-                weight: 1,
-            })
+            .map(|name| JobQueue::new(name, 1))
             .collect();
         if queues.is_empty() {
             Self::single_default()
@@ -2045,10 +2071,7 @@ impl JobQueuesConfig {
     {
         let queues: Vec<JobQueue> = entries
             .into_iter()
-            .map(|(name, weight)| JobQueue {
-                name: name.into(),
-                weight: weight.max(1),
-            })
+            .map(|(name, weight)| JobQueue::new(name, weight.max(1)))
             .collect();
         if queues.is_empty() {
             Self::single_default()
@@ -2058,6 +2081,100 @@ impl JobQueuesConfig {
                 strict: false,
             }
         }
+    }
+
+    /// Build a weighted schedule from fully-specified [`JobQueue`] entries
+    /// (weight plus optional per-queue `concurrency` cap and `reserved` slots).
+    /// Weights are clamped to a minimum of `1`. Empty input falls back to the
+    /// zero-config single `default` queue.
+    #[must_use]
+    pub fn weighted_specs(queues: Vec<JobQueue>) -> Self {
+        if queues.is_empty() {
+            Self::single_default()
+        } else {
+            Self {
+                queues: queues
+                    .into_iter()
+                    .map(|mut q| {
+                        q.weight = q.weight.max(1);
+                        q
+                    })
+                    .collect(),
+                strict: false,
+            }
+        }
+    }
+}
+
+/// One value in the `[jobs.queues]` weight table: either a bare integer weight
+/// (`critical = 4`) or a table with per-queue pool controls
+/// (`critical = { weight = 4, concurrency = 8, reserved = 2 }`).
+#[derive(Debug, Clone)]
+enum JobQueueValue {
+    Weight(u32),
+    Spec {
+        weight: Option<u32>,
+        concurrency: Option<usize>,
+        reserved: Option<usize>,
+    },
+}
+
+impl<'de> serde::Deserialize<'de> for JobQueueValue {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        use serde::de::{MapAccess, Visitor};
+        use std::fmt;
+
+        struct ValueVisitor;
+
+        impl<'de> Visitor<'de> for ValueVisitor {
+            type Value = JobQueueValue;
+
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str(
+                    "a queue weight (e.g. critical = 4) or a queue table \
+                     (e.g. critical = { weight = 4, concurrency = 8, reserved = 2 })",
+                )
+            }
+
+            fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<Self::Value, E> {
+                Ok(JobQueueValue::Weight(
+                    u32::try_from(v).map_err(|_| E::custom("queue weight is too large"))?,
+                ))
+            }
+
+            fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<Self::Value, E> {
+                if v < 0 {
+                    return Err(E::custom("queue weight must not be negative"));
+                }
+                self.visit_u64(u64::try_from(v).unwrap_or(0))
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                let mut weight = None;
+                let mut concurrency = None;
+                let mut reserved = None;
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "weight" => weight = Some(map.next_value::<u32>()?),
+                        "concurrency" => concurrency = Some(map.next_value::<usize>()?),
+                        "reserved" => reserved = Some(map.next_value::<usize>()?),
+                        other => {
+                            return Err(serde::de::Error::custom(format!(
+                                "unknown queue setting '{other}' (expected weight, concurrency, \
+                                 or reserved)"
+                            )));
+                        }
+                    }
+                }
+                Ok(JobQueueValue::Spec {
+                    weight,
+                    concurrency,
+                    reserved,
+                })
+            }
+        }
+
+        d.deserialize_any(ValueVisitor)
     }
 }
 
@@ -2093,17 +2210,30 @@ impl<'de> serde::Deserialize<'de> for JobQueuesConfig {
             }
 
             fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
-                let mut entries: Vec<(String, u32)> = Vec::new();
-                while let Some((k, v)) = map.next_entry::<String, u32>()? {
-                    if v == 0 {
+                let mut queues: Vec<JobQueue> = Vec::new();
+                while let Some((k, value)) = map.next_entry::<String, JobQueueValue>()? {
+                    let (weight, concurrency, reserved) = match value {
+                        JobQueueValue::Weight(w) => (w, None, None),
+                        JobQueueValue::Spec {
+                            weight,
+                            concurrency,
+                            reserved,
+                        } => (weight.unwrap_or(1), concurrency, reserved),
+                    };
+                    if weight == 0 {
                         return Err(serde::de::Error::custom(format!(
                             "queue '{k}' weight must be at least 1 (got 0); \
                              to disable a queue remove it from the list"
                         )));
                     }
-                    entries.push((k, v));
+                    queues.push(JobQueue {
+                        name: k,
+                        weight,
+                        concurrency,
+                        reserved,
+                    });
                 }
-                Ok(JobQueuesConfig::weighted(entries))
+                Ok(JobQueuesConfig::weighted_specs(queues))
             }
         }
 
@@ -2757,6 +2887,7 @@ impl AutumnConfig {
     /// # Jobs
     /// - `AUTUMN_JOBS__BACKEND` → `jobs.backend` (`local` / `redis`)
     /// - `AUTUMN_JOBS__WORKERS` → `jobs.workers` (`usize`)
+    /// - `AUTUMN_JOBS__PIN` → `jobs.pin` (comma-separated queue names)
     /// - `AUTUMN_JOBS__MAX_ATTEMPTS` → `jobs.max_attempts` (`u32`)
     /// - `AUTUMN_JOBS__INITIAL_BACKOFF_MS` → `jobs.initial_backoff_ms` (`u64`)
     /// - `AUTUMN_JOBS__REDIS__URL` → `jobs.redis.url` (`String`)
@@ -3329,6 +3460,14 @@ impl AutumnConfig {
     fn apply_jobs_env_overrides_with_env(&mut self, env: &dyn Env) {
         parse_env_string(env, "AUTUMN_JOBS__BACKEND", &mut self.jobs.backend);
         parse_env(env, "AUTUMN_JOBS__WORKERS", &mut self.jobs.workers);
+        if let Ok(val) = env.var("AUTUMN_JOBS__PIN") {
+            self.jobs.pin = val
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .collect();
+        }
         parse_env(
             env,
             "AUTUMN_JOBS__MAX_ATTEMPTS",
@@ -7692,6 +7831,114 @@ path = "/healthz"
         assert!(
             err.contains("duplicate queue name") && err.contains("critical"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn job_queues_table_form_parses_caps_and_reserved_slots() {
+        // Issue #1623: a queue value may be a bare weight OR a table with
+        // per-queue `concurrency` (cap) and `reserved` (dedicated) slots.
+        let config: AutumnConfig = toml::from_str(
+            r"
+            [jobs.queues]
+            critical = { weight = 3, reserved = 2 }
+            bulk = { weight = 1, concurrency = 4 }
+            default = 2
+            ",
+        )
+        .unwrap();
+        assert!(!config.jobs.queues.strict, "table form is weighted");
+        let find = |name: &str| {
+            config
+                .jobs
+                .queues
+                .queues
+                .iter()
+                .find(|q| q.name == name)
+                .cloned()
+                .unwrap()
+        };
+        let critical = find("critical");
+        assert_eq!(critical.weight, 3);
+        assert_eq!(critical.reserved, Some(2));
+        assert_eq!(critical.concurrency, None);
+        let bulk = find("bulk");
+        assert_eq!(bulk.weight, 1);
+        assert_eq!(bulk.concurrency, Some(4));
+        assert_eq!(bulk.reserved, None);
+        // Bare integer still works alongside the table form.
+        let default = find("default");
+        assert_eq!(default.weight, 2);
+        assert_eq!(default.concurrency, None);
+        assert_eq!(default.reserved, None);
+    }
+
+    #[test]
+    fn job_queues_table_form_defaults_weight_to_one() {
+        let config: AutumnConfig = toml::from_str(
+            r"
+            [jobs.queues]
+            critical = { reserved = 1 }
+            ",
+        )
+        .unwrap();
+        let critical = &config.jobs.queues.queues[0];
+        assert_eq!(critical.weight, 1, "omitted weight defaults to 1");
+        assert_eq!(critical.reserved, Some(1));
+    }
+
+    #[test]
+    fn job_queues_table_form_rejects_zero_weight() {
+        let err = toml::from_str::<AutumnConfig>(
+            r"
+            [jobs.queues]
+            critical = { weight = 0, reserved = 1 }
+            ",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("weight must be at least 1") && err.contains("critical"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn job_queues_table_form_rejects_unknown_setting() {
+        let err = toml::from_str::<AutumnConfig>(
+            r"
+            [jobs.queues]
+            critical = { weight = 1, bogus = 3 }
+            ",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("bogus"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn jobs_pin_defaults_empty_and_parses_from_toml() {
+        let default = AutumnConfig::default();
+        assert!(default.jobs.pin.is_empty(), "pin is empty by default (AC4)");
+        let config: AutumnConfig = toml::from_str(
+            r#"
+            [jobs]
+            pin = ["critical", "default"]
+            "#,
+        )
+        .unwrap();
+        assert_eq!(config.jobs.pin, vec!["critical", "default"]);
+    }
+
+    #[test]
+    fn jobs_pin_env_override_is_comma_separated() {
+        let env = MockEnv::new().with("AUTUMN_JOBS__PIN", "critical, bulk ,");
+        let mut config = AutumnConfig::default();
+        config.apply_jobs_env_overrides_with_env(&env);
+        assert_eq!(
+            config.jobs.pin,
+            vec!["critical".to_string(), "bulk".to_string()],
+            "trims whitespace and drops empty entries"
         );
     }
 

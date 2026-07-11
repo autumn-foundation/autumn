@@ -310,6 +310,29 @@ count and autoscaler, both pointing the readiness probe at `/ready` so the
 [rolling-deploy drain](#rolling-deploy-lifecycle) supervises worker rollouts the
 same way it does web.
 
+### Gating app-owned background work
+
+`AUTUMN_ROLE` gates the **framework's** `#[job]`/`#[scheduled]` workers, but not
+a background loop your app spawns itself in an `on_startup` hook — that runs on
+every replica, including the web tier, unless you gate it. The resolved role is
+exposed on `AppState` as the same value the framework used to gate its own
+workers, so self-gate app-owned loops instead of re-reading `AUTUMN_ROLE`:
+
+```rust
+use autumn_web::{AppState, ProcessRole};
+
+// on_startup hook: only start the embedded loop where workers run.
+if state.role().runs_workers() {
+    tokio::spawn(my_embedded_worker(state.clone()));
+}
+```
+
+`state.role()` returns a `ProcessRole` with `serves_http()` / `runs_workers()`
+predicates; see
+[Self-gating app-owned background work](jobs.md#self-gating-app-owned-background-work).
+Custom/named roles are unsupported today — for finer placement use per-queue
+worker pinning (#1623) plus app-level `state.role()` gating.
+
 ## Migration Jobs
 
 For multi-replica deployments, do not rely on each web process racing to apply

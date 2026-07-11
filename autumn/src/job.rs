@@ -197,6 +197,28 @@ impl QueueSchedule {
         self.queues.iter().any(|(n, _)| n == name)
     }
 
+    /// Restrict this schedule to the pinned subset (issue #1623, AC3),
+    /// preserving strict/weighted ordering *within* the subset. Pin names
+    /// outside the schedule are ignored. Returns the names of queues the pin
+    /// leaves **without** coverage in this process, for the zero-coverage guard
+    /// (AC6). An empty `pin` is a no-op returning no uncovered queues — today's
+    /// single-shared-pool behavior (AC4).
+    pub(crate) fn retain_pinned(&mut self, pin: &[String]) -> Vec<String> {
+        let pinned: std::collections::HashSet<String> =
+            pin.iter().map(|p| normalize_queue_name(p)).collect();
+        if pinned.is_empty() {
+            return Vec::new();
+        }
+        let uncovered: Vec<String> = self
+            .queues
+            .iter()
+            .filter(|(n, _)| !pinned.contains(n))
+            .map(|(n, _)| n.clone())
+            .collect();
+        self.queues.retain(|(n, _)| pinned.contains(n));
+        uncovered
+    }
+
     /// Queue names highest priority first.
     #[cfg_attr(not(any(test, feature = "redis")), allow(dead_code))]
     pub(crate) fn names(&self) -> Vec<String> {
@@ -251,6 +273,303 @@ impl QueueCursor {
         order.push(self.names[best].clone());
         order.extend(rest.into_iter().map(|i| self.names[i].clone()));
         Arc::new(order)
+    }
+}
+
+/// Per-queue worker-pool limits derived from `[jobs] queues`: an optional
+/// concurrency cap and an optional reserved-slot count per queue (issue #1623).
+/// Backend-agnostic; consumed by [`QueueSlots`] on every backend.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct QueueLimits {
+    /// Max worker slots a queue may occupy at once (AC2). Absent = uncapped.
+    concurrency: HashMap<String, usize>,
+    /// Worker slots dedicated to a queue that no other queue may consume (AC1).
+    reserved: HashMap<String, usize>,
+}
+
+impl QueueLimits {
+    /// Extract per-queue caps/reservations from parsed `[jobs] queues`. Only
+    /// positive values are recorded; `None`/`0` means "no limit".
+    pub(crate) fn from_config(cfg: &crate::config::JobQueuesConfig) -> Self {
+        let mut concurrency = HashMap::new();
+        let mut reserved = HashMap::new();
+        for q in &cfg.queues {
+            let name = normalize_queue_name(&q.name);
+            if let Some(c) = q.concurrency.filter(|c| *c > 0) {
+                concurrency.insert(name.clone(), c);
+            }
+            if let Some(r) = q.reserved.filter(|r| *r > 0) {
+                reserved.insert(name, r);
+            }
+        }
+        Self {
+            concurrency,
+            reserved,
+        }
+    }
+
+    /// Restrict the recorded caps/reservations to `queues`, dropping every
+    /// entry for a queue this process does not serve (issue #1623). After queue
+    /// pinning (`retain_pinned`) a process only drains the pinned subset; the
+    /// reservations and caps of queues served by *other* replicas must not
+    /// consume this process's shared slots. Passing the full queue set (the
+    /// empty-pin case) is a no-op, so the zero-config path is untouched.
+    pub(crate) fn retain_queues(&mut self, queues: &[String]) {
+        let keep: std::collections::HashSet<&str> = queues.iter().map(String::as_str).collect();
+        self.concurrency.retain(|q, _| keep.contains(q.as_str()));
+        self.reserved.retain(|q, _| keep.contains(q.as_str()));
+    }
+
+    /// The reservation a queue actually withholds from the *other* queues'
+    /// shared pool. A queue can never run more jobs than its own `concurrency`
+    /// cap, so reserving beyond that cap withholds slots it can never use;
+    /// clamp the effective reservation to the cap (issue #1623, P2). Uncapped
+    /// queues withhold their full reservation.
+    fn effective_reserved(&self, queue: &str) -> usize {
+        let reserved = self.reserved.get(queue).copied().unwrap_or(0);
+        self.concurrency
+            .get(queue)
+            .copied()
+            .map_or(reserved, |cap| reserved.min(cap))
+    }
+
+    /// Whether any cap or reservation is configured. When empty, the whole
+    /// slot-accounting layer is a no-op passthrough (today's behavior, AC4).
+    pub(crate) fn is_empty(&self) -> bool {
+        self.concurrency.is_empty() && self.reserved.is_empty()
+    }
+
+    /// Emit a loud startup warning when the reservations can't all be honored:
+    /// the sum of reserved slots exceeds `workers`, or any single queue reserves
+    /// more than `workers` (issue #1623). Does not panic, exit, or clamp — the
+    /// running-count ceiling still keeps total concurrency at `workers` — this
+    /// only tells the operator the config is self-contradictory so they can fix
+    /// it. Queues declared solely via `#[job(queue="…")]` are covered here (this
+    /// runs on the real per-process worker count), not by `autumn doctor`.
+    fn warn_if_oversubscribed(&self, workers: usize) {
+        if self.reserved.is_empty() {
+            return;
+        }
+        let total_reserved: usize = self.reserved.values().copied().sum();
+        if total_reserved > workers {
+            tracing::warn!(
+                workers,
+                total_reserved,
+                reserved = ?self.reserved,
+                "sum of per-queue reserved job slots ({total_reserved}) exceeds the worker \
+                 count ({workers}); not all reservations can be honored. Reduce the `reserved` \
+                 values in [jobs.queues] or raise the worker count.",
+            );
+        }
+        for (queue, reserved) in &self.reserved {
+            if *reserved > workers {
+                tracing::warn!(
+                    queue = %queue,
+                    reserved = *reserved,
+                    workers,
+                    "queue '{queue}' reserves {reserved} job slot(s) but only {workers} \
+                     worker(s) exist in this process; its reservation can never be fully \
+                     satisfied.",
+                );
+            }
+            // A reservation larger than the queue's own concurrency cap is
+            // self-contradictory: the queue can never run enough jobs to use
+            // those slots, so the excess is clamped ([`Self::effective_reserved`])
+            // instead of being withheld from other queues forever (issue #1623).
+            if let Some(cap) = self.concurrency.get(queue).copied()
+                && *reserved > cap
+            {
+                tracing::warn!(
+                    queue = %queue,
+                    reserved = *reserved,
+                    concurrency = cap,
+                    "queue '{queue}' reserves {reserved} job slot(s) but is capped at {cap} \
+                     concurrent job(s); its reservation is clamped to {cap} so the excess is \
+                     not withheld from other queues. Lower `reserved` to at most `concurrency`.",
+                );
+            }
+        }
+    }
+}
+
+/// Decide whether `queue` may claim a job **right now**, given the per-queue
+/// running counts in this process, the total running count, the configured
+/// [`QueueLimits`], and the process's total worker slots.
+///
+/// Pure and side-effect free — the unit-tested core of the per-queue worker
+/// pools (issue #1623). Rules:
+/// - A queue at or above its `concurrency` cap may not claim (AC2).
+/// - A queue may always draw on one of its own still-unfilled `reserved` slots
+///   (AC1) — a flood on another queue can never take those.
+/// - Otherwise it needs a free **shared** slot: total slots, minus everything
+///   already running, minus the reserved slots still pledged (unfilled) to
+///   *other* queues.
+/// - With no caps/reservations this reduces to "claim while any worker is
+///   free", i.e. the single-shared-pool default (AC4).
+pub(crate) fn queue_may_claim(
+    queue: &str,
+    running: &HashMap<String, usize>,
+    total_running: usize,
+    limits: &QueueLimits,
+    total_slots: usize,
+) -> bool {
+    let running_here = running.get(queue).copied().unwrap_or(0);
+
+    // AC2: a hard per-queue concurrency cap is never exceeded.
+    if let Some(cap) = limits.concurrency.get(queue)
+        && running_here >= *cap
+    {
+        return false;
+    }
+
+    // AC1: a queue may always use one of its own unfilled reserved slots.
+    let own_reserved = limits.reserved.get(queue).copied().unwrap_or(0);
+    if running_here < own_reserved {
+        return true;
+    }
+
+    // Otherwise draw from the shared pool: free = total - running - the reserved
+    // slots still owed to (unfilled by) other queues. Each queue's reservation
+    // is clamped to its own concurrency cap ([`QueueLimits::effective_reserved`]),
+    // so a queue that reserves more than it can ever run does not withhold the
+    // excess from everyone else (issue #1623, P2).
+    let reserved_for_others: usize = limits
+        .reserved
+        .keys()
+        .filter(|name| name.as_str() != queue)
+        .map(|name| {
+            limits
+                .effective_reserved(name)
+                .saturating_sub(running.get(name).copied().unwrap_or(0))
+        })
+        .sum();
+    total_slots
+        .saturating_sub(total_running)
+        .saturating_sub(reserved_for_others)
+        > 0
+}
+
+/// Process-wide per-queue running-job accounting shared by every worker on a
+/// backend. Filters each claim iteration's queue order down to the queues that
+/// currently have a slot ([`queue_may_claim`]), and hands out RAII guards that
+/// release the slot on drop (panic-safe).
+#[derive(Debug)]
+pub(crate) struct QueueSlots {
+    total_slots: usize,
+    limits: QueueLimits,
+    // (per-queue running counts, total running).
+    running: std::sync::Mutex<(HashMap<String, usize>, usize)>,
+}
+
+impl QueueSlots {
+    /// Build a shared tracker for `total_slots` workers and the given limits.
+    pub(crate) fn new(total_slots: usize, limits: QueueLimits) -> Arc<Self> {
+        // Warn (once, at startup) about over-subscribed reservations against the
+        // real per-process worker count. Skip when no workers run in this
+        // process (e.g. the web role builds a tracker with 0 workers), since
+        // there is nothing to honor a reservation with (#1623).
+        if total_slots > 0 {
+            limits.warn_if_oversubscribed(total_slots);
+        }
+        Arc::new(Self {
+            total_slots: total_slots.max(1),
+            limits,
+            running: std::sync::Mutex::new((HashMap::new(), 0)),
+        })
+    }
+
+    /// Whether any cap/reservation is configured. When `false`, [`Self::claimable`]
+    /// returns its input unchanged and callers can skip filtering.
+    pub(crate) fn is_active(&self) -> bool {
+        !self.limits.is_empty()
+    }
+
+    /// Filter `order` down to the queues that may claim right now, preserving
+    /// the input order. A no-op passthrough when no limits are configured.
+    #[allow(clippy::significant_drop_tightening)]
+    pub(crate) fn claimable(&self, order: &[String]) -> Vec<String> {
+        if self.limits.is_empty() {
+            return order.to_vec();
+        }
+        let guard = self.running.lock().expect("queue slot lock poisoned");
+        let (running, total) = &*guard;
+        order
+            .iter()
+            .filter(|q| queue_may_claim(q, running, *total, &self.limits, self.total_slots))
+            .cloned()
+            .collect()
+    }
+
+    /// Record that a job on `queue` has started; the returned guard releases the
+    /// slot when dropped.
+    #[allow(clippy::significant_drop_tightening)]
+    pub(crate) fn acquire(self: &Arc<Self>, queue: &str) -> QueueSlotGuard {
+        {
+            let mut guard = self.running.lock().expect("queue slot lock poisoned");
+            let (running, total) = &mut *guard;
+            *running.entry(queue.to_string()).or_insert(0) += 1;
+            *total += 1;
+        }
+        QueueSlotGuard {
+            slots: Arc::clone(self),
+            queue: queue.to_string(),
+        }
+    }
+
+    /// Atomically reserve a slot for `queue` **before** the claim query runs,
+    /// returning a guard that releases the slot on drop — or `None` when the
+    /// queue may not claim right now.
+    ///
+    /// This closes the check-then-claim race (issue #1623): the claimability
+    /// check ([`queue_may_claim`]) and the running-count increment happen under
+    /// the *same* lock, so two workers can never both pass the check on one
+    /// snapshot and both go on to claim, overshooting a cap or eating a slot
+    /// reserved for another queue. A hard `total_running < total_slots` ceiling
+    /// is also enforced so the own-reserved fast path in [`queue_may_claim`] can
+    /// never push total concurrency past the worker count.
+    ///
+    /// When no limits are configured this is a passthrough that always succeeds
+    /// (the active-path callers never take this branch — they use the fast path
+    /// — but keeping it balanced makes the guard safe to hold either way).
+    #[allow(clippy::significant_drop_tightening)]
+    pub(crate) fn try_reserve(self: &Arc<Self>, queue: &str) -> Option<QueueSlotGuard> {
+        if self.limits.is_empty() {
+            return Some(self.acquire(queue));
+        }
+        let mut guard = self.running.lock().expect("queue slot lock poisoned");
+        let (running, total) = &mut *guard;
+        // Hard ceiling first: never let total in-flight reach the worker count,
+        // even via a queue drawing on its own reserved slots.
+        if *total >= self.total_slots {
+            return None;
+        }
+        if !queue_may_claim(queue, running, *total, &self.limits, self.total_slots) {
+            return None;
+        }
+        *running.entry(queue.to_string()).or_insert(0) += 1;
+        *total += 1;
+        Some(QueueSlotGuard {
+            slots: Arc::clone(self),
+            queue: queue.to_string(),
+        })
+    }
+}
+
+/// RAII release for a slot acquired via [`QueueSlots::acquire`].
+pub(crate) struct QueueSlotGuard {
+    slots: Arc<QueueSlots>,
+    queue: String,
+}
+
+impl Drop for QueueSlotGuard {
+    #[allow(clippy::significant_drop_tightening)]
+    fn drop(&mut self) {
+        let mut guard = self.slots.running.lock().expect("queue slot lock poisoned");
+        let (running, total) = &mut *guard;
+        if let Some(count) = running.get_mut(&self.queue) {
+            *count = count.saturating_sub(1);
+        }
+        *total = total.saturating_sub(1);
     }
 }
 
@@ -1560,8 +1879,12 @@ struct RedisWorkerConfig {
     queue_key: String,
     /// Base key prefix used to derive per-queue list keys.
     key_prefix: String,
-    /// Priority drain schedule across named queues.
+    /// Priority drain schedule across named queues (already restricted to the
+    /// pinned subset, if any).
     schedule: QueueSchedule,
+    /// Per-queue worker-pool slot accounting (caps/reserved). Shared across all
+    /// workers in this process.
+    slots: Arc<QueueSlots>,
     processing_key: String,
     delayed_key: String,
     dead_key: String,
@@ -2254,7 +2577,15 @@ impl JobClient {
         let job_queue = normalize_queue_name(&settings.queue);
         let constraints = ResolvedJobConstraints::for_payload(settings, &payload);
         let id = uuid::Uuid::new_v4().to_string();
-        self.registry.record_enqueue(name);
+        if let Some(due) = due_at {
+            // A future due time only becomes claimable later (local timer /
+            // durable `run_at`), so record it as scheduled: it must not count
+            // toward ready per-queue depth until its ready time arrives.
+            let ready_at_ms = u64::try_from(due.timestamp_millis()).unwrap_or(0);
+            self.registry.record_enqueue_scheduled(name, ready_at_ms);
+        } else {
+            self.registry.record_enqueue(name);
+        }
         self.job_admin.record_enqueue_due(
             id.clone(),
             name,
@@ -2282,7 +2613,10 @@ impl JobClient {
                     self.local_coordination.as_deref(),
                 ) && !coordination.try_acquire_unique(name, unique_key, &id_for_enqueue, window)
                 {
-                    self.record_deduplicated_enqueue(name, &id_for_enqueue);
+                    // The coalesced enqueue recorded a scheduled mark iff it was
+                    // delayed (`due_at` is a future instant); dedup removal must
+                    // target that same ready/scheduled category.
+                    self.record_deduplicated_enqueue(name, &id_for_enqueue, due_at.is_some());
                     deduplicated_clone.store(true, ::std::sync::atomic::Ordering::SeqCst);
                     return Ok(());
                 }
@@ -2328,7 +2662,7 @@ impl JobClient {
                         {
                             coord.release_unique(name, unique_key, &id_for_enqueue);
                         }
-                        self.registry.record_cancel(name);
+                        self.registry.record_cancel_scheduled(name);
                         return Ok(());
                     }
                     // Capture what we need on cancel: unique lock release,
@@ -2353,7 +2687,7 @@ impl JobClient {
                                 {
                                     coord.release_unique(&cancel_name, &unique_key, &cancel_id);
                                 }
-                                cancel_registry.record_cancel(&cancel_name);
+                                cancel_registry.record_cancel_scheduled(&cancel_name);
                                 cancel_admin.record_cancelled(&cancel_id);
                             }
                             () = tokio::time::sleep(delay) => {
@@ -2398,14 +2732,22 @@ impl JobClient {
                 // the match must stay exhaustive.
                 Ok(EnqueueOutcome::Queued | EnqueueOutcome::Skipped) => Ok(()),
                 Ok(EnqueueOutcome::Deduplicated) => {
-                    self.record_deduplicated_enqueue(name, &id_for_enqueue);
+                    // Same category the enqueue recorded above: scheduled iff the
+                    // job was delayed (future `due_at`), else ready.
+                    self.record_deduplicated_enqueue(name, &id_for_enqueue, due_at.is_some());
                     deduplicated_clone.store(true, ::std::sync::atomic::Ordering::SeqCst);
                     return Ok(());
                 }
                 Err(error) => Err(error),
             };
             if result.is_err() {
-                self.registry.record_cancel(name);
+                // Undo the enqueue mark recorded above; a scheduled job pushed a
+                // future (scheduled) mark, so remove that category, not a ready one.
+                if due_at.is_some() {
+                    self.registry.record_cancel_scheduled(name);
+                } else {
+                    self.registry.record_cancel(name);
+                }
                 self.job_admin.record_cancelled(&id_for_enqueue);
             }
             result
@@ -2435,7 +2777,11 @@ impl JobClient {
 
         let started = started.load(::std::sync::atomic::Ordering::SeqCst);
         if !started {
-            self.registry.record_cancel(name);
+            if due_at.is_some() {
+                self.registry.record_cancel_scheduled(name);
+            } else {
+                self.registry.record_cancel(name);
+            }
             self.job_admin.record_cancelled(&id);
         }
         res.map(|()| {
@@ -2627,9 +2973,16 @@ impl JobClient {
     }
 
     /// Mark a coalesced enqueue in the registry counters and admin record.
-    fn record_deduplicated_enqueue(&self, name: &str, id: &str) {
+    ///
+    /// `was_scheduled` says whether the coalesced enqueue recorded a *scheduled*
+    /// waiting mark (`record_enqueue_scheduled`, future due) rather than a
+    /// *ready* one (`record_enqueue`), so the dedup removal targets that same
+    /// category and cannot steal a co-queued mark from the other category.
+    fn record_deduplicated_enqueue(&self, name: &str, id: &str, was_scheduled: bool) {
         tracing::debug!(job = %name, job_id = %id, "job enqueue coalesced into existing unique job");
-        self.registry.record_deduplicated(name);
+        // This path always follows a real `record_enqueue(_scheduled)` for the
+        // coalesced job, so its per-queue waiting mark must be removed.
+        self.registry.record_deduplicated(name, true, was_scheduled);
         self.job_admin.record_deduplicated(id);
     }
 
@@ -2869,8 +3222,13 @@ impl JobClient {
                         // transaction rolls back (no row was ever written), so the
                         // counter can be recorded immediately. Balance the queued
                         // gauge that record_deduplicated decrements.
+                        //
+                        // This balancing enqueue records a *ready* mark
+                        // (`record_enqueue`) and the dedup pops it back out in the
+                        // same category, so was_scheduled is false regardless of
+                        // the job's own due time — the push/pop nets to zero.
                         self.registry.record_enqueue(name);
-                        self.record_deduplicated_enqueue(name, &id_for_enqueue);
+                        self.record_deduplicated_enqueue(name, &id_for_enqueue, false);
                     }
                     Ok(_) => {
                         guard.success();
@@ -2932,6 +3290,7 @@ pub fn start_runtime(
                 config.max_attempts,
                 config.initial_backoff_ms,
                 &config.queues,
+                &config.pin,
                 run_workers,
             );
             Ok(())
@@ -2976,6 +3335,7 @@ pub fn start_runtime(
                 config.max_attempts,
                 config.initial_backoff_ms,
                 &config.queues,
+                &config.pin,
                 run_workers,
             );
             Ok(())
@@ -3134,6 +3494,7 @@ pub(crate) fn start_local_runtime(
         default_max_attempts,
         default_initial_backoff_ms,
         queues_config,
+        &[],
         true,
     );
 }
@@ -3145,7 +3506,7 @@ pub(crate) fn start_local_runtime(
 /// loops run. The in-process `local` backend is non-durable, so a split role on
 /// it is rejected earlier at startup; this path only sees `run_workers == false`
 /// via direct calls in tests.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub(crate) fn start_local_runtime_inner(
     jobs: Vec<JobInfo>,
     state: &AppState,
@@ -3154,6 +3515,7 @@ pub(crate) fn start_local_runtime_inner(
     default_max_attempts: u32,
     default_initial_backoff_ms: u64,
     queues_config: &crate::config::JobQueuesConfig,
+    pin: &[String],
     run_workers: bool,
 ) {
     let job_admin = default_job_admin_backend_for_state(state);
@@ -3164,8 +3526,10 @@ pub(crate) fn start_local_runtime_inner(
 
     {
         let guard = jobs_by_name.read().expect("job registry lock poisoned");
-        for name in guard.keys() {
-            state.job_registry.register(name);
+        for job in guard.values() {
+            state
+                .job_registry
+                .register_on_queue(&job.name, &normalize_queue_name(&job.queue));
         }
     }
 
@@ -3179,7 +3543,7 @@ pub(crate) fn start_local_runtime_inner(
     // queue declared on a job but missing from config at lowest priority so it
     // still drains. Warn loudly about those so the operator can fix the config.
     let declared_queues = collect_declared_queues(&jobs_by_name);
-    let (schedule, unconfigured) = QueueSchedule::effective(queues_config, &declared_queues);
+    let (mut schedule, unconfigured) = QueueSchedule::effective(queues_config, &declared_queues);
     for queue in &unconfigured {
         tracing::warn!(
             queue = %queue,
@@ -3187,6 +3551,23 @@ pub(crate) fn start_local_runtime_inner(
              lowest priority. Add it to the configured queue list to control its priority.",
         );
     }
+    // Queue pinning (#1623): restrict this process to the pinned subset and warn
+    // loudly about any configured queue the pin leaves without coverage (AC6).
+    let uncovered = schedule.retain_pinned(pin);
+    // Only worker/combined roles claim queues, so gate the coverage warning on
+    // `run_workers`: a web replica (run_workers == false) drains nothing by
+    // design and must not warn about queues it will never claim (#1623).
+    if should_warn_pin_coverage(run_workers, pin) {
+        warn_pinned_uncovered_queues(&uncovered, pin, schedule.names().is_empty());
+    }
+    let pin_active = !pin.is_empty();
+    // Per-queue caps / dedicated slots (#1623): the shared slot accounting core.
+    // Filter the limits to the queues this process actually drains after pinning
+    // so reservations/caps for queues served by other replicas don't consume
+    // this process's shared slots (empty pin => full set => no-op).
+    let mut limits = QueueLimits::from_config(queues_config);
+    limits.retain_queues(&schedule.names());
+    let slots = QueueSlots::new(worker_count, limits);
     let buffer = Arc::new(LocalQueueBuffer::new());
 
     let client = JobClient {
@@ -3240,6 +3621,7 @@ pub(crate) fn start_local_runtime_inner(
         let buffer = Arc::clone(&buffer);
         let shutdown = shutdown.clone();
         let coordination = Arc::clone(&coordination);
+        let slots = Arc::clone(&slots);
         let mut cursor = schedule.cursor();
 
         tokio::spawn(async move {
@@ -3247,10 +3629,57 @@ pub(crate) fn start_local_runtime_inner(
                 // Register interest before checking so an enqueue that lands
                 // between the pop attempt and the await is never lost.
                 let notified = buffer.notify.notified();
-                if let Some(job) = buffer.try_pop(&cursor.next_order()) {
-                    execute_local_job(job, &jobs_by_name, &tx, &state, &job_admin, &coordination)
+                if slots.is_active() {
+                    // Atomic reserve-then-claim (#1623): walk the priority order
+                    // and reserve a slot under the running-count lock *before*
+                    // popping, so two workers can never both pass the cap/reserved
+                    // check and both pop. The reserved guard is held for the whole
+                    // job execution and released on drop.
+                    let order = cursor.next_order();
+                    let mut ran = false;
+                    for queue in order.iter() {
+                        let Some(guard) = slots.try_reserve(queue) else {
+                            continue;
+                        };
+                        if let Some(job) = buffer.try_pop_from(queue) {
+                            execute_local_job(
+                                job,
+                                &jobs_by_name,
+                                &tx,
+                                &state,
+                                &job_admin,
+                                &coordination,
+                            )
+                            .await;
+                            drop(guard);
+                            ran = true;
+                            break;
+                        }
+                        drop(guard);
+                    }
+                    if ran {
+                        continue;
+                    }
+                } else {
+                    // Fast path (no caps/reserved): single multi-queue pop across
+                    // the (possibly pinned) order, bounding the never-strand
+                    // fallback to the pinned set. Unchanged behavior (AC4).
+                    let order = slots.claimable(&cursor.next_order());
+                    let allowed: Option<std::collections::HashSet<String>> =
+                        pin_active.then(|| order.iter().cloned().collect());
+                    if let Some(job) = buffer.try_pop(&order, allowed.as_ref()) {
+                        let _slot = slots.acquire(&normalize_queue_name(&job.queue));
+                        execute_local_job(
+                            job,
+                            &jobs_by_name,
+                            &tx,
+                            &state,
+                            &job_admin,
+                            &coordination,
+                        )
                         .await;
-                    continue;
+                        continue;
+                    }
                 }
                 tokio::select! {
                     () = shutdown.cancelled() => break,
@@ -3258,6 +3687,43 @@ pub(crate) fn start_local_runtime_inner(
                 }
             }
         });
+    }
+}
+
+/// Whether this process should evaluate queue-pin coverage and emit the AC6
+/// startup diagnostic (issue #1623). Only worker/combined roles
+/// (`run_workers == true`) claim queues, so a web replica (`run_workers ==
+/// false`) runs zero workers and intentionally covers nothing — it must never
+/// warn about queues it will not drain. An empty `pin` restricts nothing, so
+/// there is likewise no coverage gap to report. Mirrors the doctor web-role
+/// skip; since doctor queue-coverage is informational-only, this runtime guard
+/// is the authoritative AC6 check.
+const fn should_warn_pin_coverage(run_workers: bool, pin: &[String]) -> bool {
+    run_workers && !pin.is_empty()
+}
+
+/// Startup zero-coverage guard for queue pinning (issue #1623, AC6). Emits a
+/// loud diagnostic when `jobs.pin` leaves configured/declared queues without a
+/// worker in this process, or matches nothing at all. No-op when `pin` is empty.
+fn warn_pinned_uncovered_queues(uncovered: &[String], pin: &[String], schedule_empty: bool) {
+    if pin.is_empty() {
+        return;
+    }
+    if schedule_empty {
+        tracing::error!(
+            pin = ?pin,
+            "jobs.pin {pin:?} matches none of the configured or declared job queues; \
+             this worker process will claim no jobs at all. Fix jobs.pin or the queue config.",
+        );
+    }
+    if !uncovered.is_empty() {
+        tracing::warn!(
+            uncovered = ?uncovered,
+            pin = ?pin,
+            "jobs.pin leaves job queue(s) {uncovered:?} with no worker coverage in this \
+             process; jobs enqueued to them will accumulate unless another worker process \
+             (unpinned, or pinned to those queues) drains them.",
+        );
     }
 }
 
@@ -3316,21 +3782,44 @@ impl LocalQueueBuffer {
         self.notify.notify_one();
     }
 
+    /// Pop the highest-priority ready job. `order` is this iteration's queue
+    /// attempt order. When `allowed` is `Some`, the never-strand fallback sweep
+    /// is restricted to that set so a pinned or capped worker never drains a
+    /// queue outside its allocation (issue #1623); `None` preserves the
+    /// original "drain anything rather than strand work" behavior (AC4).
     #[allow(clippy::significant_drop_tightening)]
-    fn try_pop(&self, order: &[String]) -> Option<QueuedJob> {
+    fn try_pop(
+        &self,
+        order: &[String],
+        allowed: Option<&std::collections::HashSet<String>>,
+    ) -> Option<QueuedJob> {
         let mut map = self.inner.lock().expect("local job buffer lock poisoned");
         for name in order {
             if let Some(job) = map.get_mut(name).and_then(VecDeque::pop_front) {
                 return Some(job);
             }
         }
-        // Never strand work: drain any queue outside the configured order.
-        for queue in map.values_mut() {
+        // Never strand work: drain any queue outside the configured order,
+        // subject to the pin/cap allow-set when one is in effect.
+        for (name, queue) in map.iter_mut() {
+            if allowed.is_some_and(|set| !set.contains(name)) {
+                continue;
+            }
             if let Some(job) = queue.pop_front() {
                 return Some(job);
             }
         }
         None
+    }
+
+    /// Pop the next ready job from exactly `queue`, or `None`. Used by the
+    /// atomic reserve-then-claim path (#1623), where a slot is reserved for a
+    /// specific queue *before* the pop, so the pop must be scoped to that one
+    /// queue rather than sweeping the whole priority order.
+    #[allow(clippy::significant_drop_tightening)]
+    fn try_pop_from(&self, queue: &str) -> Option<QueuedJob> {
+        let mut map = self.inner.lock().expect("local job buffer lock poisoned");
+        map.get_mut(queue).and_then(VecDeque::pop_front)
     }
 }
 
@@ -3500,7 +3989,13 @@ async fn execute_local_job(
                 {
                     let key = job_unique_key(unique, &job.payload);
                     if !coordination.try_acquire_unique(&job.name, &key, &job.id, unique.window) {
-                        state.job_registry.record_deduplicated(&job.name);
+                        // Retry-dedup: this job left the ready set at start time
+                        // and never re-recorded an enqueue mark, so it owns no
+                        // per-queue waiting mark to pop (popping would steal the
+                        // real duplicate's mark and hide its backlog).
+                        state
+                            .job_registry
+                            .record_deduplicated(&job.name, false, false);
                         job_admin.record_deduplicated(&job.id);
                         // This job will never run again — it was coalesced
                         // into the duplicate that now owns the unique lock —
@@ -4163,12 +4658,16 @@ local body = redis.call('GET', KEYS[1])
 if not body then
   return 0
 end
+local scheduled = 0
 local removed = redis.call('LREM', KEYS[2], 0, ARGV[1])
 if removed == 0 then
   removed = redis.call('ZREM', KEYS[3], ARGV[1])
 end
 if removed == 0 then
   removed = redis.call('ZREM', KEYS[5], ARGV[1])
+  if removed ~= 0 then
+    scheduled = 1
+  end
 end
 if removed == 0 then
   return -1
@@ -4182,6 +4681,9 @@ if ok and record['unique_key'] and record['unique_key'] ~= cjson.null
   end
 end
 redis.call('DEL', KEYS[1])
+if scheduled == 1 then
+  return 2
+end
 return 1
 ",
             )
@@ -4195,9 +4697,19 @@ return 1
             .query_async(&mut connection)
             .await
             .map_err(|error| redis_admin_error("cancel enqueued job", &error))?;
-        if result == 1 {
+        if result == 1 || result == 2 {
             if let Some(name) = job_name {
-                self.registry.record_cancel(&name);
+                // `result == 2` means the job was removed from the delayed
+                // zset, i.e. it was still scheduled (not-yet-due). Its
+                // per-queue waiting mark is stamped with a future ready-at,
+                // so remove the *scheduled* mark. Using the ready removal path
+                // here would instead pop a co-queued ready job's mark and
+                // under-report that queue's depth while work is still waiting.
+                if result == 2 {
+                    self.registry.record_cancel_scheduled(&name);
+                } else {
+                    self.registry.record_cancel(&name);
+                }
             }
             // An operator can cancel a job before any worker ever claims it,
             // which never reaches run_job_handler — settle the tracked
@@ -4247,7 +4759,9 @@ fn redis_admin_error(operation: &str, error: &redis::RedisError) -> AutumnError 
 #[cfg(feature = "redis")]
 fn redis_admin_operation_result(result: i64, id: &str, operation: &str) -> AutumnResult<()> {
     match result {
-        1 => Ok(()),
+        // 1 = removed a ready/blocked job; 2 = removed a still-scheduled
+        // (delayed) job. Both are successful cancellations.
+        1 | 2 => Ok(()),
         0 => Err(AutumnError::not_found_msg(format!("job '{id}' not found"))),
         -1 => Err(AutumnError::bad_request_msg(format!(
             "job '{id}' is not in the expected state for {operation}"
@@ -5337,6 +5851,7 @@ async fn recover_stale_redis_jobs(
 }
 
 #[cfg(feature = "redis")]
+#[allow(clippy::too_many_lines)]
 fn spawn_redis_worker(
     client: &redis::Client,
     jobs_by_name: Arc<RwLock<HashMap<String, JobInfo>>>,
@@ -5403,7 +5918,60 @@ fn spawn_redis_worker(
                 tracing::warn!(error = %error, "redis blocked job promotion failed");
             }
 
-            let queue_keys = worker_config.queue_keys_for(&queue_cursor.next_order());
+            if worker_config.slots.is_active() {
+                // Atomic reserve-then-claim (#1623): walk the priority order and
+                // reserve a per-queue slot *before* the claim query, then scope
+                // the claim to that single queue's list key. This closes the
+                // check-then-claim race across the Redis round-trip at the cost
+                // of up to one claim query per queue per poll (only when
+                // caps/reserved are configured). The reserved guard is held for
+                // the whole job execution and released on drop.
+                let order = queue_cursor.next_order();
+                let mut handled = false;
+                for queue in order.iter() {
+                    let Some(guard) = worker_config.slots.try_reserve(queue) else {
+                        continue;
+                    };
+                    let queue_keys = worker_config.queue_keys_for(std::slice::from_ref(queue));
+                    match claim_next_redis_job(&mut connection, &worker_config, &queue_keys).await {
+                        Ok(Some(record)) => {
+                            process_redis_job_record(
+                                &mut connection,
+                                record,
+                                &jobs_by_name,
+                                &state,
+                                &job_admin,
+                                &worker_config,
+                            )
+                            .await;
+                            drop(guard);
+                            handled = true;
+                            break;
+                        }
+                        Ok(None) => {
+                            drop(guard);
+                        }
+                        Err(error) => {
+                            tracing::warn!(error = %error, "redis job worker claim failed");
+                            drop(guard);
+                            break;
+                        }
+                    }
+                }
+                if !handled {
+                    tokio::time::sleep(idle_sleep).await;
+                }
+                continue;
+            }
+
+            // Fast path (no caps/reserved): a single multi-queue claim across the
+            // full (possibly pinned) priority order. Unchanged behavior (AC4).
+            let order = worker_config.slots.claimable(&queue_cursor.next_order());
+            if order.is_empty() {
+                tokio::time::sleep(idle_sleep).await;
+                continue;
+            }
+            let queue_keys = worker_config.queue_keys_for(&order);
             let claimed =
                 match claim_next_redis_job(&mut connection, &worker_config, &queue_keys).await {
                     Ok(record) => record,
@@ -5418,6 +5986,11 @@ fn spawn_redis_worker(
                 continue;
             };
 
+            // Hold a per-queue slot for the lifetime of this job's execution so
+            // caps/reserved accounting reflects the true in-flight count.
+            let _slot = worker_config
+                .slots
+                .acquire(&normalize_queue_name(&record.queue));
             process_redis_job_record(
                 &mut connection,
                 record,
@@ -5460,9 +6033,13 @@ async fn settle_failed_redis_job(
                     // into it (deleted, not requeued) — this job will never
                     // run again, so its tracked record (if any) must settle
                     // now rather than being left non-terminal until TTL.
+                    // Retry-dedup: the coalesced retry left the ready set when it
+                    // started and recorded no fresh enqueue mark, so it holds no
+                    // per-queue waiting mark to remove (removing one would steal
+                    // the surviving duplicate's mark and hide its backlog).
                     state
                         .job_registry
-                        .record_deduplicated(&schedule.record.name);
+                        .record_deduplicated(&schedule.record.name, false, false);
                     job_admin.record_deduplicated(&schedule.record.id);
                     crate::job_tracking::settle_tracked_payload_as_failed(
                         state,
@@ -5768,7 +6345,7 @@ fn start_redis_runtime(
         }
         queues
     };
-    let (schedule, unconfigured) = QueueSchedule::effective(&config.queues, &declared_queues);
+    let (mut schedule, unconfigured) = QueueSchedule::effective(&config.queues, &declared_queues);
     for queue in &unconfigured {
         tracing::warn!(
             queue = %queue,
@@ -5776,11 +6353,28 @@ fn start_redis_runtime(
              lowest priority. Add it to the configured queue list to control its priority.",
         );
     }
+    // Admin dashboard surveys every queue (before pinning restricts this
+    // process's *worker* claim set) so the job view stays complete.
     let admin_queue_keys: Vec<String> = schedule
         .names()
         .iter()
         .map(|queue| redis_queue_key(&config.redis.key_prefix, queue))
         .collect();
+    // Queue pinning (#1623, AC3): this worker process only drains the pinned
+    // subset. Warn about any configured queue left uncovered (AC6).
+    let uncovered = schedule.retain_pinned(&config.pin);
+    // Only worker/combined roles claim queues, so gate the coverage warning on
+    // `run_workers` (this runs before the `if !run_workers { return }` guard
+    // below): a web replica drains nothing by design and must not warn about
+    // queues it will never claim (#1623).
+    if should_warn_pin_coverage(run_workers, &config.pin) {
+        warn_pinned_uncovered_queues(&uncovered, &config.pin, schedule.names().is_empty());
+    }
+    // Filter limits to the pinned subset so reservations/caps for queues served
+    // by other replicas don't consume this process's shared slots (#1623).
+    let mut limits = QueueLimits::from_config(&config.queues);
+    limits.retain_queues(&schedule.names());
+    let slots = QueueSlots::new(config.workers.max(1), limits);
 
     if job_admin_backend(state).is_none() {
         state.insert_extension(JobAdminBackendEntry(Arc::new(RedisJobAdminBackend::new(
@@ -5810,8 +6404,10 @@ fn start_redis_runtime(
 
     {
         let guard = jobs_by_name.read().expect("job registry lock poisoned");
-        for name in guard.keys() {
-            state.job_registry.register(name);
+        for job in guard.values() {
+            state
+                .job_registry
+                .register_on_queue(&job.name, &normalize_queue_name(&job.queue));
         }
     }
 
@@ -5862,6 +6458,7 @@ fn start_redis_runtime(
                 queue_key: queue_key.clone(),
                 key_prefix: config.redis.key_prefix.clone(),
                 schedule: schedule.clone(),
+                slots: Arc::clone(&slots),
                 processing_key: processing_key.clone(),
                 delayed_key: delayed_key.clone(),
                 dead_key: dead_key.clone(),
@@ -5903,8 +6500,19 @@ const PG_STATUS_FAILED: &str = "failed";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PgLifecycleRecord<'a> {
     Success,
-    Retry { error: &'a str, attempt: u32 },
-    Failure { error: &'a str },
+    /// A non-final failure that the DB requeued with `run_at = NOW() + backoff`.
+    /// `ready_at_ms` carries that scheduled ready time (epoch ms) when the
+    /// backoff is nonzero, so the local gauge records the retry as *scheduled*
+    /// (not ready) until it becomes claimable; `None` means an immediate
+    /// (backoff==0 / due-now) retry that counts toward ready depth right away.
+    Retry {
+        error: &'a str,
+        attempt: u32,
+        ready_at_ms: Option<u64>,
+    },
+    Failure {
+        error: &'a str,
+    },
 }
 
 #[cfg(feature = "db")]
@@ -5966,12 +6574,24 @@ fn record_pg_lifecycle_after_ack(
             state.job_registry.record_success(job_name);
             job_admin.record_success(job_id);
         }
-        PgLifecycleRecord::Retry { error, attempt } => {
+        PgLifecycleRecord::Retry {
+            error,
+            attempt,
+            ready_at_ms,
+        } => {
             state.job_registry.record_retry(job_name, error, attempt);
             job_admin.record_retrying(job_id, error);
-            // The row is back in autumn_jobs with status='enqueued'; reflect
-            // that in the process-local counters so /actuator shows it as queued.
-            state.job_registry.record_enqueue(job_name);
+            // The row is back in autumn_jobs with status='enqueued'; reflect that
+            // in the process-local counters so /actuator shows it as queued. A
+            // backed-off retry sets `run_at = NOW() + backoff` in the DB and is
+            // NOT claimable until then, so record it as *scheduled* with that
+            // ready time — recording it as immediately ready would inflate
+            // `queues.<name>.depth` and `oldest_waiting_age_ms` for work no
+            // worker can pick up yet. An immediate (backoff==0) retry is due now.
+            match ready_at_ms {
+                Some(ready) => state.job_registry.record_enqueue_scheduled(job_name, ready),
+                None => state.job_registry.record_enqueue(job_name),
+            }
             job_admin.record_requeued(job_id, attempt + 1);
         }
         PgLifecycleRecord::Failure { error } => {
@@ -6945,9 +7565,19 @@ async fn pg_execute_job(
             let lifecycle = if is_final_attempt(&attempt, &max_attempts) {
                 PgLifecycleRecord::Failure { error: &error }
             } else {
+                // Mirror the `run_at = NOW() + backoff` the nack UPDATE applies
+                // (same `pg_retry_delay_ms(row.initial_backoff_ms, row.attempt)`)
+                // so the local gauge tracks the retry as scheduled until it is
+                // actually claimable. A zero backoff is due-now (`None`).
+                let delay_ms = pg_retry_delay_ms(row.initial_backoff_ms, row.attempt);
+                let ready_at_ms = (delay_ms > 0).then(|| {
+                    let now_ms = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0);
+                    now_ms.saturating_add(u64::try_from(delay_ms).unwrap_or(0))
+                });
                 PgLifecycleRecord::Retry {
                     error: &error,
                     attempt,
+                    ready_at_ms,
                 }
             };
             let ack = pg_nack_failure(
@@ -7037,13 +7667,68 @@ async fn pg_worker_loop(
     job_admin: JobAdminMemoryBackend,
     serialize_claims: bool,
     schedule: QueueSchedule,
+    slots: Arc<QueueSlots>,
     shutdown: tokio_util::sync::CancellationToken,
 ) {
     let mut cursor = schedule.cursor();
     loop {
-        let queue_order = cursor.next_order();
+        if slots.is_active() {
+            // Atomic reserve-then-claim (#1623): walk the priority order and
+            // reserve a per-queue slot *before* the claim query, then scope the
+            // claim to that single queue via `$2 = ARRAY[queue]`. This closes the
+            // check-then-claim race across the DB round-trip at the cost of up to
+            // one claim query per queue per poll (only when caps/reserved are
+            // configured). The reserved guard is held for the whole job execution
+            // and released on drop.
+            let order = cursor.next_order();
+            let mut handled = false;
+            for queue in order.iter() {
+                let Some(guard) = slots.try_reserve(queue) else {
+                    continue;
+                };
+                match pg_claim_next_job(
+                    &pool,
+                    &worker_id,
+                    serialize_claims,
+                    std::slice::from_ref(queue),
+                )
+                .await
+                {
+                    Some(row) => {
+                        pg_execute_job(row, &jobs_by_name, &pool, &worker_id, &state, &job_admin)
+                            .await;
+                        drop(guard);
+                        handled = true;
+                        break;
+                    }
+                    None => drop(guard),
+                }
+            }
+            if shutdown.is_cancelled() {
+                break;
+            }
+            if !handled {
+                tokio::select! {
+                    () = shutdown.cancelled() => break,
+                    () = tokio::time::sleep(PG_WORKER_IDLE_SLEEP) => {}
+                }
+            }
+            continue;
+        }
+
+        // Fast path (no caps/reserved): a single multi-queue claim across the
+        // full (possibly pinned) priority order. Unchanged behavior (AC4).
+        let queue_order = slots.claimable(&cursor.next_order());
+        if queue_order.is_empty() {
+            tokio::select! {
+                () = shutdown.cancelled() => break,
+                () = tokio::time::sleep(PG_WORKER_IDLE_SLEEP) => {}
+            }
+            continue;
+        }
         match pg_claim_next_job(&pool, &worker_id, serialize_claims, &queue_order).await {
             Some(row) => {
+                let _slot = slots.acquire(&normalize_queue_name(&row.queue));
                 pg_execute_job(row, &jobs_by_name, &pool, &worker_id, &state, &job_admin).await;
                 if shutdown.is_cancelled() {
                     break;
@@ -7064,6 +7749,43 @@ async fn pg_worker_loop(
 #[derive(Clone)]
 struct PgJobAdminBackend {
     pool: PgPool,
+    /// Job registry whose per-queue waiting gauges the admin-cancel path must
+    /// decrement, mirroring the redis backend.
+    registry: crate::actuator::JobRegistry,
+}
+
+/// Decide which per-queue waiting mark an admin-cancel of a still-enqueued
+/// Postgres job must remove.
+///
+/// A row whose `run_at` is still in the future was recorded as a *scheduled*
+/// mark at enqueue time (via `record_enqueue_scheduled`) and must be removed
+/// with `record_cancel_scheduled`; a ready row (NULL, past, or now `run_at`,
+/// i.e. claimable now) recorded a *ready* mark and uses `record_cancel`. This
+/// mirrors the redis admin-cancel path, which picks the category from whether
+/// the job was removed from the delayed zset. `run_at` is stored as
+/// `COALESCE($run_at, NOW())` so it is never NULL in practice, but a NULL is
+/// treated as ready for safety.
+#[cfg(feature = "db")]
+fn pg_cancel_was_scheduled(
+    run_at: Option<chrono::DateTime<chrono::Utc>>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    run_at.is_some_and(|ready_at| ready_at > now)
+}
+
+/// Row returned when an admin-cancel transitions a still-enqueued Postgres job
+/// to `discarded`. Carries the fields needed to settle the tracked record
+/// (`payload`) and to decrement the correct per-queue waiting gauge (`name`
+/// resolves the queue, `run_at` selects the ready/scheduled category).
+#[cfg(feature = "db")]
+#[derive(diesel::QueryableByName)]
+struct PgCancelRow {
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    payload: String,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    name: String,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>)]
+    run_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 #[cfg(feature = "db")]
@@ -7228,14 +7950,18 @@ impl PgJobAdminBackend {
         let mut conn = self.pool.get().await.map_err(|e| {
             AutumnError::internal_server_error_msg(format!("pg admin pool error: {e}"))
         })?;
+        // The `WHERE status = 'enqueued'` guard means this only ever transitions
+        // a still-unclaimed row (a claimed job is `running`), so decrementing the
+        // gauge here can never double-count against the `record_cancel` a claimed
+        // job's cancel does at ack time.
         let updated = diesel::sql_query(
             "UPDATE autumn_jobs \
              SET status = 'discarded', finished_at = NOW() \
              WHERE id = $1 AND status = 'enqueued' \
-             RETURNING payload::TEXT AS payload",
+             RETURNING payload::TEXT AS payload, name, run_at",
         )
         .bind::<diesel::sql_types::Text, _>(id)
-        .get_result::<PgPayloadRow>(&mut *conn)
+        .get_result::<PgCancelRow>(&mut *conn)
         .await
         .optional()
         .map_err(|e| {
@@ -7246,6 +7972,17 @@ impl PgJobAdminBackend {
                 "job '{id}' not found or not in enqueued state"
             )));
         };
+        // A row was actually canceled (RETURNING yielded it), so remove the
+        // per-queue waiting mark this job pushed at enqueue time — otherwise a
+        // phantom `queues.<name>.depth`/`oldest_waiting_age_ms` lingers on this
+        // process. Category-aware, mirroring the redis admin-cancel path and the
+        // enqueue side: a still-future `run_at` was a scheduled mark, a
+        // ready/past one a ready mark.
+        if pg_cancel_was_scheduled(row.run_at, chrono::Utc::now()) {
+            self.registry.record_cancel_scheduled(&row.name);
+        } else {
+            self.registry.record_cancel(&row.name);
+        }
         // An operator can cancel a job before any worker ever claims it,
         // which never reaches run_job_handler — settle the tracked record
         // here too, or it stays pending until TTL expiry even though the
@@ -7457,6 +8194,7 @@ async fn pg_enqueued_and_scheduled_pages(
 
 /// Start the Postgres job runtime.
 #[cfg(feature = "db")]
+#[allow(clippy::too_many_lines)]
 fn start_postgres_runtime(
     jobs: Vec<JobInfo>,
     state: &AppState,
@@ -7480,18 +8218,21 @@ fn start_postgres_runtime(
 
     {
         let guard = jobs_by_name.read().expect("job registry lock poisoned");
-        for name in guard.keys() {
-            state.job_registry.register(name);
+        for job in guard.values() {
+            state
+                .job_registry
+                .register_on_queue(&job.name, &normalize_queue_name(&job.queue));
         }
     }
 
     if job_admin_backend(state).is_none() {
         state.insert_extension(JobAdminBackendEntry(Arc::new(PgJobAdminBackend {
             pool: pool.clone(),
+            registry: state.job_registry.clone(),
         })));
     }
 
-    let (schedule, unconfigured) =
+    let (mut schedule, unconfigured) =
         QueueSchedule::effective(&config.queues, &collect_declared_queues(&jobs_by_name));
     for queue in &unconfigured {
         tracing::warn!(
@@ -7500,6 +8241,21 @@ fn start_postgres_runtime(
              lowest priority. Add it to the configured queue list to control its priority.",
         );
     }
+    // Queue pinning (#1623, AC3): restrict this worker process to the pinned
+    // subset and warn about any configured queue left uncovered (AC6).
+    let uncovered = schedule.retain_pinned(&config.pin);
+    // Only worker/combined roles claim queues, so gate the coverage warning on
+    // `run_workers` (this runs before the `if !run_workers { return }` guard
+    // below): a web replica drains nothing by design and must not warn about
+    // queues it will never claim (#1623).
+    if should_warn_pin_coverage(run_workers, &config.pin) {
+        warn_pinned_uncovered_queues(&uncovered, &config.pin, schedule.names().is_empty());
+    }
+    // Filter limits to the pinned subset so reservations/caps for queues served
+    // by other replicas don't consume this process's shared slots (#1623).
+    let mut limits = QueueLimits::from_config(&config.queues);
+    limits.retain_queues(&schedule.names());
+    let slots = QueueSlots::new(config.workers.max(1), limits);
 
     install_job_client(
         state,
@@ -7557,6 +8313,7 @@ fn start_postgres_runtime(
         let job_admin = job_admin.clone();
         let shutdown = shutdown.clone();
         let schedule = schedule.clone();
+        let slots = Arc::clone(&slots);
         tokio::spawn(async move {
             let worker_id = format!("{}:{}", std::process::id(), uuid::Uuid::new_v4());
             pg_worker_loop(
@@ -7567,6 +8324,7 @@ fn start_postgres_runtime(
                 job_admin,
                 serialize_claims,
                 schedule,
+                slots,
                 shutdown,
             )
             .await;
@@ -7630,6 +8388,83 @@ mod tests {
                 "forced failure",
             )))
         })
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn pg_cancel_enqueued_gauge_accounting_is_category_aware() {
+        // The Postgres admin-cancel-of-enqueued path must decrement the same
+        // per-queue waiting mark the enqueue pushed, category-aware, mirroring
+        // the redis admin-cancel path (`record_cancel` vs
+        // `record_cancel_scheduled`). The row's `run_at` selects the category:
+        // still-future `run_at` was recorded as a *scheduled* mark, a
+        // ready/past `run_at` (claimable now) as a *ready* mark.
+        use crate::actuator::JobRegistry;
+
+        let now = chrono::Utc::now();
+
+        // Selection boundaries.
+        assert!(
+            !pg_cancel_was_scheduled(None, now),
+            "a NULL run_at is a ready row"
+        );
+        assert!(
+            !pg_cancel_was_scheduled(Some(now - chrono::TimeDelta::seconds(1)), now),
+            "a past run_at is claimable now -> ready"
+        );
+        assert!(
+            !pg_cancel_was_scheduled(Some(now), now),
+            "run_at == now is claimable -> ready, not scheduled"
+        );
+        assert!(
+            pg_cancel_was_scheduled(Some(now + chrono::TimeDelta::seconds(60)), now),
+            "a future run_at is a still-scheduled row"
+        );
+
+        // End-to-end registry accounting: enqueue a ready and a scheduled job on
+        // the same queue, then apply the admin-cancel-of-enqueued decrement the
+        // fix adds, routing each row through the category the helper selects.
+        let registry = JobRegistry::new();
+        registry.register_on_queue("send_email", "mail");
+        registry.register_on_queue("nightly_report", "mail");
+
+        registry.record_enqueue("send_email");
+        let far_future = now + chrono::TimeDelta::seconds(60);
+        let far_future_ms = u64::try_from(far_future.timestamp_millis()).unwrap();
+        registry.record_enqueue_scheduled("nightly_report", far_future_ms);
+        assert_eq!(
+            registry.queue_snapshot().get("mail").unwrap().depth,
+            1,
+            "only the ready job counts toward ready depth"
+        );
+
+        // Admin-cancels the still-scheduled row: run_at is future, so the fix
+        // routes to record_cancel_scheduled and must leave the ready mark intact.
+        let sched_run_at = Some(far_future);
+        if pg_cancel_was_scheduled(sched_run_at, now) {
+            registry.record_cancel_scheduled("nightly_report");
+        } else {
+            registry.record_cancel("nightly_report");
+        }
+        assert_eq!(
+            registry.queue_snapshot().get("mail").unwrap().depth,
+            1,
+            "canceling the scheduled enqueued job must not steal the co-queued ready mark"
+        );
+
+        // Admin-cancels the ready row: run_at is now/past, so the fix routes to
+        // record_cancel and drains the queue to zero (no leaked mark).
+        let ready_run_at = Some(now);
+        if pg_cancel_was_scheduled(ready_run_at, now) {
+            registry.record_cancel_scheduled("send_email");
+        } else {
+            registry.record_cancel("send_email");
+        }
+        assert_eq!(
+            registry.queue_snapshot().get("mail").unwrap().depth,
+            0,
+            "canceling the ready enqueued job drains the queue to zero"
+        );
     }
 
     #[test]
@@ -9210,6 +10045,7 @@ mod tests {
             queue_key: format!("{prefix}:queue"),
             key_prefix: prefix.to_string(),
             schedule: QueueSchedule::from_config(&crate::config::JobQueuesConfig::single_default()),
+            slots: QueueSlots::new(1, QueueLimits::default()),
             processing_key: format!("{prefix}:processing"),
             delayed_key: format!("{prefix}:delayed"),
             dead_key: format!("{prefix}:dead"),
@@ -10046,6 +10882,24 @@ mod tests {
                 .to_string()
                 .contains("an equivalent unique job is already pending or running"),
             "{error}"
+        );
+    }
+
+    #[cfg(feature = "redis")]
+    #[test]
+    fn redis_admin_scheduled_cancel_code_is_success() {
+        // The cancel script returns 2 when it removed a still-scheduled job from
+        // the delayed zset (vs 1 for a ready/blocked job). Both are successful
+        // cancellations — 2 must not be rejected as an unexpected code, or the
+        // scheduled-cancel path (which also routes gauge accounting through the
+        // scheduled removal path) would surface a spurious 500 to the operator.
+        assert!(
+            redis_admin_operation_result(2, "job-1", "cancel enqueued job").is_ok(),
+            "a scheduled-job cancel (code 2) must be treated as success"
+        );
+        assert!(
+            redis_admin_operation_result(1, "job-1", "cancel enqueued job").is_ok(),
+            "a ready-job cancel (code 1) must be treated as success"
         );
     }
 
@@ -12386,6 +13240,7 @@ mod tests {
                 PgLifecycleRecord::Retry {
                     error: "try again",
                     attempt: 1,
+                    ready_at_ms: None,
                 },
                 &state,
                 &job_admin
@@ -12404,6 +13259,92 @@ mod tests {
                 .expect("admin record")
                 .status;
             assert_eq!(admin_status, JobAdminStatus::Enqueued);
+        }
+
+        #[test]
+        fn pg_retry_with_backoff_records_scheduled_not_ready_depth() {
+            // Regression for the actuator.rs:857 / job.rs P2: a non-final PG
+            // failure whose nack set `run_at = NOW() + backoff` must be recorded
+            // as SCHEDULED, not ready. The row is not claimable until the backoff
+            // expires, so counting it toward ready queue depth /
+            // oldest-waiting-age inflated `/actuator/jobs` for work no worker
+            // could pick up yet (mirrors the enqueue-time #965 fix).
+            let state = AppState::for_test().with_profile("dev");
+            state.job_registry().register_on_queue("slow_retry", "work");
+            state.job_registry().record_enqueue("slow_retry");
+            state.job_registry().record_start("slow_retry");
+            let job_admin = JobAdminMemoryBackend::new_for_test(32);
+            let job_id =
+                job_admin.record_enqueue_for_test("slow_retry", serde_json::json!({}), 1, 3);
+            job_admin.record_start_for_test(&job_id, 1);
+
+            // The nack UPDATE would set run_at ~60s out; carry that ready time.
+            let ready_at_ms =
+                u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0) + 60_000;
+            assert!(record_pg_lifecycle_ack_result(
+                Ok(true),
+                "slow_retry",
+                &job_id,
+                "failure",
+                PgLifecycleRecord::Retry {
+                    error: "try again",
+                    attempt: 1,
+                    ready_at_ms: Some(ready_at_ms),
+                },
+                &state,
+                &job_admin
+            ));
+
+            // The retry is counted as queued, but NOT as ready backlog: the
+            // per-queue depth and oldest-waiting-age stay zero until run_at.
+            let status = state.job_registry().snapshot()["slow_retry"].clone();
+            assert_eq!(status.queued, 1, "the retry is tracked as queued");
+            let snapshot = state.job_registry().queue_snapshot();
+            let work = snapshot.get("work").expect("work queue tracked");
+            assert_eq!(
+                work.depth, 0,
+                "a backed-off retry is not ready backlog until its run_at"
+            );
+            assert_eq!(
+                work.oldest_waiting_age_ms, 0,
+                "a backed-off retry must not age the ready queue"
+            );
+        }
+
+        #[test]
+        fn pg_retry_without_backoff_counts_as_ready_depth() {
+            // No-regression companion: an immediate (backoff==0 → `None`) retry
+            // is due now and must still count toward ready queue depth exactly as
+            // before the scheduled-retry fix.
+            let state = AppState::for_test().with_profile("dev");
+            state.job_registry().register_on_queue("fast_retry", "work");
+            state.job_registry().record_enqueue("fast_retry");
+            state.job_registry().record_start("fast_retry");
+            let job_admin = JobAdminMemoryBackend::new_for_test(32);
+            let job_id =
+                job_admin.record_enqueue_for_test("fast_retry", serde_json::json!({}), 1, 3);
+            job_admin.record_start_for_test(&job_id, 1);
+
+            assert!(record_pg_lifecycle_ack_result(
+                Ok(true),
+                "fast_retry",
+                &job_id,
+                "failure",
+                PgLifecycleRecord::Retry {
+                    error: "try again",
+                    attempt: 1,
+                    ready_at_ms: None,
+                },
+                &state,
+                &job_admin
+            ));
+
+            let snapshot = state.job_registry().queue_snapshot();
+            let work = snapshot.get("work").expect("work queue tracked");
+            assert_eq!(
+                work.depth, 1,
+                "an immediate retry is due now and counts as ready backlog"
+            );
         }
 
         #[test]
@@ -13306,7 +14247,10 @@ mod tests {
                 .await
                 .unwrap();
 
-            let backend = PgJobAdminBackend { pool: pool.clone() };
+            let backend = PgJobAdminBackend {
+                pool: pool.clone(),
+                registry: crate::actuator::JobRegistry::new(),
+            };
             let snapshot = backend.snapshot(JobAdminQuery::default()).await.unwrap();
 
             assert!(
@@ -13333,7 +14277,10 @@ mod tests {
 
             let pool = pg_test_pool(&url);
             pg_run_migration(&pool).await;
-            let backend = PgJobAdminBackend { pool: pool.clone() };
+            let backend = PgJobAdminBackend {
+                pool: pool.clone(),
+                registry: crate::actuator::JobRegistry::new(),
+            };
 
             // --- Retry ---
             pg_enqueue_job(
@@ -13424,7 +14371,10 @@ mod tests {
             let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
             let pool = pg_test_pool(&url);
             pg_run_migration(&pool).await;
-            let backend = PgJobAdminBackend { pool: pool.clone() };
+            let backend = PgJobAdminBackend {
+                pool: pool.clone(),
+                registry: crate::actuator::JobRegistry::new(),
+            };
 
             let _guard = global_job_runtime_test_lock().lock().await;
             clear_global_job_client();
@@ -13480,7 +14430,10 @@ mod tests {
             let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
             let pool = pg_test_pool(&url);
             pg_run_migration(&pool).await;
-            let backend = PgJobAdminBackend { pool: pool.clone() };
+            let backend = PgJobAdminBackend {
+                pool: pool.clone(),
+                registry: crate::actuator::JobRegistry::new(),
+            };
 
             let _guard = global_job_runtime_test_lock().lock().await;
             clear_global_job_client();
@@ -14021,7 +14974,10 @@ mod tests {
             let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
             let pool = pg_test_pool(&url);
             pg_run_migration(&pool).await;
-            let backend = PgJobAdminBackend { pool: pool.clone() };
+            let backend = PgJobAdminBackend {
+                pool: pool.clone(),
+                registry: crate::actuator::JobRegistry::new(),
+            };
 
             let constraints = unique_constraints("invoice-3", JobUniquenessWindow::Running);
             pg_enqueue_job(
@@ -15625,7 +16581,7 @@ mod uniqueness_concurrency_tests {
         let registry = crate::actuator::JobRegistry::new();
         registry.register("dedup_job");
         registry.record_enqueue("dedup_job");
-        registry.record_deduplicated("dedup_job");
+        registry.record_deduplicated("dedup_job", true, false);
         let snapshot = registry.snapshot();
         let status = &snapshot["dedup_job"];
         assert_eq!(status.queued, 0);
@@ -16697,5 +17653,501 @@ mod queue_schedule_tests {
         let declared = vec!["default".to_string(), "critical".to_string()];
         let (_schedule, warnings) = QueueSchedule::effective(&cfg, &declared);
         assert!(warnings.is_empty());
+    }
+
+    // ── Queue pinning (#1623, AC3/AC4) ──────────────────────────────────────
+
+    #[test]
+    fn pin_restricts_schedule_to_the_pinned_subset() {
+        let cfg = JobQueuesConfig::strict_list(["critical", "default", "low"]);
+        let mut schedule = QueueSchedule::from_config(&cfg);
+        let uncovered = schedule.retain_pinned(&["critical".to_string()]);
+        assert_eq!(schedule.names(), vec!["critical"]);
+        assert!(!schedule.contains("default"));
+        assert!(!schedule.contains("low"));
+        // The queues this process no longer covers are reported for the guard.
+        assert_eq!(
+            uncovered,
+            vec!["default".to_string(), "low".to_string()],
+            "uncovered queues must be surfaced for the zero-coverage guard"
+        );
+    }
+
+    #[test]
+    fn empty_pin_is_a_noop_preserving_all_queues() {
+        let cfg = JobQueuesConfig::strict_list(["critical", "default", "low"]);
+        let mut schedule = QueueSchedule::from_config(&cfg);
+        let uncovered = schedule.retain_pinned(&[]);
+        assert_eq!(schedule.names(), vec!["critical", "default", "low"]);
+        assert!(uncovered.is_empty(), "empty pin leaves nothing uncovered");
+    }
+
+    #[test]
+    fn pin_preserves_strict_priority_order_within_subset() {
+        let cfg = JobQueuesConfig::strict_list(["critical", "default", "low"]);
+        let mut schedule = QueueSchedule::from_config(&cfg);
+        schedule.retain_pinned(&["low".to_string(), "critical".to_string()]);
+        // Order follows the configured priority, not the order given in `pin`.
+        let mut cursor = schedule.cursor();
+        assert_eq!(
+            cursor.next_order().as_slice(),
+            ["critical".to_string(), "low".to_string()]
+        );
+    }
+
+    #[test]
+    fn pin_preserves_weighted_proportions_within_subset() {
+        let cfg = JobQueuesConfig::weighted([("critical", 3), ("default", 2), ("low", 1)]);
+        let mut schedule = QueueSchedule::from_config(&cfg);
+        schedule.retain_pinned(&["critical".to_string(), "low".to_string()]);
+        let mut cursor = schedule.cursor();
+        let mut firsts: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+        // Cycle length is now sum of the *pinned* weights (3 + 1 = 4).
+        for _ in 0..4 {
+            let order = cursor.next_order();
+            assert_eq!(order.len(), 2, "only pinned queues remain: {order:?}");
+            *firsts.entry(order[0].clone()).or_default() += 1;
+        }
+        assert_eq!(firsts.get("critical").copied(), Some(3));
+        assert_eq!(firsts.get("low").copied(), Some(1));
+    }
+
+    #[test]
+    fn pin_to_unknown_queue_yields_empty_schedule_and_reports_uncovered() {
+        let cfg = JobQueuesConfig::strict_list(["critical", "default"]);
+        let mut schedule = QueueSchedule::from_config(&cfg);
+        let uncovered = schedule.retain_pinned(&["nonexistent".to_string()]);
+        // Does not panic; the schedule is empty and every real queue is uncovered.
+        assert!(schedule.names().is_empty());
+        assert_eq!(
+            uncovered,
+            vec!["critical".to_string(), "default".to_string()]
+        );
+    }
+
+    #[test]
+    fn pin_coverage_warning_gated_on_worker_role() {
+        // #1623 follow-up: a web replica (run_workers == false) runs zero job
+        // workers and claims no queues, so it must never evaluate pin coverage
+        // or emit the AC6 startup warning — even with a non-empty jobs.pin that
+        // would warn on a worker/combined role. Mirrors the doctor web-role
+        // skip; since doctor coverage is informational-only this runtime guard
+        // is the authoritative AC6 check.
+        let pin = vec!["critical".to_string()];
+        assert!(
+            !should_warn_pin_coverage(false, &pin),
+            "web role (run_workers=false) must not warn about pin coverage"
+        );
+        assert!(
+            should_warn_pin_coverage(true, &pin),
+            "worker/combined role with a pin still evaluates coverage (AC6)"
+        );
+        // An empty pin leaves nothing uncovered, so no role warns.
+        assert!(!should_warn_pin_coverage(true, &[]));
+        assert!(!should_warn_pin_coverage(false, &[]));
+    }
+
+    #[test]
+    fn pinned_limits_drop_reservations_for_unpinned_queues() {
+        // Regression (#1623): a worker pinned to `["bulk"]` must not have
+        // `critical`'s reservation subtracted from its shared pool. With
+        // `critical.reserved = workers`, an unfiltered `QueueLimits` leaves
+        // bulk zero shared slots and it can NEVER claim — a deadlock.
+        let cfg = JobQueuesConfig::strict_list(["critical", "bulk"]);
+        let mut schedule = QueueSchedule::from_config(&cfg);
+        schedule.retain_pinned(&["bulk".to_string()]);
+
+        // Unfiltered limits (the pre-fix behavior) deadlock bulk.
+        let unfiltered = limits(&[], &[("critical", 4)]);
+        let (r, total) = running(&[]);
+        assert!(
+            !queue_may_claim("bulk", &r, total, &unfiltered, 4),
+            "unfiltered limits wrongly reserve all 4 slots for a queue this \
+             process never serves, deadlocking bulk"
+        );
+
+        // After filtering to the pinned schedule, critical's reservation is
+        // gone and bulk is claimable.
+        let mut filtered = limits(&[], &[("critical", 4)]);
+        filtered.retain_queues(&schedule.names());
+        let slots = QueueSlots::new(4, filtered);
+        assert!(
+            slots.try_reserve("bulk").is_some(),
+            "a bulk-pinned worker must be able to claim bulk jobs"
+        );
+    }
+
+    #[test]
+    fn unpinned_process_still_honors_reservations() {
+        // No regression: without pinning, `critical`'s reservation is retained
+        // and still protects it from a bulk flood.
+        let cfg = JobQueuesConfig::strict_list(["critical", "bulk"]);
+        let mut schedule = QueueSchedule::from_config(&cfg);
+        // Empty pin => no-op => full schedule retained.
+        schedule.retain_pinned(&[]);
+        let mut lim = limits(&[], &[("critical", 2)]);
+        lim.retain_queues(&schedule.names());
+        assert_eq!(lim.reserved.get("critical").copied(), Some(2));
+
+        // bulk cannot eat critical's 2 reserved slots out of 4.
+        let (r, total) = running(&[("bulk", 2)]);
+        assert!(!queue_may_claim("bulk", &r, total, &lim, 4));
+        assert!(queue_may_claim("critical", &r, total, &lim, 4));
+    }
+
+    // ── Per-queue slot accounting core (#1623, AC1/AC2/AC5) ─────────────────
+
+    fn running(pairs: &[(&str, usize)]) -> (HashMap<String, usize>, usize) {
+        let map: HashMap<String, usize> =
+            pairs.iter().map(|(n, c)| ((*n).to_string(), *c)).collect();
+        let total = map.values().sum();
+        (map, total)
+    }
+
+    fn limits(concurrency: &[(&str, usize)], reserved: &[(&str, usize)]) -> QueueLimits {
+        QueueLimits {
+            concurrency: concurrency
+                .iter()
+                .map(|(n, c)| ((*n).to_string(), *c))
+                .collect(),
+            reserved: reserved
+                .iter()
+                .map(|(n, r)| ((*n).to_string(), *r))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn zero_config_claims_whenever_a_worker_is_free() {
+        // No caps/reservations: identical to today's single shared pool (AC4).
+        let lim = QueueLimits::default();
+        let (r, total) = running(&[("bulk", 3)]);
+        assert!(queue_may_claim("critical", &r, total, &lim, 4));
+        let (r, total) = running(&[("bulk", 4)]);
+        assert!(
+            !queue_may_claim("critical", &r, total, &lim, 4),
+            "no free worker slots => cannot claim"
+        );
+    }
+
+    #[test]
+    fn concurrency_cap_blocks_a_queue_at_its_limit() {
+        // AC2: `bulk` may never occupy more than 2 of the 8 slots.
+        let lim = limits(&[("bulk", 2)], &[]);
+        let (r, total) = running(&[("bulk", 1)]);
+        assert!(queue_may_claim("bulk", &r, total, &lim, 8));
+        let (r, total) = running(&[("bulk", 2)]);
+        assert!(
+            !queue_may_claim("bulk", &r, total, &lim, 8),
+            "bulk at its cap of 2 must not claim a third slot"
+        );
+        // Other queues are unaffected by bulk's cap.
+        assert!(queue_may_claim("critical", &r, total, &lim, 8));
+    }
+
+    #[test]
+    fn reserved_slots_protect_a_queue_from_a_flood() {
+        // AC1/AC5: `critical` reserves 2 of 4 slots. A flood on `bulk` can fill
+        // at most the 2 shared slots, never the 2 reserved for `critical`.
+        let lim = limits(&[], &[("critical", 2)]);
+
+        // bulk has taken both shared slots; critical is idle.
+        let (r, total) = running(&[("bulk", 2)]);
+        assert!(
+            !queue_may_claim("bulk", &r, total, &lim, 4),
+            "bulk cannot consume critical's reserved slots"
+        );
+        assert!(
+            queue_may_claim("critical", &r, total, &lim, 4),
+            "critical is promptly served from its reserved capacity despite the flood"
+        );
+
+        // Once critical fills its reservation it competes for shared slots only.
+        let (r, total) = running(&[("bulk", 2), ("critical", 2)]);
+        assert!(!queue_may_claim("critical", &r, total, &lim, 4));
+    }
+
+    #[test]
+    fn shared_pool_fallback_after_reservations_are_accounted() {
+        // 5 slots, critical reserves 2. With nothing running, bulk sees
+        // 5 - 0 - 2 = 3 shared slots.
+        let lim = limits(&[], &[("critical", 2)]);
+        let (r, total) = running(&[]);
+        assert!(queue_may_claim("bulk", &r, total, &lim, 5));
+        // 3 bulk jobs running consumes all shared slots; the last 2 are reserved.
+        let (r, total) = running(&[("bulk", 3)]);
+        assert!(!queue_may_claim("bulk", &r, total, &lim, 5));
+        // critical may still claim from its own reserved pool.
+        assert!(queue_may_claim("critical", &r, total, &lim, 5));
+    }
+
+    #[test]
+    fn cap_and_reserved_combined_on_one_queue() {
+        // A queue may reserve slots AND cap itself: critical reserves 1 but is
+        // capped at 2 total.
+        let lim = limits(&[("critical", 2)], &[("critical", 1)]);
+        let (r, total) = running(&[("critical", 1)]);
+        // Below cap and shared slots exist -> can claim a 2nd.
+        assert!(queue_may_claim("critical", &r, total, &lim, 4));
+        let (r, total) = running(&[("critical", 2)]);
+        // At its cap -> blocked even though slots are free.
+        assert!(!queue_may_claim("critical", &r, total, &lim, 4));
+    }
+
+    #[test]
+    fn reserved_is_clamped_to_own_concurrency_cap() {
+        // P2 (#1623): `critical` reserves 4 slots but is capped at 2 concurrent
+        // jobs, so it can never use more than 2. The 2 excess reserved slots
+        // must NOT be withheld from other queues' shared pool. With workers=8
+        // and `bulk` unlimited, bulk must run up to 8 - min(4, 2) = 6.
+        let lim = limits(&[("critical", 2)], &[("critical", 4)]);
+
+        // `critical` is served from its reservation while below its cap, and is
+        // blocked at its concurrency cap of 2 (reserving 4 never lifts the cap).
+        let (r, total) = running(&[("critical", 1)]);
+        assert!(
+            queue_may_claim("critical", &r, total, &lim, 8),
+            "critical draws on its reserved capacity below its cap"
+        );
+        let (r, total) = running(&[("critical", 2)]);
+        assert!(
+            !queue_may_claim("critical", &r, total, &lim, 8),
+            "critical is capped at 2 even though it reserved 4"
+        );
+
+        // With `critical` pinned at its cap of 2, `bulk` must be able to fill
+        // the remaining 6 slots. Before the clamp, bulk was wrongly blocked at
+        // 4 (the full reservation of 4 withheld 4-2=2 usable slots forever).
+        for b in 0..6 {
+            let (r, total) = running(&[("critical", 2), ("bulk", b)]);
+            assert!(
+                queue_may_claim("bulk", &r, total, &lim, 8),
+                "bulk must claim slot #{} (excess reservation must not be withheld)",
+                b + 1
+            );
+        }
+        // 6 bulk + 2 critical = 8 slots full: bulk is now genuinely blocked.
+        let (r, total) = running(&[("critical", 2), ("bulk", 6)]);
+        assert!(
+            !queue_may_claim("bulk", &r, total, &lim, 8),
+            "all 8 worker slots are full"
+        );
+    }
+
+    #[test]
+    fn effective_reserved_clamps_reservation_to_the_cap() {
+        // The amount a queue withholds from others is min(reserved, concurrency).
+        // reserved > concurrency: clamped down to the cap (the invalid config
+        // that also triggers the oversubscription warning).
+        let over = limits(&[("critical", 2)], &[("critical", 4)]);
+        assert_eq!(over.effective_reserved("critical"), 2);
+        // Uncapped queue withholds its full reservation.
+        let uncapped = limits(&[], &[("critical", 4)]);
+        assert_eq!(uncapped.effective_reserved("critical"), 4);
+        // reserved <= concurrency: unaffected, withholds the full reservation.
+        let under = limits(&[("critical", 4)], &[("critical", 2)]);
+        assert_eq!(under.effective_reserved("critical"), 2);
+        // No reservation: nothing withheld.
+        let none = limits(&[("critical", 2)], &[]);
+        assert_eq!(none.effective_reserved("critical"), 0);
+    }
+
+    #[test]
+    fn queue_slots_filters_claimable_order_and_releases_on_drop() {
+        let slots = QueueSlots::new(2, limits(&[("bulk", 1)], &[]));
+        let order = vec!["bulk".to_string(), "critical".to_string()];
+        // Nothing running: both claimable, order preserved.
+        assert_eq!(slots.claimable(&order), order);
+        let guard = slots.acquire("bulk");
+        // bulk now at its cap of 1: filtered out, critical remains.
+        assert_eq!(slots.claimable(&order), vec!["critical".to_string()]);
+        drop(guard);
+        // Slot released: bulk claimable again.
+        assert_eq!(slots.claimable(&order), order);
+    }
+
+    #[test]
+    fn queue_slots_passthrough_when_no_limits() {
+        let slots = QueueSlots::new(4, QueueLimits::default());
+        assert!(!slots.is_active());
+        let order = vec!["a".to_string(), "b".to_string()];
+        let _g = slots.acquire("a");
+        // Without limits, claimable is an unchanged passthrough.
+        assert_eq!(slots.claimable(&order), order);
+    }
+
+    #[test]
+    fn queue_limits_from_config_reads_caps_and_reservations() {
+        #[derive(serde::Deserialize)]
+        struct Wrap {
+            jobs: crate::config::JobConfig,
+        }
+        let toml = r"
+[jobs.queues]
+critical = { weight = 3, reserved = 2 }
+bulk = { weight = 1, concurrency = 4 }
+default = 1
+";
+        let wrap: Wrap = toml::from_str(toml).unwrap();
+        let lim = QueueLimits::from_config(&wrap.jobs.queues);
+        assert_eq!(lim.reserved.get("critical").copied(), Some(2));
+        assert_eq!(lim.concurrency.get("bulk").copied(), Some(4));
+        // `default = 1` is a bare weight: no cap, no reservation.
+        assert!(!lim.concurrency.contains_key("default"));
+        assert!(!lim.reserved.contains_key("default"));
+    }
+
+    /// Concurrency stress for the atomic reserve-then-claim primitive (#1623,
+    /// Finding 1). Many tasks flood `bulk`/`default` through
+    /// [`QueueSlots::try_reserve`] while a guardian repeatedly reserves
+    /// `critical`. Because the claimability check and the running-count
+    /// increment happen under one lock, the invariants below must hold under
+    /// real multi-threaded contention:
+    /// - the number of concurrently-held `bulk` guards never exceeds its cap (2);
+    /// - the total number of concurrently-held guards never exceeds `workers` (3);
+    /// - `critical`'s reserved slot is always claimable while others flood.
+    ///
+    /// A non-atomic design (check `queue_may_claim`, then `acquire` in a separate
+    /// lock section) would let two flood tasks both pass the check on the same
+    /// snapshot and both increment — overshooting the cap / total and stealing
+    /// `critical`'s reserved slot. The peak trackers and the failure counter
+    /// below catch exactly that.
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn try_reserve_upholds_caps_and_reservations_under_concurrency() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        fn bump_peak(peak: &AtomicUsize, value: usize) {
+            let mut current = peak.load(Ordering::Relaxed);
+            while value > current {
+                match peak.compare_exchange_weak(
+                    current,
+                    value,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => break,
+                    Err(observed) => current = observed,
+                }
+            }
+        }
+
+        // 3 workers; `bulk` capped at 2; `critical` reserves 1 dedicated slot.
+        let slots = QueueSlots::new(3, limits(&[("bulk", 2)], &[("critical", 1)]));
+
+        let total_held = Arc::new(AtomicUsize::new(0));
+        let bulk_held = Arc::new(AtomicUsize::new(0));
+        let total_peak = Arc::new(AtomicUsize::new(0));
+        let bulk_peak = Arc::new(AtomicUsize::new(0));
+        let critical_failures = Arc::new(AtomicUsize::new(0));
+        let critical_attempts = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let mut handles = Vec::new();
+
+        // Flood tasks: hammer `bulk` and `default` (never `critical`).
+        for i in 0..8 {
+            let slots = Arc::clone(&slots);
+            let total_held = Arc::clone(&total_held);
+            let bulk_held = Arc::clone(&bulk_held);
+            let total_peak = Arc::clone(&total_peak);
+            let bulk_peak = Arc::clone(&bulk_peak);
+            let stop = Arc::clone(&stop);
+            let queue = if i % 2 == 0 { "bulk" } else { "default" };
+            handles.push(tokio::spawn(async move {
+                while !stop.load(Ordering::Relaxed) {
+                    if let Some(guard) = slots.try_reserve(queue) {
+                        let now_total = total_held.fetch_add(1, Ordering::SeqCst) + 1;
+                        bump_peak(&total_peak, now_total);
+                        if queue == "bulk" {
+                            let now_bulk = bulk_held.fetch_add(1, Ordering::SeqCst) + 1;
+                            bump_peak(&bulk_peak, now_bulk);
+                        }
+                        // Invariants must hold while the guard is live.
+                        assert!(
+                            total_held.load(Ordering::SeqCst) <= 3,
+                            "total concurrent guards exceeded the worker count"
+                        );
+                        assert!(
+                            bulk_held.load(Ordering::SeqCst) <= 2,
+                            "bulk concurrent guards exceeded its cap"
+                        );
+                        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                        if queue == "bulk" {
+                            bulk_held.fetch_sub(1, Ordering::SeqCst);
+                        }
+                        total_held.fetch_sub(1, Ordering::SeqCst);
+                        drop(guard);
+                    }
+                    tokio::task::yield_now().await;
+                }
+            }));
+        }
+
+        // Reservation guardian: a single task, so `critical` never exceeds its
+        // reservation of 1. Its `try_reserve` must always succeed — the flood
+        // can never consume `critical`'s protected slot.
+        {
+            let slots = Arc::clone(&slots);
+            let stop = Arc::clone(&stop);
+            let critical_failures = Arc::clone(&critical_failures);
+            let critical_attempts = Arc::clone(&critical_attempts);
+            handles.push(tokio::spawn(async move {
+                while !stop.load(Ordering::Relaxed) {
+                    critical_attempts.fetch_add(1, Ordering::SeqCst);
+                    match slots.try_reserve("critical") {
+                        Some(guard) => {
+                            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                            drop(guard);
+                        }
+                        None => {
+                            critical_failures.fetch_add(1, Ordering::SeqCst);
+                        }
+                    }
+                    tokio::task::yield_now().await;
+                }
+            }));
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        stop.store(true, Ordering::Relaxed);
+        for handle in handles {
+            handle
+                .await
+                .expect("stress task panicked (invariant violated)");
+        }
+
+        // The run genuinely exercised concurrent reservations.
+        assert!(
+            total_peak.load(Ordering::SeqCst) >= 2,
+            "test did not observe concurrent reservations; peak = {}",
+            total_peak.load(Ordering::SeqCst)
+        );
+        assert!(
+            bulk_peak.load(Ordering::SeqCst) >= 1,
+            "bulk was never reserved"
+        );
+        // The final invariants: nothing exceeded caps/workers, and `critical`
+        // was always able to claim its reserved slot despite the flood.
+        assert!(
+            bulk_peak.load(Ordering::SeqCst) <= 2,
+            "bulk peak concurrency {} exceeded its cap of 2",
+            bulk_peak.load(Ordering::SeqCst)
+        );
+        assert!(
+            total_peak.load(Ordering::SeqCst) <= 3,
+            "total peak concurrency {} exceeded the worker count of 3",
+            total_peak.load(Ordering::SeqCst)
+        );
+        assert!(
+            critical_attempts.load(Ordering::SeqCst) > 0,
+            "guardian never attempted a reservation"
+        );
+        assert_eq!(
+            critical_failures.load(Ordering::SeqCst),
+            0,
+            "critical's reserved slot was stolen by the flood {} time(s)",
+            critical_failures.load(Ordering::SeqCst)
+        );
     }
 }

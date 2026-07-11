@@ -2815,6 +2815,7 @@ mod tests {
             #[cfg(feature = "db")]
             shards: None,
             profile: None,
+            role: crate::config::ProcessRole::Combined,
             started_at: std::time::Instant::now(),
             health_detailed: false,
             probes: crate::probe::ProbeState::ready_for_test(),

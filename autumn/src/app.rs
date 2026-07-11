@@ -7452,6 +7452,7 @@ fn build_state(
         #[cfg(feature = "db")]
         shards,
         profile: config.profile.clone(),
+        role: config.role,
         started_at: std::time::Instant::now(),
         health_detailed: config.health.detailed,
         probes: crate::probe::ProbeState::pending_startup(),
@@ -7777,6 +7778,7 @@ mod tests {
             #[cfg(feature = "db")]
             shards: None,
             profile: None,
+            role: crate::config::ProcessRole::Combined,
             started_at: std::time::Instant::now(),
             health_detailed: true,
             probes: crate::probe::ProbeState::ready_for_test(),
@@ -7876,6 +7878,43 @@ mod tests {
             .mark_replica_unready("replica migrations lag primary");
 
         assert_eq!(state.read_pool().expect("read pool").status().max_size, 5);
+    }
+
+    #[test]
+    fn build_state_exposes_resolved_process_role() {
+        use crate::config::ProcessRole;
+
+        // Default config resolves to the combined role: existing single-process
+        // apps see no behavior change and get both HTTP + workers.
+        let mut config = AutumnConfig::default();
+        let state = build_state(
+            &config,
+            #[cfg(feature = "db")]
+            None,
+            #[cfg(feature = "db")]
+            None,
+            #[cfg(feature = "ws")]
+            None,
+        );
+        assert_eq!(state.role(), ProcessRole::Combined);
+        assert!(state.role().serves_http());
+        assert!(state.role().runs_workers());
+
+        // A worker-role config flows through the exact same resolution the
+        // framework uses to gate the job runtime, reachable via `state.role()`.
+        config.role = ProcessRole::Worker;
+        let state = build_state(
+            &config,
+            #[cfg(feature = "db")]
+            None,
+            #[cfg(feature = "db")]
+            None,
+            #[cfg(feature = "ws")]
+            None,
+        );
+        assert_eq!(state.role(), ProcessRole::Worker);
+        assert!(state.role().runs_workers());
+        assert!(!state.role().serves_http());
     }
 
     #[cfg(feature = "db")]
@@ -9041,6 +9080,7 @@ mod tests {
             #[cfg(feature = "db")]
             shards: None,
             profile: None,
+            role: crate::config::ProcessRole::Combined,
             started_at: std::time::Instant::now(),
             health_detailed: true,
             probes: crate::probe::ProbeState::ready_for_test(),
@@ -9154,6 +9194,7 @@ mod tests {
             #[cfg(feature = "db")]
             shards: None,
             profile: None,
+            role: crate::config::ProcessRole::Combined,
             started_at: std::time::Instant::now(),
             health_detailed: true,
             probes: crate::probe::ProbeState::ready_for_test(),
@@ -9507,6 +9548,7 @@ mod tests {
             #[cfg(feature = "db")]
             shards: None,
             profile: None,
+            role: crate::config::ProcessRole::Combined,
             started_at: std::time::Instant::now(),
             health_detailed: true,
             probes: crate::probe::ProbeState::ready_for_test(),
@@ -9825,6 +9867,7 @@ mod tests {
             #[cfg(feature = "db")]
             shards: None,
             profile: None,
+            role: crate::config::ProcessRole::Combined,
             started_at: std::time::Instant::now(),
             health_detailed: true,
             probes: crate::probe::ProbeState::ready_for_test(),
@@ -9979,6 +10022,7 @@ mod tests {
             #[cfg(feature = "db")]
             shards: None,
             profile: None,
+            role: crate::config::ProcessRole::Combined,
             started_at: std::time::Instant::now(),
             health_detailed: true,
             probes: crate::probe::ProbeState::ready_for_test(),
@@ -10031,6 +10075,7 @@ mod tests {
             #[cfg(feature = "db")]
             shards: None,
             profile: None,
+            role: crate::config::ProcessRole::Combined,
             started_at: std::time::Instant::now(),
             health_detailed: true,
             probes: crate::probe::ProbeState::ready_for_test(),
@@ -10293,6 +10338,7 @@ mod tests {
             #[cfg(feature = "db")]
             shards: None,
             profile: None,
+            role: crate::config::ProcessRole::Combined,
             started_at: std::time::Instant::now(),
             health_detailed: true,
             probes: crate::probe::ProbeState::ready_for_test(),
@@ -10369,6 +10415,7 @@ mod tests {
             #[cfg(feature = "db")]
             shards: None,
             profile: None,
+            role: crate::config::ProcessRole::Combined,
             started_at: std::time::Instant::now(),
             health_detailed: true,
             probes: crate::probe::ProbeState::ready_for_test(),
