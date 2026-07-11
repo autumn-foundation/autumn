@@ -163,3 +163,35 @@ fn density_smoke_thousand_cells() {
     assert_eq!(registry.len(), 0);
     assert_eq!(registry.total_tracked_bytes(), 0);
 }
+
+/// Replacing an existing scratch key must account only for the net byte delta,
+/// not the full new size, so a same-size or shrinking replace can never
+/// transiently overshoot the quota and spuriously return `QuotaExceeded`.
+#[test]
+fn scratch_insert_replace_accounts_net_delta() {
+    let reg = autumn_web::tenant_cell::TenantCellRegistry::new();
+    let cell = reg.get_or_create("t", 1000);
+
+    cell.scratch_insert("k", vec![0u8; 800]).unwrap();
+    assert_eq!(cell.tracked_bytes(), 800);
+
+    // Replace with same size: net 0. Must NOT error even though 800 + 800 > 1000.
+    cell.scratch_insert("k", vec![0u8; 800]).unwrap();
+    assert_eq!(cell.tracked_bytes(), 800);
+
+    // Grow to exactly the quota (net delta +200).
+    cell.scratch_insert("k", vec![0u8; 1000]).unwrap();
+    assert_eq!(cell.tracked_bytes(), 1000);
+
+    // Shrink releases the delta.
+    cell.scratch_insert("k", vec![0u8; 100]).unwrap();
+    assert_eq!(cell.tracked_bytes(), 100);
+
+    // A genuine over-quota insert on a NEW key still fails and leaves state intact.
+    cell.scratch_insert("k", vec![0u8; 900]).unwrap();
+    assert_eq!(cell.tracked_bytes(), 900);
+    let err = cell.scratch_insert("j", vec![0u8; 200]).unwrap_err();
+    assert_eq!(err.quota, 1000);
+    assert_eq!(err.in_use, 900);
+    assert_eq!(cell.tracked_bytes(), 900);
+}

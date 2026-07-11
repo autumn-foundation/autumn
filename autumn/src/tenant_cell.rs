@@ -215,12 +215,16 @@ impl TenantCell {
         })
     }
 
-    /// Store `value` in the tenant's scratch buffer under `key`, charging its
-    /// size against the quota. Any previous value for `key` is released.
+    /// Store `value` in the tenant's scratch buffer under `key`, charging only
+    /// the *net* byte delta against the quota when replacing an existing entry.
+    ///
+    /// Replacing a key reserves at most `new_len - old_len` bytes (releasing the
+    /// difference when the value shrinks), so a same-size or shrinking replace
+    /// can never transiently overshoot the quota and spuriously fail.
     ///
     /// # Errors
     ///
-    /// Returns [`QuotaExceeded`] if storing `value` would exceed the tenant's
+    /// Returns [`QuotaExceeded`] if the net growth would exceed the tenant's
     /// quota; the scratch buffer is left unchanged.
     ///
     /// # Panics
@@ -231,20 +235,21 @@ impl TenantCell {
         key: impl Into<String>,
         value: Vec<u8>,
     ) -> Result<(), QuotaExceeded> {
-        let n = value.len();
-        self.inner.reserve(n)?;
         let key = key.into();
-        let previous = {
-            let mut scratch = self
-                .inner
-                .scratch
-                .lock()
-                .expect("tenant cell scratch lock poisoned");
-            scratch.insert(key, value)
-        };
-        if let Some(old) = previous {
-            self.inner.release(old.len());
+        let new_len = value.len();
+        let mut scratch = self
+            .inner
+            .scratch
+            .lock()
+            .expect("tenant cell scratch lock poisoned");
+        let old_len = scratch.get(&key).map_or(0, Vec::len);
+        if new_len > old_len {
+            self.inner.reserve(new_len - old_len)?;
+        } else if new_len < old_len {
+            self.inner.release(old_len - new_len);
         }
+        scratch.insert(key, value);
+        drop(scratch);
         Ok(())
     }
 
