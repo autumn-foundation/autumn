@@ -1194,6 +1194,11 @@ const fn pagerduty_severity(severity: AlertSeverity) -> &'static str {
 #[cfg(feature = "http-client")]
 #[must_use]
 pub fn pagerduty_event_payload(alert: &Alert, routing_key: &str) -> serde_json::Value {
+    // Reserved standard-field names Autumn writes into `custom_details` below.
+    // PagerDuty routing/correlation depends on these carrying the authoritative
+    // values, so a user detail keyed with one of these must NOT clobber it — nor
+    // be clobbered by it. Colliding user keys are preserved under `custom_<key>`.
+    const RESERVED: &[&str] = &["condition", "where_to_look", "detail"];
     if alert.event == AlertEventKind::Resolve {
         return serde_json::json!({
             "routing_key": routing_key,
@@ -1206,7 +1211,12 @@ pub fn pagerduty_event_payload(alert: &Alert, routing_key: &str) -> serde_json::
     keys.sort();
     for k in keys {
         if let Some(v) = alert.details.get(k) {
-            custom.insert(k.clone(), serde_json::Value::String(v.clone()));
+            let key = if RESERVED.contains(&k.as_str()) {
+                format!("custom_{k}")
+            } else {
+                k.clone()
+            };
+            custom.insert(key, serde_json::Value::String(v.clone()));
         }
     }
     custom.insert(
@@ -1498,8 +1508,10 @@ pub fn native_transport_channels(
 }
 
 /// Register a Slack-compatible chat channel (`slack` or `discord`) from a
-/// configured webhook `url`, skipping (with a warning) a non-absolute URL that
-/// the HTTP client could never dispatch.
+/// configured webhook `url`, skipping (with a warning) a URL that is not an
+/// absolute `https` URL — Slack and Discord only expose `https` webhook
+/// endpoints, so a relative, malformed, or plaintext `http://` value would never
+/// deliver (mirrors `autumn doctor`'s `is_absolute_https_url_doctor`).
 #[cfg(feature = "http-client")]
 fn push_chat_channel(
     channels: &mut Vec<Arc<dyn AlertChannel>>,
@@ -1511,13 +1523,14 @@ fn push_chat_channel(
     let Some(url) = url.map(str::trim).filter(|s| !s.is_empty()) else {
         return;
     };
-    if !is_absolute_http_url(url) {
+    if !is_absolute_https_url(url) {
         tracing::warn!(
             provider,
             webhook_url = url,
             "alerts: the configured [alerts] {provider}_webhook_url ({url}) is not an absolute \
-             http(s) URL; no {provider} alerts will be delivered. Fix the URL (or the \
-             AUTUMN_ALERTS__{PROVIDER}_WEBHOOK_URL env var).",
+             https URL; no {provider} alerts will be delivered ({provider} only exposes https \
+             webhook endpoints). Fix the URL (or the AUTUMN_ALERTS__{PROVIDER}_WEBHOOK_URL env \
+             var).",
             PROVIDER = provider.to_uppercase(),
         );
         return;
@@ -1563,6 +1576,20 @@ fn is_absolute_http_url(url: &str) -> bool {
         .ok()
         .and_then(|parsed| parsed.host_str().map(|h| !h.is_empty()))
         .unwrap_or(false)
+}
+
+/// Whether `url` is a non-empty ABSOLUTE **`https`** URL with a host.
+///
+/// Stricter than [`is_absolute_http_url`]: it additionally requires the `https`
+/// scheme. Slack and Discord only expose `https` webhook endpoints, so a
+/// plaintext `http://` URL will never deliver (and would transmit insecurely) —
+/// the runtime must reject it just as `autumn doctor` does. Kept in lock-step
+/// with `autumn-cli`'s `is_absolute_https_url_doctor` (same rule) so doctor and
+/// the runtime agree on which Slack/Discord webhook URLs are usable and cannot
+/// drift.
+#[cfg(feature = "http-client")]
+fn is_absolute_https_url(url: &str) -> bool {
+    url.starts_with("https://") && is_absolute_http_url(url)
 }
 
 /// Whether `email` parses as the SAME lettre [`Mailbox`](lettre::message::Mailbox)
@@ -2841,6 +2868,33 @@ mod tests {
 
     #[cfg(feature = "http-client")]
     #[test]
+    fn pagerduty_custom_details_preserves_user_key_colliding_with_reserved_field() {
+        // A user detail keyed with a RESERVED standard-field name (`condition`,
+        // `where_to_look`, `detail`) must not silently clobber — nor be clobbered
+        // by — the authoritative standard field. The standard field keeps its
+        // canonical name (PagerDuty routing/correlation depends on it); the user's
+        // value is preserved under a `custom_`-prefixed key.
+        let alert = Alert::trigger(AlertCondition::DeadLetteredJob, "dead_lettered_job:emailer")
+            .title("Job 'emailer' was dead-lettered")
+            .summary("exhausted retries")
+            .detail("condition", "user-supplied-condition")
+            .detail("where_to_look", "user-supplied-pointer")
+            .detail("detail", "user-supplied-detail")
+            .build();
+        let v = pagerduty_event_payload(&alert, "R0UT1NGKEY");
+        let cd = &v["payload"]["custom_details"];
+        // Standard fields stay authoritative under their canonical names.
+        assert_eq!(cd["condition"], "dead_lettered_job");
+        assert_eq!(cd["where_to_look"], "/actuator/jobs");
+        assert_eq!(cd["detail"], "exhausted retries");
+        // The colliding user values are preserved under `custom_<key>`.
+        assert_eq!(cd["custom_condition"], "user-supplied-condition");
+        assert_eq!(cd["custom_where_to_look"], "user-supplied-pointer");
+        assert_eq!(cd["custom_detail"], "user-supplied-detail");
+    }
+
+    #[cfg(feature = "http-client")]
+    #[test]
     fn pagerduty_resolve_payload_is_minimal_and_correlates() {
         let alert = Alert::recovery(
             AlertCondition::ScheduledTaskFailure,
@@ -2964,6 +3018,38 @@ mod tests {
             channel_names(&config).is_empty(),
             "a non-absolute pagerduty_url must skip the PagerDuty channel"
         );
+    }
+
+    #[cfg(feature = "http-client")]
+    #[test]
+    fn native_transports_reject_non_https_slack_and_discord() {
+        // Slack and Discord only expose https webhook endpoints, so a plaintext
+        // http:// URL will not deliver (and would transmit insecurely). The
+        // runtime must reject it — mirroring `autumn doctor` — and register no
+        // channel. Prevents a config doctor rejects from silently "passing" at
+        // runtime.
+        let slack = AlertConfig {
+            slack_webhook_url: Some("http://hooks.slack.com/services/x".to_owned()),
+            ..AlertConfig::default()
+        };
+        assert!(
+            channel_names(&slack).is_empty(),
+            "a non-https slack_webhook_url must not register a Slack channel"
+        );
+        let discord = AlertConfig {
+            discord_webhook_url: Some("http://discord.com/api/webhooks/x/slack".to_owned()),
+            ..AlertConfig::default()
+        };
+        assert!(
+            channel_names(&discord).is_empty(),
+            "a non-https discord_webhook_url must not register a Discord channel"
+        );
+        // An absolute https URL is still accepted.
+        let ok = AlertConfig {
+            slack_webhook_url: Some("https://hooks.slack.com/services/x".to_owned()),
+            ..AlertConfig::default()
+        };
+        assert_eq!(channel_names(&ok), vec!["slack"]);
     }
 
     #[cfg(feature = "http-client")]
