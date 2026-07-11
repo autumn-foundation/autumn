@@ -108,7 +108,7 @@ fn resolve_fk_and_name(
         }
         AssocKind::HasMany => {
             let fk = explicit_fk.map_or_else(|| format!("{snake_source}_id"), ToOwned::to_owned);
-            let name = format!("{snake_target}s");
+            let name = pluralize_word(&snake_target);
             (fk, name)
         }
         AssocKind::HasOne => {
@@ -279,11 +279,18 @@ fn resolve_associations(
 }
 
 /// The singular form used to derive a many-to-many association's mutation
-/// helper names (`add_{singular}`, `remove_{singular}`), mirroring the
-/// codebase's naive `{target}s` pluralization in reverse: strip a trailing
-/// `s` if present.
-fn m2m_mutation_singular(assoc_name: &str) -> &str {
-    assoc_name.strip_suffix('s').unwrap_or(assoc_name)
+/// helper names (`add_{singular}`, `remove_{singular}`).
+///
+/// Derived from the association's *target type* name (its `pascal_to_snake`),
+/// **not** by de-pluralizing the accessor name. A type's singular comes from
+/// the type — `Category` → `category`, `Person` → `person` — independent of
+/// how its plural accessor is spelled. This keeps the smart-pluralized
+/// accessor name (`categories`, `people`) while still yielding correct helpers
+/// (`add_category`, `add_person`). De-pluralizing the accessor by stripping a
+/// trailing `s` regressed here once the accessor started using the smart
+/// pluralizer (#1753): `categories` → `categorie`, `people` → `people`.
+fn m2m_mutation_singular(target: &syn::Ident) -> String {
+    pascal_to_snake(&target.to_string())
 }
 
 /// Reject a model whose many-to-many associations would generate colliding
@@ -291,21 +298,26 @@ fn m2m_mutation_singular(assoc_name: &str) -> &str {
 /// associations that both derive `add_tag`), rather than emitting a trait
 /// with duplicate method definitions.
 fn check_m2m_mutation_name_collisions(assocs: &[Association]) -> syn::Result<()> {
-    let mut seen: std::collections::HashMap<&str, &syn::Ident> = std::collections::HashMap::new();
+    let mut seen: std::collections::HashMap<String, &syn::Ident> = std::collections::HashMap::new();
     for assoc in assocs {
         if assoc.through.is_none() {
             continue;
         }
-        let singular = m2m_mutation_singular(&assoc.name);
-        if let Some(_prev) = seen.insert(singular, &assoc.target) {
+        let singular = m2m_mutation_singular(&assoc.target);
+        if seen.insert(singular.clone(), &assoc.target).is_some() {
             return Err(syn::Error::new_spanned(
                 &assoc.target,
                 format!(
-                    "many-to-many association `{}` would generate a mutation \
-                     helper `add_{singular}`/`remove_{singular}` that collides \
-                     with another `through =` association on this model; \
-                     disambiguate with `name = ...`",
-                    assoc.name
+                    "many-to-many association `{}` (target `{}`) resolves to the \
+                     same target-derived mutation helpers `add_{singular}`/\
+                     `remove_{singular}` as another `through =` association to \
+                     `{}` on this model; a model may currently declare at most \
+                     one many-to-many association per target type. The intended \
+                     fix is an explicit per-association helper-name override \
+                     (planned `helper = \"...\"`) so distinct m2m relations to \
+                     the same target get non-colliding helpers — tracked in \
+                     https://github.com/madmax983/autumn/issues/1785",
+                    assoc.name, assoc.target, assoc.target,
                 ),
             ));
         }
@@ -727,7 +739,7 @@ fn emit_association_items(
                     // traits are both in scope.
                     let mutation_trait_ident =
                         format_ident!("{model_ident}{}Mutations", pascal_case(&assoc.name));
-                    let singular = m2m_mutation_singular(&assoc.name);
+                    let singular = m2m_mutation_singular(target);
                     let add_ident = format_ident!("add_{singular}");
                     let remove_ident = format_ident!("remove_{singular}");
                     let set_ident = format_ident!("set_{}", assoc.name);
@@ -4605,7 +4617,59 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 pub fn infer_table_name(ident: &syn::Ident) -> String {
     let name = ident.to_string();
     let snake = pascal_to_snake(&name);
-    format!("{snake}s")
+    // Pluralize only the last snake_case segment, mirroring
+    // `autumn-cli`'s `naming::pluralize`: `blog_post` → `blog_posts`,
+    // `category` → `categories`.
+    let (prefix, last) = snake.rfind('_').map_or(("", snake.as_str()), |idx| {
+        (&snake[..=idx], &snake[idx + 1..])
+    });
+    format!("{prefix}{}", pluralize_word(last))
+}
+
+/// English pluraliser for a single word: irregulars, sibilant endings
+/// (`+es`), consonant+`y` (`y` → `ies`), otherwise `+s`.
+///
+/// This is a FAITHFUL copy of [`autumn_web::format::pluralize_word`], which is
+/// the canonical implementation (see `autumn/src/format.rs::pluralize_word`).
+/// It MUST stay in sync with that function: the CLI scaffold's `src/schema.rs`
+/// pluralises table names through `autumn_web::format::pluralize_word` (via
+/// `naming::pluralize`), and the `#[model]`/`#[repository]` derives here must
+/// produce the same table name so the generated app compiles. It is duplicated
+/// rather than imported because this proc-macro crate cannot depend on
+/// `autumn-web` (that would create a dependency cycle: `autumn-web` depends on
+/// `autumn-macros`).
+fn pluralize_word(word: &str) -> String {
+    if word.is_empty() {
+        return String::new();
+    }
+    match word {
+        "person" => return "people".to_owned(),
+        "child" => return "children".to_owned(),
+        "man" => return "men".to_owned(),
+        "woman" => return "women".to_owned(),
+        "mouse" => return "mice".to_owned(),
+        "goose" => return "geese".to_owned(),
+        _ => {}
+    }
+    let lower = word.to_ascii_lowercase();
+    if lower.ends_with("ss")
+        || lower.ends_with('x')
+        || lower.ends_with('z')
+        || lower.ends_with("ch")
+        || lower.ends_with("sh")
+    {
+        return format!("{word}es");
+    }
+    if lower.ends_with('y') {
+        // 'y' is 1-byte ASCII, so slicing off the last byte stays on a char boundary.
+        let prefix = &word[..word.len() - 1];
+        if let Some(prev) = prefix.chars().next_back()
+            && !"aeiouAEIOU".contains(prev)
+        {
+            return format!("{prefix}ies");
+        }
+    }
+    format!("{word}s")
 }
 
 pub fn pascal_to_snake(s: &str) -> String {
@@ -4779,6 +4843,16 @@ mod tests {
         let (fk, name) = resolve_fk_and_name(AssocKind::HasMany, &post, &comment, None);
         assert_eq!(fk, "post_id");
         assert_eq!(name, "comments");
+    }
+
+    #[test]
+    fn has_many_pluralizes_name_with_irregular_rules() {
+        // #1753: irregular plurals must use the smart pluraliser, not `{}s`.
+        let store = syn::parse_quote!(Store);
+        let category = syn::parse_quote!(Category);
+        let (fk, name) = resolve_fk_and_name(AssocKind::HasMany, &store, &category, None);
+        assert_eq!(fk, "store_id");
+        assert_eq!(name, "categories");
     }
 
     #[test]
@@ -5007,14 +5081,101 @@ mod tests {
 
     #[test]
     fn m2m_colliding_mutation_method_names_rejected() {
-        // `tags` and `name = tag` both derive an `add_tag` helper — reject at
+        // The mutation-helper singular comes from the *target type*, so two
+        // `through =` associations to the same target both derive an `add_tag`
+        // helper — even with a distinct `name = ...` (which only renames the
+        // accessor/trait, not the target-derived `add_`/`remove_`). Reject at
         // macro time rather than emitting a trait with duplicate methods.
         let model: syn::Ident = syn::parse_quote!(Post);
         let attrs: Vec<syn::Attribute> = vec![
             syn::parse_quote!(#[has_many(Tag, through = post_tags)]),
-            syn::parse_quote!(#[has_many(Label, through = post_labels, name = tag)]),
+            syn::parse_quote!(#[has_many(Tag, through = featured_post_tags, name = featured_tags)]),
         ];
         assert!(resolve_associations(&model, &attrs).is_err());
+    }
+
+    #[test]
+    fn m2m_mutation_singular_derives_from_target_type() {
+        // #1753 regression (Codex): the m2m mutation-helper singular must come
+        // from the *target type* (`pascal_to_snake`), not by stripping a
+        // trailing `s` from the smart-pluralized accessor name. Otherwise
+        // irregular plurals produce broken helpers: `categories` → `categorie`
+        // (should be `category`), `people` → `people` (should be `person`).
+        let category: syn::Ident = syn::parse_quote!(Category); // -ies class
+        let person: syn::Ident = syn::parse_quote!(Person); // irregular class
+        let comment: syn::Ident = syn::parse_quote!(Comment); // plain class
+        assert_eq!(m2m_mutation_singular(&category), "category");
+        assert_eq!(m2m_mutation_singular(&person), "person");
+        assert_eq!(m2m_mutation_singular(&comment), "comment");
+    }
+
+    #[test]
+    fn model_macro_m2m_mutation_helper_singular_uses_target_for_irregular_plurals() {
+        // End-to-end #1753 guard: a `through =` association to an
+        // irregular-plural target keeps the smart-pluralized accessor/`set_`
+        // name (`categories`) while the `add_`/`remove_` helpers use the
+        // target type's singular (`category`), never the broken de-pluralized
+        // accessor (`categorie`).
+        let generated = model_macro(
+            quote! {},
+            quote! {
+                #[has_many(Category, through = post_categories)]
+                pub struct Post {
+                    #[id]
+                    pub id: i64,
+                    pub title: String,
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("add_category"),
+            "expected add_category helper, got: {generated}"
+        );
+        assert!(
+            generated.contains("remove_category"),
+            "expected remove_category helper"
+        );
+        assert!(
+            !generated.contains("add_categorie"),
+            "must not emit the broken de-pluralized `add_categorie`"
+        );
+        assert!(
+            generated.contains("set_categories"),
+            "the set_ (replace-all) helper keeps the smart plural accessor name"
+        );
+    }
+
+    #[test]
+    fn model_macro_m2m_mutation_helper_singular_uses_target_for_irregular_person() {
+        // `Person` → accessor `people`; the `add_`/`remove_` helpers must use
+        // the target singular `person`, not the (unchanged-by-strip-`s`)
+        // `people`.
+        let generated = model_macro(
+            quote! {},
+            quote! {
+                #[has_many(Person, through = team_people)]
+                pub struct Team {
+                    #[id]
+                    pub id: i64,
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("add_person"),
+            "expected add_person helper, got: {generated}"
+        );
+        assert!(
+            generated.contains("remove_person"),
+            "expected remove_person helper"
+        );
+        assert!(
+            !generated.contains("add_people"),
+            "must not emit the broken `add_people`"
+        );
     }
 
     // ── Many-to-many codegen shape (#1324) ────────────────────────────────
@@ -5521,6 +5682,94 @@ mod tests {
     }
 
     #[test]
+    fn update_model_drops_every_non_patch_validator_but_new_model_keeps_them() {
+        // #1751 (residual long tail of #1742/#1719): lock in that the FULL
+        // `NON_PATCH_VALIDATORS` denylist — not just `custom` — is stripped from
+        // the generated `UpdateModel` `Patch<T>` fields while `NewModel` keeps
+        // every one. These four are enforced on create only and are genuinely
+        // unfixable on the PATCH path without the merged-model redesign:
+        //   * `must_match` / `nested` — cross-field / struct-level; no single-
+        //     field `Patch<T>` trait exists for them.
+        //   * `credit_card` (`ValidateCreditCard`) / `non_control_character`
+        //     (`ValidateNonControlCharacter`) — not exported under this
+        //     workspace's `validator` feature set, so no `Patch<T>` impl can be
+        //     written without enabling new features (out of scope for a latent
+        //     case).
+        // This is pure token-level filtering (`model_macro` does not compile the
+        // output), so the combination need not be semantically valid — only that
+        // each validator ident is dropped from the patch struct.
+        let output = model_macro(
+            TokenStream::new(),
+            quote! {
+                pub struct Signup {
+                    #[id]
+                    pub id: i64,
+                    #[validate(
+                        length(min = 1),
+                        must_match(other = "confirm"),
+                        nested,
+                        credit_card,
+                        non_control_character
+                    )]
+                    pub password: String,
+                    pub confirm: String,
+                }
+            },
+        );
+        let generated = output.to_string();
+
+        // Slice the `NewSignup` struct body (up to its closing brace).
+        let new_start = generated
+            .find("struct NewSignup")
+            .expect("NewSignup struct must be generated");
+        let new_end = new_start
+            + generated[new_start..]
+                .find('}')
+                .expect("NewSignup struct must close");
+        let new_section = &generated[new_start..new_end];
+        for kept in [
+            "length",
+            "must_match",
+            "nested",
+            "credit_card",
+            "non_control_character",
+        ] {
+            assert!(
+                new_section.contains(kept),
+                "NewSignup must keep the `{kept}` validator (enforced on create): {new_section}"
+            );
+        }
+
+        // Slice the `UpdateSignup` struct body (up to its closing brace).
+        let upd_start = generated
+            .find("struct UpdateSignup")
+            .expect("UpdateSignup struct must be generated");
+        let upd_end = upd_start
+            + generated[upd_start..]
+                .find('}')
+                .expect("UpdateSignup struct must close");
+        let upd_section = &generated[upd_start..upd_end];
+        // The lone declarative validator is retained on the patch field.
+        assert!(
+            upd_section.contains("length"),
+            "UpdateSignup must keep the declarative `length` validator: {upd_section}"
+        );
+        // Every non-declarative validator is stripped from the patch field.
+        for dropped in [
+            "must_match",
+            "nested",
+            "credit_card",
+            "non_control_character",
+        ] {
+            assert!(
+                !upd_section.contains(dropped),
+                "UpdateSignup must NOT carry the non-Patch `{dropped}` validator \
+                 (would break UpdateModel compilation / has no Patch<T> impl): {upd_section}"
+            );
+        }
+    }
+
+    #[test]
     fn update_model_drops_does_not_contain_but_new_model_keeps_it() {
         // #1719 follow-up: `does_not_contain` reaches `Patch<T>` through
         // validator's blanket `impl<T: ValidateContains> ValidateDoesNotContain`,
@@ -5530,6 +5779,12 @@ mod tests {
         // field would then spuriously fail with 422. So `does_not_contain` must
         // be dropped from the `UpdateModel` `Patch<T>` fields (enforced on create
         // via `NewModel` only), while `contains`/`length` must be RETAINED.
+        //
+        // #1751: a hand-written `ValidateDoesNotContain for Patch<T>` (which would
+        // let us keep it with correct skip semantics) is impossible — it collides
+        // with validator's blanket `impl<T: ValidateContains> ValidateDoesNotContain
+        // for T` (E0119: `Patch<T>` already impls `ValidateContains`). So the
+        // create-only filtering below is a genuine coherence wall, not a stopgap.
         let output = model_macro(
             TokenStream::new(),
             quote! {
@@ -5992,6 +6247,52 @@ mod tests {
     fn infer_table_name_multi_word() {
         let ident = syn::Ident::new("BlogPost", proc_macro2::Span::call_site());
         assert_eq!(infer_table_name(&ident), "blog_posts");
+    }
+
+    // Irregular-plural inference (#1753): the derived table name MUST match the
+    // CLI scaffold's `src/schema.rs`, which pluralises through
+    // `autumn_web::format::pluralize_word`. These mirror the assertions in
+    // `autumn/src/format.rs` and `autumn-cli/src/generate/naming.rs` so all
+    // three implementations agree.
+    #[test]
+    fn infer_table_name_irregular_plurals() {
+        let cases = [
+            ("Category", "categories"),
+            ("Company", "companies"),
+            ("City", "cities"),
+            ("Story", "stories"),
+            ("Box", "boxes"),
+            ("Buzz", "buzzes"),
+            ("Class", "classes"),
+            ("Watch", "watches"),
+            ("Dish", "dishes"),
+            ("Person", "people"),
+            ("Child", "children"),
+            ("Post", "posts"),
+            ("Node", "nodes"),
+            ("Comment", "comments"),
+            ("BlogPost", "blog_posts"),
+            ("Day", "days"),
+        ];
+        for (input, expected) in cases {
+            let ident = syn::Ident::new(input, proc_macro2::Span::call_site());
+            assert_eq!(infer_table_name(&ident), expected, "input: {input}");
+        }
+    }
+
+    #[test]
+    fn pluralize_word_matches_canonical_rules() {
+        assert_eq!(pluralize_word(""), "");
+        assert_eq!(pluralize_word("category"), "categories");
+        assert_eq!(pluralize_word("day"), "days");
+        assert_eq!(pluralize_word("box"), "boxes");
+        assert_eq!(pluralize_word("buzz"), "buzzes");
+        assert_eq!(pluralize_word("class"), "classes");
+        assert_eq!(pluralize_word("watch"), "watches");
+        assert_eq!(pluralize_word("dish"), "dishes");
+        assert_eq!(pluralize_word("person"), "people");
+        assert_eq!(pluralize_word("goose"), "geese");
+        assert_eq!(pluralize_word("post"), "posts");
     }
 
     // ── RED: etag() derivation from #[lock_version] ────────────────────────
