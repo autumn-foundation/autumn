@@ -864,6 +864,14 @@ mod tests {
     }
 
     #[test]
+    fn multipart_part_size_is_exactly_5_mib() {
+        assert_eq!(
+            MULTIPART_PART_SIZE, 5_242_880,
+            "MULTIPART_PART_SIZE must be exactly 5 MiB to satisfy S3 minimums"
+        );
+    }
+
+    #[test]
     fn implements_send_sync_clone() {
         fn assert_impl<T: Send + Sync + Clone>() {}
         assert_impl::<S3BlobStore>();

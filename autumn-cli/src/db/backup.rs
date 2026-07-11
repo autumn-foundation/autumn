@@ -8,7 +8,7 @@
 //! captures precisely the databases the running app uses — control plus every
 //! configured shard — under the active profile/env overlay. The destructive
 //! `restore` is gated by the same production guard as `autumn db drop`
-//! ([`super::guard_destructive`]).
+//! (`super::guard_destructive`).
 //!
 //! # Artifact layout (S3-bolt-on friendly — issue #1619)
 //!
@@ -27,7 +27,7 @@
 //!
 //! # Zero-external-tools for managed Postgres (AC #2)
 //!
-//! [`PgTools::locate`] resolves `pg_dump`/`pg_restore` from, in order: an
+//! `PgTools::locate` resolves `pg_dump`/`pg_restore` from, in order: an
 //! explicit `AUTUMN_PG_BIN_DIR`, the managed-Postgres bundle's `bin` directory
 //! (derived from `AUTUMN_MANAGED_PG_DATA_DIR`, which `autumn serve --bundled-pg`
 //! sets), then the `PATH`. A managed-pg daemon therefore needs no externally
@@ -39,7 +39,7 @@ use std::process::Command;
 use crate::migrate;
 
 /// Environment variable that pins the directory holding `pg_dump`/`pg_restore`.
-/// Highest precedence in [`PgTools::locate`]; lets an operator point at a
+/// Highest precedence in `PgTools::locate`; lets an operator point at a
 /// specific client-tools install.
 const PG_BIN_DIR_ENV: &str = "AUTUMN_PG_BIN_DIR";
 
