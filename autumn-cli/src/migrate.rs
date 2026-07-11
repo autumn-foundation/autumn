@@ -850,6 +850,25 @@ pub fn is_production_profile_name(profile: &str) -> bool {
     normalized == "prod" || normalized == "production"
 }
 
+/// Normalize a profile name to its canonical spelling — the SAME mapping the
+/// runtime config loader applies (`autumn_web::config`'s `normalize_profile_name`):
+/// `production`/`prod` (any case) → `prod`, `development`/`dev` (any case) → `dev`,
+/// custom names preserved (trimmed, case kept). Reused so an offsite
+/// `.env.<profile>` / `[profile.<p>]` selection matches the app's resolved profile
+/// even when the operator writes `--profile development` / `AUTUMN_ENV=PROD`
+/// (issue #1619 P2 #20).
+#[must_use]
+pub fn canonical_profile(profile: &str) -> String {
+    let trimmed = profile.trim();
+    if trimmed.eq_ignore_ascii_case("production") || trimmed.eq_ignore_ascii_case("prod") {
+        "prod".to_owned()
+    } else if trimmed.eq_ignore_ascii_case("development") || trimmed.eq_ignore_ascii_case("dev") {
+        "dev".to_owned()
+    } else {
+        trimmed.to_owned()
+    }
+}
+
 /// Profile name spellings to probe for inline `[profile.<name>]` sections,
 /// mirroring `autumn_web::config::profile_lookup_names`'s alias handling so
 /// `prod`/`production` and `dev`/`development` are interchangeable. Matching is
@@ -2256,6 +2275,21 @@ mod tests {
                 assert_eq!(effective_profile(None), "prod");
             },
         );
+    }
+
+    #[test]
+    fn canonical_profile_normalizes_aliases_and_case() {
+        // P2 #20: offsite `.env.<profile>` selection must use the app's canonical
+        // profile, so alias/case spellings collapse the same way the loader does.
+        for input in ["development", "Development", "DEV", "dev", "  dev  "] {
+            assert_eq!(canonical_profile(input), "dev", "{input:?}");
+        }
+        for input in ["production", "PROD", "Prod", "prod"] {
+            assert_eq!(canonical_profile(input), "prod", "{input:?}");
+        }
+        // Custom profiles are preserved verbatim (trimmed, case kept).
+        assert_eq!(canonical_profile("staging"), "staging");
+        assert_eq!(canonical_profile("  QA  "), "QA");
     }
 
     #[test]

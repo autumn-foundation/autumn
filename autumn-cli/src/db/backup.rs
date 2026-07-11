@@ -1058,7 +1058,11 @@ fn dotenv_env() -> autumn_web::dotenv::DotenvOsEnv {
 /// `autumn db backup --profile test --upload` from a dev/unset shell would miss
 /// `.env.test`-provided offsite settings and credentials.
 fn dotenv_env_for_profile(profile: &str) -> autumn_web::dotenv::DotenvOsEnv {
-    match autumn_web::dotenv::os_env_with_dotenv_for_profile(profile) {
+    // Normalize aliases/case to the app's resolved profile FIRST (P2 #20), so
+    // `--profile development` / `AUTUMN_ENV=PROD` selects `.env.dev` / `.env.prod`
+    // — the same file the running app reads — instead of a literal `.env.development`.
+    let profile = migrate::canonical_profile(profile);
+    match autumn_web::dotenv::os_env_with_dotenv_for_profile(&profile) {
         Ok(env) => env,
         Err(e) => {
             eprintln!("  \u{274C} .env: {e}");
@@ -1822,13 +1826,16 @@ impl LoadedOffsite {
 /// `[backup.offsite].auto_upload` (base + `[profile.<p>]` overlay) → `false`.
 fn auto_upload_probe(profile: &str) -> bool {
     use autumn_web::config::Env as _;
+    // Normalize aliases/case to the app's resolved profile (P2 #20) so both the
+    // dotenv overlay and the `[profile.<p>]` selection match what the app reads.
+    let profile = migrate::canonical_profile(profile);
     // The profile-aware dotenv overlay covers BOTH the real env and `.env.<p>`
     // (a real env var wins inside the overlay), matching P2 #6.
-    let env = dotenv_env_for_profile(profile);
+    let env = dotenv_env_for_profile(&profile);
     // Read `autumn.toml` from the config/manifest dir (AUTUMN_MANIFEST_DIR),
     // matching where the full loader + the dotenv overlay look — so an installed/
     // daemon launch with a different CWD still sees `auto_upload` (P2 #15).
-    let table = migrate::read_autumn_toml_table_with_profile_from_config_dir(Some(profile));
+    let table = migrate::read_autumn_toml_table_with_profile_from_config_dir(Some(&profile));
     auto_upload_from_sources(|k| env.var(k).ok(), table.as_ref())
 }
 
@@ -1876,16 +1883,20 @@ fn parse_bool_flag(raw: &str) -> Option<bool> {
 /// here — that is deferred to [`LoadedOffsite::resolve`] so a local backup is
 /// never blocked by an incomplete offsite section.
 fn load_offsite(profile: &str) -> Result<Option<LoadedOffsite>, BackupError> {
+    // Normalize aliases/case to the app's resolved profile (P2 #20) so the dotenv
+    // overlay, the `[profile.<p>]` selection, and the stored profile (later reused
+    // for credential resolution) all match what the running app reads.
+    let profile = migrate::canonical_profile(profile);
     // Real env + `.env.<profile>` overlay (profile-aware, P2 #6); merged TOML
     // (base + `[profile.<p>]`) — neither decrypts credentials nor validates.
-    let env = dotenv_env_for_profile(profile);
+    let env = dotenv_env_for_profile(&profile);
     // Read `autumn.toml` from the config/manifest dir (AUTUMN_MANIFEST_DIR),
     // matching the full loader + dotenv overlay — so an installed/daemon launch
     // whose CWD differs from the config dir still finds the offsite destination
     // (and enforces the distinct-bucket guard) instead of reporting it
     // unconfigured (P2 #15).
-    let table = migrate::read_autumn_toml_table_with_profile_from_config_dir(Some(profile));
-    resolve_loaded_offsite(table.as_ref(), &env, profile)
+    let table = migrate::read_autumn_toml_table_with_profile_from_config_dir(Some(&profile));
+    resolve_loaded_offsite(table.as_ref(), &env, &profile)
 }
 
 /// Pure core of [`load_offsite`]: build the offsite view from a merged TOML table
@@ -2113,14 +2124,24 @@ fn upload_run(
     if files.is_empty() {
         return Err("the completed run directory contains no files to upload".to_owned());
     }
+    let mut written_keys: Vec<String> = Vec::new();
     for file in &files {
         let path = run_dir.join(file);
         let key = offsite_object_key(&offsite.prefix, profile, run_id, file);
+        // `put_file_and_verify` WRITES the object BEFORE its HEAD/GET verification,
+        // so even a verify failure can leave the object (incl. the run manifest) in
+        // the bucket. Record the key up-front, then on ANY failure best-effort
+        // delete everything this run wrote — manifest first — so a run whose upload
+        // was reported FAILED never keeps a remote `manifest.json` and can't become
+        // `latest` or consume a retention slot (restores the P2 #2 invariant; #21).
+        written_keys.push(key.clone());
         // Stream the file straight from disk (hash pre-pass + streamed body):
         // a multi-GB dump is never read into memory.
-        client
-            .put_file_and_verify(&key, &path)
-            .map_err(|e| format!("{file}: {e}"))?;
+        if let Err(e) = client.put_file_and_verify(&key, &path) {
+            let detail = format!("{file}: {e}");
+            cleanup_failed_upload(client, &written_keys);
+            return Err(detail);
+        }
         eprintln!("  \u{2713} uploaded + verified {file}");
     }
     eprintln!(
@@ -2138,6 +2159,35 @@ fn upload_run(
         eprintln!("  \u{26A0} offsite retention skipped: {e}");
     }
     Ok(())
+}
+
+/// Best-effort removal of the objects a FAILED [`upload_run`] wrote, so a partial
+/// upload never leaves a remote `manifest.json` behind — which
+/// [`complete_remote_run_ids`] would otherwise count as a COMPLETE run for
+/// `latest`/retention (P2 #21). The manifest key is deleted FIRST so that even if
+/// a later delete fails, the completeness marker is already gone. Delete failures
+/// are swallowed: the caller surfaces the ORIGINAL upload/verify error.
+fn cleanup_failed_upload(client: &S3Client, written_keys: &[String]) {
+    for key in order_cleanup_keys(written_keys) {
+        let _ = client.delete_object(&key);
+    }
+}
+
+/// Order the keys a failed upload wrote for cleanup: the run's `manifest.json`
+/// FIRST (drop the completeness marker before anything else), then the rest in
+/// their written order. Pure for unit testing.
+fn order_cleanup_keys(written_keys: &[String]) -> Vec<String> {
+    let mut keys = written_keys.to_vec();
+    // `false` (manifest) sorts before `true` (everything else); stable sort keeps
+    // the remaining keys in their original order.
+    keys.sort_by_key(|k| !key_is_manifest(k));
+    keys
+}
+
+/// Whether an object key is a run's manifest (its final path component is
+/// [`MANIFEST_FILE`]).
+fn key_is_manifest(key: &str) -> bool {
+    key.rsplit('/').next() == Some(MANIFEST_FILE)
 }
 
 /// List the file names (not sub-directories) directly inside a run directory.
@@ -3655,6 +3705,49 @@ mod tests {
             s3.app_storage_bucket.as_deref(),
             s3.app_storage_endpoint.as_deref(),
         ));
+    }
+
+    #[test]
+    fn key_is_manifest_matches_only_the_run_manifest() {
+        assert!(key_is_manifest(
+            "db/prod/20260710T040506Z-abcd1234/manifest.json"
+        ));
+        assert!(!key_is_manifest(
+            "db/prod/20260710T040506Z-abcd1234/control.dump"
+        ));
+        // A file that merely contains the word is not the manifest.
+        assert!(!key_is_manifest("db/prod/r/not-manifest.json.dump"));
+    }
+
+    #[test]
+    fn order_cleanup_keys_deletes_manifest_first() {
+        // P2 #21: on a failed upload the run manifest must be removed FIRST so the
+        // completeness marker is gone even if a later delete fails — otherwise a
+        // failed run could still be counted `complete` for latest/retention.
+        let written = vec![
+            "db/prod/r/control.dump".to_owned(),
+            "db/prod/r/shard-a.dump".to_owned(),
+            "db/prod/r/manifest.json".to_owned(),
+        ];
+        let ordered = order_cleanup_keys(&written);
+        assert_eq!(ordered[0], "db/prod/r/manifest.json");
+        // The remaining (non-manifest) keys keep their written order.
+        assert_eq!(
+            &ordered[1..],
+            &[
+                "db/prod/r/control.dump".to_owned(),
+                "db/prod/r/shard-a.dump".to_owned()
+            ]
+        );
+
+        // And downstream: with the manifest deleted, complete_remote_run_ids no
+        // longer counts the run — so the failed run can't become `latest`.
+        let list_prefix = "db/prod/";
+        let after_cleanup = vec![s3::S3Object {
+            key: "db/prod/r/control.dump".to_owned(), // manifest was cleaned up
+            size: 10,
+        }];
+        assert!(complete_remote_run_ids(&after_cleanup, list_prefix).is_empty());
     }
 
     #[test]
