@@ -372,6 +372,101 @@ fn slice_textarea_attrs<'a>(routes: &'a str, marker: &str) -> &'a str {
     &rest[..end]
 }
 
+/// Issue #1750: a `--live-validation` scaffold renders its form through the
+/// per-field path (not `form_for`), which historically dropped the #1388
+/// client-side HTML5 constraint attributes. The live path must now carry the
+/// SAME attributes the standard path emits — `minlength`/`maxlength`,
+/// `type="email"`/`type="url"`, numeric `min`/`max`, and a `<textarea>` for
+/// constrained `Text` — threaded through the htmx inline-validation wiring, and
+/// the inline-validate handler fragment must carry them too so the swapped-in
+/// field doesn't shed its client-side guards on the first `change`.
+#[test]
+fn live_validation_forms_carry_html5_constraints() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    run_autumn_ok(tmp.path(), &["new", "live-validate-html5-app"]);
+    let project = tmp.path().join("live-validate-html5-app");
+    run_autumn_ok(
+        &project,
+        &[
+            "generate",
+            "scaffold",
+            "Post",
+            "title:String{min=3,max=120}",
+            "contact:String{email}",
+            "homepage:String{url}",
+            "age:i32{min=0,max=130}",
+            "notes:Text{min=10,max=500}",
+            "bio:Option<String>{max=200}",
+            "--live-validation",
+        ],
+    );
+    let routes = fs::read_to_string(project.join("src/routes/posts.rs")).unwrap();
+
+    // The string length constraint on the htmx-validated `title` input.
+    assert!(
+        routes.contains("minlength=\"3\" maxlength=\"120\""),
+        "title must render minlength/maxlength in live-validation mode:\n{routes}"
+    );
+    // Typed inputs (email/url) instead of a bare text input.
+    assert!(
+        routes.contains("type=\"email\" id=\"contact\""),
+        "contact must render type=email in live-validation mode:\n{routes}"
+    );
+    assert!(
+        routes.contains("type=\"url\" id=\"homepage\""),
+        "homepage must render type=url in live-validation mode:\n{routes}"
+    );
+    // Numeric min/max on the number input.
+    assert!(
+        routes.contains("type=\"number\"") && routes.contains("min=\"0\" max=\"130\""),
+        "age must render type=number with min/max in live-validation mode:\n{routes}"
+    );
+    // A constrained `Text` column becomes a <textarea> carrying its length rule.
+    assert!(
+        routes.contains("textarea id=\"notes\" name=\"notes\"")
+            && routes.contains("maxlength=\"500\""),
+        "constrained Text `notes` must render a <textarea> with maxlength:\n{routes}"
+    );
+    // The nullable `bio` keeps its maxlength.
+    assert!(
+        routes.contains("maxlength=\"200\""),
+        "bio must render maxlength in live-validation mode:\n{routes}"
+    );
+
+    // The htmx inline-validation wiring survives on a constrained validated
+    // input (real-time validation still works alongside the static constraints),
+    // and its swap wrapper marker is present.
+    assert!(
+        routes.contains("hx-post=\"/posts/validate/title\"")
+            && routes.contains("data-autumn-field-wrapper=\"title\""),
+        "the constrained title input must keep its htmx inline-validation wiring:\n{routes}"
+    );
+
+    // The inline-validate handler returns the SAME constrained fragment, so the
+    // swapped-in field doesn't drop the client-side attributes on first change.
+    let validate_title = slice_fn(&routes, "pub async fn validate_title(");
+    assert!(
+        validate_title.contains("minlength=\"3\" maxlength=\"120\""),
+        "the validate_title fragment must also carry the HTML5 constraints:\n{validate_title}"
+    );
+    assert!(
+        !validate_title.contains("type=\"email\""),
+        "sanity: the validate_title slice must be bounded to its own handler:\n{validate_title}"
+    );
+}
+
+/// Slice a generated handler body from its `fn` marker to the next handler's
+/// `#[post(` attribute (or end of file), so an assertion scoped to one
+/// inline-validate handler can't accidentally match a sibling's fragment.
+fn slice_fn<'a>(routes: &'a str, marker: &str) -> &'a str {
+    let start = routes
+        .find(marker)
+        .unwrap_or_else(|| panic!("missing {marker} in:\n{routes}"));
+    let rest = &routes[start..];
+    let end = rest[1..].find("#[post(").map_or(rest.len(), |rel| rel + 1);
+    &rest[..end]
+}
+
 #[test]
 fn unknown_constraint_modifier_fails_the_scaffold() {
     // AC5: a misspelled modifier fails loudly, naming the offending token,

@@ -334,16 +334,70 @@ fn live_validation_keeps_parent_display_on_index_and_show() {
         routes.contains("async fn post_id_select_options"),
         "the option loader must be emitted (the index label map depends on it):\n{routes}"
     );
-    // The in-FORM belongs_to `<select>` is what's deferred in live-validation
-    // (#1750): the FK renders through the per-field text-input path, not a
-    // dropdown / `form_for` select override.
+    // Issue #1750: the in-FORM belongs_to `<select>` is now rendered in
+    // live-validation too — the FK no longer leaks out as a raw per-field text
+    // input. The per-field path emits a raw `<select>` (not a `form_for`
+    // `.override_field` override, which live-validation never uses) populated
+    // from the runtime option loader.
     assert!(
-        routes.contains("required_text_input(&changeset, \"post_id\", \"Post Id\")"),
-        "the FK form control is the per-field text input (select deferred):\n{routes}"
+        routes.contains("let post_id_options = post_id_select_options(&mut db).await?;"),
+        "live-validation must load the belongs_to select options in the form handler:\n{routes}"
+    );
+    assert!(
+        routes.contains("select id=\"post_id\" name=\"post_id\""),
+        "the FK form control must be a populated <select> in live-validation:\n{routes}"
+    );
+    assert!(
+        !routes.contains("required_text_input(&changeset, \"post_id\", \"Post Id\")"),
+        "the FK must no longer render as a per-field text input:\n{routes}"
     );
     assert!(
         !routes.contains(".override_field(\"post_id\""),
         "no `form_for` select override is emitted in live-validation:\n{routes}"
+    );
+}
+
+#[test]
+fn live_validation_renders_populated_belongs_to_select() {
+    // Issue #1750 (belongs_to half): the in-form parent `<select>` must render
+    // in `--live-validation` mode, populated from the same runtime option loader
+    // the standard path uses, with a blank placeholder and changeset-driven
+    // `selected` state so a 422 re-render keeps the chosen parent.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    run_autumn_ok(tmp.path(), &["new", "bt-live-select-app"]);
+    let project = tmp.path().join("bt-live-select-app");
+    run_autumn_ok(&project, &["generate", "model", "Post", "title:String"]);
+    run_autumn_ok(
+        &project,
+        &[
+            "generate",
+            "scaffold",
+            "Comment",
+            "body:Text",
+            "post:references",
+            "--live-validation",
+        ],
+    );
+    let routes = fs::read_to_string(project.join("src/routes/comments.rs")).unwrap();
+
+    // The new-form handler gains `db` and loads the options before rendering.
+    assert!(
+        routes.contains("let post_id_options = post_id_select_options(&mut db).await?;"),
+        "the options must be loaded in the form handler:\n{routes}"
+    );
+    // The `<select>` is populated from those options with changeset `selected`.
+    assert!(
+        routes.contains("select id=\"post_id\" name=\"post_id\""),
+        "a <select> must be rendered for the belongs_to parent:\n{routes}"
+    );
+    assert!(
+        routes.contains("@for (opt_value, opt_label) in post_id_options.iter()"),
+        "the <select> options must come from the runtime loader:\n{routes}"
+    );
+    assert!(
+        routes
+            .contains("changeset.field_value(\"post_id\").as_deref() == Some(opt_value.as_str())"),
+        "the selected option must be driven by the changeset value (422 re-render):\n{routes}"
     );
 }
 
