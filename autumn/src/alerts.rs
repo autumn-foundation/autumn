@@ -17,41 +17,41 @@
 //!
 //! | Condition | Fires when | Where to look |
 //! |-----------|------------|---------------|
-//! | [`AlertCondition::DeadLetteredJob`] | a background job exhausts its retries and is dead-lettered | `/actuator/jobs` † |
-//! | [`AlertCondition::HealthIndicatorDown`] | a registered health indicator reports `Down` past the grace period | `/actuator/health` |
-//! | [`AlertCondition::HighErrorRate`] | the rolling 5xx rate crosses the configured threshold | `/actuator/metrics` |
-//! | [`AlertCondition::ScheduledTaskFailure`] | a framework-scheduled task (backup, cert-renewal, cron/fixed-delay) fails | `/actuator/tasks` † |
+//! | [`AlertCondition::DeadLetteredJob`](crate::alerts::AlertCondition::DeadLetteredJob) | a background job exhausts its retries and is dead-lettered | `/actuator/jobs` † |
+//! | [`AlertCondition::HealthIndicatorDown`](crate::alerts::AlertCondition::HealthIndicatorDown) | a registered health indicator reports `Down` past the grace period | `/actuator/health` |
+//! | [`AlertCondition::HighErrorRate`](crate::alerts::AlertCondition::HighErrorRate) | the rolling 5xx rate crosses the configured threshold | `/actuator/metrics` |
+//! | [`AlertCondition::ScheduledTaskFailure`](crate::alerts::AlertCondition::ScheduledTaskFailure) | a framework-scheduled task (backup, cert-renewal, cron/fixed-delay) fails | `/actuator/tasks` † |
 //!
 //! † `/actuator/jobs` and `/actuator/tasks` are mounted only when `[actuator]
 //! sensitive = true` (default `false`). When it is off, those two alerts point at
 //! the always-mounted `/actuator/health` instead and note that the richer
-//! endpoint needs `sensitive = true` (see [`sensitive_gated_where_to_look`]).
+//! endpoint needs `sensitive = true` (see `sensitive_gated_where_to_look`).
 //!
 //! # Delivery is a trait (extension point)
 //!
-//! Every destination implements [`AlertChannel`]. The [`Alerter`] holds a
+//! Every destination implements [`AlertChannel`](crate::alerts::AlertChannel). The [`Alerter`](crate::alerts::Alerter) holds a
 //! fan-out list of channels and delivers each alert to all of them on a
 //! detached task — so a slow or unreachable channel never adds latency to a
 //! request or blocks the others. Two built-in channels ship:
-//! [`MailAlertChannel`] (reuses the app's [`Mailer`](crate::mail::Mailer)) and
-//! [`WebhookAlertChannel`] (a signed, Stripe-style HMAC POST reusing the same
+//! [`MailAlertChannel`](crate::alerts::MailAlertChannel) (reuses the app's [`Mailer`](crate::mail::Mailer)) and
+//! [`WebhookAlertChannel`](crate::alerts::WebhookAlertChannel) (a signed, Stripe-style HMAC POST reusing the same
 //! signing scheme as [`webhook_outbound`](crate::webhook_outbound)).
 //!
 //! **Design intent (follow-up #1630):** PagerDuty / Slack / Discord transports
-//! are added purely by implementing [`AlertChannel`] and registering them with
+//! are added purely by implementing [`AlertChannel`](crate::alerts::AlertChannel) and registering them with
 //! [`AppBuilder::with_alert_channel`](crate::app::AppBuilder::with_alert_channel);
-//! the core never changes. That is why every [`Alert`] carries a **stable dedup
-//! key** ([`Alert::dedup_key`], which PagerDuty correlates on), a **severity
-//! class** ([`Alert::severity`]), and a **trigger vs resolve** discriminator
-//! ([`Alert::event`]).
+//! the core never changes. That is why every [`Alert`](crate::alerts::Alert) carries a **stable dedup
+//! key** ([`Alert::dedup_key`](crate::alerts::Alert::dedup_key), which PagerDuty correlates on), a **severity
+//! class** ([`Alert::severity`](crate::alerts::Alert::severity)), and a **trigger vs resolve** discriminator
+//! ([`Alert::event`](crate::alerts::Alert::event)).
 //!
 //! # Deduplication and recovery
 //!
 //! A sustained or repeating condition does **not** produce one notification per
-//! occurrence. [`AlertDeduplicator`] bounds notifications to **at most one per
+//! occurrence. [`AlertDeduplicator`](crate::alerts::AlertDeduplicator) bounds notifications to **at most one per
 //! condition per dedup window** (default 15 minutes); the condition re-notifies
 //! once per window while it persists. When a previously-alerted condition
-//! clears, a single [`AlertEventKind::Resolve`] recovery notification is sent.
+//! clears, a single [`AlertEventKind::Resolve`](crate::alerts::AlertEventKind::Resolve) recovery notification is sent.
 //!
 //! # Fail-safe
 //!
@@ -108,9 +108,9 @@ impl AlertCondition {
     ///
     /// This is the builder default. When the app configures a custom
     /// `[actuator] prefix`, the emitted alert's `where_to_look` is rebuilt from
-    /// the effective prefix (see [`actuator_where_to_look`]) so it points at the
+    /// the effective prefix (see `actuator_where_to_look`) so it points at the
     /// real endpoint rather than a `/actuator/*` 404. Keep the suffixes here in
-    /// sync with [`Self::actuator_suffix`].
+    /// sync with `Self::actuator_suffix`.
     #[must_use]
     pub const fn where_to_look(self) -> &'static str {
         match self {
@@ -519,14 +519,14 @@ pub struct AlerterSettings {
     /// The effective actuator URL prefix (`[actuator] prefix`, default
     /// `/actuator`). Every alert's `where_to_look` pointer is built from this so
     /// operators are sent to the real actuator endpoint even when the prefix is
-    /// customized. Stored raw; normalization happens in [`actuator_where_to_look`].
+    /// customized. Stored raw; normalization happens in `actuator_where_to_look`.
     pub actuator_prefix: String,
     /// The effective `[actuator] sensitive` flag (default `false`). The `/jobs`
     /// and `/tasks` actuator endpoints are mounted ONLY when this is `true`
     /// (see `actuator_router_with_prefix`), so the dead-lettered-job and
     /// scheduled-task-failure alerts point at them only when they exist and fall
     /// back to an always-mounted endpoint otherwise (see
-    /// [`sensitive_gated_where_to_look`]).
+    /// `sensitive_gated_where_to_look`).
     pub actuator_sensitive: bool,
 }
 

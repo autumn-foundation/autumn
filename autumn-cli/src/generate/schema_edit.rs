@@ -1038,7 +1038,7 @@ pub fn link_models_into_seed_bin(existing: &str) -> String {
 /// alone. Idempotent: a block already absent is a no-op. Blank lines left at
 /// the removal seam are collapsed so the reverted file stays tidy.
 ///
-/// This is gated by [`Revert::SeedBinLinks`]'s `owner_dir` (`src/models`) so it
+/// This is gated by [`Revert::SeedBinLinks`](crate::generate::emit::Revert::SeedBinLinks)'s `owner_dir` (`src/models`) so it
 /// only runs when the *last* model is destroyed — destroying one of several
 /// models leaves the links in place, matching the surviving `models/mod.rs`.
 #[must_use]
