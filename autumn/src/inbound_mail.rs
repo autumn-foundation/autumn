@@ -1247,63 +1247,7 @@ fn parse_rfc5322(raw: Bytes) -> InboundEmail {
         // Pass raw bytes so binary attachment parts are not corrupted.
         extract_multipart_bodies(body_bytes, &content_type)
     } else {
-        let disposition = parsed_headers
-            .get("content-disposition")
-            .map(|s| s.to_ascii_lowercase())
-            .unwrap_or_default();
-        let is_attachment = disposition.starts_with("attachment")
-            || (!ct_lower.is_empty()
-                && !ct_lower.starts_with("text/")
-                && !ct_lower.starts_with("message/"));
-        if is_attachment {
-            let filename = parsed_headers
-                .get("content-disposition")
-                .and_then(|d| mime_param(d, "filename"));
-            let ct_only = ct_lower
-                .split(';')
-                .next()
-                .map(str::trim)
-                .unwrap_or("application/octet-stream")
-                .to_string();
-            let data = if cte == "base64" {
-                let stripped: String = String::from_utf8_lossy(body_bytes)
-                    .chars()
-                    .filter(|c| !c.is_ascii_whitespace())
-                    .collect();
-                base64::engine::general_purpose::STANDARD
-                    .decode(stripped.as_bytes())
-                    .map(Bytes::from)
-                    .unwrap_or_else(|_| Bytes::copy_from_slice(body_bytes))
-            } else if cte == "quoted-printable" {
-                Bytes::from(decode_quoted_printable_bytes(body_bytes))
-            } else {
-                Bytes::copy_from_slice(body_bytes)
-            };
-            (
-                None,
-                None,
-                vec![Attachment {
-                    filename,
-                    content_type: ct_only,
-                    data,
-                }],
-            )
-        } else {
-            let body_str = String::from_utf8_lossy(body_bytes).into_owned();
-            if ct_lower.contains("text/html") {
-                (
-                    None,
-                    Some(decode_transfer_encoding(&body_str, &cte)),
-                    Vec::new(),
-                )
-            } else {
-                (
-                    Some(decode_transfer_encoding(&body_str, &cte)),
-                    None,
-                    Vec::new(),
-                )
-            }
-        }
+        extract_single_part_bodies(body_bytes, &parsed_headers, &ct_lower, &cte)
     };
 
     InboundEmail {
@@ -1466,6 +1410,71 @@ fn extract_boundary(content_type: &str) -> Option<String> {
 
 /// Split a MIME multipart body and return `(text/plain, text/html, attachments)`.
 ///
+fn extract_single_part_bodies(
+    body_bytes: &[u8],
+    parsed_headers: &HashMap<String, String>,
+    ct_lower: &str,
+    cte: &str,
+) -> (Option<String>, Option<String>, Vec<Attachment>) {
+    let disposition = parsed_headers
+        .get("content-disposition")
+        .map(|s| s.to_ascii_lowercase())
+        .unwrap_or_default();
+    let is_attachment = disposition.starts_with("attachment")
+        || (!ct_lower.is_empty()
+            && !ct_lower.starts_with("text/")
+            && !ct_lower.starts_with("message/"));
+    if is_attachment {
+        let filename = parsed_headers
+            .get("content-disposition")
+            .and_then(|d| mime_param(d, "filename"));
+        let ct_only = ct_lower
+            .split(';')
+            .next()
+            .map(str::trim)
+            .unwrap_or("application/octet-stream")
+            .to_string();
+        let data = if cte == "base64" {
+            let stripped: String = String::from_utf8_lossy(body_bytes)
+                .chars()
+                .filter(|c| !c.is_ascii_whitespace())
+                .collect();
+            base64::engine::general_purpose::STANDARD
+                .decode(stripped.as_bytes())
+                .map(Bytes::from)
+                .unwrap_or_else(|_| Bytes::copy_from_slice(body_bytes))
+        } else if cte == "quoted-printable" {
+            Bytes::from(decode_quoted_printable_bytes(body_bytes))
+        } else {
+            Bytes::copy_from_slice(body_bytes)
+        };
+        (
+            None,
+            None,
+            vec![Attachment {
+                filename,
+                content_type: ct_only,
+                data,
+            }],
+        )
+    } else {
+        let body_str = String::from_utf8_lossy(body_bytes).into_owned();
+        if ct_lower.contains("text/html") {
+            (
+                None,
+                Some(decode_transfer_encoding(&body_str, cte)),
+                Vec::new(),
+            )
+        } else {
+            (
+                Some(decode_transfer_encoding(&body_str, cte)),
+                None,
+                Vec::new(),
+            )
+        }
+    }
+}
+
 /// Accepts raw bytes so non-base64 attachment parts are stored without UTF-8
 /// round-trip corruption. Recurses into nested `multipart/*` parts.
 fn extract_multipart_bodies(
