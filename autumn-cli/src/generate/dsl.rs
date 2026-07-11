@@ -669,6 +669,21 @@ fn min_max_args(min: Option<&String>, max: Option<&String>, float: bool) -> Stri
     args.join(", ")
 }
 
+/// Ensure a reparsed float's shortest-round-trip string is a valid Rust *float*
+/// literal for a `#[validate(range(...))]` bound and the HTML5 `min`/`max`
+/// attributes: a whole-number value (`1` from `1`/`+1`/`1.0`, or `1000` from
+/// `1e3`) must carry a decimal point (`1.0`), since a bare integer literal is
+/// not accepted where an `f32`/`f64` bound is expected. Values that already
+/// contain `.`/`e`/`E` (`0.5`, `1.5e3`) are left as-is. Input is assumed finite
+/// (the caller rejects `inf`/`NaN`).
+fn canonical_float_literal(reparsed: &str) -> String {
+    if reparsed.contains(['.', 'e', 'E']) {
+        reparsed.to_owned()
+    } else {
+        format!("{reparsed}.0")
+    }
+}
+
 /// Parse the body of a `{…}` constraint-modifier block against the field's
 /// `kind` (issue #1388 validation + HTML5 constraints; issue #1146
 /// `references` `{label:col}`).
@@ -793,42 +808,48 @@ fn parse_constraint_kv(
 /// a `String`/`Text` field must be a non-negative integer; a range bound on a
 /// numeric field must be a valid number.
 fn parse_bound(value: &str, kind: FieldKind) -> Result<String, String> {
+    // Every arm returns the CANONICAL reparsed value, never the raw user token:
+    // the stored bound is spliced verbatim into both `#[validate(range/length(…))]`
+    // and the HTML5 `min`/`max`/`minlength`/`maxlength` attributes, so a token
+    // that parses but isn't a valid Rust literal (`.5`, `+1`, `007`, `1.`) would
+    // otherwise fail to COMPILE the generated app. Reparsing at the field's
+    // concrete type and re-`to_string()`-ing yields a literal that is always
+    // valid and value-preserving (issue #1388 follow-up).
     match kind {
         FieldKind::String | FieldKind::Text => {
-            value
+            let n = value
                 .parse::<u64>()
                 .map_err(|_| format!("length bound '{value}' must be a non-negative integer"))?;
-            Ok(value.to_owned())
+            Ok(n.to_string())
         }
         FieldKind::I32 => {
             // Parse at the field's CONCRETE width, not a wider `i64`: a bound
             // that overflows `i32` (e.g. `count:i32{max=3000000000}`) would
-            // otherwise be emitted verbatim as `#[validate(range(max = ...))]`
-            // on an `i32` field and fail to COMPILE the generated app. Reject
-            // it here with an actionable error instead (issue #1388 follow-up).
-            value.parse::<i32>().map_err(|_| {
+            // otherwise be emitted as `#[validate(range(max = ...))]` on an
+            // `i32` field and fail to COMPILE the generated app.
+            let n = value.parse::<i32>().map_err(|_| {
                 format!(
                     "range bound '{value}' must be an integer within the i32 range ({}..={})",
                     i32::MIN,
                     i32::MAX
                 )
             })?;
-            Ok(value.to_owned())
+            Ok(n.to_string())
         }
         FieldKind::I64 => {
-            value.parse::<i64>().map_err(|_| {
+            let n = value.parse::<i64>().map_err(|_| {
                 format!(
                     "range bound '{value}' must be an integer within the i64 range ({}..={})",
                     i64::MIN,
                     i64::MAX
                 )
             })?;
-            Ok(value.to_owned())
+            Ok(n.to_string())
         }
         FieldKind::F32 => {
             // Rust's float parse saturates overflow to ±∞ rather than erroring,
             // so an out-of-`f32`-range literal would compile to a non-finite
-            // `#[validate(range(...))]` bound; reject non-finite explicitly.
+            // bound; reject non-finite explicitly, then canonicalize.
             let parsed = value
                 .parse::<f32>()
                 .map_err(|_| format!("range bound '{value}' must be a number"))?;
@@ -837,7 +858,7 @@ fn parse_bound(value: &str, kind: FieldKind) -> Result<String, String> {
                     "range bound '{value}' is out of range for an f32 field (it overflows to a non-finite value)"
                 ));
             }
-            Ok(value.to_owned())
+            Ok(canonical_float_literal(&parsed.to_string()))
         }
         FieldKind::F64 => {
             let parsed = value
@@ -848,7 +869,7 @@ fn parse_bound(value: &str, kind: FieldKind) -> Result<String, String> {
                     "range bound '{value}' is out of range for an f64 field (it overflows to a non-finite value)"
                 ));
             }
-            Ok(value.to_owned())
+            Ok(canonical_float_literal(&parsed.to_string()))
         }
         _ => Err(format!(
             "min/max constraints are not supported for {} fields",
@@ -1791,6 +1812,38 @@ mod tests {
         assert_eq!(
             f.validation_attrs(),
             vec!["range(min = 1, max = 9007199254740992)"]
+        );
+    }
+
+    #[test]
+    fn float_leading_dot_bound_is_canonicalized_to_a_valid_literal() {
+        // `.5` parses as a number but is not a valid Rust float literal; the
+        // stored/emitted bound must be `0.5`, and a whole-number float bound
+        // must carry a decimal point (`1` -> `1.0`).
+        let f = parse_field("ratio:f64{min=.5,max=1}").unwrap();
+        assert_eq!(f.constraints.min.as_deref(), Some("0.5"));
+        assert_eq!(f.constraints.max.as_deref(), Some("1.0"));
+        assert_eq!(f.validation_attrs(), vec!["range(min = 0.5, max = 1.0)"]);
+    }
+
+    #[test]
+    fn integer_signed_and_zero_padded_bounds_are_canonicalized() {
+        // `+1` and `007` parse but aren't the literal we want to splice; the
+        // stored/emitted bound must be the canonical decimal (`1`, `7`).
+        let f = parse_field("count:i32{min=+1,max=007}").unwrap();
+        assert_eq!(f.constraints.min.as_deref(), Some("1"));
+        assert_eq!(f.constraints.max.as_deref(), Some("7"));
+        assert_eq!(f.validation_attrs(), vec!["range(min = 1, max = 7)"]);
+    }
+
+    #[test]
+    fn integer_bounds_within_range_are_emitted_verbatim() {
+        // Regression: ordinary in-range integer bounds are unchanged.
+        assert_eq!(
+            parse_field("age:i32{min=0,max=130}")
+                .unwrap()
+                .validation_attrs(),
+            vec!["range(min = 0, max = 130)"]
         );
     }
 

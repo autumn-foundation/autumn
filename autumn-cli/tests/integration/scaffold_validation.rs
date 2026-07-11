@@ -146,9 +146,11 @@ fn constrained_float_fields_keep_step_any() {
         "the constrained float must render as a number input:\n{routes}"
     );
     let ratio_input = slice_input(&routes, "id=\"ratio\" name=\"ratio\"");
+    // Float bounds are canonicalized to valid float literals (`0` -> `0.0`), so
+    // the HTML5 attributes carry the decimal form too.
     assert!(
-        ratio_input.contains("min=\"0\"")
-            && ratio_input.contains("max=\"1\"")
+        ratio_input.contains("min=\"0.0\"")
+            && ratio_input.contains("max=\"1.0\"")
             && ratio_input.contains("step=\"any\""),
         "constrained float must carry min/max AND step=any:\n{ratio_input}"
     );
@@ -382,6 +384,43 @@ fn in_range_i32_bound_generates_and_type_checks_shape() {
         model.contains("#[validate(range(max = 1000000))]"),
         "a valid in-range bound must still emit its range rule:\n{model}"
     );
+}
+
+#[test]
+fn non_canonical_numeric_bounds_generate_valid_rust_literals() {
+    // Bounds that parse but aren't valid Rust literals (`.5`, `+1`) must be
+    // canonicalized so the generated `#[validate(range(...))]` compiles:
+    // `.5` -> `0.5`, whole-number float `1` -> `1.0`, `+1` -> `1`.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    run_autumn_ok(tmp.path(), &["new", "canon-bound-app"]);
+    let project = tmp.path().join("canon-bound-app");
+    run_autumn_ok(
+        &project,
+        &[
+            "generate",
+            "scaffold",
+            "Post",
+            "ratio:f64{min=.5,max=1}",
+            "count:i32{min=+1,max=10}",
+        ],
+    );
+    let model = fs::read_to_string(project.join("src/models/post.rs")).unwrap();
+    assert!(
+        model.contains("#[validate(range(min = 0.5, max = 1.0))]"),
+        "the float bounds must be canonical valid float literals:\n{model}"
+    );
+    assert!(
+        model.contains("#[validate(range(min = 1, max = 10))]"),
+        "the `+1` integer bound must canonicalize to `1`:\n{model}"
+    );
+    // No raw non-canonical tokens should survive anywhere in the generated app.
+    let routes = fs::read_to_string(project.join("src/routes/posts.rs")).unwrap();
+    for bad in ["=.5", "\".5\"", "min = .5", "= +1", "\"+1\""] {
+        assert!(
+            !model.contains(bad) && !routes.contains(bad),
+            "no raw non-canonical bound token ({bad}) may survive:\nmodel:\n{model}\nroutes:\n{routes}"
+        );
+    }
 }
 
 /// Slow end-to-end check: the constrained scaffold (model `#[validate]` rules,
