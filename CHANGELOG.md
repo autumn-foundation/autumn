@@ -1279,7 +1279,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   running it unsharded (issue #1692).
 - **scaffold:** scaffolded views now render through the shared application
   layout instead of a bare standalone page, and flash rendering was migrated to
-  the shared flash helper (issue #1130).
+  the shared flash helper (issues #1130, #1240).
 
 ### Changed
 
