@@ -2460,17 +2460,24 @@ fn render_routes_file(
     } else {
         (String::new(), String::new(), String::new())
     };
-    // Magic-link token cleanup spliced into the `change_password` (#7) and
-    // `confirm_email_change` (#10) credential-change transactions. Gated on
-    // `--magic-link` so the `magic_link_tokens` reference only appears when the
-    // table (and its import) exist.
-    let (magic_link_change_password_clear, magic_link_email_change_clear) = if magic_link {
+    // Magic-link token cleanup spliced into the `change_password` (#7),
+    // `confirm_email_change` (#10) and `reset_password` (#11) credential-change
+    // transactions. Gated on `--magic-link` so the `magic_link_tokens` reference
+    // only appears when the table (and its import) exist. (For 2FA-enabled users
+    // the reset commit is deferred to `login_verify`, which carries its own gated
+    // cleanup — see `magic_link_reset_commit_clear_txn_src`.)
+    let (
+        magic_link_change_password_clear,
+        magic_link_email_change_clear,
+        magic_link_reset_password_clear,
+    ) = if magic_link {
         (
+            magic_link_credential_clear_txn_src(snake_name),
             magic_link_credential_clear_txn_src(snake_name),
             magic_link_credential_clear_txn_src(snake_name),
         )
     } else {
-        (String::new(), String::new())
+        (String::new(), String::new(), String::new())
     };
     let oauth_buttons = if providers.is_empty() {
         String::new()
@@ -2510,7 +2517,7 @@ fn render_routes_file(
             totp_reset_branch_src(snake_name),
             totp_clear_pending_src().to_owned(),
             totp_confirm_branch_src(snake_name),
-            totp_routes_section_src(pascal_name, snake_name, table),
+            totp_routes_section_src(pascal_name, snake_name, table, magic_link),
             totp_reauth_field_src(),
             totp_reauth_check_src(snake_name, table),
         )
@@ -5139,7 +5146,7 @@ pub async fn reset_password(
                 .values(&new_session_row)
                 .execute(conn)
                 .await?;
-            Ok(())
+{magic_link_reset_password_clear}            Ok(())
         }})
         .await
         .map_err(|e| {{
@@ -8197,7 +8204,12 @@ fn totp_reauth_check_src(snake_name: &str, table: &str) -> String {
 }
 
 #[allow(clippy::too_many_lines)]
-fn totp_routes_section_src(pascal_name: &str, snake_name: &str, table: &str) -> String {
+fn totp_routes_section_src(
+    pascal_name: &str,
+    snake_name: &str,
+    table: &str,
+    magic_link: bool,
+) -> String {
     const TPL: &str = r#"
 // ── Two-factor authentication (TOTP) ────────────────────────────────────────────
 //
@@ -8904,7 +8916,7 @@ pub async fn login_verify(
                         .execute(conn)
                         .await?;
                     }
-                    Ok(updated == 1)
+__MAGIC_LINK_RESET_CLEAR__                    Ok(updated == 1)
                 })
                 .await
                 .unwrap_or(false)
@@ -8956,10 +8968,43 @@ pub async fn login_verify(
     Ok(redirect_to(&format!("/account?recovery_remaining={}", remaining)))
 }
 "#;
-    TPL.replace("__PASCAL__", pascal_name)
+    // Magic-link token cleanup spliced into the deferred (2FA-gated) password-reset
+    // commit inside `login_verify` (#11). Gated on `--magic-link` so the
+    // `magic_link_tokens` reference only appears when the table (and its import)
+    // exist; empty otherwise so the transaction is unchanged.
+    let magic_link_reset_clear = if magic_link {
+        magic_link_reset_commit_clear_txn_src()
+    } else {
+        ""
+    };
+    TPL.replace("__MAGIC_LINK_RESET_CLEAR__", magic_link_reset_clear)
+        .replace("__PASCAL__", pascal_name)
         .replace("__SNAKE__", snake_name)
         .replace("__TABLE__", table)
         .replace("__SESSTABLE__", &sessions_table_name(snake_name))
+}
+
+/// Magic-link cleanup for the deferred (2FA-gated) password-reset commit in
+/// `login_verify` (issue #1328 hardening, review #11). Mirrors
+/// `magic_link_credential_clear_txn_src` but is guarded on `updated == 1` — the
+/// parked reset actually committed — and uses the `user_id` binding already in
+/// scope in that transaction. A link minted before this reset must not sign the
+/// account in afterwards. Emitted only under `--magic-link`.
+const fn magic_link_reset_commit_clear_txn_src() -> &'static str {
+    r"                    if updated == 1 {
+                        // Invalidate any outstanding magic-link login tokens in the
+                        // SAME transaction: a link minted before this password reset
+                        // must not sign the account in afterwards (magic-link auth
+                        // matches an unconsumed, unexpired token, keyed by user id and
+                        // independent of the changed credential).
+                        diesel::delete(
+                            magic_link_tokens::table
+                                .filter(magic_link_tokens::user_id.eq(user_id)),
+                        )
+                        .execute(conn)
+                        .await?;
+                    }
+"
 }
 
 /// Render the passwordless magic-link login section appended to `routes/auth.rs`
@@ -12156,6 +12201,89 @@ mod tests {
         assert!(
             !body_without.contains("magic_link_tokens"),
             "without --magic-link, change_password must not reference magic_link_tokens"
+        );
+    }
+
+    #[test]
+    fn reset_password_clears_magic_link_tokens_only_when_enabled() {
+        // #11: reset_password sets a new password digest and revokes sessions /
+        // remember chains, so — like change_password / confirm_email_change — it must
+        // delete the user's outstanding magic_link_tokens in the SAME transaction, or
+        // a sign-in link minted/intercepted before the recovery flow stays valid
+        // afterwards. Emitted only under --magic-link (the table exists only then).
+        let with = render_routes_file("User", "user", "users", &[], false, true);
+        let body = handler_body(&with, "reset_password");
+        assert!(
+            body.contains(
+                "magic_link_tokens::table.filter(magic_link_tokens::user_id.eq(user_id))"
+            ),
+            "with --magic-link, reset_password must delete the user's magic_link_tokens"
+        );
+        // The delete must sit inside the reset transaction (before the final
+        // `Ok(())`), after the remember-chain revocation.
+        let clear_pos = body
+            .find("magic_link_tokens::table.filter")
+            .expect("magic-link delete present");
+        let rem_pos = body
+            .find("user_remember_tokens::table")
+            .expect("remember-chain delete present");
+        let ok_pos = body
+            .rfind("Ok(())")
+            .expect("transaction closes with Ok(())");
+        assert!(
+            rem_pos < clear_pos && clear_pos < ok_pos,
+            "magic-link delete belongs inside the reset transaction with the other revocations"
+        );
+
+        let without = render_routes_file("User", "user", "users", &[], false, false);
+        let body_without = handler_body(&without, "reset_password");
+        assert!(
+            !body_without.contains("magic_link_tokens"),
+            "without --magic-link, reset_password must not reference magic_link_tokens"
+        );
+    }
+
+    #[test]
+    fn login_verify_reset_commit_clears_magic_link_tokens_only_when_enabled() {
+        // #11: for a 2FA-enabled account the password-reset commit is deferred to
+        // login_verify. That deferred commit also writes a new password_digest and
+        // revokes sessions, so it must likewise delete the user's outstanding
+        // magic_link_tokens — guarded on the commit succeeding (`updated == 1`) and
+        // only under --magic-link.
+        let with = render_routes_file("User", "user", "users", &[], true, true);
+        let body = handler_body(&with, "login_verify");
+        assert!(
+            body.contains("magic_link_tokens::table")
+                && body.contains("magic_link_tokens::user_id.eq(user_id)"),
+            "with --magic-link + --totp, login_verify's deferred reset commit must delete \
+             magic_link_tokens"
+        );
+        // The delete must sit inside the deferred-commit transaction, after the
+        // password write and before the transaction returns `Ok(updated == 1)`.
+        let commit_pos = body
+            .find("password_digest.eq(&new_digest)")
+            .expect("deferred reset commit writes the new digest");
+        let clear_pos = body
+            .find("magic_link_tokens::user_id.eq(user_id)")
+            .expect("magic-link delete present");
+        let ret_pos = body
+            .find("Ok(updated == 1)")
+            .expect("deferred commit transaction returns Ok(updated == 1)");
+        assert!(
+            commit_pos < clear_pos && clear_pos < ret_pos,
+            "magic-link delete must sit inside the deferred reset commit transaction"
+        );
+        // Guarded on the parked reset actually committing.
+        assert!(
+            body.contains("if updated == 1 {"),
+            "magic-link delete must be guarded on the parked reset committing"
+        );
+
+        let without = render_routes_file("User", "user", "users", &[], true, false);
+        let body_without = handler_body(&without, "login_verify");
+        assert!(
+            !body_without.contains("magic_link_tokens"),
+            "without --magic-link, login_verify must not reference magic_link_tokens"
         );
     }
 
