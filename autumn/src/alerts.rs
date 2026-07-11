@@ -1448,43 +1448,44 @@ fn evaluate_error_rate(
 
 /// How a health indicator's current status maps onto the alert state machine.
 ///
-/// Factored out of [`evaluate_health`] so the three-way branch is unit-testable
-/// without an `AppState`/registry. The key subtlety: recovery must be gated on
-/// [`HealthStatus::is_healthy`], NOT merely `!= Down`. `OutOfService` is a
-/// non-`Down` status that is still UNHEALTHY (`/actuator/health` reports
-/// non-200), so treating it as "recovered" would emit a false recovery while the
-/// service is still degraded.
+/// Factored out of [`evaluate_health`] so the branch is unit-testable without an
+/// `AppState`/registry. The decision hinges on [`HealthStatus::is_healthy`]: any
+/// non-healthy status triggers, and only a genuinely healthy status recovers.
+/// `OutOfService` is non-`Down` but still UNHEALTHY (`/actuator/health` reports
+/// non-200), so it takes the **trigger** path — an indicator that reports
+/// `OUT_OF_SERVICE` without ever passing through `Down` is still alerted. This
+/// also preserves the no-false-recovery property: an already-alerted `Down`
+/// indicator that dips to `OutOfService` stays unhealthy, so it stays active
+/// instead of emitting a spurious "recovered".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HealthTransition {
-    /// Status is `Down`: run the grace-period trigger logic.
-    Down,
+    /// Status is not healthy (`Down`, `OutOfService`, or any other non-healthy
+    /// variant): run the grace-period trigger logic.
+    Trigger,
     /// Status is genuinely healthy again (`is_healthy()`): clear tracking and
     /// emit a recovery for any outstanding alert.
     Recover,
-    /// Status is non-`Down` but still not healthy (e.g. `OutOfService`): hold
-    /// the active alert as-is — no recovery, and no new trigger (only `Down`
-    /// triggers, matching existing behavior).
-    Hold,
 }
 
 /// Classify a health indicator's status into the alert-state transition it
-/// drives. Uses [`HealthStatus::is_healthy`] (not `== Up`) so `Unknown` — which
-/// the actuator reports as healthy — recovers, while `OutOfService` holds.
+/// drives. Uses [`HealthStatus::is_healthy`] (not `== Up`/`== Down`) so `Unknown`
+/// — which the actuator reports as healthy — recovers, while every non-healthy
+/// status (`Down`, `OutOfService`, …) triggers.
 const fn classify_health_transition(status: crate::actuator::HealthStatus) -> HealthTransition {
-    if matches!(status, crate::actuator::HealthStatus::Down) {
-        HealthTransition::Down
-    } else if status.is_healthy() {
+    if status.is_healthy() {
         HealthTransition::Recover
     } else {
-        HealthTransition::Hold
+        HealthTransition::Trigger
     }
 }
 
 /// Condition (b): run all health indicators, track how long each has been
-/// `Down`, and alert once an indicator has stayed `Down` past the grace period.
-/// Recover only when it reports a genuinely healthy status again — a non-`Down`
-/// but still-unhealthy status (e.g. `OutOfService`) holds the active alert
-/// rather than emitting a false recovery.
+/// non-healthy, and alert once an indicator has stayed non-healthy past the grace
+/// period. The trigger fires for **any** non-healthy status (`Down`,
+/// `OutOfService`, …), matching what `/actuator/health` reports as non-200.
+/// Recover only when it reports a genuinely healthy status again — a still-unhealthy
+/// status (e.g. `OutOfService` after `Down`) keeps the active alert rather than
+/// emitting a false recovery.
 async fn evaluate_health(
     alerter: &Alerter,
     state: &AppState,
@@ -1504,14 +1505,15 @@ async fn evaluate_health(
         // share this same `key`, so they still correlate.
         let key = health_indicator_dedup_key(&result.name, &host);
         match classify_health_transition(result.output.status) {
-            HealthTransition::Down => {
+            HealthTransition::Trigger => {
+                let status = result.output.status;
                 let first = *down_since.entry(result.name.clone()).or_insert(now);
                 if now - first >= grace {
                     let secs = (now - first).num_seconds().max(0);
                     let alert = Alert::trigger(AlertCondition::HealthIndicatorDown, key)
-                        .title(format!("Health indicator '{}' is Down", result.name))
+                        .title(format!("Health indicator '{}' is {status:?}", result.name))
                         .summary(format!(
-                            "Health indicator '{}' has reported Down for {secs}s, past the \
+                            "Health indicator '{}' has reported {status:?} for {secs}s, past the \
                              {grace_secs}s grace period.",
                             result.name,
                             grace_secs = settings.health_grace.as_secs(),
@@ -1521,6 +1523,7 @@ async fn evaluate_health(
                             AlertCondition::HealthIndicatorDown,
                         ))
                         .detail("indicator", result.name.clone())
+                        .detail("status", status.as_str())
                         .detail("down_seconds", secs.to_string())
                         .build();
                     let _ = alerter.notify(alert);
@@ -1545,11 +1548,6 @@ async fn evaluate_health(
                         .build();
                     let _ = alerter.recover(alert);
                 }
-            }
-            HealthTransition::Hold => {
-                // Non-`Down` but still unhealthy (e.g. `OutOfService`): leave the
-                // active alert and `down_since` bookkeeping untouched so we do not
-                // emit a "recovered" alert while `/actuator/health` is non-healthy.
             }
         }
     }
@@ -1627,10 +1625,12 @@ mod tests {
         assert_eq!(d.on_trigger("k", ts(10)), DedupDecision::Send);
     }
 
-    // ── Health-indicator recovery classification (P2: recover only when healthy)
-    // The three-way branch in `evaluate_health`: `Down` triggers, a genuinely
-    // healthy status recovers, and any other non-healthy status (`OutOfService`)
-    // holds the active alert instead of emitting a false recovery.
+    // ── Health-indicator classification (P2: unhealthy triggers, healthy recovers)
+    // The branch in `evaluate_health`: any non-healthy status (`Down`,
+    // `OutOfService`, …) triggers the grace-period logic, and only a genuinely
+    // healthy status recovers. This means `OutOfService` reached WITHOUT a prior
+    // `Down` is still alerted, while a `Down`→`OutOfService` dip stays unhealthy
+    // (no false recovery).
 
     use crate::actuator::HealthStatus;
 
@@ -1638,7 +1638,7 @@ mod tests {
     fn health_down_status_drives_trigger_branch() {
         assert_eq!(
             classify_health_transition(HealthStatus::Down),
-            HealthTransition::Down
+            HealthTransition::Trigger
         );
     }
 
@@ -1657,67 +1657,104 @@ mod tests {
     }
 
     #[test]
-    fn out_of_service_holds_active_alert_instead_of_recovering() {
-        // `OutOfService` is non-`Down` but still UNHEALTHY: it must NOT recover.
+    fn out_of_service_triggers_like_down() {
+        // `OutOfService` is non-`Down` but still UNHEALTHY: it must take the
+        // trigger path (not recover, not silently hold), so an indicator that
+        // reports `OUT_OF_SERVICE` without ever going `Down` is still alerted.
         assert!(!HealthStatus::OutOfService.is_healthy());
         assert_eq!(
             classify_health_transition(HealthStatus::OutOfService),
-            HealthTransition::Hold
+            HealthTransition::Trigger
         );
     }
 
+    /// What `evaluate_health` did for an indicator on a single tick. Lets the
+    /// sequence tests distinguish a *trigger* send from a *recovery* send (an
+    /// `Option<DedupDecision>` alone would conflate them).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum HealthTick {
+        /// The trigger arm ran (non-healthy, past grace); carries the dedup
+        /// decision (`Send` on first alert, `Suppress` while already active).
+        Triggered(DedupDecision),
+        /// The recover arm emitted a resolve for a previously-active key.
+        Recovered(DedupDecision),
+        /// Nothing was emitted (inside the grace window, or a healthy tick with
+        /// no active alert to clear).
+        Idle,
+    }
+
     /// Drive the exact `down_since` + deduplicator bookkeeping `evaluate_health`
-    /// performs for a single indicator across a status sequence, returning the
-    /// dedup decision for any recovery emitted on the final tick (`None` when no
-    /// recovery was attempted). Proves the recovery is gated on a genuinely
-    /// healthy status, not merely `!= Down`.
-    fn recovery_decision_for_sequence(statuses: &[HealthStatus]) -> Option<DedupDecision> {
+    /// performs for a single indicator across a status sequence, applying the
+    /// given grace period, and reporting what happened on the FINAL tick. Proves
+    /// both directions of the unified rule: any non-healthy status triggers, and
+    /// recovery is gated on a genuinely healthy status (not merely `!= Down`).
+    fn health_tick_for_sequence(statuses: &[HealthStatus], grace: chrono::Duration) -> HealthTick {
         let name = "db";
         let key = format!("health_indicator_down:{name}");
         let mut dedup = AlertDeduplicator::new(std::time::Duration::from_secs(900));
         let mut down_since: HashMap<String, DateTime<Utc>> = HashMap::new();
-        // Zero grace period so a single `Down` tick alerts immediately.
-        let grace = chrono::Duration::seconds(0);
-        let mut last = None;
+        let mut last = HealthTick::Idle;
         for (i, status) in statuses.iter().enumerate() {
-            last = None;
+            last = HealthTick::Idle;
             let now = ts(i64::try_from(i).unwrap());
             match classify_health_transition(*status) {
-                HealthTransition::Down => {
+                HealthTransition::Trigger => {
                     let first = *down_since.entry(name.to_owned()).or_insert(now);
                     if now - first >= grace {
-                        let _ = dedup.on_trigger(&key, now);
+                        last = HealthTick::Triggered(dedup.on_trigger(&key, now));
                     }
                 }
                 HealthTransition::Recover => {
                     if down_since.remove(name).is_some() {
-                        last = Some(dedup.on_resolve(&key));
+                        last = HealthTick::Recovered(dedup.on_resolve(&key));
                     }
                 }
-                HealthTransition::Hold => {}
             }
         }
         last
     }
 
+    /// Convenience wrapper: run [`health_tick_for_sequence`] with a zero grace
+    /// period (so a single non-healthy tick alerts immediately). Used by the
+    /// recovery-focused sequences below.
+    fn recovery_tick_for_sequence(statuses: &[HealthStatus]) -> HealthTick {
+        health_tick_for_sequence(statuses, chrono::Duration::seconds(0))
+    }
+
+    #[test]
+    fn out_of_service_without_prior_down_triggers_after_grace() {
+        // The former bug: an indicator that reports OutOfService WITHOUT ever
+        // going Down was never alerted. Now it takes the trigger path, so once the
+        // down-duration passes the grace period an alert fires (Send on the first
+        // notification).
+        let tick = recovery_tick_for_sequence(&[HealthStatus::OutOfService]);
+        assert_eq!(
+            tick,
+            HealthTick::Triggered(DedupDecision::Send),
+            "OutOfService with no prior Down must fire an alert once past the grace period"
+        );
+    }
+
     #[test]
     fn down_then_out_of_service_does_not_recover() {
-        // Down (alert) → OutOfService: the alert stays active; no recovery emitted.
-        let decision =
-            recovery_decision_for_sequence(&[HealthStatus::Down, HealthStatus::OutOfService]);
+        // Down (alert) → OutOfService: the alert stays active (the OutOfService
+        // tick re-enters the trigger arm and is deduped as still-active) and NO
+        // recovery is emitted — the service is still unhealthy.
+        let tick = recovery_tick_for_sequence(&[HealthStatus::Down, HealthStatus::OutOfService]);
         assert_eq!(
-            decision, None,
-            "OutOfService after Down must NOT emit a recovery (service still unhealthy)"
+            tick,
+            HealthTick::Triggered(DedupDecision::Suppress),
+            "OutOfService after Down must stay active (no recovery, deduped trigger)"
         );
     }
 
     #[test]
     fn down_then_up_recovers() {
         // Down (alert) → Up: a genuine recovery is emitted for the active key.
-        let decision = recovery_decision_for_sequence(&[HealthStatus::Down, HealthStatus::Up]);
+        let tick = recovery_tick_for_sequence(&[HealthStatus::Down, HealthStatus::Up]);
         assert_eq!(
-            decision,
-            Some(DedupDecision::Send),
+            tick,
+            HealthTick::Recovered(DedupDecision::Send),
             "a genuinely healthy status after Down must emit a recovery"
         );
     }
@@ -1725,12 +1762,32 @@ mod tests {
     #[test]
     fn down_then_out_of_service_then_up_recovers_once() {
         // The alert survives the OutOfService dip and recovers when finally Up.
-        let decision = recovery_decision_for_sequence(&[
+        let tick = recovery_tick_for_sequence(&[
             HealthStatus::Down,
             HealthStatus::OutOfService,
             HealthStatus::Up,
         ]);
-        assert_eq!(decision, Some(DedupDecision::Send));
+        assert_eq!(tick, HealthTick::Recovered(DedupDecision::Send));
+    }
+
+    #[test]
+    fn brief_unhealthy_blip_inside_grace_window_does_not_alert() {
+        // A single non-healthy tick that recovers before the grace period elapses
+        // must NOT alert. With a 60s grace and consecutive 1s ticks, the lone
+        // OutOfService tick is inside the window (no trigger fires), and the
+        // following Up tick clears the tracking — but since no alert ever
+        // triggered, the resolve is dedup-gated to `Suppress`, so no notification
+        // is sent either way.
+        let tick = health_tick_for_sequence(
+            &[HealthStatus::OutOfService, HealthStatus::Up],
+            chrono::Duration::seconds(60),
+        );
+        assert_eq!(
+            tick,
+            HealthTick::Recovered(DedupDecision::Suppress),
+            "an unhealthy blip inside the grace window must not send a trigger, and its \
+             resolve must be suppressed (no active alert to clear)"
+        );
     }
 
     // ── Severity classification ──────────────────────────────────────────────

@@ -1,7 +1,7 @@
 # Operator Alerts
 
 Autumn already knows when your app is in trouble: a background job gets
-dead-lettered, a health indicator goes `Down`, the 5xx rate spikes, or a
+dead-lettered, a health indicator goes unhealthy, the 5xx rate spikes, or a
 framework-scheduled task fails. **Operator alerts** connect those built-in
 failure signals to the delivery channels your app already has — the configured
 mailer and the signed outbound webhook — so you find out **without writing any
@@ -98,7 +98,7 @@ look next** pointer.
 | Condition | Fires when | Where to look | Tuning knob (default) |
 |-----------|------------|---------------|-----------------------|
 | **Dead-lettered job** | a background job exhausts its retries and is dead-lettered | `/actuator/jobs` † | always on |
-| **Health indicator Down** | a registered health indicator reports `Down` continuously past a grace period | `/actuator/health` | `health_grace_secs` (`60`) |
+| **Health indicator down** | a registered health indicator reports a non-healthy status (`DOWN` or `OUT_OF_SERVICE`) continuously past a grace period | `/actuator/health` | `health_grace_secs` (`60`) |
 | **High 5xx rate** | the rolling 5xx rate crosses a threshold | `/actuator/metrics` | `error_rate_threshold` (`0.05`), `error_rate_min_requests` (`20`) |
 | **Scheduled-task failure** | a framework-scheduled task (cron or fixed-delay — e.g. backup, cert-renewal) returns an error | `/actuator/tasks` † | always on |
 
@@ -150,8 +150,8 @@ webhook_secret = "…"           # REQUIRED with webhook_url; alerts are always
 # Deduplication
 dedup_window_secs = 900        # at most one notice per condition per 15 min
 
-# Condition (b): health indicator Down
-health_grace_secs = 60         # indicator must stay Down this long before alerting
+# Condition (b): health indicator down
+health_grace_secs = 60         # indicator must stay non-healthy this long before alerting
 
 # Condition (c): 5xx rate
 error_rate_threshold = 0.05    # fraction in (0, 1]; 0.05 = 5% of sampled requests
@@ -178,12 +178,16 @@ previously-alerted condition clears, **exactly one recovery notification** is
 sent (severity `recovery`, event `resolve`), carrying the same stable dedup key
 as its trigger so an incident manager can auto-resolve the correlated alert.
 
-For the **health-indicator Down** condition, "clears" means the indicator
-reports a genuinely healthy status again (`UP`, or `UNKNOWN` — both of which
-`/actuator/health` treats as healthy). A `Down` indicator that later reports
-`OUT_OF_SERVICE` is **not** a recovery: the service is still non-healthy, so the
-alert stays active and no false recovery is emitted until the indicator is
-actually healthy.
+For the **health-indicator down** condition, the alert **fires** whenever an
+indicator reports any non-healthy status — `DOWN` *or* `OUT_OF_SERVICE` — past
+the grace period. (An indicator that jumps straight to `OUT_OF_SERVICE` without
+first going `DOWN` is alerted just the same; `/actuator/health` returns a non-200
+for either.) The alert names the actual status it observed. "Clears" means the
+indicator reports a genuinely healthy status again (`UP`, or `UNKNOWN` — both of
+which `/actuator/health` treats as healthy). An already-alerted indicator that
+transitions from `DOWN` to `OUT_OF_SERVICE` is **not** a recovery: the service is
+still non-healthy, so the alert stays active and no false recovery is emitted
+until the indicator is actually healthy.
 
 ### Dead-lettered jobs: bounded per job type
 
