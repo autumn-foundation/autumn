@@ -2953,6 +2953,26 @@ impl AutumnConfig {
             "AUTUMN_ALERTS__WEBHOOK_SECRET",
             &mut self.alerts.webhook_secret,
         );
+        parse_env_option_string(
+            env,
+            "AUTUMN_ALERTS__PAGERDUTY_ROUTING_KEY",
+            &mut self.alerts.pagerduty_routing_key,
+        );
+        parse_env_option_string(
+            env,
+            "AUTUMN_ALERTS__PAGERDUTY_URL",
+            &mut self.alerts.pagerduty_url,
+        );
+        parse_env_option_string(
+            env,
+            "AUTUMN_ALERTS__SLACK_WEBHOOK_URL",
+            &mut self.alerts.slack_webhook_url,
+        );
+        parse_env_option_string(
+            env,
+            "AUTUMN_ALERTS__DISCORD_WEBHOOK_URL",
+            &mut self.alerts.discord_webhook_url,
+        );
         parse_env_bool(
             env,
             "AUTUMN_ALERTS__CUSTOM_CHANNEL",
