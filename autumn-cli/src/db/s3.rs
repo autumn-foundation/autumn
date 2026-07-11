@@ -10,15 +10,15 @@
 //! # Credential safety
 //!
 //! The access key / secret access key are read (by the caller) from the
-//! environment variables *named* by config and handed in as [`S3Credentials`].
+//! environment variables *named* by config and handed in as `S3Credentials`.
 //! They are used only to derive the `SigV4` signing key and the `Authorization`
 //! header. They never appear in a URL, in `Debug`/`Display` output, in an error
-//! message, or in a log line — [`S3Credentials`] deliberately does not derive
-//! `Debug`, and [`S3Error`] carries only status codes and endpoint metadata.
+//! message, or in a log line — `S3Credentials` deliberately does not derive
+//! `Debug`, and `S3Error` carries only status codes and endpoint metadata.
 //!
 //! # Integrity (AC #2)
 //!
-//! [`S3Client::put_file_and_verify`] streams the artifact as the PUT body and
+//! `S3Client::put_file_and_verify` streams the artifact as the PUT body and
 //! sends `x-amz-checksum-sha256` so a compliant endpoint validates the payload
 //! server-side and rejects a corrupted upload. It then HEADs the object and
 //! confirms the remote length (and checksum, when the endpoint echoes it)
@@ -488,7 +488,7 @@ pub struct S3Client {
     http: reqwest::blocking::Client,
     /// Files larger than this upload via multipart (default
     /// [`MULTIPART_THRESHOLD`]); overridable for tests via
-    /// [`with_multipart_params`](Self::with_multipart_params).
+    /// [`with_part_size`](Self::with_part_size).
     multipart_threshold: u64,
     /// Target part size for multipart uploads (default [`MULTIPART_PART_SIZE`]);
     /// the effective size is floored/grown per file by [`effective_part_size`].
@@ -586,7 +586,7 @@ impl S3Client {
         self
     }
 
-    /// The endpoint host[:port] used for the `Host` header and `SigV4` signing.
+    /// The endpoint `host[:port]` used for the `Host` header and `SigV4` signing.
     fn host(&self) -> Result<String, S3Error> {
         let base = self.endpoint_base();
         let url = url::Url::parse(&base).map_err(|e| S3Error::Transport {
