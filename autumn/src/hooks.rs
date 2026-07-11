@@ -440,8 +440,12 @@ impl<'de, T: Deserialize<'de>> Deserialize<'de> for Patch<T> {
 // so implementing these foreign traits raises no orphan-rule issue.
 //
 // Only the *declarative, single-field* validators are implemented.
-// `required`/`must_match`/`nested`/`custom` are intentionally omitted: they are
-// meaningless or ill-typed on a tri-state patch field. `ValidateDoesNotContain`
+// `must_match`/`nested`/`custom` are intentionally omitted: they are
+// meaningless or ill-typed on a tri-state patch field. `required` IS implemented
+// (below), but with distinct, non-skip semantics: unlike the other rules, an
+// absent field is not uniformly "pass" — `Clear` (explicit null on a required
+// field) must FAIL so a PATCH/PUT cannot violate the model's `required` contract
+// by nulling the column. `ValidateDoesNotContain`
 // is deliberately NOT implemented here — validator provides it automatically via
 // its blanket `impl<T: ValidateContains> ValidateDoesNotContain for T`, which
 // covers `Patch<T>` through the `ValidateContains` impl below (a manual impl
@@ -529,6 +533,34 @@ impl<T: validator::ValidateRegex> validator::ValidateRegex for Patch<T> {
         match self {
             Self::Set(v) => validator::ValidateRegex::validate_regex(v, regex),
             _ => true,
+        }
+    }
+}
+
+// `required` has *tri-state* semantics that differ from the skip-on-absent rules
+// above (#1719 / Codex P2). `required` is meaningful only on `Option`-typed model
+// fields, whose `UpdateModel` field is `Patch<Option<T>>`, so the bound is
+// `T: ValidateRequired` (satisfied by validator's `impl<T> ValidateRequired for
+// Option<T>`). The derive calls `self.field.validate_required()`:
+//   - `Unchanged` -> `true`: the field was omitted from the patch, so the
+//     existing (non-null) value is kept — nothing to reject.
+//   - `Clear`     -> `false`: an explicit JSON `null` on a required field would
+//     write SQL `NULL`, violating the `required` contract — reject (422).
+//   - `Set(v)`    -> delegate to the inner `Option<T>`: `Set(Some)` passes,
+//     `Set(None)` fails (same as create).
+impl<T: validator::ValidateRequired> validator::ValidateRequired for Patch<T> {
+    fn validate_required(&self) -> bool {
+        match self {
+            Self::Unchanged => true,
+            Self::Clear => false,
+            Self::Set(v) => validator::ValidateRequired::validate_required(v),
+        }
+    }
+
+    fn is_some(&self) -> bool {
+        match self {
+            Self::Set(v) => validator::ValidateRequired::is_some(v),
+            _ => false,
         }
     }
 }
@@ -843,6 +875,33 @@ mod tests {
         // Absent variants behave like `None`: the rule is skipped (passes).
         assert!(Patch::<String>::Unchanged.validate_length(Some(1), None, None));
         assert!(Patch::<String>::Clear.validate_length(Some(1), None, None));
+    }
+
+    // `required` has tri-state semantics (#1719 / Codex P2): unlike the
+    // skip-on-absent rules, `Clear` and `Set(None)` must FAIL so a PATCH/PUT
+    // cannot null a `#[validate(required)]` column; `Unchanged` skips.
+    #[test]
+    fn patch_validate_required_unchanged_passes() {
+        use validator::ValidateRequired;
+        assert!(Patch::<Option<String>>::Unchanged.validate_required());
+    }
+
+    #[test]
+    fn patch_validate_required_clear_fails() {
+        use validator::ValidateRequired;
+        assert!(!Patch::<Option<String>>::Clear.validate_required());
+    }
+
+    #[test]
+    fn patch_validate_required_set_some_passes() {
+        use validator::ValidateRequired;
+        assert!(Patch::Set(Some(String::from("x"))).validate_required());
+    }
+
+    #[test]
+    fn patch_validate_required_set_none_fails() {
+        use validator::ValidateRequired;
+        assert!(!Patch::<Option<String>>::Set(None).validate_required());
     }
 
     // ── FieldDiff tests ──────────────────────────────────────────

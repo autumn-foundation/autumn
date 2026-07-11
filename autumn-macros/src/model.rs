@@ -975,7 +975,6 @@ const NON_PATCH_VALIDATORS: &[&str] = &[
     "custom",
     "must_match",
     "nested",
-    "required",
     "credit_card",
     "non_control_character",
     "does_not_contain",
@@ -1018,12 +1017,22 @@ const OPTION_INCOMPATIBLE_VALIDATORS: &[&str] = &["ip"];
 /// `NewModel` fields carry the bare `T` and derive `validator::Validate`
 /// directly, so they keep every validator verbatim. `UpdateModel` fields are
 /// `Patch<T>`, which only implements validator's per-field *declarative* traits
-/// (`length`, `email`, `url`, `range`, `contains`, `ip`, `regex`, …). The
-/// validators in [`NON_PATCH_VALIDATORS`] (`custom`, `must_match`, `nested`,
-/// `required`, `credit_card`, `non_control_character`) have no `Patch<T>` impl,
+/// (`length`, `email`, `url`, `range`, `contains`, `ip`, `regex`, `required`,
+/// …). The validators in [`NON_PATCH_VALIDATORS`] (`custom`, `must_match`,
+/// `nested`, `credit_card`, `non_control_character`) have no `Patch<T>` impl,
 /// so propagating them verbatim would break `UpdateModel` compilation even
 /// though `NewModel` still compiles — a latent footgun for a user who adds e.g.
 /// `#[validate(custom(...))]` to a model field.
+///
+/// `required` is deliberately NOT in the denylist (#1719 / Codex P2): it must
+/// propagate so the `UpdateModel` rejects an explicit `null` on a required
+/// field. `Patch<T>` implements `ValidateRequired` with tri-state semantics
+/// (`Unchanged` skips, `Clear`/`Set(None)` fail); see the impl in
+/// `autumn/src/hooks.rs`. `required` is only sensible on `Option`-typed fields,
+/// whose patch field is `Patch<Option<T>>` and satisfies the impl's
+/// `Option<T>: ValidateRequired` bound. (`required` on a non-`Option` field
+/// never compiles even on `NewModel`, since `validator` supplies
+/// `ValidateRequired` only for `Option<T>`, so no filtering is needed for it.)
 ///
 /// `does_not_contain` is also filtered, for a subtler reason: it does compile
 /// on `Patch<T>` (validator supplies it via the blanket
@@ -1056,10 +1065,10 @@ const OPTION_INCOMPATIBLE_VALIDATORS: &[&str] = &["ip"];
 /// Limitation: a type *alias* to `Option` is not detected (no worse than the
 /// derive's own behaviour, which also inspects the syntactic type).
 ///
-/// Documented limitation: `custom`/`must_match`/`nested`/`required`/
-/// `does_not_contain`/etc. are enforced on create (via `NewModel`) but NOT on
-/// the PATCH update path; a follow-up may add merged-model validation for
-/// cross-field/custom rules.
+/// Documented limitation: `custom`/`must_match`/`nested`/`does_not_contain`/etc.
+/// are enforced on create (via `NewModel`) but NOT on the PATCH update path; a
+/// follow-up may add merged-model validation for cross-field/custom rules.
+/// (`required` IS enforced on the PATCH path via the tri-state `Patch<T>` impl.)
 fn validate_attrs_for_patch(field: &Field) -> Vec<syn::Attribute> {
     let field_is_option = is_option_type(&field.ty);
     let mut out = Vec::new();
@@ -2974,11 +2983,13 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     //   `autumn/src/hooks.rs`), so a failing declarative rule (`length`, `email`,
     //   `url`, `range`, `contains`, …) on a `Set` value surfaces as a 422 on
     //   PATCH/PUT, while an absent (`Unchanged`/`Clear`) field is skipped —
-    //   mirroring the create path. Non-declarative/struct-level validators
-    //   (`custom`, `must_match`, `nested`, `required`, `credit_card`,
-    //   `non_control_character`) have no `Patch<T>` impl and are filtered out
-    //   here by `validate_attrs_for_patch` (they still run on `NewX`); see that
-    //   helper for the documented create-vs-update limitation.
+    //   mirroring the create path. `required` is the one non-skip rule: its
+    //   `Patch<T>` impl fails `Clear`/`Set(None)` so a PATCH can't null a
+    //   required column. Non-declarative/struct-level validators (`custom`,
+    //   `must_match`, `nested`, `credit_card`, `non_control_character`) have no
+    //   `Patch<T>` impl and are filtered out here by `validate_attrs_for_patch`
+    //   (they still run on `NewX`); see that helper for the documented
+    //   create-vs-update limitation.
     // - #[lock_version] field: plain required T (the client supplies the
     //   version they read; the framework increments it atomically)
     let mut update_fields: Vec<TokenStream> = fields_for_new
@@ -5576,6 +5587,59 @@ mod tests {
         assert!(
             upd_section.contains("length"),
             "UpdateDoc must keep the declarative `length` validator: {upd_section}"
+        );
+    }
+
+    #[test]
+    fn update_model_retains_required_on_patch_fields() {
+        // #1719 / Codex P2: `required` MUST propagate to the `UpdateModel`
+        // `Patch<Option<T>>` fields. A PATCH/PUT sending explicit JSON `null`
+        // deserializes to `Patch::Clear`; if `required` were dropped the update
+        // would silently write SQL `NULL`, violating the model's `required`
+        // contract (create still rejects `None`). The tri-state
+        // `impl ValidateRequired for Patch<T>` (autumn/src/hooks.rs) enforces it:
+        // `Unchanged` skips, `Clear`/`Set(None)` fail (422). So both `NewUser`
+        // and `UpdateUser` must carry `required`.
+        let output = model_macro(
+            TokenStream::new(),
+            quote! {
+                pub struct User {
+                    #[id]
+                    pub id: i64,
+                    #[validate(required)]
+                    pub nickname: Option<String>,
+                }
+            },
+        );
+        let generated = output.to_string();
+
+        // Slice the `NewUser` struct body (up to its closing brace).
+        let new_start = generated
+            .find("struct NewUser")
+            .expect("NewUser struct must be generated");
+        let new_end = new_start
+            + generated[new_start..]
+                .find('}')
+                .expect("NewUser struct must close");
+        let new_section = &generated[new_start..new_end];
+        assert!(
+            new_section.contains("required"),
+            "NewUser must keep the `required` validator: {new_section}"
+        );
+
+        // Slice the `UpdateUser` struct body (up to its closing brace).
+        let upd_start = generated
+            .find("struct UpdateUser")
+            .expect("UpdateUser struct must be generated");
+        let upd_end = upd_start
+            + generated[upd_start..]
+                .find('}')
+                .expect("UpdateUser struct must close");
+        let upd_section = &generated[upd_start..upd_end];
+        assert!(
+            upd_section.contains("required"),
+            "UpdateUser must RETAIN the `required` validator so a PATCH sending \
+             `null` (Patch::Clear) is rejected with 422: {upd_section}"
         );
     }
 

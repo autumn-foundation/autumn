@@ -7,7 +7,7 @@
 //! blanket `impl<T: ToString> ValidateIp for T` (validation/ip.rs) — there is no
 //! `impl ValidateIp for Option<T>` — so `Patch<Option<String>>: ValidateIp` is
 //! unsatisfiable and, before the macro fix, this module FAILED TO COMPILE with
-//! `the trait bound `Option<String>: ValidateIp` is not satisfied`.
+//! the trait bound `Option<String>: ValidateIp` not satisfied.
 //!
 //! The macro now drops `ip` from the generated PATCH fields for `Option<…>`
 //! columns only, so this module compiles. Because it lives in the consolidated

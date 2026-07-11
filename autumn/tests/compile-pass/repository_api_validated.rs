@@ -8,6 +8,7 @@ mod schema {
         articles (id) {
             id -> Int8,
             title -> Text,
+            subtitle -> Nullable<Text>,
         }
     }
 }
@@ -20,6 +21,13 @@ pub struct Article {
     pub id: i64,
     #[validate(length(min = 1, max = 200))]
     pub title: String,
+    // #1719 / Codex P2: `#[validate(required)]` on an `Option` field must
+    // propagate to the generated `UpdateArticle`'s `Patch<Option<String>>`
+    // field. This exercises the tri-state `ValidateRequired for Patch<T>` impl
+    // at compile time — `Patch<Option<String>>: ValidateRequired` must hold
+    // (via `Option<String>: ValidateRequired`), or `UpdateArticle` won't build.
+    #[validate(required)]
+    pub subtitle: Option<String>,
 }
 
 #[autumn_web::repository(Article, api = "/api/articles")]
