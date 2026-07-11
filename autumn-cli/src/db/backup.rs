@@ -388,7 +388,12 @@ fn backup(args: &BackupArgs) -> Result<(), BackupError> {
         // same-second backups of this profile from different hosts never collide
         // in the bucket; the local run directory keeps its #1595 `<timestamp>`.
         let remote_id = remote_run_id(&local_run_id, &remote_run_token());
-        upload_run(&offsite, &client, &run_dir, &profile, &remote_id).map_err(|detail| {
+        // Canonicalize the profile for the REMOTE key prefix (P2 #22) so upload,
+        // `db offsite list`, and restore all address the same `<canonical>/…`
+        // location regardless of alias/case spelling — while the LOCAL run dir
+        // keeps its raw #1595 `<profile>/<timestamp>` layout (used above).
+        let remote_profile = migrate::canonical_profile(&profile);
+        upload_run(&offsite, &client, &run_dir, &remote_profile, &remote_id).map_err(|detail| {
             BackupError::OffsiteUploadFailed {
                 local_path: run_dir.display().to_string(),
                 detail,
@@ -2315,7 +2320,9 @@ pub fn run_offsite_list(profile: Option<&str>) {
 }
 
 fn offsite_list(profile: Option<&str>) -> Result<(), BackupError> {
-    let profile = migrate::effective_profile(profile);
+    // Canonicalize so the list prefix matches the profile the upload wrote under
+    // (P2 #22): `list --profile production` and `--profile prod` both read `prod/`.
+    let profile = migrate::canonical_profile(&migrate::effective_profile(profile));
     let offsite = load_offsite(&profile)?
         .ok_or(BackupError::OffsiteNotConfigured)?
         .resolve()?;
@@ -2502,21 +2509,22 @@ fn is_safe_leaf_name(name: &str) -> bool {
 /// via the identical [`RestorePlan::discover`] path (AC #4). The temp dir is
 /// removed when the guard drops (after the restore completes or fails).
 fn restore_from_offsite(args: &RestoreArgs, oref: &OffsiteRef) -> Result<(), BackupError> {
-    let offsite = load_offsite(&oref.profile)?
+    // Canonicalize the profile so the REMOTE key prefix matches what upload wrote
+    // (P2 #22): `offsite:production/latest` reads the same `prod/…` prefix that
+    // `--profile production` uploaded under.
+    let profile = migrate::canonical_profile(&oref.profile);
+    let offsite = load_offsite(&profile)?
         .ok_or(BackupError::OffsiteNotConfigured)?
         .resolve()?;
     let client = offsite.build_client()?;
 
     let run_id = match &oref.selector {
-        OffsiteSelector::Exact(sel) => resolve_exact_run(&offsite, &client, &oref.profile, sel)?,
-        OffsiteSelector::Latest => resolve_latest_run(&offsite, &client, &oref.profile)?,
+        OffsiteSelector::Exact(sel) => resolve_exact_run(&offsite, &client, &profile, sel)?,
+        OffsiteSelector::Latest => resolve_latest_run(&offsite, &client, &profile)?,
     };
-    eprintln!(
-        "  \u{2139} restoring from offsite {}/{}",
-        oref.profile, run_id
-    );
+    eprintln!("  \u{2139} restoring from offsite {profile}/{run_id}");
 
-    let run_prefix = offsite_run_prefix(&offsite.prefix, &oref.profile, &run_id);
+    let run_prefix = offsite_run_prefix(&offsite.prefix, &profile, &run_id);
     let objects = client
         .list_objects_v2(&run_prefix)
         .map_err(|e| BackupError::Offsite {
@@ -2526,8 +2534,7 @@ fn restore_from_offsite(args: &RestoreArgs, oref: &OffsiteRef) -> Result<(), Bac
     if objects.is_empty() {
         return Err(BackupError::BadArtifact {
             detail: format!(
-                "no offsite backup found at {}/{} (nothing under {run_prefix})",
-                oref.profile, run_id
+                "no offsite backup found at {profile}/{run_id} (nothing under {run_prefix})"
             ),
         });
     }
@@ -3380,6 +3387,37 @@ mod tests {
         assert_eq!(
             offsite_run_prefix("db", "prod", "20260710T040506Z"),
             "db/prod/20260710T040506Z/"
+        );
+    }
+
+    #[test]
+    fn offsite_key_prefix_is_canonical_across_profile_spellings() {
+        // P2 #22: alias/case profile spellings must resolve to the SAME remote key
+        // prefix, so upload (`--profile production`), `db offsite list --profile
+        // prod`, and `restore offsite:prod/latest` all address `db/prod/…`.
+        for spelling in ["prod", "production", "PROD", "Production", "  prod  "] {
+            let p = migrate::canonical_profile(spelling);
+            assert_eq!(offsite_profile_prefix("db", &p), "db/prod/", "{spelling:?}");
+            assert_eq!(
+                offsite_run_prefix("db", &p, "r"),
+                "db/prod/r/",
+                "{spelling:?}"
+            );
+            assert_eq!(
+                offsite_object_key("db", &p, "r", "manifest.json"),
+                "db/prod/r/manifest.json",
+                "{spelling:?}"
+            );
+        }
+        // `prod` and `production` yield the identical prefix.
+        assert_eq!(
+            offsite_profile_prefix("db", &migrate::canonical_profile("prod")),
+            offsite_profile_prefix("db", &migrate::canonical_profile("production")),
+        );
+        // dev aliases collapse the same way.
+        assert_eq!(
+            offsite_profile_prefix("db", &migrate::canonical_profile("development")),
+            "db/dev/"
         );
     }
 

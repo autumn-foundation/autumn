@@ -360,8 +360,11 @@ async fn offsite_backup_uploads_large_artifact_via_multipart() {
         )
         .await
         .unwrap();
-    // 72 rows × 1 MiB ≈ 72 MiB, comfortably over the 64 MiB multipart threshold.
-    for id in 0..72i32 {
+    // ~1 MiB/row, sized comfortably over the 64 MiB multipart threshold. The seed
+    // count is bound once here and reused by the post-restore assertion so the two
+    // can never drift (P2 #23).
+    let seed_rows: i32 = 72;
+    for id in 0..seed_rows {
         let blob = incompressible_bytes(1024 * 1024);
         client
             .execute(
@@ -489,7 +492,8 @@ async fn offsite_backup_uploads_large_artifact_via_multipart() {
         .unwrap()
         .get(0);
     assert_eq!(
-        count, 12,
+        count,
+        i64::from(seed_rows),
         "all seeded rows must be restored from the multipart object"
     );
 }
