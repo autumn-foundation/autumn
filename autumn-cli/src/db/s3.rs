@@ -602,9 +602,12 @@ impl S3Client {
             .map_or_else(|| host.to_owned(), |port| format!("{host}:{port}")))
     }
 
-    /// Scheme + authority for the endpoint (no path). For AWS this synthesizes
-    /// the virtual-hosted bucket endpoint; for a custom endpoint it is used
-    /// verbatim (path-style) or with the bucket as a host prefix.
+    /// Scheme + authority for the endpoint (no path). The bucket lands in the
+    /// HOST for virtual-hosted addressing and in the PATH (via
+    /// [`canonical_path`](Self::canonical_path)) for path-style. `force_path_style`
+    /// is honored for BOTH a custom endpoint and AWS-default: AWS path-style uses
+    /// the regional host `s3.<region>.amazonaws.com` (required for dotted bucket
+    /// names, which can't present a valid virtual-hosted TLS certificate).
     #[allow(clippy::option_if_let_else)] // nested map_or_else closures read worse
     fn endpoint_base(&self) -> String {
         match &self.config.endpoint {
@@ -623,6 +626,11 @@ impl S3Client {
                     }
                 }
             }
+            // AWS path-style: regional host, bucket goes in the path.
+            None if self.config.force_path_style => {
+                format!("https://s3.{}.amazonaws.com", self.config.region)
+            }
+            // AWS virtual-hosted (default): bucket is a host prefix.
             None => format!(
                 "https://{}.s3.{}.amazonaws.com",
                 self.config.bucket, self.config.region
@@ -631,9 +639,12 @@ impl S3Client {
     }
 
     /// The canonical request path for `key` (`SigV4` signs this exact string).
+    /// Path-style (`force_path_style`) puts the bucket in the path — for BOTH a
+    /// custom endpoint and AWS-default — so it stays consistent with the
+    /// bucketless host [`endpoint_base`](Self::endpoint_base) builds in that mode.
     fn canonical_path(&self, key: &str) -> String {
         let key = key.trim_start_matches('/');
-        if self.config.endpoint.is_some() && self.config.force_path_style {
+        if self.config.force_path_style {
             format!("/{}/{}", self.config.bucket, aws_uri_encode(key, false))
         } else {
             format!("/{}", aws_uri_encode(key, false))
@@ -1778,5 +1789,75 @@ mod tests {
         assert_eq!(client.multipart_part_size, 5 * 1024 * 1024);
         // Threshold stays at the default — unchanged by a part-size override.
         assert_eq!(client.multipart_threshold, MULTIPART_THRESHOLD);
+    }
+
+    /// Build a client for addressing-mode tests (no network).
+    fn client_for(bucket: &str, endpoint: Option<&str>, force_path_style: bool) -> S3Client {
+        S3Client::new(
+            S3Config {
+                bucket: bucket.to_owned(),
+                region: "us-west-2".to_owned(),
+                endpoint: endpoint.map(str::to_owned),
+                force_path_style,
+            },
+            S3Credentials {
+                access_key_id: "k".to_owned(),
+                secret_access_key: "s".to_owned(),
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn aws_virtual_hosted_addressing_is_the_default() {
+        // AWS + force_path_style=false → bucket in the HOST, key-only path.
+        let c = client_for("mybucket", None, false);
+        assert_eq!(
+            c.endpoint_base(),
+            "https://mybucket.s3.us-west-2.amazonaws.com"
+        );
+        assert_eq!(c.host().unwrap(), "mybucket.s3.us-west-2.amazonaws.com");
+        assert_eq!(c.canonical_path("db/x.dump"), "/db/x.dump");
+    }
+
+    #[test]
+    fn aws_force_path_style_uses_regional_host_and_bucket_in_path() {
+        // P2 #14: AWS + force_path_style=true must NOT be virtual-hosted — the
+        // regional host is bucketless and the bucket goes in the path.
+        let c = client_for("mybucket", None, true);
+        assert_eq!(c.endpoint_base(), "https://s3.us-west-2.amazonaws.com");
+        assert_eq!(c.host().unwrap(), "s3.us-west-2.amazonaws.com");
+        assert_eq!(c.canonical_path("db/x.dump"), "/mybucket/db/x.dump");
+        // The signed canonical URI must be the tail of the actually-sent URL
+        // (SigV4 consistency): request_url == endpoint_base + canonical_path.
+        assert_eq!(
+            c.request_url("db/x.dump", ""),
+            "https://s3.us-west-2.amazonaws.com/mybucket/db/x.dump"
+        );
+    }
+
+    #[test]
+    fn aws_dotted_bucket_with_force_path_style_is_path_style() {
+        // A dotted bucket can't use virtual-hosted TLS; path-style keeps it off
+        // the host entirely.
+        let c = client_for("my.dotted.bucket", None, true);
+        assert_eq!(c.host().unwrap(), "s3.us-west-2.amazonaws.com");
+        assert!(!c.host().unwrap().contains("my.dotted.bucket"));
+        assert_eq!(
+            c.canonical_path("control.dump"),
+            "/my.dotted.bucket/control.dump"
+        );
+    }
+
+    #[test]
+    fn custom_endpoint_addressing_is_unchanged_by_the_aws_fix() {
+        // Custom endpoint + path-style: bucket in path, host verbatim.
+        let path = client_for("b", Some("https://minio.example:9000"), true);
+        assert_eq!(path.host().unwrap(), "minio.example:9000");
+        assert_eq!(path.canonical_path("k"), "/b/k");
+        // Custom endpoint + virtual-hosted: bucket prefixes the custom host.
+        let virt = client_for("b", Some("https://minio.example:9000"), false);
+        assert_eq!(virt.host().unwrap(), "b.minio.example:9000");
+        assert_eq!(virt.canonical_path("k"), "/k");
     }
 }

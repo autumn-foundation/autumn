@@ -2409,6 +2409,24 @@ fn parse_offsite_ref(s: &str) -> Option<OffsiteRef> {
     })
 }
 
+/// Whether `name` is a single, plain filename component safe to `join` onto the
+/// download temp dir (P2 #13). Rejects anything that could escape the temp dir
+/// BEFORE manifest validation: a name is safe only when it contains no path
+/// separator (`/` OR `\` — `\` is a valid Unix filename byte but an S3 key
+/// written by a Windows run could carry a traversal like `..\..\evil`), is not
+/// `.`/`..`, is not absolute, and has no Windows drive/prefix. The
+/// `Component::Normal(c) if c == name` check is the robust cross-platform core;
+/// the explicit `\` reject covers the Unix case where `\` is not a separator.
+fn is_safe_leaf_name(name: &str) -> bool {
+    use std::path::{Component, Path};
+    if name.is_empty() || name.contains('/') || name.contains('\\') {
+        return false;
+    }
+    let p = Path::new(name);
+    p.components().count() == 1
+        && matches!(p.components().next(), Some(Component::Normal(c)) if c == name)
+}
+
 /// Download the referenced offsite run to a fresh temp dir and restore from it
 /// via the identical [`RestorePlan::discover`] path (AC #4). The temp dir is
 /// removed when the guard drops (after the restore completes or fails).
@@ -2449,10 +2467,15 @@ fn restore_from_offsite(args: &RestoreArgs, oref: &OffsiteRef) -> Result<(), Bac
         let file = obj
             .key
             .strip_prefix(run_prefix.as_str())
-            .filter(|f| !f.is_empty() && !f.contains('/'))
+            .filter(|f| is_safe_leaf_name(f))
             .ok_or_else(|| BackupError::Offsite {
                 op: "download",
-                detail: format!("unexpected object key layout: {}", obj.key),
+                detail: format!(
+                    "refusing offsite object with an unsafe key layout: {} (each object name \
+                     must be a single plain filename — no path separators, traversal, or drive \
+                     prefix)",
+                    obj.key
+                ),
             })?;
         // Stream the object straight to disk (constant memory), so a multi-GB
         // dump is never buffered while downloading for restore.
@@ -3664,6 +3687,28 @@ mod tests {
         assert!(!runs[0].complete);
         let table = format_offsite_listing(&runs);
         assert!(table.contains("INCOMPLETE"), "table was: {table}");
+    }
+
+    #[test]
+    fn is_safe_leaf_name_rejects_separators_and_traversal() {
+        // P2 #13: a downloaded offsite object name must be a single plain file.
+        for good in ["control.dump", "manifest.json", "shard-orders.dump"] {
+            assert!(is_safe_leaf_name(good), "{good:?} should be accepted");
+        }
+        for bad in [
+            "",
+            "a/b",
+            "a\\b",
+            "..\\..\\evil",
+            "../evil",
+            "C:\\evil",
+            "..",
+            ".",
+            "/abs",
+            "sub/manifest.json",
+        ] {
+            assert!(!is_safe_leaf_name(bad), "{bad:?} should be rejected");
+        }
     }
 
     #[test]
