@@ -1758,14 +1758,19 @@ impl RequestBuilder {
             )
             .await?;
 
-            let Some(next) = redirect_target(&resp, &current)? else {
-                return Ok(resp);
-            };
-            // Honour a chained `no_redirect()`: return the 3xx verbatim. The
-            // initial URL was still resolved / validated / pinned above.
+            // Honour a chained `no_redirect()`: return the response verbatim
+            // BEFORE parsing the `Location` header. The initial URL was still
+            // resolved / validated / pinned above. Parsing `Location` here (via
+            // `redirect_target`) would let an untrusted server force an
+            // `InvalidUrl` error out of a `no_redirect()` fetch by returning a
+            // followable 3xx with a malformed `Location`, violating the
+            // documented "return the initial 3xx verbatim" contract.
             if !follow {
                 return Ok(resp);
             }
+            let Some(next) = redirect_target(&resp, &current)? else {
+                return Ok(resp);
+            };
             if hop >= max {
                 return Err(ClientError::TooManyRedirects(max));
             }
@@ -3327,6 +3332,44 @@ mod tests {
         assert_eq!(
             resp.headers().get("location").and_then(|v| v.to_str().ok()),
             Some("http://127.0.0.1:1/never")
+        );
+    }
+
+    // TEST 48b: the non-ssrf `no_redirect()` path returns the 3xx verbatim even
+    // when `Location` is a MALFORMED URL. That path uses reqwest's
+    // `Policy::none()` and never parses `Location`, so a bad target cannot turn
+    // a `no_redirect()` fetch into an error. This guards the same "don't parse
+    // Location when not following" contract that `send_ssrf_safe` now enforces
+    // by returning the 3xx BEFORE calling `redirect_target`.
+    //
+    // NOTE: the SSRF-safe equivalent — `get_ssrf_safe(url).no_redirect()`
+    // against a listener returning a malformed `Location` — cannot be exercised
+    // end-to-end in-sandbox: the SSRF guard denies loopback (127.0.0.1), so the
+    // request is rejected during resolve→validate before any response is
+    // received. This testable-layer variant documents/guards the shared
+    // contract instead.
+    #[tokio::test]
+    async fn no_redirect_returns_3xx_with_malformed_location() {
+        use axum::{Router, routing::get};
+        let addr = spawn(Router::new().route(
+            "/start",
+            // `ht!tp://\bad` is not a parseable absolute URL (invalid scheme),
+            // but it is a valid HTTP header value, so the server can emit it.
+            get(|| async { redirect_302("ht!tp://\\bad".to_owned()) }),
+        ))
+        .await;
+
+        let resp = Client::new()
+            .get(format!("http://127.0.0.1:{}/start", addr.port()))
+            .no_redirect()
+            .send()
+            .await
+            .expect("no_redirect() must return the 3xx even with a malformed Location");
+
+        assert_eq!(resp.status().as_u16(), 302);
+        assert_eq!(
+            resp.headers().get("location").and_then(|v| v.to_str().ok()),
+            Some("ht!tp://\\bad")
         );
     }
 
