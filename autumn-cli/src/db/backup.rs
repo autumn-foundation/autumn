@@ -1960,7 +1960,7 @@ fn resolve_loaded_offsite(
 /// Whether the offsite destination collides with the app's user-facing blob
 /// storage: same bucket AND same canonical endpoint authority. Pure for unit
 /// testing the AC #3 opt-in guard.
-fn destinations_conflict(
+pub fn destinations_conflict(
     offsite_bucket: &str,
     offsite_endpoint: Option<&str>,
     app_bucket: Option<&str>,

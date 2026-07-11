@@ -4088,7 +4088,15 @@ impl AutumnConfig {
     /// section exists in TOML, a default one is materialized only if at least
     /// one offsite env var is present, so an all-env deployment still works.
     fn apply_backup_env_overrides_with_env(&mut self, env: &dyn Env) {
-        const OFFSITE_ENV_KEYS: &[&str] = &[
+        // Keys that signal a genuine intent to CONFIGURE an offsite destination —
+        // any presence materializes the `[backup.offsite]` section. This
+        // deliberately EXCLUDES the two opt-out toggles: a lone
+        // `AUTO_UPLOAD=false` / `ALLOW_SHARED_BUCKET=false` must NOT create an
+        // otherwise-empty section (which would then fail validation / `doctor`
+        // with "backup.offsite.s3.bucket is unset") — offsite stays UNCONFIGURED
+        // (issue #1619 P2 #18). A truthy `AUTO_UPLOAD=true` DOES materialize, since
+        // it requires a validated destination to act on.
+        const OFFSITE_DEST_KEYS: &[&str] = &[
             "AUTUMN_BACKUP__OFFSITE__S3__BUCKET",
             "AUTUMN_BACKUP__OFFSITE__S3__REGION",
             "AUTUMN_BACKUP__OFFSITE__S3__ENDPOINT",
@@ -4097,10 +4105,13 @@ impl AutumnConfig {
             "AUTUMN_BACKUP__OFFSITE__S3__FORCE_PATH_STYLE",
             "AUTUMN_BACKUP__OFFSITE__PREFIX",
             "AUTUMN_BACKUP__OFFSITE__KEEP",
-            "AUTUMN_BACKUP__OFFSITE__AUTO_UPLOAD",
-            "AUTUMN_BACKUP__OFFSITE__ALLOW_SHARED_BUCKET",
         ];
-        if self.backup.offsite.is_none() && !OFFSITE_ENV_KEYS.iter().any(|k| env.var(k).is_ok()) {
+        let has_dest_key = OFFSITE_DEST_KEYS.iter().any(|k| env.var(k).is_ok());
+        let auto_upload_truthy = env
+            .var("AUTUMN_BACKUP__OFFSITE__AUTO_UPLOAD")
+            .ok()
+            .is_some_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true"));
+        if self.backup.offsite.is_none() && !has_dest_key && !auto_upload_truthy {
             return;
         }
         let offsite = self
@@ -7921,6 +7932,56 @@ path = "/healthz"
         let mut config = AutumnConfig::default();
         config.apply_env_overrides_with_env(&env);
         assert!(config.backup.offsite.is_none());
+    }
+
+    #[test]
+    fn env_override_backup_offsite_lone_opt_out_toggle_stays_none() {
+        // P2 #18: a lone false/opt-out toggle must NOT materialize an empty
+        // [backup.offsite] (which would then fail validation / `doctor` with
+        // "bucket is unset"). Offsite stays unconfigured.
+        for key in [
+            "AUTUMN_BACKUP__OFFSITE__AUTO_UPLOAD",
+            "AUTUMN_BACKUP__OFFSITE__ALLOW_SHARED_BUCKET",
+        ] {
+            let env = MockEnv::new().with(key, "false");
+            let mut config = AutumnConfig::default();
+            config.apply_env_overrides_with_env(&env);
+            assert!(
+                config.backup.offsite.is_none(),
+                "{key}=false must not materialize an offsite section",
+            );
+        }
+    }
+
+    #[test]
+    fn env_override_backup_offsite_truthy_auto_upload_materializes() {
+        // P2 #18: AUTO_UPLOAD=true genuinely needs a validated destination, so it
+        // DOES materialize the section (auto_upload set), as before.
+        let env = MockEnv::new().with("AUTUMN_BACKUP__OFFSITE__AUTO_UPLOAD", "true");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        let offsite = config
+            .backup
+            .offsite
+            .expect("auto_upload=true materializes offsite");
+        assert!(offsite.auto_upload);
+    }
+
+    #[test]
+    fn env_override_backup_offsite_destination_key_materializes() {
+        // A destination/credential key still materializes the section (with the
+        // opt-out toggle applied to it), unchanged from before P2 #18.
+        let env = MockEnv::new()
+            .with("AUTUMN_BACKUP__OFFSITE__S3__BUCKET", "offsite")
+            .with("AUTUMN_BACKUP__OFFSITE__AUTO_UPLOAD", "false");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        let offsite = config
+            .backup
+            .offsite
+            .expect("a bucket key materializes offsite");
+        assert_eq!(offsite.s3.bucket.as_deref(), Some("offsite"));
+        assert!(!offsite.auto_upload);
     }
 
     #[test]

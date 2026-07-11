@@ -4328,20 +4328,18 @@ fn resolve_offsite_backup_data() -> OffsiteBackupData {
             Err(_) => Box::new(autumn_web::config::OsEnv),
         };
     let bucket = offsite.s3.bucket.clone();
-    let endpoints_match = normalize_doctor_endpoint(offsite.s3.endpoint.as_deref())
-        == normalize_doctor_endpoint(cfg.storage.s3.endpoint.as_deref());
-    // P2 #17 (doctor twin of the runtime P2 #16 guard): the app's `[storage.s3]`
-    // bucket only counts as the shared-storage destination when the RESOLVED
-    // storage backend is actually S3. A stale `[storage.s3]` bucket left in config
-    // while the app runs on the local/disabled backend is inert — it is not where
-    // the app writes blobs — so it must not trip the shared-bucket failure (which
-    // would false-fail `autumn doctor --strict`).
+    // Evaluate the shared-bucket conflict with EXACTLY the runtime guard so doctor
+    // and the CLI never disagree: the app `[storage.s3]` bucket counts only when
+    // the resolved backend is actually S3 (P2 #16/#17), and buckets/endpoints are
+    // compared through backup.rs `destinations_conflict` + `canonical_authority`
+    // (P2 #19) — which collapses `None` and explicit `*.amazonaws.com` spellings.
     let storage_is_s3 = cfg.storage.backend == autumn_web::storage::StorageBackend::S3;
     let shares_app_bucket = offsite_shares_active_app_bucket(
         storage_is_s3,
         bucket.as_deref(),
+        offsite.s3.endpoint.as_deref(),
         cfg.storage.s3.bucket.as_deref(),
-        endpoints_match,
+        cfg.storage.s3.endpoint.as_deref(),
     );
     OffsiteBackupData {
         configured: true,
@@ -4360,17 +4358,19 @@ fn resolve_offsite_backup_data() -> OffsiteBackupData {
     }
 }
 
-/// Whether the offsite destination shares the app's ACTIVE S3 storage bucket
-/// (P2 #17, doctor twin of the runtime P2 #16 guard). The app's `[storage.s3]`
-/// bucket counts only when `storage_is_s3` (the resolved backend is S3); a stale
-/// bucket on a local/disabled backend is inert and never a shared-bucket
-/// conflict. When active, the buckets must match (trimmed, non-empty) AND the
-/// endpoints must be equivalent. Pure for credential-safe unit testing.
+/// Whether the offsite destination shares the app's ACTIVE S3 storage bucket,
+/// evaluated with EXACTLY the runtime CLI guard
+/// (`crate::db::backup::destinations_conflict`, including its `canonical_authority`
+/// endpoint canonicalization) so `doctor` can never pass a config the CLI refuses,
+/// nor flag one the CLI allows (issue #1619 P2 #19). The app bucket counts only
+/// when `storage_is_s3` (P2 #16/#17) — a stale `[storage.s3]` bucket on a
+/// local/disabled backend is inert. Pure for credential-safe unit testing.
 fn offsite_shares_active_app_bucket(
     storage_is_s3: bool,
     offsite_bucket: Option<&str>,
+    offsite_endpoint: Option<&str>,
     app_bucket: Option<&str>,
-    endpoints_match: bool,
+    app_endpoint: Option<&str>,
 ) -> bool {
     fn trimmed(b: Option<&str>) -> Option<&str> {
         b.map(str::trim).filter(|s| !s.is_empty())
@@ -4378,10 +4378,15 @@ fn offsite_shares_active_app_bucket(
     if !storage_is_s3 {
         return false;
     }
-    matches!(
-        (trimmed(offsite_bucket), trimmed(app_bucket)),
-        (Some(a), Some(b)) if a == b
-    ) && endpoints_match
+    let Some(offsite_bucket) = trimmed(offsite_bucket) else {
+        return false;
+    };
+    crate::db::backup::destinations_conflict(
+        offsite_bucket,
+        offsite_endpoint,
+        trimmed(app_bucket),
+        app_endpoint,
+    )
 }
 
 /// Whether the environment variable NAMED by `name` is present and non-empty in
@@ -4393,15 +4398,6 @@ fn cred_env_present(env: &dyn autumn_web::config::Env, name: Option<&str>) -> bo
     name.map(str::trim)
         .filter(|v| !v.is_empty())
         .is_some_and(|v| env.var(v).is_ok_and(|val| !val.is_empty()))
-}
-
-/// Normalize an endpoint for the doctor shared-bucket comparison.
-fn normalize_doctor_endpoint(endpoint: Option<&str>) -> String {
-    endpoint
-        .unwrap_or("")
-        .trim()
-        .trim_end_matches('/')
-        .to_ascii_lowercase()
 }
 
 /// Resolve `.env` filesystem state for [`check_dotenv_impl`].
@@ -5148,18 +5144,16 @@ mod tests {
     }
 
     #[test]
-    fn doctor_shared_bucket_only_flags_when_storage_backend_is_s3() {
-        // P2 #17 (doctor twin of P2 #16): a stale [storage.s3] bucket equal to the
-        // offsite bucket must NOT be flagged as shared unless the backend is S3 —
-        // otherwise `autumn doctor --strict` false-fails on a local/disabled app.
-
-        // backend=local/disabled (storage_is_s3=false): inert bucket, never shared
-        // — even with an identical bucket name and matching endpoints.
+    fn doctor_shared_bucket_matches_runtime_guard() {
+        // P2 #16/#17 backend gate: a stale [storage.s3] bucket equal to the offsite
+        // bucket must NOT flag shared unless the backend is S3 — otherwise
+        // `autumn doctor --strict` false-fails on a local/disabled app.
         assert!(!offsite_shares_active_app_bucket(
             false,
             Some("shared"),
+            None,
             Some("shared"),
-            true
+            None
         ));
         // Feeding that into the check: not shared → no --strict failure.
         let local_data = OffsiteBackupData {
@@ -5176,25 +5170,40 @@ mod tests {
             CheckStatus::Fail
         );
 
-        // backend=s3 (storage_is_s3=true): same bucket + same endpoint → shared.
+        // P2 #19: doctor must match the runtime `canonical_authority` guard — the
+        // app storage endpoint left None (AWS default) vs the offsite naming the
+        // SAME AWS bucket with an explicit AWS regional endpoint canonicalize equal,
+        // so doctor DETECTS the shared bucket (the CLI would `SharedBucketRefused`).
         assert!(offsite_shares_active_app_bucket(
             true,
             Some("shared"),
+            Some("https://s3.us-east-1.amazonaws.com"),
             Some("shared"),
-            true
+            None,
         ));
-        // Different bucket, or mismatched endpoint, is NOT shared even on S3.
+        // Both endpoints None (AWS default on both sides), same bucket → shared.
+        assert!(offsite_shares_active_app_bucket(
+            true,
+            Some("shared"),
+            None,
+            Some("shared"),
+            None
+        ));
+        // Different bucket → not shared even on S3.
         assert!(!offsite_shares_active_app_bucket(
             true,
             Some("offsite"),
+            None,
             Some("appbucket"),
-            true
+            None
         ));
+        // Genuinely different endpoints (AWS vs self-hosted MinIO) → not shared.
         assert!(!offsite_shares_active_app_bucket(
             true,
             Some("shared"),
+            Some("https://minio.example:9000"),
             Some("shared"),
-            false
+            None,
         ));
     }
 
