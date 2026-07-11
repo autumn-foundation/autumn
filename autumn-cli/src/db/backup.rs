@@ -380,11 +380,15 @@ fn backup(args: &BackupArgs) -> Result<(), BackupError> {
     // here is the split outcome (AC #2/#6): the local artifact stays intact and
     // the command exits non-zero with an unambiguous message.
     if let Some((offsite, client)) = upload_ctx {
-        let run_id = run_dir
+        let local_run_id = run_dir
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
-        upload_run(&offsite, &client, &run_dir, &profile, &run_id).map_err(|detail| {
+        // The REMOTE run id gains a globally-unique token (P2 #12) so concurrent
+        // same-second backups of this profile from different hosts never collide
+        // in the bucket; the local run directory keeps its #1595 `<timestamp>`.
+        let remote_id = remote_run_id(&local_run_id, &remote_run_token());
+        upload_run(&offsite, &client, &run_dir, &profile, &remote_id).map_err(|detail| {
             BackupError::OffsiteUploadFailed {
                 local_path: run_dir.display().to_string(),
                 detail,
@@ -1681,12 +1685,13 @@ impl ResolvedOffsite {
             op: "connect",
             detail: e.to_string(),
         })?;
-        // Test/ops escape hatch: shrink the multipart threshold and part size so
-        // the multipart path can be exercised (or tuned) without a multi-GB
-        // fixture. The value is a target part size in bytes; both threshold and
-        // part size are set to it (the client re-floors to S3's 5 MiB minimum).
+        // Ops escape hatch: tune ONLY the multipart part size (bytes). This does
+        // NOT lower the multipart threshold, so shrinking the part size can never
+        // push a normal (sub-threshold) file into a multipart upload — it only
+        // changes how an already-multipart transfer is chunked. The client
+        // re-floors the value to S3's 5 MiB minimum.
         Ok(match self.multipart_part_size_override() {
-            Some(bytes) => client.with_multipart_params(bytes, bytes),
+            Some(bytes) => client.with_part_size(bytes),
             None => client,
         })
     }
@@ -2014,6 +2019,46 @@ fn offsite_object_key(prefix: &str, profile: &str, run_id: &str, file: &str) -> 
     join_key(&[prefix, profile, run_id, file])
 }
 
+/// A short, globally-unique token appended to the REMOTE run id so that two
+/// hosts backing up the SAME profile in the SAME second to the SAME
+/// bucket/prefix never produce colliding S3 keys (issue #1619 P2 #12). Without
+/// it, `create_unique_run_dir` only disambiguates within one host's filesystem,
+/// so cross-host same-second runs would overwrite/interleave each other's dumps
+/// and manifests and corrupt `latest`.
+///
+/// Derived from host + pid + wall-clock nanoseconds, hashed with the
+/// already-linked `sha2`/`hex` crates (no new dependency). It is NON-sensitive —
+/// pure entropy, no secret material. The LOCAL run-dir naming (issue #1595
+/// `<profile>/<timestamp>/`) is deliberately left unchanged; only the remote key
+/// gains the `-<token>` suffix.
+fn remote_run_token() -> String {
+    use sha2::{Digest, Sha256};
+    let host = std::env::var("HOSTNAME")
+        .or_else(|_| std::env::var("COMPUTERNAME"))
+        .unwrap_or_default();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let mut hasher = Sha256::new();
+    hasher.update(host.as_bytes());
+    hasher.update([0]); // domain separator between host and pid
+    hasher.update(std::process::id().to_le_bytes());
+    hasher.update(nanos.to_le_bytes());
+    // 8 hex chars (4 bytes): with the same-second timestamp already dominating
+    // the run id, a cross-host collision needs the same second AND a 32-bit token
+    // collision — negligible for the handful of hosts sharing one backup prefix.
+    hex::encode(&hasher.finalize()[..4])
+}
+
+/// Compose the globally-unique REMOTE run id from the LOCAL run id (a #1595
+/// `<timestamp>`) and a [`remote_run_token`]: `<timestamp>-<token>`. The
+/// timestamp still dominates the lexical sort, so `latest` (newest by timestamp)
+/// is unaffected and the token only tie-breaks same-second runs from different
+/// hosts — each a valid distinct backup, neither overwriting the other.
+fn remote_run_id(local_run_id: &str, token: &str) -> String {
+    format!("{local_run_id}-{token}")
+}
+
 /// The list prefix that enumerates every run for a profile (trailing slash so a
 /// `list-type=2` prefix match is scoped to this profile).
 fn offsite_profile_prefix(prefix: &str, profile: &str) -> String {
@@ -2268,7 +2313,9 @@ fn group_offsite_objects(objects: &[s3::S3Object], list_prefix: &str) -> Vec<Off
 fn format_offsite_listing(runs: &[OffsiteRun]) -> String {
     use std::fmt::Write as _;
     let mut out = String::new();
-    let _ = writeln!(out, "{:<20}  {:>10}  FILES", "TIMESTAMP", "SIZE");
+    // Column shows the FULL remote run id (`<timestamp>-<token>`, P2 #12) so an
+    // operator can copy it verbatim into `restore offsite:<profile>/<run id>`.
+    let _ = writeln!(out, "{:<28}  {:>10}  FILES", "RUN ID", "SIZE");
     for run in runs {
         let mut labels: Vec<&str> = run.files.iter().map(|(f, _)| f.as_str()).collect();
         labels.sort_unstable();
@@ -2278,7 +2325,7 @@ fn format_offsite_listing(runs: &[OffsiteRun]) -> String {
         }
         let _ = writeln!(
             out,
-            "{:<20}  {:>10}  {}",
+            "{:<28}  {:>10}  {}",
             run.run_id,
             human_size(run.total),
             files,
@@ -2372,7 +2419,7 @@ fn restore_from_offsite(args: &RestoreArgs, oref: &OffsiteRef) -> Result<(), Bac
     let client = offsite.build_client()?;
 
     let run_id = match &oref.selector {
-        OffsiteSelector::Exact(ts) => ts.clone(),
+        OffsiteSelector::Exact(sel) => resolve_exact_run(&offsite, &client, &oref.profile, sel)?,
         OffsiteSelector::Latest => resolve_latest_run(&offsite, &client, &oref.profile)?,
     };
     eprintln!(
@@ -2426,6 +2473,63 @@ fn restore_from_offsite(args: &RestoreArgs, oref: &OffsiteRef) -> Result<(), Bac
     let plan = RestorePlan::discover(temp.path(), args.shard.as_deref())?;
     apply_restore_plan(&plan, args)
     // `temp` is dropped here, removing the downloaded artifacts.
+}
+
+/// Resolve an explicit offsite selector to a single complete remote run id
+/// (P2 #12). The selector may be a full remote run id (`<ts>-<token>`) or a bare
+/// `<ts>` timestamp (operator convenience, and the pre-token spelling): a
+/// complete run matches when it equals the selector or begins with
+/// `"{selector}-"`. Errors (never silently guesses) when nothing matches or when
+/// several do — the latter happens when two hosts backed up the same second, and
+/// the message lists the full run ids so the operator can re-run with one.
+fn resolve_exact_run(
+    offsite: &ResolvedOffsite,
+    client: &S3Client,
+    profile: &str,
+    selector: &str,
+) -> Result<String, BackupError> {
+    let list_prefix = offsite_profile_prefix(&offsite.prefix, profile);
+    let objects = client
+        .list_objects_v2(&list_prefix)
+        .map_err(|e| BackupError::Offsite {
+            op: "list",
+            detail: e.to_string(),
+        })?;
+    let run_ids = complete_remote_run_ids(&objects, &list_prefix);
+    match match_exact_remote_run(&run_ids, selector) {
+        Ok(id) => Ok(id),
+        Err(candidates) if candidates.is_empty() => Err(BackupError::BadArtifact {
+            detail: format!(
+                "no complete offsite backup matching {selector:?} for profile {profile:?}"
+            ),
+        }),
+        Err(candidates) => Err(BackupError::BadArtifact {
+            detail: format!(
+                "offsite reference {selector:?} is ambiguous for profile {profile:?}: it matches \
+                 {} runs ({}).\n  Re-run restore with the full run id (see `autumn db offsite list`).",
+                candidates.len(),
+                candidates.join(", "),
+            ),
+        }),
+    }
+}
+
+/// Pure selector match (P2 #12): from COMPLETE remote run ids, return the single
+/// one referred to by `selector` (a full `<ts>-<token>` id, or a bare `<ts>` that
+/// prefixes exactly one tokened id). `Ok(id)` on a unique match; `Err(matches)`
+/// otherwise — an empty vec means none, a multi-element vec means ambiguous.
+fn match_exact_remote_run(run_ids: &[String], selector: &str) -> Result<String, Vec<String>> {
+    let token_prefix = format!("{selector}-");
+    let matches: Vec<String> = run_ids
+        .iter()
+        .filter(|id| id.as_str() == selector || id.starts_with(&token_prefix))
+        .cloned()
+        .collect();
+    if let [only] = matches.as_slice() {
+        Ok(only.clone())
+    } else {
+        Err(matches)
+    }
 }
 
 /// Resolve the newest run id for a profile from the offsite listing.
@@ -3563,6 +3667,91 @@ mod tests {
     }
 
     #[test]
+    fn remote_run_token_is_eight_lowercase_hex() {
+        // P2 #12: the token is 8 hex chars derived from host/pid/time entropy.
+        let token = remote_run_token();
+        assert_eq!(token.len(), 8, "token was {token:?}");
+        assert!(
+            token
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()),
+            "token must be lowercase hex: {token:?}"
+        );
+    }
+
+    #[test]
+    fn remote_run_id_appends_token_to_local_id() {
+        // P2 #12: remote id = <local timestamp>-<token>; the timestamp still leads
+        // so lexical sort (and thus `latest`) is unchanged.
+        let id = remote_run_id("20260710T040506Z", "deadbeef");
+        assert_eq!(id, "20260710T040506Z-deadbeef");
+        assert!(id.starts_with("20260710T040506Z"));
+    }
+
+    #[test]
+    fn match_exact_remote_run_resolves_by_full_id_and_timestamp() {
+        // P2 #12: complete remote run ids carry a token; a selector matches by
+        // full id OR by the bare timestamp when exactly one tokened id begins with it.
+        let ids: Vec<String> = ["20260709T010101Z-aaaa1111", "20260710T040506Z-bbbb2222"]
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect();
+        // Full id → itself.
+        assert_eq!(
+            match_exact_remote_run(&ids, "20260710T040506Z-bbbb2222").unwrap(),
+            "20260710T040506Z-bbbb2222"
+        );
+        // Bare timestamp uniquely prefixes one run → that run.
+        assert_eq!(
+            match_exact_remote_run(&ids, "20260710T040506Z").unwrap(),
+            "20260710T040506Z-bbbb2222"
+        );
+        // A timestamp with no matching run → Err(empty).
+        assert_eq!(
+            match_exact_remote_run(&ids, "20990101T000000Z").unwrap_err(),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn match_exact_remote_run_errors_on_ambiguous_same_second() {
+        // Two hosts backed up the SAME second → two tokened ids share the <ts>.
+        // A bare-timestamp selector is ambiguous and must list both candidates.
+        let ids: Vec<String> = ["20260710T040506Z-aaaa1111", "20260710T040506Z-bbbb2222"]
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect();
+        let err = match_exact_remote_run(&ids, "20260710T040506Z").unwrap_err();
+        assert_eq!(err.len(), 2);
+        assert!(err.contains(&"20260710T040506Z-aaaa1111".to_owned()));
+        assert!(err.contains(&"20260710T040506Z-bbbb2222".to_owned()));
+        // But the full id still resolves unambiguously.
+        assert_eq!(
+            match_exact_remote_run(&ids, "20260710T040506Z-aaaa1111").unwrap(),
+            "20260710T040506Z-aaaa1111"
+        );
+    }
+
+    #[test]
+    fn complete_remote_run_ids_sort_newest_last_with_tokens() {
+        // P2 #12: the <ts> dominates the lexical sort, so `latest` (newest) is the
+        // last element regardless of the token tiebreak.
+        let list_prefix = "db/prod/";
+        let objects = vec![
+            s3::S3Object {
+                key: "db/prod/20260710T040506Z-zzzz9999/manifest.json".to_owned(),
+                size: 1,
+            },
+            s3::S3Object {
+                key: "db/prod/20260711T040506Z-aaaa0000/manifest.json".to_owned(),
+                size: 1,
+            },
+        ];
+        let ids = complete_remote_run_ids(&objects, list_prefix);
+        assert_eq!(ids.last().unwrap(), "20260711T040506Z-aaaa0000");
+    }
+
+    #[test]
     fn plan_remote_pruning_keeps_newest_and_never_the_just_uploaded() {
         let runs: Vec<String> = ["r1", "r2", "r3", "r4", "r5"]
             .iter()
@@ -3690,7 +3879,7 @@ mod tests {
         assert_eq!(runs[1].total, 128 + 4096);
 
         let table = format_offsite_listing(&runs);
-        assert!(table.contains("TIMESTAMP"));
+        assert!(table.contains("RUN ID"));
         assert!(table.contains("20260710T040506Z"));
         assert!(table.contains("control.dump"));
         assert!(table.contains("manifest.json"));

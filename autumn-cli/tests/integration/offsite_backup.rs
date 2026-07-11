@@ -344,8 +344,11 @@ async fn offsite_backup_uploads_large_artifact_via_multipart() {
 
     create_bucket(&endpoint, access, secret, region, bucket).await;
 
-    // ── Seed ~12 MiB of incompressible bytea so the custom-format dump stays
-    //    large enough to split into 3 parts at a 5 MiB part size. ──────────────
+    // ── Seed incompressible bytea LARGER than the real 64 MiB multipart
+    //    threshold so the dump takes the multipart path via the genuine default
+    //    threshold — NOT by an env override lowering it (Low 3: the part-size env
+    //    tunes only chunking, never the threshold). 72 rows × 1 MiB ≈ 72 MiB of
+    //    random data survives custom-format compression and exceeds 64 MiB. ─────
     let (client, conn) = tokio_postgres::connect(&db_url, NoTls).await.unwrap();
     tokio::spawn(async move {
         let _ = conn.await;
@@ -357,8 +360,8 @@ async fn offsite_backup_uploads_large_artifact_via_multipart() {
         )
         .await
         .unwrap();
-    // 12 rows × 1 MiB = ~12 MiB incompressible → 3 parts at 5 MiB/part.
-    for id in 0..12i32 {
+    // 72 rows × 1 MiB ≈ 72 MiB, comfortably over the 64 MiB multipart threshold.
+    for id in 0..72i32 {
         let blob = incompressible_bytes(1024 * 1024);
         client
             .execute(
@@ -392,8 +395,9 @@ async fn offsite_backup_uploads_large_artifact_via_multipart() {
         ("AUTUMN_DATABASE__URL", db_url.as_str()),
         ("AUTUMN_OFFSITE_KEY", access),
         ("AUTUMN_OFFSITE_SECRET", secret),
-        // Force the multipart path with a 5 MiB part size (S3's minimum) so a
-        // ~12 MiB dump splits into 3 parts without needing a multi-GB fixture.
+        // Tune ONLY the part size to 5 MiB (S3's minimum) so the >64 MiB dump
+        // splits into many small parts. This does NOT lower the threshold —
+        // multipart is triggered by the real 64 MiB default on the large fixture.
         ("AUTUMN_OFFSITE_MULTIPART_PART_SIZE_BYTES", "5242880"),
     ];
 
@@ -430,7 +434,10 @@ async fn offsite_backup_uploads_large_artifact_via_multipart() {
         .expect("control.dump key present in listing")
         .to_owned();
 
-    // ── HEAD it: a multipart object's ETag is `<md5>-<partcount>`; assert 3. ──
+    // ── HEAD it: a multipart object's ETag is `<md5>-<partcount>`. Assert the
+    //    `-<n>` suffix with n >= 2, proving a multipart (not single-PUT) upload
+    //    with multiple parts. The exact count depends on the dump's byte size, so
+    //    we assert the shape rather than a brittle fixed number. ───────────────
     let encoded_key = dump_key
         .split('/')
         .map(urlencode_segment)
@@ -452,10 +459,17 @@ async fn offsite_backup_uploads_large_artifact_via_multipart() {
         .get(reqwest::header::ETAG)
         .and_then(|v| v.to_str().ok())
         .unwrap_or_default()
+        .trim_matches('"')
         .to_owned();
+    let part_count: u32 = etag
+        .rsplit_once('-')
+        .and_then(|(_, n)| n.parse().ok())
+        .unwrap_or_else(|| {
+            panic!("multipart ETag should carry a -<partcount> suffix, got {etag:?}")
+        });
     assert!(
-        etag.trim_matches('"').ends_with("-3"),
-        "multipart ETag should carry a -3 part-count suffix, got {etag:?}"
+        part_count >= 2,
+        "a >64 MiB dump at a 5 MiB part size must upload as multiple parts, got {part_count} ({etag:?})"
     );
 
     // ── And the DR loop still works end-to-end (restore equality). ───────────
