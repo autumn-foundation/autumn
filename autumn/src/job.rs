@@ -3373,6 +3373,12 @@ async fn execute_local_job(
         state
             .job_registry
             .record_failure(&job.name, format!("unknown job '{}'", job.name), true);
+        crate::alerts::notify_dead_lettered_job(
+            state,
+            &job.name,
+            &job.id,
+            &format!("unknown job '{}'", job.name),
+        );
         job_admin.record_failure(&job.id, format!("unknown job '{}'", job.name));
         crate::job_tracking::settle_tracked_payload_as_failed(
             state,
@@ -3550,6 +3556,7 @@ async fn execute_local_job(
                 state
                     .job_registry
                     .record_failure(&job.name, error.clone(), true);
+                crate::alerts::notify_dead_lettered_job(state, &job.name, &job.id, &error);
                 job_admin.record_failure(&job.id, error);
                 release_local_unique_hold(
                     coordination,
@@ -3565,6 +3572,7 @@ async fn execute_local_job(
             state
                 .job_registry
                 .record_failure(&job.name, error.clone(), true);
+            crate::alerts::notify_dead_lettered_job(state, &job.name, &job.id, &error);
             job_admin.record_failure(&job.id, error);
             release_local_unique_hold(
                 coordination,
@@ -5308,6 +5316,7 @@ async fn recover_stale_redis_jobs(
                     state
                         .job_registry
                         .record_failure(&dead.name, error.clone(), true);
+                    crate::alerts::notify_dead_lettered_job(state, &dead.name, &dead.id, &error);
                     job_admin.record_failure(&dead.id, error);
                     // The worker that held this claim is gone and the job is
                     // now terminally dead-lettered — settle the tracked
@@ -5483,6 +5492,7 @@ async fn settle_failed_redis_job(
                     state
                         .job_registry
                         .record_failure(&dead.name, error.clone(), true);
+                    crate::alerts::notify_dead_lettered_job(state, &dead.name, &dead.id, &error);
                     job_admin.record_failure(&dead.id, error);
                 }
                 Ok(false) => tracing::warn!(
@@ -5518,6 +5528,7 @@ async fn dead_letter_panicked_redis_job(
             state
                 .job_registry
                 .record_failure(&dead.name, error.clone(), true);
+            crate::alerts::notify_dead_lettered_job(state, &dead.name, &dead.id, &error);
             job_admin.record_failure(&dead.id, error);
         }
         Ok(false) => tracing::warn!(
@@ -5543,14 +5554,21 @@ async fn dead_letter_invalid_redis_job(
     error: &str,
     job_admin: &JobAdminMemoryBackend,
 ) {
-    state
-        .job_registry
-        .record_failure(&record.name, error.to_owned(), true);
-    job_admin.record_failure(&record.id, error.to_owned());
     let mut dead = record.clone();
     clear_redis_claim(&mut dead);
     dead.last_error = Some(error.to_owned());
-    let _ = dead_letter_redis_job(connection, worker_config, record, &dead).await;
+    // Only record the failure / page the operator once the job is actually
+    // moved to the dead queue. If the move errors or the claim changed
+    // (`Ok(false)`), the job was NOT dead-lettered, so alerting here would be a
+    // false page — mirror the sibling redis dead-letter paths that gate all of
+    // this on the confirmed `Ok(true)` result.
+    if dead_letter_redis_job(connection, worker_config, record, &dead).await == Ok(true) {
+        state
+            .job_registry
+            .record_failure(&record.name, error.to_owned(), true);
+        crate::alerts::notify_dead_lettered_job(state, &record.name, &record.id, error);
+        job_admin.record_failure(&record.id, error.to_owned());
+    }
     crate::job_tracking::settle_tracked_payload_as_failed(
         state,
         &record.payload,
@@ -5911,10 +5929,26 @@ fn record_pg_lifecycle_after_ack(
         // Mirror whichever outcome the worker intended so /actuator metrics stay
         // consistent with the database row.
         if let PgLifecycleRecord::Failure { error } = lifecycle {
-            // Stale recovery dead-lettered the row (final attempt).
-            state
-                .job_registry
-                .record_failure(job_name, error.to_owned(), true);
+            // Terminal failure whose ack no longer applies: stale-claim recovery
+            // already transitioned this row out from under the worker, and it —
+            // not this resuming worker — OWNS the dead-letter accounting for
+            // `!ack_applied` rows:
+            //   * final attempt: `pg_recover_stale_claims` flipped the row to
+            //     `failed` AND already called `record_failure(.., dead_letter=true)`
+            //     + `notify_dead_lettered_job` for it. Recording again here would
+            //     double the `/actuator/jobs` failure/dead-letter counters and fire
+            //     a second (dedup-suppressed) alert for one DB row.
+            //   * non-final panic / unknown-type dead-letter: recovery instead
+            //     requeued the row (it is still alive, so no dead-letter is owed
+            //     yet — the real terminal outcome is recorded when it next runs).
+            // Either way we must NOT record a failure/dead-letter or alert here.
+            // Still balance this worker's own `record_start` so the process-local
+            // `in_flight` gauge doesn't leak — `record_retry` decrements in_flight
+            // without touching the failure/dead-letter counters — and settle this
+            // job_id's admin record to Failed (admin state is keyed per job_id and
+            // is left untouched by the maintenance loop, so this is the single,
+            // non-duplicated update that moves it out of Running).
+            state.job_registry.record_retry(job_name, error, 0);
             job_admin.record_failure(job_id, error.to_owned());
         } else {
             // Non-terminal or successful outcome: decrement in_flight and
@@ -5944,6 +5978,7 @@ fn record_pg_lifecycle_after_ack(
             state
                 .job_registry
                 .record_failure(job_name, error.to_owned(), true);
+            crate::alerts::notify_dead_lettered_job(state, job_name, job_id, error);
             job_admin.record_failure(job_id, error.to_owned());
         }
     }
@@ -6695,6 +6730,10 @@ async fn pg_ack_dead_letter(
 #[derive(diesel::QueryableByName)]
 struct PgStaleRecoveryRow {
     #[diesel(sql_type = diesel::sql_types::Text)]
+    id: String,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    name: String,
+    #[diesel(sql_type = diesel::sql_types::Text)]
     payload: String,
     #[diesel(sql_type = diesel::sql_types::Text)]
     status: String,
@@ -6765,7 +6804,7 @@ async fn pg_recover_stale_claims(pool: &PgPool, visibility_timeout_ms: u64, stat
            FOR UPDATE SKIP LOCKED \
            LIMIT 100 \
          ) \
-         RETURNING payload::TEXT AS payload, status",
+         RETURNING id, name, payload::TEXT AS payload, status",
     )
     .bind::<diesel::sql_types::BigInt, _>(i64::try_from(visibility_timeout_ms).unwrap_or(i64::MAX))
     .get_results::<PgStaleRecoveryRow>(&mut *conn)
@@ -6779,6 +6818,30 @@ async fn pg_recover_stale_claims(pool: &PgPool, visibility_timeout_ms: u64, stat
     match rows {
         Ok(rows) => {
             for row in rows.into_iter().filter(|row| row.status == "failed") {
+                // A crashed worker never resumes to observe its ack returning
+                // `Ok(false)`, so `record_pg_lifecycle_after_ack` never fires
+                // the dead-letter alert for these rows. Emit it here — mirroring
+                // the other dead-letter sites — so genuine crashed-worker
+                // dead-letters still page the operator.
+                //
+                // Record the failure in the registry *before* alerting, exactly
+                // as the sibling stale-recovery route
+                // (`record_pg_lifecycle_after_ack`, `!ack_applied` branch) and
+                // every other dead-letter site do. The alert points operators
+                // at `/actuator/jobs`, which is backed by `JobRegistry::snapshot()`;
+                // without this, a crashed-worker dead-letter would page but not
+                // appear where the alert tells operators to look.
+                state.job_registry.record_failure(
+                    &row.name,
+                    "visibility timeout expired".to_owned(),
+                    true,
+                );
+                crate::alerts::notify_dead_lettered_job(
+                    state,
+                    &row.name,
+                    &row.id,
+                    "visibility timeout expired",
+                );
                 let payload = serde_json::from_str::<Value>(&row.payload).unwrap_or(Value::Null);
                 crate::job_tracking::settle_tracked_payload_as_failed(
                     state,
@@ -12171,10 +12234,13 @@ mod tests {
         }
 
         #[test]
-        fn pg_terminal_failure_stale_eviction_records_dead_letter() {
+        fn pg_terminal_failure_stale_eviction_defers_dead_letter_to_recovery() {
             // When a final-attempt job's ack returns Ok(false), stale-claim
-            // recovery already dead-lettered the row; total_failures and
-            // dead_letters must be incremented to stay in sync with the DB.
+            // recovery already dead-lettered the row AND recorded the failure +
+            // dead-letter + alert itself (`pg_recover_stale_claims`). The resuming
+            // worker must NOT record a second failure/dead-letter (that would
+            // double the /actuator/jobs counters for one DB row) — it only
+            // balances its own in_flight and settles the admin record to Failed.
             let state = AppState::for_test().with_profile("dev");
             state.job_registry().register("slow_failure");
             state.job_registry().record_enqueue("slow_failure");
@@ -12197,21 +12263,73 @@ mod tests {
             ));
 
             let status = state.job_registry().snapshot()["slow_failure"].clone();
-            assert_eq!(status.in_flight, 0);
+            assert_eq!(status.in_flight, 0, "in_flight must be balanced");
             assert_eq!(
-                status.total_failures, 1,
-                "terminal stale eviction must increment total_failures"
+                status.total_failures, 0,
+                "resuming worker must not re-record the failure stale recovery already counted"
             );
             assert_eq!(
-                status.dead_letters, 1,
-                "terminal stale eviction must increment dead_letters"
+                status.dead_letters, 0,
+                "resuming worker must not re-record the dead-letter stale recovery already counted"
             );
             let snapshot = job_admin.snapshot_sync(&JobAdminQuery::default());
             assert_eq!(
                 snapshot.failed.total, 1,
-                "failed list must show the dead-lettered job"
+                "admin state (keyed per job_id, untouched by recovery) still moves to Failed"
             );
             assert_eq!(snapshot.running.total, 0);
+        }
+
+        #[test]
+        fn pg_maintenance_stale_recovery_records_dead_letter_in_registry() {
+            // `pg_recover_stale_claims` runs on a maintenance replica that did
+            // NOT execute the job: the worker that claimed it crashed on another
+            // process, so this process never called `record_start` for it and
+            // `in_flight` is 0 here. The maintenance loop still records the
+            // terminal failure in the registry *before* alerting — mirroring the
+            // sibling ack-resume route (`record_pg_lifecycle_after_ack`,
+            // `!ack_applied` branch) — so the crashed-worker dead-letter shows up
+            // in `JobRegistry::snapshot()`, the data behind `/actuator/jobs`
+            // where the alert points operators to look.
+            //
+            // The full `pg_recover_stale_claims` UPDATE ... RETURNING needs a
+            // live Postgres, so this exercises the exact registry recording the
+            // loop now performs for each stale-recovered `failed` row (and proves
+            // it is safe when this process never started the job).
+            let state = AppState::for_test().with_profile("dev");
+            state.job_registry().register("crashed_elsewhere");
+
+            // The two-line sequence the maintenance loop now runs per failed row.
+            state.job_registry().record_failure(
+                "crashed_elsewhere",
+                "visibility timeout expired".to_owned(),
+                true,
+            );
+            crate::alerts::notify_dead_lettered_job(
+                &state,
+                "crashed_elsewhere",
+                "job-crashed-elsewhere-1",
+                "visibility timeout expired",
+            );
+
+            let status = state.job_registry().snapshot()["crashed_elsewhere"].clone();
+            assert_eq!(
+                status.in_flight, 0,
+                "recording a dead-letter for a job this process never started must not underflow in_flight"
+            );
+            assert_eq!(
+                status.total_failures, 1,
+                "stale-recovered dead-letter must increment total_failures"
+            );
+            assert_eq!(
+                status.dead_letters, 1,
+                "stale-recovered dead-letter must appear in the /actuator/jobs dead-letter count"
+            );
+            assert_eq!(
+                status.last_error.as_deref(),
+                Some("visibility timeout expired"),
+                "snapshot must carry the stale-recovery reason as the last error"
+            );
         }
 
         #[test]
@@ -12359,10 +12477,13 @@ mod tests {
         }
 
         #[test]
-        fn pg_terminal_stale_eviction_records_failure_and_dead_letter() {
+        fn pg_terminal_stale_eviction_balances_inflight_without_double_recording() {
             // When ack returns Ok(false) on a final-attempt job (lifecycle=Failure),
-            // stale recovery already dead-lettered the row in the DB.  The
-            // in-memory metrics must reflect a dead-letter, not a retry.
+            // stale recovery already dead-lettered the row in the DB and recorded
+            // the failure + dead-letter itself. The resuming worker must only
+            // balance in_flight and settle the admin record to Failed — recording
+            // a second failure/dead-letter would double-count one DB row on
+            // /actuator/jobs. It must also show Failed, not Retrying, in admin.
             let state = AppState::for_test().with_profile("dev");
             state.job_registry().register("terminal_job");
             state.job_registry().record_enqueue("terminal_job");
@@ -12387,12 +12508,12 @@ mod tests {
             let status = state.job_registry().snapshot()["terminal_job"].clone();
             assert_eq!(status.in_flight, 0, "in_flight must be balanced");
             assert_eq!(
-                status.total_failures, 1,
-                "terminal stale eviction must increment total_failures"
+                status.total_failures, 0,
+                "resuming worker must not re-record a failure stale recovery already counted"
             );
             assert_eq!(
-                status.dead_letters, 1,
-                "terminal stale eviction must increment dead_letters"
+                status.dead_letters, 0,
+                "resuming worker must not re-record a dead-letter stale recovery already counted"
             );
             let admin_status = job_admin
                 .inner
@@ -12406,6 +12527,83 @@ mod tests {
                 admin_status,
                 JobAdminStatus::Failed,
                 "admin must show Failed, not Retrying, after terminal stale eviction"
+            );
+        }
+
+        #[test]
+        fn pg_slow_worker_resume_after_stale_recovery_counts_dead_letter_once() {
+            // End-to-end coordination proof for a combined-role replica (one
+            // process runs BOTH the maintenance loop and a worker loop):
+            // a final-attempt job merely runs LONGER than the visibility timeout
+            // (slow worker, not crashed). Stale-claim recovery flips the row to
+            // `failed` and records the failure + dead-letter + alert; the original
+            // worker then resumes and its terminal ack returns Ok(false). The
+            // logical dead-letter must be counted EXACTLY ONCE across both paths —
+            // regression guard for the double-count this fix removes.
+            let state = AppState::for_test().with_profile("dev");
+            state.job_registry().register("slow_resumer");
+            state.job_registry().record_enqueue("slow_resumer");
+            // The worker claimed and started the job: in_flight == 1.
+            state.job_registry().record_start("slow_resumer");
+            let job_admin = JobAdminMemoryBackend::new_for_test(32);
+            let job_id =
+                job_admin.record_enqueue_for_test("slow_resumer", serde_json::json!({}), 1, 1);
+            job_admin.record_start_for_test(&job_id, 1);
+
+            // 1) Stale-claim recovery dead-letters the final-attempt row, mirroring
+            //    the exact two-line sequence `pg_recover_stale_claims` runs per
+            //    `failed` row it flips.
+            state.job_registry().record_failure(
+                "slow_resumer",
+                "visibility timeout expired".to_owned(),
+                true,
+            );
+            crate::alerts::notify_dead_lettered_job(
+                &state,
+                "slow_resumer",
+                &job_id,
+                "visibility timeout expired",
+            );
+
+            // 2) The slow worker finally resumes; its terminal ack no longer
+            //    applies because recovery already moved the row (Ok(false)).
+            assert!(!record_pg_lifecycle_ack_result(
+                Ok(false),
+                "slow_resumer",
+                &job_id,
+                "failure",
+                PgLifecycleRecord::Failure {
+                    error: "handler returned error"
+                },
+                &state,
+                &job_admin
+            ));
+
+            let status = state.job_registry().snapshot()["slow_resumer"].clone();
+            assert_eq!(
+                status.in_flight, 0,
+                "in_flight must settle to 0 with no underflow after the worker resumes"
+            );
+            assert_eq!(
+                status.total_failures, 1,
+                "one DB row must count as exactly one failure, not two"
+            );
+            assert_eq!(
+                status.dead_letters, 1,
+                "one DB row must count as exactly one dead-letter, not two"
+            );
+            let admin_status = job_admin
+                .inner
+                .read()
+                .expect("job admin lock")
+                .records
+                .get(&job_id)
+                .expect("admin record")
+                .status;
+            assert_eq!(
+                admin_status,
+                JobAdminStatus::Failed,
+                "the resuming worker still settles the admin record to Failed"
             );
         }
 

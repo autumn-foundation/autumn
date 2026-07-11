@@ -383,6 +383,478 @@ pub fn check_trusted_hosts_impl(hosts: &[String], is_production: bool) -> CheckR
     }
 }
 
+/// Check that an operator-alert destination is configured (issue #1610).
+///
+/// Operator alerts (dead-lettered jobs, Down health indicators, 5xx-rate
+/// spikes, scheduled-task failures) are only delivered when an `[alerts]`
+/// destination — an operator `email` and/or a `webhook_url` — is configured.
+///
+/// An `email` destination only counts when a *usable* `[mail] transport` can
+/// actually send: the runtime (`alerts::install_from_config`) refuses to
+/// register a `MailAlertChannel` when `mailer.is_disabled()` (the disabled
+/// transport, which is the default outside dev), so an email paired with a
+/// disabled transport delivers nothing. `mail_transport_usable` mirrors that —
+/// it is `false` when the effective merged `[mail] transport` resolves to
+/// `disabled`. The webhook path is independent of the mailer.
+///
+/// An `email` destination ALSO needs a mail `from` address for transports that
+/// build a real RFC 5322 message: the runtime's alert mail
+/// (`MailAlertChannel`) sets no per-message `from`, so it falls back to the
+/// mailer default (`[mail] from`). Under `transport = "smtp"` with no `[mail]
+/// from`, delivery fails in `lettre_message` with "mail from address is
+/// required" — so an SMTP email with no `from` is not a working destination.
+/// `transport_requires_from` mirrors which transports actually enforce this:
+/// only `smtp` (the `log` and `file` transports render `from` only when present
+/// and deliver without it; `disabled` is already not usable). `mail_from` is the
+/// effective merged `[mail] from` (empty string when unset); for SMTP it must be
+/// both non-empty AND a valid lettre mailbox — the runtime parses it at boot
+/// (`MailerBuilder::build`) and refuses to start on an unparsable sender, so a
+/// present-but-invalid value is not a working destination.
+///
+/// The `[alerts] enabled` master switch is honoured up front: when alerting is
+/// disabled the runtime (`alerts::install_from_config`) returns BEFORE
+/// installing any `Alerter`, so NO operator alerts are delivered regardless of a
+/// configured destination. In production that earns a dedicated warning (a
+/// deploy running blind), distinct from the "no destination" one; outside
+/// production it stays lenient like the rest of this check.
+///
+/// - **Production** (`is_production = true`): warns when alerting is disabled, or
+///   when no usable destination is configured, so a deploy does not run silently
+///   blind to its own failures. An email whose mail transport is disabled — or
+///   whose SMTP transport has no `[mail] from` — gets a dedicated, clearer
+///   warning rather than the generic "no destination" one.
+/// - **Dev/test**: passes quietly (alerts are optional locally).
+///
+/// The returned check name is `"alert_destination"`.
+/// Dedicated production warning for an email destination on an SMTP transport
+/// with no `[mail] from`: the runtime's alert mail carries no per-message
+/// `from`, so `lettre_message` fails with "mail from address is required" and
+/// nothing is delivered. Distinct from the disabled-transport and no-destination
+/// warnings. Extracted so [`check_alert_destination_impl`] stays under the
+/// line-count lint.
+fn alert_email_from_missing_warning() -> CheckResult {
+    CheckResult {
+        name: "alert_destination",
+        status: CheckStatus::Warn,
+        detail: Some(
+            "an operator alert email is configured but `[mail] from` is not set, so SMTP \
+             delivery will fail; the runtime's alert mail carries no per-message from and \
+             the mailer has no default from address to fall back to"
+                .into(),
+        ),
+        hint: Some(
+            "Set [mail] from (or AUTUMN_MAIL__FROM) to a sender address like \
+             alerts@example.com, or configure a signed webhook ([alerts] webhook_url + \
+             webhook_secret). See docs/guide/operator-alerts.md",
+        ),
+    }
+}
+
+/// Dedicated production warning for a present-but-syntactically-invalid `[mail]
+/// from` on an SMTP transport: the runtime parses `[mail] from` at boot
+/// (`MailerBuilder::build` runs `parse_mailbox`), so an unparsable value like
+/// `not-a-mailbox` aborts startup outright — and even before that the alert mail
+/// (which carries no per-message `from` and falls back to this default) would
+/// fail EVERY send with an invalid-address error. Distinct from the
+/// missing-`from`, disabled-transport, invalid-email, and no-destination
+/// warnings, and it names the offending value. Validity is checked with the SAME
+/// lettre `Mailbox` parser the runtime uses (`is_valid_alert_mailbox_doctor`).
+/// Extracted so [`check_alert_destination_impl`] stays under the line-count lint.
+fn alert_email_from_invalid_warning(from: &str) -> CheckResult {
+    CheckResult {
+        name: "alert_destination",
+        status: CheckStatus::Warn,
+        detail: Some(format!(
+            "`[mail] from` (\"{from}\") is not a valid email address, so SMTP alert \
+             delivery will fail; the runtime parses it at boot and refuses to start on \
+             an unparsable sender, and the alert mail has no other `from` to fall back to"
+        )),
+        hint: Some(
+            "Set [mail] from (or AUTUMN_MAIL__FROM) to a valid sender address like \
+             alerts@example.com, or configure a signed webhook ([alerts] webhook_url + \
+             webhook_secret). See docs/guide/operator-alerts.md",
+        ),
+    }
+}
+
+/// Dedicated production warning for a present-but-syntactically-invalid
+/// `[alerts] email`: lettre parses the recipient only at send time (in
+/// `lettre_message`, not at `Mail::builder().to(...)`), so an unparsable
+/// address like `not-an-address` passes every earlier gate yet fails EVERY
+/// alert delivery at runtime with `MailError::InvalidAddress`. Distinct from
+/// the disabled-transport, missing-`from`, and no-destination warnings.
+fn alert_email_invalid_warning(email: &str) -> CheckResult {
+    CheckResult {
+        name: "alert_destination",
+        status: CheckStatus::Warn,
+        detail: Some(format!(
+            "`[alerts] email` (\"{email}\") is not a valid email address, so alert delivery \
+             will fail; the runtime parses the recipient only when sending and rejects it \
+             with an invalid-address error, delivering nothing"
+        )),
+        hint: Some(
+            "Set [alerts] email (or AUTUMN_ALERTS__EMAIL) to a valid address like \
+             alerts@example.com, or configure a signed webhook ([alerts] webhook_url + \
+             webhook_secret). See docs/guide/operator-alerts.md",
+        ),
+    }
+}
+
+/// Dedicated production warning for a present-but-non-absolute `[alerts]
+/// webhook_url`: the runtime's HTTP client (`http_client::Client::build_request`)
+/// dispatches a URL verbatim only when it starts with `http://` or `https://`,
+/// otherwise treating it as a path to join onto a base-url alias the alert
+/// webhook never has — so a relative value like `hooks.example/x` fails EVERY
+/// signed POST. Distinct from the missing-secret, invalid-email, and
+/// no-destination warnings, and it names the offending value.
+fn alert_webhook_url_invalid_warning(url: &str) -> CheckResult {
+    CheckResult {
+        name: "alert_destination",
+        status: CheckStatus::Warn,
+        detail: Some(format!(
+            "`[alerts] webhook_url` (\"{url}\") is not an absolute http(s) URL, so alert \
+             delivery will fail; the runtime's HTTP client only sends a URL starting with \
+             http:// or https://, and a relative value has no base URL to resolve against, so \
+             every signed webhook POST fails to send"
+        )),
+        hint: Some(
+            "Set [alerts] webhook_url (or AUTUMN_ALERTS__WEBHOOK_URL) to an absolute URL like \
+             https://alerts.example.com/hooks/autumn, or configure an email destination \
+             ([alerts] email). See docs/guide/operator-alerts.md",
+        ),
+    }
+}
+
+/// Resolve the production result when no `[alerts]` email/webhook destination is
+/// configured and no earlier value-validation warning fired.
+///
+/// When `custom_channel` is true the operator has DECLARED, via `[alerts]
+/// custom_channel = true` (or `AUTUMN_ALERTS__CUSTOM_CHANNEL`), that they register
+/// an alert channel in code with `AppBuilder::with_alert_channel`. The runtime
+/// installs code-registered channels regardless, so the destination is treated as
+/// present and the check passes — the sanctioned way to satisfy `autumn doctor
+/// --strict` for a code-only alert setup. Otherwise there is genuinely nowhere to
+/// deliver, so it warns and points at the flag. This runs AFTER every
+/// value-validation warning, so `custom_channel` only suppresses the pure "no
+/// destination configured" fall-through, never a broken *configured* destination.
+/// Extracted so [`check_alert_destination_impl`] stays under the line-count lint.
+fn alert_no_destination_in_production(custom_channel: bool) -> CheckResult {
+    if custom_channel {
+        return CheckResult {
+            name: "alert_destination",
+            status: CheckStatus::Pass,
+            detail: Some(
+                "no [alerts] email/webhook destination configured, but [alerts] \
+                 custom_channel = true declares a code-registered alert channel \
+                 (AppBuilder::with_alert_channel), which the runtime installs regardless"
+                    .into(),
+            ),
+            hint: None,
+        };
+    }
+    CheckResult {
+        name: "alert_destination",
+        status: CheckStatus::Warn,
+        detail: Some(
+            "no operator alert destination found in [alerts] config (email or webhook) in \
+             production; if your app registers an alert channel in code via \
+             AppBuilder::with_alert_channel, set [alerts] custom_channel = true (or \
+             AUTUMN_ALERTS__CUSTOM_CHANNEL=true) to declare that and silence this warning \
+             (doctor is a config-only checker and cannot see code-registered channels); \
+             otherwise failure conditions (dead-lettered jobs, Down health indicators, 5xx \
+             spikes, scheduled-task failures) will not be delivered anywhere"
+                .into(),
+        ),
+        hint: Some(
+            "Set [alerts] email and/or webhook_url (or AUTUMN_ALERTS__EMAIL / \
+             AUTUMN_ALERTS__WEBHOOK_URL); or if you register a channel in code, set [alerts] \
+             custom_channel = true. See docs/guide/operator-alerts.md",
+        ),
+    }
+}
+
+/// Dedicated production warning for the `[alerts] enabled = false` master switch:
+/// the runtime (`alerts::install_from_config`) returns BEFORE installing any
+/// `Alerter`, so NO operator alerts are delivered regardless of a configured
+/// destination. Mentions the (otherwise valid) destination when one is present so
+/// the operator understands the deploy is blind despite it. Extracted so
+/// [`check_alert_destination_impl`] stays under the line-count lint.
+fn alert_disabled_in_production_warning(has_destination: bool) -> CheckResult {
+    let detail = if has_destination {
+        "alerting is disabled ([alerts] enabled = false) in production, so no operator \
+         alerts will be delivered — even though a destination is configured"
+    } else {
+        "alerting is disabled ([alerts] enabled = false) in production, so no operator \
+         alerts will be delivered"
+    };
+    CheckResult {
+        name: "alert_destination",
+        status: CheckStatus::Warn,
+        detail: Some(detail.into()),
+        hint: Some(
+            "Set [alerts] enabled = true (or AUTUMN_ALERTS__ENABLED=true) to deliver \
+             operator alerts, or remove the setting (it defaults to enabled). See \
+             docs/guide/operator-alerts.md",
+        ),
+    }
+}
+
+// Five independent config booleans (alerting enabled, webhook is a usable signed
+// destination, mail transport usable, production, transport requires a `from`)
+// plus the resolved `[alerts] email`, `[alerts] webhook_url`, and `[mail] from`
+// strings each gate a distinct branch; grouping them into enums would obscure
+// rather than clarify the destination-resolution logic. The raw `webhook_url` is
+// used only to name a present-but-non-absolute value in its dedicated warning —
+// `webhook_configured` already folds in absoluteness and the signing-secret
+// requirement — and `mail_from` likewise names a present-but-invalid sender in
+// its dedicated warning while its presence+validity gate the email destination.
+#[allow(clippy::fn_params_excessive_bools, clippy::too_many_arguments)]
+pub fn check_alert_destination_impl(
+    alerts_enabled: bool,
+    email: &str,
+    webhook_configured: bool,
+    webhook_url: &str,
+    mail_transport_usable: bool,
+    is_production: bool,
+    mail_from: &str,
+    transport_requires_from: bool,
+    custom_channel: bool,
+) -> CheckResult {
+    // Presence and syntactic validity of the resolved `[alerts] email`. lettre
+    // parses the recipient only at SEND time (`lettre_message`), not when the
+    // alert `Mail` is built, so a present-but-unparsable address (e.g.
+    // `not-an-address`) passes every earlier gate yet fails EVERY delivery at
+    // runtime with `MailError::InvalidAddress`. An invalid address therefore
+    // does not count as a usable destination. Validity is checked with the SAME
+    // lettre parser the runtime uses (`is_valid_alert_mailbox_doctor` runs
+    // `value.parse::<lettre::message::Mailbox>()`, exact parity with
+    // `autumn/src/alerts.rs`'s `is_valid_alert_mailbox`) — deliberately NOT
+    // `is_valid_mailto_address_doctor`, which strips a leading `mailto:` (correct
+    // for the `List-Unsubscribe` header but wrong here). This accepts everything
+    // lettre accepts, including RFC 5322 display-name forms like
+    // `Ops <ops@example.com>`, and rejects what lettre rejects: the runtime hands
+    // `[alerts] email` verbatim to `Mail::builder().to(...)`, so a `mailto:` URI
+    // would fail EVERY delivery and doctor must reject it too.
+    let email_trimmed = email.trim();
+    let email_configured = !email_trimmed.is_empty();
+    let email_valid = email_configured && is_valid_alert_mailbox_doctor(email_trimmed);
+
+    // Presence and syntactic validity of the resolved `[mail] from`. For
+    // transports that build a real RFC 5322 message (SMTP), a `from` must be both
+    // present AND a valid lettre mailbox: the runtime parses it at boot
+    // (`MailerBuilder::build` runs `parse_mailbox`), so an unparsable value like
+    // `not-a-mailbox` aborts startup and the alert mail — which sets no
+    // per-message `from` — has no valid default to fall back to. Checked with the
+    // SAME lettre parser the recipient uses (`is_valid_alert_mailbox_doctor`),
+    // exact parity with `autumn/src/mail.rs`'s `parse_mailbox`.
+    let mail_from_trimmed = mail_from.trim();
+    let mail_from_present = !mail_from_trimmed.is_empty();
+    let mail_from_valid = mail_from_present && is_valid_alert_mailbox_doctor(mail_from_trimmed);
+
+    // Whether a configured email would actually deliver. It needs a valid
+    // address, a usable (non-disabled) transport AND — for transports that build
+    // a real RFC 5322 message (SMTP) — a present, VALID `[mail] from`, because the
+    // runtime's alert mail carries no per-message `from` and falls back to the
+    // mailer default. `log`/`file` deliver without a `from`, so they do not need one.
+    let email_from_ok = mail_from_valid || !transport_requires_from;
+    let email_destination = email_valid && mail_transport_usable && email_from_ok;
+
+    // Master off switch: when `[alerts] enabled = false`, the runtime installs no
+    // alerter at all, so a configured destination is inert. Handle this BEFORE
+    // the destination gate — doctor must not pass on the strength of a
+    // configured-but-inert destination.
+    if !alerts_enabled {
+        if is_production {
+            // Name the disabled switch explicitly. Mention the (otherwise valid)
+            // destination when one is configured so the operator understands the
+            // deploy is blind despite it; keep the message accurate otherwise.
+            return alert_disabled_in_production_warning(email_destination || webhook_configured);
+        }
+        return CheckResult {
+            name: "alert_destination",
+            status: CheckStatus::Pass,
+            detail: Some(
+                "operator alerting is disabled ([alerts] enabled = false) (optional outside \
+                 production)"
+                    .into(),
+            ),
+            hint: None,
+        };
+    }
+    // `email_destination` (computed above) already folds in the usable-transport
+    // and `from` requirements — mirroring the runtime, which skips
+    // MailAlertChannel when `mailer.is_disabled()` and whose SMTP send fails
+    // without a `from`.
+    if email_destination || webhook_configured {
+        return CheckResult {
+            name: "alert_destination",
+            status: CheckStatus::Pass,
+            detail: Some("operator alert destination configured".into()),
+            hint: None,
+        };
+    }
+    if is_production {
+        // An email is set but is not a syntactically valid address: the runtime
+        // parses the recipient only at send time, so every alert fails in
+        // `lettre_message` with an invalid-address error and nothing is
+        // delivered. Surface a dedicated warning naming the offending value,
+        // distinct from the missing-`from`, disabled-transport, and
+        // no-destination cases. Checked first because a malformed address is
+        // unusable regardless of transport or `from`.
+        if email_configured && !email_valid {
+            return alert_email_invalid_warning(email_trimmed);
+        }
+        // An email is set on a usable transport that needs a `from` (SMTP), but
+        // no `[mail] from` is configured: the runtime's alert mail has no
+        // per-message `from`, so `lettre_message` fails with "mail from address
+        // is required" and nothing is delivered. Surface a dedicated warning
+        // distinct from both the disabled-transport and no-destination cases.
+        if email_configured
+            && mail_transport_usable
+            && transport_requires_from
+            && !mail_from_present
+        {
+            return alert_email_from_missing_warning();
+        }
+        // An email is set on a usable transport that needs a `from` (SMTP) and a
+        // `[mail] from` IS set but is not a syntactically valid mailbox: the
+        // runtime parses it at boot (`MailerBuilder::build`) and refuses to start,
+        // so it never even reaches a send. Surface a dedicated warning naming the
+        // offending value, distinct from the missing-`from` case (which reads as
+        // "you set nothing" and would mislead here).
+        if email_configured
+            && mail_transport_usable
+            && transport_requires_from
+            && mail_from_present
+            && !mail_from_valid
+        {
+            return alert_email_from_invalid_warning(mail_from_trimmed);
+        }
+        // An email is set but the mail transport is disabled: the runtime
+        // installs no alert channel and delivers nothing. Surface a dedicated
+        // warning that points at the real cause instead of the generic
+        // "no destination" message (which would read as "you set nothing").
+        if email_configured && !mail_transport_usable {
+            return CheckResult {
+                name: "alert_destination",
+                status: CheckStatus::Warn,
+                detail: Some(
+                    "an operator alert email is configured but [mail] transport is disabled, so \
+                     no email alerts will be delivered; the runtime installs no email alert \
+                     channel when the mailer is disabled"
+                        .into(),
+                ),
+                hint: Some(
+                    "Set [mail] transport to a real backend (smtp/log/file) or configure a signed \
+                     webhook ([alerts] webhook_url + webhook_secret). See \
+                     docs/guide/operator-alerts.md",
+                ),
+            };
+        }
+        // A webhook URL is set but is not an absolute http(s) URL: the runtime's
+        // HTTP client dispatches a URL verbatim only when it starts with
+        // `http://`/`https://`, and an alert webhook has no base-url alias to join
+        // a relative value onto — so every signed POST fails to send. Surface a
+        // dedicated warning naming the offending value, distinct from the
+        // missing-secret ("no destination") and email cases. `webhook_configured`
+        // is already false here (it requires an absolute URL), so this only fires
+        // when there is no other working destination.
+        let webhook_url_trimmed = webhook_url.trim();
+        if !webhook_url_trimmed.is_empty() && !is_absolute_http_url_doctor(webhook_url_trimmed) {
+            return alert_webhook_url_invalid_warning(webhook_url_trimmed);
+        }
+        // No config destination resolved. Either the operator has DECLARED a
+        // code-registered channel via `[alerts] custom_channel = true` (pass), or
+        // there is genuinely nowhere to deliver (warn). Extracted so this function
+        // stays under the line-count lint.
+        alert_no_destination_in_production(custom_channel)
+    } else {
+        CheckResult {
+            name: "alert_destination",
+            status: CheckStatus::Pass,
+            detail: Some(
+                "no operator alert destination configured (optional outside production)".into(),
+            ),
+            hint: None,
+        }
+    }
+}
+
+/// Check that a configured `[alerts] error_rate_threshold` is a usable 5xx rate
+/// (issue #1610).
+///
+/// The runtime compares the threshold against a rate computed as
+/// `err_delta / req_delta` (`autumn/src/alerts.rs`'s `evaluate_error_rate`), i.e.
+/// a **fraction in `[0, 1]`**, so the only meaningful thresholds are in `(0, 1]`.
+/// A non-finite value (`nan`/`inf`) or one `> 1` makes `rate >= threshold` false
+/// for every possible rate — the 5xx alert would NEVER fire; a value `<= 0` makes
+/// it fire on a 0%-error window. The runtime (`AlerterSettings::from_config`)
+/// sanitizes such a value by falling back to the default, but doctor still flags
+/// it so the operator fixes the config rather than silently running on the default.
+///
+/// `raw` is the RAW resolved value (empty when unset — the default `0.05` is used,
+/// which is valid). In **production** an invalid value warns with a dedicated
+/// message naming it; outside production it passes quietly (alerts are optional
+/// locally), matching the leniency of the other alert checks. Never blocks beyond
+/// a warning.
+///
+/// The returned check name is `"alert_error_rate_threshold"`.
+pub fn check_alert_error_rate_threshold_impl(raw: &str, is_production: bool) -> CheckResult {
+    const NAME: &str = "alert_error_rate_threshold";
+    let trimmed = raw.trim();
+    // Unset (or cleared) -> the runtime uses the valid default (0.05). Nothing to
+    // flag.
+    if trimmed.is_empty() {
+        return CheckResult {
+            name: NAME,
+            status: CheckStatus::Pass,
+            detail: Some("no [alerts] error_rate_threshold set (defaults to 0.05)".into()),
+            hint: None,
+        };
+    }
+    // Valid iff it parses to a finite fraction in (0, 1]. `str::parse::<f64>`
+    // accepts `nan`/`inf`/`-inf` (which `is_finite()` then rejects), matching the
+    // runtime's `f64` config value; an entirely unparsable value is invalid too.
+    let valid = trimmed
+        .parse::<f64>()
+        .is_ok_and(|v| v.is_finite() && v > 0.0 && v <= 1.0);
+    if valid {
+        return CheckResult {
+            name: NAME,
+            status: CheckStatus::Pass,
+            detail: Some(format!(
+                "[alerts] error_rate_threshold ({trimmed}) is a valid 5xx rate in (0, 1]"
+            )),
+            hint: None,
+        };
+    }
+    if is_production {
+        CheckResult {
+            name: NAME,
+            status: CheckStatus::Warn,
+            detail: Some(format!(
+                "[alerts] error_rate_threshold (\"{trimmed}\") is not a valid rate in (0, 1]; \
+                 the 5xx alert will not work as intended (the runtime falls back to the default \
+                 0.05)"
+            )),
+            hint: Some(
+                "Set [alerts] error_rate_threshold (or AUTUMN_ALERTS__ERROR_RATE_THRESHOLD) to a \
+                 fraction in (0, 1], e.g. 0.05 for 5%. See docs/guide/operator-alerts.md",
+            ),
+        }
+    } else {
+        CheckResult {
+            name: NAME,
+            status: CheckStatus::Pass,
+            detail: Some(format!(
+                "[alerts] error_rate_threshold (\"{trimmed}\") is not a valid rate in (0, 1] \
+                 (optional outside production; the runtime falls back to the default 0.05)"
+            )),
+            hint: None,
+        }
+    }
+}
+
 /// Check a single `[auth.oauth2.<provider>]` entry for common misconfigurations.
 ///
 /// - In production (`is_production = true`): fails when `client_secret` is empty.
@@ -646,6 +1118,33 @@ fn is_valid_https_base_url_doctor(url: &str) -> bool {
         && parsed.fragment().is_none()
 }
 
+/// Whether `url` is an absolute http(s) URL that the runtime's HTTP client would
+/// actually dispatch — the exact absoluteness rule an `[alerts] webhook_url`
+/// must satisfy to deliver.
+///
+/// `autumn_web`'s `http_client::Client::build_request` sends a URL verbatim ONLY
+/// when it starts with `http://` or `https://`; any other string is treated as a
+/// path to be joined onto a base-url alias, and an alert webhook (posted via
+/// `named(&url).post(&url)`) has no such alias, so a relative value like
+/// `hooks.example/x` fails EVERY signed send. Mirror that rule byte-for-byte:
+/// accept BOTH schemes (the runtime does not require TLS, so neither do we) and
+/// additionally require the URL to parse with a non-empty host — a value such as
+/// `https://` or `http:///path` carries the prefix yet reqwest cannot send it.
+///
+/// Deliberately MORE permissive than [`is_valid_https_base_url_doctor`]
+/// (https-only; forbids query/fragment/userinfo): a webhook URL is a full
+/// endpoint the runtime posts as-is, so rejecting `http://` or a query string
+/// here would warn about configs that deliver fine — a false positive.
+fn is_absolute_http_url_doctor(url: &str) -> bool {
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        return false;
+    }
+    ::url::Url::parse(url)
+        .ok()
+        .and_then(|parsed| parsed.host_str().map(|h| !h.is_empty()))
+        .unwrap_or(false)
+}
+
 /// Mirror of `autumn_web`'s `is_valid_mailto_address` (see above).
 fn is_valid_mailto_address_doctor(value: &str) -> bool {
     // Reject control characters and RFC 2369 delimiters (`<`/`>`/`,`) anywhere in
@@ -671,6 +1170,35 @@ fn is_valid_mailto_address_doctor(value: &str) -> bool {
         }
         None => false,
     }
+}
+
+/// Whether `value` parses as the SAME lettre [`Mailbox`](lettre::message::Mailbox)
+/// the alert mail send path requires of every recipient — EXACT parity with the
+/// runtime's `is_valid_alert_mailbox` (`autumn/src/alerts.rs`), which validates
+/// `[alerts] email` with `email.parse::<lettre::message::Mailbox>()`.
+///
+/// The runtime hands `[alerts] email` verbatim to `Mail::builder().to(...)`, and
+/// lettre parses the recipient only at SEND time (`parse_mailbox`/`lettre_message`),
+/// not when the alert `Mail` is built. Reusing the exact same parser here means
+/// doctor accepts precisely what the runtime accepts — bare mailboxes
+/// (`ops@example.com`), `+`-addressing (`a+b@sub.example.co`) AND RFC 5322
+/// display-name forms (`Ops <ops@example.com>`) — instead of a hand-rolled
+/// approximation that was STRICTER than lettre and rejected valid display-name
+/// mailboxes, producing a false `autumn doctor --strict` failure on a config the
+/// runtime registers and delivers to fine.
+///
+/// A `mailto:` URI (e.g. `mailto:oncall@example.com`) is still rejected: lettre's
+/// parser treats the whole string as one mailbox and the `:` is not valid in a
+/// dot-atom local part, so it fails to parse — matching the runtime, where such a
+/// value fails EVERY delivery with `MailError::InvalidAddress`.
+///
+/// lettre is reachable from the CLI via `autumn_web`'s `mail`-gated re-export
+/// (`autumn_web::reexports::lettre`); `autumn-cli` enables that feature, so no
+/// direct `lettre` dependency is required.
+fn is_valid_alert_mailbox_doctor(value: &str) -> bool {
+    value
+        .parse::<autumn_web::reexports::lettre::message::Mailbox>()
+        .is_ok()
 }
 
 // ─── Pure helper functions (fully unit-testable) ──────────────────────────────
@@ -2035,6 +2563,30 @@ fn resolve_mail_unsubscribe(table: Option<&toml::Table>) -> (Option<String>, Opt
     )
 }
 
+/// Resolve the effective `[mail] from` sender address, preferring an
+/// `AUTUMN_MAIL__FROM` env override over the merged `[mail].from` (mirroring the
+/// runtime's `AUTUMN_MAIL__*` precedence — a *present* env var wins even when
+/// blank, clearing the TOML value; only an *absent* env var falls back to TOML).
+/// Returns the trimmed non-empty value, or `None` when no usable `from` is set.
+fn resolve_mail_from(table: Option<&toml::Table>) -> Option<String> {
+    let mail = table
+        .and_then(|t| t.get("mail"))
+        .and_then(toml::Value::as_table);
+    std::env::var("AUTUMN_MAIL__FROM").map_or_else(
+        |_| {
+            mail.and_then(|m| m.get("from"))
+                .and_then(toml::Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(std::borrow::ToOwned::to_owned)
+        },
+        |value| {
+            let trimmed = value.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_owned())
+        },
+    )
+}
+
 /// Resolve the effective `unsubscribe_token_ttl_days`, mirroring the runtime
 /// precedence: `[mail].unsubscribe_token_ttl_days` (or the default of 30) is the
 /// base, and a present, *parseable* `AUTUMN_MAIL__UNSUBSCRIBE_TOKEN_TTL_DAYS`
@@ -2143,6 +2695,18 @@ fn resolve_effective_mail_transport(
     } else {
         "disabled".to_owned()
     }
+}
+
+/// Whether a mail transport actually requires a `from` address to deliver.
+///
+/// Only `smtp` builds a real RFC 5322 message: autumn-web's `lettre_message`
+/// errors with "mail from address is required" when `from` is absent, and it is
+/// reached solely from the SMTP transport. The `log` and `file` transports
+/// render `from` only when present and deliver without it; `disabled` delivers
+/// nothing at all (and is already treated as an unusable transport). Mirrors
+/// autumn-web `mail.rs`.
+fn mail_transport_requires_from(transport: &str) -> bool {
+    transport == "smtp"
 }
 
 fn resolve_database_topology(table: Option<&toml::Table>) -> DoctorDatabaseTopology {
@@ -2515,6 +3079,442 @@ fn resolve_trusted_hosts() -> Vec<String> {
     parse_hosts(&table)
 }
 
+/// Resolve whether an operator-alert destination (email and/or webhook URL) is
+/// configured, from the environment or the fully-merged effective `[alerts]` (base
+/// `autumn.toml` layered with the active profile's `[profile.{name}]` section and
+/// `autumn-{profile}.toml` override file, alias-normalized exactly as the runtime).
+///
+/// Returns `(email, webhook_configured, webhook_url)`, where `email` and
+/// `webhook_url` are the RAW resolved `[alerts] email` / `[alerts] webhook_url`
+/// values (empty when unset/cleared) so the caller can check both their presence
+/// and their syntactic validity — an invalid address, or a non-absolute webhook
+/// URL, delivers nothing at runtime. `webhook_configured` already folds in the
+/// URL absoluteness and signing-secret requirements.
+fn resolve_alert_destination() -> (String, bool, String) {
+    // Evaluate the SAME fully-merged effective config the runtime boots with, not
+    // just the raw base `autumn.toml`. The runtime config loader (a) normalizes
+    // profile aliases (`production` → `prod`, `development` → `dev`) and (b) layers
+    // the active profile's inline `[profile.{name}]` section plus its
+    // `autumn-{profile}.toml` override file over the base. Reading only the base
+    // `[alerts]` with a raw lower-cased profile string let doctor greenlight a prod
+    // deploy whose `autumn-prod.toml` (or `[profile.prod.alerts]`) CLEARED the
+    // destination — installing NO alert channel at runtime. Build the merged table
+    // through the runtime-mirroring loader and resolve against its flattened
+    // top-level `[alerts]`; env vars still take highest precedence.
+    //
+    // Profile selection mirrors `resolve_profile_input`: a blank/whitespace
+    // AUTUMN_ENV is ignored before falling back to AUTUMN_PROFILE, so a blank
+    // preferred var does not silently downgrade a prod selection to dev.
+    let selected_input = std::env::var("AUTUMN_ENV")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .or_else(|| {
+            std::env::var("AUTUMN_PROFILE")
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+        })
+        .unwrap_or_default()
+        .trim()
+        .to_owned();
+    let normalized_profile = normalize_alert_profile(&selected_input);
+    // The merge flattens the active profile's inline section and override file into
+    // the top-level `[alerts]`, so resolve against an EMPTY profile: `_from_sources`
+    // then reads only the effective top-level `[alerts]` (env vars still override).
+    // Passing the profile here would re-read the STALE raw `[profile.{name}.alerts]`
+    // section and ignore the higher-priority `autumn-{profile}.toml` layer.
+    let merged = get_merged_toml_table_runtime(&normalized_profile, &selected_input);
+    // `.ok()` deliberately does NOT filter empty values: a set-but-empty env
+    // var is a PRESENT higher-priority layer that CLEARS the destination,
+    // distinct from an unset var (which falls through to the TOML layers).
+    let (_email_present, webhook) =
+        resolve_alert_destination_from_sources(|key| std::env::var(key).ok(), Some(&merged), "");
+    // Surface the RAW resolved email string (not just presence) so the
+    // destination check can validate its syntax. Mirror the same env > base
+    // precedence `_from_sources` applies to the flattened top-level `[alerts]`:
+    // a PRESENT `AUTUMN_ALERTS__EMAIL` (even empty) wins and is terminal;
+    // otherwise fall through to the merged base `[alerts] email`.
+    let email = std::env::var("AUTUMN_ALERTS__EMAIL").unwrap_or_else(|_| {
+        merged
+            .get("alerts")
+            .and_then(|a| a.get("email"))
+            .and_then(toml::Value::as_str)
+            .unwrap_or("")
+            .to_owned()
+    });
+    // Surface the RAW resolved webhook URL (not just presence) under the same
+    // env > merged-base precedence, so the destination check can name a
+    // present-but-non-absolute value in its dedicated warning. `webhook` (above)
+    // already gates on this URL being absolute AND the secret resolving.
+    let webhook_url = std::env::var("AUTUMN_ALERTS__WEBHOOK_URL").unwrap_or_else(|_| {
+        merged
+            .get("alerts")
+            .and_then(|a| a.get("webhook_url"))
+            .and_then(toml::Value::as_str)
+            .unwrap_or("")
+            .to_owned()
+    });
+    (email, webhook, webhook_url)
+}
+
+/// Normalize a raw profile input to the canonical name the runtime config loader
+/// uses, mirroring `autumn_web::config::normalize_profile_name`'s alias table
+/// (`production`/`PROD` → `prod`, `development`/`DEV` → `dev`; custom names keep
+/// their operator-specified spelling; blank stays blank). Kept in lock-step with
+/// the runtime so doctor merges the same profile sources the app will boot with.
+fn normalize_alert_profile(selected_input: &str) -> String {
+    match selected_input.trim().to_ascii_lowercase().as_str() {
+        "prod" | "production" => "prod".to_owned(),
+        "dev" | "development" => "dev".to_owned(),
+        "" => String::new(),
+        _ => selected_input.trim().to_owned(),
+    }
+}
+
+/// Resolve whether an email and/or webhook alert destination is configured,
+/// honouring layer precedence exactly as the runtime config merge does.
+///
+/// The highest-priority layer that is PRESENT wins, and an explicitly-empty
+/// higher layer CLEARS the value rather than falling back to a lower one — so a
+/// base `[alerts] email = "…"` cleared by `[profile.prod.alerts] email = ""`
+/// (or an empty `AUTUMN_ALERTS__EMAIL`) correctly resolves as "no destination".
+/// Layers, highest first: env var, `[profile.{profile}.alerts]`, base
+/// `[alerts]`. Only a layer that omits the key entirely falls through.
+///
+/// A webhook counts as configured only when `webhook_url` resolves to a
+/// non-empty ABSOLUTE http(s) URL AND `webhook_secret` resolves non-empty under
+/// this precedence — mirroring the runtime, which never registers an unsigned
+/// webhook channel and whose HTTP client cannot dispatch a relative URL — so a
+/// webhook URL with a missing/cleared secret, or a non-absolute URL, is not a
+/// destination.
+///
+/// Split out from [`resolve_alert_destination`] so the precedence logic is unit
+/// testable without mutating process-global env/cwd state.
+fn resolve_alert_destination_from_sources<F>(
+    env_var: F,
+    table: Option<&toml::Table>,
+    profile: &str,
+) -> (bool, bool)
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let profile_alerts = if profile.is_empty() {
+        None
+    } else {
+        table
+            .and_then(|t| t.get("profile"))
+            .and_then(|v| v.get(profile))
+            .and_then(toml::Value::as_table)
+            .and_then(|p| p.get("alerts"))
+            .and_then(toml::Value::as_table)
+    };
+    let base_alerts = table
+        .and_then(|t| t.get("alerts"))
+        .and_then(toml::Value::as_table);
+
+    // Resolve the RAW winning value for a key under the same layer precedence,
+    // stopping at (not falling through) the first PRESENT layer — a present layer
+    // wins even when its value is empty (an explicit clear). Returns an empty
+    // string when no layer sets the key.
+    let resolve_value = |env_key: &str, key: &str| -> String {
+        // 1. Env var — highest priority. Present (even empty) is terminal.
+        if let Some(val) = env_var(env_key) {
+            return val;
+        }
+        // 2. Profile-specific `[profile.{profile}.alerts].{key}`.
+        if let Some(v) = profile_alerts
+            .and_then(|t| t.get(key))
+            .and_then(toml::Value::as_str)
+        {
+            return v.to_owned();
+        }
+        // 3. Base `[alerts].{key}`.
+        if let Some(v) = base_alerts
+            .and_then(|t| t.get(key))
+            .and_then(toml::Value::as_str)
+        {
+            return v.to_owned();
+        }
+        String::new()
+    };
+    let resolve =
+        |env_key: &str, key: &str| -> bool { !resolve_value(env_key, key).trim().is_empty() };
+
+    let email = resolve("AUTUMN_ALERTS__EMAIL", "email");
+    // A webhook destination requires a well-formed URL AND a signing secret to be
+    // a real destination:
+    //   * The runtime (`alerts::install_from_config`) refuses to register an
+    //     unsigned webhook channel, so a URL with a missing/cleared secret
+    //     installs NO channel.
+    //   * The runtime's HTTP client (`http_client::Client::build_request`) only
+    //     dispatches a URL that starts with `http://`/`https://`; a relative value
+    //     (which an alert webhook can never resolve against a base-url alias) fails
+    //     EVERY signed POST. So a present-but-non-absolute URL is not a working
+    //     destination either.
+    // Count the webhook only when the resolved URL is a non-empty ABSOLUTE http(s)
+    // URL AND the secret resolves non-empty, under the same per-field precedence —
+    // so doctor agrees with runtime (URL-without-secret, or a relative URL, is NOT
+    // a destination → in production with no other destination, doctor warns).
+    let webhook_url = resolve_value("AUTUMN_ALERTS__WEBHOOK_URL", "webhook_url");
+    let webhook_secret = resolve("AUTUMN_ALERTS__WEBHOOK_SECRET", "webhook_secret");
+    let webhook = is_absolute_http_url_doctor(webhook_url.trim()) && webhook_secret;
+    (email, webhook)
+}
+
+/// Resolve the effective `[alerts] enabled` master switch, mirroring the runtime
+/// config merge and the `AlertConfig::default().enabled` default of `true`.
+///
+/// The runtime's `alerts::install_from_config` returns before installing any
+/// `Alerter` when `enabled` is false, so doctor must consult it: an
+/// `enabled = false` prod config delivers NO operator alerts even with an
+/// `email`/signed-`webhook` populated.
+fn resolve_alert_enabled() -> bool {
+    // Mirror `resolve_alert_destination`'s profile selection and merged-table
+    // build so `enabled` resolves against the same effective config the runtime
+    // boots with (profile inline section + `autumn-{profile}.toml` layered in),
+    // env vars still highest priority.
+    let selected_input = std::env::var("AUTUMN_ENV")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .or_else(|| {
+            std::env::var("AUTUMN_PROFILE")
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+        })
+        .unwrap_or_default()
+        .trim()
+        .to_owned();
+    let normalized_profile = normalize_alert_profile(&selected_input);
+    // The merge flattens the active profile into the top-level `[alerts]`, so
+    // resolve against an EMPTY profile (mirroring `resolve_alert_destination`).
+    let merged = get_merged_toml_table_runtime(&normalized_profile, &selected_input);
+    resolve_alert_enabled_from_sources(|key| std::env::var(key).ok(), Some(&merged), "")
+}
+
+/// Resolve the effective `[alerts] enabled` flag under the same layer precedence
+/// the runtime config merge applies (env `AUTUMN_ALERTS__ENABLED` >
+/// `[profile.{profile}.alerts].enabled` > base `[alerts].enabled`), defaulting to
+/// `true` when unset — matching `AlertConfig::default().enabled`.
+///
+/// Env parsing mirrors the runtime's `parse_env_bool`: `true`/`1` enable,
+/// `false`/`0` disable, and any other value is ignored (falls through to the
+/// TOML layers). Split out from [`resolve_alert_enabled`] so the precedence is
+/// unit-testable without mutating process-global env/cwd state.
+fn resolve_alert_enabled_from_sources<F>(
+    env_var: F,
+    table: Option<&toml::Table>,
+    profile: &str,
+) -> bool
+where
+    F: Fn(&str) -> Option<String>,
+{
+    // 1. Env var — highest priority, mirroring runtime `parse_env_bool`. An
+    //    invalid value (not true/false/1/0) is ignored and falls through.
+    if let Some(val) = env_var("AUTUMN_ALERTS__ENABLED") {
+        match val.as_str() {
+            "true" | "1" => return true,
+            "false" | "0" => return false,
+            _ => {}
+        }
+    }
+    // 2. Profile-specific `[profile.{profile}.alerts].enabled`.
+    if !profile.is_empty()
+        && let Some(v) = table
+            .and_then(|t| t.get("profile"))
+            .and_then(|v| v.get(profile))
+            .and_then(toml::Value::as_table)
+            .and_then(|p| p.get("alerts"))
+            .and_then(toml::Value::as_table)
+            .and_then(|a| a.get("enabled"))
+            .and_then(toml::Value::as_bool)
+    {
+        return v;
+    }
+    // 3. Base `[alerts].enabled`.
+    if let Some(v) = table
+        .and_then(|t| t.get("alerts"))
+        .and_then(toml::Value::as_table)
+        .and_then(|a| a.get("enabled"))
+        .and_then(toml::Value::as_bool)
+    {
+        return v;
+    }
+    // 4. Unset everywhere → alerts enabled (mirrors `AlertConfig::default()`).
+    true
+}
+
+/// Resolve the effective `[alerts] custom_channel` flag the same way the runtime
+/// config merge and `AlertConfig::default().custom_channel` (default `false`)
+/// do.
+///
+/// This is a doctor-only declaration: when true, the operator asserts they
+/// register an alert channel in code via `AppBuilder::with_alert_channel`, so the
+/// no-destination warning is suppressed. The runtime installs code-registered
+/// channels regardless of this flag; it exists purely so `autumn doctor --strict`
+/// can pass a validly-configured code-only alert setup.
+fn resolve_alert_custom_channel() -> bool {
+    // Mirror `resolve_alert_enabled`'s profile selection and merged-table build so
+    // `custom_channel` resolves against the same effective config the runtime
+    // boots with, env vars still highest priority.
+    let selected_input = std::env::var("AUTUMN_ENV")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .or_else(|| {
+            std::env::var("AUTUMN_PROFILE")
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+        })
+        .unwrap_or_default()
+        .trim()
+        .to_owned();
+    let normalized_profile = normalize_alert_profile(&selected_input);
+    // The merge flattens the active profile into the top-level `[alerts]`, so
+    // resolve against an EMPTY profile (mirroring `resolve_alert_enabled`).
+    let merged = get_merged_toml_table_runtime(&normalized_profile, &selected_input);
+    resolve_alert_custom_channel_from_sources(|key| std::env::var(key).ok(), Some(&merged), "")
+}
+
+/// Resolve the effective `[alerts] custom_channel` flag under the same layer
+/// precedence the runtime config merge applies (env
+/// `AUTUMN_ALERTS__CUSTOM_CHANNEL` > `[profile.{profile}.alerts].custom_channel` >
+/// base `[alerts].custom_channel`), defaulting to `false` when unset — matching
+/// `AlertConfig::default().custom_channel`.
+///
+/// Env parsing mirrors the runtime's `parse_env_bool`: `true`/`1` enable,
+/// `false`/`0` disable, and any other value is ignored (falls through to the TOML
+/// layers). Split out from [`resolve_alert_custom_channel`] so the precedence is
+/// unit-testable without mutating process-global env/cwd state.
+fn resolve_alert_custom_channel_from_sources<F>(
+    env_var: F,
+    table: Option<&toml::Table>,
+    profile: &str,
+) -> bool
+where
+    F: Fn(&str) -> Option<String>,
+{
+    // 1. Env var — highest priority, mirroring runtime `parse_env_bool`. An
+    //    invalid value (not true/false/1/0) is ignored and falls through.
+    if let Some(val) = env_var("AUTUMN_ALERTS__CUSTOM_CHANNEL") {
+        match val.as_str() {
+            "true" | "1" => return true,
+            "false" | "0" => return false,
+            _ => {}
+        }
+    }
+    // 2. Profile-specific `[profile.{profile}.alerts].custom_channel`.
+    if !profile.is_empty()
+        && let Some(v) = table
+            .and_then(|t| t.get("profile"))
+            .and_then(|v| v.get(profile))
+            .and_then(toml::Value::as_table)
+            .and_then(|p| p.get("alerts"))
+            .and_then(toml::Value::as_table)
+            .and_then(|a| a.get("custom_channel"))
+            .and_then(toml::Value::as_bool)
+    {
+        return v;
+    }
+    // 3. Base `[alerts].custom_channel`.
+    if let Some(v) = table
+        .and_then(|t| t.get("alerts"))
+        .and_then(toml::Value::as_table)
+        .and_then(|a| a.get("custom_channel"))
+        .and_then(toml::Value::as_bool)
+    {
+        return v;
+    }
+    // 4. Unset everywhere → false (mirrors `AlertConfig::default()`).
+    false
+}
+
+/// Resolve the RAW effective `[alerts] error_rate_threshold` (empty when unset)
+/// against the same fully-merged config the runtime boots with, mirroring
+/// [`resolve_alert_enabled`]'s profile selection and merged-table build.
+///
+/// The raw string (not a parsed number) is surfaced so
+/// [`check_alert_error_rate_threshold_impl`] can both validate its range and name
+/// a bad value in its warning. Env vars still take highest precedence.
+fn resolve_alert_error_rate_threshold() -> String {
+    let selected_input = std::env::var("AUTUMN_ENV")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .or_else(|| {
+            std::env::var("AUTUMN_PROFILE")
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+        })
+        .unwrap_or_default()
+        .trim()
+        .to_owned();
+    let normalized_profile = normalize_alert_profile(&selected_input);
+    // The merge flattens the active profile into the top-level `[alerts]`, so
+    // resolve against an EMPTY profile (mirroring `resolve_alert_enabled`).
+    let merged = get_merged_toml_table_runtime(&normalized_profile, &selected_input);
+    resolve_alert_error_rate_threshold_from_sources(
+        |key| std::env::var(key).ok(),
+        Some(&merged),
+        "",
+    )
+}
+
+/// Resolve the RAW `[alerts] error_rate_threshold` under the same layer precedence
+/// the runtime config merge applies (env `AUTUMN_ALERTS__ERROR_RATE_THRESHOLD` >
+/// `[profile.{profile}.alerts].error_rate_threshold` > base
+/// `[alerts].error_rate_threshold`), returning an empty string when unset — the
+/// runtime then uses the default `0.05`.
+///
+/// The value is a TOML float in config files but a string via the env var, so it
+/// is stringified regardless of its TOML scalar type (float/integer/string).
+/// The highest-priority PRESENT layer wins; a present env var is terminal (even
+/// empty, an explicit clear). Split out from [`resolve_alert_error_rate_threshold`]
+/// so the precedence is unit-testable without mutating process-global env/cwd state.
+fn resolve_alert_error_rate_threshold_from_sources<F>(
+    env_var: F,
+    table: Option<&toml::Table>,
+    profile: &str,
+) -> String
+where
+    F: Fn(&str) -> Option<String>,
+{
+    // Stringify a TOML scalar so a float (`0.05`), an integer (`1`), or a string
+    // value all resolve to a comparable raw representation.
+    let stringify = |v: &toml::Value| -> Option<String> {
+        match v {
+            toml::Value::Float(f) => Some(f.to_string()),
+            toml::Value::Integer(i) => Some(i.to_string()),
+            toml::Value::String(s) => Some(s.clone()),
+            _ => None,
+        }
+    };
+    // 1. Env var — highest priority. Present (even empty) is terminal.
+    if let Some(val) = env_var("AUTUMN_ALERTS__ERROR_RATE_THRESHOLD") {
+        return val;
+    }
+    // 2. Profile-specific `[profile.{profile}.alerts].error_rate_threshold`.
+    if !profile.is_empty()
+        && let Some(v) = table
+            .and_then(|t| t.get("profile"))
+            .and_then(|v| v.get(profile))
+            .and_then(toml::Value::as_table)
+            .and_then(|p| p.get("alerts"))
+            .and_then(toml::Value::as_table)
+            .and_then(|a| a.get("error_rate_threshold"))
+            .and_then(&stringify)
+    {
+        return v;
+    }
+    // 3. Base `[alerts].error_rate_threshold`.
+    if let Some(v) = table
+        .and_then(|t| t.get("alerts"))
+        .and_then(toml::Value::as_table)
+        .and_then(|a| a.get("error_rate_threshold"))
+        .and_then(stringify)
+    {
+        return v;
+    }
+    // 4. Unset everywhere → empty (runtime uses the default 0.05).
+    String::new()
+}
+
 /// Resolve whether the active profile is production from the environment or
 /// `autumn.toml`.
 fn resolve_is_production() -> bool {
@@ -2628,6 +3628,10 @@ pub fn run(opts: DoctorOptions) {
     let rate_limit_key_strategy = resolve_rate_limit_key_strategy();
     let auth_extractor_mounted = resolve_auth_extractor_mounted();
     let compression_enabled = resolve_compression_enabled();
+    let (alert_email, alert_webhook_configured, alert_webhook_url) = resolve_alert_destination();
+    let alerts_enabled = resolve_alert_enabled();
+    let alert_custom_channel = resolve_alert_custom_channel();
+    let alert_error_rate_threshold = resolve_alert_error_rate_threshold();
     let proxy_conflict_data = resolve_proxy_conflict_data();
     let (dotenv_has_example, dotenv_has_env, dotenv_uncovered) = resolve_dotenv_state();
 
@@ -2834,6 +3838,44 @@ pub fn run(opts: DoctorOptions) {
     // 12. Compression (warn in production when disabled)
     tasks.push(Box::new(move || {
         check_compression_impl(compression_enabled, is_production)
+    }));
+
+    // 12a. Operator alerts (warn in production when no destination configured).
+    //      Gate the email destination on a usable mail transport, reusing the
+    //      SAME `mail_transport_disabled` the mail-unsubscribe check resolved
+    //      from the merged config above (a `Copy` bool, still readable after it
+    //      was moved into the mail closure). This mirrors runtime
+    //      `mailer.is_disabled()`: an email with a disabled transport installs
+    //      no alert channel, so it must not count toward a valid destination.
+    let mail_transport_usable = !mail_transport_disabled;
+    // Also gate the email destination on a resolved, VALID `[mail] from` for
+    // transports that require one (SMTP): the runtime's alert mail sets no
+    // per-message `from`, so an SMTP email with no `[mail] from` — or a
+    // present-but-unparsable one, which aborts boot in `MailerBuilder::build` —
+    // fails to deliver. Pass the effective value (empty when unset) so the check
+    // can both gate on validity and name a bad value. Reuse the SAME merged config
+    // / effective transport the mail checks above resolved.
+    let mail_from = resolve_mail_from(Some(&merged_mail_toml)).unwrap_or_default();
+    let transport_requires_from = mail_transport_requires_from(&effective_transport);
+    tasks.push(Box::new(move || {
+        check_alert_destination_impl(
+            alerts_enabled,
+            &alert_email,
+            alert_webhook_configured,
+            &alert_webhook_url,
+            mail_transport_usable,
+            is_production,
+            &mail_from,
+            transport_requires_from,
+            alert_custom_channel,
+        )
+    }));
+
+    // 12a2. `[alerts] error_rate_threshold` sanity: a non-finite or out-of-(0,1]
+    //       value silently breaks the 5xx alert (the runtime falls back to the
+    //       default). Warn in production so the operator fixes the config.
+    tasks.push(Box::new(move || {
+        check_alert_error_rate_threshold_impl(&alert_error_rate_threshold, is_production)
     }));
 
     // 12b. Local-dev `.env` handling (warn on `.env.example` without `.env`,
@@ -4128,6 +5170,85 @@ pub struct Vault {
     }
 
     #[test]
+    fn is_absolute_http_url_doctor_matches_runtime_absoluteness() {
+        // Runtime (`http_client::Client::build_request`) treats a URL as absolute
+        // iff it starts with `http://` or `https://`. Accept BOTH schemes — the
+        // runtime does not require TLS for a webhook, so neither may doctor
+        // (rejecting `http://` would be a false-positive warning).
+        assert!(is_absolute_http_url_doctor(
+            "https://alerts.example.com/hooks"
+        ));
+        assert!(is_absolute_http_url_doctor(
+            "http://alerts.example.com/hooks"
+        ));
+        // A query string / userinfo / non-standard port is fine: the runtime posts
+        // the URL verbatim, so doctor must not reject what delivers (unlike the
+        // stricter https-base-url validator).
+        assert!(is_absolute_http_url_doctor(
+            "https://user@h.example.com/x?a=1"
+        ));
+        assert!(is_absolute_http_url_doctor("http://h.example.com:8080/x"));
+        // Relative values never carry the scheme prefix runtime requires, and an
+        // alert webhook has no base-url alias to resolve them against.
+        assert!(!is_absolute_http_url_doctor("hooks.example/x"));
+        assert!(!is_absolute_http_url_doctor("/hooks/autumn"));
+        assert!(!is_absolute_http_url_doctor("alerts.example.com"));
+        assert!(!is_absolute_http_url_doctor(""));
+        // Non-http(s) schemes are not dispatched by the client as absolute here.
+        assert!(!is_absolute_http_url_doctor("ftp://h.example.com/x"));
+        assert!(!is_absolute_http_url_doctor("ws://h.example.com/x"));
+        // Carries the prefix but has no host reqwest can send to.
+        assert!(!is_absolute_http_url_doctor("https://"));
+        assert!(!is_absolute_http_url_doctor("http://"));
+    }
+
+    #[test]
+    fn is_valid_alert_mailbox_matches_lettre_and_accepts_display_name() {
+        // Bare recipient mailboxes are accepted (this is what lettre parses at
+        // send time for `[alerts] email`).
+        assert!(is_valid_alert_mailbox_doctor("oncall@example.com"));
+        assert!(is_valid_alert_mailbox_doctor("a+b@sub.example.co"));
+        // RFC 5322 display-name form is ACCEPTED — the runtime's lettre parser
+        // accepts it and registers + delivers to it fine, so doctor must not
+        // reject it (the regression this fix addresses: a false `--strict`
+        // failure on a valid config).
+        assert!(is_valid_alert_mailbox_doctor("Ops <ops@example.com>"));
+        // The `mailto:` URI form is REJECTED (unlike the unsubscribe-mailto
+        // validator): the runtime passes it verbatim to lettre, which rejects it
+        // as a recipient. Doctor must not pass a config that can't deliver.
+        assert!(!is_valid_alert_mailbox_doctor("mailto:oncall@example.com"));
+        // Other scheme/URI forms and malformed values stay rejected.
+        assert!(!is_valid_alert_mailbox_doctor("https://oncall@example.com"));
+        assert!(!is_valid_alert_mailbox_doctor("not-an-address"));
+        assert!(!is_valid_alert_mailbox_doctor("oncall example.com"));
+        assert!(!is_valid_alert_mailbox_doctor(""));
+
+        // Exact parity with the runtime: doctor's check must agree with the very
+        // parser `autumn/src/alerts.rs`'s `is_valid_alert_mailbox` runs, for every
+        // case above. This is what keeps doctor from being stricter (or looser)
+        // than the SMTP send path.
+        for case in [
+            "oncall@example.com",
+            "a+b@sub.example.co",
+            "Ops <ops@example.com>",
+            "mailto:oncall@example.com",
+            "https://oncall@example.com",
+            "not-an-address",
+            "oncall example.com",
+            "",
+        ] {
+            let runtime_ok = case
+                .parse::<autumn_web::reexports::lettre::message::Mailbox>()
+                .is_ok();
+            assert_eq!(
+                is_valid_alert_mailbox_doctor(case),
+                runtime_ok,
+                "doctor and the runtime lettre parser must agree on {case:?}"
+            );
+        }
+    }
+
+    #[test]
     fn mail_unsubscribe_usage_with_both_url_and_mailto_warns_in_prod() {
         // base_url presence drives the suppression-backend warning even when a
         // mailto fallback is also configured.
@@ -4341,6 +5462,1438 @@ pub struct Vault {
         let result = check_trusted_hosts_impl(&["example.com".to_owned(), "*".to_owned()], true);
         assert_eq!(result.name, "trusted_hosts");
         assert!(matches!(result.status, CheckStatus::Warn));
+    }
+
+    // ── check_alert_destination_impl (issue #1610) ───────────────────────────
+
+    #[test]
+    fn alert_destination_warns_in_production_when_none() {
+        let r = check_alert_destination_impl(
+            true,
+            "",
+            false,
+            "",
+            true,
+            true,
+            "noreply@example.com",
+            true,
+            false,
+        );
+        assert_eq!(r.name, "alert_destination");
+        assert!(matches!(r.status, CheckStatus::Warn));
+        assert!(r.hint.is_some());
+    }
+
+    #[test]
+    fn alert_destination_passes_in_production_with_email() {
+        let r = check_alert_destination_impl(
+            true,
+            "ops@example.com",
+            false,
+            "",
+            true,
+            true,
+            "noreply@example.com",
+            true,
+            false,
+        );
+        assert!(matches!(r.status, CheckStatus::Pass));
+    }
+
+    #[test]
+    fn alert_destination_passes_in_production_with_webhook() {
+        let r = check_alert_destination_impl(
+            true,
+            "",
+            true,
+            "",
+            true,
+            true,
+            "noreply@example.com",
+            true,
+            false,
+        );
+        assert!(matches!(r.status, CheckStatus::Pass));
+    }
+
+    #[test]
+    fn alert_destination_passes_in_dev_without_destination() {
+        let r = check_alert_destination_impl(
+            true,
+            "",
+            false,
+            "",
+            true,
+            false,
+            "noreply@example.com",
+            true,
+            false,
+        );
+        assert!(matches!(r.status, CheckStatus::Pass));
+    }
+
+    // ── email destination requires a usable mail transport (issue #1610) ──────
+    // Runtime `alerts::install_from_config` skips `MailAlertChannel` when
+    // `mailer.is_disabled()` (the disabled transport, which is the default
+    // outside dev), so doctor must not count an email against a disabled
+    // transport. These wire `resolve_effective_mail_transport` (the exact helper
+    // the doctor mail check uses) to the destination check, mirroring `run()`.
+
+    #[test]
+    fn alert_destination_email_only_with_disabled_transport_warns_in_prod() {
+        // `[alerts] email` is set, but there is no `[mail] transport` — in a prod
+        // profile that resolves to the `disabled` default, so the runtime installs
+        // NO email alert channel. Doctor must NOT count the email and must warn.
+        let table: toml::Table = toml::from_str("[alerts]\nemail = \"ops@example.com\"\n").unwrap();
+        let (email, webhook) = resolve_alert_destination_from_sources(no_env, Some(&table), "prod");
+        assert!(email, "the [alerts] email itself resolves as present");
+        assert!(!webhook);
+        // No env override, no `[mail] transport`, prod profile → "disabled".
+        let transport = resolve_effective_mail_transport(None, None, "prod");
+        assert_eq!(transport, "disabled");
+        let usable = transport != "disabled";
+        let r = check_alert_destination_impl(
+            true,
+            "ops@example.com",
+            webhook,
+            "",
+            usable,
+            true,
+            "noreply@example.com",
+            true,
+            false,
+        );
+        assert!(
+            matches!(r.status, CheckStatus::Warn),
+            "email with a disabled mail transport delivers nothing → must warn in prod"
+        );
+        assert!(
+            r.detail
+                .as_deref()
+                .is_some_and(|d| d.contains("transport is disabled")),
+            "the dedicated warning must name the disabled transport as the cause"
+        );
+    }
+
+    #[test]
+    fn alert_destination_email_with_usable_transport_passes_in_prod() {
+        // Same email, but `[mail] transport = "smtp"` (a real, usable backend) →
+        // the runtime installs the channel, so doctor counts the email and passes.
+        let table: toml::Table = toml::from_str("[alerts]\nemail = \"ops@example.com\"\n").unwrap();
+        let (email, webhook) = resolve_alert_destination_from_sources(no_env, Some(&table), "prod");
+        assert!(email, "the [alerts] email resolves as present");
+        let transport = resolve_effective_mail_transport(None, Some("smtp"), "prod");
+        assert_eq!(transport, "smtp");
+        // SMTP requires a `from`; this happy path has one set, so it still passes.
+        let requires_from = mail_transport_requires_from(&transport);
+        let r = check_alert_destination_impl(
+            true,
+            "ops@example.com",
+            webhook,
+            "",
+            transport != "disabled",
+            true,
+            "noreply@example.com",
+            requires_from,
+            false,
+        );
+        assert!(
+            matches!(r.status, CheckStatus::Pass),
+            "email with a usable (smtp) transport is a valid destination in prod"
+        );
+    }
+
+    #[test]
+    fn mail_transport_requires_from_only_for_smtp() {
+        // Only SMTP builds an RFC 5322 message (`lettre_message`), which errors
+        // without a `from`. `log`/`file` render `from` only when present and
+        // deliver without it; `disabled` delivers nothing at all.
+        assert!(mail_transport_requires_from("smtp"));
+        assert!(!mail_transport_requires_from("log"));
+        assert!(!mail_transport_requires_from("file"));
+        assert!(!mail_transport_requires_from("disabled"));
+    }
+
+    // ── email destination requires a mail `from` for SMTP (issue #1610) ───────
+    // The runtime's `MailAlertChannel` builds alert mail with NO per-message
+    // `from`, so it falls back to the mailer default (`[mail] from`). Under
+    // `transport = "smtp"` with no `[mail] from`, delivery fails in
+    // autumn-web's `lettre_message` with "mail from address is required". Doctor
+    // mirrors this: an SMTP email with no `from` is not a working destination.
+    // `log`/`file` deliver without a `from`, so they must NOT be over-gated.
+
+    #[test]
+    fn alert_destination_email_smtp_with_from_passes_in_prod() {
+        // (a) email + smtp + a `[mail] from` set → the runtime installs a channel
+        // that can send, so doctor counts the email and passes in prod.
+        let transport = resolve_effective_mail_transport(None, Some("smtp"), "prod");
+        assert_eq!(transport, "smtp");
+        let requires_from = mail_transport_requires_from(&transport);
+        assert!(requires_from, "smtp must be flagged as requiring a from");
+        let mail_from = "noreply@example.com";
+        let r = check_alert_destination_impl(
+            true,
+            "ops@example.com",
+            false,
+            "",
+            transport != "disabled",
+            true,
+            mail_from,
+            requires_from,
+            false,
+        );
+        assert!(
+            matches!(r.status, CheckStatus::Pass),
+            "email + smtp + [mail] from is a valid destination in prod"
+        );
+    }
+
+    #[test]
+    fn alert_destination_email_smtp_without_from_warns_in_prod() {
+        // (b) email + smtp + NO `[mail] from` → SMTP delivery fails with "mail
+        // from address is required", so doctor must NOT count the email and must
+        // warn with the dedicated `from` message (distinct from the
+        // disabled-transport and no-destination warnings).
+        let transport = resolve_effective_mail_transport(None, Some("smtp"), "prod");
+        let requires_from = mail_transport_requires_from(&transport);
+        let mail_from = "";
+        let r = check_alert_destination_impl(
+            true,
+            "ops@example.com",
+            false,
+            "",
+            transport != "disabled",
+            true,
+            mail_from,
+            requires_from,
+            false,
+        );
+        assert!(
+            matches!(r.status, CheckStatus::Warn),
+            "email on smtp with no [mail] from delivers nothing → must warn in prod"
+        );
+        assert!(
+            r.detail
+                .as_deref()
+                .is_some_and(|d| d.contains("`[mail] from` is not set")),
+            "the dedicated warning must name the missing [mail] from as the cause"
+        );
+    }
+
+    #[test]
+    fn alert_destination_email_log_transport_without_from_still_passes() {
+        // (c) email + `log` transport + NO `[mail] from` → the log transport
+        // renders `from` only when present and delivers without it, so a missing
+        // `from` must NOT down-grade the destination. Do not over-gate.
+        let transport = resolve_effective_mail_transport(None, Some("log"), "prod");
+        assert_eq!(transport, "log");
+        let requires_from = mail_transport_requires_from(&transport);
+        assert!(
+            !requires_from,
+            "log must NOT be flagged as requiring a from"
+        );
+        let mail_from = "";
+        let r = check_alert_destination_impl(
+            true,
+            "ops@example.com",
+            false,
+            "",
+            transport != "disabled",
+            true,
+            mail_from,
+            requires_from,
+            false,
+        );
+        assert!(
+            matches!(r.status, CheckStatus::Pass),
+            "email on a log transport delivers without a from → must not warn"
+        );
+    }
+
+    // ── invalid `[mail] from` for SMTP (issue #1610 follow-up) ────────────────
+    // A present-but-unparsable `[mail] from` on an SMTP transport makes the
+    // runtime ABORT boot (`MailerBuilder::build` runs `parse_mailbox`), and the
+    // alert mail — which carries no per-message `from` — has no valid default to
+    // fall back to. Doctor must catch this PRE-deploy: NOT count the email and
+    // surface a dedicated warning naming the value, distinct from the
+    // missing-`from` case. Valid display-name senders must NOT be over-rejected,
+    // and non-SMTP transports (which never parse `from`) stay lenient.
+
+    #[test]
+    fn alert_destination_email_smtp_with_invalid_from_warns_in_prod() {
+        let transport = resolve_effective_mail_transport(None, Some("smtp"), "prod");
+        let requires_from = mail_transport_requires_from(&transport);
+        assert!(requires_from, "smtp must require a from");
+        let r = check_alert_destination_impl(
+            true,
+            "ops@example.com",
+            false,
+            "",
+            transport != "disabled",
+            true,
+            "not-a-mailbox",
+            requires_from,
+            false,
+        );
+        assert!(
+            matches!(r.status, CheckStatus::Warn),
+            "smtp with an unparsable [mail] from delivers nothing → must warn in prod"
+        );
+        let detail = r.detail.unwrap_or_default();
+        assert!(
+            detail.contains("`[mail] from`")
+                && detail.contains("not a valid email address")
+                && detail.contains("not-a-mailbox"),
+            "the dedicated invalid-from warning must fire and name the value, got: {detail}"
+        );
+    }
+
+    #[test]
+    fn alert_destination_email_smtp_with_display_name_from_passes_in_prod() {
+        // A valid RFC 5322 display-name `from` (`Ops <ops@example.com>`) is what
+        // the runtime's `parse_mailbox` accepts, so doctor must accept it too and
+        // still count the email destination — no over-rejection.
+        let transport = resolve_effective_mail_transport(None, Some("smtp"), "prod");
+        let requires_from = mail_transport_requires_from(&transport);
+        let r = check_alert_destination_impl(
+            true,
+            "ops@example.com",
+            false,
+            "",
+            transport != "disabled",
+            true,
+            "Ops <ops@example.com>",
+            requires_from,
+            false,
+        );
+        assert!(
+            matches!(r.status, CheckStatus::Pass),
+            "a valid display-name [mail] from is a working sender → must not warn"
+        );
+    }
+
+    #[test]
+    fn alert_destination_email_smtp_with_invalid_from_is_lenient_in_dev() {
+        // Dev-mode leniency mirrors the rest of the check: an invalid `[mail] from`
+        // is not a hard problem locally, so it must NOT warn outside production.
+        let transport = resolve_effective_mail_transport(None, Some("smtp"), "prod");
+        let requires_from = mail_transport_requires_from(&transport);
+        let r = check_alert_destination_impl(
+            true,
+            "ops@example.com",
+            false,
+            "",
+            transport != "disabled",
+            false, // dev
+            "not-a-mailbox",
+            requires_from,
+            false,
+        );
+        assert!(
+            matches!(r.status, CheckStatus::Pass),
+            "dev-mode leniency: an invalid [mail] from must not warn outside production"
+        );
+    }
+
+    #[test]
+    fn alert_destination_email_log_transport_with_invalid_from_still_passes() {
+        // A `log` transport never parses `[mail] from`, so even a garbage value
+        // must NOT down-grade the destination. Do not over-gate non-SMTP
+        // transports (parity with the runtime, which requires a from only for smtp).
+        let transport = resolve_effective_mail_transport(None, Some("log"), "prod");
+        assert_eq!(transport, "log");
+        let requires_from = mail_transport_requires_from(&transport);
+        assert!(!requires_from, "log must NOT require a from");
+        let r = check_alert_destination_impl(
+            true,
+            "ops@example.com",
+            false,
+            "",
+            transport != "disabled",
+            true,
+            "not-a-mailbox",
+            requires_from,
+            false,
+        );
+        assert!(
+            matches!(r.status, CheckStatus::Pass),
+            "log transport ignores [mail] from → an invalid value must not warn"
+        );
+    }
+
+    // ── invalid `[alerts] email` (issue #1610 follow-up) ──────────────────────
+    // lettre parses the recipient only at SEND time (`lettre_message`), not when
+    // the alert `Mail` is built, so a present-but-unparsable address passes every
+    // earlier gate yet fails EVERY delivery at runtime with
+    // `MailError::InvalidAddress`. Doctor must count such an email as no usable
+    // destination and surface a dedicated warning naming the bad value.
+
+    #[test]
+    fn alert_destination_invalid_email_warns_in_prod() {
+        // A non-empty but syntactically invalid address on an otherwise-usable
+        // SMTP transport with a `[mail] from` set: without this gate doctor would
+        // PASS, yet every runtime send fails with an invalid-address error.
+        let r = check_alert_destination_impl(
+            true,
+            "not-an-address",
+            false,
+            "",
+            true,                  // usable transport
+            true,                  // production
+            "noreply@example.com", // [mail] from present
+            true,                  // smtp requires from
+            false,                 // custom_channel
+        );
+        assert!(
+            matches!(r.status, CheckStatus::Warn),
+            "an invalid alert email delivers nothing at runtime → must warn in prod"
+        );
+        assert!(
+            r.detail
+                .as_deref()
+                .is_some_and(|d| d.contains("not a valid email address")),
+            "the dedicated warning must name the invalid address as the cause"
+        );
+        assert!(
+            r.detail
+                .as_deref()
+                .is_some_and(|d| d.contains("not-an-address")),
+            "the warning should echo the offending value"
+        );
+    }
+
+    #[test]
+    fn alert_destination_invalid_email_is_lenient_in_dev() {
+        // Dev-mode leniency mirrors the rest of the check: an invalid email is not
+        // a hard problem locally, so it must NOT warn outside production.
+        let r = check_alert_destination_impl(
+            true,
+            "not-an-address",
+            false,
+            "",
+            true,
+            false, // dev
+            "noreply@example.com",
+            true,
+            false,
+        );
+        assert!(
+            matches!(r.status, CheckStatus::Pass),
+            "dev-mode leniency: an invalid alert email must not warn outside production"
+        );
+    }
+
+    #[test]
+    fn alert_destination_valid_plus_addressing_passes_in_prod() {
+        // A perfectly valid address using `+` sub-addressing and a multi-label
+        // domain must NOT be rejected — the validity check must not over-reject.
+        let r = check_alert_destination_impl(
+            true,
+            "a+b@sub.example.co",
+            false,
+            "",
+            true,
+            true,
+            "noreply@example.com",
+            true,
+            false,
+        );
+        assert!(
+            matches!(r.status, CheckStatus::Pass),
+            "a valid `+`-addressed, multi-label-domain email is a working destination"
+        );
+    }
+
+    #[test]
+    fn alert_destination_mailto_uri_email_warns_in_prod() {
+        // `[alerts] email = "mailto:oncall@example.com"` is handed verbatim to
+        // lettre, which rejects the `mailto:` URI as a bare recipient — so every
+        // send fails at runtime. A prior fix used the unsubscribe-mailto validator
+        // (which strips `mailto:` and returned true), letting doctor PASS a config
+        // that can never deliver. The bare-mailbox check must reject it and surface
+        // the dedicated invalid-email warning.
+        let r = check_alert_destination_impl(
+            true,
+            "mailto:oncall@example.com",
+            false,
+            "",
+            true,                  // usable transport
+            true,                  // production
+            "noreply@example.com", // [mail] from present
+            true,                  // smtp requires from
+            false,                 // custom_channel
+        );
+        assert!(
+            matches!(r.status, CheckStatus::Warn),
+            "a mailto: URI alert email delivers nothing at runtime → must warn in prod"
+        );
+        assert!(
+            r.detail
+                .as_deref()
+                .is_some_and(|d| d.contains("not a valid email address")),
+            "the dedicated invalid-email warning must fire for the mailto: URI form"
+        );
+        assert!(
+            r.detail
+                .as_deref()
+                .is_some_and(|d| d.contains("mailto:oncall@example.com")),
+            "the warning should echo the offending value"
+        );
+    }
+
+    #[test]
+    fn alert_destination_invalid_email_not_a_destination_when_alerts_disabled() {
+        // With alerting disabled, an invalid email is not a (real) destination, so
+        // the disabled-switch warning must NOT claim a destination is configured.
+        let r = check_alert_destination_impl(
+            false, // alerting disabled
+            "not-an-address",
+            false,
+            "",
+            true,
+            true,
+            "noreply@example.com",
+            true,
+            false,
+        );
+        assert!(matches!(r.status, CheckStatus::Warn));
+        assert!(
+            r.detail
+                .as_deref()
+                .is_some_and(|d| d.contains("alerting is disabled")
+                    && !d.contains("even though a destination is configured")),
+            "an invalid email must not be counted as a configured destination"
+        );
+    }
+
+    #[test]
+    fn alert_destination_webhook_survives_disabled_transport() {
+        // The prod profile clears the email, but a signed webhook is present. The
+        // webhook path is independent of the mailer, so a disabled mail transport
+        // must not down-grade an otherwise-valid webhook destination.
+        let table: toml::Table = toml::from_str(
+            "[alerts]\nemail = \"ops@example.com\"\nwebhook_url = \"https://hooks.example/x\"\nwebhook_secret = \"s3cr3t\"\n[profile.prod.alerts]\nemail = \"\"\n",
+        )
+        .unwrap();
+        let (email, webhook) = resolve_alert_destination_from_sources(no_env, Some(&table), "prod");
+        assert!(!email, "the prod profile cleared the email");
+        assert!(webhook, "the signed webhook remains configured");
+        // Mail transport disabled — irrelevant to the webhook path.
+        let r = check_alert_destination_impl(
+            true,
+            "",
+            webhook,
+            "",
+            false,
+            true,
+            "noreply@example.com",
+            true,
+            false,
+        );
+        assert!(
+            matches!(r.status, CheckStatus::Pass),
+            "a signed webhook is a valid destination regardless of mail transport"
+        );
+    }
+
+    // ── resolve_alert_destination_from_sources precedence (issue #1610) ───────
+
+    fn no_env(_: &str) -> Option<String> {
+        None
+    }
+
+    #[test]
+    fn resolve_alert_destination_base_email_is_detected() {
+        let table: toml::Table = toml::from_str("[alerts]\nemail = \"dev@example.com\"\n").unwrap();
+        let (email, webhook) = resolve_alert_destination_from_sources(no_env, Some(&table), "prod");
+        assert!(email, "base [alerts] email should resolve as configured");
+        assert!(!webhook);
+    }
+
+    #[test]
+    fn resolve_alert_destination_prod_profile_clears_base_email() {
+        // Base sets an email; the prod profile explicitly clears it with an empty
+        // string. A production run must resolve to "no destination" so doctor warns.
+        let table: toml::Table = toml::from_str(
+            "[alerts]\nemail = \"dev@example.com\"\n[profile.prod.alerts]\nemail = \"\"\n",
+        )
+        .unwrap();
+        let (email, _webhook) =
+            resolve_alert_destination_from_sources(no_env, Some(&table), "prod");
+        assert!(
+            !email,
+            "an empty prod-profile override must CLEAR the base email, not OR it back in"
+        );
+
+        // And the surfaced doctor check warns in production for this config.
+        let r = check_alert_destination_impl(
+            true,
+            "",
+            false,
+            "",
+            true,
+            true,
+            "noreply@example.com",
+            true,
+            false,
+        );
+        assert!(matches!(r.status, CheckStatus::Warn));
+    }
+
+    #[test]
+    fn resolve_alert_destination_dev_profile_does_not_clear_base_for_prod_run() {
+        // A dev-profile override must not affect a prod run: only the active
+        // profile's layer participates.
+        let table: toml::Table = toml::from_str(
+            "[alerts]\nemail = \"dev@example.com\"\n[profile.dev.alerts]\nemail = \"\"\n",
+        )
+        .unwrap();
+        let (email, _webhook) =
+            resolve_alert_destination_from_sources(no_env, Some(&table), "prod");
+        assert!(email, "dev-profile clear must not affect a prod run");
+    }
+
+    #[test]
+    fn resolve_alert_destination_empty_env_clears_base_email() {
+        // An explicitly-empty AUTUMN_ALERTS__EMAIL is the highest-priority layer
+        // and must CLEAR a base value; an unset webhook var falls through to base.
+        // The base carries BOTH a webhook_url and a webhook_secret so the webhook
+        // is a real (signed) destination.
+        let table: toml::Table = toml::from_str(
+            "[alerts]\nemail = \"dev@example.com\"\nwebhook_url = \"https://hooks.example/x\"\nwebhook_secret = \"s3cr3t\"\n",
+        )
+        .unwrap();
+        let env = |key: &str| (key == "AUTUMN_ALERTS__EMAIL").then(String::new);
+        let (email, webhook) = resolve_alert_destination_from_sources(env, Some(&table), "prod");
+        assert!(
+            !email,
+            "empty AUTUMN_ALERTS__EMAIL must clear the base email"
+        );
+        assert!(webhook, "unset webhook env should fall through to base");
+    }
+
+    #[test]
+    fn resolve_alert_destination_nonempty_env_wins_over_absent_toml() {
+        // Env supplies both the webhook URL and its signing secret, so the webhook
+        // resolves as a real signed destination with no TOML present.
+        let env = |key: &str| match key {
+            "AUTUMN_ALERTS__WEBHOOK_URL" => Some("https://hooks.example/y".to_owned()),
+            "AUTUMN_ALERTS__WEBHOOK_SECRET" => Some("s3cr3t".to_owned()),
+            _ => None,
+        };
+        let (email, webhook) = resolve_alert_destination_from_sources(env, None, "prod");
+        assert!(!email);
+        assert!(
+            webhook,
+            "env webhook should resolve as configured with no TOML"
+        );
+    }
+
+    #[test]
+    fn resolve_alert_destination_webhook_requires_secret() {
+        // (a) URL + secret both set at base → webhook is a real destination and a
+        // production run passes.
+        let table: toml::Table = toml::from_str(
+            "[alerts]\nwebhook_url = \"https://hooks.example/x\"\nwebhook_secret = \"s3cr3t\"\n",
+        )
+        .unwrap();
+        let (email, webhook) = resolve_alert_destination_from_sources(no_env, Some(&table), "prod");
+        assert!(!email);
+        assert!(
+            webhook,
+            "webhook_url + webhook_secret must count as configured"
+        );
+        let r = check_alert_destination_impl(
+            true,
+            "",
+            webhook,
+            "",
+            true,
+            true,
+            "noreply@example.com",
+            true,
+            false,
+        );
+        assert!(matches!(r.status, CheckStatus::Pass));
+    }
+
+    #[test]
+    fn resolve_alert_destination_webhook_url_without_secret_is_not_configured() {
+        // (b) URL set but secret MISSING → runtime installs no (unsigned) channel,
+        // so doctor must NOT count it and must warn in production.
+        let table: toml::Table =
+            toml::from_str("[alerts]\nwebhook_url = \"https://hooks.example/x\"\n").unwrap();
+        let (email, webhook) = resolve_alert_destination_from_sources(no_env, Some(&table), "prod");
+        assert!(!email);
+        assert!(
+            !webhook,
+            "a webhook_url with no signing secret is not a destination"
+        );
+        let r = check_alert_destination_impl(
+            true,
+            "",
+            webhook,
+            "",
+            true,
+            true,
+            "noreply@example.com",
+            true,
+            false,
+        );
+        assert!(
+            matches!(r.status, CheckStatus::Warn),
+            "URL-without-secret in production must warn"
+        );
+    }
+
+    #[test]
+    fn resolve_alert_destination_prod_profile_clears_webhook_secret() {
+        // (c) URL + secret set at base, but the prod profile CLEARS the secret with
+        // an empty string → the higher (profile) layer wins, so the webhook is not
+        // a signed destination and doctor warns in production.
+        let table: toml::Table = toml::from_str(
+            "[alerts]\nwebhook_url = \"https://hooks.example/x\"\nwebhook_secret = \"s3cr3t\"\n[profile.prod.alerts]\nwebhook_secret = \"\"\n",
+        )
+        .unwrap();
+        let (email, webhook) = resolve_alert_destination_from_sources(no_env, Some(&table), "prod");
+        assert!(!email);
+        assert!(
+            !webhook,
+            "a prod-profile empty webhook_secret must clear the base secret"
+        );
+        let r = check_alert_destination_impl(
+            true,
+            "",
+            webhook,
+            "",
+            true,
+            true,
+            "noreply@example.com",
+            true,
+            false,
+        );
+        assert!(matches!(r.status, CheckStatus::Warn));
+
+        // And an empty AUTUMN_ALERTS__WEBHOOK_SECRET env var clears it just the same.
+        let env = |key: &str| (key == "AUTUMN_ALERTS__WEBHOOK_SECRET").then(String::new);
+        let (_email, webhook_env) =
+            resolve_alert_destination_from_sources(env, Some(&table), "prod");
+        assert!(
+            !webhook_env,
+            "an empty AUTUMN_ALERTS__WEBHOOK_SECRET must clear the secret"
+        );
+    }
+
+    #[test]
+    fn resolve_alert_destination_absolute_webhook_url_with_secret_passes() {
+        // An absolute https URL + secret is a real destination: the runtime's HTTP
+        // client dispatches it and the signed POST is deliverable → prod passes.
+        let table: toml::Table = toml::from_str(
+            "[alerts]\nwebhook_url = \"https://hooks.example/x\"\nwebhook_secret = \"s3cr3t\"\n",
+        )
+        .unwrap();
+        let (email, webhook) = resolve_alert_destination_from_sources(no_env, Some(&table), "prod");
+        assert!(!email);
+        assert!(webhook, "absolute https webhook_url + secret is configured");
+        let r = check_alert_destination_impl(
+            true,
+            "",
+            webhook,
+            "https://hooks.example/x",
+            true,
+            true,
+            "noreply@example.com",
+            true,
+            false,
+        );
+        assert!(matches!(r.status, CheckStatus::Pass));
+    }
+
+    #[test]
+    fn resolve_alert_destination_absolute_http_webhook_url_with_secret_passes() {
+        // Runtime treats `http://…` as absolute too (it does not require TLS), so
+        // doctor must accept it — rejecting it would be a false-positive warning.
+        let table: toml::Table = toml::from_str(
+            "[alerts]\nwebhook_url = \"http://hooks.example/x\"\nwebhook_secret = \"s3cr3t\"\n",
+        )
+        .unwrap();
+        let (_email, webhook) =
+            resolve_alert_destination_from_sources(no_env, Some(&table), "prod");
+        assert!(
+            webhook,
+            "an absolute http:// webhook_url + secret must count, matching runtime"
+        );
+        let r = check_alert_destination_impl(
+            true,
+            "",
+            webhook,
+            "http://hooks.example/x",
+            true,
+            true,
+            "noreply@example.com",
+            true,
+            false,
+        );
+        assert!(matches!(r.status, CheckStatus::Pass));
+    }
+
+    #[test]
+    fn resolve_alert_destination_relative_webhook_url_is_not_configured_and_warns() {
+        // A relative `webhook_url` (no scheme) + secret: the runtime's HTTP client
+        // only dispatches URLs starting with http(s)://, and an alert webhook has
+        // no base-url alias to resolve a relative value against, so EVERY signed
+        // POST fails. doctor must NOT count it and must emit its DEDICATED warning
+        // naming the value in production — not the generic "no destination" one.
+        let table: toml::Table = toml::from_str(
+            "[alerts]\nwebhook_url = \"hooks.example/x\"\nwebhook_secret = \"s3cr3t\"\n",
+        )
+        .unwrap();
+        let (email, webhook) = resolve_alert_destination_from_sources(no_env, Some(&table), "prod");
+        assert!(!email);
+        assert!(
+            !webhook,
+            "a relative webhook_url is not an absolute http(s) URL, so it is not a destination"
+        );
+        let r = check_alert_destination_impl(
+            true,
+            "",
+            webhook,
+            "hooks.example/x",
+            true,
+            true,
+            "noreply@example.com",
+            true,
+            false,
+        );
+        assert!(
+            matches!(r.status, CheckStatus::Warn),
+            "a relative webhook_url in production must warn"
+        );
+        let detail = r.detail.unwrap_or_default();
+        assert!(
+            detail.contains("not an absolute http(s) URL") && detail.contains("hooks.example/x"),
+            "the warning must name the offending value and its cause, got: {detail}"
+        );
+    }
+
+    #[test]
+    fn alert_destination_relative_webhook_url_is_lenient_in_dev() {
+        // Outside production the check stays lenient — a malformed webhook URL is
+        // not fatal locally, so it passes quietly like the rest of this check.
+        let r = check_alert_destination_impl(
+            true,
+            "",
+            false,
+            "hooks.example/x",
+            true,
+            false, // dev
+            "noreply@example.com",
+            true,
+            false,
+        );
+        assert!(matches!(r.status, CheckStatus::Pass));
+    }
+
+    // ── merged-config view (issue #1610) ──────────────────────────────────────
+    // The wrapper now resolves against the fully-merged effective config the
+    // runtime boots with — base `autumn.toml` layered with `[profile.{name}]` and
+    // the `autumn-{profile}.toml` override file, alias-normalized — reading the
+    // flattened top-level `[alerts]` with an EMPTY profile. These tests build the
+    // merged table with the same `deep_merge` the runtime loader uses (the doctor
+    // bin deliberately avoids process-global cwd mutation, so the file merge is
+    // exercised through its merge primitive rather than real on-disk files).
+
+    #[test]
+    fn normalize_alert_profile_resolves_aliases() {
+        // Mirrors `autumn_web::config::normalize_profile_name`'s alias table so
+        // doctor merges the same profile sources the app will boot with.
+        assert_eq!(normalize_alert_profile("production"), "prod");
+        assert_eq!(normalize_alert_profile("PRODUCTION"), "prod");
+        assert_eq!(normalize_alert_profile("  prod "), "prod");
+        assert_eq!(normalize_alert_profile("development"), "dev");
+        assert_eq!(normalize_alert_profile("DEV"), "dev");
+        // Custom profiles keep their operator-specified spelling; blank stays blank.
+        assert_eq!(normalize_alert_profile("staging"), "staging");
+        assert_eq!(normalize_alert_profile(""), "");
+        assert_eq!(normalize_alert_profile("   "), "");
+    }
+
+    #[test]
+    fn resolve_alert_destination_merged_override_file_clears_base_email() {
+        // Base `autumn.toml` sets the only alert channel; an `autumn-prod.toml`
+        // override file CLEARS it with an empty string. `deep_merge` flattens the
+        // override over the base into the top-level `[alerts]`, exactly as
+        // `get_merged_toml_table_runtime` produces. Resolving against this flattened
+        // view with an EMPTY profile must see NO destination → doctor warns in prod.
+        let mut merged: toml::Table =
+            toml::from_str("[alerts]\nemail = \"dev@example.com\"\n").unwrap();
+        let override_file: toml::Table = toml::from_str("[alerts]\nemail = \"\"\n").unwrap();
+        deep_merge(&mut merged, &override_file);
+
+        let (email, _webhook) = resolve_alert_destination_from_sources(no_env, Some(&merged), "");
+        assert!(
+            !email,
+            "an autumn-prod.toml that clears [alerts].email must resolve as no destination"
+        );
+        let r = check_alert_destination_impl(
+            true,
+            "",
+            false,
+            "",
+            true,
+            true,
+            "noreply@example.com",
+            true,
+            false,
+        );
+        assert!(
+            matches!(r.status, CheckStatus::Warn),
+            "a production deploy whose override file cleared the only alert channel must WARN"
+        );
+    }
+
+    #[test]
+    fn resolve_alert_destination_merged_ignores_stale_profile_section() {
+        // The merged table still carries the ORIGINAL raw `[profile.prod.alerts]`
+        // (the base is deep-merged wholesale), but the override file already
+        // flattened the effective value onto the top-level `[alerts]`. Resolving
+        // with an EMPTY profile must read the flattened top-level, NOT the stale
+        // `[profile.prod.alerts]` — otherwise a non-empty stale section would
+        // spuriously mask a file-cleared destination and re-open the #1610 hole.
+        let mut merged: toml::Table = toml::from_str(
+            "[alerts]\nemail = \"dev@example.com\"\n[profile.prod.alerts]\nemail = \"ops@example.com\"\n",
+        )
+        .unwrap();
+        // autumn-prod.toml clears email; deep_merge flattens it onto top-level [alerts].
+        let override_file: toml::Table = toml::from_str("[alerts]\nemail = \"\"\n").unwrap();
+        deep_merge(&mut merged, &override_file);
+
+        let (email, _webhook) = resolve_alert_destination_from_sources(no_env, Some(&merged), "");
+        assert!(
+            !email,
+            "the flattened top-level [alerts] wins; a stale [profile.prod.alerts] must not mask a cleared destination"
+        );
+    }
+
+    #[test]
+    fn resolve_alert_destination_merged_base_email_survives_without_override() {
+        // No override / profile clear: the base email flows through the merged view
+        // and a production run passes.
+        let merged: toml::Table =
+            toml::from_str("[alerts]\nemail = \"ops@example.com\"\n").unwrap();
+        let (email, webhook) = resolve_alert_destination_from_sources(no_env, Some(&merged), "");
+        assert!(email);
+        assert!(!webhook);
+        let r = check_alert_destination_impl(
+            true,
+            "ops@example.com",
+            webhook,
+            "",
+            true,
+            true,
+            "noreply@example.com",
+            true,
+            false,
+        );
+        assert!(matches!(r.status, CheckStatus::Pass));
+    }
+
+    #[test]
+    fn resolve_alert_destination_merged_webhook_requires_both_url_and_secret() {
+        // Base configures a signed webhook (url + secret); the override file clears
+        // the SECRET. Through the flattened merged view the webhook is no longer a
+        // signed destination, so doctor must not count it and must warn in prod.
+        let mut merged: toml::Table = toml::from_str(
+            "[alerts]\nwebhook_url = \"https://hooks.example/x\"\nwebhook_secret = \"s3cr3t\"\n",
+        )
+        .unwrap();
+        let override_file: toml::Table =
+            toml::from_str("[alerts]\nwebhook_secret = \"\"\n").unwrap();
+        deep_merge(&mut merged, &override_file);
+
+        let (email, webhook) = resolve_alert_destination_from_sources(no_env, Some(&merged), "");
+        assert!(!email);
+        assert!(
+            !webhook,
+            "a webhook whose secret was cleared by the override file is not a signed destination"
+        );
+        let r = check_alert_destination_impl(
+            true,
+            "",
+            webhook,
+            "",
+            true,
+            true,
+            "noreply@example.com",
+            true,
+            false,
+        );
+        assert!(matches!(r.status, CheckStatus::Warn));
+
+        // With both left intact through the merged view, the webhook still counts.
+        let intact: toml::Table = toml::from_str(
+            "[alerts]\nwebhook_url = \"https://hooks.example/x\"\nwebhook_secret = \"s3cr3t\"\n",
+        )
+        .unwrap();
+        let (_e, webhook_ok) = resolve_alert_destination_from_sources(no_env, Some(&intact), "");
+        assert!(
+            webhook_ok,
+            "url + secret through the merged view is a signed destination"
+        );
+    }
+
+    // ── [alerts] enabled master switch (issue #1610 follow-up) ────────────────
+    // The runtime `alerts::install_from_config` returns BEFORE installing any
+    // Alerter when `config.enabled` is false, so a prod deploy with alerting
+    // disabled delivers nothing even with a destination configured. Doctor must
+    // honour the same master switch (env > profile > base > default `true`).
+
+    #[test]
+    fn resolve_alert_enabled_defaults_true_when_unset() {
+        // No `enabled` key anywhere → the runtime default (`true`) applies.
+        let table: toml::Table = toml::from_str("[alerts]\nemail = \"ops@example.com\"\n").unwrap();
+        let enabled = resolve_alert_enabled_from_sources(no_env, Some(&table), "prod");
+        assert!(enabled);
+        // Nothing configured at all still defaults to enabled.
+        assert!(resolve_alert_enabled_from_sources(no_env, None, "prod"));
+    }
+
+    #[test]
+    fn resolve_alert_enabled_base_false_is_detected() {
+        let table: toml::Table =
+            toml::from_str("[alerts]\nenabled = false\nemail = \"ops@example.com\"\n").unwrap();
+        let enabled = resolve_alert_enabled_from_sources(no_env, Some(&table), "prod");
+        assert!(!enabled);
+    }
+
+    #[test]
+    fn resolve_alert_enabled_env_true_overrides_base_false() {
+        // Env parsing mirrors runtime `parse_env_bool`: "true"/"1" enable.
+        let env = |k: &str| (k == "AUTUMN_ALERTS__ENABLED").then(|| "true".to_owned());
+        let table: toml::Table = toml::from_str("[alerts]\nenabled = false\n").unwrap();
+        let enabled = resolve_alert_enabled_from_sources(env, Some(&table), "prod");
+        assert!(enabled);
+        let env1 = |k: &str| (k == "AUTUMN_ALERTS__ENABLED").then(|| "1".to_owned());
+        let enabled_one = resolve_alert_enabled_from_sources(env1, Some(&table), "prod");
+        assert!(enabled_one);
+    }
+
+    #[test]
+    fn resolve_alert_enabled_invalid_env_falls_through_to_toml() {
+        // A non-boolean env value is ignored (mirrors runtime), so the base
+        // `enabled = false` still wins.
+        let env = |k: &str| (k == "AUTUMN_ALERTS__ENABLED").then(|| "yes".to_owned());
+        let table: toml::Table = toml::from_str("[alerts]\nenabled = false\n").unwrap();
+        let enabled = resolve_alert_enabled_from_sources(env, Some(&table), "prod");
+        assert!(!enabled);
+    }
+
+    #[test]
+    fn resolve_alert_enabled_profile_false_overrides_base_true() {
+        // A profile-specific `enabled = false` disables under that profile while
+        // the base (empty-profile resolution) stays enabled.
+        let table: toml::Table = toml::from_str(
+            "[alerts]\nemail = \"ops@example.com\"\n[profile.prod.alerts]\nenabled = false\n",
+        )
+        .unwrap();
+        let under_profile = resolve_alert_enabled_from_sources(no_env, Some(&table), "prod");
+        assert!(!under_profile);
+        let under_base = resolve_alert_enabled_from_sources(no_env, Some(&table), "");
+        assert!(under_base);
+    }
+
+    #[test]
+    fn alert_disabled_at_base_in_prod_with_email_warns() {
+        // (a) `[alerts] enabled = false` at base, email set, production run → warn.
+        let table: toml::Table =
+            toml::from_str("[alerts]\nenabled = false\nemail = \"ops@example.com\"\n").unwrap();
+        let enabled = resolve_alert_enabled_from_sources(no_env, Some(&table), "prod");
+        let (email, webhook) = resolve_alert_destination_from_sources(no_env, Some(&table), "prod");
+        assert!(!enabled);
+        assert!(email, "the email itself is still configured");
+        let r = check_alert_destination_impl(
+            enabled,
+            "ops@example.com",
+            webhook,
+            "",
+            true,
+            true,
+            "noreply@example.com",
+            true,
+            false,
+        );
+        assert!(
+            matches!(r.status, CheckStatus::Warn),
+            "disabled alerting with a configured destination must warn in prod"
+        );
+        assert!(
+            r.detail.as_deref().is_some_and(|d| d.contains("disabled")),
+            "the warning must name the disabled master switch"
+        );
+    }
+
+    #[test]
+    fn alert_disabled_via_env_in_prod_warns() {
+        // (b) `AUTUMN_ALERTS__ENABLED=false` env override in production → warn,
+        // even though the base leaves alerting enabled with an email set.
+        let env = |k: &str| (k == "AUTUMN_ALERTS__ENABLED").then(|| "false".to_owned());
+        let table: toml::Table = toml::from_str("[alerts]\nemail = \"ops@example.com\"\n").unwrap();
+        let enabled = resolve_alert_enabled_from_sources(env, Some(&table), "prod");
+        let (_email, webhook) =
+            resolve_alert_destination_from_sources(no_env, Some(&table), "prod");
+        assert!(!enabled);
+        let r = check_alert_destination_impl(
+            enabled,
+            "ops@example.com",
+            webhook,
+            "",
+            true,
+            true,
+            "noreply@example.com",
+            true,
+            false,
+        );
+        assert!(matches!(r.status, CheckStatus::Warn));
+    }
+
+    #[test]
+    fn alert_enabled_default_true_preserves_existing_prod_pass() {
+        // (c) `enabled` unset → defaults true; a configured email + usable
+        // transport in prod still passes exactly as before this change.
+        let table: toml::Table = toml::from_str("[alerts]\nemail = \"ops@example.com\"\n").unwrap();
+        let enabled = resolve_alert_enabled_from_sources(no_env, Some(&table), "prod");
+        let (_email, webhook) =
+            resolve_alert_destination_from_sources(no_env, Some(&table), "prod");
+        assert!(enabled);
+        let r = check_alert_destination_impl(
+            enabled,
+            "ops@example.com",
+            webhook,
+            "",
+            true,
+            true,
+            "noreply@example.com",
+            true,
+            false,
+        );
+        assert!(matches!(r.status, CheckStatus::Pass));
+    }
+
+    #[test]
+    fn alert_disabled_in_dev_does_not_warn() {
+        // (d) Disabled in DEV stays lenient (no warning) like the rest of the check.
+        let table: toml::Table =
+            toml::from_str("[alerts]\nenabled = false\nemail = \"ops@example.com\"\n").unwrap();
+        let enabled = resolve_alert_enabled_from_sources(no_env, Some(&table), "dev");
+        let (_email, webhook) = resolve_alert_destination_from_sources(no_env, Some(&table), "dev");
+        assert!(!enabled);
+        let r = check_alert_destination_impl(
+            enabled,
+            "ops@example.com",
+            webhook,
+            "",
+            true,
+            false,
+            "noreply@example.com",
+            true,
+            false,
+        );
+        assert!(
+            matches!(r.status, CheckStatus::Pass),
+            "dev-mode leniency: disabled alerting must not warn outside production"
+        );
+    }
+
+    // ── [alerts] custom_channel declaration (issue #1610 follow-up) ───────────
+    // An app that delivers alerts ONLY via `AppBuilder::with_alert_channel`
+    // (code, not config) still triggered doctor's no-destination Warn, which
+    // `--strict` turns into exit 1. `[alerts] custom_channel = true` lets the
+    // operator DECLARE the code-registered channel so the pure no-destination
+    // fall-through passes — while a *broken configured* destination still warns.
+
+    #[test]
+    fn alert_destination_custom_channel_passes_in_prod_without_destination() {
+        // custom_channel = true + no email/webhook in prod → PASS (not Warn), so
+        // `autumn doctor --strict` succeeds for a code-only alert setup.
+        let r = check_alert_destination_impl(
+            true,
+            "",
+            false,
+            "",
+            true,
+            true,
+            "noreply@example.com",
+            true,
+            /* custom_channel */ true,
+        );
+        assert!(
+            matches!(r.status, CheckStatus::Pass),
+            "custom_channel = true declares a code-registered channel → no-destination must pass"
+        );
+        assert!(
+            r.detail
+                .as_deref()
+                .is_some_and(|d| d.contains("custom_channel")),
+            "the pass detail should name the custom_channel declaration"
+        );
+    }
+
+    #[test]
+    fn alert_destination_without_custom_channel_still_warns_in_prod() {
+        // custom_channel = false (default) + no destination in prod → still Warn,
+        // preserving the pre-existing behavior; the warning now points at the flag.
+        let r = check_alert_destination_impl(
+            true,
+            "",
+            false,
+            "",
+            true,
+            true,
+            "noreply@example.com",
+            true,
+            /* custom_channel */ false,
+        );
+        assert!(matches!(r.status, CheckStatus::Warn));
+        assert!(
+            r.detail
+                .as_deref()
+                .is_some_and(|d| d.contains("custom_channel")),
+            "the no-destination warning should mention the custom_channel escape hatch"
+        );
+    }
+
+    #[test]
+    fn alert_destination_custom_channel_does_not_mask_broken_webhook() {
+        // custom_channel = true but a CONFIGURED webhook_url is relative/invalid →
+        // STILL warns about the broken value. custom_channel only suppresses the
+        // pure "no destination configured" fall-through, never a misconfigured one.
+        let r = check_alert_destination_impl(
+            true,
+            "",
+            false, // relative URL is not a usable webhook, so webhook_configured is false
+            "not-a-url/hooks", // present but non-absolute → dedicated invalid warning
+            true,
+            true,
+            "noreply@example.com",
+            true,
+            /* custom_channel */ true,
+        );
+        assert!(
+            matches!(r.status, CheckStatus::Warn),
+            "a broken configured webhook_url must still warn even with custom_channel = true"
+        );
+        assert!(
+            r.detail
+                .as_deref()
+                .is_some_and(|d| d.contains("not an absolute")),
+            "the broken-webhook warning must fire, not the custom_channel pass"
+        );
+    }
+
+    #[test]
+    fn resolve_alert_custom_channel_defaults_false_when_unset() {
+        let table: toml::Table = toml::from_str("[alerts]\nemail = \"ops@example.com\"\n").unwrap();
+        assert!(!resolve_alert_custom_channel_from_sources(
+            no_env,
+            Some(&table),
+            "prod"
+        ));
+        assert!(!resolve_alert_custom_channel_from_sources(
+            no_env, None, "prod"
+        ));
+    }
+
+    #[test]
+    fn resolve_alert_custom_channel_base_true_is_detected() {
+        let table: toml::Table = toml::from_str("[alerts]\ncustom_channel = true\n").unwrap();
+        assert!(resolve_alert_custom_channel_from_sources(
+            no_env,
+            Some(&table),
+            "prod"
+        ));
+    }
+
+    #[test]
+    fn resolve_alert_custom_channel_env_true_overrides_base_false() {
+        let table: toml::Table = toml::from_str("[alerts]\ncustom_channel = false\n").unwrap();
+        let env = |k: &str| (k == "AUTUMN_ALERTS__CUSTOM_CHANNEL").then(|| "true".to_owned());
+        assert!(resolve_alert_custom_channel_from_sources(
+            env,
+            Some(&table),
+            "prod"
+        ));
+        let env1 = |k: &str| (k == "AUTUMN_ALERTS__CUSTOM_CHANNEL").then(|| "1".to_owned());
+        assert!(resolve_alert_custom_channel_from_sources(
+            env1,
+            Some(&table),
+            "prod"
+        ));
+    }
+
+    #[test]
+    fn resolve_alert_custom_channel_env_resolves_and_passes() {
+        // End-to-end at the resolver + check boundary: env sets the flag true, and
+        // with no configured destination in prod the check passes.
+        let table: toml::Table = toml::from_str("[alerts]\nemail = \"ops@example.com\"\n").unwrap();
+        let env = |k: &str| (k == "AUTUMN_ALERTS__CUSTOM_CHANNEL").then(|| "true".to_owned());
+        let custom = resolve_alert_custom_channel_from_sources(env, Some(&table), "prod");
+        assert!(
+            custom,
+            "AUTUMN_ALERTS__CUSTOM_CHANNEL=true must resolve true"
+        );
+        let r = check_alert_destination_impl(
+            true,
+            "",
+            false,
+            "",
+            true,
+            true,
+            "noreply@example.com",
+            true,
+            custom,
+        );
+        assert!(matches!(r.status, CheckStatus::Pass));
+    }
+
+    #[test]
+    fn resolve_alert_custom_channel_profile_true_overrides_base_false() {
+        let table: toml::Table = toml::from_str(
+            "[alerts]\ncustom_channel = false\n[profile.prod.alerts]\ncustom_channel = true\n",
+        )
+        .unwrap();
+        assert!(resolve_alert_custom_channel_from_sources(
+            no_env,
+            Some(&table),
+            "prod"
+        ));
+        assert!(!resolve_alert_custom_channel_from_sources(
+            no_env,
+            Some(&table),
+            ""
+        ));
+    }
+
+    // ── check_alert_error_rate_threshold_impl (issue #1610) ──────────────────
+    // The threshold is compared against a FRACTION in [0, 1] (rate = err/req), so
+    // only (0, 1] is meaningful. A non-finite value or one > 1 makes the 5xx alert
+    // never fire; a value <= 0 makes it fire on 0%-error windows. In production
+    // doctor warns; outside production it passes quietly (alerts are optional).
+
+    #[test]
+    fn alert_threshold_unset_passes() {
+        // No value set: the runtime uses the valid default (0.05).
+        let r = check_alert_error_rate_threshold_impl("", true);
+        assert!(matches!(r.status, CheckStatus::Pass));
+        let r = check_alert_error_rate_threshold_impl("   ", true);
+        assert!(matches!(r.status, CheckStatus::Pass));
+    }
+
+    #[test]
+    fn alert_threshold_valid_in_range_passes() {
+        for v in ["0.05", "0.2", "1", "1.0", "0.001"] {
+            let r = check_alert_error_rate_threshold_impl(v, true);
+            assert!(
+                matches!(r.status, CheckStatus::Pass),
+                "{v} is a valid (0, 1] rate and must pass"
+            );
+        }
+    }
+
+    #[test]
+    fn alert_threshold_nan_warns_in_prod() {
+        let r = check_alert_error_rate_threshold_impl("nan", true);
+        assert!(matches!(r.status, CheckStatus::Warn));
+        assert!(
+            r.detail.as_deref().is_some_and(|d| d.contains("nan")),
+            "the warning must name the offending value"
+        );
+        assert!(r.hint.is_some());
+    }
+
+    #[test]
+    fn alert_threshold_out_of_range_warns_in_prod() {
+        // > 1: the alert can never fire. <= 0: it fires on 0%-error windows.
+        for v in ["1.5", "0", "-0.1", "inf"] {
+            let r = check_alert_error_rate_threshold_impl(v, true);
+            assert!(
+                matches!(r.status, CheckStatus::Warn),
+                "{v} is out of (0, 1] and must warn in production"
+            );
+        }
+    }
+
+    #[test]
+    fn alert_threshold_unparsable_warns_in_prod() {
+        let r = check_alert_error_rate_threshold_impl("high", true);
+        assert!(matches!(r.status, CheckStatus::Warn));
+    }
+
+    #[test]
+    fn alert_threshold_invalid_is_lenient_outside_prod() {
+        // Dev leniency, consistent with the other alert checks: still pass.
+        for v in ["nan", "1.5", "0", "-0.1"] {
+            let r = check_alert_error_rate_threshold_impl(v, false);
+            assert!(
+                matches!(r.status, CheckStatus::Pass),
+                "{v} must pass quietly outside production"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_alert_error_rate_threshold_reads_base_float() {
+        let table: toml::Table = toml::from_str("[alerts]\nerror_rate_threshold = 0.2\n").unwrap();
+        let raw = resolve_alert_error_rate_threshold_from_sources(no_env, Some(&table), "prod");
+        assert_eq!(raw, "0.2");
+        let r = check_alert_error_rate_threshold_impl(&raw, true);
+        assert!(matches!(r.status, CheckStatus::Pass));
+    }
+
+    #[test]
+    fn resolve_alert_error_rate_threshold_out_of_range_float_warns() {
+        // A present, out-of-range float resolves and the check warns in prod.
+        let table: toml::Table = toml::from_str("[alerts]\nerror_rate_threshold = 1.5\n").unwrap();
+        let raw = resolve_alert_error_rate_threshold_from_sources(no_env, Some(&table), "prod");
+        assert_eq!(raw, "1.5");
+        let r = check_alert_error_rate_threshold_impl(&raw, true);
+        assert!(matches!(r.status, CheckStatus::Warn));
+    }
+
+    #[test]
+    fn resolve_alert_error_rate_threshold_env_overrides_base() {
+        // A present env var (even a bad one) wins over the base TOML.
+        let table: toml::Table = toml::from_str("[alerts]\nerror_rate_threshold = 0.05\n").unwrap();
+        let env = |k: &str| (k == "AUTUMN_ALERTS__ERROR_RATE_THRESHOLD").then(|| "nan".to_owned());
+        let raw = resolve_alert_error_rate_threshold_from_sources(env, Some(&table), "prod");
+        assert_eq!(raw, "nan");
+        assert!(matches!(
+            check_alert_error_rate_threshold_impl(&raw, true).status,
+            CheckStatus::Warn
+        ));
+    }
+
+    #[test]
+    fn resolve_alert_error_rate_threshold_profile_overrides_base() {
+        let table: toml::Table = toml::from_str(
+            "[alerts]\nerror_rate_threshold = 0.05\n[profile.prod.alerts]\nerror_rate_threshold = 2.0\n",
+        )
+        .unwrap();
+        let under_profile =
+            resolve_alert_error_rate_threshold_from_sources(no_env, Some(&table), "prod");
+        assert_eq!(under_profile, "2");
+        let under_base = resolve_alert_error_rate_threshold_from_sources(no_env, Some(&table), "");
+        assert_eq!(under_base, "0.05");
+    }
+
+    #[test]
+    fn resolve_alert_error_rate_threshold_unset_is_empty() {
+        let table: toml::Table = toml::from_str("[alerts]\nemail = \"ops@example.com\"\n").unwrap();
+        let raw = resolve_alert_error_rate_threshold_from_sources(no_env, Some(&table), "prod");
+        assert_eq!(raw, "");
+        assert!(matches!(
+            check_alert_error_rate_threshold_impl(&raw, true).status,
+            CheckStatus::Pass
+        ));
     }
 
     // ── compute_summary ──────────────────────────────────────────────────────

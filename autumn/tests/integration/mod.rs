@@ -1,6 +1,7 @@
 mod access_log;
 mod acting_as_integration;
 mod after_commit_integration;
+mod alerts;
 mod api_versioning_integration;
 #[cfg(feature = "openapi")]
 mod api_versioning_openapi;
