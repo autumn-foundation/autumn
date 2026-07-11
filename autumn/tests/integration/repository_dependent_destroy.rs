@@ -375,6 +375,45 @@ pub struct DepNode {
 )]
 pub trait DepNodeRepository {}
 
+// ── #1740: a HOOKED parent that also declares a dependent ─────────────────────
+//
+// All the dependent-declaring parents above are hook-free, so they exercise the
+// no-hooks `delete_many` codegen branch. This one has `hooks = ...` AND a
+// dependent, so it monomorphizes the HOOKS-path bulk-cascade branch (#1740) —
+// otherwise that branch would never be type-checked. Used only by the codegen
+// surface test (no Docker graph test), so it reuses an existing child repo.
+
+#[derive(Clone, Default)]
+pub struct DepHookedPostHooks;
+
+impl MutationHooks for DepHookedPostHooks {
+    type Model = DepHookedPost;
+    type NewModel = NewDepHookedPost;
+    type UpdateModel = UpdateDepHookedPost;
+}
+
+diesel::table! {
+    dep_hooked_posts (id) {
+        id -> Int8,
+        title -> Text,
+    }
+}
+
+#[autumn_web::model(table = "dep_hooked_posts")]
+pub struct DepHookedPost {
+    #[id]
+    pub id: i64,
+    pub title: String,
+}
+
+#[autumn_web::repository(
+    DepHookedPost,
+    table = "dep_hooked_posts",
+    hooks = DepHookedPostHooks,
+    dependent(PgDepCommentRepository, fk = "post_id", on_delete = destroy)
+)]
+pub trait DepHookedPostRepository {}
+
 // ── Row-count helpers ─────────────────────────────────────────────────────────
 
 #[derive(diesel::QueryableByName)]
@@ -462,6 +501,14 @@ fn dependent_repository_surface_is_generated() {
     assert_is_fn(PgDep3ReplyRepository::__autumn_apply_dependent_on_conn);
     assert_is_fn(<PgDepNodeRepository as DepNodeRepository>::delete_by_id);
     assert_is_fn(PgDepNodeRepository::__autumn_apply_dependent_on_conn);
+    // #1740: the bulk `delete_many` path now carries the dependent cascade too;
+    // monomorphize it (hooks-child parent + restrict-only parent) to prove the
+    // bulk-cascade codegen type-checks without Docker.
+    assert_is_fn(<PgDepPostRepository as DepPostRepository>::delete_many);
+    assert_is_fn(<PgDepPostRestrictOnlyRepository as DepPostRestrictOnlyRepository>::delete_many);
+    // Hooks-path bulk cascade branch (#1740): a hooked parent with a dependent.
+    assert_is_fn(<PgDepHookedPostRepository as DepHookedPostRepository>::delete_many);
+    assert_is_fn(<PgDepHookedPostRepository as DepHookedPostRepository>::delete_by_id);
 }
 
 // ── Tests (require Docker) ────────────────────────────────────────────────────
@@ -555,6 +602,126 @@ async fn deleting_parent_cascades_and_leaves_no_orphans() {
     // AC4: each destroyed comment fired its before_delete hook.
     // (UFCS: `RunQueryDsl` is in scope, so disambiguate from diesel's `.load`.)
     assert_eq!(AtomicUsize::load(&DESTROYED_COMMENTS, Ordering::SeqCst), 3);
+}
+
+/// #1740: `delete_many` on parents with `dependent(...)` runs the SAME cascade
+/// as `delete_by_id` — `destroy`/`delete_all`/`nullify` per child association —
+/// for every parent, in one transaction, leaving no orphaned or FK-dangling rows.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn delete_many_cascades_dependents() {
+    let (pool, _c) = setup_pool().await;
+    let mut conn = pool.get().await.expect("conn");
+
+    // Two parents, each with a comment (destroy), a vote (delete_all) and a
+    // bookmark (nullify).
+    for p in 1..=2 {
+        diesel::sql_query(format!(
+            "INSERT INTO dep_posts (id, title) VALUES ({p}, 'p{p}')"
+        ))
+        .execute(&mut conn)
+        .await
+        .unwrap();
+        diesel::sql_query(format!(
+            "INSERT INTO dep_comments (id, post_id, body) VALUES ({p}, {p}, 'c{p}')"
+        ))
+        .execute(&mut conn)
+        .await
+        .unwrap();
+        diesel::sql_query(format!(
+            "INSERT INTO dep_votes (id, post_id, value) VALUES ({p}, {p}, 1)"
+        ))
+        .execute(&mut conn)
+        .await
+        .unwrap();
+        diesel::sql_query(format!(
+            "INSERT INTO dep_bookmarks (id, post_id, label) VALUES ({p}, {p}, 'b{p}')"
+        ))
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    }
+
+    DESTROYED_COMMENTS.store(0, Ordering::SeqCst);
+
+    let repo = PgDepPostRepository::with_pool_untracked(pool.clone());
+    repo.delete_many(&[1, 2])
+        .await
+        .expect("bulk cascade delete must not FK-error");
+
+    assert_eq!(
+        count(&mut conn, "SELECT COUNT(*) AS n FROM dep_posts").await,
+        0,
+        "both parents deleted"
+    );
+    assert_eq!(
+        count(&mut conn, "SELECT COUNT(*) AS n FROM dep_comments").await,
+        0,
+        "#1740: destroy children cascaded on the bulk path"
+    );
+    assert_eq!(
+        count(&mut conn, "SELECT COUNT(*) AS n FROM dep_votes").await,
+        0,
+        "#1740: delete_all children cascaded on the bulk path"
+    );
+    assert_eq!(
+        count(
+            &mut conn,
+            "SELECT COUNT(*) AS n FROM dep_bookmarks WHERE post_id IS NOT NULL"
+        )
+        .await,
+        0,
+        "#1740: nullify children detached on the bulk path"
+    );
+    // Both destroy children fired their before_delete hook during the bulk cascade.
+    assert_eq!(AtomicUsize::load(&DESTROYED_COMMENTS, Ordering::SeqCst), 2);
+}
+
+/// #1740: a `restrict` dependent still blocks a bulk `delete_many` with a typed
+/// 409 and rolls the whole transaction back (no parent or child removed).
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn delete_many_restrict_blocks_and_rolls_back() {
+    let (pool, _c) = setup_pool().await;
+    let mut conn = pool.get().await.expect("conn");
+
+    diesel::sql_query("INSERT INTO dep_posts (id, title) VALUES (7, 'guarded'), (8, 'free')")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    // Only post 7 has a restrict child; the bulk delete of [7, 8] must still be
+    // blocked and rolled back wholesale (post 8 survives too).
+    diesel::sql_query("INSERT INTO dep_awards (id, post_id, name) VALUES (1, 7, 'gold')")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+
+    let repo = PgDepPostRestrictOnlyRepository::with_pool_untracked(pool.clone());
+    let err = repo
+        .delete_many(&[7, 8])
+        .await
+        .expect_err("restrict child must block the bulk delete");
+    assert_eq!(
+        err.status(),
+        autumn_web::reexports::http::StatusCode::CONFLICT,
+        "a blocking restrict must surface a 409 on the bulk path"
+    );
+
+    // Whole transaction rolled back: both parents and the child survive.
+    assert_eq!(
+        count(&mut conn, "SELECT COUNT(*) AS n FROM dep_posts").await,
+        2,
+        "both parents survive a blocked bulk delete"
+    );
+    assert_eq!(
+        count(
+            &mut conn,
+            "SELECT COUNT(*) AS n FROM dep_awards WHERE post_id = 7"
+        )
+        .await,
+        1,
+        "the restrict child survives"
+    );
 }
 
 /// #1739: deleting a `Dep3Post` with `dependent(Comment, destroy)` where

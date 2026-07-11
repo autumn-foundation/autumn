@@ -1618,6 +1618,157 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     };
 
+    // #1740: bulk `delete_many` dependent cascade. `delete_many` historically
+    // bypassed `dependent(...)` entirely (a plain bulk parent delete), silently
+    // orphaning children. These tokens splice the SAME cascade the single-record
+    // delete path runs into both `delete_many_body` codegen branches (hooks and
+    // no-hooks). The whole cascade is gated on `config.dependents` so a repo with
+    // no dependents keeps its exact prior bulk codegen (AC: bulk semantics
+    // preserved). Correctness over raw throughput: children are cascaded per
+    // parent row via the shared `__autumn_apply_dependent_on_conn` helper (so
+    // `destroy` recurses into grandchildren for free, #1739), which is the "per
+    // row" tradeoff called out in the issue.
+    let delete_many_has_deps = !config.dependents.is_empty();
+    // The parent's delete kind drives the child `destroy` cascade: soft when the
+    // parent repo is `#[soft_delete]` (its bulk path soft-deletes), hard otherwise.
+    let delete_many_parent_soft_lit = if config.soft_delete {
+        quote! { true }
+    } else {
+        quote! { false }
+    };
+    let emit_delete_many_cascade_call = |dep: &DependentSpec| {
+        let child_repo = &dep.child_repo;
+        let fk = &dep.fk;
+        let action_variant = dep.action.variant_ident();
+        quote! {
+            let __autumn_dep_repo = #child_repo::with_pool_untracked(
+                ::core::clone::Clone::clone(&self.pool)
+            );
+            __autumn_dep_broadcasts.extend(
+                __autumn_dep_repo
+                    .__autumn_apply_dependent_on_conn(
+                        conn,
+                        #fk,
+                        __autumn_pid,
+                        ::autumn_web::repository::DependentAction::#action_variant,
+                        #delete_many_parent_soft_lit,
+                        &mut __autumn_visited,
+                    )
+                    .await?
+            );
+        }
+    };
+    let delete_many_restrict_calls: ::std::vec::Vec<_> = config
+        .dependents
+        .iter()
+        .filter(|dep| dep.action == DependentAction::Restrict)
+        .map(&emit_delete_many_cascade_call)
+        .collect();
+    let delete_many_mutating_calls: ::std::vec::Vec<_> = config
+        .dependents
+        .iter()
+        .filter(|dep| dep.action != DependentAction::Restrict)
+        .map(&emit_delete_many_cascade_call)
+        .collect();
+    // The affected parents are (re)loaded, tenant- and live-filtered and
+    // row-locked, exactly as the single-record path locks its parent, so the
+    // cascade runs only for rows this call actually deletes (never for a
+    // wrong-tenant or already-soft-deleted id present in the input slice).
+    let delete_many_live_filter = if config.soft_delete {
+        quote! { .filter(#table_ident::deleted_at.is_null()) }
+    } else {
+        quote! {}
+    };
+    let delete_many_preload_chunk = if config.tenant_scoped {
+        quote! {
+            let __autumn_dep_q = #table_ident::table
+                .filter(#table_ident::id.eq_any(chunk))
+                #delete_many_live_filter;
+            let __autumn_dep_rows: ::std::vec::Vec<#model_name> =
+                if let ::core::option::Option::Some(t) = tenant_id {
+                    __autumn_dep_q.filter(#table_ident::tenant_id.eq(t)).for_update()
+                        .load::<#model_name>(conn).await
+                } else {
+                    __autumn_dep_q.for_update().load::<#model_name>(conn).await
+                }
+                .map_err(::autumn_web::AutumnError::from)?;
+        }
+    } else {
+        quote! {
+            let __autumn_dep_rows: ::std::vec::Vec<#model_name> =
+                #table_ident::table
+                    .filter(#table_ident::id.eq_any(chunk))
+                    #delete_many_live_filter
+                    .for_update()
+                    .load::<#model_name>(conn).await
+                    .map_err(::autumn_web::AutumnError::from)?;
+        }
+    };
+    // The cascade block, spliced inside the transaction BEFORE the bulk parent
+    // delete. Restrict probes for every parent run first (a 409 rolls the whole
+    // transaction back before any mutating action), then the mutating dependents.
+    let delete_many_cascade = if delete_many_has_deps {
+        quote! {
+            let mut __autumn_visited: ::std::collections::HashSet<(&'static str, i64)> =
+                ::std::collections::HashSet::new();
+            let mut __autumn_dep_broadcasts: ::std::vec::Vec<(::std::string::String, ::std::string::String)> =
+                ::std::vec::Vec::new();
+            let mut __autumn_dep_parent_ids: ::std::vec::Vec<i64> = ::std::vec::Vec::new();
+            for chunk in ids.chunks(1000) {
+                #delete_many_preload_chunk
+                __autumn_dep_parent_ids.extend(__autumn_dep_rows.iter().map(|__r| __r.id));
+            }
+            // Phase 1: probe all `restrict` dependents for every parent first.
+            for &__autumn_pid in &__autumn_dep_parent_ids {
+                __autumn_visited.insert((#table_name, __autumn_pid));
+                #(#delete_many_restrict_calls)*
+            }
+            // Phase 2: mutating dependents per parent, in declaration order.
+            for &__autumn_pid in &__autumn_dep_parent_ids {
+                #(#delete_many_mutating_calls)*
+            }
+        }
+    } else {
+        quote! {}
+    };
+    // When dependents exist the transaction returns the deferred child broadcasts
+    // so they can be published post-commit (a rolled-back cascade publishes
+    // nothing); otherwise it returns `()` exactly as before.
+    let delete_many_tx_bind = if delete_many_has_deps {
+        quote! { let __autumn_dep_broadcasts = }
+    } else {
+        quote! {}
+    };
+    let delete_many_tx_ok = if delete_many_has_deps {
+        quote! { Ok(__autumn_dep_broadcasts) }
+    } else {
+        quote! { Ok(()) }
+    };
+    let delete_many_post_publish = if delete_many_has_deps {
+        quote! {
+            ::autumn_web::repository::publish_deferred_dependent_broadcasts(__autumn_dep_broadcasts);
+            // A cascaded `destroy` child may have enqueued a commit hook in the
+            // same transaction; kick the durable dispatcher (idempotent).
+            ::autumn_web::__private::kick_repository_commit_hook_dispatcher(&self.pool);
+        }
+    } else {
+        quote! {}
+    };
+    // The no-hooks `delete_many` body ends with the transaction as its tail
+    // expression (`... .await`). With dependents it must instead await-and-bind,
+    // then publish the deferred broadcasts after commit; without dependents it
+    // keeps the exact prior `.await` tail (returning the transaction's Result).
+    let delete_many_no_hooks_tail = if delete_many_has_deps {
+        quote! {
+            ?;
+            ::core::mem::drop(conn);
+            #delete_many_post_publish
+            Ok(())
+        }
+    } else {
+        quote! {}
+    };
+
     // Parse derived query methods from trait body
     let mut derived_trait_methods = Vec::new();
     let mut derived_impl_methods = Vec::new();
@@ -6074,7 +6225,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 let mut conn = self.__autumn_acquire_conn().await?;
                 let __now = ::autumn_web::reexports::chrono::Utc::now().naive_utc();
 
-                ::autumn_web::__private::scoped_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
+                #delete_many_tx_bind ::autumn_web::__private::scoped_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                     async move {
                         let mut current_rows = Vec::new();
                         for chunk in ids.chunks(1000) {
@@ -6092,9 +6243,14 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             #delete_commit_hook_setup
                         }
 
+                        // #1740: cascade dependent actions for every parent BEFORE
+                        // the bulk parent delete, so no child is orphaned and the
+                        // parent delete never trips a foreign-key constraint.
+                        #delete_many_cascade
+
                         #delete_execution
 
-                        Ok(())
+                        #delete_many_tx_ok
                     }
                     .scope_boxed()
                 })
@@ -6102,6 +6258,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
                 ::core::mem::drop(conn);
                 #kick_dispatcher
+                #delete_many_post_publish
 
                 Ok(())
             }
@@ -7689,17 +7846,21 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 let mut conn = self.__autumn_acquire_conn().await?;
                 let __now = ::autumn_web::reexports::chrono::Utc::now().naive_utc();
 
-                ::autumn_web::__private::scoped_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
+                #delete_many_tx_bind ::autumn_web::__private::scoped_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                     async move {
+                        // #1740: cascade dependent actions for every parent BEFORE
+                        // the bulk parent delete (empty for repos with no
+                        // dependents, preserving the prior bulk codegen).
+                        #delete_many_cascade
                         #vh_delete_load_before
                         #delete_loop
                         #vh_delete_filter
                         #vh_delete_write
-                        Ok(())
+                        #delete_many_tx_ok
                     }
                     .scope_boxed()
                 })
-                .await
+                .await #delete_many_no_hooks_tail
             }
         };
 
@@ -11954,13 +12115,15 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         fn update_many(&self, ids: &[i64], changes: &#update_name) -> impl ::std::future::Future<Output = ::autumn_web::AutumnResult<Vec<#model_name>>> + Send;
         /// Bulk-delete the given ids in one statement.
         ///
-        /// NOTE (#1369 scope; see #1702): `dependent(...)` cascade actions are
-        /// NOT applied on this bulk path — AC2 scopes dependent actions to the
-        /// single-record `delete_by_id`/`destroy`. On a repository that declares
-        /// `dependent(...)`, `delete_many` issues a plain bulk parent
-        /// delete/soft-delete and does not cascade, so it can FK-fail or orphan
-        /// children. Callers who need the cascade must use `delete_by_id`. Bulk
-        /// cascade is a tracked follow-up.
+        /// #1740: `dependent(...)` cascade actions DO apply on this bulk path. On
+        /// a repository that declares `dependent(...)`, `delete_many` runs the same
+        /// destroy/delete_all/nullify/restrict cascade the single-record
+        /// `delete_by_id`/`destroy` runs — restrict probes first (a typed 409 rolls
+        /// the whole transaction back), then children, then the bulk parent delete,
+        /// all in one transaction — so no child is orphaned. Children are cascaded
+        /// per affected parent row (so `destroy` recurses into grandchildren,
+        /// #1739); set-based bulk child mutations are a possible future refinement.
+        /// Repositories with no dependents keep the plain bulk delete unchanged.
         fn delete_many(&self, ids: &[i64]) -> impl ::std::future::Future<Output = ::autumn_web::AutumnResult<()>> + Send;
         #upsert_many_trait_method
     };
