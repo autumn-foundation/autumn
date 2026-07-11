@@ -748,6 +748,19 @@ fn parse_field_constraints(body: &str, kind: FieldKind) -> Result<FieldConstrain
         }
     }
 
+    // `email` and `url` are mutually exclusive format validators: emitting both
+    // `#[validate(email)]` and `#[validate(url)]` makes the field unwritable (a
+    // valid email fails `url` and vice versa), and the HTML5 renderer can only
+    // pick one `type`. Reject the pair rather than silently choosing a winner,
+    // which would change the author's intent (issue #1388).
+    if c.email && c.url {
+        return Err(
+            "the `email` and `url` constraints are mutually exclusive — a value can't satisfy \
+             both; keep only one"
+                .to_owned(),
+        );
+    }
+
     // Cross-check the combination against the kind: length/range bounds need a
     // string or numeric field, and require min <= max when both are present.
     if (c.min.is_some() || c.max.is_some()) && !string_like && !numeric {
@@ -1743,6 +1756,20 @@ mod tests {
         let f = parse_field("homepage:String{url}").unwrap();
         assert!(f.constraints.url);
         assert_eq!(f.validation_attrs(), vec!["url"]);
+    }
+
+    #[test]
+    fn email_and_url_together_are_rejected() {
+        // Both format validators on one field make it unwritable (a valid email
+        // fails `url` and vice versa), so the pair is rejected at parse time
+        // rather than silently picking a winner.
+        let err = parse_field("contact:String{email,url}").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("mutually exclusive"),
+            "must explain the conflict: {msg}"
+        );
+        assert!(msg.contains("contact"), "must name the field: {msg}");
     }
 
     #[test]

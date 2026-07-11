@@ -370,6 +370,34 @@ fn out_of_range_i32_bound_fails_the_scaffold() {
 }
 
 #[test]
+fn email_and_url_together_fails_the_scaffold() {
+    // Emitting both `#[validate(email)]` and `#[validate(url)]` makes the field
+    // unwritable, so the mutually-exclusive pair is rejected up front with an
+    // actionable error naming the conflict and the field.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    run_autumn_ok(tmp.path(), &["new", "email-url-app"]);
+    let project = tmp.path().join("email-url-app");
+    let output = run_autumn(
+        &project,
+        &[
+            "generate",
+            "scaffold",
+            "Contact",
+            "contact:String{email,url}",
+        ],
+    );
+    assert!(
+        !output.status.success(),
+        "email + url on one field must fail the scaffold"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("mutually exclusive") && stderr.contains("contact"),
+        "the error must name the conflict and the field:\n{stderr}"
+    );
+}
+
+#[test]
 fn in_range_i32_bound_generates_and_type_checks_shape() {
     // The happy path: a valid in-range i32 bound still emits the range rule.
     let tmp = tempfile::tempdir().expect("tempdir");
