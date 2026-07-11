@@ -320,6 +320,19 @@ impl QueueLimits {
         self.reserved.retain(|q, _| keep.contains(q.as_str()));
     }
 
+    /// The reservation a queue actually withholds from the *other* queues'
+    /// shared pool. A queue can never run more jobs than its own `concurrency`
+    /// cap, so reserving beyond that cap withholds slots it can never use;
+    /// clamp the effective reservation to the cap (issue #1623, P2). Uncapped
+    /// queues withhold their full reservation.
+    fn effective_reserved(&self, queue: &str) -> usize {
+        let reserved = self.reserved.get(queue).copied().unwrap_or(0);
+        self.concurrency
+            .get(queue)
+            .copied()
+            .map_or(reserved, |cap| reserved.min(cap))
+    }
+
     /// Whether any cap or reservation is configured. When empty, the whole
     /// slot-accounting layer is a no-op passthrough (today's behavior, AC4).
     pub(crate) fn is_empty(&self) -> bool {
@@ -357,6 +370,22 @@ impl QueueLimits {
                     "queue '{queue}' reserves {reserved} job slot(s) but only {workers} \
                      worker(s) exist in this process; its reservation can never be fully \
                      satisfied.",
+                );
+            }
+            // A reservation larger than the queue's own concurrency cap is
+            // self-contradictory: the queue can never run enough jobs to use
+            // those slots, so the excess is clamped ([`Self::effective_reserved`])
+            // instead of being withheld from other queues forever (issue #1623).
+            if let Some(cap) = self.concurrency.get(queue).copied()
+                && *reserved > cap
+            {
+                tracing::warn!(
+                    queue = %queue,
+                    reserved = *reserved,
+                    concurrency = cap,
+                    "queue '{queue}' reserves {reserved} job slot(s) but is capped at {cap} \
+                     concurrent job(s); its reservation is clamped to {cap} so the excess is \
+                     not withheld from other queues. Lower `reserved` to at most `concurrency`.",
                 );
             }
         }
@@ -400,12 +429,19 @@ pub(crate) fn queue_may_claim(
     }
 
     // Otherwise draw from the shared pool: free = total - running - the reserved
-    // slots still owed to (unfilled by) other queues.
+    // slots still owed to (unfilled by) other queues. Each queue's reservation
+    // is clamped to its own concurrency cap ([`QueueLimits::effective_reserved`]),
+    // so a queue that reserves more than it can ever run does not withhold the
+    // excess from everyone else (issue #1623, P2).
     let reserved_for_others: usize = limits
         .reserved
-        .iter()
-        .filter(|(name, _)| name.as_str() != queue)
-        .map(|(name, r)| r.saturating_sub(running.get(name).copied().unwrap_or(0)))
+        .keys()
+        .filter(|name| name.as_str() != queue)
+        .map(|name| {
+            limits
+                .effective_reserved(name)
+                .saturating_sub(running.get(name).copied().unwrap_or(0))
+        })
         .sum();
     total_slots
         .saturating_sub(total_running)
@@ -17607,6 +17643,64 @@ mod queue_schedule_tests {
         let (r, total) = running(&[("critical", 2)]);
         // At its cap -> blocked even though slots are free.
         assert!(!queue_may_claim("critical", &r, total, &lim, 4));
+    }
+
+    #[test]
+    fn reserved_is_clamped_to_own_concurrency_cap() {
+        // P2 (#1623): `critical` reserves 4 slots but is capped at 2 concurrent
+        // jobs, so it can never use more than 2. The 2 excess reserved slots
+        // must NOT be withheld from other queues' shared pool. With workers=8
+        // and `bulk` unlimited, bulk must run up to 8 - min(4, 2) = 6.
+        let lim = limits(&[("critical", 2)], &[("critical", 4)]);
+
+        // `critical` is served from its reservation while below its cap, and is
+        // blocked at its concurrency cap of 2 (reserving 4 never lifts the cap).
+        let (r, total) = running(&[("critical", 1)]);
+        assert!(
+            queue_may_claim("critical", &r, total, &lim, 8),
+            "critical draws on its reserved capacity below its cap"
+        );
+        let (r, total) = running(&[("critical", 2)]);
+        assert!(
+            !queue_may_claim("critical", &r, total, &lim, 8),
+            "critical is capped at 2 even though it reserved 4"
+        );
+
+        // With `critical` pinned at its cap of 2, `bulk` must be able to fill
+        // the remaining 6 slots. Before the clamp, bulk was wrongly blocked at
+        // 4 (the full reservation of 4 withheld 4-2=2 usable slots forever).
+        for b in 0..6 {
+            let (r, total) = running(&[("critical", 2), ("bulk", b)]);
+            assert!(
+                queue_may_claim("bulk", &r, total, &lim, 8),
+                "bulk must claim slot #{} (excess reservation must not be withheld)",
+                b + 1
+            );
+        }
+        // 6 bulk + 2 critical = 8 slots full: bulk is now genuinely blocked.
+        let (r, total) = running(&[("critical", 2), ("bulk", 6)]);
+        assert!(
+            !queue_may_claim("bulk", &r, total, &lim, 8),
+            "all 8 worker slots are full"
+        );
+    }
+
+    #[test]
+    fn effective_reserved_clamps_reservation_to_the_cap() {
+        // The amount a queue withholds from others is min(reserved, concurrency).
+        // reserved > concurrency: clamped down to the cap (the invalid config
+        // that also triggers the oversubscription warning).
+        let over = limits(&[("critical", 2)], &[("critical", 4)]);
+        assert_eq!(over.effective_reserved("critical"), 2);
+        // Uncapped queue withholds its full reservation.
+        let uncapped = limits(&[], &[("critical", 4)]);
+        assert_eq!(uncapped.effective_reserved("critical"), 4);
+        // reserved <= concurrency: unaffected, withholds the full reservation.
+        let under = limits(&[("critical", 4)], &[("critical", 2)]);
+        assert_eq!(under.effective_reserved("critical"), 2);
+        // No reservation: nothing withheld.
+        let none = limits(&[("critical", 2)], &[]);
+        assert_eq!(none.effective_reserved("critical"), 0);
     }
 
     #[test]
