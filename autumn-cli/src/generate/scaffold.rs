@@ -1226,12 +1226,7 @@ fn render_model_form(
         // `required` (HTML) and `range` when the range spans the zero default,
         // silently accepting a value the user never typed. `Option<T>` defaults
         // to `None` (renders blank), and the `required` rule below rejects it.
-        let is_constrained_required_numeric = !f.nullable
-            && matches!(
-                f.kind,
-                FieldKind::I32 | FieldKind::I64 | FieldKind::F32 | FieldKind::F64
-            )
-            && (f.constraints.min.is_some() || f.constraints.max.is_some());
+        let is_constrained_required_numeric = is_constrained_required_numeric(f);
         if is_constrained_required_numeric {
             // Emitted alongside the `range` rule so `None` is rejected
             // server-side (a 422 with an inline error) rather than parsed as `0`.
@@ -3676,10 +3671,36 @@ fn title_case(s: &str) -> String {
         .join(" ")
 }
 
+/// A required numeric carrying a `{min,max}` range (issue #1388) that is
+/// represented as `Option<T>` on the form struct (issue #1748). Extracted so
+/// both the struct/`into_new` emission in [`render_model_form`] and the
+/// empty-pair drop set in [`render_nullable_field_match`] agree on which fields
+/// are the synthetic Options.
+const fn is_constrained_required_numeric(f: &Field) -> bool {
+    !f.nullable
+        && matches!(
+            f.kind,
+            FieldKind::I32 | FieldKind::I64 | FieldKind::F32 | FieldKind::F64
+        )
+        && (f.constraints.min.is_some() || f.constraints.max.is_some())
+}
+
+/// Render the body of the generated `is_nullable_form_field` helper — the set
+/// of fields whose empty `field=` pair the decoder drops so it deserializes as
+/// missing (`None`) rather than being handed to `serde_urlencoded` as `""`.
+///
+/// This includes the genuinely nullable fields AND the synthetic
+/// constrained-required-`Option<T>` numerics (issue #1748): those are
+/// `Option<T>` on the form struct but have `nullable == false`, so without this
+/// a blank `age=` pair (from curl, a non-browser client, or disabled JS) would
+/// reach `serde_urlencoded`, which parses `""` into the inner numeric and
+/// returns a **400** *before* `#[validate(required)]` can render the intended
+/// **422** inline error. Dropping the empty pair makes the field decode as
+/// `None`, so `required` fires and produces the 422 (the #1748 intent).
 fn render_nullable_field_match(fields: &[Field]) -> String {
     let names = fields
         .iter()
-        .filter(|field| field.nullable)
+        .filter(|field| field.nullable || is_constrained_required_numeric(field))
         .map(|field| format!("\"{}\"", field.name))
         .collect::<Vec<_>>();
     if names.is_empty() {

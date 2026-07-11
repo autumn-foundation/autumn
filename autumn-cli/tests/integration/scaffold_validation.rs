@@ -129,6 +129,47 @@ fn constrained_required_numeric_spanning_zero_is_optional_not_native() {
     );
 }
 
+/// Issue #1748 (Codex follow-up): the synthetic constrained-required-`Option<T>`
+/// numeric (`age:i32{min=0,max=130}`) must be dropped from the request body when
+/// its `field=` pair is present-but-empty, exactly like a genuinely nullable
+/// field. The decoder strips empty pairs only for fields matching
+/// `is_nullable_form_field`; that field is `Option<i32>` but has
+/// `nullable == false`, so without including it a blank `age=` (from curl, a
+/// non-browser client, or disabled JS) reaches `serde_urlencoded`, which parses
+/// `""` into the inner numeric and returns a **400** *before*
+/// `#[validate(required)]` can render the intended **422** inline error.
+/// Dropping the empty pair makes `age` decode as `None`, so `required` fires and
+/// produces the 422 (the #1748 intent). Asserts the generated
+/// `is_nullable_form_field` set includes `age` alongside the nullable `bio`.
+#[test]
+fn constrained_required_numeric_empty_pair_is_dropped_like_nullable() {
+    let (_tmp, project) = constrained_project("validate-blankdrop-app");
+    let routes = fs::read_to_string(project.join("src/routes/posts.rs")).unwrap();
+
+    // The decoder gates its empty-pair drop on `is_nullable_form_field`.
+    assert!(
+        routes.contains("!(value.is_empty() && is_nullable_form_field(key))"),
+        "decoder must drop empty pairs for the nullable/drop set:\n{routes}"
+    );
+
+    // The synthetic `Option<i32>` `age` must be part of that drop set so a blank
+    // `age=` decodes as `None` (-> 422 via `required`) rather than being parsed
+    // as `""` by serde_urlencoded (-> 400). It appears alongside nullable `bio`.
+    let helper = routes
+        .split_once("fn is_nullable_form_field(name: &str) -> bool {")
+        .and_then(|(_, rest)| rest.split_once('}'))
+        .map(|(body, _)| body)
+        .expect("generated routes must define is_nullable_form_field");
+    assert!(
+        helper.contains("\"age\""),
+        "constrained required `age` must be in the empty-pair drop set (is_nullable_form_field):\n{helper}"
+    );
+    assert!(
+        helper.contains("\"bio\""),
+        "nullable `bio` must remain in the empty-pair drop set:\n{helper}"
+    );
+}
+
 #[test]
 fn cargo_toml_pulls_in_validator_dependency() {
     let (_tmp, project) = constrained_project("validate-cargo-app");
