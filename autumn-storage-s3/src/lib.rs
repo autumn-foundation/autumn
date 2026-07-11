@@ -866,7 +866,7 @@ mod tests {
     #[test]
     fn multipart_part_size_is_exactly_5_mib() {
         assert_eq!(
-            MULTIPART_PART_SIZE, 5242880,
+            MULTIPART_PART_SIZE, 5_242_880,
             "MULTIPART_PART_SIZE must be exactly 5 MiB to satisfy S3 minimums"
         );
     }
