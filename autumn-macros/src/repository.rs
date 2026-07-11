@@ -1962,22 +1962,34 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             #body
                         }
                     });
+                    let no_shard_set_msg = format!(
+                        "cross-shard {fn_ident} requires a configured shard set: across_tenants() \
+                         cannot fan a derived query out across shards without a shard set (the \
+                         repository was built without shard context, e.g. via with_pool_untracked); \
+                         build it with shard context instead"
+                    );
                     derived_impl_methods.push(quote! {
                         async fn #fn_ident(&self, #(#params),*) -> ::autumn_web::AutumnResult<#return_type> {
                             use ::autumn_web::reexports::diesel::prelude::*;
                             use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                            // Without a shard set, an across-tenant read would bind a NULL tenant
+                            // predicate and silently return a PARTIAL result over only the current
+                            // pool, so we reject rather than fall through (#1692, #1741).
                             if self.across_tenants {
-                                if let ::core::option::Option::Some(ref __shards) = self.__autumn_shards {
-                                    // Params are cloned once per shard (the fan-out closure is
-                                    // `Fn`); allow it for `Copy` params too (e.g. an i64 filter).
-                                    #[allow(clippy::clone_on_copy)]
-                                    let __results = __shards.fan_out_shards(|__shard| {
-                                        let __sub = self.__autumn_for_shard(__shard);
-                                        #(let #param_idents = ::core::clone::Clone::clone(&#param_idents);)*
-                                        async move { __sub.#one_shard_ident(#(#param_idents),*).await }
-                                    }).await?;
-                                    return ::core::result::Result::Ok(#merge);
-                                }
+                                let ::core::option::Option::Some(ref __shards) = self.__autumn_shards else {
+                                    return ::core::result::Result::Err(
+                                        ::autumn_web::AutumnError::bad_request_msg(#no_shard_set_msg)
+                                    );
+                                };
+                                // Params are cloned once per shard (the fan-out closure is
+                                // `Fn`); allow it for `Copy` params too (e.g. an i64 filter).
+                                #[allow(clippy::clone_on_copy)]
+                                let __results = __shards.fan_out_shards(|__shard| {
+                                    let __sub = self.__autumn_for_shard(__shard);
+                                    #(let #param_idents = ::core::clone::Clone::clone(&#param_idents);)*
+                                    async move { __sub.#one_shard_ident(#(#param_idents),*).await }
+                                }).await?;
+                                return ::core::result::Result::Ok(#merge);
                             }
                             #body
                         }
@@ -11105,30 +11117,51 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut soft_delete_one_shard_helpers: Vec<proc_macro2::TokenStream> = Vec::new();
     let (with_deleted_fan_out, only_deleted_fan_out, page_only_deleted_cross_shard_guard) =
         if config.soft_delete && config.sharded && config.tenant_scoped {
+            // Without a shard set, an across-tenant read would bind a NULL tenant
+            // predicate and silently return a PARTIAL result over only the current
+            // pool, so we reject rather than fall through (#1692, #1741).
             let with_deleted_fan_out = quote! {
                 if self.across_tenants {
-                    if let ::core::option::Option::Some(ref __shards) = self.__autumn_shards {
-                        let __vecs = __shards.fan_out_shards(|__shard| {
-                            let __sub = self.__autumn_for_shard(__shard);
-                            async move { __sub.__autumn_with_deleted_one_shard().await }
-                        }).await?;
-                        return ::core::result::Result::Ok(
-                            __vecs.into_iter().flatten().collect()
+                    let ::core::option::Option::Some(ref __shards) = self.__autumn_shards else {
+                        return ::core::result::Result::Err(
+                            ::autumn_web::AutumnError::bad_request_msg(
+                                "cross-shard with_deleted requires a configured shard set: \
+                                 across_tenants() cannot fan with_deleted out across shards \
+                                 without a shard set (the repository was built without \
+                                 shard context, e.g. via with_pool_untracked); build it \
+                                 with shard context instead"
+                            )
                         );
-                    }
+                    };
+                    let __vecs = __shards.fan_out_shards(|__shard| {
+                        let __sub = self.__autumn_for_shard(__shard);
+                        async move { __sub.__autumn_with_deleted_one_shard().await }
+                    }).await?;
+                    return ::core::result::Result::Ok(
+                        __vecs.into_iter().flatten().collect()
+                    );
                 }
             };
             let only_deleted_fan_out = quote! {
                 if self.across_tenants {
-                    if let ::core::option::Option::Some(ref __shards) = self.__autumn_shards {
-                        let __vecs = __shards.fan_out_shards(|__shard| {
-                            let __sub = self.__autumn_for_shard(__shard);
-                            async move { __sub.__autumn_only_deleted_one_shard().await }
-                        }).await?;
-                        return ::core::result::Result::Ok(
-                            __vecs.into_iter().flatten().collect()
+                    let ::core::option::Option::Some(ref __shards) = self.__autumn_shards else {
+                        return ::core::result::Result::Err(
+                            ::autumn_web::AutumnError::bad_request_msg(
+                                "cross-shard only_deleted requires a configured shard set: \
+                                 across_tenants() cannot fan only_deleted out across shards \
+                                 without a shard set (the repository was built without \
+                                 shard context, e.g. via with_pool_untracked); build it \
+                                 with shard context instead"
+                            )
                         );
-                    }
+                    };
+                    let __vecs = __shards.fan_out_shards(|__shard| {
+                        let __sub = self.__autumn_for_shard(__shard);
+                        async move { __sub.__autumn_only_deleted_one_shard().await }
+                    }).await?;
+                    return ::core::result::Result::Ok(
+                        __vecs.into_iter().flatten().collect()
+                    );
                 }
             };
             let page_only_deleted_cross_shard_guard = quote! {
@@ -11515,16 +11548,32 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             // no routed-shard connection is held here, so a dead parent replica
             // or exhausted parent pool can't fail the fan-out. Each shard's own
             // read route/fallback is chosen by `__autumn_for_shard` (#1d).
+            //
+            // Without a shard set (e.g. a repo built via `with_pool_untracked`,
+            // where `__autumn_shards` is `None`), an across-tenant read would
+            // bind a NULL tenant predicate and silently return a PARTIAL result
+            // over only the current pool, so we reject rather than fall through
+            // to the single-pool query — mirroring the `count` guard (#1692,
+            // #1741).
             if self.across_tenants {
-                if let ::core::option::Option::Some(ref __shards) = self.__autumn_shards {
-                    let __vecs = __shards.fan_out_shards(|__shard| {
-                        let __sub = self.__autumn_for_shard(__shard);
-                        async move { __sub.__autumn_find_all_one_shard().await }
-                    }).await?;
-                    return ::core::result::Result::Ok(
-                        __vecs.into_iter().flatten().collect()
+                let ::core::option::Option::Some(ref __shards) = self.__autumn_shards else {
+                    return ::core::result::Result::Err(
+                        ::autumn_web::AutumnError::bad_request_msg(
+                            "cross-shard find_all requires a configured shard set: \
+                             across_tenants() cannot fan find_all out across shards \
+                             without a shard set (the repository was built without \
+                             shard context, e.g. via with_pool_untracked); build it \
+                             with shard context instead"
+                        )
                     );
-                }
+                };
+                let __vecs = __shards.fan_out_shards(|__shard| {
+                    let __sub = self.__autumn_for_shard(__shard);
+                    async move { __sub.__autumn_find_all_one_shard().await }
+                }).await?;
+                return ::core::result::Result::Ok(
+                    __vecs.into_iter().flatten().collect()
+                );
             }
             let mut conn = self.__autumn_acquire_read_conn().await?;
             #base
@@ -11551,28 +11600,40 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         let base = find_by_id_impl;
         let dispatch = quote! {
             // Fan out before acquiring a parent-shard connection (see find_all).
+            // Without a shard set, an across-tenant read would bind a NULL tenant
+            // predicate and silently return a PARTIAL result over only the current
+            // pool, so we reject rather than fall through (#1692, #1741).
             if self.across_tenants {
-                if let ::core::option::Option::Some(ref __shards) = self.__autumn_shards {
-                    let __found = __shards.fan_out_shards(|__shard| {
-                        let __sub = self.__autumn_for_shard(__shard);
-                        async move { __sub.__autumn_find_by_id_one_shard(id).await }
-                    }).await?;
-                    // Ids are unique only within a shard: with per-shard
-                    // sequences two shards can hold the same id, so a match on
-                    // more than one shard is ambiguous. Reject rather than
-                    // silently returning whichever shard sorts first (#1d).
-                    let mut __hits = __found.into_iter().flatten();
-                    let __first = __hits.next();
-                    if __hits.next().is_some() {
-                        return ::core::result::Result::Err(
-                            ::autumn_web::AutumnError::internal_server_error_msg(
-                                "ambiguous cross-shard find_by_id: id matched rows on \
-                                 multiple shards; query a specific shard instead"
-                            )
-                        );
-                    }
-                    return ::core::result::Result::Ok(__first);
+                let ::core::option::Option::Some(ref __shards) = self.__autumn_shards else {
+                    return ::core::result::Result::Err(
+                        ::autumn_web::AutumnError::bad_request_msg(
+                            "cross-shard find_by_id requires a configured shard set: \
+                             across_tenants() cannot fan find_by_id out across shards \
+                             without a shard set (the repository was built without \
+                             shard context, e.g. via with_pool_untracked); build it \
+                             with shard context instead"
+                        )
+                    );
+                };
+                let __found = __shards.fan_out_shards(|__shard| {
+                    let __sub = self.__autumn_for_shard(__shard);
+                    async move { __sub.__autumn_find_by_id_one_shard(id).await }
+                }).await?;
+                // Ids are unique only within a shard: with per-shard
+                // sequences two shards can hold the same id, so a match on
+                // more than one shard is ambiguous. Reject rather than
+                // silently returning whichever shard sorts first (#1d).
+                let mut __hits = __found.into_iter().flatten();
+                let __first = __hits.next();
+                if __hits.next().is_some() {
+                    return ::core::result::Result::Err(
+                        ::autumn_web::AutumnError::internal_server_error_msg(
+                            "ambiguous cross-shard find_by_id: id matched rows on \
+                             multiple shards; query a specific shard instead"
+                        )
+                    );
                 }
+                return ::core::result::Result::Ok(__first);
             }
             let mut conn = self.__autumn_acquire_read_conn().await?;
             #base
@@ -11723,14 +11784,26 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         let base = exists_by_id_impl;
         let dispatch = quote! {
             // Fan out before acquiring a parent-shard connection (see find_all).
+            // Without a shard set, an across-tenant read would bind a NULL tenant
+            // predicate and silently return a PARTIAL result over only the current
+            // pool, so we reject rather than fall through (#1692, #1741).
             if self.across_tenants {
-                if let ::core::option::Option::Some(ref __shards) = self.__autumn_shards {
-                    let __results = __shards.fan_out_shards(|__shard| {
-                        let __sub = self.__autumn_for_shard(__shard);
-                        async move { __sub.__autumn_exists_by_id_one_shard(id).await }
-                    }).await?;
-                    return ::core::result::Result::Ok(__results.into_iter().any(|b| b));
-                }
+                let ::core::option::Option::Some(ref __shards) = self.__autumn_shards else {
+                    return ::core::result::Result::Err(
+                        ::autumn_web::AutumnError::bad_request_msg(
+                            "cross-shard exists_by_id requires a configured shard set: \
+                             across_tenants() cannot fan exists_by_id out across shards \
+                             without a shard set (the repository was built without \
+                             shard context, e.g. via with_pool_untracked); build it \
+                             with shard context instead"
+                        )
+                    );
+                };
+                let __results = __shards.fan_out_shards(|__shard| {
+                    let __sub = self.__autumn_for_shard(__shard);
+                    async move { __sub.__autumn_exists_by_id_one_shard(id).await }
+                }).await?;
+                return ::core::result::Result::Ok(__results.into_iter().any(|b| b));
             }
             let mut conn = self.__autumn_acquire_read_conn().await?;
             #base
