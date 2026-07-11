@@ -356,6 +356,52 @@ fn is_blocked_ipv6(ip: Ipv6Addr) -> bool {
     if segs[0] == 0x2001 && segs[1] == 0x0db8 {
         return true;
     }
+
+    // Remaining IANA IPv6 special-purpose prefixes with Globally Reachable =
+    // False. These are reserved / benchmarking / documentation / discard ranges
+    // that must never be dialled, matching the deny-list's reserved policy.
+    // Each check uses explicit masks so it cannot catch an adjacent *public*
+    // address (e.g. benchmarking 2001:2::/48 must not swallow Teredo 2001:0::/32
+    // where s[1] == 0, and documentation 2001:db8::/32 stays its own check).
+    //
+    //   Prefix               RFC        Purpose
+    //   100::/64             RFC 6666   Discard-Only address block
+    //   2001:2::/48          RFC 5180   Benchmarking
+    //   2001:10::/28         RFC 4843   ORCHID (deprecated)
+    //   2001:20::/28         RFC 7343   ORCHIDv2
+    //   3fff::/20            RFC 9637   Documentation
+    //   5f00::/16            RFC 9602   Segment Routing (SRv6) SIDs
+    //   2620:4f:8000::/48    RFC 7534   Direct Delegation AS112 service
+    let s = segs;
+    // 100::/64 (Discard-Only, RFC 6666)
+    if s[0] == 0x0100 && s[1] == 0 && s[2] == 0 && s[3] == 0 {
+        return true;
+    }
+    // 2001:2::/48 (Benchmarking, RFC 5180)
+    if s[0] == 0x2001 && s[1] == 0x0002 && s[2] == 0x0000 {
+        return true;
+    }
+    // 2001:10::/28 (ORCHID, deprecated RFC 4843)
+    if s[0] == 0x2001 && (s[1] & 0xFFF0) == 0x0010 {
+        return true;
+    }
+    // 2001:20::/28 (ORCHIDv2, RFC 7343)
+    if s[0] == 0x2001 && (s[1] & 0xFFF0) == 0x0020 {
+        return true;
+    }
+    // 3fff::/20 (Documentation, RFC 9637)
+    if s[0] == 0x3fff && (s[1] & 0xF000) == 0x0000 {
+        return true;
+    }
+    // 5f00::/16 (SRv6 SIDs, RFC 9602)
+    if s[0] == 0x5f00 {
+        return true;
+    }
+    // 2620:4f:8000::/48 (Direct Delegation AS112, RFC 7534)
+    if s[0] == 0x2620 && s[1] == 0x004f && s[2] == 0x8000 {
+        return true;
+    }
+
     false
 }
 
@@ -2983,6 +3029,19 @@ mod tests {
             "fec0::1",                // deprecated site-local
             "::ffff:169.254.169.254", // IPv4-mapped metadata
             "::ffff:127.0.0.1",       // IPv4-mapped loopback
+            // Remaining IANA special-purpose prefixes (Globally Reachable = False).
+            "100::1",          // Discard-Only 100::/64 (RFC 6666)
+            "100::dead:beef",  // Discard-Only 100::/64 (RFC 6666)
+            "2001:2::1",       // Benchmarking 2001:2::/48 (RFC 5180)
+            "2001:10::1",      // ORCHID 2001:10::/28 (RFC 4843)
+            "2001:20::1",      // ORCHIDv2 2001:20::/28 (RFC 7343)
+            "2001:20:abcd::1", // ORCHIDv2 within /28 (RFC 7343)
+            "2001:2f::1",      // ORCHIDv2 top of /28 (s[1]=0x002f, RFC 7343)
+            "3fff::1",         // Documentation 3fff::/20 (RFC 9637)
+            "3fff:0fff::1",    // Documentation top of /20 (s[1]=0x0fff, RFC 9637)
+            "5f00::1",         // SRv6 SIDs 5f00::/16 (RFC 9602)
+            "5f00:1234::1",    // SRv6 SIDs within /16 (RFC 9602)
+            "2620:4f:8000::1", // Direct Delegation AS112 (RFC 7534)
         ];
         for s in blocked {
             let ip: IpAddr = s.parse().unwrap();
@@ -3001,6 +3060,25 @@ mod tests {
             is_public_ip(public),
             "2606:4700:4700::1111 should be public"
         );
+
+        // Negative tests: real public addresses adjacent to the newly-blocked
+        // special-purpose prefixes must stay allowed (no over-blocking).
+        let public_addrs = [
+            "2001:4860:4860::8888", // Google DNS
+            "2606:4700:4700::1111", // Cloudflare DNS
+            "2400:cb00:2048::1",    // public 2400 (Cloudflare)
+            "2620:0:2d0:200::7",    // public 2620 NOT in AS112 2620:4f:8000::/48
+            "2001:2:1::1",          // just outside benchmarking /48 (s[2]=1, not ORCHID)
+            "3fff:abcd::1",         // outside documentation /20 (s[1]=0xabcd > 0x0fff)
+            "4000::1",              // outside documentation 3fff::/20
+            "5e00::1",              // outside SRv6 5f00::/16
+            "6000::1",              // outside SRv6 5f00::/16
+        ];
+        for s in public_addrs {
+            let ip: IpAddr = s.parse().unwrap();
+            assert!(is_public_ip(ip), "{s} should be public");
+            assert!(!is_blocked_ip(ip), "{s} should not be blocked");
+        }
     }
 
     // TEST 46b: SSRF policy blocks private / metadata IPv4 tunnelled inside an
