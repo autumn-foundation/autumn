@@ -224,6 +224,69 @@ fn index_view_renders_parent_label_via_loaded_map() {
 }
 
 #[test]
+fn live_validation_keeps_parent_display_on_index_and_show() {
+    // Issue #1146's index/show parent-display rendering is generator-emitted
+    // VIEW markup (independent of the form control), so it must still appear in
+    // `--live-validation` mode — where the form itself uses the per-field path
+    // and the belongs_to `<select>` is deferred (#1750), the raw FK id must NOT
+    // leak into the index/show pages.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    run_autumn_ok(tmp.path(), &["new", "bt-live-app"]);
+    let project = tmp.path().join("bt-live-app");
+    run_autumn_ok(&project, &["generate", "model", "Post", "title:String"]);
+    run_autumn_ok(
+        &project,
+        &[
+            "generate",
+            "scaffold",
+            "Comment",
+            "body:Text",
+            "post:references",
+            "--live-validation",
+        ],
+    );
+    let routes = fs::read_to_string(project.join("src/routes/comments.rs")).unwrap();
+
+    // Show: loads + renders the parent's `title`, not the raw FK.
+    assert!(
+        routes.contains("let post_id_label: String")
+            && routes.contains("posts::table.find(fk).select(posts::title)")
+            && routes.contains("(post_id_label)"),
+        "live-validation show must still load + render the parent display label:\n{routes}"
+    );
+    // Index: loads + looks up the parent-label map.
+    assert!(
+        routes.contains("let post_id_labels: std::collections::HashMap<String, String>")
+            && routes.contains("post_id_labels.get(&row.post_id.to_string())"),
+        "live-validation index must still render the parent display via the label map:\n{routes}"
+    );
+    // The referenced table's schema is imported so those loads compile.
+    assert!(
+        routes.contains("use crate::schema::{comments, posts}")
+            || routes.contains("use crate::schema::posts"),
+        "the referenced `posts` schema must be imported for the label loads:\n{routes}"
+    );
+    // The option loader IS emitted — the index parent-label map is built by
+    // collecting it into a HashMap, so it's a live dependency of the restored
+    // index display (not dead code).
+    assert!(
+        routes.contains("async fn post_id_select_options"),
+        "the option loader must be emitted (the index label map depends on it):\n{routes}"
+    );
+    // The in-FORM belongs_to `<select>` is what's deferred in live-validation
+    // (#1750): the FK renders through the per-field text-input path, not a
+    // dropdown / `form_for` select override.
+    assert!(
+        routes.contains("required_text_input(&changeset, \"post_id\", \"Post Id\")"),
+        "the FK form control is the per-field text input (select deferred):\n{routes}"
+    );
+    assert!(
+        !routes.contains(".override_field(\"post_id\""),
+        "no `form_for` select override is emitted in live-validation:\n{routes}"
+    );
+}
+
+#[test]
 fn nullable_reference_renders_dash_and_blank_option() {
     let (_tmp, routes) =
         belongs_to_routes("bt-nullable-app", &["title:String"], "post:references?");

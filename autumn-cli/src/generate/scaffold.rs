@@ -1496,23 +1496,28 @@ fn render_routes_file(
     let update_columns = render_update_columns(plural, fields);
     let nullable_field_match = render_nullable_field_match(fields);
     let has_attachments = has_attachment_fields(fields);
-    // `references` columns render as a `<select>` of the referenced table's
-    // ids (issue #1135 AC 2: "enum/references→select"). The options are
-    // runtime data, so the handlers that render the form load them and pass
-    // them into the shared `{snake}_form_for` helper. `--live-validation`
-    // keeps the old per-field emission (no `form_for`), so no options are
-    // loaded there. Columns in `missing_reference_targets` (their referenced
-    // model — and therefore its `src/schema.rs` entry — isn't in the project)
-    // are left out entirely: no loader, no schema import, no Select override,
-    // so they fall back to the derived numeric id input and the generated
-    // file still compiles (the caller warned about the downgrade).
+    // Every PRESENT `references` field (its target model — and so its
+    // `src/schema.rs` entry — is in the project; `missing_reference_targets`
+    // excludes the rest, which the caller already warned about and which fall
+    // back to a numeric id). This drives the issue #1146 parent-DISPLAY
+    // rendering on index/show, which is generator-emitted *view* markup
+    // (`posts::table.find(fk).select(posts::title)`), independent of the form
+    // control — so it applies in `--live-validation` mode too.
+    let display_reference_fields: Vec<&Field> = fields
+        .iter()
+        .filter(|f| f.kind.is_reference() && !missing_reference_targets.contains(&f.name))
+        .collect();
+    // The subset that also renders an in-FORM `<select>` of the referenced
+    // table's ids (issue #1135 AC 2) plus its runtime option loaders.
+    // `--live-validation` renders the form through the per-field path (no
+    // `form_for`, and `select_input` takes only static options, so a
+    // runtime-option belongs_to `<select>` can't be wired through it without
+    // the same cross-crate form-helper change #1750 tracks): skip the dropdown
+    // + loaders there, but KEEP the index/show display rendering above.
     let reference_fields: Vec<&Field> = if live_validation {
         Vec::new()
     } else {
-        fields
-            .iter()
-            .filter(|f| f.kind.is_reference() && !missing_reference_targets.contains(&f.name))
-            .collect()
+        display_reference_fields.clone()
     };
     let has_reference_selects = !reference_fields.is_empty();
 
@@ -1555,8 +1560,9 @@ fn render_routes_file(
     // index columns, and show rows render the parent's display column (a
     // `name`/`title`/first-string heuristic, or an explicit `{label:col}`)
     // instead of the raw foreign-key id. A reference whose target has no
-    // string column has no entry here and keeps rendering the id.
-    let reference_displays: BTreeMap<String, ReferenceDisplay> = reference_fields
+    // string column has no entry here and keeps rendering the id. Resolved from
+    // the display-scoped set so it's populated in `--live-validation` too.
+    let reference_displays: BTreeMap<String, ReferenceDisplay> = display_reference_fields
         .iter()
         .filter_map(|f| resolve_reference_display(project_root, f).map(|d| (f.name.clone(), d)))
         .collect();
@@ -1791,7 +1797,15 @@ fn render_routes_file(
              }}\n    \
              }})"
         );
-        (new_form_body, edit_form_body, String::new())
+        // The in-form belongs_to `<select>` is deferred in `--live-validation`
+        // (#1750), but the referenced-row option loaders are still emitted: the
+        // issue #1146 index parent-label map is built by collecting each
+        // `{name}_select_options(...)` into a `HashMap` (see
+        // `render_index_reference_label_loads`), so the loaders are a live
+        // dependency of the restored index display, not dead code.
+        let option_loaders =
+            render_reference_option_loaders(&display_reference_fields, db_ty, &reference_displays);
+        (new_form_body, edit_form_body, option_loaders)
     } else {
         // Reference selects: load the referenced ids before rendering and
         // thread them into the shared helper (issue #1135, AC 2
@@ -2016,7 +2030,7 @@ fn render_routes_file(
     let index_label_loads = if live || sharded {
         String::new()
     } else {
-        render_index_reference_label_loads(&reference_fields, &reference_displays)
+        render_index_reference_label_loads(&display_reference_fields, &reference_displays)
     };
     // `mut db: Db` is only added to the plain index signature when there is at
     // least one label map to load — otherwise it would be an unused extractor.
@@ -2154,15 +2168,16 @@ pub async fn index(
             .to_owned()
     };
 
-    // Schema imports: the resource's own table, plus — when reference selects
-    // are rendered — each referenced table so its ids can be loaded for the
-    // select options. Only targets that are actually present in the project
-    // reach this point (`reference_fields` already excludes
-    // `missing_reference_targets`): importing a table whose `diesel::table!`
-    // entry doesn't exist in `src/schema.rs` would fail to compile, and a
-    // missing target has always been a warning, not an error.
+    // Schema imports: the resource's own table, plus each referenced table so
+    // its rows can be loaded — for the form select options AND for the
+    // index/show parent-display label loads (issue #1146), which is why this
+    // uses the display-scoped set (populated even in `--live-validation`, where
+    // the form select is skipped but the display loads remain). Only present
+    // targets reach here (`missing_reference_targets` excluded): importing a
+    // table whose `diesel::table!` entry doesn't exist would fail to compile,
+    // and a missing target has always been a warning, not an error.
     let schema_import = {
-        let mut extra_tables: BTreeSet<String> = reference_fields
+        let mut extra_tables: BTreeSet<String> = display_reference_fields
             .iter()
             .filter_map(|f| f.reference_table())
             .collect();
