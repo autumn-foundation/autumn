@@ -110,6 +110,14 @@ pub enum ClientError {
     /// validates the literal and connects to that same IP, so it is unaffected.)
     #[error("{0}")]
     PinRequiresDomainHost(&'static str),
+    /// [`pin_to`](RequestBuilder::pin_to) was combined with
+    /// [`Client::get_ssrf_safe`] — an incompatible pair. The SSRF-safe path runs
+    /// its own per-hop resolve→validate→pin and never reads the caller's
+    /// `pin_to` address, so an explicit pin would be silently ignored. Use
+    /// `pin_to` alone for a caller-chosen fixed address, or `get_ssrf_safe`
+    /// alone for guarded automatic per-hop pinning — not both.
+    #[error("{0}")]
+    PinNotAllowedWithSsrfSafe(&'static str),
 }
 
 // ── Response ─────────────────────────────────────────────────────────────────
@@ -1032,7 +1040,7 @@ impl Client {
     /// full set of validated addresses so reqwest cannot re-resolve the host
     /// (closing the DNS-rebinding / TOCTOU window) yet can still fall back across
     /// them in order if the first is unreachable. Redirects are followed manually up to
-    /// [`SSRF_SAFE_MAX_REDIRECTS`] hops, re-running resolve→validate→pin on each
+    /// `SSRF_SAFE_MAX_REDIRECTS` hops, re-running resolve→validate→pin on each
     /// hop; a hop that downgrades the scheme from `https` to `http` is rejected
     /// as defence-in-depth.
     ///
@@ -1040,7 +1048,7 @@ impl Client {
     /// override (the built-in resolve→validate→pin and scheme-downgrade guards
     /// always apply):
     ///
-    /// - by default, up to [`SSRF_SAFE_MAX_REDIRECTS`] hops are followed;
+    /// - by default, up to `SSRF_SAFE_MAX_REDIRECTS` hops are followed;
     /// - a chained [`no_redirect`](RequestBuilder::no_redirect) returns the
     ///   initial `3xx` verbatim — the initial URL is still resolved, validated
     ///   and pinned, but no redirect is followed;
@@ -1060,6 +1068,14 @@ impl Client {
     /// connector where the `resolve()` override applies, so a configured proxy
     /// would otherwise receive the request and re-resolve the host — reopening
     /// the DNS-rebinding / SSRF window this API closes.
+    ///
+    /// **Cannot be combined with [`pin_to`](RequestBuilder::pin_to).** This path
+    /// performs its own per-hop resolve→validate→pin and never reads the
+    /// `pin_to` address, so an explicit pin would be silently ignored. Chaining
+    /// the two is therefore rejected at send time with
+    /// [`ClientError::PinNotAllowedWithSsrfSafe`]. Use `pin_to` alone for a
+    /// caller-chosen fixed address, or `get_ssrf_safe` alone for guarded
+    /// automatic per-hop pinning.
     #[must_use]
     pub fn get_ssrf_safe(&self, url: impl Into<String>) -> RequestBuilder {
         let mut builder = self.build_request(Method::GET, url.into());
@@ -1522,6 +1538,24 @@ impl RequestBuilder {
 
     /// Dispatch to the appropriate custom send path. Consumes `self`.
     async fn send_custom(self) -> Result<Response, ClientError> {
+        // Reject the incompatible `get_ssrf_safe` + `pin_to` combination up
+        // front — deterministically, before any network I/O. `get_ssrf_safe`
+        // routes through `send_ssrf_safe`, which runs its OWN per-hop
+        // resolve→validate→pin and never reads `self.pin_addr`; a caller's
+        // explicit `pin_to(addr)` would therefore be silently ignored. Fail
+        // loudly instead so the mismatch is caught rather than masked. Use
+        // `pin_to` alone for a caller-chosen fixed address, or `get_ssrf_safe`
+        // alone for guarded automatic per-hop pinning.
+        if self.ssrf_safe && self.pin_addr.is_some() {
+            return Err(ClientError::PinNotAllowedWithSsrfSafe(
+                "get_ssrf_safe cannot be combined with pin_to: the SSRF-safe path \
+                 performs its own per-hop resolve/validate/pin and never reads the \
+                 pin_to address, so an explicit pin would be silently ignored. Use \
+                 pin_to alone for a caller-chosen address, or get_ssrf_safe alone \
+                 for guarded automatic per-hop pinning.",
+            ));
+        }
+
         // Reject the incompatible `pin_to` + `follow_redirects` combination up
         // front — deterministically, before issuing any request. A single pinned
         // `SocketAddr` only applies to hop 0 of `follow_loop`; later hops resolve
@@ -4007,6 +4041,25 @@ mod tests {
         assert!(
             matches!(result, Err(ClientError::PinRequiresDomainHost(_))),
             "expected PinRequiresDomainHost, got {result:?}"
+        );
+    }
+
+    // TEST 68b: get_ssrf_safe combined with pin_to is rejected at send time with
+    // PinNotAllowedWithSsrfSafe — deterministically, without touching the
+    // network. The SSRF-safe path runs its own per-hop resolve/validate/pin and
+    // never reads the pin_to address, so an explicit pin would be silently
+    // ignored; the guard fails loudly instead.
+    #[tokio::test]
+    async fn get_ssrf_safe_with_pin_to_is_rejected() {
+        let result = Client::new()
+            .get_ssrf_safe("http://example.com/")
+            .pin_to(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080))
+            .send()
+            .await;
+
+        assert!(
+            matches!(result, Err(ClientError::PinNotAllowedWithSsrfSafe(_))),
+            "expected PinNotAllowedWithSsrfSafe, got {result:?}"
         );
     }
 
