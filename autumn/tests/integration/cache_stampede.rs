@@ -342,12 +342,23 @@ async fn swr_serves_stale_and_refreshes_in_background() {
     // the grace period).
     tokio::time::sleep(Duration::from_millis(80)).await;
 
+    // A deterministic signal the background refresh's fill closure fires the
+    // moment it finishes computing the new value. Waiting on this — rather than
+    // a fixed wall-clock timeout — absorbs however long a slow/loaded runner
+    // takes to schedule and run the detached background task.
+    let refresh_done = Arc::new(tokio::sync::Notify::new());
+
     let start = std::time::Instant::now();
     let fc = fill_count.clone();
+    let done = refresh_done.clone();
     let v: String = get_or_compute_with(&cache, &key, opts.clone(), move || async move {
         fc.fetch_add(1, Ordering::SeqCst);
         tokio::time::sleep(Duration::from_millis(200)).await;
-        Ok::<String, String>("v2".to_string())
+        let out = Ok::<String, String>("v2".to_string());
+        // Publication (`insert_cached`) happens synchronously right after this
+        // closure returns; signal now that the compute is done.
+        done.notify_one();
+        out
     })
     .await
     .unwrap();
@@ -361,8 +372,18 @@ async fn swr_serves_stale_and_refreshes_in_background() {
         "serving stale must not wait on the slow background refresh, took {elapsed:?}"
     );
 
-    // Poll until the background refresh completes and the fresh value is visible.
-    let refreshed = tokio::time::timeout(Duration::from_secs(2), async {
+    // Wait deterministically for the background refresh to finish computing —
+    // no wall-clock ceiling on the load-sensitive scheduling + 200ms compute.
+    // (`notify_one` stores a permit if it fires before this await, so there is
+    // no lost-wakeup even when the background task wins the race.)
+    refresh_done.notified().await;
+
+    // The refreshed value is published in `finish_fill` synchronously right
+    // after the fill closure returns, so re-read until it is visible. This
+    // converges immediately once the background task's publish runs and is NOT
+    // gated on any load-sensitive sleep, so the generous hang-guard below only
+    // trips on a genuine hang — never on a merely slow runner.
+    let refreshed = tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             let fc = fill_count.clone();
             let v: String = get_or_compute_with(&cache, &key, opts.clone(), move || async move {
@@ -374,11 +395,11 @@ async fn swr_serves_stale_and_refreshes_in_background() {
             if v == "v2" {
                 break v;
             }
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
         }
     })
     .await
-    .expect("background refresh must eventually publish the new value");
+    .expect("background refresh must publish the new value after it finishes computing");
     assert_eq!(refreshed, "v2");
 
     let after = read_through_metrics().snapshot();

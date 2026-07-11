@@ -355,18 +355,38 @@ async fn first_progress_arrives_before_the_slow_tool_completes() {
     let start = std::time::Instant::now();
     let response = tower::ServiceExt::oneshot(router, request).await.unwrap();
     let mut body = response.into_body().into_data_stream();
-    // Pull the first non-empty chunk.
+    // Record when the first streamed signal arrives versus when the completion
+    // frame (carrying the slow tail's "done" payload) arrives. The handler
+    // sleeps 300ms *between* emitting the first event and the final one, so the
+    // "done" bytes cannot exist until that tail elapses: an incrementally
+    // streamed response necessarily surfaces the first frame ahead of
+    // completion, while a buffered response would collapse both into one chunk.
     let mut first_at = None;
+    let mut done_at = None;
+    let mut buf = String::new();
     while let Some(chunk) = body.next().await {
         let bytes = chunk.unwrap();
-        if !bytes.is_empty() {
-            first_at = Some(start.elapsed());
+        if bytes.is_empty() {
+            continue;
+        }
+        let at = start.elapsed();
+        if first_at.is_none() {
+            first_at = Some(at);
+        }
+        buf.push_str(&String::from_utf8_lossy(&bytes));
+        if buf.contains("done") {
+            done_at = Some(at);
             break;
         }
     }
-    let elapsed = first_at.expect("a first frame");
+    let first_at = first_at.expect("a first frame");
+    let done_at = done_at.expect("a completion frame carrying the slow tail");
+    // Assert ORDERING, not a fixed wall-clock budget: the first signal must
+    // arrive strictly before completion. This holds no matter how slow or
+    // loaded the runner is, because the 300ms tail is produced only after the
+    // first frame is already on the wire.
     assert!(
-        elapsed < Duration::from_millis(250),
-        "first signal should precede the 300ms tail; took {elapsed:?}"
+        first_at < done_at,
+        "first signal must precede completion (first at {first_at:?}, done at {done_at:?})"
     );
 }
