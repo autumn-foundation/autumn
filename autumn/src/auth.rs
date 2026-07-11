@@ -764,8 +764,11 @@ pub struct MagicLinkConfig {
     /// tight expiry window bounds the blast radius of a leaked link (e.g. via a
     /// forwarded email or a shared inbox). Raise it only with that tradeoff in
     /// mind.
+    ///
+    /// Unsigned: a negative `ttl_minutes` in `autumn.toml` fails deserialization
+    /// (a negative TTL would mint already-expired tokens, breaking login).
     #[serde(default = "default_magic_link_ttl_minutes")]
-    pub ttl_minutes: i64,
+    pub ttl_minutes: u64,
 
     /// Per-email cooldown, in seconds (default: `60`).
     ///
@@ -773,15 +776,21 @@ pub struct MagicLinkConfig {
     /// unconsumed token was already issued for the account within this window —
     /// throttling email-bombing a single address even from rotating IPs (the
     /// per-IP limit is enforced separately by `#[throttle]`).
+    ///
+    /// Unsigned: a negative `email_cooldown_secs` in `autumn.toml` fails
+    /// deserialization. A negative value would push the cooldown window start
+    /// into the future, so the "outstanding token" lookup would never match and
+    /// every request would re-mint and re-send — silently defeating the
+    /// email-bomb throttle.
     #[serde(default = "default_magic_link_email_cooldown_secs")]
-    pub email_cooldown_secs: i64,
+    pub email_cooldown_secs: u64,
 }
 
-const fn default_magic_link_ttl_minutes() -> i64 {
+const fn default_magic_link_ttl_minutes() -> u64 {
     15
 }
 
-const fn default_magic_link_email_cooldown_secs() -> i64 {
+const fn default_magic_link_email_cooldown_secs() -> u64 {
     60
 }
 

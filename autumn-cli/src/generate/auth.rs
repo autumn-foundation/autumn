@@ -9197,7 +9197,7 @@ pub async fn magic_link_request(
     if let Some(__SNAKE__) = maybe___SNAKE__ {
         // Per-email cooldown (AC6): skip re-minting when an unexpired,
         // unconsumed token was issued for this account within the window.
-        let cooldown_start = now - chrono::Duration::seconds(email_cooldown_secs);
+        let cooldown_start = now - chrono::Duration::seconds(email_cooldown_secs as i64);
         let recent: i64 = magic_link_tokens::table
             .filter(magic_link_tokens::user_id.eq(__SNAKE__.id))
             .filter(magic_link_tokens::consumed_at.is_null())
@@ -9213,7 +9213,7 @@ pub async fn magic_link_request(
             // SHA-256 digest is stored; the raw token appears only in the link.
             let raw_token = generate_reset_token();
             let token_digest = sha256_hex(&raw_token);
-            let expires_at = now + chrono::Duration::minutes(ttl_minutes);
+            let expires_at = now + chrono::Duration::minutes(ttl_minutes as i64);
             let new_token = NewMagicLinkToken {
                 user_id: __SNAKE__.id,
                 token_digest,
@@ -9397,7 +9397,7 @@ async fn send_magic_link_email(
     mailer: &Mailer,
     to: &str,
     token: &str,
-    ttl_minutes: i64,
+    ttl_minutes: u64,
 ) -> AutumnResult<()> {
     // APP_BASE_URL must be the public URL of your app (e.g. https://example.com).
     let base_url = std::env::var("APP_BASE_URL")
@@ -11556,6 +11556,33 @@ mod tests {
             routes.contains("state.config().auth.magic_link.email_cooldown_secs"),
             "per-email cooldown must be sourced from state.config().auth.magic_link: {routes}"
         );
+    }
+
+    #[test]
+    fn magic_link_config_knobs_are_unsigned_to_reject_negative_values() {
+        // `MagicLinkConfig::{ttl_minutes,email_cooldown_secs}` are `u64`, so a
+        // negative value in autumn.toml fails deserialization instead of
+        // silently breaking the throttle/expiry. The generated code proves it
+        // consumes those unsigned knobs: the chrono math casts through `as i64`
+        // (a negative cooldown would push `cooldown_start` into the future and
+        // defeat the per-email email-bomb throttle), and the mailer helper takes
+        // an unsigned `ttl_minutes`. Assert for BOTH the --magic-link and
+        // --magic-link --totp variants.
+        for totp in [false, true] {
+            let routes = render_routes_file("User", "user", "users", &[], totp, true);
+            assert!(
+                routes.contains("chrono::Duration::seconds(email_cooldown_secs as i64)"),
+                "cooldown math must cast the unsigned config knob via `as i64` (totp={totp}): {routes}"
+            );
+            assert!(
+                routes.contains("chrono::Duration::minutes(ttl_minutes as i64)"),
+                "TTL math must cast the unsigned config knob via `as i64` (totp={totp}): {routes}"
+            );
+            assert!(
+                routes.contains("ttl_minutes: u64,"),
+                "send_magic_link_email must take an unsigned ttl_minutes (totp={totp}): {routes}"
+            );
+        }
     }
 
     #[test]
