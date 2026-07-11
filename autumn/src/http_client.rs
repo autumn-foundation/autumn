@@ -100,6 +100,16 @@ pub enum ClientError {
     /// `follow_redirects` without `pin_to`.
     #[error("{0}")]
     IncompatiblePinRedirect(&'static str),
+    /// [`pin_to`](RequestBuilder::pin_to) was used on a request whose URL host is
+    /// an IP literal. reqwest/hyper treat an IP-literal host as already-resolved
+    /// and never consult the DNS resolver, so the `resolve_to_addrs` override
+    /// that installs the pin is skipped and the socket connects to the literal in
+    /// the URL — not the pinned address — silently bypassing the pin. `pin_to`
+    /// therefore requires a domain (hostname) host; put the desired IP directly
+    /// in the URL, or use a domain host. (`get_ssrf_safe` never sets a pin: it
+    /// validates the literal and connects to that same IP, so it is unaffected.)
+    #[error("{0}")]
+    PinRequiresDomainHost(&'static str),
 }
 
 // ── Response ─────────────────────────────────────────────────────────────────
@@ -1253,6 +1263,15 @@ impl RequestBuilder {
     /// DNS-rebinding / TOCTOU attacks where a hostname re-resolves to a
     /// different (private) address between validation and connection.
     ///
+    /// **Requires a domain (hostname) URL host.** The pin is enforced via a DNS
+    /// `resolve` override, but reqwest/hyper treat an IP-literal URL host as
+    /// already-resolved and never consult the resolver — so the override is
+    /// skipped and the socket would connect to the literal in the URL, not the
+    /// pinned address. A `pin_to` request whose URL host is an IP literal
+    /// (IPv4 or IPv6) is therefore **rejected at send time** with
+    /// [`ClientError::PinRequiresDomainHost`]. Put the desired IP directly in the
+    /// URL (no pin needed), or use a domain host.
+    ///
     /// **Pinning applies to the initial connection only.** Redirects are **not**
     /// followed under `pin_to`: a `3xx` is returned to the caller verbatim (as if
     /// [`no_redirect`](Self::no_redirect) were set) rather than being
@@ -1519,6 +1538,23 @@ impl RequestBuilder {
             ));
         }
 
+        // Reject `pin_to` on an IP-literal URL host up front — deterministically,
+        // before any network I/O. reqwest/hyper treat an IP-literal host as
+        // already-resolved and do NOT consult the DNS resolver, so the
+        // `resolve_to_addrs` override installed by `build_oneshot_client` (which
+        // is what enforces the pin) is skipped and the socket connects to the
+        // literal in the URL rather than the pinned address — silently violating
+        // `pin_to`'s documented guarantee. `get_ssrf_safe` never sets `pin_addr`
+        // (and validates+connects to the same literal, so it stays safe), so this
+        // guard targets only the explicit `pin_to` primitive.
+        if self.pin_addr.is_some() && url_host_is_ip_literal(&self.url)? {
+            return Err(ClientError::PinRequiresDomainHost(
+                "pin_to cannot be honored for an IP-literal URL host because the \
+                 HTTP stack connects to the literal directly and skips the pinned \
+                 address; put the desired IP directly in the URL, or use a domain host.",
+            ));
+        }
+
         let timeout = self
             .retry_policy
             .request_timeout
@@ -1620,7 +1656,7 @@ impl RequestBuilder {
                 return Err(ClientError::RedirectRejected(next));
             }
             // RFC 7231/7538 method+body rewriting before the next hop.
-            rewrite_after_redirect(resp.status(), &mut method, &mut body);
+            rewrite_after_redirect(resp.status(), &mut method, &mut body, &mut headers);
             current = next;
         }
         unreachable!("redirect loop is bounded by `max` and always returns")
@@ -1714,7 +1750,7 @@ impl RequestBuilder {
                 return Err(ClientError::RedirectRejected(next));
             }
             // RFC 7231/7538 method+body rewriting before the next hop.
-            rewrite_after_redirect(resp.status(), &mut method, &mut body);
+            rewrite_after_redirect(resp.status(), &mut method, &mut body, &mut headers);
             current = next;
             // The next loop iteration re-resolves + re-validates `current`
             // before connecting, so a redirect to a blocked address is rejected
@@ -1860,6 +1896,18 @@ fn host_of(url: &str) -> Result<String, ClientError> {
         .ok_or_else(|| ClientError::InvalidUrl(format!("URL has no host: {url}")))
 }
 
+/// `true` when the URL's host is an IP literal (IPv4 or IPv6) rather than a
+/// domain name. Uses the `url` crate's parsed [`url::Host`] so bracketed IPv6
+/// literals and decimal/octal/hex IPv4 encodings are classified correctly.
+fn url_host_is_ip_literal(url: &str) -> Result<bool, ClientError> {
+    let parsed = url::Url::parse(url).map_err(|e| ClientError::InvalidUrl(e.to_string()))?;
+    match parsed.host() {
+        Some(url::Host::Ipv4(_) | url::Host::Ipv6(_)) => Ok(true),
+        Some(url::Host::Domain(_)) => Ok(false),
+        None => Err(ClientError::InvalidUrl(format!("URL has no host: {url}"))),
+    }
+}
+
 /// `true` when the URL's scheme is `https` (case-insensitive).
 fn scheme_is_https(url: &str) -> Result<bool, ClientError> {
     let parsed = url::Url::parse(url).map_err(|e| ClientError::InvalidUrl(e.to_string()))?;
@@ -1923,10 +1971,18 @@ fn strip_sensitive_headers_if_cross_origin(
 ///   **and** the body verbatim (the RFC-correct behaviour — the body must NOT
 ///   be dropped).
 /// - Any other redirect status: leave method and body untouched.
+///
+/// Whenever the body is dropped (the POST→GET / 303→GET rewrites), the payload
+/// (entity) headers threaded across hops are also removed from `headers` so the
+/// bodyless follow-up hop does not carry a misleading `Content-Type` /
+/// `Content-Length` / `Transfer-Encoding` / `Content-Encoding` /
+/// `Content-Language` — matching reqwest's redirect layer. On 307/308 the body
+/// is preserved, so those headers are left intact.
 fn rewrite_after_redirect(
     status: reqwest::StatusCode,
     method: &mut Method,
     body: &mut Option<Bytes>,
+    headers: &mut HeaderMap,
 ) {
     match status.as_u16() {
         303 => {
@@ -1934,13 +1990,29 @@ fn rewrite_after_redirect(
                 *method = Method::GET;
             }
             *body = None;
+            strip_payload_headers(headers);
         }
         301 | 302 if *method == Method::POST => {
             *method = Method::GET;
             *body = None;
+            strip_payload_headers(headers);
         }
         _ => {}
     }
+}
+
+/// Remove payload (entity) headers from the threaded per-hop header map. Called
+/// when a redirect rewrite drops the request body so a bodyless GET does not
+/// keep carrying the original payload's `Content-Type` etc.
+fn strip_payload_headers(headers: &mut HeaderMap) {
+    use reqwest::header::{
+        CONTENT_ENCODING, CONTENT_LANGUAGE, CONTENT_LENGTH, CONTENT_TYPE, TRANSFER_ENCODING,
+    };
+    headers.remove(CONTENT_TYPE);
+    headers.remove(CONTENT_LENGTH);
+    headers.remove(TRANSFER_ENCODING);
+    headers.remove(CONTENT_ENCODING);
+    headers.remove(CONTENT_LANGUAGE);
 }
 
 /// Validate a set of resolved socket addresses against the built-in SSRF
@@ -3518,8 +3590,12 @@ mod tests {
             .await;
         let start_port = start.port();
 
+        // Use a DOMAIN host (`pinned.invalid`) so the pin's resolve override is
+        // actually consulted; pinning an IP-literal host is now rejected by the
+        // PinRequiresDomainHost guard. The non-resolvable domain reaches the
+        // loopback listener only via the pin.
         let resp = Client::new()
-            .get(format!("http://127.0.0.1:{start_port}/start"))
+            .get(format!("http://pinned.invalid:{start_port}/start"))
             .pin_to(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), start_port))
             .send()
             .await
@@ -3665,15 +3741,15 @@ mod tests {
             routing::{any, post},
         };
 
-        let seen: Arc<Mutex<Option<(String, Bytes)>>> = Arc::new(Mutex::new(None));
+        let seen: Arc<Mutex<Option<(String, HeaderMap, Bytes)>>> = Arc::new(Mutex::new(None));
         let seen2 = seen.clone();
-        // B records the method + body it actually received, for any verb.
+        // B records the method + headers + body it actually received, for any verb.
         let b_addr = spawn(Router::new().route(
             "/dst",
-            any(move |method: Method, body: Bytes| {
+            any(move |method: Method, headers: HeaderMap, body: Bytes| {
                 let slot = seen2.clone();
                 async move {
-                    *slot.lock().unwrap() = Some((method.to_string(), body));
+                    *slot.lock().unwrap() = Some((method.to_string(), headers, body));
                     "ok"
                 }
             }),
@@ -3687,22 +3763,34 @@ mod tests {
         ))
         .await;
 
+        // `.json(..)` sets a request body AND `Content-Type: application/json`.
+        // On the 302 POST→GET rewrite the body is dropped, and the payload
+        // headers must be dropped with it (Fix B) — otherwise the followed GET
+        // would carry a misleading `Content-Type` for a body it no longer has.
         let resp = Client::new()
             .post(format!("http://127.0.0.1:{}/", a_addr.port()))
-            .text_body("payload")
+            .json(&serde_json::json!({"payload": true}))
             .follow_redirects(3, |_| true)
             .send()
             .await
             .unwrap();
 
         assert_eq!(resp.status().as_u16(), 200);
-        let (method, body) = seen
+        let (method, headers, body) = seen
             .lock()
             .unwrap()
             .clone()
             .expect("listener B must have been reached");
         assert_eq!(method, "GET", "302 must rewrite POST → GET");
         assert!(body.is_empty(), "302 POST→GET must drop the request body");
+        assert!(
+            !headers.contains_key(reqwest::header::CONTENT_TYPE),
+            "302 POST→GET must drop the Content-Type payload header"
+        );
+        assert!(
+            !headers.contains_key(reqwest::header::CONTENT_LENGTH),
+            "302 POST→GET must drop the Content-Length payload header"
+        );
     }
 
     // TEST 62: RFC 7231 §6.4.7 — a 307 preserves BOTH the method and the body
@@ -3846,8 +3934,10 @@ mod tests {
         .await;
         let port = addr.port();
 
+        // Use a DOMAIN host so the pin's resolve override is consulted; pinning
+        // an IP-literal host is now rejected by the PinRequiresDomainHost guard.
         let resp = Client::new()
-            .get(format!("http://127.0.0.1:{port}/start"))
+            .get(format!("http://pinned.invalid:{port}/start"))
             .pin_to(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port))
             .no_redirect()
             .send()
@@ -3858,6 +3948,41 @@ mod tests {
             resp.status().as_u16(),
             302,
             "pin_to + no_redirect returns the redirect verbatim"
+        );
+    }
+
+    // TEST 67: pin_to on an IPv4-literal URL host is rejected at send time with
+    // PinRequiresDomainHost — deterministically, without touching the network.
+    // reqwest/hyper treat an IP-literal host as already-resolved and skip the
+    // resolve override that installs the pin, so the socket would connect to the
+    // literal in the URL (198.51.100.1), NOT the pinned 127.0.0.1 — silently
+    // bypassing the pin. The guard rejects it instead.
+    #[tokio::test]
+    async fn pin_to_ipv4_literal_host_is_rejected() {
+        let result = Client::new()
+            .get("http://198.51.100.1:8080/")
+            .pin_to(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080))
+            .send()
+            .await;
+
+        assert!(
+            matches!(result, Err(ClientError::PinRequiresDomainHost(_))),
+            "expected PinRequiresDomainHost, got {result:?}"
+        );
+    }
+
+    // TEST 68: the same rejection applies to an IPv6-literal URL host.
+    #[tokio::test]
+    async fn pin_to_ipv6_literal_host_is_rejected() {
+        let result = Client::new()
+            .get("http://[2606:4700::1111]/")
+            .pin_to(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080))
+            .send()
+            .await;
+
+        assert!(
+            matches!(result, Err(ClientError::PinRequiresDomainHost(_))),
+            "expected PinRequiresDomainHost, got {result:?}"
         );
     }
 }
