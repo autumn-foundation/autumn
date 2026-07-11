@@ -1397,9 +1397,76 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             .filter(|dep| dep.action != DependentAction::Restrict)
             .map(&emit_grandchild_call)
             .collect();
-        let grandchild_cascade = quote! {
+        // #1739 (repo-attribute deps): compile-time recursion over
+        // `config.dependents`. Emitted ONLY when this repo declares
+        // `dependent(...)`.
+        let compiletime_grandchild_cascade = quote! {
             #(#grandchild_restrict_calls)*
             #(#grandchild_mutating_calls)*
+        };
+        // Codex P1 (model-side deps): when this repo has NO repository-attribute
+        // `dependent(...)`, its grandchildren may be declared ONLY on the child
+        // model (via `#[has_many(..., dependent = ...)]`), which populates the
+        // runtime `Model::dependents()` slice but leaves `config.dependents`
+        // empty. The #1739 compile-time recursion above is then empty, so without
+        // this the child row would be deleted while its own children still
+        // FK-reference it (FK failure on a hard delete, or silent orphans). So
+        // consult THIS model's runtime specs and recurse into each grandchild,
+        // mirroring the top-level model-side dispatch: restrict-probe first (a
+        // 409 rolls the whole tx back), then mutating. Reuses the existing
+        // `__visited` (table, id) cycle-guard set, the boxed-future `fn`
+        // recursion (the `Send` edge stays erased through the fn-pointer), and
+        // the `__ret_broadcasts` deferred-broadcast buffer for grandchild
+        // broadcasts. For a model with no dependents this is a cheap no-op that
+        // iterates an empty `&[]`, so the plain path stays behavior-equivalent.
+        let runtime_grandchild_cascade = quote! {
+            // Inherent `dependents()` (real specs) shadows the blanket trait
+            // method (empty); unqualified so the shadow wins, `&[]` otherwise.
+            let __autumn_gc_rt_deps = #model_name::dependents();
+            for __autumn_gc_spec in __autumn_gc_rt_deps.iter().filter(|__s|
+                __s.action == ::autumn_web::repository::DependentAction::Restrict
+            ) {
+                __ret_broadcasts.extend(
+                    (__autumn_gc_spec.cascade)(
+                        &self.pool,
+                        conn,
+                        __cid,
+                        #child_soft_for_grandchildren,
+                        __visited,
+                    ).await?
+                );
+            }
+            for __autumn_gc_spec in __autumn_gc_rt_deps.iter().filter(|__s|
+                __s.action != ::autumn_web::repository::DependentAction::Restrict
+            ) {
+                __ret_broadcasts.extend(
+                    (__autumn_gc_spec.cascade)(
+                        &self.pool,
+                        conn,
+                        __cid,
+                        #child_soft_for_grandchildren,
+                        __visited,
+                    ).await?
+                );
+            }
+        };
+        // Precedence (mirrors the top-level rule exactly to avoid double-cascade):
+        // repository-attribute `config.dependents` WINS when present. So with
+        // repo-attribute deps we emit the #1739 compile-time recursion ONLY; with
+        // none we walk the runtime `Model::dependents()` ONLY. A grandchild is
+        // therefore never processed by both paths.
+        let grandchild_cascade = if has_dependents {
+            compiletime_grandchild_cascade
+        } else {
+            runtime_grandchild_cascade
+        };
+        // `use AutumnDependents` brings the blanket `dependents()` fallback into
+        // scope for the runtime walk (models without dependents), matching the
+        // top-level dispatch. Emitted only where the runtime walk is.
+        let dep_autumn_dependents_use = if has_dependents {
+            quote! {}
+        } else {
+            quote! { use ::autumn_web::repository::AutumnDependents as _; }
         };
 
         // Declaration + return of the deferred-broadcast buffer for the Destroy
@@ -1407,7 +1474,14 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         // additionally, when this repo has dependents (#1739), grandchild cascades
         // return their broadcasts here to propagate up to the top-level parent for
         // post-commit publishing. Repos with neither return an empty buffer.
-        let needs_ret_buffer = dep_needs_broadcast || has_dependents;
+        // The Destroy arm always declares `__ret_broadcasts` now (hence `true`):
+        // with repo-attribute deps for the #1739 compile-time grandchild
+        // broadcasts (`has_dependents`), and without them for the Codex-P1
+        // runtime model-side grandchild walk, which always emits its
+        // `__ret_broadcasts.extend(...)` even though the loop is a no-op for a
+        // model with no dependents. `dep_needs_broadcast` still additionally
+        // drives this repo's own broadcasts-only child accumulation.
+        let needs_ret_buffer = true;
         let destroy_ret_decl = if needs_ret_buffer {
             quote! {
                 let mut __ret_broadcasts: ::std::vec::Vec<(::std::string::String, ::std::string::String)> =
@@ -1491,6 +1565,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 use ::autumn_web::reexports::diesel::prelude::*;
                 use ::autumn_web::reexports::diesel_async::RunQueryDsl;
                 #dep_hooks_use
+                #dep_autumn_dependents_use
                 let __table: &str = #table_name;
                 match __action {
                     ::autumn_web::repository::DependentAction::Restrict => {
@@ -15453,6 +15528,65 @@ mod tests {
             hard_section.contains("__autumn_apply_dependent_on_conn")
                 && hard_section.contains(", false ,"),
             "a hard-delete parent must pass __parent_soft = false to the cascade: {hard_section}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_helper_destroy_arm_runtime_dispatches_grandchildren_without_repo_attr_deps()
+    {
+        // Codex P1: a repository with NO repository-attribute `dependent(...)`
+        // must, in its `__autumn_apply_dependent_on_conn` Destroy arm, consult
+        // the child model's runtime `dependents()` and recurse into each
+        // grandchild spec — so a FULLY model-declared `Post -> Comment -> Reply`
+        // graph cascades all the way down. Without this the arm would delete the
+        // child while its own children still FK-reference it (FK failure /
+        // orphans), because `config.dependents` is empty and the #1739
+        // compile-time recursion is a no-op.
+        let generated = repository_macro(
+            quote! { Comment },
+            quote! { pub trait CommentRepository {} },
+        )
+        .to_string();
+        // The `AutumnDependents` fallback is `use`d in the helper prelude (above
+        // the match); the runtime walk itself lives in the Destroy arm.
+        let helper = dependent_helper_body(&generated);
+        assert!(
+            helper.contains("AutumnDependents"),
+            "the helper must bring the AutumnDependents fallback into scope: {helper}"
+        );
+        let destroy_arm = dependent_destroy_arm(&generated);
+        assert!(
+            destroy_arm.contains("dependents ()"),
+            "no-repo-attr destroy arm must runtime-dispatch grandchildren via Model::dependents(): {destroy_arm}"
+        );
+        assert!(
+            destroy_arm.contains(". cascade"),
+            "the runtime grandchild walk must invoke each spec's cascade thunk: {destroy_arm}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_helper_destroy_arm_repo_attr_deps_do_not_runtime_dispatch() {
+        // Precedence (Codex P1, mirrors the top-level rule exactly to avoid
+        // double-cascade): a repository-attribute `dependent(...)` WINS — the
+        // Destroy arm keeps the #1739 compile-time grandchild recursion ONLY and
+        // must NOT also walk the runtime `Model::dependents()`, so a grandchild
+        // is never processed by both paths.
+        let generated = repository_macro(
+            quote! { Comment, dependent(PgReplyRepository, fk = "comment_id", on_delete = destroy) },
+            quote! { pub trait CommentRepository {} },
+        )
+        .to_string();
+        let helper = dependent_helper_body(&generated);
+        assert!(
+            !helper.contains("AutumnDependents"),
+            "a repo-attribute dependent(...) helper must not runtime-dispatch \
+             (repo-attr wins, no double-cascade): {helper}"
+        );
+        let destroy_arm = dependent_destroy_arm(&generated);
+        assert!(
+            destroy_arm.contains("__autumn_apply_dependent_on_conn"),
+            "the #1739 compile-time grandchild recursion must remain: {destroy_arm}"
         );
     }
 

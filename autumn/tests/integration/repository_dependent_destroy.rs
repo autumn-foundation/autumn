@@ -372,6 +372,81 @@ pub struct Dep3Reply {
 #[autumn_web::repository(Dep3Reply, table = "dep3_replies")]
 pub trait Dep3ReplyRepository {}
 
+// ── Codex P1: FULLY model-side three-level grandchild graph ───────────────────
+//
+// The same `Post → Comment → Reply` recursion as `Dep3*` above, but declared
+// ENTIRELY on the model structs via `#[has_many(..., dependent = destroy)]`,
+// with NO repository-attribute `dependent(...)` anywhere. Each parent's
+// `config.dependents` is therefore empty, so both the top-level `delete_by_id`
+// dispatch (#1738) AND the intermediate child's `__autumn_apply_dependent_on_conn`
+// Destroy arm (Codex P1) must consult the runtime `Model::dependents()` to reach
+// the grandchildren. Deleting an `M3Post` must leave zero `M3Reply` (grandchild)
+// AND zero `M3Comment` (child) rows — the exact P1 acceptance criterion. The
+// child repositories resolve by the `Pg{Child}Repository` convention
+// (`M3Comment` → `PgM3CommentRepository`, `M3Reply` → `PgM3ReplyRepository`).
+
+diesel::table! {
+    m3_posts (id) {
+        id -> Int8,
+        title -> Text,
+    }
+}
+
+#[autumn_web::model(table = "m3_posts")]
+#[has_many(M3Comment, fk = "post_id", dependent = destroy)]
+pub struct M3Post {
+    #[id]
+    pub id: i64,
+    pub title: String,
+}
+
+#[autumn_web::repository(M3Post, table = "m3_posts")]
+pub trait M3PostRepository {}
+
+diesel::table! {
+    m3_comments (id) {
+        id -> Int8,
+        post_id -> Int8,
+        body -> Text,
+    }
+}
+
+// A model-side child that ITSELF declares a model-side dependent — this is what
+// exercises the new runtime-grandchild codegen inside its Destroy arm. The
+// grandchild table is `m3_replys` (autumn's naive `{snake}s` pluralization of
+// `M3Reply`) so the `#[has_many]` preload codegen resolves the Diesel table
+// module by convention, matching the other has_many targets in this file.
+#[autumn_web::model(table = "m3_comments")]
+#[has_many(M3Reply, fk = "comment_id", dependent = destroy)]
+pub struct M3Comment {
+    #[id]
+    pub id: i64,
+    pub post_id: i64,
+    pub body: String,
+}
+
+#[autumn_web::repository(M3Comment, table = "m3_comments")]
+pub trait M3CommentRepository {}
+
+diesel::table! {
+    m3_replys (id) {
+        id -> Int8,
+        comment_id -> Int8,
+        body -> Text,
+    }
+}
+
+#[autumn_web::model(table = "m3_replys")]
+pub struct M3Reply {
+    #[id]
+    pub id: i64,
+    pub comment_id: i64,
+    pub body: String,
+}
+
+#[autumn_web::repository(M3Reply, table = "m3_replys")]
+pub trait M3ReplyRepository {}
+
 // ── #1739 cycle guard: a self-referential `destroy` dependent ─────────────────
 //
 // `dep_nodes.parent_id` references `dep_nodes.id`, and the repository declares a
@@ -488,6 +563,10 @@ async fn setup_pool() -> (
         "CREATE TABLE dep3_posts (id BIGSERIAL PRIMARY KEY, title TEXT NOT NULL)",
         "CREATE TABLE dep3_comments (id BIGSERIAL PRIMARY KEY, post_id BIGINT NOT NULL REFERENCES dep3_posts(id), body TEXT NOT NULL)",
         "CREATE TABLE dep3_replies (id BIGSERIAL PRIMARY KEY, comment_id BIGINT NOT NULL REFERENCES dep3_comments(id), body TEXT NOT NULL)",
+        // Codex P1: fully model-side three-level grandchild graph.
+        "CREATE TABLE m3_posts (id BIGSERIAL PRIMARY KEY, title TEXT NOT NULL)",
+        "CREATE TABLE m3_comments (id BIGSERIAL PRIMARY KEY, post_id BIGINT NOT NULL REFERENCES m3_posts(id), body TEXT NOT NULL)",
+        "CREATE TABLE m3_replys (id BIGSERIAL PRIMARY KEY, comment_id BIGINT NOT NULL REFERENCES m3_comments(id), body TEXT NOT NULL)",
         // Self-referential FK: parent_id references the same table. The FK is
         // DEFERRABLE INITIALLY DEFERRED so a *cyclic* component can be hard-deleted
         // within one transaction (the constraint is checked at COMMIT, by which
@@ -548,6 +627,19 @@ fn dependent_repository_surface_is_generated() {
     // `AutumnDependents::dependents`): destroy + delete_all + restrict.
     assert_is_fn(ModelDepPost::dependents);
     assert_eq!(ModelDepPost::dependents().len(), 3);
+    // Codex P1: the fully model-side three-level graph monomorphizes. The key
+    // new codegen is the intermediate `M3Comment`'s cascade leaf executor —
+    // its Destroy arm now runtime-dispatches into `M3Comment::dependents()`
+    // (the grandchild `M3Reply` spec) because `M3Comment` declares its
+    // dependent ONLY model-side (empty `config.dependents`). Referencing the
+    // helper + both `delete_by_id`s type-checks that recursive runtime path.
+    assert_is_fn(<PgM3PostRepository as M3PostRepository>::delete_by_id);
+    assert_is_fn(<PgM3CommentRepository as M3CommentRepository>::delete_by_id);
+    assert_is_fn(PgM3CommentRepository::__autumn_apply_dependent_on_conn);
+    assert_is_fn(PgM3ReplyRepository::__autumn_apply_dependent_on_conn);
+    // A model-side child (M3Comment) that itself has a model-side dependent.
+    assert_eq!(M3Post::dependents().len(), 1);
+    assert_eq!(M3Comment::dependents().len(), 1);
 }
 
 // ── Tests (require Docker) ────────────────────────────────────────────────────
@@ -819,6 +911,66 @@ async fn deleting_parent_recurses_into_grandchildren() {
         count(&mut conn, "SELECT COUNT(*) AS n FROM dep3_replies").await,
         0,
         "#1739: all replies (grandchildren) must be recursively destroyed — zero left"
+    );
+}
+
+/// Codex P1: deleting an `M3Post` whose graph is declared ENTIRELY model-side
+/// (`M3Post -> M3Comment -> M3Reply`, all via `#[has_many(..., dependent =
+/// destroy)]`, NO repository-attribute `dependent(...)`) must recurse all the
+/// way down. Because the intermediate `M3Comment` declares its dependent only
+/// model-side, its `config.dependents` is empty; the fix makes its Destroy arm
+/// consult the runtime `M3Comment::dependents()` so the grandchildren cascade
+/// too. Asserts **zero `M3Reply` rows AND zero `M3Comment` rows** remain (the
+/// exact acceptance criterion), in one transaction with no FK error.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn deleting_model_side_parent_recurses_into_model_side_grandchildren() {
+    let (pool, _c) = setup_pool().await;
+    let mut conn = pool.get().await.expect("conn");
+
+    diesel::sql_query("INSERT INTO m3_posts (id, title) VALUES (1, 'p')")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    // 2 comments, each with 2 replies → 4 grandchildren.
+    for c in 1..=2 {
+        diesel::sql_query(format!(
+            "INSERT INTO m3_comments (id, post_id, body) VALUES ({c}, 1, 'c{c}')"
+        ))
+        .execute(&mut conn)
+        .await
+        .unwrap();
+        for r in 1..=2 {
+            let rid = c * 10 + r;
+            diesel::sql_query(format!(
+                "INSERT INTO m3_replys (id, comment_id, body) VALUES ({rid}, {c}, 'r{rid}')"
+            ))
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        }
+    }
+
+    let repo = PgM3PostRepository::with_pool_untracked(pool.clone());
+    repo.delete_by_id(1)
+        .await
+        .expect("model-side recursive cascade must not FK-error");
+
+    assert_eq!(
+        count(&mut conn, "SELECT COUNT(*) AS n FROM m3_posts WHERE id = 1").await,
+        0,
+        "parent gone"
+    );
+    assert_eq!(
+        count(&mut conn, "SELECT COUNT(*) AS n FROM m3_comments").await,
+        0,
+        "Codex P1: all comments (children) must be destroyed — zero left"
+    );
+    assert_eq!(
+        count(&mut conn, "SELECT COUNT(*) AS n FROM m3_replys").await,
+        0,
+        "Codex P1: all replies (grandchildren) must be recursively destroyed via \
+         the child's runtime Model::dependents() — zero left"
     );
 }
 
