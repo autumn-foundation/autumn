@@ -1803,7 +1803,7 @@ fn render_routes_file(
         // standard path — the new/edit form bodies load the options before the
         // markup. The block wraps the `layout(...)` call so it splices into the
         // GET handlers and the 422 re-render branches unchanged.
-        let mut option_loads = String::new();
+        let mut option_loads = String::with_capacity(reference_fields.len() * 80);
         for f in &reference_fields {
             let name = &f.name;
             let _ = writeln!(
@@ -3063,7 +3063,7 @@ fn render_changeset_form_inputs(
     // it keeps the derived per-field control instead.
     let reference_select_names: BTreeSet<&str> =
         reference_selects.iter().map(|f| f.name.as_str()).collect();
-    let mut out = String::new();
+    let mut out = String::with_capacity(fields.len() * 150);
     for f in fields {
         let name = &f.name;
         let label = humanize_label(name);
