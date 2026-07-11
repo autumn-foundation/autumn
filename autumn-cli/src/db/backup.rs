@@ -1922,24 +1922,37 @@ fn resolve_loaded_offsite(
     let Some(offsite) = cfg.backup.offsite else {
         return Ok(None);
     };
+    // Only treat the `[storage.s3]` bucket as the APP storage destination when the
+    // resolved storage backend is actually S3 (P2 #16). If the app runs on the
+    // local/disabled backend, a leftover `[storage.s3]` bucket is inert — it is
+    // not where the app writes blobs — so it must NOT trip the shared-bucket guard
+    // and force `allow_shared_bucket` for an offsite backup that happens to reuse
+    // that bucket name.
+    let storage_is_s3 = cfg.storage.backend == autumn_web::storage::StorageBackend::S3;
+    let (app_storage_bucket, app_storage_endpoint) = if storage_is_s3 {
+        (
+            cfg.storage
+                .s3
+                .bucket
+                .as_deref()
+                .map(str::trim)
+                .filter(|b| !b.is_empty())
+                .map(str::to_owned),
+            cfg.storage
+                .s3
+                .endpoint
+                .as_deref()
+                .map(str::trim)
+                .filter(|e| !e.is_empty())
+                .map(str::to_owned),
+        )
+    } else {
+        (None, None)
+    };
     Ok(Some(LoadedOffsite {
         offsite: *offsite,
-        app_storage_bucket: cfg
-            .storage
-            .s3
-            .bucket
-            .as_deref()
-            .map(str::trim)
-            .filter(|b| !b.is_empty())
-            .map(str::to_owned),
-        app_storage_endpoint: cfg
-            .storage
-            .s3
-            .endpoint
-            .as_deref()
-            .map(str::trim)
-            .filter(|e| !e.is_empty())
-            .map(str::to_owned),
+        app_storage_bucket,
+        app_storage_endpoint,
         profile: profile.to_owned(),
     }))
 }
@@ -3596,6 +3609,52 @@ mod tests {
             .unwrap()
             .expect("materialized from env");
         assert_eq!(loaded2.offsite.s3.bucket.as_deref(), Some("env-bucket"));
+    }
+
+    #[test]
+    fn shared_bucket_guard_only_applies_when_storage_backend_is_s3() {
+        // P2 #16: a leftover `[storage.s3]` bucket that equals the offsite bucket
+        // must NOT trip the shared-bucket guard unless the app storage backend is
+        // actually S3. On backend=local/disabled the bucket is inert.
+        let env = autumn_web::config::MockEnv::new();
+        let make = |backend: &str| -> LoadedOffsite {
+            let table: toml::Table = toml::from_str(&format!(
+                "[storage]\nbackend = \"{backend}\"\n\
+                 [storage.s3]\nbucket = \"shared\"\nendpoint = \"https://minio.example:9000\"\n\
+                 [backup.offsite]\nprefix = \"db\"\n\
+                 [backup.offsite.s3]\nbucket = \"shared\"\nregion = \"us-east-1\"\n\
+                 endpoint = \"https://minio.example:9000\"\nforce_path_style = true\n"
+            ))
+            .unwrap();
+            resolve_loaded_offsite(Some(&table), &env, "prod")
+                .expect("resolves")
+                .expect("offsite section present")
+        };
+
+        // backend=local: the s3 bucket is NOT the app storage destination, so the
+        // guard input is empty and destinations_conflict cannot fire.
+        let local = make("local");
+        assert_eq!(local.app_storage_bucket, None);
+        assert!(!destinations_conflict(
+            "shared",
+            Some("https://minio.example:9000"),
+            local.app_storage_bucket.as_deref(),
+            local.app_storage_endpoint.as_deref(),
+        ));
+
+        // backend=disabled: same — inert `[storage.s3]`.
+        assert_eq!(make("disabled").app_storage_bucket, None);
+
+        // backend=s3: the bucket IS the app destination, so the guard fires and
+        // the offsite backup must opt in with allow_shared_bucket.
+        let s3 = make("s3");
+        assert_eq!(s3.app_storage_bucket.as_deref(), Some("shared"));
+        assert!(destinations_conflict(
+            "shared",
+            Some("https://minio.example:9000"),
+            s3.app_storage_bucket.as_deref(),
+            s3.app_storage_endpoint.as_deref(),
+        ));
     }
 
     #[test]
