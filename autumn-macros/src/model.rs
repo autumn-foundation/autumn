@@ -308,12 +308,16 @@ fn check_m2m_mutation_name_collisions(assocs: &[Association]) -> syn::Result<()>
             return Err(syn::Error::new_spanned(
                 &assoc.target,
                 format!(
-                    "many-to-many association `{}` (target `{}`) would generate \
-                     mutation helpers `add_{singular}`/`remove_{singular}` that \
-                     collide with another `through =` association to the same \
-                     target on this model; a model may declare at most one \
-                     many-to-many association per target type",
-                    assoc.name, assoc.target,
+                    "many-to-many association `{}` (target `{}`) resolves to the \
+                     same target-derived mutation helpers `add_{singular}`/\
+                     `remove_{singular}` as another `through =` association to \
+                     `{}` on this model; a model may currently declare at most \
+                     one many-to-many association per target type. The intended \
+                     fix is an explicit per-association helper-name override \
+                     (planned `helper = \"...\"`) so distinct m2m relations to \
+                     the same target get non-colliding helpers — tracked in \
+                     https://github.com/madmax983/autumn/issues/1785",
+                    assoc.name, assoc.target, assoc.target,
                 ),
             ));
         }
