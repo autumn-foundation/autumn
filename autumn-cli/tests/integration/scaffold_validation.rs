@@ -81,6 +81,95 @@ fn model_carries_validate_attributes_from_dsl_constraints() {
     );
 }
 
+/// Issue #1748: a required numeric with a `{min,max}` range that spans the
+/// type's zero default (`age:i32{min=0,max=130}`) must NOT keep its native
+/// `i32` on the form struct — a native field defaults to `0`, which pre-fills
+/// the input and passes both `required` (the HTML attribute) and the
+/// `range(0,130)` rule, so a blank submission silently becomes `0`. The fix
+/// represents it as `Option<i32>` with `#[validate(required, range(...))]`:
+/// the default is `None` (renders blank, forces deliberate input), `range`
+/// validates the inner value only when `Some`, and `required` rejects `None`
+/// server-side. The `into_new` path must unwrap the `Option`, never coerce a
+/// missing value to `0`.
+#[test]
+fn constrained_required_numeric_spanning_zero_is_optional_not_native() {
+    let (_tmp, project) = constrained_project("validate-optnum-app");
+    let routes = fs::read_to_string(project.join("src/routes/posts.rs")).unwrap();
+
+    // The form-struct field is `Option<i32>` (blank -> None), carrying both the
+    // `required` and `range` validators.
+    assert!(
+        routes.contains(
+            "    #[validate(required)]\n    #[validate(range(min = 0, max = 130))]\n    pub age: Option<i32>,"
+        ),
+        "constrained required `age` must be `Option<i32>` with #[validate(required, range(...))]:\n{routes}"
+    );
+
+    // The native-typed representation (which pre-fills `0`) must be gone.
+    assert!(
+        !routes.contains("pub age: i32,"),
+        "constrained required `age` must not keep its native `i32` type:\n{routes}"
+    );
+
+    // `into_new` must unwrap the Option and reject a missing value, never
+    // silently coerce a blank submission to `0` via a native clone.
+    assert!(
+        routes.contains("age: form.age.ok_or_else("),
+        "into_new must unwrap the Option and error on a missing value:\n{routes}"
+    );
+    assert!(
+        !routes.contains("age: form.age.clone(),") && !routes.contains("age: form.age,"),
+        "into_new must not pass the native field straight through:\n{routes}"
+    );
+
+    // The edit-form seed maps a persisted row's native value back into `Some`.
+    assert!(
+        routes.contains("age: Some(row.age),"),
+        "from_row must wrap the persisted native value in Some:\n{routes}"
+    );
+}
+
+/// Issue #1748 (Codex follow-up): the synthetic constrained-required-`Option<T>`
+/// numeric (`age:i32{min=0,max=130}`) must be dropped from the request body when
+/// its `field=` pair is present-but-empty, exactly like a genuinely nullable
+/// field. The decoder strips empty pairs only for fields matching
+/// `is_nullable_form_field`; that field is `Option<i32>` but has
+/// `nullable == false`, so without including it a blank `age=` (from curl, a
+/// non-browser client, or disabled JS) reaches `serde_urlencoded`, which parses
+/// `""` into the inner numeric and returns a **400** *before*
+/// `#[validate(required)]` can render the intended **422** inline error.
+/// Dropping the empty pair makes `age` decode as `None`, so `required` fires and
+/// produces the 422 (the #1748 intent). Asserts the generated
+/// `is_nullable_form_field` set includes `age` alongside the nullable `bio`.
+#[test]
+fn constrained_required_numeric_empty_pair_is_dropped_like_nullable() {
+    let (_tmp, project) = constrained_project("validate-blankdrop-app");
+    let routes = fs::read_to_string(project.join("src/routes/posts.rs")).unwrap();
+
+    // The decoder gates its empty-pair drop on `is_nullable_form_field`.
+    assert!(
+        routes.contains("!(value.is_empty() && is_nullable_form_field(key))"),
+        "decoder must drop empty pairs for the nullable/drop set:\n{routes}"
+    );
+
+    // The synthetic `Option<i32>` `age` must be part of that drop set so a blank
+    // `age=` decodes as `None` (-> 422 via `required`) rather than being parsed
+    // as `""` by serde_urlencoded (-> 400). It appears alongside nullable `bio`.
+    let helper = routes
+        .split_once("fn is_nullable_form_field(name: &str) -> bool {")
+        .and_then(|(_, rest)| rest.split_once('}'))
+        .map(|(body, _)| body)
+        .expect("generated routes must define is_nullable_form_field");
+    assert!(
+        helper.contains("\"age\""),
+        "constrained required `age` must be in the empty-pair drop set (is_nullable_form_field):\n{helper}"
+    );
+    assert!(
+        helper.contains("\"bio\""),
+        "nullable `bio` must remain in the empty-pair drop set:\n{helper}"
+    );
+}
+
 #[test]
 fn cargo_toml_pulls_in_validator_dependency() {
     let (_tmp, project) = constrained_project("validate-cargo-app");
@@ -321,6 +410,101 @@ fn slice_textarea_attrs<'a>(routes: &'a str, marker: &str) -> &'a str {
         .unwrap_or_else(|| panic!("missing {marker} in:\n{routes}"));
     let rest = &routes[start..];
     let end = rest.find("class=").unwrap_or(rest.len());
+    &rest[..end]
+}
+
+/// Issue #1750: a `--live-validation` scaffold renders its form through the
+/// per-field path (not `form_for`), which historically dropped the #1388
+/// client-side HTML5 constraint attributes. The live path must now carry the
+/// SAME attributes the standard path emits — `minlength`/`maxlength`,
+/// `type="email"`/`type="url"`, numeric `min`/`max`, and a `<textarea>` for
+/// constrained `Text` — threaded through the htmx inline-validation wiring, and
+/// the inline-validate handler fragment must carry them too so the swapped-in
+/// field doesn't shed its client-side guards on the first `change`.
+#[test]
+fn live_validation_forms_carry_html5_constraints() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    run_autumn_ok(tmp.path(), &["new", "live-validate-html5-app"]);
+    let project = tmp.path().join("live-validate-html5-app");
+    run_autumn_ok(
+        &project,
+        &[
+            "generate",
+            "scaffold",
+            "Post",
+            "title:String{min=3,max=120}",
+            "contact:String{email}",
+            "homepage:String{url}",
+            "age:i32{min=0,max=130}",
+            "notes:Text{min=10,max=500}",
+            "bio:Option<String>{max=200}",
+            "--live-validation",
+        ],
+    );
+    let routes = fs::read_to_string(project.join("src/routes/posts.rs")).unwrap();
+
+    // The string length constraint on the htmx-validated `title` input.
+    assert!(
+        routes.contains("minlength=\"3\" maxlength=\"120\""),
+        "title must render minlength/maxlength in live-validation mode:\n{routes}"
+    );
+    // Typed inputs (email/url) instead of a bare text input.
+    assert!(
+        routes.contains("type=\"email\" id=\"contact\""),
+        "contact must render type=email in live-validation mode:\n{routes}"
+    );
+    assert!(
+        routes.contains("type=\"url\" id=\"homepage\""),
+        "homepage must render type=url in live-validation mode:\n{routes}"
+    );
+    // Numeric min/max on the number input.
+    assert!(
+        routes.contains("type=\"number\"") && routes.contains("min=\"0\" max=\"130\""),
+        "age must render type=number with min/max in live-validation mode:\n{routes}"
+    );
+    // A constrained `Text` column becomes a <textarea> carrying its length rule.
+    assert!(
+        routes.contains("textarea id=\"notes\" name=\"notes\"")
+            && routes.contains("maxlength=\"500\""),
+        "constrained Text `notes` must render a <textarea> with maxlength:\n{routes}"
+    );
+    // The nullable `bio` keeps its maxlength.
+    assert!(
+        routes.contains("maxlength=\"200\""),
+        "bio must render maxlength in live-validation mode:\n{routes}"
+    );
+
+    // The htmx inline-validation wiring survives on a constrained validated
+    // input (real-time validation still works alongside the static constraints),
+    // and its swap wrapper marker is present.
+    assert!(
+        routes.contains("hx-post=\"/posts/validate/title\"")
+            && routes.contains("data-autumn-field-wrapper=\"title\""),
+        "the constrained title input must keep its htmx inline-validation wiring:\n{routes}"
+    );
+
+    // The inline-validate handler returns the SAME constrained fragment, so the
+    // swapped-in field doesn't drop the client-side attributes on first change.
+    let validate_title = slice_fn(&routes, "pub async fn validate_title(");
+    assert!(
+        validate_title.contains("minlength=\"3\" maxlength=\"120\""),
+        "the validate_title fragment must also carry the HTML5 constraints:\n{validate_title}"
+    );
+    assert!(
+        !validate_title.contains("type=\"email\""),
+        "sanity: the validate_title slice must be bounded to its own handler:\n{validate_title}"
+    );
+}
+
+/// Slice a generated handler body from its `fn` marker to the next handler's
+/// `#[post(` attribute (or end of file), so an assertion scoped to one
+/// inline-validate handler can't accidentally match a sibling's fragment.
+fn slice_fn<'a>(routes: &'a str, marker: &str) -> &'a str {
+    let start = routes
+        .find(marker)
+        .unwrap_or_else(|| panic!("missing {marker} in:\n{routes}"));
+    let rest = &routes[start..];
+    let end = rest[1..].find("#[post(").map_or(rest.len(), |rel| rel + 1);
     &rest[..end]
 }
 

@@ -1220,6 +1220,18 @@ fn render_model_form(
 
     for f in fields {
         let name = &f.name;
+        // A required numeric carrying a `{min,max}` range (issue #1388) is
+        // represented as `Option<T>` on the form struct (issue #1748): a native
+        // `T` defaults to `0`, which pre-fills the input and passes both
+        // `required` (HTML) and `range` when the range spans the zero default,
+        // silently accepting a value the user never typed. `Option<T>` defaults
+        // to `None` (renders blank), and the `required` rule below rejects it.
+        let is_constrained_required_numeric = is_constrained_required_numeric(f);
+        if is_constrained_required_numeric {
+            // Emitted alongside the `range` rule so `None` is rejected
+            // server-side (a 422 with an inline error) rather than parsed as `0`.
+            let _ = writeln!(struct_fields, "    #[validate(required)]");
+        }
         if let Some(rules) = validations.get(name) {
             for rule in rules {
                 let _ = writeln!(struct_fields, "    #[validate({rule})]");
@@ -1359,6 +1371,23 @@ fn render_model_form(
                     "            {name}: match &row.{name} {{ {arms}}},"
                 );
             }
+        } else if is_constrained_required_numeric {
+            // A required numeric with a `{min,max}` range (issue #1388) is
+            // `Option<T>` on the form struct (issue #1748). `validator`'s
+            // `range` rule applies to the inner value only when `Some`, so the
+            // range is still enforced server-side; `None` (the blank default)
+            // is rejected by the `#[validate(required)]` emitted above rather
+            // than parsed as `T::default()` (`0`). A native `T` here would
+            // pre-fill `0` and silently pass both `required` and a range that
+            // spans the zero default. `into_new` unwraps the validated
+            // `Some(_)`; `from_row` wraps a persisted native value in `Some`.
+            let rust_type = f.rust_type();
+            let _ = writeln!(struct_fields, "    pub {name}: Option<{rust_type}>,");
+            let _ = writeln!(
+                into_new,
+                "        {name}: form.{name}.ok_or_else(|| autumn_web::AutumnError::bad_request_msg(\"{name}: is required\"))?,"
+            );
+            let _ = writeln!(from_row, "            {name}: Some(row.{name}),");
         } else if !f.nullable
             && matches!(
                 f.kind,
@@ -1370,21 +1399,6 @@ fn render_model_form(
                     | FieldKind::Decimal { .. }
                     | FieldKind::References
             )
-            // A numeric field carrying a `{min,max}` range constraint (issue
-            // #1388) must keep its NATIVE type on the form struct, not the
-            // String representation below: `validator`'s `range` rule only
-            // applies to numeric types, so `#[validate(range(...))]` on a
-            // `String` field fails to compile — and the whole point of the
-            // constraint is that the range is rejected server-side through the
-            // changeset (a 422 with an inline error), which needs the rule on
-            // the form the changeset validates. The `T::default()` pre-fill
-            // trade-off the String representation avoids is moot here: the
-            // field is `required` and range-bounded, so a deliberate value is
-            // forced anyway.
-            && !(matches!(
-                f.kind,
-                FieldKind::I32 | FieldKind::I64 | FieldKind::F32 | FieldKind::F64
-            ) && (f.constraints.min.is_some() || f.constraints.max.is_some()))
         {
             // Represented as a `String` on the form, exactly like a required
             // enum/datetime field: `T::default()` for these kinds (`0`, the nil
@@ -1511,17 +1525,13 @@ fn render_routes_file(
         .filter(|f| f.kind.is_reference() && !missing_reference_targets.contains(&f.name))
         .collect();
     // The subset that also renders an in-FORM `<select>` of the referenced
-    // table's ids (issue #1135 AC 2) plus its runtime option loaders.
-    // `--live-validation` renders the form through the per-field path (no
-    // `form_for`, and `select_input` takes only static options, so a
-    // runtime-option belongs_to `<select>` can't be wired through it without
-    // the same cross-crate form-helper change #1750 tracks): skip the dropdown
-    // + loaders there, but KEEP the index/show display rendering above.
-    let reference_fields: Vec<&Field> = if live_validation {
-        Vec::new()
-    } else {
-        display_reference_fields.clone()
-    };
+    // table's ids (issue #1135 AC 2) plus its runtime option loaders. Issue
+    // #1750: `--live-validation` renders the form through the per-field path
+    // (no `form_for`), which used to drop the dropdown — the per-field path now
+    // emits a raw runtime-populated `<select>` (see
+    // `render_live_reference_select`), so every mode gets the belongs_to
+    // dropdown.
+    let reference_fields: Vec<&Field> = display_reference_fields.clone();
     let has_reference_selects = !reference_fields.is_empty();
 
     // Issue #1130: standard scaffolds render every view through the
@@ -1780,8 +1790,23 @@ fn render_routes_file(
             plural,
             live_validation,
             &validated_fields,
+            &reference_fields,
         );
-        let new_form_body = format!(
+        // Issue #1750: the belongs_to parent `<select>` (rendered inline by
+        // `render_changeset_form_inputs` via `render_live_reference_select`)
+        // reads a request-time `{name}_options` binding, so — exactly like the
+        // standard path — the new/edit form bodies load the options before the
+        // markup. The block wraps the `layout(...)` call so it splices into the
+        // GET handlers and the 422 re-render branches unchanged.
+        let mut option_loads = String::with_capacity(reference_fields.len() * 80);
+        for f in &reference_fields {
+            let name = &f.name;
+            let _ = writeln!(
+                option_loads,
+                "        let {name}_options = {name}_select_options(&mut db).await?;"
+            );
+        }
+        let new_form_layout = format!(
             "{layout_fn}(\"New {pascal_name}\", {cp_new}{flash_arg}, html! {{\n        \
              h1 {{ \"New {pascal_name}\" }}\n        \
              form action=\"/{plural}\" method=\"post\"{form_enctype} {{\n            \
@@ -1790,7 +1815,7 @@ fn render_routes_file(
              }}\n    \
              }})"
         );
-        let edit_form_body = format!(
+        let edit_form_layout = format!(
             "{layout_fn}(&format!(\"Edit {pascal_name} #{{}}\", *id), {cp_edit}{flash_arg}, html! {{\n        \
              h1 {{ \"Edit {pascal_name} #\" (*id) }}\n        \
              form action=(format!(\"/{plural}/{{}}/update\", *id)) method=\"post\"{form_enctype} {{\n            \
@@ -1803,12 +1828,18 @@ fn render_routes_file(
              }}\n    \
              }})"
         );
-        // The in-form belongs_to `<select>` is deferred in `--live-validation`
-        // (#1750), but the referenced-row option loaders are still emitted: the
-        // issue #1146 index parent-label map is built by collecting each
-        // `{name}_select_options(...)` into a `HashMap` (see
-        // `render_index_reference_label_loads`), so the loaders are a live
-        // dependency of the restored index display, not dead code.
+        let (new_form_body, edit_form_body) = if has_reference_selects {
+            (
+                format!("{{\n{option_loads}        {new_form_layout}\n    }}"),
+                format!("{{\n{option_loads}        {edit_form_layout}\n    }}"),
+            )
+        } else {
+            (new_form_layout, edit_form_layout)
+        };
+        // The referenced-row option loaders are emitted regardless: they
+        // populate the in-form `<select>` (issue #1750) AND the issue #1146
+        // index parent-label map (`render_index_reference_label_loads` collects
+        // each `{name}_select_options(...)` into a `HashMap`).
         let option_loaders =
             render_reference_option_loaders(&display_reference_fields, db_ty, &reference_displays);
         (new_form_body, edit_form_body, option_loaders)
@@ -2224,19 +2255,22 @@ pub async fn index(
         for (field_name, rules) in validations {
             let rule_comment = rules.join(", ");
             let label = humanize_label(field_name);
-            // Match `render_changeset_form_inputs`'s helper choice: a
-            // non-nullable field keeps `required`/`aria-required` through the
-            // htmx round-trip too, otherwise the attribute would vanish from
-            // the DOM the moment the field's wrapper gets swapped in.
-            let is_nullable = fields
-                .iter()
-                .find(|f| f.name == *field_name)
-                .is_some_and(|f| f.nullable);
-            let helper = if is_nullable {
-                "text_input_htmx"
-            } else {
-                "required_text_input_htmx"
-            };
+            let field = fields.iter().find(|f| f.name == *field_name);
+            // Issue #1750: a DSL-constrained `String`/`Text` field renders in
+            // the form through the raw-markup constrained control (carrying the
+            // #1388 HTML5 attributes `minlength`/`maxlength`/`type="email"`), so
+            // its inline-validation fragment must return the SAME markup —
+            // otherwise the htmx `outerHTML` swap on the first `change` would
+            // shed those client-side guards. The swapped-in field re-wires its
+            // own htmx trigger from the identical `validate_url`.
+            let constrained = field.and_then(|f| {
+                html5_constraint_spec(f).and_then(|(input_type, attrs)| {
+                    // Numerics don't take the htmx path (no wrapper to swap), so
+                    // only the text-family constrained controls need a fragment.
+                    matches!(f.kind, FieldKind::String | FieldKind::Text)
+                        .then_some((f, input_type, attrs))
+                })
+            });
             let _ = write!(
                 vh,
                 "\n\n/// `POST /{plural}/validate/{field_name}` — inline validation fragment.\n"
@@ -2257,10 +2291,26 @@ pub async fn index(
             vh.push_str("        return autumn_web::html! {};\n");
             vh.push_str("    };\n");
             vh.push_str("    let changeset = form.into_changeset();\n");
-            let _ = writeln!(
-                vh,
-                "    autumn_web::form::{helper}(&changeset, \"{field_name}\", \"{label}\", \"/{plural}/validate/{field_name}\")"
-            );
+            if let Some((f, input_type, attrs)) = constrained {
+                let url = format!("/{plural}/validate/{field_name}");
+                let markup =
+                    render_live_constrained_field(f, "changeset", input_type, &attrs, Some(&url));
+                let _ = writeln!(vh, "    autumn_web::html! {{\n        {markup}\n    }}");
+            } else {
+                // Match `render_changeset_form_inputs`'s helper choice: a
+                // non-nullable field keeps `required`/`aria-required` through the
+                // htmx round-trip too, otherwise the attribute would vanish from
+                // the DOM the moment the field's wrapper gets swapped in.
+                let helper = if field.is_some_and(|f| f.nullable) {
+                    "text_input_htmx"
+                } else {
+                    "required_text_input_htmx"
+                };
+                let _ = writeln!(
+                    vh,
+                    "    autumn_web::form::{helper}(&changeset, \"{field_name}\", \"{label}\", \"/{plural}/validate/{field_name}\")"
+                );
+            }
             vh.push_str("}\n");
         }
         vh
@@ -2991,20 +3041,47 @@ fn resolve_reference_display(
 /// the matching helper (`text_input`, `number_input`, `datetime_input`,
 /// `checkbox_input`, `select_input`); attachments stay a plain `<input
 /// type="file">` (a file input can't be repopulated).
+#[allow(clippy::too_many_lines)]
 fn render_changeset_form_inputs(
     fields: &[Field],
     changeset_var: &str,
     plural: &str,
     live_validation: bool,
     validated: &[&str],
+    reference_selects: &[&Field],
 ) -> String {
     use std::fmt::Write as _;
     let cv = changeset_var;
-    let mut out = String::new();
+    // The reference fields that render an in-form `<select>` (issue #1750): the
+    // present, non-missing `references` columns whose runtime option loader the
+    // handler threads into scope. A missing-target reference has no loader, so
+    // it keeps the derived per-field control instead.
+    let reference_select_names: BTreeSet<&str> =
+        reference_selects.iter().map(|f| f.name.as_str()).collect();
+    let mut out = String::with_capacity(fields.len() * 150);
     for f in fields {
         let name = &f.name;
         let label = humanize_label(name);
-        let line = if f.kind.is_attachment() {
+        // A DSL-constrained field (issue #1388) carries HTML5 attributes the
+        // shipped `autumn_web::form` helpers can't express; render it as raw
+        // markup instead so the live path matches the standard path (#1750).
+        let constraint = html5_constraint_spec(f);
+        let line = if f.kind.is_reference() && reference_select_names.contains(name.as_str()) {
+            // belongs_to parent dropdown (issue #1146), restored in the
+            // `--live-validation` per-field path (issue #1750).
+            render_live_reference_select(f, cv)
+        } else if let (true, Some((input_type, attrs))) = (
+            matches!(
+                f.kind,
+                FieldKind::I32 | FieldKind::I64 | FieldKind::F32 | FieldKind::F64
+            ),
+            &constraint,
+        ) {
+            // A constrained numeric renders a raw number input carrying its
+            // `min`/`max` (and `step="any"` for floats). Numerics don't take the
+            // htmx inline-validation path, so no `validate_url`.
+            render_live_constrained_field(f, cv, input_type, attrs, None)
+        } else if f.kind.is_attachment() {
             // Attachment fields render a plain file input plus a hidden field
             // carrying the existing blob key (from the changeset), so an edit
             // that doesn't re-upload keeps the current attachment. A file input
@@ -3089,16 +3166,29 @@ fn render_changeset_form_inputs(
                     // that happens to permit an empty string (e.g. a max-only
                     // `length` rule) doesn't leave a blank required field with
                     // no client-side guard at all.
-                    //
-                    // Known limitation (#1750): the #1388 client-side HTML5
-                    // constraint attributes (`minlength`/`maxlength`,
-                    // `type="email"`/`url`) are only emitted on the standard
-                    // `form_for` path (`html5_constraint_spec`), not through
-                    // these cross-crate `autumn_web::form` htmx helpers, which
-                    // take no constraint params. Server-side `#[validate]` still
-                    // applies in `--live-validation`; only the static HTML5
-                    // hints are absent here.
-                    if live_validation && validated.contains(&name.as_str()) {
+                    let validated_htmx = live_validation && validated.contains(&name.as_str());
+                    if let Some((input_type, attrs)) = &constraint {
+                        // Issue #1750: a DSL-constrained `String`/`Text` field
+                        // carries the #1388 client-side HTML5 attributes
+                        // (`minlength`/`maxlength`, `type="email"`/`url`, and a
+                        // `<textarea>` for long-form `Text`) the shipped helpers
+                        // can't express. Render it as raw markup mirroring the
+                        // standard `form_for` path, threading the htmx
+                        // inline-validation wiring on when the field is validated
+                        // so real-time validation keeps working alongside the
+                        // static constraints. (A constrained field always has a
+                        // validator rule, so this is the validated path; the
+                        // `validate_url` is threaded only when `live_validation`.)
+                        let validate_url =
+                            validated_htmx.then(|| format!("/{plural}/validate/{name}"));
+                        render_live_constrained_field(
+                            f,
+                            cv,
+                            input_type,
+                            attrs,
+                            validate_url.as_deref(),
+                        )
+                    } else if validated_htmx {
                         let helper = if f.nullable {
                             "text_input_htmx"
                         } else {
@@ -3221,6 +3311,136 @@ fn html5_constraint_spec(field: &Field) -> Option<(&'static str, String)> {
         return None;
     }
     Some((input_type, attrs))
+}
+
+/// Render the raw maud markup for a DSL-constrained (issue #1388)
+/// `String`/`Text`/numeric field in the `--live-validation` per-field path
+/// (issue #1750).
+///
+/// The shipped `autumn_web::form::*` helpers take no HTML5-constraint params,
+/// so the live path renders the constrained control as raw markup instead —
+/// the same inline-error/ARIA skeleton those helpers emit, plus the
+/// `input_type` override and `constraint_attrs`
+/// (`minlength`/`maxlength`/`min`/`max`/`step`) from [`html5_constraint_spec`],
+/// exactly mirroring the standard `form_for` path's `.exclude()` + `.append()`
+/// output. When `validate_url` is `Some`, the htmx inline-validation wiring
+/// (`hx-post`/`hx-trigger`/`hx-target`/`hx-swap`/`hx-include` + the
+/// `data-autumn-field-wrapper` swap marker) is threaded on too, matching
+/// `required_text_input_htmx`. Shared by [`render_changeset_form_inputs`] and
+/// the inline-validate handlers so the initially-rendered field and the
+/// htmx-swapped fragment are byte-identical.
+fn render_live_constrained_field(
+    field: &Field,
+    changeset_var: &str,
+    input_type: &str,
+    constraint_attrs: &str,
+    validate_url: Option<&str>,
+) -> String {
+    let name = &field.name;
+    let label = humanize_label(name);
+    let cv = changeset_var;
+    let required_attr = if field.nullable {
+        ""
+    } else {
+        " required aria-required=\"true\""
+    };
+    // A constrained `Text` column is long-form (Postgres `TEXT`), so it renders
+    // a `<textarea>` (matching the derived `FieldControl::Textarea` and the
+    // standard path). A `text{email}`/`text{url}` field is inherently
+    // single-line (its `input_type` is `email`/`url`), so it takes the `<input>`
+    // branch — a textarea can't carry those types.
+    let is_textarea = matches!(field.kind, FieldKind::Text) && input_type == "text";
+    // htmx inline-validation wiring + the swap-target marker on the wrapper.
+    let (wrapper_marker, htmx_attrs) = validate_url.map_or_else(
+        || (String::new(), String::new()),
+        |url| {
+            (
+                format!(" data-autumn-field-wrapper=\"{name}\""),
+                format!(
+                    "\n                    hx-post=\"{url}\"\n                    \
+                     hx-trigger=\"change\"\n                    \
+                     hx-target=\"closest [data-autumn-field-wrapper]\"\n                    \
+                     hx-swap=\"outerHTML\"\n                    hx-include=\"closest form\""
+                ),
+            )
+        },
+    );
+    let errors_tail = format!(
+        "\n                @if !errors.is_empty() {{\n                    \
+         div id=\"{name}-error\" role=\"alert\" class=\"autumn-field__errors\" {{\n                        \
+         @for error in errors {{ p class=\"autumn-field__error\" {{ (error) }} }}\n                    \
+         }}\n                \
+         }}\n            \
+         }}"
+    );
+    if is_textarea {
+        format!(
+            "div id=\"{name}-field\" class=\"autumn-field\"{wrapper_marker} {{\n                \
+             @let errors = {cv}.errors_for(\"{name}\");\n                \
+             label for=\"{name}\" class=\"autumn-field__label\" {{ \"{label}\" }}\n                \
+             textarea id=\"{name}\" name=\"{name}\"{constraint_attrs}{required_attr}\n                    \
+             class=(if errors.is_empty() {{ \"autumn-field__input\" }} else {{ \"autumn-field__input autumn-field__input--invalid\" }})\n                    \
+             aria-invalid=(if errors.is_empty() {{ \"false\" }} else {{ \"true\" }})\n                    \
+             aria-describedby=(if errors.is_empty() {{ \"\" }} else {{ \"{name}-error\" }}){htmx_attrs} {{\n                        \
+             ({cv}.field_value(\"{name}\").unwrap_or_default())\n                    \
+             }}{errors_tail}"
+        )
+    } else {
+        format!(
+            "div id=\"{name}-field\" class=\"autumn-field\"{wrapper_marker} {{\n                \
+             @let errors = {cv}.errors_for(\"{name}\");\n                \
+             label for=\"{name}\" class=\"autumn-field__label\" {{ \"{label}\" }}\n                \
+             input type=\"{input_type}\" id=\"{name}\" name=\"{name}\"\n                    \
+             value=({cv}.field_value(\"{name}\").unwrap_or_default()){constraint_attrs}{required_attr}\n                    \
+             class=(if errors.is_empty() {{ \"autumn-field__input\" }} else {{ \"autumn-field__input autumn-field__input--invalid\" }})\n                    \
+             aria-invalid=(if errors.is_empty() {{ \"false\" }} else {{ \"true\" }})\n                    \
+             aria-describedby=(if errors.is_empty() {{ \"\" }} else {{ \"{name}-error\" }}){htmx_attrs};{errors_tail}"
+        )
+    }
+}
+
+/// Render the raw maud markup for a `belongs_to` parent `<select>` in the
+/// `--live-validation` per-field path (issue #1750). The standard path renders
+/// this through a `form_for` `FieldControl::Select` override, but the per-field
+/// path has no `form_for`, so it emits a raw `<select>` populated at request
+/// time from the `{name}_options` loader (a `Vec<(String, String)>` of
+/// id/display pairs) — a blank placeholder plus `selected` driven by the
+/// changeset value so a 422 re-render keeps the chosen parent. The
+/// `{name}_options` binding is loaded into scope by the calling handler.
+fn render_live_reference_select(field: &Field, changeset_var: &str) -> String {
+    let name = &field.name;
+    let label = humanize_label(name);
+    let cv = changeset_var;
+    let placeholder = if field.nullable {
+        "— Unset —"
+    } else {
+        "— Select —"
+    };
+    let required_attr = if field.nullable {
+        ""
+    } else {
+        " required aria-required=\"true\""
+    };
+    format!(
+        "div id=\"{name}-field\" class=\"autumn-field\" {{\n                \
+         @let errors = {cv}.errors_for(\"{name}\");\n                \
+         label for=\"{name}\" class=\"autumn-field__label\" {{ \"{label}\" }}\n                \
+         select id=\"{name}\" name=\"{name}\"{required_attr}\n                    \
+         class=(if errors.is_empty() {{ \"autumn-field__input\" }} else {{ \"autumn-field__input autumn-field__input--invalid\" }})\n                    \
+         aria-invalid=(if errors.is_empty() {{ \"false\" }} else {{ \"true\" }})\n                    \
+         aria-describedby=(if errors.is_empty() {{ \"\" }} else {{ \"{name}-error\" }}) {{\n                        \
+         option value=\"\" {{ \"{placeholder}\" }}\n                        \
+         @for (opt_value, opt_label) in {name}_options.iter() {{\n                            \
+         option value=(opt_value) selected[{cv}.field_value(\"{name}\").as_deref() == Some(opt_value.as_str())] {{ (opt_label) }}\n                        \
+         }}\n                    \
+         }}\n                \
+         @if !errors.is_empty() {{\n                    \
+         div id=\"{name}-error\" role=\"alert\" class=\"autumn-field__errors\" {{\n                        \
+         @for error in errors {{ p class=\"autumn-field__error\" {{ (error) }} }}\n                    \
+         }}\n                \
+         }}\n            \
+         }}"
+    )
 }
 
 /// Produce the cell-body expression for a `data_table` column closure.
@@ -3451,10 +3671,36 @@ fn title_case(s: &str) -> String {
         .join(" ")
 }
 
+/// A required numeric carrying a `{min,max}` range (issue #1388) that is
+/// represented as `Option<T>` on the form struct (issue #1748). Extracted so
+/// both the struct/`into_new` emission in [`render_model_form`] and the
+/// empty-pair drop set in [`render_nullable_field_match`] agree on which fields
+/// are the synthetic Options.
+const fn is_constrained_required_numeric(f: &Field) -> bool {
+    !f.nullable
+        && matches!(
+            f.kind,
+            FieldKind::I32 | FieldKind::I64 | FieldKind::F32 | FieldKind::F64
+        )
+        && (f.constraints.min.is_some() || f.constraints.max.is_some())
+}
+
+/// Render the body of the generated `is_nullable_form_field` helper — the set
+/// of fields whose empty `field=` pair the decoder drops so it deserializes as
+/// missing (`None`) rather than being handed to `serde_urlencoded` as `""`.
+///
+/// This includes the genuinely nullable fields AND the synthetic
+/// constrained-required-`Option<T>` numerics (issue #1748): those are
+/// `Option<T>` on the form struct but have `nullable == false`, so without this
+/// a blank `age=` pair (from curl, a non-browser client, or disabled JS) would
+/// reach `serde_urlencoded`, which parses `""` into the inner numeric and
+/// returns a **400** *before* `#[validate(required)]` can render the intended
+/// **422** inline error. Dropping the empty pair makes the field decode as
+/// `None`, so `required` fires and produces the 422 (the #1748 intent).
 fn render_nullable_field_match(fields: &[Field]) -> String {
     let names = fields
         .iter()
-        .filter(|field| field.nullable)
+        .filter(|field| field.nullable || is_constrained_required_numeric(field))
         .map(|field| format!("\"{}\"", field.name))
         .collect::<Vec<_>>();
     if names.is_empty() {
