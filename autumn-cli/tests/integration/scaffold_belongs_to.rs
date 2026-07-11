@@ -288,10 +288,13 @@ fn live_validation_keeps_parent_display_on_index_and_show() {
 
 #[test]
 fn self_reference_resolves_display_from_in_flight_fields() {
-    // A self-reference (`category:references` on Category → the `categories`
-    // table being generated right now) has no `src/models/category.rs` on disk
-    // yet, so the #1146 display column must resolve from the IN-FLIGHT fields —
-    // `categories::name`, not the raw id. Nullable self-ref (`references?`).
+    // A self-reference (`node:references` on Node → the `nodes` table being
+    // generated right now) has no `src/models/node.rs` on disk yet, so the #1146
+    // display column must resolve from the IN-FLIGHT fields — `nodes::name`, not
+    // the raw id. Nullable self-ref (`references?`). (A regular-plural model is
+    // used so the generated app also compiles — an irregular plural like
+    // `Category` hits a separate, pre-existing `#[model]`-macro pluralization
+    // bug, `category` -> `categorys`, unrelated to this display resolution.)
     let tmp = tempfile::tempdir().expect("tempdir");
     run_autumn_ok(tmp.path(), &["new", "self-ref-app"]);
     let project = tmp.path().join("self-ref-app");
@@ -300,26 +303,26 @@ fn self_reference_resolves_display_from_in_flight_fields() {
         &[
             "generate",
             "scaffold",
-            "Category",
+            "Node",
             "name:String",
-            "category:references?",
+            "node:references?",
         ],
     );
-    let routes = fs::read_to_string(project.join("src/routes/categories.rs")).unwrap();
+    let routes = fs::read_to_string(project.join("src/routes/nodes.rs")).unwrap();
 
     // Option loader selects the in-flight `name` display column (not id-only).
     assert!(
-        routes.contains(".select((categories::id, categories::name))"),
+        routes.contains(".select((nodes::id, nodes::name))"),
         "self-ref option loader must select the in-flight `name` column:\n{routes}"
     );
     // Show loads + renders the parent's `name`.
     assert!(
-        routes.contains("categories::table.find(fk).select(categories::name)"),
+        routes.contains("nodes::table.find(fk).select(nodes::name)"),
         "self-ref show must load the parent `name` display value:\n{routes}"
     );
     // Index builds the parent-label map.
     assert!(
-        routes.contains("let category_id_labels: std::collections::HashMap<String, String>"),
+        routes.contains("let node_id_labels: std::collections::HashMap<String, String>"),
         "self-ref index must build the parent-label map:\n{routes}"
     );
     // Must NOT fall back to raw-id labeling.
