@@ -1172,7 +1172,7 @@ fn is_valid_mailto_address_doctor(value: &str) -> bool {
     }
 }
 
-/// Whether `value` parses as the SAME lettre [`Mailbox`](lettre::message::Mailbox)
+/// Whether `value` parses as the SAME lettre `Mailbox` (`lettre::message::Mailbox`)
 /// the alert mail send path requires of every recipient — EXACT parity with the
 /// runtime's `is_valid_alert_mailbox` (`autumn/src/alerts.rs`), which validates
 /// `[alerts] email` with `email.parse::<lettre::message::Mailbox>()`.
