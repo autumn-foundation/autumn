@@ -376,7 +376,17 @@ async fn swr_serves_stale_and_refreshes_in_background() {
     // no wall-clock ceiling on the load-sensitive scheduling + 200ms compute.
     // (`notify_one` stores a permit if it fires before this await, so there is
     // no lost-wakeup even when the background task wins the race.)
-    refresh_done.notified().await;
+    //
+    // The timeout here is a generous hang-guard, mirroring the 30s bound on the
+    // publish loop below: it exists only to convert a genuine never-fires hang
+    // (e.g. the detached refresh task is dropped when the global refresh
+    // semaphore is exhausted, or a regression stops it ever reaching the fill
+    // closure) into a clean test failure instead of dangling until the CI
+    // runner's global timeout. It is deliberately NOT a tight, schedule-
+    // sensitive value, so it never reintroduces load-dependent flakiness.
+    tokio::time::timeout(Duration::from_secs(30), refresh_done.notified())
+        .await
+        .expect("background refresh never signalled completion (task dropped or never started)");
 
     // The refreshed value is published in `finish_fill` synchronously right
     // after the fill closure returns, so re-read until it is visible. This
