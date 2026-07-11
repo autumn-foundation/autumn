@@ -8739,7 +8739,7 @@ pub async fn two_factor_disable(
             diesel::delete(recovery_codes::table.filter(recovery_codes::user_id.eq(user_id)))
                 .execute(conn)
                 .await?;
-            if revoke_other_sessions_in_txn {
+__MAGIC_LINK_TOTP_DISABLE_CLEAR__            if revoke_other_sessions_in_txn {
                 diesel::delete(
                     __SESSTABLE__::table
                         .filter(__SESSTABLE__::user_id.eq(user_id))
@@ -8977,7 +8977,22 @@ __MAGIC_LINK_RESET_CLEAR__                    Ok(updated == 1)
     } else {
         ""
     };
+    // Magic-link token cleanup spliced into the `two_factor_disable` transaction
+    // (Codex review). Disabling TOTP removes the second factor that gated a
+    // still-outstanding magic link, so a link minted while 2FA was on must not
+    // become a direct single-factor login afterwards. Gated on `--magic-link` so
+    // the `magic_link_tokens` reference only appears when the table (and its
+    // import) exist; empty otherwise so the transaction is unchanged.
+    let magic_link_totp_disable_clear = if magic_link {
+        magic_link_totp_disable_clear_txn_src()
+    } else {
+        ""
+    };
     TPL.replace("__MAGIC_LINK_RESET_CLEAR__", magic_link_reset_clear)
+        .replace(
+            "__MAGIC_LINK_TOTP_DISABLE_CLEAR__",
+            magic_link_totp_disable_clear,
+        )
         .replace("__PASCAL__", pascal_name)
         .replace("__SNAKE__", snake_name)
         .replace("__TABLE__", table)
@@ -9004,6 +9019,29 @@ const fn magic_link_reset_commit_clear_txn_src() -> &'static str {
                         .execute(conn)
                         .await?;
                     }
+"
+}
+
+/// Magic-link cleanup for the `two_factor_disable` transaction (Codex review).
+/// Disabling TOTP flips `totp_enabled` to false, so an outstanding magic-link
+/// token that `magic_link_verify` would have gated through `/login/verify` while
+/// 2FA was on now takes the DIRECT (single-factor) path and logs the account in
+/// fully. Delete the user's outstanding `magic_link_tokens` in the SAME
+/// transaction so disabling the second factor cannot retroactively un-gate a
+/// previously second-factor-protected link. Uses the `user_id` binding already in
+/// scope in that transaction (matching `magic_link_reset_commit_clear_txn_src`).
+/// Emitted only under `--magic-link` — the table exists only then.
+const fn magic_link_totp_disable_clear_txn_src() -> &'static str {
+    r"            // Invalidate any outstanding magic-link login tokens in the SAME
+            // transaction: disabling TOTP removes the second factor that gated
+            // these links, so a link minted while 2FA was on must not become a
+            // direct single-factor login afterwards (magic-link auth matches an
+            // unconsumed, unexpired token, keyed by user id).
+            diesel::delete(
+                magic_link_tokens::table.filter(magic_link_tokens::user_id.eq(user_id)),
+            )
+            .execute(conn)
+            .await?;
 "
 }
 
@@ -11265,6 +11303,64 @@ mod tests {
         assert!(
             remove_at < auth_insert,
             "reauth_pw_ok must be cleared BEFORE the auth key insert: {body}"
+        );
+    }
+
+    #[test]
+    fn two_factor_disable_clears_magic_link_tokens_under_magic_link() {
+        // Codex review: an outstanding magic-link token issued while TOTP was on is
+        // gated by `magic_link_verify`'s `if user.totp_enabled` branch (routes to
+        // /login/verify). Disabling TOTP flips that flag to false, so the SAME
+        // still-unconsumed token would then take the DIRECT single-factor path and
+        // log the account in fully. The disable transaction must therefore delete
+        // the user's outstanding `magic_link_tokens` so disabling 2FA cannot
+        // retroactively un-gate a previously second-factor-protected link.
+        let routes = render_routes_file("User", "user", "users", &[], true, true);
+        let start = routes
+            .find("pub async fn two_factor_disable(")
+            .expect("disable handler present");
+        let end = routes[start..]
+            .find("pub async fn login_verify_form(")
+            .map(|o| start + o)
+            .expect("login_verify_form follows disable handler");
+        let body = &routes[start..end];
+        assert!(
+            body.contains(
+                "magic_link_tokens::table.filter(magic_link_tokens::user_id.eq(user_id))"
+            ),
+            "disable transaction must delete the user's outstanding magic-link tokens: {body}"
+        );
+        // The delete must sit INSIDE the transaction (before the closing `Ok(())`),
+        // so a mid-operation failure can't leave the tokens live after 2FA is off.
+        let delete_at = body
+            .find("magic_link_tokens::table.filter(magic_link_tokens::user_id.eq(user_id))")
+            .expect("magic-link delete present");
+        let txn_ok = body
+            .find("            Ok(())")
+            .expect("transaction Ok(()) present");
+        assert!(
+            delete_at < txn_ok,
+            "the magic-link delete must sit inside the disable transaction: {body}"
+        );
+    }
+
+    #[test]
+    fn two_factor_disable_without_magic_link_omits_token_clear() {
+        // A `--totp` build with no `--magic-link` has no `magic_link_tokens` table,
+        // so the disable transaction must not reference it (or the crate won't
+        // compile).
+        let routes = render_routes_file("User", "user", "users", &[], true, false);
+        let start = routes
+            .find("pub async fn two_factor_disable(")
+            .expect("disable handler present");
+        let end = routes[start..]
+            .find("pub async fn login_verify_form(")
+            .map(|o| start + o)
+            .expect("login_verify_form follows disable handler");
+        let body = &routes[start..end];
+        assert!(
+            !body.contains("magic_link_tokens"),
+            "a non-magic-link build must not reference magic_link_tokens in disable: {body}"
         );
     }
 
