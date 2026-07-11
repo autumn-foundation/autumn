@@ -332,19 +332,17 @@ fn backup(args: &BackupArgs) -> Result<(), BackupError> {
 
     let profile = migrate::effective_profile(args.profile.as_deref());
 
-    // Offsite pre-flight (issue #1619): read the offsite section LENIENTLY (no
-    // bucket/cred validation) just to learn `auto_upload`. Only when an upload is
-    // actually requested do we STRICTLY validate (bucket required, creds env
-    // resolved, distinct destination) and build the client — BEFORE dumping — so
-    // a misconfigured offsite fails fast, while a plain local backup with an
-    // incomplete `[backup.offsite]` section is never blocked.
-    let loaded_offsite = load_offsite(&profile)?;
-    let should_upload = args.upload
-        || loaded_offsite
-            .as_ref()
-            .is_some_and(LoadedOffsite::auto_upload);
+    // Offsite pre-flight (issue #1619). Decide whether to upload with a LIGHT
+    // probe that reads ONLY `[backup.offsite].auto_upload` (real env → `.env.<p>`
+    // → merged TOML), WITHOUT a full `AutumnConfig` load — so a local-only backup
+    // never triggers global config validation or encrypted-credentials
+    // decryption (a cron job may not export AUTUMN_MASTER_KEY). Only when an
+    // upload is actually requested do we do the full, strict resolve (bucket
+    // required, creds env resolved, distinct-destination guard) and build the
+    // client — BEFORE dumping — so a misconfigured offsite fails fast.
+    let should_upload = args.upload || auto_upload_probe(&profile);
     let upload_ctx = if should_upload {
-        let offsite = loaded_offsite
+        let offsite = load_offsite(&profile)?
             .ok_or(BackupError::OffsiteNotConfigured)?
             .resolve()?;
         let client = offsite.build_client()?;
@@ -1753,11 +1751,6 @@ struct LoadedOffsite {
 }
 
 impl LoadedOffsite {
-    /// The configured-default upload flag, readable without validating anything.
-    const fn auto_upload(&self) -> bool {
-        self.offsite.auto_upload
-    }
-
     /// Validate and resolve into a ready-to-use [`ResolvedOffsite`]. This is the
     /// STRICT step — bucket is required here — and must only run when uploading.
     fn resolve(self) -> Result<ResolvedOffsite, BackupError> {
@@ -1810,6 +1803,53 @@ impl LoadedOffsite {
             app_storage_endpoint,
             profile,
         })
+    }
+}
+
+/// Decide whether a backup run should upload, reading ONLY the
+/// `[backup.offsite].auto_upload` bit — WITHOUT a full `AutumnConfig` load (no
+/// global validation, no encrypted-credentials decryption), so a local-only
+/// backup is never blocked by unrelated config/credentials issues (issue #1619
+/// P2 #8). Resolution matches the config layering: real env
+/// `AUTUMN_BACKUP__OFFSITE__AUTO_UPLOAD` → `.env.<profile>` → merged TOML
+/// `[backup.offsite].auto_upload` (base + `[profile.<p>]` overlay) → `false`.
+fn auto_upload_probe(profile: &str) -> bool {
+    use autumn_web::config::Env as _;
+    // The profile-aware dotenv overlay covers BOTH the real env and `.env.<p>`
+    // (a real env var wins inside the overlay), matching P2 #6.
+    let env = dotenv_env_for_profile(profile);
+    let table = migrate::read_autumn_toml_table_with_profile(Some(profile));
+    auto_upload_from_sources(|k| env.var(k).ok(), table.as_ref())
+}
+
+/// Pure resolution of `auto_upload` from an env lookup + a merged TOML table.
+/// Env (real + `.env`) wins over TOML; default `false`. Separated so the
+/// precedence is unit-testable without touching the filesystem/process env.
+fn auto_upload_from_sources<F>(env_var: F, table: Option<&toml::Table>) -> bool
+where
+    F: Fn(&str) -> Option<String>,
+{
+    if let Some(raw) = env_var("AUTUMN_BACKUP__OFFSITE__AUTO_UPLOAD")
+        && let Some(b) = parse_bool_flag(&raw)
+    {
+        return b;
+    }
+    table
+        .and_then(|t| t.get("backup"))
+        .and_then(|v| v.get("offsite"))
+        .and_then(|v| v.get("auto_upload"))
+        .and_then(toml::Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// Parse a boolean env flag the same way the config loader's `parse_env_bool`
+/// does: `1`/`true` → true, `0`/`false` → false (case-insensitive, trimmed),
+/// anything else → `None` (ignored).
+fn parse_bool_flag(raw: &str) -> Option<bool> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" => Some(true),
+        "0" | "false" => Some(false),
+        _ => None,
     }
 }
 
@@ -3248,10 +3288,9 @@ mod tests {
 
     #[test]
     fn local_backup_does_not_validate_incomplete_offsite() {
-        // P2 #1: an incomplete [backup.offsite] (no bucket) with auto_upload off
-        // must NOT block a plain local `autumn db backup`. Reading auto_upload
-        // never validates; the strict bucket check lives in resolve(), which the
-        // backup path only calls when an upload is actually requested.
+        // P2 #1: an incomplete [backup.offsite] (no bucket) must NOT block a plain
+        // local `autumn db backup`. The strict bucket check lives in resolve(),
+        // which the backup path only calls when an upload is actually requested.
         let offsite = autumn_web::config::OffsiteBackupConfig::default();
         assert!(offsite.s3.bucket.is_none(), "precondition: no bucket set");
         let loaded = LoadedOffsite {
@@ -3260,14 +3299,47 @@ mod tests {
             app_storage_endpoint: None,
             profile: "test".to_owned(),
         };
-        // The decision a local backup makes (args.upload = false): no upload.
-        assert!(!loaded.auto_upload());
-        // And the strict validation is deferred to resolve() (only reached when
+        // The strict validation is deferred to resolve() (only reached when
         // uploading) — proving a local-only backup never hits it.
         assert!(matches!(
             loaded.resolve(),
             Err(BackupError::OffsiteConfig { .. })
         ));
+    }
+
+    #[test]
+    fn auto_upload_probe_precedence_and_repro() {
+        // P2 #8: the upload decision reads ONLY `[backup.offsite].auto_upload`
+        // from env / .env / merged TOML — never a full config load / credential
+        // decryption. Pure `auto_upload_from_sources` proves the precedence.
+        let no_env = |_: &str| None;
+
+        // (a) REPRO: no offsite section, no env => false => NO upload, and (by
+        // construction) the decision needed no AutumnConfig load / cred decrypt.
+        assert!(!auto_upload_from_sources(no_env, None));
+        let empty: toml::Table = toml::Table::new();
+        assert!(!auto_upload_from_sources(no_env, Some(&empty)));
+
+        // (b) auto_upload=true via TOML [backup.offsite] triggers upload.
+        let toml_true: toml::Table =
+            toml::from_str("[backup.offsite]\nauto_upload = true\n").unwrap();
+        assert!(auto_upload_from_sources(no_env, Some(&toml_true)));
+
+        // (b) auto_upload=true via env (real env or .env.<profile>) triggers it,
+        // even with no TOML.
+        let env_true =
+            |k: &str| (k == "AUTUMN_BACKUP__OFFSITE__AUTO_UPLOAD").then(|| "true".to_owned());
+        assert!(auto_upload_from_sources(env_true, None));
+
+        // Env wins over TOML: env "false" overrides TOML true.
+        let env_false =
+            |k: &str| (k == "AUTUMN_BACKUP__OFFSITE__AUTO_UPLOAD").then(|| "false".to_owned());
+        assert!(!auto_upload_from_sources(env_false, Some(&toml_true)));
+
+        // A non-boolean env value is ignored, falling back to TOML.
+        let env_junk =
+            |k: &str| (k == "AUTUMN_BACKUP__OFFSITE__AUTO_UPLOAD").then(|| "yesplease".to_owned());
+        assert!(auto_upload_from_sources(env_junk, Some(&toml_true)));
     }
 
     #[test]

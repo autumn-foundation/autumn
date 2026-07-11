@@ -868,9 +868,11 @@ pub enum ConfigError {
 /// `[backup]` configuration section (issue #1619).
 ///
 /// Groups database-backup destinations. Currently only an offsite S3-compatible
-/// destination is supported. Feature-gated to `storage` because it reuses
-/// [`crate::storage::StorageS3Config`].
-#[cfg(feature = "storage")]
+/// destination is supported. NOT feature-gated: this section (`[backup.offsite]`)
+/// is recognized by every autumn-web build so a strict-config app compiled
+/// WITHOUT the `storage` feature still accepts its own `autumn.toml` `[backup]`
+/// keys (the offsite upload client lives in the CLI and is independent of the
+/// storage feature).
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct BackupConfig {
     /// Offsite upload destination (`[backup.offsite]`). `None` (the default)
@@ -890,15 +892,12 @@ pub struct BackupConfig {
 /// / `s3.secret_access_key_env` name the environment variables the secrets are
 /// read from at upload time. The secret values themselves never live in config,
 /// argv, logs, or error messages.
-#[cfg(feature = "storage")]
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct OffsiteBackupConfig {
-    /// S3-compatible connection + credential-indirection settings. Reuses the
-    /// same type as `[storage.s3]`, so it inherits `bucket` / `region` /
-    /// `endpoint` / `force_path_style` and the `*_env` credential indirection
-    /// and works against `MinIO` / R2 / B2 / Garage.
+    /// S3-compatible connection + credential-indirection settings
+    /// (`[backup.offsite.s3]`). Works against AWS S3 / `MinIO` / R2 / B2 / Garage.
     #[serde(default)]
-    pub s3: crate::storage::StorageS3Config,
+    pub s3: OffsiteS3Config,
 
     /// Key prefix under which run directories are stored. Defaults to `""`
     /// (bucket root). Objects are keyed `{prefix}/{profile}/{timestamp}/{file}`.
@@ -921,6 +920,41 @@ pub struct OffsiteBackupConfig {
     /// shared bucket is a deliberate choice (AC #3).
     #[serde(default)]
     pub allow_shared_bucket: bool,
+}
+
+/// `[backup.offsite.s3]` — S3-compatible connection settings for offsite backups.
+///
+/// A dedicated, NON-feature-gated mirror of the storage backend's S3 shape so the
+/// `[backup]` section is available in every autumn-web build (the storage
+/// module — and its `StorageS3Config` — only exist under the `storage` feature).
+/// Credentials are named via `*_env` indirection, never inlined.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct OffsiteS3Config {
+    /// Target bucket.
+    #[serde(default)]
+    pub bucket: Option<String>,
+
+    /// AWS region or region-shaped string (R2 uses `auto`). Used for the `SigV4`
+    /// credential scope; many S3-compatible endpoints ignore it.
+    #[serde(default)]
+    pub region: Option<String>,
+
+    /// Custom endpoint URL. Required for non-AWS providers (R2, `MinIO`, B2,
+    /// Garage). Leave unset for AWS.
+    #[serde(default)]
+    pub endpoint: Option<String>,
+
+    /// Environment variable the access-key id is read from.
+    #[serde(default)]
+    pub access_key_id_env: Option<String>,
+
+    /// Environment variable the secret access key is read from.
+    #[serde(default)]
+    pub secret_access_key_env: Option<String>,
+
+    /// Path-style addressing toggle (R2 / `MinIO` need this `true`).
+    #[serde(default)]
+    pub force_path_style: bool,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -1030,11 +1064,11 @@ pub struct AutumnConfig {
     /// Offsite database-backup destination (`[backup]` section, issue #1619).
     ///
     /// Composes the verified local-backup artifact (issue #1595) with an
-    /// S3-compatible offsite destination. Honored only when the `storage`
-    /// cargo feature is enabled — it reuses [`crate::storage::StorageS3Config`]
-    /// so the offsite destination inherits the same bucket/region/endpoint /
-    /// `force_path_style` shape and `*_env` credential indirection.
-    #[cfg(feature = "storage")]
+    /// S3-compatible offsite destination. Always present (not feature-gated) so
+    /// every autumn-web build recognizes `[backup.offsite]` — a strict-config app
+    /// compiled without the `storage` feature still accepts its own `[backup]`
+    /// keys. The offsite upload client lives in the CLI and needs no storage
+    /// feature.
     #[serde(default)]
     pub backup: BackupConfig,
     /// Transactional email settings.
@@ -3000,7 +3034,6 @@ impl AutumnConfig {
         self.apply_reporting_env_overrides_with_env(env);
         #[cfg(feature = "storage")]
         self.apply_storage_env_overrides_with_env(env);
-        #[cfg(feature = "storage")]
         self.apply_backup_env_overrides_with_env(env);
         #[cfg(feature = "mail")]
         self.apply_mail_env_overrides_with_env(env);
@@ -4054,13 +4087,11 @@ impl AutumnConfig {
     /// destination honors the same `AUTUMN_*` env convention. When no offsite
     /// section exists in TOML, a default one is materialized only if at least
     /// one offsite env var is present, so an all-env deployment still works.
-    #[cfg(feature = "storage")]
     fn apply_backup_env_overrides_with_env(&mut self, env: &dyn Env) {
         const OFFSITE_ENV_KEYS: &[&str] = &[
             "AUTUMN_BACKUP__OFFSITE__S3__BUCKET",
             "AUTUMN_BACKUP__OFFSITE__S3__REGION",
             "AUTUMN_BACKUP__OFFSITE__S3__ENDPOINT",
-            "AUTUMN_BACKUP__OFFSITE__S3__PUBLIC_BASE_URL",
             "AUTUMN_BACKUP__OFFSITE__S3__ACCESS_KEY_ID_ENV",
             "AUTUMN_BACKUP__OFFSITE__S3__SECRET_ACCESS_KEY_ENV",
             "AUTUMN_BACKUP__OFFSITE__S3__FORCE_PATH_STYLE",
@@ -4090,11 +4121,6 @@ impl AutumnConfig {
             env,
             "AUTUMN_BACKUP__OFFSITE__S3__ENDPOINT",
             &mut offsite.s3.endpoint,
-        );
-        parse_env_option_string(
-            env,
-            "AUTUMN_BACKUP__OFFSITE__S3__PUBLIC_BASE_URL",
-            &mut offsite.s3.public_base_url,
         );
         parse_env_option_string(
             env,
@@ -7799,7 +7825,6 @@ path = "/healthz"
         assert_eq!(config.storage.variants.max_source_height, 1_500);
     }
 
-    #[cfg(feature = "storage")]
     #[test]
     fn backup_offsite_parses_from_toml() {
         let toml = r#"
@@ -7841,14 +7866,12 @@ path = "/healthz"
         assert!(offsite.s3.force_path_style);
     }
 
-    #[cfg(feature = "storage")]
     #[test]
     fn backup_offsite_defaults_to_none() {
         let config = AutumnConfig::default();
         assert!(config.backup.offsite.is_none());
     }
 
-    #[cfg(feature = "storage")]
     #[test]
     fn env_override_backup_offsite_fields() {
         let env = MockEnv::new()
@@ -7891,7 +7914,6 @@ path = "/healthz"
         assert!(offsite.allow_shared_bucket);
     }
 
-    #[cfg(feature = "storage")]
     #[test]
     fn env_override_backup_offsite_absent_stays_none() {
         // With no offsite env vars and no TOML section, nothing is materialized.
