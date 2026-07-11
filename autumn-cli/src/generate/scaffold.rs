@@ -1220,6 +1220,23 @@ fn render_model_form(
 
     for f in fields {
         let name = &f.name;
+        // A required numeric carrying a `{min,max}` range (issue #1388) is
+        // represented as `Option<T>` on the form struct (issue #1748): a native
+        // `T` defaults to `0`, which pre-fills the input and passes both
+        // `required` (HTML) and `range` when the range spans the zero default,
+        // silently accepting a value the user never typed. `Option<T>` defaults
+        // to `None` (renders blank), and the `required` rule below rejects it.
+        let is_constrained_required_numeric = !f.nullable
+            && matches!(
+                f.kind,
+                FieldKind::I32 | FieldKind::I64 | FieldKind::F32 | FieldKind::F64
+            )
+            && (f.constraints.min.is_some() || f.constraints.max.is_some());
+        if is_constrained_required_numeric {
+            // Emitted alongside the `range` rule so `None` is rejected
+            // server-side (a 422 with an inline error) rather than parsed as `0`.
+            let _ = writeln!(struct_fields, "    #[validate(required)]");
+        }
         if let Some(rules) = validations.get(name) {
             for rule in rules {
                 let _ = writeln!(struct_fields, "    #[validate({rule})]");
@@ -1359,6 +1376,23 @@ fn render_model_form(
                     "            {name}: match &row.{name} {{ {arms}}},"
                 );
             }
+        } else if is_constrained_required_numeric {
+            // A required numeric with a `{min,max}` range (issue #1388) is
+            // `Option<T>` on the form struct (issue #1748). `validator`'s
+            // `range` rule applies to the inner value only when `Some`, so the
+            // range is still enforced server-side; `None` (the blank default)
+            // is rejected by the `#[validate(required)]` emitted above rather
+            // than parsed as `T::default()` (`0`). A native `T` here would
+            // pre-fill `0` and silently pass both `required` and a range that
+            // spans the zero default. `into_new` unwraps the validated
+            // `Some(_)`; `from_row` wraps a persisted native value in `Some`.
+            let rust_type = f.rust_type();
+            let _ = writeln!(struct_fields, "    pub {name}: Option<{rust_type}>,");
+            let _ = writeln!(
+                into_new,
+                "        {name}: form.{name}.ok_or_else(|| autumn_web::AutumnError::bad_request_msg(\"{name}: is required\"))?,"
+            );
+            let _ = writeln!(from_row, "            {name}: Some(row.{name}),");
         } else if !f.nullable
             && matches!(
                 f.kind,
@@ -1370,21 +1404,6 @@ fn render_model_form(
                     | FieldKind::Decimal { .. }
                     | FieldKind::References
             )
-            // A numeric field carrying a `{min,max}` range constraint (issue
-            // #1388) must keep its NATIVE type on the form struct, not the
-            // String representation below: `validator`'s `range` rule only
-            // applies to numeric types, so `#[validate(range(...))]` on a
-            // `String` field fails to compile — and the whole point of the
-            // constraint is that the range is rejected server-side through the
-            // changeset (a 422 with an inline error), which needs the rule on
-            // the form the changeset validates. The `T::default()` pre-fill
-            // trade-off the String representation avoids is moot here: the
-            // field is `required` and range-bounded, so a deliberate value is
-            // forced anyway.
-            && !(matches!(
-                f.kind,
-                FieldKind::I32 | FieldKind::I64 | FieldKind::F32 | FieldKind::F64
-            ) && (f.constraints.min.is_some() || f.constraints.max.is_some()))
         {
             // Represented as a `String` on the form, exactly like a required
             // enum/datetime field: `T::default()` for these kinds (`0`, the nil

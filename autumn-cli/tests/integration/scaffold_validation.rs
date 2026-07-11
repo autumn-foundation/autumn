@@ -81,6 +81,54 @@ fn model_carries_validate_attributes_from_dsl_constraints() {
     );
 }
 
+/// Issue #1748: a required numeric with a `{min,max}` range that spans the
+/// type's zero default (`age:i32{min=0,max=130}`) must NOT keep its native
+/// `i32` on the form struct — a native field defaults to `0`, which pre-fills
+/// the input and passes both `required` (the HTML attribute) and the
+/// `range(0,130)` rule, so a blank submission silently becomes `0`. The fix
+/// represents it as `Option<i32>` with `#[validate(required, range(...))]`:
+/// the default is `None` (renders blank, forces deliberate input), `range`
+/// validates the inner value only when `Some`, and `required` rejects `None`
+/// server-side. The `into_new` path must unwrap the `Option`, never coerce a
+/// missing value to `0`.
+#[test]
+fn constrained_required_numeric_spanning_zero_is_optional_not_native() {
+    let (_tmp, project) = constrained_project("validate-optnum-app");
+    let routes = fs::read_to_string(project.join("src/routes/posts.rs")).unwrap();
+
+    // The form-struct field is `Option<i32>` (blank -> None), carrying both the
+    // `required` and `range` validators.
+    assert!(
+        routes.contains(
+            "    #[validate(required)]\n    #[validate(range(min = 0, max = 130))]\n    pub age: Option<i32>,"
+        ),
+        "constrained required `age` must be `Option<i32>` with #[validate(required, range(...))]:\n{routes}"
+    );
+
+    // The native-typed representation (which pre-fills `0`) must be gone.
+    assert!(
+        !routes.contains("pub age: i32,"),
+        "constrained required `age` must not keep its native `i32` type:\n{routes}"
+    );
+
+    // `into_new` must unwrap the Option and reject a missing value, never
+    // silently coerce a blank submission to `0` via a native clone.
+    assert!(
+        routes.contains("age: form.age.ok_or_else("),
+        "into_new must unwrap the Option and error on a missing value:\n{routes}"
+    );
+    assert!(
+        !routes.contains("age: form.age.clone(),") && !routes.contains("age: form.age,"),
+        "into_new must not pass the native field straight through:\n{routes}"
+    );
+
+    // The edit-form seed maps a persisted row's native value back into `Some`.
+    assert!(
+        routes.contains("age: Some(row.age),"),
+        "from_row must wrap the persisted native value in Some:\n{routes}"
+    );
+}
+
 #[test]
 fn cargo_toml_pulls_in_validator_dependency() {
     let (_tmp, project) = constrained_project("validate-cargo-app");
