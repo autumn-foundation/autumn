@@ -1914,12 +1914,25 @@ fn scheme_is_https(url: &str) -> Result<bool, ClientError> {
     Ok(parsed.scheme().eq_ignore_ascii_case("https"))
 }
 
-/// If `resp` is a `3xx` carrying a `Location` header, resolve it to an absolute
-/// URL (joining relative locations against `base`). Returns `Ok(None)` when the
-/// response is not a followable redirect (non-3xx, or 3xx without `Location`).
+/// If `resp` is a followable redirect (status `301`, `302`, `303`, `307`, or
+/// `308`) carrying a `Location` header, resolve it to an absolute URL (joining
+/// relative locations against `base`). Returns `Ok(None)` when the response is
+/// not a followable redirect: any status outside that set (including non-3xx and
+/// the non-followable 3xx `300`/`304`/`305`/`306`), or a followable status
+/// missing its `Location` header.
 fn redirect_target(resp: &Response, base: &str) -> Result<Option<String>, ClientError> {
-    if !resp.status().is_redirection() {
-        return Ok(None);
+    // Only the statuses reqwest itself follows are treated as redirects. A
+    // response like `304 Not Modified` (or 300/305/306) can legitimately carry
+    // a `Location` header without being a followable redirect, so matching the
+    // entire 300–399 range via `is_redirection()` would wrongly issue an extra
+    // request instead of returning the response to the caller.
+    match resp.status() {
+        reqwest::StatusCode::MOVED_PERMANENTLY
+        | reqwest::StatusCode::FOUND
+        | reqwest::StatusCode::SEE_OTHER
+        | reqwest::StatusCode::TEMPORARY_REDIRECT
+        | reqwest::StatusCode::PERMANENT_REDIRECT => {}
+        _ => return Ok(None),
     }
     let Some(location) = resp
         .headers()
@@ -3248,6 +3261,17 @@ mod tests {
             .unwrap()
     }
 
+    // Build a response with an arbitrary status that carries a `Location`
+    // header — used to prove non-followable 3xx statuses (304/300/…) are NOT
+    // treated as redirects even when they advertise a `Location`.
+    fn response_with_location(status: u16, location: String) -> axum::response::Response {
+        axum::response::Response::builder()
+            .status(status)
+            .header("location", location)
+            .body(axum::body::Body::empty())
+            .unwrap()
+    }
+
     // TEST 48: no_redirect returns the 3xx verbatim without following it.
     #[tokio::test]
     async fn no_redirect_returns_3xx_unfollowed() {
@@ -3983,6 +4007,107 @@ mod tests {
         assert!(
             matches!(result, Err(ClientError::PinRequiresDomainHost(_))),
             "expected PinRequiresDomainHost, got {result:?}"
+        );
+    }
+
+    // TEST 69: a `304 Not Modified` that happens to carry a `Location` header is
+    // NOT a followable redirect. reqwest only follows 301/302/303/307/308, so
+    // `redirect_target` must return the 304 to the caller verbatim rather than
+    // issuing a second request against the `Location` target.
+    #[tokio::test]
+    async fn follow_redirects_does_not_follow_304_with_location() {
+        use axum::{Router, routing::get};
+        use std::sync::atomic::AtomicBool;
+
+        // Listener B must never be reached.
+        let touched = Arc::new(AtomicBool::new(false));
+        let touched2 = touched.clone();
+        let b_addr = spawn(Router::new().route(
+            "/dst",
+            get(move || {
+                let t = touched2.clone();
+                async move {
+                    t.store(true, Ordering::SeqCst);
+                    "SHOULD-NOT-BE-HIT"
+                }
+            }),
+        ))
+        .await;
+        let b_port = b_addr.port();
+
+        // Listener A returns 304 + Location pointing at B.
+        let a_addr = spawn(Router::new().route(
+            "/start",
+            get(move || async move {
+                response_with_location(304, format!("http://127.0.0.1:{b_port}/dst"))
+            }),
+        ))
+        .await;
+
+        let resp = Client::new()
+            .get(format!("http://127.0.0.1:{}/start", a_addr.port()))
+            .follow_redirects(5, |_| true)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            resp.status().as_u16(),
+            304,
+            "a 304 with a Location header must be returned verbatim, not followed"
+        );
+        assert!(
+            !touched.load(Ordering::SeqCst),
+            "the 304 Location target must never be requested"
+        );
+    }
+
+    // TEST 70: a `300 Multiple Choices` that carries a `Location` header is
+    // likewise not a followable redirect (only 301/302/303/307/308 are), so the
+    // 300 is returned to the caller and the `Location` target is never hit.
+    #[tokio::test]
+    async fn follow_redirects_does_not_follow_300_with_location() {
+        use axum::{Router, routing::get};
+        use std::sync::atomic::AtomicBool;
+
+        let touched = Arc::new(AtomicBool::new(false));
+        let touched2 = touched.clone();
+        let b_addr = spawn(Router::new().route(
+            "/dst",
+            get(move || {
+                let t = touched2.clone();
+                async move {
+                    t.store(true, Ordering::SeqCst);
+                    "SHOULD-NOT-BE-HIT"
+                }
+            }),
+        ))
+        .await;
+        let b_port = b_addr.port();
+
+        let a_addr = spawn(Router::new().route(
+            "/start",
+            get(move || async move {
+                response_with_location(300, format!("http://127.0.0.1:{b_port}/dst"))
+            }),
+        ))
+        .await;
+
+        let resp = Client::new()
+            .get(format!("http://127.0.0.1:{}/start", a_addr.port()))
+            .follow_redirects(5, |_| true)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            resp.status().as_u16(),
+            300,
+            "a 300 with a Location header must be returned verbatim, not followed"
+        );
+        assert!(
+            !touched.load(Ordering::SeqCst),
+            "the 300 Location target must never be requested"
         );
     }
 }
