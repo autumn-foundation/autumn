@@ -376,11 +376,80 @@ pub fn os_env_with_dotenv() -> Result<DotenvOsEnv, DotenvError> {
     })
 }
 
+/// Like [`os_env_with_dotenv`], but selects `.env.<profile>` for an EXPLICIT
+/// `profile` instead of the ambient one (which [`resolve_process_dotenv`]
+/// derives from `AUTUMN_ENV`/`AUTUMN_PROFILE`).
+///
+/// CLI paths that resolve config under a caller-forced profile — e.g.
+/// `autumn db backup --profile <p>` or an `offsite:<p>/…` restore ref — must load
+/// `.env.<p>` even when the ambient shell profile differs, otherwise a
+/// profile-specific `.env.<p>` (offsite overrides, credential values) is silently
+/// missed. Real environment variables still win over `.env`, and `.env`
+/// profile-selector keys are still ignored, exactly as in [`os_env_with_dotenv`].
+///
+/// # Errors
+/// Returns a [`DotenvError`] if a project-root `.env` file exists but cannot be
+/// read or parsed.
+pub fn os_env_with_dotenv_for_profile(profile: &str) -> Result<DotenvOsEnv, DotenvError> {
+    let base = OsEnv;
+    let dir = dotenv_base_dir(&base);
+    Ok(DotenvOsEnv {
+        overlay: resolve_dotenv_vars(&dir, profile, &base)?
+            .into_iter()
+            .collect(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::MockEnv;
     use std::path::PathBuf;
+
+    #[test]
+    fn dotenv_profile_selection_reproduces_offsite_wrong_profile_bug() {
+        // Reproduction for issue #1619 P2 #6: an offsite override + credential
+        // live ONLY in `.env.test`. With the ambient shell profile unset (default
+        // "dev"), resolving `.env` for "dev" MISSES `.env.test` — the bug the
+        // offsite path hit by feeding `dotenv_env()` the ambient profile.
+        // Resolving for the TARGET profile "test" (the fix) picks them up.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(".env.test"),
+            "AUTUMN_BACKUP__OFFSITE__S3__BUCKET=from-dot-env-test\n\
+             AUTUMN_OFFSITE_SECRET=sekret\n",
+        )
+        .unwrap();
+        let ambient = MockEnv::new(); // AUTUMN_ENV / AUTUMN_PROFILE unset
+
+        // Buggy path: the ambient/default profile "dev" does NOT load `.env.test`.
+        let dev: std::collections::HashMap<_, _> = resolve_dotenv_vars(dir.path(), "dev", &ambient)
+            .unwrap()
+            .into_iter()
+            .collect();
+        assert!(
+            !dev.contains_key("AUTUMN_BACKUP__OFFSITE__S3__BUCKET"),
+            "reproduction: dev profile must miss the .env.test offsite override"
+        );
+        assert!(!dev.contains_key("AUTUMN_OFFSITE_SECRET"));
+
+        // Fixed path: resolving for the target profile "test" loads `.env.test`,
+        // so both the offsite override and the credential value are honored.
+        let test: std::collections::HashMap<_, _> =
+            resolve_dotenv_vars(dir.path(), "test", &ambient)
+                .unwrap()
+                .into_iter()
+                .collect();
+        assert_eq!(
+            test.get("AUTUMN_BACKUP__OFFSITE__S3__BUCKET")
+                .map(String::as_str),
+            Some("from-dot-env-test")
+        );
+        assert_eq!(
+            test.get("AUTUMN_OFFSITE_SECRET").map(String::as_str),
+            Some("sekret")
+        );
+    }
 
     fn p() -> PathBuf {
         PathBuf::from("/tmp/.env")

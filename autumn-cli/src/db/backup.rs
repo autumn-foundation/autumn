@@ -1049,6 +1049,22 @@ fn dotenv_env() -> autumn_web::dotenv::DotenvOsEnv {
     }
 }
 
+/// Like [`dotenv_env`] but selects `.env.<profile>` for an explicit target
+/// profile (issue #1619). The offsite path resolves config + credentials under
+/// the run's profile (`--profile <p>` / `offsite:<p>/…`), so a profile-specific
+/// `.env.<p>` is honored even when the ambient shell profile differs — otherwise
+/// `autumn db backup --profile test --upload` from a dev/unset shell would miss
+/// `.env.test`-provided offsite settings and credentials.
+fn dotenv_env_for_profile(profile: &str) -> autumn_web::dotenv::DotenvOsEnv {
+    match autumn_web::dotenv::os_env_with_dotenv_for_profile(profile) {
+        Ok(env) => env,
+        Err(e) => {
+            eprintln!("  \u{274C} .env: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
 /// The managed-Postgres published cluster URL, used as a *fallback* control URL
 /// for bundled/daemon/single-binary apps (issue #1595). Such deployments often
 /// have no `DATABASE_URL` in env or `autumn.toml`; the running cluster instead
@@ -1640,6 +1656,9 @@ struct ResolvedOffsite {
     secret_access_key_env: Option<String>,
     app_storage_bucket: Option<String>,
     app_storage_endpoint: Option<String>,
+    /// The run's target profile — credentials are read from the `.env.<profile>`
+    /// overlay for THIS profile, matching the config read (issue #1619 P2 #6).
+    profile: String,
 }
 
 impl ResolvedOffsite {
@@ -1669,7 +1688,10 @@ impl ResolvedOffsite {
     /// Resolve the access key / secret from the environment variables NAMED by
     /// config. Credential *values* never appear in errors — only the var names.
     fn resolve_credentials(&self) -> Result<S3Credentials, BackupError> {
-        let env = dotenv_env();
+        // Read credentials from the SAME profile-specific `.env.<profile>` overlay
+        // the offsite config was resolved under (issue #1619 P2 #6), so a
+        // `.env.<profile>`-provided credential value is honored.
+        let env = dotenv_env_for_profile(&self.profile);
         let access_key_id = read_credential_env(&env, self.access_key_id_env.as_deref())?;
         let secret_access_key = read_credential_env(&env, self.secret_access_key_env.as_deref())?;
         Ok(S3Credentials {
@@ -1726,6 +1748,8 @@ struct LoadedOffsite {
     offsite: autumn_web::config::OffsiteBackupConfig,
     app_storage_bucket: Option<String>,
     app_storage_endpoint: Option<String>,
+    /// The target profile this section was resolved under (issue #1619 P2 #6).
+    profile: String,
 }
 
 impl LoadedOffsite {
@@ -1741,6 +1765,7 @@ impl LoadedOffsite {
             offsite,
             app_storage_bucket,
             app_storage_endpoint,
+            profile,
         } = self;
         let bucket = offsite
             .s3
@@ -1783,6 +1808,7 @@ impl LoadedOffsite {
             secret_access_key_env: offsite.s3.secret_access_key_env,
             app_storage_bucket,
             app_storage_endpoint,
+            profile,
         })
     }
 }
@@ -1793,7 +1819,11 @@ impl LoadedOffsite {
 /// validation — that is deferred to [`LoadedOffsite::resolve`] so a local-only
 /// backup is never blocked by an incomplete offsite section.
 fn load_offsite(profile: &str) -> Result<Option<LoadedOffsite>, BackupError> {
-    let base = dotenv_env();
+    // Load `.env.<profile>` for the TARGET profile (not the ambient shell one),
+    // then force `AUTUMN_ENV` for the TOML `[profile.<profile>]` overlay. Both
+    // must key off the same profile so a `.env.<profile>`-provided offsite
+    // override is honored (issue #1619 P2 #6).
+    let base = dotenv_env_for_profile(profile);
     let forced = ProfileForcedEnv {
         inner: &base,
         profile: profile.to_owned(),
@@ -1825,6 +1855,7 @@ fn load_offsite(profile: &str) -> Result<Option<LoadedOffsite>, BackupError> {
             .map(str::trim)
             .filter(|e| !e.is_empty())
             .map(str::to_owned),
+        profile: profile.to_owned(),
     }))
 }
 
@@ -3227,6 +3258,7 @@ mod tests {
             offsite,
             app_storage_bucket: None,
             app_storage_endpoint: None,
+            profile: "test".to_owned(),
         };
         // The decision a local backup makes (args.upload = false): no upload.
         assert!(!loaded.auto_upload());
@@ -3236,6 +3268,25 @@ mod tests {
             loaded.resolve(),
             Err(BackupError::OffsiteConfig { .. })
         ));
+    }
+
+    #[test]
+    fn resolved_offsite_carries_target_profile_for_credentials() {
+        // P2 #6: the target profile threads through resolve() into
+        // ResolvedOffsite so credential resolution reads the SAME
+        // `.env.<profile>` overlay the config was loaded under.
+        let mut offsite = autumn_web::config::OffsiteBackupConfig::default();
+        offsite.s3.bucket = Some("offsite-bucket".to_owned());
+        offsite.s3.access_key_id_env = Some("OFFSITE_KEY".to_owned());
+        offsite.s3.secret_access_key_env = Some("OFFSITE_SECRET".to_owned());
+        let loaded = LoadedOffsite {
+            offsite,
+            app_storage_bucket: None,
+            app_storage_endpoint: None,
+            profile: "test".to_owned(),
+        };
+        let resolved = loaded.resolve().expect("bucket set, resolves");
+        assert_eq!(resolved.profile, "test");
     }
 
     #[test]
