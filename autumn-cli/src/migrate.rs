@@ -850,6 +850,25 @@ pub fn is_production_profile_name(profile: &str) -> bool {
     normalized == "prod" || normalized == "production"
 }
 
+/// Normalize a profile name to its canonical spelling — the SAME mapping the
+/// runtime config loader applies (`autumn_web::config`'s `normalize_profile_name`):
+/// `production`/`prod` (any case) → `prod`, `development`/`dev` (any case) → `dev`,
+/// custom names preserved (trimmed, case kept). Reused so an offsite
+/// `.env.<profile>` / `[profile.<p>]` selection matches the app's resolved profile
+/// even when the operator writes `--profile development` / `AUTUMN_ENV=PROD`
+/// (issue #1619 P2 #20).
+#[must_use]
+pub fn canonical_profile(profile: &str) -> String {
+    let trimmed = profile.trim();
+    if trimmed.eq_ignore_ascii_case("production") || trimmed.eq_ignore_ascii_case("prod") {
+        "prod".to_owned()
+    } else if trimmed.eq_ignore_ascii_case("development") || trimmed.eq_ignore_ascii_case("dev") {
+        "dev".to_owned()
+    } else {
+        trimmed.to_owned()
+    }
+}
+
 /// Profile name spellings to probe for inline `[profile.<name>]` sections,
 /// mirroring `autumn_web::config::profile_lookup_names`'s alias handling so
 /// `prod`/`production` and `dev`/`development` are interchangeable. Matching is
@@ -902,10 +921,42 @@ pub fn read_autumn_toml_table_with_profile(profile: Option<&str>) -> Option<toml
     read_autumn_toml_table_with_profile_in(Path::new("."), profile)
 }
 
+/// Like [`read_autumn_toml_table_with_profile`], but resolves `autumn.toml` from
+/// the SAME base directory the full `AutumnConfig::load` uses
+/// (`find_config_file_named`): `AUTUMN_MANIFEST_DIR` when it holds an
+/// `autumn.toml`, otherwise the process CWD. Installed/daemon launches (config in
+/// the manifest/config dir, a different CWD) can therefore resolve offsite
+/// settings that a bare CWD read would miss — matching where the full loader and
+/// the profile-aware dotenv overlay already look (issue #1619 P2 #15).
+pub fn read_autumn_toml_table_with_profile_from_config_dir(
+    profile: Option<&str>,
+) -> Option<toml::Table> {
+    read_autumn_toml_table_with_profile_in(&autumn_toml_base_dir(), profile)
+}
+
+/// The directory to read `autumn.toml` from, mirroring the config loader's
+/// `find_config_file_named`: `AUTUMN_MANIFEST_DIR` when that directory actually
+/// contains an `autumn.toml`, otherwise `.` (the process CWD).
+fn autumn_toml_base_dir() -> std::path::PathBuf {
+    autumn_toml_base_dir_from(std::env::var("AUTUMN_MANIFEST_DIR").ok().as_deref())
+}
+
+/// Directory-parameterized core of [`autumn_toml_base_dir`], separated so the
+/// `AUTUMN_MANIFEST_DIR` resolution is unit-testable without mutating process env.
+fn autumn_toml_base_dir_from(manifest_dir: Option<&str>) -> std::path::PathBuf {
+    if let Some(dir) = manifest_dir.map(str::trim).filter(|d| !d.is_empty()) {
+        let dir = Path::new(dir);
+        if dir.join("autumn.toml").exists() {
+            return dir.to_path_buf();
+        }
+    }
+    std::path::PathBuf::from(".")
+}
+
 /// Directory-parameterized core of [`read_autumn_toml_table_with_profile`],
 /// separated so the overlay-merge behavior is unit-testable without mutating
 /// the process-global current directory.
-fn read_autumn_toml_table_with_profile_in(
+pub fn read_autumn_toml_table_with_profile_in(
     dir: &Path,
     profile: Option<&str>,
 ) -> Option<toml::Table> {
@@ -2227,6 +2278,21 @@ mod tests {
     }
 
     #[test]
+    fn canonical_profile_normalizes_aliases_and_case() {
+        // P2 #20: offsite `.env.<profile>` selection must use the app's canonical
+        // profile, so alias/case spellings collapse the same way the loader does.
+        for input in ["development", "Development", "DEV", "dev", "  dev  "] {
+            assert_eq!(canonical_profile(input), "dev", "{input:?}");
+        }
+        for input in ["production", "PROD", "Prod", "prod"] {
+            assert_eq!(canonical_profile(input), "prod", "{input:?}");
+        }
+        // Custom profiles are preserved verbatim (trimmed, case kept).
+        assert_eq!(canonical_profile("staging"), "staging");
+        assert_eq!(canonical_profile("  QA  "), "QA");
+    }
+
+    #[test]
     fn profile_file_lookup_prefers_selected_spelling() {
         // Overlay file probe order prefers the spelling the operator selected.
         assert_eq!(
@@ -3041,6 +3107,57 @@ primary_url = "postgres://prod-s0:5432/app"
             resolve_primary_database_url_from_sources(no_env, Some(&base)).as_deref(),
             Some("postgres://base-control:5432/app")
         );
+    }
+
+    #[test]
+    fn autumn_toml_base_dir_prefers_manifest_dir_with_config() {
+        // P2 #15: when AUTUMN_MANIFEST_DIR holds an autumn.toml, offsite TOML
+        // reads must resolve from THAT directory (like the full loader), not CWD.
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("autumn.toml"), "[backup.offsite]\n").unwrap();
+        assert_eq!(
+            autumn_toml_base_dir_from(Some(tmp.path().to_str().unwrap())),
+            tmp.path()
+        );
+    }
+
+    #[test]
+    fn autumn_toml_base_dir_falls_back_to_cwd() {
+        // No manifest dir, or a manifest dir WITHOUT an autumn.toml → CWD (".").
+        assert_eq!(
+            autumn_toml_base_dir_from(None),
+            std::path::PathBuf::from(".")
+        );
+        assert_eq!(
+            autumn_toml_base_dir_from(Some("   ")),
+            std::path::PathBuf::from(".")
+        );
+        let empty = tempfile::TempDir::new().unwrap();
+        assert_eq!(
+            autumn_toml_base_dir_from(Some(empty.path().to_str().unwrap())),
+            std::path::PathBuf::from(".")
+        );
+    }
+
+    #[test]
+    fn config_dir_read_surfaces_offsite_section() {
+        // The manifest-dir read must carry the [backup.offsite] section (with the
+        // profile overlay applied) so offsite resolution + auto_upload work when
+        // the config lives outside CWD.
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("autumn.toml"),
+            "[backup.offsite]\nauto_upload = true\nprefix = \"db\"\n",
+        )
+        .unwrap();
+        let table = read_autumn_toml_table_with_profile_in(tmp.path(), Some("dev"))
+            .expect("manifest-dir autumn.toml should read");
+        let auto_upload = table
+            .get("backup")
+            .and_then(|v| v.get("offsite"))
+            .and_then(|v| v.get("auto_upload"))
+            .and_then(toml::Value::as_bool);
+        assert_eq!(auto_upload, Some(true));
     }
 
     #[test]

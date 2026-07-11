@@ -56,6 +56,9 @@ const fn feature_gated_roots() -> [(bool, &'static str); 6] {
         (cfg!(feature = "i18n"), "i18n"),
         (cfg!(feature = "mail"), "mail"),
         (cfg!(feature = "storage"), "storage"),
+        // NOTE: `[backup]` (issue #1619) is intentionally NOT here — it is a
+        // non-feature-gated root present in every build, so it always appears in
+        // the schema and needs no gating exclusion.
         (cfg!(feature = "http-client"), "http"),
         (cfg!(feature = "reporting"), "reporting"),
         (cfg!(feature = "maud"), "stories"),

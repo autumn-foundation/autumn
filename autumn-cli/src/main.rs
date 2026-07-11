@@ -1001,6 +1001,11 @@ enum DbCommands {
         /// Back up only the control database (skip shards).
         #[arg(long)]
         control_only: bool,
+        /// After local verification + prune, upload the run to the configured
+        /// offsite destination ([backup.offsite]) and verify each remote object
+        /// (issue #1619). Also enabled by backup.offsite.auto_upload = true.
+        #[arg(long)]
+        upload: bool,
     },
     /// Restore the configured database(s) from a backup artifact.
     ///
@@ -1010,7 +1015,9 @@ enum DbCommands {
     /// guard as `autumn db drop` (refuses non-dev/test profiles without `--force`).
     #[command(verbatim_doc_comment)]
     Restore {
-        /// Path to the backup run directory or artifact file to restore.
+        /// Path to the backup run directory or artifact file to restore — or an
+        /// offsite reference `offsite:<profile>/<timestamp|latest>` (see
+        /// `--offsite`).
         #[arg(value_name = "ARTIFACT")]
         artifact: std::path::PathBuf,
         /// Resolve the connection through a profile overlay (see `db create`).
@@ -1022,6 +1029,25 @@ enum DbCommands {
         /// Restore only this shard from the artifact.
         #[arg(long, value_name = "NAME")]
         shard: Option<String>,
+        /// Restore from the offsite destination: interpret ARTIFACT as
+        /// `<profile>/<timestamp|latest>` and download the run before restoring
+        /// (issue #1619). An `offsite:` prefix on ARTIFACT implies this.
+        #[arg(long)]
+        offsite: bool,
+    },
+    /// Inspect the offsite backup destination ([backup.offsite], issue #1619).
+    #[command(subcommand)]
+    Offsite(OffsiteCommands),
+}
+
+/// Subcommands for `autumn db offsite` (issue #1619).
+#[derive(Subcommand)]
+enum OffsiteCommands {
+    /// List offsite backups for the active profile (timestamp, size, files).
+    List {
+        /// Resolve the destination under a profile overlay (see `db create`).
+        #[arg(long, value_name = "PROFILE")]
+        profile: Option<String>,
     },
 }
 
@@ -1035,8 +1061,8 @@ impl DbCommands {
             Self::Create { profile } => (db::DbCommand::Create, profile),
             Self::Drop { profile, force } => (db::DbCommand::Drop { force }, profile),
             Self::Reset { profile, force } => (db::DbCommand::Reset { force }, profile),
-            Self::Pull { .. } | Self::Backup { .. } | Self::Restore { .. } => {
-                unreachable!("db pull/backup/restore are dispatched before into_command")
+            Self::Pull { .. } | Self::Backup { .. } | Self::Restore { .. } | Self::Offsite(_) => {
+                unreachable!("db pull/backup/restore/offsite are dispatched before into_command")
             }
         }
     }
@@ -2368,6 +2394,7 @@ fn run_command(command: Commands) {
                 keep,
                 shard,
                 control_only,
+                upload,
             } => {
                 let format = match db::backup::BackupFormat::parse(&format) {
                     Ok(f) => f,
@@ -2387,6 +2414,7 @@ fn run_command(command: Commands) {
                     format,
                     keep,
                     target,
+                    upload,
                 });
             }
             DbCommands::Restore {
@@ -2394,12 +2422,17 @@ fn run_command(command: Commands) {
                 profile,
                 force,
                 shard,
+                offsite,
             } => db::backup::run_restore(&db::backup::RestoreArgs {
                 artifact,
                 profile,
                 force,
                 shard,
+                offsite,
             }),
+            DbCommands::Offsite(OffsiteCommands::List { profile }) => {
+                db::backup::run_offsite_list(profile.as_deref());
+            }
             other => {
                 let (command, profile) = other.into_command();
                 db::run(&command, profile.as_deref());
@@ -4538,6 +4571,7 @@ mod tests {
             keep,
             shard,
             control_only,
+            upload,
         }) = cli.command
         else {
             panic!("expected db backup");
@@ -4548,6 +4582,7 @@ mod tests {
         assert!(keep.is_none());
         assert!(shard.is_none());
         assert!(!control_only);
+        assert!(!upload);
     }
 
     #[test]
@@ -4566,6 +4601,7 @@ mod tests {
             "7",
             "--shard",
             "east",
+            "--upload",
         ])
         .unwrap();
         let Commands::Db(DbCommands::Backup {
@@ -4575,6 +4611,7 @@ mod tests {
             keep,
             shard,
             control_only,
+            upload,
         }) = cli.command
         else {
             panic!("expected db backup");
@@ -4585,6 +4622,7 @@ mod tests {
         assert_eq!(keep, Some(7));
         assert_eq!(shard.as_deref(), Some("east"));
         assert!(!control_only);
+        assert!(upload);
     }
 
     #[test]
@@ -4626,6 +4664,7 @@ mod tests {
             profile,
             force,
             shard,
+            offsite,
         }) = cli.command
         else {
             panic!("expected db restore");
@@ -4637,6 +4676,43 @@ mod tests {
         assert_eq!(profile.as_deref(), Some("prod"));
         assert!(force);
         assert_eq!(shard.as_deref(), Some("east"));
+        assert!(!offsite);
+    }
+
+    #[test]
+    fn parse_db_restore_offsite_flag() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "db",
+            "restore",
+            "prod/latest",
+            "--offsite",
+            "--force",
+        ])
+        .unwrap();
+        let Commands::Db(DbCommands::Restore {
+            artifact,
+            offsite,
+            force,
+            ..
+        }) = cli.command
+        else {
+            panic!("expected db restore");
+        };
+        assert_eq!(artifact, std::path::PathBuf::from("prod/latest"));
+        assert!(offsite);
+        assert!(force);
+    }
+
+    #[test]
+    fn parse_db_offsite_list() {
+        let cli =
+            Cli::try_parse_from(["autumn", "db", "offsite", "list", "--profile", "prod"]).unwrap();
+        let Commands::Db(DbCommands::Offsite(OffsiteCommands::List { profile })) = cli.command
+        else {
+            panic!("expected db offsite list");
+        };
+        assert_eq!(profile.as_deref(), Some("prod"));
     }
 
     // ── autumn seed tests ──────────────────────────────────────────────────

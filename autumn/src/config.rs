@@ -865,6 +865,98 @@ pub enum ConfigError {
 /// assert_eq!(config.log.level, "info");
 /// assert_eq!(config.health.path, "/health");
 /// ```
+/// `[backup]` configuration section (issue #1619).
+///
+/// Groups database-backup destinations. Currently only an offsite S3-compatible
+/// destination is supported. NOT feature-gated: this section (`[backup.offsite]`)
+/// is recognized by every autumn-web build so a strict-config app compiled
+/// WITHOUT the `storage` feature still accepts its own `autumn.toml` `[backup]`
+/// keys (the offsite upload client lives in the CLI and is independent of the
+/// storage feature).
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct BackupConfig {
+    /// Offsite upload destination (`[backup.offsite]`). `None` (the default)
+    /// means no offsite destination is configured; `autumn db backup --upload`
+    /// then errors with configuration guidance rather than silently no-op'ing.
+    ///
+    /// Boxed so an unconfigured `[backup]` costs one pointer rather than the full
+    /// [`OffsiteBackupConfig`] inline: `AutumnConfig` is held across awaits in the
+    /// app-run future, and keeping this field small avoids bloating that future.
+    #[serde(default)]
+    pub offsite: Option<Box<OffsiteBackupConfig>>,
+}
+
+/// `[backup.offsite]` — an S3-compatible offsite backup destination (issue #1619).
+///
+/// Credentials are supplied by env-var *indirection* only: `s3.access_key_id_env`
+/// / `s3.secret_access_key_env` name the environment variables the secrets are
+/// read from at upload time. The secret values themselves never live in config,
+/// argv, logs, or error messages.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct OffsiteBackupConfig {
+    /// S3-compatible connection + credential-indirection settings
+    /// (`[backup.offsite.s3]`). Works against AWS S3 / `MinIO` / R2 / B2 / Garage.
+    #[serde(default)]
+    pub s3: OffsiteS3Config,
+
+    /// Key prefix under which run directories are stored. Defaults to `""`
+    /// (bucket root). Objects are keyed `{prefix}/{profile}/{timestamp}/{file}`.
+    #[serde(default)]
+    pub prefix: Option<String>,
+
+    /// Independent remote retention: keep only the newest `N` uploaded runs per
+    /// profile, pruning older ones *after* a verified upload. `None` (default)
+    /// keeps all remote runs. Distinct from the local `--keep`.
+    #[serde(default)]
+    pub keep: Option<usize>,
+
+    /// Upload after every successful `autumn db backup` even without `--upload`
+    /// (the "configured default" upload, AC #1). Off by default.
+    #[serde(default)]
+    pub auto_upload: bool,
+
+    /// Opt-in to pointing the offsite destination at the same bucket+endpoint as
+    /// the app's user-facing blob storage (`[storage.s3]`). Off by default so a
+    /// shared bucket is a deliberate choice (AC #3).
+    #[serde(default)]
+    pub allow_shared_bucket: bool,
+}
+
+/// `[backup.offsite.s3]` — S3-compatible connection settings for offsite backups.
+///
+/// A dedicated, NON-feature-gated mirror of the storage backend's S3 shape so the
+/// `[backup]` section is available in every autumn-web build (the storage
+/// module — and its `StorageS3Config` — only exist under the `storage` feature).
+/// Credentials are named via `*_env` indirection, never inlined.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct OffsiteS3Config {
+    /// Target bucket.
+    #[serde(default)]
+    pub bucket: Option<String>,
+
+    /// AWS region or region-shaped string (R2 uses `auto`). Used for the `SigV4`
+    /// credential scope; many S3-compatible endpoints ignore it.
+    #[serde(default)]
+    pub region: Option<String>,
+
+    /// Custom endpoint URL. Required for non-AWS providers (R2, `MinIO`, B2,
+    /// Garage). Leave unset for AWS.
+    #[serde(default)]
+    pub endpoint: Option<String>,
+
+    /// Environment variable the access-key id is read from.
+    #[serde(default)]
+    pub access_key_id_env: Option<String>,
+
+    /// Environment variable the secret access key is read from.
+    #[serde(default)]
+    pub secret_access_key_env: Option<String>,
+
+    /// Path-style addressing toggle (R2 / `MinIO` need this `true`).
+    #[serde(default)]
+    pub force_path_style: bool,
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct AutumnConfig {
     /// Active profile name (e.g., "dev", "prod", "staging").
@@ -968,6 +1060,17 @@ pub struct AutumnConfig {
     #[cfg(feature = "storage")]
     #[serde(default)]
     pub storage: crate::storage::StorageConfig,
+
+    /// Offsite database-backup destination (`[backup]` section, issue #1619).
+    ///
+    /// Composes the verified local-backup artifact (issue #1595) with an
+    /// S3-compatible offsite destination. Always present (not feature-gated) so
+    /// every autumn-web build recognizes `[backup.offsite]` — a strict-config app
+    /// compiled without the `storage` feature still accepts its own `[backup]`
+    /// keys. The offsite upload client lives in the CLI and needs no storage
+    /// feature.
+    #[serde(default)]
+    pub backup: BackupConfig,
     /// Transactional email settings.
     #[cfg(feature = "mail")]
     #[serde(default)]
@@ -2931,6 +3034,7 @@ impl AutumnConfig {
         self.apply_reporting_env_overrides_with_env(env);
         #[cfg(feature = "storage")]
         self.apply_storage_env_overrides_with_env(env);
+        self.apply_backup_env_overrides_with_env(env);
         #[cfg(feature = "mail")]
         self.apply_mail_env_overrides_with_env(env);
         #[cfg(feature = "maud")]
@@ -3975,6 +4079,86 @@ impl AutumnConfig {
             env,
             "AUTUMN_STORAGE__VARIANTS__MAX_SOURCE_HEIGHT",
             &mut self.storage.variants.max_source_height,
+        );
+    }
+
+    /// Apply `AUTUMN_BACKUP__OFFSITE__*` overrides to the `[backup.offsite]`
+    /// section (issue #1619). Mirrors the storage overrides so the offsite
+    /// destination honors the same `AUTUMN_*` env convention. When no offsite
+    /// section exists in TOML, a default one is materialized only if at least
+    /// one offsite env var is present, so an all-env deployment still works.
+    fn apply_backup_env_overrides_with_env(&mut self, env: &dyn Env) {
+        // Keys that signal a genuine intent to CONFIGURE an offsite destination —
+        // any presence materializes the `[backup.offsite]` section. This
+        // deliberately EXCLUDES the two opt-out toggles: a lone
+        // `AUTO_UPLOAD=false` / `ALLOW_SHARED_BUCKET=false` must NOT create an
+        // otherwise-empty section (which would then fail validation / `doctor`
+        // with "backup.offsite.s3.bucket is unset") — offsite stays UNCONFIGURED
+        // (issue #1619 P2 #18). A truthy `AUTO_UPLOAD=true` DOES materialize, since
+        // it requires a validated destination to act on.
+        const OFFSITE_DEST_KEYS: &[&str] = &[
+            "AUTUMN_BACKUP__OFFSITE__S3__BUCKET",
+            "AUTUMN_BACKUP__OFFSITE__S3__REGION",
+            "AUTUMN_BACKUP__OFFSITE__S3__ENDPOINT",
+            "AUTUMN_BACKUP__OFFSITE__S3__ACCESS_KEY_ID_ENV",
+            "AUTUMN_BACKUP__OFFSITE__S3__SECRET_ACCESS_KEY_ENV",
+            "AUTUMN_BACKUP__OFFSITE__S3__FORCE_PATH_STYLE",
+            "AUTUMN_BACKUP__OFFSITE__PREFIX",
+            "AUTUMN_BACKUP__OFFSITE__KEEP",
+        ];
+        let has_dest_key = OFFSITE_DEST_KEYS.iter().any(|k| env.var(k).is_ok());
+        let auto_upload_truthy = env
+            .var("AUTUMN_BACKUP__OFFSITE__AUTO_UPLOAD")
+            .ok()
+            .is_some_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true"));
+        if self.backup.offsite.is_none() && !has_dest_key && !auto_upload_truthy {
+            return;
+        }
+        let offsite = self
+            .backup
+            .offsite
+            .get_or_insert_with(|| Box::new(OffsiteBackupConfig::default()));
+        parse_env_option_string(
+            env,
+            "AUTUMN_BACKUP__OFFSITE__S3__BUCKET",
+            &mut offsite.s3.bucket,
+        );
+        parse_env_option_string(
+            env,
+            "AUTUMN_BACKUP__OFFSITE__S3__REGION",
+            &mut offsite.s3.region,
+        );
+        parse_env_option_string(
+            env,
+            "AUTUMN_BACKUP__OFFSITE__S3__ENDPOINT",
+            &mut offsite.s3.endpoint,
+        );
+        parse_env_option_string(
+            env,
+            "AUTUMN_BACKUP__OFFSITE__S3__ACCESS_KEY_ID_ENV",
+            &mut offsite.s3.access_key_id_env,
+        );
+        parse_env_option_string(
+            env,
+            "AUTUMN_BACKUP__OFFSITE__S3__SECRET_ACCESS_KEY_ENV",
+            &mut offsite.s3.secret_access_key_env,
+        );
+        parse_env_bool(
+            env,
+            "AUTUMN_BACKUP__OFFSITE__S3__FORCE_PATH_STYLE",
+            &mut offsite.s3.force_path_style,
+        );
+        parse_env_option_string(env, "AUTUMN_BACKUP__OFFSITE__PREFIX", &mut offsite.prefix);
+        parse_env_option(env, "AUTUMN_BACKUP__OFFSITE__KEEP", &mut offsite.keep);
+        parse_env_bool(
+            env,
+            "AUTUMN_BACKUP__OFFSITE__AUTO_UPLOAD",
+            &mut offsite.auto_upload,
+        );
+        parse_env_bool(
+            env,
+            "AUTUMN_BACKUP__OFFSITE__ALLOW_SHARED_BUCKET",
+            &mut offsite.allow_shared_bucket,
         );
     }
 
@@ -7650,6 +7834,154 @@ path = "/healthz"
         assert_eq!(config.storage.variants.max_source_bytes, 5_242_880);
         assert_eq!(config.storage.variants.max_source_width, 2_000);
         assert_eq!(config.storage.variants.max_source_height, 1_500);
+    }
+
+    #[test]
+    fn backup_offsite_parses_from_toml() {
+        let toml = r#"
+            [backup.offsite]
+            prefix = "db"
+            keep = 5
+            auto_upload = true
+            allow_shared_bucket = true
+
+            [backup.offsite.s3]
+            bucket = "offsite-backups"
+            region = "auto"
+            endpoint = "https://minio.example.test"
+            access_key_id_env = "OFFSITE_KEY_ID"
+            secret_access_key_env = "OFFSITE_SECRET"
+            force_path_style = true
+        "#;
+        let config: AutumnConfig = toml::from_str(toml).unwrap();
+        let offsite = config.backup.offsite.expect("offsite section present");
+        assert_eq!(offsite.prefix.as_deref(), Some("db"));
+        assert_eq!(offsite.keep, Some(5));
+        assert!(offsite.auto_upload);
+        assert!(offsite.allow_shared_bucket);
+        assert_eq!(offsite.s3.bucket.as_deref(), Some("offsite-backups"));
+        assert_eq!(offsite.s3.region.as_deref(), Some("auto"));
+        assert_eq!(
+            offsite.s3.endpoint.as_deref(),
+            Some("https://minio.example.test")
+        );
+        // Credentials are indirected: config names the env vars, never the values.
+        assert_eq!(
+            offsite.s3.access_key_id_env.as_deref(),
+            Some("OFFSITE_KEY_ID")
+        );
+        assert_eq!(
+            offsite.s3.secret_access_key_env.as_deref(),
+            Some("OFFSITE_SECRET")
+        );
+        assert!(offsite.s3.force_path_style);
+    }
+
+    #[test]
+    fn backup_offsite_defaults_to_none() {
+        let config = AutumnConfig::default();
+        assert!(config.backup.offsite.is_none());
+    }
+
+    #[test]
+    fn env_override_backup_offsite_fields() {
+        let env = MockEnv::new()
+            .with("AUTUMN_BACKUP__OFFSITE__S3__BUCKET", "offsite")
+            .with("AUTUMN_BACKUP__OFFSITE__S3__REGION", "us-west-2")
+            .with(
+                "AUTUMN_BACKUP__OFFSITE__S3__ENDPOINT",
+                "https://s3.offsite.test",
+            )
+            .with("AUTUMN_BACKUP__OFFSITE__S3__ACCESS_KEY_ID_ENV", "OFF_KEY")
+            .with(
+                "AUTUMN_BACKUP__OFFSITE__S3__SECRET_ACCESS_KEY_ENV",
+                "OFF_SECRET",
+            )
+            .with("AUTUMN_BACKUP__OFFSITE__S3__FORCE_PATH_STYLE", "true")
+            .with("AUTUMN_BACKUP__OFFSITE__PREFIX", "nightly")
+            .with("AUTUMN_BACKUP__OFFSITE__KEEP", "3")
+            .with("AUTUMN_BACKUP__OFFSITE__AUTO_UPLOAD", "true")
+            .with("AUTUMN_BACKUP__OFFSITE__ALLOW_SHARED_BUCKET", "true");
+        let mut config = AutumnConfig::default();
+
+        config.apply_env_overrides_with_env(&env);
+
+        let offsite = config.backup.offsite.expect("materialized from env");
+        assert_eq!(offsite.s3.bucket.as_deref(), Some("offsite"));
+        assert_eq!(offsite.s3.region.as_deref(), Some("us-west-2"));
+        assert_eq!(
+            offsite.s3.endpoint.as_deref(),
+            Some("https://s3.offsite.test")
+        );
+        assert_eq!(offsite.s3.access_key_id_env.as_deref(), Some("OFF_KEY"));
+        assert_eq!(
+            offsite.s3.secret_access_key_env.as_deref(),
+            Some("OFF_SECRET")
+        );
+        assert!(offsite.s3.force_path_style);
+        assert_eq!(offsite.prefix.as_deref(), Some("nightly"));
+        assert_eq!(offsite.keep, Some(3));
+        assert!(offsite.auto_upload);
+        assert!(offsite.allow_shared_bucket);
+    }
+
+    #[test]
+    fn env_override_backup_offsite_absent_stays_none() {
+        // With no offsite env vars and no TOML section, nothing is materialized.
+        let env = MockEnv::new();
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        assert!(config.backup.offsite.is_none());
+    }
+
+    #[test]
+    fn env_override_backup_offsite_lone_opt_out_toggle_stays_none() {
+        // P2 #18: a lone false/opt-out toggle must NOT materialize an empty
+        // [backup.offsite] (which would then fail validation / `doctor` with
+        // "bucket is unset"). Offsite stays unconfigured.
+        for key in [
+            "AUTUMN_BACKUP__OFFSITE__AUTO_UPLOAD",
+            "AUTUMN_BACKUP__OFFSITE__ALLOW_SHARED_BUCKET",
+        ] {
+            let env = MockEnv::new().with(key, "false");
+            let mut config = AutumnConfig::default();
+            config.apply_env_overrides_with_env(&env);
+            assert!(
+                config.backup.offsite.is_none(),
+                "{key}=false must not materialize an offsite section",
+            );
+        }
+    }
+
+    #[test]
+    fn env_override_backup_offsite_truthy_auto_upload_materializes() {
+        // P2 #18: AUTO_UPLOAD=true genuinely needs a validated destination, so it
+        // DOES materialize the section (auto_upload set), as before.
+        let env = MockEnv::new().with("AUTUMN_BACKUP__OFFSITE__AUTO_UPLOAD", "true");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        let offsite = config
+            .backup
+            .offsite
+            .expect("auto_upload=true materializes offsite");
+        assert!(offsite.auto_upload);
+    }
+
+    #[test]
+    fn env_override_backup_offsite_destination_key_materializes() {
+        // A destination/credential key still materializes the section (with the
+        // opt-out toggle applied to it), unchanged from before P2 #18.
+        let env = MockEnv::new()
+            .with("AUTUMN_BACKUP__OFFSITE__S3__BUCKET", "offsite")
+            .with("AUTUMN_BACKUP__OFFSITE__AUTO_UPLOAD", "false");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        let offsite = config
+            .backup
+            .offsite
+            .expect("a bucket key materializes offsite");
+        assert_eq!(offsite.s3.bucket.as_deref(), Some("offsite"));
+        assert!(!offsite.auto_upload);
     }
 
     #[test]

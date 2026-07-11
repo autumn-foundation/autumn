@@ -25,6 +25,9 @@ use crate::migrate;
 /// ([`guard_destructive`]) verbatim.
 pub mod backup;
 
+/// Minimal synchronous S3 SigV4 client for offsite backup transfer (issue #1619).
+pub mod s3;
+
 /// The lifecycle subcommands of `autumn db`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DbCommand {
