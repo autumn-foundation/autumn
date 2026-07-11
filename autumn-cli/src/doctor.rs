@@ -780,6 +780,81 @@ pub fn check_alert_destination_impl(
     }
 }
 
+/// Check that a configured `[alerts] error_rate_threshold` is a usable 5xx rate
+/// (issue #1610).
+///
+/// The runtime compares the threshold against a rate computed as
+/// `err_delta / req_delta` (`autumn/src/alerts.rs`'s `evaluate_error_rate`), i.e.
+/// a **fraction in `[0, 1]`**, so the only meaningful thresholds are in `(0, 1]`.
+/// A non-finite value (`nan`/`inf`) or one `> 1` makes `rate >= threshold` false
+/// for every possible rate — the 5xx alert would NEVER fire; a value `<= 0` makes
+/// it fire on a 0%-error window. The runtime (`AlerterSettings::from_config`)
+/// sanitizes such a value by falling back to the default, but doctor still flags
+/// it so the operator fixes the config rather than silently running on the default.
+///
+/// `raw` is the RAW resolved value (empty when unset — the default `0.05` is used,
+/// which is valid). In **production** an invalid value warns with a dedicated
+/// message naming it; outside production it passes quietly (alerts are optional
+/// locally), matching the leniency of the other alert checks. Never blocks beyond
+/// a warning.
+///
+/// The returned check name is `"alert_error_rate_threshold"`.
+pub fn check_alert_error_rate_threshold_impl(raw: &str, is_production: bool) -> CheckResult {
+    const NAME: &str = "alert_error_rate_threshold";
+    let trimmed = raw.trim();
+    // Unset (or cleared) -> the runtime uses the valid default (0.05). Nothing to
+    // flag.
+    if trimmed.is_empty() {
+        return CheckResult {
+            name: NAME,
+            status: CheckStatus::Pass,
+            detail: Some("no [alerts] error_rate_threshold set (defaults to 0.05)".into()),
+            hint: None,
+        };
+    }
+    // Valid iff it parses to a finite fraction in (0, 1]. `str::parse::<f64>`
+    // accepts `nan`/`inf`/`-inf` (which `is_finite()` then rejects), matching the
+    // runtime's `f64` config value; an entirely unparsable value is invalid too.
+    let valid = trimmed
+        .parse::<f64>()
+        .is_ok_and(|v| v.is_finite() && v > 0.0 && v <= 1.0);
+    if valid {
+        return CheckResult {
+            name: NAME,
+            status: CheckStatus::Pass,
+            detail: Some(format!(
+                "[alerts] error_rate_threshold ({trimmed}) is a valid 5xx rate in (0, 1]"
+            )),
+            hint: None,
+        };
+    }
+    if is_production {
+        CheckResult {
+            name: NAME,
+            status: CheckStatus::Warn,
+            detail: Some(format!(
+                "[alerts] error_rate_threshold (\"{trimmed}\") is not a valid rate in (0, 1]; \
+                 the 5xx alert will not work as intended (the runtime falls back to the default \
+                 0.05)"
+            )),
+            hint: Some(
+                "Set [alerts] error_rate_threshold (or AUTUMN_ALERTS__ERROR_RATE_THRESHOLD) to a \
+                 fraction in (0, 1], e.g. 0.05 for 5%. See docs/guide/operator-alerts.md",
+            ),
+        }
+    } else {
+        CheckResult {
+            name: NAME,
+            status: CheckStatus::Pass,
+            detail: Some(format!(
+                "[alerts] error_rate_threshold (\"{trimmed}\") is not a valid rate in (0, 1] \
+                 (optional outside production; the runtime falls back to the default 0.05)"
+            )),
+            hint: None,
+        }
+    }
+}
+
 /// Check a single `[auth.oauth2.<provider>]` entry for common misconfigurations.
 ///
 /// - In production (`is_production = true`): fails when `client_secret` is empty.
@@ -3351,6 +3426,95 @@ where
     false
 }
 
+/// Resolve the RAW effective `[alerts] error_rate_threshold` (empty when unset)
+/// against the same fully-merged config the runtime boots with, mirroring
+/// [`resolve_alert_enabled`]'s profile selection and merged-table build.
+///
+/// The raw string (not a parsed number) is surfaced so
+/// [`check_alert_error_rate_threshold_impl`] can both validate its range and name
+/// a bad value in its warning. Env vars still take highest precedence.
+fn resolve_alert_error_rate_threshold() -> String {
+    let selected_input = std::env::var("AUTUMN_ENV")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .or_else(|| {
+            std::env::var("AUTUMN_PROFILE")
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+        })
+        .unwrap_or_default()
+        .trim()
+        .to_owned();
+    let normalized_profile = normalize_alert_profile(&selected_input);
+    // The merge flattens the active profile into the top-level `[alerts]`, so
+    // resolve against an EMPTY profile (mirroring `resolve_alert_enabled`).
+    let merged = get_merged_toml_table_runtime(&normalized_profile, &selected_input);
+    resolve_alert_error_rate_threshold_from_sources(
+        |key| std::env::var(key).ok(),
+        Some(&merged),
+        "",
+    )
+}
+
+/// Resolve the RAW `[alerts] error_rate_threshold` under the same layer precedence
+/// the runtime config merge applies (env `AUTUMN_ALERTS__ERROR_RATE_THRESHOLD` >
+/// `[profile.{profile}.alerts].error_rate_threshold` > base
+/// `[alerts].error_rate_threshold`), returning an empty string when unset — the
+/// runtime then uses the default `0.05`.
+///
+/// The value is a TOML float in config files but a string via the env var, so it
+/// is stringified regardless of its TOML scalar type (float/integer/string).
+/// The highest-priority PRESENT layer wins; a present env var is terminal (even
+/// empty, an explicit clear). Split out from [`resolve_alert_error_rate_threshold`]
+/// so the precedence is unit-testable without mutating process-global env/cwd state.
+fn resolve_alert_error_rate_threshold_from_sources<F>(
+    env_var: F,
+    table: Option<&toml::Table>,
+    profile: &str,
+) -> String
+where
+    F: Fn(&str) -> Option<String>,
+{
+    // Stringify a TOML scalar so a float (`0.05`), an integer (`1`), or a string
+    // value all resolve to a comparable raw representation.
+    let stringify = |v: &toml::Value| -> Option<String> {
+        match v {
+            toml::Value::Float(f) => Some(f.to_string()),
+            toml::Value::Integer(i) => Some(i.to_string()),
+            toml::Value::String(s) => Some(s.clone()),
+            _ => None,
+        }
+    };
+    // 1. Env var — highest priority. Present (even empty) is terminal.
+    if let Some(val) = env_var("AUTUMN_ALERTS__ERROR_RATE_THRESHOLD") {
+        return val;
+    }
+    // 2. Profile-specific `[profile.{profile}.alerts].error_rate_threshold`.
+    if !profile.is_empty()
+        && let Some(v) = table
+            .and_then(|t| t.get("profile"))
+            .and_then(|v| v.get(profile))
+            .and_then(toml::Value::as_table)
+            .and_then(|p| p.get("alerts"))
+            .and_then(toml::Value::as_table)
+            .and_then(|a| a.get("error_rate_threshold"))
+            .and_then(&stringify)
+    {
+        return v;
+    }
+    // 3. Base `[alerts].error_rate_threshold`.
+    if let Some(v) = table
+        .and_then(|t| t.get("alerts"))
+        .and_then(toml::Value::as_table)
+        .and_then(|a| a.get("error_rate_threshold"))
+        .and_then(stringify)
+    {
+        return v;
+    }
+    // 4. Unset everywhere → empty (runtime uses the default 0.05).
+    String::new()
+}
+
 /// Resolve whether the active profile is production from the environment or
 /// `autumn.toml`.
 fn resolve_is_production() -> bool {
@@ -3467,6 +3631,7 @@ pub fn run(opts: DoctorOptions) {
     let (alert_email, alert_webhook_configured, alert_webhook_url) = resolve_alert_destination();
     let alerts_enabled = resolve_alert_enabled();
     let alert_custom_channel = resolve_alert_custom_channel();
+    let alert_error_rate_threshold = resolve_alert_error_rate_threshold();
     let proxy_conflict_data = resolve_proxy_conflict_data();
     let (dotenv_has_example, dotenv_has_env, dotenv_uncovered) = resolve_dotenv_state();
 
@@ -3704,6 +3869,13 @@ pub fn run(opts: DoctorOptions) {
             transport_requires_from,
             alert_custom_channel,
         )
+    }));
+
+    // 12a2. `[alerts] error_rate_threshold` sanity: a non-finite or out-of-(0,1]
+    //       value silently breaks the 5xx alert (the runtime falls back to the
+    //       default). Warn in production so the operator fixes the config.
+    tasks.push(Box::new(move || {
+        check_alert_error_rate_threshold_impl(&alert_error_rate_threshold, is_production)
     }));
 
     // 12b. Local-dev `.env` handling (warn on `.env.example` without `.env`,
@@ -6598,6 +6770,129 @@ pub struct Vault {
             no_env,
             Some(&table),
             ""
+        ));
+    }
+
+    // ── check_alert_error_rate_threshold_impl (issue #1610) ──────────────────
+    // The threshold is compared against a FRACTION in [0, 1] (rate = err/req), so
+    // only (0, 1] is meaningful. A non-finite value or one > 1 makes the 5xx alert
+    // never fire; a value <= 0 makes it fire on 0%-error windows. In production
+    // doctor warns; outside production it passes quietly (alerts are optional).
+
+    #[test]
+    fn alert_threshold_unset_passes() {
+        // No value set: the runtime uses the valid default (0.05).
+        let r = check_alert_error_rate_threshold_impl("", true);
+        assert!(matches!(r.status, CheckStatus::Pass));
+        let r = check_alert_error_rate_threshold_impl("   ", true);
+        assert!(matches!(r.status, CheckStatus::Pass));
+    }
+
+    #[test]
+    fn alert_threshold_valid_in_range_passes() {
+        for v in ["0.05", "0.2", "1", "1.0", "0.001"] {
+            let r = check_alert_error_rate_threshold_impl(v, true);
+            assert!(
+                matches!(r.status, CheckStatus::Pass),
+                "{v} is a valid (0, 1] rate and must pass"
+            );
+        }
+    }
+
+    #[test]
+    fn alert_threshold_nan_warns_in_prod() {
+        let r = check_alert_error_rate_threshold_impl("nan", true);
+        assert!(matches!(r.status, CheckStatus::Warn));
+        assert!(
+            r.detail.as_deref().is_some_and(|d| d.contains("nan")),
+            "the warning must name the offending value"
+        );
+        assert!(r.hint.is_some());
+    }
+
+    #[test]
+    fn alert_threshold_out_of_range_warns_in_prod() {
+        // > 1: the alert can never fire. <= 0: it fires on 0%-error windows.
+        for v in ["1.5", "0", "-0.1", "inf"] {
+            let r = check_alert_error_rate_threshold_impl(v, true);
+            assert!(
+                matches!(r.status, CheckStatus::Warn),
+                "{v} is out of (0, 1] and must warn in production"
+            );
+        }
+    }
+
+    #[test]
+    fn alert_threshold_unparsable_warns_in_prod() {
+        let r = check_alert_error_rate_threshold_impl("high", true);
+        assert!(matches!(r.status, CheckStatus::Warn));
+    }
+
+    #[test]
+    fn alert_threshold_invalid_is_lenient_outside_prod() {
+        // Dev leniency, consistent with the other alert checks: still pass.
+        for v in ["nan", "1.5", "0", "-0.1"] {
+            let r = check_alert_error_rate_threshold_impl(v, false);
+            assert!(
+                matches!(r.status, CheckStatus::Pass),
+                "{v} must pass quietly outside production"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_alert_error_rate_threshold_reads_base_float() {
+        let table: toml::Table = toml::from_str("[alerts]\nerror_rate_threshold = 0.2\n").unwrap();
+        let raw = resolve_alert_error_rate_threshold_from_sources(no_env, Some(&table), "prod");
+        assert_eq!(raw, "0.2");
+        let r = check_alert_error_rate_threshold_impl(&raw, true);
+        assert!(matches!(r.status, CheckStatus::Pass));
+    }
+
+    #[test]
+    fn resolve_alert_error_rate_threshold_out_of_range_float_warns() {
+        // A present, out-of-range float resolves and the check warns in prod.
+        let table: toml::Table = toml::from_str("[alerts]\nerror_rate_threshold = 1.5\n").unwrap();
+        let raw = resolve_alert_error_rate_threshold_from_sources(no_env, Some(&table), "prod");
+        assert_eq!(raw, "1.5");
+        let r = check_alert_error_rate_threshold_impl(&raw, true);
+        assert!(matches!(r.status, CheckStatus::Warn));
+    }
+
+    #[test]
+    fn resolve_alert_error_rate_threshold_env_overrides_base() {
+        // A present env var (even a bad one) wins over the base TOML.
+        let table: toml::Table = toml::from_str("[alerts]\nerror_rate_threshold = 0.05\n").unwrap();
+        let env = |k: &str| (k == "AUTUMN_ALERTS__ERROR_RATE_THRESHOLD").then(|| "nan".to_owned());
+        let raw = resolve_alert_error_rate_threshold_from_sources(env, Some(&table), "prod");
+        assert_eq!(raw, "nan");
+        assert!(matches!(
+            check_alert_error_rate_threshold_impl(&raw, true).status,
+            CheckStatus::Warn
+        ));
+    }
+
+    #[test]
+    fn resolve_alert_error_rate_threshold_profile_overrides_base() {
+        let table: toml::Table = toml::from_str(
+            "[alerts]\nerror_rate_threshold = 0.05\n[profile.prod.alerts]\nerror_rate_threshold = 2.0\n",
+        )
+        .unwrap();
+        let under_profile =
+            resolve_alert_error_rate_threshold_from_sources(no_env, Some(&table), "prod");
+        assert_eq!(under_profile, "2");
+        let under_base = resolve_alert_error_rate_threshold_from_sources(no_env, Some(&table), "");
+        assert_eq!(under_base, "0.05");
+    }
+
+    #[test]
+    fn resolve_alert_error_rate_threshold_unset_is_empty() {
+        let table: toml::Table = toml::from_str("[alerts]\nemail = \"ops@example.com\"\n").unwrap();
+        let raw = resolve_alert_error_rate_threshold_from_sources(no_env, Some(&table), "prod");
+        assert_eq!(raw, "");
+        assert!(matches!(
+            check_alert_error_rate_threshold_impl(&raw, true).status,
+            CheckStatus::Pass
         ));
     }
 

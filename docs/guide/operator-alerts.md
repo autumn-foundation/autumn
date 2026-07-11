@@ -126,6 +126,17 @@ since the previous tick; it is only evaluated once at least
 `error_rate_min_requests` requests have been seen in that window, so a couple of
 errors during a quiet period never trip a false alarm.
 
+`error_rate_threshold` is a **fraction of sampled requests in `(0, 1]`** (it is
+compared against `errors / requests`), so `0.05` means "5% of sampled requests
+returned 5xx" and `1.0` means "100%". A value outside `(0, 1]` — non-finite
+(`nan`/`inf`), zero or negative, or greater than `1` — silently breaks the alert:
+a value `> 1` (or `nan`) can never be reached, so the 5xx alert would **never**
+fire, while a value `<= 0` would fire on a window with zero errors. Autumn is
+fail-safe here: at startup an invalid `error_rate_threshold` is **ignored and
+falls back to the default `0.05`** (logged with a `warn`), so 5xx alerting keeps
+working. `autumn doctor` also flags an invalid value in production so you can fix
+the config rather than unknowingly run on the default.
+
 ### Full `[alerts]` reference
 
 ```toml
@@ -143,7 +154,9 @@ dedup_window_secs = 900        # at most one notice per condition per 15 min
 health_grace_secs = 60         # indicator must stay Down this long before alerting
 
 # Condition (c): 5xx rate
-error_rate_threshold = 0.05    # 5% of sampled requests are 5xx
+error_rate_threshold = 0.05    # fraction in (0, 1]; 0.05 = 5% of sampled requests
+                               # are 5xx. An invalid value (non-finite, <= 0, or
+                               # > 1) falls back to the default 0.05 at startup.
 error_rate_min_requests = 20   # ignore the rate below this sample size
 
 # Background evaluation

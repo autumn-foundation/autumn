@@ -530,6 +530,33 @@ pub struct AlerterSettings {
     pub actuator_sensitive: bool,
 }
 
+/// Validate the configured 5xx `error_rate_threshold`, falling back to the
+/// [`default_error_rate_threshold`] when it is unusable.
+///
+/// The threshold is compared against a rate computed as `err_delta / req_delta`
+/// (see [`evaluate_error_rate`]), i.e. a **fraction in `[0, 1]`**, so the only
+/// meaningful thresholds are in `(0, 1]`. A non-finite value (`NaN`/`±inf`) or
+/// one `> 1` makes `rate >= threshold` false for every possible rate — the 5xx
+/// alert would NEVER fire; a value `<= 0` makes it true even on a 0%-error
+/// window — the alert would fire constantly. Neither can be meaningfully clamped
+/// (`NaN` especially), so a bad value falls back to the default and is logged,
+/// keeping 5xx alerting functional (fail-safe) rather than silently broken.
+fn sanitize_error_rate_threshold(threshold: f64) -> f64 {
+    if threshold.is_finite() && threshold > 0.0 && threshold <= 1.0 {
+        threshold
+    } else {
+        let default = default_error_rate_threshold();
+        tracing::warn!(
+            configured = threshold,
+            default,
+            "alerts: [alerts] error_rate_threshold ({threshold}) is not a valid 5xx rate in \
+             (0, 1]; falling back to the default ({default}) so 5xx alerting keeps working. Fix \
+             [alerts] error_rate_threshold (or the AUTUMN_ALERTS__ERROR_RATE_THRESHOLD env var)."
+        );
+        default
+    }
+}
+
 impl AlerterSettings {
     fn from_config(
         config: &AlertConfig,
@@ -539,7 +566,7 @@ impl AlerterSettings {
         Self {
             dedup_window: std::time::Duration::from_secs(config.dedup_window_secs.max(1)),
             health_grace: std::time::Duration::from_secs(config.health_grace_secs),
-            error_rate_threshold: config.error_rate_threshold,
+            error_rate_threshold: sanitize_error_rate_threshold(config.error_rate_threshold),
             error_rate_min_requests: config.error_rate_min_requests.max(1),
             eval_interval: std::time::Duration::from_secs(config.eval_interval_secs.max(1)),
             actuator_prefix,
@@ -1989,6 +2016,98 @@ mod tests {
         assert!(c.is_active());
         c.enabled = false;
         assert!(!c.is_active(), "disabled -> inactive even with destination");
+    }
+
+    // ── 5xx error_rate_threshold sanitization (P2) ───────────────────────────
+    // The threshold is compared against a FRACTION in [0, 1] (rate = err/req),
+    // so only (0, 1] is meaningful. A non-finite value or one > 1 makes the
+    // alert never fire; a value <= 0 makes it fire on 0%-error windows. Any such
+    // value falls back to the default so 5xx alerting stays functional.
+
+    fn from_config_with_threshold(threshold: f64) -> AlerterSettings {
+        let config = AlertConfig {
+            error_rate_threshold: threshold,
+            ..AlertConfig::default()
+        };
+        AlerterSettings::from_config(&config, "/actuator".to_owned(), false)
+    }
+
+    // Compare two f64s for the EXACT equality these tests intend (the sanitizer
+    // returns either the verbatim input or the bit-identical default constant), by
+    // bit pattern — avoids `clippy::float_cmp` while staying exact.
+    fn assert_threshold_eq(actual: f64, expected: f64, msg: &str) {
+        assert_eq!(actual.to_bits(), expected.to_bits(), "{msg}");
+    }
+
+    #[test]
+    fn valid_error_rate_threshold_is_kept() {
+        // An in-range finite value is preserved verbatim.
+        assert_threshold_eq(
+            from_config_with_threshold(0.2).error_rate_threshold,
+            0.2,
+            "a valid (0, 1] threshold must be kept",
+        );
+        // The boundary value 1.0 (100% of requests) is valid.
+        assert_threshold_eq(
+            from_config_with_threshold(1.0).error_rate_threshold,
+            1.0,
+            "the boundary 1.0 must be kept",
+        );
+    }
+
+    #[test]
+    fn nan_error_rate_threshold_falls_back_to_default() {
+        assert_threshold_eq(
+            from_config_with_threshold(f64::NAN).error_rate_threshold,
+            default_error_rate_threshold(),
+            "NaN threshold must fall back to the default (can't be clamped)",
+        );
+        // Infinities are non-finite too and must fall back.
+        assert_threshold_eq(
+            from_config_with_threshold(f64::INFINITY).error_rate_threshold,
+            default_error_rate_threshold(),
+            "infinity threshold must fall back to the default",
+        );
+    }
+
+    #[test]
+    fn out_of_range_error_rate_threshold_falls_back_to_default() {
+        // > 1: the alert would NEVER fire (no rate can reach it).
+        assert_threshold_eq(
+            from_config_with_threshold(1.5).error_rate_threshold,
+            default_error_rate_threshold(),
+            "a threshold > 1 must fall back to the default",
+        );
+        // <= 0: the alert would fire even on a 0%-error window.
+        assert_threshold_eq(
+            from_config_with_threshold(0.0).error_rate_threshold,
+            default_error_rate_threshold(),
+            "a zero threshold must fall back to the default",
+        );
+        assert_threshold_eq(
+            from_config_with_threshold(-0.1).error_rate_threshold,
+            default_error_rate_threshold(),
+            "a negative threshold must fall back to the default",
+        );
+    }
+
+    #[test]
+    fn sanitized_threshold_behaves_as_default_in_comparison() {
+        // A valid threshold fires for a rate at/above it and not below (the
+        // runtime gate is `rate >= threshold`).
+        let valid = from_config_with_threshold(0.10).error_rate_threshold;
+        assert!(0.10 >= valid, "a rate at the threshold fires");
+        assert!(0.05 < valid, "a rate below the threshold does not fire");
+        // The sanitized (bad) threshold compares exactly like the default: a rate
+        // at/above the DEFAULT fires, one below does not — the 5xx alert stays
+        // functional rather than silently broken.
+        let sanitized = from_config_with_threshold(f64::NAN).error_rate_threshold;
+        let default = default_error_rate_threshold();
+        assert!(default >= sanitized, "a rate at the default fires");
+        assert!(
+            default - 0.001 < sanitized,
+            "a rate below the default does not"
+        );
     }
 
     #[test]
