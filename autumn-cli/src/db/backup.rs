@@ -1719,24 +1719,6 @@ fn read_credential_env(
         })
 }
 
-/// An `Env` overlay that forces `AUTUMN_ENV` to a specific profile so
-/// [`AutumnConfig::load_with_env`](autumn_web::config::AutumnConfig::load_with_env)
-/// resolves the `[backup.offsite]` section under the SAME profile the backup run
-/// is keyed by (matching [`migrate::effective_profile`]'s resolution).
-struct ProfileForcedEnv<'a> {
-    inner: &'a dyn autumn_web::config::Env,
-    profile: String,
-}
-
-impl autumn_web::config::Env for ProfileForcedEnv<'_> {
-    fn var(&self, key: &str) -> Result<String, std::env::VarError> {
-        if key == "AUTUMN_ENV" {
-            return Ok(self.profile.clone());
-        }
-        self.inner.var(key)
-    }
-}
-
 /// A leniently-loaded `[backup.offsite]` section: enough to learn `auto_upload`
 /// WITHOUT validating the bucket/credentials, so a plain local `autumn db backup`
 /// (no `--upload`, no `auto_upload`) never fails just because an incomplete
@@ -1853,27 +1835,57 @@ fn parse_bool_flag(raw: &str) -> Option<bool> {
     }
 }
 
-/// Leniently load the `[backup.offsite]` section for `profile`, applying the
-/// profile overlay and `AUTUMN_*` env overrides via the runtime config loader.
-/// `Ok(None)` when no offsite section is configured. Performs NO bucket/cred
-/// validation — that is deferred to [`LoadedOffsite::resolve`] so a local-only
-/// backup is never blocked by an incomplete offsite section.
+/// Leniently resolve the `[backup.offsite]` destination for `profile` WITHOUT a
+/// full `AutumnConfig::load` — i.e. WITHOUT decrypting the app credential store
+/// (`config/credentials/<profile>.toml.enc`) or running app-wide validation, so
+/// offsite commands work on a minimal DR/recovery box that has only DB + offsite
+/// env vars and NO `AUTUMN_MASTER_KEY` (issue #1619 P2 #9). It reads only what
+/// offsite needs — the merged TOML (base + `[profile.<p>]`) plus real env and
+/// `.env.<profile>` overrides — for `[backup.offsite]` AND the `[storage.s3]`
+/// bucket/endpoint (the distinct-destination guard needs them).
+///
+/// `Ok(None)` when no offsite section is configured. NO bucket/cred validation
+/// here — that is deferred to [`LoadedOffsite::resolve`] so a local backup is
+/// never blocked by an incomplete offsite section.
 fn load_offsite(profile: &str) -> Result<Option<LoadedOffsite>, BackupError> {
-    // Load `.env.<profile>` for the TARGET profile (not the ambient shell one),
-    // then force `AUTUMN_ENV` for the TOML `[profile.<profile>]` overlay. Both
-    // must key off the same profile so a `.env.<profile>`-provided offsite
-    // override is honored (issue #1619 P2 #6).
-    let base = dotenv_env_for_profile(profile);
-    let forced = ProfileForcedEnv {
-        inner: &base,
-        profile: profile.to_owned(),
-    };
-    let cfg = autumn_web::config::AutumnConfig::load_with_env(&forced).map_err(|e| {
-        BackupError::Offsite {
-            op: "config load",
-            detail: e.to_string(),
+    // Real env + `.env.<profile>` overlay (profile-aware, P2 #6); merged TOML
+    // (base + `[profile.<p>]`) — neither decrypts credentials nor validates.
+    let env = dotenv_env_for_profile(profile);
+    let table = migrate::read_autumn_toml_table_with_profile(Some(profile));
+    resolve_loaded_offsite(table.as_ref(), &env, profile)
+}
+
+/// Pure core of [`load_offsite`]: build the offsite view from a merged TOML table
+/// and an `Env`, applying `AUTUMN_*` overrides via the config crate's
+/// env-override machinery (which does NOT decrypt credentials or run global
+/// validation). Separated so the DR-box behavior is unit-testable without
+/// touching the filesystem / process env / credential store.
+fn resolve_loaded_offsite(
+    table: Option<&toml::Table>,
+    env: &dyn autumn_web::config::Env,
+    profile: &str,
+) -> Result<Option<LoadedOffsite>, BackupError> {
+    // Deserialize the merged TOML into AutumnConfig — plain `Deserialize`, so no
+    // credential decryption and no `validate()` (those live only in `load*`).
+    let mut cfg = match table {
+        Some(t) => {
+            let toml_str = toml::to_string(t).map_err(|e| BackupError::Offsite {
+                op: "config",
+                detail: e.to_string(),
+            })?;
+            toml::from_str::<autumn_web::config::AutumnConfig>(&toml_str).map_err(|e| {
+                BackupError::Offsite {
+                    op: "config",
+                    detail: e.to_string(),
+                }
+            })?
         }
-    })?;
+        None => autumn_web::config::AutumnConfig::default(),
+    };
+    // Apply `AUTUMN_*` env overrides (incl. backup.offsite + storage.s3). This is
+    // pure field-setting — no decryption, no validation.
+    cfg.apply_env_overrides_with_env(env);
+
     let Some(offsite) = cfg.backup.offsite else {
         return Ok(None);
     };
@@ -3359,6 +3371,42 @@ mod tests {
         };
         let resolved = loaded.resolve().expect("bucket set, resolves");
         assert_eq!(resolved.profile, "test");
+    }
+
+    #[test]
+    fn offsite_resolves_without_app_credential_store() {
+        // P2 #9: offsite destination resolves from TOML + env WITHOUT a full
+        // AutumnConfig::load — so NO credential decryption / AUTUMN_MASTER_KEY is
+        // needed. On current code this path went through load_with_env, which
+        // would fail on a DR box whose config/credentials/<p>.toml.enc can't be
+        // decrypted. `resolve_loaded_offsite` reads only the offsite + storage.s3
+        // config, never the credential store.
+        let table: toml::Table = toml::from_str(
+            "[backup.offsite]\nprefix = \"db\"\n\
+             [backup.offsite.s3]\nbucket = \"dr-bucket\"\nregion = \"us-east-1\"\n\
+             endpoint = \"https://minio.example:9000\"\nforce_path_style = true\n\
+             access_key_id_env = \"OFFSITE_KEY\"\nsecret_access_key_env = \"OFFSITE_SECRET\"\n",
+        )
+        .unwrap();
+        // Real env supplies the S3 credential VALUES; crucially there is NO
+        // AUTUMN_MASTER_KEY and no attempt to read a credential store.
+        let env = autumn_web::config::MockEnv::new()
+            .with("OFFSITE_KEY", "AKIA_DR")
+            .with("OFFSITE_SECRET", "shh");
+        let loaded = resolve_loaded_offsite(Some(&table), &env, "prod")
+            .expect("resolves without a credential store")
+            .expect("offsite section present");
+        let resolved = loaded.resolve().expect("bucket set");
+        assert_eq!(resolved.s3.bucket, "dr-bucket");
+        assert_eq!(resolved.profile, "prod");
+
+        // Env-only configuration (no TOML at all) also resolves.
+        let env2 = autumn_web::config::MockEnv::new()
+            .with("AUTUMN_BACKUP__OFFSITE__S3__BUCKET", "env-bucket");
+        let loaded2 = resolve_loaded_offsite(None, &env2, "prod")
+            .unwrap()
+            .expect("materialized from env");
+        assert_eq!(loaded2.offsite.s3.bucket.as_deref(), Some("env-bucket"));
     }
 
     #[test]

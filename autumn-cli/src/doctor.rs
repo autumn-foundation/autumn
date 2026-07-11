@@ -4316,12 +4316,17 @@ fn resolve_offsite_backup_data() -> OffsiteBackupData {
     let Some(offsite) = cfg.backup.offsite else {
         return OffsiteBackupData::default();
     };
-    let env_set = |name: &Option<String>| {
-        name.as_deref()
-            .map(str::trim)
-            .filter(|v| !v.is_empty())
-            .is_some_and(|v| std::env::var(v).is_ok_and(|val| !val.is_empty()))
-    };
+    // Check credential presence through the SAME dotenv-aware, profile-aware
+    // env `resolve_credentials` uses at runtime — real env layered with
+    // `.env`/`.env.<profile>` — so a credential supplied via `.env.<profile>`
+    // isn't a false "not ready" (issue #1619 P2 #10). Falls back to the plain
+    // OS env only if the `.env` overlay can't be built (a malformed `.env`).
+    let profile = cfg.profile.clone().unwrap_or_else(|| "dev".to_owned());
+    let denv: Box<dyn autumn_web::config::Env> =
+        match autumn_web::dotenv::os_env_with_dotenv_for_profile(&profile) {
+            Ok(e) => Box::new(e),
+            Err(_) => Box::new(autumn_web::config::OsEnv),
+        };
     let bucket = offsite.s3.bucket.clone();
     let endpoints_match = normalize_doctor_endpoint(offsite.s3.endpoint.as_deref())
         == normalize_doctor_endpoint(cfg.storage.s3.endpoint.as_deref());
@@ -4343,10 +4348,27 @@ fn resolve_offsite_backup_data() -> OffsiteBackupData {
         bucket,
         access_key_env: offsite.s3.access_key_id_env.clone(),
         secret_key_env: offsite.s3.secret_access_key_env.clone(),
-        access_key_env_set: env_set(&offsite.s3.access_key_id_env),
-        secret_key_env_set: env_set(&offsite.s3.secret_access_key_env),
+        access_key_env_set: cred_env_present(
+            denv.as_ref(),
+            offsite.s3.access_key_id_env.as_deref(),
+        ),
+        secret_key_env_set: cred_env_present(
+            denv.as_ref(),
+            offsite.s3.secret_access_key_env.as_deref(),
+        ),
         shared_bucket_without_optin: same_bucket && endpoints_match && !offsite.allow_shared_bucket,
     }
+}
+
+/// Whether the environment variable NAMED by `name` is present and non-empty in
+/// `env`. Uses the passed `Env` (the profile-aware dotenv overlay) rather than
+/// bare `std::env`, so doctor's offsite-credential readiness matches runtime
+/// resolution (which also reads `.env`/`.env.<profile>`), issue #1619 P2 #10.
+/// Presence only — never returns or logs the value.
+fn cred_env_present(env: &dyn autumn_web::config::Env, name: Option<&str>) -> bool {
+    name.map(str::trim)
+        .filter(|v| !v.is_empty())
+        .is_some_and(|v| env.var(v).is_ok_and(|val| !val.is_empty()))
 }
 
 /// Normalize an endpoint for the doctor shared-bucket comparison.
@@ -5135,6 +5157,22 @@ mod tests {
         let r = check_offsite_backup_impl(&data);
         assert_eq!(r.status, CheckStatus::Pass);
         assert!(r.detail.unwrap().contains("offsite backups configured"));
+    }
+
+    #[test]
+    fn cred_env_present_honors_dotenv_supplied_creds() {
+        // P2 #10: readiness is checked through the profile-aware env overlay
+        // (real env + `.env.<profile>`), so a credential supplied ONLY via
+        // `.env.prod` (here simulated by the overlay surfacing the value) counts
+        // as ready — a bare `std::env::var` check would report a false negative.
+        let overlay = autumn_web::config::MockEnv::new().with("OFF_SECRET", "from-dot-env-prod");
+        assert!(cred_env_present(&overlay, Some("OFF_SECRET")));
+        // Absent / unnamed / blank-name / empty-value => not present.
+        assert!(!cred_env_present(&overlay, Some("MISSING")));
+        assert!(!cred_env_present(&overlay, None));
+        assert!(!cred_env_present(&overlay, Some("   ")));
+        let empty = autumn_web::config::MockEnv::new().with("OFF_SECRET", "");
+        assert!(!cred_env_present(&empty, Some("OFF_SECRET")));
     }
 
     #[test]
