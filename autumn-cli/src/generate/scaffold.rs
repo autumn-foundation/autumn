@@ -1837,13 +1837,13 @@ fn render_routes_file(
     let create_signature = create_signature.replacen(
         "flash: Flash",
         "flash: Flash, csrf: Option<CsrfToken>, csrf_field: Option<CsrfFormField>, \
-         submit_token: Option<SubmitToken>",
+         submit_token: Option<SubmitToken>, submit_field: Option<SubmitFormField>",
         1,
     );
     let update_signature = update_signature.replacen(
         "flash: Flash,",
         "flash: Flash,\n    csrf: Option<CsrfToken>,\n    csrf_field: Option<CsrfFormField>,\n    \
-         submit_token: Option<SubmitToken>,",
+         submit_token: Option<SubmitToken>,\n    submit_field: Option<SubmitFormField>,",
         1,
     );
 
@@ -1949,7 +1949,7 @@ fn render_routes_file(
              h1 {{ \"New {pascal_name}\" }}\n        \
              form action=(paths::create()) method=\"post\"{form_enctype} {{\n            \
              (csrf_input(csrf.as_ref(), csrf_field.as_ref()))\n            \
-             (submit_token_input(submit_token.as_ref()))\n{changeset_inputs}            \
+             (submit_token_input(submit_token.as_ref(), submit_field.as_ref()))\n{changeset_inputs}            \
              button type=\"submit\" {{ \"Create\" }}\n        \
              }}\n    \
              }})"
@@ -1959,7 +1959,7 @@ fn render_routes_file(
              h1 {{ \"Edit {pascal_name} #\" (*id) }}\n        \
              form action=(paths::update(*id)) method=\"post\"{form_enctype} {{\n            \
              (csrf_input(csrf.as_ref(), csrf_field.as_ref()))\n            \
-             (submit_token_input(submit_token.as_ref()))\n{changeset_inputs}            \
+             (submit_token_input(submit_token.as_ref(), submit_field.as_ref()))\n{changeset_inputs}            \
              button type=\"submit\" {{ \"Save\" }}\n        \
              }}\n        \
              form action=(paths::delete(*id)) method=\"post\" {{\n            \
@@ -2002,13 +2002,13 @@ fn render_routes_file(
         let new_form_layout = format!(
             "{layout_fn}(\"New {pascal_name}\", {cp_new}{flash_arg}, html! {{\n        \
              h1 {{ \"New {pascal_name}\" }}\n        \
-             ({snake_name}_form_for(&changeset, paths::create(), \"Create\", csrf.as_ref(), csrf_field.as_ref(), submit_token.as_ref(){option_args}))\n    \
+             ({snake_name}_form_for(&changeset, paths::create(), \"Create\", csrf.as_ref(), csrf_field.as_ref(), submit_token.as_ref(), submit_field.as_ref(){option_args}))\n    \
              }})"
         );
         let edit_form_layout = format!(
             "{layout_fn}(&format!(\"Edit {pascal_name} #{{}}\", *id), {cp_edit}{flash_arg}, html! {{\n        \
              h1 {{ \"Edit {pascal_name} #\" (*id) }}\n        \
-             ({snake_name}_form_for(&changeset, paths::update(*id), \"Save\", csrf.as_ref(), csrf_field.as_ref(), submit_token.as_ref(){option_args}))\n        \
+             ({snake_name}_form_for(&changeset, paths::update(*id), \"Save\", csrf.as_ref(), csrf_field.as_ref(), submit_token.as_ref(), submit_field.as_ref(){option_args}))\n        \
              form action=(paths::delete(*id)) method=\"post\" {{\n            \
              (csrf_input(csrf.as_ref(), csrf_field.as_ref()))\n            \
              button type=\"submit\" onclick=\"return confirm('Delete this {pascal_name}?')\" {{ \"Delete\" }}\n        \
@@ -2594,7 +2594,7 @@ use autumn_web::extract::Path;
 use autumn_web::pagination::{{Page, PageRequest}};
 use autumn_web::reexports::axum::body::Bytes;
 use autumn_web::reexports::serde_json;
-use autumn_web::security::{{CsrfFormField, CsrfToken, SubmitToken}};
+use autumn_web::security::{{CsrfFormField, CsrfToken, SubmitFormField, SubmitToken}};
 use autumn_web::ui::pagination::{{PagerOptions, pagination_nav}};
 {db_import}
 use diesel::prelude::*;
@@ -2687,11 +2687,14 @@ fn csrf_input(csrf: Option<&CsrfToken>, field: Option<&CsrfFormField>) -> Markup
 
 /// Emit the hidden one-time submit-token field (issue #1360). Consumed once by
 /// the framework's `SubmitTokenLayer`, so a double-click or Back→resubmit
-/// replays the first response instead of creating a duplicate row.
-fn submit_token_input(submit_token: Option<&SubmitToken>) -> Markup {{
+/// replays the first response instead of creating a duplicate row. The field
+/// name follows `security.submit_token.field_name` (default `_submit_token`) so
+/// a customised name still matches what the layer scans for.
+fn submit_token_input(submit_token: Option<&SubmitToken>, field: Option<&SubmitFormField>) -> Markup {{
+    let submit_field_name = field.map(|field| field.0.as_str()).unwrap_or("_submit_token");
     html! {{
         @if let Some(submit_token) = submit_token {{
-            input type="hidden" name="_submit_token" value=(submit_token.token());
+            input type="hidden" name=(submit_field_name) value=(submit_token.token());
         }}
     }}
 }}
@@ -2726,6 +2729,7 @@ pub async fn new_form(
     csrf: Option<CsrfToken>,
     csrf_field: Option<CsrfFormField>,
     submit_token: Option<SubmitToken>,
+    submit_field: Option<SubmitFormField>,
 ) -> AutumnResult<Markup> {{
     let changeset = Changeset::new({pascal_name}Form::default());
     Ok({new_form_body})
@@ -2744,7 +2748,8 @@ pub async fn edit_form(
     flash: Flash,
     csrf: Option<CsrfToken>,
     csrf_field: Option<CsrfFormField>,
-    submit_token: Option<SubmitToken>,{authz_params}
+    submit_token: Option<SubmitToken>,
+    submit_field: Option<SubmitFormField>,{authz_params}
 ) -> AutumnResult<Markup> {{
     let row: {pascal_name} = {plural}::table
         .find(*id)
@@ -3111,12 +3116,13 @@ fn render_form_for_helper(
          submit_label: &str,\n    \
          csrf: Option<&CsrfToken>,\n    \
          csrf_field: Option<&CsrfFormField>,\n    \
-         submit_token: Option<&SubmitToken>{extra_params},\n\
+         submit_token: Option<&SubmitToken>,\n    \
+         submit_field: Option<&SubmitFormField>{extra_params},\n\
          ) -> Markup {{\n\
          {preludes}    \
          let mut form = autumn_web::form::form_for(changeset, action, \"post\")\n        \
          .submit_label(submit_label){builder_calls}{appends};\n    \
-         form = form.append(submit_token_input(submit_token));\n    \
+         form = form.append(submit_token_input(submit_token, submit_field));\n    \
          if let Some(csrf) = csrf {{\n        \
          form = form.csrf(csrf.token());\n    \
          }}\n    \
@@ -5779,7 +5785,9 @@ async fn main() {
         );
         // The helper call threads the options through.
         assert!(
-            routes.contains("csrf_field.as_ref(), submit_token.as_ref(), &post_id_options))"),
+            routes.contains(
+                "csrf_field.as_ref(), submit_token.as_ref(), submit_field.as_ref(), &post_id_options))"
+            ),
             "view bodies must pass the loaded options to the helper: {routes}"
         );
     }
@@ -6356,9 +6364,9 @@ async fn main() {
         plan.execute(Flags::default()).unwrap();
 
         let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
-        assert!(
-            routes.contains("use autumn_web::security::{CsrfFormField, CsrfToken, SubmitToken};")
-        );
+        assert!(routes.contains(
+            "use autumn_web::security::{CsrfFormField, CsrfToken, SubmitFormField, SubmitToken};"
+        ));
         assert!(routes.contains("fn csrf_input("));
         assert!(routes.contains("input type=\"hidden\" name=(csrf_field_name"));
         assert!(routes.contains("value=(csrf.token());"));
@@ -6368,14 +6376,24 @@ async fn main() {
         assert!(routes.contains("(csrf_input(csrf.as_ref(), csrf_field.as_ref()))"));
         assert!(routes.contains("pub async fn edit_form("));
         // Issue #1360: one-time submit token embedded in create/update forms and
-        // threaded through the create/update handlers.
+        // threaded through the create/update handlers. The hidden field's `name`
+        // is bound at runtime to the configured `security.submit_token.field_name`
+        // (via the `SubmitFormField` extractor), not hardcoded — mirroring CSRF —
+        // so a custom field name still matches what `SubmitTokenLayer` scans for.
         assert!(routes.contains("fn submit_token_input("));
         assert!(routes.contains(
-            "input type=\"hidden\" name=\"_submit_token\" value=(submit_token.token());"
+            "let submit_field_name = field.map(|field| field.0.as_str()).unwrap_or(\"_submit_token\");"
         ));
+        assert!(routes.contains(
+            "input type=\"hidden\" name=(submit_field_name) value=(submit_token.token());"
+        ));
+        // The hidden field is never emitted under a hardcoded `_submit_token` name.
+        assert!(!routes.contains("name=\"_submit_token\""));
         assert!(routes.contains("submit_token: Option<SubmitToken>"));
+        assert!(routes.contains("submit_field: Option<SubmitFormField>"));
         assert!(routes.contains("submit_token.as_ref()"));
-        assert!(routes.contains("submit_token_input(submit_token)"));
+        assert!(routes.contains("submit_field.as_ref()"));
+        assert!(routes.contains("submit_token_input(submit_token, submit_field)"));
     }
 
     // ── Changeset validation round-trip (issue #1124) ──────────────────
@@ -6615,12 +6633,12 @@ async fn main() {
             "generated routes must be able to inspect raw form bytes: {routes}"
         );
         assert!(
-            routes.contains("pub async fn create(flash: Flash, csrf: Option<CsrfToken>, csrf_field: Option<CsrfFormField>, submit_token: Option<SubmitToken>, mut db: Db, body: Bytes)"),
+            routes.contains("pub async fn create(flash: Flash, csrf: Option<CsrfToken>, csrf_field: Option<CsrfFormField>, submit_token: Option<SubmitToken>, submit_field: Option<SubmitFormField>, mut db: Db, body: Bytes)"),
             "create must decode after blank nullable normalization: {routes}"
         );
         assert!(
             routes.contains(
-                "pub async fn update(\n    flash: Flash,\n    csrf: Option<CsrfToken>,\n    csrf_field: Option<CsrfFormField>,\n    submit_token: Option<SubmitToken>,\n    id: Path<i64>,\n    mut db: Db,\n    body: Bytes,\n)"
+                "pub async fn update(\n    flash: Flash,\n    csrf: Option<CsrfToken>,\n    csrf_field: Option<CsrfFormField>,\n    submit_token: Option<SubmitToken>,\n    submit_field: Option<SubmitFormField>,\n    id: Path<i64>,\n    mut db: Db,\n    body: Bytes,\n)"
             ),
             "update must decode after blank nullable normalization: {routes}"
         );

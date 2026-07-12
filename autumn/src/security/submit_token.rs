@@ -284,9 +284,11 @@ fn scan_for_token(
 enum CollectedBody {
     /// The whole body fits within the limit and is fully buffered.
     Full(Bytes),
-    /// The body exceeded the limit. `prefix` is the bytes read before the
-    /// over-limit chunk (scanned for the token, which is always emitted early);
-    /// `body` chains the prefix with the remaining stream for pass-through.
+    /// The body exceeded the limit. `prefix` is the first `limit` bytes of the
+    /// body — including the leading bytes of the chunk that crossed the cap, so
+    /// a token near the front is scannable even when the very first chunk is
+    /// already over-limit; `body` chains the full, unmodified body (every byte
+    /// of every chunk) with the remaining stream for pass-through.
     Oversized { prefix: Bytes, body: Body },
 }
 
@@ -301,8 +303,22 @@ async fn collect_body(body: Body, limit: usize) -> CollectedBody {
             // tail is harmless for scanning; the handler receives the prefix.
             None | Some(Err(_)) => break,
             Some(Ok(chunk)) => {
-                if chunk.len() > limit.saturating_sub(buf.len()) {
-                    let prefix = Bytes::from(buf.clone());
+                let remaining = limit.saturating_sub(buf.len());
+                if chunk.len() > remaining {
+                    // Fill the scan prefix up to `limit` with the leading bytes
+                    // of the over-limit chunk, so a token at the front of the
+                    // form is still found even when the FIRST chunk already
+                    // exceeds the cap (e.g. an upstream middleware rebuilt the
+                    // buffered body as one `Body::from(bytes)`, leaving `buf`
+                    // empty here).
+                    let mut prefix_buf = buf.clone();
+                    prefix_buf.extend_from_slice(&chunk[..remaining]);
+                    let prefix = Bytes::from(prefix_buf);
+                    // Replay the FULL body unchanged: the buffered prefix bytes
+                    // followed by the *complete* over-limit chunk (not just its
+                    // scanned head) and the rest of the stream. The scan prefix
+                    // is only for locating the token; the handler must receive
+                    // every byte.
                     let mut leading = Vec::with_capacity(2);
                     if !buf.is_empty() {
                         leading.push(Ok::<Bytes, axum::Error>(Bytes::from(buf)));
@@ -896,6 +912,82 @@ mod tests {
         assert!(
             succeeded >= 1,
             "at least the first submission must succeed and be replayable"
+        );
+    }
+
+    /// Regression: when the FIRST body chunk already exceeds `max_scan_bytes`
+    /// (e.g. an upstream middleware rebuilt the buffered form as a single
+    /// `Body::from(bytes)`), the leading `_submit_token` must still be scanned
+    /// from that over-limit chunk — the guard fires — while the handler still
+    /// receives the complete, untruncated body.
+    #[tokio::test]
+    async fn over_limit_first_chunk_detects_leading_token_and_preserves_body() {
+        let store: Arc<dyn IdempotencyStore> =
+            Arc::new(MemoryIdempotencyStore::new(Duration::from_secs(600)));
+        let count = Arc::new(AtomicUsize::new(0));
+        let count_inner = count.clone();
+        let seen_len = Arc::new(AtomicUsize::new(0));
+        let seen_len_inner = seen_len.clone();
+        // The handler consumes the whole body so we can assert nothing was
+        // truncated on its way through the scan.
+        let app = Router::new()
+            .route(
+                "/submit",
+                post(move |body: Bytes| {
+                    let count = count_inner.clone();
+                    let seen_len = seen_len_inner.clone();
+                    async move {
+                        count.fetch_add(1, Ordering::SeqCst);
+                        seen_len.store(body.len(), Ordering::SeqCst);
+                        "created"
+                    }
+                }),
+            )
+            // A tiny scan cap the very first chunk already blows past.
+            .layer(layer_with_store(store).with_max_scan_bytes(64));
+
+        let token = "over-limit-token";
+        // `_submit_token` sits at the front (well within the 64-byte cap); a
+        // large filler pushes the single chunk far over the cap.
+        let filler = "x".repeat(4096);
+        let full_body = format!("_submit_token={token}&title={filler}");
+        let full_len = full_body.len();
+        assert!(full_len > 64, "body must exceed the scan cap for this test");
+        let make = || {
+            Request::builder()
+                .method("POST")
+                .uri("/submit")
+                .header("Content-Type", "application/x-www-form-urlencoded")
+                .body(Body::from(full_body.clone()))
+                .unwrap()
+        };
+
+        // First submit: the guard scans the leading bytes of the over-limit
+        // chunk, runs the handler once, and the handler sees the full body.
+        let first = app.clone().oneshot(make()).await.unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        assert!(first.headers().get(SUBMIT_TOKEN_REPLAYED).is_none());
+        assert_eq!(
+            seen_len.load(Ordering::SeqCst),
+            full_len,
+            "handler must receive the complete body, not just the scanned prefix"
+        );
+
+        // Second submit with the same token replays — proving the leading token
+        // was detected despite the over-limit first chunk.
+        let second = app.clone().oneshot(make()).await.unwrap();
+        assert_eq!(
+            second
+                .headers()
+                .get(SUBMIT_TOKEN_REPLAYED)
+                .map(|v| v.to_str().unwrap()),
+            Some("true"),
+            "an over-limit first chunk with a leading token must still be guarded"
+        );
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            1,
+            "handler must run exactly once"
         );
     }
 }
