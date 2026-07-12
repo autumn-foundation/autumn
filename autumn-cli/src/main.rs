@@ -5938,6 +5938,67 @@ mod tests {
     }
 
     #[test]
+    fn parse_generate_policy_with_pascal_name() {
+        let cli = Cli::try_parse_from(["autumn", "generate", "policy", "Post"]).unwrap();
+        let Commands::Generate(GenerateCommands::Policy {
+            name,
+            dry_run,
+            force,
+        }) = cli.command
+        else {
+            panic!("expected generate policy");
+        };
+        assert_eq!(name, "Post");
+        assert!(!dry_run);
+        assert!(!force);
+    }
+
+    #[test]
+    fn parse_generate_policy_with_flags() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "generate",
+            "policy",
+            "Post",
+            "--dry-run",
+            "--force",
+        ])
+        .unwrap();
+        let Commands::Generate(GenerateCommands::Policy { dry_run, force, .. }) = cli.command
+        else {
+            panic!("expected generate policy");
+        };
+        assert!(dry_run);
+        assert!(force);
+    }
+
+    #[test]
+    fn parse_generate_scaffold_no_policy_flag() {
+        // Default: policy on.
+        let cli = Cli::try_parse_from(["autumn", "generate", "scaffold", "Post", "title:String"])
+            .unwrap();
+        let Commands::Generate(GenerateCommands::Scaffold { no_policy, .. }) = cli.command else {
+            panic!("expected generate scaffold");
+        };
+        assert!(!no_policy, "policy is on by default");
+
+        // --no-policy opts out.
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "generate",
+            "scaffold",
+            "Post",
+            "title:String",
+            "--no-policy",
+        ])
+        .unwrap();
+        let Commands::Generate(GenerateCommands::Scaffold { no_policy, .. }) = cli.command else {
+            panic!("expected generate scaffold");
+        };
+        assert!(no_policy);
+    }
+
+    #[test]
     fn parse_generate_mailer_without_name_is_error() {
         assert!(Cli::try_parse_from(["autumn", "generate", "mailer"]).is_err());
     }

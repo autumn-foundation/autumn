@@ -1644,6 +1644,90 @@ fn generated_scaffold_cargo_checks() {
     );
 }
 
+/// Issue #1125: a scaffold WITH an owner column generates a record-level
+/// `Policy`/`Scope`, authorizes the mutating HTML handlers, scopes the index,
+/// and emits a cross-user 403 smoke test. `cargo check --tests` proves the
+/// whole thing (policy file, authorize wiring, scoped index, cross-user test)
+/// type-checks against the real framework; the generated cross-user test needs
+/// no database, so we also run it directly to prove the 403 semantics hold end
+/// to end.
+///
+/// Ignored by default; run with `cargo test -p autumn-cli -- --ignored`.
+#[test]
+#[ignore = "slow: cargo-checks a fresh project — run with `cargo test -p autumn-cli -- --ignored`"]
+fn generated_policy_scaffold_cargo_checks() {
+    let (_tmp, project) = fresh_project("policy-scaffold-build");
+    patch_generated_cargo_toml(&project);
+
+    run_autumn(
+        &project,
+        &[
+            "generate",
+            "scaffold",
+            "Post",
+            "title:String",
+            "body:Text",
+            "author_id:i64",
+        ],
+    );
+
+    // The generated policy, its registration, and the authorize wiring exist.
+    let policy = fs::read_to_string(project.join("src/policies/post.rs")).unwrap();
+    assert!(
+        policy.contains("impl Policy<Post> for PostPolicy"),
+        "policy file must define PostPolicy:\n{policy}"
+    );
+    assert!(
+        policy.contains("Some(post.author_id)"),
+        "owner check must use author_id:\n{policy}"
+    );
+    let main_rs = fs::read_to_string(project.join("src/main.rs")).unwrap();
+    assert!(
+        main_rs.contains(".policy::<crate::models::post::Post, _>"),
+        "main.rs must register the policy:\n{main_rs}"
+    );
+    let routes = fs::read_to_string(project.join("src/routes/posts.rs")).unwrap();
+    assert!(
+        routes.contains("autumn_web::authorization::authorize::<Post>"),
+        "routes must authorize mutating handlers:\n{routes}"
+    );
+
+    let check = Command::new("cargo")
+        .args(["check", "--tests"])
+        .current_dir(&project)
+        .output()
+        .unwrap();
+    assert!(
+        check.status.success(),
+        "cargo check on generated policy scaffold failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&check.stdout),
+        String::from_utf8_lossy(&check.stderr),
+    );
+
+    // The cross-user 403 test needs no database — run it and prove it passes.
+    let cross_user = Command::new("cargo")
+        .args([
+            "test",
+            "--test",
+            "post",
+            "posts_cross_user_mutations_are_forbidden",
+        ])
+        .current_dir(&project)
+        .output()
+        .unwrap();
+    assert!(
+        cross_user.status.success(),
+        "generated cross-user 403 test failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&cross_user.stdout),
+        String::from_utf8_lossy(&cross_user.stderr),
+    );
+    assert!(
+        String::from_utf8_lossy(&cross_user.stdout).contains("test result: ok"),
+        "expected the cross-user test to pass:\n{}",
+        String::from_utf8_lossy(&cross_user.stdout)
+    );
+}
+
 /// Slow end-to-end check (issue #1124): scaffold a model with a `--validate`
 /// rule and prove the generated changeset round-trip actually compiles *and*
 /// runs — a rejected submission gets 422 with the other field preserved and

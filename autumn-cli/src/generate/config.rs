@@ -653,7 +653,8 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
             false,
             None,
             false,
-            false,)
+            false,
+        )
         .unwrap()
     }
 
@@ -684,7 +685,8 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
             false,
             None,
             false,
-            false,)
+            false,
+        )
         .unwrap();
         assert_eq!(fields, vec!["title:String", "body:Text"]);
     }
@@ -706,7 +708,8 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
             false,
             None,
             false,
-            false,)
+            false,
+        )
         .unwrap();
         assert_eq!(opts.model.indexes, vec!["tag"]);
     }
@@ -728,7 +731,8 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
             false,
             None,
             false,
-            false,)
+            false,
+        )
         .unwrap();
         assert_eq!(opts.model.validations, vec!["url=email"]);
     }
@@ -752,7 +756,8 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
             false,
             None,
             false,
-            false,)
+            false,
+        )
         .unwrap();
         assert_eq!(opts.model.defaults, vec!["tag=general"]);
     }
@@ -774,7 +779,8 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
             false,
             None,
             false,
-            false,)
+            false,
+        )
         .unwrap();
         assert_eq!(opts.queries, vec!["find_by_tag:tag"]);
     }
@@ -797,7 +803,8 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
             false,
             None,
             false,
-            false,)
+            false,
+        )
         .unwrap();
         assert!(fields.is_empty());
         assert!(opts.model.indexes.is_empty());
@@ -823,7 +830,8 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
             false,
             None,
             false,
-            false,)
+            false,
+        )
         .unwrap();
         assert!(
             opts.model.soft_delete,
@@ -884,7 +892,8 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
             false,
             None,
             false,
-            false,)
+            false,
+        )
         .unwrap();
         assert!(opts.api);
     }
@@ -930,7 +939,8 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
             false,
             None,
             false,
-            false,)
+            false,
+        )
         .unwrap();
         assert!(
             opts.model.sharded,
@@ -968,7 +978,8 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
             false,
             None,
             false,
-            false,)
+            false,
+        )
         .unwrap();
         assert_eq!(
             opts.model.shard_key.as_deref(),
@@ -1029,7 +1040,8 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
             false,
             Some("uuid"),
             false,
-            false,)
+            false,
+        )
         .unwrap();
         assert_eq!(
             opts.model.id_type,
@@ -1069,7 +1081,8 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
             false,
             Some("bigint"),
             false,
-            false,)
+            false,
+        )
         .unwrap();
         assert_eq!(
             opts.model.id_type,
@@ -1105,7 +1118,8 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
             false,
             Some("guid"),
             false,
-            false,)
+            false,
+        )
         .unwrap_err();
         let msg = err.to_string();
         assert!(

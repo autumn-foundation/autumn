@@ -68,6 +68,7 @@ jobs:
   # Runs:
   #   generated_project_compiles_runs_and_serves  (e2e.rs)
   #   generated_scaffold_cargo_checks             (generate.rs)
+  #   generated_policy_scaffold_cargo_checks      (generate.rs)
   #   generated_scaffold_config_cargo_checks      (generate.rs)
   #   generated_validated_scaffold_round_trip_test_passes (generate.rs)
   #   controller_generates_compiles_and_lists_routes (generate.rs)
@@ -113,6 +114,11 @@ jobs:
         run: |
           cargo test -p autumn-cli --test generate \
             generated_scaffold_cargo_checks -- --ignored --exact
+
+      - name: generated_policy_scaffold_cargo_checks
+        run: |
+          cargo test -p autumn-cli --test generate \
+            generated_policy_scaffold_cargo_checks -- --ignored --exact
 
       - name: generated_scaffold_config_cargo_checks
         run: |

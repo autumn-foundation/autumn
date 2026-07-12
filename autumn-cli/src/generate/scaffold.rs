@@ -37,6 +37,7 @@ pub(super) const SCAFFOLD_EXTRA_DEPS: &[(&str, &str)] = &[
 
 /// Optional metadata applied by `autumn generate scaffold`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)] // independent scaffold flags, not a state machine
 pub struct ScaffoldOptions {
     /// Model-level field metadata.
     pub model: ModelOptions,
@@ -1854,7 +1855,11 @@ fn render_routes_file(
     // path (`authorize` already excludes live/sharded/attachment scaffolds).
     let (update_signature, destroy_signature_arg) = if authorize {
         (
-            update_signature.replacen("\n    body: Bytes", &format!("{authz_params},\n    body: Bytes"), 1),
+            update_signature.replacen(
+                "\n    body: Bytes",
+                &format!("{authz_params},\n    body: Bytes"),
+                1,
+            ),
             format!("{destroy_signature_arg},{authz_params}"),
         )
     } else {
@@ -4683,7 +4688,7 @@ async fn __PLURAL___write_path_crud() {
 /// AC4/AC6): with an owner column present, a user may only update/delete rows
 /// they own. A stand-in resource seeded with a row owned by user A is exercised
 /// while acting as user B — the mutating routes must be forbidden (403, via the
-/// test-level [`ForbiddenResponse::Forbidden403`](autumn_web::authorization::ForbiddenResponse)
+/// test-level `ForbiddenResponse::Forbidden403`
 /// override so the demonstration asserts a concrete 403 rather than the app-wide
 /// default hide-existence 404) and B's index must exclude A's rows. Then acting
 /// as the owner (A), the same update succeeds. Self-contained (a process-local
@@ -9409,5 +9414,236 @@ async fn main() {
         assert_eq!(plan.warnings.len(), 1, "warnings: {:?}", plan.warnings);
         assert!(plan.warnings[0].contains("rust_decimal"));
         assert!(plan.warnings[0].contains("db-diesel2-postgres"));
+    }
+
+    // ── Record-level authorization scaffolding (issue #1125) ───────────────
+
+    fn scaffold_paths(plan: &Plan) -> Vec<String> {
+        plan.actions
+            .iter()
+            .map(|a| {
+                a.path()
+                    .strip_prefix(&plan.project_root)
+                    .unwrap()
+                    .display()
+                    .to_string()
+                    .replace('\\', "/")
+            })
+            .collect()
+    }
+
+    fn action_contents(plan: &Plan, suffix: &str) -> String {
+        plan.actions
+            .iter()
+            .find(|a| {
+                a.path()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+                    .ends_with(suffix)
+            })
+            .map(|a| match a {
+                Action::Create { contents, .. } | Action::Modify { contents, .. } => {
+                    contents.clone()
+                }
+                _ => String::new(),
+            })
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn default_scaffold_emits_policy_file_and_registration() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "user_id:i64".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        let paths = scaffold_paths(&plan);
+        assert!(
+            paths.iter().any(|p| p == "src/policies/post.rs"),
+            "{paths:?}"
+        );
+        assert!(
+            paths.iter().any(|p| p == "src/policies/mod.rs"),
+            "{paths:?}"
+        );
+
+        let policy = action_contents(&plan, "src/policies/post.rs");
+        assert!(
+            policy.contains("impl Policy<Post> for PostPolicy"),
+            "{policy}"
+        );
+        assert!(policy.contains("Some(post.user_id)"), "{policy}");
+
+        let main = action_contents(&plan, "src/main.rs");
+        assert!(
+            main.contains(".policy::<crate::models::post::Post, _>"),
+            "{main}"
+        );
+        assert!(
+            main.contains(".scope::<crate::models::post::Post, _>"),
+            "{main}"
+        );
+        assert!(main.contains("mod policies;"), "{main}");
+    }
+
+    #[test]
+    fn owner_scaffold_authorizes_mutating_handlers_and_scopes_index() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "user_id:i64".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        let routes = action_contents(&plan, "src/routes/posts.rs");
+        // edit / update / destroy carry an inline authorize call.
+        assert_eq!(
+            routes
+                .matches("autumn_web::authorization::authorize::<Post>")
+                .count(),
+            3,
+            "edit/update/destroy must each authorize: {routes}"
+        );
+        assert!(routes.contains("\"edit\", &row"), "{routes}");
+        assert!(routes.contains("\"update\", &current"), "{routes}");
+        assert!(routes.contains("\"delete\", &current"), "{routes}");
+        // Index applies the owner scope through a filtered paginated query.
+        assert!(
+            routes.contains("posts::user_id.eq(owner_id)"),
+            "index must filter by owner: {routes}"
+        );
+        assert!(
+            routes.contains("PolicyContext::from_request(&state, &session)"),
+            "{routes}"
+        );
+        // The cross-user 403 smoke test is emitted.
+        let smoke = action_contents(&plan, "tests/post.rs");
+        assert!(
+            smoke.contains("cross_user_mutations_are_forbidden"),
+            "{smoke}"
+        );
+        assert!(smoke.contains("ForbiddenResponse::Forbidden403"), "{smoke}");
+    }
+
+    #[test]
+    fn no_policy_flag_reverts_to_secured_only() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "user_id:i64".into()],
+            "20260427000000",
+            &ScaffoldOptions {
+                no_policy: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let paths = scaffold_paths(&plan);
+        assert!(
+            !paths.iter().any(|p| p.starts_with("src/policies/")),
+            "--no-policy must not emit a policies file: {paths:?}"
+        );
+        let routes = action_contents(&plan, "src/routes/posts.rs");
+        assert!(
+            !routes.contains("authorize::<Post>"),
+            "--no-policy must not wire authorize: {routes}"
+        );
+        let main = action_contents(&plan, "src/main.rs");
+        assert!(
+            !main.contains(".policy::<"),
+            "--no-policy must not register a policy: {main}"
+        );
+    }
+
+    #[test]
+    fn no_owner_scaffold_registers_policy_but_leaves_handlers_secured_only() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "body:Text".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        // Policy file still generated (default-deny + TODO) and registered.
+        let policy = action_contents(&plan, "src/policies/post.rs");
+        assert!(
+            policy.contains("// TODO: no owner column detected"),
+            "{policy}"
+        );
+        let main = action_contents(&plan, "src/main.rs");
+        assert!(
+            main.contains(".policy::<crate::models::post::Post, _>"),
+            "{main}"
+        );
+        // But mutating handlers keep #[secured]-only (no inline authorize) since
+        // a default-deny policy would 403 every mutation out of the box.
+        let routes = action_contents(&plan, "src/routes/posts.rs");
+        assert!(
+            !routes.contains("authorize::<Post>"),
+            "no-owner scaffold must not inline authorize: {routes}"
+        );
+    }
+
+    #[test]
+    fn api_scaffold_never_generates_policy() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "user_id:i64".into()],
+            "20260427000000",
+            &ScaffoldOptions {
+                api: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let paths = scaffold_paths(&plan);
+        assert!(
+            !paths.iter().any(|p| p.starts_with("src/policies/")),
+            "--api must not emit a policy: {paths:?}"
+        );
+    }
+
+    #[test]
+    fn policy_registration_survives_scaffold_destroy_round_trip() {
+        let tmp = project_with_main(default_main());
+        let main_path = tmp.path().join("src/main.rs");
+        let original_main = fs::read_to_string(&main_path).unwrap();
+
+        plan_scaffold(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "user_id:i64".into()],
+            "20260427000000",
+        )
+        .unwrap()
+        .execute(Flags::default())
+        .unwrap();
+        assert!(tmp.path().join("src/policies/post.rs").exists());
+        assert!(
+            fs::read_to_string(&main_path)
+                .unwrap()
+                .contains(".policy::<")
+        );
+
+        plan_scaffold(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "user_id:i64".into()],
+            "20260427000000",
+        )
+        .unwrap()
+        .revert(Flags::default())
+        .unwrap();
+        assert!(!tmp.path().join("src/policies/post.rs").exists());
+        assert!(!tmp.path().join("src/policies").exists());
+        assert_eq!(fs::read_to_string(&main_path).unwrap(), original_main);
     }
 }
