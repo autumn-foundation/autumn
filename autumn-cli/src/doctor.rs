@@ -3287,7 +3287,7 @@ fn resolve_fleet_topology(table: Option<&toml::Table>) -> Option<FleetTopology> 
 /// matches what the runtime actually drains. Two sources, in precedence order:
 ///
 /// 1. `[jobs.fleet] manifest = "path"` — a jobs manifest the app emits (reusing
-///    `effective_drained_queues` on the runtime side), a TOML file with a
+///    `effective_drained_queues_from_jobs` on the runtime side), a TOML file with a
 ///    `queues = [...]` array. This is the ground-truth set the runtime drains.
 /// 2. `[jobs.fleet] declared_queues = ["…"]` — an inline list the operator
 ///    maintains by hand (the MVP path when no manifest is emitted).
@@ -9421,6 +9421,87 @@ foo = "bar"
         let none: toml::Table =
             toml::from_str("[jobs]\nqueues = [\"critical\"]\n").expect("parse toml");
         assert!(resolve_declared_queues_from_sources(|_| None, Some(&none)).is_empty());
+    }
+
+    // ── Jobs manifest emit → consume loop (#1756) ──────────────────────────
+    //
+    // These prove the full round trip: the manifest string `autumn jobs manifest`
+    // emits (verified byte-for-byte by autumn-web's `jobs_manifest_renders_*`
+    // test) is written to disk, read back through `[jobs.fleet] manifest = ...`,
+    // and drives the topology-aware coverage verdict.
+
+    /// The exact bytes `render_jobs_manifest` emits for a `[jobs.queues] =
+    /// ["critical"]` app carrying one `#[job(queue = "email")]`.
+    const EMITTED_MANIFEST: &str = "queues = [\"critical\", \"email\"]\n";
+
+    #[test]
+    fn manifest_emit_consume_loop_fails_on_genuine_gap() {
+        // Emit → write to disk → doctor reads it back and PROVES a gap: the
+        // manifest surfaces the job-declared `email`, which no tier drains, so a
+        // topology-aware `--strict` run turns it into a hard Fail (exit 1).
+        let temp = tempfile::tempdir().expect("temp dir");
+        let manifest_path = temp.path().join("jobs-manifest.toml");
+        std::fs::write(&manifest_path, EMITTED_MANIFEST).expect("write manifest");
+
+        let table: toml::Table = toml::from_str(&format!(
+            "[jobs]\nqueues = [\"critical\"]\n\n[jobs.fleet]\nmanifest = {path:?}\ntiers = [[\"critical\"]]\n",
+            path = manifest_path.to_str().expect("utf8 path"),
+        ))
+        .expect("parse toml");
+
+        // Doctor reads the emitted manifest, not the stale inline list.
+        let declared = resolve_declared_queues(Some(&table));
+        assert_eq!(
+            declared,
+            vec!["critical".to_string(), "email".to_string()],
+            "the emitted manifest is the declared-queue source of truth"
+        );
+
+        let fleet = resolve_fleet_topology(Some(&table)).expect("topology declared");
+        let result = check_queue_coverage_topology(
+            ProcessRole::Worker,
+            &["critical".to_string()],
+            &["critical".to_string()],
+            &declared,
+            Some(&fleet),
+        );
+        assert_eq!(result.status, CheckStatus::Fail, "{:?}", result.detail);
+        assert!(
+            result.detail.unwrap().contains("email"),
+            "the failure must name the manifest-surfaced uncovered queue"
+        );
+        let summary = Summary {
+            passed: 0,
+            warned: 0,
+            failed: 1,
+        };
+        assert_eq!(exit_code(&summary, true), 1);
+    }
+
+    #[test]
+    fn manifest_emit_consume_loop_passes_on_full_coverage() {
+        // Same emitted manifest, but now a dedicated tier drains `email` too →
+        // union coverage is total → Pass, with no false negative.
+        let temp = tempfile::tempdir().expect("temp dir");
+        let manifest_path = temp.path().join("jobs-manifest.toml");
+        std::fs::write(&manifest_path, EMITTED_MANIFEST).expect("write manifest");
+
+        let table: toml::Table = toml::from_str(&format!(
+            "[jobs]\nqueues = [\"critical\"]\n\n[jobs.fleet]\nmanifest = {path:?}\ntiers = [[\"critical\"], [\"email\"]]\n",
+            path = manifest_path.to_str().expect("utf8 path"),
+        ))
+        .expect("parse toml");
+
+        let declared = resolve_declared_queues(Some(&table));
+        let fleet = resolve_fleet_topology(Some(&table)).expect("topology declared");
+        let result = check_queue_coverage_topology(
+            ProcessRole::Worker,
+            &["critical".to_string()],
+            &["critical".to_string()],
+            &declared,
+            Some(&fleet),
+        );
+        assert_eq!(result.status, CheckStatus::Pass, "{:?}", result.detail);
     }
 
     #[test]
