@@ -204,6 +204,8 @@ mod system_test_api;
 #[cfg(feature = "db")]
 mod tenancy;
 mod tenancy_unit;
+mod tenant_cell_quota;
+mod tenant_cell_unit;
 mod test_app_integration;
 mod test_db_integration;
 mod throttle_route;

@@ -3042,6 +3042,15 @@ impl AutumnConfig {
         self.apply_resilience_env_overrides_with_env(env);
         self.apply_time_zone_env_overrides_with_env(env);
         self.apply_alerts_env_overrides_with_env(env);
+        self.apply_tenancy_env_overrides_with_env(env);
+    }
+
+    fn apply_tenancy_env_overrides_with_env(&mut self, env: &dyn Env) {
+        parse_env(
+            env,
+            "AUTUMN_TENANCY__QUOTA_BYTES",
+            &mut self.tenancy.quota_bytes,
+        );
     }
 
     fn apply_alerts_env_overrides_with_env(&mut self, env: &dyn Env) {
@@ -6081,6 +6090,11 @@ pub struct TenancyConfig {
     /// logins. When `None`, the underlying authorization error is returned.
     #[serde(default)]
     pub login_redirect: Option<String>,
+
+    /// Soft per-tenant memory quota, in bytes, for in-process tenant cells.
+    /// `0` disables the quota (unlimited).
+    #[serde(default)]
+    pub quota_bytes: usize,
 }
 
 fn default_tenancy_source() -> String {
@@ -6113,6 +6127,7 @@ impl Default for TenancyConfig {
             base_domain: None,
             public_paths: Vec::new(),
             login_redirect: None,
+            quota_bytes: 0,
         }
     }
 }
@@ -8565,6 +8580,21 @@ path = "/healthz"
         let mut target = vec![];
         parse_env_csv(&env, "SOME_CSV", &mut target);
         assert_eq!(target, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn env_override_tenancy_quota_bytes() {
+        // Unset: default stays 0 (unlimited).
+        let env = MockEnv::new();
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        assert_eq!(config.tenancy.quota_bytes, 0);
+
+        // Set via env: override is applied through the dispatcher.
+        let env = MockEnv::new().with("AUTUMN_TENANCY__QUOTA_BYTES", "1048576");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        assert_eq!(config.tenancy.quota_bytes, 1_048_576);
     }
 
     #[test]

@@ -453,14 +453,34 @@ pub async fn tenancy_middleware(
 
     let request = Request::from_parts(parts, body);
     let tenant_id_clone = tenant_id.clone();
+
+    // Bind a lazily-materializing handle to the tenant's memory cell for the
+    // request lifecycle. The registry itself is lazily registered in the app
+    // state's extension map on first use, but building a handle does NOT create
+    // a cell: the cell is materialized only when a handler (or a streaming body)
+    // first accesses it via `current_tenant_cell()`. Requests to routes that
+    // never touch tenant memory therefore leave the registry untouched, even
+    // with request-controlled tenant ids.
+    let registry = state.extension_or_insert_with(crate::tenant_cell::TenantCellRegistry::new);
+    let handle = crate::tenant_cell::TenantCellHandle::new(
+        (*registry).clone(),
+        tenant_id.clone(),
+        config.tenancy.quota_bytes,
+    );
+    let handle_for_body = Some(handle.clone());
+
     let response = CURRENT_TENANT
-        .scope(Some(tenant_id), next.run(request))
+        .scope(
+            Some(tenant_id),
+            crate::tenant_cell::CURRENT_TENANT_CELL.scope(Some(handle), next.run(request)),
+        )
         .await;
 
     let (parts, body) = response.into_parts();
     let wrapped = TenantPropagatingBody {
         inner: body,
         tenant_id: tenant_id_clone,
+        handle: handle_for_body,
     };
     Response::from_parts(parts, axum::body::Body::new(wrapped))
 }
@@ -473,6 +493,7 @@ pin_project! {
         #[pin]
         pub inner: B,
         pub tenant_id: String,
+        pub handle: Option<crate::tenant_cell::TenantCellHandle>,
     }
 }
 
@@ -489,7 +510,10 @@ where
     ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
         let this = self.project();
         let tenant_id = this.tenant_id.clone();
-        CURRENT_TENANT.sync_scope(Some(tenant_id), || this.inner.poll_frame(cx))
+        let handle = this.handle.clone();
+        CURRENT_TENANT.sync_scope(Some(tenant_id), || {
+            crate::tenant_cell::CURRENT_TENANT_CELL.sync_scope(handle, || this.inner.poll_frame(cx))
+        })
     }
 
     fn is_end_stream(&self) -> bool {
