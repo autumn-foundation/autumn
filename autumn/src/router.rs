@@ -2126,7 +2126,13 @@ where
             .and(NotForContentType::const_new("application/x-bzip"))
             .and(NotForContentType::const_new("application/x-rar-compressed"))
             .and(NotForContentType::const_new("application/vnd.rar"))
-            .and(NotForContentType::const_new("application/x-7z-compressed"));
+            .and(NotForContentType::const_new("application/x-7z-compressed"))
+            // Pre-compressed web fonts — WOFF/WOFF2 embed their own compression,
+            // so gzip/br only wastes CPU and can inflate them. Raw fonts
+            // (`font/ttf`, `font/otf`) are NOT excluded: they are uncompressed
+            // SFNT data that genuinely benefits from transfer compression.
+            .and(NotForContentType::const_new("font/woff"))
+            .and(NotForContentType::const_new("font/woff2"));
         router =
             router.layer(tower_http::compression::CompressionLayer::new().compress_when(predicate));
         tracing::info!("Response compression enabled (gzip/brotli)");
@@ -3400,6 +3406,55 @@ pub fn try_build_router_with_static_inner(
                     if let Some(file_path) = static_layer.resolve(normalized)
                         && let Ok(contents) = tokio::fs::read(&file_path).await
                     {
+                        // Derive the Content-Type from the request route's
+                        // extension rather than hard-coding text/html. The
+                        // response compression layer (applied OUTSIDE this
+                        // middleware) negotiates gzip/brotli by content type, so
+                        // an accurate MIME type is what lets compressible SSG
+                        // pages (HTML/CSS/JS/JSON/XML/text) be encoded while
+                        // binary manifest assets (images, fonts, octet-stream)
+                        // are left untouched.
+                        //
+                        // The served file name is NOT a reliable MIME source for
+                        // generated routes: `static_gen::url_to_file_path` stores
+                        // every non-root route as `<route>/index.html`, so
+                        // `/robots.txt` -> `robots.txt/index.html` and
+                        // `/sitemap.xml` -> `sitemap.xml/index.html`. Reading the
+                        // extension off `index.html` would mislabel those as
+                        // text/html. The request route carries the true
+                        // extension, so prefer it — but ONLY when its final path
+                        // segment ends in an extension the asset table actually
+                        // recognizes.
+                        //
+                        // A bare `contains('.')` check is too loose: a generated
+                        // page whose slug merely contains a dot
+                        // (`/posts/release.v1`, `/users/alice@example.com`) is
+                        // still stored as `<slug>/index.html` HTML, yet `.v1` /
+                        // `.com` are not asset extensions. Deriving the MIME from
+                        // the route there would mislabel HTML as
+                        // `application/octet-stream` and break its compression.
+                        // `content_type_for_opt` returns `Some` only for a
+                        // recognized extension, so those unrecognized-dot slugs
+                        // fall through to the served file name (`index.html` ->
+                        // text/html), exactly like extensionless pages.
+                        //
+                        // Extensionless routes are real pages (`/about` ->
+                        // `about/index.html`) and resolve to text/html via the
+                        // same file-name fallback. Hand-written manifests that map
+                        // an extensionless route directly at an extensioned file
+                        // (e.g. `/logo` -> `logo.png`, `/inter` ->
+                        // `fonts/inter.woff2`) are likewise covered by it. The URL
+                        // path is always '/'-delimited, so inspecting the last
+                        // segment is unaffected by platform path separators.
+                        let content_type = crate::assets::content_type_for_opt(normalized)
+                            .unwrap_or_else(|| {
+                                file_path
+                                    .file_name()
+                                    .and_then(|name| name.to_str())
+                                    .map_or("application/octet-stream", |name| {
+                                        crate::assets::content_type_for(name)
+                                    })
+                            });
                         let body = if is_head {
                             axum::body::Body::empty()
                         } else {
@@ -3407,7 +3462,7 @@ pub fn try_build_router_with_static_inner(
                         };
                         return http::Response::builder()
                             .status(http::StatusCode::OK)
-                            .header(http::header::CONTENT_TYPE, "text/html; charset=utf-8")
+                            .header(http::header::CONTENT_TYPE, content_type)
                             .body(body)
                             .expect("infallible response builder");
                     }
@@ -6929,6 +6984,569 @@ enabled = true
     }
 
     // --- Static file serving (SSG/ISG) tests ---
+
+    // --- SSG/ISG response compression (#752) ---
+    //
+    // The static-first middleware serves manifest-backed `dist/` files by
+    // reading them from disk and building a response directly, short-circuiting
+    // before the dynamic router. Compression is applied OUTSIDE that middleware
+    // (see `try_build_router_with_static_inner`), and the served response now
+    // carries a MIME type derived from the file extension, so the compression
+    // layer encodes compressible SSG pages while leaving binary assets alone —
+    // matching the transport behaviour of dynamic handler responses.
+
+    /// Build a `dist/` dir + `manifest.json` mapping each `(route, file, bytes)`
+    /// tuple to a file on disk. Returns the `TempDir` guard; the dist directory
+    /// is at `<tmp>/dist`.
+    fn create_ssg_dist(entries: &[(&str, &str, &[u8])]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dist = dir.path().join("dist");
+        let mut routes = std::collections::HashMap::new();
+        for (route, file, bytes) in entries {
+            let path = dist.join(file);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).expect("mkdir");
+            }
+            std::fs::write(&path, bytes).expect("write file");
+            routes.insert(
+                (*route).to_owned(),
+                crate::static_gen::ManifestEntry {
+                    file: (*file).to_owned(),
+                    revalidate: None,
+                },
+            );
+        }
+        let manifest = crate::static_gen::StaticManifest {
+            generated_at: "2026-07-12T00:00:00Z".to_owned(),
+            autumn_version: "0.6.0".to_owned(),
+            routes,
+        };
+        std::fs::write(
+            dist.join("manifest.json"),
+            serde_json::to_string(&manifest).unwrap(),
+        )
+        .unwrap();
+        dir
+    }
+
+    fn compression_enabled_config() -> AutumnConfig {
+        let mut config = AutumnConfig::default();
+        config.compression.enabled = true;
+        config
+    }
+
+    /// A manifest-backed HTML page is gzip-compressed when the client accepts
+    /// gzip and framework compression is enabled, and it carries
+    /// `Vary: Accept-Encoding`.
+    #[tokio::test]
+    async fn ssg_html_hit_is_gzip_compressed() {
+        let html = format!(
+            "<html><body>{}</body></html>",
+            "Lorem ipsum dolor sit amet. ".repeat(64)
+        );
+        let tmp = create_ssg_dist(&[("/", "index.html", html.as_bytes())]);
+        let dist = tmp.path().join("dist");
+
+        let router = try_build_router_with_static(
+            Vec::new(),
+            &compression_enabled_config(),
+            test_state(),
+            Some(&dist),
+        )
+        .expect("router builds");
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .header("accept-encoding", "gzip")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(http::header::CONTENT_ENCODING)
+                .and_then(|v| v.to_str().ok()),
+            Some("gzip"),
+            "manifest-backed SSG HTML page must be gzip-compressed"
+        );
+        let vary = response
+            .headers()
+            .get(http::header::VARY)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(
+            vary.to_lowercase().contains("accept-encoding"),
+            "Vary must advertise Accept-Encoding, got {vary:?}"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("text/html; charset=utf-8"),
+            "HTML page keeps its text/html content type"
+        );
+        // The transferred body is the gzip stream, not the raw HTML.
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_ne!(
+            body.as_ref(),
+            html.as_bytes(),
+            "compressed body must differ from the raw HTML"
+        );
+    }
+
+    /// A manifest-backed *binary* asset is served with its real MIME type and is
+    /// NOT compressed, even though the client accepts gzip — proving the fix
+    /// does not blindly compress non-text responses.
+    #[tokio::test]
+    async fn ssg_binary_asset_is_not_compressed_and_keeps_mime() {
+        // PNG signature followed by pseudo-random bytes, padded well past the
+        // compression size floor so size is not the reason it is skipped.
+        let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+        bytes.extend((0u32..1024).map(|i| i.wrapping_mul(2_654_435_761).to_le_bytes()[0]));
+        let tmp = create_ssg_dist(&[("/logo", "logo.png", &bytes)]);
+        let dist = tmp.path().join("dist");
+
+        let router = try_build_router_with_static(
+            Vec::new(),
+            &compression_enabled_config(),
+            test_state(),
+            Some(&dist),
+        )
+        .expect("router builds");
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/logo")
+                    .header("accept-encoding", "gzip")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("image/png"),
+            "binary manifest asset must keep its real MIME type, not text/html"
+        );
+        assert_eq!(
+            response.headers().get(http::header::CONTENT_ENCODING),
+            None,
+            "binary asset must not be blindly compressed"
+        );
+    }
+
+    /// A manifest-backed pre-compressed web font (`.woff2`) is served with its
+    /// `font/woff2` MIME type and is NOT gzip-compressed even though the client
+    /// accepts gzip: WOFF/WOFF2 embed their own compression, so re-encoding only
+    /// wastes CPU. Raw fonts (`.ttf`/`.otf`) are deliberately left compressible.
+    #[tokio::test]
+    async fn ssg_woff2_font_is_not_compressed_and_keeps_mime() {
+        // Pad well past the compression size floor so size is not the reason it
+        // is skipped — the font MIME type is.
+        let mut bytes = b"wOF2".to_vec();
+        bytes.extend((0u32..1024).map(|i| i.wrapping_mul(2_654_435_761).to_le_bytes()[0]));
+        let tmp = create_ssg_dist(&[("/inter", "fonts/inter.woff2", &bytes)]);
+        let dist = tmp.path().join("dist");
+
+        let router = try_build_router_with_static(
+            Vec::new(),
+            &compression_enabled_config(),
+            test_state(),
+            Some(&dist),
+        )
+        .expect("router builds");
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/inter")
+                    .header("accept-encoding", "gzip")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("font/woff2"),
+            "woff2 manifest asset must keep its font/woff2 MIME type"
+        );
+        assert_eq!(
+            response.headers().get(http::header::CONTENT_ENCODING),
+            None,
+            "pre-compressed woff2 font must not be re-compressed"
+        );
+    }
+
+    /// A manifest-backed asset served from a nested path with a multi-dot file
+    /// name (`assets/js/app.min.js`) resolves to the JavaScript MIME type. The
+    /// middleware derives the type from the file name alone, so neither the
+    /// intermediate directory components nor the extra `.min.` dot cause a
+    /// misparse.
+    #[tokio::test]
+    async fn ssg_nested_multidot_asset_resolves_js_mime() {
+        let js = format!("console.log({:?});", "x".repeat(256));
+        let tmp = create_ssg_dist(&[("/app.js", "assets/js/app.min.js", js.as_bytes())]);
+        let dist = tmp.path().join("dist");
+
+        let router = try_build_router_with_static(
+            Vec::new(),
+            &compression_enabled_config(),
+            test_state(),
+            Some(&dist),
+        )
+        .expect("router builds");
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/app.js")
+                    .header("accept-encoding", "gzip")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("text/javascript; charset=utf-8"),
+            "nested multi-dot JS asset must resolve to the JavaScript MIME type"
+        );
+        // JS is a compressible content type, so the layer must still gzip it.
+        assert_eq!(
+            response
+                .headers()
+                .get(http::header::CONTENT_ENCODING)
+                .and_then(|v| v.to_str().ok()),
+            Some("gzip"),
+            "compressible JS asset must be gzip-compressed"
+        );
+    }
+
+    /// An extensionless generated page route (`/about` ->
+    /// `about/index.html`, the shape `static_gen::url_to_file_path` produces)
+    /// keeps its `text/html; charset=utf-8` type and is gzip-compressed. This
+    /// pins the fallback: routes without a file extension must NOT regress to
+    /// octet-stream just because the served file is `index.html`.
+    #[tokio::test]
+    async fn ssg_generated_html_page_keeps_text_html_and_is_compressed() {
+        let html = format!("<html><body>{}</body></html>", "About us. ".repeat(128));
+        let tmp = create_ssg_dist(&[("/about", "about/index.html", html.as_bytes())]);
+        let dist = tmp.path().join("dist");
+
+        let router = try_build_router_with_static(
+            Vec::new(),
+            &compression_enabled_config(),
+            test_state(),
+            Some(&dist),
+        )
+        .expect("router builds");
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/about")
+                    .header("accept-encoding", "gzip")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("text/html; charset=utf-8"),
+            "extensionless generated page must stay text/html, not octet-stream"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(http::header::CONTENT_ENCODING)
+                .and_then(|v| v.to_str().ok()),
+            Some("gzip"),
+            "generated HTML page must be gzip-compressed"
+        );
+    }
+
+    /// A generated `.txt` route (`/robots.txt` -> `robots.txt/index.html`) is
+    /// served as `text/plain; charset=utf-8` — derived from the request
+    /// route's extension, not the on-disk `index.html` file name — and is
+    /// gzip-compressed. Reading the MIME off the served file would mislabel it
+    /// as text/html.
+    #[tokio::test]
+    async fn ssg_generated_txt_route_is_text_plain_and_compressed() {
+        let body_text = format!("User-agent: *\nDisallow:\n{}", "# note\n".repeat(128));
+        let tmp =
+            create_ssg_dist(&[("/robots.txt", "robots.txt/index.html", body_text.as_bytes())]);
+        let dist = tmp.path().join("dist");
+
+        let router = try_build_router_with_static(
+            Vec::new(),
+            &compression_enabled_config(),
+            test_state(),
+            Some(&dist),
+        )
+        .expect("router builds");
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/robots.txt")
+                    .header("accept-encoding", "gzip")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("text/plain; charset=utf-8"),
+            "generated .txt route must be text/plain, derived from the route extension"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(http::header::CONTENT_ENCODING)
+                .and_then(|v| v.to_str().ok()),
+            Some("gzip"),
+            "compressible text/plain route must be gzip-compressed"
+        );
+    }
+
+    /// A generated `.xml` route (`/sitemap.xml` -> `sitemap.xml/index.html`) is
+    /// served as `application/xml`, derived from the request route's extension
+    /// rather than the served `index.html` file name.
+    #[tokio::test]
+    async fn ssg_generated_xml_route_is_xml_mime() {
+        let xml = format!(
+            "<?xml version=\"1.0\"?><urlset>{}</urlset>",
+            "<url><loc>https://example.com/</loc></url>".repeat(64)
+        );
+        let tmp = create_ssg_dist(&[("/sitemap.xml", "sitemap.xml/index.html", xml.as_bytes())]);
+        let dist = tmp.path().join("dist");
+
+        let router = try_build_router_with_static(
+            Vec::new(),
+            &compression_enabled_config(),
+            test_state(),
+            Some(&dist),
+        )
+        .expect("router builds");
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/sitemap.xml")
+                    .header("accept-encoding", "gzip")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("application/xml"),
+            "generated .xml route must be application/xml, derived from the route extension"
+        );
+    }
+
+    /// A generated HTML page whose slug merely *contains* a dot but ends in an
+    /// UNRECOGNIZED extension (`/posts/release.v1` -> `release.v1/index.html`)
+    /// stays `text/html; charset=utf-8` and is gzip-compressed. The `.v1`
+    /// pseudo-extension is not an asset type, so the MIME must come from the
+    /// served `index.html` — not be mislabeled octet-stream by a loose
+    /// `contains('.')` heuristic.
+    #[tokio::test]
+    async fn ssg_dotted_slug_generated_page_stays_html_and_compressed() {
+        let html = format!(
+            "<html><body>{}</body></html>",
+            "Release notes. ".repeat(128)
+        );
+        let tmp = create_ssg_dist(&[(
+            "/posts/release.v1",
+            "release.v1/index.html",
+            html.as_bytes(),
+        )]);
+        let dist = tmp.path().join("dist");
+
+        let router = try_build_router_with_static(
+            Vec::new(),
+            &compression_enabled_config(),
+            test_state(),
+            Some(&dist),
+        )
+        .expect("router builds");
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/posts/release.v1")
+                    .header("accept-encoding", "gzip")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("text/html; charset=utf-8"),
+            "dotted-slug generated page must stay text/html, not octet-stream"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(http::header::CONTENT_ENCODING)
+                .and_then(|v| v.to_str().ok()),
+            Some("gzip"),
+            "dotted-slug generated HTML page must be gzip-compressed"
+        );
+    }
+
+    /// A generated HTML page whose slug contains an email-like dotted suffix
+    /// (`/users/alice@example.com` -> `alice@example.com/index.html`) stays
+    /// `text/html; charset=utf-8`. Neither `.com` nor the `@` makes it an
+    /// asset, so the MIME comes from the served `index.html`.
+    #[tokio::test]
+    async fn ssg_email_slug_generated_page_stays_html() {
+        let html = format!("<html><body>{}</body></html>", "Profile. ".repeat(64));
+        let tmp = create_ssg_dist(&[(
+            "/users/alice@example.com",
+            "alice@example.com/index.html",
+            html.as_bytes(),
+        )]);
+        let dist = tmp.path().join("dist");
+
+        let router = try_build_router_with_static(
+            Vec::new(),
+            &compression_enabled_config(),
+            test_state(),
+            Some(&dist),
+        )
+        .expect("router builds");
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/users/alice@example.com")
+                    .header("accept-encoding", "gzip")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("text/html; charset=utf-8"),
+            "email-like dotted-slug generated page must stay text/html"
+        );
+    }
+
+    /// A dynamic fallback route (not in the manifest) is compressed the same way
+    /// as SSG pages, confirming parity between static-first and dynamic
+    /// responses.
+    #[tokio::test]
+    async fn ssg_dynamic_fallback_route_is_gzip_compressed() {
+        async fn dynamic() -> impl axum::response::IntoResponse {
+            (
+                [(http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
+                format!(
+                    "<html><body>{}</body></html>",
+                    "dynamic content ".repeat(64)
+                ),
+            )
+        }
+        let route = Route {
+            method: http::Method::GET,
+            path: "/dynamic",
+            handler: axum::routing::get(dynamic),
+            name: "dynamic",
+            api_doc: crate::openapi::ApiDoc {
+                method: "GET",
+                path: "/dynamic",
+                operation_id: "dynamic",
+                success_status: 200,
+                ..Default::default()
+            },
+            api_version: None,
+            sunset_opt_out: false,
+            repository: None,
+            idempotency: crate::route::RouteIdempotency::default(),
+            timeout: crate::route::RouteTimeout::default(),
+        };
+
+        // Manifest does NOT contain /dynamic, so the request falls through to
+        // the dynamic router.
+        let tmp = create_ssg_dist(&[("/", "index.html", b"<h1>home</h1>")]);
+        let dist = tmp.path().join("dist");
+
+        let router = try_build_router_with_static(
+            vec![route],
+            &compression_enabled_config(),
+            test_state(),
+            Some(&dist),
+        )
+        .expect("router builds");
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/dynamic")
+                    .header("accept-encoding", "gzip")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(http::header::CONTENT_ENCODING)
+                .and_then(|v| v.to_str().ok()),
+            Some("gzip"),
+            "dynamic fallback route must be compressed just like SSG pages"
+        );
+    }
 
     fn create_static_dist(revalidate: Option<u64>) -> tempfile::TempDir {
         let dir = tempfile::tempdir().expect("tempdir");

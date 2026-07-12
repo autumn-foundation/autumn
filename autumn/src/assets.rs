@@ -411,12 +411,35 @@ pub async fn asset_cache_control(
     resp
 }
 
-/// Best-effort `Content-Type` for an embedded asset, derived from its
+/// Best-effort `Content-Type` for a static/embedded asset, derived from its
 /// extension. Covers the closed set of asset types Autumn apps ship; unknown
 /// extensions fall back to `application/octet-stream`.
-#[cfg(feature = "embed-assets")]
+///
+/// Used both by the embedded-asset serving path and by the static-first
+/// (SSG/ISR) middleware, which serves manifest-backed files from `dist/` and
+/// needs an accurate MIME type so the response compression layer only encodes
+/// compressible content types (and skips binary assets).
 #[must_use]
 pub(crate) fn content_type_for(path: &str) -> &'static str {
+    content_type_for_opt(path).unwrap_or("application/octet-stream")
+}
+
+/// Like [`content_type_for`], but returns `Some(mime)` **only** when the final
+/// path segment carries a *recognized* asset extension, and `None` otherwise
+/// (extensionless input, or an extension not in the closed asset set).
+///
+/// This lets callers distinguish "the route names a real asset type" from "no
+/// idea, fall back to octet-stream". The static-first middleware relies on that
+/// distinction: a generated page whose slug merely *contains* a dot
+/// (`/posts/release.v1`, `/users/alice@example.com`) has an unrecognized
+/// trailing extension, so it returns `None` here and the caller derives the
+/// MIME from the served `index.html` file instead of mislabeling HTML as
+/// `application/octet-stream`.
+///
+/// Only the last `/`-delimited segment's extension is inspected, so dotted
+/// *ancestor* directories never affect the result.
+#[must_use]
+pub(crate) fn content_type_for_opt(path: &str) -> Option<&'static str> {
     // Lowercase the extension into a small stack buffer (extensions are short
     // and ASCII) to avoid a per-request heap allocation on the serving path.
     let raw = path
@@ -431,9 +454,9 @@ pub(crate) fn content_type_for(path: &str) -> &'static str {
         buf[..raw.len()].make_ascii_lowercase();
         std::str::from_utf8(&buf[..raw.len()]).unwrap_or("")
     } else {
-        "" // unknown long/non-ASCII extension → octet-stream
+        "" // unknown long/non-ASCII extension → unrecognized
     };
-    match ext {
+    let mime = match ext {
         "css" => "text/css; charset=utf-8",
         "js" | "mjs" => "text/javascript; charset=utf-8",
         "json" | "map" => "application/json",
@@ -452,8 +475,9 @@ pub(crate) fn content_type_for(path: &str) -> &'static str {
         "ttf" => "font/ttf",
         "otf" => "font/otf",
         "wasm" => "application/wasm",
-        _ => "application/octet-stream",
-    }
+        _ => return None,
+    };
+    Some(mime)
 }
 
 /// Process-wide cache of computed embedded-asset `ETag`s, keyed by the stable
