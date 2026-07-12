@@ -2126,7 +2126,13 @@ where
             .and(NotForContentType::const_new("application/x-bzip"))
             .and(NotForContentType::const_new("application/x-rar-compressed"))
             .and(NotForContentType::const_new("application/vnd.rar"))
-            .and(NotForContentType::const_new("application/x-7z-compressed"));
+            .and(NotForContentType::const_new("application/x-7z-compressed"))
+            // Pre-compressed web fonts — WOFF/WOFF2 embed their own compression,
+            // so gzip/br only wastes CPU and can inflate them. Raw fonts
+            // (`font/ttf`, `font/otf`) are NOT excluded: they are uncompressed
+            // SFNT data that genuinely benefits from transfer compression.
+            .and(NotForContentType::const_new("font/woff"))
+            .and(NotForContentType::const_new("font/woff2"));
         router =
             router.layer(tower_http::compression::CompressionLayer::new().compress_when(predicate));
         tracing::info!("Response compression enabled (gzip/brotli)");
@@ -7111,6 +7117,53 @@ enabled = true
             response.headers().get(http::header::CONTENT_ENCODING),
             None,
             "binary asset must not be blindly compressed"
+        );
+    }
+
+    /// A manifest-backed pre-compressed web font (`.woff2`) is served with its
+    /// `font/woff2` MIME type and is NOT gzip-compressed even though the client
+    /// accepts gzip: WOFF/WOFF2 embed their own compression, so re-encoding only
+    /// wastes CPU. Raw fonts (`.ttf`/`.otf`) are deliberately left compressible.
+    #[tokio::test]
+    async fn ssg_woff2_font_is_not_compressed_and_keeps_mime() {
+        // Pad well past the compression size floor so size is not the reason it
+        // is skipped — the font MIME type is.
+        let mut bytes = b"wOF2".to_vec();
+        bytes.extend((0u32..1024).map(|i| i.wrapping_mul(2_654_435_761).to_le_bytes()[0]));
+        let tmp = create_ssg_dist(&[("/inter", "fonts/inter.woff2", &bytes)]);
+        let dist = tmp.path().join("dist");
+
+        let router = try_build_router_with_static(
+            Vec::new(),
+            &compression_enabled_config(),
+            test_state(),
+            Some(&dist),
+        )
+        .expect("router builds");
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/inter")
+                    .header("accept-encoding", "gzip")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("font/woff2"),
+            "woff2 manifest asset must keep its font/woff2 MIME type"
+        );
+        assert_eq!(
+            response.headers().get(http::header::CONTENT_ENCODING),
+            None,
+            "pre-compressed woff2 font must not be re-compressed"
         );
     }
 
