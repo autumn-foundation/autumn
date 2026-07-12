@@ -132,6 +132,12 @@ jobs:
         with:
           tool: cargo-llvm-cov
       - name: Generate coverage
+        env:
+          # `postgresql_embedded`'s build script downloads Postgres binaries via
+          # the GitHub API; unauthenticated it hits the 60 req/hr rate limit and
+          # fails the build with a 403. Authenticate with the job's token to get
+          # the higher rate limit.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           cargo llvm-cov clean --workspace
           cargo llvm-cov --workspace --all-features --no-report
