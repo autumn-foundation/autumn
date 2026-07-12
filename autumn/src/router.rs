@@ -3400,6 +3400,18 @@ pub fn try_build_router_with_static_inner(
                     if let Some(file_path) = static_layer.resolve(normalized)
                         && let Ok(contents) = tokio::fs::read(&file_path).await
                     {
+                        // Derive the Content-Type from the served file's
+                        // extension rather than hard-coding text/html. The
+                        // response compression layer (applied OUTSIDE this
+                        // middleware) negotiates gzip/brotli by content type, so
+                        // an accurate MIME type is what lets compressible SSG
+                        // pages (HTML/CSS/JS/JSON/XML/text) be encoded while
+                        // binary manifest assets (images, fonts, octet-stream)
+                        // are left untouched. Manifest page routes point at
+                        // `*.html`, so the common case still resolves to
+                        // text/html; charset=utf-8 exactly as before.
+                        let content_type =
+                            crate::assets::content_type_for(file_path.to_str().unwrap_or(""));
                         let body = if is_head {
                             axum::body::Body::empty()
                         } else {
@@ -3407,7 +3419,7 @@ pub fn try_build_router_with_static_inner(
                         };
                         return http::Response::builder()
                             .status(http::StatusCode::OK)
-                            .header(http::header::CONTENT_TYPE, "text/html; charset=utf-8")
+                            .header(http::header::CONTENT_TYPE, content_type)
                             .body(body)
                             .expect("infallible response builder");
                     }
@@ -6929,6 +6941,236 @@ enabled = true
     }
 
     // --- Static file serving (SSG/ISG) tests ---
+
+    // --- SSG/ISG response compression (#752) ---
+    //
+    // The static-first middleware serves manifest-backed `dist/` files by
+    // reading them from disk and building a response directly, short-circuiting
+    // before the dynamic router. Compression is applied OUTSIDE that middleware
+    // (see `try_build_router_with_static_inner`), and the served response now
+    // carries a MIME type derived from the file extension, so the compression
+    // layer encodes compressible SSG pages while leaving binary assets alone —
+    // matching the transport behaviour of dynamic handler responses.
+
+    /// Build a `dist/` dir + `manifest.json` mapping each `(route, file, bytes)`
+    /// tuple to a file on disk. Returns the `TempDir` guard; the dist directory
+    /// is at `<tmp>/dist`.
+    fn create_ssg_dist(entries: &[(&str, &str, &[u8])]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dist = dir.path().join("dist");
+        let mut routes = std::collections::HashMap::new();
+        for (route, file, bytes) in entries {
+            let path = dist.join(file);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).expect("mkdir");
+            }
+            std::fs::write(&path, bytes).expect("write file");
+            routes.insert(
+                (*route).to_owned(),
+                crate::static_gen::ManifestEntry {
+                    file: (*file).to_owned(),
+                    revalidate: None,
+                },
+            );
+        }
+        let manifest = crate::static_gen::StaticManifest {
+            generated_at: "2026-07-12T00:00:00Z".to_owned(),
+            autumn_version: "0.6.0".to_owned(),
+            routes,
+        };
+        std::fs::write(
+            dist.join("manifest.json"),
+            serde_json::to_string(&manifest).unwrap(),
+        )
+        .unwrap();
+        dir
+    }
+
+    fn compression_enabled_config() -> AutumnConfig {
+        let mut config = AutumnConfig::default();
+        config.compression.enabled = true;
+        config
+    }
+
+    /// A manifest-backed HTML page is gzip-compressed when the client accepts
+    /// gzip and framework compression is enabled, and it carries
+    /// `Vary: Accept-Encoding`.
+    #[tokio::test]
+    async fn ssg_html_hit_is_gzip_compressed() {
+        let html = format!(
+            "<html><body>{}</body></html>",
+            "Lorem ipsum dolor sit amet. ".repeat(64)
+        );
+        let tmp = create_ssg_dist(&[("/", "index.html", html.as_bytes())]);
+        let dist = tmp.path().join("dist");
+
+        let router = try_build_router_with_static(
+            Vec::new(),
+            &compression_enabled_config(),
+            test_state(),
+            Some(&dist),
+        )
+        .expect("router builds");
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .header("accept-encoding", "gzip")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(http::header::CONTENT_ENCODING)
+                .and_then(|v| v.to_str().ok()),
+            Some("gzip"),
+            "manifest-backed SSG HTML page must be gzip-compressed"
+        );
+        let vary = response
+            .headers()
+            .get(http::header::VARY)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(
+            vary.to_lowercase().contains("accept-encoding"),
+            "Vary must advertise Accept-Encoding, got {vary:?}"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("text/html; charset=utf-8"),
+            "HTML page keeps its text/html content type"
+        );
+        // The transferred body is the gzip stream, not the raw HTML.
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_ne!(
+            body.as_ref(),
+            html.as_bytes(),
+            "compressed body must differ from the raw HTML"
+        );
+    }
+
+    /// A manifest-backed *binary* asset is served with its real MIME type and is
+    /// NOT compressed, even though the client accepts gzip — proving the fix
+    /// does not blindly compress non-text responses.
+    #[tokio::test]
+    async fn ssg_binary_asset_is_not_compressed_and_keeps_mime() {
+        // PNG signature followed by pseudo-random bytes, padded well past the
+        // compression size floor so size is not the reason it is skipped.
+        let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+        bytes.extend((0u32..1024).map(|i| i.wrapping_mul(2_654_435_761).to_le_bytes()[0]));
+        let tmp = create_ssg_dist(&[("/logo", "logo.png", &bytes)]);
+        let dist = tmp.path().join("dist");
+
+        let router = try_build_router_with_static(
+            Vec::new(),
+            &compression_enabled_config(),
+            test_state(),
+            Some(&dist),
+        )
+        .expect("router builds");
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/logo")
+                    .header("accept-encoding", "gzip")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("image/png"),
+            "binary manifest asset must keep its real MIME type, not text/html"
+        );
+        assert_eq!(
+            response.headers().get(http::header::CONTENT_ENCODING),
+            None,
+            "binary asset must not be blindly compressed"
+        );
+    }
+
+    /// A dynamic fallback route (not in the manifest) is compressed the same way
+    /// as SSG pages, confirming parity between static-first and dynamic
+    /// responses.
+    #[tokio::test]
+    async fn ssg_dynamic_fallback_route_is_gzip_compressed() {
+        async fn dynamic() -> impl axum::response::IntoResponse {
+            (
+                [(http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
+                format!(
+                    "<html><body>{}</body></html>",
+                    "dynamic content ".repeat(64)
+                ),
+            )
+        }
+        let route = Route {
+            method: http::Method::GET,
+            path: "/dynamic",
+            handler: axum::routing::get(dynamic),
+            name: "dynamic",
+            api_doc: crate::openapi::ApiDoc {
+                method: "GET",
+                path: "/dynamic",
+                operation_id: "dynamic",
+                success_status: 200,
+                ..Default::default()
+            },
+            api_version: None,
+            sunset_opt_out: false,
+            repository: None,
+            idempotency: crate::route::RouteIdempotency::default(),
+            timeout: crate::route::RouteTimeout::default(),
+        };
+
+        // Manifest does NOT contain /dynamic, so the request falls through to
+        // the dynamic router.
+        let tmp = create_ssg_dist(&[("/", "index.html", b"<h1>home</h1>")]);
+        let dist = tmp.path().join("dist");
+
+        let router = try_build_router_with_static(
+            vec![route],
+            &compression_enabled_config(),
+            test_state(),
+            Some(&dist),
+        )
+        .expect("router builds");
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/dynamic")
+                    .header("accept-encoding", "gzip")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(http::header::CONTENT_ENCODING)
+                .and_then(|v| v.to_str().ok()),
+            Some("gzip"),
+            "dynamic fallback route must be compressed just like SSG pages"
+        );
+    }
 
     fn create_static_dist(revalidate: Option<u64>) -> tempfile::TempDir {
         let dir = tempfile::tempdir().expect("tempdir");

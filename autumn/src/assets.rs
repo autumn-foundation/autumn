@@ -411,10 +411,14 @@ pub async fn asset_cache_control(
     resp
 }
 
-/// Best-effort `Content-Type` for an embedded asset, derived from its
+/// Best-effort `Content-Type` for a static/embedded asset, derived from its
 /// extension. Covers the closed set of asset types Autumn apps ship; unknown
 /// extensions fall back to `application/octet-stream`.
-#[cfg(feature = "embed-assets")]
+///
+/// Used both by the embedded-asset serving path and by the static-first
+/// (SSG/ISR) middleware, which serves manifest-backed files from `dist/` and
+/// needs an accurate MIME type so the response compression layer only encodes
+/// compressible content types (and skips binary assets).
 #[must_use]
 pub(crate) fn content_type_for(path: &str) -> &'static str {
     // Lowercase the extension into a small stack buffer (extensions are short
