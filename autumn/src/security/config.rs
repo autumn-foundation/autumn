@@ -364,6 +364,10 @@ pub struct SecurityConfig {
     #[serde(default)]
     pub csrf: CsrfConfig,
 
+    /// One-time submit tokens — at-most-once form submissions.
+    #[serde(default)]
+    pub submit_token: SubmitTokenConfig,
+
     /// Rate limiting (per-client-IP token bucket).
     #[serde(default)]
     pub rate_limit: RateLimitConfig,
@@ -732,6 +736,90 @@ impl Default for CsrfConfig {
             exempt_paths: Vec::new(),
         }
     }
+}
+
+/// One-time submit-token protection settings.
+///
+/// When enabled (the default), a per-render random token is exposed via the
+/// [`SubmitToken`](crate::security::SubmitToken) extractor and embedded as a
+/// hidden `_submit_token` field in scaffolded create/update forms. On the
+/// mutating POST the server consumes the token exactly once: a double-click,
+/// Back→resubmit, or browser retry carrying an already-consumed token replays
+/// the first response instead of re-running the handler, so no duplicate row is
+/// created — with no client-side JavaScript.
+///
+/// Unlike [`IdempotencyConfig`](crate::config::IdempotencyConfig), the guard is
+/// driven by a form field, not the `Idempotency-Key` header, so it protects
+/// bare browser form submits.
+///
+/// # Defaults
+///
+/// | Field | Default |
+/// |-------|---------|
+/// | `enabled` | `true` |
+/// | `field_name` | `"_submit_token"` |
+/// | `ttl_secs` | `600` (10 min) |
+/// | `backend` | `"memory"` |
+/// | `exempt_paths` | `[]` |
+///
+/// # Examples
+///
+/// ```toml
+/// [security.submit_token]
+/// enabled = true
+/// ttl_secs = 900
+/// backend = "redis"   # reuses the [idempotency.redis] connection settings
+/// ```
+#[derive(Debug, Clone, Deserialize)]
+pub struct SubmitTokenConfig {
+    /// Enable one-time submit-token protection. Default: `true`.
+    #[serde(default = "default_submit_token_enabled")]
+    pub enabled: bool,
+
+    /// Hidden form field name carrying the token. Default: `"_submit_token"`.
+    #[serde(default = "default_submit_token_field")]
+    pub field_name: String,
+
+    /// Time-to-live in seconds for a consumed token's stored response.
+    /// Default: `600` (10 minutes).
+    #[serde(default = "default_submit_token_ttl_secs")]
+    pub ttl_secs: u64,
+
+    /// Storage backend for consumed submit tokens. Default: `"memory"`.
+    ///
+    /// When `"redis"`, the store reuses the `[idempotency.redis]` connection
+    /// settings so a multi-replica deployment shares one token store.
+    #[serde(default)]
+    pub backend: crate::config::IdempotencyBackend,
+
+    /// Request path prefixes that are exempt from submit-token guarding.
+    /// Default: `[]`.
+    #[serde(default)]
+    pub exempt_paths: Vec<String>,
+}
+
+impl Default for SubmitTokenConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_submit_token_enabled(),
+            field_name: default_submit_token_field(),
+            ttl_secs: default_submit_token_ttl_secs(),
+            backend: crate::config::IdempotencyBackend::default(),
+            exempt_paths: Vec::new(),
+        }
+    }
+}
+
+const fn default_submit_token_enabled() -> bool {
+    true
+}
+
+fn default_submit_token_field() -> String {
+    "_submit_token".to_owned()
+}
+
+const fn default_submit_token_ttl_secs() -> u64 {
+    600
 }
 
 /// Strategy for identifying which client a rate-limit bucket belongs to.

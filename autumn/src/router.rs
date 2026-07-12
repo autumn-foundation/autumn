@@ -2188,6 +2188,66 @@ where
     router
 }
 
+/// Apply the one-time submit-token guard (issue #1360).
+///
+/// Enabled by default. The layer is applied *inner* to the CSRF layer (it is
+/// registered before `apply_csrf_middleware`, so on the request path CSRF is
+/// validated first): a request bearing a valid `_csrf` but an already-consumed
+/// `_submit_token` is still short-circuited by this guard. The store backend
+/// mirrors [`build_idempotency_layers`]; the `redis` backend reuses the
+/// `[idempotency.redis]` connection settings.
+fn apply_submit_token_middleware<S>(
+    mut router: axum::Router<S>,
+    config: &AutumnConfig,
+) -> Result<axum::Router<S>, RouterBuildError>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    let cfg = &config.security.submit_token;
+    if !cfg.enabled {
+        return Ok(router);
+    }
+
+    let ttl = Duration::from_secs(cfg.ttl_secs);
+    let store: std::sync::Arc<dyn IdempotencyStore> = match cfg.backend {
+        crate::config::IdempotencyBackend::Memory => {
+            std::sync::Arc::new(MemoryIdempotencyStore::new(ttl))
+        }
+        #[cfg(feature = "redis")]
+        crate::config::IdempotencyBackend::Redis => {
+            match crate::idempotency::RedisIdempotencyStore::from_config(&config.idempotency) {
+                Ok(s) => std::sync::Arc::new(s),
+                Err(e) => return Err(RouterBuildError::InvalidIdempotencyBackend(e)),
+            }
+        }
+        #[cfg(not(feature = "redis"))]
+        crate::config::IdempotencyBackend::Redis => {
+            return Err(RouterBuildError::InvalidIdempotencyBackend(
+                "submit_token backend 'redis' requires the autumn-web 'redis' feature \
+                 flag; rebuild with --features redis or switch to backend = \"memory\""
+                    .to_owned(),
+            ));
+        }
+    };
+
+    let mut layer = crate::security::SubmitTokenLayer::new(store, cfg)
+        .with_max_scan_bytes(config.security.upload.max_request_size_bytes);
+    for endpoint in &config.security.webhooks.endpoints {
+        layer = layer.with_exempt_path(&endpoint.path);
+    }
+    #[cfg(feature = "mail")]
+    if config.mail.should_mount_unsubscribe_endpoint() {
+        layer = layer.with_exempt_path(crate::mail::UNSUBSCRIBE_PATH);
+    }
+    tracing::info!(
+        backend = ?cfg.backend,
+        ttl_secs = cfg.ttl_secs,
+        "One-time submit-token protection enabled"
+    );
+    router = router.layer(layer);
+    Ok(router)
+}
+
 fn apply_bot_protection_middleware<S>(
     mut router: axum::Router<S>,
     config: &AutumnConfig,
@@ -2777,6 +2837,10 @@ fn apply_middleware(
     router = router.layer(axum::middleware::from_fn(move |req, next| {
         trusted_host_middleware(req, next, trusted_host_policy.clone())
     }));
+    // Applied before (i.e. inner to) the CSRF layer so CSRF is validated first
+    // on the request path; a replayed `_submit_token` is still short-circuited
+    // even when the request carries a valid `_csrf` (issue #1360, AC #4).
+    router = apply_submit_token_middleware(router, config)?;
     router = apply_csrf_middleware(router, config, signing_keys_opt.clone());
     router = apply_bot_protection_middleware(router, config);
     // Method-override rejection filter. The outer `MethodOverrideLayer`
