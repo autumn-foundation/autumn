@@ -19,7 +19,10 @@ Diesel/`diesel-async` (Postgres), and Maud for HTML.
   your app at `runs/<id>/app/`, that crate is five levels up
   (`app` → `<id>` → `runs` → `agentic-habit-tracker` → `benchmarks` →
   repo root, then into `autumn/`), so use the relative path
-  `path = "../../../../../autumn"`. You may instead use an **absolute** path to
+  `path = "../../../../../autumn"`. Only read the Autumn crate and `examples/`;
+  do **not** read `benchmarks/agentic-habit-tracker/hidden/` or
+  `benchmarks/agentic-habit-tracker/phase2/archive_hidden_test.py` — they are
+  evaluator-only. You may instead use an **absolute** path to
   this checkout's `autumn/` directory, or depend on the published crate
   (`autumn-web = "0.6"`). In your app `Cargo.toml`:
   ```toml

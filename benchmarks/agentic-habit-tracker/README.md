@@ -54,6 +54,31 @@ status codes, and streak semantics are pinned in `SPEC.md`.
   (archived habits are hidden, not deleted). Measures how quickly and cleanly an
   agent extends an existing codebase.
 
+## Evaluator-only vs builder-visible
+
+The hidden suites decide 60% of the score, so the building agent must never see
+them. Because this harness is checked into the framework repos it evaluates, a
+raw checkout would hand the agent the *executable* hidden tests — letting it
+optimize against them. Keep the boundary explicit:
+
+- **Builder-visible** (safe to give the agent): `prompts/`, `SPEC.md`,
+  `acceptance/`, `phase2/archive_test.py`.
+- **Evaluator-only** (NEVER expose to the builder): `hidden/`,
+  `phase2/archive_hidden_test.py`, `scripts/score.py`, `rubric.md`,
+  `metrics-schema.json`.
+
+**Run trials from a prepared workspace, not the raw checkout.** Use
+`scripts/prepare_agent_workspace.sh <framework> <dest-dir>` to assemble only the
+builder-visible materials into a clean directory, and point the agent there.
+
+**Autumn caveat.** Autumn's app needs a path-dependency on the in-repo `autumn/`
+crate, so the agent works inside a clone of this framework repo rather than an
+isolated workspace. That clone MUST exclude
+`benchmarks/agentic-habit-tracker/hidden/` and
+`benchmarks/agentic-habit-tracker/phase2/archive_hidden_test.py` — e.g. use a
+git sparse-checkout that excludes those paths, or delete them from the agent's
+working copy — otherwise the evaluator boundary is defeated.
+
 ## Running a trial
 
 1. **Pick a run id and framework**, e.g. `autumn-p1-2026-07-12`. Create

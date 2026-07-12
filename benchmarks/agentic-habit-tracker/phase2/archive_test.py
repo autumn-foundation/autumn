@@ -161,8 +161,14 @@ def run():
     check("archived habit still has current_streak", "current_streak" in got)
     check("archived habit still has history array", isinstance(got.get("history"), list))
 
-    # archive unknown id -> 404
-    r = request("POST", "/api/habits/999999999/archive")
+    # archive unknown id -> 404. Use a real returned-ID shape: create a
+    # throwaway habit, capture its id, DELETE it, then archive the now-deleted
+    # id. SPEC allows opaque string/UUID ids, so a hard-coded numeric sentinel
+    # could be rejected as a malformed route param (400) before the not-found
+    # lookup happens.
+    _, deleted_id = new_habit("throwaway-404")
+    request("DELETE", f"/api/habits/{deleted_id}")
+    r = request("POST", f"/api/habits/{deleted_id}/archive")
     check("POST archive unknown id -> 404", r.status == 404, f"got {r.status}")
 
     # regression: a second, non-archived habit still shows up in the default list

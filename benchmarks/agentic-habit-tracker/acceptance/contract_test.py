@@ -135,8 +135,14 @@ def run():
     check("GET single has current_streak", "current_streak" in got)
     check("GET single has history array", isinstance(got.get("history"), list))
 
-    # unknown id -> 404
-    r = request("GET", "/api/habits/999999999")
+    # unknown id -> 404. Use a real returned-ID shape: create a throwaway habit,
+    # capture its id, DELETE it, then look up the now-deleted id. SPEC allows
+    # opaque string/UUID ids, so a hard-coded numeric sentinel could be rejected
+    # as a malformed route param (400) before any not-found lookup happens.
+    r = request("POST", "/api/habits", {"name": "throwaway-404"})
+    deleted_id = r.json().get("id") if r.status == 201 else None
+    request("DELETE", f"/api/habits/{deleted_id}")
+    r = request("GET", f"/api/habits/{deleted_id}")
     check("GET unknown id -> 404", r.status == 404, f"got {r.status}")
 
     # update
@@ -162,8 +168,8 @@ def run():
     r = request("POST", f"/api/habits/{hid}/complete", {"date": "2026-13-40"})
     check("POST invalid date -> 4xx", r.status in (400, 422), f"got {r.status}")
 
-    # complete on unknown habit -> 404
-    r = request("POST", "/api/habits/999999999/complete", {})
+    # complete on unknown habit -> 404 (reuse the deleted real-shaped id above)
+    r = request("POST", f"/api/habits/{deleted_id}/complete", {})
     check("POST complete unknown habit -> 404", r.status == 404, f"got {r.status}")
 
     # basic streak: 3 consecutive backdated days ending today
