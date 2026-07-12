@@ -1258,6 +1258,115 @@ mod tests {
     }
 
     #[test]
+    fn generated_build_rs_reports_unknown_dirty_as_absent_not_false() {
+        // Codex P2 / issue #1676 regression: a container build supplies
+        // `AUTUMN_BUILD_GIT_SHA` but leaves `AUTUMN_BUILD_GIT_DIRTY` blank, and
+        // the Dockerfile excludes `/.git` so `git status` cannot run. The dirty
+        // state is then genuinely UNKNOWN and must be reported as absent/null on
+        // `/actuator/info`, NOT collapsed to a misleading `false`.
+        //
+        // Prove it end-to-end at the producer: compile the generated `build.rs`
+        // (which is verbatim Rust, no placeholders) and run its provenance
+        // emitter under a controlled environment. Env is passed to the child
+        // process (never mutated in-process), so this is isolated from other
+        // concurrently running tests.
+        let tmp = TempDir::new().unwrap();
+        generate("dirty-unknown-check", tmp.path()).unwrap();
+        let project = tmp.path().join("dirty-unknown-check");
+        let build_rs = project.join("build.rs");
+
+        // Compile the generated build.rs to a standalone binary. `--cap-lints
+        // allow` keeps a stray warning from failing under a strict RUSTFLAGS,
+        // and RUSTFLAGS is cleared for the same reason.
+        let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
+        let bin = project.join("provenance_probe");
+        let compile = std::process::Command::new(&rustc)
+            .arg(&build_rs)
+            .arg("--edition")
+            .arg("2021")
+            .arg("--cap-lints")
+            .arg("allow")
+            .arg("-o")
+            .arg(&bin)
+            .env_remove("RUSTFLAGS")
+            .output()
+            .expect("failed to spawn rustc");
+        assert!(
+            compile.status.success(),
+            "generated build.rs failed to compile:\n{}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+
+        // Run the emitter with a cleared environment (so `PATH` is unset and no
+        // `git` binary is reachable → git is genuinely unavailable), plus only
+        // the provenance env vars under test. Returns the emitted stdout.
+        let run = |vars: &[(&str, &str)]| -> String {
+            let mut cmd = std::process::Command::new(&bin);
+            cmd.current_dir(&project).env_clear();
+            for (k, v) in vars {
+                cmd.env(k, v);
+            }
+            let out = cmd.output().expect("failed to run provenance probe");
+            assert!(
+                out.status.success(),
+                "provenance probe exited non-zero:\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8(out.stdout).unwrap()
+        };
+
+        let has_dirty = |stdout: &str, value: &str| {
+            stdout
+                .lines()
+                .any(|l| l == format!("cargo:rustc-env=AUTUMN_BUILD_GIT_DIRTY={value}"))
+        };
+        let emits_any_dirty = |stdout: &str| {
+            stdout
+                .lines()
+                .any(|l| l.starts_with("cargo:rustc-env=AUTUMN_BUILD_GIT_DIRTY="))
+        };
+
+        // 1. SHA passthrough, dirty blank, no git → dirty is UNKNOWN → the var
+        //    is omitted entirely (consumer renders `git.dirty` as null).
+        let unknown = run(&[
+            (
+                "AUTUMN_BUILD_GIT_SHA",
+                "0123456789abcdef0123456789abcdef01234567",
+            ),
+            ("AUTUMN_BUILD_GIT_DIRTY", ""),
+        ]);
+        assert!(
+            unknown.lines().any(|l| l
+                == "cargo:rustc-env=AUTUMN_BUILD_GIT_SHA=0123456789abcdef0123456789abcdef01234567"),
+            "SHA passthrough should still be emitted:\n{unknown}"
+        );
+        assert!(
+            !emits_any_dirty(&unknown),
+            "unknown dirty state must NOT emit AUTUMN_BUILD_GIT_DIRTY (would render as `false`):\n{unknown}"
+        );
+
+        // 2. Explicit dirty=true round-trips even with no git.
+        let dirty_true = run(&[
+            ("AUTUMN_BUILD_GIT_SHA", "abc123"),
+            ("AUTUMN_BUILD_GIT_DIRTY", "true"),
+        ]);
+        assert!(
+            has_dirty(&dirty_true, "true"),
+            "explicit dirty=true must round-trip:\n{dirty_true}"
+        );
+
+        // 3. Explicit dirty=false round-trips (a genuinely clean, known build).
+        let dirty_false = run(&[
+            ("AUTUMN_BUILD_GIT_SHA", "abc123"),
+            ("AUTUMN_BUILD_GIT_DIRTY", "false"),
+        ]);
+        assert!(
+            has_dirty(&dirty_false, "false"),
+            "explicit dirty=false must round-trip:\n{dirty_false}"
+        );
+    }
+
+    #[test]
     fn no_unsubstituted_placeholders() {
         let tmp = TempDir::new().unwrap();
         generate("placeholder-check", tmp.path()).unwrap();
