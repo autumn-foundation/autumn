@@ -3347,7 +3347,8 @@ fn run_generate_command(cmd: GenerateCommands, mode: ApplyMode) {
             dry_run,
             force,
         } => {
-            let plan = generate::policy::plan_policy(&resolve_cwd(), &name);
+            let plan =
+                generate::policy::plan_policy(&resolve_cwd(), &name, mode == ApplyMode::Destroy);
             apply_plan(plan, generate::Flags { dry_run, force }, mode);
         }
         GenerateCommands::Channel {

@@ -1758,34 +1758,72 @@ pub fn remove_jobs_registration_from_app(existing: &str) -> String {
 // ── Policy registration helpers (issue #1125) ────────────────────────────
 
 /// The `.policy::<...>(...)` builder call registering `{pascal}`'s policy.
-fn policy_registration_call(pascal: &str, snake: &str) -> String {
-    format!(
-        ".policy::<crate::models::{snake}::{pascal}, _>(crate::policies::{snake}::{pascal}Policy::default())"
-    )
+///
+/// `model_path` is the fully-qualified path to the model type — either
+/// `crate::models::<snake>::<Pascal>` (per-resource `src/models/<snake>.rs`) or
+/// `crate::models::<Pascal>` (single-file `src/models.rs`). The `crate::policies`
+/// path is layout-independent (policies always live in `src/policies/<snake>.rs`).
+fn policy_registration_call(model_path: &str, pascal: &str, snake: &str) -> String {
+    format!(".policy::<{model_path}, _>(crate::policies::{snake}::{pascal}Policy::default())")
 }
 
 /// The `.scope::<...>(...)` builder call registering `{pascal}`'s scope.
-fn scope_registration_call(pascal: &str, snake: &str) -> String {
-    format!(
-        ".scope::<crate::models::{snake}::{pascal}, _>(crate::policies::{snake}::{pascal}Scope::default())"
-    )
+fn scope_registration_call(model_path: &str, pascal: &str, snake: &str) -> String {
+    format!(".scope::<{model_path}, _>(crate::policies::{snake}::{pascal}Scope::default())")
+}
+
+/// Whether `line` is the `.policy::<...>(...)` registration for `{pascal}`,
+/// keyed on the layout-independent `crate::policies::<snake>::<Pascal>Policy`
+/// suffix so it matches regardless of which model-file layout produced the
+/// (variable) `crate::models::…` type argument — important for destroy, which
+/// may run after the model (and thus the knowledge of its layout) is gone.
+fn is_policy_registration_line(line: &str, pascal: &str, snake: &str) -> bool {
+    let trimmed = line.trim();
+    trimmed.starts_with(".policy::<")
+        && trimmed.ends_with(&format!(
+            "(crate::policies::{snake}::{pascal}Policy::default())"
+        ))
+}
+
+/// Whether `line` is the `.scope::<...>(...)` registration for `{pascal}` — see
+/// [`is_policy_registration_line`].
+fn is_scope_registration_line(line: &str, pascal: &str, snake: &str) -> bool {
+    let trimmed = line.trim();
+    trimmed.starts_with(".scope::<")
+        && trimmed.ends_with(&format!(
+            "(crate::policies::{snake}::{pascal}Scope::default())"
+        ))
 }
 
 /// Inject `.policy::<...>(...)` and `.scope::<...>(...)` for `{pascal}` into
 /// the `AppBuilder` chain in `src/main.rs`, immediately before the `.run()`
-/// line (issue #1125).
+/// line (issue #1125). `model_path` is the fully-qualified model type path,
+/// honoring the project's model-file layout (see [`policy_registration_call`]).
 ///
 /// Idempotent: if `{pascal}`'s policy registration is already present the
 /// function returns `existing` unchanged. Returns `existing` unchanged when no
 /// `.run()` line can be found.
 #[must_use]
-pub fn add_policy_registration_to_app(existing: &str, pascal: &str, snake: &str) -> String {
-    let policy_call = policy_registration_call(pascal, snake);
-    if existing.contains(&policy_call) {
+pub fn add_policy_registration_to_app(
+    existing: &str,
+    model_path: &str,
+    pascal: &str,
+    snake: &str,
+) -> String {
+    if existing
+        .lines()
+        .any(|l| is_policy_registration_line(l, pascal, snake))
+    {
         return existing.to_owned();
     }
-    let with_policy = insert_before_run_call(existing, &policy_call);
-    insert_before_run_call(&with_policy, &scope_registration_call(pascal, snake))
+    let with_policy = insert_before_run_call(
+        existing,
+        &policy_registration_call(model_path, pascal, snake),
+    );
+    insert_before_run_call(
+        &with_policy,
+        &scope_registration_call(model_path, pascal, snake),
+    )
 }
 
 /// Inverse of [`add_policy_registration_to_app`] (`autumn destroy`, issue #1048).
@@ -1798,11 +1836,9 @@ pub fn add_policy_registration_to_app(existing: &str, pascal: &str, snake: &str)
 /// directory check is needed.
 #[must_use]
 pub fn remove_policy_registration_from_app(existing: &str, pascal: &str, snake: &str) -> String {
-    let policy_call = policy_registration_call(pascal, snake);
-    let scope_call = scope_registration_call(pascal, snake);
     let is_reg = |l: &str| {
-        let t = l.trim();
-        t == policy_call || t == scope_call
+        is_policy_registration_line(l, pascal, snake)
+            || is_scope_registration_line(l, pascal, snake)
     };
     if !existing.lines().any(is_reg) {
         return existing.to_owned();

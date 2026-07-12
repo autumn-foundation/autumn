@@ -408,7 +408,15 @@ pub fn plan_scaffold_with_options(
             .filter(|f| f.kind.is_reference() && f.reference_table().as_deref() == Some("users"))
             .map(|f| f.name.clone())
             .collect();
-        super::policy::detect_owner_column(&columns, &user_refs)
+        super::policy::detect_owner_column(&columns, &user_refs).map(|name| {
+            // A nullable owner column (e.g. `user:references?`) is `Option<i64>`
+            // and must be compared option-to-option in the generated policy.
+            let nullable = fields
+                .iter()
+                .find(|f| f.name == name)
+                .is_some_and(|f| f.nullable);
+            super::policy::OwnerColumn { name, nullable }
+        })
     };
     // Inline authorize/scope wiring is emitted only on the standard (non-live,
     // non-sharded) diesel path and only when an owner column exists: a
@@ -600,7 +608,7 @@ pub fn plan_scaffold_with_options(
                 metadata.validations(),
                 &missing_reference_targets,
                 authorize_wiring,
-                owner_column.as_deref(),
+                owner_column.as_ref().map(|o| o.name.as_str()),
             ),
         );
         let route_mod_path = routes_dir.join("mod.rs");
@@ -626,7 +634,10 @@ pub fn plan_scaffold_with_options(
             &pascal_name,
             &snake_name,
             &plural,
-            owner_column.as_deref(),
+            owner_column.as_ref(),
+            // Scaffold always writes the per-resource `src/models/<snake>.rs`
+            // layout, so the model type is always `crate::models::<snake>::<Pascal>`.
+            &format!("crate::models::{snake_name}::{pascal_name}"),
         );
     }
 
@@ -681,7 +692,12 @@ pub fn plan_scaffold_with_options(
     // Fold the policy/scope builder registration into the same `updated` content
     // (issue #1125) so main.rs gets a single `Modify` action.
     let updated = if policy_on {
-        super::schema_edit::add_policy_registration_to_app(&updated, &pascal_name, &snake_name)
+        super::schema_edit::add_policy_registration_to_app(
+            &updated,
+            &format!("crate::models::{snake_name}::{pascal_name}"),
+            &pascal_name,
+            &snake_name,
+        )
     } else {
         updated
     };

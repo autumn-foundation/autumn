@@ -1728,6 +1728,60 @@ fn generated_policy_scaffold_cargo_checks() {
     );
 }
 
+/// Companion to [`generated_policy_scaffold_cargo_checks`] proving the
+/// *nullable* owner-column path compiles (PR #1831 review): a `user:references?`
+/// owner is `Option<i64>`, so the generated `can_update`/`can_delete` must
+/// compare it option-to-option (`ctx.user_id_i64() == post.user_id`) rather
+/// than wrapping it in `Some(...)` (which would compare `Option<i64>` to
+/// `Option<Option<i64>>` and fail to build), and the scope must still `.eq()`
+/// the nullable diesel column.
+///
+/// Ignored by default; run with `cargo test -p autumn-cli -- --ignored`.
+#[test]
+#[ignore = "slow: cargo-checks a fresh project — run with `cargo test -p autumn-cli -- --ignored`"]
+fn generated_nullable_owner_policy_scaffold_cargo_checks() {
+    let (_tmp, project) = fresh_project("policy-nullable-owner-build");
+    patch_generated_cargo_toml(&project);
+
+    run_autumn(
+        &project,
+        &[
+            "generate",
+            "scaffold",
+            "Note",
+            "title:String",
+            "body:Text",
+            "user:references?",
+        ],
+    );
+
+    let policy = fs::read_to_string(project.join("src/policies/note.rs")).unwrap();
+    assert!(
+        policy.contains("ctx.user_id_i64() == note.user_id"),
+        "nullable owner must compare option-to-option:\n{policy}"
+    );
+    assert!(
+        !policy.contains("Some(note.user_id)"),
+        "nullable owner must not wrap in Some(...):\n{policy}"
+    );
+    assert!(
+        policy.contains("notes::user_id.eq(owner_id)"),
+        "scope must filter on the nullable owner column:\n{policy}"
+    );
+
+    let check = Command::new("cargo")
+        .args(["check", "--tests"])
+        .current_dir(&project)
+        .output()
+        .unwrap();
+    assert!(
+        check.status.success(),
+        "cargo check on generated nullable-owner policy scaffold failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&check.stdout),
+        String::from_utf8_lossy(&check.stderr),
+    );
+}
+
 /// Slow end-to-end check (issue #1124): scaffold a model with a `--validate`
 /// rule and prove the generated changeset round-trip actually compiles *and*
 /// runs — a rejected submission gets 422 with the other field preserved and

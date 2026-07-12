@@ -28,11 +28,22 @@ use super::{GenerateError, ensure_project_root, read_or_empty};
 
 /// Compute the file actions for `autumn generate policy`.
 ///
+/// `for_destroy` selects the caller's [`super::ApplyMode`]: in generate mode the
+/// model-existence guard (AC5) fires when the target model is missing, but in
+/// destroy mode it is skipped so `autumn destroy policy` can still tear the
+/// policy down after the model was already destroyed (the plan's `revert` only
+/// removes files/registrations and never consults the model). The two modes
+/// otherwise build the identical plan.
+///
 /// # Errors
-/// Returns [`GenerateError::Config`] when no matching model exists (AC5),
-/// [`GenerateError::NotInProject`] outside an Autumn project, and name- or
-/// I/O-related errors otherwise.
-pub fn plan_policy(project_root: &Path, name: &str) -> Result<Plan, GenerateError> {
+/// Returns [`GenerateError::Config`] when no matching model exists (AC5,
+/// generate mode only), [`GenerateError::NotInProject`] outside an Autumn
+/// project, and name- or I/O-related errors otherwise.
+pub fn plan_policy(
+    project_root: &Path,
+    name: &str,
+    for_destroy: bool,
+) -> Result<Plan, GenerateError> {
     ensure_project_root(project_root)?;
     validate_resource_name(name)?;
 
@@ -40,10 +51,13 @@ pub fn plan_policy(project_root: &Path, name: &str) -> Result<Plan, GenerateErro
     let pascal_name = pascal(name);
     let plural = pluralize(&snake_name);
 
-    // Model guard (AC5): the policy references `crate::models::<snake>::<Pascal>`,
-    // so the model must already exist. Because all writes happen in
-    // `Plan::execute`, returning here leaves no half-written files.
-    if !model_file_exists(project_root, &plural, &snake_name) {
+    // Model guard (AC5): the policy references the model type, so the model must
+    // already exist — but only in generate mode. On destroy the model may
+    // legitimately be gone already; erroring here would strand the policy file,
+    // its mod entry, and the app registrations before `Plan::revert` runs.
+    // Because all writes happen in `Plan::execute`, returning here leaves no
+    // half-written files.
+    if !for_destroy && !model_file_exists(project_root, &plural, &snake_name) {
         return Err(GenerateError::Config(format!(
             "no model '{pascal_name}' found — run `autumn generate model {pascal_name}` first \
              (expected src/models/{snake_name}.rs)"
@@ -51,6 +65,7 @@ pub fn plan_policy(project_root: &Path, name: &str) -> Result<Plan, GenerateErro
     }
 
     let owner = detect_owner_column_from_model(project_root, &snake_name);
+    let model_path = model_type_path(project_root, &snake_name, &pascal_name);
 
     let mut plan = Plan::new(project_root);
     push_policy_files(
@@ -59,7 +74,8 @@ pub fn plan_policy(project_root: &Path, name: &str) -> Result<Plan, GenerateErro
         &pascal_name,
         &snake_name,
         &plural,
-        owner.as_deref(),
+        owner.as_ref(),
+        &model_path,
     );
 
     // ── src/main.rs: mod policies; + .policy(...)/.scope(...) ──────────────
@@ -70,7 +86,8 @@ pub fn plan_policy(project_root: &Path, name: &str) -> Result<Plan, GenerateErro
             format!("{}: {e}", main_path.display()),
         ))
     })?;
-    let updated_main = wire_policy_into_main(&main_existing, &pascal_name, &snake_name);
+    let updated_main =
+        wire_policy_into_main(&main_existing, &pascal_name, &snake_name, &model_path);
     plan.modify(main_path.clone(), updated_main);
     plan.push_revert(Revert::PolicyRegistration {
         path: main_path,
@@ -95,14 +112,15 @@ pub(super) fn push_policy_files(
     pascal_name: &str,
     snake_name: &str,
     plural: &str,
-    owner: Option<&str>,
+    owner: Option<&OwnerColumn>,
+    model_path: &str,
 ) {
     plan.create(
         project_root
             .join("src")
             .join("policies")
             .join(format!("{snake_name}.rs")),
-        render_policy_file(pascal_name, snake_name, plural, owner),
+        render_policy_file(pascal_name, snake_name, plural, owner, model_path),
     );
 
     let mod_path = project_root.join("src").join("policies").join("mod.rs");
@@ -119,9 +137,46 @@ pub(super) fn push_policy_files(
 /// Apply the `mod policies;` declaration and the `.policy(...)`/`.scope(...)`
 /// builder registration for `{pascal}` to a `src/main.rs` source string,
 /// returning the updated content. Idempotent — re-running never duplicates.
-pub(super) fn wire_policy_into_main(main_src: &str, pascal_name: &str, snake_name: &str) -> String {
+pub(super) fn wire_policy_into_main(
+    main_src: &str,
+    pascal_name: &str,
+    snake_name: &str,
+    model_path: &str,
+) -> String {
     let with_mod = update_main_rs(main_src, &["policies"], &[]);
-    add_policy_registration_to_app(&with_mod, pascal_name, snake_name)
+    add_policy_registration_to_app(&with_mod, model_path, pascal_name, snake_name)
+}
+
+/// A detected owner column: its field name plus whether the model declares it
+/// nullable (`Option<i64>`). Nullability changes how `can_update`/`can_delete`
+/// compare the current user id — see [`render_policy_file`].
+#[derive(Debug, Clone)]
+pub(super) struct OwnerColumn {
+    pub name: String,
+    pub nullable: bool,
+}
+
+/// The fully-qualified path to the model type, honoring both model-file
+/// layouts (mirroring `src/models.rs` vs `src/models/<snake>.rs`, exactly as
+/// the reddit-clone example's `use crate::models::Post;` shows for the
+/// single-file case):
+/// - per-resource `src/models/<snake>.rs` → `crate::models::<snake>::<Pascal>`;
+/// - single-file `src/models.rs`        → `crate::models::<Pascal>`.
+///
+/// When neither exists (e.g. destroy after the model is gone) defaults to the
+/// per-resource path; the destroy path never renders the file and the
+/// registration removal is layout-independent, so the choice is immaterial there.
+fn model_type_path(project_root: &Path, snake_name: &str, pascal_name: &str) -> String {
+    let per_resource = project_root
+        .join("src")
+        .join("models")
+        .join(format!("{snake_name}.rs"));
+    let single_file = project_root.join("src").join("models.rs");
+    if !per_resource.exists() && single_file.exists() {
+        format!("crate::models::{pascal_name}")
+    } else {
+        format!("crate::models::{snake_name}::{pascal_name}")
+    }
 }
 
 /// The recognized owner-column names, in priority order (AC3).
@@ -151,16 +206,25 @@ pub(super) fn detect_owner_column(
 /// [`detect_owner_column`]) is unavailable here — it needs the field-DSL that
 /// only `generate scaffold` carries — so this considers the three canonical
 /// owner-column names only.
-fn detect_owner_column_from_model(project_root: &Path, snake_name: &str) -> Option<String> {
-    let columns = model_column_names(project_root, snake_name);
-    detect_owner_column(&columns, &[])
+fn detect_owner_column_from_model(project_root: &Path, snake_name: &str) -> Option<OwnerColumn> {
+    let fields = model_fields(project_root, snake_name);
+    let columns: Vec<String> = fields.iter().map(|(name, _)| name.clone()).collect();
+    let name = detect_owner_column(&columns, &[])?;
+    // A nullable owner column (`author_id: Option<i64>`) must be compared
+    // option-to-option; assume non-nullable when the field can't be found.
+    let nullable = fields
+        .iter()
+        .find(|(field_name, _)| *field_name == name)
+        .is_some_and(|(_, nullable)| *nullable);
+    Some(OwnerColumn { name, nullable })
 }
 
-/// The field (column) names of resource `snake_name`'s `#[model]` struct, in
+/// The field (column) names of resource `snake_name`'s `#[model]` struct, each
+/// paired with whether its declared type is `Option<…>` (nullable), in
 /// declaration order. Parses with `syn` so grouped attributes, doc comments,
 /// and a multi-model `src/models.rs` layout don't defeat it. Returns an empty
 /// vec when the model can't be located or parsed.
-fn model_column_names(project_root: &Path, snake_name: &str) -> Vec<String> {
+fn model_fields(project_root: &Path, snake_name: &str) -> Vec<(String, bool)> {
     let pascal_name = pascal(snake_name);
     let per_resource = project_root
         .join("src")
@@ -191,8 +255,26 @@ fn model_column_names(project_root: &Path, snake_name: &str) -> Vec<String> {
     fields
         .named
         .iter()
-        .filter_map(|f| f.ident.as_ref().map(ToString::to_string))
+        .filter_map(|f| {
+            f.ident
+                .as_ref()
+                .map(|ident| (ident.to_string(), type_is_option(&f.ty)))
+        })
         .collect()
+}
+
+/// Whether a `syn::Type` is spelled `Option<…>` (nullable column). Matches the
+/// last path segment so both bare `Option<i64>` and `std::option::Option<i64>`
+/// count.
+fn type_is_option(ty: &syn::Type) -> bool {
+    let syn::Type::Path(type_path) = ty else {
+        return false;
+    };
+    type_path
+        .path
+        .segments
+        .last()
+        .is_some_and(|seg| seg.ident == "Option")
 }
 
 /// Render `src/policies/<snake>.rs`.
@@ -201,7 +283,8 @@ fn render_policy_file(
     pascal_name: &str,
     snake_name: &str,
     plural: &str,
-    owner: Option<&str>,
+    owner: Option<&OwnerColumn>,
+    model_path: &str,
 ) -> String {
     let module_doc = if owner.is_some() {
         format!(
@@ -224,17 +307,29 @@ fn render_policy_file(
     };
 
     let (update_delete_bodies, scope_body, scope_ctx_param) = match owner {
-        Some(col) => (
-            format!(
-                "    fn can_update<'a>(&'a self, ctx: &'a PolicyContext, {snake_name}: &'a {pascal_name}) -> BoxFuture<'a, bool> {{\n        \
-                 Box::pin(async move {{ ctx.has_role(\"admin\") || ctx.user_id_i64() == Some({snake_name}.{col}) }})\n    \
+        Some(owner) => {
+            let col = &owner.name;
+            // A nullable owner column is already `Option<i64>`, so compare it
+            // directly against `user_id_i64()` (also `Option<i64>`); wrapping it
+            // in `Some(...)` would compare `Option<i64>` to `Option<Option<i64>>`
+            // and fail to compile. A non-nullable owner is a plain `i64` and
+            // needs the `Some(...)` wrap.
+            let owner_match = if owner.nullable {
+                format!("ctx.user_id_i64() == {snake_name}.{col}")
+            } else {
+                format!("ctx.user_id_i64() == Some({snake_name}.{col})")
+            };
+            (
+                format!(
+                    "    fn can_update<'a>(&'a self, ctx: &'a PolicyContext, {snake_name}: &'a {pascal_name}) -> BoxFuture<'a, bool> {{\n        \
+                 Box::pin(async move {{ ctx.has_role(\"admin\") || {owner_match} }})\n    \
                  }}\n\n    \
                  fn can_delete<'a>(&'a self, ctx: &'a PolicyContext, {snake_name}: &'a {pascal_name}) -> BoxFuture<'a, bool> {{\n        \
-                 Box::pin(async move {{ ctx.has_role(\"admin\") || ctx.user_id_i64() == Some({snake_name}.{col}) }})\n    \
+                 Box::pin(async move {{ ctx.has_role(\"admin\") || {owner_match} }})\n    \
                  }}\n"
-            ),
-            format!(
-                "        Box::pin(async move {{\n            \
+                ),
+                format!(
+                    "        Box::pin(async move {{\n            \
                  let owner_id = ctx.user_id_i64().unwrap_or(-1);\n            \
                  Ok({plural}::table\n                \
                  .filter({plural}::{col}.eq(owner_id))\n                \
@@ -242,10 +337,11 @@ fn render_policy_file(
                  .load(conn)\n                \
                  .await?)\n        \
                  }})\n"
-            ),
-            // `ctx` is used by the owner filter.
-            "ctx",
-        ),
+                ),
+                // `ctx` is used by the owner filter.
+                "ctx",
+            )
+        }
         None => (
             format!(
                 "    fn can_update<'a>(&'a self, _ctx: &'a PolicyContext, _{snake_name}: &'a {pascal_name}) -> BoxFuture<'a, bool> {{\n        \
@@ -288,7 +384,7 @@ fn render_policy_file(
         "{module_doc}\
 use autumn_web::authorization::{{BoxFuture, Policy, PolicyContext, Scope}};
 {diesel_imports}\
-use crate::models::{snake_name}::{pascal_name};
+use {model_path};
 {schema_import}
 #[derive(Default)]
 pub struct {pascal_name}Policy;
@@ -363,6 +459,27 @@ async fn main() {
         tmp
     }
 
+    /// A project whose `Post` model lives in the single-file `src/models.rs`
+    /// layout (`crate::models::Post`), with no `src/models/` directory.
+    fn project_with_single_file_model(fields: &str) -> TempDir {
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[package]\nname=\"x\"\n\n[dependencies]\nautumn-web = \"0.6\"\n",
+        )
+        .unwrap();
+        fs::create_dir_all(tmp.path().join("src")).unwrap();
+        fs::write(tmp.path().join("src/main.rs"), default_main()).unwrap();
+        fs::write(
+            tmp.path().join("src/models.rs"),
+            format!(
+                "use autumn_web::prelude::*;\nuse crate::schema::posts;\n\n#[model]\npub struct Post {{\n    #[id]\n    pub id: i64,\n{fields}}}\n"
+            ),
+        )
+        .unwrap();
+        tmp
+    }
+
     #[test]
     fn model_missing_returns_named_error_and_writes_nothing() {
         let tmp = TempDir::new().unwrap();
@@ -370,7 +487,7 @@ async fn main() {
         fs::create_dir_all(tmp.path().join("src")).unwrap();
         fs::write(tmp.path().join("src/main.rs"), default_main()).unwrap();
 
-        let err = plan_policy(tmp.path(), "Post").unwrap_err();
+        let err = plan_policy(tmp.path(), "Post", false).unwrap_err();
         match err {
             GenerateError::Config(msg) => {
                 assert!(msg.contains("no model 'Post' found"), "{msg}");
@@ -385,7 +502,7 @@ async fn main() {
     #[test]
     fn emits_policy_and_scope_structs() {
         let tmp = project_with_model("    pub user_id: i64,\n    pub title: String,\n");
-        plan_policy(tmp.path(), "Post")
+        plan_policy(tmp.path(), "Post", false)
             .unwrap()
             .execute(Flags::default())
             .unwrap();
@@ -401,7 +518,7 @@ async fn main() {
     #[test]
     fn user_id_owner_generates_ownership_check() {
         let tmp = project_with_model("    pub user_id: i64,\n    pub title: String,\n");
-        plan_policy(tmp.path(), "Post")
+        plan_policy(tmp.path(), "Post", false)
             .unwrap()
             .execute(Flags::default())
             .unwrap();
@@ -420,7 +537,7 @@ async fn main() {
     #[test]
     fn author_id_owner_generates_ownership_check() {
         let tmp = project_with_model("    pub author_id: i64,\n    pub body: String,\n");
-        plan_policy(tmp.path(), "Post")
+        plan_policy(tmp.path(), "Post", false)
             .unwrap()
             .execute(Flags::default())
             .unwrap();
@@ -429,9 +546,45 @@ async fn main() {
     }
 
     #[test]
+    fn nullable_owner_compares_option_to_option_without_some_wrap() {
+        // A nullable owner column is `Option<i64>`; wrapping it in `Some(...)`
+        // would compare `Option<i64>` to `Option<Option<i64>>` and not compile.
+        let tmp = project_with_model("    pub author_id: Option<i64>,\n    pub body: String,\n");
+        plan_policy(tmp.path(), "Post", false)
+            .unwrap()
+            .execute(Flags::default())
+            .unwrap();
+        let src = fs::read_to_string(tmp.path().join("src/policies/post.rs")).unwrap();
+        assert!(
+            src.contains("ctx.has_role(\"admin\") || ctx.user_id_i64() == post.author_id"),
+            "nullable owner must compare option-to-option: {src}"
+        );
+        assert!(
+            !src.contains("Some(post.author_id)"),
+            "nullable owner must not wrap in Some(...): {src}"
+        );
+        // The scope filter still `.eq(owner_id)`s the (nullable) diesel column.
+        assert!(src.contains("posts::author_id.eq(owner_id)"), "{src}");
+    }
+
+    #[test]
+    fn non_nullable_owner_keeps_some_wrap() {
+        let tmp = project_with_model("    pub user_id: i64,\n");
+        plan_policy(tmp.path(), "Post", false)
+            .unwrap()
+            .execute(Flags::default())
+            .unwrap();
+        let src = fs::read_to_string(tmp.path().join("src/policies/post.rs")).unwrap();
+        assert!(
+            src.contains("ctx.user_id_i64() == Some(post.user_id)"),
+            "non-nullable owner must keep the Some(...) wrap: {src}"
+        );
+    }
+
+    #[test]
     fn no_owner_column_default_denies_with_todo() {
         let tmp = project_with_model("    pub title: String,\n    pub body: String,\n");
-        plan_policy(tmp.path(), "Post")
+        plan_policy(tmp.path(), "Post", false)
             .unwrap()
             .execute(Flags::default())
             .unwrap();
@@ -450,7 +603,7 @@ async fn main() {
     #[test]
     fn adds_mod_entry_and_builder_registration() {
         let tmp = project_with_model("    pub user_id: i64,\n");
-        plan_policy(tmp.path(), "Post")
+        plan_policy(tmp.path(), "Post", false)
             .unwrap()
             .execute(Flags::default())
             .unwrap();
@@ -475,14 +628,50 @@ async fn main() {
     }
 
     #[test]
+    fn single_file_models_layout_imports_and_registers_crate_models_pascal() {
+        // A `Post` declared in single-file `src/models.rs` lives at
+        // `crate::models::Post` — the import and registrations must NOT point at
+        // a non-existent `crate::models::post` module.
+        let tmp = project_with_single_file_model("    pub user_id: i64,\n");
+        plan_policy(tmp.path(), "Post", false)
+            .unwrap()
+            .execute(Flags::default())
+            .unwrap();
+
+        let policy = fs::read_to_string(tmp.path().join("src/policies/post.rs")).unwrap();
+        assert!(
+            policy.contains("use crate::models::Post;"),
+            "single-file layout must import crate::models::Post: {policy}"
+        );
+        assert!(
+            !policy.contains("crate::models::post::"),
+            "single-file layout must not reference crate::models::post: {policy}"
+        );
+
+        let main = fs::read_to_string(tmp.path().join("src/main.rs")).unwrap();
+        assert!(
+            main.contains(
+                ".policy::<crate::models::Post, _>(crate::policies::post::PostPolicy::default())"
+            ),
+            "single-file layout policy registration must use crate::models::Post: {main}"
+        );
+        assert!(
+            main.contains(
+                ".scope::<crate::models::Post, _>(crate::policies::post::PostScope::default())"
+            ),
+            "single-file layout scope registration must use crate::models::Post: {main}"
+        );
+    }
+
+    #[test]
     fn builder_registration_inserted_exactly_once_when_run_twice() {
         let tmp = project_with_model("    pub user_id: i64,\n");
-        plan_policy(tmp.path(), "Post")
+        plan_policy(tmp.path(), "Post", false)
             .unwrap()
             .execute(Flags::default())
             .unwrap();
         // Second run with --force (policy file already exists).
-        plan_policy(tmp.path(), "Post")
+        plan_policy(tmp.path(), "Post", false)
             .unwrap()
             .execute(Flags {
                 force: true,
@@ -513,11 +702,11 @@ async fn main() {
         let main_path = tmp.path().join("src/main.rs");
         let original_main = fs::read_to_string(&main_path).unwrap();
 
-        plan_policy(tmp.path(), "Post")
+        plan_policy(tmp.path(), "Post", false)
             .unwrap()
             .execute(Flags::default())
             .unwrap();
-        plan_policy(tmp.path(), "Post")
+        plan_policy(tmp.path(), "Post", false)
             .unwrap()
             .revert(Flags::default())
             .unwrap();
@@ -525,6 +714,47 @@ async fn main() {
         assert!(!tmp.path().join("src/policies/post.rs").exists());
         assert!(!tmp.path().join("src/policies").exists());
         assert_eq!(fs::read_to_string(&main_path).unwrap(), original_main);
+    }
+
+    #[test]
+    fn destroy_succeeds_after_model_already_deleted() {
+        // `autumn destroy model Post` then `autumn destroy policy Post`: the
+        // model file is gone by the time the policy is destroyed. The destroy
+        // planner must skip the model guard (generate mode still errors) and,
+        // with --force, revert every artifact. As with `plan_admin_destroy_fallback`,
+        // the policy file's content is unverifiable once the model is gone, so
+        // --force is required to remove it.
+        let tmp = project_with_model("    pub user_id: i64,\n");
+        let main_path = tmp.path().join("src/main.rs");
+        let original_main = fs::read_to_string(&main_path).unwrap();
+
+        plan_policy(tmp.path(), "Post", false)
+            .unwrap()
+            .execute(Flags::default())
+            .unwrap();
+
+        // Simulate `destroy model Post` having already run.
+        fs::remove_file(tmp.path().join("src/models/post.rs")).unwrap();
+
+        // Generate mode still errors on the missing model; destroy mode must not.
+        assert!(plan_policy(tmp.path(), "Post", false).is_err());
+        let plan =
+            plan_policy(tmp.path(), "Post", true).expect("destroy plan builds without the model");
+        plan.revert(Flags {
+            dry_run: false,
+            force: true,
+        })
+        .unwrap();
+
+        assert!(!tmp.path().join("src/policies/post.rs").exists());
+        assert!(!tmp.path().join("src/policies").exists());
+        let main = fs::read_to_string(&main_path).unwrap();
+        assert!(
+            !main.contains(".policy::<") && !main.contains(".scope::<"),
+            "destroy must remove the policy/scope registrations: {main}"
+        );
+        assert!(!main.contains("mod policies;"), "{main}");
+        assert_eq!(main, original_main);
     }
 
     #[test]
@@ -551,7 +781,7 @@ async fn main() {
     #[test]
     fn plan_errors_when_not_in_project() {
         let tmp = TempDir::new().unwrap();
-        let err = plan_policy(tmp.path(), "Post").unwrap_err();
+        let err = plan_policy(tmp.path(), "Post", false).unwrap_err();
         assert!(matches!(err, GenerateError::NotInProject));
     }
 }
