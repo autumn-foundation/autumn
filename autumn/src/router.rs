@@ -3406,27 +3406,48 @@ pub fn try_build_router_with_static_inner(
                     if let Some(file_path) = static_layer.resolve(normalized)
                         && let Ok(contents) = tokio::fs::read(&file_path).await
                     {
-                        // Derive the Content-Type from the served file's
+                        // Derive the Content-Type from the request route's
                         // extension rather than hard-coding text/html. The
                         // response compression layer (applied OUTSIDE this
                         // middleware) negotiates gzip/brotli by content type, so
                         // an accurate MIME type is what lets compressible SSG
                         // pages (HTML/CSS/JS/JSON/XML/text) be encoded while
                         // binary manifest assets (images, fonts, octet-stream)
-                        // are left untouched. Manifest page routes point at
-                        // `*.html`, so the common case still resolves to
-                        // text/html; charset=utf-8 exactly as before.
+                        // are left untouched.
                         //
-                        // Match on the file name alone (not the full path) so
-                        // extension detection is unaffected by directory
-                        // components — including dotted ancestor directories or
-                        // platform-specific path separators.
-                        let content_type = file_path
-                            .file_name()
-                            .and_then(|name| name.to_str())
-                            .map_or("application/octet-stream", |name| {
-                                crate::assets::content_type_for(name)
-                            });
+                        // The served file name is NOT a reliable MIME source for
+                        // generated routes: `static_gen::url_to_file_path` stores
+                        // every non-root route as `<route>/index.html`, so
+                        // `/robots.txt` -> `robots.txt/index.html` and
+                        // `/sitemap.xml` -> `sitemap.xml/index.html`. Reading the
+                        // extension off `index.html` would mislabel those as
+                        // text/html. The request route carries the true
+                        // extension, so when its final path segment has one, use
+                        // it. The URL path is always '/'-delimited, so inspecting
+                        // the last segment is unaffected by platform path
+                        // separators.
+                        //
+                        // Extensionless routes are real pages (`/about` ->
+                        // `about/index.html`): fall back to the served file name,
+                        // which resolves to text/html; charset=utf-8 exactly as
+                        // before. Hand-written manifests that map an
+                        // extensionless route directly at an extensioned file
+                        // (e.g. `/logo` -> `logo.png`) are likewise covered by
+                        // this fallback.
+                        let route_has_extension = normalized
+                            .rsplit('/')
+                            .next()
+                            .is_some_and(|segment| segment.contains('.'));
+                        let content_type = if route_has_extension {
+                            crate::assets::content_type_for(normalized)
+                        } else {
+                            file_path
+                                .file_name()
+                                .and_then(|name| name.to_str())
+                                .map_or("application/octet-stream", |name| {
+                                    crate::assets::content_type_for(name)
+                                })
+                        };
                         let body = if is_head {
                             axum::body::Body::empty()
                         } else {
@@ -7213,6 +7234,144 @@ enabled = true
                 .and_then(|v| v.to_str().ok()),
             Some("gzip"),
             "compressible JS asset must be gzip-compressed"
+        );
+    }
+
+    /// An extensionless generated page route (`/about` ->
+    /// `about/index.html`, the shape `static_gen::url_to_file_path` produces)
+    /// keeps its `text/html; charset=utf-8` type and is gzip-compressed. This
+    /// pins the fallback: routes without a file extension must NOT regress to
+    /// octet-stream just because the served file is `index.html`.
+    #[tokio::test]
+    async fn ssg_generated_html_page_keeps_text_html_and_is_compressed() {
+        let html = format!("<html><body>{}</body></html>", "About us. ".repeat(128));
+        let tmp = create_ssg_dist(&[("/about", "about/index.html", html.as_bytes())]);
+        let dist = tmp.path().join("dist");
+
+        let router = try_build_router_with_static(
+            Vec::new(),
+            &compression_enabled_config(),
+            test_state(),
+            Some(&dist),
+        )
+        .expect("router builds");
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/about")
+                    .header("accept-encoding", "gzip")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("text/html; charset=utf-8"),
+            "extensionless generated page must stay text/html, not octet-stream"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(http::header::CONTENT_ENCODING)
+                .and_then(|v| v.to_str().ok()),
+            Some("gzip"),
+            "generated HTML page must be gzip-compressed"
+        );
+    }
+
+    /// A generated `.txt` route (`/robots.txt` -> `robots.txt/index.html`) is
+    /// served as `text/plain; charset=utf-8` — derived from the request
+    /// route's extension, not the on-disk `index.html` file name — and is
+    /// gzip-compressed. Reading the MIME off the served file would mislabel it
+    /// as text/html.
+    #[tokio::test]
+    async fn ssg_generated_txt_route_is_text_plain_and_compressed() {
+        let body_text = format!("User-agent: *\nDisallow:\n{}", "# note\n".repeat(128));
+        let tmp =
+            create_ssg_dist(&[("/robots.txt", "robots.txt/index.html", body_text.as_bytes())]);
+        let dist = tmp.path().join("dist");
+
+        let router = try_build_router_with_static(
+            Vec::new(),
+            &compression_enabled_config(),
+            test_state(),
+            Some(&dist),
+        )
+        .expect("router builds");
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/robots.txt")
+                    .header("accept-encoding", "gzip")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("text/plain; charset=utf-8"),
+            "generated .txt route must be text/plain, derived from the route extension"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(http::header::CONTENT_ENCODING)
+                .and_then(|v| v.to_str().ok()),
+            Some("gzip"),
+            "compressible text/plain route must be gzip-compressed"
+        );
+    }
+
+    /// A generated `.xml` route (`/sitemap.xml` -> `sitemap.xml/index.html`) is
+    /// served as `application/xml`, derived from the request route's extension
+    /// rather than the served `index.html` file name.
+    #[tokio::test]
+    async fn ssg_generated_xml_route_is_xml_mime() {
+        let xml = format!(
+            "<?xml version=\"1.0\"?><urlset>{}</urlset>",
+            "<url><loc>https://example.com/</loc></url>".repeat(64)
+        );
+        let tmp = create_ssg_dist(&[("/sitemap.xml", "sitemap.xml/index.html", xml.as_bytes())]);
+        let dist = tmp.path().join("dist");
+
+        let router = try_build_router_with_static(
+            Vec::new(),
+            &compression_enabled_config(),
+            test_state(),
+            Some(&dist),
+        )
+        .expect("router builds");
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/sitemap.xml")
+                    .header("accept-encoding", "gzip")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("application/xml"),
+            "generated .xml route must be application/xml, derived from the route extension"
         );
     }
 
