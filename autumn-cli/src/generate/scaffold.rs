@@ -898,14 +898,21 @@ pub fn plan_scaffold_with_options(
         let autumn_toml_path = project_root.join("autumn.toml");
         if autumn_toml_path.exists() {
             let toml_existing = read_or_empty(&autumn_toml_path);
-            let updated_toml = append_submit_token_validate_exempt_to_toml(&toml_existing, &plural);
-            if updated_toml != toml_existing {
+            // Only record the modify *and* the destroy-time revert when this
+            // scaffold actually inserts the exemption. If `/{plural}/validate`
+            // is already present (a preexisting, user-owned entry), the append
+            // is a no-op and returns `None`; recording a revert then would let a
+            // later `autumn destroy` delete an exemption we never added,
+            // re-enabling submit-token guarding on live-validation routes.
+            if let Some(updated_toml) =
+                append_submit_token_validate_exempt_to_toml(&toml_existing, &plural)
+            {
                 plan.modify(autumn_toml_path.clone(), updated_toml);
+                plan.push_revert(Revert::SubmitTokenValidateExempt {
+                    path: autumn_toml_path,
+                    plural,
+                });
             }
-            plan.push_revert(Revert::SubmitTokenValidateExempt {
-                path: autumn_toml_path,
-                plural,
-            });
         }
     }
 
@@ -5534,11 +5541,17 @@ fn toml_table_block_range(lines: &[&str], header: &str) -> Option<(usize, usize)
 /// create/update submit replay a validation fragment. Exempting the route makes
 /// it robust regardless of the configured field name.
 ///
-/// Idempotent: a no-op when the prefix is already present in the block. Handles
-/// three shapes — no `[security.submit_token]` table (append a fresh one), a
-/// table without an `exempt_paths` key (insert the key after the header), and a
-/// table whose `exempt_paths` array is merged in place.
-fn append_submit_token_validate_exempt_to_toml(existing: &str, plural: &str) -> String {
+/// Returns `Some(updated_toml)` only when it actually inserts the exemption, and
+/// `None` when the file is left unchanged — the prefix is already present, or
+/// the `exempt_paths` array is too malformed to parse. Callers must gate BOTH
+/// the plan's modify action AND the destroy-time ownership revert on `Some`:
+/// recording a revert for a no-op would let `autumn destroy` delete a
+/// preexisting, user-owned exemption we never added.
+///
+/// Handles three shapes — no `[security.submit_token]` table (append a fresh
+/// one), a table without an `exempt_paths` key (insert the key after the
+/// header), and a table whose `exempt_paths` array is merged in place.
+fn append_submit_token_validate_exempt_to_toml(existing: &str, plural: &str) -> Option<String> {
     const HEADER: &str = "[security.submit_token]";
     let exempt = submit_token_validate_exempt_prefix(plural);
     let quoted = format!("\"{exempt}\"");
@@ -5553,12 +5566,13 @@ fn append_submit_token_validate_exempt_to_toml(existing: &str, plural: &str) -> 
         out.push_str(HEADER);
         out.push('\n');
         let _ = writeln!(out, "exempt_paths = [{quoted}]");
-        return out;
+        return Some(out);
     };
 
-    // The table exists. Idempotent if the prefix is already listed in the block.
+    // The table exists. No-op if the prefix is already listed in the block —
+    // return `None` so we don't claim ownership of a preexisting entry.
     if lines[start..end].iter().any(|l| l.contains(&quoted)) {
-        return existing.to_owned();
+        return None;
     }
 
     // Look for an existing `exempt_paths` key inside the block.
@@ -5578,16 +5592,19 @@ fn append_submit_token_validate_exempt_to_toml(existing: &str, plural: &str) -> 
             .find(|&i| lines[i].contains(']'))
             .unwrap_or(key_idx);
         let joined: String = lines[key_idx..=close_idx].join("\n");
-        if let (Some(open), Some(close)) = (joined.find('['), joined.rfind(']')) {
-            let inner = joined[open + 1..close].trim().trim_end_matches(',').trim();
-            let new_inner = if inner.is_empty() {
-                quoted
-            } else {
-                format!("{inner}, {quoted}")
-            };
-            let rebuilt = format!("{}[{new_inner}]{}", &joined[..open], &joined[close + 1..]);
-            out_lines.splice(key_idx..=close_idx, std::iter::once(rebuilt));
-        }
+        let (Some(open), Some(close)) = (joined.find('['), joined.rfind(']')) else {
+            // The `exempt_paths` array is malformed (no `[`/`]` to splice into).
+            // Leave the file untouched and claim no ownership.
+            return None;
+        };
+        let inner = joined[open + 1..close].trim().trim_end_matches(',').trim();
+        let new_inner = if inner.is_empty() {
+            quoted
+        } else {
+            format!("{inner}, {quoted}")
+        };
+        let rebuilt = format!("{}[{new_inner}]{}", &joined[..open], &joined[close + 1..]);
+        out_lines.splice(key_idx..=close_idx, std::iter::once(rebuilt));
     } else {
         // Table present but no `exempt_paths` key — insert it right after the
         // header line.
@@ -5598,7 +5615,7 @@ fn append_submit_token_validate_exempt_to_toml(existing: &str, plural: &str) -> 
     if existing.ends_with('\n') && !out.ends_with('\n') {
         out.push('\n');
     }
-    out
+    Some(out)
 }
 
 /// Inverse of [`append_submit_token_validate_exempt_to_toml`] (`autumn
@@ -10071,7 +10088,8 @@ async fn main() {
     #[test]
     fn submit_token_exempt_appends_fresh_block_when_absent() {
         let existing = "[server]\nport = 3000\n";
-        let out = append_submit_token_validate_exempt_to_toml(existing, "posts");
+        let out = append_submit_token_validate_exempt_to_toml(existing, "posts")
+            .expect("absent exemption must be inserted");
         assert!(out.contains("[security.submit_token]"), "{out}");
         assert!(
             out.contains("exempt_paths = [\"/posts/validate\"]"),
@@ -10085,14 +10103,18 @@ async fn main() {
     fn submit_token_exempt_is_idempotent() {
         let existing = "[security.submit_token]\nexempt_paths = [\"/posts/validate\"]\n";
         let out = append_submit_token_validate_exempt_to_toml(existing, "posts");
-        assert_eq!(out, existing, "re-adding the same prefix must be a no-op");
+        assert_eq!(
+            out, None,
+            "re-adding the same prefix must be a no-op returning None"
+        );
     }
 
     #[test]
     fn submit_token_exempt_merges_into_existing_array() {
         let existing =
             "[security.submit_token]\nttl_secs = 900\nexempt_paths = [\"/webhooks/x\"]\n";
-        let out = append_submit_token_validate_exempt_to_toml(existing, "posts");
+        let out = append_submit_token_validate_exempt_to_toml(existing, "posts")
+            .expect("a new prefix must be merged into the existing array");
         assert!(out.contains("\"/webhooks/x\""), "{out}");
         assert!(out.contains("\"/posts/validate\""), "{out}");
         assert!(out.contains("ttl_secs = 900"), "{out}");
@@ -10103,7 +10125,8 @@ async fn main() {
     #[test]
     fn submit_token_exempt_inserts_key_when_block_lacks_it() {
         let existing = "[security.submit_token]\nttl_secs = 900\n";
-        let out = append_submit_token_validate_exempt_to_toml(existing, "posts");
+        let out = append_submit_token_validate_exempt_to_toml(existing, "posts")
+            .expect("a block lacking the key must gain one");
         assert!(
             out.contains("exempt_paths = [\"/posts/validate\"]"),
             "{out}"
@@ -10125,7 +10148,8 @@ async fn main() {
     #[test]
     fn remove_submit_token_exempt_drops_fresh_block() {
         let existing = "[server]\nport = 3000\n";
-        let added = append_submit_token_validate_exempt_to_toml(existing, "posts");
+        let added = append_submit_token_validate_exempt_to_toml(existing, "posts")
+            .expect("fresh block must be added");
         let removed = remove_submit_token_validate_exempt_from_toml(&added, "posts");
         assert!(!removed.contains("/posts/validate"), "{removed}");
         assert!(!removed.contains("[security.submit_token]"), "{removed}");
@@ -10217,6 +10241,92 @@ async fn main() {
         assert!(
             !touches_toml,
             "a plain scaffold (no --live-validation) must not add submit-token exemptions"
+        );
+    }
+
+    #[test]
+    fn live_validation_scaffold_records_revert_only_when_exemption_inserted() {
+        // Absent exemption: the scaffold both modifies autumn.toml AND records a
+        // `SubmitTokenValidateExempt` revert so `autumn destroy` cleans up the
+        // entry it added.
+        let tmp = project_with_main(default_main());
+        fs::write(
+            tmp.path().join("autumn.toml"),
+            "[security.submit_token]\nfield_name = \"_confirm\"\n",
+        )
+        .unwrap();
+        let plan = plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String".into()],
+            "20260712000000",
+            &ScaffoldOptions {
+                live_validation: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let touches_toml = plan
+            .actions
+            .iter()
+            .any(|a| a.path().ends_with("autumn.toml"));
+        assert!(
+            touches_toml,
+            "an absent exemption must be inserted via a modify action"
+        );
+        let has_revert = plan.reverts.iter().any(|r| {
+            matches!(
+                r,
+                Revert::SubmitTokenValidateExempt { plural, .. } if plural == "posts"
+            )
+        });
+        assert!(
+            has_revert,
+            "inserting the exemption must record a SubmitTokenValidateExempt revert"
+        );
+    }
+
+    #[test]
+    fn live_validation_scaffold_skips_revert_when_exemption_preexists() {
+        // The exemption is ALREADY present (e.g. a user hand-added it, possibly
+        // with a custom field name). The scaffold must NOT modify autumn.toml and
+        // must NOT record a revert — otherwise a later `autumn destroy` would
+        // delete a user-owned entry, re-enabling submit-token guarding on the
+        // live-validation routes.
+        let tmp = project_with_main(default_main());
+        fs::write(
+            tmp.path().join("autumn.toml"),
+            "[security.submit_token]\nfield_name = \"_confirm\"\nexempt_paths = [\"/posts/validate\"]\n",
+        )
+        .unwrap();
+        let plan = plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String".into()],
+            "20260712000000",
+            &ScaffoldOptions {
+                live_validation: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let touches_toml = plan
+            .actions
+            .iter()
+            .any(|a| a.path().ends_with("autumn.toml"));
+        assert!(
+            !touches_toml,
+            "a preexisting exemption must not be re-modified"
+        );
+        let has_revert = plan
+            .reverts
+            .iter()
+            .any(|r| matches!(r, Revert::SubmitTokenValidateExempt { .. }));
+        assert!(
+            !has_revert,
+            "a preexisting, user-owned exemption must not be claimed via a revert"
         );
     }
 }
