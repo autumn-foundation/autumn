@@ -43,18 +43,33 @@ pub fn run(opts: &ManifestOptions<'_>) {
             std::process::exit(1);
         });
 
-    let manifest = match manifest_from_child(
+    let stdout = match manifest_from_child(
         output.status.success(),
         output.status.code(),
         &output.stdout,
     ) {
-        Ok(manifest) => manifest,
+        Ok(stdout) => stdout,
         Err(code) => {
             eprintln!(
                 "\u{2717} Binary exited with status {} while dumping jobs manifest",
                 output.status
             );
             std::process::exit(code);
+        }
+    };
+
+    // A clean exit is not enough: the child's stdout must be the expected TOML
+    // manifest. If the app prints anything else to stdout (from a custom config
+    // or telemetry initializer, say), writing it verbatim would produce a
+    // corrupt manifest that `autumn doctor` silently treats as an empty declared
+    // set — false-passing the very topology check this manifest exists to guard.
+    // Mirror `autumn routes`, which strict-parses the child's stdout and errors
+    // on anything unexpected rather than emitting garbage.
+    let manifest = match validate_manifest(&stdout) {
+        Ok(manifest) => manifest,
+        Err(message) => {
+            eprintln!("\u{2717} {message}");
+            std::process::exit(1);
         }
     };
 
@@ -65,17 +80,53 @@ pub fn run(opts: &ManifestOptions<'_>) {
     eprintln!("\u{2713} Wrote jobs manifest \u{2192} {}", opts.output);
 }
 
-/// Interpret a finished dump child: `Ok(manifest)` when it exited cleanly,
+/// Interpret a finished dump child: `Ok(stdout)` when it exited cleanly,
 /// `Err(exit_code)` when it failed (the caller reports and propagates the code).
 ///
-/// Extracted from [`run`] so the success/failure decision and stdout capture are
-/// unit-testable without spawning a real process.
+/// Returns the child's captured stdout (lossily UTF-8 decoded) without inspecting
+/// its contents — validation that it is a well-formed manifest is [`validate_manifest`]'s
+/// job. Extracted from [`run`] so the success/failure decision and stdout capture
+/// are unit-testable without spawning a real process.
 fn manifest_from_child(success: bool, code: Option<i32>, stdout: &[u8]) -> Result<String, i32> {
     if success {
         Ok(String::from_utf8_lossy(stdout).into_owned())
     } else {
         Err(code.unwrap_or(1))
     }
+}
+
+/// Validate that `stdout` is the expected jobs manifest before it is written.
+///
+/// A clean child exit does not guarantee the captured stdout is the manifest: any
+/// bytes the app writes to stdout during boot (from a custom config loader or
+/// telemetry initializer, or a stray `println!`) land here too, and writing them
+/// verbatim produces a corrupt file. `autumn doctor` parses only a valid TOML
+/// `queues` array and silently ignores anything else, so a corrupt manifest lets
+/// the topology coverage check false-pass without the app-declared queues.
+///
+/// Mirrors `autumn routes`, which strict-parses the child's stdout (as JSON there,
+/// TOML here) and errors rather than accepting unexpected output. Requires the
+/// stdout to parse as TOML with a top-level `queues` array of strings; on success
+/// returns the original `stdout` unchanged so the on-disk bytes are byte-identical
+/// to what the app emitted (preserving the highest-priority-first ordering).
+fn validate_manifest(stdout: &str) -> Result<String, String> {
+    let hint = "app did not emit a valid jobs manifest on stdout; \
+                ensure nothing else writes to stdout during `autumn jobs manifest`";
+
+    let value: toml::Value = toml::from_str(stdout)
+        .map_err(|e| format!("{hint} (stdout did not parse as TOML: {e})"))?;
+    let queues = value
+        .get("queues")
+        .ok_or_else(|| format!("{hint} (no top-level `queues` array found)"))?
+        .as_array()
+        .ok_or_else(|| format!("{hint} (`queues` is not an array)"))?;
+    if !queues.iter().all(toml::Value::is_str) {
+        return Err(format!("{hint} (`queues` is not an array of strings)"));
+    }
+
+    // Return the stdout unchanged so the on-disk bytes are byte-identical to what
+    // the app emitted (preserving the highest-priority-first ordering).
+    Ok(stdout.to_owned())
 }
 
 /// Write `contents` to `path`, creating any missing parent directories.
@@ -130,6 +181,73 @@ mod tests {
         // A signal-terminated child has no exit code; default to 1 so callers
         // still exit non-zero.
         assert_eq!(manifest_from_child(false, None, b""), Err(1));
+    }
+
+    // ── validate_manifest ───────────────────────────────────────────────────
+
+    #[test]
+    fn validate_manifest_accepts_well_formed_manifest() {
+        let stdout = "queues = [\"critical\", \"email\"]\n";
+        let validated = validate_manifest(stdout).expect("valid manifest should pass");
+        // The stdout is returned byte-for-byte so the on-disk manifest is exactly
+        // what the app emitted (preserving highest-priority-first ordering).
+        assert_eq!(validated, stdout);
+    }
+
+    #[test]
+    fn validate_manifest_accepts_empty_queues_array() {
+        // A configured-but-empty queue set is a legitimate manifest, distinct
+        // from missing output.
+        let stdout = "queues = []\n";
+        assert_eq!(
+            validate_manifest(stdout).expect("empty array is valid"),
+            stdout
+        );
+    }
+
+    #[test]
+    fn validate_manifest_rejects_leading_stray_line() {
+        // A stray log/telemetry line before the manifest makes the whole payload
+        // fail to parse as TOML — we must error and refuse to write, not silently
+        // persist a corrupt file (strict-parse, mirroring `autumn routes`).
+        let stdout = "some log line\nqueues = [\"critical\"]\n";
+        let err = validate_manifest(stdout).expect_err("stray line must be rejected");
+        assert!(
+            err.contains("did not emit a valid jobs manifest"),
+            "expected manifest-validation error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_manifest_rejects_empty_stdout() {
+        let err = validate_manifest("").expect_err("empty stdout must be rejected");
+        assert!(
+            err.contains("did not emit a valid jobs manifest"),
+            "expected manifest-validation error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_manifest_rejects_toml_without_queues_key() {
+        // Valid TOML that lacks the `queues` array must be rejected, and the
+        // message should name the missing key.
+        let stdout = "other = [\"critical\"]\n";
+        let err = validate_manifest(stdout).expect_err("missing queues key must be rejected");
+        assert!(
+            err.contains("no top-level `queues` array"),
+            "expected missing-key error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_manifest_rejects_non_string_queue_elements() {
+        // `queues` present but not an array of strings must be rejected.
+        let stdout = "queues = [1, 2]\n";
+        let err = validate_manifest(stdout).expect_err("non-string elements must be rejected");
+        assert!(
+            err.contains("not an array of strings"),
+            "expected element-type error, got: {err}"
+        );
     }
 
     // ── write_manifest ──────────────────────────────────────────────────────
