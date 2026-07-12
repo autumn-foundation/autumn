@@ -1865,12 +1865,18 @@ fn render_routes_file(
     };
 
     // Issue #1125: thread `State` + `Session` into the mutating handlers so they
-    // can run `authorize::<{Pascal}>(...)`. Inserted before the body-consuming
-    // `Bytes` extractor in `update` (axum requires `Bytes` last) and appended to
-    // the `destroy` arg list (no body extractor). Only applied on the standard
-    // path (`authorize` already excludes live/sharded/attachment scaffolds).
-    let (update_signature, destroy_signature_arg) = if authorize {
+    // can run `authorize::<{Pascal}>(...)` (and `authorize_create::<{Pascal}>`
+    // in `create`). Inserted before the body-consuming `Bytes` extractor in
+    // `create`/`update` (axum requires `Bytes` last) and appended to the
+    // `destroy` arg list (no body extractor). Only applied on the standard path
+    // (`authorize` already excludes live/sharded/attachment scaffolds).
+    let (create_signature, update_signature, destroy_signature_arg) = if authorize {
         (
+            create_signature.replacen(
+                "body: Bytes",
+                &format!("{authz_params},\n    body: Bytes"),
+                1,
+            ),
             update_signature.replacen(
                 "\n    body: Bytes",
                 &format!("{authz_params},\n    body: Bytes"),
@@ -1879,7 +1885,7 @@ fn render_routes_file(
             format!("{destroy_signature_arg},{authz_params}"),
         )
     } else {
-        (update_signature, destroy_signature_arg)
+        (create_signature, update_signature, destroy_signature_arg)
     };
 
     // `decode_form` always returns the `{Pascal}Form` (sync — attachment blob
@@ -2054,6 +2060,16 @@ fn render_routes_file(
              Ok(autumn_web::Redirect::to(\"/{plural}\").into_response())"
         )
     };
+    // Issue #1125: on the standard authorized path, run the policy's `can_create`
+    // check before building/inserting the changeset. Create has no loaded row yet,
+    // so this uses `authorize_create` (context-only) rather than `authorize`.
+    let authz_create_call = if authorize {
+        format!(
+            "autumn_web::authorization::authorize_create::<{pascal_name}>(&state, &session).await?;\n    "
+        )
+    } else {
+        String::new()
+    };
     let create_fn = format!(
         "/// `POST /{plural}` — validate the submission and create a {snake_name},\n\
          /// or re-render the form at 422 with inline errors and preserved input.\n\
@@ -2061,6 +2077,7 @@ fn render_routes_file(
          #[post(\"/{plural}\")]\n\
          pub async fn create({create_signature}) -> AutumnResult<autumn_web::reexports::axum::response::Response> {{\n    \
          use autumn_web::reexports::axum::response::IntoResponse as _;\n    \
+         {authz_create_call}\
          let form = {decode_call};\n    \
          let changeset = form.into_changeset();\n    \
          if !changeset.is_valid() {{\n        \
@@ -9520,6 +9537,14 @@ async fn main() {
         assert!(routes.contains("\"edit\", &row"), "{routes}");
         assert!(routes.contains("\"update\", &current"), "{routes}");
         assert!(routes.contains("\"delete\", &current"), "{routes}");
+        // The HTML create handler runs the policy's `can_create` check before
+        // inserting, threading `State`/`Session` like the other mutations.
+        assert!(
+            routes
+                .contains("autumn_web::authorization::authorize_create::<Post>(&state, &session)"),
+            "create must authorize_create: {routes}"
+        );
+        assert!(routes.contains("pub async fn create("), "{routes}");
         // Index applies the owner scope through a filtered paginated query.
         assert!(
             routes.contains("posts::user_id.eq(owner_id)"),
@@ -9561,6 +9586,10 @@ async fn main() {
         assert!(
             !routes.contains("authorize::<Post>"),
             "--no-policy must not wire authorize: {routes}"
+        );
+        assert!(
+            !routes.contains("authorize_create::<Post>"),
+            "--no-policy must not wire authorize_create: {routes}"
         );
         let main = action_contents(&plan, "src/main.rs");
         assert!(
