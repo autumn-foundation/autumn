@@ -30,5 +30,8 @@ fn app_builder_multiple_route_calls() {
 #[tokio::test]
 #[should_panic(expected = "No routes registered")]
 async fn empty_routes_panics() {
-    autumn_web::app().run().await;
+    // `Box::pin` keeps this `run()` future off the stack frame: `AutumnConfig`
+    // is held by value across its await points and sits just under the
+    // `clippy::large_futures` threshold, so awaiting it inline trips the lint.
+    Box::pin(autumn_web::app().run()).await;
 }

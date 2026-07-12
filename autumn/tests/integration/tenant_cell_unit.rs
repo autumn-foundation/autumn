@@ -4,6 +4,8 @@
 //! and need no HTTP or database scaffolding, so they carry no feature gate.
 
 use autumn_web::tenant_cell::{QuotaExceeded, TenantCell, TenantCellRegistry};
+use std::sync::Arc;
+use std::time::Duration;
 
 /// A charge raises both the per-tenant and process-wide gauges by exactly its
 /// size, and dropping it returns them to zero.
@@ -386,4 +388,132 @@ fn handle_caches_cell_across_mid_request_eviction() {
     assert!(std::sync::Arc::ptr_eq(&cell1, &cell2));
     assert_eq!(cell2.tracked_bytes(), tracked);
     assert_eq!(cell2.scratch_get("k").map(|v| v.len()), Some(100));
+}
+
+/// A resident cell refreshes its soft quota from the latest `get_or_create`
+/// value (#1783): the same cell is returned, its quota reflects the new value,
+/// and `reserve` honors the atomically-updated quota — a charge that overflowed
+/// the original quota succeeds once the quota is raised.
+#[test]
+fn resident_cell_quota_refreshes_on_get_or_create() {
+    let reg = TenantCellRegistry::new();
+    let cell_a = reg.get_or_create("t", 1000);
+
+    // 1500 exceeds the initial quota of 1000.
+    cell_a
+        .try_charge(1500)
+        .expect_err("1500 must exceed the initial quota of 1000");
+
+    // Re-fetching with a larger quota returns the SAME cell with its quota
+    // atomically refreshed — no eviction/rebuild.
+    let cell_b = reg.get_or_create("t", 2000);
+    assert!(Arc::ptr_eq(&cell_a, &cell_b));
+    assert_eq!(cell_b.quota_bytes(), 2000);
+
+    // The same charge now fits under the refreshed quota, proving `reserve`
+    // reads the atomic quota rather than a cached value.
+    let charge = cell_b
+        .try_charge(1500)
+        .expect("1500 fits under the refreshed quota of 2000");
+    assert_eq!(cell_b.tracked_bytes(), 1500);
+    drop(charge);
+}
+
+/// A bounded registry evicts the least-recently-used cell once resident cells
+/// exceed the cap (#1792). Inserting t1, t2, t3 into a cap-2 registry (natural
+/// touch order t1 < t2 < t3) drops t1 and keeps t2/t3.
+#[test]
+fn registry_bounded_capacity_evicts_lru() {
+    let reg = TenantCellRegistry::with_limits(2, None);
+    assert_eq!(reg.max_cells(), 2);
+
+    // Space the creations out so their millisecond-resolution access stamps are
+    // strictly ordered t1 < t2 < t3 (creations otherwise land in one tick).
+    let _t1 = reg.get_or_create("t1", 0);
+    std::thread::sleep(Duration::from_millis(5));
+    let _t2 = reg.get_or_create("t2", 0);
+    std::thread::sleep(Duration::from_millis(5));
+    let _t3 = reg.get_or_create("t3", 0);
+
+    // t3's insert pushed the count to 3 > 2, evicting the LRU cell (t1).
+    assert_eq!(reg.len(), 2);
+    assert!(
+        reg.get("t1").is_none(),
+        "t1 was the LRU and must be evicted"
+    );
+    assert!(reg.get("t2").is_some());
+    assert!(reg.get("t3").is_some());
+}
+
+/// An idle-TTL registry evicts a cell whose last access is older than the TTL
+/// (#1792). t1 goes stale across a sleep; creating t2 triggers the idle sweep
+/// (and `evict_idle_older_than` is the explicit equivalent), removing t1 while
+/// the freshly-touched t2 survives.
+#[test]
+fn registry_idle_ttl_evicts_stale() {
+    let reg = TenantCellRegistry::with_limits(0, Some(Duration::from_millis(40)));
+    assert_eq!(reg.idle_ttl(), Some(Duration::from_millis(40)));
+
+    let _t1 = reg.get_or_create("t1", 0);
+    // Let t1 age well past the 40ms TTL before touching the registry again.
+    std::thread::sleep(Duration::from_millis(60));
+
+    // Creating t2 runs the auto idle-sweep: t1 (idle > 40ms) is evicted, and the
+    // just-touched t2 is retained.
+    let _t2 = reg.get_or_create("t2", 0);
+    assert!(reg.get("t1").is_none(), "t1 aged past the idle TTL");
+    assert!(
+        reg.get("t2").is_some(),
+        "t2 was just touched and must survive"
+    );
+    assert_eq!(reg.len(), 1);
+}
+
+/// Auto-eviction removes only the registry's strong reference (#1792): a cell
+/// evicted to honor the capacity bound while a request still holds its
+/// `Arc<TenantCell>` stays fully usable, and its tracked bytes reclaim
+/// deterministically once that held reference drops — never mid-request.
+#[test]
+fn auto_eviction_preserves_in_flight_cell() {
+    let reg = TenantCellRegistry::with_limits(1, None);
+
+    // t1 is the "in-flight" cell: create it, charge some persistent scratch
+    // bytes, and keep its Arc as a request would.
+    let t1 = reg.get_or_create("t1", 1_000_000);
+    t1.scratch_insert("k", vec![0u8; 256])
+        .expect("insert under a generous quota");
+    let tracked = t1.tracked_bytes();
+    assert!(tracked > 0);
+    assert_eq!(reg.total_tracked_bytes(), tracked);
+
+    // Space the second creation out so t1 is unambiguously the LRU victim.
+    std::thread::sleep(Duration::from_millis(5));
+    let _t2 = reg.get_or_create("t2", 1_000_000);
+
+    // t1 was evicted from the registry (cap 1) but the held Arc keeps it alive.
+    assert!(reg.get("t1").is_none(), "t1 evicted from the registry");
+    assert_eq!(reg.len(), 1);
+
+    // The in-flight cell is still fully functional: its scratch, quota, and
+    // charging all work against the same accounting state.
+    assert_eq!(t1.tracked_bytes(), tracked);
+    assert_eq!(t1.quota_bytes(), 1_000_000);
+    assert_eq!(t1.scratch_get("k").map(|v| v.len()), Some(256));
+    let charge = t1
+        .try_charge(100)
+        .expect("the evicted-but-held cell still charges");
+    drop(charge);
+    assert_eq!(t1.tracked_bytes(), tracked);
+
+    // t1's bytes are still counted process-wide while the request holds it.
+    assert_eq!(reg.total_tracked_bytes(), tracked);
+
+    // Dropping the last strong reference reclaims t1's footprint; only the empty
+    // t2 remains resident, so the process-wide gauge returns to zero.
+    drop(t1);
+    assert_eq!(
+        reg.total_tracked_bytes(),
+        0,
+        "held cell's bytes reclaim deterministically on drop"
+    );
 }

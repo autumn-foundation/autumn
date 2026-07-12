@@ -33,8 +33,9 @@
 
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant};
 
 /// Fixed bytes charged per scratch entry to cover the map's per-entry overhead:
 /// the `String` and `Vec` structs stored inline in the bucket array plus an
@@ -90,10 +91,17 @@ struct ScratchState {
 #[derive(Debug)]
 struct TenantCellInner {
     tenant_id: String,
-    /// Soft quota in bytes; `0` means unlimited.
-    quota_bytes: usize,
+    /// Soft quota in bytes; `0` means unlimited. Mutable at runtime via
+    /// [`TenantCell::set_quota_bytes`] so a resident cell can pick up a
+    /// reconfigured quota without being evicted and rebuilt.
+    quota_bytes: AtomicUsize,
     /// Bytes currently tracked for this tenant.
     tracked_bytes: AtomicUsize,
+    /// Registry-relative timestamp (milliseconds since the registry's `base`
+    /// `Instant`) of this cell's most recent access, used to drive idle-TTL and
+    /// least-recently-used eviction. Set by the registry on creation and on
+    /// every subsequent lookup.
+    last_access: AtomicU64,
     /// Owned per-tenant scratch buffer and its entry high-water mark. Dropped
     /// with the cell.
     scratch: Mutex<ScratchState>,
@@ -106,20 +114,23 @@ impl TenantCellInner {
     /// process-wide gauges. Fails without mutating state if it would exceed the
     /// quota.
     fn reserve(&self, n: usize) -> Result<(), QuotaExceeded> {
-        if self.quota_bytes == 0 {
+        // Reload the quota on entry (and on each CAS retry below) so a runtime
+        // change via `set_quota_bytes` is honored by the very next reservation.
+        if self.quota_bytes.load(Ordering::Relaxed) == 0 {
             self.tracked_bytes.fetch_add(n, Ordering::Relaxed);
             self.global_tracked.fetch_add(n, Ordering::Relaxed);
             return Ok(());
         }
         let mut current = self.tracked_bytes.load(Ordering::Relaxed);
         loop {
+            let quota = self.quota_bytes.load(Ordering::Relaxed);
             let next = current.saturating_add(n);
-            if next > self.quota_bytes {
+            if next > quota {
                 return Err(QuotaExceeded {
                     tenant_id: self.tenant_id.clone(),
                     requested: n,
                     in_use: current,
-                    quota: self.quota_bytes,
+                    quota,
                 });
             }
             match self.tracked_bytes.compare_exchange_weak(
@@ -217,8 +228,11 @@ impl TenantCell {
         Self {
             inner: Arc::new(TenantCellInner {
                 tenant_id: tenant_id.into(),
-                quota_bytes,
+                quota_bytes: AtomicUsize::new(quota_bytes),
                 tracked_bytes: AtomicUsize::new(0),
+                // The owning registry stamps the real access time immediately
+                // after construction; 0 is a placeholder until then.
+                last_access: AtomicU64::new(0),
                 scratch: Mutex::new(ScratchState::default()),
                 global_tracked,
             }),
@@ -234,7 +248,27 @@ impl TenantCell {
     /// The soft quota in bytes (`0` means unlimited).
     #[must_use]
     pub fn quota_bytes(&self) -> usize {
-        self.inner.quota_bytes
+        self.inner.quota_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Update the soft quota in bytes (`0` means unlimited). The new value takes
+    /// effect on the next [`try_charge`](Self::try_charge)/`scratch_insert`
+    /// reservation; already-tracked bytes are never retroactively rejected.
+    pub fn set_quota_bytes(&self, quota_bytes: usize) {
+        self.inner.quota_bytes.store(quota_bytes, Ordering::Relaxed);
+    }
+
+    /// Record a registry-relative access timestamp (milliseconds since the
+    /// registry's base `Instant`). Called by the registry on every lookup to
+    /// drive least-recently-used and idle-TTL eviction.
+    pub fn touch(&self, now_millis: u64) {
+        self.inner.last_access.store(now_millis, Ordering::Relaxed);
+    }
+
+    /// The registry-relative timestamp of this cell's most recent access.
+    #[must_use]
+    pub fn last_access_millis(&self) -> u64 {
+        self.inner.last_access.load(Ordering::Relaxed)
     }
 
     /// Bytes currently tracked for this tenant.
@@ -405,6 +439,15 @@ pub struct TenantCellRegistry {
 struct RegistryInner {
     cells: RwLock<HashMap<String, Arc<TenantCell>>>,
     global_tracked: Arc<AtomicUsize>,
+    /// Maximum number of resident cells; least-recently-used cells are evicted
+    /// once the count exceeds this. `0` disables the bound (unlimited).
+    max_cells: usize,
+    /// Evict a cell whose last access is older than this. `None` disables
+    /// idle-TTL eviction.
+    idle_ttl: Option<Duration>,
+    /// Monotonic clock origin for the registry-relative millisecond timestamps
+    /// stored on each cell's `last_access`.
+    base: Instant,
 }
 
 impl fmt::Debug for TenantCellRegistry {
@@ -423,15 +466,33 @@ impl Default for TenantCellRegistry {
 }
 
 impl TenantCellRegistry {
-    /// Create an empty registry.
+    /// Create an empty registry with eviction disabled (unlimited resident
+    /// cells, no idle-TTL sweep).
     #[must_use]
     pub fn new() -> Self {
+        Self::with_limits(0, None)
+    }
+
+    /// Create an empty registry that evicts cells to stay within the given
+    /// limits: at most `max_cells` resident cells (`0` = unbounded, evicting the
+    /// least-recently-used above the bound), and evicting any cell idle for
+    /// longer than `idle_ttl` (`None` = no idle sweep).
+    #[must_use]
+    pub fn with_limits(max_cells: usize, idle_ttl: Option<Duration>) -> Self {
         Self {
             inner: Arc::new(RegistryInner {
                 cells: RwLock::new(HashMap::new()),
                 global_tracked: Arc::new(AtomicUsize::new(0)),
+                max_cells,
+                idle_ttl,
+                base: Instant::now(),
             }),
         }
+    }
+
+    /// Registry-relative "now" in milliseconds since `base`.
+    fn now_millis(&self) -> u64 {
+        u64::try_from(self.inner.base.elapsed().as_millis()).unwrap_or(u64::MAX)
     }
 
     /// Fetch the cell for `tenant_id`, if one is resident.
@@ -441,23 +502,53 @@ impl TenantCellRegistry {
     /// Panics if the registry lock is poisoned.
     #[must_use]
     pub fn get(&self, tenant_id: &str) -> Option<Arc<TenantCell>> {
-        self.inner
+        let now = self.now_millis();
+        let cell = self
+            .inner
             .cells
             .read()
             .expect("tenant cell registry lock poisoned")
             .get(tenant_id)
-            .cloned()
+            .cloned();
+        if let Some(cell) = &cell {
+            cell.touch(now);
+        }
+        cell
     }
 
     /// Fetch the cell for `tenant_id`, creating it with `quota_bytes` if absent.
     /// Atomic: concurrent first requests for the same tenant share one cell.
+    ///
+    /// A *resident* cell refreshes its soft quota from `quota_bytes` on every
+    /// call, so the latest configured value is applied without evicting and
+    /// rebuilding the cell. In practice this only changes anything once a
+    /// config-reload path swaps the resident [`crate::config::AutumnConfig`]
+    /// (the middleware passes `config.tenancy.quota_bytes` here); no such
+    /// hot-reload path exists today, so the refresh is currently a no-op — the
+    /// mechanism is in place for when hot-reload lands.
+    ///
+    /// Every call also stamps the cell's last-access time and, on a miss, may
+    /// evict idle or least-recently-used cells to honor the registry's limits.
     ///
     /// # Panics
     ///
     /// Panics if the registry lock is poisoned.
     #[must_use]
     pub fn get_or_create(&self, tenant_id: &str, quota_bytes: usize) -> Arc<TenantCell> {
-        if let Some(cell) = self.get(tenant_id) {
+        let now = self.now_millis();
+        // Fast path: a resident cell just needs its access time and quota
+        // refreshed under the cheaper read lock. Bind the lookup to a local so
+        // the read guard is released before we touch/refresh the cell.
+        let resident = self
+            .inner
+            .cells
+            .read()
+            .expect("tenant cell registry lock poisoned")
+            .get(tenant_id)
+            .cloned();
+        if let Some(cell) = resident {
+            cell.touch(now);
+            cell.set_quota_bytes(quota_bytes);
             return cell;
         }
         let mut cells = self
@@ -465,16 +556,55 @@ impl TenantCellRegistry {
             .cells
             .write()
             .expect("tenant cell registry lock poisoned");
+        // Another writer may have inserted between dropping the read lock and
+        // taking the write lock.
         if let Some(cell) = cells.get(tenant_id) {
-            return Arc::clone(cell);
+            let cell = Arc::clone(cell);
+            cell.touch(now);
+            cell.set_quota_bytes(quota_bytes);
+            return cell;
         }
         let cell = Arc::new(TenantCell::new(
             tenant_id.to_string(),
             quota_bytes,
             Arc::clone(&self.inner.global_tracked),
         ));
+        cell.touch(now);
         cells.insert(tenant_id.to_string(), Arc::clone(&cell));
+        // Enforce eviction limits while we already hold the write lock. The
+        // just-touched new cell has the newest access time, so it is never the
+        // idle or LRU victim.
+        self.enforce_limits_locked(&mut cells, now);
+        drop(cells);
         cell
+    }
+
+    /// Evict idle and over-capacity cells from an already write-locked map.
+    ///
+    /// Must be called while holding the `cells` write lock; it never re-locks,
+    /// so it is safe to invoke from inside [`get_or_create`]'s miss branch.
+    /// Removal is a plain `HashMap::remove`, which drops only the registry's
+    /// strong reference — any outstanding `Arc<TenantCell>` (e.g. one held by an
+    /// in-flight request) stays valid and reclaims deterministically on drop.
+    fn enforce_limits_locked(&self, cells: &mut HashMap<String, Arc<TenantCell>>, now: u64) {
+        if let Some(ttl) = self.inner.idle_ttl {
+            let ttl_millis = u64::try_from(ttl.as_millis()).unwrap_or(u64::MAX);
+            cells.retain(|_, cell| now.saturating_sub(cell.last_access_millis()) <= ttl_millis);
+        }
+        let max_cells = self.inner.max_cells;
+        if max_cells > 0 {
+            while cells.len() > max_cells {
+                // Evict the least-recently-used (smallest last-access) cell.
+                let Some(victim) = cells
+                    .iter()
+                    .min_by_key(|(_, cell)| cell.last_access_millis())
+                    .map(|(key, _)| key.clone())
+                else {
+                    break;
+                };
+                cells.remove(&victim);
+            }
+        }
     }
 
     /// Evict `tenant_id`'s cell, removing it from the registry and returning it.
@@ -491,6 +621,44 @@ impl TenantCellRegistry {
             .write()
             .expect("tenant cell registry lock poisoned")
             .remove(tenant_id)
+    }
+
+    /// Evict every resident cell whose most recent access is older than `ttl`
+    /// (measured against the registry's current clock), returning the number of
+    /// cells removed. A reusable ops/test primitive that applies the same
+    /// idle-sweep policy `get_or_create` runs automatically.
+    ///
+    /// Removal drops only the registry's strong reference; any outstanding
+    /// `Arc<TenantCell>` keeps its cell alive and reclaims deterministically on
+    /// drop.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the registry lock is poisoned.
+    #[must_use]
+    pub fn evict_idle_older_than(&self, ttl: Duration) -> usize {
+        let now = self.now_millis();
+        let ttl_millis = u64::try_from(ttl.as_millis()).unwrap_or(u64::MAX);
+        let mut cells = self
+            .inner
+            .cells
+            .write()
+            .expect("tenant cell registry lock poisoned");
+        let before = cells.len();
+        cells.retain(|_, cell| now.saturating_sub(cell.last_access_millis()) <= ttl_millis);
+        before - cells.len()
+    }
+
+    /// The configured maximum number of resident cells (`0` = unbounded).
+    #[must_use]
+    pub fn max_cells(&self) -> usize {
+        self.inner.max_cells
+    }
+
+    /// The configured idle-eviction TTL (`None` = disabled).
+    #[must_use]
+    pub fn idle_ttl(&self) -> Option<Duration> {
+        self.inner.idle_ttl
     }
 
     /// Number of resident cells.

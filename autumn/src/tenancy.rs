@@ -461,7 +461,13 @@ pub async fn tenancy_middleware(
     // first accesses it via `current_tenant_cell()`. Requests to routes that
     // never touch tenant memory therefore leave the registry untouched, even
     // with request-controlled tenant ids.
-    let registry = state.extension_or_insert_with(crate::tenant_cell::TenantCellRegistry::new);
+    let registry = state.extension_or_insert_with(|| {
+        crate::tenant_cell::TenantCellRegistry::with_limits(
+            config.tenancy.max_cells,
+            (config.tenancy.idle_ttl_secs > 0)
+                .then(|| std::time::Duration::from_secs(config.tenancy.idle_ttl_secs)),
+        )
+    });
     let handle = crate::tenant_cell::TenantCellHandle::new(
         (*registry).clone(),
         tenant_id.clone(),
