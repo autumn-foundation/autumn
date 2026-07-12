@@ -151,7 +151,7 @@ pub type RuntimeDependentCascadeFuture<'a> = ::std::pin::Pin<
 >;
 
 /// A type-erased entry point into one child repository's
-/// [`__autumn_apply_dependent_on_conn`] leaf executor (#1738).
+/// `__autumn_apply_dependent_on_conn` leaf executor (#1738).
 ///
 /// `#[model]` emits one of these per model-declared
 /// `#[has_many(Child, dependent = …)]` association, resolving the child
