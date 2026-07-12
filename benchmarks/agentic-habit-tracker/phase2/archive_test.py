@@ -137,12 +137,12 @@ def run():
         # shrink the total and inflate the pass rate. Record every dependent
         # check as an explicit failure instead of exiting early and skipping them.
         for label in (
-            "newly created habit is active (archived false/absent AND not in archived list)",
+            "newly created habit is active (archived == false AND not in archived list)",
             "created habit present in default list",
             "POST /api/habits/{id}/archive -> 200/204",
             "archived habit absent from default list",
             "archived habit present in ?archived=true list",
-            "GET archived habit -> 200",
+            "GET archived habit -> 200 with archived == true",
             "archived habit still has current_streak",
             "archived habit still has history array",
             "POST archive unknown id -> 404",
@@ -158,9 +158,13 @@ def run():
         sys.exit(1)
     archived_field = r.json().get("archived")
     archived_ids = list_ids("/api/habits?archived=true")
+    # Phase 2 (prompts/phase2_maintenance.md) requires an `archived` boolean on
+    # the habit. A freshly created habit MUST carry archived == false: absent or
+    # None is a FAIL, not a pass — an API that omits the field no longer earns
+    # phase-2 correctness credit.
     check(
-        "newly created habit is active (archived false/absent AND not in archived list)",
-        archived_field in (False, None) and not contains(archived_ids, hid),
+        "newly created habit is active (archived == false AND not in archived list)",
+        archived_field is False and not contains(archived_ids, hid),
         f"archived={archived_field!r}, in_archived_list={contains(archived_ids, hid)}",
     )
 
@@ -180,10 +184,14 @@ def run():
     archived_ids = list_ids("/api/habits?archived=true")
     check("archived habit present in ?archived=true list", contains(archived_ids, hid))
 
-    # GET single still works for the archived habit, with streak + history
+    # GET single still works for the archived habit, and the object MUST now
+    # report archived == true (present and correct). Absent/None is a FAIL. The
+    # streak + history must still be intact.
     r = request("GET", f"/api/habits/{hid}")
-    check("GET archived habit -> 200", r.status == 200, f"got {r.status}")
     got = r.json() if r.status == 200 else {}
+    check("GET archived habit -> 200 with archived == true",
+          r.status == 200 and got.get("archived") is True,
+          f"got status {r.status}, archived={got.get('archived')!r}")
     check("archived habit still has current_streak", "current_streak" in got)
     check("archived habit still has history array", isinstance(got.get("history"), list))
 

@@ -190,8 +190,20 @@ def run():
         rc = request("POST", f"/api/habits/{h2}/complete", {})  # default = today
         check("(d) complete today (default) -> 201", rc.status == 201, f"got {rc.status}")
         today_str = rc.json().get("date") if rc.status == 201 else None
+        # Guard the server-date parse (mirror acceptance/contract_test.py): a
+        # candidate can return 201 with a non-ISO `date`, and an unguarded
+        # datetime.date.fromisoformat would raise ValueError and crash the suite
+        # before the RESULT line is printed, leaving hidden_checks_* counts
+        # unstable. On a missing/None or unparseable date, record the five
+        # server-date-dependent checks as failures and still reach RESULT.
+        parsed_today = None
         if today_str:
-            yesterday = datetime.date.fromisoformat(today_str) - datetime.timedelta(days=1)
+            try:
+                parsed_today = datetime.date.fromisoformat(today_str)
+            except (ValueError, TypeError):
+                parsed_today = None
+        if parsed_today is not None:
+            yesterday = parsed_today - datetime.timedelta(days=1)
             yesterday_str = yesterday.isoformat()
             rc2 = request("POST", f"/api/habits/{h2}/complete", {"date": yesterday_str})
             check("(d) complete yesterday (backdated) -> 201", rc2.status == 201,
@@ -208,7 +220,8 @@ def run():
                   today_str in hist and yesterday_str in hist,
                   f"history={hist}")
         else:
-            # No server date to anchor the backdated day: record the five
+            # No usable server date to anchor the backdated day (missing/None or
+            # a non-ISO string that failed to parse): record the five
             # server-date-dependent checks as failures to keep the total fixed.
             for label in (
                 "(d) complete yesterday (backdated) -> 201",
@@ -217,7 +230,7 @@ def run():
                 "(d) archived habit current_streak == 2",
                 "(d) archived habit history contains both completed dates",
             ):
-                check(label, False, "setup failed: no server date")
+                check(label, False, "setup failed: missing or unparseable server date")
     else:
         for label in (
             "(d) complete today (default) -> 201",
