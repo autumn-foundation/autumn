@@ -6796,10 +6796,23 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         // (the loaded row) is already in scope — it borrows the row, validates
         // the merged model via `from_patch`, and discards the draft (we only
         // want its 422 side-effect; the blind write below is unchanged).
-        // `#knob_load_and_validate` is spliced into the otherwise-blind no-lock
-        // sub-branches: it first SELECTs the current row (only when the knob is
-        // set — no unconditional extra query), then validates. Both expand to
+        // `#knob_load_and_validate` (plain, no tenant filter) and
+        // `#knob_load_and_validate_tenant` (tenant-filtered) are spliced into the
+        // otherwise-blind no-lock sub-branches: each first SELECTs the current row
+        // (only when the knob is set — no unconditional extra query), then
+        // validates. The tenant variant is used in the tenant_scoped blind branch
+        // so its SELECT matches that branch's own tenant-filtered UPDATE and the
+        // sibling version-checked load — otherwise a cross-tenant `id` would load a
+        // foreign row and surface 422 instead of the correct 404. All expand to
         // nothing when the knob is off, keeping the blind path byte-for-byte.
+        //
+        // Note (normalize-vs-persist asymmetry): `from_patch` normalizes the merged
+        // model before validating, but the blind path deliberately persists the
+        // un-normalized `changes.__to_changeset()` (the validation here is
+        // side-effect-only — we keep only its 422). So a value that passes only
+        // because normalization cleaned it up is stored raw. This is a known,
+        // deliberate limitation of the opt-in blind path; the hooked/#1804 path
+        // persists the normalized draft instead.
         let draft_ext_trait = format_ident!("{}DraftExt", model_name);
         let knob_validate_current = if config.validate_on_update_fetch {
             quote! {
@@ -6811,6 +6824,22 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         let knob_load_and_validate = if config.validate_on_update_fetch {
             quote! {
                 let __merged_current = #table_ident::table.find(id).first::<#model_name>(&mut conn).await.map_err(::autumn_web::AutumnError::from)?;
+                { let _ = <::autumn_web::hooks::UpdateDraft<#model_name> as #draft_ext_trait>::from_patch(&__merged_current, changes)?; }
+            }
+        } else {
+            quote! {}
+        };
+        // Tenant-scoped variant: mirror the branch's own UPDATE and sibling load,
+        // which filter by `#table_ident::tenant_id.eq(t)` when a tenant is in scope
+        // and fall back to the bare PK lookup only for across-tenants queries.
+        let knob_load_and_validate_tenant = if config.validate_on_update_fetch {
+            quote! {
+                let __merged_current = if let ::core::option::Option::Some(ref t) = tenant_id {
+                    #table_ident::table.find(id).filter(#table_ident::tenant_id.eq(t)).first::<#model_name>(&mut conn).await
+                } else {
+                    #table_ident::table.find(id).first::<#model_name>(&mut conn).await
+                }
+                .map_err(::autumn_web::AutumnError::from)?;
                 { let _ = <::autumn_web::hooks::UpdateDraft<#model_name> as #draft_ext_trait>::from_patch(&__merged_current, changes)?; }
             }
         } else {
@@ -6981,7 +7010,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     })
                     .await
                 } else {
-                    #knob_load_and_validate
+                    #knob_load_and_validate_tenant
                     let mut diesel_changeset = changes.__to_changeset();
                     if let ::core::option::Option::Some(ref t) = tenant_id {
                         use ::autumn_web::repository::CanSetTenantId as _;
@@ -14849,6 +14878,49 @@ mod tests {
             section.contains("from_patch"),
             "validate_on_update = fetch must emit a from_patch merged-model check \
              on the no-hooks update path: {section}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_tenant_scoped_validate_on_update_tenant_filters_load() {
+        // #1801 follow-up: on a `tenant_scoped` no-hooks repo WITH the knob, the
+        // blind (no version-check) sub-branch must load the current row for
+        // merged validation through the SAME tenant filter its own blind UPDATE
+        // uses — otherwise a cross-tenant `id` would load a foreign row and
+        // surface 422 instead of the correct 404. Assert the update body both
+        // emits the `from_patch` merged check and tenant-filters the load.
+        let generated = repository_macro(
+            quote! { Post, tenant_scoped, validate_on_update = fetch },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        let section = update_section(&generated);
+        assert!(
+            section.contains("from_patch"),
+            "tenant_scoped + validate_on_update = fetch must emit a from_patch \
+             merged-model check: {section}"
+        );
+        assert!(
+            section.contains("tenant_id . eq"),
+            "the tenant_scoped blind merged-validation load must be tenant-filtered \
+             (tenant_id.eq), matching its own blind UPDATE: {section}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_versioned_validate_on_update_emits_from_patch() {
+        // #1801 follow-up: a `versioned` no-hooks repo WITH the knob emits the
+        // merged-model `from_patch` check on its update body too.
+        let generated = repository_macro(
+            quote! { Post, versioned = true, validate_on_update = fetch },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        let section = update_section(&generated);
+        assert!(
+            section.contains("from_patch"),
+            "versioned + validate_on_update = fetch must emit a from_patch \
+             merged-model check: {section}"
         );
     }
 

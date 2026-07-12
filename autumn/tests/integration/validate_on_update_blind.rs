@@ -23,6 +23,7 @@
 #![allow(clippy::must_use_candidate, clippy::missing_const_for_fn)]
 
 use autumn_web::hooks::Patch;
+use autumn_web::tenancy::with_tenant;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::pooled_connection::deadpool::Pool;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
@@ -96,6 +97,45 @@ pub struct LaxHost {
 #[autumn_web::repository(LaxHost, table = "lax_hosts")]
 pub trait LaxHostRepository {}
 
+// ── Tenant-scoped opt-in repo (`tenant_scoped` + `validate_on_update = fetch`) ─
+//
+// This exists to force the `integration_tests` binary to COMPILE the macro
+// expansion of a tenant_scoped repo WITH the knob — the only configuration that
+// instantiates the tenant-filtered merged-validation SELECT. A typo in that
+// tenant-filtered token would fail to type-check here even before Docker runs.
+
+mod tenant_validated_schema {
+    autumn_web::reexports::diesel::table! {
+        tenant_blind_hosts (id) {
+            id -> Int8,
+            blurb -> Text,
+            slug -> Text,
+            tenant_id -> Text,
+        }
+    }
+}
+use tenant_validated_schema::tenant_blind_hosts;
+
+#[autumn_web::model(table = "tenant_blind_hosts")]
+pub struct TenantBlindHost {
+    #[id]
+    pub id: i64,
+    #[validate(does_not_contain(pattern = "bad"))]
+    pub blurb: String,
+    #[validate(custom(function = "no_uppercase"))]
+    pub slug: String,
+    #[default]
+    pub tenant_id: String,
+}
+
+#[autumn_web::repository(
+    TenantBlindHost,
+    table = "tenant_blind_hosts",
+    tenant_scoped,
+    validate_on_update = fetch
+)]
+pub trait TenantBlindHostRepository {}
+
 // ── Setup & helpers ──────────────────────────────────────────────────────────
 
 async fn setup_pool() -> (
@@ -129,6 +169,14 @@ async fn setup_pool() -> (
     .execute(&mut conn)
     .await
     .expect("create lax_hosts");
+    diesel::sql_query(
+        "CREATE TABLE IF NOT EXISTS tenant_blind_hosts \
+         (id BIGSERIAL PRIMARY KEY, blurb TEXT NOT NULL, slug TEXT NOT NULL, \
+          tenant_id TEXT NOT NULL)",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("create tenant_blind_hosts");
 
     (pool, container)
 }
@@ -146,6 +194,17 @@ fn build_blind_repo(pool: Pool<AsyncPgConnection>) -> PgBlindHostRepository {
 fn build_lax_repo(pool: Pool<AsyncPgConnection>) -> PgLaxHostRepository {
     PgLaxHostRepository {
         pool,
+        __autumn_read_route: autumn_web::repository::ReadRoute::Primary,
+        __autumn_statement_timeout_ms: 0,
+        __autumn_slow_threshold: std::time::Duration::from_millis(500),
+        __autumn_route: None,
+    }
+}
+
+fn build_tenant_blind_repo(pool: Pool<AsyncPgConnection>) -> PgTenantBlindHostRepository {
+    PgTenantBlindHostRepository {
+        pool,
+        across_tenants: false,
         __autumn_read_route: autumn_web::repository::ReadRoute::Primary,
         __autumn_statement_timeout_ms: 0,
         __autumn_slow_threshold: std::time::Duration::from_millis(500),
@@ -302,5 +361,49 @@ async fn plain_repo_without_knob_skips_merged_validation() {
     assert_eq!(
         updated.blurb, "this is bad",
         "the blind write must persist the patch unchanged when the knob is off"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn tenant_scoped_blind_merged_validation_stays_tenant_isolated() {
+    // #1801 follow-up: the tenant_scoped blind merged-validation SELECT must be
+    // tenant-filtered like its own blind UPDATE. Updating tenant-a's row from
+    // tenant-b's context must load NO row and surface 404 — not load the foreign
+    // row and validate the patch against it (which would surface 422).
+    //
+    // (This test is Docker-gated; its primary job in CI-without-Docker is to make
+    // the integration_tests binary COMPILE the tenant_scoped + knob macro
+    // expansion, type-checking the tenant-filtered token.)
+    let (pool, _container) = setup_pool().await;
+    let repo = build_tenant_blind_repo(pool);
+
+    let created = with_tenant("tenant-a".to_string(), async {
+        repo.save(&NewTenantBlindHost {
+            blurb: "all good".to_string(),
+            slug: "host-one".to_string(),
+        })
+        .await
+        .expect("insert a valid row under tenant-a")
+    })
+    .await;
+
+    let err = with_tenant("tenant-b".to_string(), async {
+        repo.update(
+            created.id,
+            &UpdateTenantBlindHost {
+                blurb: Patch::Set("this is bad".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect_err("a cross-tenant id must not be found from another tenant's context")
+    })
+    .await;
+    assert_eq!(
+        err.status(),
+        autumn_web::reexports::http::StatusCode::NOT_FOUND,
+        "the tenant-filtered merged-validation load must yield 404 for a foreign \
+         tenant's id, never a 422 from validating the wrong row"
     );
 }
