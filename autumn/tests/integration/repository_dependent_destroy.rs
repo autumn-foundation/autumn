@@ -479,6 +479,40 @@ pub struct DepNode {
 )]
 pub trait DepNodeRepository {}
 
+// ── Codex P2: self-referential `destroy` with an IMMEDIATE self-FK ─────────────
+//
+// `dep_imm_nodes.parent_id` references the same table, but the FK is NOT
+// deferrable (checked immediately, per-row). Bulk-deleting `[ancestor,
+// descendant]` while an intermediate node is NOT in the id list must remove the
+// whole subtree without tripping an immediate FK constraint — which requires the
+// bulk cascade to NOT pre-seed the descendant into the visited set (otherwise the
+// ancestor's cascade skips it, the intermediate is deleted first, and the still-
+// present descendant's FK immediately fails). Distinct from `dep_nodes`, whose
+// DEFERRABLE FK would mask this by deferring the check to COMMIT.
+
+diesel::table! {
+    dep_imm_nodes (id) {
+        id -> Int8,
+        parent_id -> Nullable<Int8>,
+        name -> Text,
+    }
+}
+
+#[autumn_web::model(table = "dep_imm_nodes")]
+pub struct DepImmNode {
+    #[id]
+    pub id: i64,
+    pub parent_id: Option<i64>,
+    pub name: String,
+}
+
+#[autumn_web::repository(
+    DepImmNode,
+    table = "dep_imm_nodes",
+    dependent(PgDepImmNodeRepository, fk = "parent_id", on_delete = destroy)
+)]
+pub trait DepImmNodeRepository {}
+
 // ── #1740: a HOOKED parent that also declares a dependent ─────────────────────
 //
 // All the dependent-declaring parents above are hook-free, so they exercise the
@@ -573,6 +607,9 @@ async fn setup_pool() -> (
         // point every row in the cycle is gone). ON DELETE has no DB-level cascade
         // — the framework cascade is what must clear the whole component.
         "CREATE TABLE dep_nodes (id BIGSERIAL PRIMARY KEY, parent_id BIGINT REFERENCES dep_nodes(id) DEFERRABLE INITIALLY DEFERRED, name TEXT NOT NULL)",
+        // Codex P2: IMMEDIATE (non-deferrable) self-referential FK — the check
+        // fires per-row, so the cascade cannot rely on deferral to COMMIT.
+        "CREATE TABLE dep_imm_nodes (id BIGSERIAL PRIMARY KEY, parent_id BIGINT REFERENCES dep_imm_nodes(id), name TEXT NOT NULL)",
     ] {
         diesel::sql_query(stmt)
             .execute(&mut conn)
@@ -609,6 +646,10 @@ fn dependent_repository_surface_is_generated() {
     assert_is_fn(PgDep3ReplyRepository::__autumn_apply_dependent_on_conn);
     assert_is_fn(<PgDepNodeRepository as DepNodeRepository>::delete_by_id);
     assert_is_fn(PgDepNodeRepository::__autumn_apply_dependent_on_conn);
+    // Codex P2: the immediate-FK self-referential parent's bulk delete_many
+    // monomorphizes (its cascade must not pre-seed batch targets).
+    assert_is_fn(<PgDepImmNodeRepository as DepImmNodeRepository>::delete_many);
+    assert_is_fn(PgDepImmNodeRepository::__autumn_apply_dependent_on_conn);
     // #1740: the bulk `delete_many` path now carries the dependent cascade too;
     // monomorphize it (hooks-child parent + restrict-only parent) to prove the
     // bulk-cascade codegen type-checks without Docker.
@@ -1018,6 +1059,56 @@ async fn self_referential_destroy_terminates_on_cycle() {
         count(&mut conn, "SELECT COUNT(*) AS n FROM dep_nodes").await,
         0,
         "#1739 cycle guard: the whole reachable cyclic component is destroyed, no rows left"
+    );
+}
+
+/// Codex P2: bulk-deleting `[ancestor, descendant]` of a self-referential
+/// `dependent = destroy` graph with an IMMEDIATE (non-deferrable) self-FK, where
+/// an intermediate node is NOT in the id list, must remove the whole subtree
+/// without an FK error. Chain: node 1 (ancestor) ← node 2 (intermediate, NOT in
+/// ids) ← node 3 (descendant). `delete_many([1, 3])`.
+///
+/// With the pre-#P2 pre-seeding, node 3 was marked visited up front, so the
+/// ancestor's cascade skipped it; deleting the intermediate (node 2) then failed
+/// the immediate FK from the still-present node 3. The fix populates the visited
+/// set only as rows are actually destroyed, so node 3 is cascaded (deepest first)
+/// before node 2 is removed.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn delete_many_self_referential_immediate_fk_removes_whole_subtree() {
+    let (pool, _c) = setup_pool().await;
+    let mut conn = pool.get().await.expect("conn");
+
+    // Insert with NULL parents first (immediate FK), then wire the chain.
+    for id in 1..=3 {
+        diesel::sql_query(format!(
+            "INSERT INTO dep_imm_nodes (id, parent_id, name) VALUES ({id}, NULL, 'n{id}')"
+        ))
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    }
+    // 2's parent = 1 (ancestor), 3's parent = 2 (intermediate).
+    diesel::sql_query("UPDATE dep_imm_nodes SET parent_id = 1 WHERE id = 2")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    diesel::sql_query("UPDATE dep_imm_nodes SET parent_id = 2 WHERE id = 3")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+
+    let repo = PgDepImmNodeRepository::with_pool_untracked(pool.clone());
+    // Intermediate node 2 is deliberately absent from the id list.
+    repo.delete_many(&[1, 3])
+        .await
+        .expect("Codex P2: bulk self-ref delete must not trip the immediate FK");
+
+    assert_eq!(
+        count(&mut conn, "SELECT COUNT(*) AS n FROM dep_imm_nodes").await,
+        0,
+        "Codex P2: the whole reachable subtree (ancestor, intermediate, \
+         descendant) is destroyed with no immediate FK violation"
     );
 }
 

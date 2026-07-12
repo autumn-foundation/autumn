@@ -1782,6 +1782,19 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // The cascade block, spliced inside the transaction BEFORE the bulk parent
     // delete. Restrict probes for every parent run first (a 409 rolls the whole
     // transaction back before any mutating action), then the mutating dependents.
+    //
+    // Codex P2: the shared `__autumn_visited` (table, id) cycle set is NOT
+    // pre-seeded with the bulk target ids. Pre-seeding a batch target marks it
+    // visited before it is actually processed, so for a self-referential
+    // `dependent = destroy` graph an ancestor's cascade would skip a descendant
+    // batch target that still references a not-yet-deleted intermediate node —
+    // and deleting that intermediate would then trip an IMMEDIATE foreign-key
+    // constraint mid-transaction. Instead the visited set is populated naturally
+    // AS each row is destroyed (by the Destroy arm), so a descendant referenced
+    // by an intermediate is cascaded — deepest first — when the ancestor reaches
+    // it, never pre-skipped. Cycles still terminate (a row already on the destroy
+    // path is skipped) and no row is double-deleted (the bulk `id = ANY` delete
+    // tolerates a batch target the cascade already removed).
     let delete_many_cascade = if delete_many_has_deps {
         quote! {
             let mut __autumn_visited: ::std::collections::HashSet<(&'static str, i64)> =
@@ -1794,8 +1807,8 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 __autumn_dep_parent_ids.extend(__autumn_dep_rows.iter().map(|__r| __r.id));
             }
             // Phase 1: probe all `restrict` dependents for every parent first.
+            // (Codex P2: no `__autumn_visited` pre-seed here — see above.)
             for &__autumn_pid in &__autumn_dep_parent_ids {
-                __autumn_visited.insert((#table_name, __autumn_pid));
                 #(#delete_many_restrict_calls)*
             }
             // Phase 2: mutating dependents per parent, in declaration order.
@@ -15059,6 +15072,17 @@ mod tests {
         &rest[..end]
     }
 
+    /// Helper: slice the generated `delete_many` trait-impl body (up to the next
+    /// `async fn`) so assertions target the bulk delete path.
+    fn delete_many_section(generated: &str) -> &str {
+        let start = generated
+            .find("async fn delete_many")
+            .expect("repository must generate delete_many");
+        let rest = &generated[start + "async fn delete_many".len()..];
+        let end = rest.find("async fn ").map_or(rest.len(), |p| p);
+        &rest[..end]
+    }
+
     /// Helper: slice the `Destroy` match arm of the generated
     /// `__autumn_apply_dependent_on_conn` helper, bounded to the helper method
     /// (which ends right before the always-generated `pub fn on_primary`), so
@@ -15233,6 +15257,34 @@ mod tests {
         assert!(
             !section.contains("AutumnDependents"),
             "repository-attribute delete_by_id must not runtime-dispatch (repo-attr wins): {section}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_delete_many_does_not_preseed_bulk_targets_in_visited() {
+        // Codex P2: the bulk `delete_many` cascade must NOT pre-seed the shared
+        // `__autumn_visited` cycle set with the batch target ids. Pre-seeding a
+        // descendant batch target makes an ancestor's cascade skip it, so for a
+        // self-referential `dependent = destroy` graph the still-referenced row is
+        // not removed before its intermediate parent is deleted → an immediate FK
+        // violation. The visited set must instead be populated naturally as each
+        // row is destroyed. Assert the bulk cascade issues NO `__autumn_visited`
+        // pre-insert (the only inserts happen inside the Destroy leaf executor).
+        let generated = repository_macro(
+            quote! { Node, dependent(PgNodeRepository, fk = "parent_id", on_delete = destroy) },
+            quote! { pub trait NodeRepository {} },
+        )
+        .to_string();
+        let section = delete_many_section(&generated);
+        assert!(
+            section.contains("__autumn_apply_dependent_on_conn"),
+            "the bulk delete_many path must cascade dependents: {section}"
+        );
+        assert!(
+            !section.contains("__autumn_visited . insert"),
+            "Codex P2: delete_many must not pre-seed batch target ids into the \
+             visited set (that skips still-referenced self-ref descendants and \
+             trips an immediate FK): {section}"
         );
     }
 
