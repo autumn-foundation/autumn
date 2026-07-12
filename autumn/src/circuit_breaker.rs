@@ -1,3 +1,52 @@
+//! Circuit Breaker implementation to protect the application from cascading failures.
+//!
+//! # Why does this exist?
+//! When interacting with external systems (like databases, third-party APIs, or microservices),
+//! failures are inevitable. If a remote service goes down or starts responding slowly, your
+//! application can quickly consume all its resources waiting for responses, leading to a cascading
+//! failure that takes down your entire service.
+//!
+//! The Circuit Breaker pattern prevents this by monitoring the success/failure rate of operations.
+//! If the failure rate exceeds a certain threshold, the circuit breaker "opens", and subsequent
+//! calls fail fast (returning an error immediately) without actually attempting the operation.
+//! This gives the failing system time to recover and protects your application's resources.
+//!
+//! # How it works
+//! A circuit breaker transitions between three states:
+//!
+//! * **Closed**: Operations flow normally. Successes and failures are recorded.
+//! * **Open**: Operations fail fast with [`CircuitBreakerError::Open`]. The failing service is given time to recover.
+//! * **Half-Open**: After a timeout, a limited number of test operations are allowed through. If they succeed, the circuit closes. If they fail, it opens again.
+//!
+//! # Example
+//!
+//! ```rust
+//! use autumn_web::circuit_breaker::{CircuitBreaker, CircuitBreakerPolicy};
+//! use std::time::Duration;
+//!
+//! # tokio_test::block_on(async {
+//! // Configure the policy
+//! let policy = CircuitBreakerPolicy {
+//!     failure_ratio_threshold: 0.5,
+//!     sample_window: Duration::from_secs(10),
+//!     minimum_sample_count: 5,
+//!     open_duration: Duration::from_secs(60),
+//!     half_open_trial_count: 3,
+//! };
+//!
+//! // Create a new breaker
+//! let breaker = CircuitBreaker::new("payment_gateway", policy);
+//!
+//! // Run an operation through the breaker
+//! let result = breaker.run(async {
+//!     // Simulate a fallible operation
+//!     Ok::<_, &'static str>("Payment successful")
+//! }).await;
+//!
+//! assert_eq!(result.unwrap(), "Payment successful");
+//! # });
+//! ```
+
 #![allow(
     clippy::missing_panics_doc,
     clippy::missing_errors_doc,
@@ -33,6 +82,9 @@ impl CircuitState {
     }
 }
 
+/// Configuration policy for a [`CircuitBreaker`].
+///
+/// Determines the failure threshold, sample window, and wait durations.
 #[derive(Debug, Clone)]
 pub struct CircuitBreakerPolicy {
     pub failure_ratio_threshold: f64,
@@ -103,6 +155,13 @@ pub enum CircuitBreakerError<E> {
     Execution(E),
 }
 
+/// A thread-safe, stateful circuit breaker.
+///
+/// Wraps an underlying operation. It tracks the successes and failures of the operation
+/// and automatically halts execution (fails fast) when the failure rate exceeds the
+/// configured threshold, giving the underlying system time to recover.
+///
+/// See the [module-level documentation](crate::circuit_breaker) for more details.
 #[derive(Clone)]
 pub struct CircuitBreaker {
     name: String,
@@ -157,6 +216,16 @@ impl CircuitBreakerInner {
 }
 
 impl CircuitBreaker {
+    /// Creates a new `CircuitBreaker` with the given name and policy.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use autumn_web::circuit_breaker::{CircuitBreaker, CircuitBreakerPolicy};
+    ///
+    /// let breaker = CircuitBreaker::new("my_service", CircuitBreakerPolicy::default());
+    /// assert_eq!(breaker.name(), "my_service");
+    /// ```
     pub fn new(name: impl Into<String>, mut config: CircuitBreakerPolicy) -> Self {
         config.failure_ratio_threshold = config.failure_ratio_threshold.clamp(0.000_1, 1.0);
         Self {
@@ -299,6 +368,27 @@ impl CircuitBreaker {
         }
     }
 
+    /// Executes the provided future within the circuit breaker.
+    ///
+    /// If the circuit is Open, this method immediately returns `Err(CircuitBreakerError::Open)`
+    /// without awaiting the future. If the circuit is Closed or Half-Open, the future is awaited,
+    /// and its result (success or failure) is recorded by the breaker.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use autumn_web::circuit_breaker::{CircuitBreaker, CircuitBreakerPolicy};
+    ///
+    /// # tokio_test::block_on(async {
+    /// let breaker = CircuitBreaker::new("db", CircuitBreakerPolicy::default());
+    ///
+    /// let result = breaker.run(async {
+    ///     Ok::<_, &'static str>("data")
+    /// }).await;
+    ///
+    /// assert_eq!(result.unwrap(), "data");
+    /// # });
+    /// ```
     pub async fn run<F, T, E>(&self, fut: F) -> Result<T, CircuitBreakerError<E>>
     where
         F: Future<Output = Result<T, E>>,
@@ -365,6 +455,10 @@ impl Drop for CircuitBreakerGuard {
     }
 }
 
+/// A thread-safe registry for managing multiple named [`CircuitBreaker`] instances.
+///
+/// Ensures that multiple components can share the same circuit breaker instance
+/// by name without passing `Arc` references manually.
 pub struct CircuitBreakerRegistry {
     breakers: Mutex<HashMap<String, CircuitBreaker>>,
 }
@@ -385,6 +479,20 @@ impl CircuitBreakerRegistry {
         self.breakers.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// Retrieves an existing [`CircuitBreaker`] by name, or creates a new one
+    /// using the provided configuration if it does not exist.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use autumn_web::circuit_breaker::{CircuitBreakerRegistry, CircuitBreakerPolicy};
+    ///
+    /// let registry = CircuitBreakerRegistry::new();
+    /// let breaker1 = registry.get_or_create("service_a", CircuitBreakerPolicy::default());
+    /// let breaker2 = registry.get_or_create("service_a", CircuitBreakerPolicy::default());
+    ///
+    /// assert_eq!(registry.all_breakers().len(), 1); // Both variables point to the same breaker
+    /// ```
     pub fn get_or_create(&self, name: &str, config: CircuitBreakerPolicy) -> CircuitBreaker {
         let mut breakers = self.lock_breakers();
         breakers
