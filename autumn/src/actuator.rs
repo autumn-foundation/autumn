@@ -738,14 +738,17 @@ impl JobStatus {
 }
 
 /// Per-queue observability gauges for the actuator jobs endpoint (issue #1623,
-/// AC7): approximate queue depth and the age of the oldest still-waiting job.
+/// AC7): queue depth and the age of the oldest still-waiting job.
 ///
-/// Like the per-job [`JobStatus`] gauges, these reflect enqueue/start events
-/// observed **in this process**; on the durable backends a queue also drained
-/// by other replicas reads as this replica's share of the traffic.
+/// On the **local** backend (single process, single registry) these reflect
+/// enqueue/start events observed in this process via the `record_*` marks.
+/// On the **durable** backends (Postgres/Redis) they are backend-derived and
+/// authoritative (issue #1752): a periodic survey of the durable store
+/// wholesale-replaces this snapshot each tick, so an enqueue-only web replica
+/// reports the true shared backlog rather than its own local enqueue marks.
 #[derive(Debug, Clone, Serialize)]
 pub struct QueueStatus {
-    /// Approximate jobs waiting to run on this queue.
+    /// Jobs waiting to run on this queue.
     pub depth: u64,
     /// Age in milliseconds of the oldest still-waiting job on this queue
     /// (`0` when the queue is empty).
@@ -761,7 +764,18 @@ struct QueueGaugeState {
     /// A mark whose ready-at is in the future belongs to a scheduled (delayed)
     /// job that is not yet claimable, so it is excluded from ready depth/age
     /// until its ready-at time passes.
+    ///
+    /// Only authoritative on the local backend. On the durable backends this
+    /// still records marks (harmless) but [`Self::surveyed`] overrides them.
     waiting: HashMap<String, std::collections::VecDeque<u64>>,
+    /// Backend-derived per-queue gauges from the durable survey (issue #1752).
+    /// When `Some`, this authoritative snapshot — refreshed each survey tick
+    /// from the durable store — backs [`JobRegistry::queue_snapshot`] instead
+    /// of the per-process `waiting` marks. `None` on the local backend, which
+    /// keeps the in-memory mark path. Each value is `(ready depth, oldest
+    /// ready-at epoch ms)`; the reported age is derived from the timestamp at
+    /// snapshot time so it stays fresh between surveys.
+    surveyed: Option<HashMap<String, (u64, Option<u64>)>>,
 }
 
 fn now_epoch_ms() -> u64 {
@@ -816,12 +830,45 @@ impl JobRegistry {
     }
 
     /// Snapshot per-queue depth and oldest-waiting-job age.
+    ///
+    /// On the durable backends a periodic survey has populated an authoritative
+    /// snapshot (via [`Self::set_queue_depth_gauges`]); it takes precedence over
+    /// the per-process `waiting` marks so an enqueue-only replica reports the
+    /// true shared backlog. On the local backend the survey is absent and the
+    /// in-memory marks drive the gauges.
     #[must_use]
     pub fn queue_snapshot(&self) -> HashMap<String, QueueStatus> {
         let now = now_epoch_ms();
         self.queues
             .read()
             .map(|g| {
+                if let Some(surveyed) = &g.surveyed {
+                    // Durable backend: the survey is authoritative. Report every
+                    // known queue (registered locally or seen in the survey);
+                    // queues absent from the latest survey reset to depth 0 so
+                    // stale backlog never leaks between ticks.
+                    return g
+                        .waiting
+                        .keys()
+                        .chain(surveyed.keys())
+                        .cloned()
+                        .collect::<std::collections::HashSet<String>>()
+                        .into_iter()
+                        .map(|queue| {
+                            let (depth, oldest_ready_at) =
+                                surveyed.get(&queue).copied().unwrap_or((0, None));
+                            let oldest_waiting_age_ms =
+                                oldest_ready_at.map_or(0, |ts| now.saturating_sub(ts));
+                            (
+                                queue,
+                                QueueStatus {
+                                    depth,
+                                    oldest_waiting_age_ms,
+                                },
+                            )
+                        })
+                        .collect();
+                }
                 g.waiting
                     .iter()
                     .map(|(queue, waiting)| {
@@ -946,6 +993,40 @@ impl JobRegistry {
         if let Ok(mut guard) = self.inner.write() {
             for (name, status) in guard.iter_mut() {
                 status.blocked_on_concurrency = counts.get(name).copied().unwrap_or(0);
+            }
+        }
+    }
+
+    /// Replace the per-queue depth/oldest-age gauges from a backend-wide survey
+    /// (issue #1752).
+    ///
+    /// On the durable backends (Postgres/Redis) a queue is drained by other
+    /// processes, so the authoritative ready depth and oldest-waiting age come
+    /// from a periodic survey of the durable store rather than this process's
+    /// local enqueue marks. This wholesale-replaces the snapshot each tick:
+    /// queues absent from `per_queue` reset to depth 0 (no leaks). Each value
+    /// is `(ready depth, oldest ready-at epoch ms)`; the reported age is
+    /// derived from the timestamp at [`Self::queue_snapshot`] time so it stays
+    /// fresh between surveys. Once called, the survey overrides the in-memory
+    /// `record_*` marks for the `queues` gauge family.
+    pub fn set_queue_depth_gauges(&self, per_queue: &HashMap<String, (u64, Option<u64>)>) {
+        if let Ok(mut guard) = self.queues.write() {
+            guard.surveyed = Some(per_queue.clone());
+        }
+    }
+
+    /// Replace the per-job-type `queued` gauge from a backend-wide survey
+    /// (issue #1752).
+    ///
+    /// Names absent from `counts` reset to zero, mirroring
+    /// [`Self::set_concurrency_blocked_counts`]. Used by the durable backends
+    /// whose ready depth is observed periodically rather than tracked per
+    /// enqueue/start event, so the reported `jobs.<name>.queued` reflects the
+    /// shared durable backlog instead of this process's local enqueue marks.
+    pub fn set_queued_counts(&self, counts: &HashMap<String, u64>) {
+        if let Ok(mut guard) = self.inner.write() {
+            for (name, status) in guard.iter_mut() {
+                status.queued = counts.get(name).copied().unwrap_or(0);
             }
         }
     }
@@ -3740,6 +3821,83 @@ mod tests {
         assert_eq!(drained.get("critical").unwrap().depth, 0);
         assert_eq!(drained.get("critical").unwrap().oldest_waiting_age_ms, 0);
         assert_eq!(drained.get("bulk").unwrap().depth, 0);
+    }
+
+    #[test]
+    fn survey_setter_overwrites_queue_gauges_and_resets_absent_queues() {
+        let registry = JobRegistry::new();
+        registry.register_on_queue("reset_email", "critical");
+        registry.register_on_queue("reindex", "bulk");
+
+        // Local marks exist, but once a survey is published it is authoritative:
+        // the durable backend, not this process's enqueue marks, drives the
+        // reported depth/age (issue #1752).
+        registry.record_enqueue("reset_email");
+
+        let now = now_epoch_ms();
+        let mut survey = HashMap::new();
+        // `critical` has 4 ready jobs; oldest became ready 5s ago.
+        survey.insert(
+            "critical".to_string(),
+            (4_u64, Some(now.saturating_sub(5_000))),
+        );
+        // `bulk` is empty in the survey (absent oldest → age 0).
+        survey.insert("bulk".to_string(), (0_u64, None));
+        registry.set_queue_depth_gauges(&survey);
+
+        let snap = registry.queue_snapshot();
+        assert_eq!(
+            snap.get("critical").unwrap().depth,
+            4,
+            "survey depth overrides the local enqueue mark"
+        );
+        let age = snap.get("critical").unwrap().oldest_waiting_age_ms;
+        assert!(
+            (5_000..=6_000).contains(&age),
+            "age is derived from the surveyed oldest ready-at timestamp, got {age}"
+        );
+        assert_eq!(snap.get("bulk").unwrap().depth, 0);
+        assert_eq!(snap.get("bulk").unwrap().oldest_waiting_age_ms, 0);
+
+        // A later survey that omits `critical` resets it to 0 (no leak), even
+        // though a known/registered queue keeps appearing in the snapshot.
+        let mut survey2 = HashMap::new();
+        survey2.insert("bulk".to_string(), (2_u64, Some(now)));
+        registry.set_queue_depth_gauges(&survey2);
+        let snap2 = registry.queue_snapshot();
+        assert_eq!(
+            snap2.get("critical").unwrap().depth,
+            0,
+            "a queue absent from the newest survey resets to 0"
+        );
+        assert_eq!(snap2.get("bulk").unwrap().depth, 2);
+    }
+
+    #[test]
+    fn survey_setter_overwrites_per_job_queued_and_resets_absent_names() {
+        let registry = JobRegistry::new();
+        registry.register("reset_email");
+        registry.register("reindex");
+
+        registry.record_enqueue("reset_email");
+        registry.record_enqueue("reset_email");
+
+        let mut counts = HashMap::new();
+        counts.insert("reset_email".to_string(), 7_u64);
+        registry.set_queued_counts(&counts);
+        assert_eq!(
+            registry.snapshot()["reset_email"].queued,
+            7,
+            "survey overwrites the local enqueue-driven queued count"
+        );
+        assert_eq!(
+            registry.snapshot()["reindex"].queued,
+            0,
+            "a name absent from the survey resets to 0"
+        );
+
+        registry.set_queued_counts(&HashMap::new());
+        assert_eq!(registry.snapshot()["reset_email"].queued, 0);
     }
 
     #[test]
