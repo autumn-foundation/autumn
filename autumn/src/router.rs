@@ -3422,32 +3422,39 @@ pub fn try_build_router_with_static_inner(
                         // `/sitemap.xml` -> `sitemap.xml/index.html`. Reading the
                         // extension off `index.html` would mislabel those as
                         // text/html. The request route carries the true
-                        // extension, so when its final path segment has one, use
-                        // it. The URL path is always '/'-delimited, so inspecting
-                        // the last segment is unaffected by platform path
-                        // separators.
+                        // extension, so prefer it — but ONLY when its final path
+                        // segment ends in an extension the asset table actually
+                        // recognizes.
+                        //
+                        // A bare `contains('.')` check is too loose: a generated
+                        // page whose slug merely contains a dot
+                        // (`/posts/release.v1`, `/users/alice@example.com`) is
+                        // still stored as `<slug>/index.html` HTML, yet `.v1` /
+                        // `.com` are not asset extensions. Deriving the MIME from
+                        // the route there would mislabel HTML as
+                        // `application/octet-stream` and break its compression.
+                        // `content_type_for_opt` returns `Some` only for a
+                        // recognized extension, so those unrecognized-dot slugs
+                        // fall through to the served file name (`index.html` ->
+                        // text/html), exactly like extensionless pages.
                         //
                         // Extensionless routes are real pages (`/about` ->
-                        // `about/index.html`): fall back to the served file name,
-                        // which resolves to text/html; charset=utf-8 exactly as
-                        // before. Hand-written manifests that map an
-                        // extensionless route directly at an extensioned file
-                        // (e.g. `/logo` -> `logo.png`) are likewise covered by
-                        // this fallback.
-                        let route_has_extension = normalized
-                            .rsplit('/')
-                            .next()
-                            .is_some_and(|segment| segment.contains('.'));
-                        let content_type = if route_has_extension {
-                            crate::assets::content_type_for(normalized)
-                        } else {
-                            file_path
-                                .file_name()
-                                .and_then(|name| name.to_str())
-                                .map_or("application/octet-stream", |name| {
-                                    crate::assets::content_type_for(name)
-                                })
-                        };
+                        // `about/index.html`) and resolve to text/html via the
+                        // same file-name fallback. Hand-written manifests that map
+                        // an extensionless route directly at an extensioned file
+                        // (e.g. `/logo` -> `logo.png`, `/inter` ->
+                        // `fonts/inter.woff2`) are likewise covered by it. The URL
+                        // path is always '/'-delimited, so inspecting the last
+                        // segment is unaffected by platform path separators.
+                        let content_type = crate::assets::content_type_for_opt(normalized)
+                            .unwrap_or_else(|| {
+                                file_path
+                                    .file_name()
+                                    .and_then(|name| name.to_str())
+                                    .map_or("application/octet-stream", |name| {
+                                        crate::assets::content_type_for(name)
+                                    })
+                            });
                         let body = if is_head {
                             axum::body::Body::empty()
                         } else {
@@ -7372,6 +7379,105 @@ enabled = true
                 .and_then(|v| v.to_str().ok()),
             Some("application/xml"),
             "generated .xml route must be application/xml, derived from the route extension"
+        );
+    }
+
+    /// A generated HTML page whose slug merely *contains* a dot but ends in an
+    /// UNRECOGNIZED extension (`/posts/release.v1` -> `release.v1/index.html`)
+    /// stays `text/html; charset=utf-8` and is gzip-compressed. The `.v1`
+    /// pseudo-extension is not an asset type, so the MIME must come from the
+    /// served `index.html` — not be mislabeled octet-stream by a loose
+    /// `contains('.')` heuristic.
+    #[tokio::test]
+    async fn ssg_dotted_slug_generated_page_stays_html_and_compressed() {
+        let html = format!(
+            "<html><body>{}</body></html>",
+            "Release notes. ".repeat(128)
+        );
+        let tmp = create_ssg_dist(&[(
+            "/posts/release.v1",
+            "release.v1/index.html",
+            html.as_bytes(),
+        )]);
+        let dist = tmp.path().join("dist");
+
+        let router = try_build_router_with_static(
+            Vec::new(),
+            &compression_enabled_config(),
+            test_state(),
+            Some(&dist),
+        )
+        .expect("router builds");
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/posts/release.v1")
+                    .header("accept-encoding", "gzip")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("text/html; charset=utf-8"),
+            "dotted-slug generated page must stay text/html, not octet-stream"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(http::header::CONTENT_ENCODING)
+                .and_then(|v| v.to_str().ok()),
+            Some("gzip"),
+            "dotted-slug generated HTML page must be gzip-compressed"
+        );
+    }
+
+    /// A generated HTML page whose slug contains an email-like dotted suffix
+    /// (`/users/alice@example.com` -> `alice@example.com/index.html`) stays
+    /// `text/html; charset=utf-8`. Neither `.com` nor the `@` makes it an
+    /// asset, so the MIME comes from the served `index.html`.
+    #[tokio::test]
+    async fn ssg_email_slug_generated_page_stays_html() {
+        let html = format!("<html><body>{}</body></html>", "Profile. ".repeat(64));
+        let tmp = create_ssg_dist(&[(
+            "/users/alice@example.com",
+            "alice@example.com/index.html",
+            html.as_bytes(),
+        )]);
+        let dist = tmp.path().join("dist");
+
+        let router = try_build_router_with_static(
+            Vec::new(),
+            &compression_enabled_config(),
+            test_state(),
+            Some(&dist),
+        )
+        .expect("router builds");
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/users/alice@example.com")
+                    .header("accept-encoding", "gzip")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("text/html; charset=utf-8"),
+            "email-like dotted-slug generated page must stay text/html"
         );
     }
 
