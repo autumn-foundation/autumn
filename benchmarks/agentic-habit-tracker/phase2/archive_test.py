@@ -128,7 +128,7 @@ def run():
     check("POST /api/habits -> 201", r.status == 201, f"got {r.status}")
     check("created habit has id", hid is not None)
     if hid is None:
-        # Denominator is intentionally fixed at 14: a failed setup must not
+        # Denominator is intentionally fixed at 16: a failed setup must not
         # shrink the total and inflate the pass rate. Record every dependent
         # check as an explicit failure instead of exiting early and skipping them.
         for label in (
@@ -144,6 +144,8 @@ def run():
             "POST second habit -> 201",
             "non-archived habit still present in default list after archiving another",
             "archived habit still absent from default list (regression)",
+            "archived habit name absent from HTML GET / view",
+            "active habit name present in HTML GET / view",
         ):
             check(label, False, "setup failed: no habit id")
         total = _PASSED + _FAILED
@@ -198,6 +200,40 @@ def run():
           contains(default_ids, hid2))
     check("archived habit still absent from default list (regression)",
           not contains(default_ids, hid))
+
+    # HTML view must list only non-archived habits (phase-2 brief / SPEC §4).
+    # Create one habit to archive and one to keep active, both with unique,
+    # HTML-greppable names, then assert the archived name is absent from the
+    # server-rendered HTML body while the active name is present. Fail-closed:
+    # if either habit can't be created or the archive doesn't take, record both
+    # checks as failures rather than skipping (keeps the denominator at 16).
+    HIDDEN_NAME = "ZzArchivedHidden-Q7"
+    ACTIVE_NAME = "ZzActiveVisible-Q7"
+    _, hidden_hid = new_habit(HIDDEN_NAME)
+    _, active_hid = new_habit(ACTIVE_NAME)
+    html_setup_ok = hidden_hid is not None and active_hid is not None
+    if html_setup_ok:
+        ar = request("POST", f"/api/habits/{hidden_hid}/archive")
+        html_setup_ok = ar.status in (200, 204)
+    if html_setup_ok:
+        r = request("GET", "/")
+        html_ok = r.status == 200 and "text/html" in r.content_type().lower()
+        body_text = r.body_bytes.decode("utf-8", "replace") if html_ok else ""
+        check(
+            "archived habit name absent from HTML GET / view",
+            html_ok and HIDDEN_NAME not in body_text,
+            f"status={r.status}, ct={r.content_type()!r}, present={HIDDEN_NAME in body_text}",
+        )
+        check(
+            "active habit name present in HTML GET / view",
+            html_ok and ACTIVE_NAME in body_text,
+            f"status={r.status}, ct={r.content_type()!r}, present={ACTIVE_NAME in body_text}",
+        )
+    else:
+        check("archived habit name absent from HTML GET / view", False,
+              "setup failed: could not create/archive habits for HTML view check")
+        check("active habit name present in HTML GET / view", False,
+              "setup failed: could not create/archive habits for HTML view check")
 
     total = _PASSED + _FAILED
     print(f"RESULT: {_PASSED}/{total} passed")

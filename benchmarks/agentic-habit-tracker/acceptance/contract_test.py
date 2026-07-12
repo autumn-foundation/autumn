@@ -190,13 +190,24 @@ def run():
             server_today = None
     today = server_today or datetime.date.today()
     check(f"complete {iso(today)} -> 201", r0.status == 201, f"got {r0.status}")
+    complete_streak = None
     for delta in (1, 2):  # D-1, D-2 relative to the server's today
         d = today - datetime.timedelta(days=delta)
         rr = request("POST", f"/api/habits/{sid}/complete", {"date": iso(d)})
         check(f"complete {iso(d)} -> 201", rr.status == 201, f"got {rr.status}")
+        if rr.status == 201:
+            complete_streak = (rr.json() or {}).get("current_streak")
     r = request("GET", f"/api/habits/{sid}")
     streak = r.json().get("current_streak") if r.status == 200 else None
     check("streak of 3 consecutive days == 3", streak == 3, f"got {streak}")
+    # The streak the complete endpoint returns must agree with what GET reports
+    # immediately after (both are "as of server today" per SPEC). This is a
+    # value consistency check with no hardcoded number, so an implementation
+    # that computes the streak differently on POST vs GET can't get full credit.
+    # Fail-closed: if the final backdated completion returned no streak, fail.
+    check("complete-response current_streak agrees with GET",
+          complete_streak is not None and complete_streak == streak,
+          f"complete={complete_streak}, get={streak}")
     hist = r.json().get("history") if r.status == 200 else None
     expected_hist = [iso(today - datetime.timedelta(days=d)) for d in (0, 1, 2)]
     check("history is 3 dates descending", hist == expected_hist, f"got {hist}")

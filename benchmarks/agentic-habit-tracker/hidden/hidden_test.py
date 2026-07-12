@@ -169,10 +169,20 @@ def run():
         complete(hid, 1)   # then D-1
         s = streak_of(hid)
         check("(b) out-of-order backdated completions -> streak 3", s == 3, f"got {s}")
+        # Regardless of insertion order, history must come back in strictly
+        # DESCENDING date order (SPEC). Fetch the habit and compare its history
+        # to the same dates sorted newest-first: [D, D-1, D-2].
+        rb = request("GET", f"/api/habits/{hid}")
+        hist = rb.json().get("history") if rb.status == 200 else None
+        expected_desc = [day(0), day(1), day(2)]
+        check("(b) history in descending date order after out-of-order inserts",
+              hist == expected_desc, f"got {hist}")
     else:
         for delta in (0, 2, 1):
             check(f"complete D-{delta} ({day(delta)}) -> 201", False, "setup failed: no habit id")
         check("(b) out-of-order backdated completions -> streak 3", False,
+              "setup failed: no habit id")
+        check("(b) history in descending date order after out-of-order inserts", False,
               "setup failed: no habit id")
 
     # (c) duplicate via explicit today's date after default-complete -> 409
