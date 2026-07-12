@@ -759,7 +759,7 @@ impl Default for CsrfConfig {
 /// | `enabled` | `true` |
 /// | `field_name` | `"_submit_token"` |
 /// | `ttl_secs` | `600` (10 min) |
-/// | `backend` | `"memory"` |
+/// | `backend` | *inherits `[idempotency].backend`* (in-memory in dev, Redis in prod) |
 /// | `exempt_paths` | `[]` |
 ///
 /// # Examples
@@ -768,7 +768,7 @@ impl Default for CsrfConfig {
 /// [security.submit_token]
 /// enabled = true
 /// ttl_secs = 900
-/// backend = "redis"   # reuses the [idempotency.redis] connection settings
+/// backend = "redis"   # override; reuses the [idempotency.redis] connection settings
 /// ```
 #[derive(Debug, Clone, Deserialize)]
 pub struct SubmitTokenConfig {
@@ -785,12 +785,24 @@ pub struct SubmitTokenConfig {
     #[serde(default = "default_submit_token_ttl_secs")]
     pub ttl_secs: u64,
 
-    /// Storage backend for consumed submit tokens. Default: `"memory"`.
+    /// Storage backend for consumed submit tokens.
     ///
-    /// When `"redis"`, the store reuses the `[idempotency.redis]` connection
-    /// settings so a multi-replica deployment shares one token store.
+    /// When unset (the default, `None`), the submit-token store **inherits the
+    /// configured idempotency backend** (`[idempotency].backend`): a
+    /// Redis-configured app automatically shares one consumed-token store across
+    /// replicas, while a dev app on the default in-memory idempotency backend
+    /// keeps an in-memory token store. This matches issue #1360: the token store
+    /// is backed by the existing idempotency/session store backend (in-memory in
+    /// dev, Redis in prod), so a double-click load-balanced to a different
+    /// replica cannot re-run the mutation in production.
+    ///
+    /// Set explicitly to override the inherited backend for submit tokens only.
+    /// When it resolves to `"redis"`, the store reuses the `[idempotency.redis]`
+    /// connection settings so a multi-replica deployment shares one token store.
+    ///
+    /// Use [`Self::resolved_backend`] to obtain the effective backend.
     #[serde(default)]
-    pub backend: crate::config::IdempotencyBackend,
+    pub backend: Option<crate::config::IdempotencyBackend>,
 
     /// Request path prefixes that are exempt from submit-token guarding.
     /// Default: `[]`.
@@ -804,9 +816,26 @@ impl Default for SubmitTokenConfig {
             enabled: default_submit_token_enabled(),
             field_name: default_submit_token_field(),
             ttl_secs: default_submit_token_ttl_secs(),
-            backend: crate::config::IdempotencyBackend::default(),
+            backend: None,
             exempt_paths: Vec::new(),
         }
+    }
+}
+
+impl SubmitTokenConfig {
+    /// Resolve the effective consumed-token storage backend.
+    ///
+    /// Returns the explicit `backend` override when one is configured;
+    /// otherwise inherits `idempotency_backend` (the app's
+    /// `[idempotency].backend`) so submit tokens share the idempotency store by
+    /// default. This is the single source of truth for backend selection so the
+    /// idempotency layer and the submit-token layer cannot drift apart.
+    #[must_use]
+    pub fn resolved_backend(
+        &self,
+        idempotency_backend: crate::config::IdempotencyBackend,
+    ) -> crate::config::IdempotencyBackend {
+        self.backend.unwrap_or(idempotency_backend)
     }
 }
 
@@ -1420,6 +1449,50 @@ const fn default_max_file_size_bytes() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::IdempotencyBackend;
+
+    // ── submit-token backend resolution (Finding D: inherit idempotency) ─────
+
+    #[test]
+    fn submit_token_backend_defaults_to_none_and_inherits_idempotency() {
+        // Unset `[security.submit_token].backend` deserializes to `None`.
+        let cfg: SubmitTokenConfig = toml::from_str("").unwrap();
+        assert_eq!(cfg.backend, None, "unset backend must deserialize to None");
+        // With idempotency on Redis, the resolved submit-token backend follows
+        // it — NOT the old hardcoded Memory default.
+        assert_eq!(
+            cfg.resolved_backend(IdempotencyBackend::Redis),
+            IdempotencyBackend::Redis,
+            "an unset submit-token backend must inherit the Redis idempotency backend"
+        );
+        // A dev app on the default Memory idempotency backend stays Memory.
+        assert_eq!(
+            cfg.resolved_backend(IdempotencyBackend::Memory),
+            IdempotencyBackend::Memory,
+            "an unset submit-token backend on a Memory idempotency app stays Memory"
+        );
+    }
+
+    #[test]
+    fn submit_token_explicit_backend_overrides_inherited_idempotency() {
+        // An explicit `backend = "memory"` wins even when idempotency is Redis.
+        let cfg: SubmitTokenConfig = toml::from_str("backend = \"memory\"").unwrap();
+        assert_eq!(cfg.backend, Some(IdempotencyBackend::Memory));
+        assert_eq!(
+            cfg.resolved_backend(IdempotencyBackend::Redis),
+            IdempotencyBackend::Memory,
+            "an explicit submit-token backend override must win over the inherited backend"
+        );
+
+        // An explicit `backend = "redis"` wins even when idempotency is Memory.
+        let cfg: SubmitTokenConfig = toml::from_str("backend = \"redis\"").unwrap();
+        assert_eq!(cfg.backend, Some(IdempotencyBackend::Redis));
+        assert_eq!(
+            cfg.resolved_backend(IdempotencyBackend::Memory),
+            IdempotencyBackend::Redis,
+            "an explicit redis override must win over an inherited Memory backend"
+        );
+    }
 
     // ── validate_signing_secret (RED phase) ─────────────────────────────────
 

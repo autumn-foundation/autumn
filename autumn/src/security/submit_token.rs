@@ -609,7 +609,26 @@ where
                             body: bytes.to_vec(),
                             metadata: Vec::new(),
                         };
-                        settings.store.set(&key, record, Vec::new(), settings.ttl);
+                        // Persist the consumed-token record. If the store write
+                        // fails after the handler already committed its mutation
+                        // and returned a 2xx/3xx, fail closed exactly as
+                        // `IdempotencyLayer` does: keep the in-flight lock held
+                        // (by not unlocking, it expires via `in_flight_ttl`) so a
+                        // retry carrying the same token gets a `409` in-flight
+                        // conflict rather than silently re-running the
+                        // create/update, and surface `503` instead of an
+                        // un-recorded success.
+                        if let Err(error) =
+                            settings
+                                .store
+                                .try_set(&key, record, Vec::new(), settings.ttl)
+                        {
+                            tracing::error!(
+                                error = %error,
+                                "Submit-token persistence failed after handler success; failing closed"
+                            );
+                            return Ok(crate::idempotency::persistence_failed_response());
+                        }
                     }
                     settings.store.unlock(&key);
                     Ok(Response::from_parts(parts, Body::from(bytes)))
@@ -629,7 +648,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::idempotency::MemoryIdempotencyStore;
+    use crate::idempotency::{IdempotencyEntry, IdempotencyStoreError, MemoryIdempotencyStore};
     use axum::Router;
     use axum::routing::{get, post};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -988,6 +1007,104 @@ mod tests {
             count.load(Ordering::SeqCst),
             1,
             "handler must run exactly once"
+        );
+    }
+
+    /// Store stub whose consumed-token persistence always fails, while locking
+    /// and reads behave like the in-memory store. Mirrors the idempotency
+    /// layer's failing-backend tests so we can prove fail-closed semantics.
+    struct FailingSetStore {
+        inner: MemoryIdempotencyStore,
+    }
+
+    impl FailingSetStore {
+        fn new() -> Self {
+            Self {
+                inner: MemoryIdempotencyStore::new(Duration::from_secs(600)),
+            }
+        }
+    }
+
+    impl IdempotencyStore for FailingSetStore {
+        fn get(&self, key: &str) -> Option<IdempotencyEntry> {
+            self.inner.get(key)
+        }
+
+        fn set(&self, _key: &str, _record: IdempotencyRecord, _body_hash: Vec<u8>, _ttl: Duration) {
+            // No-op: the fallible `try_set` path is what the guard uses; this
+            // simulated backend never persists so retries cannot see a record.
+        }
+
+        fn try_set(
+            &self,
+            _key: &str,
+            _record: IdempotencyRecord,
+            _body_hash: Vec<u8>,
+            _ttl: Duration,
+        ) -> Result<(), IdempotencyStoreError> {
+            Err(IdempotencyStoreError::backend(
+                "simulated consumed-token persistence failure",
+            ))
+        }
+
+        fn try_lock(&self, key: &str, lock_ttl: Duration) -> bool {
+            self.inner.try_lock(key, lock_ttl)
+        }
+
+        fn unlock(&self, key: &str) {
+            self.inner.unlock(key);
+        }
+    }
+
+    /// Finding C (fail closed): when the store cannot persist the consumed-token
+    /// record after the handler already committed its mutation, the guard must
+    /// NOT return a bare success (which a retry would re-run). It fails closed
+    /// exactly like `IdempotencyLayer`: the first request surfaces `503`, and
+    /// the in-flight lock stays held so a retry with the same token is rejected
+    /// with an in-flight `409` instead of re-running the handler.
+    #[tokio::test]
+    async fn persistence_failure_fails_closed_and_holds_lock() {
+        let store: Arc<dyn IdempotencyStore> = Arc::new(FailingSetStore::new());
+        let count = Arc::new(AtomicUsize::new(0));
+        let count_inner = count.clone();
+        let app = Router::new()
+            .route(
+                "/submit",
+                post(move || {
+                    let count = count_inner.clone();
+                    async move {
+                        count.fetch_add(1, Ordering::SeqCst);
+                        "created"
+                    }
+                }),
+            )
+            .layer(layer_with_store(store));
+
+        let token = "tok-persist-fail";
+
+        // First submit: handler runs once, but the store write fails, so the
+        // guard fails closed with 503 instead of returning the 200 "created".
+        let first = app.clone().oneshot(urlencoded_post(token)).await.unwrap();
+        assert_eq!(
+            first.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a persistence failure after handler success must fail closed, not return the success"
+        );
+
+        // Retry with the same token: the in-flight lock is still held (it was
+        // deliberately not released), so the retry is rejected in-flight and the
+        // handler does NOT run a second time.
+        let second = app.clone().oneshot(urlencoded_post(token)).await.unwrap();
+        assert_eq!(
+            second.status(),
+            StatusCode::CONFLICT,
+            "a retry after a persistence failure must be rejected in-flight, not re-run"
+        );
+
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            1,
+            "the handler must run at most once even when persistence fails"
         );
     }
 }

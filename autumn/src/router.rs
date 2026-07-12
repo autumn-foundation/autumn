@@ -2209,7 +2209,14 @@ where
     }
 
     let ttl = Duration::from_secs(cfg.ttl_secs);
-    let store: std::sync::Arc<dyn IdempotencyStore> = match cfg.backend {
+    // Backend selection: an explicit `[security.submit_token].backend` wins;
+    // otherwise inherit `[idempotency].backend` so a Redis-configured app shares
+    // one consumed-token store across replicas by default (issue #1360), while a
+    // dev app on the default memory idempotency backend keeps memory tokens.
+    // `resolved_backend` is the single source of truth so this cannot drift from
+    // `build_idempotency_layers`.
+    let backend = cfg.resolved_backend(config.idempotency.backend);
+    let store: std::sync::Arc<dyn IdempotencyStore> = match backend {
         crate::config::IdempotencyBackend::Memory => {
             std::sync::Arc::new(MemoryIdempotencyStore::new(ttl))
         }
@@ -2240,7 +2247,8 @@ where
         layer = layer.with_exempt_path(crate::mail::UNSUBSCRIBE_PATH);
     }
     tracing::info!(
-        backend = ?cfg.backend,
+        backend = ?backend,
+        inherited = cfg.backend.is_none(),
         ttl_secs = cfg.ttl_secs,
         "One-time submit-token protection enabled"
     );
