@@ -97,7 +97,9 @@ async fn stash() -> AutumnResult<&'static str> {
             let _ = bytes;
         }
 
-        // Removing releases the key + value capacity back to the quota.
+        // Removing frees only the key + value capacity back to the quota; the
+        // fixed per-entry overhead is retained (against the entry high-water
+        // mark) until the cell is evicted.
         let _ = cell.scratch_remove("draft");
     }
     Ok("ok")
@@ -153,9 +155,15 @@ effect for subsequent requests. The registry also exposes `len()`,
 - the allocation **capacity** of every stored scratch key `String` and value
   `Vec<u8>` (capacity, not length — a `Vec` with large spare capacity is
   charged for what it keeps resident), and
-- a fixed per-entry overhead for each scratch entry, exposed as
-  `TenantCell::scratch_entry_overhead()`, so that a tenant storing many tiny
-  entries cannot amplify its footprint past the cap via map growth.
+- a fixed per-entry overhead, exposed as
+  `TenantCell::scratch_entry_overhead()`, charged against the **high-water mark**
+  of live scratch entries (not the current count), so that a tenant storing many
+  tiny entries cannot amplify its footprint past the cap via map growth. Because a
+  `HashMap` never shrinks its bucket array on removal, this overhead is *retained*
+  after a `scratch_remove` (which frees only the removed key and value capacity)
+  and is reclaimed only when the cell is dropped on eviction. So `tracked_bytes()`
+  can stay elevated after you insert then remove scratch entries, and re-inserting
+  within the prior peak adds no new overhead (churn-safe).
 
 Everything tracked is deterministically reclaimed when the cell is dropped on
 eviction. What it is **not**: a measurement of the tenant's true process RSS.
