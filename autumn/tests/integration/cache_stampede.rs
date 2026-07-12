@@ -428,23 +428,39 @@ async fn swr_serves_stale_and_refreshes_in_background() {
     // schedule-sensitive; do not swap it back for a wall-clock deadline. 1,000
     // attempts x 25ms is ~25s worst case, which fails a genuine "never
     // publishes" regression fast while still tolerating a slow runner.
-    let mut refreshed = None;
-    for _ in 0..1_000 {
-        let fc = fill_count.clone();
-        let v: String = get_or_compute_with(&cache, &key, opts.clone(), move || async move {
-            fc.fetch_add(1, Ordering::SeqCst);
-            Ok::<String, String>("unexpected-refill".to_string())
-        })
-        .await
-        .unwrap();
-        if v == "v2" {
-            refreshed = Some(v);
-            break;
+    //
+    // The attempt cap is wrapped in a generous 120s `HANG_GUARD` backstop. The
+    // cap remains the primary load-scaling bound, but if a refresh signals
+    // completion (`refresh_done`) yet never publishes, then once the stale
+    // grace expires every poll read falls through to the single-flight WAITER
+    // path and parks forever — consuming zero attempts. The 120s timeout
+    // converts that parked-waiter hang into a clean `Elapsed` failure instead
+    // of dangling until the job-level timeout.
+    let refreshed = tokio::time::timeout(HANG_GUARD, async {
+        let mut refreshed = None;
+        for _ in 0..1_000 {
+            let fc = fill_count.clone();
+            let v: String = get_or_compute_with(&cache, &key, opts.clone(), move || async move {
+                fc.fetch_add(1, Ordering::SeqCst);
+                Ok::<String, String>("unexpected-refill".to_string())
+            })
+            .await
+            .unwrap();
+            if v == "v2" {
+                refreshed = Some(v);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
         }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-    let refreshed = refreshed
-        .expect("background refresh must publish the new value after it finishes computing");
+        refreshed
+    })
+    .await
+    .expect(
+        "publish-visibility poll exceeded the hang guard: a read parked as a single-flight \
+         waiter on a refresh that signalled completion but never published, so the attempt \
+         cap never advanced",
+    )
+    .expect("background refresh must publish the new value after it finishes computing");
     assert_eq!(refreshed, "v2");
 
     let after = read_through_metrics().snapshot();
