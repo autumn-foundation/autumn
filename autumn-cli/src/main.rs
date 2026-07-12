@@ -1871,6 +1871,38 @@ enum GenerateCommands {
         #[arg(long)]
         force: bool,
     },
+    /// Generate a record-level authorization `Policy` and companion `Scope`
+    /// for an existing model.
+    ///
+    /// Creates:
+    ///   - `src/policies/<snake>.rs` — `<Pascal>Policy` (`Policy<<Pascal>>`) and
+    ///     `<Pascal>Scope` (`Scope<<Pascal>>`)
+    ///   - `src/policies/mod.rs`     — created/updated with `pub mod`
+    ///   - `src/main.rs`             — `mod policies;` + `.policy(...)`/`.scope(...)`
+    ///     wired into the app builder
+    ///
+    /// When an owner column (`user_id`, `author_id`, or `owner_id`) is present,
+    /// the generated `can_update`/`can_delete` allow the record owner or an
+    /// `admin`, and the scope filters lists to the current user's rows.
+    /// Otherwise those default-deny with a `TODO` marker.
+    ///
+    /// Requires the target model to already exist (`src/models/<snake>.rs`).
+    /// Run `autumn generate model <Pascal>` (or `scaffold`) first.
+    ///
+    /// Example:
+    ///
+    ///   autumn generate policy Post
+    #[command(verbatim_doc_comment)]
+    Policy {
+        /// Model name (`PascalCase` or `snake_case`, e.g. `Post`).
+        name: String,
+        /// Print the file plan and exit without writing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Overwrite existing files instead of erroring on collision.
+        #[arg(long)]
+        force: bool,
+    },
     /// Scaffold a real-time channel: a pub/sub handler over the built-in
     /// `Channels` API, an htmx SSE live view (default) or a raw `#[ws]`
     /// socket handler, `main.rs` route wiring, and an in-process smoke test.
@@ -2302,6 +2334,14 @@ enum GenerateCommands {
         /// form inputs (implies `--live`).
         #[arg(long)]
         live_validation: bool,
+        /// Skip generating a record-level authorization `Policy`/`Scope` for the
+        /// resource. By default the scaffold generates and registers a policy;
+        /// with an owner column (`user_id`/`author_id`/`owner_id`) it also
+        /// authorizes the mutating HTML handlers and scopes the index. Pass
+        /// `--no-policy` to keep the older `#[secured]`-only output. Ignored for
+        /// `--api` scaffolds, which never generate a policy.
+        #[arg(long)]
+        no_policy: bool,
         /// Print the file plan and exit without writing anything.
         #[arg(long)]
         dry_run: bool,
@@ -3302,6 +3342,15 @@ fn run_generate_command(cmd: GenerateCommands, mode: ApplyMode) {
             );
             apply_plan(plan, generate::Flags { dry_run, force }, mode);
         }
+        GenerateCommands::Policy {
+            name,
+            dry_run,
+            force,
+        } => {
+            let plan =
+                generate::policy::plan_policy(&resolve_cwd(), &name, mode == ApplyMode::Destroy);
+            apply_plan(plan, generate::Flags { dry_run, force }, mode);
+        }
         GenerateCommands::Channel {
             name,
             sse: _,
@@ -3543,6 +3592,7 @@ fn run_generate_command(cmd: GenerateCommands, mode: ApplyMode) {
             shard_key,
             live,
             live_validation,
+            no_policy,
             dry_run,
             force,
         } => {
@@ -3599,6 +3649,7 @@ fn run_generate_command(cmd: GenerateCommands, mode: ApplyMode) {
                 live,
                 id.as_deref(),
                 live_validation,
+                no_policy,
             ) {
                 Ok(result) => result,
                 Err(e) => {
@@ -5885,6 +5936,67 @@ mod tests {
             panic!("expected generate mailer");
         };
         assert_eq!(name, "welcome_email");
+    }
+
+    #[test]
+    fn parse_generate_policy_with_pascal_name() {
+        let cli = Cli::try_parse_from(["autumn", "generate", "policy", "Post"]).unwrap();
+        let Commands::Generate(GenerateCommands::Policy {
+            name,
+            dry_run,
+            force,
+        }) = cli.command
+        else {
+            panic!("expected generate policy");
+        };
+        assert_eq!(name, "Post");
+        assert!(!dry_run);
+        assert!(!force);
+    }
+
+    #[test]
+    fn parse_generate_policy_with_flags() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "generate",
+            "policy",
+            "Post",
+            "--dry-run",
+            "--force",
+        ])
+        .unwrap();
+        let Commands::Generate(GenerateCommands::Policy { dry_run, force, .. }) = cli.command
+        else {
+            panic!("expected generate policy");
+        };
+        assert!(dry_run);
+        assert!(force);
+    }
+
+    #[test]
+    fn parse_generate_scaffold_no_policy_flag() {
+        // Default: policy on.
+        let cli = Cli::try_parse_from(["autumn", "generate", "scaffold", "Post", "title:String"])
+            .unwrap();
+        let Commands::Generate(GenerateCommands::Scaffold { no_policy, .. }) = cli.command else {
+            panic!("expected generate scaffold");
+        };
+        assert!(!no_policy, "policy is on by default");
+
+        // --no-policy opts out.
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "generate",
+            "scaffold",
+            "Post",
+            "title:String",
+            "--no-policy",
+        ])
+        .unwrap();
+        let Commands::Generate(GenerateCommands::Scaffold { no_policy, .. }) = cli.command else {
+            panic!("expected generate scaffold");
+        };
+        assert!(no_policy);
     }
 
     #[test]
