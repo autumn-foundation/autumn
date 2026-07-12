@@ -483,6 +483,21 @@ fn live_validation_forms_carry_html5_constraints() {
         "the constrained title input must keep its htmx inline-validation wiring (via typed path helper):\n{routes}"
     );
 
+    // Issue #1360 (finding F): the inline-validation POST `hx-include`s the whole
+    // form, which carries the hidden one-time `_submit_token`. Without a filter
+    // the first field validation would consume the token on the guarded
+    // `/validate/...` route, and the real create submit would replay the
+    // validation fragment instead of running the mutation. The htmx input must
+    // drop the token via `hx-params`, while the real create form keeps it.
+    assert!(
+        routes.contains("hx-params=\"not _submit_token\""),
+        "live-validation inputs must drop _submit_token from the inline POST:\n{routes}"
+    );
+    assert!(
+        routes.contains("submit_token_input(submit_token.as_ref(), submit_field.as_ref())"),
+        "the create/update form must still carry the submit token:\n{routes}"
+    );
+
     // The inline-validate handler returns the SAME constrained fragment, so the
     // swapped-in field doesn't drop the client-side attributes on first change.
     let validate_title = slice_fn(&routes, "pub async fn validate_title(");

@@ -3122,7 +3122,11 @@ fn render_form_for_helper(
          {preludes}    \
          let mut form = autumn_web::form::form_for(changeset, action, \"post\")\n        \
          .submit_label(submit_label){builder_calls}{appends};\n    \
-         form = form.append(submit_token_input(submit_token, submit_field));\n    \
+         // Emit the one-time submit token at the FRONT of the form (issue #1360):\n    \
+         // `SubmitTokenLayer` only scans the first chunk of the URL-encoded body,\n    \
+         // so a large earlier textarea could otherwise push an appended token past\n    \
+         // the scan cap and leave duplicate submits unguarded.\n    \
+         form = form.prepend(submit_token_input(submit_token, submit_field));\n    \
          if let Some(csrf) = csrf {{\n        \
          form = form.csrf(csrf.token());\n    \
          }}\n    \
@@ -3611,9 +3615,13 @@ fn html5_constraint_spec(field: &Field) -> Option<(&'static str, String)> {
 /// (`minlength`/`maxlength`/`min`/`max`/`step`) from [`html5_constraint_spec`],
 /// exactly mirroring the standard `form_for` path's `.exclude()` + `.append()`
 /// output. When `validate_url` is `Some`, the htmx inline-validation wiring
-/// (`hx-post`/`hx-trigger`/`hx-target`/`hx-swap`/`hx-include` + the
-/// `data-autumn-field-wrapper` swap marker) is threaded on too, matching
-/// `required_text_input_htmx`. Shared by [`render_changeset_form_inputs`] and
+/// (`hx-post`/`hx-trigger`/`hx-target`/`hx-swap`/`hx-include` +
+/// `hx-params="not _submit_token"` + the `data-autumn-field-wrapper` swap
+/// marker) is threaded on too, matching `required_text_input_htmx`. The
+/// `hx-params` filter keeps the inline-validation POST (which `hx-include`s the
+/// whole form) from carrying the one-time `_submit_token`, so validation never
+/// consumes the token the real create/update submit needs (issue #1360). Shared
+/// by [`render_changeset_form_inputs`] and
 /// the inline-validate handlers so the initially-rendered field and the
 /// htmx-swapped fragment are byte-identical.
 fn render_live_constrained_field(
@@ -3650,7 +3658,8 @@ fn render_live_constrained_field(
                     "\n                    hx-post=({url})\n                    \
                      hx-trigger=\"change\"\n                    \
                      hx-target=\"closest [data-autumn-field-wrapper]\"\n                    \
-                     hx-swap=\"outerHTML\"\n                    hx-include=\"closest form\""
+                     hx-swap=\"outerHTML\"\n                    hx-include=\"closest form\"\n                    \
+                     hx-params=\"not _submit_token\""
                 ),
             )
         },
@@ -6394,6 +6403,19 @@ async fn main() {
         assert!(routes.contains("submit_token.as_ref()"));
         assert!(routes.contains("submit_field.as_ref()"));
         assert!(routes.contains("submit_token_input(submit_token, submit_field)"));
+        // Issue #1360 (finding G): the token must be emitted at the FRONT of the
+        // form via `.prepend(...)`, not appended after the derived fields —
+        // `SubmitTokenLayer` only scans the first chunk of the URL-encoded body,
+        // so a large earlier field could otherwise push an appended token past
+        // the scan cap and leave duplicate submits unguarded.
+        assert!(
+            routes.contains("form.prepend(submit_token_input(submit_token, submit_field))"),
+            "standard form must prepend the submit token, not append it:\n{routes}"
+        );
+        assert!(
+            !routes.contains("form.append(submit_token_input"),
+            "submit token must not be appended after derived fields:\n{routes}"
+        );
     }
 
     // ── Changeset validation round-trip (issue #1124) ──────────────────
@@ -6561,6 +6583,64 @@ async fn main() {
         assert!(
             !routes.contains(r#"input type="text" name="title""#),
             "standard fields must no longer be hand-rolled: {routes}"
+        );
+    }
+
+    #[test]
+    fn execute_live_validation_inline_posts_drop_the_submit_token() {
+        // Finding F (issue #1360): a `--live-validation` field posts its inline
+        // validation with `hx-include="closest form"`, so that POST would carry
+        // the hidden one-time `_submit_token` to the guarded `/validate/...`
+        // route and consume it — the real create submit would then replay the
+        // validation fragment instead of running the mutation. The generated
+        // htmx input must drop the token via `hx-params="not _submit_token"`,
+        // while the real create/update form still embeds it.
+        let tmp = project_with_main(default_main());
+        // A DSL-constrained `String` auto-derives a `length` rule, so `title` is
+        // validated and renders through the raw-markup htmx constrained control.
+        let plan = plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String{min=3,max=120}".into()],
+            "20260427000000",
+            &ScaffoldOptions {
+                live_validation: true,
+                ..ScaffoldOptions::default()
+            },
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+
+        // The constrained validated input keeps its inline-validation wiring...
+        assert!(
+            routes.contains("hx-post=\"/posts/validate/title\""),
+            "title must keep its htmx inline-validation wiring:\n{routes}"
+        );
+        // ...but filters the one-time submit token out of that POST so the
+        // inline validation never consumes it.
+        assert!(
+            routes.contains("hx-params=\"not _submit_token\""),
+            "live-validation inputs must drop _submit_token from the inline POST:\n{routes}"
+        );
+        // The inline-validate handler returns the SAME fragment (byte-identical
+        // for the htmx `outerHTML` swap), so it must carry the filter too.
+        let validate_title = &routes[routes
+            .find("pub async fn validate_title(")
+            .expect("validate_title handler")..];
+        assert!(
+            validate_title[..validate_title[1..]
+                .find("#[post(")
+                .map_or(validate_title.len(), |rel| rel + 1)]
+                .contains("hx-params=\"not _submit_token\""),
+            "the validate_title fragment must also drop the submit token:\n{validate_title}"
+        );
+        // The real create/update form still embeds the submit token so the
+        // mutation stays guarded against duplicate submits.
+        assert!(
+            routes.contains("submit_token_input(submit_token.as_ref(), submit_field.as_ref())"),
+            "the create/update form must still carry the submit token:\n{routes}"
         );
     }
 
