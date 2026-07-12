@@ -40,27 +40,69 @@ fn main() {
 /// Emit `AUTUMN_BUILD_*` compile-time env vars consumed by
 /// `#[autumn_web::main]` and surfaced on `/actuator/info`.
 ///
-/// The build timestamp is always emitted (honoring `SOURCE_DATE_EPOCH` for
-/// reproducible builds). Git fields are best-effort: outside a git checkout
-/// (tarball / CI cache) they are simply omitted and the framework reports them
-/// as `null` rather than failing the build.
+/// Provenance is sourced with a two-tier strategy so both local checkouts and
+/// containerized (production) builds report real values:
 ///
-/// Note: the `dirty` flag is a best-effort snapshot taken when this script last
-/// re-ran. Cargo only re-runs it on the declared `rerun-if-changed` inputs, so
-/// after an edit that doesn't touch a watched path the baked flag may lag until
-/// the next rebuild of a watched input.
+/// 1. **Build-arg passthrough** — if the corresponding `AUTUMN_BUILD_*` env var
+///    is set (e.g. Docker `--build-arg` surfaced as `ENV`), it wins. The
+///    scaffolded Dockerfile deliberately excludes `/.git` from the build
+///    context, so a container build has no repository to inspect; the deploy/CI
+///    supplies the SHA/branch/etc. explicitly instead.
+/// 2. **Git fallback** — otherwise fields are best-effort from `git`. Outside a
+///    checkout (tarball / CI cache with no passthrough) they are simply omitted
+///    and the framework reports them as `null` rather than failing the build.
+///
+/// The build timestamp is always emitted (passthrough `AUTUMN_BUILD_TIMESTAMP`
+/// wins, else `SOURCE_DATE_EPOCH` for reproducible builds, else wall clock).
+///
+/// The `dirty` flag is three-state: an explicit `AUTUMN_BUILD_GIT_DIRTY` build
+/// arg wins; else the real `git status` (a *clean* tree is `false`); else — no
+/// arg and no git — it is genuinely UNKNOWN and no var is emitted, so
+/// `/actuator/info` reports `null` instead of a misleading `false`.
+///
+/// Note: the git-derived `dirty` flag is a best-effort snapshot taken when this
+/// script last re-ran. Cargo only re-runs it on the declared `rerun-if-changed`
+/// inputs, so after an edit that doesn't touch a watched path the baked flag may
+/// lag until the next rebuild of a watched input.
 fn emit_build_provenance() {
-    println!("cargo:rustc-env=AUTUMN_BUILD_TIMESTAMP={}", build_timestamp());
+    // Re-run whenever a passthrough build arg changes so a new deploy re-bakes
+    // the provenance instead of reusing a cached, stale value.
+    for var in [
+        "AUTUMN_BUILD_GIT_SHA",
+        "AUTUMN_BUILD_GIT_SHA_SHORT",
+        "AUTUMN_BUILD_GIT_BRANCH",
+        "AUTUMN_BUILD_GIT_DIRTY",
+        "AUTUMN_BUILD_TIMESTAMP",
+    ] {
+        println!("cargo:rerun-if-env-changed={var}");
+    }
 
-    if let Some(sha) = git(&["rev-parse", "HEAD"]) {
-        let short = git(&["rev-parse", "--short", "HEAD"])
+    let timestamp = build_arg("AUTUMN_BUILD_TIMESTAMP").unwrap_or_else(build_timestamp);
+    println!("cargo:rustc-env=AUTUMN_BUILD_TIMESTAMP={timestamp}");
+
+    // Prefer the passthrough SHA (container build); fall back to git (local
+    // checkout). If neither yields a SHA, emit no git fields → reported `null`.
+    if let Some(sha) = build_arg("AUTUMN_BUILD_GIT_SHA").or_else(|| git(&["rev-parse", "HEAD"])) {
+        let short = build_arg("AUTUMN_BUILD_GIT_SHA_SHORT")
+            .or_else(|| git(&["rev-parse", "--short", "HEAD"]))
             .unwrap_or_else(|| sha.chars().take(7).collect());
-        let branch = git(&["rev-parse", "--abbrev-ref", "HEAD"]).unwrap_or_else(|| "unknown".into());
-        let dirty = git(&["status", "--porcelain"]).is_some_and(|out| !out.trim().is_empty());
+        let branch = build_arg("AUTUMN_BUILD_GIT_BRANCH")
+            .or_else(|| git(&["rev-parse", "--abbrev-ref", "HEAD"]))
+            .unwrap_or_else(|| "unknown".into());
+        // Dirty is a THREE-state value: an explicit passthrough arg wins;
+        // otherwise the real `git status` result (a *clean* tree is `false`, not
+        // unknown); otherwise — no arg AND no git, the common case for a
+        // container build with `/.git` excluded — the dirty state is genuinely
+        // UNKNOWN. In that case emit no `AUTUMN_BUILD_GIT_DIRTY` at all, so
+        // `/actuator/info` reports `null` rather than a misleading `false`.
+        let dirty =
+            build_arg("AUTUMN_BUILD_GIT_DIRTY").or_else(|| git_dirty().map(|d| d.to_string()));
         println!("cargo:rustc-env=AUTUMN_BUILD_GIT_SHA={sha}");
         println!("cargo:rustc-env=AUTUMN_BUILD_GIT_SHA_SHORT={short}");
         println!("cargo:rustc-env=AUTUMN_BUILD_GIT_BRANCH={branch}");
-        println!("cargo:rustc-env=AUTUMN_BUILD_GIT_DIRTY={dirty}");
+        if let Some(dirty) = dirty {
+            println!("cargo:rustc-env=AUTUMN_BUILD_GIT_DIRTY={dirty}");
+        }
     }
 
     // Re-run when the ref is checked out (HEAD), the index changes (staging /
@@ -70,6 +112,20 @@ fn emit_build_provenance() {
 
     // Reproducible builds: re-run if the source date is pinned or changed.
     println!("cargo:rerun-if-env-changed=SOURCE_DATE_EPOCH");
+}
+
+/// Read a provenance build arg passed through the environment (Docker
+/// `ARG`/`ENV`), trimming surrounding whitespace. Unset or blank values return
+/// `None` so detection falls through to git — an unpopulated `ARG` surfaces as
+/// an empty string, which must not shadow the git fallback.
+fn build_arg(name: &str) -> Option<String> {
+    let value = std::env::var(name).ok()?;
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
 }
 
 /// Register `rerun-if-changed` triggers on the git ref state so a commit /
@@ -131,6 +187,28 @@ fn emit_git_rerun_triggers() {
         }
         seen.push(path);
     }
+}
+
+/// Best-effort working-tree dirtiness, distinguishing *clean* from *unknown*.
+///
+/// Returns `Some(true)`/`Some(false)` only when `git status` actually ran — a
+/// clean tree is `Some(false)`, uncommitted changes are `Some(true)`. Returns
+/// `None` when git is absent or the command fails (e.g. a container build with
+/// `/.git` excluded), so the caller can represent an *unknown* dirty state as
+/// absent (`/actuator/info` → `null`) rather than a misleading `false`.
+///
+/// This cannot reuse `git()`, which collapses empty stdout to `None` and would
+/// make a clean tree indistinguishable from git being unavailable.
+fn git_dirty() -> Option<bool> {
+    let output = std::process::Command::new("git")
+        .args(["status", "--porcelain"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(output.stdout).ok()?;
+    Some(!text.trim().is_empty())
 }
 
 /// Run a git subcommand, returning trimmed stdout on success.
