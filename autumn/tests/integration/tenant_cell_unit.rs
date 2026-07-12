@@ -107,7 +107,11 @@ fn scratch_accounting() {
 
     let removed = cell.scratch_remove("k");
     assert_eq!(removed, Some(vec![1u8; 800]));
-    assert_eq!(cell.tracked_bytes(), 0);
+    // The key and value heap are released, but the fixed per-entry overhead is
+    // retained against the entry high-water mark until the cell is evicted
+    // (`HashMap` keeps its enlarged bucket array), so tracked settles at exactly
+    // one overhead, not zero.
+    assert_eq!(cell.tracked_bytes(), overhead);
     assert_eq!(cell.scratch_get("k"), None);
 }
 
@@ -242,16 +246,19 @@ fn scratch_insert_accounts_key_capacity() {
     assert_eq!(cell.tracked_bytes(), key_cap + overhead);
     assert!(cell.tracked_bytes() >= 500);
 
-    // Removing releases the key allocation back to zero.
+    // Removing releases the key allocation, but the per-entry overhead is
+    // retained against the high-water mark until eviction, so tracked settles
+    // at exactly one overhead rather than zero.
     let _ = cell.scratch_remove(&key);
-    assert_eq!(cell.tracked_bytes(), 0);
+    assert_eq!(cell.tracked_bytes(), overhead);
 
     // A huge unique key on an empty value is now rejected by the quota
-    // (it was accepted when only value capacity was charged).
+    // (it was accepted when only value capacity was charged). The rejected
+    // insert leaves the counter at the retained overhead, unchanged.
     let big_key = "x".repeat(5000);
     let err = cell.scratch_insert(big_key, Vec::new()).unwrap_err();
     assert_eq!(err.quota, 1000);
-    assert_eq!(cell.tracked_bytes(), 0);
+    assert_eq!(cell.tracked_bytes(), overhead);
 }
 
 /// Scratch accounting must charge a value's allocation *capacity*, not its
@@ -275,17 +282,20 @@ fn scratch_insert_accounts_capacity_not_length() {
     assert_eq!(cell.tracked_bytes(), kc + cap + overhead);
     assert!(cell.tracked_bytes() >= 800);
 
-    // Removing releases the full capacity back to zero.
+    // Removing releases the full value capacity and key, but the per-entry
+    // overhead is retained against the high-water mark until eviction, so
+    // tracked settles at exactly one overhead rather than zero.
     let _ = cell.scratch_remove("k");
-    assert_eq!(cell.tracked_bytes(), 0);
+    assert_eq!(cell.tracked_bytes(), overhead);
 
     // An over-capacity empty Vec is now rejected by the quota (it was accepted
-    // when accounting by len()).
+    // when accounting by len()). The rejected insert leaves the counter at the
+    // retained overhead, unchanged.
     let big = Vec::<u8>::with_capacity(5000); // len 0, capacity >= 5000
     let err = cell.scratch_insert("k", big).unwrap_err();
     assert_eq!(err.quota, 1000);
     assert!(err.requested >= 5000);
-    assert_eq!(cell.tracked_bytes(), 0);
+    assert_eq!(cell.tracked_bytes(), overhead);
 }
 
 #[test]
@@ -304,9 +314,44 @@ fn scratch_entries_charge_fixed_overhead() {
     let a_key_cap = String::from("a").capacity();
     assert_eq!(cell.tracked_bytes(), overhead + overhead + a_key_cap);
 
-    // Removing the empty entry releases exactly one overhead.
+    // Removing the empty entry releases only its key/value heap (both empty
+    // here, so nothing), NOT the per-entry overhead: it is retained against the
+    // high-water mark until eviction, so both entries' overheads remain charged.
     let _ = cell.scratch_remove("");
-    assert_eq!(cell.tracked_bytes(), overhead + a_key_cap);
+    assert_eq!(cell.tracked_bytes(), overhead + overhead + a_key_cap);
+}
+
+#[test]
+fn scratch_overhead_retained_after_removal_and_churn_safe() {
+    let overhead = autumn_web::tenant_cell::TenantCell::scratch_entry_overhead();
+    let reg = autumn_web::tenant_cell::TenantCellRegistry::new();
+    let cell = reg.get_or_create("t", 1_000_000);
+
+    for i in 0..100 {
+        cell.scratch_insert(format!("k{i}"), Vec::new()).unwrap();
+    }
+    let peak_tracked = cell.tracked_bytes();
+    assert!(peak_tracked >= 100 * overhead);
+
+    for i in 0..100 {
+        let _ = cell.scratch_remove(&format!("k{i}"));
+    }
+    // Key/value heap released, but the per-entry (bucket) overhead is retained
+    // until eviction — tracked does NOT fall to zero.
+    assert!(cell.tracked_bytes() >= 100 * overhead);
+
+    // Re-inserting within the prior peak charges NO new overhead (churn-safe):
+    let before = cell.tracked_bytes();
+    for i in 0..100 {
+        cell.scratch_insert(format!("k{i}"), Vec::new()).unwrap();
+    }
+    // Only tiny key heaps added back; overhead unchanged (len never exceeds peak).
+    assert!(cell.tracked_bytes() < before + 100 * overhead);
+
+    // Eviction still reclaims everything to zero.
+    let _ = reg.evict("t");
+    drop(cell);
+    assert_eq!(reg.total_tracked_bytes(), 0);
 }
 
 #[test]

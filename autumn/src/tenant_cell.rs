@@ -16,13 +16,19 @@
 //! allocations made *through* the cell, and covers exactly three things: (a)
 //! each live [`Charge`]'s declared bytes, (b) the allocation *capacity* of every
 //! stored scratch key `String` and value `Vec<u8>`, and (c) a fixed
-//! [`SCRATCH_ENTRY_OVERHEAD`] per resident scratch entry (covering the map's
-//! per-entry `String`/`Vec` headers and an amortized bucket slot, so the *count*
-//! of tiny entries is bounded against the quota). It is explicitly **not** a
-//! measurement of the tenant's true process RSS: allocator-internal
-//! fragmentation, size-class rounding, and any allocation a handler makes
-//! outside the cell's API are out of scope by design. This is a safe-Rust
-//! accounting cell, not a bounding allocator.
+//! [`SCRATCH_ENTRY_OVERHEAD`] per scratch entry (covering the map's per-entry
+//! `String`/`Vec` headers and an amortized bucket slot, so the *count* of tiny
+//! entries is bounded against the quota). This per-entry overhead is charged
+//! against a **high-water mark** of the live scratch-entry count rather than the
+//! instantaneous count: it is *not* released when an individual entry is removed
+//! — [`HashMap`] does not shrink its bucket array on `remove`, so the enlarged
+//! bucket allocation stays resident — and it is reclaimed only when the whole
+//! cell is dropped/evicted (which drops the map, freeing the buckets).
+//! Re-inserting keys within a prior peak therefore adds no new overhead. It is
+//! explicitly **not** a measurement of the tenant's true process RSS:
+//! allocator-internal fragmentation, size-class rounding, and any allocation a
+//! handler makes outside the cell's API are out of scope by design. This is a
+//! safe-Rust accounting cell, not a bounding allocator.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -65,6 +71,20 @@ impl fmt::Display for QuotaExceeded {
 // through a cell can therefore propagate a quota breach with `?`.
 impl std::error::Error for QuotaExceeded {}
 
+/// The tenant's scratch map plus the high-water mark used to charge per-entry
+/// overhead. Both fields are guarded together by a single [`Mutex`] so the peak
+/// is only ever mutated while the map is locked.
+#[derive(Debug, Default)]
+struct ScratchState {
+    /// Owned per-tenant scratch buffer. Dropped with the cell.
+    map: HashMap<String, Vec<u8>>,
+    /// High-water mark of the number of live scratch entries. Monotonic for the
+    /// life of the cell: it only ever grows (never lowered on removal), because
+    /// `HashMap` does not shrink its bucket array when entries are removed, so
+    /// the per-entry bucket overhead stays resident until the map is dropped.
+    peak_entries: usize,
+}
+
 /// Shared state owned by a single tenant's cell.
 #[derive(Debug)]
 struct TenantCellInner {
@@ -73,8 +93,9 @@ struct TenantCellInner {
     quota_bytes: usize,
     /// Bytes currently tracked for this tenant.
     tracked_bytes: AtomicUsize,
-    /// Owned per-tenant scratch buffer. Dropped with the cell.
-    scratch: Mutex<HashMap<String, Vec<u8>>>,
+    /// Owned per-tenant scratch buffer and its entry high-water mark. Dropped
+    /// with the cell.
+    scratch: Mutex<ScratchState>,
     /// Process-wide tracked-bytes gauge shared with the owning registry.
     global_tracked: Arc<AtomicUsize>,
 }
@@ -197,7 +218,7 @@ impl TenantCell {
                 tenant_id: tenant_id.into(),
                 quota_bytes,
                 tracked_bytes: AtomicUsize::new(0),
-                scratch: Mutex::new(HashMap::new()),
+                scratch: Mutex::new(ScratchState::default()),
                 global_tracked,
             }),
         }
@@ -251,10 +272,14 @@ impl TenantCell {
     /// lengths, so a large unique/user-derived key or a `Vec` with large spare
     /// capacity is charged for the whole allocation it keeps resident.
     ///
-    /// The key's capacity — plus a fixed [`SCRATCH_ENTRY_OVERHEAD`] for the map
-    /// slot and per-entry headers the entry occupies — is charged only when a
-    /// *new* key is inserted (and released on removal). Replacing an existing key
-    /// leaves the stored key untouched —
+    /// The key's capacity is charged only when a *new* key is inserted (and
+    /// released on removal). The fixed [`SCRATCH_ENTRY_OVERHEAD`] for the map
+    /// slot and per-entry headers is charged against a *high-water mark* of the
+    /// live scratch-entry count: inserting a new key that pushes the count above
+    /// the prior peak charges one overhead, but re-inserting within the prior
+    /// peak charges none, and the overhead is retained (not released) on removal
+    /// because [`HashMap`] keeps its enlarged bucket array. Replacing an existing
+    /// key leaves the stored key untouched —
     /// [`HashMap::insert`](std::collections::HashMap::insert) keeps the original
     /// key and only swaps the value — so a replace charges just the
     /// value-capacity delta (`new_cap - old_cap`), releasing the difference when
@@ -281,26 +306,37 @@ impl TenantCell {
             .scratch
             .lock()
             .expect("tenant cell scratch lock poisoned");
-        match scratch.get(&key).map(Vec::capacity) {
+        let state = &mut *scratch;
+        if let Some(old_val_cap) = state.map.get(&key).map(Vec::capacity) {
             // Key already present: `insert` keeps the stored key and swaps the
             // value, so only the value-capacity delta is charged. The freshly
-            // built `key` String is dropped.
-            Some(old_val_cap) => {
-                if new_val_cap > old_val_cap {
-                    self.inner.reserve(new_val_cap - old_val_cap)?;
-                } else if new_val_cap < old_val_cap {
-                    self.inner.release(old_val_cap - new_val_cap);
-                }
+            // built `key` String is dropped. The key, overhead, and peak are all
+            // unaffected.
+            if new_val_cap > old_val_cap {
+                self.inner.reserve(new_val_cap - old_val_cap)?;
+            } else if new_val_cap < old_val_cap {
+                self.inner.release(old_val_cap - new_val_cap);
             }
-            // Genuinely new key: charge the key allocation and the value, plus a
-            // fixed per-entry overhead for the map slot / headers this entry adds
-            // (bounding the entry count against the quota).
-            None => {
-                self.inner
-                    .reserve(key.capacity() + new_val_cap + SCRATCH_ENTRY_OVERHEAD)?;
+            state.map.insert(key, value);
+        } else {
+            // Genuinely new key: charge the key allocation and the value. Charge
+            // the fixed per-entry overhead only for the portion of the new live
+            // count that exceeds the high-water mark, so re-inserting within the
+            // prior peak (after removals) adds no overhead — the bucket slot it
+            // reuses was already charged and is still resident.
+            let new_len = state.map.len() + 1;
+            let overhead_delta = new_len
+                .saturating_sub(state.peak_entries)
+                .saturating_mul(SCRATCH_ENTRY_OVERHEAD);
+            // Reserve before inserting or bumping the peak, so a quota failure
+            // returns without any untracked map growth.
+            self.inner
+                .reserve(key.capacity() + new_val_cap + overhead_delta)?;
+            state.map.insert(key, value);
+            if new_len > state.peak_entries {
+                state.peak_entries = new_len;
             }
         }
-        scratch.insert(key, value);
         drop(scratch);
         Ok(())
     }
@@ -316,17 +352,19 @@ impl TenantCell {
             .scratch
             .lock()
             .expect("tenant cell scratch lock poisoned")
+            .map
             .get(key)
             .cloned()
     }
 
     /// Remove the scratch value for `key`, releasing its bytes.
     ///
-    /// Releases the stored `String` key, the value `Vec`'s full allocation
-    /// *capacity* (the bytes the cell owned), and the fixed
-    /// [`SCRATCH_ENTRY_OVERHEAD`] — matching how
-    /// [`scratch_insert`](Self::scratch_insert) charged them on a new-key
-    /// insert.
+    /// Releases the stored `String` key and the value `Vec`'s full allocation
+    /// *capacity* (the bytes the cell owned). It does **not** release the fixed
+    /// [`SCRATCH_ENTRY_OVERHEAD`]: [`HashMap`] does not shrink its bucket array
+    /// on removal, so the bucket slot this entry occupied stays resident and is
+    /// charged against the entry high-water mark until the whole cell is dropped
+    /// (see [`scratch_insert`](Self::scratch_insert)).
     ///
     /// # Panics
     ///
@@ -334,17 +372,19 @@ impl TenantCell {
     #[must_use = "the removed scratch value is returned; bind it or `let _ =` it"]
     pub fn scratch_remove(&self, key: &str) -> Option<Vec<u8>> {
         // `remove_entry` recovers the stored key too, so its allocation is
-        // released alongside the value's.
+        // released alongside the value's. The per-entry overhead is retained:
+        // the bucket slot survives the removal, and `peak_entries` is not
+        // lowered.
         let (removed_key, removed_val) = {
             let mut scratch = self
                 .inner
                 .scratch
                 .lock()
                 .expect("tenant cell scratch lock poisoned");
-            scratch.remove_entry(key)
+            scratch.map.remove_entry(key)
         }?;
         self.inner
-            .release(removed_key.capacity() + removed_val.capacity() + SCRATCH_ENTRY_OVERHEAD);
+            .release(removed_key.capacity() + removed_val.capacity());
         Some(removed_val)
     }
 }
