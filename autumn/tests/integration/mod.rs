@@ -15,6 +15,7 @@ mod boundary_hooks_integration;
 mod broadcast_recorder;
 #[cfg(feature = "cache-moka")]
 mod cache_stampede;
+mod chaos_cache_jitter_proptest;
 #[cfg(feature = "ws")]
 mod chaos_channels;
 #[cfg(feature = "ws")]
