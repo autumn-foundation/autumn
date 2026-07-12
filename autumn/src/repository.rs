@@ -140,6 +140,107 @@ pub enum DependentAction {
     Restrict,
 }
 
+/// The boxed, `Send` future a [`RuntimeDependentCascadeFn`] returns.
+///
+/// It resolves to the deferred `(topic, dom_id)` OOB delete broadcasts a single
+/// child association's cascade accumulated (empty for a non-broadcasting child).
+pub type RuntimeDependentCascadeFuture<'a> = ::std::pin::Pin<
+    ::std::boxed::Box<
+        dyn ::std::future::Future<Output = crate::AutumnResult<Vec<(String, String)>>> + Send + 'a,
+    >,
+>;
+
+/// A type-erased entry point into one child repository's
+/// `__autumn_apply_dependent_on_conn` leaf executor (#1738).
+///
+/// `#[model]` emits one of these per model-declared
+/// `#[has_many(Child, dependent = …)]` association, resolving the child
+/// repository through the `Pg{Child}Repository` naming convention. Given the
+/// parent repository's pool, its live connection/transaction, the parent id,
+/// the parent's soft-delete kind, and the two shared cascade-guard sets, it
+/// constructs the child repository and applies this one association's cascade,
+/// returning any deferred OOB delete broadcasts to publish post-commit.
+///
+/// The two guard sets serve distinct roles (Codex round-5-B): `__path` is the
+/// ACTIVE recursion stack (pushed before descending into a node's children,
+/// popped once that subtree completes) used only to break self-/mutual-referential
+/// cycles; `__deleted` is a monotonic set of rows actually removed, used to skip a
+/// row already gone (so a row reached again — e.g. as another batch root's
+/// descendant — is neither re-deleted nor re-hooked). Keeping them separate lets a
+/// batch process a descendant root before its ancestor without the ancestor's
+/// cascade skipping a still-referenced intermediate (immediate-FK failure).
+///
+/// All references share one lifetime so the returned future can borrow the
+/// connection and both guard sets for exactly as long as it is awaited.
+pub type RuntimeDependentCascadeFn = for<'a> fn(
+    &'a ::diesel_async::pooled_connection::deadpool::Pool<::diesel_async::AsyncPgConnection>,
+    &'a mut ::diesel_async::AsyncPgConnection,
+    i64,
+    bool,
+    &'a mut ::std::collections::HashSet<(&'static str, i64)>,
+    &'a mut ::std::collections::HashSet<(&'static str, i64)>,
+) -> RuntimeDependentCascadeFuture<'a>;
+
+/// One model-declared dependent-cascade association, produced at compile time
+/// by `#[model]` and consulted at run time by the parent's `delete_by_id`
+/// (#1738).
+///
+/// The `#[model]` and `#[repository]` derives are separate proc-macro
+/// invocations, so the repository macro — which owns the `delete_by_id` cascade
+/// codegen — never sees the model struct's `#[has_many]` attributes. This spec
+/// bridges the two at run time: the parent iterates
+/// [`AutumnDependents::dependents`] and drives each spec's [`cascade`] inside
+/// its transaction, reproducing exactly the cascade the repository-attribute
+/// `dependent(PgChildRepository, …)` form produces.
+///
+/// Framework plumbing; not constructed by hand.
+///
+/// [`cascade`]: RuntimeDependentSpec::cascade
+pub struct RuntimeDependentSpec {
+    /// The child foreign-key column referencing the parent id. Informational:
+    /// the [`cascade`] thunk already binds it. Mirrors the repository-attribute
+    /// `fk = "…"`.
+    ///
+    /// [`cascade`]: RuntimeDependentSpec::cascade
+    pub fk: &'static str,
+    /// What to do with the children when the parent is deleted.
+    pub action: DependentAction,
+    /// Type-erased entry into the child repository's cascade leaf executor.
+    pub cascade: RuntimeDependentCascadeFn,
+}
+
+/// Exposes a model's runtime dependent-cascade specs to the parent
+/// repository's generated `delete_by_id` (#1738).
+///
+/// A blanket impl returns an empty slice for every type; `#[model]` emits an
+/// *inherent* `dependents()` associated function — which shadows this trait
+/// method under Rust's inherent-before-trait resolution, mirroring the
+/// [`AutumnLockVersionModelExt`] pattern — only when the model declares at
+/// least one `#[has_many(…, dependent = …)]` / `#[has_one(…, dependent = …)]`
+/// association. The generated repository calls `Model::dependents()`, so a
+/// model with no dependents (or one defined without `#[model]`) resolves to the
+/// empty blanket and keeps its exact prior delete codegen.
+///
+/// Precedence: the repository-attribute `dependent(…)` form is the explicit
+/// escape hatch (needed for child repositories that do not follow the
+/// `Pg{Child}Repository` convention, e.g. cross-crate children). When a
+/// repository declares `dependent(…)`, its compile-time specs are authoritative
+/// and the model-declared runtime specs are ignored; a repository with no
+/// `dependent(…)` drives the cascade from `Model::dependents()`.
+pub trait AutumnDependents {
+    /// The model's dependent-cascade specs, in declaration order. Defaults to
+    /// none; `#[model]` overrides via an inherent shadow when dependents exist.
+    #[must_use]
+    fn dependents() -> &'static [RuntimeDependentSpec] {
+        &[]
+    }
+}
+
+// Blanket fallback — any type without an inherent `dependents()` (i.e. a model
+// with no dependent associations, or a type not built through `#[model]`)
+// resolves to the empty slice.
+impl<T: ?Sized> AutumnDependents for T {}
+
 /// Publish a batch of deferred dependent-cascade OOB *delete* broadcasts,
 /// accumulated during a `dependent = destroy` cascade over `broadcasts = true`
 /// children and published **after** the parent transaction commits (#1369).

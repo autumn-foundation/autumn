@@ -57,6 +57,42 @@ enum AssocKind {
     HasOne,
 }
 
+/// The `dependent = <action>` / `on_delete = <action>` cascade action declared
+/// on a model `#[has_many]` / `#[has_one]` association (#1738). Mirrors the
+/// repository-attribute `on_delete` actions one-for-one.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DependentAction {
+    Destroy,
+    DeleteAll,
+    Nullify,
+    Restrict,
+}
+
+impl DependentAction {
+    /// Parse the spelling accepted after `dependent =` / `on_delete =`. Returns
+    /// `None` for an unknown action so the caller can emit a directed error.
+    fn parse(action: &str) -> Option<Self> {
+        match action {
+            "destroy" => Some(Self::Destroy),
+            "delete_all" => Some(Self::DeleteAll),
+            "nullify" => Some(Self::Nullify),
+            "restrict" => Some(Self::Restrict),
+            _ => None,
+        }
+    }
+
+    /// The `::autumn_web::repository::DependentAction` variant token.
+    fn variant_ident(self) -> proc_macro2::Ident {
+        let name = match self {
+            Self::Destroy => "Destroy",
+            Self::DeleteAll => "DeleteAll",
+            Self::Nullify => "Nullify",
+            Self::Restrict => "Restrict",
+        };
+        format_ident!("{name}")
+    }
+}
+
 /// A resolved association declaration: kind, target model, the (possibly
 /// inferred) foreign-key column, and the accessor/store name.
 struct Association {
@@ -74,6 +110,12 @@ struct Association {
     /// association: the join table this association is preloaded/mutated
     /// through, plus the join table's column pointing at the target model.
     through: Option<ThroughSpec>,
+    /// The `dependent = <action>` / `on_delete = <action>` cascade action, when
+    /// declared on a `#[has_many]` / `#[has_one]` (#1738). Drives the runtime
+    /// [`AutumnDependents`] impl `#[model]` emits so the parent repository's
+    /// `delete_by_id` cascades this association without a repository-attribute
+    /// `dependent(…)`.
+    dependent: Option<DependentAction>,
 }
 
 /// The join-table half of a many-to-many `has_many(..., through = ...)`
@@ -125,46 +167,41 @@ fn resolve_fk_and_name(
 /// associations can target the same model without colliding (e.g.
 /// `#[has_many(Post, fk = author_id, name = authored)]` plus
 /// `#[has_many(Post, fk = approver_id, name = approved)]`).
-/// Diagnose a `dependent = <action>` / `on_delete = <action>` key on a model
-/// association attribute.
+/// Resolve a `dependent = <action>` / `on_delete = <action>` key on a model
+/// association attribute into a validated [`DependentAction`], or a directed
+/// error (#1738).
 ///
-/// Faithfully wiring this model-declared spelling to the cascade machinery
-/// needs a runtime type-erased dispatch refactor (the model spelling names the
-/// child *model*, whereas the cascade needs the child *repository* type), so it
-/// is deferred (#1702). Until then we must not silently accept-and-ignore it:
-/// recognize the spelling, validate the action, and return a directed error —
-/// an unknown-action error for a bad spelling, otherwise guidance toward the
-/// repository-attribute cascade (or, on `#[belongs_to]`, that the key is
-/// meaningless there because the child foreign key lives on that side).
-fn dependent_attr_error(kind: AssocKind, key: &syn::Ident, action: &str) -> syn::Error {
+/// On `#[has_many]` / `#[has_one]` the spelling is now wired: `#[model]` emits a
+/// runtime [`AutumnDependents`] impl so the parent repository's `delete_by_id`
+/// cascades this association (resolving the child repository via the
+/// `Pg{Child}Repository` naming convention) — the same transactional cascade
+/// the repository-attribute `dependent(PgChildRepository, …)` form produces. An
+/// unknown action is still rejected. On `#[belongs_to]` the key remains an
+/// error: the child foreign key lives on that side, so there is no dependent to
+/// cascade.
+fn parse_dependent_action(
+    kind: AssocKind,
+    key: &syn::Ident,
+    action: &str,
+) -> syn::Result<DependentAction> {
     if kind == AssocKind::BelongsTo {
-        return syn::Error::new_spanned(
+        return Err(syn::Error::new_spanned(
             key,
             "`dependent`/`on_delete` is not valid on `#[belongs_to]`: the child \
              foreign key lives on this (belongs_to) side, so there is no \
              dependent to cascade — declare the cascade on the parent's \
-             `#[has_many]`/`#[has_one]` (and, for now, on the repository \
-             attribute) instead",
-        );
+             `#[has_many]`/`#[has_one]` instead",
+        ));
     }
-    // Accept exactly the actions the repository-attribute `dependent(...)`
-    // parser accepts (see repository.rs).
-    match action {
-        "destroy" | "delete_all" | "nullify" | "restrict" => syn::Error::new_spanned(
-            key,
-            "`dependent = <action>` on `#[has_many]`/`#[has_one]` is not yet \
-             wired; declare the dependent cascade on the repository instead, \
-             e.g. `#[autumn_web::repository(Model, dependent(PgChildRepository, \
-             fk = \"...\", on_delete = <action>))]` (see issue #1702)",
-        ),
-        other => syn::Error::new_spanned(
+    DependentAction::parse(action).ok_or_else(|| {
+        syn::Error::new_spanned(
             key,
             format!(
-                "unknown dependent action `{other}`; expected one of \
+                "unknown dependent action `{action}`; expected one of \
                  `destroy`, `delete_all`, `nullify`, `restrict`"
             ),
-        ),
-    }
+        )
+    })
 }
 
 fn parse_assoc_attr(
@@ -174,13 +211,14 @@ fn parse_assoc_attr(
 ) -> syn::Result<Association> {
     use syn::parse::ParseStream;
 
-    let (target, explicit_fk, explicit_name, explicit_through, explicit_target_fk) = attr
-        .parse_args_with(|input: ParseStream| {
+    let (target, explicit_fk, explicit_name, explicit_through, explicit_target_fk, dependent) =
+        attr.parse_args_with(|input: ParseStream| {
             let target: syn::Ident = input.parse()?;
             let mut explicit_fk: Option<String> = None;
             let mut explicit_name: Option<String> = None;
             let mut explicit_through: Option<String> = None;
             let mut explicit_target_fk: Option<String> = None;
+            let mut dependent: Option<DependentAction> = None;
             // Zero or more trailing `, key = value` pairs (`fk`, `name`,
             // `through`, `target_fk`), any order.
             while input.peek(syn::Token![,]) {
@@ -203,7 +241,7 @@ fn parse_assoc_attr(
                 } else if key == "target_fk" {
                     explicit_target_fk = Some(value);
                 } else if key == "dependent" || key == "on_delete" {
-                    return Err(dependent_attr_error(kind, &key, &value));
+                    dependent = Some(parse_dependent_action(kind, &key, &value)?);
                 } else {
                     return Err(syn::Error::new_spanned(
                         &key,
@@ -219,6 +257,7 @@ fn parse_assoc_attr(
                 explicit_name,
                 explicit_through,
                 explicit_target_fk,
+                dependent,
             ))
         })?;
 
@@ -233,6 +272,25 @@ fn parse_assoc_attr(
         return Err(syn::Error::new_spanned(
             &target,
             "`target_fk = <column>` requires `through = <join_table>`",
+        ));
+    }
+    if explicit_through.is_some() && dependent.is_some() {
+        // A `through = <join_table>` association's `fk` names a column on the
+        // *join table*, not on the target model. The emitted cascade calls the
+        // target repository's `__autumn_apply_dependent_on_conn`, whose SQL
+        // treats `fk` as a column on the target table — so the cascade would
+        // hit e.g. `tags.post_id` (nonexistent) instead of the join table.
+        // Reject the combination directed rather than silently mis-cascading.
+        // (Generating a real join-table cascade is a possible future
+        // enhancement; a clean reject is the correct minimal behavior.)
+        return Err(syn::Error::new_spanned(
+            &target,
+            "`dependent`/`on_delete` cascade is not supported on a `through = \
+             <join_table>` (many-to-many) association: its foreign key names a \
+             column on the join table, not on the target model, so the cascade \
+             would delete/nullify the wrong rows — remove `dependent`/\
+             `on_delete`, or declare the cascade on a model that maps the join \
+             table directly",
         ));
     }
 
@@ -252,6 +310,7 @@ fn parse_assoc_attr(
         fk,
         name,
         through,
+        dependent,
     })
 }
 
@@ -331,6 +390,100 @@ fn is_association_attr(attr: &syn::Attribute) -> bool {
     attr.path().is_ident("belongs_to")
         || attr.path().is_ident("has_many")
         || attr.path().is_ident("has_one")
+}
+
+/// Emit the inherent `dependents()` associated function on the model (#1738):
+/// the runtime dependent-cascade specs the parent repository's generated
+/// `delete_by_id` iterates. Only produced when at least one `#[has_many]` /
+/// `#[has_one]` association declares `dependent = <action>`; otherwise the
+/// blanket [`AutumnDependents`] impl supplies an empty slice and this emits
+/// nothing (so a model without dependents keeps its exact prior codegen).
+///
+/// Each dependent association resolves its child repository through the
+/// `Pg{Child}Repository` naming convention and generates a type-erased thunk
+/// into that repository's `__autumn_apply_dependent_on_conn` leaf executor. The
+/// thunk owns the child repository across the (immediately awaited) cascade,
+/// mirroring the repository-attribute cascade's inline call so the lifetimes of
+/// the borrowed connection / visited set line up.
+fn emit_dependents_impl(model_ident: &syn::Ident, assocs: &[Association]) -> TokenStream {
+    let deps: Vec<&Association> = assocs.iter().filter(|a| a.dependent.is_some()).collect();
+    if deps.is_empty() {
+        return quote! {};
+    }
+
+    let mut thunk_fns: Vec<TokenStream> = Vec::new();
+    let mut spec_entries: Vec<TokenStream> = Vec::new();
+    for (i, assoc) in deps.iter().enumerate() {
+        let action = assoc.dependent.expect("filtered to Some above");
+        let action_variant = action.variant_ident();
+        let fk = &assoc.fk;
+        // Naming convention: the child model `Comment` is served by
+        // `PgCommentRepository` (its `#[repository]` trait `CommentRepository`
+        // expands to `Pg{trait}`). A child whose repository does not follow this
+        // convention (or lives in another crate) uses the repository-attribute
+        // `dependent(...)` escape hatch instead.
+        let child_repo = format_ident!("Pg{}Repository", assoc.target);
+        let thunk_ident = format_ident!("__autumn_dependent_cascade_{}", i);
+        thunk_fns.push(quote! {
+            fn #thunk_ident<'__a>(
+                __pool: &'__a ::autumn_web::reexports::diesel_async::pooled_connection::deadpool::Pool<
+                    ::autumn_web::reexports::diesel_async::AsyncPgConnection,
+                >,
+                __conn: &'__a mut ::autumn_web::reexports::diesel_async::AsyncPgConnection,
+                __parent_id: i64,
+                __parent_soft: bool,
+                // Codex round-5-B: the active recursion path (cycle-break) and the
+                // monotonic actually-deleted set, threaded through separately.
+                __path: &'__a mut ::std::collections::HashSet<(&'static str, i64)>,
+                __deleted: &'__a mut ::std::collections::HashSet<(&'static str, i64)>,
+            ) -> ::autumn_web::repository::RuntimeDependentCascadeFuture<'__a> {
+                ::std::boxed::Box::pin(async move {
+                    // Own the child repository inside the async block so the
+                    // borrow `__autumn_apply_dependent_on_conn` takes of it stays
+                    // valid for the whole (immediately awaited) cascade.
+                    let __autumn_child_repo = #child_repo::with_pool_untracked(
+                        ::core::clone::Clone::clone(__pool),
+                    );
+                    __autumn_child_repo
+                        .__autumn_apply_dependent_on_conn(
+                            __conn,
+                            #fk,
+                            __parent_id,
+                            ::autumn_web::repository::DependentAction::#action_variant,
+                            __parent_soft,
+                            __path,
+                            __deleted,
+                        )
+                        .await
+                })
+            }
+        });
+        spec_entries.push(quote! {
+            ::autumn_web::repository::RuntimeDependentSpec {
+                fk: #fk,
+                action: ::autumn_web::repository::DependentAction::#action_variant,
+                cascade: #thunk_ident,
+            }
+        });
+    }
+
+    quote! {
+        impl #model_ident {
+            /// Runtime dependent-cascade specs consulted by the parent
+            /// repository's generated `delete_by_id` (#1738). An inherent shadow
+            /// of `AutumnDependents::dependents`; framework plumbing, not a
+            /// public API.
+            #[doc(hidden)]
+            #[must_use]
+            pub fn dependents() -> &'static [::autumn_web::repository::RuntimeDependentSpec] {
+                #(#thunk_fns)*
+                const __AUTUMN_DEPENDENTS: &[::autumn_web::repository::RuntimeDependentSpec] = &[
+                    #(#spec_entries),*
+                ];
+                __AUTUMN_DEPENDENTS
+            }
+        }
+    }
 }
 
 /// Generate everything needed to make a model's associations preloadable:
@@ -2610,6 +2763,7 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         Err(err) => return err.to_compile_error(),
     };
     let association_items = emit_association_items(name, &table_ident, vis, &associations);
+    let dependents_impl = emit_dependents_impl(name, &associations);
 
     let filtered_outer_attrs: Vec<&syn::Attribute> = outer_attrs
         .iter()
@@ -4611,6 +4765,9 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         // ── Associations + eager loading (belongs_to / has_many / has_one) ──
         #preload_retain_impl
         #association_items
+
+        // ── Model-declared dependent cascade specs (#1738) ──────────────────
+        #dependents_impl
     }
 }
 
@@ -4891,51 +5048,35 @@ mod tests {
         assert!(resolve_associations(&model, &attrs).is_err());
     }
 
-    // ── `dependent` / `on_delete` on model associations (#1702) ──────────
-    // The full model-declared cascade wiring is deferred (it needs a
-    // runtime type-erased dispatch refactor). Until then the parser must
-    // RECOGNIZE the `dependent = <action>` / `on_delete = <action>` spelling,
-    // validate the action, and emit a DIRECTED error pointing users at the
-    // repository-attribute cascade — never silently accept-and-ignore it.
+    // ── `dependent` / `on_delete` on model associations (#1738) ──────────
+    // The model-declared cascade is now wired: the parser RECOGNIZES the
+    // `dependent = <action>` / `on_delete = <action>` spelling on
+    // `#[has_many]` / `#[has_one]`, validates the action, and records it on the
+    // association so `#[model]` can emit the runtime `AutumnDependents` dispatch.
+    // An unknown action is still rejected; `#[belongs_to]` still errors.
 
     #[test]
-    fn has_many_dependent_destroy_directs_to_repository() {
+    fn has_many_dependent_destroy_is_recorded() {
         let model: syn::Ident = syn::parse_quote!(Post);
         let attrs: Vec<syn::Attribute> =
             vec![syn::parse_quote!(#[has_many(Comment, dependent = destroy)])];
-        let Err(err) = resolve_associations(&model, &attrs) else {
-            panic!("expected an error");
-        };
-        let msg = err.to_string();
-        assert!(
-            msg.contains("repository"),
-            "expected directed guidance toward the repository attribute, got: {msg}"
-        );
-        assert!(
-            msg.contains("#1702"),
-            "expected the issue reference #1702, got: {msg}"
-        );
+        let assocs = resolve_associations(&model, &attrs).expect("parse ok");
+        assert_eq!(assocs.len(), 1);
+        assert_eq!(assocs[0].kind, AssocKind::HasMany);
+        assert_eq!(assocs[0].fk, "post_id");
+        assert_eq!(assocs[0].dependent, Some(DependentAction::Destroy));
     }
 
     #[test]
-    fn has_many_on_delete_destroy_directs_to_repository() {
+    fn has_many_on_delete_destroy_is_recorded() {
         // The `on_delete = <action>` spelling is an accepted alias for
-        // `dependent = <action>` and must be directed the same way (#1702).
+        // `dependent = <action>` and records the same action (#1738).
         let model: syn::Ident = syn::parse_quote!(Post);
         let attrs: Vec<syn::Attribute> =
             vec![syn::parse_quote!(#[has_many(Comment, on_delete = destroy)])];
-        let Err(err) = resolve_associations(&model, &attrs) else {
-            panic!("expected an error");
-        };
-        let msg = err.to_string();
-        assert!(
-            msg.contains("repository"),
-            "expected directed guidance toward the repository attribute, got: {msg}"
-        );
-        assert!(
-            msg.contains("#1702"),
-            "expected the issue reference #1702, got: {msg}"
-        );
+        let assocs = resolve_associations(&model, &attrs).expect("parse ok");
+        assert_eq!(assocs.len(), 1);
+        assert_eq!(assocs[0].dependent, Some(DependentAction::Destroy));
     }
 
     #[test]
@@ -4961,21 +5102,46 @@ mod tests {
     }
 
     #[test]
-    fn has_one_dependent_nullify_directs_to_repository() {
+    fn has_one_dependent_nullify_is_recorded() {
         let model: syn::Ident = syn::parse_quote!(User);
         let attrs: Vec<syn::Attribute> =
             vec![syn::parse_quote!(#[has_one(Profile, dependent = nullify)])];
-        let Err(err) = resolve_associations(&model, &attrs) else {
-            panic!("expected an error");
+        let assocs = resolve_associations(&model, &attrs).expect("parse ok");
+        assert_eq!(assocs.len(), 1);
+        assert_eq!(assocs[0].kind, AssocKind::HasOne);
+        assert_eq!(assocs[0].dependent, Some(DependentAction::Nullify));
+    }
+
+    #[test]
+    fn model_emits_dependents_impl_for_declared_cascade() {
+        // The `#[model]` expansion must generate the runtime `AutumnDependents`
+        // dispatch (an inherent `dependents()` returning `RuntimeDependentSpec`s
+        // resolving the child repo via the `Pg{Child}Repository` convention)
+        // rather than erroring, once a `#[has_many(dependent = …)]` is declared.
+        let item: TokenStream = quote! {
+            #[has_many(Comment, dependent = destroy)]
+            struct Post {
+                #[id]
+                id: i64,
+                title: String,
+            }
         };
-        let msg = err.to_string();
+        let generated = model_macro(quote! {}, item).to_string();
         assert!(
-            msg.contains("repository"),
-            "expected directed guidance toward the repository attribute, got: {msg}"
+            generated.contains("fn dependents"),
+            "expected an inherent dependents() fn, got: {generated}"
         );
         assert!(
-            msg.contains("#1702"),
-            "expected the issue reference #1702, got: {msg}"
+            generated.contains("RuntimeDependentSpec"),
+            "expected RuntimeDependentSpec entries, got: {generated}"
+        );
+        assert!(
+            generated.contains("PgCommentRepository"),
+            "expected the child repo resolved by convention, got: {generated}"
+        );
+        assert!(
+            generated.contains("__autumn_apply_dependent_on_conn"),
+            "expected the cascade thunk to call the leaf executor, got: {generated}"
         );
     }
 
@@ -5069,6 +5235,41 @@ mod tests {
         let has_one: Vec<syn::Attribute> =
             vec![syn::parse_quote!(#[has_one(Profile, through = post_profiles)])];
         assert!(resolve_associations(&model, &has_one).is_err());
+    }
+
+    #[test]
+    fn dependent_on_through_association_is_rejected() {
+        // A `through = <join_table>` association's fk names a column on the
+        // join table, not on the target model, so the emitted cascade would
+        // call the target repo's `__autumn_apply_dependent_on_conn` with a
+        // column that does not exist there (e.g. `tags.post_id`) — deleting /
+        // nullifying the wrong rows. Reject the combination directed rather
+        // than silently mis-cascading (Codex P2).
+        let model: syn::Ident = syn::parse_quote!(Post);
+        let attrs: Vec<syn::Attribute> =
+            vec![syn::parse_quote!(#[has_many(Tag, through = post_tags, dependent = destroy)])];
+        let Err(err) = resolve_associations(&model, &attrs) else {
+            panic!("expected an error");
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("through"),
+            "expected a through-specific rejection, got: {msg}"
+        );
+        assert!(
+            msg.contains("dependent") || msg.contains("on_delete"),
+            "expected the cascade key named, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn on_delete_on_through_association_is_rejected() {
+        // The `on_delete =` alias is rejected on a `through =` association for
+        // the same reason as `dependent =` (Codex P2).
+        let model: syn::Ident = syn::parse_quote!(Post);
+        let attrs: Vec<syn::Attribute> =
+            vec![syn::parse_quote!(#[has_many(Tag, through = post_tags, on_delete = nullify)])];
+        assert!(resolve_associations(&model, &attrs).is_err());
     }
 
     #[test]

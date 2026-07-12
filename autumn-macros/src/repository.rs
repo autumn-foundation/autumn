@@ -1336,10 +1336,176 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         } else {
             quote! {}
         };
+        // #1739 grandchild recursion: within the Destroy arm, after selecting a
+        // child row but before removing it, recurse into THIS model's own
+        // `dependent(...)` cascade keyed on the child's id, so grandchildren (and
+        // deeper) are destroyed/nullified inside the SAME transaction. Only
+        // `destroy` recurses: `delete_all` stays single-level (#1739 scope), and
+        // `nullify`/`restrict` remove no rows that could themselves own children.
+        // Restrict grandchildren are probed before mutating ones (mirroring the
+        // single-record restrict-first ordering); a restrict 409 anywhere in the
+        // tree rolls the whole transaction back. Cycle guard: `__visited` holds
+        // every (table, id) already on the destroy path; an already-seen row is
+        // skipped (see the per-row guard in the loop), so self-/mutual-referential
+        // graphs terminate rather than looping forever.
+        let has_dependents = !config.dependents.is_empty();
+        // The grandchildren follow this child's delete kind: a soft-delete child
+        // is only soft-deleted when its parent is (`__parent_soft`), so its own
+        // children inherit `__parent_soft`; a non-soft-delete child is always hard
+        // deleted, so its children cascade as a hard delete (`false`).
+        let child_soft_for_grandchildren = if config.soft_delete {
+            quote! { __parent_soft }
+        } else {
+            quote! { false }
+        };
+        let emit_grandchild_call = |dep: &DependentSpec| {
+            let child_repo = &dep.child_repo;
+            let fk = &dep.fk;
+            let action_variant = dep.action.variant_ident();
+            quote! {
+                {
+                    let __autumn_gc_repo = #child_repo::with_pool_untracked(
+                        ::core::clone::Clone::clone(&self.pool)
+                    );
+                    // The helper already returns a boxed `dyn Future` (see its
+                    // definition), so the recursive edge is type-erased and this
+                    // call needs no further boxing. The connection and visited set
+                    // are reborrowed; the future is awaited immediately so it never
+                    // outlives `__autumn_gc_repo`.
+                    __ret_broadcasts.extend(
+                        __autumn_gc_repo.__autumn_apply_dependent_on_conn(
+                            conn,
+                            #fk,
+                            __cid,
+                            ::autumn_web::repository::DependentAction::#action_variant,
+                            #child_soft_for_grandchildren,
+                            __path,
+                            __deleted,
+                        ).await?
+                    );
+                }
+            }
+        };
+        let grandchild_restrict_calls: ::std::vec::Vec<_> = config
+            .dependents
+            .iter()
+            .filter(|dep| dep.action == DependentAction::Restrict)
+            .map(&emit_grandchild_call)
+            .collect();
+        let grandchild_mutating_calls: ::std::vec::Vec<_> = config
+            .dependents
+            .iter()
+            .filter(|dep| dep.action != DependentAction::Restrict)
+            .map(&emit_grandchild_call)
+            .collect();
+        // #1739 (repo-attribute deps): compile-time recursion over
+        // `config.dependents`. Emitted ONLY when this repo declares
+        // `dependent(...)`. Codex round-5-A: the restrict PROBE and the mutating
+        // cascade are split into two token blocks so the caller can run the
+        // read-only restrict probe BEFORE the child's `before_delete` hook and
+        // the mutating (destroy/nullify) grandchildren AFTER it — see the Destroy
+        // arm below.
+        let compiletime_grandchild_restrict = quote! {
+            #(#grandchild_restrict_calls)*
+        };
+        let compiletime_grandchild_mutating = quote! {
+            #(#grandchild_mutating_calls)*
+        };
+        // Codex P1 (model-side deps): when this repo has NO repository-attribute
+        // `dependent(...)`, its grandchildren may be declared ONLY on the child
+        // model (via `#[has_many(..., dependent = ...)]`), which populates the
+        // runtime `Model::dependents()` slice but leaves `config.dependents`
+        // empty. The #1739 compile-time recursion above is then empty, so without
+        // this the child row would be deleted while its own children still
+        // FK-reference it (FK failure on a hard delete, or silent orphans). So
+        // consult THIS model's runtime specs and recurse into each grandchild,
+        // mirroring the top-level model-side dispatch: restrict-probe first (a
+        // 409 rolls the whole tx back), then mutating. Reuses the existing
+        // `__visited` (table, id) cycle-guard set, the boxed-future `fn`
+        // recursion (the `Send` edge stays erased through the fn-pointer), and
+        // the `__ret_broadcasts` deferred-broadcast buffer for grandchild
+        // broadcasts. For a model with no dependents this is a cheap no-op that
+        // iterates an empty `&[]`, so the plain path stays behavior-equivalent.
+        // Codex round-5-A: same restrict/mutating split as the compile-time path,
+        // for the model-declared runtime walk. `__autumn_gc_rt_deps` is bound in
+        // the restrict block and reused by the mutating block — the two are always
+        // emitted together (runtime pairing) and in that order in the Destroy arm,
+        // so the binding is in scope for the mutating loop.
+        let runtime_grandchild_restrict = quote! {
+            // Inherent `dependents()` (real specs) shadows the blanket trait
+            // method (empty); unqualified so the shadow wins, `&[]` otherwise.
+            let __autumn_gc_rt_deps = #model_name::dependents();
+            for __autumn_gc_spec in __autumn_gc_rt_deps.iter().filter(|__s|
+                __s.action == ::autumn_web::repository::DependentAction::Restrict
+            ) {
+                __ret_broadcasts.extend(
+                    (__autumn_gc_spec.cascade)(
+                        &self.pool,
+                        conn,
+                        __cid,
+                        #child_soft_for_grandchildren,
+                        __path,
+                        __deleted,
+                    ).await?
+                );
+            }
+        };
+        let runtime_grandchild_mutating = quote! {
+            for __autumn_gc_spec in __autumn_gc_rt_deps.iter().filter(|__s|
+                __s.action != ::autumn_web::repository::DependentAction::Restrict
+            ) {
+                __ret_broadcasts.extend(
+                    (__autumn_gc_spec.cascade)(
+                        &self.pool,
+                        conn,
+                        __cid,
+                        #child_soft_for_grandchildren,
+                        __path,
+                        __deleted,
+                    ).await?
+                );
+            }
+        };
+        // Precedence (mirrors the top-level rule exactly to avoid double-cascade):
+        // repository-attribute `config.dependents` WINS when present. So with
+        // repo-attribute deps we emit the #1739 compile-time recursion ONLY; with
+        // none we walk the runtime `Model::dependents()` ONLY. A grandchild is
+        // therefore never processed by both paths. Codex round-5-A: the restrict
+        // probe and mutating cascade are chosen as a matching pair so the Destroy
+        // arm can bracket the child `before_delete` hook between them.
+        let grandchild_restrict_cascade = if has_dependents {
+            compiletime_grandchild_restrict
+        } else {
+            runtime_grandchild_restrict
+        };
+        let grandchild_mutating_cascade = if has_dependents {
+            compiletime_grandchild_mutating
+        } else {
+            runtime_grandchild_mutating
+        };
+        // `use AutumnDependents` brings the blanket `dependents()` fallback into
+        // scope for the runtime walk (models without dependents), matching the
+        // top-level dispatch. Emitted only where the runtime walk is.
+        let dep_autumn_dependents_use = if has_dependents {
+            quote! {}
+        } else {
+            quote! { use ::autumn_web::repository::AutumnDependents as _; }
+        };
+
         // Declaration + return of the deferred-broadcast buffer for the Destroy
-        // arm. Only a broadcasts-only child accumulates; every other repo returns
-        // an empty buffer (zero-cost).
-        let destroy_ret_decl = if dep_needs_broadcast {
+        // arm. A broadcasts-only child accumulates its own OOB delete fragments;
+        // additionally, when this repo has dependents (#1739), grandchild cascades
+        // return their broadcasts here to propagate up to the top-level parent for
+        // post-commit publishing. Repos with neither return an empty buffer.
+        // The Destroy arm always declares `__ret_broadcasts` now (hence `true`):
+        // with repo-attribute deps for the #1739 compile-time grandchild
+        // broadcasts (`has_dependents`), and without them for the Codex-P1
+        // runtime model-side grandchild walk, which always emits its
+        // `__ret_broadcasts.extend(...)` even though the loop is a no-op for a
+        // model with no dependents. `dep_needs_broadcast` still additionally
+        // drives this repo's own broadcasts-only child accumulation.
+        let needs_ret_buffer = true;
+        let destroy_ret_decl = if needs_ret_buffer {
             quote! {
                 let mut __ret_broadcasts: ::std::vec::Vec<(::std::string::String, ::std::string::String)> =
                     ::std::vec::Vec::new();
@@ -1347,7 +1513,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         } else {
             quote! {}
         };
-        let destroy_ret_value = if dep_needs_broadcast {
+        let destroy_ret_value = if needs_ret_buffer {
             quote! { __ret_broadcasts }
         } else {
             quote! { ::std::vec::Vec::new() }
@@ -1378,27 +1544,64 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             /// Returns the `(topic, dom_id)` OOB delete broadcasts accumulated for
             /// `broadcasts = true` (non-commit-hook) children — the parent
             /// publishes them only AFTER its transaction commits, so a rolled-back
-            /// cascade broadcasts nothing. Empty for every other configuration.
+            /// cascade broadcasts nothing. Grandchild cascades (#1739) propagate
+            /// their broadcasts up through this same buffer. Empty for a repo with
+            /// no dependents and no broadcasting children.
             ///
-            /// NOTE (#1369 scope / see #1702): the `Destroy` cascade is
-            /// single-level — it applies this model's mutation to each child but
-            /// does NOT recursively invoke the child's own `dependent(...)`
-            /// cascade, so grandchildren are not handled. #1369's target graph is
-            /// single-level; recursive/multi-level cascade is a tracked follow-up.
+            /// #1739: the `Destroy` cascade is recursive — for each destroyed
+            /// child it invokes the child's OWN `dependent(...)` cascade against
+            /// the same connection, so grandchildren (and deeper) are handled in
+            /// one transaction. `__visited` carries the (table, id) rows already on
+            /// the destroy path; an already-seen row is skipped, so self- and
+            /// mutual-referential graphs terminate. `delete_all` remains
+            /// single-level by design (#1739 scope).
+            // #1739: returns an explicitly boxed `dyn Future` rather than being an
+            // `async fn`. The Destroy cascade is recursive and, for a self- or
+            // mutual-referential `dependent(...)` graph, calls back into an
+            // `__autumn_apply_dependent_on_conn` of this same type. An `async fn`'s
+            // anonymous future cannot then be proven `Send` (the auto-trait check
+            // is circular: the future's `Send`-ness depends on itself), so the
+            // whole cascade — and every `delete_by_id` that drives it — would fail
+            // its `+ Send` bound. Returning a `Pin<Box<dyn Future + Send>>` erases
+            // the recursive edge behind a trait object whose `Send` is axiomatic,
+            // breaking the cycle while keeping the cascade `Send`.
             #[doc(hidden)]
-            pub async fn __autumn_apply_dependent_on_conn(
-                &self,
-                conn: &mut ::autumn_web::reexports::diesel_async::AsyncPgConnection,
-                __fk_column: &str,
+            // Codex round-5-B split the single cycle set into an active-path stack
+            // plus a monotonic deleted set, taking this framework-internal helper to
+            // 8 parameters; the extra guard is intentional (see the doc above).
+            #[allow(clippy::too_many_arguments)]
+            pub fn __autumn_apply_dependent_on_conn<'__dep>(
+                &'__dep self,
+                conn: &'__dep mut ::autumn_web::reexports::diesel_async::AsyncPgConnection,
+                __fk_column: &'__dep str,
                 __parent_id: i64,
                 __action: ::autumn_web::repository::DependentAction,
                 __parent_soft: bool,
-            ) -> ::autumn_web::AutumnResult<
-                ::std::vec::Vec<(::std::string::String, ::std::string::String)>,
-            > {
+                // Codex round-5-B: TWO guard sets threaded through the recursion.
+                // `__path` is the ACTIVE recursion stack — a (table, id) is pushed
+                // before descending into its children and popped once its subtree
+                // completes; it breaks self-/mutual-referential cycles ONLY.
+                // `__deleted` is a MONOTONIC set of rows actually removed; a row
+                // already in it is skipped (genuinely gone), so a row reached again
+                // as another root's descendant is neither re-deleted nor re-hooked.
+                // Separating them is what lets a batch process a descendant root
+                // before its ancestor without the ancestor's cascade pre-skipping a
+                // still-referenced intermediate (the removed monotonic-preseed's
+                // immediate-FK bug). See the Destroy arm's guards below.
+                __path: &'__dep mut ::std::collections::HashSet<(&'static str, i64)>,
+                __deleted: &'__dep mut ::std::collections::HashSet<(&'static str, i64)>,
+            ) -> ::std::pin::Pin<::std::boxed::Box<
+                dyn ::std::future::Future<
+                    Output = ::autumn_web::AutumnResult<
+                        ::std::vec::Vec<(::std::string::String, ::std::string::String)>,
+                    >,
+                > + ::core::marker::Send + '__dep,
+            >> {
+                ::std::boxed::Box::pin(async move {
                 use ::autumn_web::reexports::diesel::prelude::*;
                 use ::autumn_web::reexports::diesel_async::RunQueryDsl;
                 #dep_hooks_use
+                #dep_autumn_dependents_use
                 let __table: &str = #table_name;
                 match __action {
                     ::autumn_web::repository::DependentAction::Restrict => {
@@ -1458,10 +1661,12 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         ::core::result::Result::Ok(::std::vec::Vec::new())
                     }
                     ::autumn_web::repository::DependentAction::Destroy => {
-                        // Single-level cascade (#1369 scope; recursion tracked in
-                        // #1702): each child's mutation is applied inline here; the
-                        // child's OWN `dependent(...)` cascade is NOT invoked, so
-                        // grandchildren are not recursively destroyed/nullified.
+                        // Recursive cascade (#1739): each child row's mutation is
+                        // applied inline, and BEFORE that mutation this repo's own
+                        // `dependent(...)` cascade is invoked against the child id,
+                        // so grandchildren (and deeper) are destroyed/nullified
+                        // within the same transaction. A `__visited` (table, id)
+                        // set breaks self-/mutual-referential cycles.
                         #destroy_register
                         #destroy_ret_decl
                         #[derive(::autumn_web::reexports::diesel::QueryableByName)]
@@ -1481,6 +1686,24 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 .map_err(::autumn_web::AutumnError::from)?;
                         for __row in __ids {
                             let __cid = __row.id;
+                            // Codex round-5-B: skip a row already DELETED (genuinely
+                            // gone) — dedup across independent batch roots / branches,
+                            // and prevents re-firing a row's hooks when it is reached
+                            // again as another root's descendant.
+                            if __deleted.contains(&(#table_name, __cid)) {
+                                continue;
+                            }
+                            // #1739 cycle guard (now the ACTIVE-path stack): skip a
+                            // (table, id) already on the current destroy path. `insert`
+                            // returns false when the row is already present, so a self-
+                            // or mutual-reference (e.g. a grandchild pointing back at an
+                            // ancestor) is not re-entered and the traversal terminates.
+                            // Pushed here before descending; popped after this row's
+                            // subtree completes (see the `__path.remove` below), so a
+                            // completed sibling/root never suppresses a later cascade.
+                            if !__path.insert((#table_name, __cid)) {
+                                continue;
+                            }
                             // #1369: reload the EXACT id the (parent-soft-gated)
                             // selection returned — do NOT re-apply `#sd_filter`
                             // (`deleted_at IS NULL`) here. On a hard parent delete
@@ -1498,16 +1721,268 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 .map_err(::autumn_web::AutumnError::from)?;
                             if let ::core::option::Option::Some(__record) = __record {
                                 #destroy_ctx_decl
+                                // Codex round-5-A: probe this child's own `restrict`
+                                // grandchildren (read-only 409) BEFORE firing the
+                                // child's `before_delete` hook — a blocked delete
+                                // then never leaves a non-transactional hook side
+                                // effect behind on a doomed transaction.
+                                #grandchild_restrict_cascade
                                 #destroy_before_delete
+                                // #1739: mutate this child's OWN dependents
+                                // (grandchildren) before removing the child row, so
+                                // a hard delete never leaves an FK-dangling
+                                // grandchild and never FK-fails the child delete.
+                                #grandchild_mutating_cascade
                                 #destroy_mutation
+                                // Codex round-5-B: the row is now truly removed —
+                                // record it so any later traversal that reaches it
+                                // (another batch root's descendant, a sibling cascade)
+                                // skips it instead of re-deleting / re-hooking.
+                                __deleted.insert((#table_name, __cid));
                                 #destroy_post_mutation
                             }
+                            // Codex round-5-B: pop this row off the ACTIVE path once
+                            // its whole subtree is processed, so it only ever blocks
+                            // re-entry WHILE on the recursion stack (cycle-break), never
+                            // afterwards. Runs whether or not the row was still present.
+                            __path.remove(&(#table_name, __cid));
                         }
                         ::core::result::Result::Ok(#destroy_ret_value)
                     }
                 }
+                })
             }
         }
+    };
+
+    // #1740 + Codex P1: bulk `delete_many` dependent cascade. `delete_many`
+    // historically bypassed `dependent(...)` entirely (a plain bulk parent
+    // delete), silently orphaning children. These tokens splice the SAME cascade
+    // the single-record delete path runs into both `delete_many_body` codegen
+    // branches (hooks and no-hooks). A repository-attribute `dependent(...)`
+    // drives it at compile time; a model-declared `#[has_many(dependent = ...)]`
+    // drives it at run time via `Model::dependents()` (Codex P1). A model with no
+    // dependents at all keeps its exact prior bulk codegen (byte-identical plain
+    // path, `()` tx return). Correctness over raw throughput: children are
+    // cascaded per parent row via the shared `__autumn_apply_dependent_on_conn`
+    // helper (so `destroy` recurses into grandchildren for free, #1739), which is
+    // the "per row" tradeoff called out in the issue.
+    //
+    // The parent's delete kind drives the child `destroy` cascade: soft when the
+    // parent repo is `#[soft_delete]` (its bulk path soft-deletes), hard otherwise.
+    let delete_many_parent_soft_lit = if config.soft_delete {
+        quote! { true }
+    } else {
+        quote! { false }
+    };
+    let emit_delete_many_cascade_call = |dep: &DependentSpec| {
+        let child_repo = &dep.child_repo;
+        let fk = &dep.fk;
+        let action_variant = dep.action.variant_ident();
+        quote! {
+            let __autumn_dep_repo = #child_repo::with_pool_untracked(
+                ::core::clone::Clone::clone(&self.pool)
+            );
+            __autumn_dep_broadcasts.extend(
+                __autumn_dep_repo
+                    .__autumn_apply_dependent_on_conn(
+                        conn,
+                        #fk,
+                        __autumn_pid,
+                        ::autumn_web::repository::DependentAction::#action_variant,
+                        #delete_many_parent_soft_lit,
+                        &mut __autumn_path,
+                        &mut __autumn_deleted,
+                    )
+                    .await?
+            );
+        }
+    };
+    let delete_many_restrict_calls: ::std::vec::Vec<_> = config
+        .dependents
+        .iter()
+        .filter(|dep| dep.action == DependentAction::Restrict)
+        .map(&emit_delete_many_cascade_call)
+        .collect();
+    let delete_many_mutating_calls: ::std::vec::Vec<_> = config
+        .dependents
+        .iter()
+        .filter(|dep| dep.action != DependentAction::Restrict)
+        .map(&emit_delete_many_cascade_call)
+        .collect();
+    // The affected parents are (re)loaded, tenant- and live-filtered and
+    // row-locked, exactly as the single-record path locks its parent, so the
+    // cascade runs only for rows this call actually deletes (never for a
+    // wrong-tenant or already-soft-deleted id present in the input slice).
+    let delete_many_live_filter = if config.soft_delete {
+        quote! { .filter(#table_ident::deleted_at.is_null()) }
+    } else {
+        quote! {}
+    };
+    let delete_many_preload_chunk = if config.tenant_scoped {
+        quote! {
+            let __autumn_dep_q = #table_ident::table
+                .filter(#table_ident::id.eq_any(chunk))
+                #delete_many_live_filter;
+            let __autumn_dep_rows: ::std::vec::Vec<#model_name> =
+                if let ::core::option::Option::Some(t) = tenant_id {
+                    __autumn_dep_q.filter(#table_ident::tenant_id.eq(t)).for_update()
+                        .load::<#model_name>(conn).await
+                } else {
+                    __autumn_dep_q.for_update().load::<#model_name>(conn).await
+                }
+                .map_err(::autumn_web::AutumnError::from)?;
+        }
+    } else {
+        quote! {
+            let __autumn_dep_rows: ::std::vec::Vec<#model_name> =
+                #table_ident::table
+                    .filter(#table_ident::id.eq_any(chunk))
+                    #delete_many_live_filter
+                    .for_update()
+                    .load::<#model_name>(conn).await
+                    .map_err(::autumn_web::AutumnError::from)?;
+        }
+    };
+    // Shared preamble: preload the affected (tenant/live-filtered, row-locked)
+    // parents and collect their ids, and declare the two cascade-guard sets +
+    // deferred-broadcast buffer. Used by BOTH the compile-time (repo-attribute)
+    // and runtime (Codex P1, model-declared) cascade blocks.
+    //
+    // Codex round-5-B: the bulk cascade threads TWO guard sets, NOT one monotonic
+    // visited set. `__autumn_path` is the ACTIVE recursion stack (pushed before a
+    // node's own cascade, popped right after — cycle-break ONLY); `__autumn_deleted`
+    // is the monotonic set of rows actually removed. The removed round-2/round-4
+    // monotonic pre-seed marked a batch root visited BEFORE it was deleted, so a
+    // self-referential `dependent = destroy` batch that happened to process a
+    // descendant root before its ancestor made the ancestor's cascade skip that
+    // descendant while deleting the intermediate it still references — tripping an
+    // IMMEDIATE foreign-key constraint. With the split, a descendant root's own
+    // Phase-2 iteration pushes then pops itself on `__autumn_path`, so it is NOT on
+    // the path (and not yet in `__autumn_deleted`) when the ancestor's cascade later
+    // reaches it: the ancestor cascades it deepest-first (no FK), and once it is
+    // truly removed `__autumn_deleted` skips it everywhere after (no double delete,
+    // no double hook — including the bulk-root hook loop, which consults it too).
+    // Cycles still terminate via `__autumn_path`.
+    let delete_many_collect_parents = quote! {
+        let mut __autumn_path: ::std::collections::HashSet<(&'static str, i64)> =
+            ::std::collections::HashSet::new();
+        let mut __autumn_deleted: ::std::collections::HashSet<(&'static str, i64)> =
+            ::std::collections::HashSet::new();
+        let mut __autumn_dep_broadcasts: ::std::vec::Vec<(::std::string::String, ::std::string::String)> =
+            ::std::vec::Vec::new();
+        let mut __autumn_dep_parent_ids: ::std::vec::Vec<i64> = ::std::vec::Vec::new();
+        for chunk in ids.chunks(1000) {
+            #delete_many_preload_chunk
+            __autumn_dep_parent_ids.extend(__autumn_dep_rows.iter().map(|__r| __r.id));
+        }
+    };
+    // Compile-time (repository-attribute `dependent(...)`) bulk cascade, spliced
+    // inside the transaction BEFORE the bulk parent delete. Restrict probes for
+    // every parent run first (a 409 rolls the whole transaction back before any
+    // mutating action), then the mutating dependents.
+    let delete_many_compiletime_cascade = quote! {
+        #delete_many_collect_parents
+        // Phase 1: probe all `restrict` dependents for every parent first.
+        for &__autumn_pid in &__autumn_dep_parent_ids {
+            #(#delete_many_restrict_calls)*
+        }
+        // Phase 2: mutating dependents per parent, in declaration order.
+        for &__autumn_pid in &__autumn_dep_parent_ids {
+            // Codex round-5-B: a root already cascade-deleted as ANOTHER root's
+            // descendant is genuinely gone — skip it (its whole subtree was already
+            // handled deepest-first by that ancestor). Do NOT monotonically pre-seed
+            // it; instead push it onto the ACTIVE path only for the span of its own
+            // cascade (cycle-break for a self-referential child pointing back at it),
+            // then pop. A later ancestor can then still cascade this root deepest-first
+            // instead of pre-skipping a still-referenced intermediate (immediate-FK).
+            if __autumn_deleted.contains(&(#table_name, __autumn_pid)) {
+                continue;
+            }
+            __autumn_path.insert((#table_name, __autumn_pid));
+            #(#delete_many_mutating_calls)*
+            __autumn_path.remove(&(#table_name, __autumn_pid));
+        }
+    };
+    // Runtime (model-declared `#[has_many(dependent = ...)]`) bulk cascade
+    // (Codex P1). When the repository declares NO `dependent(...)`, `delete_many`
+    // must mirror the single-record `delete_by_id` runtime dispatch: walk the
+    // model's `Model::dependents()` specs per parent — restrict-probe first, then
+    // mutating — reusing the SAME leaf executor / boxed-future recursion /
+    // deferred-broadcast buffer as the compile-time path. Requires `__autumn_rt_deps`
+    // (the `Model::dependents()` slice) to be bound in the enclosing scope.
+    let delete_many_runtime_cascade = quote! {
+        #delete_many_collect_parents
+        // Phase 1: probe every parent's `restrict` dependents first.
+        for &__autumn_pid in &__autumn_dep_parent_ids {
+            for __autumn_spec in __autumn_rt_deps.iter().filter(|__s|
+                __s.action == ::autumn_web::repository::DependentAction::Restrict
+            ) {
+                __autumn_dep_broadcasts.extend(
+                    (__autumn_spec.cascade)(
+                        &self.pool,
+                        conn,
+                        __autumn_pid,
+                        #delete_many_parent_soft_lit,
+                        &mut __autumn_path,
+                        &mut __autumn_deleted,
+                    )
+                    .await?
+                );
+            }
+        }
+        // Phase 2: mutating dependents per parent, in declaration order.
+        for &__autumn_pid in &__autumn_dep_parent_ids {
+            // Codex round-5-B (mirrors the compile-time block): skip a root already
+            // cascade-deleted as another root's descendant; otherwise bracket its own
+            // cascade with an ACTIVE-path push/pop (cycle-break only), NOT a monotonic
+            // pre-seed — so a later ancestor can still cascade it deepest-first without
+            // pre-skipping a still-referenced intermediate (immediate-FK).
+            if __autumn_deleted.contains(&(#table_name, __autumn_pid)) {
+                continue;
+            }
+            __autumn_path.insert((#table_name, __autumn_pid));
+            for __autumn_spec in __autumn_rt_deps.iter().filter(|__s|
+                __s.action != ::autumn_web::repository::DependentAction::Restrict
+            ) {
+                __autumn_dep_broadcasts.extend(
+                    (__autumn_spec.cascade)(
+                        &self.pool,
+                        conn,
+                        __autumn_pid,
+                        #delete_many_parent_soft_lit,
+                        &mut __autumn_path,
+                        &mut __autumn_deleted,
+                    )
+                    .await?
+                );
+            }
+            __autumn_path.remove(&(#table_name, __autumn_pid));
+        }
+    };
+    // When a cascade runs, the transaction returns the deferred child broadcasts
+    // so they can be published post-commit (a rolled-back cascade publishes
+    // nothing). These "cascade" variants of the tx bind / return / publish / tail
+    // tokens are shared by the compile-time and runtime cascade forms; the "plain"
+    // (no-cascade) forms return `()` exactly as before (byte-identical bulk
+    // codegen for a model with no dependents at all).
+    let delete_many_cascade_tx_bind = quote! { let __autumn_dep_broadcasts = };
+    let delete_many_cascade_tx_ok = quote! { Ok(__autumn_dep_broadcasts) };
+    let delete_many_cascade_post_publish = quote! {
+        ::autumn_web::repository::publish_deferred_dependent_broadcasts(__autumn_dep_broadcasts);
+        // A cascaded `destroy` child may have enqueued a commit hook in the
+        // same transaction; kick the durable dispatcher (idempotent).
+        ::autumn_web::__private::kick_repository_commit_hook_dispatcher(&self.pool);
+    };
+    // The no-hooks `delete_many` body ends with the transaction as its tail
+    // expression (`... .await`). With a cascade it must instead await-and-bind,
+    // then publish the deferred broadcasts after commit; the plain form keeps the
+    // exact prior `.await` tail (returning the transaction's Result).
+    let delete_many_cascade_no_hooks_tail = quote! {
+        ?;
+        ::core::mem::drop(conn);
+        #delete_many_cascade_post_publish
+        Ok(())
     };
 
     // Parse derived query methods from trait body
@@ -1934,11 +2409,32 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                          out a derived query with a borrowed parameter; declare the parameter as \
                          an owned type (e.g. String) to enable fan-out, or query a specific shard"
                     );
+                    // Same no-shard-set rejection the owned-param branch and the
+                    // count guard emit: without a shard set, an across-tenant read
+                    // would bind a NULL tenant predicate and silently return a
+                    // PARTIAL single-pool result, so reject rather than fall
+                    // through to `#body` (#1692, #1741).
+                    let no_shard_set_msg = format!(
+                        "cross-shard {fn_ident} requires a configured shard set: across_tenants() \
+                         cannot fan a derived query out across shards without a shard set (the \
+                         repository was built without shard context, e.g. via with_pool_untracked); \
+                         build it with shard context instead"
+                    );
                     derived_impl_methods.push(quote! {
                         async fn #fn_ident(&self, #(#params),*) -> ::autumn_web::AutumnResult<#return_type> {
                             use ::autumn_web::reexports::diesel::prelude::*;
                             use ::autumn_web::reexports::diesel_async::RunQueryDsl;
-                            if self.across_tenants && self.__autumn_shards.is_some() {
+                            if self.across_tenants {
+                                // No shard set → would fall through to a partial
+                                // single-pool read; reject like the owned-param
+                                // branch and the count guard (#1741).
+                                if self.__autumn_shards.is_none() {
+                                    return ::core::result::Result::Err(
+                                        ::autumn_web::AutumnError::bad_request_msg(#no_shard_set_msg)
+                                    );
+                                }
+                                // Shard set present, but a borrowed parameter can't
+                                // fan out across shards.
                                 return ::core::result::Result::Err(
                                     ::autumn_web::AutumnError::bad_request_msg(#msg)
                                 );
@@ -1962,22 +2458,34 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             #body
                         }
                     });
+                    let no_shard_set_msg = format!(
+                        "cross-shard {fn_ident} requires a configured shard set: across_tenants() \
+                         cannot fan a derived query out across shards without a shard set (the \
+                         repository was built without shard context, e.g. via with_pool_untracked); \
+                         build it with shard context instead"
+                    );
                     derived_impl_methods.push(quote! {
                         async fn #fn_ident(&self, #(#params),*) -> ::autumn_web::AutumnResult<#return_type> {
                             use ::autumn_web::reexports::diesel::prelude::*;
                             use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                            // Without a shard set, an across-tenant read would bind a NULL tenant
+                            // predicate and silently return a PARTIAL result over only the current
+                            // pool, so we reject rather than fall through (#1692, #1741).
                             if self.across_tenants {
-                                if let ::core::option::Option::Some(ref __shards) = self.__autumn_shards {
-                                    // Params are cloned once per shard (the fan-out closure is
-                                    // `Fn`); allow it for `Copy` params too (e.g. an i64 filter).
-                                    #[allow(clippy::clone_on_copy)]
-                                    let __results = __shards.fan_out_shards(|__shard| {
-                                        let __sub = self.__autumn_for_shard(__shard);
-                                        #(let #param_idents = ::core::clone::Clone::clone(&#param_idents);)*
-                                        async move { __sub.#one_shard_ident(#(#param_idents),*).await }
-                                    }).await?;
-                                    return ::core::result::Result::Ok(#merge);
-                                }
+                                let ::core::option::Option::Some(ref __shards) = self.__autumn_shards else {
+                                    return ::core::result::Result::Err(
+                                        ::autumn_web::AutumnError::bad_request_msg(#no_shard_set_msg)
+                                    );
+                                };
+                                // Params are cloned once per shard (the fan-out closure is
+                                // `Fn`); allow it for `Copy` params too (e.g. an i64 filter).
+                                #[allow(clippy::clone_on_copy)]
+                                let __results = __shards.fan_out_shards(|__shard| {
+                                    let __sub = self.__autumn_for_shard(__shard);
+                                    #(let #param_idents = ::core::clone::Clone::clone(&#param_idents);)*
+                                    async move { __sub.#one_shard_ident(#(#param_idents),*).await }
+                                }).await?;
+                                return ::core::result::Result::Ok(#merge);
                             }
                             #body
                         }
@@ -5939,51 +6447,125 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 quote! {}
             };
 
-            quote! {
-                use ::autumn_web::reexports::diesel::prelude::*;
-                use ::autumn_web::reexports::diesel_async::RunQueryDsl;
-                use ::autumn_web::reexports::diesel_async::AsyncConnection;
-                use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
-                use ::autumn_web::hooks::{MutationContext, MutationOp, MutationHooks};
+            // The bulk delete body is parameterized on its cascade tokens so it
+            // can be emitted twice under runtime dispatch (Codex P1): a plain
+            // no-cascade form (tx returns `()`) and a runtime-cascade form (tx
+            // returns the deferred broadcasts). A repository-attribute
+            // `dependent(...)` instead emits it once with the compile-time cascade.
+            let build_delete_many_body =
+                |delete_many_cascade: &proc_macro2::TokenStream,
+                 delete_many_tx_bind: &proc_macro2::TokenStream,
+                 delete_many_tx_ok: &proc_macro2::TokenStream,
+                 delete_many_post_publish: &proc_macro2::TokenStream,
+                 delete_many_root_skip: &proc_macro2::TokenStream| {
+                    quote! {
+                        use ::autumn_web::reexports::diesel::prelude::*;
+                        use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                        use ::autumn_web::reexports::diesel_async::AsyncConnection;
+                        use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
+                        use ::autumn_web::hooks::{MutationContext, MutationOp, MutationHooks};
 
-                if ids.is_empty() {
-                    return Ok(());
-                }
-
-                #tenant_id_setup
-                let mut conn = self.__autumn_acquire_conn().await?;
-                let __now = ::autumn_web::reexports::chrono::Utc::now().naive_utc();
-
-                ::autumn_web::__private::scoped_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
-                    async move {
-                        let mut current_rows = Vec::new();
-                        for chunk in ids.chunks(1000) {
-                            let load_query = #table_ident::table.filter(#table_ident::id.eq_any(chunk))
-                                .order(#table_ident::id.asc());
-                            let chunk_rows = #load_expr
-                                .map_err(::autumn_web::AutumnError::from)?;
-                            current_rows.extend(chunk_rows);
+                        if ids.is_empty() {
+                            return Ok(());
                         }
 
-                        for record in &current_rows {
-                            let mut ctx = MutationContext::new(MutationOp::Delete);
-                            #idempotency_setup
-                            self.hooks.before_delete(&mut ctx, record).await?;
-                            #delete_commit_hook_setup
-                        }
+                        #tenant_id_setup
+                        let mut conn = self.__autumn_acquire_conn().await?;
+                        let __now = ::autumn_web::reexports::chrono::Utc::now().naive_utc();
 
-                        #delete_execution
+                        #delete_many_tx_bind ::autumn_web::__private::scoped_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
+                            async move {
+                                let mut current_rows = Vec::new();
+                                for chunk in ids.chunks(1000) {
+                                    let load_query = #table_ident::table.filter(#table_ident::id.eq_any(chunk))
+                                        .order(#table_ident::id.asc());
+                                    let chunk_rows = #load_expr
+                                        .map_err(::autumn_web::AutumnError::from)?;
+                                    current_rows.extend(chunk_rows);
+                                }
+
+                                // #1740: cascade dependent actions for every parent BEFORE
+                                // the bulk parent delete, so no child is orphaned and the
+                                // parent delete never trips a foreign-key constraint.
+                                // Codex round-5-B: the cascade runs FIRST so a batch root
+                                // that is also another root's descendant is deleted (and
+                                // recorded in `__autumn_deleted`) here — its `before_delete`
+                                // fires exactly once as that descendant; the root hook loop
+                                // below then skips it (`#delete_many_root_skip`), avoiding a
+                                // second firing, and the tolerant bulk `id = ANY` delete no
+                                // longer touches it.
+                                #delete_many_cascade
+
+                                for record in &current_rows {
+                                    #delete_many_root_skip
+                                    let mut ctx = MutationContext::new(MutationOp::Delete);
+                                    #idempotency_setup
+                                    self.hooks.before_delete(&mut ctx, record).await?;
+                                    #delete_commit_hook_setup
+                                }
+
+                                #delete_execution
+
+                                #delete_many_tx_ok
+                            }
+                            .scope_boxed()
+                        })
+                        .await?;
+
+                        ::core::mem::drop(conn);
+                        #kick_dispatcher
+                        #delete_many_post_publish
 
                         Ok(())
                     }
-                    .scope_boxed()
-                })
-                .await?;
-
-                ::core::mem::drop(conn);
-                #kick_dispatcher
-
-                Ok(())
+                };
+            // Codex round-5-B: in the cascade forms, a batch root already deleted as
+            // another root's cascaded descendant must be skipped by the root hook
+            // loop (its `before_delete`/commit-hook already fired during the cascade).
+            // The plain (no-cascade) form has no `__autumn_deleted` set, so its skip
+            // token is empty and the loop is byte-identical to the prior codegen.
+            let delete_many_cascade_root_skip = quote! {
+                if __autumn_deleted.contains(&(#table_name, record.id)) { continue; }
+            };
+            // Codex P1: with no repository-attribute `dependent(...)`, dispatch the
+            // bulk cascade at run time via the model's `Model::dependents()` — empty
+            // (blanket) for a model with no dependents, so the byte-identical plain
+            // path runs and the tx still returns `()`; non-empty for a model-declared
+            // `#[has_many(dependent = ...)]`, so the runtime cascade runs. A
+            // repository-attribute `dependent(...)` keeps its authoritative
+            // compile-time cascade (precedence, mirroring `delete_by_id`).
+            if config.dependents.is_empty() {
+                let __plain = build_delete_many_body(
+                    &quote! {},
+                    &quote! {},
+                    &quote! { Ok(()) },
+                    &quote! {},
+                    &quote! {},
+                );
+                let __runtime = build_delete_many_body(
+                    &delete_many_runtime_cascade,
+                    &delete_many_cascade_tx_bind,
+                    &delete_many_cascade_tx_ok,
+                    &delete_many_cascade_post_publish,
+                    &delete_many_cascade_root_skip,
+                );
+                quote! {
+                    use ::autumn_web::repository::AutumnDependents as _;
+                    let __autumn_rt_deps = #model_name::dependents();
+                    if __autumn_rt_deps.is_empty() {
+                        #__plain
+                    } else {
+                        #__runtime
+                    }
+                }
+            } else {
+                build_delete_many_body(
+                    &delete_many_compiletime_cascade,
+                    &delete_many_cascade_tx_bind,
+                    &delete_many_cascade_tx_ok,
+                    &delete_many_cascade_post_publish,
+                    &delete_many_cascade_root_skip,
+                )
             }
         };
 
@@ -7555,31 +8137,79 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 (loop_ts, quote! {})
             };
 
-            quote! {
-                use ::autumn_web::reexports::diesel::prelude::*;
-                use ::autumn_web::reexports::diesel_async::RunQueryDsl;
-                use ::autumn_web::reexports::diesel_async::AsyncConnection;
-                use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
+            // Parameterized on its cascade tokens so it can be emitted twice under
+            // runtime dispatch (Codex P1): a plain no-cascade form whose tx tail
+            // returns `()`, and a runtime-cascade form that binds/publishes the
+            // deferred broadcasts. A repository-attribute `dependent(...)` emits it
+            // once with the compile-time cascade.
+            let build_delete_many_body =
+                |delete_many_cascade: &proc_macro2::TokenStream,
+                 delete_many_tx_bind: &proc_macro2::TokenStream,
+                 delete_many_tx_ok: &proc_macro2::TokenStream,
+                 delete_many_no_hooks_tail: &proc_macro2::TokenStream| {
+                    quote! {
+                        use ::autumn_web::reexports::diesel::prelude::*;
+                        use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                        use ::autumn_web::reexports::diesel_async::AsyncConnection;
+                        use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
 
-                if ids.is_empty() {
-                    return Ok(());
-                }
+                        if ids.is_empty() {
+                            return Ok(());
+                        }
 
-                #tenant_id_setup
-                let mut conn = self.__autumn_acquire_conn().await?;
-                let __now = ::autumn_web::reexports::chrono::Utc::now().naive_utc();
+                        #tenant_id_setup
+                        let mut conn = self.__autumn_acquire_conn().await?;
+                        let __now = ::autumn_web::reexports::chrono::Utc::now().naive_utc();
 
-                ::autumn_web::__private::scoped_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
-                    async move {
-                        #vh_delete_load_before
-                        #delete_loop
-                        #vh_delete_filter
-                        #vh_delete_write
-                        Ok(())
+                        #delete_many_tx_bind ::autumn_web::__private::scoped_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
+                            async move {
+                                // #1740: cascade dependent actions for every parent BEFORE
+                                // the bulk parent delete (empty for repos with no
+                                // dependents, preserving the prior bulk codegen).
+                                #delete_many_cascade
+                                #vh_delete_load_before
+                                #delete_loop
+                                #vh_delete_filter
+                                #vh_delete_write
+                                #delete_many_tx_ok
+                            }
+                            .scope_boxed()
+                        })
+                        .await #delete_many_no_hooks_tail
                     }
-                    .scope_boxed()
-                })
-                .await
+                };
+            // Codex P1: with no repository-attribute `dependent(...)`, dispatch the
+            // bulk cascade at run time via `Model::dependents()` — empty (blanket)
+            // for a model with no dependents, so the byte-identical plain path runs
+            // (tx returns `()` as before); non-empty for a model-declared
+            // `#[has_many(dependent = ...)]`, so the runtime cascade runs. A
+            // repository-attribute `dependent(...)` keeps its authoritative
+            // compile-time cascade (precedence, mirroring `delete_by_id`).
+            if config.dependents.is_empty() {
+                let __plain =
+                    build_delete_many_body(&quote! {}, &quote! {}, &quote! { Ok(()) }, &quote! {});
+                let __runtime = build_delete_many_body(
+                    &delete_many_runtime_cascade,
+                    &delete_many_cascade_tx_bind,
+                    &delete_many_cascade_tx_ok,
+                    &delete_many_cascade_no_hooks_tail,
+                );
+                quote! {
+                    use ::autumn_web::repository::AutumnDependents as _;
+                    let __autumn_rt_deps = #model_name::dependents();
+                    if __autumn_rt_deps.is_empty() {
+                        #__plain
+                    } else {
+                        #__runtime
+                    }
+                }
+            } else {
+                build_delete_many_body(
+                    &delete_many_compiletime_cascade,
+                    &delete_many_cascade_tx_bind,
+                    &delete_many_cascade_tx_ok,
+                    &delete_many_cascade_no_hooks_tail,
+                )
             }
         };
 
@@ -7882,9 +8512,15 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // `across_tenants()` delete is rejected rather than cascading across shards
     // from a single routed connection (honoring the #1592/#1664/#1687 guards; a
     // cascade cannot silently skip children living on other shards).
-    let delete_body = if config.dependents.is_empty() {
-        delete_body
-    } else {
+    let delete_body = {
+        // #1738: the parent-side cascade body is shared between the
+        // repository-attribute (compile-time `dependent(...)`) form and the
+        // model-declared `#[has_many(dependent = ...)]` form (dispatched at run
+        // time via `Model::dependents()`). The parent load/mutation/hook/version
+        // tokens below are identical for both; only the per-child cascade calls
+        // differ (a compile-time list vs a runtime `RuntimeDependentSpec` slice),
+        // so those are passed into `assemble_cascade_body`.
+        //
         // The parent's own delete kind (soft vs hard) drives the child `destroy`
         // cascade (#1369 P1): a soft-delete child is only soft-deleted alongside
         // a soft-deleted parent; a hard-deleted parent hard-deletes its children.
@@ -7892,57 +8528,6 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             quote! { true }
         } else {
             quote! { false }
-        };
-        // #1369 restrict ordering: probe every `restrict` dependent BEFORE
-        // running any mutating dependent (`destroy`/`delete_all`/`nullify`).
-        // Mutating actions fire child `before_delete` hooks (counters, cache
-        // invalidation, external calls) that are NOT commit hooks — a later
-        // `restrict` 409 rolls back the DB but cannot retract those side effects.
-        // Hoisting all restrict probes ahead of the mutating pass means a blocked
-        // delete never touches a child hook. Per-action semantics are unchanged;
-        // only the order within the single transaction changes. `restrict` probes
-        // keep their parent-soft gating and short-circuit via `AutumnError`.
-        let emit_cascade_call = |dep: &DependentSpec| {
-            let child_repo = &dep.child_repo;
-            let fk = &dep.fk;
-            let action_variant = dep.action.variant_ident();
-            quote! {
-                let __autumn_dep_repo = #child_repo::with_pool_untracked(
-                    ::core::clone::Clone::clone(&self.pool)
-                );
-                // Deferred delete broadcasts accumulate here; they are published
-                // only after the tx commits (see the post-commit region below).
-                __autumn_dep_broadcasts.extend(
-                    __autumn_dep_repo
-                        .__autumn_apply_dependent_on_conn(
-                            conn,
-                            #fk,
-                            id,
-                            ::autumn_web::repository::DependentAction::#action_variant,
-                            #parent_soft_lit,
-                        )
-                        .await?
-                );
-            }
-        };
-        let restrict_calls: ::std::vec::Vec<_> = config
-            .dependents
-            .iter()
-            .filter(|dep| dep.action == DependentAction::Restrict)
-            .map(&emit_cascade_call)
-            .collect();
-        let mutating_calls: ::std::vec::Vec<_> = config
-            .dependents
-            .iter()
-            .filter(|dep| dep.action != DependentAction::Restrict)
-            .map(&emit_cascade_call)
-            .collect();
-        let cascade_calls = quote! {
-            // Phase 1: probe all `restrict` dependents first — a 409 here rolls
-            // back before any mutating action fires a child hook.
-            #(#restrict_calls)*
-            // Phase 2: mutating dependents in declaration order.
-            #(#mutating_calls)*
         };
 
         let tenant_id_setup = if config.tenant_scoped {
@@ -8145,65 +8730,215 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         } else {
             quote! {}
         };
-        quote! {
-            use ::autumn_web::reexports::diesel::prelude::*;
-            use ::autumn_web::reexports::diesel_async::RunQueryDsl;
-            use ::autumn_web::reexports::diesel_async::AsyncConnection;
-            use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
-            #parent_hooks_use
+        // Assemble the full transactional delete body around a given
+        // per-child cascade block (`cascade_calls`). Shared by the
+        // repository-attribute and model-declared (#1738) cascade forms.
+        let assemble_cascade_body = |cascade_calls: proc_macro2::TokenStream| {
+            quote! {
+                use ::autumn_web::reexports::diesel::prelude::*;
+                use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                use ::autumn_web::reexports::diesel_async::AsyncConnection;
+                use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
+                #parent_hooks_use
 
-            #parent_register
-            #tenant_id_setup
-            let mut conn = self.__autumn_acquire_conn().await?;
-            // Deferred OOB delete broadcasts for broadcasts-only cascaded children
-            // (#1369). Accumulated inside the tx and returned on commit, so a
-            // rollback drops them and no spurious client deletes are published.
-            let __autumn_dep_broadcasts: ::std::vec::Vec<(::std::string::String, ::std::string::String)> =
-                ::autumn_web::__private::scoped_transaction::<
-                    ::std::vec::Vec<(::std::string::String, ::std::string::String)>,
-                    ::autumn_web::AutumnError, _, _,
-                >(
-                    &mut *conn,
-                    |conn| {
-                        async move {
-                            let mut __autumn_dep_broadcasts: ::std::vec::Vec<(::std::string::String, ::std::string::String)> =
-                                ::std::vec::Vec::new();
-                            #parent_ctx_decl
-                            #parent_idempotency_setup
+                #parent_register
+                #tenant_id_setup
+                let mut conn = self.__autumn_acquire_conn().await?;
+                // Deferred OOB delete broadcasts for broadcasts-only cascaded children
+                // (#1369). Accumulated inside the tx and returned on commit, so a
+                // rollback drops them and no spurious client deletes are published.
+                let __autumn_dep_broadcasts: ::std::vec::Vec<(::std::string::String, ::std::string::String)> =
+                    ::autumn_web::__private::scoped_transaction::<
+                        ::std::vec::Vec<(::std::string::String, ::std::string::String)>,
+                        ::autumn_web::AutumnError, _, _,
+                    >(
+                        &mut *conn,
+                        |conn| {
+                            async move {
+                                let mut __autumn_dep_broadcasts: ::std::vec::Vec<(::std::string::String, ::std::string::String)> =
+                                    ::std::vec::Vec::new();
+                                #parent_ctx_decl
+                                #parent_idempotency_setup
 
-                            #parent_load
+                                #parent_load
 
-                            #parent_before_delete
+                                #parent_before_delete
 
-                            // Cascade to dependent children FIRST so the parent
-                            // delete never trips a foreign-key constraint and no
-                            // orphan can survive the transaction.
-                            #cascade_calls
+                                // Cascade to dependent children FIRST so the parent
+                                // delete never trips a foreign-key constraint and no
+                                // orphan can survive the transaction.
+                                #cascade_calls
 
-                            #parent_mutation
+                                #parent_mutation
 
-                            #parent_vh
+                                #parent_vh
 
-                            #parent_commit_enqueue
+                                #parent_commit_enqueue
 
-                            Ok(__autumn_dep_broadcasts)
-                        }
-                        .scope_boxed()
-                    },
-                )
-                .await?;
-            ::core::mem::drop(conn);
-            // Publish the cascaded children's OOB delete broadcasts only now that
-            // the transaction has committed (a rolled-back cascade published
-            // nothing). No-op when the buffer is empty / live channels are off.
-            ::autumn_web::repository::publish_deferred_dependent_broadcasts(__autumn_dep_broadcasts);
-            // Always kick the durable commit-hook dispatcher after a dependent
-            // delete: even when this parent has no commit hooks, a cascaded
-            // `dependent = destroy` child may have enqueued one in the same
-            // transaction. The kick is idempotent.
-            ::autumn_web::__private::kick_repository_commit_hook_dispatcher(&self.pool);
+                                Ok(__autumn_dep_broadcasts)
+                            }
+                            .scope_boxed()
+                        },
+                    )
+                    .await?;
+                ::core::mem::drop(conn);
+                // Publish the cascaded children's OOB delete broadcasts only now that
+                // the transaction has committed (a rolled-back cascade published
+                // nothing). No-op when the buffer is empty / live channels are off.
+                ::autumn_web::repository::publish_deferred_dependent_broadcasts(__autumn_dep_broadcasts);
+                // Always kick the durable commit-hook dispatcher after a dependent
+                // delete: even when this parent has no commit hooks, a cascaded
+                // `dependent = destroy` child may have enqueued one in the same
+                // transaction. The kick is idempotent.
+                ::autumn_web::__private::kick_repository_commit_hook_dispatcher(&self.pool);
 
-            Ok(())
+                Ok(())
+            }
+        };
+
+        if config.dependents.is_empty() {
+            // ── #1738: model-declared `#[has_many(dependent = ...)]` cascade ──
+            //
+            // No repository-attribute `dependent(...)` was declared, so consult
+            // the model's runtime `Model::dependents()` (an inherent shadow of
+            // `AutumnDependents::dependents`, emitted by `#[model]` only when the
+            // struct declares dependent associations; otherwise the blanket impl
+            // yields an empty slice). When empty this is exactly the prior plain
+            // delete body; when non-empty it drives the SAME transactional
+            // cascade as the repository-attribute form, resolving each child
+            // repository through the `Pg{Child}Repository` convention baked into
+            // the spec's `cascade` thunk.
+            let runtime_cascade_calls = quote! {
+                // Codex round-5-B cycle guard: the ACTIVE recursion path, seeded
+                // with this parent row so a grandchild that references an ancestor
+                // is skipped (cycle) instead of looping, plus a monotonic deleted
+                // set. The parent itself is deleted by `#parent_mutation` below, so
+                // it stays on the path for the whole cascade (never popped here).
+                let mut __autumn_path: ::std::collections::HashSet<(&'static str, i64)> =
+                    ::std::collections::HashSet::new();
+                let mut __autumn_deleted: ::std::collections::HashSet<(&'static str, i64)> =
+                    ::std::collections::HashSet::new();
+                __autumn_path.insert((#table_name, id));
+                // Phase 1: probe all `restrict` dependents first — a 409 here
+                // rolls back before any mutating action fires a child hook.
+                for __autumn_spec in __autumn_rt_deps.iter().filter(|__s|
+                    __s.action == ::autumn_web::repository::DependentAction::Restrict
+                ) {
+                    __autumn_dep_broadcasts.extend(
+                        (__autumn_spec.cascade)(
+                            &self.pool,
+                            conn,
+                            id,
+                            #parent_soft_lit,
+                            &mut __autumn_path,
+                            &mut __autumn_deleted,
+                        )
+                        .await?
+                    );
+                }
+                // Phase 2: mutating dependents in declaration order.
+                for __autumn_spec in __autumn_rt_deps.iter().filter(|__s|
+                    __s.action != ::autumn_web::repository::DependentAction::Restrict
+                ) {
+                    __autumn_dep_broadcasts.extend(
+                        (__autumn_spec.cascade)(
+                            &self.pool,
+                            conn,
+                            id,
+                            #parent_soft_lit,
+                            &mut __autumn_path,
+                            &mut __autumn_deleted,
+                        )
+                        .await?
+                    );
+                }
+            };
+            let runtime_body = assemble_cascade_body(runtime_cascade_calls);
+            let plain_delete_body = delete_body;
+            quote! {
+                use ::autumn_web::repository::AutumnDependents as _;
+                // Inherent `dependents()` (real specs) shadows the blanket trait
+                // method (empty) when the model declares dependents; unqualified
+                // call so the shadow wins. Cheap `&[]` for models without any.
+                let __autumn_rt_deps = #model_name::dependents();
+                if __autumn_rt_deps.is_empty() {
+                    #plain_delete_body
+                } else {
+                    #runtime_body
+                }
+            }
+        } else {
+            // ── #1369 repository-attribute `dependent(...)` cascade ──────────
+            //
+            // Precedence (#1738): a repository that declares `dependent(...)` is
+            // the explicit escape hatch (for children whose repository does not
+            // follow the `Pg{Child}Repository` convention, or lives in another
+            // crate). Its compile-time specs are authoritative; any model-side
+            // `#[has_many(dependent = ...)]` is ignored here.
+            //
+            // #1369 restrict ordering: probe every `restrict` dependent BEFORE
+            // running any mutating dependent (`destroy`/`delete_all`/`nullify`).
+            // Mutating actions fire child `before_delete` hooks (counters, cache
+            // invalidation, external calls) that are NOT commit hooks — a later
+            // `restrict` 409 rolls back the DB but cannot retract those side
+            // effects. Hoisting all restrict probes ahead of the mutating pass
+            // means a blocked delete never touches a child hook.
+            let emit_cascade_call = |dep: &DependentSpec| {
+                let child_repo = &dep.child_repo;
+                let fk = &dep.fk;
+                let action_variant = dep.action.variant_ident();
+                quote! {
+                    let __autumn_dep_repo = #child_repo::with_pool_untracked(
+                        ::core::clone::Clone::clone(&self.pool)
+                    );
+                    // Deferred delete broadcasts accumulate here; published only
+                    // after the tx commits (see the post-commit region above).
+                    __autumn_dep_broadcasts.extend(
+                        __autumn_dep_repo
+                            .__autumn_apply_dependent_on_conn(
+                                conn,
+                                #fk,
+                                id,
+                                ::autumn_web::repository::DependentAction::#action_variant,
+                                #parent_soft_lit,
+                                &mut __autumn_path,
+                                &mut __autumn_deleted,
+                            )
+                            .await?
+                    );
+                }
+            };
+            let restrict_calls: ::std::vec::Vec<_> = config
+                .dependents
+                .iter()
+                .filter(|dep| dep.action == DependentAction::Restrict)
+                .map(&emit_cascade_call)
+                .collect();
+            let mutating_calls: ::std::vec::Vec<_> = config
+                .dependents
+                .iter()
+                .filter(|dep| dep.action != DependentAction::Restrict)
+                .map(&emit_cascade_call)
+                .collect();
+            let cascade_calls = quote! {
+                // Codex round-5-B cycle guard: the ACTIVE recursion path (seeded
+                // with this parent row so a grandchild referencing an ancestor is
+                // skipped as a cycle, not looped) plus a monotonic deleted set,
+                // both threaded by-ref into every `__autumn_apply_dependent_on_conn`
+                // call. The parent is deleted by `#parent_mutation`, so it stays on
+                // the path for the whole cascade (not popped here).
+                let mut __autumn_path: ::std::collections::HashSet<(&'static str, i64)> =
+                    ::std::collections::HashSet::new();
+                let mut __autumn_deleted: ::std::collections::HashSet<(&'static str, i64)> =
+                    ::std::collections::HashSet::new();
+                __autumn_path.insert((#table_name, id));
+                // Phase 1: probe all `restrict` dependents first — a 409 here
+                // rolls back before any mutating action fires a child hook.
+                #(#restrict_calls)*
+                // Phase 2: mutating dependents in declaration order.
+                #(#mutating_calls)*
+            };
+            assemble_cascade_body(cascade_calls)
         }
     };
 
@@ -11105,30 +11840,51 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut soft_delete_one_shard_helpers: Vec<proc_macro2::TokenStream> = Vec::new();
     let (with_deleted_fan_out, only_deleted_fan_out, page_only_deleted_cross_shard_guard) =
         if config.soft_delete && config.sharded && config.tenant_scoped {
+            // Without a shard set, an across-tenant read would bind a NULL tenant
+            // predicate and silently return a PARTIAL result over only the current
+            // pool, so we reject rather than fall through (#1692, #1741).
             let with_deleted_fan_out = quote! {
                 if self.across_tenants {
-                    if let ::core::option::Option::Some(ref __shards) = self.__autumn_shards {
-                        let __vecs = __shards.fan_out_shards(|__shard| {
-                            let __sub = self.__autumn_for_shard(__shard);
-                            async move { __sub.__autumn_with_deleted_one_shard().await }
-                        }).await?;
-                        return ::core::result::Result::Ok(
-                            __vecs.into_iter().flatten().collect()
+                    let ::core::option::Option::Some(ref __shards) = self.__autumn_shards else {
+                        return ::core::result::Result::Err(
+                            ::autumn_web::AutumnError::bad_request_msg(
+                                "cross-shard with_deleted requires a configured shard set: \
+                                 across_tenants() cannot fan with_deleted out across shards \
+                                 without a shard set (the repository was built without \
+                                 shard context, e.g. via with_pool_untracked); build it \
+                                 with shard context instead"
+                            )
                         );
-                    }
+                    };
+                    let __vecs = __shards.fan_out_shards(|__shard| {
+                        let __sub = self.__autumn_for_shard(__shard);
+                        async move { __sub.__autumn_with_deleted_one_shard().await }
+                    }).await?;
+                    return ::core::result::Result::Ok(
+                        __vecs.into_iter().flatten().collect()
+                    );
                 }
             };
             let only_deleted_fan_out = quote! {
                 if self.across_tenants {
-                    if let ::core::option::Option::Some(ref __shards) = self.__autumn_shards {
-                        let __vecs = __shards.fan_out_shards(|__shard| {
-                            let __sub = self.__autumn_for_shard(__shard);
-                            async move { __sub.__autumn_only_deleted_one_shard().await }
-                        }).await?;
-                        return ::core::result::Result::Ok(
-                            __vecs.into_iter().flatten().collect()
+                    let ::core::option::Option::Some(ref __shards) = self.__autumn_shards else {
+                        return ::core::result::Result::Err(
+                            ::autumn_web::AutumnError::bad_request_msg(
+                                "cross-shard only_deleted requires a configured shard set: \
+                                 across_tenants() cannot fan only_deleted out across shards \
+                                 without a shard set (the repository was built without \
+                                 shard context, e.g. via with_pool_untracked); build it \
+                                 with shard context instead"
+                            )
                         );
-                    }
+                    };
+                    let __vecs = __shards.fan_out_shards(|__shard| {
+                        let __sub = self.__autumn_for_shard(__shard);
+                        async move { __sub.__autumn_only_deleted_one_shard().await }
+                    }).await?;
+                    return ::core::result::Result::Ok(
+                        __vecs.into_iter().flatten().collect()
+                    );
                 }
             };
             let page_only_deleted_cross_shard_guard = quote! {
@@ -11515,16 +12271,32 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             // no routed-shard connection is held here, so a dead parent replica
             // or exhausted parent pool can't fail the fan-out. Each shard's own
             // read route/fallback is chosen by `__autumn_for_shard` (#1d).
+            //
+            // Without a shard set (e.g. a repo built via `with_pool_untracked`,
+            // where `__autumn_shards` is `None`), an across-tenant read would
+            // bind a NULL tenant predicate and silently return a PARTIAL result
+            // over only the current pool, so we reject rather than fall through
+            // to the single-pool query — mirroring the `count` guard (#1692,
+            // #1741).
             if self.across_tenants {
-                if let ::core::option::Option::Some(ref __shards) = self.__autumn_shards {
-                    let __vecs = __shards.fan_out_shards(|__shard| {
-                        let __sub = self.__autumn_for_shard(__shard);
-                        async move { __sub.__autumn_find_all_one_shard().await }
-                    }).await?;
-                    return ::core::result::Result::Ok(
-                        __vecs.into_iter().flatten().collect()
+                let ::core::option::Option::Some(ref __shards) = self.__autumn_shards else {
+                    return ::core::result::Result::Err(
+                        ::autumn_web::AutumnError::bad_request_msg(
+                            "cross-shard find_all requires a configured shard set: \
+                             across_tenants() cannot fan find_all out across shards \
+                             without a shard set (the repository was built without \
+                             shard context, e.g. via with_pool_untracked); build it \
+                             with shard context instead"
+                        )
                     );
-                }
+                };
+                let __vecs = __shards.fan_out_shards(|__shard| {
+                    let __sub = self.__autumn_for_shard(__shard);
+                    async move { __sub.__autumn_find_all_one_shard().await }
+                }).await?;
+                return ::core::result::Result::Ok(
+                    __vecs.into_iter().flatten().collect()
+                );
             }
             let mut conn = self.__autumn_acquire_read_conn().await?;
             #base
@@ -11551,28 +12323,40 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         let base = find_by_id_impl;
         let dispatch = quote! {
             // Fan out before acquiring a parent-shard connection (see find_all).
+            // Without a shard set, an across-tenant read would bind a NULL tenant
+            // predicate and silently return a PARTIAL result over only the current
+            // pool, so we reject rather than fall through (#1692, #1741).
             if self.across_tenants {
-                if let ::core::option::Option::Some(ref __shards) = self.__autumn_shards {
-                    let __found = __shards.fan_out_shards(|__shard| {
-                        let __sub = self.__autumn_for_shard(__shard);
-                        async move { __sub.__autumn_find_by_id_one_shard(id).await }
-                    }).await?;
-                    // Ids are unique only within a shard: with per-shard
-                    // sequences two shards can hold the same id, so a match on
-                    // more than one shard is ambiguous. Reject rather than
-                    // silently returning whichever shard sorts first (#1d).
-                    let mut __hits = __found.into_iter().flatten();
-                    let __first = __hits.next();
-                    if __hits.next().is_some() {
-                        return ::core::result::Result::Err(
-                            ::autumn_web::AutumnError::internal_server_error_msg(
-                                "ambiguous cross-shard find_by_id: id matched rows on \
-                                 multiple shards; query a specific shard instead"
-                            )
-                        );
-                    }
-                    return ::core::result::Result::Ok(__first);
+                let ::core::option::Option::Some(ref __shards) = self.__autumn_shards else {
+                    return ::core::result::Result::Err(
+                        ::autumn_web::AutumnError::bad_request_msg(
+                            "cross-shard find_by_id requires a configured shard set: \
+                             across_tenants() cannot fan find_by_id out across shards \
+                             without a shard set (the repository was built without \
+                             shard context, e.g. via with_pool_untracked); build it \
+                             with shard context instead"
+                        )
+                    );
+                };
+                let __found = __shards.fan_out_shards(|__shard| {
+                    let __sub = self.__autumn_for_shard(__shard);
+                    async move { __sub.__autumn_find_by_id_one_shard(id).await }
+                }).await?;
+                // Ids are unique only within a shard: with per-shard
+                // sequences two shards can hold the same id, so a match on
+                // more than one shard is ambiguous. Reject rather than
+                // silently returning whichever shard sorts first (#1d).
+                let mut __hits = __found.into_iter().flatten();
+                let __first = __hits.next();
+                if __hits.next().is_some() {
+                    return ::core::result::Result::Err(
+                        ::autumn_web::AutumnError::internal_server_error_msg(
+                            "ambiguous cross-shard find_by_id: id matched rows on \
+                             multiple shards; query a specific shard instead"
+                        )
+                    );
                 }
+                return ::core::result::Result::Ok(__first);
             }
             let mut conn = self.__autumn_acquire_read_conn().await?;
             #base
@@ -11723,14 +12507,26 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         let base = exists_by_id_impl;
         let dispatch = quote! {
             // Fan out before acquiring a parent-shard connection (see find_all).
+            // Without a shard set, an across-tenant read would bind a NULL tenant
+            // predicate and silently return a PARTIAL result over only the current
+            // pool, so we reject rather than fall through (#1692, #1741).
             if self.across_tenants {
-                if let ::core::option::Option::Some(ref __shards) = self.__autumn_shards {
-                    let __results = __shards.fan_out_shards(|__shard| {
-                        let __sub = self.__autumn_for_shard(__shard);
-                        async move { __sub.__autumn_exists_by_id_one_shard(id).await }
-                    }).await?;
-                    return ::core::result::Result::Ok(__results.into_iter().any(|b| b));
-                }
+                let ::core::option::Option::Some(ref __shards) = self.__autumn_shards else {
+                    return ::core::result::Result::Err(
+                        ::autumn_web::AutumnError::bad_request_msg(
+                            "cross-shard exists_by_id requires a configured shard set: \
+                             across_tenants() cannot fan exists_by_id out across shards \
+                             without a shard set (the repository was built without \
+                             shard context, e.g. via with_pool_untracked); build it \
+                             with shard context instead"
+                        )
+                    );
+                };
+                let __results = __shards.fan_out_shards(|__shard| {
+                    let __sub = self.__autumn_for_shard(__shard);
+                    async move { __sub.__autumn_exists_by_id_one_shard(id).await }
+                }).await?;
+                return ::core::result::Result::Ok(__results.into_iter().any(|b| b));
             }
             let mut conn = self.__autumn_acquire_read_conn().await?;
             #base
@@ -11765,13 +12561,15 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         fn update_many(&self, ids: &[i64], changes: &#update_name) -> impl ::std::future::Future<Output = ::autumn_web::AutumnResult<Vec<#model_name>>> + Send;
         /// Bulk-delete the given ids in one statement.
         ///
-        /// NOTE (#1369 scope; see #1702): `dependent(...)` cascade actions are
-        /// NOT applied on this bulk path — AC2 scopes dependent actions to the
-        /// single-record `delete_by_id`/`destroy`. On a repository that declares
-        /// `dependent(...)`, `delete_many` issues a plain bulk parent
-        /// delete/soft-delete and does not cascade, so it can FK-fail or orphan
-        /// children. Callers who need the cascade must use `delete_by_id`. Bulk
-        /// cascade is a tracked follow-up.
+        /// #1740: `dependent(...)` cascade actions DO apply on this bulk path. On
+        /// a repository that declares `dependent(...)`, `delete_many` runs the same
+        /// destroy/delete_all/nullify/restrict cascade the single-record
+        /// `delete_by_id`/`destroy` runs — restrict probes first (a typed 409 rolls
+        /// the whole transaction back), then children, then the bulk parent delete,
+        /// all in one transaction — so no child is orphaned. Children are cascaded
+        /// per affected parent row (so `destroy` recurses into grandchildren,
+        /// #1739); set-based bulk child mutations are a possible future refinement.
+        /// Repositories with no dependents keep the plain bulk delete unchanged.
         fn delete_many(&self, ids: &[i64]) -> impl ::std::future::Future<Output = ::autumn_web::AutumnResult<()>> + Send;
         #upsert_many_trait_method
     };
@@ -14546,6 +15344,17 @@ mod tests {
         &rest[..end]
     }
 
+    /// Helper: slice the generated `delete_many` trait-impl body (up to the next
+    /// `async fn`) so assertions target the bulk delete path.
+    fn delete_many_section(generated: &str) -> &str {
+        let start = generated
+            .find("async fn delete_many")
+            .expect("repository must generate delete_many");
+        let rest = &generated[start + "async fn delete_many".len()..];
+        let end = rest.find("async fn ").map_or(rest.len(), |p| p);
+        &rest[..end]
+    }
+
     /// Helper: slice the `Destroy` match arm of the generated
     /// `__autumn_apply_dependent_on_conn` helper, bounded to the helper method
     /// (which ends right before the always-generated `pub fn on_primary`), so
@@ -14556,7 +15365,7 @@ mod tests {
         // parent's cascade *call* site inside `delete_by_id`. Bound to the method
         // (it ends right before the always-generated `pub fn on_primary`).
         let hstart = generated
-            .find("pub async fn __autumn_apply_dependent_on_conn")
+            .find("pub fn __autumn_apply_dependent_on_conn")
             .expect("dependent-apply helper definition present");
         let hrest = &generated[hstart..];
         let hend = hrest.find("pub fn on_primary").unwrap_or(hrest.len());
@@ -14681,15 +15490,173 @@ mod tests {
     }
 
     #[test]
-    fn repository_macro_without_dependents_delete_by_id_has_no_cascade() {
-        // AC7: default behavior unchanged — delete_by_id must not call the
-        // cascade helper when no dependents are declared.
+    fn repository_macro_without_dependents_delete_by_id_dispatches_at_runtime() {
+        // #1738: with no repository-attribute `dependent(...)`, delete_by_id no
+        // longer calls the cascade helper directly at compile time; instead it
+        // consults the model's runtime `dependents()` (empty for a model with no
+        // `#[has_many(dependent = ...)]`, so the plain delete path runs). The
+        // compile-time `__autumn_apply_dependent_on_conn` call site is gone.
         let generated =
             repository_macro(quote! { Post }, quote! { pub trait PostRepository {} }).to_string();
         let section = delete_by_id_section(&generated);
         assert!(
             !section.contains("__autumn_apply_dependent_on_conn"),
-            "delete_by_id must not cascade when no dependent(...) is declared: {section}"
+            "delete_by_id must not emit a compile-time cascade call when no \
+             dependent(...) is declared: {section}"
+        );
+        assert!(
+            section.contains("dependents") && section.contains("AutumnDependents"),
+            "delete_by_id must consult the model's runtime dependents() for the \
+             model-declared cascade (#1738): {section}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_with_dependents_delete_by_id_does_not_runtime_dispatch() {
+        // Precedence (#1738): a repository-attribute `dependent(...)` is the
+        // authoritative escape hatch. Its delete_by_id uses the compile-time
+        // cascade and must NOT also consult the model's runtime dependents().
+        let generated = repository_macro(
+            quote! { Post, dependent(PgCommentRepository, fk = "post_id", on_delete = destroy) },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        let section = delete_by_id_section(&generated);
+        assert!(
+            section.contains("__autumn_apply_dependent_on_conn"),
+            "repository-attribute delete_by_id must emit the compile-time cascade: {section}"
+        );
+        assert!(
+            !section.contains("AutumnDependents"),
+            "repository-attribute delete_by_id must not runtime-dispatch (repo-attr wins): {section}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_without_dependents_delete_many_dispatches_at_runtime() {
+        // Codex P1: with no repository-attribute `dependent(...)`, the bulk
+        // `delete_many` path must consult the model's runtime `dependents()`
+        // (empty for a model with no `#[has_many(dependent = ...)]`, so the plain
+        // bulk path runs) instead of emitting a compile-time cascade call. This
+        // mirrors the single-record `delete_by_id` runtime dispatch.
+        let generated =
+            repository_macro(quote! { Post }, quote! { pub trait PostRepository {} }).to_string();
+        let section = delete_many_section(&generated);
+        assert!(
+            !section.contains("__autumn_apply_dependent_on_conn"),
+            "delete_many must not emit a compile-time cascade call when no \
+             dependent(...) is declared: {section}"
+        );
+        assert!(
+            section.contains("dependents") && section.contains("AutumnDependents"),
+            "delete_many must consult the model's runtime dependents() for the \
+             model-declared bulk cascade (Codex P1): {section}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_with_dependents_delete_many_does_not_runtime_dispatch() {
+        // Precedence (Codex P1): a repository-attribute `dependent(...)` is the
+        // authoritative escape hatch. Its delete_many uses the compile-time
+        // cascade and must NOT also consult the model's runtime dependents().
+        let generated = repository_macro(
+            quote! { Post, dependent(PgCommentRepository, fk = "post_id", on_delete = destroy) },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        let section = delete_many_section(&generated);
+        assert!(
+            section.contains("__autumn_apply_dependent_on_conn"),
+            "repository-attribute delete_many must emit the compile-time cascade: {section}"
+        );
+        assert!(
+            !section.contains("AutumnDependents"),
+            "repository-attribute delete_many must not runtime-dispatch (repo-attr wins): {section}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_delete_many_uses_path_and_deleted_not_monotonic_preseed() {
+        // Codex round-5-B: the bulk `delete_many` cascade must NOT use a single
+        // monotonic visited set that pre-seeds a batch root before it is deleted
+        // (that made an ancestor's cascade skip a still-referenced descendant batch
+        // root and trip an IMMEDIATE FK). The old `__autumn_visited` set is gone,
+        // replaced by TWO structures: an ACTIVE-path stack (`__autumn_path`, pushed
+        // then popped around each root's own cascade — cycle-break only) and a
+        // monotonic `__autumn_deleted` set of rows actually removed. Phase 2 must
+        // (a) push the current root onto the path before its mutating cascade,
+        // (b) pop it right after, and (c) skip a root already in `__autumn_deleted`
+        // (cascade-deleted as another root's descendant) — never a pre-seed.
+        let generated = repository_macro(
+            quote! { Node, dependent(PgNodeRepository, fk = "parent_id", on_delete = destroy) },
+            quote! { pub trait NodeRepository {} },
+        )
+        .to_string();
+        let section = delete_many_section(&generated);
+        assert!(
+            section.contains("__autumn_apply_dependent_on_conn"),
+            "the bulk delete_many path must cascade dependents: {section}"
+        );
+        assert!(
+            !section.contains("__autumn_visited"),
+            "round-5-B: the monotonic pre-seeded visited set must be gone: {section}"
+        );
+        // Phase 2 brackets each root's own cascade with a path push/pop (cycle-break
+        // only) — NOT a monotonic pre-seed.
+        assert!(
+            section.contains(
+                "if __autumn_deleted . contains (& (\"nodes\" , __autumn_pid)) { continue ; } \
+                 __autumn_path . insert ((\"nodes\" , __autumn_pid)) ;"
+            ),
+            "round-5-B: Phase 2 must skip an already-cascade-deleted root, then push \
+             the current root onto the ACTIVE path before its cascade: {section}"
+        );
+        assert!(
+            section.contains("__autumn_path . remove (& (\"nodes\" , __autumn_pid))"),
+            "round-5-B: the current bulk root must be popped off the ACTIVE path after \
+             its own cascade completes (so it never suppresses a later ancestor): {section}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_delete_many_hooked_root_loop_skips_already_deleted_roots() {
+        // Codex round-5-B: for a HOOKED bulk parent, the root `before_delete` loop
+        // must run AFTER the cascade and skip any root already cascade-deleted as
+        // another root's descendant (present in `__autumn_deleted`) — otherwise that
+        // root's `before_delete` would fire twice (once as the cascaded descendant,
+        // once as the batch root). A `destroy` self-reference exercises the case.
+        let generated = repository_macro(
+            quote! { Node, hooks = NodeHooks, dependent(PgNodeRepository, fk = "parent_id", on_delete = destroy) },
+            quote! { pub trait NodeRepository {} },
+        )
+        .to_string();
+        let section = delete_many_section(&generated);
+        assert!(
+            section.contains(
+                "if __autumn_deleted . contains (& (\"nodes\" , record . id)) { continue ; }"
+            ),
+            "round-5-B: the hooked bulk-root loop must skip a root already \
+             cascade-deleted before firing its before_delete: {section}"
+        );
+        // The skip guard must sit at the TOP of the root loop, before before_delete.
+        let skip_pos = section
+            .find("if __autumn_deleted . contains (& (\"nodes\" , record . id))")
+            .expect("root skip guard present");
+        let before_delete_pos = section
+            .find("before_delete")
+            .expect("root loop fires before_delete");
+        assert!(
+            skip_pos < before_delete_pos,
+            "round-5-B: the __autumn_deleted skip must precede the root before_delete: {section}"
+        );
+        // And the cascade must precede that loop so `__autumn_deleted` is populated.
+        let cascade_pos = section
+            .find("__autumn_apply_dependent_on_conn")
+            .expect("cascade present");
+        assert!(
+            cascade_pos < before_delete_pos,
+            "round-5-B: the cascade must run before the root before_delete loop so a \
+             cascade-deleted root is already recorded: {section}"
         );
     }
 
@@ -14985,6 +15952,115 @@ mod tests {
             hard_section.contains("__autumn_apply_dependent_on_conn")
                 && hard_section.contains(", false ,"),
             "a hard-delete parent must pass __parent_soft = false to the cascade: {hard_section}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_helper_destroy_arm_runtime_dispatches_grandchildren_without_repo_attr_deps()
+    {
+        // Codex P1: a repository with NO repository-attribute `dependent(...)`
+        // must, in its `__autumn_apply_dependent_on_conn` Destroy arm, consult
+        // the child model's runtime `dependents()` and recurse into each
+        // grandchild spec — so a FULLY model-declared `Post -> Comment -> Reply`
+        // graph cascades all the way down. Without this the arm would delete the
+        // child while its own children still FK-reference it (FK failure /
+        // orphans), because `config.dependents` is empty and the #1739
+        // compile-time recursion is a no-op.
+        let generated = repository_macro(
+            quote! { Comment },
+            quote! { pub trait CommentRepository {} },
+        )
+        .to_string();
+        // The `AutumnDependents` fallback is `use`d in the helper prelude (above
+        // the match); the runtime walk itself lives in the Destroy arm.
+        let helper = dependent_helper_body(&generated);
+        assert!(
+            helper.contains("AutumnDependents"),
+            "the helper must bring the AutumnDependents fallback into scope: {helper}"
+        );
+        let destroy_arm = dependent_destroy_arm(&generated);
+        assert!(
+            destroy_arm.contains("dependents ()"),
+            "no-repo-attr destroy arm must runtime-dispatch grandchildren via Model::dependents(): {destroy_arm}"
+        );
+        assert!(
+            destroy_arm.contains(". cascade"),
+            "the runtime grandchild walk must invoke each spec's cascade thunk: {destroy_arm}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_destroy_arm_probes_grandchild_restrict_before_child_hook() {
+        // Codex round-5-A: in the shared Destroy arm, a child's own `restrict`
+        // grandchild must be probed (read-only 409) BEFORE the child's
+        // `before_delete` hook fires, and its mutating (`destroy`) grandchildren
+        // AFTER it. Otherwise deleting a `Post -> Comment(destroy) -> Reply(restrict)`
+        // graph fires `Comment::before_delete` and only then returns the restrict
+        // 409 — leaving a non-transactional hook side effect on a doomed tx.
+        // Order in the arm must be: grandchild-restrict probe < child before_delete
+        // < grandchild-mutating cascade < child row delete.
+        let generated = repository_macro(
+            quote! {
+                Comment,
+                hooks = CommentHooks,
+                dependent(PgReplyRepository, fk = "comment_id", on_delete = restrict),
+                dependent(PgLikeRepository, fk = "comment_id", on_delete = destroy)
+            },
+            quote! { pub trait CommentRepository {} },
+        )
+        .to_string();
+        let destroy_arm = dependent_destroy_arm(&generated);
+        let restrict_probe_pos = destroy_arm
+            .find("PgReplyRepository")
+            .expect("grandchild restrict probe (Reply) must be emitted");
+        let before_delete_pos = destroy_arm
+            .find("before_delete")
+            .expect("child before_delete hook must be emitted");
+        let mutating_pos = destroy_arm
+            .find("PgLikeRepository")
+            .expect("grandchild mutating cascade (Like) must be emitted");
+        let child_delete_pos = destroy_arm
+            .find("diesel :: delete")
+            .expect("child row DELETE must be emitted");
+        assert!(
+            restrict_probe_pos < before_delete_pos,
+            "round-5-A: the grandchild restrict probe must run BEFORE the child \
+             before_delete hook: {destroy_arm}"
+        );
+        assert!(
+            before_delete_pos < mutating_pos,
+            "round-5-A: mutating grandchildren must be cascaded AFTER the child \
+             before_delete hook: {destroy_arm}"
+        );
+        assert!(
+            mutating_pos < child_delete_pos,
+            "round-5-A: mutating grandchildren must still be removed BEFORE the child \
+             row delete (deepest-first, no FK dangle): {destroy_arm}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_helper_destroy_arm_repo_attr_deps_do_not_runtime_dispatch() {
+        // Precedence (Codex P1, mirrors the top-level rule exactly to avoid
+        // double-cascade): a repository-attribute `dependent(...)` WINS — the
+        // Destroy arm keeps the #1739 compile-time grandchild recursion ONLY and
+        // must NOT also walk the runtime `Model::dependents()`, so a grandchild
+        // is never processed by both paths.
+        let generated = repository_macro(
+            quote! { Comment, dependent(PgReplyRepository, fk = "comment_id", on_delete = destroy) },
+            quote! { pub trait CommentRepository {} },
+        )
+        .to_string();
+        let helper = dependent_helper_body(&generated);
+        assert!(
+            !helper.contains("AutumnDependents"),
+            "a repo-attribute dependent(...) helper must not runtime-dispatch \
+             (repo-attr wins, no double-cascade): {helper}"
+        );
+        let destroy_arm = dependent_destroy_arm(&generated);
+        assert!(
+            destroy_arm.contains("__autumn_apply_dependent_on_conn"),
+            "the #1739 compile-time grandchild recursion must remain: {destroy_arm}"
         );
     }
 
