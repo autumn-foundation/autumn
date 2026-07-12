@@ -50,6 +50,15 @@ fn compile_fail_tests() {
     // (issue #1526).
     #[cfg(feature = "maud")]
     t.compile_fail("tests/compile-fail/story_captures_environment.rs");
+
+    // Typed accessible UI primitives (#1706): an accessible name is a
+    // compile-time obligation, so inaccessible construction does not build.
+    #[cfg(feature = "maud")]
+    t.compile_fail("tests/compile-fail/a11y_img_missing_alt.rs");
+    #[cfg(feature = "maud")]
+    t.compile_fail("tests/compile-fail/a11y_button_missing_name.rs");
+    #[cfg(feature = "maud")]
+    t.compile_fail("tests/compile-fail/a11y_textfield_unlabeled.rs");
 }
 
 #[test]
@@ -69,6 +78,10 @@ fn compile_pass_tests() {
     // Maud + form/json handlers (require maud feature)
     #[cfg(feature = "maud")]
     t.pass("tests/compile-pass/json_form_handlers.rs");
+
+    // Typed accessible UI primitives (#1706): the accessible forms build.
+    #[cfg(feature = "maud")]
+    t.pass("tests/compile-pass/a11y_primitives.rs");
 
     // Model derive (requires db feature)
     #[cfg(feature = "db")]

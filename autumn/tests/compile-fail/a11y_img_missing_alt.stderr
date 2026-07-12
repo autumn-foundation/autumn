@@ -1,0 +1,15 @@
+error[E0061]: this function takes 2 arguments but 1 argument was supplied
+ --> tests/compile-fail/a11y_img_missing_alt.rs:8:16
+  |
+8 |     let _img = Img::new("/logo.png");
+  |                ^^^^^^^^------------- argument #2 is missing
+  |
+note: associated function defined here
+ --> src/a11y.rs
+  |
+  |     pub fn new(src: impl Into<String>, alt: impl Into<String>) -> Self {
+  |            ^^^
+help: provide the argument
+  |
+8 |     let _img = Img::new("/logo.png", /* alt */);
+  |                                    +++++++++++

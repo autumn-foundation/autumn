@@ -1,3 +1,5 @@
+#[cfg(feature = "maud")]
+mod a11y;
 mod access_log;
 mod acting_as_integration;
 mod after_commit_integration;
