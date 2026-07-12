@@ -9352,6 +9352,50 @@ pub async fn magic_link_verify(
         return Ok(magic_link_invalid_page().into_response());
     };
 
+    // Defense-in-depth (#1777): re-check the account lock at verify time with a
+    // FRESH read of `locked_at` at the DB, AFTER consuming the token but BEFORE
+    // establishing any session. A magic link minted BEFORE the account was locked
+    // must not complete a login AFTER the lock. The in-memory `__SNAKE__` row was
+    // SELECTed above and can be STALE: a concurrent login can cross the lockout
+    // threshold between that SELECT and here, so trusting `__SNAKE__.locked_at`
+    // would leave a TOCTOU hole (the stale value is still NULL and the link
+    // succeeds even though the account is now locked). Mirror the password-login
+    // success-path guard EXACTLY: a single guarded UPDATE predicated on
+    // `locked_at` re-reads the current lock state at the DB and, like password
+    // login, clears an expired lock (WHERE `locked_at IS NULL` OR
+    // `locked_at <= now - cooloff`) while resetting `failed_attempts`. If zero
+    // rows match, the account is actively locked (concurrently or otherwise) and
+    // the login is rejected. Gated on the same `lockout_enabled` predicate, so it
+    // is a no-op when lockout is disabled in config. A locked account funnels to
+    // the SAME generic failure page as an expired/consumed/unknown token — no
+    // oracle distinguishes "locked" from "bad link". This sits before the TOTP
+    // branch below, so it gates BOTH the 2FA-park and the direct-login paths.
+    let lockout_cfg = state.config().auth.lockout;
+    let lockout_enabled = lockout_cfg.enabled && lockout_cfg.threshold > 0;
+    if lockout_enabled {
+        let cooloff = chrono::Duration::seconds(lockout_cfg.cooloff_secs as i64);
+        let lock_expired_before = now - cooloff;
+        let rows_cleared = diesel::update(
+            __TABLE__::table
+                .find(__SNAKE__.id)
+                .filter(
+                    __TABLE__::locked_at.is_null().or(
+                        __TABLE__::locked_at.le(lock_expired_before)
+                    )
+                ),
+        )
+        .set((
+            __TABLE__::failed_attempts.eq(0),
+            __TABLE__::locked_at.eq(None::<chrono::NaiveDateTime>),
+        ))
+        .execute(&mut *db)
+        .await
+        .map_err(|e| AutumnError::internal_server_error_msg(&format!("Failed to reset lockout on magic-link login: {e}")))?;
+        if rows_cleared == 0 {
+            return Ok(magic_link_invalid_page().into_response());
+        }
+    }
+
     // This browser may already hold a tracked session for another account. The
     // rotation below destroys that session id, so drop its row now.
     untrack_current_session(&mut db, &session).await?;
@@ -11336,6 +11380,122 @@ mod tests {
             pending_return < auth_insert,
             "the direct auth-session insert must be gated behind the 2FA early-return: {body}"
         );
+    }
+
+    #[test]
+    fn magic_link_verify_rechecks_account_lock() {
+        // #1777: the POST verify handler must re-check `locked_at` AFTER the
+        // atomic token consume and BEFORE establishing the session, so a link
+        // minted before a lockout cannot complete a login after it. Non-totp
+        // variant. Mirrors the password-login success-path guard.
+        let routes = render_routes_file("User", "user", "users", &[], false, true);
+        let body = magic_link_verify_body(&routes);
+        // Reads the same [auth.lockout] config the password-login path uses.
+        assert!(
+            body.contains("let lockout_cfg = state.config().auth.lockout;"),
+            "verify must read [auth.lockout] config for the lock recheck: {body}"
+        );
+        // TOCTOU-safe: the recheck must NOT trust the stale in-memory `user` row
+        // SELECTed earlier — it must re-read `locked_at` at the DB. The stale
+        // in-memory check (`if let Some(locked_at) = user.locked_at`) is gone.
+        assert!(
+            !body.contains("if let Some(locked_at) = user.locked_at {"),
+            "verify must NOT gate on the stale in-memory user.locked_at row \
+             (TOCTOU race): {body}"
+        );
+        // Fresh DB read: a guarded UPDATE predicated on `locked_at` re-reads the
+        // current lock state, clearing an expired lock and rejecting an active one
+        // — the same guard the password success path uses right before the session.
+        assert!(
+            body.contains("let rows_cleared = diesel::update(")
+                && body.contains("users::locked_at.is_null().or(")
+                && body.contains("users::locked_at.le(lock_expired_before)")
+                && body.contains("users::failed_attempts.eq(0),")
+                && body.contains("if rows_cleared == 0 {"),
+            "verify must re-read locked_at at the DB via a guarded UPDATE (mirrors \
+             password login), not the stale in-memory row: {body}"
+        );
+        // Ordering: guard sits AFTER the atomic consume and BEFORE the auth insert.
+        let consume = body
+            .find("magic_link_tokens::consumed_at.eq(Some(now))")
+            .expect("token consume present");
+        let recheck = body
+            .find("let rows_cleared = diesel::update(")
+            .expect("lock recheck present");
+        let auth_insert = body
+            .find("session.insert(state.auth_session_key()")
+            .expect("auth insert present");
+        assert!(
+            consume < recheck && recheck < auth_insert,
+            "lock recheck must be AFTER the token consume and BEFORE the session is \
+             established: {body}"
+        );
+    }
+
+    #[test]
+    fn magic_link_verify_rechecks_account_lock_with_totp() {
+        // #1777: the same fresh-DB lock recheck must be present in the
+        // `--magic-link --totp` variant, and must gate BOTH the 2FA park and the
+        // direct login (it sits before the /login/verify early-return).
+        let routes = render_routes_file("User", "user", "users", &[], true, true);
+        let body = magic_link_verify_body(&routes);
+        assert!(
+            body.contains("let lockout_cfg = state.config().auth.lockout;"),
+            "totp variant must read [auth.lockout] config for the lock recheck: {body}"
+        );
+        assert!(
+            !body.contains("if let Some(locked_at) = user.locked_at {"),
+            "totp variant must NOT gate on the stale in-memory user.locked_at row \
+             (TOCTOU race): {body}"
+        );
+        assert!(
+            body.contains("let rows_cleared = diesel::update(")
+                && body.contains("users::locked_at.is_null().or(")
+                && body.contains("users::locked_at.le(lock_expired_before)")
+                && body.contains("if rows_cleared == 0 {"),
+            "totp variant must re-read locked_at at the DB via a guarded UPDATE: {body}"
+        );
+        let consume = body
+            .find("magic_link_tokens::consumed_at.eq(Some(now))")
+            .expect("token consume present");
+        let recheck = body
+            .find("let rows_cleared = diesel::update(")
+            .expect("lock recheck present");
+        let pending_return = body
+            .find("return Ok(redirect_to(\"/login/verify\"));")
+            .expect("2FA early-return present");
+        assert!(
+            consume < recheck && recheck < pending_return,
+            "lock recheck must sit after the consume and before the 2FA park/redirect: {body}"
+        );
+    }
+
+    #[test]
+    fn magic_link_verify_locked_account_uses_generic_failure_page() {
+        // #1777 (no oracle): a locked account must be indistinguishable from a
+        // bad/expired/consumed token — both render magic_link_invalid_page().
+        for (totp, label) in [(false, "--magic-link"), (true, "--magic-link --totp")] {
+            let routes = render_routes_file("User", "user", "users", &[], totp, true);
+            let body = magic_link_verify_body(&routes);
+            // The token-failure path already returns the generic page.
+            assert!(
+                body.contains("Err(_) => return Ok(magic_link_invalid_page().into_response())"),
+                "{label}: token-failure path must render the generic page: {body}"
+            );
+            // The fresh-DB lock guard returns the SAME generic page when zero rows
+            // match (account actively locked) — no distinct response, no oracle.
+            let recheck = body
+                .find("if rows_cleared == 0 {")
+                .expect("lock recheck present");
+            let tail = &body[recheck..];
+            let next_brace = tail.find('}').unwrap_or(tail.len());
+            let recheck_block = &tail[..next_brace];
+            assert!(
+                recheck_block.contains("return Ok(magic_link_invalid_page().into_response());"),
+                "{label}: locked account must render the SAME generic failure page \
+                 (no oracle): {body}"
+            );
+        }
     }
 
     #[test]
