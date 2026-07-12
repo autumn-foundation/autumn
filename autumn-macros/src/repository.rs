@@ -1415,6 +1415,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             #child_soft_for_grandchildren,
                             __path,
                             __deleted,
+                            __physical,
                         ).await?
                     );
                 }
@@ -1480,6 +1481,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         #child_soft_for_grandchildren,
                         __path,
                         __deleted,
+                        __physical,
                     ).await?
                 );
             }
@@ -1497,6 +1499,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         #child_soft_for_grandchildren,
                         __path,
                         __deleted,
+                        __physical,
                     ).await?
                 );
             }
@@ -1564,32 +1567,43 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         } else {
             quote! {}
         };
-        // #1800 case 1: record a row in the monotonic `__deleted` traversal-dedup
-        // set ONLY when it was PHYSICALLY removed. A soft delete (`SET deleted_at`,
-        // when this is a `#[soft_delete]` child AND the parent is soft-deleted)
-        // leaves the row physically present, so marking it here would wrongly make
-        // a LATER hard-delete path (reached through a hard-deleted sibling/parent in
-        // a mixed soft/hard diamond) skip it — leaving a dangling FK or FK-failing
-        // the hard delete. A non-soft child, or a soft child under a HARD parent, is
-        // always physically deleted, so it is always recorded.
+        // #1800 case 1: record every HANDLED row in the monotonic `__deleted` set
+        // (soft OR physical) so the bulk `delete_many` root dedup / hook
+        // double-fire guard skips a root already processed as another root's
+        // descendant — a soft-deleted descendant MUST land here or its
+        // `before_delete` fires a second time in the bulk root loop. Separately
+        // record ONLY physically-removed rows in `__physical`: a soft delete
+        // (`SET deleted_at`, when this is a `#[soft_delete]` child AND the parent is
+        // soft-deleted) leaves the row physically present, so the diamond
+        // revisit-skip (which consults `__physical`, not `__deleted`) must NOT see
+        // it — otherwise a LATER hard-delete path (reached through a hard-deleted
+        // sibling/parent in a mixed soft/hard diamond) would skip it, leaving a
+        // dangling FK or FK-failing the hard delete. A non-soft child, or a soft
+        // child under a HARD parent, is always physically deleted, so it is recorded
+        // in BOTH sets.
         let destroy_deleted_mark = if config.soft_delete {
             quote! {
+                __deleted.insert((#table_name, __cid));
                 if !__parent_soft {
-                    __deleted.insert((#table_name, __cid));
+                    __physical.insert((#table_name, __cid));
                 }
             }
         } else {
             quote! {
                 __deleted.insert((#table_name, __cid));
+                __physical.insert((#table_name, __cid));
             }
         };
         // #1800 case 1 (companion guard): because a soft-deleted row is deliberately
-        // NOT recorded in `__deleted`, a later SOFT re-visit of the SAME row (a
-        // pure-soft diamond) would otherwise re-fire its `before_delete` hook and
-        // re-issue a no-op UPDATE. Skip it: if this visit would soft-delete
-        // (`__parent_soft`) and the row is already soft-deleted, it is logically
-        // gone and nothing more is owed. A HARD re-visit (`!__parent_soft`) still
-        // proceeds to physically delete the row (the diamond's hard branch).
+        // NOT recorded in `__physical` (only in the "all handled" `__deleted`), the
+        // Phase-2 revisit-skip — which consults `__physical` so the diamond's hard
+        // branch can still reach it — does NOT suppress a later SOFT re-visit of the
+        // SAME row (a pure-soft diamond), which would otherwise re-fire its
+        // `before_delete` hook and re-issue a no-op UPDATE. Skip it here instead: if
+        // this visit would soft-delete (`__parent_soft`) and the row is already
+        // soft-deleted, it is logically gone and nothing more is owed. A HARD
+        // re-visit (`!__parent_soft`) still proceeds to physically delete the row
+        // (the diamond's hard branch).
         let destroy_soft_revisit_skip = if config.soft_delete {
             quote! {
                 if __parent_soft && __record.deleted_at.is_some() {
@@ -1638,8 +1652,9 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             // breaking the cycle while keeping the cascade `Send`.
             #[doc(hidden)]
             // Codex round-5-B split the single cycle set into an active-path stack
-            // plus a monotonic deleted set, taking this framework-internal helper to
-            // 8 parameters; the extra guard is intentional (see the doc above).
+            // plus a monotonic handled set; #1800 case 1 added the physical-delete
+            // subset, taking this framework-internal helper to 9 parameters; the
+            // extra guards are intentional (see the doc above).
             #[allow(clippy::too_many_arguments)]
             pub fn __autumn_apply_dependent_on_conn<'__dep>(
                 &'__dep self,
@@ -1648,19 +1663,29 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 __parent_id: i64,
                 __action: ::autumn_web::repository::DependentAction,
                 __parent_soft: bool,
-                // Codex round-5-B: TWO guard sets threaded through the recursion.
+                // Codex round-5-B + #1800 case 1: THREE guard sets threaded through
+                // the recursion.
                 // `__path` is the ACTIVE recursion stack — a (table, id) is pushed
                 // before descending into its children and popped once its subtree
                 // completes; it breaks self-/mutual-referential cycles ONLY.
-                // `__deleted` is a MONOTONIC set of rows actually removed; a row
-                // already in it is skipped (genuinely gone), so a row reached again
-                // as another root's descendant is neither re-deleted nor re-hooked.
-                // Separating them is what lets a batch process a descendant root
-                // before its ancestor without the ancestor's cascade pre-skipping a
-                // still-referenced intermediate (the removed monotonic-preseed's
-                // immediate-FK bug). See the Destroy arm's guards below.
+                // `__deleted` is a MONOTONIC set of every row HANDLED by the cascade
+                // — soft OR physical. The bulk `delete_many` root dedup / hook
+                // double-fire guard consults it so a root already processed as
+                // another root's descendant is neither re-cascaded nor re-hooked
+                // (this is why a soft-handled row MUST be recorded here — #1800).
+                // `__physical` is the subset of rows PHYSICALLY removed; the diamond
+                // traversal revisit-skip consults ONLY it, so a hard-delete path can
+                // still physically remove a row a soft-delete path merely marked
+                // `deleted_at` on (a mixed soft/hard diamond) without the "all
+                // handled" set suppressing it.
+                // Separating `__path` from the others is what lets a batch process a
+                // descendant root before its ancestor without the ancestor's cascade
+                // pre-skipping a still-referenced intermediate (the removed
+                // monotonic-preseed's immediate-FK bug). See the Destroy arm's
+                // guards below.
                 __path: &'__dep mut ::std::collections::HashSet<(&'static str, i64)>,
                 __deleted: &'__dep mut ::std::collections::HashSet<(&'static str, i64)>,
+                __physical: &'__dep mut ::std::collections::HashSet<(&'static str, i64)>,
             ) -> ::std::pin::Pin<::std::boxed::Box<
                 dyn ::std::future::Future<
                     Output = ::autumn_web::AutumnResult<
@@ -1785,11 +1810,17 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         // have passed, fire hooks and mutate.
                         for __row in __ids {
                             let __cid = __row.id;
-                            // Codex round-5-B: skip a row already DELETED (genuinely
-                            // gone) — dedup across independent batch roots / branches,
-                            // and prevents re-firing a row's hooks when it is reached
-                            // again as another root's descendant.
-                            if __deleted.contains(&(#table_name, __cid)) {
+                            // Codex round-5-B + #1800 case 1: the diamond traversal
+                            // revisit-skip. Skip a row already PHYSICALLY removed
+                            // (genuinely gone) — dedup across independent batch roots
+                            // / branches. This consults `__physical`, NOT the "all
+                            // handled" `__deleted`: a row soft-deleted on an earlier
+                            // path is NOT physically gone, so a later HARD path (mixed
+                            // soft/hard diamond) must still reach and physically remove
+                            // it. A redundant SOFT re-visit is instead caught by the
+                            // `__record.deleted_at` guard below (once reloaded), so a
+                            // soft-handled row is not re-hooked either.
+                            if __physical.contains(&(#table_name, __cid)) {
                                 continue;
                             }
                             // #1739 cycle guard (now the ACTIVE-path stack): skip a
@@ -1893,6 +1924,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         #delete_many_parent_soft_lit,
                         &mut __autumn_path,
                         &mut __autumn_deleted,
+                        &mut __autumn_physically_deleted,
                     )
                     .await?
             );
@@ -1969,6 +2001,11 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             ::std::collections::HashSet::new();
         let mut __autumn_deleted: ::std::collections::HashSet<(&'static str, i64)> =
             ::std::collections::HashSet::new();
+        // #1800 case 1: the physical-delete subset, consulted only by the diamond
+        // revisit-skip inside the leaf executor (not by the bulk root dedup, which
+        // uses the "all handled" `__autumn_deleted`).
+        let mut __autumn_physically_deleted: ::std::collections::HashSet<(&'static str, i64)> =
+            ::std::collections::HashSet::new();
         let mut __autumn_dep_broadcasts: ::std::vec::Vec<(::std::string::String, ::std::string::String)> =
             ::std::vec::Vec::new();
         let mut __autumn_dep_parent_ids: ::std::vec::Vec<i64> = ::std::vec::Vec::new();
@@ -2026,6 +2063,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         #delete_many_parent_soft_lit,
                         &mut __autumn_path,
                         &mut __autumn_deleted,
+                        &mut __autumn_physically_deleted,
                     )
                     .await?
                 );
@@ -2053,6 +2091,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         #delete_many_parent_soft_lit,
                         &mut __autumn_path,
                         &mut __autumn_deleted,
+                        &mut __autumn_physically_deleted,
                     )
                     .await?
                 );
@@ -9010,6 +9049,9 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     ::std::collections::HashSet::new();
                 let mut __autumn_deleted: ::std::collections::HashSet<(&'static str, i64)> =
                     ::std::collections::HashSet::new();
+                // #1800 case 1: physical-delete subset for the diamond revisit-skip.
+                let mut __autumn_physically_deleted: ::std::collections::HashSet<(&'static str, i64)> =
+                    ::std::collections::HashSet::new();
                 __autumn_path.insert((#table_name, id));
                 // #1800 case 3 / Phase 1: probe all `restrict` dependents first —
                 // a 409 here rolls back before the parent `before_delete` hook (and
@@ -9025,6 +9067,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             #parent_soft_lit,
                             &mut __autumn_path,
                             &mut __autumn_deleted,
+                            &mut __autumn_physically_deleted,
                         )
                         .await?
                     );
@@ -9044,6 +9087,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             #parent_soft_lit,
                             &mut __autumn_path,
                             &mut __autumn_deleted,
+                            &mut __autumn_physically_deleted,
                         )
                         .await?
                     );
@@ -9100,6 +9144,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 #parent_soft_lit,
                                 &mut __autumn_path,
                                 &mut __autumn_deleted,
+                                &mut __autumn_physically_deleted,
                             )
                             .await?
                     );
@@ -9155,6 +9200,9 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 let mut __autumn_path: ::std::collections::HashSet<(&'static str, i64)> =
                     ::std::collections::HashSet::new();
                 let mut __autumn_deleted: ::std::collections::HashSet<(&'static str, i64)> =
+                    ::std::collections::HashSet::new();
+                // #1800 case 1: physical-delete subset for the diamond revisit-skip.
+                let mut __autumn_physically_deleted: ::std::collections::HashSet<(&'static str, i64)> =
                     ::std::collections::HashSet::new();
                 __autumn_path.insert((#table_name, id));
                 // #1800 case 3 / Phase 1: probe all `restrict` dependents first —
@@ -16576,22 +16624,42 @@ mod tests {
     }
 
     #[test]
-    fn repository_macro_destroy_arm_marks_deleted_only_on_physical_delete() {
-        // #1800 case 1: for a `#[soft_delete]` child, the traversal `__deleted`
-        // dedup mark must be GATED on a physical delete (`if ! __parent_soft`), so a
-        // soft-deleted row (which stays physically present) does not suppress a later
-        // hard-delete path in a mixed soft/hard diamond. A redundant SOFT re-visit of
-        // an already-soft-deleted row is skipped instead.
+    fn repository_macro_destroy_arm_separates_all_handled_from_physical_dedup() {
+        // #1800 case 1: the two dedup concerns are tracked in SEPARATE sets.
+        //   * `__deleted` records EVERY handled row (soft OR physical) — it backs the
+        //     bulk `delete_many` root dedup / hook double-fire guard, so a
+        //     soft-deleted descendant that is also a batch root is skipped by the
+        //     root hook loop (fires its `before_delete` exactly once).
+        //   * `__physical` records ONLY physically-removed rows — it backs the diamond
+        //     traversal revisit-skip, so a hard-delete path can still physically
+        //     remove a row a soft-delete path merely marked `deleted_at` on.
+        // For a `#[soft_delete]` child the `__deleted` mark is UNCONDITIONAL while the
+        // `__physical` mark is gated on a physical delete (`if ! __parent_soft`).
         let soft = repository_macro(
             quote! { Comment, soft_delete, dependent(PgReplyRepository, fk = "comment_id", on_delete = destroy) },
             quote! { pub trait CommentRepository {} },
         )
         .to_string();
         let soft_arm = dependent_destroy_arm(&soft);
+        // "All handled" mark is unconditional (NOT gated on `if ! __parent_soft`), so
+        // a soft-deleted row is recorded for the bulk-root dedup.
         assert!(
-            soft_arm.contains("if ! __parent_soft { __deleted . insert"),
-            "#1800 case 1: a soft_delete child must record __deleted only on a physical \
+            soft_arm.contains("__deleted . insert")
+                && !soft_arm.contains("if ! __parent_soft { __deleted . insert"),
+            "#1800 case 1: a soft_delete child must record __deleted (all handled) \
+             UNCONDITIONALLY so the bulk-root dedup skips it: {soft_arm}"
+        );
+        // Physical mark is gated on a physical delete only.
+        assert!(
+            soft_arm.contains("if ! __parent_soft { __physical . insert"),
+            "#1800 case 1: a soft_delete child must record __physical only on a physical \
              delete (`if ! __parent_soft`): {soft_arm}"
+        );
+        // The diamond revisit-skip consults the PHYSICAL set, not the all-handled set,
+        // so a soft-visited row is still reachable by a later hard path.
+        assert!(
+            soft_arm.contains("if __physical . contains"),
+            "#1800 case 1: the diamond revisit-skip must consult __physical: {soft_arm}"
         );
         assert!(
             soft_arm.contains("if __parent_soft && __record . deleted_at . is_some")
@@ -16599,8 +16667,9 @@ mod tests {
             "#1800 case 1: a redundant soft re-visit of an already-soft-deleted row \
              must be skipped: {soft_arm}"
         );
-        // A non-soft child is always physically deleted, so its __deleted mark is
-        // unconditional (no __parent_soft gate) and there is no soft-revisit skip.
+        // A non-soft child is always physically deleted, so BOTH marks are
+        // unconditional (no `if ! __parent_soft` gate on either) and there is no
+        // soft-revisit skip.
         let hard = repository_macro(
             quote! { Comment, dependent(PgReplyRepository, fk = "comment_id", on_delete = destroy) },
             quote! { pub trait CommentRepository {} },
@@ -16609,8 +16678,58 @@ mod tests {
         let hard_arm = dependent_destroy_arm(&hard);
         assert!(
             hard_arm.contains("__deleted . insert")
-                && !hard_arm.contains("if ! __parent_soft { __deleted . insert"),
-            "#1800 case 1: a non-soft child must record __deleted unconditionally: {hard_arm}"
+                && hard_arm.contains("__physical . insert")
+                && !hard_arm.contains("if ! __parent_soft { __deleted . insert")
+                && !hard_arm.contains("if ! __parent_soft { __physical . insert"),
+            "#1800 case 1: a non-soft child must record BOTH __deleted and __physical \
+             unconditionally: {hard_arm}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_bulk_root_skip_uses_all_handled_not_physical_set() {
+        // #1800 case 1: the bulk `delete_many` root dedup guards — the Phase-2 root
+        // skip and the HOOKED root loop skip — must consult the "all handled"
+        // `__autumn_deleted` set (which records soft AND physical deletes), NOT the
+        // physical-only set. Otherwise a soft-deleted descendant that is also a batch
+        // root would not be skipped and its `before_delete` would fire twice. The
+        // per-row diamond revisit-skip inside the leaf executor, by contrast, consults
+        // the physical set.
+        let generated = repository_macro(
+            quote! { Node, soft_delete, hooks = NodeHooks, dependent(PgNodeRepository, fk = "parent_id", on_delete = destroy) },
+            quote! { pub trait NodeRepository {} },
+        )
+        .to_string();
+        let section = delete_many_section(&generated);
+        // The bulk-root dedup (Phase 2 + hooked root loop) references the all-handled
+        // set keyed by (table, id).
+        assert!(
+            section.contains("__autumn_deleted . contains (& (\"nodes\" , __autumn_pid))"),
+            "#1800: the bulk Phase-2 root skip must consult the all-handled \
+             __autumn_deleted set: {section}"
+        );
+        assert!(
+            section.contains("__autumn_deleted . contains (& (\"nodes\" , record . id))"),
+            "#1800: the hooked bulk-root hook loop skip must consult the all-handled \
+             __autumn_deleted set: {section}"
+        );
+        // The physical-only set is threaded into the bulk cascade calls (so the leaf
+        // executor's diamond revisit-skip has it) but is NOT what the bulk-root dedup
+        // consults.
+        assert!(
+            section.contains("__autumn_physically_deleted"),
+            "#1800: the physical-delete set must be threaded through the bulk cascade: {section}"
+        );
+        assert!(
+            !section.contains("__autumn_physically_deleted . contains"),
+            "#1800: the bulk-root dedup must NOT consult the physical-only set \
+             (that would regress soft-delete graphs): {section}"
+        );
+        // And the leaf executor's per-row diamond revisit-skip consults `__physical`.
+        let destroy_arm = dependent_destroy_arm(&generated);
+        assert!(
+            destroy_arm.contains("if __physical . contains"),
+            "#1800: the leaf diamond revisit-skip must consult the physical set: {destroy_arm}"
         );
     }
 

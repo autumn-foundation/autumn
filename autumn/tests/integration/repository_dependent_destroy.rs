@@ -724,6 +724,70 @@ pub struct ChainNode {
 )]
 pub trait ChainNodeRepository {}
 
+// ── #1800 case 1 (regression): bulk soft-delete must not double-fire hooks ─────
+//
+// A `#[soft_delete]` HOOKED self-referential `dependent = destroy` graph.
+// `bsd_nodes.parent_id` references the same table (DEFERRABLE self-FK so the whole
+// component can be handled in one transaction), the repo is `soft_delete`, and the
+// model logs every `before_delete`. Anc(1) ← Desc(2) (Desc.parent_id = Anc).
+// `delete_many([Desc, Anc])` — the descendant AND its ancestor — must fire Desc's
+// `before_delete` hook EXACTLY ONCE.
+//
+// This is the regression the first #1800 fix introduced: because the ancestor's
+// soft cascade soft-deletes Desc, and the (buggy) fix only recorded PHYSICALLY
+// deleted rows in `__deleted`, the bulk root hook loop no longer saw Desc as
+// already-handled and fired its `before_delete` a SECOND time (once as the
+// cascaded descendant, once as the batch root). Tracking every HANDLED row —
+// soft OR physical — in the "all handled" set (while a SEPARATE physical set backs
+// the diamond revisit-skip) restores single-firing for soft-delete graphs.
+
+pub static BSD_DELETE_LOG: Mutex<Vec<i64>> = Mutex::new(Vec::new());
+
+#[derive(Clone, Default)]
+pub struct BsdNodeHooks;
+
+impl MutationHooks for BsdNodeHooks {
+    type Model = BsdNode;
+    type NewModel = NewBsdNode;
+    type UpdateModel = UpdateBsdNode;
+
+    async fn before_delete(
+        &self,
+        _ctx: &mut MutationContext,
+        record: &BsdNode,
+    ) -> AutumnResult<()> {
+        BSD_DELETE_LOG.lock().unwrap().push(record.id);
+        Ok(())
+    }
+}
+
+diesel::table! {
+    bsd_nodes (id) {
+        id -> Int8,
+        parent_id -> Nullable<Int8>,
+        name -> Text,
+        deleted_at -> Nullable<Timestamp>,
+    }
+}
+
+#[autumn_web::model(table = "bsd_nodes")]
+pub struct BsdNode {
+    #[id]
+    pub id: i64,
+    pub parent_id: Option<i64>,
+    pub name: String,
+    pub deleted_at: Option<chrono::NaiveDateTime>,
+}
+
+#[autumn_web::repository(
+    BsdNode,
+    table = "bsd_nodes",
+    soft_delete,
+    hooks = BsdNodeHooks,
+    dependent(PgBsdNodeRepository, fk = "parent_id", on_delete = destroy)
+)]
+pub trait BsdNodeRepository {}
+
 // ── #1740: a HOOKED parent that also declares a dependent ─────────────────────
 //
 // All the dependent-declaring parents above are hook-free, so they exercise the
@@ -1013,6 +1077,9 @@ async fn setup_pool() -> (
         "CREATE TABLE ra_replies (id BIGSERIAL PRIMARY KEY, comment_id BIGINT NOT NULL REFERENCES ra_comments(id), body TEXT NOT NULL)",
         // Codex round-5-B: HOOKED self-referential chain with an IMMEDIATE self-FK.
         "CREATE TABLE chain_nodes (id BIGSERIAL PRIMARY KEY, parent_id BIGINT REFERENCES chain_nodes(id), name TEXT NOT NULL)",
+        // #1800 case 1 (regression): HOOKED soft-delete self-referential graph. The
+        // self-FK is DEFERRABLE so the component can be handled in one transaction.
+        "CREATE TABLE bsd_nodes (id BIGSERIAL PRIMARY KEY, parent_id BIGINT REFERENCES bsd_nodes(id) DEFERRABLE INITIALLY DEFERRED, name TEXT NOT NULL, deleted_at TIMESTAMP NULL)",
         // #1800 case 1: mixed soft/hard-delete diamond. The leaf references BOTH a
         // soft parent (soft_id) and a hard parent (hard_id) with IMMEDIATE FKs, so a
         // leaf left present while its hard parent is deleted trips the FK at once.
@@ -1079,6 +1146,13 @@ fn dependent_repository_surface_is_generated() {
     // delete_many monomorphizes the two-structure (path + deleted) cascade.
     assert_is_fn(<PgChainNodeRepository as ChainNodeRepository>::delete_many);
     assert_is_fn(PgChainNodeRepository::__autumn_apply_dependent_on_conn);
+    // #1800 case 1 (regression): the HOOKED soft-delete self-referential parent's
+    // bulk delete_many monomorphizes the soft-delete bulk cascade — its soft
+    // `destroy` records the descendant in the "all handled" set so the bulk root
+    // hook loop skips it (no double-fire), while a SEPARATE physical set backs the
+    // diamond revisit-skip.
+    assert_is_fn(<PgBsdNodeRepository as BsdNodeRepository>::delete_many);
+    assert_is_fn(PgBsdNodeRepository::__autumn_apply_dependent_on_conn);
     // #1740: the bulk `delete_many` path now carries the dependent cascade too;
     // monomorphize it (hooks-child parent + restrict-only parent) to prove the
     // bulk-cascade codegen type-checks without Docker.
@@ -1824,6 +1898,81 @@ async fn delete_many_self_referential_immediate_fk_chain_no_double_hook() {
         log.iter().filter(|&&id| id == 1).count(),
         1,
         "round-5-B: the ancestor fires once: log = {log:?}"
+    );
+}
+
+/// #1800 case 1 (regression): bulk `delete_many([Desc, Anc])` over a HOOKED
+/// `#[soft_delete]` self-referential `dependent = destroy` graph — the descendant
+/// AND its ancestor — must fire the descendant's `before_delete` hook EXACTLY ONCE.
+///
+/// The ancestor's soft cascade soft-deletes the descendant (firing its hook once as
+/// a cascaded descendant); the descendant is then also a batch root, so the bulk
+/// root hook loop must SKIP it. That skip consults the "all handled" `__autumn_deleted`
+/// set, which must record the SOFT-deleted descendant.
+///
+/// RED under the first #1800 fix (which recorded ONLY physically-deleted rows in the
+/// single `__deleted` set): the soft-deleted descendant was absent from the set, so
+/// the bulk root loop did not skip it and its `before_delete` fired a SECOND time
+/// (count == 2). GREEN once the "all handled" bulk-root set and the "physically
+/// deleted" diamond set are tracked SEPARATELY: the descendant is recorded as
+/// handled, the root loop skips it, and the hook fires exactly once (count == 1).
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn delete_many_soft_self_referential_fires_descendant_hook_once() {
+    let (pool, _c) = setup_pool().await;
+    let mut conn = pool.get().await.expect("conn");
+
+    // Insert with NULL parents first (satisfy the deferrable FK), then wire
+    // Anc(1) ← Desc(2): the descendant's parent_id points at the ancestor.
+    for id in 1..=2 {
+        diesel::sql_query(format!(
+            "INSERT INTO bsd_nodes (id, parent_id, name) VALUES ({id}, NULL, 'n{id}')"
+        ))
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    }
+    diesel::sql_query("UPDATE bsd_nodes SET parent_id = 1 WHERE id = 2")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+
+    BSD_DELETE_LOG.lock().unwrap().clear();
+
+    let repo = PgBsdNodeRepository::with_pool_untracked(pool.clone());
+    // Batch BOTH the descendant Desc(2) and the ancestor Anc(1). The ancestor's
+    // soft `destroy` cascade soft-deletes Desc; Desc is also a batch root.
+    repo.delete_many(&[2, 1])
+        .await
+        .expect("#1800: bulk soft self-ref delete must not error");
+
+    // Both rows are soft-deleted (present, deleted_at set) — nothing is physically
+    // removed on a soft-delete graph.
+    assert_eq!(
+        count(
+            &mut conn,
+            "SELECT COUNT(*) AS n FROM bsd_nodes WHERE deleted_at IS NOT NULL"
+        )
+        .await,
+        2,
+        "#1800: both the ancestor and descendant are soft-deleted"
+    );
+
+    // The crux: the descendant Desc(2)'s `before_delete` hook fired EXACTLY ONCE —
+    // once as the ancestor's cascaded descendant, and NOT a second time as a batch
+    // root (the bulk root loop skips it because it is recorded in the "all handled"
+    // set even though it was only soft-deleted).
+    let log = BSD_DELETE_LOG.lock().unwrap().clone();
+    assert_eq!(
+        log.iter().filter(|&&id| id == 2).count(),
+        1,
+        "#1800: the soft-deleted descendant's before_delete must fire EXACTLY ONCE \
+         on the bulk path (not once-as-cascade + once-as-root): log = {log:?}"
+    );
+    assert_eq!(
+        log.iter().filter(|&&id| id == 1).count(),
+        1,
+        "#1800: the ancestor fires once (as the bulk parent delete): log = {log:?}"
     );
 }
 
