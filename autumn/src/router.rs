@@ -3410,8 +3410,17 @@ pub fn try_build_router_with_static_inner(
                         // are left untouched. Manifest page routes point at
                         // `*.html`, so the common case still resolves to
                         // text/html; charset=utf-8 exactly as before.
-                        let content_type =
-                            crate::assets::content_type_for(file_path.to_str().unwrap_or(""));
+                        //
+                        // Match on the file name alone (not the full path) so
+                        // extension detection is unaffected by directory
+                        // components — including dotted ancestor directories or
+                        // platform-specific path separators.
+                        let content_type = file_path
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .map_or("application/octet-stream", |name| {
+                                crate::assets::content_type_for(name)
+                            });
                         let body = if is_head {
                             axum::body::Body::empty()
                         } else {
@@ -7102,6 +7111,55 @@ enabled = true
             response.headers().get(http::header::CONTENT_ENCODING),
             None,
             "binary asset must not be blindly compressed"
+        );
+    }
+
+    /// A manifest-backed asset served from a nested path with a multi-dot file
+    /// name (`assets/js/app.min.js`) resolves to the JavaScript MIME type. The
+    /// middleware derives the type from the file name alone, so neither the
+    /// intermediate directory components nor the extra `.min.` dot cause a
+    /// misparse.
+    #[tokio::test]
+    async fn ssg_nested_multidot_asset_resolves_js_mime() {
+        let js = format!("console.log({:?});", "x".repeat(256));
+        let tmp = create_ssg_dist(&[("/app.js", "assets/js/app.min.js", js.as_bytes())]);
+        let dist = tmp.path().join("dist");
+
+        let router = try_build_router_with_static(
+            Vec::new(),
+            &compression_enabled_config(),
+            test_state(),
+            Some(&dist),
+        )
+        .expect("router builds");
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/app.js")
+                    .header("accept-encoding", "gzip")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("text/javascript; charset=utf-8"),
+            "nested multi-dot JS asset must resolve to the JavaScript MIME type"
+        );
+        // JS is a compressible content type, so the layer must still gzip it.
+        assert_eq!(
+            response
+                .headers()
+                .get(http::header::CONTENT_ENCODING)
+                .and_then(|v| v.to_str().ok()),
+            Some("gzip"),
+            "compressible JS asset must be gzip-compressed"
         );
     }
 
