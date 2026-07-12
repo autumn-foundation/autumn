@@ -1277,7 +1277,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the standard `form_for` path, and `reference_fields` was zeroed out under
   `--live-validation`, so a `references` field leaked out as a plain text input.
   The live path now renders DSL-constrained `String`/`Text`/numeric fields and
-  the reference dropdown as raw maud markup carrying the same HTML5 attributes and
+  the reference dropdown as raw Maud markup carrying the same HTML5 attributes and
   ARIA/inline-error skeleton the standard path produces; the reference option
   loaders are threaded into the new/edit form bodies (and the 422 re-render
   branches) so the `<select>` is populated at request time with changeset-driven
