@@ -1821,6 +1821,16 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
         // Phase 2: mutating dependents per parent, in declaration order.
         for &__autumn_pid in &__autumn_dep_parent_ids {
+            // Codex round-4: seed ONLY the current bulk root into the shared
+            // visited set IMMEDIATELY before its own mutating destroy cascade
+            // (mirroring how `delete_by_id` seeds its parent). Without this a
+            // self-referential 2-cycle (A.parent_id = B, B.parent_id = A) would
+            // re-enter A through a child's destroy executor and fire A's
+            // hooks/history/broadcasts as a cascaded child before the final bulk
+            // parent delete. Seeding one root at a time (NOT the whole batch — the
+            // removed all-target pre-seed) keeps the round-2 property: a descendant
+            // batch target not yet on the active path is still cascaded deepest-first.
+            __autumn_visited.insert((#table_name, __autumn_pid));
             #(#delete_many_mutating_calls)*
         }
     };
@@ -1852,6 +1862,16 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
         // Phase 2: mutating dependents per parent, in declaration order.
         for &__autumn_pid in &__autumn_dep_parent_ids {
+            // Codex round-4: seed ONLY the current bulk root into the shared
+            // visited set IMMEDIATELY before its own mutating destroy cascade
+            // (mirroring how `delete_by_id` seeds its parent). Without this a
+            // self-referential 2-cycle (A.parent_id = B, B.parent_id = A) would
+            // re-enter A through a child's destroy executor and fire A's
+            // hooks/history/broadcasts as a cascaded child before the final bulk
+            // parent delete. Seeding one root at a time (NOT the whole batch — the
+            // removed all-target pre-seed) keeps the round-2 property: a descendant
+            // batch target not yet on the active path is still cascaded deepest-first.
+            __autumn_visited.insert((#table_name, __autumn_pid));
             for __autumn_spec in __autumn_rt_deps.iter().filter(|__s|
                 __s.action != ::autumn_web::repository::DependentAction::Restrict
             ) {
@@ -15449,15 +15469,22 @@ mod tests {
     }
 
     #[test]
-    fn repository_macro_delete_many_does_not_preseed_bulk_targets_in_visited() {
-        // Codex P2: the bulk `delete_many` cascade must NOT pre-seed the shared
-        // `__autumn_visited` cycle set with the batch target ids. Pre-seeding a
-        // descendant batch target makes an ancestor's cascade skip it, so for a
-        // self-referential `dependent = destroy` graph the still-referenced row is
-        // not removed before its intermediate parent is deleted → an immediate FK
-        // violation. The visited set must instead be populated naturally as each
-        // row is destroyed. Assert the bulk cascade issues NO `__autumn_visited`
-        // pre-insert (the only inserts happen inside the Destroy leaf executor).
+    fn repository_macro_delete_many_seeds_current_root_before_its_destroy_cascade() {
+        // Codex P2 + round-4: the bulk `delete_many` cascade must NOT pre-seed the
+        // shared `__autumn_visited` cycle set with the WHOLE batch of target ids
+        // (that would make an ancestor's cascade skip a still-referenced descendant
+        // batch target and trip an immediate FK). But it MUST seed the CURRENT root
+        // — one root at a time — immediately before that root's own mutating destroy
+        // cascade, mirroring how `delete_by_id` seeds its parent. Otherwise a
+        // self-referential 2-cycle (A.parent_id = B, B.parent_id = A) re-enters A
+        // through a child's destroy executor and fires A's hooks/history/broadcasts
+        // as a cascaded child before the final bulk parent delete.
+        //
+        // For a `destroy`-only model there is no restrict phase, so the ONLY visited
+        // insert in the bulk section is the per-root Phase-2 seed at the top of the
+        // mutating loop (`for & __autumn_pid ... { __autumn_visited . insert(...)`);
+        // asserting exactly one insert, located there, proves per-root seeding
+        // without the removed all-target pre-seed.
         let generated = repository_macro(
             quote! { Node, dependent(PgNodeRepository, fk = "parent_id", on_delete = destroy) },
             quote! { pub trait NodeRepository {} },
@@ -15468,11 +15495,19 @@ mod tests {
             section.contains("__autumn_apply_dependent_on_conn"),
             "the bulk delete_many path must cascade dependents: {section}"
         );
+        assert_eq!(
+            section.matches("__autumn_visited . insert").count(),
+            1,
+            "round-4: delete_many must seed EXACTLY the current root (one insert), \
+             not pre-seed the whole batch: {section}"
+        );
         assert!(
-            !section.contains("__autumn_visited . insert"),
-            "Codex P2: delete_many must not pre-seed batch target ids into the \
-             visited set (that skips still-referenced self-ref descendants and \
-             trips an immediate FK): {section}"
+            section.contains(
+                "for & __autumn_pid in & __autumn_dep_parent_ids { __autumn_visited . insert"
+            ),
+            "round-4: the current bulk root must be seeded at the TOP of its own \
+             mutating (Phase 2) loop, before recursing into its destroy cascade: \
+             {section}"
         );
     }
 

@@ -513,6 +513,71 @@ pub struct DepImmNode {
 )]
 pub trait DepImmNodeRepository {}
 
+// ── Codex round-4: a HOOKED self-referential `destroy` (2-cycle re-entry) ──────
+//
+// `dep_cycle_nodes.parent_id` references the same table via a DEFERRABLE self-FK
+// (so a true 2-cycle can exist), the repository declares `dependent = destroy`
+// back onto itself, AND the model fires a `before_delete` hook that LOGS the id
+// of every row it deletes. For a 2-cycle A.parent_id = B, B.parent_id = A,
+// `delete_many([A])` must:
+//   1. fire A's `before_delete` hook EXACTLY ONCE (as the bulk parent delete) —
+//      NOT twice (it must not be re-entered as a cascaded child through B's
+//      destroy executor before the final bulk parent delete), and
+//   2. remove BOTH rows.
+// Before the round-4 fix the bulk loop never seeded the current root into the
+// shared visited set, so cascading A → child B → grandchild A re-entered A and
+// fired its hook a second time (as a cascaded child) before the bulk parent
+// delete. Seeding the current root immediately before its own destroy cascade
+// (mirroring `delete_by_id`) closes the re-entry.
+
+use std::sync::Mutex;
+
+// Records the id of every `DepCycleNode` whose `before_delete` hook fires, in
+// order. A row appearing twice means it was re-entered as a cascaded child.
+pub static CYCLE_DELETE_LOG: Mutex<Vec<i64>> = Mutex::new(Vec::new());
+
+#[derive(Clone, Default)]
+pub struct DepCycleNodeHooks;
+
+impl MutationHooks for DepCycleNodeHooks {
+    type Model = DepCycleNode;
+    type NewModel = NewDepCycleNode;
+    type UpdateModel = UpdateDepCycleNode;
+
+    async fn before_delete(
+        &self,
+        _ctx: &mut MutationContext,
+        record: &DepCycleNode,
+    ) -> AutumnResult<()> {
+        CYCLE_DELETE_LOG.lock().unwrap().push(record.id);
+        Ok(())
+    }
+}
+
+diesel::table! {
+    dep_cycle_nodes (id) {
+        id -> Int8,
+        parent_id -> Nullable<Int8>,
+        name -> Text,
+    }
+}
+
+#[autumn_web::model(table = "dep_cycle_nodes")]
+pub struct DepCycleNode {
+    #[id]
+    pub id: i64,
+    pub parent_id: Option<i64>,
+    pub name: String,
+}
+
+#[autumn_web::repository(
+    DepCycleNode,
+    table = "dep_cycle_nodes",
+    hooks = DepCycleNodeHooks,
+    dependent(PgDepCycleNodeRepository, fk = "parent_id", on_delete = destroy)
+)]
+pub trait DepCycleNodeRepository {}
+
 // ── #1740: a HOOKED parent that also declares a dependent ─────────────────────
 //
 // All the dependent-declaring parents above are hook-free, so they exercise the
@@ -610,6 +675,10 @@ async fn setup_pool() -> (
         // Codex P2: IMMEDIATE (non-deferrable) self-referential FK — the check
         // fires per-row, so the cascade cannot rely on deferral to COMMIT.
         "CREATE TABLE dep_imm_nodes (id BIGSERIAL PRIMARY KEY, parent_id BIGINT REFERENCES dep_imm_nodes(id), name TEXT NOT NULL)",
+        // Codex round-4: HOOKED self-referential FK, DEFERRABLE so a true 2-cycle
+        // (A.parent_id = B, B.parent_id = A) can exist — the bulk cascade must seed
+        // the current root before recursing so the root's hook fires exactly once.
+        "CREATE TABLE dep_cycle_nodes (id BIGSERIAL PRIMARY KEY, parent_id BIGINT REFERENCES dep_cycle_nodes(id) DEFERRABLE INITIALLY DEFERRED, name TEXT NOT NULL)",
     ] {
         diesel::sql_query(stmt)
             .execute(&mut conn)
@@ -650,6 +719,12 @@ fn dependent_repository_surface_is_generated() {
     // monomorphizes (its cascade must not pre-seed batch targets).
     assert_is_fn(<PgDepImmNodeRepository as DepImmNodeRepository>::delete_many);
     assert_is_fn(PgDepImmNodeRepository::__autumn_apply_dependent_on_conn);
+    // Codex round-4: the HOOKED self-referential parent's bulk delete_many
+    // monomorphizes the HOOKS-path bulk self-ref cascade (its Phase-2 loop seeds
+    // the current root before recursing, so a 2-cycle can't re-enter the root as a
+    // cascaded child and double-fire its hook).
+    assert_is_fn(<PgDepCycleNodeRepository as DepCycleNodeRepository>::delete_many);
+    assert_is_fn(PgDepCycleNodeRepository::__autumn_apply_dependent_on_conn);
     // #1740: the bulk `delete_many` path now carries the dependent cascade too;
     // monomorphize it (hooks-child parent + restrict-only parent) to prove the
     // bulk-cascade codegen type-checks without Docker.
@@ -1173,6 +1248,72 @@ async fn delete_many_self_referential_immediate_fk_removes_whole_subtree() {
         0,
         "Codex P2: the whole reachable subtree (ancestor, intermediate, \
          descendant) is destroyed with no immediate FK violation"
+    );
+}
+
+/// Codex round-4: `delete_many([A])` on a self-referential `dependent = destroy`
+/// graph that forms a TRUE 2-cycle (`A.parent_id` = B, `B.parent_id` = A) must fire
+/// A's `before_delete` hook EXACTLY ONCE (as the bulk parent delete) and remove
+/// BOTH rows. Before the fix the bulk cascade never seeded the current root into
+/// the shared visited set, so cascading A → child B → grandchild A re-entered A
+/// through B's destroy executor and fired A's hook a SECOND time (as a cascaded
+/// child) before the final bulk parent delete. Seeding the current root
+/// immediately before its own destroy cascade (mirroring `delete_by_id`) closes
+/// the re-entry while still cascading B deepest-first.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn delete_many_self_referential_two_cycle_fires_root_hook_once() {
+    let (pool, _c) = setup_pool().await;
+    let mut conn = pool.get().await.expect("conn");
+
+    // Insert with NULL parents first (satisfy the deferrable FK), then wire the
+    // 2-cycle: node 1 (A).parent_id = 2 (B), node 2 (B).parent_id = 1 (A).
+    for id in 1..=2 {
+        diesel::sql_query(format!(
+            "INSERT INTO dep_cycle_nodes (id, parent_id, name) VALUES ({id}, NULL, 'n{id}')"
+        ))
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    }
+    diesel::sql_query("UPDATE dep_cycle_nodes SET parent_id = 2 WHERE id = 1")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    diesel::sql_query("UPDATE dep_cycle_nodes SET parent_id = 1 WHERE id = 2")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+
+    CYCLE_DELETE_LOG.lock().unwrap().clear();
+
+    let repo = PgDepCycleNodeRepository::with_pool_untracked(pool.clone());
+    // Bulk-delete only A (node 1). The cascade must reach B (node 2) but must NOT
+    // re-enter A as a cascaded child.
+    repo.delete_many(&[1])
+        .await
+        .expect("round-4: bulk self-ref 2-cycle delete must terminate without error");
+
+    // Both rows removed (the whole cyclic component reachable from A).
+    assert_eq!(
+        count(&mut conn, "SELECT COUNT(*) AS n FROM dep_cycle_nodes").await,
+        0,
+        "round-4: both rows of the 2-cycle are destroyed"
+    );
+
+    // The root A (id 1) fired its `before_delete` hook EXACTLY ONCE — it was not
+    // re-entered as a cascaded child. B (id 2) also fires once (cascaded child).
+    let log: Vec<i64> = CYCLE_DELETE_LOG.lock().unwrap().clone();
+    assert_eq!(
+        log.iter().filter(|&&id| id == 1).count(),
+        1,
+        "round-4: the bulk root's before_delete hook must fire EXACTLY ONCE \
+         (not re-entered as a cascaded child): log = {log:?}"
+    );
+    assert_eq!(
+        log.iter().filter(|&&id| id == 2).count(),
+        1,
+        "round-4: the cascaded child fires once: log = {log:?}"
     );
 }
 
