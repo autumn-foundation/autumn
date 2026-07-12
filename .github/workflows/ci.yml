@@ -62,8 +62,21 @@ jobs:
         continue-on-error: true
       - name: Run tests
         run: cargo test --workspace
+      - name: Install Postgres client tools (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          # The offsite-backup round-trip below drives `autumn db backup`, which
+          # shells out to the HOST `pg_dump`/`pg_restore`. ubuntu-latest does not
+          # guarantee these on PATH, so install the client package explicitly.
+          # (postgresql-client installs pg_dump/pg_restore into /usr/bin via the
+          # pg_wrapper symlinks, so no extra PATH tweak is needed.)
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client
+          pg_dump --version
+          pg_restore --version
       - name: Run Docker-dependent tests
         if: runner.os == 'Linux'
+        timeout-minutes: 30
         run: |
           cargo test -p autumn-web --test db_hooks_lifecycle -- --ignored
           cargo test -p autumn-web --test repository_shard_replica_routing -- --ignored
@@ -74,6 +87,14 @@ jobs:
           cargo test -p autumn-cli --test flags -- --ignored
           cargo test -p autumn-cli --test config -- --ignored
           cargo test -p autumn-cli --test experiments -- --ignored
+          # Offsite-backup DR round-trip (#1744): seed -> `autumn db backup
+          # --upload` -> restore from offsite -> row-level equality, against real
+          # MinIO + Postgres testcontainers. The `offsite` filter selects both
+          # ignored tests in autumn-cli/tests/integration/offsite_backup.rs.
+          # Needs Docker (testcontainers) + host pg_dump/pg_restore (installed
+          # above). Runs in the existing Docker-dependent Linux step rather than a
+          # separate required gate.
+          cargo test -p autumn-cli --test cli_tests -- --ignored offsite
           # offline-sync is not a default feature, so the workspace test run
           # above compiles these out; run them (plus the Docker-gated PG
           # conformance suite) here.
