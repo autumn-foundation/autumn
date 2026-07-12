@@ -419,6 +419,48 @@ fn resident_cell_quota_refreshes_on_get_or_create() {
     drop(charge);
 }
 
+/// Dynamic quota (`set_quota_bytes`) with `0 == unlimited` must be honored on
+/// every `reserve` retry, not just on entry: flipping a resident cell's finite
+/// quota to `0` mid-life makes a subsequent charge that far exceeds the old
+/// finite quota succeed (unlimited), while a finite quota still gates an
+/// over-limit charge with `QuotaExceeded`.
+#[test]
+fn dynamic_quota_zero_is_unlimited_after_refresh() {
+    let reg = TenantCellRegistry::new();
+    let cell = reg.get_or_create("t", 100);
+
+    // Charge some bytes under the finite quota of 100.
+    let charge = cell.try_charge(50).expect("50 fits under the quota of 100");
+    assert_eq!(cell.tracked_bytes(), 50);
+
+    // A charge over the finite quota is still rejected while it is non-zero.
+    cell.try_charge(100)
+        .expect_err("50 + 100 = 150 must exceed the finite quota of 100");
+
+    // Flip the quota to unlimited at runtime.
+    cell.set_quota_bytes(0);
+    assert_eq!(cell.quota_bytes(), 0);
+
+    // A charge far exceeding the old finite quota (and current tracked) now
+    // succeeds — `reserve` re-applies `0 == unlimited` on the atomic reload
+    // rather than comparing against `0`.
+    let big = cell
+        .try_charge(10_000)
+        .expect("under an unlimited quota, a large charge must succeed");
+    assert_eq!(cell.tracked_bytes(), 10_050);
+    drop(big);
+    drop(charge);
+    assert_eq!(cell.tracked_bytes(), 0);
+
+    // Restoring a finite quota re-gates: an over-limit charge fails again.
+    cell.set_quota_bytes(1000);
+    let err = cell
+        .try_charge(1001)
+        .expect_err("1001 must exceed the restored finite quota of 1000");
+    assert_eq!(err.quota, 1000);
+    assert_eq!(cell.tracked_bytes(), 0);
+}
+
 /// A bounded registry evicts the least-recently-used cell once resident cells
 /// exceed the cap (#1792). Inserting t1, t2, t3 into a cap-2 registry drives the
 /// access order t1 < t2 < t3 via the globally-monotonic access sequence (no

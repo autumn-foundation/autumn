@@ -130,7 +130,17 @@ impl TenantCellInner {
         }
         let mut current = self.tracked_bytes.load(Ordering::Relaxed);
         loop {
+            // Reload the quota each iteration and re-apply the `0 == unlimited`
+            // rule *before* the over-quota check: a concurrent `set_quota_bytes`
+            // can flip a finite quota to unlimited between the entry check above
+            // and a later CAS retry, and once unlimited every positive `next`
+            // must be accepted rather than compared against `0`.
             let quota = self.quota_bytes.load(Ordering::Relaxed);
+            if quota == 0 {
+                self.tracked_bytes.fetch_add(n, Ordering::Relaxed);
+                self.global_tracked.fetch_add(n, Ordering::Relaxed);
+                return Ok(());
+            }
             let next = current.saturating_add(n);
             if next > quota {
                 return Err(QuotaExceeded {
