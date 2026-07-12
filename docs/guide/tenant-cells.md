@@ -24,6 +24,8 @@ buys you.
 [tenancy]
 enabled = true
 quota_bytes = 1048576   # 1 MiB soft quota per tenant; 0 (the default) disables the quota
+max_cells = 10000       # cap resident tenant cells; LRU-evict above this. 0 (the default) = unbounded
+idle_ttl_secs = 3600    # evict a cell idle longer than this many seconds. 0 (the default) = disabled
 ```
 
 `quota_bytes` is the soft per-tenant quota applied to every cell the registry
@@ -31,15 +33,45 @@ mints. `0` — the default — disables the quota entirely: charges always succe
 and nothing is capped, while `tracked_bytes()` still accounts what flows
 through the cell.
 
+`max_cells` bounds how many tenant cells stay resident in the registry. When a
+new cell would push the map past this count, the least-recently-used cells are
+evicted until it fits. `0` — the default — leaves the registry unbounded. This
+matters whenever tenant IDs are high-cardinality or request-controlled: a
+tenant sourced from a header, JWT claim, or subdomain lets callers mint new IDs
+at will, and on an allocating route every distinct ID would otherwise grow the
+registry without bound. `max_cells` caps that growth to a fixed working set.
+
+`idle_ttl_secs` evicts a cell whose last access is older than this many seconds.
+`0` — the default — disables the idle sweep. Enforcement is lazy: the TTL is
+applied on cell insert rather than by a background timer (a reusable
+`evict_idle_older_than` primitive is also exposed for callers that want to run a
+sweep on their own cadence).
+
+Both limits reclaim memory the same way manual `evict` does — see
+[Eviction and lifecycle](#eviction-and-lifecycle).
+
 Environment overrides:
 
 | Variable | Field |
 |----------|-------|
+| `AUTUMN_TENANCY__ENABLED` | `tenancy.enabled` |
+| `AUTUMN_TENANCY__SOURCE` | `tenancy.source` |
+| `AUTUMN_TENANCY__HEADER_NAME` | `tenancy.header_name` |
+| `AUTUMN_TENANCY__SESSION_KEY` | `tenancy.session_key` |
+| `AUTUMN_TENANCY__JWT_CLAIM` | `tenancy.jwt_claim` |
+| `AUTUMN_TENANCY__JWT_SECRET` | `tenancy.jwt_secret` |
+| `AUTUMN_TENANCY__JWT_ISSUER` | `tenancy.jwt_issuer` |
+| `AUTUMN_TENANCY__JWT_AUDIENCE` | `tenancy.jwt_audience` |
+| `AUTUMN_TENANCY__BASE_DOMAIN` | `tenancy.base_domain` |
+| `AUTUMN_TENANCY__LOGIN_REDIRECT` | `tenancy.login_redirect` |
+| `AUTUMN_TENANCY__PUBLIC_PATHS` | `tenancy.public_paths` (comma-separated) |
 | `AUTUMN_TENANCY__QUOTA_BYTES` | `tenancy.quota_bytes` |
+| `AUTUMN_TENANCY__MAX_CELLS` | `tenancy.max_cells` |
+| `AUTUMN_TENANCY__IDLE_TTL_SECS` | `tenancy.idle_ttl_secs` |
 
-Among the `[tenancy]` fields, the environment currently overrides only
-`quota_bytes` (full tenancy-section env coverage is tracked in
-[#1793](https://github.com/madmax983/autumn/issues/1793)).
+The entire `[tenancy]` section is now settable from the environment via
+`AUTUMN_TENANCY__*`, so every field above can be supplied without an
+`autumn.toml`.
 
 ## Using the cell in a handler
 
@@ -138,13 +170,27 @@ app state. Two properties matter operationally:
   and all) is reclaimed, and its tracked bytes leave the process-wide gauge.
   This is ordinary Rust `Drop`, not a background sweep — reclaim is immediate
   and predictable.
+- **Automatic eviction.** With `max_cells` or `idle_ttl_secs` set (see
+  [Configuration](#configuration)), the registry evicts on its own — LRU cells
+  above the cap, and cells idle past the TTL — enforced lazily on cell insert.
+  Automatic eviction reclaims memory exactly like the manual `evict` above: it
+  drops only the registry's strong reference, so the same deterministic `Drop`
+  applies and an in-flight holder is never disturbed.
 
 Eviction is safe to do mid-request. Each in-flight request caches the cell it
 first materialized, so evicting a tenant while one of its requests is running
 does **not** reset that request's state or hand it a fresh empty cell: the
-running request keeps its stable cell to completion, and the eviction takes
-effect for subsequent requests. The registry also exposes `len()`,
-`is_empty()`, and `total_tracked_bytes()` for observability.
+running request keeps its own cached `Arc` and its stable cell to completion,
+its memory reclaiming on drop, and the eviction takes effect for subsequent
+requests. The registry also exposes `len()`, `is_empty()`, and
+`total_tracked_bytes()` for observability.
+
+**Dynamic quota.** A cell's `quota_bytes` is stored atomically rather than
+frozen at creation. Every access refreshes a resident cell's quota from the
+configured `quota_bytes`, so a future config-reload path could change the
+per-tenant quota without evicting and rebuilding cells. No such reload path
+exists today — the mechanism is in place for when one lands, and until then the
+refresh simply re-applies the same configured value.
 
 ## The accounting guarantee
 
@@ -175,12 +221,9 @@ are counted honestly and released deterministically.
 
 ## Limitations and roadmap
 
-- **Runtime-mutable quota** — the quota is fixed for a cell's lifetime today;
-  changing it at runtime is deferred to
+- **Config hot-reload** — resident cells already refresh their quota from
+  `quota_bytes` on every access (see [Dynamic quota](#eviction-and-lifecycle)),
+  but nothing re-reads `autumn.toml` at runtime to feed a new value, so the
+  quota is effectively fixed for a process's lifetime. Wiring up a reload path
+  is the remaining half of
   [#1783](https://github.com/madmax983/autumn/issues/1783).
-- **Bounded / idle registry eviction** — the registry does not yet evict idle
-  tenants automatically; call `evict` yourself. Tracked in
-  [#1792](https://github.com/madmax983/autumn/issues/1792).
-- **Full tenancy-section env overrides** — only `quota_bytes` is currently
-  overridable via the environment; the rest of `[tenancy]` is tracked in
-  [#1793](https://github.com/madmax983/autumn/issues/1793).
