@@ -1624,7 +1624,7 @@ message and leaves the local artifact intact. Configure it in `autumn.toml`:
 ```toml
 [backup.offsite]
 auto_upload = true          # upload after every `autumn db backup`, no --upload
-prefix = "db"               # objects keyed {prefix}/{profile}/{timestamp}/{file}
+prefix = "db"               # objects keyed {prefix}/{profile}/{timestamp}-{token}/{file}
 keep = 30                   # independent remote retention (prune after verify)
 # allow_shared_bucket = true  # opt-in to reuse the app's [storage.s3] bucket
 
@@ -1641,11 +1641,16 @@ Every key has an `AUTUMN_BACKUP__OFFSITE__*` override (e.g.
 `AUTUMN_BACKUP__OFFSITE__S3__BUCKET`) and honors profile overlays
 (`[profile.prod.backup.offsite]`). Credentials are **env-var indirection** only
 — config names the env vars the secrets are read from; the values never live in
-config, argv, logs, or errors. `autumn db offsite list [--profile P]` shows the
-offsite runs for the active profile; `autumn db restore
-offsite:<profile>/<timestamp|latest>` (or `--offsite`) downloads a run to a temp
-dir and applies the same integrity verification and production `--force` guard as
-a local restore. The transfer client is a dependency-light synchronous `SigV4`
+config, argv, logs, or errors. The remote run id appends a short unique token to
+the timestamp (`{timestamp}-{token}`) so same-second backups of one profile from
+different hosts never collide in the bucket. `autumn db offsite list [--profile
+P]` shows the offsite runs for the active profile (printing the full
+`{timestamp}-{token}` run id); `autumn db restore
+offsite:<profile>/<run-id|latest>` (or `--offsite`) downloads a run to a temp dir
+and applies the same integrity verification and production `--force` guard as a
+local restore. The selector accepts the full `{timestamp}-{token}` run id, a bare
+`{timestamp}` (only when it uniquely matches one run — otherwise it errors and
+lists the candidates), or `latest` (newest complete run). The transfer client is a dependency-light synchronous `SigV4`
 client streamed end-to-end (a single `PutObject` sends a server-side
 `x-amz-checksum-sha256`; above 64 MiB — S3 caps a single `PutObject` at 5 GiB —
 the artifact uploads via multipart, hashed locally and verified after

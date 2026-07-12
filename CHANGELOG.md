@@ -1219,12 +1219,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   errors), with `AUTUMN_BACKUP__OFFSITE__*` env overrides (e.g.
   `AUTUMN_BACKUP__OFFSITE__S3__BUCKET`) and profile overlays
   (`[profile.prod.backup.offsite]`). Objects are keyed
-  `{prefix}/{profile}/{timestamp}/{file}`; independent remote retention
+  `{prefix}/{profile}/{timestamp}-{token}/{file}` — the remote run id appends a
+  short unique token to the timestamp so same-second backups of one profile from
+  different hosts never collide; independent remote retention
   (`keep = N`) prunes older uploaded runs only after a verified upload (never the
   just-uploaded run). New `autumn db offsite list` shows the offsite runs for the
-  active profile, and `autumn db restore offsite:<profile>/<timestamp|latest>`
-  (or `--offsite`) downloads a run to a temp dir and applies the same integrity
-  verification and production `--force` guard as a local restore. Transfers use a
+  active profile (printing the full `{timestamp}-{token}` run id), and `autumn db
+  restore offsite:<profile>/<run-id|latest>` (or `--offsite`) downloads a run to a
+  temp dir and applies the same integrity verification and production `--force`
+  guard as a local restore. The selector accepts the full `{timestamp}-{token}`
+  run id (exact), a bare `{timestamp}` (works only when it uniquely identifies one
+  run — otherwise it errors and lists the candidates), or `latest` (newest
+  complete run). Transfers use a
   dependency-light synchronous SigV4 S3 client streamed end-to-end to bound memory
   (a single `PutObject` sends a server-side `x-amz-checksum-sha256`; above 64 MiB —
   S3 caps a single `PutObject` at 5 GiB — the artifact uploads via multipart, hashed
