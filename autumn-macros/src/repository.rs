@@ -6813,6 +6813,18 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         // because normalization cleaned it up is stored raw. This is a known,
         // deliberate limitation of the opt-in blind path; the hooked/#1804 path
         // persists the normalized draft instead.
+        //
+        // Concurrency (known, deliberate): this merged validation is point-in-time
+        // against a non-locked snapshot (a plain SELECT, no `FOR UPDATE`). It
+        // reliably rejects a single request that is invalid once merged (the #1801
+        // acceptance criterion), but does not provide a serializable cross-field
+        // invariant under concurrent partial writes to different fields — two
+        // concurrent requests can each validate against the same old row and then
+        // persist a combination the validator would reject. This matches the blind
+        // path's intentionally non-transactional, last-write-wins-per-column
+        // semantics; callers needing atomic cross-field enforcement should use a
+        // versioned or `hooks = ...` repository, whose update runs
+        // `SELECT ... FOR UPDATE` inside the mutation transaction.
         let draft_ext_trait = format_ident!("{}DraftExt", model_name);
         let knob_validate_current = if config.validate_on_update_fetch {
             quote! {
@@ -11446,6 +11458,13 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     // because this handler returns `IdempotencyReplayOr`; sits
                     // with the other pure pre-replay checks so it cannot affect
                     // idempotency replay semantics.
+                    //
+                    // Concurrency (known, deliberate): this is point-in-time —
+                    // it validates against the `__existing` snapshot loaded for
+                    // the 404/policy gate, not under a row lock held through
+                    // `repo.update`, so it is best-effort under concurrent writes
+                    // for the same reason as the blind path above (deliberate,
+                    // given the always-on zero-extra-query design).
                     if let ::core::result::Result::Err(err) =
                         <::autumn_web::hooks::UpdateDraft<#model_name> as #draft_ext_trait>::from_patch(&__existing, &patch)
                     {
