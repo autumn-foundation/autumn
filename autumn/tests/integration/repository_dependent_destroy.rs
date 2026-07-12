@@ -664,6 +664,10 @@ fn dependent_repository_surface_is_generated() {
     // from the model side with no repository-attribute `dependent(...)`)
     // type-checks against the same four cascade actions.
     assert_is_fn(<PgModelDepPostRepository as ModelDepPostRepository>::delete_by_id);
+    // Codex P1: the model-declared parent's bulk `delete_many` monomorphizes too —
+    // proving the runtime `RuntimeDependentSpec` dispatch on the BULK path (all
+    // four actions: destroy + delete_all + restrict) type-checks.
+    assert_is_fn(<PgModelDepPostRepository as ModelDepPostRepository>::delete_many);
     // The model exposes its runtime dependent specs (inherent shadow of
     // `AutumnDependents::dependents`): destroy + delete_all + restrict.
     assert_is_fn(ModelDepPost::dependents);
@@ -675,6 +679,9 @@ fn dependent_repository_surface_is_generated() {
     // dependent ONLY model-side (empty `config.dependents`). Referencing the
     // helper + both `delete_by_id`s type-checks that recursive runtime path.
     assert_is_fn(<PgM3PostRepository as M3PostRepository>::delete_by_id);
+    // Codex P1: the fully model-side parent's BULK delete_many must also
+    // runtime-dispatch (and recurse into model-side grandchildren).
+    assert_is_fn(<PgM3PostRepository as M3PostRepository>::delete_many);
     assert_is_fn(<PgM3CommentRepository as M3CommentRepository>::delete_by_id);
     assert_is_fn(PgM3CommentRepository::__autumn_apply_dependent_on_conn);
     assert_is_fn(PgM3ReplyRepository::__autumn_apply_dependent_on_conn);
@@ -1012,6 +1019,63 @@ async fn deleting_model_side_parent_recurses_into_model_side_grandchildren() {
         0,
         "Codex P1: all replies (grandchildren) must be recursively destroyed via \
          the child's runtime Model::dependents() — zero left"
+    );
+}
+
+/// Codex P1: bulk `delete_many` on a FULLY model-side parent (`M3Post`, whose
+/// `#[has_many(M3Comment, dependent = destroy)]` is declared only on the model
+/// struct, no repository-attribute `dependent(...)`) must cascade — the bulk
+/// path has to consult the runtime `M3Post::dependents()` just like `delete_by_id`
+/// does, otherwise the children are orphaned / FK-error. Deleting `[1, 2]` must
+/// leave zero comments AND zero (grandchild) replies, in one transaction.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn delete_many_model_side_parent_cascades_via_runtime_dispatch() {
+    let (pool, _c) = setup_pool().await;
+    let mut conn = pool.get().await.expect("conn");
+
+    // Two posts, each with a comment, each comment with a reply (grandchild).
+    for p in 1..=2 {
+        diesel::sql_query(format!(
+            "INSERT INTO m3_posts (id, title) VALUES ({p}, 'p{p}')"
+        ))
+        .execute(&mut conn)
+        .await
+        .unwrap();
+        diesel::sql_query(format!(
+            "INSERT INTO m3_comments (id, post_id, body) VALUES ({p}, {p}, 'c{p}')"
+        ))
+        .execute(&mut conn)
+        .await
+        .unwrap();
+        diesel::sql_query(format!(
+            "INSERT INTO m3_replys (id, comment_id, body) VALUES ({p}, {p}, 'r{p}')"
+        ))
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    }
+
+    let repo = PgM3PostRepository::with_pool_untracked(pool.clone());
+    repo.delete_many(&[1, 2])
+        .await
+        .expect("Codex P1: model-side bulk cascade must not FK-error / orphan");
+
+    assert_eq!(
+        count(&mut conn, "SELECT COUNT(*) AS n FROM m3_posts").await,
+        0,
+        "both parents deleted"
+    );
+    assert_eq!(
+        count(&mut conn, "SELECT COUNT(*) AS n FROM m3_comments").await,
+        0,
+        "Codex P1: model-declared destroy children cascaded on the BULK path — zero left"
+    );
+    assert_eq!(
+        count(&mut conn, "SELECT COUNT(*) AS n FROM m3_replys").await,
+        0,
+        "Codex P1: grandchildren recursively destroyed on the bulk path via the \
+         child's runtime Model::dependents() — zero left"
     );
 }
 
