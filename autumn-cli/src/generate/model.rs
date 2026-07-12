@@ -8,8 +8,8 @@ use super::dsl::{Field, FieldConstraints, FieldKind, IdType, parse_fields};
 use super::emit::Plan;
 use super::naming::{pascal, pluralize, snake};
 use super::schema_edit::{
-    add_mod_declaration, append_schema_table_with_id, create_table_sql_with_metadata_and_id,
-    drop_table_sql, link_models_into_seed_bin,
+    add_mod_declaration, add_search_down_sql, add_search_up_sql, append_schema_table_with_id,
+    create_table_sql_with_metadata_and_id, drop_table_sql, link_models_into_seed_bin,
 };
 use super::{GenerateError, ensure_project_root, read_or_empty};
 
@@ -38,6 +38,12 @@ pub struct ModelOptions {
     /// Primary-key type emitted for the `id` column. Defaults to `BigSerial`
     /// (`BIGSERIAL`/`i64`); set to `Uuid` for non-enumerable identifiers.
     pub id_type: IdType,
+    /// Text field names (`String`/`Text`) to make full-text searchable
+    /// (issue #1319). Emits a struct-level `#[searchable(language = "english")]`
+    /// plus per-field `#[searchable(weight = "…")]`, and a `search_vector`
+    /// generated column + GIN index in the migration. Empty by default (the
+    /// flag is purely additive; when unset, output is byte-for-byte identical).
+    pub searchable: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -45,12 +51,30 @@ pub struct ModelMetadata {
     indexes: BTreeSet<String>,
     validations: BTreeMap<String, Vec<String>>,
     defaults: BTreeMap<String, String>,
+    /// Full-text search config (issue #1319): the FTS dictionary language and
+    /// the ordered `(field, weight)` list. `search_language` is `Some` iff any
+    /// field is searchable.
+    search_language: Option<String>,
+    searchable: Vec<(String, char)>,
 }
 
 impl ModelMetadata {
     #[must_use]
     pub fn has_validator_rules(&self) -> bool {
         !self.validations.is_empty()
+    }
+
+    /// The FTS dictionary language when the model has searchable fields.
+    #[must_use]
+    pub fn search_language(&self) -> Option<&str> {
+        self.search_language.as_deref()
+    }
+
+    /// The ordered `(field, weight)` pairs the `search_vector` column is built
+    /// from (issue #1319). Empty when the model is not searchable.
+    #[must_use]
+    pub fn searchable(&self) -> &[(String, char)] {
+        &self.searchable
     }
 
     #[must_use]
@@ -188,8 +212,25 @@ pub fn plan_model_with_options(
     } else {
         table_sql
     };
+    // Full-text search (issue #1319): the `search_vector` generated column + GIN
+    // index are what `#[repository(..., searchable)]`'s `search_page` queries.
+    // Emitted in the same create-table migration so `autumn migrate` yields a
+    // working search with zero manual SQL. The column is a stored generated
+    // column, so it is intentionally NOT added to the model struct or schema.rs
+    // (the macro loads matched rows by id via raw SQL).
+    let (up_sql, down_sql) = if metadata.searchable().is_empty() {
+        (up_sql, drop_table_sql(&table))
+    } else {
+        let language = metadata.search_language().unwrap_or("english");
+        let search_up = add_search_up_sql(&table, language, metadata.searchable());
+        let search_down = add_search_down_sql(&table);
+        (
+            format!("{up_sql}\n{search_up}"),
+            format!("{search_down}{}", drop_table_sql(&table)),
+        )
+    };
     plan.create(migration_dir.join("up.sql"), up_sql);
-    plan.create(migration_dir.join("down.sql"), drop_table_sql(&table));
+    plan.create(migration_dir.join("down.sql"), down_sql);
 
     // (c) `src/schema.rs` entry
     let schema_path = project_root.join("src").join("schema.rs");
@@ -1318,6 +1359,37 @@ pub fn parse_model_metadata(
         metadata.defaults.insert(field_name.to_owned(), sql);
     }
 
+    // Full-text search config (issue #1319). Only text (`String`/`Text`) fields
+    // can populate a `tsvector`; a non-text field would emit a model that fails
+    // to compile against the `#[searchable]` macro and a migration Postgres
+    // rejects, so reject it here with an actionable, field-naming error (AC5).
+    // Weights follow the `search_page`/wiki convention: the first field gets the
+    // highest `A` weight, the rest `B`/`C`/`D` (capped), in the order given.
+    for (i, name) in options.searchable.iter().enumerate() {
+        let field_name = name.trim();
+        let field = field_by_name(fields, field_name).ok_or_else(|| {
+            GenerateError::Config(format!(
+                "--searchable names '{field_name}', which is not a field of this model. \
+                 Only declared text fields can be full-text searchable."
+            ))
+        })?;
+        if !is_string_like(field) {
+            return Err(GenerateError::Config(format!(
+                "--searchable field '{field_name}' is `{}`, but only text fields \
+                 (`String`/`Text`) can be full-text searchable. Remove it from \
+                 --searchable (numbers, bools, dates, and references are not text).",
+                field.rust_type()
+            )));
+        }
+        let weight = [b'A', b'B', b'C', b'D'][i.min(3)] as char;
+        metadata.searchable.push((field_name.to_owned(), weight));
+    }
+    if !metadata.searchable.is_empty() {
+        // `english` matches the `wiki` example and is the most common default;
+        // the FTS dictionary is otherwise out of scope for this slice.
+        metadata.search_language = Some("english".to_owned());
+    }
+
     Ok(metadata)
 }
 
@@ -1744,6 +1816,12 @@ fn render_model_file(
         }
     }
     out.push_str("#[autumn_web::model]\n");
+    // Struct-level `#[searchable(language = "…")]` (issue #1319) opts the model
+    // into full-text search; the per-field `#[searchable(weight = "…")]` below
+    // declare which columns feed the `search_vector` and at what rank weight.
+    if let Some(language) = metadata.search_language() {
+        let _ = writeln!(out, "#[searchable(language = \"{language}\")]");
+    }
     if let Some(key) = shard_key {
         let _ = writeln!(out, "#[shard_key = \"{key}\"]");
     }
@@ -1753,6 +1831,9 @@ fn render_model_file(
     for f in fields {
         if metadata.indexes.contains(&f.name) {
             out.push_str("    #[indexed]\n");
+        }
+        if let Some((_, weight)) = metadata.searchable().iter().find(|(n, _)| n == &f.name) {
+            let _ = writeln!(out, "    #[searchable(weight = \"{weight}\")]");
         }
         if let Some(validations) = metadata.validations.get(&f.name) {
             for validation in validations {

@@ -10,6 +10,7 @@ mod offsite_backup;
 mod repo_hygiene;
 mod scaffold_belongs_to;
 mod scaffold_form_for;
+mod scaffold_search;
 mod scaffold_validation;
 mod seed_model_linking;
 #[cfg(unix)]

@@ -2342,6 +2342,12 @@ enum GenerateCommands {
         /// `--api` scaffolds, which never generate a policy.
         #[arg(long)]
         no_policy: bool,
+        /// Make these text fields full-text searchable (issue #1319): comma-
+        /// separated or repeatable, e.g. `--searchable title,body`. Adds
+        /// `#[searchable]` to the model, `searchable` to the repository, a
+        /// `search_vector` migration, and a wired search box in the index view.
+        #[arg(long, value_name = "FIELD,FIELD", value_delimiter = ',')]
+        searchable: Vec<String>,
         /// Print the file plan and exit without writing anything.
         #[arg(long)]
         dry_run: bool,
@@ -3610,6 +3616,7 @@ fn run_generate_command(cmd: GenerateCommands, mode: ApplyMode) {
             live,
             live_validation,
             no_policy,
+            searchable,
             dry_run,
             force,
         } => {
@@ -3667,6 +3674,7 @@ fn run_generate_command(cmd: GenerateCommands, mode: ApplyMode) {
                 id.as_deref(),
                 live_validation,
                 no_policy,
+                &searchable,
             ) {
                 Ok(result) => result,
                 Err(e) => {
