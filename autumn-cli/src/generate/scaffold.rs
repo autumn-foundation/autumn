@@ -2097,32 +2097,25 @@ fn render_routes_file(
     // the policy check *before* touching it, so a forbidden actor is denied
     // (404/403 per config) before any write. Loading first also gives the same
     // not-found behavior the post-update `updated == 0` guard provides.
-    let authz_update_preamble = if authorize {
-        format!(
-            "let current: {pascal_name} = {plural}::table\n        \
-             .find(*id)\n        \
-             .select({pascal_name}::as_select())\n        \
-             .first(&mut *db)\n        \
-             .await\n        \
-             .map_err(AutumnError::not_found)?;\n    \
-             autumn_web::authorization::authorize::<{pascal_name}>(&state, &session, \"update\", &current).await?;\n    "
-        )
-    } else {
-        String::new()
+    // `update` and `destroy` share the same load-then-authorize preamble; only
+    // the policy action differs.
+    let authz_mutation_preamble = |action: &str| {
+        if authorize {
+            format!(
+                "let current: {pascal_name} = {plural}::table\n        \
+                 .find(*id)\n        \
+                 .select({pascal_name}::as_select())\n        \
+                 .first(&mut *db)\n        \
+                 .await\n        \
+                 .map_err(AutumnError::not_found)?;\n    \
+                 autumn_web::authorization::authorize::<{pascal_name}>(&state, &session, \"{action}\", &current).await?;\n    "
+            )
+        } else {
+            String::new()
+        }
     };
-    let authz_destroy_preamble = if authorize {
-        format!(
-            "let current: {pascal_name} = {plural}::table\n        \
-             .find(*id)\n        \
-             .select({pascal_name}::as_select())\n        \
-             .first(&mut *db)\n        \
-             .await\n        \
-             .map_err(AutumnError::not_found)?;\n    \
-             autumn_web::authorization::authorize::<{pascal_name}>(&state, &session, \"delete\", &current).await?;\n    "
-        )
-    } else {
-        String::new()
-    };
+    let authz_update_preamble = authz_mutation_preamble("update");
+    let authz_destroy_preamble = authz_mutation_preamble("delete");
     let authz_edit_call = if authorize {
         format!(
             "autumn_web::authorization::authorize::<{pascal_name}>(&state, &session, \"edit\", &row).await?;\n    "
