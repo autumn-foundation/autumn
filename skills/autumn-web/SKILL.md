@@ -1187,7 +1187,8 @@ to look" actuator pointer:
 - **High 5xx rate** — the rolling 5xx rate crosses `error_rate_threshold`
   (default `0.05`, a fraction in `(0, 1]`) over ≥ `error_rate_min_requests`.
 - **Scheduled-task failure** — a `#[scheduled]`/framework task returns an error.
-  A failed `autumn db backup` offsite upload also raises this condition
+  A failed `autumn db backup` offsite upload also raises this condition,
+  delivered via the outbound-HTTP alert channels only (not email)
   **(unreleased — trunk-dev, issue #1743)**.
 
 Delivery is best-effort and off the request path (background tick every
@@ -1648,8 +1649,10 @@ a local restore. The transfer client is a dependency-light synchronous `SigV4`
 client streamed end-to-end (multipart above 64 MiB — S3 caps a single
 `PutObject` at 5 GiB — with a server-side `x-amz-checksum-sha256`). `autumn
 doctor` adds an informational `offsite_backup` check (see the `doctor` skill),
-and a failed upload raises a `ScheduledTaskFailure` operator alert when
-`[alerts]` is configured (issue #1743). Pointing the offsite bucket at the app's
+and a failed upload raises a `ScheduledTaskFailure` operator alert only when an
+outbound-HTTP `[alerts]` channel (PagerDuty / Slack / Discord / signed webhook)
+is configured — an email-only `[alerts]` config is not notified (issue #1743).
+Pointing the offsite bucket at the app's
 own `[storage.s3]` bucket needs `allow_shared_bucket = true`. See
 `docs/guide/daemon.md`.
 

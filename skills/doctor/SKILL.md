@@ -69,6 +69,7 @@ These names match what `autumn doctor --json` actually emits in the `name` field
 | `version_compat` | Upgrade `autumn-cli` to match the framework version: `cargo install autumn-cli --version 0.5.0` |
 | `dotenv` | Copy `.env.example` to `.env` and fill in local values, or add every present secret dotenv file (`.env`, `.env.local`, and any `.env.<profile>.local`) to `.gitignore` if it is not already ignored — committable `.env.<profile>` files are left alone (warns only; never fails) |
 | `jobs_queue_coverage` **(trunk-dev)** | Add the uncovered queue(s) to a tier's `jobs.pin` in `[jobs.fleet].tiers`, or run an unpinned tier that drains everything (only fails under `--strict` once `[jobs.fleet]` is declared) |
+| `offsite_backup` **(trunk-dev)** | Set `backup.offsite.s3.bucket`, or set `backup.offsite.allow_shared_bucket = true` if intentionally reusing the app `[storage.s3]` bucket |
 
 ## Operator alert checks (unreleased — trunk-dev)
 
@@ -100,15 +101,22 @@ accepted in place of the TOML key (issue #1630). See
 
 ## Offsite-backup check (unreleased — trunk-dev, issue #1619)
 
-`autumn doctor` adds an informational `offsite_backup` check for the offsite S3
-backup destination (`[backup.offsite]`). It is never a hard failure and never
-prints a credential value: it notes when no offsite destination is configured,
-and — once one is — flags an unset `backup.offsite.s3.bucket`, a destination that
-shares the app's `[storage.s3]` bucket without
-`backup.offsite.allow_shared_bucket = true`, or named credential env vars
-(`backup.offsite.s3.access_key_id_env` / `secret_access_key_env`) that are not
-ready. Remedy: add a `[backup.offsite]` section and run `autumn db backup
---upload`, or set the specific key the check names. See `docs/guide/daemon.md`.
+`autumn doctor` adds an `offsite_backup` check for the offsite S3 backup
+destination (`[backup.offsite]`). It never prints a credential value (only
+env-var names / booleans), but it **can hard-fail** on an invalid configured
+destination:
+
+- **Pass** — no offsite destination is configured, or a configured destination
+  is complete (bucket set + credential env vars ready).
+- **Warn** — the bucket is set but the named credential env vars
+  (`backup.offsite.s3.access_key_id_env` / `secret_access_key_env`) are not ready
+  (unset name, or the variable is not exported).
+- **Fail** — an invalid configured destination: `[backup.offsite]` is set without
+  `backup.offsite.s3.bucket`, or the destination reuses the app's `[storage.s3]`
+  bucket at the same endpoint without `backup.offsite.allow_shared_bucket = true`.
+
+Remedy: add a `[backup.offsite]` section and run `autumn db backup --upload`, or
+set the specific key the check names. See `docs/guide/daemon.md`.
 
 ## Topology-aware queue coverage (unreleased — trunk-dev, issue #1756)
 

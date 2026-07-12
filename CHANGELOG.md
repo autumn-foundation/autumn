@@ -1230,21 +1230,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   server-side `x-amz-checksum-sha256`); pointing the offsite bucket at the app's
   own `[storage.s3]` bucket requires the explicit `allow_shared_bucket = true`
   opt-in (issue #1619).
-- **doctor:** new `offsite_backup` check — informational (never a hard failure,
-  never prints a credential value). It notes when no `[backup.offsite]`
-  destination is configured, and once one is, flags an unset
-  `backup.offsite.s3.bucket`, a destination that shares the app's `[storage.s3]`
-  bucket without `backup.offsite.allow_shared_bucket = true`, or named credential
-  env vars that are not ready (issue #1619).
+- **doctor:** new `offsite_backup` check (never prints a credential value — only
+  env-var names / booleans). It Passes when no `[backup.offsite]` destination is
+  configured, or when a configured destination is complete. It **Fails** on an
+  invalid configured destination — `[backup.offsite]` set without
+  `backup.offsite.s3.bucket`, or a destination that reuses the app's
+  `[storage.s3]` bucket at the same endpoint without
+  `backup.offsite.allow_shared_bucket = true`. It **Warns** when the bucket is set
+  but the named credential env vars are not ready (unset name, or the variable is
+  not exported) (issue #1619).
 - **alerts:** a failed `autumn db backup` offsite upload now raises a
   `ScheduledTaskFailure` operator alert (dedup key
   `scheduled_task_failure:db-backup-offsite-upload`, title "Offsite backup upload
-  failed") through the configured `[alerts]` channels (PagerDuty / Slack / Discord
-  + signed webhook), so an unattended/cron backup never fails its upload silently.
-  Delivery is best-effort on a short-lived runtime and can never change the
-  command's exit code; with no `[alerts]` destination configured no channels are
-  built, so the interactive case (message + non-zero exit) is unchanged
-  (issue #1743).
+  failed") through the outbound-HTTP `[alerts]` channels only (PagerDuty / Slack /
+  Discord + signed webhook), so an unattended/cron backup never fails its upload
+  silently. Email is intentionally excluded — an email-only `[alerts]` config
+  builds no channels here and is not notified. Delivery is best-effort on a
+  short-lived runtime and can never change the command's exit code; with no
+  outbound-HTTP `[alerts]` channel configured no channels are built, so the
+  interactive case (message + non-zero exit) is unchanged (issue #1743).
 - **ci:** the offsite-backup disaster-recovery round-trip
   (`autumn-cli/tests/integration/offsite_backup.rs`) now runs in GitHub Actions —
   `cargo test -p autumn-cli --test cli_tests -- --ignored offsite` drives
