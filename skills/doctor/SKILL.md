@@ -69,6 +69,19 @@ These names match what `autumn doctor --json` actually emits in the `name` field
 | `version_compat` | Upgrade `autumn-cli` to match the framework version: `cargo install autumn-cli --version 0.5.0` |
 | `dotenv` | Copy `.env.example` to `.env` and fill in local values, or add every present secret dotenv file (`.env`, `.env.local`, and any `.env.<profile>.local`) to `.gitignore` if it is not already ignored — committable `.env.<profile>` files are left alone (warns only; never fails) |
 
+## Operator alert checks (unreleased — trunk-dev)
+
+On trunk-dev, `autumn doctor` adds production-only **operator-alert** warnings
+(issue #1610). It warns when `[alerts]` configures no destination (no `email`
+and no `webhook_url`), when an `email` destination is paired with a disabled
+`[mail]` transport or an SMTP transport missing/invalid `[mail] from`, when
+`webhook_url` is set without a `webhook_secret` or is not an absolute `http(s)`
+URL, when `error_rate_threshold` is outside `(0, 1]`, and when `[alerts]
+enabled = false` despite a configured destination. If you register an
+`AlertChannel` in code via `AppBuilder::with_alert_channel`, declare
+`[alerts] custom_channel = true` so `--strict` passes without a `[alerts]`
+destination. See `docs/guide/operator-alerts.md`.
+
 ## Secrets redaction
 
 Before displaying any output, redact values that look like secrets:

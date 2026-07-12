@@ -1078,6 +1078,67 @@ app-code change) via `role = "web"|"worker"|"combined"` in config or the
   generated **docker-compose** output and sets the web-tier role on the `app`
   service (#1613). See `docs/guide/cloud-native.md`.
 
+### Per-queue worker pools, pinning & `ProcessRole` on `AppState` (unreleased — trunk-dev)
+
+Carve the per-process worker pool up per queue and dedicate a worker tier to a
+subset of queues — all config-only, no app-code change:
+
+- **Reserved / capped pools** — make a `[jobs.queues]` value a table:
+  `critical = { weight = 4, reserved = 2 }` keeps 2 slots that no other queue may
+  ever consume; `bulk = { weight = 1, concurrency = 4 }` caps a queue at 4 of the
+  process's `jobs.workers` slots. A bare integer is still just a weight. Total
+  capacity stays `jobs.workers`; the rules only redistribute it and are enforced
+  on every backend (local/Postgres/Redis).
+- **Worker pinning** — `jobs.pin = ["critical"]` (or `AUTUMN_JOBS__PIN=bulk,default`,
+  comma-separated) makes a `worker`-role process claim *only* those queues,
+  preserving weighted/strict order within the subset; empty/unset drains every
+  queue. A worker leaving a configured queue uncovered logs a startup `WARN`
+  (an `ERROR` if it would claim nothing); `autumn doctor --strict` reports
+  coverage informationally (`jobs_queue_coverage`) without failing (issue #1623).
+- **Per-queue actuator gauges** — `<actuator-prefix>/jobs` adds a `queues` key
+  with per-queue `depth` and `oldest_waiting_age_ms` alongside the existing
+  per-job-type gauges (per-process approximations on multi-process backends).
+- **`ProcessRole` on `AppState`** — `state.role()` returns the resolved
+  `ProcessRole` (exported at `autumn_web::ProcessRole`) with `serves_http()` /
+  `runs_workers()` predicates, so app-owned background loops in `on_startup`
+  self-gate to the right tier instead of re-reading `AUTUMN_ROLE` (issue #1726).
+  See `docs/guide/jobs.md`.
+
+## Operator alerts (unreleased — trunk-dev, issue #1610)
+
+Connect Autumn's built-in failure signals to email + a signed webhook with **no
+app code** — configure a destination under `[alerts]` and every built-in
+condition is delivered, deduplicated, with a recovery notice when it clears:
+
+```toml
+[alerts]
+email = "oncall@example.com"        # AUTUMN_ALERTS__EMAIL
+webhook_url = "https://alerts.example.com/hooks/autumn"
+webhook_secret = "…"                # REQUIRED with webhook_url; alerts are always
+                                    # signed (prefer AUTUMN_ALERTS__WEBHOOK_SECRET)
+```
+
+Built-in conditions — each carries a stable `dedup_key`, a `severity`
+(`critical` on trigger, `recovery` on resolve), the host/replica, and a "where
+to look" actuator pointer:
+
+- **Dead-lettered job** — a job exhausts its retries (deduped per job type).
+- **Health indicator down** — an indicator stays non-healthy past
+  `health_grace_secs` (default 60).
+- **High 5xx rate** — the rolling 5xx rate crosses `error_rate_threshold`
+  (default `0.05`, a fraction in `(0, 1]`) over ≥ `error_rate_min_requests`.
+- **Scheduled-task failure** — a `#[scheduled]`/framework task returns an error.
+
+Delivery is best-effort and off the request path (background tick every
+`eval_interval_secs`, default 30), reuses your existing mailer + outbound-webhook
+machinery, and the webhook is signed exactly like other Autumn webhooks
+(`Autumn-Signature: t=…,v1=<hmac-sha256>`). `enabled = false` is the master off
+switch (also silences custom channels). Add your own transport (PagerDuty,
+Slack, …) by implementing `AlertChannel` and registering it with
+`AppBuilder::with_alert_channel`. `autumn doctor` warns (in production) on a
+missing or unusable destination — see the `doctor` skill. See
+`docs/guide/operator-alerts.md`.
+
 ## Observability defaults
 
 Published 0.5.0 behavior:

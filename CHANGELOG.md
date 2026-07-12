@@ -1124,6 +1124,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `.create_many`. `autumn seed --count N --model <Name>` (used together)
   generates and inserts N faked rows via the model's factory instead of running
   the hand-written seed body (issue #1343).
+- **alerts:** operator alerts on critical production failures — email and
+  signed-webhook notifications delivered through your existing mailer and
+  outbound-webhook machinery with no application code. Configure a destination
+  under `[alerts]` (`email` / `webhook_url` + `webhook_secret`) and every
+  built-in condition fires, deduplicated with a recovery notice when it clears:
+  a dead-lettered job, a health indicator down past `health_grace_secs`, the
+  rolling 5xx rate crossing `error_rate_threshold`, or a framework-scheduled
+  task failing. Each alert carries a stable `dedup_key`, a `critical`/`recovery`
+  severity, the host/replica, and a "where to look" actuator pointer; webhooks
+  are always signed (`webhook_secret` required). Custom transports plug in via
+  `AlertChannel` + `AppBuilder::with_alert_channel`, and `autumn doctor` warns
+  (in production) on a missing or unusable destination (issue #1610).
+- **macros:** `#[validate(...)]` rules declared on an `UpdateModel` are now
+  enforced on `PUT`/`PATCH` updates, not only on create, so a partial update
+  rejects invalid input the same way a create does (issue #1719).
+- **jobs:** per-queue reserved/concurrency worker pools — a `[jobs.queues]`
+  value can be a table with `reserved = N` (dedicated slots no other queue may
+  consume) and `concurrency = N` (a hard cap on a queue's share of
+  `jobs.workers`), plus `jobs.pin` (or `AUTUMN_JOBS__PIN`) to pin a
+  `worker`-role process to a subset of queues, and per-queue actuator gauges (a
+  `queues` key with `depth` / `oldest_waiting_age_ms`) on
+  `<actuator-prefix>/jobs` (issue #1623). The resolved `ProcessRole` is exposed
+  on `AppState` via `state.role()` (`serves_http()` / `runs_workers()`), so
+  app-owned background loops can self-gate to the right tier (issue #1726).
+- **cli:** authenticated account-management flows scaffolded by
+  `autumn generate auth` — change-password (`/account/password`) and
+  change-email (`/account/email`), both `#[secured]` and behind a fresh
+  `#[step_up]` claim, verifying the current password and re-rendering at **422**
+  on bad input, with the current device kept signed in (issue #1396) — plus
+  `--magic-link` passwordless email login, which adds a `magic_link_token`
+  model + `magic_link_tokens` table and single-use, expiring login-link routes
+  (issue #1328).
+- **scaffold:** richer `autumn generate scaffold` output — a `belongs_to`
+  foreign key (`post:references`) renders as a populated `<select>` dropdown
+  labeled by the parent's display column (overridable with `{label:col}`), with
+  index/show views showing the parent's display value instead of the raw `*_id`
+  (issue #1146); a trailing `{…}` block on a field declares a constraint once
+  and emits **both** a server-side `#[validate(...)]` rule and the matching
+  HTML5 input attribute — `{min=N,max=N}`, `{email}`, `{url}` (issue #1388); and
+  when a `src/bin/seed.rs` exists the generator idempotently links the
+  `schema`/`models` modules into it so `autumn seed --count/--model` resolves
+  the model's factory (issue #1718).
+- **http:** SSRF hardening for the outbound HTTP client, all opt-in — the
+  default path (shared client, reqwest auto-follow) is unchanged.
+  `RequestBuilder::no_redirect()` returns a 3xx verbatim and
+  `follow_redirects(max, validator)` follows a bounded number of hops, resolving
+  each `Location` to an absolute URL and calling the validator before following
+  (rejecting with `RedirectRejected` / `TooManyRedirects`) (issue #1238);
+  `RequestBuilder::pin_to(addr)` pins the connection to a validated socket
+  address (skipping DNS while preserving Host/SNI) to close DNS-rebinding/TOCTOU
+  gaps (issue #1239). `Client::get_ssrf_safe(url)` composes the safe path —
+  resolve once, validate every resolved IP against the built-in SSRF deny-list
+  (public `is_blocked_ip` / `is_public_ip` helpers, IPv4-mapped/compat and
+  NAT64/6to4-tunnelled forms unwrapped and re-checked), pin to a validated
+  address, then follow redirects with per-hop resolve→validate→pin and an
+  https→http downgrade guard. New `ClientError` variants `SsrfBlocked`,
+  `TooManyRedirects`, `RedirectRejected`, `InvalidUrl` (issues #1238, #1239).
 
 ### Fixed
 
@@ -1216,6 +1273,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   layout, and honors `SOURCE_DATE_EPOCH` for a deterministic build timestamp on
   reproducible builds. Non-git builds still degrade gracefully (fields `null`,
   build never fails).
+- **macros:** `has_many(dependent = …)` now emits a directed compile error for
+  unsupported values instead of a confusing generic parse failure (issue #1702);
+  `across_tenants()` rejects a query with no shard set instead of silently
+  running it unsharded (issue #1692).
+- **scaffold:** scaffolded views now render through the shared application
+  layout instead of a bare standalone page, and flash rendering was migrated to
+  the shared flash helper (issues #1130, #1240).
 
 ### Changed
 

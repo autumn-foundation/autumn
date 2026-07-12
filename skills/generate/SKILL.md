@@ -32,7 +32,7 @@ them; on 0.5.0 fall back to the documented manual alternative.
 | `migration` | `migration add_slug_to_posts` | Empty timestamped migration file |
 | `mailer` | `mailer User` | Mailer struct + email templates (generator appends `Mailer` → produces `UserMailer`) |
 | `task` | `task RecalculateCounts` | `#[task]` operational command |
-| `auth` | `auth User --oauth github,google` | Full auth scaffold (login/register/password reset/OAuth); **(trunk-dev)** also scaffolds a configurable password policy and persistent "remember me" login by default |
+| `auth` | `auth User --oauth github,google` | Full auth scaffold (login/register/password reset/OAuth); **(trunk-dev)** also scaffolds a configurable password policy and persistent "remember me" login by default, authenticated change-password/change-email flows, and `--magic-link` passwordless login |
 | `admin` | `admin Post title:String body:Text` | Admin plugin resource page — fields must be supplied explicitly; generator does not read the model |
 | `system-test` | `system-test checkout_flow` | System test fixture (name must be `snake_case` or `PascalCase` — no hyphens) |
 | `pwa` | `pwa` | PWA scaffolding — manifest, service worker, offline shell, icons, route handlers, smoke test |
@@ -111,6 +111,30 @@ disables CSRF, so the same-origin form `POST`s carry no `_csrf` token (the real
 `form_for`-rendered forms inject one for the browser; the in-process harness
 does not require it). Emitted for HTML scaffolds only — `--api` scaffolds get
 the JSON read test but no write-path suite.
+
+**Scaffold `{…}` validation, belongs_to dropdowns & seed linking (trunk-dev)**:
+three additive scaffold behaviors (issues #1388, #1146, #1718):
+
+- **Inline `{…}` validation + HTML5 constraints** — a trailing `{…}` block on a
+  field declares a constraint once and enforces it on both sides: the model
+  field gets a `#[validate(...)]` rule and the form input gets the matching HTML5
+  attribute. `title:String{min=3,max=120}` → `length(min,max)` +
+  `minlength`/`maxlength`; numeric `{min,max}` → `range` + `min`/`max`;
+  `{email}` → `email` + `type="email"`; `{url}` → `url` + `type="url"`. A bad
+  submission is a 422 with inline per-field errors; a misspelled modifier (e.g.
+  `{maxx=5}`) fails the scaffold naming the token. Quote the whole token in
+  bash/zsh so the shell doesn't brace-expand the comma.
+- **belongs_to dropdowns** — when a `post:references` parent model exists, the
+  new/edit form renders the FK as a populated `<select>` (one `<option>` per
+  parent row) and index/show render the parent's display value instead of the
+  raw `*_id`. The display column is `name`/`title` → first string column → id;
+  override with `'post:references{label:slug}'`. A nullable `post:references?`
+  gets a blank "— Unset —" first option.
+- **Seed-binary model linking** — when a `src/bin/seed.rs` exists, the generator
+  idempotently splices `#[path = "../schema.rs"] mod schema;` +
+  `#[path = "../models/mod.rs"] mod models;` into it so `autumn seed
+  --count/--model` resolves the model's factory; `autumn destroy` removes those
+  links again. See `docs/guide/generators.md`.
 
 ## Execution flow
 
@@ -303,6 +327,15 @@ Next steps:
 2. Run: autumn migrate   (applies the sessions + remember-token migrations)
 3. --oauth / --totp / --passkeys still apply; there is no --remember or
    --password-policy flag — both are on by default (#1345, #1397).
+4. Authenticated account flows are scaffolded too (issue #1396): a
+   change-password form at `GET`/`POST /account/password` (verifies the current
+   password, applies the password policy, keeps the current device signed in)
+   and a change-email flow at `GET`/`POST /account/email` — both `#[secured]`
+   and behind a fresh `#[step_up]` claim, re-rendering at 422 on bad input.
+5. Pass `--magic-link` for passwordless email login (issue #1328): the
+   generator adds a `magic_link_token` model + `magic_link_tokens` table and the
+   single-use, expiring login-link routes (do not name the auth resource
+   `magic_link_token`).
 ```
 
 ## Flags
