@@ -7771,6 +7771,28 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tower::ServiceExt;
 
+    #[test]
+    fn is_dump_jobs_mode_only_true_for_exactly_one() {
+        // `autumn jobs manifest` sets AUTUMN_DUMP_JOBS=1 to select the manifest
+        // dump path in `run()`. Any other value (or an unset var) must fall
+        // through to the normal boot path.
+        temp_env::with_var("AUTUMN_DUMP_JOBS", Some("1"), || {
+            assert!(is_dump_jobs_mode(), "`1` must select the jobs-dump path");
+        });
+        temp_env::with_var("AUTUMN_DUMP_JOBS", Some("0"), || {
+            assert!(!is_dump_jobs_mode(), "`0` must not select the dump path");
+        });
+        temp_env::with_var("AUTUMN_DUMP_JOBS", Some("true"), || {
+            assert!(
+                !is_dump_jobs_mode(),
+                "only the literal `1` enables the mode"
+            );
+        });
+        temp_env::with_var("AUTUMN_DUMP_JOBS", None::<&str>, || {
+            assert!(!is_dump_jobs_mode(), "unset must not select the dump path");
+        });
+    }
+
     #[cfg(feature = "db")]
     const APP_TEST_MIGRATIONS: crate::migrate::EmbeddedMigrations =
         diesel_migrations::embed_migrations!("test_migrations");
