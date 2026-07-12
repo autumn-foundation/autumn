@@ -425,7 +425,6 @@ pub fn plan_auth_with_providers(
 ///
 /// # Errors
 /// Same as [`plan_auth`].
-#[allow(clippy::too_many_lines)]
 pub fn plan_auth_with_providers_ex(
     project_root: &Path,
     name: &str,
@@ -433,6 +432,36 @@ pub fn plan_auth_with_providers_ex(
     providers: &[String],
     totp: bool,
     magic_link: bool,
+) -> Result<Plan, GenerateError> {
+    // Generation path: run the full plan, including the shared-layout preflight.
+    // `autumn destroy auth` recomputes the identical plan before reverting it,
+    // and must bypass that generate-only preflight (issue #1353 follow-up); it
+    // reaches the builder through `plan_auth_full_ex2_for_revert` instead.
+    plan_auth_with_providers_ex_impl(
+        project_root,
+        name,
+        timestamp,
+        providers,
+        totp,
+        magic_link,
+        false,
+    )
+}
+
+/// Shared implementation of [`plan_auth_with_providers_ex`]. `for_revert`
+/// suppresses the generate-only shared-layout preflight so `autumn destroy
+/// auth` (which recomputes this same plan before [`Plan::revert`]) can remove
+/// generated files even in a project whose shared `pub fn layout` is missing or
+/// renamed — a regression the preflight would otherwise introduce.
+#[allow(clippy::too_many_lines)]
+fn plan_auth_with_providers_ex_impl(
+    project_root: &Path,
+    name: &str,
+    timestamp: &str,
+    providers: &[String],
+    totp: bool,
+    magic_link: bool,
+    for_revert: bool,
 ) -> Result<Plan, GenerateError> {
     ensure_project_root(project_root)?;
     super::model::validate_resource_name(name)?;
@@ -479,26 +508,34 @@ pub fn plan_auth_with_providers_ex(
     // rather than emitting routes that call a nonexistent or mismatched
     // `crate::layout`. This mirrors the scaffold generator's preflight
     // (issue #1130) and reuses its lexically-aware detector.
-    let main_for_layout_check = project_root.join("src").join("main.rs");
-    let main_src = match std::fs::read_to_string(&main_for_layout_check) {
-        Ok(src) => src,
-        // `main.rs` genuinely absent: surface the actionable message below by
-        // treating it as an empty source (no `pub fn layout` present).
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-        // Any other io error (e.g. PermissionDenied) preserves its original
-        // `ErrorKind` + OS message rather than being masked.
-        Err(e) => return Err(GenerateError::Io(e)),
-    };
-    if !super::scaffold::has_shared_layout(&main_src) {
-        return Err(GenerateError::Config(
-            "`autumn generate auth` requires a shared `pub fn layout` in src/main.rs \
-             so the generated views can render through \
-             `crate::layout(title, current_path, flash, content)` (4 args). Run this inside \
-             an app created by `autumn new`, or add a shared \
-             `pub fn layout(title: &str, current_path: &str, flash: maud::Markup, content: maud::Markup) -> maud::Markup` \
-             to src/main.rs and re-run."
-                .to_owned(),
-        ));
+    //
+    // The preflight is a generate-time guard only. `autumn destroy auth`
+    // recomputes this same plan before reverting it, so running the preflight
+    // on that path would hard-fail cleanup in a project whose shared
+    // `pub fn layout` is missing or renamed — stranding the very files destroy
+    // is meant to remove. Skip it when `for_revert` is set.
+    if !for_revert {
+        let main_for_layout_check = project_root.join("src").join("main.rs");
+        let main_src = match std::fs::read_to_string(&main_for_layout_check) {
+            Ok(src) => src,
+            // `main.rs` genuinely absent: surface the actionable message below by
+            // treating it as an empty source (no `pub fn layout` present).
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            // Any other io error (e.g. PermissionDenied) preserves its original
+            // `ErrorKind` + OS message rather than being masked.
+            Err(e) => return Err(GenerateError::Io(e)),
+        };
+        if !super::scaffold::has_shared_layout(&main_src) {
+            return Err(GenerateError::Config(
+                "`autumn generate auth` requires a shared `pub fn layout` in src/main.rs \
+                 so the generated views can render through \
+                 `crate::layout(title, current_path, flash, content)` (4 args). Run this inside \
+                 an app created by `autumn new`, or add a shared \
+                 `pub fn layout(title: &str, current_path: &str, flash: maud::Markup, content: maud::Markup) -> maud::Markup` \
+                 to src/main.rs and re-run."
+                    .to_owned(),
+            ));
+        }
     }
 
     let mut plan = Plan::new(project_root);
@@ -939,7 +976,16 @@ pub fn plan_auth_with_options(
     timestamp: &str,
     oauth: &AuthOAuthOptions,
 ) -> Result<Plan, GenerateError> {
-    plan_auth_options_impl(project_root, name, timestamp, oauth, false, false, false)
+    plan_auth_options_impl(
+        project_root,
+        name,
+        timestamp,
+        oauth,
+        false,
+        false,
+        false,
+        false,
+    )
 }
 
 /// Compute the file actions for `autumn generate auth [--oauth …] [--totp]`.
@@ -957,7 +1003,16 @@ pub fn plan_auth_full(
     oauth: &AuthOAuthOptions,
     totp: bool,
 ) -> Result<Plan, GenerateError> {
-    plan_auth_options_impl(project_root, name, timestamp, oauth, totp, false, false)
+    plan_auth_options_impl(
+        project_root,
+        name,
+        timestamp,
+        oauth,
+        totp,
+        false,
+        false,
+        false,
+    )
 }
 
 /// Compute the file actions for `autumn generate auth [--oauth …] [--totp] [--passkeys]`.
@@ -974,7 +1029,16 @@ pub fn plan_auth_full_ex(
     totp: bool,
     passkeys: bool,
 ) -> Result<Plan, GenerateError> {
-    plan_auth_options_impl(project_root, name, timestamp, oauth, totp, passkeys, false)
+    plan_auth_options_impl(
+        project_root,
+        name,
+        timestamp,
+        oauth,
+        totp,
+        passkeys,
+        false,
+        false,
+    )
 }
 
 /// Compute the file actions for
@@ -1003,14 +1067,22 @@ pub fn plan_auth_full_ex2(
         totp,
         passkeys,
         magic_link,
+        false,
     )
 }
 
-/// Shared implementation: base (optionally TOTP-aware, optionally passkey-aware,
-/// optionally magic-link-aware) scaffold plus, when providers are supplied, the
-/// OAuth artifacts.
-#[allow(clippy::too_many_lines)]
-fn plan_auth_options_impl(
+/// Compute the file actions for `autumn destroy auth …`.
+///
+/// Identical to [`plan_auth_full_ex2`] except it recomputes the plan for the
+/// revert path: it skips the generate-only shared-layout preflight so cleanup
+/// still succeeds in a project whose shared `pub fn layout` is missing or
+/// renamed (e.g. one scaffolded by an older CLI). `autumn destroy auth` reverts
+/// the returned plan; the preflight would otherwise hard-fail the destroy
+/// before any generated file is removed (issue #1353 follow-up).
+///
+/// # Errors
+/// Same as [`plan_auth_full_ex2`], minus the shared-layout preflight.
+pub fn plan_auth_full_ex2_for_revert(
     project_root: &Path,
     name: &str,
     timestamp: &str,
@@ -1019,15 +1091,51 @@ fn plan_auth_options_impl(
     passkeys: bool,
     magic_link: bool,
 ) -> Result<Plan, GenerateError> {
+    plan_auth_options_impl(
+        project_root,
+        name,
+        timestamp,
+        oauth,
+        totp,
+        passkeys,
+        magic_link,
+        true,
+    )
+}
+
+/// Shared implementation: base (optionally TOTP-aware, optionally passkey-aware,
+/// optionally magic-link-aware) scaffold plus, when providers are supplied, the
+/// OAuth artifacts.
+// The three feature flags (`totp`/`passkeys`/`magic_link`) already saturate the
+// bool/arg budget; the fourth (`for_revert`) is an internal generate-vs-destroy
+// toggle threaded only from this crate's two public wrappers, so keep the flat
+// signature rather than wrap it in a one-off options struct.
+#[allow(
+    clippy::too_many_lines,
+    clippy::too_many_arguments,
+    clippy::fn_params_excessive_bools
+)]
+fn plan_auth_options_impl(
+    project_root: &Path,
+    name: &str,
+    timestamp: &str,
+    oauth: &AuthOAuthOptions,
+    totp: bool,
+    passkeys: bool,
+    magic_link: bool,
+    for_revert: bool,
+) -> Result<Plan, GenerateError> {
     // Start with the base auth plan with providers (and optional TOTP, and
-    // optional magic-link) applied.
-    let mut plan = plan_auth_with_providers_ex(
+    // optional magic-link) applied. `for_revert` threads through to suppress the
+    // generate-only shared-layout preflight on the `autumn destroy auth` path.
+    let mut plan = plan_auth_with_providers_ex_impl(
         project_root,
         name,
         timestamp,
         &oauth.providers,
         totp,
         magic_link,
+        for_revert,
     )?;
 
     let pascal_name = pascal(name);
@@ -12565,6 +12673,51 @@ mod tests {
             }
             other => panic!("expected an actionable Config error, got: {other:?}"),
         }
+    }
+
+    /// Issue #1353 follow-up: `autumn destroy auth` recomputes the identical
+    /// plan before reverting it. The shared-layout preflight is a generate-time
+    /// guard only — it must NOT fire on the destroy/revert path, or cleanup
+    /// would hard-fail in a project whose shared `pub fn layout` is missing or
+    /// renamed (e.g. one scaffolded by an older CLI), stranding the generated
+    /// files. The revert-only plan builder must therefore succeed even when
+    /// `src/main.rs` exposes no shared 4-arg layout.
+    #[test]
+    fn plan_auth_for_revert_succeeds_without_shared_layout() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("Cargo.toml"), "[package]\nname=\"x\"\n").unwrap();
+        fs::create_dir_all(tmp.path().join("src")).unwrap();
+        // A project with NO shared `pub fn layout` — the exact input the
+        // generate-time preflight rejects.
+        fs::write(tmp.path().join("src/main.rs"), main_without_layout()).unwrap();
+        let oauth = AuthOAuthOptions {
+            providers: Vec::new(),
+        };
+        // The revert builder must not consult the shared layout at all.
+        let plan = plan_auth_full_ex2_for_revert(
+            tmp.path(),
+            "User",
+            "20260508000000",
+            &oauth,
+            false,
+            false,
+            false,
+        )
+        .expect("destroy auth must build its revert plan without a shared layout");
+        // Sanity: it produced the auth routes file a normal auth plan would, so
+        // `Plan::revert` has something to remove.
+        assert!(
+            find_plan_content_for_path(&plan, &tmp.path().join("src/routes/auth.rs")).is_some(),
+            "revert plan should still include the auth routes it will remove"
+        );
+
+        // And the generate path over the SAME project still fails fast — the
+        // guard is bypassed only for revert, never weakened for generation.
+        let err = plan_auth(tmp.path(), "User", "20260508000000").unwrap_err();
+        assert!(
+            matches!(err, GenerateError::Config(ref msg) if msg.contains("pub fn layout")),
+            "generate path must still reject a missing shared layout: {err:?}"
+        );
     }
 
     #[test]
