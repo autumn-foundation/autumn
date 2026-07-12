@@ -419,6 +419,24 @@ pub fn story(input: TokenStream) -> TokenStream {
 /// repo.remove_tag(post_id, tag_id).await?;   // idempotent: no-op if unlinked
 /// repo.set_tags(post_id, &tag_ids).await?;   // replace-all, one transaction
 /// ```
+///
+/// The `add_`/`remove_` singular is derived from the target *type* name, so a
+/// model may declare at most one m2m association per target type by default —
+/// a second one to the same target would generate colliding helpers (a compile
+/// error). To declare two m2m associations to the same target (e.g. a
+/// self-referential `followers`/`following` pair through one `Friendship` join
+/// table), give each a distinct explicit `helper = "..."` override, which sets
+/// the singular used for its `add_`/`remove_` helpers:
+///
+/// ```ignore
+/// #[model]
+/// #[has_many(User, through = friendships, name = followers,
+///            fk = followed_id, target_fk = follower_id, helper = "follower")]
+/// #[has_many(User, through = friendships, name = following,
+///            fk = follower_id, target_fk = followed_id, helper = "following")]
+/// pub struct User { /* ... */ }
+/// // -> add_follower/remove_follower and add_following/remove_following
+/// ```
 #[proc_macro_attribute]
 pub fn model(attr: TokenStream, item: TokenStream) -> TokenStream {
     model::model_macro(attr.into(), item.into()).into()

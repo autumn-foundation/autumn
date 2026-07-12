@@ -116,6 +116,14 @@ struct Association {
     /// `delete_by_id` cascades this association without a repository-attribute
     /// `dependent(…)`.
     dependent: Option<DependentAction>,
+    /// Explicit override for the singular used to derive the many-to-many
+    /// `add_`/`remove_` mutation helper names (`helper = "follower"` →
+    /// `add_follower`/`remove_follower`). When absent, the singular is derived
+    /// from the target type name. Distinct overrides let a model declare two
+    /// m2m associations to the *same* target type (e.g. `followers` and
+    /// `following`, both through `Friendship` to `User`) without their
+    /// target-derived helpers colliding.
+    helper: Option<String>,
 }
 
 /// The join-table half of a many-to-many `has_many(..., through = ...)`
@@ -204,6 +212,10 @@ fn parse_dependent_action(
     })
 }
 
+// Accumulates per-feature parsing/validation for each association key (`fk`,
+// `name`, `through`, `target_fk`, `dependent`/`on_delete`, `helper`), so it
+// grows past the line lint as association options are added.
+#[allow(clippy::too_many_lines)]
 fn parse_assoc_attr(
     attr: &syn::Attribute,
     kind: AssocKind,
@@ -211,55 +223,66 @@ fn parse_assoc_attr(
 ) -> syn::Result<Association> {
     use syn::parse::ParseStream;
 
-    let (target, explicit_fk, explicit_name, explicit_through, explicit_target_fk, dependent) =
-        attr.parse_args_with(|input: ParseStream| {
-            let target: syn::Ident = input.parse()?;
-            let mut explicit_fk: Option<String> = None;
-            let mut explicit_name: Option<String> = None;
-            let mut explicit_through: Option<String> = None;
-            let mut explicit_target_fk: Option<String> = None;
-            let mut dependent: Option<DependentAction> = None;
-            // Zero or more trailing `, key = value` pairs (`fk`, `name`,
-            // `through`, `target_fk`), any order.
-            while input.peek(syn::Token![,]) {
-                input.parse::<syn::Token![,]>()?;
-                let key: syn::Ident = input.parse()?;
-                input.parse::<syn::Token![=]>()?;
-                // Accept either a bare identifier (`fk = author_id`) or a string
-                // literal (`fk = "author_id"`).
-                let value = if input.peek(LitStr) {
-                    input.parse::<LitStr>()?.value()
-                } else {
-                    input.parse::<syn::Ident>()?.to_string()
-                };
-                if key == "fk" {
-                    explicit_fk = Some(value);
-                } else if key == "name" {
-                    explicit_name = Some(value);
-                } else if key == "through" {
-                    explicit_through = Some(value);
-                } else if key == "target_fk" {
-                    explicit_target_fk = Some(value);
-                } else if key == "dependent" || key == "on_delete" {
-                    dependent = Some(parse_dependent_action(kind, &key, &value)?);
-                } else {
-                    return Err(syn::Error::new_spanned(
-                        &key,
-                        "expected `fk = <column>`, `name = <accessor>`, \
-                         `through = <join_table>`, or `target_fk = <column>` \
-                         in association attribute",
-                    ));
-                }
+    let (
+        target,
+        explicit_fk,
+        explicit_name,
+        explicit_through,
+        explicit_target_fk,
+        dependent,
+        explicit_helper,
+    ) = attr.parse_args_with(|input: ParseStream| {
+        let target: syn::Ident = input.parse()?;
+        let mut explicit_fk: Option<String> = None;
+        let mut explicit_name: Option<String> = None;
+        let mut explicit_through: Option<String> = None;
+        let mut explicit_target_fk: Option<String> = None;
+        let mut dependent: Option<DependentAction> = None;
+        let mut explicit_helper: Option<String> = None;
+        // Zero or more trailing `, key = value` pairs (`fk`, `name`,
+        // `through`, `target_fk`, `helper`), any order.
+        while input.peek(syn::Token![,]) {
+            input.parse::<syn::Token![,]>()?;
+            let key: syn::Ident = input.parse()?;
+            input.parse::<syn::Token![=]>()?;
+            // Accept either a bare identifier (`fk = author_id`) or a string
+            // literal (`fk = "author_id"`).
+            let value = if input.peek(LitStr) {
+                input.parse::<LitStr>()?.value()
+            } else {
+                input.parse::<syn::Ident>()?.to_string()
+            };
+            if key == "fk" {
+                explicit_fk = Some(value);
+            } else if key == "name" {
+                explicit_name = Some(value);
+            } else if key == "through" {
+                explicit_through = Some(value);
+            } else if key == "target_fk" {
+                explicit_target_fk = Some(value);
+            } else if key == "helper" {
+                explicit_helper = Some(value);
+            } else if key == "dependent" || key == "on_delete" {
+                dependent = Some(parse_dependent_action(kind, &key, &value)?);
+            } else {
+                return Err(syn::Error::new_spanned(
+                    &key,
+                    "expected `fk = <column>`, `name = <accessor>`, \
+                         `through = <join_table>`, `target_fk = <column>`, or \
+                         `helper = <singular>` in association attribute",
+                ));
             }
-            Ok((
-                target,
-                explicit_fk,
-                explicit_name,
-                explicit_through,
-                explicit_target_fk,
-                dependent,
-            ))
-        })?;
+        }
+        Ok((
+            target,
+            explicit_fk,
+            explicit_name,
+            explicit_through,
+            explicit_target_fk,
+            dependent,
+            explicit_helper,
+        ))
+    })?;
 
     if explicit_through.is_some() && kind != AssocKind::HasMany {
         return Err(syn::Error::new_spanned(
@@ -293,6 +316,15 @@ fn parse_assoc_attr(
              table directly",
         ));
     }
+    if explicit_helper.is_some() && explicit_through.is_none() {
+        return Err(syn::Error::new_spanned(
+            &target,
+            "`helper = <singular>` overrides the many-to-many `add_`/`remove_` \
+             mutation-helper names and therefore requires `through = \
+             <join_table>` (it has no effect on plain `belongs_to`/`has_one`/\
+             non-`through` `has_many` associations)",
+        ));
+    }
 
     let (fk, derived_name) =
         resolve_fk_and_name(kind, model_ident, &target, explicit_fk.as_deref());
@@ -311,6 +343,7 @@ fn parse_assoc_attr(
         name,
         through,
         dependent,
+        helper: explicit_helper,
     })
 }
 
@@ -352,6 +385,24 @@ fn m2m_mutation_singular(target: &syn::Ident) -> String {
     pascal_to_snake(&target.to_string())
 }
 
+/// The *resolved* singular for an association's `add_`/`remove_` mutation
+/// helpers: the explicit per-association `helper = "..."` override when present,
+/// otherwise the target-type-derived singular.
+///
+/// The override is the escape hatch (#1785) that lets a model declare more than
+/// one many-to-many association to the *same* target type — e.g. `followers`
+/// and `following`, both `#[has_many(User, through = Friendship, ...)]` — by
+/// giving each a distinct `helper` (`add_follower` vs. `add_following`) instead
+/// of the colliding target-derived `add_user`. It is opt-in and explicit: no
+/// inference/inverse-inflection (deliberately avoided as the fragile class of
+/// bug #1779 fixed).
+fn resolved_m2m_singular(assoc: &Association) -> String {
+    assoc
+        .helper
+        .clone()
+        .unwrap_or_else(|| m2m_mutation_singular(&assoc.target))
+}
+
 /// Reject a model whose many-to-many associations would generate colliding
 /// `add_*`/`remove_*`/`set_*` mutation helper names (e.g. two `through =`
 /// associations that both derive `add_tag`), rather than emitting a trait
@@ -362,19 +413,20 @@ fn check_m2m_mutation_name_collisions(assocs: &[Association]) -> syn::Result<()>
         if assoc.through.is_none() {
             continue;
         }
-        let singular = m2m_mutation_singular(&assoc.target);
+        let singular = resolved_m2m_singular(assoc);
         if seen.insert(singular.clone(), &assoc.target).is_some() {
             return Err(syn::Error::new_spanned(
                 &assoc.target,
                 format!(
                     "many-to-many association `{}` (target `{}`) resolves to the \
-                     same target-derived mutation helpers `add_{singular}`/\
-                     `remove_{singular}` as another `through =` association to \
-                     `{}` on this model; a model may currently declare at most \
-                     one many-to-many association per target type. The intended \
-                     fix is an explicit per-association helper-name override \
-                     (planned `helper = \"...\"`) so distinct m2m relations to \
-                     the same target get non-colliding helpers — tracked in \
+                     same mutation helpers `add_{singular}`/`remove_{singular}` \
+                     as another `through =` association on this model. Two m2m \
+                     associations to the same target type would otherwise \
+                     generate colliding helpers. Give at least one an explicit \
+                     per-association override, e.g. `#[has_many({}, through = \
+                     ..., helper = \"...\")]`, so each gets a distinct \
+                     `add_`/`remove_` name (the followers/following-through-a-\
+                     join pattern) — see \
                      https://github.com/madmax983/autumn/issues/1785",
                     assoc.name, assoc.target, assoc.target,
                 ),
@@ -892,7 +944,7 @@ fn emit_association_items(
                     // traits are both in scope.
                     let mutation_trait_ident =
                         format_ident!("{model_ident}{}Mutations", pascal_case(&assoc.name));
-                    let singular = m2m_mutation_singular(target);
+                    let singular = resolved_m2m_singular(assoc);
                     let add_ident = format_ident!("add_{singular}");
                     let remove_ident = format_ident!("remove_{singular}");
                     let set_ident = format_ident!("set_{}", assoc.name);
@@ -5339,6 +5391,109 @@ mod tests {
             syn::parse_quote!(#[has_many(Tag, through = featured_post_tags, name = featured_tags)]),
         ];
         assert!(resolve_associations(&model, &attrs).is_err());
+    }
+
+    #[test]
+    fn m2m_helper_override_re_enables_two_relations_to_same_target() {
+        // #1785 escape hatch: two m2m associations to the *same* target type
+        // (`User`, both through `friendships`) compile when each carries a
+        // distinct `helper = "..."` override, because the collision check keys
+        // on the *resolved* singular (the override) instead of the
+        // target-derived one.
+        let model: syn::Ident = syn::parse_quote!(User);
+        let attrs: Vec<syn::Attribute> = vec![
+            syn::parse_quote!(
+                #[has_many(User, through = friendships, name = followers,
+                           fk = followed_id, target_fk = follower_id,
+                           helper = follower)]
+            ),
+            syn::parse_quote!(
+                #[has_many(User, through = friendships, name = following,
+                           fk = follower_id, target_fk = followed_id,
+                           helper = following)]
+            ),
+        ];
+        assert!(
+            resolve_associations(&model, &attrs).is_ok(),
+            "distinct `helper = ...` overrides must re-enable dual m2m to one target"
+        );
+    }
+
+    #[test]
+    fn m2m_helper_override_matching_derived_still_collides() {
+        // A `helper` override that resolves to the same singular as another
+        // association's target-derived singular still collides — the check
+        // keys on the resolved name, override or not.
+        let model: syn::Ident = syn::parse_quote!(Post);
+        let attrs: Vec<syn::Attribute> = vec![
+            syn::parse_quote!(#[has_many(Tag, through = post_tags)]),
+            syn::parse_quote!(
+                #[has_many(Label, through = post_labels, name = labels, helper = tag)]
+            ),
+        ];
+        assert!(
+            resolve_associations(&model, &attrs).is_err(),
+            "an override colliding with a derived singular must still be rejected"
+        );
+    }
+
+    #[test]
+    fn m2m_helper_override_requires_through() {
+        // `helper = ...` only affects m2m mutation helpers, so it is rejected
+        // on a non-`through` association rather than silently ignored.
+        let model: syn::Ident = syn::parse_quote!(Post);
+        let attrs: Vec<syn::Attribute> =
+            vec![syn::parse_quote!(#[has_many(Comment, helper = commentary)])];
+        assert!(resolve_associations(&model, &attrs).is_err());
+    }
+
+    #[test]
+    fn model_macro_m2m_helper_override_generates_distinct_helpers() {
+        // End-to-end #1785: the followers/following-through-`Friendship`
+        // pattern generates distinct `add_follower`/`add_following` (and
+        // `remove_`) helpers keyed on the `helper = ...` override, not the
+        // colliding target-derived `add_user`.
+        let generated = model_macro(
+            quote! {},
+            quote! {
+                #[has_many(User, through = friendships, name = followers,
+                           fk = followed_id, target_fk = follower_id,
+                           helper = follower)]
+                #[has_many(User, through = friendships, name = following,
+                           fk = follower_id, target_fk = followed_id,
+                           helper = following)]
+                pub struct User {
+                    #[id]
+                    pub id: i64,
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("add_follower"),
+            "expected add_follower helper, got: {generated}"
+        );
+        assert!(
+            generated.contains("remove_follower"),
+            "expected remove_follower helper"
+        );
+        assert!(
+            generated.contains("add_following"),
+            "expected add_following helper"
+        );
+        assert!(
+            generated.contains("remove_following"),
+            "expected remove_following helper"
+        );
+        assert!(
+            !generated.contains("add_user"),
+            "must not fall back to the colliding target-derived add_user"
+        );
+        assert!(
+            generated.contains("set_followers") && generated.contains("set_following"),
+            "the set_ (replace-all) helpers keep their per-association accessor names"
+        );
     }
 
     #[test]

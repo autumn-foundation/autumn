@@ -24,6 +24,11 @@ fn compile_fail_tests() {
     #[cfg(feature = "db")]
     t.compile_fail("tests/compile-fail/model_shard_key_unknown.rs");
 
+    // Two m2m associations to the same target type with no `helper = "..."`
+    // override collide on their target-derived mutation helpers (#1785).
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/model_m2m_helper_collision.rs");
+
     // Repository hooks failures (require db feature)
     #[cfg(feature = "db")]
     compile_repository_hooks_not_default(&t);
@@ -72,6 +77,11 @@ fn compile_pass_tests() {
     // Model field enum (requires db feature)
     #[cfg(feature = "db")]
     t.pass("tests/compile-pass/model_field_enum.rs");
+
+    // Two m2m associations to the same target type disambiguated by distinct
+    // `helper = "..."` overrides — the followers/following pattern (#1785).
+    #[cfg(feature = "db")]
+    t.pass("tests/compile-pass/model_m2m_helper_override.rs");
 
     // Model draft accessors (requires db feature)
     #[cfg(feature = "db")]

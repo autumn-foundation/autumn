@@ -1,0 +1,5 @@
+error: many-to-many association `following` (target `User`) resolves to the same mutation helpers `add_user`/`remove_user` as another `through =` association on this model. Two m2m associations to the same target type would otherwise generate colliding helpers. Give at least one an explicit per-association override, e.g. `#[has_many(User, through = ..., helper = "...")]`, so each gets a distinct `add_`/`remove_` name (the followers/following-through-a-join pattern) — see https://github.com/madmax983/autumn/issues/1785
+  --> tests/compile-fail/model_m2m_helper_collision.rs:17:12
+   |
+17 | #[has_many(User, through = friendships, name = following,
+   |            ^^^^
