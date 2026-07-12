@@ -1796,13 +1796,28 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         // mutating pass below.
                         for __row in &__ids {
                             let __cid = __row.id;
-                            // Skip a row already removed elsewhere (its restrict
-                            // grandchildren, if any, were probed on that path). The
-                            // probe body may be empty (no restrict grandchildren), so
-                            // this is written as a positive guard rather than an early
+                            // #1800 (Codex "Re-probe restricts on hard revisits"):
+                            // skip a row already PHYSICALLY removed elsewhere (its
+                            // restrict grandchildren, if any, were probed on that
+                            // path). This consults `__physical`, NOT the "all handled"
+                            // `__deleted`, to stay consistent with the Phase-2 diamond
+                            // revisit-skip below: a row merely SOFT-deleted on an
+                            // earlier path is still in `__deleted` but NOT in
+                            // `__physical`, so a later HARD-delete revisit (mixed
+                            // soft/hard diamond) still re-runs this restrict pre-scan.
+                            // If the pre-scan keyed on `__deleted` it would skip the
+                            // probe while Phase-2 (keyed on `__physical`) still hard-
+                            // deletes the row — firing the child hook and falling
+                            // through to a raw FK failure instead of the typed 409
+                            // when the row has a soft-deleted restrict dependent. The
+                            // hard-path probe drops the live filter (`__parent_soft`
+                            // is false on that path), so it INCLUDES the soft-deleted
+                            // dependent and returns the 409 before any hook. The probe
+                            // body may be empty (no restrict grandchildren), so this is
+                            // written as a positive guard rather than an early
                             // `continue` (which clippy flags as redundant when it is
                             // the loop's last statement).
-                            if !__deleted.contains(&(#table_name, __cid)) {
+                            if !__physical.contains(&(#table_name, __cid)) {
                                 #grandchild_restrict_cascade
                             }
                         }
@@ -16730,6 +16745,56 @@ mod tests {
         assert!(
             destroy_arm.contains("if __physical . contains"),
             "#1800: the leaf diamond revisit-skip must consult the physical set: {destroy_arm}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_grandchild_restrict_prescan_skip_uses_physical_not_handled_set() {
+        // #1800 (Codex "Re-probe restricts on hard revisits"): the grandchild
+        // `restrict` PRE-SCAN skip must consult the PHYSICAL-delete set, NOT the
+        // "all handled" `__deleted` set. In a mixed soft/hard diamond a row that was
+        // soft-deleted on an earlier (soft-parent) path sits in `__deleted` but not
+        // in `__physical`. The Phase-2 mutating loop keys its revisit-skip on
+        // `__physical`, so it still hard-deletes that row on a later hard-delete
+        // path; the pre-scan MUST therefore also key on `__physical` so it re-runs
+        // the restrict probe on that hard revisit. If it kept keying on `__deleted`
+        // the probe would be skipped while the hard delete proceeds — firing the
+        // child hook and falling through to a raw FK failure instead of the typed
+        // 409 when the row has a soft-deleted restrict dependent.
+        let generated = repository_macro(
+            quote! { Comment, soft_delete, dependent(PgReplyRepository, fk = "comment_id", on_delete = restrict) },
+            quote! { pub trait CommentRepository {} },
+        )
+        .to_string();
+        let destroy_arm = dependent_destroy_arm(&generated);
+        // Isolate the read-only restrict PRE-SCAN region: it iterates the ids by
+        // reference (`for __row in & __ids`) and ends where the Phase-2 mutating
+        // loop iterates them by value (`for __row in __ids`).
+        let prescan_start = destroy_arm
+            .find("for __row in & __ids")
+            .expect("#1800: restrict pre-scan loop (by-ref) present");
+        let after = &destroy_arm[prescan_start..];
+        let prescan_end = after
+            .find("for __row in __ids")
+            .expect("#1800: Phase-2 mutating loop (by-value) present");
+        let prescan = &after[..prescan_end];
+        // The pre-scan skip guard consults the physical set...
+        assert!(
+            prescan.contains("if ! __physical . contains"),
+            "#1800: the grandchild restrict pre-scan skip must consult __physical: {prescan}"
+        );
+        // ...and NOT the "all handled" set (which would skip the probe on a hard
+        // revisit of a soft-deleted row, letting the hard delete FK-fail).
+        assert!(
+            !prescan.contains("if ! __deleted . contains"),
+            "#1800: the grandchild restrict pre-scan skip must NOT consult the \
+             all-handled __deleted set (regresses the mixed soft/hard diamond): {prescan}"
+        );
+        // Consistency: the Phase-2 diamond revisit-skip below already keys on
+        // `__physical`, so the pre-scan now matches it.
+        assert!(
+            destroy_arm.contains("if __physical . contains"),
+            "#1800: the Phase-2 diamond revisit-skip must consult __physical: {destroy_arm}"
         );
     }
 
