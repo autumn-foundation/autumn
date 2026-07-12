@@ -952,7 +952,22 @@ async fn main() {
         // two entirely different generators, so the mailer's own
         // `src/mailers` owner_dir sibling check alone can't see that auth
         // still needs the feature.
-        let tmp = project_with_main(default_main());
+        // `generate auth` (issue #1353) requires a shared 4-arg `pub fn layout`
+        // in src/main.rs so its views can render through `crate::layout`, so this
+        // project's main.rs must expose one (as `autumn new` emits).
+        let tmp = project_with_main(
+            "use autumn_web::prelude::*;\n\n\
+             pub fn layout(title: &str, current_path: &str, flash: maud::Markup, content: maud::Markup) -> maud::Markup {\n\
+             \x20   let _ = (current_path, flash);\n\
+             \x20   maud::html! { title { (title) } (content) }\n\
+             }\n\n\
+             #[get(\"/\")]\n\
+             async fn index() -> &'static str { \"ok\" }\n\n\
+             #[autumn_web::main]\n\
+             async fn main() {\n\
+             \x20   autumn_web::app().routes(routes![index]).run().await;\n\
+             }\n",
+        );
         let cargo_path = tmp.path().join("Cargo.toml");
 
         crate::generate::auth::plan_auth(tmp.path(), "User", "20260508000000")

@@ -81,7 +81,7 @@ struct QuerySpec {
 /// `layout` must be a complete token — the character after it is `(`, `<`, or
 /// whitespace — so decoys like `pub fn layout_sidebar` are ignored. Malformed
 /// input (unterminated paren/comment/string) simply contributes no arity.
-fn has_shared_layout(main_src: &str) -> bool {
+pub fn has_shared_layout(main_src: &str) -> bool {
     layout_param_counts(main_src).into_iter().any(|n| n == 4)
 }
 

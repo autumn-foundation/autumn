@@ -3501,15 +3501,32 @@ fn run_generate_command(cmd: GenerateCommands, mode: ApplyMode) {
         } => {
             let oauth_options = generate::auth::AuthOAuthOptions { providers: oauth };
             let timestamp = generate::timestamp_now();
-            let plan = generate::auth::plan_auth_full_ex2(
-                &resolve_cwd(),
-                &name,
-                &timestamp,
-                &oauth_options,
-                totp,
-                passkeys,
-                magic_link,
-            );
+            // `destroy auth` recomputes this same plan before reverting it. The
+            // shared-layout preflight in the plan builder is a generate-time
+            // guard only: running it on the destroy path would hard-fail cleanup
+            // in a project whose shared `pub fn layout` is missing or renamed,
+            // stranding the generated files (issue #1353 follow-up). Use the
+            // revert-only plan builder for `ApplyMode::Destroy`, which skips it.
+            let plan = match mode {
+                ApplyMode::Generate => generate::auth::plan_auth_full_ex2(
+                    &resolve_cwd(),
+                    &name,
+                    &timestamp,
+                    &oauth_options,
+                    totp,
+                    passkeys,
+                    magic_link,
+                ),
+                ApplyMode::Destroy => generate::auth::plan_auth_full_ex2_for_revert(
+                    &resolve_cwd(),
+                    &name,
+                    &timestamp,
+                    &oauth_options,
+                    totp,
+                    passkeys,
+                    magic_link,
+                ),
+            };
             apply_plan(plan, generate::Flags { dry_run, force }, mode);
         }
         GenerateCommands::Admin {

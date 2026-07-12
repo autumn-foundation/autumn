@@ -425,7 +425,6 @@ pub fn plan_auth_with_providers(
 ///
 /// # Errors
 /// Same as [`plan_auth`].
-#[allow(clippy::too_many_lines)]
 pub fn plan_auth_with_providers_ex(
     project_root: &Path,
     name: &str,
@@ -433,6 +432,36 @@ pub fn plan_auth_with_providers_ex(
     providers: &[String],
     totp: bool,
     magic_link: bool,
+) -> Result<Plan, GenerateError> {
+    // Generation path: run the full plan, including the shared-layout preflight.
+    // `autumn destroy auth` recomputes the identical plan before reverting it,
+    // and must bypass that generate-only preflight (issue #1353 follow-up); it
+    // reaches the builder through `plan_auth_full_ex2_for_revert` instead.
+    plan_auth_with_providers_ex_impl(
+        project_root,
+        name,
+        timestamp,
+        providers,
+        totp,
+        magic_link,
+        false,
+    )
+}
+
+/// Shared implementation of [`plan_auth_with_providers_ex`]. `for_revert`
+/// suppresses the generate-only shared-layout preflight so `autumn destroy
+/// auth` (which recomputes this same plan before [`Plan::revert`]) can remove
+/// generated files even in a project whose shared `pub fn layout` is missing or
+/// renamed — a regression the preflight would otherwise introduce.
+#[allow(clippy::too_many_lines)]
+fn plan_auth_with_providers_ex_impl(
+    project_root: &Path,
+    name: &str,
+    timestamp: &str,
+    providers: &[String],
+    totp: bool,
+    magic_link: bool,
+    for_revert: bool,
 ) -> Result<Plan, GenerateError> {
     ensure_project_root(project_root)?;
     super::model::validate_resource_name(name)?;
@@ -466,6 +495,47 @@ pub fn plan_auth_with_providers_ex(
              `--magic-link`; choose a different resource name."
                 .to_owned(),
         ));
+    }
+
+    // Issue #1353: the generated auth views render through the application's
+    // shared `crate::layout(title, current_path, flash, content)` (nav bar,
+    // stylesheet links, skip-link, footer) rather than a private per-file
+    // layout stub, so the target app must expose a shared layout with the
+    // matching 4-arg signature (as `autumn new` emits). Detect it by looking
+    // for a `pub fn layout` in `src/main.rs`. If it is missing — or present
+    // with the wrong arity (e.g. an older/custom 2-arg
+    // `pub fn layout(title, content)`) — fail early with an actionable message
+    // rather than emitting routes that call a nonexistent or mismatched
+    // `crate::layout`. This mirrors the scaffold generator's preflight
+    // (issue #1130) and reuses its lexically-aware detector.
+    //
+    // The preflight is a generate-time guard only. `autumn destroy auth`
+    // recomputes this same plan before reverting it, so running the preflight
+    // on that path would hard-fail cleanup in a project whose shared
+    // `pub fn layout` is missing or renamed — stranding the very files destroy
+    // is meant to remove. Skip it when `for_revert` is set.
+    if !for_revert {
+        let main_for_layout_check = project_root.join("src").join("main.rs");
+        let main_src = match std::fs::read_to_string(&main_for_layout_check) {
+            Ok(src) => src,
+            // `main.rs` genuinely absent: surface the actionable message below by
+            // treating it as an empty source (no `pub fn layout` present).
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            // Any other io error (e.g. PermissionDenied) preserves its original
+            // `ErrorKind` + OS message rather than being masked.
+            Err(e) => return Err(GenerateError::Io(e)),
+        };
+        if !super::scaffold::has_shared_layout(&main_src) {
+            return Err(GenerateError::Config(
+                "`autumn generate auth` requires a shared `pub fn layout` in src/main.rs \
+                 so the generated views can render through \
+                 `crate::layout(title, current_path, flash, content)` (4 args). Run this inside \
+                 an app created by `autumn new`, or add a shared \
+                 `pub fn layout(title: &str, current_path: &str, flash: maud::Markup, content: maud::Markup) -> maud::Markup` \
+                 to src/main.rs and re-run."
+                    .to_owned(),
+            ));
+        }
     }
 
     let mut plan = Plan::new(project_root);
@@ -906,7 +976,16 @@ pub fn plan_auth_with_options(
     timestamp: &str,
     oauth: &AuthOAuthOptions,
 ) -> Result<Plan, GenerateError> {
-    plan_auth_options_impl(project_root, name, timestamp, oauth, false, false, false)
+    plan_auth_options_impl(
+        project_root,
+        name,
+        timestamp,
+        oauth,
+        false,
+        false,
+        false,
+        false,
+    )
 }
 
 /// Compute the file actions for `autumn generate auth [--oauth …] [--totp]`.
@@ -924,7 +1003,16 @@ pub fn plan_auth_full(
     oauth: &AuthOAuthOptions,
     totp: bool,
 ) -> Result<Plan, GenerateError> {
-    plan_auth_options_impl(project_root, name, timestamp, oauth, totp, false, false)
+    plan_auth_options_impl(
+        project_root,
+        name,
+        timestamp,
+        oauth,
+        totp,
+        false,
+        false,
+        false,
+    )
 }
 
 /// Compute the file actions for `autumn generate auth [--oauth …] [--totp] [--passkeys]`.
@@ -941,7 +1029,16 @@ pub fn plan_auth_full_ex(
     totp: bool,
     passkeys: bool,
 ) -> Result<Plan, GenerateError> {
-    plan_auth_options_impl(project_root, name, timestamp, oauth, totp, passkeys, false)
+    plan_auth_options_impl(
+        project_root,
+        name,
+        timestamp,
+        oauth,
+        totp,
+        passkeys,
+        false,
+        false,
+    )
 }
 
 /// Compute the file actions for
@@ -970,14 +1067,22 @@ pub fn plan_auth_full_ex2(
         totp,
         passkeys,
         magic_link,
+        false,
     )
 }
 
-/// Shared implementation: base (optionally TOTP-aware, optionally passkey-aware,
-/// optionally magic-link-aware) scaffold plus, when providers are supplied, the
-/// OAuth artifacts.
-#[allow(clippy::too_many_lines)]
-fn plan_auth_options_impl(
+/// Compute the file actions for `autumn destroy auth …`.
+///
+/// Identical to [`plan_auth_full_ex2`] except it recomputes the plan for the
+/// revert path: it skips the generate-only shared-layout preflight so cleanup
+/// still succeeds in a project whose shared `pub fn layout` is missing or
+/// renamed (e.g. one scaffolded by an older CLI). `autumn destroy auth` reverts
+/// the returned plan; the preflight would otherwise hard-fail the destroy
+/// before any generated file is removed (issue #1353 follow-up).
+///
+/// # Errors
+/// Same as [`plan_auth_full_ex2`], minus the shared-layout preflight.
+pub fn plan_auth_full_ex2_for_revert(
     project_root: &Path,
     name: &str,
     timestamp: &str,
@@ -986,15 +1091,51 @@ fn plan_auth_options_impl(
     passkeys: bool,
     magic_link: bool,
 ) -> Result<Plan, GenerateError> {
+    plan_auth_options_impl(
+        project_root,
+        name,
+        timestamp,
+        oauth,
+        totp,
+        passkeys,
+        magic_link,
+        true,
+    )
+}
+
+/// Shared implementation: base (optionally TOTP-aware, optionally passkey-aware,
+/// optionally magic-link-aware) scaffold plus, when providers are supplied, the
+/// OAuth artifacts.
+// The three feature flags (`totp`/`passkeys`/`magic_link`) already saturate the
+// bool/arg budget; the fourth (`for_revert`) is an internal generate-vs-destroy
+// toggle threaded only from this crate's two public wrappers, so keep the flat
+// signature rather than wrap it in a one-off options struct.
+#[allow(
+    clippy::too_many_lines,
+    clippy::too_many_arguments,
+    clippy::fn_params_excessive_bools
+)]
+fn plan_auth_options_impl(
+    project_root: &Path,
+    name: &str,
+    timestamp: &str,
+    oauth: &AuthOAuthOptions,
+    totp: bool,
+    passkeys: bool,
+    magic_link: bool,
+    for_revert: bool,
+) -> Result<Plan, GenerateError> {
     // Start with the base auth plan with providers (and optional TOTP, and
-    // optional magic-link) applied.
-    let mut plan = plan_auth_with_providers_ex(
+    // optional magic-link) applied. `for_revert` threads through to suppress the
+    // generate-only shared-layout preflight on the `autumn destroy auth` path.
+    let mut plan = plan_auth_with_providers_ex_impl(
         project_root,
         name,
         timestamp,
         &oauth.providers,
         totp,
         magic_link,
+        for_revert,
     )?;
 
     let pascal_name = pascal(name);
@@ -2579,20 +2720,6 @@ use crate::schema::{table};
 
 // ── Layout helpers ────────────────────────────────────────────────────────────
 
-fn layout(title: &str, content: Markup) -> Markup {{
-    html! {{
-        (autumn_web::PreEscaped("<!DOCTYPE html>"))
-        html lang="en" {{
-            head {{
-                meta charset="utf-8";
-                title {{ (title) }}
-                link rel="stylesheet" href=(autumn_web::flash::FLASH_CSS_PATH);
-            }}
-            body {{ (content) }}
-        }}
-    }}
-}}
-
 fn redirect_to(url: &str) -> Response {{
     axum::response::Redirect::to(url).into_response()
 }}
@@ -3309,7 +3436,7 @@ pub async fn sessions_page(
     if hx.is_htmx {{
         return Ok(fragment.into_response());
     }}
-    Ok(layout("Active Sessions", html! {{
+    Ok(crate::layout("Active Sessions", "/account/sessions", html! {{}}, html! {{
         @if let Some(ref csrf) = csrf {{ meta name="csrf-token" content=(csrf.token()); }}
         script src=(HTMX_JS_PATH) {{}}
         script src=(HTMX_CSRF_JS_PATH) {{}}
@@ -3434,7 +3561,7 @@ fn render_signup_form(
     csrf: Option<&CsrfToken>,
     csrf_field: Option<&CsrfFormField>,
 ) -> Markup {{
-    layout("Sign Up", html! {{
+    crate::layout("Sign Up", "/signup", html! {{}}, html! {{
         h1 {{ "Create an Account" }}
         @if let Some(error) = error {{
             p role="alert" {{ (error) }}
@@ -3602,9 +3729,7 @@ pub async fn signup(
 /// `GET /login` — render the login form.
 #[get("/login")]
 pub async fn login_form(flash: Flash, csrf: Option<CsrfToken>, csrf_field: Option<CsrfFormField>) -> AutumnResult<Markup> {{
-    let flash_html = flash.render().await;
-    Ok(layout("Log In", html! {{
-        (flash_html)
+    Ok(crate::layout("Log In", "/login", flash_messages(&flash.consume().await), html! {{
         h1 {{ "Log In" }}
         form action="/login" method="post" {{
             @if let Some(ref csrf) = csrf {{ input type="hidden" name=(csrf_field.as_ref().map_or("_csrf", |f| f.0.as_str())) value=(csrf.token()); }}
@@ -3982,7 +4107,7 @@ pub async fn unlock_account(
         .execute(&mut *db)
         .await
         .map_err(|e| AutumnError::internal_server_error_msg(&format!("Failed to unlock account: {{e}}")))?;
-    Ok(layout("Account Unlocked", html! {{
+    Ok(crate::layout("Account Unlocked", "/account", html! {{}}, html! {{
         h1 {{ "Account Unlocked" }}
         p {{ "The lockout for " (email) " has been cleared if it existed." }}
     }}))
@@ -4009,9 +4134,7 @@ pub async fn account(session: Session, State(state): State<AppState>, mut db: Db
         return Ok(redirect_to("/check-your-email").into_response());
     }}
 
-    let flash_html = flash.render().await;
-    Ok(layout("Your Account", html! {{
-        (flash_html)
+    Ok(crate::layout("Your Account", "/account", flash_messages(&flash.consume().await), html! {{
         h1 {{ "Your Account" }}
         @if let Some(scheduled) = {snake_name}.delete_scheduled_at {{
             div style="border:1px solid #c00;padding:0.75rem;margin-bottom:1rem;" {{
@@ -4097,7 +4220,7 @@ fn render_change_password_form(
     csrf: Option<&CsrfToken>,
     csrf_field: Option<&CsrfFormField>,
 ) -> Markup {{
-    layout("Change Password", html! {{
+    crate::layout("Change Password", "/account/password", html! {{}}, html! {{
         h1 {{ "Change Password" }}
         @if let Some(error) = error {{
             p role="alert" {{ (error) }}
@@ -4299,7 +4422,7 @@ fn render_change_email_form(
     csrf: Option<&CsrfToken>,
     csrf_field: Option<&CsrfFormField>,
 ) -> Markup {{
-    layout("Change Email Address", html! {{
+    crate::layout("Change Email Address", "/account/email", html! {{}}, html! {{
         h1 {{ "Change Email Address" }}
         p {{ "We'll send a confirmation link to the new address. Your current \
               address keeps working until you confirm the change." }}
@@ -4549,7 +4672,7 @@ pub async fn confirm_email_change(
         return Err(generic());
     }}
 
-    Ok(layout("Email Address Updated", html! {{
+    Ok(crate::layout("Email Address Updated", "/account/email", html! {{}}, html! {{
         h1 {{ "Email Address Updated" }}
         p {{ "Your email address has been changed to " (new_email_display) "." }}
         p {{ a href="/account" {{ "← Back to account" }} }}
@@ -4666,7 +4789,7 @@ pub async fn reauth_form(
     // Validates the tracked session row (401s immediately if revoked).
     let _ = require_tracked_session(&session, &mut db, &state).await?;
     let return_to = params.get("return_to").cloned().unwrap_or_default();
-    Ok(layout("Confirm your identity", html! {{
+    Ok(crate::layout("Confirm your identity", "/reauth", html! {{}}, html! {{
         h1 {{ "Confirm your identity" }}
         p {{ "For security, please re-enter your password to continue." }}
         form action="/reauth" method="post" {{
@@ -4729,7 +4852,7 @@ pub async fn reauth(
     if !pw_verified_recently {{
         // Helper to render the reauth error form without duplicating markup.
         let reauth_form_err = |ret: &str| {{
-            layout("Confirm your identity", html! {{
+            crate::layout("Confirm your identity", "/reauth", html! {{}}, html! {{
                 h1 {{ "Confirm your identity" }}
                 p style="color:red" {{ "Incorrect password. Please try again." }}
                 form action="/reauth" method="post" {{
@@ -4876,7 +4999,7 @@ pub async fn reauth(
 /// `GET /forgot-password` — render the forgot-password form.
 #[get("/forgot-password")]
 pub async fn forgot_password_form(csrf: Option<CsrfToken>, csrf_field: Option<CsrfFormField>) -> AutumnResult<Markup> {{
-    Ok(layout("Forgot Password", html! {{
+    Ok(crate::layout("Forgot Password", "/forgot-password", html! {{}}, html! {{
         h1 {{ "Forgot Your Password?" }}
         form action="/forgot-password" method="post" {{
             @if let Some(ref csrf) = csrf {{ input type="hidden" name=(csrf_field.as_ref().map_or("_csrf", |f| f.0.as_str())) value=(csrf.token()); }}
@@ -4959,7 +5082,7 @@ pub async fn forgot_password(
         tokio::time::sleep(remaining).await;
     }}
 
-    Ok(layout("Check Your Email", html! {{
+    Ok(crate::layout("Check Your Email", "/forgot-password", html! {{}}, html! {{
         h1 {{ "Check Your Email" }}
         p {{
             "If that address is registered you'll receive a reset link shortly."
@@ -4984,7 +5107,7 @@ fn render_reset_password_form(
     csrf: Option<&CsrfToken>,
     csrf_field: Option<&CsrfFormField>,
 ) -> Markup {{
-    layout("Reset Password", html! {{
+    crate::layout("Reset Password", "/reset-password", html! {{}}, html! {{
         h1 {{ "Set a New Password" }}
         @if let Some(error) = error {{
             p role="alert" {{ (error) }}
@@ -5230,9 +5353,7 @@ async fn send_reset_email(mailer: &Mailer, to: &str, token: &str) -> AutumnResul
 /// `GET /check-your-email` — shown after signup while awaiting email confirmation.
 #[get("/check-your-email")]
 pub async fn check_your_email(flash: Flash) -> AutumnResult<Markup> {{
-    let flash_html = flash.render().await;
-    Ok(layout("Check Your Email", html! {{
-        (flash_html)
+    Ok(crate::layout("Check Your Email", "/check-your-email", flash_messages(&flash.consume().await), html! {{
         h1 {{ "Check Your Email" }}
         p {{ "We've sent a confirmation link to your email address." }}
         p {{ "Please click the link in the email to activate your account. The link expires in 24 hours." }}
@@ -5327,7 +5448,7 @@ pub async fn resend_confirmation_form(
     csrf: Option<CsrfToken>,
     csrf_field: Option<CsrfFormField>,
 ) -> AutumnResult<Markup> {{
-    Ok(layout("Resend Confirmation Email", html! {{
+    Ok(crate::layout("Resend Confirmation Email", "/auth/confirm/resend", html! {{}}, html! {{
         h1 {{ "Resend Confirmation Email" }}
         form action="/auth/confirm/resend" method="post" {{
             @if let Some(ref csrf) = csrf {{ input type="hidden" name=(csrf_field.as_ref().map_or("_csrf", |f| f.0.as_str())) value=(csrf.token()); }}
@@ -5424,7 +5545,7 @@ pub async fn resend_confirmation(
         tokio::time::sleep(remaining).await;
     }}
 
-    Ok(layout("Confirmation Email Sent", html! {{
+    Ok(crate::layout("Confirmation Email Sent", "/auth/confirm/resend", html! {{}}, html! {{
         h1 {{ "Check Your Email" }}
         p {{
             "If that address has a pending unconfirmed account, you'll receive a new \
@@ -5496,7 +5617,7 @@ pub async fn data_export_form(
 ) -> AutumnResult<Response> {{
     // Validates the tracked session row (401s immediately if revoked).
     let _ = require_tracked_session(&session, &mut db, &state).await?;
-    Ok(layout("Download My Data", html! {{
+    Ok(crate::layout("Download My Data", "/account/data-export", html! {{}}, html! {{
         h1 {{ "Download My Data" }}
         p {{
             "Request a copy of all data we hold about you. You will receive an email \
@@ -5544,7 +5665,7 @@ pub async fn data_export(
         .map_err(|_| AutumnError::internal_server_error_msg("Failed to record export request."))?;
 
     if updated == 0 {{
-        return Ok(layout("Export Already Pending", html! {{
+        return Ok(crate::layout("Export Already Pending", "/account/data-export", html! {{}}, html! {{
             h1 {{ "Export Already Pending" }}
             p {{
                 "A data export was already requested within the last hour. \
@@ -5570,7 +5691,7 @@ pub async fn data_export(
     .await
     .ok();
 
-    Ok(layout("Export Requested", html! {{
+    Ok(crate::layout("Export Requested", "/account/data-export", html! {{}}, html! {{
         h1 {{ "Export Requested" }}
         p {{
             "Your data export is being prepared. You will receive an email with a \
@@ -5620,7 +5741,7 @@ pub async fn delete_account_form(
 ) -> AutumnResult<Response> {{
     // Validates the tracked session row (401s immediately if revoked).
     let _ = require_tracked_session(&session, &mut db, &state).await?;
-    Ok(layout("Delete My Account", html! {{
+    Ok(crate::layout("Delete My Account", "/account/delete", html! {{}}, html! {{
         h1 {{ "Delete My Account" }}
         p class="warning" {{
             "⚠️ This action schedules your account for permanent deletion after a \
@@ -5666,7 +5787,7 @@ pub async fn delete_account(
 
     // Require the user to type DELETE as a confirmation step.
     if form.confirmation.trim() != "DELETE" {{
-        return Ok(layout("Delete My Account", html! {{
+        return Ok(crate::layout("Delete My Account", "/account/delete", html! {{}}, html! {{
             h1 {{ "Delete My Account" }}
             p class="error" {{ "You must type DELETE (in uppercase) to confirm." }}
             p {{ a href="/account/delete" {{ "← Back" }} }}
@@ -5700,7 +5821,7 @@ pub async fn delete_account(
 
     session.destroy().await;
 
-    Ok(layout("Deletion Scheduled", html! {{
+    Ok(crate::layout("Deletion Scheduled", "/account/delete", html! {{}}, html! {{
         h1 {{ "Account Deletion Scheduled" }}
         p {{
             "Your account has been scheduled for deletion in 30 days. \
@@ -8138,7 +8259,7 @@ fn totp_reauth_check_src(snake_name: &str, table: &str) -> String {
         let code = form.totp_code.trim().to_owned();
         if code.is_empty() {
             let return_to = form.return_to.clone();
-            return Ok(layout("Confirm your identity", html! {{
+            return Ok(crate::layout("Confirm your identity", "/reauth", html! {}, html! {{
                 h1 {{ "Confirm your identity" }}
                 p style="color:red" {{ "Your account uses two-factor authentication. Please also enter your authenticator code." }}
                 form action="/reauth" method="post" {{
@@ -8204,7 +8325,7 @@ fn totp_reauth_check_src(snake_name: &str, table: &str) -> String {
         }
         if !totp_verified {
             let return_to = form.return_to.clone();
-            return Ok(layout("Confirm your identity", html! {{
+            return Ok(crate::layout("Confirm your identity", "/reauth", html! {}, html! {{
                 h1 {{ "Confirm your identity" }}
                 p style="color:red" {{ "Invalid authenticator code. Please try again." }}
                 form action="/reauth" method="post" {{
@@ -8435,7 +8556,7 @@ pub async fn two_factor_status(
         0
     };
 
-    Ok(layout("Two-Factor Authentication", html! {
+    Ok(crate::layout("Two-Factor Authentication", "/account/2fa", html! {}, html! {
         h1 { "Two-Factor Authentication" }
         @if __SNAKE__.totp_enabled {
             p { "Two-factor authentication is " strong { "enabled" } "." }
@@ -8533,7 +8654,7 @@ pub async fn two_factor_enable(
     let encrypted = encrypt_secret(&secret_bytes)?;
     session.insert("totp_pending_secret", &encrypted).await;
 
-    Ok(layout("Enable Two-Factor", html! {
+    Ok(crate::layout("Enable Two-Factor", "/account/2fa", html! {}, html! {
         h1 { "Scan this QR code" }
         p { "Scan with Google Authenticator, 1Password, or any RFC 6238 app." }
         img src=(format!("data:image/png;base64,{}", qr)) alt="TOTP QR code";
@@ -8672,7 +8793,7 @@ pub async fn two_factor_confirm(
 
     session.remove("totp_pending_secret").await;
 
-    Ok(layout("Save Your Recovery Codes", html! {
+    Ok(crate::layout("Save Your Recovery Codes", "/account/2fa", html! {}, html! {
         h1 { "Two-factor authentication enabled" }
         p { strong { "Save these recovery codes now." } " Each can be used once if you lose your device. They will not be shown again." }
         ul {
@@ -8791,7 +8912,7 @@ pub async fn login_verify_form(
     if session.get("totp_pending_id").await.is_none() {
         return Ok(redirect_to("/login"));
     }
-    Ok(layout("Two-Factor Verification", html! {
+    Ok(crate::layout("Two-Factor Verification", "/login/verify", html! {}, html! {
         h1 { "Two-Factor Verification" }
         form action="/login/verify" method="post" {
             @if let Some(ref csrf) = csrf { input type="hidden" name=(csrf_field.as_ref().map_or("_csrf", |f| f.0.as_str())) value=(csrf.token()); }
@@ -9134,7 +9255,7 @@ pub async fn magic_link_request_form(
     csrf: Option<CsrfToken>,
     csrf_field: Option<CsrfFormField>,
 ) -> AutumnResult<Markup> {
-    Ok(layout("Sign in with a magic link", html! {
+    Ok(crate::layout("Sign in with a magic link", "/login/magic", html! {}, html! {
         h1 { "Sign in with a magic link" }
         p { "Enter your email and we'll send you a one-time sign-in link — no password required." }
         form action="/login/magic" method="post" {
@@ -9239,7 +9360,7 @@ pub async fn magic_link_request(
         tokio::time::sleep(remaining).await;
     }
 
-    Ok(layout("Check Your Email", html! {
+    Ok(crate::layout("Check Your Email", "/login/magic", html! {}, html! {
         h1 { "Check Your Email" }
         p {
             "If that address is registered, a one-time sign-in link is on its way. \
@@ -9262,7 +9383,7 @@ pub struct MagicLinkVerifyForm {
 /// Generic magic-link failure page. Expired, consumed, unknown, and malformed
 /// tokens ALL render this identical page so nothing acts as an oracle (AC5).
 fn magic_link_invalid_page() -> Markup {
-    layout("Sign-in link invalid", html! {
+    crate::layout("Sign-in link invalid", "/login/magic/verify", html! {}, html! {
         h1 { "This sign-in link is invalid or has expired" }
         p { "Magic sign-in links can be used once and expire quickly. Please request a new one." }
         p { a href="/login/magic" { "Request a new link" } }
@@ -9287,9 +9408,7 @@ pub async fn magic_link_verify_form(
     csrf_field: Option<CsrfFormField>,
     Query(query): Query<MagicLinkVerifyQuery>,
 ) -> AutumnResult<Markup> {
-    let flash_html = flash.render().await;
-    Ok(layout("Confirm sign-in", html! {
-        (flash_html)
+    Ok(crate::layout("Confirm sign-in", "/login/magic/verify", flash_messages(&flash.consume().await), html! {
         h1 { "Confirm sign-in" }
         p { "Click the button below to finish signing in to your account." }
         form action="/login/magic/verify" method="post" {
@@ -10774,16 +10893,38 @@ mod tests {
         )
         .unwrap();
         fs::create_dir_all(tmp.path().join("src")).unwrap();
-        fs::write(
-            tmp.path().join("src/main.rs"),
-            "use autumn_web::prelude::*;\n\n\
-             #[autumn_web::main]\n\
-             async fn main() {\n\
-             \x20   autumn_web::app().routes(routes![]).run().await;\n\
-             }\n",
-        )
-        .unwrap();
+        fs::write(tmp.path().join("src/main.rs"), main_with_layout()).unwrap();
         tmp
+    }
+
+    /// A `src/main.rs` exposing a shared 4-arg
+    /// `pub fn layout(title, current_path, flash, content)` — what `autumn new`
+    /// emits and what the auth generator's views render through
+    /// (`crate::layout`, issue #1353). The auth preflight requires this.
+    fn main_with_layout() -> &'static str {
+        "use autumn_web::prelude::*;\n\n\
+         pub fn layout(title: &str, current_path: &str, flash: maud::Markup, content: maud::Markup) -> maud::Markup {\n\
+         \x20   let _ = (current_path, flash);\n\
+         \x20   maud::html! {\n\
+         \x20       title { (title) }\n\
+         \x20       (content)\n\
+         \x20   }\n\
+         }\n\n\
+         #[autumn_web::main]\n\
+         async fn main() {\n\
+         \x20   autumn_web::app().routes(routes![]).run().await;\n\
+         }\n"
+    }
+
+    /// A `src/main.rs` with no shared `pub fn layout` — used to exercise the
+    /// actionable error the auth generator raises when the target app has no
+    /// shared layout for its HTML views to render through (issue #1353).
+    fn main_without_layout() -> &'static str {
+        "use autumn_web::prelude::*;\n\n\
+         #[autumn_web::main]\n\
+         async fn main() {\n\
+         \x20   autumn_web::app().routes(routes![]).run().await;\n\
+         }\n"
     }
 
     /// A Cargo.toml matching what `autumn new`'s own template ships
@@ -12405,14 +12546,177 @@ mod tests {
             routes.contains("flash.info(\"Account created"),
             "signup must set a flash: {routes}"
         );
-        // The redirect-target pages render pending flashes in their layout.
+        // Issue #1353/#1240: the redirect-target pages render pending flashes
+        // through the shared, accessible `flash_messages()` helper threaded into
+        // the layout's 3rd argument — NOT the older in-content `flash.render()`.
         assert!(
-            routes.contains("flash.render().await"),
-            "auth pages must render pending flashes: {routes}"
+            !routes.contains("flash.render().await"),
+            "auth pages must not use the old in-content flash.render() path: {routes}"
+        );
+        assert!(
+            routes.contains("flash_messages(&flash.consume().await)"),
+            "auth pages must render pending flashes via flash_messages(): {routes}"
         );
         assert!(
             routes.contains("pub async fn login_form(flash: Flash"),
             "login_form must take the Flash extractor to render notices: {routes}"
+        );
+    }
+
+    /// Issue #1353: every auth view renders through the application's shared
+    /// `crate::layout(title, current_path, flash, content)` (4 args) rather than
+    /// a private per-file `fn layout(title, content)` stub. The private stub —
+    /// and its bare DOCTYPE shell — must be gone, and representative pages must
+    /// call `crate::layout` with a per-page `current_path` and the flash arg.
+    #[test]
+    fn auth_views_render_through_shared_layout() {
+        let routes = render_routes_file("User", "user", "users", &[], false, false);
+        // The private layout stub is gone.
+        assert!(
+            !routes.contains("fn layout(title: &str, content: Markup)"),
+            "the private 2-arg layout stub must be removed: {routes}"
+        );
+        // Views render through the shared 4-arg layout.
+        assert!(
+            routes.contains("crate::layout("),
+            "auth views must render through crate::layout: {routes}"
+        );
+        assert!(
+            !routes.contains(" layout(") || routes.contains("crate::layout("),
+            "no bare 2-arg layout() calls may remain: {routes}"
+        );
+        // Login renders through the shared layout with its own current_path and
+        // the flash threaded to the 3rd arg (mirrors scaffold's assertions).
+        assert!(
+            routes.contains(
+                "crate::layout(\"Log In\", \"/login\", flash_messages(&flash.consume().await),"
+            ),
+            "login_form must render through crate::layout with /login + flash: {routes}"
+        );
+        // The account page likewise threads its current_path + flash.
+        assert!(
+            routes.contains(
+                "crate::layout(\"Your Account\", \"/account\", flash_messages(&flash.consume().await),"
+            ),
+            "account must render through crate::layout with /account + flash: {routes}"
+        );
+        // A page that shows no flash still passes a per-page current_path and an
+        // empty flash markup as the 3rd arg.
+        assert!(
+            routes.contains("crate::layout(\"Sign Up\", \"/signup\", html! {},"),
+            "signup form must render through crate::layout with /signup: {routes}"
+        );
+    }
+
+    /// Issue #1353: the TOTP (`--totp`) and magic-link (`--magic-link`) views
+    /// also render through the shared `crate::layout`, with per-page paths.
+    #[test]
+    fn auth_totp_and_magic_link_views_render_through_shared_layout() {
+        let routes = render_routes_file("User", "user", "users", &[], true, true);
+        assert!(
+            !routes.contains("fn layout(title: &str, content: Markup)"),
+            "the private layout stub must be removed under --totp/--magic-link: {routes}"
+        );
+        assert!(
+            routes.contains(
+                "crate::layout(\"Two-Factor Verification\", \"/login/verify\", html! {},"
+            ),
+            "the TOTP verify page must render through crate::layout: {routes}"
+        );
+        assert!(
+            routes.contains(
+                "crate::layout(\"Confirm sign-in\", \"/login/magic/verify\", flash_messages(&flash.consume().await),"
+            ),
+            "the magic-link confirm page must thread flash through crate::layout: {routes}"
+        );
+    }
+
+    /// Issue #1353: `autumn generate auth` requires the target app to expose a
+    /// shared 4-arg `pub fn layout` (as `autumn new` emits) so its views can
+    /// render through `crate::layout`. When `src/main.rs` has no such layout —
+    /// e.g. an `autumn new --api` project — the generator fails early with an
+    /// actionable Config error rather than emitting routes that fail to compile.
+    /// Mirrors the scaffold generator's preflight (issue #1130).
+    #[test]
+    fn plan_auth_errors_when_main_rs_has_no_shared_layout() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("Cargo.toml"), "[package]\nname=\"x\"\n").unwrap();
+        fs::create_dir_all(tmp.path().join("src")).unwrap();
+        fs::write(tmp.path().join("src/main.rs"), main_without_layout()).unwrap();
+        let err = plan_auth(tmp.path(), "User", "20260508000000").unwrap_err();
+        match err {
+            GenerateError::Config(msg) => {
+                assert!(
+                    msg.contains("pub fn layout") && msg.contains("autumn new"),
+                    "missing shared layout must yield the actionable error: {msg}"
+                );
+            }
+            other => panic!("expected an actionable Config error, got: {other:?}"),
+        }
+    }
+
+    /// Issue #1353: a genuinely absent `src/main.rs` surfaces the same
+    /// actionable shared-layout Config error (pointing at `autumn new`), not a
+    /// raw Io "missing" error.
+    #[test]
+    fn plan_auth_errors_when_main_rs_missing() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("Cargo.toml"), "[package]\nname=\"x\"\n").unwrap();
+        fs::create_dir_all(tmp.path().join("src")).unwrap();
+        let err = plan_auth(tmp.path(), "User", "20260508000000").unwrap_err();
+        match err {
+            GenerateError::Config(msg) => {
+                assert!(
+                    msg.contains("pub fn layout") && msg.contains("autumn new"),
+                    "absent main.rs must yield the actionable shared-layout error: {msg}"
+                );
+            }
+            other => panic!("expected an actionable Config error, got: {other:?}"),
+        }
+    }
+
+    /// Issue #1353 follow-up: `autumn destroy auth` recomputes the identical
+    /// plan before reverting it. The shared-layout preflight is a generate-time
+    /// guard only — it must NOT fire on the destroy/revert path, or cleanup
+    /// would hard-fail in a project whose shared `pub fn layout` is missing or
+    /// renamed (e.g. one scaffolded by an older CLI), stranding the generated
+    /// files. The revert-only plan builder must therefore succeed even when
+    /// `src/main.rs` exposes no shared 4-arg layout.
+    #[test]
+    fn plan_auth_for_revert_succeeds_without_shared_layout() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("Cargo.toml"), "[package]\nname=\"x\"\n").unwrap();
+        fs::create_dir_all(tmp.path().join("src")).unwrap();
+        // A project with NO shared `pub fn layout` — the exact input the
+        // generate-time preflight rejects.
+        fs::write(tmp.path().join("src/main.rs"), main_without_layout()).unwrap();
+        let oauth = AuthOAuthOptions {
+            providers: Vec::new(),
+        };
+        // The revert builder must not consult the shared layout at all.
+        let plan = plan_auth_full_ex2_for_revert(
+            tmp.path(),
+            "User",
+            "20260508000000",
+            &oauth,
+            false,
+            false,
+            false,
+        )
+        .expect("destroy auth must build its revert plan without a shared layout");
+        // Sanity: it produced the auth routes file a normal auth plan would, so
+        // `Plan::revert` has something to remove.
+        assert!(
+            find_plan_content_for_path(&plan, &tmp.path().join("src/routes/auth.rs")).is_some(),
+            "revert plan should still include the auth routes it will remove"
+        );
+
+        // And the generate path over the SAME project still fails fast — the
+        // guard is bypassed only for revert, never weakened for generation.
+        let err = plan_auth(tmp.path(), "User", "20260508000000").unwrap_err();
+        assert!(
+            matches!(err, GenerateError::Config(ref msg) if msg.contains("pub fn layout")),
+            "generate path must still reject a missing shared layout: {err:?}"
         );
     }
 

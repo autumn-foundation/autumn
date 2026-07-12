@@ -3300,6 +3300,28 @@ fn generate_auth_in_fresh_project_creates_expected_files() {
         !routes.contains("email.find('@').unwrap()"),
         "signup email validation should not search for @ repeatedly"
     );
+    // Issue #1353: auth views render through the app's shared `crate::layout`
+    // (nav/header/footer shell) rather than a private bare-DOCTYPE `fn layout`
+    // stub, and pending flashes are threaded to the layout's 3rd argument via
+    // the accessible `flash_messages()` helper (not the old `flash.render()`).
+    assert!(
+        !routes.contains("fn layout(title: &str, content: Markup)"),
+        "the private 2-arg layout stub must be removed"
+    );
+    assert!(
+        routes.contains("crate::layout("),
+        "auth views must render through crate::layout"
+    );
+    assert!(
+        routes.contains(
+            "crate::layout(\"Log In\", \"/login\", flash_messages(&flash.consume().await),"
+        ),
+        "login must render through crate::layout with /login + flash"
+    );
+    assert!(
+        !routes.contains("flash.render().await"),
+        "auth views must not use the old in-content flash.render() path"
+    );
 
     // routes/mod.rs
     let route_mod = fs::read_to_string(project.join("src/routes/mod.rs")).unwrap();
