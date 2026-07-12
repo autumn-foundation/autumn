@@ -115,7 +115,11 @@ pub fn run_test(channel_filter: Option<&str>) {
 /// `config`: the native providers (`PagerDuty` / Slack / Discord) plus the
 /// generic signed webhook. Prints a note when a webhook URL is set without the
 /// signing secret (alert webhooks are always signed, so it is skipped).
-fn configured_http_channels(
+///
+/// Shared with `db::backup` (issue #1743) so a failed offsite upload alert and
+/// `autumn alert test` build the EXACT same channel set. Email is intentionally
+/// not included — it needs a configured mailer.
+pub fn configured_http_channels(
     config: &autumn_web::alerts::AlertConfig,
     client: &Client,
 ) -> Vec<Arc<dyn AlertChannel>> {
