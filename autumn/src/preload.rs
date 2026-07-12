@@ -252,6 +252,38 @@ pub trait AutumnPreloadScopeExt {
 
 impl<T: ?Sized> AutumnPreloadScopeExt for T {}
 
+/// Normalizes a `#[has_many]` child's foreign-key field to `Option<i64>` so the
+/// preload loader can group children uniformly whether the FK column is `NOT
+/// NULL` (`i64`) or nullable (`Option<i64>`, as every `dependent = nullify`
+/// child has).
+///
+/// The `#[has_many]` preload loader groups children into a `HashMap<i64, _>`
+/// keyed by the child's FK field, but the `#[model]` macro has no type
+/// information for that field at expansion time. Both FK shapes implement this
+/// trait, so the generated grouping can call [`FkKey::autumn_fk_key`] and skip
+/// `None` (orphan / detached) children without the macro needing to know the
+/// field's Rust type.
+///
+/// This is framework plumbing, not a public API.
+#[doc(hidden)]
+pub trait FkKey {
+    /// The grouping key, or `None` for a detached (nullified) child that
+    /// belongs to no parent.
+    fn autumn_fk_key(&self) -> ::core::option::Option<i64>;
+}
+
+impl FkKey for i64 {
+    fn autumn_fk_key(&self) -> ::core::option::Option<i64> {
+        ::core::option::Option::Some(*self)
+    }
+}
+
+impl FkKey for ::core::option::Option<i64> {
+    fn autumn_fk_key(&self) -> ::core::option::Option<i64> {
+        *self
+    }
+}
+
 #[cfg(feature = "db")]
 tokio::task_local! {
     /// Set by a repository's `preload` to the repository's `across_tenants`
