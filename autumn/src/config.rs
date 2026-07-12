@@ -3046,10 +3046,67 @@ impl AutumnConfig {
     }
 
     fn apply_tenancy_env_overrides_with_env(&mut self, env: &dyn Env) {
+        parse_env_bool(env, "AUTUMN_TENANCY__ENABLED", &mut self.tenancy.enabled);
+        parse_env_string(env, "AUTUMN_TENANCY__SOURCE", &mut self.tenancy.source);
+        parse_env_string(
+            env,
+            "AUTUMN_TENANCY__HEADER_NAME",
+            &mut self.tenancy.header_name,
+        );
+        parse_env_string(
+            env,
+            "AUTUMN_TENANCY__SESSION_KEY",
+            &mut self.tenancy.session_key,
+        );
+        parse_env_string(
+            env,
+            "AUTUMN_TENANCY__JWT_CLAIM",
+            &mut self.tenancy.jwt_claim,
+        );
+        parse_env_option_secret(
+            env,
+            "AUTUMN_TENANCY__JWT_SECRET",
+            &mut self.tenancy.jwt_secret,
+        );
+        parse_env_option_string(
+            env,
+            "AUTUMN_TENANCY__JWT_ISSUER",
+            &mut self.tenancy.jwt_issuer,
+        );
+        parse_env_option_string(
+            env,
+            "AUTUMN_TENANCY__JWT_AUDIENCE",
+            &mut self.tenancy.jwt_audience,
+        );
+        parse_env_option_string(
+            env,
+            "AUTUMN_TENANCY__BASE_DOMAIN",
+            &mut self.tenancy.base_domain,
+        );
+        parse_env_option_string(
+            env,
+            "AUTUMN_TENANCY__LOGIN_REDIRECT",
+            &mut self.tenancy.login_redirect,
+        );
+        parse_env_csv(
+            env,
+            "AUTUMN_TENANCY__PUBLIC_PATHS",
+            &mut self.tenancy.public_paths,
+        );
         parse_env(
             env,
             "AUTUMN_TENANCY__QUOTA_BYTES",
             &mut self.tenancy.quota_bytes,
+        );
+        parse_env(
+            env,
+            "AUTUMN_TENANCY__MAX_CELLS",
+            &mut self.tenancy.max_cells,
+        );
+        parse_env(
+            env,
+            "AUTUMN_TENANCY__IDLE_TTL_SECS",
+            &mut self.tenancy.idle_ttl_secs,
         );
     }
 
@@ -5638,6 +5695,21 @@ fn parse_env_option_string(env: &dyn Env, key: &str, target: &mut Option<String>
     }
 }
 
+/// Secret-aware variant of [`parse_env_option_string`]: an empty (after
+/// trimming) value clears the target, otherwise the trimmed value is wrapped in
+/// a [`secrecy::SecretString`] so it is redacted from `Debug` and zeroized on
+/// drop.
+fn parse_env_option_secret(env: &dyn Env, key: &str, target: &mut Option<secrecy::SecretString>) {
+    if let Ok(val) = env.var(key) {
+        let trimmed = val.trim();
+        *target = if trimmed.is_empty() {
+            None
+        } else {
+            Some(secrecy::SecretString::from(trimmed.to_owned()))
+        };
+    }
+}
+
 fn parse_env_option<T: std::str::FromStr>(env: &dyn Env, key: &str, target: &mut Option<T>) {
     if let Ok(val) = env.var(key) {
         if val.is_empty() {
@@ -6098,6 +6170,16 @@ pub struct TenancyConfig {
     /// `0` disables the quota (unlimited).
     #[serde(default)]
     pub quota_bytes: usize,
+
+    /// Maximum number of resident tenant cells; least-recently-used cells are
+    /// evicted above this. `0` = unbounded.
+    #[serde(default)]
+    pub max_cells: usize,
+
+    /// Evict a tenant cell whose last access exceeds this many seconds.
+    /// `0` = disabled.
+    #[serde(default)]
+    pub idle_ttl_secs: u64,
 }
 
 fn default_tenancy_source() -> String {
@@ -6131,6 +6213,8 @@ impl Default for TenancyConfig {
             public_paths: Vec::new(),
             login_redirect: None,
             quota_bytes: 0,
+            max_cells: 0,
+            idle_ttl_secs: 0,
         }
     }
 }
@@ -8670,6 +8754,103 @@ path = "/healthz"
         let mut config = AutumnConfig::default();
         config.apply_env_overrides_with_env(&env);
         assert_eq!(config.tenancy.quota_bytes, 1_048_576);
+    }
+
+    #[test]
+    fn env_override_tenancy_enabled() {
+        // Unset: default stays false.
+        let env = MockEnv::new();
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        assert!(!config.tenancy.enabled);
+
+        let env = MockEnv::new().with("AUTUMN_TENANCY__ENABLED", "true");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        assert!(config.tenancy.enabled);
+    }
+
+    #[test]
+    fn env_override_tenancy_string_fields() {
+        let env = MockEnv::new()
+            .with("AUTUMN_TENANCY__SOURCE", "jwt")
+            .with("AUTUMN_TENANCY__HEADER_NAME", "x-org")
+            .with("AUTUMN_TENANCY__SESSION_KEY", "org_id")
+            .with("AUTUMN_TENANCY__JWT_CLAIM", "org")
+            .with("AUTUMN_TENANCY__JWT_ISSUER", "https://issuer.example")
+            .with("AUTUMN_TENANCY__JWT_AUDIENCE", "autumn-api")
+            .with("AUTUMN_TENANCY__BASE_DOMAIN", "apps.example.com")
+            .with("AUTUMN_TENANCY__LOGIN_REDIRECT", "/login")
+            .with("AUTUMN_TENANCY__PUBLIC_PATHS", "/login, /signup ,/assets");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        assert_eq!(config.tenancy.source, "jwt");
+        assert_eq!(config.tenancy.header_name, "x-org");
+        assert_eq!(config.tenancy.session_key, "org_id");
+        assert_eq!(config.tenancy.jwt_claim, "org");
+        assert_eq!(
+            config.tenancy.jwt_issuer.as_deref(),
+            Some("https://issuer.example")
+        );
+        assert_eq!(config.tenancy.jwt_audience.as_deref(), Some("autumn-api"));
+        assert_eq!(
+            config.tenancy.base_domain.as_deref(),
+            Some("apps.example.com")
+        );
+        assert_eq!(config.tenancy.login_redirect.as_deref(), Some("/login"));
+        assert_eq!(
+            config.tenancy.public_paths,
+            vec!["/login", "/signup", "/assets"]
+        );
+    }
+
+    #[test]
+    fn env_override_tenancy_eviction_knobs() {
+        // Unset: defaults stay 0 (unbounded / disabled).
+        let env = MockEnv::new();
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        assert_eq!(config.tenancy.max_cells, 0);
+        assert_eq!(config.tenancy.idle_ttl_secs, 0);
+
+        let env = MockEnv::new()
+            .with("AUTUMN_TENANCY__MAX_CELLS", "512")
+            .with("AUTUMN_TENANCY__IDLE_TTL_SECS", "900");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        assert_eq!(config.tenancy.max_cells, 512);
+        assert_eq!(config.tenancy.idle_ttl_secs, 900);
+    }
+
+    #[test]
+    fn env_override_tenancy_secret() {
+        use secrecy::ExposeSecret;
+
+        // Unset: default stays None.
+        let env = MockEnv::new();
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        assert!(config.tenancy.jwt_secret.is_none());
+
+        // Set via env: wrapped as a SecretString, trimmed.
+        let env = MockEnv::new().with("AUTUMN_TENANCY__JWT_SECRET", "  s3cr3t-signing-key  ");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        assert_eq!(
+            config
+                .tenancy
+                .jwt_secret
+                .as_ref()
+                .map(|s| s.expose_secret().to_owned()),
+            Some("s3cr3t-signing-key".to_string())
+        );
+
+        // Empty value clears the secret.
+        let env = MockEnv::new().with("AUTUMN_TENANCY__JWT_SECRET", "   ");
+        let mut config = AutumnConfig::default();
+        config.tenancy.jwt_secret = Some(secrecy::SecretString::from("preexisting".to_string()));
+        config.apply_env_overrides_with_env(&env);
+        assert!(config.tenancy.jwt_secret.is_none());
     }
 
     #[test]
