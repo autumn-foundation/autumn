@@ -145,10 +145,18 @@ fn index_renders_search_box_wired_to_results_route() {
         "search input must target the generated results route/container:\n{routes}"
     );
     // htmx isn't loaded by the shared layout, so the index inlines the script
-    // and keeps a <noscript> plain listing for graceful degradation.
+    // and renders the initial list server-side inside the `active_search`
+    // target container — so htmx swaps have somewhere to land, the first paint
+    // needs no extra AJAX round-trip, and non-JS visitors still see the list.
     assert!(
-        routes.contains("HTMX_JS_PATH") && routes.contains("noscript"),
-        "search index must inline htmx and degrade without JS:\n{routes}"
+        routes.contains("HTMX_JS_PATH") && routes.contains("id=\"posts-search-results\""),
+        "search index must inline htmx and render the results container:\n{routes}"
+    );
+    // The broken `.initial_load()` + `<noscript>` combination (target-less swap
+    // plus a duplicate DB query) must be gone.
+    assert!(
+        !routes.contains(".initial_load(") && !routes.contains("noscript"),
+        "search index must not use initial_load/noscript:\n{routes}"
     );
 }
 
@@ -167,6 +175,12 @@ fn search_handler_calls_search_page_with_empty_fallback() {
     assert!(
         routes.contains("repo.page(&page_req).await?"),
         "an empty query must fall back to page():\n{routes}"
+    );
+    // The results pager preserves the request's raw query string so `q` survives
+    // pagination (via PagerOptions::query, no hand-rolled percent-encoding).
+    assert!(
+        routes.contains("PagerOptions::new(\"/posts/search\").query(pager_query)"),
+        "search pager must preserve the query string across pages:\n{routes}"
     );
 }
 

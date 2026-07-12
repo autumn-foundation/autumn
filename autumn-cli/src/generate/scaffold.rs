@@ -2365,12 +2365,15 @@ fn render_routes_file(
 
     let list_render = if live { &live_ul_render } else { &table_render };
     // The list + pager block the index handler renders. When searchable (AC3),
-    // this becomes an `active_search` box wired to `GET /{plural}/search`, with
-    // the plain data_table list kept in a `<noscript>` so the page still shows
-    // its rows and search still works without JavaScript. The shared
-    // `crate::layout` does not load htmx, so an htmx `<script>` is inlined here.
-    // When not searchable (or a live variant), it is exactly the previous
-    // `{list_render}` + `pagination_nav` pair — byte-for-byte identical (AC4).
+    // this becomes an `active_search` box wired to `GET /{plural}/search` sitting
+    // above the live `#{plural}-search-results` container that htmx swaps into.
+    // The initial `{list_render}` + pager render server-side *inside* that
+    // container, so the first paint needs no extra AJAX round-trip (no
+    // `.initial_load()`) and non-JavaScript visitors still see the full list.
+    // The shared `crate::layout` does not load htmx, so an htmx `<script>` is
+    // inlined here. When not searchable (or a live variant), it is exactly the
+    // previous `{list_render}` + `pagination_nav` pair — byte-for-byte identical
+    // (AC4).
     let pager_line =
         format!(r#"(pagination_nav(&page_data, &PagerOptions::new(&paths::index())))"#);
     let index_list_block = if search_enabled {
@@ -2378,8 +2381,8 @@ fn render_routes_file(
             "script src=(autumn_web::htmx::HTMX_JS_PATH) {{}}\n        \
              (autumn_web::widgets::active_search(\"{snake_name}-search\", \"Search {pascal_name}s\", \
              &autumn_web::widgets::ActiveSearchConfig::new(\"/{plural}/search\", \"#{plural}-search-results\")\
-             .placeholder(\"Search {pascal_name}s…\").initial_load()))\n        \
-             noscript {{\n            {list_render}\n            {pager_line}\n        }}"
+             .placeholder(\"Search {pascal_name}s…\")))\n        \
+             div id=\"{plural}-search-results\" {{\n            {list_render}\n            {pager_line}\n        }}"
         )
     } else {
         format!("{list_render}\n        {pager_line}")
@@ -2685,11 +2688,14 @@ pub async fn index(
 
     // Issue #1319: the FTS results handler backing the index `active_search`
     // box. For htmx requests it returns just the results fragment (swapped into
-    // `#{plural}-search-results`); for a plain navigation — the `<noscript>`
-    // fallback form, or a shared pager link — it returns the full page so search
-    // degrades gracefully without JavaScript. An empty `q` falls back to the
-    // standard `page(&page_req)` listing (AC3). Reuses the same `columns` and
+    // `#{plural}-search-results`); for a plain navigation — a bookmarked search
+    // URL, or a shared pager link — it returns the full page so search degrades
+    // gracefully without JavaScript. An empty `q` falls back to the standard
+    // `page(&page_req)` listing (AC3). Reuses the same `columns` and
     // reference-label loads the index builds so search rows render identically.
+    // The pager preserves the request's raw query string (stripping `page`/
+    // `size`) via `PagerOptions::query`, so `q` survives pagination without any
+    // hand-rolled percent-encoding.
     let search_handler = if search_enabled {
         let field_list = searchable.join(", ");
         let (repo_extractor, repo_bind) = if sharded {
@@ -2711,7 +2717,7 @@ pub async fn index(
 /// Powers the `active_search` box on the index list. Ranked by relevance via
 /// the repository's `search_page`; an empty `q` falls back to the plain
 /// `page(&page_req)` listing. htmx requests get only the results fragment;
-/// non-htmx navigations (the `<noscript>` form, or a pager link) get a full
+/// non-htmx navigations (a bookmarked search URL, or a pager link) get a full
 /// page so search still works without JavaScript.
 #[derive(serde::Deserialize)]
 pub struct SearchQuery {{
@@ -2722,11 +2728,16 @@ pub struct SearchQuery {{
 #[get("/{plural}/search")]
 pub async fn search(
     autumn_web::extract::Query(query): autumn_web::extract::Query<SearchQuery>,
+    autumn_web::reexports::axum::extract::RawQuery(raw_query): autumn_web::reexports::axum::extract::RawQuery,
     page_req: PageRequest,
     hx: autumn_web::htmx::HxRequest,
 {repo_extractor}    flash: Flash,
 ) -> AutumnResult<Markup> {{
 {repo_bind}    let q = query.q.trim();
+    // Preserve the request's raw query string (already percent-encoded) on pager
+    // links so `q` survives pagination; `PagerOptions::query` strips the stale
+    // `page`/`size` params and re-adds them per link.
+    let pager_query = raw_query.as_deref().unwrap_or("");
     let page_data: Page<{pascal_name}> = if q.is_empty() {{
         repo.page(&page_req).await?
     }} else {{
@@ -2734,7 +2745,7 @@ pub async fn search(
     }};
 {index_label_loads}{index_columns_labeled}    let results = html! {{
         (autumn_web::widgets::data_table(&page_data.content, &columns, &autumn_web::widgets::DataTableConfig::new("No {plural} found.").base_path("/{plural}/search")))
-        (pagination_nav(&page_data, &PagerOptions::new("/{plural}/search")))
+        (pagination_nav(&page_data, &PagerOptions::new("/{plural}/search").query(pager_query)))
     }};
     if hx.is_htmx {{
         return Ok(results);
@@ -9160,10 +9171,25 @@ async fn main() {
                 && routes.contains("\"/posts/search\", \"#posts-search-results\""),
             "index must render the search input wired to the results route: {routes}"
         );
+        // The `active_search` target must exist as a real element that renders
+        // the initial list server-side (no `.initial_load()` AJAX round-trip, no
+        // `<noscript>` fallback wrapper).
+        assert!(
+            routes.contains("div id=\"posts-search-results\"")
+                && !routes.contains(".initial_load(")
+                && !routes.contains("noscript"),
+            "index must render the results container server-side without initial_load/noscript: {routes}"
+        );
         assert!(
             routes.contains("pub async fn search(")
                 && routes.contains("repo.search_page(q, &page_req)"),
             "a search results handler must call search_page: {routes}"
+        );
+        // The results pager must preserve the request query (so `q` survives
+        // pagination) instead of pointing at a bare `/posts/search`.
+        assert!(
+            routes.contains("PagerOptions::new(\"/posts/search\").query(pager_query)"),
+            "search pager must preserve the query string across pages: {routes}"
         );
         assert!(
             routes.contains("repo.page(&page_req).await?"),
