@@ -2937,6 +2937,17 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             let ident = &f.ident;
             let ty = &f.ty;
             let attrs = user_attrs(f);
+            // #1778: keep the field's full `#[validate(...)]` rules on the read
+            // model so the *effective merged model* (existing row ∪ patch) can be
+            // validated on the update path via `from_patch`. The model's fields
+            // are concrete `T` (not `Patch<T>`), so every validator — including
+            // the ones the `Patch<T>` path cannot express (`ip` on `Option`,
+            // `does_not_contain`, and the cross-field `custom`/`must_match`/
+            // `nested`) — compiles and runs here without hitting the E0119
+            // trait-coherence walls that block them on `Patch<T>`. The struct
+            // only derives `validator::Validate` when `has_validation` is set
+            // (see below), so the attribute is always registered when present.
+            let val_attrs = validate_attrs(f);
             // Encrypted columns route through an AEAD wrapper transparently:
             // `serialize_as` encrypts on write, `deserialize_as` decrypts on read.
             // The public field stays a plain `String` (plaintext in Rust code).
@@ -2952,7 +2963,7 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             // `skip`) keeps `Deserialize` intact.
             let private = (field_hidden_from_json(f) && !field_already_skips_serialization(f))
                 .then(|| quote! { #[serde(skip_serializing)] });
-            quote! { #(#attrs)* #enc #private pub #ident: #ty }
+            quote! { #(#val_attrs)* #(#attrs)* #enc #private pub #ident: #ty }
         })
         .collect();
 
@@ -3043,6 +3054,30 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // Conditional Validate derive
     let validate_derive = if has_validation {
         quote! { #[derive(::autumn_web::reexports::validator::Validate)] }
+    } else {
+        quote! {}
+    };
+
+    // #1778: statement that validates the effective *merged model* inside
+    // `from_patch` (existing row ∪ patch). Because `after` is a concrete `#name`
+    // — not `Patch<T>` — the model's `#[validate(...)]` rules run against real
+    // values, so the validators that hit E0119 coherence walls on `Patch<T>`
+    // (`ip` on `Option`, `does_not_contain`) and the cross-field ones
+    // (`custom`, `must_match`, `nested`) are all enforced on the update path,
+    // returning the same 422 field-error map as create. Runs before the
+    // `before_update` hook, mirroring create (where `validate_new` runs before
+    // `before_create`). Emitted only when the model declares validation; when it
+    // does not there is nothing to check and the model derives no `Validate`.
+    let merged_validate_stmt = if has_validation {
+        quote! {
+            {
+                #[allow(unused_imports)]
+                use ::autumn_web::validation::{
+                    MaybeValidateFallback as _, MaybeValidateViaValidator as _,
+                };
+                (&::autumn_web::validation::MaybeValidate(&after)).autumn_maybe_validate()?;
+            }
+        }
     } else {
         quote! {}
     };
@@ -4153,6 +4188,12 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
         #[derive(#name_debug_derive Clone, ::diesel::Queryable, ::diesel::Selectable, ::diesel::AsChangeset, ::diesel::Insertable)]
         #[derive(::serde::Serialize, ::serde::Deserialize)]
+        // #1778: derive `validator::Validate` on the read model (gated on
+        // `has_validation`, symmetric with New*/Update*) so the merged model
+        // built by `from_patch` can be validated on the update path. See the
+        // `query_fields` comment for why concrete `T` fields dodge the E0119
+        // walls that block the same validators on `Patch<T>`.
+        #validate_derive
         #[diesel(table_name = #table_ident)]
         #(#filtered_outer_attrs)*
         #vis struct #name {
@@ -4371,6 +4412,11 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 // (before validation / persistence), so the DB observes the
                 // canonical value. No-op when no columns normalize.
                 #(#normalize_draft_stmts)*
+                // #1778: validate the effective merged model (existing row ∪
+                // patch, post-normalization) so the full `#[validate(...)]` set
+                // runs against concrete values. No-op when the model declares no
+                // validation.
+                #merged_validate_stmt
                 Ok(Self::new_with_changes(current.clone(), after))
             }
 
@@ -5678,6 +5724,83 @@ mod tests {
         assert!(
             !upd_section.contains("custom"),
             "UpdateUser must NOT carry the non-declarative `custom` validator: {upd_section}"
+        );
+    }
+
+    #[test]
+    fn read_model_keeps_full_validator_set_and_from_patch_validates_merged_model() {
+        // #1778: the read model retains EVERY `#[validate(...)]` rule (including
+        // the ones dropped from the `Patch<T>` update fields, e.g. `custom`) and
+        // derives `validator::Validate`, so `from_patch` can validate the
+        // effective merged model (existing row ∪ patch) on the update path.
+        let output = model_macro(
+            TokenStream::new(),
+            quote! {
+                pub struct User {
+                    #[id]
+                    pub id: i64,
+                    #[validate(length(min = 1), custom(function = "v"))]
+                    pub name: String,
+                }
+            },
+        );
+        let generated = output.to_string();
+
+        // Slice the read-model `struct User` body (first occurrence, before
+        // `NewUser`/`UpdateUser`/`UserChangeset`).
+        let read_start = generated
+            .find("struct User")
+            .expect("read model struct must be generated");
+        let read_end = read_start
+            + generated[read_start..]
+                .find('}')
+                .expect("read model struct must close");
+        let read_section = &generated[read_start..read_end];
+        assert!(
+            read_section.contains("length") && read_section.contains("custom"),
+            "read model must keep the FULL validator set (incl. `custom`, which the \
+             Patch<T> update fields drop) so the merged model can enforce it: {read_section}"
+        );
+
+        // The read model now derives `Validate` too, so the derive appears three
+        // times (read model + NewUser + UpdateUser) rather than twice.
+        let derive_count = generated.matches("validator :: Validate").count();
+        assert_eq!(
+            derive_count, 3,
+            "read model, NewModel, and UpdateModel must each derive `validator::Validate`: {generated}"
+        );
+
+        // `from_patch` validates the merged concrete model via the autoref
+        // `MaybeValidate` specialization (same 422 mapping as create).
+        assert!(
+            generated.contains("from_patch") && generated.contains("autumn_maybe_validate"),
+            "from_patch must validate the merged model via autumn_maybe_validate: {generated}"
+        );
+    }
+
+    #[test]
+    fn read_model_without_validation_does_not_derive_validate_or_validate_on_merge() {
+        // Symmetric guard: a model with no `#[validate(...)]` rules must NOT gain
+        // a `Validate` derive on the read model nor a merged-model check in
+        // `from_patch` — the autoref no-op is only paid for by validated models.
+        let output = model_macro(
+            TokenStream::new(),
+            quote! {
+                pub struct Plain {
+                    #[id]
+                    pub id: i64,
+                    pub name: String,
+                }
+            },
+        );
+        let generated = output.to_string();
+        assert!(
+            !generated.contains("validator :: Validate"),
+            "an unvalidated model must not derive `validator::Validate`: {generated}"
+        );
+        assert!(
+            !generated.contains("autumn_maybe_validate"),
+            "an unvalidated model's from_patch must not emit a merged-model check: {generated}"
         );
     }
 
