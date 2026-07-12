@@ -394,9 +394,10 @@ the model instead of the repository **(unreleased — trunk-dev, issues #1738,
   `on_delete = destroy`). The repository codegen consults this at run time (via
   a generated `Model::dependents()`) when no repository-side `dependent(...)` is
   present; the repository attribute wins when both are declared. Ships for
-  `destroy`, `delete_all`, and `restrict`, grandchild recursion and the
-  `delete_many` bulk path included; `dependent = nullify` is a deferred
-  follow-up, and `dependent`/`on_delete` on a `through = <join_table>`
+  `destroy`, `delete_all`, `nullify`, and `restrict`, grandchild recursion and
+  the `delete_many` bulk path included; only both-sites conflict diagnostics are
+  a deferred follow-up (when both sites declare, the repository attribute
+  silently wins), and `dependent`/`on_delete` on a `through = <join_table>`
   association is a compile error (issue #1738).
 
 See `docs/guide/repositories.md`.

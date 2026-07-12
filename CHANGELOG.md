@@ -1090,11 +1090,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   still wins when both are declared), so `#[has_many(Child, dependent =
   destroy)]` drives the same transactional cascade — grandchild recursion and
   the `delete_many` bulk path included — with no repository attribute required.
-  This model form ships for `destroy`, `delete_all`, and `restrict`; `dependent
-  = nullify` and both-sites conflict diagnostics are deferred follow-ups, and a
-  `dependent`/`on_delete` on a `through = <join_table>` association is a directed
-  compile error rather than a mis-targeted cascade (issue #1738). See
-  `docs/guide/repositories.md`.
+  This model form ships for `destroy`, `delete_all`, `nullify`, and `restrict`
+  (grandchild recursion and the `delete_many` bulk path included), driving the
+  same runtime cascade as the repository attribute; only both-sites conflict
+  diagnostics are a deferred follow-up — when both a repository-side
+  `dependent(...)` and a model-side `dependent`/`on_delete` are declared the
+  repository attribute silently wins — and a `dependent`/`on_delete` on a
+  `through = <join_table>` association is a directed compile error rather than a
+  mis-targeted cascade (issue #1738). See `docs/guide/repositories.md`.
 - **audit:** version/audit writes are auto-attributed to the current actor. A new
   `autumn_web::current` module carries a request-scoped actor
   (`Current::set_actor` / `Current::actor`, plus `Current::set_default_actor` for
