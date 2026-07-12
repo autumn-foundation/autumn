@@ -43,11 +43,16 @@ class Resp:
         return self.headers.get("content-type", "")
 
 
-def request(method, path, body=None):
-    """Perform an HTTP request. `path` may be absolute or relative to BASE_URL."""
+def request(method, path, body=None, accept="application/json"):
+    """Perform an HTTP request. `path` may be absolute or relative to BASE_URL.
+
+    `accept` controls the Accept header: JSON endpoints keep the default, while
+    the server-rendered HTML view is fetched with ``accept="text/html"`` so a
+    content-negotiating server isn't wrongly asked for JSON on an HTML route.
+    """
     url = path if path.startswith("http") else BASE_URL + path
     data = None
-    headers = {"Accept": "application/json"}
+    headers = {"Accept": accept}
     if body is not None:
         data = json.dumps(body).encode("utf-8")
         headers["Content-Type"] = "application/json"
@@ -216,7 +221,7 @@ def run():
         ar = request("POST", f"/api/habits/{hidden_hid}/archive")
         html_setup_ok = ar.status in (200, 204)
     if html_setup_ok:
-        r = request("GET", "/")
+        r = request("GET", "/", accept="text/html")
         html_ok = r.status == 200 and "text/html" in r.content_type().lower()
         body_text = r.body_bytes.decode("utf-8", "replace") if html_ok else ""
         check(
