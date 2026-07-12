@@ -366,13 +366,40 @@ child cleanup **(unreleased — trunk-dev)**:
 pub trait PostRepository {}
 ```
 
-`on_delete` = `destroy` (soft-delete-aware, fires each child's hooks — does
-**not** recurse into the child's own `dependent`) | `delete_all` (bulk delete,
-no child hooks) | `nullify` (set the FK null) | `restrict` (probe for
-referencing rows *before* mutating; errors `cannot delete: dependent N row(s) …`
-if any still exist). The generated `delete_by_id` loads and locks the parent,
-applies every declared action, then deletes the parent — all in a single
-transaction (Part of #1369). See `docs/guide/repositories.md`.
+`on_delete` = `destroy` (soft-delete-aware, fires each child's hooks; on
+trunk-dev this **now recurses** into each child's own `dependent`, cascading
+into grandchildren — see the recursive/bulk/model-side note below) |
+`delete_all` (bulk delete, no child hooks) | `nullify` (set the FK null) |
+`restrict` (probe for referencing rows *before* mutating; errors `cannot delete:
+dependent N row(s) …` if any still exist). The generated `delete_by_id` loads and
+locks the parent, applies every declared action, then deletes the parent — all in
+a single transaction (Part of #1369). See `docs/guide/repositories.md`.
+
+On trunk-dev the cascade is recursive and bulk-aware, and can be declared on
+the model instead of the repository **(unreleased — trunk-dev, issues #1738,
+#1739, #1740)**:
+
+- **Grandchildren cascade.** `destroy` now recurses — each destroyed child runs
+  its OWN `dependent(...)` before its row is removed, so a `Post -> Comment ->
+  Reply` graph clears `Reply` rows too, all in one transaction. A self- or
+  mutually-referential graph terminates via a `(table, id)` cycle guard rather
+  than looping; `delete_all` stays single-level by design (issue #1739).
+- **Bulk `delete_many`.** The generated `delete_many` runs the same
+  restrict/destroy/`delete_all`/`nullify` cascade per affected parent inside its
+  transaction — restrict probes first (a `409` rolls the whole batch back) — so
+  bulk-deleting parents no longer orphans or FK-errors dependent children
+  (issues #1740, #1787).
+- **Model-side declaration.** Declare the cascade on the association instead of
+  the repository attribute: `#[has_many(Comment, dependent = destroy)]` (or
+  `on_delete = destroy`). The repository codegen consults this at run time (via
+  a generated `Model::dependents()`) when no repository-side `dependent(...)` is
+  present; the repository attribute wins when both are declared. Ships for
+  `destroy`, `delete_all`, and `restrict`, grandchild recursion and the
+  `delete_many` bulk path included; `dependent = nullify` is a deferred
+  follow-up, and `dependent`/`on_delete` on a `through = <join_table>`
+  association is a compile error (issue #1738).
+
+See `docs/guide/repositories.md`.
 
 ### Model state machines — `#[state_machine]`
 
@@ -474,6 +501,29 @@ create/update handlers validate the decoded payload before touching the DB:
   `Validate` derive compile to a no-op via the autoref `MaybeValidate`
   specialization (no migration burden), and this applies to plain and
   policy-backed handlers (#1237, #1253). See `docs/guide/pagination.md`.
+
+### Partial-update validation — the effective merged model (unreleased — trunk-dev, issue #1778)
+
+On a repository with `hooks = ...`, a `PATCH`/`PUT` update now validates the
+**effective merged model** — the existing row ∪ the patch, after normalization —
+not only the patch struct's own fields. `#[model]` derives `validator::Validate`
+on the read model (gated on `has_validation`, symmetric with the `New*`/`Update*`
+models) and keeps the full `#[validate(...)]` set there; the generated
+`from_patch` validates the reconstructed concrete model before returning the
+draft, running before `before_update` (mirroring create, where validation runs
+before `before_create`). Because the merged model's fields are concrete `T`
+rather than `Patch<T>`, validators that cannot be expressed on `Patch<T>` — `ip`
+on `Option` fields and `does_not_contain` (E0119 trait-coherence walls under
+validator `0.20`), plus the cross-field `custom`/`must_match`/`nested` (no
+single-field `Patch<T>` trait) — are now enforced on update, returning the same
+**422** field-error map as create.
+
+This covers every update path that builds a draft via `from_patch` (hooked
+repositories and their `--api` handlers). The blind `__to_changeset` update paths
+(plain/`api`/`policy` repositories without hooks) still run only the patch-struct
+validators (follow-up: issue #1801). The `Patch<T>` per-field impls and the
+`UpdateModel` denylist are unchanged, so this is backward compatible (issue
+#1778). See `docs/guide/repositories.md`.
 
 ### Transactions
 
@@ -1098,6 +1148,15 @@ subset of queues — all config-only, no app-code change:
 - **Per-queue actuator gauges** — `<actuator-prefix>/jobs` adds a `queues` key
   with per-queue `depth` and `oldest_waiting_age_ms` alongside the existing
   per-job-type gauges (per-process approximations on multi-process backends).
+- **Backend-derived queue gauges (unreleased — trunk-dev, issue #1752)** — on
+  the durable backends (Postgres/Redis) those `queues` gauges and the
+  per-job-type `queued` counter are no longer per-process approximations: a
+  periodic survey of the durable store (Redis every 2s, the interval doubling as
+  the gauge cache TTL) wholesale-replaces this process's local enqueue marks each
+  tick, so an enqueue-only `web` replica reports the true shared backlog and a
+  queue absent from the latest survey resets to `depth` 0. The Redis survey pages
+  the whole due-delayed ZSET so scheduled/retry bursts count exactly. The `local`
+  backend keeps the in-process mark path. See `docs/guide/jobs.md`.
 - **`ProcessRole` on `AppState`** — `state.role()` returns the resolved
   `ProcessRole` (exported at `autumn_web::ProcessRole`) with `serves_http()` /
   `runs_workers()` predicates, so app-owned background loops in `on_startup`
@@ -1128,6 +1187,8 @@ to look" actuator pointer:
 - **High 5xx rate** — the rolling 5xx rate crosses `error_rate_threshold`
   (default `0.05`, a fraction in `(0, 1]`) over ≥ `error_rate_min_requests`.
 - **Scheduled-task failure** — a `#[scheduled]`/framework task returns an error.
+  A failed `autumn db backup` offsite upload also raises this condition
+  **(unreleased — trunk-dev, issue #1743)**.
 
 Delivery is best-effort and off the request path (background tick every
 `eval_interval_secs`, default 30), reuses your existing mailer + outbound-webhook
@@ -1138,6 +1199,42 @@ Slack, …) by implementing `AlertChannel` and registering it with
 `AppBuilder::with_alert_channel`. `autumn doctor` warns (in production) on a
 missing or unusable destination — see the `doctor` skill. See
 `docs/guide/operator-alerts.md`.
+
+### Native transports (unreleased — trunk-dev, issue #1630)
+
+PagerDuty, Slack, and Discord now ship as built-in `AlertChannel`s — no code,
+just `[alerts]` keys (each with an `AUTUMN_ALERTS__*` env override):
+
+```toml
+[alerts]
+pagerduty_routing_key = "…"   # Events API v2 integration key; enables PagerDuty
+pagerduty_url = "https://events.pagerduty.com/v2/enqueue"  # optional override
+pagerduty_severities = "all"  # "all" (default) | "critical"
+slack_webhook_url = "https://hooks.slack.com/services/…"
+slack_severities = "all"
+discord_webhook_url = "https://discord.com/api/webhooks/…/slack"  # append /slack
+discord_severities = "all"
+```
+
+- **PagerDuty** delivers each alert as an Events API v2 event correlated on the
+  alert's stable `dedup_key`, so a repeating condition folds into one incident
+  and a `recovery` auto-resolves it — keep `pagerduty_severities = "all"` so the
+  `resolve` event reaches PagerDuty. `pagerduty_url` targets any
+  PagerDuty-Events-compatible endpoint.
+- **Slack / Discord** post a human-readable message; Discord reuses Slack's
+  payload dialect via its `/slack`-suffixed endpoint. Both require an absolute
+  `https` webhook URL (enforced at runtime and by `autumn doctor`).
+- **Per-channel severity routing** — `*_severities = "critical"` sends only
+  firing alerts (recoveries suppressed); `"all"` (default) sends both. An alert
+  below a channel's threshold is never delivered to it (`AlertChannel::accepts_severity`).
+- All outbound calls reuse the SSRF-hardened HTTP client and stay off the
+  request path. A native transport counts as a destination, so configuring one
+  satisfies `autumn doctor --strict` without `[alerts] email`/`webhook_url`.
+- `autumn alert test [--channel <name>]` fires a synthetic alert through each
+  configured outbound-HTTP channel (email is excluded) and reports per-channel
+  success/error.
+
+(issue #1630). See `docs/guide/operator-alerts.md`.
 
 ## Observability defaults
 
@@ -1261,6 +1358,60 @@ bounded `each_shard` fan-out); install custom routing with
 There are no cross-shard queries or transactions by design. See
 `docs/guide/sharding.md` and `examples/bookmarks-sharded`.
 
+## Per-tenant memory cells (unreleased — trunk-dev, issue #1766)
+
+Row-level tenancy scopes a tenant's *rows*; per-tenant memory cells bound a
+tenant's *in-process memory*. Each resolved tenant gets a `TenantCell` — a
+byte-accounting boundary with a soft quota and an owned scratch buffer — minted
+lazily by the process-wide `TenantCellRegistry` on the first call to
+`current_tenant_cell()` (returns `Option<Arc<TenantCell>>`; `None` when tenancy
+is disabled or no tenant is bound, so a route outside a tenant context degrades
+gracefully). Reach for it in a handler, charge the memory you want bounded, and
+let the RAII guard release it:
+
+```rust
+use autumn_web::prelude::*;
+use autumn_web::tenant_cell::current_tenant_cell;
+
+#[post("/reports")]
+async fn build_report() -> AutumnResult<String> {
+    // Over-quota tenants get a 503 here via `?`; the charge releases on drop.
+    let _charge = match current_tenant_cell() {
+        Some(cell) => Some(cell.try_charge(512 * 1024)?),
+        None => None, // tenancy disabled / no tenant bound
+    };
+    Ok(expensive_render().await?)
+}
+```
+
+- `try_charge(n)` reserves *before* you allocate and hands back a `Charge`
+  guard; the per-tenant scratch store
+  (`scratch_insert`/`scratch_get`/`scratch_remove`) is charged by allocation
+  **capacity** (not length) plus a fixed per-entry overhead
+  (`TenantCell::scratch_entry_overhead()`).
+- A charge over quota fails **only that tenant's** request — `QuotaExceeded`
+  converts to `AutumnError` as HTTP **503**; every other tenant's counter is
+  independent, so one whale degrades only its own traffic.
+- Configure under `[tenancy]`: `quota_bytes` (soft quota; `0`, the default,
+  disables it), `max_cells` (LRU cap on resident cells) and `idle_ttl_secs`
+  (idle eviction) — both `0` by default, both enforced lazily on cell insert.
+  The quota is stored atomically and refreshed on every access (retune-ready;
+  no config-reload path exists yet).
+- The whole `[tenancy]` section is settable from the environment via
+  `AUTUMN_TENANCY__*` (e.g. `AUTUMN_TENANCY__QUOTA_BYTES`,
+  `AUTUMN_TENANCY__MAX_CELLS`, `AUTUMN_TENANCY__IDLE_TTL_SECS`).
+- Eviction — manual `TenantCellRegistry::evict(tenant_id)` or automatic
+  (`max_cells`/`idle_ttl_secs`) — reclaims tracked bytes on `Drop`; an in-flight
+  request keeps its own cached `Arc<TenantCell>` to completion, so evicting
+  mid-request never resets a running request's state. This is a tracked-bytes
+  accounting boundary via `tracked_bytes()` / `total_tracked_bytes()`, **not**
+  RSS — allocations made outside the cell API are invisible by design.
+
+`TenantCell`/`TenantCellRegistry`/`current_tenant_cell` live in
+`autumn_web::tenant_cell` (not in the prelude). Orthogonal to sharding: sharding
+picks the *database*, cells bound *process memory*. See
+docs/guide/tenant-cells.md (issue #1766).
+
 ## Error handling
 
 JSON errors are standardized as RFC 7807-style Problem Details.
@@ -1372,6 +1523,7 @@ autumn i18n check                # compare t!/t(...) keys vs i18n/*.ftl; --stric
 autumn test                      # provision/target an isolated *_test DB, migrate, then cargo test
 autumn test --reset -- --nocapture   # drop+recreate the test DB; forward args to the harness
 autumn db backup --keep 7        # dump control DB + shards to ./backups/<profile>/<ts>/; db restore <artifact> reverses it
+autumn db backup --upload --keep 7   # + upload each verified run offsite (S3/MinIO/R2); db offsite list; db restore offsite:<profile>/latest  # (unreleased — trunk-dev)
 autumn seed --count 50 --model Post  # generate+insert 50 faked rows via the model's factory (both flags together)
 autumn serve --role worker       # run only workers + scheduler (web/worker split); also --role web|combined
 ```
@@ -1458,6 +1610,48 @@ prunes to the newest N runs. `autumn db restore <ARTIFACT> [--shard NAME]
 [--force]` verifies every artifact before touching a database and is gated by the
 same production guard as `db drop` (refuses non-dev/test without `--force`). See
 `docs/guide/deployment.md`.
+
+### Offsite S3 backups (unreleased — trunk-dev, issue #1619)
+
+`autumn db backup --upload` (or `[backup.offsite] auto_upload = true`) uploads
+each completed local run to an S3-compatible offsite destination (AWS S3,
+`MinIO`, Cloudflare R2, Backblaze B2, Garage) **after** local verification
+passes, then HEAD/GET-verifies every remote object matches before reporting
+success; a local-good / upload-failed run exits non-zero with a split-outcome
+message and leaves the local artifact intact. Configure it in `autumn.toml`:
+
+```toml
+[backup.offsite]
+auto_upload = true          # upload after every `autumn db backup`, no --upload
+prefix = "db"               # objects keyed {prefix}/{profile}/{timestamp}/{file}
+keep = 30                   # independent remote retention (prune after verify)
+# allow_shared_bucket = true  # opt-in to reuse the app's [storage.s3] bucket
+
+[backup.offsite.s3]
+bucket   = "myapp-db-offsite"
+region   = "auto"
+endpoint = "https://<accountid>.r2.cloudflarestorage.com"
+force_path_style = true
+access_key_id_env     = "AUTUMN_OFFSITE_ACCESS_KEY_ID"    # names, not values
+secret_access_key_env = "AUTUMN_OFFSITE_SECRET_ACCESS_KEY"
+```
+
+Every key has an `AUTUMN_BACKUP__OFFSITE__*` override (e.g.
+`AUTUMN_BACKUP__OFFSITE__S3__BUCKET`) and honors profile overlays
+(`[profile.prod.backup.offsite]`). Credentials are **env-var indirection** only
+— config names the env vars the secrets are read from; the values never live in
+config, argv, logs, or errors. `autumn db offsite list [--profile P]` shows the
+offsite runs for the active profile; `autumn db restore
+offsite:<profile>/<timestamp|latest>` (or `--offsite`) downloads a run to a temp
+dir and applies the same integrity verification and production `--force` guard as
+a local restore. The transfer client is a dependency-light synchronous `SigV4`
+client streamed end-to-end (multipart above 64 MiB — S3 caps a single
+`PutObject` at 5 GiB — with a server-side `x-amz-checksum-sha256`). `autumn
+doctor` adds an informational `offsite_backup` check (see the `doctor` skill),
+and a failed upload raises a `ScheduledTaskFailure` operator alert when
+`[alerts]` is configured (issue #1743). Pointing the offsite bucket at the app's
+own `[storage.s3]` bucket needs `allow_shared_bucket = true`. See
+`docs/guide/daemon.md`.
 
 `autumn destroy` mirrors `autumn generate` argument-for-argument and never
 touches a database — it only reverses generated files/migrations.
