@@ -4351,6 +4351,7 @@ impl AppBuilder {
     async fn run_dump_jobs_mode(self) {
         let Self {
             jobs,
+            listeners,
             config_loader_factory,
             telemetry_provider,
             ..
@@ -4359,7 +4360,10 @@ impl AppBuilder {
         let (config, _telemetry_guard) =
             load_config_and_telemetry(config_loader_factory, telemetry_provider).await;
 
-        let manifest = crate::job::render_jobs_manifest(&config.jobs.queues, &jobs);
+        // Fold in the synthesized durable-listener jobs exactly as the boot path
+        // does, so the manifest reflects the same effective drained-queue set the
+        // runtime drains (including the `default` queue those jobs land on).
+        let manifest = dump_jobs_manifest(&config.jobs.queues, jobs, listeners);
         print!("{manifest}");
         std::process::exit(0);
     }
@@ -5344,15 +5348,56 @@ fn run_state_initializers(initializers: Vec<StateInitializer>, state: &AppState)
 /// extractor, appends a job per durable listener so they ride the job runtime
 /// (retry + DLQ + restart-safety), and initializes the process-global bus used
 /// by the module-level `events::publish`.
+/// Build the [`EventRegistry`](crate::events::EventRegistry) from `listeners` and
+/// append the synthesized `default`-queue [`JobInfo`](crate::job::JobInfo) for
+/// each durable listener to `jobs`, returning the registry.
+///
+/// This is the pure, DB-free half of [`finalize_event_bus`]: it needs no live
+/// `AppState` or database, only the listener set. Both the boot path (through
+/// `finalize_event_bus`, which additionally wires the global bus onto live state)
+/// and the deliberately DB-free `AUTUMN_DUMP_JOBS=1` dump path
+/// ([`dump_jobs_manifest`]) funnel through here, so the emitted manifest can
+/// never omit the durable-listener jobs the runtime actually drains.
+fn synthesize_durable_listener_jobs(
+    listeners: Vec<crate::events::ListenerInfo>,
+    jobs: &mut Vec<crate::job::JobInfo>,
+) -> crate::events::EventRegistry {
+    let registry = crate::events::EventRegistry::from_listeners(listeners);
+    jobs.extend(registry.durable_job_infos());
+    registry
+}
+
 fn finalize_event_bus(
     listeners: Vec<crate::events::ListenerInfo>,
     jobs: &mut Vec<crate::job::JobInfo>,
     state: &AppState,
 ) {
-    let registry = crate::events::EventRegistry::from_listeners(listeners);
-    jobs.extend(registry.durable_job_infos());
+    let registry = synthesize_durable_listener_jobs(listeners, jobs);
     state.insert_extension(registry.clone());
     crate::events::init_global_event_bus(&registry, state, None);
+}
+
+/// Compute the `AUTUMN_DUMP_JOBS=1` jobs manifest for the dump path.
+///
+/// Mirrors the boot path's job set: the builder's registered `jobs` PLUS the
+/// synthesized `default`-queue jobs that [`finalize_event_bus`] appends for
+/// durable listeners before the runtime starts. Without folding those in, an app
+/// that registers a durable listener and configures `[jobs.queues]` without
+/// `default` would emit a manifest omitting `default`, letting a topology-aware
+/// `autumn doctor` accept a fleet where no tier drains the durable-listener jobs.
+///
+/// Only the pure job-synthesis half of `finalize_event_bus` runs here
+/// (via [`synthesize_durable_listener_jobs`]); the dump path is deliberately
+/// DB-free, so the live-state/global-bus wiring is skipped. Factored out so the
+/// boot and dump paths share one job-preparation seam and so it is unit testable
+/// without the process-exiting dump entrypoint.
+fn dump_jobs_manifest(
+    cfg: &crate::config::JobQueuesConfig,
+    mut jobs: Vec<crate::job::JobInfo>,
+    listeners: Vec<crate::events::ListenerInfo>,
+) -> String {
+    synthesize_durable_listener_jobs(listeners, &mut jobs);
+    crate::job::render_jobs_manifest(cfg, &jobs)
 }
 
 fn initialize_job_runtime(
@@ -7791,6 +7836,41 @@ mod tests {
         temp_env::with_var("AUTUMN_DUMP_JOBS", None::<&str>, || {
             assert!(!is_dump_jobs_mode(), "unset must not select the dump path");
         });
+    }
+
+    #[test]
+    fn dump_jobs_manifest_includes_synthesized_durable_listener_default_queue() {
+        // Regression (#1802, Codex P2): an app that registers a durable listener
+        // and configures `[jobs.queues]` WITHOUT `default` still drains `default`
+        // at runtime — `finalize_event_bus` synthesizes a `default`-queue
+        // `JobInfo` for each durable listener before the runtime starts. The
+        // `AUTUMN_DUMP_JOBS=1` manifest must reflect that same set through the
+        // shared `synthesize_durable_listener_jobs` seam, or a topology-aware
+        // `autumn doctor` would accept a fleet where no tier drains those jobs.
+        fn listener_handler(
+            _state: AppState,
+            _payload: serde_json::Value,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = crate::AutumnResult<()>> + Send + 'static>,
+        > {
+            Box::pin(async move { Ok(()) })
+        }
+        let durable = crate::events::ListenerInfo {
+            event_name: "UserSignedUp",
+            listener_name: "app::send_welcome_email".to_string(),
+            mode: crate::events::DispatchMode::Durable,
+            job_name: Some("__event_listener::send_welcome_email".to_string()),
+            max_attempts: 4,
+            initial_backoff_ms: 250,
+            handler: listener_handler,
+        };
+        let cfg = crate::config::JobQueuesConfig::strict_list(["critical"]);
+
+        // The dump path holds no builder-registered jobs, only the durable
+        // listener; the manifest must still surface `default` (where that
+        // listener's synthesized job runs) alongside the configured `critical`.
+        let manifest = dump_jobs_manifest(&cfg, Vec::new(), vec![durable]);
+        assert_eq!(manifest, "queues = [\"critical\", \"default\"]\n");
     }
 
     #[cfg(feature = "db")]
