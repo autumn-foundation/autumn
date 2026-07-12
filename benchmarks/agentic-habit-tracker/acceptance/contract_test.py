@@ -172,12 +172,25 @@ def run():
     r = request("POST", f"/api/habits/{deleted_id}/complete", {})
     check("POST complete unknown habit -> 404", r.status == 404, f"got {r.status}")
 
-    # basic streak: 3 consecutive backdated days ending today
+    # basic streak: 3 consecutive backdated days ending today. Anchor the dates
+    # to the SERVER's today, not the evaluator's local date: SPEC computes
+    # current_streak relative to the server clock, so a default completion tells
+    # us the server's D. Backdating relative to the evaluator's date would fail a
+    # correct server across a timezone / midnight-boundary skew.
     r = request("POST", "/api/habits", {"name": "Streaker"})
     check("POST streak habit -> 201", r.status == 201, f"got {r.status}")
     sid = r.json().get("id") if r.status == 201 else None
-    today = datetime.date.today()
-    for delta in (2, 1, 0):  # T-2, T-1, T
+    r0 = request("POST", f"/api/habits/{sid}/complete", {})  # default = server today
+    server_today = None
+    if r0.status == 201:
+        ds = (r0.json() or {}).get("date")
+        try:
+            server_today = datetime.date.fromisoformat(ds) if ds else None
+        except (ValueError, TypeError):
+            server_today = None
+    today = server_today or datetime.date.today()
+    check(f"complete {iso(today)} -> 201", r0.status == 201, f"got {r0.status}")
+    for delta in (1, 2):  # D-1, D-2 relative to the server's today
         d = today - datetime.timedelta(days=delta)
         rr = request("POST", f"/api/habits/{sid}/complete", {"date": iso(d)})
         check(f"complete {iso(d)} -> 201", rr.status == 201, f"got {rr.status}")
@@ -203,6 +216,9 @@ def run():
         f"content-type={r.content_type()!r}",
     )
 
+    # Denominator is intentionally fixed: every check above runs unconditionally
+    # (no setup-guard skips a dependent check), so a broken implementation is
+    # always charged the same total and pass rates stay comparable across runs.
     total = _PASSED + _FAILED
     print(f"RESULT: {_PASSED}/{total} passed")
     sys.exit(0 if _FAILED == 0 else 1)

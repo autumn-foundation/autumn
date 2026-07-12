@@ -117,6 +117,12 @@ def run():
         print("RESULT: 0/1 passed")
         sys.exit(1)
 
+    # Denominator is intentionally fixed at 16: each scenario contributes a
+    # constant number of checks. When a setup step (habit creation or the
+    # default completion) fails, the dependent checks are recorded as explicit
+    # failures instead of being skipped, so a broken implementation can never
+    # shrink the total and inflate its pass rate.
+
     # (a) default-active: a newly created habit is active — present in the default
     #     list and absent from ?archived=true.
     _, active_hid = new_habit("h-default-active")
@@ -126,6 +132,9 @@ def run():
               contains(id_list("/api/habits"), active_hid))
         check("(a) new habit absent from ?archived=true",
               not contains(id_list("/api/habits?archived=true"), active_hid))
+    else:
+        check("(a) new habit present in default list", False, "setup failed: no habit id")
+        check("(a) new habit absent from ?archived=true", False, "setup failed: no habit id")
 
     # (b) archive idempotency: POST archive twice -> both 200/204; H appears
     #     exactly once in ?archived=true and never in the default list.
@@ -143,6 +152,12 @@ def run():
               f"count={count}")
         check("(b) archived habit never in default list",
               not contains(id_list("/api/habits"), hid))
+    else:
+        check("(b) first archive -> 200/204", False, "setup failed: no habit id")
+        check("(b) second archive (idempotent) -> 200/204", False, "setup failed: no habit id")
+        check("(b) archived habit appears exactly once in ?archived=true", False,
+              "setup failed: no habit id")
+        check("(b) archived habit never in default list", False, "setup failed: no habit id")
 
     # (c) explicit ?archived=false mirrors the default (active only). SPEC §4 says
     #     this param MAY be treated the same as no query, so explicit support is
@@ -160,6 +175,11 @@ def run():
         else:
             check("(c) ?archived=false optional param handled without server error",
                   r.status < 500, f"got {r.status}")
+    else:
+        # This scenario always contributes exactly one check; record it as a
+        # failure when the active/archived witnesses were never created.
+        check("(c) ?archived=false returns only active habits", False,
+              "setup failed: missing active or archived witness")
 
     # (d) an archived habit still computes its streak correctly. Complete today
     #     (default date, so we use the server-returned date) and yesterday, then
@@ -187,6 +207,27 @@ def run():
             check("(d) archived habit history contains both completed dates",
                   today_str in hist and yesterday_str in hist,
                   f"history={hist}")
+        else:
+            # No server date to anchor the backdated day: record the five
+            # server-date-dependent checks as failures to keep the total fixed.
+            for label in (
+                "(d) complete yesterday (backdated) -> 201",
+                "(d) archive habit -> 200/204",
+                "(d) GET archived habit -> 200",
+                "(d) archived habit current_streak == 2",
+                "(d) archived habit history contains both completed dates",
+            ):
+                check(label, False, "setup failed: no server date")
+    else:
+        for label in (
+            "(d) complete today (default) -> 201",
+            "(d) complete yesterday (backdated) -> 201",
+            "(d) archive habit -> 200/204",
+            "(d) GET archived habit -> 200",
+            "(d) archived habit current_streak == 2",
+            "(d) archived habit history contains both completed dates",
+        ):
+            check(label, False, "setup failed: no habit id")
 
     total = _PASSED + _FAILED
     print(f"RESULT: {_PASSED}/{total} passed")

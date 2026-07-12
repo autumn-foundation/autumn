@@ -128,7 +128,26 @@ def run():
     check("POST /api/habits -> 201", r.status == 201, f"got {r.status}")
     check("created habit has id", hid is not None)
     if hid is None:
-        print(f"RESULT: {_PASSED}/{_PASSED + _FAILED} passed")
+        # Denominator is intentionally fixed at 14: a failed setup must not
+        # shrink the total and inflate the pass rate. Record every dependent
+        # check as an explicit failure instead of exiting early and skipping them.
+        for label in (
+            "newly created habit is active (archived false/absent AND not in archived list)",
+            "created habit present in default list",
+            "POST /api/habits/{id}/archive -> 200/204",
+            "archived habit absent from default list",
+            "archived habit present in ?archived=true list",
+            "GET archived habit -> 200",
+            "archived habit still has current_streak",
+            "archived habit still has history array",
+            "POST archive unknown id -> 404",
+            "POST second habit -> 201",
+            "non-archived habit still present in default list after archiving another",
+            "archived habit still absent from default list (regression)",
+        ):
+            check(label, False, "setup failed: no habit id")
+        total = _PASSED + _FAILED
+        print(f"RESULT: {_PASSED}/{total} passed")
         sys.exit(1)
     archived_field = r.json().get("archived")
     archived_ids = list_ids("/api/habits?archived=true")

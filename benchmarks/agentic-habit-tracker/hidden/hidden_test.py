@@ -21,7 +21,12 @@ import urllib.error
 import urllib.request
 
 BASE_URL = os.environ.get("BASE_URL", "http://localhost:8080").rstrip("/")
-TODAY = datetime.date.today()
+# SERVER_TODAY anchors every backdated streak date to the SERVER's clock rather
+# than the evaluator's local date. It is established at runtime (see run()) by
+# POSTing a default completion and reading the returned date, so a correct
+# server is not failed by a timezone / midnight-boundary skew. The module-level
+# value is only a fallback used before the probe runs.
+SERVER_TODAY = datetime.date.today()
 
 _PASSED = 0
 _FAILED = 0
@@ -85,8 +90,8 @@ def wait_for_server(timeout_s=30):
 
 
 def day(delta):
-    """ISO date string for TODAY - delta days."""
-    return (TODAY - datetime.timedelta(days=delta)).isoformat()
+    """ISO date string for the SERVER's today - delta days."""
+    return (SERVER_TODAY - datetime.timedelta(days=delta)).isoformat()
 
 
 def new_habit(name):
@@ -119,6 +124,27 @@ def run():
         print("RESULT: 0/1 passed")
         sys.exit(1)
 
+    # Establish the SERVER's today from a default completion (no date) so every
+    # backdated streak date below is anchored to the server clock. This probe
+    # habit is isolated from the scenarios and adds no checks, so the denominator
+    # is unchanged.
+    global SERVER_TODAY
+    probe = new_habit("_server-date-probe")
+    if probe is not None:
+        r = request("POST", f"/api/habits/{probe}/complete", {})
+        if r.status == 201:
+            ds = (r.json() or {}).get("date")
+            try:
+                if ds:
+                    SERVER_TODAY = datetime.date.fromisoformat(ds)
+            except (ValueError, TypeError):
+                pass
+
+    # Denominator is intentionally fixed: each scenario contributes a constant
+    # number of checks. When a setup step (habit creation) fails, the dependent
+    # checks are recorded as explicit failures below instead of being skipped,
+    # so a broken implementation can never shrink the total.
+
     # (a) gap before today: complete D-4, D-3, D-2; skip D-1 and today -> streak 0
     hid = new_habit("a-gap")
     check("(a) create habit", hid is not None)
@@ -128,6 +154,11 @@ def run():
         complete(hid, 2)
         s = streak_of(hid)
         check("(a) streak 0 when last completion older than yesterday", s == 0, f"got {s}")
+    else:
+        for delta in (4, 3, 2):
+            check(f"complete D-{delta} ({day(delta)}) -> 201", False, "setup failed: no habit id")
+        check("(a) streak 0 when last completion older than yesterday", False,
+              "setup failed: no habit id")
 
     # (b) out-of-order insertion: today, then D-2, then D-1 -> streak 3
     hid = new_habit("b-unordered")
@@ -138,6 +169,11 @@ def run():
         complete(hid, 1)   # then D-1
         s = streak_of(hid)
         check("(b) out-of-order backdated completions -> streak 3", s == 3, f"got {s}")
+    else:
+        for delta in (0, 2, 1):
+            check(f"complete D-{delta} ({day(delta)}) -> 201", False, "setup failed: no habit id")
+        check("(b) out-of-order backdated completions -> streak 3", False,
+              "setup failed: no habit id")
 
     # (c) duplicate via explicit today's date after default-complete -> 409
     hid = new_habit("c-dup")
@@ -148,6 +184,9 @@ def run():
         completed_date = r.json().get("date") if r.status == 201 else day(0)
         r = request("POST", f"/api/habits/{hid}/complete", {"date": completed_date})  # explicit today
         check("(c) explicit-today duplicate -> 409", r.status == 409, f"got {r.status}")
+    else:
+        check("(c) default complete -> 201", False, "setup failed: no habit id")
+        check("(c) explicit-today duplicate -> 409", False, "setup failed: no habit id")
 
     # (d) yesterday only -> streak 1 (yesterday counts as current)
     hid = new_habit("d-yesterday")
@@ -156,6 +195,9 @@ def run():
         complete(hid, 1)
         s = streak_of(hid)
         check("(d) yesterday-only -> streak 1", s == 1, f"got {s}")
+    else:
+        check(f"complete D-1 ({day(1)}) -> 201", False, "setup failed: no habit id")
+        check("(d) yesterday-only -> streak 1", False, "setup failed: no habit id")
 
     # (e) D-3 only -> streak 0 (too old to be current)
     hid = new_habit("e-old")
@@ -164,6 +206,9 @@ def run():
         complete(hid, 3)
         s = streak_of(hid)
         check("(e) D-3-only -> streak 0", s == 0, f"got {s}")
+    else:
+        check(f"complete D-3 ({day(3)}) -> 201", False, "setup failed: no habit id")
+        check("(e) D-3-only -> streak 0", False, "setup failed: no habit id")
 
     # (f) malformed date -> 4xx
     hid = new_habit("f-baddate")
@@ -171,6 +216,8 @@ def run():
     if hid is not None:
         r = request("POST", f"/api/habits/{hid}/complete", {"date": "2026-13-40"})
         check("(f) malformed date -> 4xx", r.status in (400, 422), f"got {r.status}")
+    else:
+        check("(f) malformed date -> 4xx", False, "setup failed: no habit id")
 
     # (g) after DELETE, GET -> 404 (and completions gone with it)
     hid = new_habit("g-delete")
@@ -181,6 +228,10 @@ def run():
         check("(g) DELETE -> 204", r.status == 204, f"got {r.status}")
         r = request("GET", f"/api/habits/{hid}")
         check("(g) GET after delete -> 404", r.status == 404, f"got {r.status}")
+    else:
+        check(f"complete D-0 ({day(0)}) -> 201", False, "setup failed: no habit id")
+        check("(g) DELETE -> 204", False, "setup failed: no habit id")
+        check("(g) GET after delete -> 404", False, "setup failed: no habit id")
 
     total = _PASSED + _FAILED
     print(f"RESULT: {_PASSED}/{total} passed")
