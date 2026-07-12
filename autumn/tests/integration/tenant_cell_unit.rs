@@ -420,19 +420,18 @@ fn resident_cell_quota_refreshes_on_get_or_create() {
 }
 
 /// A bounded registry evicts the least-recently-used cell once resident cells
-/// exceed the cap (#1792). Inserting t1, t2, t3 into a cap-2 registry (natural
-/// touch order t1 < t2 < t3) drops t1 and keeps t2/t3.
+/// exceed the cap (#1792). Inserting t1, t2, t3 into a cap-2 registry drives the
+/// access order t1 < t2 < t3 via the globally-monotonic access sequence (no
+/// sleeps needed), so t1 is unambiguously the LRU victim and t2/t3 are kept.
 #[test]
 fn registry_bounded_capacity_evicts_lru() {
     let reg = TenantCellRegistry::with_limits(2, None);
     assert_eq!(reg.max_cells(), 2);
 
-    // Space the creations out so their millisecond-resolution access stamps are
-    // strictly ordered t1 < t2 < t3 (creations otherwise land in one tick).
+    // Each get_or_create draws a strictly-greater access sequence, so insertion
+    // order alone establishes t1 < t2 < t3 — no wall-clock spacing required.
     let _t1 = reg.get_or_create("t1", 0);
-    std::thread::sleep(Duration::from_millis(5));
     let _t2 = reg.get_or_create("t2", 0);
-    std::thread::sleep(Duration::from_millis(5));
     let _t3 = reg.get_or_create("t3", 0);
 
     // t3's insert pushed the count to 3 > 2, evicting the LRU cell (t1).
@@ -515,5 +514,52 @@ fn auto_eviction_preserves_in_flight_cell() {
         reg.total_tracked_bytes(),
         0,
         "held cell's bytes reclaim deterministically on drop"
+    );
+}
+
+/// Millisecond-resolution access stamps tie when several tenants are created in
+/// the same tick, which could let LRU eviction drop the cell `get_or_create`
+/// just inserted. The globally-monotonic access sequence breaks those ties so
+/// the newest cell is never the victim. A same-ms burst of 5 distinct tenants
+/// into a cap-2 registry (no sleeps) must keep exactly 2 cells, with the
+/// last-created tenant always resident and an early tenant evicted.
+#[test]
+fn registry_lru_tiebreak_keeps_newest_on_burst() {
+    let registry = TenantCellRegistry::with_limits(2, None);
+
+    // Rapid same-tick burst: no sleeps, so the cells' millisecond access stamps
+    // may all tie — only the access sequence disambiguates their LRU order.
+    for i in 0..5 {
+        let _ = registry.get_or_create(&format!("t{i}"), 0);
+    }
+
+    // The cap is honored exactly.
+    assert_eq!(registry.len(), 2);
+    // The just-inserted cell (t4 holds the greatest access sequence) is never
+    // chosen as the LRU victim, so the newest tenant stays resident.
+    assert!(
+        registry.get("t4").is_some(),
+        "the last-created tenant must remain resident under the cap"
+    );
+    // An early tenant was evicted as the least-recently-used.
+    assert!(
+        registry.get("t0").is_none(),
+        "an early tenant must be evicted under the cap"
+    );
+}
+
+/// A `get` on a resident cell refreshes its access sequence under the read lock
+/// (Fix 1's touch fires): the cell's `last_access_seq` strictly increases across
+/// the lookup, proving the access time is refreshed before the guard drops.
+#[test]
+fn get_touch_raises_access_seq() {
+    let registry = TenantCellRegistry::new();
+    let cell = registry.get_or_create("t", 0);
+    let before = cell.last_access_seq();
+
+    let fetched = registry.get("t").expect("cell is resident");
+    assert!(
+        fetched.last_access_seq() > before,
+        "get() must raise the resident cell's access sequence"
     );
 }

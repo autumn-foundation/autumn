@@ -102,6 +102,13 @@ struct TenantCellInner {
     /// least-recently-used eviction. Set by the registry on creation and on
     /// every subsequent lookup.
     last_access: AtomicU64,
+    /// Globally-monotonic access sequence number (from the registry's `seq`
+    /// counter) of this cell's most recent access. Unlike `last_access`, which
+    /// has millisecond resolution and can tie when several tenants are created
+    /// in the same tick, `last_access_seq` is strictly increasing and unique
+    /// per access, so LRU victim selection has no ties and never evicts the
+    /// just-inserted cell. Idle-TTL still uses `last_access` (wall-clock age).
+    last_access_seq: AtomicU64,
     /// Owned per-tenant scratch buffer and its entry high-water mark. Dropped
     /// with the cell.
     scratch: Mutex<ScratchState>,
@@ -233,6 +240,9 @@ impl TenantCell {
                 // The owning registry stamps the real access time immediately
                 // after construction; 0 is a placeholder until then.
                 last_access: AtomicU64::new(0),
+                // Likewise a placeholder until the registry's first `touch`
+                // stamps a real, strictly-increasing sequence number.
+                last_access_seq: AtomicU64::new(0),
                 scratch: Mutex::new(ScratchState::default()),
                 global_tracked,
             }),
@@ -259,16 +269,30 @@ impl TenantCell {
     }
 
     /// Record a registry-relative access timestamp (milliseconds since the
-    /// registry's base `Instant`). Called by the registry on every lookup to
-    /// drive least-recently-used and idle-TTL eviction.
-    pub fn touch(&self, now_millis: u64) {
+    /// registry's base `Instant`) together with a globally-monotonic access
+    /// sequence number. Called by the registry on every lookup to drive
+    /// idle-TTL (via the millisecond timestamp) and least-recently-used (via the
+    /// strictly-increasing sequence) eviction. Both are relaxed atomic stores,
+    /// so this is safe to call through a shared `&TenantCell` while the
+    /// registry's read guard is still held.
+    pub fn touch(&self, now_millis: u64, seq: u64) {
         self.inner.last_access.store(now_millis, Ordering::Relaxed);
+        self.inner.last_access_seq.store(seq, Ordering::Relaxed);
     }
 
     /// The registry-relative timestamp of this cell's most recent access.
     #[must_use]
     pub fn last_access_millis(&self) -> u64 {
         self.inner.last_access.load(Ordering::Relaxed)
+    }
+
+    /// The globally-monotonic access sequence number of this cell's most recent
+    /// access. Strictly increases with every `touch`, so it breaks the
+    /// millisecond ties `last_access_millis` can produce when multiple tenants
+    /// are accessed in the same tick — used to pick the LRU eviction victim.
+    #[must_use]
+    pub fn last_access_seq(&self) -> u64 {
+        self.inner.last_access_seq.load(Ordering::Relaxed)
     }
 
     /// Bytes currently tracked for this tenant.
@@ -448,6 +472,11 @@ struct RegistryInner {
     /// Monotonic clock origin for the registry-relative millisecond timestamps
     /// stored on each cell's `last_access`.
     base: Instant,
+    /// Globally-monotonic access counter. Every lookup/insert draws a fresh,
+    /// strictly-greater value via [`next_seq`](Self::next_seq) and stamps it on
+    /// the touched cell's `last_access_seq`, giving LRU eviction a unique,
+    /// tie-free ordering so the just-inserted cell is never the victim.
+    seq: AtomicU64,
 }
 
 impl fmt::Debug for TenantCellRegistry {
@@ -486,6 +515,7 @@ impl TenantCellRegistry {
                 max_cells,
                 idle_ttl,
                 base: Instant::now(),
+                seq: AtomicU64::new(0),
             }),
         }
     }
@@ -495,25 +525,40 @@ impl TenantCellRegistry {
         u64::try_from(self.inner.base.elapsed().as_millis()).unwrap_or(u64::MAX)
     }
 
+    /// Draw the next globally-monotonic access sequence number. Each call
+    /// returns a strictly-greater value, so the most recent access always has
+    /// the greatest sequence and LRU victim selection is tie-free.
+    fn next_seq(&self) -> u64 {
+        self.inner.seq.fetch_add(1, Ordering::Relaxed)
+    }
+
     /// Fetch the cell for `tenant_id`, if one is resident.
     ///
     /// # Panics
     ///
     /// Panics if the registry lock is poisoned.
     #[must_use]
+    // The read guard is deliberately held across the `touch` below: refreshing
+    // the access time under the lock is what closes the eviction race, so we
+    // opt out of the drop-tightening lint that would shrink the guard's scope.
+    #[allow(clippy::significant_drop_tightening)]
     pub fn get(&self, tenant_id: &str) -> Option<Arc<TenantCell>> {
         let now = self.now_millis();
-        let cell = self
+        let seq = self.next_seq();
+        let guard = self
             .inner
             .cells
             .read()
-            .expect("tenant cell registry lock poisoned")
-            .get(tenant_id)
-            .cloned();
-        if let Some(cell) = &cell {
-            cell.touch(now);
+            .expect("tenant cell registry lock poisoned");
+        // Refresh the access time/sequence WHILE the read guard is still held,
+        // so a concurrent writer cannot evict this cell in the gap between the
+        // lookup and the touch. `touch` is relaxed atomic stores through the
+        // shared `&Arc<TenantCell>`, safe under the read lock.
+        if let Some(cell) = guard.get(tenant_id) {
+            cell.touch(now, seq);
+            return Some(Arc::clone(cell));
         }
-        cell
+        None
     }
 
     /// Fetch the cell for `tenant_id`, creating it with `quota_bytes` if absent.
@@ -537,19 +582,21 @@ impl TenantCellRegistry {
     pub fn get_or_create(&self, tenant_id: &str, quota_bytes: usize) -> Arc<TenantCell> {
         let now = self.now_millis();
         // Fast path: a resident cell just needs its access time and quota
-        // refreshed under the cheaper read lock. Bind the lookup to a local so
-        // the read guard is released before we touch/refresh the cell.
-        let resident = self
-            .inner
-            .cells
-            .read()
-            .expect("tenant cell registry lock poisoned")
-            .get(tenant_id)
-            .cloned();
-        if let Some(cell) = resident {
-            cell.touch(now);
-            cell.set_quota_bytes(quota_bytes);
-            return cell;
+        // refreshed under the cheaper read lock. Do the touch/quota-refresh
+        // WHILE the read guard is still held so a concurrent writer cannot evict
+        // this cell in the gap between the lookup and the refresh — `touch` and
+        // `set_quota_bytes` are relaxed atomic stores, safe under the read lock.
+        {
+            let guard = self
+                .inner
+                .cells
+                .read()
+                .expect("tenant cell registry lock poisoned");
+            if let Some(cell) = guard.get(tenant_id) {
+                cell.touch(now, self.next_seq());
+                cell.set_quota_bytes(quota_bytes);
+                return Arc::clone(cell);
+            }
         }
         let mut cells = self
             .inner
@@ -560,7 +607,7 @@ impl TenantCellRegistry {
         // taking the write lock.
         if let Some(cell) = cells.get(tenant_id) {
             let cell = Arc::clone(cell);
-            cell.touch(now);
+            cell.touch(now, self.next_seq());
             cell.set_quota_bytes(quota_bytes);
             return cell;
         }
@@ -569,11 +616,13 @@ impl TenantCellRegistry {
             quota_bytes,
             Arc::clone(&self.inner.global_tracked),
         ));
-        cell.touch(now);
+        // Stamp the new cell's access sequence BEFORE enforcing limits, so it
+        // holds the greatest sequence and is never chosen as the LRU victim.
+        cell.touch(now, self.next_seq());
         cells.insert(tenant_id.to_string(), Arc::clone(&cell));
         // Enforce eviction limits while we already hold the write lock. The
-        // just-touched new cell has the newest access time, so it is never the
-        // idle or LRU victim.
+        // just-touched new cell has the newest access time and the greatest
+        // access sequence, so it is never the idle or LRU victim.
         self.enforce_limits_locked(&mut cells, now);
         drop(cells);
         cell
@@ -594,10 +643,14 @@ impl TenantCellRegistry {
         let max_cells = self.inner.max_cells;
         if max_cells > 0 {
             while cells.len() > max_cells {
-                // Evict the least-recently-used (smallest last-access) cell.
+                // Evict the least-recently-used cell, chosen by the smallest
+                // access *sequence*. The sequence is globally unique and
+                // monotonic, so there are no ties (unlike millisecond
+                // timestamps) and the just-inserted cell — which drew the
+                // greatest sequence above — is never the victim.
                 let Some(victim) = cells
                     .iter()
-                    .min_by_key(|(_, cell)| cell.last_access_millis())
+                    .min_by_key(|(_, cell)| cell.last_access_seq())
                     .map(|(key, _)| key.clone())
                 else {
                     break;
