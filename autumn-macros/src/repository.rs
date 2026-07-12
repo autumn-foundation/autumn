@@ -9028,6 +9028,32 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 .map(&emit_cascade_call)
                 .collect();
             let cascade_calls = quote! {
+                // ── #1788: both-sites override diagnostic ────────────────────
+                //
+                // The repository-attribute `dependent(...)` above is authoritative
+                // and drives this cascade. But the model MAY ALSO declare
+                // `#[has_many(..., dependent = ...)]`; if so, that model-side
+                // declaration is silently overridden (repo-attr wins, see the
+                // precedence note above) and is inert. Emit a debug-only warn so a
+                // user does not wrongly believe the model-side `dependent` is
+                // active. Mirrors the `across_tenants()` debug-warn template
+                // (`cfg!(debug_assertions)`-gated `tracing::warn!`): zero-cost in
+                // release builds. The unqualified `#model_name::dependents()` call
+                // resolves to the model's inherent shadow (real specs) when present
+                // and to the blanket `AutumnDependents` fallback (empty slice)
+                // otherwise, so the `use` is required for the fallback to resolve.
+                if ::core::cfg!(debug_assertions) {
+                    use ::autumn_web::repository::AutumnDependents as _;
+                    if !#model_name::dependents().is_empty() {
+                        ::autumn_web::reexports::tracing::warn!(
+                            "{}: both repository-attribute `dependent(...)` and \
+                             model-declared `#[has_many(..., dependent = ...)]` are \
+                             present for the same delete; the model-side dependents \
+                             are overridden and inert (repository-attribute wins)",
+                            ::core::stringify!(#model_name)
+                        );
+                    }
+                }
                 // Codex round-5-B cycle guard: the ACTIVE recursion path (seeded
                 // with this parent row so a grandchild referencing an ancestor is
                 // skipped as a cycle, not looped) plus a monotonic deleted set,
@@ -15844,7 +15870,11 @@ mod tests {
     fn repository_macro_with_dependents_delete_by_id_does_not_runtime_dispatch() {
         // Precedence (#1738): a repository-attribute `dependent(...)` is the
         // authoritative escape hatch. Its delete_by_id uses the compile-time
-        // cascade and must NOT also consult the model's runtime dependents().
+        // cascade and must NOT runtime-DRIVE the cascade from the model's
+        // `dependents()`. #1788: it MAY reference `dependents()` behind a
+        // `cfg!(debug_assertions)` guard purely for the override diagnostic, but
+        // it must never bind `__autumn_rt_deps` to drive the cascade (that is the
+        // no-repo-attr runtime path only).
         let generated = repository_macro(
             quote! { Post, dependent(PgCommentRepository, fk = "post_id", on_delete = destroy) },
             quote! { pub trait PostRepository {} },
@@ -15856,8 +15886,40 @@ mod tests {
             "repository-attribute delete_by_id must emit the compile-time cascade: {section}"
         );
         assert!(
-            !section.contains("AutumnDependents"),
-            "repository-attribute delete_by_id must not runtime-dispatch (repo-attr wins): {section}"
+            !section.contains("__autumn_rt_deps"),
+            "repository-attribute delete_by_id must not runtime-DRIVE the cascade \
+             from the model's dependents() (repo-attr wins): {section}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_with_dependents_delete_by_id_emits_both_sites_diagnostic() {
+        // #1788: when a repository declares `dependent(...)` the repo-attribute
+        // cascade is authoritative and any model-side `#[has_many(dependent = ...)]`
+        // is silently overridden. Compile-time detection is impossible (the
+        // repository macro cannot see the model struct's attributes), so the
+        // repo-attr `delete_by_id` branch must splice a debug-only diagnostic: a
+        // `cfg!(debug_assertions)`-gated `tracing::warn!` that fires when the model
+        // ALSO declared dependents (`Model::dependents()` non-empty). Mirrors the
+        // `across_tenants()` debug-warn template; zero-cost in release builds.
+        let generated = repository_macro(
+            quote! { Post, dependent(PgCommentRepository, fk = "post_id", on_delete = destroy) },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        let section = delete_by_id_section(&generated);
+        assert!(
+            section.contains("debug_assertions"),
+            "both-sites diagnostic must be gated on cfg!(debug_assertions): {section}"
+        );
+        assert!(
+            section.contains("AutumnDependents") && section.contains("dependents"),
+            "both-sites diagnostic must consult the model's dependents() via the \
+             AutumnDependents trait: {section}"
+        );
+        assert!(
+            section.contains("tracing :: warn"),
+            "both-sites diagnostic must emit a tracing::warn! for the override: {section}"
         );
     }
 
