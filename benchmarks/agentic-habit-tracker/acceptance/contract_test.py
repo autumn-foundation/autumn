@@ -35,7 +35,17 @@ class Resp:
         self.body_bytes = body_bytes
 
     def json(self):
-        return json.loads(self.body_bytes.decode("utf-8"))
+        """Parse the body as JSON, returning None on any decode failure.
+
+        A candidate can answer an otherwise-expected status with an empty or
+        HTML body; raising JSONDecodeError here would crash the suite before it
+        prints its RESULT line. Returning None instead lets callers fold a
+        non-JSON body into a recorded check failure (they treat it as ``{}``).
+        """
+        try:
+            return json.loads(self.body_bytes.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            return None
 
     def content_type(self):
         return self.headers.get("content-type", "")
@@ -109,7 +119,7 @@ def run():
     # create
     r = request("POST", "/api/habits", {"name": "Read", "description": "20 pages"})
     check("POST /api/habits -> 201", r.status == 201, f"got {r.status}")
-    habit = r.json() if r.status == 201 else {}
+    habit = (r.json() or {}) if r.status == 201 else {}
     check("created habit has id", "id" in habit)
     check("created habit echoes name", habit.get("name") == "Read")
     check("created habit has created_at", "created_at" in habit)
@@ -136,7 +146,7 @@ def run():
     # get single
     r = request("GET", f"/api/habits/{hid}")
     check("GET /api/habits/{id} -> 200", r.status == 200, f"got {r.status}")
-    got = r.json() if r.status == 200 else {}
+    got = (r.json() or {}) if r.status == 200 else {}
     check("GET single has current_streak", "current_streak" in got)
     check("GET single has history array", isinstance(got.get("history"), list))
 
@@ -145,7 +155,7 @@ def run():
     # opaque string/UUID ids, so a hard-coded numeric sentinel could be rejected
     # as a malformed route param (400) before any not-found lookup happens.
     r = request("POST", "/api/habits", {"name": "throwaway-404"})
-    deleted_id = r.json().get("id") if r.status == 201 else None
+    deleted_id = (r.json() or {}).get("id") if r.status == 201 else None
     request("DELETE", f"/api/habits/{deleted_id}")
     r = request("GET", f"/api/habits/{deleted_id}")
     check("GET unknown id -> 404", r.status == 404, f"got {r.status}")
@@ -153,13 +163,13 @@ def run():
     # update
     r = request("PUT", f"/api/habits/{hid}", {"name": "Read more", "description": "30 pages"})
     check("PUT /api/habits/{id} -> 200", r.status == 200, f"got {r.status}")
-    updated = r.json() if r.status == 200 else {}
+    updated = (r.json() or {}) if r.status == 200 else {}
     check("PUT updates name", updated.get("name") == "Read more")
 
     # complete today (default date)
     r = request("POST", f"/api/habits/{hid}/complete", {})
     check("POST complete (default date) -> 201", r.status == 201, f"got {r.status}")
-    comp = r.json() if r.status == 201 else {}
+    comp = (r.json() or {}) if r.status == 201 else {}
     check("complete returns date", "date" in comp)
     check("complete returns current_streak", "current_streak" in comp)
 
@@ -184,7 +194,7 @@ def run():
     # correct server across a timezone / midnight-boundary skew.
     r = request("POST", "/api/habits", {"name": "Streaker"})
     check("POST streak habit -> 201", r.status == 201, f"got {r.status}")
-    sid = r.json().get("id") if r.status == 201 else None
+    sid = (r.json() or {}).get("id") if r.status == 201 else None
     r0 = request("POST", f"/api/habits/{sid}/complete", {})  # default = server today
     server_today = None
     if r0.status == 201:
@@ -203,7 +213,7 @@ def run():
         if rr.status == 201:
             complete_streak = (rr.json() or {}).get("current_streak")
     r = request("GET", f"/api/habits/{sid}")
-    streak = r.json().get("current_streak") if r.status == 200 else None
+    streak = (r.json() or {}).get("current_streak") if r.status == 200 else None
     check("streak of 3 consecutive days == 3", streak == 3, f"got {streak}")
     # The streak the complete endpoint returns must agree with what GET reports
     # immediately after (both are "as of server today" per SPEC). This is a
@@ -213,7 +223,7 @@ def run():
     check("complete-response current_streak agrees with GET",
           complete_streak is not None and complete_streak == streak,
           f"complete={complete_streak}, get={streak}")
-    hist = r.json().get("history") if r.status == 200 else None
+    hist = (r.json() or {}).get("history") if r.status == 200 else None
     expected_hist = [iso(today - datetime.timedelta(days=d)) for d in (0, 1, 2)]
     check("history is 3 dates descending", hist == expected_hist, f"got {hist}")
 
@@ -223,13 +233,30 @@ def run():
     r = request("GET", f"/api/habits/{hid}")
     check("GET after delete -> 404", r.status == 404, f"got {r.status}")
 
-    # HTML view
+    # HTML view. Beyond content-type, SPEC requires the server-rendered index to
+    # actually LIST current habits, so a static empty page must not pass. Create
+    # a habit with a fixed, uncommon, HTML-greppable name (deterministic — no
+    # per-run randomness) and require it to appear in the rendered body. The name
+    # is unique enough not to collide with any habit created above. Fail-closed:
+    # if the habit can't be created or the page can't be fetched, the listing
+    # check is recorded as a failure rather than skipped.
+    HTML_HABIT_NAME = "ZzHtmlListed-Q9"
+    rc = request("POST", "/api/habits", {"name": HTML_HABIT_NAME})
+    html_habit_ok = rc.status == 201
     r = request("GET", "/", accept="text/html")
     check("GET / -> 200", r.status == 200, f"got {r.status}")
+    html_ok = r.status == 200 and "text/html" in r.content_type().lower()
     check(
         "GET / is text/html",
         "text/html" in r.content_type().lower(),
         f"content-type={r.content_type()!r}",
+    )
+    body_text = r.body_bytes.decode("utf-8", "replace") if html_ok else ""
+    check(
+        "GET / HTML view lists a created habit",
+        html_habit_ok and html_ok and HTML_HABIT_NAME in body_text,
+        f"created={html_habit_ok}, html_ok={html_ok}, "
+        f"present={HTML_HABIT_NAME in body_text}",
     )
 
     # Denominator is intentionally fixed: every check above runs unconditionally

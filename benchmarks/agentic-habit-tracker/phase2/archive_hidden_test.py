@@ -40,7 +40,17 @@ class Resp:
         self.body_bytes = body_bytes
 
     def json(self):
-        return json.loads(self.body_bytes.decode("utf-8"))
+        """Parse the body as JSON, returning None on any decode failure.
+
+        A candidate can answer an otherwise-expected status with an empty or
+        HTML body; raising here would crash the suite before it prints its
+        RESULT line. Returning None lets callers fold a non-JSON body into a
+        recorded check failure (they treat it as ``{}``).
+        """
+        try:
+            return json.loads(self.body_bytes.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            return None
 
 
 def request(method, path, body=None):
@@ -92,7 +102,7 @@ def wait_for_server(timeout_s=30):
 
 def new_habit(name):
     r = request("POST", "/api/habits", {"name": name})
-    return r, (r.json().get("id") if r.status == 201 else None)
+    return r, ((r.json() or {}).get("id") if r.status == 201 else None)
 
 
 def id_list(path):
@@ -189,7 +199,7 @@ def run():
     if h2 is not None:
         rc = request("POST", f"/api/habits/{h2}/complete", {})  # default = today
         check("(d) complete today (default) -> 201", rc.status == 201, f"got {rc.status}")
-        today_str = rc.json().get("date") if rc.status == 201 else None
+        today_str = (rc.json() or {}).get("date") if rc.status == 201 else None
         # Guard the server-date parse (mirror acceptance/contract_test.py): a
         # candidate can return 201 with a non-ISO `date`, and an unguarded
         # datetime.date.fromisoformat would raise ValueError and crash the suite
@@ -212,7 +222,7 @@ def run():
             check("(d) archive habit -> 200/204", ra.status in (200, 204), f"got {ra.status}")
             r = request("GET", f"/api/habits/{h2}")
             check("(d) GET archived habit -> 200", r.status == 200, f"got {r.status}")
-            got = r.json() if r.status == 200 else {}
+            got = (r.json() or {}) if r.status == 200 else {}
             check("(d) archived habit current_streak == 2", got.get("current_streak") == 2,
                   f"got {got.get('current_streak')}")
             hist = got.get("history") if isinstance(got.get("history"), list) else []

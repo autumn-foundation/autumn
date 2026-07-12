@@ -37,7 +37,17 @@ class Resp:
         self.body_bytes = body_bytes
 
     def json(self):
-        return json.loads(self.body_bytes.decode("utf-8"))
+        """Parse the body as JSON, returning None on any decode failure.
+
+        A candidate can answer an otherwise-expected status with an empty or
+        HTML body; raising here would crash the suite before it prints its
+        RESULT line. Returning None lets callers fold a non-JSON body into a
+        recorded check failure (they treat it as ``{}``).
+        """
+        try:
+            return json.loads(self.body_bytes.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            return None
 
     def content_type(self):
         return self.headers.get("content-type", "")
@@ -102,7 +112,7 @@ def wait_for_server(timeout_s=30):
 def new_habit(name):
     """Create a habit; return (response, id)."""
     r = request("POST", "/api/habits", {"name": name})
-    hid = r.json().get("id") if r.status == 201 else None
+    hid = (r.json() or {}).get("id") if r.status == 201 else None
     return r, hid
 
 
@@ -156,7 +166,7 @@ def run():
         total = _PASSED + _FAILED
         print(f"RESULT: {_PASSED}/{total} passed")
         sys.exit(1)
-    archived_field = r.json().get("archived")
+    archived_field = (r.json() or {}).get("archived")
     archived_ids = list_ids("/api/habits?archived=true")
     # Phase 2 (prompts/phase2_maintenance.md) requires an `archived` boolean on
     # the habit. A freshly created habit MUST carry archived == false: absent or
@@ -188,7 +198,7 @@ def run():
     # report archived == true (present and correct). Absent/None is a FAIL. The
     # streak + history must still be intact.
     r = request("GET", f"/api/habits/{hid}")
-    got = r.json() if r.status == 200 else {}
+    got = (r.json() or {}) if r.status == 200 else {}
     check("GET archived habit -> 200 with archived == true",
           r.status == 200 and got.get("archived") is True,
           f"got status {r.status}, archived={got.get('archived')!r}")

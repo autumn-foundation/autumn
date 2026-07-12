@@ -41,7 +41,17 @@ class Resp:
         self.body_bytes = body_bytes
 
     def json(self):
-        return json.loads(self.body_bytes.decode("utf-8"))
+        """Parse the body as JSON, returning None on any decode failure.
+
+        A candidate can answer an otherwise-expected status with an empty or
+        HTML body; raising here would crash the suite before it prints its
+        RESULT line. Returning None lets callers fold a non-JSON body into a
+        recorded check failure (they treat it as ``{}``).
+        """
+        try:
+            return json.loads(self.body_bytes.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            return None
 
 
 def request(method, path, body=None):
@@ -98,7 +108,7 @@ def new_habit(name):
     r = request("POST", "/api/habits", {"name": name})
     if r.status != 201:
         return None
-    return r.json().get("id")
+    return (r.json() or {}).get("id")
 
 
 def complete(hid, delta, expect=201, label=None):
@@ -114,7 +124,7 @@ def streak_of(hid):
     r = request("GET", f"/api/habits/{hid}")
     if r.status != 200:
         return None
-    return r.json().get("current_streak")
+    return (r.json() or {}).get("current_streak")
 
 
 # ── tests ──────────────────────────────────────────────────────────────────────
@@ -173,7 +183,7 @@ def run():
         # DESCENDING date order (SPEC). Fetch the habit and compare its history
         # to the same dates sorted newest-first: [D, D-1, D-2].
         rb = request("GET", f"/api/habits/{hid}")
-        hist = rb.json().get("history") if rb.status == 200 else None
+        hist = (rb.json() or {}).get("history") if rb.status == 200 else None
         expected_desc = [day(0), day(1), day(2)]
         check("(b) history in descending date order after out-of-order inserts",
               hist == expected_desc, f"got {hist}")
@@ -191,7 +201,7 @@ def run():
     if hid is not None:
         r = request("POST", f"/api/habits/{hid}/complete", {})  # default = today
         check("(c) default complete -> 201", r.status == 201, f"got {r.status}")
-        completed_date = r.json().get("date") if r.status == 201 else day(0)
+        completed_date = (r.json() or {}).get("date") if r.status == 201 else day(0)
         r = request("POST", f"/api/habits/{hid}/complete", {"date": completed_date})  # explicit today
         check("(c) explicit-today duplicate -> 409", r.status == 409, f"got {r.status}")
     else:

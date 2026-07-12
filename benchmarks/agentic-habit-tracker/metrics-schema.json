@@ -58,19 +58,19 @@
     },
     "visible_checks_passed": {
       "type": "integer",
-      "description": "Passing checks from acceptance/contract_test.py (the X in its RESULT line)."
+      "description": "Passing checks (the X in the RESULT line) from the visible suite: phase 1 — acceptance/contract_test.py; phase 2 — phase2/archive_test.py."
     },
     "visible_checks_total": {
       "type": "integer",
-      "description": "Total checks from acceptance/contract_test.py (the Y in its RESULT line)."
+      "description": "Total checks (the Y in the RESULT line) from the visible suite: phase 1 — acceptance/contract_test.py; phase 2 — phase2/archive_test.py."
     },
     "hidden_checks_passed": {
       "type": "integer",
-      "description": "Passing checks from hidden/hidden_test.py."
+      "description": "Passing checks from the hidden suite: phase 1 — hidden/hidden_test.py; phase 2 — phase2/archive_hidden_test.py."
     },
     "hidden_checks_total": {
       "type": "integer",
-      "description": "Total checks from hidden/hidden_test.py."
+      "description": "Total checks from the hidden suite: phase 1 — hidden/hidden_test.py; phase 2 — phase2/archive_hidden_test.py."
     },
     "has_tests": {
       "type": "boolean",
