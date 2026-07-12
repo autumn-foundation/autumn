@@ -153,6 +153,11 @@ pub enum Revert {
     /// Remove the `[auth.webauthn]` stub block `autumn generate auth
     /// --passkeys` appended to `path` (`autumn.toml`).
     AuthWebauthnStub { path: PathBuf },
+    /// Remove `/{plural}/validate` from `[security.submit_token] exempt_paths`
+    /// in `path` (`autumn.toml`) — the submit-token exemption `autumn generate
+    /// scaffold --live-validation` appended for issue #1360 — dropping the
+    /// block if that empties a freshly-generated `exempt_paths` key.
+    SubmitTokenValidateExempt { path: PathBuf, plural: String },
     /// Remove the remember-me middleware layer + startup-hook calls
     /// `autumn generate auth` injected into the `AppBuilder` chain in `path`
     /// (`src/main.rs`) (issue #1397).
@@ -187,6 +192,7 @@ impl Revert {
             | Self::PwaMainRsInjection { path }
             | Self::AuthOAuthProviderStubs { path, .. }
             | Self::AuthWebauthnStub { path }
+            | Self::SubmitTokenValidateExempt { path, .. }
             | Self::RememberMiddleware { path }
             | Self::SeedBinLinks { path, .. } => path,
         }
@@ -216,6 +222,7 @@ impl Revert {
             | Self::PwaMainRsInjection { .. }
             | Self::AuthOAuthProviderStubs { .. }
             | Self::AuthWebauthnStub { .. }
+            | Self::SubmitTokenValidateExempt { .. }
             | Self::RememberMiddleware { .. } => None,
         }
     }
@@ -333,6 +340,9 @@ impl Revert {
                 super::auth::remove_oauth_provider_stubs(content, providers)
             }
             Self::AuthWebauthnStub { .. } => super::auth::remove_webauthn_stub(content),
+            Self::SubmitTokenValidateExempt { plural, .. } => {
+                super::scaffold::remove_submit_token_validate_exempt_from_toml(content, plural)
+            }
             Self::SeedBinLinks { .. } => super::schema_edit::unlink_models_from_seed_bin(content),
         }
     }

@@ -290,6 +290,12 @@ enum CollectedBody {
     /// already over-limit; `body` chains the full, unmodified body (every byte
     /// of every chunk) with the remaining stream for pass-through.
     Oversized { prefix: Bytes, body: Body },
+    /// The body stream yielded an error before EOF (and before crossing the
+    /// limit). The bytes read so far are discarded: buffering-then-rebuilding
+    /// them would hand a downstream handler a silently TRUNCATED form (a valid
+    /// leading `_submit_token` followed by missing tail fields), so the caller
+    /// must fail the request instead of pretending the short read succeeded.
+    Errored(axum::Error),
 }
 
 /// Buffer `body` up to `limit` bytes without corrupting oversized bodies.
@@ -298,10 +304,13 @@ async fn collect_body(body: Body, limit: usize) -> CollectedBody {
     let mut stream = body.into_data_stream();
     loop {
         match stream.next().await {
-            // End of stream, or a mid-stream error: return what we have. The
-            // token (if any) is emitted at the front of the form, so a truncated
-            // tail is harmless for scanning; the handler receives the prefix.
-            None | Some(Err(_)) => break,
+            // Clean end of stream: return everything buffered so far.
+            None => break,
+            // A mid-stream read error must be propagated, never swallowed into a
+            // truncated `Full`: the handler would otherwise receive a form whose
+            // tail fields were lost while the leading token still scanned and
+            // consumed, so the caller fails the request on this variant.
+            Some(Err(err)) => return CollectedBody::Errored(err),
             Some(Ok(chunk)) => {
                 let remaining = limit.saturating_sub(buf.len());
                 if chunk.len() > remaining {
@@ -336,11 +345,15 @@ async fn collect_body(body: Body, limit: usize) -> CollectedBody {
 
 /// Extract the submitted `_submit_token` from the request body, returning the
 /// token (if present) and a request whose body is preserved for the handler.
+///
+/// Returns `Err` when the body stream errors mid-read while scanning: the caller
+/// must reject the request rather than forward a truncated form (see
+/// [`CollectedBody::Errored`]).
 async fn extract_submitted_token(
     req: Request<Body>,
     field: &str,
     max_scan_bytes: usize,
-) -> (Option<String>, Request<Body>) {
+) -> Result<(Option<String>, Request<Body>), axum::Error> {
     let (parts, body) = req.into_parts();
 
     let content_type = parts
@@ -357,18 +370,19 @@ async fn extract_submitted_token(
     // content_type borrow ends here.
 
     if !is_urlencoded && boundary.is_none() {
-        return (None, Request::from_parts(parts, body));
+        return Ok((None, Request::from_parts(parts, body)));
     }
 
     match collect_body(body, max_scan_bytes).await {
         CollectedBody::Full(bytes) => {
             let token = scan_for_token(&bytes, is_urlencoded, boundary.as_deref(), field);
-            (token, Request::from_parts(parts, Body::from(bytes)))
+            Ok((token, Request::from_parts(parts, Body::from(bytes))))
         }
         CollectedBody::Oversized { prefix, body } => {
             let token = scan_for_token(&prefix, is_urlencoded, boundary.as_deref(), field);
-            (token, Request::from_parts(parts, body))
+            Ok((token, Request::from_parts(parts, body)))
         }
+        CollectedBody::Errored(err) => Err(err),
     }
 }
 
@@ -417,6 +431,27 @@ fn in_flight_conflict_response() -> Response<Body> {
         .body(Body::from(
             "this form submission is already being processed; retry after 1 second",
         ))
+        .unwrap_or_else(|_| Response::new(Body::empty()))
+}
+
+/// `400` returned when the request body stream errors mid-read while scanning
+/// for the token. Failing here is safer than forwarding a truncated form to the
+/// handler (missing tail fields) after a leading token has already been consumed.
+fn body_read_error_response() -> Response<Body> {
+    Response::builder()
+        .status(StatusCode::BAD_REQUEST)
+        .body(Body::from("could not read the request body"))
+        .unwrap_or_else(|_| Response::new(Body::empty()))
+}
+
+/// `500` returned when the handler's response body stream errors while it is
+/// being buffered for replay caching. The token is not recorded and the
+/// in-flight lock is released, so we cannot cache or safely replay this
+/// response; surface an error rather than a truncated body.
+fn response_read_error_response() -> Response<Body> {
+    Response::builder()
+        .status(StatusCode::INTERNAL_SERVER_ERROR)
+        .body(Body::from("could not read the response body"))
         .unwrap_or_else(|_| Response::new(Body::empty()))
 }
 
@@ -567,7 +602,22 @@ where
             }
 
             let (submitted, req) =
-                extract_submitted_token(req, &settings.field_name, settings.max_scan_bytes).await;
+                match extract_submitted_token(req, &settings.field_name, settings.max_scan_bytes)
+                    .await
+                {
+                    Ok(pair) => pair,
+                    Err(error) => {
+                        // A body-stream read error while scanning must reject the
+                        // request: forwarding the bytes read so far would hand the
+                        // handler a truncated form whose leading token we already
+                        // scanned, silently dropping tail fields.
+                        tracing::warn!(
+                            error = %error,
+                            "Submit-token body scan failed on a read error; rejecting the request"
+                        );
+                        return Ok(body_read_error_response());
+                    }
+                };
 
             let Some(token) = submitted.filter(|t| !t.is_empty()) else {
                 // No submit token present — pass through unchanged.
@@ -623,53 +673,73 @@ where
             }
 
             let response = inner.call(req).await?;
-            let (parts, body) = response.into_parts();
+            Ok(cache_consumed_token_response(response, &settings, &key).await)
+        })
+    }
+}
 
-            match collect_body(body, MAX_CACHEABLE_RESPONSE_BODY).await {
-                CollectedBody::Full(bytes) => {
-                    let status = parts.status.as_u16();
-                    // Cache successful (2xx) and redirect (3xx) responses so the
-                    // replayed submit returns the first response verbatim.
-                    if (200..400).contains(&status) {
-                        let record = IdempotencyRecord {
-                            status,
-                            headers: replay_headers(&parts.headers),
-                            body: bytes.to_vec(),
-                            metadata: Vec::new(),
-                        };
-                        // Persist the consumed-token record. If the store write
-                        // fails after the handler already committed its mutation
-                        // and returned a 2xx/3xx, fail closed exactly as
-                        // `IdempotencyLayer` does: keep the in-flight lock held
-                        // (by not unlocking, it expires via `in_flight_ttl`) so a
-                        // retry carrying the same token gets a `409` in-flight
-                        // conflict rather than silently re-running the
-                        // create/update, and surface `503` instead of an
-                        // un-recorded success.
-                        if let Err(error) =
-                            settings
-                                .store
-                                .try_set(&key, record, Vec::new(), settings.ttl)
-                        {
-                            tracing::error!(
-                                error = %error,
-                                "Submit-token persistence failed after handler success; failing closed"
-                            );
-                            return Ok(crate::idempotency::persistence_failed_response());
-                        }
-                    }
-                    settings.store.unlock(&key);
-                    Ok(Response::from_parts(parts, Body::from(bytes)))
-                }
-                CollectedBody::Oversized { body, .. } => {
-                    // Too large to cache — stream through. The lock is released;
-                    // a later retry re-runs (acceptable: form responses are tiny
-                    // redirects, so this path is not hit in practice).
-                    settings.store.unlock(&key);
-                    Ok(Response::from_parts(parts, body))
+/// Run the handler's response through the consumed-token replay cache: buffer it
+/// (up to [`MAX_CACHEABLE_RESPONSE_BODY`]), record 2xx/3xx responses under `key`
+/// so a replay returns them verbatim, and release the in-flight lock. Kept out
+/// of [`SubmitTokenService::call`] so that hot method stays under the line cap.
+async fn cache_consumed_token_response(
+    response: Response<Body>,
+    settings: &SubmitTokenSettings,
+    key: &str,
+) -> Response<Body> {
+    let (parts, body) = response.into_parts();
+    match collect_body(body, MAX_CACHEABLE_RESPONSE_BODY).await {
+        CollectedBody::Full(bytes) => {
+            let status = parts.status.as_u16();
+            // Cache successful (2xx) and redirect (3xx) responses so the
+            // replayed submit returns the first response verbatim.
+            if (200..400).contains(&status) {
+                let record = IdempotencyRecord {
+                    status,
+                    headers: replay_headers(&parts.headers),
+                    body: bytes.to_vec(),
+                    metadata: Vec::new(),
+                };
+                // Persist the consumed-token record. If the store write fails
+                // after the handler already committed its mutation and returned
+                // a 2xx/3xx, fail closed exactly as `IdempotencyLayer` does: keep
+                // the in-flight lock held (by not unlocking, it expires via
+                // `in_flight_ttl`) so a retry carrying the same token gets a
+                // `409` in-flight conflict rather than silently re-running the
+                // create/update, and surface `503` instead of an un-recorded
+                // success.
+                if let Err(error) = settings
+                    .store
+                    .try_set(key, record, Vec::new(), settings.ttl)
+                {
+                    tracing::error!(
+                        error = %error,
+                        "Submit-token persistence failed after handler success; failing closed"
+                    );
+                    return crate::idempotency::persistence_failed_response();
                 }
             }
-        })
+            settings.store.unlock(key);
+            Response::from_parts(parts, Body::from(bytes))
+        }
+        CollectedBody::Oversized { body, .. } => {
+            // Too large to cache — stream through. The lock is released; a later
+            // retry re-runs (acceptable: form responses are tiny redirects, so
+            // this path is not hit in practice).
+            settings.store.unlock(key);
+            Response::from_parts(parts, body)
+        }
+        CollectedBody::Errored(error) => {
+            // The response body errored while buffering for the replay cache. We
+            // can neither record the token nor replay a truncated body; release
+            // the lock and surface a 500.
+            tracing::error!(
+                error = %error,
+                "Submit-token response buffering failed on a read error"
+            );
+            settings.store.unlock(key);
+            response_read_error_response()
+        }
     }
 }
 
@@ -1233,6 +1303,57 @@ mod tests {
             count.load(Ordering::SeqCst),
             1,
             "the handler must not re-run when the consumed-token lookup fails"
+        );
+    }
+
+    /// Finding J (preserve body read errors): when the request body stream
+    /// yields an error mid-read while the guard is scanning for the token, the
+    /// request must FAIL (400) rather than reach the handler with a silently
+    /// truncated form. A leading `_submit_token` followed by a lost tail must
+    /// never be forwarded as if the short read had succeeded.
+    #[tokio::test]
+    async fn body_read_error_rejects_request_and_does_not_reach_handler() {
+        let store: Arc<dyn IdempotencyStore> =
+            Arc::new(MemoryIdempotencyStore::new(Duration::from_secs(600)));
+        let count = Arc::new(AtomicUsize::new(0));
+        let count_inner = count.clone();
+        let app = Router::new()
+            .route(
+                "/submit",
+                post(move |_body: Bytes| {
+                    let count = count_inner.clone();
+                    async move {
+                        count.fetch_add(1, Ordering::SeqCst);
+                        "created"
+                    }
+                }),
+            )
+            .layer(layer_with_store(store));
+
+        // A urlencoded body whose stream delivers a leading chunk (with the
+        // token near the front) and then errors before EOF.
+        let chunks: Vec<Result<Bytes, std::io::Error>> = vec![
+            Ok(Bytes::from("_submit_token=tok-read-err&ti")),
+            Err(std::io::Error::other("simulated body read failure")),
+        ];
+        let body = Body::from_stream(futures::stream::iter(chunks));
+        let req = Request::builder()
+            .method("POST")
+            .uri("/submit")
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .body(body)
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "a mid-read body-stream error must reject the request, not forward a truncated form"
+        );
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            0,
+            "the handler must never see a truncated body when the stream errors mid-read"
         );
     }
 }

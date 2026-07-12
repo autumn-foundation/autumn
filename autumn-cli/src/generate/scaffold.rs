@@ -883,6 +883,32 @@ pub fn plan_scaffold_with_options(
         }
     }
 
+    // ── autumn.toml: exempt the live-validation routes from the submit-token
+    // guard (issue #1360). The generated `POST /{plural}/validate/{field}`
+    // inline-validation routes `hx-include` the whole form, so without this the
+    // one-time `_submit_token` is consumed by a validation POST and the real
+    // create/update submit replays a validation fragment instead of mutating.
+    // The `hx-params="not _submit_token"` markup filter mitigates this only for
+    // the DEFAULT field name; exempting the route by prefix makes it robust for
+    // ANY configured `security.submit_token.field_name`. Only meaningful for
+    // `--live-validation`, and only when the project actually has an
+    // `autumn.toml` to edit (a bare/hand-rolled project keeps the markup
+    // filter as its sole, still-effective default-field-name guard).
+    if options_with_key.live_validation {
+        let autumn_toml_path = project_root.join("autumn.toml");
+        if autumn_toml_path.exists() {
+            let toml_existing = read_or_empty(&autumn_toml_path);
+            let updated_toml = append_submit_token_validate_exempt_to_toml(&toml_existing, &plural);
+            if updated_toml != toml_existing {
+                plan.modify(autumn_toml_path.clone(), updated_toml);
+            }
+            plan.push_revert(Revert::SubmitTokenValidateExempt {
+                path: autumn_toml_path,
+                plural,
+            });
+        }
+    }
+
     Ok(plan)
 }
 
@@ -5471,6 +5497,188 @@ fn main_route_entries(
     }
 }
 
+/// The submit-token exempt-path prefix for a `--live-validation` resource.
+///
+/// The generated inline-validation routes are `POST /{plural}/validate/{field}`;
+/// this prefix exempts every one of them from the submit-token guard at once
+/// (the guard matches `exempt_paths` by prefix — an exact match, a prefix ending
+/// in `/`, or a prefix whose remainder begins with `/`, so `/{plural}/validate`
+/// covers `/{plural}/validate/title`, `/{plural}/validate/body`, … without
+/// touching the guarded `POST /{plural}` create route).
+fn submit_token_validate_exempt_prefix(plural: &str) -> String {
+    format!("/{plural}/validate")
+}
+
+/// The `(start, end)` line span of a top-level `[header]` TOML table — the
+/// header line through the last line before the next top-level `[...]` header
+/// or EOF. `None` when `header` is absent. Mirrors the auth generator's
+/// equivalent so submit-token exemptions merge into an existing block instead
+/// of emitting a duplicate table.
+fn toml_table_block_range(lines: &[&str], header: &str) -> Option<(usize, usize)> {
+    let start = lines.iter().position(|l| l.trim() == header)?;
+    let end = lines[start + 1..]
+        .iter()
+        .position(|l| l.trim_start().starts_with('['))
+        .map_or(lines.len(), |rel| start + 1 + rel);
+    Some((start, end))
+}
+
+/// Ensure `/{plural}/validate` is listed under `[security.submit_token]
+/// exempt_paths` so a `--live-validation` scaffold's inline-validation POSTs
+/// never consume the one-time submit token (issue #1360).
+///
+/// This is the route-based, field-name-agnostic half of the fix: the
+/// `hx-params="not _submit_token"` markup filter only strips the DEFAULT field
+/// name, so an app that customises `security.submit_token.field_name` would
+/// otherwise still leak the token into the validation POST and have the real
+/// create/update submit replay a validation fragment. Exempting the route makes
+/// it robust regardless of the configured field name.
+///
+/// Idempotent: a no-op when the prefix is already present in the block. Handles
+/// three shapes — no `[security.submit_token]` table (append a fresh one), a
+/// table without an `exempt_paths` key (insert the key after the header), and a
+/// table whose `exempt_paths` array is merged in place.
+fn append_submit_token_validate_exempt_to_toml(existing: &str, plural: &str) -> String {
+    const HEADER: &str = "[security.submit_token]";
+    let exempt = submit_token_validate_exempt_prefix(plural);
+    let quoted = format!("\"{exempt}\"");
+
+    let lines: Vec<&str> = existing.lines().collect();
+    let Some((start, end)) = toml_table_block_range(&lines, HEADER) else {
+        // No `[security.submit_token]` table yet — append a fresh one.
+        let mut out = existing.trim_end().to_owned();
+        if !out.is_empty() {
+            out.push_str("\n\n");
+        }
+        out.push_str(HEADER);
+        out.push('\n');
+        let _ = writeln!(out, "exempt_paths = [{quoted}]");
+        return out;
+    };
+
+    // The table exists. Idempotent if the prefix is already listed in the block.
+    if lines[start..end].iter().any(|l| l.contains(&quoted)) {
+        return existing.to_owned();
+    }
+
+    // Look for an existing `exempt_paths` key inside the block.
+    let key_pos = lines[start + 1..end]
+        .iter()
+        .position(|l| l.trim_start().starts_with("exempt_paths"))
+        .map(|rel| start + 1 + rel);
+
+    let mut out_lines: Vec<String> = lines.iter().map(|l| (*l).to_owned()).collect();
+
+    if let Some(key_idx) = key_pos {
+        // Merge into the existing array. Find its closing `]` (arrays here don't
+        // nest) starting at the key line, collapsing a multi-line array to a
+        // single line if necessary — correctness over formatting for this
+        // uncommon hand-configured case.
+        let close_idx = (key_idx..end)
+            .find(|&i| lines[i].contains(']'))
+            .unwrap_or(key_idx);
+        let joined: String = lines[key_idx..=close_idx].join("\n");
+        if let (Some(open), Some(close)) = (joined.find('['), joined.rfind(']')) {
+            let inner = joined[open + 1..close].trim().trim_end_matches(',').trim();
+            let new_inner = if inner.is_empty() {
+                quoted
+            } else {
+                format!("{inner}, {quoted}")
+            };
+            let rebuilt = format!("{}[{new_inner}]{}", &joined[..open], &joined[close + 1..]);
+            out_lines.splice(key_idx..=close_idx, std::iter::once(rebuilt));
+        }
+    } else {
+        // Table present but no `exempt_paths` key — insert it right after the
+        // header line.
+        out_lines.insert(start + 1, format!("exempt_paths = [{quoted}]"));
+    }
+
+    let mut out = out_lines.join("\n");
+    if existing.ends_with('\n') && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out
+}
+
+/// Inverse of [`append_submit_token_validate_exempt_to_toml`] (`autumn
+/// destroy`, issue #1048): remove `/{plural}/validate` from
+/// `[security.submit_token] exempt_paths`, dropping the whole block if that
+/// leaves an empty freshly-generated `exempt_paths = [...]` as its only key.
+///
+/// Conservative: only touches an `exempt_paths` array that still contains the
+/// exact prefix this generator inserts, never a hand-edited value.
+pub(super) fn remove_submit_token_validate_exempt_from_toml(
+    existing: &str,
+    plural: &str,
+) -> String {
+    const HEADER: &str = "[security.submit_token]";
+    let exempt = submit_token_validate_exempt_prefix(plural);
+    let quoted = format!("\"{exempt}\"");
+
+    let lines: Vec<&str> = existing.lines().collect();
+    let Some((start, end)) = toml_table_block_range(&lines, HEADER) else {
+        return existing.to_owned();
+    };
+    let Some(key_idx) = lines[start + 1..end]
+        .iter()
+        .position(|l| l.trim_start().starts_with("exempt_paths"))
+        .map(|rel| start + 1 + rel)
+    else {
+        return existing.to_owned();
+    };
+    let close_idx = (key_idx..end)
+        .find(|&i| lines[i].contains(']'))
+        .unwrap_or(key_idx);
+    let joined: String = lines[key_idx..=close_idx].join("\n");
+    let (Some(open), Some(close)) = (joined.find('['), joined.rfind(']')) else {
+        return existing.to_owned();
+    };
+    let inner = &joined[open + 1..close];
+    if !inner.contains(&quoted) {
+        return existing.to_owned();
+    }
+    // Strip our element from the array's comma-separated items.
+    let remaining: Vec<String> = inner
+        .split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty() && *item != quoted)
+        .map(str::to_owned)
+        .collect();
+
+    let mut out_lines: Vec<String> = lines.iter().map(|l| (*l).to_owned()).collect();
+    if remaining.is_empty() {
+        // The block only carried our exempt_paths line — remove the key, and the
+        // whole table too if the key was its sole content.
+        let block_only_our_key = (start + 1..end).all(|i| {
+            i == key_idx || (key_idx..=close_idx).contains(&i) || lines[i].trim().is_empty()
+        });
+        if block_only_our_key {
+            out_lines.splice(start..end, std::iter::empty::<String>());
+        } else {
+            out_lines.splice(key_idx..=close_idx, std::iter::empty::<String>());
+        }
+    } else {
+        let rebuilt = format!(
+            "{}[{}]{}",
+            &joined[..open],
+            remaining.join(", "),
+            &joined[close + 1..]
+        );
+        out_lines.splice(key_idx..=close_idx, std::iter::once(rebuilt));
+    }
+
+    let mut out = out_lines.join("\n");
+    // Collapse any doubled blank lines left by removing the block.
+    while out.contains("\n\n\n") {
+        out = out.replace("\n\n\n", "\n\n");
+    }
+    if existing.ends_with('\n') && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -9856,5 +10064,159 @@ async fn main() {
         assert!(!tmp.path().join("src/policies/post.rs").exists());
         assert!(!tmp.path().join("src/policies").exists());
         assert_eq!(fs::read_to_string(&main_path).unwrap(), original_main);
+    }
+
+    // ── submit-token live-validation exempt_paths (issue #1360) ──────────────
+
+    #[test]
+    fn submit_token_exempt_appends_fresh_block_when_absent() {
+        let existing = "[server]\nport = 3000\n";
+        let out = append_submit_token_validate_exempt_to_toml(existing, "posts");
+        assert!(out.contains("[security.submit_token]"), "{out}");
+        assert!(
+            out.contains("exempt_paths = [\"/posts/validate\"]"),
+            "{out}"
+        );
+        // The original content is preserved.
+        assert!(out.contains("[server]"), "{out}");
+    }
+
+    #[test]
+    fn submit_token_exempt_is_idempotent() {
+        let existing = "[security.submit_token]\nexempt_paths = [\"/posts/validate\"]\n";
+        let out = append_submit_token_validate_exempt_to_toml(existing, "posts");
+        assert_eq!(out, existing, "re-adding the same prefix must be a no-op");
+    }
+
+    #[test]
+    fn submit_token_exempt_merges_into_existing_array() {
+        let existing =
+            "[security.submit_token]\nttl_secs = 900\nexempt_paths = [\"/webhooks/x\"]\n";
+        let out = append_submit_token_validate_exempt_to_toml(existing, "posts");
+        assert!(out.contains("\"/webhooks/x\""), "{out}");
+        assert!(out.contains("\"/posts/validate\""), "{out}");
+        assert!(out.contains("ttl_secs = 900"), "{out}");
+        // No duplicate exempt_paths key.
+        assert_eq!(out.matches("exempt_paths").count(), 1, "{out}");
+    }
+
+    #[test]
+    fn submit_token_exempt_inserts_key_when_block_lacks_it() {
+        let existing = "[security.submit_token]\nttl_secs = 900\n";
+        let out = append_submit_token_validate_exempt_to_toml(existing, "posts");
+        assert!(
+            out.contains("exempt_paths = [\"/posts/validate\"]"),
+            "{out}"
+        );
+        assert!(out.contains("ttl_secs = 900"), "{out}");
+    }
+
+    #[test]
+    fn submit_token_exempt_prefix_covers_only_validation_routes() {
+        // Field-name-agnostic: the exemption is a route prefix, independent of
+        // `security.submit_token.field_name`. It must cover the per-field
+        // validation routes but never the guarded create route.
+        assert_eq!(
+            submit_token_validate_exempt_prefix("posts"),
+            "/posts/validate"
+        );
+    }
+
+    #[test]
+    fn remove_submit_token_exempt_drops_fresh_block() {
+        let existing = "[server]\nport = 3000\n";
+        let added = append_submit_token_validate_exempt_to_toml(existing, "posts");
+        let removed = remove_submit_token_validate_exempt_from_toml(&added, "posts");
+        assert!(!removed.contains("/posts/validate"), "{removed}");
+        assert!(!removed.contains("[security.submit_token]"), "{removed}");
+        assert!(removed.contains("[server]"), "{removed}");
+    }
+
+    #[test]
+    fn remove_submit_token_exempt_keeps_other_entries() {
+        let existing =
+            "[security.submit_token]\nexempt_paths = [\"/webhooks/x\", \"/posts/validate\"]\n";
+        let removed = remove_submit_token_validate_exempt_from_toml(existing, "posts");
+        assert!(removed.contains("\"/webhooks/x\""), "{removed}");
+        assert!(!removed.contains("/posts/validate"), "{removed}");
+        assert!(removed.contains("[security.submit_token]"), "{removed}");
+    }
+
+    #[test]
+    fn remove_submit_token_exempt_ignores_hand_edited_value() {
+        // Never touch an array that no longer carries our exact prefix.
+        let existing = "[security.submit_token]\nexempt_paths = [\"/custom/only\"]\n";
+        let removed = remove_submit_token_validate_exempt_from_toml(existing, "posts");
+        assert_eq!(removed, existing);
+    }
+
+    #[test]
+    fn live_validation_scaffold_exempts_validation_routes_in_autumn_toml() {
+        // End-to-end at plan level: a `--live-validation` scaffold with a
+        // CUSTOM submit-token field name still exempts the generated
+        // `/posts/validate/*` routes, because the exemption is route-based
+        // (field-name-agnostic) rather than relying on the `hx-params` filter,
+        // which only strips the default `_submit_token` name.
+        let tmp = project_with_main(default_main());
+        // A customised field name in autumn.toml — the exemption must not depend
+        // on it.
+        fs::write(
+            tmp.path().join("autumn.toml"),
+            "[security.submit_token]\nfield_name = \"_confirm\"\n",
+        )
+        .unwrap();
+        let plan = plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String".into()],
+            "20260712000000",
+            &ScaffoldOptions {
+                live_validation: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let toml_action = plan
+            .actions
+            .iter()
+            .rev()
+            .find_map(|a| match a {
+                Action::Modify { path, contents } if path.ends_with("autumn.toml") => {
+                    Some(contents.clone())
+                }
+                _ => None,
+            })
+            .expect("live-validation scaffold must modify autumn.toml");
+        assert!(
+            toml_action.contains("\"/posts/validate\""),
+            "autumn.toml must exempt the validation route prefix:\n{toml_action}"
+        );
+        // The custom field name is left untouched.
+        assert!(
+            toml_action.contains("field_name = \"_confirm\""),
+            "{toml_action}"
+        );
+    }
+
+    #[test]
+    fn non_live_validation_scaffold_does_not_touch_autumn_toml_exempt() {
+        let tmp = project_with_main(default_main());
+        fs::write(tmp.path().join("autumn.toml"), "[server]\nport = 3000\n").unwrap();
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &["title:String".into()],
+            "20260712000000",
+        )
+        .unwrap();
+        let touches_toml = plan
+            .actions
+            .iter()
+            .any(|a| a.path().ends_with("autumn.toml"));
+        assert!(
+            !touches_toml,
+            "a plain scaffold (no --live-validation) must not add submit-token exemptions"
+        );
     }
 }
