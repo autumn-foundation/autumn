@@ -1,0 +1,18 @@
+# The repo root .gitignore ignores *.py and *.sh (this is a Rust workspace).
+# The harness is Python, so re-include its checked-in scripts here.
+!acceptance/*.py
+!hidden/*.py
+!phase2/*.py
+!scripts/*.py
+!scripts/prepare_agent_workspace.sh
+
+# Generated per-run artifacts must never be committed.
+runs/*/app/
+runs/*/boot.log
+runs/*/visible.log
+runs/*/hidden.log
+runs/*/metrics.json
+runs/*/run.sh
+runs/*/README.md
+__pycache__/
+*.pyc
