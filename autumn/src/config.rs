@@ -4136,22 +4136,25 @@ impl AutumnConfig {
     /// one offsite env var is present, so an all-env deployment still works.
     fn apply_backup_env_overrides_with_env(&mut self, env: &dyn Env) {
         // Keys that signal a genuine intent to CONFIGURE an offsite destination —
-        // any presence materializes the `[backup.offsite]` section. This
-        // deliberately EXCLUDES the two opt-out toggles: a lone
+        // presence of any REQUIRED destination/credential key materializes the
+        // `[backup.offsite]` section (issue #1791). This is limited to the keys
+        // that a working upload genuinely requires — a bucket, or the access /
+        // secret key-env names. Optional-only keys (`region`,
+        // `force_path_style`, `endpoint`, `prefix`, `keep`) do NOT materialize
+        // the section on their own: a bare `AUTUMN_BACKUP__OFFSITE__S3__REGION`
+        // (or endpoint) with no bucket cannot upload, so it must leave offsite
+        // UNCONFIGURED rather than produce an empty section that then fails
+        // validation / `doctor` with "backup.offsite.s3.bucket is unset". Those
+        // optional keys are still APPLIED below once the section IS materialized
+        // by a required key. This also EXCLUDES the two opt-out toggles: a lone
         // `AUTO_UPLOAD=false` / `ALLOW_SHARED_BUCKET=false` must NOT create an
-        // otherwise-empty section (which would then fail validation / `doctor`
-        // with "backup.offsite.s3.bucket is unset") — offsite stays UNCONFIGURED
-        // (issue #1619 P2 #18). A truthy `AUTO_UPLOAD=true` DOES materialize, since
-        // it requires a validated destination to act on.
+        // otherwise-empty section (issue #1619 P2 #18). A truthy
+        // `AUTO_UPLOAD=true` DOES materialize, since it requires a validated
+        // destination to act on.
         const OFFSITE_DEST_KEYS: &[&str] = &[
             "AUTUMN_BACKUP__OFFSITE__S3__BUCKET",
-            "AUTUMN_BACKUP__OFFSITE__S3__REGION",
-            "AUTUMN_BACKUP__OFFSITE__S3__ENDPOINT",
             "AUTUMN_BACKUP__OFFSITE__S3__ACCESS_KEY_ID_ENV",
             "AUTUMN_BACKUP__OFFSITE__S3__SECRET_ACCESS_KEY_ENV",
-            "AUTUMN_BACKUP__OFFSITE__S3__FORCE_PATH_STYLE",
-            "AUTUMN_BACKUP__OFFSITE__PREFIX",
-            "AUTUMN_BACKUP__OFFSITE__KEEP",
         ];
         let has_dest_key = OFFSITE_DEST_KEYS.iter().any(|k| env.var(k).is_ok());
         let auto_upload_truthy = env
@@ -8068,6 +8071,78 @@ path = "/healthz"
             .expect("a bucket key materializes offsite");
         assert_eq!(offsite.s3.bucket.as_deref(), Some("offsite"));
         assert!(!offsite.auto_upload);
+    }
+
+    #[test]
+    fn env_override_backup_offsite_lone_optional_key_stays_none() {
+        // #1791: optional-only keys (region, force_path_style, endpoint, prefix,
+        // keep) must NOT materialize [backup.offsite] on their own — a bare
+        // region with no bucket/credentials cannot upload, so offsite stays
+        // UNCONFIGURED rather than producing an empty section that then fails
+        // `doctor` with "bucket is unset".
+        for (key, val) in [
+            ("AUTUMN_BACKUP__OFFSITE__S3__REGION", "us-east-1"),
+            ("AUTUMN_BACKUP__OFFSITE__S3__ENDPOINT", "https://s3.test"),
+            ("AUTUMN_BACKUP__OFFSITE__S3__FORCE_PATH_STYLE", "true"),
+            ("AUTUMN_BACKUP__OFFSITE__PREFIX", "nightly"),
+            ("AUTUMN_BACKUP__OFFSITE__KEEP", "3"),
+        ] {
+            let env = MockEnv::new().with(key, val);
+            let mut config = AutumnConfig::default();
+            config.apply_env_overrides_with_env(&env);
+            assert!(
+                config.backup.offsite.is_none(),
+                "{key} is optional-only and must not materialize an offsite section",
+            );
+        }
+    }
+
+    #[test]
+    fn env_override_backup_offsite_credential_key_materializes() {
+        // #1791: the access/secret key-env names are REQUIRED signals, so either
+        // one still materializes the section.
+        for key in [
+            "AUTUMN_BACKUP__OFFSITE__S3__ACCESS_KEY_ID_ENV",
+            "AUTUMN_BACKUP__OFFSITE__S3__SECRET_ACCESS_KEY_ENV",
+        ] {
+            let env = MockEnv::new().with(key, "SOME_ENV_NAME");
+            let mut config = AutumnConfig::default();
+            config.apply_env_overrides_with_env(&env);
+            assert!(
+                config.backup.offsite.is_some(),
+                "{key} is a required credential signal and must materialize offsite",
+            );
+        }
+    }
+
+    #[test]
+    fn env_override_backup_offsite_bucket_only_materializes() {
+        // #1791: a lone bucket (required destination signal) still materializes.
+        let env = MockEnv::new().with("AUTUMN_BACKUP__OFFSITE__S3__BUCKET", "offsite");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        let offsite = config
+            .backup
+            .offsite
+            .expect("a bucket key materializes offsite");
+        assert_eq!(offsite.s3.bucket.as_deref(), Some("offsite"));
+    }
+
+    #[test]
+    fn env_override_backup_offsite_region_only_applied_when_materialized() {
+        // #1791: region no longer TRIGGERS materialization, but it is still
+        // APPLIED when a required key materializes the section.
+        let env = MockEnv::new()
+            .with("AUTUMN_BACKUP__OFFSITE__S3__BUCKET", "offsite")
+            .with("AUTUMN_BACKUP__OFFSITE__S3__REGION", "us-west-2")
+            .with("AUTUMN_BACKUP__OFFSITE__PREFIX", "nightly")
+            .with("AUTUMN_BACKUP__OFFSITE__KEEP", "5");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        let offsite = config.backup.offsite.expect("bucket materializes offsite");
+        assert_eq!(offsite.s3.region.as_deref(), Some("us-west-2"));
+        assert_eq!(offsite.prefix.as_deref(), Some("nightly"));
+        assert_eq!(offsite.keep, Some(5));
     }
 
     #[test]

@@ -916,6 +916,27 @@ impl S3Client {
         })
     }
 
+    /// Verify the just-written object matches, deleting the remote object on a
+    /// verification failure (#1760). `put_file*` WRITES the object BEFORE
+    /// verifying it, so a mismatch (or a transient read failure during verify)
+    /// can leave a corrupt/partial object behind. On any verify error we
+    /// best-effort `DeleteObject` the key so `put_file_and_verify` is
+    /// self-cleaning for every caller and leaves nothing behind even
+    /// transiently. The delete is cleanup only: its own failure must NEVER mask
+    /// the original verify error, which stays loud and non-zero.
+    fn verify_or_delete(&self, key: &str, len: u64, checksum_b64: &str) -> Result<(), S3Error> {
+        if let Err(e) = self.verify_uploaded(key, len, checksum_b64) {
+            if let Err(del_err) = self.delete_object(key) {
+                eprintln!(
+                    "  \u{26A0} failed to delete {key} after post-upload verification \
+                     failed: {del_err}"
+                );
+            }
+            return Err(e);
+        }
+        Ok(())
+    }
+
     /// Stream the file at `path` to `key` and verify the remote object matches
     /// (AC #2): a single streaming hash pre-pass computes the sha256 + length,
     /// the file is streamed as the PUT body with a server-side checksum, then
@@ -940,7 +961,7 @@ impl S3Client {
         let checksum_b64 = base64_standard(&digest);
         let content_hex = hex::encode(digest);
         self.put_file(key, path, &checksum_b64, &content_hex)?;
-        self.verify_uploaded(key, hashed_len, &checksum_b64)
+        self.verify_or_delete(key, hashed_len, &checksum_b64)
     }
 
     /// Upload `path` to `key` as an S3 multipart upload: `CreateMultipartUpload`,
@@ -975,8 +996,10 @@ impl S3Client {
             Ok(whole_b64) => {
                 // Completion succeeded: the object now exists. Do NOT abort.
                 // Verify the assembled object matches the streamed-hash of the
-                // local file (HEAD length + checksum, else GET-and-rehash).
-                self.verify_uploaded(key, len, &whole_b64)
+                // local file (HEAD length + checksum, else GET-and-rehash). On a
+                // verify failure the completed object is deleted (#1760) so a
+                // corrupt object is never left behind.
+                self.verify_or_delete(key, len, &whole_b64)
             }
             Err(err) => {
                 // Best-effort abort; surface the ORIGINAL upload error regardless
@@ -1586,6 +1609,138 @@ mod tests {
             .unwrap();
         server.join().unwrap();
         assert_eq!(sink, body);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn put_file_and_verify_deletes_object_on_verify_failure() {
+        // #1760: `put_file_and_verify` WRITES the object BEFORE verifying it, so a
+        // post-upload verify failure must best-effort DELETE the just-written key
+        // — leaving no corrupt/partial object behind. A one-connection local S3
+        // stub accepts the PUT, then answers the verify HEAD with a WRONG
+        // Content-Length (forcing a length-mismatch `VerifyFailed`), and records
+        // that a DELETE for the same key follows. The multipart path funnels
+        // through the same `verify_or_delete` helper, so proving the single-PUT
+        // path proves the shared cleanup.
+        use std::io::{Read as _, Write as _};
+        use std::time::Duration;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("artifact.dump");
+        let payload = b"verify-failure-cleanup-body";
+        std::fs::write(&path, payload).unwrap();
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let payload_len = payload.len();
+
+        let server = std::thread::spawn(move || {
+            let mut methods: Vec<String> = Vec::new();
+            // reqwest's blocking client reuses one keep-alive connection for the
+            // PUT/HEAD/DELETE sequence; the outer loop tolerates a fresh
+            // connection per request too. Read timeouts stop a stray idle
+            // connection from hanging the test.
+            'accept: for _conn in 0..8 {
+                let Ok((mut sock, _)) = listener.accept() else {
+                    break;
+                };
+                sock.set_read_timeout(Some(Duration::from_secs(5))).ok();
+                loop {
+                    // Read the request head (up to CRLFCRLF).
+                    let mut acc: Vec<u8> = Vec::new();
+                    let mut buf = [0u8; 1024];
+                    let header_end = loop {
+                        if let Some(p) = acc.windows(4).position(|w| w == b"\r\n\r\n") {
+                            break Some(p + 4);
+                        }
+                        match sock.read(&mut buf) {
+                            Ok(0) | Err(_) => break None,
+                            Ok(n) => acc.extend_from_slice(&buf[..n]),
+                        }
+                    };
+                    let Some(header_end) = header_end else {
+                        break; // connection closed / idle — try the next one
+                    };
+                    let head = String::from_utf8_lossy(&acc[..header_end]).into_owned();
+                    let method = head
+                        .lines()
+                        .next()
+                        .and_then(|l| l.split_whitespace().next())
+                        .unwrap_or_default()
+                        .to_owned();
+                    let content_length: usize = head
+                        .lines()
+                        .find_map(|l| {
+                            let (k, v) = l.split_once(':')?;
+                            k.trim()
+                                .eq_ignore_ascii_case("content-length")
+                                .then(|| v.trim().parse().ok())
+                                .flatten()
+                        })
+                        .unwrap_or(0);
+                    // Consume any request body (the PUT streams the file).
+                    let mut remaining = content_length.saturating_sub(acc.len() - header_end);
+                    while remaining > 0 {
+                        match sock.read(&mut buf) {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => remaining = remaining.saturating_sub(n),
+                        }
+                    }
+                    methods.push(method.clone());
+                    match method.as_str() {
+                        "HEAD" => {
+                            // A wrong length forces verify_head's length-mismatch
+                            // VerifyFailed BEFORE any checksum/GET fallback.
+                            let resp = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+                                payload_len + 999
+                            );
+                            sock.write_all(resp.as_bytes()).ok();
+                        }
+                        "DELETE" => {
+                            sock.write_all(b"HTTP/1.1 204 No Content\r\n\r\n").ok();
+                            sock.flush().ok();
+                            break 'accept;
+                        }
+                        _ => {
+                            sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                                .ok();
+                        }
+                    }
+                    sock.flush().ok();
+                }
+            }
+            methods
+        });
+
+        let client = S3Client::new(
+            S3Config {
+                bucket: "b".to_owned(),
+                region: "us-east-1".to_owned(),
+                endpoint: Some(format!("http://127.0.0.1:{port}")),
+                force_path_style: true,
+            },
+            S3Credentials {
+                access_key_id: "k".to_owned(),
+                secret_access_key: "s".to_owned(),
+            },
+        )
+        .unwrap();
+
+        let err = client
+            .put_file_and_verify("prefix/artifact.dump", &path)
+            .expect_err("verify must fail on the mismatched HEAD length");
+        assert!(
+            matches!(err, S3Error::VerifyFailed { .. }),
+            "expected VerifyFailed, got {err:?}"
+        );
+
+        let methods = server.join().unwrap();
+        assert_eq!(
+            methods,
+            vec!["PUT".to_owned(), "HEAD".to_owned(), "DELETE".to_owned()],
+            "on a verify failure the object must be PUT, verified via HEAD, then DELETEd",
+        );
     }
 
     #[test]

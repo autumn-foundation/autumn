@@ -36,6 +36,9 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
+
+use autumn_web::alerts::{Alert, AlertChannel, AlertCondition};
 
 use crate::db::s3::{self, S3Client, S3Config, S3Credentials};
 use crate::migrate;
@@ -393,14 +396,90 @@ fn backup(args: &BackupArgs) -> Result<(), BackupError> {
         // location regardless of alias/case spelling — while the LOCAL run dir
         // keeps its raw #1595 `<profile>/<timestamp>` layout (used above).
         let remote_profile = migrate::canonical_profile(&profile);
-        upload_run(&offsite, &client, &run_dir, &remote_profile, &remote_id).map_err(|detail| {
-            BackupError::OffsiteUploadFailed {
-                local_path: run_dir.display().to_string(),
-                detail,
-            }
-        })?;
+        if let Err(detail) = upload_run(&offsite, &client, &run_dir, &remote_profile, &remote_id) {
+            let local_path = run_dir.display().to_string();
+            // #1743: raise an operator alert so an unattended/cron backup with
+            // [alerts] configured never fails its upload silently. Best-effort —
+            // never changes the exit code; the `?`-equivalent return below still
+            // exits non-zero with the same split-outcome message as before.
+            emit_offsite_upload_failure_alert(&local_path, &detail);
+            return Err(BackupError::OffsiteUploadFailed { local_path, detail });
+        }
     }
     Ok(())
+}
+
+/// Best-effort operator alert for a failed offsite upload (#1743).
+///
+/// Discriminator (chosen design): fire on ANY upload failure when `[alerts]`
+/// channels are configured. Interactive users with no `[alerts]` destination
+/// build zero channels, so this is a no-op for them — the interactive case
+/// (message + non-zero exit) is unchanged. Loading the config here is
+/// acceptable: we are already on the failure path and about to exit non-zero.
+fn emit_offsite_upload_failure_alert(local_path: &str, detail: &str) {
+    let config = match autumn_web::config::AutumnConfig::load() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("  \u{26A0} offsite-upload-failed alert skipped: could not load config: {e}");
+            return;
+        }
+    };
+    let client = autumn_web::http::Client::from_config(&config.http.client);
+    let channels = crate::alert::configured_http_channels(&config.alerts, &client);
+    deliver_offsite_upload_alert(&channels, local_path, detail);
+}
+
+/// Build the `ScheduledTaskFailure` alert raised when an offsite upload fails.
+/// Pure (no I/O) so it can be asserted directly in tests.
+fn build_offsite_upload_alert(local_path: &str, detail: &str) -> Alert {
+    Alert::trigger(
+        AlertCondition::ScheduledTaskFailure,
+        "scheduled_task_failure:db-backup-offsite-upload",
+    )
+    .title("Offsite backup upload failed")
+    .summary(detail)
+    .detail("local_path", local_path)
+    .detail("error", detail)
+    .build()
+}
+
+/// Deliver the offsite-upload-failure alert through every configured channel on
+/// a short-lived current-thread runtime (mirrors `autumn alert test`).
+/// Best-effort: a per-channel delivery error is logged but never propagated, so
+/// alerting can NEVER change the command's exit code. A no-op when `channels`
+/// is empty. Takes `&[Arc<dyn AlertChannel>]` so a test can inject a capturing
+/// mock channel and assert the alert that a failed upload raises.
+fn deliver_offsite_upload_alert(
+    channels: &[Arc<dyn AlertChannel>],
+    local_path: &str,
+    detail: &str,
+) {
+    if channels.is_empty() {
+        return;
+    }
+    let alert = build_offsite_upload_alert(local_path, detail);
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!(
+                "  \u{26A0} offsite-upload-failed alert not sent: could not start runtime: {e}"
+            );
+            return;
+        }
+    };
+    runtime.block_on(async {
+        for channel in channels {
+            if let Err(error) = channel.deliver(&alert).await {
+                eprintln!(
+                    "  \u{26A0} offsite-upload-failed alert not delivered via {}: {error}",
+                    channel.name()
+                );
+            }
+        }
+    });
 }
 
 /// Dump every target into `run_dir`, verify each artifact, and write the
@@ -2133,12 +2212,13 @@ fn upload_run(
     for file in &files {
         let path = run_dir.join(file);
         let key = offsite_object_key(&offsite.prefix, profile, run_id, file);
-        // `put_file_and_verify` WRITES the object BEFORE its HEAD/GET verification,
-        // so even a verify failure can leave the object (incl. the run manifest) in
-        // the bucket. Record the key up-front, then on ANY failure best-effort
-        // delete everything this run wrote — manifest first — so a run whose upload
-        // was reported FAILED never keeps a remote `manifest.json` and can't become
-        // `latest` or consume a retention slot (restores the P2 #2 invariant; #21).
+        // `put_file_and_verify` now self-cleans the single key it just wrote on a
+        // verify failure (#1760). This run-level cleanup is still needed for the
+        // OTHER keys written EARLIER in the run: record every key up-front, then on
+        // ANY failure best-effort delete everything this run wrote — manifest first
+        // — so a run whose upload was reported FAILED never keeps a remote
+        // `manifest.json` and can't become `latest` or consume a retention slot
+        // (restores the P2 #2 invariant; #21).
         written_keys.push(key.clone());
         // Stream the file straight from disk (hash pre-pass + streamed body):
         // a multi-GB dump is never read into memory.
@@ -3529,6 +3609,77 @@ mod tests {
         assert!(s.contains("Local backup OK at /backups/prod/20260710T040506Z"));
         assert!(s.contains("OFFSITE UPLOAD FAILED"));
         assert!(s.contains("intact"));
+    }
+
+    // ── #1743: failed offsite upload raises an operator alert ─────────────────
+
+    #[derive(Default)]
+    struct CapturingChannel {
+        received: Arc<std::sync::Mutex<Vec<Alert>>>,
+    }
+
+    impl AlertChannel for CapturingChannel {
+        fn name(&self) -> &'static str {
+            "capturing"
+        }
+        fn deliver<'a>(&'a self, alert: &'a Alert) -> autumn_web::alerts::AlertDeliveryFuture<'a> {
+            let received = Arc::clone(&self.received);
+            let cloned = alert.clone();
+            Box::pin(async move {
+                received.lock().expect("lock").push(cloned);
+                Ok(())
+            })
+        }
+    }
+
+    #[test]
+    fn build_offsite_upload_alert_is_scheduled_task_failure() {
+        let alert = build_offsite_upload_alert(
+            "/backups/prod/20260710T040506Z",
+            "S3 put returned HTTP 403 (AccessDenied)",
+        );
+        assert_eq!(alert.condition, AlertCondition::ScheduledTaskFailure);
+        assert_eq!(alert.title, "Offsite backup upload failed");
+        assert_eq!(alert.summary, "S3 put returned HTTP 403 (AccessDenied)");
+        assert_eq!(
+            alert.dedup_key,
+            "scheduled_task_failure:db-backup-offsite-upload"
+        );
+    }
+
+    #[test]
+    fn deliver_offsite_upload_alert_reaches_configured_channel() {
+        // Failure-injection: the upload-failure path delivers a
+        // ScheduledTaskFailure alert to every configured channel. A capturing
+        // mock channel records what a failed upload would raise.
+        let capture = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let channel = Arc::new(CapturingChannel {
+            received: Arc::clone(&capture),
+        });
+        let channels: Vec<Arc<dyn AlertChannel>> = vec![channel];
+
+        deliver_offsite_upload_alert(
+            &channels,
+            "/backups/prod/20260710T040506Z",
+            "S3 put returned HTTP 403 (AccessDenied)",
+        );
+
+        let delivered = {
+            let received = capture.lock().expect("lock");
+            received.clone()
+        };
+        assert_eq!(delivered.len(), 1, "exactly one alert must be delivered");
+        let alert = &delivered[0];
+        assert_eq!(alert.condition, AlertCondition::ScheduledTaskFailure);
+        assert_eq!(alert.title, "Offsite backup upload failed");
+        assert_eq!(alert.summary, "S3 put returned HTTP 403 (AccessDenied)");
+    }
+
+    #[test]
+    fn deliver_offsite_upload_alert_is_noop_without_channels() {
+        // Interactive case (no [alerts] configured → no channels): must be a
+        // no-op so behavior is unchanged. No panic, nothing delivered.
+        deliver_offsite_upload_alert(&[], "/backups/prod/run", "boom");
     }
 
     #[test]
