@@ -1661,7 +1661,7 @@ and a failed upload raises a `ScheduledTaskFailure` operator alert only when an
 outbound-HTTP `[alerts]` channel (PagerDuty / Slack / Discord / signed webhook)
 is configured — an email-only `[alerts]` config is not notified (issue #1743).
 Pointing the offsite bucket at the app's
-own `[storage.s3]` bucket needs `allow_shared_bucket = true`. See
+own `[storage.s3]` bucket at the same endpoint needs `allow_shared_bucket = true`. See
 `docs/guide/daemon.md`.
 
 `autumn destroy` mirrors `autumn generate` argument-for-argument and never

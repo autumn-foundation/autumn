@@ -1236,8 +1236,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   S3 caps a single `PutObject` at 5 GiB — the artifact uploads via multipart, hashed
   locally and verified after `CompleteMultipartUpload` via HEAD/GET); pointing the
   offsite bucket at the app's
-  own `[storage.s3]` bucket requires the explicit `allow_shared_bucket = true`
-  opt-in (issue #1619).
+  own `[storage.s3]` bucket at the same endpoint requires the explicit
+  `allow_shared_bucket = true` opt-in (issue #1619).
 - **doctor:** new `offsite_backup` check (never prints a credential value — only
   env-var names / booleans). It Passes when no `[backup.offsite]` destination is
   configured, or when a configured destination is complete. It **Fails** on an
