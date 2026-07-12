@@ -2334,6 +2334,14 @@ enum GenerateCommands {
         /// form inputs (implies `--live`).
         #[arg(long)]
         live_validation: bool,
+        /// Skip generating a record-level authorization `Policy`/`Scope` for the
+        /// resource. By default the scaffold generates and registers a policy;
+        /// with an owner column (`user_id`/`author_id`/`owner_id`) it also
+        /// authorizes the mutating HTML handlers and scopes the index. Pass
+        /// `--no-policy` to keep the older `#[secured]`-only output. Ignored for
+        /// `--api` scaffolds, which never generate a policy.
+        #[arg(long)]
+        no_policy: bool,
         /// Print the file plan and exit without writing anything.
         #[arg(long)]
         dry_run: bool,
@@ -3583,6 +3591,7 @@ fn run_generate_command(cmd: GenerateCommands, mode: ApplyMode) {
             shard_key,
             live,
             live_validation,
+            no_policy,
             dry_run,
             force,
         } => {
@@ -3639,6 +3648,7 @@ fn run_generate_command(cmd: GenerateCommands, mode: ApplyMode) {
                 live,
                 id.as_deref(),
                 live_validation,
+                no_policy,
             ) {
                 Ok(result) => result,
                 Err(e) => {

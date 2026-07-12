@@ -207,7 +207,7 @@ fn render_policy_file(pascal_name: &str, snake_name: &str, plural: &str, owner: 
         )
     };
 
-    let (update_delete_bodies, scope_body_db, scope_body_no_db) = match owner {
+    let (update_delete_bodies, scope_body, scope_ctx_param) = match owner {
         Some(col) => (
             format!(
                 "    fn can_update<'a>(&'a self, ctx: &'a PolicyContext, {snake_name}: &'a {pascal_name}) -> BoxFuture<'a, bool> {{\n        \
@@ -217,7 +217,6 @@ fn render_policy_file(pascal_name: &str, snake_name: &str, plural: &str, owner: 
                  Box::pin(async move {{ ctx.has_role(\"admin\") || ctx.user_id_i64() == Some({snake_name}.{col}) }})\n    \
                  }}\n"
             ),
-            // Scope::list body under the `db` feature.
             format!(
                 "        Box::pin(async move {{\n            \
                  let owner_id = ctx.user_id_i64().unwrap_or(-1);\n            \
@@ -228,8 +227,8 @@ fn render_policy_file(pascal_name: &str, snake_name: &str, plural: &str, owner: 
                  .await?)\n        \
                  }})\n"
             ),
-            // Scope::list body without the `db` feature.
-            "        Box::pin(async { Ok(Vec::new()) })\n".to_owned(),
+            // `ctx` is used by the owner filter.
+            "ctx",
         ),
         None => (
             format!(
@@ -245,24 +244,36 @@ fn render_policy_file(pascal_name: &str, snake_name: &str, plural: &str, owner: 
             "        // TODO: no owner column detected — implement the scope filter.\n        \
              Box::pin(async { Ok(Vec::new()) })\n"
                 .to_owned(),
-            "        // TODO: no owner column detected — implement the scope filter.\n        \
-             Box::pin(async { Ok(Vec::new()) })\n"
-                .to_owned(),
+            // `ctx`/`conn` are unused in the default-deny stub.
+            "_ctx",
         ),
+    };
+    // `conn` is only referenced when an owner filter is emitted.
+    let scope_conn_param = if owner.is_some() { "conn" } else { "_conn" };
+
+    // Diesel is used unconditionally, mirroring the scaffold's other generated
+    // files (`src/routes/*.rs`, `src/repositories/*.rs`): a generated Autumn app
+    // always compiles against autumn-web's `db` feature, and the app crate does
+    // not define its own `db` feature — so gating these on `#[cfg(feature =
+    // \"db\")]` would (wrongly) drop them while autumn-web's 3-arg `Scope::list`
+    // stays in scope. The `use` lines are only needed for the owner filter.
+    let diesel_imports = if owner.is_some() {
+        "use diesel::prelude::*;\nuse diesel_async::RunQueryDsl;\n"
+    } else {
+        ""
+    };
+    let schema_import = if owner.is_some() {
+        format!("use crate::schema::{plural};\n")
+    } else {
+        String::new()
     };
 
     format!(
         "{module_doc}\
 use autumn_web::authorization::{{BoxFuture, Policy, PolicyContext, Scope}};
-#[cfg(feature = \"db\")]
-use diesel::prelude::*;
-#[cfg(feature = \"db\")]
-use diesel_async::RunQueryDsl;
-
+{diesel_imports}\
 use crate::models::{snake_name}::{pascal_name};
-#[cfg(feature = \"db\")]
-use crate::schema::{plural};
-
+{schema_import}
 #[derive(Default)]
 pub struct {pascal_name}Policy;
 
@@ -282,24 +293,13 @@ impl Policy<{pascal_name}> for {pascal_name}Policy {{
 #[derive(Default)]
 pub struct {pascal_name}Scope;
 
-#[cfg(feature = \"db\")]
 impl Scope<{pascal_name}> for {pascal_name}Scope {{
     fn list<'a>(
         &'a self,
-        ctx: &'a PolicyContext,
-        conn: &'a mut diesel_async::AsyncPgConnection,
+        {scope_ctx_param}: &'a PolicyContext,
+        {scope_conn_param}: &'a mut diesel_async::AsyncPgConnection,
     ) -> BoxFuture<'a, autumn_web::AutumnResult<Vec<{pascal_name}>>> {{
-{scope_body_db}    }}
-}}
-
-#[cfg(not(feature = \"db\"))]
-impl Scope<{pascal_name}> for {pascal_name}Scope {{
-    fn list<'a>(
-        &'a self,
-        ctx: &'a PolicyContext,
-    ) -> BoxFuture<'a, autumn_web::AutumnResult<Vec<{pascal_name}>>> {{
-        let _ = ctx;
-{scope_body_no_db}    }}
+{scope_body}    }}
 }}
 "
     )
