@@ -1,0 +1,115 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Habit-tracker benchmark per-run metrics",
+  "description": "Informal schema for runs/<run-id>/metrics.json. One file per trial (framework x phase). Consumed by scripts/score.py.",
+  "type": "object",
+  "required": [
+    "framework",
+    "prompt_version",
+    "phase",
+    "wall_clock_seconds",
+    "agent_tool_calls",
+    "visible_checks_passed",
+    "visible_checks_total",
+    "hidden_checks_passed",
+    "hidden_checks_total",
+    "generated_loc",
+    "has_tests"
+  ],
+  "properties": {
+    "framework": {
+      "type": "string",
+      "description": "Framework under test.",
+      "examples": ["autumn", "django", "rails", "springboot", "phoenix", "loco"]
+    },
+    "prompt_version": {
+      "type": "string",
+      "description": "Prompt-Version header from the prompt used.",
+      "examples": ["v1"]
+    },
+    "phase": {
+      "type": "integer",
+      "enum": [1, 2],
+      "description": "1 = greenfield build, 2 = archived-habits maintenance change."
+    },
+    "wall_clock_seconds": {
+      "type": "number",
+      "description": "Seconds from agent start to first green (visible tests all pass). Measured during the trial, not by score.py."
+    },
+    "agent_tool_calls": {
+      "type": "integer",
+      "description": "Total agent tool calls made to reach first green."
+    },
+    "agent_turns": {
+      "type": "integer",
+      "description": "Number of agent conversation turns (assistant messages) in the trial."
+    },
+    "failed_test_runs": {
+      "type": "integer",
+      "description": "How many times the acceptance suite was run and failed before first green."
+    },
+    "human_interventions": {
+      "type": "integer",
+      "description": "Count of manual nudges/corrections a human gave the agent. 0 for a clean autonomous run."
+    },
+    "generated_loc": {
+      "type": "integer",
+      "description": "Lines of application source the agent generated. Exclude vendored deps and lockfiles."
+    },
+    "visible_checks_passed": {
+      "type": "integer",
+      "description": "Passing checks from acceptance/contract_test.py (the X in its RESULT line)."
+    },
+    "visible_checks_total": {
+      "type": "integer",
+      "description": "Total checks from acceptance/contract_test.py (the Y in its RESULT line)."
+    },
+    "hidden_checks_passed": {
+      "type": "integer",
+      "description": "Passing checks from hidden/hidden_test.py."
+    },
+    "hidden_checks_total": {
+      "type": "integer",
+      "description": "Total checks from hidden/hidden_test.py."
+    },
+    "has_tests": {
+      "type": "boolean",
+      "description": "Did the agent ship automated tests for core behavior?"
+    },
+    "readme_quality": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 3,
+      "description": "Manual 0-3: quality/accuracy/sufficiency of run instructions."
+    },
+    "uses_conventions": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 3,
+      "description": "Manual 0-3: how idiomatically the code uses the framework's conventions."
+    },
+    "notes": {
+      "type": "string",
+      "description": "Free-form reviewer notes about the run."
+    }
+  },
+  "example": {
+    "framework": "autumn",
+    "prompt_version": "v1",
+    "phase": 1,
+    "wall_clock_seconds": 640.5,
+    "agent_tool_calls": 58,
+    "agent_turns": 22,
+    "failed_test_runs": 2,
+    "human_interventions": 0,
+    "generated_loc": 430,
+    "visible_checks_passed": 30,
+    "visible_checks_total": 30,
+    "hidden_checks_passed": 25,
+    "hidden_checks_total": 25,
+    "has_tests": true,
+    "readme_quality": 2,
+    "uses_conventions": 3,
+    "notes": "Copied examples/todo-app as a base; clean run."
+  }
+}
