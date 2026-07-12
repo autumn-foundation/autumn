@@ -749,7 +749,17 @@ fn emit_association_items(
                         let mut __groups: ::std::collections::HashMap<i64, #stored_ty> =
                             ::std::collections::HashMap::new();
                         for __child in __children {
-                            __groups.entry(__child.#fk_ident).or_default().push(__child);
+                            // Normalize the child's FK (which may be `i64` or a
+                            // nullable `Option<i64>`, as every `dependent =
+                            // nullify` child has) to an `Option<i64>` key and
+                            // drop orphan (`None`-FK, detached) children — they
+                            // belong to no loaded parent. Non-null FKs are always
+                            // `Some`, so this is byte-identical for them.
+                            if let ::core::option::Option::Some(__k) =
+                                ::autumn_web::preload::FkKey::autumn_fk_key(&__child.#fk_ident)
+                            {
+                                __groups.entry(__k).or_default().push(__child);
+                            }
                         }
                         for __r in records.iter_mut() {
                             let __v: #stored_ty = __groups.remove(&__r.id).unwrap_or_default();

@@ -182,16 +182,18 @@ pub trait DepAwardRepository {}
 // → `PgDepCommentRepository`, etc.). Reuses the existing child tables/repos via
 // an explicit `fk = "post_id"` (the default would infer `model_dep_post_id`).
 //
-// `dependent = nullify` is intentionally omitted here: a nullify child has a
-// NULLABLE foreign key, and `#[has_many]` preload codegen does not yet support
-// a nullable child FK (it groups children into a `HashMap<i64, _>` keyed by the
-// non-`Option` FK). That is a pre-existing preload limitation, independent of
-// the cascade dispatch; tracked as a #1738 follow-up. destroy/delete_all/
-// restrict all target non-null-FK children and cascade from the model side.
+// #1786: `dependent = nullify` is declared model-side too. A nullify child has a
+// NULLABLE foreign key (`DepBookmark::post_id: Option<i64>`); the `#[has_many]`
+// preload loader now normalizes the child FK through `preload::FkKey` (grouping
+// on `Option<i64>` and dropping `None`-FK orphans), so declaring a nullable-FK
+// association compiles and its model-side cascade (`dependents()`) sets the
+// child FK to NULL. destroy/delete_all/restrict/nullify all cascade from the
+// model side.
 #[autumn_web::model(table = "dep_posts")]
 #[has_many(DepComment, fk = "post_id", name = md_comments, dependent = destroy)]
 #[has_many(DepVote, fk = "post_id", name = md_votes, dependent = delete_all)]
 #[has_many(DepAward, fk = "post_id", name = md_awards, dependent = restrict)]
+#[has_many(DepBookmark, fk = "post_id", name = md_bookmarks, dependent = nullify)]
 pub struct ModelDepPost {
     #[id]
     pub id: i64,
@@ -904,9 +906,12 @@ fn dependent_repository_surface_is_generated() {
     // four actions: destroy + delete_all + restrict) type-checks.
     assert_is_fn(<PgModelDepPostRepository as ModelDepPostRepository>::delete_many);
     // The model exposes its runtime dependent specs (inherent shadow of
-    // `AutumnDependents::dependents`): destroy + delete_all + restrict.
+    // `AutumnDependents::dependents`): destroy + delete_all + restrict + nullify.
+    // #1786: the `nullify` child (`DepBookmark`, nullable `post_id: Option<i64>`)
+    // is now declared model-side — the has_many preload loader groups the child
+    // through `preload::FkKey`, so a nullable-FK association compiles.
     assert_is_fn(ModelDepPost::dependents);
-    assert_eq!(ModelDepPost::dependents().len(), 3);
+    assert_eq!(ModelDepPost::dependents().len(), 4);
     // Codex P1: the fully model-side three-level graph monomorphizes. The key
     // new codegen is the intermediate `M3Comment`'s cascade leaf executor —
     // its Destroy arm now runtime-dispatches into `M3Comment::dependents()`
@@ -1941,6 +1946,68 @@ async fn model_declared_dependent_cascades_like_repository_attribute() {
         .await,
         0,
         "delete_all child rows removed via the model-declared cascade"
+    );
+}
+
+/// #1786: model-declared `#[has_many(dependent = nullify)]` sets the child FK to
+/// NULL from the MODEL side — the nullable-FK (`DepBookmark::post_id:
+/// Option<i64>`) association now compiles (`has_many` preload groups through
+/// `preload::FkKey`), and deleting the `ModelDepPost` detaches its bookmarks:
+/// the rows survive with `post_id IS NULL`, mirroring the repository-attribute
+/// nullify test but driven by `ModelDepPost::dependents()`.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn model_declared_nullify_detaches_children() {
+    let (pool, _c) = setup_pool().await;
+    let mut conn = pool.get().await.expect("conn");
+
+    diesel::sql_query("INSERT INTO dep_posts (id, title) VALUES (33, 'model-nullify')")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    for i in 1..=3 {
+        diesel::sql_query(format!(
+            "INSERT INTO dep_bookmarks (id, post_id, label) VALUES ({}, 33, 'b{i}')",
+            300 + i
+        ))
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    }
+
+    let repo = PgModelDepPostRepository::with_pool_untracked(pool.clone());
+    repo.delete_by_id(33)
+        .await
+        .expect("model-declared nullify cascade must not FK-error");
+
+    assert_eq!(
+        count(
+            &mut conn,
+            "SELECT COUNT(*) AS n FROM dep_posts WHERE id = 33"
+        )
+        .await,
+        0,
+        "parent gone"
+    );
+    // nullify: bookmark rows survive but detached (FK set NULL) via the
+    // model-declared cascade.
+    assert_eq!(
+        count(
+            &mut conn,
+            "SELECT COUNT(*) AS n FROM dep_bookmarks WHERE post_id = 33"
+        )
+        .await,
+        0,
+        "no bookmark still points at the deleted parent"
+    );
+    assert_eq!(
+        count(
+            &mut conn,
+            "SELECT COUNT(*) AS n FROM dep_bookmarks WHERE post_id IS NULL AND id IN (301, 302, 303)"
+        )
+        .await,
+        3,
+        "nullify child rows survive detached (post_id = NULL) via the model-declared cascade"
     );
 }
 
