@@ -478,9 +478,9 @@ fn live_validation_forms_carry_html5_constraints() {
     // input (real-time validation still works alongside the static constraints),
     // and its swap wrapper marker is present.
     assert!(
-        routes.contains("hx-post=\"/posts/validate/title\"")
+        routes.contains("hx-post=(paths::validate_title())")
             && routes.contains("data-autumn-field-wrapper=\"title\""),
-        "the constrained title input must keep its htmx inline-validation wiring:\n{routes}"
+        "the constrained title input must keep its htmx inline-validation wiring (via typed path helper):\n{routes}"
     );
 
     // The inline-validate handler returns the SAME constrained fragment, so the

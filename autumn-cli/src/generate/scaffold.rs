@@ -1095,7 +1095,11 @@ fn render_repository_file(
     let fragment_item_content = if api {
         "(self.id)".to_string()
     } else {
-        format!("a href=(format!(\"/{plural}/{{}}\", self.id)) {{ (self.id) }}")
+        // Link through the routes module's typed path helper so the show URL
+        // has a single source of truth (issue #1133). This fragment lives in the
+        // repository module, so it reaches `paths::show` via the fully-qualified
+        // `crate::routes::{plural}::paths` path.
+        format!("a href=(crate::routes::{plural}::paths::show(self.id)) {{ (self.id) }}")
     };
     let live_fragment_impl = if live {
         format!(
@@ -1787,7 +1791,6 @@ fn render_routes_file(
         let changeset_inputs = render_changeset_form_inputs(
             fields,
             "changeset",
-            plural,
             live_validation,
             &validated_fields,
             &reference_fields,
@@ -1809,7 +1812,7 @@ fn render_routes_file(
         let new_form_layout = format!(
             "{layout_fn}(\"New {pascal_name}\", {cp_new}{flash_arg}, html! {{\n        \
              h1 {{ \"New {pascal_name}\" }}\n        \
-             form action=\"/{plural}\" method=\"post\"{form_enctype} {{\n            \
+             form action=(paths::create()) method=\"post\"{form_enctype} {{\n            \
              (csrf_input(csrf.as_ref(), csrf_field.as_ref()))\n{changeset_inputs}            \
              button type=\"submit\" {{ \"Create\" }}\n        \
              }}\n    \
@@ -1818,11 +1821,11 @@ fn render_routes_file(
         let edit_form_layout = format!(
             "{layout_fn}(&format!(\"Edit {pascal_name} #{{}}\", *id), {cp_edit}{flash_arg}, html! {{\n        \
              h1 {{ \"Edit {pascal_name} #\" (*id) }}\n        \
-             form action=(format!(\"/{plural}/{{}}/update\", *id)) method=\"post\"{form_enctype} {{\n            \
+             form action=(paths::update(*id)) method=\"post\"{form_enctype} {{\n            \
              (csrf_input(csrf.as_ref(), csrf_field.as_ref()))\n{changeset_inputs}            \
              button type=\"submit\" {{ \"Save\" }}\n        \
              }}\n        \
-             form action=(format!(\"/{plural}/{{}}/delete\", *id)) method=\"post\" {{\n            \
+             form action=(paths::delete(*id)) method=\"post\" {{\n            \
              (csrf_input(csrf.as_ref(), csrf_field.as_ref()))\n            \
              button type=\"submit\" onclick=\"return confirm('Delete this {pascal_name}?')\" {{ \"Delete\" }}\n        \
              }}\n    \
@@ -1862,14 +1865,14 @@ fn render_routes_file(
         let new_form_layout = format!(
             "{layout_fn}(\"New {pascal_name}\", {cp_new}{flash_arg}, html! {{\n        \
              h1 {{ \"New {pascal_name}\" }}\n        \
-             ({snake_name}_form_for(&changeset, \"/{plural}\".to_string(), \"Create\", csrf.as_ref(), csrf_field.as_ref(){option_args}))\n    \
+             ({snake_name}_form_for(&changeset, paths::create(), \"Create\", csrf.as_ref(), csrf_field.as_ref(){option_args}))\n    \
              }})"
         );
         let edit_form_layout = format!(
             "{layout_fn}(&format!(\"Edit {pascal_name} #{{}}\", *id), {cp_edit}{flash_arg}, html! {{\n        \
              h1 {{ \"Edit {pascal_name} #\" (*id) }}\n        \
-             ({snake_name}_form_for(&changeset, format!(\"/{plural}/{{}}/update\", *id), \"Save\", csrf.as_ref(), csrf_field.as_ref(){option_args}))\n        \
-             form action=(format!(\"/{plural}/{{}}/delete\", *id)) method=\"post\" {{\n            \
+             ({snake_name}_form_for(&changeset, paths::update(*id), \"Save\", csrf.as_ref(), csrf_field.as_ref(){option_args}))\n        \
+             form action=(paths::delete(*id)) method=\"post\" {{\n            \
              (csrf_input(csrf.as_ref(), csrf_field.as_ref()))\n            \
              button type=\"submit\" onclick=\"return confirm('Delete this {pascal_name}?')\" {{ \"Delete\" }}\n        \
              }}\n    \
@@ -1906,7 +1909,7 @@ fn render_routes_file(
         format!(
             "{create_stmt}\n    \
              flash.success(\"{pascal_name} created\").await;\n    \
-             Ok(autumn_web::Redirect::to(\"/{plural}\").into_response())"
+             Ok(autumn_web::Redirect::to(&paths::index()).into_response())"
         )
     } else {
         format!(
@@ -1924,7 +1927,7 @@ fn render_routes_file(
              return Err(err);\n    \
              }}\n    \
              flash.success(\"{pascal_name} created\").await;\n    \
-             Ok(autumn_web::Redirect::to(\"/{plural}\").into_response())"
+             Ok(autumn_web::Redirect::to(&paths::index()).into_response())"
         )
     };
     let create_fn = format!(
@@ -1953,7 +1956,7 @@ fn render_routes_file(
              )));\n    \
              }}\n    \
              flash.success(\"{pascal_name} updated\").await;\n    \
-             Ok(autumn_web::Redirect::to(&format!(\"/{plural}/{{}}\", *id)).into_response())"
+             Ok(autumn_web::Redirect::to(&paths::show(*id)).into_response())"
         )
     } else {
         format!(
@@ -1979,7 +1982,7 @@ fn render_routes_file(
              )));\n    \
              }}\n    \
              flash.success(\"{pascal_name} updated\").await;\n    \
-             Ok(autumn_web::Redirect::to(&format!(\"/{plural}/{{}}\", *id)).into_response())"
+             Ok(autumn_web::Redirect::to(&paths::show(*id)).into_response())"
         )
     };
     let update_fn = format!(
@@ -2024,7 +2027,7 @@ fn render_routes_file(
     // the box — no hand-authored <table>/<th>/<td> tags needed.
     let li_render = if live {
         format!(
-            r#"li id=(format!("{snake_name}-{{}}", row.id)) {{ a href=(format!("/{plural}/{{}}", row.id)) {{ "{pascal_name} #{{}}" (row.id) }} }}"#
+            r#"li id=(format!("{snake_name}-{{}}", row.id)) {{ a href=(paths::show(row.id)) {{ "{pascal_name} #{{}}" (row.id) }} }}"#
         )
     } else {
         String::new() // unused in the non-live path
@@ -2035,7 +2038,7 @@ fn render_routes_file(
     let live_ul_render = if live {
         format!(
             r#"@if page_req.page() == 1 {{
-            ul id="{plural}-list" hx-ext="sse" sse-connect="/{plural}/events" sse-swap="message" hx-swap="none" {{
+            ul id="{plural}-list" hx-ext="sse" sse-connect=(paths::events()) sse-swap="message" hx-swap="none" {{
                 @for row in &page_data.content {{
                     {li_render}
                 }}
@@ -2064,7 +2067,7 @@ fn render_routes_file(
     let columns_let = if live {
         String::new()
     } else {
-        render_columns_vec(pascal_name, plural, fields, &reference_displays, false)
+        render_columns_vec(pascal_name, fields, &reference_displays, false)
     };
     let index_label_loads = if live {
         String::new()
@@ -2088,13 +2091,13 @@ fn render_routes_file(
     let index_columns_labeled = if index_label_loads.is_empty() {
         columns_let
     } else {
-        render_columns_vec(pascal_name, plural, fields, &reference_displays, true)
+        render_columns_vec(pascal_name, fields, &reference_displays, true)
     };
     let table_render = if live {
         String::new()
     } else {
         format!(
-            r#"(autumn_web::widgets::data_table(&page_data.content, &columns, &autumn_web::widgets::DataTableConfig::new("No {plural} yet.").base_path("/{plural}")))"#
+            r#"(autumn_web::widgets::data_table(&page_data.content, &columns, &autumn_web::widgets::DataTableConfig::new("No {plural} yet.").base_path(&paths::index())))"#
         )
     };
 
@@ -2122,9 +2125,9 @@ pub async fn index(
     let page_data: Page<{pascal_name}> = repo.page(&page_req).await?;
     Ok({layout_fn}("{pascal_name} index", {cp_index}{flash_arg}, html! {{
         h1 {{ "{pascal_name}s" }}
-        a href="/{plural}/new" {{ "New {pascal_name}" }}
+        a href=(paths::new()) {{ "New {pascal_name}" }}
         {list_render}
-        (pagination_nav(&page_data, &PagerOptions::new("/{plural}")))
+        (pagination_nav(&page_data, &PagerOptions::new(&paths::index())))
     }}))
 }}"#
             )
@@ -2145,9 +2148,9 @@ pub async fn index(
     let page_data: Page<{pascal_name}> = repo.page(&page_req).await?;
 {index_label_loads}{index_columns_labeled}    Ok({layout_fn}("{pascal_name} index", {cp_index}{flash_arg}, html! {{
         h1 {{ "{pascal_name}s" }}
-        a href="/{plural}/new" {{ "New {pascal_name}" }}
+        a href=(paths::new()) {{ "New {pascal_name}" }}
         {list_render}
-        (pagination_nav(&page_data, &PagerOptions::new("/{plural}")))
+        (pagination_nav(&page_data, &PagerOptions::new(&paths::index())))
     }}))
 }}"#
             )
@@ -2168,9 +2171,9 @@ pub async fn index(
     let page_data: Page<{pascal_name}> = repo.page(&page_req).await?;
     Ok({layout_fn}("{pascal_name} index", {cp_index}{flash_arg}, html! {{
         h1 {{ "{pascal_name}s" }}
-        a href="/{plural}/new" {{ "New {pascal_name}" }}
+        a href=(paths::new()) {{ "New {pascal_name}" }}
         {list_render}
-        (pagination_nav(&page_data, &PagerOptions::new("/{plural}")))
+        (pagination_nav(&page_data, &PagerOptions::new(&paths::index())))
     }}))
 }}"#
         )
@@ -2190,9 +2193,9 @@ pub async fn index(
     let page_data: Page<{pascal_name}> = repo.page(&page_req).await?;
 {index_label_loads}{index_columns_labeled}    Ok({layout_fn}("{pascal_name} index", {cp_index}{flash_arg}, html! {{
         h1 {{ "{pascal_name}s" }}
-        a href="/{plural}/new" {{ "New {pascal_name}" }}
+        a href=(paths::new()) {{ "New {pascal_name}" }}
         {list_render}
-        (pagination_nav(&page_data, &PagerOptions::new("/{plural}")))
+        (pagination_nav(&page_data, &PagerOptions::new(&paths::index())))
     }}))
 }}"#
         )
@@ -2292,7 +2295,9 @@ pub async fn index(
             vh.push_str("    };\n");
             vh.push_str("    let changeset = form.into_changeset();\n");
             if let Some((f, input_type, attrs)) = constrained {
-                let url = format!("/{plural}/validate/{field_name}");
+                // The validate endpoint URL is emitted as a typed path-helper
+                // call expression (issue #1133), spliced into `hx-post=(…)`.
+                let url = format!("paths::validate_{field_name}()");
                 let markup =
                     render_live_constrained_field(f, "changeset", input_type, &attrs, Some(&url));
                 let _ = writeln!(vh, "    autumn_web::html! {{\n        {markup}\n    }}");
@@ -2308,7 +2313,7 @@ pub async fn index(
                 };
                 let _ = writeln!(
                     vh,
-                    "    autumn_web::form::{helper}(&changeset, \"{field_name}\", \"{label}\", \"/{plural}/validate/{field_name}\")"
+                    "    autumn_web::form::{helper}(&changeset, \"{field_name}\", \"{label}\", &paths::validate_{field_name}())"
                 );
             }
             vh.push_str("}\n");
@@ -2316,6 +2321,42 @@ pub async fn index(
         vh
     } else {
         String::new()
+    };
+
+    // Issue #1133: emit an `autumn_web::paths![…]` invocation so the routes
+    // module gains a `pub mod paths` re-exporting each handler's typed
+    // `__autumn_path_*` companion under a clean short name. Every view href,
+    // form action, and redirect above calls into this module (e.g.
+    // `paths::show(id)`), so the resource's URLs have a single source of truth:
+    // the route-macro path strings. `new_form`/`edit_form`/`destroy` carry
+    // `name = "new"|"edit"|"delete"` overrides so their helpers read
+    // `paths::new()`/`paths::edit(id)`/`paths::delete(id)`.
+    let paths_macro = {
+        let mut names: Vec<String> = vec![
+            "index".to_owned(),
+            "show".to_owned(),
+            "new".to_owned(),
+            "create".to_owned(),
+            "edit".to_owned(),
+            "update".to_owned(),
+            "delete".to_owned(),
+        ];
+        if live {
+            names.push("events".to_owned());
+        }
+        // One inline-validation endpoint per validated field (live-validation
+        // only), each linked from the form's `hx-post=(paths::validate_{f}())`.
+        if live_validation {
+            for field_name in validations.keys() {
+                names.push(format!("validate_{field_name}"));
+            }
+        }
+        let mut out = String::from("\n\nautumn_web::paths![\n");
+        for name in &names {
+            let _ = writeln!(out, "    {name},");
+        }
+        out.push_str("];\n");
+        out
     };
 
     format!(
@@ -2435,15 +2476,15 @@ pub async fn show(id: Path<{id_rust}>, mut db: {db_ty}, flash: Flash) -> AutumnR
     Ok({layout_fn}(&format!("{pascal_name} #{{}}", row.id), {cp_show}{flash_arg}, html! {{
         h1 {{ "{pascal_name} #" (row.id) }}
         (autumn_web::widgets::property_list(&props))
-        a href="/{plural}" {{ "Back to list" }}
+        a href=(paths::index()) {{ "Back to list" }}
         " "
-        a href=(format!("/{plural}/{{}}/edit", row.id)) {{ "Edit" }}
+        a href=(paths::edit(row.id)) {{ "Edit" }}
     }}))
 }}
 
 /// `GET /{plural}/new` — render the new-{snake_name} form.
 #[secured]
-#[get("/{plural}/new")]
+#[get("/{plural}/new", name = "new")]
 pub async fn new_form(
     {new_form_db_param}flash: Flash,
     csrf: Option<CsrfToken>,
@@ -2459,7 +2500,7 @@ pub async fn new_form(
 /// PUT directly without JS); the auto-generated JSON `PUT /api/{plural}/{{id}}`
 /// remains available for API clients.
 #[secured]
-#[get("/{plural}/{{id}}/edit")]
+#[get("/{plural}/{{id}}/edit", name = "edit")]
 pub async fn edit_form(
     id: Path<{id_rust}>,
     mut db: {db_ty},
@@ -2484,7 +2525,7 @@ pub async fn edit_form(
 /// clients via the auto-generated repository handler. Honours the resource's
 /// soft-delete configuration (marks `deleted_at` when `--soft-delete` is set).
 #[secured]
-#[post("/{plural}/{{id}}/delete")]
+#[post("/{plural}/{{id}}/delete", name = "delete")]
 pub async fn destroy(
     id: Path<{id_rust}>,
     {destroy_signature_arg},
@@ -2497,7 +2538,7 @@ pub async fn destroy(
         )));
     }}
     flash.success("{pascal_name} deleted").await;
-    Ok(autumn_web::Redirect::to("/{plural}"))
+    Ok(autumn_web::Redirect::to(&paths::index()))
 }}
 
 {form_struct}
@@ -2542,6 +2583,7 @@ pub async fn events(
     } else {
         String::new()
     } + &validate_handlers
+        + &paths_macro
 }
 
 /// The `UNIQUE_CONSTRAINTS` module-level const the generated `create`/
@@ -3045,7 +3087,6 @@ fn resolve_reference_display(
 fn render_changeset_form_inputs(
     fields: &[Field],
     changeset_var: &str,
-    plural: &str,
     live_validation: bool,
     validated: &[&str],
     reference_selects: &[&Field],
@@ -3180,7 +3221,7 @@ fn render_changeset_form_inputs(
                         // validator rule, so this is the validated path; the
                         // `validate_url` is threaded only when `live_validation`.)
                         let validate_url =
-                            validated_htmx.then(|| format!("/{plural}/validate/{name}"));
+                            validated_htmx.then(|| format!("paths::validate_{name}()"));
                         render_live_constrained_field(
                             f,
                             cv,
@@ -3196,7 +3237,7 @@ fn render_changeset_form_inputs(
                         };
                         format!(
                             "(autumn_web::form::{helper}(&{cv}, \"{name}\", \"{label}\", \
-                             \"/{plural}/validate/{name}\"))"
+                             &paths::validate_{name}()))"
                         )
                     } else if f.nullable {
                         format!("(autumn_web::form::text_input(&{cv}, \"{name}\", \"{label}\"))")
@@ -3334,6 +3375,9 @@ fn render_live_constrained_field(
     changeset_var: &str,
     input_type: &str,
     constraint_attrs: &str,
+    // A Rust expression (as source text) producing the inline-validation URL —
+    // the typed path helper `paths::validate_{field}()` (issue #1133). Spliced
+    // into `hx-post=(…)` so the URL has a single source of truth.
     validate_url: Option<&str>,
 ) -> String {
     let name = &field.name;
@@ -3357,7 +3401,7 @@ fn render_live_constrained_field(
             (
                 format!(" data-autumn-field-wrapper=\"{name}\""),
                 format!(
-                    "\n                    hx-post=\"{url}\"\n                    \
+                    "\n                    hx-post=({url})\n                    \
                      hx-trigger=\"change\"\n                    \
                      hx-target=\"closest [data-autumn-field-wrapper]\"\n                    \
                      hx-swap=\"outerHTML\"\n                    hx-include=\"closest form\""
@@ -3487,7 +3531,6 @@ fn cell_value_expr(field: &Field) -> String {
 /// ordering per-column is out of scope; dead sort links would be worse than none.
 fn render_columns_vec(
     pascal_name: &str,
-    plural: &str,
     fields: &[Field],
     reference_displays: &BTreeMap<String, ReferenceDisplay>,
     use_label_maps: bool,
@@ -3535,7 +3578,7 @@ fn render_columns_vec(
     // Show link column
     let _ = writeln!(
         out,
-        "        autumn_web::widgets::Column::new(\"\", |row: &{pascal_name}| maud::html! {{ a href=(format!(\"/{plural}/{{}}\", row.id)) {{ \"Show\" }} }}),"
+        "        autumn_web::widgets::Column::new(\"\", |row: &{pascal_name}| maud::html! {{ a href=(paths::show(row.id)) {{ \"Show\" }} }}),"
     );
     let _ = writeln!(out, "    ];");
     out
@@ -5542,9 +5585,9 @@ async fn main() {
             !routes.contains("#[secured]\n#[get(\"/posts/{id}\")]"),
             "read-only show pages should stay public when generated"
         );
-        assert!(routes.contains("#[get(\"/posts/new\")]"));
+        assert!(routes.contains("#[get(\"/posts/new\", name = \"new\")]"));
         assert!(routes.contains("#[post(\"/posts\")]"));
-        assert!(routes.contains("#[get(\"/posts/{id}/edit\")]"));
+        assert!(routes.contains("#[get(\"/posts/{id}/edit\", name = \"edit\")]"));
         // The HTML edit form posts to a regular `POST /posts/{id}/update`
         // (browsers can't submit PUT natively); the JSON `PUT /api/posts/{id}`
         // remains available via the auto-generated repository handler.
@@ -5558,8 +5601,9 @@ async fn main() {
         assert!(routes.contains("if updated == 0"));
         assert!(routes.contains("AutumnError::not_found_msg"));
         // The HTML edit form must point at the new HTML update handler, not
-        // the JSON PUT endpoint — browsers cannot submit PUT without JS.
-        assert!(routes.contains("/posts/{}/update"));
+        // the JSON PUT endpoint — browsers cannot submit PUT without JS. The
+        // URL is emitted through the typed path helper (issue #1133).
+        assert!(routes.contains("paths::update(*id)"));
         assert!(!routes.contains("/api/posts/{}\""));
         // HTML handlers use POST for update and delete (browsers can't submit
         // PUT or DELETE natively); `#[put(` and `#[delete(` appear only in the
@@ -5567,7 +5611,7 @@ async fn main() {
         assert!(!routes.contains("#[put("));
         assert!(!routes.contains("#[delete("));
         // The HTML delete route must be present and use POST (not DELETE).
-        assert!(routes.contains(r#"#[post("/posts/{id}/delete")]"#));
+        assert!(routes.contains(r#"#[post("/posts/{id}/delete", name = "delete")]"#));
     }
 
     // ── enum field: form widgets, boundary validation, imports (issue #1030) ─
@@ -6271,9 +6315,10 @@ async fn main() {
         assert!(routes.contains(r#"flash.success("Post deleted")"#));
         // A destroy handler now exists, wired as a browser-friendly POST.
         assert!(routes.contains("pub async fn destroy("));
-        assert!(routes.contains(r#"#[post("/posts/{id}/delete")]"#));
-        // The show page exposes a delete control that targets it.
-        assert!(routes.contains("/posts/{}/delete"));
+        assert!(routes.contains(r#"#[post("/posts/{id}/delete", name = "delete")]"#));
+        // The edit page exposes a delete control that targets it, through the
+        // typed path helper (issue #1133).
+        assert!(routes.contains("paths::delete(*id)"));
         // Issue #1130: the standard scaffold no longer emits a private layout
         // stub — every view renders through the app's shared `crate::layout`.
         assert!(
@@ -8118,7 +8163,7 @@ async fn main() {
         .unwrap();
         plan.execute(Flags::default()).unwrap();
         let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
-        assert!(routes.contains("/posts/{}"), "{routes}");
+        assert!(routes.contains("paths::show(row.id)"), "{routes}");
         assert!(routes.contains("row.id"), "{routes}");
     }
 
@@ -8169,7 +8214,7 @@ async fn main() {
         let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
         // Live variant must keep the ul/li SSE contract intact
         assert!(routes.contains("ul id=\"posts-list\""), "{routes}");
-        assert!(routes.contains("sse-connect=\"/posts/events\""), "{routes}");
+        assert!(routes.contains("sse-connect=(paths::events())"), "{routes}");
     }
 
     #[test]
@@ -8196,7 +8241,7 @@ async fn main() {
         assert!(routes.contains("/posts/events"));
         assert!(routes.contains("autumn_web::sse::stream"));
         assert!(routes.contains("hx-ext=\"sse\""));
-        assert!(routes.contains("sse-connect=\"/posts/events\""));
+        assert!(routes.contains("sse-connect=(paths::events())"));
         assert!(routes.contains("hx-swap=\"none\""));
         assert!(routes.contains("autumn_web::htmx::HTMX_JS_PATH"));
         assert!(routes.contains("autumn_web::htmx::HTMX_SSE_JS_PATH"));
