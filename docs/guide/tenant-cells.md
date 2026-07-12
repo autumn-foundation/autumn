@@ -107,11 +107,19 @@ async fn stash() -> AutumnResult<&'static str> {
 ## Quota isolation
 
 A quota breach is scoped to the tenant that hit it. When a tenant is over
-quota, only *its* over-budget request fails — with a 503 — and it fails at the
-`try_charge` / `scratch_insert` call, before the oversized allocation is made.
-Every other tenant has its own independent counter and is completely
-unaffected: a whale exhausting its cell degrades only its own traffic, not the
-process.
+quota, only *its* over-budget request fails — with a 503 — and every other
+tenant has its own independent counter and is completely unaffected: a whale
+exhausting its cell degrades only its own traffic, not the process.
+
+Where in the request that 503 lands depends on the API. `try_charge(n)?`
+reserves *before* you allocate: the quota is checked up front, so an over-quota
+tenant is rejected without ever building the buffer. `scratch_insert(key,
+value)` instead takes an already-built `Vec`, so the value exists in memory
+before the check — the quota rejects it before it is stored in and counted
+against the cell, bounding what the cell *retains*, but it does not prevent the
+caller's transient allocation. That is the same tracked-bytes, not-RSS boundary
+as [The accounting guarantee](#the-accounting-guarantee) below: the cell bounds
+the memory it owns, not every byte a handler touches on the way there.
 
 ## Eviction and lifecycle
 
