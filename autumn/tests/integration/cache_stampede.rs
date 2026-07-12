@@ -425,9 +425,11 @@ async fn swr_serves_stale_and_refreshes_in_background() {
     // into a clean failure instead of dangling until the job-level timeout. The
     // cap is deliberately generous: under any sane load this converges in a
     // handful of iterations (the refresh computes in 200ms), so it is not
-    // schedule-sensitive; do not swap it back for a wall-clock deadline.
+    // schedule-sensitive; do not swap it back for a wall-clock deadline. 1,000
+    // attempts x 25ms is ~25s worst case, which fails a genuine "never
+    // publishes" regression fast while still tolerating a slow runner.
     let mut refreshed = None;
-    for _ in 0..10_000 {
+    for _ in 0..1_000 {
         let fc = fill_count.clone();
         let v: String = get_or_compute_with(&cache, &key, opts.clone(), move || async move {
             fc.fetch_add(1, Ordering::SeqCst);
