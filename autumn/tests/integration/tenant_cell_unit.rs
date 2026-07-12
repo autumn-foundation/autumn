@@ -563,3 +563,32 @@ fn get_touch_raises_access_seq() {
         "get() must raise the resident cell's access sequence"
     );
 }
+
+/// `touch` stores its timestamp and sequence monotonically (`fetch_max`), so a
+/// later `touch` carrying an *older* time/sequence — e.g. one captured before a
+/// lock wait and applied out of order — can never regress the recorded access
+/// time or sequence below a fresher value already stamped. This is what keeps a
+/// just-accessed tenant from being seen as idle (and evicted) because of a
+/// lagging timestamp.
+#[test]
+fn touch_does_not_regress_timestamp() {
+    let registry = TenantCellRegistry::new();
+    let cell = registry.get_or_create("t", 0);
+
+    cell.touch(1000, 5);
+    assert_eq!(cell.last_access_millis(), 1000);
+    assert_eq!(cell.last_access_seq(), 5);
+
+    // A stale/out-of-order touch with older values must not lower either field.
+    cell.touch(500, 3);
+    assert_eq!(
+        cell.last_access_millis(),
+        1000,
+        "a stale timestamp must not regress the recorded access time"
+    );
+    assert_eq!(
+        cell.last_access_seq(),
+        5,
+        "an out-of-order sequence must not regress the recorded access sequence"
+    );
+}
