@@ -1871,6 +1871,38 @@ enum GenerateCommands {
         #[arg(long)]
         force: bool,
     },
+    /// Generate a record-level authorization `Policy` and companion `Scope`
+    /// for an existing model.
+    ///
+    /// Creates:
+    ///   - `src/policies/<snake>.rs` — `<Pascal>Policy` (`Policy<<Pascal>>`) and
+    ///     `<Pascal>Scope` (`Scope<<Pascal>>`)
+    ///   - `src/policies/mod.rs`     — created/updated with `pub mod`
+    ///   - `src/main.rs`             — `mod policies;` + `.policy(...)`/`.scope(...)`
+    ///     wired into the app builder
+    ///
+    /// When an owner column (`user_id`, `author_id`, or `owner_id`) is present,
+    /// the generated `can_update`/`can_delete` allow the record owner or an
+    /// `admin`, and the scope filters lists to the current user's rows.
+    /// Otherwise those default-deny with a `TODO` marker.
+    ///
+    /// Requires the target model to already exist (`src/models/<snake>.rs`).
+    /// Run `autumn generate model <Pascal>` (or `scaffold`) first.
+    ///
+    /// Example:
+    ///
+    ///   autumn generate policy Post
+    #[command(verbatim_doc_comment)]
+    Policy {
+        /// Model name (`PascalCase` or `snake_case`, e.g. `Post`).
+        name: String,
+        /// Print the file plan and exit without writing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Overwrite existing files instead of erroring on collision.
+        #[arg(long)]
+        force: bool,
+    },
     /// Scaffold a real-time channel: a pub/sub handler over the built-in
     /// `Channels` API, an htmx SSE live view (default) or a raw `#[ws]`
     /// socket handler, `main.rs` route wiring, and an in-process smoke test.
@@ -3300,6 +3332,14 @@ fn run_generate_command(cmd: GenerateCommands, mode: ApplyMode) {
                 list_unsubscribe.as_deref(),
                 no_layout,
             );
+            apply_plan(plan, generate::Flags { dry_run, force }, mode);
+        }
+        GenerateCommands::Policy {
+            name,
+            dry_run,
+            force,
+        } => {
+            let plan = generate::policy::plan_policy(&resolve_cwd(), &name);
             apply_plan(plan, generate::Flags { dry_run, force }, mode);
         }
         GenerateCommands::Channel {

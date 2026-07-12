@@ -1755,6 +1755,66 @@ pub fn remove_jobs_registration_from_app(existing: &str) -> String {
     remove_single_line(&lines, idx, existing.ends_with('\n'))
 }
 
+// ── Policy registration helpers (issue #1125) ────────────────────────────
+
+/// The `.policy::<...>(...)` builder call registering `{pascal}`'s policy.
+fn policy_registration_call(pascal: &str, snake: &str) -> String {
+    format!(
+        ".policy::<crate::models::{snake}::{pascal}, _>(crate::policies::{snake}::{pascal}Policy::default())"
+    )
+}
+
+/// The `.scope::<...>(...)` builder call registering `{pascal}`'s scope.
+fn scope_registration_call(pascal: &str, snake: &str) -> String {
+    format!(
+        ".scope::<crate::models::{snake}::{pascal}, _>(crate::policies::{snake}::{pascal}Scope::default())"
+    )
+}
+
+/// Inject `.policy::<...>(...)` and `.scope::<...>(...)` for `{pascal}` into
+/// the `AppBuilder` chain in `src/main.rs`, immediately before the `.run()`
+/// line (issue #1125).
+///
+/// Idempotent: if `{pascal}`'s policy registration is already present the
+/// function returns `existing` unchanged. Returns `existing` unchanged when no
+/// `.run()` line can be found.
+#[must_use]
+pub fn add_policy_registration_to_app(existing: &str, pascal: &str, snake: &str) -> String {
+    let policy_call = policy_registration_call(pascal, snake);
+    if existing.contains(&policy_call) {
+        return existing.to_owned();
+    }
+    let with_policy = insert_before_run_call(existing, &policy_call);
+    insert_before_run_call(&with_policy, &scope_registration_call(pascal, snake))
+}
+
+/// Inverse of [`add_policy_registration_to_app`] (`autumn destroy`, issue #1048).
+///
+/// Removes the `.policy::<...>(...)` and `.scope::<...>(...)` lines for
+/// `{pascal}` from the `AppBuilder` chain. A no-op if neither is present.
+/// Unlike [`remove_jobs_registration_from_app`] (which shares one `.jobs(...)`
+/// call across every job), each resource carries its own pair of registration
+/// lines keyed by its type, so removal is per-resource — no sibling
+/// directory check is needed.
+#[must_use]
+pub fn remove_policy_registration_from_app(existing: &str, pascal: &str, snake: &str) -> String {
+    let policy_call = policy_registration_call(pascal, snake);
+    let scope_call = scope_registration_call(pascal, snake);
+    let is_reg = |l: &str| {
+        let t = l.trim();
+        t == policy_call || t == scope_call
+    };
+    if !existing.lines().any(is_reg) {
+        return existing.to_owned();
+    }
+    let kept: Vec<&str> = existing.lines().filter(|l| !is_reg(l)).collect();
+    let mut out = kept.join("\n");
+    if existing.ends_with('\n') && !out.is_empty() {
+        out.push('\n');
+    }
+    out
+}
+
 // ── Cargo.toml: feature injection ────────────────────────────────────────
 
 /// Rewrite `lines` so that a feature is added at or near `feat_idx`.

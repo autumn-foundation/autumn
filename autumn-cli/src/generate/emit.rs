@@ -103,6 +103,17 @@ pub enum Revert {
     /// (`src/jobs/mod.rs`), dropping the whole freshly-generated
     /// `registered_jobs()` function if it was the only entry.
     JobEntry { path: PathBuf, entry: String },
+    /// Remove the `.policy::<...>(...)` and `.scope::<...>(...)` registration
+    /// lines this generator injected for `{pascal}` into the `AppBuilder` chain
+    /// in `path` (`src/main.rs`) (issue #1125). Unlike [`Revert::JobsRegistration`]
+    /// (one shared call gated on `owner_dir`), each resource carries its own
+    /// pair of registration lines keyed by its type, so removal is per-resource
+    /// and needs no sibling-directory check.
+    PolicyRegistration {
+        path: PathBuf,
+        pascal: String,
+        snake: String,
+    },
     /// Remove the `.jobs(jobs::registered_jobs())` call from the
     /// `AppBuilder` chain in `path` (`src/main.rs`) — but only once
     /// `owner_dir` (`src/jobs`) has no other job file left in it, so a
@@ -169,6 +180,7 @@ impl Revert {
             | Self::CargoAutumnWebDevFeature { path, .. }
             | Self::JobEntry { path, .. }
             | Self::JobsRegistration { path, .. }
+            | Self::PolicyRegistration { path, .. }
             | Self::MailPreview { path, .. }
             | Self::InboundMailHandler { path, .. }
             | Self::SystemTestCargoPatch { path, .. }
@@ -197,6 +209,7 @@ impl Revert {
             | Self::RoutesEntries { .. }
             | Self::SchemaTable { .. }
             | Self::JobEntry { .. }
+            | Self::PolicyRegistration { .. }
             | Self::MailPreview { .. }
             | Self::InboundMailHandler { .. }
             | Self::SystemTestCargoPatch { .. }
@@ -230,8 +243,8 @@ impl Revert {
         use super::schema_edit::{
             remove_autumn_web_dev_dependency_feature, remove_autumn_web_feature, remove_job_entry,
             remove_jobs_registration_from_app, remove_mail_preview_from_app,
-            remove_mod_declaration, remove_remember_middleware_from_app, remove_routes_entries,
-            remove_schema_table,
+            remove_mod_declaration, remove_policy_registration_from_app,
+            remove_remember_middleware_from_app, remove_routes_entries, remove_schema_table,
         };
         match self {
             Self::ModDecl { name, .. } => remove_mod_declaration(content, name),
@@ -296,6 +309,9 @@ impl Revert {
             }
             Self::JobEntry { entry, .. } => remove_job_entry(content, entry),
             Self::JobsRegistration { .. } => remove_jobs_registration_from_app(content),
+            Self::PolicyRegistration { pascal, snake, .. } => {
+                remove_policy_registration_from_app(content, pascal, snake)
+            }
             Self::MailPreview { mailer_type, .. } => {
                 remove_mail_preview_from_app(content, mailer_type)
             }
@@ -1406,6 +1422,7 @@ const SHARED_MAIN_MODULE_NAMES: &[&str] = &[
     "jobs",
     "mailers",
     "inbound_mailers",
+    "policies",
 ];
 
 /// Whether `name`'s backing module still exists on disk — either as
