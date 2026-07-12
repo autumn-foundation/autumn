@@ -645,6 +645,7 @@ pub fn plan_scaffold_with_options(
             metadata.indexes(),
             metadata.defaults(),
             metadata.validations(),
+            authorize_wiring,
         ),
     );
 
@@ -4213,6 +4214,7 @@ fn render_smoke_test(
     indexes: &BTreeSet<String>,
     defaults: &BTreeMap<String, String>,
     validations: &BTreeMap<String, Vec<String>>,
+    authorize: bool,
 ) -> String {
     let stub_tables_sql = render_reference_stub_tables_sql(fields, plural);
     let create_table_sql =
@@ -4263,10 +4265,18 @@ fn render_smoke_test(
     // Always emitted for HTML scaffolds (even without declared `--validate`
     // rules): the stand-in carries its own validated field, so a bare
     // `generate scaffold Post` still gets create/update/delete coverage.
-    if api {
+    let base = if api {
         base
     } else {
         base + &render_write_path_smoke_test(pascal_name, plural)
+    };
+
+    // Issue #1125 (AC4/AC6): when the scaffold authorizes its mutating handlers
+    // (owner column, standard path), also emit a cross-user 403 demonstration.
+    if authorize {
+        base + &render_cross_user_forbidden_smoke_test(plural)
+    } else {
+        base
     }
 }
 
@@ -4667,6 +4677,131 @@ async fn __PLURAL___write_path_crud() {
     TEMPLATE
         .replace("__PASCAL__", pascal_name)
         .replace("__PLURAL__", plural)
+}
+
+/// Render the cross-user record-level-authorization smoke test (issue #1125,
+/// AC4/AC6): with an owner column present, a user may only update/delete rows
+/// they own. A stand-in resource seeded with a row owned by user A is exercised
+/// while acting as user B — the mutating routes must be forbidden (403, via the
+/// test-level [`ForbiddenResponse::Forbidden403`](autumn_web::authorization::ForbiddenResponse)
+/// override so the demonstration asserts a concrete 403 rather than the app-wide
+/// default hide-existence 404) and B's index must exclude A's rows. Then acting
+/// as the owner (A), the same update succeeds. Self-contained (a process-local
+/// store stands in for the database), so it runs in-process with no external
+/// services, exactly like the write-path CRUD test above.
+#[allow(clippy::too_many_lines)] // the emitted test body is one raw-string template
+fn render_cross_user_forbidden_smoke_test(plural: &str) -> String {
+    const TEMPLATE: &str = r#"
+
+// ── cross-user record-level authorization (issue #1125) ───────────────────
+//
+// Owner-or-admin update/delete. A row owned by user A is off-limits to user B:
+// B's update/delete are forbidden (403) and B's index excludes A's rows, while
+// the owner (A) is allowed. `TestApp::new()` disables CSRF; the 403 comes from
+// the registered policy + the `ForbiddenResponse::Forbidden403` test override.
+#[tokio::test]
+async fn __PLURAL___cross_user_mutations_are_forbidden() {
+    use autumn_web::authorization::{authorize, BoxFuture, Policy, PolicyContext};
+    use autumn_web::test::{TestApp, TestClient};
+
+    #[derive(Clone)]
+    struct OwnedRow {
+        id: i64,
+        owner_id: i64,
+    }
+
+    // Process-local stand-in for the persistence layer.
+    static STORE: std::sync::Mutex<Vec<OwnedRow>> = std::sync::Mutex::new(Vec::new());
+
+    fn find_row(id: i64) -> Option<OwnedRow> {
+        STORE.lock().unwrap().iter().find(|r| r.id == id).cloned()
+    }
+
+    #[derive(Default)]
+    struct OwnedRowPolicy;
+
+    impl Policy<OwnedRow> for OwnedRowPolicy {
+        fn can_update<'a>(&'a self, ctx: &'a PolicyContext, row: &'a OwnedRow) -> BoxFuture<'a, bool> {
+            Box::pin(async move { ctx.has_role("admin") || ctx.user_id_i64() == Some(row.owner_id) })
+        }
+        fn can_delete<'a>(&'a self, ctx: &'a PolicyContext, row: &'a OwnedRow) -> BoxFuture<'a, bool> {
+            Box::pin(async move { ctx.has_role("admin") || ctx.user_id_i64() == Some(row.owner_id) })
+        }
+    }
+
+    #[secured]
+    #[get("/owned")]
+    async fn index(
+        autumn_web::extract::State(state): autumn_web::extract::State<autumn_web::AppState>,
+        session: autumn_web::session::Session,
+    ) -> autumn_web::AutumnResult<autumn_web::Markup> {
+        let ctx = PolicyContext::from_request(&state, &session).await;
+        let me = ctx.user_id_i64().unwrap_or(-1);
+        let ids: Vec<i64> = STORE
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.owner_id == me)
+            .map(|r| r.id)
+            .collect();
+        Ok(autumn_web::html! { @for id in &ids { p { "owned-row-" (id) } } })
+    }
+
+    #[secured]
+    #[post("/owned/{id}/update")]
+    async fn update(
+        id: autumn_web::extract::Path<i64>,
+        autumn_web::extract::State(state): autumn_web::extract::State<autumn_web::AppState>,
+        session: autumn_web::session::Session,
+    ) -> autumn_web::AutumnResult<autumn_web::Redirect> {
+        let row = find_row(*id).ok_or_else(|| autumn_web::AutumnError::not_found_msg("not found"))?;
+        authorize::<OwnedRow>(&state, &session, "update", &row).await?;
+        Ok(autumn_web::Redirect::to("/owned"))
+    }
+
+    #[secured]
+    #[post("/owned/{id}/delete")]
+    async fn destroy(
+        id: autumn_web::extract::Path<i64>,
+        autumn_web::extract::State(state): autumn_web::extract::State<autumn_web::AppState>,
+        session: autumn_web::session::Session,
+    ) -> autumn_web::AutumnResult<autumn_web::Redirect> {
+        let row = find_row(*id).ok_or_else(|| autumn_web::AutumnError::not_found_msg("not found"))?;
+        authorize::<OwnedRow>(&state, &session, "delete", &row).await?;
+        STORE.lock().unwrap().retain(|r| r.id != *id);
+        Ok(autumn_web::Redirect::to("/owned"))
+    }
+
+    {
+        let mut store = STORE.lock().unwrap();
+        store.clear();
+        // Row 1 is owned by user A (id 1).
+        store.push(OwnedRow { id: 1, owner_id: 1 });
+    }
+
+    let client: TestClient = TestApp::new()
+        .routes(routes![index, update, destroy])
+        .policy::<OwnedRow, _>(OwnedRowPolicy::default())
+        .forbidden_response(autumn_web::authorization::ForbiddenResponse::Forbidden403)
+        .build();
+
+    // Acting as user B (id 2), who owns nothing.
+    client.acting_as(2).await;
+
+    // B cannot update or delete A's row.
+    client.post("/owned/1/update").send().await.assert_status(403);
+    client.post("/owned/1/delete").send().await.assert_status(403);
+
+    // B's index excludes A's rows.
+    let body = client.get("/owned").send().await.assert_ok().text();
+    assert!(!body.contains("owned-row-1"), "B must not see A's row: {body}");
+
+    // The owner (A, id 1) is allowed to update their own row.
+    client.acting_as(1).await;
+    client.post("/owned/1/update").send().await.assert_status(303);
+}
+"#;
+    TEMPLATE.replace("__PLURAL__", plural)
 }
 
 /// A representative non-`NULL` literal for a `FieldKind`, used to fill in the
