@@ -51,10 +51,18 @@ pub struct NoShardSetPost {
 
 /// tenant_scoped so `across_tenants()` is generated; sharded so the cross-shard
 /// batch/count guards are emitted. A derived `find_by_title` read exercises the
-/// derived `find_by_*` fan-out guard (#1741).
+/// derived `find_by_*` fan-out guard (#1741). A derived `find_by_tenant_id` with
+/// a BORROWED (`&str`) parameter exercises the `has_borrowed_param` branch of the
+/// derived-read guard (#1741 follow-up): it cannot fan out, but must still reject
+/// under `across_tenants()` with no shard set rather than returning a single-pool
+/// partial result.
 #[autumn_web::repository(NoShardSetPost, table = "no_shard_set_posts", tenant_scoped, sharded)]
 pub trait NoShardSetPostRepository {
     async fn find_by_title(&self, title: String) -> autumn_web::AutumnResult<Vec<NoShardSetPost>>;
+    async fn find_by_tenant_id(
+        &self,
+        tenant_id: &str,
+    ) -> autumn_web::AutumnResult<Vec<NoShardSetPost>>;
 }
 
 mod soft_schema {
@@ -231,6 +239,30 @@ async fn find_by_derived_across_tenants_without_shard_set_rejects() {
         err.to_string()
             .contains("cross-shard find_by_title requires a configured shard set"),
         "derived find_by_* guard must reject cross-shard read without a shard set, got: {err}"
+    );
+}
+
+/// §1741 follow-up: a derived `find_by_*` read whose parameter is BORROWED
+/// (`&str`) takes the `has_borrowed_param` branch, which cannot fan out. It must
+/// still REJECT under `across_tenants()` with no shard set — rather than falling
+/// through to a single-pool partial result — with the same "requires a
+/// configured shard set" rejection the owned-param branch and the count guard
+/// emit. The guard fires before any connection is acquired, so no live database
+/// is required.
+#[tokio::test]
+async fn find_by_borrowed_derived_across_tenants_without_shard_set_rejects() {
+    let pool = make_pool();
+    let repo = PgNoShardSetPostRepository::with_pool_untracked(pool).across_tenants();
+    assert!(repo.__autumn_shards.is_none());
+
+    let err = repo
+        .find_by_tenant_id("acme")
+        .await
+        .expect_err("across_tenants borrowed-param find_by_* without a shard set must reject");
+    assert!(
+        err.to_string()
+            .contains("cross-shard find_by_tenant_id requires a configured shard set"),
+        "borrowed-param derived find_by_* guard must reject cross-shard read without a shard set, got: {err}"
     );
 }
 

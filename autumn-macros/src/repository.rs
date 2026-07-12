@@ -2317,11 +2317,32 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                          out a derived query with a borrowed parameter; declare the parameter as \
                          an owned type (e.g. String) to enable fan-out, or query a specific shard"
                     );
+                    // Same no-shard-set rejection the owned-param branch and the
+                    // count guard emit: without a shard set, an across-tenant read
+                    // would bind a NULL tenant predicate and silently return a
+                    // PARTIAL single-pool result, so reject rather than fall
+                    // through to `#body` (#1692, #1741).
+                    let no_shard_set_msg = format!(
+                        "cross-shard {fn_ident} requires a configured shard set: across_tenants() \
+                         cannot fan a derived query out across shards without a shard set (the \
+                         repository was built without shard context, e.g. via with_pool_untracked); \
+                         build it with shard context instead"
+                    );
                     derived_impl_methods.push(quote! {
                         async fn #fn_ident(&self, #(#params),*) -> ::autumn_web::AutumnResult<#return_type> {
                             use ::autumn_web::reexports::diesel::prelude::*;
                             use ::autumn_web::reexports::diesel_async::RunQueryDsl;
-                            if self.across_tenants && self.__autumn_shards.is_some() {
+                            if self.across_tenants {
+                                // No shard set → would fall through to a partial
+                                // single-pool read; reject like the owned-param
+                                // branch and the count guard (#1741).
+                                if self.__autumn_shards.is_none() {
+                                    return ::core::result::Result::Err(
+                                        ::autumn_web::AutumnError::bad_request_msg(#no_shard_set_msg)
+                                    );
+                                }
+                                // Shard set present, but a borrowed parameter can't
+                                // fan out across shards.
                                 return ::core::result::Result::Err(
                                     ::autumn_web::AutumnError::bad_request_msg(#msg)
                                 );
