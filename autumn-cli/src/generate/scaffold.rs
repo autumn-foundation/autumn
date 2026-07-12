@@ -6838,9 +6838,11 @@ async fn main() {
 
         let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
 
-        // The constrained validated input keeps its inline-validation wiring...
+        // The constrained validated input keeps its inline-validation wiring,
+        // now routed through the typed path helper (#1823) rather than a
+        // hardcoded URL.
         assert!(
-            routes.contains("hx-post=\"/posts/validate/title\""),
+            routes.contains("hx-post=(paths::validate_title())"),
             "title must keep its htmx inline-validation wiring:\n{routes}"
         );
         // ...but filters the one-time submit token out of that POST so the
