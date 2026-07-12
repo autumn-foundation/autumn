@@ -76,6 +76,28 @@ def request(method, path, body=None, accept="application/json"):
         return Resp(e.code, hdrs, raw)
 
 
+# ── shape coercion ──────────────────────────────────────────────────────────────
+#
+# A candidate can answer an expected status with a syntactically VALID JSON body
+# of the wrong shape (a list where an object is expected, a scalar, or null).
+# Feeding that straight into ``.get(...)`` / indexing / iteration would raise
+# AttributeError/TypeError and crash the suite before it prints its RESULT line.
+# These helpers coerce every parsed body to the shape the caller expects, so a
+# wrong shape degrades into a failed ``check(...)`` (empty dict / empty list)
+# rather than an exception. The happy path (correct shapes) is unaffected.
+
+def as_obj(r):
+    """Return the response body as a dict, or ``{}`` for any non-object shape."""
+    j = r.json()
+    return j if isinstance(j, dict) else {}
+
+
+def as_list(r):
+    """Return the response body as a list, or ``[]`` for any non-array shape."""
+    j = r.json()
+    return j if isinstance(j, list) else []
+
+
 # ── assertions ─────────────────────────────────────────────────────────────────
 
 def check(name, condition, detail=""):
@@ -119,7 +141,7 @@ def run():
     # create
     r = request("POST", "/api/habits", {"name": "Read", "description": "20 pages"})
     check("POST /api/habits -> 201", r.status == 201, f"got {r.status}")
-    habit = (r.json() or {}) if r.status == 201 else {}
+    habit = as_obj(r) if r.status == 201 else {}
     check("created habit has id", "id" in habit)
     check("created habit echoes name", habit.get("name") == "Read")
     check("created habit has created_at", "created_at" in habit)
@@ -136,17 +158,17 @@ def run():
     # list
     r = request("GET", "/api/habits")
     check("GET /api/habits -> 200", r.status == 200, f"got {r.status}")
-    listed = r.json() if r.status == 200 else None
-    check("GET /api/habits returns array", isinstance(listed, list))
+    listed = as_list(r) if r.status == 200 else []
+    check("GET /api/habits returns array", isinstance(r.json(), list))
     check(
         "created habit present in list",
-        isinstance(listed, list) and any(str(h.get("id")) == str(hid) for h in listed),
+        any(str(h.get("id")) == str(hid) for h in listed if isinstance(h, dict)),
     )
 
     # get single
     r = request("GET", f"/api/habits/{hid}")
     check("GET /api/habits/{id} -> 200", r.status == 200, f"got {r.status}")
-    got = (r.json() or {}) if r.status == 200 else {}
+    got = as_obj(r) if r.status == 200 else {}
     check("GET single has current_streak", "current_streak" in got)
     check("GET single has history array", isinstance(got.get("history"), list))
 
@@ -155,7 +177,7 @@ def run():
     # opaque string/UUID ids, so a hard-coded numeric sentinel could be rejected
     # as a malformed route param (400) before any not-found lookup happens.
     r = request("POST", "/api/habits", {"name": "throwaway-404"})
-    deleted_id = (r.json() or {}).get("id") if r.status == 201 else None
+    deleted_id = as_obj(r).get("id") if r.status == 201 else None
     request("DELETE", f"/api/habits/{deleted_id}")
     r = request("GET", f"/api/habits/{deleted_id}")
     check("GET unknown id -> 404", r.status == 404, f"got {r.status}")
@@ -163,13 +185,13 @@ def run():
     # update
     r = request("PUT", f"/api/habits/{hid}", {"name": "Read more", "description": "30 pages"})
     check("PUT /api/habits/{id} -> 200", r.status == 200, f"got {r.status}")
-    updated = (r.json() or {}) if r.status == 200 else {}
+    updated = as_obj(r) if r.status == 200 else {}
     check("PUT updates name", updated.get("name") == "Read more")
 
     # complete today (default date)
     r = request("POST", f"/api/habits/{hid}/complete", {})
     check("POST complete (default date) -> 201", r.status == 201, f"got {r.status}")
-    comp = (r.json() or {}) if r.status == 201 else {}
+    comp = as_obj(r) if r.status == 201 else {}
     check("complete returns date", "date" in comp)
     check("complete returns current_streak", "current_streak" in comp)
 
@@ -194,11 +216,11 @@ def run():
     # correct server across a timezone / midnight-boundary skew.
     r = request("POST", "/api/habits", {"name": "Streaker"})
     check("POST streak habit -> 201", r.status == 201, f"got {r.status}")
-    sid = (r.json() or {}).get("id") if r.status == 201 else None
+    sid = as_obj(r).get("id") if r.status == 201 else None
     r0 = request("POST", f"/api/habits/{sid}/complete", {})  # default = server today
     server_today = None
     if r0.status == 201:
-        ds = (r0.json() or {}).get("date")
+        ds = as_obj(r0).get("date")
         try:
             server_today = datetime.date.fromisoformat(ds) if ds else None
         except (ValueError, TypeError):
@@ -211,9 +233,9 @@ def run():
         rr = request("POST", f"/api/habits/{sid}/complete", {"date": iso(d)})
         check(f"complete {iso(d)} -> 201", rr.status == 201, f"got {rr.status}")
         if rr.status == 201:
-            complete_streak = (rr.json() or {}).get("current_streak")
+            complete_streak = as_obj(rr).get("current_streak")
     r = request("GET", f"/api/habits/{sid}")
-    streak = (r.json() or {}).get("current_streak") if r.status == 200 else None
+    streak = as_obj(r).get("current_streak") if r.status == 200 else None
     check("streak of 3 consecutive days == 3", streak == 3, f"got {streak}")
     # The streak the complete endpoint returns must agree with what GET reports
     # immediately after (both are "as of server today" per SPEC). This is a
@@ -223,7 +245,7 @@ def run():
     check("complete-response current_streak agrees with GET",
           complete_streak is not None and complete_streak == streak,
           f"complete={complete_streak}, get={streak}")
-    hist = (r.json() or {}).get("history") if r.status == 200 else None
+    hist = as_obj(r).get("history") if r.status == 200 else None
     expected_hist = [iso(today - datetime.timedelta(days=d)) for d in (0, 1, 2)]
     check("history is 3 dates descending", hist == expected_hist, f"got {hist}")
 

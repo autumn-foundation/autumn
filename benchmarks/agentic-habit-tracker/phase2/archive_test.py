@@ -107,12 +107,33 @@ def wait_for_server(timeout_s=30):
     return False
 
 
+# ── shape coercion ──────────────────────────────────────────────────────────────
+#
+# A candidate can answer an expected status with a syntactically VALID JSON body
+# of the wrong shape (a list where an object is expected, a scalar, or null).
+# Feeding that into ``.get(...)`` / indexing / iteration would raise and crash the
+# suite before it prints its RESULT line. These helpers coerce every parsed body
+# to the expected shape, so a wrong shape degrades into a failed ``check(...)``
+# rather than an exception. The happy path (correct shapes) is unaffected.
+
+def as_obj(r):
+    """Return the response body as a dict, or ``{}`` for any non-object shape."""
+    j = r.json()
+    return j if isinstance(j, dict) else {}
+
+
+def as_list(r):
+    """Return the response body as a list, or ``[]`` for any non-array shape."""
+    j = r.json()
+    return j if isinstance(j, list) else []
+
+
 # ── helpers ──────────────────────────────────────────────────────────────────
 
 def new_habit(name):
     """Create a habit; return (response, id)."""
     r = request("POST", "/api/habits", {"name": name})
-    hid = (r.json() or {}).get("id") if r.status == 201 else None
+    hid = as_obj(r).get("id") if r.status == 201 else None
     return r, hid
 
 
@@ -124,7 +145,38 @@ def list_ids(path):
     body = r.json()
     if not isinstance(body, list):
         return None
-    return {str(h.get("id")) for h in body}
+    return {str(h.get("id")) for h in body if isinstance(h, dict)}
+
+
+def list_objs(path):
+    """GET a habits listing and return its list of dict objects (or None on error).
+
+    Unlike ``list_ids`` this preserves the full objects so callers can assert on
+    per-object fields (e.g. the phase-2 ``archived`` boolean). Returns None on a
+    non-200 status or a non-array body; a valid-but-wrong shape thus becomes a
+    failed check rather than a crash.
+    """
+    r = request("GET", path)
+    if r.status != 200:
+        return None
+    body = r.json()
+    if not isinstance(body, list):
+        return None
+    return body
+
+
+def all_archived_is(objs, expected):
+    """True iff ``objs`` is a non-empty list whose every element is a dict that
+    carries ``archived`` as the bool ``expected`` (present, correct type, correct
+    value). Fail-closed: None (fetch/shape error), an empty list, a non-dict
+    element, a missing/None/non-bool ``archived``, or the wrong value all yield
+    False. ``is expected`` also rejects a truthy non-bool (e.g. ``1``)."""
+    if not isinstance(objs, list) or not objs:
+        return False
+    for h in objs:
+        if not isinstance(h, dict) or h.get("archived") is not expected:
+            return False
+    return True
 
 
 def contains(ids, hid):
@@ -143,15 +195,17 @@ def run():
     check("POST /api/habits -> 201", r.status == 201, f"got {r.status}")
     check("created habit has id", hid is not None)
     if hid is None:
-        # Denominator is intentionally fixed at 16: a failed setup must not
+        # Denominator is intentionally fixed at 18: a failed setup must not
         # shrink the total and inflate the pass rate. Record every dependent
         # check as an explicit failure instead of exiting early and skipping them.
         for label in (
             "newly created habit is active (archived == false AND not in archived list)",
             "created habit present in default list",
+            "every habit in default list carries archived == false",
             "POST /api/habits/{id}/archive -> 200/204",
             "archived habit absent from default list",
             "archived habit present in ?archived=true list",
+            "every habit in ?archived=true list carries archived == true",
             "GET archived habit -> 200 with archived == true",
             "archived habit still has current_streak",
             "archived habit still has history array",
@@ -166,7 +220,7 @@ def run():
         total = _PASSED + _FAILED
         print(f"RESULT: {_PASSED}/{total} passed")
         sys.exit(1)
-    archived_field = (r.json() or {}).get("archived")
+    archived_field = as_obj(r).get("archived")
     archived_ids = list_ids("/api/habits?archived=true")
     # Phase 2 (prompts/phase2_maintenance.md) requires an `archived` boolean on
     # the habit. A freshly created habit MUST carry archived == false: absent or
@@ -182,6 +236,16 @@ def run():
     default_ids = list_ids("/api/habits")
     check("created habit present in default list", contains(default_ids, hid))
 
+    # Every OBJECT in the default (active) list must itself carry archived ==
+    # false. The id-only filter checks above can't catch an impl that omits the
+    # `archived` field from list objects, so assert on the full objects here.
+    # Fail-closed: a fetch/shape error, a non-dict element, or a missing / non-
+    # bool / wrong-valued `archived` all fail this check.
+    default_objs = list_objs("/api/habits")
+    check("every habit in default list carries archived == false",
+          all_archived_is(default_objs, False),
+          f"objs={default_objs!r}")
+
     # archive H -> 200 or 204 (SPEC allows either)
     r = request("POST", f"/api/habits/{hid}/archive")
     check("POST /api/habits/{id}/archive -> 200/204", r.status in (200, 204), f"got {r.status}")
@@ -194,11 +258,19 @@ def run():
     archived_ids = list_ids("/api/habits?archived=true")
     check("archived habit present in ?archived=true list", contains(archived_ids, hid))
 
+    # Every OBJECT in the ?archived=true list must itself carry archived == true
+    # (present, bool, correct value) — mirror of the default-list check so an
+    # impl can't omit the field from archived list objects. Fail-closed.
+    archived_objs = list_objs("/api/habits?archived=true")
+    check("every habit in ?archived=true list carries archived == true",
+          all_archived_is(archived_objs, True),
+          f"objs={archived_objs!r}")
+
     # GET single still works for the archived habit, and the object MUST now
     # report archived == true (present and correct). Absent/None is a FAIL. The
     # streak + history must still be intact.
     r = request("GET", f"/api/habits/{hid}")
-    got = (r.json() or {}) if r.status == 200 else {}
+    got = as_obj(r) if r.status == 200 else {}
     check("GET archived habit -> 200 with archived == true",
           r.status == 200 and got.get("archived") is True,
           f"got status {r.status}, archived={got.get('archived')!r}")
@@ -229,7 +301,7 @@ def run():
     # HTML-greppable names, then assert the archived name is absent from the
     # server-rendered HTML body while the active name is present. Fail-closed:
     # if either habit can't be created or the archive doesn't take, record both
-    # checks as failures rather than skipping (keeps the denominator at 16).
+    # checks as failures rather than skipping (keeps the denominator at 18).
     HIDDEN_NAME = "ZzArchivedHidden-Q7"
     ACTIVE_NAME = "ZzActiveVisible-Q7"
     _, hidden_hid = new_habit(HIDDEN_NAME)

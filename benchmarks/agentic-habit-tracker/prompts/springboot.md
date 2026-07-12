@@ -11,8 +11,16 @@ Spring Boot-specific bootstrapping notes.
 - Use **Spring Boot** (Java or Kotlin) with **Spring Web**, **Spring Data JPA**,
   and a template engine (**Thymeleaf**) for the HTML view.
 - Scaffold via Spring Initializr (`spring init` CLI or start.spring.io)
-  with dependencies: `web`, `data-jpa`, `thymeleaf`, plus a database driver
-  (H2 in-memory or Postgres — H2 file/mem is fine for the benchmark).
+  with dependencies: `web`, `data-jpa`, `thymeleaf`, plus a database driver.
+- **Persistence is a hard requirement (`_core.md` §1): no in-memory-only
+  storage.** H2 running in its default **in-memory** mode
+  (`jdbc:h2:mem:...`) is **NOT allowed** — its data is wiped when the JVM
+  exits, so it cannot satisfy the contract. Use a persistent relational store
+  whose data **survives a server restart**: either the benchmark **Postgres**
+  (`postgres://postgres:postgres@localhost:5432/...`,
+  `spring.datasource.url=jdbc:postgresql://localhost:5432/...`) or **H2 in
+  file mode** (on-disk, e.g. `jdbc:h2:file:./data/habits`). A file-backed H2
+  URL is fine; `jdbc:h2:mem:` is not.
 - **Entities.**
   - `Habit` (`id`, `name`, `description` nullable, `createdAt`).
   - `Completion` (`id`, `@ManyToOne Habit`, `LocalDate date`) with a unique

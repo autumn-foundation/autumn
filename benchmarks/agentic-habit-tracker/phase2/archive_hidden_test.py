@@ -98,11 +98,32 @@ def wait_for_server(timeout_s=30):
     return False
 
 
+# ── shape coercion ──────────────────────────────────────────────────────────────
+#
+# A candidate can answer an expected status with a syntactically VALID JSON body
+# of the wrong shape (a list where an object is expected, a scalar, or null).
+# Feeding that into ``.get(...)`` / indexing / iteration would raise and crash the
+# suite before it prints its RESULT line. These helpers coerce every parsed body
+# to the expected shape, so a wrong shape degrades into a failed ``check(...)``
+# rather than an exception. The happy path (correct shapes) is unaffected.
+
+def as_obj(r):
+    """Return the response body as a dict, or ``{}`` for any non-object shape."""
+    j = r.json()
+    return j if isinstance(j, dict) else {}
+
+
+def as_list(r):
+    """Return the response body as a list, or ``[]`` for any non-array shape."""
+    j = r.json()
+    return j if isinstance(j, list) else []
+
+
 # ── helpers ──────────────────────────────────────────────────────────────────
 
 def new_habit(name):
     r = request("POST", "/api/habits", {"name": name})
-    return r, ((r.json() or {}).get("id") if r.status == 201 else None)
+    return r, (as_obj(r).get("id") if r.status == 201 else None)
 
 
 def id_list(path):
@@ -113,7 +134,35 @@ def id_list(path):
     body = r.json()
     if not isinstance(body, list):
         return None
-    return [str(h.get("id")) for h in body]
+    return [str(h.get("id")) for h in body if isinstance(h, dict)]
+
+
+def list_objs(path):
+    """GET a listing and return its list of dict objects (or None on error).
+
+    Preserves the full objects so callers can assert on per-object fields (the
+    phase-2 ``archived`` boolean). None on a non-200 status or non-array body.
+    """
+    r = request("GET", path)
+    if r.status != 200:
+        return None
+    body = r.json()
+    if not isinstance(body, list):
+        return None
+    return body
+
+
+def all_archived_is(objs, expected):
+    """True iff ``objs`` is a non-empty list whose every element is a dict that
+    carries ``archived`` as the bool ``expected`` (present, correct type, correct
+    value). Fail-closed on None, empty list, non-dict element, or a missing /
+    non-bool / wrong-valued ``archived`` (``is expected`` rejects e.g. ``1``)."""
+    if not isinstance(objs, list) or not objs:
+        return False
+    for h in objs:
+        if not isinstance(h, dict) or h.get("archived") is not expected:
+            return False
+    return True
 
 
 def contains(ids, hid):
@@ -127,7 +176,7 @@ def run():
         print("RESULT: 0/1 passed")
         sys.exit(1)
 
-    # Denominator is intentionally fixed at 16: each scenario contributes a
+    # Denominator is intentionally fixed at 18: each scenario contributes a
     # constant number of checks. When a setup step (habit creation or the
     # default completion) fails, the dependent checks are recorded as explicit
     # failures instead of being skipped, so a broken implementation can never
@@ -142,9 +191,17 @@ def run():
               contains(id_list("/api/habits"), active_hid))
         check("(a) new habit absent from ?archived=true",
               not contains(id_list("/api/habits?archived=true"), active_hid))
+        # The default list is active-only, so every OBJECT it returns must carry
+        # archived == false. The id-only checks above can't catch an impl that
+        # omits `archived` from list objects; assert on the full objects here.
+        # Fail-closed (None / empty / non-dict element / missing / wrong value).
+        check("(a) every habit in default list carries archived == false",
+              all_archived_is(list_objs("/api/habits"), False))
     else:
         check("(a) new habit present in default list", False, "setup failed: no habit id")
         check("(a) new habit absent from ?archived=true", False, "setup failed: no habit id")
+        check("(a) every habit in default list carries archived == false", False,
+              "setup failed: no habit id")
 
     # (b) archive idempotency: POST archive twice -> both 200/204; H appears
     #     exactly once in ?archived=true and never in the default list.
@@ -162,12 +219,19 @@ def run():
               f"count={count}")
         check("(b) archived habit never in default list",
               not contains(id_list("/api/habits"), hid))
+        # H is archived, so the ?archived=true list is non-empty and every OBJECT
+        # it returns must carry archived == true (present, bool, correct value).
+        # Fail-closed mirror of the (a) default-list object check.
+        check("(b) every habit in ?archived=true list carries archived == true",
+              all_archived_is(list_objs("/api/habits?archived=true"), True))
     else:
         check("(b) first archive -> 200/204", False, "setup failed: no habit id")
         check("(b) second archive (idempotent) -> 200/204", False, "setup failed: no habit id")
         check("(b) archived habit appears exactly once in ?archived=true", False,
               "setup failed: no habit id")
         check("(b) archived habit never in default list", False, "setup failed: no habit id")
+        check("(b) every habit in ?archived=true list carries archived == true", False,
+              "setup failed: no habit id")
 
     # (c) explicit ?archived=false mirrors the default (active only). SPEC §4 says
     #     this param MAY be treated the same as no query, so explicit support is
@@ -178,7 +242,7 @@ def run():
     if active_hid is not None and hid is not None:
         r = request("GET", "/api/habits?archived=false")
         if r.status == 200 and isinstance(r.json(), list):
-            ids = [str(h.get("id")) for h in r.json()]
+            ids = [str(h.get("id")) for h in as_list(r) if isinstance(h, dict)]
             ok = str(active_hid) in ids and str(hid) not in ids
             check("(c) ?archived=false returns only active habits", ok,
                   f"active_present={str(active_hid) in ids}, archived_present={str(hid) in ids}")
@@ -199,7 +263,7 @@ def run():
     if h2 is not None:
         rc = request("POST", f"/api/habits/{h2}/complete", {})  # default = today
         check("(d) complete today (default) -> 201", rc.status == 201, f"got {rc.status}")
-        today_str = (rc.json() or {}).get("date") if rc.status == 201 else None
+        today_str = as_obj(rc).get("date") if rc.status == 201 else None
         # Guard the server-date parse (mirror acceptance/contract_test.py): a
         # candidate can return 201 with a non-ISO `date`, and an unguarded
         # datetime.date.fromisoformat would raise ValueError and crash the suite
@@ -222,7 +286,7 @@ def run():
             check("(d) archive habit -> 200/204", ra.status in (200, 204), f"got {ra.status}")
             r = request("GET", f"/api/habits/{h2}")
             check("(d) GET archived habit -> 200", r.status == 200, f"got {r.status}")
-            got = (r.json() or {}) if r.status == 200 else {}
+            got = as_obj(r) if r.status == 200 else {}
             check("(d) archived habit current_streak == 2", got.get("current_streak") == 2,
                   f"got {got.get('current_streak')}")
             hist = got.get("history") if isinstance(got.get("history"), list) else []

@@ -73,6 +73,27 @@ def request(method, path, body=None):
         return Resp(e.code, hdrs, raw)
 
 
+# ── shape coercion ──────────────────────────────────────────────────────────────
+#
+# A candidate can answer an expected status with a syntactically VALID JSON body
+# of the wrong shape (a list where an object is expected, a scalar, or null).
+# Feeding that into ``.get(...)`` / indexing / iteration would raise and crash the
+# suite before it prints its RESULT line. These helpers coerce every parsed body
+# to the expected shape, so a wrong shape degrades into a failed ``check(...)``
+# rather than an exception. The happy path (correct shapes) is unaffected.
+
+def as_obj(r):
+    """Return the response body as a dict, or ``{}`` for any non-object shape."""
+    j = r.json()
+    return j if isinstance(j, dict) else {}
+
+
+def as_list(r):
+    """Return the response body as a list, or ``[]`` for any non-array shape."""
+    j = r.json()
+    return j if isinstance(j, list) else []
+
+
 def check(name, condition, detail=""):
     global _PASSED, _FAILED
     if condition:
@@ -108,7 +129,7 @@ def new_habit(name):
     r = request("POST", "/api/habits", {"name": name})
     if r.status != 201:
         return None
-    return (r.json() or {}).get("id")
+    return as_obj(r).get("id")
 
 
 def complete(hid, delta, expect=201, label=None):
@@ -124,7 +145,7 @@ def streak_of(hid):
     r = request("GET", f"/api/habits/{hid}")
     if r.status != 200:
         return None
-    return (r.json() or {}).get("current_streak")
+    return as_obj(r).get("current_streak")
 
 
 # ── tests ──────────────────────────────────────────────────────────────────────
@@ -143,7 +164,7 @@ def run():
     if probe is not None:
         r = request("POST", f"/api/habits/{probe}/complete", {})
         if r.status == 201:
-            ds = (r.json() or {}).get("date")
+            ds = as_obj(r).get("date")
             try:
                 if ds:
                     SERVER_TODAY = datetime.date.fromisoformat(ds)
@@ -183,7 +204,7 @@ def run():
         # DESCENDING date order (SPEC). Fetch the habit and compare its history
         # to the same dates sorted newest-first: [D, D-1, D-2].
         rb = request("GET", f"/api/habits/{hid}")
-        hist = (rb.json() or {}).get("history") if rb.status == 200 else None
+        hist = as_obj(rb).get("history") if rb.status == 200 else None
         expected_desc = [day(0), day(1), day(2)]
         check("(b) history in descending date order after out-of-order inserts",
               hist == expected_desc, f"got {hist}")
@@ -201,7 +222,7 @@ def run():
     if hid is not None:
         r = request("POST", f"/api/habits/{hid}/complete", {})  # default = today
         check("(c) default complete -> 201", r.status == 201, f"got {r.status}")
-        completed_date = (r.json() or {}).get("date") if r.status == 201 else day(0)
+        completed_date = as_obj(r).get("date") if r.status == 201 else day(0)
         r = request("POST", f"/api/habits/{hid}/complete", {"date": completed_date})  # explicit today
         check("(c) explicit-today duplicate -> 409", r.status == 409, f"got {r.status}")
     else:
