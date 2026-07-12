@@ -479,6 +479,13 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
             "mcp requires api = \"/path\": MCP tools are derived from the generated CRUD routes",
         ));
     }
+    if validate_on_update_fetch && no_upsert_trait {
+        return Err(syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "validate_on_update = fetch requires the generated update draft (from_patch), \
+             which no_upsert_trait repositories do not have; remove one of the two",
+        ));
+    }
     let table = table_name.unwrap_or_else(|| infer_table_name(&model));
     let generated_internal_hooks = false;
 
@@ -15081,6 +15088,25 @@ mod tests {
         assert!(
             err.to_string().contains("validate_on_update"),
             "error must name the knob: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_repo_args_rejects_validate_on_update_fetch_with_no_upsert_trait() {
+        // #1801: `validate_on_update = fetch` emits `from_patch` on the generated
+        // update draft, but `no_upsert_trait` repositories have no such scaffold.
+        // The combination must be rejected at parse time rather than producing a
+        // downstream compile error.
+        let tokens: proc_macro2::TokenStream = "Post, validate_on_update = fetch, no_upsert_trait"
+            .parse()
+            .unwrap();
+        let err = parse_repo_args(tokens)
+            .err()
+            .expect("fetch validation with no_upsert_trait must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("validate_on_update") && msg.contains("no_upsert_trait"),
+            "error must name both knobs: {err}"
         );
     }
 
