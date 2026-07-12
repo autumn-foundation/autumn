@@ -413,9 +413,10 @@ diesel::table! {
 
 // A model-side child that ITSELF declares a model-side dependent — this is what
 // exercises the new runtime-grandchild codegen inside its Destroy arm. The
-// grandchild table is `m3_replys` (autumn's naive `{snake}s` pluralization of
-// `M3Reply`) so the `#[has_many]` preload codegen resolves the Diesel table
-// module by convention, matching the other has_many targets in this file.
+// grandchild table is `m3_replies` (autumn's smart pluralization of `M3Reply`:
+// consonant + `y` → `ies`, per #1753) so the `#[has_many]` preload codegen
+// resolves the Diesel table module by convention, matching the other has_many
+// targets in this file.
 #[autumn_web::model(table = "m3_comments")]
 #[has_many(M3Reply, fk = "comment_id", dependent = destroy)]
 pub struct M3Comment {
@@ -429,14 +430,14 @@ pub struct M3Comment {
 pub trait M3CommentRepository {}
 
 diesel::table! {
-    m3_replys (id) {
+    m3_replies (id) {
         id -> Int8,
         comment_id -> Int8,
         body -> Text,
     }
 }
 
-#[autumn_web::model(table = "m3_replys")]
+#[autumn_web::model(table = "m3_replies")]
 pub struct M3Reply {
     #[id]
     pub id: i64,
@@ -444,7 +445,7 @@ pub struct M3Reply {
     pub body: String,
 }
 
-#[autumn_web::repository(M3Reply, table = "m3_replys")]
+#[autumn_web::repository(M3Reply, table = "m3_replies")]
 pub trait M3ReplyRepository {}
 
 // ── #1739 cycle guard: a self-referential `destroy` dependent ─────────────────
@@ -808,7 +809,7 @@ async fn setup_pool() -> (
         // Codex P1: fully model-side three-level grandchild graph.
         "CREATE TABLE m3_posts (id BIGSERIAL PRIMARY KEY, title TEXT NOT NULL)",
         "CREATE TABLE m3_comments (id BIGSERIAL PRIMARY KEY, post_id BIGINT NOT NULL REFERENCES m3_posts(id), body TEXT NOT NULL)",
-        "CREATE TABLE m3_replys (id BIGSERIAL PRIMARY KEY, comment_id BIGINT NOT NULL REFERENCES m3_comments(id), body TEXT NOT NULL)",
+        "CREATE TABLE m3_replies (id BIGSERIAL PRIMARY KEY, comment_id BIGINT NOT NULL REFERENCES m3_comments(id), body TEXT NOT NULL)",
         // Self-referential FK: parent_id references the same table. The FK is
         // DEFERRABLE INITIALLY DEFERRED so a *cyclic* component can be hard-deleted
         // within one transaction (the constraint is checked at COMMIT, by which
@@ -1225,7 +1226,7 @@ async fn deleting_model_side_parent_recurses_into_model_side_grandchildren() {
         for r in 1..=2 {
             let rid = c * 10 + r;
             diesel::sql_query(format!(
-                "INSERT INTO m3_replys (id, comment_id, body) VALUES ({rid}, {c}, 'r{rid}')"
+                "INSERT INTO m3_replies (id, comment_id, body) VALUES ({rid}, {c}, 'r{rid}')"
             ))
             .execute(&mut conn)
             .await
@@ -1249,7 +1250,7 @@ async fn deleting_model_side_parent_recurses_into_model_side_grandchildren() {
         "Codex P1: all comments (children) must be destroyed — zero left"
     );
     assert_eq!(
-        count(&mut conn, "SELECT COUNT(*) AS n FROM m3_replys").await,
+        count(&mut conn, "SELECT COUNT(*) AS n FROM m3_replies").await,
         0,
         "Codex P1: all replies (grandchildren) must be recursively destroyed via \
          the child's runtime Model::dependents() — zero left"
@@ -1283,7 +1284,7 @@ async fn delete_many_model_side_parent_cascades_via_runtime_dispatch() {
         .await
         .unwrap();
         diesel::sql_query(format!(
-            "INSERT INTO m3_replys (id, comment_id, body) VALUES ({p}, {p}, 'r{p}')"
+            "INSERT INTO m3_replies (id, comment_id, body) VALUES ({p}, {p}, 'r{p}')"
         ))
         .execute(&mut conn)
         .await
@@ -1306,7 +1307,7 @@ async fn delete_many_model_side_parent_cascades_via_runtime_dispatch() {
         "Codex P1: model-declared destroy children cascaded on the BULK path — zero left"
     );
     assert_eq!(
-        count(&mut conn, "SELECT COUNT(*) AS n FROM m3_replys").await,
+        count(&mut conn, "SELECT COUNT(*) AS n FROM m3_replies").await,
         0,
         "Codex P1: grandchildren recursively destroyed on the bulk path via the \
          child's runtime Model::dependents() — zero left"
