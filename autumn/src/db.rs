@@ -654,20 +654,24 @@ fn consume_estring_body(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
 /// Called after the opening `$tag$` delimiter has already been consumed.
 /// Uses a simple sliding-window match — sufficient for valid SQL.
 fn consume_dollar_quoted_body(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, tag: &str) {
-    let closing: Vec<char> = format!("${tag}$").chars().collect();
-    let clen = closing.len();
-    let mut match_count = 0usize;
+    let mut expected_chars = std::iter::once('$').chain(tag.chars()).chain(std::iter::once('$'));
+    let mut expected = expected_chars.next().unwrap();
+
     for sc in chars.by_ref() {
-        if sc == closing[match_count] {
-            match_count += 1;
-            if match_count == clen {
+        if sc == expected {
+            if let Some(next) = expected_chars.next() {
+                expected = next;
+            } else {
                 break; // Found the closing delimiter.
             }
         } else {
-            match_count = 0;
-            // The current char may start a new partial match.
-            if sc == closing[0] {
-                match_count = 1;
+            // Reset the state machine.
+            expected_chars = std::iter::once('$').chain(tag.chars()).chain(std::iter::once('$'));
+            expected = expected_chars.next().unwrap();
+
+            // If the current character is '$', it might be the start of a new match.
+            if sc == expected {
+                expected = expected_chars.next().unwrap();
             }
         }
     }
