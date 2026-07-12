@@ -3287,7 +3287,7 @@ fn resolve_fleet_topology(table: Option<&toml::Table>) -> Option<FleetTopology> 
 /// matches what the runtime actually drains. Two sources, in precedence order:
 ///
 /// 1. `[jobs.fleet] manifest = "path"` — a jobs manifest the app emits (reusing
-///    `effective_drained_queues` on the runtime side), a TOML file with a
+///    `effective_drained_queues_from_jobs` on the runtime side), a TOML file with a
 ///    `queues = [...]` array. This is the ground-truth set the runtime drains.
 /// 2. `[jobs.fleet] declared_queues = ["…"]` — an inline list the operator
 ///    maintains by hand (the MVP path when no manifest is emitted).

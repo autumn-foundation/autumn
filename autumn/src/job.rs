@@ -3754,47 +3754,29 @@ fn collect_declared_queues(jobs_by_name: &Arc<RwLock<HashMap<String, JobInfo>>>)
     collect_declared_queues_from_jobs(guard.values())
 }
 
-/// The full set of queue names this worker actually drains: the configured
+/// The full set of queue names the running app actually drains: the configured
 /// `[jobs.queues]` plus every `#[job(queue = "…")]`-declared queue the runtime
 /// appends to the effective schedule at lowest priority (#1756).
 ///
 /// This is the ground-truth "must be drained" set that a fleet manifest emits so
 /// a topology-aware `autumn doctor --strict` coverage check sees exactly what the
 /// runtime drains — never a stale config-only view that false-positives on
-/// job-declared queues. It reuses [`QueueSchedule::effective`] and
-/// [`collect_declared_queues`] so it can never drift from the real drain plan.
+/// job-declared queues. It runs the same [`QueueSchedule::effective`] union the
+/// runtime boot path runs, over the builder's raw `Vec<JobInfo>` (the emit path
+/// holds the job slice, not the runtime's `Arc<RwLock<…>>` registry), so the
+/// emitted manifest can never drift from the real drain plan.
 ///
 /// Exposed through the `autumn jobs manifest` subcommand, which runs the app
 /// under `AUTUMN_DUMP_JOBS=1` and writes these names to the manifest path doctor
 /// consumes (via [`render_jobs_manifest`]); an app can also declare them inline
 /// under `[jobs.fleet]`.
-#[cfg_attr(not(test), allow(dead_code))]
-fn effective_drained_queues(
-    cfg: &crate::config::JobQueuesConfig,
-    jobs_by_name: &Arc<RwLock<HashMap<String, JobInfo>>>,
-) -> Vec<String> {
-    effective_drained_queues_from_declared(cfg, &collect_declared_queues(jobs_by_name))
-}
-
-/// The effective drained-queue set computed from an already-collected declared
-/// list. Shared tail of both [`effective_drained_queues`] (runtime registry) and
-/// [`render_jobs_manifest`] (builder job slice) so the union logic lives once.
-fn effective_drained_queues_from_declared(
-    cfg: &crate::config::JobQueuesConfig,
-    declared: &[String],
-) -> Vec<String> {
-    QueueSchedule::effective(cfg, declared).0.names()
-}
-
-/// The full set of queue names the running app would drain, computed directly
-/// from the builder's `Vec<JobInfo>` (the `autumn jobs manifest` emit path holds
-/// the raw job slice, not the runtime's `Arc<RwLock<…>>` registry). Reuses the
-/// exact union logic the runtime uses so the emitted manifest can never drift.
 fn effective_drained_queues_from_jobs(
     cfg: &crate::config::JobQueuesConfig,
     jobs: &[JobInfo],
 ) -> Vec<String> {
-    effective_drained_queues_from_declared(cfg, &collect_declared_queues_from_jobs(jobs))
+    QueueSchedule::effective(cfg, &collect_declared_queues_from_jobs(jobs))
+        .0
+        .names()
 }
 
 /// Serialize the ground-truth drained-queue set (#1756) as the TOML manifest
@@ -18303,7 +18285,10 @@ mod queue_schedule_tests {
         );
         let registry = Arc::new(RwLock::new(jobs));
         let cfg = JobQueuesConfig::strict_list(["critical"]);
-        let drained = effective_drained_queues(&cfg, &registry);
+        // Mirror the runtime boot path (start_local_runtime_inner): collect the
+        // registry's declared queues, then take the effective drain plan's names.
+        let declared = collect_declared_queues(&registry);
+        let drained = QueueSchedule::effective(&cfg, &declared).0.names();
         assert_eq!(drained, vec!["critical".to_string(), "email".to_string()]);
     }
 
