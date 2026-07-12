@@ -124,8 +124,12 @@ Mark the habit as completed for a calendar day.
 #### `GET /` (HTML view)
 
 - Success: **200 OK** with `Content-Type: text/html` (charset suffix allowed).
-- The body is a server-rendered HTML page listing the current habits. Minimal
-  markup is fine; tests only assert status 200 and a `text/html` content type.
+- The body MUST be a server-rendered HTML page that **lists the current
+  (non-archived) habits**: a created habit's name MUST appear in the page body.
+  Minimal markup is fine, but the acceptance suite asserts more than the status
+  and content type — it checks that a habit's name is actually rendered. Under
+  Phase 2 (§4), archived habits MUST be excluded from this view, so an archived
+  habit's name MUST NOT appear while active habits still do.
 
 ## 3. Streak semantics (precise)
 
