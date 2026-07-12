@@ -157,17 +157,27 @@ pub type RuntimeDependentCascadeFuture<'a> = ::std::pin::Pin<
 /// `#[has_many(Child, dependent = …)]` association, resolving the child
 /// repository through the `Pg{Child}Repository` naming convention. Given the
 /// parent repository's pool, its live connection/transaction, the parent id,
-/// the parent's soft-delete kind, and the shared cycle-guard visited set, it
+/// the parent's soft-delete kind, and the two shared cascade-guard sets, it
 /// constructs the child repository and applies this one association's cascade,
 /// returning any deferred OOB delete broadcasts to publish post-commit.
 ///
+/// The two guard sets serve distinct roles (Codex round-5-B): `__path` is the
+/// ACTIVE recursion stack (pushed before descending into a node's children,
+/// popped once that subtree completes) used only to break self-/mutual-referential
+/// cycles; `__deleted` is a monotonic set of rows actually removed, used to skip a
+/// row already gone (so a row reached again — e.g. as another batch root's
+/// descendant — is neither re-deleted nor re-hooked). Keeping them separate lets a
+/// batch process a descendant root before its ancestor without the ancestor's
+/// cascade skipping a still-referenced intermediate (immediate-FK failure).
+///
 /// All references share one lifetime so the returned future can borrow the
-/// connection and visited set for exactly as long as it is awaited.
+/// connection and both guard sets for exactly as long as it is awaited.
 pub type RuntimeDependentCascadeFn = for<'a> fn(
     &'a ::diesel_async::pooled_connection::deadpool::Pool<::diesel_async::AsyncPgConnection>,
     &'a mut ::diesel_async::AsyncPgConnection,
     i64,
     bool,
+    &'a mut ::std::collections::HashSet<(&'static str, i64)>,
     &'a mut ::std::collections::HashSet<(&'static str, i64)>,
 ) -> RuntimeDependentCascadeFuture<'a>;
 

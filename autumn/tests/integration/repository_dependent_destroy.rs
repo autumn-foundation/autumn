@@ -578,6 +578,149 @@ pub struct DepCycleNode {
 )]
 pub trait DepCycleNodeRepository {}
 
+// ── Codex round-5-A: grandchild `restrict` must probe BEFORE the child hook ────
+//
+// Graph: `ra_posts` → `ra_comments` (dependent = destroy, with a `before_delete`
+// hook) → `ra_replies` (dependent = restrict). Deleting a post cascades into the
+// comment `destroy`; because the comment has a `restrict` grandchild (a reply),
+// the delete must return 409 — and it must do so WITHOUT firing the comment's
+// `before_delete` hook, since a non-transactional hook side effect on a doomed
+// transaction cannot be undone. The Destroy arm therefore probes the grandchild
+// restrict (read-only) BEFORE running the child `before_delete`.
+
+// Counts how many times `RaComment::before_delete` fired. Must stay 0 when a
+// grandchild restrict blocks the delete (round-5-A).
+pub static RA_COMMENT_HOOK_FIRED: AtomicUsize = AtomicUsize::new(0);
+
+#[derive(Clone, Default)]
+pub struct RaCommentHooks;
+
+impl MutationHooks for RaCommentHooks {
+    type Model = RaComment;
+    type NewModel = NewRaComment;
+    type UpdateModel = UpdateRaComment;
+
+    async fn before_delete(
+        &self,
+        _ctx: &mut MutationContext,
+        _record: &RaComment,
+    ) -> AutumnResult<()> {
+        RA_COMMENT_HOOK_FIRED.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+diesel::table! {
+    ra_posts (id) { id -> Int8, title -> Text, }
+}
+diesel::table! {
+    ra_comments (id) { id -> Int8, post_id -> Int8, body -> Text, }
+}
+diesel::table! {
+    ra_replies (id) { id -> Int8, comment_id -> Int8, body -> Text, }
+}
+
+#[autumn_web::model(table = "ra_posts")]
+pub struct RaPost {
+    #[id]
+    pub id: i64,
+    pub title: String,
+}
+
+#[autumn_web::model(table = "ra_comments")]
+pub struct RaComment {
+    #[id]
+    pub id: i64,
+    pub post_id: i64,
+    pub body: String,
+}
+
+#[autumn_web::model(table = "ra_replies")]
+pub struct RaReply {
+    #[id]
+    pub id: i64,
+    pub comment_id: i64,
+    pub body: String,
+}
+
+#[autumn_web::repository(
+    RaPost,
+    table = "ra_posts",
+    dependent(PgRaCommentRepository, fk = "post_id", on_delete = destroy)
+)]
+pub trait RaPostRepository {}
+
+#[autumn_web::repository(
+    RaComment,
+    table = "ra_comments",
+    hooks = RaCommentHooks,
+    dependent(PgRaReplyRepository, fk = "comment_id", on_delete = restrict)
+)]
+pub trait RaCommentRepository {}
+
+#[autumn_web::repository(RaReply, table = "ra_replies")]
+pub trait RaReplyRepository {}
+
+// ── Codex round-5-B: HOOKED self-referential chain with an IMMEDIATE self-FK ───
+//
+// `chain_nodes.parent_id` references the same table with a NON-deferrable FK, and
+// the model logs every `before_delete`. Chain Anc(1) ← I(2) ← D(3) (child's
+// parent_id points at its parent). Bulk `delete_many([D, Anc])` — a descendant
+// and its ancestor, with the intermediate NOT in the batch — must:
+//   1. remove all three rows with NO immediate FK violation (the ancestor's
+//      cascade deletes D deepest-first, before the intermediate it references), and
+//   2. fire D's `before_delete` hook EXACTLY ONCE (not once as a cascaded
+//      descendant AND once as a batch root).
+// Under the round-4 monotonic per-root seed, processing the descendant root D
+// before its ancestor pre-marked D visited, so the ancestor's cascade skipped D
+// while deleting the intermediate it still references → immediate FK; and the
+// other processing order double-fired D's hook. The round-5-B split into an
+// active-path stack + a monotonic deleted set fixes both.
+
+pub static CHAIN_DELETE_LOG: Mutex<Vec<i64>> = Mutex::new(Vec::new());
+
+#[derive(Clone, Default)]
+pub struct ChainNodeHooks;
+
+impl MutationHooks for ChainNodeHooks {
+    type Model = ChainNode;
+    type NewModel = NewChainNode;
+    type UpdateModel = UpdateChainNode;
+
+    async fn before_delete(
+        &self,
+        _ctx: &mut MutationContext,
+        record: &ChainNode,
+    ) -> AutumnResult<()> {
+        CHAIN_DELETE_LOG.lock().unwrap().push(record.id);
+        Ok(())
+    }
+}
+
+diesel::table! {
+    chain_nodes (id) {
+        id -> Int8,
+        parent_id -> Nullable<Int8>,
+        name -> Text,
+    }
+}
+
+#[autumn_web::model(table = "chain_nodes")]
+pub struct ChainNode {
+    #[id]
+    pub id: i64,
+    pub parent_id: Option<i64>,
+    pub name: String,
+}
+
+#[autumn_web::repository(
+    ChainNode,
+    table = "chain_nodes",
+    hooks = ChainNodeHooks,
+    dependent(PgChainNodeRepository, fk = "parent_id", on_delete = destroy)
+)]
+pub trait ChainNodeRepository {}
+
 // ── #1740: a HOOKED parent that also declares a dependent ─────────────────────
 //
 // All the dependent-declaring parents above are hook-free, so they exercise the
@@ -679,6 +822,12 @@ async fn setup_pool() -> (
         // (A.parent_id = B, B.parent_id = A) can exist — the bulk cascade must seed
         // the current root before recursing so the root's hook fires exactly once.
         "CREATE TABLE dep_cycle_nodes (id BIGSERIAL PRIMARY KEY, parent_id BIGINT REFERENCES dep_cycle_nodes(id) DEFERRABLE INITIALLY DEFERRED, name TEXT NOT NULL)",
+        // Codex round-5-A: post → comment (destroy, hooked) → reply (restrict).
+        "CREATE TABLE ra_posts (id BIGSERIAL PRIMARY KEY, title TEXT NOT NULL)",
+        "CREATE TABLE ra_comments (id BIGSERIAL PRIMARY KEY, post_id BIGINT NOT NULL REFERENCES ra_posts(id), body TEXT NOT NULL)",
+        "CREATE TABLE ra_replies (id BIGSERIAL PRIMARY KEY, comment_id BIGINT NOT NULL REFERENCES ra_comments(id), body TEXT NOT NULL)",
+        // Codex round-5-B: HOOKED self-referential chain with an IMMEDIATE self-FK.
+        "CREATE TABLE chain_nodes (id BIGSERIAL PRIMARY KEY, parent_id BIGINT REFERENCES chain_nodes(id), name TEXT NOT NULL)",
     ] {
         diesel::sql_query(stmt)
             .execute(&mut conn)
@@ -725,6 +874,16 @@ fn dependent_repository_surface_is_generated() {
     // cascaded child and double-fire its hook).
     assert_is_fn(<PgDepCycleNodeRepository as DepCycleNodeRepository>::delete_many);
     assert_is_fn(PgDepCycleNodeRepository::__autumn_apply_dependent_on_conn);
+    // Codex round-5-A: the post→comment(destroy,hooked)→reply(restrict) graph
+    // monomorphizes — the Destroy arm's grandchild restrict probe runs before the
+    // child before_delete hook. All three repos' cascade surfaces must type-check.
+    assert_is_fn(<PgRaPostRepository as RaPostRepository>::delete_by_id);
+    assert_is_fn(PgRaCommentRepository::__autumn_apply_dependent_on_conn);
+    assert_is_fn(PgRaReplyRepository::__autumn_apply_dependent_on_conn);
+    // Codex round-5-B: the HOOKED immediate-FK self-referential chain's bulk
+    // delete_many monomorphizes the two-structure (path + deleted) cascade.
+    assert_is_fn(<PgChainNodeRepository as ChainNodeRepository>::delete_many);
+    assert_is_fn(PgChainNodeRepository::__autumn_apply_dependent_on_conn);
     // #1740: the bulk `delete_many` path now carries the dependent cascade too;
     // monomorphize it (hooks-child parent + restrict-only parent) to prove the
     // bulk-cascade codegen type-checks without Docker.
@@ -1314,6 +1473,147 @@ async fn delete_many_self_referential_two_cycle_fires_root_hook_once() {
         log.iter().filter(|&&id| id == 2).count(),
         1,
         "round-4: the cascaded child fires once: log = {log:?}"
+    );
+}
+
+/// Codex round-5-A: deleting a `Post -> Comment(destroy, hooked) -> Reply(restrict)`
+/// graph must return the restrict 409 WITHOUT firing the comment's `before_delete`
+/// hook. The Destroy arm probes the grandchild restrict (read-only) BEFORE running
+/// the child hook, so a doomed transaction never leaves a non-transactional hook
+/// side effect behind.
+///
+/// RED under the pre-fix ordering (grandchild cascade after `before_delete`):
+/// deleting the post fired `RaComment::before_delete` and only then hit the reply
+/// restrict 409 — the hook counter would read 1. GREEN: the probe precedes the
+/// hook, so the counter stays 0.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn grandchild_restrict_blocks_before_child_before_delete_hook_fires() {
+    let (pool, _c) = setup_pool().await;
+    let mut conn = pool.get().await.expect("conn");
+
+    diesel::sql_query("INSERT INTO ra_posts (id, title) VALUES (1, 'p')")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    diesel::sql_query("INSERT INTO ra_comments (id, post_id, body) VALUES (1, 1, 'c')")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    // A reply exists → the comment's `restrict` grandchild must block the delete.
+    diesel::sql_query("INSERT INTO ra_replies (id, comment_id, body) VALUES (1, 1, 'r')")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+
+    RA_COMMENT_HOOK_FIRED.store(0, Ordering::SeqCst);
+
+    let repo = PgRaPostRepository::with_pool_untracked(pool.clone());
+    let result = repo.delete_by_id(1).await;
+    assert!(
+        result.is_err(),
+        "round-5-A: the grandchild restrict must block the post delete with a 409"
+    );
+
+    // The whole transaction rolled back — post, comment and reply all survive.
+    assert_eq!(
+        count(&mut conn, "SELECT COUNT(*) AS n FROM ra_posts").await,
+        1
+    );
+    assert_eq!(
+        count(&mut conn, "SELECT COUNT(*) AS n FROM ra_comments").await,
+        1
+    );
+    assert_eq!(
+        count(&mut conn, "SELECT COUNT(*) AS n FROM ra_replies").await,
+        1
+    );
+
+    // The crux: the comment's before_delete hook must NOT have fired — the restrict
+    // probe ran first and returned the 409 before any child hook.
+    assert_eq!(
+        // Fully-qualified `load` — `RunQueryDsl::load` is in scope and would
+        // otherwise shadow the atomic's inherent method (see DESTROYED_COMMENTS).
+        AtomicUsize::load(&RA_COMMENT_HOOK_FIRED, Ordering::SeqCst),
+        0,
+        "round-5-A: RaComment::before_delete must NOT fire when a grandchild restrict \
+         blocks the delete (probe precedes the hook)"
+    );
+}
+
+/// Codex round-5-B: bulk `delete_many([D, Anc])` over a HOOKED self-referential
+/// chain Anc(1) ← I(2) ← D(3) with an IMMEDIATE self-FK (the intermediate I is
+/// NOT in the batch) must remove all three rows with NO immediate FK violation,
+/// and fire D's `before_delete` hook EXACTLY ONCE.
+///
+/// RED under the round-4 monotonic per-root seed: if the batch processed the
+/// descendant root D before its ancestor Anc, D was pre-marked visited, so Anc's
+/// cascade skipped D while deleting the intermediate I it still references →
+/// immediate FK failure; the opposite order double-fired D's hook (once as Anc's
+/// cascaded descendant, once as a batch root). GREEN with the two-structure model:
+/// the active-path stack only blocks re-entry while on the recursion stack (so a
+/// completed descendant root no longer suppresses the ancestor's cascade → D is
+/// deleted deepest-first, no FK), and the monotonic deleted set skips any row (or
+/// batch root) already removed (so D's hook fires exactly once).
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn delete_many_self_referential_immediate_fk_chain_no_double_hook() {
+    let (pool, _c) = setup_pool().await;
+    let mut conn = pool.get().await.expect("conn");
+
+    // Insert with NULL parents first (immediate FK), then wire the chain
+    // Anc(1) ← I(2) ← D(3): each child's parent_id points at its parent.
+    for id in 1..=3 {
+        diesel::sql_query(format!(
+            "INSERT INTO chain_nodes (id, parent_id, name) VALUES ({id}, NULL, 'n{id}')"
+        ))
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    }
+    diesel::sql_query("UPDATE chain_nodes SET parent_id = 1 WHERE id = 2")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    diesel::sql_query("UPDATE chain_nodes SET parent_id = 2 WHERE id = 3")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+
+    CHAIN_DELETE_LOG.lock().unwrap().clear();
+
+    let repo = PgChainNodeRepository::with_pool_untracked(pool.clone());
+    // Batch the descendant D(3) and the ancestor Anc(1); the intermediate I(2) is
+    // deliberately absent from the id list.
+    repo.delete_many(&[3, 1])
+        .await
+        .expect("round-5-B: bulk self-ref immediate-FK chain delete must not trip the FK");
+
+    // All three rows (ancestor, intermediate, descendant) are gone.
+    assert_eq!(
+        count(&mut conn, "SELECT COUNT(*) AS n FROM chain_nodes").await,
+        0,
+        "round-5-B: the whole chain is removed with no immediate FK violation"
+    );
+
+    let log = CHAIN_DELETE_LOG.lock().unwrap().clone();
+    // Each of the three nodes fired before_delete exactly once — in particular the
+    // descendant root D(3), which is both a batch target and a cascaded descendant.
+    assert_eq!(
+        log.iter().filter(|&&id| id == 3).count(),
+        1,
+        "round-5-B: D's before_delete must fire EXACTLY once (not once-as-child + \
+         once-as-root): log = {log:?}"
+    );
+    assert_eq!(
+        log.iter().filter(|&&id| id == 2).count(),
+        1,
+        "round-5-B: the intermediate fires once: log = {log:?}"
+    );
+    assert_eq!(
+        log.iter().filter(|&&id| id == 1).count(),
+        1,
+        "round-5-B: the ancestor fires once: log = {log:?}"
     );
 }
 

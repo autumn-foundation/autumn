@@ -432,7 +432,10 @@ fn emit_dependents_impl(model_ident: &syn::Ident, assocs: &[Association]) -> Tok
                 __conn: &'__a mut ::autumn_web::reexports::diesel_async::AsyncPgConnection,
                 __parent_id: i64,
                 __parent_soft: bool,
-                __visited: &'__a mut ::std::collections::HashSet<(&'static str, i64)>,
+                // Codex round-5-B: the active recursion path (cycle-break) and the
+                // monotonic actually-deleted set, threaded through separately.
+                __path: &'__a mut ::std::collections::HashSet<(&'static str, i64)>,
+                __deleted: &'__a mut ::std::collections::HashSet<(&'static str, i64)>,
             ) -> ::autumn_web::repository::RuntimeDependentCascadeFuture<'__a> {
                 ::std::boxed::Box::pin(async move {
                     // Own the child repository inside the async block so the
@@ -448,7 +451,8 @@ fn emit_dependents_impl(model_ident: &syn::Ident, assocs: &[Association]) -> Tok
                             __parent_id,
                             ::autumn_web::repository::DependentAction::#action_variant,
                             __parent_soft,
-                            __visited,
+                            __path,
+                            __deleted,
                         )
                         .await
                 })
