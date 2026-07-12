@@ -759,6 +759,7 @@ impl Default for CsrfConfig {
 /// | `enabled` | `true` |
 /// | `field_name` | `"_submit_token"` |
 /// | `ttl_secs` | `600` (10 min) |
+/// | `in_flight_ttl_secs` | `86_400` (24 h) |
 /// | `backend` | *inherits `[idempotency].backend`* (in-memory in dev, Redis in prod) |
 /// | `exempt_paths` | `[]` |
 ///
@@ -784,6 +785,21 @@ pub struct SubmitTokenConfig {
     /// Default: `600` (10 minutes).
     #[serde(default = "default_submit_token_ttl_secs")]
     pub ttl_secs: u64,
+
+    /// Maximum stale lifetime in seconds for an in-flight submission lock.
+    ///
+    /// While a mutating request is running, its token is locked so a concurrent
+    /// retry carrying the same token is excluded until the first request records
+    /// its consumed response. The lock is released as soon as that record is
+    /// stored, so this value is only the backend safety expiry for crashes or
+    /// lost unlocks — it must be comfortably longer than any supported mutating
+    /// request duration. Deliberately **independent of `ttl_secs`** (the replay
+    /// window): lowering `ttl_secs` must never shorten how long an active
+    /// submission is excluded from re-entry, which would let a slow request's
+    /// retry acquire a fresh lock and double-execute. Default: `86_400`
+    /// (24 hours), matching `[idempotency].in_flight_ttl_secs`.
+    #[serde(default = "default_submit_token_in_flight_ttl_secs")]
+    pub in_flight_ttl_secs: u64,
 
     /// Storage backend for consumed submit tokens.
     ///
@@ -816,6 +832,7 @@ impl Default for SubmitTokenConfig {
             enabled: default_submit_token_enabled(),
             field_name: default_submit_token_field(),
             ttl_secs: default_submit_token_ttl_secs(),
+            in_flight_ttl_secs: default_submit_token_in_flight_ttl_secs(),
             backend: None,
             exempt_paths: Vec::new(),
         }
@@ -849,6 +866,10 @@ fn default_submit_token_field() -> String {
 
 const fn default_submit_token_ttl_secs() -> u64 {
     600
+}
+
+const fn default_submit_token_in_flight_ttl_secs() -> u64 {
+    86_400
 }
 
 /// Strategy for identifying which client a rate-limit bucket belongs to.

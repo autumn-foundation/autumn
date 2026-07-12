@@ -507,12 +507,18 @@ impl SubmitTokenLayer {
     #[must_use]
     pub fn new(store: Arc<dyn IdempotencyStore>, config: &SubmitTokenConfig) -> Self {
         let ttl = Duration::from_secs(config.ttl_secs);
+        // The in-flight lock TTL is a SEPARATE knob from the replay `ttl`: it
+        // must outlast any active mutating request so a slow submission's retry
+        // stays excluded until the first request records its consumed token.
+        // Deriving it from `ttl_secs` would let lowering the replay window reopen
+        // the double-execute re-entry gap (issue #1360).
+        let in_flight_ttl = Duration::from_secs(config.in_flight_ttl_secs);
         Self {
             settings: Arc::new(SubmitTokenSettings {
                 store,
                 field_name: config.field_name.clone(),
                 ttl,
-                in_flight_ttl: ttl,
+                in_flight_ttl,
                 exempt_paths: config.exempt_paths.clone(),
                 max_scan_bytes: MAX_SCAN_BYTES_CAP,
             }),
@@ -1354,6 +1360,146 @@ mod tests {
             count.load(Ordering::SeqCst),
             0,
             "the handler must never see a truncated body when the stream errors mid-read"
+        );
+    }
+
+    /// Store that records the TTL handed to `try_lock` (the in-flight lock
+    /// duration) versus `set` (the consumed-record replay window), so a test can
+    /// assert the two are governed by SEPARATE config knobs. Locking and storage
+    /// otherwise behave like the in-memory store.
+    struct TtlRecordingStore {
+        inner: MemoryIdempotencyStore,
+        lock_ttl: std::sync::Mutex<Option<Duration>>,
+        set_ttl: std::sync::Mutex<Option<Duration>>,
+    }
+
+    impl TtlRecordingStore {
+        fn new() -> Self {
+            Self {
+                inner: MemoryIdempotencyStore::new(Duration::from_secs(600)),
+                lock_ttl: std::sync::Mutex::new(None),
+                set_ttl: std::sync::Mutex::new(None),
+            }
+        }
+    }
+
+    impl IdempotencyStore for TtlRecordingStore {
+        fn get(&self, key: &str) -> Option<IdempotencyEntry> {
+            self.inner.get(key)
+        }
+
+        fn set(&self, key: &str, record: IdempotencyRecord, body_hash: Vec<u8>, ttl: Duration) {
+            *self.set_ttl.lock().unwrap() = Some(ttl);
+            self.inner.set(key, record, body_hash, ttl);
+        }
+
+        fn try_lock(&self, key: &str, lock_ttl: Duration) -> bool {
+            *self.lock_ttl.lock().unwrap() = Some(lock_ttl);
+            self.inner.try_lock(key, lock_ttl)
+        }
+
+        fn unlock(&self, key: &str) {
+            self.inner.unlock(key);
+        }
+    }
+
+    /// Finding L (decouple in-flight lock TTL from replay TTL): the in-flight
+    /// submission lock must be governed by `in_flight_ttl_secs`, NOT by the
+    /// `ttl_secs` replay window. An operator who lowers `ttl_secs` must not
+    /// shorten how long an active submission is excluded from re-entry — else a
+    /// create/update that outruns the shrunken TTL would let a retry with the
+    /// same token acquire a FRESH lock before the consumed record lands and both
+    /// requests execute the mutation.
+    #[tokio::test]
+    async fn in_flight_lock_ttl_is_decoupled_from_replay_ttl() {
+        let store = Arc::new(TtlRecordingStore::new());
+        let store_dyn: Arc<dyn IdempotencyStore> = store.clone();
+        // A deliberately tiny replay window paired with a normal in-flight TTL.
+        let config = SubmitTokenConfig {
+            enabled: true,
+            ttl_secs: 1,
+            in_flight_ttl_secs: 86_400,
+            ..Default::default()
+        };
+        let app = Router::new()
+            .route("/submit", post(|| async { "created" }))
+            .layer(SubmitTokenLayer::new(store_dyn, &config));
+
+        let resp = app.oneshot(urlencoded_post("tok-decoupled")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // The lock excluding a concurrent retry lives for the full
+        // in_flight_ttl_secs — lowering ttl_secs does NOT open the re-entry gap.
+        let lock_ttl = store
+            .lock_ttl
+            .lock()
+            .unwrap()
+            .expect("the guard must acquire an in-flight lock");
+        assert_eq!(
+            lock_ttl,
+            Duration::from_secs(86_400),
+            "the in-flight lock TTL must come from in_flight_ttl_secs, not ttl_secs"
+        );
+        // ...while the consumed-record replay window still tracks ttl_secs.
+        let set_ttl = store
+            .set_ttl
+            .lock()
+            .unwrap()
+            .expect("the guard must record the consumed token");
+        assert_eq!(
+            set_ttl,
+            Duration::from_secs(1),
+            "the consumed-record replay TTL must still come from ttl_secs"
+        );
+    }
+
+    /// Finding L (behavioural): even with a tiny replay `ttl_secs`, a token whose
+    /// submission is still in-flight (lock held, consumed record not yet stored)
+    /// excludes a retry with a `409` rather than letting it re-run the mutation.
+    #[tokio::test]
+    async fn in_flight_token_excludes_retry_with_small_replay_ttl() {
+        let store = Arc::new(MemoryIdempotencyStore::new(Duration::from_secs(600)));
+        let store_dyn: Arc<dyn IdempotencyStore> = store.clone();
+        let config = SubmitTokenConfig {
+            enabled: true,
+            ttl_secs: 1,
+            in_flight_ttl_secs: 86_400,
+            ..Default::default()
+        };
+        let count = Arc::new(AtomicUsize::new(0));
+        let count_inner = count.clone();
+        let app = Router::new()
+            .route(
+                "/submit",
+                post(move || {
+                    let count = count_inner.clone();
+                    async move {
+                        count.fetch_add(1, Ordering::SeqCst);
+                        "created"
+                    }
+                }),
+            )
+            .layer(SubmitTokenLayer::new(store_dyn, &config));
+
+        // Simulate the first request being mid-flight: hold the in-flight lock
+        // for the token key with the normal in-flight TTL, without recording a
+        // consumed response yet.
+        let token = "tok-inflight";
+        let key = storage_key(token);
+        assert!(store.try_lock(&key, Duration::from_secs(86_400)));
+
+        // A concurrent retry with the same token is rejected in-flight and never
+        // reaches the handler.
+        let resp = app.oneshot(urlencoded_post(token)).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::CONFLICT,
+            "a retry against a still-in-flight token must be excluded, not re-run"
+        );
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            0,
+            "the handler must not run for a retry held out by the in-flight lock"
         );
     }
 }
