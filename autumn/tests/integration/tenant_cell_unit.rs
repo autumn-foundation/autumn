@@ -366,3 +366,24 @@ fn many_tiny_scratch_entries_are_bounded_by_quota() {
     // With a fixed per-entry overhead, only a small number of tiny entries fit.
     assert!(n < 100, "expected quota to bound tiny-entry count, got {n}");
 }
+
+#[test]
+fn handle_caches_cell_across_mid_request_eviction() {
+    let reg = autumn_web::tenant_cell::TenantCellRegistry::new();
+    let handle =
+        autumn_web::tenant_cell::TenantCellHandle::new(reg.clone(), "t".to_string(), 1_000_000);
+
+    let cell1 = handle.cell();
+    cell1.scratch_insert("k", vec![0u8; 100]).unwrap();
+    let tracked = cell1.tracked_bytes();
+
+    // Admin evicts the tenant while the request is still in flight.
+    let _ = reg.evict("t");
+
+    // A later access in the SAME request must return the SAME cell — not a fresh
+    // empty one — so scratch state and quota usage survive to request end.
+    let cell2 = handle.cell();
+    assert!(std::sync::Arc::ptr_eq(&cell1, &cell2));
+    assert_eq!(cell2.tracked_bytes(), tracked);
+    assert_eq!(cell2.scratch_get("k").map(|v| v.len()), Some(100));
+}

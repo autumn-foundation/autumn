@@ -529,6 +529,11 @@ pub struct TenantCellHandle {
     registry: TenantCellRegistry,
     tenant_id: String,
     quota_bytes: usize,
+    /// Per-request cache of the first materialized cell. Wrapped in an `Arc` so
+    /// every clone of the same handle (the task-local copy and the copy held by
+    /// the streaming body) shares one cache; the middleware builds a fresh
+    /// handle per request, so the cache is scoped to a single request.
+    cached: Arc<std::sync::OnceLock<Arc<TenantCell>>>,
 }
 
 impl fmt::Debug for TenantCellHandle {
@@ -539,6 +544,7 @@ impl fmt::Debug for TenantCellHandle {
             .field("tenant_id", &self.tenant_id)
             .field("quota_bytes", &self.quota_bytes)
             .field("registry_cells", &self.registry.len())
+            .field("materialized", &self.cached.get().is_some())
             .finish()
     }
 }
@@ -548,20 +554,33 @@ impl TenantCellHandle {
     /// `quota_bytes` to apply if and when the cell is materialized. Building the
     /// handle does not touch the registry.
     #[must_use]
-    pub const fn new(registry: TenantCellRegistry, tenant_id: String, quota_bytes: usize) -> Self {
+    pub fn new(registry: TenantCellRegistry, tenant_id: String, quota_bytes: usize) -> Self {
         Self {
             registry,
             tenant_id,
             quota_bytes,
+            cached: Arc::new(std::sync::OnceLock::new()),
         }
     }
 
     /// Materialize (get-or-create) the tenant's cell in the registry, creating
-    /// the registry entry on first access.
+    /// the registry entry on first access, and cache it for the rest of the
+    /// request.
+    ///
+    /// The first call does the registry `get_or_create`; every subsequent call
+    /// on this handle (or any clone of it — the cache is a shared `Arc`) returns
+    /// that same `Arc<TenantCell>`. So even if the tenant is evicted from the
+    /// registry mid-request, an in-flight request keeps its cell alive and
+    /// stable to completion instead of minting a fresh empty one. Laziness is
+    /// preserved: nothing materializes until this is first called.
     #[must_use]
     pub fn cell(&self) -> Arc<TenantCell> {
-        self.registry
-            .get_or_create(&self.tenant_id, self.quota_bytes)
+        self.cached
+            .get_or_init(|| {
+                self.registry
+                    .get_or_create(&self.tenant_id, self.quota_bytes)
+            })
+            .clone()
     }
 
     /// The tenant id this handle resolves to.
