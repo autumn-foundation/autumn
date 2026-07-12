@@ -1648,7 +1648,8 @@ dir and applies the same integrity verification and production `--force` guard a
 a local restore. The transfer client is a dependency-light synchronous `SigV4`
 client streamed end-to-end (multipart above 64 MiB — S3 caps a single
 `PutObject` at 5 GiB — with a server-side `x-amz-checksum-sha256`). `autumn
-doctor` adds an informational `offsite_backup` check (see the `doctor` skill),
+doctor` adds an `offsite_backup` check that fails on an invalid configured
+destination and warns on unready credentials (see the `doctor` skill),
 and a failed upload raises a `ScheduledTaskFailure` operator alert only when an
 outbound-HTTP `[alerts]` channel (PagerDuty / Slack / Discord / signed webhook)
 is configured — an email-only `[alerts]` config is not notified (issue #1743).
