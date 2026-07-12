@@ -318,11 +318,13 @@ async fn different_keys_do_not_coalesce() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn swr_serves_stale_and_refreshes_in_background() {
-    // Floor-not-ceiling hang-guard for the two waits below (refresh-notify and
-    // publish-visibility poll). Deliberately generous: it must never trip on a
-    // slow/oversubscribed runner — only on a genuine never-publishes hang. A
-    // real windows-latest run starved the detached refresh past 30s (PR #1764),
-    // so this is set well above any plausible scheduling-starvation window.
+    // Floor-not-ceiling hang-guard for the refresh-notify wait below.
+    // Deliberately generous: it must never trip on a slow/oversubscribed runner
+    // — only on a genuine never-fires hang. A real windows-latest run starved
+    // the detached refresh past 30s (PR #1764), so this is set well above any
+    // plausible scheduling-starvation window. (The publish-visibility poll
+    // further below is bounded by attempt count, not wall-clock time — see
+    // #1809 — so it cannot elapse merely because the suite runs slow.)
     const HANG_GUARD: Duration = Duration::from_secs(120);
 
     let _guard = METRICS_LOCK.lock().await;
@@ -411,30 +413,36 @@ async fn swr_serves_stale_and_refreshes_in_background() {
     // runner can starve for many seconds (a real windows-latest run starved it
     // past 30s; see PR #1764).
     //
-    // WHY THE 120s BOUND IS A FLOOR, NOT A CEILING: under any sane load this
-    // converges in well under a second (the refresh computes in 200ms), so 120s
-    // must never trip on a merely slow/loaded runner — it exists solely to turn
-    // a genuine "publish never happens" bug (dropped/hung refresh task) into a
-    // clean failure instead of dangling until the job-level timeout. It is
-    // deliberately generous precisely so it is not schedule-sensitive; do not
-    // shrink it back toward the observed starvation window.
-    let refreshed = tokio::time::timeout(HANG_GUARD, async {
-        loop {
-            let fc = fill_count.clone();
-            let v: String = get_or_compute_with(&cache, &key, opts.clone(), move || async move {
-                fc.fetch_add(1, Ordering::SeqCst);
-                Ok::<String, String>("unexpected-refill".to_string())
-            })
-            .await
-            .unwrap();
-            if v == "v2" {
-                break v;
-            }
-            tokio::time::sleep(Duration::from_millis(25)).await;
+    // WHY THE BOUND IS ON ATTEMPTS, NOT WALL-CLOCK TIME: a fixed
+    // `tokio::time::timeout` deadline here is timing-fragile — on an
+    // oversubscribed runner the ~35-min `autumn-web` integration suite could
+    // let the deadline elapse before the refresh published, tripping
+    // `Elapsed(())` even though nothing is wrong (#1809). Instead we cap the
+    // number of *read attempts*: under load each attempt simply takes longer,
+    // but the loop still gets its full quota of retries before giving up, so it
+    // can never fail merely because the runner is slow. It still converts a
+    // genuine "publish never happens" regression (dropped/hung refresh task)
+    // into a clean failure instead of dangling until the job-level timeout. The
+    // cap is deliberately generous: under any sane load this converges in a
+    // handful of iterations (the refresh computes in 200ms), so it is not
+    // schedule-sensitive; do not swap it back for a wall-clock deadline.
+    let mut refreshed = None;
+    for _ in 0..10_000 {
+        let fc = fill_count.clone();
+        let v: String = get_or_compute_with(&cache, &key, opts.clone(), move || async move {
+            fc.fetch_add(1, Ordering::SeqCst);
+            Ok::<String, String>("unexpected-refill".to_string())
+        })
+        .await
+        .unwrap();
+        if v == "v2" {
+            refreshed = Some(v);
+            break;
         }
-    })
-    .await
-    .expect("background refresh must publish the new value after it finishes computing");
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let refreshed = refreshed
+        .expect("background refresh must publish the new value after it finishes computing");
     assert_eq!(refreshed, "v2");
 
     let after = read_through_metrics().snapshot();
