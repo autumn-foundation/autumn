@@ -1646,8 +1646,10 @@ offsite runs for the active profile; `autumn db restore
 offsite:<profile>/<timestamp|latest>` (or `--offsite`) downloads a run to a temp
 dir and applies the same integrity verification and production `--force` guard as
 a local restore. The transfer client is a dependency-light synchronous `SigV4`
-client streamed end-to-end (multipart above 64 MiB — S3 caps a single
-`PutObject` at 5 GiB — with a server-side `x-amz-checksum-sha256`). `autumn
+client streamed end-to-end (a single `PutObject` sends a server-side
+`x-amz-checksum-sha256`; above 64 MiB — S3 caps a single `PutObject` at 5 GiB —
+the artifact uploads via multipart, hashed locally and verified after
+`CompleteMultipartUpload` via HEAD/GET). `autumn
 doctor` adds an `offsite_backup` check that fails on an invalid configured
 destination and warns on unready credentials (see the `doctor` skill),
 and a failed upload raises a `ScheduledTaskFailure` operator alert only when an

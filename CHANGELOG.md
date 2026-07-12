@@ -1226,8 +1226,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (or `--offsite`) downloads a run to a temp dir and applies the same integrity
   verification and production `--force` guard as a local restore. Transfers use a
   dependency-light synchronous SigV4 S3 client streamed end-to-end to bound memory
-  (multipart above 64 MiB — S3 caps a single `PutObject` at 5 GiB — sending a
-  server-side `x-amz-checksum-sha256`); pointing the offsite bucket at the app's
+  (a single `PutObject` sends a server-side `x-amz-checksum-sha256`; above 64 MiB —
+  S3 caps a single `PutObject` at 5 GiB — the artifact uploads via multipart, hashed
+  locally and verified after `CompleteMultipartUpload` via HEAD/GET); pointing the
+  offsite bucket at the app's
   own `[storage.s3]` bucket requires the explicit `allow_shared_bucket = true`
   opt-in (issue #1619).
 - **doctor:** new `offsite_backup` check (never prints a credential value — only
