@@ -770,9 +770,9 @@ fn generate_scaffold_full_e2e_post() {
     for needle in [
         "#[get(\"/posts\")]",
         "#[get(\"/posts/{id}\")]",
-        "#[get(\"/posts/new\")]",
+        "#[get(\"/posts/new\", name = \"new\")]",
         "#[post(\"/posts\")]",
-        "#[get(\"/posts/{id}/edit\")]",
+        "#[get(\"/posts/{id}/edit\", name = \"edit\")]",
         "#[post(\"/posts/{id}/update\")]",
         "pub async fn index",
         "pub async fn show",
@@ -5050,9 +5050,9 @@ fn live_validation_emits_hx_post_and_error_slot() {
     // `required_text_input_htmx` variant.
     assert!(
         routes.contains(
-            "autumn_web::form::required_text_input_htmx(&changeset, \"title\", \"Title\", \"/posts/validate/title\")"
+            "autumn_web::form::required_text_input_htmx(&changeset, \"title\", \"Title\", &paths::validate_title())"
         ),
-        "create form must render the validated title input via required_text_input_htmx:\n{routes}"
+        "create form must render the validated title input via required_text_input_htmx with a typed path helper:\n{routes}"
     );
     // body field (not validated, but required) must use required_text_input.
     assert!(
@@ -5222,9 +5222,10 @@ fn live_scaffold_emits_live_fragment_and_broadcasts() {
         "LiveFragment impl must override insert_swap() with BeforeEnd targeting the list container:\n{repo}"
     );
     // render_fragment must include a show-page link so live rows are navigable.
+    // The URL goes through the routes module's typed path helper (issue #1133).
     assert!(
-        repo.contains("a href=(format!(\"/posts/"),
-        "render_fragment must include a show link href:\n{repo}"
+        repo.contains("a href=(crate::routes::posts::paths::show(self.id))"),
+        "render_fragment must include a show link href via the typed path helper:\n{repo}"
     );
 }
 
@@ -5245,8 +5246,8 @@ fn live_scaffold_index_uses_sse_list_and_stream_route() {
         "index list must have hx-ext=\"sse\" under --live:\n{routes}"
     );
     assert!(
-        routes.contains("sse-connect=\"/posts/events\""),
-        "index list must connect to the SSE stream endpoint:\n{routes}"
+        routes.contains("sse-connect=(paths::events())"),
+        "index list must connect to the SSE stream endpoint via the typed path helper:\n{routes}"
     );
     assert!(
         routes.contains("pub async fn events"),
