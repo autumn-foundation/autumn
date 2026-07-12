@@ -136,6 +136,30 @@ three additive scaffold behaviors (issues #1388, #1146, #1718):
   --count/--model` resolves the model's factory; `autumn destroy` removes those
   links again. See `docs/guide/generators.md`.
 
+**Constrained-required numerics & `--live-validation` parity (unreleased — trunk-dev, issues #1748, #1750)**: two refinements to the `{…}` block above:
+
+- **Blank-state for constrained required numerics** — a required numeric field
+  with a `{min,max}` range (e.g. `age:i32{min=0,max=130}`) is emitted as
+  `Option<T>` on the generated `*Form` struct with `#[validate(required,
+  range(...))]`, not the native `i32`/`i64`/`f32`/`f64`. A native numeric
+  defaults to `0` and pre-fills the input, so a blank submit used to pass both
+  `required` and `range` when the range spans zero and silently persist `0`;
+  `Option<T>` defaults to `None`, renders blank, and `required` rejects it with a
+  **422** inline error. The empty `field=` pair is also dropped by the form
+  decoder, so a blank non-browser submit yields the 422 rather than a `400`. The
+  `required` rule sits on the form struct only, never the model field; a nullable
+  numeric is already `Option<T>` and is unaffected (issue #1748).
+- **`--live-validation` HTML5 + belongs_to parity** — `--live-validation`
+  scaffolds now emit the same client-side HTML5 constraint attributes
+  (`minlength`/`maxlength`, `type="email"`/`type="url"`, numeric `min`/`max`,
+  `step="any"`, and a `<textarea>` for a constrained `Text`) and the `belongs_to`
+  parent `<select>` as the standard `form_for` path; both were previously dropped
+  on the per-field live path. Server-side `#[validate(...)]` was already enforced
+  under `--live-validation` — this only restores the client-side hints and the
+  request-time populated dropdown (with changeset-driven `selected` state), and
+  the inline-validate fragment returns identical markup so an htmx `outerHTML`
+  swap on `change` keeps the guards (issue #1750). See `docs/guide/generators.md`.
+
 ## Execution flow
 
 1. Parse the subcommand and arguments from user input.
@@ -337,6 +361,19 @@ Next steps:
    single-use, expiring login-link routes (do not name the auth resource
    `magic_link_token`).
 ```
+
+**Magic-link account-lock recheck (trunk-dev)**: the generated `POST
+/login/magic/verify` handler re-checks the account lock **(unreleased —
+trunk-dev, issue #1777)** after consuming the single-use token and before
+establishing a session, so a magic link minted before an account was locked can
+no longer complete a login after lockout. The recheck is a fresh guarded
+`UPDATE` on `locked_at` (same time-bounded `[auth.lockout]` cool-off semantics
+as password login, gated on the same `lockout_enabled` predicate — a no-op when
+lockout is disabled), re-reading the current lock state at the DB to close the
+concurrent-lock TOCTOU. It sits before the TOTP branch, so it covers both
+`--magic-link` and `--magic-link --totp`; a locked account renders the same
+generic failure page as an expired/consumed/unknown token, so there is no
+oracle.
 
 ## Flags
 

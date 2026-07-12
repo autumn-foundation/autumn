@@ -1071,6 +1071,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `on_delete` = `destroy` (soft-delete-aware, fires child hooks) | `delete_all` |
   `nullify` | `restrict` (probes for referencing rows before mutating and errors if
   any still exist) (issue #1369).
+- **macros:** `dependent(...)` cascade delete is now recursive, bulk-aware, and
+  declarable model-side. Deleting a parent that declares dependents cascades
+  into grandchildren and deeper in the same transaction — each destroyed child
+  runs its own `dependent(...)` cascade before its row is removed, with a
+  `(table, id)` cycle guard so self- or mutually-referential graphs terminate
+  instead of looping (`delete_all` stays single-level by design) (issue #1739).
+  The generated `delete_many` bulk path runs the same
+  destroy/`delete_all`/`nullify`/`restrict` cascade per affected parent inside
+  its existing transaction — restrict probes first (a `409` rolls the whole
+  batch back), then children, then the bulk parent delete — so bulk-deleting
+  parents with dependent children no longer orphans or FK-errors those rows
+  (issues #1740, #1787). Cascades can now be declared on the model with
+  `#[has_many(Child, dependent = <action>)]` / `#[has_one(...)]` (equivalently
+  `on_delete = <action>`) instead of the repository attribute: the model derive
+  emits a runtime `Model::dependents()` that the repository codegen consults
+  when no repository-side `dependent(...)` is present (the repository attribute
+  still wins when both are declared), so `#[has_many(Child, dependent =
+  destroy)]` drives the same transactional cascade — grandchild recursion and
+  the `delete_many` bulk path included — with no repository attribute required.
+  This model form ships for `destroy`, `delete_all`, `nullify`, and `restrict`
+  (grandchild recursion and the `delete_many` bulk path included), driving the
+  same runtime cascade as the repository attribute; only both-sites conflict
+  diagnostics are a deferred follow-up — when both a repository-side
+  `dependent(...)` and a model-side `dependent`/`on_delete` are declared the
+  repository attribute silently wins — and a `dependent`/`on_delete` on a
+  `through = <join_table>` association is a directed compile error rather than a
+  mis-targeted cascade (issue #1738). See `docs/guide/repositories.md`.
 - **audit:** version/audit writes are auto-attributed to the current actor. A new
   `autumn_web::current` module carries a request-scoped actor
   (`Current::set_actor` / `Current::actor`, plus `Current::set_default_actor` for
@@ -1181,6 +1208,179 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   address, then follow redirects with per-hop resolve→validate→pin and an
   https→http downgrade guard. New `ClientError` variants `SsrfBlocked`,
   `TooManyRedirects`, `RedirectRejected`, `InvalidUrl` (issues #1238, #1239).
+- **db:** offsite S3 backups — `autumn db backup --upload` (or
+  `[backup.offsite] auto_upload = true`) now uploads each completed local run to
+  an S3-compatible offsite destination (AWS S3, MinIO, Cloudflare R2, Backblaze
+  B2, Garage) *after* local integrity verification passes, then HEAD/GET-verifies
+  every remote object matches the local file before reporting success; a
+  local-good / upload-failed run exits non-zero with an unambiguous split-outcome
+  message and leaves the local artifact intact. Configure the destination in
+  `autumn.toml` under `[backup.offsite]` / `[backup.offsite.s3]` (`bucket`,
+  `region`, `endpoint`, `force_path_style`, `prefix`, `keep`,
+  `allow_shared_bucket`, and credential *indirection* via `access_key_id_env` /
+  `secret_access_key_env` — the secret values never live in config, argv, logs, or
+  errors), with `AUTUMN_BACKUP__OFFSITE__*` env overrides (e.g.
+  `AUTUMN_BACKUP__OFFSITE__S3__BUCKET`) and profile overlays
+  (`[profile.prod.backup.offsite]`). Objects are keyed
+  `{prefix}/{profile}/{timestamp}-{token}/{file}` — the remote run id appends a
+  short unique token to the timestamp so same-second backups of one profile from
+  different hosts never collide; independent remote retention
+  (`keep = N`) prunes older uploaded runs only after a verified upload (never the
+  just-uploaded run). New `autumn db offsite list` shows the offsite runs for the
+  active profile (printing the full `{timestamp}-{token}` run id), and `autumn db
+  restore offsite:<profile>/<run-id|latest>` (or `--offsite`) downloads a run to a
+  temp dir and applies the same integrity verification and production `--force`
+  guard as a local restore. The selector accepts the full `{timestamp}-{token}`
+  run id (exact), a bare `{timestamp}` (works only when it uniquely identifies one
+  run — otherwise it errors and lists the candidates), or `latest` (newest
+  complete run). Transfers use a
+  dependency-light synchronous SigV4 S3 client streamed end-to-end to bound memory
+  (a single `PutObject` sends a server-side `x-amz-checksum-sha256`; above 64 MiB —
+  S3 caps a single `PutObject` at 5 GiB — the artifact uploads via multipart, hashed
+  locally and verified after `CompleteMultipartUpload` via HEAD/GET); pointing the
+  offsite bucket at the app's
+  own `[storage.s3]` bucket at the same endpoint requires the explicit
+  `allow_shared_bucket = true` opt-in (issue #1619).
+- **doctor:** new `offsite_backup` check (never prints a credential value — only
+  env-var names / booleans). It Passes when no `[backup.offsite]` destination is
+  configured, or when a configured destination is complete. It **Fails** on an
+  invalid configured destination — `[backup.offsite]` set without
+  `backup.offsite.s3.bucket`, or a destination that reuses the app's
+  `[storage.s3]` bucket at the same endpoint without
+  `backup.offsite.allow_shared_bucket = true`. It **Warns** when the bucket is set
+  but the named credential env vars are not ready (unset name, or the variable is
+  not exported) (issue #1619).
+- **alerts:** a failed `autumn db backup` offsite upload now raises a
+  `ScheduledTaskFailure` operator alert (dedup key
+  `scheduled_task_failure:db-backup-offsite-upload`, title "Offsite backup upload
+  failed") through the outbound-HTTP `[alerts]` channels only (PagerDuty / Slack /
+  Discord + signed webhook), so an unattended/cron backup never fails its upload
+  silently. Email is intentionally excluded — an email-only `[alerts]` config
+  builds no channels here and is not notified. Delivery is best-effort on a
+  short-lived runtime and can never change the command's exit code; with no
+  outbound-HTTP `[alerts]` channel configured no channels are built, so the
+  interactive case (message + non-zero exit) is unchanged (issue #1743).
+- **ci:** the offsite-backup disaster-recovery round-trip
+  (`autumn-cli/tests/integration/offsite_backup.rs`) now runs in GitHub Actions —
+  `cargo test -p autumn-cli --test cli_tests -- --ignored offsite` drives
+  seed → `autumn db backup --upload` → restore-from-offsite → row-level equality
+  against real MinIO + Postgres testcontainers. The Docker-dependent Linux step
+  installs `postgresql-client` (so the host `pg_dump`/`pg_restore` that `autumn db
+  backup` shells out to are on PATH) and gains `timeout-minutes: 30`; the
+  round-trip stays in the existing Docker-dependent step rather than a new
+  required gate (issue #1744).
+- **scaffold:** a scaffolded required numeric field carrying a `{min,max}` range
+  constraint (issue #1388) is now emitted as `Option<T>` on the generated
+  `*Form` struct with `#[validate(required, range(...))]` instead of the native
+  `i32`/`i64`/`f32`/`f64`. A native numeric defaults to `0`, which pre-fills the
+  input, so a blank submission used to pass both the HTML `required` attribute
+  and the server-side `range` rule whenever the declared range spans the type's
+  zero default (e.g. `age:i32{min=0,max=130}`), silently coercing the field to
+  `0`. `Option<T>::default()` is `None`, so the input renders blank; `required`
+  rejects `None` with a **422** inline error and `range` still validates the
+  inner value when `Some`. `into_new` unwraps the validated `Some(_)` (a missing
+  value is a bad request naming the field), `from_row` wraps a persisted native
+  value in `Some`, and the empty `field=` pair is dropped by the form decoder so
+  a blank non-browser submit surfaces the 422 rather than a `400` from parsing
+  `""`. The `required` rule lands only on the form struct, never on the
+  native-typed model field (issue #1748).
+- **scaffold:** `--live-validation` scaffolds now emit the client-side HTML5
+  constraint attributes (`minlength`/`maxlength`, `type="email"`/`type="url"`,
+  numeric `min`/`max`, `step="any"`, and a `<textarea>` for a constrained `Text`
+  column) and the `belongs_to` parent `<select>`, both of which the per-field
+  live path previously dropped — the #1388 client-side hints were only emitted on
+  the standard `form_for` path, and `reference_fields` was zeroed out under
+  `--live-validation`, so a `references` field leaked out as a plain text input.
+  The live path now renders DSL-constrained `String`/`Text`/numeric fields and
+  the reference dropdown as raw Maud markup carrying the same HTML5 attributes and
+  ARIA/inline-error skeleton the standard path produces; the reference option
+  loaders are threaded into the new/edit form bodies (and the 422 re-render
+  branches) so the `<select>` is populated at request time with changeset-driven
+  `selected` state, and the inline-validate handlers return the identical
+  constrained fragment so an htmx `outerHTML` swap on `change` no longer sheds the
+  client-side guards. Server-side `#[validate(...)]` was already applied under
+  `--live-validation`; this restores only the client-side HTML5 hints and the
+  parent dropdown (issue #1750).
+- **actuator:** backend-derived `/actuator/jobs` queue gauges on the durable
+  backends. On Postgres/Redis the per-queue `depth` / `oldest_waiting_age_ms`
+  and the per-job-type `queued` counters are now surveyed from the durable store
+  and wholesale-replace this process's local enqueue marks each tick, so an
+  enqueue-only `web` replica reports the true shared backlog instead of its own
+  ever-growing local marks; a queue absent from the latest survey resets to
+  `depth` 0, so stale backlog never leaks between ticks. The Redis survey runs
+  every 2s (the interval doubles as the gauge cache TTL) and pages the entire
+  due-delayed ZSET so scheduled/retry bursts are counted exactly, emitting a
+  single `warn!` if a pathological backlog is truncated at the scan cap. The
+  `local` backend keeps its in-process mark path unchanged (issue #1752).
+- **doctor:** topology-aware queue-coverage (`jobs_queue_coverage`). Declare the
+  fleet's worker tiers under
+  `[jobs.fleet] tiers = [["critical"], ["bulk", "default"]]` (each inner array is
+  one `worker` tier's `jobs.pin`; an empty array is an unpinned tier that drains
+  every queue) and doctor proves coverage topology-wide. When a needed queue —
+  the configured `[jobs.queues]` unioned with the `#[job(queue = "…")]`-declared
+  set — is drained by no tier anywhere, the check is a hard `Fail`, so a normal
+  `autumn doctor` run exits non-zero on that gap (not only `--strict`, which is
+  the stricter mode that also escalates warnings). A valid multi-tier subset
+  split no longer false-positives. The job-declared set is resolved from
+  `[jobs.fleet] manifest = "<path>"` (a `queues = [...]` manifest the app emits)
+  or an inline `[jobs.fleet] declared_queues = ["…"]`. Absent `[jobs.fleet]` the
+  check stays informational-only, exactly as before, so no existing deployment
+  regresses (issue #1756).
+- **cli:** `autumn jobs manifest <path>` emits the running app's effective
+  drained-queue manifest. It compiles the app (debug profile) and runs it under
+  `AUTUMN_DUMP_JOBS=1` to capture the ground-truth drained-queue set — the
+  configured `[jobs.queues]` unioned with every `#[job(queue = "…")]`-declared
+  queue, including synthesized durable-listener queues — without binding a port
+  or touching a database, then writes a TOML `queues = [...]` document to
+  `<path>`. `autumn doctor` consumes it via `[jobs.fleet] manifest = "<path>"`,
+  so the topology coverage check sees exactly what the runtime drains rather than
+  a hand-maintained list. `--package` / `--bin` select the target in a
+  workspace, and the captured stdout is validated as a TOML `queues` string
+  array before it is written (issue #1756).
+- **tenancy:** per-tenant in-process memory cells — each resolved tenant gets a
+  `TenantCell`, a byte-accounting boundary with a soft memory quota and an owned
+  scratch buffer, minted lazily by the process-wide `TenantCellRegistry` on the
+  first call to `current_tenant_cell()`, so routes that never touch tenant
+  memory allocate no cell. `try_charge(n)` reserves bytes against the quota and
+  returns a `Charge` RAII guard that releases them on drop; the per-tenant
+  scratch store (`scratch_insert`/`scratch_get`/`scratch_remove`) is charged by
+  allocation capacity plus a fixed per-entry overhead. A charge that would
+  exceed the quota fails only the offending tenant's request with `QuotaExceeded`
+  → HTTP **503 Service Unavailable**, leaving every other tenant's independent
+  counter untouched; `TenantCellRegistry::evict` deterministically reclaims a
+  cell's tracked footprint on `Drop` while an in-flight request keeps its cached
+  cell to completion. Configure under `[tenancy]` with `quota_bytes` (`0`, the
+  default, disables the quota). Follow-ups add bounded (`max_cells`, LRU) and
+  idle (`idle_ttl_secs`) registry eviction, enforced lazily on cell insert, plus
+  a reusable `evict_idle_older_than` primitive (issue #1792); store the soft
+  quota atomically and refresh a resident cell from the configured value on every
+  access via `set_quota_bytes`, so a future config-reload path can retune it
+  without rebuilding cells (issue #1783); and make the entire `[tenancy]` section
+  settable from the environment through `AUTUMN_TENANCY__*` — including
+  `AUTUMN_TENANCY__QUOTA_BYTES`, `AUTUMN_TENANCY__MAX_CELLS`,
+  `AUTUMN_TENANCY__IDLE_TTL_SECS`, and `AUTUMN_TENANCY__JWT_SECRET` (issue #1793)
+  (issues #1766, #1792, #1783, #1793).
+- **alerts:** native `PagerDuty` / Slack / Discord alert transports, built on
+  the `AlertChannel` fan-out seam from #1610 with no change to the core alert
+  pipeline. Configure any of them under `[alerts]`: `pagerduty_routing_key`
+  (Events API v2 integration key; optional `pagerduty_url` to target a
+  PagerDuty-Events-compatible endpoint), `slack_webhook_url`, and
+  `discord_webhook_url` (delivered via Discord's Slack-compatible endpoint —
+  append `/slack`), each with an `AUTUMN_ALERTS__*` env override. PagerDuty
+  events correlate on the alert's stable `dedup_key`, so a repeating condition
+  folds into one incident and an autumn-side recovery auto-resolves it.
+  Per-channel severity routing via `pagerduty_severities` / `slack_severities` /
+  `discord_severities` (`"all"`, the default, or `"critical"` to page on failure
+  but stay quiet on recovery); an alert below a channel's threshold is never
+  delivered to it. Slack/Discord webhook URLs must be absolute `https`
+  (validated at config load and by `autumn doctor`); the outbound alert sends
+  only validate URL shape and do not run through the SSRF deny-list, so restrict
+  alert destinations to trusted operator-configured URLs. `autumn alert test
+  [--channel <name>]` fires a synthetic alert through each configured
+  outbound-HTTP channel and reports per-channel success/error, and `autumn
+  doctor` gained an `alert_transports` check that (in production) flags a
+  whitespace-mangled routing key, a non-absolute `pagerduty_url`, or a
+  non-absolute-`https` Slack/Discord URL (issue #1630).
 
 ### Fixed
 
@@ -1277,9 +1477,91 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unsupported values instead of a confusing generic parse failure (issue #1702);
   `across_tenants()` rejects a query with no shard set instead of silently
   running it unsharded (issue #1692).
+- **repository:** a sharded, tenant-scoped repository built without a shard set
+  (e.g. via `with_pool_untracked`) now rejects `across_tenants()` reads across
+  the whole read family instead of silently returning a partial single-pool
+  result. `find_all`, `find_by_id`, `exists_by_id`, the derived `find_by_*`,
+  `with_deleted`, and `only_deleted` previously fanned out only when a shard set
+  was present and otherwise bound a `NULL` tenant predicate against just the
+  current pool, returning an incomplete result; each now returns a "requires a
+  configured shard set" `bad_request`, matching the `count`/batch guard from
+  #1692 (covers both the owned- and borrowed-param derived-read branches)
+  (issue #1741).
 - **scaffold:** scaffolded views now render through the shared application
   layout instead of a bare standalone page, and flash rendering was migrated to
   the shared flash helper (issues #1130, #1240).
+- **config:** `[backup.offsite]` is no longer materialized from optional-only
+  environment keys. A bare `AUTUMN_BACKUP__OFFSITE__S3__REGION` (or `ENDPOINT`,
+  `FORCE_PATH_STYLE`, `PREFIX`, `KEEP`) with no bucket or credential-env names
+  used to create an otherwise-empty section that then failed validation /
+  `autumn doctor --strict` with "backup.offsite.s3.bucket is unset". The
+  materializing trigger set is now limited to the keys a working upload genuinely
+  requires — `BUCKET`, `ACCESS_KEY_ID_ENV`, `SECRET_ACCESS_KEY_ENV` (plus a truthy
+  `AUTO_UPLOAD`) — while the optional keys are still applied once the section is
+  materialized by a required key (issue #1791).
+- **db:** offsite upload now deletes a just-written remote object when its
+  post-upload verification fails. Because `put_file_and_verify` writes the object
+  *before* its HEAD/GET verification, a verify failure (or a transient read during
+  verify) could leave a corrupt/partial object in the bucket; both the single-
+  `PutObject` and multipart paths now route their final verify through a shared
+  `verify_or_delete` helper that best-effort `DeleteObject`s the key on any verify
+  error before returning the original (loud, non-zero) verify error — a failed
+  delete is logged but never masks it (issue #1760).
+- **security:** the generated magic-link verify handler (`POST
+  /login/magic/verify`) now re-checks the account lock before establishing a
+  session. A magic link minted before an account was locked previously bypassed
+  the lockout policy — the handler consumed the single-use token and logged the
+  user in without re-checking `locked_at`. It now runs a fresh guarded `UPDATE`
+  on `locked_at` (the same time-bounded `[auth.lockout]` cool-off semantics as
+  password login, gated on `lockout_enabled`, a no-op when lockout is disabled)
+  that re-reads the current lock state at the DB — closing the concurrent-lock
+  TOCTOU against the earlier in-memory row — and rejects when the account is
+  actively locked. The recheck sits before the TOTP branch, covering both
+  `--magic-link` and `--magic-link --totp`, and a locked account renders the
+  same generic failure page as an expired/consumed/unknown token, so there is
+  no oracle distinguishing "locked" from "bad link" (issue #1777).
+- **macros:** `#[autumn_web::model]` / `#[repository]` now derive table
+  names with rule-based English inflection instead of naively appending
+  `s`, so `Category` maps to `categories` (matching the CLI scaffold's
+  `pluralize_word`) rather than a nonexistent `categorys` schema module
+  that failed to compile (E0433). Only the last snake_case segment is
+  pluralized (`blog_post` → `blog_posts`), irregulars
+  (`person` → `people`), sibilant endings (`+es`) and consonant-`y`
+  (`+ies`) are handled, and the `has_many` default accessor plus the
+  `add_`/`remove_` m2m helpers use the same rule — the latter derived from
+  the target type's singular so `categories` still yields `add_category`,
+  not `add_categorie`. The `#[model(table = "...")]` escape hatch is
+  unchanged (issue #1753).
+- **security:** the generated auth scaffold no longer grants step-up
+  "sudo mode" when a session is restored from a remember-me cookie. A
+  long-lived persistent cookie is not strong authentication, so
+  `establish_remember_login` no longer stamps `set_last_strong_auth_at`,
+  and because `rotate_id()` preserves session data it now actively clears
+  any stale elevation carried over from a prior authenticated state in the
+  same browser — both `last_strong_auth_at` (`STEP_UP_SESSION_KEY`) and the
+  reauth flow's `reauth_pw_ok` marker. This forces `#[step_up]` routes
+  (e.g. account deletion) to redirect to `/reauth` for a fresh password
+  check, closing a path where a stolen or unattended remember cookie could
+  silently pass elevated routes (issue #1397).
+- **openapi:** `extract_path_params` no longer emits phantom or
+  brace-carrying parameter names for escaped, regex-constrained, or
+  unbalanced-brace route patterns during spec generation. Escaped literal
+  braces (`{{hello}}`) now yield no parameter, `:constraint` suffixes are
+  stripped to the bare name (`{id:[0-9]{1,3}}` → `id`), and a brace-free
+  guard drops malformed candidates (`{a{b}` → none), keeping the emitted
+  list brace-free. This path is `openapi`-only; routing is unaffected since
+  matchit rejects such patterns at registration (issue #1721).
+- **http:** htmx positional and `innerHTML` out-of-band swaps now render a
+  `<div>` carrier instead of `<template>`, so `HtmxFragments` fragments
+  sent via `oob_with_strategy` with `OobSwap::{BeforeBegin, AfterBegin,
+  BeforeEnd, AfterEnd, InnerHTML}` actually land in the DOM. htmx applies
+  these swaps by iterating the carrier's `childNodes`, which are empty for
+  a `<template>` (its children live in `.content`); element-replacing swaps
+  (`true` / `outerHTML`) keep the `<template>` carrier htmx unwraps by id.
+  A fragment passed to a child-node-inserting swap must be a valid direct
+  child of a `<div>` — a bare `<tr>`/`<td>`/`<tbody>`/`<option>`/`<col>` is
+  foster-parented out and vanishes; use the element-replacing path with the
+  id on the row for table-row swaps (issue #1688).
 
 ### Changed
 
@@ -1339,6 +1621,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   compiler diagnostics when a rebuild fails, instead of leaving a blank or stale
   page — injected under the strict nonce-based CSP and cleared on the next
   successful rebuild (issue #1115).
+- **macros:** partial updates now validate the effective **merged model** (the
+  existing row ∪ the patch, after normalization) on the `from_patch` update path,
+  not only the patch struct's own fields. `#[model]` derives `validator::Validate`
+  on the read model (gated on `has_validation`, symmetric with the `New*`/
+  `Update*` models) and keeps the full field `#[validate(...)]` set there, and the
+  generated `from_patch` validates the reconstructed concrete model before
+  returning the draft — before `before_update`, mirroring create (validate before
+  `before_create`). Because the merged model's fields are concrete `T` rather than
+  `Patch<T>`, validators that cannot be enforced on `Patch<T>` — `ip` on `Option`
+  fields and `does_not_contain` (E0119 trait-coherence walls under validator
+  `0.20`) and the cross-field `custom`/`must_match`/`nested` (no single-field
+  `Patch<T>` trait) — are now enforced on update too, returning the same **422**
+  field-error map as create. This covers every update path that builds a draft via
+  `from_patch` (repositories with `hooks = ...` and their `--api` handlers); the
+  blind `__to_changeset` paths (plain/`api`/`policy` repositories without hooks)
+  still run only the patch-struct validators (follow-up: issue #1801). The
+  `Patch<T>` per-field impls and the `UpdateModel` denylist are unchanged, so the
+  change is backward compatible (issue #1778).
+- **cli:** the magic-link login flow scaffolded by `autumn generate auth
+  --magic-link` now sources its token lifetime and per-email cooldown from
+  `autumn.toml` instead of hard-coded `const`s, so operators can tune them
+  without editing the generated handler. New `[auth.magic_link]` section on
+  `AuthConfig`: `ttl_minutes` (default `15`; keep it ≤ 15 to bound a leaked
+  link's blast radius) and `email_cooldown_secs` (default `60`; the per-email
+  re-mint throttle). Both are unsigned, so a negative value in `autumn.toml`
+  now fails deserialization rather than silently minting expired tokens or
+  defeating the email-bomb throttle (issue #1737).
 
 ### Fixed
 
