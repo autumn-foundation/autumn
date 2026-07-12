@@ -1372,8 +1372,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Per-channel severity routing via `pagerduty_severities` / `slack_severities` /
   `discord_severities` (`"all"`, the default, or `"critical"` to page on failure
   but stay quiet on recovery); an alert below a channel's threshold is never
-  delivered to it. All outbound calls reuse the SSRF-hardened HTTP client and
-  Slack/Discord webhooks require absolute `https`. `autumn alert test
+  delivered to it. Slack/Discord webhook URLs must be absolute `https`
+  (validated at config load and by `autumn doctor`); the outbound alert sends
+  only validate URL shape and do not run through the SSRF deny-list, so restrict
+  alert destinations to trusted operator-configured URLs. `autumn alert test
   [--channel <name>]` fires a synthetic alert through each configured
   outbound-HTTP channel and reports per-channel success/error, and `autumn
   doctor` gained an `alert_transports` check that (in production) flags a

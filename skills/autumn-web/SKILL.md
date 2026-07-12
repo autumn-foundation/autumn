@@ -1229,8 +1229,11 @@ discord_severities = "all"
 - **Per-channel severity routing** — `*_severities = "critical"` sends only
   firing alerts (recoveries suppressed); `"all"` (default) sends both. An alert
   below a channel's threshold is never delivered to it (`AlertChannel::accepts_severity`).
-- All outbound calls reuse the SSRF-hardened HTTP client and stay off the
-  request path. A native transport counts as a destination, so configuring one
+- Outbound alert sends stay off the request path (dispatched best-effort on a
+  background runtime task). Slack/Discord webhook URLs must be absolute `https`,
+  but the sends only validate URL shape and do not run through the SSRF
+  deny-list, so restrict alert destinations to trusted operator-configured URLs.
+  A native transport counts as a destination, so configuring one
   satisfies `autumn doctor --strict` without `[alerts] email`/`webhook_url`.
 - `autumn alert test [--channel <name>]` fires a synthetic alert through each
   configured outbound-HTTP channel (email is excluded) and reports per-channel
