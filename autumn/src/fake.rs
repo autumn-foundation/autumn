@@ -726,3 +726,14 @@ static DOMAINS: &[&str] = &[
     "stark.io",
     "wayne.net",
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn int_range_boundary() {
+        assert_eq!(int_range(5, 5), 5);
+        assert_eq!(int_range(10, 5), 10);
+    }
+}

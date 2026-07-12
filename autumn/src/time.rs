@@ -301,10 +301,35 @@ mod tests {
     }
 
     #[test]
+    fn clock_unix_secs_exact_epoch() {
+        let epoch = Utc.with_ymd_and_hms(1970, 1, 1, 0, 0, 0).unwrap();
+        let clock = FixedClock::at(epoch);
+        assert_eq!(clock_unix_secs(&clock), 0);
+    }
+
+    #[test]
     fn clock_unix_duration_zero_for_pre_epoch() {
         // Chrono timestamps before the epoch should not underflow.
         let pre_epoch = Utc.with_ymd_and_hms(1969, 12, 31, 23, 59, 59).unwrap();
         let clock = FixedClock::at(pre_epoch);
         assert_eq!(clock_unix_duration(&clock), std::time::Duration::ZERO);
+    }
+
+    #[test]
+    fn clock_unix_duration_exact_epoch_with_nanos() {
+        // Test exact epoch with some nanos to ensure the true branch logic is exercised
+        let epoch_with_nanos = Utc.with_ymd_and_hms(1970, 1, 1, 0, 0, 0).unwrap() + chrono::Duration::nanoseconds(100);
+        let clock = FixedClock::at(epoch_with_nanos);
+        assert_eq!(clock_unix_duration(&clock), std::time::Duration::from_nanos(100));
+    }
+
+    #[test]
+    fn clock_unix_duration_post_epoch() {
+        let post_epoch = Utc.with_ymd_and_hms(1970, 1, 1, 0, 0, 1).unwrap();
+        let clock = FixedClock::at(post_epoch);
+        assert_eq!(
+            clock_unix_duration(&clock),
+            std::time::Duration::from_secs(1)
+        );
     }
 }
