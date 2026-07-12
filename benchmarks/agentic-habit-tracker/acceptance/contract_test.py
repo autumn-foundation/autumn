@@ -152,8 +152,10 @@ def run():
     check("complete returns date", "date" in comp)
     check("complete returns current_streak", "current_streak" in comp)
 
-    # duplicate same-day -> 409
-    r = request("POST", f"/api/habits/{hid}/complete", {"date": iso(datetime.date.today())})
+    # duplicate same-day -> 409 (reuse the server-returned completion date so
+    # we collide on the same day even across a midnight boundary)
+    completed_date = comp.get("date") if isinstance(comp, dict) and "date" in comp else iso(datetime.date.today())
+    r = request("POST", f"/api/habits/{hid}/complete", {"date": completed_date})
     check("POST duplicate same-day -> 409", r.status == 409, f"got {r.status}")
 
     # invalid date -> 4xx

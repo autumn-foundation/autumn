@@ -145,7 +145,8 @@ def run():
     if hid is not None:
         r = request("POST", f"/api/habits/{hid}/complete", {})  # default = today
         check("(c) default complete -> 201", r.status == 201, f"got {r.status}")
-        r = request("POST", f"/api/habits/{hid}/complete", {"date": day(0)})  # explicit today
+        completed_date = r.json().get("date") if r.status == 201 else day(0)
+        r = request("POST", f"/api/habits/{hid}/complete", {"date": completed_date})  # explicit today
         check("(c) explicit-today duplicate -> 409", r.status == 409, f"got {r.status}")
 
     # (d) yesterday only -> streak 1 (yesterday counts as current)

@@ -107,9 +107,9 @@ Mark the habit as completed for a calendar day.
 - Request body: `{"date": "YYYY-MM-DD"?}` — `date` is **optional**; when omitted
   it defaults to **today** (server date).
 - Success: **201 Created** with `{"date": "YYYY-MM-DD", "current_streak": int}`
-  where `date` is the completed day and `current_streak` is recomputed per §3
-  **as of the completed date is NOT used** — the streak returned here is the
-  current streak as of today (server date), consistent with `GET`.
+  where `date` is the completed day and `current_streak` is the current streak
+  as of today (server date), consistent with `GET` (i.e., the completed date
+  itself is NOT used as the reference date for the streak calculation).
 - Duplicate: completing the **same habit** for the **same date** twice MUST
   return **409 Conflict**. This holds whether the two calls use an explicit
   `date` or the default (today) — they collide if they resolve to the same day.

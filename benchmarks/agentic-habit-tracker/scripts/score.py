@@ -69,10 +69,10 @@ def score_speed(m):
 
 def score_correctness(m):
     vis = safe_ratio(
-        m.get("visible_checks_passed", 0), m.get("visible_checks_total", 0)
+        m.get("visible_checks_passed") or 0, m.get("visible_checks_total") or 0
     )
     hid = safe_ratio(
-        m.get("hidden_checks_passed", 0), m.get("hidden_checks_total", 0)
+        m.get("hidden_checks_passed") or 0, m.get("hidden_checks_total") or 0
     )
     score = round((VISIBLE_WEIGHT * vis + HIDDEN_WEIGHT * hid) * 100.0, 1)
     return {
@@ -125,9 +125,9 @@ def main():
 
     print("== CORRECTNESS ==")
     print(f"  visible_pass_rate  : {correctness['visible_pass_rate']:.3f}"
-          f"  ({m.get('visible_checks_passed', 0)}/{m.get('visible_checks_total', 0)})")
+          f"  ({m.get('visible_checks_passed') or 0}/{m.get('visible_checks_total') or 0})")
     print(f"  hidden_pass_rate   : {correctness['hidden_pass_rate']:.3f}"
-          f"  ({m.get('hidden_checks_passed', 0)}/{m.get('hidden_checks_total', 0)})")
+          f"  ({m.get('hidden_checks_passed') or 0}/{m.get('hidden_checks_total') or 0})")
     print(f"  weighting          : visible {int(VISIBLE_WEIGHT*100)}% / hidden {int(HIDDEN_WEIGHT*100)}%")
     print(f"  CORRECTNESS        : {correctness['score']:.1f} / 100  [{bar(correctness['score'])}]")
     print()
