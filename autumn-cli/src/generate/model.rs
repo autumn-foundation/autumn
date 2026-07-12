@@ -1359,6 +1359,22 @@ pub fn parse_model_metadata(
         metadata.defaults.insert(field_name.to_owned(), sql);
     }
 
+    // Full-text search's generated `search_page` (in the repository macro)
+    // hardcodes an `i64`/`BigInt` primary key: it collects `SearchId { id: i64 }`
+    // rows into a `Vec<i64>`, filters with `id.eq_any(&ids)`, and dedups through
+    // a `HashMap<i64, _>`. A non-`i64` primary key (e.g. `--id uuid`) would make
+    // those `id` operations type-mismatch, so the generated repository would fail
+    // to compile. Reject the combination up front — before any files are written
+    // — rather than emitting broken code.
+    if !options.searchable.is_empty() && options.id_type != IdType::BigSerial {
+        return Err(GenerateError::Config(format!(
+            "`--searchable` requires an i64 (bigint) primary key; full-text search does not \
+             yet support `{}` ids (the repository's `search_page` is hardcoded to `i64`). \
+             Re-run without `--searchable`, or use the default `--id bigint` primary key.",
+            options.id_type.rust_type()
+        )));
+    }
+
     // Full-text search config (issue #1319). Only text (`String`/`Text`) fields
     // can populate a `tsvector`; a non-text field would emit a model that fails
     // to compile against the `#[searchable]` macro and a migration Postgres
@@ -1381,7 +1397,7 @@ pub fn parse_model_metadata(
                 field.rust_type()
             )));
         }
-        let weight = [b'A', b'B', b'C', b'D'][i.min(3)] as char;
+        let weight = b"ABCD"[i.min(3)] as char;
         metadata.searchable.push((field_name.to_owned(), weight));
     }
     if !metadata.searchable.is_empty() {
@@ -2438,6 +2454,53 @@ mod tests {
             metadata.defaults().get("amount").map(String::as_str),
             Some("1.500")
         );
+    }
+
+    /// Issue #1319: the repository macro's `search_page` is hardcoded to an
+    /// `i64`/`BigInt` primary key (`SearchId { id: i64 }`, `Vec<i64>`,
+    /// `id.eq_any(&ids)`, `HashMap<i64, _>`), so pairing `--searchable` with a
+    /// non-i64 (uuid) key would emit a repository that fails to compile.
+    /// `parse_model_metadata` rejects the combination directly, independent of
+    /// the scaffold command's broader uuid gate.
+    #[test]
+    fn searchable_with_uuid_primary_key_is_rejected() {
+        let fields = parse_fields(&["title:String".into(), "body:Text".into()]).unwrap();
+        let err = parse_model_metadata(
+            &fields,
+            &ModelOptions {
+                searchable: vec!["title".into(), "body".into()],
+                id_type: IdType::Uuid,
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            matches!(err, GenerateError::Config(_)),
+            "expected Config error, got: {err:?}"
+        );
+        assert!(
+            msg.contains("--searchable")
+                && (msg.contains("i64") || msg.contains("bigint"))
+                && msg.contains("uuid::Uuid"),
+            "error must explain the i64-primary-key requirement and name the uuid type: {msg}"
+        );
+    }
+
+    /// A uuid primary key WITHOUT `--searchable` stays valid (the guard only
+    /// fires when full-text search is requested).
+    #[test]
+    fn uuid_primary_key_without_searchable_is_accepted() {
+        let fields = parse_fields(&["title:String".into()]).unwrap();
+        let metadata = parse_model_metadata(
+            &fields,
+            &ModelOptions {
+                id_type: IdType::Uuid,
+                ..Default::default()
+            },
+        )
+        .expect("uuid without --searchable must be accepted");
+        assert!(metadata.searchable().is_empty());
     }
 
     #[test]

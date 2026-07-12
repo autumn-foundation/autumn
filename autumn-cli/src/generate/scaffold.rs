@@ -2365,21 +2365,23 @@ fn render_routes_file(
 
     let list_render = if live { &live_ul_render } else { &table_render };
     // The list + pager block the index handler renders. When searchable (AC3),
-    // this becomes an `active_search` box wired to `GET /{plural}/search` sitting
-    // above the live `#{plural}-search-results` container that htmx swaps into.
-    // The initial `{list_render}` + pager render server-side *inside* that
-    // container, so the first paint needs no extra AJAX round-trip (no
-    // `.initial_load()`) and non-JavaScript visitors still see the full list.
-    // The shared `crate::layout` does not load htmx, so an htmx `<script>` is
-    // inlined here. When not searchable (or a live variant), it is exactly the
-    // previous `{list_render}` + `pagination_nav` pair — byte-for-byte identical
-    // (AC4).
+    // this becomes an `active_search_input` box wired to `GET /{plural}/search`
+    // sitting above the single `#{plural}-search-results` container that htmx
+    // swaps into. We use the input-only `active_search_input` (not the composite
+    // `active_search`, which would render its OWN empty `#{plural}-search-results`
+    // container and produce a duplicate id) and render one container ourselves,
+    // seeded with the initial `{list_render}` + pager server-side — so the first
+    // paint needs no extra AJAX round-trip (no `.initial_load()`) and
+    // non-JavaScript visitors still see the full list. The shared `crate::layout`
+    // does not load htmx, so an htmx `<script>` is inlined here. When not
+    // searchable (or a live variant), it is exactly the previous `{list_render}`
+    // + `pagination_nav` pair — byte-for-byte identical (AC4).
     let pager_line =
-        format!(r#"(pagination_nav(&page_data, &PagerOptions::new(&paths::index())))"#);
+        r"(pagination_nav(&page_data, &PagerOptions::new(&paths::index())))".to_string();
     let index_list_block = if search_enabled {
         format!(
             "script src=(autumn_web::htmx::HTMX_JS_PATH) {{}}\n        \
-             (autumn_web::widgets::active_search(\"{snake_name}-search\", \"Search {pascal_name}s\", \
+             (autumn_web::widgets::active_search_input(\"{snake_name}-search\", \"Search {pascal_name}s\", \
              &autumn_web::widgets::ActiveSearchConfig::new(\"/{plural}/search\", \"#{plural}-search-results\")\
              .placeholder(\"Search {pascal_name}s…\")))\n        \
              div id=\"{plural}-search-results\" {{\n            {list_render}\n            {pager_line}\n        }}"
@@ -9087,6 +9089,46 @@ async fn main() {
         );
     }
 
+    /// Issue #1319: a `--searchable` scaffold with a uuid primary key is
+    /// rejected before any files are written. The scaffold command already gates
+    /// off ALL uuid primary keys (the `#[repository]` REST API is i64-only), so
+    /// this combination surfaces that broader gate; a metadata-layer guard in
+    /// `parse_model_metadata` (see `model.rs`) is the defense-in-depth backstop
+    /// specific to the FTS `search_page` i64 hardcoding.
+    #[test]
+    fn searchable_with_uuid_primary_key_is_rejected() {
+        let tmp = project_with_main(default_main());
+        let err = plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "body:Text".into()],
+            "20260427000000",
+            &ScaffoldOptions {
+                model: ModelOptions {
+                    searchable: vec!["title".into(), "body".into()],
+                    id_type: IdType::Uuid,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, GenerateError::Config(_)),
+            "expected Config error, got: {err:?}"
+        );
+        assert!(
+            err.to_string().to_lowercase().contains("uuid"),
+            "error must name uuid as unsupported: {err}"
+        );
+        // No files written: the scaffold plan fails before touching the tree.
+        assert!(
+            !tmp.path().join("src/models/post.rs").exists()
+                && !tmp.path().join("src/repositories/post.rs").exists(),
+            "rejected uuid+searchable scaffold must not write any files"
+        );
+    }
+
     /// Issue #1319 AC5: naming a field that does not exist in `--searchable`
     /// fails generation with a clear error.
     #[test]
@@ -9166,19 +9208,32 @@ async fn main() {
         );
 
         let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+        // Input-only `active_search_input` (the composite `active_search` would
+        // render its own empty results container — a duplicate id).
         assert!(
-            routes.contains("active_search(\"post-search\"")
+            routes.contains("active_search_input(\"post-search\"")
+                && !routes.contains("widgets::active_search(\"post-search\"")
                 && routes.contains("\"/posts/search\", \"#posts-search-results\""),
-            "index must render the search input wired to the results route: {routes}"
+            "index must render the input-only search box wired to the results route: {routes}"
         );
         // The `active_search` target must exist as a real element that renders
         // the initial list server-side (no `.initial_load()` AJAX round-trip, no
-        // `<noscript>` fallback wrapper).
+        // `<noscript>` fallback wrapper), exactly once on the index page.
         assert!(
             routes.contains("div id=\"posts-search-results\"")
                 && !routes.contains(".initial_load(")
                 && !routes.contains("noscript"),
             "index must render the results container server-side without initial_load/noscript: {routes}"
+        );
+        let index_fn = routes
+            .split("pub async fn index(")
+            .nth(1)
+            .and_then(|s| s.split("pub async fn ").next())
+            .expect("an index handler must be emitted");
+        assert_eq!(
+            index_fn.matches("id=\"posts-search-results\"").count(),
+            1,
+            "the index page must render the results container exactly once: {index_fn}"
         );
         assert!(
             routes.contains("pub async fn search(")
@@ -9261,7 +9316,9 @@ async fn main() {
         .unwrap();
         let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
         assert!(
-            !routes.contains("active_search(") && !routes.contains("pub async fn search("),
+            !routes.contains("active_search(")
+                && !routes.contains("active_search_input(")
+                && !routes.contains("pub async fn search("),
             "live variant must not emit a search box: {routes}"
         );
         let repo = fs::read_to_string(tmp.path().join("src/repositories/post.rs")).unwrap();

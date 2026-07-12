@@ -136,9 +136,12 @@ fn search_vector_is_not_in_schema_or_struct() {
 fn index_renders_search_box_wired_to_results_route() {
     let (_tmp, project) = searchable_project();
     let routes = fs::read_to_string(project.join("src/routes/posts.rs")).unwrap();
+    // The input-only `active_search_input` is used (not the composite
+    // `active_search`, which renders its own results container — a duplicate id).
     assert!(
-        routes.contains("active_search(\"post-search\""),
-        "index must render the active_search widget:\n{routes}"
+        routes.contains("active_search_input(\"post-search\"")
+            && !routes.contains("widgets::active_search(\"post-search\""),
+        "index must render the input-only active_search widget:\n{routes}"
     );
     assert!(
         routes.contains("ActiveSearchConfig::new(\"/posts/search\", \"#posts-search-results\")"),
@@ -157,6 +160,19 @@ fn index_renders_search_box_wired_to_results_route() {
     assert!(
         !routes.contains(".initial_load(") && !routes.contains("noscript"),
         "search index must not use initial_load/noscript:\n{routes}"
+    );
+    // The results container id must appear EXACTLY ONCE on the index page: the
+    // composite `active_search` widget rendered a second, empty one, so htmx
+    // swapped into that stale container instead of the seeded list.
+    let index_fn = routes
+        .split("pub async fn index(")
+        .nth(1)
+        .and_then(|s| s.split("pub async fn ").next())
+        .expect("an index handler must be emitted");
+    assert_eq!(
+        index_fn.matches("id=\"posts-search-results\"").count(),
+        1,
+        "the index page must render the results container exactly once:\n{index_fn}"
     );
 }
 
