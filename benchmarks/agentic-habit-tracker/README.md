@@ -27,6 +27,9 @@ acceptance/contract_test.py visible acceptance tests (run against a live server)
 hidden/
   HIDDEN_TESTS.md           high-level description of what the hidden suite probes
   hidden_test.py            the actual hidden checks (not shown to the agent)
+phase2/
+  archive_test.py           visible phase-2 archive acceptance tests
+  archive_hidden_test.py    hidden phase-2 archive checks (not shown to the agent)
 scripts/score.py            deterministic scorer (reads metrics.json)
 runs/                       one subdir per trial (see runs/README.md)
 ```
@@ -83,7 +86,20 @@ status codes, and streak semantics are pinned in `SPEC.md`.
    single number. It is deterministic: same `metrics.json` in, same output out.
 
 For phase 2, repeat steps 2-7 with `prompts/phase2_maintenance.md` against the
-phase-1 app, recording a second `metrics.json` with `"phase": 2`.
+phase-1 app, recording a second `metrics.json` with `"phase": 2`. Phase-2
+**correctness** is scored by the dedicated archive suites, not by the phase-1
+tests — run them against the modified app:
+
+```sh
+BASE_URL=http://localhost:8080 python3 phase2/archive_test.py         # visible
+BASE_URL=http://localhost:8080 python3 phase2/archive_hidden_test.py  # hidden
+```
+
+The `RESULT: X/Y passed` lines from these two suites feed the phase-2
+`visible_checks_*` / `hidden_checks_*` metrics. In **addition**, re-run the
+phase-1 suites (`acceptance/contract_test.py` and `hidden/hidden_test.py`) as a
+regression check — the maintenance change must not break any phase-1 behavior —
+but phase-2 correctness itself is measured by the archive suites above.
 
 ## Requirements
 

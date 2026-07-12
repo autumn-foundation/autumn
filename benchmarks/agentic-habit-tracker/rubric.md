@@ -62,8 +62,13 @@ Each framework can be run in two phases (see `README.md`):
   (archived habits) applied to the phase-1 app.
 
 Score each phase separately with its own `metrics.json` (the `phase` field
-distinguishes them). Phase 2 especially exercises the maintainability axis: how
-small and idiomatic the change is, and whether existing tests keep passing.
+distinguishes them). Phase-2 correctness is measured the same way as phase 1 —
+visible + hidden pass rates — but backed by the dedicated archive suites
+(`phase2/archive_test.py` visible, `phase2/archive_hidden_test.py` hidden), which
+actually exercise the archive endpoint and list filtering rather than only
+re-running the phase-1 tests. Phase 2 especially exercises the maintainability
+axis: how small and idiomatic the change is, and whether existing tests keep
+passing.
 
 ## Determinism
 

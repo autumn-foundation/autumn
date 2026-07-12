@@ -40,3 +40,12 @@ The hidden suite probes:
 
 These are enforced by `hidden_test.py`, which is not provided to the building
 agent during a trial.
+
+## Phase-2 hidden checks (archived habits)
+
+A separate hidden suite (`phase2/archive_hidden_test.py`) probes the phase-2
+archive feature, again without publishing exact values. At a high level it checks
+that a newly created habit defaults to active, that archiving is idempotent, that
+the archived-vs-active listings stay consistent, and that streak computation
+still works correctly for an archived habit. Like the phase-1 hidden suite it is
+not shown to the building agent during a trial.

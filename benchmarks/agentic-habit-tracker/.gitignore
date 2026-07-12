@@ -2,6 +2,7 @@
 # The harness is Python, so re-include its checked-in scripts here.
 !acceptance/*.py
 !hidden/*.py
+!phase2/*.py
 !scripts/*.py
 
 # Generated per-run artifacts must never be committed.

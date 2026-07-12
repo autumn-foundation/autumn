@@ -11,13 +11,25 @@ Autumn-specific facts you need to build it.
 Autumn is a batteries-included Rust web framework (`autumn-web`) built on axum,
 Diesel/`diesel-async` (Postgres), and Maud for HTML.
 
-- **Dependency.** In-repo path dependency — in your app `Cargo.toml`:
+- **Dependency.** Depend on the in-repo Autumn crate. This benchmark lives at
+  `<repo-root>/benchmarks/agentic-habit-tracker/` and the crate is at
+  `<repo-root>/autumn`. Discover the repo root with
+  `git rev-parse --show-toplevel` — do **not** hardcode an absolute home path
+  such as one under `/home/.../autumn`. From
+  your app at `runs/<id>/app/`, that crate is five levels up
+  (`app` → `<id>` → `runs` → `agentic-habit-tracker` → `benchmarks` →
+  repo root, then into `autumn/`), so use the relative path
+  `path = "../../../../../autumn"`. You may instead use an **absolute** path to
+  this checkout's `autumn/` directory, or depend on the published crate
+  (`autumn-web = "0.6"`). In your app `Cargo.toml`:
   ```toml
   [package]
   edition = "2024"
 
   [dependencies]
-  autumn-web = { path = "/home/user/autumn/autumn", features = ["seed"] }
+  # Relative path from runs/<id>/app/ to <repo-root>/autumn (five levels up).
+  # Or use an absolute path from `git rev-parse --show-toplevel`, or `autumn-web = "0.6"`.
+  autumn-web = { path = "../../../../../autumn", features = ["seed"] }
   diesel = { version = "2", features = ["postgres", "chrono"] }
   diesel-async = { version = "0.9", features = ["postgres"] }
   diesel_migrations = "2"
@@ -29,7 +41,7 @@ Diesel/`diesel-async` (Postgres), and Maud for HTML.
   validator = { version = "0.20", features = ["derive"] }
 
   [dev-dependencies]
-  autumn-web = { path = "/home/user/autumn/autumn", features = ["test-support"] }
+  autumn-web = { path = "../../../../../autumn", features = ["test-support"] }
   ```
 
 - **Routes.** Handlers are annotated with `#[get("/path")]` / `#[post("/path")]`
@@ -107,18 +119,47 @@ Diesel/`diesel-async` (Postgres), and Maud for HTML.
   drives your router in-process so you can assert on JSON responses. Write
   integration tests under `tests/`.
 
-## Scaffolding options
+## Scaffolding (recommended first)
 
-- Fastest: **copy `/home/user/autumn/examples/todo-app`** as a starting point and
-  adapt it — it already wires migrations, a Diesel model, Maud HTML routes, JSON
-  API routes, `Json<T>`, validation, a `seed` bin, and `TestApp`/`TestDb` tests.
-  `/home/user/autumn/examples/bookmarks` is a second, simpler reference.
-- Or scaffold a fresh app with the CLI:
-  `cargo run -p autumn-cli -- new habit-tracker` (run from `/home/user/autumn`).
+**Fastest path — scaffold with the CLI, then fill in the streak logic and the
+JSON contract.** Hand-building by copying `examples/` is the fallback. All CLI
+commands can be run in-repo via `cargo run -p autumn-cli -- <args>` (run from the
+repo root — find it with `git rev-parse --show-toplevel`); if `autumn` is on your
+`PATH`, `autumn <args>` is equivalent.
+
+- **Create the app.** `autumn new habit-tracker` scaffolds a fresh project
+  (minimal base by default). Pass `--starter <name>` to start from a curated
+  starter, and `--list-starters` to see what's available. In-repo:
+  `cargo run -p autumn-cli -- new habit-tracker`.
+- **Scaffold a resource in one step.**
+  `autumn generate scaffold Habit name:String description:Text` generates the
+  `#[model]` struct, a Diesel migration, a `#[repository]`, HTML routes, and a
+  smoke test, and registers the new routes in `src/main.rs`. Field DSL supports
+  `name:Type`, `field:references` (FK), `field:Type:unique`, `enum{a,b,c}`, and
+  `Option<...>`; `--api` emits a JSON-only resource. Narrower generators exist
+  too: `autumn generate model|migration|task|job|mailer ...`. In-repo:
+  `cargo run -p autumn-cli -- generate scaffold Habit name:String description:Text`.
+- **Iterate and verify.** `autumn dev` runs the dev server with hot reload
+  (watch mode); `autumn migrate` runs pending migrations; `autumn test`
+  provisions the test database, migrates it, and runs `cargo test`.
+
+After scaffolding, adapt the generated code to match the exact JSON contract in
+`SPEC.md` (status codes, the `complete`/streak endpoints, and the
+`current_streak`/`history` computation are yours to implement — the scaffold
+won't produce them verbatim).
+
+## Reference examples (fallback: hand-build)
+
+- **Copy `examples/todo-app`** (at the repo root of this checkout —
+  `<repo-root>/examples/todo-app`; the repo root is discoverable via
+  `git rev-parse --show-toplevel`) as a starting point and adapt it — it already
+  wires migrations, a Diesel model, Maud HTML routes, JSON API routes, `Json<T>`,
+  validation, a `seed` bin, and `TestApp`/`TestDb` tests. `<repo-root>/examples/bookmarks`
+  is a second, simpler reference.
 
 Study those two examples — `todo-app` and `bookmarks` — for the canonical
 Autumn patterns before writing code. Do not invent APIs; mirror what the
-examples do.
+examples (and the CLI-generated scaffold) do.
 
 ## run.sh
 
