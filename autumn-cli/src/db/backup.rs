@@ -2133,12 +2133,13 @@ fn upload_run(
     for file in &files {
         let path = run_dir.join(file);
         let key = offsite_object_key(&offsite.prefix, profile, run_id, file);
-        // `put_file_and_verify` WRITES the object BEFORE its HEAD/GET verification,
-        // so even a verify failure can leave the object (incl. the run manifest) in
-        // the bucket. Record the key up-front, then on ANY failure best-effort
-        // delete everything this run wrote — manifest first — so a run whose upload
-        // was reported FAILED never keeps a remote `manifest.json` and can't become
-        // `latest` or consume a retention slot (restores the P2 #2 invariant; #21).
+        // `put_file_and_verify` now self-cleans the single key it just wrote on a
+        // verify failure (#1760). This run-level cleanup is still needed for the
+        // OTHER keys written EARLIER in the run: record every key up-front, then on
+        // ANY failure best-effort delete everything this run wrote — manifest first
+        // — so a run whose upload was reported FAILED never keeps a remote
+        // `manifest.json` and can't become `latest` or consume a retention slot
+        // (restores the P2 #2 invariant; #21).
         written_keys.push(key.clone());
         // Stream the file straight from disk (hash pre-pass + streamed body):
         // a multi-GB dump is never read into memory.
