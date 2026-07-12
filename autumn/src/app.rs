@@ -2597,6 +2597,16 @@ impl AppBuilder {
             return;
         }
 
+        // ── Jobs manifest dump mode ────────────────────────────────────
+        // When AUTUMN_DUMP_JOBS=1, print the effective drained-queue manifest
+        // (TOML `queues = [...]`) and exit. Triggered by `autumn jobs manifest`
+        // so a topology-aware `autumn doctor` sees exactly what the runtime
+        // drains without booting the server or connecting to a database.
+        if is_dump_jobs_mode() {
+            self.run_dump_jobs_mode().await;
+            return;
+        }
+
         if is_list_one_off_tasks_mode() {
             self.run_list_one_off_tasks_mode();
             return;
@@ -4330,6 +4340,30 @@ impl AppBuilder {
         std::process::exit(0);
     }
 
+    /// Dump the effective drained-queue manifest as TOML and exit.
+    ///
+    /// Triggered when `AUTUMN_DUMP_JOBS=1` is set (by `autumn jobs manifest`).
+    /// Emits a single top-level `queues = [...]` array — the configured
+    /// `[jobs.queues]` set unioned with every `#[job(queue = "…")]`-declared
+    /// queue, ordered highest priority first exactly as the runtime drains — so a
+    /// topology-aware `autumn doctor` consumes the ground-truth set the app runs
+    /// with. Does not connect to a database or bind a TCP port. Always exits 0.
+    async fn run_dump_jobs_mode(self) {
+        let Self {
+            jobs,
+            config_loader_factory,
+            telemetry_provider,
+            ..
+        } = self;
+
+        let (config, _telemetry_guard) =
+            load_config_and_telemetry(config_loader_factory, telemetry_provider).await;
+
+        let manifest = crate::job::render_jobs_manifest(&config.jobs.queues, &jobs);
+        print!("{manifest}");
+        std::process::exit(0);
+    }
+
     /// Dump registered one-off tasks as JSON and exit.
     ///
     /// Triggered by `AUTUMN_LIST_TASKS=1` from `autumn task --list`.
@@ -4715,6 +4749,10 @@ fn exit_stop_managed_pg() {
 
 pub(crate) fn is_dump_routes_mode() -> bool {
     std::env::var("AUTUMN_DUMP_ROUTES").as_deref() == Ok("1")
+}
+
+pub(crate) fn is_dump_jobs_mode() -> bool {
+    std::env::var("AUTUMN_DUMP_JOBS").as_deref() == Ok("1")
 }
 
 pub(crate) fn is_list_one_off_tasks_mode() -> bool {

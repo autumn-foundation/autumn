@@ -21,6 +21,7 @@ mod flags;
 mod generate;
 mod http;
 mod i18n;
+mod jobs;
 mod maintenance;
 mod migrate;
 mod monitor;
@@ -70,6 +71,30 @@ pub enum I18nSubcommands {
         /// Treat untranslated/unused warnings as failures (exit non-zero).
         #[arg(long)]
         strict: bool,
+    },
+}
+
+/// Subcommands for `autumn jobs`.
+#[derive(Subcommand, Clone, Debug, PartialEq, Eq)]
+pub enum JobsSubcommands {
+    /// Emit the effective drained-queue manifest the running app declares.
+    ///
+    /// Compiles the application (debug profile) and runs it under
+    /// `AUTUMN_DUMP_JOBS=1` to capture the ground-truth drained-queue set — the
+    /// configured `[jobs.queues]` unioned with every `#[job(queue = "…")]`-declared
+    /// queue — without starting the HTTP server or connecting to a database.
+    /// Writes a TOML `queues = [...]` document to `<path>`, which `autumn doctor`
+    /// consumes via `[jobs.fleet] manifest = "<path>"`.
+    Manifest {
+        /// Path to write the manifest to (e.g. `target/jobs-manifest.toml`).
+        #[arg(value_name = "PATH")]
+        path: String,
+        /// Package to inspect (for workspaces).
+        #[arg(short, long)]
+        package: Option<String>,
+        /// Binary target to inspect (for packages with multiple bin targets).
+        #[arg(long, value_name = "BIN")]
+        bin: Option<String>,
     },
 }
 
@@ -554,6 +579,12 @@ enum Commands {
     I18n {
         #[command(subcommand)]
         action: I18nSubcommands,
+    },
+
+    /// Inspect the application's background jobs.
+    Jobs {
+        #[command(subcommand)]
+        action: JobsSubcommands,
     },
 
     /// Run conformance checks against a plugin's route contributions.
@@ -2736,6 +2767,15 @@ fn run_command(command: Commands) {
                     }
                 };
                 i18n::run(i18n::I18nCheckOptions { format, strict });
+            }
+        },
+        Commands::Jobs { action } => match action {
+            JobsSubcommands::Manifest { path, package, bin } => {
+                jobs::run(&jobs::ManifestOptions {
+                    package: package.as_deref(),
+                    bin: bin.as_deref(),
+                    output: &path,
+                });
             }
         },
         Commands::PluginCheck {
@@ -4993,6 +5033,31 @@ mod tests {
                 assert!(user_only);
             }
             _ => panic!("expected Routes command"),
+        }
+    }
+
+    #[test]
+    fn parse_jobs_manifest_with_path_and_flags() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "jobs",
+            "manifest",
+            "target/jobs-manifest.toml",
+            "--package",
+            "myapp",
+            "--bin",
+            "server",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Jobs {
+                action: JobsSubcommands::Manifest { path, package, bin },
+            } => {
+                assert_eq!(path, "target/jobs-manifest.toml");
+                assert_eq!(package.as_deref(), Some("myapp"));
+                assert_eq!(bin.as_deref(), Some("server"));
+            }
+            _ => panic!("expected Jobs manifest command"),
         }
     }
 

@@ -3727,20 +3727,31 @@ fn warn_pinned_uncovered_queues(uncovered: &[String], pin: &[String], schedule_e
     }
 }
 
-/// Distinct queue names declared by the registered jobs.
-fn collect_declared_queues(jobs_by_name: &Arc<RwLock<HashMap<String, JobInfo>>>) -> Vec<String> {
+/// Distinct queue names declared by the given jobs, in first-seen order.
+///
+/// The single source of the job-declared queue set: both the runtime drain-plan
+/// path (via [`collect_declared_queues`], over the `Arc<RwLock<…>>` registry) and
+/// the `autumn jobs manifest` emitter (via [`effective_drained_queues_from_jobs`],
+/// over the builder's `Vec<JobInfo>`) funnel through here, so the emitted manifest
+/// can never drift from what the runtime actually drains.
+fn collect_declared_queues_from_jobs<'a>(
+    jobs: impl IntoIterator<Item = &'a JobInfo>,
+) -> Vec<String> {
     let mut seen = std::collections::HashSet::new();
     let mut queues = Vec::new();
-    {
-        let guard = jobs_by_name.read().expect("job registry lock poisoned");
-        for job in guard.values() {
-            let name = normalize_queue_name(&job.queue);
-            if seen.insert(name.clone()) {
-                queues.push(name);
-            }
+    for job in jobs {
+        let name = normalize_queue_name(&job.queue);
+        if seen.insert(name.clone()) {
+            queues.push(name);
         }
     }
     queues
+}
+
+/// Distinct queue names declared by the registered jobs.
+fn collect_declared_queues(jobs_by_name: &Arc<RwLock<HashMap<String, JobInfo>>>) -> Vec<String> {
+    let guard = jobs_by_name.read().expect("job registry lock poisoned");
+    collect_declared_queues_from_jobs(guard.values())
 }
 
 /// The full set of queue names this worker actually drains: the configured
@@ -3753,16 +3764,56 @@ fn collect_declared_queues(jobs_by_name: &Arc<RwLock<HashMap<String, JobInfo>>>)
 /// job-declared queues. It reuses [`QueueSchedule::effective`] and
 /// [`collect_declared_queues`] so it can never drift from the real drain plan.
 ///
-/// follow-up (#1756): expose this through an `autumn jobs manifest` subcommand
-/// that writes these names to the manifest path doctor consumes; today an app can
-/// emit them itself (or declare them inline under `[jobs.fleet]`).
+/// Exposed through the `autumn jobs manifest` subcommand, which runs the app
+/// under `AUTUMN_DUMP_JOBS=1` and writes these names to the manifest path doctor
+/// consumes (via [`render_jobs_manifest`]); an app can also declare them inline
+/// under `[jobs.fleet]`.
 #[cfg_attr(not(test), allow(dead_code))]
 fn effective_drained_queues(
     cfg: &crate::config::JobQueuesConfig,
     jobs_by_name: &Arc<RwLock<HashMap<String, JobInfo>>>,
 ) -> Vec<String> {
-    let declared = collect_declared_queues(jobs_by_name);
-    QueueSchedule::effective(cfg, &declared).0.names()
+    effective_drained_queues_from_declared(cfg, &collect_declared_queues(jobs_by_name))
+}
+
+/// The effective drained-queue set computed from an already-collected declared
+/// list. Shared tail of both [`effective_drained_queues`] (runtime registry) and
+/// [`render_jobs_manifest`] (builder job slice) so the union logic lives once.
+fn effective_drained_queues_from_declared(
+    cfg: &crate::config::JobQueuesConfig,
+    declared: &[String],
+) -> Vec<String> {
+    QueueSchedule::effective(cfg, declared).0.names()
+}
+
+/// The full set of queue names the running app would drain, computed directly
+/// from the builder's `Vec<JobInfo>` (the `autumn jobs manifest` emit path holds
+/// the raw job slice, not the runtime's `Arc<RwLock<…>>` registry). Reuses the
+/// exact union logic the runtime uses so the emitted manifest can never drift.
+fn effective_drained_queues_from_jobs(
+    cfg: &crate::config::JobQueuesConfig,
+    jobs: &[JobInfo],
+) -> Vec<String> {
+    effective_drained_queues_from_declared(cfg, &collect_declared_queues_from_jobs(jobs))
+}
+
+/// Serialize the ground-truth drained-queue set (#1756) as the TOML manifest
+/// `autumn doctor` consumes: a single top-level `queues = [...]` array, ordered
+/// highest priority first exactly as the runtime drains. Emitted to stdout by
+/// `AUTUMN_DUMP_JOBS=1` and read back by doctor's `resolve_declared_queues`.
+pub(crate) fn render_jobs_manifest(
+    cfg: &crate::config::JobQueuesConfig,
+    jobs: &[JobInfo],
+) -> String {
+    #[derive(serde::Serialize)]
+    struct JobsManifest {
+        queues: Vec<String>,
+    }
+    let manifest = JobsManifest {
+        queues: effective_drained_queues_from_jobs(cfg, jobs),
+    };
+    toml::to_string(&manifest)
+        .expect("jobs manifest is a plain string array; serialization is infallible")
 }
 
 const LOCAL_QUEUE_WARN_THRESHOLD: usize = 10_000;
@@ -18254,6 +18305,42 @@ mod queue_schedule_tests {
         let cfg = JobQueuesConfig::strict_list(["critical"]);
         let drained = effective_drained_queues(&cfg, &registry);
         assert_eq!(drained, vec!["critical".to_string(), "email".to_string()]);
+    }
+
+    #[test]
+    fn jobs_manifest_renders_effective_drained_queues() {
+        // The `autumn jobs manifest` emit path holds the builder's `Vec<JobInfo>`,
+        // not the runtime registry, so it computes the same effective set through
+        // `effective_drained_queues_from_jobs` and serializes it as the exact TOML
+        // doctor's `resolve_declared_queues` reads back: `queues = [...]`.
+        fn handler(
+            _state: AppState,
+            _payload: Value,
+        ) -> Pin<Box<dyn Future<Output = AutumnResult<()>> + Send + 'static>> {
+            Box::pin(async move { Ok(()) })
+        }
+        let jobs = vec![JobInfo {
+            version: 1,
+            name: "emailer".to_string(),
+            max_attempts: 1,
+            initial_backoff_ms: 1,
+            queue: "email".to_string(),
+            uniqueness: None,
+            concurrency: None,
+            handler,
+        }];
+        let cfg = JobQueuesConfig::strict_list(["critical"]);
+
+        // The computed set matches the runtime drain plan exactly.
+        assert_eq!(
+            effective_drained_queues_from_jobs(&cfg, &jobs),
+            vec!["critical".to_string(), "email".to_string()]
+        );
+
+        // And it serializes to the precise manifest shape doctor consumes,
+        // highest-priority first with a trailing newline.
+        let manifest = render_jobs_manifest(&cfg, &jobs);
+        assert_eq!(manifest, "queues = [\"critical\", \"email\"]\n");
     }
 
     // ── Queue pinning (#1623, AC3/AC4) ──────────────────────────────────────
