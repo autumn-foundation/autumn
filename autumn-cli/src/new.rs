@@ -1230,6 +1230,34 @@ mod tests {
     }
 
     #[test]
+    fn generated_build_rs_prefers_build_arg_provenance_over_git() {
+        // Issue #1676: containerized builds exclude `/.git` from the build
+        // context, so the generated build.rs must prefer `AUTUMN_BUILD_*` build
+        // args (Docker `--build-arg`/`ENV` passthrough) when set, falling back
+        // to git only for local checkout builds. Without this, production images
+        // report `git.*` as `null` on `/actuator/info`.
+        let tmp = TempDir::new().unwrap();
+        generate("build-arg-provenance-check", tmp.path()).unwrap();
+
+        let content =
+            fs::read_to_string(tmp.path().join("build-arg-provenance-check/build.rs")).unwrap();
+        // A dedicated helper reads the passthrough env vars.
+        assert!(content.contains("fn build_arg("));
+        // Each git field prefers the build arg, then falls back to git.
+        assert!(content.contains("build_arg(\"AUTUMN_BUILD_GIT_SHA\").or_else(|| git("));
+        assert!(content.contains("build_arg(\"AUTUMN_BUILD_GIT_SHA_SHORT\")"));
+        assert!(content.contains("build_arg(\"AUTUMN_BUILD_GIT_BRANCH\")"));
+        assert!(content.contains("build_arg(\"AUTUMN_BUILD_GIT_DIRTY\")"));
+        // Timestamp passthrough wins over the computed timestamp.
+        assert!(
+            content
+                .contains("build_arg(\"AUTUMN_BUILD_TIMESTAMP\").unwrap_or_else(build_timestamp)")
+        );
+        // Re-run when a passthrough build arg changes so deploys re-bake it.
+        assert!(content.contains("cargo:rerun-if-env-changed={var}"));
+    }
+
+    #[test]
     fn no_unsubstituted_placeholders() {
         let tmp = TempDir::new().unwrap();
         generate("placeholder-check", tmp.path()).unwrap();

@@ -43,6 +43,28 @@ RUN cargo install diesel_cli \
     --no-default-features \
     --features postgres
 
+# Git/build provenance passthrough. The build context excludes `/.git` (see
+# .dockerignore), so the generated build.rs cannot shell out to git here.
+# Supply provenance explicitly and surface it as ENV, which build.rs prefers
+# over git and bakes into the binary for `/actuator/info`. Populate from CI, e.g:
+#   docker build \
+#     --build-arg AUTUMN_BUILD_GIT_SHA=$(git rev-parse HEAD) \
+#     --build-arg AUTUMN_BUILD_GIT_SHA_SHORT=$(git rev-parse --short HEAD) \
+#     --build-arg AUTUMN_BUILD_GIT_BRANCH=$(git rev-parse --abbrev-ref HEAD) \
+#     --build-arg AUTUMN_BUILD_GIT_DIRTY=false \
+#     --build-arg AUTUMN_BUILD_TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ) .
+# Unset args stay empty and are ignored, so `/actuator/info` reports `null`.
+ARG AUTUMN_BUILD_GIT_SHA=
+ARG AUTUMN_BUILD_GIT_SHA_SHORT=
+ARG AUTUMN_BUILD_GIT_BRANCH=
+ARG AUTUMN_BUILD_GIT_DIRTY=
+ARG AUTUMN_BUILD_TIMESTAMP=
+ENV AUTUMN_BUILD_GIT_SHA=${AUTUMN_BUILD_GIT_SHA} \
+    AUTUMN_BUILD_GIT_SHA_SHORT=${AUTUMN_BUILD_GIT_SHA_SHORT} \
+    AUTUMN_BUILD_GIT_BRANCH=${AUTUMN_BUILD_GIT_BRANCH} \
+    AUTUMN_BUILD_GIT_DIRTY=${AUTUMN_BUILD_GIT_DIRTY} \
+    AUTUMN_BUILD_TIMESTAMP=${AUTUMN_BUILD_TIMESTAMP}
+
 COPY . .
 {{build_step}}
 

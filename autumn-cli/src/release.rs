@@ -435,6 +435,49 @@ mod tests {
     }
 
     #[test]
+    fn dockerfile_passes_through_git_provenance_build_args() {
+        // Issue #1676: the build context excludes `/.git`, so the release
+        // Dockerfile must surface the `AUTUMN_BUILD_*` provenance as build-arg
+        // ENV before the build step. Otherwise the generated build.rs finds no
+        // git repo and the container reports `git.*` as `null` on
+        // `/actuator/info`, defeating deploy/rollback verification.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::Default, false).unwrap();
+        let content = fs::read_to_string(dir.join("Dockerfile")).unwrap();
+
+        for arg in [
+            "AUTUMN_BUILD_GIT_SHA",
+            "AUTUMN_BUILD_GIT_SHA_SHORT",
+            "AUTUMN_BUILD_GIT_BRANCH",
+            "AUTUMN_BUILD_GIT_DIRTY",
+            "AUTUMN_BUILD_TIMESTAMP",
+        ] {
+            assert!(
+                content.contains(&format!("ARG {arg}")),
+                "Dockerfile must declare `ARG {arg}` for git provenance passthrough: {content}"
+            );
+            assert!(
+                content.contains(&format!("{arg}=${{{arg}}}")),
+                "Dockerfile must surface `{arg}` as ENV so build.rs bakes it: {content}"
+            );
+        }
+
+        // The provenance ENV must precede the build step so the compile sees it.
+        let env_pos = content.find("AUTUMN_BUILD_GIT_SHA=${AUTUMN_BUILD_GIT_SHA}");
+        let build_pos = content.find("{{build_step}}").or_else(|| {
+            // `{{build_step}}` is already substituted; both variants run cargo.
+            content
+                .find("cargo build --release")
+                .or_else(|| content.find("autumn build --embed"))
+        });
+        assert!(
+            matches!((env_pos, build_pos), (Some(e), Some(b)) if e < b),
+            "provenance ENV must appear before the build step: {content}"
+        );
+    }
+
+    #[test]
     fn dockerfile_has_three_stages() {
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
