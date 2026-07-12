@@ -68,7 +68,7 @@ These names match what `autumn doctor --json` actually emits in the `name` field
 | `rate_limit_key_strategy` | Set `rate_limit.key_strategy` to `"ip"`, `"api_token"`, or `"authenticated_principal"` |
 | `version_compat` | Upgrade `autumn-cli` to match the framework version: `cargo install autumn-cli --version 0.5.0` |
 | `dotenv` | Copy `.env.example` to `.env` and fill in local values, or add every present secret dotenv file (`.env`, `.env.local`, and any `.env.<profile>.local`) to `.gitignore` if it is not already ignored — committable `.env.<profile>` files are left alone (warns only; never fails) |
-| `jobs_queue_coverage` **(trunk-dev)** | Add the uncovered queue(s) to a tier's `jobs.pin` in `[jobs.fleet].tiers`, or run an unpinned tier that drains everything (only fails under `--strict` once `[jobs.fleet]` is declared) |
+| `jobs_queue_coverage` **(trunk-dev)** | Add the uncovered queue(s) to a tier's `jobs.pin` in `[jobs.fleet].tiers`, or run an unpinned tier that drains everything (fails once `[jobs.fleet]` is declared and a needed queue is uncovered; informational when `[jobs.fleet]` is absent) |
 | `offsite_backup` **(trunk-dev)** | Set `backup.offsite.s3.bucket`, or set `backup.offsite.allow_shared_bucket = true` if intentionally reusing the app `[storage.s3]` bucket |
 
 ## Operator alert checks (unreleased — trunk-dev)
@@ -120,9 +120,9 @@ set the specific key the check names. See `docs/guide/daemon.md`.
 
 ## Topology-aware queue coverage (unreleased — trunk-dev, issue #1756)
 
-On trunk-dev, `autumn doctor --strict` can hard-fail on a genuine job-queue
-coverage gap once the operator declares the fleet topology. Declare every worker
-tier's pin under `[jobs.fleet]`:
+On trunk-dev, `autumn doctor` hard-fails on a genuine job-queue coverage gap
+once the operator declares the fleet topology. Declare every worker tier's pin
+under `[jobs.fleet]`:
 
 ```toml
 [jobs.fleet]
@@ -133,13 +133,16 @@ manifest = "target/jobs-manifest.toml"       # OR: declared_queues = ["…"]
 ```
 
 The `jobs_queue_coverage` check then reasons about the **union** of all tier
-pins: it FAILS (exit 1 under `--strict`) only when a needed queue — the
-configured `[jobs.queues]` unioned with the compiled `#[job(queue = "…")]`-declared
-set — is drained by no tier anywhere, so a valid multi-tier subset split no
-longer false-positives. The declared set comes from a `[jobs.fleet] manifest`
-emitted by `autumn jobs manifest` (a TOML `queues = [...]` document) or an inline
-`[jobs.fleet] declared_queues` list. Without `[jobs.fleet]` the check stays
-informational-only (Pass), exactly as before (issue #1756).
+pins: it returns a hard `Fail` when a needed queue — the configured
+`[jobs.queues]` unioned with the compiled `#[job(queue = "…")]`-declared set —
+is drained by no tier anywhere, so a valid multi-tier subset split no longer
+false-positives. Because a `Fail` counts toward the exit code regardless of
+mode, ANY `autumn doctor` run (not just `--strict`) exits non-zero on that gap;
+`--strict` additionally escalates warnings to a non-zero exit. The declared set
+comes from a `[jobs.fleet] manifest` emitted by `autumn jobs manifest` (a TOML
+`queues = [...]` document) or an inline `[jobs.fleet] declared_queues` list.
+Without `[jobs.fleet]` the check stays informational-only (Pass), exactly as
+before (issue #1756).
 
 ## Secrets redaction
 

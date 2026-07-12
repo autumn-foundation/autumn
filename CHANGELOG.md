@@ -1309,18 +1309,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   due-delayed ZSET so scheduled/retry bursts are counted exactly, emitting a
   single `warn!` if a pathological backlog is truncated at the scan cap. The
   `local` backend keeps its in-process mark path unchanged (issue #1752).
-- **doctor:** topology-aware `autumn doctor --strict` queue-coverage
-  (`jobs_queue_coverage`). Declare the fleet's worker tiers under
+- **doctor:** topology-aware queue-coverage (`jobs_queue_coverage`). Declare the
+  fleet's worker tiers under
   `[jobs.fleet] tiers = [["critical"], ["bulk", "default"]]` (each inner array is
   one `worker` tier's `jobs.pin`; an empty array is an unpinned tier that drains
-  every queue) and doctor proves coverage topology-wide, hard-failing only when a
-  needed queue — the configured `[jobs.queues]` unioned with the
-  `#[job(queue = "…")]`-declared set — is drained by no tier anywhere, so a valid
-  multi-tier subset split no longer false-positives. The job-declared set is
-  resolved from `[jobs.fleet] manifest = "<path>"` (a `queues = [...]` manifest
-  the app emits) or an inline `[jobs.fleet] declared_queues = ["…"]`. Absent
-  `[jobs.fleet]` the check stays informational-only, exactly as before, so no
-  existing deployment regresses (issue #1756).
+  every queue) and doctor proves coverage topology-wide. When a needed queue —
+  the configured `[jobs.queues]` unioned with the `#[job(queue = "…")]`-declared
+  set — is drained by no tier anywhere, the check is a hard `Fail`, so a normal
+  `autumn doctor` run exits non-zero on that gap (not only `--strict`, which is
+  the stricter mode that also escalates warnings). A valid multi-tier subset
+  split no longer false-positives. The job-declared set is resolved from
+  `[jobs.fleet] manifest = "<path>"` (a `queues = [...]` manifest the app emits)
+  or an inline `[jobs.fleet] declared_queues = ["…"]`. Absent `[jobs.fleet]` the
+  check stays informational-only, exactly as before, so no existing deployment
+  regresses (issue #1756).
 - **cli:** `autumn jobs manifest <path>` emits the running app's effective
   drained-queue manifest. It compiles the app (debug profile) and runs it under
   `AUTUMN_DUMP_JOBS=1` to capture the ground-truth drained-queue set — the
