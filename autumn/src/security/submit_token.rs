@@ -576,9 +576,22 @@ where
 
             let key = storage_key(&token);
 
-            // Already consumed — replay the stored first response.
-            if let Some(entry) = settings.store.get(&key) {
-                return Ok(replay_response(&entry.record));
+            // Already consumed — replay the stored first response. Use the
+            // fallible `try_get` so a backend read/deserialization failure fails
+            // CLOSED (matching `IdempotencyService`'s lookup path) instead of
+            // collapsing to a cache miss: a swallowed error would fall through,
+            // acquire a fresh lock, and re-run the mutation for an
+            // already-consumed token. No lock is held yet, so surface `503`.
+            match settings.store.try_get(&key) {
+                Ok(Some(entry)) => return Ok(replay_response(&entry.record)),
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::error!(
+                        error = %error,
+                        "Submit-token consumed-token lookup failed; failing closed"
+                    );
+                    return Ok(crate::idempotency::persistence_failed_response());
+                }
             }
 
             // Acquire the in-flight lock. A concurrent duplicate that loses the
@@ -589,9 +602,24 @@ where
 
             // Double-check after locking: a racing request may have completed
             // and stored its response between our miss and the lock acquisition.
-            if let Some(entry) = settings.store.get(&key) {
-                settings.store.unlock(&key);
-                return Ok(replay_response(&entry.record));
+            // A read failure here must also fail closed. Because we now hold the
+            // in-flight lock, keep it held (do NOT unlock, letting it expire via
+            // `in_flight_ttl`) so a retry with the same token is rejected
+            // in-flight rather than re-running the handler — exactly as
+            // `IdempotencyService` does on a post-lock lookup error.
+            match settings.store.try_get(&key) {
+                Ok(Some(entry)) => {
+                    settings.store.unlock(&key);
+                    return Ok(replay_response(&entry.record));
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::error!(
+                        error = %error,
+                        "Submit-token consumed-token lookup failed after lock acquisition; failing closed"
+                    );
+                    return Ok(crate::idempotency::persistence_failed_response());
+                }
             }
 
             let response = inner.call(req).await?;
@@ -1105,6 +1133,106 @@ mod tests {
             count.load(Ordering::SeqCst),
             1,
             "the handler must run at most once even when persistence fails"
+        );
+    }
+
+    /// Store stub whose consumed-token lookups can be flipped to fail. Locking
+    /// and writes behave like the in-memory store so a token can first be
+    /// consumed, then have its lookup fail on replay. Mirrors the write-side
+    /// `FailingSetStore` to prove the READ path also fails closed.
+    struct FailingGetStore {
+        inner: MemoryIdempotencyStore,
+        fail_reads: std::sync::atomic::AtomicBool,
+    }
+
+    impl FailingGetStore {
+        fn new() -> Self {
+            Self {
+                inner: MemoryIdempotencyStore::new(Duration::from_secs(600)),
+                fail_reads: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+    }
+
+    impl IdempotencyStore for FailingGetStore {
+        fn get(&self, key: &str) -> Option<IdempotencyEntry> {
+            // The infallible path collapses a read failure to a cache miss —
+            // exactly the fail-open behaviour the guard must NOT rely on. It
+            // uses `try_get` instead, so this stays here only for the trait.
+            if self.fail_reads.load(Ordering::SeqCst) {
+                None
+            } else {
+                self.inner.get(key)
+            }
+        }
+
+        fn try_get(&self, key: &str) -> Result<Option<IdempotencyEntry>, IdempotencyStoreError> {
+            if self.fail_reads.load(Ordering::SeqCst) {
+                Err(IdempotencyStoreError::backend(
+                    "simulated consumed-token lookup failure",
+                ))
+            } else {
+                self.inner.try_get(key)
+            }
+        }
+
+        fn set(&self, key: &str, record: IdempotencyRecord, body_hash: Vec<u8>, ttl: Duration) {
+            self.inner.set(key, record, body_hash, ttl);
+        }
+
+        fn try_lock(&self, key: &str, lock_ttl: Duration) -> bool {
+            self.inner.try_lock(key, lock_ttl)
+        }
+
+        fn unlock(&self, key: &str) {
+            self.inner.unlock(key);
+        }
+    }
+
+    /// Finding (fail closed on read): once a token has been consumed, a backend
+    /// read failure on the consumed-token lookup must NOT collapse to a cache
+    /// miss that acquires a fresh lock and re-runs the mutation. The guard uses
+    /// the fallible `try_get`, so a lookup error fails closed with `503` and the
+    /// handler is not re-run — matching `IdempotencyService`'s lookup path.
+    #[tokio::test]
+    async fn read_failure_fails_closed_and_does_not_rerun() {
+        let store = Arc::new(FailingGetStore::new());
+        let store_dyn: Arc<dyn IdempotencyStore> = store.clone();
+        let count = Arc::new(AtomicUsize::new(0));
+        let count_inner = count.clone();
+        let app = Router::new()
+            .route(
+                "/submit",
+                post(move || {
+                    let count = count_inner.clone();
+                    async move {
+                        count.fetch_add(1, Ordering::SeqCst);
+                        "created"
+                    }
+                }),
+            )
+            .layer(layer_with_store(store_dyn));
+
+        let token = "tok-read-fail";
+
+        // First submit consumes the token and records the response.
+        let first = app.clone().oneshot(urlencoded_post(token)).await.unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+
+        // Now make consumed-token lookups fail. A replay must fail closed with
+        // 503 rather than treating the errored lookup as a miss and re-running.
+        store.fail_reads.store(true, Ordering::SeqCst);
+        let second = app.clone().oneshot(urlencoded_post(token)).await.unwrap();
+        assert_eq!(
+            second.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a consumed-token lookup failure must fail closed, not re-run the handler"
+        );
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            1,
+            "the handler must not re-run when the consumed-token lookup fails"
         );
     }
 }
