@@ -16,7 +16,8 @@
 //! allocations made *through* the cell, and covers exactly three things: (a)
 //! each live [`Charge`]'s declared bytes, (b) the allocation *capacity* of every
 //! stored scratch key `String` and value `Vec<u8>`, and (c) a fixed
-//! [`SCRATCH_ENTRY_OVERHEAD`] per scratch entry (covering the map's per-entry
+//! [`SCRATCH_ENTRY_OVERHEAD`](TenantCell::scratch_entry_overhead) per scratch
+//! entry (covering the map's per-entry
 //! `String`/`Vec` headers and an amortized bucket slot, so the *count* of tiny
 //! entries is bounded against the quota). This per-entry overhead is charged
 //! against a **high-water mark** of the live scratch-entry count rather than the
@@ -273,7 +274,8 @@ impl TenantCell {
     /// capacity is charged for the whole allocation it keeps resident.
     ///
     /// The key's capacity is charged only when a *new* key is inserted (and
-    /// released on removal). The fixed [`SCRATCH_ENTRY_OVERHEAD`] for the map
+    /// released on removal). The fixed
+    /// [`SCRATCH_ENTRY_OVERHEAD`](Self::scratch_entry_overhead) for the map
     /// slot and per-entry headers is charged against a *high-water mark* of the
     /// live scratch-entry count: inserting a new key that pushes the count above
     /// the prior peak charges one overhead, but re-inserting within the prior
@@ -361,7 +363,8 @@ impl TenantCell {
     ///
     /// Releases the stored `String` key and the value `Vec`'s full allocation
     /// *capacity* (the bytes the cell owned). It does **not** release the fixed
-    /// [`SCRATCH_ENTRY_OVERHEAD`]: [`HashMap`] does not shrink its bucket array
+    /// [`SCRATCH_ENTRY_OVERHEAD`](Self::scratch_entry_overhead): [`HashMap`] does
+    /// not shrink its bucket array
     /// on removal, so the bucket slot this entry occupied stays resident and is
     /// charged against the entry high-water mark until the whole cell is dropped
     /// (see [`scratch_insert`](Self::scratch_insert)).
