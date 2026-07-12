@@ -218,6 +218,13 @@ struct RepoConfig {
     /// `delete_by_id` runs a transactional, soft-delete-aware, hook-firing
     /// cascade over these child associations before deleting the parent.
     dependents: Vec<DependentSpec>,
+    /// Opt-in (`validate_on_update = fetch`) merged-model validation on the
+    /// no-hooks blind update path (issue #1801). When `true`, the generated
+    /// `update` validates the effective merged model (existing row ∪ patch)
+    /// via `from_patch` in every branch, loading the current row first on the
+    /// otherwise-blind no-lock sub-branches. When `false` (default) the blind
+    /// path stays byte-for-byte as before: no extra SELECT, no validation.
+    validate_on_update_fetch: bool,
 }
 
 #[allow(clippy::too_many_lines)]
@@ -246,6 +253,7 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
     let mut broadcast_render: Option<syn::Path> = None;
     let mut broadcast_container: Option<String> = None;
     let mut dependents: Vec<DependentSpec> = Vec::new();
+    let mut validate_on_update_fetch = false;
 
     syn::meta::parser(|meta| {
         // `hooks = Ident` must be checked before the catch-all model_name case,
@@ -362,6 +370,24 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
         } else if meta.path.is_ident("sharded") {
             sharded = true;
             Ok(())
+        } else if meta.path.is_ident("validate_on_update") {
+            // `validate_on_update = fetch` (issue #1801): opt into merged-model
+            // validation on the no-hooks blind update path. Only the bare ident
+            // `fetch` is accepted as the value (it fetches the current row when
+            // the blind path would otherwise skip the SELECT).
+            let value: Ident = meta.value()?.parse()?;
+            if value == "fetch" {
+                validate_on_update_fetch = true;
+                Ok(())
+            } else {
+                Err(syn::Error::new(
+                    value.span(),
+                    format!(
+                        "unknown validate_on_update mode `{value}`; expected \
+                         `validate_on_update = fetch`"
+                    ),
+                ))
+            }
         } else if meta.path.is_ident("dependent") {
             // `dependent(ChildRepository, fk = "col", on_delete = <action>)`
             let mut child_repo: Option<syn::Path> = None;
@@ -429,7 +455,7 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
             Ok(())
         } else {
             Err(meta.error(
-                "expected model name, table = \"...\", hooks = Type, commit_hooks = true, api = \"/path\", mcp, mcp = \"read\", policy = Type, scope = Type, cursor_key = field, cursor_key_type = Type, soft_delete, tenant_scoped, no_upsert_trait, searchable, versioned = true, no_versioned_record_impl, primary_reads, sharded, dependent(ChildRepository, fk = \"...\", on_delete = ...), broadcasts = true, topic = \"...\", render = fn, or container = \"...\"",
+                "expected model name, table = \"...\", hooks = Type, commit_hooks = true, api = \"/path\", mcp, mcp = \"read\", policy = Type, scope = Type, cursor_key = field, cursor_key_type = Type, soft_delete, tenant_scoped, no_upsert_trait, searchable, versioned = true, no_versioned_record_impl, primary_reads, sharded, validate_on_update = fetch, dependent(ChildRepository, fk = \"...\", on_delete = ...), broadcasts = true, topic = \"...\", render = fn, or container = \"...\"",
             ))
         }
     })
@@ -451,6 +477,13 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
         return Err(syn::Error::new(
             mcp_span.unwrap_or_else(proc_macro2::Span::call_site),
             "mcp requires api = \"/path\": MCP tools are derived from the generated CRUD routes",
+        ));
+    }
+    if validate_on_update_fetch && no_upsert_trait {
+        return Err(syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "validate_on_update = fetch requires the generated update draft (from_patch), \
+             which no_upsert_trait repositories do not have; remove one of the two",
         ));
     }
     let table = table_name.unwrap_or_else(|| infer_table_name(&model));
@@ -481,6 +514,7 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
         broadcast_container,
         generated_internal_hooks,
         dependents,
+        validate_on_update_fetch,
     })
 }
 
@@ -6764,6 +6798,73 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
         };
 
+        // #1801: opt-in merged-model validation on the no-hooks update path.
+        // `#knob_validate_current` is spliced into branches where `current`
+        // (the loaded row) is already in scope — it borrows the row, validates
+        // the merged model via `from_patch`, and discards the draft (we only
+        // want its 422 side-effect; the blind write below is unchanged).
+        // `#knob_load_and_validate` (plain, no tenant filter) and
+        // `#knob_load_and_validate_tenant` (tenant-filtered) are spliced into the
+        // otherwise-blind no-lock sub-branches: each first SELECTs the current row
+        // (only when the knob is set — no unconditional extra query), then
+        // validates. The tenant variant is used in the tenant_scoped blind branch
+        // so its SELECT matches that branch's own tenant-filtered UPDATE and the
+        // sibling version-checked load — otherwise a cross-tenant `id` would load a
+        // foreign row and surface 422 instead of the correct 404. All expand to
+        // nothing when the knob is off, keeping the blind path byte-for-byte.
+        //
+        // Note (normalize-vs-persist asymmetry): `from_patch` normalizes the merged
+        // model before validating, but the blind path deliberately persists the
+        // un-normalized `changes.__to_changeset()` (the validation here is
+        // side-effect-only — we keep only its 422). So a value that passes only
+        // because normalization cleaned it up is stored raw. This is a known,
+        // deliberate limitation of the opt-in blind path; the hooked/#1804 path
+        // persists the normalized draft instead.
+        //
+        // Concurrency (known, deliberate): this merged validation is point-in-time
+        // against a non-locked snapshot (a plain SELECT, no `FOR UPDATE`). It
+        // reliably rejects a single request that is invalid once merged (the #1801
+        // acceptance criterion), but does not provide a serializable cross-field
+        // invariant under concurrent partial writes to different fields — two
+        // concurrent requests can each validate against the same old row and then
+        // persist a combination the validator would reject. This matches the blind
+        // path's intentionally non-transactional, last-write-wins-per-column
+        // semantics; callers needing atomic cross-field enforcement should use a
+        // versioned or `hooks = ...` repository, whose update runs
+        // `SELECT ... FOR UPDATE` inside the mutation transaction.
+        let draft_ext_trait = format_ident!("{}DraftExt", model_name);
+        let knob_validate_current = if config.validate_on_update_fetch {
+            quote! {
+                { let _ = <::autumn_web::hooks::UpdateDraft<#model_name> as #draft_ext_trait>::from_patch(&current, changes)?; }
+            }
+        } else {
+            quote! {}
+        };
+        let knob_load_and_validate = if config.validate_on_update_fetch {
+            quote! {
+                let __merged_current = #table_ident::table.find(id).first::<#model_name>(&mut conn).await.map_err(::autumn_web::AutumnError::from)?;
+                { let _ = <::autumn_web::hooks::UpdateDraft<#model_name> as #draft_ext_trait>::from_patch(&__merged_current, changes)?; }
+            }
+        } else {
+            quote! {}
+        };
+        // Tenant-scoped variant: mirror the branch's own UPDATE and sibling load,
+        // which filter by `#table_ident::tenant_id.eq(t)` when a tenant is in scope
+        // and fall back to the bare PK lookup only for across-tenants queries.
+        let knob_load_and_validate_tenant = if config.validate_on_update_fetch {
+            quote! {
+                let __merged_current = if let ::core::option::Option::Some(ref t) = tenant_id {
+                    #table_ident::table.find(id).filter(#table_ident::tenant_id.eq(t)).first::<#model_name>(&mut conn).await
+                } else {
+                    #table_ident::table.find(id).first::<#model_name>(&mut conn).await
+                }
+                .map_err(::autumn_web::AutumnError::from)?;
+                { let _ = <::autumn_web::hooks::UpdateDraft<#model_name> as #draft_ext_trait>::from_patch(&__merged_current, changes)?; }
+            }
+        } else {
+            quote! {}
+        };
+
         let update_body = if config.tenant_scoped && config.versioned {
             let vh_insert = vh_insert_ts(
                 table_name,
@@ -6828,6 +6929,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 format!("{} with id {} not found", stringify!(#model_name), id)
                             ))?
                         };
+                        #knob_validate_current
                         let mut diesel_changeset = changes.__to_changeset();
                         if let ::core::option::Option::Some(ref t) = tenant_id {
                             diesel_changeset.set_tenant_id(t.clone());
@@ -6903,6 +7005,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 }
                             }
 
+                            #knob_validate_current
                             let mut diesel_changeset = changes.__to_changeset();
                             if let ::core::option::Option::Some(ref t) = tenant_id {
                                 use ::autumn_web::repository::CanSetTenantId as _;
@@ -6926,6 +7029,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     })
                     .await
                 } else {
+                    #knob_load_and_validate_tenant
                     let mut diesel_changeset = changes.__to_changeset();
                     if let ::core::option::Option::Some(ref t) = tenant_id {
                         use ::autumn_web::repository::CanSetTenantId as _;
@@ -6998,6 +7102,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                     format!("{} with id {} not found", stringify!(#model_name), id)
                                 ))?
                         };
+                        #knob_validate_current
                         let diesel_changeset = changes.__to_changeset();
                         let update_target = #table_ident::table.find(id);
                         let record = ::autumn_web::reexports::diesel::update(update_target)
@@ -7049,6 +7154,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 }
                             }
 
+                            #knob_validate_current
                             let diesel_changeset = changes.__to_changeset();
                             let update_target = #table_ident::table.find(id);
                             ::autumn_web::reexports::diesel::update(update_target)
@@ -7061,6 +7167,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     })
                     .await
                 } else {
+                    #knob_load_and_validate
                     let diesel_changeset = changes.__to_changeset();
                     let update_target = #table_ident::table.find(id);
                     ::autumn_web::reexports::diesel::update(update_target)
@@ -11336,6 +11443,44 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
         };
         let update_body = if has_policy {
+            // #1801: merged-model validation via `from_patch` structurally needs
+            // the `#[model]`-generated `<Model>DraftExt` trait (and `Model:
+            // Clone`, required by `UpdateDraft`). Hand-written models opt out of
+            // the generated DTO scaffolding with `no_upsert_trait` and supply
+            // their own changeset, so they have no `DraftExt`; skip the merged
+            // check for them (the patch-level `#validate_patch_idempotency` above
+            // still runs). Regression: repository_policy_non_serialize_new.rs.
+            let merged_validate = if config.no_upsert_trait {
+                quote! {}
+            } else {
+                let draft_ext_trait = format_ident!("{}DraftExt", model_name);
+                quote! {
+                    // #1801: also validate the effective merged model (existing
+                    // row ∪ patch) so the full validator set runs against
+                    // concrete values, matching the hooked-repo precedent
+                    // (#1804). Runs after 404/403/patch-422 and reuses the
+                    // already-loaded `__existing` (no extra query). We only want
+                    // the 422 side-effect, so the draft is discarded and the
+                    // blind `repo.update` below is unchanged. Wrapped (not `?`)
+                    // because this handler returns `IdempotencyReplayOr`; sits
+                    // with the other pure pre-replay checks so it cannot affect
+                    // idempotency replay semantics.
+                    //
+                    // Concurrency (known, deliberate): this is point-in-time —
+                    // it validates against the `__existing` snapshot loaded for
+                    // the 404/policy gate, not under a row lock held through
+                    // `repo.update`, so it is best-effort under concurrent writes
+                    // for the same reason as the blind path above (deliberate,
+                    // given the always-on zero-extra-query design).
+                    if let ::core::result::Result::Err(err) =
+                        <::autumn_web::hooks::UpdateDraft<#model_name> as #draft_ext_trait>::from_patch(&__existing, &patch)
+                    {
+                        return ::autumn_web::idempotency::IdempotencyReplayOr::Inner(
+                            ::core::result::Result::Err(err)
+                        );
+                    }
+                }
+            };
             quote! {
                 let __existing = match repo.on_primary().find_by_id(id).await {
                     ::core::result::Result::Ok(::core::option::Option::Some(existing)) => existing,
@@ -11372,6 +11517,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 // policy gate above, sits before the pure `__replay_response`
                 // read, so it cannot affect idempotency replay semantics.
                 #validate_patch_idempotency
+                #merged_validate
                 if let ::core::option::Option::Some(response) =
                     ::autumn_web::idempotency::__replay_response(&__autumn_idempotency_replay)
                 {
@@ -14743,6 +14889,122 @@ mod tests {
     }
 
     #[test]
+    fn repository_macro_no_hooks_validate_on_update_emits_from_patch() {
+        // #1801: with `validate_on_update = fetch` on a plain no-hooks repo, the
+        // generated single-record `update` body validates the effective merged
+        // model via `from_patch` (existing row ∪ patch), surfacing the standard
+        // 422 for a patch that only becomes invalid once merged.
+        let generated = repository_macro(
+            quote! { Post, validate_on_update = fetch },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        let section = update_section(&generated);
+        assert!(
+            section.contains("from_patch"),
+            "validate_on_update = fetch must emit a from_patch merged-model check \
+             on the no-hooks update path: {section}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_tenant_scoped_validate_on_update_tenant_filters_load() {
+        // #1801 follow-up: on a `tenant_scoped` no-hooks repo WITH the knob, the
+        // blind (no version-check) sub-branch must load the current row for
+        // merged validation through the SAME tenant filter its own blind UPDATE
+        // uses — otherwise a cross-tenant `id` would load a foreign row and
+        // surface 422 instead of the correct 404. Assert the update body both
+        // emits the `from_patch` merged check and tenant-filters the load.
+        let generated = repository_macro(
+            quote! { Post, tenant_scoped, validate_on_update = fetch },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        let section = update_section(&generated);
+        assert!(
+            section.contains("from_patch"),
+            "tenant_scoped + validate_on_update = fetch must emit a from_patch \
+             merged-model check: {section}"
+        );
+        assert!(
+            section.contains("tenant_id . eq"),
+            "the tenant_scoped blind merged-validation load must be tenant-filtered \
+             (tenant_id.eq), matching its own blind UPDATE: {section}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_versioned_validate_on_update_emits_from_patch() {
+        // #1801 follow-up: a `versioned` no-hooks repo WITH the knob emits the
+        // merged-model `from_patch` check on its update body too.
+        let generated = repository_macro(
+            quote! { Post, versioned = true, validate_on_update = fetch },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        let section = update_section(&generated);
+        assert!(
+            section.contains("from_patch"),
+            "versioned + validate_on_update = fetch must emit a from_patch \
+             merged-model check: {section}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_no_hooks_without_knob_has_no_from_patch() {
+        // #1801 AC #2: without the opt-in knob, the blind no-hooks update path
+        // stays byte-for-byte as before — no `from_patch` call, so no
+        // unconditional extra SELECT or merged validation.
+        let generated =
+            repository_macro(quote! { Post }, quote! { pub trait PostRepository {} }).to_string();
+        let section = update_section(&generated);
+        assert!(
+            !section.contains("from_patch"),
+            "a no-hooks repo without validate_on_update must not emit a from_patch \
+             merged-model check on the update path: {section}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_api_policy_update_validates_merged_model() {
+        // #1801 sub-case 1: the policy `--api` update handler unconditionally
+        // validates the effective merged model via `from_patch` on the already
+        // loaded `__existing` row (zero extra query), independent of the knob.
+        let generated = repository_macro(
+            quote! { Post, api = "/api/posts", policy = PostPolicy },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        let start = generated
+            .find("async fn post_api_update")
+            .expect("policy update handler must be generated");
+        let rest = &generated[start..];
+        let end = rest
+            .find("fn __autumn_route_info_post_api_update")
+            .unwrap_or(rest.len());
+        let section = &rest[..end];
+
+        assert!(
+            section.contains("from_patch (& __existing"),
+            "policy update handler must validate the merged model via from_patch on \
+             the loaded __existing row (zero extra query): {section}"
+        );
+        let from_patch_at = section
+            .find("from_patch")
+            .expect("policy update handler must validate the merged model via from_patch");
+        // The merged validation must run after the policy gate (403) so ordering
+        // stays 404 -> 403 -> patch-422 -> merged-422.
+        let policy_at = section
+            .find("__check_policy_scoped")
+            .expect("policy update handler must run the scoped policy check");
+        assert!(
+            policy_at < from_patch_at,
+            "merged-model validation must run after the policy check: {section}"
+        );
+    }
+
+    #[test]
     fn repository_macro_api_policy_create_validates_before_persist() {
         // #1253 AC: the policy-backed create branch validates before persisting
         // so authorization and validation both run.
@@ -14791,6 +15053,60 @@ mod tests {
         assert!(
             !config.primary_reads,
             "reads route to the replica by default"
+        );
+    }
+
+    #[test]
+    fn parse_repo_args_validate_on_update_fetch() {
+        // #1801: `validate_on_update = fetch` opts the no-hooks blind update
+        // path into merged-model validation.
+        let tokens: proc_macro2::TokenStream = "Post, validate_on_update = fetch".parse().unwrap();
+        let config = parse_repo_args(tokens).unwrap();
+        assert!(
+            config.validate_on_update_fetch,
+            "validate_on_update = fetch must set validate_on_update_fetch"
+        );
+    }
+
+    #[test]
+    fn parse_repo_args_validate_on_update_defaults_off() {
+        let tokens: proc_macro2::TokenStream = "Post".parse().unwrap();
+        let config = parse_repo_args(tokens).unwrap();
+        assert!(
+            !config.validate_on_update_fetch,
+            "the blind update path skips merged validation by default"
+        );
+    }
+
+    #[test]
+    fn parse_repo_args_validate_on_update_rejects_unknown_mode() {
+        // Only the bare ident `fetch` is a valid value.
+        let tokens: proc_macro2::TokenStream = "Post, validate_on_update = eager".parse().unwrap();
+        let err = parse_repo_args(tokens)
+            .err()
+            .expect("unknown mode must be rejected");
+        assert!(
+            err.to_string().contains("validate_on_update"),
+            "error must name the knob: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_repo_args_rejects_validate_on_update_fetch_with_no_upsert_trait() {
+        // #1801: `validate_on_update = fetch` emits `from_patch` on the generated
+        // update draft, but `no_upsert_trait` repositories have no such scaffold.
+        // The combination must be rejected at parse time rather than producing a
+        // downstream compile error.
+        let tokens: proc_macro2::TokenStream = "Post, validate_on_update = fetch, no_upsert_trait"
+            .parse()
+            .unwrap();
+        let err = parse_repo_args(tokens)
+            .err()
+            .expect("fetch validation with no_upsert_trait must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("validate_on_update") && msg.contains("no_upsert_trait"),
+            "error must name both knobs: {err}"
         );
     }
 
@@ -15351,6 +15667,19 @@ mod tests {
             .find("async fn delete_many")
             .expect("repository must generate delete_many");
         let rest = &generated[start + "async fn delete_many".len()..];
+        let end = rest.find("async fn ").map_or(rest.len(), |p| p);
+        &rest[..end]
+    }
+
+    /// Helper: slice the generated `update` trait-impl body (up to the next
+    /// `async fn`) so assertions target the single-record update path. Anchors
+    /// on `async fn update (` so it does not match `async fn update_many (`.
+    fn update_section(generated: &str) -> &str {
+        let needle = "async fn update (";
+        let start = generated
+            .find(needle)
+            .expect("repository must generate update");
+        let rest = &generated[start + needle.len()..];
         let end = rest.find("async fn ").map_or(rest.len(), |p| p);
         &rest[..end]
     }
