@@ -4,6 +4,22 @@
 //! through the cloneable [`Mailer`] extractor, and swap transports through the
 //! [`MailTransport`] trait when SMTP is not the right coffin lining.
 
+// autumn-panic-gate: request-path module — production code path must be panic-free.
+// See CONTRIBUTING.md "Request-path panic gate". Justify exceptions with
+// #[allow(clippy::<lint>, reason = "…")] at the narrowest scope.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::todo,
+        clippy::unimplemented,
+        clippy::indexing_slicing,
+    )
+)]
+
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -1198,6 +1214,10 @@ pub mod unsubscribe {
 
     /// Derive a 32-byte AES-256 key from a signing key via HMAC-SHA256 with a
     /// domain-separation label.
+    #[allow(
+        clippy::expect_used,
+        reason = "infallible: HMAC accepts any key length"
+    )]
     fn derive_key(signing_key: &[u8]) -> [u8; 32] {
         let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(signing_key)
             .expect("HMAC accepts any key length");
@@ -1226,6 +1246,10 @@ pub mod unsubscribe {
     ///
     /// Panics if the OS RNG is unavailable.
     #[must_use]
+    #[allow(
+        clippy::expect_used,
+        reason = "infallible crypto: AES-256-GCM over a 32-byte derived key; an OS RNG failure is an unrecoverable environment fault surfaced as a documented panic"
+    )]
     pub fn sign_token(
         keys: &ResolvedSigningKeys,
         subscriber: &str,
@@ -1256,6 +1280,10 @@ pub mod unsubscribe {
     ///
     /// Returns [`TokenError`] when the token is malformed, its signature is
     /// invalid, or it has expired relative to `now_unix`.
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "blob.len() is checked to be >= 1 + NONCE_LEN above, so these indices are in bounds"
+    )]
     pub fn verify_token(
         keys: &ResolvedSigningKeys,
         token: &str,
@@ -1398,7 +1426,7 @@ impl SuppressionStore for InMemorySuppressionStore {
             let suppressed = self
                 .suppressed
                 .lock()
-                .expect("suppression lock")
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .contains(&key);
             Ok(suppressed)
         })
@@ -1413,7 +1441,7 @@ impl SuppressionStore for InMemorySuppressionStore {
             let key = (subscriber.to_owned(), list_id.to_owned());
             self.suppressed
                 .lock()
-                .expect("suppression lock")
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .insert(key);
             Ok(())
         })
@@ -1881,6 +1909,10 @@ impl Mailer {
 
             crate::db::AFTER_COMMIT_REGISTRY
                 .try_with(|registry| {
+                    #[allow(
+                        clippy::expect_used,
+                        reason = "unreachable: try_with closure body runs at most once"
+                    )]
                     let (m, m_mail) = f_opt.take().expect("once");
                     let span = deliver_span.clone();
                     let boxed: crate::db::CommitCallback = Box::new(move || {
@@ -1899,7 +1931,10 @@ impl Mailer {
                             span,
                         ))
                     });
-                    registry.lock().expect("registry lock").push(boxed);
+                    registry
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push(boxed);
                 })
                 .ok();
 
@@ -2354,7 +2389,12 @@ fn base64_wrap76(bytes: &[u8]) -> String {
         if !wrapped.is_empty() {
             wrapped.push('\n');
         }
-        wrapped.push_str(std::str::from_utf8(chunk).expect("base64 output is always ASCII"));
+        #[allow(
+            clippy::expect_used,
+            reason = "infallible: base64 output is always ASCII"
+        )]
+        let chunk_str = std::str::from_utf8(chunk).expect("base64 output is always ASCII");
+        wrapped.push_str(chunk_str);
     }
     wrapped
 }
@@ -3227,6 +3267,10 @@ fn lettre_attachment_part(attachment: &MailAttachment) -> Result<SinglePart, Mai
     // Force base64 regardless of content: lettre's automatic encoder picks
     // `7bit` for short ASCII byte buffers, but attachments must always carry
     // a `base64` Content-Transfer-Encoding per the framework's contract.
+    #[allow(
+        clippy::expect_used,
+        reason = "infallible: base64 encoding is always valid for any byte buffer"
+    )]
     let body =
         LettreBody::new_with_encoding(attachment.bytes.clone(), ContentTransferEncoding::Base64)
             .expect("base64 encoding is always valid for any byte buffer");
@@ -3849,7 +3893,7 @@ pub mod suppression {
                 Ok(self
                     .entries
                     .lock()
-                    .expect("suppression lock")
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .contains_key(&key))
             })
         }
@@ -3863,7 +3907,7 @@ pub mod suppression {
                 let key = canonical_subscriber(address);
                 self.entries
                     .lock()
-                    .expect("suppression lock")
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .insert(key, reason);
                 Ok(())
             })
@@ -3875,7 +3919,10 @@ pub mod suppression {
         ) -> Pin<Box<dyn Future<Output = Result<(), MailError>> + Send + 'a>> {
             Box::pin(async move {
                 let key = canonical_subscriber(address);
-                self.entries.lock().expect("suppression lock").remove(&key);
+                self.entries
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(&key);
                 Ok(())
             })
         }
@@ -6382,7 +6429,9 @@ mod tests {
         registry: &std::sync::Arc<std::sync::Mutex<Vec<crate::db::CommitCallback>>>,
     ) {
         let callbacks: Vec<crate::db::CommitCallback> = {
-            let mut reg = registry.lock().expect("registry lock");
+            let mut reg = registry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             std::mem::take(&mut *reg)
         };
 

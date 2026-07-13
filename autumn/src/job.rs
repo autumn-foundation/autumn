@@ -3,6 +3,22 @@
 //! Provides [`JobInfo`] metadata used by `#[job]` and `jobs![]`, plus local
 //! and Redis-backed queue backends.
 
+// autumn-panic-gate: request-path module — production code path must be panic-free.
+// See CONTRIBUTING.md "Request-path panic gate". Justify exceptions with
+// #[allow(clippy::<lint>, reason = "…")] at the narrowest scope.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::todo,
+        clippy::unimplemented,
+        clippy::indexing_slicing,
+    )
+)]
+
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
@@ -251,6 +267,10 @@ impl QueueCursor {
     /// Ordered queue names to attempt for this claim iteration. The first entry
     /// is the queue to serve now; the rest follow (so a worker never idles while
     /// any queue has work).
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "names, weights, and current are maintained at equal length; all indices come from 0..names.len() or best < names.len()"
+    )]
     pub(crate) fn next_order(&mut self) -> Arc<Vec<String>> {
         if self.strict || self.names.len() <= 1 {
             return Arc::clone(&self.names);
@@ -491,7 +511,10 @@ impl QueueSlots {
         if self.limits.is_empty() {
             return order.to_vec();
         }
-        let guard = self.running.lock().expect("queue slot lock poisoned");
+        let guard = self
+            .running
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (running, total) = &*guard;
         order
             .iter()
@@ -505,7 +528,10 @@ impl QueueSlots {
     #[allow(clippy::significant_drop_tightening)]
     pub(crate) fn acquire(self: &Arc<Self>, queue: &str) -> QueueSlotGuard {
         {
-            let mut guard = self.running.lock().expect("queue slot lock poisoned");
+            let mut guard = self
+                .running
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let (running, total) = &mut *guard;
             *running.entry(queue.to_string()).or_insert(0) += 1;
             *total += 1;
@@ -536,7 +562,10 @@ impl QueueSlots {
         if self.limits.is_empty() {
             return Some(self.acquire(queue));
         }
-        let mut guard = self.running.lock().expect("queue slot lock poisoned");
+        let mut guard = self
+            .running
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (running, total) = &mut *guard;
         // Hard ceiling first: never let total in-flight reach the worker count,
         // even via a queue drawing on its own reserved slots.
@@ -564,7 +593,11 @@ pub(crate) struct QueueSlotGuard {
 impl Drop for QueueSlotGuard {
     #[allow(clippy::significant_drop_tightening)]
     fn drop(&mut self) {
-        let mut guard = self.slots.running.lock().expect("queue slot lock poisoned");
+        let mut guard = self
+            .slots
+            .running
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (running, total) = &mut *guard;
         if let Some(count) = running.get_mut(&self.queue) {
             *count = count.saturating_sub(1);
@@ -2938,11 +2971,18 @@ impl JobClient {
         #[cfg(feature = "db")]
         crate::db::AFTER_COMMIT_REGISTRY
             .try_with(|registry| {
+                #[allow(
+                    clippy::expect_used,
+                    reason = "unreachable: try_with closure body runs at most once"
+                )]
                 let f = f_opt.take().expect("closure only entered once");
                 let span = enqueue_span.clone();
                 let boxed: crate::db::CommitCallback =
                     Box::new(move || Box::pin(tracing::Instrument::instrument(f(), span)));
-                registry.lock().expect("registry lock").push(boxed);
+                registry
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(boxed);
             })
             .ok();
 
@@ -3525,7 +3565,9 @@ pub(crate) fn start_local_runtime_inner(
     ));
 
     {
-        let guard = jobs_by_name.read().expect("job registry lock poisoned");
+        let guard = jobs_by_name
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         for job in guard.values() {
             state
                 .job_registry
@@ -3750,7 +3792,9 @@ fn collect_declared_queues_from_jobs<'a>(
 
 /// Distinct queue names declared by the registered jobs.
 fn collect_declared_queues(jobs_by_name: &Arc<RwLock<HashMap<String, JobInfo>>>) -> Vec<String> {
-    let guard = jobs_by_name.read().expect("job registry lock poisoned");
+    let guard = jobs_by_name
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     collect_declared_queues_from_jobs(guard.values())
 }
 
@@ -3783,6 +3827,10 @@ fn effective_drained_queues_from_jobs(
 /// `autumn doctor` consumes: a single top-level `queues = [...]` array, ordered
 /// highest priority first exactly as the runtime drains. Emitted to stdout by
 /// `AUTUMN_DUMP_JOBS=1` and read back by doctor's `resolve_declared_queues`.
+#[allow(
+    clippy::expect_used,
+    reason = "infallible: manifest is a plain string array; TOML serialization cannot fail"
+)]
 pub(crate) fn render_jobs_manifest(
     cfg: &crate::config::JobQueuesConfig,
     jobs: &[JobInfo],
@@ -3821,7 +3869,10 @@ impl LocalQueueBuffer {
     #[allow(clippy::significant_drop_tightening)]
     fn push(&self, job: QueuedJob) {
         {
-            let mut map = self.inner.lock().expect("local job buffer lock poisoned");
+            let mut map = self
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let bucket = map.entry(normalize_queue_name(&job.queue)).or_default();
             if bucket.len() == LOCAL_QUEUE_WARN_THRESHOLD {
                 tracing::warn!(
@@ -3848,7 +3899,10 @@ impl LocalQueueBuffer {
         order: &[String],
         allowed: Option<&std::collections::HashSet<String>>,
     ) -> Option<QueuedJob> {
-        let mut map = self.inner.lock().expect("local job buffer lock poisoned");
+        let mut map = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         for name in order {
             if let Some(job) = map.get_mut(name).and_then(VecDeque::pop_front) {
                 return Some(job);
@@ -3873,7 +3927,10 @@ impl LocalQueueBuffer {
     /// queue rather than sweeping the whole priority order.
     #[allow(clippy::significant_drop_tightening)]
     fn try_pop_from(&self, queue: &str) -> Option<QueuedJob> {
-        let mut map = self.inner.lock().expect("local job buffer lock poisoned");
+        let mut map = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         map.get_mut(queue).and_then(VecDeque::pop_front)
     }
 }
@@ -3889,7 +3946,7 @@ async fn execute_local_job(
 ) {
     let maybe_info = jobs_by_name
         .read()
-        .expect("job registry lock poisoned")
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .get(&job.name)
         .map(|info| {
             (
@@ -6506,7 +6563,9 @@ async fn process_redis_job_record(
     state.job_registry.record_start(&record.name);
 
     let maybe_info = {
-        let guard = jobs_by_name.read().expect("job registry lock poisoned");
+        let guard = jobs_by_name
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         guard
             .get(&record.name)
             .map(|info| (info.handler, info.max_attempts, info.initial_backoff_ms))
@@ -6734,7 +6793,9 @@ fn start_redis_runtime(
     ));
 
     {
-        let guard = jobs_by_name.read().expect("job registry lock poisoned");
+        let guard = jobs_by_name
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         for job in guard.values() {
             state
                 .job_registry
@@ -7956,7 +8017,7 @@ async fn pg_execute_job(
     let payload = serde_json::from_str::<Value>(&row.payload).unwrap_or(Value::Null);
     let job_info_snapshot = jobs_by_name
         .read()
-        .expect("job registry lock poisoned")
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .get(&row.name)
         .map(|info| (info.handler, info.uniqueness.clone()));
     let pending_unique_key = job_info_snapshot
@@ -8688,7 +8749,9 @@ fn start_postgres_runtime(
     ));
 
     {
-        let guard = jobs_by_name.read().expect("job registry lock poisoned");
+        let guard = jobs_by_name
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         for job in guard.values() {
             state
                 .job_registry
