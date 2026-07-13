@@ -115,6 +115,14 @@ impl SecurityDump {
         for endpoint in &config.security.webhooks.endpoints {
             exempt_paths.push(endpoint.path.clone());
         }
+        // Runtime also exempts the framework-owned RFC 8058 one-click unsubscribe
+        // endpoint from CSRF (`apply_csrf_middleware`, `router.rs`) under the same
+        // `mail`-feature gate and `should_mount_unsubscribe_endpoint()` predicate,
+        // so fold that path in too when it applies.
+        #[cfg(feature = "mail")]
+        if config.mail.should_mount_unsubscribe_endpoint() {
+            exempt_paths.push(crate::mail::UNSUBSCRIBE_PATH.to_owned());
+        }
         exempt_paths.sort();
         exempt_paths.dedup();
 
@@ -1469,6 +1477,46 @@ mod tests {
         assert_eq!(
             dump.csrf.exempt_paths, sorted,
             "exempt_paths must stay sorted and deduped"
+        );
+    }
+
+    /// Runtime's `apply_csrf_middleware` exempts the framework-owned RFC 8058
+    /// one-click unsubscribe endpoint when the app opts in with a base URL, so
+    /// the dumped `csrf.exempt_paths` must include `UNSUBSCRIBE_PATH` for that
+    /// configuration and a mutating route there must read as CSRF-unenforced.
+    #[cfg(feature = "mail")]
+    #[test]
+    fn security_dump_exempts_mounted_unsubscribe_path() {
+        let mut config = AutumnConfig::default();
+        config.mail.mount_unsubscribe_endpoint = true;
+        config.mail.unsubscribe_base_url = Some("https://example.com".to_owned());
+        assert!(
+            config.mail.should_mount_unsubscribe_endpoint(),
+            "test precondition: unsubscribe endpoint must be mounted"
+        );
+
+        let dump = SecurityDump::from_config(&config);
+        assert!(
+            dump.csrf
+                .exempt_paths
+                .iter()
+                .any(|p| p == crate::mail::UNSUBSCRIBE_PATH),
+            "mounted unsubscribe path must be a CSRF exempt path: {:?}",
+            dump.csrf.exempt_paths
+        );
+
+        // When the endpoint is NOT mounted, the path must not be folded in.
+        let mut plain = AutumnConfig::default();
+        plain.mail.mount_unsubscribe_endpoint = false;
+        let plain_dump = SecurityDump::from_config(&plain);
+        assert!(
+            !plain_dump
+                .csrf
+                .exempt_paths
+                .iter()
+                .any(|p| p == crate::mail::UNSUBSCRIBE_PATH),
+            "unmounted unsubscribe path must not be exempt: {:?}",
+            plain_dump.csrf.exempt_paths
         );
     }
 }
