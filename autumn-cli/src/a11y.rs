@@ -868,6 +868,21 @@ fn parse_element(trees: &[TokenTree], start: usize) -> (Element, usize) {
                 attrs.push(attr);
                 i = next;
             }
+            // A quoted (string-literal) attribute name, e.g.
+            // `button "@click"="save" { … }` or `input "aria-label"="Search";`.
+            // maud accepts a `LitStr` as an attribute-name fragment, so route it
+            // through `parse_attr` like an ident name: its `="value"` (or bare /
+            // `[toggler]`) is consumed and the element body that follows is still
+            // parsed. `read_name` records the unquoted text, so a quoted
+            // accessible-name source (`"aria-label"`, `"title"`, `"alt"`) counts
+            // toward the accessible name exactly like the ident form. A non-string
+            // literal is not a valid name here and ends the element (best-effort:
+            // a missed check is acceptable, a false positive is not).
+            TokenTree::Literal(lit) if string_literal_value(lit).is_some() => {
+                let (attr, next) = parse_attr(trees, i);
+                attrs.push(attr);
+                i = next;
+            }
             // Anything else (a stray splice, operator, …) ends the element.
             _ => break,
         }
@@ -1021,6 +1036,16 @@ fn read_attr_value(trees: &[TokenTree], i: usize) -> (AttrValue, usize) {
                 (AttrValue::Literal(v), i + 1)
             }),
         Some(TokenTree::Group(_) | TokenTree::Ident(_)) => (AttrValue::Dynamic, i + 1),
+        // A control-flow / markup value: `attr=@if c { "x" }`,
+        // `attr=@match s { _ => "c" }`. maud allows an attribute value to be a
+        // `Markup` control; consume the control head + its brace group(s) (via the
+        // same skipper the shorthand path uses) so the element body that follows
+        // is still parsed rather than orphaned (which would fire a false
+        // `button-name`/`link-name` on the parent). The value is unresolvable, so
+        // it is recorded as `Dynamic` (non-failing).
+        Some(TokenTree::Punct(p)) if p.as_char() == '@' => {
+            (AttrValue::Dynamic, skip_shorthand_control(trees, i + 1))
+        }
         _ => (AttrValue::Dynamic, i),
     }
 }
@@ -2212,6 +2237,81 @@ mod tests {
         // keeps its `href` and its `{ "Link" }` text, so it is not flagged.
         let src = wrap(r#"a href="/x" data:foo="y" { "Link" }"#);
         assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+    }
+
+    // ── quoted (string-literal) attribute names ─────────────────────────────
+
+    #[test]
+    fn quoted_attr_name_does_not_orphan_button_body() {
+        // Regression (false positive): maud accepts a STRING-LITERAL attribute
+        // name (`"@click"`). If it is not recognized as an attribute name the
+        // element ends early and orphans its `{ "Save" }` body — the button is
+        // analyzed as empty and falsely flagged.
+        let src = wrap(r#"button "@click"="save" { "Save" }"#);
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn quoted_aria_label_provides_accessible_name() {
+        // A quoted `"aria-label"` name is recorded like the ident form, so its
+        // static value supplies the accessible name — a labelless `<input>` with
+        // an `aria-label` is not flagged.
+        let src = wrap(r#"input "aria-label"="Search";"#);
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn quoted_non_name_attr_consumed_empty_button_still_flagged() {
+        // The quoted attribute is consumed, but it supplies no accessible name and
+        // the body is empty — a genuinely nameless button is still caught.
+        let src = wrap(r#"button "data-x"="y" { }"#);
+        assert_eq!(
+            rule_ids(&src),
+            vec!["button-name"],
+            "{:?}",
+            findings_for(&src)
+        );
+    }
+
+    // ── control-valued / markup-valued attributes (`attr=@if …`) ────────────
+
+    #[test]
+    fn match_valued_attr_does_not_truncate_button() {
+        // Regression (false positive): a maud attribute value may be a control
+        // (`class=@match state { _ => "primary" }`). The control must be fully
+        // consumed so the button's real `{ "Save" }` body is parsed — otherwise
+        // the button is analyzed as empty and falsely flagged.
+        let src = wrap(r#"button class=@match state { _ => "primary" } { "Save" }"#);
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn if_valued_attr_after_real_attr_stays_clean() {
+        // An `@if`-valued attribute following a real `href` must not truncate the
+        // anchor: it keeps its `{ "Link" }` text, so it is not flagged.
+        let src = wrap(r#"a href="/x" class=@if hot { "hot" } { "Link" }"#);
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn if_valued_attr_empty_button_still_flagged() {
+        // The control value is consumed, but a genuinely empty body is still
+        // caught (no over-correction into a false negative).
+        let src = wrap(r#"button class=@if c { "x" } { }"#);
+        assert_eq!(
+            rule_ids(&src),
+            vec!["button-name"],
+            "{:?}",
+            findings_for(&src)
+        );
+    }
+
+    #[test]
+    fn match_valued_attr_then_id_unlabeled_input_still_flagged() {
+        // The control value is consumed and the following `id="q"` attribute is
+        // parsed, but with no matching label the input is still flagged.
+        let src = wrap(r#"input class=@match s { _ => "c" } id="q";"#);
+        assert_eq!(rule_ids(&src), vec!["label"], "{:?}", findings_for(&src));
     }
 
     // ── aria-hidden on the control itself ───────────────────────────────────
