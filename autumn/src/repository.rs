@@ -161,22 +161,30 @@ pub type RuntimeDependentCascadeFuture<'a> = ::std::pin::Pin<
 /// constructs the child repository and applies this one association's cascade,
 /// returning any deferred OOB delete broadcasts to publish post-commit.
 ///
-/// The two guard sets serve distinct roles (Codex round-5-B): `__path` is the
-/// ACTIVE recursion stack (pushed before descending into a node's children,
-/// popped once that subtree completes) used only to break self-/mutual-referential
-/// cycles; `__deleted` is a monotonic set of rows actually removed, used to skip a
-/// row already gone (so a row reached again — e.g. as another batch root's
-/// descendant — is neither re-deleted nor re-hooked). Keeping them separate lets a
-/// batch process a descendant root before its ancestor without the ancestor's
-/// cascade skipping a still-referenced intermediate (immediate-FK failure).
+/// The three guard sets serve distinct roles (Codex round-5-B + #1800 case 1):
+/// `__path` is the ACTIVE recursion stack (pushed before descending into a node's
+/// children, popped once that subtree completes) used only to break
+/// self-/mutual-referential cycles; `__deleted` is a monotonic set of every row
+/// HANDLED by the cascade — soft OR physical — used by the bulk `delete_many` root
+/// dedup / hook double-fire guard to skip a root already processed as another
+/// root's descendant (so its `before_delete` never fires twice); `__physical` is
+/// the subset of rows PHYSICALLY removed, used only by the diamond traversal
+/// revisit-skip so a hard-delete path can still physically remove a row a
+/// soft-delete path merely marked `deleted_at` on. Keeping `__deleted` and
+/// `__physical` separate is what lets the bulk root skip stay complete for
+/// soft-delete graphs while the diamond hard path is still free to run; keeping
+/// `__path` separate lets a batch process a descendant root before its ancestor
+/// without the ancestor's cascade skipping a still-referenced intermediate
+/// (immediate-FK failure).
 ///
 /// All references share one lifetime so the returned future can borrow the
-/// connection and both guard sets for exactly as long as it is awaited.
+/// connection and all three guard sets for exactly as long as it is awaited.
 pub type RuntimeDependentCascadeFn = for<'a> fn(
     &'a ::diesel_async::pooled_connection::deadpool::Pool<::diesel_async::AsyncPgConnection>,
     &'a mut ::diesel_async::AsyncPgConnection,
     i64,
     bool,
+    &'a mut ::std::collections::HashSet<(&'static str, i64)>,
     &'a mut ::std::collections::HashSet<(&'static str, i64)>,
     &'a mut ::std::collections::HashSet<(&'static str, i64)>,
 ) -> RuntimeDependentCascadeFuture<'a>;

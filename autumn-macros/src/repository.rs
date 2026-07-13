@@ -1415,6 +1415,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             #child_soft_for_grandchildren,
                             __path,
                             __deleted,
+                            __physical,
                         ).await?
                     );
                 }
@@ -1461,10 +1462,10 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         // broadcasts. For a model with no dependents this is a cheap no-op that
         // iterates an empty `&[]`, so the plain path stays behavior-equivalent.
         // Codex round-5-A: same restrict/mutating split as the compile-time path,
-        // for the model-declared runtime walk. `__autumn_gc_rt_deps` is bound in
-        // the restrict block and reused by the mutating block — the two are always
-        // emitted together (runtime pairing) and in that order in the Destroy arm,
-        // so the binding is in scope for the mutating loop.
+        // for the model-declared runtime walk. #1800 case 2: the two blocks are now
+        // emitted in SEPARATE loops (the restrict probe pre-scans every selected
+        // child id before any child hook), so each block re-binds
+        // `__autumn_gc_rt_deps` independently rather than sharing one binding.
         let runtime_grandchild_restrict = quote! {
             // Inherent `dependents()` (real specs) shadows the blanket trait
             // method (empty); unqualified so the shadow wins, `&[]` otherwise.
@@ -1480,11 +1481,13 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         #child_soft_for_grandchildren,
                         __path,
                         __deleted,
+                        __physical,
                     ).await?
                 );
             }
         };
         let runtime_grandchild_mutating = quote! {
+            let __autumn_gc_rt_deps = #model_name::dependents();
             for __autumn_gc_spec in __autumn_gc_rt_deps.iter().filter(|__s|
                 __s.action != ::autumn_web::repository::DependentAction::Restrict
             ) {
@@ -1496,6 +1499,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         #child_soft_for_grandchildren,
                         __path,
                         __deleted,
+                        __physical,
                     ).await?
                 );
             }
@@ -1563,6 +1567,53 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         } else {
             quote! {}
         };
+        // #1800 case 1: record every HANDLED row in the monotonic `__deleted` set
+        // (soft OR physical) so the bulk `delete_many` root dedup / hook
+        // double-fire guard skips a root already processed as another root's
+        // descendant — a soft-deleted descendant MUST land here or its
+        // `before_delete` fires a second time in the bulk root loop. Separately
+        // record ONLY physically-removed rows in `__physical`: a soft delete
+        // (`SET deleted_at`, when this is a `#[soft_delete]` child AND the parent is
+        // soft-deleted) leaves the row physically present, so the diamond
+        // revisit-skip (which consults `__physical`, not `__deleted`) must NOT see
+        // it — otherwise a LATER hard-delete path (reached through a hard-deleted
+        // sibling/parent in a mixed soft/hard diamond) would skip it, leaving a
+        // dangling FK or FK-failing the hard delete. A non-soft child, or a soft
+        // child under a HARD parent, is always physically deleted, so it is recorded
+        // in BOTH sets.
+        let destroy_deleted_mark = if config.soft_delete {
+            quote! {
+                __deleted.insert((#table_name, __cid));
+                if !__parent_soft {
+                    __physical.insert((#table_name, __cid));
+                }
+            }
+        } else {
+            quote! {
+                __deleted.insert((#table_name, __cid));
+                __physical.insert((#table_name, __cid));
+            }
+        };
+        // #1800 case 1 (companion guard): because a soft-deleted row is deliberately
+        // NOT recorded in `__physical` (only in the "all handled" `__deleted`), the
+        // Phase-2 revisit-skip — which consults `__physical` so the diamond's hard
+        // branch can still reach it — does NOT suppress a later SOFT re-visit of the
+        // SAME row (a pure-soft diamond), which would otherwise re-fire its
+        // `before_delete` hook and re-issue a no-op UPDATE. Skip it here instead: if
+        // this visit would soft-delete (`__parent_soft`) and the row is already
+        // soft-deleted, it is logically gone and nothing more is owed. A HARD
+        // re-visit (`!__parent_soft`) still proceeds to physically delete the row
+        // (the diamond's hard branch).
+        let destroy_soft_revisit_skip = if config.soft_delete {
+            quote! {
+                if __parent_soft && __record.deleted_at.is_some() {
+                    __path.remove(&(#table_name, __cid));
+                    continue;
+                }
+            }
+        } else {
+            quote! {}
+        };
 
         quote! {
             /// Apply a [`DependentAction`](::autumn_web::repository::DependentAction)
@@ -1601,8 +1652,9 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             // breaking the cycle while keeping the cascade `Send`.
             #[doc(hidden)]
             // Codex round-5-B split the single cycle set into an active-path stack
-            // plus a monotonic deleted set, taking this framework-internal helper to
-            // 8 parameters; the extra guard is intentional (see the doc above).
+            // plus a monotonic handled set; #1800 case 1 added the physical-delete
+            // subset, taking this framework-internal helper to 9 parameters; the
+            // extra guards are intentional (see the doc above).
             #[allow(clippy::too_many_arguments)]
             pub fn __autumn_apply_dependent_on_conn<'__dep>(
                 &'__dep self,
@@ -1611,19 +1663,29 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 __parent_id: i64,
                 __action: ::autumn_web::repository::DependentAction,
                 __parent_soft: bool,
-                // Codex round-5-B: TWO guard sets threaded through the recursion.
+                // Codex round-5-B + #1800 case 1: THREE guard sets threaded through
+                // the recursion.
                 // `__path` is the ACTIVE recursion stack — a (table, id) is pushed
                 // before descending into its children and popped once its subtree
                 // completes; it breaks self-/mutual-referential cycles ONLY.
-                // `__deleted` is a MONOTONIC set of rows actually removed; a row
-                // already in it is skipped (genuinely gone), so a row reached again
-                // as another root's descendant is neither re-deleted nor re-hooked.
-                // Separating them is what lets a batch process a descendant root
-                // before its ancestor without the ancestor's cascade pre-skipping a
-                // still-referenced intermediate (the removed monotonic-preseed's
-                // immediate-FK bug). See the Destroy arm's guards below.
+                // `__deleted` is a MONOTONIC set of every row HANDLED by the cascade
+                // — soft OR physical. The bulk `delete_many` root dedup / hook
+                // double-fire guard consults it so a root already processed as
+                // another root's descendant is neither re-cascaded nor re-hooked
+                // (this is why a soft-handled row MUST be recorded here — #1800).
+                // `__physical` is the subset of rows PHYSICALLY removed; the diamond
+                // traversal revisit-skip consults ONLY it, so a hard-delete path can
+                // still physically remove a row a soft-delete path merely marked
+                // `deleted_at` on (a mixed soft/hard diamond) without the "all
+                // handled" set suppressing it.
+                // Separating `__path` from the others is what lets a batch process a
+                // descendant root before its ancestor without the ancestor's cascade
+                // pre-skipping a still-referenced intermediate (the removed
+                // monotonic-preseed's immediate-FK bug). See the Destroy arm's
+                // guards below.
                 __path: &'__dep mut ::std::collections::HashSet<(&'static str, i64)>,
                 __deleted: &'__dep mut ::std::collections::HashSet<(&'static str, i64)>,
+                __physical: &'__dep mut ::std::collections::HashSet<(&'static str, i64)>,
             ) -> ::std::pin::Pin<::std::boxed::Box<
                 dyn ::std::future::Future<
                     Output = ::autumn_web::AutumnResult<
@@ -1708,8 +1770,30 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::BigInt)]
                             id: i64,
                         }
+                        // Codex P2 ("Lock children before the restrict pre-scan"):
+                        // this id selection acquires `FOR UPDATE` on every selected
+                        // child row BEFORE the read-only restrict pre-scan below runs
+                        // its `EXISTS` probes. Under READ COMMITTED an FK insert of a
+                        // `restrict` grandchild takes a `FOR KEY SHARE` lock on the
+                        // referenced child row; holding `FOR UPDATE` on that row here
+                        // blocks such an insert until this transaction commits/rolls
+                        // back, so a concurrent grandchild cannot slip in between the
+                        // pre-scan `EXISTS` probe and either the Phase-2 child reload /
+                        // `before_delete` hook or the child delete. The Phase-2 reload
+                        // still calls `.for_update()`, but that is now a re-lock of a
+                        // row already held (a no-op) rather than the FIRST lock — the
+                        // TOCTOU window between probe and hook/delete is closed. The
+                        // lock is hoisted from Phase 2 to here (same parent -> child
+                        // order, same rows), so it introduces no new lock-ordering /
+                        // deadlock class. `ORDER BY id` also makes the lock acquisition
+                        // order deterministic across concurrent cascades. This covers
+                        // the single `delete_by_id` path and both `delete_many` bulk
+                        // paths (they all reach this shared helper), and both soft and
+                        // hard child deletes (the `#destroy_live_filter` gate is applied
+                        // BEFORE `FOR UPDATE`, so the locked row set matches the rows
+                        // the pre-scan + mutating pass operate on).
                         let __q = format!(
-                            "SELECT id FROM \"{}\" WHERE \"{}\" = $1{} ORDER BY id",
+                            "SELECT id FROM \"{}\" WHERE \"{}\" = $1{} ORDER BY id FOR UPDATE",
                             __table, __fk_column, #destroy_live_filter
                         );
                         let __ids: ::std::vec::Vec<__AutumnDepId> =
@@ -1718,13 +1802,62 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 .load::<__AutumnDepId>(conn)
                                 .await
                                 .map_err(::autumn_web::AutumnError::from)?;
+                        // #1800 case 2: PRE-SCAN pass. Probe the `restrict`
+                        // grandchildren of EVERY selected child id BEFORE any child
+                        // `before_delete` hook fires. Codex round-5-A already ordered
+                        // a child's own grandchild restrict ahead of that SAME child's
+                        // hook, but the probe was still inside the per-child mutating
+                        // loop — so with multiple siblings an EARLIER sibling's
+                        // before_delete fired and only THEN a LATER sibling's restrict
+                        // grandchild returned the 409. The transaction rolls back, but
+                        // a non-transactional hook side effect does not. Hoisting the
+                        // read-only probe into its own pass over all ids closes that
+                        // window; the probe mutates neither `__path` nor `__deleted`
+                        // (a `restrict` action is a pure `SELECT EXISTS`), so it is
+                        // safe to run ahead of — and without re-running in — the
+                        // mutating pass below.
+                        for __row in &__ids {
+                            let __cid = __row.id;
+                            // #1800 (Codex "Re-probe restricts on hard revisits"):
+                            // skip a row already PHYSICALLY removed elsewhere (its
+                            // restrict grandchildren, if any, were probed on that
+                            // path). This consults `__physical`, NOT the "all handled"
+                            // `__deleted`, to stay consistent with the Phase-2 diamond
+                            // revisit-skip below: a row merely SOFT-deleted on an
+                            // earlier path is still in `__deleted` but NOT in
+                            // `__physical`, so a later HARD-delete revisit (mixed
+                            // soft/hard diamond) still re-runs this restrict pre-scan.
+                            // If the pre-scan keyed on `__deleted` it would skip the
+                            // probe while Phase-2 (keyed on `__physical`) still hard-
+                            // deletes the row — firing the child hook and falling
+                            // through to a raw FK failure instead of the typed 409
+                            // when the row has a soft-deleted restrict dependent. The
+                            // hard-path probe drops the live filter (`__parent_soft`
+                            // is false on that path), so it INCLUDES the soft-deleted
+                            // dependent and returns the 409 before any hook. The probe
+                            // body may be empty (no restrict grandchildren), so this is
+                            // written as a positive guard rather than an early
+                            // `continue` (which clippy flags as redundant when it is
+                            // the loop's last statement).
+                            if !__physical.contains(&(#table_name, __cid)) {
+                                #grandchild_restrict_cascade
+                            }
+                        }
+                        // Phase 2: now that every sibling's restrict grandchildren
+                        // have passed, fire hooks and mutate.
                         for __row in __ids {
                             let __cid = __row.id;
-                            // Codex round-5-B: skip a row already DELETED (genuinely
-                            // gone) — dedup across independent batch roots / branches,
-                            // and prevents re-firing a row's hooks when it is reached
-                            // again as another root's descendant.
-                            if __deleted.contains(&(#table_name, __cid)) {
+                            // Codex round-5-B + #1800 case 1: the diamond traversal
+                            // revisit-skip. Skip a row already PHYSICALLY removed
+                            // (genuinely gone) — dedup across independent batch roots
+                            // / branches. This consults `__physical`, NOT the "all
+                            // handled" `__deleted`: a row soft-deleted on an earlier
+                            // path is NOT physically gone, so a later HARD path (mixed
+                            // soft/hard diamond) must still reach and physically remove
+                            // it. A redundant SOFT re-visit is instead caught by the
+                            // `__record.deleted_at` guard below (once reloaded), so a
+                            // soft-handled row is not re-hooked either.
+                            if __physical.contains(&(#table_name, __cid)) {
                                 continue;
                             }
                             // #1739 cycle guard (now the ACTIVE-path stack): skip a
@@ -1754,13 +1887,15 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 .optional()
                                 .map_err(::autumn_web::AutumnError::from)?;
                             if let ::core::option::Option::Some(__record) = __record {
+                                // #1800 case 1: skip a redundant SOFT re-visit of an
+                                // already-soft-deleted row (it is not in `__deleted`).
+                                #destroy_soft_revisit_skip
                                 #destroy_ctx_decl
-                                // Codex round-5-A: probe this child's own `restrict`
-                                // grandchildren (read-only 409) BEFORE firing the
-                                // child's `before_delete` hook — a blocked delete
-                                // then never leaves a non-transactional hook side
-                                // effect behind on a doomed transaction.
-                                #grandchild_restrict_cascade
+                                // #1800 case 2: this child's own `restrict`
+                                // grandchildren were already probed in the pre-scan
+                                // pass above (read-only 409), so the child
+                                // `before_delete` hook only ever fires once every
+                                // reachable sibling restrict has passed.
                                 #destroy_before_delete
                                 // #1739: mutate this child's OWN dependents
                                 // (grandchildren) before removing the child row, so
@@ -1768,11 +1903,10 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 // grandchild and never FK-fails the child delete.
                                 #grandchild_mutating_cascade
                                 #destroy_mutation
-                                // Codex round-5-B: the row is now truly removed —
-                                // record it so any later traversal that reaches it
-                                // (another batch root's descendant, a sibling cascade)
-                                // skips it instead of re-deleting / re-hooking.
-                                __deleted.insert((#table_name, __cid));
+                                // #1800 case 1: record the row as gone ONLY when it
+                                // was physically deleted (a soft-deleted row stays
+                                // reachable for a later hard-delete path).
+                                #destroy_deleted_mark
                                 #destroy_post_mutation
                             }
                             // Codex round-5-B: pop this row off the ACTIVE path once
@@ -1827,6 +1961,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         #delete_many_parent_soft_lit,
                         &mut __autumn_path,
                         &mut __autumn_deleted,
+                        &mut __autumn_physically_deleted,
                     )
                     .await?
             );
@@ -1903,6 +2038,11 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             ::std::collections::HashSet::new();
         let mut __autumn_deleted: ::std::collections::HashSet<(&'static str, i64)> =
             ::std::collections::HashSet::new();
+        // #1800 case 1: the physical-delete subset, consulted only by the diamond
+        // revisit-skip inside the leaf executor (not by the bulk root dedup, which
+        // uses the "all handled" `__autumn_deleted`).
+        let mut __autumn_physically_deleted: ::std::collections::HashSet<(&'static str, i64)> =
+            ::std::collections::HashSet::new();
         let mut __autumn_dep_broadcasts: ::std::vec::Vec<(::std::string::String, ::std::string::String)> =
             ::std::vec::Vec::new();
         let mut __autumn_dep_parent_ids: ::std::vec::Vec<i64> = ::std::vec::Vec::new();
@@ -1960,6 +2100,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         #delete_many_parent_soft_lit,
                         &mut __autumn_path,
                         &mut __autumn_deleted,
+                        &mut __autumn_physically_deleted,
                     )
                     .await?
                 );
@@ -1987,6 +2128,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         #delete_many_parent_soft_lit,
                         &mut __autumn_path,
                         &mut __autumn_deleted,
+                        &mut __autumn_physically_deleted,
                     )
                     .await?
                 );
@@ -8837,71 +8979,90 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         } else {
             quote! {}
         };
-        // Assemble the full transactional delete body around a given
-        // per-child cascade block (`cascade_calls`). Shared by the
-        // repository-attribute and model-declared (#1738) cascade forms.
-        let assemble_cascade_body = |cascade_calls: proc_macro2::TokenStream| {
-            quote! {
-                use ::autumn_web::reexports::diesel::prelude::*;
-                use ::autumn_web::reexports::diesel_async::RunQueryDsl;
-                use ::autumn_web::reexports::diesel_async::AsyncConnection;
-                use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
-                #parent_hooks_use
+        // Assemble the full transactional delete body around a given cascade,
+        // split into its read-only `restrict` PROBE block and its mutating block.
+        // Shared by the repository-attribute and model-declared (#1738) cascade
+        // forms. #1800 case 3: the parent's `restrict` dependents are probed
+        // BEFORE the parent's own `before_delete` hook fires (mirroring the
+        // child-tier ordering) — a `restrict` 409 must not leave a
+        // non-transactional parent hook side effect behind on a doomed
+        // transaction. The mutating dependents still run AFTER the hook (so a
+        // hook that vetoes the delete short-circuits them) and BEFORE the parent
+        // row mutation (so no FK dangles).
+        let assemble_cascade_body =
+            |cascade_restrict_calls: proc_macro2::TokenStream,
+             cascade_mutating_calls: proc_macro2::TokenStream| {
+                quote! {
+                    use ::autumn_web::reexports::diesel::prelude::*;
+                    use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                    use ::autumn_web::reexports::diesel_async::AsyncConnection;
+                    use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
+                    #parent_hooks_use
 
-                #parent_register
-                #tenant_id_setup
-                let mut conn = self.__autumn_acquire_conn().await?;
-                // Deferred OOB delete broadcasts for broadcasts-only cascaded children
-                // (#1369). Accumulated inside the tx and returned on commit, so a
-                // rollback drops them and no spurious client deletes are published.
-                let __autumn_dep_broadcasts: ::std::vec::Vec<(::std::string::String, ::std::string::String)> =
-                    ::autumn_web::__private::scoped_transaction::<
-                        ::std::vec::Vec<(::std::string::String, ::std::string::String)>,
-                        ::autumn_web::AutumnError, _, _,
-                    >(
-                        &mut *conn,
-                        |conn| {
-                            async move {
-                                let mut __autumn_dep_broadcasts: ::std::vec::Vec<(::std::string::String, ::std::string::String)> =
-                                    ::std::vec::Vec::new();
-                                #parent_ctx_decl
-                                #parent_idempotency_setup
+                    #parent_register
+                    #tenant_id_setup
+                    let mut conn = self.__autumn_acquire_conn().await?;
+                    // Deferred OOB delete broadcasts for broadcasts-only cascaded children
+                    // (#1369). Accumulated inside the tx and returned on commit, so a
+                    // rollback drops them and no spurious client deletes are published.
+                    let __autumn_dep_broadcasts: ::std::vec::Vec<(::std::string::String, ::std::string::String)> =
+                        ::autumn_web::__private::scoped_transaction::<
+                            ::std::vec::Vec<(::std::string::String, ::std::string::String)>,
+                            ::autumn_web::AutumnError, _, _,
+                        >(
+                            &mut *conn,
+                            |conn| {
+                                async move {
+                                    let mut __autumn_dep_broadcasts: ::std::vec::Vec<(::std::string::String, ::std::string::String)> =
+                                        ::std::vec::Vec::new();
+                                    #parent_ctx_decl
+                                    #parent_idempotency_setup
 
-                                #parent_load
+                                    #parent_load
 
-                                #parent_before_delete
+                                    // #1800 case 3: probe the parent's `restrict`
+                                    // dependents (read-only 409) BEFORE the parent
+                                    // `before_delete` hook — a blocked delete then never
+                                    // leaves a non-transactional parent hook side effect
+                                    // behind on a rolled-back transaction. Declares the
+                                    // cascade cycle-guard sets, which the mutating block
+                                    // below reuses.
+                                    #cascade_restrict_calls
 
-                                // Cascade to dependent children FIRST so the parent
-                                // delete never trips a foreign-key constraint and no
-                                // orphan can survive the transaction.
-                                #cascade_calls
+                                    #parent_before_delete
 
-                                #parent_mutation
+                                    // Cascade the mutating dependents (destroy/nullify/
+                                    // delete_all) AFTER the hook but BEFORE the parent row
+                                    // is removed, so the parent delete never trips a
+                                    // foreign-key constraint and no orphan can survive.
+                                    #cascade_mutating_calls
 
-                                #parent_vh
+                                    #parent_mutation
 
-                                #parent_commit_enqueue
+                                    #parent_vh
 
-                                Ok(__autumn_dep_broadcasts)
-                            }
-                            .scope_boxed()
-                        },
-                    )
-                    .await?;
-                ::core::mem::drop(conn);
-                // Publish the cascaded children's OOB delete broadcasts only now that
-                // the transaction has committed (a rolled-back cascade published
-                // nothing). No-op when the buffer is empty / live channels are off.
-                ::autumn_web::repository::publish_deferred_dependent_broadcasts(__autumn_dep_broadcasts);
-                // Always kick the durable commit-hook dispatcher after a dependent
-                // delete: even when this parent has no commit hooks, a cascaded
-                // `dependent = destroy` child may have enqueued one in the same
-                // transaction. The kick is idempotent.
-                ::autumn_web::__private::kick_repository_commit_hook_dispatcher(&self.pool);
+                                    #parent_commit_enqueue
 
-                Ok(())
-            }
-        };
+                                    Ok(__autumn_dep_broadcasts)
+                                }
+                                .scope_boxed()
+                            },
+                        )
+                        .await?;
+                    ::core::mem::drop(conn);
+                    // Publish the cascaded children's OOB delete broadcasts only now that
+                    // the transaction has committed (a rolled-back cascade published
+                    // nothing). No-op when the buffer is empty / live channels are off.
+                    ::autumn_web::repository::publish_deferred_dependent_broadcasts(__autumn_dep_broadcasts);
+                    // Always kick the durable commit-hook dispatcher after a dependent
+                    // delete: even when this parent has no commit hooks, a cascaded
+                    // `dependent = destroy` child may have enqueued one in the same
+                    // transaction. The kick is idempotent.
+                    ::autumn_web::__private::kick_repository_commit_hook_dispatcher(&self.pool);
+
+                    Ok(())
+                }
+            };
 
         if config.dependents.is_empty() {
             // ── #1738: model-declared `#[has_many(dependent = ...)]` cascade ──
@@ -8915,7 +9076,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             // cascade as the repository-attribute form, resolving each child
             // repository through the `Pg{Child}Repository` convention baked into
             // the spec's `cascade` thunk.
-            let runtime_cascade_calls = quote! {
+            let runtime_cascade_restrict = quote! {
                 // Codex round-5-B cycle guard: the ACTIVE recursion path, seeded
                 // with this parent row so a grandchild that references an ancestor
                 // is skipped (cycle) instead of looping, plus a monotonic deleted
@@ -8925,9 +9086,13 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     ::std::collections::HashSet::new();
                 let mut __autumn_deleted: ::std::collections::HashSet<(&'static str, i64)> =
                     ::std::collections::HashSet::new();
+                // #1800 case 1: physical-delete subset for the diamond revisit-skip.
+                let mut __autumn_physically_deleted: ::std::collections::HashSet<(&'static str, i64)> =
+                    ::std::collections::HashSet::new();
                 __autumn_path.insert((#table_name, id));
-                // Phase 1: probe all `restrict` dependents first — a 409 here
-                // rolls back before any mutating action fires a child hook.
+                // #1800 case 3 / Phase 1: probe all `restrict` dependents first —
+                // a 409 here rolls back before the parent `before_delete` hook (and
+                // any mutating action's child hook) fires.
                 for __autumn_spec in __autumn_rt_deps.iter().filter(|__s|
                     __s.action == ::autumn_web::repository::DependentAction::Restrict
                 ) {
@@ -8939,11 +9104,15 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             #parent_soft_lit,
                             &mut __autumn_path,
                             &mut __autumn_deleted,
+                            &mut __autumn_physically_deleted,
                         )
                         .await?
                     );
                 }
-                // Phase 2: mutating dependents in declaration order.
+            };
+            let runtime_cascade_mutating = quote! {
+                // Phase 2: mutating dependents in declaration order. Reuses the
+                // cycle-guard sets declared by the restrict block above.
                 for __autumn_spec in __autumn_rt_deps.iter().filter(|__s|
                     __s.action != ::autumn_web::repository::DependentAction::Restrict
                 ) {
@@ -8955,12 +9124,14 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             #parent_soft_lit,
                             &mut __autumn_path,
                             &mut __autumn_deleted,
+                            &mut __autumn_physically_deleted,
                         )
                         .await?
                     );
                 }
             };
-            let runtime_body = assemble_cascade_body(runtime_cascade_calls);
+            let runtime_body =
+                assemble_cascade_body(runtime_cascade_restrict, runtime_cascade_mutating);
             let plain_delete_body = delete_body;
             quote! {
                 use ::autumn_web::repository::AutumnDependents as _;
@@ -9010,6 +9181,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 #parent_soft_lit,
                                 &mut __autumn_path,
                                 &mut __autumn_deleted,
+                                &mut __autumn_physically_deleted,
                             )
                             .await?
                     );
@@ -9027,7 +9199,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 .filter(|dep| dep.action != DependentAction::Restrict)
                 .map(&emit_cascade_call)
                 .collect();
-            let cascade_calls = quote! {
+            let cascade_restrict_calls = quote! {
                 // ── #1788: both-sites override diagnostic ────────────────────
                 //
                 // The repository-attribute `dependent(...)` above is authoritative
@@ -9042,6 +9214,8 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 // resolves to the model's inherent shadow (real specs) when present
                 // and to the blanket `AutumnDependents` fallback (empty slice)
                 // otherwise, so the `use` is required for the fallback to resolve.
+                // Runs at the very top of the restrict (Phase 1) block, before any
+                // restrict probe or the parent `before_delete` hook fires.
                 if ::core::cfg!(debug_assertions) {
                     use ::autumn_web::repository::AutumnDependents as _;
                     if !#model_name::dependents().is_empty() {
@@ -9064,14 +9238,21 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     ::std::collections::HashSet::new();
                 let mut __autumn_deleted: ::std::collections::HashSet<(&'static str, i64)> =
                     ::std::collections::HashSet::new();
+                // #1800 case 1: physical-delete subset for the diamond revisit-skip.
+                let mut __autumn_physically_deleted: ::std::collections::HashSet<(&'static str, i64)> =
+                    ::std::collections::HashSet::new();
                 __autumn_path.insert((#table_name, id));
-                // Phase 1: probe all `restrict` dependents first — a 409 here
-                // rolls back before any mutating action fires a child hook.
+                // #1800 case 3 / Phase 1: probe all `restrict` dependents first —
+                // a 409 here rolls back before the parent `before_delete` hook (and
+                // any mutating action's child hook) fires.
                 #(#restrict_calls)*
-                // Phase 2: mutating dependents in declaration order.
+            };
+            let cascade_mutating_calls = quote! {
+                // Phase 2: mutating dependents in declaration order. Reuses the
+                // cycle-guard sets declared by the restrict block above.
                 #(#mutating_calls)*
             };
-            assemble_cascade_body(cascade_calls)
+            assemble_cascade_body(cascade_restrict_calls, cascade_mutating_calls)
         }
     };
 
@@ -16427,6 +16608,320 @@ mod tests {
             mutating_pos < child_delete_pos,
             "round-5-A: mutating grandchildren must still be removed BEFORE the child \
              row delete (deepest-first, no FK dangle): {destroy_arm}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_destroy_arm_pre_scans_sibling_restricts_before_any_hook() {
+        // #1800 case 2: the grandchild restrict probe must be hoisted into a
+        // PRE-SCAN pass over EVERY selected child id, ahead of the per-child
+        // mutating loop that fires `before_delete`. So with multiple destroy
+        // siblings a later sibling's restrict grandchild aborts before an earlier
+        // sibling's hook runs. Structurally: a `for __row in & __ids` pre-scan loop
+        // emits the grandchild restrict probe, then a separate `for __row in __ids`
+        // loop fires the child before_delete — with the probe strictly before the
+        // hook (and no probe left inside the mutating loop).
+        let generated = repository_macro(
+            quote! {
+                Comment,
+                hooks = CommentHooks,
+                dependent(PgReplyRepository, fk = "comment_id", on_delete = restrict),
+                dependent(PgLikeRepository, fk = "comment_id", on_delete = destroy)
+            },
+            quote! { pub trait CommentRepository {} },
+        )
+        .to_string();
+        let destroy_arm = dependent_destroy_arm(&generated);
+        let prescan_pos = destroy_arm
+            .find("for __row in & __ids")
+            .expect("#1800 case 2: a `for __row in &__ids` restrict pre-scan pass must be emitted");
+        let mutating_loop_pos = destroy_arm
+            .find("for __row in __ids")
+            .expect("the per-child mutating loop must still be emitted");
+        let restrict_probe_pos = destroy_arm
+            .find("PgReplyRepository")
+            .expect("grandchild restrict probe (Reply) must be emitted");
+        let before_delete_pos = destroy_arm
+            .find("before_delete")
+            .expect("child before_delete hook must be emitted");
+        assert!(
+            prescan_pos < mutating_loop_pos,
+            "#1800 case 2: the restrict pre-scan loop must precede the mutating loop: {destroy_arm}"
+        );
+        assert!(
+            prescan_pos < restrict_probe_pos && restrict_probe_pos < mutating_loop_pos,
+            "#1800 case 2: the grandchild restrict probe must live in the pre-scan loop \
+             (before the mutating loop), not inside the per-child mutating loop: {destroy_arm}"
+        );
+        assert!(
+            restrict_probe_pos < before_delete_pos,
+            "#1800 case 2: every sibling's restrict grandchild is probed before any \
+             child before_delete hook fires: {destroy_arm}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_destroy_arm_locks_child_ids_before_restrict_prescan() {
+        // Codex P2 ("Lock children before the restrict pre-scan"): the child-id
+        // selection that feeds the sibling restrict PRE-SCAN must acquire
+        // `FOR UPDATE` on the selected child rows. Otherwise, under READ
+        // COMMITTED, a concurrent FK insert of a `restrict` grandchild can commit
+        // AFTER this EXISTS pass and BEFORE the Phase-2 `for_update` child reload,
+        // so the child `before_delete` hook still fires and the hard delete falls
+        // through to a raw FK error (or a soft delete proceeds despite a live
+        // restrict dependent). Holding `FOR UPDATE` on the child row blocks the
+        // concurrent grandchild insert's `FOR KEY SHARE` on that referenced row,
+        // closing the TOCTOU window between probe and hook/delete. Structurally:
+        // the `SELECT id ... ORDER BY id FOR UPDATE` id query must precede the
+        // `for __row in & __ids` pre-scan loop.
+        let generated = repository_macro(
+            quote! {
+                Comment,
+                hooks = CommentHooks,
+                dependent(PgReplyRepository, fk = "comment_id", on_delete = restrict),
+                dependent(PgLikeRepository, fk = "comment_id", on_delete = destroy)
+            },
+            quote! { pub trait CommentRepository {} },
+        )
+        .to_string();
+        let destroy_arm = dependent_destroy_arm(&generated);
+        // The child-id selection SQL literal must acquire the row lock.
+        let id_lock_pos = destroy_arm.find("ORDER BY id FOR UPDATE").expect(
+            "Codex P2: the child-id selection feeding the restrict pre-scan must \
+             acquire FOR UPDATE (SELECT id ... ORDER BY id FOR UPDATE)",
+        );
+        let id_select_pos = destroy_arm
+            .find("SELECT id FROM")
+            .expect("the child-id selection query must be emitted");
+        let prescan_pos = destroy_arm
+            .find("for __row in & __ids")
+            .expect("the restrict pre-scan loop must be emitted");
+        assert!(
+            id_select_pos <= id_lock_pos,
+            "Codex P2: FOR UPDATE must belong to the child-id SELECT: {destroy_arm}"
+        );
+        assert!(
+            id_lock_pos < prescan_pos,
+            "Codex P2: the locked child-id SELECT must run BEFORE the restrict \
+             pre-scan EXISTS pass so no FK insert can slip between probe and hook: \
+             {destroy_arm}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_destroy_arm_separates_all_handled_from_physical_dedup() {
+        // #1800 case 1: the two dedup concerns are tracked in SEPARATE sets.
+        //   * `__deleted` records EVERY handled row (soft OR physical) — it backs the
+        //     bulk `delete_many` root dedup / hook double-fire guard, so a
+        //     soft-deleted descendant that is also a batch root is skipped by the
+        //     root hook loop (fires its `before_delete` exactly once).
+        //   * `__physical` records ONLY physically-removed rows — it backs the diamond
+        //     traversal revisit-skip, so a hard-delete path can still physically
+        //     remove a row a soft-delete path merely marked `deleted_at` on.
+        // For a `#[soft_delete]` child the `__deleted` mark is UNCONDITIONAL while the
+        // `__physical` mark is gated on a physical delete (`if ! __parent_soft`).
+        let soft = repository_macro(
+            quote! { Comment, soft_delete, dependent(PgReplyRepository, fk = "comment_id", on_delete = destroy) },
+            quote! { pub trait CommentRepository {} },
+        )
+        .to_string();
+        let soft_arm = dependent_destroy_arm(&soft);
+        // "All handled" mark is unconditional (NOT gated on `if ! __parent_soft`), so
+        // a soft-deleted row is recorded for the bulk-root dedup.
+        assert!(
+            soft_arm.contains("__deleted . insert")
+                && !soft_arm.contains("if ! __parent_soft { __deleted . insert"),
+            "#1800 case 1: a soft_delete child must record __deleted (all handled) \
+             UNCONDITIONALLY so the bulk-root dedup skips it: {soft_arm}"
+        );
+        // Physical mark is gated on a physical delete only.
+        assert!(
+            soft_arm.contains("if ! __parent_soft { __physical . insert"),
+            "#1800 case 1: a soft_delete child must record __physical only on a physical \
+             delete (`if ! __parent_soft`): {soft_arm}"
+        );
+        // The diamond revisit-skip consults the PHYSICAL set, not the all-handled set,
+        // so a soft-visited row is still reachable by a later hard path.
+        assert!(
+            soft_arm.contains("if __physical . contains"),
+            "#1800 case 1: the diamond revisit-skip must consult __physical: {soft_arm}"
+        );
+        assert!(
+            soft_arm.contains("if __parent_soft && __record . deleted_at . is_some")
+                && soft_arm.contains("continue"),
+            "#1800 case 1: a redundant soft re-visit of an already-soft-deleted row \
+             must be skipped: {soft_arm}"
+        );
+        // A non-soft child is always physically deleted, so BOTH marks are
+        // unconditional (no `if ! __parent_soft` gate on either) and there is no
+        // soft-revisit skip.
+        let hard = repository_macro(
+            quote! { Comment, dependent(PgReplyRepository, fk = "comment_id", on_delete = destroy) },
+            quote! { pub trait CommentRepository {} },
+        )
+        .to_string();
+        let hard_arm = dependent_destroy_arm(&hard);
+        assert!(
+            hard_arm.contains("__deleted . insert")
+                && hard_arm.contains("__physical . insert")
+                && !hard_arm.contains("if ! __parent_soft { __deleted . insert")
+                && !hard_arm.contains("if ! __parent_soft { __physical . insert"),
+            "#1800 case 1: a non-soft child must record BOTH __deleted and __physical \
+             unconditionally: {hard_arm}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_bulk_root_skip_uses_all_handled_not_physical_set() {
+        // #1800 case 1: the bulk `delete_many` root dedup guards — the Phase-2 root
+        // skip and the HOOKED root loop skip — must consult the "all handled"
+        // `__autumn_deleted` set (which records soft AND physical deletes), NOT the
+        // physical-only set. Otherwise a soft-deleted descendant that is also a batch
+        // root would not be skipped and its `before_delete` would fire twice. The
+        // per-row diamond revisit-skip inside the leaf executor, by contrast, consults
+        // the physical set.
+        let generated = repository_macro(
+            quote! { Node, soft_delete, hooks = NodeHooks, dependent(PgNodeRepository, fk = "parent_id", on_delete = destroy) },
+            quote! { pub trait NodeRepository {} },
+        )
+        .to_string();
+        let section = delete_many_section(&generated);
+        // The bulk-root dedup (Phase 2 + hooked root loop) references the all-handled
+        // set keyed by (table, id).
+        assert!(
+            section.contains("__autumn_deleted . contains (& (\"nodes\" , __autumn_pid))"),
+            "#1800: the bulk Phase-2 root skip must consult the all-handled \
+             __autumn_deleted set: {section}"
+        );
+        assert!(
+            section.contains("__autumn_deleted . contains (& (\"nodes\" , record . id))"),
+            "#1800: the hooked bulk-root hook loop skip must consult the all-handled \
+             __autumn_deleted set: {section}"
+        );
+        // The physical-only set is threaded into the bulk cascade calls (so the leaf
+        // executor's diamond revisit-skip has it) but is NOT what the bulk-root dedup
+        // consults.
+        assert!(
+            section.contains("__autumn_physically_deleted"),
+            "#1800: the physical-delete set must be threaded through the bulk cascade: {section}"
+        );
+        assert!(
+            !section.contains("__autumn_physically_deleted . contains"),
+            "#1800: the bulk-root dedup must NOT consult the physical-only set \
+             (that would regress soft-delete graphs): {section}"
+        );
+        // And the leaf executor's per-row diamond revisit-skip consults `__physical`.
+        let destroy_arm = dependent_destroy_arm(&generated);
+        assert!(
+            destroy_arm.contains("if __physical . contains"),
+            "#1800: the leaf diamond revisit-skip must consult the physical set: {destroy_arm}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_grandchild_restrict_prescan_skip_uses_physical_not_handled_set() {
+        // #1800 (Codex "Re-probe restricts on hard revisits"): the grandchild
+        // `restrict` PRE-SCAN skip must consult the PHYSICAL-delete set, NOT the
+        // "all handled" `__deleted` set. In a mixed soft/hard diamond a row that was
+        // soft-deleted on an earlier (soft-parent) path sits in `__deleted` but not
+        // in `__physical`. The Phase-2 mutating loop keys its revisit-skip on
+        // `__physical`, so it still hard-deletes that row on a later hard-delete
+        // path; the pre-scan MUST therefore also key on `__physical` so it re-runs
+        // the restrict probe on that hard revisit. If it kept keying on `__deleted`
+        // the probe would be skipped while the hard delete proceeds — firing the
+        // child hook and falling through to a raw FK failure instead of the typed
+        // 409 when the row has a soft-deleted restrict dependent.
+        let generated = repository_macro(
+            quote! { Comment, soft_delete, dependent(PgReplyRepository, fk = "comment_id", on_delete = restrict) },
+            quote! { pub trait CommentRepository {} },
+        )
+        .to_string();
+        let destroy_arm = dependent_destroy_arm(&generated);
+        // Isolate the read-only restrict PRE-SCAN region: it iterates the ids by
+        // reference (`for __row in & __ids`) and ends where the Phase-2 mutating
+        // loop iterates them by value (`for __row in __ids`).
+        let prescan_start = destroy_arm
+            .find("for __row in & __ids")
+            .expect("#1800: restrict pre-scan loop (by-ref) present");
+        let after = &destroy_arm[prescan_start..];
+        let prescan_end = after
+            .find("for __row in __ids")
+            .expect("#1800: Phase-2 mutating loop (by-value) present");
+        let prescan = &after[..prescan_end];
+        // The pre-scan skip guard consults the physical set...
+        assert!(
+            prescan.contains("if ! __physical . contains"),
+            "#1800: the grandchild restrict pre-scan skip must consult __physical: {prescan}"
+        );
+        // ...and NOT the "all handled" set (which would skip the probe on a hard
+        // revisit of a soft-deleted row, letting the hard delete FK-fail).
+        assert!(
+            !prescan.contains("if ! __deleted . contains"),
+            "#1800: the grandchild restrict pre-scan skip must NOT consult the \
+             all-handled __deleted set (regresses the mixed soft/hard diamond): {prescan}"
+        );
+        // Consistency: the Phase-2 diamond revisit-skip below already keys on
+        // `__physical`, so the pre-scan now matches it.
+        assert!(
+            destroy_arm.contains("if __physical . contains"),
+            "#1800: the Phase-2 diamond revisit-skip must consult __physical: {destroy_arm}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_parent_restrict_probed_before_parent_before_delete_hook() {
+        // #1800 case 3: `assemble_cascade_body` must emit the parent's `restrict`
+        // dependent probe BEFORE the parent `before_delete` hook, mirroring the
+        // child-tier ordering — a restrict 409 must not leave a non-transactional
+        // parent hook side effect behind. Covers BOTH the repository-attribute
+        // (compile-time) and the model-declared (runtime) cascade branches.
+        //
+        // Repository-attribute branch: a hooked parent with a restrict dependent.
+        let repo_attr = repository_macro(
+            quote! { Post, hooks = PostHooks, dependent(PgGuardRepository, fk = "post_id", on_delete = restrict) },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        let section = delete_by_id_section(&repo_attr);
+        let restrict_pos = section
+            .find("DependentAction :: Restrict")
+            .expect("the parent restrict cascade call must be emitted");
+        let hook_pos = section
+            .find("self . hooks . before_delete")
+            .expect("the parent before_delete hook must be emitted");
+        assert!(
+            restrict_pos < hook_pos,
+            "#1800 case 3 (repo-attribute): the parent restrict probe must precede the \
+             parent before_delete hook: {section}"
+        );
+
+        // Model-declared branch: no repository-attribute dependent(...), so the
+        // parent cascade dispatches at runtime via Model::dependents(). The
+        // generated body has two arms (`if __autumn_rt_deps.is_empty()` plain path,
+        // `else` runtime-cascade path); scope to the runtime arm (it seeds
+        // `__autumn_path`) so the plain arm's hook doesn't confuse the ordering. The
+        // Phase-1 restrict loop (filtering on DependentAction::Restrict) must precede
+        // the parent before_delete hook there.
+        let model_side = repository_macro(
+            quote! { Post, hooks = PostHooks },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        let section = delete_by_id_section(&model_side);
+        let runtime_arm_pos = section
+            .find("__autumn_path . insert")
+            .expect("the runtime cascade arm (seeding __autumn_path) must be emitted");
+        let runtime_arm = &section[runtime_arm_pos..];
+        let restrict_pos = runtime_arm
+            .find("== :: autumn_web :: repository :: DependentAction :: Restrict")
+            .expect("the runtime Phase-1 restrict filter must be emitted");
+        let hook_pos = runtime_arm
+            .find("self . hooks . before_delete")
+            .expect("the parent before_delete hook must be emitted");
+        assert!(
+            restrict_pos < hook_pos,
+            "#1800 case 3 (model-declared): the runtime restrict probe loop must precede \
+             the parent before_delete hook: {runtime_arm}"
         );
     }
 

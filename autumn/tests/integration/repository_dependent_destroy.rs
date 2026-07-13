@@ -724,6 +724,70 @@ pub struct ChainNode {
 )]
 pub trait ChainNodeRepository {}
 
+// ── #1800 case 1 (regression): bulk soft-delete must not double-fire hooks ─────
+//
+// A `#[soft_delete]` HOOKED self-referential `dependent = destroy` graph.
+// `bsd_nodes.parent_id` references the same table (DEFERRABLE self-FK so the whole
+// component can be handled in one transaction), the repo is `soft_delete`, and the
+// model logs every `before_delete`. Anc(1) ← Desc(2) (Desc.parent_id = Anc).
+// `delete_many([Desc, Anc])` — the descendant AND its ancestor — must fire Desc's
+// `before_delete` hook EXACTLY ONCE.
+//
+// This is the regression the first #1800 fix introduced: because the ancestor's
+// soft cascade soft-deletes Desc, and the (buggy) fix only recorded PHYSICALLY
+// deleted rows in `__deleted`, the bulk root hook loop no longer saw Desc as
+// already-handled and fired its `before_delete` a SECOND time (once as the
+// cascaded descendant, once as the batch root). Tracking every HANDLED row —
+// soft OR physical — in the "all handled" set (while a SEPARATE physical set backs
+// the diamond revisit-skip) restores single-firing for soft-delete graphs.
+
+pub static BSD_DELETE_LOG: Mutex<Vec<i64>> = Mutex::new(Vec::new());
+
+#[derive(Clone, Default)]
+pub struct BsdNodeHooks;
+
+impl MutationHooks for BsdNodeHooks {
+    type Model = BsdNode;
+    type NewModel = NewBsdNode;
+    type UpdateModel = UpdateBsdNode;
+
+    async fn before_delete(
+        &self,
+        _ctx: &mut MutationContext,
+        record: &BsdNode,
+    ) -> AutumnResult<()> {
+        BSD_DELETE_LOG.lock().unwrap().push(record.id);
+        Ok(())
+    }
+}
+
+diesel::table! {
+    bsd_nodes (id) {
+        id -> Int8,
+        parent_id -> Nullable<Int8>,
+        name -> Text,
+        deleted_at -> Nullable<Timestamp>,
+    }
+}
+
+#[autumn_web::model(table = "bsd_nodes")]
+pub struct BsdNode {
+    #[id]
+    pub id: i64,
+    pub parent_id: Option<i64>,
+    pub name: String,
+    pub deleted_at: Option<chrono::NaiveDateTime>,
+}
+
+#[autumn_web::repository(
+    BsdNode,
+    table = "bsd_nodes",
+    soft_delete,
+    hooks = BsdNodeHooks,
+    dependent(PgBsdNodeRepository, fk = "parent_id", on_delete = destroy)
+)]
+pub trait BsdNodeRepository {}
+
 // ── #1740: a HOOKED parent that also declares a dependent ─────────────────────
 //
 // All the dependent-declaring parents above are hook-free, so they exercise the
@@ -762,6 +826,358 @@ pub struct DepHookedPost {
     dependent(PgDepCommentRepository, fk = "post_id", on_delete = destroy)
 )]
 pub trait DepHookedPostRepository {}
+
+// ── #1800 case 1: mixed soft/hard-delete diamond ──────────────────────────────
+//
+// A SOFT parent (`dia_roots`) `destroy`s two children:
+//   - `dia_softs`  — a `#[soft_delete]` model (soft-deleted under a soft parent), and
+//   - `dia_hards`  — a NON-soft model (always hard-deleted).
+// Both children `destroy` the SAME grandchild table `dia_leaves` (a `#[soft_delete]`
+// model) via two different FKs: a leaf references its soft parent (`soft_id`) AND
+// its hard parent (`hard_id`). Because the soft child is processed FIRST, the leaf
+// is reached first through the soft branch (soft-deleted), then through the hard
+// branch (must be HARD-deleted, since its `hard_id` FK references a row that is
+// being physically removed).
+//
+// Before #1800 the leaf was added to the traversal `__deleted` set on the soft
+// delete, so the hard branch SKIPPED it — leaving the leaf physically present with
+// a `hard_id` pointing at the now-deleted hard row (an IMMEDIATE FK violation, i.e.
+// a 500, and a dangling FK). After #1800 a soft delete no longer records the row in
+// `__deleted`, so the hard branch still reaches and physically removes it.
+
+diesel::table! {
+    dia_roots (id) {
+        id -> Int8,
+        title -> Text,
+        deleted_at -> Nullable<Timestamp>,
+    }
+}
+
+#[autumn_web::model(table = "dia_roots")]
+pub struct DiaRoot {
+    #[id]
+    pub id: i64,
+    pub title: String,
+    pub deleted_at: Option<chrono::NaiveDateTime>,
+}
+
+// The soft child is declared BEFORE the hard child, so the cascade processes the
+// soft branch first (the order that triggers the pre-#1800 dangling-FK bug).
+#[autumn_web::repository(
+    DiaRoot,
+    table = "dia_roots",
+    soft_delete,
+    dependent(PgDiaSoftRepository, fk = "root_id", on_delete = destroy),
+    dependent(PgDiaHardRepository, fk = "root_id", on_delete = destroy)
+)]
+pub trait DiaRootRepository {}
+
+diesel::table! {
+    dia_softs (id) {
+        id -> Int8,
+        root_id -> Int8,
+        deleted_at -> Nullable<Timestamp>,
+    }
+}
+
+#[autumn_web::model(table = "dia_softs")]
+pub struct DiaSoft {
+    #[id]
+    pub id: i64,
+    pub root_id: i64,
+    pub deleted_at: Option<chrono::NaiveDateTime>,
+}
+
+#[autumn_web::repository(
+    DiaSoft,
+    table = "dia_softs",
+    soft_delete,
+    dependent(PgDiaLeafRepository, fk = "soft_id", on_delete = destroy)
+)]
+pub trait DiaSoftRepository {}
+
+diesel::table! {
+    dia_hards (id) {
+        id -> Int8,
+        root_id -> Int8,
+    }
+}
+
+#[autumn_web::model(table = "dia_hards")]
+pub struct DiaHard {
+    #[id]
+    pub id: i64,
+    pub root_id: i64,
+}
+
+#[autumn_web::repository(
+    DiaHard,
+    table = "dia_hards",
+    dependent(PgDiaLeafRepository, fk = "hard_id", on_delete = destroy)
+)]
+pub trait DiaHardRepository {}
+
+diesel::table! {
+    dia_leaves (id) {
+        id -> Int8,
+        soft_id -> Int8,
+        hard_id -> Int8,
+        deleted_at -> Nullable<Timestamp>,
+    }
+}
+
+#[autumn_web::model(table = "dia_leaves")]
+pub struct DiaLeaf {
+    #[id]
+    pub id: i64,
+    pub soft_id: i64,
+    pub hard_id: i64,
+    pub deleted_at: Option<chrono::NaiveDateTime>,
+}
+
+#[autumn_web::repository(DiaLeaf, table = "dia_leaves", soft_delete)]
+pub trait DiaLeafRepository {}
+
+// ── #1800 (Codex "Re-probe restricts on hard revisits"): a mixed soft/hard ─────
+// diamond where the shared soft leaf has a SOFT-DELETED `restrict` dependent.
+//
+// Same diamond shape as `dia_*`, but the leaf (`dhr_leaves`, a `#[soft_delete]`
+// model) additionally:
+//   - fires a `before_delete` hook (so we can count how many times it runs), and
+//   - declares a `restrict` dependent (`dhr_guards`, itself `#[soft_delete]`).
+//
+// Graph: soft parent `dhr_roots` destroys a soft child (`dhr_softs`, declared
+// FIRST) and a hard child (`dhr_hards`, declared SECOND); both destroy the SAME
+// leaf via `soft_id` / `hard_id`. The leaf restrict-depends on `dhr_guards`.
+//
+// The test pre-SOFT-deletes the guard, then deletes the root:
+//   * Soft branch (processed first): the leaf is soft-deleted under the soft
+//     child. Its restrict probe runs with `__parent_soft == true`, so the live
+//     filter keeps the soft-deleted guard OUT — no 409, the leaf hook fires once,
+//     and the leaf lands in the "all handled" `__deleted` set but NOT `__physical`.
+//   * Hard branch: the leaf is reached again through the hard child, which HARD-
+//     deletes. The pre-scan skip now keys on `__physical` (the fix), so it re-runs
+//     the leaf restrict probe — this time with `__parent_soft == false`, dropping
+//     the live filter so the soft-deleted guard IS included → typed 409 BEFORE the
+//     leaf hook fires a second time and BEFORE the hard DELETE hits the guard FK.
+//
+// RED before the fix: the pre-scan skip keyed on `__deleted`, which already held
+// the soft-deleted leaf, so the hard-path probe was SKIPPED; Phase-2 (keyed on
+// `__physical`) still ran, firing the leaf hook a second time and hard-deleting the
+// leaf, which fell through to a raw FK failure (500) against the still-present
+// soft-deleted guard.
+
+pub static DHR_LEAF_HOOK_FIRED: AtomicUsize = AtomicUsize::new(0);
+
+#[derive(Clone, Default)]
+pub struct DhrLeafHooks;
+
+impl MutationHooks for DhrLeafHooks {
+    type Model = DhrLeaf;
+    type NewModel = NewDhrLeaf;
+    type UpdateModel = UpdateDhrLeaf;
+
+    async fn before_delete(
+        &self,
+        _ctx: &mut MutationContext,
+        _record: &DhrLeaf,
+    ) -> AutumnResult<()> {
+        DHR_LEAF_HOOK_FIRED.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+diesel::table! {
+    dhr_roots (id) {
+        id -> Int8,
+        title -> Text,
+        deleted_at -> Nullable<Timestamp>,
+    }
+}
+
+#[autumn_web::model(table = "dhr_roots")]
+pub struct DhrRoot {
+    #[id]
+    pub id: i64,
+    pub title: String,
+    pub deleted_at: Option<chrono::NaiveDateTime>,
+}
+
+// Soft child declared BEFORE the hard child, so the cascade soft-deletes the leaf
+// first and only THEN reaches it through the hard branch (the revisit).
+#[autumn_web::repository(
+    DhrRoot,
+    table = "dhr_roots",
+    soft_delete,
+    dependent(PgDhrSoftRepository, fk = "root_id", on_delete = destroy),
+    dependent(PgDhrHardRepository, fk = "root_id", on_delete = destroy)
+)]
+pub trait DhrRootRepository {}
+
+diesel::table! {
+    dhr_softs (id) {
+        id -> Int8,
+        root_id -> Int8,
+        deleted_at -> Nullable<Timestamp>,
+    }
+}
+
+#[autumn_web::model(table = "dhr_softs")]
+pub struct DhrSoft {
+    #[id]
+    pub id: i64,
+    pub root_id: i64,
+    pub deleted_at: Option<chrono::NaiveDateTime>,
+}
+
+#[autumn_web::repository(
+    DhrSoft,
+    table = "dhr_softs",
+    soft_delete,
+    dependent(PgDhrLeafRepository, fk = "soft_id", on_delete = destroy)
+)]
+pub trait DhrSoftRepository {}
+
+diesel::table! {
+    dhr_hards (id) {
+        id -> Int8,
+        root_id -> Int8,
+    }
+}
+
+#[autumn_web::model(table = "dhr_hards")]
+pub struct DhrHard {
+    #[id]
+    pub id: i64,
+    pub root_id: i64,
+}
+
+#[autumn_web::repository(
+    DhrHard,
+    table = "dhr_hards",
+    dependent(PgDhrLeafRepository, fk = "hard_id", on_delete = destroy)
+)]
+pub trait DhrHardRepository {}
+
+diesel::table! {
+    dhr_leaves (id) {
+        id -> Int8,
+        soft_id -> Int8,
+        hard_id -> Int8,
+        deleted_at -> Nullable<Timestamp>,
+    }
+}
+
+#[autumn_web::model(table = "dhr_leaves")]
+pub struct DhrLeaf {
+    #[id]
+    pub id: i64,
+    pub soft_id: i64,
+    pub hard_id: i64,
+    pub deleted_at: Option<chrono::NaiveDateTime>,
+}
+
+// The leaf both fires a `before_delete` hook AND restrict-depends on `dhr_guards`.
+#[autumn_web::repository(
+    DhrLeaf,
+    table = "dhr_leaves",
+    soft_delete,
+    hooks = DhrLeafHooks,
+    dependent(PgDhrGuardRepository, fk = "leaf_id", on_delete = restrict)
+)]
+pub trait DhrLeafRepository {}
+
+diesel::table! {
+    dhr_guards (id) {
+        id -> Int8,
+        leaf_id -> Int8,
+        name -> Text,
+        deleted_at -> Nullable<Timestamp>,
+    }
+}
+
+#[autumn_web::model(table = "dhr_guards")]
+pub struct DhrGuard {
+    #[id]
+    pub id: i64,
+    pub leaf_id: i64,
+    pub name: String,
+    pub deleted_at: Option<chrono::NaiveDateTime>,
+}
+
+#[autumn_web::repository(DhrGuard, table = "dhr_guards", soft_delete)]
+pub trait DhrGuardRepository {}
+
+// ── #1800 case 2: sibling restrict pre-scan ───────────────────────────────────
+//
+// Reuses the round-5-A `ra_posts → ra_comments(destroy, hooked) → ra_replies
+// (restrict)` graph, but with TWO comment siblings: comment #1 has no replies,
+// comment #2 has one. Deleting the post must return 409 (comment #2's restrict
+// grandchild blocks) WITHOUT firing comment #1's `before_delete` hook. Before
+// #1800 the grandchild restrict probe lived inside the per-child mutating loop, so
+// comment #1's hook fired and only then did comment #2's probe return the 409.
+
+// ── #1800 case 3: parent restrict probe before the parent before_delete hook ───
+//
+// A parent (`ph_posts`) with BOTH a `before_delete` hook (bumping a counter) AND a
+// `restrict` dependent (`ph_guards`) with a live child. Deleting the parent must
+// return 409 WITHOUT firing the parent hook — the parent restrict probe now runs
+// before `#parent_before_delete`. Before #1800 the parent hook fired first, then
+// the restrict probe returned the 409 (rolling back the DB but not the hook's
+// non-transactional side effect).
+
+pub static PH_POST_HOOK_FIRED: AtomicUsize = AtomicUsize::new(0);
+
+#[derive(Clone, Default)]
+pub struct PhPostHooks;
+
+impl MutationHooks for PhPostHooks {
+    type Model = PhPost;
+    type NewModel = NewPhPost;
+    type UpdateModel = UpdatePhPost;
+
+    async fn before_delete(
+        &self,
+        _ctx: &mut MutationContext,
+        _record: &PhPost,
+    ) -> AutumnResult<()> {
+        PH_POST_HOOK_FIRED.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+diesel::table! {
+    ph_posts (id) { id -> Int8, title -> Text, }
+}
+diesel::table! {
+    ph_guards (id) { id -> Int8, post_id -> Int8, name -> Text, }
+}
+
+#[autumn_web::model(table = "ph_posts")]
+pub struct PhPost {
+    #[id]
+    pub id: i64,
+    pub title: String,
+}
+
+#[autumn_web::model(table = "ph_guards")]
+pub struct PhGuard {
+    #[id]
+    pub id: i64,
+    pub post_id: i64,
+    pub name: String,
+}
+
+#[autumn_web::repository(
+    PhPost,
+    table = "ph_posts",
+    hooks = PhPostHooks,
+    dependent(PgPhGuardRepository, fk = "post_id", on_delete = restrict)
+)]
+pub trait PhPostRepository {}
+
+#[autumn_web::repository(PhGuard, table = "ph_guards")]
+pub trait PhGuardRepository {}
 
 // ── Row-count helpers ─────────────────────────────────────────────────────────
 
@@ -831,6 +1247,28 @@ async fn setup_pool() -> (
         "CREATE TABLE ra_replies (id BIGSERIAL PRIMARY KEY, comment_id BIGINT NOT NULL REFERENCES ra_comments(id), body TEXT NOT NULL)",
         // Codex round-5-B: HOOKED self-referential chain with an IMMEDIATE self-FK.
         "CREATE TABLE chain_nodes (id BIGSERIAL PRIMARY KEY, parent_id BIGINT REFERENCES chain_nodes(id), name TEXT NOT NULL)",
+        // #1800 case 1 (regression): HOOKED soft-delete self-referential graph. The
+        // self-FK is DEFERRABLE so the component can be handled in one transaction.
+        "CREATE TABLE bsd_nodes (id BIGSERIAL PRIMARY KEY, parent_id BIGINT REFERENCES bsd_nodes(id) DEFERRABLE INITIALLY DEFERRED, name TEXT NOT NULL, deleted_at TIMESTAMP NULL)",
+        // #1800 case 1: mixed soft/hard-delete diamond. The leaf references BOTH a
+        // soft parent (soft_id) and a hard parent (hard_id) with IMMEDIATE FKs, so a
+        // leaf left present while its hard parent is deleted trips the FK at once.
+        "CREATE TABLE dia_roots (id BIGSERIAL PRIMARY KEY, title TEXT NOT NULL, deleted_at TIMESTAMP NULL)",
+        "CREATE TABLE dia_softs (id BIGSERIAL PRIMARY KEY, root_id BIGINT NOT NULL REFERENCES dia_roots(id), deleted_at TIMESTAMP NULL)",
+        "CREATE TABLE dia_hards (id BIGSERIAL PRIMARY KEY, root_id BIGINT NOT NULL REFERENCES dia_roots(id))",
+        "CREATE TABLE dia_leaves (id BIGSERIAL PRIMARY KEY, soft_id BIGINT NOT NULL REFERENCES dia_softs(id), hard_id BIGINT NOT NULL REFERENCES dia_hards(id), deleted_at TIMESTAMP NULL)",
+        // #1800 (Codex "Re-probe restricts on hard revisits"): same diamond, but the
+        // shared soft leaf HOOKS and restrict-depends on a soft-deletable guard. The
+        // guard FK is IMMEDIATE so a hard delete of the leaf (with the guard still
+        // present) trips a raw FK 500 in the RED (pre-fix) state.
+        "CREATE TABLE dhr_roots (id BIGSERIAL PRIMARY KEY, title TEXT NOT NULL, deleted_at TIMESTAMP NULL)",
+        "CREATE TABLE dhr_softs (id BIGSERIAL PRIMARY KEY, root_id BIGINT NOT NULL REFERENCES dhr_roots(id), deleted_at TIMESTAMP NULL)",
+        "CREATE TABLE dhr_hards (id BIGSERIAL PRIMARY KEY, root_id BIGINT NOT NULL REFERENCES dhr_roots(id))",
+        "CREATE TABLE dhr_leaves (id BIGSERIAL PRIMARY KEY, soft_id BIGINT NOT NULL REFERENCES dhr_softs(id), hard_id BIGINT NOT NULL REFERENCES dhr_hards(id), deleted_at TIMESTAMP NULL)",
+        "CREATE TABLE dhr_guards (id BIGSERIAL PRIMARY KEY, leaf_id BIGINT NOT NULL REFERENCES dhr_leaves(id), name TEXT NOT NULL, deleted_at TIMESTAMP NULL)",
+        // #1800 case 3: parent with a before_delete hook AND a restrict dependent.
+        "CREATE TABLE ph_posts (id BIGSERIAL PRIMARY KEY, title TEXT NOT NULL)",
+        "CREATE TABLE ph_guards (id BIGSERIAL PRIMARY KEY, post_id BIGINT NOT NULL REFERENCES ph_posts(id), name TEXT NOT NULL)",
     ] {
         diesel::sql_query(stmt)
             .execute(&mut conn)
@@ -887,6 +1325,13 @@ fn dependent_repository_surface_is_generated() {
     // delete_many monomorphizes the two-structure (path + deleted) cascade.
     assert_is_fn(<PgChainNodeRepository as ChainNodeRepository>::delete_many);
     assert_is_fn(PgChainNodeRepository::__autumn_apply_dependent_on_conn);
+    // #1800 case 1 (regression): the HOOKED soft-delete self-referential parent's
+    // bulk delete_many monomorphizes the soft-delete bulk cascade — its soft
+    // `destroy` records the descendant in the "all handled" set so the bulk root
+    // hook loop skips it (no double-fire), while a SEPARATE physical set backs the
+    // diamond revisit-skip.
+    assert_is_fn(<PgBsdNodeRepository as BsdNodeRepository>::delete_many);
+    assert_is_fn(PgBsdNodeRepository::__autumn_apply_dependent_on_conn);
     // #1740: the bulk `delete_many` path now carries the dependent cascade too;
     // monomorphize it (hooks-child parent + restrict-only parent) to prove the
     // bulk-cascade codegen type-checks without Docker.
@@ -928,6 +1373,27 @@ fn dependent_repository_surface_is_generated() {
     // A model-side child (M3Comment) that itself has a model-side dependent.
     assert_eq!(M3Post::dependents().len(), 1);
     assert_eq!(M3Comment::dependents().len(), 1);
+    // #1800 case 1: the mixed soft/hard-delete diamond monomorphizes — a soft
+    // parent, a soft child and a hard child both cascading into the same soft
+    // grandchild table via distinct FKs.
+    assert_is_fn(<PgDiaRootRepository as DiaRootRepository>::delete_by_id);
+    assert_is_fn(PgDiaSoftRepository::__autumn_apply_dependent_on_conn);
+    assert_is_fn(PgDiaHardRepository::__autumn_apply_dependent_on_conn);
+    assert_is_fn(PgDiaLeafRepository::__autumn_apply_dependent_on_conn);
+    // #1800 (Codex "Re-probe restricts on hard revisits"): the mixed soft/hard
+    // diamond whose shared soft leaf HOOKS and restrict-depends on a soft guard
+    // monomorphizes — its Destroy arm's restrict pre-scan skip now keys on the
+    // physical-delete set, so a hard revisit of a soft-deleted leaf re-probes.
+    assert_is_fn(<PgDhrRootRepository as DhrRootRepository>::delete_by_id);
+    assert_is_fn(PgDhrSoftRepository::__autumn_apply_dependent_on_conn);
+    assert_is_fn(PgDhrHardRepository::__autumn_apply_dependent_on_conn);
+    assert_is_fn(PgDhrLeafRepository::__autumn_apply_dependent_on_conn);
+    assert_is_fn(PgDhrGuardRepository::__autumn_apply_dependent_on_conn);
+    // #1800 case 3: a parent with a before_delete hook AND a restrict dependent
+    // monomorphizes the assemble_cascade_body branch that now probes the parent
+    // restrict BEFORE the parent hook.
+    assert_is_fn(<PgPhPostRepository as PhPostRepository>::delete_by_id);
+    assert_is_fn(PgPhGuardRepository::__autumn_apply_dependent_on_conn);
 }
 
 // ── Tests (require Docker) ────────────────────────────────────────────────────
@@ -1623,6 +2089,81 @@ async fn delete_many_self_referential_immediate_fk_chain_no_double_hook() {
     );
 }
 
+/// #1800 case 1 (regression): bulk `delete_many([Desc, Anc])` over a HOOKED
+/// `#[soft_delete]` self-referential `dependent = destroy` graph — the descendant
+/// AND its ancestor — must fire the descendant's `before_delete` hook EXACTLY ONCE.
+///
+/// The ancestor's soft cascade soft-deletes the descendant (firing its hook once as
+/// a cascaded descendant); the descendant is then also a batch root, so the bulk
+/// root hook loop must SKIP it. That skip consults the "all handled" `__autumn_deleted`
+/// set, which must record the SOFT-deleted descendant.
+///
+/// RED under the first #1800 fix (which recorded ONLY physically-deleted rows in the
+/// single `__deleted` set): the soft-deleted descendant was absent from the set, so
+/// the bulk root loop did not skip it and its `before_delete` fired a SECOND time
+/// (count == 2). GREEN once the "all handled" bulk-root set and the "physically
+/// deleted" diamond set are tracked SEPARATELY: the descendant is recorded as
+/// handled, the root loop skips it, and the hook fires exactly once (count == 1).
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn delete_many_soft_self_referential_fires_descendant_hook_once() {
+    let (pool, _c) = setup_pool().await;
+    let mut conn = pool.get().await.expect("conn");
+
+    // Insert with NULL parents first (satisfy the deferrable FK), then wire
+    // Anc(1) ← Desc(2): the descendant's parent_id points at the ancestor.
+    for id in 1..=2 {
+        diesel::sql_query(format!(
+            "INSERT INTO bsd_nodes (id, parent_id, name) VALUES ({id}, NULL, 'n{id}')"
+        ))
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    }
+    diesel::sql_query("UPDATE bsd_nodes SET parent_id = 1 WHERE id = 2")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+
+    BSD_DELETE_LOG.lock().unwrap().clear();
+
+    let repo = PgBsdNodeRepository::with_pool_untracked(pool.clone());
+    // Batch BOTH the descendant Desc(2) and the ancestor Anc(1). The ancestor's
+    // soft `destroy` cascade soft-deletes Desc; Desc is also a batch root.
+    repo.delete_many(&[2, 1])
+        .await
+        .expect("#1800: bulk soft self-ref delete must not error");
+
+    // Both rows are soft-deleted (present, deleted_at set) — nothing is physically
+    // removed on a soft-delete graph.
+    assert_eq!(
+        count(
+            &mut conn,
+            "SELECT COUNT(*) AS n FROM bsd_nodes WHERE deleted_at IS NOT NULL"
+        )
+        .await,
+        2,
+        "#1800: both the ancestor and descendant are soft-deleted"
+    );
+
+    // The crux: the descendant Desc(2)'s `before_delete` hook fired EXACTLY ONCE —
+    // once as the ancestor's cascaded descendant, and NOT a second time as a batch
+    // root (the bulk root loop skips it because it is recorded in the "all handled"
+    // set even though it was only soft-deleted).
+    let log = BSD_DELETE_LOG.lock().unwrap().clone();
+    assert_eq!(
+        log.iter().filter(|&&id| id == 2).count(),
+        1,
+        "#1800: the soft-deleted descendant's before_delete must fire EXACTLY ONCE \
+         on the bulk path (not once-as-cascade + once-as-root): log = {log:?}"
+    );
+    assert_eq!(
+        log.iter().filter(|&&id| id == 1).count(),
+        1,
+        "#1800: the ancestor fires once (as the bulk parent delete): log = {log:?}"
+    );
+}
+
 /// AC5: `dependent = restrict` blocks the delete with a typed 409 Conflict when
 /// children exist, and rolls back (parent survives).
 #[tokio::test]
@@ -2068,5 +2609,337 @@ async fn model_declared_restrict_blocks_with_conflict_and_rolls_back() {
         .await,
         1,
         "the destroy child rows must be untouched after a blocked delete"
+    );
+}
+
+// ── #1800 case 1: mixed soft/hard-delete diamond ──────────────────────────────
+
+/// #1800 case 1: a SOFT parent destroys a soft child and a hard child that both
+/// point at the same soft grandchild (the leaf) via different FKs. The soft branch
+/// is processed first and soft-deletes the leaf; the hard branch must still HARD-
+/// delete the leaf (its `hard_id` FK references a row being physically removed).
+///
+/// RED before the fix: the soft delete recorded the leaf in the traversal
+/// `__deleted` set, so the hard branch skipped it — leaving the leaf physically
+/// present with a `hard_id` referencing the deleted hard row (an immediate FK
+/// violation → the whole delete errors, and the leaf dangles). GREEN after the
+/// fix: a soft delete no longer records the row as gone, so the hard branch reaches
+/// and physically removes the leaf; the delete succeeds with no dangling FK.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn mixed_soft_hard_diamond_hard_branch_still_removes_shared_leaf() {
+    let (pool, _c) = setup_pool().await;
+    let mut conn = pool.get().await.expect("conn");
+
+    diesel::sql_query("INSERT INTO dia_roots (id, title) VALUES (1, 'root')")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    diesel::sql_query("INSERT INTO dia_softs (id, root_id) VALUES (1, 1)")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    diesel::sql_query("INSERT INTO dia_hards (id, root_id) VALUES (1, 1)")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    // The shared leaf references BOTH the soft child (soft_id) and the hard child
+    // (hard_id). It is reached through the soft branch first, then the hard branch.
+    diesel::sql_query("INSERT INTO dia_leaves (id, soft_id, hard_id) VALUES (1, 1, 1)")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+
+    let repo = PgDiaRootRepository::with_pool_untracked(pool.clone());
+    // Soft-deletes the root; cascades soft (dia_softs) then hard (dia_hards).
+    repo.delete_by_id(1)
+        .await
+        .expect("case 1: the hard branch must physically remove the shared leaf, no dangling FK");
+
+    // The hard child is physically gone.
+    assert_eq!(
+        count(&mut conn, "SELECT COUNT(*) AS n FROM dia_hards").await,
+        0,
+        "case 1: the hard child must be physically deleted"
+    );
+    // The shared leaf must be PHYSICALLY gone — not merely soft-deleted — because
+    // its hard parent was hard-deleted. A surviving (even soft-deleted) row would be
+    // a dangling `hard_id` FK.
+    assert_eq!(
+        count(&mut conn, "SELECT COUNT(*) AS n FROM dia_leaves").await,
+        0,
+        "case 1: the shared leaf must be HARD-deleted through the hard branch, \
+         not left present by the soft branch's __deleted mark (no dangling FK)"
+    );
+    // The soft parent and soft child remain present but soft-deleted (deleted_at set).
+    assert_eq!(
+        count(
+            &mut conn,
+            "SELECT COUNT(*) AS n FROM dia_roots WHERE deleted_at IS NOT NULL"
+        )
+        .await,
+        1,
+        "case 1: the soft root is soft-deleted (row present, deleted_at set)"
+    );
+    assert_eq!(
+        count(
+            &mut conn,
+            "SELECT COUNT(*) AS n FROM dia_softs WHERE deleted_at IS NOT NULL"
+        )
+        .await,
+        1,
+        "case 1: the soft child is soft-deleted (row present, deleted_at set)"
+    );
+}
+
+// ── #1800 (Codex "Re-probe restricts on hard revisits") ───────────────────────
+
+/// #1800 (Codex "Re-probe restricts on hard revisits"): in a mixed soft/hard
+/// diamond, a soft-deleted leaf reached again through the hard branch must re-run
+/// its grandchild `restrict` pre-scan. The leaf restrict-depends on a SOFT-DELETED
+/// guard: the hard-path probe drops the live filter, so it sees the guard and must
+/// return a typed 409 BEFORE the leaf `before_delete` hook fires a second time and
+/// BEFORE the hard DELETE falls through to a raw FK failure against the guard.
+///
+/// RED before the fix: the restrict pre-scan skip keyed on the "all handled"
+/// `__deleted` set, which already held the soft-deleted leaf, so the hard-path
+/// probe was SKIPPED. Phase-2 (keyed on `__physical`) still fired the leaf hook a
+/// second time and hard-deleted the leaf → raw FK 500 (not the typed 409).
+/// GREEN after the fix: the pre-scan skip keys on `__physical` (which does NOT hold
+/// the soft-deleted leaf), so it re-probes with `__parent_soft == false`, includes
+/// the soft-deleted guard, and returns the 409 before any second hook fire.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn hard_revisit_reprobes_restrict_before_child_hook_and_fk_failure() {
+    let (pool, _c) = setup_pool().await;
+    let mut conn = pool.get().await.expect("conn");
+
+    diesel::sql_query("INSERT INTO dhr_roots (id, title) VALUES (1, 'root')")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    diesel::sql_query("INSERT INTO dhr_softs (id, root_id) VALUES (1, 1)")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    diesel::sql_query("INSERT INTO dhr_hards (id, root_id) VALUES (1, 1)")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    // The shared leaf references BOTH the soft child (soft_id) and the hard child
+    // (hard_id). It is reached through the soft branch first, then the hard branch.
+    diesel::sql_query("INSERT INTO dhr_leaves (id, soft_id, hard_id) VALUES (1, 1, 1)")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    // The leaf's `restrict` dependent — a guard that we SOFT-DELETE below, so it is
+    // invisible to the soft-path probe (live-filtered) but visible to the hard-path
+    // probe (which drops the filter). Its FK to the leaf is a real, immediate DB
+    // constraint, so a hard delete of the leaf while the guard is present FK-fails.
+    diesel::sql_query("INSERT INTO dhr_guards (id, leaf_id, name) VALUES (1, 1, 'g')")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+
+    // Soft-delete the guard (its repo is `#[soft_delete]`), committing it as a
+    // soft-deleted restrict dependent BEFORE the root delete runs.
+    PgDhrGuardRepository::with_pool_untracked(pool.clone())
+        .delete_by_id(1)
+        .await
+        .expect("soft-deleting the guard must succeed");
+    assert_eq!(
+        count(
+            &mut conn,
+            "SELECT COUNT(*) AS n FROM dhr_guards WHERE deleted_at IS NOT NULL"
+        )
+        .await,
+        1,
+        "the guard must be soft-deleted (row present, deleted_at set)"
+    );
+
+    DHR_LEAF_HOOK_FIRED.store(0, Ordering::SeqCst);
+
+    let repo = PgDhrRootRepository::with_pool_untracked(pool.clone());
+    let err = repo
+        .delete_by_id(1)
+        .await
+        .expect_err("the hard-revisit restrict must block the delete");
+
+    // The crux: a typed 409 (restrict conflict), NOT a raw FK 500. Before the fix
+    // the hard-path probe was skipped and the delete fell through to the guard FK.
+    assert_eq!(
+        err.status(),
+        autumn_web::reexports::http::StatusCode::CONFLICT,
+        "the hard-path restrict probe must return a typed 409, not a raw FK 500"
+    );
+
+    // The leaf `before_delete` hook fired EXACTLY ONCE — on the soft branch — and
+    // NOT a second time on the hard branch (the 409 preempted it). Before the fix it
+    // fired twice (soft branch + a second time before the FK failure).
+    assert_eq!(
+        AtomicUsize::load(&DHR_LEAF_HOOK_FIRED, Ordering::SeqCst),
+        1,
+        "the leaf before_delete must not fire again on the hard revisit — the \
+         restrict 409 must precede it"
+    );
+
+    // Whole transaction rolled back: the root is NOT soft-deleted and the leaf is
+    // present and live (its soft-branch soft-delete was undone with everything else).
+    assert_eq!(
+        count(
+            &mut conn,
+            "SELECT COUNT(*) AS n FROM dhr_roots WHERE id = 1 AND deleted_at IS NULL"
+        )
+        .await,
+        1,
+        "the root delete must have rolled back (deleted_at still NULL)"
+    );
+    assert_eq!(
+        count(
+            &mut conn,
+            "SELECT COUNT(*) AS n FROM dhr_leaves WHERE id = 1 AND deleted_at IS NULL"
+        )
+        .await,
+        1,
+        "the leaf must be present and live after rollback (no dangling FK, no \
+         physical delete)"
+    );
+}
+
+// ── #1800 case 2: sibling restrict pre-scan ───────────────────────────────────
+
+/// #1800 case 2: `Post → Comment(destroy, before_delete) → Reply(restrict)` with
+/// TWO comment siblings — comment #1 has no replies, comment #2 has one. Deleting
+/// the post must return 409 AND leave comment #1's `before_delete` counter at 0:
+/// every sibling's restrict grandchildren are pre-scanned before any child hook.
+///
+/// RED before the fix: the grandchild restrict probe ran inside the per-child
+/// mutating loop, so comment #1's `before_delete` fired, and only then comment #2's
+/// probe returned the 409 (counter == 1). GREEN after the fix: the pre-scan pass
+/// probes every comment's replies first, so comment #2's restrict aborts before any
+/// hook (counter == 0).
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn sibling_restrict_pre_scan_blocks_before_earlier_sibling_hook_fires() {
+    let (pool, _c) = setup_pool().await;
+    let mut conn = pool.get().await.expect("conn");
+
+    diesel::sql_query("INSERT INTO ra_posts (id, title) VALUES (2, 'p')")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    // Two comment siblings under the same post; comment #1 (lower id) is processed
+    // first and has NO replies, so its restrict probe passes.
+    diesel::sql_query("INSERT INTO ra_comments (id, post_id, body) VALUES (10, 2, 'c1')")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    diesel::sql_query("INSERT INTO ra_comments (id, post_id, body) VALUES (11, 2, 'c2')")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    // Only comment #2 has a reply → its restrict grandchild must block the delete.
+    diesel::sql_query("INSERT INTO ra_replies (id, comment_id, body) VALUES (10, 11, 'r')")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+
+    RA_COMMENT_HOOK_FIRED.store(0, Ordering::SeqCst);
+
+    let repo = PgRaPostRepository::with_pool_untracked(pool.clone());
+    let result = repo.delete_by_id(2).await;
+    assert!(
+        result.is_err(),
+        "case 2: a later sibling's restrict grandchild must block the post delete with a 409"
+    );
+
+    // Whole transaction rolled back — post, both comments and the reply survive.
+    assert_eq!(
+        count(
+            &mut conn,
+            "SELECT COUNT(*) AS n FROM ra_comments WHERE post_id = 2"
+        )
+        .await,
+        2
+    );
+    assert_eq!(
+        count(
+            &mut conn,
+            "SELECT COUNT(*) AS n FROM ra_replies WHERE comment_id = 11"
+        )
+        .await,
+        1
+    );
+
+    // The crux: NO comment's before_delete fired — the restrict pre-scan covered
+    // every selected sibling before any child hook. Under the old per-child ordering
+    // this was 1 (comment #1's hook fired before comment #2's restrict aborted).
+    assert_eq!(
+        AtomicUsize::load(&RA_COMMENT_HOOK_FIRED, Ordering::SeqCst),
+        0,
+        "case 2: no sibling before_delete may fire before a later sibling's restrict \
+         grandchild returns the 409 (pre-scan precedes every child hook)"
+    );
+}
+
+// ── #1800 case 3: parent restrict probe before the parent before_delete hook ───
+
+/// #1800 case 3: a parent with a `before_delete` hook AND a live `restrict`
+/// dependent. Deleting it must return 409 AND leave the parent hook counter at 0 —
+/// the parent restrict probe now runs before `#parent_before_delete`.
+///
+/// RED before the fix: `assemble_cascade_body` emitted the parent hook before the
+/// cascade (where the restrict probe lives), so the hook fired and only then did the
+/// probe return the 409 (counter == 1). GREEN after the fix: the parent restrict is
+/// probed first (counter == 0).
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn parent_restrict_probes_before_parent_before_delete_hook_fires() {
+    let (pool, _c) = setup_pool().await;
+    let mut conn = pool.get().await.expect("conn");
+
+    diesel::sql_query("INSERT INTO ph_posts (id, title) VALUES (1, 'guarded')")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    diesel::sql_query("INSERT INTO ph_guards (id, post_id, name) VALUES (1, 1, 'g')")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+
+    PH_POST_HOOK_FIRED.store(0, Ordering::SeqCst);
+
+    let repo = PgPhPostRepository::with_pool_untracked(pool.clone());
+    let err = repo
+        .delete_by_id(1)
+        .await
+        .expect_err("case 3: a live restrict dependent must block the parent delete");
+    assert_eq!(
+        err.status(),
+        autumn_web::reexports::http::StatusCode::CONFLICT,
+        "case 3: a blocking parent restrict must surface a 409"
+    );
+
+    // The crux: the parent's before_delete must NOT have fired — the restrict probe
+    // ran first and returned the 409 before the parent hook.
+    assert_eq!(
+        AtomicUsize::load(&PH_POST_HOOK_FIRED, Ordering::SeqCst),
+        0,
+        "case 3: the parent before_delete must NOT fire when a restrict dependent \
+         blocks the delete (parent restrict probe precedes the parent hook)"
+    );
+
+    // Rolled back: parent and guard both survive.
+    assert_eq!(
+        count(&mut conn, "SELECT COUNT(*) AS n FROM ph_posts WHERE id = 1").await,
+        1
+    );
+    assert_eq!(
+        count(
+            &mut conn,
+            "SELECT COUNT(*) AS n FROM ph_guards WHERE post_id = 1"
+        )
+        .await,
+        1
     );
 }

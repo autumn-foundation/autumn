@@ -485,9 +485,12 @@ fn emit_dependents_impl(model_ident: &syn::Ident, assocs: &[Association]) -> Tok
                 __parent_id: i64,
                 __parent_soft: bool,
                 // Codex round-5-B: the active recursion path (cycle-break) and the
-                // monotonic actually-deleted set, threaded through separately.
+                // monotonic HANDLED set (soft OR physical), threaded through
+                // separately. #1800 case 1: `__physical` additionally tracks only
+                // physically-removed rows for the diamond revisit-skip.
                 __path: &'__a mut ::std::collections::HashSet<(&'static str, i64)>,
                 __deleted: &'__a mut ::std::collections::HashSet<(&'static str, i64)>,
+                __physical: &'__a mut ::std::collections::HashSet<(&'static str, i64)>,
             ) -> ::autumn_web::repository::RuntimeDependentCascadeFuture<'__a> {
                 ::std::boxed::Box::pin(async move {
                     // Own the child repository inside the async block so the
@@ -505,6 +508,7 @@ fn emit_dependents_impl(model_ident: &syn::Ident, assocs: &[Association]) -> Tok
                             __parent_soft,
                             __path,
                             __deleted,
+                            __physical,
                         )
                         .await
                 })
