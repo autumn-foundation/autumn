@@ -129,6 +129,14 @@ managed-pg = ["db", "dep:postgresql_embedded"]
 # binary (tens-to-~150MB), still a supervised child process with an on-disk
 # data dir. Implies `managed-pg`.
 managed-pg-bundled = ["managed-pg", "postgresql_embedded/bundled"]
+# Serve HTTPS directly from the app process: a config-driven native TLS
+# listener (`[server.tls]` cert + key) that terminates rustls in-process and
+# reuses the existing axum serve / graceful-shutdown / connect-info wiring
+# (issue #1603). Off by default — absent `[server.tls]` keeps today's plain
+# HTTP. Reuses the already-vendored `ring`-backed `rustls` (no second TLS
+# backend); adds `tokio-rustls` for the async accept-time handshake and
+# `x509-parser` for leaf-certificate expiry detection.
+tls = ["dep:tokio-rustls", "dep:x509-parser", "dep:rustls", "dep:rustls-pki-types"]
 
 [dependencies]
 autumn-macros = { version = "0.6.0", path = "../autumn-macros" }
@@ -158,6 +166,14 @@ tokio-postgres-rustls = { version = "0.13", optional = true }
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"], optional = true }
 rustls-pki-types = { version = "1", features = ["std"], optional = true }
 webpki-roots = { version = "1", optional = true }
+# Inbound/server TLS (issue #1603, `tls` feature): async accept-time rustls
+# handshake wrapping the existing TCP listener. `default-features = false` +
+# `ring` reuses the SAME crypto backend as the outbound Postgres TLS path —
+# the workspace forbids a second TLS backend (no aws-lc-rs / native-tls).
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"], optional = true }
+# Parse the leaf certificate's `NotAfter` for fail-fast expired-cert detection
+# at startup and the `autumn doctor` near-expiry warning. Only pulled by `tls`.
+x509-parser = { version = "0.16", optional = true }
 postgresql_embedded = { version = "0.19", optional = true, default-features = false, features = [
     "tokio",
     "theseus",

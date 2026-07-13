@@ -384,6 +384,104 @@ pub fn check_trusted_hosts_impl(hosts: &[String], is_production: bool) -> CheckR
     }
 }
 
+/// The resolved state of `[server.tls]` for the direct-HTTPS doctor check
+/// (issue #1603). Constructed offline (from `autumn.toml` + the referenced
+/// files, no network, no server boot) so [`check_tls_impl`] can grade it purely.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TlsDoctorData {
+    /// No `[server.tls]` section — the app serves plain HTTP.
+    NotConfigured,
+    /// Configured, the cert + key loaded and matched, and the leaf certificate
+    /// expires in `days_until_expiry` days (negative once already expired).
+    ///
+    /// Only constructed when the CLI is built with the `tls` feature (the
+    /// offline inspection lives behind it); `check_tls_impl` still grades it in
+    /// every build (and the unit tests exercise it), hence the conditional
+    /// `dead_code` allow for the feature-less build.
+    #[cfg_attr(not(feature = "tls"), allow(dead_code))]
+    Healthy {
+        /// Whole days until the leaf certificate's `notAfter` (negative if past).
+        days_until_expiry: i64,
+    },
+    /// Configured, but the cert/key could not be loaded or validated (missing
+    /// file, unparseable PEM, key/cert mismatch, …). `detail` is the reason.
+    Invalid {
+        /// Human-readable failure reason.
+        detail: String,
+    },
+    /// Configured, but this CLI was built without the `tls` feature, so it
+    /// cannot inspect the certificate. Only constructed in the feature-less
+    /// build; graded in every build (and unit-tested), hence the conditional
+    /// `dead_code` allow when the `tls` feature is on.
+    #[cfg_attr(feature = "tls", allow(dead_code))]
+    FeatureDisabled,
+}
+
+/// Grade the resolved `[server.tls]` state (pure, injectable for tests).
+///
+/// - Not configured → **Pass** (serving plain HTTP is a valid choice).
+/// - Built without the `tls` feature → **Warn** (cannot diagnose; do not
+///   silently omit the check).
+/// - Cert/key invalid or missing → **Fail**.
+/// - Leaf certificate already expired → **Fail**.
+/// - Leaf certificate expiring within 30 days → **Warn**.
+/// - Otherwise → **Pass**.
+#[must_use]
+pub fn check_tls_impl(data: &TlsDoctorData) -> CheckResult {
+    match data {
+        TlsDoctorData::NotConfigured => CheckResult {
+            name: "tls",
+            status: CheckStatus::Pass,
+            detail: Some("no [server.tls] configured; serving plain HTTP".into()),
+            hint: None,
+        },
+        TlsDoctorData::FeatureDisabled => CheckResult {
+            name: "tls",
+            status: CheckStatus::Warn,
+            detail: Some(
+                "[server.tls] is configured but this autumn CLI was built without the `tls` \
+                 feature, so the certificate could not be inspected"
+                    .into(),
+            ),
+            hint: Some("Rebuild the autumn CLI with the `tls` feature to enable TLS diagnostics"),
+        },
+        TlsDoctorData::Invalid { detail } => CheckResult {
+            name: "tls",
+            status: CheckStatus::Fail,
+            detail: Some(detail.clone()),
+            hint: Some(
+                "Fix [server.tls] cert_path/key_path: ensure both files exist, are valid PEM, \
+                 and the key matches the certificate",
+            ),
+        },
+        TlsDoctorData::Healthy { days_until_expiry } if *days_until_expiry < 0 => CheckResult {
+            name: "tls",
+            status: CheckStatus::Fail,
+            detail: Some(format!(
+                "the [server.tls] leaf certificate expired {} day(s) ago",
+                days_until_expiry.abs()
+            )),
+            hint: Some("Renew the certificate; an expired certificate fails every TLS handshake"),
+        },
+        TlsDoctorData::Healthy { days_until_expiry } if *days_until_expiry <= 30 => CheckResult {
+            name: "tls",
+            status: CheckStatus::Warn,
+            detail: Some(format!(
+                "the [server.tls] leaf certificate expires in {days_until_expiry} day(s)"
+            )),
+            hint: Some("Renew the certificate soon to avoid downtime"),
+        },
+        TlsDoctorData::Healthy { days_until_expiry } => CheckResult {
+            name: "tls",
+            status: CheckStatus::Pass,
+            detail: Some(format!(
+                "[server.tls] certificate valid ({days_until_expiry} day(s) until expiry)"
+            )),
+            hint: None,
+        },
+    }
+}
+
 /// Check that an operator-alert destination is configured (issue #1610).
 ///
 /// Operator alerts (dead-lettered jobs, Down health indicators, 5xx-rate
@@ -3621,6 +3719,97 @@ fn resolve_trusted_hosts() -> Vec<String> {
     parse_hosts(&table)
 }
 
+/// Resolve the configured `[server.tls]` cert/key paths, honoring env-var
+/// overrides and the active profile's merged config, exactly as the runtime
+/// loads them. Returns `None` when TLS is not configured at all.
+fn resolve_tls_paths() -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+    let (canonical, selected, _) = resolve_active_profiles();
+    let merged = get_merged_toml_table_runtime(&canonical, &selected);
+    let tls = merged
+        .get("server")
+        .and_then(toml::Value::as_table)
+        .and_then(|s| s.get("tls"))
+        .and_then(toml::Value::as_table);
+
+    let env_cert = std::env::var("AUTUMN_SERVER__TLS__CERT_PATH")
+        .ok()
+        .filter(|v| !v.trim().is_empty());
+    let env_key = std::env::var("AUTUMN_SERVER__TLS__KEY_PATH")
+        .ok()
+        .filter(|v| !v.trim().is_empty());
+
+    let toml_cert = tls
+        .and_then(|t| t.get("cert_path"))
+        .and_then(toml::Value::as_str)
+        .map(str::to_owned);
+    let toml_key = tls
+        .and_then(|t| t.get("key_path"))
+        .and_then(toml::Value::as_str)
+        .map(str::to_owned);
+
+    let cert = env_cert.or(toml_cert);
+    let key = env_key.or(toml_key);
+
+    // TLS is "configured" if the section is present OR any TLS env var is set.
+    let configured = tls.is_some()
+        || std::env::var_os("AUTUMN_SERVER__TLS__CERT_PATH").is_some()
+        || std::env::var_os("AUTUMN_SERVER__TLS__KEY_PATH").is_some();
+    if !configured {
+        return None;
+    }
+
+    // Present but incomplete: signal with empty paths so the caller reports an
+    // actionable "must set both" failure rather than silently skipping.
+    Some((
+        std::path::PathBuf::from(cert.unwrap_or_default()),
+        std::path::PathBuf::from(key.unwrap_or_default()),
+    ))
+}
+
+/// Resolve `[server.tls]` into the graded [`TlsDoctorData`] for [`check_tls_impl`].
+///
+/// Offline only: reads `autumn.toml` and the referenced cert/key files, never
+/// boots a server or touches the network. When the CLI is built without the
+/// `tls` feature the certificate cannot be inspected, so a configured section
+/// reports [`TlsDoctorData::FeatureDisabled`] rather than being silently dropped.
+fn resolve_tls_doctor_data() -> TlsDoctorData {
+    let Some((cert, key)) = resolve_tls_paths() else {
+        return TlsDoctorData::NotConfigured;
+    };
+
+    if cert.as_os_str().is_empty() || key.as_os_str().is_empty() {
+        return TlsDoctorData::Invalid {
+            detail: "[server.tls] must set both cert_path and key_path".to_owned(),
+        };
+    }
+
+    #[cfg(feature = "tls")]
+    {
+        match autumn_web::tls::inspect_leaf(&cert, &key) {
+            Ok(inspection) => {
+                let now = i64::try_from(
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0),
+                )
+                .unwrap_or(i64::MAX);
+                TlsDoctorData::Healthy {
+                    days_until_expiry: inspection.days_until_expiry(now),
+                }
+            }
+            Err(e) => TlsDoctorData::Invalid {
+                detail: e.to_string(),
+            },
+        }
+    }
+    #[cfg(not(feature = "tls"))]
+    {
+        let _ = (cert, key);
+        TlsDoctorData::FeatureDisabled
+    }
+}
+
 /// Resolve whether an operator-alert destination (email and/or webhook URL) is
 /// configured, from the environment or the fully-merged effective `[alerts]` (base
 /// `autumn.toml` layered with the active profile's `[profile.{name}]` section and
@@ -4354,6 +4543,11 @@ pub fn run(opts: DoctorOptions) {
     tasks.push(Box::new(move || {
         check_trusted_hosts_impl(&trusted_hosts, is_production)
     }));
+
+    // 8a. Direct-HTTPS certificate readiness (issue #1603): validate
+    // [server.tls] cert/key and warn on near-expiry / fail on expired.
+    let tls_data = resolve_tls_doctor_data();
+    tasks.push(Box::new(move || check_tls_impl(&tls_data)));
 
     // 8b. Rate-limit key-strategy misconfiguration
     tasks.push(Box::new(move || {
@@ -6498,6 +6692,70 @@ pub struct Vault {
         let result = check_trusted_hosts_impl(&["example.com".to_owned(), "*".to_owned()], true);
         assert_eq!(result.name, "trusted_hosts");
         assert!(matches!(result.status, CheckStatus::Warn));
+    }
+
+    // ── check_tls_impl (issue #1603) ─────────────────────────────────────────
+
+    #[test]
+    fn tls_pass_when_not_configured() {
+        let r = check_tls_impl(&TlsDoctorData::NotConfigured);
+        assert_eq!(r.name, "tls");
+        assert!(matches!(r.status, CheckStatus::Pass));
+        assert!(r.hint.is_none());
+    }
+
+    #[test]
+    fn tls_fail_when_expired() {
+        let r = check_tls_impl(&TlsDoctorData::Healthy {
+            days_until_expiry: -3,
+        });
+        assert!(matches!(r.status, CheckStatus::Fail));
+        assert!(r.detail.as_deref().unwrap().contains("expired"));
+        assert!(r.hint.is_some());
+    }
+
+    #[test]
+    fn tls_warn_when_near_expiry() {
+        let r = check_tls_impl(&TlsDoctorData::Healthy {
+            days_until_expiry: 10,
+        });
+        assert!(matches!(r.status, CheckStatus::Warn));
+        assert!(r.detail.as_deref().unwrap().contains("10 day"));
+    }
+
+    #[test]
+    fn tls_warn_at_exactly_thirty_days() {
+        // The 30-day boundary is inclusive of the warning window.
+        let r = check_tls_impl(&TlsDoctorData::Healthy {
+            days_until_expiry: 30,
+        });
+        assert!(matches!(r.status, CheckStatus::Warn));
+    }
+
+    #[test]
+    fn tls_pass_when_healthy() {
+        let r = check_tls_impl(&TlsDoctorData::Healthy {
+            days_until_expiry: 365,
+        });
+        assert!(matches!(r.status, CheckStatus::Pass));
+        assert!(r.hint.is_none());
+    }
+
+    #[test]
+    fn tls_fail_when_invalid() {
+        let r = check_tls_impl(&TlsDoctorData::Invalid {
+            detail: "cert file not found".to_owned(),
+        });
+        assert!(matches!(r.status, CheckStatus::Fail));
+        assert_eq!(r.detail.as_deref(), Some("cert file not found"));
+        assert!(r.hint.is_some());
+    }
+
+    #[test]
+    fn tls_warn_when_feature_disabled() {
+        let r = check_tls_impl(&TlsDoctorData::FeatureDisabled);
+        assert!(matches!(r.status, CheckStatus::Warn));
+        assert!(r.detail.as_deref().unwrap().contains("tls"));
     }
 
     // ── check_alert_destination_impl (issue #1610) ───────────────────────────

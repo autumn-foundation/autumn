@@ -16,6 +16,17 @@ autotests = false
 name = "autumn"
 path = "src/main.rs"
 
+[features]
+# On by default so the shipped/release `autumn` binary can diagnose
+# `[server.tls]` (issue #1603): `autumn doctor` validates the configured
+# certificate + key and warns on near-expiry. Turning it off drops the TLS
+# certificate inspection from `autumn doctor` (the check then reports a Warn
+# explaining the feature is disabled). Enabling it turns on `autumn-web`'s
+# `tls` feature, whose `autumn_web::tls::inspect_leaf` does the offline
+# certificate parsing.
+default = ["tls"]
+tls = ["autumn-web/tls"]
+
 [dependencies]
 autumn-web = { version = "0.6.0", path = "../autumn", default-features = false, features = [
     "db", "htmx", "maud", "mail", "storage", "i18n", "telemetry-otlp", "redis", "cache-moka", "http-client", "reporting"
