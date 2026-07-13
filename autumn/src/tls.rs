@@ -103,6 +103,20 @@ pub enum TlsError {
         /// Human-readable parse detail.
         detail: String,
     },
+    /// A certificate in the chain (at 1-based `position`) is not valid DER.
+    ///
+    /// The PEM block decoded, but the bytes are not a parseable X.509
+    /// certificate — a malformed intermediate that rustls would store unparsed
+    /// and serve to clients that reject the chain.
+    #[error("certificate #{position} in the chain in `{path}` is malformed: {detail}")]
+    ParseChainCert {
+        /// Certificate path.
+        path: PathBuf,
+        /// 1-based position of the offending certificate in the chain.
+        position: usize,
+        /// Human-readable parse detail.
+        detail: String,
+    },
     /// The leaf certificate has already expired.
     #[error("the leaf certificate in `{path}` expired at {not_after} (UNIX {not_after_unix})")]
     Expired {
@@ -197,6 +211,32 @@ fn leaf_validity_unix(cert_path: &Path, leaf: &CertificateDer<'_>) -> Result<(i6
     ))
 }
 
+/// Parse every NON-leaf certificate DER in `chain`, failing fast (naming the
+/// 1-based chain position) if any block is not a parseable X.509 certificate.
+///
+/// [`read_cert_chain`] only PEM-decodes each block, and rustls'
+/// [`CertifiedKey::from_der`] validates only the leaf (`chain[0]`). A malformed
+/// INTERMEDIATE would therefore be stored unparsed and served, so startup and
+/// `autumn doctor` pass while normal clients reject the chain. Parsing each
+/// intermediate here turns that into an actionable fail-fast at load/inspection
+/// time. The leaf (`chain[0]`) is parsed separately by [`leaf_validity_unix`].
+fn validate_chain_certs(cert_path: &Path, chain: &[CertificateDer<'_>]) -> Result<(), TlsError> {
+    use x509_parser::prelude::FromDer as _;
+
+    // Skip index 0 (the leaf); `leaf_validity_unix` already parses it.
+    for (idx, cert) in chain.iter().enumerate().skip(1) {
+        x509_parser::certificate::X509Certificate::from_der(cert.as_ref()).map_err(|e| {
+            TlsError::ParseChainCert {
+                path: cert_path.to_path_buf(),
+                // 1-based, matching how operators count "certificate #2" in a bundle.
+                position: idx + 1,
+                detail: e.to_string(),
+            }
+        })?;
+    }
+    Ok(())
+}
+
 /// Load, validate, and return the certificate + key as a rustls [`CertifiedKey`].
 ///
 /// Fails fast on any of: missing/unreadable file, unparseable PEM, an empty
@@ -238,6 +278,11 @@ pub fn load_certified_key(
             not_after_unix: not_after,
         });
     }
+
+    // Parse every intermediate before accepting the chain: rustls validates only
+    // the leaf, so a malformed intermediate would otherwise boot a listener that
+    // serves a chain normal clients reject.
+    validate_chain_certs(cert_path, &chain)?;
 
     // `from_der` loads the key with the crypto provider (rejecting an invalid
     // key) and compares the key's SubjectPublicKeyInfo against the leaf
@@ -589,6 +634,11 @@ pub fn inspect_leaf(cert_path: &Path, key_path: &Path) -> Result<LeafInspection,
     let key = read_private_key(key_path)?;
     let (not_before, not_after) = leaf_validity_unix(cert_path, &chain[0])?;
 
+    // Parse every intermediate too, so doctor fails a malformed-intermediate
+    // chain instead of greenlighting one the runtime would boot but clients
+    // reject (rustls validates only the leaf).
+    validate_chain_certs(cert_path, &chain)?;
+
     // Validate the key matches the leaf even though we do not need the key
     // material — a mismatched pair would fail every handshake at runtime, so
     // doctor should surface it too.
@@ -620,6 +670,16 @@ mod tests {
     const EXPIRED_CERT_PEM: &str = include_str!("../tests/fixtures/tls/expired.cert.pem");
     const EXPIRED_KEY_PEM: &str = include_str!("../tests/fixtures/tls/expired.key.pem");
 
+    // A well-formed PEM CERTIFICATE block whose body is valid base64 but NOT a
+    // parseable X.509 DER (all-zero bytes). PEM-decodes fine, so it survives
+    // `read_cert_chain`, but `X509Certificate::from_der` rejects it — standing in
+    // for a malformed intermediate in a chain.
+    const MALFORMED_CERT_PEM: &str = "\
+-----BEGIN CERTIFICATE-----
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+-----END CERTIFICATE-----
+";
+
     fn write_temp(dir: &Path, name: &str, contents: &str) -> PathBuf {
         let path = dir.join(name);
         let mut f = std::fs::File::create(&path).unwrap();
@@ -644,6 +704,44 @@ mod tests {
         let provider = crypto_provider();
         let ck = load_certified_key(&cert, &key, &provider, now()).expect("valid pair loads");
         assert!(!ck.cert.is_empty());
+    }
+
+    // Regression (#1603, Codex): rustls validates only the leaf, so a malformed
+    // INTERMEDIATE would boot a listener serving a chain normal clients reject.
+    // `load_certified_key` must parse every cert in the chain and fail fast,
+    // naming the offending 1-based position.
+    #[test]
+    fn malformed_intermediate_in_chain_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        // [valid leaf, malformed intermediate].
+        let chain_pem = format!("{CERT_PEM}\n{MALFORMED_CERT_PEM}");
+        let cert = write_temp(dir.path(), "chain.pem", &chain_pem);
+        let key = write_temp(dir.path(), "k.pem", KEY_PEM);
+        let provider = crypto_provider();
+        let err = load_certified_key(&cert, &key, &provider, now()).unwrap_err();
+        assert!(
+            matches!(err, TlsError::ParseChainCert { position: 2, .. }),
+            "a malformed intermediate must fail fast naming its chain position, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("#2"),
+            "error must name the offending position, got: {err}"
+        );
+    }
+
+    // A chain of [valid leaf, well-formed intermediate] still loads. Chain-cert
+    // validation checks DER parseability (not chain-of-trust), so a second
+    // parseable certificate stands in for a real intermediate here.
+    #[test]
+    fn valid_leaf_and_intermediate_chain_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let chain_pem = format!("{CERT_PEM}\n{EXPIRED_CERT_PEM}");
+        let cert = write_temp(dir.path(), "chain.pem", &chain_pem);
+        let key = write_temp(dir.path(), "k.pem", KEY_PEM);
+        let provider = crypto_provider();
+        let ck = load_certified_key(&cert, &key, &provider, now())
+            .expect("a valid leaf + well-formed intermediate must load");
+        assert_eq!(ck.cert.len(), 2, "both chain certificates are retained");
     }
 
     #[test]

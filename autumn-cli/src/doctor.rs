@@ -3759,24 +3759,26 @@ fn resolve_trusted_hosts() -> Vec<String> {
     parse_hosts(&table)
 }
 
-/// Whether ANY `AUTUMN_SERVER__TLS__*` env var is set in the process.
+/// Every env var the runtime recognizes as configuring `[server.tls]`: the
+/// cert/key paths plus the tuning knobs. This is the ONLY set that counts as
+/// "TLS configured via the environment", kept in lockstep with the keys
+/// `apply_server_env_overrides_with_env` reads in `autumn-web`'s config loader
+/// (`CERT_PATH`, `KEY_PATH`, `RELOAD_INTERVAL_SECS`, `HANDSHAKE_TIMEOUT_SECS`).
 ///
-/// The runtime materializes an (otherwise-empty) `[server.tls]` table when a
-/// tuning-only var such as `AUTUMN_SERVER__TLS__RELOAD_INTERVAL_SECS` or
-/// `AUTUMN_SERVER__TLS__HANDSHAKE_TIMEOUT_SECS` is present, then fails fast on
-/// the missing cert/key. Scanning the whole prefix (not just `CERT_PATH`/`KEY_PATH`)
-/// lets doctor treat those deployments as configured and surface the same
-/// actionable failure instead of a false Pass.
-fn any_tls_env_var_set() -> bool {
-    std::env::vars_os().any(|(name, _)| name.to_string_lossy().starts_with("AUTUMN_SERVER__TLS__"))
-}
-
-/// Every env var that configures `[server.tls]`: the cert/key paths plus the
-/// tuning knobs. Doctor scans these through the profile-aware dotenv overlay
-/// (an [`Env`](autumn_web::config::Env), which exposes only `var(key)` lookups,
-/// not iteration) so a TLS deployment supplied through `.env`/`.env.<profile>`
-/// is detected — the overlay analog of the raw-process-env
-/// [`any_tls_env_var_set`] prefix scan.
+/// Detection is deliberately restricted to exactly these keys rather than a
+/// broad `AUTUMN_SERVER__TLS__*` prefix scan: an unrelated or mistyped var such
+/// as `AUTUMN_SERVER__TLS__ENABLED` does NOT make the runtime materialize
+/// `[server.tls]`, so that process serves plain HTTP. Treating it as configured
+/// would make `autumn doctor --strict` fail on a missing cert/key for exactly
+/// the deployment the server itself accepts. The recognized tuning vars
+/// (`RELOAD_INTERVAL_SECS`/`HANDSHAKE_TIMEOUT_SECS`) DO materialize the table, so
+/// they must still count.
+///
+/// Doctor scans these through the profile-aware dotenv overlay (an
+/// [`Env`](autumn_web::config::Env), which exposes only `var(key)` lookups, not
+/// iteration) so a TLS deployment supplied through `.env`/`.env.<profile>` — or
+/// through the real process env, which the overlay layers on top of — is
+/// detected.
 const TLS_ENV_VAR_NAMES: [&str; 4] = [
     "AUTUMN_SERVER__TLS__CERT_PATH",
     "AUTUMN_SERVER__TLS__KEY_PATH",
@@ -3788,8 +3790,8 @@ const TLS_ENV_VAR_NAMES: [&str; 4] = [
 /// tuning-only var). Reads through the passed [`Env`], so a var supplied only
 /// via the `.env`/`.env.<profile>` overlay counts — the runtime materializes an
 /// (otherwise-empty) `[server.tls]` table for it, so doctor must grade it rather
-/// than emit a false Pass. Presence alone marks configured, mirroring
-/// [`any_tls_env_var_set`].
+/// than emit a false Pass. Presence of any [`TLS_ENV_VAR_NAMES`] key marks
+/// configured; an unrecognized `AUTUMN_SERVER__TLS__*` var does not.
 fn any_tls_env_var_set_in(env: &dyn autumn_web::config::Env) -> bool {
     TLS_ENV_VAR_NAMES.iter().any(|name| env.var(name).is_ok())
 }
@@ -3799,9 +3801,10 @@ fn any_tls_env_var_set_in(env: &dyn autumn_web::config::Env) -> bool {
 /// process environment. `env_*` win over `toml_*` (matching the runtime).
 ///
 /// TLS is "configured" — and therefore worth grading — when the `[server.tls]`
-/// section is present OR any `AUTUMN_SERVER__TLS__*` var is set. A configured
-/// deployment missing a cert/key yields `Some((empty, empty))` so the caller
-/// reports an actionable "must set both" failure rather than silently skipping.
+/// section is present OR any recognized [`TLS_ENV_VAR_NAMES`] var is set. A
+/// configured deployment missing a cert/key yields `Some((empty, empty))` so the
+/// caller reports an actionable "must set both" failure rather than silently
+/// skipping.
 fn resolve_tls_paths_from_sources(
     tls_section_present: bool,
     toml_cert: Option<String>,
@@ -3871,10 +3874,13 @@ fn resolve_tls_paths() -> Option<(std::path::PathBuf, std::path::PathBuf)> {
         .and_then(toml::Value::as_str)
         .map(str::to_owned);
 
-    // Consider TLS configured if any prefix var is set in the real process env
-    // (catches vars named outside the known set) OR any known var is present
-    // through the dotenv overlay (catches `.env`-supplied tuning vars).
-    let any_tls_env = any_tls_env_var_set() || any_tls_env_var_set_in(denv.as_ref());
+    // Consider TLS configured only when a RECOGNIZED `[server.tls]` env var is
+    // present (through the overlay, which layers the real process env under the
+    // `.env`/`.env.<profile>` values). Restricting to `TLS_ENV_VAR_NAMES` — the
+    // exact set the runtime materializes the table from — avoids treating an
+    // unrelated/mistyped var like `AUTUMN_SERVER__TLS__ENABLED` as configured and
+    // failing `doctor --strict` on a config the server serves as plain HTTP.
+    let any_tls_env = any_tls_env_var_set_in(denv.as_ref());
 
     resolve_tls_paths_from_sources(
         tls.is_some(),
@@ -7027,6 +7033,44 @@ pub struct Vault {
         assert!(
             resolve_tls_paths_from_sources(false, None, None, None, None, false).is_none(),
             "no section and no TLS env means not configured"
+        );
+    }
+
+    // Regression (#1603, Codex): detection must be limited to the FOUR recognized
+    // `TLS_ENV_VAR_NAMES` — the exact set the runtime materializes `[server.tls]`
+    // from. An unrelated/mistyped var sharing the prefix, e.g.
+    // `AUTUMN_SERVER__TLS__ENABLED=false`, must NOT mark TLS configured: the
+    // server serves plain HTTP for it, so treating it as configured would make
+    // `doctor --strict` fail on a missing cert/key for a config the server
+    // accepts. A recognized tuning var (`HANDSHAKE_TIMEOUT_SECS`) must still count.
+    #[test]
+    fn unrecognized_tls_env_var_is_not_detected() {
+        use autumn_web::config::MockEnv;
+
+        // Unrecognized prefix var, no cert/key: NOT detected → not configured.
+        let unrecognized = MockEnv::new().with("AUTUMN_SERVER__TLS__ENABLED", "false");
+        assert!(
+            !any_tls_env_var_set_in(&unrecognized),
+            "an unrecognized AUTUMN_SERVER__TLS__* var must not mark TLS configured"
+        );
+        assert!(
+            resolve_tls_paths_from_sources(
+                false, // no [server.tls] section
+                None,
+                None,
+                None,
+                None,
+                any_tls_env_var_set_in(&unrecognized),
+            )
+            .is_none(),
+            "an unrecognized TLS env var must resolve as not-configured (no spurious Fail)"
+        );
+
+        // A recognized tuning var IS still detected (materializes the table).
+        let recognized = MockEnv::new().with("AUTUMN_SERVER__TLS__HANDSHAKE_TIMEOUT_SECS", "5");
+        assert!(
+            any_tls_env_var_set_in(&recognized),
+            "a recognized TLS tuning var must still mark TLS configured"
         );
     }
 
