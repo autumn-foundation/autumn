@@ -43,6 +43,11 @@
 //!   for elements, but a `<label for=…>`/`id` association that a splice makes
 //!   unresolvable suppresses the corresponding `label` finding rather than
 //!   risking a false positive.
+//! - Only maud/autumn `html!` markup is analyzed. A different `html!` macro
+//!   (e.g. a Yew/JSX island using `<tag>…</tag>` angle-bracket syntax) is
+//!   detected and skipped wholesale — maud never uses JSX tags, so parsing such
+//!   a body as maud would misread `<button></button>` as an empty `button` and
+//!   fire a false `button-name`.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -323,7 +328,18 @@ fn find_html_blocks(stream: &TokenStream, file: &str, scan: &mut Scan) {
             && matches!(trees.get(i + 1), Some(TokenTree::Punct(p)) if p.as_char() == '!')
             && let Some(TokenTree::Group(group)) = trees.get(i + 2)
         {
-            let nodes = parse_markup(&group.stream());
+            let body: Vec<TokenTree> = group.stream().into_iter().collect();
+            // Only maud/autumn `html!` markup is analyzed. A project may define a
+            // DIFFERENT `html!` (e.g. a Yew/JSX island using `<tag>…</tag>`
+            // syntax); handing such a body to the maud parser would strip the
+            // angle brackets and misread `<button></button>` as an empty maud
+            // `button`, a false `button-name`. maud never uses JSX angle-bracket
+            // tags, so a body that does is a different macro — skip it entirely.
+            if looks_like_jsx(&body) {
+                i += 3;
+                continue;
+            }
+            let nodes = parse_nodes(&body);
             scan.html_blocks += 1;
             analyze_block(&nodes, file, scan);
             // Descend into the body for nested `html!` splices.
@@ -336,6 +352,32 @@ fn find_html_blocks(stream: &TokenStream, file: &str, scan: &mut Scan) {
         }
         i += 1;
     }
+}
+
+/// Whether an `html!` body is JSX/Yew-style angle-bracket markup rather than
+/// maud. maud markup NEVER uses `<tag …>` / `</tag>` element syntax, so a `<`
+/// punct immediately followed by an ident or `/` (`<button`, `</`) — the way
+/// every JSX open/close tag begins — marks the body as a DIFFERENT `html!`
+/// macro. Such a body is skipped entirely rather than parsed as maud, which
+/// would drop the angle brackets and misread `<button></button>` as an empty
+/// maud `button` (a false `button-name`). When in doubt we skip: a missed check
+/// on non-maud markup is acceptable, a false positive on valid markup is not.
+fn looks_like_jsx(trees: &[TokenTree]) -> bool {
+    for (idx, tree) in trees.iter().enumerate() {
+        let TokenTree::Punct(p) = tree else {
+            continue;
+        };
+        if p.as_char() != '<' {
+            continue;
+        }
+        match trees.get(idx + 1) {
+            // `<button` (open tag) or `</button` (close tag) — JSX, not maud.
+            Some(TokenTree::Ident(_)) => return true,
+            Some(TokenTree::Punct(q)) if q.as_char() == '/' => return true,
+            _ => {}
+        }
+    }
+    false
 }
 
 // ── Maud markup model ──────────────────────────────────────────────────────
@@ -916,21 +958,30 @@ fn read_attr_value(trees: &[TokenTree], i: usize) -> (AttrValue, usize) {
     }
 }
 
-/// Read a (possibly hyphenated) name — `aria-label`, `hx-post`, `for` — starting
-/// at `start`. Returns the joined name and the index just past it.
+/// Read a (possibly hyphenated or colon-qualified) name — `aria-label`,
+/// `hx-post`, `x-on:click`, `svg:path`, `for` — starting at `start`. Returns the
+/// joined name and the index just past it. maud names are a
+/// `Punctuated<HtmlNameFragment, ':' | '-'>`, so both `-` and `:` continue the
+/// name; consuming the whole name (including a colon-qualified suffix like
+/// `x-on:click`) is essential — otherwise the leftover `:` ends the element
+/// early and orphans its real `{ … }` body, firing a false `button-name`/
+/// `link-name` on the parent.
 fn read_name(trees: &[TokenTree], start: usize) -> (String, usize) {
     let Some(mut name) = name_segment(trees.get(start)) else {
         return (String::new(), start);
     };
     let mut i = start + 1;
-    while matches!(trees.get(i), Some(TokenTree::Punct(p)) if p.as_char() == '-') {
-        if let Some(seg) = name_segment(trees.get(i + 1)) {
-            name.push('-');
-            name.push_str(&seg);
-            i += 2;
-        } else {
+    while let Some(TokenTree::Punct(p)) = trees.get(i) {
+        let sep = p.as_char();
+        if sep != '-' && sep != ':' {
             break;
         }
+        let Some(seg) = name_segment(trees.get(i + 1)) else {
+            break;
+        };
+        name.push(sep);
+        name.push_str(&seg);
+        i += 2;
     }
     (name, i)
 }
@@ -980,6 +1031,14 @@ fn collect_labels(nodes: &[Node], fors: &mut BTreeSet<String>, dynamic: &mut boo
     for node in nodes {
         match node {
             Node::Element(el) => {
+                // A `<label>` inside an `aria-hidden="true"` subtree is not in the
+                // accessibility tree, so its `for` association contributes no
+                // accessible name — skip the element and its subtree entirely,
+                // consistent with `walk`'s name derivation. A dynamic/spliced
+                // `aria-hidden=(…)` stays non-hidden (conservative).
+                if is_aria_hidden(el) {
+                    continue;
+                }
                 if el.name.eq_ignore_ascii_case("label") {
                     match el.attr("for") {
                         // Only a label that actually provides a name satisfies the
@@ -1623,6 +1682,24 @@ mod tests {
         assert_eq!(rule_ids(&src), vec!["label"], "{:?}", findings_for(&src));
     }
 
+    #[test]
+    fn label_in_aria_hidden_container_does_not_satisfy_association() {
+        // Regression (false negative): a `<label for=..>` that only exists inside
+        // an `aria-hidden="true"` subtree is not in the accessibility tree, so it
+        // provides no accessible name. `collect_labels` must stop descending into
+        // hidden subtrees (like `walk`), so the visible input is FLAGGED.
+        let src = wrap(r#"div aria-hidden="true" { label for="q" { "Search" } } input id="q";"#);
+        assert_eq!(rule_ids(&src), vec!["label"], "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn label_in_visible_container_satisfies_association() {
+        // Unchanged: a `<label for=..>` inside a visible container is in the
+        // accessibility tree and names the associated input, so it is CLEAN.
+        let src = wrap(r#"div { label for="q" { "Search" } } input id="q";"#);
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+    }
+
     // ── Escape-hatch / dynamic limits ──────────────────────────────────────
 
     #[test]
@@ -1965,6 +2042,40 @@ mod tests {
         assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
     }
 
+    // ── colon-qualified maud names (x-on:click, data:foo, svg:path) ─────────
+
+    #[test]
+    fn colon_qualified_attr_name_does_not_orphan_button_body() {
+        // Regression (false positive): maud names allow `:` (and `-`), so an
+        // Alpine/Vue-style `x-on:click` attribute must be read as ONE name. If the
+        // scanner stopped at the `:`, the leftover token ends the element early and
+        // orphans its `{ "Save" }` body — the button is analyzed as empty and
+        // falsely flagged.
+        let src = wrap(r#"button x-on:click="save" { "Save" }"#);
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn colon_qualified_attr_name_empty_button_still_flagged() {
+        // The colon-qualified name is consumed, but a genuinely empty button is
+        // still caught (no over-correction into a false negative).
+        let src = wrap(r#"button x-on:click="save" { }"#);
+        assert_eq!(
+            rule_ids(&src),
+            vec!["button-name"],
+            "{:?}",
+            findings_for(&src)
+        );
+    }
+
+    #[test]
+    fn colon_qualified_attr_on_link_is_clean() {
+        // A colon-qualified `data:foo` attribute must not truncate the anchor: it
+        // keeps its `href` and its `{ "Link" }` text, so it is not flagged.
+        let src = wrap(r#"a href="/x" data:foo="y" { "Link" }"#);
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+    }
+
     // ── aria-hidden on the control itself ───────────────────────────────────
 
     #[test]
@@ -2161,6 +2272,38 @@ mod tests {
         assert!(json.contains("\"wcag\":\"1.1.1\""), "{json}");
         assert!(json.contains("\"severity\":\"Serious\""), "{json}");
         assert!(json.contains("\"rule_id\":\"image-alt\""), "{json}");
+    }
+
+    // ── non-maud html! (JSX/Yew island) is skipped, not misparsed ───────────
+
+    #[test]
+    fn jsx_html_button_is_skipped() {
+        // Regression (false positive): a DIFFERENT `html!` (e.g. a Yew/JSX island)
+        // uses `<tag>…</tag>` angle-bracket syntax that maud never uses. Parsing it
+        // as maud would strip the brackets and misread `<button></button>` as an
+        // empty maud `button`. The body is detected as JSX and skipped — no finding.
+        let src = wrap(r"<button>{label}</button>");
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn jsx_html_div_input_is_skipped() {
+        // A JSX island with self-closing tags (`<input/>`) is likewise skipped.
+        let src = wrap(r"<div><input/></div>");
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn real_maud_button_still_analyzed_after_jsx_skip() {
+        // The JSX skip must not silence real maud: an empty maud `button { }` (no
+        // angle brackets) is STILL parsed and flagged.
+        let src = wrap(r"button { }");
+        assert_eq!(
+            rule_ids(&src),
+            vec!["button-name"],
+            "{:?}",
+            findings_for(&src)
+        );
     }
 
     // ── End-to-end: red project → fix → green ──────────────────────────────
