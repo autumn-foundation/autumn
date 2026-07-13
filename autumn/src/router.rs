@@ -7990,6 +7990,27 @@ mod trusted_host_tests {
         }
     }
 
+    /// Regression guard (#1627): the `StartupBarrierState` allow-list, which is
+    /// seeded from `actuator_endpoint_paths`, must permit the mutating
+    /// `POST {prefix}/webhooks/replay` route to bypass the startup barrier. A
+    /// prior fix removed the path from `actuator_endpoint_paths` to kill a
+    /// phantom GET in the route listing, which also silently dropped it from
+    /// this bypass set.
+    #[cfg(feature = "http-client")]
+    #[test]
+    fn startup_barrier_allows_webhook_replay_post_path() {
+        let mut cfg = AutumnConfig::default();
+        cfg.actuator.sensitive = true;
+        let state = crate::state::AppState::for_test();
+        let barrier = StartupBarrierState::from_config(&cfg, &state);
+        let replay_path =
+            crate::actuator::actuator_route_path(&cfg.actuator.prefix, "/webhooks/replay");
+        assert!(
+            barrier.allows_path(&replay_path),
+            "startup barrier must allow {replay_path} to bypass admission"
+        );
+    }
+
     #[tokio::test]
     async fn trusted_host_release_rejects_loopback_unless_listed() {
         let mut cfg = AutumnConfig {

@@ -396,6 +396,19 @@ fn excluded_dimensions() -> Vec<ExcludedDimension> {
             eventual_provenance: Provenance::RuntimeOnly,
             reason: "boot-time fact; excluded from a build-time manifest by design",
         },
+        ExcludedDimension {
+            dimension: "serve_path_routers",
+            // Provable once plumbed: these are real mounted routes that
+            // `autumn routes` would enumerate (like the routes dimension) if
+            // the dump path injected them into merge_routers.
+            eventual_provenance: Provenance::Provable,
+            reason: "opt-in serve-path HTTP surfaces (MCP, inbound-mail, storage, SEO) are \
+                     injected only on the serve path, after the dump early-exit, so they are not \
+                     enumerated by `autumn routes` at build time; their mutating POSTs (MCP, \
+                     inbound-mail) run outside the framework CSRF layer and self-protect (MCP: \
+                     origin + csrf_header + trusted-host; inbound-mail: provider signature \
+                     verification). Enumerating them is deferred to a dump-plumbing follow-up",
+        },
     ]
 }
 
@@ -863,7 +876,7 @@ mod tests {
 
         // Excluded list is present, ordered, and uses the closed enum values.
         let excluded = json["excluded"].as_array().expect("excluded array");
-        assert_eq!(excluded.len(), 8);
+        assert_eq!(excluded.len(), 9);
         assert_eq!(excluded[0]["dimension"], "authorization_policies");
         assert_eq!(excluded[0]["eventual_provenance"], "provable");
         let runtime_only = excluded
@@ -871,6 +884,15 @@ mod tests {
             .find(|e| e["dimension"] == "policy_registration")
             .expect("policy_registration excluded");
         assert_eq!(runtime_only["eventual_provenance"], "runtime-only");
+
+        // The serve-path routers (MCP, inbound-mail, storage, SEO) are injected
+        // only on the serve path (after the dump early-exit), so they are
+        // honestly disclosed as excluded rather than silently absent (#1627 AC).
+        let serve_path = excluded
+            .iter()
+            .find(|e| e["dimension"] == "serve_path_routers")
+            .expect("serve_path_routers excluded");
+        assert_eq!(serve_path["eventual_provenance"], "provable");
     }
 
     /// AC-2 falsifiability: one CSRF entry per mutating route; a safe-method

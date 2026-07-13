@@ -105,6 +105,14 @@ every dimension that is not yet emitted is named, with the class it will carry
 and why it is deferred — so a reader can tell the difference between "proven
 absent" and "not yet measured".
 
+That honesty also covers a runtime boundary: the `serve_path_routers` entry
+records that opt-in serve-path HTTP surfaces (MCP, inbound-mail, storage, SEO)
+are injected only when the server actually starts — after the route-dump
+early-exit — so `autumn routes` does not enumerate them at build time. Their
+mutating endpoints (MCP, inbound-mail) run outside the framework CSRF layer and
+rely on their own protections; enumerating them is deferred to a dump-plumbing
+follow-up.
+
 ## See also
 
 - [`autumn routes` — Route Inspection CLI](routes-cli.md) — the `audit`

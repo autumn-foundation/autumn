@@ -527,24 +527,38 @@ pub(crate) fn append_framework_routes(
         }
     }
 
+    // Mutating (non-GET) actuator routes are enumerated separately so they
+    // carry their real HTTP method (e.g. `PUT /actuator/loggers/{name}`,
+    // `POST /actuator/webhooks/replay`) rather than a phantom GET.
+    let mutating_routes = crate::actuator::actuator_mutating_routes(
+        &config.actuator.prefix,
+        config.actuator.sensitive,
+    );
+    // Some entries in `actuator_endpoint_paths` exist only to seed the runtime
+    // startup-barrier allow-list (`StartupBarrierState::from_config`) and are
+    // actually mounted with a mutating method (e.g. `/webhooks/replay` is a
+    // `POST`). Skip any path already covered by a mutating-method entry so the
+    // GET-only listing does not emit a phantom GET for it.
+    let mutating_paths: std::collections::HashSet<&str> = mutating_routes
+        .iter()
+        .map(|(_, path)| path.as_str())
+        .collect();
+
     for path in crate::actuator::actuator_endpoint_paths(
         &config.actuator.prefix,
         config.actuator.sensitive,
         config.actuator.prometheus,
     ) {
+        if mutating_paths.contains(path.as_str()) {
+            continue;
+        }
         infos.push(RouteInfo::framework_get(path, "actuator"));
     }
 
-    // Mutating (non-GET) actuator routes are enumerated separately so they
-    // carry their real HTTP method (e.g. `PUT /actuator/loggers/{name}`,
-    // `POST /actuator/webhooks/replay`) rather than a phantom GET.
-    for (route_method, route_path) in crate::actuator::actuator_mutating_routes(
-        &config.actuator.prefix,
-        config.actuator.sensitive,
-    ) {
+    for (route_method, route_path) in &mutating_routes {
         infos.push(RouteInfo::framework_route(
             route_method,
-            route_path,
+            route_path.clone(),
             "actuator",
         ));
     }
@@ -628,6 +642,17 @@ pub(crate) fn append_framework_routes(
         ] {
             infos.push(RouteInfo::framework_get(path.to_owned(), handler));
         }
+    }
+
+    // Tracked-job status endpoint (#1627): runtime mounts
+    // `GET /_autumn/jobs/{token}` when `jobs.tracking.route_enabled` (default
+    // true), gated identically to the router mount. List it so the manifest
+    // reflects the mounted route.
+    if config.jobs.tracking.route_enabled {
+        infos.push(RouteInfo::framework_get(
+            crate::job_tracking::JOB_STATUS_ROUTE_PATH.to_owned(),
+            "job_status",
+        ));
     }
 
     // Static file serving is unconditionally mounted at /static.
@@ -1334,6 +1359,82 @@ mod tests {
                 .iter()
                 .any(|i| i.method == "GET" && i.path == dlq_path),
             "expected GET {dlq_path} framework route: {infos:?}"
+        );
+    }
+
+    /// Regression guard (#1627): `/webhooks/replay` must stay in the runtime
+    /// path set (`actuator_endpoint_paths`) that seeds the startup-barrier
+    /// allow-list, while the GET-only route listing must NOT emit a phantom
+    /// GET for it (only the real `POST`). A prior fix dropped the path from
+    /// `actuator_endpoint_paths` entirely to kill the phantom GET, which also
+    /// silently removed it from the barrier bypass set — this asserts both
+    /// halves are decoupled: complete runtime set, clean listing.
+    #[cfg(feature = "http-client")]
+    #[test]
+    fn webhook_replay_in_runtime_set_but_not_a_phantom_get_listing() {
+        let mut config = AutumnConfig::default();
+        config.actuator.sensitive = true;
+        let prefix = config.actuator.prefix.clone();
+        let replay_path = format!("{prefix}/webhooks/replay");
+
+        // Runtime set (barrier allow-list source) still contains the path.
+        let runtime_paths = crate::actuator::actuator_endpoint_paths(
+            &prefix,
+            config.actuator.sensitive,
+            config.actuator.prometheus,
+        );
+        assert!(
+            runtime_paths.contains(&replay_path),
+            "runtime actuator_endpoint_paths must contain {replay_path} so the \
+             startup barrier bypasses the POST: {runtime_paths:?}"
+        );
+
+        // Listing: no phantom GET, but the real POST is present.
+        let mut infos = Vec::new();
+        append_framework_routes(&mut infos, &config);
+        assert!(
+            !infos
+                .iter()
+                .any(|i| i.method == "GET" && i.path == replay_path),
+            "listing must not contain a phantom GET {replay_path}: {infos:?}"
+        );
+        assert!(
+            infos
+                .iter()
+                .any(|i| i.method == "POST" && i.path == replay_path),
+            "listing must contain POST {replay_path}: {infos:?}"
+        );
+    }
+
+    /// #1627: the tracked-job status endpoint (`GET /_autumn/jobs/{token}`) is
+    /// mounted by default and must be enumerated; disabling
+    /// `jobs.tracking.route_enabled` (the same gate as the router mount) drops
+    /// both the mount and the listing.
+    #[test]
+    fn framework_routes_include_job_status_when_enabled() {
+        let mut config = AutumnConfig::default();
+        assert!(
+            config.jobs.tracking.route_enabled,
+            "job status route should default to enabled"
+        );
+        let mut infos = Vec::new();
+        append_framework_routes(&mut infos, &config);
+        assert!(
+            infos.iter().any(|i| i.method == "GET"
+                && i.path == crate::job_tracking::JOB_STATUS_ROUTE_PATH
+                && i.classification == RouteClassification::Framework),
+            "expected GET {} framework route when enabled: {infos:?}",
+            crate::job_tracking::JOB_STATUS_ROUTE_PATH
+        );
+
+        config.jobs.tracking.route_enabled = false;
+        let mut infos = Vec::new();
+        append_framework_routes(&mut infos, &config);
+        assert!(
+            !infos
+                .iter()
+                .any(|i| i.path == crate::job_tracking::JOB_STATUS_ROUTE_PATH),
+            "job status route must be absent when disabled: {infos:?}"
         );
     }
 

@@ -3521,9 +3521,17 @@ pub(crate) fn actuator_endpoint_paths(
         }
         #[cfg(feature = "http-client")]
         {
-            // Only the GET DLQ listing is enumerated here; `/webhooks/replay`
-            // is mounted as `POST` (see `actuator_mutating_routes`), not `GET`.
             paths.push(actuator_route_path(prefix, "/webhooks/dlq"));
+            // `/webhooks/replay` is mounted as `POST` (see
+            // `actuator_mutating_routes`), not `GET`, but it is included in this
+            // path set because the runtime startup barrier seeds its actuator
+            // allow-list from this helper (`StartupBarrierState::from_config`).
+            // Without it, the `POST {prefix}/webhooks/replay` mount would no
+            // longer bypass the startup barrier. The GET-only route listing
+            // (`append_framework_routes`) excludes any path also produced by
+            // `actuator_mutating_routes`, so this does not surface as a phantom
+            // GET there.
+            paths.push(actuator_route_path(prefix, "/webhooks/replay"));
         }
         #[cfg(feature = "ws")]
         {
