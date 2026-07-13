@@ -1103,13 +1103,28 @@ fn read_name(trees: &[TokenTree], start: usize) -> (String, usize) {
     (name, i)
 }
 
-/// The identifier/literal text of a single name segment.
+/// The text of a single name segment. maud's `HtmlNameFragment` is an
+/// identifier, an integer literal, or a string literal (`.col-12`, `data-1`,
+/// `x-2` all use the integer variant), so all three continue a name. A
+/// non-integer non-string literal (e.g. a float) is not a valid fragment and
+/// ends the name.
 fn name_segment(tree: Option<&TokenTree>) -> Option<String> {
     match tree {
         Some(TokenTree::Ident(id)) => Some(id.to_string()),
-        Some(TokenTree::Literal(lit)) => string_literal_value(lit),
+        Some(TokenTree::Literal(lit)) => {
+            string_literal_value(lit).or_else(|| int_literal_text(lit))
+        }
         _ => None,
     }
+}
+
+/// The digits of an integer literal (e.g. the `12` in `.col-12`), or `None` if
+/// the literal is not an integer. maud accepts an integer as an `HtmlName`
+/// fragment, so it must be consumed as part of the name.
+fn int_literal_text(lit: &Literal) -> Option<String> {
+    syn::parse2::<syn::LitInt>(TokenStream::from(TokenTree::Literal(lit.clone())))
+        .ok()
+        .map(|n| n.base10_digits().to_string())
 }
 
 /// The unescaped value of a string literal, or `None` for a non-string literal.
@@ -1141,12 +1156,13 @@ fn collect_labels(nodes: &[Node], fors: &mut BTreeSet<String>, dynamic: &mut boo
     for node in nodes {
         match node {
             Node::Element(el) => {
-                // A `<label>` inside an `aria-hidden="true"` subtree is not in the
-                // accessibility tree, so its `for` association contributes no
-                // accessible name — skip the element and its subtree entirely,
-                // consistent with `walk`'s name derivation. A dynamic/spliced
-                // `aria-hidden=(…)` stays non-hidden (conservative).
-                if is_aria_hidden(el) {
+                // A `<label>` inside an `aria-hidden="true"` (or natively
+                // `hidden`) subtree is not in the accessibility tree, so its
+                // `for` association contributes no accessible name — skip the
+                // element and its subtree entirely, consistent with `walk`'s
+                // name derivation. A dynamic/spliced `aria-hidden=(…)`/`hidden=(…)`
+                // stays non-hidden (conservative).
+                if is_hidden(el) {
                     continue;
                 }
                 if el.name.eq_ignore_ascii_case("label") {
@@ -1218,9 +1234,9 @@ fn walk(
             continue;
         };
         // An element removed from the accessibility tree by `aria-hidden="true"`
-        // on ITSELF needs no accessible name, and neither does its subtree — skip
-        // both rule application and recursion for it.
-        if is_aria_hidden(el) {
+        // or a native boolean `hidden` on ITSELF needs no accessible name, and
+        // neither does its subtree — skip both rule application and recursion.
+        if is_hidden(el) {
             continue;
         }
         apply_rules(el, file, &ctx, scan);
@@ -1312,20 +1328,32 @@ fn named_content(el: &Element) -> bool {
     el.has_aria_name() || el.has_title_name() || content_provides_name(&el.children)
 }
 
-/// Whether an element is hidden from the accessibility tree via a literal
-/// `aria-hidden="true"`. Per ARIA such a subtree contributes nothing to an
-/// ancestor's accessible name. A dynamic/spliced `aria-hidden=(…)` is
-/// unresolvable and treated as *not* hidden (conservative — don't suppress a
-/// name on an unresolved splice); `aria-hidden="false"` or an absent attribute
-/// are likewise not hidden.
-fn is_aria_hidden(el: &Element) -> bool {
-    matches!(el.attr("aria-hidden"), Some(AttrValue::Literal(v)) if v.eq_ignore_ascii_case("true"))
+/// Whether an element is hidden from the accessibility tree, either via a
+/// literal `aria-hidden="true"` or via the native boolean `hidden` attribute.
+/// Per ARIA/HTML such a subtree contributes nothing to an ancestor's accessible
+/// name and its controls need no name. A dynamic/spliced `aria-hidden=(…)` or
+/// `hidden=(…)` is unresolvable and treated as *not* hidden (conservative —
+/// don't suppress a name on an unresolved splice); `aria-hidden="false"` or an
+/// absent attribute are likewise not hidden. A present static `hidden` — bare
+/// (`hidden`) or with any literal value (`hidden="until-found"`) — counts as
+/// hidden, matching HTML's boolean-attribute semantics.
+fn is_hidden(el: &Element) -> bool {
+    let aria_hidden = matches!(
+        el.attr("aria-hidden"),
+        Some(AttrValue::Literal(v)) if v.eq_ignore_ascii_case("true")
+    );
+    let native_hidden = matches!(
+        el.attr("hidden"),
+        Some(AttrValue::Boolean | AttrValue::Literal(_))
+    );
+    aria_hidden || native_hidden
 }
 
 /// Whether descendant content contributes an accessible name to an enclosing
 /// control: a dynamic (spliced) node, non-empty visible text, or a named
-/// `<img>`. Subtrees hidden via a literal `aria-hidden="true"` are excluded —
-/// per ARIA their text does not count toward the ancestor's accessible name.
+/// `<img>`. Subtrees hidden via a literal `aria-hidden="true"` or a native
+/// boolean `hidden` are excluded — per ARIA/HTML their text does not count
+/// toward the ancestor's accessible name.
 fn content_provides_name(nodes: &[Node]) -> bool {
     nodes.iter().any(|n| match n {
         // Only a genuine `(expr)`/`[..]` splice renders text that could name the
@@ -1333,7 +1361,7 @@ fn content_provides_name(nodes: &[Node]) -> bool {
         // (its branch bodies were already parsed out), so it is not a name.
         Node::Dynamic { splice } => *splice,
         Node::Text(t) => !t.trim().is_empty(),
-        Node::Element(e) if is_aria_hidden(e) => false,
+        Node::Element(e) if is_hidden(e) => false,
         Node::Element(e) => {
             // A descendant contributes a name via its own `aria-label`/
             // `aria-labelledby`/`title` (used during the name-from-content
@@ -2338,6 +2366,59 @@ mod tests {
         assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
     }
 
+    // ── numeric maud name fragments (.col-12, data-1, x-2) ──────────────────
+
+    #[test]
+    fn numeric_class_shorthand_does_not_orphan_button_body() {
+        // Regression (false positive): maud `HtmlName` fragments may be integers,
+        // so `.col-12` is ONE class name. If the reader stopped at the numeric
+        // fragment the leftover `-12` ends the element early and orphans its
+        // `{ "Save" }` body — the button is analyzed as empty and falsely flagged.
+        let src = wrap(r#"button.col-12 { "Save" }"#);
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn numeric_attr_name_does_not_orphan_button_body() {
+        // A numeric attribute-name fragment (`data-1`) must be read as one name so
+        // the button's `{ "Save" }` body is still parsed.
+        let src = wrap(r#"button data-1="x" { "Save" }"#);
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn numeric_class_shorthand_on_link_is_clean() {
+        // An anchor with a numeric class shorthand keeps its `href` and `{ "Link" }`
+        // text, so it is not flagged.
+        let src = wrap(r#"a.col-6 href="/x" { "Link" }"#);
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn numeric_class_shorthand_empty_button_still_flagged() {
+        // The numeric class name is consumed correctly, but a genuinely empty body
+        // is still caught (no over-correction into a false negative).
+        let src = wrap(r"button.col-12 { }");
+        assert_eq!(
+            rule_ids(&src),
+            vec!["button-name"],
+            "{:?}",
+            findings_for(&src)
+        );
+    }
+
+    #[test]
+    fn plain_empty_button_without_numeric_name_still_flagged() {
+        // A plain nameless button is unaffected by the numeric-fragment fix.
+        let src = wrap(r"button { }");
+        assert_eq!(
+            rule_ids(&src),
+            vec!["button-name"],
+            "{:?}",
+            findings_for(&src)
+        );
+    }
+
     // ── quoted (string-literal) attribute names ─────────────────────────────
 
     #[test]
@@ -2459,6 +2540,65 @@ mod tests {
         // A spliced `aria-hidden=(…)` is unresolvable → treated as NOT hidden, so
         // a nameless button is still flagged (no new false negative).
         let src = wrap(r"button aria-hidden=(flag) { }");
+        assert_eq!(
+            rule_ids(&src),
+            vec!["button-name"],
+            "{:?}",
+            findings_for(&src)
+        );
+    }
+
+    // ── native boolean `hidden` attribute ───────────────────────────────────
+
+    #[test]
+    fn native_hidden_button_needs_no_name() {
+        // A `<button hidden>` is removed from the accessibility tree, so it needs
+        // no accessible name (regression: false positive on valid markup).
+        let src = wrap(r"button hidden { }");
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn native_hidden_subtree_control_is_exempt() {
+        // A control nested inside a natively `hidden` subtree is hidden too, so its
+        // subtree is skipped and the inner input is not flagged.
+        let src = wrap(r"div hidden { input; }");
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn native_hidden_with_literal_value_needs_no_name() {
+        // `hidden="until-found"` is a present static boolean `hidden` (HTML treats
+        // any value as hidden), so the button is exempt.
+        let src = wrap(r#"button hidden="until-found" { }"#);
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn button_without_hidden_still_flagged() {
+        // A nameless button with no `hidden` attribute is unaffected by the fix.
+        let src = wrap(r"button { }");
+        assert_eq!(
+            rule_ids(&src),
+            vec!["button-name"],
+            "{:?}",
+            findings_for(&src)
+        );
+    }
+
+    #[test]
+    fn visible_subtree_control_without_hidden_still_flagged() {
+        // A `<div>` without `hidden` does not hide its input — the labelless input
+        // is still flagged (no new false negative).
+        let src = wrap(r"div { input; }");
+        assert_eq!(rule_ids(&src), vec!["label"], "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn dynamic_hidden_control_is_still_checked() {
+        // A spliced `hidden=(…)` is unresolvable → treated as NOT hidden, so a
+        // nameless button is still flagged (conservative, no new false negative).
+        let src = wrap(r"button hidden=(flag) { }");
         assert_eq!(
             rule_ids(&src),
             vec!["button-name"],
