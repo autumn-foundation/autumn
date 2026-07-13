@@ -371,25 +371,30 @@ fn find_html_blocks(stream: &TokenStream, file: &str, scan: &mut Scan) {
 }
 
 /// Whether an `html!` body is JSX/Yew-style angle-bracket markup rather than
-/// maud. maud markup NEVER uses `<tag …>` / `</tag>` element syntax, so a `<`
-/// punct immediately followed by an ident or `/` (`<button`, `</`) — the way
-/// every JSX open/close tag begins — marks the body as a DIFFERENT `html!`
-/// macro. Such a body is skipped entirely rather than parsed as maud, which
-/// would drop the angle brackets and misread `<button></button>` as an empty
-/// maud `button` (a false `button-name`). When in doubt we skip: a missed check
-/// on non-maud markup is acceptable, a false positive on valid markup is not.
+/// maud. Detection keys ONLY on token pairs that maud never emits but that every
+/// JSX/Yew element carries: a closing tag `</…>` (a `<` immediately followed by
+/// `/`) or a self-closing tag `<…/>` (a `/` immediately followed by `>`). maud
+/// markup uses `{}`/`;`, never angle-bracket tags, so neither pair can appear in
+/// valid maud. A bare `<`/`>` is NOT treated as JSX: it is an ordinary Rust
+/// comparison inside a control head (`@if count < limit { … }`, `@if a > b { … }`),
+/// and misreading it as JSX would skip — and thus stop analyzing — the entire
+/// `html!` body. A JSX body is skipped rather than parsed as maud, which would
+/// drop the angle brackets and misread `<button></button>` as an empty maud
+/// `button` (a false `button-name`). When in doubt we do NOT classify as JSX: a
+/// missed check on non-maud markup is acceptable, disabling the scanner on valid
+/// maud is not.
 fn looks_like_jsx(trees: &[TokenTree]) -> bool {
     for (idx, tree) in trees.iter().enumerate() {
         let TokenTree::Punct(p) = tree else {
             continue;
         };
-        if p.as_char() != '<' {
-            continue;
-        }
-        match trees.get(idx + 1) {
-            // `<button` (open tag) or `</button` (close tag) — JSX, not maud.
-            Some(TokenTree::Ident(_)) => return true,
-            Some(TokenTree::Punct(q)) if q.as_char() == '/' => return true,
+        let next_is =
+            |c: char| matches!(trees.get(idx + 1), Some(TokenTree::Punct(q)) if q.as_char() == c);
+        match p.as_char() {
+            // `</…>` — a closing tag. maud never emits `<` followed by `/`.
+            '<' if next_is('/') => return true,
+            // `<…/>` — a self-closing tag. maud never emits `/` followed by `>`.
+            '/' if next_is('>') => return true,
             _ => {}
         }
     }
@@ -476,12 +481,31 @@ fn is_presentational(el: &Element) -> bool {
 }
 
 /// Whether an attribute value supplies a non-empty accessible name: a spliced
-/// value (unresolvable → assume present) or a non-empty string literal.
-const fn attr_is_present_name(value: Option<&AttrValue>) -> bool {
+/// value (unresolvable → assume present) or a string literal that is non-blank
+/// after `.trim()`. A whitespace-only literal (`aria-label="   "`, `title=" "`,
+/// `alt="  "`) collapses to an empty accessible name — mirroring how text nodes
+/// are trimmed — so it does NOT count as a present name.
+fn attr_is_present_name(value: Option<&AttrValue>) -> bool {
     match value {
         Some(AttrValue::Dynamic) => true,
-        Some(AttrValue::Literal(s)) => !s.is_empty(),
+        Some(AttrValue::Literal(s)) => !s.trim().is_empty(),
         _ => false,
+    }
+}
+
+/// Whether an `<img>` carries an `alt` that is a valid decorative marker or a
+/// real textual name. An explicitly empty `alt=""` is the accepted decorative
+/// marker (kept clean). A literal `alt` counts as a name only when it is
+/// non-blank after `.trim()`: a whitespace-only `alt="   "` collapses to an
+/// empty accessible name and is neither a name nor a valid decorative marker, so
+/// it does NOT satisfy the check. A dynamic/boolean `alt` is unresolvable and
+/// treated as present (non-failing convention).
+fn has_alt_marker(el: &Element) -> bool {
+    match el.attr("alt") {
+        None => false,
+        // Exact-empty is decorative; otherwise it must be non-blank after trim.
+        Some(AttrValue::Literal(s)) => s.is_empty() || !s.trim().is_empty(),
+        Some(_) => true,
     }
 }
 
@@ -585,10 +609,19 @@ fn parse_nodes(trees: &[TokenTree]) -> Vec<Node> {
 ///   accepts a **block-expression** condition (`@if { cond } { body }`); the
 ///   leading brace is then the condition, not the body.
 ///
-/// The body is the final brace of the clause: a brace outside a pattern region,
-/// and — when no condition token precedes it — only if it is not itself a
-/// leading block-expression condition (i.e. not immediately followed by the real
-/// body brace).
+/// The body is the FINAL top-level brace of the clause. Two kinds of earlier
+/// brace are part of the condition and must NOT be parsed as markup:
+///
+/// - a **leading** block-expression condition (`@if { cond } { body }`): a brace
+///   seen before any condition token, immediately followed by the body brace, and
+/// - a **block-bearing keyword** expression inside the condition — `match`/`loop`/
+///   `unsafe` (`@if match s { … } { body }`): the keyword owns the next top-level
+///   brace (its block), which belongs to the condition, not the body.
+///
+/// A plain `@if a { body } { sibling }` is different: `a` is a complete condition,
+/// `{ body }` is the markup body, and `{ sibling }` is a following sibling block —
+/// both are scanned. So a brace-followed-by-brace is only skipped when it is a
+/// leading block condition or a pending keyword block; otherwise it is the body.
 fn skip_control(trees: &[TokenTree], start: usize, nodes: &mut Vec<Node>) -> usize {
     let mut i = start;
     // Inside a `let`/`for` pattern region, where braces are pattern syntax.
@@ -596,16 +629,25 @@ fn skip_control(trees: &[TokenTree], start: usize, nodes: &mut Vec<Node>) -> usi
     // Whether a non-brace condition token has been seen (so a following brace is
     // the body, not a leading block-expression condition).
     let mut saw_cond = false;
+    // A `match`/`loop`/`unsafe` expression in the condition owns the next
+    // top-level brace (its block), which is part of the condition, not the body.
+    let mut pending_block = false;
     while i < trees.len() {
         match &trees[i] {
             TokenTree::Ident(id) => {
                 match id.to_string().as_str() {
-                    // Control keywords: not condition tokens.
+                    // Leading control keywords: not condition tokens.
                     "if" | "while" | "else" => {}
                     // `let`/`for` open a pattern region.
                     "let" | "for" => in_pattern = true,
                     // `in` closes a `@for pat in …` pattern region.
                     "in" if in_pattern => in_pattern = false,
+                    // A block-bearing keyword expression in the condition: the
+                    // next top-level brace is its block, part of the condition.
+                    "match" | "loop" | "unsafe" if !in_pattern => {
+                        saw_cond = true;
+                        pending_block = true;
+                    }
                     // Any other ident is part of the condition/iterator expression.
                     _ => {
                         if !in_pattern {
@@ -631,6 +673,14 @@ fn skip_control(trees: &[TokenTree], start: usize, nodes: &mut Vec<Node>) -> usi
                     i += 1;
                     continue;
                 }
+                if pending_block {
+                    // The block of a `match`/`loop`/`unsafe` condition expression
+                    // (e.g. the arm-list of `@if match s { … } { body }`). Part of
+                    // the condition — skip; the body is a later brace.
+                    pending_block = false;
+                    i += 1;
+                    continue;
+                }
                 if !saw_cond
                     && matches!(trees.get(i + 1), Some(TokenTree::Group(n)) if n.delimiter() == Delimiter::Brace)
                 {
@@ -652,6 +702,7 @@ fn skip_control(trees: &[TokenTree], start: usize, nodes: &mut Vec<Node>) -> usi
                     // Reset for the `@else` / `@else if …` continuation.
                     in_pattern = false;
                     saw_cond = false;
+                    pending_block = false;
                     continue;
                 }
                 break;
@@ -1150,7 +1201,7 @@ fn apply_rules(el: &Element, file: &str, ctx: &LabelCtx, scan: &mut Scan) {
         // `aria-label`/`aria-labelledby`, a non-empty `title`, or an explicit
         // presentational role. Only a bare image with none of these is flagged.
         "img"
-            if !el.has_attr("alt")
+            if !has_alt_marker(el)
                 && !el.has_aria_name()
                 && !el.has_title_name()
                 && !is_presentational(el) =>
@@ -1387,6 +1438,46 @@ mod tests {
     fn img_with_dynamic_alt_is_clean() {
         let src = wrap(r#"img src="x.png" alt=(caption);"#);
         assert!(findings_for(&src).is_empty());
+    }
+
+    #[test]
+    fn img_with_whitespace_alt_is_flagged() {
+        // A whitespace-only `alt="  "` collapses to an empty accessible name and
+        // is not a valid decorative marker (only exact `alt=""` is) — flagged.
+        let src = wrap(r#"img src="x" alt="  ";"#);
+        assert_eq!(
+            rule_ids(&src),
+            vec!["image-alt"],
+            "{:?}",
+            findings_for(&src)
+        );
+    }
+
+    #[test]
+    fn button_with_whitespace_aria_label_is_flagged() {
+        // A whitespace-only static `aria-label="   "` supplies no accessible name.
+        let src = wrap(r#"button aria-label="   " { }"#);
+        assert_eq!(
+            rule_ids(&src),
+            vec!["button-name"],
+            "{:?}",
+            findings_for(&src)
+        );
+    }
+
+    #[test]
+    fn button_with_real_aria_label_is_clean() {
+        // A non-blank static `aria-label` is a present accessible name — clean.
+        let src = wrap(r#"button aria-label="Close" { }"#);
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn input_with_whitespace_title_and_no_label_is_flagged() {
+        // A whitespace-only `title=" "` is not a name; with no label the field is
+        // flagged.
+        let src = wrap(r#"input title=" " id="q";"#);
+        assert_eq!(rule_ids(&src), vec!["label"], "{:?}", findings_for(&src));
     }
 
     // ── Rule 2: label ──────────────────────────────────────────────────────
@@ -1920,6 +2011,37 @@ mod tests {
         assert_eq!(rule_ids(&src), vec!["label"], "{:?}", findings_for(&src));
     }
 
+    #[test]
+    fn if_match_condition_arm_list_is_not_parsed_as_markup() {
+        // Regression (false positive): a `match` expression IN the `@if` condition
+        // owns its arm-list brace — that brace is part of the condition, and the
+        // real markup body is the FINAL `{ "ok" }`. The arm pattern `input` must
+        // NOT be misread as an `<input>`, and the body must be scanned.
+        let src = wrap(r#"@if match state { input => true, _ => false } { "ok" }"#);
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn if_simple_condition_body_input_still_flagged() {
+        // A plain `@if cond { body }` still parses the body: a real unlabeled
+        // `<input>` is flagged (no match brace to confuse the head).
+        let src = wrap(r"@if cond { input; }");
+        assert_eq!(rule_ids(&src), vec!["label"], "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn while_comparison_condition_body_is_scanned() {
+        // `@while x > 0 { button { } }`: the comparison is the condition and the
+        // body is scanned — the empty button is flagged.
+        let src = wrap(r"@while x > 0 { button { } }");
+        assert_eq!(
+            rule_ids(&src),
+            vec!["button-name"],
+            "{:?}",
+            findings_for(&src)
+        );
+    }
+
     // ── maud class/id shorthand (dynamic + toggled) ─────────────────────────
 
     #[test]
@@ -2320,6 +2442,43 @@ mod tests {
             "{:?}",
             findings_for(&src)
         );
+    }
+
+    #[test]
+    fn maud_comparison_in_if_head_is_not_misread_as_jsx() {
+        // Regression (false negative): a `<`/`>` comparison in a control head is a
+        // normal Rust comparison, NOT a JSX tag start. Misreading it as JSX would
+        // skip the WHOLE `html!` body. The body must still be scanned — a real
+        // unlabeled `<input>` inside `@if count < limit { … }` is still flagged.
+        let src = wrap(r"@if count < limit { input; }");
+        assert_eq!(rule_ids(&src), vec!["label"], "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn maud_greater_than_comparison_is_not_misread_as_jsx() {
+        // `@if a > b { button { } }`: `>` is a comparison, not a self-closing tag.
+        // The body is scanned and the empty button flagged.
+        let src = wrap(r"@if a > b { button { } }");
+        assert_eq!(
+            rule_ids(&src),
+            vec!["button-name"],
+            "{:?}",
+            findings_for(&src)
+        );
+    }
+
+    #[test]
+    fn jsx_close_tag_is_still_skipped() {
+        // A JSX closing tag `</button>` marks the body as non-maud — skipped.
+        let src = wrap(r"<button>{label}</button>");
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn jsx_self_closing_tag_is_still_skipped() {
+        // A JSX self-closing tag `<input/>` marks the body as non-maud — skipped.
+        let src = wrap(r"<input/>");
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
     }
 
     // ── End-to-end: red project → fix → green ──────────────────────────────
