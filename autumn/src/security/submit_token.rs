@@ -445,9 +445,10 @@ fn body_read_error_response() -> Response<Body> {
 }
 
 /// `500` returned when the handler's response body stream errors while it is
-/// being buffered for replay caching. The token is not recorded and the
-/// in-flight lock is released, so we cannot cache or safely replay this
-/// response; surface an error rather than a truncated body.
+/// being buffered for replay caching. The token is not recorded, and the
+/// in-flight lock is intentionally kept held (it expires via `in_flight_ttl`)
+/// so a retry is rejected in-flight rather than re-running the already-committed
+/// mutation; surface an error rather than a truncated body.
 fn response_read_error_response() -> Response<Body> {
     Response::builder()
         .status(StatusCode::INTERNAL_SERVER_ERROR)
@@ -736,14 +737,29 @@ async fn cache_consumed_token_response(
             Response::from_parts(parts, body)
         }
         CollectedBody::Errored(error) => {
-            // The response body errored while buffering for the replay cache. We
-            // can neither record the token nor replay a truncated body; release
-            // the lock and surface a 500.
+            let status = parts.status.as_u16();
+            // The response body errored while buffering for the replay cache.
+            // Mirror the `Full` branch's commit policy, keyed on status:
+            //
+            // * 2xx/3xx (committed, cacheable): the handler already committed
+            //   its mutation, but we can neither record the token nor replay a
+            //   truncated body. Fail closed exactly like the `try_set`
+            //   persistence-failure path above — keep the in-flight lock held
+            //   (by not unlocking, it expires via `in_flight_ttl`) so a retry
+            //   carrying the same token gets a `409` in-flight conflict rather
+            //   than re-running the committed mutation.
+            // * non-2xx/3xx (not committed, not cacheable): like the `Full`
+            //   branch's clean non-success path, this stores no record and the
+            //   request stays retryable, so release the lock. An immediate
+            //   resubmit of a failed/validation request re-runs the handler
+            //   instead of getting a spurious 24h `409` in-flight conflict.
             tracing::error!(
                 error = %error,
-                "Submit-token response buffering failed on a read error"
+                "Submit-token response buffering failed on a read error; failing closed"
             );
-            settings.store.unlock(key);
+            if !(200..400).contains(&status) {
+                settings.store.unlock(key);
+            }
             response_read_error_response()
         }
     }
@@ -1209,6 +1225,151 @@ mod tests {
             count.load(Ordering::SeqCst),
             1,
             "the handler must run at most once even when persistence fails"
+        );
+    }
+
+    /// Finding (fail closed on response-stream error): when the handler has
+    /// already committed its mutation and returned a 2xx, but its response body
+    /// stream then errors mid-buffer, the guard can neither record the token nor
+    /// replay the truncated body. It must fail closed exactly like the
+    /// persistence-failure path: the first request surfaces `500`, no
+    /// consumed-token record is stored, and the in-flight lock stays held so a
+    /// retry with the same token is rejected in-flight with a `409` instead of
+    /// re-running the committed mutation.
+    #[tokio::test]
+    async fn response_stream_error_fails_closed_and_holds_lock() {
+        let store = Arc::new(MemoryIdempotencyStore::new(Duration::from_secs(600)));
+        let store_dyn: Arc<dyn IdempotencyStore> = store.clone();
+        let count = Arc::new(AtomicUsize::new(0));
+        let count_inner = count.clone();
+        let app = Router::new()
+            .route(
+                "/submit",
+                post(move || {
+                    let count = count_inner.clone();
+                    async move {
+                        // The handler commits its mutation and returns a 200
+                        // whose body stream delivers a leading chunk and then
+                        // errors before EOF — so the replay cache buffering hits
+                        // `CollectedBody::Errored` after the commit.
+                        count.fetch_add(1, Ordering::SeqCst);
+                        let chunks: Vec<Result<Bytes, std::io::Error>> = vec![
+                            Ok(Bytes::from("created")),
+                            Err(std::io::Error::other("simulated response read failure")),
+                        ];
+                        Response::new(Body::from_stream(futures::stream::iter(chunks)))
+                    }
+                }),
+            )
+            .layer(layer_with_store(store_dyn));
+
+        let token = "tok-resp-stream-fail";
+
+        // First submit: handler runs once and commits, but its response body
+        // stream errors while buffering, so the guard fails closed with 500
+        // instead of returning a truncated success.
+        let first = app.clone().oneshot(urlencoded_post(token)).await.unwrap();
+        assert_eq!(
+            first.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "a response-stream error after handler commit must fail closed, not return a truncated body"
+        );
+
+        // No consumed-token record was persisted (the body never fully buffered).
+        let key = storage_key(token);
+        assert!(
+            store.get(&key).is_none(),
+            "a response-stream error must not persist a consumed-token record"
+        );
+
+        // Retry with the same token: the in-flight lock is still held (it was
+        // deliberately not released), so the retry is rejected in-flight and the
+        // handler does NOT run a second time.
+        let second = app.clone().oneshot(urlencoded_post(token)).await.unwrap();
+        assert_eq!(
+            second.status(),
+            StatusCode::CONFLICT,
+            "a retry after a response-stream error must be rejected in-flight, not re-run"
+        );
+
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            1,
+            "the handler must run at most once even when the response stream errors"
+        );
+    }
+
+    /// Companion to `response_stream_error_fails_closed_and_holds_lock`: when the
+    /// erroring response carries a NON-success status (e.g. `422`), the handler
+    /// did not commit a cacheable mutation, so — matching the `Full` branch's
+    /// clean non-success path — no record is stored and the in-flight lock is
+    /// released. An immediate resubmit with the same token must therefore be
+    /// retryable: it re-acquires the lock and re-runs the handler rather than
+    /// getting a spurious `409` in-flight conflict for the full `in_flight_ttl`.
+    #[tokio::test]
+    async fn response_stream_error_on_non_success_releases_lock() {
+        let store = Arc::new(MemoryIdempotencyStore::new(Duration::from_secs(600)));
+        let store_dyn: Arc<dyn IdempotencyStore> = store.clone();
+        let count = Arc::new(AtomicUsize::new(0));
+        let count_inner = count.clone();
+        let app = Router::new()
+            .route(
+                "/submit",
+                post(move || {
+                    let count = count_inner.clone();
+                    async move {
+                        // The handler returns a 422 (validation failure — no
+                        // committed, cacheable mutation) whose body stream
+                        // delivers a leading chunk and then errors before EOF,
+                        // so the replay cache buffering hits
+                        // `CollectedBody::Errored` on a non-success status.
+                        count.fetch_add(1, Ordering::SeqCst);
+                        let chunks: Vec<Result<Bytes, std::io::Error>> = vec![
+                            Ok(Bytes::from("invalid")),
+                            Err(std::io::Error::other("simulated response read failure")),
+                        ];
+                        Response::builder()
+                            .status(StatusCode::UNPROCESSABLE_ENTITY)
+                            .body(Body::from_stream(futures::stream::iter(chunks)))
+                            .unwrap()
+                    }
+                }),
+            )
+            .layer(layer_with_store(store_dyn));
+
+        let token = "tok-resp-stream-fail-422";
+
+        // First submit: handler runs once and returns a 422 whose body stream
+        // errors while buffering, so the guard surfaces 500 but — because the
+        // status is non-success — releases the in-flight lock.
+        let first = app.clone().oneshot(urlencoded_post(token)).await.unwrap();
+        assert_eq!(
+            first.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "a response-stream error must fail closed with 500 rather than a truncated body"
+        );
+
+        // No consumed-token record was persisted (non-success, and the body
+        // never fully buffered).
+        let key = storage_key(token);
+        assert!(
+            store.get(&key).is_none(),
+            "a non-success response-stream error must not persist a consumed-token record"
+        );
+
+        // Retry with the same token: the lock was released, so the retry is NOT
+        // rejected in-flight — it re-acquires the lock and re-runs the handler.
+        let second = app.clone().oneshot(urlencoded_post(token)).await.unwrap();
+        assert_ne!(
+            second.status(),
+            StatusCode::CONFLICT,
+            "a retry after a non-success response-stream error must be retryable, not a 409 in-flight conflict"
+        );
+
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            2,
+            "the handler must re-run on retry once the non-success lock is released"
         );
     }
 
