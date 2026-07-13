@@ -27,7 +27,16 @@
 //! `type/subtype` > `type/*` > `*/*`: `text/html` is covered by
 //! `text/html.or(text/*).or(*/*)` and JSON by
 //! `application/json.or(application/*).or(*/*)`. The higher effective q wins; on
-//! a tie the earlier list entry wins. So `Accept: text/html;q=0.1, */*;q=1`
+//! a tie the earlier list entry wins.
+//!
+//! `application/problem+json` is deliberately **not** part of the JSON tier: it
+//! is an error-path (Problem Details) signal, not a success representation, so
+//! advertising it alone does not count as accepting the `application/json`
+//! success body. A request whose `Accept` names only `application/problem+json`
+//! leaves both HTML and JSON unmentioned and falls back to the configured
+//! default, exactly like any other unhandled type (e.g. `application/xml`).
+//!
+//! So `Accept: text/html;q=0.1, */*;q=1`
 //! serves **JSON** — `text/html` is explicitly demoted to `q=0.1` while
 //! `*/*;q=1` lifts JSON to `q=1` — rather than being fooled by the bare presence
 //! of `text/html`. Likewise `Accept: text/*;q=0, */*;q=1` serves **JSON**: the
@@ -503,6 +512,80 @@ mod tests {
         assert_eq!(
             negotiate(Some("text/html;q=0.1, */*;q=1")).resolve(),
             Resolution::Json,
+        );
+    }
+
+    // ── `application/problem+json` is an error-path signal, not success JSON ──
+
+    #[test]
+    fn problem_json_alone_uses_html_default() {
+        // `application/problem+json` is an error-path (Problem Details) signal,
+        // not the success `application/json` body. Alone it leaves both HTML and
+        // JSON unmentioned, so the HTML default applies — it must NOT select JSON.
+        assert_eq!(
+            negotiate(Some("application/problem+json")).resolve(),
+            Resolution::Html,
+        );
+        assert_eq!(
+            negotiate(Some("application/problem+json")).format(),
+            Format::Html,
+        );
+    }
+
+    #[test]
+    fn problem_json_alone_uses_json_default_via_default_not_match() {
+        // With a JSON default, problem+json alone still falls through to the
+        // default (both formats unmentioned) — JSON is served *because it is the
+        // default*, not because problem+json matched the success JSON slot.
+        assert_eq!(
+            negotiate(Some("application/problem+json"))
+                .default_format(Format::Json)
+                .resolve(),
+            Resolution::Json,
+        );
+        assert_eq!(
+            negotiate(Some("application/problem+json"))
+                .default_format(Format::Json)
+                .format(),
+            Format::Json,
+        );
+    }
+
+    #[test]
+    fn plain_json_serves_json() {
+        // Regression: the success `application/json` type still negotiates JSON.
+        assert_eq!(
+            negotiate(Some("application/json")).resolve(),
+            Resolution::Json,
+        );
+        assert_eq!(negotiate(Some("application/json")).format(), Format::Json);
+    }
+
+    #[test]
+    fn json_and_problem_json_serves_json() {
+        // `application/json` is present (alongside the problem+json error
+        // signal), so the success JSON body is negotiated.
+        assert_eq!(
+            negotiate(Some("application/json, application/problem+json")).resolve(),
+            Resolution::Json,
+        );
+        assert_eq!(
+            negotiate(Some("application/json, application/problem+json")).format(),
+            Format::Json,
+        );
+    }
+
+    #[test]
+    fn problem_json_with_html_serves_html() {
+        // problem+json does not lift the JSON tier, and text/html is present, so
+        // HTML wins outright.
+        assert_eq!(
+            negotiate(Some("application/problem+json, text/html")).resolve(),
+            Resolution::Html,
+        );
+        assert_eq!(
+            negotiate(Some("application/problem+json, text/html")).format(),
+            Format::Html,
         );
     }
 

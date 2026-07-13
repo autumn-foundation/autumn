@@ -214,6 +214,55 @@ async fn concrete_html_exclusion_beats_text_star_and_serves_json() {
     assert_eq!(body_string(response).await, r#"{"id":7,"name":"spanner"}"#);
 }
 
+// ── `application/problem+json` is an error-path signal, not success JSON ─────
+
+#[tokio::test]
+async fn problem_json_alone_serves_html_default() {
+    // `application/problem+json` is a Problem Details (error-path) signal, not
+    // the success `application/json` body. Alone it leaves both formats
+    // unmentioned, so the HTML default applies — it must NOT select JSON.
+    let response = send(app(), Some("application/problem+json")).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(header(&response, "content-type").starts_with("text/html"));
+    assert_eq!(header(&response, "vary"), "Accept");
+    assert!(body_string(response).await.contains("<h1>spanner</h1>"));
+}
+
+#[tokio::test]
+async fn problem_json_alone_serves_json_via_default_not_match() {
+    // With a JSON default, problem+json alone still falls through to the default
+    // (both formats unmentioned) — JSON is served because it is the default, not
+    // because problem+json matched the success JSON slot.
+    let app = Router::new().route("/widget", axum::routing::get(show_json_default));
+    let response = send(app, Some("application/problem+json")).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(header(&response, "content-type"), "application/json");
+    assert_eq!(header(&response, "vary"), "Accept");
+    assert_eq!(body_string(response).await, r#"{"id":7,"name":"spanner"}"#);
+}
+
+#[tokio::test]
+async fn json_and_problem_json_serves_json() {
+    // `application/json` is present alongside the problem+json error signal, so
+    // the success JSON body is negotiated.
+    let response = send(app(), Some("application/json, application/problem+json")).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(header(&response, "content-type"), "application/json");
+    assert_eq!(header(&response, "vary"), "Accept");
+    assert_eq!(body_string(response).await, r#"{"id":7,"name":"spanner"}"#);
+}
+
+#[tokio::test]
+async fn problem_json_with_html_serves_html() {
+    // problem+json does not lift the JSON tier, and text/html is present, so HTML
+    // wins outright.
+    let response = send(app(), Some("application/problem+json, text/html")).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(header(&response, "content-type").starts_with("text/html"));
+    assert_eq!(header(&response, "vary"), "Accept");
+    assert!(body_string(response).await.contains("<h1>spanner</h1>"));
+}
+
 // ── `q=0` exclusions and `406 Not Acceptable` ───────────────────────────────
 
 #[tokio::test]

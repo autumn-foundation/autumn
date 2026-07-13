@@ -343,8 +343,23 @@ pub fn accept_prefers_html(headers: &axum::http::HeaderMap) -> bool {
 pub struct AcceptQualities {
     /// Best match for `text/html`.
     pub html: Option<(f32, usize)>,
-    /// Best match for `application/json` / `application/problem+json`.
+    /// Best match for the success JSON type `application/json` (only).
+    ///
+    /// Kept separate from [`Self::problem_json`] so the
+    /// [`Negotiate`](crate::negotiate::Negotiate) responder can negotiate the
+    /// success `application/json` body without treating the error-only
+    /// `application/problem+json` signal as accepting it.
     pub json: Option<(f32, usize)>,
+    /// Best match for `application/problem+json`.
+    ///
+    /// `application/problem+json` is an **error-path** (Problem Details) signal,
+    /// not a success representation. The legacy
+    /// [`accept_preference`]/[`accept_prefers_html`] path folds it into the JSON
+    /// preference (so a client asking for problem+json still gets a JSON error
+    /// body rather than an HTML error page), but the `Negotiate` success
+    /// responder deliberately ignores it: advertising problem+json alone does
+    /// **not** count as accepting the `application/json` success body.
+    pub problem_json: Option<(f32, usize)>,
     /// Best match for the `text/*` subtype wildcard.
     ///
     /// A media range like `text/*` covers `text/html` per RFC 7231 §5.3.2 but is
@@ -369,9 +384,10 @@ pub struct AcceptQualities {
 /// The one canonical `Accept` parser.
 ///
 /// Scans the comma-separated `Accept` header once, recording the best
-/// `(q-value, list-index)` seen for `text/html`, for `application/json` /
-/// `application/problem+json`, for the `text/*` and `application/*` subtype
-/// wildcards, and for the `*/*` wildcard. Out-of-range
+/// `(q-value, list-index)` seen for `text/html`, for `application/json`, for
+/// `application/problem+json` (tracked in its own slot — an error-path signal
+/// that does not drive success JSON negotiation), for the `text/*` and
+/// `application/*` subtype wildcards, and for the `*/*` wildcard. Out-of-range
 /// q-values are clamped to `[0.0, 1.0]`. Entries with `q=0` are *retained*
 /// (recorded as `Some((0.0, index))`) so an explicit "not acceptable"
 /// exclusion survives; each consumer decides how to treat them.
@@ -420,10 +436,15 @@ pub fn accept_qualities(headers: &axum::http::HeaderMap) -> AcceptQualities {
             "text/html" if qualities.html.is_none_or(|(existing_q, _)| q > existing_q) => {
                 qualities.html = Some((q, index));
             }
-            "application/json" | "application/problem+json"
-                if qualities.json.is_none_or(|(existing_q, _)| q > existing_q) =>
-            {
+            "application/json" if qualities.json.is_none_or(|(existing_q, _)| q > existing_q) => {
                 qualities.json = Some((q, index));
+            }
+            "application/problem+json"
+                if qualities
+                    .problem_json
+                    .is_none_or(|(existing_q, _)| q > existing_q) =>
+            {
+                qualities.problem_json = Some((q, index));
             }
             "text/*"
                 if qualities
@@ -453,6 +474,30 @@ pub fn accept_qualities(headers: &axum::http::HeaderMap) -> AcceptQualities {
     qualities
 }
 
+/// Merge two `(q-value, list-index)` slots into the single best one — higher q
+/// wins, ties broken by the earlier list index — reproducing the behaviour of
+/// the original single-slot `accept_qualities`, where `application/json` and
+/// `application/problem+json` shared one slot updated by strictly-greater q.
+///
+/// Used by the legacy [`accept_preference`] path to fold the (now separate)
+/// `problem_json` slot back into the JSON signal. The `Negotiate` success
+/// responder does **not** call this: it negotiates on the `json` slot alone.
+fn combine_slots(a: Option<(f32, usize)>, b: Option<(f32, usize)>) -> Option<(f32, usize)> {
+    match (a, b) {
+        (Some((aq, ai)), Some((bq, bi))) => Some(if (aq - bq).abs() < f32::EPSILON {
+            // Equal q: the earlier list entry is the one the single-slot scan
+            // would have kept (it only replaced on strictly-greater q).
+            if ai <= bi { (aq, ai) } else { (bq, bi) }
+        } else if aq > bq {
+            (aq, ai)
+        } else {
+            (bq, bi)
+        }),
+        (a @ Some(_), None) => a,
+        (None, b) => b,
+    }
+}
+
 /// The one canonical q-value `Accept` negotiator (legacy enum resolution).
 ///
 /// Returns the client's concrete representation preference. Empty or missing
@@ -479,9 +524,18 @@ pub fn accept_preference(headers: &axum::http::HeaderMap) -> AcceptPreference {
     let AcceptQualities {
         html,
         json,
+        problem_json,
         wildcard,
         ..
     } = accept_qualities(headers);
+
+    // Legacy resolution treats `application/problem+json` as a JSON signal (a
+    // problem+json client wants a JSON error body, not an HTML page). The shared
+    // parser now records it in its own slot, so recombine the two into one
+    // effective JSON signal here — higher q wins, ties broken by earlier list
+    // index — reproducing the original single-slot `(q, index)` semantics
+    // exactly so this path stays byte-identical.
+    let json = combine_slots(json, problem_json);
 
     // Legacy resolution only cares about *positive* preference: a `q=0` slot
     // (now retained by the shared parser) is treated as absent here, exactly
