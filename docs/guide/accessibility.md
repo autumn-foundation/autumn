@@ -590,7 +590,7 @@ just like `autumn i18n check`:
   run: autumn a11y verify --format json
 ```
 
-### Scope and limits
+### Scope and limitations
 
 The primitives are the proof; `verify` is the safety net. Code that splices a
 typed primitive — `(Img::new(src, alt))` — is a `(expr)` splice, not an `img`
@@ -599,10 +599,18 @@ check`, the scanner reads tokens rather than a resolved AST and always errs
 toward *not* flagging what it cannot resolve, so it never breaks CI on a false
 positive: a spliced attribute value or content (`alt=(caption)`,
 `button { (label) }`) is treated as present, and a `<label for=…>`/`id`
-association a splice makes unresolvable suppresses the `label` finding. The
-honest guarantee is: use the typed primitives and accessibility is proven at
-compile time; if you must write raw `html!`, `verify` catches the common
-missing-name mistakes before they ship.
+association a splice makes unresolvable suppresses the `label` finding.
+
+In short, `verify` is **best-effort and advisory**. Because it prefers to skip
+anything ambiguous, dynamic, or non-maud — unresolved splices, complex Rust
+expressions, and non-maud `html!` macros are passed over rather than guessed at
+— a clean run is not itself a proof of accessibility: the scanner can *miss* a
+defect buried in exotic markup (an acceptable trade by design), so its
+raw-`html!` findings are advisory-grade signal and may not be exhaustive. For
+the real, by-construction guarantee, route accessible content through the typed
+primitives in `autumn_web::a11y`, where an accessible name is a compile-time
+type obligation (proven by trybuild) rather than something a source scan has to
+infer.
 
 ---
 

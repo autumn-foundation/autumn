@@ -14,6 +14,22 @@
 //! the project's `.rs` files — the same token-descent strategy `autumn i18n
 //! check` uses to find `t!` calls nested inside `html!`.
 //!
+//! # Scope and limitations
+//!
+//! `verify` is a build-time **static** scanner over raw `maud::html!` bodies
+//! that applies the WCAG rules below (`image-alt` 1.1.1, `label` 1.3.1 / 3.3.2,
+//! `button-name` / `link-name` 4.1.2). It is **best-effort and advisory**: it
+//! parses maud markup heuristically at the token level and deliberately errs
+//! toward *not* failing on anything it cannot statically resolve — unresolved
+//! splices, complex Rust expressions, and non-maud `html!` macros are skipped
+//! rather than guessed at. It should never fail valid markup, but it can
+//! therefore *miss* a defect in exotic markup (a miss is acceptable by design),
+//! so its raw-`html!` findings are advisory-grade signal, not a proof of
+//! accessibility. The complete, by-construction guarantee lives in the typed
+//! primitives in [`autumn_web::a11y`](autumn_web::a11y), where an accessible
+//! name is a compile-time type obligation proven by `trybuild`; this scanner is
+//! only the escape-hatch net over raw hand-written `html!`.
+//!
 //! # Ruleset (first slice)
 //!
 //! Findings reuse the WCAG success-criterion numbers, rule identifiers, and
