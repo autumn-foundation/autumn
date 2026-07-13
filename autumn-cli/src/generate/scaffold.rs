@@ -883,6 +883,39 @@ pub fn plan_scaffold_with_options(
         }
     }
 
+    // ── autumn.toml: exempt the live-validation routes from the submit-token
+    // guard (issue #1360). The generated `POST /{plural}/validate/{field}`
+    // inline-validation routes `hx-include` the whole form, so without this the
+    // one-time `_submit_token` is consumed by a validation POST and the real
+    // create/update submit replays a validation fragment instead of mutating.
+    // The `hx-params="not _submit_token"` markup filter mitigates this only for
+    // the DEFAULT field name; exempting the route by prefix makes it robust for
+    // ANY configured `security.submit_token.field_name`. Only meaningful for
+    // `--live-validation`, and only when the project actually has an
+    // `autumn.toml` to edit (a bare/hand-rolled project keeps the markup
+    // filter as its sole, still-effective default-field-name guard).
+    if options_with_key.live_validation {
+        let autumn_toml_path = project_root.join("autumn.toml");
+        if autumn_toml_path.exists() {
+            let toml_existing = read_or_empty(&autumn_toml_path);
+            // Only record the modify *and* the destroy-time revert when this
+            // scaffold actually inserts the exemption. If `/{plural}/validate`
+            // is already present (a preexisting, user-owned entry), the append
+            // is a no-op and returns `None`; recording a revert then would let a
+            // later `autumn destroy` delete an exemption we never added,
+            // re-enabling submit-token guarding on live-validation routes.
+            if let Some(updated_toml) =
+                append_submit_token_validate_exempt_to_toml(&toml_existing, &plural)
+            {
+                plan.modify(autumn_toml_path.clone(), updated_toml);
+                plan.push_revert(Revert::SubmitTokenValidateExempt {
+                    path: autumn_toml_path,
+                    plural,
+                });
+            }
+        }
+    }
+
     Ok(plan)
 }
 
@@ -906,6 +939,8 @@ const ROUTES_FILE_RESERVED_NAMES: &[&str] = &[
     "Bytes",
     "CsrfFormField",
     "CsrfToken",
+    "SubmitFormField",
+    "SubmitToken",
     "PagerOptions",
     "Flash",
     "ShardedDb",
@@ -1836,12 +1871,14 @@ fn render_routes_file(
     // must come before it.
     let create_signature = create_signature.replacen(
         "flash: Flash",
-        "flash: Flash, csrf: Option<CsrfToken>, csrf_field: Option<CsrfFormField>",
+        "flash: Flash, csrf: Option<CsrfToken>, csrf_field: Option<CsrfFormField>, \
+         submit_token: Option<SubmitToken>, submit_field: Option<SubmitFormField>",
         1,
     );
     let update_signature = update_signature.replacen(
         "flash: Flash,",
-        "flash: Flash,\n    csrf: Option<CsrfToken>,\n    csrf_field: Option<CsrfFormField>,",
+        "flash: Flash,\n    csrf: Option<CsrfToken>,\n    csrf_field: Option<CsrfFormField>,\n    \
+         submit_token: Option<SubmitToken>,\n    submit_field: Option<SubmitFormField>,",
         1,
     );
 
@@ -1946,7 +1983,8 @@ fn render_routes_file(
             "{layout_fn}(\"New {pascal_name}\", {cp_new}{flash_arg}, html! {{\n        \
              h1 {{ \"New {pascal_name}\" }}\n        \
              form action=(paths::create()) method=\"post\"{form_enctype} {{\n            \
-             (csrf_input(csrf.as_ref(), csrf_field.as_ref()))\n{changeset_inputs}            \
+             (csrf_input(csrf.as_ref(), csrf_field.as_ref()))\n            \
+             (submit_token_input(submit_token.as_ref(), submit_field.as_ref()))\n{changeset_inputs}            \
              button type=\"submit\" {{ \"Create\" }}\n        \
              }}\n    \
              }})"
@@ -1955,7 +1993,8 @@ fn render_routes_file(
             "{layout_fn}(&format!(\"Edit {pascal_name} #{{}}\", *id), {cp_edit}{flash_arg}, html! {{\n        \
              h1 {{ \"Edit {pascal_name} #\" (*id) }}\n        \
              form action=(paths::update(*id)) method=\"post\"{form_enctype} {{\n            \
-             (csrf_input(csrf.as_ref(), csrf_field.as_ref()))\n{changeset_inputs}            \
+             (csrf_input(csrf.as_ref(), csrf_field.as_ref()))\n            \
+             (submit_token_input(submit_token.as_ref(), submit_field.as_ref()))\n{changeset_inputs}            \
              button type=\"submit\" {{ \"Save\" }}\n        \
              }}\n        \
              form action=(paths::delete(*id)) method=\"post\" {{\n            \
@@ -1998,13 +2037,13 @@ fn render_routes_file(
         let new_form_layout = format!(
             "{layout_fn}(\"New {pascal_name}\", {cp_new}{flash_arg}, html! {{\n        \
              h1 {{ \"New {pascal_name}\" }}\n        \
-             ({snake_name}_form_for(&changeset, paths::create(), \"Create\", csrf.as_ref(), csrf_field.as_ref(){option_args}))\n    \
+             ({snake_name}_form_for(&changeset, paths::create(), \"Create\", csrf.as_ref(), csrf_field.as_ref(), submit_token.as_ref(), submit_field.as_ref(){option_args}))\n    \
              }})"
         );
         let edit_form_layout = format!(
             "{layout_fn}(&format!(\"Edit {pascal_name} #{{}}\", *id), {cp_edit}{flash_arg}, html! {{\n        \
              h1 {{ \"Edit {pascal_name} #\" (*id) }}\n        \
-             ({snake_name}_form_for(&changeset, paths::update(*id), \"Save\", csrf.as_ref(), csrf_field.as_ref(){option_args}))\n        \
+             ({snake_name}_form_for(&changeset, paths::update(*id), \"Save\", csrf.as_ref(), csrf_field.as_ref(), submit_token.as_ref(), submit_field.as_ref(){option_args}))\n        \
              form action=(paths::delete(*id)) method=\"post\" {{\n            \
              (csrf_input(csrf.as_ref(), csrf_field.as_ref()))\n            \
              button type=\"submit\" onclick=\"return confirm('Delete this {pascal_name}?')\" {{ \"Delete\" }}\n        \
@@ -2590,7 +2629,7 @@ use autumn_web::extract::Path;
 use autumn_web::pagination::{{Page, PageRequest}};
 use autumn_web::reexports::axum::body::Bytes;
 use autumn_web::reexports::serde_json;
-use autumn_web::security::{{CsrfFormField, CsrfToken}};
+use autumn_web::security::{{CsrfFormField, CsrfToken, SubmitFormField, SubmitToken}};
 use autumn_web::ui::pagination::{{PagerOptions, pagination_nav}};
 {db_import}
 use diesel::prelude::*;
@@ -2680,6 +2719,20 @@ fn csrf_input(csrf: Option<&CsrfToken>, field: Option<&CsrfFormField>) -> Markup
         }}
     }}
 }}
+
+/// Emit the hidden one-time submit-token field (issue #1360). Consumed once by
+/// the framework's `SubmitTokenLayer`, so a double-click or Back→resubmit
+/// replays the first response instead of creating a duplicate row. The field
+/// name follows `security.submit_token.field_name` (default `_submit_token`) so
+/// a customised name still matches what the layer scans for.
+fn submit_token_input(submit_token: Option<&SubmitToken>, field: Option<&SubmitFormField>) -> Markup {{
+    let submit_field_name = field.map(|field| field.0.as_str()).unwrap_or("_submit_token");
+    html! {{
+        @if let Some(submit_token) = submit_token {{
+            input type="hidden" name=(submit_field_name) value=(submit_token.token());
+        }}
+    }}
+}}
 {private_layout}
 {index_handler}
 
@@ -2710,6 +2763,8 @@ pub async fn new_form(
     {new_form_db_param}flash: Flash,
     csrf: Option<CsrfToken>,
     csrf_field: Option<CsrfFormField>,
+    submit_token: Option<SubmitToken>,
+    submit_field: Option<SubmitFormField>,
 ) -> AutumnResult<Markup> {{
     let changeset = Changeset::new({pascal_name}Form::default());
     Ok({new_form_body})
@@ -2727,7 +2782,9 @@ pub async fn edit_form(
     mut db: {db_ty},
     flash: Flash,
     csrf: Option<CsrfToken>,
-    csrf_field: Option<CsrfFormField>,{authz_params}
+    csrf_field: Option<CsrfFormField>,
+    submit_token: Option<SubmitToken>,
+    submit_field: Option<SubmitFormField>,{authz_params}
 ) -> AutumnResult<Markup> {{
     let row: {pascal_name} = {plural}::table
         .find(*id)
@@ -3093,11 +3150,18 @@ fn render_form_for_helper(
          action: String,\n    \
          submit_label: &str,\n    \
          csrf: Option<&CsrfToken>,\n    \
-         csrf_field: Option<&CsrfFormField>{extra_params},\n\
+         csrf_field: Option<&CsrfFormField>,\n    \
+         submit_token: Option<&SubmitToken>,\n    \
+         submit_field: Option<&SubmitFormField>{extra_params},\n\
          ) -> Markup {{\n\
          {preludes}    \
          let mut form = autumn_web::form::form_for(changeset, action, \"post\")\n        \
          .submit_label(submit_label){builder_calls}{appends};\n    \
+         // Emit the one-time submit token at the FRONT of the form (issue #1360):\n    \
+         // `SubmitTokenLayer` only scans the first chunk of the URL-encoded body,\n    \
+         // so a large earlier textarea could otherwise push an appended token past\n    \
+         // the scan cap and leave duplicate submits unguarded.\n    \
+         form = form.prepend(submit_token_input(submit_token, submit_field));\n    \
          if let Some(csrf) = csrf {{\n        \
          form = form.csrf(csrf.token());\n    \
          }}\n    \
@@ -3586,9 +3650,13 @@ fn html5_constraint_spec(field: &Field) -> Option<(&'static str, String)> {
 /// (`minlength`/`maxlength`/`min`/`max`/`step`) from [`html5_constraint_spec`],
 /// exactly mirroring the standard `form_for` path's `.exclude()` + `.append()`
 /// output. When `validate_url` is `Some`, the htmx inline-validation wiring
-/// (`hx-post`/`hx-trigger`/`hx-target`/`hx-swap`/`hx-include` + the
-/// `data-autumn-field-wrapper` swap marker) is threaded on too, matching
-/// `required_text_input_htmx`. Shared by [`render_changeset_form_inputs`] and
+/// (`hx-post`/`hx-trigger`/`hx-target`/`hx-swap`/`hx-include` +
+/// `hx-params="not _submit_token"` + the `data-autumn-field-wrapper` swap
+/// marker) is threaded on too, matching `required_text_input_htmx`. The
+/// `hx-params` filter keeps the inline-validation POST (which `hx-include`s the
+/// whole form) from carrying the one-time `_submit_token`, so validation never
+/// consumes the token the real create/update submit needs (issue #1360). Shared
+/// by [`render_changeset_form_inputs`] and
 /// the inline-validate handlers so the initially-rendered field and the
 /// htmx-swapped fragment are byte-identical.
 fn render_live_constrained_field(
@@ -3625,7 +3693,8 @@ fn render_live_constrained_field(
                     "\n                    hx-post=({url})\n                    \
                      hx-trigger=\"change\"\n                    \
                      hx-target=\"closest [data-autumn-field-wrapper]\"\n                    \
-                     hx-swap=\"outerHTML\"\n                    hx-include=\"closest form\""
+                     hx-swap=\"outerHTML\"\n                    hx-include=\"closest form\"\n                    \
+                     hx-params=\"not _submit_token\""
                 ),
             )
         },
@@ -5437,6 +5506,177 @@ fn main_route_entries(
     }
 }
 
+/// The submit-token exempt-path prefix for a `--live-validation` resource.
+///
+/// The generated inline-validation routes are `POST /{plural}/validate/{field}`;
+/// this prefix exempts every one of them from the submit-token guard at once
+/// (the guard matches `exempt_paths` by prefix — an exact match, a prefix ending
+/// in `/`, or a prefix whose remainder begins with `/`, so `/{plural}/validate`
+/// covers `/{plural}/validate/title`, `/{plural}/validate/body`, … without
+/// touching the guarded `POST /{plural}` create route).
+fn submit_token_validate_exempt_prefix(plural: &str) -> String {
+    format!("/{plural}/validate")
+}
+
+/// The `(start, end)` line span of a top-level `[header]` TOML table — the
+/// header line through the last line before the next top-level `[...]` header
+/// or EOF. `None` when `header` is absent. Mirrors the auth generator's
+/// equivalent so submit-token exemptions merge into an existing block instead
+/// of emitting a duplicate table.
+fn toml_table_block_range(lines: &[&str], header: &str) -> Option<(usize, usize)> {
+    let start = lines.iter().position(|l| l.trim() == header)?;
+    let end = lines[start + 1..]
+        .iter()
+        .position(|l| l.trim_start().starts_with('['))
+        .map_or(lines.len(), |rel| start + 1 + rel);
+    Some((start, end))
+}
+
+/// Ensure `/{plural}/validate` is listed under `[security.submit_token]
+/// exempt_paths` so a `--live-validation` scaffold's inline-validation POSTs
+/// never consume the one-time submit token (issue #1360).
+///
+/// This is the route-based, field-name-agnostic half of the fix: the
+/// `hx-params="not _submit_token"` markup filter only strips the DEFAULT field
+/// name, so an app that customises `security.submit_token.field_name` would
+/// otherwise still leak the token into the validation POST and have the real
+/// create/update submit replay a validation fragment. Exempting the route makes
+/// it robust regardless of the configured field name.
+///
+/// Returns `Some(updated_toml)` only when it actually inserts the exemption, and
+/// `None` when the file is left unchanged — the prefix is already present, or
+/// the `exempt_paths` array is too malformed to parse. Callers must gate BOTH
+/// the plan's modify action AND the destroy-time ownership revert on `Some`:
+/// recording a revert for a no-op would let `autumn destroy` delete a
+/// preexisting, user-owned exemption we never added.
+///
+/// Handles three shapes — no `[security.submit_token]` table (append a fresh
+/// one), a table without an `exempt_paths` key (insert the key after the
+/// header), and a table whose `exempt_paths` array is merged in place.
+fn append_submit_token_validate_exempt_to_toml(existing: &str, plural: &str) -> Option<String> {
+    use toml_edit::{Array, DocumentMut, Item, Table, Value};
+
+    let exempt = submit_token_validate_exempt_prefix(plural);
+
+    // Parse format-preservingly so comments, ordering, and hand-crafted array
+    // layout survive the edit. A config we can't parse is left untouched (and we
+    // claim no ownership) rather than risking corruption via raw string edits.
+    let mut doc = existing.parse::<DocumentMut>().ok()?;
+
+    // Navigate to — creating if absent — `[security.submit_token]`. A freshly
+    // created `[security]` parent is marked implicit so it renders as the dotted
+    // `[security.submit_token]` header (matching the hand-written convention)
+    // rather than emitting a bare, empty `[security]` table of its own.
+    let security_missing = !doc.as_table().contains_key("security");
+    let security = doc
+        .as_table_mut()
+        .entry("security")
+        .or_insert_with(|| Item::Table(Table::new()))
+        .as_table_mut()?;
+    if security_missing {
+        security.set_implicit(true);
+    }
+    let submit_token = security
+        .entry("submit_token")
+        .or_insert_with(|| Item::Table(Table::new()))
+        .as_table_mut()?;
+
+    // Get or create the `exempt_paths` array.
+    let array = submit_token
+        .entry("exempt_paths")
+        .or_insert_with(|| Item::Value(Value::Array(Array::new())))
+        .as_array_mut()?;
+
+    // Idempotent: if the prefix is already listed, return `None` so we don't
+    // claim ownership of (and later, on `autumn destroy`, delete) a preexisting,
+    // user-owned exemption.
+    if array.iter().any(|v| v.as_str() == Some(exempt.as_str())) {
+        return None;
+    }
+
+    array.push(exempt.as_str());
+
+    Some(doc.to_string())
+}
+
+/// Inverse of [`append_submit_token_validate_exempt_to_toml`] (`autumn
+/// destroy`, issue #1048): remove `/{plural}/validate` from
+/// `[security.submit_token] exempt_paths`, dropping the whole block if that
+/// leaves an empty freshly-generated `exempt_paths = [...]` as its only key.
+///
+/// Conservative: only touches an `exempt_paths` array that still contains the
+/// exact prefix this generator inserts, never a hand-edited value.
+pub(super) fn remove_submit_token_validate_exempt_from_toml(
+    existing: &str,
+    plural: &str,
+) -> String {
+    const HEADER: &str = "[security.submit_token]";
+    let exempt = submit_token_validate_exempt_prefix(plural);
+    let quoted = format!("\"{exempt}\"");
+
+    let lines: Vec<&str> = existing.lines().collect();
+    let Some((start, end)) = toml_table_block_range(&lines, HEADER) else {
+        return existing.to_owned();
+    };
+    let Some(key_idx) = lines[start + 1..end]
+        .iter()
+        .position(|l| l.trim_start().starts_with("exempt_paths"))
+        .map(|rel| start + 1 + rel)
+    else {
+        return existing.to_owned();
+    };
+    let close_idx = (key_idx..end)
+        .find(|&i| lines[i].contains(']'))
+        .unwrap_or(key_idx);
+    let joined: String = lines[key_idx..=close_idx].join("\n");
+    let (Some(open), Some(close)) = (joined.find('['), joined.rfind(']')) else {
+        return existing.to_owned();
+    };
+    let inner = &joined[open + 1..close];
+    if !inner.contains(&quoted) {
+        return existing.to_owned();
+    }
+    // Strip our element from the array's comma-separated items.
+    let remaining: Vec<String> = inner
+        .split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty() && *item != quoted)
+        .map(str::to_owned)
+        .collect();
+
+    let mut out_lines: Vec<String> = lines.iter().map(|l| (*l).to_owned()).collect();
+    if remaining.is_empty() {
+        // The block only carried our exempt_paths line — remove the key, and the
+        // whole table too if the key was its sole content.
+        let block_only_our_key = (start + 1..end).all(|i| {
+            i == key_idx || (key_idx..=close_idx).contains(&i) || lines[i].trim().is_empty()
+        });
+        if block_only_our_key {
+            out_lines.splice(start..end, std::iter::empty::<String>());
+        } else {
+            out_lines.splice(key_idx..=close_idx, std::iter::empty::<String>());
+        }
+    } else {
+        let rebuilt = format!(
+            "{}[{}]{}",
+            &joined[..open],
+            remaining.join(", "),
+            &joined[close + 1..]
+        );
+        out_lines.splice(key_idx..=close_idx, std::iter::once(rebuilt));
+    }
+
+    let mut out = out_lines.join("\n");
+    // Collapse any doubled blank lines left by removing the block.
+    while out.contains("\n\n\n") {
+        out = out.replace("\n\n\n", "\n\n");
+    }
+    if existing.ends_with('\n') && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5760,7 +6000,9 @@ async fn main() {
         );
         // The helper call threads the options through.
         assert!(
-            routes.contains("csrf_field.as_ref(), &post_id_options))"),
+            routes.contains(
+                "csrf_field.as_ref(), submit_token.as_ref(), submit_field.as_ref(), &post_id_options))"
+            ),
             "view bodies must pass the loaded options to the helper: {routes}"
         );
     }
@@ -6181,6 +6423,32 @@ async fn main() {
     }
 
     #[test]
+    fn scaffold_enum_field_named_submit_token_is_rejected() {
+        // `submit_token:enum{a,b}` pascalizes to `SubmitToken` and
+        // `submit_form_field:enum{a,b}` to `SubmitFormField`, colliding with the
+        // `use autumn_web::security::{…, SubmitFormField, SubmitToken};` import
+        // every non-`--api` scaffold's routes file now carries (issue #1360) — a
+        // duplicate `SubmitToken`/`SubmitFormField` import fails with E0252,
+        // exactly like the `CsrfToken`/`Changeset` collisions above. Rejecting
+        // the field up front yields the actionable field-name error instead of a
+        // broken generated file.
+        for field_name in ["submit_token", "submit_form_field"] {
+            let tmp = project_with_main(default_main());
+            let err = plan_scaffold(
+                tmp.path(),
+                "Post",
+                &[format!("{field_name}:enum{{a,b}}")],
+                "20260427000000",
+            )
+            .unwrap_err();
+            assert!(
+                matches!(err, GenerateError::InvalidField { .. }),
+                "expected '{field_name}' to be rejected"
+            );
+        }
+    }
+
+    #[test]
     fn scaffold_enum_field_colliding_with_generated_form_struct_is_rejected() {
         // `post_form:enum{a,b}` on model `Post` pascalizes to `PostForm`,
         // colliding with the scaffold's own generated `pub struct PostForm`
@@ -6337,7 +6605,9 @@ async fn main() {
         plan.execute(Flags::default()).unwrap();
 
         let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
-        assert!(routes.contains("use autumn_web::security::{CsrfFormField, CsrfToken};"));
+        assert!(routes.contains(
+            "use autumn_web::security::{CsrfFormField, CsrfToken, SubmitFormField, SubmitToken};"
+        ));
         assert!(routes.contains("fn csrf_input("));
         assert!(routes.contains("input type=\"hidden\" name=(csrf_field_name"));
         assert!(routes.contains("value=(csrf.token());"));
@@ -6346,6 +6616,38 @@ async fn main() {
         assert!(routes.contains("csrf_field: Option<CsrfFormField>"));
         assert!(routes.contains("(csrf_input(csrf.as_ref(), csrf_field.as_ref()))"));
         assert!(routes.contains("pub async fn edit_form("));
+        // Issue #1360: one-time submit token embedded in create/update forms and
+        // threaded through the create/update handlers. The hidden field's `name`
+        // is bound at runtime to the configured `security.submit_token.field_name`
+        // (via the `SubmitFormField` extractor), not hardcoded — mirroring CSRF —
+        // so a custom field name still matches what `SubmitTokenLayer` scans for.
+        assert!(routes.contains("fn submit_token_input("));
+        assert!(routes.contains(
+            "let submit_field_name = field.map(|field| field.0.as_str()).unwrap_or(\"_submit_token\");"
+        ));
+        assert!(routes.contains(
+            "input type=\"hidden\" name=(submit_field_name) value=(submit_token.token());"
+        ));
+        // The hidden field is never emitted under a hardcoded `_submit_token` name.
+        assert!(!routes.contains("name=\"_submit_token\""));
+        assert!(routes.contains("submit_token: Option<SubmitToken>"));
+        assert!(routes.contains("submit_field: Option<SubmitFormField>"));
+        assert!(routes.contains("submit_token.as_ref()"));
+        assert!(routes.contains("submit_field.as_ref()"));
+        assert!(routes.contains("submit_token_input(submit_token, submit_field)"));
+        // Issue #1360 (finding G): the token must be emitted at the FRONT of the
+        // form via `.prepend(...)`, not appended after the derived fields —
+        // `SubmitTokenLayer` only scans the first chunk of the URL-encoded body,
+        // so a large earlier field could otherwise push an appended token past
+        // the scan cap and leave duplicate submits unguarded.
+        assert!(
+            routes.contains("form.prepend(submit_token_input(submit_token, submit_field))"),
+            "standard form must prepend the submit token, not append it:\n{routes}"
+        );
+        assert!(
+            !routes.contains("form.append(submit_token_input"),
+            "submit token must not be appended after derived fields:\n{routes}"
+        );
     }
 
     // ── Changeset validation round-trip (issue #1124) ──────────────────
@@ -6517,6 +6819,66 @@ async fn main() {
     }
 
     #[test]
+    fn execute_live_validation_inline_posts_drop_the_submit_token() {
+        // Finding F (issue #1360): a `--live-validation` field posts its inline
+        // validation with `hx-include="closest form"`, so that POST would carry
+        // the hidden one-time `_submit_token` to the guarded `/validate/...`
+        // route and consume it — the real create submit would then replay the
+        // validation fragment instead of running the mutation. The generated
+        // htmx input must drop the token via `hx-params="not _submit_token"`,
+        // while the real create/update form still embeds it.
+        let tmp = project_with_main(default_main());
+        // A DSL-constrained `String` auto-derives a `length` rule, so `title` is
+        // validated and renders through the raw-markup htmx constrained control.
+        let plan = plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String{min=3,max=120}".into()],
+            "20260427000000",
+            &ScaffoldOptions {
+                live_validation: true,
+                ..ScaffoldOptions::default()
+            },
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+
+        // The constrained validated input keeps its inline-validation wiring,
+        // now routed through the typed path helper (#1823) rather than a
+        // hardcoded URL.
+        assert!(
+            routes.contains("hx-post=(paths::validate_title())"),
+            "title must keep its htmx inline-validation wiring:\n{routes}"
+        );
+        // ...but filters the one-time submit token out of that POST so the
+        // inline validation never consumes it.
+        assert!(
+            routes.contains("hx-params=\"not _submit_token\""),
+            "live-validation inputs must drop _submit_token from the inline POST:\n{routes}"
+        );
+        // The inline-validate handler returns the SAME fragment (byte-identical
+        // for the htmx `outerHTML` swap), so it must carry the filter too.
+        let validate_title = &routes[routes
+            .find("pub async fn validate_title(")
+            .expect("validate_title handler")..];
+        assert!(
+            validate_title[..validate_title[1..]
+                .find("#[post(")
+                .map_or(validate_title.len(), |rel| rel + 1)]
+                .contains("hx-params=\"not _submit_token\""),
+            "the validate_title fragment must also drop the submit token:\n{validate_title}"
+        );
+        // The real create/update form still embeds the submit token so the
+        // mutation stays guarded against duplicate submits.
+        assert!(
+            routes.contains("submit_token_input(submit_token.as_ref(), submit_field.as_ref())"),
+            "the create/update form must still carry the submit token:\n{routes}"
+        );
+    }
+
+    #[test]
     fn execute_writes_edit_form_with_prefilled_values_and_nullable_optional_inputs() {
         let tmp = project_with_main(default_main());
         let plan = plan_scaffold(
@@ -6585,12 +6947,12 @@ async fn main() {
             "generated routes must be able to inspect raw form bytes: {routes}"
         );
         assert!(
-            routes.contains("pub async fn create(flash: Flash, csrf: Option<CsrfToken>, csrf_field: Option<CsrfFormField>, mut db: Db, body: Bytes)"),
+            routes.contains("pub async fn create(flash: Flash, csrf: Option<CsrfToken>, csrf_field: Option<CsrfFormField>, submit_token: Option<SubmitToken>, submit_field: Option<SubmitFormField>, mut db: Db, body: Bytes)"),
             "create must decode after blank nullable normalization: {routes}"
         );
         assert!(
             routes.contains(
-                "pub async fn update(\n    flash: Flash,\n    csrf: Option<CsrfToken>,\n    csrf_field: Option<CsrfFormField>,\n    id: Path<i64>,\n    mut db: Db,\n    body: Bytes,\n)"
+                "pub async fn update(\n    flash: Flash,\n    csrf: Option<CsrfToken>,\n    csrf_field: Option<CsrfFormField>,\n    submit_token: Option<SubmitToken>,\n    submit_field: Option<SubmitFormField>,\n    id: Path<i64>,\n    mut db: Db,\n    body: Bytes,\n)"
             ),
             "update must decode after blank nullable normalization: {routes}"
         );
@@ -9728,5 +10090,286 @@ async fn main() {
         assert!(!tmp.path().join("src/policies/post.rs").exists());
         assert!(!tmp.path().join("src/policies").exists());
         assert_eq!(fs::read_to_string(&main_path).unwrap(), original_main);
+    }
+
+    // ── submit-token live-validation exempt_paths (issue #1360) ──────────────
+
+    #[test]
+    fn submit_token_exempt_appends_fresh_block_when_absent() {
+        let existing = "[server]\nport = 3000\n";
+        let out = append_submit_token_validate_exempt_to_toml(existing, "posts")
+            .expect("absent exemption must be inserted");
+        assert!(out.contains("[security.submit_token]"), "{out}");
+        assert!(
+            out.contains("exempt_paths = [\"/posts/validate\"]"),
+            "{out}"
+        );
+        // The original content is preserved.
+        assert!(out.contains("[server]"), "{out}");
+    }
+
+    #[test]
+    fn submit_token_exempt_is_idempotent() {
+        let existing = "[security.submit_token]\nexempt_paths = [\"/posts/validate\"]\n";
+        let out = append_submit_token_validate_exempt_to_toml(existing, "posts");
+        assert_eq!(
+            out, None,
+            "re-adding the same prefix must be a no-op returning None"
+        );
+    }
+
+    #[test]
+    fn submit_token_exempt_merges_into_existing_array() {
+        let existing =
+            "[security.submit_token]\nttl_secs = 900\nexempt_paths = [\"/webhooks/x\"]\n";
+        let out = append_submit_token_validate_exempt_to_toml(existing, "posts")
+            .expect("a new prefix must be merged into the existing array");
+        assert!(out.contains("\"/webhooks/x\""), "{out}");
+        assert!(out.contains("\"/posts/validate\""), "{out}");
+        assert!(out.contains("ttl_secs = 900"), "{out}");
+        // No duplicate exempt_paths key.
+        assert_eq!(out.matches("exempt_paths").count(), 1, "{out}");
+    }
+
+    #[test]
+    fn submit_token_exempt_merges_into_commented_multiline_array() {
+        // A hand-edited, multiline `exempt_paths` array with item comments must
+        // merge into VALID TOML: the format-preserving edit inserts the new path
+        // as a real array element before the closing bracket, never splicing it
+        // after a `#` comment (which would produce e.g.
+        // `[..., # api, "/posts/validate"]` — invalid TOML that corrupts the
+        // config).
+        let existing = "\
+[security.submit_token]
+exempt_paths = [
+    \"/api\", # public api, never guarded
+    \"/webhooks/x\",
+]
+";
+        let out = append_submit_token_validate_exempt_to_toml(existing, "posts")
+            .expect("a new prefix must be merged into the commented array");
+        // The merged output is valid TOML.
+        let parsed: toml::Value =
+            toml::from_str(&out).unwrap_or_else(|e| panic!("merged TOML must parse: {e}\n{out}"));
+        // Both preexisting entries and the new prefix are present.
+        let paths = parsed["security"]["submit_token"]["exempt_paths"]
+            .as_array()
+            .expect("exempt_paths must be an array");
+        let values: Vec<&str> = paths.iter().filter_map(toml::Value::as_str).collect();
+        assert!(values.contains(&"/api"), "{out}");
+        assert!(values.contains(&"/webhooks/x"), "{out}");
+        assert!(values.contains(&"/posts/validate"), "{out}");
+        // The item comment survives the edit.
+        assert!(out.contains("# public api, never guarded"), "{out}");
+        // No duplicate exempt_paths key.
+        assert_eq!(out.matches("exempt_paths").count(), 1, "{out}");
+    }
+
+    #[test]
+    fn submit_token_exempt_inserts_key_when_block_lacks_it() {
+        let existing = "[security.submit_token]\nttl_secs = 900\n";
+        let out = append_submit_token_validate_exempt_to_toml(existing, "posts")
+            .expect("a block lacking the key must gain one");
+        assert!(
+            out.contains("exempt_paths = [\"/posts/validate\"]"),
+            "{out}"
+        );
+        assert!(out.contains("ttl_secs = 900"), "{out}");
+    }
+
+    #[test]
+    fn submit_token_exempt_prefix_covers_only_validation_routes() {
+        // Field-name-agnostic: the exemption is a route prefix, independent of
+        // `security.submit_token.field_name`. It must cover the per-field
+        // validation routes but never the guarded create route.
+        assert_eq!(
+            submit_token_validate_exempt_prefix("posts"),
+            "/posts/validate"
+        );
+    }
+
+    #[test]
+    fn remove_submit_token_exempt_drops_fresh_block() {
+        let existing = "[server]\nport = 3000\n";
+        let added = append_submit_token_validate_exempt_to_toml(existing, "posts")
+            .expect("fresh block must be added");
+        let removed = remove_submit_token_validate_exempt_from_toml(&added, "posts");
+        assert!(!removed.contains("/posts/validate"), "{removed}");
+        assert!(!removed.contains("[security.submit_token]"), "{removed}");
+        assert!(removed.contains("[server]"), "{removed}");
+    }
+
+    #[test]
+    fn remove_submit_token_exempt_keeps_other_entries() {
+        let existing =
+            "[security.submit_token]\nexempt_paths = [\"/webhooks/x\", \"/posts/validate\"]\n";
+        let removed = remove_submit_token_validate_exempt_from_toml(existing, "posts");
+        assert!(removed.contains("\"/webhooks/x\""), "{removed}");
+        assert!(!removed.contains("/posts/validate"), "{removed}");
+        assert!(removed.contains("[security.submit_token]"), "{removed}");
+    }
+
+    #[test]
+    fn remove_submit_token_exempt_ignores_hand_edited_value() {
+        // Never touch an array that no longer carries our exact prefix.
+        let existing = "[security.submit_token]\nexempt_paths = [\"/custom/only\"]\n";
+        let removed = remove_submit_token_validate_exempt_from_toml(existing, "posts");
+        assert_eq!(removed, existing);
+    }
+
+    #[test]
+    fn live_validation_scaffold_exempts_validation_routes_in_autumn_toml() {
+        // End-to-end at plan level: a `--live-validation` scaffold with a
+        // CUSTOM submit-token field name still exempts the generated
+        // `/posts/validate/*` routes, because the exemption is route-based
+        // (field-name-agnostic) rather than relying on the `hx-params` filter,
+        // which only strips the default `_submit_token` name.
+        let tmp = project_with_main(default_main());
+        // A customised field name in autumn.toml — the exemption must not depend
+        // on it.
+        fs::write(
+            tmp.path().join("autumn.toml"),
+            "[security.submit_token]\nfield_name = \"_confirm\"\n",
+        )
+        .unwrap();
+        let plan = plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String".into()],
+            "20260712000000",
+            &ScaffoldOptions {
+                live_validation: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let toml_action = plan
+            .actions
+            .iter()
+            .rev()
+            .find_map(|a| match a {
+                Action::Modify { path, contents } if path.ends_with("autumn.toml") => {
+                    Some(contents.clone())
+                }
+                _ => None,
+            })
+            .expect("live-validation scaffold must modify autumn.toml");
+        assert!(
+            toml_action.contains("\"/posts/validate\""),
+            "autumn.toml must exempt the validation route prefix:\n{toml_action}"
+        );
+        // The custom field name is left untouched.
+        assert!(
+            toml_action.contains("field_name = \"_confirm\""),
+            "{toml_action}"
+        );
+    }
+
+    #[test]
+    fn non_live_validation_scaffold_does_not_touch_autumn_toml_exempt() {
+        let tmp = project_with_main(default_main());
+        fs::write(tmp.path().join("autumn.toml"), "[server]\nport = 3000\n").unwrap();
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &["title:String".into()],
+            "20260712000000",
+        )
+        .unwrap();
+        let touches_toml = plan
+            .actions
+            .iter()
+            .any(|a| a.path().ends_with("autumn.toml"));
+        assert!(
+            !touches_toml,
+            "a plain scaffold (no --live-validation) must not add submit-token exemptions"
+        );
+    }
+
+    #[test]
+    fn live_validation_scaffold_records_revert_only_when_exemption_inserted() {
+        // Absent exemption: the scaffold both modifies autumn.toml AND records a
+        // `SubmitTokenValidateExempt` revert so `autumn destroy` cleans up the
+        // entry it added.
+        let tmp = project_with_main(default_main());
+        fs::write(
+            tmp.path().join("autumn.toml"),
+            "[security.submit_token]\nfield_name = \"_confirm\"\n",
+        )
+        .unwrap();
+        let plan = plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String".into()],
+            "20260712000000",
+            &ScaffoldOptions {
+                live_validation: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let touches_toml = plan
+            .actions
+            .iter()
+            .any(|a| a.path().ends_with("autumn.toml"));
+        assert!(
+            touches_toml,
+            "an absent exemption must be inserted via a modify action"
+        );
+        let has_revert = plan.reverts.iter().any(|r| {
+            matches!(
+                r,
+                Revert::SubmitTokenValidateExempt { plural, .. } if plural == "posts"
+            )
+        });
+        assert!(
+            has_revert,
+            "inserting the exemption must record a SubmitTokenValidateExempt revert"
+        );
+    }
+
+    #[test]
+    fn live_validation_scaffold_skips_revert_when_exemption_preexists() {
+        // The exemption is ALREADY present (e.g. a user hand-added it, possibly
+        // with a custom field name). The scaffold must NOT modify autumn.toml and
+        // must NOT record a revert — otherwise a later `autumn destroy` would
+        // delete a user-owned entry, re-enabling submit-token guarding on the
+        // live-validation routes.
+        let tmp = project_with_main(default_main());
+        fs::write(
+            tmp.path().join("autumn.toml"),
+            "[security.submit_token]\nfield_name = \"_confirm\"\nexempt_paths = [\"/posts/validate\"]\n",
+        )
+        .unwrap();
+        let plan = plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String".into()],
+            "20260712000000",
+            &ScaffoldOptions {
+                live_validation: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let touches_toml = plan
+            .actions
+            .iter()
+            .any(|a| a.path().ends_with("autumn.toml"));
+        assert!(
+            !touches_toml,
+            "a preexisting exemption must not be re-modified"
+        );
+        let has_revert = plan
+            .reverts
+            .iter()
+            .any(|r| matches!(r, Revert::SubmitTokenValidateExempt { .. }));
+        assert!(
+            !has_revert,
+            "a preexisting, user-owned exemption must not be claimed via a revert"
+        );
     }
 }

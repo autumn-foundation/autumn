@@ -778,9 +778,16 @@ fn generate_scaffold_full_e2e_post() {
         "pub async fn show",
         "pub async fn new_form(",
         "pub async fn update",
-        "use autumn_web::security::{CsrfFormField, CsrfToken};",
+        "use autumn_web::security::{CsrfFormField, CsrfToken, SubmitFormField, SubmitToken};",
         "input type=\"hidden\" name=(csrf_field_name)",
         "(csrf_input(csrf.as_ref(), csrf_field.as_ref()))",
+        // Issue #1360: one-time submit token wired into create/update forms.
+        // The hidden field name follows the configured
+        // `security.submit_token.field_name` (via the `SubmitFormField`
+        // extractor), not a hardcoded `_submit_token`.
+        "fn submit_token_input(",
+        "input type=\"hidden\" name=(submit_field_name) value=(submit_token.token());",
+        "submit_token: Option<SubmitToken>",
     ] {
         assert!(routes.contains(needle), "routes file missing: {needle}");
     }
@@ -2748,7 +2755,7 @@ fn generate_scaffold_without_unique_field_omits_unique_constraints() {
     assert!(!routes.contains("UNIQUE_CONSTRAINTS"), "got:\n{routes}");
     assert!(
         routes.contains(
-            "pub async fn create(flash: Flash, csrf: Option<CsrfToken>, csrf_field: Option<CsrfFormField>, mut db: Db, body: Bytes) -> AutumnResult<autumn_web::reexports::axum::response::Response>"
+            "pub async fn create(flash: Flash, csrf: Option<CsrfToken>, csrf_field: Option<CsrfFormField>, submit_token: Option<SubmitToken>, submit_field: Option<SubmitFormField>, mut db: Db, body: Bytes) -> AutumnResult<autumn_web::reexports::axum::response::Response>"
         ),
         "got:\n{routes}"
     );

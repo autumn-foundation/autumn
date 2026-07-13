@@ -886,10 +886,30 @@ pub fn text_input<T: Serialize>(
 /// Render a labeled `<input type="text">` with htmx inline-validation attributes.
 ///
 /// Like [`text_input`] but adds `hx-post`, `hx-trigger="change"`,
-/// `hx-target="closest [data-autumn-field-wrapper]"`, `hx-swap="outerHTML"`, and
-/// `hx-include="closest form"` to the input element so htmx
-/// POSTs the whole form to `validate_url` after a changed value is committed
-/// and swaps the returned field wrapper in place — no JavaScript required.
+/// `hx-target="closest [data-autumn-field-wrapper]"`, `hx-swap="outerHTML"`,
+/// `hx-include="closest form"`, and `hx-params="not _submit_token"` to the input
+/// element so htmx POSTs the whole form to `validate_url` after a changed value
+/// is committed and swaps the returned field wrapper in place — no JavaScript
+/// required.
+///
+/// The `hx-params="not _submit_token"` filter drops the hidden one-time
+/// submit-token field (issue #1360) from the inline-validation POST: `SubmitTokenLayer`
+/// consumes any `_submit_token` a mutating POST carries, so without this filter
+/// the first field validation would spend the token and the real create/update
+/// submit would replay the validation fragment instead of running the mutation.
+///
+/// # Custom `field_name` limitation
+///
+/// The `hx-params` filter hardcodes the **default** field name `_submit_token`.
+/// It excludes only that default from inline htmx validation posts. If you
+/// customize `[security.submit_token].field_name` **and** hand-write a
+/// live-validation form using these helpers, the filter will not exclude your
+/// custom field, so the token leaks into the validation POST and
+/// `SubmitTokenLayer` consumes it. Add your validation route(s) to
+/// `[security.submit_token].exempt_paths` so the one-time token is not consumed
+/// by validation requests. Generated scaffolds keep the default field name and
+/// wire their validation routes into `exempt_paths` automatically, so this only
+/// affects hand-written forms with a customized `field_name`.
 ///
 /// The inline-validation handler should extract [`ChangesetForm<T>`],
 /// validate, and return `text_input_htmx(...)` for just the single field.
@@ -936,7 +956,8 @@ pub fn text_input_htmx<T: Serialize>(
                 hx-trigger="change"
                 hx-target=(target)
                 hx-swap="outerHTML"
-                hx-include="closest form";
+                hx-include="closest form"
+                hx-params="not _submit_token";
             @if has_errors {
                 div id=(error_id) role="alert" class="autumn-field__errors" {
                     @for error in errors {
@@ -956,6 +977,12 @@ pub fn text_input_htmx<T: Serialize>(
 /// client-side "must fill this in" signal, and a server-side rule that
 /// happens to permit an empty string (e.g. a max-only `length` rule) would
 /// let a blank required field through silently.
+///
+/// Like [`text_input_htmx`], the emitted `hx-params="not _submit_token"` filter
+/// hardcodes the **default** submit-token field name. See
+/// [`text_input_htmx`](text_input_htmx#custom-field_name-limitation) for the
+/// custom `[security.submit_token].field_name` caveat and the `exempt_paths`
+/// workaround for hand-written live-validation forms.
 #[cfg(feature = "maud")]
 #[must_use]
 pub fn required_text_input_htmx<T: Serialize>(
@@ -988,7 +1015,8 @@ pub fn required_text_input_htmx<T: Serialize>(
                 hx-trigger="change"
                 hx-target=(target)
                 hx-swap="outerHTML"
-                hx-include="closest form";
+                hx-include="closest form"
+                hx-params="not _submit_token";
             @if has_errors {
                 div id=(error_id) role="alert" class="autumn-field__errors" {
                     @for error in errors {
@@ -2237,6 +2265,7 @@ where
         excluded: Vec::new(),
         field_overrides: Vec::new(),
         label_overrides: Vec::new(),
+        prepended: Vec::new(),
         appended: Vec::new(),
         submit_label: "Save".to_string(),
         force_multipart: false,
@@ -2255,6 +2284,7 @@ pub struct FormFor<'a, T: Serialize + FormModel> {
     excluded: Vec<String>,
     field_overrides: Vec<(String, FieldControl)>,
     label_overrides: Vec<(String, String)>,
+    prepended: Vec<maud::Markup>,
     appended: Vec<maud::Markup>,
     submit_label: String,
     force_multipart: bool,
@@ -2306,6 +2336,20 @@ impl<T: Serialize + FormModel> FormFor<'_, T> {
         self
     }
 
+    /// Insert extra markup at the front of the form, immediately after the
+    /// hidden CSRF/method-override inputs and before every derived field.
+    ///
+    /// Use this for hidden control fields — such as a one-time
+    /// `_submit_token` — that a body-scanning middleware must find near the
+    /// start of the URL-encoded body. A large earlier field (e.g. a long
+    /// `<textarea>`) would otherwise push an appended token past the scan cap,
+    /// leaving the request effectively token-less.
+    #[must_use]
+    pub fn prepend(mut self, markup: maud::Markup) -> Self {
+        self.prepended.push(markup);
+        self
+    }
+
     /// Override the submit button label (default `"Save"`).
     #[must_use]
     pub fn submit_label(mut self, label: impl Into<String>) -> Self {
@@ -2333,6 +2377,7 @@ impl<T: Serialize + FormModel> FormFor<'_, T> {
             excluded,
             field_overrides,
             label_overrides,
+            prepended,
             appended,
             submit_label,
             force_multipart,
@@ -2345,6 +2390,9 @@ impl<T: Serialize + FormModel> FormFor<'_, T> {
                 .any(|f| matches!(f.control, FieldControl::File));
 
         let inner = maud::html! {
+            @for markup in prepended {
+                (markup)
+            }
             @for field in &fields {
                 (render_form_field(changeset, field))
             }
@@ -3520,6 +3568,34 @@ mod tests {
 
     #[cfg(feature = "maud")]
     #[test]
+    fn text_input_htmx_drops_submit_token_param() {
+        // The inline-validation POST `hx-include`s the whole form, which carries
+        // the hidden one-time `_submit_token` (issue #1360). `SubmitTokenLayer`
+        // consumes any `_submit_token` a mutating POST carries, so validation
+        // must filter it out via `hx-params` — otherwise the first field
+        // validation spends the token and the real submit replays the fragment.
+        #[derive(serde::Serialize)]
+        struct F {
+            name: String,
+        }
+        let cs = Changeset::new(F {
+            name: String::new(),
+        });
+        let plain = text_input_htmx(&cs, "name", "Name", "/validate/name").into_string();
+        assert!(
+            plain.contains(r#"hx-params="not _submit_token""#),
+            "{plain}"
+        );
+        let required =
+            required_text_input_htmx(&cs, "name", "Name", "/validate/name").into_string();
+        assert!(
+            required.contains(r#"hx-params="not _submit_token""#),
+            "{required}"
+        );
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
     fn text_input_htmx_valid_state_no_error_markup() {
         #[derive(serde::Serialize)]
         struct F {
@@ -4486,6 +4562,30 @@ mod tests {
             .find(r#"type="submit""#)
             .expect("submit button missing");
         assert!(append_idx < submit_idx, "{html}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn form_for_prepend_inserts_before_fields() {
+        // A prepended hidden field (e.g. a one-time submit token, issue #1360)
+        // must render at the FRONT of the form — after the CSRF input but before
+        // every derived field — so a body-scanning middleware finds it even when
+        // an earlier field carries a large value.
+        let cs = Changeset::new(blank_form_for_model());
+        let html = form_for(&cs, "/posts", "post")
+            .csrf("tok")
+            .prepend(maud::html! { input type="hidden" name="_submit_token" value="st"; })
+            .render()
+            .into_string();
+        let csrf_idx = html.find(r#"name="_csrf""#).expect("csrf input missing");
+        let prepend_idx = html
+            .find(r#"name="_submit_token""#)
+            .expect("prepend markup missing");
+        let first_field_idx = html.find(r#"name="title""#).expect("derived field missing");
+        assert!(
+            csrf_idx < prepend_idx && prepend_idx < first_field_idx,
+            "prepended token must sit after csrf and before the first derived field: {html}"
+        );
     }
 
     #[cfg(feature = "maud")]

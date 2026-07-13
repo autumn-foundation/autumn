@@ -364,6 +364,10 @@ pub struct SecurityConfig {
     #[serde(default)]
     pub csrf: CsrfConfig,
 
+    /// One-time submit tokens — at-most-once form submissions.
+    #[serde(default)]
+    pub submit_token: SubmitTokenConfig,
+
     /// Rate limiting (per-client-IP token bucket).
     #[serde(default)]
     pub rate_limit: RateLimitConfig,
@@ -732,6 +736,199 @@ impl Default for CsrfConfig {
             exempt_paths: Vec::new(),
         }
     }
+}
+
+/// One-time submit-token protection settings.
+///
+/// When enabled (the default), a per-render random token is exposed via the
+/// [`SubmitToken`](crate::security::SubmitToken) extractor and embedded as a
+/// hidden `_submit_token` field in scaffolded create/update forms. On the
+/// mutating POST the server consumes the token exactly once: a double-click,
+/// Back→resubmit, or browser retry carrying an already-consumed token replays
+/// the first response instead of re-running the handler, so no duplicate row is
+/// created — with no client-side JavaScript.
+///
+/// Unlike [`IdempotencyConfig`](crate::config::IdempotencyConfig), the guard is
+/// driven by a form field, not the `Idempotency-Key` header, so it protects
+/// bare browser form submits.
+///
+/// # Defaults
+///
+/// | Field | Default |
+/// |-------|---------|
+/// | `enabled` | `true` |
+/// | `field_name` | `"_submit_token"` |
+/// | `ttl_secs` | `600` (10 min) |
+/// | `in_flight_ttl_secs` | `86_400` (24 h) |
+/// | `backend` | *inherits `[idempotency].backend`* (in-memory in dev, Redis in prod) |
+/// | `exempt_paths` | `[]` |
+///
+/// # Examples
+///
+/// ```toml
+/// [security.submit_token]
+/// enabled = true
+/// ttl_secs = 900
+/// backend = "redis"   # override; reuses the [idempotency.redis] connection settings
+/// ```
+#[derive(Debug, Clone, Deserialize)]
+pub struct SubmitTokenConfig {
+    /// Enable one-time submit-token protection. Default: `true`.
+    #[serde(default = "default_submit_token_enabled")]
+    pub enabled: bool,
+
+    /// Hidden form field name carrying the token. Default: `"_submit_token"`.
+    #[serde(default = "default_submit_token_field")]
+    pub field_name: String,
+
+    /// Time-to-live in seconds for a consumed token's stored response.
+    /// Default: `600` (10 minutes).
+    #[serde(default = "default_submit_token_ttl_secs")]
+    pub ttl_secs: u64,
+
+    /// Maximum stale lifetime in seconds for an in-flight submission lock.
+    ///
+    /// While a mutating request is running, its token is locked so a concurrent
+    /// retry carrying the same token is excluded until the first request records
+    /// its consumed response. The lock is released as soon as that record is
+    /// stored, so this value is only the backend safety expiry for crashes or
+    /// lost unlocks — it must be comfortably longer than any supported mutating
+    /// request duration. Deliberately **independent of `ttl_secs`** (the replay
+    /// window): lowering `ttl_secs` must never shorten how long an active
+    /// submission is excluded from re-entry, which would let a slow request's
+    /// retry acquire a fresh lock and double-execute. Default: `86_400`
+    /// (24 hours), matching `[idempotency].in_flight_ttl_secs`.
+    #[serde(default = "default_submit_token_in_flight_ttl_secs")]
+    pub in_flight_ttl_secs: u64,
+
+    /// Storage backend for consumed submit tokens.
+    ///
+    /// When unset (the default, `None`), the submit-token store **inherits the
+    /// configured idempotency backend** (`[idempotency].backend`): a
+    /// Redis-configured app automatically shares one consumed-token store across
+    /// replicas, while a dev app on the default in-memory idempotency backend
+    /// keeps an in-memory token store. This matches issue #1360: the token store
+    /// is backed by the existing idempotency/session store backend (in-memory in
+    /// dev, Redis in prod), so a double-click load-balanced to a different
+    /// replica cannot re-run the mutation in production.
+    ///
+    /// Set explicitly to override the inherited backend for submit tokens only.
+    /// When it resolves to `"redis"`, the store reuses the `[idempotency.redis]`
+    /// connection settings so a multi-replica deployment shares one token store.
+    ///
+    /// Use [`Self::resolved_backend`] to obtain the effective backend.
+    #[serde(default)]
+    pub backend: Option<crate::config::IdempotencyBackend>,
+
+    /// Request path prefixes that are exempt from submit-token guarding.
+    /// Default: `[]`.
+    #[serde(default)]
+    pub exempt_paths: Vec<String>,
+}
+
+impl Default for SubmitTokenConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_submit_token_enabled(),
+            field_name: default_submit_token_field(),
+            ttl_secs: default_submit_token_ttl_secs(),
+            in_flight_ttl_secs: default_submit_token_in_flight_ttl_secs(),
+            backend: None,
+            exempt_paths: Vec::new(),
+        }
+    }
+}
+
+impl SubmitTokenConfig {
+    /// Resolve the effective consumed-token storage backend.
+    ///
+    /// Returns the explicit `backend` override when one is configured;
+    /// otherwise inherits `idempotency_backend` (the app's
+    /// `[idempotency].backend`) so submit tokens share the idempotency store by
+    /// default. This is the single source of truth for backend selection so the
+    /// idempotency layer and the submit-token layer cannot drift apart.
+    #[must_use]
+    pub fn resolved_backend(
+        &self,
+        idempotency_backend: crate::config::IdempotencyBackend,
+    ) -> crate::config::IdempotencyBackend {
+        self.backend.unwrap_or(idempotency_backend)
+    }
+
+    /// Decide the production safety action for the resolved consumed-token
+    /// backend.
+    ///
+    /// Submit tokens are DEFAULT-ON, so the resolved backend can silently land
+    /// on the in-memory store in production when neither `[idempotency]` nor
+    /// `[security.submit_token].backend` is configured. A per-process memory
+    /// store cannot deduplicate submits across replicas, so this mirrors the
+    /// idempotency production-memory guard
+    /// ([`fail_fast_on_invalid_idempotency_config`](crate::app)) — using the
+    /// same `prod`/`production` profile detection — while distinguishing an
+    /// EXPLICIT opt-in from an INHERITED default:
+    ///
+    /// - EXPLICIT `[security.submit_token].backend = "memory"` in production
+    ///   ([`Self::backend`] is `Some(Memory)`) → [`SubmitTokenMemoryGuard::FailExplicit`]:
+    ///   the operator deliberately chose an unsafe backend, so fail fast like
+    ///   idempotency's explicit enabled+memory prod guard.
+    /// - INHERITED default ([`Self::backend`] is `None`) that resolves to
+    ///   memory in production → [`SubmitTokenMemoryGuard::WarnInherited`]: only
+    ///   warn, so upgrading Autumn does not turn into "prod won't boot without
+    ///   Redis" for a single-replica app.
+    /// - Non-production, or a resolved backend that is not memory →
+    ///   [`SubmitTokenMemoryGuard::Ok`].
+    #[must_use]
+    pub(crate) fn production_memory_guard(
+        &self,
+        idempotency_backend: crate::config::IdempotencyBackend,
+        is_production: bool,
+    ) -> SubmitTokenMemoryGuard {
+        use crate::config::IdempotencyBackend;
+        if !is_production
+            || self.resolved_backend(idempotency_backend) != IdempotencyBackend::Memory
+        {
+            return SubmitTokenMemoryGuard::Ok;
+        }
+        // Resolved to the in-memory store in production. `backend == Some(Memory)`
+        // is an explicit opt-in (hard fail); `backend == None` inherited the
+        // memory idempotency backend (warn only). `Some(Redis)` cannot reach here
+        // because it would not resolve to memory.
+        match self.backend {
+            Some(IdempotencyBackend::Memory) => SubmitTokenMemoryGuard::FailExplicit,
+            _ => SubmitTokenMemoryGuard::WarnInherited,
+        }
+    }
+}
+
+/// Production safety decision for the resolved submit-token consumed-token
+/// backend. Produced by [`SubmitTokenConfig::production_memory_guard`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubmitTokenMemoryGuard {
+    /// No action: not production, or the resolved backend is not the in-memory
+    /// store.
+    Ok,
+    /// The default/inherited backend resolves to the in-memory store in
+    /// production. Boot proceeds, but an actionable startup warning is emitted.
+    WarnInherited,
+    /// An explicit `[security.submit_token].backend = "memory"` in production.
+    /// Boot must fail fast.
+    FailExplicit,
+}
+
+const fn default_submit_token_enabled() -> bool {
+    true
+}
+
+fn default_submit_token_field() -> String {
+    "_submit_token".to_owned()
+}
+
+const fn default_submit_token_ttl_secs() -> u64 {
+    600
+}
+
+const fn default_submit_token_in_flight_ttl_secs() -> u64 {
+    86_400
 }
 
 /// Strategy for identifying which client a rate-limit bucket belongs to.
@@ -1332,6 +1529,114 @@ const fn default_max_file_size_bytes() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::IdempotencyBackend;
+
+    // ── submit-token backend resolution (Finding D: inherit idempotency) ─────
+
+    #[test]
+    fn submit_token_backend_defaults_to_none_and_inherits_idempotency() {
+        // Unset `[security.submit_token].backend` deserializes to `None`.
+        let cfg: SubmitTokenConfig = toml::from_str("").unwrap();
+        assert_eq!(cfg.backend, None, "unset backend must deserialize to None");
+        // With idempotency on Redis, the resolved submit-token backend follows
+        // it — NOT the old hardcoded Memory default.
+        assert_eq!(
+            cfg.resolved_backend(IdempotencyBackend::Redis),
+            IdempotencyBackend::Redis,
+            "an unset submit-token backend must inherit the Redis idempotency backend"
+        );
+        // A dev app on the default Memory idempotency backend stays Memory.
+        assert_eq!(
+            cfg.resolved_backend(IdempotencyBackend::Memory),
+            IdempotencyBackend::Memory,
+            "an unset submit-token backend on a Memory idempotency app stays Memory"
+        );
+    }
+
+    #[test]
+    fn submit_token_explicit_backend_overrides_inherited_idempotency() {
+        // An explicit `backend = "memory"` wins even when idempotency is Redis.
+        let cfg: SubmitTokenConfig = toml::from_str("backend = \"memory\"").unwrap();
+        assert_eq!(cfg.backend, Some(IdempotencyBackend::Memory));
+        assert_eq!(
+            cfg.resolved_backend(IdempotencyBackend::Redis),
+            IdempotencyBackend::Memory,
+            "an explicit submit-token backend override must win over the inherited backend"
+        );
+
+        // An explicit `backend = "redis"` wins even when idempotency is Memory.
+        let cfg: SubmitTokenConfig = toml::from_str("backend = \"redis\"").unwrap();
+        assert_eq!(cfg.backend, Some(IdempotencyBackend::Redis));
+        assert_eq!(
+            cfg.resolved_backend(IdempotencyBackend::Memory),
+            IdempotencyBackend::Redis,
+            "an explicit redis override must win over an inherited Memory backend"
+        );
+    }
+
+    // ── submit-token production memory guard (Finding O) ────────────────────
+
+    #[test]
+    fn submit_token_explicit_memory_in_production_fails_fast() {
+        // EXPLICIT `[security.submit_token].backend = "memory"` in production
+        // is a deliberate unsafe opt-in → hard fail, mirroring idempotency's
+        // explicit enabled+memory prod guard.
+        let cfg: SubmitTokenConfig = toml::from_str("backend = \"memory\"").unwrap();
+        assert_eq!(cfg.backend, Some(IdempotencyBackend::Memory));
+        assert_eq!(
+            cfg.production_memory_guard(IdempotencyBackend::Redis, true),
+            SubmitTokenMemoryGuard::FailExplicit,
+        );
+        assert_eq!(
+            cfg.production_memory_guard(IdempotencyBackend::Memory, true),
+            SubmitTokenMemoryGuard::FailExplicit,
+        );
+    }
+
+    #[test]
+    fn submit_token_inherited_memory_in_production_only_warns() {
+        // INHERITED default (`backend = None`) resolving to Memory in production
+        // must NOT fail — upgrading Autumn must not turn into "prod won't boot
+        // without Redis". It only warns.
+        let cfg: SubmitTokenConfig = toml::from_str("").unwrap();
+        assert_eq!(cfg.backend, None);
+        assert_eq!(
+            cfg.production_memory_guard(IdempotencyBackend::Memory, true),
+            SubmitTokenMemoryGuard::WarnInherited,
+        );
+        // Inherited Redis resolves to Redis → no warning, no fail.
+        assert_eq!(
+            cfg.production_memory_guard(IdempotencyBackend::Redis, true),
+            SubmitTokenMemoryGuard::Ok,
+        );
+    }
+
+    #[test]
+    fn submit_token_memory_outside_production_is_ok() {
+        // Dev / non-production → no warn, no fail, regardless of explicit or
+        // inherited memory.
+        let explicit: SubmitTokenConfig = toml::from_str("backend = \"memory\"").unwrap();
+        assert_eq!(
+            explicit.production_memory_guard(IdempotencyBackend::Memory, false),
+            SubmitTokenMemoryGuard::Ok,
+        );
+        let inherited: SubmitTokenConfig = toml::from_str("").unwrap();
+        assert_eq!(
+            inherited.production_memory_guard(IdempotencyBackend::Memory, false),
+            SubmitTokenMemoryGuard::Ok,
+        );
+    }
+
+    #[test]
+    fn submit_token_explicit_redis_backend_never_triggers_guard() {
+        // An explicit Redis override never resolves to memory, so the guard is
+        // a no-op even in production.
+        let cfg: SubmitTokenConfig = toml::from_str("backend = \"redis\"").unwrap();
+        assert_eq!(
+            cfg.production_memory_guard(IdempotencyBackend::Memory, true),
+            SubmitTokenMemoryGuard::Ok,
+        );
+    }
 
     // ── validate_signing_secret (RED phase) ─────────────────────────────────
 

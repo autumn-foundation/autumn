@@ -144,6 +144,7 @@ pub(crate) mod headers;
 pub(crate) mod path;
 pub mod proxy;
 pub mod rate_limit;
+pub(crate) mod submit_token;
 pub(crate) mod trusted_proxies;
 
 // Re-export commonly used types at the module level.
@@ -155,8 +156,8 @@ pub use captcha::{
 };
 pub use config::{
     CspNonceConfig, CsrfConfig, HeadersConfig, KeyStrategy, RateLimitBackend, RateLimitConfig,
-    RateLimitNamedConfig, RateLimitTierConfig, SecurityConfig, TrustedProxiesConfig, UploadConfig,
-    default_content_security_policy, hmac_sha256_hex,
+    RateLimitNamedConfig, RateLimitTierConfig, SecurityConfig, SubmitTokenConfig,
+    TrustedProxiesConfig, UploadConfig, default_content_security_policy, hmac_sha256_hex,
 };
 #[cfg(feature = "redis")]
 pub use config::{RateLimitBackendFailure, RateLimitRedisConfig};
@@ -169,4 +170,5 @@ pub use rate_limit::{
     RateLimitEnvelopeCounted, RateLimitExempt, RateLimitLayer, RateLimitOverride,
     RateLimitPrincipal, ThrottleSpec,
 };
+pub use submit_token::{SubmitFormField, SubmitToken, SubmitTokenLayer};
 pub use trusted_proxies::{ProxyResolver, ResolvedClientIdentity, TrustedProxiesLayer};
