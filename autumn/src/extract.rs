@@ -222,14 +222,44 @@ impl Multipart {
         // must still be sniffed and enforced, since callers can consume its
         // bytes by field name. Capture the empty-filename flag now, before the
         // body is consumed by the prefix-buffering loop, to avoid borrowing
-        // `field` after it has been read.
+        // `field` after it has been read. The same flag drives the
+        // `file_name()` normalization: a genuinely-empty optional input
+        // surfaces as `None`, a non-empty-body empty-filename part as a file.
         let filename_is_empty = field.file_name().is_some_and(str::is_empty);
 
         if !needs_sniff {
-            return Ok(Some(MultipartField::new(
-                field,
-                self.config.max_file_size_bytes,
-            )));
+            // Default path: no MIME policy, so no sniffing. We still must detect
+            // the genuinely-empty optional file input (empty filename AND empty
+            // body) so `file_name()` normalizes it to `None` consistently with
+            // the sniff path below. Only empty-filename parts can qualify, so
+            // only those need a body peek; every other part streams through
+            // untouched with no buffering.
+            if !filename_is_empty {
+                return Ok(Some(MultipartField::new(
+                    field,
+                    self.config.max_file_size_bytes,
+                )));
+            }
+
+            // Peek whether the empty-filename body yields any bytes. Buffer the
+            // peeked chunk as the prefix so the consuming methods replay it and
+            // no bytes are lost; the per-file cap is still enforced there.
+            let mut prefix: Vec<u8> = Vec::new();
+            if let Some(chunk) = field
+                .chunk()
+                .await
+                .map_err(|err| multipart_error_to_error(&err))?
+            {
+                prefix.extend_from_slice(&chunk);
+            }
+            let is_empty_optional_input = prefix.is_empty();
+            return Ok(Some(MultipartField {
+                inner: field,
+                max_file_size_bytes: self.config.max_file_size_bytes,
+                prefix,
+                sniffed_content_type: None,
+                is_empty_optional_input,
+            }));
         }
 
         // Buffer a bounded leading prefix (a few chunks at most) for sniffing,
@@ -291,6 +321,7 @@ impl Multipart {
             max_file_size_bytes: self.config.max_file_size_bytes,
             prefix,
             sniffed_content_type: sniffed,
+            is_empty_optional_input: is_empty_file_input,
         }))
     }
 }
@@ -459,6 +490,12 @@ pub struct MultipartField<'a> {
     /// Sniffed (magic-byte) content type, if the leading bytes were recognized.
     /// `infer` returns a `&'static str`, so this stores the borrow directly.
     sniffed_content_type: Option<&'static str>,
+    /// Whether this part is a genuinely-empty optional file input: an empty
+    /// `filename=""` AND a 0-byte body. Computed in `next_field`, where body
+    /// emptiness is observable, and used by [`file_name`](Self::file_name) to
+    /// normalize such a part to `None` while leaving an empty-filename part with
+    /// a non-empty body classified as a file (`Some("")`).
+    is_empty_optional_input: bool,
 }
 
 #[cfg(all(feature = "multipart", feature = "storage"))]
@@ -482,6 +519,7 @@ impl<'a> MultipartField<'a> {
             max_file_size_bytes,
             prefix: Vec::new(),
             sniffed_content_type: None,
+            is_empty_optional_input: false,
         }
     }
 
@@ -505,18 +543,30 @@ impl<'a> MultipartField<'a> {
 
     /// Uploaded file name (if this field represents a file).
     ///
-    /// An empty `filename=""` is normalized to `None`: an optional file input
-    /// that was left blank submits a part with an empty filename and a 0-byte
-    /// body, which represents an absent file rather than a real upload (see
-    /// issue #1873). Handlers that distinguish uploads via
-    /// `field.file_name().is_some()` therefore correctly treat such a part as
-    /// "no file provided" instead of persisting a zero-byte file. This
-    /// normalization does not relax MIME enforcement: a `filename=""` part with
-    /// a NON-empty body is still sniffed and enforced (that carve-out reads the
-    /// raw axum filename during `next_field`, not this getter).
+    /// Normalization applies to exactly ONE case: an empty `filename=""` AND a
+    /// 0-byte body is returned as `None`, because an optional file input left
+    /// blank submits such a part to represent an absent file rather than a real
+    /// upload (see issue #1873). Handlers that distinguish uploads via
+    /// `field.file_name().is_some()` therefore treat it as "no file provided"
+    /// instead of persisting a zero-byte file.
+    ///
+    /// Every other part is returned unchanged, so this getter agrees with the
+    /// file/non-file classification `next_field` uses for enforcement:
+    ///
+    /// - empty filename + NON-empty body → `Some("")` (it is a file: it is
+    ///   sniffed and enforced under an allow-list, so it is surfaced as one);
+    /// - non-empty filename → `Some("name")`.
+    ///
+    /// The decision is made in `next_field`, where body emptiness is
+    /// observable, and recorded on this field — this getter cannot inspect the
+    /// (lazily read) body itself.
     #[must_use]
     pub fn file_name(&self) -> Option<&str> {
-        self.inner.file_name().filter(|name| !name.is_empty())
+        if self.is_empty_optional_input {
+            None
+        } else {
+            self.inner.file_name()
+        }
     }
 
     /// Declared MIME type for this field.
