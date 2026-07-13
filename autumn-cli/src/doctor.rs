@@ -637,7 +637,7 @@ pub fn probe_port(domain: &str, port: u16) -> PortReachability {
 }
 
 /// Thin bounded I/O wrapper: resolve `domain` and compare its addresses to this
-/// host's local non-loopback IPs.
+/// host's local IPs via the pure [`grade_dns_points_here`] grader.
 #[must_use]
 pub fn resolve_dns_points_here(domain: &str) -> DnsPointsHere {
     use std::net::ToSocketAddrs as _;
@@ -645,14 +645,37 @@ pub fn resolve_dns_points_here(domain: &str) -> DnsPointsHere {
         Ok(addrs) => addrs.map(|s| s.ip()).collect(),
         Err(_) => return DnsPointsHere::Unresolved,
     };
+    grade_dns_points_here(&resolved, &local_ips())
+}
+
+/// Grade a domain's resolved addresses against this host's local IPs (pure;
+/// injectable for tests).
+///
+/// Only *public* local IPs can prove "points here": in NAT/container deployments
+/// the discovered local source IP is private (RFC1918), CGNAT (100.64/10), or
+/// link/unique-local while the ACME domain resolves to a public LB/elastic IP, so
+/// comparing a private local IP against a public DNS result would wrongly report
+/// [`DnsPointsHere::ResolvesElsewhere`] and fail `doctor --online --strict` even
+/// though HTTP-01 routes fine through NAT. When no public local IP is known the
+/// result is [`DnsPointsHere::LocalIpsUnknown`] (inconclusive Warn), never a hard
+/// mismatch.
+#[must_use]
+fn grade_dns_points_here(
+    resolved: &[std::net::IpAddr],
+    local_ips: &[std::net::IpAddr],
+) -> DnsPointsHere {
     if resolved.is_empty() {
         return DnsPointsHere::Unresolved;
     }
-    let local = local_public_ips();
-    if local.is_empty() {
+    let local_public: Vec<std::net::IpAddr> = local_ips
+        .iter()
+        .copied()
+        .filter(|ip| is_public_ip(*ip))
+        .collect();
+    if local_public.is_empty() {
         return DnsPointsHere::LocalIpsUnknown;
     }
-    if resolved.iter().any(|ip| local.contains(ip)) {
+    if resolved.iter().any(|ip| local_public.contains(ip)) {
         DnsPointsHere::Matches
     } else {
         DnsPointsHere::ResolvesElsewhere {
@@ -661,13 +684,56 @@ pub fn resolve_dns_points_here(domain: &str) -> DnsPointsHere {
     }
 }
 
-/// This host's local non-loopback IP addresses, best-effort.
+/// Whether `ip` is a globally-routable address a public ACME peer could see as
+/// "this host". Filters out loopback, unspecified, RFC1918 private, CGNAT
+/// (`100.64/10`), link-local (`169.254/16`, `fe80::/10`), and IPv6 unique-local
+/// (`fc00::/7`) ranges — a source IP in any of those is a NAT/container-internal
+/// address, not a public identity, so it cannot confirm or deny where the domain
+/// points.
+const fn is_public_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            !(v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_broadcast()
+                || v4.is_unspecified()
+                || is_cgnat_v4(v4))
+        }
+        std::net::IpAddr::V6(v6) => {
+            !(v6.is_loopback()
+                || v6.is_unspecified()
+                || is_link_local_v6(v6)
+                || is_unique_local_v6(v6))
+        }
+    }
+}
+
+/// CGNAT shared address space, `100.64.0.0/10` (RFC 6598): first octet `100`,
+/// second octet `64..=127`.
+const fn is_cgnat_v4(v4: std::net::Ipv4Addr) -> bool {
+    let o = v4.octets();
+    o[0] == 100 && (o[1] & 0xc0) == 64
+}
+
+/// IPv6 link-local unicast, `fe80::/10`.
+const fn is_link_local_v6(v6: std::net::Ipv6Addr) -> bool {
+    (v6.segments()[0] & 0xffc0) == 0xfe80
+}
+
+/// IPv6 unique-local addresses, `fc00::/7`.
+const fn is_unique_local_v6(v6: std::net::Ipv6Addr) -> bool {
+    (v6.segments()[0] & 0xfe00) == 0xfc00
+}
+
+/// This host's local IP addresses, best-effort.
 ///
 /// Uses a UDP "connect" trick (no packets sent) to discover the outbound source
 /// address, which is the address a public peer would see for a simple setup.
-/// Returns empty when it cannot be determined (NAT, no route), which the grader
-/// treats as "unknown" rather than a failure.
-fn local_public_ips() -> Vec<std::net::IpAddr> {
+/// Returns empty when it cannot be determined (NAT, no route). The pure
+/// [`grade_dns_points_here`] grader filters these to *public* addresses and
+/// treats an empty public set as "unknown" rather than a failure.
+fn local_ips() -> Vec<std::net::IpAddr> {
     let mut out = Vec::new();
     for target in ["8.8.8.8:80", "[2001:4860:4860::8888]:80"] {
         if let Ok(sock) = std::net::UdpSocket::bind(if target.starts_with('[') {
@@ -678,7 +744,7 @@ fn local_public_ips() -> Vec<std::net::IpAddr> {
             && let Ok(addr) = sock.local_addr()
         {
             let ip = addr.ip();
-            if !ip.is_loopback() && !out.contains(&ip) {
+            if !out.contains(&ip) {
                 out.push(ip);
             }
         }
@@ -4027,6 +4093,55 @@ const fn should_run_static_tls_check(acme_configured: bool, static_cert_key_pres
     static_cert_key_present || !acme_configured
 }
 
+/// Grade the static-vs-ACME TLS mode invariants, mirroring
+/// [`autumn_web::config::TlsConfig::validate`] (pure; injectable for tests).
+///
+/// The runtime fails fast at boot when `[server.tls.acme]` is combined with a
+/// static `cert_path`/`key_path` (mutually exclusive), and when only ONE of
+/// `cert_path`/`key_path` is set (half pair). Doctor only used the static paths
+/// to decide whether to run the static-cert check, so it could bless configs the
+/// app won't start: a config with BOTH a valid static cert/key AND acme, or a
+/// single static path plus acme. This grader replicates the same rules and
+/// returns a `Fail` [`CheckResult`] for the offending combination, or `None` when
+/// the mode is valid (ACME-only, static-only with both paths, or neither — TLS is
+/// optional). Messages mirror `TlsConfig::validate`'s so the operator sees the
+/// same guidance doctor and the runtime would give.
+#[must_use]
+pub fn check_tls_mode_impl(
+    has_cert: bool,
+    has_key: bool,
+    acme_configured: bool,
+) -> Option<CheckResult> {
+    let static_configured = has_cert || has_key;
+    match (static_configured, acme_configured) {
+        (true, true) => Some(CheckResult {
+            name: "tls_mode",
+            status: CheckStatus::Fail,
+            detail: Some(
+                "[server.tls] sets a static cert_path/key_path AND [server.tls.acme]; choose \
+                 exactly one — remove the static cert to use ACME, or remove [server.tls.acme] \
+                 to serve the static certificate"
+                    .into(),
+            ),
+            hint: Some(
+                "Static TLS cert/key and [server.tls.acme] are mutually exclusive; configure \
+                 exactly one",
+            ),
+        }),
+        (true, false) if !(has_cert && has_key) => Some(CheckResult {
+            name: "tls_mode",
+            status: CheckStatus::Fail,
+            detail: Some(
+                "[server.tls] cert_path and key_path must be set together; set both, or \
+                 configure [server.tls.acme] instead"
+                    .into(),
+            ),
+            hint: Some("Set both cert_path and key_path"),
+        }),
+        _ => None,
+    }
+}
+
 /// The resolved `[server.tls.acme]` inputs the doctor needs (issue #1608).
 #[derive(Debug, Clone)]
 pub struct AcmeDoctorConfig {
@@ -4127,15 +4242,17 @@ fn acme_online_probe_domains(config: &AcmeDoctorConfig) -> Vec<String> {
     config.domains.clone()
 }
 
-/// Inspect the newest stored ACME certificate under the configured directory
-/// namespace and grade its expiry, offline (reuses the #1603 `inspect_leaf`
-/// path). `cert_dir` must be the namespaced store directory
-/// (`{cache_dir}/{directory_label}/`), NOT the bare cache dir. Returns
-/// [`TlsDoctorData::NotConfigured`] when nothing is stored yet (a first run
-/// before issuance is not a failure).
-fn resolve_acme_stored_cert_data(cert_dir: &std::path::Path) -> TlsDoctorData {
-    // Find the newest `<id>.chain.pem` + matching `<id>.key.pem` pair.
-    let Some((chain, key)) = newest_acme_cert_pair(cert_dir) else {
+/// Inspect the stored ACME certificate for the CONFIGURED domains under the
+/// configured directory namespace and grade its expiry, offline (reuses the
+/// #1603 `inspect_leaf` path). `cert_dir` must be the namespaced store directory
+/// (`{cache_dir}/{directory_label}/`), NOT the bare cache dir; `domains` is the
+/// active `acme.domains`. Returns [`TlsDoctorData::NotConfigured`] when no cert
+/// for the configured domains is stored yet (a first run before issuance is not
+/// a failure).
+fn resolve_acme_stored_cert_data(cert_dir: &std::path::Path, domains: &[String]) -> TlsDoctorData {
+    // Inspect EXACTLY the cert the runtime loads for these domains
+    // (`CertId::from_domains(domains)`), not whichever file is newest.
+    let Some((chain, key)) = configured_acme_cert_pair(cert_dir, domains) else {
         return TlsDoctorData::NotConfigured;
     };
 
@@ -4166,48 +4283,57 @@ fn resolve_acme_stored_cert_data(cert_dir: &std::path::Path) -> TlsDoctorData {
     }
 }
 
-/// Find the most-recently-modified `<id>.chain.pem` with a sibling
-/// `<id>.key.pem` in `cert_dir`, returning both paths.
+/// Locate the stored `{cert_id}.chain.pem` + `{cert_id}.key.pem` pair for the
+/// CONFIGURED domains in `cert_dir`, where `cert_id` is derived from `domains`
+/// exactly as [`autumn_web::acme::store::CertId::from_domains`] does.
 ///
 /// `cert_dir` MUST be the configured directory namespace
-/// (`{cache_dir}/{directory-label}/`, see [`FsAcmeStore`]) — the one the runtime
-/// actually loads from. It scans ONLY that directory (no recursion into sibling
-/// namespaces): after promoting `directory = "production"`, a newer leftover
-/// `staging/*.chain.pem` must NOT be inspected, because the production
-/// `FsAcmeStore` reads only `{cache_dir}/production/` and would never serve it.
-///
-/// [`FsAcmeStore`]: autumn_web::acme::store::FsAcmeStore
-fn newest_acme_cert_pair(
+/// (`{cache_dir}/{directory-label}/`) — the one the runtime's `FsAcmeStore`
+/// actually loads from. Inspecting the cert id derived from the ACTIVE
+/// `acme.domains` (rather than whichever file is newest) matches what
+/// `build_acme_tls_listener` loads: if `domains` changed and old cert files
+/// remain, an expired-but-ignored old cert must not fail `--strict`, and a
+/// healthy old cert for other domains must not be reported as the stored cert
+/// for these domains. Returns `None` (→ "no cert yet for the configured
+/// domains", a benign first-run state) when either half is absent, mirroring
+/// `FsAcmeStore::load_cert`'s treatment of a partial pair as absent.
+fn configured_acme_cert_pair(
     cert_dir: &std::path::Path,
+    domains: &[String],
 ) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
-    let mut best: Option<(
-        std::time::SystemTime,
-        std::path::PathBuf,
-        std::path::PathBuf,
-    )> = None;
-
-    let entries = std::fs::read_dir(cert_dir).ok()?;
-    for entry in entries.flatten() {
-        let chain = entry.path();
-        let Some(name) = chain.file_name().and_then(|n| n.to_str()) else {
-            continue;
-        };
-        let Some(id) = name.strip_suffix(".chain.pem") else {
-            continue;
-        };
-        let key = cert_dir.join(format!("{id}.key.pem"));
-        if !key.exists() {
-            continue;
-        }
-        let mtime = entry
-            .metadata()
-            .and_then(|m| m.modified())
-            .unwrap_or(std::time::UNIX_EPOCH);
-        if best.as_ref().is_none_or(|(t, _, _)| mtime >= *t) {
-            best = Some((mtime, chain, key));
-        }
+    let id = acme_cert_id(domains);
+    let chain = cert_dir.join(format!("{id}.chain.pem"));
+    let key = cert_dir.join(format!("{id}.key.pem"));
+    if chain.exists() && key.exists() {
+        Some((chain, key))
+    } else {
+        None
     }
-    best.map(|(_, chain, key)| (chain, key))
+}
+
+/// The stable certificate id for a domain set, replicating
+/// [`autumn_web::acme::store::CertId::from_domains`] (which lives behind the
+/// `acme` feature while this doctor path also compiles feature-less). Keep in
+/// EXACT sync with `store.rs`: sort + dedup the domains, SHA-256 each with a
+/// trailing NUL separator, and hex-encode the first 16 digest bytes. A
+/// `#[cfg(feature = "acme")]` test asserts this equals the store's derivation.
+fn acme_cert_id(domains: &[String]) -> String {
+    use sha2::{Digest as _, Sha256};
+    let mut sorted: Vec<&str> = domains.iter().map(String::as_str).collect();
+    sorted.sort_unstable();
+    sorted.dedup();
+    let mut hasher = Sha256::new();
+    for domain in sorted {
+        hasher.update(domain.as_bytes());
+        hasher.update(b"\0");
+    }
+    let digest = hasher.finalize();
+    let mut out = String::with_capacity(32);
+    for byte in &digest[..16] {
+        use std::fmt::Write as _;
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
 }
 
 /// Grade the stored ACME certificate's expiry (pure; injectable for tests).
@@ -5022,8 +5148,24 @@ pub fn run(opts: DoctorOptions) {
     let (acme_canonical, acme_selected, _) = resolve_active_profiles();
     let merged_acme_toml = get_merged_toml_table_runtime(&acme_canonical, &acme_selected);
     let acme_config = resolve_acme_doctor_config(Some(&merged_acme_toml));
-    let static_cert_key_present = resolve_tls_paths()
-        .is_some_and(|(cert, key)| !cert.as_os_str().is_empty() && !key.as_os_str().is_empty());
+    let (has_cert_path, has_key_path) = resolve_tls_paths()
+        .map_or((false, false), |(cert, key)| {
+            (!cert.as_os_str().is_empty(), !key.as_os_str().is_empty())
+        });
+    let static_cert_key_present = has_cert_path && has_key_path;
+
+    // Mirror `TlsConfig::validate()`'s static-vs-ACME XOR + half-pair rules so
+    // doctor FAILS exactly the combinations the runtime refuses to boot: static
+    // cert/key AND [server.tls.acme] together (mutually exclusive), or only one
+    // of cert_path/key_path (half pair). Without this, a config with BOTH a valid
+    // static cert/key AND acme could PASS `--strict`, and a config with a single
+    // static path plus acme would silently skip the static check — blessing a
+    // config the app won't start.
+    if let Some(mode_fail) = check_tls_mode_impl(has_cert_path, has_key_path, acme_config.is_some())
+    {
+        tasks.push(Box::new(move || mode_fail));
+    }
+
     if should_run_static_tls_check(acme_config.is_some(), static_cert_key_present) {
         let tls_data = resolve_tls_doctor_data();
         tasks.push(Box::new(move || check_tls_impl(&tls_data)));
@@ -5037,7 +5179,7 @@ pub fn run(opts: DoctorOptions) {
         // Scan ONLY the configured directory namespace the runtime store loads
         // from ({cache_dir}/{directory_label}/), never sibling namespaces.
         let cert_dir = acme.cache_dir.join(&acme.directory_label);
-        let stored = resolve_acme_stored_cert_data(&cert_dir);
+        let stored = resolve_acme_stored_cert_data(&cert_dir, &acme.domains);
         tasks.push(Box::new(move || check_acme_stored_cert_impl(&stored)));
 
         // Probe EVERY configured domain: issuance orders authorizations for all
@@ -7332,6 +7474,94 @@ pub struct Vault {
         }
     }
 
+    // Regression (#1608, Codex): in NAT/container deployments the discovered local
+    // source IP is private/CGNAT/link-local while the domain resolves to a public
+    // LB/elastic IP. Comparing those must NOT report `ResolvesElsewhere` (which
+    // fails `--online --strict`); with no PUBLIC local IP the result is the
+    // inconclusive `LocalIpsUnknown`.
+    #[test]
+    fn dns_private_local_ips_are_inconclusive_not_elsewhere() {
+        let resolved: Vec<std::net::IpAddr> = vec!["203.0.113.10".parse().unwrap()];
+        let local: Vec<std::net::IpAddr> = vec![
+            "10.0.0.5".parse().unwrap(),     // RFC1918
+            "172.16.4.9".parse().unwrap(),   // RFC1918
+            "192.168.1.20".parse().unwrap(), // RFC1918
+            "100.72.0.1".parse().unwrap(),   // CGNAT 100.64/10
+            "169.254.3.4".parse().unwrap(),  // link-local
+            "127.0.0.1".parse().unwrap(),    // loopback
+            "fe80::1".parse().unwrap(),      // IPv6 link-local
+            "fd00::1".parse().unwrap(),      // IPv6 unique-local
+        ];
+        assert_eq!(
+            grade_dns_points_here(&resolved, &local),
+            DnsPointsHere::LocalIpsUnknown,
+            "only private/link-local local IPs must be inconclusive, never ResolvesElsewhere"
+        );
+    }
+
+    #[test]
+    fn dns_public_local_ip_matching_result_points_here() {
+        let ip: std::net::IpAddr = "203.0.113.10".parse().unwrap();
+        // A private IP alongside a matching public one must not suppress the match.
+        let local: Vec<std::net::IpAddr> = vec!["192.168.1.20".parse().unwrap(), ip];
+        assert_eq!(grade_dns_points_here(&[ip], &local), DnsPointsHere::Matches);
+    }
+
+    #[test]
+    fn dns_public_local_ip_not_in_result_resolves_elsewhere() {
+        let resolved: Vec<std::net::IpAddr> = vec!["203.0.113.10".parse().unwrap()];
+        // A genuine PUBLIC local IP that does not appear in the DNS result is a
+        // real mismatch.
+        let local: Vec<std::net::IpAddr> = vec!["198.51.100.7".parse().unwrap()];
+        assert_eq!(
+            grade_dns_points_here(&resolved, &local),
+            DnsPointsHere::ResolvesElsewhere {
+                resolved: vec!["203.0.113.10".to_owned()],
+            }
+        );
+    }
+
+    #[test]
+    fn dns_unresolved_when_no_addresses() {
+        let local: Vec<std::net::IpAddr> = vec!["203.0.113.9".parse().unwrap()];
+        assert_eq!(
+            grade_dns_points_here(&[], &local),
+            DnsPointsHere::Unresolved
+        );
+    }
+
+    #[test]
+    fn is_public_ip_classifies_ranges() {
+        for public in ["203.0.113.10", "198.51.100.7", "2001:4860:4860::8888"] {
+            assert!(
+                is_public_ip(public.parse().unwrap()),
+                "{public} should be public"
+            );
+        }
+        for private in [
+            "10.0.0.1",
+            "172.16.0.1",
+            "192.168.0.1",
+            "100.64.0.1",
+            "100.127.255.255",
+            "169.254.1.1",
+            "127.0.0.1",
+            "0.0.0.0",
+            "fe80::1",
+            "fc00::1",
+            "fdff::1",
+            "::1",
+        ] {
+            assert!(
+                !is_public_ip(private.parse().unwrap()),
+                "{private} should NOT be public"
+            );
+        }
+        // Just outside CGNAT (100.64/10) is public again.
+        assert!(is_public_ip("100.128.0.1".parse().unwrap()));
+        assert!(is_public_ip("100.63.255.255".parse().unwrap()));
+    }
+
     #[test]
     fn acme_stored_cert_pass_when_none_yet() {
         let r = check_acme_stored_cert_impl(&TlsDoctorData::NotConfigured);
@@ -7386,6 +7616,58 @@ pub struct Vault {
         // No acme, no static cert/key: run the static check so the incomplete
         // static-TLS config still surfaces the actionable "must set both" Fail.
         assert!(should_run_static_tls_check(false, false));
+    }
+
+    // Regression (#1608, Codex): doctor must mirror `TlsConfig::validate`'s
+    // static-vs-ACME XOR + half-pair rules so it FAILS exactly the combinations
+    // the runtime refuses to boot, instead of blessing them under `--strict`.
+    #[test]
+    fn tls_mode_fails_static_and_acme_together() {
+        // Both a static cert/key AND acme configured → mutually exclusive Fail,
+        // even though both static paths are present (would otherwise pass).
+        let r = check_tls_mode_impl(true, true, true).expect("both modes must Fail");
+        assert!(matches!(r.status, CheckStatus::Fail));
+        assert_eq!(r.name, "tls_mode");
+        assert!(r.detail.as_deref().unwrap().contains("[server.tls.acme]"));
+
+        // A single static path plus acme is still the mutually-exclusive case
+        // (any static path counts as static-configured), and previously the
+        // static check was silently SKIPPED, hiding it.
+        assert!(check_tls_mode_impl(true, false, true).is_some());
+        assert!(check_tls_mode_impl(false, true, true).is_some());
+    }
+
+    #[test]
+    fn tls_mode_fails_half_static_pair_without_acme() {
+        // Exactly one of cert_path/key_path set, no acme → "must set both" Fail.
+        for (has_cert, has_key) in [(true, false), (false, true)] {
+            let r = check_tls_mode_impl(has_cert, has_key, false)
+                .unwrap_or_else(|| panic!("half pair ({has_cert},{has_key}) must Fail"));
+            assert!(matches!(r.status, CheckStatus::Fail));
+            assert!(
+                r.detail
+                    .as_deref()
+                    .unwrap()
+                    .contains("must be set together")
+            );
+        }
+    }
+
+    #[test]
+    fn tls_mode_passes_valid_single_mode_configs() {
+        // Valid ACME-only: no static paths, acme configured → no mode Fail (the
+        // dedicated acme checks grade it).
+        assert!(
+            check_tls_mode_impl(false, false, true).is_none(),
+            "ACME-only is a valid single mode"
+        );
+        // Valid static-only: both paths, no acme → no mode Fail.
+        assert!(
+            check_tls_mode_impl(true, true, false).is_none(),
+            "static-only with both paths is a valid single mode"
+        );
+        // Neither configured: TLS is optional → no mode Fail.
+        assert!(check_tls_mode_impl(false, false, false).is_none());
     }
 
     // Regression (#1608, Codex): [server.tls.acme] supplied ONLY by an active
@@ -7524,57 +7806,100 @@ directory = \"production\"
         assert!(label.starts_with("custom-"), "got {label}");
     }
 
-    // Regression (#1608, Codex): after promoting to `directory = "production"`, a
-    // newer leftover staging cert must NOT be inspected. The scan targets only
-    // the configured namespace ({cache_dir}/production/), which is all the
-    // production FsAcmeStore ever loads.
+    // Regression (#1608, Codex): doctor must inspect the cert id derived from the
+    // ACTIVE `acme.domains` (what `build_acme_tls_listener` loads), NOT whichever
+    // `*.chain.pem` is newest. If `domains` changed and old cert files remain, an
+    // old cert for other domains must not be reported as the stored cert, and an
+    // absent configured cert is a benign first-run state — not a "healthy old
+    // cert" or an expired-old-cert `--strict` failure.
     #[test]
-    fn acme_scan_inspects_only_configured_directory() {
-        use std::time::{Duration, SystemTime};
-
+    fn acme_scan_inspects_configured_domain_cert() {
         let dir = tempfile::tempdir().unwrap();
-        let cache = dir.path();
+        let cert_dir = dir.path().join("production");
+        std::fs::create_dir_all(&cert_dir).unwrap();
 
-        let write_pair = |sub: &str, id: &str, mtime: SystemTime| {
-            let d = cache.join(sub);
-            std::fs::create_dir_all(&d).unwrap();
-            let chain = d.join(format!("{id}.chain.pem"));
-            let key = d.join(format!("{id}.key.pem"));
-            std::fs::write(&chain, b"chain").unwrap();
-            std::fs::write(&key, b"key").unwrap();
-            // Pin the chain's mtime so ordering is deterministic (no sleeps).
-            std::fs::File::open(&chain)
-                .unwrap()
-                .set_modified(mtime)
-                .unwrap();
-            chain
+        let configured = vec!["app.example.com".to_owned()];
+        let old = vec!["old.example.com".to_owned()];
+        let configured_id = acme_cert_id(&configured);
+        let old_id = acme_cert_id(&old);
+        assert_ne!(configured_id, old_id);
+
+        let write_pair = |id: &str| {
+            std::fs::write(cert_dir.join(format!("{id}.chain.pem")), b"chain").unwrap();
+            std::fs::write(cert_dir.join(format!("{id}.key.pem")), b"key").unwrap();
         };
 
-        let now = SystemTime::now();
-        // Staging cert is NEWER than production — the old all-subdirs walk would
-        // have wrongly selected it.
-        write_pair("staging", "staging-cert", now + Duration::from_secs(3_600));
-        let prod_chain = write_pair("production", "prod-cert", now);
-
-        let picked = newest_acme_cert_pair(&cache.join("production"))
-            .expect("production cert must be found");
-        assert_eq!(picked.0, prod_chain);
+        // Only the OLD (different-domains) cert present: the configured-domains
+        // lookup finds nothing, so the old cert is NOT reported as the stored one.
+        write_pair(&old_id);
         assert!(
-            picked.0.to_string_lossy().contains("production"),
-            "must inspect the production cert, got {:?}",
+            configured_acme_cert_pair(&cert_dir, &configured).is_none(),
+            "a cert for different domains must not be reported as the stored cert"
+        );
+
+        // Now add the configured-domains cert alongside the old one: the lookup
+        // targets EXACTLY the configured id, ignoring the old file.
+        write_pair(&configured_id);
+        let picked = configured_acme_cert_pair(&cert_dir, &configured)
+            .expect("configured-domains cert must be found");
+        assert!(
+            picked.0.to_string_lossy().contains(&configured_id),
+            "must inspect the configured-domains cert, got {:?}",
             picked.0
         );
         assert!(
-            !picked.0.to_string_lossy().contains("staging"),
-            "must NOT inspect the newer staging cert, got {:?}",
+            !picked.0.to_string_lossy().contains(&old_id),
+            "must NOT inspect the old different-domains cert, got {:?}",
             picked.0
         );
+    }
 
-        // And scanning the staging namespace independently still finds staging,
-        // confirming the scan is namespace-scoped (not empty-by-accident).
-        let staging_pick =
-            newest_acme_cert_pair(&cache.join("staging")).expect("staging cert exists");
-        assert!(staging_pick.0.to_string_lossy().contains("staging"));
+    // A missing configured-domains cert (only a partial pair, or nothing) reads as
+    // "not stored yet" — a benign first-run state, never a hard scan miss.
+    #[test]
+    fn acme_scan_absent_configured_cert_is_not_stored() {
+        let dir = tempfile::tempdir().unwrap();
+        let cert_dir = dir.path().join("production");
+        std::fs::create_dir_all(&cert_dir).unwrap();
+        let domains = vec!["app.example.com".to_owned()];
+        let id = acme_cert_id(&domains);
+
+        // Nothing stored yet.
+        assert!(configured_acme_cert_pair(&cert_dir, &domains).is_none());
+
+        // Only the chain (no key) — mirrors FsAcmeStore treating a partial pair as
+        // absent.
+        std::fs::write(cert_dir.join(format!("{id}.chain.pem")), b"chain").unwrap();
+        assert!(configured_acme_cert_pair(&cert_dir, &domains).is_none());
+
+        // The graded result for an absent cert is the benign "not configured yet".
+        assert_eq!(
+            resolve_acme_stored_cert_data(&cert_dir, &domains),
+            TlsDoctorData::NotConfigured
+        );
+    }
+
+    // Drift guard (#1608, Codex): the doctor's feature-less replica of the cert-id
+    // hashing MUST stay byte-for-byte equal to the store's
+    // `CertId::from_domains`. Only compiled with the `acme` feature (which pulls
+    // in `autumn_web::acme`), so the two derivations are compared directly.
+    #[cfg(feature = "acme")]
+    #[test]
+    fn doctor_cert_id_matches_store() {
+        let cases: &[&[&str]] = &[
+            &["app.example.com"],
+            &["b.example.com", "a.example.com"],
+            &["a.example.com", "b.example.com", "a.example.com"],
+            &["one.example.com", "two.example.net", "three.example.org"],
+        ];
+        for case in cases {
+            let domains: Vec<String> = case.iter().map(|s| (*s).to_owned()).collect();
+            assert_eq!(
+                acme_cert_id(&domains),
+                autumn_web::acme::store::CertId::from_domains(&domains).as_str(),
+                "doctor cert-id replica drifted from CertId::from_domains for {domains:?}"
+            );
+        }
     }
 
     // ── check_alert_destination_impl (issue #1610) ───────────────────────────

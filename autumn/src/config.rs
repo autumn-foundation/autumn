@@ -6880,13 +6880,23 @@ impl<'de> de::Deserializer<'de> for SchemaDeserializer {
     fn deserialize_enum<V>(
         self,
         _name: &'static str,
-        _variants: &'static [&'static str],
+        variants: &'static [&'static str],
         visitor: V,
     ) -> Result<V::Value, Self::Error>
     where
         V: Visitor<'de>,
     {
-        visitor.visit_enum(SchemaEnumAccess)
+        // Feed the FIRST declared variant name (not `""`) so serde's derived
+        // variant-identifier visitor accepts it. An empty tag is an "unknown
+        // variant" error that aborts the ENTIRE remaining schema traversal, so a
+        // single enum field (e.g. `server.tls.acme.directory`) would drop every
+        // sibling/subsequent section (`database`, …) from the derived schema —
+        // silently disabling the strict unknown-key validator for them. The enum
+        // is still treated as an opaque leaf: every `SchemaEnumAccess` variant
+        // arm resolves to `visit_unit` without recursing.
+        visitor.visit_enum(SchemaEnumAccess {
+            variant: variants.first().copied().unwrap_or_default(),
+        })
     }
 
     fn deserialize_identifier<V>(self, visitor: V) -> Result<V::Value, Self::Error>
@@ -6963,7 +6973,12 @@ impl<'de> MapAccess<'de> for SchemaMapAccess {
     }
 }
 
-struct SchemaEnumAccess;
+struct SchemaEnumAccess {
+    /// The variant name to report to serde's derived variant-identifier visitor.
+    /// Must be a REAL variant name (the first declared one), never `""`, or
+    /// serde returns an "unknown variant" error that aborts schema traversal.
+    variant: &'static str,
+}
 
 impl<'de> de::EnumAccess<'de> for SchemaEnumAccess {
     type Error = serde::de::value::Error;
@@ -6973,7 +6988,7 @@ impl<'de> de::EnumAccess<'de> for SchemaEnumAccess {
     where
         V: de::DeserializeSeed<'de>,
     {
-        let val = seed.deserialize(de::value::StrDeserializer::new(""))?;
+        let val = seed.deserialize(de::value::StrDeserializer::new(self.variant))?;
         Ok((val, self))
     }
 }
@@ -7040,6 +7055,39 @@ mod tests {
 
         assert!(keys.contains_key("database"));
         assert!(keys["database"].contains("primary_url"));
+    }
+
+    // Regression (#1608): `server.tls.acme.directory` is the `AcmeDirectory`
+    // enum, declared under `server` — which precedes `database` in `AutumnConfig`.
+    // The `SchemaDeserializer` must treat that enum as an opaque leaf and keep
+    // walking; if it instead errors on the variant tag it aborts the whole
+    // traversal at the enum, dropping `database` (and every later section) from
+    // the derived schema. That silently disables the strict unknown-key validator
+    // for `[database]`, so a typo like `primry_url` stops being flagged.
+    #[cfg(feature = "acme")]
+    #[test]
+    fn acme_enum_field_does_not_truncate_schema_traversal() {
+        let keys = AutumnConfig::get_schema_keys();
+        assert!(
+            keys.contains_key("server.tls.acme"),
+            "acme section must be in the schema"
+        );
+        assert!(
+            keys.contains_key("database"),
+            "database schema dropped: the acme enum truncated traversal"
+        );
+        assert!(keys["database"].contains("primary_url"));
+
+        // The unknown-key validator must still flag a typo in a section declared
+        // after the enum, with the edit-distance suggestion.
+        let errs = AutumnConfig::validate_toml("[database]\nprimry_url = \"x\"\n", &keys);
+        assert_eq!(
+            errs,
+            vec![(
+                "database.primry_url".to_owned(),
+                Some("database.primary_url".to_owned())
+            )]
+        );
     }
 
     #[test]
