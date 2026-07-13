@@ -492,3 +492,99 @@ fn generated_attachment_scaffold_cargo_checks() {
     );
     assert_project_cargo_checks(&project);
 }
+
+/// Issue #1872: the create/update handlers stream each uploaded file to the
+/// blob store *during* multipart parsing — before changeset validation and the
+/// DB write. Every early return after that save (invalid changeset,
+/// unique-violation 422, `into_new` parse failure, generic DB `Err`, the
+/// update's row-load and not-found guard) must best-effort delete the
+/// just-saved blob so an ordinary invalid submission doesn't orphan its upload.
+/// The success path must *not* delete, and a preserved existing blob
+/// (`current.<field>`) is never touched — only the freshly-saved
+/// `<field>_blob`, recorded via `saved_blob_keys`, is cleaned up.
+#[test]
+fn scaffold_attachment_cleans_up_saved_blob_on_early_return() {
+    // `email:String:unique` gives us the unique-violation 422 branch too, so all
+    // four create early returns and all of the update early returns are present.
+    let (_tmp, project) = scaffold_project(
+        "attach-cleanup-app",
+        "Photo",
+        &["caption:String", "image:Attachment", "email:String:unique"],
+    );
+    let routes = fs::read_to_string(project.join("src/routes/photos.rs")).unwrap();
+
+    // Only the freshly-saved blob keys are recorded for cleanup; preserved
+    // existing blobs are never enrolled.
+    assert!(
+        routes.contains("let mut saved_blob_keys: Vec<String> = Vec::new();"),
+        "{routes}"
+    );
+    assert!(
+        routes.contains("saved_blob_keys.push(blob.key.clone());"),
+        "{routes}"
+    );
+    // The cleanup snippet best-effort deletes each saved blob, ignoring the
+    // result so a cleanup failure never masks the original error/response.
+    assert!(
+        routes.contains("for key in &saved_blob_keys {")
+            && routes.contains("let _ = store.delete(key).await;"),
+        "{routes}"
+    );
+
+    let create = handler_body(&routes, "pub async fn create(", "pub async fn update(");
+    // Split create at the success tail: everything up to `flash.success` is the
+    // early-return region, everything after is the success path.
+    let create_success_at = create
+        .find("flash.success(\"Photo created\")")
+        .unwrap_or_else(|| panic!("missing create success in:\n{create}"));
+    let (create_early, create_success) = create.split_at(create_success_at);
+
+    // Cleanup guards every create early return: validation 422, `into_new`
+    // parse failure, the unique-violation 422, and the generic DB `Err`.
+    assert_eq!(
+        create_early
+            .matches("let _ = store.delete(key).await;")
+            .count(),
+        4,
+        "create must clean up the saved blob on all four early returns \
+         (validation, into_new, unique-violation, DB error):\n{create}"
+    );
+    // The success path must NOT delete the blob it just persisted.
+    assert!(
+        !create_success.contains("store.delete("),
+        "create success path must not delete the persisted blob:\n{create_success}"
+    );
+
+    let update = handler_body(&routes, "pub async fn update(", "pub async fn destroy(");
+    let update_success_at = update
+        .find("flash.success(\"Photo updated\")")
+        .unwrap_or_else(|| panic!("missing update success in:\n{update}"));
+    let (update_early, update_success) = update.split_at(update_success_at);
+    // Cleanup guards every update early return: validation 422, the current-row
+    // load, `into_new`, the unique-violation 422, the generic DB `Err`, and the
+    // not-found (`updated == 0`) guard.
+    assert_eq!(
+        update_early
+            .matches("let _ = store.delete(key).await;")
+            .count(),
+        6,
+        "update must clean up the saved blob on all six early returns:\n{update}"
+    );
+    assert!(
+        !update_success.contains("store.delete("),
+        "update success path must not delete the persisted blob:\n{update_success}"
+    );
+
+    // The preserve-on-update bind is untouched: only `image_blob` (the freshly
+    // saved upload) is ever deleted, never the preserved `current.image`.
+    assert!(
+        routes.contains("new.image = image_blob.or(current.image);"),
+        "{routes}"
+    );
+
+    // A plain (non-attachment) scaffold gets none of the cleanup machinery.
+    let (_tmp2, plain) = scaffold_project("plain-cleanup-app", "Article", &["title:String"]);
+    let plain_routes = fs::read_to_string(plain.join("src/routes/articles.rs")).unwrap();
+    assert!(!plain_routes.contains("saved_blob_keys"), "{plain_routes}");
+    assert!(!plain_routes.contains("store.delete("), "{plain_routes}");
+}
