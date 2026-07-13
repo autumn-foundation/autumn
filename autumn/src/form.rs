@@ -457,6 +457,24 @@ impl<T: Serialize> ChangesetForm<T> {
         text_input_htmx(&self.changeset, field, label, validate_url)
     }
 
+    /// Render a labeled `<input type="text">` with htmx inline-validation
+    /// attributes for `field`, excluding the configured submit-token field
+    /// `token_field` from the validation POST.
+    ///
+    /// Delegates to [`text_input_htmx_with_token_field`]; use this when the app
+    /// customizes `[security.submit_token].field_name` (issue #1843). Source the
+    /// name from the [`SubmitFormField`](crate::security::SubmitFormField)
+    /// extractor.
+    pub fn text_input_htmx_with_token_field(
+        &self,
+        field: &str,
+        label: &str,
+        validate_url: &str,
+        token_field: &str,
+    ) -> maud::Markup {
+        text_input_htmx_with_token_field(&self.changeset, field, label, validate_url, token_field)
+    }
+
     /// Render a `<button type="submit">` with `label`.
     pub fn submit_button(&self, label: &str) -> maud::Markup {
         submit_button(label)
@@ -916,12 +934,17 @@ pub fn text_input<T: Serialize>(
 ///
 /// # Custom `field_name` limitation
 ///
-/// The `hx-params` filter hardcodes the **default** field name `_submit_token`.
-/// It excludes only that default from inline htmx validation posts. If you
-/// customize `[security.submit_token].field_name` **and** hand-write a
-/// live-validation form using these helpers, the filter will not exclude your
-/// custom field, so the token leaks into the validation POST and
-/// `SubmitTokenLayer` consumes it. Add your validation route(s) to
+/// This helper hardcodes the **default** submit-token field name
+/// `_submit_token` in its `hx-params` filter, so it excludes only that default
+/// from inline htmx validation posts. If you customize
+/// `[security.submit_token].field_name` **and** hand-write a live-validation
+/// form using these helpers, the filter will not exclude your custom field, so
+/// the token leaks into the validation POST and `SubmitTokenLayer` consumes it.
+///
+/// The proper resolution is [`text_input_htmx_with_token_field`], which takes
+/// the configured field name and filters `not <field_name>` instead. Source
+/// the name at request time from the [`SubmitFormField`](crate::security::SubmitFormField)
+/// extractor. Alternatively, add your validation route(s) to
 /// `[security.submit_token].exempt_paths` so the one-time token is not consumed
 /// by validation requests. Generated scaffolds keep the default field name and
 /// wire their validation routes into `exempt_paths` automatically, so this only
@@ -950,12 +973,66 @@ pub fn text_input_htmx<T: Serialize>(
     label: &str,
     validate_url: &str,
 ) -> maud::Markup {
+    text_input_htmx_with_token_field(
+        changeset,
+        field,
+        label,
+        validate_url,
+        DEFAULT_SUBMIT_TOKEN_FIELD,
+    )
+}
+
+/// The default `[security.submit_token].field_name`, matching
+/// `default_submit_token_field()` in [`crate::security`]. Used by
+/// [`text_input_htmx`] / [`required_text_input_htmx`] to preserve their original
+/// hardcoded `hx-params="not _submit_token"` behaviour when delegating to the
+/// `*_with_token_field` variants.
+#[cfg(feature = "maud")]
+const DEFAULT_SUBMIT_TOKEN_FIELD: &str = "_submit_token";
+
+/// Like [`text_input_htmx`] but excludes the caller-supplied submit-token field
+/// name (`token_field`) from the inline-validation POST instead of the hardcoded
+/// default `_submit_token`.
+///
+/// Use this when the app customizes `[security.submit_token].field_name` and
+/// hand-writes a live-validation form: pass the configured field name so the
+/// emitted `hx-params="not <token_field>"` filter drops the actual one-time
+/// submit-token field. Without this, the token leaks into the validation POST,
+/// `SubmitTokenLayer` consumes it, and the real create/update submit replays the
+/// validation fragment instead of running the mutation (issue #1843).
+///
+/// Callers obtain the configured field name at request time from the
+/// [`SubmitFormField`](crate::security::SubmitFormField) extractor. Passing
+/// `"_submit_token"` here is equivalent to calling [`text_input_htmx`].
+///
+/// # Example
+///
+/// ```rust,ignore
+/// async fn validate_email(
+///     form: ChangesetForm<UserForm>,
+///     SubmitFormField(token_field): SubmitFormField,
+/// ) -> Markup {
+///     text_input_htmx_with_token_field(
+///         &form.changeset, "email", "Email", "/users/validate/email", &token_field,
+///     )
+/// }
+/// ```
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn text_input_htmx_with_token_field<T: Serialize>(
+    changeset: &Changeset<T>,
+    field: &str,
+    label: &str,
+    validate_url: &str,
+    token_field: &str,
+) -> maud::Markup {
     let errors = changeset.errors_for(field);
     let has_errors = !errors.is_empty();
     let value = changeset.field_value(field).unwrap_or_default();
     let error_id = format!("{field}-error");
     let wrapper_id = format!("{field}-field");
     let target = "closest [data-autumn-field-wrapper]";
+    let hx_params = format!("not {token_field}");
 
     maud::html! {
         div id=(wrapper_id) class="autumn-field" data-autumn-field-wrapper=(field) {
@@ -973,7 +1050,7 @@ pub fn text_input_htmx<T: Serialize>(
                 hx-target=(target)
                 hx-swap="outerHTML"
                 hx-include="closest form"
-                hx-params="not _submit_token";
+                hx-params=(hx_params);
             @if has_errors {
                 div id=(error_id) role="alert" class="autumn-field__errors" {
                     @for error in errors {
@@ -994,11 +1071,14 @@ pub fn text_input_htmx<T: Serialize>(
 /// happens to permit an empty string (e.g. a max-only `length` rule) would
 /// let a blank required field through silently.
 ///
-/// Like [`text_input_htmx`], the emitted `hx-params="not _submit_token"` filter
-/// hardcodes the **default** submit-token field name. See
+/// Like [`text_input_htmx`], this helper hardcodes the **default** submit-token
+/// field name in its `hx-params="not _submit_token"` filter. See
 /// [`text_input_htmx`](text_input_htmx#custom-field_name-limitation) for the
-/// custom `[security.submit_token].field_name` caveat and the `exempt_paths`
-/// workaround for hand-written live-validation forms.
+/// custom `[security.submit_token].field_name` caveat. When you customize the
+/// field name, use [`required_text_input_htmx_with_token_field`] (the proper
+/// resolution) or add the validation route(s) to
+/// `[security.submit_token].exempt_paths` (the alternative) for hand-written
+/// live-validation forms.
 #[cfg(feature = "maud")]
 #[must_use]
 pub fn required_text_input_htmx<T: Serialize>(
@@ -1007,12 +1087,40 @@ pub fn required_text_input_htmx<T: Serialize>(
     label: &str,
     validate_url: &str,
 ) -> maud::Markup {
+    required_text_input_htmx_with_token_field(
+        changeset,
+        field,
+        label,
+        validate_url,
+        DEFAULT_SUBMIT_TOKEN_FIELD,
+    )
+}
+
+/// Like [`required_text_input_htmx`] but excludes the caller-supplied
+/// submit-token field name (`token_field`) from the inline-validation POST
+/// instead of the hardcoded default `_submit_token`.
+///
+/// This is the required-field counterpart of
+/// [`text_input_htmx_with_token_field`]; see that function for the full
+/// rationale (issue #1843) and how to source the configured field name from the
+/// [`SubmitFormField`](crate::security::SubmitFormField) extractor. Passing
+/// `"_submit_token"` here is equivalent to calling [`required_text_input_htmx`].
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn required_text_input_htmx_with_token_field<T: Serialize>(
+    changeset: &Changeset<T>,
+    field: &str,
+    label: &str,
+    validate_url: &str,
+    token_field: &str,
+) -> maud::Markup {
     let errors = changeset.errors_for(field);
     let has_errors = !errors.is_empty();
     let value = changeset.field_value(field).unwrap_or_default();
     let error_id = format!("{field}-error");
     let wrapper_id = format!("{field}-field");
     let target = "closest [data-autumn-field-wrapper]";
+    let hx_params = format!("not {token_field}");
 
     maud::html! {
         div id=(wrapper_id) class="autumn-field" data-autumn-field-wrapper=(field) {
@@ -1032,7 +1140,7 @@ pub fn required_text_input_htmx<T: Serialize>(
                 hx-target=(target)
                 hx-swap="outerHTML"
                 hx-include="closest form"
-                hx-params="not _submit_token";
+                hx-params=(hx_params);
             @if has_errors {
                 div id=(error_id) role="alert" class="autumn-field__errors" {
                     @for error in errors {
@@ -3607,6 +3715,76 @@ mod tests {
         assert!(
             required.contains(r#"hx-params="not _submit_token""#),
             "{required}"
+        );
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn text_input_htmx_with_token_field_filters_custom_field() {
+        // When the app customizes `[security.submit_token].field_name`, the
+        // `*_with_token_field` variants must exclude the configured field name
+        // from the inline-validation POST (issue #1843), not the default.
+        #[derive(serde::Serialize)]
+        struct F {
+            name: String,
+        }
+        let cs = Changeset::new(F {
+            name: String::new(),
+        });
+        let plain =
+            text_input_htmx_with_token_field(&cs, "name", "Name", "/validate/name", "csrf_tok")
+                .into_string();
+        assert!(plain.contains(r#"hx-params="not csrf_tok""#), "{plain}");
+        assert!(!plain.contains("_submit_token"), "{plain}");
+
+        let required = required_text_input_htmx_with_token_field(
+            &cs,
+            "name",
+            "Name",
+            "/validate/name",
+            "csrf_tok",
+        )
+        .into_string();
+        assert!(
+            required.contains(r#"hx-params="not csrf_tok""#),
+            "{required}"
+        );
+        assert!(!required.contains("_submit_token"), "{required}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn with_token_field_default_matches_legacy_helpers() {
+        // Passing the default field name reproduces the original hardcoded
+        // `hx-params="not _submit_token"` behaviour, guarding backward compat.
+        #[derive(serde::Serialize)]
+        struct F {
+            name: String,
+        }
+        let cs = Changeset::new(F {
+            name: String::new(),
+        });
+        assert_eq!(
+            text_input_htmx_with_token_field(
+                &cs,
+                "name",
+                "Name",
+                "/validate/name",
+                "_submit_token"
+            )
+            .into_string(),
+            text_input_htmx(&cs, "name", "Name", "/validate/name").into_string(),
+        );
+        assert_eq!(
+            required_text_input_htmx_with_token_field(
+                &cs,
+                "name",
+                "Name",
+                "/validate/name",
+                "_submit_token",
+            )
+            .into_string(),
+            required_text_input_htmx(&cs, "name", "Name", "/validate/name").into_string(),
         );
     }
 
