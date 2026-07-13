@@ -1271,6 +1271,7 @@ fn validate_enum_field_collisions(
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 pub fn parse_model_metadata(
     fields: &[Field],
     options: &ModelOptions,
@@ -1372,6 +1373,28 @@ pub fn parse_model_metadata(
              yet support `{}` ids (the repository's `search_page` is hardcoded to `i64`). \
              Re-run without `--searchable`, or use the default `--id bigint` primary key.",
             options.id_type.rust_type()
+        )));
+    }
+
+    // `search_vector` is the generated FTS column name, hardcoded by the
+    // repository macro (`ADD COLUMN search_vector tsvector` in the appended
+    // migration, and the `search_vector @@ …` queries in `search_page`). If the
+    // model also declares its own field named `search_vector`, the create-table
+    // SQL emits that column first and the FTS migration then fails to add it
+    // (duplicate column) at `autumn migrate`. Reserve the name for searchable
+    // models and reject up front (case-insensitive; only relevant with
+    // `--searchable` — a `search_vector` field is harmless otherwise).
+    if !options.searchable.is_empty()
+        && let Some(field) = fields
+            .iter()
+            .find(|f| f.name.eq_ignore_ascii_case("search_vector"))
+    {
+        return Err(GenerateError::Config(format!(
+            "`{}` is a reserved column name for `--searchable` models: `search_vector` is \
+             the generated tsvector column the FTS migration adds, so a model field of the \
+             same name collides with it (duplicate column at `autumn migrate`). Rename the \
+             field, or drop `--searchable`.",
+            field.name
         )));
     }
 
@@ -2485,6 +2508,43 @@ mod tests {
                 && msg.contains("uuid::Uuid"),
             "error must explain the i64-primary-key requirement and name the uuid type: {msg}"
         );
+    }
+
+    /// Issue #1319: a model field named `search_vector` collides with the
+    /// generated tsvector column the FTS migration adds, so pairing it with
+    /// `--searchable` is rejected up front. (Field names parse as lowercase
+    /// `snake_case`, so the guard's `eq_ignore_ascii_case` is defensive; the
+    /// reachable case is a lowercase `search_vector` field.)
+    #[test]
+    fn searchable_with_search_vector_field_is_rejected() {
+        let fields = parse_fields(&["title:String".into(), "search_vector:String".into()]).unwrap();
+        let err = parse_model_metadata(
+            &fields,
+            &ModelOptions {
+                searchable: vec!["title".into()],
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            matches!(err, GenerateError::Config(_)),
+            "expected Config error, got: {err:?}"
+        );
+        assert!(
+            msg.contains("search_vector") && msg.contains("reserved"),
+            "error must flag `search_vector` as reserved: {msg}"
+        );
+    }
+
+    /// A `search_vector` field WITHOUT `--searchable` is harmless and accepted
+    /// (the name is only reserved for full-text-search models).
+    #[test]
+    fn search_vector_field_without_searchable_is_accepted() {
+        let fields = parse_fields(&["title:String".into(), "search_vector:String".into()]).unwrap();
+        let metadata = parse_model_metadata(&fields, &ModelOptions::default())
+            .expect("search_vector without --searchable must be accepted");
+        assert!(metadata.searchable().is_empty());
     }
 
     /// A uuid primary key WITHOUT `--searchable` stays valid (the guard only
