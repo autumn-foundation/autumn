@@ -2255,13 +2255,19 @@ fn render_routes_file(
                 "        let {name}_options = {name}_select_options(&mut db).await?;"
             );
         }
+        // Issue #1706: the primary submit control is emitted through the typed
+        // `autumn_web::a11y::Button` primitive, whose constructor requires an
+        // accessible name — a nameless submit button is a compile error in the
+        // generated app. The destructive delete button below stays raw markup:
+        // it carries an `onclick` confirm the current `Button` API can't express,
+        // and converting would drop the confirmation guard.
         let new_form_layout = format!(
             "{layout_fn}(\"New {pascal_name}\", {cp_new}{flash_arg}, html! {{\n        \
              h1 {{ \"New {pascal_name}\" }}\n        \
              form action=(paths::create()) method=\"post\"{form_enctype} {{\n            \
              (csrf_input(csrf.as_ref(), csrf_field.as_ref()))\n            \
              (submit_token_input(submit_token.as_ref(), submit_field.as_ref()))\n{changeset_inputs}            \
-             button type=\"submit\" {{ \"Create\" }}\n        \
+             (autumn_web::a11y::Button::new(\"Create\").submit())\n        \
              }}\n    \
              }})"
         );
@@ -2271,7 +2277,7 @@ fn render_routes_file(
              form action=(paths::update(*id)) method=\"post\"{form_enctype} {{\n            \
              (csrf_input(csrf.as_ref(), csrf_field.as_ref()))\n            \
              (submit_token_input(submit_token.as_ref(), submit_field.as_ref()))\n{changeset_inputs}            \
-             button type=\"submit\" {{ \"Save\" }}\n        \
+             (autumn_web::a11y::Button::new(\"Save\").submit())\n        \
              }}\n        \
              form action=(paths::delete(*id)) method=\"post\" {{\n            \
              (csrf_input(csrf.as_ref(), csrf_field.as_ref()))\n            \
@@ -2692,7 +2698,7 @@ pub async fn index(
     let page_data: Page<{pascal_name}> = Page::new(items, total, &page_req);
 {index_label_loads}{index_columns_labeled}    Ok({layout_fn}("{pascal_name} index", {cp_index}{flash_arg}, html! {{
         h1 {{ "{pascal_name}s" }}
-        a href="/{plural}/new" {{ "New {pascal_name}" }}
+        (autumn_web::a11y::Link::new("/{plural}/new", "New {pascal_name}"))
         {list_render}
         (pagination_nav(&page_data, &PagerOptions::new("/{plural}")))
     }}))
@@ -2716,7 +2722,7 @@ pub async fn index(
     let page_data: Page<{pascal_name}> = repo.page(&page_req).await?;
     Ok({layout_fn}("{pascal_name} index", {cp_index}{flash_arg}, html! {{
         h1 {{ "{pascal_name}s" }}
-        a href=(paths::new()) {{ "New {pascal_name}" }}
+        (autumn_web::a11y::Link::new(paths::new(), "New {pascal_name}"))
         {index_list_block}
     }}))
 }}"#
@@ -2743,7 +2749,7 @@ pub async fn index(
     let pager_query = raw_query.as_deref().unwrap_or("");
 {index_label_loads}{index_columns_labeled}    Ok({layout_fn}("{pascal_name} index", {cp_index}{flash_arg}, html! {{
         h1 {{ "{pascal_name}s" }}
-        a href=(paths::new()) {{ "New {pascal_name}" }}
+        (autumn_web::a11y::Link::new(paths::new(), "New {pascal_name}"))
         {index_list_block}
     }}))
 }}"#
@@ -2765,7 +2771,7 @@ pub async fn index(
     let page_data: Page<{pascal_name}> = repo.page(&page_req).await?;
     Ok({layout_fn}("{pascal_name} index", {cp_index}{flash_arg}, html! {{
         h1 {{ "{pascal_name}s" }}
-        a href=(paths::new()) {{ "New {pascal_name}" }}
+        (autumn_web::a11y::Link::new(paths::new(), "New {pascal_name}"))
         {index_list_block}
     }}))
 }}"#
@@ -2790,7 +2796,7 @@ pub async fn index(
     let pager_query = raw_query.as_deref().unwrap_or("");
 {index_label_loads}{index_columns_labeled}    Ok({layout_fn}("{pascal_name} index", {cp_index}{flash_arg}, html! {{
         h1 {{ "{pascal_name}s" }}
-        a href=(paths::new()) {{ "New {pascal_name}" }}
+        (autumn_web::a11y::Link::new(paths::new(), "New {pascal_name}"))
         {index_list_block}
     }}))
 }}"#
@@ -3033,7 +3039,7 @@ pub async fn search(
     }}
     Ok({layout_fn}("Search {pascal_name}s", {cp_index}{flash_arg}, html! {{
         h1 {{ "Search {pascal_name}s" }}
-        a href="/{plural}" {{ "Back to list" }}
+        (autumn_web::a11y::Link::new("/{plural}", "Back to list"))
         div id="{plural}-search-results" {{ (results) }}
     }}))
 }}"#
@@ -3189,9 +3195,9 @@ pub async fn show(id: Path<{id_rust}>, mut db: {db_ty}, flash: Flash) -> AutumnR
     Ok({layout_fn}(&format!("{pascal_name} #{{}}", row.id), {cp_show}{flash_arg}, html! {{
         h1 {{ "{pascal_name} #" (row.id) }}
         (autumn_web::widgets::property_list(&props))
-        a href=(paths::index()) {{ "Back to list" }}
+        (autumn_web::a11y::Link::new(paths::index(), "Back to list"))
         " "
-        a href=(paths::edit(row.id)) {{ "Edit" }}
+        (autumn_web::a11y::Link::new(paths::edit(row.id), "Edit"))
     }}))
 }}
 
@@ -4315,7 +4321,7 @@ fn render_columns_vec(
     // Show link column
     let _ = writeln!(
         out,
-        "        autumn_web::widgets::Column::new(\"\", |row: &{pascal_name}| maud::html! {{ a href=(paths::show(row.id)) {{ \"Show\" }} }}),"
+        "        autumn_web::widgets::Column::new(\"\", |row: &{pascal_name}| maud::html! {{ (autumn_web::a11y::Link::new(paths::show(row.id), \"Show\")) }}),"
     );
     let _ = writeln!(out, "    ];");
     out
