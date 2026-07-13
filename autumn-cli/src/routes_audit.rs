@@ -302,7 +302,6 @@ fn build_headers_dimension(h: &HeadersDump) -> HeadersDimension {
 
     let mut entries = vec![
         header_entry("content_security_policy", h.content_security_policy.clone()),
-        header_entry("csp_nonce", bool_header(h.csp_nonce, "enabled")),
         header_entry("permissions_policy", h.permissions_policy.clone()),
         header_entry("referrer_policy", h.referrer_policy.clone()),
         header_entry("strict_transport_security", hsts_value),
@@ -1058,6 +1057,48 @@ mod tests {
         assert_eq!(
             entry["emitted"], false,
             "an invalid (unparseable) header value must not be reported as emitted"
+        );
+    }
+
+    /// Finding E: `csp_nonce` is a config toggle that shapes the CSP *value*, not
+    /// a response header. Runtime stores the nonce in request extensions and
+    /// substitutes it into `Content-Security-Policy`; it never emits a `csp_nonce`
+    /// header. The `security_headers` dimension must therefore carry no
+    /// `csp_nonce` entry, while the nonce toggle's effect stays visible through
+    /// the nonce-aware `content_security_policy` value.
+    #[test]
+    fn csp_nonce_is_not_reported_as_an_emitted_header() {
+        let routes = vec![route("GET", "/page", "page", "public")];
+        // Mirror `SecurityDump::from_config` for a nonce-enabled app on the
+        // default CSP: `csp_nonce = true` and `content_security_policy` resolved
+        // to the nonce-aware template (see `resolved_content_security_policy`).
+        let mut sec = security_dump(true, &[]);
+        sec.headers.csp_nonce = true;
+        sec.headers.content_security_policy =
+            "style-src 'self' 'nonce-AUTUMN_CSP_NONCE'; script-src 'self' 'nonce-AUTUMN_CSP_NONCE'"
+                .to_owned();
+        let json = manifest_value(&build_manifest(&routes, Some(&sec)));
+
+        let entries = json["dimensions"]["security_headers"]["entries"]
+            .as_array()
+            .unwrap();
+        assert!(
+            !entries.iter().any(|e| e["header"] == "csp_nonce"),
+            "csp_nonce is not a response header and must not appear in security_headers"
+        );
+
+        // The nonce toggle's effect remains observable via the CSP entry value.
+        let csp = entries
+            .iter()
+            .find(|e| e["header"] == "content_security_policy")
+            .expect("content_security_policy entry present");
+        assert_eq!(csp["emitted"], true);
+        assert!(
+            csp["value"]
+                .as_str()
+                .unwrap()
+                .contains("'nonce-AUTUMN_CSP_NONCE'"),
+            "the nonce-aware CSP template must remain visible in the CSP value: {csp}"
         );
     }
 
