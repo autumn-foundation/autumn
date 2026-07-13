@@ -261,6 +261,83 @@ fn rate_limit_bucket_single_winner() {
     });
 }
 
+/// Models the `MemoryStore::decide` rate limit bucket time-warp race condition.
+///
+/// In `MemoryStore::decide`, `now = Instant::now()` is called OUTSIDE the bucket
+/// lock. Thread A can capture a very early `now` and stall. Thread B captures a later
+/// `now`, runs `decide`, consumes tokens, and updates `last_refill` to its later `now`.
+/// Thread A then wakes up, locks the bucket, and applies its EARLY `now`.
+///
+/// `bucket.tokens = elapsed.mul_add(refill_per_sec, bucket.tokens).min(burst);`
+/// (elapsed is 0 because `saturating_duration_since` on a future `last_refill` is 0)
+///
+/// Then thread A does `bucket.last_refill = now` (the EARLY `now`).
+/// This clobbers thread B's later `last_refill` with an older timestamp.
+/// The next request will observe an artificially long `elapsed` duration because the
+/// `last_refill` was time-warped backwards, granting full tokens immediately and breaking
+/// the rate limit envelope.
+#[test]
+fn rate_limit_time_warp() {
+    let show_bug = std::env::var_os("RATE_LIMIT_LOOM_SHOW_BUG").is_some();
+    loom::model(move || {
+        // Models `Instant` using an integer
+        let bucket_tokens = Arc::new(Mutex::new(0.0));
+        let bucket_last_refill = Arc::new(Mutex::new(0));
+
+        let t1 = {
+            let tokens = bucket_tokens.clone();
+            let last_refill = bucket_last_refill.clone();
+            thread::spawn(move || {
+                let now = 10;
+                let mut guard_t = tokens.lock().unwrap();
+                let mut guard_l = last_refill.lock().unwrap();
+
+                // simulate elapsed logic
+                let elapsed = if now > *guard_l { now - *guard_l } else { 0 };
+                *guard_t = (*guard_t + elapsed as f64).min(5.0);
+
+                if show_bug {
+                    // BUGGY: update last_refill to our captured `now` regardless of what it was
+                    *guard_l = now;
+                } else {
+                    // FIXED: update last_refill to `now` ONLY IF `now` is >= current last_refill
+                    *guard_l = std::cmp::max(*guard_l, now);
+                }
+            })
+        };
+
+        let t2 = {
+            let tokens = bucket_tokens.clone();
+            let last_refill = bucket_last_refill.clone();
+            thread::spawn(move || {
+                let now = 20; // happens later
+                let mut guard_t = tokens.lock().unwrap();
+                let mut guard_l = last_refill.lock().unwrap();
+
+                let elapsed = if now > *guard_l { now - *guard_l } else { 0 };
+                *guard_t = (*guard_t + elapsed as f64).min(5.0);
+
+                if show_bug {
+                    *guard_l = now;
+                } else {
+                    *guard_l = std::cmp::max(*guard_l, now);
+                }
+            })
+        };
+
+        t1.join().unwrap();
+        t2.join().unwrap();
+
+        // The time should not go backwards. Thread 2 happened at T=20, so the max observed time
+        // must be retained to prevent time warping backwards to T=10 if Thread 1 won the lock last.
+        assert_eq!(
+            *bucket_last_refill.lock().unwrap(),
+            20,
+            "last_refill must not travel backwards"
+        );
+    });
+}
+
 /// Models the exactly-once `requests_active` decrement across the
 /// `MetricsFuture` completion race.
 ///
