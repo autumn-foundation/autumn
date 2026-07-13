@@ -1014,31 +1014,26 @@ fn walk(
 
 fn apply_rules(el: &Element, file: &str, ctx: &LabelCtx, scan: &mut Scan) {
     match el.name.to_ascii_lowercase().as_str() {
-        "img" => {
-            // An `<img>` is named by `alt` (even empty `alt=""`, the decorative
-            // marker), or — per the axe `image-alt` checks — by an
-            // `aria-label`/`aria-labelledby`, a non-empty `title`, or an explicit
-            // presentational role. Only a bare image with none of these is flagged.
+        // An `<img>` is named by `alt` (even empty `alt=""`, the decorative
+        // marker), or — per the axe `image-alt` checks — by an
+        // `aria-label`/`aria-labelledby`, a non-empty `title`, or an explicit
+        // presentational role. Only a bare image with none of these is flagged.
+        "img"
             if !el.has_attr("alt")
                 && !el.has_aria_name()
                 && !el.has_title_name()
-                && !is_presentational(el)
-            {
-                scan.push(Rule::ImageAlt, "img", el.line, file);
-            }
+                && !is_presentational(el) =>
+        {
+            scan.push(Rule::ImageAlt, "img", el.line, file);
         }
         name @ ("input" | "select" | "textarea") => {
             check_field(el, name, file, ctx, scan);
         }
-        "button" => {
-            if !named_content(el) {
-                scan.push(Rule::ButtonName, "button", el.line, file);
-            }
+        "button" if !named_content(el) => {
+            scan.push(Rule::ButtonName, "button", el.line, file);
         }
-        "a" => {
-            if el.has_attr("href") && !named_content(el) {
-                scan.push(Rule::LinkName, "a", el.line, file);
-            }
+        "a" if el.has_attr("href") && !named_content(el) => {
+            scan.push(Rule::LinkName, "a", el.line, file);
         }
         _ => {}
     }
