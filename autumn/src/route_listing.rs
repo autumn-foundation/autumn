@@ -589,6 +589,23 @@ pub(crate) fn append_framework_routes(
         }
     }
 
+    // Framework-owned RFC 8058 one-click unsubscribe endpoint. Runtime merges
+    // `unsubscribe_router()` — a GET and a POST at `UNSUBSCRIBE_PATH` — under the
+    // same `mail`-feature gate and `should_mount_unsubscribe_endpoint()` predicate
+    // that folds the path into `csrf.exempt_paths`, so list both methods here to
+    // keep the manifest in lockstep. Without the POST listed, `build_csrf_dimension`
+    // would silently under-report the exempt (not-enforced) mutating route.
+    #[cfg(feature = "mail")]
+    if config.mail.should_mount_unsubscribe_endpoint() {
+        for http_method in ["GET", "POST"] {
+            infos.push(RouteInfo::framework_route(
+                http_method,
+                crate::mail::UNSUBSCRIBE_PATH.to_owned(),
+                "unsubscribe",
+            ));
+        }
+    }
+
     // Widget story gallery routes (#1526), listed iff the resolved config
     // enables them (same gating condition as the router mount).
     #[cfg(feature = "maud")]
@@ -1350,6 +1367,53 @@ mod tests {
         assert!(
             !paths.contains(&"/_stories/{slug}"),
             "disabled stories must not list the detail route: {paths:?}"
+        );
+    }
+
+    /// Codex P2 (issue #1627): when the RFC 8058 one-click unsubscribe endpoint
+    /// is mounted, runtime merges `unsubscribe_router()` — a GET and a POST at
+    /// `UNSUBSCRIBE_PATH` — and exempts the path from CSRF. `append_framework_routes`
+    /// must list both methods (matching the same `should_mount_unsubscribe_endpoint()`
+    /// predicate the exempt fold uses) so the csrf posture dimension can see the
+    /// mutating POST. When the endpoint is not mounted, neither route is listed.
+    #[cfg(feature = "mail")]
+    #[test]
+    fn append_framework_routes_includes_mounted_unsubscribe_routes() {
+        let mut config = AutumnConfig::default();
+        config.mail.mount_unsubscribe_endpoint = true;
+        config.mail.unsubscribe_base_url = Some("https://example.com".to_owned());
+        assert!(
+            config.mail.should_mount_unsubscribe_endpoint(),
+            "test precondition: unsubscribe endpoint must be mounted"
+        );
+        let mut infos = Vec::new();
+        append_framework_routes(&mut infos, &config);
+
+        assert!(
+            infos.iter().any(|i| i.method == "POST"
+                && i.path == crate::mail::UNSUBSCRIBE_PATH
+                && i.classification == RouteClassification::Framework),
+            "expected POST {} framework route: {infos:?}",
+            crate::mail::UNSUBSCRIBE_PATH
+        );
+        assert!(
+            infos.iter().any(|i| i.method == "GET"
+                && i.path == crate::mail::UNSUBSCRIBE_PATH
+                && i.classification == RouteClassification::Framework),
+            "expected GET {} framework route: {infos:?}",
+            crate::mail::UNSUBSCRIBE_PATH
+        );
+
+        // When the endpoint is NOT mounted, neither route is listed.
+        let plain = AutumnConfig::default();
+        assert!(!plain.mail.should_mount_unsubscribe_endpoint());
+        let mut infos = Vec::new();
+        append_framework_routes(&mut infos, &plain);
+        assert!(
+            !infos
+                .iter()
+                .any(|i| i.path == crate::mail::UNSUBSCRIBE_PATH),
+            "unmounted unsubscribe path must not be listed: {infos:?}"
         );
     }
 

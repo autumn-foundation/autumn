@@ -1221,6 +1221,44 @@ mod tests {
         );
     }
 
+    /// The framework-owned RFC 8058 one-click unsubscribe endpoint is mounted as
+    /// a GET + POST at `/_autumn/unsubscribe` and its path is folded into the
+    /// dump's `csrf.exempt_paths` (by `SecurityDump::from_config`). Once the POST
+    /// route is listed by `append_framework_routes`, the csrf dimension must show
+    /// it as present-but-exempt: `csrf_enforced == false && exempt == true`,
+    /// matching runtime (which exempts the path from CSRF). Underreporting it
+    /// would hide a mutating route from the posture manifest.
+    #[test]
+    fn unsubscribe_exempt_path_marks_post_unenforced() {
+        // Path literal mirrors `autumn_web::mail::UNSUBSCRIBE_PATH`; kept literal
+        // so this dimension-level test does not require the `mail` feature.
+        let routes = vec![route(
+            "POST",
+            "/_autumn/unsubscribe",
+            "unsubscribe",
+            "framework",
+        )];
+        let sec = security_dump(true, &["/_autumn/unsubscribe"]);
+        let manifest = build_manifest(&routes, Some(&sec));
+        let entry = &manifest.dimensions.csrf.entries[0];
+        assert_eq!(entry.path, "/_autumn/unsubscribe");
+        assert_eq!(entry.method, "POST");
+        assert!(entry.exempt, "mounted unsubscribe path must be exempt");
+        assert!(
+            !entry.csrf_enforced,
+            "runtime exempts the unsubscribe endpoint from CSRF, so csrf_enforced must be false"
+        );
+        assert!(
+            manifest
+                .dimensions
+                .csrf
+                .exempt_paths
+                .iter()
+                .any(|p| p == "/_autumn/unsubscribe"),
+            "dimension exempt_paths must record the unsubscribe path"
+        );
+    }
+
     /// AC-6: two builds of identical source + config produce byte-identical
     /// manifest JSON.
     #[test]
