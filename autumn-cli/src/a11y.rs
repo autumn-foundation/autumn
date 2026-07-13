@@ -486,7 +486,14 @@ fn skip_control(trees: &[TokenTree], start: usize, nodes: &mut Vec<Node>) -> usi
             TokenTree::Group(g) if g.delimiter() == Delimiter::Brace => {
                 nodes.extend(parse_markup(&g.stream()));
                 i += 1;
-                if matches!(trees.get(i), Some(TokenTree::Punct(p)) if p.as_char() == '@') {
+                // Only `@else` continues this chain. Any other `@`-control
+                // (`@let`/`@if`/`@for`/`@match`) is a sibling that must be
+                // returned to `parse_nodes` so it hits its proper handler —
+                // consuming it here would misparse e.g. a following `@let`'s
+                // struct-literal initializer as markup.
+                if matches!(trees.get(i), Some(TokenTree::Punct(p)) if p.as_char() == '@')
+                    && matches!(trees.get(i + 1), Some(TokenTree::Ident(id)) if *id == "else")
+                {
                     i += 1;
                     continue;
                 }
@@ -943,7 +950,10 @@ fn is_aria_hidden(el: &Element) -> bool {
 /// per ARIA their text does not count toward the ancestor's accessible name.
 fn content_provides_name(nodes: &[Node]) -> bool {
     nodes.iter().any(|n| match n {
-        Node::Dynamic { .. } => true,
+        // Only a genuine `(expr)`/`[..]` splice renders text that could name the
+        // control; an `@`-control head (`splice: false`) renders nothing itself
+        // (its branch bodies were already parsed out), so it is not a name.
+        Node::Dynamic { splice } => *splice,
         Node::Text(t) => !t.trim().is_empty(),
         Node::Element(e) if is_aria_hidden(e) => false,
         Node::Element(e) => {
@@ -1262,6 +1272,26 @@ mod tests {
         assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
     }
 
+    #[test]
+    fn button_with_only_control_head_is_flagged() {
+        // The only child is an `@if` control HEAD (`splice: false`), whose branch
+        // bodies were parsed out — it renders no accessible text. A definitively
+        // nameless button must still be flagged (regression: false negative — a
+        // control head was wrongly counted as a name).
+        let src = wrap(r"button { @if disabled { } }");
+        let f = findings_for(&src);
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert_eq!(f[0].rule_id, "button-name");
+    }
+
+    #[test]
+    fn button_with_real_splice_content_is_clean() {
+        // A genuine `(expr)` splice body could render the button's name, so it is
+        // treated as named (unchanged; guards against over-correcting the head fix).
+        let src = wrap(r"button { (label) }");
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+    }
+
     // ── Rule 4: link-name ──────────────────────────────────────────────────
 
     #[test]
@@ -1342,6 +1372,16 @@ mod tests {
         // hidden-excluding name walk as buttons/links, so the field is FLAGGED
         // (regression: false negative — hidden text was wrongly accepted).
         let src = wrap(r#"label for="q" { span aria-hidden="true" { "Search" } } input id="q";"#);
+        assert_eq!(rule_ids(&src), vec!["label"], "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn label_with_only_control_head_does_not_satisfy_association() {
+        // The `<label>` body is only an `@if` control HEAD (`splice: false`),
+        // which renders no accessible name — so the associated field must still be
+        // FLAGGED (regression: false negative — a control head was wrongly counted
+        // as a name).
+        let src = wrap(r#"label for="q" { @if show { } } input id="q";"#);
         assert_eq!(rule_ids(&src), vec!["label"], "{:?}", findings_for(&src));
     }
 
@@ -1452,6 +1492,24 @@ mod tests {
         // A plain (non-struct) `@let` initializer parses without panicking.
         let src = wrap(r#"@let x = foo(); div { "ok" }"#);
         assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn let_after_control_reaches_its_skip_handler() {
+        // Regression: only `@else` continues a control chain. A `@let` following a
+        // parsed control block must be returned to `parse_nodes` so it hits
+        // `skip_let` — otherwise its `Field { input: true }` struct literal is
+        // misparsed as markup and fires a bogus `<input>` finding (false positive).
+        let src = wrap(r#"@if show { "ok" } @let props = Field { input: true };"#);
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn if_else_chain_still_parses_and_flags_real_input() {
+        // A genuine `@if … @else …` chain still parses across the `@else`, and a
+        // real unlabeled `<input>` in the `@if` body is still flagged.
+        let src = wrap(r#"@if c { input; } @else { "x" }"#);
+        assert_eq!(rule_ids(&src), vec!["label"], "{:?}", findings_for(&src));
     }
 
     #[test]
