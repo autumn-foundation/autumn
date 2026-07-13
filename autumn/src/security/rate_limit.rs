@@ -1089,6 +1089,18 @@ pub fn __throttle_registry_reset() {
     }
 }
 
+/// Process-global lock serializing tests that exercise the shared
+/// `#[throttle]` limiter registry.
+///
+/// Because [`__throttle_registry_reset`] clears the entire process-wide
+/// registry, a test that resets mid-run could drop a limiter another test is
+/// concurrently relying on, and per-principal buckets can otherwise bleed
+/// between the parallel integration tests. Each registry-touching test takes
+/// this lock FIRST, then resets, and holds the guard for the whole test so no
+/// sibling mutates the registry during its assertions. Mirrors
+/// [`crate::circuit_breaker::TEST_LOCK`].
+pub static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn build_throttle_limiter(
     global: &RateLimitConfig,
     trusted_proxies: &TrustedProxiesConfig,
