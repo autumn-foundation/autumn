@@ -2173,8 +2173,12 @@ where
 {
     // CSRF middleware (only applied when enabled)
     if config.security.csrf.enabled {
-        let mut csrf_layer = crate::security::CsrfLayer::from_config(&config.security.csrf)
-            .with_max_scan_bytes(config.security.upload.max_request_size_bytes);
+        // The CSRF token scan reads only a bounded prefix of the body
+        // (`security.csrf.token_scan_bytes`, 2 MiB default) and streams the
+        // remainder through, so the cap comes from CSRF config — NOT from
+        // `upload.max_request_size_bytes` (which would force whole uploads into
+        // memory and defeat the streaming upload path).
+        let mut csrf_layer = crate::security::CsrfLayer::from_config(&config.security.csrf);
         if let Some(keys) = signing_keys {
             csrf_layer = csrf_layer.with_signing_keys(keys);
         }

@@ -13,6 +13,25 @@
 //!    `_csrf` form field).
 //! 3. Safe methods (GET, HEAD, OPTIONS, TRACE) are exempt.
 //!
+//! # Body-token scanning
+//!
+//! When the token is carried in a urlencoded / multipart **form body** (rather
+//! than the header or query string), the layer scans only a bounded **prefix**
+//! of the body — at most `security.csrf.token_scan_bytes` (2 MiB by default) —
+//! to locate the `_csrf` field. The remainder of the body is **streamed
+//! through unbuffered** to the handler, so a large file upload is never fully
+//! copied into memory by this layer (which would otherwise be a DoS-shaped
+//! memory cost and would defeat the streaming upload path).
+//!
+//! **Token-early constraint:** the `_csrf` token must therefore appear within
+//! the first `token_scan_bytes` of the body. Scaffolded forms emit the hidden
+//! `_csrf` field *before* any file field, so they are always safe. Hand-written
+//! forms that place large fields ahead of `_csrf` should move the token earlier
+//! or raise the cap. A body whose token sits beyond the prefix is treated as a
+//! missing token (403); a genuinely oversized upload is rejected downstream by
+//! the real body / upload limits (the natural `413`), which is where that
+//! belongs.
+//!
 //! # Configuration
 //!
 //! See [`CsrfConfig`] for available settings.
@@ -47,8 +66,10 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
+use axum::body::{Body, Bytes};
 use axum::extract::{FromRequestParts, OptionalFromRequestParts};
 use axum::http::{Request, Response, StatusCode};
+use futures::StreamExt as _;
 use http::header::HeaderName;
 
 use tower::{Layer, Service};
@@ -59,43 +80,18 @@ use super::config::CsrfConfig;
 /// Error body returned with a `403 Forbidden` when CSRF validation fails.
 const CSRF_FORBIDDEN_MESSAGE: &str = "CSRF token missing or invalid";
 
-/// Error body returned with a `413 Payload Too Large` when the form body carrying
-/// the `_csrf` token exceeds the configured scan cap (see [`CsrfVerdict`]).
-const CSRF_PAYLOAD_TOO_LARGE_MESSAGE: &str = "Request body exceeds the maximum allowed size";
-
 /// Outcome of CSRF verification for a mutating request.
 enum CsrfVerdict {
     /// A matching token was found — allow the request through.
     Valid,
     /// No valid token was presented — reject with `403 Forbidden`.
+    ///
+    /// This also covers the case where a form-body token exists but sits beyond
+    /// the scanned prefix (`max_scan_bytes`): the token is simply not observed,
+    /// so the request is rejected like any other missing token. A genuinely
+    /// oversized body streams through and is bounded downstream by the real
+    /// body / upload limits.
     Missing,
-    /// The urlencoded/multipart form body carrying the token exceeded
-    /// `max_scan_bytes`, so `to_bytes` could not buffer it to locate the
-    /// `_csrf` field. Reject with `413 Payload Too Large` rather than a
-    /// misleading `403` "missing token": the body genuinely is over the
-    /// request-size limit, and the intended `413` would otherwise be
-    /// unobservable because this CSRF layer short-circuits before the upload
-    /// extractor/body-limit can surface it (see issue #1866).
-    BodyTooLarge,
-}
-
-/// Return `true` when `err` (from [`axum::body::to_bytes`]) was caused by the
-/// scan-cap length limit being exceeded, as opposed to some other body read
-/// error (e.g. a client disconnect mid-body).
-///
-/// `to_bytes` wraps the limit failure as an [`http_body_util::LengthLimitError`]
-/// in the error's source chain (see the axum `to_bytes` docs). We walk the whole
-/// chain and downcast so the detection stays robust even if axum adds wrapping
-/// layers.
-fn is_body_length_limit_error(err: &axum::Error) -> bool {
-    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(err);
-    while let Some(err) = source {
-        if err.is::<http_body_util::LengthLimitError>() {
-            return true;
-        }
-        source = err.source();
-    }
-    false
 }
 
 /// The configured CSRF form field name, placed in request extensions by [`CsrfLayer`].
@@ -295,26 +291,9 @@ impl CsrfLayer {
                 safe_methods,
                 exempt_paths: config.exempt_paths.clone(),
                 signing_keys: None,
-                max_scan_bytes: 2 * 1024 * 1024,
+                max_scan_bytes: config.token_scan_bytes,
             }),
         }
-    }
-
-    /// Limit the form-body bytes read when scanning for the CSRF token field.
-    ///
-    /// Honors the caller-supplied `n` verbatim. The router passes the configured
-    /// `security.upload.max_request_size_bytes` here so the token scan cap tracks
-    /// the request body limit: a zero-JS multipart upload up to that size can
-    /// still have its `_csrf` field located (see issue #1866). The request body
-    /// is already bounded upstream by the global `DefaultBodyLimit` (also derived
-    /// from `max_request_size_bytes`), so buffering up to `n` here introduces no
-    /// new unbounded-memory exposure. When this method is not called the default
-    /// from [`Self::from_config`] (2 MiB) applies.
-    #[must_use]
-    pub(crate) fn with_max_scan_bytes(mut self, n: usize) -> Self {
-        let settings = Arc::make_mut(&mut self.settings);
-        settings.max_scan_bytes = n;
-        self
     }
 
     /// Attach signing keys so CSRF tokens are HMAC-signed.
@@ -511,22 +490,17 @@ where
                     let instance = Some(req.uri().path().to_owned());
                     let prefers_problem = wants_problem_details(req.headers());
 
-                    // Oversized form body → 413; anything else (missing/invalid
-                    // token, unreadable body) → 403.
-                    let (status, message) = match verdict {
-                        CsrfVerdict::BodyTooLarge => (
-                            StatusCode::PAYLOAD_TOO_LARGE,
-                            CSRF_PAYLOAD_TOO_LARGE_MESSAGE,
-                        ),
-                        _ => (StatusCode::FORBIDDEN, CSRF_FORBIDDEN_MESSAGE),
-                    };
+                    // Missing/invalid token (including a token beyond the scanned
+                    // prefix) → 403. Genuinely oversized bodies stream through and
+                    // are rejected downstream by the real body / upload limits.
+                    let message = CSRF_FORBIDDEN_MESSAGE;
 
                     if prefers_problem {
-                        return Ok(csrf_problem_response(status, message, request_id, instance));
+                        return Ok(csrf_problem_response(message, request_id, instance));
                     }
 
                     let mut response = Response::new(ResBody::from(message));
-                    *response.status_mut() = status;
+                    *response.status_mut() = StatusCode::FORBIDDEN;
                     response.headers_mut().insert(
                         http::header::CONTENT_TYPE,
                         http::HeaderValue::from_static("text/plain; charset=utf-8"),
@@ -554,32 +528,24 @@ fn wants_problem_details(headers: &http::HeaderMap) -> bool {
 }
 
 fn csrf_problem_response<ResBody: From<String> + Default>(
-    status: StatusCode,
     message: &str,
     request_id: Option<String>,
     instance: Option<String>,
 ) -> Response<ResBody> {
-    // The 403 case keeps the CSRF-specific problem type/code; the 413 case
-    // (oversized form body, see issue #1866) uses the module-wide
-    // payload-too-large mapping derived from the status.
-    let explicit_type =
-        (status == StatusCode::FORBIDDEN).then_some("https://autumn.dev/problems/csrf");
     let mut problem = crate::error::problem_details(
-        status,
+        StatusCode::FORBIDDEN,
         message.to_owned(),
         None,
-        explicit_type,
+        Some("https://autumn.dev/problems/csrf"),
         request_id,
         instance,
         true,
     );
-    if status == StatusCode::FORBIDDEN {
-        "autumn.csrf".clone_into(&mut problem.code);
-    }
+    "autumn.csrf".clone_into(&mut problem.code);
     let body = crate::error::problem_details_to_json_string(&problem);
 
     Response::builder()
-        .status(status)
+        .status(StatusCode::FORBIDDEN)
         .header(http::header::CONTENT_TYPE, "application/problem+json")
         .body(ResBody::from(body))
         .unwrap_or_default()
@@ -739,31 +705,32 @@ async fn verify_csrf_token(
         return CsrfVerdict::Missing;
     }
 
-    // Temporarily take ownership of the body
+    // Take the body, buffer at most `max_scan_bytes` of it into a scan prefix,
+    // and reconstruct the full, unmodified body so downstream handlers still
+    // receive every byte. When the body is larger than the cap, the tail is
+    // *streamed* through rather than buffered — the CSRF layer never forces a
+    // large upload into memory.
     let body = std::mem::replace(req.body_mut(), axum::body::Body::empty());
 
-    // Limit body size to avoid DoS when extracting form field.
-    let bytes = match axum::body::to_bytes(body, settings.max_scan_bytes).await {
-        Ok(bytes) => bytes,
-        Err(err) if is_body_length_limit_error(&err) => {
-            // The form body carrying `_csrf` is larger than the scan cap (which
-            // tracks `upload.max_request_size_bytes`). Surface this as
-            // `413 Payload Too Large` instead of falling through to a misleading
-            // `403` "missing token" — the token isn't absent, the body is simply
-            // over the request-size limit (see issue #1866).
-            return CsrfVerdict::BodyTooLarge;
+    let (prefix, rebuilt) = match collect_body_prefix(body, settings.max_scan_bytes).await {
+        CollectedBody::Full(bytes) => {
+            let rebuilt = Body::from(bytes.clone());
+            (bytes, rebuilt)
         }
-        Err(_) => {
-            // A non-length body read error (e.g. the client disconnected
-            // mid-body). This module has no dedicated malformed-body path, so we
-            // preserve the pre-existing behavior of treating an unreadable body
-            // as a missing token (→ 403) rather than inventing a new 400 here.
+        CollectedBody::Oversized { prefix, body } => (prefix, body),
+        CollectedBody::Errored(err) => {
+            // The body stream errored mid-read (e.g. a client disconnect). We
+            // cannot losslessly reconstruct it, and a token cannot be confirmed,
+            // so we preserve the pre-existing behavior of treating an unreadable
+            // body as a missing token (→ 403). The request is rejected and the
+            // handler never runs, so the discarded body is immaterial.
+            tracing::debug!(error = %err, "CSRF token scan: body read error, treating as missing token");
             return CsrfVerdict::Missing;
         }
     };
 
     if is_urlencoded {
-        for (key, value) in url::form_urlencoded::parse(&bytes) {
+        for (key, value) in url::form_urlencoded::parse(&prefix) {
             if key == settings.form_field {
                 if let Some(c) = cookie_token
                     && !c.is_empty()
@@ -778,7 +745,7 @@ async fn verify_csrf_token(
         }
     } else if let Some(ref boundary) = multipart_boundary {
         #[allow(clippy::collapsible_if)]
-        if let Some(value) = scan_multipart_field(&bytes, boundary, &settings.form_field) {
+        if let Some(value) = scan_multipart_field(&prefix, boundary, &settings.form_field) {
             if let Some(c) = cookie_token
                 && !c.is_empty()
                 && !value.is_empty()
@@ -790,14 +757,73 @@ async fn verify_csrf_token(
         }
     }
 
-    // Restore request body so downstream handlers (e.g. Multipart extractor) can read it.
-    *req.body_mut() = axum::body::Body::from(bytes);
+    // Restore the full body so downstream handlers (e.g. the Multipart
+    // extractor) read it intact — identical bytes and framing.
+    *req.body_mut() = rebuilt;
 
     if token_found {
         CsrfVerdict::Valid
     } else {
         CsrfVerdict::Missing
     }
+}
+
+/// Body buffered up to a bounded scan prefix, plus a reconstruction of the full
+/// body for downstream handlers. Mirrors the `collect_body` pattern in
+/// [`submit_token`](crate::security::submit_token) so both middlewares scan a
+/// bounded prefix and stream the remainder identically.
+enum CollectedBody {
+    /// The whole body fit within the cap and is fully buffered. The same bytes
+    /// serve as both the scan prefix and the rebuilt body.
+    Full(Bytes),
+    /// The body exceeded the cap. `prefix` is the first `limit` bytes (the scan
+    /// window); `body` replays the complete, unmodified body — the buffered
+    /// prefix bytes plus the over-limit chunk and the remaining stream — so the
+    /// handler receives every byte with the tail streamed rather than buffered.
+    Oversized { prefix: Bytes, body: Body },
+    /// The body stream errored before EOF. The bytes read so far are discarded:
+    /// the caller rejects the request rather than forward a truncated body.
+    Errored(axum::Error),
+}
+
+/// Buffer `body` up to `limit` bytes into a scan prefix without failing when the
+/// body is larger, reconstructing the full body for pass-through.
+async fn collect_body_prefix(body: Body, limit: usize) -> CollectedBody {
+    let mut buf = Vec::<u8>::new();
+    let mut stream = body.into_data_stream();
+    loop {
+        match stream.next().await {
+            None => break,
+            Some(Err(err)) => return CollectedBody::Errored(err),
+            Some(Ok(chunk)) => {
+                let remaining = limit.saturating_sub(buf.len());
+                if chunk.len() > remaining {
+                    // Fill the scan prefix up to `limit` with the leading bytes
+                    // of the over-limit chunk, so a token at the front of the
+                    // form is still found even when the FIRST chunk already
+                    // exceeds the cap (e.g. an upstream middleware rebuilt the
+                    // body as one `Body::from(bytes)`, leaving `buf` empty here).
+                    let mut prefix_buf = buf.clone();
+                    prefix_buf.extend_from_slice(&chunk[..remaining]);
+                    let prefix = Bytes::from(prefix_buf);
+                    // Replay the FULL body unchanged: the buffered prefix bytes
+                    // followed by the *complete* over-limit chunk (not just its
+                    // scanned head) and the rest of the stream. The prefix is
+                    // only for locating the token; the handler must receive every
+                    // byte, and the tail streams through unbuffered.
+                    let mut leading = Vec::with_capacity(2);
+                    if !buf.is_empty() {
+                        leading.push(Ok::<Bytes, axum::Error>(Bytes::from(buf)));
+                    }
+                    leading.push(Ok::<Bytes, axum::Error>(chunk));
+                    let body = Body::from_stream(futures::stream::iter(leading).chain(stream));
+                    return CollectedBody::Oversized { prefix, body };
+                }
+                buf.extend_from_slice(&chunk);
+            }
+        }
+    }
+    CollectedBody::Full(Bytes::from(buf))
 }
 
 #[cfg(test)]
@@ -859,6 +885,17 @@ mod tests {
     fn default_csrf_config() -> CsrfConfig {
         CsrfConfig {
             enabled: true,
+            ..Default::default()
+        }
+    }
+
+    /// An enabled CSRF config with a custom body-token scan-prefix cap, used to
+    /// exercise the bounded-prefix scan boundary without allocating multi-MiB
+    /// bodies.
+    fn csrf_config_with_scan_bytes(n: usize) -> CsrfConfig {
+        CsrfConfig {
+            enabled: true,
+            token_scan_bytes: n,
             ..Default::default()
         }
     }
@@ -1292,17 +1329,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn post_with_large_body_returns_413() {
-        let token = Uuid::new_v4().to_string();
-        let app = Router::new()
-            .route("/submit", post(|| async { "created" }))
-            .layer(CsrfLayer::from_config(&default_csrf_config()));
+    async fn post_with_large_urlencoded_body_token_first_streams_and_passes() {
+        // A urlencoded body far larger than the scan prefix, with `_csrf` FIRST.
+        // The token is located in the prefix (→ pass) and the full body still
+        // reaches the handler intact — the tail streams through unbuffered.
+        async fn echo_len(body: Body) -> String {
+            let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+            bytes.len().to_string()
+        }
 
-        // Create a body just over the 2 MiB default scan cap. `to_bytes` cannot
-        // buffer it to locate `_csrf`, so the CSRF layer now returns 413 Payload
-        // Too Large (the token isn't missing — the body is oversized; see #1866).
-        let large_padding = "a".repeat(2 * 1024 * 1024 + 10);
+        let token = Uuid::new_v4().to_string();
+        let large_padding = "a".repeat(256 * 1024);
         let body_content = format!("_csrf={token}&pad={large_padding}");
+        let full_len = body_content.len();
+
+        // 4 KiB prefix cap: `_csrf=...` is well within it, the body is not.
+        let app = Router::new()
+            .route("/submit", post(echo_len))
+            .layer(CsrfLayer::from_config(&csrf_config_with_scan_bytes(4096)));
 
         let response = app
             .oneshot(
@@ -1317,7 +1361,15 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(response.status(), StatusCode::OK);
+        let echoed = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let received: usize = std::str::from_utf8(&echoed).unwrap().parse().unwrap();
+        assert_eq!(
+            received, full_len,
+            "handler must receive the full, unmodified body (tail streamed through)"
+        );
     }
 
     #[tokio::test]
@@ -1748,24 +1800,50 @@ mod tests {
         body
     }
 
-    /// Regression test for issue #1866. A zero-JS multipart upload larger than the
-    /// legacy hard-clamped 2 MiB scan window — but within the configured scan cap —
-    /// must still have its `_csrf` field located, so it is NOT rejected with 403.
-    #[tokio::test]
-    async fn post_large_multipart_within_scan_cap_finds_token_passes() {
-        let token = "test-csrf-token-uuid-1866";
-        let boundary = "----WebKitFormBoundary1866PASS";
-        // 3 MiB of padding => whole body exceeds the legacy 2 MiB clamp.
-        let body = large_multipart_body(boundary, token, 3 * 1024 * 1024);
-        assert!(body.len() > 2 * 1024 * 1024);
+    /// Build a multipart body with a large filler field placed BEFORE `_csrf`,
+    /// so the token sits `lead_bytes`+ into the body (used to push it past a
+    /// scan prefix). Returns `(body, full_len)`.
+    fn multipart_token_after_filler(boundary: &str, token: &str, lead_bytes: usize) -> Vec<u8> {
+        let mut body =
+            format!("--{boundary}\r\nContent-Disposition: form-data; name=\"filler\"\r\n\r\n")
+                .into_bytes();
+        body.extend(std::iter::repeat_n(b'x', lead_bytes));
+        body.extend_from_slice(
+            format!(
+                "\r\n--{boundary}\r\nContent-Disposition: form-data; \
+                 name=\"_csrf\"\r\n\r\n{token}\r\n--{boundary}--\r\n"
+            )
+            .as_bytes(),
+        );
+        body
+    }
 
-        // Router wires `with_max_scan_bytes(upload.max_request_size_bytes)`; here we
-        // model a configured 4 MiB request-body limit (> the legacy 2 MiB clamp).
+    /// Stream-through regression (issue #1866 redesign). A multipart body far
+    /// larger than the scan prefix, with `_csrf` as the FIRST field, must:
+    ///   1. PASS CSRF — the token is located within the bounded prefix; and
+    ///   2. deliver the FULL, unmodified body to the handler — proving the
+    ///      remainder streamed through and the reconstruction is lossless.
+    /// The scan itself stops at the cap by construction: the 4 KiB prefix cap is
+    /// far smaller than the body, yet the request still passes and streams, so
+    /// the layer cannot have buffered the whole body to find the token.
+    #[tokio::test]
+    async fn post_large_multipart_token_first_streams_full_body_and_passes() {
+        async fn echo_len(body: Body) -> String {
+            let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+            bytes.len().to_string()
+        }
+
+        let token = "test-csrf-token-uuid-stream";
+        let boundary = "----WebKitFormBoundarySTREAM";
+        // _csrf first, then a ~256 KiB file field — body far exceeds the cap.
+        let body = large_multipart_body(boundary, token, 256 * 1024);
+        let full_len = body.len();
+        assert!(full_len > 4096);
+
+        // 4 KiB prefix cap: the leading `_csrf` field is well within it.
         let app = Router::new()
-            .route("/upload", post(|| async { "ok" }))
-            .layer(
-                CsrfLayer::from_config(&default_csrf_config()).with_max_scan_bytes(4 * 1024 * 1024),
-            );
+            .route("/upload", post(echo_len))
+            .layer(CsrfLayer::from_config(&csrf_config_with_scan_bytes(4096)));
 
         let response = app
             .oneshot(
@@ -1785,22 +1863,28 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
+        let echoed = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let received: usize = std::str::from_utf8(&echoed).unwrap().parse().unwrap();
+        assert_eq!(
+            received, full_len,
+            "handler must receive the full, unmodified body (tail streamed through)"
+        );
     }
 
-    /// Issue #1866: when the form body carrying `_csrf` exceeds the scan cap, the
-    /// token cannot be buffered, so it must NOT be misreported as a missing token
-    /// (403). The body is genuinely over the request-size limit, so the CSRF layer
-    /// now returns `413 Payload Too Large` — the response issue #1866 wanted to be
-    /// observable, rather than a misleading 403. Here the scan cap is left at the
-    /// 2 MiB default (no `with_max_scan_bytes` override) and the body is > 2 MiB.
+    /// Token-early constraint. When `_csrf` sits AFTER more than `max_scan_bytes`
+    /// of preceding data, it is not observed in the prefix and the request is
+    /// rejected as a missing token (403) — NOT a 413. A genuinely oversized body
+    /// is left to the downstream body / upload limits.
     #[tokio::test]
-    async fn post_large_multipart_exceeding_scan_cap_returns_413() {
-        let token = "test-csrf-token-uuid-1866b";
-        let boundary = "----WebKitFormBoundary1866FAIL";
-        let body = large_multipart_body(boundary, token, 3 * 1024 * 1024);
+    async fn post_multipart_token_beyond_scan_prefix_returns_403() {
+        let token = "test-csrf-token-uuid-beyond";
+        let boundary = "----WebKitFormBoundaryBEYOND";
+        // Default 2 MiB cap; place `_csrf` after > 2 MiB of filler.
+        let body = multipart_token_after_filler(boundary, token, 2 * 1024 * 1024 + 1024);
         assert!(body.len() > 2 * 1024 * 1024);
 
-        // Default cap is 2 MiB (from_config, no with_max_scan_bytes override).
         let app = Router::new()
             .route("/upload", post(|| async { "ok" }))
             .layer(CsrfLayer::from_config(&default_csrf_config()));
@@ -1822,47 +1906,48 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 
-    /// The overflow is classified before token presence: a form body over the scan
-    /// cap that carries NO `_csrf` field still returns 413 (not the 403 a genuinely
-    /// missing token would produce), confirming the size limit is evaluated first.
+    /// Configurable cap moves the scan boundary. The SAME body — with `_csrf`
+    /// ~8 KiB into it — is rejected under a 4 KiB cap (token beyond the prefix)
+    /// but accepted under a 64 KiB cap (token within the prefix).
     #[tokio::test]
-    async fn post_large_multipart_over_cap_without_token_returns_413() {
-        let boundary = "----WebKitFormBoundary1866NOTOK";
-        // Build an oversized body with a file field but no `_csrf` part.
-        let mut body = format!(
-            "--{boundary}\r\nContent-Disposition: form-data; name=\"avatar\"; \
-             filename=\"photo.bin\"\r\nContent-Type: application/octet-stream\r\n\r\n"
-        )
-        .into_bytes();
-        body.extend(std::iter::repeat_n(b'A', 3 * 1024 * 1024));
-        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
-        assert!(body.len() > 2 * 1024 * 1024);
+    async fn configurable_scan_cap_moves_token_boundary() {
+        let token = "test-csrf-token-uuid-cap";
+        let boundary = "----WebKitFormBoundaryCAP";
+        let body = multipart_token_after_filler(boundary, token, 8 * 1024);
 
-        // Default cap is 2 MiB (from_config, no with_max_scan_bytes override).
-        let app = Router::new()
+        let make_request = || {
+            Request::builder()
+                .method("POST")
+                .uri("/upload")
+                .header("Cookie", format!("autumn-csrf={token}"))
+                .header(http::header::ACCEPT, "text/html")
+                .header(
+                    "Content-Type",
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .body(Body::from(body.clone()))
+                .unwrap()
+        };
+
+        // Small 4 KiB cap: `_csrf` sits beyond the prefix → not found → 403.
+        let small = Router::new()
             .route("/upload", post(|| async { "ok" }))
-            .layer(CsrfLayer::from_config(&default_csrf_config()));
+            .layer(CsrfLayer::from_config(&csrf_config_with_scan_bytes(
+                4 * 1024,
+            )));
+        let resp = small.oneshot(make_request()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/upload")
-                    .header("Cookie", "autumn-csrf=sometoken")
-                    .header(http::header::ACCEPT, "text/html")
-                    .header(
-                        "Content-Type",
-                        format!("multipart/form-data; boundary={boundary}"),
-                    )
-                    .body(Body::from(body))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        // Larger 64 KiB cap: the same `_csrf` now falls within the prefix → 200.
+        let large = Router::new()
+            .route("/upload", post(|| async { "ok" }))
+            .layer(CsrfLayer::from_config(&csrf_config_with_scan_bytes(
+                64 * 1024,
+            )));
+        let resp = large.oneshot(make_request()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 }

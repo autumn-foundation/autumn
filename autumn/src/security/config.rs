@@ -39,6 +39,7 @@
 //! | `AUTUMN_SECURITY__HEADERS__CONTENT_SECURITY_POLICY` | `security.headers.content_security_policy` | `String` |
 //! | `AUTUMN_SECURITY__HEADERS__CSP_NONCE__ENABLED` | `security.headers.csp_nonce.enabled` | `bool` |
 //! | `AUTUMN_SECURITY__CSRF__ENABLED` | `security.csrf.enabled` | `bool` |
+//! | `AUTUMN_SECURITY__CSRF__TOKEN_SCAN_BYTES` | `security.csrf.token_scan_bytes` | `usize` |
 //! | `AUTUMN_SECURITY__RATE_LIMIT__ENABLED` | `security.rate_limit.enabled` | `bool` |
 //! | `AUTUMN_SECURITY__RATE_LIMIT__REQUESTS_PER_SECOND` | `security.rate_limit.requests_per_second` | `f64` |
 //! | `AUTUMN_SECURITY__RATE_LIMIT__BURST` | `security.rate_limit.burst` | `u32` |
@@ -679,6 +680,7 @@ impl Default for HeadersConfig {
 /// | `cookie_name` | `"autumn-csrf"` |
 /// | `safe_methods` | `["GET", "HEAD", "OPTIONS", "TRACE"]` |
 /// | `exempt_paths` | `[]` |
+/// | `token_scan_bytes` | `2_097_152` (2 MiB) |
 ///
 /// # Examples
 ///
@@ -723,6 +725,29 @@ pub struct CsrfConfig {
     /// under `/api/`.
     #[serde(default)]
     pub exempt_paths: Vec<String>,
+
+    /// Maximum number of leading request-body bytes scanned for the `_csrf`
+    /// form field on a urlencoded / multipart POST. Default: `2 MiB`
+    /// (`2 * 1024 * 1024`).
+    ///
+    /// The token scan reads at most this many bytes of the body into a prefix
+    /// buffer and looks for the `_csrf` field there. The rest of the body is
+    /// **streamed through unbuffered** to the handler, so a large file upload
+    /// is never fully copied into memory by the CSRF layer. This deliberately
+    /// does **not** track `upload.max_request_size_bytes`: buffering a whole
+    /// 32 MiB upload per request (× concurrency) just to locate a token would
+    /// be a DoS-shaped memory cost and would defeat the streaming upload path.
+    ///
+    /// **Token-early constraint:** because only this prefix is scanned, the
+    /// `_csrf` token must appear within the first `token_scan_bytes` of the
+    /// body. Scaffolded forms emit the hidden `_csrf` field *before* any file
+    /// field, so they are always safe. Hand-written forms that place large
+    /// fields ahead of `_csrf` should either move the token earlier or raise
+    /// this cap (the escape hatch). A genuinely oversized body whose token is
+    /// beyond the prefix is not found and is rejected downstream (403 missing
+    /// token, or the natural 413 from the upload/body limit).
+    #[serde(default = "default_csrf_token_scan_bytes")]
+    pub token_scan_bytes: usize,
 }
 
 impl Default for CsrfConfig {
@@ -734,6 +759,7 @@ impl Default for CsrfConfig {
             cookie_name: default_csrf_cookie(),
             safe_methods: default_safe_methods(),
             exempt_paths: Vec::new(),
+            token_scan_bytes: default_csrf_token_scan_bytes(),
         }
     }
 }
@@ -1499,6 +1525,14 @@ fn default_csrf_field() -> String {
 
 fn default_csrf_cookie() -> String {
     "autumn-csrf".to_owned()
+}
+
+/// Default CSRF token-scan prefix cap: 2 MiB.
+///
+/// Deliberately independent of `upload.max_request_size_bytes` — only the
+/// leading prefix is buffered to locate `_csrf`; the remainder streams through.
+const fn default_csrf_token_scan_bytes() -> usize {
+    2 * 1024 * 1024
 }
 
 fn default_safe_methods() -> Vec<String> {
