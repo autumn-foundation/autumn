@@ -635,6 +635,25 @@ fn skip_control(trees: &[TokenTree], start: usize, nodes: &mut Vec<Node>) -> usi
     while i < trees.len() {
         match &trees[i] {
             TokenTree::Ident(id) => {
+                // A Rust macro call in the condition: `ident! { … }` /
+                // `ident!(…)` / `ident![…]` (e.g. `@if ready! { input } { body }`).
+                // The condition is parsed with `parse_without_eager_brace`, which
+                // accepts a macro invocation, so the `!`-delimited group is macro
+                // input — part of the condition, NOT markup. Skip the ident, the
+                // `!`, and the group together (any delimiter), the same way
+                // `match`/`loop`/`unsafe` keep their block out of the body;
+                // otherwise the macro's brace group is misparsed as markup (a
+                // phantom `<input>`) and the real body brace is missed. Requiring a
+                // delimiter group right after `!` excludes the `!=` operator (whose
+                // `!` is followed by `=`, not a group).
+                if !in_pattern
+                    && matches!(trees.get(i + 1), Some(TokenTree::Punct(p)) if p.as_char() == '!')
+                    && matches!(trees.get(i + 2), Some(TokenTree::Group(_)))
+                {
+                    saw_cond = true;
+                    i += 3;
+                    continue;
+                }
                 match id.to_string().as_str() {
                     // Leading control keywords: not condition tokens.
                     "if" | "while" | "else" => {}
@@ -841,10 +860,16 @@ fn parse_element(trees: &[TokenTree], start: usize) -> (Element, usize) {
     let line = trees[start].span().start().line;
     // A leading `.`/`#` with no explicit tag name is an implicit `div`; the
     // shorthand class/id begins AT `start` and the tag is `div`. Otherwise the
-    // tag is the ident at `start` and shorthands begin just after it.
+    // tag name is a full maud `HtmlName` (`Punctuated<HtmlNameFragment, '-' | ':'>`),
+    // so a custom/namespaced tag like `x-input`, `x-button`, or `svg:rect` must be
+    // read via the SAME `read_name` logic used for attribute names — consuming only
+    // the first identifier would leave the `-`/`:` + suffix in the stream, where the
+    // next pass would misread the `input`/`button`/`rect` suffix as a separate plain
+    // control element and fire a false `label`/`button-name`. Shorthands begin just
+    // past the whole name.
     let (name, shorthand_start) = match &trees[start] {
         TokenTree::Punct(p) if matches!(p.as_char(), '#' | '.') => ("div".to_owned(), start),
-        other => (ident_string(other), start + 1),
+        _ => read_name(trees, start),
     };
     let mut attrs = Vec::new();
     let mut i = parse_shorthand(trees, shorthand_start, &mut attrs);
@@ -1084,13 +1109,6 @@ fn name_segment(tree: Option<&TokenTree>) -> Option<String> {
         Some(TokenTree::Ident(id)) => Some(id.to_string()),
         Some(TokenTree::Literal(lit)) => string_literal_value(lit),
         _ => None,
-    }
-}
-
-fn ident_string(tree: &TokenTree) -> String {
-    match tree {
-        TokenTree::Ident(id) => id.to_string(),
-        _ => String::new(),
     }
 }
 
@@ -2059,6 +2077,87 @@ mod tests {
         // `@while x > 0 { button { } }`: the comparison is the condition and the
         // body is scanned — the empty button is flagged.
         let src = wrap(r"@while x > 0 { button { } }");
+        assert_eq!(
+            rule_ids(&src),
+            vec!["button-name"],
+            "{:?}",
+            findings_for(&src)
+        );
+    }
+
+    #[test]
+    fn if_macro_condition_is_not_parsed_as_markup() {
+        // Regression (false positive): a Rust macro call in the `@if` condition
+        // (`@if ready! { input } { "ok" }`) owns its `!`-delimited brace group —
+        // that group is macro input, part of the condition, and the real markup
+        // body is the FINAL `{ "ok" }`. The macro's `input` token must NOT be
+        // misread as a phantom `<input>`, and the body must be scanned.
+        let src = wrap(r#"@if ready! { input } { "ok" }"#);
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn if_macro_condition_body_is_still_scanned() {
+        // The macro condition is skipped, but the body IS scanned: an empty
+        // `<button>` in the body is still flagged (the body brace was correctly
+        // identified past the macro's group).
+        let src = wrap(r"@if ready! { input } { button { } }");
+        assert_eq!(
+            rule_ids(&src),
+            vec!["button-name"],
+            "{:?}",
+            findings_for(&src)
+        );
+    }
+
+    #[test]
+    fn if_non_macro_condition_body_input_still_flagged() {
+        // A plain `@if cond { input; }` (no macro) still parses the body, so a
+        // real unlabeled `<input>` is flagged — the macro handling does not
+        // change the macro-free path.
+        let src = wrap(r"@if cond { input; }");
+        assert_eq!(rule_ids(&src), vec!["label"], "{:?}", findings_for(&src));
+    }
+
+    // ── element tag names: custom `-` / namespaced `:` ──────────────────────
+
+    #[test]
+    fn custom_hyphenated_tag_is_not_flagged() {
+        // Regression (false positive): a maud element name is a full `HtmlName`
+        // (`Punctuated<HtmlNameFragment, '-' | ':'>`), so `x-input` is ONE custom
+        // tag that matches no rule. Reading only the first ident (`x`) would leave
+        // `-input` in the stream and misfire a `label` on a phantom `<input>`.
+        let src = wrap(r"x-input;");
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn custom_hyphenated_tag_with_body_is_not_flagged() {
+        // `x-button { }` is a single custom tag (no `button-name` rule applies),
+        // not a `<button>` — its `{ }` body is parsed normally.
+        let src = wrap(r"x-button { }");
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn namespaced_colon_tag_is_not_flagged() {
+        // A colon-namespaced tag `svg:rect` is one `HtmlName`, matching no rule.
+        let src = wrap(r"svg:rect;");
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn plain_input_tag_is_still_flagged() {
+        // A plain `input;` (no `-`/`:` continuation) is a real `<input>` and is
+        // still flagged — the full-name read does not affect simple tag names.
+        let src = wrap(r"input;");
+        assert_eq!(rule_ids(&src), vec!["label"], "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn plain_button_tag_is_still_flagged() {
+        // A plain empty `button { }` is still flagged for a missing name.
+        let src = wrap(r"button { }");
         assert_eq!(
             rule_ids(&src),
             vec!["button-name"],
