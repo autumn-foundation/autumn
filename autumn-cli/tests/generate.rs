@@ -6122,6 +6122,50 @@ fn generated_sharded_scaffold_cargo_checks() {
     );
 }
 
+/// Slow end-to-end check: scaffold a `--searchable` (full-text search) project,
+/// patch Cargo.toml to the local autumn-web, and `cargo check --tests` the
+/// result. Verifies that the merged FTS codegen (issue #1319/#1825) compiles:
+/// the `#[searchable]` model attributes, the `searchable` repository option,
+/// the generated `{Model}SearchQuery` extractor type, and the `search_vector`
+/// migration all typecheck against this workspace's `autumn-web`.
+///
+/// Uses a plain searchable model (no owner scoping — the generator rejects the
+/// owner-scoped + search combination).
+///
+/// Run with: `cargo test -p autumn-cli -- --ignored generated_searchable_scaffold_cargo_checks`
+#[test]
+#[ignore = "slow: cargo-checks a fresh searchable project — run with `cargo test -p autumn-cli -- --ignored`"]
+fn generated_searchable_scaffold_cargo_checks() {
+    let (_tmp, project) = fresh_project("searchable-build");
+
+    patch_generated_cargo_toml(&project);
+
+    run_autumn(
+        &project,
+        &[
+            "generate",
+            "scaffold",
+            "Post",
+            "title:String",
+            "body:Text",
+            "--searchable",
+            "title,body",
+        ],
+    );
+
+    let check = Command::new("cargo")
+        .args(["check", "--tests"])
+        .current_dir(&project)
+        .output()
+        .unwrap();
+    assert!(
+        check.status.success(),
+        "cargo check on generated searchable scaffold failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&check.stdout),
+        String::from_utf8_lossy(&check.stderr),
+    );
+}
+
 /// Slow end-to-end check: scaffold a `--soft-delete` project, patch Cargo.toml
 /// to the local autumn-web, and `cargo check --tests` the result. Regression
 /// coverage for a bug where the generated model's `deleted_at` field lacked

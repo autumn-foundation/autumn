@@ -171,12 +171,11 @@ jobs:
   # variant land as one matrix leg.
   #
   # Legs (variant -> ignored test in autumn-cli/tests/generate.rs):
-  #   totp    -> generated_auth_totp_cargo_checks
-  #   sharded -> generated_sharded_scaffold_cargo_checks
+  #   totp       -> generated_auth_totp_cargo_checks
+  #   sharded    -> generated_sharded_scaffold_cargo_checks
+  #   searchable -> generated_searchable_scaffold_cargo_checks
   #
-  # TODO: add passkeys (after #1822/#1851 merges) and searchable (needs a
-  # generated_searchable_scaffold_cargo_checks conformance test — see #1319/#1825
-  # FTS work) — tracked in #1856.
+  # TODO: add passkeys once #1851 merges — tracked in #1856.
   app-variant-conformance:
     name: App-variant conformance (${{ matrix.variant.name }}, ${{ matrix.toolchain }})
     runs-on: ubuntu-latest
@@ -189,6 +188,8 @@ jobs:
             test: generated_auth_totp_cargo_checks
           - name: sharded
             test: generated_sharded_scaffold_cargo_checks
+          - name: searchable
+            test: generated_searchable_scaffold_cargo_checks
     steps:
       - uses: actions/checkout@v7
 
