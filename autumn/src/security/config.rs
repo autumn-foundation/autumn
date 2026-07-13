@@ -854,6 +854,65 @@ impl SubmitTokenConfig {
     ) -> crate::config::IdempotencyBackend {
         self.backend.unwrap_or(idempotency_backend)
     }
+
+    /// Decide the production safety action for the resolved consumed-token
+    /// backend.
+    ///
+    /// Submit tokens are DEFAULT-ON, so the resolved backend can silently land
+    /// on the in-memory store in production when neither `[idempotency]` nor
+    /// `[security.submit_token].backend` is configured. A per-process memory
+    /// store cannot deduplicate submits across replicas, so this mirrors the
+    /// idempotency production-memory guard
+    /// ([`fail_fast_on_invalid_idempotency_config`](crate::app)) — using the
+    /// same `prod`/`production` profile detection — while distinguishing an
+    /// EXPLICIT opt-in from an INHERITED default:
+    ///
+    /// - EXPLICIT `[security.submit_token].backend = "memory"` in production
+    ///   ([`Self::backend`] is `Some(Memory)`) → [`SubmitTokenMemoryGuard::FailExplicit`]:
+    ///   the operator deliberately chose an unsafe backend, so fail fast like
+    ///   idempotency's explicit enabled+memory prod guard.
+    /// - INHERITED default ([`Self::backend`] is `None`) that resolves to
+    ///   memory in production → [`SubmitTokenMemoryGuard::WarnInherited`]: only
+    ///   warn, so upgrading Autumn does not turn into "prod won't boot without
+    ///   Redis" for a single-replica app.
+    /// - Non-production, or a resolved backend that is not memory →
+    ///   [`SubmitTokenMemoryGuard::Ok`].
+    #[must_use]
+    pub(crate) fn production_memory_guard(
+        &self,
+        idempotency_backend: crate::config::IdempotencyBackend,
+        is_production: bool,
+    ) -> SubmitTokenMemoryGuard {
+        use crate::config::IdempotencyBackend;
+        if !is_production
+            || self.resolved_backend(idempotency_backend) != IdempotencyBackend::Memory
+        {
+            return SubmitTokenMemoryGuard::Ok;
+        }
+        // Resolved to the in-memory store in production. `backend == Some(Memory)`
+        // is an explicit opt-in (hard fail); `backend == None` inherited the
+        // memory idempotency backend (warn only). `Some(Redis)` cannot reach here
+        // because it would not resolve to memory.
+        match self.backend {
+            Some(IdempotencyBackend::Memory) => SubmitTokenMemoryGuard::FailExplicit,
+            _ => SubmitTokenMemoryGuard::WarnInherited,
+        }
+    }
+}
+
+/// Production safety decision for the resolved submit-token consumed-token
+/// backend. Produced by [`SubmitTokenConfig::production_memory_guard`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubmitTokenMemoryGuard {
+    /// No action: not production, or the resolved backend is not the in-memory
+    /// store.
+    Ok,
+    /// The default/inherited backend resolves to the in-memory store in
+    /// production. Boot proceeds, but an actionable startup warning is emitted.
+    WarnInherited,
+    /// An explicit `[security.submit_token].backend = "memory"` in production.
+    /// Boot must fail fast.
+    FailExplicit,
 }
 
 const fn default_submit_token_enabled() -> bool {
@@ -1512,6 +1571,70 @@ mod tests {
             cfg.resolved_backend(IdempotencyBackend::Memory),
             IdempotencyBackend::Redis,
             "an explicit redis override must win over an inherited Memory backend"
+        );
+    }
+
+    // ── submit-token production memory guard (Finding O) ────────────────────
+
+    #[test]
+    fn submit_token_explicit_memory_in_production_fails_fast() {
+        // EXPLICIT `[security.submit_token].backend = "memory"` in production
+        // is a deliberate unsafe opt-in → hard fail, mirroring idempotency's
+        // explicit enabled+memory prod guard.
+        let cfg: SubmitTokenConfig = toml::from_str("backend = \"memory\"").unwrap();
+        assert_eq!(cfg.backend, Some(IdempotencyBackend::Memory));
+        assert_eq!(
+            cfg.production_memory_guard(IdempotencyBackend::Redis, true),
+            SubmitTokenMemoryGuard::FailExplicit,
+        );
+        assert_eq!(
+            cfg.production_memory_guard(IdempotencyBackend::Memory, true),
+            SubmitTokenMemoryGuard::FailExplicit,
+        );
+    }
+
+    #[test]
+    fn submit_token_inherited_memory_in_production_only_warns() {
+        // INHERITED default (`backend = None`) resolving to Memory in production
+        // must NOT fail — upgrading Autumn must not turn into "prod won't boot
+        // without Redis". It only warns.
+        let cfg: SubmitTokenConfig = toml::from_str("").unwrap();
+        assert_eq!(cfg.backend, None);
+        assert_eq!(
+            cfg.production_memory_guard(IdempotencyBackend::Memory, true),
+            SubmitTokenMemoryGuard::WarnInherited,
+        );
+        // Inherited Redis resolves to Redis → no warning, no fail.
+        assert_eq!(
+            cfg.production_memory_guard(IdempotencyBackend::Redis, true),
+            SubmitTokenMemoryGuard::Ok,
+        );
+    }
+
+    #[test]
+    fn submit_token_memory_outside_production_is_ok() {
+        // Dev / non-production → no warn, no fail, regardless of explicit or
+        // inherited memory.
+        let explicit: SubmitTokenConfig = toml::from_str("backend = \"memory\"").unwrap();
+        assert_eq!(
+            explicit.production_memory_guard(IdempotencyBackend::Memory, false),
+            SubmitTokenMemoryGuard::Ok,
+        );
+        let inherited: SubmitTokenConfig = toml::from_str("").unwrap();
+        assert_eq!(
+            inherited.production_memory_guard(IdempotencyBackend::Memory, false),
+            SubmitTokenMemoryGuard::Ok,
+        );
+    }
+
+    #[test]
+    fn submit_token_explicit_redis_backend_never_triggers_guard() {
+        // An explicit Redis override never resolves to memory, so the guard is
+        // a no-op even in production.
+        let cfg: SubmitTokenConfig = toml::from_str("backend = \"redis\"").unwrap();
+        assert_eq!(
+            cfg.production_memory_guard(IdempotencyBackend::Memory, true),
+            SubmitTokenMemoryGuard::Ok,
         );
     }
 

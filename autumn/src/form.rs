@@ -898,6 +898,19 @@ pub fn text_input<T: Serialize>(
 /// the first field validation would spend the token and the real create/update
 /// submit would replay the validation fragment instead of running the mutation.
 ///
+/// # Custom `field_name` limitation
+///
+/// The `hx-params` filter hardcodes the **default** field name `_submit_token`.
+/// It excludes only that default from inline htmx validation posts. If you
+/// customize `[security.submit_token].field_name` **and** hand-write a
+/// live-validation form using these helpers, the filter will not exclude your
+/// custom field, so the token leaks into the validation POST and
+/// `SubmitTokenLayer` consumes it. Add your validation route(s) to
+/// `[security.submit_token].exempt_paths` so the one-time token is not consumed
+/// by validation requests. Generated scaffolds keep the default field name and
+/// wire their validation routes into `exempt_paths` automatically, so this only
+/// affects hand-written forms with a customized `field_name`.
+///
 /// The inline-validation handler should extract [`ChangesetForm<T>`],
 /// validate, and return `text_input_htmx(...)` for just the single field.
 ///
@@ -964,6 +977,12 @@ pub fn text_input_htmx<T: Serialize>(
 /// client-side "must fill this in" signal, and a server-side rule that
 /// happens to permit an empty string (e.g. a max-only `length` rule) would
 /// let a blank required field through silently.
+///
+/// Like [`text_input_htmx`], the emitted `hx-params="not _submit_token"` filter
+/// hardcodes the **default** submit-token field name. See
+/// [`text_input_htmx`](text_input_htmx#custom-field_name-limitation) for the
+/// custom `[security.submit_token].field_name` caveat and the `exempt_paths`
+/// workaround for hand-written live-validation forms.
 #[cfg(feature = "maud")]
 #[must_use]
 pub fn required_text_input_htmx<T: Serialize>(

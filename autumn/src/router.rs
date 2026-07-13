@@ -41,6 +41,12 @@ pub enum RouterBuildError {
     #[error("invalid idempotency backend configuration: {0}")]
     #[allow(dead_code)] // constructed only in the `redis` feature path
     InvalidIdempotencyBackend(String),
+    /// The submit-token backend configuration is invalid for production — an
+    /// explicit `[security.submit_token].backend = "memory"` cannot safely
+    /// deduplicate submits across replicas. Mirrors the idempotency
+    /// production-memory fail-fast.
+    #[error("invalid submit-token backend configuration: {0}")]
+    InvalidSubmitTokenBackend(String),
     /// A user-defined route conflicts with a framework-provided route.
     #[error("framework route overlap at {path}: {existing} conflicts with {incoming}")]
     FrameworkRouteOverlap {
@@ -2199,6 +2205,7 @@ where
 fn apply_submit_token_middleware<S>(
     mut router: axum::Router<S>,
     config: &AutumnConfig,
+    is_production: bool,
 ) -> Result<axum::Router<S>, RouterBuildError>
 where
     S: Clone + Send + Sync + 'static,
@@ -2206,6 +2213,37 @@ where
     let cfg = &config.security.submit_token;
     if !cfg.enabled {
         return Ok(router);
+    }
+
+    // Production guard for the resolved consumed-token backend. Submit tokens
+    // are DEFAULT-ON, so the resolved backend can land on the per-process memory
+    // store in production — which cannot deduplicate submits across replicas.
+    // Mirrors the idempotency production-memory guard
+    // (`fail_fast_on_invalid_idempotency_config`): an EXPLICIT
+    // `[security.submit_token].backend = "memory"` in prod fails fast, while an
+    // INHERITED default only warns so upgrading Autumn never becomes
+    // "prod won't boot without Redis".
+    match cfg.production_memory_guard(config.idempotency.backend, is_production) {
+        crate::security::config::SubmitTokenMemoryGuard::Ok => {}
+        crate::security::config::SubmitTokenMemoryGuard::WarnInherited => {
+            tracing::warn!(
+                "[security.submit_token].backend resolved to the in-memory store in production \
+                 (inherited from [idempotency].backend, which is unset or memory). \
+                 Single-replica deployments are fine, but multi-replica deployments need a shared \
+                 backend: configure [idempotency] with backend = \"redis\" (or set \
+                 [security.submit_token].backend = \"redis\") so consumed tokens are shared across \
+                 replicas — otherwise a duplicate submit can slip through on a different replica."
+            );
+        }
+        crate::security::config::SubmitTokenMemoryGuard::FailExplicit => {
+            return Err(RouterBuildError::InvalidSubmitTokenBackend(
+                "the in-memory submit-token backend is not safe for multi-replica production use. \
+                 Set `[security.submit_token].backend = \"redis\"` in autumn.toml (it reuses the \
+                 [idempotency.redis] connection settings), or remove the explicit `backend` \
+                 override to inherit `[idempotency].backend`."
+                    .to_owned(),
+            ));
+        }
     }
 
     let ttl = Duration::from_secs(cfg.ttl_secs);
@@ -2848,7 +2886,7 @@ fn apply_middleware(
     // Applied before (i.e. inner to) the CSRF layer so CSRF is validated first
     // on the request path; a replayed `_submit_token` is still short-circuited
     // even when the request carries a valid `_csrf` (issue #1360, AC #4).
-    router = apply_submit_token_middleware(router, config)?;
+    router = apply_submit_token_middleware(router, config, is_production)?;
     router = apply_csrf_middleware(router, config, signing_keys_opt.clone());
     router = apply_bot_protection_middleware(router, config);
     // Method-override rejection filter. The outer `MethodOverrideLayer`
@@ -4290,6 +4328,42 @@ mod tests {
             clock: std::sync::Arc::new(crate::time::SystemClock),
             app_id: crate::state::AppState::next_app_id(),
         }
+    }
+
+    // ── submit-token production memory guard wiring (Finding O) ─────────────
+
+    #[test]
+    fn submit_token_explicit_memory_in_production_fails_router_build() {
+        // EXPLICIT `[security.submit_token].backend = "memory"` + production →
+        // hard fail at router build, mirroring the idempotency prod-memory guard.
+        let mut config = AutumnConfig::default();
+        config.security.submit_token.backend = Some(crate::config::IdempotencyBackend::Memory);
+        let err = apply_submit_token_middleware(axum::Router::<()>::new(), &config, true)
+            .expect_err("explicit memory submit-token backend in prod must fail router build");
+        assert!(
+            matches!(err, RouterBuildError::InvalidSubmitTokenBackend(_)),
+            "expected InvalidSubmitTokenBackend, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn submit_token_inherited_memory_in_production_builds() {
+        // INHERITED default (`backend = None`) resolving to Memory in prod must
+        // NOT fail — it only warns. Router build succeeds.
+        let mut config = AutumnConfig::default();
+        config.security.submit_token.backend = None;
+        config.idempotency.backend = crate::config::IdempotencyBackend::Memory;
+        let _router = apply_submit_token_middleware(axum::Router::<()>::new(), &config, true)
+            .expect("inherited memory submit-token backend in prod must still build (warn only)");
+    }
+
+    #[test]
+    fn submit_token_memory_outside_production_builds() {
+        // Non-production → no fail regardless of explicit memory.
+        let mut config = AutumnConfig::default();
+        config.security.submit_token.backend = Some(crate::config::IdempotencyBackend::Memory);
+        let _router = apply_submit_token_middleware(axum::Router::<()>::new(), &config, false)
+            .expect("memory submit-token backend outside production must build");
     }
 
     #[tokio::test]
