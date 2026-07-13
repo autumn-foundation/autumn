@@ -465,6 +465,17 @@ fn parse_nodes(trees: &[TokenTree]) -> Vec<Node> {
                 }
                 i += 1;
             }
+            // A leading `.`/`#` shorthand with NO explicit tag name is maud's
+            // implicit `div`: `.input { … }` renders `<div class="input">` and
+            // `#button { … }` renders `<div id="button">`. The class/id token is
+            // a VALUE, not a tag, so parse it as a `div` element (which triggers
+            // no rule) rather than letting the next iteration read `input`/`button`
+            // as a phantom element (false positive).
+            TokenTree::Punct(p) if matches!(p.as_char(), '#' | '.') => {
+                let (element, next) = parse_element(trees, i);
+                nodes.push(Node::Element(element));
+                i = next;
+            }
             TokenTree::Punct(p) if p.as_char() == '@' => {
                 // Control flow (`@if`/`@for`/`@match`/`@let`): dynamic, but still
                 // descend into any block so elements inside are analyzed. Not a
@@ -714,13 +725,20 @@ fn parse_arm_body(trees: &[TokenTree], start: usize, nodes: &mut Vec<Node>) -> u
     if j < trees.len() { j + 1 } else { j }
 }
 
-/// Parse a single element starting at `trees[start]` (an ident). Returns the
-/// element and the index just past it.
+/// Parse a single element starting at `trees[start]` (an ident, or a leading
+/// `.`/`#` shorthand denoting maud's implicit `div`). Returns the element and the
+/// index just past it.
 fn parse_element(trees: &[TokenTree], start: usize) -> (Element, usize) {
-    let name = ident_string(&trees[start]);
     let line = trees[start].span().start().line;
+    // A leading `.`/`#` with no explicit tag name is an implicit `div`; the
+    // shorthand class/id begins AT `start` and the tag is `div`. Otherwise the
+    // tag is the ident at `start` and shorthands begin just after it.
+    let (name, shorthand_start) = match &trees[start] {
+        TokenTree::Punct(p) if matches!(p.as_char(), '#' | '.') => ("div".to_owned(), start),
+        other => (ident_string(other), start + 1),
+    };
     let mut attrs = Vec::new();
-    let mut i = parse_shorthand(trees, start + 1, &mut attrs);
+    let mut i = parse_shorthand(trees, shorthand_start, &mut attrs);
     let mut children = Vec::new();
     while i < trees.len() {
         match &trees[i] {
@@ -758,13 +776,16 @@ fn parse_element(trees: &[TokenTree], start: usize) -> (Element, usize) {
 
 /// Parse maud `#id` / `.class` shorthands, recording `#id` as an `id` attribute.
 ///
-/// Each shorthand's value can be a static name (`#bar`, `.foo`), a dynamic
-/// splice (`#(expr)`, `.(expr)` — a paren-group Markup), and a class may carry a
-/// `[cond]` toggler (`.foo[active]`). A dynamic `#(expr)` id is recorded as
-/// `Dynamic` (unresolvable, like `id=(expr)`). Consuming the value and toggler
-/// is essential: leaving a `(expr)`/`[cond]` group unconsumed ends the element
-/// early, orphaning its `{ … }` body and firing false positives on the parent
-/// (e.g. `button.(cls) { "Save" }` losing its text).
+/// Each shorthand's value is a maud `HtmlNameOrMarkup`: a static name (`#bar`,
+/// `.foo`), a dynamic splice (`#(expr)`, `.(expr)` — a paren-group Markup), a
+/// braced markup group (`.{ … }`), or a MARKUP control value
+/// (`.@if primary { "primary" }`); a class may then carry a `[cond]` toggler
+/// (`.foo[active]`). A dynamic/markup id value is recorded as `Dynamic`
+/// (unresolvable, like `id=(expr)`). Consuming the value and toggler is
+/// essential: leaving a `(expr)`/`{ … }`/`@…`/`[cond]` group unconsumed ends the
+/// element early, orphaning its real `{ … }` body and firing false positives on
+/// the parent (e.g. `button.(cls) { "Save" }` or `button.@if c { "x" } { "Save" }`
+/// losing its text).
 fn parse_shorthand(trees: &[TokenTree], start: usize, attrs: &mut Vec<Attr>) -> usize {
     let mut i = start;
     while let Some(TokenTree::Punct(p)) = trees.get(i) {
@@ -775,8 +796,13 @@ fn parse_shorthand(trees: &[TokenTree], start: usize, attrs: &mut Vec<Attr>) -> 
         let is_id = sym == '#';
         i += 1; // consume the `#`/`.` — guarantees progress even with no name.
         match trees.get(i) {
-            // Dynamic shorthand value: `#(expr)` / `.(expr)`.
-            Some(TokenTree::Group(g)) if g.delimiter() == Delimiter::Parenthesis => {
+            // Dynamic shorthand value: `#(expr)` / `.(expr)`, or a braced markup
+            // group `#{ … }` / `.{ … }` — an unresolvable markup value. (A body
+            // brace never follows a `#`/`.` directly, so this is the class/id
+            // value, never the element body.)
+            Some(TokenTree::Group(g))
+                if matches!(g.delimiter(), Delimiter::Parenthesis | Delimiter::Brace) =>
+            {
                 if is_id {
                     attrs.push(Attr {
                         name: "id".to_owned(),
@@ -784,6 +810,20 @@ fn parse_shorthand(trees: &[TokenTree], start: usize, attrs: &mut Vec<Attr>) -> 
                     });
                 }
                 i += 1;
+            }
+            // Markup-valued shorthand via a maud control:
+            // `.@if c { "x" }` / `#@match … { … }`. Fully consume the control
+            // (head + brace group(s) + any `@else` chain) so the element's real
+            // body that follows is still parsed. The value is unresolvable, so an
+            // id records as `Dynamic`.
+            Some(TokenTree::Punct(q)) if q.as_char() == '@' => {
+                if is_id {
+                    attrs.push(Attr {
+                        name: "id".to_owned(),
+                        value: AttrValue::Dynamic,
+                    });
+                }
+                i = skip_shorthand_control(trees, i + 1);
             }
             // Static shorthand value: `#bar` / `.foo` (possibly hyphenated).
             _ => {
@@ -806,6 +846,22 @@ fn parse_shorthand(trees: &[TokenTree], start: usize, attrs: &mut Vec<Attr>) -> 
         }
     }
     i
+}
+
+/// Consume a markup-valued class/id control value (`.@if c { "x" }`), returning
+/// the index just past it. `start` points just past the `@`, at the control
+/// keyword. Reuses the same control/match/let skippers as node parsing; any
+/// markup they descend into is discarded — a class/id value is a maud
+/// `NoElement` context and can render no element to scan.
+fn skip_shorthand_control(trees: &[TokenTree], start: usize) -> usize {
+    let mut discard = Vec::new();
+    if matches!(trees.get(start), Some(TokenTree::Ident(id)) if *id == "match") {
+        skip_match(trees, start + 1, &mut discard)
+    } else if matches!(trees.get(start), Some(TokenTree::Ident(id)) if *id == "let") {
+        skip_let(trees, start + 1)
+    } else {
+        skip_control(trees, start, &mut discard)
+    }
 }
 
 /// Parse one attribute (`name`, `name="v"`, `name=(expr)`, `name[cond]`, …).
@@ -1832,6 +1888,81 @@ mod tests {
         // A static `#id` shorthand with no matching label is still flagged.
         let src = wrap(r#"input#name type="text";"#);
         assert_eq!(rule_ids(&src), vec!["label"], "{:?}", findings_for(&src));
+    }
+
+    // ── maud implicit-div leading shorthand (no explicit tag) ───────────────
+
+    #[test]
+    fn leading_class_shorthand_is_implicit_div_not_input() {
+        // Regression (false positive): `.input { }` is an implicit `<div
+        // class="input">`, NOT an `<input>` element — the class token is a VALUE,
+        // not a tag. A `<div>` triggers no rule, so nothing is flagged.
+        let src = wrap(r".input { }");
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn leading_id_shorthand_is_implicit_div_not_button() {
+        // `#button { }` is an implicit `<div id="button">`, not a `<button>`.
+        let src = wrap(r"#button { }");
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn leading_class_shorthand_with_text_is_implicit_div() {
+        // `.input { "x" }` is still an implicit `<div>`; its text body is not a
+        // control name obligation.
+        let src = wrap(r#".input { "x" }"#);
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn implicit_div_wrapping_real_input_still_flags_inner_input() {
+        // The implicit `<div class="card">` triggers no rule itself, but its body
+        // is still scanned: a real unlabeled `<input>` inside is STILL flagged.
+        let src = wrap(r".card { input; }");
+        assert_eq!(rule_ids(&src), vec!["label"], "{:?}", findings_for(&src));
+    }
+
+    // ── maud markup-valued class shorthand (`.@if c { "x" }`) ────────────────
+
+    #[test]
+    fn markup_valued_class_shorthand_does_not_truncate_button() {
+        // Regression (false positive): `.@if primary { "primary" }` is a
+        // MARKUP-valued class value; the button's real body is the FOLLOWING
+        // `{ "Save" }`. The class control must be fully consumed so the body is
+        // parsed — otherwise the button is analyzed as empty and falsely flagged.
+        let src = wrap(r#"button.@if primary { "primary" } { "Save" }"#);
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn markup_valued_class_shorthand_empty_button_still_flagged() {
+        // The markup class value is consumed, but a genuinely empty body is still
+        // caught (no over-correction into a false negative).
+        let src = wrap(r#"button.@if primary { "primary" } { }"#);
+        assert_eq!(
+            rule_ids(&src),
+            vec!["button-name"],
+            "{:?}",
+            findings_for(&src)
+        );
+    }
+
+    #[test]
+    fn markup_valued_class_shorthand_before_attr_and_body_is_clean() {
+        // A markup class value followed by a real attribute and body: the anchor
+        // keeps its `href` and its `{ "Link" }` text, so it is not flagged.
+        let src = wrap(r#"a.@if c { "x" } href="/y" { "Link" }"#);
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn splice_valued_class_shorthand_stays_clean() {
+        // A splice-valued class `.(dynamic_class)` was already handled; it must
+        // stay clean (the button keeps its "Save" body).
+        let src = wrap(r#"button.(dynamic_class) { "Save" }"#);
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
     }
 
     // ── aria-hidden on the control itself ───────────────────────────────────
