@@ -216,17 +216,32 @@ pub fn grade_ssh_reachability(
         );
     }
 
-    match TcpStream::connect_timeout(&addrs[0], timeout) {
-        Ok(_) => PreflightCheck::pass(
-            "ssh_reachability",
-            format!("SSH port reachable at {host}:{ssh_port}"),
-        ),
-        Err(e) => PreflightCheck::fail(
-            "ssh_reachability",
-            format!("cannot reach {host}:{ssh_port}: {e}"),
-            "Confirm the server is up, the SSH port is open, and any firewall allows your IP",
-        ),
+    // Probe every resolved address, not just the first. A dual-stack host may
+    // resolve to an IPv6 address first that an IPv4-only client cannot reach
+    // (or vice versa); the port is reachable as long as ANY address connects.
+    // Fail only when all of them fail, reporting the last error.
+    let mut last_err = None;
+    for addr in &addrs {
+        match TcpStream::connect_timeout(addr, timeout) {
+            Ok(_) => {
+                return PreflightCheck::pass(
+                    "ssh_reachability",
+                    format!("SSH port reachable at {host}:{ssh_port}"),
+                );
+            }
+            Err(e) => last_err = Some(e),
+        }
     }
+
+    let detail = last_err.map_or_else(
+        || format!("cannot reach {host}:{ssh_port}"),
+        |e| format!("cannot reach {host}:{ssh_port}: {e}"),
+    );
+    PreflightCheck::fail(
+        "ssh_reachability",
+        detail,
+        "Confirm the server is up, the SSH port is open, and any firewall allows your IP",
+    )
 }
 
 /// Grade signing-secret presence. Never prints the secret value.
@@ -302,10 +317,17 @@ pub fn grade_migrate_check(migrations_dir: &Path) -> PreflightCheck {
 
 /// Render the systemd service unit that supervises the deployed app.
 ///
-/// The unit runs `autumn serve --release` from the release directory, restarts
-/// on failure, comes back after reboot (`WantedBy=multi-user.target`), and
-/// sources secrets from an `EnvironmentFile` so they are never inlined into the
-/// world-readable unit (AC-5).
+/// An autumn app compiled with `autumn build --embed` is a standalone server
+/// binary (the generated Dockerfile launches it directly as
+/// `CMD ["/usr/local/bin/<app>"]`, with no `serve` subcommand). The deploy flow
+/// uploads that pre-built binary into a timestamped release dir fronted by the
+/// `current` symlink, so the unit execs the deployed binary at
+/// `{app_dir}/current/{app_name}` directly — it must NOT run
+/// `autumn serve --release`, which would rebuild the project from source.
+///
+/// The unit restarts on failure, comes back after reboot
+/// (`WantedBy=multi-user.target`), and sources secrets from an `EnvironmentFile`
+/// so they are never inlined into the world-readable unit (AC-5).
 #[must_use]
 pub fn render_systemd_unit(cfg: &ResolvedDeployConfig) -> String {
     format!(
@@ -319,7 +341,7 @@ pub fn render_systemd_unit(cfg: &ResolvedDeployConfig) -> String {
          User={user}\n\
          WorkingDirectory={current}\n\
          EnvironmentFile={env_file}\n\
-         ExecStart=autumn serve --release\n\
+         ExecStart={current}/{app}\n\
          Restart=on-failure\n\
          RestartSec=2\n\
          \n\
@@ -598,7 +620,11 @@ mod tests {
         assert!(unit.contains("Description=Autumn application: shop"));
         assert!(unit.contains("User=deploy"));
         assert!(unit.contains("WorkingDirectory=/srv/autumn/shop/current"));
-        assert!(unit.contains("ExecStart=autumn serve --release"));
+        // The unit execs the uploaded standalone app binary at the `current`
+        // symlink directly — never `autumn serve --release` (which would rebuild
+        // from source rather than run the pre-built release binary).
+        assert!(unit.contains("ExecStart=/srv/autumn/shop/current/shop"));
+        assert!(!unit.contains("autumn serve --release"));
         assert!(unit.contains("Restart=on-failure"));
         assert!(unit.contains("WantedBy=multi-user.target"));
         // Secrets come from an EnvironmentFile, never inlined into the unit.
@@ -679,6 +705,18 @@ mod tests {
         // A blank host is treated the same as unset.
         let blank = grade_ssh_reachability(Some("   "), 22, Duration::from_millis(50));
         assert!(!blank.passed);
+    }
+
+    #[test]
+    fn ssh_reachability_fails_when_all_addresses_unreachable() {
+        // Offline + deterministic: the loopback with a port nothing listens on
+        // refuses the connect on every resolved address, so the grader must FAIL
+        // (not pass). Using a literal IP avoids DNS so the test never depends on
+        // the resolver; port 1 is privileged and never bound by a test harness.
+        let check = grade_ssh_reachability(Some("127.0.0.1"), 1, Duration::from_millis(100));
+        assert!(!check.passed, "closed port should fail: {}", check.detail);
+        assert_eq!(check.name, "ssh_reachability");
+        assert!(check.detail.contains("cannot reach"));
     }
 
     #[test]

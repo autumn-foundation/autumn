@@ -37,9 +37,15 @@ fn deploy_plan_prints_unit_and_steps() {
     );
 
     // Renders the systemd unit with the resolved paths and an EnvironmentFile
-    // (secrets are never inlined into the unit).
+    // (secrets are never inlined into the unit). ExecStart runs the uploaded
+    // standalone app binary at the `current` symlink directly — NOT
+    // `autumn serve --release` (which would rebuild from source).
     assert!(
-        stdout.contains("ExecStart=autumn serve --release"),
+        stdout.contains("ExecStart=/srv/autumn/demoapp/current/demoapp"),
+        "stdout:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("autumn serve --release"),
         "stdout:\n{stdout}"
     );
     assert!(

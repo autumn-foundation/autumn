@@ -5728,9 +5728,20 @@ pub fn run(opts: DoctorOptions) {
     // secret, database URL, migrate check) always run when deploy is configured;
     // the SSH-reachability network probe is gated behind `--online` so `doctor`
     // stays offline and non-flaky by default, matching the ACME probes.
-    if let Some(deploy_cfg) = toml_table
-        .as_ref()
-        .and_then(|t| t.get("deploy").cloned())
+    //
+    // Resolve `[deploy]` from the MERGED active-profile runtime table (base
+    // autumn.toml + [profile.<env>] + autumn-<env>.toml), exactly like the
+    // sibling profile-aware checks (queue pinning, ACME) and the runtime config
+    // loader — NOT the raw top-level `toml_table`. A `[deploy]` block supplied
+    // only by an active profile (`autumn-<env>.toml` / `[profile.<env>].deploy`)
+    // is invisible to the raw table, so a raw-table lookup would skip the deploy
+    // preflight entirely (or `--online` would probe the base host instead of the
+    // effective target) — grading a deploy config the runtime never loads.
+    let (deploy_canonical, deploy_selected, _) = resolve_active_profiles();
+    let merged_deploy_toml = get_merged_toml_table_runtime(&deploy_canonical, &deploy_selected);
+    if let Some(deploy_cfg) = merged_deploy_toml
+        .get("deploy")
+        .cloned()
         .and_then(|v| v.try_into::<DeployConfig>().ok())
     {
         let deploy_signing = resolve_optional_signing_secret();
