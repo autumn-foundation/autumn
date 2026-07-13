@@ -34,6 +34,7 @@ them; on 0.5.0 fall back to the documented manual alternative.
 | `task` | `task RecalculateCounts` | `#[task]` operational command |
 | `auth` | `auth User --oauth github,google` | Full auth scaffold (login/register/password reset/OAuth); **(trunk-dev)** also scaffolds a configurable password policy and persistent "remember me" login by default, authenticated change-password/change-email flows, and `--magic-link` passwordless login |
 | `admin` | `admin Post title:String body:Text` | Admin plugin resource page — fields must be supplied explicitly; generator does not read the model |
+| `policy` **(trunk-dev)** | `policy Post` | Scaffolds `<Pascal>Policy`/`<Pascal>Scope` for an EXISTING model — owner-or-admin `update`/`delete` plus an owner-scoped `list`. When no owner column (`user_id`/`author_id`/`owner_id`) is found, emits a default-deny TODO stub instead (issue #1125) |
 | `system-test` | `system-test checkout_flow` | System test fixture (name must be `snake_case` or `PascalCase` — no hyphens) |
 | `pwa` | `pwa` | PWA scaffolding — manifest, service worker, offline shell, icons, route handlers, smoke test |
 | `wizard` | `wizard checkout shipping payment review` | Session-backed multi-step form — step structs, GET/POST handlers, confirm/commit/cancel, and ignored integration test skeletons |
@@ -64,7 +65,7 @@ accept aliases like `Integer` or `Boolean`.
 | `DateTime` | `TIMESTAMPTZ NOT NULL` | `DateTime<Utc>` |
 | `Uuid` | `UUID NOT NULL` | `Uuid` |
 | `Bytea` | `BYTEA NOT NULL` | `Vec<u8>` |
-| `Attachment` | `JSONB NULL` (blob metadata) | `Option<Blob>` (always nullable) — **requires `storage` feature in Cargo.toml**; generator does not add it automatically |
+| `Attachment` | `JSONB NULL` (blob metadata) | `Option<Blob>` (always nullable) — **requires `storage` feature in Cargo.toml**; generator does not add it automatically. **(trunk-dev)** the scaffold's create/update handlers take a `Multipart` extractor and stream to the blob store via `save_to_blob_store` (issue #1236) |
 | `Option<T>` | Nullable version of any above | `Option<T>` |
 | `references` **(trunk-dev)** | `post:references` → `post_id BIGINT NOT NULL REFERENCES posts(id)` + auto index | `i64` (field name gets `_id` appended; `post:references?` for `Option<i64>`) |
 | `enum{a,b,c}` **(trunk-dev)** | `TEXT` + `CHECK (col IN (...))` | Generated PascalCase Rust enum with Diesel/serde impls + `<select>` widget; `--default field=variant` sets SQL DEFAULT + `#[default]`. Quote the token in bash/zsh (brace expansion) |
@@ -184,6 +185,29 @@ Next steps:
 2. Run: autumn dev
 3. Visit: http://localhost:3000/<plural>
 ```
+
+**Scaffold record-level authorization (trunk-dev)**: scaffolds now emit a
+default-deny `Policy`/`Scope` by default. When an owner column is detected
+(`user_id` → `author_id` → `owner_id` → the first `*_id` column referencing
+`users`), the generator authorizes the create/edit/update/delete handlers and
+owner-scopes the index; pass `--no-policy` to opt out (issue #1125).
+
+**Scaffold typed path module (trunk-dev)**: scaffolds reference a generated
+`autumn_web::paths![index, show, new, create, edit, update, delete]` module
+(`+events` under `--live`, `+validate_{field}` under `--live-validation`) for
+every href/action/redirect/SSE endpoint/`hx-post` target instead of literal URL
+strings (issue #1133).
+
+**Scaffold sortable/filterable index (trunk-dev)**: the non-live,
+non-owner-scoped `GET /<plural>` index wires allowlisted sort/filter through the
+`ListQuery` extractor and `repo.list(&list_query, &page_req)` (`?sort=&dir=`,
+`?filter[col]=`), rendering sortable `data_table` headers (blob/attachment/enum
+columns excluded). Owner-scoped and `--live` indexes opt out (issue #1126).
+
+**Scaffold no-JS uploads (trunk-dev)**: `Attachment` fields produce working
+`multipart/form-data` uploads without JS — the create/update handlers take a
+`Multipart` extractor and stream to the blob store via `save_to_blob_store`
+(still requires the `storage` feature) (issue #1236).
 
 ### controller (trunk-dev)
 ```
@@ -386,6 +410,8 @@ oracle.
 - `--live` **(trunk-dev)**: For `scaffold` — repository broadcasts, a `LiveFragment` impl, an SSE stream route, and an SSE-wired index list
 - `--live-validation` **(trunk-dev)**: For `scaffold` — per-field inline validation endpoints with `hx-post` inputs (implies `--live`)
 - `--unique FIELD` / `--index FIELD` / `--default field=variant` **(trunk-dev)**: Constraint/index/default markers (see field table)
+- `--no-policy` **(trunk-dev)**: For `scaffold` — skip the default-generated record-level `Policy`/`Scope`. Ignored under `--api` (issue #1125)
+- `--searchable <field,field>` **(trunk-dev)**: For `scaffold` — make the named text fields Postgres full-text searchable. Emits `#[searchable]` attrs, a `search_vector` generated column + GIN index migration, and a search box wired to `GET /<plural>/search`. Rejected for non-text/unknown fields, uuid-PK models, and owner-scoped models; gated off under `--live`/`--live-validation` (issue #1319)
 
 ## Wizard name constraints
 

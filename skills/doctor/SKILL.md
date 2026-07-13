@@ -144,6 +144,32 @@ comes from a `[jobs.fleet] manifest` emitted by `autumn jobs manifest` (a TOML
 Without `[jobs.fleet]` the check stays informational-only (Pass), exactly as
 before (issue #1756).
 
+## TLS certificate check (unreleased — trunk-dev, issue #1603)
+
+On trunk-dev, `autumn doctor` adds a `tls` check that grades the `[server.tls]`
+configuration:
+
+- **Pass** — TLS is unconfigured (plain HTTP), or the configured leaf certificate
+  is valid and expires more than 30 days out.
+- **Warn** — the leaf certificate expires within 30 days, or the CLI was built
+  without the `tls` feature (so the cert cannot be fully graded).
+- **Fail** — a missing or invalid cert or key, a cert/key mismatch, or an
+  expired/not-yet-valid leaf or intermediate certificate.
+
+See issue #1852.
+
+## ACME preflight checks (unreleased — trunk-dev, issue #1608)
+
+On trunk-dev, `autumn doctor --online` (alias `--preflight`) runs active network
+probes, gated behind the CLI `acme` feature:
+
+- `acme_ports` — grades reachability of `:80` (HTTP-01) and `:443`.
+- `acme_dns` — grades whether the configured `[server.tls.acme]` domains resolve
+  to this host (`Matches` = pass, `PartialMatch` = warn, `ResolvesElsewhere` =
+  fail).
+
+Offline stored-cert expiry is also graded. See issue #1858.
+
 ## Secrets redaction
 
 Before displaying any output, redact values that look like secrets:

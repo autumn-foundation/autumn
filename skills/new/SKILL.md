@@ -70,6 +70,14 @@ First-run checklist:
   `i18n/en.ftl`, the `[i18n]` block in `autumn.toml`, and the `i18n` feature
   on `autumn-web`).
 - `--with-seed`: Scaffold a stub `src/bin/seed.rs` for database seeding.
+- `--api` **(trunk-dev)**: Scaffold a JSON-first app instead of the HTML/view
+  flavor (issue #1847). Handlers return `Json<…>`; `autumn-web` is pinned
+  `default-features = false` to a lean set (`db`, `cache-moka`, `http-client`,
+  `reporting`, `flash`), dropping the maud/htmx/tailwind view stack. No
+  `static/`, `input.css`, `tailwind.config.js`, vendored assets, or Tailwind
+  CI/README notes are generated, and the first `cargo run` serves JSON (no
+  `autumn setup` Tailwind download needed). `--api` conflicts with `--daemon`
+  and `--bundled-pg`, but composes with `--with-i18n` and `--with-seed`.
 
 ## Key files to know
 
