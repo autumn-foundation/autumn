@@ -2454,8 +2454,14 @@ fn generate_scaffold_unique_field_update_violation_form_preserves_submitted_valu
 
     // The violation-branch re-render (spliced into `update`) preserves the
     // *submitted* edits by rebuilding the changeset from the decoded form via
-    // `Changeset::from_errors` — no stale `row` refetch (issue #1124).
-    let update_body = &routes[update_start..];
+    // `Changeset::from_errors` — no stale `row` refetch (issue #1124). Scope to
+    // the `update` handler only (the trailing `destroy` handler also loads its
+    // row for the authorize preamble).
+    let update_only = &routes[update_start..];
+    let destroy_off = update_only
+        .find("pub async fn destroy")
+        .expect("destroy handler after update");
+    let update_body = &update_only[..destroy_off];
     assert!(
         update_body.contains("Changeset::from_errors(changeset.into_inner(), errors)"),
         "got:\n{update_body}"
@@ -2466,9 +2472,20 @@ fn generate_scaffold_unique_field_update_violation_form_preserves_submitted_valu
         update_body.contains("user_form_for(&changeset"),
         "got:\n{update_body}"
     );
+    // Issue #1830: the mutating handlers now record-authorize the actor, which
+    // loads the target row ONCE up front (`.first(&mut *db)` → `authorize`). That
+    // load feeds the policy check, NOT the 422 re-render — the violation branch
+    // still rebuilds the changeset from the submitted `form`, never a refetched
+    // row. So the only row load in `update` is the authorize preamble.
+    assert_eq!(
+        update_body.matches(".first(&mut *db)").count(),
+        1,
+        "the update violation path must not re-fetch the row for its re-render; \
+         the only load is the authorize preamble; got:\n{update_body}"
+    );
     assert!(
-        !update_body.contains(".first(&mut *db)"),
-        "the update violation path must not re-fetch the row; got:\n{update_body}"
+        update_body.contains("authorize::<User>(&state, &session, \"update\", &current)"),
+        "the single row load must be the authorize preamble; got:\n{update_body}"
     );
 }
 
@@ -2974,9 +2991,11 @@ fn generate_scaffold_without_unique_field_omits_unique_constraints() {
 
     let routes = fs::read_to_string(project.join("src/routes/posts.rs")).unwrap();
     assert!(!routes.contains("UNIQUE_CONSTRAINTS"), "got:\n{routes}");
+    // Issue #1830: no-owner scaffolds record-authorize their handlers too, so
+    // `State`/`Session` are threaded in before the last `body: Bytes` extractor.
     assert!(
         routes.contains(
-            "pub async fn create(flash: Flash, csrf: Option<CsrfToken>, csrf_field: Option<CsrfFormField>, submit_token: Option<SubmitToken>, submit_field: Option<SubmitFormField>, mut db: Db, body: Bytes) -> AutumnResult<autumn_web::reexports::axum::response::Response>"
+            "pub async fn create(flash: Flash, csrf: Option<CsrfToken>, csrf_field: Option<CsrfFormField>, submit_token: Option<SubmitToken>, submit_field: Option<SubmitFormField>, mut db: Db, \n    autumn_web::extract::State(state): autumn_web::extract::State<autumn_web::AppState>,\n    session: autumn_web::session::Session,\n    body: Bytes) -> AutumnResult<autumn_web::reexports::axum::response::Response>"
         ),
         "got:\n{routes}"
     );

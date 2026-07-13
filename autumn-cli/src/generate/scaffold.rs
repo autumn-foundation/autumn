@@ -460,22 +460,28 @@ fn plan_scaffold_with_options_impl(
             super::policy::OwnerColumn { name, nullable }
         })
     };
-    // Issue #1830: inline authorize/scope wiring is emitted on EVERY scaffold
-    // variant (standard, `--live`, `--sharded`, attachment) whenever an owner
-    // column exists — the per-variant plumbing differs (repository vs raw diesel
-    // vs a reused attachment `State`) but every mutating handler now loads its
-    // target row and record-authorizes the actor, and every index is
-    // owner-scoped. A default-deny policy wired into a *no-owner* scaffold would
-    // reject all mutations out of the box, so the no-owner case is handled
-    // separately (see `policy.rs`). The policy is still generated and registered
-    // in every non-`--api` case regardless, so the resource always ships an
-    // enforceable authorization surface.
-    let authorize_routes = policy_on && owner_column.is_some();
-    // The standard (non-live, non-sharded) diesel path. Retained as the signal
-    // for the cross-user 403 smoke test, which drives real HTTP create/update/
-    // delete as two users and is only wired for the plain diesel path (the live
-    // SSE and sharded runtimes need extra harness the smoke test doesn't set up).
-    let authorize_wiring = authorize_routes
+    // Issue #1830: inline record-level authorization is emitted on EVERY scaffold
+    // variant (standard, `--live`, `--sharded`, attachment) whenever a policy is
+    // generated — including the no-owner case. The per-variant plumbing differs
+    // (repository vs raw diesel vs a reused attachment `State`) but every mutating
+    // handler loads its target row and record-authorizes the actor. Routing the
+    // mutation through the policy gives the developer ONE place to tighten the
+    // rule; the generated no-owner policy authorizes any authenticated user (a
+    // no-regression over the prior `#[secured]`-only handlers, which already let
+    // any authenticated user mutate any row — see `policy.rs`), so a fresh
+    // no-owner scaffold never 403s out of the box.
+    let authorize_routes = policy_on;
+    // Whether the index is owner-scoped: only when an owner column exists. A
+    // no-owner scaffold authorizes its handlers but keeps the unscoped index
+    // (there is no column to filter on).
+    let owner_authorizes = policy_on && owner_column.is_some();
+    // The standard (non-live, non-sharded) diesel OWNER path. Retained as the
+    // signal for the cross-user 403 smoke test, which drives real HTTP create/
+    // update/delete as two users and is only meaningful with an owner column (the
+    // no-owner policy authorizes any authenticated user, so a cross-user denial
+    // would not hold) and only wired for the plain diesel path (the live SSE and
+    // sharded runtimes need extra harness the smoke test doesn't set up).
+    let authorize_wiring = owner_authorizes
         && !options_with_key.model.sharded
         && !options_with_key.live
         && !options_with_key.live_validation;
@@ -492,7 +498,7 @@ fn plan_scaffold_with_options_impl(
     // box; search is force-disabled for `--live`/`--live-validation` (see
     // `search_enabled`), so this covers the standard and `--sharded` owner paths.
     if !options_with_key.model.searchable.is_empty()
-        && authorize_routes
+        && owner_authorizes
         && !options_with_key.live
         && !options_with_key.live_validation
     {
@@ -1821,8 +1827,13 @@ fn render_routes_file(
     // second, conflicting `State` extractor — see `create_update_authz_params` /
     // `create_update_state_expr` below.
     // The owner column name (`user_id`/`author_id`/`owner_id`/a users FK). Only
-    // read when `authorize` is set (so the caller always passed `Some`).
+    // read when `owner_scoped_index` is set (so the caller passed `Some`).
     let owner_col = owner.unwrap_or("user_id");
+    // Issue #1830: the index is owner-scoped only when an owner column exists. A
+    // no-owner scaffold still record-authorizes its mutating handlers (`authorize`
+    // is set), but its index cannot filter by owner, so it keeps the unscoped
+    // listing.
+    let owner_scoped_index = authorize && owner.is_some();
     // The full extractor pair the authorize wiring needs on handlers that do not
     // already carry a `state:` wrapper. No trailing comma — each insertion site
     // supplies its own delimiter.
@@ -2693,7 +2704,7 @@ fn render_routes_file(
     // headers are opted-in per column by `render_columns_vec`.
     let table_render = if live {
         String::new()
-    } else if authorize {
+    } else if owner_scoped_index {
         // #1125 owner-scoped index: the handler runs a manual owner-filtered
         // query (not `repo.list`) and does not extract `ListQuery`, so its
         // data_table stays on the plain (non-sort/filter) config. #1126's
@@ -2758,7 +2769,7 @@ fn render_routes_file(
     } else {
         "mut db: Db"
     };
-    let index_handler = if authorize {
+    let index_handler = if owner_scoped_index {
         // Issue #1125/#1830: owner-scoped index for every variant with an owner
         // column. Pagination is preserved by running a `COUNT(*)` + `LIMIT/OFFSET`
         // query filtered to the current user's rows, then wrapping the result in
@@ -7677,13 +7688,16 @@ async fn main() {
             routes.contains("use autumn_web::reexports::axum::body::Bytes;"),
             "generated routes must be able to inspect raw form bytes: {routes}"
         );
+        // Issue #1830: no-owner scaffolds now also record-authorize their
+        // mutating handlers, so `State`/`Session` are threaded in before the
+        // body-consuming `Bytes` extractor (which stays last).
         assert!(
-            routes.contains("pub async fn create(flash: Flash, csrf: Option<CsrfToken>, csrf_field: Option<CsrfFormField>, submit_token: Option<SubmitToken>, submit_field: Option<SubmitFormField>, mut db: Db, body: Bytes)"),
+            routes.contains("pub async fn create(flash: Flash, csrf: Option<CsrfToken>, csrf_field: Option<CsrfFormField>, submit_token: Option<SubmitToken>, submit_field: Option<SubmitFormField>, mut db: Db, \n    autumn_web::extract::State(state): autumn_web::extract::State<autumn_web::AppState>,\n    session: autumn_web::session::Session,\n    body: Bytes)"),
             "create must decode after blank nullable normalization: {routes}"
         );
         assert!(
             routes.contains(
-                "pub async fn update(\n    flash: Flash,\n    csrf: Option<CsrfToken>,\n    csrf_field: Option<CsrfFormField>,\n    submit_token: Option<SubmitToken>,\n    submit_field: Option<SubmitFormField>,\n    id: Path<i64>,\n    mut db: Db,\n    body: Bytes,\n)"
+                "pub async fn update(\n    flash: Flash,\n    csrf: Option<CsrfToken>,\n    csrf_field: Option<CsrfFormField>,\n    submit_token: Option<SubmitToken>,\n    submit_field: Option<SubmitFormField>,\n    id: Path<i64>,\n    mut db: Db,\n    autumn_web::extract::State(state): autumn_web::extract::State<autumn_web::AppState>,\n    session: autumn_web::session::Session,\n    body: Bytes,\n)"
             ),
             "update must decode after blank nullable normalization: {routes}"
         );
@@ -11429,7 +11443,12 @@ async fn main() {
     }
 
     #[test]
-    fn no_owner_scaffold_registers_policy_but_leaves_handlers_secured_only() {
+    fn no_owner_scaffold_authorizes_via_authenticated_policy_without_scoping_index() {
+        // Issue #1830: no-owner scaffolds now record-authorize their mutating
+        // handlers too (routing the mutation through the enforceable policy), and
+        // the generated no-owner policy authorizes any authenticated user — so a
+        // fresh scaffold never 403s out of the box. There is no owner column, so
+        // the index is NOT owner-scoped.
         let tmp = project_with_main(default_main());
         let plan = plan_scaffold(
             tmp.path(),
@@ -11438,23 +11457,44 @@ async fn main() {
             "20260427000000",
         )
         .unwrap();
-        // Policy file still generated (default-deny + TODO) and registered.
+        // Policy generated (authenticated check + SECURITY TODO) and registered.
         let policy = action_contents(&plan, "src/policies/post.rs");
         assert!(
-            policy.contains("// TODO: no owner column detected"),
+            policy.contains("// SECURITY TODO: this only checks authentication"),
             "{policy}"
+        );
+        assert!(
+            policy.contains("Box::pin(async move { ctx.is_authenticated() })"),
+            "no-owner can_update/can_delete must authenticate-check: {policy}"
         );
         let main = action_contents(&plan, "src/main.rs");
         assert!(
             main.contains(".policy::<crate::models::post::Post, _>"),
             "{main}"
         );
-        // But mutating handlers keep #[secured]-only (no inline authorize) since
-        // a default-deny policy would 403 every mutation out of the box.
+        // Mutating handlers are now inline-authorized (edit/update/destroy) and
+        // create runs authorize_create — routed through the enforceable policy.
         let routes = action_contents(&plan, "src/routes/posts.rs");
+        assert_eq!(
+            routes
+                .matches("autumn_web::authorization::authorize::<Post>")
+                .count(),
+            3,
+            "no-owner edit/update/destroy must each authorize: {routes}"
+        );
         assert!(
-            !routes.contains("authorize::<Post>"),
-            "no-owner scaffold must not inline authorize: {routes}"
+            routes
+                .contains("autumn_web::authorization::authorize_create::<Post>(&state, &session)"),
+            "no-owner create must authorize_create: {routes}"
+        );
+        // But the index is NOT owner-scoped (no owner column to filter on).
+        assert!(
+            !routes.contains(".eq(owner_id)"),
+            "no-owner index must not be owner-scoped: {routes}"
+        );
+        assert!(
+            !routes.contains("PolicyContext::from_request(&state, &session)"),
+            "no-owner index must not build a PolicyContext for owner filtering: {routes}"
         );
     }
 
