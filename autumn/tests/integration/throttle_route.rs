@@ -27,8 +27,10 @@ async fn plain() -> &'static str {
 }
 
 // Each test gets its own uniquely-named handler so it maps to a distinct
-// `route_id` bucket in the process-global throttle registry. This keeps the
-// tests isolated under parallel `--test-threads` without any registry reset.
+// `route_id` bucket in the process-global throttle registry. As a further
+// guard against cross-test bucket bleed under parallel `--test-threads`, each
+// test also takes `security::TEST_LOCK` and resets the registry up front (see
+// the per-test isolation guard below).
 #[get("/retry-headers")]
 #[throttle(limit = 1, per = "1s", key = "ip")]
 async fn retry_headers() -> &'static str {
@@ -254,7 +256,18 @@ fn top_level_trusted_proxy_config() -> AutumnConfig {
 // ── Tests ───────────────────────────────────────────────────────────────────
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)]
 async fn throttled_route_429s_after_burst_while_sibling_route_unaffected() {
+    // Isolate the process-global `#[throttle]` registry: take the shared
+    // TEST_LOCK FIRST, then clear it, holding the guard for the whole test so
+    // no sibling repopulates or drops per-principal buckets mid-assertion
+    // (#1725). Every registry-touching test must hold the lock, since the
+    // reset clears the entire process-wide registry.
+    let _throttle_lock = autumn_web::security::TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    autumn_web::security::__throttle_registry_reset();
+
     let client = TestApp::new()
         .routes(routes![throttled, plain])
         .config(base_config())
@@ -293,7 +306,18 @@ async fn throttled_route_429s_after_burst_while_sibling_route_unaffected() {
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)]
 async fn primitive_returning_throttled_handler_compiles_and_throttles() {
+    // Isolate the process-global `#[throttle]` registry: take the shared
+    // TEST_LOCK FIRST, then clear it, holding the guard for the whole test so
+    // no sibling repopulates or drops per-principal buckets mid-assertion
+    // (#1725). Every registry-touching test must hold the lock, since the
+    // reset clears the entire process-wide registry.
+    let _throttle_lock = autumn_web::security::TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    autumn_web::security::__throttle_registry_reset();
+
     // Core proof is that `primitive_throttled` (a `#[throttle]` handler returning
     // `u32`) compiles at all. Also verify a throttled handler returning
     // `impl IntoResponse` and one returning `Response` compile and serve, and
@@ -328,7 +352,18 @@ async fn primitive_returning_throttled_handler_compiles_and_throttles() {
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)]
 async fn throttled_idempotent_replay_still_consumes_bucket_and_429s() {
+    // Isolate the process-global `#[throttle]` registry: take the shared
+    // TEST_LOCK FIRST, then clear it, holding the guard for the whole test so
+    // no sibling repopulates or drops per-principal buckets mid-assertion
+    // (#1725). Every registry-touching test must hold the lock, since the
+    // reset clears the entire process-wide registry.
+    let _throttle_lock = autumn_web::security::TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    autumn_web::security::__throttle_registry_reset();
+
     // limit = 1: the first keyed request succeeds and is cached; a second request
     // reusing the SAME Idempotency-Key must be denied by the throttle (429), not
     // served the cached 2xx. This proves the throttle check precedes the
@@ -362,7 +397,18 @@ async fn throttled_idempotent_replay_still_consumes_bucket_and_429s() {
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)]
 async fn throttled_idempotent_replay_consumes_bucket_with_throttle_attribute_first() {
+    // Isolate the process-global `#[throttle]` registry: take the shared
+    // TEST_LOCK FIRST, then clear it, holding the guard for the whole test so
+    // no sibling repopulates or drops per-principal buckets mid-assertion
+    // (#1725). Every registry-touching test must hold the lock, since the
+    // reset clears the entire process-wide registry.
+    let _throttle_lock = autumn_web::security::TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    autumn_web::security::__throttle_registry_reset();
+
     // Same guarantee as `throttled_idempotent_replay_still_consumes_bucket_and_429s`
     // but the handler is written with `#[throttle]` ABOVE `#[post]` (throttle
     // expands first, then the route macro). A replay reusing the same
@@ -398,7 +444,18 @@ async fn throttled_idempotent_replay_consumes_bucket_with_throttle_attribute_fir
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)]
 async fn throttled_429_carries_retry_after_and_ratelimit_headers() {
+    // Isolate the process-global `#[throttle]` registry: take the shared
+    // TEST_LOCK FIRST, then clear it, holding the guard for the whole test so
+    // no sibling repopulates or drops per-principal buckets mid-assertion
+    // (#1725). Every registry-touching test must hold the lock, since the
+    // reset clears the entire process-wide registry.
+    let _throttle_lock = autumn_web::security::TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    autumn_web::security::__throttle_registry_reset();
+
     let client = TestApp::new()
         .routes(routes![retry_headers])
         .config(throttle_only_config())
@@ -449,7 +506,18 @@ async fn throttled_429_carries_retry_after_and_ratelimit_headers() {
 /// This drives the route past its per-route limit while the global bucket still
 /// has ample quota, and asserts the 429 carries the ROUTE's headers.
 #[tokio::test]
+#[allow(clippy::await_holding_lock)]
 async fn throttle_429_headers_survive_enabled_global_limiter() {
+    // Isolate the process-global `#[throttle]` registry: take the shared
+    // TEST_LOCK FIRST, then clear it, holding the guard for the whole test so
+    // no sibling repopulates or drops per-principal buckets mid-assertion
+    // (#1725). Every registry-touching test must hold the lock, since the
+    // reset clears the entire process-wide registry.
+    let _throttle_lock = autumn_web::security::TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    autumn_web::security::__throttle_registry_reset();
+
     // Generous global limiter (rps/burst = 1000) + a strict per-route throttle
     // (limit = 1). The global bucket is nowhere near exhausted, so any 429 here
     // is purely the per-route throttle's doing.
@@ -489,7 +557,18 @@ async fn throttle_429_headers_survive_enabled_global_limiter() {
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)]
 async fn throttled_window_resets_after_sleep() {
+    // Isolate the process-global `#[throttle]` registry: take the shared
+    // TEST_LOCK FIRST, then clear it, holding the guard for the whole test so
+    // no sibling repopulates or drops per-principal buckets mid-assertion
+    // (#1725). Every registry-touching test must hold the lock, since the
+    // reset clears the entire process-wide registry.
+    let _throttle_lock = autumn_web::security::TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    autumn_web::security::__throttle_registry_reset();
+
     let client = TestApp::new()
         .routes(routes![window])
         .config(base_config())
@@ -520,7 +599,18 @@ async fn throttled_window_resets_after_sleep() {
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)]
 async fn named_limiter_reads_from_config() {
+    // Isolate the process-global `#[throttle]` registry: take the shared
+    // TEST_LOCK FIRST, then clear it, holding the guard for the whole test so
+    // no sibling repopulates or drops per-principal buckets mid-assertion
+    // (#1725). Every registry-touching test must hold the lock, since the
+    // reset clears the entire process-wide registry.
+    let _throttle_lock = autumn_web::security::TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    autumn_web::security::__throttle_registry_reset();
+
     let mut config = base_config();
     config.security.rate_limit.named.insert(
         "login".to_owned(),
@@ -551,7 +641,18 @@ async fn named_limiter_reads_from_config() {
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)]
 async fn independent_ips_have_independent_throttle_buckets() {
+    // Isolate the process-global `#[throttle]` registry: take the shared
+    // TEST_LOCK FIRST, then clear it, holding the guard for the whole test so
+    // no sibling repopulates or drops per-principal buckets mid-assertion
+    // (#1725). Every registry-touching test must hold the lock, since the
+    // reset clears the entire process-wide registry.
+    let _throttle_lock = autumn_web::security::TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    autumn_web::security::__throttle_registry_reset();
+
     let client = TestApp::new()
         .routes(routes![independent_ips])
         .config(base_config())
@@ -579,6 +680,7 @@ async fn independent_ips_have_independent_throttle_buckets() {
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)]
 async fn rate_limit_exempt_bypasses_per_route_throttle() {
     // The tower path can't set request extensions from the outside, so we
     // build a router directly and inject `RateLimitExempt` on every request.
@@ -588,6 +690,16 @@ async fn rate_limit_exempt_bypasses_per_route_throttle() {
     use axum::http::{Request, StatusCode};
     use std::net::SocketAddr;
     use tower::ServiceExt;
+
+    // Isolate the process-global `#[throttle]` registry: take the shared
+    // TEST_LOCK FIRST, then clear it, holding the guard for the whole test so
+    // no sibling repopulates or drops per-principal buckets mid-assertion
+    // (#1725). Every registry-touching test must hold the lock, since the
+    // reset clears the entire process-wide registry.
+    let _throttle_lock = autumn_web::security::TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    autumn_web::security::__throttle_registry_reset();
 
     // Use the raw axum router built by the framework (via TestApp::router) so
     // the throttle attribute wiring is exercised end-to-end.
@@ -643,6 +755,7 @@ async fn rate_limit_exempt_bypasses_per_route_throttle() {
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)]
 async fn envelope_counted_marker_still_charges_per_route_throttle() {
     // Regression for the split-marker fix (#1350): an MCP `tools/call` replay
     // now carries `RateLimitEnvelopeCounted` (not `RateLimitExempt`). That
@@ -655,6 +768,16 @@ async fn envelope_counted_marker_still_charges_per_route_throttle() {
     use axum::http::{Request, StatusCode};
     use std::net::SocketAddr;
     use tower::ServiceExt;
+
+    // Isolate the process-global `#[throttle]` registry: take the shared
+    // TEST_LOCK FIRST, then clear it, holding the guard for the whole test so
+    // no sibling repopulates or drops per-principal buckets mid-assertion
+    // (#1725). Every registry-touching test must hold the lock, since the
+    // reset clears the entire process-wide registry.
+    let _throttle_lock = autumn_web::security::TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    autumn_web::security::__throttle_registry_reset();
 
     let mut config = base_config();
     config.security.rate_limit.enabled = true;
@@ -688,6 +811,7 @@ async fn envelope_counted_marker_still_charges_per_route_throttle() {
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)]
 async fn principal_key_isolates_by_principal_extension() {
     use axum::Router;
     use axum::body::Body;
@@ -695,6 +819,16 @@ async fn principal_key_isolates_by_principal_extension() {
     use axum::http::{Request, StatusCode};
     use std::net::SocketAddr;
     use tower::ServiceExt;
+
+    // Isolate the process-global `#[throttle]` registry: take the shared
+    // TEST_LOCK FIRST, then clear it, holding the guard for the whole test so
+    // no sibling repopulates or drops per-principal buckets mid-assertion
+    // (#1725). Every registry-touching test must hold the lock, since the
+    // reset clears the entire process-wide registry.
+    let _throttle_lock = autumn_web::security::TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    autumn_web::security::__throttle_registry_reset();
 
     let mut config = base_config();
     // Use principal key strategy globally so populate_rate_limit_principal
@@ -741,7 +875,18 @@ async fn principal_key_isolates_by_principal_extension() {
 /// limit while principal B — with no `RateLimitPrincipal` extension either — still
 /// passes, proving keying is per-principal, not per-IP.
 #[tokio::test]
+#[allow(clippy::await_holding_lock)]
 async fn principal_key_derives_from_session_without_global_principal_middleware() {
+    // Isolate the process-global `#[throttle]` registry: take the shared
+    // TEST_LOCK FIRST, then clear it, holding the guard for the whole test so
+    // no sibling repopulates or drops per-principal buckets mid-assertion
+    // (#1725). Every registry-touching test must hold the lock, since the
+    // reset clears the entire process-wide registry.
+    let _throttle_lock = autumn_web::security::TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    autumn_web::security::__throttle_registry_reset();
+
     // Global limiter enabled but at its DEFAULT (IP) strategy — so the router
     // does NOT install populate_rate_limit_principal and no RateLimitPrincipal
     // extension is ever set. The global IP bucket is generous (burst = 1000), so
@@ -868,7 +1013,18 @@ async fn user_handler_429_receives_global_ratelimit_headers() {
 /// test transport sets no TCP peer, the limiter saw no key and *bypassed* every
 /// request — so neither request below would ever have been throttled.
 #[tokio::test]
+#[allow(clippy::await_holding_lock)]
 async fn throttle_ip_key_uses_top_level_trusted_proxies_resolver() {
+    // Isolate the process-global `#[throttle]` registry: take the shared
+    // TEST_LOCK FIRST, then clear it, holding the guard for the whole test so
+    // no sibling repopulates or drops per-principal buckets mid-assertion
+    // (#1725). Every registry-touching test must hold the lock, since the
+    // reset clears the entire process-wide registry.
+    let _throttle_lock = autumn_web::security::TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    autumn_web::security::__throttle_registry_reset();
+
     let client = TestApp::new()
         .routes(routes![trusted_proxy_ip])
         .config(top_level_trusted_proxy_config())
@@ -912,12 +1068,18 @@ async fn throttle_ip_key_uses_top_level_trusted_proxies_resolver() {
 #[cfg(all(feature = "redis", feature = "test-support"))]
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
+#[allow(clippy::await_holding_lock)]
 async fn throttle_redis_routes_do_not_share_bucket() {
     use autumn_web::security::{RateLimitBackend, RateLimitRedisConfig};
     use testcontainers::runners::AsyncRunner;
     use testcontainers_modules::redis::Redis as RedisImage;
 
-    // Isolate from any per-route limiters cached by earlier tests in this process.
+    // Isolate the process-global `#[throttle]` registry: take the shared
+    // TEST_LOCK FIRST, then clear it, holding the guard for the whole test so
+    // no sibling repopulates or drops per-route limiters mid-assertion (#1725).
+    let _throttle_lock = autumn_web::security::TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     autumn_web::security::__throttle_registry_reset();
 
     let container = RedisImage::default()
@@ -981,7 +1143,18 @@ async fn throttle_redis_routes_do_not_share_bucket() {
 /// driven past its limit (→ 429) while path B — same handler, same client IP —
 /// must still return 200, proving the buckets are isolated by mounted path.
 #[tokio::test]
+#[allow(clippy::await_holding_lock)]
 async fn inline_throttle_isolates_same_handler_mounted_at_two_paths() {
+    // Isolate the process-global `#[throttle]` registry: take the shared
+    // TEST_LOCK FIRST, then clear it, holding the guard for the whole test so
+    // no sibling repopulates or drops per-principal buckets mid-assertion
+    // (#1725). Every registry-touching test must hold the lock, since the
+    // reset clears the entire process-wide registry.
+    let _throttle_lock = autumn_web::security::TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    autumn_web::security::__throttle_registry_reset();
+
     let client = TestApp::new()
         .scoped(
             "/mount-a",
@@ -1035,7 +1208,18 @@ async fn inline_throttle_isolates_same_handler_mounted_at_two_paths() {
 /// intentionally NOT folded into a named limiter's key), so exhausting the
 /// budget on route A immediately throttles route B for the same client.
 #[tokio::test]
+#[allow(clippy::await_holding_lock)]
 async fn named_limiter_is_shared_across_two_routes() {
+    // Isolate the process-global `#[throttle]` registry: take the shared
+    // TEST_LOCK FIRST, then clear it, holding the guard for the whole test so
+    // no sibling repopulates or drops per-principal buckets mid-assertion
+    // (#1725). Every registry-touching test must hold the lock, since the
+    // reset clears the entire process-wide registry.
+    let _throttle_lock = autumn_web::security::TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    autumn_web::security::__throttle_registry_reset();
+
     let mut config = base_config();
     config.security.rate_limit.named.insert(
         "shared_login".to_owned(),
