@@ -17,6 +17,22 @@
 //! For the full set of Axum extractors, use
 //! `autumn_web::reexports::axum::extract`.
 
+// autumn-panic-gate: request-path module — production code path must be panic-free.
+// See CONTRIBUTING.md "Request-path panic gate". Justify exceptions with
+// #[allow(clippy::<lint>, reason = "…")] at the narrowest scope.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::todo,
+        clippy::unimplemented,
+        clippy::indexing_slicing,
+    )
+)]
+
 use axum::extract::{FromRequest, FromRequestParts};
 use axum::response::{IntoResponse, Response};
 
@@ -284,11 +300,7 @@ fn content_type_essence(raw: &str) -> &str {
 #[cfg(feature = "multipart")]
 fn prefix_looks_like_markup(prefix: &[u8]) -> bool {
     let bytes = prefix.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(prefix);
-    let trimmed = bytes
-        .iter()
-        .position(|byte| !byte.is_ascii_whitespace())
-        .map_or(&[][..], |idx| &bytes[idx..]);
-    trimmed.first() == Some(&b'<')
+    bytes.iter().find(|byte| !byte.is_ascii_whitespace()) == Some(&b'<')
 }
 
 /// Bound a content-type value before echoing it into an error message, so a

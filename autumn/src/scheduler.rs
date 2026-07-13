@@ -4,6 +4,22 @@
 //! The Postgres backend uses advisory locks so each fleet-wide task tick is
 //! claimed by at most one replica under normal operation.
 
+// autumn-panic-gate: request-path module — production code path must be panic-free.
+// See CONTRIBUTING.md "Request-path panic gate". Justify exceptions with
+// #[allow(clippy::<lint>, reason = "…")] at the narrowest scope.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::todo,
+        clippy::unimplemented,
+        clippy::indexing_slicing,
+    )
+)]
+
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -320,7 +336,12 @@ pub fn advisory_lock_key(key_prefix: &str, task_name: &str, tick_key: &str) -> i
     hasher.update(tick_key.as_bytes());
     let digest = hasher.finalize();
     let mut bytes = [0_u8; 8];
-    bytes.copy_from_slice(&digest[..8]);
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "infallible: SHA-256 digest is always 32 bytes, so [..8] is in bounds"
+    )]
+    let head = &digest[..8];
+    bytes.copy_from_slice(head);
     i64::from_be_bytes(bytes)
 }
 

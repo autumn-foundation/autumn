@@ -1,5 +1,21 @@
 //! Client sync loop: push pending changes, pull newer rows.
 
+// autumn-panic-gate: request-path module — production code path must be panic-free.
+// See CONTRIBUTING.md "Request-path panic gate". Justify exceptions with
+// #[allow(clippy::<lint>, reason = "…")] at the narrowest scope.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::todo,
+        clippy::unimplemented,
+        clippy::indexing_slicing,
+    )
+)]
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -111,6 +127,10 @@ impl SyncEngine {
     /// Panics if the HTTP client's TLS backend cannot be initialized
     /// (`reqwest::Client` construction).
     #[must_use]
+    #[allow(
+        clippy::expect_used,
+        reason = "infallible: reqwest client built from static config; a TLS-backend init failure is an unrecoverable environment fault surfaced as a documented panic"
+    )]
     pub fn new(store: SyncStore, config: SyncConfig) -> Self {
         let client = reqwest::Client::builder()
             .timeout(config.request_timeout)

@@ -8,6 +8,22 @@
 //! In dev mode, a Next.js-style error badge is injected into the HTML
 //! response for quick debugging.
 
+// autumn-panic-gate: request-path module — production code path must be panic-free.
+// See CONTRIBUTING.md "Request-path panic gate". Justify exceptions with
+// #[allow(clippy::<lint>, reason = "…")] at the narrowest scope.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::todo,
+        clippy::unimplemented,
+        clippy::indexing_slicing,
+    )
+)]
+
 use axum::response::{IntoResponse, Response};
 
 #[cfg(feature = "maud")]
@@ -454,10 +470,16 @@ fn form_pairs_to_nested_json(pairs: Vec<(String, String)>) -> serde_json::Value 
 /// `"user.password"` → `["user", "password"]`
 /// `"a[b][c]"` → `["a", "b", "c"]`
 /// `"simple"` → `["simple"]`
+#[allow(
+    clippy::indexing_slicing,
+    reason = "pos is a valid byte index returned by str::find('['); both slices split on that boundary"
+)]
 fn bracket_key_segments(key: &str) -> Vec<String> {
     // Dot notation: split on '.' first (only if no brackets present)
     if key.contains('[') {
-        let pos = key.find('[').unwrap();
+        let Some(pos) = key.find('[') else {
+            return vec![key.to_owned()];
+        };
         let mut parts = vec![key[..pos].to_owned()];
         for seg in key[pos + 1..].split('[') {
             let seg = seg.trim_end_matches(']');
@@ -476,6 +498,10 @@ fn bracket_key_segments(key: &str) -> Vec<String> {
     }
 }
 
+#[allow(
+    clippy::indexing_slicing,
+    reason = "path is guaranteed non-empty here and len >= 2 past the length guards below"
+)]
 fn form_insert_at_path(
     map: &mut serde_json::Map<String, serde_json::Value>,
     path: &[String],

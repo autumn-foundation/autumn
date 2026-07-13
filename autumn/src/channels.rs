@@ -17,6 +17,22 @@
 //! # // In async context: let msg = rx.recv().await.expect("should receive");
 //! ```
 
+// autumn-panic-gate: request-path module — production code path must be panic-free.
+// See CONTRIBUTING.md "Request-path panic gate". Justify exceptions with
+// #[allow(clippy::<lint>, reason = "…")] at the narrowest scope.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::todo,
+        clippy::unimplemented,
+        clippy::indexing_slicing,
+    )
+)]
+
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -253,26 +269,38 @@ struct ChannelMetricCounters {
 
 impl ChannelMetrics {
     fn ensure_topic(&self, topic: &str) {
-        let mut counters = self.counters.lock().expect("channel metrics lock poisoned");
+        let mut counters = self
+            .counters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         counters.entry(topic.to_owned()).or_default();
     }
 
     fn record_publish(&self, topic: &str) {
-        let mut counters = self.counters.lock().expect("channel metrics lock poisoned");
+        let mut counters = self
+            .counters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let stats = counters.entry(topic.to_owned()).or_default();
         stats.publishes = stats.publishes.saturating_add(1);
         drop(counters);
     }
 
     fn record_dropped(&self, topic: &str, count: u64) {
-        let mut counters = self.counters.lock().expect("channel metrics lock poisoned");
+        let mut counters = self
+            .counters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let stats = counters.entry(topic.to_owned()).or_default();
         stats.drops = stats.drops.saturating_add(count);
         drop(counters);
     }
 
     fn record_lagged(&self, topic: &str, count: u64) {
-        let mut counters = self.counters.lock().expect("channel metrics lock poisoned");
+        let mut counters = self
+            .counters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let stats = counters.entry(topic.to_owned()).or_default();
         stats.lags = stats.lags.saturating_add(count);
         drop(counters);
@@ -281,7 +309,7 @@ impl ChannelMetrics {
     fn snapshot(&self) -> HashMap<String, ChannelMetricCounters> {
         self.counters
             .lock()
-            .expect("channel metrics lock poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
     }
 
@@ -290,7 +318,10 @@ impl ChannelMetrics {
             return;
         }
 
-        let mut counters = self.counters.lock().expect("channel metrics lock poisoned");
+        let mut counters = self
+            .counters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         counters.retain(|topic, _| !topics.contains(topic));
         drop(counters);
     }
@@ -659,7 +690,11 @@ impl LocalChannelsBackend {
     }
 
     fn get_or_create_topic(&self, topic: &str) -> Arc<TopicState> {
-        let mut registry = self.inner.registry.lock().expect("channels lock poisoned");
+        let mut registry = self
+            .inner
+            .registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         #[allow(clippy::option_if_let_else)]
         if let Some(state) = registry.get(topic) {
@@ -699,7 +734,10 @@ impl LocalChannelsBackend {
         // every message a resumed subscriber receives is published strictly
         // after its snapshot, keeping the replay/live seam gapless. The id is
         // assigned even when there are zero receivers so ids stay dense.
-        let mut replay = state.replay.lock().expect("channel replay lock poisoned");
+        let mut replay = state
+            .replay
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let id = replay.next_id;
         replay.next_id = replay.next_id.saturating_add(1);
         replay.buf.push_back((id, msg.clone()));
@@ -728,7 +766,10 @@ impl LocalChannelsBackend {
         // `rx` can only ever observe messages published strictly after this
         // point (seqs `start_seq + 1, start_seq + 2, ...`), none of which are in
         // the snapshot below.
-        let replay_guard = state.replay.lock().expect("channel replay lock poisoned");
+        let replay_guard = state
+            .replay
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let rx = state.sender.subscribe();
         let start_seq = replay_guard.next_id.saturating_sub(1);
         let oldest = replay_guard.buf.front().map(|(seq, _)| *seq);
@@ -830,7 +871,11 @@ impl ChannelsBackend for LocalChannelsBackend {
     }
 
     fn channel_count(&self) -> usize {
-        let registry = self.inner.registry.lock().expect("channels lock poisoned");
+        let registry = self
+            .inner
+            .registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         registry.len()
     }
 
@@ -839,7 +884,11 @@ impl ChannelsBackend for LocalChannelsBackend {
         // topic kept alive only by transient SSE subscribers can lose its
         // replay history during a disconnect window (resumable-SSE is in-process
         // best-effort — see docs/guide/realtime.md, issue #1356).
-        let mut registry = self.inner.registry.lock().expect("channels lock poisoned");
+        let mut registry = self
+            .inner
+            .registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut removed_topics = HashSet::new();
         registry.retain(|topic, state| {
             // Keep topics with live receivers, or with outstanding keepalive
@@ -861,7 +910,11 @@ impl ChannelsBackend for LocalChannelsBackend {
         // subscribe paths touch metrics before registry, so snapshot must never
         // hold the registry mutex while reading metrics.
         let subscriber_counts: HashMap<String, usize> = {
-            let registry = self.inner.registry.lock().expect("channels lock poisoned");
+            let registry = self
+                .inner
+                .registry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             registry
                 .iter()
                 .map(|(topic, state)| (topic.clone(), state.sender.receiver_count()))
@@ -1188,6 +1241,10 @@ impl InterceptedChannelsBackend {
 }
 
 #[cfg(feature = "ws")]
+#[allow(
+    clippy::indexing_slicing,
+    reason = "idx < interceptors.len() is checked immediately before the index"
+)]
 fn run_chain(
     topic: &str,
     msg: &ChannelMessage,
