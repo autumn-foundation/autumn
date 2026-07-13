@@ -1068,15 +1068,28 @@ fn autumn_web_feature_markers(feature: &str) -> &'static [&'static str] {
         // use these APIs directly. Destroying the last attachment model must
         // not strip a feature such a route still needs (PR #1867 review).
         //
-        // `extract::Multipart` matches both the fully-qualified extractor
-        // type (`autumn_web::extract::Multipart`) and a `use
-        // autumn_web::extract::Multipart;` import, without matching unrelated
-        // identifiers that merely contain `Multipart`.
-        "multipart" => &["extract::Multipart"],
+        // Bare `Multipart` (not `extract::Multipart`) so the marker also
+        // catches a hand-written route that pulls the extractor in through
+        // `use autumn_web::prelude::*;` and names it UNQUALIFIED — the prelude
+        // re-exports `Multipart` (`autumn/src/prelude.rs`), so such a route
+        // contains neither `extract::Multipart` nor any storage path, and the
+        // narrower marker would let `destroy` wrongly strip the feature (PR
+        // #1867 review follow-up). This still matches the fully-qualified
+        // `autumn_web::extract::Multipart` the scaffold itself emits and any
+        // `use ...::Multipart;` import; the only extra hits are identifiers
+        // like `MultipartField`/`MultipartError`, which are themselves part of
+        // the multipart API surface, so over-retaining on them is harmless.
+        "multipart" => &["Multipart"],
         // `autumn_web::storage::` covers the model's blob column type
         // (`autumn_web::storage::Blob`) as well as route usage of the store
         // (`autumn_web::storage::BlobStoreState`, `save_to_blob_store`
         // call sites that reference the `autumn_web::storage::` path, etc.).
+        // Unlike `multipart`, the prelude does NOT re-export any storage type
+        // (`Blob`, `BlobStore`, `BlobStoreState`, …), so a hand-written
+        // storage user must reach them through a `autumn_web::storage::…`
+        // path — either fully qualified or via a `use autumn_web::storage::{…}`
+        // import line — both of which this marker already catches. There is no
+        // prelude-unqualified spelling to miss, so no extra marker is needed.
         "storage" => &["autumn_web::storage::"],
         _ => &[],
     }
@@ -2224,10 +2237,15 @@ mod tests {
         // `autumn-web/storage`; both must carry markers so `autumn destroy`
         // of the last attachment model can't strip a feature a hand-written
         // route still uses (PR #1867 review).
+        // The marker is the bare `Multipart` substring so it also catches a
+        // route that names the extractor unqualified via `use
+        // autumn_web::prelude::*;` (the prelude re-exports `Multipart`), not
+        // just the fully-qualified `autumn_web::extract::Multipart` spelling.
         let multipart = autumn_web_feature_markers("multipart");
         assert!(
-            multipart.contains(&"extract::Multipart"),
-            "multipart marker must catch `autumn_web::extract::Multipart` usage, got {multipart:?}"
+            multipart.contains(&"Multipart"),
+            "multipart marker must catch bare `Multipart` (covers prelude-unqualified \
+             and `autumn_web::extract::Multipart` usage), got {multipart:?}"
         );
 
         let storage = autumn_web_feature_markers("storage");
@@ -2241,13 +2259,18 @@ mod tests {
     fn multipart_and_storage_markers_retain_features_for_handwritten_routes() {
         // A hand-written route using the multipart extractor and the blob
         // store must keep those features alive even when the model/route the
-        // attachment scaffold generated is being destroyed (excluded).
+        // attachment scaffold generated is being destroyed (excluded). The
+        // route deliberately imports through `use autumn_web::prelude::*;` and
+        // names `Multipart` UNQUALIFIED (the prelude re-exports it), the exact
+        // shape the narrower `extract::Multipart` marker used to miss; the
+        // blob store stays a `autumn_web::storage::` path since the prelude
+        // does not re-export storage types.
         let tmp = tempfile::TempDir::new().unwrap();
         fs::create_dir_all(tmp.path().join("src/routes")).unwrap();
         let handwritten = tmp.path().join("src/routes/manual.rs");
         fs::write(
             &handwritten,
-            "use autumn_web::extract::Multipart;\n\n\
+            "use autumn_web::prelude::*;\n\n\
              async fn upload(mut mp: Multipart, store: autumn_web::storage::BlobStoreState) {}\n",
         )
         .unwrap();

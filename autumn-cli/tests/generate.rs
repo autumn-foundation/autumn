@@ -2766,10 +2766,15 @@ fn destroy_attachment_scaffold_keeps_features_used_by_handwritten_route() {
     );
 
     // A hand-written route that uses both the multipart extractor and the
-    // blob store directly — unrelated to the scaffold's generated files.
+    // blob store directly — unrelated to the scaffold's generated files. It
+    // imports through `use autumn_web::prelude::*;` and names `Multipart`
+    // UNQUALIFIED (the prelude re-exports it), the shape the earlier
+    // `extract::Multipart` marker would have missed — so destroy would have
+    // wrongly stripped `multipart`. The blob store stays a
+    // `autumn_web::storage::` path since the prelude re-exports no storage type.
     fs::write(
         project.join("src/routes/manual.rs"),
-        "use autumn_web::extract::Multipart;\n\n\
+        "use autumn_web::prelude::*;\n\n\
          pub async fn manual_upload(\n    \
          mut multipart: Multipart,\n    \
          store: autumn_web::storage::BlobStoreState,\n\
