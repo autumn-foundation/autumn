@@ -156,12 +156,14 @@ pub use captcha::{
 };
 pub use config::{
     CspNonceConfig, CsrfConfig, HeadersConfig, KeyStrategy, RateLimitBackend, RateLimitConfig,
-    RateLimitNamedConfig, RateLimitTierConfig, SecurityConfig, SigningSecretError,
-    SubmitTokenConfig, TrustedProxiesConfig, UploadConfig, default_content_security_policy,
-    hmac_sha256_hex, validate_signing_secret,
+    RateLimitNamedConfig, RateLimitTierConfig, SecurityConfig, SubmitTokenConfig,
+    TrustedProxiesConfig, UploadConfig, default_content_security_policy, hmac_sha256_hex,
 };
 #[cfg(feature = "redis")]
 pub use config::{RateLimitBackendFailure, RateLimitRedisConfig};
+// Exposed for autumn-cli's `autumn deploy` preflight to reuse the single source of truth for signing-secret validation; not yet a stable public API (may be promoted deliberately later).
+#[doc(hidden)]
+pub use config::{SigningSecretError, validate_signing_secret};
 pub use csrf::{CsrfFormField, CsrfLayer, CsrfToken, CsrfTokenHeader};
 pub use headers::{CspNonce, SecurityHeadersLayer};
 pub use proxy::TrustedProxy;
