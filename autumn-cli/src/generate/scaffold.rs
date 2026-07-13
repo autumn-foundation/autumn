@@ -21,8 +21,8 @@ use super::model::{
 use super::naming::{humanize_label, pascal, pluralize, snake};
 use super::schema_edit::{
     add_mod_declaration, create_table_sql_with_metadata_and_id, ensure_autumn_web_feature,
-    ensure_dev_dependency_test_support, ensure_dev_dependency_tokio_test_features,
-    unique_index_name, update_main_rs,
+    ensure_dependency_feature, ensure_dev_dependency_test_support,
+    ensure_dev_dependency_tokio_test_features, unique_index_name, update_main_rs,
 };
 use super::{GenerateError, ensure_project_root, read_or_empty};
 
@@ -848,6 +848,16 @@ pub fn plan_scaffold_with_options(
     // and `multipart` feature (the create/update handlers take an
     // `autumn_web::extract::Multipart` body and stream files to the store with
     // zero JavaScript). Enable both so a freshly scaffolded resource compiles.
+    //
+    // The generated create/update handlers also mint each blob key as
+    // `{plural}/{field}/{nanos}_{uuid}` — the `uuid::Uuid::new_v4()` suffix
+    // prevents two uploads for the same field colliding on an identical
+    // nanosecond timestamp (including two attachment fields in the SAME
+    // multipart request). `MODEL_DEPS` already declares `uuid` (with only the
+    // `serde` feature via `plan_cargo_deps` above), so enable its `v4` feature
+    // so that call resolves. Reverting the whole `uuid` dep at `destroy` time is
+    // handled by `plan_cargo_deps`'s `CargoDeps` revert, so no separate
+    // feature-revert is needed here.
     if has_attachment_fields(&fields) {
         let cargo_path = project_root.join("Cargo.toml");
         let base = plan
@@ -864,6 +874,7 @@ pub fn plan_scaffold_with_options(
         for feat in feats {
             updated = ensure_autumn_web_feature(&updated, feat);
         }
+        updated = ensure_dependency_feature(&updated, "uuid", "v4");
         if updated != base {
             plan.actions.retain(|a| a.path() != cargo_path);
             plan.modify(cargo_path.clone(), updated);
@@ -2071,8 +2082,9 @@ fn render_routes_file(
                 "            Some(\"{name}\") => {{\n                \
                  if field.file_name().is_some_and(|file_name| !file_name.is_empty()) {{\n                    \
                  let key = format!(\n                        \
-                 \"{plural}/{name}/{{}}\",\n                        \
-                 chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()\n                    \
+                 \"{plural}/{name}/{{}}_{{}}\",\n                        \
+                 chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default(),\n                        \
+                 uuid::Uuid::new_v4()\n                    \
                  );\n                    \
                  {name}_blob = Some(field.save_to_blob_store(&*store, key).await?);\n                \
                  }}\n            \
