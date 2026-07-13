@@ -296,16 +296,49 @@ fn accepts_html<B>(req: &axum::http::Request<B>) -> bool {
     accept_prefers_html(req.headers())
 }
 
+/// Which representation the client's `Accept` header prefers.
+///
+/// Produced by the single canonical negotiator [`accept_preference`]; the
+/// public [`accept_prefers_html`] wrapper is defined in terms of it so all
+/// content negotiation in the crate shares one source of truth.
+// `pub` here is crate-visible only: the enclosing `error_page_filter` module is
+// itself `pub(crate)`, so this never escapes the crate (clippy::redundant_pub_crate).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AcceptPreference {
+    /// `text/html` wins (explicitly or via q-values).
+    Html,
+    /// `application/json` (or `application/problem+json`) wins.
+    Json,
+    /// Only `*/*` present — no concrete html/json preference.
+    Any,
+    /// No `Accept` header, or it was empty.
+    Unspecified,
+}
+
 /// Check whether an Accept header prefers an HTML response over JSON.
 pub fn accept_prefers_html(headers: &axum::http::HeaderMap) -> bool {
+    matches!(
+        accept_preference(headers),
+        AcceptPreference::Html | AcceptPreference::Any
+    )
+}
+
+/// The one canonical q-value `Accept` negotiator.
+///
+/// Returns the client's concrete representation preference. Empty or missing
+/// `Accept` yields [`AcceptPreference::Unspecified`]; a `*/*`-only header
+/// yields [`AcceptPreference::Any`]. When both `text/html` and
+/// `application/json` are present, the higher q-value wins, ties broken by
+/// earlier list position.
+pub fn accept_preference(headers: &axum::http::HeaderMap) -> AcceptPreference {
     let accept = headers
         .get(axum::http::header::ACCEPT)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
 
-    // If no Accept header, default to JSON (API-first).
+    // If no Accept header, there is no concrete preference.
     if accept.is_empty() {
-        return false;
+        return AcceptPreference::Unspecified;
     }
 
     let mut html: Option<(f32, usize)> = None;
@@ -356,14 +389,20 @@ pub fn accept_prefers_html(headers: &axum::http::HeaderMap) -> bool {
 
     match (html, json, wildcard) {
         (Some((hq, hidx)), Some((jq, jidx)), _) => {
-            if (hq - jq).abs() < f32::EPSILON {
+            let html_wins = if (hq - jq).abs() < f32::EPSILON {
                 hidx < jidx
             } else {
                 hq > jq
+            };
+            if html_wins {
+                AcceptPreference::Html
+            } else {
+                AcceptPreference::Json
             }
         }
-        (Some(_), None, _) | (None, None, Some(_)) => true,
-        (None, Some(_), _) | (None, None, None) => false,
+        (Some(_), None, _) => AcceptPreference::Html,
+        (None, None, Some(_)) => AcceptPreference::Any,
+        (None, Some(_), _) | (None, None, None) => AcceptPreference::Json,
     }
 }
 
@@ -758,6 +797,48 @@ mod tests {
             .body(Body::empty())
             .unwrap();
         assert!(accepts_html(&req));
+    }
+
+    #[test]
+    fn prefers_html_for_ac_tie_case() {
+        // Acceptance-criteria case: html has the higher q-value and wins.
+        let headers = header_map("application/json;q=0.9, text/html;q=1.0");
+        assert!(accept_prefers_html(&headers));
+        assert_eq!(accept_preference(&headers), AcceptPreference::Html);
+    }
+
+    /// Build a `HeaderMap` with a single `Accept` header for direct
+    /// [`accept_preference`] / [`accept_prefers_html`] assertions.
+    fn header_map(accept: &str) -> axum::http::HeaderMap {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::ACCEPT,
+            axum::http::HeaderValue::from_str(accept).unwrap(),
+        );
+        headers
+    }
+
+    #[test]
+    fn accept_preference_maps_cases_and_wrapper_is_unchanged() {
+        // Empty / missing header → Unspecified, wrapper → false.
+        let empty = axum::http::HeaderMap::new();
+        assert_eq!(accept_preference(&empty), AcceptPreference::Unspecified);
+        assert!(!accept_prefers_html(&empty));
+
+        // `*/*` only → Any, wrapper → true.
+        let any = header_map("*/*");
+        assert_eq!(accept_preference(&any), AcceptPreference::Any);
+        assert!(accept_prefers_html(&any));
+
+        // `text/html` → Html, wrapper → true.
+        let html = header_map("text/html");
+        assert_eq!(accept_preference(&html), AcceptPreference::Html);
+        assert!(accept_prefers_html(&html));
+
+        // `application/json` → Json, wrapper → false.
+        let json = header_map("application/json");
+        assert_eq!(accept_preference(&json), AcceptPreference::Json);
+        assert!(!accept_prefers_html(&json));
     }
 
     // ── Integration tests with the full middleware pipeline ──────

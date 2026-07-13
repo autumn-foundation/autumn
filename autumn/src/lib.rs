@@ -345,6 +345,9 @@ pub(crate) mod logging;
 #[cfg(feature = "mcp")]
 pub mod mcp;
 pub mod middleware;
+/// Content-negotiated success responder (`Negotiate` / `Negotiated` / `Format`).
+#[cfg(feature = "maud")]
+pub mod negotiate;
 pub mod openapi;
 pub mod pagination;
 pub mod paths;
