@@ -1,3 +1,4 @@
+mod api_scaffold;
 mod cloud_native_scaffold;
 mod db;
 mod db_pull;
