@@ -408,7 +408,12 @@ enum Node {
     /// A non-empty static text node.
     Text(String),
     /// A splice `(expr)` or a control block — an unresolvable dynamic value.
-    Dynamic,
+    /// `splice` records whether it is a genuine `(expr)`/`[..]` splice (which
+    /// could render a `<label>` fragment beside a control) rather than an
+    /// `@`-control head; only the former marks a block as possibly-labeled.
+    Dynamic {
+        splice: bool,
+    },
 }
 
 /// Parse a maud markup token stream into a best-effort node list.
@@ -436,8 +441,9 @@ fn parse_nodes(trees: &[TokenTree]) -> Vec<Node> {
             }
             TokenTree::Punct(p) if p.as_char() == '@' => {
                 // Control flow (`@if`/`@for`/`@match`/`@let`): dynamic, but still
-                // descend into any block so elements inside are analyzed.
-                nodes.push(Node::Dynamic);
+                // descend into any block so elements inside are analyzed. Not a
+                // spliced fragment, so it never marks the block as possibly-labeled.
+                nodes.push(Node::Dynamic { splice: false });
                 if matches!(trees.get(i + 1), Some(TokenTree::Ident(id)) if *id == "match") {
                     // `@match` is special: the brace group after the scrutinee is
                     // an arm LIST, not markup. Parsing it as markup would treat
@@ -459,8 +465,9 @@ fn parse_nodes(trees: &[TokenTree]) -> Vec<Node> {
                 if g.delimiter() == Delimiter::Brace {
                     nodes.extend(parse_markup(&g.stream()));
                 } else {
-                    // A `(expr)` splice or `[..]` — an unresolvable dynamic value.
-                    nodes.push(Node::Dynamic);
+                    // A `(expr)` splice or `[..]` — an unresolvable dynamic value
+                    // that could render a `<label>` fragment beside a control.
+                    nodes.push(Node::Dynamic { splice: true });
                 }
                 i += 1;
             }
@@ -779,22 +786,32 @@ fn analyze_block(nodes: &[Node], file: &str, scan: &mut Scan) {
 /// label's `for` is a splice (which makes association unresolvable).
 fn collect_labels(nodes: &[Node], fors: &mut BTreeSet<String>, dynamic: &mut bool) {
     for node in nodes {
-        if let Node::Element(el) = node {
-            if el.name.eq_ignore_ascii_case("label") {
-                match el.attr("for") {
-                    // Only a label that actually provides a name satisfies the
-                    // association: an empty `<label for=..>` contributes no
-                    // accessible name, so recording it would let an unlabeled
-                    // control pass. A dynamic (spliced) body still counts, per
-                    // the non-failing-splice convention (`label_provides_name`).
-                    Some(AttrValue::Literal(v)) if label_provides_name(el) => {
-                        fors.insert(v.clone());
+        match node {
+            Node::Element(el) => {
+                if el.name.eq_ignore_ascii_case("label") {
+                    match el.attr("for") {
+                        // Only a label that actually provides a name satisfies the
+                        // association: an empty `<label for=..>` contributes no
+                        // accessible name, so recording it would let an unlabeled
+                        // control pass. A dynamic (spliced) body still counts, per
+                        // the non-failing-splice convention (`label_provides_name`).
+                        Some(AttrValue::Literal(v)) if label_provides_name(el) => {
+                            fors.insert(v.clone());
+                        }
+                        Some(AttrValue::Dynamic) if label_provides_name(el) => *dynamic = true,
+                        _ => {}
                     }
-                    Some(AttrValue::Dynamic) if label_provides_name(el) => *dynamic = true,
-                    _ => {}
                 }
+                collect_labels(&el.children, fors, dynamic);
             }
-            collect_labels(&el.children, fors, dynamic);
+            // A spliced fragment `(expr)` beside a control could itself render a
+            // `<label for=..>`, making the association unresolvable. Mirror the
+            // dynamic-`for` convention and mark the block as possibly-labeled
+            // rather than risk a false positive on valid fragment-composed forms.
+            // An `@`-control head (`splice: false`) is not a fragment and never
+            // sets this, so unrelated static controls stay flagged.
+            Node::Dynamic { splice: true } => *dynamic = true,
+            Node::Dynamic { splice: false } | Node::Text(_) => {}
         }
     }
 }
@@ -926,7 +943,7 @@ fn is_aria_hidden(el: &Element) -> bool {
 /// per ARIA their text does not count toward the ancestor's accessible name.
 fn content_provides_name(nodes: &[Node]) -> bool {
     nodes.iter().any(|n| match n {
-        Node::Dynamic => true,
+        Node::Dynamic { .. } => true,
         Node::Text(t) => !t.trim().is_empty(),
         Node::Element(e) if is_aria_hidden(e) => false,
         Node::Element(e) => {
@@ -936,26 +953,13 @@ fn content_provides_name(nodes: &[Node]) -> bool {
     })
 }
 
-/// Whether a `<label>` provides a name to a control it wraps: any visible text
-/// or a dynamic (spliced) label body.
+/// Whether a `<label>` provides an accessible name to a control (whether it
+/// wraps the control or associates via `for`). This uses the SAME accessible-
+/// name walk as buttons and links (`content_provides_name`): visible text or a
+/// dynamic (spliced) body counts, a named child `<img alt>` counts, and an
+/// `aria-hidden="true"` subtree does NOT — its text is not an accessible name.
 fn label_provides_name(el: &Element) -> bool {
-    subtree_has_text(&el.children) || subtree_has_dynamic(&el.children)
-}
-
-fn subtree_has_text(nodes: &[Node]) -> bool {
-    nodes.iter().any(|n| match n {
-        Node::Text(t) => !t.trim().is_empty(),
-        Node::Element(e) => subtree_has_text(&e.children),
-        Node::Dynamic => false,
-    })
-}
-
-fn subtree_has_dynamic(nodes: &[Node]) -> bool {
-    nodes.iter().any(|n| match n {
-        Node::Dynamic => true,
-        Node::Element(e) => subtree_has_dynamic(&e.children),
-        Node::Text(_) => false,
-    })
+    content_provides_name(&el.children)
 }
 
 // ── Output ─────────────────────────────────────────────────────────────────
@@ -1204,6 +1208,25 @@ mod tests {
         assert_eq!(rule_ids(&src), vec!["label"], "{:?}", findings_for(&src));
     }
 
+    #[test]
+    fn spliced_label_fragment_beside_control_is_not_flagged() {
+        // A label composed as a separate fragment and spliced next to the raw
+        // control could render a `<label for=..>`; the association is
+        // unresolvable, so per the non-failing-splice convention the control is
+        // treated as possibly-labeled (regression: false positive).
+        let src = wrap(r#"(field_label) input id="email";"#);
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn unlabeled_input_with_no_splice_is_still_flagged() {
+        // With no spliced fragment anywhere in the block, an unlabeled control
+        // must still be flagged — the fragment marker must not suppress unrelated
+        // static controls.
+        let src = wrap(r#"input id="x";"#);
+        assert_eq!(rule_ids(&src), vec!["label"], "{:?}", findings_for(&src));
+    }
+
     // ── Rule 3: button-name ────────────────────────────────────────────────
 
     #[test]
@@ -1310,6 +1333,40 @@ mod tests {
         // positive on valid dynamic markup.
         let src = wrap(r#"button { span aria-hidden=(flag) { "×" } }"#);
         assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn label_with_only_aria_hidden_text_does_not_satisfy_association() {
+        // The `<label>` body is entirely `aria-hidden="true"`, which per ARIA
+        // contributes no accessible name — the label check must use the same
+        // hidden-excluding name walk as buttons/links, so the field is FLAGGED
+        // (regression: false negative — hidden text was wrongly accepted).
+        let src = wrap(r#"label for="q" { span aria-hidden="true" { "Search" } } input id="q";"#);
+        assert_eq!(rule_ids(&src), vec!["label"], "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn label_with_alt_image_satisfies_association() {
+        // A `<label>` whose only content is an `<img alt=..>` has an accessible
+        // name via the alt text, so the associated field is CLEAN (regression:
+        // false positive — the img alt was previously ignored).
+        let src = wrap(r#"label for="q" { img src="s.svg" alt="Search"; } input id="q";"#);
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn label_with_plain_text_still_satisfies_association() {
+        // Unchanged: a `<label for=..>` with real visible text names the field.
+        let src = wrap(r#"label for="e" { "Email" } input id="e";"#);
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn empty_label_body_still_does_not_satisfy_association() {
+        // Unchanged: an empty `<label for=..>` provides no accessible name, so
+        // the associated field is FLAGGED.
+        let src = wrap(r#"label for="e" { } input id="e";"#);
+        assert_eq!(rule_ids(&src), vec!["label"], "{:?}", findings_for(&src));
     }
 
     // ── Escape-hatch / dynamic limits ──────────────────────────────────────
