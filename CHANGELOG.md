@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **a11y:** the typed `a11y::TextField` primitive (issue #1706) can now carry
+  the wrapper/validation attributes that raw scaffold form-fields need — a
+  `class`, the `aria-invalid`/`aria-describedby` error wiring, and the HTML5
+  validation constraints `aria-required`/`minlength`/`maxlength`/`min`/`max`/
+  `step` — via new chainable builder methods. Crucially, the compile-time
+  "must have an accessible name" guarantee is preserved: the new setters are
+  available in both type-states but none of them supplies a label, so a
+  `TextField<NoLabel>` still cannot be rendered until `.label(..)` /
+  `.aria_label(..)` / `.labelled_by(..)` transitions it to `Labeled` (proven by
+  a trybuild compile-fail fixture that sets every new attribute and still fails
+  to `.render()`). This unblocks routing raw scaffold form-fields through the
+  primitive instead of hand-rolled `html!`.
 - **config:** Autumn now auto-loads a project-root `.env` file, feeding its
   values into the highest (`AUTUMN_*` environment-variable) configuration layer.
   It is not a new precedence tier: a real shell environment variable of the same

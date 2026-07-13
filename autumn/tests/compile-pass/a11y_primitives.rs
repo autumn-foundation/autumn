@@ -36,6 +36,28 @@ fn main() {
     let _search = TextField::new("q").aria_label("Search").render();
     let _named = TextField::new("q").labelled_by("search-heading").render();
 
+    // A labeled field carrying the scaffold wrapper/validation attributes still
+    // renders — the presentational/constraint setters never lift the label
+    // obligation, they only enrich a field that already has (or later gets) a
+    // label.
+    let _constrained = TextField::new("title")
+        .class("autumn-field__input")
+        .aria_invalid(false)
+        .described_by("title-error")
+        .required()
+        .aria_required()
+        .minlength(3)
+        .maxlength(120)
+        .label("Title")
+        .render();
+    let _ratio = TextField::new("ratio")
+        .input_type("number")
+        .min("0")
+        .max("1")
+        .step("any")
+        .aria_label("Ratio")
+        .render();
+
     // Link carries its visible text as the accessible name; href + text are both
     // required.
     let _about = Link::new("/about", "About us").class("nav").render();
