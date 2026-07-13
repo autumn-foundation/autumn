@@ -5936,6 +5936,7 @@ async fn build_acme_tls_listener(
         // Filled in at the renewal spawn site once the scheduler coordinator has
         // been built and any distributed → in-process fallback is known.
         leadership_degraded: false,
+        renew_window_misconfigured: std::sync::atomic::AtomicBool::new(false),
     };
     Ok((
         listener,

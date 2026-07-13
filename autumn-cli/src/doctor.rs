@@ -4268,11 +4268,34 @@ fn resolve_static_tls_presence() -> (bool, bool) {
         .and_then(toml::Value::as_table)
         .and_then(|s| s.get("tls"))
         .and_then(toml::Value::as_table);
-    // Mirror the runtime env-override application (`env.var(..).ok()`), which
-    // treats an empty-but-set var as present (`Some("")`).
-    let cert_env = std::env::var("AUTUMN_SERVER__TLS__CERT_PATH").is_ok();
-    let key_env = std::env::var("AUTUMN_SERVER__TLS__KEY_PATH").is_ok();
+    // Read the static cert/key env overrides through the SAME profile-aware dotenv
+    // overlay the sibling `resolve_tls_paths()` uses — NOT the bare process env.
+    // The runtime applies `AUTUMN_SERVER__TLS__CERT_PATH`/`KEY_PATH` from the
+    // `.env`/`.env.<profile>` overlay (`TomlEnvConfigLoader`), so a static cert/key
+    // supplied there alongside `[server.tls.acme]` is a mixed static+ACME config
+    // the runtime rejects at boot. Reading only the process env would miss the
+    // dotenv-supplied override, letting the static-vs-ACME XOR pass `doctor
+    // --strict` on a config the server won't start. Fall back to the bare OS env
+    // only if the overlay can't be built (a malformed `.env`).
+    let denv: Box<dyn autumn_web::config::Env> =
+        match autumn_web::dotenv::os_env_with_dotenv_for_profile(&canonical) {
+            Ok(e) => Box::new(e),
+            Err(_) => Box::new(autumn_web::config::OsEnv),
+        };
+    let (cert_env, key_env) = static_tls_env_presence_in(denv.as_ref());
     static_tls_presence_from(tls, cert_env, key_env)
+}
+
+/// Whether the static `[server.tls]` cert/key env OVERRIDES are PRESENT in `env`
+/// (injectable for tests). A set-but-empty value counts as present, mirroring the
+/// runtime's `env.var(..).ok()` (an empty override is `Some("")`, a clearing
+/// override). Fed the profile-aware dotenv overlay by [`resolve_static_tls_presence`]
+/// so a cert/key supplied via `.env`/`.env.<profile>` is detected.
+fn static_tls_env_presence_in(env: &dyn autumn_web::config::Env) -> (bool, bool) {
+    (
+        env.var("AUTUMN_SERVER__TLS__CERT_PATH").is_ok(),
+        env.var("AUTUMN_SERVER__TLS__KEY_PATH").is_ok(),
+    )
 }
 
 /// Pure core of [`resolve_static_tls_presence`] (injectable for tests): the
@@ -4407,6 +4430,12 @@ pub struct AcmeDoctorConfig {
     /// runtime `AcmeConfig::validate()` rejects `0` (it binds an ephemeral OS port
     /// the HTTP-01 validator can never reach), so doctor mirrors that as a FAIL.
     pub http_challenge_port: u16,
+    /// Days-before-expiry renewal window. Defaults to 30 when unset. The runtime
+    /// `AcmeConfig::validate()` rejects a value `>= 90` (the effective max cert
+    /// lifetime): such a window keeps a freshly-issued cert perpetually "due",
+    /// re-ordering every tick and burning CA rate limits — doctor mirrors that as
+    /// a FAIL.
+    pub renew_before_days: u32,
     /// Directory holding the stored account + certificates.
     pub cache_dir: std::path::PathBuf,
     /// The per-directory subdirectory label the runtime store namespaces
@@ -4431,6 +4460,14 @@ pub struct AcmeDoctorConfig {
     /// `80` (which would hide a config the server won't start). `None` when the
     /// port is a valid `u16` or unset (unset uses the runtime default, `80`).
     pub port_error: Option<String>,
+    /// The rendered offending `domains` entry when the `domains` array contains a
+    /// NON-STRING element (e.g. `domains = ["app.example.com", 123]`). The
+    /// runtime's typed `Vec<String>` deserialization FAILS on such an entry and
+    /// the server won't boot, but doctor previously `filter_map`ped non-strings
+    /// away — keeping the valid names and passing while the server rejects the
+    /// config. Recorded here so the grader surfaces it as an `acme_config` FAIL.
+    /// `None` when every entry is a string (or `domains` is absent).
+    pub domains_error: Option<String>,
 }
 
 /// Deserialize `[server.tls.acme] directory` exactly as the runtime does.
@@ -4519,16 +4556,25 @@ fn resolve_acme_doctor_config(toml_table: Option<&toml::Table>) -> Option<AcmeDo
         .get("acme")
         .and_then(toml::Value::as_table)?;
 
-    let domains = acme
-        .get("domains")
-        .and_then(toml::Value::as_array)
-        .map(|a| {
-            a.iter()
-                .filter_map(toml::Value::as_str)
-                .map(str::to_owned)
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
+    // Collect the domains as the runtime's typed `Vec<String>` deserialization
+    // does — and, unlike a lenient `filter_map`, RECORD any non-string entry
+    // (e.g. `domains = ["app.example.com", 123]`) instead of silently dropping it.
+    // The runtime fails to deserialize such an array and won't boot, so the grader
+    // must FAIL rather than pass on the surviving string names.
+    let mut domains = Vec::new();
+    let mut domains_error = None;
+    if let Some(array) = acme.get("domains").and_then(toml::Value::as_array) {
+        for (index, entry) in array.iter().enumerate() {
+            let Some(domain) = entry.as_str() else {
+                domains_error = Some(format!(
+                    "entry at index {index} ({}) is not a string",
+                    entry.to_string().trim()
+                ));
+                break;
+            };
+            domains.push(domain.to_owned());
+        }
+    }
 
     let contact_email = acme
         .get("contact_email")
@@ -4547,6 +4593,17 @@ fn resolve_acme_doctor_config(toml_table: Option<&toml::Table>) -> Option<AcmeDo
         Err(bad_value) => (80, Some(bad_value)),
     };
 
+    // Deserialize `renew_before_days` the way the runtime's typed `AcmeConfig`
+    // does: an absent key defaults to 30, a valid in-range integer is preserved
+    // (including a >= 90 value, so the acme-config grader FAILs it exactly as
+    // `AcmeConfig::validate()` does), and a value the runtime would reject
+    // pre-boot (negative or out of `u32` range) is clamped to `u32::MAX` so it too
+    // trips the `>= 90` FAIL rather than silently falling back to the default.
+    let renew_before_days = acme
+        .get("renew_before_days")
+        .and_then(toml::Value::as_integer)
+        .map_or(30, |v| u32::try_from(v).unwrap_or(u32::MAX));
+
     let cache_dir = acme
         .get("cache_dir")
         .and_then(toml::Value::as_str)
@@ -4564,10 +4621,12 @@ fn resolve_acme_doctor_config(toml_table: Option<&toml::Table>) -> Option<AcmeDo
         domains,
         contact_email,
         http_challenge_port,
+        renew_before_days,
         cache_dir,
         directory_label,
         directory_error,
         port_error,
+        domains_error,
     })
 }
 
@@ -4596,105 +4655,127 @@ pub fn check_acme_config_impl(
     domains: &[String],
     contact_email: &str,
     http_challenge_port: u16,
+    renew_before_days: u32,
     directory_error: Option<&str>,
     port_error: Option<&str>,
+    domains_error: Option<&str>,
 ) -> Option<CheckResult> {
-    if let Some(bad_value) = directory_error {
-        return Some(CheckResult {
+    // All ACME-config violations share the same `acme_config` Fail shape; this
+    // collapses each branch to a detail + hint pair.
+    let fail = |detail: String, hint: &'static str| {
+        Some(CheckResult {
             name: "acme_config",
             status: CheckStatus::Fail,
-            detail: Some(format!(
+            detail: Some(detail),
+            hint: Some(hint),
+        })
+    };
+
+    if let Some(bad_value) = domains_error {
+        return fail(
+            format!(
+                "[server.tls.acme] domains {bad_value}: every entry must be a string hostname. \
+                 The runtime deserializes domains as a list of strings and fails to boot on a \
+                 non-string entry"
+            ),
+            "List only string hostnames in [server.tls.acme] domains",
+        );
+    }
+    if let Some(bad_value) = directory_error {
+        return fail(
+            format!(
                 "[server.tls.acme] directory value {bad_value} is not a valid ACME directory: use \
                  \"staging\", \"production\", or a custom directory URL. The runtime fails to boot \
                  on this value"
-            )),
-            hint: Some(
-                "Set [server.tls.acme] directory to \"staging\", \"production\", or a custom \
-                 directory URL",
             ),
-        });
+            "Set [server.tls.acme] directory to \"staging\", \"production\", or a custom directory \
+             URL",
+        );
     }
     if let Some(bad_value) = port_error {
-        return Some(CheckResult {
-            name: "acme_config",
-            status: CheckStatus::Fail,
-            detail: Some(format!(
+        return fail(
+            format!(
                 "[server.tls.acme] http_challenge_port value {bad_value} is not a valid port: it \
                  must be an integer in the range 0-65535 (the runtime fails to boot on an \
                  out-of-range or non-integer value)"
-            )),
-            hint: Some(
-                "Set [server.tls.acme] http_challenge_port to a valid port number (80, or the \
-                 port a front-end forwards `:80` to)",
             ),
-        });
+            "Set [server.tls.acme] http_challenge_port to a valid port number (80, or the port a \
+             front-end forwards `:80` to)",
+        );
     }
     if domains.is_empty() {
-        return Some(CheckResult {
-            name: "acme_config",
-            status: CheckStatus::Fail,
-            detail: Some(
-                "[server.tls.acme] domains must list at least one domain to request a \
-                 certificate for"
-                    .into(),
-            ),
-            hint: Some("Add at least one domain to [server.tls.acme] domains"),
-        });
+        return fail(
+            "[server.tls.acme] domains must list at least one domain to request a certificate for"
+                .to_owned(),
+            "Add at least one domain to [server.tls.acme] domains",
+        );
     }
     if contact_email.trim().is_empty() {
-        return Some(CheckResult {
-            name: "acme_config",
-            status: CheckStatus::Fail,
-            detail: Some(
-                "[server.tls.acme] contact_email must be set (the ACME CA requires an account \
-                 contact for expiry notifications)"
-                    .into(),
-            ),
-            hint: Some("Set [server.tls.acme] contact_email"),
-        });
+        return fail(
+            "[server.tls.acme] contact_email must be set (the ACME CA requires an account contact \
+             for expiry notifications)"
+                .to_owned(),
+            "Set [server.tls.acme] contact_email",
+        );
     }
     if http_challenge_port == 0 {
-        return Some(CheckResult {
+        return fail(
+            "[server.tls.acme] http_challenge_port must not be 0: port 0 binds an ephemeral \
+             OS-assigned port that the ACME HTTP-01 validator (which always connects on port 80) \
+             can never reach, so every issuance fails. Use 80, or the port a front-end forwards \
+             `:80` to"
+                .to_owned(),
+            "Set [server.tls.acme] http_challenge_port to 80 (or the port `:80` forwards to)",
+        );
+    }
+    if renew_before_days >= 90 {
+        return fail(
+            format!(
+                "[server.tls.acme] renew_before_days ({renew_before_days}) must be less than 90: \
+                 it is compared against the issued certificate's remaining validity, and \
+                 publicly-trusted CAs (e.g. Let's Encrypt) issue certificates that live at most \
+                 ~90 days. A value >= the certificate lifetime keeps the cert perpetually inside \
+                 its renew-before window, so the renewal loop would order a fresh certificate \
+                 every hour and burn the CA's rate limits"
+            ),
+            "Set [server.tls.acme] renew_before_days below 90 (default 30)",
+        );
+    }
+    check_acme_domain_entries(domains)
+}
+
+/// Grade individual `[server.tls.acme] domains` entries (blank / wildcard),
+/// mirroring `AcmeConfig::validate`'s per-entry rules. Extracted from
+/// [`check_acme_config_impl`] to keep that grader within the line budget.
+fn check_acme_domain_entries(domains: &[String]) -> Option<CheckResult> {
+    let fail = |detail: String, hint: &'static str| {
+        Some(CheckResult {
             name: "acme_config",
             status: CheckStatus::Fail,
-            detail: Some(
-                "[server.tls.acme] http_challenge_port must not be 0: port 0 binds an ephemeral \
-                 OS-assigned port that the ACME HTTP-01 validator (which always connects on port \
-                 80) can never reach, so every issuance fails. Use 80, or the port a front-end \
-                 forwards `:80` to"
-                    .into(),
-            ),
-            hint: Some(
-                "Set [server.tls.acme] http_challenge_port to 80 (or the port `:80` forwards to)",
-            ),
-        });
-    }
+            detail: Some(detail),
+            hint: Some(hint),
+        })
+    };
     for (index, domain) in domains.iter().enumerate() {
         let trimmed = domain.trim();
         if trimmed.is_empty() {
-            return Some(CheckResult {
-                name: "acme_config",
-                status: CheckStatus::Fail,
-                detail: Some(format!(
+            return fail(
+                format!(
                     "[server.tls.acme] domains must not contain blank entries (entry at index \
                      {index} is empty or whitespace-only)"
-                )),
-                hint: Some("Remove blank/whitespace-only entries from [server.tls.acme] domains"),
-            });
+                ),
+                "Remove blank/whitespace-only entries from [server.tls.acme] domains",
+            );
         }
         if trimmed.starts_with("*.") {
-            return Some(CheckResult {
-                name: "acme_config",
-                status: CheckStatus::Fail,
-                detail: Some(format!(
+            return fail(
+                format!(
                     "[server.tls.acme] wildcard domain `{trimmed}` is not supported: wildcards \
                      require the DNS-01 challenge, which is out of scope here (tracked in #1620). \
                      List explicit hostnames instead"
-                )),
-                hint: Some(
-                    "Remove wildcard domains; list explicit hostnames (DNS-01 tracked in #1620)",
                 ),
-            });
+                "Remove wildcard domains; list explicit hostnames (DNS-01 tracked in #1620)",
+            );
         }
     }
     None
@@ -5696,8 +5777,10 @@ pub fn run(opts: DoctorOptions) {
             &acme.domains,
             &acme.contact_email,
             acme.http_challenge_port,
+            acme.renew_before_days,
             acme.directory_error.as_deref(),
             acme.port_error.as_deref(),
+            acme.domains_error.as_deref(),
         ) {
             tasks.push(Box::new(move || config_fail));
         } else {
@@ -8562,7 +8645,7 @@ pub struct Vault {
     // doctor must FAIL it rather than silently pass acme_stored_cert.
     #[test]
     fn acme_config_fail_when_domains_empty() {
-        let r = check_acme_config_impl(&[], "ops@example.com", 80, None, None)
+        let r = check_acme_config_impl(&[], "ops@example.com", 80, 30, None, None, None)
             .expect("empty domains must be a FAIL, not Pass");
         assert!(matches!(r.status, CheckStatus::Fail));
         assert_eq!(r.name, "acme_config");
@@ -8570,8 +8653,16 @@ pub struct Vault {
 
     #[test]
     fn acme_config_fail_when_contact_email_blank() {
-        let r = check_acme_config_impl(&["app.example.com".to_owned()], "   ", 80, None, None)
-            .expect("blank contact_email must be a FAIL");
+        let r = check_acme_config_impl(
+            &["app.example.com".to_owned()],
+            "   ",
+            80,
+            30,
+            None,
+            None,
+            None,
+        )
+        .expect("blank contact_email must be a FAIL");
         assert!(matches!(r.status, CheckStatus::Fail));
     }
 
@@ -8581,6 +8672,8 @@ pub struct Vault {
             &["*.example.com".to_owned()],
             "ops@example.com",
             80,
+            30,
+            None,
             None,
             None,
         )
@@ -8599,6 +8692,8 @@ pub struct Vault {
                 &["app.example.com".to_owned()],
                 "ops@example.com",
                 80,
+                30,
+                None,
                 None,
                 None
             )
@@ -8613,8 +8708,16 @@ pub struct Vault {
     // identifier, so doctor must FAIL it rather than pass acme_stored_cert.
     #[test]
     fn acme_config_fail_when_domain_entry_blank() {
-        let r = check_acme_config_impl(&[String::new()], "ops@example.com", 80, None, None)
-            .expect("a blank domain entry must be a FAIL");
+        let r = check_acme_config_impl(
+            &[String::new()],
+            "ops@example.com",
+            80,
+            30,
+            None,
+            None,
+            None,
+        )
+        .expect("a blank domain entry must be a FAIL");
         assert!(matches!(r.status, CheckStatus::Fail));
         assert_eq!(r.name, "acme_config");
         assert!(
@@ -8624,8 +8727,16 @@ pub struct Vault {
         );
 
         // Whitespace-only is rejected the same way.
-        let r = check_acme_config_impl(&["   ".to_owned()], "ops@example.com", 80, None, None)
-            .expect("a whitespace-only domain entry must be a FAIL");
+        let r = check_acme_config_impl(
+            &["   ".to_owned()],
+            "ops@example.com",
+            80,
+            30,
+            None,
+            None,
+            None,
+        )
+        .expect("a whitespace-only domain entry must be a FAIL");
         assert!(matches!(r.status, CheckStatus::Fail));
     }
 
@@ -8639,6 +8750,8 @@ pub struct Vault {
             &["app.example.com".to_owned()],
             "ops@example.com",
             0,
+            30,
+            None,
             None,
             None,
         )
@@ -8683,8 +8796,10 @@ http_challenge_port = 70000
             &acme.domains,
             &acme.contact_email,
             acme.http_challenge_port,
+            acme.renew_before_days,
             acme.directory_error.as_deref(),
             acme.port_error.as_deref(),
+            acme.domains_error.as_deref(),
         )
         .expect("an out-of-range http_challenge_port must be a FAIL, not silently 80");
         assert!(matches!(r.status, CheckStatus::Fail));
@@ -8714,8 +8829,10 @@ http_challenge_port = \"80\"
             &acme.domains,
             &acme.contact_email,
             acme.http_challenge_port,
+            acme.renew_before_days,
             acme.directory_error.as_deref(),
             acme.port_error.as_deref(),
+            acme.domains_error.as_deref(),
         )
         .expect("a non-integer http_challenge_port must be a FAIL");
         assert!(matches!(r.status, CheckStatus::Fail));
@@ -8742,11 +8859,115 @@ http_challenge_port = 8080
                 &acme.domains,
                 &acme.contact_email,
                 acme.http_challenge_port,
+                acme.renew_before_days,
                 acme.directory_error.as_deref(),
                 acme.port_error.as_deref(),
+                acme.domains_error.as_deref(),
             )
             .is_none(),
             "a valid http_challenge_port must not raise an acme_config FAIL"
+        );
+    }
+
+    // Regression (#1608, Codex P2): a `renew_before_days` >= the issued cert's
+    // lifetime (~90 days for a public CA) keeps a freshly-issued cert perpetually
+    // "due", so the renewal loop re-orders every tick and burns CA rate limits.
+    // The runtime `AcmeConfig::validate()` rejects it, so doctor must mirror that
+    // as an `acme_config` FAIL rather than silently defaulting.
+    #[test]
+    fn acme_config_fail_when_renew_before_days_at_or_above_cert_lifetime() {
+        let raw: toml::Table = toml::from_str(
+            "\
+[server.tls.acme]
+domains = [\"app.example.com\"]
+contact_email = \"ops@example.com\"
+renew_before_days = 100
+",
+        )
+        .unwrap();
+        let acme = resolve_acme_doctor_config(Some(&raw)).expect("[server.tls.acme] present");
+        assert_eq!(acme.renew_before_days, 100);
+        let r = check_acme_config_impl(
+            &acme.domains,
+            &acme.contact_email,
+            acme.http_challenge_port,
+            acme.renew_before_days,
+            acme.directory_error.as_deref(),
+            acme.port_error.as_deref(),
+            acme.domains_error.as_deref(),
+        )
+        .expect("renew_before_days >= 90 must be a FAIL");
+        assert!(matches!(r.status, CheckStatus::Fail));
+        assert_eq!(r.name, "acme_config");
+        let detail = r.detail.as_deref().unwrap_or_default();
+        assert!(
+            detail.contains("renew_before_days") && detail.contains("100"),
+            "detail must name the bad renew_before_days value: {detail}"
+        );
+
+        // A sane sub-lifetime value must NOT FAIL.
+        let raw: toml::Table = toml::from_str(
+            "\
+[server.tls.acme]
+domains = [\"app.example.com\"]
+contact_email = \"ops@example.com\"
+renew_before_days = 30
+",
+        )
+        .unwrap();
+        let acme = resolve_acme_doctor_config(Some(&raw)).expect("[server.tls.acme] present");
+        assert_eq!(acme.renew_before_days, 30);
+        assert!(
+            check_acme_config_impl(
+                &acme.domains,
+                &acme.contact_email,
+                acme.http_challenge_port,
+                acme.renew_before_days,
+                acme.directory_error.as_deref(),
+                acme.port_error.as_deref(),
+                acme.domains_error.as_deref(),
+            )
+            .is_none(),
+            "a valid renew_before_days must not raise an acme_config FAIL"
+        );
+    }
+
+    // Regression (#1608, Codex P2): a NON-STRING entry in the `domains` array
+    // (`domains = ["app.example.com", 123]`) fails the runtime's typed
+    // `Vec<String>` deserialization and the server won't boot, but doctor
+    // previously `filter_map`ped it away — keeping the valid name and passing.
+    // `resolve_acme_doctor_config` now records the bad entry and the grader FAILs.
+    #[test]
+    fn acme_config_fail_when_domain_entry_not_a_string() {
+        let raw: toml::Table = toml::from_str(
+            "\
+[server.tls.acme]
+domains = [\"app.example.com\", 123]
+contact_email = \"ops@example.com\"
+",
+        )
+        .unwrap();
+        let acme = resolve_acme_doctor_config(Some(&raw)).expect("[server.tls.acme] present");
+        assert!(
+            acme.domains_error.is_some(),
+            "a non-string domain entry must be recorded, not silently dropped"
+        );
+        let r = check_acme_config_impl(
+            &acme.domains,
+            &acme.contact_email,
+            acme.http_challenge_port,
+            acme.renew_before_days,
+            acme.directory_error.as_deref(),
+            acme.port_error.as_deref(),
+            acme.domains_error.as_deref(),
+        )
+        .expect("a non-string domain entry must be a FAIL, not silently dropped");
+        assert!(matches!(r.status, CheckStatus::Fail));
+        assert_eq!(r.name, "acme_config");
+        let detail = r.detail.as_deref().unwrap_or_default();
+        assert!(
+            detail.contains("domains") && detail.contains("123"),
+            "detail must name the non-string domains entry: {detail}"
         );
     }
 
@@ -8778,8 +8999,10 @@ directory = \"prod\"
             &acme.domains,
             &acme.contact_email,
             acme.http_challenge_port,
+            acme.renew_before_days,
             acme.directory_error.as_deref(),
             acme.port_error.as_deref(),
+            acme.domains_error.as_deref(),
         )
         .expect("an invalid `directory` must be a FAIL, not silently staging");
         assert!(matches!(r.status, CheckStatus::Fail));
@@ -8834,8 +9057,10 @@ contact_email = \"ops@example.com\"
                     &acme.domains,
                     &acme.contact_email,
                     acme.http_challenge_port,
+                    acme.renew_before_days,
                     acme.directory_error.as_deref(),
                     acme.port_error.as_deref(),
+                    acme.domains_error.as_deref(),
                 )
                 .is_none(),
                 "valid directory `{line}` must not raise an acme_config FAIL"
@@ -9014,6 +9239,62 @@ contact_email = \"ops@example.com\"
         );
     }
 
+    // Regression (#1608, Codex P2): the static-vs-ACME XOR must read the static
+    // cert/key env overrides through the SAME profile-aware dotenv overlay the
+    // sibling `resolve_tls_paths()` uses — not the bare process env. A cert/key
+    // supplied via `.env`/`.env.<profile>` alongside `[server.tls.acme]` is a mixed
+    // static+ACME config the runtime rejects at boot; reading only the process env
+    // would miss it and pass `doctor --strict`. `static_tls_env_presence_in` reads
+    // the overlay (fed a `MockEnv` here, standing in for the dotenv overlay), so
+    // the dotenv-supplied cert/key are seen as present and the mixed-mode FAIL fires.
+    #[test]
+    fn tls_mode_fails_when_dotenv_overlay_supplies_cert_key_with_acme() {
+        use autumn_web::config::MockEnv;
+
+        // cert/key present ONLY through the overlay (never TOML), one of them an
+        // empty clearing override — both must count as PRESENT, mirroring the
+        // runtime's `env.var(..).ok()`.
+        let env = MockEnv::new()
+            .with("AUTUMN_SERVER__TLS__CERT_PATH", "/dotenv/cert.pem")
+            .with("AUTUMN_SERVER__TLS__KEY_PATH", "");
+        let (cert_env, key_env) = static_tls_env_presence_in(&env);
+        assert!(
+            cert_env,
+            "a dotenv-supplied CERT_PATH must be seen as present"
+        );
+        assert!(
+            key_env,
+            "a present-but-empty dotenv KEY_PATH override is still present"
+        );
+
+        // With no static cert/key in TOML but both supplied via the overlay, the
+        // static keys are present — combined with acme, that is the mixed mode the
+        // runtime rejects, so the tls_mode grader FAILs.
+        let (has_static_cert, has_static_key) = static_tls_presence_from(None, cert_env, key_env);
+        assert!(has_static_cert && has_static_key);
+        let r = check_tls_mode_impl(has_static_cert, has_static_key, true)
+            .expect("dotenv-supplied static cert/key + [server.tls.acme] must FAIL as mixed mode");
+        assert!(matches!(r.status, CheckStatus::Fail));
+        assert_eq!(r.name, "tls_mode");
+        assert!(
+            r.detail
+                .as_deref()
+                .unwrap_or_default()
+                .contains("[server.tls.acme]"),
+            "the FAIL must name the mutually-exclusive [server.tls.acme]"
+        );
+
+        // Sanity: with the overlay reporting NO TLS env vars, the same TOML-less
+        // config is a valid ACME-only deployment (no mixed-mode FAIL).
+        let empty = MockEnv::new();
+        let (c, k) = static_tls_env_presence_in(&empty);
+        let (hc, hk) = static_tls_presence_from(None, c, k);
+        assert!(
+            check_tls_mode_impl(hc, hk, true).is_none(),
+            "no dotenv-supplied cert/key + acme is a valid ACME-only mode"
+        );
+    }
+
     // An env override for `cert_path` — even an empty one — counts as static-mode
     // present, mirroring the runtime applying `AUTUMN_SERVER__TLS__CERT_PATH` as
     // `Some("")`.
@@ -9101,10 +9382,12 @@ directory = \"production\"
             domains: vec!["ok.example.com".to_owned(), "bad.example.com".to_owned()],
             contact_email: "ops@example.com".to_owned(),
             http_challenge_port: 80,
+            renew_before_days: 30,
             cache_dir: std::path::PathBuf::from("config/acme"),
             directory_label: "production".to_owned(),
             directory_error: None,
             port_error: None,
+            domains_error: None,
         };
 
         // Every configured domain is scheduled for probing, not just the first.

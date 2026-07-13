@@ -4773,6 +4773,25 @@ impl AcmeConfig {
                     .to_owned(),
             );
         }
+        // The renew-before window is compared against the issued certificate's
+        // REMAINING validity. Publicly-trusted CAs (Let's Encrypt) issue
+        // ~90-day certificates, so treat 90 days as the effective maximum cert
+        // lifetime: a `renew_before_days >= 90` keeps the freshly-issued
+        // certificate perpetually inside its renew-before window, so `needs_renewal`
+        // stays true immediately after every successful renewal and the hourly
+        // loop orders a brand-new certificate every tick until the CA's rate
+        // limits are hit. Reject it up front.
+        if self.renew_before_days >= 90 {
+            return Err(format!(
+                "[server.tls.acme] renew_before_days ({}) must be less than 90: it is compared \
+                 against the issued certificate's remaining validity, and publicly-trusted CAs \
+                 (e.g. Let's Encrypt) issue certificates that live at most ~90 days. A value >= \
+                 the certificate lifetime keeps the cert perpetually inside its renew-before \
+                 window, so the renewal loop would order a fresh certificate every hour and burn \
+                 the CA's rate limits. Use a smaller value (default 30)",
+                self.renew_before_days
+            ));
+        }
         for (index, domain) in self.domains.iter().enumerate() {
             let trimmed = domain.trim();
             if trimmed.is_empty() {
@@ -9666,6 +9685,48 @@ path = "/healthz"
         cfg.acme = Some(acme);
         let err = cfg.validate().unwrap_err();
         assert!(err.contains("http_challenge_port"), "got: {err}");
+    }
+
+    // Regression (#1608, Codex P2): a `renew_before_days` >= the issued cert's
+    // lifetime (treated as ~90 days for a public CA) keeps `needs_renewal` true
+    // immediately after every successful renewal, so the hourly loop re-orders a
+    // fresh cert every tick until the CA rate-limits the account. `validate()`
+    // must reject any value >= 90.
+    #[test]
+    fn validate_acme_renew_before_days_at_or_above_cert_lifetime_rejected() {
+        // Well above the cert lifetime (the reviewer's example).
+        let mut cfg = tls_static(None, None);
+        let mut acme = acme_cfg(&["app.example.com"], "ops@example.com");
+        acme.renew_before_days = 100;
+        cfg.acme = Some(acme);
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("renew_before_days"), "got: {err}");
+        assert!(err.contains("rate limits"), "got: {err}");
+
+        // Exactly 90 (== the effective max cert lifetime) is also rejected: the
+        // fresh cert would be due for renewal from the moment it is issued.
+        let mut cfg = tls_static(None, None);
+        let mut acme = acme_cfg(&["app.example.com"], "ops@example.com");
+        acme.renew_before_days = 90;
+        cfg.acme = Some(acme);
+        assert!(
+            cfg.validate().is_err(),
+            "renew_before_days == 90 must be rejected"
+        );
+
+        // A sane sub-lifetime value passes.
+        let mut cfg = tls_static(None, None);
+        let mut acme = acme_cfg(&["app.example.com"], "ops@example.com");
+        acme.renew_before_days = 30;
+        cfg.acme = Some(acme);
+        assert!(cfg.validate().is_ok(), "got: {:?}", cfg.validate());
+
+        // The just-below-boundary value (89) is still accepted.
+        let mut cfg = tls_static(None, None);
+        let mut acme = acme_cfg(&["app.example.com"], "ops@example.com");
+        acme.renew_before_days = 89;
+        cfg.acme = Some(acme);
+        assert!(cfg.validate().is_ok(), "got: {:?}", cfg.validate());
     }
 
     // Companion: a valid domain list plus the default challenge port is unaffected

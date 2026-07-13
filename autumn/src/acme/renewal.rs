@@ -278,6 +278,16 @@ pub struct AcmeRenewalTask {
     /// leadership is restored. Never set for a genuinely single-replica
     /// deployment (`scheduler.backend = in_process` → in-process is correct).
     pub leadership_degraded: bool,
+    /// Runtime backstop against a re-renewal loop that burns CA rate limits.
+    ///
+    /// Set once a freshly-issued certificate STILL immediately satisfies
+    /// [`needs_renewal`] — i.e. the configured `renew_before_days` is >= the
+    /// certificate's own lifetime (a value `AcmeConfig::validate()` rejects for
+    /// public CAs, but a custom directory issuing shorter-lived certificates can
+    /// still trip). While set, the loop refuses to order again — otherwise every
+    /// hourly tick would order a brand-new certificate until the CA rate-limits
+    /// the account. Cleared only by a restart (which re-runs config validation).
+    pub renew_window_misconfigured: std::sync::atomic::AtomicBool,
 }
 
 /// RAII guard tracking the HTTP-01 tokens published for one order.
@@ -384,6 +394,18 @@ impl AcmeRenewalTask {
         // swaps to a strictly-newer, fully-loadable pair.
         self.adopt_stored_cert_if_newer().await;
 
+        // Runtime backstop: a previous issuance produced a certificate that STILL
+        // immediately satisfied `needs_renewal` (the renew-before window is >= the
+        // cert's own lifetime). Ordering again would loop and burn the CA's rate
+        // limits, so refuse to order until a restart re-runs config validation.
+        // The failure was already recorded/reported when the flag was set.
+        if self
+            .renew_window_misconfigured
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return;
+        }
+
         // No stored cert (still on the placeholder), or a torn/mismatched pair
         // that does not load → treated as absent → always due.
         let due = self.stored_not_after().await.is_none_or(|not_after| {
@@ -459,6 +481,16 @@ impl AcmeRenewalTask {
             tracing::warn!(error = %e, "failed to release ACME renewal lease");
         }
 
+        self.handle_issue_outcome(outcome, reporter);
+    }
+
+    /// Record the result of one [`issue`](Self::issue) attempt and apply the
+    /// misconfigured-renew-window backstop.
+    ///
+    /// Extracted from [`try_renew_once`](Self::try_renew_once) (and kept
+    /// network-free) so the backstop is unit-testable without ordering a real
+    /// certificate.
+    fn handle_issue_outcome(&self, outcome: Result<i64, String>, reporter: &ReporterFn) {
         match outcome {
             Ok(not_after) => {
                 self.status.record_success(now_unix(), not_after);
@@ -466,6 +498,29 @@ impl AcmeRenewalTask {
                     cert_id = self.cert_id.as_str(),
                     "ACME certificate issued/renewed and hot-swapped into the TLS listener"
                 );
+
+                // Backstop (defense in depth): if the freshly-issued certificate
+                // ALREADY satisfies `needs_renewal`, the configured
+                // `renew_before_days` is >= the certificate's own lifetime.
+                // `AcmeConfig::validate()` rejects this for a public CA, but a
+                // custom directory issuing shorter-lived certs can still reach it.
+                // Re-ordering on the next tick would loop and burn the CA's rate
+                // limits, so record a failure, report it, and refuse to order
+                // again until a restart re-runs config validation.
+                if needs_renewal(not_after, self.config.renew_before_days, now_unix()) {
+                    let msg = format!(
+                        "ACME renewal: renew_before_days ({}) is >= the issued certificate \
+                         lifetime; refusing to re-order to avoid burning CA rate limits — lower \
+                         [server.tls.acme] renew_before_days below the certificate's validity \
+                         period",
+                        self.config.renew_before_days
+                    );
+                    tracing::error!("{msg}");
+                    self.status.record_failure(now_unix(), msg.clone());
+                    reporter(msg);
+                    self.renew_window_misconfigured
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                }
             }
             Err(e) => {
                 let msg = format!("ACME certificate issuance failed: {e}");
@@ -939,6 +994,7 @@ mod tests {
             config,
             serving_stored_cert: false,
             leadership_degraded: false,
+            renew_window_misconfigured: std::sync::atomic::AtomicBool::new(false),
         };
 
         // Capture reporter invocations.
@@ -1039,6 +1095,7 @@ mod tests {
             config,
             serving_stored_cert: false,
             leadership_degraded,
+            renew_window_misconfigured: std::sync::atomic::AtomicBool::new(false),
         };
         (task, store_dir, status)
     }
@@ -1284,6 +1341,99 @@ mod tests {
             task.stored_not_after().await,
             Some(na),
             "a valid matching pair reports its leaf notAfter normally"
+        );
+    }
+
+    // FIX 1 (#1608, Codex P2): a freshly-issued certificate that STILL immediately
+    // satisfies `needs_renewal` means the renew-before window is >= the cert's own
+    // lifetime. The loop must record a failure, report it, set the backstop flag,
+    // and — critically — NOT re-order on the next tick (no tight loop that burns CA
+    // rate limits).
+    #[tokio::test]
+    async fn backstop_refuses_reorder_when_fresh_cert_still_needs_renewal() {
+        // Default renew window is 30 days; simulate an issued cert that expires in
+        // only 1 day, so `needs_renewal` is immediately true.
+        let (task, _dir, status) = degraded_test_task(false);
+
+        let captured = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let sink = Arc::clone(&captured);
+        let reporter: ReporterFn = Arc::new(move |msg| sink.lock().unwrap().push(msg));
+
+        // Feed the post-issuance handler a "just issued" cert whose notAfter is
+        // inside the renew window — exactly what `issue()` would return for a
+        // misconfigured window.
+        task.handle_issue_outcome(Ok(now_unix() + DAY), &reporter);
+
+        // A failure is recorded and dispatched, naming the misconfiguration.
+        let snap = status.snapshot();
+        let failure = snap
+            .last_failure
+            .expect("a fresh cert still due for renewal must record a failure");
+        assert!(
+            failure.1.contains("refusing to re-order"),
+            "unexpected failure message: {}",
+            failure.1
+        );
+        let msgs = captured.lock().unwrap().clone();
+        assert_eq!(msgs.len(), 1, "reporter must be invoked once");
+        assert!(msgs[0].contains("refusing to re-order"));
+
+        // The backstop flag is now set.
+        assert!(
+            task.renew_window_misconfigured
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "the misconfigured-window backstop must be set"
+        );
+
+        // A subsequent tick must NOT order, even though the store is empty (which
+        // otherwise counts as due): the coordinator is never consulted.
+        let acquired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let coordinator: Arc<dyn SchedulerCoordinator> = Arc::new(RecordingCoordinator {
+            acquired: Arc::clone(&acquired),
+        });
+        task.maybe_renew(&coordinator, &reporter).await;
+        assert!(
+            !acquired.load(std::sync::atomic::Ordering::SeqCst),
+            "a backed-off loop must NOT re-order (no tight loop)"
+        );
+    }
+
+    // FIX 1 companion: a healthy issuance (cert far from expiry) must NOT trip the
+    // backstop — the loop stays free to renew normally when the next window opens.
+    #[tokio::test]
+    async fn healthy_issuance_does_not_trip_backstop() {
+        let (task, _dir, status) = degraded_test_task(false);
+        let reporter: ReporterFn = Arc::new(|_| {});
+
+        // Issued cert with 60 days of validity, 30-day window → not immediately due.
+        task.handle_issue_outcome(Ok(now_unix() + 60 * DAY), &reporter);
+
+        let snap = status.snapshot();
+        assert!(
+            snap.last_failure.is_none(),
+            "a healthy issuance must not record a failure"
+        );
+        assert!(
+            snap.last_success_unix.is_some(),
+            "a healthy issuance must record success"
+        );
+        assert!(
+            !task
+                .renew_window_misconfigured
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "a healthy issuance must not trip the backstop"
+        );
+
+        // And the loop is free to order when due (empty store → due) — the
+        // coordinator IS consulted.
+        let acquired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let coordinator: Arc<dyn SchedulerCoordinator> = Arc::new(RecordingCoordinator {
+            acquired: Arc::clone(&acquired),
+        });
+        task.maybe_renew(&coordinator, &reporter).await;
+        assert!(
+            acquired.load(std::sync::atomic::Ordering::SeqCst),
+            "a healthy issuance must leave the loop free to renew"
         );
     }
 }
