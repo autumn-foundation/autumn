@@ -4147,6 +4147,10 @@ pub fn check_tls_mode_impl(
 pub struct AcmeDoctorConfig {
     /// Configured domains (first is used for active probes).
     pub domains: Vec<String>,
+    /// Contact email registered with the ACME account. Empty when unset; the
+    /// runtime `AcmeConfig::validate()` rejects a missing/blank value at boot, so
+    /// doctor mirrors that as a FAIL.
+    pub contact_email: String,
     /// Directory holding the stored account + certificates.
     pub cache_dir: std::path::PathBuf,
     /// The per-directory subdirectory label the runtime store namespaces
@@ -4216,6 +4220,12 @@ fn resolve_acme_doctor_config(toml_table: Option<&toml::Table>) -> Option<AcmeDo
         })
         .unwrap_or_default();
 
+    let contact_email = acme
+        .get("contact_email")
+        .and_then(toml::Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+
     let cache_dir = acme
         .get("cache_dir")
         .and_then(toml::Value::as_str)
@@ -4225,9 +4235,67 @@ fn resolve_acme_doctor_config(toml_table: Option<&toml::Table>) -> Option<AcmeDo
 
     Some(AcmeDoctorConfig {
         domains,
+        contact_email,
         cache_dir,
         directory_label,
     })
+}
+
+/// Grade the resolved ACME config against the runtime's boot-time invariants,
+/// mirroring [`autumn_web::config::AcmeConfig::validate`] (pure; injectable for
+/// tests).
+///
+/// The runtime `TlsConfig::validate()` / `AcmeConfig::validate()` REJECTS an ACME
+/// config that (a) lists no `domains`, (b) has a blank `contact_email`, or (c)
+/// includes a wildcard `*.` domain (wildcards require DNS-01, tracked in #1620) —
+/// the server exits at boot. Doctor previously turned a missing/empty `domains`
+/// into an empty list and reported `acme_stored_cert` as Pass with no probes, so
+/// `doctor --strict` blessed a deployment that immediately exits. This grader
+/// returns a `Fail` [`CheckResult`] for the first violated rule (messages mirror
+/// `AcmeConfig::validate`'s), or `None` when the ACME config is valid.
+#[must_use]
+pub fn check_acme_config_impl(domains: &[String], contact_email: &str) -> Option<CheckResult> {
+    if domains.is_empty() {
+        return Some(CheckResult {
+            name: "acme_config",
+            status: CheckStatus::Fail,
+            detail: Some(
+                "[server.tls.acme] domains must list at least one domain to request a \
+                 certificate for"
+                    .into(),
+            ),
+            hint: Some("Add at least one domain to [server.tls.acme] domains"),
+        });
+    }
+    if contact_email.trim().is_empty() {
+        return Some(CheckResult {
+            name: "acme_config",
+            status: CheckStatus::Fail,
+            detail: Some(
+                "[server.tls.acme] contact_email must be set (the ACME CA requires an account \
+                 contact for expiry notifications)"
+                    .into(),
+            ),
+            hint: Some("Set [server.tls.acme] contact_email"),
+        });
+    }
+    for domain in domains {
+        if domain.starts_with("*.") {
+            return Some(CheckResult {
+                name: "acme_config",
+                status: CheckStatus::Fail,
+                detail: Some(format!(
+                    "[server.tls.acme] wildcard domain `{domain}` is not supported: wildcards \
+                     require the DNS-01 challenge, which is out of scope here (tracked in #1620). \
+                     List explicit hostnames instead"
+                )),
+                hint: Some(
+                    "Remove wildcard domains; list explicit hostnames (DNS-01 tracked in #1620)",
+                ),
+            });
+        }
+    }
+    None
 }
 
 /// The set of domains the `--online` doctor actively probes (port 80/443 + DNS).
@@ -5175,31 +5243,41 @@ pub fn run(opts: DoctorOptions) {
     // is configured: always inspect the stored certificate offline (expiry), and
     // — only under --online — actively probe port reachability and DNS.
     if let Some(acme) = acme_config {
-        // Offline: stored certificate expiry (reuses the #1603 inspect path).
-        // Scan ONLY the configured directory namespace the runtime store loads
-        // from ({cache_dir}/{directory_label}/), never sibling namespaces.
-        let cert_dir = acme.cache_dir.join(&acme.directory_label);
-        let stored = resolve_acme_stored_cert_data(&cert_dir, &acme.domains);
-        tasks.push(Box::new(move || check_acme_stored_cert_impl(&stored)));
+        // Mirror `AcmeConfig::validate()` FIRST: the runtime refuses to boot an
+        // ACME config with no domains, a blank contact_email, or a wildcard
+        // domain. Without this, doctor's empty-domains path reported
+        // `acme_stored_cert` as Pass with no probes, blessing a config that exits
+        // at boot. Emit the FAIL and SKIP the misleading stored-cert / online
+        // probes when the config is invalid (there is nothing valid to inspect).
+        if let Some(config_fail) = check_acme_config_impl(&acme.domains, &acme.contact_email) {
+            tasks.push(Box::new(move || config_fail));
+        } else {
+            // Offline: stored certificate expiry (reuses the #1603 inspect path).
+            // Scan ONLY the configured directory namespace the runtime store loads
+            // from ({cache_dir}/{directory_label}/), never sibling namespaces.
+            let cert_dir = acme.cache_dir.join(&acme.directory_label);
+            let stored = resolve_acme_stored_cert_data(&cert_dir, &acme.domains);
+            tasks.push(Box::new(move || check_acme_stored_cert_impl(&stored)));
 
-        // Probe EVERY configured domain: issuance orders authorizations for all
-        // `config.domains`, so a probe of only the first name can pass doctor
-        // while issuance fails on an unprobed domain. One port + DNS check per
-        // domain, each labeled with the domain in its detail; still bounded and
-        // gated behind --online.
-        if opts.online {
-            for domain in acme_online_probe_domains(&acme) {
-                let d80 = domain.clone();
-                tasks.push(Box::new(move || {
-                    let p80 = probe_port(&d80, 80);
-                    let p443 = probe_port(&d80, 443);
-                    check_acme_ports_impl(&d80, p80, p443)
-                }));
-                let d_dns = domain;
-                tasks.push(Box::new(move || {
-                    let outcome = resolve_dns_points_here(&d_dns);
-                    check_acme_dns_impl(&d_dns, &outcome)
-                }));
+            // Probe EVERY configured domain: issuance orders authorizations for
+            // all `config.domains`, so a probe of only the first name can pass
+            // doctor while issuance fails on an unprobed domain. One port + DNS
+            // check per domain, each labeled with the domain in its detail; still
+            // bounded and gated behind --online.
+            if opts.online {
+                for domain in acme_online_probe_domains(&acme) {
+                    let d80 = domain.clone();
+                    tasks.push(Box::new(move || {
+                        let p80 = probe_port(&d80, 80);
+                        let p443 = probe_port(&d80, 443);
+                        check_acme_ports_impl(&d80, p80, p443)
+                    }));
+                    let d_dns = domain;
+                    tasks.push(Box::new(move || {
+                        let outcome = resolve_dns_points_here(&d_dns);
+                        check_acme_dns_impl(&d_dns, &outcome)
+                    }));
+                }
             }
         }
     }
@@ -7593,6 +7671,43 @@ pub struct Vault {
         assert!(matches!(r.status, CheckStatus::Pass));
     }
 
+    // Regression (#1608, Codex): doctor must mirror AcmeConfig::validate(). An
+    // ACME config with no/empty `domains` is REJECTED by the runtime at boot, so
+    // doctor must FAIL it rather than silently pass acme_stored_cert.
+    #[test]
+    fn acme_config_fail_when_domains_empty() {
+        let r = check_acme_config_impl(&[], "ops@example.com")
+            .expect("empty domains must be a FAIL, not Pass");
+        assert!(matches!(r.status, CheckStatus::Fail));
+        assert_eq!(r.name, "acme_config");
+    }
+
+    #[test]
+    fn acme_config_fail_when_contact_email_blank() {
+        let r = check_acme_config_impl(&["app.example.com".to_owned()], "   ")
+            .expect("blank contact_email must be a FAIL");
+        assert!(matches!(r.status, CheckStatus::Fail));
+    }
+
+    #[test]
+    fn acme_config_fail_when_wildcard_domain() {
+        let r = check_acme_config_impl(&["*.example.com".to_owned()], "ops@example.com")
+            .expect("wildcard domain must be a FAIL");
+        assert!(matches!(r.status, CheckStatus::Fail));
+        // Points the operator at the DNS-01 tracking issue, mirroring
+        // AcmeConfig::validate().
+        assert!(r.detail.as_deref().unwrap_or_default().contains("#1620"));
+    }
+
+    #[test]
+    fn acme_config_ok_when_valid() {
+        // A valid ACME config produces no acme_config failure.
+        assert!(
+            check_acme_config_impl(&["app.example.com".to_owned()], "ops@example.com").is_none(),
+            "a valid ACME config must not raise an acme_config failure"
+        );
+    }
+
     // Regression (#1608, Codex): an ACME-only deployment ([server.tls.acme]
     // configured, no static cert_path/key_path) must NOT run the static
     // [server.tls] cert/key check. resolve_tls_paths() sees the enclosing
@@ -7741,6 +7856,7 @@ directory = \"production\"
     fn online_probes_every_configured_domain() {
         let config = AcmeDoctorConfig {
             domains: vec!["ok.example.com".to_owned(), "bad.example.com".to_owned()],
+            contact_email: "ops@example.com".to_owned(),
             cache_dir: std::path::PathBuf::from("config/acme"),
             directory_label: "production".to_owned(),
         };

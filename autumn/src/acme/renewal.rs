@@ -199,13 +199,27 @@ impl AcmeHealthIndicator {
             details.insert("last_failure".to_owned(), serde_json::json!(msg));
         }
 
-        // Down ONLY when a failure coincides with real expiry danger: the served
+        // An already-expired served certificate is Down on its own, INDEPENDENTLY
+        // of whether a renewal failure has been recorded. At boot
+        // `build_acme_tls_listener` records the stored cert's `cert_not_after_unix`
+        // and serves it while renewal runs; if leadership is skipped/degraded or
+        // issuance is merely pending, `last_failure` stays `None` and the
+        // failure-in-danger-window rule below would report `Up` for a TLS cert
+        // that is already invalid. Treat `not_after <= now` as Down and say so.
+        let cert_expired = snap
+            .cert_not_after_unix
+            .is_some_and(|not_after| not_after <= now_unix);
+        if cert_expired {
+            details.insert("cert_expired".to_owned(), serde_json::json!(true));
+        }
+
+        // Down ALSO when a failure coincides with real expiry danger: the served
         // certificate is already inside its renew-before window (or we have no
         // certificate at all). A failure with plenty of validity left is a blip.
         let in_danger = snap
             .cert_not_after_unix
             .is_none_or(|not_after| needs_renewal(not_after, self.renew_before_days, now_unix));
-        let status = if snap.last_failure.is_some() && in_danger {
+        let status = if cert_expired || (snap.last_failure.is_some() && in_danger) {
             HealthStatus::Down
         } else {
             HealthStatus::Up
@@ -729,6 +743,41 @@ mod tests {
         status.record_failure(now, "never issued");
         let indicator = AcmeHealthIndicator::new(status, 30);
         assert_eq!(indicator.grade(now).status, HealthStatus::Down);
+    }
+
+    #[test]
+    fn health_down_when_served_cert_already_expired_without_failure() {
+        // An already-expired stored cert served at boot (not_after <= now) must be
+        // Down even though NO renewal failure has been recorded yet (leadership
+        // skipped/degraded or issuance still pending). Otherwise health hides an
+        // already-invalid TLS certificate.
+        let now = 1_000_000_000;
+        let status = AcmeStatus::new();
+        status.set_cert_not_after(now - DAY);
+        assert!(
+            status.snapshot().last_failure.is_none(),
+            "precondition: no failure recorded"
+        );
+        let indicator = AcmeHealthIndicator::new(status, 30);
+        let out = indicator.grade(now);
+        assert_eq!(out.status, HealthStatus::Down);
+        assert_eq!(
+            out.details.get("cert_expired"),
+            Some(&serde_json::json!(true))
+        );
+    }
+
+    #[test]
+    fn health_up_when_cert_has_plenty_of_validity_and_no_failure() {
+        // A healthy served cert with lots of validity left and no failure is Up,
+        // and is NOT flagged as expired.
+        let now = 1_000_000_000;
+        let status = AcmeStatus::new();
+        status.set_cert_not_after(now + 60 * DAY);
+        let indicator = AcmeHealthIndicator::new(status, 30);
+        let out = indicator.grade(now);
+        assert_eq!(out.status, HealthStatus::Up);
+        assert!(!out.details.contains_key("cert_expired"));
     }
 
     #[test]
