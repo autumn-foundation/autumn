@@ -25,6 +25,7 @@ database.slow_query_threshold
 database.startup_wait_secs
 database.statement_timeout
 database.url
+deploy
 dev
 health
 http

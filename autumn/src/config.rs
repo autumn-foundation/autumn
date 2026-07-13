@@ -1196,6 +1196,121 @@ pub struct AutumnConfig {
     /// reads/writes still work through `Deref`/`DerefMut`.
     #[serde(default)]
     pub alerts: Box<crate::alerts::AlertConfig>,
+
+    /// Push-button VPS deploy settings (`[deploy]` section, issue #1607).
+    ///
+    /// Operator-facing configuration for `autumn deploy` — the SSH-reachable
+    /// target host plus the remote install layout and rollout tuning knobs.
+    /// Top-level (not nested under `[server]`) because it describes *where and
+    /// how* the app is deployed, not how the running server behaves.
+    ///
+    /// Absent by default (`None`), so an app that never runs `autumn deploy`
+    /// is unaffected. A bare `[deploy]` table is valid at rest — `host` is only
+    /// required when a deploy actually runs, enforced by
+    /// [`DeployConfig::validate`].
+    #[serde(default)]
+    pub deploy: Option<DeployConfig>,
+}
+
+/// Push-button VPS deploy settings (`[deploy]` section, issue #1607).
+///
+/// Describes the SSH-reachable target server and the remote install layout for
+/// `autumn deploy`'s zero-downtime rollout. Everything except `host` has a
+/// sensible default, and `app_name`/`app_dir`/`service_name` are resolved from
+/// the project's package name at deploy time (not during deserialization) so an
+/// unset value stays `None` here.
+///
+/// # `autumn.toml` example
+///
+/// ```toml
+/// [deploy]
+/// host = "203.0.113.10"      # required at deploy time; SSH-reachable address
+/// user = "deploy"            # SSH user (default: "root")
+/// ssh_port = 22              # SSH port (default: 22)
+/// app_name = "myapp"         # default: the crate's package name
+/// app_dir = "/srv/myapp"     # default: /srv/autumn/{app_name}
+/// service_name = "myapp"     # systemd unit name; default: {app_name}
+/// readiness_timeout_secs = 60 # readiness window before rollback (default: 60)
+/// keep_releases = 3          # releases retained on the host (default: 3)
+/// ```
+#[derive(Debug, Clone, Deserialize)]
+pub struct DeployConfig {
+    /// SSH-reachable address (hostname or IP) of the target server.
+    ///
+    /// Required when a deploy actually runs (`autumn deploy`), but `None` is
+    /// valid at rest so a bare `[deploy]` table parses. Enforced by
+    /// [`validate`](Self::validate).
+    #[serde(default)]
+    pub host: Option<String>,
+
+    /// SSH user to connect as. Default: `"root"`.
+    #[serde(default = "default_deploy_user")]
+    pub user: String,
+
+    /// SSH port on the target host. Default: `22`.
+    #[serde(default = "default_deploy_ssh_port")]
+    pub ssh_port: u16,
+
+    /// Application name used to derive remote paths and the service unit.
+    /// Resolved to the project's package name when unset (at deploy time, not
+    /// during deserialization).
+    #[serde(default)]
+    pub app_name: Option<String>,
+
+    /// Remote install directory. Resolved to `/srv/autumn/{app_name}` when
+    /// unset (at deploy time).
+    #[serde(default)]
+    pub app_dir: Option<String>,
+
+    /// systemd unit name. Resolved to `{app_name}` when unset (at deploy time).
+    #[serde(default)]
+    pub service_name: Option<String>,
+
+    /// Bounded readiness window, in seconds, the new release has to report
+    /// `/ready` before the deploy rolls back. Default: `60`.
+    #[serde(default = "default_deploy_readiness_timeout_secs")]
+    pub readiness_timeout_secs: u64,
+
+    /// Number of prior releases retained on the host for rollback. Default: `3`.
+    #[serde(default = "default_deploy_keep_releases")]
+    pub keep_releases: u32,
+}
+
+impl Default for DeployConfig {
+    fn default() -> Self {
+        Self {
+            host: None,
+            user: default_deploy_user(),
+            ssh_port: default_deploy_ssh_port(),
+            app_name: None,
+            app_dir: None,
+            service_name: None,
+            readiness_timeout_secs: default_deploy_readiness_timeout_secs(),
+            keep_releases: default_deploy_keep_releases(),
+        }
+    }
+}
+
+impl DeployConfig {
+    /// Validate the `[deploy]` section for a context that actually runs a deploy.
+    ///
+    /// A bare `[deploy]` table is valid at rest, but a deploy needs a target:
+    /// this rejects a missing or blank `host` with an actionable message so the
+    /// operator knows exactly which key to set.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when `host` is unset or empty.
+    pub fn validate(&self) -> Result<(), String> {
+        match self.host.as_deref() {
+            Some(host) if !host.trim().is_empty() => Ok(()),
+            _ => Err(
+                "[deploy] requires a target host: set `[deploy] host = \"<address>\"` in \
+                      autumn.toml to the SSH-reachable hostname or IP of your server"
+                    .to_owned(),
+            ),
+        }
+    }
 }
 
 /// Observability configuration (`[observability]` section in `autumn.toml`).
@@ -6160,6 +6275,26 @@ const fn default_tls_handshake_timeout_secs() -> u64 {
     10
 }
 
+/// Default SSH user for `[deploy]`.
+fn default_deploy_user() -> String {
+    "root".to_owned()
+}
+
+/// Default SSH port for `[deploy]`.
+const fn default_deploy_ssh_port() -> u16 {
+    22
+}
+
+/// Default readiness window (seconds) before an `autumn deploy` rolls back.
+const fn default_deploy_readiness_timeout_secs() -> u64 {
+    60
+}
+
+/// Default number of prior releases retained on the host for rollback.
+const fn default_deploy_keep_releases() -> u32 {
+    3
+}
+
 /// Default directory for the ACME account key and issued certificates
 /// (`[server.tls.acme] cache_dir`).
 fn default_acme_cache_dir() -> PathBuf {
@@ -9533,6 +9668,91 @@ path = "/healthz"
         let mut config = AutumnConfig::default();
         config.apply_env_overrides_with_env(&env);
         assert!(config.server.tls.is_none());
+    }
+
+    // ── deploy (#1607) ────────────────────────────────────────────
+
+    #[test]
+    fn deploy_absent_is_none() {
+        // No [deploy] section → the field stays None so existing apps are
+        // unaffected.
+        let config = AutumnConfig::default();
+        assert!(config.deploy.is_none());
+        let parsed: AutumnConfig = toml::from_str("[server]\nport = 3000\n")
+            .expect("config without [deploy] should parse");
+        assert!(parsed.deploy.is_none());
+    }
+
+    #[test]
+    fn deploy_defaults_from_bare_table() {
+        // A bare [deploy] table materializes the section with every optional
+        // field at its documented default.
+        let config: AutumnConfig =
+            toml::from_str("[deploy]\n").expect("bare [deploy] table should parse");
+        let deploy = config.deploy.expect("deploy configured");
+        assert_eq!(deploy.host, None);
+        assert_eq!(deploy.user, "root");
+        assert_eq!(deploy.ssh_port, 22);
+        assert_eq!(deploy.app_name, None);
+        assert_eq!(deploy.app_dir, None);
+        assert_eq!(deploy.service_name, None);
+        assert_eq!(deploy.readiness_timeout_secs, 60);
+        assert_eq!(deploy.keep_releases, 3);
+    }
+
+    #[test]
+    fn deploy_full_table_parses() {
+        let config: AutumnConfig = toml::from_str(
+            r#"
+            [deploy]
+            host = "203.0.113.10"
+            user = "deploy"
+            ssh_port = 2222
+            app_name = "myapp"
+            app_dir = "/srv/myapp"
+            service_name = "myapp-web"
+            readiness_timeout_secs = 90
+            keep_releases = 5
+            "#,
+        )
+        .expect("full [deploy] table should parse");
+        let deploy = config.deploy.expect("deploy configured");
+        assert_eq!(deploy.host.as_deref(), Some("203.0.113.10"));
+        assert_eq!(deploy.user, "deploy");
+        assert_eq!(deploy.ssh_port, 2222);
+        assert_eq!(deploy.app_name.as_deref(), Some("myapp"));
+        assert_eq!(deploy.app_dir.as_deref(), Some("/srv/myapp"));
+        assert_eq!(deploy.service_name.as_deref(), Some("myapp-web"));
+        assert_eq!(deploy.readiness_timeout_secs, 90);
+        assert_eq!(deploy.keep_releases, 5);
+        assert!(deploy.validate().is_ok());
+    }
+
+    #[test]
+    fn deploy_validate_rejects_missing_host() {
+        // Missing host: a bare table is valid at rest but validate() rejects it.
+        let missing = DeployConfig::default();
+        let err = missing
+            .validate()
+            .expect_err("missing host must be rejected");
+        assert!(
+            err.contains("host"),
+            "error should name the missing key: {err}"
+        );
+
+        // Present-but-blank host is also rejected.
+        let blank = DeployConfig {
+            host: Some("   ".to_owned()),
+            ..DeployConfig::default()
+        };
+        assert!(blank.validate().is_err());
+
+        // A real host passes.
+        let ok = DeployConfig {
+            host: Some("example.com".to_owned()),
+            ..DeployConfig::default()
+        };
+        assert!(ok.validate().is_ok());
     }
 
     // ── server.tls.acme (#1608) ───────────────────────────────────

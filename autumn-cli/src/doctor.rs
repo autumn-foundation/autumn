@@ -4,7 +4,7 @@
 //! reports each as ✅/⚠️/❌ with a one-line remediation hint, and exits with
 //! code 0 (all clear) or 1 (any failure detected).
 
-use autumn_web::config::ProcessRole;
+use autumn_web::config::{DeployConfig, ProcessRole};
 use serde::Serialize;
 use std::collections::{BTreeSet, HashMap, HashSet};
 
@@ -5537,6 +5537,27 @@ fn resolve_compression_enabled() -> bool {
     parse_enabled(&table).unwrap_or(false)
 }
 
+/// Map a shared `autumn deploy` preflight grader result into a doctor
+/// [`CheckResult`] under the given (deploy-namespaced) name. A passing grader
+/// becomes a `Pass`; a failing one becomes a `Fail` so `doctor --strict` treats
+/// a broken deploy target as a hard error, consistent with the other
+/// config-gated checks.
+fn deploy_preflight_result(
+    name: &'static str,
+    check: crate::deploy::PreflightCheck,
+) -> CheckResult {
+    CheckResult {
+        name,
+        status: if check.passed {
+            CheckStatus::Pass
+        } else {
+            CheckStatus::Fail
+        },
+        detail: Some(check.detail),
+        hint: check.hint,
+    }
+}
+
 // ─── Main entry point ─────────────────────────────────────────────────────────
 
 /// Run all doctor checks and report results.
@@ -5700,6 +5721,55 @@ pub fn run(opts: DoctorOptions) {
     tasks.push(Box::new(move || {
         check_trusted_hosts_impl(&trusted_hosts, is_production)
     }));
+
+    // 8-deploy. Deploy preflight (issue #1607). Config-gated: only runs when a
+    // `[deploy]` section is present, and skips gracefully otherwise. Reuses the
+    // exact graders behind `autumn deploy check`. The offline graders (signing
+    // secret, database URL, migrate check) always run when deploy is configured;
+    // the SSH-reachability network probe is gated behind `--online` so `doctor`
+    // stays offline and non-flaky by default, matching the ACME probes.
+    if let Some(deploy_cfg) = toml_table
+        .as_ref()
+        .and_then(|t| t.get("deploy").cloned())
+        .and_then(|v| v.try_into::<DeployConfig>().ok())
+    {
+        let deploy_signing = resolve_optional_signing_secret();
+        let deploy_db_url = db_topology.primary_url;
+
+        if opts.online {
+            let host = deploy_cfg.host.clone();
+            let ssh_port = deploy_cfg.ssh_port;
+            tasks.push(Box::new(move || {
+                deploy_preflight_result(
+                    "deploy_ssh_reachability",
+                    crate::deploy::grade_ssh_reachability(
+                        host.as_deref(),
+                        ssh_port,
+                        std::time::Duration::from_secs(5),
+                    ),
+                )
+            }));
+        }
+
+        tasks.push(Box::new(move || {
+            deploy_preflight_result(
+                "deploy_signing_secret",
+                crate::deploy::grade_signing_secret(deploy_signing.as_deref()),
+            )
+        }));
+        tasks.push(Box::new(move || {
+            deploy_preflight_result(
+                "deploy_database_url",
+                crate::deploy::grade_database_url(deploy_db_url.as_deref()),
+            )
+        }));
+        tasks.push(Box::new(|| {
+            deploy_preflight_result(
+                "deploy_migrate_check",
+                crate::deploy::grade_migrate_check(std::path::Path::new("migrations")),
+            )
+        }));
+    }
 
     // 8a. Direct-HTTPS certificate readiness (issue #1603): validate
     // [server.tls] cert/key and warn on near-expiry / fail on expired.
