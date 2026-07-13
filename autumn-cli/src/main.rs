@@ -1,5 +1,6 @@
 use clap::{Parser, Subcommand, ValueEnum};
 
+mod a11y;
 mod alert;
 mod assets;
 mod build;
@@ -100,6 +101,28 @@ pub enum I18nSubcommands {
         #[arg(long, default_value = "text", value_name = "FORMAT")]
         format: String,
         /// Treat untranslated/unused warnings as failures (exit non-zero).
+        #[arg(long)]
+        strict: bool,
+    },
+}
+
+/// Subcommands for `autumn a11y`.
+#[derive(Subcommand, Clone, Debug, PartialEq, Eq)]
+pub enum A11ySubcommands {
+    /// Statically audit raw `html!` markup for accessibility violations that
+    /// bypass the typed `autumn_web::a11y` primitives. Scans project `.rs`
+    /// files, reports WCAG-keyed findings, and exits non-zero when any are
+    /// found (CI-friendly). Code using the typed primitives is proven at
+    /// compile time and is intentionally not re-scanned.
+    Verify {
+        /// Project root to scan (defaults to the current directory).
+        #[arg(value_name = "PATH", default_value = ".")]
+        path: String,
+        /// Output format: `text` (default) or `json`.
+        #[arg(long, default_value = "text", value_name = "FORMAT")]
+        format: String,
+        /// Lower the failure threshold so any finding (Moderate and above)
+        /// fails, consistent with `autumn i18n check --strict`.
         #[arg(long)]
         strict: bool,
     },
@@ -616,6 +639,25 @@ enum Commands {
     I18n {
         #[command(subcommand)]
         action: I18nSubcommands,
+    },
+
+    /// Statically audit accessibility of raw `html!` markup at build time.
+    ///
+    /// The typed `autumn_web::a11y` primitives (`Img`, `Button`, `Link`,
+    /// `MenuItem`, `TextField`) prove accessible-name obligations at compile
+    /// time. `autumn a11y verify` covers the escape hatch they cannot see: raw
+    /// markup written directly in `html!` blocks. It scans the project's `.rs`
+    /// files, reports WCAG-keyed findings, and exits non-zero when any exist.
+    ///
+    /// # Examples
+    ///
+    ///   autumn a11y verify
+    ///   autumn a11y verify --format json
+    ///   autumn a11y verify ./crates/web --strict
+    #[command(verbatim_doc_comment)]
+    A11y {
+        #[command(subcommand)]
+        action: A11ySubcommands,
     },
 
     /// Inspect the application's background jobs.
@@ -2878,6 +2920,29 @@ fn run_command(command: Commands) {
                     }
                 };
                 i18n::run(i18n::I18nCheckOptions { format, strict });
+            }
+        },
+        Commands::A11y { action } => match action {
+            A11ySubcommands::Verify {
+                path,
+                format,
+                strict,
+            } => {
+                let format = match format.as_str() {
+                    "json" => a11y::OutputFormat::Json,
+                    "text" => a11y::OutputFormat::Text,
+                    other => {
+                        eprintln!(
+                            "autumn a11y verify: unknown --format `{other}` (expected `text` or `json`)"
+                        );
+                        std::process::exit(2);
+                    }
+                };
+                let code = a11y::run_in(
+                    std::path::Path::new(&path),
+                    a11y::A11yVerifyOptions { format, strict },
+                );
+                std::process::exit(code);
             }
         },
         Commands::Jobs { action } => match action {
@@ -5474,6 +5539,47 @@ mod tests {
                     strict: true,
                 }
             } if format == "json"
+        ));
+    }
+
+    // ── autumn a11y tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn parse_a11y_verify_defaults() {
+        let cli = Cli::try_parse_from(["autumn", "a11y", "verify"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::A11y {
+                action: A11ySubcommands::Verify {
+                    ref path,
+                    ref format,
+                    strict: false,
+                }
+            } if path == "." && format == "text"
+        ));
+    }
+
+    #[test]
+    fn parse_a11y_verify_path_json_and_strict() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "a11y",
+            "verify",
+            "./crates/web",
+            "--format",
+            "json",
+            "--strict",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::A11y {
+                action: A11ySubcommands::Verify {
+                    ref path,
+                    ref format,
+                    strict: true,
+                }
+            } if path == "./crates/web" && format == "json"
         ));
     }
 
