@@ -5,6 +5,7 @@ WORKDIR /app
 COPY Cargo.toml autumn.toml build.rs ./
 COPY src ./src
 COPY migrations ./migrations
+# __AUTUMN_I18N_BUILDER_COPY__
 
 # Git/build provenance passthrough. The build context excludes `/.git` (see
 # .dockerignore), so the generated build.rs cannot shell out to git here.
@@ -42,6 +43,7 @@ WORKDIR /app
 COPY --from=builder /app/target/release/{{project_name}} /usr/local/bin/{{project_name}}
 COPY --from=builder /app/autumn.toml /app/autumn.toml
 COPY --from=builder /app/migrations /app/migrations
+# __AUTUMN_I18N_RUNTIME_COPY__
 
 ENV AUTUMN_PROFILE=prod
 EXPOSE 3000

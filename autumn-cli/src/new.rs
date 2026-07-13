@@ -308,12 +308,16 @@ fn generate_inner(
         );
     }
     fs::write(project_dir.join("autumn.toml"), autumn_toml)?;
-    let dockerfile_template = if opts.with_api {
-        templates::DOCKERFILE_API
+    let dockerfile = if opts.with_api {
+        // The `--api` Dockerfile carries i18n `COPY` anchors resolved by flag:
+        // ship the `i18n/` sidecar into the image for `--with-i18n`, or strip
+        // the anchors so a non-i18n build context (which has no `i18n/` dir)
+        // still builds. The fullstack `Dockerfile.tmpl` is used verbatim.
+        inject_i18n_dockerfile_api(&render(templates::DOCKERFILE_API), opts.with_i18n)
     } else {
-        templates::DOCKERFILE
+        render(templates::DOCKERFILE)
     };
-    fs::write(project_dir.join("Dockerfile"), render(dockerfile_template))?;
+    fs::write(project_dir.join("Dockerfile"), dockerfile)?;
     fs::write(
         project_dir.join(".dockerignore"),
         render(templates::DOCKERIGNORE),
@@ -572,6 +576,45 @@ fn inject_i18n_api(main_rs: &str) -> String {
          \x20   #[cfg(feature = \"embed-assets\")]\n\
          \x20   let app = app.embedded_locales(&EMBEDDED_LOCALES);\n\n    app\n",
     )
+}
+
+/// Anchor: the builder-stage i18n `COPY` insertion point in
+/// `Dockerfile.api.tmpl` (an otherwise-inert comment line). Replaced with a
+/// `COPY i18n ./i18n` line for `--api --with-i18n`, or stripped entirely
+/// otherwise so a non-i18n project's build context has no missing `i18n/` dir.
+const DOCKERFILE_API_I18N_BUILDER_ANCHOR: &str = "# __AUTUMN_I18N_BUILDER_COPY__\n";
+/// Anchor: the runtime-stage i18n `COPY` insertion point in
+/// `Dockerfile.api.tmpl`. Replaced with a `COPY --from=builder /app/i18n
+/// /app/i18n` line for `--api --with-i18n`, or stripped otherwise.
+const DOCKERFILE_API_I18N_RUNTIME_ANCHOR: &str = "# __AUTUMN_I18N_RUNTIME_COPY__\n";
+
+/// Resolve the two i18n `COPY` anchors in the rendered `--api` Dockerfile.
+///
+/// The `--api` scaffold's `main.rs` calls `.i18n_auto()` when `--with-i18n`,
+/// which loads `i18n/en.ftl` from disk at startup and panics if it is missing.
+/// The API image must therefore ship the `i18n/` sidecar into both the builder
+/// (so `cargo build` sees it for any embed) and the runtime stage (so the
+/// running binary can read it). The `COPY` lines are gated on `with_i18n`: an
+/// unconditional `COPY i18n ./i18n` would break `docker build` for non-i18n
+/// projects, whose build context has no `i18n/` directory. When `with_i18n` is
+/// false the anchors are stripped, leaving the Dockerfile byte-for-byte as it
+/// was before this wiring (no leftover anchor markers).
+fn inject_i18n_dockerfile_api(dockerfile: &str, with_i18n: bool) -> String {
+    if with_i18n {
+        let with_builder = replace_anchor(
+            dockerfile,
+            DOCKERFILE_API_I18N_BUILDER_ANCHOR,
+            "COPY i18n ./i18n\n",
+        );
+        replace_anchor(
+            &with_builder,
+            DOCKERFILE_API_I18N_RUNTIME_ANCHOR,
+            "COPY --from=builder /app/i18n /app/i18n\n",
+        )
+    } else {
+        let no_builder = replace_anchor(dockerfile, DOCKERFILE_API_I18N_BUILDER_ANCHOR, "");
+        replace_anchor(&no_builder, DOCKERFILE_API_I18N_RUNTIME_ANCHOR, "")
+    }
 }
 
 /// Anchor: the Tailwind CI extension note in `ci.yml.tmpl`. The JSON-first API

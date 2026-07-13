@@ -207,6 +207,51 @@ fn api_scaffold_composes_with_i18n_and_seed() {
     );
 }
 
+/// AC #7 (Docker): `--api --with-i18n` must copy the `i18n/` sidecar into both
+/// the builder and runtime stages so the image doesn't panic at startup when
+/// `.i18n_auto()` loads `i18n/en.ftl` from disk.
+#[test]
+fn api_scaffold_with_i18n_copies_i18n_into_docker_image() {
+    let (_tmp, project) = api_project("api-i18n-docker-app", &["--with-i18n"]);
+    let dockerfile = fs::read_to_string(project.join("Dockerfile")).unwrap();
+
+    assert!(
+        dockerfile.contains("COPY i18n ./i18n"),
+        "--api --with-i18n Dockerfile must copy i18n/ into the builder stage:\n{dockerfile}"
+    );
+    assert!(
+        dockerfile.contains("COPY --from=builder /app/i18n /app/i18n"),
+        "--api --with-i18n Dockerfile must copy i18n/ into the runtime stage:\n{dockerfile}"
+    );
+    // No leftover anchor markers.
+    assert!(
+        !dockerfile.contains("__AUTUMN_I18N"),
+        "--api --with-i18n Dockerfile must not leave anchor markers:\n{dockerfile}"
+    );
+}
+
+/// A non-i18n `--api` Dockerfile must carry NO i18n `COPY` lines (an
+/// unconditional `COPY i18n ./i18n` would break `docker build`, whose context
+/// has no `i18n/` dir) and no leftover anchor markers.
+#[test]
+fn api_scaffold_without_i18n_has_no_i18n_docker_copy() {
+    let (_tmp, project) = api_project("api-no-i18n-docker-app", &[]);
+    let dockerfile = fs::read_to_string(project.join("Dockerfile")).unwrap();
+
+    assert!(
+        !dockerfile.contains("COPY i18n ./i18n"),
+        "non-i18n --api Dockerfile must not copy i18n/ (build context has no i18n/ dir):\n{dockerfile}"
+    );
+    assert!(
+        !dockerfile.contains("/app/i18n"),
+        "non-i18n --api Dockerfile must not reference /app/i18n:\n{dockerfile}"
+    );
+    assert!(
+        !dockerfile.contains("__AUTUMN_I18N"),
+        "non-i18n --api Dockerfile must not leave anchor markers:\n{dockerfile}"
+    );
+}
+
 /// `--api` cannot be combined with the daemon flavors (conflicting feature
 /// sets); the CLI rejects the combination.
 #[test]
