@@ -444,6 +444,13 @@ fn parse_nodes(trees: &[TokenTree]) -> Vec<Node> {
                     // each arm's pattern (e.g. `input => …`) as an element and
                     // fire a false positive. Skip past `@match`, then parse arms.
                     i = skip_match(trees, i + 2, &mut nodes);
+                } else if matches!(trees.get(i + 1), Some(TokenTree::Ident(id)) if *id == "let") {
+                    // `@let` is special: it binds a Rust expression, so any brace
+                    // group in its initializer (`Field { input: true }`) is
+                    // struct-literal syntax, NEVER markup. Unlike `@if`/`@for`,
+                    // descending into it would misread a Rust field named `input`
+                    // as an `<input>`. Skip the whole binding up to its `;`.
+                    i = skip_let(trees, i + 2);
                 } else {
                     i = skip_control(trees, i + 1, &mut nodes);
                 }
@@ -485,6 +492,25 @@ fn skip_control(trees: &[TokenTree], start: usize, nodes: &mut Vec<Node>) -> usi
             }
             _ => i += 1,
         }
+    }
+    i
+}
+
+/// Skip an `@let` binding, consuming every token up to and including its
+/// terminating top-level `;`. Unlike `@if`/`@for`/`@match` — whose braces are
+/// markup — an `@let` binds a Rust expression, so any brace group in its
+/// initializer (`Field { input: true }`) is struct-literal syntax and must NOT
+/// be parsed as markup; descending into it would misread a Rust field named
+/// `input` as an `<input>` element and fire a false positive. `start` points
+/// just past `@let`. Group token trees are atomic, so the `;` seen at this
+/// level is always the binding terminator, never one nested in a brace.
+fn skip_let(trees: &[TokenTree], start: usize) -> usize {
+    let mut i = start;
+    while i < trees.len() {
+        if matches!(&trees[i], TokenTree::Punct(p) if p.as_char() == ';') {
+            return i + 1;
+        }
+        i += 1;
     }
     i
 }
@@ -764,7 +790,7 @@ fn collect_labels(nodes: &[Node], fors: &mut BTreeSet<String>, dynamic: &mut boo
                     Some(AttrValue::Literal(v)) if label_provides_name(el) => {
                         fors.insert(v.clone());
                     }
-                    Some(AttrValue::Dynamic) => *dynamic = true,
+                    Some(AttrValue::Dynamic) if label_provides_name(el) => *dynamic = true,
                     _ => {}
                 }
             }
@@ -1125,6 +1151,31 @@ mod tests {
     }
 
     #[test]
+    fn dynamic_for_label_with_empty_body_does_not_satisfy_association() {
+        // A spliced-`for` label with a statically EMPTY body provides no
+        // accessible name, so a static-id control must still be flagged. The
+        // dynamic-`for` marker must carry the same `label_provides_name` guard as
+        // the literal-`for` path (regression: false negative).
+        let src = wrap(r#"label for=(id) { } input type="text" id="email";"#);
+        assert_eq!(rule_ids(&src), vec!["label"], "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn dynamic_for_label_with_dynamic_body_is_clean() {
+        // A spliced-`for` label with a dynamic (spliced) body counts as providing
+        // a name, per the non-failing-splice convention.
+        let src = wrap(r#"label for=(id) { (title) } input type="text" id="email";"#);
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn dynamic_for_label_with_text_body_is_clean() {
+        // A spliced-`for` label with real text provides a name.
+        let src = wrap(r#"label for=(id) { "Email" } input type="text" id="email";"#);
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+    }
+
+    #[test]
     fn input_with_dynamic_type_is_not_flagged() {
         // A spliced `type=(…)` is unresolvable — it may be a non-labeling type
         // like submit/button, so skip rather than misfire (regression: false
@@ -1263,6 +1314,31 @@ mod tests {
             "{:?}",
             findings_for(&src)
         );
+    }
+
+    #[test]
+    fn let_initializer_struct_literal_is_not_parsed_as_markup() {
+        // Regression: `@let props = Field { input: true };` binds a Rust
+        // expression, so its brace group is struct-literal syntax, not markup.
+        // Parsing it as markup misread the Rust field `input` as an `<input>`
+        // element and fired a false `label` finding on valid views.
+        let src = wrap(r#"@let props = Field { input: true }; div { "ok" }"#);
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn let_binding_does_not_suppress_real_input_elsewhere() {
+        // The `@let` initializer is skipped wholesale, but a real unlabeled
+        // `<input>` later in the same markup must still be flagged.
+        let src = wrap(r#"@let props = Field { input: true }; input type="text" id="name";"#);
+        assert_eq!(rule_ids(&src), vec!["label"], "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn let_with_plain_initializer_does_not_crash() {
+        // A plain (non-struct) `@let` initializer parses without panicking.
+        let src = wrap(r#"@let x = foo(); div { "ok" }"#);
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
     }
 
     #[test]
