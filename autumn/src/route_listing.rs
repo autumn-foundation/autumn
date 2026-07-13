@@ -220,7 +220,15 @@ fn classify(
         );
     }
     let repo_has_policy = repository.is_some_and(|r| r.has_policy);
-    if api_doc.secured || api_doc.has_policy || repo_has_policy {
+    // A repository auto-API declared with `scope = ...` (but no `policy = ...`)
+    // enforces the registered scope on its generated list handler at runtime,
+    // yet leaves both the handler `ApiDoc` and `RepositoryApiMeta::has_policy`
+    // at their defaults. Treat the presence of a scope guard as gated too, so
+    // these scope-protected `GET /<api>` routes are not false-failed as
+    // `Unclassified`. No scope *name* is recorded on the meta (only a
+    // type-erased registry probe), so there is nothing to carry into `scopes`.
+    let repo_has_scope = repository.is_some_and(|r| r.scope_check.is_some());
+    if api_doc.secured || api_doc.has_policy || repo_has_policy || repo_has_scope {
         let roles = api_doc
             .required_roles
             .iter()
@@ -557,6 +565,22 @@ mod tests {
         }
     }
 
+    /// Build a [`RepositoryApiMeta`](crate::route::RepositoryApiMeta) for a
+    /// `scope = ...` (but no `policy = ...`) auto-API: `has_policy` stays
+    /// `false`, but the list handler carries a `scope_check` probe.
+    fn repo_meta_scope_only() -> crate::route::RepositoryApiMeta {
+        fn probe(_: &crate::authorization::PolicyRegistry) -> bool {
+            true
+        }
+        crate::route::RepositoryApiMeta {
+            resource_type_name: "Post",
+            api_path: "/api/posts",
+            has_policy: false,
+            policy_check: None,
+            scope_check: Some(probe),
+        }
+    }
+
     fn make_repo_route(
         method: Method,
         path: &'static str,
@@ -782,6 +806,30 @@ mod tests {
             "repository has_policy must surface as policy = true"
         );
         assert!(roles.is_empty() && scopes.is_empty());
+    }
+
+    /// A repository auto-API declared with `scope = ...` (but no `policy =
+    /// ...`) enforces the registered scope on its generated list handler,
+    /// recorded as `RepositoryApiMeta::scope_check = Some(..)` while
+    /// `has_policy` stays `false`. Such a route must classify `Gated` — not
+    /// `Unclassified` — so the audit gate does not flag a scope-protected list
+    /// endpoint as unauthenticated. No scope *name* is recorded on the meta, so
+    /// `scopes` stays empty and `policy` stays `false` (a scope is not a
+    /// policy). (#1604)
+    #[test]
+    fn classify_repository_scope_only_is_gated() {
+        let repo = repo_meta_scope_only();
+        let (c, roles, scopes, policy) =
+            classify(&RouteSource::User, &dummy_api_doc(), Some(&repo));
+        assert_eq!(c, RouteClassification::Gated);
+        assert!(
+            !policy,
+            "a repository scope guard is not a policy: policy must stay false"
+        );
+        assert!(
+            roles.is_empty() && scopes.is_empty(),
+            "no scope name is recorded on the meta, so scopes stays empty"
+        );
     }
 
     /// A repository route without a policy (`#[repository(api = ...)]`, no

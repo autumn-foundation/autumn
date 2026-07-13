@@ -269,13 +269,13 @@ impl Plugin for AdminPlugin {
 
         // Declare routes for `autumn routes` listing. The underlying Axum router
         // is added via nest() which is opaque to route enumeration, so we
-        // explicitly register route metadata here. `nest_declared` records the
-        // mount as coverage-audited: because `declared` faithfully enumerates
-        // every admin endpoint, `autumn routes audit` must not treat this mount
-        // as an omitted, unprovable raw router (which would false-fail the gate).
+        // explicitly register route metadata here. Because the declared routes'
+        // paths all fall under the nest prefix, `autumn routes audit` treats this
+        // mount as covered (enumerable) instead of an omitted, unprovable raw
+        // router that would false-fail the gate.
         let declared = admin_route_infos(&prefix, has_config, require_role.as_deref());
 
-        app.nest_declared(&prefix, router, declared)
+        app.nest(&prefix, router).declare_plugin_routes(declared)
     }
 }
 

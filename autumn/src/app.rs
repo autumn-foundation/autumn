@@ -137,7 +137,6 @@ pub fn app() -> AppBuilder {
         #[cfg(feature = "maud")]
         story_gallery: None,
         declared_routes: Vec::new(),
-        declared_nest_prefixes: Vec::new(),
         idempotency_enabled: false,
         #[cfg(feature = "mail")]
         mail_interceptor: None,
@@ -160,18 +159,55 @@ pub fn app() -> AppBuilder {
 /// endpoints can't be enumerated — the value `autumn routes audit` treats as a
 /// hard failure (an unprovable route defeats the coverage guarantee).
 ///
-/// Every `.merge()` router and every bare `.nest()` router is opaque and counts.
-/// A nest mounted via [`AppBuilder::nest_declared`] supplies covering
-/// `RouteInfo`s (folded into the listing), so it is enumerable and is excluded.
-/// Exactly one prefix is recorded per `nest_declared` call and never more than
-/// there are nest routers, so the subtraction cannot underflow; it saturates
-/// defensively all the same.
-const fn omitted_router_count(
+/// Every `.merge()` router is rootless — it has no mount prefix to match
+/// declarations against — so it is always opaque and always counts. A `.nest()`
+/// router carries a mount prefix, so it is treated as **covered** (enumerable,
+/// not omitted) when at least one declared route (from
+/// [`declare_plugin_routes`](AppBuilder::declare_plugin_routes)) has a path that
+/// falls under that prefix. This makes the documented
+/// `app.nest(prefix, router).declare_plugin_routes(routes)` pattern audit-clean
+/// without any dedicated bookkeeping: the declared routes prove the mount.
+///
+/// Soundness (fail-closed) is preserved: a bare `nest(prefix, raw_router)` with
+/// no declared route under `prefix` stays uncovered and counts, and every
+/// `merge()` counts unconditionally.
+fn omitted_router_count<'a>(
     merge_routers: usize,
-    nest_routers: usize,
-    declared_nest_prefixes: usize,
+    nest_prefixes: impl IntoIterator<Item = &'a str>,
+    declared_routes: &[crate::route_listing::RouteInfo],
 ) -> usize {
-    merge_routers + nest_routers.saturating_sub(declared_nest_prefixes)
+    let uncovered_nests = nest_prefixes
+        .into_iter()
+        .filter(|prefix| !nest_prefix_is_covered(prefix, declared_routes))
+        .count();
+    merge_routers + uncovered_nests
+}
+
+/// A nested mount at `prefix` is "covered" when at least one declared route's
+/// path falls under that prefix, proving the nested router's endpoints are
+/// enumerable in the `autumn routes` listing.
+fn nest_prefix_is_covered(
+    prefix: &str,
+    declared_routes: &[crate::route_listing::RouteInfo],
+) -> bool {
+    declared_routes
+        .iter()
+        .any(|route| path_is_under_prefix(&route.path, prefix))
+}
+
+/// Whether `path` is mounted under `prefix` — i.e. equal to the prefix or a
+/// descendant of it at a path-segment boundary (`/admin` covers `/admin` and
+/// `/admin/users`, but not `/administrators`). A root prefix (`/` or empty)
+/// covers everything.
+fn path_is_under_prefix(path: &str, prefix: &str) -> bool {
+    let prefix = prefix.trim_end_matches('/');
+    if prefix.is_empty() {
+        return true;
+    }
+    path == prefix
+        || path
+            .strip_prefix(prefix)
+            .is_some_and(|rest| rest.starts_with('/'))
 }
 
 type StartupHookFuture = Pin<Box<dyn Future<Output = crate::AutumnResult<()>> + Send>>;
@@ -425,13 +461,6 @@ pub struct AppBuilder {
     /// opaque `nest_routers`. Included in `autumn routes` output even though
     /// the underlying Axum router is not enumerable.
     declared_routes: Vec<crate::route_listing::RouteInfo>,
-    /// Path prefixes of `nest_routers` mounted via [`AppBuilder::nest_declared`],
-    /// i.e. raw nested routers whose route metadata was declared alongside the
-    /// mount. These mounts are enumerable through [`Self::declared_routes`], so
-    /// `autumn routes audit` must *not* count them among the opaque, omitted
-    /// routers that hard-fail the coverage gate. One entry is pushed per
-    /// `nest_declared` call (never more than there are `nest_routers`).
-    declared_nest_prefixes: Vec<String>,
     /// Whether `.idempotent()` was called on this builder. Applied to the
     /// loaded `AutumnConfig` before router assembly so that startup validation
     /// and `apply_middleware` both see `config.idempotency.enabled = true`.
@@ -1356,6 +1385,16 @@ impl AppBuilder {
     /// Routes are automatically attributed to the current plugin when called from
     /// within a plugin's `build()` method. The `source` field of each supplied
     /// `RouteInfo` is overwritten with that attribution.
+    ///
+    /// Declaring routes also makes a [`nest`](Self::nest) mount *coverage-clean*
+    /// for `autumn routes audit`: a nested router is normally opaque and counts
+    /// as an omitted, unprovable router that hard-fails the gate, but when at
+    /// least one declared route's path falls under the nest's prefix, the mount
+    /// is treated as enumerable and no longer counts. So the documented
+    /// `app.nest(prefix, router).declare_plugin_routes(routes)` pattern — with
+    /// `routes` covering everything the raw router serves under `prefix` — passes
+    /// the audit. A bare `nest`/`merge` with no covering declaration stays
+    /// opaque and still fails closed.
     #[must_use]
     pub fn declare_plugin_routes(
         mut self,
@@ -1372,31 +1411,6 @@ impl AppBuilder {
             self.declared_routes.push(route);
         }
         self
-    }
-
-    /// Mount a raw Axum router under a path prefix **and** declare its route
-    /// metadata in a single, coverage-audited step.
-    ///
-    /// Equivalent to [`nest(path, router)`](Self::nest) followed by
-    /// [`declare_plugin_routes(routes)`](Self::declare_plugin_routes), except the
-    /// mount is additionally recorded as *declared-covered*. Because `routes`
-    /// enumerates the nested router's endpoints, `autumn routes audit` can prove
-    /// their auth posture, so this mount is **not** counted among the opaque,
-    /// unenumerable routers that hard-fail the coverage gate.
-    ///
-    /// Plain [`nest`](Self::nest) / [`merge`](Self::merge) mounts stay opaque:
-    /// their routes cannot be proven and continue to fail the audit gate. Use
-    /// this method whenever the declared `routes` faithfully cover everything the
-    /// raw router serves under `path`.
-    #[must_use]
-    pub fn nest_declared(
-        mut self,
-        path: &str,
-        router: axum::Router<AppState>,
-        declared: impl IntoIterator<Item = crate::route_listing::RouteInfo>,
-    ) -> Self {
-        self.declared_nest_prefixes.push(path.to_owned());
-        self.nest(path, router).declare_plugin_routes(declared)
     }
 
     /// Register an async startup hook that runs after [`AppState`] exists and
@@ -2739,7 +2753,6 @@ impl AppBuilder {
             #[cfg(feature = "maud")]
             story_gallery,
             declared_routes: _,
-            declared_nest_prefixes: _,
             idempotency_enabled,
             #[cfg(feature = "mail")]
             mail_interceptor,
@@ -3883,7 +3896,6 @@ impl AppBuilder {
             #[cfg(feature = "maud")]
             story_gallery,
             declared_routes: _,
-            declared_nest_prefixes: _,
             idempotency_enabled,
             #[cfg(feature = "mail")]
             mail_interceptor,
@@ -4311,7 +4323,6 @@ impl AppBuilder {
             merge_routers,
             nest_routers,
             declared_routes,
-            declared_nest_prefixes,
             config_loader_factory,
             telemetry_provider,
             #[cfg(feature = "openapi")]
@@ -4354,17 +4365,16 @@ impl AppBuilder {
         // Raw Axum routers registered via .merge()/.nest() are opaque: there is
         // no public API to enumerate their routes, so they are omitted from the
         // listing and hard-fail `autumn routes audit` (their auth posture can't
-        // be proven). The one exception is a nest mounted through
-        // `nest_declared`: it supplies covering RouteInfos (already folded into
-        // `declared_routes`), so those endpoints ARE enumerable and must not be
-        // counted as omitted. Every `.merge()` and every bare `.nest()` stays
-        // opaque. One prefix is recorded per `nest_declared` call and never more
-        // than there are nest routers, so the subtraction can't underflow, but
-        // saturate defensively regardless.
+        // be proven). The exception is a `.nest(prefix, router)` whose endpoints
+        // were declared via `declare_plugin_routes` — when a declared route's
+        // path falls under the nest prefix, those endpoints ARE enumerable
+        // (folded into `declared_routes`) and must not be counted as omitted.
+        // Every `.merge()` is rootless and always counts; a bare `.nest()` with
+        // no covering declaration stays opaque and counts.
         let hidden = omitted_router_count(
             merge_routers.len(),
-            nest_routers.len(),
-            declared_nest_prefixes.len(),
+            nest_routers.iter().map(|(prefix, _)| prefix.as_str()),
+            &declared_routes,
         );
         if hidden > 0 {
             eprintln!(
@@ -7889,14 +7899,31 @@ mod tests {
 
     // ── omitted-router accounting for `autumn routes audit` ──────────────────
 
-    /// Regression (#1604): a raw router mounted via `nest_declared` (as the
-    /// first-party `AdminPlugin` does) supplies covering `RouteInfo`s, so its
-    /// endpoints are enumerable and must NOT be counted among the opaque,
-    /// omitted routers that hard-fail the audit gate. Before the fix, the mere
-    /// presence of the nested raw router pushed `hidden > 0` and false-failed
-    /// the audit even though every admin route was declared and classified.
+    /// Compute the omitted-router count for a builder using the same inputs
+    /// `run_dump_routes_mode` feeds `omitted_router_count`: the merge count, the
+    /// nest prefixes, and the declared routes that prove nest coverage.
+    fn omitted_for(builder: &AppBuilder) -> usize {
+        omitted_router_count(
+            builder.merge_routers.len(),
+            builder
+                .nest_routers
+                .iter()
+                .map(|(prefix, _)| prefix.as_str()),
+            &builder.declared_routes,
+        )
+    }
+
+    /// Regression (#1604): the DOCUMENTED plugin pattern —
+    /// `app.nest(prefix, router).declare_plugin_routes(routes)`, which the
+    /// first-party `AdminPlugin` uses — declares route metadata whose paths fall
+    /// under the nest prefix. That coverage makes the nested raw router
+    /// enumerable, so it must NOT be counted among the opaque, omitted routers
+    /// that hard-fail the audit gate. Before the fix, prefix coverage was
+    /// ignored and the mere presence of the nested raw router pushed
+    /// `hidden > 0`, false-failing the audit even though every admin route was
+    /// declared and classified.
     #[test]
-    fn declared_nest_mounts_are_not_counted_as_omitted() {
+    fn documented_nest_then_declare_is_not_counted_as_omitted() {
         let raw =
             axum::Router::<AppState>::new().route("/ping", axum::routing::get(|| async { "pong" }));
         let declared = vec![crate::route_listing::RouteInfo {
@@ -7906,24 +7933,22 @@ mod tests {
             ..Default::default()
         }];
 
-        let builder = app().nest_declared("/admin", raw, declared);
+        // The plain documented pattern: nest the raw router, then declare its
+        // covering route metadata. No dedicated `nest_declared` bookkeeping.
+        let builder = app().nest("/admin", raw).declare_plugin_routes(declared);
 
         // The raw router is still mounted (serving path is unchanged) …
         assert_eq!(builder.nest_routers.len(), 1);
-        // … and it is recorded as declared-covered.
-        assert_eq!(builder.declared_nest_prefixes, vec!["/admin".to_owned()]);
-        // Its declared metadata was folded into `declared_routes`.
+        // … and its declared metadata was folded into `declared_routes`.
         assert_eq!(builder.declared_routes.len(), 1);
 
-        // ⇒ zero omitted routers: the audit gate must NOT fire.
+        // ⇒ zero omitted routers: the declared route `/admin/ping` falls under
+        // the `/admin` nest prefix, so the mount is covered and the audit gate
+        // must NOT fire.
         assert_eq!(
-            omitted_router_count(
-                builder.merge_routers.len(),
-                builder.nest_routers.len(),
-                builder.declared_nest_prefixes.len(),
-            ),
+            omitted_for(&builder),
             0,
-            "a nest+declare mount is enumerable and must not count as omitted",
+            "a nest whose endpoints are declared is enumerable and must not count as omitted",
         );
     }
 
@@ -7941,23 +7966,45 @@ mod tests {
 
         assert_eq!(builder.nest_routers.len(), 1);
         assert_eq!(builder.merge_routers.len(), 1);
-        // Nothing was declared-covered.
-        assert!(builder.declared_nest_prefixes.is_empty());
+        // Nothing was declared, so nothing covers the nest.
+        assert!(builder.declared_routes.is_empty());
 
         assert_eq!(
-            omitted_router_count(
-                builder.merge_routers.len(),
-                builder.nest_routers.len(),
-                builder.declared_nest_prefixes.len(),
-            ),
+            omitted_for(&builder),
             2,
             "an undeclared nest and a merge are both opaque and must be reported",
         );
     }
 
+    /// An undeclared `merge()` is rootless — it cannot be prefix-matched — so it
+    /// stays omitted even when unrelated declared routes exist. Guards against a
+    /// declaration for one mount silently covering an unrelated raw `merge()`.
+    #[test]
+    fn declared_routes_do_not_cover_a_rootless_merge() {
+        let raw_merge =
+            axum::Router::<AppState>::new().route("/y", axum::routing::get(|| async { "y" }));
+
+        let builder =
+            app()
+                .merge(raw_merge)
+                .declare_plugin_routes(vec![crate::route_listing::RouteInfo {
+                    method: "GET".to_owned(),
+                    path: "/admin/ok".to_owned(),
+                    handler: "admin::ok".to_owned(),
+                    ..Default::default()
+                }]);
+
+        assert_eq!(
+            omitted_for(&builder),
+            1,
+            "a merge has no prefix to match declarations against and must always count",
+        );
+    }
+
     /// A declared nest alongside an *undeclared* nest: only the undeclared one
-    /// is omitted. Guards against the association silently covering unrelated
-    /// bare `nest()` mounts.
+    /// is omitted. Prefix-matching must cover the `/admin` mount (a declared
+    /// route falls under it) without spilling onto the unrelated `/raw` mount
+    /// (no declared route falls under it).
     #[test]
     fn mixed_declared_and_undeclared_nests_count_only_the_undeclared() {
         let declared_raw =
@@ -7966,28 +8013,45 @@ mod tests {
             .route("/opaque", axum::routing::get(|| async { "opaque" }));
 
         let builder = app()
-            .nest_declared(
-                "/admin",
-                declared_raw,
-                vec![crate::route_listing::RouteInfo {
-                    method: "GET".to_owned(),
-                    path: "/admin/ok".to_owned(),
-                    handler: "admin::ok".to_owned(),
-                    ..Default::default()
-                }],
-            )
+            .nest("/admin", declared_raw)
+            .declare_plugin_routes(vec![crate::route_listing::RouteInfo {
+                method: "GET".to_owned(),
+                path: "/admin/ok".to_owned(),
+                handler: "admin::ok".to_owned(),
+                ..Default::default()
+            }])
             .nest("/raw", undeclared_raw);
 
         assert_eq!(builder.nest_routers.len(), 2);
-        assert_eq!(builder.declared_nest_prefixes.len(), 1);
+        assert_eq!(builder.declared_routes.len(), 1);
         assert_eq!(
-            omitted_router_count(
-                builder.merge_routers.len(),
-                builder.nest_routers.len(),
-                builder.declared_nest_prefixes.len(),
-            ),
+            omitted_for(&builder),
             1,
             "only the bare nest() is omitted; the declared mount is covered",
+        );
+    }
+
+    /// A declared route whose path merely *shares a leading substring* with a
+    /// nest prefix (`/administrators` vs `/admin`) must NOT cover the nest:
+    /// prefix-matching honours path-segment boundaries, so this bare nest still
+    /// counts as omitted and the audit fails closed.
+    #[test]
+    fn prefix_match_respects_path_segment_boundaries() {
+        let raw = axum::Router::<AppState>::new().route("/x", axum::routing::get(|| async { "x" }));
+
+        let builder = app().nest("/admin", raw).declare_plugin_routes(vec![
+            crate::route_listing::RouteInfo {
+                method: "GET".to_owned(),
+                path: "/administrators".to_owned(),
+                handler: "other::index".to_owned(),
+                ..Default::default()
+            },
+        ]);
+
+        assert_eq!(
+            omitted_for(&builder),
+            1,
+            "`/administrators` is not under the `/admin` nest prefix; the nest stays omitted",
         );
     }
 

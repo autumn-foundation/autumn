@@ -531,11 +531,13 @@ mod tests {
     }
 
     /// The mirror of the case above (#1604): a raw router mounted with covering
-    /// declarations — as the first-party `AdminPlugin` does via
-    /// `nest_declared` — is enumerable, so the app emits NO omitted marker
-    /// (`hidden == 0`). `parse_omitted_count` returns 0 and, with clean visible
-    /// routes, the combined gate must PASS. Previously the nested admin router
-    /// still tripped the marker and false-failed the audit.
+    /// declarations — as the first-party `AdminPlugin` does via the documented
+    /// `nest(prefix, router).declare_plugin_routes(routes)` pattern — is
+    /// enumerable, so the app emits NO omitted marker (`hidden == 0`) because a
+    /// declared route falls under the nest prefix. `parse_omitted_count` returns
+    /// 0 and, with clean visible routes, the combined gate must PASS. Previously
+    /// the nested admin router still tripped the marker and false-failed the
+    /// audit.
     #[test]
     fn declared_nest_emits_no_marker_and_passes_the_gate() {
         // Visible routes include the declared admin endpoints, all classified.
