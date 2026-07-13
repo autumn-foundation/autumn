@@ -738,6 +738,60 @@ pub fn inspect_leaf(
     })
 }
 
+/// Build a rustls [`CertifiedKey`] from an in-memory PEM certificate chain and
+/// private key, WITHOUT touching the filesystem.
+///
+/// Used by the ACME path (issue #1608) to hot-swap a freshly issued certificate
+/// into a [`ReloadableCertResolver`] without a round-trip through disk. Like
+/// [`load_certified_key`], `from_der` validates the key and checks it matches
+/// the leaf; unlike it, this does not reject an expired leaf (the caller — the
+/// renewal task — decides how to react to a stale cert, and the self-signed
+/// placeholder it also loads is deliberately short-lived).
+///
+/// # Errors
+///
+/// Returns a human-readable message if the PEM cannot be parsed or the key does
+/// not match the leaf certificate.
+#[cfg(feature = "acme")]
+pub fn certified_key_from_pem(
+    chain_pem: &[u8],
+    key_pem: &[u8],
+    provider: &CryptoProvider,
+) -> Result<Arc<CertifiedKey>, String> {
+    let mut chain = Vec::new();
+    for cert in CertificateDer::pem_slice_iter(chain_pem) {
+        chain.push(cert.map_err(|e| format!("failed to parse ACME certificate PEM: {e}"))?);
+    }
+    if chain.is_empty() {
+        return Err("ACME certificate chain contained no PEM CERTIFICATE blocks".to_owned());
+    }
+    let key = PrivateKeyDer::from_pem_slice(key_pem)
+        .map_err(|e| format!("failed to parse ACME private key PEM: {e}"))?;
+    let certified = CertifiedKey::from_der(chain, key, provider)
+        .map_err(|e| format!("ACME private key does not match the issued certificate: {e}"))?;
+    Ok(Arc::new(certified))
+}
+
+/// The leaf certificate's `notAfter` (UNIX seconds) from an in-memory PEM chain.
+///
+/// Used by the ACME renewal loop and health indicator to decide when a stored
+/// certificate is due for renewal. Returns an error message if the PEM has no
+/// certificate or the leaf cannot be parsed.
+///
+/// # Errors
+///
+/// Returns a human-readable message on a missing or unparseable leaf.
+#[cfg(feature = "acme")]
+pub fn leaf_not_after_from_pem(chain_pem: &[u8]) -> Result<i64, String> {
+    let leaf = CertificateDer::pem_slice_iter(chain_pem)
+        .next()
+        .ok_or_else(|| "certificate chain contained no PEM CERTIFICATE blocks".to_owned())?
+        .map_err(|e| format!("failed to parse certificate PEM: {e}"))?;
+    leaf_validity_unix(Path::new("<memory>"), &leaf)
+        .map(|(_, not_after)| not_after)
+        .map_err(|e| e.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

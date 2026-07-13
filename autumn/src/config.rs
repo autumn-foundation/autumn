@@ -3358,10 +3358,10 @@ impl AutumnConfig {
         {
             let tls = self.server.tls.get_or_insert_with(TlsConfig::empty_for_env);
             if let Some(cert) = tls_cert {
-                tls.cert_path = PathBuf::from(cert);
+                tls.cert_path = Some(PathBuf::from(cert));
             }
             if let Some(key) = tls_key {
-                tls.key_path = PathBuf::from(key);
+                tls.key_path = Some(PathBuf::from(key));
             }
             if let Some(reload) = tls_reload.and_then(|v| v.trim().parse::<u64>().ok()) {
                 tls.reload_interval_secs = reload;
@@ -4578,10 +4578,19 @@ pub struct ServerConfig {
 #[derive(Debug, Clone, Deserialize)]
 pub struct TlsConfig {
     /// Path to the PEM certificate chain (leaf first, then intermediates).
-    pub cert_path: PathBuf,
+    ///
+    /// Optional so a `[server.tls]` section can instead enable automatic ACME
+    /// provisioning (issue #1608) via [`acme`](Self::acme). In static-cert mode
+    /// this must be set together with [`key_path`](Self::key_path); in ACME mode
+    /// both must be unset. The startup [`validate`](Self::validate) guard
+    /// rejects any other combination.
+    #[serde(default)]
+    pub cert_path: Option<PathBuf>,
 
-    /// Path to the PEM private key matching the leaf certificate.
-    pub key_path: PathBuf,
+    /// Path to the PEM private key matching the leaf certificate. Optional; see
+    /// [`cert_path`](Self::cert_path).
+    #[serde(default)]
+    pub key_path: Option<PathBuf>,
 
     /// How often, in seconds, the running server polls the certificate and key
     /// files' modification times to pick up an external renewal (e.g. after
@@ -4596,21 +4605,228 @@ pub struct TlsConfig {
     /// clamped to `1` second.
     #[serde(default = "default_tls_handshake_timeout_secs")]
     pub handshake_timeout_secs: u64,
+
+    /// Automatic ACME (Let's Encrypt) certificate provisioning + renewal
+    /// (issue #1608). When present the server obtains and auto-renews its own
+    /// certificate over the ACME HTTP-01 challenge instead of loading a static
+    /// cert from disk. Mutually exclusive with
+    /// [`cert_path`](Self::cert_path)/[`key_path`](Self::key_path); the startup
+    /// [`validate`](Self::validate) guard enforces exactly one mode. The serving
+    /// code is gated behind the off-by-default `acme` feature.
+    #[serde(default)]
+    pub acme: Option<AcmeConfig>,
 }
 
 impl TlsConfig {
     /// An empty `TlsConfig` used only as the seed for env-var overrides of a
-    /// section that was absent from TOML. Both paths are empty (which fails
-    /// fast at startup if left unset), and the reload interval takes its
-    /// default.
-    fn empty_for_env() -> Self {
+    /// section that was absent from TOML. Both paths are unset (which fails
+    /// fast at startup if neither a static cert nor ACME is configured), and the
+    /// reload interval takes its default.
+    const fn empty_for_env() -> Self {
         Self {
-            cert_path: PathBuf::new(),
-            key_path: PathBuf::new(),
+            cert_path: None,
+            key_path: None,
             reload_interval_secs: default_tls_reload_interval_secs(),
             handshake_timeout_secs: default_tls_handshake_timeout_secs(),
+            acme: None,
         }
     }
+
+    /// Validate the `[server.tls]` wiring before the listener binds.
+    ///
+    /// Exactly one provisioning mode must be selected:
+    /// - **static cert**: both [`cert_path`](Self::cert_path) and
+    ///   [`key_path`](Self::key_path) set (and no `[server.tls.acme]`), or
+    /// - **ACME**: `[server.tls.acme]` present (and neither path set).
+    ///
+    /// Every rejection names the offending combination so the operator can act
+    /// on it without guesswork.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message describing the first problem found.
+    pub fn validate(&self) -> Result<(), String> {
+        let has_cert = self.cert_path.is_some();
+        let has_key = self.key_path.is_some();
+        let static_configured = has_cert || has_key;
+        let acme_configured = self.acme.is_some();
+
+        match (static_configured, acme_configured) {
+            (true, true) => {
+                return Err(
+                    "[server.tls] sets a static cert_path/key_path AND [server.tls.acme]; \
+                     choose exactly one — remove the static cert to use ACME, or remove \
+                     [server.tls.acme] to serve the static certificate"
+                        .to_owned(),
+                );
+            }
+            (false, false) => {
+                return Err(
+                    "[server.tls] must configure exactly one of: a static certificate \
+                     (cert_path AND key_path) or automatic provisioning ([server.tls.acme] \
+                     with domains + contact_email)"
+                        .to_owned(),
+                );
+            }
+            (true, false) => {
+                if !(has_cert && has_key) {
+                    return Err("[server.tls] cert_path and key_path must be set together; \
+                         set both, or configure [server.tls.acme] instead"
+                        .to_owned());
+                }
+            }
+            (false, true) => {}
+        }
+
+        if let Some(acme) = &self.acme {
+            acme.validate()?;
+        }
+
+        Ok(())
+    }
+}
+
+/// Automatic ACME (Let's Encrypt) certificate provisioning settings (issue
+/// #1608). Present under `[server.tls.acme]`.
+///
+/// # Deployment scope
+///
+/// HTTP-01 ACME here is **single-host**: the challenge-token map is per-process
+/// in-memory and certificates are stored on local disk, so behind a load
+/// balancer the CA's `:80` validation can hit a replica without the token
+/// (→ 404) and non-leader replicas cannot adopt a cert from a non-shared store.
+/// Single-replica deployments are fully correct; multi-replica needs a shared
+/// token store or DNS-01 (tracked in #1620). Configuring ACME alongside a
+/// distributed scheduler backend logs a startup warning.
+///
+/// # `autumn.toml` example
+///
+/// ```toml
+/// [server.tls.acme]
+/// domains = ["app.example.com"]
+/// contact_email = "ops@example.com"
+/// # optional; "staging" (default), "production", or a custom directory URL.
+/// directory = "staging"
+/// ```
+#[derive(Debug, Clone, Deserialize)]
+pub struct AcmeConfig {
+    /// Domains to include on the issued certificate (SANs). At least one is
+    /// required. Wildcards (`*.example.com`) are rejected — they require the
+    /// DNS-01 challenge, tracked in issue #1620.
+    pub domains: Vec<String>,
+
+    /// Contact email registered with the ACME account (used for expiry
+    /// notifications from the CA). Required.
+    pub contact_email: String,
+
+    /// Which ACME directory to use. Defaults to Let's Encrypt **staging** on
+    /// purpose, so a first run or CI cannot burn the strict production rate
+    /// limit before the deployment is known good.
+    #[serde(default)]
+    pub directory: AcmeDirectory,
+
+    /// Directory that stores the ACME account key and issued certificates.
+    /// Default: `config/acme`.
+    #[serde(default = "default_acme_cache_dir")]
+    pub cache_dir: PathBuf,
+
+    /// Port to serve the HTTP-01 challenge (and the HTTP→HTTPS redirect) on.
+    /// The ACME CA always validates HTTP-01 over port 80, so this defaults to
+    /// `80`; override it when a front-end forwards `:80` to another port.
+    #[serde(default = "default_acme_http_challenge_port")]
+    pub http_challenge_port: u16,
+
+    /// Renew the certificate once it has fewer than this many days of validity
+    /// left. Default: `30`.
+    #[serde(default = "default_acme_renew_before_days")]
+    pub renew_before_days: u32,
+}
+
+impl AcmeConfig {
+    /// Validate the ACME wiring: at least one non-wildcard domain and a
+    /// non-empty contact email.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message describing the first problem found.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.domains.is_empty() {
+            return Err(
+                "[server.tls.acme] domains must list at least one domain to request a \
+                 certificate for"
+                    .to_owned(),
+            );
+        }
+        if self.contact_email.trim().is_empty() {
+            return Err(
+                "[server.tls.acme] contact_email must be set (the ACME CA requires an account \
+                 contact for expiry notifications)"
+                    .to_owned(),
+            );
+        }
+        if self.http_challenge_port == 0 {
+            return Err(
+                "[server.tls.acme] http_challenge_port must not be 0: port 0 binds an ephemeral \
+                 OS-assigned port that the ACME HTTP-01 validator (which always connects on port \
+                 80) can never reach, so every issuance fails. Use 80, or the port a front-end \
+                 forwards `:80` to"
+                    .to_owned(),
+            );
+        }
+        // The renew-before window is compared against the issued certificate's
+        // REMAINING validity. Publicly-trusted CAs (Let's Encrypt) issue
+        // ~90-day certificates, so treat 90 days as the effective maximum cert
+        // lifetime: a `renew_before_days >= 90` keeps the freshly-issued
+        // certificate perpetually inside its renew-before window, so `needs_renewal`
+        // stays true immediately after every successful renewal and the hourly
+        // loop orders a brand-new certificate every tick until the CA's rate
+        // limits are hit. Reject it up front.
+        if self.renew_before_days >= 90 {
+            return Err(format!(
+                "[server.tls.acme] renew_before_days ({}) must be less than 90: it is compared \
+                 against the issued certificate's remaining validity, and publicly-trusted CAs \
+                 (e.g. Let's Encrypt) issue certificates that live at most ~90 days. A value >= \
+                 the certificate lifetime keeps the cert perpetually inside its renew-before \
+                 window, so the renewal loop would order a fresh certificate every hour and burn \
+                 the CA's rate limits. Use a smaller value (default 30)",
+                self.renew_before_days
+            ));
+        }
+        for (index, domain) in self.domains.iter().enumerate() {
+            let trimmed = domain.trim();
+            if trimmed.is_empty() {
+                return Err(format!(
+                    "[server.tls.acme] domains must not contain blank entries (entry at index \
+                     {index} is empty or whitespace-only)"
+                ));
+            }
+            if trimmed.starts_with("*.") {
+                return Err(format!(
+                    "[server.tls.acme] wildcard domain `{trimmed}` is not supported: wildcards \
+                     require the DNS-01 challenge, which is out of scope here (tracked in #1620). \
+                     List explicit hostnames instead"
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Which ACME directory endpoint to provision against.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AcmeDirectory {
+    /// Let's Encrypt **staging** (the default): untrusted certificates, but
+    /// generous rate limits — safe for first runs and CI.
+    #[default]
+    Staging,
+    /// Let's Encrypt production: trusted certificates, strict rate limits.
+    Production,
+    /// A custom ACME directory URL (e.g. a private CA or a pebble test server).
+    Custom {
+        /// The directory URL (e.g. `https://acme.example.com/directory`).
+        url: String,
+    },
 }
 
 /// Behavior when a configured read replica is unavailable or stale.
@@ -5944,6 +6160,25 @@ const fn default_tls_handshake_timeout_secs() -> u64 {
     10
 }
 
+/// Default directory for the ACME account key and issued certificates
+/// (`[server.tls.acme] cache_dir`).
+fn default_acme_cache_dir() -> PathBuf {
+    PathBuf::from("config/acme")
+}
+
+/// Default HTTP-01 challenge / redirect port (`[server.tls.acme]
+/// http_challenge_port`). The ACME CA always validates HTTP-01 over port 80.
+const fn default_acme_http_challenge_port() -> u16 {
+    80
+}
+
+/// Default renew-before window in days (`[server.tls.acme] renew_before_days`).
+/// Let's Encrypt certificates are valid for 90 days; renewing with 30 days left
+/// leaves ample slack for retries.
+const fn default_acme_renew_before_days() -> u32 {
+    30
+}
+
 fn default_health_path() -> String {
     "/health".to_owned()
 }
@@ -6680,13 +6915,23 @@ impl<'de> de::Deserializer<'de> for SchemaDeserializer {
     fn deserialize_enum<V>(
         self,
         _name: &'static str,
-        _variants: &'static [&'static str],
+        variants: &'static [&'static str],
         visitor: V,
     ) -> Result<V::Value, Self::Error>
     where
         V: Visitor<'de>,
     {
-        visitor.visit_enum(SchemaEnumAccess)
+        // Feed the FIRST declared variant name (not `""`) so serde's derived
+        // variant-identifier visitor accepts it. An empty tag is an "unknown
+        // variant" error that aborts the ENTIRE remaining schema traversal, so a
+        // single enum field (e.g. `server.tls.acme.directory`) would drop every
+        // sibling/subsequent section (`database`, …) from the derived schema —
+        // silently disabling the strict unknown-key validator for them. The enum
+        // is still treated as an opaque leaf: every `SchemaEnumAccess` variant
+        // arm resolves to `visit_unit` without recursing.
+        visitor.visit_enum(SchemaEnumAccess {
+            variant: variants.first().copied().unwrap_or_default(),
+        })
     }
 
     fn deserialize_identifier<V>(self, visitor: V) -> Result<V::Value, Self::Error>
@@ -6763,7 +7008,12 @@ impl<'de> MapAccess<'de> for SchemaMapAccess {
     }
 }
 
-struct SchemaEnumAccess;
+struct SchemaEnumAccess {
+    /// The variant name to report to serde's derived variant-identifier visitor.
+    /// Must be a REAL variant name (the first declared one), never `""`, or
+    /// serde returns an "unknown variant" error that aborts schema traversal.
+    variant: &'static str,
+}
 
 impl<'de> de::EnumAccess<'de> for SchemaEnumAccess {
     type Error = serde::de::value::Error;
@@ -6773,7 +7023,7 @@ impl<'de> de::EnumAccess<'de> for SchemaEnumAccess {
     where
         V: de::DeserializeSeed<'de>,
     {
-        let val = seed.deserialize(de::value::StrDeserializer::new(""))?;
+        let val = seed.deserialize(de::value::StrDeserializer::new(self.variant))?;
         Ok((val, self))
     }
 }
@@ -6840,6 +7090,39 @@ mod tests {
 
         assert!(keys.contains_key("database"));
         assert!(keys["database"].contains("primary_url"));
+    }
+
+    // Regression (#1608): `server.tls.acme.directory` is the `AcmeDirectory`
+    // enum, declared under `server` — which precedes `database` in `AutumnConfig`.
+    // The `SchemaDeserializer` must treat that enum as an opaque leaf and keep
+    // walking; if it instead errors on the variant tag it aborts the whole
+    // traversal at the enum, dropping `database` (and every later section) from
+    // the derived schema. That silently disables the strict unknown-key validator
+    // for `[database]`, so a typo like `primry_url` stops being flagged.
+    #[cfg(feature = "acme")]
+    #[test]
+    fn acme_enum_field_does_not_truncate_schema_traversal() {
+        let keys = AutumnConfig::get_schema_keys();
+        assert!(
+            keys.contains_key("server.tls.acme"),
+            "acme section must be in the schema"
+        );
+        assert!(
+            keys.contains_key("database"),
+            "database schema dropped: the acme enum truncated traversal"
+        );
+        assert!(keys["database"].contains("primary_url"));
+
+        // The unknown-key validator must still flag a typo in a section declared
+        // after the enum, with the edit-distance suggestion.
+        let errs = AutumnConfig::validate_toml("[database]\nprimry_url = \"x\"\n", &keys);
+        assert_eq!(
+            errs,
+            vec![(
+                "database.primry_url".to_owned(),
+                Some("database.primary_url".to_owned())
+            )]
+        );
     }
 
     #[test]
@@ -9158,15 +9441,18 @@ path = "/healthz"
         let tls = config.server.tls.expect("tls configured");
         assert_eq!(
             tls.cert_path,
-            std::path::PathBuf::from("/etc/autumn/tls/fullchain.pem")
+            Some(std::path::PathBuf::from("/etc/autumn/tls/fullchain.pem"))
         );
         assert_eq!(
             tls.key_path,
-            std::path::PathBuf::from("/etc/autumn/tls/privkey.pem")
+            Some(std::path::PathBuf::from("/etc/autumn/tls/privkey.pem"))
         );
         // Reload interval and handshake timeout default when omitted.
         assert_eq!(tls.reload_interval_secs, 60);
         assert_eq!(tls.handshake_timeout_secs, 10);
+        // No ACME section → static-cert mode.
+        assert!(tls.acme.is_none());
+        assert!(tls.validate().is_ok());
     }
 
     #[test]
@@ -9210,8 +9496,11 @@ path = "/healthz"
         assert!(config.server.tls.is_none());
         config.apply_env_overrides_with_env(&env);
         let tls = config.server.tls.expect("env should materialize tls");
-        assert_eq!(tls.cert_path, std::path::PathBuf::from("/env/cert.pem"));
-        assert_eq!(tls.key_path, std::path::PathBuf::from("/env/key.pem"));
+        assert_eq!(
+            tls.cert_path,
+            Some(std::path::PathBuf::from("/env/cert.pem"))
+        );
+        assert_eq!(tls.key_path, Some(std::path::PathBuf::from("/env/key.pem")));
         assert_eq!(tls.reload_interval_secs, 90);
         assert_eq!(tls.handshake_timeout_secs, 5);
     }
@@ -9231,8 +9520,11 @@ path = "/healthz"
         let env = MockEnv::new().with("AUTUMN_SERVER__TLS__CERT_PATH", "override-cert.pem");
         config.apply_env_overrides_with_env(&env);
         let tls = config.server.tls.expect("tls configured");
-        assert_eq!(tls.cert_path, std::path::PathBuf::from("override-cert.pem"));
-        assert_eq!(tls.key_path, std::path::PathBuf::from("toml-key.pem"));
+        assert_eq!(
+            tls.cert_path,
+            Some(std::path::PathBuf::from("override-cert.pem"))
+        );
+        assert_eq!(tls.key_path, Some(std::path::PathBuf::from("toml-key.pem")));
     }
 
     #[test]
@@ -9241,6 +9533,212 @@ path = "/healthz"
         let mut config = AutumnConfig::default();
         config.apply_env_overrides_with_env(&env);
         assert!(config.server.tls.is_none());
+    }
+
+    // ── server.tls.acme (#1608) ───────────────────────────────────
+
+    fn tls_static(cert: Option<&str>, key: Option<&str>) -> TlsConfig {
+        TlsConfig {
+            cert_path: cert.map(PathBuf::from),
+            key_path: key.map(PathBuf::from),
+            reload_interval_secs: default_tls_reload_interval_secs(),
+            handshake_timeout_secs: default_tls_handshake_timeout_secs(),
+            acme: None,
+        }
+    }
+
+    fn acme_cfg(domains: &[&str], email: &str) -> AcmeConfig {
+        AcmeConfig {
+            domains: domains.iter().map(|d| (*d).to_owned()).collect(),
+            contact_email: email.to_owned(),
+            directory: AcmeDirectory::Staging,
+            cache_dir: default_acme_cache_dir(),
+            http_challenge_port: default_acme_http_challenge_port(),
+            renew_before_days: default_acme_renew_before_days(),
+        }
+    }
+
+    #[test]
+    fn acme_parses_from_toml_with_defaults() {
+        let config: AutumnConfig = toml::from_str(
+            r#"
+            [server.tls.acme]
+            domains = ["app.example.com"]
+            contact_email = "ops@example.com"
+            "#,
+        )
+        .expect("config with [server.tls.acme] should parse");
+        let tls = config.server.tls.expect("tls configured");
+        let acme = tls.acme.as_ref().expect("acme configured");
+        assert_eq!(acme.domains, vec!["app.example.com".to_owned()]);
+        assert_eq!(acme.contact_email, "ops@example.com");
+        // Staging is the default on purpose (rate-limit safety).
+        assert_eq!(acme.directory, AcmeDirectory::Staging);
+        assert_eq!(acme.cache_dir, PathBuf::from("config/acme"));
+        assert_eq!(acme.http_challenge_port, 80);
+        assert_eq!(acme.renew_before_days, 30);
+        assert!(tls.validate().is_ok());
+    }
+
+    #[test]
+    fn acme_directory_custom_parses() {
+        let config: AutumnConfig = toml::from_str(
+            r#"
+            [server.tls.acme]
+            domains = ["a.example.com"]
+            contact_email = "ops@example.com"
+            directory = { custom = { url = "https://pebble.test/dir" } }
+            "#,
+        )
+        .expect("custom directory should parse");
+        let acme = config.server.tls.unwrap().acme.unwrap();
+        assert_eq!(
+            acme.directory,
+            AcmeDirectory::Custom {
+                url: "https://pebble.test/dir".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn validate_static_only_ok() {
+        assert!(tls_static(Some("c.pem"), Some("k.pem")).validate().is_ok());
+    }
+
+    #[test]
+    fn validate_acme_only_ok() {
+        let mut cfg = tls_static(None, None);
+        cfg.acme = Some(acme_cfg(&["app.example.com"], "ops@example.com"));
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_both_static_and_acme_rejected() {
+        let mut cfg = tls_static(Some("c.pem"), Some("k.pem"));
+        cfg.acme = Some(acme_cfg(&["app.example.com"], "ops@example.com"));
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("choose exactly one"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_neither_static_nor_acme_rejected() {
+        let err = tls_static(None, None).validate().unwrap_err();
+        assert!(err.contains("exactly one of"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_cert_without_key_rejected() {
+        let err = tls_static(Some("c.pem"), None).validate().unwrap_err();
+        assert!(err.contains("set together"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_acme_empty_domains_rejected() {
+        let mut cfg = tls_static(None, None);
+        cfg.acme = Some(acme_cfg(&[], "ops@example.com"));
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("at least one domain"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_acme_empty_email_rejected() {
+        let mut cfg = tls_static(None, None);
+        cfg.acme = Some(acme_cfg(&["app.example.com"], "  "));
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("contact_email"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_acme_wildcard_domain_rejected_mentions_1620() {
+        let mut cfg = tls_static(None, None);
+        cfg.acme = Some(acme_cfg(&["*.example.com"], "ops@example.com"));
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("#1620"), "got: {err}");
+        assert!(err.contains("wildcard"), "got: {err}");
+    }
+
+    // Regression (#1608, Codex P2): a blank/whitespace-only domain entry passes
+    // `domains.is_empty()` (the list has length 1) but the runtime then orders a
+    // cert for an empty DNS identifier, so `validate()` must reject it up front.
+    #[test]
+    fn validate_acme_blank_domain_entry_rejected() {
+        let mut cfg = tls_static(None, None);
+        cfg.acme = Some(acme_cfg(&[""], "ops@example.com"));
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("blank entries"), "got: {err}");
+
+        // A whitespace-only entry is rejected the same way.
+        let mut cfg = tls_static(None, None);
+        cfg.acme = Some(acme_cfg(&["   "], "ops@example.com"));
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("blank entries"), "got: {err}");
+    }
+
+    // Regression (#1608, Codex P2): `http_challenge_port = 0` binds an ephemeral
+    // OS port the HTTP-01 validator (always port 80) can never reach, so every
+    // issuance fails while the process stays up — `validate()` must reject it.
+    #[test]
+    fn validate_acme_zero_http_challenge_port_rejected() {
+        let mut cfg = tls_static(None, None);
+        let mut acme = acme_cfg(&["app.example.com"], "ops@example.com");
+        acme.http_challenge_port = 0;
+        cfg.acme = Some(acme);
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("http_challenge_port"), "got: {err}");
+    }
+
+    // Regression (#1608, Codex P2): a `renew_before_days` >= the issued cert's
+    // lifetime (treated as ~90 days for a public CA) keeps `needs_renewal` true
+    // immediately after every successful renewal, so the hourly loop re-orders a
+    // fresh cert every tick until the CA rate-limits the account. `validate()`
+    // must reject any value >= 90.
+    #[test]
+    fn validate_acme_renew_before_days_at_or_above_cert_lifetime_rejected() {
+        // Well above the cert lifetime (the reviewer's example).
+        let mut cfg = tls_static(None, None);
+        let mut acme = acme_cfg(&["app.example.com"], "ops@example.com");
+        acme.renew_before_days = 100;
+        cfg.acme = Some(acme);
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("renew_before_days"), "got: {err}");
+        assert!(err.contains("rate limits"), "got: {err}");
+
+        // Exactly 90 (== the effective max cert lifetime) is also rejected: the
+        // fresh cert would be due for renewal from the moment it is issued.
+        let mut cfg = tls_static(None, None);
+        let mut acme = acme_cfg(&["app.example.com"], "ops@example.com");
+        acme.renew_before_days = 90;
+        cfg.acme = Some(acme);
+        assert!(
+            cfg.validate().is_err(),
+            "renew_before_days == 90 must be rejected"
+        );
+
+        // A sane sub-lifetime value passes.
+        let mut cfg = tls_static(None, None);
+        let mut acme = acme_cfg(&["app.example.com"], "ops@example.com");
+        acme.renew_before_days = 30;
+        cfg.acme = Some(acme);
+        assert!(cfg.validate().is_ok(), "got: {:?}", cfg.validate());
+
+        // The just-below-boundary value (89) is still accepted.
+        let mut cfg = tls_static(None, None);
+        let mut acme = acme_cfg(&["app.example.com"], "ops@example.com");
+        acme.renew_before_days = 89;
+        cfg.acme = Some(acme);
+        assert!(cfg.validate().is_ok(), "got: {:?}", cfg.validate());
+    }
+
+    // Companion: a valid domain list plus the default challenge port is unaffected
+    // by the new blank-entry / zero-port rejections.
+    #[test]
+    fn validate_acme_valid_domains_and_port_ok() {
+        let mut cfg = tls_static(None, None);
+        cfg.acme = Some(acme_cfg(
+            &["app.example.com", "www.example.com"],
+            "ops@example.com",
+        ));
+        assert!(cfg.validate().is_ok(), "got: {:?}", cfg.validate());
     }
 
     // ── server.max_concurrent_requests (#1006) ────────────────────
