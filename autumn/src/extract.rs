@@ -207,17 +207,23 @@ impl Multipart {
         };
 
         // Only file parts carry uploadable content worth validating. Regular
-        // form fields often omit `Content-Type` and are never sniffed. A part
-        // with an empty filename (`filename=""`, as an optional/empty file
-        // input sends) carries no upload and is treated as a non-file field, so
-        // enforcement never runs against its 0-byte body and aborts the submit.
-        //
-        // We sniff whenever an allow-list is configured OR strict
-        // mismatch-rejection is enabled — either check needs the actual
-        // (magic-byte) content type rather than the spoofable client header.
-        let needs_sniff = field.file_name().is_some_and(|name| !name.is_empty())
+        // form fields omit a filename entirely and are never sniffed. A file
+        // part always carries a filename (`Some`), so we sniff whenever one is
+        // present AND an allow-list is configured OR strict mismatch-rejection
+        // is enabled — either check needs the actual (magic-byte) content type
+        // rather than the spoofable client header.
+        let needs_sniff = field.file_name().is_some()
             && (!self.config.allowed_mime_types.is_empty()
                 || self.config.reject_on_content_type_mismatch);
+
+        // An optional/empty file input submits a part with `filename=""` and a
+        // 0-byte body. Only that genuinely-empty case is exempt from
+        // enforcement (see below); a `filename=""` part with a NON-empty body
+        // must still be sniffed and enforced, since callers can consume its
+        // bytes by field name. Capture the empty-filename flag now, before the
+        // body is consumed by the prefix-buffering loop, to avoid borrowing
+        // `field` after it has been read.
+        let filename_is_empty = field.file_name().is_some_and(str::is_empty);
 
         if !needs_sniff {
             return Ok(Some(MultipartField::new(
@@ -256,19 +262,28 @@ impl Multipart {
         let declared_essence = field.content_type().map(content_type_essence);
         let sniffed = sniff_content_type(&prefix);
 
-        // Enforce the allow-list (sniffed → markup-guard → declared fallback)
-        // and, when enabled, strict declared-vs-sniffed matching. See the
-        // helpers below for the exact rules.
-        if !self.config.allowed_mime_types.is_empty() {
-            enforce_upload_allow_list(
-                &self.config.allowed_mime_types,
-                &prefix,
-                declared_essence,
-                sniffed,
-            )?;
-        }
-        if self.config.reject_on_content_type_mismatch {
-            enforce_content_type_match(declared_essence, sniffed)?;
+        // A genuinely-empty optional file input (empty filename AND 0-byte
+        // body) carries no upload: skip enforcement so it passes through as a
+        // non-file/absent field instead of aborting the submit. Every other
+        // part with a filename — including `filename=""` with a non-empty body
+        // — is sniffed and enforced exactly as below, closing the bypass where
+        // a crafted empty filename could smuggle disallowed content.
+        let is_empty_file_input = filename_is_empty && prefix.is_empty();
+        if !is_empty_file_input {
+            // Enforce the allow-list (sniffed → markup-guard → declared
+            // fallback) and, when enabled, strict declared-vs-sniffed matching.
+            // See the helpers below for the exact rules.
+            if !self.config.allowed_mime_types.is_empty() {
+                enforce_upload_allow_list(
+                    &self.config.allowed_mime_types,
+                    &prefix,
+                    declared_essence,
+                    sniffed,
+                )?;
+            }
+            if self.config.reject_on_content_type_mismatch {
+                enforce_content_type_match(declared_essence, sniffed)?;
+            }
         }
 
         Ok(Some(MultipartField {

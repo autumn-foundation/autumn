@@ -848,6 +848,27 @@ async fn multipart_empty_filename_part_skips_strict_mismatch_enforcement() {
 
 #[cfg(feature = "multipart")]
 #[tokio::test]
+async fn multipart_empty_filename_non_empty_body_still_enforced() {
+    let boundary = "X-BOUNDARY";
+    // Security regression (gemini + codex P1): a crafted part can carry
+    // `filename=""` yet a NON-empty, disallowed body. The empty-filename
+    // carve-out must apply only to a genuinely-empty (0-byte) input, so this
+    // part must still be sniffed and rejected under an allow-list rather than
+    // slipping through unenforced.
+    let png = png_fixture();
+    let body = single_file_multipart_body(boundary, "file", "", "image/png", &png);
+
+    let config = autumn_web::security::UploadConfig {
+        allowed_mime_types: vec!["image/jpeg".to_owned()],
+        ..autumn_web::security::UploadConfig::default()
+    };
+
+    let response = run_sniff_upload(config, body, boundary).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[cfg(feature = "multipart")]
+#[tokio::test]
 async fn multipart_named_disallowed_part_still_rejected() {
     let boundary = "X-BOUNDARY";
     // Regression guard: a genuinely-named file part with disallowed content
