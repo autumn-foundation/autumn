@@ -255,7 +255,7 @@ fn build_csrf_dimension(routes: &[AuditRoute], csrf: &CsrfDump) -> CsrfDimension
         .iter()
         .filter(|r| !method_is_safe(&r.method, &csrf.safe_methods))
         .map(|r| {
-            let exempt = path_is_exempt(&r.path, &csrf.exempt_paths);
+            let exempt = path_is_exempt(&r.path, &exempt_paths);
             CsrfEntry {
                 path: r.path.clone(),
                 method: r.method.clone(),

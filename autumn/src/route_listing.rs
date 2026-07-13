@@ -104,8 +104,10 @@ impl SecurityDump {
 
         let mut safe_methods = csrf.safe_methods.clone();
         safe_methods.sort();
+        safe_methods.dedup();
         let mut exempt_paths = csrf.exempt_paths.clone();
         exempt_paths.sort();
+        exempt_paths.dedup();
 
         Self {
             csrf: CsrfDump {
