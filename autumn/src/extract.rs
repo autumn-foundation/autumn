@@ -222,44 +222,26 @@ impl Multipart {
         // must still be sniffed and enforced, since callers can consume its
         // bytes by field name. Capture the empty-filename flag now, before the
         // body is consumed by the prefix-buffering loop, to avoid borrowing
-        // `field` after it has been read. The same flag drives the
-        // `file_name()` normalization: a genuinely-empty optional input
-        // surfaces as `None`, a non-empty-body empty-filename part as a file.
+        // `field` after it has been read. On the sniff path this flag also
+        // drives the `file_name()` normalization: a genuinely-empty optional
+        // input surfaces as `None`, a non-empty-body empty-filename part as a
+        // file.
         let filename_is_empty = field.file_name().is_some_and(str::is_empty);
 
         if !needs_sniff {
-            // Default path: no MIME policy, so no sniffing. We still must detect
-            // the genuinely-empty optional file input (empty filename AND empty
-            // body) so `file_name()` normalizes it to `None` consistently with
-            // the sniff path below. Only empty-filename parts can qualify, so
-            // only those need a body peek; every other part streams through
-            // untouched with no buffering.
-            if !filename_is_empty {
-                return Ok(Some(MultipartField::new(
-                    field,
-                    self.config.max_file_size_bytes,
-                )));
-            }
-
-            // Peek whether the empty-filename body yields any bytes. Buffer the
-            // peeked chunk as the prefix so the consuming methods replay it and
-            // no bytes are lost; the per-file cap is still enforced there.
-            let mut prefix: Vec<u8> = Vec::new();
-            if let Some(chunk) = field
-                .chunk()
-                .await
-                .map_err(|err| multipart_error_to_error(&err))?
-            {
-                prefix.extend_from_slice(&chunk);
-            }
-            let is_empty_optional_input = prefix.is_empty();
-            return Ok(Some(MultipartField {
-                inner: field,
-                max_file_size_bytes: self.config.max_file_size_bytes,
-                prefix,
-                sniffed_content_type: None,
-                is_empty_optional_input,
-            }));
+            // Default path: no MIME policy, so no sniffing and no enforcement.
+            // Hand the field through with ZERO buffering — exactly as before
+            // #1873 — so a handler can reject or stream it without the whole
+            // part being pulled into memory first. `file_name()` normalization
+            // is scoped to the sniff path (below), where body emptiness is
+            // already observed from the bounded sniff prefix; here there is no
+            // classification happening, so the raw inner filename (`Some("")`
+            // for an empty-filename part) is surfaced unchanged. Default config
+            // was explicitly unaffected by #1873.
+            return Ok(Some(MultipartField::new(
+                field,
+                self.config.max_file_size_bytes,
+            )));
         }
 
         // Buffer a bounded leading prefix (a few chunks at most) for sniffing,
@@ -491,10 +473,14 @@ pub struct MultipartField<'a> {
     /// `infer` returns a `&'static str`, so this stores the borrow directly.
     sniffed_content_type: Option<&'static str>,
     /// Whether this part is a genuinely-empty optional file input: an empty
-    /// `filename=""` AND a 0-byte body. Computed in `next_field`, where body
-    /// emptiness is observable, and used by [`file_name`](Self::file_name) to
-    /// normalize such a part to `None` while leaving an empty-filename part with
-    /// a non-empty body classified as a file (`Some("")`).
+    /// `filename=""` AND a 0-byte body. Set only on the sniff path (an
+    /// allow-list or strict-mismatch policy is configured), where body
+    /// emptiness is already observed from the bounded sniff prefix, and used by
+    /// [`file_name`](Self::file_name) to normalize such a part to `None` while
+    /// leaving an empty-filename part with a non-empty body classified as a
+    /// file (`Some("")`). Always `false` on the default (no-policy) path, which
+    /// streams through without buffering and performs no `file_name()`
+    /// normalization.
     is_empty_optional_input: bool,
 }
 
@@ -543,23 +529,31 @@ impl<'a> MultipartField<'a> {
 
     /// Uploaded file name (if this field represents a file).
     ///
-    /// Normalization applies to exactly ONE case: an empty `filename=""` AND a
-    /// 0-byte body is returned as `None`, because an optional file input left
-    /// blank submits such a part to represent an absent file rather than a real
-    /// upload (see issue #1873). Handlers that distinguish uploads via
-    /// `field.file_name().is_some()` therefore treat it as "no file provided"
-    /// instead of persisting a zero-byte file.
+    /// Normalization applies on the SNIFF PATH ONLY — i.e. when an allow-list
+    /// or strict-mismatch policy is configured — and to exactly ONE case there:
+    /// an empty `filename=""` AND a 0-byte body is returned as `None`, because
+    /// an optional file input left blank submits such a part to represent an
+    /// absent file rather than a real upload (see issue #1873). Handlers that
+    /// distinguish uploads via `field.file_name().is_some()` therefore treat it
+    /// as "no file provided" instead of persisting a zero-byte file.
     ///
-    /// Every other part is returned unchanged, so this getter agrees with the
-    /// file/non-file classification `next_field` uses for enforcement:
+    /// On the sniff path every other part is returned unchanged, so this getter
+    /// agrees with the file/non-file classification `next_field` uses for
+    /// enforcement:
     ///
     /// - empty filename + NON-empty body → `Some("")` (it is a file: it is
     ///   sniffed and enforced under an allow-list, so it is surfaced as one);
     /// - non-empty filename → `Some("name")`.
     ///
-    /// The decision is made in `next_field`, where body emptiness is
-    /// observable, and recorded on this field — this getter cannot inspect the
-    /// (lazily read) body itself.
+    /// On the DEFAULT path (no MIME policy) no normalization occurs: the field
+    /// streams through unbuffered and the raw inner value is returned verbatim
+    /// (`Some("")` for an empty-filename part). Default config was explicitly
+    /// unaffected by #1873, and no enforcement/classification happens there, so
+    /// there is no inconsistency to resolve.
+    ///
+    /// The sniff-path decision is made in `next_field`, where body emptiness is
+    /// observable from the bounded prefix, and recorded on this field — this
+    /// getter cannot inspect the (lazily read) body itself.
     #[must_use]
     pub fn file_name(&self) -> Option<&str> {
         if self.is_empty_optional_input {

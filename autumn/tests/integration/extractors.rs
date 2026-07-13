@@ -852,8 +852,9 @@ async fn file_name_handler(mut multipart: Multipart) -> autumn_web::AutumnResult
         .next_field()
         .await?
         .expect("expected one multipart field");
-    // Report the yielded filename so the test can assert normalization:
-    // an empty `filename=""` part must surface as `None`, not `Some("")`.
+    // Report the yielded filename so the test can assert behavior: on the sniff
+    // path a genuinely-empty optional input surfaces as `None`, while on the
+    // default path the raw inner value (`Some("")`) streams through verbatim.
     Ok(field
         .file_name()
         .map_or_else(|| "none".to_owned(), |name| format!("some:{name}")))
@@ -894,12 +895,18 @@ async fn run_file_name_upload(
 
 #[cfg(feature = "multipart")]
 #[tokio::test]
-async fn multipart_empty_filename_yields_none_file_name() {
+async fn multipart_empty_filename_default_config_streams_through_verbatim() {
     let boundary = "X-BOUNDARY";
-    // Issue #1873: an empty `filename=""` (0-byte) part represents an absent
-    // optional file. After it passes through, the yielded field's
-    // `file_name()` must normalize to `None` (not `Some("")`) so handlers that
-    // gate on `field.file_name().is_some()` don't persist a zero-byte file.
+    // Default config (no allow-list, no strict-mismatch): the part streams
+    // through UNBUFFERED, exactly as before #1873, and `file_name()` returns
+    // the raw inner value verbatim — `Some("")` for an empty `filename=""`
+    // part. `file_name()` normalization is intentionally scoped to the sniff
+    // path (where an allow-list/strict policy is configured and body emptiness
+    // is known from the bounded prefix); the default path performs no
+    // enforcement/classification, so there is nothing to normalize and it must
+    // not buffer the body to peek at it (codex P2 memory regression). Issue
+    // #1873 only ever affected the configured allow-list path, and default
+    // config was explicitly unchanged.
     let body = single_file_multipart_body(boundary, "file", "", "application/octet-stream", b"");
 
     let app = Router::new().route("/", axum::routing::post(file_name_handler));
@@ -922,7 +929,8 @@ async fn multipart_empty_filename_yields_none_file_name() {
     let out = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
         .unwrap();
-    assert_eq!(&out[..], b"none");
+    // `Some("")` → the handler emits the `some:` prefix with an empty name.
+    assert_eq!(&out[..], b"some:");
 }
 
 #[cfg(feature = "multipart")]
