@@ -262,11 +262,19 @@ impl CsrfLayer {
     }
 
     /// Limit the form-body bytes read when scanning for the CSRF token field.
-    /// The effective limit is `min(n, 2 MiB)`.
+    ///
+    /// Honors the caller-supplied `n` verbatim. The router passes the configured
+    /// `security.upload.max_request_size_bytes` here so the token scan cap tracks
+    /// the request body limit: a zero-JS multipart upload up to that size can
+    /// still have its `_csrf` field located (see issue #1866). The request body
+    /// is already bounded upstream by the global `DefaultBodyLimit` (also derived
+    /// from `max_request_size_bytes`), so buffering up to `n` here introduces no
+    /// new unbounded-memory exposure. When this method is not called the default
+    /// from [`Self::from_config`] (2 MiB) applies.
     #[must_use]
     pub(crate) fn with_max_scan_bytes(mut self, n: usize) -> Self {
         let settings = Arc::make_mut(&mut self.settings);
-        settings.max_scan_bytes = n.min(2 * 1024 * 1024);
+        settings.max_scan_bytes = n;
         self
     }
 
@@ -1623,6 +1631,101 @@ mod tests {
                     .method("POST")
                     .uri("/upload")
                     .header("Cookie", "autumn-csrf=correct-token")
+                    .header(http::header::ACCEPT, "text/html")
+                    .header(
+                        "Content-Type",
+                        format!("multipart/form-data; boundary={boundary}"),
+                    )
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    /// Build a multipart body larger than the legacy 2 MiB scan cap: a valid
+    /// `_csrf` field positioned first, followed by a padded binary file field.
+    fn large_multipart_body(boundary: &str, token: &str, pad_bytes: usize) -> Vec<u8> {
+        let mut body = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"_csrf\"\r\n\r\n{token}\r\n"
+        )
+        .into_bytes();
+        body.extend_from_slice(
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"avatar\"; \
+                 filename=\"photo.bin\"\r\nContent-Type: application/octet-stream\r\n\r\n"
+            )
+            .as_bytes(),
+        );
+        body.extend(std::iter::repeat_n(b'A', pad_bytes));
+        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        body
+    }
+
+    /// Regression test for issue #1866. A zero-JS multipart upload larger than the
+    /// legacy hard-clamped 2 MiB scan window — but within the configured scan cap —
+    /// must still have its `_csrf` field located, so it is NOT rejected with 403.
+    #[tokio::test]
+    async fn post_large_multipart_within_scan_cap_finds_token_passes() {
+        let token = "test-csrf-token-uuid-1866";
+        let boundary = "----WebKitFormBoundary1866PASS";
+        // 3 MiB of padding => whole body exceeds the legacy 2 MiB clamp.
+        let body = large_multipart_body(boundary, token, 3 * 1024 * 1024);
+        assert!(body.len() > 2 * 1024 * 1024);
+
+        // Router wires `with_max_scan_bytes(upload.max_request_size_bytes)`; here we
+        // model a configured 4 MiB request-body limit (> the legacy 2 MiB clamp).
+        let app = Router::new()
+            .route("/upload", post(|| async { "ok" }))
+            .layer(
+                CsrfLayer::from_config(&default_csrf_config()).with_max_scan_bytes(4 * 1024 * 1024),
+            );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/upload")
+                    .header("Cookie", format!("autumn-csrf={token}"))
+                    .header(http::header::ACCEPT, "text/html")
+                    .header(
+                        "Content-Type",
+                        format!("multipart/form-data; boundary={boundary}"),
+                    )
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// Contrast for issue #1866: with the scan cap left at the 2 MiB default, the
+    /// same >2 MiB body cannot be buffered, so `to_bytes` errors, the token is not
+    /// found, and the request is rejected with 403 — the pre-fix behavior. This
+    /// documents that the effective ceiling is the scan cap, which the fix now
+    /// aligns to `max_request_size_bytes`.
+    #[tokio::test]
+    async fn post_large_multipart_exceeding_scan_cap_rejected() {
+        let token = "test-csrf-token-uuid-1866b";
+        let boundary = "----WebKitFormBoundary1866FAIL";
+        let body = large_multipart_body(boundary, token, 3 * 1024 * 1024);
+        assert!(body.len() > 2 * 1024 * 1024);
+
+        // Default cap is 2 MiB (from_config, no with_max_scan_bytes override).
+        let app = Router::new()
+            .route("/upload", post(|| async { "ok" }))
+            .layer(CsrfLayer::from_config(&default_csrf_config()));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/upload")
+                    .header("Cookie", format!("autumn-csrf={token}"))
                     .header(http::header::ACCEPT, "text/html")
                     .header(
                         "Content-Type",
