@@ -292,7 +292,7 @@ testcontainers-modules = { workspace = true }
 redis.workspace = true
 proptest = "1.4"
 time = { workspace = true }
-tokio-tungstenite = "0.29.0"
+tokio-tungstenite = "0.30.0"
 loom = "0.7.2"
 temp-env = { version = "0.3.6", features = ["async_closure"] }
 rustversion = "1"
