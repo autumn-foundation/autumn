@@ -901,14 +901,39 @@ fn check_field(
     scan.push(Rule::Label, name, el.line, file);
 }
 
-/// Whether an element has an accessible name from its content: an `aria-label`,
-/// visible text, or a named child image. A dynamic subtree is unresolvable, so
-/// it is treated as named (skip rather than misfire).
+/// Whether an element has an accessible name from its own attributes or content:
+/// an `aria-label`/`aria-labelledby` on the control itself, or — among the
+/// descendants that are not hidden from the accessibility tree — visible text, a
+/// dynamic (spliced) body, or a named child image. A dynamic subtree is
+/// unresolvable, so it is treated as named (skip rather than misfire).
 fn named_content(el: &Element) -> bool {
-    el.has_aria_name()
-        || subtree_has_dynamic(&el.children)
-        || subtree_has_text(&el.children)
-        || subtree_has_named_img(&el.children)
+    el.has_aria_name() || content_provides_name(&el.children)
+}
+
+/// Whether an element is hidden from the accessibility tree via a literal
+/// `aria-hidden="true"`. Per ARIA such a subtree contributes nothing to an
+/// ancestor's accessible name. A dynamic/spliced `aria-hidden=(…)` is
+/// unresolvable and treated as *not* hidden (conservative — don't suppress a
+/// name on an unresolved splice); `aria-hidden="false"` or an absent attribute
+/// are likewise not hidden.
+fn is_aria_hidden(el: &Element) -> bool {
+    matches!(el.attr("aria-hidden"), Some(AttrValue::Literal(v)) if v.eq_ignore_ascii_case("true"))
+}
+
+/// Whether descendant content contributes an accessible name to an enclosing
+/// control: a dynamic (spliced) node, non-empty visible text, or a named
+/// `<img>`. Subtrees hidden via a literal `aria-hidden="true"` are excluded —
+/// per ARIA their text does not count toward the ancestor's accessible name.
+fn content_provides_name(nodes: &[Node]) -> bool {
+    nodes.iter().any(|n| match n {
+        Node::Dynamic => true,
+        Node::Text(t) => !t.trim().is_empty(),
+        Node::Element(e) if is_aria_hidden(e) => false,
+        Node::Element(e) => {
+            (e.name.eq_ignore_ascii_case("img") && attr_is_present_name(e.attr("alt")))
+                || content_provides_name(&e.children)
+        }
+    })
 }
 
 /// Whether a `<label>` provides a name to a control it wraps: any visible text
@@ -930,18 +955,6 @@ fn subtree_has_dynamic(nodes: &[Node]) -> bool {
         Node::Dynamic => true,
         Node::Element(e) => subtree_has_dynamic(&e.children),
         Node::Text(_) => false,
-    })
-}
-
-/// Whether the subtree contains an `<img>` with a non-empty (or dynamic) `alt`,
-/// which contributes to an enclosing control's accessible name.
-fn subtree_has_named_img(nodes: &[Node]) -> bool {
-    nodes.iter().any(|n| match n {
-        Node::Element(e) => {
-            let named = e.name.eq_ignore_ascii_case("img") && attr_is_present_name(e.attr("alt"));
-            named || subtree_has_named_img(&e.children)
-        }
-        _ => false,
     })
 }
 
@@ -1254,6 +1267,49 @@ mod tests {
     fn icon_anchor_with_aria_label_is_clean() {
         let src = wrap(r#"a href="https://example.com" aria-label="GitHub" { }"#);
         assert!(findings_for(&src).is_empty());
+    }
+
+    // ── aria-hidden subtrees don't count toward the accessible name ─────────
+
+    #[test]
+    fn icon_button_with_aria_hidden_glyph_is_flagged() {
+        // The only content is an `aria-hidden="true"` glyph, which per ARIA does
+        // not contribute an accessible name — the button is effectively nameless.
+        let src = wrap(r#"button { span aria-hidden="true" { "×" } }"#);
+        let f = findings_for(&src);
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert_eq!(f[0].rule_id, "button-name");
+    }
+
+    #[test]
+    fn icon_anchor_with_aria_hidden_glyph_is_flagged() {
+        let src = wrap(r#"a href="/x" { span aria-hidden="true" { "🔍" } }"#);
+        let f = findings_for(&src);
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert_eq!(f[0].rule_id, "link-name");
+    }
+
+    #[test]
+    fn button_with_hidden_glyph_and_visible_text_is_clean() {
+        // The visible "Close" text still provides an accessible name.
+        let src = wrap(r#"button { span aria-hidden="true" { "×" } "Close" }"#);
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn button_with_hidden_glyph_and_aria_label_is_clean() {
+        // The `aria-label` on the control itself provides the name.
+        let src = wrap(r#"button aria-label="Close" { span aria-hidden="true" { "×" } }"#);
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn button_with_dynamic_aria_hidden_glyph_is_not_flagged() {
+        // A spliced `aria-hidden=(…)` is unresolvable, so the subtree is treated
+        // as not hidden and its text still counts — conservative, no new false
+        // positive on valid dynamic markup.
+        let src = wrap(r#"button { span aria-hidden=(flag) { "×" } }"#);
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
     }
 
     // ── Escape-hatch / dynamic limits ──────────────────────────────────────
