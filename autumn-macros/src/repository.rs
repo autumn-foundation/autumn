@@ -225,6 +225,15 @@ struct RepoConfig {
     /// otherwise-blind no-lock sub-branches. When `false` (default) the blind
     /// path stays byte-for-byte as before: no extra SELECT, no validation.
     validate_on_update_fetch: bool,
+    /// Name of the per-record owner column (a `users` foreign key such as
+    /// `user_id`/`author_id`) when the repository is owner-scoped (issue #1841).
+    /// `None` (the default) emits nothing extra: every existing `#[repository]`
+    /// is unaffected. `Some(col)` additionally emits owner-filtered
+    /// `list_scoped(owner_id, ..)` and (when `searchable`) `search_page_scoped(
+    /// owner_id, ..)` methods so an owner-scoped index/search never returns other
+    /// users' rows. The column may be `BigInt` or `Nullable<BigInt>`; a nullable
+    /// owner never matches NULL (unowned) rows, which is the intended semantics.
+    owner_column: Option<String>,
 }
 
 #[allow(clippy::too_many_lines)]
@@ -254,6 +263,7 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
     let mut broadcast_container: Option<String> = None;
     let mut dependents: Vec<DependentSpec> = Vec::new();
     let mut validate_on_update_fetch = false;
+    let mut owner_column: Option<String> = None;
 
     syn::meta::parser(|meta| {
         // `hooks = Ident` must be checked before the catch-all model_name case,
@@ -336,6 +346,13 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
         } else if meta.path.is_ident("scope") {
             let value: Ident = meta.value()?.parse()?;
             scope_type = Some(value);
+            Ok(())
+        } else if meta.path.is_ident("owner") {
+            // `owner = <column ident>` (issue #1841): opts the repository into
+            // owner-scoped list/search codegen. The value is a bare column ident
+            // (e.g. `user_id`, `author_id`) matching a `users` foreign key.
+            let value: Ident = meta.value()?.parse()?;
+            owner_column = Some(value.to_string());
             Ok(())
         } else if meta.path.is_ident("cursor_key") {
             let value: Ident = meta.value()?.parse()?;
@@ -455,7 +472,7 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
             Ok(())
         } else {
             Err(meta.error(
-                "expected model name, table = \"...\", hooks = Type, commit_hooks = true, api = \"/path\", mcp, mcp = \"read\", policy = Type, scope = Type, cursor_key = field, cursor_key_type = Type, soft_delete, tenant_scoped, no_upsert_trait, searchable, versioned = true, no_versioned_record_impl, primary_reads, sharded, validate_on_update = fetch, dependent(ChildRepository, fk = \"...\", on_delete = ...), broadcasts = true, topic = \"...\", render = fn, or container = \"...\"",
+                "expected model name, table = \"...\", hooks = Type, commit_hooks = true, api = \"/path\", mcp, mcp = \"read\", policy = Type, scope = Type, owner = column, cursor_key = field, cursor_key_type = Type, soft_delete, tenant_scoped, no_upsert_trait, searchable, versioned = true, no_versioned_record_impl, primary_reads, sharded, validate_on_update = fetch, dependent(ChildRepository, fk = \"...\", on_delete = ...), broadcasts = true, topic = \"...\", render = fn, or container = \"...\"",
             ))
         }
     })
@@ -515,6 +532,7 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
         generated_internal_hooks,
         dependents,
         validate_on_update_fetch,
+        owner_column,
     })
 }
 
@@ -1155,6 +1173,13 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     } else {
         quote! {}
     };
+
+    // #1841 owner-scoping: when the repository declares `owner = <column>`, we
+    // emit owner-filtered `list_scoped` / `search_page_scoped` methods so the
+    // generated `#[secured]` index/search never returns other users' rows. The
+    // column ident is bound here once; `owner_column.is_some()` gates every scoped
+    // emission below so an ordinary `#[repository]` (no `owner =`) is unaffected.
+    let owner_col_ident = config.owner_column.as_ref().map(|c| format_ident!("{c}"));
 
     // ── #1369 dependent destroy/nullify ─────────────────────────────
     //
@@ -10148,6 +10173,115 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     };
 
+    // ── #1841: owner-scoped list method ─────────────────────────────────
+    //
+    // `list_scoped(owner_id, ..)` is `list(..)` with an unconditional
+    // `owner_column = owner_id` filter applied to BOTH the COUNT and the page
+    // query *before* the allowlisted sort/filter helpers run, so `total` and the
+    // returned rows agree and neither can be widened by a request-supplied
+    // filter. Emitted only when `owner =` is declared; otherwise both fragments
+    // are empty and every existing `#[repository]` is byte-for-byte unchanged.
+    // The owner filter composes with tenant scoping (both are `.filter(..)` on
+    // the boxed query) so a repository that is both tenant- and owner-scoped
+    // narrows by tenant AND owner.
+    let (list_scoped_trait_method, list_scoped_impl_method) = if let Some(ref owner_col) =
+        owner_col_ident
+    {
+        let trait_method = quote! {
+            /// Fetch one page of records **owned by `owner_id`** applying the same
+            /// allowlisted sort + equality filters as [`list`](Self::list).
+            ///
+            /// The `owner_id` filter is applied to both the COUNT and the page
+            /// query and cannot be overridden by a request-supplied `filter[..]`
+            /// key, so an owner-scoped index/search can never return another
+            /// user's rows (issue #1841). A nullable owner column never matches
+            /// NULL (unowned) rows.
+            fn list_scoped(
+                &self,
+                owner_id: i64,
+                query: &::autumn_web::pagination::ListQuery,
+                req: &::autumn_web::pagination::PageRequest,
+            ) -> impl ::std::future::Future<Output = ::autumn_web::AutumnResult<::autumn_web::pagination::Page<#model_name>>> + Send;
+        };
+        // Optional tenant setup + per-query tenant filters, mirroring `list`.
+        let scoped_tenant_setup = if config.tenant_scoped {
+            quote! {
+                let __tenant = if self.across_tenants {
+                    ::core::option::Option::None
+                } else {
+                    let t = ::autumn_web::tenancy::CURRENT_TENANT.try_with(|t| t.clone()).ok().flatten()
+                        .ok_or_else(|| ::autumn_web::AutumnError::internal_server_error_msg("Query scoped to tenant, but no tenant context was established"))?;
+                    ::core::option::Option::Some(t)
+                };
+            }
+        } else {
+            quote! {}
+        };
+        let scoped_tenant_count_filter = if config.tenant_scoped {
+            quote! {
+                if let ::core::option::Option::Some(ref t) = __tenant {
+                    __count_q = __count_q.filter(#table_ident::tenant_id.eq(t.clone()));
+                }
+            }
+        } else {
+            quote! {}
+        };
+        let scoped_tenant_page_filter = if config.tenant_scoped {
+            quote! {
+                if let ::core::option::Option::Some(ref t) = __tenant {
+                    __page_q = __page_q.filter(#table_ident::tenant_id.eq(t.clone()));
+                }
+            }
+        } else {
+            quote! {}
+        };
+        let impl_method = quote! {
+            async fn list_scoped(
+                &self,
+                owner_id: i64,
+                query: &::autumn_web::pagination::ListQuery,
+                req: &::autumn_web::pagination::PageRequest,
+            ) -> ::autumn_web::AutumnResult<::autumn_web::pagination::Page<#model_name>> {
+                #page_cross_shard_guard
+                use ::autumn_web::reexports::diesel::prelude::*;
+                use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                #[allow(unused_imports)]
+                use ::autumn_web::pagination::AutumnListable as _;
+                #scoped_tenant_setup
+                let mut conn = self.__autumn_acquire_read_conn().await?;
+
+                let mut __count_q = #table_ident::table.into_boxed() #sd_filter;
+                #scoped_tenant_count_filter
+                // #1841: owner filter applied BEFORE the allowlisted helpers so a
+                // request `filter[..]` can only narrow, never widen, the owner set.
+                __count_q = __count_q.filter(#table_ident::#owner_col.eq(owner_id));
+                let __count_q = #model_name::__autumn_list_apply_filters(__count_q, query);
+                let total: i64 = __count_q
+                    .count()
+                    .get_result::<i64>(&mut conn)
+                    .await
+                    .map_err(::autumn_web::AutumnError::from)?;
+
+                let mut __page_q = #table_ident::table.into_boxed() #sd_filter;
+                #scoped_tenant_page_filter
+                __page_q = __page_q.filter(#table_ident::#owner_col.eq(owner_id));
+                let __page_q = #model_name::__autumn_list_apply_filters(__page_q, query);
+                let __page_q = #model_name::__autumn_list_apply_order(__page_q, query);
+                let items: ::std::vec::Vec<#model_name> = __page_q
+                    .limit(req.limit())
+                    .offset(req.offset())
+                    .select(#model_name::as_select())
+                    .load::<#model_name>(&mut conn)
+                    .await
+                    .map_err(::autumn_web::AutumnError::from)?;
+                ::core::result::Result::Ok(::autumn_web::pagination::Page::new(items, total, req))
+            }
+        };
+        (trait_method, impl_method)
+    } else {
+        (quote! {}, quote! {})
+    };
+
     // `cursor_page` is only generated when the user declares `cursor_key = field`.
     //
     // Two modes depending on whether `cursor_key_type` is also declared:
@@ -13428,6 +13562,254 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         (quote! {}, quote! {})
     };
 
+    // ── #1841: owner-scoped full-text search (`search_page_scoped`) ──────
+    //
+    // Emitted only when the repository is BOTH `searchable` AND `owner =`
+    // scoped. It clones `search_page` and adds the owner filter to ALL THREE
+    // query phases — the COUNT raw SQL, the id-SELECT raw SQL, and the typed
+    // hydration query — so `total`, the paged id set, and the hydrated rows all
+    // agree and none can leak another user's rows. The owner id is bound as a
+    // positional parameter (never string-interpolated); the parameter index
+    // shifts by one when tenant scoping already occupies `$3`, mirroring the
+    // tenant code's `$3/$4/$5` arity handling.
+    let (search_page_scoped_trait_method, search_page_scoped_impl_method) = if let (
+        true,
+        ::core::option::Option::Some(owner_col),
+        ::core::option::Option::Some(owner_col_name),
+    ) = (
+        config.searchable,
+        owner_col_ident.as_ref(),
+        config.owner_column.as_deref(),
+    ) {
+        // Owner clause literals for the two positional slots the runtime SQL
+        // builder can land the owner filter on: `$3` (no tenant param) or
+        // `$4` (tenant occupies `$3`). Built at macro-expansion time from the
+        // trusted column ident, so the runtime string only ever concatenates
+        // a fixed, developer-declared identifier — never request input.
+        let owner_and_p3 = format!(" AND {owner_col_name} = $3");
+        let owner_and_p4 = format!(" AND {owner_col_name} = $4");
+
+        let tenant_id_setup = if config.tenant_scoped {
+            quote! {
+                let tenant_id = if self.across_tenants {
+                    ::core::option::Option::None
+                } else {
+                    let t = ::autumn_web::tenancy::CURRENT_TENANT.try_with(|t| t.clone()).ok().flatten()
+                        .ok_or_else(|| ::autumn_web::AutumnError::internal_server_error_msg("Query scoped to tenant, but no tenant context was established"))?;
+                    ::core::option::Option::Some(t)
+                };
+            }
+        } else {
+            quote! {
+                let tenant_id = ::core::option::Option::None::<::std::string::String>;
+            }
+        };
+        let search_page_cross_shard_guard = if config.sharded && config.tenant_scoped {
+            quote! {
+                if self.across_tenants && self.__autumn_shards.is_some() {
+                    return ::core::result::Result::Err(
+                        ::autumn_web::AutumnError::bad_request_msg(
+                            "cross-shard search_page is not supported: \
+                             across_tenants() fans out unpaginated reads only; \
+                             page a specific shard instead"
+                        )
+                    );
+                }
+            }
+        } else {
+            quote! {}
+        };
+        let second_stage_owner_filter = quote! {
+            records_query = records_query.filter(#table_ident::#owner_col.eq(owner_id));
+        };
+
+        let trait_method = quote! {
+            /// Owner-scoped full-text search: like [`search_page`](Self::search_page)
+            /// but every phase (`COUNT`, the ranked id `SELECT`, and the typed
+            /// hydration) is filtered to rows owned by `owner_id`, so an
+            /// owner-scoped `/search` endpoint can never return another user's
+            /// rows (issue #1841). A nullable owner column never matches NULL
+            /// (unowned) rows.
+            fn search_page_scoped(
+                &self,
+                owner_id: i64,
+                query: &str,
+                req: &::autumn_web::pagination::PageRequest,
+            ) -> impl ::std::future::Future<Output = ::autumn_web::AutumnResult<::autumn_web::pagination::Page<#model_name>>> + Send;
+        };
+
+        let impl_method = quote! {
+            async fn search_page_scoped(
+                &self,
+                owner_id: i64,
+                query: &str,
+                req: &::autumn_web::pagination::PageRequest,
+            ) -> ::autumn_web::AutumnResult<::autumn_web::pagination::Page<#model_name>> {
+                use ::autumn_web::reexports::diesel::prelude::*;
+                use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                #search_page_cross_shard_guard
+
+                if query.trim().is_empty() {
+                    return Ok(::autumn_web::pagination::Page::new(Vec::new(), 0, req));
+                }
+
+                #[derive(::autumn_web::reexports::diesel::QueryableByName)]
+                struct SearchId {
+                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::BigInt)]
+                    id: i64,
+                }
+
+                #[derive(::autumn_web::reexports::diesel::QueryableByName)]
+                struct SearchCount {
+                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::BigInt)]
+                    count: i64,
+                }
+
+                #tenant_id_setup
+                let mut conn = self.__autumn_acquire_read_conn().await?;
+                let language = <#model_name as ::autumn_web::repository::AutumnSearchableModel>::SEARCH_LANGUAGE;
+                let limit = req.limit();
+                let offset = req.offset();
+
+                // ── COUNT (owner-filtered) ──
+                let mut count_sql = format!(
+                    "SELECT COUNT(*) AS count FROM \"{}\" WHERE search_vector @@ websearch_to_tsquery($1::regconfig, $2)",
+                    #table_name
+                );
+                if #config_soft_delete {
+                    count_sql.push_str(" AND deleted_at IS NULL");
+                }
+                if #config_tenant_scoped {
+                    if let ::core::option::Option::Some(ref _t) = tenant_id {
+                        count_sql.push_str(" AND tenant_id = $3");
+                        count_sql.push_str(#owner_and_p4);
+                    } else {
+                        count_sql.push_str(#owner_and_p3);
+                    }
+                } else {
+                    count_sql.push_str(#owner_and_p3);
+                }
+
+                let total = if #config_tenant_scoped {
+                    if let ::core::option::Option::Some(ref t) = tenant_id {
+                        ::autumn_web::reexports::diesel::sql_query(count_sql)
+                            .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(language)
+                            .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(query)
+                            .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(t)
+                            .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(owner_id)
+                            .get_result::<SearchCount>(&mut conn)
+                            .await?
+                            .count
+                    } else {
+                        ::autumn_web::reexports::diesel::sql_query(count_sql)
+                            .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(language)
+                            .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(query)
+                            .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(owner_id)
+                            .get_result::<SearchCount>(&mut conn)
+                            .await?
+                            .count
+                    }
+                } else {
+                    ::autumn_web::reexports::diesel::sql_query(count_sql)
+                        .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(language)
+                        .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(query)
+                        .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(owner_id)
+                        .get_result::<SearchCount>(&mut conn)
+                        .await?
+                        .count
+                };
+
+                // ── ranked id SELECT (owner-filtered) ──
+                let mut select_sql = format!(
+                    "SELECT id FROM \"{}\" WHERE search_vector @@ websearch_to_tsquery($1::regconfig, $2)",
+                    #table_name
+                );
+                if #config_soft_delete {
+                    select_sql.push_str(" AND deleted_at IS NULL");
+                }
+                if #config_tenant_scoped {
+                    if let ::core::option::Option::Some(ref _t) = tenant_id {
+                        select_sql.push_str(" AND tenant_id = $3");
+                        select_sql.push_str(#owner_and_p4);
+                        select_sql.push_str(" ORDER BY ts_rank_cd(search_vector, websearch_to_tsquery($1::regconfig, $2)) DESC, id DESC");
+                        select_sql.push_str(" LIMIT $5 OFFSET $6");
+                    } else {
+                        select_sql.push_str(#owner_and_p3);
+                        select_sql.push_str(" ORDER BY ts_rank_cd(search_vector, websearch_to_tsquery($1::regconfig, $2)) DESC, id DESC");
+                        select_sql.push_str(" LIMIT $4 OFFSET $5");
+                    }
+                } else {
+                    select_sql.push_str(#owner_and_p3);
+                    select_sql.push_str(" ORDER BY ts_rank_cd(search_vector, websearch_to_tsquery($1::regconfig, $2)) DESC, id DESC");
+                    select_sql.push_str(" LIMIT $4 OFFSET $5");
+                }
+
+                let ids = if #config_tenant_scoped {
+                    if let ::core::option::Option::Some(ref t) = tenant_id {
+                        ::autumn_web::reexports::diesel::sql_query(select_sql)
+                            .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(language)
+                            .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(query)
+                            .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(t)
+                            .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(owner_id)
+                            .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(limit)
+                            .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(offset)
+                            .load::<SearchId>(&mut conn)
+                            .await?
+                    } else {
+                        ::autumn_web::reexports::diesel::sql_query(select_sql)
+                            .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(language)
+                            .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(query)
+                            .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(owner_id)
+                            .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(limit)
+                            .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(offset)
+                            .load::<SearchId>(&mut conn)
+                            .await?
+                    }
+                } else {
+                    ::autumn_web::reexports::diesel::sql_query(select_sql)
+                        .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(language)
+                        .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(query)
+                        .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(owner_id)
+                        .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(limit)
+                        .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(offset)
+                        .load::<SearchId>(&mut conn)
+                        .await?
+                };
+
+                let id_list: Vec<i64> = ids.into_iter().map(|s| s.id).collect();
+                if id_list.is_empty() {
+                    return Ok(::autumn_web::pagination::Page::new(Vec::new(), total, req));
+                }
+
+                // ── typed hydration (owner-filtered) ──
+                let mut records_query = #table_ident::table
+                    .filter(#table_ident::id.eq_any(&id_list))
+                    .into_boxed();
+                #second_stage_soft_delete_filter
+                #second_stage_tenant_filter
+                #second_stage_owner_filter
+                let records = records_query
+                    .load::<#model_name>(&mut conn)
+                    .await?;
+
+                let mut record_map: ::std::collections::HashMap<i64, #model_name> = records
+                    .into_iter()
+                    .map(|r| (r.id, r))
+                    .collect();
+
+                let sorted_records: Vec<#model_name> = id_list
+                    .iter()
+                    .filter_map(|id| record_map.remove(id))
+                    .collect();
+
+                Ok(::autumn_web::pagination::Page::new(sorted_records, total, req))
+            }
+        };
+        (trait_method, impl_method)
+    } else {
+        (quote! {}, quote! {})
+    };
+
     let upsert_set_ext_impl = quote! {};
     let upsert_execution_ext_impl = quote! {};
     let correlate_ext_impl = quote! {};
@@ -13876,11 +14258,13 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             fn exists_by_id(&self, id: i64) -> impl ::std::future::Future<Output = ::autumn_web::AutumnResult<bool>> + Send;
             #pagination_trait_method
             #list_trait_method
+            #list_scoped_trait_method
             #cursor_page_trait_method
             #(#derived_trait_methods)*
             #soft_delete_trait_methods
             #bulk_trait_methods
             #search_trait_methods
+            #search_page_scoped_trait_method
         }
 
         // Bridges this repository's tenant/soft-delete config to the model's
@@ -13964,6 +14348,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
             #pagination_impl_method
             #list_impl_method
+            #list_scoped_impl_method
             #cursor_page_impl_method
             #(#derived_impl_methods)*
             #soft_delete_impl_methods
@@ -13997,6 +14382,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
             #upsert_many_impl_method
             #search_impl_methods
+            #search_page_scoped_impl_method
         }
 
         #[allow(clippy::useless_let_if_seq)]
@@ -17177,6 +17563,100 @@ mod tests {
         assert!(
             !list_body.contains("ORDER BY") && !list_body.contains("sql_query"),
             "list() must not interpolate request-derived ORDER BY / raw SQL: {list_body}"
+        );
+        // #1841: without `owner =`, no scoped methods are emitted (zero impact
+        // on ordinary repositories).
+        assert!(
+            !generated.contains("list_scoped") && !generated.contains("search_page_scoped"),
+            "no `owner =` attr must emit no owner-scoped methods: {generated}"
+        );
+    }
+
+    #[test]
+    fn parse_repo_args_with_owner() {
+        // #1841: `owner = <column>` is parsed onto `RepoConfig::owner_column`.
+        let tokens: proc_macro2::TokenStream =
+            r#"Post, api = "/api/posts", owner = author_id"#.parse().unwrap();
+        let config = parse_repo_args(tokens).unwrap();
+        assert_eq!(
+            config.owner_column.as_deref(),
+            Some("author_id"),
+            "owner attribute must be stored on RepoConfig"
+        );
+    }
+
+    #[test]
+    fn repository_owner_scoped_list_filters_owner_in_count_and_page() {
+        // #1841: `owner =` emits `list_scoped(owner_id, ..)` whose owner filter is
+        // applied to BOTH the COUNT and the page query, before the allowlisted
+        // sort/filter helpers, so `total` and the returned rows can never be
+        // widened past the owner's rows.
+        let generated = repository_macro(
+            quote! { Post, api = "/api/posts", owner = author_id },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        assert!(
+            generated.contains("fn list_scoped"),
+            "owner-scoped repository must declare `list_scoped`: {generated}"
+        );
+        let pos = generated
+            .find("async fn list_scoped")
+            .expect("list_scoped impl present");
+        let body = &generated[pos..(pos + 3000).min(generated.len())];
+        // The owner filter must appear twice — once on the count query and once
+        // on the page query (`__count_q` / `__page_q` each gain a `.filter`).
+        let owner_filters = body.matches("posts :: author_id . eq (owner_id)").count();
+        assert!(
+            owner_filters >= 2,
+            "list_scoped must filter by owner on both the count and page query \
+             (found {owner_filters}): {body}"
+        );
+        assert!(
+            body.contains("__count_q = __count_q . filter (posts :: author_id . eq (owner_id))")
+                && body
+                    .contains("__page_q = __page_q . filter (posts :: author_id . eq (owner_id))"),
+            "list_scoped must filter both __count_q and __page_q by owner: {body}"
+        );
+    }
+
+    #[test]
+    fn repository_owner_scoped_search_filters_all_three_phases() {
+        // #1841: `owner =` + `searchable` emits `search_page_scoped(owner_id, ..)`
+        // that filters the COUNT raw SQL, the id-SELECT raw SQL, AND the typed
+        // hydration query by owner — all three, or `total`/rows would disagree
+        // and the endpoint could leak another user's rows.
+        let generated = repository_macro(
+            quote! { Post, api = "/api/posts", owner = author_id, searchable },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        assert!(
+            generated.contains("fn search_page_scoped"),
+            "owner-scoped searchable repository must declare `search_page_scoped`: {generated}"
+        );
+        let pos = generated
+            .find("async fn search_page_scoped")
+            .expect("search_page_scoped impl present");
+        let body = &generated[pos..(pos + 9000).min(generated.len())];
+        // (a) COUNT raw SQL owner clause, (b) id-SELECT raw SQL owner clause —
+        // both go through the `" AND author_id = $3"` literal appended to
+        // count_sql / select_sql.
+        assert!(
+            body.contains("\" AND author_id = $3\""),
+            "search_page_scoped raw SQL (count + select) must filter by owner: {body}"
+        );
+        // owner id is bound positionally, never string-interpolated.
+        assert!(
+            body.contains(". bind :: < :: autumn_web :: reexports :: diesel :: sql_types :: BigInt , _ > (owner_id)"),
+            "search_page_scoped must bind owner_id as a positional BigInt param: {body}"
+        );
+        // (c) typed hydration owner filter.
+        assert!(
+            body.contains(
+                "records_query = records_query . filter (posts :: author_id . eq (owner_id))"
+            ),
+            "search_page_scoped hydration query must filter by owner: {body}"
         );
     }
 
