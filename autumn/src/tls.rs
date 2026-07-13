@@ -410,9 +410,24 @@ pub struct LeafInspection {
 
 impl LeafInspection {
     /// Whole days from `now_unix` until `notAfter`. Negative once expired.
+    ///
+    /// Note: this truncates toward zero, so a certificate that expired less
+    /// than 24h ago still reports `0` days. Callers grading expiry must use
+    /// [`Self::is_expired`] for the pass/fail decision rather than relying on
+    /// this day bucket.
     #[must_use]
     pub const fn days_until_expiry(&self, now_unix: i64) -> i64 {
         (self.not_after_unix - now_unix) / 86_400
+    }
+
+    /// Whether the leaf certificate has already expired at `now_unix`.
+    ///
+    /// Decided from the raw `notAfter` timestamp (not the truncated day
+    /// bucket), so a certificate expired even seconds ago reports `true` —
+    /// matching the runtime, which rejects such a pair at startup.
+    #[must_use]
+    pub const fn is_expired(&self, now_unix: i64) -> bool {
+        self.not_after_unix <= now_unix
     }
 }
 

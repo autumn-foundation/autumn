@@ -400,7 +400,14 @@ pub enum TlsDoctorData {
     /// `dead_code` allow for the feature-less build.
     #[cfg_attr(not(feature = "tls"), allow(dead_code))]
     Healthy {
+        /// Whether the leaf certificate has already expired, decided from the
+        /// raw `notAfter` timestamp rather than the truncated `days_until_expiry`
+        /// bucket. A certificate expired less than 24h ago buckets to `0` days
+        /// but must still grade as a failure, matching the runtime which rejects
+        /// it at startup — so the pass/fail decision keys off this flag.
+        expired: bool,
         /// Whole days until the leaf certificate's `notAfter` (negative if past).
+        /// Used only for the human-readable message, never the grade.
         days_until_expiry: i64,
     },
     /// Configured, but the cert/key could not be loaded or validated (missing
@@ -454,7 +461,10 @@ pub fn check_tls_impl(data: &TlsDoctorData) -> CheckResult {
                  and the key matches the certificate",
             ),
         },
-        TlsDoctorData::Healthy { days_until_expiry } if *days_until_expiry < 0 => CheckResult {
+        TlsDoctorData::Healthy {
+            expired: true,
+            days_until_expiry,
+        } => CheckResult {
             name: "tls",
             status: CheckStatus::Fail,
             detail: Some(format!(
@@ -463,7 +473,10 @@ pub fn check_tls_impl(data: &TlsDoctorData) -> CheckResult {
             )),
             hint: Some("Renew the certificate; an expired certificate fails every TLS handshake"),
         },
-        TlsDoctorData::Healthy { days_until_expiry } if *days_until_expiry <= 30 => CheckResult {
+        TlsDoctorData::Healthy {
+            expired: false,
+            days_until_expiry,
+        } if *days_until_expiry <= 30 => CheckResult {
             name: "tls",
             status: CheckStatus::Warn,
             detail: Some(format!(
@@ -471,7 +484,9 @@ pub fn check_tls_impl(data: &TlsDoctorData) -> CheckResult {
             )),
             hint: Some("Renew the certificate soon to avoid downtime"),
         },
-        TlsDoctorData::Healthy { days_until_expiry } => CheckResult {
+        TlsDoctorData::Healthy {
+            days_until_expiry, ..
+        } => CheckResult {
             name: "tls",
             status: CheckStatus::Pass,
             detail: Some(format!(
@@ -3719,6 +3734,47 @@ fn resolve_trusted_hosts() -> Vec<String> {
     parse_hosts(&table)
 }
 
+/// Whether ANY `AUTUMN_SERVER__TLS__*` env var is set in the process.
+///
+/// The runtime materializes an (otherwise-empty) `[server.tls]` table when a
+/// tuning-only var such as `AUTUMN_SERVER__TLS__RELOAD_INTERVAL_SECS` or
+/// `AUTUMN_SERVER__TLS__HANDSHAKE_TIMEOUT_SECS` is present, then fails fast on
+/// the missing cert/key. Scanning the whole prefix (not just `CERT_PATH`/`KEY_PATH`)
+/// lets doctor treat those deployments as configured and surface the same
+/// actionable failure instead of a false Pass.
+fn any_tls_env_var_set() -> bool {
+    std::env::vars_os().any(|(name, _)| name.to_string_lossy().starts_with("AUTUMN_SERVER__TLS__"))
+}
+
+/// Pure core of [`resolve_tls_paths`]: decide the resolved cert/key paths from
+/// already-extracted sources, so it can be graded in tests without mutating the
+/// process environment. `env_*` win over `toml_*` (matching the runtime).
+///
+/// TLS is "configured" — and therefore worth grading — when the `[server.tls]`
+/// section is present OR any `AUTUMN_SERVER__TLS__*` var is set. A configured
+/// deployment missing a cert/key yields `Some((empty, empty))` so the caller
+/// reports an actionable "must set both" failure rather than silently skipping.
+fn resolve_tls_paths_from_sources(
+    tls_section_present: bool,
+    toml_cert: Option<String>,
+    toml_key: Option<String>,
+    env_cert: Option<String>,
+    env_key: Option<String>,
+    any_tls_env: bool,
+) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+    let cert = env_cert.or(toml_cert);
+    let key = env_key.or(toml_key);
+
+    if !(tls_section_present || any_tls_env) {
+        return None;
+    }
+
+    Some((
+        std::path::PathBuf::from(cert.unwrap_or_default()),
+        std::path::PathBuf::from(key.unwrap_or_default()),
+    ))
+}
+
 /// Resolve the configured `[server.tls]` cert/key paths, honoring env-var
 /// overrides and the active profile's merged config, exactly as the runtime
 /// loads them. Returns `None` when TLS is not configured at all.
@@ -3747,23 +3803,14 @@ fn resolve_tls_paths() -> Option<(std::path::PathBuf, std::path::PathBuf)> {
         .and_then(toml::Value::as_str)
         .map(str::to_owned);
 
-    let cert = env_cert.or(toml_cert);
-    let key = env_key.or(toml_key);
-
-    // TLS is "configured" if the section is present OR any TLS env var is set.
-    let configured = tls.is_some()
-        || std::env::var_os("AUTUMN_SERVER__TLS__CERT_PATH").is_some()
-        || std::env::var_os("AUTUMN_SERVER__TLS__KEY_PATH").is_some();
-    if !configured {
-        return None;
-    }
-
-    // Present but incomplete: signal with empty paths so the caller reports an
-    // actionable "must set both" failure rather than silently skipping.
-    Some((
-        std::path::PathBuf::from(cert.unwrap_or_default()),
-        std::path::PathBuf::from(key.unwrap_or_default()),
-    ))
+    resolve_tls_paths_from_sources(
+        tls.is_some(),
+        toml_cert,
+        toml_key,
+        env_cert,
+        env_key,
+        any_tls_env_var_set(),
+    )
 }
 
 /// Resolve `[server.tls]` into the graded [`TlsDoctorData`] for [`check_tls_impl`].
@@ -3795,6 +3842,7 @@ fn resolve_tls_doctor_data() -> TlsDoctorData {
                 )
                 .unwrap_or(i64::MAX);
                 TlsDoctorData::Healthy {
+                    expired: inspection.is_expired(now),
                     days_until_expiry: inspection.days_until_expiry(now),
                 }
             }
@@ -6707,6 +6755,7 @@ pub struct Vault {
     #[test]
     fn tls_fail_when_expired() {
         let r = check_tls_impl(&TlsDoctorData::Healthy {
+            expired: true,
             days_until_expiry: -3,
         });
         assert!(matches!(r.status, CheckStatus::Fail));
@@ -6717,6 +6766,7 @@ pub struct Vault {
     #[test]
     fn tls_warn_when_near_expiry() {
         let r = check_tls_impl(&TlsDoctorData::Healthy {
+            expired: false,
             days_until_expiry: 10,
         });
         assert!(matches!(r.status, CheckStatus::Warn));
@@ -6727,6 +6777,7 @@ pub struct Vault {
     fn tls_warn_at_exactly_thirty_days() {
         // The 30-day boundary is inclusive of the warning window.
         let r = check_tls_impl(&TlsDoctorData::Healthy {
+            expired: false,
             days_until_expiry: 30,
         });
         assert!(matches!(r.status, CheckStatus::Warn));
@@ -6735,10 +6786,68 @@ pub struct Vault {
     #[test]
     fn tls_pass_when_healthy() {
         let r = check_tls_impl(&TlsDoctorData::Healthy {
+            expired: false,
             days_until_expiry: 365,
         });
         assert!(matches!(r.status, CheckStatus::Pass));
         assert!(r.hint.is_none());
+    }
+
+    // A certificate that expired less than 24h ago truncates to `0` days but
+    // must grade as a FAIL, not a near-expiry WARN — the runtime rejects it at
+    // startup (issue #1603, Codex review). We grade off the injected notAfter
+    // via `LeafInspection::is_expired`, so no time-dependent fixture is needed.
+    #[cfg(feature = "tls")]
+    #[test]
+    fn tls_grades_from_raw_timestamp_not_day_bucket() {
+        use autumn_web::tls::LeafInspection;
+
+        let now: i64 = 1_700_000_000;
+
+        // Expired 1h ago: buckets to 0 days, but is_expired → Fail.
+        let just_expired = LeafInspection {
+            not_after_unix: now - 3_600,
+        };
+        assert!(just_expired.is_expired(now));
+        let r = check_tls_impl(&TlsDoctorData::Healthy {
+            expired: just_expired.is_expired(now),
+            days_until_expiry: just_expired.days_until_expiry(now),
+        });
+        assert!(
+            matches!(r.status, CheckStatus::Fail),
+            "cert expired <24h ago must Fail, got {:?}",
+            r.status
+        );
+
+        // Expires in 1h (not yet expired): near-expiry Warn.
+        let expiring_soon = LeafInspection {
+            not_after_unix: now + 3_600,
+        };
+        assert!(!expiring_soon.is_expired(now));
+        let r = check_tls_impl(&TlsDoctorData::Healthy {
+            expired: expiring_soon.is_expired(now),
+            days_until_expiry: expiring_soon.days_until_expiry(now),
+        });
+        assert!(
+            matches!(r.status, CheckStatus::Warn),
+            "cert expiring in <24h (not expired) must Warn, got {:?}",
+            r.status
+        );
+
+        // Expires in 40 days: healthy Pass.
+        let healthy = LeafInspection {
+            not_after_unix: now + 40 * 86_400,
+        };
+        assert!(!healthy.is_expired(now));
+        let r = check_tls_impl(&TlsDoctorData::Healthy {
+            expired: healthy.is_expired(now),
+            days_until_expiry: healthy.days_until_expiry(now),
+        });
+        assert!(
+            matches!(r.status, CheckStatus::Pass),
+            "cert with 40 days left must Pass, got {:?}",
+            r.status
+        );
     }
 
     #[test]
@@ -6749,6 +6858,67 @@ pub struct Vault {
         assert!(matches!(r.status, CheckStatus::Fail));
         assert_eq!(r.detail.as_deref(), Some("cert file not found"));
         assert!(r.hint.is_some());
+    }
+
+    // Regression (#1603, Codex): a tuning-only TLS env deployment — e.g. only
+    // `AUTUMN_SERVER__TLS__RELOAD_INTERVAL_SECS` set, no cert/key — makes the
+    // runtime materialize `[server.tls]` and fail fast. Doctor must treat it as
+    // configured (Some with empty paths) so it emits the actionable "must set
+    // both" Fail, not a false Pass/NotConfigured. Tested via the pure sources
+    // helper to avoid mutating the process-global environment.
+    #[test]
+    fn tls_tuning_only_env_resolves_as_incomplete_config() {
+        let resolved = resolve_tls_paths_from_sources(
+            false, // no [server.tls] section
+            None,  // toml_cert
+            None,  // toml_key
+            None,  // env_cert (CERT_PATH unset)
+            None,  // env_key (KEY_PATH unset)
+            true,  // any_tls_env: a tuning-only var such as RELOAD_INTERVAL_SECS is set
+        );
+        let (cert, key) = resolved.expect("tuning-only TLS env must resolve as configured");
+        assert!(
+            cert.as_os_str().is_empty() && key.as_os_str().is_empty(),
+            "cert/key must be empty so the caller reports 'must set both'"
+        );
+
+        // Empty paths are exactly what `resolve_tls_doctor_data` maps to the
+        // incomplete-config Invalid, which grades as a Fail.
+        assert!(
+            cert.as_os_str().is_empty() || key.as_os_str().is_empty(),
+            "mirrors resolve_tls_doctor_data's incomplete-config guard"
+        );
+        let data = TlsDoctorData::Invalid {
+            detail: "[server.tls] must set both cert_path and key_path".to_owned(),
+        };
+        let r = check_tls_impl(&data);
+        assert!(matches!(r.status, CheckStatus::Fail));
+        assert!(r.detail.as_deref().unwrap().contains("must set both"));
+    }
+
+    // Complementary: with no section and NO TLS env var, TLS is unconfigured.
+    #[test]
+    fn tls_paths_none_when_unconfigured() {
+        assert!(
+            resolve_tls_paths_from_sources(false, None, None, None, None, false).is_none(),
+            "no section and no TLS env means not configured"
+        );
+    }
+
+    // Env cert/key win over toml, and a fully-specified pair resolves as-is.
+    #[test]
+    fn tls_paths_env_overrides_toml() {
+        let resolved = resolve_tls_paths_from_sources(
+            true,
+            Some("/toml/c.pem".to_owned()),
+            Some("/toml/k.pem".to_owned()),
+            Some("/env/c.pem".to_owned()),
+            Some("/env/k.pem".to_owned()),
+            true,
+        )
+        .expect("configured");
+        assert_eq!(resolved.0, std::path::PathBuf::from("/env/c.pem"));
+        assert_eq!(resolved.1, std::path::PathBuf::from("/env/k.pem"));
     }
 
     #[test]
