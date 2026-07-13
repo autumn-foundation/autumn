@@ -1,0 +1,51 @@
+FROM rust:{{rust_version}}-bookworm AS builder
+
+WORKDIR /app
+
+COPY Cargo.toml autumn.toml build.rs ./
+COPY src ./src
+COPY migrations ./migrations
+
+# Git/build provenance passthrough. The build context excludes `/.git` (see
+# .dockerignore), so the generated build.rs cannot shell out to git here.
+# Supply provenance explicitly and surface it as ENV, which build.rs prefers
+# over git and bakes into the binary for `/actuator/info`. Populate from CI, e.g:
+#   docker build \
+#     --build-arg AUTUMN_BUILD_GIT_SHA=$(git rev-parse HEAD) \
+#     --build-arg AUTUMN_BUILD_GIT_SHA_SHORT=$(git rev-parse --short HEAD) \
+#     --build-arg AUTUMN_BUILD_GIT_BRANCH=$(git rev-parse --abbrev-ref HEAD) \
+#     --build-arg AUTUMN_BUILD_GIT_DIRTY=false \
+#     --build-arg AUTUMN_BUILD_TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ) .
+# Unset args stay empty and are ignored, so `/actuator/info` reports `null`.
+ARG AUTUMN_BUILD_GIT_SHA=
+ARG AUTUMN_BUILD_GIT_SHA_SHORT=
+ARG AUTUMN_BUILD_GIT_BRANCH=
+ARG AUTUMN_BUILD_GIT_DIRTY=
+ARG AUTUMN_BUILD_TIMESTAMP=
+ENV AUTUMN_BUILD_GIT_SHA=${AUTUMN_BUILD_GIT_SHA} \
+    AUTUMN_BUILD_GIT_SHA_SHORT=${AUTUMN_BUILD_GIT_SHA_SHORT} \
+    AUTUMN_BUILD_GIT_BRANCH=${AUTUMN_BUILD_GIT_BRANCH} \
+    AUTUMN_BUILD_GIT_DIRTY=${AUTUMN_BUILD_GIT_DIRTY} \
+    AUTUMN_BUILD_TIMESTAMP=${AUTUMN_BUILD_TIMESTAMP}
+
+RUN cargo build --release
+
+FROM debian:bookworm-slim AS runtime
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --system --create-home --uid 10001 autumn
+
+WORKDIR /app
+
+COPY --from=builder /app/target/release/{{project_name}} /usr/local/bin/{{project_name}}
+COPY --from=builder /app/autumn.toml /app/autumn.toml
+COPY --from=builder /app/migrations /app/migrations
+
+ENV AUTUMN_PROFILE=prod
+EXPOSE 3000
+
+USER autumn
+
+CMD ["{{project_name}}"]

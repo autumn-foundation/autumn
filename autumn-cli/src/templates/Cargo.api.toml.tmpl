@@ -1,0 +1,27 @@
+[package]
+name = "{{project_name}}"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# JSON-first API project (`autumn new --api`): the HTML/CSS view stack is
+# disabled via `default-features = false`, leaving a lean JSON feature set.
+# Enable more optional subsystems by extending the features list below, e.g.
+# "mail" or "redis".
+autumn-web = "{{autumn_version}}"
+diesel_migrations = "2"
+
+[features]
+# Flash messages carry one-shot notices across redirects; kept on for parity
+# with the fullstack scaffold (harmless for pure-JSON apps).
+default = ["flash"]
+flash = ["autumn-web/flash"]
+# Enable single-binary asset embedding (autumn build --embed). Only meaningful
+# once you add embeddable assets (e.g. i18n locale bundles via --with-i18n).
+embed-assets = ["autumn-web/embed-assets"]
+
+[dev-dependencies]
+# tokio runtime macros are needed for #[tokio::test] in integration tests.
+tokio = { version = "1", features = ["rt", "macros"] }
+
+[workspace]

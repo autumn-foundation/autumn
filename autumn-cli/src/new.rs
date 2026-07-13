@@ -10,12 +10,21 @@ use autumn_web::credentials::{MasterKey, encrypt};
 
 mod templates {
     pub const CARGO_TOML: &str = include_str!("templates/Cargo.toml.tmpl");
+    /// JSON-first API flavor (`autumn new --api`): drops the HTML/CSS view
+    /// stack (`maud`) and disables `autumn-web`'s default view features.
+    pub const CARGO_API_TOML: &str = include_str!("templates/Cargo.api.toml.tmpl");
     pub const README: &str = include_str!("templates/README.md.tmpl");
     pub const MAIN_RS: &str = include_str!("templates/main.rs.tmpl");
+    /// JSON-first API flavor: `Json<...>` handlers, no `maud`/layout/HTML.
+    pub const MAIN_API_RS: &str = include_str!("templates/main.api.rs.tmpl");
     pub const AUTUMN_TOML: &str = include_str!("templates/autumn.toml.tmpl");
     pub const DOCKERFILE: &str = include_str!("templates/Dockerfile.tmpl");
+    /// JSON-first API flavor: no Tailwind download / CSS build / static copy.
+    pub const DOCKERFILE_API: &str = include_str!("templates/Dockerfile.api.tmpl");
     pub const DOCKERIGNORE: &str = include_str!("templates/.dockerignore.tmpl");
     pub const BUILD_RS: &str = include_str!("templates/build.rs.tmpl");
+    /// JSON-first API flavor: build provenance only, no Tailwind CSS step.
+    pub const BUILD_API_RS: &str = include_str!("templates/build.api.rs.tmpl");
     pub const INPUT_CSS: &str = include_str!("templates/input.css.tmpl");
     pub const TAILWIND_CONFIG: &str = include_str!("templates/tailwind.config.js.tmpl");
     pub const GITIGNORE: &str = include_str!("templates/gitignore.tmpl");
@@ -115,6 +124,13 @@ pub struct GenerateOptions {
     /// Implies [`Self::with_daemon`]-style serve usage. Mutually exclusive with a
     /// DB-free daemon.
     pub with_bundled_pg: bool,
+    /// JSON-first API flavor (`autumn new --api`): emit a lean skeleton with no
+    /// HTML/CSS/Tailwind artifacts. Handlers return `Json<...>`; the `maud`
+    /// dependency and `autumn-web`'s view features (maud/htmx/tailwind) are
+    /// dropped, and the Tailwind/CSS build step, `input.css`, `tailwind.config.js`,
+    /// and vendored JS/static assets are not scaffolded. Keeps `db`/migrations so
+    /// database features still work. Mutually exclusive with the daemon flavors.
+    pub with_api: bool,
 }
 
 /// Generate a new Autumn project under `parent_dir/name` with default options.
@@ -124,6 +140,20 @@ pub fn generate(name: &str, parent_dir: &Path) -> Result<(), NewError> {
 
 /// Reject unsupported flag combinations before any files are written.
 fn check_option_combination(opts: GenerateOptions) -> Result<(), NewError> {
+    // The API flavor and the daemon flavors are different app shapes with
+    // conflicting `autumn-web` feature sets: `--api` drops the view stack
+    // (maud/htmx/tailwind) for a pure-JSON app, while `--daemon`/`--bundled-pg`
+    // keep it. Composing them would produce contradictory Cargo features, so
+    // reject the combination rather than scaffolding an incoherent project.
+    // (`--api` still composes with `--with-i18n` and `--with-seed`.)
+    if opts.with_api && (opts.with_daemon || opts.with_bundled_pg) {
+        return Err(NewError::IncompatibleOptions(
+            "--api scaffolds a JSON-first app without the HTML/CSS view stack, so \
+             it cannot be combined with --daemon or --bundled-pg (which scaffold \
+             daemon apps that keep the view stack)"
+                .to_owned(),
+        ));
+    }
     // The DB-free daemon starter builds with no database, so a seed binary
     // (which needs `autumn_web::seed::SeedContext` and the `db` feature) cannot
     // compile. Reject the combination rather than scaffolding a broken project.
@@ -190,8 +220,12 @@ fn generate_inner(
     let rust_version = option_env!("CARGO_PKG_RUST_VERSION").unwrap_or("1.88.0");
 
     fs::create_dir_all(project_dir.join("src"))?;
-    fs::create_dir_all(project_dir.join("static/css"))?;
-    fs::create_dir_all(project_dir.join("static/js"))?;
+    // The JSON-first API flavor ships no CSS/JS assets, so it has no `static/`
+    // tree; the fullstack scaffold seeds `static/css` + `static/js`.
+    if !opts.with_api {
+        fs::create_dir_all(project_dir.join("static/css"))?;
+        fs::create_dir_all(project_dir.join("static/js"))?;
+    }
     fs::create_dir_all(project_dir.join("migrations"))?;
     fs::create_dir_all(project_dir.join("tests"))?;
     fs::create_dir_all(project_dir.join("config/credentials"))?;
@@ -208,10 +242,15 @@ fn generate_inner(
     };
     let render = |template: &str| -> String { render_template(template, &vars) };
 
+    let cargo_template = if opts.with_api {
+        templates::CARGO_API_TOML
+    } else {
+        templates::CARGO_TOML
+    };
     let cargo_toml = render_cargo_toml(
         opts,
         autumn_version,
-        render(templates::CARGO_TOML),
+        render(cargo_template),
         &render(templates::SEED_CARGO_TOML),
     );
     fs::write(project_dir.join("Cargo.toml"), cargo_toml)?;
@@ -221,10 +260,15 @@ fn generate_inner(
         render_readme(render(templates::README), opts, &vars),
     )?;
 
-    let mut main_rs = if opts.with_i18n {
-        inject_i18n(&render(templates::MAIN_RS))
+    let main_template = if opts.with_api {
+        templates::MAIN_API_RS
     } else {
-        render(templates::MAIN_RS)
+        templates::MAIN_RS
+    };
+    let mut main_rs = match (opts.with_api, opts.with_i18n) {
+        (true, true) => inject_i18n_api(&render(main_template)),
+        (false, true) => inject_i18n(&render(main_template)),
+        (_, false) => render(main_template),
     };
     if opts.with_bundled_pg {
         // Managed-Postgres daemon: keep migrations, install the pool provider.
@@ -264,23 +308,34 @@ fn generate_inner(
         );
     }
     fs::write(project_dir.join("autumn.toml"), autumn_toml)?;
-    fs::write(
-        project_dir.join("Dockerfile"),
-        render(templates::DOCKERFILE),
-    )?;
+    let dockerfile_template = if opts.with_api {
+        templates::DOCKERFILE_API
+    } else {
+        templates::DOCKERFILE
+    };
+    fs::write(project_dir.join("Dockerfile"), render(dockerfile_template))?;
     fs::write(
         project_dir.join(".dockerignore"),
         render(templates::DOCKERIGNORE),
     )?;
-    fs::write(project_dir.join("build.rs"), render(templates::BUILD_RS))?;
-    fs::write(
-        project_dir.join("static/css/input.css"),
-        render(templates::INPUT_CSS),
-    )?;
-    fs::write(
-        project_dir.join("tailwind.config.js"),
-        render(templates::TAILWIND_CONFIG),
-    )?;
+    let build_rs_template = if opts.with_api {
+        templates::BUILD_API_RS
+    } else {
+        templates::BUILD_RS
+    };
+    fs::write(project_dir.join("build.rs"), render(build_rs_template))?;
+    // The API flavor has no Tailwind/CSS pipeline, so skip the CSS input and
+    // Tailwind config entirely (there is no `static/css` directory either).
+    if !opts.with_api {
+        fs::write(
+            project_dir.join("static/css/input.css"),
+            render(templates::INPUT_CSS),
+        )?;
+        fs::write(
+            project_dir.join("tailwind.config.js"),
+            render(templates::TAILWIND_CONFIG),
+        )?;
+    }
     fs::write(project_dir.join(".gitignore"), render(templates::GITIGNORE))?;
     fs::write(
         project_dir.join(".env.example"),
@@ -288,7 +343,11 @@ fn generate_inner(
     )?;
     fs::write(project_dir.join("migrations/.gitkeep"), "")?;
 
-    scaffold_vendor_assets(&project_dir)?;
+    // The API flavor serves no HTML, so it needs no vendored htmx/SSE JS or the
+    // static asset manifest — skip the whole `static/` vendoring step.
+    if !opts.with_api {
+        scaffold_vendor_assets(&project_dir)?;
+    }
     scaffold_credentials(&project_dir, name)?;
     fs::write(
         project_dir.join("tests/integration_test.rs"),
@@ -299,7 +358,12 @@ fn generate_inner(
     // `)?;` line that passing tests never hit, which llvm-cov reports as an
     // uncovered line (as it does for the multi-line writes above).
     let ci_workflow = project_dir.join(".github/workflows/ci.yml");
-    fs::write(ci_workflow, render(templates::CI_WORKFLOW))?;
+    let ci_yml = if opts.with_api {
+        strip_ci_tailwind_note(&render(templates::CI_WORKFLOW))
+    } else {
+        render(templates::CI_WORKFLOW)
+    };
+    fs::write(ci_workflow, ci_yml)?;
     let rust_toolchain = project_dir.join("rust-toolchain.toml");
     fs::write(rust_toolchain, render(templates::RUST_TOOLCHAIN))?;
     fs::write(project_dir.join("rustfmt.toml"), render(templates::RUSTFMT))?;
@@ -409,8 +473,11 @@ fn print_scaffold_summary(name: &str, opts: GenerateOptions) {
     if opts.with_seed {
         println!("  Created {name}/src/bin/seed.rs");
     }
-    println!("  Created {name}/static/css/input.css");
-    println!("  Created {name}/tailwind.config.js");
+    // The JSON-first API flavor ships no CSS/Tailwind pipeline.
+    if !opts.with_api {
+        println!("  Created {name}/static/css/input.css");
+        println!("  Created {name}/tailwind.config.js");
+    }
     println!("  Created {name}/.gitignore");
     println!("  Created {name}/.env.example");
     println!("  Created {name}/rust-toolchain.toml");
@@ -481,6 +548,44 @@ fn inject_i18n(main_rs: &str) -> String {
     )
 }
 
+/// i18n variant of [`inject_i18n`] for the JSON-first API scaffold's `main.rs`,
+/// which has no HTML/static asset layer. Enables locale auto-detection with
+/// `.i18n_auto()` and embeds the `i18n/` locale bundles into the binary (behind
+/// the `embed-assets` feature) for single-binary deploys.
+fn inject_i18n_api(main_rs: &str) -> String {
+    let with_locale_call = replace_anchor(
+        main_rs,
+        "        .routes(routes![index, hello_name])",
+        "        .i18n_auto()\n        .routes(routes![index, hello_name])",
+    );
+    let with_locales_static = replace_anchor(
+        &with_locale_call,
+        "const MIGRATIONS: EmbeddedMigrations = embed_migrations!();\n",
+        "const MIGRATIONS: EmbeddedMigrations = embed_migrations!();\n\n\
+         #[cfg(feature = \"embed-assets\")]\n\
+         static EMBEDDED_LOCALES: autumn_web::include_dir::Dir = autumn_web::embed_locales!();\n",
+    );
+    replace_anchor(
+        &with_locales_static,
+        "        .migrations(MIGRATIONS);\n\n    app\n",
+        "        .migrations(MIGRATIONS);\n\n\
+         \x20   #[cfg(feature = \"embed-assets\")]\n\
+         \x20   let app = app.embedded_locales(&EMBEDDED_LOCALES);\n\n    app\n",
+    )
+}
+
+/// Anchor: the Tailwind CI extension note in `ci.yml.tmpl`. The JSON-first API
+/// scaffold has no Tailwind/CSS step, so this note is stripped for `--api` (it
+/// is also the only `tailwind` mention in the generated tree).
+const CI_TAILWIND_NOTE: &str = "#   - Tailwind: add `autumn setup --tailwind` and run the downloaded binary\n\
+     #     before `cargo build` to compile CSS in CI.\n";
+
+/// Remove the Tailwind CI extension note from a rendered `ci.yml` for the API
+/// scaffold (which ships no CSS pipeline).
+fn strip_ci_tailwind_note(ci_yml: &str) -> String {
+    replace_anchor(ci_yml, CI_TAILWIND_NOTE, "")
+}
+
 /// Inject a managed-Postgres pool provider plus a shutdown hook into a
 /// generated `main.rs` so the bundled cluster is supervised by the daemon.
 fn inject_managed_pg(main_rs: &str) -> String {
@@ -526,6 +631,11 @@ const DAEMON_NO_DB_FEATURES: &[&str] = &[
     "reporting",
 ];
 
+/// Default `autumn-web` features minus the HTML view stack (`maud`/`htmx`/
+/// `tailwind`) — the JSON-first API (`--api`) feature set. Keeps `db` so
+/// migrations and database features still work.
+const API_FEATURES: &[&str] = &["db", "cache-moka", "http-client", "reporting", "flash"];
+
 /// Anchor: first line of the DB-specific prerequisites/steps block in
 /// `README.md.tmpl` (the `- **A reachable Postgres**` bullet). Everything from
 /// here up to [`README_TAIL_ANCHOR`] is the default DB-first golden path and is
@@ -548,6 +658,14 @@ const README_SCAFFOLD_ROW: &str = "| `autumn generate scaffold <Name> field:Type
 /// the DB-free daemon README (that scaffold has no migrations directory).
 const README_MIGRATIONS_LAYOUT_ROW: &str =
     "| `migrations/` | Diesel migrations — one directory per migration. |\n";
+/// Anchor: the Tailwind binary prerequisite bullet in `README.md.tmpl`. The
+/// JSON-first API scaffold has no CSS pipeline, so this bullet is removed for
+/// `--api` (it is the only `tailwind` mention in the generated README).
+const README_TAILWIND_PREREQ: &str =
+    "- **The Tailwind binary** (downloaded by `autumn setup`):\n  ```sh\n  autumn setup\n  ```\n";
+/// Anchor: the `static/` project-layout row in `README.md.tmpl`. The API
+/// scaffold ships no `static/` directory, so the row is removed for `--api`.
+const README_STATIC_LAYOUT_ROW: &str = "| `static/` | Static assets served under `/static/`. |\n";
 
 /// Render the project README, tailoring the golden path to the app shape and
 /// appending flag-specific sections.
@@ -570,6 +688,15 @@ const README_MIGRATIONS_LAYOUT_ROW: &str =
 /// `no_unsubstituted_placeholders` walks the generated tree and would flag it
 /// (crate/project names are interpolated from `vars`, not left as tokens).
 fn render_readme(rendered: String, opts: GenerateOptions, vars: &TemplateVars<'_>) -> String {
+    // The JSON-first API scaffold shares the DB-first golden path (it keeps
+    // `db`/migrations) but has no Tailwind/CSS pipeline and no `static/` tree,
+    // so strip the Tailwind prerequisite and the `static/` layout row.
+    if opts.with_api {
+        let mut readme = rendered.replace(README_TAILWIND_PREREQ, "");
+        readme = readme.replace(README_STATIC_LAYOUT_ROW, "");
+        append_optional_readme_sections(&mut readme, opts);
+        return readme;
+    }
     // `--bundled-pg` implies `with_daemon`, so test it first.
     let mut readme = if opts.with_bundled_pg {
         // Bundled Postgres keeps the `db` feature, so `generate scaffold` and the
@@ -581,6 +708,14 @@ fn render_readme(rendered: String, opts: GenerateOptions, vars: &TemplateVars<'_
     } else {
         rendered
     };
+    append_optional_readme_sections(&mut readme, opts);
+    readme
+}
+
+/// Append the `--with-i18n` and `--with-seed` README sections when those flags
+/// are set. Shared by every app shape (fullstack, daemon, and `--api`) so the
+/// flag-specific guidance is identical regardless of the golden-path body.
+fn append_optional_readme_sections(readme: &mut String, opts: GenerateOptions) {
     if opts.with_i18n {
         readme.push_str(
             "\n## Internationalization (i18n)\n\
@@ -607,7 +742,6 @@ fn render_readme(rendered: String, opts: GenerateOptions, vars: &TemplateVars<'_
              ```\n",
         );
     }
-    readme
 }
 
 /// Replace the default DB-first golden-path block (from
@@ -731,6 +865,35 @@ fn render_cargo_toml(
     seed_bin_toml: &str,
 ) -> String {
     use std::fmt::Write;
+
+    // JSON-first API starter: drop the HTML view stack (maud/htmx/tailwind) by
+    // switching off default features and pinning the lean API feature set. The
+    // API `Cargo.toml` template ships a plain `autumn-web = "…"` dep (no `maud`
+    // line), so rewrite it to the explicit `default-features = false` table.
+    if opts.with_api {
+        let plain_dep = format!(r#"autumn-web = "{autumn_version}""#);
+        let mut features: Vec<&str> = API_FEATURES.to_vec();
+        if opts.with_i18n {
+            features.push("i18n");
+        }
+        if opts.with_seed {
+            features.push("seed");
+        }
+        let features_str = features
+            .iter()
+            .map(|f| format!(r#""{f}""#))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let dep = format!(
+            r#"autumn-web = {{ version = "{autumn_version}", default-features = false, features = [{features_str}] }}"#
+        );
+        cargo_toml = cargo_toml.replace(&plain_dep, &dep);
+        if opts.with_seed {
+            cargo_toml.push('\n');
+            cargo_toml.push_str(seed_bin_toml);
+        }
+        return cargo_toml;
+    }
 
     // DB-free daemon starter: switch off default features (drops `db`) so the
     // binary links no Postgres, and remove the diesel migrations dependency.

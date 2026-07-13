@@ -146,6 +146,12 @@ enum Commands {
         /// wires a managed local Postgres provider (implies a daemon app).
         #[arg(long = "bundled-pg")]
         bundled_pg: bool,
+        /// JSON-first API starter: a lean skeleton with no HTML/CSS/Tailwind
+        /// artifacts. Handlers return JSON; the view stack (maud/htmx/tailwind)
+        /// is dropped. Keeps the database/migrations. Composes with --with-i18n
+        /// and --with-seed; not combinable with --daemon or --bundled-pg.
+        #[arg(long)]
+        api: bool,
     },
     /// Pre-render static routes to dist/
     Build {
@@ -2629,6 +2635,7 @@ fn run_command(command: Commands) {
             with_seed,
             daemon,
             bundled_pg,
+            api,
         } => {
             if list_starters {
                 starters::print_list();
@@ -2644,11 +2651,11 @@ fn run_command(command: Commands) {
             if let Some(starter) = starter {
                 // A starter brings a complete composition; the base-project
                 // scaffolding toggles do not apply.
-                if with_i18n || with_seed || daemon || bundled_pg {
+                if with_i18n || with_seed || daemon || bundled_pg || api {
                     eprintln!(
                         "Error: --starter cannot be combined with --with-i18n, \
-                         --with-seed, --daemon, or --bundled-pg (a starter brings \
-                         its own composition)"
+                         --with-seed, --daemon, --bundled-pg, or --api (a starter \
+                         brings its own composition)"
                     );
                     std::process::exit(1);
                 }
@@ -2668,6 +2675,7 @@ fn run_command(command: Commands) {
                         // --bundled-pg is a daemon flavor that keeps the database.
                         with_daemon: daemon || bundled_pg,
                         with_bundled_pg: bundled_pg,
+                        with_api: api,
                     },
                 );
             }
