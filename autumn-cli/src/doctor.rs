@@ -4036,6 +4036,45 @@ fn resolve_tls_paths() -> Option<(std::path::PathBuf, std::path::PathBuf)> {
     ))
 }
 
+/// Whether the static `cert_path` / `key_path` KEYS are PRESENT — set in the
+/// merged runtime `[server.tls]` TOML or as an env override — regardless of
+/// whether the value is empty.
+///
+/// This mirrors [`autumn_web::config::TlsConfig::validate`], which keys the
+/// static-vs-ACME XOR on `cert_path.is_some()` / `key_path.is_some()`: an
+/// explicitly-present-but-empty path is `Some("")` at runtime, hence PRESENT.
+/// Doctor must gate the XOR on presence, not non-emptiness, or a
+/// `[server.tls.acme]` config paired with `cert_path = ""` (or an empty env
+/// override) collapses to "absent" and wrongly passes as ACME-only, when the
+/// runtime rejects it as a mixed static+ACME config.
+fn resolve_static_tls_presence() -> (bool, bool) {
+    let (canonical, selected, _) = resolve_active_profiles();
+    let merged = get_merged_toml_table_runtime(&canonical, &selected);
+    let tls = merged
+        .get("server")
+        .and_then(toml::Value::as_table)
+        .and_then(|s| s.get("tls"))
+        .and_then(toml::Value::as_table);
+    // Mirror the runtime env-override application (`env.var(..).ok()`), which
+    // treats an empty-but-set var as present (`Some("")`).
+    let cert_env = std::env::var("AUTUMN_SERVER__TLS__CERT_PATH").is_ok();
+    let key_env = std::env::var("AUTUMN_SERVER__TLS__KEY_PATH").is_ok();
+    static_tls_presence_from(tls, cert_env, key_env)
+}
+
+/// Pure core of [`resolve_static_tls_presence`] (injectable for tests): the
+/// `cert_path` / `key_path` keys are present when set in the `[server.tls]` TOML
+/// table OR supplied as an env override, independent of an empty value.
+fn static_tls_presence_from(
+    tls: Option<&toml::Table>,
+    cert_env_present: bool,
+    key_env_present: bool,
+) -> (bool, bool) {
+    let cert_present = tls.is_some_and(|t| t.contains_key("cert_path")) || cert_env_present;
+    let key_present = tls.is_some_and(|t| t.contains_key("key_path")) || key_env_present;
+    (cert_present, key_present)
+}
+
 /// Resolve `[server.tls]` into the graded [`TlsDoctorData`] for [`check_tls_impl`].
 ///
 /// Offline only: reads `autumn.toml` and the referenced cert/key files, never
@@ -4155,31 +4194,56 @@ pub struct AcmeDoctorConfig {
     pub cache_dir: std::path::PathBuf,
     /// The per-directory subdirectory label the runtime store namespaces
     /// certificates under (`{cache_dir}/{directory_label}/`). Derived from the
-    /// configured `acme.directory`, matching `FsAcmeStore`.
+    /// configured `acme.directory`, matching `FsAcmeStore`. Falls back to the
+    /// `staging` label when `directory` fails to deserialize (see
+    /// [`directory_error`](Self::directory_error)); that path FAILs, so the label
+    /// is unused.
     pub directory_label: String,
+    /// The rendered invalid `acme.directory` value when it fails to deserialize
+    /// as [`autumn_web::config::AcmeDirectory`] the way the runtime does (a typo
+    /// like `directory = "prod"` or a malformed custom table). The runtime fails
+    /// to boot on such a value, so doctor surfaces it as an `acme_config` FAIL
+    /// instead of silently defaulting to staging. `None` when the directory is
+    /// valid or unset (unset uses the runtime default, staging).
+    pub directory_error: Option<String>,
 }
 
-/// The `FsAcmeStore` subdirectory label for the configured `acme.directory`.
+/// Deserialize `[server.tls.acme] directory` exactly as the runtime does.
+///
+/// Returns the parsed [`autumn_web::config::AcmeDirectory`], or — on a
+/// deserialize error the runtime would fail to boot on (a typo like
+/// `directory = "prod"` or a malformed custom table) — the rendered invalid
+/// value, so the caller can surface it as an `acme_config` FAIL instead of
+/// silently defaulting to staging. An absent `directory` key uses the runtime
+/// default (staging).
+fn parse_acme_directory(acme: &toml::Table) -> Result<autumn_web::config::AcmeDirectory, String> {
+    acme.get("directory").cloned().map_or_else(
+        || Ok(autumn_web::config::AcmeDirectory::default()),
+        |value| {
+            // Render the value BEFORE `try_into` consumes it, for the FAIL message.
+            let rendered = value.to_string();
+            value
+                .try_into::<autumn_web::config::AcmeDirectory>()
+                .map_err(|_| rendered.trim().to_owned())
+        },
+    )
+}
+
+/// The `FsAcmeStore` subdirectory label for a parsed `acme.directory`.
 ///
 /// Mirrors [`autumn_web::acme::directory_label`], replicated here because that
 /// helper lives behind the `acme` feature while this doctor path also compiles
 /// in the feature-less build. Keep in sync with the store — see
 /// `autumn_web::acme::store::FsAcmeStore`, which reads/writes certificates only
-/// under `{cache_dir}/{this label}/`. Defaults to `staging` (the runtime
-/// default when `directory` is unset).
-fn acme_directory_label(acme: &toml::Table) -> String {
-    let directory = acme
-        .get("directory")
-        .cloned()
-        .and_then(|v| v.try_into::<autumn_web::config::AcmeDirectory>().ok())
-        .unwrap_or_default();
+/// under `{cache_dir}/{this label}/`.
+fn acme_directory_label(directory: &autumn_web::config::AcmeDirectory) -> String {
     match directory {
         autumn_web::config::AcmeDirectory::Staging => "staging".to_owned(),
         autumn_web::config::AcmeDirectory::Production => "production".to_owned(),
         // A custom URL is hashed to a short, filesystem-safe token, exactly as
         // `autumn_web::acme::directory_label` / `short_hash` do.
         autumn_web::config::AcmeDirectory::Custom { url } => {
-            format!("custom-{}", acme_short_hash(&url))
+            format!("custom-{}", acme_short_hash(url))
         }
     }
 }
@@ -4231,13 +4295,20 @@ fn resolve_acme_doctor_config(toml_table: Option<&toml::Table>) -> Option<AcmeDo
         .and_then(toml::Value::as_str)
         .map_or_else(|| std::path::PathBuf::from("config/acme"), Into::into);
 
-    let directory_label = acme_directory_label(acme);
+    // Deserialize `directory` the way the runtime does; on error, record the bad
+    // value so the acme-config grader FAILs (the runtime won't boot on it) rather
+    // than silently defaulting to staging. On success derive the store label.
+    let (directory_label, directory_error) = match parse_acme_directory(acme) {
+        Ok(directory) => (acme_directory_label(&directory), None),
+        Err(bad_value) => ("staging".to_owned(), Some(bad_value)),
+    };
 
     Some(AcmeDoctorConfig {
         domains,
         contact_email,
         cache_dir,
         directory_label,
+        directory_error,
     })
 }
 
@@ -4246,15 +4317,41 @@ fn resolve_acme_doctor_config(toml_table: Option<&toml::Table>) -> Option<AcmeDo
 /// tests).
 ///
 /// The runtime `TlsConfig::validate()` / `AcmeConfig::validate()` REJECTS an ACME
-/// config that (a) lists no `domains`, (b) has a blank `contact_email`, or (c)
-/// includes a wildcard `*.` domain (wildcards require DNS-01, tracked in #1620) —
-/// the server exits at boot. Doctor previously turned a missing/empty `domains`
-/// into an empty list and reported `acme_stored_cert` as Pass with no probes, so
-/// `doctor --strict` blessed a deployment that immediately exits. This grader
-/// returns a `Fail` [`CheckResult`] for the first violated rule (messages mirror
-/// `AcmeConfig::validate`'s), or `None` when the ACME config is valid.
+/// config that (a) has a `directory` value that fails to deserialize as
+/// [`autumn_web::config::AcmeDirectory`], (b) lists no `domains`, (c) has a blank
+/// `contact_email`, or (d) includes a wildcard `*.` domain (wildcards require
+/// DNS-01, tracked in #1620) — the server exits at boot. Doctor previously turned
+/// a missing/empty `domains` into an empty list and reported `acme_stored_cert`
+/// as Pass with no probes, and silently defaulted a malformed `directory` to
+/// staging, so `doctor --strict` blessed a deployment that immediately exits.
+/// This grader returns a `Fail` [`CheckResult`] for the first violated rule
+/// (messages mirror the runtime's), or `None` when the ACME config is valid.
+///
+/// `directory_error` is the rendered invalid `directory` value (see
+/// [`AcmeDoctorConfig::directory_error`]); it is checked first because the
+/// runtime deserializes `AcmeConfig` — failing on a bad `directory` — before it
+/// runs `validate()`.
 #[must_use]
-pub fn check_acme_config_impl(domains: &[String], contact_email: &str) -> Option<CheckResult> {
+pub fn check_acme_config_impl(
+    domains: &[String],
+    contact_email: &str,
+    directory_error: Option<&str>,
+) -> Option<CheckResult> {
+    if let Some(bad_value) = directory_error {
+        return Some(CheckResult {
+            name: "acme_config",
+            status: CheckStatus::Fail,
+            detail: Some(format!(
+                "[server.tls.acme] directory value {bad_value} is not a valid ACME directory: use \
+                 \"staging\", \"production\", or a custom directory URL. The runtime fails to boot \
+                 on this value"
+            )),
+            hint: Some(
+                "Set [server.tls.acme] directory to \"staging\", \"production\", or a custom \
+                 directory URL",
+            ),
+        });
+    }
     if domains.is_empty() {
         return Some(CheckResult {
             name: "acme_config",
@@ -5216,6 +5313,22 @@ pub fn run(opts: DoctorOptions) {
     let (acme_canonical, acme_selected, _) = resolve_active_profiles();
     let merged_acme_toml = get_merged_toml_table_runtime(&acme_canonical, &acme_selected);
     let acme_config = resolve_acme_doctor_config(Some(&merged_acme_toml));
+
+    // XOR inputs mirror `TlsConfig::validate`, which keys static-mode on
+    // `cert_path.is_some()` / `key_path.is_some()`: base them on whether the
+    // `cert_path`/`key_path` KEY is PRESENT (TOML or env override), independent of
+    // an empty value. An explicitly-present-but-empty path is `Some("")` at
+    // runtime, so `[server.tls.acme]` + `cert_path = ""` is a mixed static+ACME
+    // config the runtime rejects — doctor must Fail it, not collapse the empty
+    // path to "absent" and pass it as ACME-only.
+    let (has_static_cert, has_static_key) = resolve_static_tls_presence();
+
+    // Whether a genuine (non-empty) static cert/key PAIR exists — value-based,
+    // gating the static-cert INSPECTION below. A present-but-empty path is not a
+    // runnable static cert, so it stays absent here: an empty pure-static config
+    // still Fails via the static check's "must set both" path, and an empty path
+    // alongside acme skips the (now redundant) static inspection because the
+    // mixed-mode Fail already fired.
     let (has_cert_path, has_key_path) = resolve_tls_paths()
         .map_or((false, false), |(cert, key)| {
             (!cert.as_os_str().is_empty(), !key.as_os_str().is_empty())
@@ -5229,7 +5342,8 @@ pub fn run(opts: DoctorOptions) {
     // static cert/key AND acme could PASS `--strict`, and a config with a single
     // static path plus acme would silently skip the static check — blessing a
     // config the app won't start.
-    if let Some(mode_fail) = check_tls_mode_impl(has_cert_path, has_key_path, acme_config.is_some())
+    if let Some(mode_fail) =
+        check_tls_mode_impl(has_static_cert, has_static_key, acme_config.is_some())
     {
         tasks.push(Box::new(move || mode_fail));
     }
@@ -5243,13 +5357,19 @@ pub fn run(opts: DoctorOptions) {
     // is configured: always inspect the stored certificate offline (expiry), and
     // — only under --online — actively probe port reachability and DNS.
     if let Some(acme) = acme_config {
-        // Mirror `AcmeConfig::validate()` FIRST: the runtime refuses to boot an
-        // ACME config with no domains, a blank contact_email, or a wildcard
-        // domain. Without this, doctor's empty-domains path reported
+        // Mirror the runtime's ACME boot invariants FIRST: it refuses to boot an
+        // ACME config with an invalid `directory` (deserialize failure), no
+        // domains, a blank contact_email, or a wildcard domain. Without this,
+        // doctor silently defaulted a bad directory to staging, and its
+        // empty-domains path reported
         // `acme_stored_cert` as Pass with no probes, blessing a config that exits
         // at boot. Emit the FAIL and SKIP the misleading stored-cert / online
         // probes when the config is invalid (there is nothing valid to inspect).
-        if let Some(config_fail) = check_acme_config_impl(&acme.domains, &acme.contact_email) {
+        if let Some(config_fail) = check_acme_config_impl(
+            &acme.domains,
+            &acme.contact_email,
+            acme.directory_error.as_deref(),
+        ) {
             tasks.push(Box::new(move || config_fail));
         } else {
             // Offline: stored certificate expiry (reuses the #1603 inspect path).
@@ -7676,7 +7796,7 @@ pub struct Vault {
     // doctor must FAIL it rather than silently pass acme_stored_cert.
     #[test]
     fn acme_config_fail_when_domains_empty() {
-        let r = check_acme_config_impl(&[], "ops@example.com")
+        let r = check_acme_config_impl(&[], "ops@example.com", None)
             .expect("empty domains must be a FAIL, not Pass");
         assert!(matches!(r.status, CheckStatus::Fail));
         assert_eq!(r.name, "acme_config");
@@ -7684,14 +7804,14 @@ pub struct Vault {
 
     #[test]
     fn acme_config_fail_when_contact_email_blank() {
-        let r = check_acme_config_impl(&["app.example.com".to_owned()], "   ")
+        let r = check_acme_config_impl(&["app.example.com".to_owned()], "   ", None)
             .expect("blank contact_email must be a FAIL");
         assert!(matches!(r.status, CheckStatus::Fail));
     }
 
     #[test]
     fn acme_config_fail_when_wildcard_domain() {
-        let r = check_acme_config_impl(&["*.example.com".to_owned()], "ops@example.com")
+        let r = check_acme_config_impl(&["*.example.com".to_owned()], "ops@example.com", None)
             .expect("wildcard domain must be a FAIL");
         assert!(matches!(r.status, CheckStatus::Fail));
         // Points the operator at the DNS-01 tracking issue, mirroring
@@ -7703,9 +7823,112 @@ pub struct Vault {
     fn acme_config_ok_when_valid() {
         // A valid ACME config produces no acme_config failure.
         assert!(
-            check_acme_config_impl(&["app.example.com".to_owned()], "ops@example.com").is_none(),
+            check_acme_config_impl(&["app.example.com".to_owned()], "ops@example.com", None)
+                .is_none(),
             "a valid ACME config must not raise an acme_config failure"
         );
+    }
+
+    // Regression (#1608, Codex P2): a malformed/typo `acme.directory` must FAIL,
+    // not silently default to staging. `resolve_acme_doctor_config` deserializes
+    // `directory` the way the runtime does; the runtime FAILS TO BOOT on a value
+    // that does not deserialize as `AcmeDirectory`, while doctor previously
+    // swallowed the error (`.ok().unwrap_or_default()`) and blessed the config by
+    // inspecting the (wrong) staging cache. Now the bad value surfaces as an
+    // `acme_config` FAIL, folded into the same grader as the other ACME invariants.
+    #[test]
+    fn acme_config_fail_when_directory_invalid() {
+        let raw: toml::Table = toml::from_str(
+            "\
+[server.tls.acme]
+domains = [\"app.example.com\"]
+contact_email = \"ops@example.com\"
+directory = \"prod\"
+",
+        )
+        .unwrap();
+        let acme = resolve_acme_doctor_config(Some(&raw)).expect("[server.tls.acme] present");
+        // The bad value is recorded (not silently defaulted to staging).
+        assert!(
+            acme.directory_error.is_some(),
+            "a malformed `directory` must be recorded as an error, not defaulted"
+        );
+        let r = check_acme_config_impl(
+            &acme.domains,
+            &acme.contact_email,
+            acme.directory_error.as_deref(),
+        )
+        .expect("an invalid `directory` must be a FAIL, not silently staging");
+        assert!(matches!(r.status, CheckStatus::Fail));
+        assert_eq!(r.name, "acme_config");
+        // The FAIL names the offending value so the operator can fix it.
+        let detail = r.detail.as_deref().unwrap_or_default();
+        assert!(
+            detail.contains("prod"),
+            "detail must name the bad value: {detail}"
+        );
+        assert!(
+            detail.contains("directory"),
+            "detail must mention `directory`: {detail}"
+        );
+    }
+
+    // Companion to the above: valid `directory` values (staging, production, a
+    // custom directory table, and an absent key defaulting to staging) must NOT
+    // raise the invalid-directory FAIL.
+    #[test]
+    fn acme_config_ok_for_valid_directories() {
+        let cases = [
+            ("directory = \"staging\"", "staging"),
+            ("directory = \"production\"", "production"),
+            (
+                "directory = { custom = { url = \"https://acme.example.com/directory\" } }",
+                "custom-",
+            ),
+        ];
+        for (line, label_prefix) in cases {
+            let raw: toml::Table = toml::from_str(&format!(
+                "\
+[server.tls.acme]
+domains = [\"app.example.com\"]
+contact_email = \"ops@example.com\"
+{line}
+"
+            ))
+            .unwrap();
+            let acme = resolve_acme_doctor_config(Some(&raw)).expect("[server.tls.acme] present");
+            assert!(
+                acme.directory_error.is_none(),
+                "valid directory `{line}` must not be an error"
+            );
+            assert!(
+                acme.directory_label.starts_with(label_prefix),
+                "directory label for `{line}` should start with `{label_prefix}`, got `{}`",
+                acme.directory_label
+            );
+            assert!(
+                check_acme_config_impl(
+                    &acme.domains,
+                    &acme.contact_email,
+                    acme.directory_error.as_deref(),
+                )
+                .is_none(),
+                "valid directory `{line}` must not raise an acme_config FAIL"
+            );
+        }
+
+        // Absent `directory` → runtime default (staging), no error.
+        let raw: toml::Table = toml::from_str(
+            "\
+[server.tls.acme]
+domains = [\"app.example.com\"]
+contact_email = \"ops@example.com\"
+",
+        )
+        .unwrap();
+        let acme = resolve_acme_doctor_config(Some(&raw)).expect("[server.tls.acme] present");
+        assert!(acme.directory_error.is_none());
+        assert_eq!(acme.directory_label, "staging");
     }
 
     // Regression (#1608, Codex): an ACME-only deployment ([server.tls.acme]
@@ -7785,6 +8008,101 @@ pub struct Vault {
         assert!(check_tls_mode_impl(false, false, false).is_none());
     }
 
+    // Regression (#1608, Codex P2): the static-vs-ACME XOR must key on static-path
+    // PRESENCE, not non-emptiness. The runtime keys `TlsConfig::validate` on
+    // `cert_path.is_some()`, so `[server.tls.acme]` + `cert_path = ""` is a mixed
+    // static+ACME config it rejects at boot. Doctor previously collapsed the empty
+    // path to "absent", treated the config as ACME-only, skipped the static check,
+    // and could pass `--strict`. `static_tls_presence_from` now reports a
+    // present-but-empty path as PRESENT, so the mixed-mode FAIL fires.
+    #[test]
+    fn empty_static_path_with_acme_is_mixed_mode_not_acme_only() {
+        let raw: toml::Table = toml::from_str(
+            "\
+[server.tls]
+cert_path = \"\"
+
+[server.tls.acme]
+domains = [\"app.example.com\"]
+contact_email = \"ops@example.com\"
+",
+        )
+        .unwrap();
+        let tls = raw
+            .get("server")
+            .and_then(toml::Value::as_table)
+            .and_then(|s| s.get("tls"))
+            .and_then(toml::Value::as_table);
+
+        // The present-but-empty `cert_path` KEY counts as static-mode present.
+        let (has_static_cert, has_static_key) = static_tls_presence_from(tls, false, false);
+        assert!(
+            has_static_cert,
+            "a present-but-empty `cert_path` must count as static-mode present"
+        );
+        assert!(!has_static_key, "no `key_path` key is set");
+
+        // acme is configured, so this is a mixed static+ACME config → FAIL, exactly
+        // as `TlsConfig::validate` rejects it (NOT skipped as ACME-only).
+        let acme = resolve_acme_doctor_config(Some(&raw)).expect("[server.tls.acme] present");
+        let r = check_tls_mode_impl(has_static_cert, has_static_key, true)
+            .expect("mixed static+ACME (present-but-empty cert_path) must FAIL");
+        assert!(matches!(r.status, CheckStatus::Fail));
+        assert_eq!(r.name, "tls_mode");
+        assert!(
+            r.detail
+                .as_deref()
+                .unwrap_or_default()
+                .contains("[server.tls.acme]"),
+            "the FAIL must name the mutually-exclusive [server.tls.acme]"
+        );
+        // Sanity: acme itself resolves (the domains/email are valid).
+        assert_eq!(acme.domains, ["app.example.com"]);
+    }
+
+    // Companion: an ACME-only deployment with NO `cert_path`/`key_path` key at all
+    // is a valid single mode — neither static key present → no mixed-mode FAIL.
+    #[test]
+    fn acme_only_without_static_keys_is_valid() {
+        let raw: toml::Table = toml::from_str(
+            "\
+[server.tls.acme]
+domains = [\"app.example.com\"]
+contact_email = \"ops@example.com\"
+",
+        )
+        .unwrap();
+        let tls = raw
+            .get("server")
+            .and_then(toml::Value::as_table)
+            .and_then(|s| s.get("tls"))
+            .and_then(toml::Value::as_table);
+
+        let (has_static_cert, has_static_key) = static_tls_presence_from(tls, false, false);
+        assert!(
+            !has_static_cert && !has_static_key,
+            "ACME-only config must report NO static cert/key keys present"
+        );
+        assert!(
+            check_tls_mode_impl(has_static_cert, has_static_key, true).is_none(),
+            "ACME-only (no static keys) is a valid single mode — no mixed-mode FAIL"
+        );
+    }
+
+    // An env override for `cert_path` — even an empty one — counts as static-mode
+    // present, mirroring the runtime applying `AUTUMN_SERVER__TLS__CERT_PATH` as
+    // `Some("")`.
+    #[test]
+    fn static_presence_counts_empty_env_override() {
+        // No [server.tls] table at all, but the cert env override is set.
+        let (has_static_cert, has_static_key) = static_tls_presence_from(None, true, false);
+        assert!(
+            has_static_cert,
+            "an env cert override must count as present"
+        );
+        assert!(!has_static_key);
+    }
+
     // Regression (#1608, Codex): [server.tls.acme] supplied ONLY by an active
     // profile ([profile.prod] / autumn-prod.toml) must be detected by doctor. A
     // raw top-level table misses it, so `resolve_tls_paths()` would still see the
@@ -7859,6 +8177,7 @@ directory = \"production\"
             contact_email: "ops@example.com".to_owned(),
             cache_dir: std::path::PathBuf::from("config/acme"),
             directory_label: "production".to_owned(),
+            directory_error: None,
         };
 
         // Every configured domain is scheduled for probing, not just the first.
@@ -7904,21 +8223,22 @@ directory = \"production\"
     // the stored-cert scan reads the SAME subdirectory the runtime loads.
     #[test]
     fn acme_directory_label_matches_store() {
-        let staging: toml::Table = toml::from_str("directory = \"staging\"").unwrap();
-        assert_eq!(acme_directory_label(&staging), "staging");
+        let label_of = |src: &str| {
+            let table: toml::Table = toml::from_str(src).unwrap();
+            acme_directory_label(&parse_acme_directory(&table).expect("valid directory"))
+        };
 
-        let production: toml::Table = toml::from_str("directory = \"production\"").unwrap();
-        assert_eq!(acme_directory_label(&production), "production");
+        assert_eq!(label_of("directory = \"staging\""), "staging");
+        assert_eq!(label_of("directory = \"production\""), "production");
 
         // Unset directory defaults to staging (the runtime default).
-        let empty = toml::Table::new();
-        assert_eq!(acme_directory_label(&empty), "staging");
+        assert_eq!(
+            acme_directory_label(&parse_acme_directory(&toml::Table::new()).unwrap()),
+            "staging"
+        );
 
         // A custom directory hashes its URL, mirroring the store's `custom-<hash>`.
-        let custom: toml::Table =
-            toml::from_str("directory = { custom = { url = \"https://pebble.test/dir\" } }")
-                .unwrap();
-        let label = acme_directory_label(&custom);
+        let label = label_of("directory = { custom = { url = \"https://pebble.test/dir\" } }");
         assert!(label.starts_with("custom-"), "got {label}");
     }
 
