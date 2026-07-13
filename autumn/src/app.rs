@@ -3665,7 +3665,7 @@ impl AppBuilder {
         #[cfg(feature = "acme")]
         if let Some(bind_state) = acme_bind_state.take() {
             let AcmeBindState {
-                renewal_task,
+                mut renewal_task,
                 tokens,
                 http_challenge_port,
                 https_port,
@@ -3718,6 +3718,17 @@ impl AppBuilder {
 
             // Build the coordinator for leader election (regardless of role) and
             // the reporter callback, then spawn the renewal loop.
+            //
+            // `leadership_degraded` captures the dangerous case: a DISTRIBUTED
+            // backend was configured (multi-replica intent) but
+            // `coordinator_from_config` could not build the distributed
+            // coordinator (no DB pool / `db` feature absent in this process) and
+            // we fell back to a per-process in-process one. Keyed off the
+            // configured backend AND the actual fallback so it never fires for a
+            // genuinely single-replica `in_process` deployment. When set, the
+            // renewal loop refuses to order (see `AcmeRenewalTask`) rather than
+            // letting every replica grab its own local lease and race the CA.
+            let mut leadership_degraded = false;
             let coordinator =
                 match crate::scheduler::coordinator_from_config(&config.scheduler, &state) {
                     Ok(c) => c,
@@ -3726,11 +3737,16 @@ impl AppBuilder {
                             error = %e,
                             "ACME renewal: falling back to an in-process coordinator"
                         );
+                        leadership_degraded = !matches!(
+                            config.scheduler.backend,
+                            crate::config::SchedulerBackend::InProcess
+                        );
                         std::sync::Arc::new(crate::scheduler::InProcessSchedulerCoordinator::new(
                             config.scheduler.resolved_replica_id(),
                         ))
                     }
                 };
+            renewal_task.leadership_degraded = leadership_degraded;
 
             // HTTP-01 ACME is single-host in this slice: the token map is
             // per-process and the store is local disk. A distributed scheduler
@@ -5910,6 +5926,9 @@ async fn build_acme_tls_listener(
         status,
         config: acme_cfg.clone(),
         serving_stored_cert,
+        // Filled in at the renewal spawn site once the scheduler coordinator has
+        // been built and any distributed → in-process fallback is known.
+        leadership_degraded: false,
     };
     Ok((
         listener,

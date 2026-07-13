@@ -254,6 +254,16 @@ pub struct AcmeRenewalTask {
     /// Whether a valid stored certificate is already being served (so the first
     /// tick can skip ordering unless it is due for renewal).
     pub serving_stored_cert: bool,
+    /// Set when a *distributed* scheduler backend was configured (multi-replica
+    /// intent) but this process could not build the distributed coordinator and
+    /// fell back to a per-process in-process one. In that state we must NOT
+    /// order: every replica would grab its OWN local lease and order the SAME
+    /// certificate concurrently, racing the per-process HTTP-01 token maps and
+    /// local stores and burning the CA's rate limits. Instead each cycle records
+    /// an ACME failure and keeps serving the existing/placeholder cert until
+    /// leadership is restored. Never set for a genuinely single-replica
+    /// deployment (`scheduler.backend = in_process` → in-process is correct).
+    pub leadership_degraded: bool,
 }
 
 /// RAII guard tracking the HTTP-01 tokens published for one order.
@@ -365,6 +375,27 @@ impl AcmeRenewalTask {
         coordinator: &Arc<dyn SchedulerCoordinator>,
         reporter: &ReporterFn,
     ) {
+        // A distributed scheduler backend was configured (multi-replica intent)
+        // but this process could not build the distributed coordinator and fell
+        // back to a per-process in-process one. Ordering now would give this
+        // replica its OWN local lease, so every replica would order the SAME
+        // certificate concurrently — racing the per-process HTTP-01 token maps
+        // and local stores and burning the CA's rate limits. Refuse to order:
+        // record the failure and dispatch it through the reporter (same seam as
+        // the coordinator-error path) so health does not stay `Up` while serving
+        // only the placeholder, then keep serving the existing cert this cycle.
+        if self.leadership_degraded {
+            let msg = "ACME renewal: a distributed scheduler backend is configured but its \
+                coordinator is unavailable in this process — refusing to order to avoid racing \
+                replicas and Let's Encrypt rate limits (fix the scheduler backend / database \
+                connectivity, or run ACME on a single host)"
+                .to_owned();
+            tracing::error!("{msg}");
+            self.status.record_failure(now_unix(), msg.clone());
+            reporter(msg);
+            return;
+        }
+
         // `Fleet` is the single-leader mode: the in-process backend always
         // grants (correct single-replica behavior), while the Postgres backend
         // grants to exactly one replica via an advisory lock keyed on the cert.
@@ -823,6 +854,7 @@ mod tests {
             status: status.clone(),
             config,
             serving_stored_cert: false,
+            leadership_degraded: false,
         };
 
         // Capture reporter invocations.
@@ -849,5 +881,162 @@ mod tests {
         let msgs = captured.lock().unwrap().clone();
         assert_eq!(msgs.len(), 1, "reporter must be invoked once");
         assert!(msgs[0].contains("leader election failed"));
+    }
+
+    /// A coordinator that records whether leader election was ever attempted,
+    /// then returns `Ok(None)` ("another replica leads") so the ordering path
+    /// exits without a network round-trip. Lets a test assert whether the
+    /// renewal task reached leader election at all.
+    struct RecordingCoordinator {
+        acquired: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl SchedulerCoordinator for RecordingCoordinator {
+        fn backend(&self) -> &'static str {
+            "in_process"
+        }
+        fn replica_id(&self) -> &'static str {
+            "test-replica"
+        }
+        fn try_acquire<'a>(
+            &'a self,
+            _task_name: &'a str,
+            _tick_key: &'a str,
+            _coordination: TaskCoordination,
+        ) -> crate::scheduler::SchedulerFuture<
+            'a,
+            crate::AutumnResult<Option<crate::scheduler::SchedulerLease>>,
+        > {
+            self.acquired
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async { Ok(None) })
+        }
+    }
+
+    /// Build a renewal task serving the self-signed placeholder (pre-issuance
+    /// state) with the given `leadership_degraded` flag. The returned `TempDir`
+    /// must be kept alive for the store to stay valid.
+    fn degraded_test_task(
+        leadership_degraded: bool,
+    ) -> (AcmeRenewalTask, tempfile::TempDir, AcmeStatus) {
+        let domains = vec!["app.example.com".to_owned()];
+        let placeholder = self_signed_placeholder(&domains).expect("placeholder builds");
+        let provider = crate::tls::crypto_provider();
+        let certified = crate::tls::certified_key_from_pem(
+            placeholder.chain_pem.as_bytes(),
+            placeholder.key_pem.as_bytes(),
+            &provider,
+        )
+        .expect("placeholder loads");
+        let resolver = Arc::new(ReloadableCertResolver::new(certified));
+
+        let store_dir = tempfile::tempdir().unwrap();
+        let store: Arc<dyn AcmeStore> = Arc::new(crate::acme::store::FsAcmeStore::new(
+            store_dir.path(),
+            "staging",
+        ));
+
+        let status = AcmeStatus::new();
+        let config = AcmeConfig {
+            domains: domains.clone(),
+            contact_email: "ops@example.com".to_owned(),
+            directory: crate::config::AcmeDirectory::Staging,
+            cache_dir: store_dir.path().to_path_buf(),
+            http_challenge_port: 80,
+            renew_before_days: 30,
+        };
+        let task = AcmeRenewalTask {
+            resolver,
+            provider: crate::tls::crypto_provider(),
+            store,
+            cert_id: CertId::from_domains(&domains),
+            tokens: Http01Tokens::new(),
+            status: status.clone(),
+            config,
+            serving_stored_cert: false,
+            leadership_degraded,
+        };
+        (task, store_dir, status)
+    }
+
+    // Regression (#1608, Codex P2): a *distributed* scheduler backend was
+    // configured (multi-replica intent) but this process could not build the
+    // distributed coordinator and fell back to a per-process in-process one.
+    // Ordering would let every replica grab its OWN local lease and race the CA.
+    // The renewal task MUST refuse to order — record a failure, dispatch it
+    // through the reporter, and never consult the coordinator this cycle.
+    #[tokio::test]
+    async fn leadership_degraded_refuses_to_order_and_reports() {
+        let (task, _store_dir, status) = degraded_test_task(true);
+
+        let captured = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let sink = Arc::clone(&captured);
+        let reporter: ReporterFn = Arc::new(move |msg| sink.lock().unwrap().push(msg));
+
+        // The degraded gate must return before touching the coordinator, so this
+        // flag stays false.
+        let acquired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let coordinator: Arc<dyn SchedulerCoordinator> = Arc::new(RecordingCoordinator {
+            acquired: Arc::clone(&acquired),
+        });
+        task.try_renew_once(&coordinator, &reporter).await;
+
+        // No lease was acquired / no order was attempted.
+        assert!(
+            !acquired.load(std::sync::atomic::Ordering::SeqCst),
+            "degraded leadership must NOT acquire a lease or order"
+        );
+
+        // The failure is recorded in status...
+        let snap = status.snapshot();
+        let failure = snap
+            .last_failure
+            .expect("degraded leadership must be recorded as a failure");
+        assert!(
+            failure.1.contains("refusing to order"),
+            "unexpected failure message: {}",
+            failure.1
+        );
+
+        // ...and dispatched through the reporter exactly once.
+        let msgs = captured.lock().unwrap().clone();
+        assert_eq!(msgs.len(), 1, "reporter must be invoked once");
+        assert!(msgs[0].contains("refusing to order"));
+    }
+
+    // The genuinely single-replica path (in-process coordinator by design) is
+    // unaffected by the degraded gate: it proceeds to leader election as normal.
+    // A full network order is out of scope for a unit test, so the coordinator
+    // returns `Ok(None)`; the assertion is that the gate did NOT short-circuit
+    // (the coordinator WAS consulted) and no spurious degraded failure surfaced.
+    #[tokio::test]
+    async fn single_replica_path_is_unaffected_and_proceeds_to_order() {
+        let (task, _store_dir, status) = degraded_test_task(false);
+
+        let captured = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let sink = Arc::clone(&captured);
+        let reporter: ReporterFn = Arc::new(move |msg| sink.lock().unwrap().push(msg));
+
+        let acquired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let coordinator: Arc<dyn SchedulerCoordinator> = Arc::new(RecordingCoordinator {
+            acquired: Arc::clone(&acquired),
+        });
+        task.try_renew_once(&coordinator, &reporter).await;
+
+        // The renewal task reached leader election rather than short-circuiting.
+        assert!(
+            acquired.load(std::sync::atomic::Ordering::SeqCst),
+            "single-replica path must proceed to leader election / ordering"
+        );
+
+        // No degraded failure was recorded and the reporter was not invoked.
+        assert!(
+            status.snapshot().last_failure.is_none(),
+            "single-replica path must not record a degraded failure"
+        );
+        assert!(
+            captured.lock().unwrap().is_empty(),
+            "single-replica path must not report a degraded failure"
+        );
     }
 }
