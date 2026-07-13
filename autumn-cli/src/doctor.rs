@@ -5549,7 +5549,6 @@ fn resolve_compression_enabled() -> bool {
 ///    Results are joined back in display order.
 #[allow(clippy::too_many_lines)]
 pub fn run(opts: DoctorOptions) {
-    use std::thread;
     type Task = Box<dyn FnOnce() -> CheckResult + Send>;
 
     let cli_version = env!("CARGO_PKG_VERSION");
@@ -6043,9 +6042,13 @@ pub fn run(opts: DoctorOptions) {
     }));
 
     // ── Phase 3: spawn all tasks concurrently ────────────────────────────────
+    run_doctor_tasks(tasks, opts);
+}
+
+fn run_doctor_tasks(tasks: Vec<Box<dyn FnOnce() -> CheckResult + Send>>, opts: DoctorOptions) {
     #[allow(clippy::needless_collect)]
-    let handles: Vec<thread::JoinHandle<CheckResult>> =
-        tasks.into_iter().map(thread::spawn).collect();
+    let handles: Vec<std::thread::JoinHandle<CheckResult>> =
+        tasks.into_iter().map(std::thread::spawn).collect();
 
     // ── Phase 4: join in order (preserves display ordering) ──────────────────
     let results: Vec<CheckResult> = handles
