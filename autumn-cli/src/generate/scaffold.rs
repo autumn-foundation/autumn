@@ -2346,6 +2346,13 @@ fn render_routes_file(
     // already loads labels through the same connection — so the index reuses
     // that mechanism rather than falling back to raw ids. Only the `--live` SSE
     // list (a `<ul>` of ids, no data-table) keeps id rendering.
+    //
+    // #1126: sort/filter (the `ListQuery` extractor + `repo.list(..)` + sortable
+    // `data_table` headers) is likewise gated OFF for the `--live` variants —
+    // their `<ul>` has no column headers to hang sort links on, and the SSE
+    // OOB-swap contract owns the list DOM. The `--live` index keeps the plain
+    // `repo.page(&page_req)` call. `--live-validation` (without `--live`) renders
+    // the normal data_table index, so it DOES get sort/filter.
     let columns_let = if live {
         String::new()
     } else {
@@ -2375,11 +2382,25 @@ fn render_routes_file(
     } else {
         render_columns_vec(pascal_name, fields, &reference_displays, true)
     };
+    // #1126: the data_table config is wired symmetrically with what the server
+    // applies — `.query(..)` preserves the current filters on sort links,
+    // `.active_sort`/`.active_dir` mark the column the repository ordered by, and
+    // `repo.list(&list_query, ..)` applies exactly that sort/filter. Sortable
+    // headers are opted-in per column by `render_columns_vec`.
     let table_render = if live {
         String::new()
-    } else {
+    } else if authorize {
+        // #1125 owner-scoped index: the handler runs a manual owner-filtered
+        // query (not `repo.list`) and does not extract `ListQuery`, so its
+        // data_table stays on the plain (non-sort/filter) config. #1126's
+        // allowlisted sort/filter is not owner-scoped — the same limitation the
+        // `--searchable` guard documents for owner-scoped FTS.
         format!(
             r#"(autumn_web::widgets::data_table(&page_data.content, &columns, &autumn_web::widgets::DataTableConfig::new("No {plural} yet.").base_path(&paths::index())))"#
+        )
+    } else {
+        format!(
+            r#"(autumn_web::widgets::data_table(&page_data.content, &columns, &autumn_web::widgets::DataTableConfig::new("No {plural} yet.").base_path(&paths::index()).query(raw_query.as_deref().unwrap_or_default()).active_sort(list_query.sort().unwrap_or_default()).active_dir(list_query.direction())))"#
         )
     };
 
@@ -2396,8 +2417,17 @@ fn render_routes_file(
     // does not load htmx, so an htmx `<script>` is inlined here. When not
     // searchable (or a live variant), it is exactly the previous `{list_render}`
     // + `pagination_nav` pair — byte-for-byte identical (AC4).
-    let pager_line =
-        r"(pagination_nav(&page_data, &PagerOptions::new(&paths::index())))".to_string();
+    // #1126: the non-live (sort/filter) index handlers preserve the active
+    // sort+filter query string on the pager links via `PagerOptions::query`, so
+    // paging never drops the current sort/filter (`pager_query` is bound in each
+    // handler from the raw query string). The `--live` variants call `repo.page`
+    // and extract no `RawQuery`, so they keep the plain pager.
+    let pager_line = if live {
+        r"(pagination_nav(&page_data, &PagerOptions::new(&paths::index())))".to_string()
+    } else {
+        r"(pagination_nav(&page_data, &PagerOptions::new(&paths::index()).query(pager_query)))"
+            .to_string()
+    };
     let index_list_block = if search_enabled {
         format!(
             "script src=(autumn_web::htmx::HTMX_JS_PATH) {{}}\n        \
@@ -2485,19 +2515,24 @@ pub async fn index(
             )
         } else {
             format!(
-                r#"/// `GET /{plural}` — paginated list of {snake_name}s.
+                r#"/// `GET /{plural}` — paginated, sortable, filterable list of {snake_name}s.
 ///
-/// Accepts `?page=N&size=M` query parameters via the [`PageRequest`] extractor.
-/// Out-of-range or missing values are clamped silently — list endpoints never
-/// return HTTP 400 for bad paging parameters.
+/// Accepts `?page=N&size=M` paging plus allowlisted `?sort=col&dir=asc|desc`
+/// and `?filter[col]=val` params (the [`ListQuery`] extractor). Unknown or
+/// malicious sort/filter keys are ignored against the model's column allowlist,
+/// so this never 400s and can never inject SQL. `from_shard` keeps the query
+/// pinned to a single shard.
 #[get("/{plural}")]
 pub async fn index(
+    list_query: ListQuery,
+    RawQuery(raw_query): RawQuery,
     page_req: PageRequest,
     {sharded_index_db},
     flash: Flash,
 ) -> AutumnResult<Markup> {{
     let repo = Pg{pascal_name}Repository::from_shard(&db);
-    let page_data: Page<{pascal_name}> = repo.page(&page_req).await?;
+    let page_data: Page<{pascal_name}> = repo.list(&list_query, &page_req).await?;
+    let pager_query = raw_query.as_deref().unwrap_or("");
 {index_label_loads}{index_columns_labeled}    Ok({layout_fn}("{pascal_name} index", {cp_index}{flash_arg}, html! {{
         h1 {{ "{pascal_name}s" }}
         a href=(paths::new()) {{ "New {pascal_name}" }}
@@ -2529,18 +2564,22 @@ pub async fn index(
         )
     } else {
         format!(
-            r#"/// `GET /{plural}` — paginated list of {snake_name}s.
+            r#"/// `GET /{plural}` — paginated, sortable, filterable list of {snake_name}s.
 ///
-/// Accepts `?page=N&size=M` query parameters via the [`PageRequest`] extractor.
-/// Out-of-range or missing values are clamped silently — list endpoints never
-/// return HTTP 400 for bad paging parameters.
+/// Accepts `?page=N&size=M` paging plus allowlisted `?sort=col&dir=asc|desc`
+/// and `?filter[col]=val` params (the [`ListQuery`] extractor). Unknown or
+/// malicious sort/filter keys are ignored against the model's column allowlist,
+/// so this never 400s and can never inject SQL.
 #[get("/{plural}")]
 pub async fn index(
+    list_query: ListQuery,
+    RawQuery(raw_query): RawQuery,
     page_req: PageRequest,
     repo: Pg{pascal_name}Repository,
     {index_db_param}flash: Flash,
 ) -> AutumnResult<Markup> {{
-    let page_data: Page<{pascal_name}> = repo.page(&page_req).await?;
+    let page_data: Page<{pascal_name}> = repo.list(&list_query, &page_req).await?;
+    let pager_query = raw_query.as_deref().unwrap_or("");
 {index_label_loads}{index_columns_labeled}    Ok({layout_fn}("{pascal_name} index", {cp_index}{flash_arg}, html! {{
         h1 {{ "{pascal_name}s" }}
         a href=(paths::new()) {{ "New {pascal_name}" }}
@@ -2548,6 +2587,18 @@ pub async fn index(
     }}))
 }}"#
         )
+    };
+
+    // #1126: the non-live index handlers extract `ListQuery` (allowlisted
+    // sort/filter) and the raw query string (`RawQuery`, to preserve filters on
+    // the data_table sort links). The pure `--live` index keeps `repo.page` and
+    // needs neither — omit the imports there to avoid unused-import warnings.
+    let sort_imports = if live {
+        String::new()
+    } else {
+        "use autumn_web::pagination::ListQuery;\n\
+         use autumn_web::reexports::axum::extract::RawQuery;\n"
+            .to_owned()
     };
 
     // Imports: when sharded, drop Db from brace-import and add ShardedDb separately.
@@ -2791,7 +2842,7 @@ pub async fn search(
 {attachment_note}
 use autumn_web::extract::Path;
 use autumn_web::pagination::{{Page, PageRequest}};
-use autumn_web::reexports::axum::body::Bytes;
+{sort_imports}use autumn_web::reexports::axum::body::Bytes;
 use autumn_web::reexports::serde_json;
 use autumn_web::security::{{CsrfFormField, CsrfToken, SubmitFormField, SubmitToken}};
 use autumn_web::ui::pagination::{{PagerOptions, pagination_nav}};
@@ -3979,11 +4030,29 @@ fn cell_value_expr(field: &Field) -> String {
     }
 }
 
+/// Whether a column of this kind is server-sortable via the generated
+/// `list()` method (#1126).
+///
+/// Mirrors the orderable-type allowlist in the `#[model]` macro: every scalar
+/// column is sortable EXCEPT binary blobs (`Bytea`/`Attachment`) and closed-set
+/// `Enum` columns (whose Rust type is a generated enum the macro doesn't emit a
+/// sort arm for). Emitting `.sortable(..)` only for these keeps the rendered
+/// header links symmetric with what the server actually applies — a link that
+/// resolves to the default order would be a dead affordance.
+const fn kind_is_sortable(kind: FieldKind) -> bool {
+    !matches!(
+        kind,
+        FieldKind::Bytea | FieldKind::Attachment | FieldKind::Enum
+    )
+}
+
 /// Emit the `let columns: Vec<Column<Pascal>> = vec![…];` block for the index handler.
 ///
 /// Includes an "Id" column, one column per scaffold field (title-cased header),
-/// and a trailing "Show" actions column. All columns are non-sortable — server-side
-/// ordering per-column is out of scope; dead sort links would be worse than none.
+/// and a trailing "Show" actions column. Scalar columns are marked `.sortable(..)`
+/// (the sort key is the column's snake name) so the `data_table` renders header
+/// links that the generated `list()` method applies against the model's column
+/// allowlist (#1126). The trailing "Show" action column is never sortable.
 fn render_columns_vec(
     pascal_name: &str,
     fields: &[Field],
@@ -3996,14 +4065,19 @@ fn render_columns_vec(
         out,
         "    let columns: Vec<autumn_web::widgets::Column<{pascal_name}>> = vec!["
     );
-    // ID column
+    // ID column — always sortable (the default order is `id DESC`).
     let _ = writeln!(
         out,
-        "        autumn_web::widgets::Column::new(\"Id\", |row: &{pascal_name}| maud::html! {{ (row.id) }}),"
+        "        autumn_web::widgets::Column::new(\"Id\", |row: &{pascal_name}| maud::html! {{ (row.id) }}).sortable(\"id\"),"
     );
     // One column per field
     for f in fields {
         let header = title_case(&f.name);
+        let sortable_suffix = if kind_is_sortable(f.kind) {
+            format!(".sortable(\"{}\")", f.name)
+        } else {
+            String::new()
+        };
         // A displayable `references` column renders the parent's label from
         // the per-view `{name}_labels` map the handler loaded (issue #1146),
         // instead of the raw foreign-key id. The closure borrows the map,
@@ -4027,7 +4101,7 @@ fn render_columns_vec(
         };
         let _ = writeln!(
             out,
-            "        autumn_web::widgets::Column::new(\"{header}\", |row: &{pascal_name}| maud::html! {{ ({cell_expr}) }}),"
+            "        autumn_web::widgets::Column::new(\"{header}\", |row: &{pascal_name}| maud::html! {{ ({cell_expr}) }}){sortable_suffix},"
         );
     }
     // Show link column
@@ -9423,6 +9497,60 @@ async fn main() {
         assert!(
             repo.contains(", searchable)"),
             "live repo must still carry searchable: {repo}"
+        );
+    }
+
+    #[test]
+    fn kind_is_sortable_excludes_blobs_and_enums() {
+        // #1126: only kinds the model macro emits a sort arm for get a
+        // `.sortable(..)` header — otherwise the link would be a dead affordance.
+        assert!(kind_is_sortable(FieldKind::String));
+        assert!(kind_is_sortable(FieldKind::Text));
+        assert!(kind_is_sortable(FieldKind::I32));
+        assert!(kind_is_sortable(FieldKind::I64));
+        assert!(kind_is_sortable(FieldKind::Bool));
+        assert!(kind_is_sortable(FieldKind::F64));
+        assert!(kind_is_sortable(FieldKind::Uuid));
+        assert!(kind_is_sortable(FieldKind::DateTime));
+        assert!(kind_is_sortable(FieldKind::References));
+        assert!(kind_is_sortable(FieldKind::Decimal {
+            precision: 12,
+            scale: 2
+        }));
+        // Excluded: binary blobs and closed-set enums.
+        assert!(!kind_is_sortable(FieldKind::Bytea));
+        assert!(!kind_is_sortable(FieldKind::Attachment));
+        assert!(!kind_is_sortable(FieldKind::Enum));
+    }
+
+    #[test]
+    fn index_wires_allowlisted_sort_filter() {
+        // #1126: the generated index extracts ListQuery, calls repo.list, and
+        // marks scalar columns sortable with a symmetric data_table config.
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &[
+                "title:String".into(),
+                "body:Text".into(),
+                "published:bool".into(),
+            ],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+        assert!(routes.contains("list_query: ListQuery,"), "{routes}");
+        assert!(
+            routes.contains("repo.list(&list_query, &page_req)"),
+            "{routes}"
+        );
+        assert!(routes.contains(".sortable(\"id\")"), "{routes}");
+        assert!(routes.contains(".sortable(\"title\")"), "{routes}");
+        assert!(
+            routes.contains(".active_dir(list_query.direction())"),
+            "{routes}"
         );
     }
 
