@@ -1770,8 +1770,30 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::BigInt)]
                             id: i64,
                         }
+                        // Codex P2 ("Lock children before the restrict pre-scan"):
+                        // this id selection acquires `FOR UPDATE` on every selected
+                        // child row BEFORE the read-only restrict pre-scan below runs
+                        // its `EXISTS` probes. Under READ COMMITTED an FK insert of a
+                        // `restrict` grandchild takes a `FOR KEY SHARE` lock on the
+                        // referenced child row; holding `FOR UPDATE` on that row here
+                        // blocks such an insert until this transaction commits/rolls
+                        // back, so a concurrent grandchild cannot slip in between the
+                        // pre-scan `EXISTS` probe and either the Phase-2 child reload /
+                        // `before_delete` hook or the child delete. The Phase-2 reload
+                        // still calls `.for_update()`, but that is now a re-lock of a
+                        // row already held (a no-op) rather than the FIRST lock — the
+                        // TOCTOU window between probe and hook/delete is closed. The
+                        // lock is hoisted from Phase 2 to here (same parent -> child
+                        // order, same rows), so it introduces no new lock-ordering /
+                        // deadlock class. `ORDER BY id` also makes the lock acquisition
+                        // order deterministic across concurrent cascades. This covers
+                        // the single `delete_by_id` path and both `delete_many` bulk
+                        // paths (they all reach this shared helper), and both soft and
+                        // hard child deletes (the `#destroy_live_filter` gate is applied
+                        // BEFORE `FOR UPDATE`, so the locked row set matches the rows
+                        // the pre-scan + mutating pass operate on).
                         let __q = format!(
-                            "SELECT id FROM \"{}\" WHERE \"{}\" = $1{} ORDER BY id",
+                            "SELECT id FROM \"{}\" WHERE \"{}\" = $1{} ORDER BY id FOR UPDATE",
                             __table, __fk_column, #destroy_live_filter
                         );
                         let __ids: ::std::vec::Vec<__AutumnDepId> =
@@ -16635,6 +16657,54 @@ mod tests {
             restrict_probe_pos < before_delete_pos,
             "#1800 case 2: every sibling's restrict grandchild is probed before any \
              child before_delete hook fires: {destroy_arm}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_destroy_arm_locks_child_ids_before_restrict_prescan() {
+        // Codex P2 ("Lock children before the restrict pre-scan"): the child-id
+        // selection that feeds the sibling restrict PRE-SCAN must acquire
+        // `FOR UPDATE` on the selected child rows. Otherwise, under READ
+        // COMMITTED, a concurrent FK insert of a `restrict` grandchild can commit
+        // AFTER this EXISTS pass and BEFORE the Phase-2 `for_update` child reload,
+        // so the child `before_delete` hook still fires and the hard delete falls
+        // through to a raw FK error (or a soft delete proceeds despite a live
+        // restrict dependent). Holding `FOR UPDATE` on the child row blocks the
+        // concurrent grandchild insert's `FOR KEY SHARE` on that referenced row,
+        // closing the TOCTOU window between probe and hook/delete. Structurally:
+        // the `SELECT id ... ORDER BY id FOR UPDATE` id query must precede the
+        // `for __row in & __ids` pre-scan loop.
+        let generated = repository_macro(
+            quote! {
+                Comment,
+                hooks = CommentHooks,
+                dependent(PgReplyRepository, fk = "comment_id", on_delete = restrict),
+                dependent(PgLikeRepository, fk = "comment_id", on_delete = destroy)
+            },
+            quote! { pub trait CommentRepository {} },
+        )
+        .to_string();
+        let destroy_arm = dependent_destroy_arm(&generated);
+        // The child-id selection SQL literal must acquire the row lock.
+        let id_lock_pos = destroy_arm.find("ORDER BY id FOR UPDATE").expect(
+            "Codex P2: the child-id selection feeding the restrict pre-scan must \
+             acquire FOR UPDATE (SELECT id ... ORDER BY id FOR UPDATE)",
+        );
+        let id_select_pos = destroy_arm
+            .find("SELECT id FROM")
+            .expect("the child-id selection query must be emitted");
+        let prescan_pos = destroy_arm
+            .find("for __row in & __ids")
+            .expect("the restrict pre-scan loop must be emitted");
+        assert!(
+            id_select_pos <= id_lock_pos,
+            "Codex P2: FOR UPDATE must belong to the child-id SELECT: {destroy_arm}"
+        );
+        assert!(
+            id_lock_pos < prescan_pos,
+            "Codex P2: the locked child-id SELECT must run BEFORE the restrict \
+             pre-scan EXISTS pass so no FK insert can slip between probe and hook: \
+             {destroy_arm}"
         );
     }
 
