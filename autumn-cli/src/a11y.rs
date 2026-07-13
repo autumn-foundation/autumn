@@ -246,7 +246,17 @@ impl Scan {
 }
 
 /// Walk `root` recursively and scan every `.rs` file for raw-`html!` markup.
-fn scan_project(root: &Path) -> Scan {
+///
+/// The scan ROOT read is fatal: a misspelled/unreadable/nonexistent path must
+/// fail hard, not silently yield zero findings — a zero-findings run prints
+/// PASS and would let a CI typo disable the whole audit. `std::fs::read_dir`
+/// surfaces all three failure modes (path absent, path is not a directory, or
+/// the directory is unreadable). A genuinely empty-but-readable directory reads
+/// fine here and legitimately produces an empty file list (zero findings, exit
+/// 0). Nested subdir read errors *during recursion* remain best-effort
+/// (swallowed by [`collect_rs_files`]), mirroring `autumn i18n check`.
+fn scan_project(root: &Path) -> std::io::Result<Scan> {
+    std::fs::read_dir(root)?;
     let mut scan = Scan::default();
     let mut files = Vec::new();
     collect_rs_files(root, &mut files);
@@ -263,7 +273,7 @@ fn scan_project(root: &Path) -> Scan {
         scan_source(&src, &rel, &mut scan);
         scan.files_scanned += 1;
     }
-    scan
+    Ok(scan)
 }
 
 fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -819,7 +829,17 @@ those primitives.";
 /// calls this with the resolved project path and `std::process::exit`s on it.
 #[must_use]
 pub fn run_in(root: &Path, opts: A11yVerifyOptions) -> i32 {
-    let report = Report::from_scan(scan_project(root));
+    // An unreadable scan root is a hard failure, not an empty (PASS) audit:
+    // surface the io error on stderr and exit non-zero so a CI path typo cannot
+    // silently disable the whole check.
+    let scan = match scan_project(root) {
+        Ok(scan) => scan,
+        Err(err) => {
+            eprintln!("error: cannot read scan path '{}': {err}", root.display());
+            return 1;
+        }
+    };
+    let report = Report::from_scan(scan);
     match opts.format {
         OutputFormat::Json => print_json(&report),
         OutputFormat::Text => print_text(&report, opts.strict),
@@ -1114,6 +1134,36 @@ mod tests {
         std::fs::write(dir.path().join("view.rs"), wrap(r#"button { "Ok" }"#)).unwrap();
         let opts = A11yVerifyOptions {
             format: OutputFormat::Json,
+            strict: false,
+        };
+        assert_eq!(run_in(dir.path(), opts), 0);
+    }
+
+    #[test]
+    fn nonexistent_scan_root_fails_hard() {
+        // A misspelled/unreadable scan root must be a hard non-zero failure, not
+        // a zero-findings PASS — otherwise a CI path typo silently disables the
+        // whole audit.
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("does-not-exist");
+        let opts = A11yVerifyOptions {
+            format: OutputFormat::Text,
+            strict: false,
+        };
+        assert_eq!(
+            run_in(&missing, opts),
+            1,
+            "an unreadable scan root must fail, not report an empty clean audit"
+        );
+    }
+
+    #[test]
+    fn empty_but_readable_root_passes() {
+        // A genuinely empty-but-readable directory has no findings and must still
+        // pass (exit 0) — distinct from the unreadable-root failure above.
+        let dir = tempfile::tempdir().unwrap();
+        let opts = A11yVerifyOptions {
+            format: OutputFormat::Text,
             strict: false,
         };
         assert_eq!(run_in(dir.path(), opts), 0);
