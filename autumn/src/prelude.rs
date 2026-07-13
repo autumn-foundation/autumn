@@ -42,7 +42,7 @@ pub use autumn_macros::{mail_previews, mailer, mailer_preview};
 /// Typed accessible UI primitives — accessible name enforced at compile time.
 /// See [`crate::a11y`] for the full API.
 #[cfg(feature = "maud")]
-pub use crate::a11y::{Button, ButtonType, Img, TextField};
+pub use crate::a11y::{Button, ButtonType, Img, Link, MenuItem, TextField};
 /// Resolve a logical static asset path to a fingerprinted URL in release builds.
 pub use crate::assets::asset_url;
 /// Render a `<script>` tag with SRI integrity for a named vendored JS dependency.

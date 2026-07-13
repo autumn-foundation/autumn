@@ -8,7 +8,7 @@
 //!
 #![cfg(feature = "maud")]
 
-use autumn_web::a11y::{Button, Img, TextField};
+use autumn_web::a11y::{Button, Img, Link, MenuItem, TextField};
 use autumn_web::html;
 use maud::Render;
 
@@ -71,6 +71,59 @@ fn text_field_aria_label_and_labelled_by_variants() {
         .render()
         .into_string();
     assert!(by.contains("aria-labelledby=\"search-heading\""), "{by}");
+}
+
+#[test]
+fn link_renders_href_and_visible_text() {
+    let markup = Link::new("/about", "About us").render().into_string();
+    assert!(markup.contains("href=\"/about\""), "{markup}");
+    assert!(markup.contains(">About us<"), "{markup}");
+    assert!(!markup.contains("aria-label"), "{markup}");
+}
+
+#[test]
+fn link_new_tab_sets_rel_noopener() {
+    let markup = Link::new("https://example.com", "Docs")
+        .new_tab()
+        .render()
+        .into_string();
+    assert!(markup.contains("target=\"_blank\""), "{markup}");
+    assert!(markup.contains("rel=\"noopener noreferrer\""), "{markup}");
+}
+
+#[test]
+fn icon_link_uses_aria_label() {
+    let glyph = html! { span aria-hidden="true" { "gh" } };
+    let markup = Link::icon("https://example.com", glyph, "GitHub")
+        .render()
+        .into_string();
+    assert!(markup.contains("href=\"https://example.com\""), "{markup}");
+    assert!(markup.contains("aria-label=\"GitHub\""), "{markup}");
+}
+
+#[test]
+fn menu_item_defaults_to_button_with_role() {
+    let markup = MenuItem::new("Settings").render().into_string();
+    assert!(markup.contains("role=\"menuitem\""), "{markup}");
+    assert!(markup.contains("type=\"button\""), "{markup}");
+    assert!(markup.contains(">Settings<"), "{markup}");
+    assert!(!markup.contains("aria-label"), "{markup}");
+}
+
+#[test]
+fn menu_item_with_href_renders_link() {
+    let markup = MenuItem::new("Home").href("/").render().into_string();
+    assert!(markup.contains("role=\"menuitem\""), "{markup}");
+    assert!(markup.contains("href=\"/\""), "{markup}");
+    assert!(markup.contains(">Home<"), "{markup}");
+}
+
+#[test]
+fn icon_menu_item_uses_aria_label() {
+    let cog = html! { span aria-hidden="true" { "*" } };
+    let markup = MenuItem::new("Settings").icon(cog).render().into_string();
+    assert!(markup.contains("role=\"menuitem\""), "{markup}");
+    assert!(markup.contains("aria-label=\"Settings\""), "{markup}");
 }
 
 #[test]
