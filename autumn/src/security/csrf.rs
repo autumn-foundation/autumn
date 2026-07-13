@@ -318,6 +318,19 @@ impl CsrfLayer {
             .push(path.into());
         self
     }
+
+    /// Override the effective body-token scan cap (`max_scan_bytes`).
+    ///
+    /// The primary bound stays the small `security.csrf.token_scan_bytes`
+    /// prefix (2 MiB by default). The router uses this to *clamp* that prefix to
+    /// `min(token_scan_bytes, upload.max_request_size_bytes)` so the CSRF scan
+    /// never buffers more than the global body limit when an operator lowers
+    /// that limit below the prefix cap. See the call site in `router.rs`.
+    #[must_use]
+    pub fn with_max_scan_bytes(mut self, max_scan_bytes: usize) -> Self {
+        Arc::make_mut(&mut self.settings).max_scan_bytes = max_scan_bytes;
+        self
+    }
 }
 
 impl<S> Layer<S> for CsrfLayer {
@@ -1436,6 +1449,36 @@ mod tests {
         assert_eq!(layer.settings.safe_methods.len(), 2);
         assert!(layer.settings.safe_methods.contains(&http::Method::GET));
         assert!(layer.settings.safe_methods.contains(&http::Method::POST));
+    }
+
+    #[test]
+    fn with_max_scan_bytes_clamps_effective_scan_cap_below_prefix() {
+        // Operator lowered the global body limit (64 KiB) below the CSRF prefix
+        // cap (2 MiB default). The router clamps the effective scan cap to
+        // min(token_scan_bytes, max_request_size_bytes) = 64 KiB, so the CSRF
+        // layer never buffers more than the global body limit.
+        let token_scan_bytes = default_csrf_config().token_scan_bytes; // 2 MiB
+        let max_request_size_bytes = 64 * 1024; // 64 KiB
+        let effective = token_scan_bytes.min(max_request_size_bytes);
+
+        let layer = CsrfLayer::from_config(&default_csrf_config()).with_max_scan_bytes(effective);
+
+        assert_eq!(layer.settings.max_scan_bytes, 64 * 1024);
+    }
+
+    #[test]
+    fn with_max_scan_bytes_preserves_small_prefix_in_normal_case() {
+        // Normal/high-upload case: a large max_request_size_bytes (32 MiB
+        // default) must NOT raise the effective cap — the small token_scan_bytes
+        // prefix (2 MiB) stays the primary bound via `min`.
+        let token_scan_bytes = default_csrf_config().token_scan_bytes; // 2 MiB
+        let max_request_size_bytes = 32 * 1024 * 1024; // 32 MiB
+        let effective = token_scan_bytes.min(max_request_size_bytes);
+
+        let layer = CsrfLayer::from_config(&default_csrf_config()).with_max_scan_bytes(effective);
+
+        assert_eq!(layer.settings.max_scan_bytes, token_scan_bytes);
+        assert_eq!(layer.settings.max_scan_bytes, 2 * 1024 * 1024);
     }
 
     #[test]

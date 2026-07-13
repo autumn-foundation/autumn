@@ -2178,7 +2178,22 @@ where
         // remainder through, so the cap comes from CSRF config — NOT from
         // `upload.max_request_size_bytes` (which would force whole uploads into
         // memory and defeat the streaming upload path).
-        let mut csrf_layer = crate::security::CsrfLayer::from_config(&config.security.csrf);
+        //
+        // Clamp the effective prefix to the global body limit: the CSRF layer
+        // must never buffer more than `upload.max_request_size_bytes`. In the
+        // normal/high-upload case the small `token_scan_bytes` prefix wins (the
+        // `min` keeps it at 2 MiB — it is *not* raised to the upload limit).
+        // Only when an operator deliberately lowers the global limit *below* the
+        // prefix cap does the upload limit clamp the scan down — the whole body
+        // is ≤ that limit anyway, so an early `_csrf` token is still in range,
+        // and anything larger is rejected downstream by `DefaultBodyLimit`.
+        let effective_scan_bytes = config
+            .security
+            .csrf
+            .token_scan_bytes
+            .min(config.security.upload.max_request_size_bytes);
+        let mut csrf_layer = crate::security::CsrfLayer::from_config(&config.security.csrf)
+            .with_max_scan_bytes(effective_scan_bytes);
         if let Some(keys) = signing_keys {
             csrf_layer = csrf_layer.with_signing_keys(keys);
         }
