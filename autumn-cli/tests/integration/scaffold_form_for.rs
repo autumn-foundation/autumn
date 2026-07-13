@@ -356,3 +356,75 @@ fn rescaffold_with_added_column_leaves_view_form_call_unchanged() {
         );
     }
 }
+
+// ── Issue #1236: zero-JS multipart file uploads ─────────────────────────
+
+/// A scaffold with a file-attachment column emits progressive-enhancement
+/// multipart upload handlers: a `multipart/form-data` form (via
+/// `FieldControl::File`), a `Multipart` body streamed straight to the blob
+/// store with `save_to_blob_store`, no hidden presign key, and no
+/// JavaScript/presign dead-end in the default path.
+#[test]
+fn scaffold_attachment_emits_zero_js_multipart_handlers() {
+    let (_tmp, project) = scaffold_project(
+        "attach-app",
+        "Photo",
+        &["caption:String", "image:Attachment"],
+    );
+    let routes = fs::read_to_string(project.join("src/routes/photos.rs")).unwrap();
+
+    // Attachment promoted to FieldControl::File (auto multipart enctype + plain
+    // file input, no `.exclude` + hand-rolled append, no hidden key input).
+    assert!(
+        routes.contains(".override_field(\"image\", autumn_web::form::FieldControl::File)"),
+        "{routes}"
+    );
+    assert!(!routes.contains(".exclude(\"image\")"), "{routes}");
+    assert!(
+        !routes.contains("input type=\"hidden\" name=\"image\""),
+        "{routes}"
+    );
+
+    // Handlers take a Multipart body and stream to the blob store.
+    assert!(
+        routes.contains("mut multipart: autumn_web::extract::Multipart"),
+        "{routes}"
+    );
+    assert!(
+        routes.contains(".save_to_blob_store(&*store, key).await?"),
+        "{routes}"
+    );
+    assert!(routes.contains("multipart.next_field().await?"), "{routes}");
+    // Default path does not CALL the presign helper (the header note may still
+    // mention it as an advanced opt-in), so match the invocation.
+    assert!(!routes.contains("complete_direct_upload(&"), "{routes}");
+
+    // Preserve-on-update and create-binding.
+    assert!(
+        routes.contains("new.image = image_blob.or(current.image);"),
+        "{routes}"
+    );
+    assert!(routes.contains("new.image = image_blob;"), "{routes}");
+
+    // storage + multipart auto-enabled on autumn-web (AC7).
+    let cargo = fs::read_to_string(project.join("Cargo.toml")).unwrap();
+    assert!(cargo.contains("storage"), "{cargo}");
+    assert!(cargo.contains("multipart"), "{cargo}");
+}
+
+/// Slow end-to-end proof (issue #1236, AC7): a freshly scaffolded resource
+/// with an attachment column must `cargo check --tests` with only the
+/// auto-enabled `storage` + `multipart` features — the multipart-streaming
+/// codegen has to actually compile, not just look right as a string.
+///
+/// Ignored by default; run with `cargo test -p autumn-cli -- --ignored`.
+#[test]
+#[ignore = "slow: cargo-checks a fresh project — run with `cargo test -p autumn-cli -- --ignored`"]
+fn generated_attachment_scaffold_cargo_checks() {
+    let (_tmp, project) = scaffold_project(
+        "attach-check",
+        "Photo",
+        &["caption:String", "image:Attachment"],
+    );
+    assert_project_cargo_checks(&project);
+}
