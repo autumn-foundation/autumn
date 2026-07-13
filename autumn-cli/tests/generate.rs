@@ -2743,6 +2743,56 @@ fn generate_scaffold_unique_attachment_field_is_skipped_in_smoke_test() {
     );
 }
 
+/// PR #1867 review (Finding 2): destroying the last attachment *model* must
+/// not strip `autumn-web/multipart` or `autumn-web/storage` from Cargo.toml
+/// when a hand-written route still uses those APIs — otherwise the project
+/// stops compiling. The `Revert::CargoAutumnWebFeature` bookkeeping alone
+/// would strip them (its `owner_dir` sibling check only sees the scaffold's
+/// own `src/models`), so `autumn_web_feature_markers` must retain them via a
+/// whole-project marker scan.
+#[test]
+fn destroy_attachment_scaffold_keeps_features_used_by_handwritten_route() {
+    let (_tmp, project) = fresh_project("destroy-attachment-features-app");
+
+    run_autumn(
+        &project,
+        &["generate", "scaffold", "Document", "file:Attachment"],
+    );
+
+    let cargo_before = fs::read_to_string(project.join("Cargo.toml")).unwrap();
+    assert!(
+        cargo_before.contains("\"multipart\"") && cargo_before.contains("\"storage\""),
+        "attachment scaffold must enable multipart+storage, got:\n{cargo_before}"
+    );
+
+    // A hand-written route that uses both the multipart extractor and the
+    // blob store directly — unrelated to the scaffold's generated files.
+    fs::write(
+        project.join("src/routes/manual.rs"),
+        "use autumn_web::extract::Multipart;\n\n\
+         pub async fn manual_upload(\n    \
+         mut multipart: Multipart,\n    \
+         store: autumn_web::storage::BlobStoreState,\n\
+         ) {\n    let _ = (&mut multipart, &store);\n}\n",
+    )
+    .unwrap();
+
+    run_autumn(
+        &project,
+        &["destroy", "scaffold", "Document", "file:Attachment"],
+    );
+
+    let cargo_after = fs::read_to_string(project.join("Cargo.toml")).unwrap();
+    assert!(
+        cargo_after.contains("\"multipart\""),
+        "multipart must be retained while a hand-written route uses the Multipart extractor, got:\n{cargo_after}"
+    );
+    assert!(
+        cargo_after.contains("\"storage\""),
+        "storage must be retained while a hand-written route references autumn_web::storage::, got:\n{cargo_after}"
+    );
+}
+
 #[test]
 fn generate_scaffold_without_unique_field_omits_unique_constraints() {
     // A scaffold with NO unique fields emits no UNIQUE_CONSTRAINTS const, but

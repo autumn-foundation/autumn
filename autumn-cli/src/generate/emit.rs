@@ -1063,6 +1063,21 @@ fn autumn_web_feature_markers(feature: &str) -> &'static [&'static str] {
         // the type (e.g. the template-shipped `tests/integration_test.rs`'s
         // "Add DB-backed tests with `TestDb`...") doesn't count as usage.
         "test-support" => &["TestDb::"],
+        // Attachment scaffolds (`generate scaffold ... --attachment`) enable
+        // both `multipart` and `storage`, but a hand-written route can also
+        // use these APIs directly. Destroying the last attachment model must
+        // not strip a feature such a route still needs (PR #1867 review).
+        //
+        // `extract::Multipart` matches both the fully-qualified extractor
+        // type (`autumn_web::extract::Multipart`) and a `use
+        // autumn_web::extract::Multipart;` import, without matching unrelated
+        // identifiers that merely contain `Multipart`.
+        "multipart" => &["extract::Multipart"],
+        // `autumn_web::storage::` covers the model's blob column type
+        // (`autumn_web::storage::Blob`) as well as route usage of the store
+        // (`autumn_web::storage::BlobStoreState`, `save_to_blob_store`
+        // call sites that reference the `autumn_web::storage::` path, etc.).
+        "storage" => &["autumn_web::storage::"],
         _ => &[],
     }
 }
@@ -2201,5 +2216,80 @@ mod tests {
             "src/mailers/ must be fully pruned once mod.rs and every file under it are gone, \
              just like every other now-empty generated directory"
         );
+    }
+
+    #[test]
+    fn multipart_and_storage_have_feature_markers() {
+        // Attachment scaffolds enable `autumn-web/multipart` and
+        // `autumn-web/storage`; both must carry markers so `autumn destroy`
+        // of the last attachment model can't strip a feature a hand-written
+        // route still uses (PR #1867 review).
+        let multipart = autumn_web_feature_markers("multipart");
+        assert!(
+            multipart.contains(&"extract::Multipart"),
+            "multipart marker must catch `autumn_web::extract::Multipart` usage, got {multipart:?}"
+        );
+
+        let storage = autumn_web_feature_markers("storage");
+        assert!(
+            storage.contains(&"autumn_web::storage::"),
+            "storage marker must catch `autumn_web::storage::` usage, got {storage:?}"
+        );
+    }
+
+    #[test]
+    fn multipart_and_storage_markers_retain_features_for_handwritten_routes() {
+        // A hand-written route using the multipart extractor and the blob
+        // store must keep those features alive even when the model/route the
+        // attachment scaffold generated is being destroyed (excluded).
+        let tmp = tempfile::TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("src/routes")).unwrap();
+        let handwritten = tmp.path().join("src/routes/manual.rs");
+        fs::write(
+            &handwritten,
+            "use autumn_web::extract::Multipart;\n\n\
+             async fn upload(mut mp: Multipart, store: autumn_web::storage::BlobStoreState) {}\n",
+        )
+        .unwrap();
+
+        // The scaffold's own generated files are being destroyed — excluded
+        // from the scan so they can't self-retain — but the hand-written
+        // route is not, so both features must stay needed.
+        let excluding = vec![tmp.path().join("src/models/photo.rs")];
+        let overrides = HashMap::new();
+        assert!(
+            autumn_web_feature_still_needed_elsewhere(
+                "multipart",
+                tmp.path(),
+                &excluding,
+                &overrides
+            ),
+            "multipart must be retained while a hand-written route uses the Multipart extractor"
+        );
+        assert!(
+            autumn_web_feature_still_needed_elsewhere(
+                "storage",
+                tmp.path(),
+                &excluding,
+                &overrides
+            ),
+            "storage must be retained while a hand-written route references autumn_web::storage::"
+        );
+
+        // With the hand-written route removed too, nothing references the
+        // features anymore — they become free to strip.
+        fs::remove_file(&handwritten).unwrap();
+        assert!(!autumn_web_feature_still_needed_elsewhere(
+            "multipart",
+            tmp.path(),
+            &excluding,
+            &overrides
+        ));
+        assert!(!autumn_web_feature_still_needed_elsewhere(
+            "storage",
+            tmp.path(),
+            &excluding,
+            &overrides
+        ));
     }
 }
