@@ -617,10 +617,7 @@ mod tests {
             path: path.to_owned(),
             handler: format!("{}_handler", path.trim_start_matches('/').replace('/', "_")),
             source,
-            middleware: vec![],
-            api_version: None,
-            status: None,
-            sunset_opt_out: None,
+            ..Default::default()
         }
     }
 

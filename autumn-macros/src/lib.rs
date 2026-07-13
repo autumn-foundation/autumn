@@ -36,6 +36,7 @@ mod one_off_tasks_macro;
 mod param_helpers;
 mod parse;
 mod paths_macro;
+mod public;
 mod repository;
 mod route;
 mod routes_macro;
@@ -649,6 +650,29 @@ pub fn one_off_tasks(input: TokenStream) -> TokenStream {
 #[proc_macro_attribute]
 pub fn secured(attr: TokenStream, item: TokenStream) -> TokenStream {
     secured::secured_macro(attr.into(), item.into()).into()
+}
+
+/// Declare a route handler as deliberately public (unauthenticated).
+///
+/// `#[public]` injects no runtime guard — it is a compile-time *marker* that
+/// records intent. The route macros surface it as `ApiDoc::public`, which the
+/// build-time security classifier (`autumn routes audit`) uses to distinguish
+/// a route that is *meant* to be open from one whose auth posture was simply
+/// never declared. Applying it makes an otherwise-unclassified route pass the
+/// audit gate, exactly like adding a [`#[secured]`](macro@secured) guard does.
+///
+/// # Example
+///
+/// ```ignore
+/// use autumn_web::prelude::*;
+///
+/// #[get("/health")]
+/// #[public]
+/// async fn health() -> &'static str { "ok" }
+/// ```
+#[proc_macro_attribute]
+pub fn public(attr: TokenStream, item: TokenStream) -> TokenStream {
+    public::public_macro(attr.into(), item.into()).into()
 }
 
 /// Require fresh ("step-up") authentication before a route handler runs.

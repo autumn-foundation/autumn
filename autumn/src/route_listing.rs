@@ -11,14 +11,75 @@ use crate::route::Route;
 
 /// Where a route was registered: by the user application, by a named plugin,
 /// or by the framework itself (probes, actuator, htmx assets, dev reload).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum RouteSource {
     /// Registered directly by the user application.
+    #[default]
     User,
     /// Registered by a named autumn plugin (e.g. `"admin"` for autumn-admin-plugin).
     Plugin(String),
     /// Registered by the framework (probes, actuator, htmx assets, dev reload).
     Framework,
+}
+
+/// Security posture of a route.
+///
+/// Derived at build time from the handler's macro-expanded
+/// [`ApiDoc`](crate::openapi::ApiDoc) and its [`RouteSource`]. Emitted alongside
+/// every route in the `autumn routes audit` manifest so route authentication
+/// coverage can be gated in CI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RouteClassification {
+    /// Owned by the framework (probes, actuator, htmx assets, docs). Exempt
+    /// from the audit gate — these are pre-attributed and never require an
+    /// explicit `#[secured]`/`#[public]` declaration.
+    Framework,
+    /// Guarded by authentication (`#[secured]`) and/or dynamic policy
+    /// authorization (`#[authorize]`).
+    Gated,
+    /// Explicitly declared unauthenticated via `#[public]`.
+    Public,
+    /// No security posture could be proven for this route. This is the state
+    /// the audit gate fails on.
+    #[default]
+    Unclassified,
+}
+
+impl RouteClassification {
+    /// Stable lowercase tag used in serialized manifests.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Framework => "framework",
+            Self::Gated => "gated",
+            Self::Public => "public",
+            Self::Unclassified => "unclassified",
+        }
+    }
+}
+
+impl std::fmt::Display for RouteClassification {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl Serialize for RouteClassification {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for RouteClassification {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        Ok(match s.as_str() {
+            "framework" => Self::Framework,
+            "gated" => Self::Gated,
+            "public" => Self::Public,
+            _ => Self::Unclassified,
+        })
+    }
 }
 
 impl std::fmt::Display for RouteSource {
@@ -51,7 +112,7 @@ impl<'de> Deserialize<'de> for RouteSource {
 }
 
 /// Metadata for a single mounted route, suitable for display and JSON export.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RouteInfo {
     /// HTTP method (`GET`, `POST`, `PUT`, `DELETE`, `PATCH`, `WS`, etc.).
     pub method: String,
@@ -73,6 +134,99 @@ pub struct RouteInfo {
     /// Whether this route opts out of sunset 410 Gone response
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sunset_opt_out: Option<bool>,
+    /// Build-time security classification derived from the handler's auth
+    /// posture and registration source. Consumed by `autumn routes audit`.
+    #[serde(default)]
+    pub classification: RouteClassification,
+    /// Roles required by `#[secured("role")]`, carried for `Gated` routes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub roles: Vec<String>,
+    /// Scopes required by `#[secured(scopes = [...])]`, carried for `Gated` routes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scopes: Vec<String>,
+    /// Whether the route is guarded by dynamic policy authorization
+    /// (`#[authorize]`), carried for `Gated` routes.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub policy: bool,
+    /// Module path of the handler (from `module_path!()`), used to name a
+    /// route in audit diagnostics. `None` for routes without a known module.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub module: Option<String>,
+}
+
+/// `skip_serializing_if` helper: elide `false` booleans from JSON output.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+const fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+impl RouteInfo {
+    /// Construct a framework-owned `GET` route entry. Framework routes are
+    /// pre-classified and exempt from the audit gate.
+    fn framework_get(path: String, handler: &str) -> Self {
+        Self {
+            method: "GET".to_owned(),
+            path,
+            handler: handler.to_owned(),
+            source: RouteSource::Framework,
+            classification: RouteClassification::Framework,
+            ..Self::default()
+        }
+    }
+}
+
+/// Derive a route's security classification (and carried posture) from its
+/// registration source and macro-expanded [`ApiDoc`](crate::openapi::ApiDoc).
+///
+/// Precedence: framework routes are always [`RouteClassification::Framework`];
+/// otherwise a route guarded by `#[secured]` or `#[authorize]` is
+/// [`RouteClassification::Gated`] (carrying its roles/scopes/policy); an
+/// explicit `#[public]` is [`RouteClassification::Public`]; anything left is
+/// [`RouteClassification::Unclassified`].
+fn classify(
+    source: &RouteSource,
+    api_doc: &crate::openapi::ApiDoc,
+) -> (RouteClassification, Vec<String>, Vec<String>, bool) {
+    if matches!(source, RouteSource::Framework) {
+        return (
+            RouteClassification::Framework,
+            Vec::new(),
+            Vec::new(),
+            false,
+        );
+    }
+    if api_doc.secured || api_doc.has_policy {
+        let roles = api_doc
+            .required_roles
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect();
+        let scopes = api_doc
+            .required_scopes
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect();
+        return (
+            RouteClassification::Gated,
+            roles,
+            scopes,
+            api_doc.has_policy,
+        );
+    }
+    if api_doc.public {
+        return (RouteClassification::Public, Vec::new(), Vec::new(), false);
+    }
+    (
+        RouteClassification::Unclassified,
+        Vec::new(),
+        Vec::new(),
+        false,
+    )
+}
+
+/// The handler's module path, when the route macros captured one.
+fn module_of(api_doc: &crate::openapi::ApiDoc) -> Option<String> {
+    (!api_doc.module_path.is_empty()).then(|| api_doc.module_path.to_owned())
 }
 
 /// Helper type alias representing version name, status string, and sunset opt-out flag.
@@ -139,6 +293,7 @@ pub fn collect_route_infos(
         let source = route_sources.get(i).cloned().unwrap_or(RouteSource::User);
         let (api_version, status, sunset_opt_out) =
             resolve_status(route.name, route.api_version, route.sunset_opt_out)?;
+        let (classification, roles, scopes, policy) = classify(&source, &route.api_doc);
         infos.push(RouteInfo {
             method: route.method.to_string(),
             path: route.path.to_owned(),
@@ -148,6 +303,11 @@ pub fn collect_route_infos(
             api_version,
             status,
             sunset_opt_out,
+            classification,
+            roles,
+            scopes,
+            policy,
+            module: module_of(&route.api_doc),
         });
     }
 
@@ -156,6 +316,7 @@ pub fn collect_route_infos(
             let full_path = join_scope_path(&group.prefix, route.path);
             let (api_version, status, sunset_opt_out) =
                 resolve_status(route.name, route.api_version, route.sunset_opt_out)?;
+            let (classification, roles, scopes, policy) = classify(&group.source, &route.api_doc);
             infos.push(RouteInfo {
                 method: route.method.to_string(),
                 path: full_path,
@@ -165,6 +326,11 @@ pub fn collect_route_infos(
                 api_version,
                 status,
                 sunset_opt_out,
+                classification,
+                roles,
+                scopes,
+                policy,
+                module: module_of(&route.api_doc),
             });
         }
     }
@@ -189,16 +355,7 @@ pub(crate) fn append_framework_routes(
         (config.health.path.as_str(), "health"),
     ] {
         if probe_paths.insert(path) {
-            infos.push(RouteInfo {
-                method: "GET".to_owned(),
-                path: path.to_owned(),
-                handler: name.to_owned(),
-                source: RouteSource::Framework,
-                middleware: Vec::new(),
-                api_version: None,
-                status: None,
-                sunset_opt_out: None,
-            });
+            infos.push(RouteInfo::framework_get(path.to_owned(), name));
         }
     }
 
@@ -207,60 +364,27 @@ pub(crate) fn append_framework_routes(
         config.actuator.sensitive,
         config.actuator.prometheus,
     ) {
-        infos.push(RouteInfo {
-            method: "GET".to_owned(),
-            path,
-            handler: "actuator".to_owned(),
-            source: RouteSource::Framework,
-            middleware: Vec::new(),
-            api_version: None,
-            status: None,
-            sunset_opt_out: None,
-        });
+        infos.push(RouteInfo::framework_get(path, "actuator"));
     }
 
     #[cfg(feature = "htmx")]
     {
-        infos.push(RouteInfo {
-            method: "GET".to_owned(),
-            path: crate::htmx::HTMX_JS_PATH.to_owned(),
-            handler: "htmx".to_owned(),
-            source: RouteSource::Framework,
-            middleware: Vec::new(),
-            api_version: None,
-            status: None,
-            sunset_opt_out: None,
-        });
-        infos.push(RouteInfo {
-            method: "GET".to_owned(),
-            path: crate::htmx::HTMX_CSRF_JS_PATH.to_owned(),
-            handler: "htmx_csrf".to_owned(),
-            source: RouteSource::Framework,
-            middleware: Vec::new(),
-            api_version: None,
-            status: None,
-            sunset_opt_out: None,
-        });
-        infos.push(RouteInfo {
-            method: "GET".to_owned(),
-            path: crate::htmx::IDIOMORPH_JS_PATH.to_owned(),
-            handler: "idiomorph".to_owned(),
-            source: RouteSource::Framework,
-            middleware: Vec::new(),
-            api_version: None,
-            status: None,
-            sunset_opt_out: None,
-        });
-        infos.push(RouteInfo {
-            method: "GET".to_owned(),
-            path: crate::htmx::HTMX_SSE_JS_PATH.to_owned(),
-            handler: "htmx_sse".to_owned(),
-            source: RouteSource::Framework,
-            middleware: Vec::new(),
-            api_version: None,
-            status: None,
-            sunset_opt_out: None,
-        });
+        infos.push(RouteInfo::framework_get(
+            crate::htmx::HTMX_JS_PATH.to_owned(),
+            "htmx",
+        ));
+        infos.push(RouteInfo::framework_get(
+            crate::htmx::HTMX_CSRF_JS_PATH.to_owned(),
+            "htmx_csrf",
+        ));
+        infos.push(RouteInfo::framework_get(
+            crate::htmx::IDIOMORPH_JS_PATH.to_owned(),
+            "idiomorph",
+        ));
+        infos.push(RouteInfo::framework_get(
+            crate::htmx::HTMX_SSE_JS_PATH.to_owned(),
+            "htmx_sse",
+        ));
     }
 
     #[cfg(feature = "mail")]
@@ -279,16 +403,7 @@ pub(crate) fn append_framework_routes(
                 "mail_preview_template",
             ),
         ] {
-            infos.push(RouteInfo {
-                method: "GET".to_owned(),
-                path: path.to_owned(),
-                handler: handler.to_owned(),
-                source: RouteSource::Framework,
-                middleware: Vec::new(),
-                api_version: None,
-                status: None,
-                sunset_opt_out: None,
-            });
+            infos.push(RouteInfo::framework_get(path.to_owned(), handler));
         }
     }
 
@@ -300,16 +415,7 @@ pub(crate) fn append_framework_routes(
             (crate::stories::STORIES_PATH, "story_gallery_index"),
             ("/_stories/{slug}", "story_gallery_story"),
         ] {
-            infos.push(RouteInfo {
-                method: "GET".to_owned(),
-                path: path.to_owned(),
-                handler: handler.to_owned(),
-                source: RouteSource::Framework,
-                middleware: Vec::new(),
-                api_version: None,
-                status: None,
-                sunset_opt_out: None,
-            });
+            infos.push(RouteInfo::framework_get(path.to_owned(), handler));
         }
     }
 
@@ -321,30 +427,15 @@ pub(crate) fn append_framework_routes(
             (inspector_path.as_str(), "inspector_index"),
             (inspector_detail_path.as_str(), "inspector_detail"),
         ] {
-            infos.push(RouteInfo {
-                method: "GET".to_owned(),
-                path: path.to_owned(),
-                handler: handler.to_owned(),
-                source: RouteSource::Framework,
-                middleware: Vec::new(),
-                api_version: None,
-                status: None,
-                sunset_opt_out: None,
-            });
+            infos.push(RouteInfo::framework_get(path.to_owned(), handler));
         }
     }
 
     // Static file serving is unconditionally mounted at /static.
-    infos.push(RouteInfo {
-        method: "GET".to_owned(),
-        path: "/static/{*path}".to_owned(),
-        handler: "static_files".to_owned(),
-        source: RouteSource::Framework,
-        middleware: Vec::new(),
-        api_version: None,
-        status: None,
-        sunset_opt_out: None,
-    });
+    infos.push(RouteInfo::framework_get(
+        "/static/{*path}".to_owned(),
+        "static_files",
+    ));
 }
 
 /// Append `OpenAPI` documentation routes (`/v3/api-docs`, `/swagger-ui`).
@@ -355,27 +446,12 @@ pub(crate) fn append_openapi_routes(
     infos: &mut Vec<RouteInfo>,
     openapi: &crate::openapi::OpenApiConfig,
 ) {
-    infos.push(RouteInfo {
-        method: "GET".to_owned(),
-        path: openapi.openapi_json_path.clone(),
-        handler: "openapi_json".to_owned(),
-        source: RouteSource::Framework,
-        middleware: Vec::new(),
-        api_version: None,
-        status: None,
-        sunset_opt_out: None,
-    });
+    infos.push(RouteInfo::framework_get(
+        openapi.openapi_json_path.clone(),
+        "openapi_json",
+    ));
     if let Some(ui_path) = &openapi.swagger_ui_path {
-        infos.push(RouteInfo {
-            method: "GET".to_owned(),
-            path: ui_path.clone(),
-            handler: "swagger_ui".to_owned(),
-            source: RouteSource::Framework,
-            middleware: Vec::new(),
-            api_version: None,
-            status: None,
-            sunset_opt_out: None,
-        });
+        infos.push(RouteInfo::framework_get(ui_path.clone(), "swagger_ui"));
     }
 }
 
@@ -392,16 +468,7 @@ pub(crate) fn append_dev_reload_routes(infos: &mut Vec<RouteInfo>) {
                 "dev_live_reload_js",
             ),
         ] {
-            infos.push(RouteInfo {
-                method: "GET".to_owned(),
-                path: path.to_owned(),
-                handler: handler.to_owned(),
-                source: RouteSource::Framework,
-                middleware: Vec::new(),
-                api_version: None,
-                status: None,
-                sunset_opt_out: None,
-            });
+            infos.push(RouteInfo::framework_get(path.to_owned(), handler));
         }
     }
 }
@@ -447,6 +514,15 @@ mod tests {
     }
 
     fn make_route(method: Method, path: &'static str, name: &'static str) -> Route {
+        make_route_with(method, path, name, dummy_api_doc())
+    }
+
+    fn make_route_with(
+        method: Method,
+        path: &'static str,
+        name: &'static str,
+        api_doc: crate::openapi::ApiDoc,
+    ) -> Route {
         async fn handler() -> &'static str {
             "ok"
         }
@@ -455,7 +531,7 @@ mod tests {
             path,
             handler: get(handler),
             name,
-            api_doc: dummy_api_doc(),
+            api_doc,
             repository: None,
             idempotency: crate::route::RouteIdempotency::Direct,
             timeout: crate::route::RouteTimeout::Inherit,
@@ -586,6 +662,123 @@ mod tests {
         assert_eq!(infos[0].source, RouteSource::User);
     }
 
+    // ── classification (#1604) ──────────────────────────────────────────────
+
+    #[test]
+    fn classify_framework_source_is_framework() {
+        let (c, roles, scopes, policy) = classify(&RouteSource::Framework, &dummy_api_doc());
+        assert_eq!(c, RouteClassification::Framework);
+        assert!(roles.is_empty() && scopes.is_empty() && !policy);
+    }
+
+    #[test]
+    fn classify_secured_is_gated_and_carries_posture() {
+        let api_doc = crate::openapi::ApiDoc {
+            secured: true,
+            required_roles: &["admin"],
+            required_scopes: &["posts:write"],
+            ..dummy_api_doc()
+        };
+        let (c, roles, scopes, policy) = classify(&RouteSource::User, &api_doc);
+        assert_eq!(c, RouteClassification::Gated);
+        assert_eq!(roles, vec!["admin"]);
+        assert_eq!(scopes, vec!["posts:write"]);
+        assert!(!policy);
+    }
+
+    #[test]
+    fn classify_policy_is_gated_and_carries_policy_flag() {
+        let api_doc = crate::openapi::ApiDoc {
+            has_policy: true,
+            ..dummy_api_doc()
+        };
+        let (c, _roles, _scopes, policy) = classify(&RouteSource::User, &api_doc);
+        assert_eq!(c, RouteClassification::Gated);
+        assert!(policy);
+    }
+
+    #[test]
+    fn classify_public_is_public() {
+        let api_doc = crate::openapi::ApiDoc {
+            public: true,
+            ..dummy_api_doc()
+        };
+        let (c, _, _, _) = classify(&RouteSource::User, &api_doc);
+        assert_eq!(c, RouteClassification::Public);
+    }
+
+    #[test]
+    fn classify_unannotated_is_unclassified() {
+        let (c, _, _, _) = classify(&RouteSource::User, &dummy_api_doc());
+        assert_eq!(c, RouteClassification::Unclassified);
+    }
+
+    /// Keystone falsifiability check (#1604) at the library level: an
+    /// unannotated mutating handler classifies as `Unclassified` (the audit
+    /// gate's failure state), and adding *either* a `#[secured]` guard or a
+    /// `#[public]` marker flips it to a passing classification.
+    #[test]
+    fn unclassified_route_turns_green_when_guarded_or_public() {
+        // Red: no auth posture declared.
+        let route = make_route_with(Method::POST, "/widgets", "create_widget", dummy_api_doc());
+        let infos = collect_route_infos(&[route], &[RouteSource::User], &[], &[]).unwrap();
+        assert_eq!(infos[0].classification, RouteClassification::Unclassified);
+
+        // Green via #[secured]: carries the declared role.
+        let secured_doc = crate::openapi::ApiDoc {
+            secured: true,
+            required_roles: &["admin"],
+            ..dummy_api_doc()
+        };
+        let route = make_route_with(Method::POST, "/widgets", "create_widget", secured_doc);
+        let infos = collect_route_infos(&[route], &[RouteSource::User], &[], &[]).unwrap();
+        assert_eq!(infos[0].classification, RouteClassification::Gated);
+        assert_eq!(infos[0].roles, vec!["admin"]);
+
+        // Green via #[public].
+        let public_doc = crate::openapi::ApiDoc {
+            public: true,
+            ..dummy_api_doc()
+        };
+        let route = make_route_with(Method::POST, "/widgets", "create_widget", public_doc);
+        let infos = collect_route_infos(&[route], &[RouteSource::User], &[], &[]).unwrap();
+        assert_eq!(infos[0].classification, RouteClassification::Public);
+    }
+
+    #[test]
+    fn collect_carries_handler_module_when_present() {
+        let api_doc = crate::openapi::ApiDoc {
+            public: true,
+            module_path: "myapp::widgets",
+            ..dummy_api_doc()
+        };
+        let route = make_route_with(Method::GET, "/widgets", "list_widgets", api_doc);
+        let infos = collect_route_infos(&[route], &[RouteSource::User], &[], &[]).unwrap();
+        assert_eq!(infos[0].module.as_deref(), Some("myapp::widgets"));
+    }
+
+    #[test]
+    fn framework_get_helper_is_exempt() {
+        let info = RouteInfo::framework_get("/actuator/health".to_owned(), "actuator");
+        assert_eq!(info.classification, RouteClassification::Framework);
+        assert_eq!(info.source, RouteSource::Framework);
+        assert_eq!(info.method, "GET");
+    }
+
+    #[test]
+    fn route_classification_serializes_to_lowercase_tag() {
+        assert_eq!(
+            serde_json::to_string(&RouteClassification::Gated).unwrap(),
+            "\"gated\""
+        );
+        assert_eq!(
+            serde_json::to_string(&RouteClassification::Unclassified).unwrap(),
+            "\"unclassified\""
+        );
+        let decoded: RouteClassification = serde_json::from_str("\"public\"").unwrap();
+        assert_eq!(decoded, RouteClassification::Public);
+    }
+
     // ── sort_route_infos ───────────────────────────────────────────────────
 
     #[test]
@@ -600,6 +793,7 @@ mod tests {
                 api_version: None,
                 status: None,
                 sunset_opt_out: None,
+                ..Default::default()
             },
             RouteInfo {
                 method: "GET".to_owned(),
@@ -610,6 +804,7 @@ mod tests {
                 api_version: None,
                 status: None,
                 sunset_opt_out: None,
+                ..Default::default()
             },
             RouteInfo {
                 method: "GET".to_owned(),
@@ -620,6 +815,7 @@ mod tests {
                 api_version: None,
                 status: None,
                 sunset_opt_out: None,
+                ..Default::default()
             },
         ];
         sort_route_infos(&mut infos);
@@ -642,6 +838,7 @@ mod tests {
                 api_version: None,
                 status: None,
                 sunset_opt_out: None,
+                ..Default::default()
             },
             RouteInfo {
                 method: "GET".to_owned(),
@@ -652,6 +849,7 @@ mod tests {
                 api_version: None,
                 status: None,
                 sunset_opt_out: None,
+                ..Default::default()
             },
         ];
         sort_route_infos(&mut infos);
@@ -836,6 +1034,7 @@ mod tests {
             api_version: None,
             status: None,
             sunset_opt_out: None,
+            ..Default::default()
         };
         let json = serde_json::to_string(&info).unwrap();
         let decoded: RouteInfo = serde_json::from_str(&json).unwrap();

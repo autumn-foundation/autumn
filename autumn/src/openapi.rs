@@ -77,8 +77,8 @@ use serde::{Deserialize, Serialize};
 /// any [`#[api_doc(...)]`](crate::api_doc) overrides.
 #[derive(Clone, Debug, Default)]
 // A flat, generated metadata descriptor; the independent boolean flags
-// (hidden, secured, sunset_opt_out, has_policy, mcp_tool, mcp_exclude) each
-// model a distinct, orthogonal route property, so grouping them into a
+// (hidden, secured, sunset_opt_out, has_policy, public, mcp_tool, mcp_exclude)
+// each model a distinct, orthogonal route property, so grouping them into a
 // sub-struct would obscure rather than clarify.
 #[allow(clippy::struct_excessive_bools)]
 pub struct ApiDoc {
@@ -126,6 +126,17 @@ pub struct ApiDoc {
     pub sunset_opt_out: bool,
     /// Whether this route uses dynamic policy authorization.
     pub has_policy: bool,
+    /// True when the handler is explicitly declared public via `#[public]`.
+    ///
+    /// Populated by the route macros from the `#[public]` marker. Used by the
+    /// route-listing security classifier (`autumn routes audit`) to
+    /// distinguish a *deliberately* open route from one whose auth posture was
+    /// simply never declared.
+    pub public: bool,
+    /// Module path of the handler (`module_path!()` captured at the handler's
+    /// definition site), used to name a route in security-audit diagnostics.
+    /// Empty for routes constructed without the route macros.
+    pub module_path: &'static str,
     /// True when the endpoint opts in to MCP tool exposure via
     /// `#[api_doc(mcp)]`. Opt-in is per-endpoint and never implicit.
     pub mcp_tool: bool,
