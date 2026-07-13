@@ -29,11 +29,27 @@
 //! explicitly demoted to `q=0.1` while `*/*;q=1` lifts JSON to `q=1` — rather
 //! than being fooled by the bare presence of `text/html`.
 //!
+//! ## `q=0` exclusions and `406 Not Acceptable`
+//!
+//! A media range listed with `q=0` means "**not acceptable**" (RFC 7231
+//! §5.3.1), not merely "less preferred". A format whose effective q is `0`
+//! (because it, or the `*/*` it would inherit from, was explicitly demoted to
+//! `q=0`) is *forbidden*: it is never served, not via the wildcard and not via
+//! the configured default. So `Accept: text/html;q=0, */*;q=1` serves **JSON**
+//! (HTML is forbidden; `*/*` still covers JSON), and `application/json;q=0`
+//! serves **HTML** even under `default_format(Format::Json)` (the default may
+//! not resurrect a forbidden format). When *both* HTML and JSON are forbidden
+//! (e.g. `text/html;q=0, application/json;q=0`, or a bare `*/*;q=0`) the
+//! responder answers **`406 Not Acceptable`** with a short plain-text body.
+//! Merely *unlisted* types are not exclusions — an `Accept` naming only, say,
+//! `application/xml` leaves both HTML and JSON unmentioned and falls back to the
+//! default, never a 406.
+//!
 //! When the client expresses no concrete preference — a missing/empty `Accept`,
 //! a bare `*/*`, or a wildcard-only tie where neither side is named directly —
 //! the default is [`Format::Html`] (browser-first); override it with
 //! [`Negotiate::default_format`]. Responses carry `Vary: Accept` so shared
-//! caches key the two representations separately.
+//! caches key the two representations separately — including the `406` arm.
 
 use std::convert::Infallible;
 
@@ -76,45 +92,115 @@ impl Negotiate {
 
     /// The resolved representation, chosen by *effective* q-value.
     ///
+    /// A convenience view over [`Negotiate::resolve`] that collapses the
+    /// not-acceptable case onto the configured `default`: it answers the
+    /// question "which representation would be served if one *must* be" and so
+    /// cannot express a `406`. Prefer [`Negotiate::respond`] for the full
+    /// behaviour — only it emits `406 Not Acceptable` when both formats are
+    /// forbidden.
+    ///
     /// Each candidate's effective quality folds in the `*/*` wildcard —
     /// `html.or(wildcard)` for HTML and `json.or(wildcard)` for JSON — so a
     /// high-q wildcard can outrank an explicitly demoted concrete type (RFC 7231
-    /// content negotiation). The higher effective q wins; on a tie the earlier
+    /// content negotiation). A format whose effective q is `0` is forbidden and
+    /// never chosen. The higher positive effective q wins; on a tie the earlier
     /// list entry wins. When neither side is named directly (both effective
     /// values come from the same `*/*` entry, or there is no `Accept` at all)
     /// there is no real preference, so the configured `default` applies.
     #[must_use]
     pub fn format(&self) -> Format {
+        match self.resolve() {
+            Resolution::Html => Format::Html,
+            Resolution::Json => Format::Json,
+            // Both formats are forbidden; there is no acceptable representation.
+            // Collapse onto the default for this lossy view — `respond` emits a
+            // real `406` for this case instead.
+            Resolution::NotAcceptable => self.default,
+        }
+    }
+
+    /// Resolve the request's `Accept` header into a concrete decision, honouring
+    /// `q=0` exclusions and reporting [`Resolution::NotAcceptable`] when every
+    /// format the handler can produce has been explicitly forbidden.
+    ///
+    /// For each format `F` in {HTML, JSON} the *effective* quality `q_F` is `F`'s
+    /// own explicit max-q if `F` was listed at all (**including `q=0`**), else
+    /// the `*/*` wildcard's explicit max-q if `*/*` was listed (including `q=0`),
+    /// else `None` (unmentioned). Then:
+    ///
+    /// * `q_F == Some(0.0)` → `F` is **forbidden** (never served — not via the
+    ///   wildcard, not via the default).
+    /// * Among non-forbidden formats, one with `q_F == Some(>0)` is a *positive
+    ///   candidate*; the higher positive q wins, ties broken by earlier list
+    ///   index. A tie at the *same* index means both derive from one `*/*` entry
+    ///   (no concrete preference) → the `default`, restricted to non-forbidden
+    ///   formats.
+    /// * If neither is positive but at least one non-forbidden format is
+    ///   unmentioned → the `default`, falling back to the other non-forbidden
+    ///   format if the default itself is forbidden.
+    /// * If **both** formats are forbidden → [`Resolution::NotAcceptable`].
+    fn resolve(&self) -> Resolution {
         let html_eff = self.qualities.html.or(self.qualities.wildcard);
         let json_eff = self.qualities.json.or(self.qualities.wildcard);
 
-        match (html_eff, json_eff) {
+        let html_forbidden = matches!(html_eff, Some((q, _)) if q <= 0.0);
+        let json_forbidden = matches!(json_eff, Some((q, _)) if q <= 0.0);
+
+        // No representation is acceptable to the client.
+        if html_forbidden && json_forbidden {
+            return Resolution::NotAcceptable;
+        }
+
+        // Positive candidates: listed (directly or via `*/*`) with q > 0.
+        let html_pos = html_eff.filter(|&(q, _)| q > 0.0);
+        let json_pos = json_eff.filter(|&(q, _)| q > 0.0);
+
+        match (html_pos, json_pos) {
             (Some((hq, hidx)), Some((jq, jidx))) => {
                 if (hq - jq).abs() < f32::EPSILON {
-                    // Equal effective q: the earlier list entry wins. Equal
-                    // index means both sides resolved to the *same* `*/*` entry,
-                    // i.e. no concrete preference — fall back to the default.
+                    // Equal effective q: earlier list entry wins. Equal index
+                    // means both sides resolved to the *same* `*/*` entry, i.e.
+                    // no concrete preference — fall back to the default.
                     match hidx.cmp(&jidx) {
-                        std::cmp::Ordering::Less => Format::Html,
-                        std::cmp::Ordering::Greater => Format::Json,
-                        std::cmp::Ordering::Equal => self.default,
+                        std::cmp::Ordering::Less => Resolution::Html,
+                        std::cmp::Ordering::Greater => Resolution::Json,
+                        std::cmp::Ordering::Equal => {
+                            self.default_resolution(html_forbidden, json_forbidden)
+                        }
                     }
                 } else if hq > jq {
-                    Format::Html
+                    Resolution::Html
                 } else {
-                    Format::Json
+                    Resolution::Json
                 }
             }
-            (Some(_), None) => Format::Html,
-            (None, Some(_)) => Format::Json,
-            (None, None) => self.default,
+            // The other side is forbidden or unmentioned; the positive one wins.
+            (Some(_), None) => Resolution::Html,
+            (None, Some(_)) => Resolution::Json,
+            // Neither is a positive candidate, but they are not both forbidden,
+            // so at least one is non-forbidden and unmentioned: use the default.
+            (None, None) => self.default_resolution(html_forbidden, json_forbidden),
+        }
+    }
+
+    /// The configured `default` as a [`Resolution`], but never a forbidden
+    /// format: if the default itself is forbidden, serve the other side (which
+    /// callers guarantee is non-forbidden in every context this is reached).
+    const fn default_resolution(&self, html_forbidden: bool, json_forbidden: bool) -> Resolution {
+        match self.default {
+            Format::Html if html_forbidden => Resolution::Json,
+            Format::Html => Resolution::Html,
+            Format::Json if json_forbidden => Resolution::Html,
+            Format::Json => Resolution::Json,
         }
     }
 
     /// Serve `html` to browser clients and `json` to API clients.
     ///
     /// The `html` closure runs only when HTML is the chosen representation, so
-    /// the markup is never rendered for an API response.
+    /// the markup is never rendered for an API response. When the client has
+    /// forbidden every representation the handler can produce (via `q=0`), the
+    /// response is `406 Not Acceptable` and neither branch runs.
     #[must_use]
     pub fn respond<F, J>(self, html: F, json: J) -> Negotiated<F, J>
     where
@@ -122,11 +208,26 @@ impl Negotiate {
         J: serde::Serialize,
     {
         Negotiated {
-            format: self.format(),
+            resolution: self.resolve(),
             html,
             json,
         }
     }
+}
+
+/// A resolved content-negotiation decision for the [`Negotiate`] responder.
+///
+/// Unlike [`Format`], this can express that the client forbade every
+/// representation the handler can produce, which the responder answers with
+/// `406 Not Acceptable`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Resolution {
+    /// Serve the HTML representation.
+    Html,
+    /// Serve the JSON representation.
+    Json,
+    /// Every producible format was forbidden (`q=0`) — answer `406`.
+    NotAcceptable,
 }
 
 impl<S> FromRequestParts<S> for Negotiate
@@ -146,9 +247,10 @@ where
 /// The response produced by [`Negotiate::respond`].
 ///
 /// Renders the HTML closure or serializes the JSON value depending on the
-/// negotiated [`Format`], and always appends `Vary: Accept`.
+/// negotiated [`Resolution`], answers `406 Not Acceptable` when the client
+/// forbade every producible representation, and always appends `Vary: Accept`.
 pub struct Negotiated<F, J> {
-    format: Format,
+    resolution: Resolution,
     html: F,
     json: J,
 }
@@ -159,11 +261,18 @@ where
     J: serde::Serialize,
 {
     fn into_response(self) -> Response {
-        let mut response = match self.format {
-            Format::Html => (self.html)().into_response(),
-            Format::Json => axum::Json(self.json).into_response(),
+        let mut response = match self.resolution {
+            Resolution::Html => (self.html)().into_response(),
+            Resolution::Json => axum::Json(self.json).into_response(),
+            Resolution::NotAcceptable => (
+                http::StatusCode::NOT_ACCEPTABLE,
+                "406 Not Acceptable: no acceptable representation for this resource",
+            )
+                .into_response(),
         };
-        // Append (never insert) so any existing Vary values are preserved.
+        // Append (never insert) so any existing Vary values are preserved. This
+        // is done on every arm, including the `406`, so shared caches still key
+        // the negotiated representations separately.
         response
             .headers_mut()
             .append(VARY, HeaderValue::from_static("Accept"));
@@ -242,5 +351,101 @@ mod tests {
             negotiate(None).default_format(Format::Json).format(),
             Format::Json,
         );
+    }
+
+    // ── `q=0` exclusions (RFC 7231 §5.3.1) and `406 Not Acceptable` ──────────
+
+    #[test]
+    fn forbidden_html_falls_through_to_wildcard_json() {
+        // `text/html;q=0` forbids HTML; `*/*;q=1` still covers JSON, so JSON is
+        // served rather than the default resurrecting the rejected HTML.
+        assert_eq!(
+            negotiate(Some("text/html;q=0, */*;q=1")).resolve(),
+            Resolution::Json,
+        );
+    }
+
+    #[test]
+    fn forbidden_json_not_resurrected_by_default() {
+        // JSON is explicitly forbidden; even a JSON default must not serve it,
+        // so the non-forbidden HTML is served instead.
+        assert_eq!(
+            negotiate(Some("application/json;q=0"))
+                .default_format(Format::Json)
+                .resolve(),
+            Resolution::Html,
+        );
+    }
+
+    #[test]
+    fn both_formats_forbidden_is_not_acceptable() {
+        assert_eq!(
+            negotiate(Some("text/html;q=0, application/json;q=0")).resolve(),
+            Resolution::NotAcceptable,
+        );
+    }
+
+    #[test]
+    fn wildcard_forbidden_is_not_acceptable() {
+        // A bare `*/*;q=0` forbids every representation the handler can produce.
+        assert_eq!(
+            negotiate(Some("*/*;q=0")).resolve(),
+            Resolution::NotAcceptable
+        );
+        // The JSON default cannot rescue it either.
+        assert_eq!(
+            negotiate(Some("*/*;q=0"))
+                .default_format(Format::Json)
+                .resolve(),
+            Resolution::NotAcceptable,
+        );
+    }
+
+    #[test]
+    fn unlisted_type_is_not_an_exclusion() {
+        // Naming only an unrelated type leaves HTML and JSON unmentioned (not
+        // forbidden): fall back to the default, never a 406.
+        assert_eq!(
+            negotiate(Some("application/xml")).resolve(),
+            Resolution::Html,
+        );
+        assert_eq!(
+            negotiate(Some("application/xml"))
+                .default_format(Format::Json)
+                .resolve(),
+            Resolution::Json,
+        );
+    }
+
+    #[test]
+    fn demoted_but_positive_html_still_loses_to_wildcard() {
+        // Regression: `q=0.1` is a demotion, not an exclusion, and JSON (lifted
+        // by `*/*;q=1`) still wins on effective q.
+        assert_eq!(
+            negotiate(Some("text/html;q=0.1, */*;q=1")).resolve(),
+            Resolution::Json,
+        );
+    }
+
+    #[test]
+    fn resolve_matches_format_for_non_forbidden_cases() {
+        // The lossy `format()` view agrees with `resolve()` whenever a
+        // representation is actually acceptable.
+        for accept in [
+            Some("text/html"),
+            Some("application/json"),
+            Some("application/json;q=0.9, text/html;q=1.0"),
+            Some("text/html;q=1, */*;q=1"),
+            Some("*/*"),
+            None,
+        ] {
+            let n = negotiate(accept);
+            let expected = match n.resolve() {
+                Resolution::Html => Format::Html,
+                Resolution::Json => Format::Json,
+                Resolution::NotAcceptable => unreachable!("no forbidden case here"),
+            };
+            assert_eq!(n.format(), expected, "accept={accept:?}");
+        }
     }
 }

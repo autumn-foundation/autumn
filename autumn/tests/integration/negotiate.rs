@@ -158,3 +158,42 @@ async fn configurable_default_yields_json_when_accept_missing() {
     assert_eq!(header(&response, "vary"), "Accept");
     assert_eq!(body_string(response).await, r#"{"id":7,"name":"spanner"}"#);
 }
+
+// ── `q=0` exclusions and `406 Not Acceptable` ───────────────────────────────
+
+#[tokio::test]
+async fn forbidden_html_serves_wildcard_json() {
+    // `text/html;q=0` forbids HTML; `*/*;q=1` still covers JSON, so JSON wins —
+    // the default must not resurrect the explicitly rejected HTML.
+    let response = send(app(), Some("text/html;q=0, */*;q=1")).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(header(&response, "content-type"), "application/json");
+    assert_eq!(header(&response, "vary"), "Accept");
+    assert_eq!(body_string(response).await, r#"{"id":7,"name":"spanner"}"#);
+}
+
+#[tokio::test]
+async fn forbidden_json_not_resurrected_by_json_default() {
+    // JSON is explicitly forbidden; even under `default_format(Format::Json)`
+    // the non-forbidden HTML must be served instead.
+    let app = Router::new().route("/widget", axum::routing::get(show_json_default));
+    let response = send(app, Some("application/json;q=0")).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(header(&response, "content-type").starts_with("text/html"));
+    assert_eq!(header(&response, "vary"), "Accept");
+    assert!(body_string(response).await.contains("<h1>spanner</h1>"));
+}
+
+#[tokio::test]
+async fn both_formats_forbidden_returns_406() {
+    let response = send(app(), Some("text/html;q=0, application/json;q=0")).await;
+    assert_eq!(response.status(), StatusCode::NOT_ACCEPTABLE);
+    assert_eq!(header(&response, "vary"), "Accept");
+}
+
+#[tokio::test]
+async fn wildcard_forbidden_returns_406() {
+    let response = send(app(), Some("*/*;q=0")).await;
+    assert_eq!(response.status(), StatusCode::NOT_ACCEPTABLE);
+    assert_eq!(header(&response, "vary"), "Accept");
+}

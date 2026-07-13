@@ -329,8 +329,11 @@ pub fn accept_prefers_html(headers: &axum::http::HeaderMap) -> bool {
 ///
 /// `index` is the position of the winning entry in the comma-separated header
 /// (0-based), used to break q-value ties in favour of the earlier entry. Each
-/// field is `None` when that media type was absent or fully demoted (`q=0`).
-/// Both [`accept_preference`] (legacy enum resolution) and the
+/// field is `None` only when that media type was entirely absent from the
+/// header; a media type listed with `q=0` records `Some((0.0, index))` so an
+/// explicit "not acceptable" exclusion (RFC 7231 §5.3.1) stays distinguishable
+/// from a mere absence. Both [`accept_preference`] (legacy enum resolution) and
+/// the
 /// [`Negotiate`](crate::negotiate::Negotiate) responder (effective-q
 /// resolution) build on this shared parse, so the crate never forks its
 /// `Accept` parsing.
@@ -350,8 +353,10 @@ pub struct AcceptQualities {
 ///
 /// Scans the comma-separated `Accept` header once, recording the best
 /// `(q-value, list-index)` seen for `text/html`, for `application/json` /
-/// `application/problem+json`, and for the `*/*` wildcard. Entries demoted to
-/// `q=0` are dropped, and out-of-range q-values are clamped to `[0.0, 1.0]`.
+/// `application/problem+json`, and for the `*/*` wildcard. Out-of-range
+/// q-values are clamped to `[0.0, 1.0]`. Entries with `q=0` are *retained*
+/// (recorded as `Some((0.0, index))`) so an explicit "not acceptable"
+/// exclusion survives; each consumer decides how to treat them.
 ///
 /// This is the crate's single source of truth for `Accept` tokenisation; the
 /// two consumers apply their own *resolution policy* on top of the returned
@@ -386,10 +391,13 @@ pub fn accept_qualities(headers: &axum::http::HeaderMap) -> AcceptQualities {
                 q = parsed.clamp(0.0, 1.0);
             }
         }
-        if q <= 0.0 {
-            continue;
-        }
 
+        // Record the entry even when `q == 0`: an explicit `q=0` means the type
+        // is *not acceptable* (RFC 7231 §5.3.1), which is distinct from the type
+        // being absent. Consumers that only care about positive preference (the
+        // legacy `accept_preference`/`accept_prefers_html` path) filter these
+        // `q == 0` slots back out; the `Negotiate` responder honours them as
+        // explicit exclusions.
         match mime {
             "text/html" if qualities.html.is_none_or(|(existing_q, _)| q > existing_q) => {
                 qualities.html = Some((q, index));
@@ -438,6 +446,12 @@ pub fn accept_preference(headers: &axum::http::HeaderMap) -> AcceptPreference {
         json,
         wildcard,
     } = accept_qualities(headers);
+
+    // Legacy resolution only cares about *positive* preference: a `q=0` slot
+    // (now retained by the shared parser) is treated as absent here, exactly
+    // reproducing the pre-`q=0`-aware behaviour of this enum negotiator.
+    let positive = |slot: Option<(f32, usize)>| slot.filter(|&(q, _)| q > 0.0);
+    let (html, json, wildcard) = (positive(html), positive(json), positive(wildcard));
 
     match (html, json, wildcard) {
         (Some((hq, hidx)), Some((jq, jidx)), _) => {
