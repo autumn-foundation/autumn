@@ -16,6 +16,7 @@
 
 use std::process::Command;
 
+use autumn_web::route_listing::OMITTED_ROUTES_MARKER;
 use serde::{Deserialize, Serialize};
 
 use crate::routes;
@@ -156,6 +157,39 @@ pub fn audit_exit_code(routes: &[AuditRoute]) -> i32 {
     i32::from(routes.iter().any(AuditRoute::is_unclassified))
 }
 
+/// Number of raw routers the dumped listing omitted, as reported by the app's
+/// `AUTUMN_DUMP_ROUTES` stderr marker ([`OMITTED_ROUTES_MARKER`]).
+///
+/// Routers added via `AppBuilder::merge()`/`nest()` are opaque and cannot be
+/// enumerated, so they never appear in the parsed stdout listing. Their auth
+/// posture is therefore unprovable — the audit gate must fail rather than emit a
+/// manifest that silently drops them.
+#[must_use]
+pub fn parse_omitted_count(stderr: &str) -> usize {
+    let marker = OMITTED_ROUTES_MARKER.trim();
+    // Take the last matching marker line; the dump emits at most one per run.
+    stderr
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix(marker))
+        .filter_map(|rest| rest.trim().parse::<usize>().ok())
+        .next_back()
+        .unwrap_or(0)
+}
+
+/// Hard-failure diagnostic for omitted (unenumerable) raw routers. These defeat
+/// the coverage proof, so the gate fails and tells the user how to make the
+/// routes provable.
+#[must_use]
+pub fn format_omitted_diagnostic(count: usize) -> String {
+    format!(
+        "\u{2717} {count} raw router(s) added via `AppBuilder::merge()`/`nest()` \
+         are not enumerable and were omitted from the route listing.\n\
+         Route auth coverage can't be proven while these exist. Mount routes via \
+         `routes![]` (or a plugin's `declare_plugin_routes`) so they are visible \
+         and classifiable.\n"
+    )
+}
+
 /// Human diagnostic naming every unclassified route (method + path + handler,
 /// with the handler's module when known).
 #[must_use]
@@ -217,15 +251,22 @@ pub fn run(opts: &AuditOptions<'_>) {
     routes::compile_binary(opts.package, opts.bin);
     let binary = routes::find_binary(opts.package, opts.bin);
 
+    // Capture stderr (rather than inheriting it) so we can detect the app's
+    // omitted-routes marker; forward it verbatim afterwards so warnings stay
+    // visible to the user.
     let output = Command::new(&binary)
         .env("AUTUMN_DUMP_ROUTES", "1")
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::piped())
         .output()
         .unwrap_or_else(|e| {
             eprintln!("\u{2717} Failed to run {}: {e}", binary.display());
             std::process::exit(1);
         });
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    eprint!("{stderr}");
+    let omitted = parse_omitted_count(&stderr);
 
     if !output.status.success() {
         eprintln!(
@@ -261,7 +302,7 @@ pub fn run(opts: &AuditOptions<'_>) {
 
     let unresolved = unclassified_routes(&routes);
     if unresolved.is_empty() {
-        if !opts.json {
+        if !opts.json && omitted == 0 {
             eprintln!("\u{2713} All routes are classified.");
         }
     } else {
@@ -271,7 +312,13 @@ pub fn run(opts: &AuditOptions<'_>) {
         }
     }
 
-    std::process::exit(audit_exit_code(&routes));
+    if omitted > 0 {
+        eprint!("\n{}", format_omitted_diagnostic(omitted));
+    }
+
+    // Fail the gate on either unclassified routes or omitted (unprovable) ones.
+    let failed = omitted > 0 || audit_exit_code(&routes) != 0;
+    std::process::exit(i32::from(failed));
 }
 
 #[cfg(test)]
@@ -436,5 +483,50 @@ mod tests {
         assert_eq!(audit_exit_code(&dump("gated")), 0);
         // Green via #[public].
         assert_eq!(audit_exit_code(&dump("public")), 0);
+    }
+
+    // ── omitted routes (raw merge/nest routers) ──────────────────────────────
+
+    #[test]
+    fn parse_omitted_count_reads_the_marker() {
+        let stderr = format!(
+            "\u{1F342} autumn routes\n\
+             [autumn routes] warning: 2 raw router(s) added via .merge()/.nest() ...\n\
+             {OMITTED_ROUTES_MARKER}2\n"
+        );
+        assert_eq!(parse_omitted_count(&stderr), 2);
+    }
+
+    #[test]
+    fn parse_omitted_count_zero_when_no_marker() {
+        assert_eq!(parse_omitted_count(""), 0);
+        assert_eq!(parse_omitted_count("some unrelated warning\n"), 0);
+    }
+
+    /// A dump that omits raw routers (marker present, count > 0) must fail the
+    /// gate even when every *visible* route is fully classified — the omitted
+    /// routes are unprovable, so the audit can't pass silently.
+    #[test]
+    fn omitted_routes_fail_the_gate_even_when_visible_routes_are_clean() {
+        // All visible routes are classified: audit_exit_code alone would pass.
+        let visible = vec![
+            route("GET", "/health", "health", "framework"),
+            route("GET", "/posts", "list", "public"),
+        ];
+        assert_eq!(audit_exit_code(&visible), 0);
+
+        // But the child reported an omitted raw router on stderr.
+        let stderr = format!("{OMITTED_ROUTES_MARKER}1\n");
+        let omitted = parse_omitted_count(&stderr);
+        assert_eq!(omitted, 1);
+
+        // The combined gate (mirroring `run`) must fail.
+        let failed = omitted > 0 || audit_exit_code(&visible) != 0;
+        assert!(failed, "omitted routes must hard-fail the audit gate");
+
+        // And the diagnostic explains why and how to fix it.
+        let diag = format_omitted_diagnostic(omitted);
+        assert!(diag.contains("merge()"), "{diag}");
+        assert!(diag.contains("routes!["), "{diag}");
     }
 }

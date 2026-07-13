@@ -4306,6 +4306,12 @@ impl AppBuilder {
                 "[autumn routes] warning: {hidden} raw router(s) added via \
                  .merge()/.nest() are not enumerable and are omitted from this listing"
             );
+            // Machine-readable marker consumed by `autumn routes audit` to
+            // hard-fail the coverage gate: omitted routes can't be proven.
+            eprintln!(
+                "{marker}{hidden}",
+                marker = crate::route_listing::OMITTED_ROUTES_MARKER
+            );
         }
 
         let (config, _telemetry_guard) =

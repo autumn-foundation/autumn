@@ -270,7 +270,7 @@ impl Plugin for AdminPlugin {
         // Declare routes for `autumn routes` listing. The underlying Axum router
         // is added via nest() which is opaque to route enumeration, so we
         // explicitly register route metadata here.
-        let declared = admin_route_infos(&prefix, has_config);
+        let declared = admin_route_infos(&prefix, has_config, require_role.as_deref());
 
         app.nest(&prefix, router).declare_plugin_routes(declared)
     }
@@ -284,7 +284,28 @@ impl Plugin for AdminPlugin {
 ///
 /// Kept in sync with `routes::admin_router` — update here when routes are
 /// added or removed from the admin router.
-pub(crate) fn admin_route_infos(prefix: &str, has_config: bool) -> Vec<RouteInfo> {
+///
+/// `require_role` mirrors [`AdminPlugin::require_role`]: the whole admin router
+/// is wrapped in role-check middleware, so every declared route inherits that
+/// posture. When a role is required the routes classify [`Gated`] (carrying the
+/// role) rather than `Unclassified`; when the plugin's auth is explicitly
+/// disabled (`None`) they classify [`Public`]. Without this, the default admin
+/// plugin would false-fail `autumn routes audit` out of the box, since declared
+/// routes otherwise inherit `Unclassified` from `RouteInfo::default()`.
+///
+/// [`Gated`]: autumn_web::route_listing::RouteClassification::Gated
+/// [`Public`]: autumn_web::route_listing::RouteClassification::Public
+pub(crate) fn admin_route_infos(
+    prefix: &str,
+    has_config: bool,
+    require_role: Option<&str>,
+) -> Vec<RouteInfo> {
+    use autumn_web::route_listing::RouteClassification;
+
+    let (classification, roles) = require_role.map_or_else(
+        || (RouteClassification::Public, Vec::new()),
+        |role| (RouteClassification::Gated, vec![role.to_owned()]),
+    );
     let mut entries: Vec<(&str, String)> = vec![
         ("GET", prefix.to_string()),
         ("GET", format!("{prefix}/jobs")),
@@ -323,6 +344,8 @@ pub(crate) fn admin_route_infos(prefix: &str, has_config: bool) -> Vec<RouteInfo
             path,
             handler: format!("admin::{}", method.to_lowercase()),
             source: autumn_web::route_listing::RouteSource::User, // overwritten by declare_plugin_routes
+            classification,
+            roles: roles.clone(),
             ..Default::default()
         })
         .collect()
@@ -353,7 +376,7 @@ mod conformance_tests {
     }
 
     fn admin_routes_with_config(prefix: &str, has_config: bool) -> Vec<RouteInfo> {
-        super::admin_route_infos(prefix, has_config)
+        super::admin_route_infos(prefix, has_config, Some("admin"))
             .into_iter()
             .map(|mut r| {
                 r.source = RouteSource::Plugin(PLUGIN_NAME.to_owned());
@@ -449,6 +472,56 @@ mod conformance_tests {
                 !declared.contains(&(method, path)),
                 "config route {method} {path} should not be declared when has_config=false"
             );
+        }
+    }
+
+    /// The default admin plugin guards its whole router with role-check
+    /// middleware, so its declared routes must classify `Gated` (carrying the
+    /// role) — not `Unclassified` — or `autumn routes audit` would false-fail
+    /// every protected admin route out of the box (#1604).
+    #[test]
+    fn admin_plugin_declared_routes_classify_gated_with_role() {
+        use autumn_web::route_listing::RouteClassification;
+
+        let routes = super::admin_route_infos("/admin", true, Some("admin"));
+        assert!(!routes.is_empty());
+        for r in &routes {
+            assert_eq!(
+                r.classification,
+                RouteClassification::Gated,
+                "admin route {} {} should be Gated, got {:?}",
+                r.method,
+                r.path,
+                r.classification
+            );
+            assert_eq!(
+                r.roles,
+                vec!["admin".to_owned()],
+                "admin route {} {} should carry the required role",
+                r.method,
+                r.path
+            );
+        }
+    }
+
+    /// When the plugin's auth is explicitly disabled (`require_role(None)`) the
+    /// declared routes classify `Public` — still a proven posture, so the audit
+    /// gate passes rather than flagging them `Unclassified`.
+    #[test]
+    fn admin_plugin_declared_routes_classify_public_when_role_disabled() {
+        use autumn_web::route_listing::RouteClassification;
+
+        let routes = super::admin_route_infos("/admin", true, None);
+        assert!(!routes.is_empty());
+        for r in &routes {
+            assert_eq!(
+                r.classification,
+                RouteClassification::Public,
+                "admin route {} {} should be Public when auth disabled",
+                r.method,
+                r.path
+            );
+            assert!(r.roles.is_empty(), "public route should carry no roles");
         }
     }
 

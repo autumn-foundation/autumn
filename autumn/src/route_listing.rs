@@ -9,6 +9,20 @@ use serde::{Deserialize, Serialize};
 use crate::app::ScopedGroup;
 use crate::route::Route;
 
+/// Machine-readable stderr marker for omitted (unenumerable) raw routers.
+///
+/// Emitted by the `AUTUMN_DUMP_ROUTES` dump when raw routers registered via
+/// [`AppBuilder::merge`](crate::app::AppBuilder::merge) /
+/// [`AppBuilder::nest`](crate::app::AppBuilder::nest) are omitted from the JSON
+/// route listing (they are opaque and cannot be enumerated). The decimal count
+/// of omitted routers follows the marker on the same line.
+///
+/// This is a process-boundary protocol: `autumn routes audit` runs the built
+/// binary as a child, scans its stderr for this marker, and hard-fails the
+/// coverage gate when the count is non-zero — omitted routes can carry unproven
+/// auth posture, so a manifest that silently drops them would defeat the gate.
+pub const OMITTED_ROUTES_MARKER: &str = "[autumn:omitted-routes] ";
+
 /// Where a route was registered: by the user application, by a named plugin,
 /// or by the framework itself (probes, actuator, htmx assets, dev reload).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]

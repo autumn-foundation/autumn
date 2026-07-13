@@ -2757,12 +2757,17 @@ fn run_command(command: Commands) {
             command,
         } => match command {
             Some(RoutesSubcommands::Audit {
-                package,
-                bin,
+                package: audit_package,
+                bin: audit_bin,
                 manifest,
                 json,
                 strict,
             }) => {
+                // Fall back to the parent `routes` target flags so both
+                // `autumn routes -p blog audit` and `autumn routes audit -p blog`
+                // select the same binary in multi-target workspaces.
+                let package = audit_package.or(package);
+                let bin = audit_bin.or(bin);
                 routes_audit::run(&routes_audit::AuditOptions {
                     package: package.as_deref(),
                     bin: bin.as_deref(),
@@ -5289,6 +5294,63 @@ mod tests {
                 assert_eq!(manifest.as_deref(), Some("target/security.json"));
                 assert!(json);
                 assert!(!strict);
+            }
+            _ => panic!("expected Routes audit subcommand"),
+        }
+    }
+
+    /// Parent `-p`/`--bin` flags placed before the `audit` subcommand land on
+    /// the parent `Routes` variant, not on `Audit`. The dispatch falls back to
+    /// them (`audit.package.or(parent.package)`), so `autumn routes -p blog
+    /// audit` and `autumn routes audit -p blog` resolve the same target (#1604).
+    #[test]
+    fn parse_routes_parent_package_flows_into_audit() {
+        // `-p blog` BEFORE `audit`: parent carries it, audit's own is None.
+        let cli = Cli::try_parse_from(["autumn", "routes", "-p", "blog", "audit"]).unwrap();
+        match cli.command {
+            Commands::Routes {
+                package: parent_package,
+                bin: parent_bin,
+                command:
+                    Some(RoutesSubcommands::Audit {
+                        package: audit_package,
+                        bin: audit_bin,
+                        ..
+                    }),
+                ..
+            } => {
+                assert_eq!(parent_package.as_deref(), Some("blog"));
+                assert_eq!(audit_package, None);
+                // The fallback the dispatch applies.
+                let resolved_package = audit_package.or(parent_package);
+                let resolved_bin = audit_bin.or(parent_bin);
+                assert_eq!(resolved_package.as_deref(), Some("blog"));
+                assert_eq!(resolved_bin, None);
+            }
+            _ => panic!("expected Routes audit subcommand"),
+        }
+    }
+
+    /// The subcommand's own `-p`/`--bin` (placed after `audit`) still win — the
+    /// fallback only fills in when the audit value is `None`.
+    #[test]
+    fn parse_routes_audit_own_package_takes_precedence() {
+        let cli =
+            Cli::try_parse_from(["autumn", "routes", "-p", "blog", "audit", "-p", "shop"]).unwrap();
+        match cli.command {
+            Commands::Routes {
+                package: parent_package,
+                command:
+                    Some(RoutesSubcommands::Audit {
+                        package: audit_package,
+                        ..
+                    }),
+                ..
+            } => {
+                assert_eq!(parent_package.as_deref(), Some("blog"));
+                assert_eq!(audit_package.as_deref(), Some("shop"));
+                let resolved = audit_package.or(parent_package);
+                assert_eq!(resolved.as_deref(), Some("shop"));
             }
             _ => panic!("expected Routes audit subcommand"),
         }
