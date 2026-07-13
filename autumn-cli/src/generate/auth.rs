@@ -911,6 +911,18 @@ fn plan_auth_with_providers_ex_impl(
         .chain(AUTH_EXTRA_DEPS.iter().copied())
         .chain(if totp { TOTP_EXTRA_DEPS } else { &[] }.iter().copied())
         .collect();
+    // The `--totp` routes add `base64 = "0.22"` and use its 0.21+ `Engine`
+    // API; `ensure_cargo_dependencies` is name-only, so an app pinning an older
+    // `base64` keeps it and the generated 2FA code won't compile. Warn instead.
+    if totp {
+        super::model::warn_if_existing_dep_below_version(
+            &mut plan,
+            &cargo_existing,
+            "base64",
+            0,
+            22,
+        );
+    }
     // Apply dep additions then enable the mail feature in a single write.
     let with_deps = ensure_cargo_dependencies(&cargo_existing, &all_deps);
     // `ensure_cargo_dependencies` no-ops on an already-declared `totp-rs`, so
@@ -1423,6 +1435,10 @@ fn plan_auth_options_impl(
         let base_cargo = find_plan_content_for_path(&plan, &cargo_toml_path)
             .unwrap_or_else(|| read_or_empty(&cargo_toml_path));
         let all_passkey_deps: Vec<(&str, &str)> = PASSKEY_EXTRA_DEPS.to_vec();
+        // `ensure_cargo_dependencies` is name-only, so an app that already pins
+        // an older `base64` keeps it and never gets `0.22`; the emitted
+        // `encode_cred_id` needs the 0.21+ `Engine` API, so warn if it's too old.
+        super::model::warn_if_existing_dep_below_version(&mut plan, &base_cargo, "base64", 0, 22);
         let with_deps = super::model::ensure_cargo_dependencies(&base_cargo, &all_passkey_deps);
         // If the project already declared webauthn-rs without the required features,
         // ensure_cargo_dependencies would have skipped it; merge them here.
