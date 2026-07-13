@@ -207,12 +207,15 @@ impl Multipart {
         };
 
         // Only file parts carry uploadable content worth validating. Regular
-        // form fields often omit `Content-Type` and are never sniffed.
+        // form fields often omit `Content-Type` and are never sniffed. A part
+        // with an empty filename (`filename=""`, as an optional/empty file
+        // input sends) carries no upload and is treated as a non-file field, so
+        // enforcement never runs against its 0-byte body and aborts the submit.
         //
         // We sniff whenever an allow-list is configured OR strict
         // mismatch-rejection is enabled — either check needs the actual
         // (magic-byte) content type rather than the spoofable client header.
-        let needs_sniff = field.file_name().is_some()
+        let needs_sniff = field.file_name().is_some_and(|name| !name.is_empty())
             && (!self.config.allowed_mime_types.is_empty()
                 || self.config.reject_on_content_type_mismatch);
 
