@@ -4764,10 +4764,26 @@ impl AcmeConfig {
                     .to_owned(),
             );
         }
-        for domain in &self.domains {
-            if domain.starts_with("*.") {
+        if self.http_challenge_port == 0 {
+            return Err(
+                "[server.tls.acme] http_challenge_port must not be 0: port 0 binds an ephemeral \
+                 OS-assigned port that the ACME HTTP-01 validator (which always connects on port \
+                 80) can never reach, so every issuance fails. Use 80, or the port a front-end \
+                 forwards `:80` to"
+                    .to_owned(),
+            );
+        }
+        for (index, domain) in self.domains.iter().enumerate() {
+            let trimmed = domain.trim();
+            if trimmed.is_empty() {
                 return Err(format!(
-                    "[server.tls.acme] wildcard domain `{domain}` is not supported: wildcards \
+                    "[server.tls.acme] domains must not contain blank entries (entry at index \
+                     {index} is empty or whitespace-only)"
+                ));
+            }
+            if trimmed.starts_with("*.") {
+                return Err(format!(
+                    "[server.tls.acme] wildcard domain `{trimmed}` is not supported: wildcards \
                      require the DNS-01 challenge, which is out of scope here (tracked in #1620). \
                      List explicit hostnames instead"
                 ));
@@ -9620,6 +9636,48 @@ path = "/healthz"
         let err = cfg.validate().unwrap_err();
         assert!(err.contains("#1620"), "got: {err}");
         assert!(err.contains("wildcard"), "got: {err}");
+    }
+
+    // Regression (#1608, Codex P2): a blank/whitespace-only domain entry passes
+    // `domains.is_empty()` (the list has length 1) but the runtime then orders a
+    // cert for an empty DNS identifier, so `validate()` must reject it up front.
+    #[test]
+    fn validate_acme_blank_domain_entry_rejected() {
+        let mut cfg = tls_static(None, None);
+        cfg.acme = Some(acme_cfg(&[""], "ops@example.com"));
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("blank entries"), "got: {err}");
+
+        // A whitespace-only entry is rejected the same way.
+        let mut cfg = tls_static(None, None);
+        cfg.acme = Some(acme_cfg(&["   "], "ops@example.com"));
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("blank entries"), "got: {err}");
+    }
+
+    // Regression (#1608, Codex P2): `http_challenge_port = 0` binds an ephemeral
+    // OS port the HTTP-01 validator (always port 80) can never reach, so every
+    // issuance fails while the process stays up — `validate()` must reject it.
+    #[test]
+    fn validate_acme_zero_http_challenge_port_rejected() {
+        let mut cfg = tls_static(None, None);
+        let mut acme = acme_cfg(&["app.example.com"], "ops@example.com");
+        acme.http_challenge_port = 0;
+        cfg.acme = Some(acme);
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("http_challenge_port"), "got: {err}");
+    }
+
+    // Companion: a valid domain list plus the default challenge port is unaffected
+    // by the new blank-entry / zero-port rejections.
+    #[test]
+    fn validate_acme_valid_domains_and_port_ok() {
+        let mut cfg = tls_static(None, None);
+        cfg.acme = Some(acme_cfg(
+            &["app.example.com", "www.example.com"],
+            "ops@example.com",
+        ));
+        assert!(cfg.validate().is_ok(), "got: {:?}", cfg.validate());
     }
 
     // ── server.max_concurrent_requests (#1006) ────────────────────

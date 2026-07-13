@@ -4190,6 +4190,10 @@ pub struct AcmeDoctorConfig {
     /// runtime `AcmeConfig::validate()` rejects a missing/blank value at boot, so
     /// doctor mirrors that as a FAIL.
     pub contact_email: String,
+    /// Port to serve the HTTP-01 challenge on. Defaults to 80 when unset. The
+    /// runtime `AcmeConfig::validate()` rejects `0` (it binds an ephemeral OS port
+    /// the HTTP-01 validator can never reach), so doctor mirrors that as a FAIL.
+    pub http_challenge_port: u16,
     /// Directory holding the stored account + certificates.
     pub cache_dir: std::path::PathBuf,
     /// The per-directory subdirectory label the runtime store namespaces
@@ -4290,6 +4294,14 @@ fn resolve_acme_doctor_config(toml_table: Option<&toml::Table>) -> Option<AcmeDo
         .unwrap_or_default()
         .to_owned();
 
+    // Mirror the runtime default (`default_acme_http_challenge_port` = 80) when
+    // the key is absent; preserve an explicit `0` so the acme-config grader FAILs
+    // it exactly as `AcmeConfig::validate()` does.
+    let http_challenge_port = acme
+        .get("http_challenge_port")
+        .and_then(toml::Value::as_integer)
+        .map_or(80, |v| u16::try_from(v).unwrap_or(80));
+
     let cache_dir = acme
         .get("cache_dir")
         .and_then(toml::Value::as_str)
@@ -4306,6 +4318,7 @@ fn resolve_acme_doctor_config(toml_table: Option<&toml::Table>) -> Option<AcmeDo
     Some(AcmeDoctorConfig {
         domains,
         contact_email,
+        http_challenge_port,
         cache_dir,
         directory_label,
         directory_error,
@@ -4335,6 +4348,7 @@ fn resolve_acme_doctor_config(toml_table: Option<&toml::Table>) -> Option<AcmeDo
 pub fn check_acme_config_impl(
     domains: &[String],
     contact_email: &str,
+    http_challenge_port: u16,
     directory_error: Option<&str>,
 ) -> Option<CheckResult> {
     if let Some(bad_value) = directory_error {
@@ -4376,13 +4390,41 @@ pub fn check_acme_config_impl(
             hint: Some("Set [server.tls.acme] contact_email"),
         });
     }
-    for domain in domains {
-        if domain.starts_with("*.") {
+    if http_challenge_port == 0 {
+        return Some(CheckResult {
+            name: "acme_config",
+            status: CheckStatus::Fail,
+            detail: Some(
+                "[server.tls.acme] http_challenge_port must not be 0: port 0 binds an ephemeral \
+                 OS-assigned port that the ACME HTTP-01 validator (which always connects on port \
+                 80) can never reach, so every issuance fails. Use 80, or the port a front-end \
+                 forwards `:80` to"
+                    .into(),
+            ),
+            hint: Some(
+                "Set [server.tls.acme] http_challenge_port to 80 (or the port `:80` forwards to)",
+            ),
+        });
+    }
+    for (index, domain) in domains.iter().enumerate() {
+        let trimmed = domain.trim();
+        if trimmed.is_empty() {
             return Some(CheckResult {
                 name: "acme_config",
                 status: CheckStatus::Fail,
                 detail: Some(format!(
-                    "[server.tls.acme] wildcard domain `{domain}` is not supported: wildcards \
+                    "[server.tls.acme] domains must not contain blank entries (entry at index \
+                     {index} is empty or whitespace-only)"
+                )),
+                hint: Some("Remove blank/whitespace-only entries from [server.tls.acme] domains"),
+            });
+        }
+        if trimmed.starts_with("*.") {
+            return Some(CheckResult {
+                name: "acme_config",
+                status: CheckStatus::Fail,
+                detail: Some(format!(
+                    "[server.tls.acme] wildcard domain `{trimmed}` is not supported: wildcards \
                      require the DNS-01 challenge, which is out of scope here (tracked in #1620). \
                      List explicit hostnames instead"
                 )),
@@ -5368,6 +5410,7 @@ pub fn run(opts: DoctorOptions) {
         if let Some(config_fail) = check_acme_config_impl(
             &acme.domains,
             &acme.contact_email,
+            acme.http_challenge_port,
             acme.directory_error.as_deref(),
         ) {
             tasks.push(Box::new(move || config_fail));
@@ -7796,7 +7839,7 @@ pub struct Vault {
     // doctor must FAIL it rather than silently pass acme_stored_cert.
     #[test]
     fn acme_config_fail_when_domains_empty() {
-        let r = check_acme_config_impl(&[], "ops@example.com", None)
+        let r = check_acme_config_impl(&[], "ops@example.com", 80, None)
             .expect("empty domains must be a FAIL, not Pass");
         assert!(matches!(r.status, CheckStatus::Fail));
         assert_eq!(r.name, "acme_config");
@@ -7804,14 +7847,14 @@ pub struct Vault {
 
     #[test]
     fn acme_config_fail_when_contact_email_blank() {
-        let r = check_acme_config_impl(&["app.example.com".to_owned()], "   ", None)
+        let r = check_acme_config_impl(&["app.example.com".to_owned()], "   ", 80, None)
             .expect("blank contact_email must be a FAIL");
         assert!(matches!(r.status, CheckStatus::Fail));
     }
 
     #[test]
     fn acme_config_fail_when_wildcard_domain() {
-        let r = check_acme_config_impl(&["*.example.com".to_owned()], "ops@example.com", None)
+        let r = check_acme_config_impl(&["*.example.com".to_owned()], "ops@example.com", 80, None)
             .expect("wildcard domain must be a FAIL");
         assert!(matches!(r.status, CheckStatus::Fail));
         // Points the operator at the DNS-01 tracking issue, mirroring
@@ -7823,9 +7866,51 @@ pub struct Vault {
     fn acme_config_ok_when_valid() {
         // A valid ACME config produces no acme_config failure.
         assert!(
-            check_acme_config_impl(&["app.example.com".to_owned()], "ops@example.com", None)
+            check_acme_config_impl(&["app.example.com".to_owned()], "ops@example.com", 80, None)
                 .is_none(),
             "a valid ACME config must not raise an acme_config failure"
+        );
+    }
+
+    // Regression (#1608, Codex P2): mirror `AcmeConfig::validate()` rejecting a
+    // blank/whitespace-only domain entry. `domains = [""]` passes the empty-list
+    // check (length 1) but the runtime then orders a cert for an empty DNS
+    // identifier, so doctor must FAIL it rather than pass acme_stored_cert.
+    #[test]
+    fn acme_config_fail_when_domain_entry_blank() {
+        let r = check_acme_config_impl(&[String::new()], "ops@example.com", 80, None)
+            .expect("a blank domain entry must be a FAIL");
+        assert!(matches!(r.status, CheckStatus::Fail));
+        assert_eq!(r.name, "acme_config");
+        assert!(
+            r.detail.as_deref().unwrap_or_default().contains("blank"),
+            "detail must mention blank entries: {:?}",
+            r.detail
+        );
+
+        // Whitespace-only is rejected the same way.
+        let r = check_acme_config_impl(&["   ".to_owned()], "ops@example.com", 80, None)
+            .expect("a whitespace-only domain entry must be a FAIL");
+        assert!(matches!(r.status, CheckStatus::Fail));
+    }
+
+    // Regression (#1608, Codex P2): mirror `AcmeConfig::validate()` rejecting
+    // `http_challenge_port = 0`. Port 0 binds an ephemeral OS port the HTTP-01
+    // validator (always port 80) can never reach, so every issuance fails while
+    // the process stays up — doctor must FAIL it.
+    #[test]
+    fn acme_config_fail_when_http_challenge_port_zero() {
+        let r = check_acme_config_impl(&["app.example.com".to_owned()], "ops@example.com", 0, None)
+            .expect("http_challenge_port = 0 must be a FAIL");
+        assert!(matches!(r.status, CheckStatus::Fail));
+        assert_eq!(r.name, "acme_config");
+        assert!(
+            r.detail
+                .as_deref()
+                .unwrap_or_default()
+                .contains("http_challenge_port"),
+            "detail must mention http_challenge_port: {:?}",
+            r.detail
         );
     }
 
@@ -7856,6 +7941,7 @@ directory = \"prod\"
         let r = check_acme_config_impl(
             &acme.domains,
             &acme.contact_email,
+            acme.http_challenge_port,
             acme.directory_error.as_deref(),
         )
         .expect("an invalid `directory` must be a FAIL, not silently staging");
@@ -7910,6 +7996,7 @@ contact_email = \"ops@example.com\"
                 check_acme_config_impl(
                     &acme.domains,
                     &acme.contact_email,
+                    acme.http_challenge_port,
                     acme.directory_error.as_deref(),
                 )
                 .is_none(),
@@ -8175,6 +8262,7 @@ directory = \"production\"
         let config = AcmeDoctorConfig {
             domains: vec!["ok.example.com".to_owned(), "bad.example.com".to_owned()],
             contact_email: "ops@example.com".to_owned(),
+            http_challenge_port: 80,
             cache_dir: std::path::PathBuf::from("config/acme"),
             directory_label: "production".to_owned(),
             directory_error: None,
