@@ -4059,6 +4059,60 @@ fn resolve_optional_signing_secret() -> Option<String> {
         })
 }
 
+/// Resolve the signing secret the deploy preflight should grade, from the SAME
+/// merged active-profile runtime table used for the deploy config and DB URL
+/// (base autumn.toml + `[profile.<env>]` + autumn-<env>.toml), env first. A
+/// secret supplied only in an active profile
+/// (`[profile.<env>].security.signing_secret` / autumn-<env>.toml) is invisible
+/// to the raw top-level `autumn.toml` that [`resolve_optional_signing_secret`]
+/// reads, so a raw-table lookup would report it MISSING even though
+/// `AutumnConfig::load()` and `autumn deploy check` see it. Never returns/prints
+/// the value except to the (secret-safe) grader. Env-var precedence matches the
+/// runtime loader.
+fn resolve_deploy_signing_secret(merged: &toml::Table) -> Option<String> {
+    if let Ok(val) = std::env::var("AUTUMN_SECURITY__SIGNING_SECRET")
+        && !val.is_empty()
+    {
+        return Some(val);
+    }
+    merged
+        .get("security")
+        .and_then(|s| s.get("signing_secret"))
+        .and_then(|ss| ss.get("secret"))
+        .and_then(toml::Value::as_str)
+        .filter(|v| !v.is_empty())
+        .map(std::borrow::ToOwned::to_owned)
+}
+
+/// Whether any enabled runtime feature requires a configured Postgres pool at
+/// startup, resolved from the merged active-profile runtime table (env first).
+/// Mirrors the exact backend conditions the runtime enforces:
+/// - `jobs.backend = "postgres"` → `job::start_postgres_runtime` requires a pool.
+/// - `scheduler.backend = "postgres"` → `scheduler::coordinator_from_config`
+///   requires a pool.
+///
+/// Cache, channels, and idempotency have only in-memory/Redis backends (no
+/// Postgres variant), so they never require a DB pool.
+fn resolve_deploy_db_backed_runtime(merged: &toml::Table) -> bool {
+    let env_var = |key: &str| std::env::var(key).ok().filter(|value| !value.is_empty());
+
+    let jobs = merged.get("jobs").and_then(toml::Value::as_table);
+    let jobs_postgres = first_env(&env_var, &["AUTUMN_JOBS__BACKEND"])
+        .or_else(|| first_toml_string(jobs, &["backend"]))
+        .as_deref()
+        .map(str::trim)
+        == Some("postgres");
+
+    let scheduler = merged.get("scheduler").and_then(toml::Value::as_table);
+    let scheduler_postgres = first_env(&env_var, &["AUTUMN_SCHEDULER__BACKEND"])
+        .or_else(|| first_toml_string(scheduler, &["backend"]))
+        .as_deref()
+        .and_then(autumn_web::config::SchedulerBackend::from_env_value)
+        .is_some_and(|backend| backend == autumn_web::config::SchedulerBackend::Postgres);
+
+    jobs_postgres || scheduler_postgres
+}
+
 fn resolve_trusted_hosts() -> Vec<String> {
     if let Ok(val) = std::env::var("AUTUMN_SECURITY__TRUSTED_HOSTS__HOSTS") {
         return val
@@ -5785,7 +5839,14 @@ pub fn run(opts: DoctorOptions) {
         tasks.push(Box::new(move || check));
     }
     if let Some(deploy_cfg) = deploy_cfg {
-        let deploy_signing = resolve_optional_signing_secret();
+        // Resolve the deploy signing secret from the SAME merged active-profile
+        // table used for `deploy_cfg` and the DB URL (env first, then
+        // `merged_deploy_toml`'s `security.signing_secret.secret`) — NOT the raw
+        // top-level `autumn.toml` that `resolve_optional_signing_secret` reads. A
+        // secret supplied only by the active profile is invisible to the raw
+        // table, so a raw lookup would report it MISSING even though
+        // `AutumnConfig::load()` and `autumn deploy check` see it.
+        let deploy_signing = resolve_deploy_signing_secret(&merged_deploy_toml);
         // Derive the deploy DB-URL preflight input from the SAME merged
         // active-profile table used for `deploy_cfg` (base autumn.toml +
         // [profile.<env>] + autumn-<env>.toml), exactly like the sibling
@@ -5817,6 +5878,12 @@ pub fn run(opts: DoctorOptions) {
         // database-backed even without a migrations directory, so `grade_database_url`
         // requires a URL. A DB-free app (no `[database]`, no migrations dir) passes.
         let deploy_db_configured = merged_deploy_toml.get("database").is_some();
+        // A DB-backed runtime feature (jobs.backend/scheduler.backend = postgres)
+        // requires a configured pool at startup, so a writable DB URL is required
+        // even with no migrations dir and no `[database]` section. Resolved from
+        // the SAME merged active-profile table so `doctor` and `deploy check`
+        // apply the identical DB-required rule.
+        let deploy_db_backed_runtime = resolve_deploy_db_backed_runtime(&merged_deploy_toml);
 
         // Host presence is validated OFFLINE (always, whenever `[deploy]` is
         // configured): a `[deploy]` table with a missing/blank `host` makes
@@ -5851,7 +5918,7 @@ pub fn run(opts: DoctorOptions) {
         tasks.push(Box::new(move || {
             deploy_preflight_result(
                 "deploy_signing_secret",
-                crate::deploy::grade_signing_secret(deploy_signing.as_deref()),
+                crate::deploy::grade_signing_secret(deploy_signing.as_deref(), is_production),
             )
         }));
         tasks.push(Box::new(move || {
@@ -5861,6 +5928,7 @@ pub fn run(opts: DoctorOptions) {
                     deploy_db_url.as_deref(),
                     std::path::Path::new("migrations"),
                     deploy_db_configured,
+                    deploy_db_backed_runtime,
                 ),
             )
         }));

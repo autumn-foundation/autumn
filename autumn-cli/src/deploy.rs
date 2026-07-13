@@ -276,44 +276,91 @@ pub fn grade_ssh_reachability(
     )
 }
 
-/// Grade signing-secret presence. Never prints the secret value.
+/// Grade signing-secret presence and, in production, strength. Never prints the
+/// secret value.
+///
+/// In a non-production profile a present, non-empty secret is enough. In a
+/// production profile the app boot path runs
+/// [`autumn_web::security::validate_signing_secret`] and *exits* on a
+/// missing/too-short/known-demo secret, so preflight reuses that exact validator
+/// to reject the same values here — otherwise `deploy check` would greenlight a
+/// release that immediately fails to boot (or ships a known demo secret).
 #[must_use]
-pub fn grade_signing_secret(secret: Option<&str>) -> PreflightCheck {
-    match secret.map(str::trim).filter(|s| !s.is_empty()) {
-        Some(_) => PreflightCheck::pass("signing_secret", "signing secret is configured"),
-        None => PreflightCheck::fail(
+pub fn grade_signing_secret(secret: Option<&str>, is_production: bool) -> PreflightCheck {
+    let Some(value) = secret.map(str::trim).filter(|s| !s.is_empty()) else {
+        return PreflightCheck::fail(
             "signing_secret",
             "no signing secret configured",
             "Set AUTUMN_SECURITY__SIGNING_SECRET (generate with `openssl rand -hex 32`)",
-        ),
+        );
+    };
+
+    if is_production {
+        // Reuse the exact runtime validator so preflight and app boot agree on
+        // what counts as a valid production secret. The error's `Display`
+        // embeds the (demo) secret value for `KnownWeakValue`, so we translate
+        // each variant into a value-free message rather than formatting it.
+        use autumn_web::security::{SigningSecretError, validate_signing_secret};
+        if let Err(error) = validate_signing_secret(Some(value), true) {
+            let detail = match error {
+                SigningSecretError::MissingInProduction => {
+                    "signing secret is required in production".to_owned()
+                }
+                SigningSecretError::TooShort { actual, required } => format!(
+                    "signing secret is too short ({actual} bytes, minimum {required}) for production"
+                ),
+                SigningSecretError::KnownWeakValue(_) => {
+                    "signing secret is a known demo/template value not allowed in production"
+                        .to_owned()
+                }
+            };
+            return PreflightCheck::fail(
+                "signing_secret",
+                detail,
+                "Set a strong AUTUMN_SECURITY__SIGNING_SECRET (generate with `openssl rand -hex 32`)",
+            );
+        }
     }
+
+    PreflightCheck::pass("signing_secret", "signing secret is configured")
 }
 
 /// Grade database-URL presence. Never prints the URL (it may embed credentials).
 ///
-/// The URL is only *required* when the app is database-backed — either a
-/// migrations directory exists (the same presence check [`grade_migrate_check`]
-/// uses, so the two graders agree) or a `[database]` section is configured. A
-/// zero-dependency, daemon-style app with neither has nothing to connect to, so
-/// the grader passes with a "no database configured" note instead of failing
-/// preflight unconditionally.
+/// The URL is only *required* when the app is database-backed — any of:
+/// - a migrations directory exists (the same presence check [`grade_migrate_check`]
+///   uses, so the two graders agree), or
+/// - a `[database]` section is configured, or
+/// - a DB-backed runtime feature is enabled (`db_backed_runtime`) — e.g.
+///   `jobs.backend = "postgres"` or `scheduler.backend = "postgres"`, whose
+///   startup paths (`job::start_postgres_runtime` /
+///   `scheduler::coordinator_from_config`) require a configured pool.
+///
+/// A zero-dependency, daemon-style app with none of these has nothing to connect
+/// to, so the grader passes with a "no database configured" note instead of
+/// failing preflight unconditionally.
 #[must_use]
 pub fn grade_database_url(
     url: Option<&str>,
     migrations_dir: &Path,
     database_configured: bool,
+    db_backed_runtime: bool,
 ) -> PreflightCheck {
     match url.map(str::trim).filter(|u| !u.is_empty()) {
         Some(_) => PreflightCheck::pass("database_url", "database URL is configured"),
-        None if !migrations_dir.exists() && !database_configured => PreflightCheck::pass(
-            "database_url",
-            "no database configured (nothing to connect to)",
-        ),
+        None if !migrations_dir.exists() && !database_configured && !db_backed_runtime => {
+            PreflightCheck::pass(
+                "database_url",
+                "no database configured (nothing to connect to)",
+            )
+        }
         None => PreflightCheck::fail(
             "database_url",
-            "no writable database URL: `autumn migrate` needs a primary/control \
+            "no writable database URL: this app is database-backed (migrations, a \
+             `[database]` section, or a Postgres-backed runtime feature such as \
+             `jobs.backend`/`scheduler.backend`) and needs a primary/control \
              (`database.primary_url`) or shard-primary URL; `database.replica_url` \
-             alone can't run migrations",
+             alone is not a writable target",
             "Set database.primary_url (or database.url) in autumn.toml, or AUTUMN_DATABASE__URL",
         ),
     }
@@ -594,14 +641,42 @@ fn collect_preflight(
             resolved.ssh_port,
             SSH_PROBE_TIMEOUT,
         ),
-        grade_signing_secret(config.security.signing_secret.secret.as_deref()),
+        grade_signing_secret(
+            config.security.signing_secret.secret.as_deref(),
+            is_production_profile(config.profile.as_deref()),
+        ),
         grade_database_url(
             resolve_writable_db_url(&config.database),
             Path::new(MIGRATIONS_DIR),
             database_configured,
+            requires_database_pool(config),
         ),
         grade_migrate_check(Path::new(MIGRATIONS_DIR)),
     ]
+}
+
+/// Whether the active profile is production, matching the exact rule the app boot
+/// path uses in `fail_fast_on_invalid_signing_secret`
+/// (`matches!(config.profile.as_deref(), Some("prod" | "production"))`).
+#[must_use]
+fn is_production_profile(profile: Option<&str>) -> bool {
+    matches!(profile, Some("prod" | "production"))
+}
+
+/// Whether any enabled runtime feature requires a configured Postgres pool at
+/// startup, mirroring the exact backend conditions the runtime enforces:
+/// - `jobs.backend = "postgres"` → `job::start_postgres_runtime` calls
+///   `state.pool().ok_or(...)` and errors without a pool.
+/// - `scheduler.backend = "postgres"` → `scheduler::coordinator_from_config`
+///   calls `state.pool().ok_or(...)` and errors without a pool.
+///
+/// Cache, channels, and idempotency have only in-memory/Redis backends (no
+/// Postgres variant), so they never require a DB pool and are deliberately not
+/// included here.
+#[must_use]
+fn requires_database_pool(config: &AutumnConfig) -> bool {
+    config.jobs.backend == "postgres"
+        || config.scheduler.backend == autumn_web::config::SchedulerBackend::Postgres
 }
 
 fn run_check(config: &AutumnConfig, resolved: &ResolvedDeployConfig) -> Result<(), DeployError> {
@@ -890,13 +965,60 @@ mod tests {
 
     #[test]
     fn signing_secret_grader_never_echoes_value() {
-        let present = grade_signing_secret(Some("super-secret-value"));
+        let present = grade_signing_secret(Some("super-secret-value"), false);
         assert!(present.passed);
         assert!(!present.detail.contains("super-secret-value"));
 
-        let missing = grade_signing_secret(None);
+        let missing = grade_signing_secret(None, false);
         assert!(!missing.passed);
-        assert!(!grade_signing_secret(Some("   ")).passed);
+        assert!(!grade_signing_secret(Some("   "), false).passed);
+    }
+
+    #[test]
+    fn signing_secret_grader_non_production_accepts_weak_secret() {
+        // Outside production, a present, non-empty secret is enough: a dev/staging
+        // deploy must not be blocked by the production strength rules.
+        assert!(grade_signing_secret(Some("changeme"), false).passed);
+        assert!(grade_signing_secret(Some("short"), false).passed);
+    }
+
+    #[test]
+    fn signing_secret_grader_production_rejects_weak_secret() {
+        // In production the grader reuses the runtime validator
+        // (`autumn_web::security::validate_signing_secret`), which the app boot
+        // path also runs before binding. A known demo value and a too-short
+        // secret must both FAIL preflight so `deploy check` never greenlights a
+        // release that would exit on startup.
+        let demo = grade_signing_secret(Some("changeme"), true);
+        assert!(!demo.passed, "demo value must fail in production");
+        assert!(demo.hint.is_some());
+        // Never echo the secret value, even a known demo one.
+        assert!(!demo.detail.contains("changeme"));
+
+        let short = grade_signing_secret(Some("too-short"), true);
+        assert!(!short.passed, "too-short secret must fail in production");
+        assert!(!short.detail.contains("too-short"));
+    }
+
+    #[test]
+    fn signing_secret_grader_production_accepts_strong_secret() {
+        // A 64-hex-char secret (openssl rand -hex 32) clears the runtime
+        // validator's minimum length and is not a demo value.
+        let strong = "a".repeat(64);
+        let check = grade_signing_secret(Some(&strong), true);
+        assert!(
+            check.passed,
+            "strong production secret should pass: {}",
+            check.detail
+        );
+        assert!(!check.detail.contains(&strong));
+    }
+
+    #[test]
+    fn signing_secret_grader_production_missing_fails() {
+        let check = grade_signing_secret(None, true);
+        assert!(!check.passed);
+        assert!(check.hint.is_some());
     }
 
     #[test]
@@ -904,10 +1026,10 @@ mod tests {
         // Force the DB-backed path so the missing-URL case still fails: a
         // configured `[database]` marks the app as database-backed.
         let absent = Path::new("autumn-deploy-no-such-migrations-dir-echo-guard");
-        let present = grade_database_url(Some("postgres://user:pw@host/db"), absent, true);
+        let present = grade_database_url(Some("postgres://user:pw@host/db"), absent, true, false);
         assert!(present.passed);
         assert!(!present.detail.contains("pw"));
-        assert!(!grade_database_url(None, absent, true).passed);
+        assert!(!grade_database_url(None, absent, true, false).passed);
     }
 
     #[test]
@@ -918,12 +1040,53 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let absent_migrations = tmp.path().join("migrations");
         assert!(!absent_migrations.exists());
-        let check = grade_database_url(None, &absent_migrations, false);
+        let check = grade_database_url(None, &absent_migrations, false, false);
         assert!(
             check.passed,
             "DB-free app should pass the DB-URL preflight: {}",
             check.detail
         );
+    }
+
+    #[test]
+    fn database_url_grader_fails_for_db_backed_runtime_without_url() {
+        // No migrations dir and no `[database]` section, but a DB-backed runtime
+        // feature (e.g. `jobs.backend = "postgres"` or `scheduler.backend =
+        // "postgres"`) is enabled. Its startup path requires a configured pool,
+        // so a missing writable URL must FAIL preflight rather than taking the
+        // DB-free pass branch and failing at boot.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let absent_migrations = tmp.path().join("migrations");
+        assert!(!absent_migrations.exists());
+        let check = grade_database_url(None, &absent_migrations, false, true);
+        assert!(
+            !check.passed,
+            "DB-backed runtime feature without a URL must fail preflight"
+        );
+        assert!(
+            check.hint.is_some(),
+            "the failure should carry an actionable remediation hint"
+        );
+    }
+
+    #[test]
+    fn database_url_grader_passes_for_db_backed_runtime_with_url() {
+        // The same DB-backed runtime feature WITH a writable primary URL passes.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let absent_migrations = tmp.path().join("migrations");
+        assert!(!absent_migrations.exists());
+        let check = grade_database_url(
+            Some("postgres://user:pw@host/db"),
+            &absent_migrations,
+            false,
+            true,
+        );
+        assert!(
+            check.passed,
+            "DB-backed runtime feature with a URL should pass: {}",
+            check.detail
+        );
+        assert!(!check.detail.contains("pw"));
     }
 
     #[test]
@@ -934,7 +1097,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let migrations = tmp.path().join("migrations");
         std::fs::create_dir(&migrations).unwrap();
-        let check = grade_database_url(None, &migrations, false);
+        let check = grade_database_url(None, &migrations, false, false);
         assert!(
             !check.passed,
             "DB-backed app without a URL should fail preflight"
@@ -970,7 +1133,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let migrations = tmp.path().join("migrations");
         std::fs::create_dir(&migrations).unwrap();
-        let check = grade_database_url(url, &migrations, true);
+        let check = grade_database_url(url, &migrations, true, false);
         assert!(
             check.passed,
             "shard-only app with migrations should pass the DB-URL preflight: {}",
@@ -1008,7 +1171,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let migrations = tmp.path().join("migrations");
         std::fs::create_dir(&migrations).unwrap();
-        let check = grade_database_url(url, &migrations, true);
+        let check = grade_database_url(url, &migrations, true, false);
         assert!(
             !check.passed,
             "replica-only app with migrations must fail the DB-URL preflight"
@@ -1030,5 +1193,37 @@ mod tests {
             "absent migrations dir should pass: {}",
             check.detail
         );
+    }
+
+    #[test]
+    fn is_production_profile_matches_runtime_rule() {
+        assert!(is_production_profile(Some("prod")));
+        assert!(is_production_profile(Some("production")));
+        assert!(!is_production_profile(Some("dev")));
+        assert!(!is_production_profile(Some("staging")));
+        assert!(!is_production_profile(None));
+    }
+
+    #[test]
+    fn requires_database_pool_detects_postgres_backends() {
+        use autumn_web::config::{AutumnConfig, SchedulerBackend};
+
+        // Default (local jobs, in-process scheduler): no pool required.
+        let mut config = AutumnConfig::default();
+        assert!(!requires_database_pool(&config));
+
+        // jobs.backend = "postgres" → pool required.
+        config.jobs.backend = "postgres".to_owned();
+        assert!(requires_database_pool(&config));
+
+        // scheduler.backend = postgres → pool required.
+        let mut config = AutumnConfig::default();
+        config.scheduler.backend = SchedulerBackend::Postgres;
+        assert!(requires_database_pool(&config));
+
+        // A non-postgres jobs backend (redis/local) does not require a PG pool.
+        let mut config = AutumnConfig::default();
+        config.jobs.backend = "redis".to_owned();
+        assert!(!requires_database_pool(&config));
     }
 }

@@ -156,8 +156,9 @@ pub use captcha::{
 };
 pub use config::{
     CspNonceConfig, CsrfConfig, HeadersConfig, KeyStrategy, RateLimitBackend, RateLimitConfig,
-    RateLimitNamedConfig, RateLimitTierConfig, SecurityConfig, SubmitTokenConfig,
-    TrustedProxiesConfig, UploadConfig, default_content_security_policy, hmac_sha256_hex,
+    RateLimitNamedConfig, RateLimitTierConfig, SecurityConfig, SigningSecretError,
+    SubmitTokenConfig, TrustedProxiesConfig, UploadConfig, default_content_security_policy,
+    hmac_sha256_hex, validate_signing_secret,
 };
 #[cfg(feature = "redis")]
 pub use config::{RateLimitBackendFailure, RateLimitRedisConfig};
