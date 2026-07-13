@@ -392,6 +392,10 @@ pub struct AcceptQualities {
 /// (recorded as `Some((0.0, index))`) so an explicit "not acceptable"
 /// exclusion survives; each consumer decides how to treat them.
 ///
+/// Media-range tokens and the quality parameter name are matched
+/// case-insensitively per RFC 7231 §3.1.1.1: `Application/JSON` records the
+/// same slot as `application/json`, and `Q=` is honoured like `q=`.
+///
 /// This is the crate's single source of truth for `Accept` tokenisation; the
 /// two consumers apply their own *resolution policy* on top of the returned
 /// [`AcceptQualities`] (they differ only in policy, not parsing).
@@ -419,7 +423,10 @@ pub fn accept_qualities(headers: &axum::http::HeaderMap) -> AcceptQualities {
                 continue;
             }
 
-            if let Some(value) = segment.strip_prefix("q=")
+            // Parameter names are case-insensitive (RFC 7231 §3.1.1.1), so the
+            // quality parameter may arrive as `q=` or `Q=`.
+            if let Some((name, value)) = segment.split_once('=')
+                && name.trim().eq_ignore_ascii_case("q")
                 && let Ok(parsed) = value.trim().parse::<f32>()
             {
                 q = parsed.clamp(0.0, 1.0);
@@ -432,42 +439,41 @@ pub fn accept_qualities(headers: &axum::http::HeaderMap) -> AcceptQualities {
         // legacy `accept_preference`/`accept_prefers_html` path) filter these
         // `q == 0` slots back out; the `Negotiate` responder honours them as
         // explicit exclusions.
-        match mime {
-            "text/html" if qualities.html.is_none_or(|(existing_q, _)| q > existing_q) => {
-                qualities.html = Some((q, index));
-            }
-            "application/json" if qualities.json.is_none_or(|(existing_q, _)| q > existing_q) => {
-                qualities.json = Some((q, index));
-            }
-            "application/problem+json"
-                if qualities
-                    .problem_json
-                    .is_none_or(|(existing_q, _)| q > existing_q) =>
-            {
-                qualities.problem_json = Some((q, index));
-            }
-            "text/*"
-                if qualities
-                    .text_star
-                    .is_none_or(|(existing_q, _)| q > existing_q) =>
-            {
-                qualities.text_star = Some((q, index));
-            }
-            "application/*"
-                if qualities
-                    .application_star
-                    .is_none_or(|(existing_q, _)| q > existing_q) =>
-            {
-                qualities.application_star = Some((q, index));
-            }
-            "*/*"
-                if qualities
-                    .wildcard
-                    .is_none_or(|(existing_q, _)| q > existing_q) =>
-            {
-                qualities.wildcard = Some((q, index));
-            }
-            _ => {}
+        // Media types and subtypes are case-insensitive (RFC 7231 §3.1.1.1), so
+        // `Application/JSON` must record the same slot as `application/json`.
+        // Compare without allocating a lowercased copy of the token.
+        if mime.eq_ignore_ascii_case("text/html")
+            && qualities.html.is_none_or(|(existing_q, _)| q > existing_q)
+        {
+            qualities.html = Some((q, index));
+        } else if mime.eq_ignore_ascii_case("application/json")
+            && qualities.json.is_none_or(|(existing_q, _)| q > existing_q)
+        {
+            qualities.json = Some((q, index));
+        } else if mime.eq_ignore_ascii_case("application/problem+json")
+            && qualities
+                .problem_json
+                .is_none_or(|(existing_q, _)| q > existing_q)
+        {
+            qualities.problem_json = Some((q, index));
+        } else if mime.eq_ignore_ascii_case("text/*")
+            && qualities
+                .text_star
+                .is_none_or(|(existing_q, _)| q > existing_q)
+        {
+            qualities.text_star = Some((q, index));
+        } else if mime.eq_ignore_ascii_case("application/*")
+            && qualities
+                .application_star
+                .is_none_or(|(existing_q, _)| q > existing_q)
+        {
+            qualities.application_star = Some((q, index));
+        } else if mime.eq_ignore_ascii_case("*/*")
+            && qualities
+                .wildcard
+                .is_none_or(|(existing_q, _)| q > existing_q)
+        {
+            qualities.wildcard = Some((q, index));
         }
     }
 
@@ -995,6 +1001,53 @@ mod tests {
         let json = header_map("application/json");
         assert_eq!(accept_preference(&json), AcceptPreference::Json);
         assert!(!accept_prefers_html(&json));
+    }
+
+    #[test]
+    fn accept_qualities_matches_media_types_case_insensitively() {
+        // Media types are case-insensitive (RFC 7231 §3.1.1.1): a mixed-case
+        // token must record the same slot as its lowercase form.
+        let json = accept_qualities(&header_map("Application/JSON"));
+        assert_eq!(json.json, Some((1.0, 0)));
+        assert_eq!(json.html, None);
+
+        let html = accept_qualities(&header_map("TEXT/HTML"));
+        assert_eq!(html.html, Some((1.0, 0)));
+        assert_eq!(html.json, None);
+
+        // Subtype wildcard is case-insensitive too.
+        let app_star = accept_qualities(&header_map("APPLICATION/*;q=1"));
+        assert_eq!(app_star.application_star, Some((1.0, 0)));
+    }
+
+    #[test]
+    fn accept_qualities_matches_q_parameter_case_insensitively() {
+        // Parameter names are case-insensitive: `Q=` must be honoured like `q=`.
+        let q = accept_qualities(&header_map("text/html;Q=0.9, application/json;Q=1.0"));
+        assert_eq!(q.html, Some((0.9, 0)));
+        assert_eq!(q.json, Some((1.0, 1)));
+    }
+
+    #[test]
+    fn accept_prefers_html_honours_case_insensitive_tokens() {
+        // Mixed-case JSON must not fall back to the HTML default.
+        assert!(!accept_prefers_html(&header_map("Application/JSON")));
+        assert_eq!(
+            accept_preference(&header_map("Application/JSON")),
+            AcceptPreference::Json
+        );
+
+        // Mixed-case HTML still prefers HTML.
+        assert!(accept_prefers_html(&header_map("TEXT/HTML")));
+        assert_eq!(
+            accept_preference(&header_map("TEXT/HTML")),
+            AcceptPreference::Html
+        );
+
+        // Uppercase Q honoured: JSON has the higher q and wins.
+        assert!(!accept_prefers_html(&header_map(
+            "text/html;Q=0.9, application/json;Q=1.0"
+        )));
     }
 
     // ── Integration tests with the full middleware pipeline ──────
