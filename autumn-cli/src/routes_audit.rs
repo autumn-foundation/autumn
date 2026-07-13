@@ -529,4 +529,37 @@ mod tests {
         assert!(diag.contains("merge()"), "{diag}");
         assert!(diag.contains("routes!["), "{diag}");
     }
+
+    /// The mirror of the case above (#1604): a raw router mounted with covering
+    /// declarations — as the first-party `AdminPlugin` does via
+    /// `nest_declared` — is enumerable, so the app emits NO omitted marker
+    /// (`hidden == 0`). `parse_omitted_count` returns 0 and, with clean visible
+    /// routes, the combined gate must PASS. Previously the nested admin router
+    /// still tripped the marker and false-failed the audit.
+    #[test]
+    fn declared_nest_emits_no_marker_and_passes_the_gate() {
+        // Visible routes include the declared admin endpoints, all classified.
+        let visible = vec![
+            route("GET", "/health", "health", "framework"),
+            route("GET", "/admin", "admin::index", "gated"),
+            route("POST", "/admin/users", "admin::create", "gated"),
+        ];
+        assert_eq!(audit_exit_code(&visible), 0);
+
+        // A declared-covered nest emits no marker, so no omitted count is
+        // reported even though a raw router was mounted.
+        let stderr = "\u{1F342} autumn routes\n";
+        let omitted = parse_omitted_count(stderr);
+        assert_eq!(
+            omitted, 0,
+            "a declared-covered nest must not emit the marker"
+        );
+
+        // The combined gate (mirroring `run`) must pass.
+        let failed = omitted > 0 || audit_exit_code(&visible) != 0;
+        assert!(
+            !failed,
+            "a declared-covered admin nest must not false-fail the audit gate"
+        );
+    }
 }
