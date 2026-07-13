@@ -279,7 +279,9 @@ pub fn grade_database_url(
         ),
         None => PreflightCheck::fail(
             "database_url",
-            "no database URL configured",
+            "no writable database URL: `autumn migrate` needs a primary/control \
+             (`database.primary_url`) or shard-primary URL; `database.replica_url` \
+             alone can't run migrations",
             "Set database.primary_url (or database.url) in autumn.toml, or AUTUMN_DATABASE__URL",
         ),
     }
@@ -503,19 +505,20 @@ fn resolve_project_name() -> String {
         .unwrap_or_else(|| "app".to_owned())
 }
 
-/// Resolve the first database URL a deploy/migration would actually act on,
-/// honoring shard-only deployments.
+/// Resolve the first *writable* database URL a deploy/migration would actually
+/// act on, honoring shard-only deployments.
 ///
-/// `autumn migrate` treats a shard-only app (one or more `[[database.shards]]`
-/// with no control `primary_url`/`url`) as a valid shape and migrates each
-/// shard's `primary_url` (see `migrate::build_targets`). The DB-URL preflight
-/// must agree, so it considers the app to have a usable database when a control
-/// primary, a replica, OR at least one shard primary URL resolves — returning
-/// the first such URL (control primary → replica → first shard primary). The
-/// grader never prints the value, so surfacing a shard URL here is safe.
-fn resolve_preflight_db_url(db: &autumn_web::config::DatabaseConfig) -> Option<&str> {
+/// `autumn migrate` only ever targets a writable primary: the control
+/// `primary_url`/`url`, or — for a shard-only app (one or more
+/// `[[database.shards]]` with no control primary) — each shard's `primary_url`
+/// (see `migrate::build_targets`). It never migrates against
+/// `database.replica_url`. The DB-URL preflight must agree, so it returns the
+/// first writable URL that resolves (control primary → first shard primary);
+/// replicas are excluded because `autumn migrate` cannot migrate against a
+/// replica. The grader never prints the value, so surfacing a shard URL here is
+/// safe.
+fn resolve_writable_db_url(db: &autumn_web::config::DatabaseConfig) -> Option<&str> {
     db.effective_primary_url()
-        .or(db.replica_url.as_deref())
         .or_else(|| db.shards.first().map(|shard| shard.primary_url.as_str()))
 }
 
@@ -543,7 +546,7 @@ fn collect_preflight(
         ),
         grade_signing_secret(config.security.signing_secret.secret.as_deref()),
         grade_database_url(
-            resolve_preflight_db_url(&config.database),
+            resolve_writable_db_url(&config.database),
             Path::new(MIGRATIONS_DIR),
             database_configured,
         ),
@@ -839,7 +842,7 @@ mod tests {
         };
         assert!(db.effective_primary_url().is_none());
 
-        let url = resolve_preflight_db_url(&db);
+        let url = resolve_writable_db_url(&db);
         assert_eq!(url, Some("postgres://user:pw@shard0/app"));
 
         // Migrations dir present + database configured (has_shards) → DB-backed.
@@ -853,6 +856,47 @@ mod tests {
             check.detail
         );
         // The grader must never echo the shard credentials.
+        assert!(!check.detail.contains("pw"));
+    }
+
+    #[test]
+    fn replica_only_config_resolves_no_writable_url_and_fails_with_migrations() {
+        use autumn_web::config::DatabaseConfig;
+
+        // A replica-only app: only `database.replica_url` is set — no control
+        // `primary_url`/`url` and no `[[database.shards]]`. `autumn migrate` only
+        // ever targets a writable primary/control or shard-primary URL (see
+        // `migrate::build_targets`); it can never migrate against a replica. So
+        // the writable-URL resolver must return None, and a project with a
+        // `migrations/` dir must FAIL the DB-URL preflight rather than passing on
+        // a replica the migration step can't use.
+        let db = DatabaseConfig {
+            replica_url: Some("postgres://user:pw@replica/app".to_owned()),
+            ..Default::default()
+        };
+        assert!(db.effective_primary_url().is_none());
+
+        let url = resolve_writable_db_url(&db);
+        assert_eq!(
+            url, None,
+            "replica_url alone is not a writable migration target"
+        );
+
+        // Migrations dir present + database configured (replica_url set) →
+        // DB-backed, but no writable URL → FAIL with an actionable hint.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let migrations = tmp.path().join("migrations");
+        std::fs::create_dir(&migrations).unwrap();
+        let check = grade_database_url(url, &migrations, true);
+        assert!(
+            !check.passed,
+            "replica-only app with migrations must fail the DB-URL preflight"
+        );
+        assert!(
+            check.hint.is_some(),
+            "the failure should carry an actionable remediation hint"
+        );
+        // The grader must never echo the replica credentials.
         assert!(!check.detail.contains("pw"));
     }
 
