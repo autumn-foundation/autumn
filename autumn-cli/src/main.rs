@@ -573,6 +573,11 @@ enum Commands {
         /// Treat warnings as failures (exit 1 on any ⚠️).
         #[arg(long)]
         strict: bool,
+        /// Run active network probes (ACME preflight: port 80/443 reachability
+        /// and DNS-points-here for the configured domains). Off by default so
+        /// `doctor` stays offline and non-flaky.
+        #[arg(long, alias = "preflight")]
+        online: bool,
     },
 
     /// Inspect the project's Fluent i18n translations.
@@ -2791,8 +2796,16 @@ fn run_command(command: Commands) {
                 std::process::exit(1);
             }
         }
-        Commands::Doctor { json, strict } => {
-            doctor::run(doctor::DoctorOptions { json, strict });
+        Commands::Doctor {
+            json,
+            strict,
+            online,
+        } => {
+            doctor::run(doctor::DoctorOptions {
+                json,
+                strict,
+                online,
+            });
         }
         Commands::I18n { action } => match action {
             I18nSubcommands::Check { format, strict } => {
@@ -5213,7 +5226,8 @@ mod tests {
             cli.command,
             Commands::Doctor {
                 json: false,
-                strict: false
+                strict: false,
+                online: false
             }
         ));
     }
@@ -5225,7 +5239,8 @@ mod tests {
             cli.command,
             Commands::Doctor {
                 json: true,
-                strict: false
+                strict: false,
+                online: false
             }
         ));
     }
@@ -5237,7 +5252,8 @@ mod tests {
             cli.command,
             Commands::Doctor {
                 json: false,
-                strict: true
+                strict: true,
+                online: false
             }
         ));
     }
@@ -5249,9 +5265,25 @@ mod tests {
             cli.command,
             Commands::Doctor {
                 json: true,
-                strict: true
+                strict: true,
+                online: false
             }
         ));
+    }
+
+    #[test]
+    fn parse_doctor_online_flag_and_preflight_alias() {
+        for flag in ["--online", "--preflight"] {
+            let cli = Cli::try_parse_from(["autumn", "doctor", flag]).unwrap();
+            assert!(matches!(
+                cli.command,
+                Commands::Doctor {
+                    json: false,
+                    strict: false,
+                    online: true
+                }
+            ));
+        }
     }
 
     // ── autumn i18n tests ──────────────────────────────────────────────────

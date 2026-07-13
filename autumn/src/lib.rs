@@ -226,6 +226,14 @@ pub mod route_listing;
 #[cfg(feature = "tls")]
 pub mod tls;
 
+/// Automatic ACME (Let's Encrypt) certificate provisioning + renewal (#1608).
+///
+/// Builds on the [`tls`] listener: the certificate obtained over the ACME
+/// HTTP-01 challenge hot-swaps into the same `ReloadableCertResolver` the TLS
+/// listener serves. Gated behind the off-by-default `acme` feature.
+#[cfg(feature = "acme")]
+pub mod acme;
+
 #[cfg(feature = "db")]
 pub mod sharding;
 

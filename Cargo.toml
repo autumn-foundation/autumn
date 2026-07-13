@@ -36,6 +36,15 @@ repository = "https://github.com/madmax983/autumn"
 # Runtime
 axum = { version = "0.8", features = ["macros", "ws"] }
 tokio-util = "0.7"
+# Automatic ACME (Let's Encrypt) certificate provisioning (issue #1608, the
+# `acme` feature on autumn-web). `default-features = false` + `ring` is load
+# bearing: the DEFAULT features of both crates pull `aws-lc-rs` into the
+# dependency graph, which violates the workspace single-crypto-backend rule
+# (rustls 0.23 + ring). `instant-acme` drives the ACME order state machine over
+# hyper-rustls; `rcgen` generates the ACME account key, the certificate
+# keypair/CSR, and the self-signed placeholder certificate.
+instant-acme = { version = "0.8.5", default-features = false, features = ["ring", "hyper-rustls"] }
+rcgen = { version = "0.14", default-features = false, features = ["pem", "ring"] }
 diesel = { version = "2", features = ["sqlite", "postgres"] }
 pq-sys = { version = "0.7", features = ["bundled_without_openssl"] }
 # `async-connection-wrapper` provides the sync diesel API (incl. running

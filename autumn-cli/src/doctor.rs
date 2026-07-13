@@ -99,6 +99,10 @@ pub struct DoctorOptions {
     pub json: bool,
     /// Treat warnings as failures (exit 1).
     pub strict: bool,
+    /// Run active network probes (ACME preflight: port reachability, DNS
+    /// pointing here). Off by default so `autumn doctor` stays offline and
+    /// non-flaky; opt in with `--online` / `--preflight`.
+    pub online: bool,
 }
 
 /// Extension point: implement this trait to add custom checks.
@@ -480,6 +484,206 @@ pub fn check_tls_impl(data: &TlsDoctorData) -> CheckResult {
             hint: None,
         },
     }
+}
+
+// ── ACME preflight checks (issue #1608) ──────────────────────────────────────
+//
+// These active checks only run under `autumn doctor --online`, so the default
+// offline `doctor` stays fast and non-flaky. Each grader is a pure function of
+// injected inputs (mirroring `check_tls_impl`) with a thin, bounded I/O wrapper.
+
+/// Reachability of a TCP port, as observed by a bounded connect attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PortReachability {
+    /// The connection succeeded.
+    Open,
+    /// The connection was actively refused (nothing listening).
+    Refused,
+    /// The attempt timed out (filtered/unroutable).
+    TimedOut,
+    /// Another error prevented the attempt (DNS failure, unroutable, …).
+    Error,
+}
+
+/// Grade whether the ACME challenge port (80) and HTTPS port (443) are
+/// reachable on the configured domain (pure; injectable for tests).
+///
+/// HTTP-01 validation requires the CA to reach `:80`, so a refused/timed-out
+/// `:80` is a **Fail**. `:443` merely being down yet is a **Warn** (the listener
+/// may not be up during preflight).
+#[must_use]
+pub fn check_acme_ports_impl(
+    domain: &str,
+    port_80: PortReachability,
+    port_443: PortReachability,
+) -> CheckResult {
+    match port_80 {
+        PortReachability::Refused | PortReachability::TimedOut | PortReachability::Error => {
+            return CheckResult {
+                name: "acme_ports",
+                status: CheckStatus::Fail,
+                detail: Some(format!(
+                    "port 80 on {domain} is not reachable ({port_80:?}); the ACME CA validates \
+                     HTTP-01 over port 80"
+                )),
+                hint: Some(
+                    "Open inbound TCP/80 to this host (or forward it) so Let's Encrypt can reach \
+                     the HTTP-01 challenge",
+                ),
+            };
+        }
+        PortReachability::Open => {}
+    }
+    match port_443 {
+        PortReachability::Open => CheckResult {
+            name: "acme_ports",
+            status: CheckStatus::Pass,
+            detail: Some(format!("ports 80 and 443 on {domain} are reachable")),
+            hint: None,
+        },
+        other => CheckResult {
+            name: "acme_ports",
+            status: CheckStatus::Warn,
+            detail: Some(format!(
+                "port 80 on {domain} is reachable but port 443 is not yet ({other:?})"
+            )),
+            hint: Some("Ensure the HTTPS listener is up and inbound TCP/443 is open"),
+        },
+    }
+}
+
+/// The DNS resolution outcome for a domain, relative to this host's public IPs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DnsPointsHere {
+    /// The domain resolves to at least one of this host's local public IPs.
+    Matches,
+    /// The domain resolves, but to none of this host's IPs.
+    ResolvesElsewhere {
+        /// The resolved addresses (for the message).
+        resolved: Vec<String>,
+    },
+    /// The domain could not be resolved.
+    Unresolved,
+    /// This host's own public IPs could not be determined.
+    LocalIpsUnknown,
+}
+
+/// Grade whether an ACME domain's DNS points at this host (pure; injectable).
+///
+/// A clear mismatch is a **Fail** (HTTP-01 will hit the wrong host); an
+/// indeterminate result (can't resolve, or can't tell where "here" is) is a
+/// **Warn** rather than a hard failure, since split-horizon DNS and NAT make
+/// "points here" unknowable from inside the host.
+#[must_use]
+pub fn check_acme_dns_impl(domain: &str, outcome: &DnsPointsHere) -> CheckResult {
+    match outcome {
+        DnsPointsHere::Matches => CheckResult {
+            name: "acme_dns",
+            status: CheckStatus::Pass,
+            detail: Some(format!("{domain} resolves to this host")),
+            hint: None,
+        },
+        DnsPointsHere::ResolvesElsewhere { resolved } => CheckResult {
+            name: "acme_dns",
+            status: CheckStatus::Fail,
+            detail: Some(format!(
+                "{domain} resolves to {} which is not one of this host's addresses; HTTP-01 \
+                 validation will reach a different server",
+                resolved.join(", ")
+            )),
+            hint: Some(
+                "Point the domain's A/AAAA records at this host, or run ACME on the host the \
+                 domain resolves to",
+            ),
+        },
+        DnsPointsHere::Unresolved => CheckResult {
+            name: "acme_dns",
+            status: CheckStatus::Warn,
+            detail: Some(format!("{domain} did not resolve to any address")),
+            hint: Some("Publish A/AAAA records for the domain before requesting a certificate"),
+        },
+        DnsPointsHere::LocalIpsUnknown => CheckResult {
+            name: "acme_dns",
+            status: CheckStatus::Warn,
+            detail: Some(format!(
+                "could not determine this host's public IPs, so cannot confirm {domain} points \
+                 here"
+            )),
+            hint: None,
+        },
+    }
+}
+
+/// Thin bounded I/O wrapper: probe a TCP port on `domain` with a 2s connect
+/// timeout, resolving the domain first.
+#[must_use]
+pub fn probe_port(domain: &str, port: u16) -> PortReachability {
+    use std::net::ToSocketAddrs as _;
+    let addrs = match (domain, port).to_socket_addrs() {
+        Ok(addrs) => addrs.collect::<Vec<_>>(),
+        Err(_) => return PortReachability::Error,
+    };
+    let Some(addr) = addrs.into_iter().next() else {
+        return PortReachability::Error;
+    };
+    match std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(2)) {
+        Ok(_) => PortReachability::Open,
+        Err(e) => match e.kind() {
+            std::io::ErrorKind::ConnectionRefused => PortReachability::Refused,
+            std::io::ErrorKind::TimedOut => PortReachability::TimedOut,
+            _ => PortReachability::Error,
+        },
+    }
+}
+
+/// Thin bounded I/O wrapper: resolve `domain` and compare its addresses to this
+/// host's local non-loopback IPs.
+#[must_use]
+pub fn resolve_dns_points_here(domain: &str) -> DnsPointsHere {
+    use std::net::ToSocketAddrs as _;
+    let resolved: Vec<std::net::IpAddr> = match (domain, 0_u16).to_socket_addrs() {
+        Ok(addrs) => addrs.map(|s| s.ip()).collect(),
+        Err(_) => return DnsPointsHere::Unresolved,
+    };
+    if resolved.is_empty() {
+        return DnsPointsHere::Unresolved;
+    }
+    let local = local_public_ips();
+    if local.is_empty() {
+        return DnsPointsHere::LocalIpsUnknown;
+    }
+    if resolved.iter().any(|ip| local.contains(ip)) {
+        DnsPointsHere::Matches
+    } else {
+        DnsPointsHere::ResolvesElsewhere {
+            resolved: resolved.iter().map(ToString::to_string).collect(),
+        }
+    }
+}
+
+/// This host's local non-loopback IP addresses, best-effort.
+///
+/// Uses a UDP "connect" trick (no packets sent) to discover the outbound source
+/// address, which is the address a public peer would see for a simple setup.
+/// Returns empty when it cannot be determined (NAT, no route), which the grader
+/// treats as "unknown" rather than a failure.
+fn local_public_ips() -> Vec<std::net::IpAddr> {
+    let mut out = Vec::new();
+    for target in ["8.8.8.8:80", "[2001:4860:4860::8888]:80"] {
+        if let Ok(sock) = std::net::UdpSocket::bind(if target.starts_with('[') {
+            "[::]:0"
+        } else {
+            "0.0.0.0:0"
+        }) && sock.connect(target).is_ok()
+            && let Ok(addr) = sock.local_addr()
+        {
+            let ip = addr.ip();
+            if !ip.is_loopback() && !out.contains(&ip) {
+                out.push(ip);
+            }
+        }
+    }
+    out
 }
 
 /// Check that an operator-alert destination is configured (issue #1610).
@@ -3810,6 +4014,172 @@ fn resolve_tls_doctor_data() -> TlsDoctorData {
     }
 }
 
+/// The resolved `[server.tls.acme]` inputs the doctor needs (issue #1608).
+#[derive(Debug, Clone)]
+pub struct AcmeDoctorConfig {
+    /// Configured domains (first is used for active probes).
+    pub domains: Vec<String>,
+    /// Directory holding the stored account + certificates.
+    pub cache_dir: std::path::PathBuf,
+}
+
+/// Resolve `[server.tls.acme]` from the parsed `autumn.toml`, if configured.
+fn resolve_acme_doctor_config(toml_table: Option<&toml::Table>) -> Option<AcmeDoctorConfig> {
+    let acme = toml_table?
+        .get("server")
+        .and_then(toml::Value::as_table)?
+        .get("tls")
+        .and_then(toml::Value::as_table)?
+        .get("acme")
+        .and_then(toml::Value::as_table)?;
+
+    let domains = acme
+        .get("domains")
+        .and_then(toml::Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(toml::Value::as_str)
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    let cache_dir = acme
+        .get("cache_dir")
+        .and_then(toml::Value::as_str)
+        .map_or_else(|| std::path::PathBuf::from("config/acme"), Into::into);
+
+    Some(AcmeDoctorConfig { domains, cache_dir })
+}
+
+/// Inspect the newest stored ACME certificate under `cache_dir` and grade its
+/// expiry, offline (reuses the #1603 `inspect_leaf` path). Returns
+/// [`TlsDoctorData::NotConfigured`] when nothing is stored yet (a first run
+/// before issuance is not a failure).
+fn resolve_acme_stored_cert_data(cache_dir: &std::path::Path) -> TlsDoctorData {
+    // Find the newest `<id>.chain.pem` + matching `<id>.key.pem` pair.
+    let Some((chain, key)) = newest_acme_cert_pair(cache_dir) else {
+        return TlsDoctorData::NotConfigured;
+    };
+
+    #[cfg(feature = "tls")]
+    {
+        match autumn_web::tls::inspect_leaf(&chain, &key) {
+            Ok(inspection) => {
+                let now = i64::try_from(
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0),
+                )
+                .unwrap_or(i64::MAX);
+                TlsDoctorData::Healthy {
+                    days_until_expiry: inspection.days_until_expiry(now),
+                }
+            }
+            Err(e) => TlsDoctorData::Invalid {
+                detail: e.to_string(),
+            },
+        }
+    }
+    #[cfg(not(feature = "tls"))]
+    {
+        let _ = (chain, key);
+        TlsDoctorData::FeatureDisabled
+    }
+}
+
+/// Find the most-recently-modified `<id>.chain.pem` in `cache_dir` that has a
+/// sibling `<id>.key.pem`, returning both paths.
+fn newest_acme_cert_pair(
+    cache_dir: &std::path::Path,
+) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+    let mut best: Option<(
+        std::time::SystemTime,
+        std::path::PathBuf,
+        std::path::PathBuf,
+    )> = None;
+    for entry in std::fs::read_dir(cache_dir).ok()?.flatten() {
+        let chain = entry.path();
+        let Some(name) = chain.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let Some(id) = name.strip_suffix(".chain.pem") else {
+            continue;
+        };
+        let key = cache_dir.join(format!("{id}.key.pem"));
+        if !key.exists() {
+            continue;
+        }
+        let mtime = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::UNIX_EPOCH);
+        if best.as_ref().is_none_or(|(t, _, _)| mtime >= *t) {
+            best = Some((mtime, chain, key));
+        }
+    }
+    best.map(|(_, chain, key)| (chain, key))
+}
+
+/// Grade the stored ACME certificate's expiry (pure; injectable for tests).
+///
+/// Mirrors [`check_tls_impl`] but names the check `acme_stored_cert` and reads
+/// "no stored certificate yet" (`NotConfigured`) as a benign Pass — the renewal
+/// task will issue one on first boot.
+#[must_use]
+pub fn check_acme_stored_cert_impl(data: &TlsDoctorData) -> CheckResult {
+    match data {
+        TlsDoctorData::NotConfigured => CheckResult {
+            name: "acme_stored_cert",
+            status: CheckStatus::Pass,
+            detail: Some("no ACME certificate stored yet; it will be issued on first boot".into()),
+            hint: None,
+        },
+        TlsDoctorData::FeatureDisabled => CheckResult {
+            name: "acme_stored_cert",
+            status: CheckStatus::Warn,
+            detail: Some(
+                "[server.tls.acme] is configured but this autumn CLI was built without the `tls` \
+                 feature, so the stored certificate could not be inspected"
+                    .into(),
+            ),
+            hint: Some("Rebuild the autumn CLI with the `tls` feature to enable TLS diagnostics"),
+        },
+        TlsDoctorData::Invalid { detail } => CheckResult {
+            name: "acme_stored_cert",
+            status: CheckStatus::Fail,
+            detail: Some(detail.clone()),
+            hint: Some("Delete the corrupt cert from the ACME cache_dir so it is re-issued"),
+        },
+        TlsDoctorData::Healthy { days_until_expiry } if *days_until_expiry < 0 => CheckResult {
+            name: "acme_stored_cert",
+            status: CheckStatus::Fail,
+            detail: Some(format!(
+                "the stored ACME certificate expired {} day(s) ago",
+                days_until_expiry.abs()
+            )),
+            hint: Some("Check the renewal task logs; renewal should have replaced it"),
+        },
+        TlsDoctorData::Healthy { days_until_expiry } if *days_until_expiry <= 30 => CheckResult {
+            name: "acme_stored_cert",
+            status: CheckStatus::Warn,
+            detail: Some(format!(
+                "the stored ACME certificate expires in {days_until_expiry} day(s)"
+            )),
+            hint: Some("The renewal task should renew it automatically; watch for renewal errors"),
+        },
+        TlsDoctorData::Healthy { days_until_expiry } => CheckResult {
+            name: "acme_stored_cert",
+            status: CheckStatus::Pass,
+            detail: Some(format!(
+                "stored ACME certificate valid ({days_until_expiry} day(s) until expiry)"
+            )),
+            hint: None,
+        },
+    }
+}
+
 /// Resolve whether an operator-alert destination (email and/or webhook URL) is
 /// configured, from the environment or the fully-merged effective `[alerts]` (base
 /// `autumn.toml` layered with the active profile's `[profile.{name}]` section and
@@ -4548,6 +4918,31 @@ pub fn run(opts: DoctorOptions) {
     // [server.tls] cert/key and warn on near-expiry / fail on expired.
     let tls_data = resolve_tls_doctor_data();
     tasks.push(Box::new(move || check_tls_impl(&tls_data)));
+
+    // 8a-bis. Automatic ACME provisioning (issue #1608). When [server.tls.acme]
+    // is configured: always inspect the stored certificate offline (expiry), and
+    // — only under --online — actively probe port reachability and DNS.
+    if let Some(acme) = resolve_acme_doctor_config(toml_table.as_ref()) {
+        // Offline: stored certificate expiry (reuses the #1603 inspect path).
+        let stored = resolve_acme_stored_cert_data(&acme.cache_dir);
+        tasks.push(Box::new(move || check_acme_stored_cert_impl(&stored)));
+
+        if opts.online
+            && let Some(domain) = acme.domains.first().cloned()
+        {
+            let d80 = domain.clone();
+            tasks.push(Box::new(move || {
+                let p80 = probe_port(&d80, 80);
+                let p443 = probe_port(&d80, 443);
+                check_acme_ports_impl(&d80, p80, p443)
+            }));
+            let d_dns = domain;
+            tasks.push(Box::new(move || {
+                let outcome = resolve_dns_points_here(&d_dns);
+                check_acme_dns_impl(&d_dns, &outcome)
+            }));
+        }
+    }
 
     // 8b. Rate-limit key-strategy misconfiguration
     tasks.push(Box::new(move || {
@@ -6756,6 +7151,98 @@ pub struct Vault {
         let r = check_tls_impl(&TlsDoctorData::FeatureDisabled);
         assert!(matches!(r.status, CheckStatus::Warn));
         assert!(r.detail.as_deref().unwrap().contains("tls"));
+    }
+
+    // ── ACME preflight graders (issue #1608) ─────────────────────────────────
+
+    #[test]
+    fn acme_ports_pass_when_both_open() {
+        let r = check_acme_ports_impl(
+            "app.example.com",
+            PortReachability::Open,
+            PortReachability::Open,
+        );
+        assert!(matches!(r.status, CheckStatus::Pass));
+    }
+
+    #[test]
+    fn acme_ports_fail_when_80_unreachable() {
+        for p80 in [
+            PortReachability::Refused,
+            PortReachability::TimedOut,
+            PortReachability::Error,
+        ] {
+            let r = check_acme_ports_impl("app.example.com", p80, PortReachability::Open);
+            assert!(matches!(r.status, CheckStatus::Fail), "port80={p80:?}");
+            assert!(r.detail.as_deref().unwrap().contains("port 80"));
+        }
+    }
+
+    #[test]
+    fn acme_ports_warn_when_only_443_down() {
+        let r = check_acme_ports_impl(
+            "app.example.com",
+            PortReachability::Open,
+            PortReachability::Refused,
+        );
+        assert!(matches!(r.status, CheckStatus::Warn));
+    }
+
+    #[test]
+    fn acme_dns_pass_when_points_here() {
+        let r = check_acme_dns_impl("app.example.com", &DnsPointsHere::Matches);
+        assert!(matches!(r.status, CheckStatus::Pass));
+    }
+
+    #[test]
+    fn acme_dns_fail_when_resolves_elsewhere() {
+        let r = check_acme_dns_impl(
+            "app.example.com",
+            &DnsPointsHere::ResolvesElsewhere {
+                resolved: vec!["203.0.113.7".to_owned()],
+            },
+        );
+        assert!(matches!(r.status, CheckStatus::Fail));
+        assert!(r.detail.as_deref().unwrap().contains("203.0.113.7"));
+    }
+
+    #[test]
+    fn acme_dns_warn_when_indeterminate() {
+        for outcome in [DnsPointsHere::Unresolved, DnsPointsHere::LocalIpsUnknown] {
+            let r = check_acme_dns_impl("app.example.com", &outcome);
+            assert!(matches!(r.status, CheckStatus::Warn), "outcome={outcome:?}");
+        }
+    }
+
+    #[test]
+    fn acme_stored_cert_pass_when_none_yet() {
+        let r = check_acme_stored_cert_impl(&TlsDoctorData::NotConfigured);
+        assert!(matches!(r.status, CheckStatus::Pass));
+        assert!(r.detail.as_deref().unwrap().contains("first boot"));
+    }
+
+    #[test]
+    fn acme_stored_cert_fail_when_expired() {
+        let r = check_acme_stored_cert_impl(&TlsDoctorData::Healthy {
+            days_until_expiry: -3,
+        });
+        assert!(matches!(r.status, CheckStatus::Fail));
+    }
+
+    #[test]
+    fn acme_stored_cert_warn_when_near_expiry() {
+        let r = check_acme_stored_cert_impl(&TlsDoctorData::Healthy {
+            days_until_expiry: 10,
+        });
+        assert!(matches!(r.status, CheckStatus::Warn));
+    }
+
+    #[test]
+    fn acme_stored_cert_pass_when_healthy() {
+        let r = check_acme_stored_cert_impl(&TlsDoctorData::Healthy {
+            days_until_expiry: 75,
+        });
+        assert!(matches!(r.status, CheckStatus::Pass));
     }
 
     // ── check_alert_destination_impl (issue #1610) ───────────────────────────

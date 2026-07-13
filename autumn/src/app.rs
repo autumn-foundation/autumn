@@ -3042,6 +3042,31 @@ impl AppBuilder {
             }
         }
 
+        // When ACME is configured, register a `HealthOnly` indicator backed by a
+        // shared status the renewal task writes. Built here (before the router)
+        // so it is baked into `/actuator/health`; the same `AcmeStatus` handle is
+        // reused by the renewal task spawned at bind time below.
+        #[cfg(feature = "acme")]
+        let acme_status: Option<crate::acme::renewal::AcmeStatus> = if let Some(acme_cfg) =
+            config.server.tls.as_ref().and_then(|t| t.acme.as_ref())
+        {
+            let status = crate::acme::renewal::AcmeStatus::new();
+            let indicator = std::sync::Arc::new(crate::acme::renewal::AcmeHealthIndicator::new(
+                status.clone(),
+                acme_cfg.renew_before_days,
+            ));
+            if let Err(e) = state.health_indicator_registry.register(
+                "acme",
+                crate::actuator::IndicatorGroup::HealthOnly,
+                indicator,
+            ) {
+                tracing::warn!("{e}");
+            }
+            Some(status)
+        } else {
+            None
+        };
+
         #[cfg(feature = "db")]
         configure_replica_migration_check(&state, replica_migration_check);
         #[cfg(feature = "db")]
@@ -3053,6 +3078,13 @@ impl AppBuilder {
             crate::cache::clear_global_cache();
         }
         state.insert_extension(RegisteredApiVersions(api_versions));
+
+        // Capture a clone of the registered reporter chain for the ACME renewal
+        // task (spawned below) so each renewal failure reaches the same
+        // Sentry/etc. sinks a request-path 5xx would. Empty is fine — failures
+        // still log via `tracing` inside the loop.
+        #[cfg(all(feature = "acme", feature = "reporting"))]
+        let acme_reporters = error_reporters.clone();
 
         // Install registered error reporters so the reporting layer (wired in
         // `apply_middleware`) can deliver panic + 5xx events. Empty is fine —
@@ -3281,13 +3313,37 @@ impl AppBuilder {
         // would serve plain HTTP on a port operators expect to be HTTPS;
         // (2) TLS is combined with a Unix socket, which the direct-HTTPS path
         // does not serve over (TLS terminates on `host:port`).
-        if config.server.tls.is_some() {
+        if let Some(tls_cfg) = config.server.tls.as_ref() {
+            // Reject an incoherent `[server.tls]` (both static + ACME, neither,
+            // a half-set cert pair, an empty/wildcard ACME domain set, …) before
+            // binding, with a named message. Pure config validation, so it runs
+            // regardless of build features.
+            if let Err(msg) = tls_cfg.validate() {
+                tracing::error!("Invalid [server.tls] configuration: {msg}");
+                #[cfg(feature = "managed-pg")]
+                crate::managed_pg::emergency_stop_async().await;
+                std::process::exit(1);
+            }
             #[cfg(not(feature = "tls"))]
             {
                 tracing::error!(
                     "[server.tls] is configured but this binary was built without the `tls` \
                      feature; rebuild with `--features tls`, or remove [server.tls] to serve \
                      plain HTTP"
+                );
+                #[cfg(feature = "managed-pg")]
+                crate::managed_pg::emergency_stop_async().await;
+                std::process::exit(1);
+            }
+            // `[server.tls.acme]` needs the `acme` feature; otherwise it would be
+            // silently ignored and the app would serve a self-signed placeholder
+            // (or fail) on a port operators expect to serve a real ACME cert.
+            #[cfg(all(feature = "tls", not(feature = "acme")))]
+            if tls_cfg.acme.is_some() {
+                tracing::error!(
+                    "[server.tls.acme] is configured but this binary was built without the \
+                     `acme` feature; rebuild with `--features acme`, or configure a static \
+                     cert_path/key_path instead"
                 );
                 #[cfg(feature = "managed-pg")]
                 crate::managed_pg::emergency_stop_async().await;
@@ -3309,6 +3365,11 @@ impl AppBuilder {
         // background reload task spawned once `server_shutdown` exists.
         #[cfg(feature = "tls")]
         let mut tls_reload_state: Option<TlsReloadState> = None;
+
+        // Carries the ACME challenge listener + renewal task wiring from the TLS
+        // bind path to the sibling tasks spawned once `server_shutdown` exists.
+        #[cfg(feature = "acme")]
+        let mut acme_bind_state: Option<AcmeBindState> = None;
 
         let (bound_listener, bound_desc, unix_socket_cleanup): (
             BoundListener,
@@ -3417,6 +3478,55 @@ impl AppBuilder {
             #[cfg(feature = "tls")]
             {
                 if let Some(tls_cfg) = config.server.tls.as_ref() {
+                    // ACME mode: build the resolver from a stored cert if present,
+                    // else a self-signed placeholder so `:443` binds immediately;
+                    // the renewal task swaps the real cert in once issued.
+                    #[cfg(feature = "acme")]
+                    if let Some(acme_cfg) = tls_cfg.acme.as_ref() {
+                        let https_port = config.server.port;
+                        match build_acme_tls_listener(
+                            listener,
+                            tls_cfg,
+                            acme_cfg,
+                            https_port,
+                            acme_status.clone(),
+                        )
+                        .await
+                        {
+                            Ok((tls_listener, bind_state)) => {
+                                acme_bind_state = Some(bind_state);
+                                (
+                                    BoundListener::Tls(tls_listener),
+                                    format!("https://{addr} (ACME)"),
+                                    None,
+                                )
+                            }
+                            Err(e) => {
+                                tracing::error!(error = %e, "Failed to configure [server.tls.acme]");
+                                #[cfg(feature = "managed-pg")]
+                                crate::managed_pg::emergency_stop_async().await;
+                                std::process::exit(1);
+                            }
+                        }
+                    } else {
+                        match build_tls_listener(listener, tls_cfg) {
+                            Ok((tls_listener, reload)) => {
+                                tls_reload_state = Some(reload);
+                                (
+                                    BoundListener::Tls(tls_listener),
+                                    format!("https://{addr}"),
+                                    None,
+                                )
+                            }
+                            Err(e) => {
+                                tracing::error!(error = %e, "Failed to configure [server.tls]");
+                                #[cfg(feature = "managed-pg")]
+                                crate::managed_pg::emergency_stop_async().await;
+                                std::process::exit(1);
+                            }
+                        }
+                    }
+                    #[cfg(not(feature = "acme"))]
                     match build_tls_listener(listener, tls_cfg) {
                         Ok((tls_listener, reload)) => {
                             tls_reload_state = Some(reload);
@@ -3543,6 +3653,80 @@ impl AppBuilder {
             let reload_shutdown = server_shutdown.child_token();
             tokio::spawn(async move {
                 run_tls_cert_reload(reload, reload_shutdown).await;
+            });
+        }
+
+        // ACME (issue #1608): bind the `:80` HTTP-01 challenge + HTTP→HTTPS
+        // redirect listener and spawn the renewal loop, each a child of
+        // `server_shutdown` so they tear down with the main server. The renewal
+        // loop runs on every replica (a pure `web` replica must renew its own
+        // cert) and leader-elects through the scheduler coordinator so only one
+        // replica orders per certificate.
+        #[cfg(feature = "acme")]
+        if let Some(bind_state) = acme_bind_state.take() {
+            let AcmeBindState {
+                renewal_task,
+                tokens,
+                http_challenge_port,
+                https_port,
+            } = bind_state;
+
+            // The `:80` challenge/redirect listener. Fail-fast on a bind error:
+            // `:80` needs privilege (CAP_NET_BIND_SERVICE) and ACME validation
+            // cannot succeed without it.
+            let challenge_addr = format!("0.0.0.0:{http_challenge_port}");
+            let challenge_listener = match tokio::net::TcpListener::bind(&challenge_addr).await {
+                Ok(l) => l,
+                Err(e) => {
+                    tracing::error!(
+                        addr = %challenge_addr,
+                        "Failed to bind the ACME HTTP-01 challenge listener: {e}. Port \
+                         {http_challenge_port} typically needs privilege (grant \
+                         CAP_NET_BIND_SERVICE), or set [server.tls.acme] http_challenge_port \
+                         to a port a front-end forwards :80 to"
+                    );
+                    #[cfg(feature = "managed-pg")]
+                    crate::managed_pg::emergency_stop_async().await;
+                    std::process::exit(1);
+                }
+            };
+            let challenge_router = crate::acme::challenge::challenge_router(tokens, https_port);
+            let challenge_shutdown = server_shutdown.child_token();
+            tokio::spawn(async move {
+                if let Err(e) = axum::serve(challenge_listener, challenge_router)
+                    .with_graceful_shutdown(async move {
+                        challenge_shutdown.cancelled().await;
+                    })
+                    .await
+                {
+                    tracing::error!(error = %e, "ACME challenge listener stopped with an error");
+                }
+            });
+
+            // Build the coordinator for leader election (regardless of role) and
+            // the reporter callback, then spawn the renewal loop.
+            let coordinator =
+                match crate::scheduler::coordinator_from_config(&config.scheduler, &state) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "ACME renewal: falling back to an in-process coordinator"
+                        );
+                        std::sync::Arc::new(crate::scheduler::InProcessSchedulerCoordinator::new(
+                            config.scheduler.resolved_replica_id(),
+                        ))
+                    }
+                };
+            #[cfg(feature = "reporting")]
+            let reporter = make_acme_reporter(acme_reporters);
+            #[cfg(not(feature = "reporting"))]
+            let reporter = make_acme_reporter();
+            let renewal_shutdown = server_shutdown.child_token();
+            tokio::spawn(async move {
+                renewal_task
+                    .run(coordinator, reporter, renewal_shutdown)
+                    .await;
             });
         }
 
@@ -5567,8 +5751,18 @@ fn build_tls_listener(
     cfg: &crate::config::TlsConfig,
 ) -> Result<(crate::tls::TlsListener, TlsReloadState), crate::tls::TlsError> {
     let provider = crate::tls::crypto_provider();
-    let certified =
-        crate::tls::load_certified_key(&cfg.cert_path, &cfg.key_path, &provider, now_unix())?;
+    // The pre-bind `TlsConfig::validate()` guarantees both paths are set in
+    // static-cert mode (the only mode that reaches this function; ACME mode is
+    // handled separately), so unwrapping here is validated, not hopeful.
+    let cert_path = cfg
+        .cert_path
+        .as_deref()
+        .expect("validated: static [server.tls] sets cert_path");
+    let key_path = cfg
+        .key_path
+        .as_deref()
+        .expect("validated: static [server.tls] sets key_path");
+    let certified = crate::tls::load_certified_key(cert_path, key_path, &provider, now_unix())?;
     let resolver = std::sync::Arc::new(crate::tls::ReloadableCertResolver::new(certified));
     let server_config = crate::tls::build_server_config(
         std::sync::Arc::clone(&provider),
@@ -5581,12 +5775,161 @@ fn build_tls_listener(
     let reload = TlsReloadState {
         resolver,
         provider,
-        cert_path: cfg.cert_path.clone(),
-        key_path: cfg.key_path.clone(),
+        cert_path: cert_path.to_path_buf(),
+        key_path: key_path.to_path_buf(),
         // A zero interval would busy-loop; clamp to at least one second.
         interval: std::time::Duration::from_secs(cfg.reload_interval_secs.max(1)),
     };
     Ok((listener, reload))
+}
+
+/// Carries the ACME challenge-listener + renewal-task wiring from the bind path
+/// to the sibling tasks spawned once `server_shutdown` exists.
+#[cfg(feature = "acme")]
+struct AcmeBindState {
+    renewal_task: crate::acme::renewal::AcmeRenewalTask,
+    tokens: crate::acme::challenge::Http01Tokens,
+    http_challenge_port: u16,
+    https_port: u16,
+}
+
+/// Build a TLS listener for ACME mode: serve a stored certificate if one is
+/// present, else a self-signed placeholder so `:443` binds immediately. The
+/// returned [`AcmeBindState`] carries everything the renewal task and challenge
+/// listener need.
+#[cfg(feature = "acme")]
+async fn build_acme_tls_listener(
+    tcp: tokio::net::TcpListener,
+    tls_cfg: &crate::config::TlsConfig,
+    acme_cfg: &crate::config::AcmeConfig,
+    https_port: u16,
+    status: Option<crate::acme::renewal::AcmeStatus>,
+) -> Result<(crate::tls::TlsListener, AcmeBindState), String> {
+    use crate::acme::store::{AcmeStore, CertId, FsAcmeStore};
+
+    let provider = crate::tls::crypto_provider();
+    let cert_id = CertId::from_domains(&acme_cfg.domains);
+    let directory_label = crate::acme::directory_label(&acme_cfg.directory);
+    let store: std::sync::Arc<dyn AcmeStore> = std::sync::Arc::new(FsAcmeStore::new(
+        acme_cfg.cache_dir.clone(),
+        directory_label,
+    ));
+    let status = status.unwrap_or_default();
+
+    // Prefer a valid stored certificate; fall back to a self-signed placeholder
+    // so the port comes up while the first issuance runs in the background.
+    let (initial, serving_stored_cert) = match store.load_cert(&cert_id).await {
+        Ok(Some(stored)) => match crate::tls::certified_key_from_pem(
+            stored.chain_pem.as_bytes(),
+            stored.key_pem.as_bytes(),
+            &provider,
+        ) {
+            Ok(ck) => {
+                if let Ok(not_after) =
+                    crate::tls::leaf_not_after_from_pem(stored.chain_pem.as_bytes())
+                {
+                    status.set_cert_not_after(not_after);
+                }
+                (ck, true)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "stored ACME certificate is unusable ({e}); serving a self-signed \
+                     placeholder until the renewal task issues a real one"
+                );
+                (acme_placeholder_key(&acme_cfg.domains, &provider)?, false)
+            }
+        },
+        Ok(None) => (acme_placeholder_key(&acme_cfg.domains, &provider)?, false),
+        Err(e) => {
+            tracing::warn!(
+                "failed to read the stored ACME certificate ({e}); serving a self-signed \
+                 placeholder"
+            );
+            (acme_placeholder_key(&acme_cfg.domains, &provider)?, false)
+        }
+    };
+
+    let resolver = std::sync::Arc::new(crate::tls::ReloadableCertResolver::new(initial));
+    let server_config = crate::tls::build_server_config(
+        std::sync::Arc::clone(&provider),
+        std::sync::Arc::clone(&resolver),
+    )
+    .map_err(|e| e.to_string())?;
+    let handshake_timeout = std::time::Duration::from_secs(tls_cfg.handshake_timeout_secs.max(1));
+    let listener = crate::tls::TlsListener::new(tcp, server_config, handshake_timeout);
+
+    let tokens = crate::acme::challenge::Http01Tokens::new();
+    let renewal_task = crate::acme::renewal::AcmeRenewalTask {
+        resolver,
+        provider,
+        store,
+        cert_id,
+        tokens: tokens.clone(),
+        status,
+        config: acme_cfg.clone(),
+        serving_stored_cert,
+    };
+    Ok((
+        listener,
+        AcmeBindState {
+            renewal_task,
+            tokens,
+            http_challenge_port: acme_cfg.http_challenge_port,
+            https_port,
+        },
+    ))
+}
+
+/// Build a `CertifiedKey` from a fresh self-signed placeholder for `domains`.
+#[cfg(feature = "acme")]
+fn acme_placeholder_key(
+    domains: &[String],
+    provider: &rustls::crypto::CryptoProvider,
+) -> Result<std::sync::Arc<rustls::sign::CertifiedKey>, String> {
+    let placeholder = crate::acme::renewal::self_signed_placeholder(domains)?;
+    crate::tls::certified_key_from_pem(
+        placeholder.chain_pem.as_bytes(),
+        placeholder.key_pem.as_bytes(),
+        provider,
+    )
+}
+
+/// Build the ACME renewal failure reporter: dispatch each failure as an
+/// [`ErrorEvent`](crate::reporting::ErrorEvent) to the registered reporter chain
+/// on a detached task, so failures reach Sentry/etc. when configured (failures
+/// also always log via `tracing` inside the loop).
+#[cfg(all(feature = "acme", feature = "reporting"))]
+fn make_acme_reporter(
+    reporters: Vec<std::sync::Arc<dyn crate::reporting::ErrorReporter>>,
+) -> crate::acme::renewal::ReporterFn {
+    std::sync::Arc::new(move |message: String| {
+        if reporters.is_empty() {
+            return;
+        }
+        let reporters = reporters.clone();
+        tokio::spawn(async move {
+            let event = crate::reporting::ErrorEvent {
+                status: axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                message,
+                problem_type: None,
+                request_id: None,
+                route: Some("acme-renewal".to_owned()),
+                method: None,
+                panic: None,
+            };
+            for reporter in &reporters {
+                reporter.report(&event).await;
+            }
+        });
+    })
+}
+
+/// The no-op ACME reporter used when the `reporting` feature is off (failures
+/// still log via `tracing`).
+#[cfg(all(feature = "acme", not(feature = "reporting")))]
+fn make_acme_reporter() -> crate::acme::renewal::ReporterFn {
+    std::sync::Arc::new(|_message: String| {})
 }
 
 /// Modification times of the cert and key files, `None` for a file that could

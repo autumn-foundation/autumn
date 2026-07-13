@@ -26,6 +26,11 @@ path = "src/main.rs"
 # certificate parsing.
 default = ["tls"]
 tls = ["autumn-web/tls"]
+# Mirrors autumn-web's `acme` feature (issue #1608). The `autumn doctor` ACME
+# preflight checks compile in every build (they only need `std`), but enabling
+# this keeps CLI/library feature parity and turns on `autumn-web/acme` for any
+# future ACME-aware CLI tooling. Implies `tls` (ACME builds on it).
+acme = ["tls", "autumn-web/acme"]
 
 [dependencies]
 autumn-web = { version = "0.6.0", path = "../autumn", default-features = false, features = [
