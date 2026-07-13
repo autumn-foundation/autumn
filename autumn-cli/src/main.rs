@@ -5036,6 +5036,17 @@ mod tests {
     }
 
     #[test]
+    fn parse_routes_format_csv() {
+        let cli = Cli::try_parse_from(["autumn", "routes", "--format", "csv"]).unwrap();
+        match cli.command {
+            Commands::Routes { format, .. } => {
+                assert_eq!(format, "csv");
+            }
+            _ => panic!("expected Routes command"),
+        }
+    }
+
+    #[test]
     fn parse_routes_with_package() {
         let cli = Cli::try_parse_from(["autumn", "routes", "-p", "blog"]).unwrap();
         match cli.command {
