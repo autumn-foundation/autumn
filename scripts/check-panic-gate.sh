@@ -73,17 +73,42 @@ for module in "${REQUEST_PATH_MODULES[@]}"; do
   [[ -f "$module" ]] || die "gated request-path module is missing: $module"
   grep -q 'autumn-panic-gate:' "$module" \
     || die "missing gate marker 'autumn-panic-gate:' in $module"
-  # The deny header is `#![cfg_attr(not(test), deny(clippy::unwrap_used, …))]`.
-  # rustfmt wraps it across several lines, so match its stable tokens
-  # individually rather than as one literal block.
-  grep -q '#!\[cfg_attr(' "$module" \
-    && grep -q 'not(test)' "$module" \
-    && grep -q 'deny(' "$module" \
+  # Extract ONLY the crate-level panic-gate deny attribute. rustfmt wraps it
+  # across several lines:
+  #
+  #     #![cfg_attr(
+  #         not(test),
+  #         deny(
+  #             clippy::unwrap_used,
+  #             …
+  #             clippy::indexing_slicing,
+  #         )
+  #     )]
+  #
+  # Capture the region from the `#![cfg_attr(` opener through its closing `)]`
+  # and validate the required lints INSIDE that block only. The block is
+  # buffered and emitted solely once the closer is seen, so an unterminated
+  # header yields an empty block (and a hard failure below) rather than a run
+  # to EOF. Scoping to the block matters: gated modules now carry legitimate
+  # per-site `#[allow(clippy::expect_used, reason = "…")]` annotations, and a
+  # whole-file scan would let such an `#[allow(...)]` spoof a lint that was
+  # actually dropped from the deny header.
+  deny_block="$(awk '
+    /#!\[cfg_attr\(/       { capturing = 1 }
+    capturing             { buf = buf $0 ORS }
+    capturing && /\)\]/    { printf "%s", buf; exit }
+  ' "$module")"
+
+  [[ -n "$deny_block" ]] \
+    || die "could not locate a terminated '#![cfg_attr(not(test), deny(…))]' gate header in $module"
+  grep -q 'not(test)' <<<"$deny_block" \
+    && grep -q 'deny(' <<<"$deny_block" \
     || die "missing gate deny header opener '#![cfg_attr(not(test), deny(' in $module"
-  # Require every canonical panic lint by its fully-qualified token so no
-  # gated module can quietly drop one while keeping the others.
+  # Require every canonical panic lint by its fully-qualified token, matched
+  # WITHIN the extracted deny block so no gated module can quietly drop one from
+  # the header while a per-site `#[allow(...)]` keeps the token alive elsewhere.
   for lint in "${REQUIRED_PANIC_LINTS[@]}"; do
-    grep -qF "$lint" "$module" \
+    grep -qF "$lint" <<<"$deny_block" \
       || die "gate header in $module is missing required panic lint '$lint'"
   done
 done
