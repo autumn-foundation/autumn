@@ -438,7 +438,15 @@ fn parse_nodes(trees: &[TokenTree]) -> Vec<Node> {
                 // Control flow (`@if`/`@for`/`@match`/`@let`): dynamic, but still
                 // descend into any block so elements inside are analyzed.
                 nodes.push(Node::Dynamic);
-                i = skip_control(trees, i + 1, &mut nodes);
+                if matches!(trees.get(i + 1), Some(TokenTree::Ident(id)) if *id == "match") {
+                    // `@match` is special: the brace group after the scrutinee is
+                    // an arm LIST, not markup. Parsing it as markup would treat
+                    // each arm's pattern (e.g. `input => …`) as an element and
+                    // fire a false positive. Skip past `@match`, then parse arms.
+                    i = skip_match(trees, i + 2, &mut nodes);
+                } else {
+                    i = skip_control(trees, i + 1, &mut nodes);
+                }
             }
             TokenTree::Group(g) => {
                 if g.delimiter() == Delimiter::Brace {
@@ -479,6 +487,87 @@ fn skip_control(trees: &[TokenTree], start: usize, nodes: &mut Vec<Node>) -> usi
         }
     }
     i
+}
+
+/// Skip a `@match` head and scan only the arm BODIES. `start` points just past
+/// `@match`, at the scrutinee expression. The first brace group encountered is
+/// the arm list (a Rust struct-literal scrutinee needs parens, so it cannot be
+/// mistaken for this brace); its contents are handed to [`parse_match_arms`].
+fn skip_match(trees: &[TokenTree], start: usize, nodes: &mut Vec<Node>) -> usize {
+    let mut i = start;
+    while i < trees.len() {
+        if let TokenTree::Group(g) = &trees[i]
+            && g.delimiter() == Delimiter::Brace
+        {
+            let arms: Vec<TokenTree> = g.stream().into_iter().collect();
+            parse_match_arms(&arms, nodes);
+            return i + 1;
+        }
+        i += 1;
+    }
+    i
+}
+
+/// Parse a maud `@match` arm list. For each arm, skip the pattern tokens (and
+/// any `if <guard>`) up to and including `=>`, then scan ONLY the arm body as
+/// markup. This keeps arm patterns from being misread as elements while still
+/// analyzing the real markup each arm renders.
+fn parse_match_arms(trees: &[TokenTree], nodes: &mut Vec<Node>) {
+    let mut i = 0;
+    while i < trees.len() {
+        // Locate the `=>` that separates this arm's pattern/guard from its body.
+        // A fat arrow is two joined puncts `=` `>`; the first one after the arm
+        // start delimits the body (guards use `>=`/`==`, never `=>`).
+        let Some(arrow) = find_fat_arrow(trees, i) else {
+            break;
+        };
+        i = parse_arm_body(trees, arrow + 2, nodes);
+    }
+}
+
+/// The index of the `=` token of the first `=>` at or after `start`, if any.
+fn find_fat_arrow(trees: &[TokenTree], start: usize) -> Option<usize> {
+    let mut i = start;
+    while i < trees.len() {
+        if let TokenTree::Punct(p) = &trees[i]
+            && p.as_char() == '='
+            && matches!(trees.get(i + 1), Some(TokenTree::Punct(q)) if q.as_char() == '>')
+        {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Scan a single `@match` arm body starting at `start` (just past `=>`) and
+/// return the index of the next arm. A brace-group body is parsed as markup; any
+/// other shape (`(splice)`, string literal, single element) is collected up to
+/// the next top-level comma and parsed as markup. An unrecognized/ambiguous
+/// shape is simply skipped — a missed check is acceptable here, a false positive
+/// is not.
+fn parse_arm_body(trees: &[TokenTree], start: usize, nodes: &mut Vec<Node>) -> usize {
+    if let Some(TokenTree::Group(g)) = trees.get(start)
+        && g.delimiter() == Delimiter::Brace
+    {
+        nodes.extend(parse_markup(&g.stream()));
+        let mut next = start + 1;
+        if matches!(trees.get(next), Some(TokenTree::Punct(p)) if p.as_char() == ',') {
+            next += 1;
+        }
+        return next;
+    }
+    // Non-brace body: collect up to the next top-level comma (group contents are
+    // atomic token trees, so any comma seen here is an arm separator).
+    let mut j = start;
+    while j < trees.len() {
+        if matches!(&trees[j], TokenTree::Punct(p) if p.as_char() == ',') {
+            break;
+        }
+        j += 1;
+    }
+    nodes.extend(parse_nodes(&trees[start..j]));
+    if j < trees.len() { j + 1 } else { j }
 }
 
 /// Parse a single element starting at `trees[start]` (an ident). Returns the
@@ -1136,6 +1225,44 @@ mod tests {
     fn element_inside_control_block_is_still_scanned() {
         let src = wrap(r#"@if show { img src="x.png"; }"#);
         assert_eq!(rule_ids(&src), vec!["image-alt"]);
+    }
+
+    #[test]
+    fn match_arm_pattern_named_input_is_not_flagged() {
+        // Regression: an `@match` arm whose PATTERN is named `input` must not be
+        // read as an `<input>` element. Parsing the arm list as markup produced a
+        // false `label` finding on valid views.
+        let src = wrap(r#"@match field { input => { "text" } }"#);
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn match_arm_body_real_input_is_still_flagged() {
+        // The arm PATTERN is skipped, but the arm BODY is still scanned: a real
+        // unlabeled `<input>` inside an arm body must still be flagged.
+        let src = wrap(r"@match x { A => { input; } }");
+        assert_eq!(rule_ids(&src), vec!["label"], "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn match_arm_with_guard_does_not_misparse() {
+        // A guard (`Pattern if cond => …`) sits between the pattern and `=>` and
+        // must be skipped along with the pattern — no crash, no false finding.
+        let src = wrap(r#"@match x { A if ready => { "ok" } B => { "no" } }"#);
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn match_multiple_arms_scan_each_body() {
+        // Several arms, mixed body shapes: only the real markup in bodies counts.
+        // The `input` pattern must not flag; the alt-less `<img>` body must.
+        let src = wrap(r#"@match k { input => { "a" } other => { img src="x.png"; } }"#);
+        assert_eq!(
+            rule_ids(&src),
+            vec!["image-alt"],
+            "{:?}",
+            findings_for(&src)
+        );
     }
 
     #[test]
