@@ -323,27 +323,46 @@ pub fn accept_prefers_html(headers: &axum::http::HeaderMap) -> bool {
     )
 }
 
-/// The one canonical q-value `Accept` negotiator.
+/// Best `(q-value, list-index)` seen for each media type the crate negotiates
+/// on, parsed from a request's `Accept` header by the one canonical parser
+/// [`accept_qualities`].
 ///
-/// Returns the client's concrete representation preference. Empty or missing
-/// `Accept` yields [`AcceptPreference::Unspecified`]; a `*/*`-only header
-/// yields [`AcceptPreference::Any`]. When both `text/html` and
-/// `application/json` are present, the higher q-value wins, ties broken by
-/// earlier list position.
-pub fn accept_preference(headers: &axum::http::HeaderMap) -> AcceptPreference {
+/// `index` is the position of the winning entry in the comma-separated header
+/// (0-based), used to break q-value ties in favour of the earlier entry. Each
+/// field is `None` when that media type was absent or fully demoted (`q=0`).
+/// Both [`accept_preference`] (legacy enum resolution) and the
+/// [`Negotiate`](crate::negotiate::Negotiate) responder (effective-q
+/// resolution) build on this shared parse, so the crate never forks its
+/// `Accept` parsing.
+// `pub` (not `pub(crate)`): the enclosing `error_page_filter` module is itself
+// `pub(crate)`, so these never escape the crate (clippy::redundant_pub_crate).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct AcceptQualities {
+    /// Best match for `text/html`.
+    pub html: Option<(f32, usize)>,
+    /// Best match for `application/json` / `application/problem+json`.
+    pub json: Option<(f32, usize)>,
+    /// Best match for the `*/*` wildcard.
+    pub wildcard: Option<(f32, usize)>,
+}
+
+/// The one canonical `Accept` parser.
+///
+/// Scans the comma-separated `Accept` header once, recording the best
+/// `(q-value, list-index)` seen for `text/html`, for `application/json` /
+/// `application/problem+json`, and for the `*/*` wildcard. Entries demoted to
+/// `q=0` are dropped, and out-of-range q-values are clamped to `[0.0, 1.0]`.
+///
+/// This is the crate's single source of truth for `Accept` tokenisation; the
+/// two consumers apply their own *resolution policy* on top of the returned
+/// [`AcceptQualities`] (they differ only in policy, not parsing).
+pub fn accept_qualities(headers: &axum::http::HeaderMap) -> AcceptQualities {
     let accept = headers
         .get(axum::http::header::ACCEPT)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
 
-    // If no Accept header, there is no concrete preference.
-    if accept.is_empty() {
-        return AcceptPreference::Unspecified;
-    }
-
-    let mut html: Option<(f32, usize)> = None;
-    let mut json: Option<(f32, usize)> = None;
-    let mut wildcard: Option<(f32, usize)> = None;
+    let mut qualities = AcceptQualities::default();
 
     for (index, raw_part) in accept.split(',').enumerate() {
         let part = raw_part.trim();
@@ -372,20 +391,53 @@ pub fn accept_preference(headers: &axum::http::HeaderMap) -> AcceptPreference {
         }
 
         match mime {
-            "text/html" if html.is_none_or(|(existing_q, _)| q > existing_q) => {
-                html = Some((q, index));
+            "text/html" if qualities.html.is_none_or(|(existing_q, _)| q > existing_q) => {
+                qualities.html = Some((q, index));
             }
             "application/json" | "application/problem+json"
-                if json.is_none_or(|(existing_q, _)| q > existing_q) =>
+                if qualities.json.is_none_or(|(existing_q, _)| q > existing_q) =>
             {
-                json = Some((q, index));
+                qualities.json = Some((q, index));
             }
-            "*/*" if wildcard.is_none_or(|(existing_q, _)| q > existing_q) => {
-                wildcard = Some((q, index));
+            "*/*"
+                if qualities
+                    .wildcard
+                    .is_none_or(|(existing_q, _)| q > existing_q) =>
+            {
+                qualities.wildcard = Some((q, index));
             }
             _ => {}
         }
     }
+
+    qualities
+}
+
+/// The one canonical q-value `Accept` negotiator (legacy enum resolution).
+///
+/// Returns the client's concrete representation preference. Empty or missing
+/// `Accept` yields [`AcceptPreference::Unspecified`]; a `*/*`-only header
+/// yields [`AcceptPreference::Any`]. When both `text/html` and
+/// `application/json` are present, the higher q-value wins, ties broken by
+/// earlier list position. Parsing is delegated to the shared
+/// [`accept_qualities`]; this function only applies the enum resolution policy.
+pub fn accept_preference(headers: &axum::http::HeaderMap) -> AcceptPreference {
+    // Distinguish a missing/empty `Accept` (no concrete preference at all) from
+    // one that is present but names no html/json/wildcard type. The shared
+    // parser collapses both to all-`None`, so the emptiness check stays here.
+    let accept = headers
+        .get(axum::http::header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if accept.is_empty() {
+        return AcceptPreference::Unspecified;
+    }
+
+    let AcceptQualities {
+        html,
+        json,
+        wildcard,
+    } = accept_qualities(headers);
 
     match (html, json, wildcard) {
         (Some((hq, hidx)), Some((jq, jidx)), _) => {

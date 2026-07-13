@@ -93,6 +93,55 @@ async fn q_value_negotiation_prefers_html() {
 }
 
 #[tokio::test]
+async fn wildcard_q_demotes_html_and_serves_json() {
+    // Codex P2 case: `text/html` is explicitly demoted to q=0.1 while `*/*;q=1`
+    // covers `application/json` at q=1, so JSON must win despite html appearing.
+    let response = send(app(), Some("text/html;q=0.1, */*;q=1")).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(header(&response, "content-type"), "application/json");
+    assert_eq!(header(&response, "vary"), "Accept");
+    assert_eq!(body_string(response).await, r#"{"id":7,"name":"spanner"}"#);
+}
+
+#[tokio::test]
+async fn explicit_html_ties_wildcard_and_serves_html() {
+    // `text/html` and `*/*` tie at q=1; the earlier (html) entry wins.
+    let response = send(app(), Some("text/html;q=1, */*;q=1")).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(header(&response, "content-type").starts_with("text/html"));
+    assert_eq!(header(&response, "vary"), "Accept");
+    assert!(body_string(response).await.contains("<h1>spanner</h1>"));
+}
+
+#[tokio::test]
+async fn explicit_json_beats_demoted_wildcard_and_serves_json() {
+    // `application/json` at q=1 outranks the html-covering `*/*;q=0.1`.
+    let response = send(app(), Some("application/json, */*;q=0.1")).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(header(&response, "content-type"), "application/json");
+    assert_eq!(header(&response, "vary"), "Accept");
+    assert_eq!(body_string(response).await, r#"{"id":7,"name":"spanner"}"#);
+}
+
+#[tokio::test]
+async fn bare_wildcard_uses_default_html() {
+    let response = send(app(), Some("*/*")).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(header(&response, "content-type").starts_with("text/html"));
+    assert!(body_string(response).await.contains("<h1>spanner</h1>"));
+}
+
+#[tokio::test]
+async fn bare_wildcard_honours_configured_json_default() {
+    let app = Router::new().route("/widget", axum::routing::get(show_json_default));
+    let response = send(app, Some("*/*")).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(header(&response, "content-type"), "application/json");
+    assert_eq!(header(&response, "vary"), "Accept");
+    assert_eq!(body_string(response).await, r#"{"id":7,"name":"spanner"}"#);
+}
+
+#[tokio::test]
 async fn missing_accept_defaults_to_html() {
     let response = send(app(), None).await;
     assert_eq!(response.status(), StatusCode::OK);
