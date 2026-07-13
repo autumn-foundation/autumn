@@ -285,8 +285,19 @@ pub fn grade_ssh_reachability(
 /// missing/too-short/known-demo secret, so preflight reuses that exact validator
 /// to reject the same values here — otherwise `deploy check` would greenlight a
 /// release that immediately fails to boot (or ships a known demo secret).
+///
+/// The app boot path (`fail_fast_on_invalid_signing_secret`) also validates every
+/// `previous_secrets` rotation entry with the same validator and exits if any is
+/// weak, so preflight validates them too: a strong current secret paired with a
+/// `previous_secrets = ["changeme"]` entry would otherwise pass `deploy check`
+/// and then fail to boot. The rejection message names the offending rotation
+/// entry by position without printing its value.
 #[must_use]
-pub fn grade_signing_secret(secret: Option<&str>, is_production: bool) -> PreflightCheck {
+pub fn grade_signing_secret(
+    secret: Option<&str>,
+    previous_secrets: &[String],
+    is_production: bool,
+) -> PreflightCheck {
     let Some(value) = secret.map(str::trim).filter(|s| !s.is_empty()) else {
         return PreflightCheck::fail(
             "signing_secret",
@@ -319,6 +330,32 @@ pub fn grade_signing_secret(secret: Option<&str>, is_production: bool) -> Prefli
                 detail,
                 "Set a strong AUTUMN_SECURITY__SIGNING_SECRET (generate with `openssl rand -hex 32`)",
             );
+        }
+
+        // Rotation secrets accepted during a grace window must clear the same
+        // bar as the current secret; the app boot path validates each
+        // `previous_secrets` entry with the same validator and exits on the
+        // first weak one. Report by 1-based position without printing the value.
+        for (index, previous) in previous_secrets.iter().enumerate() {
+            if let Err(error) = validate_signing_secret(Some(previous.as_str()), true) {
+                let position = index + 1;
+                let detail = match error {
+                    SigningSecretError::MissingInProduction => format!(
+                        "previous (rotation) signing secret #{position} is empty and not allowed in production"
+                    ),
+                    SigningSecretError::TooShort { actual, required } => format!(
+                        "previous (rotation) signing secret #{position} is too short ({actual} bytes, minimum {required}) for production"
+                    ),
+                    SigningSecretError::KnownWeakValue(_) => format!(
+                        "previous (rotation) signing secret #{position} is a known demo/template value not allowed in production"
+                    ),
+                };
+                return PreflightCheck::fail(
+                    "signing_secret",
+                    detail,
+                    "Remove or rotate out the weak entry in security.signing_secret.previous_secrets (each must be as strong as the current secret)",
+                );
+            }
         }
     }
 
@@ -643,6 +680,7 @@ fn collect_preflight(
         ),
         grade_signing_secret(
             config.security.signing_secret.secret.as_deref(),
+            &config.security.signing_secret.previous_secrets,
             is_production_profile(config.profile.as_deref()),
         ),
         grade_database_url(
@@ -965,21 +1003,23 @@ mod tests {
 
     #[test]
     fn signing_secret_grader_never_echoes_value() {
-        let present = grade_signing_secret(Some("super-secret-value"), false);
+        let present = grade_signing_secret(Some("super-secret-value"), &[], false);
         assert!(present.passed);
         assert!(!present.detail.contains("super-secret-value"));
 
-        let missing = grade_signing_secret(None, false);
+        let missing = grade_signing_secret(None, &[], false);
         assert!(!missing.passed);
-        assert!(!grade_signing_secret(Some("   "), false).passed);
+        assert!(!grade_signing_secret(Some("   "), &[], false).passed);
     }
 
     #[test]
     fn signing_secret_grader_non_production_accepts_weak_secret() {
         // Outside production, a present, non-empty secret is enough: a dev/staging
         // deploy must not be blocked by the production strength rules.
-        assert!(grade_signing_secret(Some("changeme"), false).passed);
-        assert!(grade_signing_secret(Some("short"), false).passed);
+        assert!(grade_signing_secret(Some("changeme"), &[], false).passed);
+        assert!(grade_signing_secret(Some("short"), &[], false).passed);
+        // A weak rotation secret is likewise fine outside production.
+        assert!(grade_signing_secret(Some("changeme"), &["also-weak".to_owned()], false).passed);
     }
 
     #[test]
@@ -989,13 +1029,13 @@ mod tests {
         // path also runs before binding. A known demo value and a too-short
         // secret must both FAIL preflight so `deploy check` never greenlights a
         // release that would exit on startup.
-        let demo = grade_signing_secret(Some("changeme"), true);
+        let demo = grade_signing_secret(Some("changeme"), &[], true);
         assert!(!demo.passed, "demo value must fail in production");
         assert!(demo.hint.is_some());
         // Never echo the secret value, even a known demo one.
         assert!(!demo.detail.contains("changeme"));
 
-        let short = grade_signing_secret(Some("too-short"), true);
+        let short = grade_signing_secret(Some("too-short"), &[], true);
         assert!(!short.passed, "too-short secret must fail in production");
         assert!(!short.detail.contains("too-short"));
     }
@@ -1005,7 +1045,7 @@ mod tests {
         // A 64-hex-char secret (openssl rand -hex 32) clears the runtime
         // validator's minimum length and is not a demo value.
         let strong = "a".repeat(64);
-        let check = grade_signing_secret(Some(&strong), true);
+        let check = grade_signing_secret(Some(&strong), &[], true);
         assert!(
             check.passed,
             "strong production secret should pass: {}",
@@ -1016,9 +1056,51 @@ mod tests {
 
     #[test]
     fn signing_secret_grader_production_missing_fails() {
-        let check = grade_signing_secret(None, true);
+        let check = grade_signing_secret(None, &[], true);
         assert!(!check.passed);
         assert!(check.hint.is_some());
+    }
+
+    #[test]
+    fn signing_secret_grader_production_rejects_weak_previous_secret() {
+        // The app boot path validates each `previous_secrets` entry with the same
+        // rule and exits if any is weak, so a strong CURRENT secret paired with a
+        // weak rotation entry must FAIL preflight rather than boot-crash later.
+        let strong = "a".repeat(64);
+        let check = grade_signing_secret(Some(&strong), &["changeme".to_owned()], true);
+        assert!(
+            !check.passed,
+            "weak previous_secrets entry must fail in production"
+        );
+        assert!(check.hint.is_some());
+        // Never echo the rotation secret value.
+        assert!(!check.detail.contains("changeme"));
+        // The message identifies it as a previous/rotation secret.
+        assert!(
+            check.detail.contains("previous"),
+            "detail should name the rotation secret: {}",
+            check.detail
+        );
+    }
+
+    #[test]
+    fn signing_secret_grader_production_accepts_strong_previous_secrets() {
+        // Strong current + strong rotation entries pass.
+        let strong = "a".repeat(64);
+        let previous = vec!["b".repeat(64), "c".repeat(64)];
+        let check = grade_signing_secret(Some(&strong), &previous, true);
+        assert!(
+            check.passed,
+            "strong current + strong previous should pass: {}",
+            check.detail
+        );
+    }
+
+    #[test]
+    fn signing_secret_grader_non_production_ignores_weak_previous_secret() {
+        // Outside production, rotation entries are not strength-checked.
+        let check = grade_signing_secret(Some("dev-secret"), &["changeme".to_owned()], false);
+        assert!(check.passed);
     }
 
     #[test]

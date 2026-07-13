@@ -4084,6 +4084,28 @@ fn resolve_deploy_signing_secret(merged: &toml::Table) -> Option<String> {
         .map(std::borrow::ToOwned::to_owned)
 }
 
+/// Resolve the `previous_secrets` rotation entries the deploy preflight should
+/// grade, from the SAME merged active-profile runtime table used for the current
+/// signing secret. `previous_secrets` has no env override in the runtime loader
+/// (only `AUTUMN_SECURITY__SIGNING_SECRET` sets the current secret), so it is
+/// read from the merged table alone — matching what `AutumnConfig::load()` and
+/// `autumn deploy check` see. Never returns/prints the values except to the
+/// (secret-safe) grader.
+fn resolve_deploy_previous_signing_secrets(merged: &toml::Table) -> Vec<String> {
+    merged
+        .get("security")
+        .and_then(|s| s.get("signing_secret"))
+        .and_then(|ss| ss.get("previous_secrets"))
+        .and_then(toml::Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(toml::Value::as_str)
+                .map(std::borrow::ToOwned::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Whether any enabled runtime feature requires a configured Postgres pool at
 /// startup, resolved from the merged active-profile runtime table (env first).
 /// Mirrors the exact backend conditions the runtime enforces:
@@ -5847,6 +5869,10 @@ pub fn run(opts: DoctorOptions) {
         // table, so a raw lookup would report it MISSING even though
         // `AutumnConfig::load()` and `autumn deploy check` see it.
         let deploy_signing = resolve_deploy_signing_secret(&merged_deploy_toml);
+        // Rotation secrets accepted during a grace window are validated at boot
+        // with the same rule as the current secret, so grade them here from the
+        // same merged table (no env override exists for `previous_secrets`).
+        let deploy_previous_signing = resolve_deploy_previous_signing_secrets(&merged_deploy_toml);
         // Derive the deploy DB-URL preflight input from the SAME merged
         // active-profile table used for `deploy_cfg` (base autumn.toml +
         // [profile.<env>] + autumn-<env>.toml), exactly like the sibling
@@ -5918,7 +5944,11 @@ pub fn run(opts: DoctorOptions) {
         tasks.push(Box::new(move || {
             deploy_preflight_result(
                 "deploy_signing_secret",
-                crate::deploy::grade_signing_secret(deploy_signing.as_deref(), is_production),
+                crate::deploy::grade_signing_secret(
+                    deploy_signing.as_deref(),
+                    &deploy_previous_signing,
+                    is_production,
+                ),
             )
         }));
         tasks.push(Box::new(move || {

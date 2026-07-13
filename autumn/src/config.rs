@@ -3142,6 +3142,7 @@ impl AutumnConfig {
     /// Apply environment overrides using the provided env abstraction.
     pub fn apply_env_overrides_with_env(&mut self, env: &dyn Env) {
         self.apply_server_env_overrides_with_env(env);
+        self.apply_deploy_env_overrides_with_env(env);
         self.apply_database_env_overrides_with_env(env);
         self.apply_log_env_overrides_with_env(env);
         self.apply_telemetry_env_overrides_with_env(env);
@@ -3501,6 +3502,44 @@ impl AutumnConfig {
                 tls.handshake_timeout_secs = handshake;
             }
         }
+    }
+
+    fn apply_deploy_env_overrides_with_env(&mut self, env: &dyn Env) {
+        // `[deploy]` is a top-level optional section. Materialize it from the
+        // environment when any of its keys are set (seeding the documented
+        // defaults if the TOML section was absent), so a CI/VPS deploy can keep
+        // the target host out of `autumn.toml` and drive it entirely through
+        // `AUTUMN_DEPLOY__*`. Env overrides win over any TOML-provided values.
+        const KEYS: [&str; 8] = [
+            "AUTUMN_DEPLOY__HOST",
+            "AUTUMN_DEPLOY__USER",
+            "AUTUMN_DEPLOY__SSH_PORT",
+            "AUTUMN_DEPLOY__APP_NAME",
+            "AUTUMN_DEPLOY__APP_DIR",
+            "AUTUMN_DEPLOY__SERVICE_NAME",
+            "AUTUMN_DEPLOY__READINESS_TIMEOUT_SECS",
+            "AUTUMN_DEPLOY__KEEP_RELEASES",
+        ];
+        if !KEYS.iter().any(|key| env.var(key).is_ok()) {
+            return;
+        }
+        let deploy = self.deploy.get_or_insert_with(DeployConfig::default);
+        parse_env_option_string(env, "AUTUMN_DEPLOY__HOST", &mut deploy.host);
+        parse_env_string(env, "AUTUMN_DEPLOY__USER", &mut deploy.user);
+        parse_env(env, "AUTUMN_DEPLOY__SSH_PORT", &mut deploy.ssh_port);
+        parse_env_option_string(env, "AUTUMN_DEPLOY__APP_NAME", &mut deploy.app_name);
+        parse_env_option_string(env, "AUTUMN_DEPLOY__APP_DIR", &mut deploy.app_dir);
+        parse_env_option_string(env, "AUTUMN_DEPLOY__SERVICE_NAME", &mut deploy.service_name);
+        parse_env(
+            env,
+            "AUTUMN_DEPLOY__READINESS_TIMEOUT_SECS",
+            &mut deploy.readiness_timeout_secs,
+        );
+        parse_env(
+            env,
+            "AUTUMN_DEPLOY__KEEP_RELEASES",
+            &mut deploy.keep_releases,
+        );
     }
 
     fn apply_database_env_overrides_with_env(&mut self, env: &dyn Env) {
@@ -9769,6 +9808,91 @@ path = "/healthz"
             ..DeployConfig::default()
         };
         assert!(ok.validate().is_ok());
+    }
+
+    #[test]
+    fn env_override_materializes_deploy() {
+        // A CI/VPS deploy can keep the target host out of autumn.toml and drive
+        // the whole [deploy] section through AUTUMN_DEPLOY__* env vars.
+        let env = MockEnv::new()
+            .with("AUTUMN_DEPLOY__HOST", "203.0.113.10")
+            .with("AUTUMN_DEPLOY__USER", "deploy")
+            .with("AUTUMN_DEPLOY__SSH_PORT", "2222")
+            .with("AUTUMN_DEPLOY__APP_NAME", "myapp")
+            .with("AUTUMN_DEPLOY__APP_DIR", "/srv/myapp")
+            .with("AUTUMN_DEPLOY__SERVICE_NAME", "myapp-web")
+            .with("AUTUMN_DEPLOY__READINESS_TIMEOUT_SECS", "90")
+            .with("AUTUMN_DEPLOY__KEEP_RELEASES", "5");
+        let mut config = AutumnConfig::default();
+        assert!(config.deploy.is_none());
+        config.apply_env_overrides_with_env(&env);
+        let deploy = config.deploy.expect("env should materialize deploy");
+        assert_eq!(deploy.host.as_deref(), Some("203.0.113.10"));
+        assert_eq!(deploy.user, "deploy");
+        assert_eq!(deploy.ssh_port, 2222);
+        assert_eq!(deploy.app_name.as_deref(), Some("myapp"));
+        assert_eq!(deploy.app_dir.as_deref(), Some("/srv/myapp"));
+        assert_eq!(deploy.service_name.as_deref(), Some("myapp-web"));
+        assert_eq!(deploy.readiness_timeout_secs, 90);
+        assert_eq!(deploy.keep_releases, 5);
+        assert!(deploy.validate().is_ok());
+    }
+
+    #[test]
+    fn env_override_materializes_deploy_from_single_host() {
+        // Setting only AUTUMN_DEPLOY__HOST with no [deploy] in TOML seeds the
+        // section with defaults and fills in the host.
+        let env = MockEnv::new().with("AUTUMN_DEPLOY__HOST", "198.51.100.7");
+        let mut config = AutumnConfig::default();
+        assert!(config.deploy.is_none());
+        config.apply_env_overrides_with_env(&env);
+        let deploy = config.deploy.expect("env should materialize deploy");
+        assert_eq!(deploy.host.as_deref(), Some("198.51.100.7"));
+        // Remaining fields fall back to their documented defaults.
+        assert_eq!(deploy.user, "root");
+        assert_eq!(deploy.ssh_port, 22);
+        assert_eq!(deploy.readiness_timeout_secs, 60);
+        assert_eq!(deploy.keep_releases, 3);
+    }
+
+    #[test]
+    fn env_override_updates_existing_deploy_host() {
+        // An env var overrides just the host of a TOML-configured section,
+        // leaving the other keys intact.
+        let mut config: AutumnConfig = toml::from_str(
+            r#"
+            [deploy]
+            host = "toml-host"
+            user = "deploy"
+            ssh_port = 2200
+            "#,
+        )
+        .unwrap();
+        let env = MockEnv::new().with("AUTUMN_DEPLOY__HOST", "env-host");
+        config.apply_env_overrides_with_env(&env);
+        let deploy = config.deploy.expect("deploy configured");
+        assert_eq!(deploy.host.as_deref(), Some("env-host"));
+        assert_eq!(deploy.user, "deploy");
+        assert_eq!(deploy.ssh_port, 2200);
+    }
+
+    #[test]
+    fn env_override_parses_deploy_ssh_port_u16() {
+        let env = MockEnv::new()
+            .with("AUTUMN_DEPLOY__HOST", "example.com")
+            .with("AUTUMN_DEPLOY__SSH_PORT", "65535");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        let deploy = config.deploy.expect("env should materialize deploy");
+        assert_eq!(deploy.ssh_port, 65_535_u16);
+    }
+
+    #[test]
+    fn no_deploy_env_leaves_deploy_none() {
+        let env = MockEnv::new().with("AUTUMN_SERVER__PORT", "8080");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        assert!(config.deploy.is_none());
     }
 
     // ── server.tls.acme (#1608) ───────────────────────────────────
