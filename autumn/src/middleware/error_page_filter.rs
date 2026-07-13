@@ -345,6 +345,23 @@ pub struct AcceptQualities {
     pub html: Option<(f32, usize)>,
     /// Best match for `application/json` / `application/problem+json`.
     pub json: Option<(f32, usize)>,
+    /// Best match for the `text/*` subtype wildcard.
+    ///
+    /// A media range like `text/*` covers `text/html` per RFC 7231 §5.3.2 but is
+    /// less specific than a concrete `text/html`. Recorded like the other slots
+    /// (max-q including `q=0`, plus list index) so the `Negotiate` responder can
+    /// slot it between the concrete type and the `*/*` wildcard. The legacy
+    /// `accept_preference`/`accept_prefers_html` path ignores it.
+    pub text_star: Option<(f32, usize)>,
+    /// Best match for the `application/*` subtype wildcard.
+    ///
+    /// A media range like `application/*` covers `application/json` per RFC 7231
+    /// §5.3.2 but is less specific than a concrete `application/json`. Recorded
+    /// like the other slots (max-q including `q=0`, plus list index) so the
+    /// `Negotiate` responder can slot it between the concrete type and the `*/*`
+    /// wildcard. The legacy `accept_preference`/`accept_prefers_html` path
+    /// ignores it.
+    pub application_star: Option<(f32, usize)>,
     /// Best match for the `*/*` wildcard.
     pub wildcard: Option<(f32, usize)>,
 }
@@ -353,7 +370,8 @@ pub struct AcceptQualities {
 ///
 /// Scans the comma-separated `Accept` header once, recording the best
 /// `(q-value, list-index)` seen for `text/html`, for `application/json` /
-/// `application/problem+json`, and for the `*/*` wildcard. Out-of-range
+/// `application/problem+json`, for the `text/*` and `application/*` subtype
+/// wildcards, and for the `*/*` wildcard. Out-of-range
 /// q-values are clamped to `[0.0, 1.0]`. Entries with `q=0` are *retained*
 /// (recorded as `Some((0.0, index))`) so an explicit "not acceptable"
 /// exclusion survives; each consumer decides how to treat them.
@@ -407,6 +425,20 @@ pub fn accept_qualities(headers: &axum::http::HeaderMap) -> AcceptQualities {
             {
                 qualities.json = Some((q, index));
             }
+            "text/*"
+                if qualities
+                    .text_star
+                    .is_none_or(|(existing_q, _)| q > existing_q) =>
+            {
+                qualities.text_star = Some((q, index));
+            }
+            "application/*"
+                if qualities
+                    .application_star
+                    .is_none_or(|(existing_q, _)| q > existing_q) =>
+            {
+                qualities.application_star = Some((q, index));
+            }
             "*/*"
                 if qualities
                     .wildcard
@@ -441,10 +473,14 @@ pub fn accept_preference(headers: &axum::http::HeaderMap) -> AcceptPreference {
         return AcceptPreference::Unspecified;
     }
 
+    // The legacy enum negotiator predates type wildcards and intentionally does
+    // not consult the `text/*` / `application/*` slots — only the concrete types
+    // and the `*/*` wildcard — so `accept_prefers_html` stays byte-identical.
     let AcceptQualities {
         html,
         json,
         wildcard,
+        ..
     } = accept_qualities(headers);
 
     // Legacy resolution only cares about *positive* preference: a `q=0` slot

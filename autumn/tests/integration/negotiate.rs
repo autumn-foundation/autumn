@@ -159,6 +159,61 @@ async fn configurable_default_yields_json_when_accept_missing() {
     assert_eq!(body_string(response).await, r#"{"id":7,"name":"spanner"}"#);
 }
 
+// ── Type-wildcard precedence (RFC 7231 §5.3.2) ──────────────────────────────
+
+#[tokio::test]
+async fn text_star_forbidden_serves_wildcard_json() {
+    // `text/*;q=0` forbids every text format (including text/html); `*/*;q=1`
+    // still covers JSON, so JSON wins.
+    let response = send(app(), Some("text/*;q=0, */*;q=1")).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(header(&response, "content-type"), "application/json");
+    assert_eq!(header(&response, "vary"), "Accept");
+    assert_eq!(body_string(response).await, r#"{"id":7,"name":"spanner"}"#);
+}
+
+#[tokio::test]
+async fn application_star_forbidden_not_resurrected_by_json_default() {
+    // `application/*;q=0` forbids JSON via the subtype wildcard; even under a
+    // JSON default, the non-forbidden HTML is served instead.
+    let app = Router::new().route("/widget", axum::routing::get(show_json_default));
+    let response = send(app, Some("application/*;q=0")).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(header(&response, "content-type").starts_with("text/html"));
+    assert_eq!(header(&response, "vary"), "Accept");
+    assert!(body_string(response).await.contains("<h1>spanner</h1>"));
+}
+
+#[tokio::test]
+async fn text_star_positive_serves_html() {
+    // `text/*;q=1` lifts HTML with nothing to beat it.
+    let response = send(app(), Some("text/*;q=1")).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(header(&response, "content-type").starts_with("text/html"));
+    assert!(body_string(response).await.contains("<h1>spanner</h1>"));
+}
+
+#[tokio::test]
+async fn application_star_positive_serves_json() {
+    // `application/*;q=1` lifts JSON with nothing to beat it.
+    let response = send(app(), Some("application/*;q=1")).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(header(&response, "content-type"), "application/json");
+    assert_eq!(header(&response, "vary"), "Accept");
+    assert_eq!(body_string(response).await, r#"{"id":7,"name":"spanner"}"#);
+}
+
+#[tokio::test]
+async fn concrete_html_exclusion_beats_text_star_and_serves_json() {
+    // Concrete `text/html;q=0` is more specific than `text/*;q=1`, so HTML is
+    // forbidden; JSON is unmentioned and non-forbidden, so it is served.
+    let response = send(app(), Some("text/html;q=0, text/*;q=1")).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(header(&response, "content-type"), "application/json");
+    assert_eq!(header(&response, "vary"), "Accept");
+    assert_eq!(body_string(response).await, r#"{"id":7,"name":"spanner"}"#);
+}
+
 // ── `q=0` exclusions and `406 Not Acceptable` ───────────────────────────────
 
 #[tokio::test]

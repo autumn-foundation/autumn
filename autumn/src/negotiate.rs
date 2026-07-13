@@ -22,20 +22,28 @@
 //! *effective* q-values that honour the `*/*` wildcard per RFC 7231 content
 //! negotiation.
 //!
-//! Each candidate's effective q-value is the better of its own explicit entry
-//! and any `*/*` wildcard: `text/html` is covered by `html.or(*/*)` and JSON by
-//! `json.or(*/*)`. The higher effective q wins; on a tie the earlier list entry
-//! wins. So `Accept: text/html;q=0.1, */*;q=1` serves **JSON** — `text/html` is
-//! explicitly demoted to `q=0.1` while `*/*;q=1` lifts JSON to `q=1` — rather
-//! than being fooled by the bare presence of `text/html`.
+//! Each candidate's effective q-value is drawn from the most specific media
+//! range that names it, following RFC 7231 §5.3.2 precedence
+//! `type/subtype` > `type/*` > `*/*`: `text/html` is covered by
+//! `text/html.or(text/*).or(*/*)` and JSON by
+//! `application/json.or(application/*).or(*/*)`. The higher effective q wins; on
+//! a tie the earlier list entry wins. So `Accept: text/html;q=0.1, */*;q=1`
+//! serves **JSON** — `text/html` is explicitly demoted to `q=0.1` while
+//! `*/*;q=1` lifts JSON to `q=1` — rather than being fooled by the bare presence
+//! of `text/html`. Likewise `Accept: text/*;q=0, */*;q=1` serves **JSON**: the
+//! `text/*` range forbids every text format, so only JSON (covered by `*/*`)
+//! remains.
 //!
 //! ## `q=0` exclusions and `406 Not Acceptable`
 //!
 //! A media range listed with `q=0` means "**not acceptable**" (RFC 7231
 //! §5.3.1), not merely "less preferred". A format whose effective q is `0`
-//! (because it, or the `*/*` it would inherit from, was explicitly demoted to
-//! `q=0`) is *forbidden*: it is never served, not via the wildcard and not via
-//! the configured default. So `Accept: text/html;q=0, */*;q=1` serves **JSON**
+//! (because it, or the most specific range covering it — `text/*` /
+//! `application/*` or the bare `*/*` — was explicitly demoted to `q=0`) is
+//! *forbidden*: it is never served, not via a wildcard and not via the
+//! configured default. A more specific range overrides a broader one either way,
+//! so `text/html;q=0, text/*;q=1` still forbids HTML while `text/*;q=0, */*;q=1`
+//! forbids every text format. So `Accept: text/html;q=0, */*;q=1` serves **JSON**
 //! (HTML is forbidden; `*/*` still covers JSON), and `application/json;q=0`
 //! serves **HTML** even under `default_format(Format::Json)` (the default may
 //! not resurrect a forbidden format). When *both* HTML and JSON are forbidden
@@ -99,10 +107,11 @@ impl Negotiate {
     /// behaviour — only it emits `406 Not Acceptable` when both formats are
     /// forbidden.
     ///
-    /// Each candidate's effective quality folds in the `*/*` wildcard —
-    /// `html.or(wildcard)` for HTML and `json.or(wildcard)` for JSON — so a
-    /// high-q wildcard can outrank an explicitly demoted concrete type (RFC 7231
-    /// content negotiation). A format whose effective q is `0` is forbidden and
+    /// Each candidate's effective quality is drawn from the most specific media
+    /// range that names it — `text/html.or(text/*).or(*/*)` for HTML and
+    /// `application/json.or(application/*).or(*/*)` for JSON (RFC 7231 §5.3.2
+    /// precedence) — so a high-q wildcard can outrank an explicitly demoted
+    /// concrete type. A format whose effective q is `0` is forbidden and
     /// never chosen. The higher positive effective q wins; on a tie the earlier
     /// list entry wins. When neither side is named directly (both effective
     /// values come from the same `*/*` entry, or there is no `Accept` at all)
@@ -123,10 +132,14 @@ impl Negotiate {
     /// `q=0` exclusions and reporting [`Resolution::NotAcceptable`] when every
     /// format the handler can produce has been explicitly forbidden.
     ///
-    /// For each format `F` in {HTML, JSON} the *effective* quality `q_F` is `F`'s
-    /// own explicit max-q if `F` was listed at all (**including `q=0`**), else
-    /// the `*/*` wildcard's explicit max-q if `*/*` was listed (including `q=0`),
-    /// else `None` (unmentioned). Then:
+    /// For each format `F` in {HTML, JSON} the *effective* quality `q_F` is drawn
+    /// from the most specific media range that names it (RFC 7231 §5.3.2):
+    /// `F`'s own explicit max-q if `F` was listed at all (**including `q=0`**),
+    /// else its subtype wildcard (`text/*` for HTML, `application/*` for JSON) if
+    /// that was listed (including `q=0`), else the `*/*` wildcard's explicit max-q
+    /// if `*/*` was listed (including `q=0`), else `None` (unmentioned). A more
+    /// specific range with `q=0` therefore forbids `F` even when a broader range
+    /// below it is permissive. Then:
     ///
     /// * `q_F == Some(0.0)` → `F` is **forbidden** (never served — not via the
     ///   wildcard, not via the default).
@@ -140,8 +153,22 @@ impl Negotiate {
     ///   format if the default itself is forbidden.
     /// * If **both** formats are forbidden → [`Resolution::NotAcceptable`].
     fn resolve(&self) -> Resolution {
-        let html_eff = self.qualities.html.or(self.qualities.wildcard);
-        let json_eff = self.qualities.json.or(self.qualities.wildcard);
+        // Media-range precedence per RFC 7231 §5.3.2: `type/subtype` beats
+        // `type/*` beats `*/*`. `.or()` chaining picks the most-specific slot
+        // that is present, and because a present slot short-circuits even when
+        // it is `Some(0.0)`, a more-specific `q=0` exclusion (e.g. `text/html;q=0`
+        // or `text/*;q=0`) still forbids the format regardless of a permissive
+        // less-specific range below it.
+        let html_eff = self
+            .qualities
+            .html
+            .or(self.qualities.text_star)
+            .or(self.qualities.wildcard);
+        let json_eff = self
+            .qualities
+            .json
+            .or(self.qualities.application_star)
+            .or(self.qualities.wildcard);
 
         let html_forbidden = matches!(html_eff, Some((q, _)) if q <= 0.0);
         let json_forbidden = matches!(json_eff, Some((q, _)) if q <= 0.0);
@@ -349,6 +376,58 @@ mod tests {
         assert_eq!(negotiate(None).format(), Format::Html);
         assert_eq!(
             negotiate(None).default_format(Format::Json).format(),
+            Format::Json,
+        );
+    }
+
+    // ── Type-wildcard precedence (RFC 7231 §5.3.2): type/* between concrete and */* ──
+
+    #[test]
+    fn text_star_forbidden_falls_through_to_wildcard_json() {
+        // `text/*;q=0` forbids every text format (including text/html); `*/*;q=1`
+        // still covers JSON, so JSON is served rather than HTML resurfacing.
+        assert_eq!(
+            negotiate(Some("text/*;q=0, */*;q=1")).format(),
+            Format::Json,
+        );
+    }
+
+    #[test]
+    fn application_star_forbidden_not_resurrected_by_json_default() {
+        // `application/*;q=0` forbids JSON via the subtype wildcard; even a JSON
+        // default must not serve it, so HTML is served instead.
+        assert_eq!(
+            negotiate(Some("application/*;q=0"))
+                .default_format(Format::Json)
+                .format(),
+            Format::Html,
+        );
+    }
+
+    #[test]
+    fn text_star_positive_serves_html() {
+        // `text/*;q=1` lifts HTML (via the subtype wildcard) with nothing to beat
+        // it, so HTML wins.
+        assert_eq!(negotiate(Some("text/*;q=1")).format(), Format::Html);
+    }
+
+    #[test]
+    fn application_star_positive_serves_json() {
+        // `application/*;q=1` lifts JSON (via the subtype wildcard) with nothing
+        // to beat it, so JSON wins.
+        assert_eq!(negotiate(Some("application/*;q=1")).format(), Format::Json);
+    }
+
+    #[test]
+    fn concrete_type_beats_type_wildcard_forbidding_html() {
+        // Concrete `text/html;q=0` is more specific than `text/*;q=1`, so HTML is
+        // forbidden; JSON is unmentioned and non-forbidden, so it is served.
+        assert_eq!(
+            negotiate(Some("text/html;q=0, text/*;q=1")).resolve(),
+            Resolution::Json,
+        );
+        assert_eq!(
+            negotiate(Some("text/html;q=0, text/*;q=1")).format(),
             Format::Json,
         );
     }
