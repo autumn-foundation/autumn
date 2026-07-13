@@ -7,6 +7,22 @@
 //! result or a user-safe error. A [`JobTrackingStore`] persists that state,
 //! keyed by a hash of the token, with a configurable TTL.
 
+// autumn-panic-gate: request-path module — production code path must be panic-free.
+// See CONTRIBUTING.md "Request-path panic gate". Justify exceptions with
+// #[allow(clippy::<lint>, reason = "…")] at the narrowest scope.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::todo,
+        clippy::unimplemented,
+        clippy::indexing_slicing,
+    )
+)]
+
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
@@ -267,7 +283,7 @@ impl JobContext {
             *inner
                 .result
                 .lock()
-                .expect("job context result lock poisoned") = Some(result);
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(result);
         }
     }
 
@@ -284,7 +300,7 @@ impl JobContext {
             *inner
                 .user_error
                 .lock()
-                .expect("job context error lock poisoned") = Some(message.into());
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(message.into());
         }
     }
 
@@ -296,7 +312,7 @@ impl JobContext {
         let result = inner
             .result
             .lock()
-            .expect("job context result lock poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take()
             .unwrap_or(Value::Null);
         let _ = inner.store.complete(&inner.key, result).await;
@@ -312,7 +328,7 @@ impl JobContext {
         let message = inner
             .user_error
             .lock()
-            .expect("job context error lock poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take()
             .unwrap_or_else(|| default_message.to_owned());
         let _ = inner.store.fail(&inner.key, message).await;
@@ -972,7 +988,7 @@ impl InMemoryJobTrackingStore {
     fn raw_entry_count(&self) -> usize {
         self.entries
             .read()
-            .expect("job tracking store lock poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .len()
     }
 
@@ -981,7 +997,7 @@ impl InMemoryJobTrackingStore {
         let mut guard = self
             .entries
             .write()
-            .expect("job tracking store lock poisoned");
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         guard.insert(
             key.to_owned(),
             MemoryEntry {
@@ -1006,7 +1022,7 @@ impl InMemoryJobTrackingStore {
         let mut guard = self
             .entries
             .write()
-            .expect("job tracking store lock poisoned");
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let now = self.clock.now();
         if let Some(entry) = guard.get_mut(key)
             && self.is_live(entry)
@@ -1028,7 +1044,7 @@ impl InMemoryJobTrackingStore {
         let mut guard = self
             .entries
             .write()
-            .expect("job tracking store lock poisoned");
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(entry) = guard.get(key)
             && self.is_live(entry)
             && entry.record.updated_at == expected_updated_at
@@ -1121,7 +1137,7 @@ impl JobTrackingStore for InMemoryJobTrackingStore {
             let guard = self
                 .entries
                 .read()
-                .expect("job tracking store lock poisoned");
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             Ok(guard
                 .get(key)
                 .filter(|entry| self.is_live(entry))

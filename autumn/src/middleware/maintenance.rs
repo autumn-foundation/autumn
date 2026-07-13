@@ -25,6 +25,22 @@
 //! 4. **Read-only mode** – when `readonly = true`, `GET`, `HEAD`, and
 //!    `OPTIONS` requests pass through; write methods are gated.
 
+// autumn-panic-gate: request-path module — production code path must be panic-free.
+// See CONTRIBUTING.md "Request-path panic gate". Justify exceptions with
+// #[allow(clippy::<lint>, reason = "…")] at the narrowest scope.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::todo,
+        clippy::unimplemented,
+        clippy::indexing_slicing,
+    )
+)]
+
 use std::future::Future;
 use std::net::IpAddr;
 use std::pin::Pin;
@@ -272,6 +288,10 @@ where
 {
     type Output = Result<Response<Body>, E>;
 
+    #[allow(
+        clippy::expect_used,
+        reason = "unreachable: future not polled after Ready"
+    )]
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         match self.project() {
             MaintenanceFutureProj::ShortCircuit { response } => Poll::Ready(Ok(response
@@ -324,6 +344,7 @@ fn extract_client_ip<B>(req: &Request<B>) -> Option<IpAddr> {
 }
 
 /// Build a 503 response with the appropriate content type.
+#[allow(clippy::expect_used, reason = "infallible: static 503 response")]
 fn build_503_response<B>(req: &Request<B>, config: &MaintenanceConfig) -> Response<Body> {
     let message = config
         .message

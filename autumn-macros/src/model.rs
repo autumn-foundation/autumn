@@ -4403,8 +4403,170 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     };
 
+    // ── #1126: allowlisted sort/filter helpers ──────────────────────────
+    //
+    // `#[repository]` is applied to a *trait* and cannot see the model's
+    // columns, so the typed, injection-safe ordering/filtering DSL lives here
+    // (the `#[model]` macro knows every field + type) and is called from the
+    // generated `list()` method. The allowlist is the set of the model's own
+    // scalar columns; an unknown `sort`/`filter` key hits the default match arm
+    // and is silently ignored — it can never be interpolated into SQL.
+    let list_boxed_ty = quote! {
+        ::autumn_web::reexports::diesel::helper_types::IntoBoxed<
+            '__lq,
+            #table_ident::table,
+            ::autumn_web::reexports::diesel::pg::Pg,
+        >
+    };
+    // Single primary key used for the default order + tie-break. Absent for
+    // composite/id-less models, in which case ordering is best-effort.
+    let list_pk: Option<&syn::Ident> = if id_field_names.len() == 1 {
+        Some(id_field_names[0])
+    } else {
+        None
+    };
+    let mut list_sort_arms: Vec<TokenStream> = Vec::new();
+    let mut list_filter_arms: Vec<TokenStream> = Vec::new();
+    for field in &all_fields {
+        let Some(ident) = field.ident.as_ref() else {
+            continue;
+        };
+        let raw = ident.to_string();
+        let col = raw.strip_prefix("r#").unwrap_or(&raw).to_string();
+        let is_option = option_inner_type(&field.ty).is_some();
+        let base_ty = option_inner_type(&field.ty).unwrap_or(&field.ty);
+        let Some(last) = ty_last_ident(base_ty) else {
+            continue;
+        };
+        // Sortable: any scalar column that maps to an orderable SQL type
+        // (nullable columns included — ordering nulls is well-defined).
+        let orderable = matches!(
+            last.as_str(),
+            "String"
+                | "i16"
+                | "i32"
+                | "i64"
+                | "bool"
+                | "f32"
+                | "f64"
+                | "Decimal"
+                | "Uuid"
+                | "NaiveDateTime"
+                | "NaiveDate"
+                | "NaiveTime"
+                | "DateTime"
+        );
+        if orderable {
+            let is_pk = list_pk.is_some_and(|pk| pk == ident);
+            let tie_break = match (is_pk, list_pk) {
+                // No redundant `ORDER BY id, id`, and no tie-break when the
+                // model has no single primary key.
+                (true, _) | (_, None) => quote! {},
+                (false, Some(pk)) => quote! { .then_order_by(#table_ident::#pk.desc()) },
+            };
+            list_sort_arms.push(quote! {
+                ::core::option::Option::Some(#col) => match __dir {
+                    ::autumn_web::pagination::SortDir::Asc =>
+                        __q.order(#table_ident::#ident.asc()) #tie_break,
+                    ::autumn_web::pagination::SortDir::Desc =>
+                        __q.order(#table_ident::#ident.desc()) #tie_break,
+                },
+            });
+        }
+        // Filterable (equality only): non-null String / integer / bool. Other
+        // types are excluded — see the `list()` doc comment.
+        if !is_option {
+            match last.as_str() {
+                "String" => list_filter_arms.push(quote! {
+                    #col => { __q = __q.filter(#table_ident::#ident.eq(__val.to_owned())); }
+                }),
+                "i16" | "i32" | "i64" | "bool" => {
+                    let parse_ty = format_ident!("{last}");
+                    list_filter_arms.push(quote! {
+                        #col => {
+                            if let ::core::result::Result::Ok(__v) = __val.parse::<#parse_ty>() {
+                                __q = __q.filter(#table_ident::#ident.eq(__v));
+                            }
+                        }
+                    });
+                }
+                _ => {}
+            }
+        }
+    }
+    let list_default_order = list_pk.map_or_else(
+        || quote! { __q },
+        |pk| quote! { __q.order(#table_ident::#pk.desc()) },
+    );
+    let list_filter_body = if list_filter_arms.is_empty() {
+        quote! { let _ = &__query; __q }
+    } else {
+        quote! {
+            use ::autumn_web::reexports::diesel::prelude::*;
+            for (__col, __val) in __query.filters() {
+                match __col {
+                    #(#list_filter_arms)*
+                    _ => {}
+                }
+            }
+            __q
+        }
+    };
+    let list_order_body = if list_sort_arms.is_empty() {
+        quote! {
+            use ::autumn_web::reexports::diesel::prelude::*;
+            let _ = __query;
+            #list_default_order
+        }
+    } else {
+        quote! {
+            use ::autumn_web::reexports::diesel::prelude::*;
+            let __dir = __query.direction();
+            match __query.sort() {
+                #(#list_sort_arms)*
+                _ => #list_default_order,
+            }
+        }
+    };
+    let list_query_helpers = quote! {
+        impl #name {
+            /// Apply the allowlisted equality filters carried by a
+            /// [`::autumn_web::pagination::ListQuery`] to a boxed query.
+            ///
+            /// Generated by `#[model]` for the repository `list()` method; not
+            /// part of the public API. Only the model's own non-null
+            /// `String`/integer/`bool` columns are filterable — any other
+            /// requested `filter[..]` key is ignored.
+            #[doc(hidden)]
+            #[allow(unused_mut, clippy::allow_attributes)]
+            pub fn __autumn_list_apply_filters<'__lq>(
+                mut __q: #list_boxed_ty,
+                __query: &::autumn_web::pagination::ListQuery,
+            ) -> #list_boxed_ty {
+                #list_filter_body
+            }
+
+            /// Apply the allowlisted ordering carried by a
+            /// [`::autumn_web::pagination::ListQuery`] to a boxed query,
+            /// defaulting to primary-key-descending when the requested `sort`
+            /// key is empty or names a non-orderable column.
+            ///
+            /// Generated by `#[model]`; not part of the public API.
+            #[doc(hidden)]
+            #[allow(clippy::allow_attributes)]
+            pub fn __autumn_list_apply_order<'__lq>(
+                __q: #list_boxed_ty,
+                __query: &::autumn_web::pagination::ListQuery,
+            ) -> #list_boxed_ty {
+                #list_order_body
+            }
+        }
+    };
+
     quote! {
         #encrypted_use
+
+        #list_query_helpers
 
         #[derive(#name_debug_derive Clone, ::diesel::Queryable, ::diesel::Selectable, ::diesel::AsChangeset, ::diesel::Insertable)]
         #[derive(::serde::Serialize, ::serde::Deserialize)]
@@ -6951,6 +7113,86 @@ mod tests {
         assert!(
             generated.contains("\"shipped\""),
             "transition table must contain all destination states: {generated}"
+        );
+    }
+
+    #[test]
+    fn list_helpers_allowlist_is_typed_and_injection_safe() {
+        // #1126 AC5: the generated sort/filter DSL is an allowlist of the
+        // model's OWN columns, matched with typed Diesel expressions. An
+        // attacker-supplied `sort=id;DROP TABLE users` has no match arm, so it
+        // can only ever hit the default `_ =>` arm (order by the primary key).
+        // Assert this STRUCTURALLY — there is no code path that interpolates a
+        // request-supplied column name into SQL.
+        let output = model_macro(
+            TokenStream::new(),
+            quote! {
+                pub struct Post {
+                    #[id]
+                    pub id: i64,
+                    pub title: String,
+                    pub views: i64,
+                    pub published: bool,
+                }
+            },
+        );
+        let generated = output.to_string();
+
+        // The order helper matches on `query.sort()` with a typed column arm
+        // per real column, plus a primary-key default.
+        assert!(
+            generated.contains("fn __autumn_list_apply_order"),
+            "model must generate the ordering helper: {generated}"
+        );
+        assert!(
+            generated.contains("Some (\"title\")")
+                && generated.contains("Some (\"views\")")
+                && generated.contains("Some (\"published\")"),
+            "each real column must be an allowlisted sort arm: {generated}"
+        );
+        // The default arm orders by the primary key — this is where every
+        // unknown/malicious `sort` lands.
+        assert!(
+            generated.contains("__q . order (posts :: id . desc ())"),
+            "unknown sort must fall back to the primary-key default order: {generated}"
+        );
+
+        // The filter helper matches on the column key with typed `.eq(..)` on
+        // real columns only (non-null String/integer/bool).
+        assert!(
+            generated.contains("fn __autumn_list_apply_filters"),
+            "model must generate the filter helper: {generated}"
+        );
+        assert!(
+            generated.contains("posts :: title . eq")
+                && generated.contains("posts :: views . eq")
+                && generated.contains("posts :: published . eq"),
+            "filters must be typed column equality on allowlisted columns: {generated}"
+        );
+
+        // Injection safety, asserted structurally: NO request-derived string is
+        // ever turned into SQL. There is no raw `sql_query`, no `ORDER BY`
+        // string, and no `format!` building a clause. The only way a column
+        // reaches SQL is through the compile-time-checked `posts :: <col>` paths
+        // above, so `id;DROP TABLE users` (which is not a column) is inert.
+        let order_start = generated
+            .find("fn __autumn_list_apply_order")
+            .expect("order helper present");
+        let filter_start = generated
+            .find("fn __autumn_list_apply_filters")
+            .expect("filter helper present");
+        let helpers_region = {
+            let lo = order_start.min(filter_start);
+            // Grab a generous window covering both helper bodies.
+            &generated[lo..(lo + 4000).min(generated.len())]
+        };
+        assert!(
+            !helpers_region.contains("sql_query") && !helpers_region.contains("ORDER BY"),
+            "sort/filter must never build raw SQL from request input: {helpers_region}"
+        );
+        assert!(
+            !helpers_region.contains("format !"),
+            "sort/filter must never string-format a column into a query: {helpers_region}"
         );
     }
 

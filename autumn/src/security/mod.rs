@@ -165,7 +165,7 @@ pub use csrf::{CsrfFormField, CsrfLayer, CsrfToken, CsrfTokenHeader};
 pub use headers::{CspNonce, SecurityHeadersLayer};
 pub use proxy::TrustedProxy;
 #[doc(hidden)]
-pub use rate_limit::{__check_throttle, __throttle_registry_reset};
+pub use rate_limit::{__check_throttle, __throttle_registry_reset, TEST_LOCK};
 pub use rate_limit::{
     RateLimitEnvelopeCounted, RateLimitExempt, RateLimitLayer, RateLimitOverride,
     RateLimitPrincipal, ThrottleSpec,

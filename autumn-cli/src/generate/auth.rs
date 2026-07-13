@@ -49,6 +49,7 @@ const PASSKEY_EXTRA_DEPS: &[(&str, &str)] = &[
         "{ version = \"0.5\", features = [\"danger-allow-state-serialisation\", \"conditional-ui\"] }",
     ),
     ("uuid", "{ version = \"1\", features = [\"v4\"] }"),
+    ("base64", "\"0.22\""),
 ];
 
 /// Required features for the `webauthn-rs` dependency.
@@ -910,6 +911,18 @@ fn plan_auth_with_providers_ex_impl(
         .chain(AUTH_EXTRA_DEPS.iter().copied())
         .chain(if totp { TOTP_EXTRA_DEPS } else { &[] }.iter().copied())
         .collect();
+    // The `--totp` routes add `base64 = "0.22"` and use its 0.21+ `Engine`
+    // API; `ensure_cargo_dependencies` is name-only, so an app pinning an older
+    // `base64` keeps it and the generated 2FA code won't compile. Warn instead.
+    if totp {
+        super::model::warn_if_existing_dep_below_version(
+            &mut plan,
+            &cargo_existing,
+            "base64",
+            0,
+            22,
+        );
+    }
     // Apply dep additions then enable the mail feature in a single write.
     let with_deps = ensure_cargo_dependencies(&cargo_existing, &all_deps);
     // `ensure_cargo_dependencies` no-ops on an already-declared `totp-rs`, so
@@ -1422,6 +1435,10 @@ fn plan_auth_options_impl(
         let base_cargo = find_plan_content_for_path(&plan, &cargo_toml_path)
             .unwrap_or_else(|| read_or_empty(&cargo_toml_path));
         let all_passkey_deps: Vec<(&str, &str)> = PASSKEY_EXTRA_DEPS.to_vec();
+        // `ensure_cargo_dependencies` is name-only, so an app that already pins
+        // an older `base64` keeps it and never gets `0.22`; the emitted
+        // `encode_cred_id` needs the 0.21+ `Engine` API, so warn if it's too old.
+        super::model::warn_if_existing_dep_below_version(&mut plan, &base_cargo, "base64", 0, 22);
         let with_deps = super::model::ensure_cargo_dependencies(&base_cargo, &all_passkey_deps);
         // If the project already declared webauthn-rs without the required features,
         // ensure_cargo_dependencies would have skipped it; merge them here.
@@ -9876,9 +9893,9 @@ pub struct WebauthnCredential {{
     pub credential_id: String,
     pub credential_json: String,
     pub name: String,
-    pub created_at: chrono::NaiveDateTime,
     #[default]
     pub last_used_at: Option<chrono::NaiveDateTime>,
+    pub created_at: chrono::NaiveDateTime,
 }}
 
 diesel::joinable!(webauthn_credentials -> {user_table} (user_id));
@@ -9912,13 +9929,24 @@ fn render_passkeys_routes_file(pascal_name: &str, snake_name: &str, user_table: 
 //!   state returned by webauthn-rs and should not be inspected by app code.
 
 use autumn_web::prelude::*;
+use base64::Engine as _;
 use diesel::prelude::*;
 use diesel_async::AsyncConnection as _;
 use diesel_async::RunQueryDsl;
 use serde::{Deserialize, Serialize};
 use webauthn_rs::prelude::*;
 
-fn redirect_to(url: &str) -> impl IntoResponse {
+/// Encode an opaque credential ID as a base64url (no padding) string.
+///
+/// webauthn-rs 0.5's `CredentialID` is a `HumanBinaryData` newtype over
+/// `Vec<u8>` and no longer implements `Display`/`ToString`, so encode the raw
+/// bytes explicitly. Registration and login use this same helper, keeping the
+/// stored `credential_id` and the login lookup key byte-for-byte consistent.
+fn encode_cred_id(cred_id: &CredentialID) -> String {
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(cred_id.as_ref())
+}
+
+fn redirect_to(url: &str) -> axum::response::Redirect {
     axum::response::Redirect::to(url)
 }
 
@@ -10133,7 +10161,7 @@ pub async fn passkey_register_finish(
     let passkey = webauthn
         .finish_passkey_registration(&rpk_finish, &reg_state)
         .map_err(|e| AutumnError::unprocessable_msg(format!("Registration failed: {e}")))?;
-    let cred_id = passkey.cred_id().to_string();
+    let cred_id = encode_cred_id(passkey.cred_id());
     let cred_json = serde_json::to_string(&passkey)
         .map_err(|_| AutumnError::internal_server_error_msg("Failed to serialise passkey."))?;
     // Store the passkey and revoke every *other* session in one
@@ -10295,7 +10323,7 @@ pub async fn passkey_login_finish(
     let auth_result = webauthn
         .finish_discoverable_authentication(&pkc, auth_state, &disc_keys)
         .map_err(|e| AutumnError::unauthorized_msg(format!("Authentication failed: {e}")))?;
-    let cred_id_str = auth_result.cred_id().to_string();
+    let cred_id_str = encode_cred_id(auth_result.cred_id());
     let (wc_id, cred_json) = {
         use crate::schema::webauthn_credentials;
         webauthn_credentials::table
@@ -10435,7 +10463,7 @@ pub async fn passkey_revoke(
     State(state): State<AppState>,
     mut db: Db,
     Form(form): Form<PasskeyRevokeForm>,
-) -> AutumnResult<impl IntoResponse> {
+) -> AutumnResult<axum::response::Redirect> {
     // Validates the tracked session row (401s immediately if revoked).
     let current =
         crate::routes::auth::require_tracked_session(&session, &mut db, &state).await?;
@@ -15416,8 +15444,9 @@ mod tests {
             "passkeys.rs must define redirect_to: {routes}"
         );
         assert!(
-            routes.contains("impl IntoResponse"),
-            "redirect_to must return impl IntoResponse: {routes}"
+            routes.contains("fn redirect_to(url: &str) -> axum::response::Redirect"),
+            "redirect_to must return a concrete axum::response::Redirect \
+             (impl Trait is illegal nested in AutumnResult<_>): {routes}"
         );
     }
 

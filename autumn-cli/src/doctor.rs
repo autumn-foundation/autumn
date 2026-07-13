@@ -404,7 +404,20 @@ pub enum TlsDoctorData {
     /// `dead_code` allow for the feature-less build.
     #[cfg_attr(not(feature = "tls"), allow(dead_code))]
     Healthy {
+        /// Whether the leaf certificate is not yet valid — its `notBefore` lies
+        /// in the future. Such a certificate fails every handshake until its
+        /// window opens, so the runtime rejects it at startup; doctor grades it a
+        /// failure, symmetric to `expired`. Checked before `expired` (a cert
+        /// cannot be both), so the pass/fail decision keys off this flag first.
+        not_yet_valid: bool,
+        /// Whether the leaf certificate has already expired, decided from the
+        /// raw `notAfter` timestamp rather than the truncated `days_until_expiry`
+        /// bucket. A certificate expired less than 24h ago buckets to `0` days
+        /// but must still grade as a failure, matching the runtime which rejects
+        /// it at startup — so the pass/fail decision keys off this flag.
+        expired: bool,
         /// Whole days until the leaf certificate's `notAfter` (negative if past).
+        /// Used only for the human-readable message, never the grade.
         days_until_expiry: i64,
     },
     /// Configured, but the cert/key could not be loaded or validated (missing
@@ -427,6 +440,7 @@ pub enum TlsDoctorData {
 /// - Built without the `tls` feature → **Warn** (cannot diagnose; do not
 ///   silently omit the check).
 /// - Cert/key invalid or missing → **Fail**.
+/// - Leaf certificate not yet valid (`notBefore` in the future) → **Fail**.
 /// - Leaf certificate already expired → **Fail**.
 /// - Leaf certificate expiring within 30 days → **Warn**.
 /// - Otherwise → **Pass**.
@@ -458,7 +472,27 @@ pub fn check_tls_impl(data: &TlsDoctorData) -> CheckResult {
                  and the key matches the certificate",
             ),
         },
-        TlsDoctorData::Healthy { days_until_expiry } if *days_until_expiry < 0 => CheckResult {
+        TlsDoctorData::Healthy {
+            not_yet_valid: true,
+            ..
+        } => CheckResult {
+            name: "tls",
+            status: CheckStatus::Fail,
+            detail: Some(
+                "the [server.tls] leaf certificate is not yet valid (its notBefore is in the \
+                 future)"
+                    .into(),
+            ),
+            hint: Some(
+                "Wait for the certificate's validity window to open or install a currently-valid \
+                 certificate; a not-yet-valid certificate fails every TLS handshake",
+            ),
+        },
+        TlsDoctorData::Healthy {
+            expired: true,
+            days_until_expiry,
+            ..
+        } => CheckResult {
             name: "tls",
             status: CheckStatus::Fail,
             detail: Some(format!(
@@ -467,7 +501,11 @@ pub fn check_tls_impl(data: &TlsDoctorData) -> CheckResult {
             )),
             hint: Some("Renew the certificate; an expired certificate fails every TLS handshake"),
         },
-        TlsDoctorData::Healthy { days_until_expiry } if *days_until_expiry <= 30 => CheckResult {
+        TlsDoctorData::Healthy {
+            expired: false,
+            days_until_expiry,
+            ..
+        } if *days_until_expiry <= 30 => CheckResult {
             name: "tls",
             status: CheckStatus::Warn,
             detail: Some(format!(
@@ -475,7 +513,9 @@ pub fn check_tls_impl(data: &TlsDoctorData) -> CheckResult {
             )),
             hint: Some("Renew the certificate soon to avoid downtime"),
         },
-        TlsDoctorData::Healthy { days_until_expiry } => CheckResult {
+        TlsDoctorData::Healthy {
+            days_until_expiry, ..
+        } => CheckResult {
             name: "tls",
             status: CheckStatus::Pass,
             detail: Some(format!(
@@ -555,8 +595,19 @@ pub fn check_acme_ports_impl(
 /// The DNS resolution outcome for a domain, relative to this host's public IPs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DnsPointsHere {
-    /// The domain resolves to at least one of this host's local public IPs.
+    /// Every resolved address is one of this host's local public IPs.
     Matches,
+    /// Some resolved addresses point here, but at least one does NOT. HTTP-01's
+    /// challenge-token map is per-process, so if the CA validates against a
+    /// resolved address that is not this host it 404s and issuance fails — a
+    /// partial match is therefore not a clean pass. Graded a Warn (not a hard
+    /// Fail) because `local_ips()` is best-effort and usually discovers only the
+    /// single outbound source IP, so a legitimately multi-homed / multi-A host
+    /// can land here; the unmatched addresses are named so the operator can act.
+    PartialMatch {
+        /// The resolved addresses that are NOT known local public IPs.
+        unmatched: Vec<String>,
+    },
     /// The domain resolves, but to none of this host's IPs.
     ResolvesElsewhere {
         /// The resolved addresses (for the message).
@@ -582,6 +633,21 @@ pub fn check_acme_dns_impl(domain: &str, outcome: &DnsPointsHere) -> CheckResult
             status: CheckStatus::Pass,
             detail: Some(format!("{domain} resolves to this host")),
             hint: None,
+        },
+        DnsPointsHere::PartialMatch { unmatched } => CheckResult {
+            name: "acme_dns",
+            status: CheckStatus::Warn,
+            detail: Some(format!(
+                "{domain} resolves to this host but also to {} which {} not one of this host's \
+                 addresses; HTTP-01's challenge token is served only by this process, so the ACME \
+                 CA validating against an unmatched address would 404",
+                unmatched.join(", "),
+                if unmatched.len() == 1 { "is" } else { "are" }
+            )),
+            hint: Some(
+                "Point every A/AAAA record for the domain at this host (or remove the extra \
+                 addresses); a stray record can send the CA's HTTP-01 probe to a different server",
+            ),
         },
         DnsPointsHere::ResolvesElsewhere { resolved } => CheckResult {
             name: "acme_dns",
@@ -675,11 +741,25 @@ fn grade_dns_points_here(
     if local_public.is_empty() {
         return DnsPointsHere::LocalIpsUnknown;
     }
-    if resolved.iter().any(|ip| local_public.contains(ip)) {
+    // Every resolved address the CA might pick must point here — a partial match
+    // still lets the CA hit an address this process does not serve the HTTP-01
+    // token on (a 404). Split the resolved set into addresses that ARE a known
+    // local public IP and those that are not, and grade on the unmatched set
+    // rather than passing as soon as one address matches.
+    let unmatched: Vec<std::net::IpAddr> = resolved
+        .iter()
+        .copied()
+        .filter(|ip| !local_public.contains(ip))
+        .collect();
+    if unmatched.is_empty() {
         DnsPointsHere::Matches
-    } else {
+    } else if unmatched.len() == resolved.len() {
         DnsPointsHere::ResolvesElsewhere {
             resolved: resolved.iter().map(ToString::to_string).collect(),
+        }
+    } else {
+        DnsPointsHere::PartialMatch {
+            unmatched: unmatched.iter().map(ToString::to_string).collect(),
         }
     }
 }
@@ -3022,10 +3102,29 @@ fn override_file_lookup_names(profile: &str, selected_input: &str) -> Vec<String
 /// `autumn_web::config`: inline `[profile.{name}]` sections are applied in alias
 /// order (canonical spelling wins), and exactly one `autumn-{name}.toml` file is
 /// loaded — the first that exists, preferring the selected spelling.
+///
+/// Reads each config file from the process CWD. Use
+/// [`get_merged_toml_table_runtime_with`] to honor `AUTUMN_MANIFEST_DIR` the way
+/// the runtime loader does.
 fn get_merged_toml_table_runtime(normalized_profile: &str, selected_input: &str) -> toml::Table {
+    get_merged_toml_table_runtime_with(normalized_profile, selected_input, |f| {
+        std::path::PathBuf::from(f)
+    })
+}
+
+/// Like [`get_merged_toml_table_runtime`], but resolves each config filename
+/// through `resolve_path`, so a caller can honor `AUTUMN_MANIFEST_DIR` (the
+/// runtime prefers the manifest dir for `autumn.toml` / `autumn-{name}.toml`,
+/// falling back to the CWD). Injectable so tests can point the lookup at a
+/// temp dir without mutating the process environment.
+fn get_merged_toml_table_runtime_with(
+    normalized_profile: &str,
+    selected_input: &str,
+    resolve_path: impl Fn(&str) -> std::path::PathBuf,
+) -> toml::Table {
     let mut merged = toml::Table::new();
 
-    let base_toml = std::fs::read_to_string("autumn.toml")
+    let base_toml = std::fs::read_to_string(resolve_path("autumn.toml"))
         .ok()
         .and_then(|c| toml::from_str::<toml::Table>(&c).ok());
 
@@ -3049,9 +3148,10 @@ fn get_merged_toml_table_runtime(normalized_profile: &str, selected_input: &str)
 
     // 3. Exactly one autumn-{name}.toml override file (first existing).
     for profile_name in override_file_lookup_names(normalized_profile, selected_input) {
-        if let Some(table) = std::fs::read_to_string(format!("autumn-{profile_name}.toml"))
-            .ok()
-            .and_then(|c| toml::from_str::<toml::Table>(&c).ok())
+        if let Some(table) =
+            std::fs::read_to_string(resolve_path(&format!("autumn-{profile_name}.toml")))
+                .ok()
+                .and_then(|c| toml::from_str::<toml::Table>(&c).ok())
         {
             deep_merge(&mut merged, &table);
             break;
@@ -3059,6 +3159,24 @@ fn get_merged_toml_table_runtime(normalized_profile: &str, selected_input: &str)
     }
 
     merged
+}
+
+/// Resolve a config filename the way the runtime loader does: prefer
+/// `$AUTUMN_MANIFEST_DIR/<filename>` when that variable is set (through the
+/// crate's [`autumn_web::config::OsEnv`], which surfaces the value baked in by
+/// `#[autumn_web::main]` for installed apps) and the file exists there;
+/// otherwise fall back to the process CWD. Mirrors `config`'s
+/// `find_config_file_named`, so doctor reads the same `autumn.toml` the app
+/// boots from when launched with `AUTUMN_MANIFEST_DIR`.
+fn resolve_config_path_manifest_aware(filename: &str) -> std::path::PathBuf {
+    use autumn_web::config::Env as _;
+    if let Ok(manifest_dir) = autumn_web::config::OsEnv.var("AUTUMN_MANIFEST_DIR") {
+        let candidate = std::path::PathBuf::from(manifest_dir).join(filename);
+        if candidate.exists() {
+            return candidate;
+        }
+    }
+    std::path::PathBuf::from(filename)
 }
 
 pub struct DoctorOAuth2Provider {
@@ -3989,24 +4107,120 @@ fn resolve_trusted_hosts() -> Vec<String> {
     parse_hosts(&table)
 }
 
+/// Every env var the runtime recognizes as configuring `[server.tls]`: the
+/// cert/key paths plus the tuning knobs. This is the ONLY set that counts as
+/// "TLS configured via the environment", kept in lockstep with the keys
+/// `apply_server_env_overrides_with_env` reads in `autumn-web`'s config loader
+/// (`CERT_PATH`, `KEY_PATH`, `RELOAD_INTERVAL_SECS`, `HANDSHAKE_TIMEOUT_SECS`).
+///
+/// Detection is deliberately restricted to exactly these keys rather than a
+/// broad `AUTUMN_SERVER__TLS__*` prefix scan: an unrelated or mistyped var such
+/// as `AUTUMN_SERVER__TLS__ENABLED` does NOT make the runtime materialize
+/// `[server.tls]`, so that process serves plain HTTP. Treating it as configured
+/// would make `autumn doctor --strict` fail on a missing cert/key for exactly
+/// the deployment the server itself accepts. The recognized tuning vars
+/// (`RELOAD_INTERVAL_SECS`/`HANDSHAKE_TIMEOUT_SECS`) DO materialize the table, so
+/// they must still count.
+///
+/// Doctor scans these through the profile-aware dotenv overlay (an
+/// [`Env`](autumn_web::config::Env), which exposes only `var(key)` lookups, not
+/// iteration) so a TLS deployment supplied through `.env`/`.env.<profile>` — or
+/// through the real process env, which the overlay layers on top of — is
+/// detected.
+const TLS_ENV_VAR_NAMES: [&str; 4] = [
+    "AUTUMN_SERVER__TLS__CERT_PATH",
+    "AUTUMN_SERVER__TLS__KEY_PATH",
+    "AUTUMN_SERVER__TLS__RELOAD_INTERVAL_SECS",
+    "AUTUMN_SERVER__TLS__HANDSHAKE_TIMEOUT_SECS",
+];
+
+/// Whether any `[server.tls]` env var is present in `env` (including a
+/// tuning-only var). Reads through the passed [`Env`], so a var supplied only
+/// via the `.env`/`.env.<profile>` overlay counts — the runtime materializes an
+/// (otherwise-empty) `[server.tls]` table for it, so doctor must grade it rather
+/// than emit a false Pass. Presence of any [`TLS_ENV_VAR_NAMES`] key marks
+/// configured; an unrecognized `AUTUMN_SERVER__TLS__*` var does not.
+fn any_tls_env_var_set_in(env: &dyn autumn_web::config::Env) -> bool {
+    TLS_ENV_VAR_NAMES.iter().any(|name| env.var(name).is_ok())
+}
+
+/// Pure core of [`resolve_tls_paths`]: decide the resolved cert/key paths from
+/// already-extracted sources, so it can be graded in tests without mutating the
+/// process environment. `env_*` win over `toml_*` (matching the runtime).
+///
+/// TLS is "configured" — and therefore worth grading — when the `[server.tls]`
+/// section is present OR any recognized [`TLS_ENV_VAR_NAMES`] var is set. A
+/// configured deployment missing a cert/key yields `Some((empty, empty))` so the
+/// caller reports an actionable "must set both" failure rather than silently
+/// skipping.
+fn resolve_tls_paths_from_sources(
+    tls_section_present: bool,
+    toml_cert: Option<String>,
+    toml_key: Option<String>,
+    env_cert: Option<String>,
+    env_key: Option<String>,
+    any_tls_env: bool,
+) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+    let cert = env_cert.or(toml_cert);
+    let key = env_key.or(toml_key);
+
+    if !(tls_section_present || any_tls_env) {
+        return None;
+    }
+
+    Some((
+        std::path::PathBuf::from(cert.unwrap_or_default()),
+        std::path::PathBuf::from(key.unwrap_or_default()),
+    ))
+}
+
 /// Resolve the configured `[server.tls]` cert/key paths, honoring env-var
 /// overrides and the active profile's merged config, exactly as the runtime
 /// loads them. Returns `None` when TLS is not configured at all.
+///
+/// The `AUTUMN_SERVER__TLS__*` vars are read through the SAME profile-aware
+/// dotenv overlay the sibling checks use (`os_env_with_dotenv_for_profile`), so
+/// a cert/key or tuning var supplied via `.env`/`.env.<profile>` — which the
+/// runtime loads via `TomlEnvConfigLoader` and would boot a TLS listener from —
+/// is visible to doctor instead of being reported as not-configured.
+///
+/// The merged TOML is resolved through [`resolve_config_path_manifest_aware`],
+/// so a `[server.tls]` section present only in the `AUTUMN_MANIFEST_DIR` config
+/// (where an installed app keeps `autumn.toml`) is graded, rather than being
+/// reported as not-configured because doctor read the CWD instead.
 fn resolve_tls_paths() -> Option<(std::path::PathBuf, std::path::PathBuf)> {
     let (canonical, selected, _) = resolve_active_profiles();
-    let merged = get_merged_toml_table_runtime(&canonical, &selected);
+    let merged = get_merged_toml_table_runtime_with(
+        &canonical,
+        &selected,
+        resolve_config_path_manifest_aware,
+    );
     let tls = merged
         .get("server")
         .and_then(toml::Value::as_table)
         .and_then(|s| s.get("tls"))
         .and_then(toml::Value::as_table);
 
-    let env_cert = std::env::var("AUTUMN_SERVER__TLS__CERT_PATH")
-        .ok()
-        .filter(|v| !v.trim().is_empty());
-    let env_key = std::env::var("AUTUMN_SERVER__TLS__KEY_PATH")
-        .ok()
-        .filter(|v| !v.trim().is_empty());
+    // Read TLS env vars through the profile-aware `.env` overlay — the real OS
+    // env still wins, but `.env`/`.env.<profile>` values now fill keys the OS
+    // env lacks. Fall back to the bare OS env only if the overlay can't be built
+    // (a malformed `.env`), matching `resolve_offsite_backup_data`.
+    let denv: Box<dyn autumn_web::config::Env> =
+        match autumn_web::dotenv::os_env_with_dotenv_for_profile(&canonical) {
+            Ok(e) => Box::new(e),
+            Err(_) => Box::new(autumn_web::config::OsEnv),
+        };
+
+    // `.ok()` deliberately does NOT filter empty values: a set-but-empty env
+    // var is a PRESENT higher-priority override. The runtime materializes it as
+    // an empty `PathBuf` that OVERWRITES any TOML `cert_path`/`key_path`
+    // (`apply_env_overrides_with_env` uses `env.var(...).ok()` with no
+    // empty-filter, then `PathBuf::from(cert)`), so startup fails fast on the
+    // missing file. Dropping the empty override here would let doctor fall back
+    // to the TOML path and pass a config the server rejects — mirror the
+    // runtime's presence rule so doctor resolves to the same empty path.
+    let env_cert = denv.var("AUTUMN_SERVER__TLS__CERT_PATH").ok();
+    let env_key = denv.var("AUTUMN_SERVER__TLS__KEY_PATH").ok();
 
     let toml_cert = tls
         .and_then(|t| t.get("cert_path"))
@@ -4017,23 +4231,22 @@ fn resolve_tls_paths() -> Option<(std::path::PathBuf, std::path::PathBuf)> {
         .and_then(toml::Value::as_str)
         .map(str::to_owned);
 
-    let cert = env_cert.or(toml_cert);
-    let key = env_key.or(toml_key);
+    // Consider TLS configured only when a RECOGNIZED `[server.tls]` env var is
+    // present (through the overlay, which layers the real process env under the
+    // `.env`/`.env.<profile>` values). Restricting to `TLS_ENV_VAR_NAMES` — the
+    // exact set the runtime materializes the table from — avoids treating an
+    // unrelated/mistyped var like `AUTUMN_SERVER__TLS__ENABLED` as configured and
+    // failing `doctor --strict` on a config the server serves as plain HTTP.
+    let any_tls_env = any_tls_env_var_set_in(denv.as_ref());
 
-    // TLS is "configured" if the section is present OR any TLS env var is set.
-    let configured = tls.is_some()
-        || std::env::var_os("AUTUMN_SERVER__TLS__CERT_PATH").is_some()
-        || std::env::var_os("AUTUMN_SERVER__TLS__KEY_PATH").is_some();
-    if !configured {
-        return None;
-    }
-
-    // Present but incomplete: signal with empty paths so the caller reports an
-    // actionable "must set both" failure rather than silently skipping.
-    Some((
-        std::path::PathBuf::from(cert.unwrap_or_default()),
-        std::path::PathBuf::from(key.unwrap_or_default()),
-    ))
+    resolve_tls_paths_from_sources(
+        tls.is_some(),
+        toml_cert,
+        toml_key,
+        env_cert,
+        env_key,
+        any_tls_env,
+    )
 }
 
 /// Whether the static `cert_path` / `key_path` KEYS are PRESENT — set in the
@@ -4094,19 +4307,19 @@ fn resolve_tls_doctor_data() -> TlsDoctorData {
 
     #[cfg(feature = "tls")]
     {
-        match autumn_web::tls::inspect_leaf(&cert, &key) {
-            Ok(inspection) => {
-                let now = i64::try_from(
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0),
-                )
-                .unwrap_or(i64::MAX);
-                TlsDoctorData::Healthy {
-                    days_until_expiry: inspection.days_until_expiry(now),
-                }
-            }
+        let now = i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+        )
+        .unwrap_or(i64::MAX);
+        match autumn_web::tls::inspect_leaf(&cert, &key, now) {
+            Ok(inspection) => TlsDoctorData::Healthy {
+                not_yet_valid: inspection.is_not_yet_valid(now),
+                expired: inspection.is_expired(now),
+                days_until_expiry: inspection.days_until_expiry(now),
+            },
             Err(e) => TlsDoctorData::Invalid {
                 detail: e.to_string(),
             },
@@ -4210,6 +4423,14 @@ pub struct AcmeDoctorConfig {
     /// instead of silently defaulting to staging. `None` when the directory is
     /// valid or unset (unset uses the runtime default, staging).
     pub directory_error: Option<String>,
+    /// The rendered invalid `acme.http_challenge_port` value when it is PRESENT
+    /// but does not deserialize as a `u16` the way the runtime's typed
+    /// `AcmeConfig` does (out of range like `70000`/`-1`, or a non-integer like a
+    /// quoted string). The runtime rejects such a value before boot, so doctor
+    /// surfaces it as an `acme_config` FAIL instead of silently falling back to
+    /// `80` (which would hide a config the server won't start). `None` when the
+    /// port is a valid `u16` or unset (unset uses the runtime default, `80`).
+    pub port_error: Option<String>,
 }
 
 /// Deserialize `[server.tls.acme] directory` exactly as the runtime does.
@@ -4228,6 +4449,27 @@ fn parse_acme_directory(acme: &toml::Table) -> Result<autumn_web::config::AcmeDi
             let rendered = value.to_string();
             value
                 .try_into::<autumn_web::config::AcmeDirectory>()
+                .map_err(|_| rendered.trim().to_owned())
+        },
+    )
+}
+
+/// Deserialize `[server.tls.acme] http_challenge_port` exactly as the runtime's
+/// typed `AcmeConfig` does.
+///
+/// Returns the parsed `u16`, or — on a value the runtime would fail to
+/// deserialize (out of `u16` range like `70000`/`-1`, or a non-integer such as a
+/// quoted string) — the rendered invalid value, so the caller can surface it as
+/// an `acme_config` FAIL instead of silently falling back to the default `80`.
+/// An absent `http_challenge_port` key uses the runtime default (`80`).
+fn parse_acme_http_challenge_port(acme: &toml::Table) -> Result<u16, String> {
+    acme.get("http_challenge_port").cloned().map_or_else(
+        || Ok(80),
+        |value| {
+            // Render the value BEFORE `try_into` consumes it, for the FAIL message.
+            let rendered = value.to_string();
+            value
+                .try_into::<u16>()
                 .map_err(|_| rendered.trim().to_owned())
         },
     )
@@ -4294,13 +4536,16 @@ fn resolve_acme_doctor_config(toml_table: Option<&toml::Table>) -> Option<AcmeDo
         .unwrap_or_default()
         .to_owned();
 
-    // Mirror the runtime default (`default_acme_http_challenge_port` = 80) when
-    // the key is absent; preserve an explicit `0` so the acme-config grader FAILs
-    // it exactly as `AcmeConfig::validate()` does.
-    let http_challenge_port = acme
-        .get("http_challenge_port")
-        .and_then(toml::Value::as_integer)
-        .map_or(80, |v| u16::try_from(v).unwrap_or(80));
+    // Deserialize `http_challenge_port` the way the runtime's typed `AcmeConfig`
+    // does: an absent key defaults to 80, an explicit valid `u16` is preserved
+    // (including `0`, so the acme-config grader FAILs it exactly as
+    // `AcmeConfig::validate()` does), and a value the runtime would reject
+    // pre-boot (out of `u16` range, or a non-integer like a quoted string)
+    // records the bad value so the grader FAILs rather than silently defaulting.
+    let (http_challenge_port, port_error) = match parse_acme_http_challenge_port(acme) {
+        Ok(port) => (port, None),
+        Err(bad_value) => (80, Some(bad_value)),
+    };
 
     let cache_dir = acme
         .get("cache_dir")
@@ -4322,6 +4567,7 @@ fn resolve_acme_doctor_config(toml_table: Option<&toml::Table>) -> Option<AcmeDo
         cache_dir,
         directory_label,
         directory_error,
+        port_error,
     })
 }
 
@@ -4340,16 +4586,18 @@ fn resolve_acme_doctor_config(toml_table: Option<&toml::Table>) -> Option<AcmeDo
 /// This grader returns a `Fail` [`CheckResult`] for the first violated rule
 /// (messages mirror the runtime's), or `None` when the ACME config is valid.
 ///
-/// `directory_error` is the rendered invalid `directory` value (see
-/// [`AcmeDoctorConfig::directory_error`]); it is checked first because the
-/// runtime deserializes `AcmeConfig` — failing on a bad `directory` — before it
-/// runs `validate()`.
+/// `directory_error` and `port_error` are the rendered invalid `directory` /
+/// `http_challenge_port` values (see [`AcmeDoctorConfig::directory_error`] /
+/// [`AcmeDoctorConfig::port_error`]); they are checked first because the runtime
+/// DESERIALIZES `AcmeConfig` — failing on a bad `directory` or an out-of-range /
+/// non-integer `http_challenge_port` — before it runs `validate()`.
 #[must_use]
 pub fn check_acme_config_impl(
     domains: &[String],
     contact_email: &str,
     http_challenge_port: u16,
     directory_error: Option<&str>,
+    port_error: Option<&str>,
 ) -> Option<CheckResult> {
     if let Some(bad_value) = directory_error {
         return Some(CheckResult {
@@ -4363,6 +4611,21 @@ pub fn check_acme_config_impl(
             hint: Some(
                 "Set [server.tls.acme] directory to \"staging\", \"production\", or a custom \
                  directory URL",
+            ),
+        });
+    }
+    if let Some(bad_value) = port_error {
+        return Some(CheckResult {
+            name: "acme_config",
+            status: CheckStatus::Fail,
+            detail: Some(format!(
+                "[server.tls.acme] http_challenge_port value {bad_value} is not a valid port: it \
+                 must be an integer in the range 0-65535 (the runtime fails to boot on an \
+                 out-of-range or non-integer value)"
+            )),
+            hint: Some(
+                "Set [server.tls.acme] http_challenge_port to a valid port number (80, or the \
+                 port a front-end forwards `:80` to)",
             ),
         });
     }
@@ -4465,19 +4728,19 @@ fn resolve_acme_stored_cert_data(cert_dir: &std::path::Path, domains: &[String])
 
     #[cfg(feature = "tls")]
     {
-        match autumn_web::tls::inspect_leaf(&chain, &key) {
-            Ok(inspection) => {
-                let now = i64::try_from(
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0),
-                )
-                .unwrap_or(i64::MAX);
-                TlsDoctorData::Healthy {
-                    days_until_expiry: inspection.days_until_expiry(now),
-                }
-            }
+        let now = i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+        )
+        .unwrap_or(i64::MAX);
+        match autumn_web::tls::inspect_leaf(&chain, &key, now) {
+            Ok(inspection) => TlsDoctorData::Healthy {
+                not_yet_valid: inspection.is_not_yet_valid(now),
+                expired: inspection.is_expired(now),
+                days_until_expiry: inspection.days_until_expiry(now),
+            },
             Err(e) => TlsDoctorData::Invalid {
                 detail: e.to_string(),
             },
@@ -4573,7 +4836,23 @@ pub fn check_acme_stored_cert_impl(data: &TlsDoctorData) -> CheckResult {
             detail: Some(detail.clone()),
             hint: Some("Delete the corrupt cert from the ACME cache_dir so it is re-issued"),
         },
-        TlsDoctorData::Healthy { days_until_expiry } if *days_until_expiry < 0 => CheckResult {
+        TlsDoctorData::Healthy {
+            not_yet_valid: true,
+            ..
+        } => CheckResult {
+            name: "acme_stored_cert",
+            status: CheckStatus::Fail,
+            detail: Some(
+                "the stored ACME certificate is not yet valid (its notBefore is in the future)"
+                    .into(),
+            ),
+            hint: Some("Check the renewal task logs; renewal should have replaced it"),
+        },
+        TlsDoctorData::Healthy {
+            expired: true,
+            days_until_expiry,
+            ..
+        } => CheckResult {
             name: "acme_stored_cert",
             status: CheckStatus::Fail,
             detail: Some(format!(
@@ -4582,7 +4861,11 @@ pub fn check_acme_stored_cert_impl(data: &TlsDoctorData) -> CheckResult {
             )),
             hint: Some("Check the renewal task logs; renewal should have replaced it"),
         },
-        TlsDoctorData::Healthy { days_until_expiry } if *days_until_expiry <= 30 => CheckResult {
+        TlsDoctorData::Healthy {
+            expired: false,
+            days_until_expiry,
+            ..
+        } if *days_until_expiry <= 30 => CheckResult {
             name: "acme_stored_cert",
             status: CheckStatus::Warn,
             detail: Some(format!(
@@ -4590,7 +4873,9 @@ pub fn check_acme_stored_cert_impl(data: &TlsDoctorData) -> CheckResult {
             )),
             hint: Some("The renewal task should renew it automatically; watch for renewal errors"),
         },
-        TlsDoctorData::Healthy { days_until_expiry } => CheckResult {
+        TlsDoctorData::Healthy {
+            days_until_expiry, ..
+        } => CheckResult {
             name: "acme_stored_cert",
             status: CheckStatus::Pass,
             detail: Some(format!(
@@ -5412,6 +5697,7 @@ pub fn run(opts: DoctorOptions) {
             &acme.contact_email,
             acme.http_challenge_port,
             acme.directory_error.as_deref(),
+            acme.port_error.as_deref(),
         ) {
             tasks.push(Box::new(move || config_fail));
         } else {
@@ -7603,6 +7889,8 @@ pub struct Vault {
     #[test]
     fn tls_fail_when_expired() {
         let r = check_tls_impl(&TlsDoctorData::Healthy {
+            not_yet_valid: false,
+            expired: true,
             days_until_expiry: -3,
         });
         assert!(matches!(r.status, CheckStatus::Fail));
@@ -7610,9 +7898,27 @@ pub struct Vault {
         assert!(r.hint.is_some());
     }
 
+    // A not-yet-valid leaf (notBefore in the future) fails every handshake until
+    // its window opens, so the runtime rejects it at startup — doctor must grade
+    // it a Fail, symmetric to the expired path (#1603, Codex review). The
+    // not_yet_valid flag wins even when the expiry fields would otherwise Pass.
+    #[test]
+    fn tls_fail_when_not_yet_valid() {
+        let r = check_tls_impl(&TlsDoctorData::Healthy {
+            not_yet_valid: true,
+            expired: false,
+            days_until_expiry: 365,
+        });
+        assert!(matches!(r.status, CheckStatus::Fail));
+        assert!(r.detail.as_deref().unwrap().contains("not yet valid"));
+        assert!(r.hint.is_some());
+    }
+
     #[test]
     fn tls_warn_when_near_expiry() {
         let r = check_tls_impl(&TlsDoctorData::Healthy {
+            not_yet_valid: false,
+            expired: false,
             days_until_expiry: 10,
         });
         assert!(matches!(r.status, CheckStatus::Warn));
@@ -7623,6 +7929,8 @@ pub struct Vault {
     fn tls_warn_at_exactly_thirty_days() {
         // The 30-day boundary is inclusive of the warning window.
         let r = check_tls_impl(&TlsDoctorData::Healthy {
+            not_yet_valid: false,
+            expired: false,
             days_until_expiry: 30,
         });
         assert!(matches!(r.status, CheckStatus::Warn));
@@ -7631,10 +7939,100 @@ pub struct Vault {
     #[test]
     fn tls_pass_when_healthy() {
         let r = check_tls_impl(&TlsDoctorData::Healthy {
+            not_yet_valid: false,
+            expired: false,
             days_until_expiry: 365,
         });
         assert!(matches!(r.status, CheckStatus::Pass));
         assert!(r.hint.is_none());
+    }
+
+    // A certificate that expired less than 24h ago truncates to `0` days but
+    // must grade as a FAIL, not a near-expiry WARN — the runtime rejects it at
+    // startup (issue #1603, Codex review). We grade off the injected notAfter
+    // via `LeafInspection::is_expired`, so no time-dependent fixture is needed.
+    #[cfg(feature = "tls")]
+    #[test]
+    fn tls_grades_from_raw_timestamp_not_day_bucket() {
+        use autumn_web::tls::LeafInspection;
+
+        let now: i64 = 1_700_000_000;
+
+        // A notBefore a day in the past keeps every fixture below currently
+        // valid (not_yet_valid == false), isolating the expiry grading.
+        let not_before = now - 86_400;
+
+        // Expired 1h ago: buckets to 0 days, but is_expired → Fail.
+        let just_expired = LeafInspection {
+            not_before_unix: not_before,
+            not_after_unix: now - 3_600,
+        };
+        assert!(just_expired.is_expired(now));
+        assert!(!just_expired.is_not_yet_valid(now));
+        let r = check_tls_impl(&TlsDoctorData::Healthy {
+            not_yet_valid: just_expired.is_not_yet_valid(now),
+            expired: just_expired.is_expired(now),
+            days_until_expiry: just_expired.days_until_expiry(now),
+        });
+        assert!(
+            matches!(r.status, CheckStatus::Fail),
+            "cert expired <24h ago must Fail, got {:?}",
+            r.status
+        );
+
+        // Expires in 1h (not yet expired): near-expiry Warn.
+        let expiring_soon = LeafInspection {
+            not_before_unix: not_before,
+            not_after_unix: now + 3_600,
+        };
+        assert!(!expiring_soon.is_expired(now));
+        let r = check_tls_impl(&TlsDoctorData::Healthy {
+            not_yet_valid: expiring_soon.is_not_yet_valid(now),
+            expired: expiring_soon.is_expired(now),
+            days_until_expiry: expiring_soon.days_until_expiry(now),
+        });
+        assert!(
+            matches!(r.status, CheckStatus::Warn),
+            "cert expiring in <24h (not expired) must Warn, got {:?}",
+            r.status
+        );
+
+        // Expires in 40 days: healthy Pass.
+        let healthy = LeafInspection {
+            not_before_unix: not_before,
+            not_after_unix: now + 40 * 86_400,
+        };
+        assert!(!healthy.is_expired(now));
+        let r = check_tls_impl(&TlsDoctorData::Healthy {
+            not_yet_valid: healthy.is_not_yet_valid(now),
+            expired: healthy.is_expired(now),
+            days_until_expiry: healthy.days_until_expiry(now),
+        });
+        assert!(
+            matches!(r.status, CheckStatus::Pass),
+            "cert with 40 days left must Pass, got {:?}",
+            r.status
+        );
+
+        // Not yet valid: notBefore an hour in the future → Fail, even though
+        // notAfter is far off (days_until_expiry would otherwise Pass).
+        let not_yet_valid = LeafInspection {
+            not_before_unix: now + 3_600,
+            not_after_unix: now + 40 * 86_400,
+        };
+        assert!(not_yet_valid.is_not_yet_valid(now));
+        assert!(!not_yet_valid.is_expired(now));
+        let r = check_tls_impl(&TlsDoctorData::Healthy {
+            not_yet_valid: not_yet_valid.is_not_yet_valid(now),
+            expired: not_yet_valid.is_expired(now),
+            days_until_expiry: not_yet_valid.days_until_expiry(now),
+        });
+        assert!(
+            matches!(r.status, CheckStatus::Fail),
+            "not-yet-valid cert must Fail, got {:?}",
+            r.status
+        );
+        assert!(r.detail.as_deref().unwrap().contains("not yet valid"));
     }
 
     #[test]
@@ -7645,6 +8043,272 @@ pub struct Vault {
         assert!(matches!(r.status, CheckStatus::Fail));
         assert_eq!(r.detail.as_deref(), Some("cert file not found"));
         assert!(r.hint.is_some());
+    }
+
+    // Regression (#1603, Codex): a tuning-only TLS env deployment — e.g. only
+    // `AUTUMN_SERVER__TLS__RELOAD_INTERVAL_SECS` set, no cert/key — makes the
+    // runtime materialize `[server.tls]` and fail fast. Doctor must treat it as
+    // configured (Some with empty paths) so it emits the actionable "must set
+    // both" Fail, not a false Pass/NotConfigured. Tested via the pure sources
+    // helper to avoid mutating the process-global environment.
+    #[test]
+    fn tls_tuning_only_env_resolves_as_incomplete_config() {
+        let resolved = resolve_tls_paths_from_sources(
+            false, // no [server.tls] section
+            None,  // toml_cert
+            None,  // toml_key
+            None,  // env_cert (CERT_PATH unset)
+            None,  // env_key (KEY_PATH unset)
+            true,  // any_tls_env: a tuning-only var such as RELOAD_INTERVAL_SECS is set
+        );
+        let (cert, key) = resolved.expect("tuning-only TLS env must resolve as configured");
+        assert!(
+            cert.as_os_str().is_empty() && key.as_os_str().is_empty(),
+            "cert/key must be empty so the caller reports 'must set both'"
+        );
+
+        // Empty paths are exactly what `resolve_tls_doctor_data` maps to the
+        // incomplete-config Invalid, which grades as a Fail.
+        assert!(
+            cert.as_os_str().is_empty() || key.as_os_str().is_empty(),
+            "mirrors resolve_tls_doctor_data's incomplete-config guard"
+        );
+        let data = TlsDoctorData::Invalid {
+            detail: "[server.tls] must set both cert_path and key_path".to_owned(),
+        };
+        let r = check_tls_impl(&data);
+        assert!(matches!(r.status, CheckStatus::Fail));
+        assert!(r.detail.as_deref().unwrap().contains("must set both"));
+    }
+
+    // Regression (#1603, Codex): the runtime prefers `AUTUMN_MANIFEST_DIR` for
+    // `autumn.toml`, so a `[server.tls]` section present ONLY in the manifest-dir
+    // config must be graded — not reported NotConfigured because doctor read the
+    // CWD. `resolve_tls_paths` resolves the merged table through
+    // `resolve_config_path_manifest_aware`; here we inject the manifest dir
+    // directly (no process-env mutation) by pointing `resolve_path` at a temp dir
+    // and confirm the section flows through `resolve_tls_paths_from_sources`.
+    #[test]
+    fn tls_section_in_manifest_dir_config_is_detected() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("autumn.toml"),
+            "[server.tls]\ncert_path = \"/etc/tls/cert.pem\"\nkey_path = \"/etc/tls/key.pem\"\n",
+        )
+        .unwrap();
+
+        // Resolve the merged table the way `resolve_tls_paths` does when
+        // `AUTUMN_MANIFEST_DIR` points at `dir`: each filename resolves under it.
+        let base = dir.path().to_path_buf();
+        let merged = get_merged_toml_table_runtime_with("dev", "dev", move |f| base.join(f));
+
+        let tls = merged
+            .get("server")
+            .and_then(toml::Value::as_table)
+            .and_then(|s| s.get("tls"))
+            .and_then(toml::Value::as_table);
+        assert!(
+            tls.is_some(),
+            "a [server.tls] section in the manifest-dir autumn.toml must be visible"
+        );
+
+        let toml_cert = tls
+            .and_then(|t| t.get("cert_path"))
+            .and_then(toml::Value::as_str)
+            .map(str::to_owned);
+        let toml_key = tls
+            .and_then(|t| t.get("key_path"))
+            .and_then(toml::Value::as_str)
+            .map(str::to_owned);
+
+        let (cert, key) =
+            resolve_tls_paths_from_sources(tls.is_some(), toml_cert, toml_key, None, None, false)
+                .expect("manifest-dir [server.tls] must resolve as configured, not NotConfigured");
+        assert_eq!(cert, std::path::PathBuf::from("/etc/tls/cert.pem"));
+        assert_eq!(key, std::path::PathBuf::from("/etc/tls/key.pem"));
+    }
+
+    // Complementary: with no section and NO TLS env var, TLS is unconfigured.
+    #[test]
+    fn tls_paths_none_when_unconfigured() {
+        assert!(
+            resolve_tls_paths_from_sources(false, None, None, None, None, false).is_none(),
+            "no section and no TLS env means not configured"
+        );
+    }
+
+    // Regression (#1603, Codex): detection must be limited to the FOUR recognized
+    // `TLS_ENV_VAR_NAMES` — the exact set the runtime materializes `[server.tls]`
+    // from. An unrelated/mistyped var sharing the prefix, e.g.
+    // `AUTUMN_SERVER__TLS__ENABLED=false`, must NOT mark TLS configured: the
+    // server serves plain HTTP for it, so treating it as configured would make
+    // `doctor --strict` fail on a missing cert/key for a config the server
+    // accepts. A recognized tuning var (`HANDSHAKE_TIMEOUT_SECS`) must still count.
+    #[test]
+    fn unrecognized_tls_env_var_is_not_detected() {
+        use autumn_web::config::MockEnv;
+
+        // Unrecognized prefix var, no cert/key: NOT detected → not configured.
+        let unrecognized = MockEnv::new().with("AUTUMN_SERVER__TLS__ENABLED", "false");
+        assert!(
+            !any_tls_env_var_set_in(&unrecognized),
+            "an unrecognized AUTUMN_SERVER__TLS__* var must not mark TLS configured"
+        );
+        assert!(
+            resolve_tls_paths_from_sources(
+                false, // no [server.tls] section
+                None,
+                None,
+                None,
+                None,
+                any_tls_env_var_set_in(&unrecognized),
+            )
+            .is_none(),
+            "an unrecognized TLS env var must resolve as not-configured (no spurious Fail)"
+        );
+
+        // A recognized tuning var IS still detected (materializes the table).
+        let recognized = MockEnv::new().with("AUTUMN_SERVER__TLS__HANDSHAKE_TIMEOUT_SECS", "5");
+        assert!(
+            any_tls_env_var_set_in(&recognized),
+            "a recognized TLS tuning var must still mark TLS configured"
+        );
+    }
+
+    // Env cert/key win over toml, and a fully-specified pair resolves as-is.
+    #[test]
+    fn tls_paths_env_overrides_toml() {
+        let resolved = resolve_tls_paths_from_sources(
+            true,
+            Some("/toml/c.pem".to_owned()),
+            Some("/toml/k.pem".to_owned()),
+            Some("/env/c.pem".to_owned()),
+            Some("/env/k.pem".to_owned()),
+            true,
+        )
+        .expect("configured");
+        assert_eq!(resolved.0, std::path::PathBuf::from("/env/c.pem"));
+        assert_eq!(resolved.1, std::path::PathBuf::from("/env/k.pem"));
+    }
+
+    // Regression (#1603, Codex): a PRESENT-but-EMPTY `AUTUMN_SERVER__TLS__CERT_PATH`
+    // (e.g. a deployment that exports `AUTUMN_SERVER__TLS__CERT_PATH=`) is a
+    // higher-priority override the runtime materializes as an empty `PathBuf`,
+    // OVERWRITING the valid TOML cert path and failing fast on the missing file.
+    // Doctor must read env vars with `.ok()` (no empty-filter) so it resolves to
+    // the SAME empty path and grades a Fail — not silently fall back to the TOML
+    // path and pass a config the server rejects. Extract exactly as
+    // `resolve_tls_paths` now does (`env.var(...).ok()`) from a map-backed `Env`.
+    #[test]
+    fn tls_empty_env_override_clears_toml_path() {
+        use autumn_web::config::{Env, MockEnv};
+
+        // TOML has a valid cert/key pair, but the deployment exports an EMPTY
+        // CERT_PATH override. The runtime overwrites cert_path with an empty
+        // PathBuf; doctor must mirror that presence-vs-empty rule.
+        let env = MockEnv::new().with("AUTUMN_SERVER__TLS__CERT_PATH", "");
+        // Mirror `resolve_tls_paths`: `.ok()` with NO `.filter(non-empty)`, so a
+        // present-but-empty var is `Some("")` (a clearing override), while an
+        // unset var stays `None` (falls through to TOML).
+        let env_cert = env.var("AUTUMN_SERVER__TLS__CERT_PATH").ok();
+        let env_key = env.var("AUTUMN_SERVER__TLS__KEY_PATH").ok();
+        assert_eq!(
+            env_cert.as_deref(),
+            Some(""),
+            "a present-but-empty CERT_PATH must survive as Some(\"\"), not be dropped"
+        );
+        assert!(env_key.is_none(), "an unset KEY_PATH stays None");
+
+        let (cert, key) = resolve_tls_paths_from_sources(
+            true,                              // [server.tls] section present
+            Some("/toml/cert.pem".to_owned()), // valid TOML cert
+            Some("/toml/key.pem".to_owned()),  // valid TOML key
+            env_cert,                          // present-but-empty override
+            env_key,                           // unset -> falls back to TOML key
+            any_tls_env_var_set_in(&env),
+        )
+        .expect("a present TLS env var means TLS is configured");
+
+        // The empty override wins over the TOML cert, matching the runtime.
+        assert!(
+            cert.as_os_str().is_empty(),
+            "empty CERT_PATH override must clear the TOML cert path"
+        );
+        assert_eq!(
+            key,
+            std::path::PathBuf::from("/toml/key.pem"),
+            "the unset KEY_PATH keeps the TOML value"
+        );
+
+        // Empty cert path is exactly what `resolve_tls_doctor_data` maps to the
+        // incomplete-config Invalid, which grades a Fail — same failure the
+        // server surfaces at startup.
+        let r = check_tls_impl(&TlsDoctorData::Invalid {
+            detail: "[server.tls] must set both cert_path and key_path".to_owned(),
+        });
+        assert!(matches!(r.status, CheckStatus::Fail));
+    }
+
+    // Regression (#1603, Codex): TLS vars supplied through the `.env`/
+    // `.env.<profile>` overlay the runtime loads (not the process env) must be
+    // visible to doctor. `resolve_tls_paths` now reads them through the same
+    // profile-aware `Env` overlay the sibling checks use; feed that overlay a
+    // `MockEnv` (a map-backed `Env`) with TLS vars set and prove detection.
+    #[test]
+    fn dotenv_supplied_tls_var_is_detected() {
+        use autumn_web::config::{Env, MockEnv};
+
+        // A cert/key pair visible ONLY through the overlay (never the process
+        // env) must resolve as configured — this is exactly the source
+        // `resolve_tls_paths` now reads the `AUTUMN_SERVER__TLS__*` vars from.
+        let env = MockEnv::new()
+            .with("AUTUMN_SERVER__TLS__CERT_PATH", "/dotenv/cert.pem")
+            .with("AUTUMN_SERVER__TLS__KEY_PATH", "/dotenv/key.pem");
+        assert!(
+            any_tls_env_var_set_in(&env),
+            "a dotenv-supplied TLS var must count as configured"
+        );
+        let env_cert = env
+            .var("AUTUMN_SERVER__TLS__CERT_PATH")
+            .ok()
+            .filter(|v| !v.trim().is_empty());
+        let env_key = env
+            .var("AUTUMN_SERVER__TLS__KEY_PATH")
+            .ok()
+            .filter(|v| !v.trim().is_empty());
+        let resolved = resolve_tls_paths_from_sources(
+            false, // no [server.tls] section in autumn.toml
+            None,  // toml_cert
+            None,  // toml_key
+            env_cert,
+            env_key,
+            any_tls_env_var_set_in(&env),
+        )
+        .expect("dotenv-supplied TLS cert/key must resolve as configured");
+        assert_eq!(resolved.0, std::path::PathBuf::from("/dotenv/cert.pem"));
+        assert_eq!(resolved.1, std::path::PathBuf::from("/dotenv/key.pem"));
+
+        // A tuning-only dotenv var (no cert/key) is otherwise invisible, yet
+        // must still mark TLS configured so doctor emits the actionable "must
+        // set both" Fail instead of a false Pass.
+        let tuning_only = MockEnv::new().with("AUTUMN_SERVER__TLS__RELOAD_INTERVAL_SECS", "30");
+        assert!(
+            any_tls_env_var_set_in(&tuning_only),
+            "a dotenv-supplied tuning var must count as configured"
+        );
+        let (cert, key) = resolve_tls_paths_from_sources(
+            false,
+            None,
+            None,
+            None,
+            None,
+            any_tls_env_var_set_in(&tuning_only),
+        )
+        .expect("tuning-only dotenv TLS var must resolve as configured");
+        assert!(
+            cert.as_os_str().is_empty() && key.as_os_str().is_empty(),
+            "cert/key must be empty so the caller reports 'must set both'"
+        );
     }
 
     #[test]
@@ -7771,6 +8435,45 @@ pub struct Vault {
         );
     }
 
+    // Regression (#1608, Codex P2): the domain resolves to TWO public addresses,
+    // only one of which is this host. HTTP-01's challenge token is per-process, so
+    // the CA validating against the unmatched address would 404 — a partial match
+    // must NOT grade as a clean Pass; it reports the unmatched address as a Warn.
+    #[test]
+    fn dns_partial_match_flags_unmatched_address() {
+        let here: std::net::IpAddr = "203.0.113.10".parse().unwrap();
+        let elsewhere: std::net::IpAddr = "198.51.100.7".parse().unwrap();
+        // Two resolved public addresses; only `here` is a local public IP.
+        let resolved: Vec<std::net::IpAddr> = vec![here, elsewhere];
+        let local: Vec<std::net::IpAddr> = vec![here];
+
+        // The grader must not collapse to Matches just because one address matched.
+        assert_eq!(
+            grade_dns_points_here(&resolved, &local),
+            DnsPointsHere::PartialMatch {
+                unmatched: vec!["198.51.100.7".to_owned()],
+            },
+            "an unmatched resolved address must not be swallowed by a first-match Pass"
+        );
+
+        // And the check grades a partial match as a Warn that names the stray
+        // address — not a clean Pass.
+        let outcome = grade_dns_points_here(&resolved, &local);
+        let r = check_acme_dns_impl("app.example.com", &outcome);
+        assert!(
+            matches!(r.status, CheckStatus::Warn),
+            "a partial DNS match must be a Warn, not a clean Pass"
+        );
+        assert!(
+            r.detail
+                .as_deref()
+                .unwrap_or_default()
+                .contains("198.51.100.7"),
+            "the unmatched address must be reported: {:?}",
+            r.detail
+        );
+    }
+
     #[test]
     fn is_public_ip_classifies_ranges() {
         for public in ["203.0.113.10", "198.51.100.7", "2001:4860:4860::8888"] {
@@ -7813,14 +8516,32 @@ pub struct Vault {
     #[test]
     fn acme_stored_cert_fail_when_expired() {
         let r = check_acme_stored_cert_impl(&TlsDoctorData::Healthy {
+            not_yet_valid: false,
+            expired: true,
             days_until_expiry: -3,
         });
         assert!(matches!(r.status, CheckStatus::Fail));
     }
 
     #[test]
+    fn acme_stored_cert_fail_when_not_yet_valid() {
+        // Mirrors check_tls_impl: a stored cert whose notBefore is in the future
+        // fails every handshake until its window opens, so grade it a Fail even
+        // when the expiry fields would otherwise Pass.
+        let r = check_acme_stored_cert_impl(&TlsDoctorData::Healthy {
+            not_yet_valid: true,
+            expired: false,
+            days_until_expiry: 365,
+        });
+        assert!(matches!(r.status, CheckStatus::Fail));
+        assert!(r.detail.as_deref().unwrap().contains("not yet valid"));
+    }
+
+    #[test]
     fn acme_stored_cert_warn_when_near_expiry() {
         let r = check_acme_stored_cert_impl(&TlsDoctorData::Healthy {
+            not_yet_valid: false,
+            expired: false,
             days_until_expiry: 10,
         });
         assert!(matches!(r.status, CheckStatus::Warn));
@@ -7829,6 +8550,8 @@ pub struct Vault {
     #[test]
     fn acme_stored_cert_pass_when_healthy() {
         let r = check_acme_stored_cert_impl(&TlsDoctorData::Healthy {
+            not_yet_valid: false,
+            expired: false,
             days_until_expiry: 75,
         });
         assert!(matches!(r.status, CheckStatus::Pass));
@@ -7839,7 +8562,7 @@ pub struct Vault {
     // doctor must FAIL it rather than silently pass acme_stored_cert.
     #[test]
     fn acme_config_fail_when_domains_empty() {
-        let r = check_acme_config_impl(&[], "ops@example.com", 80, None)
+        let r = check_acme_config_impl(&[], "ops@example.com", 80, None, None)
             .expect("empty domains must be a FAIL, not Pass");
         assert!(matches!(r.status, CheckStatus::Fail));
         assert_eq!(r.name, "acme_config");
@@ -7847,15 +8570,21 @@ pub struct Vault {
 
     #[test]
     fn acme_config_fail_when_contact_email_blank() {
-        let r = check_acme_config_impl(&["app.example.com".to_owned()], "   ", 80, None)
+        let r = check_acme_config_impl(&["app.example.com".to_owned()], "   ", 80, None, None)
             .expect("blank contact_email must be a FAIL");
         assert!(matches!(r.status, CheckStatus::Fail));
     }
 
     #[test]
     fn acme_config_fail_when_wildcard_domain() {
-        let r = check_acme_config_impl(&["*.example.com".to_owned()], "ops@example.com", 80, None)
-            .expect("wildcard domain must be a FAIL");
+        let r = check_acme_config_impl(
+            &["*.example.com".to_owned()],
+            "ops@example.com",
+            80,
+            None,
+            None,
+        )
+        .expect("wildcard domain must be a FAIL");
         assert!(matches!(r.status, CheckStatus::Fail));
         // Points the operator at the DNS-01 tracking issue, mirroring
         // AcmeConfig::validate().
@@ -7866,8 +8595,14 @@ pub struct Vault {
     fn acme_config_ok_when_valid() {
         // A valid ACME config produces no acme_config failure.
         assert!(
-            check_acme_config_impl(&["app.example.com".to_owned()], "ops@example.com", 80, None)
-                .is_none(),
+            check_acme_config_impl(
+                &["app.example.com".to_owned()],
+                "ops@example.com",
+                80,
+                None,
+                None
+            )
+            .is_none(),
             "a valid ACME config must not raise an acme_config failure"
         );
     }
@@ -7878,7 +8613,7 @@ pub struct Vault {
     // identifier, so doctor must FAIL it rather than pass acme_stored_cert.
     #[test]
     fn acme_config_fail_when_domain_entry_blank() {
-        let r = check_acme_config_impl(&[String::new()], "ops@example.com", 80, None)
+        let r = check_acme_config_impl(&[String::new()], "ops@example.com", 80, None, None)
             .expect("a blank domain entry must be a FAIL");
         assert!(matches!(r.status, CheckStatus::Fail));
         assert_eq!(r.name, "acme_config");
@@ -7889,7 +8624,7 @@ pub struct Vault {
         );
 
         // Whitespace-only is rejected the same way.
-        let r = check_acme_config_impl(&["   ".to_owned()], "ops@example.com", 80, None)
+        let r = check_acme_config_impl(&["   ".to_owned()], "ops@example.com", 80, None, None)
             .expect("a whitespace-only domain entry must be a FAIL");
         assert!(matches!(r.status, CheckStatus::Fail));
     }
@@ -7900,8 +8635,14 @@ pub struct Vault {
     // the process stays up — doctor must FAIL it.
     #[test]
     fn acme_config_fail_when_http_challenge_port_zero() {
-        let r = check_acme_config_impl(&["app.example.com".to_owned()], "ops@example.com", 0, None)
-            .expect("http_challenge_port = 0 must be a FAIL");
+        let r = check_acme_config_impl(
+            &["app.example.com".to_owned()],
+            "ops@example.com",
+            0,
+            None,
+            None,
+        )
+        .expect("http_challenge_port = 0 must be a FAIL");
         assert!(matches!(r.status, CheckStatus::Fail));
         assert_eq!(r.name, "acme_config");
         assert!(
@@ -7911,6 +8652,101 @@ pub struct Vault {
                 .contains("http_challenge_port"),
             "detail must mention http_challenge_port: {:?}",
             r.detail
+        );
+    }
+
+    // Regression (#1608, Codex P2): a malformed `http_challenge_port` must FAIL,
+    // not silently fall back to 80. The runtime's typed `AcmeConfig` deserializes
+    // the field as a `u16`, so an out-of-range value like `70000` or a non-integer
+    // like a quoted string is rejected before boot; doctor previously swallowed the
+    // parse error (`as_integer().map_or(80, |v| try_from(v).unwrap_or(80))`) and
+    // graded a config the server won't start. `resolve_acme_doctor_config` now
+    // records the bad value and `check_acme_config_impl` surfaces it as a FAIL.
+    #[test]
+    fn acme_config_fail_when_http_challenge_port_malformed() {
+        // Out-of-`u16`-range integer.
+        let raw: toml::Table = toml::from_str(
+            "\
+[server.tls.acme]
+domains = [\"app.example.com\"]
+contact_email = \"ops@example.com\"
+http_challenge_port = 70000
+",
+        )
+        .unwrap();
+        let acme = resolve_acme_doctor_config(Some(&raw)).expect("[server.tls.acme] present");
+        assert!(
+            acme.port_error.is_some(),
+            "an out-of-range http_challenge_port must be recorded, not defaulted to 80"
+        );
+        let r = check_acme_config_impl(
+            &acme.domains,
+            &acme.contact_email,
+            acme.http_challenge_port,
+            acme.directory_error.as_deref(),
+            acme.port_error.as_deref(),
+        )
+        .expect("an out-of-range http_challenge_port must be a FAIL, not silently 80");
+        assert!(matches!(r.status, CheckStatus::Fail));
+        assert_eq!(r.name, "acme_config");
+        let detail = r.detail.as_deref().unwrap_or_default();
+        assert!(
+            detail.contains("http_challenge_port") && detail.contains("70000"),
+            "detail must name the bad port value: {detail}"
+        );
+
+        // A non-integer (quoted string) is rejected the same way.
+        let raw: toml::Table = toml::from_str(
+            "\
+[server.tls.acme]
+domains = [\"app.example.com\"]
+contact_email = \"ops@example.com\"
+http_challenge_port = \"80\"
+",
+        )
+        .unwrap();
+        let acme = resolve_acme_doctor_config(Some(&raw)).expect("[server.tls.acme] present");
+        assert!(
+            acme.port_error.is_some(),
+            "a quoted-string http_challenge_port must be recorded, not defaulted to 80"
+        );
+        let r = check_acme_config_impl(
+            &acme.domains,
+            &acme.contact_email,
+            acme.http_challenge_port,
+            acme.directory_error.as_deref(),
+            acme.port_error.as_deref(),
+        )
+        .expect("a non-integer http_challenge_port must be a FAIL");
+        assert!(matches!(r.status, CheckStatus::Fail));
+        assert_eq!(r.name, "acme_config");
+    }
+
+    // A valid explicit `http_challenge_port` records no error and does not FAIL.
+    #[test]
+    fn acme_config_ok_when_http_challenge_port_valid() {
+        let raw: toml::Table = toml::from_str(
+            "\
+[server.tls.acme]
+domains = [\"app.example.com\"]
+contact_email = \"ops@example.com\"
+http_challenge_port = 8080
+",
+        )
+        .unwrap();
+        let acme = resolve_acme_doctor_config(Some(&raw)).expect("[server.tls.acme] present");
+        assert!(acme.port_error.is_none());
+        assert_eq!(acme.http_challenge_port, 8080);
+        assert!(
+            check_acme_config_impl(
+                &acme.domains,
+                &acme.contact_email,
+                acme.http_challenge_port,
+                acme.directory_error.as_deref(),
+                acme.port_error.as_deref(),
+            )
+            .is_none(),
+            "a valid http_challenge_port must not raise an acme_config FAIL"
         );
     }
 
@@ -7943,6 +8779,7 @@ directory = \"prod\"
             &acme.contact_email,
             acme.http_challenge_port,
             acme.directory_error.as_deref(),
+            acme.port_error.as_deref(),
         )
         .expect("an invalid `directory` must be a FAIL, not silently staging");
         assert!(matches!(r.status, CheckStatus::Fail));
@@ -7998,6 +8835,7 @@ contact_email = \"ops@example.com\"
                     &acme.contact_email,
                     acme.http_challenge_port,
                     acme.directory_error.as_deref(),
+                    acme.port_error.as_deref(),
                 )
                 .is_none(),
                 "valid directory `{line}` must not raise an acme_config FAIL"
@@ -8266,6 +9104,7 @@ directory = \"production\"
             cache_dir: std::path::PathBuf::from("config/acme"),
             directory_label: "production".to_owned(),
             directory_error: None,
+            port_error: None,
         };
 
         // Every configured domain is scheduled for probing, not just the first.

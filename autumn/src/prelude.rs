@@ -175,7 +175,7 @@ pub use crate::tenant_cell::{TenantCell, TenantCellHandle, TenantCellRegistry};
 
 // ── Pagination ──────────────────────────────────────────────────
 /// Pagination primitives — offset and cursor extractors and wrappers.
-pub use crate::pagination::{CursorPage, CursorRequest, Page, PageRequest};
+pub use crate::pagination::{CursorPage, CursorRequest, ListQuery, Page, PageRequest, SortDir};
 /// Reusable Maud pager renderers and options — render an accessible,
 /// filter-preserving, htmx-ready pager from a [`Page`]/[`CursorPage`] in one
 /// line. See [`crate::ui::pagination`] for the full API.
@@ -204,7 +204,7 @@ pub use crate::widgets::{
     ActiveSearchConfig, AlertConfig, AlertVariant, AutocompleteConfig, AvatarConfig, AvatarSize,
     BadgeConfig, BadgeVariant, CardConfig, Column, ConfirmActionConfig, Crumb, Cta, CtaStyle,
     DEFAULT_TOAST_REGION_ID, DataTableConfig, FeedConfig, FeedMode, HeadingLevel, HeroConfig,
-    ModalConfig, NavBarConfig, NavBarLayout, NavItem, NavLinkMatch, NavMenu, SearchMethod, SortDir,
+    ModalConfig, NavBarConfig, NavBarLayout, NavItem, NavLinkMatch, NavMenu, SearchMethod,
     active_search, active_search_empty_state, active_search_input, active_search_results, alert,
     alert_with, autocomplete_empty_state, autocomplete_input, autocomplete_option, avatar, badge,
     badge_with, breadcrumb, card, confirm_action, data_table, error_summary, feed_page, hero,

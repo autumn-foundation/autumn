@@ -4108,19 +4108,23 @@ fn generate_scaffold_index_uses_paginated_repo_method() {
         routes.contains("pagination_nav") || routes.contains("pagination"),
         "scaffold index must render a pagination nav partial: {routes}"
     );
+    // Since #1126 the default (non-live) index calls the paginated, sort/filter
+    // `list(&ListQuery, &PageRequest)` method instead of the bare `page()`;
+    // either paginated repository method satisfies issue #681 (both take a
+    // `PageRequest` and return a `Page`, never loading every row).
     assert!(
-        routes.contains(".page("),
-        "scaffold index must call the repository page() method: {routes}"
+        routes.contains(".page(") || routes.contains(".list("),
+        "scaffold index must call a paginated repository method (page()/list()): {routes}"
     );
     assert!(
         !routes.contains(".load(&mut *db)"),
         "scaffold index must not load every row without pagination: {routes}"
     );
-    // The repository trait must be imported so `repo.page()` (a trait method)
-    // resolves at compile time — without it the generated code fails with E0599.
+    // The repository trait must be imported so `repo.list()`/`repo.page()` (trait
+    // methods) resolve at compile time — without it the generated code fails with E0599.
     assert!(
         routes.contains("PostRepository"),
-        "scaffold routes must import the PostRepository trait (needed to call repo.page()): {routes}"
+        "scaffold routes must import the PostRepository trait (needed to call repo.list()): {routes}"
     );
 }
 
@@ -6117,6 +6121,50 @@ fn generated_sharded_scaffold_cargo_checks() {
     assert!(
         check.status.success(),
         "cargo check on generated sharded scaffold failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&check.stdout),
+        String::from_utf8_lossy(&check.stderr),
+    );
+}
+
+/// Slow end-to-end check: scaffold a `--searchable` (full-text search) project,
+/// patch Cargo.toml to the local autumn-web, and `cargo check --tests` the
+/// result. Verifies that the merged FTS codegen (issue #1319/#1825) compiles:
+/// the `#[searchable]` model attributes, the `searchable` repository option,
+/// the generated `{Model}SearchQuery` extractor type, and the `search_vector`
+/// migration all typecheck against this workspace's `autumn-web`.
+///
+/// Uses a plain searchable model (no owner scoping — the generator rejects the
+/// owner-scoped + search combination).
+///
+/// Run with: `cargo test -p autumn-cli -- --ignored generated_searchable_scaffold_cargo_checks`
+#[test]
+#[ignore = "slow: cargo-checks a fresh searchable project — run with `cargo test -p autumn-cli -- --ignored`"]
+fn generated_searchable_scaffold_cargo_checks() {
+    let (_tmp, project) = fresh_project("searchable-build");
+
+    patch_generated_cargo_toml(&project);
+
+    run_autumn(
+        &project,
+        &[
+            "generate",
+            "scaffold",
+            "Post",
+            "title:String",
+            "body:Text",
+            "--searchable",
+            "title,body",
+        ],
+    );
+
+    let check = Command::new("cargo")
+        .args(["check", "--tests"])
+        .current_dir(&project)
+        .output()
+        .unwrap();
+    assert!(
+        check.status.success(),
+        "cargo check on generated searchable scaffold failed:\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&check.stdout),
         String::from_utf8_lossy(&check.stderr),
     );

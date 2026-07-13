@@ -8,8 +8,8 @@ use super::dsl::{Field, FieldConstraints, FieldKind, IdType, parse_fields};
 use super::emit::Plan;
 use super::naming::{pascal, pluralize, snake};
 use super::schema_edit::{
-    add_mod_declaration, append_schema_table_with_id, create_table_sql_with_metadata_and_id,
-    drop_table_sql, link_models_into_seed_bin,
+    add_mod_declaration, add_search_down_sql, add_search_up_sql, append_schema_table_with_id,
+    create_table_sql_with_metadata_and_id, drop_table_sql, link_models_into_seed_bin,
 };
 use super::{GenerateError, ensure_project_root, read_or_empty};
 
@@ -38,6 +38,12 @@ pub struct ModelOptions {
     /// Primary-key type emitted for the `id` column. Defaults to `BigSerial`
     /// (`BIGSERIAL`/`i64`); set to `Uuid` for non-enumerable identifiers.
     pub id_type: IdType,
+    /// Text field names (`String`/`Text`) to make full-text searchable
+    /// (issue #1319). Emits a struct-level `#[searchable(language = "english")]`
+    /// plus per-field `#[searchable(weight = "…")]`, and a `search_vector`
+    /// generated column + GIN index in the migration. Empty by default (the
+    /// flag is purely additive; when unset, output is byte-for-byte identical).
+    pub searchable: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -45,12 +51,30 @@ pub struct ModelMetadata {
     indexes: BTreeSet<String>,
     validations: BTreeMap<String, Vec<String>>,
     defaults: BTreeMap<String, String>,
+    /// Full-text search config (issue #1319): the FTS dictionary language and
+    /// the ordered `(field, weight)` list. `search_language` is `Some` iff any
+    /// field is searchable.
+    search_language: Option<String>,
+    searchable: Vec<(String, char)>,
 }
 
 impl ModelMetadata {
     #[must_use]
     pub fn has_validator_rules(&self) -> bool {
         !self.validations.is_empty()
+    }
+
+    /// The FTS dictionary language when the model has searchable fields.
+    #[must_use]
+    pub fn search_language(&self) -> Option<&str> {
+        self.search_language.as_deref()
+    }
+
+    /// The ordered `(field, weight)` pairs the `search_vector` column is built
+    /// from (issue #1319). Empty when the model is not searchable.
+    #[must_use]
+    pub fn searchable(&self) -> &[(String, char)] {
+        &self.searchable
     }
 
     #[must_use]
@@ -188,8 +212,25 @@ pub fn plan_model_with_options(
     } else {
         table_sql
     };
+    // Full-text search (issue #1319): the `search_vector` generated column + GIN
+    // index are what `#[repository(..., searchable)]`'s `search_page` queries.
+    // Emitted in the same create-table migration so `autumn migrate` yields a
+    // working search with zero manual SQL. The column is a stored generated
+    // column, so it is intentionally NOT added to the model struct or schema.rs
+    // (the macro loads matched rows by id via raw SQL).
+    let (up_sql, down_sql) = if metadata.searchable().is_empty() {
+        (up_sql, drop_table_sql(&table))
+    } else {
+        let language = metadata.search_language().unwrap_or("english");
+        let search_up = add_search_up_sql(&table, language, metadata.searchable());
+        let search_down = add_search_down_sql(&table);
+        (
+            format!("{up_sql}\n{search_up}"),
+            format!("{search_down}{}", drop_table_sql(&table)),
+        )
+    };
     plan.create(migration_dir.join("up.sql"), up_sql);
-    plan.create(migration_dir.join("down.sql"), drop_table_sql(&table));
+    plan.create(migration_dir.join("down.sql"), down_sql);
 
     // (c) `src/schema.rs` entry
     let schema_path = project_root.join("src").join("schema.rs");
@@ -1068,6 +1109,179 @@ pub(super) fn warn_if_existing_dep_missing_features(
     }
 }
 
+/// Pull the version literal out of the right-hand side of a single-line
+/// dependency declaration, whether shorthand (`"0.13"`) or the inline-table
+/// `{ version = "0.13", ... }` form. Returns `None` when there is no version
+/// literal to read (`{ workspace = true }`, git/path deps, etc.).
+fn extract_version_literal(rhs: &str) -> Option<&str> {
+    let rhs = rhs.trim();
+    let after = if let Some(idx) = rhs.find("version") {
+        // Inline-table form: skip past `version`, then read the literal.
+        &rhs[idx + "version".len()..]
+    } else if rhs.starts_with('"') {
+        // Shorthand form: the literal starts here.
+        rhs
+    } else {
+        return None;
+    };
+    let start = after.find('"')? + 1;
+    let end = after[start..].find('"')? + start;
+    Some(&after[start..end])
+}
+
+/// Parse the leading `major.minor` out of a version-requirement literal such
+/// as `"0.13"`, `"^0.21"`, `"~0.22.1"`, or `"1"`. A missing minor defaults to
+/// `0`. Returns `None` only when the major component itself can't be parsed.
+fn parse_major_minor(ver: &str) -> Option<(u64, u64)> {
+    // Trim a leading caret/tilde/comparator so `^0.13`, `~0.13`, `>=0.13`
+    // parse to the same base version.
+    let ver = ver.trim_start_matches(['^', '~', '=', '>', '<', ' ']);
+    let mut it = ver.split('.');
+    let major = it.next()?.trim().parse::<u64>().ok()?;
+    let minor = it
+        .next()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(0);
+    Some((major, minor))
+}
+
+/// Best-effort: return the `(major, minor)` version `existing` Cargo.toml pins
+/// for `crate_name` in `[dependencies]`, or `None` when the crate is absent or
+/// its version can't be determined from the text alone.
+///
+/// Mirrors [`dep_section_has`]'s shape handling so it sees the same declarations
+/// `ensure_cargo_dependencies` treats as "already present":
+/// - single-line shorthand / inline-table (`crate = "0.13"`,
+///   `crate = { version = "0.13", ... }`), and
+/// - the `[dependencies.<crate>]` subtable form, scanning its body (up to the
+///   next table header) for a `version = "…"` key.
+///
+/// Returns `None` for shapes with no readable version literal — workspace
+/// inheritance (`{ workspace = true }`), git/path deps, or a subtable with no
+/// `version` key. Callers treat that undeterminable case conservatively.
+fn existing_dep_version(existing: &str, crate_name: &str) -> Option<(u64, u64)> {
+    let lines: Vec<&str> = existing.lines().collect();
+    let deps_idx = lines
+        .iter()
+        .position(|l| is_table_header(l, "dependencies"))?;
+    let scan_end = lines[deps_idx + 1..]
+        .iter()
+        .position(|l| is_any_table_header(l) && !is_dep_subtable_boundary_marker(l))
+        .map_or(lines.len(), |off| deps_idx + 1 + off);
+    let dep_section = &lines[deps_idx + 1..scan_end];
+
+    // `[dependencies.<crate>]` subtable form: scan its body for a `version` key.
+    if let Some(sub_idx) = dep_section
+        .iter()
+        .position(|l| dep_subtable_crate_name(l) == Some(crate_name))
+    {
+        let sub_body_end = dep_section[sub_idx + 1..]
+            .iter()
+            .position(|l| is_any_table_header(l))
+            .map_or(dep_section.len(), |off| sub_idx + 1 + off);
+        for l in &dep_section[sub_idx + 1..sub_body_end] {
+            let t = l.trim_start();
+            if t.starts_with('#') {
+                continue;
+            }
+            if let Some((key, rhs)) = t.split_once('=')
+                && key.trim() == "version"
+            {
+                return extract_version_literal(rhs).and_then(parse_major_minor);
+            }
+        }
+        // Subtable present but no `version` key → undeterminable.
+        return None;
+    }
+
+    // `crate = …` single-line shorthand / inline-table form.
+    for l in dep_section {
+        let t = l.trim_start();
+        if t.starts_with('#') {
+            continue;
+        }
+        let Some((name, rhs)) = t.split_once('=') else {
+            continue;
+        };
+        if name.trim() != crate_name {
+            continue;
+        }
+        return extract_version_literal(rhs).and_then(parse_major_minor);
+    }
+    None
+}
+
+/// Best-effort: return `true` if the generator should warn that `existing`
+/// Cargo.toml's `crate_name` pin might be too old — i.e. `crate_name` is
+/// declared (in *any* shape [`dep_section_has`] recognises) but is *not*
+/// provably at version `>= (min_major, min_minor)`.
+///
+/// [`ensure_cargo_dependencies`] is name-only: once a crate is declared it
+/// never bumps the version, so a stale pin silently yields generated code that
+/// won't compile. Because that skip fires for both the shorthand and the
+/// `[dependencies.<crate>]` subtable shapes, the version check must see both —
+/// otherwise a subtable pin of `base64 = "0.13"` would dodge the warning while
+/// still breaking the build.
+///
+/// Decision:
+/// - crate absent → `false` (it'll be added fresh at the required version);
+/// - version provably `>= (min_major, min_minor)` → `false`;
+/// - version provably below → `true`;
+/// - version undeterminable but the crate is declared → `true`, conservatively
+///   (a spurious warning is far cheaper than a silent compile break).
+fn existing_dep_version_below(
+    existing: &str,
+    crate_name: &str,
+    min_major: u64,
+    min_minor: u64,
+) -> bool {
+    let lines: Vec<&str> = existing.lines().collect();
+    let Some(deps_idx) = lines
+        .iter()
+        .position(|l| is_table_header(l, "dependencies"))
+    else {
+        return false;
+    };
+    let scan_end = lines[deps_idx + 1..]
+        .iter()
+        .position(|l| is_any_table_header(l) && !is_dep_subtable_boundary_marker(l))
+        .map_or(lines.len(), |off| deps_idx + 1 + off);
+    let dep_section = &lines[deps_idx + 1..scan_end];
+
+    // Absent (in every shape ensure_cargo_dependencies would skip) → no warn.
+    if !dep_section_has(dep_section, crate_name) {
+        return false;
+    }
+    // Declared: warn unless we can prove the pinned version is new enough.
+    existing_dep_version(existing, crate_name)
+        .is_none_or(|version| version < (min_major, min_minor))
+}
+
+/// If `existing` Cargo.toml already declares `crate_name` at a version below
+/// `(min_major, min_minor)`, record a single `plan` warning. Used for deps
+/// whose generated code needs a newer API than an older pinned version
+/// exposes (e.g. `base64` 0.21+ `Engine`/`engine::general_purpose`), which
+/// [`ensure_cargo_dependencies`] silently skips because it is name-only. See
+/// [`warn_if_existing_dep_missing_features`] for the sibling case.
+pub(super) fn warn_if_existing_dep_below_version(
+    plan: &mut Plan,
+    existing_cargo_toml: &str,
+    crate_name: &str,
+    min_major: u64,
+    min_minor: u64,
+) {
+    if existing_dep_version_below(existing_cargo_toml, crate_name, min_major, min_minor) {
+        plan.warn(format!(
+            "Cargo.toml already declares '{crate_name}', but not provably at \
+             version >= {min_major}.{min_minor} — the generated passkeys/2FA \
+             handlers use the '{crate_name}' 0.21+ `Engine`/\
+             `engine::general_purpose` API; make sure '{crate_name}' >= \
+             {min_major}.{min_minor} by hand or the generated code may fail to \
+             compile."
+        ));
+    }
+}
+
 /// Reserved resource names whose snake-case form would collide with a special
 /// file in the generated layout (e.g. `mod` → `src/models/mod.rs`).
 const RESERVED_RESOURCE_NAMES: &[&str] = &["main", "lib"];
@@ -1230,6 +1444,7 @@ fn validate_enum_field_collisions(
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 pub fn parse_model_metadata(
     fields: &[Field],
     options: &ModelOptions,
@@ -1316,6 +1531,75 @@ pub fn parse_model_metadata(
                 reason,
             })?;
         metadata.defaults.insert(field_name.to_owned(), sql);
+    }
+
+    // Full-text search's generated `search_page` (in the repository macro)
+    // hardcodes an `i64`/`BigInt` primary key: it collects `SearchId { id: i64 }`
+    // rows into a `Vec<i64>`, filters with `id.eq_any(&ids)`, and dedups through
+    // a `HashMap<i64, _>`. A non-`i64` primary key (e.g. `--id uuid`) would make
+    // those `id` operations type-mismatch, so the generated repository would fail
+    // to compile. Reject the combination up front — before any files are written
+    // — rather than emitting broken code.
+    if !options.searchable.is_empty() && options.id_type != IdType::BigSerial {
+        return Err(GenerateError::Config(format!(
+            "`--searchable` requires an i64 (bigint) primary key; full-text search does not \
+             yet support `{}` ids (the repository's `search_page` is hardcoded to `i64`). \
+             Re-run without `--searchable`, or use the default `--id bigint` primary key.",
+            options.id_type.rust_type()
+        )));
+    }
+
+    // `search_vector` is the generated FTS column name, hardcoded by the
+    // repository macro (`ADD COLUMN search_vector tsvector` in the appended
+    // migration, and the `search_vector @@ …` queries in `search_page`). If the
+    // model also declares its own field named `search_vector`, the create-table
+    // SQL emits that column first and the FTS migration then fails to add it
+    // (duplicate column) at `autumn migrate`. Reserve the name for searchable
+    // models and reject up front (case-insensitive; only relevant with
+    // `--searchable` — a `search_vector` field is harmless otherwise).
+    if !options.searchable.is_empty()
+        && let Some(field) = fields
+            .iter()
+            .find(|f| f.name.eq_ignore_ascii_case("search_vector"))
+    {
+        return Err(GenerateError::Config(format!(
+            "`{}` is a reserved column name for `--searchable` models: `search_vector` is \
+             the generated tsvector column the FTS migration adds, so a model field of the \
+             same name collides with it (duplicate column at `autumn migrate`). Rename the \
+             field, or drop `--searchable`.",
+            field.name
+        )));
+    }
+
+    // Full-text search config (issue #1319). Only text (`String`/`Text`) fields
+    // can populate a `tsvector`; a non-text field would emit a model that fails
+    // to compile against the `#[searchable]` macro and a migration Postgres
+    // rejects, so reject it here with an actionable, field-naming error (AC5).
+    // Weights follow the `search_page`/wiki convention: the first field gets the
+    // highest `A` weight, the rest `B`/`C`/`D` (capped), in the order given.
+    for (i, name) in options.searchable.iter().enumerate() {
+        let field_name = name.trim();
+        let field = field_by_name(fields, field_name).ok_or_else(|| {
+            GenerateError::Config(format!(
+                "--searchable names '{field_name}', which is not a field of this model. \
+                 Only declared text fields can be full-text searchable."
+            ))
+        })?;
+        if !is_string_like(field) {
+            return Err(GenerateError::Config(format!(
+                "--searchable field '{field_name}' is `{}`, but only text fields \
+                 (`String`/`Text`) can be full-text searchable. Remove it from \
+                 --searchable (numbers, bools, dates, and references are not text).",
+                field.rust_type()
+            )));
+        }
+        let weight = b"ABCD"[i.min(3)] as char;
+        metadata.searchable.push((field_name.to_owned(), weight));
+    }
+    if !metadata.searchable.is_empty() {
+        // `english` matches the `wiki` example and is the most common default;
+        // the FTS dictionary is otherwise out of scope for this slice.
+        metadata.search_language = Some("english".to_owned());
     }
 
     Ok(metadata)
@@ -1744,6 +2028,12 @@ fn render_model_file(
         }
     }
     out.push_str("#[autumn_web::model]\n");
+    // Struct-level `#[searchable(language = "…")]` (issue #1319) opts the model
+    // into full-text search; the per-field `#[searchable(weight = "…")]` below
+    // declare which columns feed the `search_vector` and at what rank weight.
+    if let Some(language) = metadata.search_language() {
+        let _ = writeln!(out, "#[searchable(language = \"{language}\")]");
+    }
     if let Some(key) = shard_key {
         let _ = writeln!(out, "#[shard_key = \"{key}\"]");
     }
@@ -1753,6 +2043,9 @@ fn render_model_file(
     for f in fields {
         if metadata.indexes.contains(&f.name) {
             out.push_str("    #[indexed]\n");
+        }
+        if let Some((_, weight)) = metadata.searchable().iter().find(|(n, _)| n == &f.name) {
+            let _ = writeln!(out, "    #[searchable(weight = \"{weight}\")]");
         }
         if let Some(validations) = metadata.validations.get(&f.name) {
             for validation in validations {
@@ -2357,6 +2650,90 @@ mod tests {
             metadata.defaults().get("amount").map(String::as_str),
             Some("1.500")
         );
+    }
+
+    /// Issue #1319: the repository macro's `search_page` is hardcoded to an
+    /// `i64`/`BigInt` primary key (`SearchId { id: i64 }`, `Vec<i64>`,
+    /// `id.eq_any(&ids)`, `HashMap<i64, _>`), so pairing `--searchable` with a
+    /// non-i64 (uuid) key would emit a repository that fails to compile.
+    /// `parse_model_metadata` rejects the combination directly, independent of
+    /// the scaffold command's broader uuid gate.
+    #[test]
+    fn searchable_with_uuid_primary_key_is_rejected() {
+        let fields = parse_fields(&["title:String".into(), "body:Text".into()]).unwrap();
+        let err = parse_model_metadata(
+            &fields,
+            &ModelOptions {
+                searchable: vec!["title".into(), "body".into()],
+                id_type: IdType::Uuid,
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            matches!(err, GenerateError::Config(_)),
+            "expected Config error, got: {err:?}"
+        );
+        assert!(
+            msg.contains("--searchable")
+                && (msg.contains("i64") || msg.contains("bigint"))
+                && msg.contains("uuid::Uuid"),
+            "error must explain the i64-primary-key requirement and name the uuid type: {msg}"
+        );
+    }
+
+    /// Issue #1319: a model field named `search_vector` collides with the
+    /// generated tsvector column the FTS migration adds, so pairing it with
+    /// `--searchable` is rejected up front. (Field names parse as lowercase
+    /// `snake_case`, so the guard's `eq_ignore_ascii_case` is defensive; the
+    /// reachable case is a lowercase `search_vector` field.)
+    #[test]
+    fn searchable_with_search_vector_field_is_rejected() {
+        let fields = parse_fields(&["title:String".into(), "search_vector:String".into()]).unwrap();
+        let err = parse_model_metadata(
+            &fields,
+            &ModelOptions {
+                searchable: vec!["title".into()],
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            matches!(err, GenerateError::Config(_)),
+            "expected Config error, got: {err:?}"
+        );
+        assert!(
+            msg.contains("search_vector") && msg.contains("reserved"),
+            "error must flag `search_vector` as reserved: {msg}"
+        );
+    }
+
+    /// A `search_vector` field WITHOUT `--searchable` is harmless and accepted
+    /// (the name is only reserved for full-text-search models).
+    #[test]
+    fn search_vector_field_without_searchable_is_accepted() {
+        let fields = parse_fields(&["title:String".into(), "search_vector:String".into()]).unwrap();
+        let metadata = parse_model_metadata(&fields, &ModelOptions::default())
+            .expect("search_vector without --searchable must be accepted");
+        assert!(metadata.searchable().is_empty());
+    }
+
+    /// A uuid primary key WITHOUT `--searchable` stays valid (the guard only
+    /// fires when full-text search is requested).
+    #[test]
+    fn uuid_primary_key_without_searchable_is_accepted() {
+        let fields = parse_fields(&["title:String".into()]).unwrap();
+        let metadata = parse_model_metadata(
+            &fields,
+            &ModelOptions {
+                id_type: IdType::Uuid,
+                ..Default::default()
+            },
+        )
+        .expect("uuid without --searchable must be accepted");
+        assert!(metadata.searchable().is_empty());
     }
 
     #[test]
@@ -2997,6 +3374,135 @@ autumn-web = \"0.3\"\n";
             chrono_pos < dev_deps_pos,
             "chrono must land in [dependencies], not [dev-dependencies]"
         );
+    }
+
+    #[test]
+    fn existing_dep_version_below_detects_old_base64() {
+        // Shorthand and inline-table forms below 0.22 → true.
+        assert!(existing_dep_version_below(
+            "[dependencies]\nbase64 = \"0.13\"\n",
+            "base64",
+            0,
+            22
+        ));
+        assert!(existing_dep_version_below(
+            "[dependencies]\nbase64 = { version = \"0.20\" }\n",
+            "base64",
+            0,
+            22
+        ));
+        // Leading caret/comparator is tolerated.
+        assert!(existing_dep_version_below(
+            "[dependencies]\nbase64 = \"^0.21\"\n",
+            "base64",
+            0,
+            22
+        ));
+        // At or above the floor → no warning.
+        assert!(!existing_dep_version_below(
+            "[dependencies]\nbase64 = \"0.22\"\n",
+            "base64",
+            0,
+            22
+        ));
+        assert!(!existing_dep_version_below(
+            "[dependencies]\nbase64 = \"0.22.1\"\n",
+            "base64",
+            0,
+            22
+        ));
+        assert!(!existing_dep_version_below(
+            "[dependencies]\nbase64 = \"1.0\"\n",
+            "base64",
+            0,
+            22
+        ));
+        // Absent crate → no warning.
+        assert!(!existing_dep_version_below(
+            "[dependencies]\nserde = \"1\"\n",
+            "base64",
+            0,
+            22
+        ));
+        // `[dependencies.base64]` subtable with an old `version` key → warn.
+        assert!(existing_dep_version_below(
+            "[dependencies]\n[dependencies.base64]\nversion = \"0.13\"\n",
+            "base64",
+            0,
+            22
+        ));
+        // Subtable under a populated `[dependencies]` table, old version → warn.
+        assert!(existing_dep_version_below(
+            "[dependencies]\nserde = \"1\"\n\n[dependencies.base64]\nversion = \"0.13\"\nfeatures = [\"std\"]\n",
+            "base64",
+            0,
+            22
+        ));
+        // `[dependencies.base64]` subtable at/above the floor → no warning.
+        assert!(!existing_dep_version_below(
+            "[dependencies]\n[dependencies.base64]\nversion = \"0.22\"\n",
+            "base64",
+            0,
+            22
+        ));
+        // Subtable with NO `version` key → undeterminable → warn conservatively.
+        assert!(existing_dep_version_below(
+            "[dependencies]\n[dependencies.base64]\nworkspace = true\n",
+            "base64",
+            0,
+            22
+        ));
+        // Shorthand workspace inheritance is undeterminable → warn (the crate is
+        // declared, but we can't prove it's new enough).
+        assert!(existing_dep_version_below(
+            "[dependencies]\nbase64 = { workspace = true }\n",
+            "base64",
+            0,
+            22
+        ));
+        // A commented-out old pin must not trip the check (crate is absent).
+        assert!(!existing_dep_version_below(
+            "[dependencies]\n# base64 = \"0.13\"\n",
+            "base64",
+            0,
+            22
+        ));
+    }
+
+    #[test]
+    fn warn_if_existing_dep_below_version_records_one_warning() {
+        let mut plan = Plan::new(std::path::PathBuf::from("."));
+        warn_if_existing_dep_below_version(
+            &mut plan,
+            "[dependencies]\nbase64 = \"0.13\"\n",
+            "base64",
+            0,
+            22,
+        );
+        assert_eq!(plan.warnings.len(), 1, "warnings: {:?}", plan.warnings);
+        assert!(plan.warnings[0].contains("base64"));
+
+        let mut plan = Plan::new(std::path::PathBuf::from("."));
+        warn_if_existing_dep_below_version(
+            &mut plan,
+            "[dependencies]\nbase64 = \"0.22\"\n",
+            "base64",
+            0,
+            22,
+        );
+        assert!(plan.warnings.is_empty(), "warnings: {:?}", plan.warnings);
+
+        // Subtable pin below the floor fires exactly one warning.
+        let mut plan = Plan::new(std::path::PathBuf::from("."));
+        warn_if_existing_dep_below_version(
+            &mut plan,
+            "[dependencies]\n[dependencies.base64]\nversion = \"0.13\"\n",
+            "base64",
+            0,
+            22,
+        );
+        assert_eq!(plan.warnings.len(), 1, "warnings: {:?}", plan.warnings);
+        assert!(plan.warnings[0].contains("base64"));
     }
 
     #[test]

@@ -6,6 +6,22 @@
 //!
 //! Metrics are exposed via the `/actuator/metrics` endpoint.
 
+// autumn-panic-gate: request-path module — production code path must be panic-free.
+// See CONTRIBUTING.md "Request-path panic gate". Justify exceptions with
+// #[allow(clippy::<lint>, reason = "…")] at the narrowest scope.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::todo,
+        clippy::unimplemented,
+        clippy::indexing_slicing,
+    )
+)]
+
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
@@ -214,6 +230,10 @@ impl MetricsCollector {
         }
     }
 
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "shard_idx is hash % SHARD_COUNT so always in bounds; buf slice length is <= 256, the buffer size"
+    )]
     fn record_route(&self, method: &str, route: &str, latency_ms: u64) {
         // ⚡ Bolt Optimization:
         // FNV-1a hash is faster than DefaultHasher (SipHash) for short strings like routes.
@@ -273,6 +293,10 @@ impl MetricsCollector {
     }
 
     /// Record a database query's duration.
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "shard_idx is hash % SHARD_COUNT so always in bounds"
+    )]
     pub fn record_db_query(&self, key: &str, latency_ms: u64) {
         // Hash key to determine shard index using FNV-1a
         let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
@@ -492,6 +516,10 @@ struct Percentiles {
     p99: u64,
 }
 
+#[allow(
+    clippy::indexing_slicing,
+    reason = "p95_idx <= p99_idx <= len - 1, so the inclusive ranges stay within data's bounds"
+)]
 fn compute_percentiles(latencies: &VecDeque<u64>) -> Percentiles {
     let len = latencies.len();
     if len == 0 {

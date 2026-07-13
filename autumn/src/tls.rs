@@ -103,6 +103,20 @@ pub enum TlsError {
         /// Human-readable parse detail.
         detail: String,
     },
+    /// A certificate in the chain (at 1-based `position`) is not valid DER.
+    ///
+    /// The PEM block decoded, but the bytes are not a parseable X.509
+    /// certificate — a malformed intermediate that rustls would store unparsed
+    /// and serve to clients that reject the chain.
+    #[error("certificate #{position} in the chain in `{path}` is malformed: {detail}")]
+    ParseChainCert {
+        /// Certificate path.
+        path: PathBuf,
+        /// 1-based position of the offending certificate in the chain.
+        position: usize,
+        /// Human-readable parse detail.
+        detail: String,
+    },
     /// The leaf certificate has already expired.
     #[error("the leaf certificate in `{path}` expired at {not_after} (UNIX {not_after_unix})")]
     Expired {
@@ -112,6 +126,53 @@ pub enum TlsError {
         not_after: String,
         /// `notAfter` as a UNIX timestamp.
         not_after_unix: i64,
+    },
+    /// The leaf certificate is not yet valid — its `notBefore` is in the future.
+    #[error(
+        "the leaf certificate in `{path}` is not valid until {not_before} (UNIX {not_before_unix})"
+    )]
+    NotYetValid {
+        /// Certificate path.
+        path: PathBuf,
+        /// RFC 2822-ish rendering of `notBefore`.
+        not_before: String,
+        /// `notBefore` as a UNIX timestamp.
+        not_before_unix: i64,
+    },
+    /// A non-leaf certificate in the chain (at 1-based `position`) has already
+    /// expired. Normal TLS clients reject the whole chain during path
+    /// validation, so refuse it at load/inspection time rather than boot a
+    /// listener that serves it. Symmetric to the leaf's [`Self::Expired`].
+    #[error(
+        "certificate #{position} in the chain in `{path}` expired at {not_after} \
+         (UNIX {not_after_unix})"
+    )]
+    ExpiredChainCert {
+        /// Certificate path.
+        path: PathBuf,
+        /// 1-based position of the offending certificate in the chain.
+        position: usize,
+        /// RFC 2822-ish rendering of `notAfter`.
+        not_after: String,
+        /// `notAfter` as a UNIX timestamp.
+        not_after_unix: i64,
+    },
+    /// A non-leaf certificate in the chain (at 1-based `position`) is not yet
+    /// valid — its `notBefore` is in the future. Symmetric to the leaf's
+    /// [`Self::NotYetValid`].
+    #[error(
+        "certificate #{position} in the chain in `{path}` is not yet valid until {not_before} \
+         (UNIX {not_before_unix})"
+    )]
+    NotYetValidChainCert {
+        /// Certificate path.
+        path: PathBuf,
+        /// 1-based position of the offending certificate in the chain.
+        position: usize,
+        /// RFC 2822-ish rendering of `notBefore`.
+        not_before: String,
+        /// `notBefore` as a UNIX timestamp.
+        not_before_unix: i64,
     },
     /// Building the rustls `ServerConfig` failed.
     #[error("failed to build the rustls server configuration: {source}")]
@@ -162,12 +223,13 @@ fn read_private_key(key_path: &Path) -> Result<PrivateKeyDer<'static>, TlsError>
     })
 }
 
-/// The `notAfter` of the leaf certificate, as a UNIX timestamp (seconds).
+/// The `notBefore` and `notAfter` of the leaf certificate, as UNIX timestamps
+/// (seconds), returned as `(not_before, not_after)`.
 ///
 /// Parses just enough of the DER to read the validity window; a parse failure
 /// is surfaced rather than silently ignored so a corrupt certificate is caught
 /// at load time.
-fn leaf_not_after_unix(cert_path: &Path, leaf: &CertificateDer<'_>) -> Result<i64, TlsError> {
+fn leaf_validity_unix(cert_path: &Path, leaf: &CertificateDer<'_>) -> Result<(i64, i64), TlsError> {
     use x509_parser::prelude::FromDer as _;
 
     let (_, parsed) =
@@ -177,7 +239,72 @@ fn leaf_not_after_unix(cert_path: &Path, leaf: &CertificateDer<'_>) -> Result<i6
                 detail: e.to_string(),
             }
         })?;
-    Ok(parsed.validity().not_after.timestamp())
+    let validity = parsed.validity();
+    Ok((
+        validity.not_before.timestamp(),
+        validity.not_after.timestamp(),
+    ))
+}
+
+/// Parse and lifetime-check every NON-leaf certificate DER in `chain`, failing
+/// fast (naming the 1-based chain position) if any block is not a parseable
+/// X.509 certificate OR is outside its validity window at `now_unix`.
+///
+/// [`read_cert_chain`] only PEM-decodes each block, and rustls'
+/// [`CertifiedKey::from_der`] validates only the leaf (`chain[0]`). A malformed
+/// — or an expired / not-yet-valid — INTERMEDIATE would therefore be stored
+/// unchecked and served, so startup and `autumn doctor` pass while normal TLS
+/// clients reject the chain during path validation. Parsing and lifetime-
+/// checking each intermediate here turns that into an actionable fail-fast at
+/// load/inspection time. The leaf (`chain[0]`) is parsed and lifetime-checked
+/// separately (by [`leaf_validity_unix`] and its callers).
+///
+/// `now_unix` is the current UNIX time; it is a parameter (rather than read
+/// internally) so tests can pin "now" deterministically.
+fn validate_chain_certs(
+    cert_path: &Path,
+    chain: &[CertificateDer<'_>],
+    now_unix: i64,
+) -> Result<(), TlsError> {
+    use x509_parser::prelude::FromDer as _;
+
+    // Skip index 0 (the leaf); its DER and validity window are checked by the
+    // callers via `leaf_validity_unix`.
+    for (idx, cert) in chain.iter().enumerate().skip(1) {
+        // 1-based, matching how operators count "certificate #2" in a bundle.
+        let position = idx + 1;
+        let (_, parsed) = x509_parser::certificate::X509Certificate::from_der(cert.as_ref())
+            .map_err(|e| TlsError::ParseChainCert {
+                path: cert_path.to_path_buf(),
+                position,
+                detail: e.to_string(),
+            })?;
+
+        // Reject an intermediate outside its validity window, mirroring the
+        // leaf's not-yet-valid / expired handling: `notBefore` in the future is
+        // as fatal as a past `notAfter`, since either makes clients reject the
+        // served chain.
+        let validity = parsed.validity();
+        let not_before = validity.not_before.timestamp();
+        let not_after = validity.not_after.timestamp();
+        if now_unix < not_before {
+            return Err(TlsError::NotYetValidChainCert {
+                path: cert_path.to_path_buf(),
+                position,
+                not_before: render_unix(not_before),
+                not_before_unix: not_before,
+            });
+        }
+        if not_after < now_unix {
+            return Err(TlsError::ExpiredChainCert {
+                path: cert_path.to_path_buf(),
+                position,
+                not_after: render_unix(not_after),
+                not_after_unix: not_after,
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Load, validate, and return the certificate + key as a rustls [`CertifiedKey`].
@@ -201,10 +328,19 @@ pub fn load_certified_key(
     let chain = read_cert_chain(cert_path)?;
     let key = read_private_key(key_path)?;
 
-    // Reject an already-expired leaf before we even build the key: serving an
-    // expired certificate fails every client handshake, so refuse at startup
-    // with a clear message rather than booting into a broken listener.
-    let not_after = leaf_not_after_unix(cert_path, &chain[0])?;
+    // Reject a leaf outside its validity window before we even build the key:
+    // an expired OR not-yet-valid certificate fails every client handshake, so
+    // refuse at startup with a clear message rather than booting into a broken
+    // listener. Symmetric bounds: `notBefore` in the future is as fatal as a
+    // past `notAfter`.
+    let (not_before, not_after) = leaf_validity_unix(cert_path, &chain[0])?;
+    if now_unix < not_before {
+        return Err(TlsError::NotYetValid {
+            path: cert_path.to_path_buf(),
+            not_before: render_unix(not_before),
+            not_before_unix: not_before,
+        });
+    }
     if not_after < now_unix {
         return Err(TlsError::Expired {
             path: cert_path.to_path_buf(),
@@ -212,6 +348,12 @@ pub fn load_certified_key(
             not_after_unix: not_after,
         });
     }
+
+    // Parse and lifetime-check every intermediate before accepting the chain:
+    // rustls validates only the leaf, so a malformed — or expired / not-yet-valid
+    // — intermediate would otherwise boot a listener that serves a chain normal
+    // clients reject during path validation.
+    validate_chain_certs(cert_path, &chain, now_unix)?;
 
     // `from_der` loads the key with the crypto provider (rejecting an invalid
     // key) and compares the key's SubjectPublicKeyInfo against the leaf
@@ -300,45 +442,171 @@ pub fn build_server_config(
     Ok(Arc::new(config))
 }
 
+/// Upper bound on TLS handshakes running concurrently at any instant.
+///
+/// The background acceptor task acquires a permit from a semaphore of this size
+/// before spawning each handshake, so a flood of connecting clients can never
+/// spawn an unbounded number of handshake tasks: once this many are in flight
+/// the acceptor parks on the next permit (still draining the kernel accept
+/// queue's backlog as permits free up). 256 is a generous default for a single
+/// listener; it could be made configurable later if a deployment needs to tune
+/// the in-flight-handshake ceiling.
+const MAX_CONCURRENT_HANDSHAKES: usize = 256;
+
+/// Capacity of the channel carrying completed TLS streams to `accept`.
+///
+/// Bounded so a burst of successful handshakes that outruns axum's consumption
+/// applies backpressure (a completed-handshake task parks on `send` while still
+/// holding its semaphore permit) rather than buffering without limit.
+const READY_CONN_CHANNEL_CAPACITY: usize = 1024;
+
 /// A TLS-terminating [`axum::serve::Listener`] wrapping a
 /// [`tokio::net::TcpListener`].
 ///
-/// [`accept`](axum::serve::Listener::accept) accepts a TCP connection and
-/// completes the rustls handshake before yielding a decrypted
+/// [`accept`](axum::serve::Listener::accept) yields a decrypted
 /// [`TlsStream`](tokio_rustls::server::TlsStream) plus the peer's
 /// [`SocketAddr`](std::net::SocketAddr). Because the peer address is a real TCP
 /// `SocketAddr`, the rest of the serve stack — connect-info, trusted-proxy
 /// resolution, graceful shutdown, SSE/WebSocket streaming — is identical to the
 /// plain-TCP path; the only difference is the handshake performed here.
 ///
-/// A failed handshake (a plaintext or malformed client, an unsupported cipher,
-/// a dropped connection) is logged at debug and skipped — it must never take
-/// down the accept loop. Because the handshake runs inline with `accept`, a
-/// client that opens TCP but never completes (or even starts) the handshake
-/// would otherwise head-of-line-block every new accept indefinitely; each
-/// handshake is therefore bounded by `handshake_timeout`, after which the
-/// connection is dropped and the accept loop continues.
+/// TCP-accept and the rustls handshake are **decoupled**: a background acceptor
+/// task drains `tcp.accept()` and, for each connection, spawns a bounded
+/// handshake task (see [`MAX_CONCURRENT_HANDSHAKES`]) that performs the rustls
+/// handshake and forwards the finished stream over a channel to `accept`. This
+/// means a flood of silent or stalled clients cannot serialize the accept loop:
+/// a client that opens TCP but never completes (or even starts) the handshake
+/// occupies only its own handshake task (bounded by `handshake_timeout`), never
+/// head-of-line-blocking the acceptance of the next connection. A failed
+/// handshake (a plaintext or malformed client, an unsupported cipher, a dropped
+/// connection) is logged at debug and dropped; it never affects the acceptor.
 pub struct TlsListener {
-    tcp: tokio::net::TcpListener,
-    acceptor: tokio_rustls::TlsAcceptor,
-    handshake_timeout: std::time::Duration,
+    /// Completed `(stream, peer)` pairs from the background handshake tasks.
+    rx: tokio::sync::mpsc::Receiver<(
+        tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
+        std::net::SocketAddr,
+    )>,
+    /// The bound address, captured before `tcp` moved into the acceptor task.
+    local_addr: std::net::SocketAddr,
+    /// Shutdown signal; also used to park `accept` once the acceptor has ended
+    /// (channel closed) so axum's own graceful-shutdown future drives teardown.
+    shutdown: tokio_util::sync::CancellationToken,
 }
 
 impl TlsListener {
     /// Wrap `tcp` so accepted connections are TLS-terminated with `config`,
     /// bounding each handshake by `handshake_timeout` (a stalled or silent
-    /// client is dropped rather than parking the accept loop).
+    /// client is dropped rather than starving other clients). `shutdown` ties
+    /// the background acceptor task's lifetime to server shutdown.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `tcp.local_addr()` fails — the listener is already bound, so
+    /// this is not expected in practice.
     #[must_use]
     pub fn new(
         tcp: tokio::net::TcpListener,
         config: Arc<rustls::ServerConfig>,
         handshake_timeout: std::time::Duration,
+        shutdown: tokio_util::sync::CancellationToken,
     ) -> Self {
+        let local_addr = tcp
+            .local_addr()
+            .expect("bound TLS listener must have a local address");
+        let acceptor = tokio_rustls::TlsAcceptor::from(config);
+        let (tx, rx) = tokio::sync::mpsc::channel(READY_CONN_CHANNEL_CAPACITY);
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_HANDSHAKES));
+        let acceptor_shutdown = shutdown.clone();
+
+        tokio::spawn(async move {
+            run_acceptor(
+                tcp,
+                acceptor,
+                handshake_timeout,
+                semaphore,
+                tx,
+                acceptor_shutdown,
+            )
+            .await;
+        });
+
         Self {
-            tcp,
-            acceptor: tokio_rustls::TlsAcceptor::from(config),
-            handshake_timeout,
+            rx,
+            local_addr,
+            shutdown,
         }
+    }
+}
+
+/// Background accept loop: drain `tcp`, and for each connection spawn a bounded
+/// handshake task that forwards the completed TLS stream over `tx`. Breaks (and
+/// drops `tx`) on `shutdown`.
+async fn run_acceptor(
+    tcp: tokio::net::TcpListener,
+    acceptor: tokio_rustls::TlsAcceptor,
+    handshake_timeout: std::time::Duration,
+    semaphore: Arc<tokio::sync::Semaphore>,
+    tx: tokio::sync::mpsc::Sender<(
+        tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
+        std::net::SocketAddr,
+    )>,
+    shutdown: tokio_util::sync::CancellationToken,
+) {
+    loop {
+        let (stream, peer) = tokio::select! {
+            () = shutdown.cancelled() => break,
+            result = tcp.accept() => match result {
+                Ok(pair) => pair,
+                Err(e) => {
+                    // Never break the loop on a per-connection error — that
+                    // would tear down the whole listener. Retry transient
+                    // per-connection errors immediately; back off briefly on
+                    // anything else so we do not spin (e.g. on the process's
+                    // open-file limit).
+                    if is_transient_connection_error(&e) {
+                        continue;
+                    }
+                    tracing::error!(error = %e, "TLS listener accept error");
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    continue;
+                }
+            },
+        };
+
+        // Acquire a permit BEFORE spawning so in-flight handshakes are bounded:
+        // once `MAX_CONCURRENT_HANDSHAKES` are running, this parks (applying
+        // backpressure to accept) until one finishes. The only error is a closed
+        // semaphore, which we never close, so the `else` is unreachable in
+        // practice; stop the loop defensively if it ever happens.
+        let Ok(permit) = Arc::clone(&semaphore).acquire_owned().await else {
+            break;
+        };
+        let acceptor = acceptor.clone();
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            // The permit is released when this task ends (handshake done,
+            // failed, or timed out), freeing a slot for the next connection.
+            let _permit = permit;
+            // Bound the handshake so a client that connects but never sends a
+            // ClientHello (or stalls mid-handshake) releases its permit instead
+            // of holding it for the process lifetime.
+            match tokio::time::timeout(handshake_timeout, acceptor.accept(stream)).await {
+                Ok(Ok(tls)) => {
+                    // A closed receiver means the listener is gone; drop.
+                    let _ = tx.send((tls, peer)).await;
+                }
+                Ok(Err(e)) => {
+                    tracing::debug!(
+                        peer = %peer,
+                        error = %e,
+                        "TLS handshake failed; dropping connection"
+                    );
+                }
+                Err(_elapsed) => {
+                    tracing::debug!(peer = %peer, "TLS handshake timed out");
+                }
+            }
+        });
     }
 }
 
@@ -360,59 +628,62 @@ impl axum::serve::Listener for TlsListener {
     type Addr = std::net::SocketAddr;
 
     async fn accept(&mut self) -> (Self::Io, Self::Addr) {
-        loop {
-            let (stream, peer) = match self.tcp.accept().await {
-                Ok(pair) => pair,
-                Err(e) => {
-                    // Never return an error from here — that terminates the
-                    // whole serve loop. Retry transient per-connection errors
-                    // immediately; back off briefly on anything else so we do
-                    // not spin (e.g. on the process's open-file limit).
-                    if is_transient_connection_error(&e) {
-                        continue;
-                    }
-                    tracing::error!(error = %e, "TLS listener accept error");
-                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                    continue;
-                }
-            };
-            // Bound the handshake: a client that connects but never sends a
-            // ClientHello (or stalls mid-handshake) must not park the accept
-            // loop and deny every other client. On timeout or handshake error,
-            // drop the connection and keep accepting.
-            match tokio::time::timeout(self.handshake_timeout, self.acceptor.accept(stream)).await {
-                Ok(Ok(tls)) => return (tls, peer),
-                Ok(Err(e)) => {
-                    tracing::debug!(
-                        peer = %peer,
-                        error = %e,
-                        "TLS handshake failed; dropping connection"
-                    );
-                }
-                Err(_elapsed) => {
-                    tracing::debug!(peer = %peer, "TLS handshake timed out");
-                }
-            }
+        if let Some(conn) = self.rx.recv().await {
+            return conn;
         }
+        // The acceptor task has ended and the channel is drained (shutdown, or
+        // an unrecoverable acceptor exit). `Listener::accept` returns no
+        // `Result` and axum loops on it, so we must neither panic nor busy-loop:
+        // park here forever (awaiting the shutdown token, then a never-resolving
+        // future) so axum's own graceful-shutdown path drives teardown instead
+        // of us spinning.
+        self.shutdown.cancelled().await;
+        std::future::pending().await
     }
 
     fn local_addr(&self) -> std::io::Result<Self::Addr> {
-        self.tcp.local_addr()
+        Ok(self.local_addr)
     }
 }
 
 /// The outcome of inspecting a configured certificate + key pair, offline.
 #[derive(Debug, Clone, Copy)]
 pub struct LeafInspection {
+    /// The leaf certificate's `notBefore`, as a UNIX timestamp (seconds).
+    pub not_before_unix: i64,
     /// The leaf certificate's `notAfter`, as a UNIX timestamp (seconds).
     pub not_after_unix: i64,
 }
 
 impl LeafInspection {
+    /// Whether the leaf certificate is not yet valid at `now_unix` — its
+    /// `notBefore` lies in the future. Such a certificate fails every handshake
+    /// until its validity window opens, so the runtime rejects it at startup and
+    /// doctor grades it a failure, symmetric to [`Self::is_expired`].
+    #[must_use]
+    pub const fn is_not_yet_valid(&self, now_unix: i64) -> bool {
+        now_unix < self.not_before_unix
+    }
+
     /// Whole days from `now_unix` until `notAfter`. Negative once expired.
+    ///
+    /// Note: this truncates toward zero, so a certificate that expired less
+    /// than 24h ago still reports `0` days. Callers grading expiry must use
+    /// [`Self::is_expired`] for the pass/fail decision rather than relying on
+    /// this day bucket.
     #[must_use]
     pub const fn days_until_expiry(&self, now_unix: i64) -> i64 {
         (self.not_after_unix - now_unix) / 86_400
+    }
+
+    /// Whether the leaf certificate has already expired at `now_unix`.
+    ///
+    /// Decided from the raw `notAfter` timestamp (not the truncated day
+    /// bucket), so a certificate expired even seconds ago reports `true` —
+    /// matching the runtime, which rejects such a pair at startup.
+    #[must_use]
+    pub const fn is_expired(&self, now_unix: i64) -> bool {
+        self.not_after_unix <= now_unix
     }
 }
 
@@ -420,18 +691,36 @@ impl LeafInspection {
 /// WITHOUT booting a server or touching the network. Used by `autumn doctor`.
 ///
 /// This performs the same parsing and cert/key-match validation as
-/// [`load_certified_key`] (so a broken pair is reported), but tolerates an
-/// already-expired certificate — the caller decides how to grade expiry — by
-/// still returning the `notAfter`.
+/// [`load_certified_key`] (so a broken pair is reported), but tolerates a LEAF
+/// outside its validity window — already-expired OR not-yet-valid — leaving the
+/// caller to decide how to grade it, by still returning the `notBefore`/
+/// `notAfter` bounds. Non-leaf (intermediate) certificates are NOT tolerated:
+/// an expired or not-yet-valid intermediate is rejected here (mirroring the
+/// runtime), since clients reject the served chain during path validation.
+///
+/// `now_unix` is the current UNIX time; it is a parameter (rather than read
+/// internally) so tests can pin "now" deterministically. It is used only to
+/// lifetime-check the intermediates — the leaf's window is returned ungraded.
 ///
 /// # Errors
 ///
 /// Returns a [`TlsError`] for a missing/unreadable file, unparseable PEM, an
-/// empty certificate file, or a key that does not match the leaf certificate.
-pub fn inspect_leaf(cert_path: &Path, key_path: &Path) -> Result<LeafInspection, TlsError> {
+/// empty certificate file, a key that does not match the leaf certificate, or a
+/// malformed / expired / not-yet-valid intermediate certificate.
+pub fn inspect_leaf(
+    cert_path: &Path,
+    key_path: &Path,
+    now_unix: i64,
+) -> Result<LeafInspection, TlsError> {
     let chain = read_cert_chain(cert_path)?;
     let key = read_private_key(key_path)?;
-    let not_after = leaf_not_after_unix(cert_path, &chain[0])?;
+    let (not_before, not_after) = leaf_validity_unix(cert_path, &chain[0])?;
+
+    // Parse and lifetime-check every intermediate too, so doctor fails a
+    // malformed — or expired / not-yet-valid — intermediate chain instead of
+    // greenlighting one the runtime would boot but clients reject (rustls
+    // validates only the leaf).
+    validate_chain_certs(cert_path, &chain, now_unix)?;
 
     // Validate the key matches the leaf even though we do not need the key
     // material — a mismatched pair would fail every handshake at runtime, so
@@ -444,6 +733,7 @@ pub fn inspect_leaf(cert_path: &Path, key_path: &Path) -> Result<LeafInspection,
     })?;
 
     Ok(LeafInspection {
+        not_before_unix: not_before,
         not_after_unix: not_after,
     })
 }
@@ -497,7 +787,9 @@ pub fn leaf_not_after_from_pem(chain_pem: &[u8]) -> Result<i64, String> {
         .next()
         .ok_or_else(|| "certificate chain contained no PEM CERTIFICATE blocks".to_owned())?
         .map_err(|e| format!("failed to parse certificate PEM: {e}"))?;
-    leaf_not_after_unix(Path::new("<memory>"), &leaf).map_err(|e| e.to_string())
+    leaf_validity_unix(Path::new("<memory>"), &leaf)
+        .map(|(_, not_after)| not_after)
+        .map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
@@ -514,6 +806,16 @@ mod tests {
     // Self-signed `CN=localhost` that expired in 2021.
     const EXPIRED_CERT_PEM: &str = include_str!("../tests/fixtures/tls/expired.cert.pem");
     const EXPIRED_KEY_PEM: &str = include_str!("../tests/fixtures/tls/expired.key.pem");
+
+    // A well-formed PEM CERTIFICATE block whose body is valid base64 but NOT a
+    // parseable X.509 DER (all-zero bytes). PEM-decodes fine, so it survives
+    // `read_cert_chain`, but `X509Certificate::from_der` rejects it — standing in
+    // for a malformed intermediate in a chain.
+    const MALFORMED_CERT_PEM: &str = "\
+-----BEGIN CERTIFICATE-----
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+-----END CERTIFICATE-----
+";
 
     fn write_temp(dir: &Path, name: &str, contents: &str) -> PathBuf {
         let path = dir.join(name);
@@ -539,6 +841,117 @@ mod tests {
         let provider = crypto_provider();
         let ck = load_certified_key(&cert, &key, &provider, now()).expect("valid pair loads");
         assert!(!ck.cert.is_empty());
+    }
+
+    // Regression (#1603, Codex): rustls validates only the leaf, so a malformed
+    // INTERMEDIATE would boot a listener serving a chain normal clients reject.
+    // `load_certified_key` must parse every cert in the chain and fail fast,
+    // naming the offending 1-based position.
+    #[test]
+    fn malformed_intermediate_in_chain_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        // [valid leaf, malformed intermediate].
+        let chain_pem = format!("{CERT_PEM}\n{MALFORMED_CERT_PEM}");
+        let cert = write_temp(dir.path(), "chain.pem", &chain_pem);
+        let key = write_temp(dir.path(), "k.pem", KEY_PEM);
+        let provider = crypto_provider();
+        let err = load_certified_key(&cert, &key, &provider, now()).unwrap_err();
+        assert!(
+            matches!(err, TlsError::ParseChainCert { position: 2, .. }),
+            "a malformed intermediate must fail fast naming its chain position, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("#2"),
+            "error must name the offending position, got: {err}"
+        );
+    }
+
+    // A chain of [valid leaf, well-formed valid intermediate] still loads.
+    // Chain-cert validation checks DER parseability and the validity window
+    // (not chain-of-trust), so a second currently-valid certificate stands in
+    // for a real intermediate here.
+    #[test]
+    fn valid_leaf_and_intermediate_chain_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        // Both blocks are the far-future `CERT_PEM` fixture, so the intermediate
+        // is within its validity window (an expired intermediate is now rejected).
+        let chain_pem = format!("{CERT_PEM}\n{CERT_PEM}");
+        let cert = write_temp(dir.path(), "chain.pem", &chain_pem);
+        let key = write_temp(dir.path(), "k.pem", KEY_PEM);
+        let provider = crypto_provider();
+        let ck = load_certified_key(&cert, &key, &provider, now())
+            .expect("a valid leaf + well-formed intermediate must load");
+        assert_eq!(ck.cert.len(), 2, "both chain certificates are retained");
+    }
+
+    // Regression (#1603, Codex): an EXPIRED intermediate is rejected by clients
+    // during path validation, so `validate_chain_certs` must fail fast at
+    // load/inspection time, naming the 1-based position and that it expired.
+    #[test]
+    fn expired_intermediate_in_chain_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        // [valid leaf (far-future), expired intermediate (2021)].
+        let chain_pem = format!("{CERT_PEM}\n{EXPIRED_CERT_PEM}");
+        let path = write_temp(dir.path(), "chain.pem", &chain_pem);
+        let chain = read_cert_chain(&path).unwrap();
+        // "Now" is inside the leaf's window but well past the intermediate's
+        // 2021 notAfter.
+        let err = validate_chain_certs(&path, &chain, now()).unwrap_err();
+        assert!(
+            matches!(err, TlsError::ExpiredChainCert { position: 2, .. }),
+            "an expired intermediate must fail fast at position 2, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("#2"),
+            "error must name the offending position, got: {err}"
+        );
+        assert!(
+            err.to_string().contains("expired"),
+            "error must report expiry, got: {err}"
+        );
+    }
+
+    // Regression (#1603, Codex): a NOT-YET-VALID intermediate is likewise
+    // rejected by clients, so it must fail fast at position 2. `now` is pinned
+    // before the intermediate's notBefore; the leaf (`chain[0]`) is skipped by
+    // `validate_chain_certs`, so only the intermediate is graded.
+    #[test]
+    fn not_yet_valid_intermediate_in_chain_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let leaf = write_temp(dir.path(), "leaf.pem", CERT_PEM);
+        let leaf_key = write_temp(dir.path(), "leaf.key.pem", KEY_PEM);
+        // The intermediate is a second copy of `CERT_PEM`; pin "now" one hour
+        // before its notBefore so its validity window has not opened yet.
+        let not_before = inspect_leaf(&leaf, &leaf_key, now())
+            .unwrap()
+            .not_before_unix;
+        let chain_pem = format!("{CERT_PEM}\n{CERT_PEM}");
+        let path = write_temp(dir.path(), "chain.pem", &chain_pem);
+        let chain = read_cert_chain(&path).unwrap();
+        let err = validate_chain_certs(&path, &chain, not_before - 3600).unwrap_err();
+        assert!(
+            matches!(err, TlsError::NotYetValidChainCert { position: 2, .. }),
+            "a not-yet-valid intermediate must fail fast at position 2, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("#2"),
+            "error must name the offending position, got: {err}"
+        );
+        assert!(
+            err.to_string().contains("not yet valid"),
+            "error must report the not-yet-valid window, got: {err}"
+        );
+    }
+
+    // A chain whose intermediate is currently within its validity window passes.
+    #[test]
+    fn valid_intermediate_in_chain_is_accepted() {
+        let dir = tempfile::tempdir().unwrap();
+        let chain_pem = format!("{CERT_PEM}\n{CERT_PEM}");
+        let path = write_temp(dir.path(), "chain.pem", &chain_pem);
+        let chain = read_cert_chain(&path).unwrap();
+        validate_chain_certs(&path, &chain, now())
+            .expect("a valid, in-window intermediate must be accepted");
     }
 
     #[test]
@@ -591,11 +1004,44 @@ mod tests {
     }
 
     #[test]
+    fn not_yet_valid_leaf_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let cert = write_temp(dir.path(), "c.pem", CERT_PEM);
+        let key = write_temp(dir.path(), "k.pem", KEY_PEM);
+        let provider = crypto_provider();
+
+        // Pin "now" to one hour BEFORE the fixture's notBefore (equivalent to a
+        // cert whose notBefore is now + 3600): the leaf is not yet valid, so
+        // load must fail fast — symmetric to the expired-leaf rejection.
+        let not_before = inspect_leaf(&cert, &key, now()).unwrap().not_before_unix;
+        let err = load_certified_key(&cert, &key, &provider, not_before - 3600).unwrap_err();
+        assert!(matches!(err, TlsError::NotYetValid { .. }), "got {err:?}");
+
+        // A currently-valid cert is unaffected: one second into the validity
+        // window (and well before notAfter) the same pair loads cleanly.
+        load_certified_key(&cert, &key, &provider, not_before + 1)
+            .expect("cert loads once notBefore has passed");
+    }
+
+    #[test]
+    fn inspect_reports_not_yet_valid_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let cert = write_temp(dir.path(), "c.pem", CERT_PEM);
+        let key = write_temp(dir.path(), "k.pem", KEY_PEM);
+        // inspect_leaf tolerates a not-yet-valid leaf (doctor grades it) but
+        // returns notBefore so the caller can see the window has not opened.
+        let inspection = inspect_leaf(&cert, &key, now()).expect("pair inspects");
+        assert!(inspection.is_not_yet_valid(inspection.not_before_unix - 1));
+        assert!(!inspection.is_not_yet_valid(inspection.not_before_unix));
+        assert!(!inspection.is_not_yet_valid(inspection.not_after_unix));
+    }
+
+    #[test]
     fn inspect_reports_future_expiry() {
         let dir = tempfile::tempdir().unwrap();
         let cert = write_temp(dir.path(), "c.pem", CERT_PEM);
         let key = write_temp(dir.path(), "k.pem", KEY_PEM);
-        let inspection = inspect_leaf(&cert, &key).expect("valid pair inspects");
+        let inspection = inspect_leaf(&cert, &key, now()).expect("valid pair inspects");
         assert!(
             inspection.days_until_expiry(now()) > 30,
             "fixture should be valid far into the future"
@@ -609,7 +1055,7 @@ mod tests {
         let key = write_temp(dir.path(), "k.pem", EXPIRED_KEY_PEM);
         // inspect_leaf tolerates expiry (doctor grades it) but still returns
         // the notAfter so the caller can see it is in the past.
-        let inspection = inspect_leaf(&cert, &key).expect("expired pair still inspects");
+        let inspection = inspect_leaf(&cert, &key, now()).expect("expired pair still inspects");
         assert!(inspection.days_until_expiry(now()) < 0);
     }
 

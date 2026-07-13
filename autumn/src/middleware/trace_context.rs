@@ -15,6 +15,22 @@
 //! Installed automatically by the framework when the `telemetry-otlp`
 //! feature is enabled — you do not need to register it manually.
 
+// autumn-panic-gate: request-path module — production code path must be panic-free.
+// See CONTRIBUTING.md "Request-path panic gate". Justify exceptions with
+// #[allow(clippy::<lint>, reason = "…")] at the narrowest scope.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::todo,
+        clippy::unimplemented,
+        clippy::indexing_slicing,
+    )
+)]
+
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};

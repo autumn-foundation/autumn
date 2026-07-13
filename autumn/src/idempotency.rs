@@ -1,3 +1,19 @@
+// autumn-panic-gate: request-path module — production code path must be panic-free.
+// See CONTRIBUTING.md "Request-path panic gate". Justify exceptions with
+// #[allow(clippy::<lint>, reason = "…")] at the narrowest scope.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::todo,
+        clippy::unimplemented,
+        clippy::indexing_slicing,
+    )
+)]
+
 use bytes::Bytes;
 use futures::StreamExt as FuturesStreamExt;
 
@@ -5,7 +21,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
@@ -482,7 +498,12 @@ impl MemoryIdempotencyStore {
 impl IdempotencyStore for MemoryIdempotencyStore {
     fn get(&self, key: &str) -> Option<IdempotencyEntry> {
         // Release the read lock immediately after cloning.
-        let entry = self.entries.read().unwrap().get(key).cloned();
+        let entry = self
+            .entries
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(key)
+            .cloned();
         entry.filter(|e| e.expires_at > Instant::now())
     }
 
@@ -492,7 +513,7 @@ impl IdempotencyStore for MemoryIdempotencyStore {
             body_hash,
             expires_at: saturating_deadline(ttl),
         };
-        let mut entries = self.entries.write().unwrap();
+        let mut entries = self.entries.write().unwrap_or_else(PoisonError::into_inner);
         entries.insert(key.to_owned(), entry);
         // Periodically evict expired entries to bound memory growth for
         // long-running processes. O(N) scan is amortised over every 128 writes.
@@ -509,7 +530,10 @@ impl IdempotencyStore for MemoryIdempotencyStore {
 
     fn try_lock_owned(&self, key: &str, owner: &str, lock_ttl: Duration) -> bool {
         let now = Instant::now();
-        let mut in_flight = self.in_flight.write().unwrap();
+        let mut in_flight = self
+            .in_flight
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
         // Check only the requested key's active in-flight marker.
         if let Some(lock) = in_flight.get(key)
             && lock.expires_at > now
@@ -534,11 +558,17 @@ impl IdempotencyStore for MemoryIdempotencyStore {
     }
 
     fn unlock(&self, key: &str) {
-        self.in_flight.write().unwrap().remove(key);
+        self.in_flight
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(key);
     }
 
     fn unlock_owned(&self, key: &str, owner: &str) {
-        let mut in_flight = self.in_flight.write().unwrap();
+        let mut in_flight = self
+            .in_flight
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
         if in_flight
             .get(key)
             .is_some_and(|lock| lock.owner.as_str() == owner)
@@ -1081,6 +1111,10 @@ where
     }
 }
 
+#[allow(
+    clippy::unwrap_used,
+    reason = "infallible: response built from static status/body"
+)]
 fn request_body_too_large_response() -> Response<Body> {
     Response::builder()
         .status(StatusCode::PAYLOAD_TOO_LARGE)
@@ -1090,6 +1124,10 @@ fn request_body_too_large_response() -> Response<Body> {
         .unwrap()
 }
 
+#[allow(
+    clippy::unwrap_used,
+    reason = "infallible: response built from static status/body"
+)]
 fn in_flight_conflict_response() -> Response<Body> {
     Response::builder()
         .status(StatusCode::CONFLICT)
@@ -1101,6 +1139,10 @@ fn in_flight_conflict_response() -> Response<Body> {
         .unwrap()
 }
 
+#[allow(
+    clippy::unwrap_used,
+    reason = "infallible: response built from static status/body"
+)]
 fn replay_requires_inner_stop_response() -> Response<Body> {
     Response::builder()
         .status(StatusCode::CONFLICT)
@@ -1110,6 +1152,10 @@ fn replay_requires_inner_stop_response() -> Response<Body> {
         .unwrap()
 }
 
+#[allow(
+    clippy::unwrap_used,
+    reason = "infallible: response built from static status/body"
+)]
 pub(crate) fn persistence_failed_response() -> Response<Body> {
     Response::builder()
         .status(StatusCode::SERVICE_UNAVAILABLE)
@@ -1209,7 +1255,7 @@ impl DeferredIdempotencyCommit {
         let Some(mut state) = self
             .inner
             .lock()
-            .expect("deferred idempotency commit lock poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
             .take()
         else {
             return Ok(());
@@ -1258,10 +1304,7 @@ impl DeferredIdempotencyCommit {
     }
 
     fn add_session_alias(&self, session_id: Option<&str>, primary_replay_after_guard_denial: bool) {
-        let mut guard = self
-            .inner
-            .lock()
-            .expect("deferred idempotency commit lock poisoned");
+        let mut guard = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
         let Some(state) = guard.as_mut() else {
             return;
         };
@@ -1285,7 +1328,7 @@ impl DeferredIdempotencyCommit {
         let Some(mut state) = self
             .inner
             .lock()
-            .expect("deferred idempotency commit lock poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
             .take()
         else {
             return;
@@ -1747,10 +1790,15 @@ where
             idempotency.key = %idempotency_key,
             "Idempotency payload mismatch — returning 422"
         );
-        return Ok(Response::builder()
+        #[allow(
+            clippy::unwrap_used,
+            reason = "infallible: response built from static status/body"
+        )]
+        let response = Response::builder()
             .status(StatusCode::UNPROCESSABLE_ENTITY)
             .body(Body::from("idempotency key reused with different payload"))
-            .unwrap());
+            .unwrap();
+        return Ok(response);
     }
 
     if fail_closed_on_replay {
@@ -1784,15 +1832,44 @@ where
     Ok(replay.into_response())
 }
 
+#[allow(
+    clippy::unwrap_used,
+    reason = "infallible: response built from static status/body"
+)]
+fn corrupted_replay_record_response() -> Response<Body> {
+    Response::builder()
+        .status(StatusCode::INTERNAL_SERVER_ERROR)
+        .body(Body::from(
+            "stored idempotency replay record is invalid or corrupted",
+        ))
+        .unwrap()
+}
+
 fn response_from_record(record: IdempotencyRecord) -> Response<Body> {
     let mut builder = Response::builder().status(record.status);
     for (name, value) in &record.headers {
         builder = builder.header(name.as_str(), value.as_slice());
     }
-    builder
+    // The status, header names/values, and body all originate from the
+    // idempotency store, which may be a custom or corrupted backend. An
+    // invalid stored status (e.g. `0` or `> 999`) or invalid header bytes
+    // makes the builder stash an error that surfaces here. A corrupted replay
+    // record must not crash request handling: fall back to an internal-error
+    // response instead of panicking.
+    match builder
         .header(X_IDEMPOTENT_REPLAYED, "true")
         .body(Body::from(record.body))
-        .unwrap()
+    {
+        Ok(response) => response,
+        Err(error) => {
+            tracing::error!(
+                error = %error,
+                "Stored idempotency replay record produced an invalid response; \
+                 returning 500 instead of replaying"
+            );
+            corrupted_replay_record_response()
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1843,6 +1920,49 @@ mod tests {
         fn unlock(&self, key: &str) {
             self.record_key(key);
         }
+    }
+
+    #[test]
+    fn poisoned_lock_does_not_break_subsequent_requests() {
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+
+        let store = MemoryIdempotencyStore::new(Duration::from_secs(60));
+
+        // Simulate a request handler that panics while holding one of the
+        // store's internal locks, poisoning it. Without poison recovery this
+        // would make every later request that touches `entries` panic too.
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            let _guard = store
+                .entries
+                .write()
+                .expect("first acquisition is not poisoned");
+            panic!("simulated handler panic while holding the idempotency lock");
+        }));
+        assert!(result.is_err(), "the induced panic should have unwound");
+        assert!(
+            store.entries.is_poisoned(),
+            "holding the write lock across a panic must poison it",
+        );
+
+        // A subsequent normal store round-trip must still succeed, proving the
+        // `unwrap_or_else(PoisonError::into_inner)` recovery keeps shared state
+        // usable for later requests (AC4 lock-poisoning recovery contract).
+        let record = IdempotencyRecord {
+            status: 200,
+            headers: Vec::new(),
+            body: b"ok".to_vec(),
+            metadata: Vec::new(),
+        };
+        store.set("k", record, b"body-hash".to_vec(), Duration::from_secs(60));
+        let fetched = store.get("k");
+        assert!(
+            fetched.is_some(),
+            "store must remain usable after a poisoned lock (into_inner recovery)",
+        );
+        assert_eq!(
+            fetched.expect("entry present after recovery").record.body,
+            b"ok",
+        );
     }
 
     fn idempotent_post(path: &str, key: &str, body: &'static str) -> Request<Body> {
@@ -2192,5 +2312,47 @@ mod tests {
             observed.1,
             expected_storage_key("POST", "/payments", None, "pay-once")
         );
+    }
+
+    #[test]
+    fn corrupted_stored_record_does_not_panic_on_replay() {
+        // A store backend (custom or corrupted) can hand back a record whose
+        // stored status is out of the valid HTTP range and whose headers carry
+        // invalid bytes. Replaying it must not panic — it must surface an
+        // internal-error response instead.
+        let corrupted = IdempotencyRecord {
+            status: 1000,
+            headers: vec![("inv\nalid".to_owned(), vec![0x00, 0x0a])],
+            body: b"stored body".to_vec(),
+            metadata: Vec::new(),
+        };
+
+        let response = IdempotencyReplayResponse { record: corrupted }.into_response();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "a corrupted replay record must fall back to a 500 recovery response"
+        );
+        assert!(
+            response.headers().get(X_IDEMPOTENT_REPLAYED).is_none(),
+            "the recovery response must not masquerade as a successful replay"
+        );
+    }
+
+    #[test]
+    fn invalid_stored_status_alone_does_not_panic_on_replay() {
+        // Even with otherwise-valid headers, an out-of-range status byte must
+        // not crash replay handling.
+        let corrupted = IdempotencyRecord {
+            status: 0,
+            headers: vec![("content-type".to_owned(), b"text/plain".to_vec())],
+            body: b"stored body".to_vec(),
+            metadata: Vec::new(),
+        };
+
+        let response = response_from_record(corrupted);
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 }

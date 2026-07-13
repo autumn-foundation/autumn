@@ -146,6 +146,12 @@ enum Commands {
         /// wires a managed local Postgres provider (implies a daemon app).
         #[arg(long = "bundled-pg")]
         bundled_pg: bool,
+        /// JSON-first API starter: a lean skeleton with no HTML/CSS/Tailwind
+        /// artifacts. Handlers return JSON; the view stack (maud/htmx/tailwind)
+        /// is dropped. Keeps the database/migrations. Composes with --with-i18n
+        /// and --with-seed; not combinable with --daemon or --bundled-pg.
+        #[arg(long)]
+        api: bool,
     },
     /// Pre-render static routes to dist/
     Build {
@@ -2347,6 +2353,12 @@ enum GenerateCommands {
         /// `--api` scaffolds, which never generate a policy.
         #[arg(long)]
         no_policy: bool,
+        /// Make these text fields full-text searchable (issue #1319): comma-
+        /// separated or repeatable, e.g. `--searchable title,body`. Adds
+        /// `#[searchable]` to the model, `searchable` to the repository, a
+        /// `search_vector` migration, and a wired search box in the index view.
+        #[arg(long, value_name = "FIELD,FIELD", value_delimiter = ',')]
+        searchable: Vec<String>,
         /// Print the file plan and exit without writing anything.
         #[arg(long)]
         dry_run: bool,
@@ -2634,6 +2646,7 @@ fn run_command(command: Commands) {
             with_seed,
             daemon,
             bundled_pg,
+            api,
         } => {
             if list_starters {
                 starters::print_list();
@@ -2649,11 +2662,11 @@ fn run_command(command: Commands) {
             if let Some(starter) = starter {
                 // A starter brings a complete composition; the base-project
                 // scaffolding toggles do not apply.
-                if with_i18n || with_seed || daemon || bundled_pg {
+                if with_i18n || with_seed || daemon || bundled_pg || api {
                     eprintln!(
                         "Error: --starter cannot be combined with --with-i18n, \
-                         --with-seed, --daemon, or --bundled-pg (a starter brings \
-                         its own composition)"
+                         --with-seed, --daemon, --bundled-pg, or --api (a starter \
+                         brings its own composition)"
                     );
                     std::process::exit(1);
                 }
@@ -2673,6 +2686,7 @@ fn run_command(command: Commands) {
                         // --bundled-pg is a daemon flavor that keeps the database.
                         with_daemon: daemon || bundled_pg,
                         with_bundled_pg: bundled_pg,
+                        with_api: api,
                     },
                 );
             }
@@ -3623,6 +3637,7 @@ fn run_generate_command(cmd: GenerateCommands, mode: ApplyMode) {
             live,
             live_validation,
             no_policy,
+            searchable,
             dry_run,
             force,
         } => {
@@ -3680,6 +3695,7 @@ fn run_generate_command(cmd: GenerateCommands, mode: ApplyMode) {
                 id.as_deref(),
                 live_validation,
                 no_policy,
+                &searchable,
             ) {
                 Ok(result) => result,
                 Err(e) => {
@@ -3688,13 +3704,28 @@ fn run_generate_command(cmd: GenerateCommands, mode: ApplyMode) {
                 }
             };
             let timestamp = generate::timestamp_now();
-            let plan = generate::scaffold::plan_scaffold_with_options(
-                &resolve_cwd(),
-                &name,
-                &fields,
-                &timestamp,
-                &options,
-            );
+            // `destroy scaffold` recomputes this same plan before reverting it.
+            // The shared-layout preflight in the plan builder is a generate-time
+            // guard only: running it on the destroy path would hard-fail cleanup
+            // in a project whose shared `pub fn layout` is missing or renamed,
+            // stranding the generated files (issue #1834). Use the revert-only
+            // plan builder for `ApplyMode::Destroy`, which skips it.
+            let plan = match mode {
+                ApplyMode::Generate => generate::scaffold::plan_scaffold_with_options(
+                    &resolve_cwd(),
+                    &name,
+                    &fields,
+                    &timestamp,
+                    &options,
+                ),
+                ApplyMode::Destroy => generate::scaffold::plan_scaffold_with_options_for_revert(
+                    &resolve_cwd(),
+                    &name,
+                    &fields,
+                    &timestamp,
+                    &options,
+                ),
+            };
             apply_plan(plan, generate::Flags { dry_run, force }, mode);
         }
         GenerateCommands::Plugin {

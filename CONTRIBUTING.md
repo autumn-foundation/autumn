@@ -61,6 +61,84 @@ The tests capture and print the full `cargo build` / `cargo check`
 stdout+stderr on failure, so the breakage is diagnosable directly from the
 CI summary.
 
+## Request-path panic gate
+
+Autumn enforces a [#1611][issue-1611] invariant: **request-path modules must not
+panic on the production code path.** A request that reaches a runtime module
+should never be able to bring the process down through an `unwrap`, `expect`,
+`panic!`, out-of-bounds index, or an unfinished `todo!`/`unimplemented!`.
+
+### What counts as "request path"
+
+Per AC2, the gate covers modules that run **per request** or in
+**framework-owned background loops** — extractors, form/body decoding, session
+and idempotency stores, the scheduler and job queues, channels, and the
+per-request middleware stack. These are the files listed in the
+`REQUEST_PATH_MODULES` array in `scripts/check-panic-gate.sh`.
+
+Explicitly **exempt** surfaces (a panic there cannot take down a live request):
+
+- `#[cfg(test)]` code, benches, and examples;
+- build scripts;
+- the `autumn-cli` crate (a short-lived operator tool);
+- application-author code (your route handlers are yours to write).
+
+### What the gate checks
+
+Each gated module carries a header that opts its **production** target into a
+set of panic-class clippy denials:
+
+```rust
+// autumn-panic-gate: request-path module — production code path must be panic-free.
+#![cfg_attr(not(test), deny(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::indexing_slicing,
+))]
+```
+
+The `cfg_attr(not(test), …)` scope means the denials apply to the library build
+but auto-exempt the module's own `#[cfg(test)] mod tests`. Enforcement happens
+in the CI `lint` job (same workflow as `fmt`/`clippy`, no new services):
+
+- `cargo clippy --workspace --all-targets -- -D warnings` fails on any un-justified
+  panic-class site in a gated module; and
+- `scripts/check-panic-gate.sh` verifies every module in the canonical manifest
+  still exists and still carries the gate header, so the gate cannot be silently
+  removed.
+
+Run the manifest check locally with `./scripts/check-panic-gate.sh`.
+
+### Justifying an exception
+
+When a site is provably infallible or a misconfiguration you want surfaced
+eagerly, annotate it at the **narrowest** scope with a `reason`:
+
+```rust
+#[allow(clippy::expect_used, reason = "infallible: HMAC accepts any key length")]
+```
+
+For lock poisoning, do **not** annotate — **recover** instead, so one panicking
+lock holder can't poison shared state for every later request:
+
+```rust
+let guard = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+```
+
+This `unwrap_or_else(PoisonError::into_inner)` idiom is the established
+lock-poisoning recovery contract (AC4); see `circuit_breaker.rs`.
+
+### Deferred: arithmetic
+
+Unchecked time/duration/integer arithmetic (`clippy::arithmetic_side_effects`)
+is a deferred follow-up and is **not** in the automated lint set yet. It is
+currently guarded by the saturating-arithmetic idiom (e.g. `saturating_deadline`
+in `idempotency.rs`) plus review rather than by the gate.
+
 ## Fuzzing
 
 Autumn coverage-guides a set of [cargo-fuzz][cargo-fuzz] (libFuzzer) harnesses

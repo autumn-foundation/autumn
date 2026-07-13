@@ -597,6 +597,14 @@ pub use pagination::Page;
 /// patterns.
 pub use pagination::PageRequest;
 
+/// Allowlisted sort/filter parameters extracted from the query string, and the
+/// canonical [`SortDir`] direction. Compose with [`PageRequest`] to drive the
+/// `#[repository]`-generated `list()` method.
+///
+/// See the [`pagination`] module for the security model (the allowlist is the
+/// injection boundary) and the query contract.
+pub use pagination::{ListQuery, SortDir};
+
 /// Cursor pagination response wrapper. Companion to [`CursorRequest`]
 /// for keyset/seek pagination of real-time feeds.
 ///

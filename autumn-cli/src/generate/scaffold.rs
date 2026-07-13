@@ -335,13 +335,55 @@ pub fn plan_scaffold(
 /// # Errors
 /// Surfaces any planning error from the underlying model generation as well
 /// as project-layout, repository query, and metadata problems.
-#[allow(clippy::too_many_lines)]
 pub fn plan_scaffold_with_options(
     project_root: &Path,
     name: &str,
     field_tokens: &[String],
     timestamp: &str,
     options: &ScaffoldOptions,
+) -> Result<Plan, GenerateError> {
+    // Generation path: run the full plan, including the shared-layout preflight.
+    // `autumn destroy scaffold` recomputes the identical plan before reverting
+    // it, and must bypass that generate-only preflight (issue #1834); it reaches
+    // the builder through `plan_scaffold_with_options_for_revert` instead.
+    plan_scaffold_with_options_impl(project_root, name, field_tokens, timestamp, options, false)
+}
+
+/// Compute the file actions for `autumn destroy scaffold …`.
+///
+/// Identical to [`plan_scaffold_with_options`] except it recomputes the plan for
+/// the revert path: it skips the generate-only shared-layout preflight so
+/// cleanup still succeeds in a project whose shared `pub fn layout` is missing or
+/// renamed (e.g. one scaffolded by an older CLI, or one whose `layout` was since
+/// renamed). `autumn destroy scaffold` reverts the returned plan; the preflight
+/// would otherwise hard-fail the destroy before any generated file is removed,
+/// stranding the files it is meant to remove (issue #1834).
+///
+/// # Errors
+/// Same as [`plan_scaffold_with_options`], minus the shared-layout preflight.
+pub fn plan_scaffold_with_options_for_revert(
+    project_root: &Path,
+    name: &str,
+    field_tokens: &[String],
+    timestamp: &str,
+    options: &ScaffoldOptions,
+) -> Result<Plan, GenerateError> {
+    plan_scaffold_with_options_impl(project_root, name, field_tokens, timestamp, options, true)
+}
+
+/// Shared implementation of [`plan_scaffold_with_options`]. `for_revert`
+/// suppresses the generate-only shared-layout preflight so `autumn destroy
+/// scaffold` (which recomputes this same plan before [`Plan::revert`]) can
+/// remove generated files even in a project whose shared `pub fn layout` is
+/// missing or renamed — a regression the preflight would otherwise introduce.
+#[allow(clippy::too_many_lines)]
+fn plan_scaffold_with_options_impl(
+    project_root: &Path,
+    name: &str,
+    field_tokens: &[String],
+    timestamp: &str,
+    options: &ScaffoldOptions,
+    for_revert: bool,
 ) -> Result<Plan, GenerateError> {
     ensure_project_root(project_root)?;
     // Gate: UUID primary keys are not yet supported for scaffolds. Every scaffold
@@ -429,6 +471,26 @@ pub fn plan_scaffold_with_options(
         && !options_with_key.model.sharded
         && !options_with_key.live
         && !options_with_key.live_validation;
+
+    // Issue #1319 security guard: the generated `GET /{plural}/search` handler calls
+    // the repository's UNSCOPED `search_page`, which returns rows for ALL users. When
+    // the model is owner-scoped, the index view is `#[secured]` and filters to the
+    // current user's rows — so pairing `--searchable` with owner scoping would leak
+    // other users' rows through the search endpoint that the list view prevents.
+    // Owner-scoped FTS needs a scoped `search_page` in the repository macro (framework
+    // work, tracked in #1841); until then, refuse the unsafe combination. Returns
+    // before the plan is built, so no files are written.
+    if !options_with_key.model.searchable.is_empty() && authorize_wiring {
+        return Err(GenerateError::Config(format!(
+            "`--searchable` is not yet supported for owner-scoped models: full-text search \
+             (`search_page`) is not owner-scoped, so the generated `GET /{plural}/search` \
+             endpoint would expose other users' rows that the `#[secured]` index view \
+             filters out (owner column `{owner}`). Remove `--searchable`, drop the owner \
+             column, or pass `--no-policy` to opt out of owner scoping. Track: framework \
+             support for owner-scoped FTS (issue #1841).",
+            owner = owner_column.as_ref().map_or("user_id", |o| o.name.as_str()),
+        )));
+    }
 
     // `references` columns whose target model can't be found in the project
     // (same presence test `check_reference_targets` used for its warning —
@@ -531,6 +593,7 @@ pub fn plan_scaffold_with_options(
             options_with_key.api,
             options_with_key.model.sharded,
             options_with_key.live,
+            !options_with_key.model.searchable.is_empty(),
         ),
     );
     let repo_mod_path = repos_dir.join("mod.rs");
@@ -552,7 +615,11 @@ pub fn plan_scaffold_with_options(
         // private `fn layout` and never call `crate::layout`, so an app without
         // a shared layout must not block them. This mirrors the renderer's
         // `shared_layout = !live && !live_validation`.
-        if !options_with_key.live && !options_with_key.live_validation {
+        //
+        // `for_revert` additionally skips the preflight on the `autumn destroy
+        // scaffold` path: it recomputes this plan before reverting it, and the
+        // generate-only guard must not hard-fail cleanup (issue #1834).
+        if !options_with_key.live && !options_with_key.live_validation && !for_revert {
             // Issue #1130: scaffolded HTML views render through the application's
             // shared `crate::layout`, so the target app must expose one with the
             // matching signature. Detect it by looking for a `pub fn layout` in
@@ -609,6 +676,7 @@ pub fn plan_scaffold_with_options(
                 &missing_reference_targets,
                 authorize_wiring,
                 owner_column.as_ref().map(|o| o.name.as_str()),
+                &options_with_key.model.searchable,
             ),
         );
         let route_mod_path = routes_dir.join("mod.rs");
@@ -674,11 +742,17 @@ pub fn plan_scaffold_with_options(
     } else {
         Vec::new()
     };
+    // Issue #1319: the search box/route exist only for the standard (non-live)
+    // HTML index; the model/repository/migration get `searchable` regardless.
+    let search_enabled = !options_with_key.model.searchable.is_empty()
+        && !options_with_key.live
+        && !options_with_key.live_validation;
     let route_entries = main_route_entries(
         &plural,
         &snake_name,
         options_with_key.api,
         options_with_key.live,
+        search_enabled && !options_with_key.api,
         &validated_field_names,
     );
     let mut mods = vec!["models", "schema", "repositories"];
@@ -784,6 +858,33 @@ pub fn plan_scaffold_with_options(
         plan.push_revert(Revert::CargoAutumnWebFeature {
             path: cargo_path,
             feature: "maud".to_owned(),
+            owner_dir: Some(project_root.join("src").join("routes")),
+        });
+    }
+
+    // Issue #1319: a searchable (non-live) index inlines an htmx `<script>` and
+    // its results handler extracts `HxRequest`, both gated behind autumn-web's
+    // `htmx` feature — enable it. (Live variants enable `htmx` in the block
+    // below; api scaffolds have no HTML index, so no search box.)
+    if search_enabled && !options_with_key.api {
+        let cargo_path = project_root.join("Cargo.toml");
+        let base = plan
+            .actions
+            .iter()
+            .rev()
+            .find_map(|a| match a {
+                Action::Modify { path, contents } if path == &cargo_path => Some(contents.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| read_or_empty(&cargo_path));
+        let updated = ensure_autumn_web_feature(&base, "htmx");
+        if updated != base {
+            plan.actions.retain(|a| a.path() != cargo_path);
+            plan.modify(cargo_path.clone(), updated);
+        }
+        plan.push_revert(Revert::CargoAutumnWebFeature {
+            path: cargo_path,
+            feature: "htmx".to_owned(),
             owner_dir: Some(project_root.join("src").join("routes")),
         });
     }
@@ -1138,7 +1239,7 @@ pub(super) fn render_repository_for_pull(
     )
 }
 
-#[allow(clippy::fn_params_excessive_bools)]
+#[allow(clippy::fn_params_excessive_bools, clippy::too_many_arguments)]
 fn render_repository_file(
     pascal_name: &str,
     snake_name: &str,
@@ -1147,11 +1248,16 @@ fn render_repository_file(
     api: bool,
     sharded: bool,
     live: bool,
+    searchable: bool,
 ) -> String {
     let plural = pluralize(snake_name);
     let query_body = render_repository_queries(pascal_name, queries);
     let soft_delete_attr = if soft_delete { ", soft_delete" } else { "" };
     let broadcasts_attr = if live { ", broadcasts = true" } else { "" };
+    // Issue #1319: `searchable` opts the repository into the FTS `search()` /
+    // `search_page(query, &PageRequest)` methods (backed by the model's
+    // `#[searchable]` fields + the migration's `search_vector` column).
+    let searchable_attr = if searchable { ", searchable" } else { "" };
     let sharded_note = if sharded {
         format!(
             "//!\n\
@@ -1258,7 +1364,7 @@ fn render_repository_file(
          use crate::models::{snake_name}::{{{pascal_name}, New{pascal_name}, Update{pascal_name}}};\n\
          use crate::schema::{plural};\n\
          \n\
-         #[autumn_web::repository({pascal_name}, api = \"/api/{plural}\"{soft_delete_attr}{broadcasts_attr})]\n\
+         #[autumn_web::repository({pascal_name}, api = \"/api/{plural}\"{soft_delete_attr}{broadcasts_attr}{searchable_attr})]\n\
          pub trait {pascal_name}Repository {{\n\
 {query_body}\
          }}\n\
@@ -1637,8 +1743,16 @@ fn render_routes_file(
     missing_reference_targets: &BTreeSet<String>,
     authorize: bool,
     owner: Option<&str>,
+    searchable: &[String],
 ) -> String {
     let id_rust = id_type.rust_type();
+    // Issue #1319: the full-text search box + results handler apply only to the
+    // standard (non-live) HTML index. The `--live`/`--live-validation` list is a
+    // `<ul>` with an SSE out-of-band swap contract that a `data_table` search
+    // fragment would break, so gate the search box off for those variants (the
+    // model/repository/migration still get `searchable`). Precedent: the label
+    // -map gating for the live index.
+    let search_enabled = !searchable.is_empty() && !live && !live_validation;
     let validated_fields: Vec<&str> = validations.keys().map(String::as_str).collect();
     let unique_fields: Vec<&Field> = fields.iter().filter(|f| f.unique).collect();
     let update_columns = render_update_columns(plural, fields);
@@ -2278,6 +2392,13 @@ fn render_routes_file(
     // already loads labels through the same connection — so the index reuses
     // that mechanism rather than falling back to raw ids. Only the `--live` SSE
     // list (a `<ul>` of ids, no data-table) keeps id rendering.
+    //
+    // #1126: sort/filter (the `ListQuery` extractor + `repo.list(..)` + sortable
+    // `data_table` headers) is likewise gated OFF for the `--live` variants —
+    // their `<ul>` has no column headers to hang sort links on, and the SSE
+    // OOB-swap contract owns the list DOM. The `--live` index keeps the plain
+    // `repo.page(&page_req)` call. `--live-validation` (without `--live`) renders
+    // the normal data_table index, so it DOES get sort/filter.
     let columns_let = if live {
         String::new()
     } else {
@@ -2307,15 +2428,63 @@ fn render_routes_file(
     } else {
         render_columns_vec(pascal_name, fields, &reference_displays, true)
     };
+    // #1126: the data_table config is wired symmetrically with what the server
+    // applies — `.query(..)` preserves the current filters on sort links,
+    // `.active_sort`/`.active_dir` mark the column the repository ordered by, and
+    // `repo.list(&list_query, ..)` applies exactly that sort/filter. Sortable
+    // headers are opted-in per column by `render_columns_vec`.
     let table_render = if live {
         String::new()
-    } else {
+    } else if authorize {
+        // #1125 owner-scoped index: the handler runs a manual owner-filtered
+        // query (not `repo.list`) and does not extract `ListQuery`, so its
+        // data_table stays on the plain (non-sort/filter) config. #1126's
+        // allowlisted sort/filter is not owner-scoped — the same limitation the
+        // `--searchable` guard documents for owner-scoped FTS.
         format!(
             r#"(autumn_web::widgets::data_table(&page_data.content, &columns, &autumn_web::widgets::DataTableConfig::new("No {plural} yet.").base_path(&paths::index())))"#
+        )
+    } else {
+        format!(
+            r#"(autumn_web::widgets::data_table(&page_data.content, &columns, &autumn_web::widgets::DataTableConfig::new("No {plural} yet.").base_path(&paths::index()).query(raw_query.as_deref().unwrap_or_default()).active_sort(list_query.sort().unwrap_or_default()).active_dir(list_query.direction())))"#
         )
     };
 
     let list_render = if live { &live_ul_render } else { &table_render };
+    // The list + pager block the index handler renders. When searchable (AC3),
+    // this becomes an `active_search_input` box wired to `GET /{plural}/search`
+    // sitting above the single `#{plural}-search-results` container that htmx
+    // swaps into. We use the input-only `active_search_input` (not the composite
+    // `active_search`, which would render its OWN empty `#{plural}-search-results`
+    // container and produce a duplicate id) and render one container ourselves,
+    // seeded with the initial `{list_render}` + pager server-side — so the first
+    // paint needs no extra AJAX round-trip (no `.initial_load()`) and
+    // non-JavaScript visitors still see the full list. The shared `crate::layout`
+    // does not load htmx, so an htmx `<script>` is inlined here. When not
+    // searchable (or a live variant), it is exactly the previous `{list_render}`
+    // + `pagination_nav` pair — byte-for-byte identical (AC4).
+    // #1126: the non-live (sort/filter) index handlers preserve the active
+    // sort+filter query string on the pager links via `PagerOptions::query`, so
+    // paging never drops the current sort/filter (`pager_query` is bound in each
+    // handler from the raw query string). The `--live` variants call `repo.page`
+    // and extract no `RawQuery`, so they keep the plain pager.
+    let pager_line = if live {
+        r"(pagination_nav(&page_data, &PagerOptions::new(&paths::index())))".to_string()
+    } else {
+        r"(pagination_nav(&page_data, &PagerOptions::new(&paths::index()).query(pager_query)))"
+            .to_string()
+    };
+    let index_list_block = if search_enabled {
+        format!(
+            "script src=(autumn_web::htmx::HTMX_JS_PATH) {{}}\n        \
+             (autumn_web::widgets::active_search_input(\"{snake_name}-search\", \"Search {pascal_name}s\", \
+             &autumn_web::widgets::ActiveSearchConfig::new(\"/{plural}/search\", \"#{plural}-search-results\")\
+             .placeholder(\"Search {pascal_name}s…\")))\n        \
+             div id=\"{plural}-search-results\" {{\n            {list_render}\n            {pager_line}\n        }}"
+        )
+    } else {
+        format!("{list_render}\n        {pager_line}")
+    };
     let show_rows = render_show_property_rows(all_fields, &reference_displays);
     // The `show` handler pre-loads each displayable reference's parent label
     // (issue #1146) before building its property rows.
@@ -2386,31 +2555,34 @@ pub async fn index(
     Ok({layout_fn}("{pascal_name} index", {cp_index}{flash_arg}, html! {{
         h1 {{ "{pascal_name}s" }}
         a href=(paths::new()) {{ "New {pascal_name}" }}
-        {list_render}
-        (pagination_nav(&page_data, &PagerOptions::new(&paths::index())))
+        {index_list_block}
     }}))
 }}"#
             )
         } else {
             format!(
-                r#"/// `GET /{plural}` — paginated list of {snake_name}s.
+                r#"/// `GET /{plural}` — paginated, sortable, filterable list of {snake_name}s.
 ///
-/// Accepts `?page=N&size=M` query parameters via the [`PageRequest`] extractor.
-/// Out-of-range or missing values are clamped silently — list endpoints never
-/// return HTTP 400 for bad paging parameters.
+/// Accepts `?page=N&size=M` paging plus allowlisted `?sort=col&dir=asc|desc`
+/// and `?filter[col]=val` params (the [`ListQuery`] extractor). Unknown or
+/// malicious sort/filter keys are ignored against the model's column allowlist,
+/// so this never 400s and can never inject SQL. `from_shard` keeps the query
+/// pinned to a single shard.
 #[get("/{plural}")]
 pub async fn index(
+    list_query: ListQuery,
+    RawQuery(raw_query): RawQuery,
     page_req: PageRequest,
     {sharded_index_db},
     flash: Flash,
 ) -> AutumnResult<Markup> {{
     let repo = Pg{pascal_name}Repository::from_shard(&db);
-    let page_data: Page<{pascal_name}> = repo.page(&page_req).await?;
+    let page_data: Page<{pascal_name}> = repo.list(&list_query, &page_req).await?;
+    let pager_query = raw_query.as_deref().unwrap_or("");
 {index_label_loads}{index_columns_labeled}    Ok({layout_fn}("{pascal_name} index", {cp_index}{flash_arg}, html! {{
         h1 {{ "{pascal_name}s" }}
         a href=(paths::new()) {{ "New {pascal_name}" }}
-        {list_render}
-        (pagination_nav(&page_data, &PagerOptions::new(&paths::index())))
+        {index_list_block}
     }}))
 }}"#
             )
@@ -2432,33 +2604,47 @@ pub async fn index(
     Ok({layout_fn}("{pascal_name} index", {cp_index}{flash_arg}, html! {{
         h1 {{ "{pascal_name}s" }}
         a href=(paths::new()) {{ "New {pascal_name}" }}
-        {list_render}
-        (pagination_nav(&page_data, &PagerOptions::new(&paths::index())))
+        {index_list_block}
     }}))
 }}"#
         )
     } else {
         format!(
-            r#"/// `GET /{plural}` — paginated list of {snake_name}s.
+            r#"/// `GET /{plural}` — paginated, sortable, filterable list of {snake_name}s.
 ///
-/// Accepts `?page=N&size=M` query parameters via the [`PageRequest`] extractor.
-/// Out-of-range or missing values are clamped silently — list endpoints never
-/// return HTTP 400 for bad paging parameters.
+/// Accepts `?page=N&size=M` paging plus allowlisted `?sort=col&dir=asc|desc`
+/// and `?filter[col]=val` params (the [`ListQuery`] extractor). Unknown or
+/// malicious sort/filter keys are ignored against the model's column allowlist,
+/// so this never 400s and can never inject SQL.
 #[get("/{plural}")]
 pub async fn index(
+    list_query: ListQuery,
+    RawQuery(raw_query): RawQuery,
     page_req: PageRequest,
     repo: Pg{pascal_name}Repository,
     {index_db_param}flash: Flash,
 ) -> AutumnResult<Markup> {{
-    let page_data: Page<{pascal_name}> = repo.page(&page_req).await?;
+    let page_data: Page<{pascal_name}> = repo.list(&list_query, &page_req).await?;
+    let pager_query = raw_query.as_deref().unwrap_or("");
 {index_label_loads}{index_columns_labeled}    Ok({layout_fn}("{pascal_name} index", {cp_index}{flash_arg}, html! {{
         h1 {{ "{pascal_name}s" }}
         a href=(paths::new()) {{ "New {pascal_name}" }}
-        {list_render}
-        (pagination_nav(&page_data, &PagerOptions::new(&paths::index())))
+        {index_list_block}
     }}))
 }}"#
         )
+    };
+
+    // #1126: the non-live index handlers extract `ListQuery` (allowlisted
+    // sort/filter) and the raw query string (`RawQuery`, to preserve filters on
+    // the data_table sort links). The pure `--live` index keeps `repo.page` and
+    // needs neither — omit the imports there to avoid unused-import warnings.
+    let sort_imports = if live {
+        String::new()
+    } else {
+        "use autumn_web::pagination::ListQuery;\n\
+         use autumn_web::reexports::axum::extract::RawQuery;\n"
+            .to_owned()
     };
 
     // Imports: when sharded, drop Db from brace-import and add ShardedDb separately.
@@ -2619,6 +2805,81 @@ pub async fn index(
         out
     };
 
+    // Issue #1319: the FTS results handler backing the index `active_search`
+    // box. For htmx requests it returns just the results fragment (swapped into
+    // `#{plural}-search-results`); for a plain navigation — a bookmarked search
+    // URL, or a shared pager link — it returns the full page so search degrades
+    // gracefully without JavaScript. An empty `q` falls back to the standard
+    // `page(&page_req)` listing (AC3). Reuses the same `columns` and
+    // reference-label loads the index builds so search rows render identically.
+    // The pager preserves the request's raw query string (stripping `page`/
+    // `size`) via `PagerOptions::query`, so `q` survives pagination without any
+    // hand-rolled percent-encoding.
+    let search_handler = if search_enabled {
+        let field_list = searchable.join(", ");
+        let (repo_extractor, repo_bind) = if sharded {
+            (
+                format!("    {sharded_index_db},\n"),
+                format!("    let repo = Pg{pascal_name}Repository::from_shard(&db);\n"),
+            )
+        } else {
+            (
+                format!("    repo: Pg{pascal_name}Repository,\n    {index_db_param}"),
+                String::new(),
+            )
+        };
+        format!(
+            r#"
+
+/// `GET /{plural}/search` — full-text search over {field_list}.
+///
+/// Powers the `active_search` box on the index list. Ranked by relevance via
+/// the repository's `search_page`; an empty `q` falls back to the plain
+/// `page(&page_req)` listing. htmx requests get only the results fragment;
+/// non-htmx navigations (a bookmarked search URL, or a pager link) get a full
+/// page so search still works without JavaScript.
+#[derive(serde::Deserialize)]
+pub struct {pascal_name}SearchQuery {{
+    #[serde(default)]
+    pub q: String,
+}}
+
+#[get("/{plural}/search")]
+pub async fn search(
+    autumn_web::extract::Query(query): autumn_web::extract::Query<{pascal_name}SearchQuery>,
+    autumn_web::reexports::axum::extract::RawQuery(raw_query): autumn_web::reexports::axum::extract::RawQuery,
+    page_req: PageRequest,
+    hx: autumn_web::htmx::HxRequest,
+{repo_extractor}    flash: Flash,
+) -> AutumnResult<Markup> {{
+{repo_bind}    let q = query.q.trim();
+    // Preserve the request's raw query string (already percent-encoded) on pager
+    // links so `q` survives pagination; `PagerOptions::query` strips the stale
+    // `page`/`size` params and re-adds them per link.
+    let pager_query = raw_query.as_deref().unwrap_or("");
+    let page_data: Page<{pascal_name}> = if q.is_empty() {{
+        repo.page(&page_req).await?
+    }} else {{
+        repo.search_page(q, &page_req).await?
+    }};
+{index_label_loads}{index_columns_labeled}    let results = html! {{
+        (autumn_web::widgets::data_table(&page_data.content, &columns, &autumn_web::widgets::DataTableConfig::new("No {plural} found.").base_path("/{plural}/search")))
+        (pagination_nav(&page_data, &PagerOptions::new("/{plural}/search").query(pager_query)))
+    }};
+    if hx.is_htmx {{
+        return Ok(results);
+    }}
+    Ok({layout_fn}("Search {pascal_name}s", {cp_index}{flash_arg}, html! {{
+        h1 {{ "Search {pascal_name}s" }}
+        a href="/{plural}" {{ "Back to list" }}
+        div id="{plural}-search-results" {{ (results) }}
+    }}))
+}}"#
+        )
+    } else {
+        String::new()
+    };
+
     format!(
         r"//! Generated by `autumn generate scaffold`.
 //!
@@ -2627,7 +2888,7 @@ pub async fn index(
 {attachment_note}
 use autumn_web::extract::Path;
 use autumn_web::pagination::{{Page, PageRequest}};
-use autumn_web::reexports::axum::body::Bytes;
+{sort_imports}use autumn_web::reexports::axum::body::Bytes;
 use autumn_web::reexports::serde_json;
 use autumn_web::security::{{CsrfFormField, CsrfToken, SubmitFormField, SubmitToken}};
 use autumn_web::ui::pagination::{{PagerOptions, pagination_nav}};
@@ -2862,6 +3123,7 @@ pub async fn events(
         String::new()
     } + &validate_handlers
         + &paths_macro
+        + &search_handler
 }
 
 /// The `UNIQUE_CONSTRAINTS` module-level const the generated `create`/
@@ -3814,11 +4076,29 @@ fn cell_value_expr(field: &Field) -> String {
     }
 }
 
+/// Whether a column of this kind is server-sortable via the generated
+/// `list()` method (#1126).
+///
+/// Mirrors the orderable-type allowlist in the `#[model]` macro: every scalar
+/// column is sortable EXCEPT binary blobs (`Bytea`/`Attachment`) and closed-set
+/// `Enum` columns (whose Rust type is a generated enum the macro doesn't emit a
+/// sort arm for). Emitting `.sortable(..)` only for these keeps the rendered
+/// header links symmetric with what the server actually applies — a link that
+/// resolves to the default order would be a dead affordance.
+const fn kind_is_sortable(kind: FieldKind) -> bool {
+    !matches!(
+        kind,
+        FieldKind::Bytea | FieldKind::Attachment | FieldKind::Enum
+    )
+}
+
 /// Emit the `let columns: Vec<Column<Pascal>> = vec![…];` block for the index handler.
 ///
 /// Includes an "Id" column, one column per scaffold field (title-cased header),
-/// and a trailing "Show" actions column. All columns are non-sortable — server-side
-/// ordering per-column is out of scope; dead sort links would be worse than none.
+/// and a trailing "Show" actions column. Scalar columns are marked `.sortable(..)`
+/// (the sort key is the column's snake name) so the `data_table` renders header
+/// links that the generated `list()` method applies against the model's column
+/// allowlist (#1126). The trailing "Show" action column is never sortable.
 fn render_columns_vec(
     pascal_name: &str,
     fields: &[Field],
@@ -3831,14 +4111,19 @@ fn render_columns_vec(
         out,
         "    let columns: Vec<autumn_web::widgets::Column<{pascal_name}>> = vec!["
     );
-    // ID column
+    // ID column — always sortable (the default order is `id DESC`).
     let _ = writeln!(
         out,
-        "        autumn_web::widgets::Column::new(\"Id\", |row: &{pascal_name}| maud::html! {{ (row.id) }}),"
+        "        autumn_web::widgets::Column::new(\"Id\", |row: &{pascal_name}| maud::html! {{ (row.id) }}).sortable(\"id\"),"
     );
     // One column per field
     for f in fields {
         let header = title_case(&f.name);
+        let sortable_suffix = if kind_is_sortable(f.kind) {
+            format!(".sortable(\"{}\")", f.name)
+        } else {
+            String::new()
+        };
         // A displayable `references` column renders the parent's label from
         // the per-view `{name}_labels` map the handler loaded (issue #1146),
         // instead of the raw foreign-key id. The closure borrows the map,
@@ -3862,7 +4147,7 @@ fn render_columns_vec(
         };
         let _ = writeln!(
             out,
-            "        autumn_web::widgets::Column::new(\"{header}\", |row: &{pascal_name}| maud::html! {{ ({cell_expr}) }}),"
+            "        autumn_web::widgets::Column::new(\"{header}\", |row: &{pascal_name}| maud::html! {{ ({cell_expr}) }}){sortable_suffix},"
         );
     }
     // Show link column
@@ -5470,6 +5755,7 @@ fn main_route_entries(
     snake_name: &str,
     api: bool,
     live: bool,
+    search: bool,
     validated_field_names: &[String],
 ) -> Vec<String> {
     if api {
@@ -5496,6 +5782,11 @@ fn main_route_entries(
         ];
         if live {
             entries.push(format!("routes::{plural}::events"));
+        }
+        // Issue #1319: register the FTS results route (non-live only; the box is
+        // gated off for live variants — see `render_routes_file`).
+        if search {
+            entries.push(format!("routes::{plural}::search"));
         }
         for field_name in validated_field_names {
             entries.push(format!("routes::{plural}::validate_{field_name}"));
@@ -7201,6 +7492,52 @@ async fn main() {
         }
     }
 
+    /// Issue #1834: the shared-layout preflight is a generate-time guard only —
+    /// it must NOT fire on the `autumn destroy scaffold` / revert path, or
+    /// cleanup would hard-fail in a project whose shared `pub fn layout` is
+    /// missing or renamed (e.g. one scaffolded by an older CLI), stranding the
+    /// generated files. The revert-only plan builder must therefore succeed even
+    /// when `src/main.rs` exposes no shared 4-arg layout, while still planning
+    /// the routes file it will remove.
+    #[test]
+    fn scaffold_for_revert_succeeds_without_shared_layout() {
+        let tmp = project_with_main(main_without_layout());
+        let plan = plan_scaffold_with_options_for_revert(
+            tmp.path(),
+            "Post",
+            &["title:String".into()],
+            "20260427000000",
+            &ScaffoldOptions::default(),
+        )
+        .expect("destroy scaffold must build its revert plan without a shared layout");
+        // Sanity: it still plans the HTML routes file a normal scaffold would, so
+        // `Plan::revert` has something to remove.
+        assert!(
+            plan.actions.iter().any(|a| {
+                a.path()
+                    .display()
+                    .to_string()
+                    .replace('\\', "/")
+                    .ends_with("src/routes/posts.rs")
+            }),
+            "revert plan should still include the HTML routes file it will remove"
+        );
+
+        // And the generate path over the SAME project still fails fast — the
+        // guard is bypassed only for revert, never weakened for generation.
+        let err = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &["title:String".into()],
+            "20260427000000",
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, GenerateError::Config(ref msg) if msg.contains("pub fn layout")),
+            "generate path must still reject a missing shared layout: {err:?}"
+        );
+    }
+
     /// Issue #1130, AC 4: live scaffolds emit their OWN private 3-arg
     /// `fn layout` and never call `crate::layout`, so the shared-layout
     /// preflight must not run for them. Scaffolding `--live` into an app with
@@ -8710,7 +9047,8 @@ async fn main() {
 
     #[test]
     fn repository_notes_sharded() {
-        let rendered = render_repository_file("Account", "account", &[], false, false, true, false);
+        let rendered =
+            render_repository_file("Account", "account", &[], false, false, true, false, false);
         assert!(
             rendered.contains("shard-aware"),
             "sharded repository doc must mention shard-aware: {rendered}"
@@ -8723,7 +9061,8 @@ async fn main() {
 
     #[test]
     fn repository_notes_api_sharded_caveat() {
-        let rendered = render_repository_file("Account", "account", &[], false, true, true, false);
+        let rendered =
+            render_repository_file("Account", "account", &[], false, true, true, false, false);
         assert!(
             rendered.contains("control pool"),
             "sharded api repository doc must note control pool: {rendered}"
@@ -8732,7 +9071,8 @@ async fn main() {
 
     #[test]
     fn repository_no_sharded_note_when_not_sharded() {
-        let rendered = render_repository_file("Post", "post", &[], false, false, false, false);
+        let rendered =
+            render_repository_file("Post", "post", &[], false, false, false, false, false);
         assert!(
             !rendered.contains("shard-aware"),
             "non-sharded repository must not mention shard-aware: {rendered}"
@@ -8850,6 +9190,459 @@ async fn main() {
         assert!(
             !routes.contains("ul id=\"posts-list\""),
             "still uses ul: {routes}"
+        );
+    }
+
+    /// Issue #1319 AC4: with `--searchable` omitted, threading an empty
+    /// `searchable` set through the generator produces output byte-for-byte
+    /// identical to today's default scaffold (the flag is purely additive).
+    #[test]
+    fn searchable_omitted_is_byte_identical_to_default() {
+        let fields = ["title:String".to_string(), "body:Text".to_string()];
+
+        let tmp_default = project_with_main(default_main());
+        plan_scaffold(tmp_default.path(), "Post", &fields, "20260427000000")
+            .unwrap()
+            .execute(Flags::default())
+            .unwrap();
+
+        let tmp_empty = project_with_main(default_main());
+        plan_scaffold_with_options(
+            tmp_empty.path(),
+            "Post",
+            &fields,
+            "20260427000000",
+            &ScaffoldOptions {
+                model: ModelOptions {
+                    searchable: Vec::new(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .execute(Flags::default())
+        .unwrap();
+
+        for rel in [
+            "src/routes/posts.rs",
+            "src/models/post.rs",
+            "src/repositories/post.rs",
+            "migrations/20260427000000_create_posts/up.sql",
+            "migrations/20260427000000_create_posts/down.sql",
+            "src/main.rs",
+        ] {
+            let a = fs::read_to_string(tmp_default.path().join(rel)).unwrap();
+            let b = fs::read_to_string(tmp_empty.path().join(rel)).unwrap();
+            assert_eq!(a, b, "empty --searchable must not change `{rel}`");
+            assert!(
+                !b.contains("searchable")
+                    && !b.contains("active_search")
+                    && !b.contains("search_vector"),
+                "non-searchable `{rel}` must carry no FTS artifacts:\n{b}"
+            );
+        }
+    }
+
+    /// Issue #1319 AC5: naming a non-text field in `--searchable` fails
+    /// generation with a clear, field-naming error rather than emitting a model
+    /// that won't compile.
+    #[test]
+    fn searchable_non_text_field_is_rejected() {
+        let tmp = project_with_main(default_main());
+        let err = plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "views:i64".into()],
+            "20260427000000",
+            &ScaffoldOptions {
+                model: ModelOptions {
+                    searchable: vec!["views".into()],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            matches!(err, GenerateError::Config(_)),
+            "expected Config error, got: {err:?}"
+        );
+        assert!(
+            msg.contains("views") && (msg.contains("text") || msg.contains("String")),
+            "error must name the offending field and mention text-only: {msg}"
+        );
+    }
+
+    /// Issue #1319: a `--searchable` scaffold with a uuid primary key is
+    /// rejected before any files are written. The scaffold command already gates
+    /// off ALL uuid primary keys (the `#[repository]` REST API is i64-only), so
+    /// this combination surfaces that broader gate; a metadata-layer guard in
+    /// `parse_model_metadata` (see `model.rs`) is the defense-in-depth backstop
+    /// specific to the FTS `search_page` i64 hardcoding.
+    #[test]
+    fn searchable_with_uuid_primary_key_is_rejected() {
+        let tmp = project_with_main(default_main());
+        let err = plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "body:Text".into()],
+            "20260427000000",
+            &ScaffoldOptions {
+                model: ModelOptions {
+                    searchable: vec!["title".into(), "body".into()],
+                    id_type: IdType::Uuid,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, GenerateError::Config(_)),
+            "expected Config error, got: {err:?}"
+        );
+        assert!(
+            err.to_string().to_lowercase().contains("uuid"),
+            "error must name uuid as unsupported: {err}"
+        );
+        // No files written: the scaffold plan fails before touching the tree.
+        assert!(
+            !tmp.path().join("src/models/post.rs").exists()
+                && !tmp.path().join("src/repositories/post.rs").exists(),
+            "rejected uuid+searchable scaffold must not write any files"
+        );
+    }
+
+    /// Issue #1319 security guard: `--searchable` on an owner-scoped model is
+    /// rejected before any files are written. The owner-scoped index is
+    /// `#[secured]` and filters to the current user, but the FTS `search_page`
+    /// is unscoped, so the `/search` endpoint would leak other users' rows.
+    #[test]
+    fn searchable_with_owner_scoped_model_is_rejected() {
+        let tmp = project_with_main(default_main());
+        // `user_id` is an owner column, so the default policy makes the index
+        // owner-scoped (`authorize_wiring`). Pairing that with `--searchable`
+        // must be refused.
+        let err = plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &[
+                "user_id:i64".into(),
+                "title:String".into(),
+                "body:Text".into(),
+            ],
+            "20260427000000",
+            &ScaffoldOptions {
+                model: ModelOptions {
+                    searchable: vec!["title".into(), "body".into()],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            matches!(err, GenerateError::Config(_)),
+            "expected Config error, got: {err:?}"
+        );
+        assert!(
+            msg.contains("--searchable")
+                && msg.contains("owner-scoped")
+                && msg.contains("search_page"),
+            "error must explain the owner-scoped FTS leak: {msg}"
+        );
+        // No files written: the scaffold plan fails before touching the tree.
+        assert!(
+            !tmp.path().join("src/models/post.rs").exists()
+                && !tmp.path().join("src/repositories/post.rs").exists(),
+            "rejected owner-scoped +searchable scaffold must not write any files"
+        );
+    }
+
+    /// The owner-scoped guard is scoped to owner scoping: `--no-policy` opts out
+    /// of the secured index, so `--searchable` with an owner column is allowed
+    /// (index and search are both unscoped — consistent, no leak relative to the
+    /// list view).
+    #[test]
+    fn searchable_with_owner_column_but_no_policy_is_allowed() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &[
+                "user_id:i64".into(),
+                "title:String".into(),
+                "body:Text".into(),
+            ],
+            "20260427000000",
+            &ScaffoldOptions {
+                model: ModelOptions {
+                    searchable: vec!["title".into(), "body".into()],
+                    ..Default::default()
+                },
+                no_policy: true,
+                ..Default::default()
+            },
+        );
+        assert!(
+            plan.is_ok(),
+            "--searchable + owner column + --no-policy must be allowed: {plan:?}"
+        );
+    }
+
+    /// Issue #1319 AC5: naming a field that does not exist in `--searchable`
+    /// fails generation with a clear error.
+    #[test]
+    fn searchable_unknown_field_is_rejected() {
+        let tmp = project_with_main(default_main());
+        let err = plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String".into()],
+            "20260427000000",
+            &ScaffoldOptions {
+                model: ModelOptions {
+                    searchable: vec!["nope".into()],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, GenerateError::Config(_)),
+            "expected Config error, got: {err:?}"
+        );
+        assert!(
+            err.to_string().contains("nope"),
+            "must name the field: {err}"
+        );
+    }
+
+    /// Issue #1319 AC1/AC3/AC6: a `--searchable` scaffold wires the model,
+    /// repository, migration, and index/search route coherently.
+    #[test]
+    fn searchable_scaffold_wires_model_repo_and_index() {
+        let tmp = project_with_main(default_main());
+        plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "body:Text".into()],
+            "20260427000000",
+            &ScaffoldOptions {
+                model: ModelOptions {
+                    searchable: vec!["title".into(), "body".into()],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .execute(Flags::default())
+        .unwrap();
+
+        let model = fs::read_to_string(tmp.path().join("src/models/post.rs")).unwrap();
+        assert!(
+            model.contains("#[searchable(language = \"english\")]"),
+            "model must opt into search: {model}"
+        );
+        assert!(
+            model.contains("#[searchable(weight = \"A\")]")
+                && model.contains("#[searchable(weight = \"B\")]"),
+            "each named text field must be weighted: {model}"
+        );
+
+        let repo = fs::read_to_string(tmp.path().join("src/repositories/post.rs")).unwrap();
+        assert!(
+            repo.contains("api = \"/api/posts\", searchable)"),
+            "repository must carry `searchable`: {repo}"
+        );
+
+        let up = fs::read_to_string(
+            tmp.path()
+                .join("migrations/20260427000000_create_posts/up.sql"),
+        )
+        .unwrap();
+        assert!(
+            up.contains("search_vector tsvector") && up.contains("USING gin(search_vector)"),
+            "migration must add the generated column + GIN index: {up}"
+        );
+
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+        // Input-only `active_search_input` (the composite `active_search` would
+        // render its own empty results container — a duplicate id).
+        assert!(
+            routes.contains("active_search_input(\"post-search\"")
+                && !routes.contains("widgets::active_search(\"post-search\"")
+                && routes.contains("\"/posts/search\", \"#posts-search-results\""),
+            "index must render the input-only search box wired to the results route: {routes}"
+        );
+        // The `active_search` target must exist as a real element that renders
+        // the initial list server-side (no `.initial_load()` AJAX round-trip, no
+        // `<noscript>` fallback wrapper), exactly once on the index page.
+        assert!(
+            routes.contains("div id=\"posts-search-results\"")
+                && !routes.contains(".initial_load(")
+                && !routes.contains("noscript"),
+            "index must render the results container server-side without initial_load/noscript: {routes}"
+        );
+        let index_fn = routes
+            .split("pub async fn index(")
+            .nth(1)
+            .and_then(|s| s.split("pub async fn ").next())
+            .expect("an index handler must be emitted");
+        assert_eq!(
+            index_fn.matches("id=\"posts-search-results\"").count(),
+            1,
+            "the index page must render the results container exactly once: {index_fn}"
+        );
+        assert!(
+            routes.contains("pub async fn search(")
+                && routes.contains("repo.search_page(q, &page_req)"),
+            "a search results handler must call search_page: {routes}"
+        );
+        // The results pager must preserve the request query (so `q` survives
+        // pagination) instead of pointing at a bare `/posts/search`.
+        assert!(
+            routes.contains("PagerOptions::new(\"/posts/search\").query(pager_query)"),
+            "search pager must preserve the query string across pages: {routes}"
+        );
+        assert!(
+            routes.contains("repo.page(&page_req).await?"),
+            "empty q must fall back to page(): {routes}"
+        );
+
+        let main_rs = fs::read_to_string(tmp.path().join("src/main.rs")).unwrap();
+        assert!(
+            main_rs.contains("routes::posts::search"),
+            "search route must be registered in main.rs: {main_rs}"
+        );
+    }
+
+    /// Issue #1319: `search_vector` is a stored generated column, so it must NOT
+    /// leak into `schema.rs` or the model struct (the macro loads rows by id).
+    #[test]
+    fn searchable_column_is_not_in_schema_or_struct() {
+        let tmp = project_with_main(default_main());
+        plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "body:Text".into()],
+            "20260427000000",
+            &ScaffoldOptions {
+                model: ModelOptions {
+                    searchable: vec!["title".into(), "body".into()],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .execute(Flags::default())
+        .unwrap();
+        let schema = fs::read_to_string(tmp.path().join("src/schema.rs")).unwrap();
+        let model = fs::read_to_string(tmp.path().join("src/models/post.rs")).unwrap();
+        assert!(
+            !schema.contains("search_vector"),
+            "search_vector must not be in schema.rs: {schema}"
+        );
+        assert!(
+            !model.contains("pub search_vector"),
+            "search_vector must not be a struct field: {model}"
+        );
+    }
+
+    /// Issue #1319: the search box is gated off for `--live` variants (the SSE
+    /// `<ul>` OOB contract differs), but the model/repository/migration still
+    /// receive `searchable`.
+    #[test]
+    fn searchable_search_box_gated_off_for_live() {
+        let tmp = project_with_main(default_main());
+        plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "body:Text".into()],
+            "20260427000000",
+            &ScaffoldOptions {
+                model: ModelOptions {
+                    searchable: vec!["title".into(), "body".into()],
+                    ..Default::default()
+                },
+                live: true,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .execute(Flags::default())
+        .unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+        assert!(
+            !routes.contains("active_search(")
+                && !routes.contains("active_search_input(")
+                && !routes.contains("pub async fn search("),
+            "live variant must not emit a search box: {routes}"
+        );
+        let repo = fs::read_to_string(tmp.path().join("src/repositories/post.rs")).unwrap();
+        assert!(
+            repo.contains(", searchable)"),
+            "live repo must still carry searchable: {repo}"
+        );
+    }
+
+    #[test]
+    fn kind_is_sortable_excludes_blobs_and_enums() {
+        // #1126: only kinds the model macro emits a sort arm for get a
+        // `.sortable(..)` header — otherwise the link would be a dead affordance.
+        assert!(kind_is_sortable(FieldKind::String));
+        assert!(kind_is_sortable(FieldKind::Text));
+        assert!(kind_is_sortable(FieldKind::I32));
+        assert!(kind_is_sortable(FieldKind::I64));
+        assert!(kind_is_sortable(FieldKind::Bool));
+        assert!(kind_is_sortable(FieldKind::F64));
+        assert!(kind_is_sortable(FieldKind::Uuid));
+        assert!(kind_is_sortable(FieldKind::DateTime));
+        assert!(kind_is_sortable(FieldKind::References));
+        assert!(kind_is_sortable(FieldKind::Decimal {
+            precision: 12,
+            scale: 2
+        }));
+        // Excluded: binary blobs and closed-set enums.
+        assert!(!kind_is_sortable(FieldKind::Bytea));
+        assert!(!kind_is_sortable(FieldKind::Attachment));
+        assert!(!kind_is_sortable(FieldKind::Enum));
+    }
+
+    #[test]
+    fn index_wires_allowlisted_sort_filter() {
+        // #1126: the generated index extracts ListQuery, calls repo.list, and
+        // marks scalar columns sortable with a symmetric data_table config.
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &[
+                "title:String".into(),
+                "body:Text".into(),
+                "published:bool".into(),
+            ],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+        assert!(routes.contains("list_query: ListQuery,"), "{routes}");
+        assert!(
+            routes.contains("repo.list(&list_query, &page_req)"),
+            "{routes}"
+        );
+        assert!(routes.contains(".sortable(\"id\")"), "{routes}");
+        assert!(routes.contains(".sortable(\"title\")"), "{routes}");
+        assert!(
+            routes.contains(".active_dir(list_query.direction())"),
+            "{routes}"
         );
     }
 
