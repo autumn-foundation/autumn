@@ -335,13 +335,55 @@ pub fn plan_scaffold(
 /// # Errors
 /// Surfaces any planning error from the underlying model generation as well
 /// as project-layout, repository query, and metadata problems.
-#[allow(clippy::too_many_lines)]
 pub fn plan_scaffold_with_options(
     project_root: &Path,
     name: &str,
     field_tokens: &[String],
     timestamp: &str,
     options: &ScaffoldOptions,
+) -> Result<Plan, GenerateError> {
+    // Generation path: run the full plan, including the shared-layout preflight.
+    // `autumn destroy scaffold` recomputes the identical plan before reverting
+    // it, and must bypass that generate-only preflight (issue #1834); it reaches
+    // the builder through `plan_scaffold_with_options_for_revert` instead.
+    plan_scaffold_with_options_impl(project_root, name, field_tokens, timestamp, options, false)
+}
+
+/// Compute the file actions for `autumn destroy scaffold …`.
+///
+/// Identical to [`plan_scaffold_with_options`] except it recomputes the plan for
+/// the revert path: it skips the generate-only shared-layout preflight so
+/// cleanup still succeeds in a project whose shared `pub fn layout` is missing or
+/// renamed (e.g. one scaffolded by an older CLI, or one whose `layout` was since
+/// renamed). `autumn destroy scaffold` reverts the returned plan; the preflight
+/// would otherwise hard-fail the destroy before any generated file is removed,
+/// stranding the files it is meant to remove (issue #1834).
+///
+/// # Errors
+/// Same as [`plan_scaffold_with_options`], minus the shared-layout preflight.
+pub fn plan_scaffold_with_options_for_revert(
+    project_root: &Path,
+    name: &str,
+    field_tokens: &[String],
+    timestamp: &str,
+    options: &ScaffoldOptions,
+) -> Result<Plan, GenerateError> {
+    plan_scaffold_with_options_impl(project_root, name, field_tokens, timestamp, options, true)
+}
+
+/// Shared implementation of [`plan_scaffold_with_options`]. `for_revert`
+/// suppresses the generate-only shared-layout preflight so `autumn destroy
+/// scaffold` (which recomputes this same plan before [`Plan::revert`]) can
+/// remove generated files even in a project whose shared `pub fn layout` is
+/// missing or renamed — a regression the preflight would otherwise introduce.
+#[allow(clippy::too_many_lines)]
+fn plan_scaffold_with_options_impl(
+    project_root: &Path,
+    name: &str,
+    field_tokens: &[String],
+    timestamp: &str,
+    options: &ScaffoldOptions,
+    for_revert: bool,
 ) -> Result<Plan, GenerateError> {
     ensure_project_root(project_root)?;
     // Gate: UUID primary keys are not yet supported for scaffolds. Every scaffold
@@ -552,7 +594,11 @@ pub fn plan_scaffold_with_options(
         // private `fn layout` and never call `crate::layout`, so an app without
         // a shared layout must not block them. This mirrors the renderer's
         // `shared_layout = !live && !live_validation`.
-        if !options_with_key.live && !options_with_key.live_validation {
+        //
+        // `for_revert` additionally skips the preflight on the `autumn destroy
+        // scaffold` path: it recomputes this plan before reverting it, and the
+        // generate-only guard must not hard-fail cleanup (issue #1834).
+        if !options_with_key.live && !options_with_key.live_validation && !for_revert {
             // Issue #1130: scaffolded HTML views render through the application's
             // shared `crate::layout`, so the target app must expose one with the
             // matching signature. Detect it by looking for a `pub fn layout` in
@@ -7199,6 +7245,52 @@ async fn main() {
             }
             other => panic!("expected an actionable Config error, got: {other:?}"),
         }
+    }
+
+    /// Issue #1834: the shared-layout preflight is a generate-time guard only —
+    /// it must NOT fire on the `autumn destroy scaffold` / revert path, or
+    /// cleanup would hard-fail in a project whose shared `pub fn layout` is
+    /// missing or renamed (e.g. one scaffolded by an older CLI), stranding the
+    /// generated files. The revert-only plan builder must therefore succeed even
+    /// when `src/main.rs` exposes no shared 4-arg layout, while still planning
+    /// the routes file it will remove.
+    #[test]
+    fn scaffold_for_revert_succeeds_without_shared_layout() {
+        let tmp = project_with_main(main_without_layout());
+        let plan = plan_scaffold_with_options_for_revert(
+            tmp.path(),
+            "Post",
+            &["title:String".into()],
+            "20260427000000",
+            &ScaffoldOptions::default(),
+        )
+        .expect("destroy scaffold must build its revert plan without a shared layout");
+        // Sanity: it still plans the HTML routes file a normal scaffold would, so
+        // `Plan::revert` has something to remove.
+        assert!(
+            plan.actions.iter().any(|a| {
+                a.path()
+                    .display()
+                    .to_string()
+                    .replace('\\', "/")
+                    .ends_with("src/routes/posts.rs")
+            }),
+            "revert plan should still include the HTML routes file it will remove"
+        );
+
+        // And the generate path over the SAME project still fails fast — the
+        // guard is bypassed only for revert, never weakened for generation.
+        let err = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &["title:String".into()],
+            "20260427000000",
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, GenerateError::Config(ref msg) if msg.contains("pub fn layout")),
+            "generate path must still reject a missing shared layout: {err:?}"
+        );
     }
 
     /// Issue #1130, AC 4: live scaffolds emit their OWN private 3-arg
