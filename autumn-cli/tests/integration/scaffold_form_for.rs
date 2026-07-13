@@ -412,6 +412,70 @@ fn scaffold_attachment_emits_zero_js_multipart_handlers() {
     assert!(cargo.contains("multipart"), "{cargo}");
 }
 
+/// AC6: a scaffold with an attachment column emits a generated write-path test
+/// that performs a zero-JS multipart create and asserts the blob key is bound
+/// on the persisted record. Follows the #1127 in-process style (no database,
+/// so it runs green without Docker): the emitted test drives the real
+/// `Multipart` extractor + `save_to_blob_store` against a real `LocalBlobStore`
+/// and asserts the bound blob key is non-empty. This is a string-shape check;
+/// `generated_attachment_scaffold_multipart_test_passes` actually runs it.
+#[test]
+fn scaffold_attachment_emits_generated_multipart_write_path_test() {
+    let (_tmp, project) = scaffold_project(
+        "attach-wp-app",
+        "Photo",
+        &["caption:String", "image:Attachment"],
+    );
+    // The generated write-path test lives in the resource's `tests/<snake>.rs`.
+    let test_src = fs::read_to_string(project.join("tests/photo.rs")).unwrap();
+
+    // A dedicated, non-ignored multipart write-path test exists (the
+    // `#[tokio::test]` sits directly on the fn, with no `#[ignore]` between
+    // them, so it runs green without Docker).
+    assert!(
+        test_src.contains("#[tokio::test]\nasync fn photos_multipart_upload_binds_blob_key() {"),
+        "multipart write-path test must be a runnable, non-ignored tokio test: {test_src}"
+    );
+
+    // It builds a real blob store, drives a real multipart create through the
+    // real `save_to_blob_store` path, and asserts the blob key is bound.
+    assert!(test_src.contains("LocalBlobStore::new("), "{test_src}");
+    assert!(
+        test_src.contains("BlobStoreState::new(blob_store.clone())"),
+        "{test_src}"
+    );
+    assert!(
+        test_src.contains("multipart/form-data; boundary=BOUND"),
+        "{test_src}"
+    );
+    assert!(
+        test_src.contains(".save_to_blob_store(&*store, key).await?"),
+        "{test_src}"
+    );
+    assert!(
+        test_src.contains("the attachment column must bind a non-empty blob key"),
+        "{test_src}"
+    );
+    // The uploaded bytes are read back out of the store at the bound key.
+    assert!(
+        test_src.contains("store_handle") && test_src.contains(".get(&bound.key)"),
+        "{test_src}"
+    );
+
+    // A plain (non-attachment) scaffold must NOT get the multipart write-path
+    // test — the #1127 in-memory CRUD test is unchanged there.
+    let (_tmp2, plain) = scaffold_project("plain-wp-app", "Article", &["title:String"]);
+    let plain_src = fs::read_to_string(plain.join("tests/article.rs")).unwrap();
+    assert!(
+        !plain_src.contains("multipart_upload_binds_blob_key"),
+        "{plain_src}"
+    );
+    assert!(
+        plain_src.contains("async fn articles_write_path_crud()"),
+        "plain scaffold keeps the #1127 write-path test: {plain_src}"
+    );
+}
+
 /// Slow end-to-end proof (issue #1236, AC7): a freshly scaffolded resource
 /// with an attachment column must `cargo check --tests` with only the
 /// auto-enabled `storage` + `multipart` features — the multipart-streaming

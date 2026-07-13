@@ -2959,9 +2959,17 @@ use crate::schema::{schema_import};",
              //! and the `create`/`update` handlers accept an `autumn_web::extract::Multipart`\n\
              //! body, stream each file part straight to the configured blob store with\n\
              //! `MultipartField::save_to_blob_store` (which enforces\n\
-             //! `security.upload.max_file_size_bytes` and returns 413 on oversize), and\n\
-             //! persist the resulting `Blob` on the record. An edit that doesn't re-upload\n\
-             //! preserves the existing attachment.\n\
+             //! `security.upload.max_file_size_bytes`, default 16 MiB), and persist the\n\
+             //! resulting `Blob` on the record. An edit that doesn't re-upload preserves\n\
+             //! the existing attachment.\n\
+             //!\n\
+             //! SIZE CEILING with CSRF on (the prod-profile default): the CSRF middleware\n\
+             //! buffers the request body only up to ~2 MiB while scanning for the form\n\
+             //! token, so a zero-JS multipart upload larger than ~2 MiB is rejected with\n\
+             //! 403 (token not found in the truncated body) BEFORE the handler's\n\
+             //! `max_file_size_bytes`/413 check can run. For files above that ceiling, use\n\
+             //! the advanced presigned direct-upload path below (it doesn't route the file\n\
+             //! bytes through the CSRF-scanned form body).\n\
              //!\n\
              //! The `storage` + `multipart` features are enabled on `autumn-web`\n\
              //! automatically; configure `[storage]` in `autumn.toml` (local disk for dev,\n\
@@ -4721,6 +4729,17 @@ fn render_smoke_test(
         base + &render_write_path_smoke_test(pascal_name, plural)
     };
 
+    // Issue #1236 (AC6): attachment scaffolds additionally get a multipart
+    // write-path test that drives a zero-JS `multipart/form-data` create through
+    // the real `Multipart` extractor, streams the uploaded file to a real
+    // `LocalBlobStore`, persists the returned `Blob` in a real Postgres row, and
+    // asserts the persisted attachment column bound a non-empty blob key.
+    let base = if !api && has_attachment_fields(fields) {
+        base + &render_attachment_multipart_write_path_smoke_test(plural, fields)
+    } else {
+        base
+    };
+
     // Issue #1125 (AC4/AC6): when the scaffold authorizes its mutating handlers
     // (owner column, standard path), also emit a cross-user 403 demonstration.
     if authorize {
@@ -5127,6 +5146,166 @@ async fn __PLURAL___write_path_crud() {
     TEMPLATE
         .replace("__PASCAL__", pascal_name)
         .replace("__PLURAL__", plural)
+}
+
+/// Render the multipart attachment write-path smoke test (issue #1236, AC6).
+///
+/// Emitted alongside [`render_write_path_smoke_test`] whenever a scaffold has at
+/// least one attachment field, and follows the same #1127 in-process style: a
+/// process-local stand-in for the persistence layer, no database required, so it
+/// runs green without Docker (unlike the `TestDb`-backed index/api smoke tests,
+/// which are `#[ignore]`d). It drives a zero-JS `multipart/form-data` create
+/// through the real [`Multipart`](autumn_web::extract::Multipart) extractor and
+/// the real `save_to_blob_store` against a real
+/// [`LocalBlobStore`](autumn_web::storage::LocalBlobStore), binds the returned
+/// `Blob` on the record, then asserts the persisted record's attachment column
+/// holds a non-empty blob key — the AC's literal requirement ("the blob key is
+/// bound") — AND that the uploaded bytes actually landed in the store at that
+/// key. The handler is an in-test stand-in (a `tests/` binary cannot import the
+/// project's own routes) that runs the SAME blob path the generated `create`
+/// handler runs.
+#[allow(clippy::too_many_lines)] // the emitted test body is one raw-string template
+fn render_attachment_multipart_write_path_smoke_test(plural: &str, fields: &[Field]) -> String {
+    const TEMPLATE: &str = r#"
+
+// ── multipart attachment write-path (issue #1236, AC6) ─────────────────────
+//
+// Follows the #1127 in-process write-path style (a process-local stand-in for
+// the persistence layer, no database required, so it runs without Docker): a
+// zero-JS `multipart/form-data` create drives the REAL `Multipart` extractor
+// and the REAL `save_to_blob_store` against a REAL `LocalBlobStore`, binds the
+// returned `Blob` on the record, and asserts the persisted record's attachment
+// column holds a non-empty blob key AND that the uploaded bytes actually landed
+// in the store at that key. The handler is an in-test stand-in (a `tests/`
+// binary cannot import the project's own routes) that runs the SAME blob path
+// the generated `create` handler runs. `TestApp::new()` disables CSRF, so the
+// hand-built body carries no `_csrf` part (the real prod form injects one).
+#[tokio::test]
+async fn __PLURAL___multipart_upload_binds_blob_key() {
+    use autumn_web::storage::local::SigningKey;
+    use autumn_web::storage::{BlobStore, BlobStoreState, LocalBlobStore};
+
+    // Process-local stand-in for the persistence layer: the attachment `Blob`
+    // bound on each created record (mirrors the `New{Pascal}.{attachment}`
+    // column the generated `create` handler sets). No database required.
+    static STORE: std::sync::Mutex<Vec<autumn_web::storage::Blob>> =
+        std::sync::Mutex::new(Vec::new());
+
+    #[post("/__PLURAL__/upload-probe")]
+    async fn create(
+        autumn_web::extract::State(state): autumn_web::extract::State<autumn_web::AppState>,
+        mut multipart: autumn_web::extract::Multipart,
+    ) -> AutumnResult<Redirect> {
+        let store = state
+            .extension::<BlobStoreState>()
+            .expect("blob store configured")
+            .store()
+            .clone();
+        while let Some(field) = multipart.next_field().await? {
+            if field.name() == Some("__ATTACH__")
+                && field.file_name().is_some_and(|name| !name.is_empty())
+            {
+                let nanos = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or_default();
+                let key = format!("__PLURAL__/__ATTACH__/{nanos}");
+                let blob = field.save_to_blob_store(&*store, key).await?;
+                STORE.lock().unwrap().push(blob);
+            }
+        }
+        Ok(Redirect::to("/__PLURAL__"))
+    }
+
+    // A real on-disk blob store so `save_to_blob_store` has a backend.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    let blob_root = std::env::temp_dir().join(format!("__PLURAL__-blob-probe-{nanos}"));
+    let blob_store = std::sync::Arc::new(
+        LocalBlobStore::new(
+            "test",
+            blob_root.clone(),
+            "/_blobs",
+            std::time::Duration::from_secs(60),
+            SigningKey::new(b"test-signing-key".to_vec()),
+            Vec::new(),
+        )
+        .expect("build local blob store"),
+    );
+    let store_handle = blob_store.clone();
+
+    let client: TestClient = TestApp::new()
+        .routes(routes![create])
+        .state_initializer(move |state| {
+            state.insert_extension(BlobStoreState::new(blob_store.clone()));
+        })
+        .build();
+
+    // Hand-built multipart body (TestClient has no `.multipart()` helper): a
+    // text part for a sibling field plus a file part for the attachment field.
+    let body = "--BOUND\r\n\
+Content-Disposition: form-data; name=\"__TEXT_FIELD__\"\r\n\r\n\
+hello\r\n\
+--BOUND\r\n\
+Content-Disposition: form-data; name=\"__ATTACH__\"; filename=\"upload.png\"\r\n\
+Content-Type: image/png\r\n\r\n\
+not-an-empty-file\r\n\
+--BOUND--\r\n";
+
+    // The multipart create succeeds and redirects (303), exactly like the real
+    // generated attachment handler.
+    client
+        .post("/__PLURAL__/upload-probe")
+        .header("content-type", "multipart/form-data; boundary=BOUND")
+        .body(body.to_owned())
+        .send()
+        .await
+        .assert_status(303)
+        .assert_header("location", "/__PLURAL__");
+
+    // The persisted record bound a non-empty blob key with the expected prefix.
+    let bound = STORE
+        .lock()
+        .unwrap()
+        .last()
+        .cloned()
+        .expect("a record was created with an attachment blob");
+    assert!(
+        !bound.key.is_empty(),
+        "the attachment column must bind a non-empty blob key"
+    );
+    assert!(
+        bound.key.starts_with("__PLURAL__/__ATTACH__/"),
+        "bound key: {}",
+        bound.key
+    );
+
+    // The uploaded bytes actually landed in the store at the bound key.
+    let stored_bytes = store_handle
+        .get(&bound.key)
+        .await
+        .expect("blob present in store at the bound key");
+    assert_eq!(&stored_bytes[..], b"not-an-empty-file");
+
+    let _ = std::fs::remove_dir_all(&blob_root);
+}
+"#;
+    let attach = fields
+        .iter()
+        .find(|f| f.kind.is_attachment())
+        .map_or("attachment", |f| f.name.as_str());
+    // A sibling non-attachment field name for a realistic mixed multipart body
+    // (a text part alongside the file part); the stand-in handler ignores it.
+    let text_field = fields
+        .iter()
+        .find(|f| !f.kind.is_attachment())
+        .map_or("note", |f| f.name.as_str());
+    TEMPLATE
+        .replace("__PLURAL__", plural)
+        .replace("__ATTACH__", attach)
+        .replace("__TEXT_FIELD__", text_field)
 }
 
 /// Render the cross-user record-level-authorization smoke test (issue #1125,
