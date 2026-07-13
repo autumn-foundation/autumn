@@ -667,7 +667,12 @@ fn collect_labels(nodes: &[Node], fors: &mut BTreeSet<String>, dynamic: &mut boo
         if let Node::Element(el) = node {
             if el.name.eq_ignore_ascii_case("label") {
                 match el.attr("for") {
-                    Some(AttrValue::Literal(v)) => {
+                    // Only a label that actually provides a name satisfies the
+                    // association: an empty `<label for=..>` contributes no
+                    // accessible name, so recording it would let an unlabeled
+                    // control pass. A dynamic (spliced) body still counts, per
+                    // the non-failing-splice convention (`label_provides_name`).
+                    Some(AttrValue::Literal(v)) if label_provides_name(el) => {
                         fors.insert(v.clone());
                     }
                     Some(AttrValue::Dynamic) => *dynamic = true,
@@ -748,13 +753,21 @@ fn check_field(
     in_named_label: bool,
     scan: &mut Scan,
 ) {
-    // `<input type=…>` variants that need no visible label.
-    if name == "input"
-        && let Some(AttrValue::Literal(ty)) = el.attr("type")
-        && ["hidden", "submit", "button", "reset", "image"]
-            .contains(&ty.to_ascii_lowercase().as_str())
-    {
-        return;
+    // `<input type=…>` handling. Literal submit/hidden/button/reset/image
+    // controls need no visible label. A spliced `type=(…)` is unresolvable —
+    // it could be one of those non-labeling types, so skip rather than misfire
+    // on valid markup (per the non-failing-splice convention).
+    if name == "input" {
+        match el.attr("type") {
+            Some(AttrValue::Literal(ty))
+                if ["hidden", "submit", "button", "reset", "image"]
+                    .contains(&ty.to_ascii_lowercase().as_str()) =>
+            {
+                return;
+            }
+            Some(AttrValue::Dynamic) => return,
+            _ => {}
+        }
     }
     if el.has_aria_name() || in_named_label {
         return;
@@ -998,6 +1011,44 @@ mod tests {
         // A spliced id cannot be matched to a label — skip rather than misfire.
         let src = wrap(r#"input type="text" id=(field_id);"#);
         assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn empty_label_for_does_not_satisfy_association() {
+        // An empty `<label for=..>` provides no accessible name, so the
+        // associated control must still be flagged (regression: false negative).
+        let src = wrap(r#"label for="email" { } input type="text" id="email";"#);
+        assert_eq!(rule_ids(&src), vec!["label"], "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn labeled_input_via_for_with_text_is_clean() {
+        // A `<label for=..>` with real text satisfies the association.
+        let src = wrap(r#"label for="email" { "Email" } input type="text" id="email";"#);
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn label_for_with_dynamic_body_is_clean() {
+        // A spliced label body is unresolvable and counts as providing a name.
+        let src = wrap(r#"label for="email" { (title) } input type="text" id="email";"#);
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn input_with_dynamic_type_is_not_flagged() {
+        // A spliced `type=(…)` is unresolvable — it may be a non-labeling type
+        // like submit/button, so skip rather than misfire (regression: false
+        // positive).
+        let src = wrap(r#"input type=(kind) value="Save";"#);
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn input_with_literal_text_type_still_flagged() {
+        // A literal text-like type with no label is still flagged.
+        let src = wrap(r#"input type="text";"#);
+        assert_eq!(rule_ids(&src), vec!["label"], "{:?}", findings_for(&src));
     }
 
     // ── Rule 3: button-name ────────────────────────────────────────────────
