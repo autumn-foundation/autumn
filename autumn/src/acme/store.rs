@@ -180,8 +180,25 @@ impl AcmeStore for FsAcmeStore {
         let key = cert.key_pem.clone().into_bytes();
         Box::pin(async move {
             ensure_dir(&dir).await?;
-            write_owner_only(&chain_path, &chain).await?;
-            write_owner_only(&key_path, &key).await
+            // Publish the pair as atomically as two files allow: STAGE both temp
+            // files fully (write + flush) BEFORE renaming EITHER into place, so a
+            // crash can only tear the pair during the two back-to-back rename
+            // syscalls rather than across a full write+flush of the key. Any
+            // residual torn state (a new chain with the old/mismatched key, or
+            // vice-versa) is still caught at load time by the renewal decision's
+            // pair validation, which treats a non-loadable pair as absent. If
+            // staging the key fails, clean up the already-staged chain temp so it
+            // does not linger.
+            let chain_tmp = stage_owner_only(&chain_path, &chain).await?;
+            let key_tmp = match stage_owner_only(&key_path, &key).await {
+                Ok(tmp) => tmp,
+                Err(e) => {
+                    let _ = tokio::fs::remove_file(&chain_tmp).await;
+                    return Err(e);
+                }
+            };
+            publish_staged(&chain_tmp, &chain_path).await?;
+            publish_staged(&key_tmp, &key_path).await
         })
     }
 }
@@ -212,14 +229,25 @@ async fn ensure_dir(dir: &Path) -> io::Result<()> {
 /// Atomically write `data` to `path` with owner-only (`0600`) permissions on
 /// Unix.
 ///
-/// Writes to a sibling `{path}.tmp` (created `0600` from the start via
-/// `OpenOptions::mode`, so it is never briefly group/other-readable — the same
-/// fail-closed discipline the unix-socket bind uses for its `0600` socket) and
-/// then `rename`s it over `path`. `rename` is atomic within a directory, so a
-/// crash mid-write can never leave a torn cert/key for the loader/reload path:
-/// `path` is either the old contents or the complete new contents, never a
-/// partial write.
+/// Stages the data to a sibling `{path}.tmp` and then `rename`s it over `path`.
+/// `rename` is atomic within a directory, so a crash mid-write can never leave a
+/// torn single file for the loader/reload path: `path` is either the old
+/// contents or the complete new contents, never a partial write.
 async fn write_owner_only(path: &Path, data: &[u8]) -> io::Result<()> {
+    let tmp = stage_owner_only(path, data).await?;
+    publish_staged(&tmp, path).await
+}
+
+/// Write `data` to a sibling `{path}.tmp` with owner-only (`0600`) permissions on
+/// Unix, flush it, and return the temp path — WITHOUT renaming it into place.
+///
+/// The temp file is created `0600` from the start via `OpenOptions::mode`, so it
+/// is never briefly group/other-readable — the same fail-closed discipline the
+/// unix-socket bind uses for its `0600` socket. Splitting staging from the final
+/// [`publish_staged`] rename lets a multi-file publish (the cert chain + its key)
+/// stage BOTH files before renaming EITHER, shrinking the window in which a crash
+/// could tear the pair down to the two back-to-back rename syscalls.
+async fn stage_owner_only(path: &Path, data: &[u8]) -> io::Result<PathBuf> {
     use tokio::io::AsyncWriteExt as _;
 
     let tmp = tmp_path(path);
@@ -242,10 +270,14 @@ async fn write_owner_only(path: &Path, data: &[u8]) -> io::Result<()> {
         use std::os::unix::fs::PermissionsExt as _;
         tokio::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600)).await?;
     }
-    // Atomic publish. On error, best-effort clean up the temp file so it does
-    // not accumulate.
-    if let Err(e) = tokio::fs::rename(&tmp, path).await {
-        let _ = tokio::fs::remove_file(&tmp).await;
+    Ok(tmp)
+}
+
+/// Atomically publish a staged temp file by renaming it over `path`. On error,
+/// best-effort clean up the temp file so it does not accumulate.
+async fn publish_staged(tmp: &Path, path: &Path) -> io::Result<()> {
+    if let Err(e) = tokio::fs::rename(tmp, path).await {
+        let _ = tokio::fs::remove_file(tmp).await;
         return Err(e);
     }
     Ok(())
@@ -358,6 +390,37 @@ mod tests {
         assert!(production.load_cert(&id).await.unwrap().is_none());
         // The staging store still finds its own cert.
         assert_eq!(staging.load_cert(&id).await.unwrap(), Some(staging_cert));
+    }
+
+    #[tokio::test]
+    async fn save_cert_publishes_both_files_without_leftover_temps() {
+        // The staged-then-rename publish must leave BOTH files in place and no
+        // `.tmp` siblings behind (regression for the atomic-pair-publish change).
+        let dir = tempfile::tempdir().unwrap();
+        let store = FsAcmeStore::new(dir.path(), "staging");
+        let id = CertId::from_domains(&["app.example.com".into()]);
+        store
+            .save_cert(
+                &id,
+                &StoredCert {
+                    chain_pem: "CHAIN".into(),
+                    key_pem: "KEY".into(),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(store.chain_path(&id).exists(), "chain must be published");
+        assert!(store.key_path(&id).exists(), "key must be published");
+
+        let mut entries = tokio::fs::read_dir(store.cert_dir()).await.unwrap();
+        while let Some(entry) = entries.next_entry().await.unwrap() {
+            let name = entry.file_name();
+            assert!(
+                !name.to_string_lossy().ends_with(".tmp"),
+                "no staged temp file should linger, found {name:?}"
+            );
+        }
     }
 
     #[cfg(unix)]

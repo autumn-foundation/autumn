@@ -374,7 +374,18 @@ impl AcmeRenewalTask {
         coordinator: &Arc<dyn SchedulerCoordinator>,
         reporter: &ReporterFn,
     ) {
-        // No stored cert (still on the placeholder) → always due.
+        // Every tick, BEFORE the renewal decision, hot-swap in a newer/healthier
+        // stored certificate if one has appeared. When another replica (or an
+        // out-of-band tool) persists a fresh cert to the shared/local store, a
+        // process that did not issue it must adopt it immediately — otherwise a
+        // follower keeps serving the placeholder or a stale in-memory cert until
+        // its own renew window opens (which, for a freshly-renewed cert, is up to
+        // a full renew-before period away). Adoption never downgrades: it only
+        // swaps to a strictly-newer, fully-loadable pair.
+        self.adopt_stored_cert_if_newer().await;
+
+        // No stored cert (still on the placeholder), or a torn/mismatched pair
+        // that does not load → treated as absent → always due.
         let due = self.stored_not_after().await.is_none_or(|not_after| {
             needs_renewal(not_after, self.config.renew_before_days, now_unix())
         });
@@ -465,13 +476,37 @@ impl AcmeRenewalTask {
         }
     }
 
-    /// The stored certificate's leaf `notAfter`, if one is persisted.
+    /// The stored certificate's leaf `notAfter`, if a *usable* pair is persisted.
+    ///
+    /// Returns the expiry ONLY when the full chain+key pair loads as a valid
+    /// [`CertifiedKey`](rustls::sign::CertifiedKey). A torn write (a new chain
+    /// left with the old/mismatched key by a crash between `save_cert`'s two
+    /// renames — or observed mid-write by another reader), or any otherwise
+    /// malformed pair, is treated as ABSENT (`None`) rather than trusting the
+    /// future-dated-but-unusable chain: otherwise `maybe_renew` would see a
+    /// healthy far-future `notAfter`, decide renewal is not due, and stay stuck on
+    /// the placeholder/old cert until the wrong chain finally entered its renew
+    /// window. `None` here makes the renewal decision proceed instead.
     async fn stored_not_after(&self) -> Option<i64> {
         let stored = self.store.load_cert(&self.cert_id).await.ok().flatten()?;
+        // Validate the FULL pair (same load/validation path the resolver uses) so
+        // a mismatched or malformed pair is detected and counts as absent.
+        crate::tls::certified_key_from_pem(
+            stored.chain_pem.as_bytes(),
+            stored.key_pem.as_bytes(),
+            &self.provider,
+        )
+        .ok()?;
         crate::tls::leaf_not_after_from_pem(stored.chain_pem.as_bytes()).ok()
     }
 
-    /// If a shared store holds a newer certificate than we serve, adopt it.
+    /// If the store holds a strictly-newer, fully-loadable certificate than we
+    /// currently serve, adopt it into the resolver.
+    ///
+    /// Only swaps when the stored pair loads as a valid `CertifiedKey` AND its
+    /// leaf `notAfter` is strictly later than the currently-served cert's (or we
+    /// have no served expiry recorded yet) — it never downgrades to an older cert
+    /// and never swaps in a torn/mismatched pair.
     async fn adopt_stored_cert_if_newer(&self) {
         let Some(stored) = self.store.load_cert(&self.cert_id).await.ok().flatten() else {
             return;
@@ -480,7 +515,7 @@ impl AcmeRenewalTask {
             return;
         };
         let serving = self.status.snapshot().cert_not_after_unix;
-        if serving != Some(not_after)
+        if serving.is_none_or(|current| not_after > current)
             && let Ok(certified) = crate::tls::certified_key_from_pem(
                 stored.chain_pem.as_bytes(),
                 stored.key_pem.as_bytes(),
@@ -489,7 +524,7 @@ impl AcmeRenewalTask {
         {
             self.resolver.store(certified);
             self.status.set_cert_not_after(not_after);
-            tracing::info!("adopted a newer ACME certificate from the shared store");
+            tracing::info!("adopted a newer ACME certificate from the store");
         }
     }
 
@@ -1086,6 +1121,169 @@ mod tests {
         assert!(
             captured.lock().unwrap().is_empty(),
             "single-replica path must not report a degraded failure"
+        );
+    }
+
+    /// Build a real, loadable self-signed cert for `app.example.com` (matching
+    /// the `CertId` `degraded_test_task` uses) valid until `year-month-day`.
+    /// Returns the stored pair and its leaf `notAfter` in UNIX seconds.
+    fn cert_valid_until_ymd(year: i32, month: u8, day: u8) -> (StoredCert, i64) {
+        use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair, date_time_ymd};
+        let key = KeyPair::generate().expect("keypair");
+        let mut params =
+            CertificateParams::new(vec!["app.example.com".to_owned()]).expect("params");
+        params.not_before = date_time_ymd(2020, 1, 1);
+        params.not_after = date_time_ymd(year, month, day);
+        let mut dn = DistinguishedName::new();
+        dn.push(DnType::CommonName, "app.example.com");
+        params.distinguished_name = dn;
+        let cert = params.self_signed(&key).expect("self-sign");
+        let stored = StoredCert {
+            chain_pem: cert.pem(),
+            key_pem: key.serialize_pem(),
+        };
+        let not_after = crate::tls::leaf_not_after_from_pem(stored.chain_pem.as_bytes())
+            .expect("leaf notAfter parses");
+        (stored, not_after)
+    }
+
+    /// A torn stored pair: a valid, future-dated chain paired with a FRESH,
+    /// MISMATCHED key (as a crash between `save_cert`'s two renames would leave —
+    /// a new chain with the old/unrelated key).
+    fn torn_cert_future() -> StoredCert {
+        let (valid, _) = cert_valid_until_ymd(2200, 1, 1);
+        let other = rcgen::KeyPair::generate().expect("mismatched keypair");
+        StoredCert {
+            chain_pem: valid.chain_pem,
+            key_pem: other.serialize_pem(),
+        }
+    }
+
+    // FIX 1 (#1608, Codex P2): a strictly-newer, fully-loadable stored cert is
+    // hot-swapped into the resolver on adoption, independent of whether renewal
+    // is due — so a follower / a process that did not issue picks it up at once.
+    #[tokio::test]
+    async fn adopt_swaps_in_a_strictly_newer_stored_cert() {
+        let (task, _dir, status) = degraded_test_task(false);
+        let initial = task.resolver.current();
+        let (newer, newer_na) = cert_valid_until_ymd(2200, 1, 1);
+        // The served baseline is OLDER than the stored cert.
+        status.set_cert_not_after(newer_na - 100 * DAY);
+        task.store.save_cert(&task.cert_id, &newer).await.unwrap();
+
+        task.adopt_stored_cert_if_newer().await;
+
+        assert!(
+            !Arc::ptr_eq(&task.resolver.current(), &initial),
+            "a strictly-newer stored cert must be swapped into the resolver"
+        );
+        assert_eq!(status.snapshot().cert_not_after_unix, Some(newer_na));
+    }
+
+    // FIX 1: adoption must never DOWNGRADE — an older stored cert than the one we
+    // serve is left in place.
+    #[tokio::test]
+    async fn adopt_does_not_downgrade_to_an_older_stored_cert() {
+        let (task, _dir, status) = degraded_test_task(false);
+        let initial = task.resolver.current();
+        let (older, older_na) = cert_valid_until_ymd(2100, 1, 1);
+        // The served baseline is NEWER than the stored cert.
+        let served = older_na + 100 * DAY;
+        status.set_cert_not_after(served);
+        task.store.save_cert(&task.cert_id, &older).await.unwrap();
+
+        task.adopt_stored_cert_if_newer().await;
+
+        assert!(
+            Arc::ptr_eq(&task.resolver.current(), &initial),
+            "must not downgrade to an older stored cert"
+        );
+        assert_eq!(
+            status.snapshot().cert_not_after_unix,
+            Some(served),
+            "served expiry must be unchanged"
+        );
+    }
+
+    // FIX 1: no stored cert at all → nothing to adopt, resolver untouched.
+    #[tokio::test]
+    async fn adopt_no_swap_when_store_is_empty() {
+        let (task, _dir, status) = degraded_test_task(false);
+        let initial = task.resolver.current();
+        status.set_cert_not_after(1_000_000_000);
+
+        task.adopt_stored_cert_if_newer().await;
+
+        assert!(Arc::ptr_eq(&task.resolver.current(), &initial));
+        assert_eq!(status.snapshot().cert_not_after_unix, Some(1_000_000_000));
+    }
+
+    // FIX 1 (integration): `maybe_renew` adopts a newer stored cert on a tick even
+    // when renewal is NOT due — and, because the adopted cert is far from expiry,
+    // it does NOT proceed to leader election / ordering.
+    #[tokio::test]
+    async fn maybe_renew_adopts_newer_cert_without_ordering_when_not_due() {
+        let (task, _dir, status) = degraded_test_task(false);
+        let initial = task.resolver.current();
+        let (newer, newer_na) = cert_valid_until_ymd(2200, 1, 1);
+        status.set_cert_not_after(newer_na - 100 * DAY);
+        task.store.save_cert(&task.cert_id, &newer).await.unwrap();
+
+        let reporter: ReporterFn = Arc::new(|_| {});
+        let acquired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let coordinator: Arc<dyn SchedulerCoordinator> = Arc::new(RecordingCoordinator {
+            acquired: Arc::clone(&acquired),
+        });
+
+        task.maybe_renew(&coordinator, &reporter).await;
+
+        // The newer cert was adopted into the resolver...
+        assert!(
+            !Arc::ptr_eq(&task.resolver.current(), &initial),
+            "maybe_renew must adopt a newer stored cert every tick"
+        );
+        assert_eq!(status.snapshot().cert_not_after_unix, Some(newer_na));
+        // ...and renewal was NOT due, so the coordinator was never consulted.
+        assert!(
+            !acquired.load(std::sync::atomic::Ordering::SeqCst),
+            "adoption must not trigger ordering when renewal is not due"
+        );
+    }
+
+    // FIX 2 (#1608, Codex P2): a torn/mismatched stored pair (valid future-dated
+    // chain + wrong key) must count as ABSENT for the renewal decision, so a
+    // follower does not treat the unusable future-dated chain as healthy and
+    // stall on the placeholder/old cert.
+    #[tokio::test]
+    async fn stored_not_after_is_absent_for_a_torn_pair() {
+        let (task, _dir, _status) = degraded_test_task(false);
+        let torn = torn_cert_future();
+        // The chain alone parses a future notAfter (the trap the old code fell
+        // into)...
+        assert!(
+            crate::tls::leaf_not_after_from_pem(torn.chain_pem.as_bytes()).is_ok(),
+            "precondition: the torn chain is itself a valid, future-dated leaf"
+        );
+        task.store.save_cert(&task.cert_id, &torn).await.unwrap();
+
+        // ...but the renewal decision treats the unusable PAIR as absent.
+        assert!(
+            task.stored_not_after().await.is_none(),
+            "a torn/mismatched pair must count as absent for the renewal decision"
+        );
+    }
+
+    // FIX 2: a valid matching pair reports its expiry normally (healthy path).
+    #[tokio::test]
+    async fn stored_not_after_is_present_for_a_valid_pair() {
+        let (task, _dir, _status) = degraded_test_task(false);
+        let (valid, na) = cert_valid_until_ymd(2200, 1, 1);
+        task.store.save_cert(&task.cert_id, &valid).await.unwrap();
+
+        assert_eq!(
+            task.stored_not_after().await,
+            Some(na),
+            "a valid matching pair reports its leaf notAfter normally"
         );
     }
 }
