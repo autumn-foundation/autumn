@@ -3,7 +3,7 @@
 //! Each primitive can only be constructed with an accessible name, and only a
 //! labeled `TextField` can be rendered — these are exactly those forms.
 
-use autumn_web::a11y::{Button, ButtonType, Img, TextField};
+use autumn_web::a11y::{Button, ButtonType, Img, Link, MenuItem, TextField};
 use autumn_web::html;
 use maud::Render;
 
@@ -35,4 +35,25 @@ fn main() {
     // aria-label and aria-labelledby are equally valid labeling strategies.
     let _search = TextField::new("q").aria_label("Search").render();
     let _named = TextField::new("q").labelled_by("search-heading").render();
+
+    // Link carries its visible text as the accessible name; href + text are both
+    // required.
+    let _about = Link::new("/about", "About us").class("nav").render();
+
+    // A link opening in a new tab sets rel="noopener noreferrer".
+    let _docs = Link::new("https://example.com", "Docs").new_tab().render();
+
+    // Icon-only link routes the accessible name to aria-label.
+    let glyph = html! { span aria-hidden="true" { "gh" } };
+    let _github = Link::icon("https://example.com", glyph, "GitHub").render();
+
+    // Menu item defaults to a button with role="menuitem".
+    let _settings = MenuItem::new("Settings").render();
+
+    // A menu item with an href renders as a link-style item.
+    let _home = MenuItem::new("Home").href("/").render();
+
+    // Icon-only menu item keeps its accessible name via aria-label.
+    let cog = html! { span aria-hidden="true" { "*" } };
+    let _icon_item = MenuItem::new("Settings").icon(cog).class("item").render();
 }

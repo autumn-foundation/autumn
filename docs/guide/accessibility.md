@@ -437,10 +437,12 @@ Each primitive implements `maud::Render`, so it splices straight into an
 | ------------ | ----------------------------------------------------------- | ------------------------------------------------ |
 | `Img`        | 1.1.1 Non-text Content                                      | `alt` is a required constructor argument         |
 | `Button`     | 4.1.2 Name, Role, Value                                     | accessible name is a required constructor argument |
+| `Link`       | 2.4.4 Link Purpose (In Context) / 4.1.2 Name, Role, Value  | link text is a required constructor argument     |
+| `MenuItem`   | 4.1.2 Name, Role, Value                                     | accessible name is a required constructor argument (renders `role="menuitem"`) |
 | `TextField`  | 1.3.1 Info and Relationships / 3.3.2 Labels / 4.1.2         | only a *labeled* field can be rendered (typestate) |
 
 ```rust
-use autumn_web::a11y::{Button, Img, TextField};
+use autumn_web::a11y::{Button, Img, Link, MenuItem, TextField};
 use autumn_web::html;
 
 let page = html! {
@@ -449,8 +451,17 @@ let page = html! {
     (TextField::new("email").input_type("email").label("Email address"))
     (Button::icon(html! { span aria-hidden="true" { "🗑" } }, "Delete"))
     (Button::new("Save").submit())
+    (Link::new("/about", "About us"))                       // link text required
+    (Link::new("https://example.com", "Docs").new_tab())    // rel="noopener noreferrer"
+    (MenuItem::new("Settings"))                             // role="menuitem", name required
+    (MenuItem::new("Home").href("/"))                       // link-style menu item
 };
 ```
+
+`Link::new` takes the visible link text as a required argument (an icon-only
+link routes its name to `aria-label` via `Link::icon`), and `MenuItem::new`
+requires the accessible name, emitting `role="menuitem"` on a `<button>` by
+default or an `<a>` when an `.href(..)` is attached.
 
 ### Red build → fix → green build
 
@@ -461,6 +472,14 @@ the typed primitives it does not:
 // error[E0061]: this function takes 2 arguments but 1 argument was supplied
 let _ = Img::new("/logo.png");
 
+// error[E0061]: this function takes 2 arguments but 1 argument was supplied
+//        — a link with no text has no accessible name
+let _ = Link::new("/about");
+
+// error[E0061]: this function takes 1 argument but 0 arguments were supplied
+//        — a menu item must carry an accessible name
+let _ = MenuItem::new();
+
 // error: no method named `render` found for `TextField<NoLabel>`
 //        — an unlabeled field cannot be turned into markup
 let _ = TextField::new("email").render();
@@ -470,6 +489,8 @@ let _ = TextField::new("email").render();
 
 ```rust
 let _ = Img::new("/logo.png", "Company logo");            // ✅ compiles
+let _ = Link::new("/about", "About us");                  // ✅ compiles
+let _ = MenuItem::new("Settings");                        // ✅ compiles
 let _ = TextField::new("email").label("Email").render();  // ✅ compiles
 ```
 

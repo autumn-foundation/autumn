@@ -17,6 +17,13 @@
 //! - [`Button`] — WCAG 4.1.2 Name, Role, Value. The accessible name is a
 //!   required argument; an icon-only button routes it to `aria-label` via
 //!   [`Button::icon`].
+//! - [`Link`] — WCAG 2.4.4 Link Purpose (In Context) / 4.1.2 Name, Role, Value.
+//!   The link text is a required argument of [`Link::new`]; an icon-only link
+//!   routes its name to `aria-label` via [`Link::icon`]. There is no text-less
+//!   constructor.
+//! - [`MenuItem`] — WCAG 4.1.2 Name, Role, Value. A menu item carries an
+//!   explicit `role="menuitem"` and a required accessible name from
+//!   [`MenuItem::new`]; an icon-only item routes that name to `aria-label`.
 //! - [`TextField`] — WCAG 1.3.1 Info and Relationships / 3.3.2 Labels or
 //!   Instructions / 4.1.2 Name, Role, Value. A [`TextField<NoLabel>`] has no
 //!   way to render; only after a label is attached (producing a
@@ -248,6 +255,209 @@ impl Render for Button {
                         aria-label=(self.accessible_name)
                         class=[self.class.as_deref()] {
                         (icon)
+                    }
+                }
+            },
+        )
+    }
+}
+
+/// A hyperlink with a mandatory accessible name (WCAG 2.4.4 Link Purpose (In
+/// Context) / 4.1.2 Name, Role, Value).
+///
+/// [`Link::new`] takes the visible link text as a required positional argument,
+/// so a text-less link cannot be built. [`Link::icon`] builds an icon-only link
+/// whose accessible name becomes an `aria-label`. There is no name-less
+/// constructor.
+#[derive(Debug, Clone)]
+pub struct Link {
+    href: String,
+    accessible_name: String,
+    icon: Option<Markup>,
+    class: Option<String>,
+    new_tab: bool,
+}
+
+impl Link {
+    /// Build a link with visible text, which is also its accessible name. Both
+    /// the `href` and the `text` are required.
+    ///
+    /// ```rust
+    /// use autumn_web::a11y::Link;
+    /// use maud::Render;
+    ///
+    /// let markup = Link::new("/about", "About us").render().into_string();
+    /// assert!(markup.contains("href=\"/about\""));
+    /// assert!(markup.contains(">About us<"));
+    /// ```
+    pub fn new(href: impl Into<String>, text: impl Into<String>) -> Self {
+        Self {
+            href: href.into(),
+            accessible_name: text.into(),
+            icon: None,
+            class: None,
+            new_tab: false,
+        }
+    }
+
+    /// Build an icon-only link. The `accessible_name` becomes the link's
+    /// `aria-label`, since the icon carries no text for assistive technology.
+    ///
+    /// ```rust
+    /// use autumn_web::a11y::Link;
+    /// use autumn_web::html;
+    /// use maud::Render;
+    ///
+    /// let glyph = html! { span aria-hidden="true" { "gh" } };
+    /// let markup = Link::icon("https://example.com", glyph, "GitHub")
+    ///     .render()
+    ///     .into_string();
+    /// assert!(markup.contains("aria-label=\"GitHub\""));
+    /// ```
+    pub fn icon(href: impl Into<String>, icon: Markup, accessible_name: impl Into<String>) -> Self {
+        Self {
+            href: href.into(),
+            accessible_name: accessible_name.into(),
+            icon: Some(icon),
+            class: None,
+            new_tab: false,
+        }
+    }
+
+    /// Open the link in a new browsing context (`target="_blank"`), adding
+    /// `rel="noopener noreferrer"` so the opened page cannot reach back through
+    /// `window.opener`.
+    #[must_use]
+    pub const fn new_tab(mut self) -> Self {
+        self.new_tab = true;
+        self
+    }
+
+    /// Set the `class` attribute.
+    #[must_use]
+    pub fn class(mut self, class: impl Into<String>) -> Self {
+        self.class = Some(class.into());
+        self
+    }
+}
+
+impl Render for Link {
+    fn render(&self) -> Markup {
+        let target = self.new_tab.then_some("_blank");
+        let rel = self.new_tab.then_some("noopener noreferrer");
+        self.icon.as_ref().map_or_else(
+            || {
+                html! {
+                    a href=(self.href) target=[target] rel=[rel] class=[self.class.as_deref()] {
+                        (self.accessible_name)
+                    }
+                }
+            },
+            |icon| {
+                html! {
+                    a
+                        href=(self.href)
+                        aria-label=(self.accessible_name)
+                        target=[target]
+                        rel=[rel]
+                        class=[self.class.as_deref()] {
+                        (icon)
+                    }
+                }
+            },
+        )
+    }
+}
+
+/// An interactive menu item with a mandatory accessible name and an explicit
+/// `role="menuitem"` (WCAG 4.1.2 Name, Role, Value).
+///
+/// [`MenuItem::new`] takes the visible label as a required argument. By default
+/// the item renders as a `<button type="button" role="menuitem">`; attaching an
+/// [`href`](MenuItem::href) renders it as an `<a role="menuitem">` instead.
+/// Adding an [`icon`](MenuItem::icon) routes the accessible name to
+/// `aria-label`, so an icon-only item can never ship without a name. There is
+/// no name-less constructor.
+#[derive(Debug, Clone)]
+pub struct MenuItem {
+    accessible_name: String,
+    href: Option<String>,
+    icon: Option<Markup>,
+    class: Option<String>,
+}
+
+impl MenuItem {
+    /// Build a menu item with a visible label, which is also its accessible
+    /// name. The label is required.
+    ///
+    /// ```rust
+    /// use autumn_web::a11y::MenuItem;
+    /// use maud::Render;
+    ///
+    /// let markup = MenuItem::new("Settings").render().into_string();
+    /// assert!(markup.contains("role=\"menuitem\""));
+    /// assert!(markup.contains(">Settings<"));
+    /// ```
+    pub fn new(accessible_name: impl Into<String>) -> Self {
+        Self {
+            accessible_name: accessible_name.into(),
+            href: None,
+            icon: None,
+            class: None,
+        }
+    }
+
+    /// Render the item as a link (`<a role="menuitem" href=…>`) rather than the
+    /// default button.
+    #[must_use]
+    pub fn href(mut self, href: impl Into<String>) -> Self {
+        self.href = Some(href.into());
+        self
+    }
+
+    /// Add a leading icon. The visible label from [`MenuItem::new`] moves to
+    /// `aria-label`, keeping the accessible name intact for icon-only items.
+    #[must_use]
+    pub fn icon(mut self, icon: Markup) -> Self {
+        self.icon = Some(icon);
+        self
+    }
+
+    /// Set the `class` attribute.
+    #[must_use]
+    pub fn class(mut self, class: impl Into<String>) -> Self {
+        self.class = Some(class.into());
+        self
+    }
+}
+
+impl Render for MenuItem {
+    fn render(&self) -> Markup {
+        // An icon-only item routes its accessible name to `aria-label`; a text
+        // item renders the name as visible content.
+        let aria_label = self.icon.is_some().then_some(self.accessible_name.as_str());
+        self.href.as_deref().map_or_else(
+            || {
+                html! {
+                    button
+                        type="button"
+                        role="menuitem"
+                        aria-label=[aria_label]
+                        class=[self.class.as_deref()] {
+                        @match &self.icon {
+                            Some(icon) => (icon),
+                            None => (self.accessible_name),
+                        }
+                    }
+                }
+            },
+            |href| {
+                html! {
+                    a href=(href) role="menuitem" aria-label=[aria_label] class=[self.class.as_deref()] {
+                        @match &self.icon {
+                            Some(icon) => (icon),
+                            None => (self.accessible_name),
+                        }
                     }
                 }
             },

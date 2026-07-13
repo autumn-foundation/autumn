@@ -59,6 +59,10 @@ fn compile_fail_tests() {
     t.compile_fail("tests/compile-fail/a11y_button_missing_name.rs");
     #[cfg(feature = "maud")]
     t.compile_fail("tests/compile-fail/a11y_textfield_unlabeled.rs");
+    #[cfg(feature = "maud")]
+    t.compile_fail("tests/compile-fail/a11y_link_missing_text.rs");
+    #[cfg(feature = "maud")]
+    t.compile_fail("tests/compile-fail/a11y_menuitem_missing_name.rs");
 }
 
 #[test]
