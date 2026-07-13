@@ -504,9 +504,19 @@ impl<'a> MultipartField<'a> {
     }
 
     /// Uploaded file name (if this field represents a file).
+    ///
+    /// An empty `filename=""` is normalized to `None`: an optional file input
+    /// that was left blank submits a part with an empty filename and a 0-byte
+    /// body, which represents an absent file rather than a real upload (see
+    /// issue #1873). Handlers that distinguish uploads via
+    /// `field.file_name().is_some()` therefore correctly treat such a part as
+    /// "no file provided" instead of persisting a zero-byte file. This
+    /// normalization does not relax MIME enforcement: a `filename=""` part with
+    /// a NON-empty body is still sniffed and enforced (that carve-out reads the
+    /// raw axum filename during `next_field`, not this getter).
     #[must_use]
     pub fn file_name(&self) -> Option<&str> {
-        self.inner.file_name()
+        self.inner.file_name().filter(|name| !name.is_empty())
     }
 
     /// Declared MIME type for this field.
