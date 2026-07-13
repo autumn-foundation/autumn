@@ -47,9 +47,21 @@ pub fn upcase(s: &str) -> String {
 }
 
 /// Trim and collapse every internal run of whitespace to a single ASCII space.
+///
+/// ⚡ Bolt: Optimization - Avoids an intermediate `Vec` allocation by pushing words
+/// directly into a pre-allocated `String` buffer.
 #[must_use]
 pub fn squish(s: &str) -> String {
-    s.split_whitespace().collect::<Vec<_>>().join(" ")
+    let mut out = String::with_capacity(s.len());
+    let mut words = s.split_whitespace();
+    if let Some(w) = words.next() {
+        out.push_str(w);
+    }
+    for w in words {
+        out.push(' ');
+        out.push_str(w);
+    }
+    out
 }
 
 /// A type whose `#[normalize]` columns can be canonicalized in place.
