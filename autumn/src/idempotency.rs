@@ -1834,17 +1834,42 @@ where
 
 #[allow(
     clippy::unwrap_used,
-    reason = "infallible: response built from stored record status/headers/body"
+    reason = "infallible: response built from static status/body"
 )]
+fn corrupted_replay_record_response() -> Response<Body> {
+    Response::builder()
+        .status(StatusCode::INTERNAL_SERVER_ERROR)
+        .body(Body::from(
+            "stored idempotency replay record is invalid or corrupted",
+        ))
+        .unwrap()
+}
+
 fn response_from_record(record: IdempotencyRecord) -> Response<Body> {
     let mut builder = Response::builder().status(record.status);
     for (name, value) in &record.headers {
         builder = builder.header(name.as_str(), value.as_slice());
     }
-    builder
+    // The status, header names/values, and body all originate from the
+    // idempotency store, which may be a custom or corrupted backend. An
+    // invalid stored status (e.g. `0` or `> 999`) or invalid header bytes
+    // makes the builder stash an error that surfaces here. A corrupted replay
+    // record must not crash request handling: fall back to an internal-error
+    // response instead of panicking.
+    match builder
         .header(X_IDEMPOTENT_REPLAYED, "true")
         .body(Body::from(record.body))
-        .unwrap()
+    {
+        Ok(response) => response,
+        Err(error) => {
+            tracing::error!(
+                error = %error,
+                "Stored idempotency replay record produced an invalid response; \
+                 returning 500 instead of replaying"
+            );
+            corrupted_replay_record_response()
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2287,5 +2312,47 @@ mod tests {
             observed.1,
             expected_storage_key("POST", "/payments", None, "pay-once")
         );
+    }
+
+    #[test]
+    fn corrupted_stored_record_does_not_panic_on_replay() {
+        // A store backend (custom or corrupted) can hand back a record whose
+        // stored status is out of the valid HTTP range and whose headers carry
+        // invalid bytes. Replaying it must not panic — it must surface an
+        // internal-error response instead.
+        let corrupted = IdempotencyRecord {
+            status: 1000,
+            headers: vec![("inv\nalid".to_owned(), vec![0x00, 0x0a])],
+            body: b"stored body".to_vec(),
+            metadata: Vec::new(),
+        };
+
+        let response = IdempotencyReplayResponse { record: corrupted }.into_response();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "a corrupted replay record must fall back to a 500 recovery response"
+        );
+        assert!(
+            response.headers().get(X_IDEMPOTENT_REPLAYED).is_none(),
+            "the recovery response must not masquerade as a successful replay"
+        );
+    }
+
+    #[test]
+    fn invalid_stored_status_alone_does_not_panic_on_replay() {
+        // Even with otherwise-valid headers, an out-of-range status byte must
+        // not crash replay handling.
+        let corrupted = IdempotencyRecord {
+            status: 0,
+            headers: vec![("content-type".to_owned(), b"text/plain".to_vec())],
+            body: b"stored body".to_vec(),
+            metadata: Vec::new(),
+        };
+
+        let response = response_from_record(corrupted);
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 }
