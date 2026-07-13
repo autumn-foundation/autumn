@@ -3718,6 +3718,34 @@ impl AppBuilder {
                         ))
                     }
                 };
+
+            // HTTP-01 ACME is single-host in this slice: the token map is
+            // per-process and the store is local disk. A distributed scheduler
+            // backend means a multi-replica deployment, where the CA's :80
+            // validation can hit a replica without the token (404) and
+            // non-leaders cannot adopt certs from the non-shared store. Warn
+            // loudly rather than silently mis-serving. See #1620.
+            //
+            // Keyed off the configured backend (operator intent) rather than the
+            // built coordinator, so the warning still fires when
+            // `coordinator_from_config` fell back to in-process after a Postgres
+            // error — exactly the case where the fleet is multi-replica but this
+            // process degraded. Exhaustive `matches!` is compiler-enforced if a
+            // new distributed backend variant is added.
+            if !matches!(
+                config.scheduler.backend,
+                crate::config::SchedulerBackend::InProcess
+            ) {
+                tracing::warn!(
+                    scheduler_backend = coordinator.backend(),
+                    "ACME HTTP-01 validation is not fleet-safe with the local on-disk token \
+                     store: behind a load balancer the CA's :80 challenge may reach a replica \
+                     without the token (404), and non-leader replicas cannot adopt issued \
+                     certificates from a non-shared store. Run ACME on a single host, or use a \
+                     shared token store / DNS-01 (#1620)"
+                );
+            }
+
             #[cfg(feature = "reporting")]
             let reporter = make_acme_reporter(acme_reporters);
             #[cfg(not(feature = "reporting"))]

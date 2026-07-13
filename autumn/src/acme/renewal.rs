@@ -256,6 +256,56 @@ pub struct AcmeRenewalTask {
     pub serving_stored_cert: bool,
 }
 
+/// RAII guard tracking the HTTP-01 tokens published for one order.
+///
+/// Every token handed to [`PublishedTokens::publish`] is inserted into the
+/// shared [`Http01Tokens`] map immediately and removed again when the guard
+/// drops — so no matter which `?` in the order flow returns `Err`, published
+/// tokens never leak into the map to accumulate across repeated failures.
+struct PublishedTokens<'a> {
+    tokens: &'a Http01Tokens,
+    published: Vec<String>,
+}
+
+impl<'a> PublishedTokens<'a> {
+    const fn new(tokens: &'a Http01Tokens) -> Self {
+        Self {
+            tokens,
+            published: Vec::new(),
+        }
+    }
+
+    /// Publish `token → key_authorization` and track it for cleanup on drop.
+    fn publish(&mut self, token: String, key_authorization: String) {
+        self.tokens.insert(token.clone(), key_authorization);
+        self.published.push(token);
+    }
+}
+
+impl Drop for PublishedTokens<'_> {
+    fn drop(&mut self) {
+        for token in &self.published {
+            self.tokens.remove(token);
+        }
+    }
+}
+
+/// Decide whether the boot-time immediate order should fire, given the
+/// `notAfter` of the stored leaf we would serve (`None` while still on the
+/// self-signed placeholder — i.e. no real cert yet).
+///
+/// Fires when there is no real stored certificate yet OR the stored leaf is
+/// already inside its renew-before window (including already expired) —
+/// otherwise a loadable but dead/expiring stored cert would be served for up to
+/// [`RENEWAL_CHECK_INTERVAL`] before the first scheduled check renews it.
+///
+/// Pure and injectable (`now_unix`) so the decision is unit-testable without the
+/// network, mirroring [`needs_renewal`].
+#[must_use]
+fn due_at_boot(stored_not_after: Option<i64>, renew_before_days: u32, now_unix: i64) -> bool {
+    stored_not_after.is_none_or(|not_after| needs_renewal(not_after, renew_before_days, now_unix))
+}
+
 impl AcmeRenewalTask {
     /// Run the renewal loop until `shutdown` fires.
     ///
@@ -271,8 +321,17 @@ impl AcmeRenewalTask {
         reporter: ReporterFn,
         shutdown: tokio_util::sync::CancellationToken,
     ) {
-        // Immediate check on boot: issue if we have no real cert yet.
-        if !self.serving_stored_cert {
+        // Immediate check on boot: order now if we have no real cert yet, or the
+        // stored cert we would serve is already inside its renew-before window
+        // (or expired). Without the latter, a loadable-but-expired stored cert
+        // sets `serving_stored_cert = true` and we would serve a dead cert for
+        // up to `RENEWAL_CHECK_INTERVAL` before the first scheduled renewal.
+        let stored_not_after = if self.serving_stored_cert {
+            self.stored_not_after().await
+        } else {
+            None
+        };
+        if due_at_boot(stored_not_after, self.config.renew_before_days, now_unix()) {
             self.try_renew_once(&coordinator, &reporter).await;
         }
 
@@ -399,8 +458,12 @@ impl AcmeRenewalTask {
             .await
             .map_err(|e| format!("failed to create ACME order: {e}"))?;
 
-        // Publish an HTTP-01 response for each pending authorization.
-        let mut published: Vec<String> = Vec::new();
+        // Publish an HTTP-01 response for each pending authorization. The RAII
+        // guard removes every published token from the shared map on ALL exit
+        // paths (early `?` inside this scope, the `poll_ready` error below, or
+        // normal completion), so a transient failure cannot leak tokens that
+        // accumulate across repeated renewal attempts.
+        let mut published = PublishedTokens::new(&self.tokens);
         {
             let mut authorizations = order.authorizations();
             while let Some(result) = authorizations.next().await {
@@ -414,21 +477,22 @@ impl AcmeRenewalTask {
                     .ok_or_else(|| "authorization offered no http-01 challenge".to_owned())?;
                 let token = challenge.token.clone();
                 let key_auth = challenge.key_authorization().as_str().to_owned();
-                self.tokens.insert(token.clone(), key_auth);
+                // Publish BEFORE signalling ready so the CA can fetch it — and
+                // track it in the guard so a failing `set_ready` still cleans up.
+                published.publish(token, key_auth);
                 challenge
                     .set_ready()
                     .await
                     .map_err(|e| format!("failed to signal challenge ready: {e}"))?;
-                published.push(token);
             }
         }
 
-        // Wait for the order to become ready, then clean up published tokens.
-        let poll = order.poll_ready(&RetryPolicy::default()).await;
-        for token in &published {
-            self.tokens.remove(token);
-        }
-        let status = poll.map_err(|e| format!("order did not become ready: {e}"))?;
+        // Wait for the order to become ready. The guard clears published tokens
+        // when it drops at the end of `issue`, on both the error and Ok paths.
+        let status = order
+            .poll_ready(&RetryPolicy::default())
+            .await
+            .map_err(|e| format!("order did not become ready: {e}"))?;
         if status != OrderStatus::Ready {
             return Err(format!("ACME order ended in unexpected state {status:?}"));
         }
@@ -624,5 +688,55 @@ mod tests {
         status.record_failure(now, "never issued");
         let indicator = AcmeHealthIndicator::new(status, 30);
         assert_eq!(indicator.grade(now).status, HealthStatus::Down);
+    }
+
+    #[test]
+    fn published_tokens_are_cleared_on_error_path() {
+        // Simulate an order body that publishes N tokens and then returns Err
+        // (e.g. `set_ready` or `poll_ready` failing). The guard must leave the
+        // shared token map empty rather than leaking the published tokens.
+        let tokens = Http01Tokens::new();
+        // The inner block scopes the guard: it drops at the closing brace, just
+        // as the guard in `issue` drops when that function returns `Err`.
+        let outcome: Result<(), String> = {
+            let mut published = PublishedTokens::new(&tokens);
+            published.publish("token-a".to_owned(), "key-a".to_owned());
+            published.publish("token-b".to_owned(), "key-b".to_owned());
+            // Both are visible while the order is in flight.
+            assert_eq!(tokens.get("token-a").as_deref(), Some("key-a"));
+            assert_eq!(tokens.get("token-b").as_deref(), Some("key-b"));
+            Err("simulated failure after publishing".to_owned())
+        };
+
+        assert!(outcome.is_err());
+        // Every published token was removed on the error path.
+        assert!(tokens.get("token-a").is_none());
+        assert!(tokens.get("token-b").is_none());
+    }
+
+    #[test]
+    fn published_tokens_are_cleared_on_success_path() {
+        let tokens = Http01Tokens::new();
+        {
+            let mut published = PublishedTokens::new(&tokens);
+            published.publish("token-a".to_owned(), "key-a".to_owned());
+            assert_eq!(tokens.get("token-a").as_deref(), Some("key-a"));
+        }
+        assert!(tokens.get("token-a").is_none());
+    }
+
+    #[test]
+    fn due_at_boot_matrix() {
+        let now = 1_000_000_000;
+        // No real cert yet (still on the placeholder) → order immediately.
+        assert!(due_at_boot(None, 30, now));
+        // Serving a healthy stored cert (60 days out) → no immediate order.
+        assert!(!due_at_boot(Some(now + 60 * DAY), 30, now));
+        // Serving a stored cert already inside its renew-before window (5 days
+        // out, 30-day window) → order immediately.
+        assert!(due_at_boot(Some(now + 5 * DAY), 30, now));
+        // Serving a loadable-but-EXPIRED stored cert → order immediately (the
+        // bug: previously this waited a full check interval serving a dead cert).
+        assert!(due_at_boot(Some(now - DAY), 30, now));
     }
 }

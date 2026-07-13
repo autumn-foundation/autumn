@@ -4089,8 +4089,15 @@ fn resolve_acme_stored_cert_data(cache_dir: &std::path::Path) -> TlsDoctorData {
     }
 }
 
-/// Find the most-recently-modified `<id>.chain.pem` in `cache_dir` that has a
-/// sibling `<id>.key.pem`, returning both paths.
+/// Find the most-recently-modified `<id>.chain.pem` with a sibling
+/// `<id>.key.pem`, returning both paths.
+///
+/// The store namespaces certificates under a per-directory subdirectory
+/// (`{cache_dir}/{directory-label}/<id>.chain.pem`, see [`FsAcmeStore`]), so
+/// this scans `cache_dir` itself **and** its immediate subdirectories and picks
+/// the newest matching pair across all of them.
+///
+/// [`FsAcmeStore`]: autumn_web::acme::store::FsAcmeStore
 fn newest_acme_cert_pair(
     cache_dir: &std::path::Path,
 ) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
@@ -4099,24 +4106,42 @@ fn newest_acme_cert_pair(
         std::path::PathBuf,
         std::path::PathBuf,
     )> = None;
-    for entry in std::fs::read_dir(cache_dir).ok()?.flatten() {
-        let chain = entry.path();
-        let Some(name) = chain.file_name().and_then(|n| n.to_str()) else {
-            continue;
-        };
-        let Some(id) = name.strip_suffix(".chain.pem") else {
-            continue;
-        };
-        let key = cache_dir.join(format!("{id}.key.pem"));
-        if !key.exists() {
-            continue;
+
+    // Search `cache_dir` and each immediate subdirectory (the per-directory
+    // namespaces: `staging/`, `production/`, `custom-<hash>/`).
+    let mut search_dirs = vec![cache_dir.to_path_buf()];
+    if let Ok(entries) = std::fs::read_dir(cache_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                search_dirs.push(path);
+            }
         }
-        let mtime = entry
-            .metadata()
-            .and_then(|m| m.modified())
-            .unwrap_or(std::time::UNIX_EPOCH);
-        if best.as_ref().is_none_or(|(t, _, _)| mtime >= *t) {
-            best = Some((mtime, chain, key));
+    }
+
+    for dir in search_dirs {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let chain = entry.path();
+            let Some(name) = chain.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            let Some(id) = name.strip_suffix(".chain.pem") else {
+                continue;
+            };
+            let key = dir.join(format!("{id}.key.pem"));
+            if !key.exists() {
+                continue;
+            }
+            let mtime = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .unwrap_or(std::time::UNIX_EPOCH);
+            if best.as_ref().is_none_or(|(t, _, _)| mtime >= *t) {
+                best = Some((mtime, chain, key));
+            }
         }
     }
     best.map(|(_, chain, key)| (chain, key))

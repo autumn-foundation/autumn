@@ -4689,6 +4689,16 @@ impl TlsConfig {
 /// Automatic ACME (Let's Encrypt) certificate provisioning settings (issue
 /// #1608). Present under `[server.tls.acme]`.
 ///
+/// # Deployment scope
+///
+/// HTTP-01 ACME here is **single-host**: the challenge-token map is per-process
+/// in-memory and certificates are stored on local disk, so behind a load
+/// balancer the CA's `:80` validation can hit a replica without the token
+/// (→ 404) and non-leader replicas cannot adopt a cert from a non-shared store.
+/// Single-replica deployments are fully correct; multi-replica needs a shared
+/// token store or DNS-01 (tracked in #1620). Configuring ACME alongside a
+/// distributed scheduler backend logs a startup warning.
+///
 /// # `autumn.toml` example
 ///
 /// ```toml

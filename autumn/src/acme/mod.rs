@@ -22,6 +22,22 @@
 //!   and the [`AcmeStatus`](renewal::AcmeStatus) /
 //!   [`AcmeHealthIndicator`](renewal::AcmeHealthIndicator) observability seam.
 //!
+//! # Deployment scope: single-host in this slice
+//!
+//! HTTP-01 ACME as shipped here is **single-host**. The renewal loop
+//! leader-elects correctly across a fleet (so only one replica *orders* per
+//! certificate), but the HTTP-01 token map ([`challenge::Http01Tokens`]) is
+//! per-process in-memory and the only [`store::AcmeStore`] is the local-disk
+//! [`store::FsAcmeStore`]. Behind a load balancer, the CA's `:80` validation
+//! request can therefore land on a replica that never published the token
+//! (→ 404), and non-leader replicas cannot adopt an issued certificate from a
+//! non-shared store. Single-replica deployments are fully correct.
+//!
+//! Multi-replica HTTP-01 needs a shared token store (or DNS-01), tracked in
+//! #1620. When ACME is configured alongside a distributed scheduler backend
+//! (i.e. a multi-replica deployment) the app emits a startup `warn` to this
+//! effect.
+//!
 //! The crypto backend is `ring` throughout (`instant-acme` and `rcgen` are both
 //! pinned `default-features = false` + `ring`), the SAME backend the rest of
 //! autumn-web uses — the workspace forbids a second crypto backend.
