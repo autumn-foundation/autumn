@@ -62,6 +62,13 @@ pub fn ws_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let upgrade_name = format_ident!("__autumn_ws_upgrade_{}", fn_name);
     let route_info_name = format_ident!("__autumn_route_info_{}", fn_name);
 
+    // Honor a `#[public]` marker on the handler so the route audit gate can
+    // classify this WebSocket route as `public` rather than `unclassified`.
+    // Mirrors the standard `#[get]`/`#[post]` route macro (see
+    // `crate::route`), which is the only place `is_public` was previously
+    // wired.
+    let is_public = crate::api_doc::is_public(&input_fn);
+
     // Separate user params into AppState params (supplied from extracted state)
     // and extractor params (become Axum extractors on the upgrade handler).
     let mut extractor_params = Vec::new();
@@ -150,6 +157,8 @@ pub fn ws_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     required_roles: &[],
                     register_schemas: ::core::option::Option::None,
                     api_version: ::core::option::Option::None,
+                    public: #is_public,
+                    module_path: ::core::module_path!(),
                     ..::core::default::Default::default()
                 },
                 repository: ::core::option::Option::None,
@@ -178,5 +187,60 @@ pub fn ws_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 sunset_opt_out: false,
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use quote::quote;
+
+    use super::ws_macro;
+
+    #[test]
+    fn ws_defaults_public_false() {
+        let generated = ws_macro(
+            quote! { "/echo" },
+            quote! { async fn echo() -> impl WsHandler { |socket| async move {} } },
+        )
+        .to_string();
+        assert!(
+            generated.contains("public : false"),
+            "an unannotated ws route must record public = false: {generated}"
+        );
+        // The handler's module path is captured for audit diagnostics.
+        assert!(generated.contains("module_path"));
+    }
+
+    #[test]
+    fn ws_marks_public_when_public_attribute_present() {
+        // Ordering A: `#[ws]` outermost, `#[public]` still an attribute below.
+        let generated = ws_macro(
+            quote! { "/echo" },
+            quote! {
+                #[public]
+                async fn echo() -> impl WsHandler { |socket| async move {} }
+            },
+        )
+        .to_string();
+        assert!(
+            generated.contains("public : true"),
+            "a #[public] ws route must record public = true: {generated}"
+        );
+    }
+
+    #[test]
+    fn ws_marks_public_from_expanded_marker() {
+        // Ordering B: `#[public]` written above `#[ws]`, so it expands first and
+        // injects the `__AUTUMN_PUBLIC` marker into the body; the ws route macro
+        // must recognize the marker.
+        let public_fn = crate::public::public_macro(
+            quote! {},
+            quote! { async fn echo() -> impl WsHandler { |socket| async move {} } },
+        );
+        let generated = ws_macro(quote! { "/echo" }, public_fn).to_string();
+        assert!(
+            generated.contains("public : true"),
+            "a ws route macro over an expanded #[public] marker must record public = true: {generated}"
+        );
     }
 }

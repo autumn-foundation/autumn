@@ -183,9 +183,19 @@ impl RouteInfo {
 /// [`RouteClassification::Gated`] (carrying its roles/scopes/policy); an
 /// explicit `#[public]` is [`RouteClassification::Public`]; anything left is
 /// [`RouteClassification::Unclassified`].
+///
+/// Repository auto-API routes (`#[repository(api = ..., policy = ...)]`) carry
+/// their record-level authorization guard on the route's
+/// [`RepositoryApiMeta`](crate::route::RepositoryApiMeta), *not* on the
+/// handler's [`ApiDoc`](crate::openapi::ApiDoc): the generated CRUD handlers
+/// build their `ApiDoc` with `..Default::default()` and never set
+/// `secured`/`has_policy`. So a `policy = ...` repository must be classified
+/// from `repository.has_policy` — otherwise a policy-protected CRUD endpoint
+/// would fail the audit gate as `Unclassified` despite enforcing authorization.
 fn classify(
     source: &RouteSource,
     api_doc: &crate::openapi::ApiDoc,
+    repository: Option<&crate::route::RepositoryApiMeta>,
 ) -> (RouteClassification, Vec<String>, Vec<String>, bool) {
     if matches!(source, RouteSource::Framework) {
         return (
@@ -195,7 +205,8 @@ fn classify(
             false,
         );
     }
-    if api_doc.secured || api_doc.has_policy {
+    let repo_has_policy = repository.is_some_and(|r| r.has_policy);
+    if api_doc.secured || api_doc.has_policy || repo_has_policy {
         let roles = api_doc
             .required_roles
             .iter()
@@ -210,7 +221,7 @@ fn classify(
             RouteClassification::Gated,
             roles,
             scopes,
-            api_doc.has_policy,
+            api_doc.has_policy || repo_has_policy,
         );
     }
     if api_doc.public {
@@ -293,7 +304,8 @@ pub fn collect_route_infos(
         let source = route_sources.get(i).cloned().unwrap_or(RouteSource::User);
         let (api_version, status, sunset_opt_out) =
             resolve_status(route.name, route.api_version, route.sunset_opt_out)?;
-        let (classification, roles, scopes, policy) = classify(&source, &route.api_doc);
+        let (classification, roles, scopes, policy) =
+            classify(&source, &route.api_doc, route.repository.as_ref());
         infos.push(RouteInfo {
             method: route.method.to_string(),
             path: route.path.to_owned(),
@@ -316,7 +328,8 @@ pub fn collect_route_infos(
             let full_path = join_scope_path(&group.prefix, route.path);
             let (api_version, status, sunset_opt_out) =
                 resolve_status(route.name, route.api_version, route.sunset_opt_out)?;
-            let (classification, roles, scopes, policy) = classify(&group.source, &route.api_doc);
+            let (classification, roles, scopes, policy) =
+                classify(&group.source, &route.api_doc, route.repository.as_ref());
             infos.push(RouteInfo {
                 method: route.method.to_string(),
                 path: full_path,
@@ -517,6 +530,30 @@ mod tests {
         make_route_with(method, path, name, dummy_api_doc())
     }
 
+    /// Build a [`RepositoryApiMeta`](crate::route::RepositoryApiMeta) with the
+    /// given `has_policy`, mirroring what the `#[repository]` macro emits for a
+    /// `policy = ...` (or bare) auto-API.
+    fn repo_meta(has_policy: bool) -> crate::route::RepositoryApiMeta {
+        crate::route::RepositoryApiMeta {
+            resource_type_name: "Post",
+            api_path: "/api/posts",
+            has_policy,
+            policy_check: None,
+            scope_check: None,
+        }
+    }
+
+    fn make_repo_route(
+        method: Method,
+        path: &'static str,
+        name: &'static str,
+        repository: Option<crate::route::RepositoryApiMeta>,
+    ) -> Route {
+        let mut route = make_route_with(method, path, name, dummy_api_doc());
+        route.repository = repository;
+        route
+    }
+
     fn make_route_with(
         method: Method,
         path: &'static str,
@@ -666,7 +703,7 @@ mod tests {
 
     #[test]
     fn classify_framework_source_is_framework() {
-        let (c, roles, scopes, policy) = classify(&RouteSource::Framework, &dummy_api_doc());
+        let (c, roles, scopes, policy) = classify(&RouteSource::Framework, &dummy_api_doc(), None);
         assert_eq!(c, RouteClassification::Framework);
         assert!(roles.is_empty() && scopes.is_empty() && !policy);
     }
@@ -679,7 +716,7 @@ mod tests {
             required_scopes: &["posts:write"],
             ..dummy_api_doc()
         };
-        let (c, roles, scopes, policy) = classify(&RouteSource::User, &api_doc);
+        let (c, roles, scopes, policy) = classify(&RouteSource::User, &api_doc, None);
         assert_eq!(c, RouteClassification::Gated);
         assert_eq!(roles, vec!["admin"]);
         assert_eq!(scopes, vec!["posts:write"]);
@@ -692,7 +729,7 @@ mod tests {
             has_policy: true,
             ..dummy_api_doc()
         };
-        let (c, _roles, _scopes, policy) = classify(&RouteSource::User, &api_doc);
+        let (c, _roles, _scopes, policy) = classify(&RouteSource::User, &api_doc, None);
         assert_eq!(c, RouteClassification::Gated);
         assert!(policy);
     }
@@ -703,14 +740,46 @@ mod tests {
             public: true,
             ..dummy_api_doc()
         };
-        let (c, _, _, _) = classify(&RouteSource::User, &api_doc);
+        let (c, _, _, _) = classify(&RouteSource::User, &api_doc, None);
         assert_eq!(c, RouteClassification::Public);
     }
 
     #[test]
     fn classify_unannotated_is_unclassified() {
-        let (c, _, _, _) = classify(&RouteSource::User, &dummy_api_doc());
+        let (c, _, _, _) = classify(&RouteSource::User, &dummy_api_doc(), None);
         assert_eq!(c, RouteClassification::Unclassified);
+    }
+
+    /// A repository CRUD route generated by `#[repository(api = ..., policy =
+    /// ...)]` carries its record-level authorization guard on
+    /// [`RepositoryApiMeta::has_policy`](crate::route::RepositoryApiMeta),
+    /// while its handler `ApiDoc` is left at defaults (never `secured`/
+    /// `has_policy`). Such a route must classify `Gated` — not
+    /// `Unclassified` — so the audit gate does not flag a policy-protected
+    /// endpoint as unauthenticated. (#1604)
+    #[test]
+    fn classify_repository_policy_is_gated() {
+        let repo = repo_meta(true);
+        let (c, roles, scopes, policy) =
+            classify(&RouteSource::User, &dummy_api_doc(), Some(&repo));
+        assert_eq!(c, RouteClassification::Gated);
+        assert!(
+            policy,
+            "repository has_policy must surface as policy = true"
+        );
+        assert!(roles.is_empty() && scopes.is_empty());
+    }
+
+    /// A repository route without a policy (`#[repository(api = ...)]`, no
+    /// `policy = ...`) has `has_policy == false` and stays `Unclassified`:
+    /// that unauthenticated CRUD form is exactly what the audit gate should
+    /// keep flagging. (#1604)
+    #[test]
+    fn classify_repository_without_policy_is_unclassified() {
+        let repo = repo_meta(false);
+        let (c, _, _, policy) = classify(&RouteSource::User, &dummy_api_doc(), Some(&repo));
+        assert_eq!(c, RouteClassification::Unclassified);
+        assert!(!policy);
     }
 
     /// Keystone falsifiability check (#1604) at the library level: an
@@ -743,6 +812,33 @@ mod tests {
         let route = make_route_with(Method::POST, "/widgets", "create_widget", public_doc);
         let infos = collect_route_infos(&[route], &[RouteSource::User], &[], &[]).unwrap();
         assert_eq!(infos[0].classification, RouteClassification::Public);
+    }
+
+    /// End-to-end through `collect_route_infos`: a policy-protected repository
+    /// CRUD route classifies `Gated` (carrying `policy = true`) rather than
+    /// `Unclassified`, so it does not fail the audit gate. A bare repository
+    /// route (no policy) stays `Unclassified`. (#1604)
+    #[test]
+    fn collect_repository_policy_route_is_gated() {
+        let route = make_repo_route(
+            Method::POST,
+            "/api/posts",
+            "posts_create",
+            Some(repo_meta(true)),
+        );
+        let infos = collect_route_infos(&[route], &[RouteSource::User], &[], &[]).unwrap();
+        assert_eq!(infos[0].classification, RouteClassification::Gated);
+        assert!(infos[0].policy);
+
+        let bare = make_repo_route(
+            Method::POST,
+            "/api/posts",
+            "posts_create",
+            Some(repo_meta(false)),
+        );
+        let infos = collect_route_infos(&[bare], &[RouteSource::User], &[], &[]).unwrap();
+        assert_eq!(infos[0].classification, RouteClassification::Unclassified);
+        assert!(!infos[0].policy);
     }
 
     #[test]
