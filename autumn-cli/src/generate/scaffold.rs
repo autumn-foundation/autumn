@@ -2742,14 +2742,14 @@ pub async fn index(
 /// non-htmx navigations (a bookmarked search URL, or a pager link) get a full
 /// page so search still works without JavaScript.
 #[derive(serde::Deserialize)]
-pub struct SearchQuery {{
+pub struct {pascal_name}SearchQuery {{
     #[serde(default)]
     pub q: String,
 }}
 
 #[get("/{plural}/search")]
 pub async fn search(
-    autumn_web::extract::Query(query): autumn_web::extract::Query<SearchQuery>,
+    autumn_web::extract::Query(query): autumn_web::extract::Query<{pascal_name}SearchQuery>,
     autumn_web::reexports::axum::extract::RawQuery(raw_query): autumn_web::reexports::axum::extract::RawQuery,
     page_req: PageRequest,
     hx: autumn_web::htmx::HxRequest,
