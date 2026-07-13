@@ -381,8 +381,18 @@ impl AcmeRenewalTask {
                 return;
             }
             Err(e) => {
+                // The coordinator itself errored (e.g. the Postgres advisory-lock
+                // pool is unavailable at first boot). We do NOT know whether we
+                // are the leader, so we must NOT order — but this is a real
+                // failure, not a benign "someone else leads". Record it and
+                // dispatch through the reporter (same as an issuance failure) so
+                // the health indicator does not stay `Up` while serving only the
+                // self-signed placeholder, then skip this cycle and retry next
+                // tick.
                 let msg = format!("ACME renewal leader election failed: {e}");
-                tracing::warn!("{msg}");
+                tracing::error!("{msg}");
+                self.status.record_failure(now_unix(), msg.clone());
+                reporter(msg);
                 return;
             }
         };
@@ -738,5 +748,106 @@ mod tests {
         // Serving a loadable-but-EXPIRED stored cert → order immediately (the
         // bug: previously this waited a full check interval serving a dead cert).
         assert!(due_at_boot(Some(now - DAY), 30, now));
+    }
+
+    /// A coordinator whose `try_acquire` always errors — simulates the Postgres
+    /// advisory-lock pool being unavailable at first boot.
+    struct FailingCoordinator;
+
+    impl SchedulerCoordinator for FailingCoordinator {
+        fn backend(&self) -> &'static str {
+            "failing"
+        }
+        fn replica_id(&self) -> &'static str {
+            "test-replica"
+        }
+        fn try_acquire<'a>(
+            &'a self,
+            _task_name: &'a str,
+            _tick_key: &'a str,
+            _coordination: TaskCoordination,
+        ) -> crate::scheduler::SchedulerFuture<
+            'a,
+            crate::AutumnResult<Option<crate::scheduler::SchedulerLease>>,
+        > {
+            Box::pin(async {
+                Err(crate::AutumnError::service_unavailable_msg(
+                    "advisory-lock pool unavailable",
+                ))
+            })
+        }
+    }
+
+    // Regression (#1608, Codex): when the coordinator itself errors, renewal is
+    // skipped, but the failure MUST be recorded in AcmeStatus AND dispatched to
+    // the reporter — otherwise health can stay `Up` while serving only the
+    // self-signed placeholder and operators lose the error signal.
+    #[tokio::test]
+    async fn coordinator_error_records_failure_and_reports() {
+        let domains = vec!["app.example.com".to_owned()];
+
+        // A resolver serving the self-signed placeholder (the pre-issuance state).
+        let placeholder = self_signed_placeholder(&domains).expect("placeholder builds");
+        let provider = crate::tls::crypto_provider();
+        let certified = crate::tls::certified_key_from_pem(
+            placeholder.chain_pem.as_bytes(),
+            placeholder.key_pem.as_bytes(),
+            &provider,
+        )
+        .expect("placeholder loads");
+        let resolver = Arc::new(ReloadableCertResolver::new(certified));
+
+        // The store is never touched on the coordinator-error path, but the task
+        // needs one.
+        let store_dir = tempfile::tempdir().unwrap();
+        let store: Arc<dyn AcmeStore> = Arc::new(crate::acme::store::FsAcmeStore::new(
+            store_dir.path(),
+            "staging",
+        ));
+
+        let status = AcmeStatus::new();
+        let config = AcmeConfig {
+            domains: domains.clone(),
+            contact_email: "ops@example.com".to_owned(),
+            directory: crate::config::AcmeDirectory::Staging,
+            cache_dir: store_dir.path().to_path_buf(),
+            http_challenge_port: 80,
+            renew_before_days: 30,
+        };
+        let task = AcmeRenewalTask {
+            resolver,
+            provider: crate::tls::crypto_provider(),
+            store,
+            cert_id: CertId::from_domains(&domains),
+            tokens: Http01Tokens::new(),
+            status: status.clone(),
+            config,
+            serving_stored_cert: false,
+        };
+
+        // Capture reporter invocations.
+        let captured = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let sink = Arc::clone(&captured);
+        let reporter: ReporterFn = Arc::new(move |msg| sink.lock().unwrap().push(msg));
+
+        let coordinator: Arc<dyn SchedulerCoordinator> = Arc::new(FailingCoordinator);
+        task.try_renew_once(&coordinator, &reporter).await;
+
+        // The failure is recorded in status...
+        let snap = status.snapshot();
+        let failure = snap
+            .last_failure
+            .expect("coordinator error must be recorded as a failure");
+        assert!(
+            failure.1.contains("leader election failed"),
+            "unexpected failure message: {}",
+            failure.1
+        );
+
+        // ...and dispatched through the reporter exactly once. Clone out so the
+        // mutex guard is released immediately.
+        let msgs = captured.lock().unwrap().clone();
+        assert_eq!(msgs.len(), 1, "reporter must be invoked once");
+        assert!(msgs[0].contains("leader election failed"));
     }
 }

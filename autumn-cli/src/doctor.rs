@@ -4014,6 +4014,19 @@ fn resolve_tls_doctor_data() -> TlsDoctorData {
     }
 }
 
+/// Whether the static `[server.tls]` cert/key doctor check should run.
+///
+/// It runs whenever a genuine static cert/key pair is present. It is SKIPPED
+/// only for an ACME-only deployment — `[server.tls.acme]` configured with no
+/// static `cert_path`/`key_path` — because `resolve_tls_paths()` still sees the
+/// enclosing `[server.tls]` table and would make `check_tls_impl` emit a
+/// spurious "must set both `cert_path` and `key_path`" failure, even though the
+/// runtime's `TlsConfig::validate()` accepts ACME-only. ACME deployments are
+/// graded by the dedicated `acme_stored_cert`/`acme_ports`/`acme_dns` checks.
+const fn should_run_static_tls_check(acme_configured: bool, static_cert_key_present: bool) -> bool {
+    static_cert_key_present || !acme_configured
+}
+
 /// The resolved `[server.tls.acme]` inputs the doctor needs (issue #1608).
 #[derive(Debug, Clone)]
 pub struct AcmeDoctorConfig {
@@ -4021,6 +4034,50 @@ pub struct AcmeDoctorConfig {
     pub domains: Vec<String>,
     /// Directory holding the stored account + certificates.
     pub cache_dir: std::path::PathBuf,
+    /// The per-directory subdirectory label the runtime store namespaces
+    /// certificates under (`{cache_dir}/{directory_label}/`). Derived from the
+    /// configured `acme.directory`, matching `FsAcmeStore`.
+    pub directory_label: String,
+}
+
+/// The `FsAcmeStore` subdirectory label for the configured `acme.directory`.
+///
+/// Mirrors [`autumn_web::acme::directory_label`], replicated here because that
+/// helper lives behind the `acme` feature while this doctor path also compiles
+/// in the feature-less build. Keep in sync with the store — see
+/// `autumn_web::acme::store::FsAcmeStore`, which reads/writes certificates only
+/// under `{cache_dir}/{this label}/`. Defaults to `staging` (the runtime
+/// default when `directory` is unset).
+fn acme_directory_label(acme: &toml::Table) -> String {
+    let directory = acme
+        .get("directory")
+        .cloned()
+        .and_then(|v| v.try_into::<autumn_web::config::AcmeDirectory>().ok())
+        .unwrap_or_default();
+    match directory {
+        autumn_web::config::AcmeDirectory::Staging => "staging".to_owned(),
+        autumn_web::config::AcmeDirectory::Production => "production".to_owned(),
+        // A custom URL is hashed to a short, filesystem-safe token, exactly as
+        // `autumn_web::acme::directory_label` / `short_hash` do.
+        autumn_web::config::AcmeDirectory::Custom { url } => {
+            format!("custom-{}", acme_short_hash(&url))
+        }
+    }
+}
+
+/// A short hex digest (first 8 bytes of SHA-256) of `input`.
+///
+/// Replicates `autumn_web::acme::short_hash` (feature-gated behind `acme`) so
+/// the feature-less doctor build derives the same custom-directory label.
+fn acme_short_hash(input: &str) -> String {
+    use sha2::{Digest as _, Sha256};
+    let digest = Sha256::digest(input.as_bytes());
+    let mut out = String::with_capacity(16);
+    for byte in &digest[..8] {
+        use std::fmt::Write as _;
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
 }
 
 /// Resolve `[server.tls.acme]` from the parsed `autumn.toml`, if configured.
@@ -4049,16 +4106,24 @@ fn resolve_acme_doctor_config(toml_table: Option<&toml::Table>) -> Option<AcmeDo
         .and_then(toml::Value::as_str)
         .map_or_else(|| std::path::PathBuf::from("config/acme"), Into::into);
 
-    Some(AcmeDoctorConfig { domains, cache_dir })
+    let directory_label = acme_directory_label(acme);
+
+    Some(AcmeDoctorConfig {
+        domains,
+        cache_dir,
+        directory_label,
+    })
 }
 
-/// Inspect the newest stored ACME certificate under `cache_dir` and grade its
-/// expiry, offline (reuses the #1603 `inspect_leaf` path). Returns
+/// Inspect the newest stored ACME certificate under the configured directory
+/// namespace and grade its expiry, offline (reuses the #1603 `inspect_leaf`
+/// path). `cert_dir` must be the namespaced store directory
+/// (`{cache_dir}/{directory_label}/`), NOT the bare cache dir. Returns
 /// [`TlsDoctorData::NotConfigured`] when nothing is stored yet (a first run
 /// before issuance is not a failure).
-fn resolve_acme_stored_cert_data(cache_dir: &std::path::Path) -> TlsDoctorData {
+fn resolve_acme_stored_cert_data(cert_dir: &std::path::Path) -> TlsDoctorData {
     // Find the newest `<id>.chain.pem` + matching `<id>.key.pem` pair.
-    let Some((chain, key)) = newest_acme_cert_pair(cache_dir) else {
+    let Some((chain, key)) = newest_acme_cert_pair(cert_dir) else {
         return TlsDoctorData::NotConfigured;
     };
 
@@ -4090,16 +4155,18 @@ fn resolve_acme_stored_cert_data(cache_dir: &std::path::Path) -> TlsDoctorData {
 }
 
 /// Find the most-recently-modified `<id>.chain.pem` with a sibling
-/// `<id>.key.pem`, returning both paths.
+/// `<id>.key.pem` in `cert_dir`, returning both paths.
 ///
-/// The store namespaces certificates under a per-directory subdirectory
-/// (`{cache_dir}/{directory-label}/<id>.chain.pem`, see [`FsAcmeStore`]), so
-/// this scans `cache_dir` itself **and** its immediate subdirectories and picks
-/// the newest matching pair across all of them.
+/// `cert_dir` MUST be the configured directory namespace
+/// (`{cache_dir}/{directory-label}/`, see [`FsAcmeStore`]) — the one the runtime
+/// actually loads from. It scans ONLY that directory (no recursion into sibling
+/// namespaces): after promoting `directory = "production"`, a newer leftover
+/// `staging/*.chain.pem` must NOT be inspected, because the production
+/// `FsAcmeStore` reads only `{cache_dir}/production/` and would never serve it.
 ///
 /// [`FsAcmeStore`]: autumn_web::acme::store::FsAcmeStore
 fn newest_acme_cert_pair(
-    cache_dir: &std::path::Path,
+    cert_dir: &std::path::Path,
 ) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
     let mut best: Option<(
         std::time::SystemTime,
@@ -4107,41 +4174,25 @@ fn newest_acme_cert_pair(
         std::path::PathBuf,
     )> = None;
 
-    // Search `cache_dir` and each immediate subdirectory (the per-directory
-    // namespaces: `staging/`, `production/`, `custom-<hash>/`).
-    let mut search_dirs = vec![cache_dir.to_path_buf()];
-    if let Ok(entries) = std::fs::read_dir(cache_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                search_dirs.push(path);
-            }
-        }
-    }
-
-    for dir in search_dirs {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
+    let entries = std::fs::read_dir(cert_dir).ok()?;
+    for entry in entries.flatten() {
+        let chain = entry.path();
+        let Some(name) = chain.file_name().and_then(|n| n.to_str()) else {
             continue;
         };
-        for entry in entries.flatten() {
-            let chain = entry.path();
-            let Some(name) = chain.file_name().and_then(|n| n.to_str()) else {
-                continue;
-            };
-            let Some(id) = name.strip_suffix(".chain.pem") else {
-                continue;
-            };
-            let key = dir.join(format!("{id}.key.pem"));
-            if !key.exists() {
-                continue;
-            }
-            let mtime = entry
-                .metadata()
-                .and_then(|m| m.modified())
-                .unwrap_or(std::time::UNIX_EPOCH);
-            if best.as_ref().is_none_or(|(t, _, _)| mtime >= *t) {
-                best = Some((mtime, chain, key));
-            }
+        let Some(id) = name.strip_suffix(".chain.pem") else {
+            continue;
+        };
+        let key = cert_dir.join(format!("{id}.key.pem"));
+        if !key.exists() {
+            continue;
+        }
+        let mtime = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::UNIX_EPOCH);
+        if best.as_ref().is_none_or(|(t, _, _)| mtime >= *t) {
+            best = Some((mtime, chain, key));
         }
     }
     best.map(|(_, chain, key)| (chain, key))
@@ -4941,15 +4992,30 @@ pub fn run(opts: DoctorOptions) {
 
     // 8a. Direct-HTTPS certificate readiness (issue #1603): validate
     // [server.tls] cert/key and warn on near-expiry / fail on expired.
-    let tls_data = resolve_tls_doctor_data();
-    tasks.push(Box::new(move || check_tls_impl(&tls_data)));
+    //
+    // Skip this static-cert check for an ACME-only deployment (acme configured
+    // with no static cert/key): the runtime's `TlsConfig::validate()` accepts
+    // ACME-only, but `resolve_tls_paths()` sees the enclosing `[server.tls]`
+    // table and reports empty paths, so `check_tls_impl` would emit a spurious
+    // "must set both cert_path and key_path" Fail for EVERY ACME deployment.
+    // ACME mode is graded by the acme checks below instead.
+    let acme_config = resolve_acme_doctor_config(toml_table.as_ref());
+    let static_cert_key_present = resolve_tls_paths()
+        .is_some_and(|(cert, key)| !cert.as_os_str().is_empty() && !key.as_os_str().is_empty());
+    if should_run_static_tls_check(acme_config.is_some(), static_cert_key_present) {
+        let tls_data = resolve_tls_doctor_data();
+        tasks.push(Box::new(move || check_tls_impl(&tls_data)));
+    }
 
     // 8a-bis. Automatic ACME provisioning (issue #1608). When [server.tls.acme]
     // is configured: always inspect the stored certificate offline (expiry), and
     // — only under --online — actively probe port reachability and DNS.
-    if let Some(acme) = resolve_acme_doctor_config(toml_table.as_ref()) {
+    if let Some(acme) = acme_config {
         // Offline: stored certificate expiry (reuses the #1603 inspect path).
-        let stored = resolve_acme_stored_cert_data(&acme.cache_dir);
+        // Scan ONLY the configured directory namespace the runtime store loads
+        // from ({cache_dir}/{directory_label}/), never sibling namespaces.
+        let cert_dir = acme.cache_dir.join(&acme.directory_label);
+        let stored = resolve_acme_stored_cert_data(&cert_dir);
         tasks.push(Box::new(move || check_acme_stored_cert_impl(&stored)));
 
         if opts.online
@@ -7268,6 +7334,106 @@ pub struct Vault {
             days_until_expiry: 75,
         });
         assert!(matches!(r.status, CheckStatus::Pass));
+    }
+
+    // Regression (#1608, Codex): an ACME-only deployment ([server.tls.acme]
+    // configured, no static cert_path/key_path) must NOT run the static
+    // [server.tls] cert/key check. resolve_tls_paths() sees the enclosing
+    // [server.tls] table and reports empty paths, which check_tls_impl grades
+    // as a "must set both cert_path and key_path" Fail — a false positive for
+    // every ACME deployment, since TlsConfig::validate() accepts ACME-only.
+    #[test]
+    fn acme_only_config_skips_static_tls_check() {
+        // acme configured, no static cert/key present → skip the static check,
+        // so the spurious "must set both" failure is never produced.
+        assert!(
+            !should_run_static_tls_check(true, false),
+            "ACME-only deployment must skip the static [server.tls] cert/key check"
+        );
+
+        // Genuine static-TLS mode (cert/key present) is still checked, even when
+        // acme is also configured.
+        assert!(should_run_static_tls_check(true, true));
+        assert!(should_run_static_tls_check(false, true));
+
+        // No acme, no static cert/key: run the static check so the incomplete
+        // static-TLS config still surfaces the actionable "must set both" Fail.
+        assert!(should_run_static_tls_check(false, false));
+    }
+
+    // The doctor's ACME directory label must match FsAcmeStore's namespacing so
+    // the stored-cert scan reads the SAME subdirectory the runtime loads.
+    #[test]
+    fn acme_directory_label_matches_store() {
+        let staging: toml::Table = toml::from_str("directory = \"staging\"").unwrap();
+        assert_eq!(acme_directory_label(&staging), "staging");
+
+        let production: toml::Table = toml::from_str("directory = \"production\"").unwrap();
+        assert_eq!(acme_directory_label(&production), "production");
+
+        // Unset directory defaults to staging (the runtime default).
+        let empty = toml::Table::new();
+        assert_eq!(acme_directory_label(&empty), "staging");
+
+        // A custom directory hashes its URL, mirroring the store's `custom-<hash>`.
+        let custom: toml::Table =
+            toml::from_str("directory = { custom = { url = \"https://pebble.test/dir\" } }")
+                .unwrap();
+        let label = acme_directory_label(&custom);
+        assert!(label.starts_with("custom-"), "got {label}");
+    }
+
+    // Regression (#1608, Codex): after promoting to `directory = "production"`, a
+    // newer leftover staging cert must NOT be inspected. The scan targets only
+    // the configured namespace ({cache_dir}/production/), which is all the
+    // production FsAcmeStore ever loads.
+    #[test]
+    fn acme_scan_inspects_only_configured_directory() {
+        use std::time::{Duration, SystemTime};
+
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path();
+
+        let write_pair = |sub: &str, id: &str, mtime: SystemTime| {
+            let d = cache.join(sub);
+            std::fs::create_dir_all(&d).unwrap();
+            let chain = d.join(format!("{id}.chain.pem"));
+            let key = d.join(format!("{id}.key.pem"));
+            std::fs::write(&chain, b"chain").unwrap();
+            std::fs::write(&key, b"key").unwrap();
+            // Pin the chain's mtime so ordering is deterministic (no sleeps).
+            std::fs::File::open(&chain)
+                .unwrap()
+                .set_modified(mtime)
+                .unwrap();
+            chain
+        };
+
+        let now = SystemTime::now();
+        // Staging cert is NEWER than production — the old all-subdirs walk would
+        // have wrongly selected it.
+        write_pair("staging", "staging-cert", now + Duration::from_secs(3_600));
+        let prod_chain = write_pair("production", "prod-cert", now);
+
+        let picked = newest_acme_cert_pair(&cache.join("production"))
+            .expect("production cert must be found");
+        assert_eq!(picked.0, prod_chain);
+        assert!(
+            picked.0.to_string_lossy().contains("production"),
+            "must inspect the production cert, got {:?}",
+            picked.0
+        );
+        assert!(
+            !picked.0.to_string_lossy().contains("staging"),
+            "must NOT inspect the newer staging cert, got {:?}",
+            picked.0
+        );
+
+        // And scanning the staging namespace independently still finds staging,
+        // confirming the scan is namespace-scoped (not empty-by-accident).
+        let staging_pick =
+            newest_acme_cert_pair(&cache.join("staging")).expect("staging cert exists");
+        assert!(staging_pick.0.to_string_lossy().contains("staging"));
     }
 
     // ── check_alert_destination_impl (issue #1610) ───────────────────────────
