@@ -3305,6 +3305,11 @@ impl AppBuilder {
             }
         }
 
+        // Root shutdown token for all background tasks. Created before the bind
+        // block so the TLS listener's background acceptor task can take a child
+        // token and stop cleanly on shutdown (issue #1603).
+        let server_shutdown = tokio_util::sync::CancellationToken::new();
+
         // Carries the cert/key reload wiring from the TLS bind path to the
         // background reload task spawned once `server_shutdown` exists.
         #[cfg(feature = "tls")]
@@ -3417,7 +3422,7 @@ impl AppBuilder {
             #[cfg(feature = "tls")]
             {
                 if let Some(tls_cfg) = config.server.tls.as_ref() {
-                    match build_tls_listener(listener, tls_cfg) {
+                    match build_tls_listener(listener, tls_cfg, server_shutdown.child_token()) {
                         Ok((tls_listener, reload)) => {
                             tls_reload_state = Some(reload);
                             (
@@ -3445,7 +3450,6 @@ impl AppBuilder {
 
         let shutdown_timeout = config.server.shutdown_timeout_secs;
         let prestop_grace = config.server.prestop_grace_secs;
-        let server_shutdown = tokio_util::sync::CancellationToken::new();
 
         if let Err(error) = initialize_job_runtime(
             jobs,
@@ -5565,6 +5569,7 @@ struct TlsReloadState {
 fn build_tls_listener(
     tcp: tokio::net::TcpListener,
     cfg: &crate::config::TlsConfig,
+    shutdown: tokio_util::sync::CancellationToken,
 ) -> Result<(crate::tls::TlsListener, TlsReloadState), crate::tls::TlsError> {
     let provider = crate::tls::crypto_provider();
     let certified =
@@ -5577,7 +5582,7 @@ fn build_tls_listener(
     // A zero handshake timeout would drop every connection instantly; clamp to
     // at least one second, mirroring the reload-interval clamp below.
     let handshake_timeout = std::time::Duration::from_secs(cfg.handshake_timeout_secs.max(1));
-    let listener = crate::tls::TlsListener::new(tcp, server_config, handshake_timeout);
+    let listener = crate::tls::TlsListener::new(tcp, server_config, handshake_timeout, shutdown);
     let reload = TlsReloadState {
         resolver,
         provider,

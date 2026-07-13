@@ -300,45 +300,171 @@ pub fn build_server_config(
     Ok(Arc::new(config))
 }
 
+/// Upper bound on TLS handshakes running concurrently at any instant.
+///
+/// The background acceptor task acquires a permit from a semaphore of this size
+/// before spawning each handshake, so a flood of connecting clients can never
+/// spawn an unbounded number of handshake tasks: once this many are in flight
+/// the acceptor parks on the next permit (still draining the kernel accept
+/// queue's backlog as permits free up). 256 is a generous default for a single
+/// listener; it could be made configurable later if a deployment needs to tune
+/// the in-flight-handshake ceiling.
+const MAX_CONCURRENT_HANDSHAKES: usize = 256;
+
+/// Capacity of the channel carrying completed TLS streams to `accept`.
+///
+/// Bounded so a burst of successful handshakes that outruns axum's consumption
+/// applies backpressure (a completed-handshake task parks on `send` while still
+/// holding its semaphore permit) rather than buffering without limit.
+const READY_CONN_CHANNEL_CAPACITY: usize = 1024;
+
 /// A TLS-terminating [`axum::serve::Listener`] wrapping a
 /// [`tokio::net::TcpListener`].
 ///
-/// [`accept`](axum::serve::Listener::accept) accepts a TCP connection and
-/// completes the rustls handshake before yielding a decrypted
+/// [`accept`](axum::serve::Listener::accept) yields a decrypted
 /// [`TlsStream`](tokio_rustls::server::TlsStream) plus the peer's
 /// [`SocketAddr`](std::net::SocketAddr). Because the peer address is a real TCP
 /// `SocketAddr`, the rest of the serve stack — connect-info, trusted-proxy
 /// resolution, graceful shutdown, SSE/WebSocket streaming — is identical to the
 /// plain-TCP path; the only difference is the handshake performed here.
 ///
-/// A failed handshake (a plaintext or malformed client, an unsupported cipher,
-/// a dropped connection) is logged at debug and skipped — it must never take
-/// down the accept loop. Because the handshake runs inline with `accept`, a
-/// client that opens TCP but never completes (or even starts) the handshake
-/// would otherwise head-of-line-block every new accept indefinitely; each
-/// handshake is therefore bounded by `handshake_timeout`, after which the
-/// connection is dropped and the accept loop continues.
+/// TCP-accept and the rustls handshake are **decoupled**: a background acceptor
+/// task drains `tcp.accept()` and, for each connection, spawns a bounded
+/// handshake task (see [`MAX_CONCURRENT_HANDSHAKES`]) that performs the rustls
+/// handshake and forwards the finished stream over a channel to `accept`. This
+/// means a flood of silent or stalled clients cannot serialize the accept loop:
+/// a client that opens TCP but never completes (or even starts) the handshake
+/// occupies only its own handshake task (bounded by `handshake_timeout`), never
+/// head-of-line-blocking the acceptance of the next connection. A failed
+/// handshake (a plaintext or malformed client, an unsupported cipher, a dropped
+/// connection) is logged at debug and dropped; it never affects the acceptor.
 pub struct TlsListener {
-    tcp: tokio::net::TcpListener,
-    acceptor: tokio_rustls::TlsAcceptor,
-    handshake_timeout: std::time::Duration,
+    /// Completed `(stream, peer)` pairs from the background handshake tasks.
+    rx: tokio::sync::mpsc::Receiver<(
+        tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
+        std::net::SocketAddr,
+    )>,
+    /// The bound address, captured before `tcp` moved into the acceptor task.
+    local_addr: std::net::SocketAddr,
+    /// Shutdown signal; also used to park `accept` once the acceptor has ended
+    /// (channel closed) so axum's own graceful-shutdown future drives teardown.
+    shutdown: tokio_util::sync::CancellationToken,
 }
 
 impl TlsListener {
     /// Wrap `tcp` so accepted connections are TLS-terminated with `config`,
     /// bounding each handshake by `handshake_timeout` (a stalled or silent
-    /// client is dropped rather than parking the accept loop).
+    /// client is dropped rather than starving other clients). `shutdown` ties
+    /// the background acceptor task's lifetime to server shutdown.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `tcp.local_addr()` fails — the listener is already bound, so
+    /// this is not expected in practice.
     #[must_use]
     pub fn new(
         tcp: tokio::net::TcpListener,
         config: Arc<rustls::ServerConfig>,
         handshake_timeout: std::time::Duration,
+        shutdown: tokio_util::sync::CancellationToken,
     ) -> Self {
+        let local_addr = tcp
+            .local_addr()
+            .expect("bound TLS listener must have a local address");
+        let acceptor = tokio_rustls::TlsAcceptor::from(config);
+        let (tx, rx) = tokio::sync::mpsc::channel(READY_CONN_CHANNEL_CAPACITY);
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_HANDSHAKES));
+        let acceptor_shutdown = shutdown.clone();
+
+        tokio::spawn(async move {
+            run_acceptor(
+                tcp,
+                acceptor,
+                handshake_timeout,
+                semaphore,
+                tx,
+                acceptor_shutdown,
+            )
+            .await;
+        });
+
         Self {
-            tcp,
-            acceptor: tokio_rustls::TlsAcceptor::from(config),
-            handshake_timeout,
+            rx,
+            local_addr,
+            shutdown,
         }
+    }
+}
+
+/// Background accept loop: drain `tcp`, and for each connection spawn a bounded
+/// handshake task that forwards the completed TLS stream over `tx`. Breaks (and
+/// drops `tx`) on `shutdown`.
+async fn run_acceptor(
+    tcp: tokio::net::TcpListener,
+    acceptor: tokio_rustls::TlsAcceptor,
+    handshake_timeout: std::time::Duration,
+    semaphore: Arc<tokio::sync::Semaphore>,
+    tx: tokio::sync::mpsc::Sender<(
+        tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
+        std::net::SocketAddr,
+    )>,
+    shutdown: tokio_util::sync::CancellationToken,
+) {
+    loop {
+        let (stream, peer) = tokio::select! {
+            () = shutdown.cancelled() => break,
+            result = tcp.accept() => match result {
+                Ok(pair) => pair,
+                Err(e) => {
+                    // Never break the loop on a per-connection error — that
+                    // would tear down the whole listener. Retry transient
+                    // per-connection errors immediately; back off briefly on
+                    // anything else so we do not spin (e.g. on the process's
+                    // open-file limit).
+                    if is_transient_connection_error(&e) {
+                        continue;
+                    }
+                    tracing::error!(error = %e, "TLS listener accept error");
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    continue;
+                }
+            },
+        };
+
+        // Acquire a permit BEFORE spawning so in-flight handshakes are bounded:
+        // once `MAX_CONCURRENT_HANDSHAKES` are running, this parks (applying
+        // backpressure to accept) until one finishes. The only error is a closed
+        // semaphore, which we never close, so the `else` is unreachable in
+        // practice; stop the loop defensively if it ever happens.
+        let Ok(permit) = Arc::clone(&semaphore).acquire_owned().await else {
+            break;
+        };
+        let acceptor = acceptor.clone();
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            // The permit is released when this task ends (handshake done,
+            // failed, or timed out), freeing a slot for the next connection.
+            let _permit = permit;
+            // Bound the handshake so a client that connects but never sends a
+            // ClientHello (or stalls mid-handshake) releases its permit instead
+            // of holding it for the process lifetime.
+            match tokio::time::timeout(handshake_timeout, acceptor.accept(stream)).await {
+                Ok(Ok(tls)) => {
+                    // A closed receiver means the listener is gone; drop.
+                    let _ = tx.send((tls, peer)).await;
+                }
+                Ok(Err(e)) => {
+                    tracing::debug!(
+                        peer = %peer,
+                        error = %e,
+                        "TLS handshake failed; dropping connection"
+                    );
+                }
+                Err(_elapsed) => {
+                    tracing::debug!(peer = %peer, "TLS handshake timed out");
+                }
+            }
+        });
     }
 }
 
@@ -360,44 +486,21 @@ impl axum::serve::Listener for TlsListener {
     type Addr = std::net::SocketAddr;
 
     async fn accept(&mut self) -> (Self::Io, Self::Addr) {
-        loop {
-            let (stream, peer) = match self.tcp.accept().await {
-                Ok(pair) => pair,
-                Err(e) => {
-                    // Never return an error from here — that terminates the
-                    // whole serve loop. Retry transient per-connection errors
-                    // immediately; back off briefly on anything else so we do
-                    // not spin (e.g. on the process's open-file limit).
-                    if is_transient_connection_error(&e) {
-                        continue;
-                    }
-                    tracing::error!(error = %e, "TLS listener accept error");
-                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                    continue;
-                }
-            };
-            // Bound the handshake: a client that connects but never sends a
-            // ClientHello (or stalls mid-handshake) must not park the accept
-            // loop and deny every other client. On timeout or handshake error,
-            // drop the connection and keep accepting.
-            match tokio::time::timeout(self.handshake_timeout, self.acceptor.accept(stream)).await {
-                Ok(Ok(tls)) => return (tls, peer),
-                Ok(Err(e)) => {
-                    tracing::debug!(
-                        peer = %peer,
-                        error = %e,
-                        "TLS handshake failed; dropping connection"
-                    );
-                }
-                Err(_elapsed) => {
-                    tracing::debug!(peer = %peer, "TLS handshake timed out");
-                }
-            }
+        if let Some(conn) = self.rx.recv().await {
+            return conn;
         }
+        // The acceptor task has ended and the channel is drained (shutdown, or
+        // an unrecoverable acceptor exit). `Listener::accept` returns no
+        // `Result` and axum loops on it, so we must neither panic nor busy-loop:
+        // park here forever (awaiting the shutdown token, then a never-resolving
+        // future) so axum's own graceful-shutdown path drives teardown instead
+        // of us spinning.
+        self.shutdown.cancelled().await;
+        std::future::pending().await
     }
 
     fn local_addr(&self) -> std::io::Result<Self::Addr> {
-        self.tcp.local_addr()
+        Ok(self.local_addr)
     }
 }
 

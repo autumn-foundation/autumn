@@ -3746,6 +3746,29 @@ fn any_tls_env_var_set() -> bool {
     std::env::vars_os().any(|(name, _)| name.to_string_lossy().starts_with("AUTUMN_SERVER__TLS__"))
 }
 
+/// Every env var that configures `[server.tls]`: the cert/key paths plus the
+/// tuning knobs. Doctor scans these through the profile-aware dotenv overlay
+/// (an [`Env`](autumn_web::config::Env), which exposes only `var(key)` lookups,
+/// not iteration) so a TLS deployment supplied through `.env`/`.env.<profile>`
+/// is detected — the overlay analog of the raw-process-env
+/// [`any_tls_env_var_set`] prefix scan.
+const TLS_ENV_VAR_NAMES: [&str; 4] = [
+    "AUTUMN_SERVER__TLS__CERT_PATH",
+    "AUTUMN_SERVER__TLS__KEY_PATH",
+    "AUTUMN_SERVER__TLS__RELOAD_INTERVAL_SECS",
+    "AUTUMN_SERVER__TLS__HANDSHAKE_TIMEOUT_SECS",
+];
+
+/// Whether any `[server.tls]` env var is present in `env` (including a
+/// tuning-only var). Reads through the passed [`Env`], so a var supplied only
+/// via the `.env`/`.env.<profile>` overlay counts — the runtime materializes an
+/// (otherwise-empty) `[server.tls]` table for it, so doctor must grade it rather
+/// than emit a false Pass. Presence alone marks configured, mirroring
+/// [`any_tls_env_var_set`].
+fn any_tls_env_var_set_in(env: &dyn autumn_web::config::Env) -> bool {
+    TLS_ENV_VAR_NAMES.iter().any(|name| env.var(name).is_ok())
+}
+
 /// Pure core of [`resolve_tls_paths`]: decide the resolved cert/key paths from
 /// already-extracted sources, so it can be graded in tests without mutating the
 /// process environment. `env_*` win over `toml_*` (matching the runtime).
@@ -3778,6 +3801,12 @@ fn resolve_tls_paths_from_sources(
 /// Resolve the configured `[server.tls]` cert/key paths, honoring env-var
 /// overrides and the active profile's merged config, exactly as the runtime
 /// loads them. Returns `None` when TLS is not configured at all.
+///
+/// The `AUTUMN_SERVER__TLS__*` vars are read through the SAME profile-aware
+/// dotenv overlay the sibling checks use (`os_env_with_dotenv_for_profile`), so
+/// a cert/key or tuning var supplied via `.env`/`.env.<profile>` — which the
+/// runtime loads via `TomlEnvConfigLoader` and would boot a TLS listener from —
+/// is visible to doctor instead of being reported as not-configured.
 fn resolve_tls_paths() -> Option<(std::path::PathBuf, std::path::PathBuf)> {
     let (canonical, selected, _) = resolve_active_profiles();
     let merged = get_merged_toml_table_runtime(&canonical, &selected);
@@ -3787,10 +3816,22 @@ fn resolve_tls_paths() -> Option<(std::path::PathBuf, std::path::PathBuf)> {
         .and_then(|s| s.get("tls"))
         .and_then(toml::Value::as_table);
 
-    let env_cert = std::env::var("AUTUMN_SERVER__TLS__CERT_PATH")
+    // Read TLS env vars through the profile-aware `.env` overlay — the real OS
+    // env still wins, but `.env`/`.env.<profile>` values now fill keys the OS
+    // env lacks. Fall back to the bare OS env only if the overlay can't be built
+    // (a malformed `.env`), matching `resolve_offsite_backup_data`.
+    let denv: Box<dyn autumn_web::config::Env> =
+        match autumn_web::dotenv::os_env_with_dotenv_for_profile(&canonical) {
+            Ok(e) => Box::new(e),
+            Err(_) => Box::new(autumn_web::config::OsEnv),
+        };
+
+    let env_cert = denv
+        .var("AUTUMN_SERVER__TLS__CERT_PATH")
         .ok()
         .filter(|v| !v.trim().is_empty());
-    let env_key = std::env::var("AUTUMN_SERVER__TLS__KEY_PATH")
+    let env_key = denv
+        .var("AUTUMN_SERVER__TLS__KEY_PATH")
         .ok()
         .filter(|v| !v.trim().is_empty());
 
@@ -3803,13 +3844,18 @@ fn resolve_tls_paths() -> Option<(std::path::PathBuf, std::path::PathBuf)> {
         .and_then(toml::Value::as_str)
         .map(str::to_owned);
 
+    // Consider TLS configured if any prefix var is set in the real process env
+    // (catches vars named outside the known set) OR any known var is present
+    // through the dotenv overlay (catches `.env`-supplied tuning vars).
+    let any_tls_env = any_tls_env_var_set() || any_tls_env_var_set_in(denv.as_ref());
+
     resolve_tls_paths_from_sources(
         tls.is_some(),
         toml_cert,
         toml_key,
         env_cert,
         env_key,
-        any_tls_env_var_set(),
+        any_tls_env,
     )
 }
 
@@ -6919,6 +6965,68 @@ pub struct Vault {
         .expect("configured");
         assert_eq!(resolved.0, std::path::PathBuf::from("/env/c.pem"));
         assert_eq!(resolved.1, std::path::PathBuf::from("/env/k.pem"));
+    }
+
+    // Regression (#1603, Codex): TLS vars supplied through the `.env`/
+    // `.env.<profile>` overlay the runtime loads (not the process env) must be
+    // visible to doctor. `resolve_tls_paths` now reads them through the same
+    // profile-aware `Env` overlay the sibling checks use; feed that overlay a
+    // `MockEnv` (a map-backed `Env`) with TLS vars set and prove detection.
+    #[test]
+    fn dotenv_supplied_tls_var_is_detected() {
+        use autumn_web::config::{Env, MockEnv};
+
+        // A cert/key pair visible ONLY through the overlay (never the process
+        // env) must resolve as configured — this is exactly the source
+        // `resolve_tls_paths` now reads the `AUTUMN_SERVER__TLS__*` vars from.
+        let env = MockEnv::new()
+            .with("AUTUMN_SERVER__TLS__CERT_PATH", "/dotenv/cert.pem")
+            .with("AUTUMN_SERVER__TLS__KEY_PATH", "/dotenv/key.pem");
+        assert!(
+            any_tls_env_var_set_in(&env),
+            "a dotenv-supplied TLS var must count as configured"
+        );
+        let env_cert = env
+            .var("AUTUMN_SERVER__TLS__CERT_PATH")
+            .ok()
+            .filter(|v| !v.trim().is_empty());
+        let env_key = env
+            .var("AUTUMN_SERVER__TLS__KEY_PATH")
+            .ok()
+            .filter(|v| !v.trim().is_empty());
+        let resolved = resolve_tls_paths_from_sources(
+            false, // no [server.tls] section in autumn.toml
+            None,  // toml_cert
+            None,  // toml_key
+            env_cert,
+            env_key,
+            any_tls_env_var_set_in(&env),
+        )
+        .expect("dotenv-supplied TLS cert/key must resolve as configured");
+        assert_eq!(resolved.0, std::path::PathBuf::from("/dotenv/cert.pem"));
+        assert_eq!(resolved.1, std::path::PathBuf::from("/dotenv/key.pem"));
+
+        // A tuning-only dotenv var (no cert/key) is otherwise invisible, yet
+        // must still mark TLS configured so doctor emits the actionable "must
+        // set both" Fail instead of a false Pass.
+        let tuning_only = MockEnv::new().with("AUTUMN_SERVER__TLS__RELOAD_INTERVAL_SECS", "30");
+        assert!(
+            any_tls_env_var_set_in(&tuning_only),
+            "a dotenv-supplied tuning var must count as configured"
+        );
+        let (cert, key) = resolve_tls_paths_from_sources(
+            false,
+            None,
+            None,
+            None,
+            None,
+            any_tls_env_var_set_in(&tuning_only),
+        )
+        .expect("tuning-only dotenv TLS var must resolve as configured");
+        assert!(
+            cert.as_os_str().is_empty() && key.as_os_str().is_empty(),
+            "cert/key must be empty so the caller reports 'must set both'"
+        );
     }
 
     #[test]

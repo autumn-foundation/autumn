@@ -125,7 +125,13 @@ async fn serve_tls_with_handshake_timeout(handshake_timeout: Duration) -> TestSe
         .await
         .expect("bind ephemeral port");
     let addr = tcp.local_addr().expect("local_addr");
-    let listener = TlsListener::new(tcp, server_config, handshake_timeout);
+    let shutdown = CancellationToken::new();
+    let listener = TlsListener::new(
+        tcp,
+        server_config,
+        handshake_timeout,
+        shutdown.child_token(),
+    );
 
     let router = Router::new()
         .route("/health", get(|| async { "ok" }))
@@ -148,7 +154,6 @@ async fn serve_tls_with_handshake_timeout(handshake_timeout: Duration) -> TestSe
             router,
         );
 
-    let shutdown = CancellationToken::new();
     let shutdown_wait = shutdown.clone();
     let handle = tokio::spawn(async move {
         axum::serve(listener, make_service)
@@ -332,6 +337,64 @@ async fn hung_handshake_does_not_wedge_the_listener() {
 
     // Keep the hung socket alive until after the good request completed, so the
     // test truly overlapped a stalled handshake with a real one.
+    drop(hung);
+
+    server.shutdown.cancel();
+    let _ = server.handle.await;
+}
+
+#[tokio::test]
+async fn concurrent_handshakes_do_not_serialize_accept() {
+    // Number of stalled connections opened before the good request.
+    const STALLED: usize = 5;
+
+    // A short per-handshake timeout so each stalled connection would, IF the
+    // accept loop were serialized, hold it up for this long.
+    let handshake_timeout = Duration::from_secs(2);
+    let server = serve_tls_with_handshake_timeout(handshake_timeout).await;
+    let addr = server.addr;
+
+    // Open several raw TCP connections that connect and send NOTHING — no
+    // ClientHello, ever. With an accept loop that ran the handshake inline,
+    // each of these would park acceptance for the full `handshake_timeout`, so
+    // a good request queued behind them would wait up to
+    // `STALLED * handshake_timeout` (here 5 * 2s = 10s). With handshakes driven
+    // concurrently off the accept loop, the good request is served promptly.
+    let mut hung = Vec::with_capacity(STALLED);
+    for _ in 0..STALLED {
+        hung.push(std::net::TcpStream::connect(addr).expect("open raw TCP connection"));
+    }
+    // Give the acceptor a beat to pull the stalled connections off the queue,
+    // so the good connection below is genuinely contending with in-flight
+    // stalled handshakes.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // The good request must complete well under `STALLED * handshake_timeout`
+    // (10s). A 5s bound is generous against CI slowness yet still proves the
+    // good request was NOT serialized behind the five stalled handshakes.
+    let start = std::time::Instant::now();
+    let good = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::task::spawn_blocking(move || https_get(addr, "/health")),
+    )
+    .await
+    .expect("good request must not serialize behind stalled handshakes")
+    .unwrap()
+    .expect("HTTPS GET /health while handshakes are stalled");
+    let elapsed = start.elapsed();
+
+    assert!(
+        good.starts_with("HTTP/1.1 200"),
+        "listener must serve a real client while handshakes stall, got: {good:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "good request took {elapsed:?}; expected well under STALLED*timeout (10s), \
+         proving handshakes are not serialized in the accept loop"
+    );
+
+    // Keep the stalled sockets alive until the good request completed, so the
+    // test truly overlapped stalled handshakes with a real one.
     drop(hung);
 
     server.shutdown.cancel();
