@@ -23,6 +23,112 @@ use crate::route::Route;
 /// auth posture, so a manifest that silently drops them would defeat the gate.
 pub const OMITTED_ROUTES_MARKER: &str = "[autumn:omitted-routes] ";
 
+/// Machine-readable stderr marker carrying the resolved security configuration
+/// (CSRF + headers) for the `declared` manifest dimensions built by
+/// `autumn routes audit`.
+///
+/// Emitted by the `AUTUMN_DUMP_ROUTES` dump only when `AUTUMN_DUMP_SECURITY=1`
+/// is *also* set — which `autumn routes audit` sets, but the plain
+/// `autumn routes` listing does not. A single compact JSON [`SecurityDump`]
+/// follows the marker on the same line. Kept off stdout so the routes-only JSON
+/// parse path (`autumn routes`, and older audit builds) stays byte-compatible.
+pub const SECURITY_CONFIG_MARKER: &str = "[autumn:security-config] ";
+
+/// Resolved CSRF configuration carried across the dump boundary for the
+/// `declared` CSRF manifest dimension.
+///
+/// Mirrors the runtime-relevant subset of
+/// [`CsrfConfig`](crate::security::config::CsrfConfig): the enable flag plus the
+/// two inputs to the runtime safe/exempt predicate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CsrfDump {
+    /// Whether CSRF enforcement is enabled.
+    pub enabled: bool,
+    /// Methods that never require a CSRF token (sorted).
+    pub safe_methods: Vec<String>,
+    /// Path prefixes exempt from CSRF validation (sorted).
+    pub exempt_paths: Vec<String>,
+}
+
+/// Resolved security-headers configuration carried across the dump boundary for
+/// the `declared` security-headers manifest dimension.
+///
+/// Every string is the *effective* declared value — in particular
+/// `content_security_policy` is the resolved template
+/// ([`default_content_security_policy`](crate::security::config::default_content_security_policy)
+/// when unset), not an unresolved sentinel.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[allow(clippy::struct_excessive_bools)]
+pub struct HeadersDump {
+    /// `X-Frame-Options` value (empty = header not emitted).
+    pub x_frame_options: String,
+    /// Whether `X-Content-Type-Options: nosniff` is sent.
+    pub x_content_type_options: bool,
+    /// Whether `X-XSS-Protection: 1; mode=block` is sent.
+    pub xss_protection: bool,
+    /// Resolved `Content-Security-Policy` value (empty = header not emitted).
+    pub content_security_policy: String,
+    /// `Referrer-Policy` value (empty = header not emitted).
+    pub referrer_policy: String,
+    /// `Permissions-Policy` value (empty = header not emitted).
+    pub permissions_policy: String,
+    /// Whether `Strict-Transport-Security` (HSTS) is sent.
+    pub strict_transport_security: bool,
+    /// HSTS `max-age` in seconds.
+    pub hsts_max_age_secs: u64,
+    /// Whether HSTS includes subdomains.
+    pub hsts_include_subdomains: bool,
+    /// Whether per-request CSP nonce injection is enabled.
+    pub csp_nonce: bool,
+}
+
+/// Resolved security configuration snapshot emitted after
+/// [`SECURITY_CONFIG_MARKER`] for the manifest's `declared` dimensions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SecurityDump {
+    /// CSRF configuration.
+    pub csrf: CsrfDump,
+    /// Security-headers configuration.
+    pub headers: HeadersDump,
+}
+
+impl SecurityDump {
+    /// Snapshot the security-relevant configuration for the manifest dump.
+    ///
+    /// Every emitted list is sorted so the serialized snapshot is
+    /// byte-deterministic across runs, regardless of config source ordering.
+    #[must_use]
+    pub fn from_config(config: &crate::config::AutumnConfig) -> Self {
+        let csrf = &config.security.csrf;
+        let headers = &config.security.headers;
+
+        let mut safe_methods = csrf.safe_methods.clone();
+        safe_methods.sort();
+        let mut exempt_paths = csrf.exempt_paths.clone();
+        exempt_paths.sort();
+
+        Self {
+            csrf: CsrfDump {
+                enabled: csrf.enabled,
+                safe_methods,
+                exempt_paths,
+            },
+            headers: HeadersDump {
+                x_frame_options: headers.x_frame_options.clone(),
+                x_content_type_options: headers.x_content_type_options,
+                xss_protection: headers.xss_protection,
+                content_security_policy: headers.content_security_policy.clone(),
+                referrer_policy: headers.referrer_policy.clone(),
+                permissions_policy: headers.permissions_policy.clone(),
+                strict_transport_security: headers.strict_transport_security,
+                hsts_max_age_secs: headers.hsts_max_age_secs,
+                hsts_include_subdomains: headers.hsts_include_subdomains,
+                csp_nonce: headers.csp_nonce.enabled,
+            },
+        }
+    }
+}
+
 /// Where a route was registered: by the user application, by a named plugin,
 /// or by the framework itself (probes, actuator, htmx assets, dev reload).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
