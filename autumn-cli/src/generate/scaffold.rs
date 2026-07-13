@@ -939,6 +939,8 @@ const ROUTES_FILE_RESERVED_NAMES: &[&str] = &[
     "Bytes",
     "CsrfFormField",
     "CsrfToken",
+    "SubmitFormField",
+    "SubmitToken",
     "PagerOptions",
     "Flash",
     "ShardedDb",
@@ -5552,70 +5554,49 @@ fn toml_table_block_range(lines: &[&str], header: &str) -> Option<(usize, usize)
 /// one), a table without an `exempt_paths` key (insert the key after the
 /// header), and a table whose `exempt_paths` array is merged in place.
 fn append_submit_token_validate_exempt_to_toml(existing: &str, plural: &str) -> Option<String> {
-    const HEADER: &str = "[security.submit_token]";
+    use toml_edit::{Array, DocumentMut, Item, Table, Value};
+
     let exempt = submit_token_validate_exempt_prefix(plural);
-    let quoted = format!("\"{exempt}\"");
 
-    let lines: Vec<&str> = existing.lines().collect();
-    let Some((start, end)) = toml_table_block_range(&lines, HEADER) else {
-        // No `[security.submit_token]` table yet — append a fresh one.
-        let mut out = existing.trim_end().to_owned();
-        if !out.is_empty() {
-            out.push_str("\n\n");
-        }
-        out.push_str(HEADER);
-        out.push('\n');
-        let _ = writeln!(out, "exempt_paths = [{quoted}]");
-        return Some(out);
-    };
+    // Parse format-preservingly so comments, ordering, and hand-crafted array
+    // layout survive the edit. A config we can't parse is left untouched (and we
+    // claim no ownership) rather than risking corruption via raw string edits.
+    let mut doc = existing.parse::<DocumentMut>().ok()?;
 
-    // The table exists. No-op if the prefix is already listed in the block —
-    // return `None` so we don't claim ownership of a preexisting entry.
-    if lines[start..end].iter().any(|l| l.contains(&quoted)) {
+    // Navigate to — creating if absent — `[security.submit_token]`. A freshly
+    // created `[security]` parent is marked implicit so it renders as the dotted
+    // `[security.submit_token]` header (matching the hand-written convention)
+    // rather than emitting a bare, empty `[security]` table of its own.
+    let security_missing = !doc.as_table().contains_key("security");
+    let security = doc
+        .as_table_mut()
+        .entry("security")
+        .or_insert_with(|| Item::Table(Table::new()))
+        .as_table_mut()?;
+    if security_missing {
+        security.set_implicit(true);
+    }
+    let submit_token = security
+        .entry("submit_token")
+        .or_insert_with(|| Item::Table(Table::new()))
+        .as_table_mut()?;
+
+    // Get or create the `exempt_paths` array.
+    let array = submit_token
+        .entry("exempt_paths")
+        .or_insert_with(|| Item::Value(Value::Array(Array::new())))
+        .as_array_mut()?;
+
+    // Idempotent: if the prefix is already listed, return `None` so we don't
+    // claim ownership of (and later, on `autumn destroy`, delete) a preexisting,
+    // user-owned exemption.
+    if array.iter().any(|v| v.as_str() == Some(exempt.as_str())) {
         return None;
     }
 
-    // Look for an existing `exempt_paths` key inside the block.
-    let key_pos = lines[start + 1..end]
-        .iter()
-        .position(|l| l.trim_start().starts_with("exempt_paths"))
-        .map(|rel| start + 1 + rel);
+    array.push(exempt.as_str());
 
-    let mut out_lines: Vec<String> = lines.iter().map(|l| (*l).to_owned()).collect();
-
-    if let Some(key_idx) = key_pos {
-        // Merge into the existing array. Find its closing `]` (arrays here don't
-        // nest) starting at the key line, collapsing a multi-line array to a
-        // single line if necessary — correctness over formatting for this
-        // uncommon hand-configured case.
-        let close_idx = (key_idx..end)
-            .find(|&i| lines[i].contains(']'))
-            .unwrap_or(key_idx);
-        let joined: String = lines[key_idx..=close_idx].join("\n");
-        let (Some(open), Some(close)) = (joined.find('['), joined.rfind(']')) else {
-            // The `exempt_paths` array is malformed (no `[`/`]` to splice into).
-            // Leave the file untouched and claim no ownership.
-            return None;
-        };
-        let inner = joined[open + 1..close].trim().trim_end_matches(',').trim();
-        let new_inner = if inner.is_empty() {
-            quoted
-        } else {
-            format!("{inner}, {quoted}")
-        };
-        let rebuilt = format!("{}[{new_inner}]{}", &joined[..open], &joined[close + 1..]);
-        out_lines.splice(key_idx..=close_idx, std::iter::once(rebuilt));
-    } else {
-        // Table present but no `exempt_paths` key — insert it right after the
-        // header line.
-        out_lines.insert(start + 1, format!("exempt_paths = [{quoted}]"));
-    }
-
-    let mut out = out_lines.join("\n");
-    if existing.ends_with('\n') && !out.ends_with('\n') {
-        out.push('\n');
-    }
-    Some(out)
+    Some(doc.to_string())
 }
 
 /// Inverse of [`append_submit_token_validate_exempt_to_toml`] (`autumn
@@ -6426,6 +6407,32 @@ async fn main() {
         // duplicate `Changeset`/`IntoChangeset` import fails with E0252,
         // exactly like the pre-existing `Path`/`ToString` collisions above.
         for field_name in ["changeset", "into_changeset"] {
+            let tmp = project_with_main(default_main());
+            let err = plan_scaffold(
+                tmp.path(),
+                "Post",
+                &[format!("{field_name}:enum{{a,b}}")],
+                "20260427000000",
+            )
+            .unwrap_err();
+            assert!(
+                matches!(err, GenerateError::InvalidField { .. }),
+                "expected '{field_name}' to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn scaffold_enum_field_named_submit_token_is_rejected() {
+        // `submit_token:enum{a,b}` pascalizes to `SubmitToken` and
+        // `submit_form_field:enum{a,b}` to `SubmitFormField`, colliding with the
+        // `use autumn_web::security::{…, SubmitFormField, SubmitToken};` import
+        // every non-`--api` scaffold's routes file now carries (issue #1360) — a
+        // duplicate `SubmitToken`/`SubmitFormField` import fails with E0252,
+        // exactly like the `CsrfToken`/`Changeset` collisions above. Rejecting
+        // the field up front yields the actionable field-name error instead of a
+        // broken generated file.
+        for field_name in ["submit_token", "submit_form_field"] {
             let tmp = project_with_main(default_main());
             let err = plan_scaffold(
                 tmp.path(),
@@ -10120,6 +10127,40 @@ async fn main() {
         assert!(out.contains("\"/webhooks/x\""), "{out}");
         assert!(out.contains("\"/posts/validate\""), "{out}");
         assert!(out.contains("ttl_secs = 900"), "{out}");
+        // No duplicate exempt_paths key.
+        assert_eq!(out.matches("exempt_paths").count(), 1, "{out}");
+    }
+
+    #[test]
+    fn submit_token_exempt_merges_into_commented_multiline_array() {
+        // A hand-edited, multiline `exempt_paths` array with item comments must
+        // merge into VALID TOML: the format-preserving edit inserts the new path
+        // as a real array element before the closing bracket, never splicing it
+        // after a `#` comment (which would produce e.g.
+        // `[..., # api, "/posts/validate"]` — invalid TOML that corrupts the
+        // config).
+        let existing = "\
+[security.submit_token]
+exempt_paths = [
+    \"/api\", # public api, never guarded
+    \"/webhooks/x\",
+]
+";
+        let out = append_submit_token_validate_exempt_to_toml(existing, "posts")
+            .expect("a new prefix must be merged into the commented array");
+        // The merged output is valid TOML.
+        let parsed: toml::Value =
+            toml::from_str(&out).unwrap_or_else(|e| panic!("merged TOML must parse: {e}\n{out}"));
+        // Both preexisting entries and the new prefix are present.
+        let paths = parsed["security"]["submit_token"]["exempt_paths"]
+            .as_array()
+            .expect("exempt_paths must be an array");
+        let values: Vec<&str> = paths.iter().filter_map(toml::Value::as_str).collect();
+        assert!(values.contains(&"/api"), "{out}");
+        assert!(values.contains(&"/webhooks/x"), "{out}");
+        assert!(values.contains(&"/posts/validate"), "{out}");
+        // The item comment survives the edit.
+        assert!(out.contains("# public api, never guarded"), "{out}");
         // No duplicate exempt_paths key.
         assert_eq!(out.matches("exempt_paths").count(), 1, "{out}");
     }
