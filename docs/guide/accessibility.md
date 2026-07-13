@@ -509,6 +509,103 @@ cover those.
 
 ---
 
+## `autumn a11y verify` (build-time raw-`html!` audit)
+
+The typed primitives above are the *compile-time proof*: code that uses `Img`,
+`Button`, `Link`, `MenuItem`, or `TextField` cannot ship without an accessible
+name, so it never needs re-checking. But a project can always drop down to raw
+`maud::html! { … }` markup, which bypasses the primitives entirely and the type
+system cannot see. `autumn a11y verify` is the net for that escape hatch.
+
+Because there is no walkable widget tree at runtime, `verify` is a **static**
+pass: it token-scans the `html!` blocks in your project's `.rs` files (the same
+descent `autumn i18n check` uses to find `t!` calls inside `html!`) and reports
+raw elements that are missing an accessible name. It reuses the WCAG success
+criteria, rule ids, and severity levels of `autumn check --a11y`, applied to
+source rather than rendered HTML.
+
+### What it checks
+
+| Rule id       | Element                              | Condition                                                              | WCAG SC               |
+| ------------- | ----------------------------------- | --------------------------------------------------------------------- | --------------------- |
+| `image-alt`   | `<img>`                             | no `alt` attribute                                                     | 1.1.1                 |
+| `label`       | `<input>` / `<select>` / `<textarea>` | no matching `<label for=…>`, `aria-label`, or `aria-labelledby`       | 1.3.1 / 3.3.2 / 4.1.2 |
+| `button-name` | `<button>`                          | no text content and no `aria-label`/`aria-labelledby`                  | 4.1.2                 |
+| `link-name`   | `<a href>`                          | no link text and no `aria-label`/`aria-labelledby`                     | 2.4.4 / 4.1.2         |
+
+Each finding carries the fix hint — the typed primitive that discharges the
+obligation at compile time (`Img::new(src, alt)`, `TextField::new(..).label(..)`,
+`Button::new(name)`, `Link::new(href, text)`).
+
+### Usage
+
+```bash
+# Audit the current project (defaults to the working directory)
+autumn a11y verify
+
+# Point at a specific crate/directory
+autumn a11y verify ./crates/web
+
+# Machine-readable conformance manifest
+autumn a11y verify --format json
+
+# Fail on any finding (Moderate and above), mirroring `i18n check --strict`
+autumn a11y verify --strict
+```
+
+### `--format json` (conformance manifest)
+
+The JSON output is an array of findings keyed to WCAG success criteria plus a
+summary, suitable for archiving as a conformance manifest:
+
+```json
+{
+  "files_scanned": 12,
+  "html_blocks": 34,
+  "findings": [
+    {
+      "file": "src/views/profile.rs",
+      "line": 42,
+      "element": "img",
+      "rule_id": "image-alt",
+      "wcag": "1.1.1",
+      "severity": "Serious",
+      "message": "raw <img> has no alt attribute",
+      "hint": "use autumn_web::a11y::Img::new(src, alt) / Img::decorative(src)"
+    }
+  ],
+  "summary": { "critical": 0, "serious": 1, "moderate": 0, "total": 1 }
+}
+```
+
+### CI integration
+
+`autumn a11y verify` exits non-zero when any finding meets the failure threshold
+(Serious by default; `--strict` lowers it to Moderate), so it fails the build
+just like `autumn i18n check`:
+
+```yaml
+# GitHub Actions example
+- name: Accessibility (raw html!) verification
+  run: autumn a11y verify --format json
+```
+
+### Scope and limits
+
+The primitives are the proof; `verify` is the safety net. Code that splices a
+typed primitive — `(Img::new(src, alt))` — is a `(expr)` splice, not an `img`
+element, so it is **never** re-scanned or falsely flagged. Like `autumn i18n
+check`, the scanner reads tokens rather than a resolved AST and always errs
+toward *not* flagging what it cannot resolve, so it never breaks CI on a false
+positive: a spliced attribute value or content (`alt=(caption)`,
+`button { (label) }`) is treated as present, and a `<label for=…>`/`id`
+association a splice makes unresolvable suppresses the `label` finding. The
+honest guarantee is: use the typed primitives and accessibility is proven at
+compile time; if you must write raw `html!`, `verify` catches the common
+missing-name mistakes before they ship.
+
+---
+
 ## Further reading
 
 - [WCAG 2.1 Quick Reference](https://www.w3.org/WAI/WCAG21/quickref/)
