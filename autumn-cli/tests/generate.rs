@@ -4108,19 +4108,23 @@ fn generate_scaffold_index_uses_paginated_repo_method() {
         routes.contains("pagination_nav") || routes.contains("pagination"),
         "scaffold index must render a pagination nav partial: {routes}"
     );
+    // Since #1126 the default (non-live) index calls the paginated, sort/filter
+    // `list(&ListQuery, &PageRequest)` method instead of the bare `page()`;
+    // either paginated repository method satisfies issue #681 (both take a
+    // `PageRequest` and return a `Page`, never loading every row).
     assert!(
-        routes.contains(".page("),
-        "scaffold index must call the repository page() method: {routes}"
+        routes.contains(".page(") || routes.contains(".list("),
+        "scaffold index must call a paginated repository method (page()/list()): {routes}"
     );
     assert!(
         !routes.contains(".load(&mut *db)"),
         "scaffold index must not load every row without pagination: {routes}"
     );
-    // The repository trait must be imported so `repo.page()` (a trait method)
-    // resolves at compile time — without it the generated code fails with E0599.
+    // The repository trait must be imported so `repo.list()`/`repo.page()` (trait
+    // methods) resolve at compile time — without it the generated code fails with E0599.
     assert!(
         routes.contains("PostRepository"),
-        "scaffold routes must import the PostRepository trait (needed to call repo.page()): {routes}"
+        "scaffold routes must import the PostRepository trait (needed to call repo.list()): {routes}"
     );
 }
 

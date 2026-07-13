@@ -10035,6 +10035,119 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     };
 
+    // ── #1126: allowlisted sort/filter list method ──────────────────────
+    //
+    // `list()` is `page()` plus allowlisted ordering + equality filtering. The
+    // ordering/filtering DSL is *typed* — the `#[model]` macro generated
+    // `__autumn_list_apply_filters` / `__autumn_list_apply_order` over a boxed
+    // Diesel query, matching requested keys against the model's own columns.
+    // An unknown `sort`/`filter[..]` key hits the default arm and is ignored,
+    // so a request like `?sort=id;DROP TABLE` can never reach SQL. Filters are
+    // applied to both the COUNT and the page query so `total` is consistent.
+    let list_trait_method = quote! {
+        /// Fetch one page of records applying **allowlisted** sort + equality
+        /// filters from a [`::autumn_web::pagination::ListQuery`], with offset
+        /// pagination from a [`::autumn_web::pagination::PageRequest`].
+        ///
+        /// Only the model's own columns are sortable, and only its non-null
+        /// `String`/integer/`bool` columns are filterable; any other requested
+        /// key is silently ignored (never interpolated into SQL). An empty or
+        /// unknown `sort` falls back to primary-key-descending order.
+        fn list(
+            &self,
+            query: &::autumn_web::pagination::ListQuery,
+            req: &::autumn_web::pagination::PageRequest,
+        ) -> impl ::std::future::Future<Output = ::autumn_web::AutumnResult<::autumn_web::pagination::Page<#model_name>>> + Send;
+    };
+
+    let list_impl_method = if config.tenant_scoped {
+        quote! {
+            async fn list(
+                &self,
+                query: &::autumn_web::pagination::ListQuery,
+                req: &::autumn_web::pagination::PageRequest,
+            ) -> ::autumn_web::AutumnResult<::autumn_web::pagination::Page<#model_name>> {
+                #page_cross_shard_guard
+                use ::autumn_web::reexports::diesel::prelude::*;
+                use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                // Fallback no-ops for hand-written models; the `#[model]`-generated
+                // inherent methods take precedence when present.
+                #[allow(unused_imports)]
+                use ::autumn_web::pagination::AutumnListable as _;
+                let __tenant = if self.across_tenants {
+                    ::core::option::Option::None
+                } else {
+                    let t = ::autumn_web::tenancy::CURRENT_TENANT.try_with(|t| t.clone()).ok().flatten()
+                        .ok_or_else(|| ::autumn_web::AutumnError::internal_server_error_msg("Query scoped to tenant, but no tenant context was established"))?;
+                    ::core::option::Option::Some(t)
+                };
+                let mut conn = self.__autumn_acquire_read_conn().await?;
+
+                let mut __count_q = #table_ident::table.into_boxed() #sd_filter;
+                if let ::core::option::Option::Some(ref t) = __tenant {
+                    __count_q = __count_q.filter(#table_ident::tenant_id.eq(t.clone()));
+                }
+                let __count_q = #model_name::__autumn_list_apply_filters(__count_q, query);
+                let total: i64 = __count_q
+                    .count()
+                    .get_result::<i64>(&mut conn)
+                    .await
+                    .map_err(::autumn_web::AutumnError::from)?;
+
+                let mut __page_q = #table_ident::table.into_boxed() #sd_filter;
+                if let ::core::option::Option::Some(ref t) = __tenant {
+                    __page_q = __page_q.filter(#table_ident::tenant_id.eq(t.clone()));
+                }
+                let __page_q = #model_name::__autumn_list_apply_filters(__page_q, query);
+                let __page_q = #model_name::__autumn_list_apply_order(__page_q, query);
+                let items: ::std::vec::Vec<#model_name> = __page_q
+                    .limit(req.limit())
+                    .offset(req.offset())
+                    .select(#model_name::as_select())
+                    .load::<#model_name>(&mut conn)
+                    .await
+                    .map_err(::autumn_web::AutumnError::from)?;
+                ::core::result::Result::Ok(::autumn_web::pagination::Page::new(items, total, req))
+            }
+        }
+    } else {
+        quote! {
+            async fn list(
+                &self,
+                query: &::autumn_web::pagination::ListQuery,
+                req: &::autumn_web::pagination::PageRequest,
+            ) -> ::autumn_web::AutumnResult<::autumn_web::pagination::Page<#model_name>> {
+                use ::autumn_web::reexports::diesel::prelude::*;
+                use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                // Fallback no-ops for hand-written models; the `#[model]`-generated
+                // inherent methods take precedence when present.
+                #[allow(unused_imports)]
+                use ::autumn_web::pagination::AutumnListable as _;
+                let mut conn = self.__autumn_acquire_read_conn().await?;
+
+                let __count_q = #table_ident::table.into_boxed() #sd_filter;
+                let __count_q = #model_name::__autumn_list_apply_filters(__count_q, query);
+                let total: i64 = __count_q
+                    .count()
+                    .get_result::<i64>(&mut conn)
+                    .await
+                    .map_err(::autumn_web::AutumnError::from)?;
+
+                let __page_q = #table_ident::table.into_boxed() #sd_filter;
+                let __page_q = #model_name::__autumn_list_apply_filters(__page_q, query);
+                let __page_q = #model_name::__autumn_list_apply_order(__page_q, query);
+                let items: ::std::vec::Vec<#model_name> = __page_q
+                    .limit(req.limit())
+                    .offset(req.offset())
+                    .select(#model_name::as_select())
+                    .load::<#model_name>(&mut conn)
+                    .await
+                    .map_err(::autumn_web::AutumnError::from)?;
+                ::core::result::Result::Ok(::autumn_web::pagination::Page::new(items, total, req))
+            }
+        }
+    };
+
     // `cursor_page` is only generated when the user declares `cursor_key = field`.
     //
     // Two modes depending on whether `cursor_key_type` is also declared:
@@ -13762,6 +13875,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             fn count(&self) -> impl ::std::future::Future<Output = ::autumn_web::AutumnResult<i64>> + Send;
             fn exists_by_id(&self, id: i64) -> impl ::std::future::Future<Output = ::autumn_web::AutumnResult<bool>> + Send;
             #pagination_trait_method
+            #list_trait_method
             #cursor_page_trait_method
             #(#derived_trait_methods)*
             #soft_delete_trait_methods
@@ -13849,6 +13963,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
 
             #pagination_impl_method
+            #list_impl_method
             #cursor_page_impl_method
             #(#derived_impl_methods)*
             #soft_delete_impl_methods
@@ -17029,6 +17144,39 @@ mod tests {
             !destroy_arm.contains("publish_oob")
                 && !destroy_arm.contains("__ret_broadcasts . push"),
             "a commit_hooks child must not also accumulate/publish the inline broadcast (no double emit): {destroy_arm}"
+        );
+    }
+
+    #[test]
+    fn repository_generates_typed_list_method() {
+        // #1126: `list()` is generated alongside `page()` and delegates
+        // ordering/filtering to the model's typed, allowlisted helpers — never
+        // raw SQL built from request input.
+        let generated = repository_macro(
+            quote! { Post, api = "/api/posts" },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        assert!(
+            generated.contains("fn list"),
+            "repository must declare a `list` method: {generated}"
+        );
+        assert!(
+            generated.contains("Post :: __autumn_list_apply_filters")
+                && generated.contains("Post :: __autumn_list_apply_order"),
+            "list() must apply sort/filter through the model's typed allowlist helpers: {generated}"
+        );
+        assert!(
+            generated.contains("into_boxed"),
+            "list() must build a boxed Diesel query (typed DSL), not string SQL: {generated}"
+        );
+        // The `list` body must not fabricate a raw ORDER BY / sql_query from the
+        // request — the allowlist helpers are the only ordering path.
+        let list_pos = generated.find("async fn list").expect("list impl present");
+        let list_body = &generated[list_pos..(list_pos + 2500).min(generated.len())];
+        assert!(
+            !list_body.contains("ORDER BY") && !list_body.contains("sql_query"),
+            "list() must not interpolate request-derived ORDER BY / raw SQL: {list_body}"
         );
     }
 

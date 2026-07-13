@@ -696,47 +696,11 @@ pub fn property_list(rows: &[(&str, maud::Markup)]) -> maud::Markup {
 
 /// Sort direction for a [`data_table`] sortable column header.
 ///
-/// `Asc` is the default. Use [`SortDir::toggled`] to flip the direction
-/// when building sort links for the active column.
+/// Re-exported from [`crate::pagination`] so the widget layer and the
+/// `ListQuery`/`list()` query layer share a single canonical type — a
+/// `data_table` renders exactly the direction the repository applies.
 #[cfg(feature = "maud")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum SortDir {
-    /// Ascending order (default).
-    #[default]
-    Asc,
-    /// Descending order.
-    Desc,
-}
-
-#[cfg(feature = "maud")]
-impl SortDir {
-    /// Query-parameter value: `"asc"` or `"desc"`.
-    #[must_use]
-    pub const fn param_value(self) -> &'static str {
-        match self {
-            Self::Asc => "asc",
-            Self::Desc => "desc",
-        }
-    }
-
-    /// `aria-sort` attribute value: `"ascending"` or `"descending"`.
-    #[must_use]
-    pub const fn aria_value(self) -> &'static str {
-        match self {
-            Self::Asc => "ascending",
-            Self::Desc => "descending",
-        }
-    }
-
-    /// Returns the opposite direction.
-    #[must_use]
-    pub const fn toggled(self) -> Self {
-        match self {
-            Self::Asc => Self::Desc,
-            Self::Desc => Self::Asc,
-        }
-    }
-}
+pub use crate::pagination::SortDir;
 
 /// A single column definition for [`data_table`].
 ///
