@@ -5745,7 +5745,22 @@ pub fn run(opts: DoctorOptions) {
         .and_then(|v| v.try_into::<DeployConfig>().ok())
     {
         let deploy_signing = resolve_optional_signing_secret();
-        let deploy_db_url = db_topology.primary_url;
+        // Derive the deploy DB-URL preflight input from the SAME merged
+        // active-profile table used for `deploy_cfg` (base autumn.toml +
+        // [profile.<env>] + autumn-<env>.toml), exactly like the sibling
+        // profile-aware checks above — NOT the pre-merge `db_topology` built from
+        // the raw top-level `toml_table`. A database URL supplied only by the
+        // active profile (`[profile.<env>].database` / `autumn-<env>.toml`) is
+        // invisible to the raw table, so a raw-table lookup would fail
+        // `deploy_database_url` under `--strict` even though `AutumnConfig::load()`
+        // and `autumn deploy check` see it. Env-var precedence is preserved
+        // (`resolve_database_topology` reads env first, then the merged table).
+        let deploy_db_topology = resolve_database_topology(Some(&merged_deploy_toml));
+        let deploy_db_url = deploy_db_topology.primary_url;
+        // A `[database]` present in the merged runtime table marks the app as
+        // database-backed even without a migrations directory, so `grade_database_url`
+        // requires a URL. A DB-free app (no `[database]`, no migrations dir) passes.
+        let deploy_db_configured = merged_deploy_toml.get("database").is_some();
 
         if opts.online {
             let host = deploy_cfg.host.clone();
@@ -5771,7 +5786,11 @@ pub fn run(opts: DoctorOptions) {
         tasks.push(Box::new(move || {
             deploy_preflight_result(
                 "deploy_database_url",
-                crate::deploy::grade_database_url(deploy_db_url.as_deref()),
+                crate::deploy::grade_database_url(
+                    deploy_db_url.as_deref(),
+                    std::path::Path::new("migrations"),
+                    deploy_db_configured,
+                ),
             )
         }));
         tasks.push(Box::new(|| {

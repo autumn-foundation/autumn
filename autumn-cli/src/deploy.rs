@@ -258,10 +258,25 @@ pub fn grade_signing_secret(secret: Option<&str>) -> PreflightCheck {
 }
 
 /// Grade database-URL presence. Never prints the URL (it may embed credentials).
+///
+/// The URL is only *required* when the app is database-backed — either a
+/// migrations directory exists (the same presence check [`grade_migrate_check`]
+/// uses, so the two graders agree) or a `[database]` section is configured. A
+/// zero-dependency, daemon-style app with neither has nothing to connect to, so
+/// the grader passes with a "no database configured" note instead of failing
+/// preflight unconditionally.
 #[must_use]
-pub fn grade_database_url(url: Option<&str>) -> PreflightCheck {
+pub fn grade_database_url(
+    url: Option<&str>,
+    migrations_dir: &Path,
+    database_configured: bool,
+) -> PreflightCheck {
     match url.map(str::trim).filter(|u| !u.is_empty()) {
         Some(_) => PreflightCheck::pass("database_url", "database URL is configured"),
+        None if !migrations_dir.exists() && !database_configured => PreflightCheck::pass(
+            "database_url",
+            "no database configured (nothing to connect to)",
+        ),
         None => PreflightCheck::fail(
             "database_url",
             "no database URL configured",
@@ -494,6 +509,14 @@ fn collect_preflight(
     config: &AutumnConfig,
     resolved: &ResolvedDeployConfig,
 ) -> Vec<PreflightCheck> {
+    // A `[database]` is considered configured when any connection URL is set on
+    // the loaded config (primary/compat `url` or a replica-only role). Combined
+    // with the migrations-dir presence check inside `grade_database_url`, this
+    // marks the app as database-backed so a missing URL fails preflight — while a
+    // DB-free app (no URLs, no migrations) passes.
+    let database_configured = config.database.url.is_some()
+        || config.database.primary_url.is_some()
+        || config.database.replica_url.is_some();
     vec![
         grade_ssh_reachability(
             resolved.host.as_deref(),
@@ -501,7 +524,11 @@ fn collect_preflight(
             SSH_PROBE_TIMEOUT,
         ),
         grade_signing_secret(config.security.signing_secret.secret.as_deref()),
-        grade_database_url(config.database.effective_primary_url()),
+        grade_database_url(
+            config.database.effective_primary_url(),
+            Path::new(MIGRATIONS_DIR),
+            database_configured,
+        ),
         grade_migrate_check(Path::new(MIGRATIONS_DIR)),
     ]
 }
@@ -732,10 +759,48 @@ mod tests {
 
     #[test]
     fn database_url_grader_never_echoes_value() {
-        let present = grade_database_url(Some("postgres://user:pw@host/db"));
+        // Force the DB-backed path so the missing-URL case still fails: a
+        // configured `[database]` marks the app as database-backed.
+        let absent = Path::new("autumn-deploy-no-such-migrations-dir-echo-guard");
+        let present = grade_database_url(Some("postgres://user:pw@host/db"), absent, true);
         assert!(present.passed);
         assert!(!present.detail.contains("pw"));
-        assert!(!grade_database_url(None).passed);
+        assert!(!grade_database_url(None, absent, true).passed);
+    }
+
+    #[test]
+    fn database_url_grader_passes_for_db_free_app() {
+        // No migrations directory and no configured `[database]`: a
+        // zero-dependency daemon app has nothing to connect to, so preflight
+        // must pass rather than require a URL.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let absent_migrations = tmp.path().join("migrations");
+        assert!(!absent_migrations.exists());
+        let check = grade_database_url(None, &absent_migrations, false);
+        assert!(
+            check.passed,
+            "DB-free app should pass the DB-URL preflight: {}",
+            check.detail
+        );
+    }
+
+    #[test]
+    fn database_url_grader_fails_for_db_backed_app_without_url() {
+        // A migrations directory (the same presence check `grade_migrate_check`
+        // uses) marks the app as database-backed, so a missing URL must fail
+        // with an actionable hint.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let migrations = tmp.path().join("migrations");
+        std::fs::create_dir(&migrations).unwrap();
+        let check = grade_database_url(None, &migrations, false);
+        assert!(
+            !check.passed,
+            "DB-backed app without a URL should fail preflight"
+        );
+        assert!(
+            check.hint.is_some(),
+            "the failure should carry an actionable remediation hint"
+        );
     }
 
     #[test]
