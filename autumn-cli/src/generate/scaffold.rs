@@ -430,6 +430,26 @@ pub fn plan_scaffold_with_options(
         && !options_with_key.live
         && !options_with_key.live_validation;
 
+    // Issue #1319 security guard: the generated `GET /{plural}/search` handler calls
+    // the repository's UNSCOPED `search_page`, which returns rows for ALL users. When
+    // the model is owner-scoped, the index view is `#[secured]` and filters to the
+    // current user's rows — so pairing `--searchable` with owner scoping would leak
+    // other users' rows through the search endpoint that the list view prevents.
+    // Owner-scoped FTS needs a scoped `search_page` in the repository macro (framework
+    // work, tracked in #1841); until then, refuse the unsafe combination. Returns
+    // before the plan is built, so no files are written.
+    if !options_with_key.model.searchable.is_empty() && authorize_wiring {
+        return Err(GenerateError::Config(format!(
+            "`--searchable` is not yet supported for owner-scoped models: full-text search \
+             (`search_page`) is not owner-scoped, so the generated `GET /{plural}/search` \
+             endpoint would expose other users' rows that the `#[secured]` index view \
+             filters out (owner column `{owner}`). Remove `--searchable`, drop the owner \
+             column, or pass `--no-policy` to opt out of owner scoping. Track: framework \
+             support for owner-scoped FTS (issue #1841).",
+            owner = owner_column.as_ref().map_or("user_id", |o| o.name.as_str()),
+        )));
+    }
+
     // `references` columns whose target model can't be found in the project
     // (same presence test `check_reference_targets` used for its warning —
     // the table presumably exists out-of-band, or gets generated later).
@@ -9126,6 +9146,84 @@ async fn main() {
             !tmp.path().join("src/models/post.rs").exists()
                 && !tmp.path().join("src/repositories/post.rs").exists(),
             "rejected uuid+searchable scaffold must not write any files"
+        );
+    }
+
+    /// Issue #1319 security guard: `--searchable` on an owner-scoped model is
+    /// rejected before any files are written. The owner-scoped index is
+    /// `#[secured]` and filters to the current user, but the FTS `search_page`
+    /// is unscoped, so the `/search` endpoint would leak other users' rows.
+    #[test]
+    fn searchable_with_owner_scoped_model_is_rejected() {
+        let tmp = project_with_main(default_main());
+        // `user_id` is an owner column, so the default policy makes the index
+        // owner-scoped (`authorize_wiring`). Pairing that with `--searchable`
+        // must be refused.
+        let err = plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &[
+                "user_id:i64".into(),
+                "title:String".into(),
+                "body:Text".into(),
+            ],
+            "20260427000000",
+            &ScaffoldOptions {
+                model: ModelOptions {
+                    searchable: vec!["title".into(), "body".into()],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            matches!(err, GenerateError::Config(_)),
+            "expected Config error, got: {err:?}"
+        );
+        assert!(
+            msg.contains("--searchable")
+                && msg.contains("owner-scoped")
+                && msg.contains("search_page"),
+            "error must explain the owner-scoped FTS leak: {msg}"
+        );
+        // No files written: the scaffold plan fails before touching the tree.
+        assert!(
+            !tmp.path().join("src/models/post.rs").exists()
+                && !tmp.path().join("src/repositories/post.rs").exists(),
+            "rejected owner-scoped +searchable scaffold must not write any files"
+        );
+    }
+
+    /// The owner-scoped guard is scoped to owner scoping: `--no-policy` opts out
+    /// of the secured index, so `--searchable` with an owner column is allowed
+    /// (index and search are both unscoped — consistent, no leak relative to the
+    /// list view).
+    #[test]
+    fn searchable_with_owner_column_but_no_policy_is_allowed() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &[
+                "user_id:i64".into(),
+                "title:String".into(),
+                "body:Text".into(),
+            ],
+            "20260427000000",
+            &ScaffoldOptions {
+                model: ModelOptions {
+                    searchable: vec!["title".into(), "body".into()],
+                    ..Default::default()
+                },
+                no_policy: true,
+                ..Default::default()
+            },
+        );
+        assert!(
+            plan.is_ok(),
+            "--searchable + owner column + --no-policy must be allowed: {plan:?}"
         );
     }
 
