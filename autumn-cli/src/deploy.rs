@@ -27,6 +27,16 @@ const SSH_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Default migrations directory scanned by the `migrate check` preflight grader.
 const MIGRATIONS_DIR: &str = "migrations";
 
+/// Detail shown when no deploy target host is configured. Shared by the offline
+/// host-present grader and the online SSH-reachability probe so `autumn deploy
+/// check` and `autumn doctor` report the missing-host case identically.
+const DEPLOY_HOST_MISSING_DETAIL: &str = "no target host configured";
+
+/// Remediation hint for a missing/blank `[deploy] host`. Shared so every surface
+/// (offline `doctor`, online `deploy check`) points at the same fix.
+const DEPLOY_HOST_MISSING_HINT: &str =
+    "Set `[deploy] host` in autumn.toml to your server's SSH-reachable address";
+
 /// Errors surfaced by `autumn deploy`.
 #[derive(Debug, thiserror::Error)]
 pub enum DeployError {
@@ -180,9 +190,31 @@ impl PreflightCheck {
 
 // ── Preflight graders (AC-6) ─────────────────────────────────────────────────
 
+/// Grade that a deploy target host is configured — a pure, OFFLINE check with no
+/// network I/O. This is deliberately split out from [`grade_ssh_reachability`]
+/// (which performs a TCP probe) so `autumn doctor` can validate host presence
+/// unconditionally — even without `--online` — while keeping the actual TCP
+/// connect behind `--online`. A `[deploy]` table with a missing/blank `host`
+/// makes `autumn deploy check` fail immediately, so `doctor` must fail on it too
+/// rather than green-lighting a config the deploy path rejects.
+#[must_use]
+pub fn grade_deploy_host_present(host: Option<&str>) -> PreflightCheck {
+    match host.map(str::trim).filter(|h| !h.is_empty()) {
+        Some(_) => PreflightCheck::pass("deploy_host", "deploy target host is configured"),
+        None => PreflightCheck::fail(
+            "deploy_host",
+            DEPLOY_HOST_MISSING_DETAIL,
+            DEPLOY_HOST_MISSING_HINT,
+        ),
+    }
+}
+
 /// Grade SSH reachability: a bounded, non-interactive TCP connect to the SSH
 /// port. This slice does not shell out to `ssh` (that lands with real remote
 /// execution) — an honest "the port is reachable" probe is sufficient here.
+///
+/// The missing-host case reuses the same detail/hint as the offline
+/// [`grade_deploy_host_present`] grader so the two surfaces stay consistent.
 #[must_use]
 pub fn grade_ssh_reachability(
     host: Option<&str>,
@@ -192,8 +224,8 @@ pub fn grade_ssh_reachability(
     let Some(host) = host.map(str::trim).filter(|h| !h.is_empty()) else {
         return PreflightCheck::fail(
             "ssh_reachability",
-            "no target host configured",
-            "Set `[deploy] host` in autumn.toml to your server's SSH-reachable address",
+            DEPLOY_HOST_MISSING_DETAIL,
+            DEPLOY_HOST_MISSING_HINT,
         );
     };
 
@@ -375,9 +407,23 @@ pub fn render_systemd_unit(cfg: &ResolvedDeployConfig) -> String {
 ///
 /// The sequence encodes the framework's `/live`-`/ready`-drain contract:
 /// migrations run *before* cutover (a failed migration leaves the old version
-/// serving), the new release must report `/ready` within the bounded window
-/// (else roll back), traffic flips only after readiness, and the old release is
-/// drained and pruned last.
+/// serving), the candidate must report `/ready` within the bounded window (else
+/// roll back), traffic is handed over only after readiness, and the old release
+/// is drained and pruned last.
+///
+/// **The candidate never binds the live `server.port`.** For the default TCP
+/// serving config the running app binds `server.host:server.port`, so starting
+/// the candidate on that same port while the old release is still serving would
+/// fail with "address already in use" *before* the readiness gate could ever
+/// run — the plan would not be executable. The candidate is therefore started on
+/// a SEPARATE listener (a distinct port/socket from the live service), and a
+/// later explicit handoff step switches live traffic to it.
+///
+/// **The concrete handoff mechanism is an open design decision for the execution
+/// follow-up.** This slice emits a mechanism-neutral PLAN: the cutover is
+/// described as a "reverse-proxy upstream swap or systemd socket-activation
+/// handoff" without committing to either in code. Whatever is chosen, the plan
+/// must never imply the candidate binds the live `server.port`.
 #[must_use]
 pub fn build_deploy_plan(cfg: &ResolvedDeployConfig) -> Vec<DeployStep> {
     vec![
@@ -397,27 +443,31 @@ pub fn build_deploy_plan(cfg: &ResolvedDeployConfig) -> Vec<DeployStep> {
             "Run pending migrations BEFORE cutover — abort here leaves the current version serving",
         ),
         DeployStep::new(
-            "start",
-            "Start the new release as a candidate (old version still serving traffic)",
+            "start-candidate",
+            "Start the new release as a candidate on a SEPARATE listener (a distinct \
+             port/socket from the live service) — it does NOT bind the live \
+             `server.port`, so the old release keeps serving traffic uninterrupted",
         ),
         DeployStep::new(
             "readiness-gate",
             format!(
-                "Poll the new release's /ready within {}s — roll back on timeout",
+                "Poll the candidate's /ready on its separate listener within {}s — roll back on \
+                 timeout",
                 cfg.readiness_timeout_secs
             ),
         ),
         DeployStep::new(
             "cutover",
             format!(
-                "Flip the {} symlink to the new release and reload the {} service",
+                "Hand live traffic over to the candidate — reverse-proxy upstream swap or systemd \
+                 socket-activation handoff (mechanism finalized in the execution slice) — then \
+                 promote it by pointing the {} symlink at the new release",
                 cfg.current_symlink(),
-                cfg.service_name
             ),
         ),
         DeployStep::new(
             "drain",
-            "Drain and stop the old release once cutover completes",
+            "Drain and stop the previous release once traffic has moved to the candidate",
         ),
         DeployStep::new(
             "prune",
@@ -690,6 +740,10 @@ mod tests {
             .iter()
             .position(|&l| l == "migrate")
             .expect("migrate step");
+        let candidate = labels
+            .iter()
+            .position(|&l| l == "start-candidate")
+            .expect("start-candidate step");
         let readiness = labels
             .iter()
             .position(|&l| l == "readiness-gate")
@@ -698,13 +752,53 @@ mod tests {
             .iter()
             .position(|&l| l == "cutover")
             .expect("cutover step");
+        let drain = labels
+            .iter()
+            .position(|&l| l == "drain")
+            .expect("drain step");
 
-        // Migrations run before the readiness gate, which runs before cutover.
+        // (c) Migrations run before the readiness gate, which runs before cutover.
         assert!(
             migrate < readiness,
             "migrations must precede the readiness gate"
         );
+        assert!(
+            migrate < cutover,
+            "migrations must precede cutover (a failed migration leaves the old version serving)"
+        );
         assert!(readiness < cutover, "readiness gate must precede cutover");
+
+        // (a) The candidate is started on a SEPARATE/distinct listener and the
+        // step must NOT claim it binds the live `server.port` — starting on the
+        // live port while the old release still serves would fail with
+        // address-in-use before the readiness gate could run.
+        let candidate_desc = &plan[candidate].description;
+        let candidate_lc = candidate_desc.to_lowercase();
+        assert!(
+            candidate_lc.contains("separate") || candidate_lc.contains("distinct"),
+            "candidate must start on a separate/distinct listener: {candidate_desc}"
+        );
+        assert!(
+            candidate_lc.contains("does not bind") || candidate_lc.contains("not bind"),
+            "candidate step must state it does NOT bind the live port: {candidate_desc}"
+        );
+
+        // (b) An explicit traffic-handoff/cutover step runs AFTER the readiness
+        // gate and BEFORE draining the old release.
+        assert!(
+            readiness < cutover,
+            "handoff must follow the readiness gate"
+        );
+        assert!(
+            cutover < drain,
+            "traffic handoff must precede draining the old release"
+        );
+        let cutover_desc = &plan[cutover].description.to_lowercase();
+        assert!(
+            cutover_desc.contains("hand") || cutover_desc.contains("traffic"),
+            "cutover must describe a traffic handoff: {}",
+            plan[cutover].description
+        );
 
         // The readiness gate is bounded by the configured timeout and mentions
         // rollback on timeout (AC-4).
@@ -741,6 +835,33 @@ mod tests {
             restart < reprobe,
             "restart must precede the /ready re-probe"
         );
+    }
+
+    #[test]
+    fn deploy_host_present_grader_is_offline_and_flags_missing_host() {
+        // Present, non-blank host → passes with no network I/O.
+        let ok = grade_deploy_host_present(Some("203.0.113.10"));
+        assert!(ok.passed);
+        assert_eq!(ok.name, "deploy_host");
+
+        // Missing host → fails offline with the actionable `[deploy] host` hint,
+        // matching the message `deploy check` uses.
+        let missing = grade_deploy_host_present(None);
+        assert!(!missing.passed, "missing host must fail offline");
+        assert_eq!(missing.name, "deploy_host");
+        assert_eq!(missing.detail, DEPLOY_HOST_MISSING_DETAIL);
+        assert!(missing.hint.unwrap().contains("[deploy] host"));
+
+        // Blank/whitespace host is treated the same as unset.
+        let blank = grade_deploy_host_present(Some("   "));
+        assert!(!blank.passed, "blank host must fail offline");
+        assert_eq!(blank.detail, DEPLOY_HOST_MISSING_DETAIL);
+
+        // Consistency: the offline host-present grader and the online SSH probe
+        // report the missing-host case identically.
+        let probe = grade_ssh_reachability(None, 22, Duration::from_millis(50));
+        assert_eq!(probe.detail, missing.detail);
+        assert_eq!(probe.hint, missing.hint);
     }
 
     #[test]

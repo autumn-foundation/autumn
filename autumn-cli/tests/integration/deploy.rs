@@ -86,6 +86,30 @@ fn deploy_check_fails_fast_without_host() {
 }
 
 #[test]
+fn doctor_fails_offline_on_deploy_without_host() {
+    // A `[deploy]` table with no host makes `autumn deploy check` fail
+    // immediately, so default/OFFLINE `autumn doctor` (no `--online`) must fail
+    // on it too — the host-present validation runs offline, only the TCP probe
+    // is gated behind `--online`.
+    let dir = project("");
+    let (stdout, stderr, code) = run_autumn(dir.path(), &["doctor"], &[]);
+    let combined = format!("{stdout}{stderr}");
+    assert_ne!(
+        code,
+        Some(0),
+        "offline doctor must fail on a hostless [deploy]\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        combined.contains("deploy_host"),
+        "doctor must surface the offline deploy_host check\n{combined}"
+    );
+    assert!(
+        combined.contains("[deploy] host"),
+        "doctor must name the config key to set\n{combined}"
+    );
+}
+
+#[test]
 fn deploy_help_lists_subcommands() {
     let dir = tempfile::tempdir().expect("temp dir");
     let (stdout, stderr, code) = run_autumn(dir.path(), &["deploy", "--help"], &[]);

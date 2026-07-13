@@ -5818,8 +5818,23 @@ pub fn run(opts: DoctorOptions) {
         // requires a URL. A DB-free app (no `[database]`, no migrations dir) passes.
         let deploy_db_configured = merged_deploy_toml.get("database").is_some();
 
+        // Host presence is validated OFFLINE (always, whenever `[deploy]` is
+        // configured): a `[deploy]` table with a missing/blank `host` makes
+        // `autumn deploy check` fail immediately, so default/offline `doctor
+        // --strict` must fail on it too rather than green-lighting a config the
+        // deploy path rejects. Only the actual TCP connect probe is gated behind
+        // `--online`.
+        let host = deploy_cfg.host.clone();
+        tasks.push(Box::new({
+            let host = host.clone();
+            move || {
+                deploy_preflight_result(
+                    "deploy_host",
+                    crate::deploy::grade_deploy_host_present(host.as_deref()),
+                )
+            }
+        }));
         if opts.online {
-            let host = deploy_cfg.host.clone();
             let ssh_port = deploy_cfg.ssh_port;
             tasks.push(Box::new(move || {
                 deploy_preflight_result(
