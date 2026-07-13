@@ -73,7 +73,6 @@ jobs:
   #   generated_validated_scaffold_round_trip_test_passes (generate.rs)
   #   controller_generates_compiles_and_lists_routes (generate.rs)
   #   controller_api_generates_json               (generate.rs)
-  #   generated_auth_totp_cargo_checks            (generate.rs)
   #   generated_job_cargo_checks                  (generate.rs)
   #   generated_channel_cargo_checks              (generate.rs)
   #   generated_channel_ws_cargo_checks           (generate.rs)
@@ -143,30 +142,6 @@ jobs:
           cargo test -p autumn-cli --test generate \
             controller_api_generates_json -- --ignored --exact
 
-      - name: Pre-fetch TOTP deps (absent from workspace Cargo.lock)
-        # totp-rs is not a workspace dep, so it is absent from the workspace
-        # Cargo.lock and not covered by rust-cache. Pre-fetching it here
-        # ensures the cargo registry cache is warm before the auth gate runs,
-        # avoiding a full download on every CI run.
-        run: |
-          tmp=$(mktemp -d)
-          cat > "$tmp/Cargo.toml" <<'TOML'
-          [package]
-          name    = "totp-prefetch"
-          version = "0.0.0"
-          edition = "2024"
-          [dependencies]
-          totp-rs = { version = "5", features = ["qr", "gen_secret", "otpauth"] }
-          TOML
-          mkdir -p "$tmp/src"
-          printf 'fn main() {}' > "$tmp/src/main.rs"
-          cargo fetch --manifest-path "$tmp/Cargo.toml"
-
-      - name: generated_auth_totp_cargo_checks
-        run: |
-          cargo test -p autumn-cli --test generate \
-            generated_auth_totp_cargo_checks -- --ignored --exact
-
       - name: generated_job_cargo_checks
         run: |
           cargo test -p autumn-cli --test generate \
@@ -186,6 +161,74 @@ jobs:
         run: |
           cargo test -p autumn-cli --test generate \
             generated_channel_smoke_test_passes -- --ignored --exact
+
+  # ── Generated-app variant conformance matrix ────────────────────────────────
+  #
+  # One matrixed job that scaffolds a fresh project in a specific "variant"
+  # shape and `cargo check --tests` the result (via the #[ignore]d conformance
+  # tests in generate.rs). Sharing a single matrixed job keeps the variants in
+  # lock-step instead of drifting across copy-pasted jobs, and lets each new
+  # variant land as one matrix leg.
+  #
+  # Legs (variant -> ignored test in autumn-cli/tests/generate.rs):
+  #   totp    -> generated_auth_totp_cargo_checks
+  #   sharded -> generated_sharded_scaffold_cargo_checks
+  #
+  # TODO: add passkeys (after #1822/#1851 merges) and searchable (needs a
+  # generated_searchable_scaffold_cargo_checks conformance test — see #1319/#1825
+  # FTS work) — tracked in #1856.
+  app-variant-conformance:
+    name: App-variant conformance (${{ matrix.variant.name }}, ${{ matrix.toolchain }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        toolchain: [stable, "1.88.0"]
+        variant:
+          - name: totp
+            test: generated_auth_totp_cargo_checks
+          - name: sharded
+            test: generated_sharded_scaffold_cargo_checks
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android \
+                      /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.toolchain }}
+
+      - uses: Swatinem/rust-cache@v2.7.8
+        continue-on-error: true
+
+      - name: Pre-fetch TOTP deps (absent from workspace Cargo.lock)
+        # totp-rs is not a workspace dep, so it is absent from the workspace
+        # Cargo.lock and not covered by rust-cache. Pre-fetching it here
+        # ensures the cargo registry cache is warm before the auth gate runs,
+        # avoiding a full download on every CI run. Only the totp leg needs it.
+        if: matrix.variant.name == 'totp'
+        run: |
+          tmp=$(mktemp -d)
+          cat > "$tmp/Cargo.toml" <<'TOML'
+          [package]
+          name    = "totp-prefetch"
+          version = "0.0.0"
+          edition = "2024"
+          [dependencies]
+          totp-rs = { version = "5", features = ["qr", "gen_secret", "otpauth"] }
+          TOML
+          mkdir -p "$tmp/src"
+          printf 'fn main() {}' > "$tmp/src/main.rs"
+          cargo fetch --manifest-path "$tmp/Cargo.toml"
+
+      - name: ${{ matrix.variant.test }}
+        run: |
+          cargo test -p autumn-cli --test generate \
+            ${{ matrix.variant.test }} -- --ignored --exact
 
   # ── Postgres e2e gate ────────────────────────────────────────────────────────
   #
