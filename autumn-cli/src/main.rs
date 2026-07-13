@@ -33,6 +33,7 @@ mod plugin_check;
 mod process;
 mod release;
 mod routes;
+mod routes_audit;
 mod scaling_driver;
 mod seed;
 mod serve;
@@ -55,6 +56,36 @@ pub enum CheckSubcommands {
         /// Binary target to check (for packages with multiple bin targets)
         #[arg(long, value_name = "BIN")]
         bin: Option<String>,
+    },
+}
+
+/// Subcommands for `autumn routes`.
+#[derive(Subcommand, Clone, Debug, PartialEq, Eq)]
+pub enum RoutesSubcommands {
+    /// Prove route authentication coverage at build time (issue #1604).
+    ///
+    /// Compiles the app, classifies every route from its macro-expanded auth
+    /// posture, and emits a stable-ordered security manifest. Exits non-zero
+    /// when any route is unclassified — i.e. neither framework-owned, guarded
+    /// (`#[secured]` / `#[authorize]`), nor explicitly `#[public]` — naming each
+    /// offending route so it can be closed. This is the CI gate.
+    Audit {
+        /// Package to inspect (for workspaces).
+        #[arg(short, long)]
+        package: Option<String>,
+        /// Binary target to inspect (for packages with multiple bin targets).
+        #[arg(long, value_name = "BIN")]
+        bin: Option<String>,
+        /// Write the JSON security manifest to this file path.
+        #[arg(long, value_name = "PATH")]
+        manifest: Option<String>,
+        /// Emit the JSON manifest to stdout instead of the human summary.
+        #[arg(long)]
+        json: bool,
+        /// Reserved for tightening the gate; fail-on-unclassified is already the
+        /// default behavior.
+        #[arg(long)]
+        strict: bool,
     },
 }
 
@@ -725,6 +756,9 @@ enum Commands {
         /// Hide framework-internal routes (`/actuator/*`, probes, htmx assets).
         #[arg(long)]
         user_only: bool,
+        /// Optional subcommand (e.g. `audit`). When omitted, lists routes.
+        #[command(subcommand)]
+        command: Option<RoutesSubcommands>,
     },
 
     /// Measure and gate dev-loop latency for `autumn dev`.
@@ -2734,15 +2768,38 @@ fn run_command(command: Commands) {
             filter,
             method,
             user_only,
-        } => run_routes_command(
-            package.as_deref(),
-            bin.as_deref(),
-            &format,
-            prefix.as_deref(),
-            filter.as_deref(),
-            &method,
-            user_only,
-        ),
+            command,
+        } => match command {
+            Some(RoutesSubcommands::Audit {
+                package: audit_package,
+                bin: audit_bin,
+                manifest,
+                json,
+                strict,
+            }) => {
+                // Fall back to the parent `routes` target flags so both
+                // `autumn routes -p blog audit` and `autumn routes audit -p blog`
+                // select the same binary in multi-target workspaces.
+                let package = audit_package.or(package);
+                let bin = audit_bin.or(bin);
+                routes_audit::run(&routes_audit::AuditOptions {
+                    package: package.as_deref(),
+                    bin: bin.as_deref(),
+                    manifest: manifest.as_deref(),
+                    json,
+                    strict,
+                });
+            }
+            None => run_routes_command(
+                package.as_deref(),
+                bin.as_deref(),
+                &format,
+                prefix.as_deref(),
+                filter.as_deref(),
+                &method,
+                user_only,
+            ),
+        },
         Commands::Release(cmd) => run_release_command(cmd),
         Commands::Token(cmd) => match cmd {
             TokenCommands::Issue {
@@ -5045,6 +5102,7 @@ mod tests {
                 filter,
                 method,
                 user_only,
+                command,
             } => {
                 assert!(package.is_none());
                 assert!(bin.is_none());
@@ -5053,6 +5111,7 @@ mod tests {
                 assert!(filter.is_none());
                 assert!(method.is_empty());
                 assert!(!user_only);
+                assert!(command.is_none());
             }
             _ => panic!("expected Routes command"),
         }
@@ -5196,6 +5255,7 @@ mod tests {
                 filter,
                 method,
                 user_only,
+                command,
             } => {
                 assert_eq!(package.as_deref(), Some("blog"));
                 assert!(bin.is_none());
@@ -5204,6 +5264,7 @@ mod tests {
                 assert_eq!(filter.as_deref(), Some("/api"));
                 assert_eq!(method, vec!["GET", "POST"]);
                 assert!(user_only);
+                assert!(command.is_none());
             }
             _ => panic!("expected Routes command"),
         }
@@ -5231,6 +5292,106 @@ mod tests {
                 assert_eq!(package.as_deref(), Some("blog"));
                 assert_eq!(prefix.as_deref(), Some("/api"));
             }
+            _ => panic!("expected Routes command"),
+        }
+    }
+
+    #[test]
+    fn parse_routes_audit_subcommand() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "routes",
+            "audit",
+            "--manifest",
+            "target/security.json",
+            "--json",
+            "-p",
+            "blog",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Routes {
+                command:
+                    Some(RoutesSubcommands::Audit {
+                        package,
+                        manifest,
+                        json,
+                        strict,
+                        ..
+                    }),
+                ..
+            } => {
+                assert_eq!(package.as_deref(), Some("blog"));
+                assert_eq!(manifest.as_deref(), Some("target/security.json"));
+                assert!(json);
+                assert!(!strict);
+            }
+            _ => panic!("expected Routes audit subcommand"),
+        }
+    }
+
+    /// Parent `-p`/`--bin` flags placed before the `audit` subcommand land on
+    /// the parent `Routes` variant, not on `Audit`. The dispatch falls back to
+    /// them (`audit.package.or(parent.package)`), so `autumn routes -p blog
+    /// audit` and `autumn routes audit -p blog` resolve the same target (#1604).
+    #[test]
+    fn parse_routes_parent_package_flows_into_audit() {
+        // `-p blog` BEFORE `audit`: parent carries it, audit's own is None.
+        let cli = Cli::try_parse_from(["autumn", "routes", "-p", "blog", "audit"]).unwrap();
+        match cli.command {
+            Commands::Routes {
+                package: parent_package,
+                bin: parent_bin,
+                command:
+                    Some(RoutesSubcommands::Audit {
+                        package: audit_package,
+                        bin: audit_bin,
+                        ..
+                    }),
+                ..
+            } => {
+                assert_eq!(parent_package.as_deref(), Some("blog"));
+                assert_eq!(audit_package, None);
+                // The fallback the dispatch applies.
+                let resolved_package = audit_package.or(parent_package);
+                let resolved_bin = audit_bin.or(parent_bin);
+                assert_eq!(resolved_package.as_deref(), Some("blog"));
+                assert_eq!(resolved_bin, None);
+            }
+            _ => panic!("expected Routes audit subcommand"),
+        }
+    }
+
+    /// The subcommand's own `-p`/`--bin` (placed after `audit`) still win — the
+    /// fallback only fills in when the audit value is `None`.
+    #[test]
+    fn parse_routes_audit_own_package_takes_precedence() {
+        let cli =
+            Cli::try_parse_from(["autumn", "routes", "-p", "blog", "audit", "-p", "shop"]).unwrap();
+        match cli.command {
+            Commands::Routes {
+                package: parent_package,
+                command:
+                    Some(RoutesSubcommands::Audit {
+                        package: audit_package,
+                        ..
+                    }),
+                ..
+            } => {
+                assert_eq!(parent_package.as_deref(), Some("blog"));
+                assert_eq!(audit_package.as_deref(), Some("shop"));
+                let resolved = audit_package.or(parent_package);
+                assert_eq!(resolved.as_deref(), Some("shop"));
+            }
+            _ => panic!("expected Routes audit subcommand"),
+        }
+    }
+
+    #[test]
+    fn parse_routes_without_subcommand_lists() {
+        let cli = Cli::try_parse_from(["autumn", "routes"]).unwrap();
+        match cli.command {
+            Commands::Routes { command, .. } => assert!(command.is_none()),
             _ => panic!("expected Routes command"),
         }
     }

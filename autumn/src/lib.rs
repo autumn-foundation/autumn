@@ -1069,6 +1069,25 @@ pub use auth::API_TOKEN_MIGRATIONS;
 /// ```
 pub use autumn_macros::secured;
 
+/// Declare a route handler as deliberately public (unauthenticated).
+///
+/// A compile-time marker that records intent: it injects no runtime guard and
+/// leaves the handler signature untouched, but surfaces on the route's
+/// [`ApiDoc::public`](crate::openapi::ApiDoc::public) so the build-time security
+/// classifier (`autumn routes audit`) treats the route as an explicit opt-out
+/// of authentication rather than an oversight.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use autumn_web::prelude::*;
+///
+/// #[get("/pricing")]
+/// #[public]
+/// async fn pricing() -> &'static str { "free" }
+/// ```
+pub use autumn_macros::public;
+
 /// Require fresh ("step-up") authentication before a route handler runs.
 ///
 /// The handler is guarded by a freshness check on the session's

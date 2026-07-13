@@ -147,6 +147,7 @@ pub fn route_macro(
     let response_body = api_doc::schema_option(api_doc::infer_response_body(&input_fn));
     let query_schema = api_doc::schema_option(api_doc::infer_query_params(&input_fn));
     let (secured, required_roles, required_scopes) = api_doc::extract_secured_info(&input_fn);
+    let is_public = api_doc::is_public(&input_fn);
     let has_feature_flag = has_feature_flag_attr || has_expanded_feature_flag_gate(&input_fn);
     let body_guarded_replay = secured
         || has_authorize_guard(&input_fn)
@@ -222,6 +223,8 @@ pub fn route_macro(
                     api_version: #api_version_expr,
                     sunset_opt_out: #sunset_opt_out_val,
                     has_policy: #has_policy_val,
+                    public: #is_public,
+                    module_path: ::core::module_path!(),
                     #api_doc_fields
                 },
                 repository: ::core::option::Option::None,
@@ -721,6 +724,58 @@ mod tests {
         assert!(
             generated.contains("from_millis") && generated.contains("120000"),
             "override must carry the configured millisecond budget: {generated}"
+        );
+    }
+
+    #[test]
+    fn route_macro_defaults_public_false() {
+        let generated = route_macro(
+            "POST",
+            "post",
+            quote! { "/widgets" },
+            quote! { async fn create_widget() -> &'static str { "ok" } },
+        )
+        .to_string();
+        assert!(
+            generated.contains("public : false"),
+            "an unannotated route must record public = false: {generated}"
+        );
+        // The handler's module path is captured for audit diagnostics.
+        assert!(generated.contains("module_path"));
+    }
+
+    #[test]
+    fn route_macro_marks_public_when_public_attribute_present() {
+        // Ordering A: `#[post]` outermost, `#[public]` still an attribute below.
+        let generated = route_macro(
+            "POST",
+            "post",
+            quote! { "/pricing" },
+            quote! {
+                #[public]
+                async fn pricing() -> &'static str { "free" }
+            },
+        )
+        .to_string();
+        assert!(
+            generated.contains("public : true"),
+            "a #[public] handler must record public = true: {generated}"
+        );
+    }
+
+    #[test]
+    fn route_macro_marks_public_from_expanded_marker() {
+        // Ordering B: `#[public]` written above `#[post]`, so it expands first and
+        // injects the `__AUTUMN_PUBLIC` marker into the body; the route macro must
+        // recognize the marker.
+        let public_fn = crate::public::public_macro(
+            quote! {},
+            quote! { async fn pricing() -> &'static str { "free" } },
+        );
+        let generated = route_macro("POST", "post", quote! { "/pricing" }, public_fn).to_string();
+        assert!(
+            generated.contains("public : true"),
+            "a route macro over an expanded #[public] marker must record public = true: {generated}"
         );
     }
 

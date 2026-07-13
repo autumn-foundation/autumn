@@ -32,8 +32,8 @@ pub use autumn_macros::ws;
 /// HTTP method route macros, main macro, and route collection.
 pub use autumn_macros::{
     api_doc, authorize, cached, delete, event, feature_flag, get, job, jobs, listener, listeners,
-    main, oauth2_callback, one_off_tasks, patch, paths, post, put, routes, scheduled, secured,
-    service, static_get, static_routes, step_up, task, tasks, throttle,
+    main, oauth2_callback, one_off_tasks, patch, paths, post, public, put, routes, scheduled,
+    secured, service, static_get, static_routes, step_up, task, tasks, throttle,
 };
 #[cfg(feature = "mail")]
 pub use autumn_macros::{mail_previews, mailer, mailer_preview};

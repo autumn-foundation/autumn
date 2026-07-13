@@ -663,6 +663,54 @@ pub fn extract_secured_info(input_fn: &syn::ItemFn) -> (bool, TokenStream, Token
     (false, quote! { &[] }, quote! { &[] })
 }
 
+/// Detect an explicit `#[public]` marker on a handler.
+///
+/// Mirrors [`extract_secured_info`]'s attribute/marker duality:
+/// 1. `#[public]` (or `#[autumn_web::public]`) still present as an attribute,
+///    which happens when the route macro is outermost and `#[public]` has not
+///    expanded yet.
+/// 2. The `__AUTUMN_PUBLIC` marker const emitted into the handler body when
+///    `#[public]` expanded before the route macro.
+pub fn is_public(input_fn: &syn::ItemFn) -> bool {
+    for attr in &input_fn.attrs {
+        if attr.path().is_ident("public")
+            || attr
+                .path()
+                .segments
+                .last()
+                .is_some_and(|s| s.ident == "public")
+        {
+            return true;
+        }
+    }
+    has_public_marker_in_stmts(&input_fn.block.stmts)
+}
+
+fn has_public_marker_in_stmts(stmts: &[syn::Stmt]) -> bool {
+    stmts.iter().any(has_public_marker_in_stmt)
+}
+
+fn has_public_marker_in_stmt(stmt: &syn::Stmt) -> bool {
+    match stmt {
+        syn::Stmt::Item(syn::Item::Const(item_const)) => item_const.ident == "__AUTUMN_PUBLIC",
+        syn::Stmt::Expr(expr, _) => has_public_marker_in_expr(expr),
+        syn::Stmt::Local(local) => local
+            .init
+            .as_ref()
+            .is_some_and(|init| has_public_marker_in_expr(&init.expr)),
+        _ => false,
+    }
+}
+
+fn has_public_marker_in_expr(expr: &syn::Expr) -> bool {
+    match expr {
+        syn::Expr::Block(block) => has_public_marker_in_stmts(&block.block.stmts),
+        syn::Expr::Async(block) => has_public_marker_in_stmts(&block.block.stmts),
+        syn::Expr::Unsafe(block) => has_public_marker_in_stmts(&block.block.stmts),
+        _ => false,
+    }
+}
+
 fn extract_secured_roles_marker(input_fn: &syn::ItemFn) -> Option<Vec<String>> {
     extract_secured_roles_marker_from_stmts(&input_fn.block.stmts)
 }
@@ -1014,5 +1062,34 @@ mod tests {
             async fn handler() {}
         };
         assert_eq!(extract_secured_scopes_marker(&input_fn), None);
+    }
+
+    // ── #[public] detection (#1604) ──────────────────────────────────────────
+
+    #[test]
+    fn is_public_detects_attribute() {
+        let input_fn: syn::ItemFn = syn::parse_quote! {
+            #[public]
+            async fn handler() {}
+        };
+        assert!(is_public(&input_fn));
+    }
+
+    #[test]
+    fn is_public_detects_body_marker() {
+        let input_fn: syn::ItemFn = syn::parse_quote! {
+            async fn handler() {
+                const __AUTUMN_PUBLIC: () = ();
+            }
+        };
+        assert!(is_public(&input_fn));
+    }
+
+    #[test]
+    fn is_public_false_for_unannotated() {
+        let input_fn: syn::ItemFn = syn::parse_quote! {
+            async fn handler() {}
+        };
+        assert!(!is_public(&input_fn));
     }
 }

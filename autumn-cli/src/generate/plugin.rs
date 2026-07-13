@@ -242,10 +242,7 @@ mod conformance_tests {{
                 path: "/autumn-{name_kebab}-plugin".to_owned(),
                 handler: "autumn_{name_snake}_plugin::index".to_owned(),
                 source: RouteSource::Plugin("autumn-{name_kebab}-plugin".to_owned()),
-                middleware: vec![],
-                api_version: None,
-                status: None,
-                sunset_opt_out: None,
+                ..Default::default()
             }},
         ];
 
