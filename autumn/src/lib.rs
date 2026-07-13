@@ -218,6 +218,14 @@ pub use plugin::{Plugin, Plugins};
 
 pub mod route_listing;
 
+/// Inbound (server-side) TLS support (issue #1603).
+///
+/// Load and validate a certificate + key, build a reloadable rustls
+/// `ServerConfig`, and inspect leaf-certificate expiry. Gated behind the
+/// off-by-default `tls` feature.
+#[cfg(feature = "tls")]
+pub mod tls;
+
 #[cfg(feature = "db")]
 pub mod sharding;
 

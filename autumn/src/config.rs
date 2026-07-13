@@ -3340,6 +3340,36 @@ impl AutumnConfig {
             "AUTUMN_SERVER__MAX_CONCURRENT_REQUESTS",
             &mut self.server.max_concurrent_requests,
         );
+
+        // `[server.tls]` is a nested optional. Materialize it from the
+        // environment when any of its keys are set (seeding an empty struct if
+        // the TOML section was absent), so a fully env-driven deployment can
+        // enable direct HTTPS without an `autumn.toml` section. A partially
+        // specified pair (e.g. only the cert) leaves the other path empty and
+        // is caught by the startup fail-fast validation.
+        let tls_cert = env.var("AUTUMN_SERVER__TLS__CERT_PATH").ok();
+        let tls_key = env.var("AUTUMN_SERVER__TLS__KEY_PATH").ok();
+        let tls_reload = env.var("AUTUMN_SERVER__TLS__RELOAD_INTERVAL_SECS").ok();
+        let tls_handshake = env.var("AUTUMN_SERVER__TLS__HANDSHAKE_TIMEOUT_SECS").ok();
+        if tls_cert.is_some()
+            || tls_key.is_some()
+            || tls_reload.is_some()
+            || tls_handshake.is_some()
+        {
+            let tls = self.server.tls.get_or_insert_with(TlsConfig::empty_for_env);
+            if let Some(cert) = tls_cert {
+                tls.cert_path = PathBuf::from(cert);
+            }
+            if let Some(key) = tls_key {
+                tls.key_path = PathBuf::from(key);
+            }
+            if let Some(reload) = tls_reload.and_then(|v| v.trim().parse::<u64>().ok()) {
+                tls.reload_interval_secs = reload;
+            }
+            if let Some(handshake) = tls_handshake.and_then(|v| v.trim().parse::<u64>().ok()) {
+                tls.handshake_timeout_secs = handshake;
+            }
+        }
     }
 
     fn apply_database_env_overrides_with_env(&mut self, env: &dyn Env) {
@@ -4505,6 +4535,82 @@ pub struct ServerConfig {
     /// Configured via `AUTUMN_SERVER__MAX_CONCURRENT_REQUESTS`.
     #[serde(default)]
     pub max_concurrent_requests: Option<usize>,
+
+    /// Terminate HTTPS directly in the app process (issue #1603).
+    ///
+    /// When set, the server serves TLS on `host:port` using the configured
+    /// certificate chain and private key — no sidecar reverse proxy required.
+    /// Absent (the default), the server keeps serving plain HTTP, so existing
+    /// applications are unaffected.
+    ///
+    /// This field is always parsed, regardless of build features, so a
+    /// misconfiguration is a clear "built without the `tls` feature" error
+    /// rather than a silently-ignored section. The serving code itself is
+    /// gated behind the off-by-default `tls` feature.
+    ///
+    /// Configured via `[server.tls]` (`cert_path`, `key_path`,
+    /// `reload_interval_secs`, `handshake_timeout_secs`) or the matching
+    /// `AUTUMN_SERVER__TLS__CERT_PATH` / `AUTUMN_SERVER__TLS__KEY_PATH` /
+    /// `AUTUMN_SERVER__TLS__RELOAD_INTERVAL_SECS` /
+    /// `AUTUMN_SERVER__TLS__HANDSHAKE_TIMEOUT_SECS` env vars.
+    #[serde(default)]
+    pub tls: Option<TlsConfig>,
+}
+
+/// Direct-HTTPS (native TLS termination) settings (issue #1603).
+///
+/// Present under `[server.tls]`; when present the server terminates TLS
+/// in-process. Both paths point at PEM files: `cert_path` at the leaf
+/// certificate followed by any intermediates, `key_path` at the matching
+/// private key (PKCS#8, PKCS#1, or SEC1).
+///
+/// # `autumn.toml` example
+///
+/// ```toml
+/// [server.tls]
+/// cert_path = "/etc/autumn/tls/fullchain.pem"
+/// key_path = "/etc/autumn/tls/privkey.pem"
+/// # optional; how often (seconds) to poll for a renewed cert. Default: 60.
+/// reload_interval_secs = 60
+/// # optional; per-handshake timeout (seconds). Default: 10.
+/// handshake_timeout_secs = 10
+/// ```
+#[derive(Debug, Clone, Deserialize)]
+pub struct TlsConfig {
+    /// Path to the PEM certificate chain (leaf first, then intermediates).
+    pub cert_path: PathBuf,
+
+    /// Path to the PEM private key matching the leaf certificate.
+    pub key_path: PathBuf,
+
+    /// How often, in seconds, the running server polls the certificate and key
+    /// files' modification times to pick up an external renewal (e.g. after
+    /// `certbot`/ACME writes new files) without a restart. Default: `60`.
+    #[serde(default = "default_tls_reload_interval_secs")]
+    pub reload_interval_secs: u64,
+
+    /// Maximum time, in seconds, allowed for a single inbound TLS handshake
+    /// before the connection is dropped. Bounds a client that opens TCP but
+    /// never completes (or starts) the handshake so it cannot park the accept
+    /// loop and deny service to everyone else. Default: `10`. A value of `0` is
+    /// clamped to `1` second.
+    #[serde(default = "default_tls_handshake_timeout_secs")]
+    pub handshake_timeout_secs: u64,
+}
+
+impl TlsConfig {
+    /// An empty `TlsConfig` used only as the seed for env-var overrides of a
+    /// section that was absent from TOML. Both paths are empty (which fails
+    /// fast at startup if left unset), and the reload interval takes its
+    /// default.
+    fn empty_for_env() -> Self {
+        Self {
+            cert_path: PathBuf::new(),
+            key_path: PathBuf::new(),
+            reload_interval_secs: default_tls_reload_interval_secs(),
+            handshake_timeout_secs: default_tls_handshake_timeout_secs(),
+        }
+    }
 }
 
 /// Behavior when a configured read replica is unavailable or stale.
@@ -5820,6 +5926,24 @@ fn default_telemetry_environment() -> String {
     "development".to_owned()
 }
 
+/// Default `[server.tls]` cert/key reload poll interval, in seconds.
+///
+/// Kept in lockstep with `crate::tls::DEFAULT_RELOAD_INTERVAL_SECS` (the
+/// serving path's constant); a literal is used here because this default must
+/// compile even when the `tls` feature — and thus `crate::tls` — is off.
+const fn default_tls_reload_interval_secs() -> u64 {
+    60
+}
+
+/// Default `[server.tls]` inbound-handshake timeout, in seconds.
+///
+/// Bounds a single TLS handshake so a client that opens TCP but never sends a
+/// `ClientHello` cannot park the accept loop. 10s is generous for a real
+/// handshake while still shedding a stalled connection promptly.
+const fn default_tls_handshake_timeout_secs() -> u64 {
+    10
+}
+
 fn default_health_path() -> String {
     "/health".to_owned()
 }
@@ -5849,6 +5973,7 @@ impl Default for ServerConfig {
             timeouts: RequestTimeoutsConfig::default(),
             unix_socket: None,
             max_concurrent_requests: None,
+            tls: None,
         }
     }
 }
@@ -9009,6 +9134,113 @@ path = "/healthz"
             config.server.unix_socket.as_deref(),
             Some("/tmp/autumn.sock")
         );
+    }
+
+    // ── server.tls (#1603) ────────────────────────────────────────
+
+    #[test]
+    fn server_config_defaults_tls_none() {
+        // Default must keep plain HTTP so existing apps are unaffected.
+        let config = AutumnConfig::default();
+        assert!(config.server.tls.is_none());
+    }
+
+    #[test]
+    fn server_tls_parses_from_toml() {
+        let config: AutumnConfig = toml::from_str(
+            r#"
+            [server.tls]
+            cert_path = "/etc/autumn/tls/fullchain.pem"
+            key_path = "/etc/autumn/tls/privkey.pem"
+            "#,
+        )
+        .expect("config with [server.tls] should parse");
+        let tls = config.server.tls.expect("tls configured");
+        assert_eq!(
+            tls.cert_path,
+            std::path::PathBuf::from("/etc/autumn/tls/fullchain.pem")
+        );
+        assert_eq!(
+            tls.key_path,
+            std::path::PathBuf::from("/etc/autumn/tls/privkey.pem")
+        );
+        // Reload interval and handshake timeout default when omitted.
+        assert_eq!(tls.reload_interval_secs, 60);
+        assert_eq!(tls.handshake_timeout_secs, 10);
+    }
+
+    #[test]
+    fn server_tls_handshake_timeout_parses_from_toml() {
+        let config: AutumnConfig = toml::from_str(
+            r#"
+            [server.tls]
+            cert_path = "cert.pem"
+            key_path = "key.pem"
+            handshake_timeout_secs = 25
+            "#,
+        )
+        .expect("config with [server.tls] handshake_timeout_secs should parse");
+        assert_eq!(config.server.tls.unwrap().handshake_timeout_secs, 25);
+    }
+
+    #[test]
+    fn server_tls_reload_interval_parses_from_toml() {
+        let config: AutumnConfig = toml::from_str(
+            r#"
+            [server.tls]
+            cert_path = "cert.pem"
+            key_path = "key.pem"
+            reload_interval_secs = 120
+            "#,
+        )
+        .expect("config with [server.tls] reload_interval_secs should parse");
+        assert_eq!(config.server.tls.unwrap().reload_interval_secs, 120);
+    }
+
+    #[test]
+    fn env_override_materializes_server_tls() {
+        // A fully env-driven deployment can enable direct HTTPS with no
+        // [server.tls] section in autumn.toml.
+        let env = MockEnv::new()
+            .with("AUTUMN_SERVER__TLS__CERT_PATH", "/env/cert.pem")
+            .with("AUTUMN_SERVER__TLS__KEY_PATH", "/env/key.pem")
+            .with("AUTUMN_SERVER__TLS__RELOAD_INTERVAL_SECS", "90")
+            .with("AUTUMN_SERVER__TLS__HANDSHAKE_TIMEOUT_SECS", "5");
+        let mut config = AutumnConfig::default();
+        assert!(config.server.tls.is_none());
+        config.apply_env_overrides_with_env(&env);
+        let tls = config.server.tls.expect("env should materialize tls");
+        assert_eq!(tls.cert_path, std::path::PathBuf::from("/env/cert.pem"));
+        assert_eq!(tls.key_path, std::path::PathBuf::from("/env/key.pem"));
+        assert_eq!(tls.reload_interval_secs, 90);
+        assert_eq!(tls.handshake_timeout_secs, 5);
+    }
+
+    #[test]
+    fn env_override_updates_existing_server_tls_cert() {
+        // An env var overrides just the cert path of a TOML-configured section,
+        // leaving the key path intact.
+        let mut config: AutumnConfig = toml::from_str(
+            r#"
+            [server.tls]
+            cert_path = "toml-cert.pem"
+            key_path = "toml-key.pem"
+            "#,
+        )
+        .unwrap();
+        let env = MockEnv::new().with("AUTUMN_SERVER__TLS__CERT_PATH", "override-cert.pem");
+        config.apply_env_overrides_with_env(&env);
+        let tls = config.server.tls.expect("tls configured");
+        assert_eq!(tls.cert_path, std::path::PathBuf::from("override-cert.pem"));
+        assert_eq!(tls.key_path, std::path::PathBuf::from("toml-key.pem"));
+    }
+
+    #[test]
+    fn no_tls_env_leaves_tls_none() {
+        let env = MockEnv::new().with("AUTUMN_SERVER__PORT", "8080");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        assert!(config.server.tls.is_none());
     }
 
     // ── server.max_concurrent_requests (#1006) ────────────────────

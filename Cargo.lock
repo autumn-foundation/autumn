@@ -536,6 +536,7 @@ dependencies = [
  "tokio-cron-scheduler",
  "tokio-postgres",
  "tokio-postgres-rustls",
+ "tokio-rustls",
  "tokio-stream",
  "tokio-tungstenite",
  "tokio-util",
@@ -551,6 +552,7 @@ dependencies = [
  "validator",
  "webauthn-rs",
  "webpki-roots 1.0.8",
+ "x509-parser",
 ]
 
 [[package]]

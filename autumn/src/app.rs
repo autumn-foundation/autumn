@@ -3274,6 +3274,47 @@ impl AppBuilder {
         // `unix_socket_cleanup` is the socket to unlink on clean exit (axum does
         // not remove it for us), as `(path, dev, inode)` so cleanup can confirm
         // the file is still the one *this* process bound before removing it.
+        // Validate `[server.tls]` wiring before we bind anything, so a
+        // misconfiguration is a clear pre-bind failure. Two cases fail fast:
+        // (1) the section is present but this binary was built without the
+        // `tls` feature — otherwise it would be silently ignored and the app
+        // would serve plain HTTP on a port operators expect to be HTTPS;
+        // (2) TLS is combined with a Unix socket, which the direct-HTTPS path
+        // does not serve over (TLS terminates on `host:port`).
+        if config.server.tls.is_some() {
+            #[cfg(not(feature = "tls"))]
+            {
+                tracing::error!(
+                    "[server.tls] is configured but this binary was built without the `tls` \
+                     feature; rebuild with `--features tls`, or remove [server.tls] to serve \
+                     plain HTTP"
+                );
+                #[cfg(feature = "managed-pg")]
+                crate::managed_pg::emergency_stop_async().await;
+                std::process::exit(1);
+            }
+            #[cfg(feature = "tls")]
+            if config.server.unix_socket.is_some() {
+                tracing::error!(
+                    "[server.tls] cannot be combined with server.unix_socket; direct TLS \
+                     terminates on host:port. Unset one of them"
+                );
+                #[cfg(feature = "managed-pg")]
+                crate::managed_pg::emergency_stop_async().await;
+                std::process::exit(1);
+            }
+        }
+
+        // Root shutdown token for all background tasks. Created before the bind
+        // block so the TLS listener's background acceptor task can take a child
+        // token and stop cleanly on shutdown (issue #1603).
+        let server_shutdown = tokio_util::sync::CancellationToken::new();
+
+        // Carries the cert/key reload wiring from the TLS bind path to the
+        // background reload task spawned once `server_shutdown` exists.
+        #[cfg(feature = "tls")]
+        let mut tls_reload_state: Option<TlsReloadState> = None;
+
         let (bound_listener, bound_desc, unix_socket_cleanup): (
             BoundListener,
             String,
@@ -3372,12 +3413,43 @@ impl AppBuilder {
                     std::process::exit(1);
                 }
             };
-            (BoundListener::Tcp(listener), addr, None)
+            // When `[server.tls]` is set (and the `tls` feature is built in),
+            // wrap the just-bound TCP listener in a rustls acceptor so the same
+            // host:port serves HTTPS. Fail fast on any cert/key problem — the
+            // pre-bind guard already rejected a Unix-socket combination and a
+            // feature-less build, so reaching here with `tls = Some` means the
+            // feature is on.
+            #[cfg(feature = "tls")]
+            {
+                if let Some(tls_cfg) = config.server.tls.as_ref() {
+                    match build_tls_listener(listener, tls_cfg, server_shutdown.child_token()) {
+                        Ok((tls_listener, reload)) => {
+                            tls_reload_state = Some(reload);
+                            (
+                                BoundListener::Tls(tls_listener),
+                                format!("https://{addr}"),
+                                None,
+                            )
+                        }
+                        Err(e) => {
+                            tracing::error!(error = %e, "Failed to configure [server.tls]");
+                            #[cfg(feature = "managed-pg")]
+                            crate::managed_pg::emergency_stop_async().await;
+                            std::process::exit(1);
+                        }
+                    }
+                } else {
+                    (BoundListener::Tcp(listener), addr, None)
+                }
+            }
+            #[cfg(not(feature = "tls"))]
+            {
+                (BoundListener::Tcp(listener), addr, None)
+            }
         };
 
         let shutdown_timeout = config.server.shutdown_timeout_secs;
         let prestop_grace = config.server.prestop_grace_secs;
-        let server_shutdown = tokio_util::sync::CancellationToken::new();
 
         if let Err(error) = initialize_job_runtime(
             jobs,
@@ -3463,6 +3535,21 @@ impl AppBuilder {
             });
         }
 
+        // TLS certificate hot-reload: poll the cert/key file mtimes on an
+        // interval and swap the served certificate in place on change (e.g.
+        // after a `certbot`/ACME renewal), so a renewal is picked up WITHOUT a
+        // restart. A child of `server_shutdown`, exactly like the presence
+        // sweep above, so it stops cleanly on shutdown. A failed reload logs an
+        // error and keeps serving the previously loaded certificate — a bad
+        // renewal never breaks the listener.
+        #[cfg(feature = "tls")]
+        if let Some(reload) = tls_reload_state.take() {
+            let reload_shutdown = server_shutdown.child_token();
+            tokio::spawn(async move {
+                run_tls_cert_reload(reload, reload_shutdown).await;
+            });
+        }
+
         tracing::info!(bound = %bound_desc, "Listening");
 
         let server_shutdown_wait = server_shutdown.clone();
@@ -3519,6 +3606,31 @@ impl AppBuilder {
                 let make_service =
                     axum::ServiceExt::<axum::extract::Request>::into_make_service_with_connect_info::<
                         UdsConnectInfo,
+                    >(service);
+                tokio::spawn(async move {
+                    axum::serve(listener, make_service)
+                        .with_graceful_shutdown(async move {
+                            server_shutdown_wait.cancelled().await;
+                        })
+                        .await
+                })
+            }
+            // HTTPS arm: mirrors the TCP arm exactly. The peer is a real TCP
+            // `SocketAddr`, so the SAME `ConnectInfo<SocketAddr>` connect-info,
+            // `TrustedProxiesLayer`/`ClientAddr` resolution, SSE/WebSocket(wss)
+            // streaming, and graceful-shutdown wiring apply unchanged — the only
+            // difference is the rustls handshake performed inside the listener's
+            // `accept`. The no-op `tap_io` wrapper lets axum's blanket
+            // `Connected<IncomingStream<TapIo<L, F>>> for L::Addr` supply the
+            // peer `SocketAddr`, since the concrete `SocketAddr: Connected`
+            // impl is provided only for `tokio::net::TcpListener`.
+            #[cfg(feature = "tls")]
+            BoundListener::Tls(listener) => {
+                use axum::serve::ListenerExt as _;
+                let listener = listener.tap_io(|_io| {});
+                let make_service =
+                    axum::ServiceExt::<axum::extract::Request>::into_make_service_with_connect_info::<
+                        std::net::SocketAddr,
                     >(service);
                 tokio::spawn(async move {
                     axum::serve(listener, make_service)
@@ -5427,6 +5539,143 @@ enum BoundListener {
     /// Unix domain socket listener (local daemon transport).
     #[cfg(unix)]
     Unix(tokio::net::UnixListener),
+    /// TLS-terminating listener on `host:port` (direct HTTPS, issue #1603).
+    #[cfg(feature = "tls")]
+    Tls(crate::tls::TlsListener),
+}
+
+/// Current UNIX time in seconds, saturating on the (impossible) pre-epoch case.
+#[cfg(feature = "tls")]
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
+}
+
+/// State carried from the TLS bind path to the background reload task.
+#[cfg(feature = "tls")]
+struct TlsReloadState {
+    resolver: std::sync::Arc<crate::tls::ReloadableCertResolver>,
+    provider: std::sync::Arc<rustls::crypto::CryptoProvider>,
+    cert_path: std::path::PathBuf,
+    key_path: std::path::PathBuf,
+    interval: std::time::Duration,
+}
+
+/// Bind a TLS-terminating listener over `tcp`, loading and validating the
+/// configured certificate and key (fail-fast on any problem).
+#[cfg(feature = "tls")]
+fn build_tls_listener(
+    tcp: tokio::net::TcpListener,
+    cfg: &crate::config::TlsConfig,
+    shutdown: tokio_util::sync::CancellationToken,
+) -> Result<(crate::tls::TlsListener, TlsReloadState), crate::tls::TlsError> {
+    let provider = crate::tls::crypto_provider();
+    let certified =
+        crate::tls::load_certified_key(&cfg.cert_path, &cfg.key_path, &provider, now_unix())?;
+    let resolver = std::sync::Arc::new(crate::tls::ReloadableCertResolver::new(certified));
+    let server_config = crate::tls::build_server_config(
+        std::sync::Arc::clone(&provider),
+        std::sync::Arc::clone(&resolver),
+    )?;
+    // A zero handshake timeout would drop every connection instantly; clamp to
+    // at least one second, mirroring the reload-interval clamp below.
+    let handshake_timeout = std::time::Duration::from_secs(cfg.handshake_timeout_secs.max(1));
+    let listener = crate::tls::TlsListener::new(tcp, server_config, handshake_timeout, shutdown);
+    let reload = TlsReloadState {
+        resolver,
+        provider,
+        cert_path: cfg.cert_path.clone(),
+        key_path: cfg.key_path.clone(),
+        // A zero interval would busy-loop; clamp to at least one second.
+        interval: std::time::Duration::from_secs(cfg.reload_interval_secs.max(1)),
+    };
+    Ok((listener, reload))
+}
+
+/// Modification times of the cert and key files, `None` for a file that could
+/// not be stat'd. Reloads trigger on any change to this pair.
+#[cfg(feature = "tls")]
+fn tls_file_mtimes(
+    cert: &std::path::Path,
+    key: &std::path::Path,
+) -> (Option<std::time::SystemTime>, Option<std::time::SystemTime>) {
+    let mtime = |p: &std::path::Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+    (mtime(cert), mtime(key))
+}
+
+/// Background task: poll the cert/key file mtimes and hot-swap the served
+/// certificate on change. Never breaks the listener — a failed reload keeps the
+/// previously loaded certificate and retries on the next tick.
+#[cfg(feature = "tls")]
+async fn run_tls_cert_reload(state: TlsReloadState, shutdown: tokio_util::sync::CancellationToken) {
+    // Stat and PEM-read the cert/key on a blocking thread — both touch the
+    // filesystem and must not run on a tokio worker. On a `JoinError` (the
+    // blocking pool shutting down) just skip the tick and retry next time.
+    let stat_mtimes = |cert: std::path::PathBuf, key: std::path::PathBuf| {
+        tokio::task::spawn_blocking(move || tls_file_mtimes(&cert, &key))
+    };
+
+    let mut last = match stat_mtimes(state.cert_path.clone(), state.key_path.clone()).await {
+        Ok(mtimes) => mtimes,
+        Err(e) => {
+            tracing::warn!(error = %e, "TLS reload: initial mtime read failed; assuming unknown");
+            (None, None)
+        }
+    };
+    loop {
+        tokio::select! {
+            () = tokio::time::sleep(state.interval) => {}
+            () = shutdown.cancelled() => break,
+        }
+
+        let current = match stat_mtimes(state.cert_path.clone(), state.key_path.clone()).await {
+            Ok(mtimes) => mtimes,
+            Err(e) => {
+                tracing::warn!(error = %e, "TLS reload: mtime read task failed; skipping tick");
+                continue;
+            }
+        };
+        if current == last {
+            continue;
+        }
+
+        let cert_path = state.cert_path.clone();
+        let key_path = state.key_path.clone();
+        let provider = std::sync::Arc::clone(&state.provider);
+        let loaded = tokio::task::spawn_blocking(move || {
+            crate::tls::load_certified_key(&cert_path, &key_path, &provider, now_unix())
+        })
+        .await;
+        let loaded = match loaded {
+            Ok(result) => result,
+            Err(e) => {
+                tracing::warn!(error = %e, "TLS reload: load task failed; skipping tick");
+                continue;
+            }
+        };
+
+        match loaded {
+            Ok(next) => {
+                state.resolver.store(next);
+                // Only advance the baseline on a successful load, so a partial
+                // write observed mid-renewal is retried on the next tick.
+                last = current;
+                tracing::info!(
+                    cert = %state.cert_path.display(),
+                    "Reloaded TLS certificate after detecting a change on disk"
+                );
+            }
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    cert = %state.cert_path.display(),
+                    "TLS certificate reload failed; keeping the previously loaded certificate"
+                );
+            }
+        }
+    }
 }
 
 /// Connection info for a Unix-domain-socket request.

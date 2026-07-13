@@ -50,6 +50,11 @@ server.shutdown_timeout_secs
 server.strict_config
 server.timeouts
 server.timeouts.request_timeout_ms
+server.tls
+server.tls.cert_path
+server.tls.handshake_timeout_secs
+server.tls.key_path
+server.tls.reload_interval_secs
 server.unix_socket
 session
 storage

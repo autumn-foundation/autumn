@@ -212,6 +212,8 @@ mod test_app_integration;
 mod test_db_integration;
 mod throttle_route;
 mod time_zone_integration;
+#[cfg(feature = "tls")]
+mod tls_serving;
 mod transactional_test_integration;
 mod tx_isolation_retry_integration;
 #[cfg(feature = "db")]
