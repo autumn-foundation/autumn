@@ -1,0 +1,494 @@
+//! Typed accessible UI primitives — accessibility conformance by construction
+//! (issue #1706).
+//!
+//! Autumn renders every view through Maud, which means an inaccessible page is
+//! usually just a missing attribute away: an `<img>` with no `alt`, an
+//! icon-only `<button>` with no accessible name, an `<input>` with no
+//! associated `<label>`. Those omissions compile cleanly and only surface in an
+//! audit (or, worse, for a user relying on assistive technology).
+//!
+//! The primitives in this module make the accessible name a **type-level
+//! obligation** rather than a convention. Each one maps to a WCAG 2.1 success
+//! criterion and is constructed so that the inaccessible form does not compile:
+//!
+//! - [`Img`] — WCAG 1.1.1 Non-text Content. The alt text is a mandatory
+//!   positional argument of [`Img::new`]; there is no alt-less constructor.
+//!   Decorative images opt in explicitly with [`Img::decorative`].
+//! - [`Button`] — WCAG 4.1.2 Name, Role, Value. The accessible name is a
+//!   required argument; an icon-only button routes it to `aria-label` via
+//!   [`Button::icon`].
+//! - [`TextField`] — WCAG 1.3.1 Info and Relationships / 3.3.2 Labels or
+//!   Instructions / 4.1.2 Name, Role, Value. A [`TextField<NoLabel>`] has no
+//!   way to render; only after a label is attached (producing a
+//!   [`TextField<Labeled>`]) does the type implement [`maud::Render`]. An
+//!   unlabeled field is therefore unrepresentable as markup.
+//!
+//! All three implement [`maud::Render`], so they splice directly into an
+//! `html!` block:
+//!
+//! ```rust
+//! use autumn_web::a11y::{Button, Img, TextField};
+//! use autumn_web::html;
+//!
+//! let page = html! {
+//!     (Img::new("/logo.svg", "Autumn logo"))
+//!     (TextField::new("email").input_type("email").label("Email address"))
+//!     (Button::new("Save").submit())
+//! };
+//! assert!(page.into_string().contains("alt=\"Autumn logo\""));
+//! ```
+
+use maud::{Markup, Render, html};
+
+/// An informative or decorative image with a mandatory accessible name
+/// (WCAG 1.1.1 Non-text Content).
+///
+/// Construct an informative image with [`Img::new`], which requires the `alt`
+/// text as a positional argument — there is no way to build an `Img` without
+/// one. Purely decorative images use [`Img::decorative`], which sets an
+/// explicit empty `alt=""` so assistive technology skips them.
+#[derive(Debug, Clone)]
+pub struct Img {
+    src: String,
+    alt: String,
+    class: Option<String>,
+    width: Option<u32>,
+    height: Option<u32>,
+}
+
+impl Img {
+    /// Build an informative image. The accessible name (`alt`) is required.
+    ///
+    /// ```rust
+    /// use autumn_web::a11y::Img;
+    /// use maud::Render;
+    ///
+    /// let markup = Img::new("/hero.png", "A field at sunrise").render();
+    /// assert!(markup.into_string().contains("alt=\"A field at sunrise\""));
+    /// ```
+    pub fn new(src: impl Into<String>, alt: impl Into<String>) -> Self {
+        Self {
+            src: src.into(),
+            alt: alt.into(),
+            class: None,
+            width: None,
+            height: None,
+        }
+    }
+
+    /// Build a decorative image with an explicit empty `alt=""`.
+    ///
+    /// This documents intent: the image conveys no information, so assistive
+    /// technology should ignore it. An empty `alt` is the WCAG-valid marker
+    /// for a decorative image — distinct from a *missing* `alt`.
+    pub fn decorative(src: impl Into<String>) -> Self {
+        Self {
+            src: src.into(),
+            alt: String::new(),
+            class: None,
+            width: None,
+            height: None,
+        }
+    }
+
+    /// Set the `class` attribute.
+    #[must_use]
+    pub fn class(mut self, class: impl Into<String>) -> Self {
+        self.class = Some(class.into());
+        self
+    }
+
+    /// Set the `width` attribute (in pixels).
+    #[must_use]
+    pub const fn width(mut self, width: u32) -> Self {
+        self.width = Some(width);
+        self
+    }
+
+    /// Set the `height` attribute (in pixels).
+    #[must_use]
+    pub const fn height(mut self, height: u32) -> Self {
+        self.height = Some(height);
+        self
+    }
+}
+
+impl Render for Img {
+    fn render(&self) -> Markup {
+        html! {
+            img
+                src=(self.src)
+                alt=(self.alt)
+                class=[self.class.as_deref()]
+                width=[self.width]
+                height=[self.height];
+        }
+    }
+}
+
+/// The `type` of a [`Button`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ButtonType {
+    /// `type="button"` — an inert button driven by JavaScript/htmx.
+    #[default]
+    Button,
+    /// `type="submit"` — submits the enclosing form.
+    Submit,
+    /// `type="reset"` — resets the enclosing form.
+    Reset,
+}
+
+impl ButtonType {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Button => "button",
+            Self::Submit => "submit",
+            Self::Reset => "reset",
+        }
+    }
+}
+
+/// A button with a mandatory accessible name (WCAG 4.1.2 Name, Role, Value).
+///
+/// [`Button::new`] takes the visible text label as a required argument.
+/// [`Button::icon`] builds an icon-only button whose accessible name becomes an
+/// `aria-label`, so an icon button can never ship without a name. There is no
+/// name-less constructor.
+#[derive(Debug, Clone)]
+pub struct Button {
+    accessible_name: String,
+    icon: Option<Markup>,
+    kind: ButtonType,
+    class: Option<String>,
+}
+
+impl Button {
+    /// Build a button with a visible text label, which is also its accessible
+    /// name. The label is required.
+    ///
+    /// ```rust
+    /// use autumn_web::a11y::Button;
+    /// use maud::Render;
+    ///
+    /// assert!(Button::new("Save").render().into_string().contains("Save"));
+    /// ```
+    pub fn new(accessible_name: impl Into<String>) -> Self {
+        Self {
+            accessible_name: accessible_name.into(),
+            icon: None,
+            kind: ButtonType::default(),
+            class: None,
+        }
+    }
+
+    /// Build an icon-only button. The `accessible_name` becomes the button's
+    /// `aria-label`, since the icon carries no text for assistive technology.
+    ///
+    /// ```rust
+    /// use autumn_web::a11y::Button;
+    /// use autumn_web::html;
+    /// use maud::Render;
+    ///
+    /// let trash = html! { span aria-hidden="true" { "🗑" } };
+    /// let markup = Button::icon(trash, "Delete item").render().into_string();
+    /// assert!(markup.contains("aria-label=\"Delete item\""));
+    /// ```
+    pub fn icon(icon: Markup, accessible_name: impl Into<String>) -> Self {
+        Self {
+            accessible_name: accessible_name.into(),
+            icon: Some(icon),
+            kind: ButtonType::default(),
+            class: None,
+        }
+    }
+
+    /// Set the button `type` explicitly.
+    #[must_use]
+    pub const fn kind(mut self, kind: ButtonType) -> Self {
+        self.kind = kind;
+        self
+    }
+
+    /// Shorthand for `type="submit"`.
+    #[must_use]
+    pub const fn submit(mut self) -> Self {
+        self.kind = ButtonType::Submit;
+        self
+    }
+
+    /// Shorthand for `type="button"` (the default).
+    #[must_use]
+    pub const fn button(mut self) -> Self {
+        self.kind = ButtonType::Button;
+        self
+    }
+
+    /// Set the `class` attribute.
+    #[must_use]
+    pub fn class(mut self, class: impl Into<String>) -> Self {
+        self.class = Some(class.into());
+        self
+    }
+}
+
+impl Render for Button {
+    fn render(&self) -> Markup {
+        self.icon.as_ref().map_or_else(
+            || {
+                html! {
+                    button type=(self.kind.as_str()) class=[self.class.as_deref()] {
+                        (self.accessible_name)
+                    }
+                }
+            },
+            |icon| {
+                html! {
+                    button
+                        type=(self.kind.as_str())
+                        aria-label=(self.accessible_name)
+                        class=[self.class.as_deref()] {
+                        (icon)
+                    }
+                }
+            },
+        )
+    }
+}
+
+/// Typestate marker: a [`TextField`] with no label attached yet. This state
+/// does **not** implement [`maud::Render`], so it cannot be turned into markup.
+#[derive(Debug, Clone, Copy)]
+pub struct NoLabel;
+
+/// Typestate marker: a [`TextField`] whose label has been attached. Only this
+/// state implements [`maud::Render`].
+#[derive(Debug, Clone, Copy)]
+pub struct Labeled;
+
+/// How a [`TextField`]'s accessible name is provided.
+#[derive(Debug, Clone)]
+enum LabelSource {
+    /// A visible `<label for=…>` element.
+    Visible(String),
+    /// An `aria-label` attribute (no visible label).
+    Aria(String),
+    /// An `aria-labelledby` reference to an existing element's `id`.
+    LabelledBy(String),
+}
+
+/// A text input whose label association is enforced by the type system
+/// (WCAG 1.3.1 Info and Relationships, 3.3.2 Labels or Instructions,
+/// 4.1.2 Name, Role, Value).
+///
+/// [`TextField::new`] returns a `TextField<NoLabel>`, which has no way to
+/// render. Attaching a label with [`label`](TextField::label),
+/// [`aria_label`](TextField::aria_label), or
+/// [`labelled_by`](TextField::labelled_by) consumes it and returns a
+/// `TextField<Labeled>`, the only state that implements [`maud::Render`]. An
+/// unlabeled field therefore cannot be turned into markup — the accessible
+/// name obligation is discharged at compile time.
+///
+/// The value/type/required attributes are chainable in either state.
+#[derive(Debug, Clone)]
+pub struct TextField<State> {
+    name: String,
+    input_type: String,
+    value: Option<String>,
+    required: bool,
+    label: Option<LabelSource>,
+    _state: std::marker::PhantomData<State>,
+}
+
+impl TextField<NoLabel> {
+    /// Start building a text field with the given form `name`. The returned
+    /// value has no label yet and cannot be rendered until one is attached.
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            input_type: "text".to_owned(),
+            value: None,
+            required: false,
+            label: None,
+            _state: std::marker::PhantomData,
+        }
+    }
+
+    /// Attach a visible `<label for=…>` and transition to the renderable
+    /// [`Labeled`] state.
+    #[must_use]
+    pub fn label(self, text: impl Into<String>) -> TextField<Labeled> {
+        self.with_label(LabelSource::Visible(text.into()))
+    }
+
+    /// Attach an `aria-label` (no visible label) and transition to the
+    /// renderable [`Labeled`] state.
+    #[must_use]
+    pub fn aria_label(self, text: impl Into<String>) -> TextField<Labeled> {
+        self.with_label(LabelSource::Aria(text.into()))
+    }
+
+    /// Reference an existing element's `id` via `aria-labelledby` and
+    /// transition to the renderable [`Labeled`] state.
+    #[must_use]
+    pub fn labelled_by(self, id: impl Into<String>) -> TextField<Labeled> {
+        self.with_label(LabelSource::LabelledBy(id.into()))
+    }
+
+    fn with_label(self, label: LabelSource) -> TextField<Labeled> {
+        TextField {
+            name: self.name,
+            input_type: self.input_type,
+            value: self.value,
+            required: self.required,
+            label: Some(label),
+            _state: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<State> TextField<State> {
+    /// Set the input `type` (e.g. `"email"`, `"password"`). Available before or
+    /// after a label is attached.
+    #[must_use]
+    pub fn input_type(mut self, input_type: impl Into<String>) -> Self {
+        self.input_type = input_type.into();
+        self
+    }
+
+    /// Set the input's initial `value`.
+    #[must_use]
+    pub fn value(mut self, value: impl Into<String>) -> Self {
+        self.value = Some(value.into());
+        self
+    }
+
+    /// Mark the input as `required`.
+    #[must_use]
+    pub const fn required(mut self) -> Self {
+        self.required = true;
+        self
+    }
+}
+
+impl Render for TextField<Labeled> {
+    fn render(&self) -> Markup {
+        // `label` is always `Some` in the `Labeled` state — it is set on every
+        // transition out of `NoLabel` — but match defensively rather than
+        // unwrap.
+        match &self.label {
+            Some(LabelSource::Visible(text)) => html! {
+                label for=(self.name) { (text) }
+                input
+                    type=(self.input_type)
+                    id=(self.name)
+                    name=(self.name)
+                    value=[self.value.as_deref()]
+                    required[self.required];
+            },
+            Some(LabelSource::Aria(text)) => html! {
+                input
+                    type=(self.input_type)
+                    id=(self.name)
+                    name=(self.name)
+                    aria-label=(text)
+                    value=[self.value.as_deref()]
+                    required[self.required];
+            },
+            Some(LabelSource::LabelledBy(id)) => html! {
+                input
+                    type=(self.input_type)
+                    id=(self.name)
+                    name=(self.name)
+                    aria-labelledby=(id)
+                    value=[self.value.as_deref()]
+                    required[self.required];
+            },
+            None => html! {},
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn img_new_requires_and_renders_alt() {
+        let markup = Img::new("/logo.png", "Company logo").render().into_string();
+        assert!(markup.contains("src=\"/logo.png\""));
+        assert!(markup.contains("alt=\"Company logo\""));
+    }
+
+    #[test]
+    fn img_decorative_sets_empty_alt() {
+        let markup = Img::decorative("/divider.png").render().into_string();
+        assert!(markup.contains("alt=\"\""));
+    }
+
+    #[test]
+    fn img_escapes_alt_text() {
+        let markup = Img::new("/x.png", "a \"quoted\" & <tagged> name")
+            .render()
+            .into_string();
+        assert!(!markup.contains("<tagged>"));
+        assert!(markup.contains("&lt;tagged&gt;"));
+    }
+
+    #[test]
+    fn button_new_renders_visible_label() {
+        let markup = Button::new("Save").submit().render().into_string();
+        assert!(markup.contains("type=\"submit\""));
+        assert!(markup.contains(">Save<"));
+        assert!(!markup.contains("aria-label"));
+    }
+
+    #[test]
+    fn button_icon_uses_aria_label() {
+        let icon = html! { span aria-hidden="true" { "x" } };
+        let markup = Button::icon(icon, "Close dialog").render().into_string();
+        assert!(markup.contains("aria-label=\"Close dialog\""));
+    }
+
+    #[test]
+    fn text_field_visible_label_is_associated() {
+        let markup = TextField::new("email")
+            .input_type("email")
+            .label("Email address")
+            .render()
+            .into_string();
+        assert!(markup.contains("<label for=\"email\">Email address</label>"));
+        assert!(markup.contains("id=\"email\""));
+        assert!(markup.contains("name=\"email\""));
+        assert!(markup.contains("type=\"email\""));
+    }
+
+    #[test]
+    fn text_field_aria_label_variant() {
+        let markup = TextField::new("q")
+            .aria_label("Search")
+            .render()
+            .into_string();
+        assert!(markup.contains("aria-label=\"Search\""));
+    }
+
+    #[test]
+    fn text_field_labelled_by_variant() {
+        let markup = TextField::new("q")
+            .labelled_by("search-heading")
+            .render()
+            .into_string();
+        assert!(markup.contains("aria-labelledby=\"search-heading\""));
+    }
+
+    #[test]
+    fn text_field_required_and_value() {
+        let markup = TextField::new("name")
+            .value("Ada")
+            .required()
+            .label("Name")
+            .render()
+            .into_string();
+        assert!(markup.contains("value=\"Ada\""));
+        assert!(markup.contains("required"));
+    }
+}

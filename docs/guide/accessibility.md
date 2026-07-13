@@ -421,6 +421,73 @@ accessibility posture hasn't regressed.
 
 ---
 
+## Typed accessible primitives (`autumn_web::a11y`)
+
+The form helpers above make the *right* thing easy. The primitives in
+`autumn_web::a11y` go one step further and make the *wrong* thing impossible:
+they encode the accessible name as a **type-level obligation**, so an image
+without alt text, a button without a name, or an input without a label does not
+compile. This is accessibility conformance by construction, proven at build
+time by the framework's compile-fail test harness.
+
+Each primitive implements `maud::Render`, so it splices straight into an
+`html!` block, and maps to a specific WCAG 2.1 success criterion:
+
+| Primitive    | WCAG SC                                                      | Obligation                                       |
+| ------------ | ----------------------------------------------------------- | ------------------------------------------------ |
+| `Img`        | 1.1.1 Non-text Content                                      | `alt` is a required constructor argument         |
+| `Button`     | 4.1.2 Name, Role, Value                                     | accessible name is a required constructor argument |
+| `TextField`  | 1.3.1 Info and Relationships / 3.3.2 Labels / 4.1.2         | only a *labeled* field can be rendered (typestate) |
+
+```rust
+use autumn_web::a11y::{Button, Img, TextField};
+use autumn_web::html;
+
+let page = html! {
+    (Img::new("/logo.svg", "Autumn logo"))                 // alt required
+    (Img::decorative("/divider.svg"))                       // explicit alt=""
+    (TextField::new("email").input_type("email").label("Email address"))
+    (Button::icon(html! { span aria-hidden="true" { "🗑" } }, "Delete"))
+    (Button::new("Save").submit())
+};
+```
+
+### Red build → fix → green build
+
+**Red** — an alt-less image or an unlabeled input used to compile clean. With
+the typed primitives it does not:
+
+```rust
+// error[E0061]: this function takes 2 arguments but 1 argument was supplied
+let _ = Img::new("/logo.png");
+
+// error: no method named `render` found for `TextField<NoLabel>`
+//        — an unlabeled field cannot be turned into markup
+let _ = TextField::new("email").render();
+```
+
+**Fix** — supply the accessible name / attach a label:
+
+```rust
+let _ = Img::new("/logo.png", "Company logo");            // ✅ compiles
+let _ = TextField::new("email").label("Email").render();  // ✅ compiles
+```
+
+**Green** — the build passes only once every primitive carries its accessible
+name. `TextField::new(..)` returns a `TextField<NoLabel>`; attaching a label
+with `.label(..)`, `.aria_label(..)`, or `.labelled_by(..)` transitions it to
+`TextField<Labeled>`, the only state that implements `Render`. There is no
+`.render()`/`.build()` on the unlabeled state, so an unlabeled field is
+literally unrepresentable as markup.
+
+What this proves at compile time: the *presence* of an accessible name on every
+image, button, and text field. What still belongs to runtime/authoring review:
+whether that name is *meaningful* (a helpful `alt`, not `"image"`), plus page
+structure, contrast, and focus order — the checklist and audit tooling above
+cover those.
+
+---
+
 ## Further reading
 
 - [WCAG 2.1 Quick Reference](https://www.w3.org/WAI/WCAG21/quickref/)

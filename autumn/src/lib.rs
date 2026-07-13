@@ -66,6 +66,11 @@
 #[allow(unused_extern_crates)]
 extern crate self as autumn_web;
 
+/// Typed accessible UI primitives (issue #1706).
+///
+/// These make the accessible name a compile-time obligation. See [`mod@a11y`].
+#[cfg(feature = "maud")]
+pub mod a11y;
 pub mod actuator;
 pub mod aggregate;
 /// Operator alerts for built-in failure conditions.
