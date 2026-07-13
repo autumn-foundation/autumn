@@ -3505,41 +3505,7 @@ impl AutumnConfig {
     }
 
     fn apply_deploy_env_overrides_with_env(&mut self, env: &dyn Env) {
-        // `[deploy]` is a top-level optional section. Materialize it from the
-        // environment when any of its keys are set (seeding the documented
-        // defaults if the TOML section was absent), so a CI/VPS deploy can keep
-        // the target host out of `autumn.toml` and drive it entirely through
-        // `AUTUMN_DEPLOY__*`. Env overrides win over any TOML-provided values.
-        const KEYS: [&str; 8] = [
-            "AUTUMN_DEPLOY__HOST",
-            "AUTUMN_DEPLOY__USER",
-            "AUTUMN_DEPLOY__SSH_PORT",
-            "AUTUMN_DEPLOY__APP_NAME",
-            "AUTUMN_DEPLOY__APP_DIR",
-            "AUTUMN_DEPLOY__SERVICE_NAME",
-            "AUTUMN_DEPLOY__READINESS_TIMEOUT_SECS",
-            "AUTUMN_DEPLOY__KEEP_RELEASES",
-        ];
-        if !KEYS.iter().any(|key| env.var(key).is_ok()) {
-            return;
-        }
-        let deploy = self.deploy.get_or_insert_with(DeployConfig::default);
-        parse_env_option_string(env, "AUTUMN_DEPLOY__HOST", &mut deploy.host);
-        parse_env_string(env, "AUTUMN_DEPLOY__USER", &mut deploy.user);
-        parse_env(env, "AUTUMN_DEPLOY__SSH_PORT", &mut deploy.ssh_port);
-        parse_env_option_string(env, "AUTUMN_DEPLOY__APP_NAME", &mut deploy.app_name);
-        parse_env_option_string(env, "AUTUMN_DEPLOY__APP_DIR", &mut deploy.app_dir);
-        parse_env_option_string(env, "AUTUMN_DEPLOY__SERVICE_NAME", &mut deploy.service_name);
-        parse_env(
-            env,
-            "AUTUMN_DEPLOY__READINESS_TIMEOUT_SECS",
-            &mut deploy.readiness_timeout_secs,
-        );
-        parse_env(
-            env,
-            "AUTUMN_DEPLOY__KEEP_RELEASES",
-            &mut deploy.keep_releases,
-        );
+        apply_deploy_env_overrides(&mut self.deploy, env);
     }
 
     fn apply_database_env_overrides_with_env(&mut self, env: &dyn Env) {
@@ -6169,6 +6135,50 @@ pub struct CompressionConfig {
     /// already carry `Content-Encoding` are passed through unchanged.
     #[serde(default)]
     pub enabled: bool,
+}
+
+/// Apply `AUTUMN_DEPLOY__*` environment overrides to an optional deploy config.
+///
+/// `[deploy]` is a top-level optional section. This materializes it from the
+/// environment when any of its keys are set (seeding the documented defaults if
+/// the section was absent/`None`), so a CI/VPS deploy can keep the target host
+/// out of `autumn.toml` and drive it entirely through `AUTUMN_DEPLOY__*`. Env
+/// overrides win over any TOML-provided values.
+///
+/// Shared by [`AutumnConfig::load`] and `autumn doctor`'s deploy preflight so
+/// both surfaces resolve the identical deploy target (host, `ssh_port`, …) for the
+/// same environment + profile + TOML.
+pub fn apply_deploy_env_overrides(deploy: &mut Option<DeployConfig>, env: &dyn Env) {
+    const KEYS: [&str; 8] = [
+        "AUTUMN_DEPLOY__HOST",
+        "AUTUMN_DEPLOY__USER",
+        "AUTUMN_DEPLOY__SSH_PORT",
+        "AUTUMN_DEPLOY__APP_NAME",
+        "AUTUMN_DEPLOY__APP_DIR",
+        "AUTUMN_DEPLOY__SERVICE_NAME",
+        "AUTUMN_DEPLOY__READINESS_TIMEOUT_SECS",
+        "AUTUMN_DEPLOY__KEEP_RELEASES",
+    ];
+    if !KEYS.iter().any(|key| env.var(key).is_ok()) {
+        return;
+    }
+    let deploy = deploy.get_or_insert_with(DeployConfig::default);
+    parse_env_option_string(env, "AUTUMN_DEPLOY__HOST", &mut deploy.host);
+    parse_env_string(env, "AUTUMN_DEPLOY__USER", &mut deploy.user);
+    parse_env(env, "AUTUMN_DEPLOY__SSH_PORT", &mut deploy.ssh_port);
+    parse_env_option_string(env, "AUTUMN_DEPLOY__APP_NAME", &mut deploy.app_name);
+    parse_env_option_string(env, "AUTUMN_DEPLOY__APP_DIR", &mut deploy.app_dir);
+    parse_env_option_string(env, "AUTUMN_DEPLOY__SERVICE_NAME", &mut deploy.service_name);
+    parse_env(
+        env,
+        "AUTUMN_DEPLOY__READINESS_TIMEOUT_SECS",
+        &mut deploy.readiness_timeout_secs,
+    );
+    parse_env(
+        env,
+        "AUTUMN_DEPLOY__KEEP_RELEASES",
+        &mut deploy.keep_releases,
+    );
 }
 
 /// Parse an environment variable into a typed target, logging a warning on failure.

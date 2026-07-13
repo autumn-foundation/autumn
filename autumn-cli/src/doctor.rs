@@ -5648,24 +5648,43 @@ fn deploy_preflight_result(
 /// error into the check detail is safe.
 fn resolve_deploy_doctor_config(
     merged: &toml::Table,
+    env: &dyn autumn_web::config::Env,
 ) -> (Option<DeployConfig>, Option<CheckResult>) {
-    merged.get("deploy").cloned().map_or((None, None), |value| {
-        match value.try_into::<DeployConfig>() {
-            Ok(cfg) => (Some(cfg), None),
-            Err(err) => (
-                None,
-                Some(CheckResult {
-                    name: "deploy_config",
-                    status: CheckStatus::Fail,
-                    detail: Some(format!("[deploy] is present but invalid: {err}")),
-                    hint: Some(
-                        "Fix the [deploy] section in autumn.toml so its fields match the \
-                         expected types (see `autumn deploy check`)",
-                    ),
-                }),
-            ),
-        }
-    })
+    // First resolve the merged-profile `[deploy]` table (base autumn.toml +
+    // [profile.<env>] + autumn-<env>.toml). A present-but-malformed table is a
+    // hard fail regardless of env, because `AutumnConfig::load()` also fails to
+    // deserialize it, so `autumn deploy` cannot run — surface it loudly instead
+    // of silently skipping.
+    let mut deploy_cfg = match merged.get("deploy").cloned() {
+        Some(value) => match value.try_into::<DeployConfig>() {
+            Ok(cfg) => Some(cfg),
+            Err(err) => {
+                return (
+                    None,
+                    Some(CheckResult {
+                        name: "deploy_config",
+                        status: CheckStatus::Fail,
+                        detail: Some(format!("[deploy] is present but invalid: {err}")),
+                        hint: Some(
+                            "Fix the [deploy] section in autumn.toml so its fields match the \
+                             expected types (see `autumn deploy check`)",
+                        ),
+                    }),
+                );
+            }
+        },
+        None => None,
+    };
+    // Apply `AUTUMN_DEPLOY__*` env overrides on top of the merged-profile value,
+    // exactly like `AutumnConfig::load()` does before `autumn deploy check`
+    // grades `config.deploy`. This makes doctor grade the SAME deploy target as
+    // `deploy check` for the same env + profile + TOML: an env-only
+    // `AUTUMN_DEPLOY__HOST` materializes `Some(DeployConfig)` (so the preflight
+    // runs instead of being skipped), and env values win over TOML. When no
+    // `[deploy]` TOML and no `AUTUMN_DEPLOY__*` env exist, this stays `None` and
+    // the preflight skips gracefully.
+    autumn_web::config::apply_deploy_env_overrides(&mut deploy_cfg, env);
+    (deploy_cfg, None)
 }
 
 // ─── Main entry point ─────────────────────────────────────────────────────────
@@ -5856,7 +5875,14 @@ pub fn run(opts: DoctorOptions) {
     // `AutumnConfig` and fails on the same table, so `doctor --strict` would
     // greenlight a config the deploy path cannot parse. Surface a failing
     // `deploy_config` check instead.
-    let (deploy_cfg, deploy_config_check) = resolve_deploy_doctor_config(&merged_deploy_toml);
+    //
+    // `AUTUMN_DEPLOY__*` env overrides are then applied on top (env wins over
+    // TOML, and an env-only host materializes a deploy config), matching
+    // `AutumnConfig::load()` so doctor grades the same target as `deploy check`
+    // for an env-only or env-overridden deploy — instead of skipping or probing
+    // a stale/base host.
+    let (deploy_cfg, deploy_config_check) =
+        resolve_deploy_doctor_config(&merged_deploy_toml, &autumn_web::config::OsEnv);
     if let Some(check) = deploy_config_check {
         tasks.push(Box::new(move || check));
     }
@@ -5893,13 +5919,23 @@ pub fn run(opts: DoctorOptions) {
         // targets count — `database.replica_url` is excluded because `autumn
         // migrate` cannot migrate against a replica. The grader never prints the
         // value.
-        let deploy_shards = crate::migrate::resolve_shard_database_urls_from_sources(
+        // Use the FALLIBLE shard resolver here: the exiting
+        // `resolve_shard_database_urls_from_sources` calls `std::process::exit(1)`
+        // on a malformed `[[database.shards]]` entry, which — running while
+        // BUILDING doctor tasks — would terminate `autumn doctor --json` before it
+        // emits its JSON result/summary, bypassing normal `CheckResult` reporting.
+        // Instead map an `Err` to a failing `deploy_database_url` check below so
+        // doctor still produces valid output. `autumn migrate` keeps its
+        // print-and-exit behavior via the thin wrapper.
+        let deploy_db_url_result = crate::migrate::try_resolve_shard_database_urls_from_sources(
             |key| std::env::var(key),
             Some(&merged_deploy_toml),
-        );
-        let deploy_db_url = deploy_db_topology
-            .primary_url
-            .or_else(|| deploy_shards.into_iter().next().map(|(_, url)| url));
+        )
+        .map(|deploy_shards| {
+            deploy_db_topology
+                .primary_url
+                .or_else(|| deploy_shards.into_iter().next().map(|(_, url)| url))
+        });
         // A `[database]` present in the merged runtime table marks the app as
         // database-backed even without a migrations directory, so `grade_database_url`
         // requires a URL. A DB-free app (no `[database]`, no migrations dir) passes.
@@ -5951,17 +5987,35 @@ pub fn run(opts: DoctorOptions) {
                 ),
             )
         }));
-        tasks.push(Box::new(move || {
-            deploy_preflight_result(
-                "deploy_database_url",
-                crate::deploy::grade_database_url(
-                    deploy_db_url.as_deref(),
-                    std::path::Path::new("migrations"),
-                    deploy_db_configured,
-                    deploy_db_backed_runtime,
-                ),
-            )
-        }));
+        match deploy_db_url_result {
+            Ok(deploy_db_url) => {
+                tasks.push(Box::new(move || {
+                    deploy_preflight_result(
+                        "deploy_database_url",
+                        crate::deploy::grade_database_url(
+                            deploy_db_url.as_deref(),
+                            std::path::Path::new("migrations"),
+                            deploy_db_configured,
+                            deploy_db_backed_runtime,
+                        ),
+                    )
+                }));
+            }
+            Err(msg) => {
+                // A malformed `[[database.shards]]` entry: surface it as a FAILING
+                // check instead of exiting the process, so `autumn doctor --json`
+                // still emits valid JSON with a clear, actionable failure.
+                tasks.push(Box::new(move || CheckResult {
+                    name: "deploy_database_url",
+                    status: CheckStatus::Fail,
+                    detail: Some(format!("[[database.shards]] is present but invalid: {msg}")),
+                    hint: Some(
+                        "Fix the [[database.shards]] entries in autumn.toml so each has a string \
+                         `name` and `primary_url` with unique names (see `autumn deploy check`)",
+                    ),
+                }));
+            }
+        }
         tasks.push(Box::new(|| {
             deploy_preflight_result(
                 "deploy_migrate_check",
@@ -13877,9 +13931,11 @@ redirect_uri = "http://localhost/callback"
 
     #[test]
     fn deploy_doctor_config_absent_is_skipped() {
-        // No [deploy] table → no config parsed, no failing check (graceful skip).
+        use autumn_web::config::MockEnv;
+        // No [deploy] table and no AUTUMN_DEPLOY__* env → no config parsed, no
+        // failing check (graceful skip).
         let table: toml::Table = "".parse().unwrap();
-        let (cfg, check) = resolve_deploy_doctor_config(&table);
+        let (cfg, check) = resolve_deploy_doctor_config(&table, &MockEnv::new());
         assert!(cfg.is_none(), "absent [deploy] must not yield a config");
         assert!(
             check.is_none(),
@@ -13889,10 +13945,11 @@ redirect_uri = "http://localhost/callback"
 
     #[test]
     fn deploy_doctor_config_valid_parses() {
+        use autumn_web::config::MockEnv;
         let table: toml::Table = "[deploy]\nhost = \"203.0.113.10\"\nssh_port = 2222\n"
             .parse()
             .unwrap();
-        let (cfg, check) = resolve_deploy_doctor_config(&table);
+        let (cfg, check) = resolve_deploy_doctor_config(&table, &MockEnv::new());
         assert!(check.is_none(), "valid [deploy] must not emit a fail check");
         let cfg = cfg.expect("valid [deploy] must parse into a config");
         assert_eq!(cfg.host.as_deref(), Some("203.0.113.10"));
@@ -13900,13 +13957,56 @@ redirect_uri = "http://localhost/callback"
     }
 
     #[test]
+    fn deploy_doctor_config_env_only_host_materializes_config() {
+        use autumn_web::config::MockEnv;
+        // No [deploy] in TOML, but AUTUMN_DEPLOY__HOST is set: doctor must
+        // materialize a deploy config (Some) so the preflight runs against that
+        // host instead of being skipped — matching `autumn deploy check`, which
+        // grades `AutumnConfig::load().deploy` (env applied).
+        let table: toml::Table = "".parse().unwrap();
+        let env = MockEnv::new()
+            .with("AUTUMN_DEPLOY__HOST", "203.0.113.99")
+            .with("AUTUMN_DEPLOY__SSH_PORT", "2201");
+        let (cfg, check) = resolve_deploy_doctor_config(&table, &env);
+        assert!(
+            check.is_none(),
+            "env-only deploy must not emit a fail check"
+        );
+        let cfg = cfg.expect("env-only AUTUMN_DEPLOY__HOST must materialize a config");
+        assert_eq!(cfg.host.as_deref(), Some("203.0.113.99"));
+        assert_eq!(cfg.ssh_port, 2201);
+    }
+
+    #[test]
+    fn deploy_doctor_config_env_overrides_toml_host() {
+        use autumn_web::config::MockEnv;
+        // A TOML host is present, but AUTUMN_DEPLOY__HOST wins — doctor grades
+        // the same effective target as `autumn deploy check`.
+        let table: toml::Table = "[deploy]\nhost = \"toml.example\"\nssh_port = 22\n"
+            .parse()
+            .unwrap();
+        let env = MockEnv::new().with("AUTUMN_DEPLOY__HOST", "env.example");
+        let (cfg, check) = resolve_deploy_doctor_config(&table, &env);
+        assert!(check.is_none());
+        let cfg = cfg.expect("config must be present");
+        assert_eq!(
+            cfg.host.as_deref(),
+            Some("env.example"),
+            "AUTUMN_DEPLOY__HOST must override the TOML host"
+        );
+        // Unset env fields fall back to the TOML value.
+        assert_eq!(cfg.ssh_port, 22);
+    }
+
+    #[test]
     fn deploy_doctor_config_bad_type_fails_not_skipped() {
+        use autumn_web::config::MockEnv;
         // `ssh_port` as a string is a present-but-invalid table: the old `.ok()`
         // path silently skipped ALL deploy checks; now it must FAIL loudly.
         let table: toml::Table = "[deploy]\nhost = \"h\"\nssh_port = \"22\"\n"
             .parse()
             .unwrap();
-        let (cfg, check) = resolve_deploy_doctor_config(&table);
+        let (cfg, check) = resolve_deploy_doctor_config(&table, &MockEnv::new());
         assert!(
             cfg.is_none(),
             "an invalid [deploy] must not yield a config to preflight"
@@ -13922,11 +14022,12 @@ redirect_uri = "http://localhost/callback"
 
     #[test]
     fn deploy_doctor_config_negative_keep_releases_fails() {
+        use autumn_web::config::MockEnv;
         // `keep_releases = -1` cannot deserialize into u32 → fail, not skip.
         let table: toml::Table = "[deploy]\nhost = \"h\"\nkeep_releases = -1\n"
             .parse()
             .unwrap();
-        let (cfg, check) = resolve_deploy_doctor_config(&table);
+        let (cfg, check) = resolve_deploy_doctor_config(&table, &MockEnv::new());
         assert!(cfg.is_none());
         assert_eq!(
             check.expect("negative keep_releases must fail").status,
