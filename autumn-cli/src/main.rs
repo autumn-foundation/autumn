@@ -19,6 +19,7 @@ mod experiments;
 mod export;
 mod flags;
 mod generate;
+mod graph;
 mod http;
 mod i18n;
 mod jobs;
@@ -725,6 +726,19 @@ enum Commands {
         /// Hide framework-internal routes (`/actuator/*`, probes, htmx assets).
         #[arg(long)]
         user_only: bool,
+    },
+
+    /// Generate a Mermaid.js graph of the application's routes and middleware
+    Graph {
+        /// Package to run (for workspaces)
+        #[arg(short, long)]
+        package: Option<String>,
+        /// Binary to run (if package has multiple)
+        #[arg(long)]
+        bin: Option<String>,
+        /// Output file for the Mermaid graph
+        #[arg(short, long, default_value = "routes.mmd")]
+        output: String,
     },
 
     /// Measure and gate dev-loop latency for `autumn dev`.
@@ -2743,6 +2757,11 @@ fn run_command(command: Commands) {
             &method,
             user_only,
         ),
+        Commands::Graph {
+            package,
+            bin,
+            output,
+        } => graph::run(package.as_deref(), bin.as_deref(), &output),
         Commands::Release(cmd) => run_release_command(cmd),
         Commands::Token(cmd) => match cmd {
             TokenCommands::Issue {
