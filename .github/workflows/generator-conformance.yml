@@ -176,6 +176,9 @@ jobs:
   #   searchable -> generated_searchable_scaffold_cargo_checks
   #   passkeys   -> generated_auth_passkeys_cargo_checks
   #   live       -> generated_live_scaffold_cargo_checks
+  #   live-owner       -> generated_live_owner_scaffold_cargo_checks
+  #   sharded-owner    -> generated_sharded_owner_scaffold_cargo_checks
+  #   attachment-owner -> generated_attachment_owner_scaffold_cargo_checks
   app-variant-conformance:
     name: App-variant conformance (${{ matrix.variant.name }}, ${{ matrix.toolchain }})
     runs-on: ubuntu-latest
@@ -194,6 +197,12 @@ jobs:
             test: generated_auth_passkeys_cargo_checks
           - name: live
             test: generated_live_scaffold_cargo_checks
+          - name: live-owner
+            test: generated_live_owner_scaffold_cargo_checks
+          - name: sharded-owner
+            test: generated_sharded_owner_scaffold_cargo_checks
+          - name: attachment-owner
+            test: generated_attachment_owner_scaffold_cargo_checks
     steps:
       - uses: actions/checkout@v7
 

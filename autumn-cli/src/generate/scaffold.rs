@@ -460,14 +460,22 @@ fn plan_scaffold_with_options_impl(
             super::policy::OwnerColumn { name, nullable }
         })
     };
-    // Inline authorize/scope wiring is emitted only on the standard (non-live,
-    // non-sharded) diesel path and only when an owner column exists: a
-    // default-deny policy wired into every mutation would make a fresh
-    // no-owner scaffold reject all updates/deletes out of the box. The policy
-    // is still generated and registered in every non-`--api` case either way,
-    // so the resource always ships an enforceable authorization surface.
-    let authorize_wiring = policy_on
-        && owner_column.is_some()
+    // Issue #1830: inline authorize/scope wiring is emitted on EVERY scaffold
+    // variant (standard, `--live`, `--sharded`, attachment) whenever an owner
+    // column exists — the per-variant plumbing differs (repository vs raw diesel
+    // vs a reused attachment `State`) but every mutating handler now loads its
+    // target row and record-authorizes the actor, and every index is
+    // owner-scoped. A default-deny policy wired into a *no-owner* scaffold would
+    // reject all mutations out of the box, so the no-owner case is handled
+    // separately (see `policy.rs`). The policy is still generated and registered
+    // in every non-`--api` case regardless, so the resource always ships an
+    // enforceable authorization surface.
+    let authorize_routes = policy_on && owner_column.is_some();
+    // The standard (non-live, non-sharded) diesel path. Retained as the signal
+    // for the cross-user 403 smoke test, which drives real HTTP create/update/
+    // delete as two users and is only wired for the plain diesel path (the live
+    // SSE and sharded runtimes need extra harness the smoke test doesn't set up).
+    let authorize_wiring = authorize_routes
         && !options_with_key.model.sharded
         && !options_with_key.live
         && !options_with_key.live_validation;
@@ -480,7 +488,14 @@ fn plan_scaffold_with_options_impl(
     // Owner-scoped FTS needs a scoped `search_page` in the repository macro (framework
     // work, tracked in #1841); until then, refuse the unsafe combination. Returns
     // before the plan is built, so no files are written.
-    if !options_with_key.model.searchable.is_empty() && authorize_wiring {
+    // The leak exists wherever an owner-scoped index coexists with the search
+    // box; search is force-disabled for `--live`/`--live-validation` (see
+    // `search_enabled`), so this covers the standard and `--sharded` owner paths.
+    if !options_with_key.model.searchable.is_empty()
+        && authorize_routes
+        && !options_with_key.live
+        && !options_with_key.live_validation
+    {
         return Err(GenerateError::Config(format!(
             "`--searchable` is not yet supported for owner-scoped models: full-text search \
              (`search_page`) is not owner-scoped, so the generated `GET /{plural}/search` \
@@ -674,7 +689,7 @@ fn plan_scaffold_with_options_impl(
                 options_with_key.live_validation,
                 metadata.validations(),
                 &missing_reference_targets,
-                authorize_wiring,
+                authorize_routes,
                 owner_column.as_ref().map(|o| o.name.as_str()),
                 &options_with_key.model.searchable,
             ),
@@ -1798,22 +1813,56 @@ fn render_routes_file(
     let update_columns = render_update_columns(plural, fields);
     let nullable_field_match = render_nullable_field_match(fields);
     let has_attachments = has_attachment_fields(fields);
-    // Issue #1125: inline record-level authorization on the mutating HTML
-    // handlers + owner-scoped index. The caller only sets `authorize` on the
-    // standard (non-live, non-sharded) path with an owner column; attachment
-    // scaffolds already thread a `state:` param through `into_new`, so they are
-    // excluded here to avoid a conflicting second `state` extractor.
-    let authorize = authorize && !has_attachments;
+    // Issue #1125/#1830: inline record-level authorization on the mutating HTML
+    // handlers + owner-scoped index. The caller sets `authorize` whenever an
+    // owner column exists, on EVERY variant. Attachment scaffolds already thread
+    // a `state: State<AppState>` param through `create`/`update` (for the
+    // multipart upload), so those two handlers reuse it rather than injecting a
+    // second, conflicting `State` extractor — see `create_update_authz_params` /
+    // `create_update_state_expr` below.
     // The owner column name (`user_id`/`author_id`/`owner_id`/a users FK). Only
     // read when `authorize` is set (so the caller always passed `Some`).
     let owner_col = owner.unwrap_or("user_id");
-    // Extra handler params (`State` + `Session`) the authorize wiring needs.
-    // No trailing comma — each insertion site supplies its own delimiter.
-    let authz_params = if authorize {
+    // The full extractor pair the authorize wiring needs on handlers that do not
+    // already carry a `state:` wrapper. No trailing comma — each insertion site
+    // supplies its own delimiter.
+    let authz_params_full = if authorize {
         "\n    autumn_web::extract::State(state): autumn_web::extract::State<autumn_web::AppState>,\
          \n    session: autumn_web::session::Session"
     } else {
         ""
+    };
+    // Attachment `create`/`update` already own a `state: State<AppState>` param;
+    // a second `State(state)` would be a duplicate binding (why #1125 excluded
+    // attachments), so those two handlers gain ONLY `session` and deref the
+    // existing wrapper (`&*state`) in their authorize calls. `edit`/`destroy`
+    // never carry `state`, so they take the full pair.
+    let authz_params_session_only = if authorize {
+        "\n    session: autumn_web::session::Session"
+    } else {
+        ""
+    };
+    let create_update_authz_params = if has_attachments {
+        authz_params_session_only
+    } else {
+        authz_params_full
+    };
+    let edit_destroy_authz_params = authz_params_full;
+    // The `AppState` receiver expression for the authorize calls: create/update
+    // deref the reused attachment wrapper (`State<T>` → `T`); everything else
+    // binds `AppState` directly via the injected `State(state)`.
+    let create_update_state_expr = if has_attachments { "&*state" } else { "&state" };
+    let edit_destroy_state_expr = "&state";
+    // The attachment `update` handler loads `current` after parsing the multipart
+    // body (to preserve un-replaced blobs); record-authorize the actor against
+    // that same already-loaded row before writing, instead of a second load.
+    // Spliced into `update_new_block` right after its `current` load.
+    let authz_attachment_update = if authorize && has_attachments {
+        format!(
+            "autumn_web::authorization::authorize::<{pascal_name}>({create_update_state_expr}, &session, \"update\", &current).await?;\n    "
+        )
+    } else {
+        String::new()
     };
     // Every PRESENT `references` field (its target model — and so its
     // `src/schema.rs` entry — is in the project; `missing_reference_targets`
@@ -2065,25 +2114,25 @@ fn render_routes_file(
         String::new()
     };
 
-    // Issue #1125: thread `State` + `Session` into the mutating handlers so they
-    // can run `authorize::<{Pascal}>(...)` (and `authorize_create::<{Pascal}>`
-    // in `create`). Inserted before the body-consuming `Bytes` extractor in
-    // `create`/`update` (axum requires `Bytes` last) and appended to the
-    // `destroy` arg list (no body extractor). Only applied on the standard path
-    // (`authorize` already excludes live/sharded/attachment scaffolds).
+    // Issue #1125/#1830: thread the extractors the authorize wiring needs into
+    // the mutating handlers. Inserted before the body-consuming `Bytes` extractor
+    // in `create`/`update` (axum requires `Bytes` last) and appended to the
+    // `destroy` arg list (no body extractor). `create`/`update` on the attachment
+    // path reuse their existing `state:` wrapper and add only `session`; every
+    // other authorized handler gets the full `State` + `Session` pair.
     let (create_signature, update_signature, destroy_signature_arg) = if authorize {
         (
             create_signature.replacen(
                 "body: Bytes",
-                &format!("{authz_params},\n    body: Bytes"),
+                &format!("{create_update_authz_params},\n    body: Bytes"),
                 1,
             ),
             update_signature.replacen(
                 "\n    body: Bytes",
-                &format!("{authz_params},\n    body: Bytes"),
+                &format!("{create_update_authz_params},\n    body: Bytes"),
                 1,
             ),
-            format!("{destroy_signature_arg},{authz_params}"),
+            format!("{destroy_signature_arg},{edit_destroy_authz_params}"),
         )
     } else {
         (create_signature, update_signature, destroy_signature_arg)
@@ -2223,7 +2272,7 @@ fn render_routes_file(
             let name = &f.name;
             let _ = write!(binds, "\n    new.{name} = {name}_blob.or(current.{name});");
         }
-        format!("{load_current}let mut new = {into_new_call};{binds}")
+        format!("{load_current}{authz_attachment_update}let mut new = {into_new_call};{binds}")
     } else {
         format!("let new = {into_new_call};")
     };
@@ -2401,7 +2450,7 @@ fn render_routes_file(
     // so this uses `authorize_create` (context-only) rather than `authorize`.
     let authz_create_call = if authorize {
         format!(
-            "autumn_web::authorization::authorize_create::<{pascal_name}>(&state, &session).await?;\n    "
+            "autumn_web::authorization::authorize_create::<{pascal_name}>({create_update_state_expr}, &session).await?;\n    "
         )
     } else {
         String::new()
@@ -2462,32 +2511,61 @@ fn render_routes_file(
              Ok(autumn_web::Redirect::to(&paths::show(*id)).into_response())"
         )
     };
-    // Issue #1125: on the standard authorized path, load the target row and run
-    // the policy check *before* touching it, so a forbidden actor is denied
-    // (404/403 per config) before any write. Loading first also gives the same
-    // not-found behavior the post-update `updated == 0` guard provides.
-    // `update` and `destroy` share the same load-then-authorize preamble; only
-    // the policy action differs.
-    let authz_mutation_preamble = |action: &str| {
-        if authorize {
+    // Issue #1125/#1830: load the target row and run the policy check *before*
+    // touching it, so a forbidden actor is denied (404/403 per config) before any
+    // write. Loading first also gives the same not-found behavior the post-update
+    // `updated == 0` guard provides. The load handle depends on the variant: the
+    // `repo` extractor on `--live`, a `from_shard` repository on `--sharded`, and
+    // raw diesel otherwise — all three yield the same `{Pascal}` row type.
+    let load_current_stmt = |binding: &str| -> String {
+        if live && !sharded {
             format!(
-                "let current: {pascal_name} = {plural}::table\n        \
+                "let {binding}: {pascal_name} = repo.find_by_id(*id).await?\n        \
+                 .ok_or_else(|| AutumnError::not_found_msg(format!(\"{pascal_name} with id {{}} not found\", *id)))?;\n    "
+            )
+        } else if sharded {
+            format!(
+                "let {binding}: {pascal_name} = Pg{pascal_name}Repository::from_shard(&db).find_by_id(*id).await?\n        \
+                 .ok_or_else(|| AutumnError::not_found_msg(format!(\"{pascal_name} with id {{}} not found\", *id)))?;\n    "
+            )
+        } else {
+            format!(
+                "let {binding}: {pascal_name} = {plural}::table\n        \
                  .find(*id)\n        \
                  .select({pascal_name}::as_select())\n        \
                  .first(&mut *db)\n        \
                  .await\n        \
-                 .map_err(AutumnError::not_found)?;\n    \
-                 autumn_web::authorization::authorize::<{pascal_name}>(&state, &session, \"{action}\", &current).await?;\n    "
+                 .map_err(AutumnError::not_found)?;\n    "
             )
-        } else {
-            String::new()
         }
     };
-    let authz_update_preamble = authz_mutation_preamble("update");
-    let authz_destroy_preamble = authz_mutation_preamble("delete");
+    // Update: on the attachment path the handler already loads `current` (after
+    // parsing multipart, to preserve un-replaced blobs) and authorizes there via
+    // `authz_attachment_update`, so no up-front preamble is emitted. Every other
+    // variant loads + authorizes here.
+    let authz_update_preamble = if authorize && !has_attachments {
+        format!(
+            "{load}autumn_web::authorization::authorize::<{pascal_name}>({state}, &session, \"update\", &current).await?;\n    ",
+            load = load_current_stmt("current"),
+            state = create_update_state_expr,
+        )
+    } else {
+        String::new()
+    };
+    // Destroy: no form body, so always load + authorize up front (`&state`, since
+    // `destroy` takes the full `State` pair even on the attachment path).
+    let authz_destroy_preamble = if authorize {
+        format!(
+            "{load}autumn_web::authorization::authorize::<{pascal_name}>({state}, &session, \"delete\", &current).await?;\n    ",
+            load = load_current_stmt("current"),
+            state = edit_destroy_state_expr,
+        )
+    } else {
+        String::new()
+    };
     let authz_edit_call = if authorize {
         format!(
-            "autumn_web::authorization::authorize::<{pascal_name}>(&state, &session, \"edit\", &row).await?;\n    "
+            "autumn_web::authorization::authorize::<{pascal_name}>({edit_destroy_state_expr}, &session, \"edit\", &row).await?;\n    "
         )
     } else {
         String::new()
@@ -2670,12 +2748,23 @@ fn render_routes_file(
     // (issue #1146) before building its property rows.
     let show_label_loads = render_show_reference_label_loads(all_fields, &reference_displays);
 
+    // Issue #1830: the owner-scoped index runs a manual owner-filtered query on
+    // whichever connection the variant threads — `ShardedDb` (pinned to the
+    // current shard, exactly like the generated `show`/`create` handlers) when
+    // `--sharded`, `Db` otherwise. Both deref (`&mut *db`) to a diesel-async
+    // connection the count/load queries run against.
+    let owner_index_db_param = if sharded {
+        "mut db: ShardedDb"
+    } else {
+        "mut db: Db"
+    };
     let index_handler = if authorize {
-        // Issue #1125: owner-scoped index. `authorize` implies the standard
-        // (non-live, non-sharded) path, so this branch is the only one that
-        // needs to filter by the owner column. Pagination is preserved by
-        // running a `COUNT(*)` + `LIMIT/OFFSET` query filtered to the current
-        // user's rows, then wrapping the result in `Page::new`.
+        // Issue #1125/#1830: owner-scoped index for every variant with an owner
+        // column. Pagination is preserved by running a `COUNT(*)` + `LIMIT/OFFSET`
+        // query filtered to the current user's rows, then wrapping the result in
+        // `Page::new`. `{list_render}` keeps the `--live` SSE `<ul>` island (a
+        // data_table for the non-live variants), so the SSE broadcast contract is
+        // unaffected — only the *initial* server-rendered list is owner-scoped.
         format!(
             r#"/// `GET /{plural}` — paginated list of {snake_name}s the current user owns.
 ///
@@ -2690,7 +2779,7 @@ pub async fn index(
     page_req: PageRequest,
     autumn_web::extract::State(state): autumn_web::extract::State<autumn_web::AppState>,
     session: autumn_web::session::Session,
-    mut db: Db,
+    {owner_index_db_param},
     flash: Flash,
 ) -> AutumnResult<Markup> {{
     let ctx = autumn_web::authorization::PolicyContext::from_request(&state, &session).await;
@@ -3241,7 +3330,7 @@ pub async fn edit_form(
     csrf: Option<CsrfToken>,
     csrf_field: Option<CsrfFormField>,
     submit_token: Option<SubmitToken>,
-    submit_field: Option<SubmitFormField>,{authz_params}
+    submit_field: Option<SubmitFormField>,{edit_destroy_authz_params}
 ) -> AutumnResult<Markup> {{
     let row: {pascal_name} = {plural}::table
         .find(*id)
@@ -11134,6 +11223,174 @@ async fn main() {
             "{smoke}"
         );
         assert!(smoke.contains("ForbiddenResponse::Forbidden403"), "{smoke}");
+    }
+
+    #[test]
+    fn live_owner_scaffold_authorizes_mutating_handlers_and_scopes_index() {
+        // Issue #1830: `--live` variants now record-authorize their mutating
+        // handlers and owner-scope the index, loading the current row through the
+        // repository (not raw diesel) while keeping the SSE `<ul>` island.
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "author_id:i64".into()],
+            "20260427000000",
+            &ScaffoldOptions {
+                live: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let routes = action_contents(&plan, "src/routes/posts.rs");
+        // edit / update / destroy each carry an inline authorize call.
+        assert_eq!(
+            routes
+                .matches("autumn_web::authorization::authorize::<Post>")
+                .count(),
+            3,
+            "live edit/update/destroy must each authorize: {routes}"
+        );
+        assert!(routes.contains("\"edit\", &row"), "{routes}");
+        assert!(routes.contains("\"update\", &current"), "{routes}");
+        assert!(routes.contains("\"delete\", &current"), "{routes}");
+        // The row is loaded via the repository extractor, not raw diesel.
+        assert!(
+            routes.contains("let current: Post = repo.find_by_id(*id).await?"),
+            "live variant must load current row via the repository: {routes}"
+        );
+        assert!(
+            routes
+                .contains("autumn_web::authorization::authorize_create::<Post>(&state, &session)"),
+            "live create must authorize_create: {routes}"
+        );
+        // Index is owner-scoped but keeps the SSE list contract.
+        assert!(
+            routes.contains("posts::author_id.eq(owner_id)"),
+            "live index must filter by owner: {routes}"
+        );
+        assert!(
+            routes.contains("PolicyContext::from_request(&state, &session)"),
+            "{routes}"
+        );
+        assert!(
+            routes.contains("ul id=\"posts-list\"")
+                && routes.contains("sse-connect=(paths::events())"),
+            "live owner index must keep the SSE ul island: {routes}"
+        );
+    }
+
+    #[test]
+    fn sharded_owner_scaffold_authorizes_mutating_handlers_and_scopes_index() {
+        // Issue #1830: `--sharded` variants record-authorize their mutating
+        // handlers and owner-scope the index, loading the current row through a
+        // `from_shard` repository and querying the pinned `ShardedDb` connection.
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "author_id:i64".into()],
+            "20260427000000",
+            &ScaffoldOptions {
+                model: ModelOptions {
+                    sharded: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let routes = action_contents(&plan, "src/routes/posts.rs");
+        assert_eq!(
+            routes
+                .matches("autumn_web::authorization::authorize::<Post>")
+                .count(),
+            3,
+            "sharded edit/update/destroy must each authorize: {routes}"
+        );
+        assert!(routes.contains("\"edit\", &row"), "{routes}");
+        assert!(routes.contains("\"update\", &current"), "{routes}");
+        assert!(routes.contains("\"delete\", &current"), "{routes}");
+        // The row is loaded via `from_shard(&db).find_by_id(...)`.
+        assert!(
+            routes.contains(
+                "let current: Post = PgPostRepository::from_shard(&db).find_by_id(*id).await?"
+            ),
+            "sharded variant must load current row via from_shard: {routes}"
+        );
+        assert!(
+            routes
+                .contains("autumn_web::authorization::authorize_create::<Post>(&state, &session)"),
+            "sharded create must authorize_create: {routes}"
+        );
+        // Owner-scoped index runs on the ShardedDb connection (no bare `Db`).
+        assert!(
+            routes.contains("posts::author_id.eq(owner_id)"),
+            "sharded index must filter by owner: {routes}"
+        );
+        assert!(
+            routes.contains("mut db: ShardedDb") && !routes.contains("mut db: Db"),
+            "sharded handlers must use ShardedDb, not Db: {routes}"
+        );
+    }
+
+    #[test]
+    fn attachment_owner_scaffold_authorizes_reusing_state_wrapper() {
+        // Issue #1830: attachment scaffolds already thread a `state:` wrapper for
+        // the multipart upload, so the authorize wiring reuses it (`&*state`) and
+        // adds only `session` — no duplicate `State(state)` extractor.
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &[
+                "title:String".into(),
+                "author_id:i64".into(),
+                "avatar:Attachment".into(),
+            ],
+            "20260427000000",
+        )
+        .unwrap();
+        let routes = action_contents(&plan, "src/routes/posts.rs");
+        // create/update deref the reused wrapper; edit/destroy take the full pair.
+        assert!(
+            routes
+                .contains("autumn_web::authorization::authorize_create::<Post>(&*state, &session)"),
+            "attachment create must authorize_create via &*state: {routes}"
+        );
+        assert!(
+            routes.contains(
+                "autumn_web::authorization::authorize::<Post>(&*state, &session, \"update\", &current)"
+            ),
+            "attachment update must authorize via &*state: {routes}"
+        );
+        assert!(
+            routes.contains(
+                "autumn_web::authorization::authorize::<Post>(&state, &session, \"delete\", &current)"
+            ),
+            "attachment destroy must authorize via &state: {routes}"
+        );
+        assert!(
+            routes.contains(
+                "autumn_web::authorization::authorize::<Post>(&state, &session, \"edit\", &row)"
+            ),
+            "attachment edit must authorize via &state: {routes}"
+        );
+        // The create/update handlers must NOT gain a second `State(state)`
+        // extractor — the reused wrapper stays the sole `state` binding.
+        assert!(
+            !routes.contains(
+                "autumn_web::extract::State(state): autumn_web::extract::State<autumn_web::AppState>,\n    body: Bytes"
+            ) && !routes.contains(
+                "autumn_web::extract::State(state): autumn_web::extract::State<autumn_web::AppState>,\n    mut multipart"
+            ),
+            "attachment create/update must not inject a duplicate State extractor: {routes}"
+        );
+        // Owner-scoped index still emitted for the attachment path.
+        assert!(
+            routes.contains("posts::author_id.eq(owner_id)"),
+            "attachment index must filter by owner: {routes}"
+        );
     }
 
     #[test]

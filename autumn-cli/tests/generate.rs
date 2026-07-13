@@ -1789,6 +1789,172 @@ fn generated_nullable_owner_policy_scaffold_cargo_checks() {
     );
 }
 
+/// Issue #1830 companion to [`generated_policy_scaffold_cargo_checks`] for the
+/// `--live` variant: an owner column on a `--live` scaffold now record-authorizes
+/// the mutating handlers (loading the current row through the *repository*, not
+/// raw diesel) and owner-scopes the index while keeping the SSE `<ul>` island.
+/// `cargo check --tests` proves the repository-based authorize wiring compiles
+/// against the real framework.
+///
+/// Ignored by default; run with `cargo test -p autumn-cli -- --ignored`.
+#[test]
+#[ignore = "slow: cargo-checks a fresh project — run with `cargo test -p autumn-cli -- --ignored`"]
+fn generated_live_owner_scaffold_cargo_checks() {
+    let (_tmp, project) = fresh_project("live-owner-scaffold-build");
+    patch_generated_cargo_toml(&project);
+
+    run_autumn(
+        &project,
+        &[
+            "generate",
+            "scaffold",
+            "Post",
+            "title:String",
+            "author_id:i64",
+            "--live",
+        ],
+    );
+
+    let routes = fs::read_to_string(project.join("src/routes/posts.rs")).unwrap();
+    assert!(
+        routes.contains("autumn_web::authorization::authorize::<Post>"),
+        "live routes must authorize mutating handlers:\n{routes}"
+    );
+    assert!(
+        routes.contains("let current: Post = repo.find_by_id(*id).await?"),
+        "live variant must load the current row via the repository:\n{routes}"
+    );
+    assert!(
+        routes.contains("posts::author_id.eq(owner_id)"),
+        "live index must be owner-scoped:\n{routes}"
+    );
+    assert!(
+        routes.contains("sse-connect=(paths::events())"),
+        "live owner index must keep the SSE list contract:\n{routes}"
+    );
+
+    let check = Command::new("cargo")
+        .args(["check", "--tests"])
+        .current_dir(&project)
+        .output()
+        .unwrap();
+    assert!(
+        check.status.success(),
+        "cargo check on generated live-owner scaffold failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&check.stdout),
+        String::from_utf8_lossy(&check.stderr),
+    );
+}
+
+/// Issue #1830 companion for the `--sharded` variant: an owner column on a
+/// `--sharded` scaffold record-authorizes the mutating handlers (loading the
+/// current row through a `from_shard` repository) and owner-scopes the index on
+/// the `ShardedDb` connection. `cargo check --tests` proves the sharded
+/// authorize wiring compiles against the real framework.
+///
+/// Ignored by default; run with `cargo test -p autumn-cli -- --ignored`.
+#[test]
+#[ignore = "slow: cargo-checks a fresh project — run with `cargo test -p autumn-cli -- --ignored`"]
+fn generated_sharded_owner_scaffold_cargo_checks() {
+    let (_tmp, project) = fresh_project("sharded-owner-scaffold-build");
+    patch_generated_cargo_toml(&project);
+
+    run_autumn(
+        &project,
+        &[
+            "generate",
+            "scaffold",
+            "Post",
+            "title:String",
+            "author_id:i64",
+            "--sharded",
+        ],
+    );
+
+    let routes = fs::read_to_string(project.join("src/routes/posts.rs")).unwrap();
+    assert!(
+        routes.contains("autumn_web::authorization::authorize::<Post>"),
+        "sharded routes must authorize mutating handlers:\n{routes}"
+    );
+    assert!(
+        routes.contains(
+            "let current: Post = PgPostRepository::from_shard(&db).find_by_id(*id).await?"
+        ),
+        "sharded variant must load the current row via from_shard:\n{routes}"
+    );
+    assert!(
+        routes.contains("posts::author_id.eq(owner_id)"),
+        "sharded index must be owner-scoped:\n{routes}"
+    );
+    assert!(
+        !routes.contains("mut db: Db"),
+        "sharded handlers must use ShardedDb, not a bare Db extractor:\n{routes}"
+    );
+
+    let check = Command::new("cargo")
+        .args(["check", "--tests"])
+        .current_dir(&project)
+        .output()
+        .unwrap();
+    assert!(
+        check.status.success(),
+        "cargo check on generated sharded-owner scaffold failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&check.stdout),
+        String::from_utf8_lossy(&check.stderr),
+    );
+}
+
+/// Issue #1830 companion for the attachment variant: an owner column on an
+/// attachment scaffold record-authorizes the mutating handlers by REUSING the
+/// `state: State<AppState>` wrapper the multipart upload already threads
+/// (`&*state`) rather than injecting a second, conflicting `State` extractor —
+/// the exact case #1125 excluded. `cargo check --tests` proves the deref-based
+/// authorize wiring compiles against the real framework.
+///
+/// Ignored by default; run with `cargo test -p autumn-cli -- --ignored`.
+#[test]
+#[ignore = "slow: cargo-checks a fresh project — run with `cargo test -p autumn-cli -- --ignored`"]
+fn generated_attachment_owner_scaffold_cargo_checks() {
+    let (_tmp, project) = fresh_project("attachment-owner-scaffold-build");
+    patch_generated_cargo_toml(&project);
+
+    run_autumn(
+        &project,
+        &[
+            "generate",
+            "scaffold",
+            "Post",
+            "title:String",
+            "author_id:i64",
+            "avatar:Attachment",
+        ],
+    );
+
+    let routes = fs::read_to_string(project.join("src/routes/posts.rs")).unwrap();
+    assert!(
+        routes.contains("autumn_web::authorization::authorize_create::<Post>(&*state, &session)"),
+        "attachment create must authorize_create via the reused &*state wrapper:\n{routes}"
+    );
+    assert!(
+        routes.contains(
+            "autumn_web::authorization::authorize::<Post>(&*state, &session, \"update\", &current)"
+        ),
+        "attachment update must authorize via &*state:\n{routes}"
+    );
+
+    let check = Command::new("cargo")
+        .args(["check", "--tests"])
+        .current_dir(&project)
+        .output()
+        .unwrap();
+    assert!(
+        check.status.success(),
+        "cargo check on generated attachment-owner scaffold failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&check.stdout),
+        String::from_utf8_lossy(&check.stderr),
+    );
+}
+
 /// Slow end-to-end check (issue #1124): scaffold a model with a `--validate`
 /// rule and prove the generated changeset round-trip actually compiles *and*
 /// runs — a rejected submission gets 422 with the other field preserved and
