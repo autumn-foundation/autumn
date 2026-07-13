@@ -6225,6 +6225,48 @@ fn generated_searchable_scaffold_cargo_checks() {
     );
 }
 
+/// Slow end-to-end check: scaffold a `--live` project, patch Cargo.toml to the
+/// local autumn-web, and `cargo check --tests` the result. Regression coverage
+/// for issue #1853: `--live` sets `broadcasts = true` on the `#[repository]`,
+/// which makes the macro synthesize internal hooks whose generated `update`
+/// body expands an unqualified `{Pascal}DraftExt::from_patch(...)`. The
+/// generated repository file must import `{Pascal}DraftExt` alongside the other
+/// model types, or the scaffold fails to compile with
+/// `error[E0405]: cannot find trait PostDraftExt in this scope`.
+///
+/// Run with: `cargo test -p autumn-cli -- --ignored generated_live_scaffold_cargo_checks`
+#[test]
+#[ignore = "slow: cargo-checks a fresh live scaffold — run with `cargo test -p autumn-cli -- --ignored`"]
+fn generated_live_scaffold_cargo_checks() {
+    let (_tmp, project) = fresh_project("live-build");
+
+    patch_generated_cargo_toml(&project);
+
+    run_autumn(
+        &project,
+        &[
+            "generate",
+            "scaffold",
+            "Post",
+            "title:String",
+            "body:Text",
+            "--live",
+        ],
+    );
+
+    let check = Command::new("cargo")
+        .args(["check", "--tests"])
+        .current_dir(&project)
+        .output()
+        .unwrap();
+    assert!(
+        check.status.success(),
+        "cargo check on generated live scaffold failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&check.stdout),
+        String::from_utf8_lossy(&check.stderr),
+    );
+}
+
 /// Slow end-to-end check: scaffold a `--soft-delete` project, patch Cargo.toml
 /// to the local autumn-web, and `cargo check --tests` the result. Regression
 /// coverage for a bug where the generated model's `deleted_at` field lacked

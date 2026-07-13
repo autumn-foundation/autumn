@@ -1304,6 +1304,18 @@ fn render_repository_file(
     let query_body = render_repository_queries(pascal_name, queries);
     let soft_delete_attr = if soft_delete { ", soft_delete" } else { "" };
     let broadcasts_attr = if live { ", broadcasts = true" } else { "" };
+    // When `broadcasts = true` is set, `#[repository]` synthesizes internal
+    // hooks whose generated `update` body expands an unqualified
+    // `{Pascal}DraftExt::from_patch(...)`. Import that trait alongside the other
+    // model types so the generated repository compiles (issue #1853). Gated on
+    // the same `live` boolean that drives `broadcasts_attr` — the default
+    // (non-broadcast) scaffold emits no hooks and no `from_patch`, so it keeps
+    // the plain three-name import.
+    let draft_ext_import = if live {
+        format!(", {pascal_name}DraftExt")
+    } else {
+        String::new()
+    };
     // Issue #1319: `searchable` opts the repository into the FTS `search()` /
     // `search_page(query, &PageRequest)` methods (backed by the model's
     // `#[searchable]` fields + the migration's `search_vector` column).
@@ -1411,7 +1423,7 @@ fn render_repository_file(
     };
     format!(
         "{doc_comment}\n\
-         use crate::models::{snake_name}::{{{pascal_name}, New{pascal_name}, Update{pascal_name}}};\n\
+         use crate::models::{snake_name}::{{{pascal_name}, New{pascal_name}, Update{pascal_name}{draft_ext_import}}};\n\
          use crate::schema::{plural};\n\
          \n\
          #[autumn_web::repository({pascal_name}, api = \"/api/{plural}\"{soft_delete_attr}{broadcasts_attr}{searchable_attr})]\n\
