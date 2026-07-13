@@ -56,7 +56,9 @@ pub struct CsrfDump {
 /// Every string is the *effective* declared value — in particular
 /// `content_security_policy` is the resolved template
 /// ([`default_content_security_policy`](crate::security::config::default_content_security_policy)
-/// when unset), not an unresolved sentinel.
+/// when unset), not an unresolved sentinel. When per-request CSP nonce injection
+/// is active it is the nonce-aware template (with a stable `AUTUMN_CSP_NONCE`
+/// placeholder), matching what responses actually send.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct HeadersDump {
@@ -106,6 +108,13 @@ impl SecurityDump {
         safe_methods.sort();
         safe_methods.dedup();
         let mut exempt_paths = csrf.exempt_paths.clone();
+        // Runtime's `apply_csrf_middleware` exempts every configured webhook
+        // endpoint path via `CsrfLayer::with_exempt_path`, so a webhook POST
+        // route not also listed in `csrf.exempt_paths` still skips CSRF at
+        // runtime. Fold those paths into the exempt set so the manifest matches.
+        for endpoint in &config.security.webhooks.endpoints {
+            exempt_paths.push(endpoint.path.clone());
+        }
         exempt_paths.sort();
         exempt_paths.dedup();
 
@@ -119,7 +128,9 @@ impl SecurityDump {
                 x_frame_options: headers.x_frame_options.clone(),
                 x_content_type_options: headers.x_content_type_options,
                 xss_protection: headers.xss_protection,
-                content_security_policy: headers.content_security_policy.clone(),
+                content_security_policy: crate::security::headers::resolved_content_security_policy(
+                    headers,
+                ),
                 referrer_policy: headers.referrer_policy.clone(),
                 permissions_policy: headers.permissions_policy.clone(),
                 strict_transport_security: headers.strict_transport_security,
@@ -1391,6 +1402,73 @@ mod tests {
         assert!(
             infos.is_empty(),
             "expected no dev routes when AUTUMN_DEV unset"
+        );
+    }
+
+    // ── SecurityDump::from_config (declared-vs-runtime honesty) ─────────────
+
+    /// Finding A: when CSP nonce injection is enabled and the CSP is the
+    /// framework default, runtime emits the nonce-aware template (not the raw
+    /// default), so the dumped CSP must be that template with the stable
+    /// `AUTUMN_CSP_NONCE` placeholder — never the raw default.
+    #[test]
+    fn security_dump_reports_nonce_aware_csp_when_nonce_enabled() {
+        let mut config = AutumnConfig::default();
+        // Default CSP is left in place; only the nonce flag flips.
+        config.security.headers.csp_nonce.enabled = true;
+
+        let dump = SecurityDump::from_config(&config);
+        let csp = &dump.headers.content_security_policy;
+        assert!(
+            csp.contains("'nonce-AUTUMN_CSP_NONCE'"),
+            "nonce-enabled default CSP must report the nonce-aware template: {csp}"
+        );
+        assert_eq!(
+            *csp,
+            crate::security::headers::resolved_content_security_policy(&config.security.headers),
+            "dump must mirror the runtime CSP resolution verbatim"
+        );
+
+        // With the nonce disabled the raw default is reported (no placeholder).
+        let mut plain = AutumnConfig::default();
+        plain.security.headers.csp_nonce.enabled = false;
+        let plain_dump = SecurityDump::from_config(&plain);
+        assert!(
+            !plain_dump
+                .headers
+                .content_security_policy
+                .contains("AUTUMN_CSP_NONCE"),
+            "nonce-disabled CSP must not carry the placeholder"
+        );
+    }
+
+    /// Finding B: runtime's `apply_csrf_middleware` exempts every configured
+    /// webhook endpoint path, so the dumped `csrf.exempt_paths` must include
+    /// them even when they are not duplicated in `security.csrf.exempt_paths`.
+    #[test]
+    fn security_dump_exempts_configured_webhook_paths() {
+        let mut config = AutumnConfig::default();
+        config.security.webhooks.endpoints = vec![crate::webhook::WebhookEndpointConfig {
+            path: "/webhooks/stripe".to_owned(),
+            ..Default::default()
+        }];
+
+        let dump = SecurityDump::from_config(&config);
+        assert!(
+            dump.csrf
+                .exempt_paths
+                .iter()
+                .any(|p| p == "/webhooks/stripe"),
+            "configured webhook path must be a CSRF exempt path: {:?}",
+            dump.csrf.exempt_paths
+        );
+        // Determinism: sorted and deduped.
+        let mut sorted = dump.csrf.exempt_paths.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(
+            dump.csrf.exempt_paths, sorted,
+            "exempt_paths must stay sorted and deduped"
         );
     }
 }

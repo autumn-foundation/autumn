@@ -106,6 +106,36 @@ fn header_config_changes_are_visible_in_the_wire_snapshot() {
     assert!(no_csp.headers.content_security_policy.is_empty());
 }
 
+/// Finding B: runtime's `apply_csrf_middleware` exempts every configured webhook
+/// endpoint path, so the wire snapshot must fold those paths into
+/// `csrf.exempt_paths` (sorted + deduped) even when they are absent from
+/// `security.csrf.exempt_paths` — otherwise the manifest claims CSRF on a route
+/// runtime never enforces.
+#[test]
+fn webhook_endpoint_paths_are_folded_into_csrf_exempt_paths() {
+    let mut config = AutumnConfig::default();
+    config.security.webhooks.endpoints = vec![autumn_web::webhook::WebhookEndpointConfig {
+        path: "/webhooks/stripe".to_owned(),
+        ..Default::default()
+    }];
+    // The webhook path is deliberately NOT duplicated in csrf.exempt_paths.
+    assert!(config.security.csrf.exempt_paths.is_empty());
+
+    let dump = SecurityDump::from_config(&config);
+    assert!(
+        dump.csrf
+            .exempt_paths
+            .iter()
+            .any(|p| p == "/webhooks/stripe"),
+        "webhook endpoint path must be a CSRF exempt path: {:?}",
+        dump.csrf.exempt_paths
+    );
+    let mut sorted = dump.csrf.exempt_paths.clone();
+    sorted.sort();
+    sorted.dedup();
+    assert_eq!(dump.csrf.exempt_paths, sorted, "sorted + deduped");
+}
+
 /// Small local helper so the CSRF-isolation assertion above can compare just the
 /// headers half of two snapshots.
 trait HeadersOnly {

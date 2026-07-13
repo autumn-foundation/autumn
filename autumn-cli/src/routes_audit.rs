@@ -178,7 +178,9 @@ pub struct HeadersDimension {
     pub entries: Vec<HeaderEntry>,
 }
 
-/// One security-header entry. `emitted` is `!value.is_empty()`.
+/// One security-header entry. `emitted` is `true` only when `value` is non-empty
+/// *and* parses as a valid `HeaderValue`, mirroring the runtime layer which
+/// skips headers whose value `HeaderValue::from_str` rejects.
 #[derive(Debug, Serialize)]
 pub struct HeaderEntry {
     pub header: String,
@@ -197,6 +199,14 @@ pub struct ExcludedDimension {
 /// Whether `method` is in the configured safe-method set (case-sensitive; route
 /// methods and config defaults are both upper-case).
 fn method_is_safe(method: &str, safe_methods: &[String]) -> bool {
+    // `#[ws]` routes are listed with the synthetic method `WS`, but the router
+    // mounts them via `axum::routing::get`, so at runtime `CsrfLayer` checks the
+    // *real* GET method against `safe_methods` and the default GET exemption
+    // applies — no CSRF token is ever validated on a WebSocket upgrade. Treat
+    // WS-listed routes as CSRF-safe so the manifest matches runtime.
+    if method == "WS" {
+        return true;
+    }
     safe_methods.iter().any(|m| m == method)
 }
 
@@ -316,9 +326,16 @@ fn build_headers_dimension(h: &HeadersDump) -> HeadersDimension {
 }
 
 fn header_entry(header: &str, value: String) -> HeaderEntry {
+    // Mirror the runtime security-headers layer, which inserts a header only
+    // when `HeaderValue::from_str(value)` succeeds and otherwise skips it. A
+    // non-empty but invalid value (e.g. one containing a newline) is therefore
+    // NOT emitted — the manifest must expose that misconfiguration, not paper
+    // over it by reporting `emitted: true`.
+    use autumn_web::reexports::http::HeaderValue;
+    let emitted = !value.is_empty() && HeaderValue::from_str(&value).is_ok();
     HeaderEntry {
         header: header.to_owned(),
-        emitted: !value.is_empty(),
+        emitted,
         value,
     }
 }
@@ -985,6 +1002,92 @@ mod tests {
         assert_eq!(find(&base, "content_security_policy")["emitted"], true);
         assert_eq!(find(&no_csp, "content_security_policy")["emitted"], false);
         assert_eq!(find(&no_csp, "content_security_policy")["value"], "");
+    }
+
+    /// Finding C: `#[ws]` routes are listed with the synthetic method `WS` but
+    /// mounted as GET, so runtime never validates a CSRF token on them. They
+    /// must NOT appear as mutating `csrf_enforced: true` entries in the manifest.
+    #[test]
+    fn ws_routes_are_treated_as_csrf_safe() {
+        let routes = vec![
+            route("WS", "/live", "live_socket", "public"),
+            route("POST", "/widgets", "create_widget", "gated"),
+        ];
+        let manifest = build_manifest(&routes, Some(&security_dump(true, &[])));
+        let entries: Vec<(&str, &str)> = manifest
+            .dimensions
+            .csrf
+            .entries
+            .iter()
+            .map(|e| (e.path.as_str(), e.method.as_str()))
+            .collect();
+        assert_eq!(
+            entries,
+            vec![("/widgets", "POST")],
+            "WS routes are GET-safe at runtime and must not be listed as mutating"
+        );
+        assert!(
+            !manifest
+                .dimensions
+                .csrf
+                .entries
+                .iter()
+                .any(|e| e.method == "WS"),
+            "no WS entry may appear in the csrf dimension"
+        );
+    }
+
+    /// Finding D: runtime's security-headers layer inserts a header only when
+    /// `HeaderValue::from_str` succeeds. A non-empty but invalid value (e.g. one
+    /// containing a newline) must be reported `emitted: false`, exposing the
+    /// misconfiguration instead of overstating what responses send.
+    #[test]
+    fn invalid_header_value_is_not_emitted() {
+        let routes = vec![route("POST", "/widgets", "create_widget", "gated")];
+        let mut sec = security_dump(true, &[]);
+        // A newline is rejected by `HeaderValue::from_str`.
+        sec.headers.referrer_policy = "no-referrer\r\ninjected: 1".to_owned();
+        let json = manifest_value(&build_manifest(&routes, Some(&sec)));
+        let entry = json["dimensions"]["security_headers"]["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["header"] == "referrer_policy")
+            .unwrap()
+            .clone();
+        assert_eq!(
+            entry["emitted"], false,
+            "an invalid (unparseable) header value must not be reported as emitted"
+        );
+    }
+
+    /// Finding B (manifest side): a webhook endpoint path folded into the dump's
+    /// `csrf.exempt_paths` (as `SecurityDump::from_config` does at runtime) makes
+    /// a POST route on that path exempt and unenforced, and records the path in
+    /// the dimension's `exempt_paths`.
+    #[test]
+    fn webhook_exempt_path_marks_route_unenforced() {
+        let routes = vec![route("POST", "/webhooks/stripe", "stripe_hook", "public")];
+        // The webhook path is NOT in `security.csrf.exempt_paths`; it arrives via
+        // the webhook-endpoint fold performed by `SecurityDump::from_config`.
+        let sec = security_dump(true, &["/webhooks/stripe"]);
+        let manifest = build_manifest(&routes, Some(&sec));
+        let entry = &manifest.dimensions.csrf.entries[0];
+        assert_eq!(entry.path, "/webhooks/stripe");
+        assert!(entry.exempt, "webhook path must be exempt");
+        assert!(
+            !entry.csrf_enforced,
+            "runtime skips CSRF on webhook endpoints, so csrf_enforced must be false"
+        );
+        assert!(
+            manifest
+                .dimensions
+                .csrf
+                .exempt_paths
+                .iter()
+                .any(|p| p == "/webhooks/stripe"),
+            "dimension exempt_paths must record the webhook path"
+        );
     }
 
     /// AC-6: two builds of identical source + config produce byte-identical
