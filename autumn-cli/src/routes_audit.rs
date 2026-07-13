@@ -196,17 +196,27 @@ pub struct ExcludedDimension {
     pub reason: &'static str,
 }
 
+/// Normalize a route's *listed* method to the method the runtime router actually
+/// mounts and dispatches on.
+///
+/// `#[ws]` routes are listed with the synthetic method `WS`, but the macro mounts
+/// them via `axum::routing::get` (see `autumn-macros/src/ws.rs`), so at runtime
+/// `CsrfService` sees a real `GET` and checks *that* against the configured
+/// `safe_methods` (`autumn/src/security/csrf.rs`). Deciding CSRF safety on the
+/// normalized `GET` keeps the manifest faithful to runtime in both the common
+/// case (default config: `GET` is safe → WS never CSRF-validated) and the
+/// customized case (an app removing `GET` from `safe_methods` → the WS upgrade,
+/// being a GET, *is* CSRF-validated and must show up as enforced).
+fn normalize_method(method: &str) -> &str {
+    if method == "WS" { "GET" } else { method }
+}
+
 /// Whether `method` is in the configured safe-method set (case-sensitive; route
-/// methods and config defaults are both upper-case).
+/// methods and config defaults are both upper-case). The listed method is first
+/// normalized to what the router mounts (see [`normalize_method`]) so the
+/// safe/exempt decision matches runtime, which only ever sees the mounted method.
 fn method_is_safe(method: &str, safe_methods: &[String]) -> bool {
-    // `#[ws]` routes are listed with the synthetic method `WS`, but the router
-    // mounts them via `axum::routing::get`, so at runtime `CsrfLayer` checks the
-    // *real* GET method against `safe_methods` and the default GET exemption
-    // applies — no CSRF token is ever validated on a WebSocket upgrade. Treat
-    // WS-listed routes as CSRF-safe so the manifest matches runtime.
-    if method == "WS" {
-        return true;
-    }
+    let method = normalize_method(method);
     safe_methods.iter().any(|m| m == method)
 }
 
@@ -1003,15 +1013,17 @@ mod tests {
         assert_eq!(find(&no_csp, "content_security_policy")["value"], "");
     }
 
-    /// Finding C: `#[ws]` routes are listed with the synthetic method `WS` but
-    /// mounted as GET, so runtime never validates a CSRF token on them. They
-    /// must NOT appear as mutating `csrf_enforced: true` entries in the manifest.
+    /// Finding C (default config): `#[ws]` routes are listed with the synthetic
+    /// method `WS` but mounted as GET, and the default `safe_methods` includes
+    /// GET, so runtime never validates a CSRF token on them. They must NOT appear
+    /// in `csrf.entries` under the default configuration.
     #[test]
-    fn ws_routes_are_treated_as_csrf_safe() {
+    fn ws_routes_are_csrf_safe_when_get_is_a_safe_method() {
         let routes = vec![
             route("WS", "/live", "live_socket", "public"),
             route("POST", "/widgets", "create_widget", "gated"),
         ];
+        // Default `safe_methods` includes GET (see `security_dump`).
         let manifest = build_manifest(&routes, Some(&security_dump(true, &[])));
         let entries: Vec<(&str, &str)> = manifest
             .dimensions
@@ -1023,7 +1035,7 @@ mod tests {
         assert_eq!(
             entries,
             vec![("/widgets", "POST")],
-            "WS routes are GET-safe at runtime and must not be listed as mutating"
+            "WS routes mount as GET; with GET safe they must not be listed as mutating"
         );
         assert!(
             !manifest
@@ -1032,7 +1044,53 @@ mod tests {
                 .entries
                 .iter()
                 .any(|e| e.method == "WS"),
-            "no WS entry may appear in the csrf dimension"
+            "no WS entry may appear in the csrf dimension when GET is safe"
+        );
+    }
+
+    /// Finding C (customized config): an app that removes GET from
+    /// `security.csrf.safe_methods` makes runtime CSRF-validate the WS upgrade
+    /// (a GET) unless its path is exempt. The manifest must reflect that: the WS
+    /// route now appears in `csrf.entries`, its displayed `method` stays the
+    /// route's listed `WS` (consistent with the `routes` dimension), and
+    /// `csrf_enforced` is computed via the normal exempt-path predicate
+    /// (enforced when the path isn't exempt, unenforced when it is).
+    #[test]
+    fn ws_routes_are_csrf_enforced_when_get_is_not_a_safe_method() {
+        let routes = vec![
+            route("WS", "/live", "live_socket", "public"),
+            route("WS", "/api/live", "api_socket", "public"),
+            route("POST", "/widgets", "create_widget", "gated"),
+        ];
+        // Customize config: drop GET, and exempt the `/api/` prefix.
+        let mut sec = security_dump(true, &["/api/"]);
+        sec.csrf.safe_methods = vec!["HEAD".to_owned(), "OPTIONS".to_owned()];
+        let manifest = build_manifest(&routes, Some(&sec));
+
+        let entries: Vec<(&str, &str, bool, bool)> = manifest
+            .dimensions
+            .csrf
+            .entries
+            .iter()
+            .map(|e| {
+                (
+                    e.path.as_str(),
+                    e.method.as_str(),
+                    e.csrf_enforced,
+                    e.exempt,
+                )
+            })
+            .collect();
+        // Ordered by (path, method): /api/live (WS), /live (WS), /widgets (POST).
+        assert_eq!(
+            entries,
+            vec![
+                ("/api/live", "WS", false, true),
+                ("/live", "WS", true, false),
+                ("/widgets", "POST", true, false),
+            ],
+            "WS routes appear as GET-mutating entries with the exempt-path predicate applied, \
+             while keeping their listed `WS` method for display"
         );
     }
 
