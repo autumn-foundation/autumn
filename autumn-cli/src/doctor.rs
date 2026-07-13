@@ -2792,10 +2792,29 @@ fn override_file_lookup_names(profile: &str, selected_input: &str) -> Vec<String
 /// `autumn_web::config`: inline `[profile.{name}]` sections are applied in alias
 /// order (canonical spelling wins), and exactly one `autumn-{name}.toml` file is
 /// loaded — the first that exists, preferring the selected spelling.
+///
+/// Reads each config file from the process CWD. Use
+/// [`get_merged_toml_table_runtime_with`] to honor `AUTUMN_MANIFEST_DIR` the way
+/// the runtime loader does.
 fn get_merged_toml_table_runtime(normalized_profile: &str, selected_input: &str) -> toml::Table {
+    get_merged_toml_table_runtime_with(normalized_profile, selected_input, |f| {
+        std::path::PathBuf::from(f)
+    })
+}
+
+/// Like [`get_merged_toml_table_runtime`], but resolves each config filename
+/// through `resolve_path`, so a caller can honor `AUTUMN_MANIFEST_DIR` (the
+/// runtime prefers the manifest dir for `autumn.toml` / `autumn-{name}.toml`,
+/// falling back to the CWD). Injectable so tests can point the lookup at a
+/// temp dir without mutating the process environment.
+fn get_merged_toml_table_runtime_with(
+    normalized_profile: &str,
+    selected_input: &str,
+    resolve_path: impl Fn(&str) -> std::path::PathBuf,
+) -> toml::Table {
     let mut merged = toml::Table::new();
 
-    let base_toml = std::fs::read_to_string("autumn.toml")
+    let base_toml = std::fs::read_to_string(resolve_path("autumn.toml"))
         .ok()
         .and_then(|c| toml::from_str::<toml::Table>(&c).ok());
 
@@ -2819,9 +2838,10 @@ fn get_merged_toml_table_runtime(normalized_profile: &str, selected_input: &str)
 
     // 3. Exactly one autumn-{name}.toml override file (first existing).
     for profile_name in override_file_lookup_names(normalized_profile, selected_input) {
-        if let Some(table) = std::fs::read_to_string(format!("autumn-{profile_name}.toml"))
-            .ok()
-            .and_then(|c| toml::from_str::<toml::Table>(&c).ok())
+        if let Some(table) =
+            std::fs::read_to_string(resolve_path(&format!("autumn-{profile_name}.toml")))
+                .ok()
+                .and_then(|c| toml::from_str::<toml::Table>(&c).ok())
         {
             deep_merge(&mut merged, &table);
             break;
@@ -2829,6 +2849,24 @@ fn get_merged_toml_table_runtime(normalized_profile: &str, selected_input: &str)
     }
 
     merged
+}
+
+/// Resolve a config filename the way the runtime loader does: prefer
+/// `$AUTUMN_MANIFEST_DIR/<filename>` when that variable is set (through the
+/// crate's [`autumn_web::config::OsEnv`], which surfaces the value baked in by
+/// `#[autumn_web::main]` for installed apps) and the file exists there;
+/// otherwise fall back to the process CWD. Mirrors `config`'s
+/// `find_config_file_named`, so doctor reads the same `autumn.toml` the app
+/// boots from when launched with `AUTUMN_MANIFEST_DIR`.
+fn resolve_config_path_manifest_aware(filename: &str) -> std::path::PathBuf {
+    use autumn_web::config::Env as _;
+    if let Ok(manifest_dir) = autumn_web::config::OsEnv.var("AUTUMN_MANIFEST_DIR") {
+        let candidate = std::path::PathBuf::from(manifest_dir).join(filename);
+        if candidate.exists() {
+            return candidate;
+        }
+    }
+    std::path::PathBuf::from(filename)
 }
 
 pub struct DoctorOAuth2Provider {
@@ -3835,9 +3873,18 @@ fn resolve_tls_paths_from_sources(
 /// a cert/key or tuning var supplied via `.env`/`.env.<profile>` — which the
 /// runtime loads via `TomlEnvConfigLoader` and would boot a TLS listener from —
 /// is visible to doctor instead of being reported as not-configured.
+///
+/// The merged TOML is resolved through [`resolve_config_path_manifest_aware`],
+/// so a `[server.tls]` section present only in the `AUTUMN_MANIFEST_DIR` config
+/// (where an installed app keeps `autumn.toml`) is graded, rather than being
+/// reported as not-configured because doctor read the CWD instead.
 fn resolve_tls_paths() -> Option<(std::path::PathBuf, std::path::PathBuf)> {
     let (canonical, selected, _) = resolve_active_profiles();
-    let merged = get_merged_toml_table_runtime(&canonical, &selected);
+    let merged = get_merged_toml_table_runtime_with(
+        &canonical,
+        &selected,
+        resolve_config_path_manifest_aware,
+    );
     let tls = merged
         .get("server")
         .and_then(toml::Value::as_table)
@@ -3911,21 +3958,19 @@ fn resolve_tls_doctor_data() -> TlsDoctorData {
 
     #[cfg(feature = "tls")]
     {
-        match autumn_web::tls::inspect_leaf(&cert, &key) {
-            Ok(inspection) => {
-                let now = i64::try_from(
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0),
-                )
-                .unwrap_or(i64::MAX);
-                TlsDoctorData::Healthy {
-                    not_yet_valid: inspection.is_not_yet_valid(now),
-                    expired: inspection.is_expired(now),
-                    days_until_expiry: inspection.days_until_expiry(now),
-                }
-            }
+        let now = i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+        )
+        .unwrap_or(i64::MAX);
+        match autumn_web::tls::inspect_leaf(&cert, &key, now) {
+            Ok(inspection) => TlsDoctorData::Healthy {
+                not_yet_valid: inspection.is_not_yet_valid(now),
+                expired: inspection.is_expired(now),
+                days_until_expiry: inspection.days_until_expiry(now),
+            },
             Err(e) => TlsDoctorData::Invalid {
                 detail: e.to_string(),
             },
@@ -7025,6 +7070,53 @@ pub struct Vault {
         let r = check_tls_impl(&data);
         assert!(matches!(r.status, CheckStatus::Fail));
         assert!(r.detail.as_deref().unwrap().contains("must set both"));
+    }
+
+    // Regression (#1603, Codex): the runtime prefers `AUTUMN_MANIFEST_DIR` for
+    // `autumn.toml`, so a `[server.tls]` section present ONLY in the manifest-dir
+    // config must be graded — not reported NotConfigured because doctor read the
+    // CWD. `resolve_tls_paths` resolves the merged table through
+    // `resolve_config_path_manifest_aware`; here we inject the manifest dir
+    // directly (no process-env mutation) by pointing `resolve_path` at a temp dir
+    // and confirm the section flows through `resolve_tls_paths_from_sources`.
+    #[test]
+    fn tls_section_in_manifest_dir_config_is_detected() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("autumn.toml"),
+            "[server.tls]\ncert_path = \"/etc/tls/cert.pem\"\nkey_path = \"/etc/tls/key.pem\"\n",
+        )
+        .unwrap();
+
+        // Resolve the merged table the way `resolve_tls_paths` does when
+        // `AUTUMN_MANIFEST_DIR` points at `dir`: each filename resolves under it.
+        let base = dir.path().to_path_buf();
+        let merged = get_merged_toml_table_runtime_with("dev", "dev", move |f| base.join(f));
+
+        let tls = merged
+            .get("server")
+            .and_then(toml::Value::as_table)
+            .and_then(|s| s.get("tls"))
+            .and_then(toml::Value::as_table);
+        assert!(
+            tls.is_some(),
+            "a [server.tls] section in the manifest-dir autumn.toml must be visible"
+        );
+
+        let toml_cert = tls
+            .and_then(|t| t.get("cert_path"))
+            .and_then(toml::Value::as_str)
+            .map(str::to_owned);
+        let toml_key = tls
+            .and_then(|t| t.get("key_path"))
+            .and_then(toml::Value::as_str)
+            .map(str::to_owned);
+
+        let (cert, key) =
+            resolve_tls_paths_from_sources(tls.is_some(), toml_cert, toml_key, None, None, false)
+                .expect("manifest-dir [server.tls] must resolve as configured, not NotConfigured");
+        assert_eq!(cert, std::path::PathBuf::from("/etc/tls/cert.pem"));
+        assert_eq!(key, std::path::PathBuf::from("/etc/tls/key.pem"));
     }
 
     // Complementary: with no section and NO TLS env var, TLS is unconfigured.

@@ -139,6 +139,41 @@ pub enum TlsError {
         /// `notBefore` as a UNIX timestamp.
         not_before_unix: i64,
     },
+    /// A non-leaf certificate in the chain (at 1-based `position`) has already
+    /// expired. Normal TLS clients reject the whole chain during path
+    /// validation, so refuse it at load/inspection time rather than boot a
+    /// listener that serves it. Symmetric to the leaf's [`Self::Expired`].
+    #[error(
+        "certificate #{position} in the chain in `{path}` expired at {not_after} \
+         (UNIX {not_after_unix})"
+    )]
+    ExpiredChainCert {
+        /// Certificate path.
+        path: PathBuf,
+        /// 1-based position of the offending certificate in the chain.
+        position: usize,
+        /// RFC 2822-ish rendering of `notAfter`.
+        not_after: String,
+        /// `notAfter` as a UNIX timestamp.
+        not_after_unix: i64,
+    },
+    /// A non-leaf certificate in the chain (at 1-based `position`) is not yet
+    /// valid — its `notBefore` is in the future. Symmetric to the leaf's
+    /// [`Self::NotYetValid`].
+    #[error(
+        "certificate #{position} in the chain in `{path}` is not yet valid until {not_before} \
+         (UNIX {not_before_unix})"
+    )]
+    NotYetValidChainCert {
+        /// Certificate path.
+        path: PathBuf,
+        /// 1-based position of the offending certificate in the chain.
+        position: usize,
+        /// RFC 2822-ish rendering of `notBefore`.
+        not_before: String,
+        /// `notBefore` as a UNIX timestamp.
+        not_before_unix: i64,
+    },
     /// Building the rustls `ServerConfig` failed.
     #[error("failed to build the rustls server configuration: {source}")]
     BuildConfig {
@@ -211,28 +246,63 @@ fn leaf_validity_unix(cert_path: &Path, leaf: &CertificateDer<'_>) -> Result<(i6
     ))
 }
 
-/// Parse every NON-leaf certificate DER in `chain`, failing fast (naming the
-/// 1-based chain position) if any block is not a parseable X.509 certificate.
+/// Parse and lifetime-check every NON-leaf certificate DER in `chain`, failing
+/// fast (naming the 1-based chain position) if any block is not a parseable
+/// X.509 certificate OR is outside its validity window at `now_unix`.
 ///
 /// [`read_cert_chain`] only PEM-decodes each block, and rustls'
 /// [`CertifiedKey::from_der`] validates only the leaf (`chain[0]`). A malformed
-/// INTERMEDIATE would therefore be stored unparsed and served, so startup and
-/// `autumn doctor` pass while normal clients reject the chain. Parsing each
-/// intermediate here turns that into an actionable fail-fast at load/inspection
-/// time. The leaf (`chain[0]`) is parsed separately by [`leaf_validity_unix`].
-fn validate_chain_certs(cert_path: &Path, chain: &[CertificateDer<'_>]) -> Result<(), TlsError> {
+/// — or an expired / not-yet-valid — INTERMEDIATE would therefore be stored
+/// unchecked and served, so startup and `autumn doctor` pass while normal TLS
+/// clients reject the chain during path validation. Parsing and lifetime-
+/// checking each intermediate here turns that into an actionable fail-fast at
+/// load/inspection time. The leaf (`chain[0]`) is parsed and lifetime-checked
+/// separately (by [`leaf_validity_unix`] and its callers).
+///
+/// `now_unix` is the current UNIX time; it is a parameter (rather than read
+/// internally) so tests can pin "now" deterministically.
+fn validate_chain_certs(
+    cert_path: &Path,
+    chain: &[CertificateDer<'_>],
+    now_unix: i64,
+) -> Result<(), TlsError> {
     use x509_parser::prelude::FromDer as _;
 
-    // Skip index 0 (the leaf); `leaf_validity_unix` already parses it.
+    // Skip index 0 (the leaf); its DER and validity window are checked by the
+    // callers via `leaf_validity_unix`.
     for (idx, cert) in chain.iter().enumerate().skip(1) {
-        x509_parser::certificate::X509Certificate::from_der(cert.as_ref()).map_err(|e| {
-            TlsError::ParseChainCert {
+        // 1-based, matching how operators count "certificate #2" in a bundle.
+        let position = idx + 1;
+        let (_, parsed) = x509_parser::certificate::X509Certificate::from_der(cert.as_ref())
+            .map_err(|e| TlsError::ParseChainCert {
                 path: cert_path.to_path_buf(),
-                // 1-based, matching how operators count "certificate #2" in a bundle.
-                position: idx + 1,
+                position,
                 detail: e.to_string(),
-            }
-        })?;
+            })?;
+
+        // Reject an intermediate outside its validity window, mirroring the
+        // leaf's not-yet-valid / expired handling: `notBefore` in the future is
+        // as fatal as a past `notAfter`, since either makes clients reject the
+        // served chain.
+        let validity = parsed.validity();
+        let not_before = validity.not_before.timestamp();
+        let not_after = validity.not_after.timestamp();
+        if now_unix < not_before {
+            return Err(TlsError::NotYetValidChainCert {
+                path: cert_path.to_path_buf(),
+                position,
+                not_before: render_unix(not_before),
+                not_before_unix: not_before,
+            });
+        }
+        if not_after < now_unix {
+            return Err(TlsError::ExpiredChainCert {
+                path: cert_path.to_path_buf(),
+                position,
+                not_after: render_unix(not_after),
+                not_after_unix: not_after,
+            });
+        }
     }
     Ok(())
 }
@@ -279,10 +349,11 @@ pub fn load_certified_key(
         });
     }
 
-    // Parse every intermediate before accepting the chain: rustls validates only
-    // the leaf, so a malformed intermediate would otherwise boot a listener that
-    // serves a chain normal clients reject.
-    validate_chain_certs(cert_path, &chain)?;
+    // Parse and lifetime-check every intermediate before accepting the chain:
+    // rustls validates only the leaf, so a malformed — or expired / not-yet-valid
+    // — intermediate would otherwise boot a listener that serves a chain normal
+    // clients reject during path validation.
+    validate_chain_certs(cert_path, &chain, now_unix)?;
 
     // `from_der` loads the key with the crypto provider (rejecting an invalid
     // key) and compares the key's SubjectPublicKeyInfo against the leaf
@@ -620,24 +691,36 @@ impl LeafInspection {
 /// WITHOUT booting a server or touching the network. Used by `autumn doctor`.
 ///
 /// This performs the same parsing and cert/key-match validation as
-/// [`load_certified_key`] (so a broken pair is reported), but tolerates a leaf
+/// [`load_certified_key`] (so a broken pair is reported), but tolerates a LEAF
 /// outside its validity window — already-expired OR not-yet-valid — leaving the
 /// caller to decide how to grade it, by still returning the `notBefore`/
-/// `notAfter` bounds.
+/// `notAfter` bounds. Non-leaf (intermediate) certificates are NOT tolerated:
+/// an expired or not-yet-valid intermediate is rejected here (mirroring the
+/// runtime), since clients reject the served chain during path validation.
+///
+/// `now_unix` is the current UNIX time; it is a parameter (rather than read
+/// internally) so tests can pin "now" deterministically. It is used only to
+/// lifetime-check the intermediates — the leaf's window is returned ungraded.
 ///
 /// # Errors
 ///
 /// Returns a [`TlsError`] for a missing/unreadable file, unparseable PEM, an
-/// empty certificate file, or a key that does not match the leaf certificate.
-pub fn inspect_leaf(cert_path: &Path, key_path: &Path) -> Result<LeafInspection, TlsError> {
+/// empty certificate file, a key that does not match the leaf certificate, or a
+/// malformed / expired / not-yet-valid intermediate certificate.
+pub fn inspect_leaf(
+    cert_path: &Path,
+    key_path: &Path,
+    now_unix: i64,
+) -> Result<LeafInspection, TlsError> {
     let chain = read_cert_chain(cert_path)?;
     let key = read_private_key(key_path)?;
     let (not_before, not_after) = leaf_validity_unix(cert_path, &chain[0])?;
 
-    // Parse every intermediate too, so doctor fails a malformed-intermediate
-    // chain instead of greenlighting one the runtime would boot but clients
-    // reject (rustls validates only the leaf).
-    validate_chain_certs(cert_path, &chain)?;
+    // Parse and lifetime-check every intermediate too, so doctor fails a
+    // malformed — or expired / not-yet-valid — intermediate chain instead of
+    // greenlighting one the runtime would boot but clients reject (rustls
+    // validates only the leaf).
+    validate_chain_certs(cert_path, &chain, now_unix)?;
 
     // Validate the key matches the leaf even though we do not need the key
     // material — a mismatched pair would fail every handshake at runtime, so
@@ -729,19 +812,92 @@ AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
         );
     }
 
-    // A chain of [valid leaf, well-formed intermediate] still loads. Chain-cert
-    // validation checks DER parseability (not chain-of-trust), so a second
-    // parseable certificate stands in for a real intermediate here.
+    // A chain of [valid leaf, well-formed valid intermediate] still loads.
+    // Chain-cert validation checks DER parseability and the validity window
+    // (not chain-of-trust), so a second currently-valid certificate stands in
+    // for a real intermediate here.
     #[test]
     fn valid_leaf_and_intermediate_chain_loads() {
         let dir = tempfile::tempdir().unwrap();
-        let chain_pem = format!("{CERT_PEM}\n{EXPIRED_CERT_PEM}");
+        // Both blocks are the far-future `CERT_PEM` fixture, so the intermediate
+        // is within its validity window (an expired intermediate is now rejected).
+        let chain_pem = format!("{CERT_PEM}\n{CERT_PEM}");
         let cert = write_temp(dir.path(), "chain.pem", &chain_pem);
         let key = write_temp(dir.path(), "k.pem", KEY_PEM);
         let provider = crypto_provider();
         let ck = load_certified_key(&cert, &key, &provider, now())
             .expect("a valid leaf + well-formed intermediate must load");
         assert_eq!(ck.cert.len(), 2, "both chain certificates are retained");
+    }
+
+    // Regression (#1603, Codex): an EXPIRED intermediate is rejected by clients
+    // during path validation, so `validate_chain_certs` must fail fast at
+    // load/inspection time, naming the 1-based position and that it expired.
+    #[test]
+    fn expired_intermediate_in_chain_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        // [valid leaf (far-future), expired intermediate (2021)].
+        let chain_pem = format!("{CERT_PEM}\n{EXPIRED_CERT_PEM}");
+        let path = write_temp(dir.path(), "chain.pem", &chain_pem);
+        let chain = read_cert_chain(&path).unwrap();
+        // "Now" is inside the leaf's window but well past the intermediate's
+        // 2021 notAfter.
+        let err = validate_chain_certs(&path, &chain, now()).unwrap_err();
+        assert!(
+            matches!(err, TlsError::ExpiredChainCert { position: 2, .. }),
+            "an expired intermediate must fail fast at position 2, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("#2"),
+            "error must name the offending position, got: {err}"
+        );
+        assert!(
+            err.to_string().contains("expired"),
+            "error must report expiry, got: {err}"
+        );
+    }
+
+    // Regression (#1603, Codex): a NOT-YET-VALID intermediate is likewise
+    // rejected by clients, so it must fail fast at position 2. `now` is pinned
+    // before the intermediate's notBefore; the leaf (`chain[0]`) is skipped by
+    // `validate_chain_certs`, so only the intermediate is graded.
+    #[test]
+    fn not_yet_valid_intermediate_in_chain_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let leaf = write_temp(dir.path(), "leaf.pem", CERT_PEM);
+        let leaf_key = write_temp(dir.path(), "leaf.key.pem", KEY_PEM);
+        // The intermediate is a second copy of `CERT_PEM`; pin "now" one hour
+        // before its notBefore so its validity window has not opened yet.
+        let not_before = inspect_leaf(&leaf, &leaf_key, now())
+            .unwrap()
+            .not_before_unix;
+        let chain_pem = format!("{CERT_PEM}\n{CERT_PEM}");
+        let path = write_temp(dir.path(), "chain.pem", &chain_pem);
+        let chain = read_cert_chain(&path).unwrap();
+        let err = validate_chain_certs(&path, &chain, not_before - 3600).unwrap_err();
+        assert!(
+            matches!(err, TlsError::NotYetValidChainCert { position: 2, .. }),
+            "a not-yet-valid intermediate must fail fast at position 2, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("#2"),
+            "error must name the offending position, got: {err}"
+        );
+        assert!(
+            err.to_string().contains("not yet valid"),
+            "error must report the not-yet-valid window, got: {err}"
+        );
+    }
+
+    // A chain whose intermediate is currently within its validity window passes.
+    #[test]
+    fn valid_intermediate_in_chain_is_accepted() {
+        let dir = tempfile::tempdir().unwrap();
+        let chain_pem = format!("{CERT_PEM}\n{CERT_PEM}");
+        let path = write_temp(dir.path(), "chain.pem", &chain_pem);
+        let chain = read_cert_chain(&path).unwrap();
+        validate_chain_certs(&path, &chain, now())
+            .expect("a valid, in-window intermediate must be accepted");
     }
 
     #[test]
@@ -803,7 +959,7 @@ AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
         // Pin "now" to one hour BEFORE the fixture's notBefore (equivalent to a
         // cert whose notBefore is now + 3600): the leaf is not yet valid, so
         // load must fail fast — symmetric to the expired-leaf rejection.
-        let not_before = inspect_leaf(&cert, &key).unwrap().not_before_unix;
+        let not_before = inspect_leaf(&cert, &key, now()).unwrap().not_before_unix;
         let err = load_certified_key(&cert, &key, &provider, not_before - 3600).unwrap_err();
         assert!(matches!(err, TlsError::NotYetValid { .. }), "got {err:?}");
 
@@ -820,7 +976,7 @@ AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
         let key = write_temp(dir.path(), "k.pem", KEY_PEM);
         // inspect_leaf tolerates a not-yet-valid leaf (doctor grades it) but
         // returns notBefore so the caller can see the window has not opened.
-        let inspection = inspect_leaf(&cert, &key).expect("pair inspects");
+        let inspection = inspect_leaf(&cert, &key, now()).expect("pair inspects");
         assert!(inspection.is_not_yet_valid(inspection.not_before_unix - 1));
         assert!(!inspection.is_not_yet_valid(inspection.not_before_unix));
         assert!(!inspection.is_not_yet_valid(inspection.not_after_unix));
@@ -831,7 +987,7 @@ AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
         let dir = tempfile::tempdir().unwrap();
         let cert = write_temp(dir.path(), "c.pem", CERT_PEM);
         let key = write_temp(dir.path(), "k.pem", KEY_PEM);
-        let inspection = inspect_leaf(&cert, &key).expect("valid pair inspects");
+        let inspection = inspect_leaf(&cert, &key, now()).expect("valid pair inspects");
         assert!(
             inspection.days_until_expiry(now()) > 30,
             "fixture should be valid far into the future"
@@ -845,7 +1001,7 @@ AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
         let key = write_temp(dir.path(), "k.pem", EXPIRED_KEY_PEM);
         // inspect_leaf tolerates expiry (doctor grades it) but still returns
         // the notAfter so the caller can see it is in the past.
-        let inspection = inspect_leaf(&cert, &key).expect("expired pair still inspects");
+        let inspection = inspect_leaf(&cert, &key, now()).expect("expired pair still inspects");
         assert!(inspection.days_until_expiry(now()) < 0);
     }
 
