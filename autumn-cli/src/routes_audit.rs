@@ -906,6 +906,38 @@ mod tests {
         );
     }
 
+    /// Codex P2 (issue #1627): a mutating framework route (the actuator's
+    /// `PUT {prefix}/loggers/{name}`) that previously never reached the listing
+    /// must, once enumerated, surface in `csrf.entries` with enforcement on.
+    #[test]
+    fn csrf_dimension_covers_mutating_framework_routes() {
+        let routes = vec![
+            route("GET", "/actuator/loggers", "loggers_get", "framework"),
+            route(
+                "PUT",
+                "/actuator/loggers/{name}",
+                "loggers_put",
+                "framework",
+            ),
+        ];
+        let dim = build_csrf_dimension(&routes, &security_dump(true, &[]).csrf);
+        let entry = dim
+            .entries
+            .iter()
+            .find(|e| e.method == "PUT" && e.path == "/actuator/loggers/{name}")
+            .expect("mutating framework route must appear in csrf.entries");
+        assert!(
+            entry.csrf_enforced && !entry.exempt,
+            "PUT loggers must be CSRF-enforced: {entry:?}"
+        );
+        // The safe-method GET listing route is never a csrf entry.
+        assert!(
+            !dim.entries.iter().any(|e| e.method == "GET"),
+            "safe-method routes must not appear: {:?}",
+            dim.entries
+        );
+    }
+
     /// AC-2 keystone: disabling CSRF flips exactly the affected `csrf.entries`
     /// and leaves `routes` and `security_headers` byte-identical.
     #[test]

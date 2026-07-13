@@ -305,8 +305,14 @@ impl RouteInfo {
     /// Construct a framework-owned `GET` route entry. Framework routes are
     /// pre-classified and exempt from the audit gate.
     fn framework_get(path: String, handler: &str) -> Self {
+        Self::framework_route("GET", path, handler)
+    }
+
+    /// Construct a framework-owned route entry for an arbitrary HTTP method.
+    /// Framework routes are pre-classified and exempt from the audit gate.
+    fn framework_route(method: &str, path: String, handler: &str) -> Self {
         Self {
-            method: "GET".to_owned(),
+            method: method.to_owned(),
             path,
             handler: handler.to_owned(),
             source: RouteSource::Framework,
@@ -527,6 +533,20 @@ pub(crate) fn append_framework_routes(
         config.actuator.prometheus,
     ) {
         infos.push(RouteInfo::framework_get(path, "actuator"));
+    }
+
+    // Mutating (non-GET) actuator routes are enumerated separately so they
+    // carry their real HTTP method (e.g. `PUT /actuator/loggers/{name}`,
+    // `POST /actuator/webhooks/replay`) rather than a phantom GET.
+    for (route_method, route_path) in crate::actuator::actuator_mutating_routes(
+        &config.actuator.prefix,
+        config.actuator.sensitive,
+    ) {
+        infos.push(RouteInfo::framework_route(
+            route_method,
+            route_path,
+            "actuator",
+        ));
     }
 
     #[cfg(feature = "htmx")]
@@ -1238,6 +1258,65 @@ mod tests {
         assert!(
             paths.contains(&"/ping"),
             "custom health path missing: {paths:?}"
+        );
+    }
+
+    /// Codex P2 (issue #1627): mutating actuator routes must be enumerated with
+    /// their real HTTP method so the `csrf` posture dimension can see them.
+    /// `PUT {prefix}/loggers/{name}` is mounted at runtime when
+    /// `actuator.sensitive = true` but was previously absent from the listing.
+    #[test]
+    fn append_framework_routes_includes_mutating_actuator_routes() {
+        let mut config = AutumnConfig::default();
+        config.actuator.sensitive = true;
+        let prefix = config.actuator.prefix.clone();
+        let mut infos = Vec::new();
+        append_framework_routes(&mut infos, &config);
+
+        let loggers_path = format!("{prefix}/loggers/{{name}}");
+        assert!(
+            infos.iter().any(|i| i.method == "PUT"
+                && i.path == loggers_path
+                && i.classification == RouteClassification::Framework),
+            "expected PUT {loggers_path} framework route: {infos:?}"
+        );
+
+        // The `/webhooks/replay` route is mounted as POST only; it must never
+        // appear as a phantom GET.
+        let replay_path = format!("{prefix}/webhooks/replay");
+        assert!(
+            !infos
+                .iter()
+                .any(|i| i.method == "GET" && i.path == replay_path),
+            "phantom GET {replay_path} must not be listed: {infos:?}"
+        );
+    }
+
+    /// Companion to the above, guarded on `http-client`: the DLQ replay endpoint
+    /// is mounted as `POST` and must be enumerated as such.
+    #[cfg(feature = "http-client")]
+    #[test]
+    fn append_framework_routes_includes_webhook_replay_post() {
+        let mut config = AutumnConfig::default();
+        config.actuator.sensitive = true;
+        let prefix = config.actuator.prefix.clone();
+        let mut infos = Vec::new();
+        append_framework_routes(&mut infos, &config);
+
+        let replay_path = format!("{prefix}/webhooks/replay");
+        assert!(
+            infos.iter().any(|i| i.method == "POST"
+                && i.path == replay_path
+                && i.classification == RouteClassification::Framework),
+            "expected POST {replay_path} framework route: {infos:?}"
+        );
+        // `/webhooks/dlq` stays a GET listing.
+        let dlq_path = format!("{prefix}/webhooks/dlq");
+        assert!(
+            infos
+                .iter()
+                .any(|i| i.method == "GET" && i.path == dlq_path),
+            "expected GET {dlq_path} framework route: {infos:?}"
         );
     }
 

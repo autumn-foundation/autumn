@@ -3521,8 +3521,9 @@ pub(crate) fn actuator_endpoint_paths(
         }
         #[cfg(feature = "http-client")]
         {
+            // Only the GET DLQ listing is enumerated here; `/webhooks/replay`
+            // is mounted as `POST` (see `actuator_mutating_routes`), not `GET`.
             paths.push(actuator_route_path(prefix, "/webhooks/dlq"));
-            paths.push(actuator_route_path(prefix, "/webhooks/replay"));
         }
         #[cfg(feature = "ws")]
         {
@@ -3532,6 +3533,31 @@ pub(crate) fn actuator_endpoint_paths(
     }
 
     paths
+}
+
+/// Enumerate the actuator's mutating (non-`GET`) framework routes, gated to
+/// match the mounts in [`actuator_router_with_prefix`].
+///
+/// Kept separate from [`actuator_endpoint_paths`] (which is `GET`-only and
+/// paths-only) so the route listing can classify these with their real HTTP
+/// method. Returns `(method, path)` pairs using the same
+/// [`actuator_route_path`] helper as the mounting code so paths match
+/// byte-for-byte.
+pub(crate) fn actuator_mutating_routes(
+    prefix: &str,
+    sensitive: bool,
+) -> Vec<(&'static str, String)> {
+    let mut routes: Vec<(&'static str, String)> = Vec::new();
+
+    if sensitive {
+        routes.push(("PUT", actuator_route_path(prefix, "/loggers/{name}")));
+        #[cfg(feature = "http-client")]
+        {
+            routes.push(("POST", actuator_route_path(prefix, "/webhooks/replay")));
+        }
+    }
+
+    routes
 }
 
 /// Build the actuator router with profile-aware endpoint exposure.
