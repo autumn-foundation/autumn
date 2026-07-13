@@ -1109,6 +1109,179 @@ pub(super) fn warn_if_existing_dep_missing_features(
     }
 }
 
+/// Pull the version literal out of the right-hand side of a single-line
+/// dependency declaration, whether shorthand (`"0.13"`) or the inline-table
+/// `{ version = "0.13", ... }` form. Returns `None` when there is no version
+/// literal to read (`{ workspace = true }`, git/path deps, etc.).
+fn extract_version_literal(rhs: &str) -> Option<&str> {
+    let rhs = rhs.trim();
+    let after = if let Some(idx) = rhs.find("version") {
+        // Inline-table form: skip past `version`, then read the literal.
+        &rhs[idx + "version".len()..]
+    } else if rhs.starts_with('"') {
+        // Shorthand form: the literal starts here.
+        rhs
+    } else {
+        return None;
+    };
+    let start = after.find('"')? + 1;
+    let end = after[start..].find('"')? + start;
+    Some(&after[start..end])
+}
+
+/// Parse the leading `major.minor` out of a version-requirement literal such
+/// as `"0.13"`, `"^0.21"`, `"~0.22.1"`, or `"1"`. A missing minor defaults to
+/// `0`. Returns `None` only when the major component itself can't be parsed.
+fn parse_major_minor(ver: &str) -> Option<(u64, u64)> {
+    // Trim a leading caret/tilde/comparator so `^0.13`, `~0.13`, `>=0.13`
+    // parse to the same base version.
+    let ver = ver.trim_start_matches(['^', '~', '=', '>', '<', ' ']);
+    let mut it = ver.split('.');
+    let major = it.next()?.trim().parse::<u64>().ok()?;
+    let minor = it
+        .next()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(0);
+    Some((major, minor))
+}
+
+/// Best-effort: return the `(major, minor)` version `existing` Cargo.toml pins
+/// for `crate_name` in `[dependencies]`, or `None` when the crate is absent or
+/// its version can't be determined from the text alone.
+///
+/// Mirrors [`dep_section_has`]'s shape handling so it sees the same declarations
+/// `ensure_cargo_dependencies` treats as "already present":
+/// - single-line shorthand / inline-table (`crate = "0.13"`,
+///   `crate = { version = "0.13", ... }`), and
+/// - the `[dependencies.<crate>]` subtable form, scanning its body (up to the
+///   next table header) for a `version = "…"` key.
+///
+/// Returns `None` for shapes with no readable version literal — workspace
+/// inheritance (`{ workspace = true }`), git/path deps, or a subtable with no
+/// `version` key. Callers treat that undeterminable case conservatively.
+fn existing_dep_version(existing: &str, crate_name: &str) -> Option<(u64, u64)> {
+    let lines: Vec<&str> = existing.lines().collect();
+    let deps_idx = lines
+        .iter()
+        .position(|l| is_table_header(l, "dependencies"))?;
+    let scan_end = lines[deps_idx + 1..]
+        .iter()
+        .position(|l| is_any_table_header(l) && !is_dep_subtable_boundary_marker(l))
+        .map_or(lines.len(), |off| deps_idx + 1 + off);
+    let dep_section = &lines[deps_idx + 1..scan_end];
+
+    // `[dependencies.<crate>]` subtable form: scan its body for a `version` key.
+    if let Some(sub_idx) = dep_section
+        .iter()
+        .position(|l| dep_subtable_crate_name(l) == Some(crate_name))
+    {
+        let sub_body_end = dep_section[sub_idx + 1..]
+            .iter()
+            .position(|l| is_any_table_header(l))
+            .map_or(dep_section.len(), |off| sub_idx + 1 + off);
+        for l in &dep_section[sub_idx + 1..sub_body_end] {
+            let t = l.trim_start();
+            if t.starts_with('#') {
+                continue;
+            }
+            if let Some((key, rhs)) = t.split_once('=')
+                && key.trim() == "version"
+            {
+                return extract_version_literal(rhs).and_then(parse_major_minor);
+            }
+        }
+        // Subtable present but no `version` key → undeterminable.
+        return None;
+    }
+
+    // `crate = …` single-line shorthand / inline-table form.
+    for l in dep_section {
+        let t = l.trim_start();
+        if t.starts_with('#') {
+            continue;
+        }
+        let Some((name, rhs)) = t.split_once('=') else {
+            continue;
+        };
+        if name.trim() != crate_name {
+            continue;
+        }
+        return extract_version_literal(rhs).and_then(parse_major_minor);
+    }
+    None
+}
+
+/// Best-effort: return `true` if the generator should warn that `existing`
+/// Cargo.toml's `crate_name` pin might be too old — i.e. `crate_name` is
+/// declared (in *any* shape [`dep_section_has`] recognises) but is *not*
+/// provably at version `>= (min_major, min_minor)`.
+///
+/// [`ensure_cargo_dependencies`] is name-only: once a crate is declared it
+/// never bumps the version, so a stale pin silently yields generated code that
+/// won't compile. Because that skip fires for both the shorthand and the
+/// `[dependencies.<crate>]` subtable shapes, the version check must see both —
+/// otherwise a subtable pin of `base64 = "0.13"` would dodge the warning while
+/// still breaking the build.
+///
+/// Decision:
+/// - crate absent → `false` (it'll be added fresh at the required version);
+/// - version provably `>= (min_major, min_minor)` → `false`;
+/// - version provably below → `true`;
+/// - version undeterminable but the crate is declared → `true`, conservatively
+///   (a spurious warning is far cheaper than a silent compile break).
+fn existing_dep_version_below(
+    existing: &str,
+    crate_name: &str,
+    min_major: u64,
+    min_minor: u64,
+) -> bool {
+    let lines: Vec<&str> = existing.lines().collect();
+    let Some(deps_idx) = lines
+        .iter()
+        .position(|l| is_table_header(l, "dependencies"))
+    else {
+        return false;
+    };
+    let scan_end = lines[deps_idx + 1..]
+        .iter()
+        .position(|l| is_any_table_header(l) && !is_dep_subtable_boundary_marker(l))
+        .map_or(lines.len(), |off| deps_idx + 1 + off);
+    let dep_section = &lines[deps_idx + 1..scan_end];
+
+    // Absent (in every shape ensure_cargo_dependencies would skip) → no warn.
+    if !dep_section_has(dep_section, crate_name) {
+        return false;
+    }
+    // Declared: warn unless we can prove the pinned version is new enough.
+    existing_dep_version(existing, crate_name)
+        .is_none_or(|version| version < (min_major, min_minor))
+}
+
+/// If `existing` Cargo.toml already declares `crate_name` at a version below
+/// `(min_major, min_minor)`, record a single `plan` warning. Used for deps
+/// whose generated code needs a newer API than an older pinned version
+/// exposes (e.g. `base64` 0.21+ `Engine`/`engine::general_purpose`), which
+/// [`ensure_cargo_dependencies`] silently skips because it is name-only. See
+/// [`warn_if_existing_dep_missing_features`] for the sibling case.
+pub(super) fn warn_if_existing_dep_below_version(
+    plan: &mut Plan,
+    existing_cargo_toml: &str,
+    crate_name: &str,
+    min_major: u64,
+    min_minor: u64,
+) {
+    if existing_dep_version_below(existing_cargo_toml, crate_name, min_major, min_minor) {
+        plan.warn(format!(
+            "Cargo.toml already declares '{crate_name}', but not provably at \
+             version >= {min_major}.{min_minor} — the generated passkeys/2FA \
+             handlers use the '{crate_name}' 0.21+ `Engine`/\
+             `engine::general_purpose` API; make sure '{crate_name}' >= \
+             {min_major}.{min_minor} by hand or the generated code may fail to \
+             compile."
+        ));
+    }
+}
+
 /// Reserved resource names whose snake-case form would collide with a special
 /// file in the generated layout (e.g. `mod` → `src/models/mod.rs`).
 const RESERVED_RESOURCE_NAMES: &[&str] = &["main", "lib"];
@@ -3201,6 +3374,135 @@ autumn-web = \"0.3\"\n";
             chrono_pos < dev_deps_pos,
             "chrono must land in [dependencies], not [dev-dependencies]"
         );
+    }
+
+    #[test]
+    fn existing_dep_version_below_detects_old_base64() {
+        // Shorthand and inline-table forms below 0.22 → true.
+        assert!(existing_dep_version_below(
+            "[dependencies]\nbase64 = \"0.13\"\n",
+            "base64",
+            0,
+            22
+        ));
+        assert!(existing_dep_version_below(
+            "[dependencies]\nbase64 = { version = \"0.20\" }\n",
+            "base64",
+            0,
+            22
+        ));
+        // Leading caret/comparator is tolerated.
+        assert!(existing_dep_version_below(
+            "[dependencies]\nbase64 = \"^0.21\"\n",
+            "base64",
+            0,
+            22
+        ));
+        // At or above the floor → no warning.
+        assert!(!existing_dep_version_below(
+            "[dependencies]\nbase64 = \"0.22\"\n",
+            "base64",
+            0,
+            22
+        ));
+        assert!(!existing_dep_version_below(
+            "[dependencies]\nbase64 = \"0.22.1\"\n",
+            "base64",
+            0,
+            22
+        ));
+        assert!(!existing_dep_version_below(
+            "[dependencies]\nbase64 = \"1.0\"\n",
+            "base64",
+            0,
+            22
+        ));
+        // Absent crate → no warning.
+        assert!(!existing_dep_version_below(
+            "[dependencies]\nserde = \"1\"\n",
+            "base64",
+            0,
+            22
+        ));
+        // `[dependencies.base64]` subtable with an old `version` key → warn.
+        assert!(existing_dep_version_below(
+            "[dependencies]\n[dependencies.base64]\nversion = \"0.13\"\n",
+            "base64",
+            0,
+            22
+        ));
+        // Subtable under a populated `[dependencies]` table, old version → warn.
+        assert!(existing_dep_version_below(
+            "[dependencies]\nserde = \"1\"\n\n[dependencies.base64]\nversion = \"0.13\"\nfeatures = [\"std\"]\n",
+            "base64",
+            0,
+            22
+        ));
+        // `[dependencies.base64]` subtable at/above the floor → no warning.
+        assert!(!existing_dep_version_below(
+            "[dependencies]\n[dependencies.base64]\nversion = \"0.22\"\n",
+            "base64",
+            0,
+            22
+        ));
+        // Subtable with NO `version` key → undeterminable → warn conservatively.
+        assert!(existing_dep_version_below(
+            "[dependencies]\n[dependencies.base64]\nworkspace = true\n",
+            "base64",
+            0,
+            22
+        ));
+        // Shorthand workspace inheritance is undeterminable → warn (the crate is
+        // declared, but we can't prove it's new enough).
+        assert!(existing_dep_version_below(
+            "[dependencies]\nbase64 = { workspace = true }\n",
+            "base64",
+            0,
+            22
+        ));
+        // A commented-out old pin must not trip the check (crate is absent).
+        assert!(!existing_dep_version_below(
+            "[dependencies]\n# base64 = \"0.13\"\n",
+            "base64",
+            0,
+            22
+        ));
+    }
+
+    #[test]
+    fn warn_if_existing_dep_below_version_records_one_warning() {
+        let mut plan = Plan::new(std::path::PathBuf::from("."));
+        warn_if_existing_dep_below_version(
+            &mut plan,
+            "[dependencies]\nbase64 = \"0.13\"\n",
+            "base64",
+            0,
+            22,
+        );
+        assert_eq!(plan.warnings.len(), 1, "warnings: {:?}", plan.warnings);
+        assert!(plan.warnings[0].contains("base64"));
+
+        let mut plan = Plan::new(std::path::PathBuf::from("."));
+        warn_if_existing_dep_below_version(
+            &mut plan,
+            "[dependencies]\nbase64 = \"0.22\"\n",
+            "base64",
+            0,
+            22,
+        );
+        assert!(plan.warnings.is_empty(), "warnings: {:?}", plan.warnings);
+
+        // Subtable pin below the floor fires exactly one warning.
+        let mut plan = Plan::new(std::path::PathBuf::from("."));
+        warn_if_existing_dep_below_version(
+            &mut plan,
+            "[dependencies]\n[dependencies.base64]\nversion = \"0.13\"\n",
+            "base64",
+            0,
+            22,
+        );
+        assert_eq!(plan.warnings.len(), 1, "warnings: {:?}", plan.warnings);
+        assert!(plan.warnings[0].contains("base64"));
     }
 
     #[test]
