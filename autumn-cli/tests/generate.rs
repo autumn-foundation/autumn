@@ -6373,8 +6373,9 @@ fn generated_sharded_scaffold_cargo_checks() {
 /// the generated `{Model}SearchQuery` extractor type, and the `search_vector`
 /// migration all typecheck against this workspace's `autumn-web`.
 ///
-/// Uses a plain searchable model (no owner scoping — the generator rejects the
-/// owner-scoped + search combination).
+/// Uses a plain searchable model (no owner scoping). The owner-scoped +
+/// searchable combination is covered separately by
+/// [`generated_owner_searchable_scaffold_cargo_checks`] (issue #1841).
 ///
 /// Run with: `cargo test -p autumn-cli -- --ignored generated_searchable_scaffold_cargo_checks`
 #[test]
@@ -6405,6 +6406,133 @@ fn generated_searchable_scaffold_cargo_checks() {
     assert!(
         check.status.success(),
         "cargo check on generated searchable scaffold failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&check.stdout),
+        String::from_utf8_lossy(&check.stderr),
+    );
+}
+
+/// Issue #1841: the critical proof that lifting the owner-scoped `--searchable`
+/// rejection produces a COMPILING app whose search/index are safely owner-scoped.
+///
+/// Scaffolds `Post title:String body:Text author_id:i64 --searchable` — an owner
+/// column (`author_id`) AND full-text search, the exact combination the
+/// generator REJECTED before #1841. The repository macro now emits owner-filtered
+/// `list_scoped` / `search_page_scoped`, and the generated owner-scoped index +
+/// `/search` handlers call ONLY those scoped methods. `cargo check --tests`
+/// proves the whole owner-scoped FTS codegen (the macro's three-phase
+/// owner-filtered `search_page_scoped`, `list_scoped`, and the scoped handlers)
+/// type-checks against this workspace's `autumn-web`.
+///
+/// The security invariant — the owner branch never calls the unscoped
+/// `repo.search_page`/`repo.page` — is asserted directly on the generated source
+/// here and in the `scaffold.rs` unit tests; this test proves it also COMPILES.
+///
+/// Run with:
+/// `cargo test -p autumn-cli --test generate generated_owner_searchable_scaffold_cargo_checks -- --ignored --exact`
+#[test]
+#[ignore = "slow: cargo-checks a fresh owner-scoped searchable project — run with `cargo test -p autumn-cli -- --ignored`"]
+fn generated_owner_searchable_scaffold_cargo_checks() {
+    let (_tmp, project) = fresh_project("owner-searchable-build");
+
+    patch_generated_cargo_toml(&project);
+
+    run_autumn(
+        &project,
+        &[
+            "generate",
+            "scaffold",
+            "Post",
+            "title:String",
+            "body:Text",
+            "author_id:i64",
+            "--searchable",
+            "title,body",
+        ],
+    );
+
+    // The repository carries `owner = author_id` (→ the macro's scoped codegen).
+    let repo = fs::read_to_string(project.join("src/repositories/post.rs")).unwrap();
+    assert!(
+        repo.contains(", owner = author_id)"),
+        "owner-scoped searchable repository must carry `owner = author_id`:\n{repo}"
+    );
+
+    // The owner-scoped /search + index call ONLY the scoped methods — never the
+    // unscoped `repo.search_page(`/`repo.page(` (the cross-user leak guard).
+    let routes = fs::read_to_string(project.join("src/routes/posts.rs")).unwrap();
+    assert!(
+        routes.contains("repo.search_page_scoped(owner_id, q, &page_req)")
+            && routes.contains("repo.list_scoped(owner_id, &list_query, &page_req)"),
+        "owner-scoped search/index must call the scoped repository methods:\n{routes}"
+    );
+    assert!(
+        !routes.contains("repo.search_page(") && !routes.contains("repo.page("),
+        "SECURITY: owner-scoped searchable routes must NEVER call the unscoped \
+         repo.search_page(/repo.page( (cross-user leak):\n{routes}"
+    );
+
+    let check = Command::new("cargo")
+        .args(["check", "--tests"])
+        .current_dir(&project)
+        .output()
+        .unwrap();
+    assert!(
+        check.status.success(),
+        "cargo check on generated owner-scoped searchable scaffold failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&check.stdout),
+        String::from_utf8_lossy(&check.stderr),
+    );
+}
+
+/// Issue #1841 companion proving the *nullable* owner-column + searchable path
+/// compiles: a `user:references?` owner is `Option<i64>`, so the macro's scoped
+/// `.eq(owner_id)` filter (typed hydration) and the raw-SQL owner bind must
+/// compile against a `Nullable<BigInt>` column. A nullable owner never matches
+/// NULL (unowned) rows — semantically correct (unowned rows stay hidden).
+///
+/// Run with:
+/// `cargo test -p autumn-cli --test generate generated_nullable_owner_searchable_scaffold_cargo_checks -- --ignored --exact`
+#[test]
+#[ignore = "slow: cargo-checks a fresh nullable-owner searchable project — run with `cargo test -p autumn-cli -- --ignored`"]
+fn generated_nullable_owner_searchable_scaffold_cargo_checks() {
+    let (_tmp, project) = fresh_project("nullable-owner-searchable-build");
+
+    patch_generated_cargo_toml(&project);
+
+    run_autumn(
+        &project,
+        &[
+            "generate",
+            "scaffold",
+            "Note",
+            "title:String",
+            "body:Text",
+            "user:references?",
+            "--searchable",
+            "title,body",
+        ],
+    );
+
+    let repo = fs::read_to_string(project.join("src/repositories/note.rs")).unwrap();
+    assert!(
+        repo.contains(", owner = user_id)"),
+        "nullable-owner searchable repository must carry `owner = user_id`:\n{repo}"
+    );
+    let routes = fs::read_to_string(project.join("src/routes/notes.rs")).unwrap();
+    assert!(
+        !routes.contains("repo.search_page(") && !routes.contains("repo.page("),
+        "SECURITY: nullable-owner searchable routes must NEVER call the unscoped \
+         repo.search_page(/repo.page(:\n{routes}"
+    );
+
+    let check = Command::new("cargo")
+        .args(["check", "--tests"])
+        .current_dir(&project)
+        .output()
+        .unwrap();
+    assert!(
+        check.status.success(),
+        "cargo check on generated nullable-owner searchable scaffold failed:\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&check.stdout),
         String::from_utf8_lossy(&check.stderr),
     );

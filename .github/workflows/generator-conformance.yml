@@ -179,6 +179,8 @@ jobs:
   #   live-owner       -> generated_live_owner_scaffold_cargo_checks
   #   sharded-owner    -> generated_sharded_owner_scaffold_cargo_checks
   #   attachment-owner -> generated_attachment_owner_scaffold_cargo_checks
+  #   owner-searchable          -> generated_owner_searchable_scaffold_cargo_checks
+  #   nullable-owner-searchable -> generated_nullable_owner_searchable_scaffold_cargo_checks
   app-variant-conformance:
     name: App-variant conformance (${{ matrix.variant.name }}, ${{ matrix.toolchain }})
     runs-on: ubuntu-latest
@@ -203,6 +205,13 @@ jobs:
             test: generated_sharded_owner_scaffold_cargo_checks
           - name: attachment-owner
             test: generated_attachment_owner_scaffold_cargo_checks
+          # Issue #1841: owner-scoped `--searchable` (previously REJECTED) now
+          # emits owner-filtered `list_scoped`/`search_page_scoped` and a scoped
+          # index/search. Proves the lifted rejection produces a compiling app.
+          - name: owner-searchable
+            test: generated_owner_searchable_scaffold_cargo_checks
+          - name: nullable-owner-searchable
+            test: generated_nullable_owner_searchable_scaffold_cargo_checks
     steps:
       - uses: actions/checkout@v7
 
