@@ -3350,7 +3350,12 @@ impl AutumnConfig {
         let tls_cert = env.var("AUTUMN_SERVER__TLS__CERT_PATH").ok();
         let tls_key = env.var("AUTUMN_SERVER__TLS__KEY_PATH").ok();
         let tls_reload = env.var("AUTUMN_SERVER__TLS__RELOAD_INTERVAL_SECS").ok();
-        if tls_cert.is_some() || tls_key.is_some() || tls_reload.is_some() {
+        let tls_handshake = env.var("AUTUMN_SERVER__TLS__HANDSHAKE_TIMEOUT_SECS").ok();
+        if tls_cert.is_some()
+            || tls_key.is_some()
+            || tls_reload.is_some()
+            || tls_handshake.is_some()
+        {
             let tls = self.server.tls.get_or_insert_with(TlsConfig::empty_for_env);
             if let Some(cert) = tls_cert {
                 tls.cert_path = PathBuf::from(cert);
@@ -3360,6 +3365,9 @@ impl AutumnConfig {
             }
             if let Some(reload) = tls_reload.and_then(|v| v.trim().parse::<u64>().ok()) {
                 tls.reload_interval_secs = reload;
+            }
+            if let Some(handshake) = tls_handshake.and_then(|v| v.trim().parse::<u64>().ok()) {
+                tls.handshake_timeout_secs = handshake;
             }
         }
     }
@@ -4541,9 +4549,10 @@ pub struct ServerConfig {
     /// gated behind the off-by-default `tls` feature.
     ///
     /// Configured via `[server.tls]` (`cert_path`, `key_path`,
-    /// `reload_interval_secs`) or the matching
+    /// `reload_interval_secs`, `handshake_timeout_secs`) or the matching
     /// `AUTUMN_SERVER__TLS__CERT_PATH` / `AUTUMN_SERVER__TLS__KEY_PATH` /
-    /// `AUTUMN_SERVER__TLS__RELOAD_INTERVAL_SECS` env vars.
+    /// `AUTUMN_SERVER__TLS__RELOAD_INTERVAL_SECS` /
+    /// `AUTUMN_SERVER__TLS__HANDSHAKE_TIMEOUT_SECS` env vars.
     #[serde(default)]
     pub tls: Option<TlsConfig>,
 }
@@ -4563,6 +4572,8 @@ pub struct ServerConfig {
 /// key_path = "/etc/autumn/tls/privkey.pem"
 /// # optional; how often (seconds) to poll for a renewed cert. Default: 60.
 /// reload_interval_secs = 60
+/// # optional; per-handshake timeout (seconds). Default: 10.
+/// handshake_timeout_secs = 10
 /// ```
 #[derive(Debug, Clone, Deserialize)]
 pub struct TlsConfig {
@@ -4577,6 +4588,14 @@ pub struct TlsConfig {
     /// `certbot`/ACME writes new files) without a restart. Default: `60`.
     #[serde(default = "default_tls_reload_interval_secs")]
     pub reload_interval_secs: u64,
+
+    /// Maximum time, in seconds, allowed for a single inbound TLS handshake
+    /// before the connection is dropped. Bounds a client that opens TCP but
+    /// never completes (or starts) the handshake so it cannot park the accept
+    /// loop and deny service to everyone else. Default: `10`. A value of `0` is
+    /// clamped to `1` second.
+    #[serde(default = "default_tls_handshake_timeout_secs")]
+    pub handshake_timeout_secs: u64,
 }
 
 impl TlsConfig {
@@ -4589,6 +4608,7 @@ impl TlsConfig {
             cert_path: PathBuf::new(),
             key_path: PathBuf::new(),
             reload_interval_secs: default_tls_reload_interval_secs(),
+            handshake_timeout_secs: default_tls_handshake_timeout_secs(),
         }
     }
 }
@@ -5913,6 +5933,15 @@ fn default_telemetry_environment() -> String {
 /// compile even when the `tls` feature — and thus `crate::tls` — is off.
 const fn default_tls_reload_interval_secs() -> u64 {
     60
+}
+
+/// Default `[server.tls]` inbound-handshake timeout, in seconds.
+///
+/// Bounds a single TLS handshake so a client that opens TCP but never sends a
+/// `ClientHello` cannot park the accept loop. 10s is generous for a real
+/// handshake while still shedding a stalled connection promptly.
+const fn default_tls_handshake_timeout_secs() -> u64 {
+    10
 }
 
 fn default_health_path() -> String {
@@ -9135,8 +9164,23 @@ path = "/healthz"
             tls.key_path,
             std::path::PathBuf::from("/etc/autumn/tls/privkey.pem")
         );
-        // Reload interval defaults when omitted.
+        // Reload interval and handshake timeout default when omitted.
         assert_eq!(tls.reload_interval_secs, 60);
+        assert_eq!(tls.handshake_timeout_secs, 10);
+    }
+
+    #[test]
+    fn server_tls_handshake_timeout_parses_from_toml() {
+        let config: AutumnConfig = toml::from_str(
+            r#"
+            [server.tls]
+            cert_path = "cert.pem"
+            key_path = "key.pem"
+            handshake_timeout_secs = 25
+            "#,
+        )
+        .expect("config with [server.tls] handshake_timeout_secs should parse");
+        assert_eq!(config.server.tls.unwrap().handshake_timeout_secs, 25);
     }
 
     #[test]
@@ -9160,7 +9204,8 @@ path = "/healthz"
         let env = MockEnv::new()
             .with("AUTUMN_SERVER__TLS__CERT_PATH", "/env/cert.pem")
             .with("AUTUMN_SERVER__TLS__KEY_PATH", "/env/key.pem")
-            .with("AUTUMN_SERVER__TLS__RELOAD_INTERVAL_SECS", "90");
+            .with("AUTUMN_SERVER__TLS__RELOAD_INTERVAL_SECS", "90")
+            .with("AUTUMN_SERVER__TLS__HANDSHAKE_TIMEOUT_SECS", "5");
         let mut config = AutumnConfig::default();
         assert!(config.server.tls.is_none());
         config.apply_env_overrides_with_env(&env);
@@ -9168,6 +9213,7 @@ path = "/healthz"
         assert_eq!(tls.cert_path, std::path::PathBuf::from("/env/cert.pem"));
         assert_eq!(tls.key_path, std::path::PathBuf::from("/env/key.pem"));
         assert_eq!(tls.reload_interval_secs, 90);
+        assert_eq!(tls.handshake_timeout_secs, 5);
     }
 
     #[test]

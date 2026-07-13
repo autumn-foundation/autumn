@@ -105,8 +105,15 @@ struct TestServer {
 }
 
 /// Boot the real `TlsListener` on an ephemeral port, serving a minimal router
-/// with the same connect-info + graceful-shutdown wiring as `app.rs`.
+/// with the same connect-info + graceful-shutdown wiring as `app.rs`. Uses a
+/// generous handshake timeout that never fires in the well-behaved-client tests.
 async fn serve_tls() -> TestServer {
+    serve_tls_with_handshake_timeout(Duration::from_secs(10)).await
+}
+
+/// Like [`serve_tls`] but with a caller-chosen per-handshake timeout, so a test
+/// can prove a stalled handshake is shed rather than parking the accept loop.
+async fn serve_tls_with_handshake_timeout(handshake_timeout: Duration) -> TestServer {
     let (dir, cert, key) = write_fixtures();
     let provider = crypto_provider();
     let certified = load_certified_key(&cert, &key, &provider, now_unix()).expect("load cert/key");
@@ -118,7 +125,7 @@ async fn serve_tls() -> TestServer {
         .await
         .expect("bind ephemeral port");
     let addr = tcp.local_addr().expect("local_addr");
-    let listener = TlsListener::new(tcp, server_config);
+    let listener = TlsListener::new(tcp, server_config, handshake_timeout);
 
     let router = Router::new()
         .route("/health", get(|| async { "ok" }))
@@ -289,6 +296,43 @@ async fn bad_handshake_does_not_kill_the_listener() {
         resp.starts_with("HTTP/1.1 200"),
         "listener should survive a failed handshake, got: {resp:?}"
     );
+
+    server.shutdown.cancel();
+    let _ = server.handle.await;
+}
+
+#[tokio::test]
+async fn hung_handshake_does_not_wedge_the_listener() {
+    // A short handshake timeout so the stalled connection is shed quickly.
+    let server = serve_tls_with_handshake_timeout(Duration::from_secs(1)).await;
+    let addr = server.addr;
+
+    // Open a raw TCP connection and send NOTHING — no ClientHello, ever. Before
+    // the handshake-timeout fix this parks `acceptor.accept(...)` inside the
+    // accept loop forever, denying every other client (single-connection DoS).
+    // Hold the socket open for the duration of the good request below.
+    let hung = std::net::TcpStream::connect(addr).expect("open raw TCP connection");
+
+    // Immediately, while the hung socket is still connected and silent, a
+    // well-behaved client must still get served. Give it a generous but bounded
+    // timeout: before the fix this hangs; after, it returns 200 promptly.
+    let good = tokio::time::timeout(
+        Duration::from_secs(10),
+        tokio::task::spawn_blocking(move || https_get(addr, "/health")),
+    )
+    .await
+    .expect("good request must not hang behind the stalled handshake")
+    .unwrap()
+    .expect("HTTPS GET /health while a handshake is stalled");
+
+    assert!(
+        good.starts_with("HTTP/1.1 200"),
+        "listener must keep serving while a handshake is stalled, got: {good:?}"
+    );
+
+    // Keep the hung socket alive until after the good request completed, so the
+    // test truly overlapped a stalled handshake with a real one.
+    drop(hung);
 
     server.shutdown.cancel();
     let _ = server.handle.await;

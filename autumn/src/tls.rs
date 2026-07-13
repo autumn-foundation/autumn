@@ -39,10 +39,6 @@ use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 /// two-`stat`-per-minute cost.
 pub const DEFAULT_RELOAD_INTERVAL_SECS: u64 = 60;
 
-/// Number of days before `notAfter` at which `autumn doctor` starts warning
-/// about an approaching certificate expiry.
-pub const NEAR_EXPIRY_WARN_DAYS: i64 = 30;
-
 /// Something went wrong loading, validating, or inspecting the configured TLS
 /// material. Every variant names the offending path so the operator can act on
 /// it without guesswork.
@@ -317,20 +313,31 @@ pub fn build_server_config(
 ///
 /// A failed handshake (a plaintext or malformed client, an unsupported cipher,
 /// a dropped connection) is logged at debug and skipped — it must never take
-/// down the accept loop. Note the tradeoff: the handshake runs inline with
-/// `accept`, so one slow handshake briefly head-of-line-blocks new accepts.
+/// down the accept loop. Because the handshake runs inline with `accept`, a
+/// client that opens TCP but never completes (or even starts) the handshake
+/// would otherwise head-of-line-block every new accept indefinitely; each
+/// handshake is therefore bounded by `handshake_timeout`, after which the
+/// connection is dropped and the accept loop continues.
 pub struct TlsListener {
     tcp: tokio::net::TcpListener,
     acceptor: tokio_rustls::TlsAcceptor,
+    handshake_timeout: std::time::Duration,
 }
 
 impl TlsListener {
-    /// Wrap `tcp` so accepted connections are TLS-terminated with `config`.
+    /// Wrap `tcp` so accepted connections are TLS-terminated with `config`,
+    /// bounding each handshake by `handshake_timeout` (a stalled or silent
+    /// client is dropped rather than parking the accept loop).
     #[must_use]
-    pub fn new(tcp: tokio::net::TcpListener, config: Arc<rustls::ServerConfig>) -> Self {
+    pub fn new(
+        tcp: tokio::net::TcpListener,
+        config: Arc<rustls::ServerConfig>,
+        handshake_timeout: std::time::Duration,
+    ) -> Self {
         Self {
             tcp,
             acceptor: tokio_rustls::TlsAcceptor::from(config),
+            handshake_timeout,
         }
     }
 }
@@ -369,14 +376,21 @@ impl axum::serve::Listener for TlsListener {
                     continue;
                 }
             };
-            match self.acceptor.accept(stream).await {
-                Ok(tls) => return (tls, peer),
-                Err(e) => {
+            // Bound the handshake: a client that connects but never sends a
+            // ClientHello (or stalls mid-handshake) must not park the accept
+            // loop and deny every other client. On timeout or handshake error,
+            // drop the connection and keep accepting.
+            match tokio::time::timeout(self.handshake_timeout, self.acceptor.accept(stream)).await {
+                Ok(Ok(tls)) => return (tls, peer),
+                Ok(Err(e)) => {
                     tracing::debug!(
                         peer = %peer,
                         error = %e,
                         "TLS handshake failed; dropping connection"
                     );
+                }
+                Err(_elapsed) => {
+                    tracing::debug!(peer = %peer, "TLS handshake timed out");
                 }
             }
         }

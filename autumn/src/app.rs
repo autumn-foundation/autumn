@@ -5574,7 +5574,10 @@ fn build_tls_listener(
         std::sync::Arc::clone(&provider),
         std::sync::Arc::clone(&resolver),
     )?;
-    let listener = crate::tls::TlsListener::new(tcp, server_config);
+    // A zero handshake timeout would drop every connection instantly; clamp to
+    // at least one second, mirroring the reload-interval clamp below.
+    let handshake_timeout = std::time::Duration::from_secs(cfg.handshake_timeout_secs.max(1));
+    let listener = crate::tls::TlsListener::new(tcp, server_config, handshake_timeout);
     let reload = TlsReloadState {
         resolver,
         provider,
@@ -5602,24 +5605,53 @@ fn tls_file_mtimes(
 /// previously loaded certificate and retries on the next tick.
 #[cfg(feature = "tls")]
 async fn run_tls_cert_reload(state: TlsReloadState, shutdown: tokio_util::sync::CancellationToken) {
-    let mut last = tls_file_mtimes(&state.cert_path, &state.key_path);
+    // Stat and PEM-read the cert/key on a blocking thread — both touch the
+    // filesystem and must not run on a tokio worker. On a `JoinError` (the
+    // blocking pool shutting down) just skip the tick and retry next time.
+    let stat_mtimes = |cert: std::path::PathBuf, key: std::path::PathBuf| {
+        tokio::task::spawn_blocking(move || tls_file_mtimes(&cert, &key))
+    };
+
+    let mut last = match stat_mtimes(state.cert_path.clone(), state.key_path.clone()).await {
+        Ok(mtimes) => mtimes,
+        Err(e) => {
+            tracing::warn!(error = %e, "TLS reload: initial mtime read failed; assuming unknown");
+            (None, None)
+        }
+    };
     loop {
         tokio::select! {
             () = tokio::time::sleep(state.interval) => {}
             () = shutdown.cancelled() => break,
         }
 
-        let current = tls_file_mtimes(&state.cert_path, &state.key_path);
+        let current = match stat_mtimes(state.cert_path.clone(), state.key_path.clone()).await {
+            Ok(mtimes) => mtimes,
+            Err(e) => {
+                tracing::warn!(error = %e, "TLS reload: mtime read task failed; skipping tick");
+                continue;
+            }
+        };
         if current == last {
             continue;
         }
 
-        match crate::tls::load_certified_key(
-            &state.cert_path,
-            &state.key_path,
-            &state.provider,
-            now_unix(),
-        ) {
+        let cert_path = state.cert_path.clone();
+        let key_path = state.key_path.clone();
+        let provider = std::sync::Arc::clone(&state.provider);
+        let loaded = tokio::task::spawn_blocking(move || {
+            crate::tls::load_certified_key(&cert_path, &key_path, &provider, now_unix())
+        })
+        .await;
+        let loaded = match loaded {
+            Ok(result) => result,
+            Err(e) => {
+                tracing::warn!(error = %e, "TLS reload: load task failed; skipping tick");
+                continue;
+            }
+        };
+
+        match loaded {
             Ok(next) => {
                 state.resolver.store(next);
                 // Only advance the baseline on a successful load, so a partial
