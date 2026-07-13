@@ -3683,13 +3683,28 @@ fn run_generate_command(cmd: GenerateCommands, mode: ApplyMode) {
                 }
             };
             let timestamp = generate::timestamp_now();
-            let plan = generate::scaffold::plan_scaffold_with_options(
-                &resolve_cwd(),
-                &name,
-                &fields,
-                &timestamp,
-                &options,
-            );
+            // `destroy scaffold` recomputes this same plan before reverting it.
+            // The shared-layout preflight in the plan builder is a generate-time
+            // guard only: running it on the destroy path would hard-fail cleanup
+            // in a project whose shared `pub fn layout` is missing or renamed,
+            // stranding the generated files (issue #1834). Use the revert-only
+            // plan builder for `ApplyMode::Destroy`, which skips it.
+            let plan = match mode {
+                ApplyMode::Generate => generate::scaffold::plan_scaffold_with_options(
+                    &resolve_cwd(),
+                    &name,
+                    &fields,
+                    &timestamp,
+                    &options,
+                ),
+                ApplyMode::Destroy => generate::scaffold::plan_scaffold_with_options_for_revert(
+                    &resolve_cwd(),
+                    &name,
+                    &fields,
+                    &timestamp,
+                    &options,
+                ),
+            };
             apply_plan(plan, generate::Flags { dry_run, force }, mode);
         }
         GenerateCommands::Plugin {
