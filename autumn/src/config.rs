@@ -968,6 +968,36 @@ pub struct AutumnConfig {
     #[serde(default)]
     pub server: ServerConfig,
 
+    /// Push-button VPS deploy settings (`[deploy]` section, issue #1607).
+    ///
+    /// Operator-facing configuration for `autumn deploy` — the SSH-reachable
+    /// target host plus the remote install layout and rollout tuning knobs.
+    /// Top-level (not nested under `[server]`) because it describes *where and
+    /// how* the app is deployed, not how the running server behaves.
+    ///
+    /// Absent by default (`None`), so an app that never runs `autumn deploy`
+    /// is unaffected. A bare `[deploy]` table is valid at rest — `host` is only
+    /// required when a deploy actually runs, enforced by
+    /// [`DeployConfig::validate`].
+    ///
+    /// # Field ordering (load-bearing — do not move below `database`)
+    ///
+    /// `deploy` is declared here, before [`database`](Self::database), so that
+    /// [`get_schema_keys`](Self::get_schema_keys)'s `SchemaDeserializer`
+    /// traversal recurses into [`DeployConfig`]'s child keys and the strict
+    /// unknown-key validator (`validate_toml` / `server.strict_config` /
+    /// `autumn check --config`) rejects a typo like `[deploy] app_dr = "…"`.
+    /// `DatabaseConfig` has a `deserialize_with` duration field
+    /// (`statement_timeout`, via the untagged [`deserialize_duration`] parser)
+    /// whose parser rejects the `SchemaDeserializer`'s placeholder value and
+    /// returns an error, which aborts the remainder of `AutumnConfig`'s field
+    /// traversal — so any section declared *after* `database` is recorded only
+    /// as an opaque root leaf, never descended into. Keeping `deploy` ahead of
+    /// `database` sidesteps that abort. The regression guard
+    /// `deploy_child_keys_are_strictly_validated` fails if this ordering breaks.
+    #[serde(default)]
+    pub deploy: Option<DeployConfig>,
+
     /// Database connection settings (URL, pool size, timeouts).
     #[serde(default)]
     pub database: DatabaseConfig,
@@ -1196,20 +1226,6 @@ pub struct AutumnConfig {
     /// reads/writes still work through `Deref`/`DerefMut`.
     #[serde(default)]
     pub alerts: Box<crate::alerts::AlertConfig>,
-
-    /// Push-button VPS deploy settings (`[deploy]` section, issue #1607).
-    ///
-    /// Operator-facing configuration for `autumn deploy` — the SSH-reachable
-    /// target host plus the remote install layout and rollout tuning knobs.
-    /// Top-level (not nested under `[server]`) because it describes *where and
-    /// how* the app is deployed, not how the running server behaves.
-    ///
-    /// Absent by default (`None`), so an app that never runs `autumn deploy`
-    /// is unaffected. A bare `[deploy]` table is valid at rest — `host` is only
-    /// required when a deploy actually runs, enforced by
-    /// [`DeployConfig::validate`].
-    #[serde(default)]
-    pub deploy: Option<DeployConfig>,
 }
 
 /// Push-button VPS deploy settings (`[deploy]` section, issue #1607).

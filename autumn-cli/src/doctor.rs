@@ -5558,6 +5558,40 @@ fn deploy_preflight_result(
     }
 }
 
+/// Resolve the `[deploy]` doctor branch from the merged active-profile runtime
+/// table.
+///
+/// Returns `(Some(cfg), None)` when `[deploy]` is present and parses (run the
+/// preflight graders), `(None, None)` when `[deploy]` is absent (skip the
+/// preflight gracefully), and `(None, Some(fail))` when `[deploy]` is present
+/// but a field has the wrong type. That last case is the important one: dropping
+/// the parse error with `.ok()` would silently skip every deploy check while
+/// `autumn deploy` (which loads the same `[deploy]` via `AutumnConfig::load()`)
+/// fails on it — so `doctor --strict` would greenlight a config the deploy path
+/// cannot parse. The `[deploy]` schema carries no secrets, so echoing the serde
+/// error into the check detail is safe.
+fn resolve_deploy_doctor_config(
+    merged: &toml::Table,
+) -> (Option<DeployConfig>, Option<CheckResult>) {
+    merged.get("deploy").cloned().map_or((None, None), |value| {
+        match value.try_into::<DeployConfig>() {
+            Ok(cfg) => (Some(cfg), None),
+            Err(err) => (
+                None,
+                Some(CheckResult {
+                    name: "deploy_config",
+                    status: CheckStatus::Fail,
+                    detail: Some(format!("[deploy] is present but invalid: {err}")),
+                    hint: Some(
+                        "Fix the [deploy] section in autumn.toml so its fields match the \
+                         expected types (see `autumn deploy check`)",
+                    ),
+                }),
+            ),
+        }
+    })
+}
+
 // ─── Main entry point ─────────────────────────────────────────────────────────
 
 /// Run all doctor checks and report results.
@@ -5739,11 +5773,18 @@ pub fn run(opts: DoctorOptions) {
     // effective target) — grading a deploy config the runtime never loads.
     let (deploy_canonical, deploy_selected, _) = resolve_active_profiles();
     let merged_deploy_toml = get_merged_toml_table_runtime(&deploy_canonical, &deploy_selected);
-    if let Some(deploy_cfg) = merged_deploy_toml
-        .get("deploy")
-        .cloned()
-        .and_then(|v| v.try_into::<DeployConfig>().ok())
-    {
+    // Distinguish "[deploy] absent" (skip the preflight gracefully) from
+    // "[deploy] present but malformed". Swallowing the parse error with `.ok()`
+    // would silently drop EVERY deploy check when a field has the wrong type
+    // (e.g. `ssh_port = "22"`, `keep_releases = -1`) — yet `autumn deploy` loads
+    // `AutumnConfig` and fails on the same table, so `doctor --strict` would
+    // greenlight a config the deploy path cannot parse. Surface a failing
+    // `deploy_config` check instead.
+    let (deploy_cfg, deploy_config_check) = resolve_deploy_doctor_config(&merged_deploy_toml);
+    if let Some(check) = deploy_config_check {
+        tasks.push(Box::new(move || check));
+    }
+    if let Some(deploy_cfg) = deploy_cfg {
         let deploy_signing = resolve_optional_signing_secret();
         // Derive the deploy DB-URL preflight input from the SAME merged
         // active-profile table used for `deploy_cfg` (base autumn.toml +
@@ -13717,6 +13758,65 @@ redirect_uri = "http://localhost/callback"
         assert!(
             json.contains("security.rate_limit.trusted_proxies"),
             "JSON must contain the deprecated key path"
+        );
+    }
+
+    #[test]
+    fn deploy_doctor_config_absent_is_skipped() {
+        // No [deploy] table → no config parsed, no failing check (graceful skip).
+        let table: toml::Table = "".parse().unwrap();
+        let (cfg, check) = resolve_deploy_doctor_config(&table);
+        assert!(cfg.is_none(), "absent [deploy] must not yield a config");
+        assert!(
+            check.is_none(),
+            "absent [deploy] must not emit a failing check"
+        );
+    }
+
+    #[test]
+    fn deploy_doctor_config_valid_parses() {
+        let table: toml::Table = "[deploy]\nhost = \"203.0.113.10\"\nssh_port = 2222\n"
+            .parse()
+            .unwrap();
+        let (cfg, check) = resolve_deploy_doctor_config(&table);
+        assert!(check.is_none(), "valid [deploy] must not emit a fail check");
+        let cfg = cfg.expect("valid [deploy] must parse into a config");
+        assert_eq!(cfg.host.as_deref(), Some("203.0.113.10"));
+        assert_eq!(cfg.ssh_port, 2222);
+    }
+
+    #[test]
+    fn deploy_doctor_config_bad_type_fails_not_skipped() {
+        // `ssh_port` as a string is a present-but-invalid table: the old `.ok()`
+        // path silently skipped ALL deploy checks; now it must FAIL loudly.
+        let table: toml::Table = "[deploy]\nhost = \"h\"\nssh_port = \"22\"\n"
+            .parse()
+            .unwrap();
+        let (cfg, check) = resolve_deploy_doctor_config(&table);
+        assert!(
+            cfg.is_none(),
+            "an invalid [deploy] must not yield a config to preflight"
+        );
+        let check = check.expect("an invalid [deploy] must emit a failing check");
+        assert_eq!(check.name, "deploy_config");
+        assert_eq!(check.status, CheckStatus::Fail);
+        assert!(
+            check.detail.unwrap().contains("present but invalid"),
+            "detail must explain the [deploy] table is present but invalid"
+        );
+    }
+
+    #[test]
+    fn deploy_doctor_config_negative_keep_releases_fails() {
+        // `keep_releases = -1` cannot deserialize into u32 → fail, not skip.
+        let table: toml::Table = "[deploy]\nhost = \"h\"\nkeep_releases = -1\n"
+            .parse()
+            .unwrap();
+        let (cfg, check) = resolve_deploy_doctor_config(&table);
+        assert!(cfg.is_none());
+        assert_eq!(
+            check.expect("negative keep_releases must fail").status,
+            CheckStatus::Fail
         );
     }
 }
