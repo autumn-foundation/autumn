@@ -45,6 +45,10 @@ tokio-util = "0.7"
 # keypair/CSR, and the self-signed placeholder certificate.
 instant-acme = { version = "0.8.5", default-features = false, features = ["ring", "hyper-rustls"] }
 rcgen = { version = "0.14", default-features = false, features = ["pem", "ring"] }
+# `socket2` (already in the graph transitively via tokio/hyper) is used directly
+# to build a dual-stack IPv4+IPv6 `[::]` HTTP-01 challenge listener with
+# `IPV6_V6ONLY = false`, so Let's Encrypt can validate an AAAA-only deployment.
+socket2 = { version = "0.6", features = ["all"] }
 diesel = { version = "2", features = ["sqlite", "postgres"] }
 pq-sys = { version = "0.7", features = ["bundled_without_openssl"] }
 # `async-connection-wrapper` provides the sync diesel API (incl. running

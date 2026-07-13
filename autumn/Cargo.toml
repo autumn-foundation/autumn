@@ -144,7 +144,7 @@ tls = ["dep:tokio-rustls", "dep:x509-parser", "dep:rustls", "dep:rustls-pki-type
 # ACME order state machine) and `rcgen` (account/cert key + CSR + self-signed
 # placeholder), both pinned to `ring` so no second crypto backend enters the
 # graph.
-acme = ["tls", "dep:instant-acme", "dep:rcgen"]
+acme = ["tls", "dep:instant-acme", "dep:rcgen", "dep:socket2"]
 
 [dependencies]
 autumn-macros = { version = "0.6.0", path = "../autumn-macros" }
@@ -188,6 +188,9 @@ x509-parser = { version = "0.16", optional = true }
 # TLS/crypto backend (no aws-lc-rs), which the crates' defaults would pull in.
 instant-acme = { workspace = true, optional = true }
 rcgen = { workspace = true, optional = true }
+# Build the dual-stack (`[::]`, IPV6_V6ONLY=false) HTTP-01 challenge listener so
+# the ACME CA can validate over IPv6 on AAAA-only deployments (issue #1608).
+socket2 = { workspace = true, optional = true }
 postgresql_embedded = { version = "0.19", optional = true, default-features = false, features = [
     "tokio",
     "theseus",

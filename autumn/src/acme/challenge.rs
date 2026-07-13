@@ -91,6 +91,75 @@ pub fn challenge_router(tokens: Http01Tokens, https_port: u16) -> Router {
         .with_state(ChallengeState { tokens, https_port })
 }
 
+/// Bind the HTTP-01 challenge listener(s) so they accept BOTH IPv4 and IPv6.
+///
+/// Let's Encrypt validates HTTP-01 against whichever address family the domain's
+/// A/AAAA records point at. An IPv4-only `0.0.0.0` bind leaves an AAAA-only
+/// (IPv6-first) deployment unreachable on `:80`, so the CA gets connection
+/// refused even while HTTPS is up.
+///
+/// Preferred: a single dual-stack `[::]:{port}` socket with `IPV6_V6ONLY = false`
+/// (so IPv4 arrives as v4-mapped addresses) and `SO_REUSEADDR`. If the platform
+/// refuses a dual-stack socket, fall back to binding `0.0.0.0:{port}` (the
+/// mandatory IPv4 baseline) plus a best-effort v6-only `[::]:{port}` listener
+/// when an IPv6 stack is present; the caller serves each. Returns at least one
+/// listener on success.
+///
+/// # Errors
+///
+/// Returns the underlying [`std::io::Error`] only when the IPv4 baseline cannot
+/// be bound (e.g. the port is privileged and the process lacks permission, or
+/// the port is already in use), so the caller can fail fast — `:80` needs
+/// privilege (`CAP_NET_BIND_SERVICE`) and ACME cannot validate without it. A
+/// missing IPv6 stack is not fatal: an IPv4-only host still serves over IPv4.
+pub async fn bind_challenge_listeners(port: u16) -> std::io::Result<Vec<tokio::net::TcpListener>> {
+    // Preferred: one dual-stack `[::]` socket that also accepts IPv4 (v4-mapped).
+    if let Ok(listener) = bind_ipv6(port, false) {
+        return Ok(vec![listener]);
+    }
+
+    // Fallback: the platform refused a dual-stack socket. Bind IPv4 `0.0.0.0` as
+    // the mandatory baseline (its failure is fatal), then ADD a v6-only `[::]`
+    // listener when IPv6 is available — a missing IPv6 stack must not take down
+    // an otherwise-serviceable IPv4-only deployment.
+    tracing::warn!(
+        port,
+        "Dual-stack [::] bind for the ACME HTTP-01 challenge listener is unavailable; binding \
+         IPv4 0.0.0.0 with a best-effort IPv6 [::] listener"
+    );
+    let v4 = tokio::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, port)).await?;
+    let mut listeners = vec![v4];
+    // v6-only so `[::]` does not also claim IPv4 and collide with the `0.0.0.0`
+    // bind above (SO_REUSEADDR lets the two families share the port regardless).
+    match bind_ipv6(port, true) {
+        Ok(v6) => listeners.push(v6),
+        Err(e) => tracing::warn!(
+            error = %e,
+            port,
+            "IPv6 [::] bind for the ACME HTTP-01 challenge listener failed; serving IPv4 only"
+        ),
+    }
+    Ok(listeners)
+}
+
+/// Bind an IPv6 (`[::]:{port}`) TCP listener with `SO_REUSEADDR`, controlling the
+/// `IPV6_V6ONLY` flag: `only_v6 = false` yields a dual-stack socket that also
+/// accepts IPv4 (v4-mapped); `only_v6 = true` restricts it to IPv6.
+fn bind_ipv6(port: u16, only_v6: bool) -> std::io::Result<tokio::net::TcpListener> {
+    use socket2::{Domain, Protocol, Socket, Type};
+
+    let socket = Socket::new(Domain::IPV6, Type::STREAM, Some(Protocol::TCP))?;
+    socket.set_only_v6(only_v6)?;
+    socket.set_reuse_address(true)?;
+    let addr: std::net::SocketAddr = (std::net::Ipv6Addr::UNSPECIFIED, port).into();
+    socket.bind(&addr.into())?;
+    // A generous backlog: the challenge listener answers short-lived HTTP-01
+    // validation requests and HTTP→HTTPS redirects.
+    socket.listen(1024)?;
+    socket.set_nonblocking(true)?;
+    tokio::net::TcpListener::from_std(socket.into())
+}
+
 /// Answer an HTTP-01 challenge: return the published key authorization, or 404.
 async fn serve_challenge(
     State(state): State<ChallengeState>,
@@ -285,5 +354,69 @@ mod tests {
         assert_eq!(host_only("example.com:80"), "example.com");
         assert_eq!(host_only("[::1]:80"), "[::1]");
         assert_eq!(host_only("[::1]"), "[::1]");
+    }
+
+    /// Serve `listeners` with the challenge router and assert an IPv4 loopback
+    /// connection reaches it (a `308` redirect from the fallback route confirms
+    /// the router actually served the connection).
+    async fn assert_ipv4_served(listeners: Vec<tokio::net::TcpListener>) {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        assert!(!listeners.is_empty(), "must bind at least one listener");
+        let port = listeners[0].local_addr().unwrap().port();
+
+        let router = challenge_router(Http01Tokens::new(), 443);
+        let mut serve_handles = Vec::new();
+        for listener in listeners {
+            let router = router.clone();
+            serve_handles.push(tokio::spawn(async move {
+                let _ = axum::serve(listener, router).await;
+            }));
+        }
+
+        let mut stream = tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port))
+            .await
+            .expect("IPv4 loopback connection to the challenge listener");
+        stream
+            .write_all(b"GET / HTTP/1.0\r\nHost: app.example.com\r\n\r\n")
+            .await
+            .unwrap();
+        let mut buf = Vec::new();
+        stream.read_to_end(&mut buf).await.unwrap();
+        let response = String::from_utf8_lossy(&buf);
+        assert!(
+            response.contains("308"),
+            "challenge router must serve the IPv4 connection (expected a 308 redirect), \
+             got: {response}"
+        );
+
+        for handle in serve_handles {
+            handle.abort();
+        }
+    }
+
+    // Regression (#1608, Codex): the HTTP-01 challenge listener must accept BOTH
+    // IPv4 and IPv6 so Let's Encrypt can validate an AAAA-only deployment.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn challenge_listener_accepts_ipv4_and_is_dual_stack_when_available() {
+        // The app-facing entrypoint always yields an IPv4-reachable listener,
+        // whether it took the dual-stack path or the IPv4 baseline fallback (an
+        // IPv4-only host has no IPv6 stack for the `[::]` socket).
+        let listeners = bind_challenge_listeners(0)
+            .await
+            .expect("bind ephemeral challenge listener");
+        assert_ipv4_served(listeners).await;
+
+        // Where the platform supports a dual-stack socket, an IPv4 connection
+        // accepted on the IPv6-bound `[::]` socket is the definitive proof that
+        // IPV6_V6ONLY=false (v4-mapped addresses are accepted). On an IPv4-only
+        // host this bind fails, and the invariant is already covered above.
+        if let Ok(dual) = bind_ipv6(0, false) {
+            assert!(
+                dual.local_addr().unwrap().is_ipv6(),
+                "the dual-stack challenge listener must be bound on the IPv6 wildcard [::]"
+            );
+            assert_ipv4_served(vec![dual]).await;
+        }
     }
 }

@@ -3671,37 +3671,50 @@ impl AppBuilder {
                 https_port,
             } = bind_state;
 
-            // The `:80` challenge/redirect listener. Fail-fast on a bind error:
-            // `:80` needs privilege (CAP_NET_BIND_SERVICE) and ACME validation
-            // cannot succeed without it.
-            let challenge_addr = format!("0.0.0.0:{http_challenge_port}");
-            let challenge_listener = match tokio::net::TcpListener::bind(&challenge_addr).await {
-                Ok(l) => l,
-                Err(e) => {
-                    tracing::error!(
-                        addr = %challenge_addr,
-                        "Failed to bind the ACME HTTP-01 challenge listener: {e}. Port \
-                         {http_challenge_port} typically needs privilege (grant \
-                         CAP_NET_BIND_SERVICE), or set [server.tls.acme] http_challenge_port \
-                         to a port a front-end forwards :80 to"
-                    );
-                    #[cfg(feature = "managed-pg")]
-                    crate::managed_pg::emergency_stop_async().await;
-                    std::process::exit(1);
-                }
-            };
+            // The `:80` challenge/redirect listener, bound DUAL-STACK so the CA
+            // can validate HTTP-01 over both IPv4 and IPv6 (an AAAA-only host is
+            // otherwise unreachable on `:80`). Preferred: one `[::]` socket with
+            // IPV6_V6ONLY=false; on a platform that refuses it, a separate
+            // IPv4 + IPv6 listener pair (each served below). Fail-fast on a bind
+            // error: `:80` needs privilege (CAP_NET_BIND_SERVICE) and ACME
+            // validation cannot succeed without it.
+            let challenge_listeners =
+                match crate::acme::challenge::bind_challenge_listeners(http_challenge_port).await {
+                    Ok(listeners) => listeners,
+                    Err(e) => {
+                        tracing::error!(
+                            port = http_challenge_port,
+                            "Failed to bind the ACME HTTP-01 challenge listener: {e}. Port \
+                             {http_challenge_port} typically needs privilege (grant \
+                             CAP_NET_BIND_SERVICE), or set [server.tls.acme] http_challenge_port \
+                             to a port a front-end forwards :80 to"
+                        );
+                        #[cfg(feature = "managed-pg")]
+                        crate::managed_pg::emergency_stop_async().await;
+                        std::process::exit(1);
+                    }
+                };
             let challenge_router = crate::acme::challenge::challenge_router(tokens, https_port);
-            let challenge_shutdown = server_shutdown.child_token();
-            tokio::spawn(async move {
-                if let Err(e) = axum::serve(challenge_listener, challenge_router)
-                    .with_graceful_shutdown(async move {
-                        challenge_shutdown.cancelled().await;
-                    })
-                    .await
-                {
-                    tracing::error!(error = %e, "ACME challenge listener stopped with an error");
-                }
-            });
+            // Serve every bound listener (one for dual-stack, two for the split
+            // fallback), each a child of `server_shutdown` so they tear down with
+            // the main server. The router is cheap to clone (shared Arc state).
+            for challenge_listener in challenge_listeners {
+                let router = challenge_router.clone();
+                let challenge_shutdown = server_shutdown.child_token();
+                tokio::spawn(async move {
+                    if let Err(e) = axum::serve(challenge_listener, router)
+                        .with_graceful_shutdown(async move {
+                            challenge_shutdown.cancelled().await;
+                        })
+                        .await
+                    {
+                        tracing::error!(
+                            error = %e,
+                            "ACME challenge listener stopped with an error"
+                        );
+                    }
+                });
+            }
 
             // Build the coordinator for leader election (regardless of role) and
             // the reporter callback, then spawn the renewal loop.

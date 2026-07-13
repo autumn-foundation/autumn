@@ -4115,6 +4115,18 @@ fn resolve_acme_doctor_config(toml_table: Option<&toml::Table>) -> Option<AcmeDo
     })
 }
 
+/// The set of domains the `--online` doctor actively probes (port 80/443 + DNS).
+///
+/// This is EVERY configured domain, not just the first: issuance orders an
+/// authorization for each name in `config.domains`, so probing only the first
+/// name can let doctor pass while issuance fails on an unprobed domain. Extracted
+/// as a pure helper so the "probe every configured domain" contract is
+/// unit-testable without real network I/O — `run()` enqueues one bounded port
+/// task and one DNS task for each domain returned here.
+fn acme_online_probe_domains(config: &AcmeDoctorConfig) -> Vec<String> {
+    config.domains.clone()
+}
+
 /// Inspect the newest stored ACME certificate under the configured directory
 /// namespace and grade its expiry, offline (reuses the #1603 `inspect_leaf`
 /// path). `cert_dir` must be the namespaced store directory
@@ -4999,7 +5011,17 @@ pub fn run(opts: DoctorOptions) {
     // table and reports empty paths, so `check_tls_impl` would emit a spurious
     // "must set both cert_path and key_path" Fail for EVERY ACME deployment.
     // ACME mode is graded by the acme checks below instead.
-    let acme_config = resolve_acme_doctor_config(toml_table.as_ref());
+    // Resolve the ACME config from the MERGED active-profile runtime table (base
+    // autumn.toml + [profile.<env>] + autumn-<env>.toml), exactly like the
+    // sibling `resolve_tls_paths()` does — NOT the raw top-level `toml_table`. A
+    // `[server.tls.acme]` supplied only by an active profile or override file is
+    // invisible to the raw table, so a raw-table lookup would leave
+    // `acme_configured` false while `resolve_tls_paths()` still sees the enclosing
+    // `[server.tls]` with no static paths, wrongly running (and failing) the
+    // static TLS check on a valid profile-scoped ACME deployment.
+    let (acme_canonical, acme_selected, _) = resolve_active_profiles();
+    let merged_acme_toml = get_merged_toml_table_runtime(&acme_canonical, &acme_selected);
+    let acme_config = resolve_acme_doctor_config(Some(&merged_acme_toml));
     let static_cert_key_present = resolve_tls_paths()
         .is_some_and(|(cert, key)| !cert.as_os_str().is_empty() && !key.as_os_str().is_empty());
     if should_run_static_tls_check(acme_config.is_some(), static_cert_key_present) {
@@ -5018,20 +5040,25 @@ pub fn run(opts: DoctorOptions) {
         let stored = resolve_acme_stored_cert_data(&cert_dir);
         tasks.push(Box::new(move || check_acme_stored_cert_impl(&stored)));
 
-        if opts.online
-            && let Some(domain) = acme.domains.first().cloned()
-        {
-            let d80 = domain.clone();
-            tasks.push(Box::new(move || {
-                let p80 = probe_port(&d80, 80);
-                let p443 = probe_port(&d80, 443);
-                check_acme_ports_impl(&d80, p80, p443)
-            }));
-            let d_dns = domain;
-            tasks.push(Box::new(move || {
-                let outcome = resolve_dns_points_here(&d_dns);
-                check_acme_dns_impl(&d_dns, &outcome)
-            }));
+        // Probe EVERY configured domain: issuance orders authorizations for all
+        // `config.domains`, so a probe of only the first name can pass doctor
+        // while issuance fails on an unprobed domain. One port + DNS check per
+        // domain, each labeled with the domain in its detail; still bounded and
+        // gated behind --online.
+        if opts.online {
+            for domain in acme_online_probe_domains(&acme) {
+                let d80 = domain.clone();
+                tasks.push(Box::new(move || {
+                    let p80 = probe_port(&d80, 80);
+                    let p443 = probe_port(&d80, 443);
+                    check_acme_ports_impl(&d80, p80, p443)
+                }));
+                let d_dns = domain;
+                tasks.push(Box::new(move || {
+                    let outcome = resolve_dns_points_here(&d_dns);
+                    check_acme_dns_impl(&d_dns, &outcome)
+                }));
+            }
         }
     }
 
@@ -7359,6 +7386,120 @@ pub struct Vault {
         // No acme, no static cert/key: run the static check so the incomplete
         // static-TLS config still surfaces the actionable "must set both" Fail.
         assert!(should_run_static_tls_check(false, false));
+    }
+
+    // Regression (#1608, Codex): [server.tls.acme] supplied ONLY by an active
+    // profile ([profile.prod] / autumn-prod.toml) must be detected by doctor. A
+    // raw top-level table misses it, so `resolve_tls_paths()` would still see the
+    // enclosing (static-path-less) [server.tls] and the static TLS check would
+    // spuriously Fail a valid ACME deployment. The MERGED runtime table (base +
+    // profile) sees the acme config, so doctor SKIPS the static check. This
+    // mirrors get_merged_toml_table_runtime's profile merge (deep_merge of
+    // [profile.<env>] onto the base top-level) feeding the testable
+    // resolve_acme_doctor_config helper.
+    #[test]
+    fn profile_only_acme_skips_static_tls_check() {
+        // [server.tls.acme] appears ONLY under [profile.prod]; the base top-level
+        // [server.tls] carries no acme and no static cert/key.
+        let raw: toml::Table = toml::from_str(
+            "\
+[server.tls]
+
+[profile.prod.server.tls.acme]
+domains = [\"app.example.com\"]
+directory = \"production\"
+",
+        )
+        .unwrap();
+
+        // The raw top-level lookup (the buggy source) does NOT see the
+        // profile-scoped acme, so it would leave the static TLS check running.
+        assert!(
+            resolve_acme_doctor_config(Some(&raw)).is_none(),
+            "raw top-level table must miss profile-scoped [server.tls.acme]"
+        );
+
+        // Build the MERGED runtime table exactly as get_merged_toml_table_runtime
+        // does for the active profile: base top-level, then deep_merge
+        // [profile.prod].
+        let mut merged = toml::Table::new();
+        deep_merge(&mut merged, &raw);
+        let prof = raw
+            .get("profile")
+            .and_then(toml::Value::as_table)
+            .and_then(|p| p.get("prod"))
+            .and_then(toml::Value::as_table)
+            .expect("[profile.prod] table");
+        deep_merge(&mut merged, prof);
+
+        // The merged table (what resolve_tls_paths and the fixed doctor path use)
+        // DOES surface the acme config.
+        let acme = resolve_acme_doctor_config(Some(&merged))
+            .expect("merged/profile table must surface [server.tls.acme]");
+        assert_eq!(acme.domains, ["app.example.com"]);
+        assert_eq!(acme.directory_label, "production");
+
+        // With acme detected and NO static cert/key present, the static
+        // [server.tls] check is skipped — no spurious "must set both cert_path and
+        // key_path" Fail for the profile-scoped ACME deployment.
+        assert!(
+            !should_run_static_tls_check(
+                resolve_acme_doctor_config(Some(&merged)).is_some(),
+                false,
+            ),
+            "profile-scoped ACME deployment must skip the static TLS check"
+        );
+    }
+
+    // Regression (#1608, Codex): --online must probe EVERY configured ACME
+    // domain, not just the first. Issuance orders an authorization for each name,
+    // so probing only the first can pass doctor while issuance fails on an
+    // unprobed domain. A 2-domain config must yield a port + DNS check per domain.
+    #[test]
+    fn online_probes_every_configured_domain() {
+        let config = AcmeDoctorConfig {
+            domains: vec!["ok.example.com".to_owned(), "bad.example.com".to_owned()],
+            cache_dir: std::path::PathBuf::from("config/acme"),
+            directory_label: "production".to_owned(),
+        };
+
+        // Every configured domain is scheduled for probing, not just the first.
+        let domains = acme_online_probe_domains(&config);
+        assert_eq!(
+            domains,
+            vec!["ok.example.com".to_owned(), "bad.example.com".to_owned()],
+            "every configured domain must be probed, not just the first"
+        );
+
+        // Each domain flows through the pure graders to a domain-labeled check,
+        // mirroring the port + DNS tasks run() enqueues per domain.
+        let mut ports_checks = Vec::new();
+        let mut dns_checks = Vec::new();
+        for domain in &domains {
+            ports_checks.push(check_acme_ports_impl(
+                domain,
+                PortReachability::Open,
+                PortReachability::Open,
+            ));
+            dns_checks.push(check_acme_dns_impl(domain, &DnsPointsHere::Matches));
+        }
+
+        assert_eq!(ports_checks.len(), 2, "one acme_ports check per domain");
+        assert_eq!(dns_checks.len(), 2, "one acme_dns check per domain");
+        for domain in &domains {
+            assert!(
+                ports_checks
+                    .iter()
+                    .any(|c| c.detail.as_deref().is_some_and(|d| d.contains(domain))),
+                "{domain} must be represented by a labeled acme_ports check"
+            );
+            assert!(
+                dns_checks
+                    .iter()
+                    .any(|c| c.detail.as_deref().is_some_and(|d| d.contains(domain))),
+                "{domain} must be represented by a labeled acme_dns check"
+            );
+        }
     }
 
     // The doctor's ACME directory label must match FsAcmeStore's namespacing so
