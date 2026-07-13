@@ -503,6 +503,22 @@ fn resolve_project_name() -> String {
         .unwrap_or_else(|| "app".to_owned())
 }
 
+/// Resolve the first database URL a deploy/migration would actually act on,
+/// honoring shard-only deployments.
+///
+/// `autumn migrate` treats a shard-only app (one or more `[[database.shards]]`
+/// with no control `primary_url`/`url`) as a valid shape and migrates each
+/// shard's `primary_url` (see `migrate::build_targets`). The DB-URL preflight
+/// must agree, so it considers the app to have a usable database when a control
+/// primary, a replica, OR at least one shard primary URL resolves — returning
+/// the first such URL (control primary → replica → first shard primary). The
+/// grader never prints the value, so surfacing a shard URL here is safe.
+fn resolve_preflight_db_url(db: &autumn_web::config::DatabaseConfig) -> Option<&str> {
+    db.effective_primary_url()
+        .or(db.replica_url.as_deref())
+        .or_else(|| db.shards.first().map(|shard| shard.primary_url.as_str()))
+}
+
 /// Collect all preflight graders for the resolved config against the loaded
 /// runtime configuration.
 fn collect_preflight(
@@ -510,13 +526,15 @@ fn collect_preflight(
     resolved: &ResolvedDeployConfig,
 ) -> Vec<PreflightCheck> {
     // A `[database]` is considered configured when any connection URL is set on
-    // the loaded config (primary/compat `url` or a replica-only role). Combined
-    // with the migrations-dir presence check inside `grade_database_url`, this
-    // marks the app as database-backed so a missing URL fails preflight — while a
-    // DB-free app (no URLs, no migrations) passes.
+    // the loaded config (primary/compat `url`, a replica-only role, or any
+    // `[[database.shards]]` entry). Combined with the migrations-dir presence
+    // check inside `grade_database_url`, this marks the app as database-backed
+    // so a missing URL fails preflight — while a DB-free app (no URLs, no
+    // shards, no migrations) passes.
     let database_configured = config.database.url.is_some()
         || config.database.primary_url.is_some()
-        || config.database.replica_url.is_some();
+        || config.database.replica_url.is_some()
+        || config.database.has_shards();
     vec![
         grade_ssh_reachability(
             resolved.host.as_deref(),
@@ -525,7 +543,7 @@ fn collect_preflight(
         ),
         grade_signing_secret(config.security.signing_secret.secret.as_deref()),
         grade_database_url(
-            config.database.effective_primary_url(),
+            resolve_preflight_db_url(&config.database),
             Path::new(MIGRATIONS_DIR),
             database_configured,
         ),
@@ -801,6 +819,41 @@ mod tests {
             check.hint.is_some(),
             "the failure should carry an actionable remediation hint"
         );
+    }
+
+    #[test]
+    fn shard_only_config_resolves_a_usable_db_url() {
+        use autumn_web::config::{DatabaseConfig, ShardConfig};
+
+        // A shard-only app: no control `primary_url`/`url`/`replica_url`, but one
+        // `[[database.shards]]` entry with a `primary_url`. `autumn migrate` would
+        // target that shard, so the preflight must treat the app as having a
+        // usable database and PASS even with a migrations directory present.
+        let db = DatabaseConfig {
+            shards: vec![ShardConfig {
+                name: "shard0".to_owned(),
+                primary_url: "postgres://user:pw@shard0/app".to_owned(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(db.effective_primary_url().is_none());
+
+        let url = resolve_preflight_db_url(&db);
+        assert_eq!(url, Some("postgres://user:pw@shard0/app"));
+
+        // Migrations dir present + database configured (has_shards) → DB-backed.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let migrations = tmp.path().join("migrations");
+        std::fs::create_dir(&migrations).unwrap();
+        let check = grade_database_url(url, &migrations, true);
+        assert!(
+            check.passed,
+            "shard-only app with migrations should pass the DB-URL preflight: {}",
+            check.detail
+        );
+        // The grader must never echo the shard credentials.
+        assert!(!check.detail.contains("pw"));
     }
 
     #[test]

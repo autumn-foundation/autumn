@@ -5756,7 +5756,21 @@ pub fn run(opts: DoctorOptions) {
         // and `autumn deploy check` see it. Env-var precedence is preserved
         // (`resolve_database_topology` reads env first, then the merged table).
         let deploy_db_topology = resolve_database_topology(Some(&merged_deploy_toml));
-        let deploy_db_url = deploy_db_topology.primary_url;
+        // Shard-only apps declare no control `primary_url`/`url` but still have a
+        // usable database: `autumn migrate` targets each `[[database.shards]]`
+        // entry (see `migrate::build_targets`). Resolve the shard URLs from the
+        // SAME merged active-profile table, reusing the exact migrate resolver so
+        // preflight and the real migration step agree, and fall back to the first
+        // shard's primary URL when no control primary/replica resolves. The grader
+        // never prints the value.
+        let deploy_shards = crate::migrate::resolve_shard_database_urls_from_sources(
+            |key| std::env::var(key),
+            Some(&merged_deploy_toml),
+        );
+        let deploy_db_url = deploy_db_topology
+            .primary_url
+            .or(deploy_db_topology.replica_url)
+            .or_else(|| deploy_shards.into_iter().next().map(|(_, url)| url));
         // A `[database]` present in the merged runtime table marks the app as
         // database-backed even without a migrations directory, so `grade_database_url`
         // requires a URL. A DB-free app (no `[database]`, no migrations dir) passes.
