@@ -53,19 +53,39 @@ REQUEST_PATH_MODULES=(
   autumn/src/middleware/load_shed.rs
 )
 
+# Canonical panic-class lints every gated module must deny on the production
+# code path. The header spells each as a fully-qualified `clippy::<lint>` token
+# (that is how rustfmt normalizes it), so match the qualified form to prevent a
+# bare `unwrap_used` elsewhere in the file from spoofing the check. If a gated
+# module drops any one of these while keeping the rest, the gate is silently
+# weakened — so we require the COMPLETE set, not a subset.
+REQUIRED_PANIC_LINTS=(
+  clippy::unwrap_used
+  clippy::expect_used
+  clippy::panic
+  clippy::unreachable
+  clippy::todo
+  clippy::unimplemented
+  clippy::indexing_slicing
+)
+
 for module in "${REQUEST_PATH_MODULES[@]}"; do
   [[ -f "$module" ]] || die "gated request-path module is missing: $module"
   grep -q 'autumn-panic-gate:' "$module" \
     || die "missing gate marker 'autumn-panic-gate:' in $module"
   # The deny header is `#![cfg_attr(not(test), deny(clippy::unwrap_used, …))]`.
-  # rustfmt may wrap it across several lines, so match its stable tokens
-  # individually rather than as one literal string.
+  # rustfmt wraps it across several lines, so match its stable tokens
+  # individually rather than as one literal block.
   grep -q '#!\[cfg_attr(' "$module" \
     && grep -q 'not(test)' "$module" \
     && grep -q 'deny(' "$module" \
-    && grep -q 'clippy::unwrap_used' "$module" \
-    && grep -q 'clippy::indexing_slicing' "$module" \
-    || die "missing or incomplete gate deny header (cfg_attr(not(test), deny(…))) in $module"
+    || die "missing gate deny header opener '#![cfg_attr(not(test), deny(' in $module"
+  # Require every canonical panic lint by its fully-qualified token so no
+  # gated module can quietly drop one while keeping the others.
+  for lint in "${REQUIRED_PANIC_LINTS[@]}"; do
+    grep -qF "$lint" "$module" \
+      || die "gate header in $module is missing required panic lint '$lint'"
+  done
 done
 
 echo "panic-gate: ${#REQUEST_PATH_MODULES[@]} request-path modules gated"
