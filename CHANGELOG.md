@@ -991,6 +991,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `autumn-admin-plugin` `TokenAdminModel` panel. Additive `api_tokens` columns
   (`name`, `scopes` JSONB, `expires_at`, `last_used_at`) via a new framework
   migration; minor version bump, no breaking change to `autumn-web`.
+- **cli:** `autumn explore` (PR #1580) [no-plugin] — an interactive ratatui
+  TUI for browsing and searching the app's route table. Compiles the app and
+  introspects its routes like `autumn routes`, then presents them in a
+  scrollable, incrementally-searchable table (filter by method, path, handler,
+  source, or middleware) with a details panel showing source, middleware,
+  API version, and sunset status for the selected route.
 - **cli:** `autumn generate tauri` — scaffolds a complete `src-tauri/` sidecar
   project so any existing autumn app ships as a native desktop installer with a
   single additional command (`cargo tauri build`). Uses the Tauri v2 sidecar

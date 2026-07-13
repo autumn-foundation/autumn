@@ -16,6 +16,7 @@ mod dev_loop_bench;
 mod dev_loop_scaling;
 mod doctor;
 mod experiments;
+mod explore;
 mod export;
 mod flags;
 mod generate;
@@ -689,10 +690,25 @@ enum Commands {
     #[command(subcommand, verbatim_doc_comment)]
     Canary(CanaryCommands),
 
+    /// Interactive ratatui TUI for visually browsing and searching app routes
+    Explore {
+        /// Package to inspect (for workspaces).
+        #[arg(short, long)]
+        package: Option<String>,
+        /// Binary target to inspect.
+        #[arg(long)]
+        bin: Option<String>,
+    },
     /// Print every mounted route — method, path, handler, source, middleware.
     ///
     /// Compiles the application (debug profile) and introspects its route
     /// table without starting the HTTP server or connecting to a database.
+    ///
+    /// List all routes, grouped by path and sorted by method.
+    ///
+    /// Runs the compiled app with a special flag that dumps its router
+    /// tree, then exits. Handlers without a `#[get]` or similar macro are
+    /// not included.
     ///
     /// Rows are stable-sorted by path, then method, so the output is
     /// diff-friendly. Redirect to a file and `git diff` two snapshots to
@@ -2729,6 +2745,16 @@ fn run_command(command: Commands) {
             &method,
             user_only,
         ),
+        Commands::Explore { package, bin } => {
+            explore::run(&routes::RoutesOptions {
+                package: package.as_deref(),
+                bin: bin.as_deref(),
+                format: routes::OutputFormat::Table, // format is ignored in explore
+                filter: None,
+                methods: &[],
+                user_only: false,
+            });
+        }
         Commands::Release(cmd) => run_release_command(cmd),
         Commands::Token(cmd) => match cmd {
             TokenCommands::Issue {
