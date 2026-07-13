@@ -400,6 +400,12 @@ pub enum TlsDoctorData {
     /// `dead_code` allow for the feature-less build.
     #[cfg_attr(not(feature = "tls"), allow(dead_code))]
     Healthy {
+        /// Whether the leaf certificate is not yet valid — its `notBefore` lies
+        /// in the future. Such a certificate fails every handshake until its
+        /// window opens, so the runtime rejects it at startup; doctor grades it a
+        /// failure, symmetric to `expired`. Checked before `expired` (a cert
+        /// cannot be both), so the pass/fail decision keys off this flag first.
+        not_yet_valid: bool,
         /// Whether the leaf certificate has already expired, decided from the
         /// raw `notAfter` timestamp rather than the truncated `days_until_expiry`
         /// bucket. A certificate expired less than 24h ago buckets to `0` days
@@ -430,6 +436,7 @@ pub enum TlsDoctorData {
 /// - Built without the `tls` feature → **Warn** (cannot diagnose; do not
 ///   silently omit the check).
 /// - Cert/key invalid or missing → **Fail**.
+/// - Leaf certificate not yet valid (`notBefore` in the future) → **Fail**.
 /// - Leaf certificate already expired → **Fail**.
 /// - Leaf certificate expiring within 30 days → **Warn**.
 /// - Otherwise → **Pass**.
@@ -462,8 +469,25 @@ pub fn check_tls_impl(data: &TlsDoctorData) -> CheckResult {
             ),
         },
         TlsDoctorData::Healthy {
+            not_yet_valid: true,
+            ..
+        } => CheckResult {
+            name: "tls",
+            status: CheckStatus::Fail,
+            detail: Some(
+                "the [server.tls] leaf certificate is not yet valid (its notBefore is in the \
+                 future)"
+                    .into(),
+            ),
+            hint: Some(
+                "Wait for the certificate's validity window to open or install a currently-valid \
+                 certificate; a not-yet-valid certificate fails every TLS handshake",
+            ),
+        },
+        TlsDoctorData::Healthy {
             expired: true,
             days_until_expiry,
+            ..
         } => CheckResult {
             name: "tls",
             status: CheckStatus::Fail,
@@ -476,6 +500,7 @@ pub fn check_tls_impl(data: &TlsDoctorData) -> CheckResult {
         TlsDoctorData::Healthy {
             expired: false,
             days_until_expiry,
+            ..
         } if *days_until_expiry <= 30 => CheckResult {
             name: "tls",
             status: CheckStatus::Warn,
@@ -3826,14 +3851,16 @@ fn resolve_tls_paths() -> Option<(std::path::PathBuf, std::path::PathBuf)> {
             Err(_) => Box::new(autumn_web::config::OsEnv),
         };
 
-    let env_cert = denv
-        .var("AUTUMN_SERVER__TLS__CERT_PATH")
-        .ok()
-        .filter(|v| !v.trim().is_empty());
-    let env_key = denv
-        .var("AUTUMN_SERVER__TLS__KEY_PATH")
-        .ok()
-        .filter(|v| !v.trim().is_empty());
+    // `.ok()` deliberately does NOT filter empty values: a set-but-empty env
+    // var is a PRESENT higher-priority override. The runtime materializes it as
+    // an empty `PathBuf` that OVERWRITES any TOML `cert_path`/`key_path`
+    // (`apply_env_overrides_with_env` uses `env.var(...).ok()` with no
+    // empty-filter, then `PathBuf::from(cert)`), so startup fails fast on the
+    // missing file. Dropping the empty override here would let doctor fall back
+    // to the TOML path and pass a config the server rejects — mirror the
+    // runtime's presence rule so doctor resolves to the same empty path.
+    let env_cert = denv.var("AUTUMN_SERVER__TLS__CERT_PATH").ok();
+    let env_key = denv.var("AUTUMN_SERVER__TLS__KEY_PATH").ok();
 
     let toml_cert = tls
         .and_then(|t| t.get("cert_path"))
@@ -3888,6 +3915,7 @@ fn resolve_tls_doctor_data() -> TlsDoctorData {
                 )
                 .unwrap_or(i64::MAX);
                 TlsDoctorData::Healthy {
+                    not_yet_valid: inspection.is_not_yet_valid(now),
                     expired: inspection.is_expired(now),
                     days_until_expiry: inspection.days_until_expiry(now),
                 }
@@ -6801,6 +6829,7 @@ pub struct Vault {
     #[test]
     fn tls_fail_when_expired() {
         let r = check_tls_impl(&TlsDoctorData::Healthy {
+            not_yet_valid: false,
             expired: true,
             days_until_expiry: -3,
         });
@@ -6809,9 +6838,26 @@ pub struct Vault {
         assert!(r.hint.is_some());
     }
 
+    // A not-yet-valid leaf (notBefore in the future) fails every handshake until
+    // its window opens, so the runtime rejects it at startup — doctor must grade
+    // it a Fail, symmetric to the expired path (#1603, Codex review). The
+    // not_yet_valid flag wins even when the expiry fields would otherwise Pass.
+    #[test]
+    fn tls_fail_when_not_yet_valid() {
+        let r = check_tls_impl(&TlsDoctorData::Healthy {
+            not_yet_valid: true,
+            expired: false,
+            days_until_expiry: 365,
+        });
+        assert!(matches!(r.status, CheckStatus::Fail));
+        assert!(r.detail.as_deref().unwrap().contains("not yet valid"));
+        assert!(r.hint.is_some());
+    }
+
     #[test]
     fn tls_warn_when_near_expiry() {
         let r = check_tls_impl(&TlsDoctorData::Healthy {
+            not_yet_valid: false,
             expired: false,
             days_until_expiry: 10,
         });
@@ -6823,6 +6869,7 @@ pub struct Vault {
     fn tls_warn_at_exactly_thirty_days() {
         // The 30-day boundary is inclusive of the warning window.
         let r = check_tls_impl(&TlsDoctorData::Healthy {
+            not_yet_valid: false,
             expired: false,
             days_until_expiry: 30,
         });
@@ -6832,6 +6879,7 @@ pub struct Vault {
     #[test]
     fn tls_pass_when_healthy() {
         let r = check_tls_impl(&TlsDoctorData::Healthy {
+            not_yet_valid: false,
             expired: false,
             days_until_expiry: 365,
         });
@@ -6850,12 +6898,19 @@ pub struct Vault {
 
         let now: i64 = 1_700_000_000;
 
+        // A notBefore a day in the past keeps every fixture below currently
+        // valid (not_yet_valid == false), isolating the expiry grading.
+        let not_before = now - 86_400;
+
         // Expired 1h ago: buckets to 0 days, but is_expired → Fail.
         let just_expired = LeafInspection {
+            not_before_unix: not_before,
             not_after_unix: now - 3_600,
         };
         assert!(just_expired.is_expired(now));
+        assert!(!just_expired.is_not_yet_valid(now));
         let r = check_tls_impl(&TlsDoctorData::Healthy {
+            not_yet_valid: just_expired.is_not_yet_valid(now),
             expired: just_expired.is_expired(now),
             days_until_expiry: just_expired.days_until_expiry(now),
         });
@@ -6867,10 +6922,12 @@ pub struct Vault {
 
         // Expires in 1h (not yet expired): near-expiry Warn.
         let expiring_soon = LeafInspection {
+            not_before_unix: not_before,
             not_after_unix: now + 3_600,
         };
         assert!(!expiring_soon.is_expired(now));
         let r = check_tls_impl(&TlsDoctorData::Healthy {
+            not_yet_valid: expiring_soon.is_not_yet_valid(now),
             expired: expiring_soon.is_expired(now),
             days_until_expiry: expiring_soon.days_until_expiry(now),
         });
@@ -6882,10 +6939,12 @@ pub struct Vault {
 
         // Expires in 40 days: healthy Pass.
         let healthy = LeafInspection {
+            not_before_unix: not_before,
             not_after_unix: now + 40 * 86_400,
         };
         assert!(!healthy.is_expired(now));
         let r = check_tls_impl(&TlsDoctorData::Healthy {
+            not_yet_valid: healthy.is_not_yet_valid(now),
             expired: healthy.is_expired(now),
             days_until_expiry: healthy.days_until_expiry(now),
         });
@@ -6894,6 +6953,26 @@ pub struct Vault {
             "cert with 40 days left must Pass, got {:?}",
             r.status
         );
+
+        // Not yet valid: notBefore an hour in the future → Fail, even though
+        // notAfter is far off (days_until_expiry would otherwise Pass).
+        let not_yet_valid = LeafInspection {
+            not_before_unix: now + 3_600,
+            not_after_unix: now + 40 * 86_400,
+        };
+        assert!(not_yet_valid.is_not_yet_valid(now));
+        assert!(!not_yet_valid.is_expired(now));
+        let r = check_tls_impl(&TlsDoctorData::Healthy {
+            not_yet_valid: not_yet_valid.is_not_yet_valid(now),
+            expired: not_yet_valid.is_expired(now),
+            days_until_expiry: not_yet_valid.days_until_expiry(now),
+        });
+        assert!(
+            matches!(r.status, CheckStatus::Fail),
+            "not-yet-valid cert must Fail, got {:?}",
+            r.status
+        );
+        assert!(r.detail.as_deref().unwrap().contains("not yet valid"));
     }
 
     #[test]
@@ -6965,6 +7044,64 @@ pub struct Vault {
         .expect("configured");
         assert_eq!(resolved.0, std::path::PathBuf::from("/env/c.pem"));
         assert_eq!(resolved.1, std::path::PathBuf::from("/env/k.pem"));
+    }
+
+    // Regression (#1603, Codex): a PRESENT-but-EMPTY `AUTUMN_SERVER__TLS__CERT_PATH`
+    // (e.g. a deployment that exports `AUTUMN_SERVER__TLS__CERT_PATH=`) is a
+    // higher-priority override the runtime materializes as an empty `PathBuf`,
+    // OVERWRITING the valid TOML cert path and failing fast on the missing file.
+    // Doctor must read env vars with `.ok()` (no empty-filter) so it resolves to
+    // the SAME empty path and grades a Fail — not silently fall back to the TOML
+    // path and pass a config the server rejects. Extract exactly as
+    // `resolve_tls_paths` now does (`env.var(...).ok()`) from a map-backed `Env`.
+    #[test]
+    fn tls_empty_env_override_clears_toml_path() {
+        use autumn_web::config::{Env, MockEnv};
+
+        // TOML has a valid cert/key pair, but the deployment exports an EMPTY
+        // CERT_PATH override. The runtime overwrites cert_path with an empty
+        // PathBuf; doctor must mirror that presence-vs-empty rule.
+        let env = MockEnv::new().with("AUTUMN_SERVER__TLS__CERT_PATH", "");
+        // Mirror `resolve_tls_paths`: `.ok()` with NO `.filter(non-empty)`, so a
+        // present-but-empty var is `Some("")` (a clearing override), while an
+        // unset var stays `None` (falls through to TOML).
+        let env_cert = env.var("AUTUMN_SERVER__TLS__CERT_PATH").ok();
+        let env_key = env.var("AUTUMN_SERVER__TLS__KEY_PATH").ok();
+        assert_eq!(
+            env_cert.as_deref(),
+            Some(""),
+            "a present-but-empty CERT_PATH must survive as Some(\"\"), not be dropped"
+        );
+        assert!(env_key.is_none(), "an unset KEY_PATH stays None");
+
+        let (cert, key) = resolve_tls_paths_from_sources(
+            true,                              // [server.tls] section present
+            Some("/toml/cert.pem".to_owned()), // valid TOML cert
+            Some("/toml/key.pem".to_owned()),  // valid TOML key
+            env_cert,                          // present-but-empty override
+            env_key,                           // unset -> falls back to TOML key
+            any_tls_env_var_set_in(&env),
+        )
+        .expect("a present TLS env var means TLS is configured");
+
+        // The empty override wins over the TOML cert, matching the runtime.
+        assert!(
+            cert.as_os_str().is_empty(),
+            "empty CERT_PATH override must clear the TOML cert path"
+        );
+        assert_eq!(
+            key,
+            std::path::PathBuf::from("/toml/key.pem"),
+            "the unset KEY_PATH keeps the TOML value"
+        );
+
+        // Empty cert path is exactly what `resolve_tls_doctor_data` maps to the
+        // incomplete-config Invalid, which grades a Fail — same failure the
+        // server surfaces at startup.
+        let r = check_tls_impl(&TlsDoctorData::Invalid {
+            detail: "[server.tls] must set both cert_path and key_path".to_owned(),
+        });
+        assert!(matches!(r.status, CheckStatus::Fail));
     }
 
     // Regression (#1603, Codex): TLS vars supplied through the `.env`/

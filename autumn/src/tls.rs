@@ -113,6 +113,18 @@ pub enum TlsError {
         /// `notAfter` as a UNIX timestamp.
         not_after_unix: i64,
     },
+    /// The leaf certificate is not yet valid — its `notBefore` is in the future.
+    #[error(
+        "the leaf certificate in `{path}` is not valid until {not_before} (UNIX {not_before_unix})"
+    )]
+    NotYetValid {
+        /// Certificate path.
+        path: PathBuf,
+        /// RFC 2822-ish rendering of `notBefore`.
+        not_before: String,
+        /// `notBefore` as a UNIX timestamp.
+        not_before_unix: i64,
+    },
     /// Building the rustls `ServerConfig` failed.
     #[error("failed to build the rustls server configuration: {source}")]
     BuildConfig {
@@ -162,12 +174,13 @@ fn read_private_key(key_path: &Path) -> Result<PrivateKeyDer<'static>, TlsError>
     })
 }
 
-/// The `notAfter` of the leaf certificate, as a UNIX timestamp (seconds).
+/// The `notBefore` and `notAfter` of the leaf certificate, as UNIX timestamps
+/// (seconds), returned as `(not_before, not_after)`.
 ///
 /// Parses just enough of the DER to read the validity window; a parse failure
 /// is surfaced rather than silently ignored so a corrupt certificate is caught
 /// at load time.
-fn leaf_not_after_unix(cert_path: &Path, leaf: &CertificateDer<'_>) -> Result<i64, TlsError> {
+fn leaf_validity_unix(cert_path: &Path, leaf: &CertificateDer<'_>) -> Result<(i64, i64), TlsError> {
     use x509_parser::prelude::FromDer as _;
 
     let (_, parsed) =
@@ -177,7 +190,11 @@ fn leaf_not_after_unix(cert_path: &Path, leaf: &CertificateDer<'_>) -> Result<i6
                 detail: e.to_string(),
             }
         })?;
-    Ok(parsed.validity().not_after.timestamp())
+    let validity = parsed.validity();
+    Ok((
+        validity.not_before.timestamp(),
+        validity.not_after.timestamp(),
+    ))
 }
 
 /// Load, validate, and return the certificate + key as a rustls [`CertifiedKey`].
@@ -201,10 +218,19 @@ pub fn load_certified_key(
     let chain = read_cert_chain(cert_path)?;
     let key = read_private_key(key_path)?;
 
-    // Reject an already-expired leaf before we even build the key: serving an
-    // expired certificate fails every client handshake, so refuse at startup
-    // with a clear message rather than booting into a broken listener.
-    let not_after = leaf_not_after_unix(cert_path, &chain[0])?;
+    // Reject a leaf outside its validity window before we even build the key:
+    // an expired OR not-yet-valid certificate fails every client handshake, so
+    // refuse at startup with a clear message rather than booting into a broken
+    // listener. Symmetric bounds: `notBefore` in the future is as fatal as a
+    // past `notAfter`.
+    let (not_before, not_after) = leaf_validity_unix(cert_path, &chain[0])?;
+    if now_unix < not_before {
+        return Err(TlsError::NotYetValid {
+            path: cert_path.to_path_buf(),
+            not_before: render_unix(not_before),
+            not_before_unix: not_before,
+        });
+    }
     if not_after < now_unix {
         return Err(TlsError::Expired {
             path: cert_path.to_path_buf(),
@@ -507,11 +533,22 @@ impl axum::serve::Listener for TlsListener {
 /// The outcome of inspecting a configured certificate + key pair, offline.
 #[derive(Debug, Clone, Copy)]
 pub struct LeafInspection {
+    /// The leaf certificate's `notBefore`, as a UNIX timestamp (seconds).
+    pub not_before_unix: i64,
     /// The leaf certificate's `notAfter`, as a UNIX timestamp (seconds).
     pub not_after_unix: i64,
 }
 
 impl LeafInspection {
+    /// Whether the leaf certificate is not yet valid at `now_unix` — its
+    /// `notBefore` lies in the future. Such a certificate fails every handshake
+    /// until its validity window opens, so the runtime rejects it at startup and
+    /// doctor grades it a failure, symmetric to [`Self::is_expired`].
+    #[must_use]
+    pub const fn is_not_yet_valid(&self, now_unix: i64) -> bool {
+        now_unix < self.not_before_unix
+    }
+
     /// Whole days from `now_unix` until `notAfter`. Negative once expired.
     ///
     /// Note: this truncates toward zero, so a certificate that expired less
@@ -538,9 +575,10 @@ impl LeafInspection {
 /// WITHOUT booting a server or touching the network. Used by `autumn doctor`.
 ///
 /// This performs the same parsing and cert/key-match validation as
-/// [`load_certified_key`] (so a broken pair is reported), but tolerates an
-/// already-expired certificate — the caller decides how to grade expiry — by
-/// still returning the `notAfter`.
+/// [`load_certified_key`] (so a broken pair is reported), but tolerates a leaf
+/// outside its validity window — already-expired OR not-yet-valid — leaving the
+/// caller to decide how to grade it, by still returning the `notBefore`/
+/// `notAfter` bounds.
 ///
 /// # Errors
 ///
@@ -549,7 +587,7 @@ impl LeafInspection {
 pub fn inspect_leaf(cert_path: &Path, key_path: &Path) -> Result<LeafInspection, TlsError> {
     let chain = read_cert_chain(cert_path)?;
     let key = read_private_key(key_path)?;
-    let not_after = leaf_not_after_unix(cert_path, &chain[0])?;
+    let (not_before, not_after) = leaf_validity_unix(cert_path, &chain[0])?;
 
     // Validate the key matches the leaf even though we do not need the key
     // material — a mismatched pair would fail every handshake at runtime, so
@@ -562,6 +600,7 @@ pub fn inspect_leaf(cert_path: &Path, key_path: &Path) -> Result<LeafInspection,
     })?;
 
     Ok(LeafInspection {
+        not_before_unix: not_before,
         not_after_unix: not_after,
     })
 }
@@ -654,6 +693,39 @@ mod tests {
         let provider = crypto_provider();
         let err = load_certified_key(&cert, &key, &provider, now()).unwrap_err();
         assert!(matches!(err, TlsError::Expired { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn not_yet_valid_leaf_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let cert = write_temp(dir.path(), "c.pem", CERT_PEM);
+        let key = write_temp(dir.path(), "k.pem", KEY_PEM);
+        let provider = crypto_provider();
+
+        // Pin "now" to one hour BEFORE the fixture's notBefore (equivalent to a
+        // cert whose notBefore is now + 3600): the leaf is not yet valid, so
+        // load must fail fast — symmetric to the expired-leaf rejection.
+        let not_before = inspect_leaf(&cert, &key).unwrap().not_before_unix;
+        let err = load_certified_key(&cert, &key, &provider, not_before - 3600).unwrap_err();
+        assert!(matches!(err, TlsError::NotYetValid { .. }), "got {err:?}");
+
+        // A currently-valid cert is unaffected: one second into the validity
+        // window (and well before notAfter) the same pair loads cleanly.
+        load_certified_key(&cert, &key, &provider, not_before + 1)
+            .expect("cert loads once notBefore has passed");
+    }
+
+    #[test]
+    fn inspect_reports_not_yet_valid_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let cert = write_temp(dir.path(), "c.pem", CERT_PEM);
+        let key = write_temp(dir.path(), "k.pem", KEY_PEM);
+        // inspect_leaf tolerates a not-yet-valid leaf (doctor grades it) but
+        // returns notBefore so the caller can see the window has not opened.
+        let inspection = inspect_leaf(&cert, &key).expect("pair inspects");
+        assert!(inspection.is_not_yet_valid(inspection.not_before_unix - 1));
+        assert!(!inspection.is_not_yet_valid(inspection.not_before_unix));
+        assert!(!inspection.is_not_yet_valid(inspection.not_after_unix));
     }
 
     #[test]
