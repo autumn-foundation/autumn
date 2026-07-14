@@ -239,6 +239,7 @@ const EXPECTED_STORY_SLUGS: &[&str] = &[
     "stat-card",
     "tabs",
     "toast",
+    "transition-controls",
 ];
 
 #[test]
