@@ -154,7 +154,7 @@
 //! ```
 //!
 //! Use **raw diesel inserts on `conn`**, not a generated
-//! [`Repository`](crate::repository) `create`: that `create` opens its *own*
+//! [`Repository`](macro@crate::repository) `create`: that `create` opens its *own*
 //! `Db::tx`, and `Db::tx` cannot be re-entered on the same connection — the
 //! nested call trips the nested-transaction guard and returns a `400`. Keep the
 //! whole parent-plus-children unit of work in the one outer `tx`.
