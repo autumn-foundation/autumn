@@ -1271,8 +1271,16 @@ pub fn pagerduty_event_payload(alert: &Alert, routing_key: &str) -> serde_json::
 /// [`Alert::dedup_key`], so a repeating condition folds into a single incident
 /// and a recovery emits a `resolve` event that auto-resolves it. Works against
 /// PagerDuty-Events-compatible endpoints offered by other paging services (set
-/// `[alerts] pagerduty_url`). Uses the SSRF-hardened
-/// [`http_client::Client`](crate::http_client::Client) for the outbound call.
+/// `[alerts] pagerduty_url`).
+///
+/// The endpoint URL is validated only for *shape* — an absolute `http(s)` URL —
+/// at config load and by `autumn doctor`'s `alert_transports` check. The
+/// outbound POST does NOT apply the
+/// [`http_client::Client`](crate::http_client::Client)'s SSRF deny-list /
+/// address pinning (that guard is only enabled via
+/// [`Client::get_ssrf_safe`](crate::http_client::Client::get_ssrf_safe)). Alert
+/// URLs are treated as trusted operator configuration and are intentionally
+/// exempt so operators can page internal endpoints.
 #[cfg(feature = "http-client")]
 pub struct PagerDutyAlertChannel {
     client: crate::http_client::Client,
@@ -1380,8 +1388,16 @@ pub fn slack_message_payload(alert: &Alert) -> serde_json::Value {
 ///
 /// POSTs a human-readable message to a Slack incoming-webhook URL, or to a
 /// Discord webhook's Slack-compatible endpoint (append `/slack`), using one
-/// payload dialect for both. Uses the SSRF-hardened
-/// [`http_client::Client`](crate::http_client::Client) for the outbound call.
+/// payload dialect for both.
+///
+/// The webhook URL is validated only for *shape* — an absolute `https` URL — at
+/// config load and by `autumn doctor`'s `alert_transports` check. The outbound
+/// POST does NOT apply the
+/// [`http_client::Client`](crate::http_client::Client)'s SSRF deny-list /
+/// address pinning (that guard is only enabled via
+/// [`Client::get_ssrf_safe`](crate::http_client::Client::get_ssrf_safe)). Alert
+/// URLs are treated as trusted operator configuration and are intentionally
+/// exempt so operators can alert to internal chat endpoints.
 #[cfg(feature = "http-client")]
 pub struct SlackAlertChannel {
     client: crate::http_client::Client,
@@ -1467,8 +1483,16 @@ impl AlertChannel for SlackAlertChannel {
 /// actually delivers.
 ///
 /// Shared by [`install_from_config`] (runtime wiring) and the CLI `autumn alert
-/// test` command so both agree on exactly which transports are usable. All
-/// outbound calls go through the passed SSRF-hardened `client`.
+/// test` command so both agree on exactly which transports are usable.
+///
+/// All outbound calls go through the passed `client`, but only the transport
+/// URL *shape* is validated (absolute `https` for Slack/Discord; absolute
+/// `http(s)` for `PagerDuty`) — at config load and by `autumn doctor`'s
+/// `alert_transports` check. Dispatch does NOT apply the client's SSRF deny-list
+/// / address pinning (that guard is only enabled via
+/// [`Client::get_ssrf_safe`](crate::http_client::Client::get_ssrf_safe)); alert
+/// URLs are trusted operator configuration and are intentionally exempt so
+/// operators can alert to internal endpoints.
 #[cfg(feature = "http-client")]
 #[must_use]
 pub fn native_transport_channels(
@@ -1711,7 +1735,13 @@ fn build_mail_alert_channel(
 
 /// Append the native provider channels (issue #1630, `PagerDuty` / Slack /
 /// Discord) to `channels`, built through [`native_transport_channels`] with the
-/// SSRF-hardened shared HTTP client.
+/// shared HTTP client.
+///
+/// Alert dispatch validates only the transport URL's *shape*; it does NOT apply
+/// the client's SSRF deny-list / address pinning (see
+/// [`native_transport_channels`]). Alert URLs are trusted operator
+/// configuration and are intentionally exempt so operators can alert to
+/// internal endpoints.
 ///
 /// Compiled to a warn-only no-op when the `http-client` feature is off, so a
 /// PagerDuty/Slack/Discord-only config does not silently deliver nothing.
