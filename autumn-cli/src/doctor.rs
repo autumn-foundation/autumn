@@ -2898,6 +2898,53 @@ fn sqlite_primary_target_is_bootable(
     database_backend_consistency(legacy_url, primary_url, replica_url, has_shards).is_ok()
 }
 
+/// Finding F27: run the boot-time backend-consistency rule as an
+/// **unconditional** doctor check, independent of which backend is the effective
+/// primary.
+///
+/// `DatabaseConfig::validate` refuses to boot any config whose roles mix
+/// backends: a `sqlite://` primary with a Postgres legacy `database.url` (F26), a
+/// Postgres primary with a `sqlite://` legacy `database.url` (F27, the mirror
+/// image), a `SQLite` read replica or shard, etc. The `SQLite`-only bootability
+/// gate ([`sqlite_primary_target_is_bootable`]) only fires when the *effective
+/// primary* is `SQLite`, so a Postgres-primary mismatch slipped through: with the
+/// Postgres primary reachable, `autumn doctor --strict` could greenlight a config
+/// the app rejects at boot because the legacy `SQLite` role was never validated.
+///
+/// This check asks the exact function boot uses on **every** resolved role, so
+/// doctor Fails the same mismatched configs boot Fails, whatever the primary
+/// backend. It is the authoritative signal: when it Fails, `run()` withholds the
+/// per-role connectivity Pass so a reachable primary can't contradict it.
+fn check_database_backend_consistency(
+    legacy_url: Option<&str>,
+    primary_url: Option<&str>,
+    replica_url: Option<&str>,
+    has_shards: bool,
+) -> CheckResult {
+    match autumn_web::config::database_backend_consistency(
+        legacy_url,
+        primary_url,
+        replica_url,
+        has_shards,
+    ) {
+        Ok(()) => CheckResult {
+            name: "db_backend_consistency",
+            status: CheckStatus::Pass,
+            detail: Some("all configured database roles use the same backend".to_owned()),
+            hint: None,
+        },
+        Err(msg) => CheckResult {
+            name: "db_backend_consistency",
+            status: CheckStatus::Fail,
+            detail: Some(msg),
+            hint: Some(
+                "Align every database role (database.url, primary_url, replica_url, shards) on a \
+                 single backend — this is exactly what the app validates at boot",
+            ),
+        },
+    }
+}
+
 fn check_db_role_connectivity(
     role: &'static str,
     database_url: &str,
@@ -5994,49 +6041,97 @@ pub fn run(opts: DoctorOptions) {
         Some(&merged_db_toml),
     )
     .is_ok_and(|shards| !shards.is_empty());
+    // Finding F27: the boot-time backend-consistency rule
+    // (`DatabaseConfig::validate`) must run as an UNCONDITIONAL doctor check,
+    // independent of which backend is the effective primary. The SQLite-only
+    // `sqlite_primary_target_is_bootable` gate below only fires for a SQLite
+    // effective primary, so its mirror image — a Postgres primary with a mismatched
+    // `sqlite://` legacy `database.url` (or a SQLite replica/shard) — slipped
+    // through: with the Postgres primary reachable, the per-role connectivity Pass
+    // greenlit a config the app rejects at boot. Compute the consistency verdict
+    // once, on every resolved role, and make it AUTHORITATIVE: when it Fails, the
+    // per-role connectivity Pass logic is withheld so a reachable primary can't
+    // contradict the mismatch (findings F26 sqlite-primary+pg-legacy AND F27
+    // pg-primary+sqlite-legacy, plus any role mismatch — replica, shards).
+    let backend_consistent = autumn_web::config::database_backend_consistency(
+        db_topology.legacy_url.as_deref(),
+        db_topology.primary_url.as_deref(),
+        db_topology.replica_url.as_deref(),
+        db_has_shards,
+    )
+    .is_ok();
+    // Only surface the check when a database is actually configured — a no-database
+    // app has nothing to be inconsistent about. Any configured role (legacy `url`,
+    // `primary_url`, `replica_url`, or shards) triggers it, so both mismatch
+    // directions and role mismatches are covered.
+    let db_configured = db_topology.primary_url.is_some()
+        || db_topology.legacy_url.is_some()
+        || db_topology.replica_url.is_some()
+        || db_has_shards;
+    if db_configured {
+        let legacy = db_topology.legacy_url.clone();
+        let primary = db_topology.primary_url.clone();
+        let replica = db_topology.replica_url.clone();
+        tasks.push(Box::new(move || {
+            check_database_backend_consistency(
+                legacy.as_deref(),
+                primary.as_deref(),
+                replica.as_deref(),
+                db_has_shards,
+            )
+        }));
+    }
+
     let sqlite_primary_bootable = sqlite_primary_target_is_bootable(
         db_topology.legacy_url.as_deref(),
         db_topology.primary_url.as_deref(),
         db_topology.replica_url.as_deref(),
         db_has_shards,
     );
-    if let Some(url) = db_topology.primary_url.clone() {
-        let primary_for_pending = url.clone();
-        let primary_is_sqlite = autumn_web::config::DatabaseBackend::detect(&url)
-            == Some(autumn_web::config::DatabaseBackend::Sqlite);
-        tasks.push(Box::new(move || {
-            check_db_connectivity(&url, sqlite_primary_bootable)
-        }));
-        // `check_pending_migrations` shells out to `diesel migration pending` and,
-        // when the CLI is absent, tells users to install `diesel_cli ... --features
-        // postgres` — a Postgres-specific warning / `--strict` failure that doesn't
-        // apply to a SQLite app. SQLite migration tracking is deferred to #1906, so
-        // emit an honest deferred note instead of the Postgres probe (finding F20),
-        // gated off the SAME profile-merged backend detection as the pg_client_tools
-        // skip and the connectivity check.
-        if primary_is_sqlite {
-            tasks.push(Box::new(check_pending_migrations_sqlite));
-        } else {
+    // Withhold per-role connectivity Pass/Fail logic for a backend-inconsistent
+    // config: the unconditional consistency FAIL above is the authoritative signal,
+    // and a reachable primary must not double-report a contradictory "reachable"
+    // Pass (finding F27, part 2). A backend-consistent config runs the ordinary
+    // connectivity/pending-migration probes unchanged.
+    if backend_consistent {
+        if let Some(url) = db_topology.primary_url.clone() {
+            let primary_for_pending = url.clone();
+            let primary_is_sqlite = autumn_web::config::DatabaseBackend::detect(&url)
+                == Some(autumn_web::config::DatabaseBackend::Sqlite);
             tasks.push(Box::new(move || {
-                check_pending_migrations(&primary_for_pending)
+                check_db_connectivity(&url, sqlite_primary_bootable)
+            }));
+            // `check_pending_migrations` shells out to `diesel migration pending` and,
+            // when the CLI is absent, tells users to install `diesel_cli ... --features
+            // postgres` — a Postgres-specific warning / `--strict` failure that doesn't
+            // apply to a SQLite app. SQLite migration tracking is deferred to #1906, so
+            // emit an honest deferred note instead of the Postgres probe (finding F20),
+            // gated off the SAME profile-merged backend detection as the pg_client_tools
+            // skip and the connectivity check.
+            if primary_is_sqlite {
+                tasks.push(Box::new(check_pending_migrations_sqlite));
+            } else {
+                tasks.push(Box::new(move || {
+                    check_pending_migrations(&primary_for_pending)
+                }));
+            }
+        }
+
+        if let Some(url) = db_topology.replica_url.clone() {
+            tasks.push(Box::new(move || {
+                check_db_role_connectivity("replica", &url, tcp_reachable, false)
             }));
         }
-    }
 
-    if let Some(url) = db_topology.replica_url.clone() {
-        tasks.push(Box::new(move || {
-            check_db_role_connectivity("replica", &url, tcp_reachable, false)
-        }));
-    }
-
-    if let (Some(primary_url), Some(replica_url)) = (
-        db_topology.primary_url.clone(),
-        db_topology.replica_url.clone(),
-    ) {
-        let fallback = db_topology.replica_fallback;
-        tasks.push(Box::new(move || {
-            check_replica_migrations(&primary_url, &replica_url, fallback)
-        }));
+        if let (Some(primary_url), Some(replica_url)) = (
+            db_topology.primary_url.clone(),
+            db_topology.replica_url.clone(),
+        ) {
+            let fallback = db_topology.replica_fallback;
+            tasks.push(Box::new(move || {
+                check_replica_migrations(&primary_url, &replica_url, fallback)
+            }));
+        }
     }
 
     // 6. Port bindable
@@ -13468,6 +13563,87 @@ foo = "bar"
         );
     }
 
+    /// Finding F27: the backend-consistency check is UNCONDITIONAL — it must Fail
+    /// a mismatched config whatever the effective primary backend, so a reachable
+    /// Postgres primary can't greenlight `doctor --strict` for a config
+    /// `DatabaseConfig::validate` rejects at boot. This is the mirror image of F26.
+    #[test]
+    fn backend_consistency_check_catches_mismatch_for_any_primary() {
+        // Signature: (legacy_url, primary_url, replica_url, has_shards).
+
+        // F27: Postgres primary + SQLite legacy `database.url` → mixed backends.
+        // The SQLite-only bootability gate never fires (primary is Postgres), so
+        // this unconditional check is what catches it.
+        let r = check_database_backend_consistency(
+            Some("sqlite://app.db"),
+            Some("postgres://db:5432/app"),
+            None,
+            false,
+        );
+        assert_eq!(
+            r.status,
+            CheckStatus::Fail,
+            "F27: pg primary + sqlite legacy"
+        );
+        assert!(
+            r.detail.unwrap_or_default().contains("backend"),
+            "the FAIL detail must explain the backend mismatch"
+        );
+
+        // F26 (mirror image): SQLite primary + Postgres legacy `database.url`.
+        let r = check_database_backend_consistency(
+            Some("postgres://db:5432/app"),
+            Some("sqlite://app.db"),
+            None,
+            false,
+        );
+        assert_eq!(
+            r.status,
+            CheckStatus::Fail,
+            "F26: sqlite primary + pg legacy"
+        );
+
+        // Replica mismatch: Postgres primary + SQLite replica → Fail.
+        let r = check_database_backend_consistency(
+            None,
+            Some("postgres://db:5432/app"),
+            Some("sqlite://replica.db"),
+            false,
+        );
+        assert_eq!(r.status, CheckStatus::Fail, "pg primary + sqlite replica");
+
+        // Shard mismatch: SQLite primary + shards → Fail.
+        let r = check_database_backend_consistency(None, Some("sqlite://app.db"), None, true);
+        assert_eq!(r.status, CheckStatus::Fail, "sqlite primary + shards");
+
+        // Clean all-Postgres (primary + replica, no mismatch) → Pass.
+        let r = check_database_backend_consistency(
+            None,
+            Some("postgres://db:5432/app"),
+            Some("postgres://replica:5432/app"),
+            false,
+        );
+        assert_eq!(r.status, CheckStatus::Pass, "clean all-postgres");
+
+        // Clean single SQLite primary (no legacy/replica/shards) → Pass.
+        let r = check_database_backend_consistency(None, Some("sqlite://app.db"), None, false);
+        assert_eq!(r.status, CheckStatus::Pass, "clean single sqlite");
+
+        // A redundant same-backend legacy `database.url` alongside the primary is
+        // consistent → Pass (both directions).
+        let r = check_database_backend_consistency(
+            Some("postgres://db:5432/app"),
+            Some("postgres://db:5432/app"),
+            None,
+            false,
+        );
+        assert_eq!(
+            r.status,
+            CheckStatus::Pass,
+            "redundant pg legacy == pg primary"
+        );
+    }
+
     /// Finding F23: `check_db_connectivity` must Fail (not Pass) for a `SQLite`
     /// primary that is not bootable because shards are present, mirroring
     /// `validate_backend_consistency`. The Fail detail names shards as a
@@ -13623,6 +13799,62 @@ foo = "bar"
                 false
             ),
             "a Postgres primary is not a SQLite target"
+        );
+    }
+
+    /// Finding F27, end-to-end through topology resolution: a config with a
+    /// Postgres `primary_url` and a mismatched legacy `sqlite://` `database.url`
+    /// must resolve BOTH roles from the merged table, and the unconditional
+    /// backend-consistency check must Fail — mirroring `DatabaseConfig::validate`,
+    /// which rejects this mixed-backend config at boot. Before F27 doctor collapsed
+    /// to the (reachable) Postgres primary and never validated the legacy `SQLite`
+    /// role, so `doctor --strict` could greenlight a config the app refuses to load.
+    #[test]
+    fn postgres_primary_with_mismatched_sqlite_legacy_url_fails_consistency() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("autumn.toml"),
+            "[database]\nprimary_url = \"postgres://db:5432/app\"\nurl = \"sqlite://app.db\"\n",
+        )
+        .unwrap();
+
+        let base = dir.path().to_path_buf();
+        let merged = get_merged_toml_table_runtime_with("prod", "prod", move |f| base.join(f));
+        let topology = resolve_database_topology_from_sources(|_| None, Some(&merged));
+
+        // The effective primary collapses to Postgres, but the legacy SQLite role
+        // must be threaded through so the consistency check can see the mismatch.
+        assert_eq!(
+            topology.primary_url.as_deref(),
+            Some("postgres://db:5432/app"),
+            "primary_url wins for the effective primary"
+        );
+        assert_eq!(
+            topology.legacy_url.as_deref(),
+            Some("sqlite://app.db"),
+            "the legacy database.url must be resolved separately for the mismatch check"
+        );
+
+        // The SQLite-only bootability gate does NOT fire (effective primary is
+        // Postgres) — this is exactly why F27 needs the unconditional check.
+        assert!(!sqlite_primary_target_is_bootable(
+            topology.legacy_url.as_deref(),
+            topology.primary_url.as_deref(),
+            topology.replica_url.as_deref(),
+            false,
+        ));
+
+        // The unconditional consistency check catches it.
+        let r = check_database_backend_consistency(
+            topology.legacy_url.as_deref(),
+            topology.primary_url.as_deref(),
+            topology.replica_url.as_deref(),
+            false,
+        );
+        assert_eq!(
+            r.status,
+            CheckStatus::Fail,
+            "F27: pg primary + sqlite legacy url must Fail the unconditional check"
         );
     }
 
