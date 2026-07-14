@@ -101,7 +101,13 @@
 //! it re-emits every submitted row (values + inline errors) and then appends
 //! at least one blank template row so a user can add a child **without any
 //! JavaScript** — the pre-rendered blank row's `items[n][…]` inputs post like
-//! any other. Supplying [`InputsForOptions::add_row_url`] additionally emits an
+//! any other. Because the browser submits that blank row's empty inputs, the
+//! decoder applies Rails-style `reject_if: :all_blank`: a child row whose every
+//! non-`_destroy` subfield is blank (empty or whitespace-only) is **ignored**
+//! entirely — never decoded, validated, or persisted — so the auto-rendered
+//! blank template row is safe with no JS and never becomes a phantom child that
+//! blocks submission (on a required-field child) or saves an empty row (on an
+//! all-optional child). Supplying [`InputsForOptions::add_row_url`] additionally emits an
 //! htmx "Add row" button (`hx-get` + `hx-swap="beforeend"`, with
 //! `hx-params="not _submit_token"` so the one-time submit token is not spent
 //! fetching the fragment); [`nested_row_fragment`] renders the server response
@@ -360,6 +366,16 @@ impl<P, C: NestedChild> NestedChangeset<P, C> {
 /// its row destroyed; destroyed rows are retained (for re-render) but never
 /// contribute to `valid_children`.
 ///
+/// Following Rails' `reject_if: :all_blank`, a child row whose every
+/// non-`_destroy` subfield value is blank (empty or whitespace-only after
+/// trimming) is **ignored**: it is not decoded, not validated, not retained in
+/// `rows`, and never counts toward `valid_children` — exactly as if that index
+/// had never been submitted. This is what makes the blank template row
+/// [`inputs_for`] auto-renders safe with no JavaScript. A row with at least one
+/// non-blank non-`_destroy` value is kept and validated as usual, so a
+/// partially filled row that omits a required field still surfaces per-field
+/// errors.
+///
 /// Both the parent and each non-destroyed child are decoded through the same
 /// blank-optional-dropping `serde_urlencoded` path
 /// [`ChangesetForm`](crate::form::ChangesetForm) uses, so string→typed
@@ -422,6 +438,22 @@ where
             } else {
                 decode_pairs.push((sub.clone(), val.clone()));
             }
+        }
+
+        // Rails `reject_if: :all_blank`: if every non-`_destroy` subfield value
+        // is blank (empty or whitespace-only after trimming), drop the row
+        // entirely. This is the auto-rendered blank template row `inputs_for`
+        // emits for the no-JS "add a child" path, not a real submitted child —
+        // treat it as if the index was never submitted: do not decode, do not
+        // validate, do not retain it, and do not count it toward the children.
+        // A row with at least one non-blank non-`_destroy` value is kept and
+        // validated as usual, so a partially filled row still surfaces its
+        // per-field errors. (`decode_pairs` already excludes `_destroy`, so an
+        // all-blank row that also carries `_destroy` is dropped here too — the
+        // same outcome as the destroy path.)
+        let all_blank = decode_pairs.iter().all(|(_, val)| val.trim().is_empty());
+        if all_blank {
+            continue;
         }
 
         let mut errors: HashMap<String, Vec<String>> = HashMap::new();
@@ -957,6 +989,13 @@ impl Default for InputsForOptions {
 /// `<div class="nested-fields__row" data-index="{i}">` so htmx/JS removal can
 /// target the node's `outerHTML`.
 ///
+/// The appended blank template row makes adding a child work with **no
+/// JavaScript**, and it is safe even though the browser submits its empty
+/// inputs: [`decode_nested_urlencoded`] applies Rails-style
+/// `reject_if: :all_blank`, so a child row whose every non-`_destroy` subfield
+/// is blank is ignored rather than decoded as a phantom child. An untouched
+/// blank row therefore never blocks submission or persists an empty child.
+///
 /// When [`InputsForOptions::add_row_url`] is `Some`, an "Add row"
 /// `<button type="button">` is emitted with `hx-get`, `hx-target="#{container_id}"`,
 /// `hx-swap="beforeend"`, and — critically — `hx-params="not _submit_token"` so the
@@ -1085,6 +1124,20 @@ mod tests {
 
     impl NestedChild for LineItem {
         const COLLECTION: &'static str = "items";
+    }
+
+    /// A child with one **required** field (`name`) and one **optional** field
+    /// (`nickname`), used to exercise the reject-all-blank rules.
+    #[derive(serde::Deserialize, validator::Validate)]
+    struct Contact {
+        #[validate(length(min = 1, message = "name required"))]
+        name: String,
+        #[validate(length(min = 1, message = "nickname too short"))]
+        nickname: Option<String>,
+    }
+
+    impl NestedChild for Contact {
+        const COLLECTION: &'static str = "contacts";
     }
 
     fn p(k: &str, v: &str) -> (String, String) {
@@ -1247,6 +1300,95 @@ mod tests {
         let pairs = vec![p("count", "not-a-number")];
         let result = decode_nested_urlencoded::<NumericParent, Child>(&pairs);
         assert!(result.is_err());
+    }
+
+    // ── reject_if: :all_blank ──────────────────────────────────────
+
+    /// The core regression test for the phantom-blank-row P1: `inputs_for`
+    /// always emits a trailing all-blank template row, and with no JS the
+    /// browser submits its empty inputs. That row must be ignored, not decoded
+    /// as a real (empty) child.
+    #[test]
+    fn all_blank_template_row_is_ignored() {
+        let pairs = vec![
+            p("name", "Order"),
+            // One filled, valid child row.
+            p("contacts[0][name]", "Alice"),
+            p("contacts[0][nickname]", "Al"),
+            // The auto-rendered blank template row: every subfield empty.
+            p("contacts[1][name]", ""),
+            p("contacts[1][nickname]", ""),
+        ];
+        let cs = decode_nested_urlencoded::<Order, Contact>(&pairs).expect("parent decodes");
+        assert!(cs.is_valid());
+        // The blank template row was dropped entirely — only the real row remains.
+        assert_eq!(cs.rows().len(), 1);
+        assert_eq!(cs.rows()[0].value("name"), Some("Alice"));
+
+        let (_order, contacts) = cs.into_valid().unwrap_or_else(|_| panic!("valid"));
+        assert_eq!(contacts.len(), 1);
+        assert_eq!(contacts[0].name, "Alice");
+    }
+
+    /// Blank detection trims: a row whose fields are whitespace-only (or empty)
+    /// is treated as blank and dropped.
+    #[test]
+    fn whitespace_only_row_is_ignored() {
+        let pairs = vec![
+            p("name", "Order"),
+            p("contacts[0][name]", "Bob"),
+            // Whitespace-only + empty: still all-blank after trimming.
+            p("contacts[1][name]", "   "),
+            p("contacts[1][nickname]", ""),
+        ];
+        let cs = decode_nested_urlencoded::<Order, Contact>(&pairs).expect("parent decodes");
+        assert!(cs.is_valid());
+        assert_eq!(cs.rows().len(), 1);
+        assert_eq!(cs.rows()[0].value("name"), Some("Bob"));
+
+        let (_order, contacts) = cs.into_valid().unwrap_or_else(|_| panic!("valid"));
+        assert_eq!(contacts.len(), 1);
+    }
+
+    /// A row with at least one non-blank value is a real child the user is
+    /// adding: it is kept and validated, so a missing **required** field still
+    /// surfaces a per-row error. We must not over-aggressively drop it.
+    #[test]
+    fn partially_filled_row_with_missing_required_still_errors() {
+        let pairs = vec![
+            p("name", "Order"),
+            // Required `name` left blank, but the optional `nickname` is filled,
+            // so the row is NOT all-blank: it is kept and must error.
+            p("contacts[0][name]", ""),
+            p("contacts[0][nickname]", "Ally"),
+        ];
+        let cs = decode_nested_urlencoded::<Order, Contact>(&pairs).expect("parent decodes");
+        assert!(!cs.is_valid());
+        assert_eq!(cs.rows().len(), 1);
+        // The kept row surfaces the required-field error under its combined key.
+        assert!(!cs.errors_for("contacts[0].name").is_empty());
+        // Raw values retained for re-render.
+        assert_eq!(cs.rows()[0].value("nickname"), Some("Ally"));
+        assert!(cs.into_valid().is_err());
+    }
+
+    /// A fully filled row is still bound — reject-all-blank does not regress the
+    /// happy path when every submitted row carries real values.
+    #[test]
+    fn fully_filled_row_is_still_bound() {
+        let pairs = vec![
+            p("name", "Order"),
+            p("contacts[0][name]", "Carol"),
+            p("contacts[0][nickname]", "Caz"),
+        ];
+        let cs = decode_nested_urlencoded::<Order, Contact>(&pairs).expect("parent decodes");
+        assert!(cs.is_valid());
+        assert_eq!(cs.rows().len(), 1);
+
+        let (_order, contacts) = cs.into_valid().unwrap_or_else(|_| panic!("valid"));
+        assert_eq!(contacts.len(), 1);
+        assert_eq!(contacts[0].name, "Carol");
+        assert_eq!(contacts[0].nickname.as_deref(), Some("Caz"));
     }
 
     #[test]
