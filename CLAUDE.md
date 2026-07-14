@@ -46,6 +46,22 @@ The default approach for new tests is to add them to the consolidated binary so 
    mod <test_name>;
    ```
 
+##### Docker / testcontainer DB tests run automatically in CI
+
+The CI "Run Docker-dependent tests" step (Linux) sweeps **all** `#[ignore]`d
+tests in the `autumn` consolidated `integration_tests` binary with
+`--features "test-support,offline-sync"` (a bare `--ignored` run), so a new
+house-pattern testcontainer DB test — `#[ignore = "requires Docker
+(testcontainers)"]` in a `db`-gated (or ungated) module — executes in CI with
+**no workflow edit**. Do not add a per-test allowlist line.
+
+If a new `#[ignore]`d test does **not** want a Postgres/Redis container (a
+browser/Chromium test, or a release-mode timing microbenchmark), it must be
+gated behind a non-default feature so it never compiles into this run — browser
+tests already live behind the `system-tests` feature — otherwise it will be
+swept in and fail. The one unconditionally-compiled exception (the access-log
+p99 timing bench) is named in the step's `--skip` list.
+
 #### 2. Isolated Integration Tests (Separate Binaries)
 
 Only create separate test binaries if the test:
