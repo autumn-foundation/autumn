@@ -218,7 +218,9 @@ pub struct NestedRow {
     /// inputs when re-rendering after a failed submission.
     values: HashMap<String, String>,
     /// Per-subfield validation (or parse) errors. A row that failed to parse
-    /// records its error under the empty-string key.
+    /// records its error under the offending subfield's name (via
+    /// `serde_path_to_error`), falling back to the empty-string (row-level) key
+    /// only when no field can be identified.
     errors: HashMap<String, Vec<String>>,
     /// `true` when the row carried a truthy `_destroy` marker.
     destroyed: bool,
@@ -477,9 +479,29 @@ where
                 }
             },
             Err(e) => {
-                // Row-level parse failure: keep raw values, record under the
-                // empty-string key so `errors_for("items[i]")` surfaces it.
-                errors.entry(String::new()).or_default().push(e.to_string());
+                // Row parse failure (deserialization failed before validation,
+                // e.g. `sku` filled but the required numeric `quantity` is
+                // malformed). `serde_path_to_error` already captured which
+                // subfield tripped the decode, so key the message under that
+                // subfield — it then surfaces as `items[i].{field}`, rendered by
+                // `errors_for("{field}")` next to the offending input rather than
+                // only under the row-level "" key. When no field can be
+                // identified (e.g. a missing required field reported at the row
+                // root, so the path is empty), fall back to the row-level ""
+                // key so the error is never silently dropped.
+                let field = e
+                    .path()
+                    .iter()
+                    .filter_map(|seg| match seg {
+                        serde_path_to_error::Segment::Map { key }
+                        | serde_path_to_error::Segment::Enum { variant: key } => Some(key.clone()),
+                        serde_path_to_error::Segment::Seq { .. }
+                        | serde_path_to_error::Segment::Unknown => None,
+                    })
+                    .next_back()
+                    .filter(|f| !f.is_empty())
+                    .unwrap_or_default();
+                errors.entry(field).or_default().push(e.to_string());
                 all_children_ok = false;
             }
         }
@@ -798,7 +820,21 @@ impl RowScope<'_> {
         self.text_like_input(sub, label, false)
     }
 
-    /// Like [`RowScope::text_input`] but adds `required` + `aria-required="true"`.
+    /// Like [`RowScope::text_input`] but adds `required` + `aria-required="true"`
+    /// — **only for real/submitted rows** (`self.row.is_some()`).
+    ///
+    /// A blank template row (`row: None`, the one [`inputs_for`] auto-appends
+    /// for the no-JS "add a child" path) deliberately renders the *same* input
+    /// **without** the client-side `required`/`aria-required` attributes so it
+    /// stays leaveable-empty. Otherwise the browser's native constraint
+    /// validation would block form submit on the empty trailing template row
+    /// *before* the server's all-blank rejection can run — a user who filled one
+    /// child row could not submit while a blank row sat beneath it. Required-ness
+    /// is still enforced server-side for any row the user actually engages: a
+    /// partially-filled row is retained as a `Some` row on re-render and
+    /// re-acquires `required`, and the decoder's all-blank rejection drops the
+    /// untouched template row. This composes with that all-blank rejection so
+    /// neither the client nor the server treats the template row as a real child.
     #[must_use]
     pub fn required_text_input(&self, sub: &str, label: &str) -> maud::Markup {
         self.text_like_input(sub, label, true)
@@ -806,6 +842,13 @@ impl RowScope<'_> {
 
     /// Shared body for the text-like inputs.
     fn text_like_input(&self, sub: &str, label: &str, required: bool) -> maud::Markup {
+        // Emit the client-side `required`/`aria-required` constraint only for a
+        // real/submitted row. A blank template row (`row: None`) must stay
+        // leaveable-empty so the browser does not block submit on the trailing
+        // auto-appended blank row before the server's all-blank rejection runs;
+        // server-side validation still enforces required-ness for any row the
+        // user actually fills (it is retained as a `Some` row on re-render).
+        let required = required && self.row.is_some();
         let errors = self.errors_for(sub);
         let has_errors = !errors.is_empty();
         let value = self.value(sub).unwrap_or_default();
@@ -995,6 +1038,15 @@ impl Default for InputsForOptions {
 /// `reject_if: :all_blank`, so a child row whose every non-`_destroy` subfield
 /// is blank is ignored rather than decoded as a phantom child. An untouched
 /// blank row therefore never blocks submission or persists an empty child.
+///
+/// So the no-JS path stays submittable, the appended blank template row's inputs
+/// omit the client-side `required`/`aria-required` constraint by design (see
+/// [`RowScope::required_text_input`]): a required-variant input renders empty and
+/// *leaveable* on a `row: None` template row, so the browser's native validation
+/// does not block submitting a form that still carries a trailing blank row.
+/// This composes with the decoder's all-blank rejection — the untouched template
+/// row is dropped server-side — while server-side validation still enforces
+/// required-ness for any row the user actually fills.
 ///
 /// When [`InputsForOptions::add_row_url`] is `Some`, an "Add row"
 /// `<button type="button">` is emitted with `hx-get`, `hx-target="#{container_id}"`,
@@ -1264,21 +1316,31 @@ mod tests {
     }
 
     #[test]
-    fn child_parse_failure_records_row_level_error() {
+    fn child_parse_failure_keys_error_to_offending_field() {
         let pairs = vec![
             p("name", "Order"),
+            // `sku` is filled, so the row is NOT all-blank (it is kept, not
+            // dropped) — contrast `all_blank_template_row_is_ignored`, where an
+            // empty row is dropped entirely with no error.
             p("items[0][sku]", "A"),
-            // Non-numeric quantity: hard parse failure for i32.
+            // Non-numeric quantity: hard parse failure for i32, before
+            // validation. `serde_path_to_error` attributes it to `quantity`.
             p("items[0][quantity]", "not-a-number"),
         ];
         let cs = decode_nested_urlencoded::<Order, LineItem>(&pairs).expect("parent decodes");
         assert!(!cs.is_valid());
         assert_eq!(cs.rows().len(), 1);
         // Raw values retained for re-render.
+        assert_eq!(cs.rows()[0].value("sku"), Some("A"));
         assert_eq!(cs.rows()[0].value("quantity"), Some("not-a-number"));
-        // Row-level error surfaced under the bare row key (empty subfield).
-        assert!(!cs.errors_for("items[0]").is_empty());
-        assert!(!cs.rows()[0].errors_for("").is_empty());
+        // The parse error is keyed to the offending subfield, so it renders next
+        // to the bad input via `errors_for("quantity")` on that row.
+        assert!(!cs.errors_for("items[0].quantity").is_empty());
+        assert!(!cs.rows()[0].errors_for("quantity").is_empty());
+        // It is NOT stored under the row-level "" key anymore.
+        assert!(cs.rows()[0].errors_for("").is_empty());
+        assert!(cs.errors_for("items[0]").is_empty());
+        assert!(cs.into_valid().is_err());
     }
 
     #[test]
@@ -1497,6 +1559,40 @@ mod maud_tests {
         assert!(html.contains(r#"data-index="1""#), "{html}");
         assert!(html.contains(r#"data-index="2""#), "{html}");
         assert!(html.contains(r#"name="items[2][sku]""#), "{html}");
+    }
+
+    /// Extract the full `<...>` tag containing the given `name="…"` attribute,
+    /// so a per-input attribute assertion isn't fooled by a sibling row's tag.
+    fn tag_with_name(html: &str, name: &str) -> String {
+        let needle = format!(r#"name="{name}""#);
+        let at = html
+            .find(&needle)
+            .unwrap_or_else(|| panic!("missing {name} in {html}"));
+        let open = html[..at].rfind('<').expect("tag has an opening '<'");
+        let close = html[at..].find('>').expect("tag has a closing '>'") + at;
+        html[open..=close].to_string()
+    }
+
+    /// Fix 1: a required-variant input on a submitted row carries the client-side
+    /// `required`/`aria-required` constraint, but the auto-appended blank template
+    /// row (`row: None`) omits it so the form stays submittable with a trailing
+    /// blank row present (server-side validation still enforces required-ness).
+    #[test]
+    fn blank_template_row_omits_client_required_but_submitted_row_keeps_it() {
+        let cs = two_row_changeset();
+        let opts = InputsForOptions::default();
+        let html = inputs_for(&cs, &opts, render_row).into_string();
+
+        // Submitted rows (indices 0, 1) keep the client-side constraint.
+        let submitted = tag_with_name(&html, "items[0][sku]");
+        assert!(submitted.contains(" required"), "{submitted}");
+        assert!(submitted.contains(r#"aria-required="true""#), "{submitted}");
+
+        // The appended blank template row (index 2) omits both, so it is
+        // leaveable-empty and does not block submitting the form.
+        let blank = tag_with_name(&html, "items[2][sku]");
+        assert!(!blank.contains("required"), "{blank}");
+        assert!(!blank.contains("aria-required"), "{blank}");
     }
 
     #[test]
