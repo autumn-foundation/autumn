@@ -587,7 +587,7 @@ where
 /// guarantee. And nothing new is reachable through this leniency: a client
 /// that wants a `#[serde(default)]` field to take its default value could
 /// already get that by omitting the key entirely.
-fn decode_urlencoded_dropping_blank_optional_fields<T: serde::de::DeserializeOwned>(
+pub(crate) fn decode_urlencoded_dropping_blank_optional_fields<T: serde::de::DeserializeOwned>(
     bytes: &[u8],
 ) -> Result<T, serde_path_to_error::Error<serde_urlencoded::de::Error>> {
     let mut pairs: Vec<(String, String)> = url::form_urlencoded::parse(bytes)
@@ -703,7 +703,9 @@ where
 
 // ── Internal helpers ───────────────────────────────────────────────
 
-fn validation_errors_to_map(errors: &validator::ValidationErrors) -> HashMap<String, Vec<String>> {
+pub(crate) fn validation_errors_to_map(
+    errors: &validator::ValidationErrors,
+) -> HashMap<String, Vec<String>> {
     let mut map = HashMap::new();
     collect_errors(errors, "", &mut map);
     map
