@@ -948,9 +948,27 @@ fn is_query_canceled(err: &diesel::result::Error) -> bool {
 
 /// Error type for pool creation failures.
 ///
-/// Alias for the deadpool `BuildError`. Returned by [`create_pool`] when
-/// the pool cannot be constructed (e.g., invalid max-size configuration).
-pub type PoolError = diesel_async::pooled_connection::deadpool::BuildError;
+/// Returned by [`create_pool`] (and the other topology builders) when a pool
+/// cannot be constructed. Historically this was a bare alias for deadpool's
+/// `BuildError`; it now also carries the boot-time refusal emitted for a
+/// recognized-but-not-yet-wired backend (`SQLite`, issue #1614), so callers fail
+/// fast at pool construction with an actionable message instead of at the first
+/// query. The [`Build`](PoolError::Build) variant delegates its `Display` to the
+/// underlying `BuildError`, so the Postgres path's error text is unchanged.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum PoolError {
+    /// The underlying deadpool builder failed (e.g., timeouts configured
+    /// without a runtime, or an invalid max-size configuration).
+    #[error(transparent)]
+    Build(#[from] diesel_async::pooled_connection::deadpool::BuildError),
+
+    /// A database backend that Autumn recognizes but whose runtime pool is not
+    /// available in this build was configured. See
+    /// [`DatabaseBackend`](crate::config::DatabaseBackend).
+    #[error("{0}")]
+    UnsupportedBackend(String),
+}
 
 /// Primary plus optional read-replica database pools.
 #[derive(Clone)]
@@ -1033,6 +1051,20 @@ fn build_pool(
     pool_size: usize,
     connect_timeout_secs: u64,
 ) -> Result<Pool<AsyncPgConnection>, PoolError> {
+    // A SQLite target is recognized (issue #1614) but the runtime pool that
+    // would serve it is not wired into this build yet — the pool below is a
+    // Postgres pool (`Pool<AsyncPgConnection>`). Refuse here, at pool-build
+    // (boot) time, with an actionable message so a SQLite misconfiguration
+    // fails fast rather than reaching a confusing first-query failure. The
+    // Postgres path is unchanged: a Postgres target skips this branch entirely.
+    if crate::config::DatabaseBackend::detect(url) == Some(crate::config::DatabaseBackend::Sqlite) {
+        return Err(PoolError::UnsupportedBackend(format!(
+            "SQLite is a recognized database backend but its runtime pool is not yet \
+             available in this build of autumn-web; follow \
+             https://github.com/madmax983/autumn/issues/1614 for status (target: {url:?})"
+        )));
+    }
+
     let timeout = Duration::from_secs(connect_timeout_secs);
     // When the URL's `sslmode` asks for TLS, plug a rustls-backed connector
     // into the pool via a custom setup callback — diesel-async's default
@@ -1049,12 +1081,12 @@ fn build_pool(
             AsyncDieselConnectionManager::<AsyncPgConnection>::new_with_config(url, config)
         }
     };
-    Pool::builder(manager)
+    Ok(Pool::builder(manager)
         .max_size(pool_size.max(1))
         .wait_timeout(Some(timeout))
         .create_timeout(Some(timeout))
         .runtime(deadpool::Runtime::Tokio1)
-        .build()
+        .build()?)
 }
 
 /// Create a connection pool from the database configuration.
@@ -3074,6 +3106,43 @@ mod tests {
         };
         let pool = create_pool(&config).expect("should build pool from valid config");
         assert!(pool.is_some());
+    }
+
+    #[test]
+    fn create_pool_with_sqlite_url_fails_fast() {
+        // SQLite is a recognized target (issue #1614) but its runtime pool is
+        // not wired yet, so pool construction must refuse at boot with an
+        // actionable message — never reaching a first-query failure or panic.
+        let config = DatabaseConfig {
+            url: Some("sqlite:///var/lib/app.db".into()),
+            ..Default::default()
+        };
+        // The Ok variant (`Option<Pool>`) is not `Debug`, so match rather than
+        // use `expect_err`.
+        let Err(err) = create_pool(&config) else {
+            panic!("sqlite target must refuse at pool build");
+        };
+        assert!(
+            matches!(err, PoolError::UnsupportedBackend(_)),
+            "expected UnsupportedBackend, got: {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("SQLite") && msg.contains("1614"),
+            "message must be actionable and point at the tracking issue, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn create_topology_with_sqlite_url_fails_fast() {
+        let config = DatabaseConfig {
+            primary_url: Some("sqlite::memory:".into()),
+            ..Default::default()
+        };
+        let Err(err) = create_topology(&config) else {
+            panic!("sqlite target must refuse at topology build");
+        };
+        assert!(matches!(err, PoolError::UnsupportedBackend(_)), "{err:?}");
     }
 
     #[test]
