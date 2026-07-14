@@ -390,11 +390,21 @@ fn scaffold_attachment_emits_zero_js_multipart_handlers() {
         routes.contains("mut multipart: autumn_web::extract::Multipart"),
         "{routes}"
     );
+    // Issue #1872 (codex P2, centralized): the whole multipart-parse-and-decode
+    // span runs inside one `async {…}.await` block whose `Err` is funneled through
+    // a single cleanup path, so each save is a plain `?` (its failure — and every
+    // other `?` in the span — is covered centrally, no per-line `match` wrapper).
     assert!(
-        routes.contains(".save_to_blob_store(&*store, key).await?"),
+        routes.contains(".save_to_blob_store(&*store, key).await?;"),
         "{routes}"
     );
     assert!(routes.contains("multipart.next_field().await?"), "{routes}");
+    // The parse span is wrapped in a single fallible block funneling every `?`
+    // (next_field, save, bytes_limited, utf8, decode_form) to one cleanup path.
+    assert!(
+        routes.contains("let __parse_result: AutumnResult<PhotoForm> = async {"),
+        "the multipart parse span must run inside a single cleanup-on-error block:\n{routes}"
+    );
     // Default path does not CALL the presign helper (the header note may still
     // mention it as an advanced opt-in), so match the invocation.
     assert!(!routes.contains("complete_direct_upload(&"), "{routes}");
@@ -491,4 +501,175 @@ fn generated_attachment_scaffold_cargo_checks() {
         &["caption:String", "image:Attachment"],
     );
     assert_project_cargo_checks(&project);
+}
+
+/// Issue #1872 (codex P2, centralized): the entire fallible parse span —
+/// `next_field()?`, each `save_to_blob_store()?`, `bytes_limited()?`, the UTF-8
+/// `map_err(…)?`, and `decode_form(…)?` — runs inside one `async {…}.await`
+/// block whose `Err` is funneled through a single cleanup path. So each save and
+/// the decode are plain `?` (no per-line `match`), and a malformed boundary /
+/// oversized text field / invalid UTF-8 arriving *after* a save is cleaned up
+/// too, not just the save and decode failures.
+fn assert_parse_span_centralized(routes: &str) {
+    assert!(
+        routes.contains("let __parse_result: AutumnResult<PhotoForm> = async {"),
+        "the parse span must run inside a single cleanup-on-error block:\n{routes}"
+    );
+    assert!(
+        routes.contains("let blob = field.save_to_blob_store(&*store, key).await?;"),
+        "the multipart save is a plain `?` covered by the central cleanup block:\n{routes}"
+    );
+    assert!(
+        routes.contains("let form = decode_form(Bytes::from(encoded))?;"),
+        "decode_form is a plain `?` covered by the central cleanup block:\n{routes}"
+    );
+    assert!(
+        routes.contains("while let Some(field) = multipart.next_field().await? {"),
+        "next_field must be a `?` inside the covered parse block:\n{routes}"
+    );
+    assert!(
+        routes.contains("let value = String::from_utf8(field.bytes_limited().await?)"),
+        "bytes_limited must be a `?` inside the covered parse block:\n{routes}"
+    );
+    // The block's single `Err` arm runs the cleanup then re-returns the exact
+    // error the `?` produced, preserving the original error->response mapping.
+    assert!(
+        routes.contains("let form = match __parse_result {") && routes.contains("Err(err) => {"),
+        "the parse block funnels every `?` failure through one cleanup+return:\n{routes}"
+    );
+}
+
+/// Issue #1872: the create/update handlers stream each uploaded file to the
+/// blob store *during* multipart parsing — before changeset validation and the
+/// DB write. Every early return after that save (invalid changeset,
+/// unique-violation 422, `into_new` parse failure, generic DB `Err`, the
+/// update's row-load and not-found guard) must best-effort delete the
+/// just-saved blob so an ordinary invalid submission doesn't orphan its upload.
+/// The success path must *not* delete, and a preserved existing blob
+/// (`current.<field>`) is never touched — only the freshly-saved
+/// `<field>_blob`, recorded via `saved_blob_keys`, is cleaned up.
+#[test]
+fn scaffold_attachment_cleans_up_saved_blob_on_early_return() {
+    // `email:String:unique` gives us the unique-violation 422 branch too, so all
+    // four create early returns and all of the update early returns are present.
+    let (_tmp, project) = scaffold_project(
+        "attach-cleanup-app",
+        "Photo",
+        &["caption:String", "image:Attachment", "email:String:unique"],
+    );
+    let routes = fs::read_to_string(project.join("src/routes/photos.rs")).unwrap();
+
+    // Only the freshly-saved blob keys are recorded for cleanup; preserved
+    // existing blobs are never enrolled.
+    assert!(
+        routes.contains("let mut saved_blob_keys: Vec<String> = Vec::new();"),
+        "{routes}"
+    );
+    assert!(
+        routes.contains("saved_blob_keys.push(blob.key.clone());"),
+        "{routes}"
+    );
+    // The cleanup snippet best-effort deletes each saved blob, ignoring the
+    // result so a cleanup failure never masks the original error/response.
+    assert!(
+        routes.contains("for key in &saved_blob_keys {")
+            && routes.contains("let _ = store.delete(key).await;"),
+        "{routes}"
+    );
+
+    assert_parse_span_centralized(&routes);
+
+    let create = handler_body(&routes, "pub async fn create(", "pub async fn update(");
+
+    // `saved_blob_keys` is declared *before* the parse span (outside the `async`
+    // block, so the block borrows it mutably and the post-block cleanup can read
+    // it), and the push happens at save-time — both before `decode_form(`.
+    let decl_at = create
+        .find("let mut saved_blob_keys: Vec<String> = Vec::new();")
+        .unwrap_or_else(|| panic!("missing saved_blob_keys decl in create:\n{create}"));
+    let parse_at = create
+        .find("let __parse_result: AutumnResult<PhotoForm> = async {")
+        .unwrap_or_else(|| panic!("missing parse block in create:\n{create}"));
+    assert!(
+        decl_at < parse_at,
+        "saved_blob_keys must be declared before the parse span in create:\n{create}"
+    );
+    let push_at = create
+        .find("saved_blob_keys.push(blob.key.clone());")
+        .unwrap_or_else(|| panic!("missing saved_blob_keys.push in create:\n{create}"));
+    let decode_at = create
+        .find("decode_form(")
+        .unwrap_or_else(|| panic!("missing decode_form( in create:\n{create}"));
+    assert!(
+        push_at < decode_at,
+        "saved_blob_keys must be populated before decode_form in create:\n{create}"
+    );
+    // Split create at the success tail: everything up to `flash.success` is the
+    // early-return region, everything after is the success path.
+    let create_success_at = create
+        .find("flash.success(\"Photo created\")")
+        .unwrap_or_else(|| panic!("missing create success in:\n{create}"));
+    let (create_early, create_success) = create.split_at(create_success_at);
+
+    // Cleanup guards every create early return that can occur after the first
+    // blob is saved. Codex P2 centralized the parse span: the mid-loop save
+    // failure, `next_field`, `bytes_limited`, the UTF-8 conversion, and
+    // `decode_form` on malformed scalar input all funnel through ONE cleanup
+    // inside the parse block — so those five formerly-separate (and two
+    // previously-uncovered) returns collapse to a single `store.delete` loop. The
+    // four post-parse returns keep their own cleanup: validation 422, `into_new`
+    // parse failure, the unique-violation 422, and the generic DB `Err`.
+    assert_eq!(
+        create_early
+            .matches("let _ = store.delete(key).await;")
+            .count(),
+        5,
+        "create must clean up the saved blob on all five early-return sites \
+         (one central parse-span cleanup covering save/next_field/bytes_limited/utf8/decode_form, \
+         plus validation, into_new, unique-violation, DB error):\n{create}"
+    );
+    // The success path must NOT delete the blob it just persisted.
+    assert!(
+        !create_success.contains("store.delete("),
+        "create success path must not delete the persisted blob:\n{create_success}"
+    );
+
+    let update = handler_body(&routes, "pub async fn update(", "pub async fn destroy(");
+    let update_success_at = update
+        .find("flash.success(\"Photo updated\")")
+        .unwrap_or_else(|| panic!("missing update success in:\n{update}"));
+    let (update_early, update_success) = update.split_at(update_success_at);
+    // Cleanup guards every update early return that can occur after the first
+    // blob is saved. Codex P2 centralized the parse span: the mid-loop save
+    // failure, `next_field`, `bytes_limited`, the UTF-8 conversion, and
+    // `decode_form` collapse to ONE cleanup inside the parse block. The six
+    // post-parse returns keep their own cleanup: validation 422, the current-row
+    // load, `into_new`, the unique-violation 422, the generic DB `Err`, and the
+    // not-found (`updated == 0`) guard.
+    assert_eq!(
+        update_early
+            .matches("let _ = store.delete(key).await;")
+            .count(),
+        7,
+        "update must clean up the saved blob on all seven early-return sites \
+         (one central parse-span cleanup, plus validation, current-row load, into_new, \
+         unique-violation, DB error, not-found):\n{update}"
+    );
+    assert!(
+        !update_success.contains("store.delete("),
+        "update success path must not delete the persisted blob:\n{update_success}"
+    );
+
+    // The preserve-on-update bind is untouched: only `image_blob` (the freshly
+    // saved upload) is ever deleted, never the preserved `current.image`.
+    assert!(
+        routes.contains("new.image = image_blob.or(current.image);"),
+        "{routes}"
+    );
+
+    // A plain (non-attachment) scaffold gets none of the cleanup machinery.
+    let (_tmp2, plain) = scaffold_project("plain-cleanup-app", "Article", &["title:String"]);
+    let plain_routes = fs::read_to_string(plain.join("src/routes/articles.rs")).unwrap();
+    assert!(!plain_routes.contains("saved_blob_keys"), "{plain_routes}");
+    assert!(!plain_routes.contains("store.delete("), "{plain_routes}");
 }

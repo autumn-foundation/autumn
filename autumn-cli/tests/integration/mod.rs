@@ -2,6 +2,7 @@ mod api_scaffold;
 mod cloud_native_scaffold;
 mod db;
 mod db_pull;
+mod deploy;
 mod generate_references_postgres;
 mod generate_tauri_mobile;
 mod generate_tauri_mobile_offline;

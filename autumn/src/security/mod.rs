@@ -161,6 +161,9 @@ pub use config::{
 };
 #[cfg(feature = "redis")]
 pub use config::{RateLimitBackendFailure, RateLimitRedisConfig};
+// Exposed for autumn-cli's `autumn deploy` preflight to reuse the single source of truth for signing-secret validation; not yet a stable public API (may be promoted deliberately later).
+#[doc(hidden)]
+pub use config::{SigningSecretError, validate_signing_secret};
 pub use csrf::{CsrfFormField, CsrfLayer, CsrfToken, CsrfTokenHeader};
 pub use headers::{CspNonce, SecurityHeadersLayer};
 pub use proxy::TrustedProxy;
