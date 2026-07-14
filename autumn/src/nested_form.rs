@@ -481,26 +481,22 @@ where
             Err(e) => {
                 // Row parse failure (deserialization failed before validation,
                 // e.g. `sku` filled but the required numeric `quantity` is
-                // malformed). `serde_path_to_error` already captured which
-                // subfield tripped the decode, so key the message under that
-                // subfield — it then surfaces as `items[i].{field}`, rendered by
-                // `errors_for("{field}")` next to the offending input rather than
-                // only under the row-level "" key. When no field can be
-                // identified (e.g. a missing required field reported at the row
-                // root, so the path is empty), fall back to the row-level ""
-                // key so the error is never silently dropped.
-                let field = e
-                    .path()
-                    .iter()
-                    .filter_map(|seg| match seg {
-                        serde_path_to_error::Segment::Map { key }
-                        | serde_path_to_error::Segment::Enum { variant: key } => Some(key.clone()),
-                        serde_path_to_error::Segment::Seq { .. }
-                        | serde_path_to_error::Segment::Unknown => None,
-                    })
-                    .next_back()
-                    .filter(|f| !f.is_empty())
-                    .unwrap_or_default();
+                // malformed or present-but-blank). Key the message under the
+                // offending subfield so it surfaces as `items[i].{field}`,
+                // rendered by `errors_for("{field}")` next to the offending
+                // input rather than only under the row-level "" key.
+                //
+                // The blank-optional retry inside
+                // `decode_urlencoded_dropping_blank_optional_fields` can DROP a
+                // present-but-blank typed field (`quantity=`) before serde sees
+                // it, so the primary error is then `missing field \`quantity\``
+                // reported at the ROW ROOT with an empty path — losing the field
+                // name the row helpers need. `recover_child_error_field` layers a
+                // raw (non-dropping) re-decode and a message parse on top of the
+                // primary path to recover it; see that helper. Only if all layers
+                // fail does it fall back to the row-level "" key, so the error is
+                // never silently dropped.
+                let field = recover_child_error_field::<C>(&e, &decode_pairs);
                 errors.entry(field).or_default().push(e.to_string());
                 all_children_ok = false;
             }
@@ -575,6 +571,84 @@ fn encode_pairs(pairs: &[(String, String)]) -> String {
     url::form_urlencoded::Serializer::new(String::new())
         .extend_pairs(pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())))
         .finish()
+}
+
+/// Last `Map`/`Enum` key in a `serde_path_to_error` path, if any is non-empty.
+///
+/// This is the subfield the decode failure is attributed to (e.g. `quantity`
+/// for `items[i][quantity]`). `Seq`/`Unknown` segments carry no field name.
+fn last_path_field(path: &serde_path_to_error::Path) -> Option<String> {
+    path.iter()
+        .filter_map(|seg| match seg {
+            serde_path_to_error::Segment::Map { key }
+            | serde_path_to_error::Segment::Enum { variant: key } => Some(key.clone()),
+            serde_path_to_error::Segment::Seq { .. } | serde_path_to_error::Segment::Unknown => {
+                None
+            }
+        })
+        .next_back()
+        .filter(|f| !f.is_empty())
+}
+
+/// Extract the field name from serde's stable "missing field" message — the
+/// backtick-quoted identifier in [`serde::de::Error::missing_field`]'s
+/// `Display` format — if present.
+fn missing_field_name(msg: &str) -> Option<String> {
+    let after = msg.split_once("missing field `")?.1;
+    let name = after.split_once('`')?.0;
+    (!name.is_empty()).then(|| name.to_owned())
+}
+
+/// Recover the offending subfield name for a child-row parse failure so the
+/// error can be keyed to `items[i].{field}` (rendered next to the input) rather
+/// than only under the row-level "" key.
+///
+/// Layered because the blank-optional retry inside
+/// [`decode_urlencoded_dropping_blank_optional_fields`] can DROP a
+/// present-but-blank typed field (`quantity=`) before serde ever sees it, so
+/// the primary decode reports a root-level missing-field error for `quantity`
+/// with an empty path — losing the field name the row helpers need:
+///
+/// 1. The primary decode's `serde_path_to_error` path (last `Map`/`Enum` key).
+///    For a malformed non-blank value (`quantity=abc`) this already yields the
+///    field, since that pair is never dropped.
+/// 2. If empty, a raw re-decode over the ORIGINAL row pairs with blanks
+///    RETAINED (no dropping), mirroring the shared helper's deserializer minus
+///    the drop loop. For a present-but-blank typed field serde now fails
+///    parsing `""` AT `.quantity`, recovering the field.
+/// 3. If still empty (a field truly never submitted), the backtick-quoted
+///    identifier in serde's missing-field message.
+/// 4. Otherwise `""` (row-level key) so the error is never silently dropped.
+///
+/// This runs ONLY on the already-failed path to LOCATE the field; it does not
+/// affect the success path. Legitimately-blank optional fields still decode to
+/// `None` via the primary blank-dropping decode, which succeeds for them and
+/// never reaches here.
+fn recover_child_error_field<C: serde::de::DeserializeOwned>(
+    primary: &serde_path_to_error::Error<serde_urlencoded::de::Error>,
+    decode_pairs: &[(String, String)],
+) -> String {
+    // 1. Primary decode path.
+    if let Some(field) = last_path_field(primary.path()) {
+        return field;
+    }
+
+    // 2. Raw (non-dropping) re-decode over the original row pairs.
+    let encoded = encode_pairs(decode_pairs);
+    let deserializer =
+        serde_urlencoded::Deserializer::new(url::form_urlencoded::parse(encoded.as_bytes()));
+    if let Err(raw_err) = serde_path_to_error::deserialize::<_, C>(deserializer) {
+        if let Some(field) = last_path_field(raw_err.path()) {
+            return field;
+        }
+        // 3. Parse serde's stable `missing field \`X\`` message.
+        if let Some(field) = missing_field_name(&raw_err.to_string()) {
+            return field;
+        }
+    }
+
+    // 4. Row-level key.
+    String::new()
 }
 
 /// Whether a `_destroy` marker value counts as "destroy this row".
@@ -1341,6 +1415,68 @@ mod tests {
         assert!(cs.rows()[0].errors_for("").is_empty());
         assert!(cs.errors_for("items[0]").is_empty());
         assert!(cs.into_valid().is_err());
+    }
+
+    #[test]
+    fn child_parse_failure_on_blank_typed_field_keys_error_to_field() {
+        // The Codex case: a row with `sku` filled but the required TYPED
+        // `quantity` present-but-blank. The blank-optional retry inside
+        // `decode_urlencoded_dropping_blank_optional_fields` DROPS the blank
+        // `quantity=` pair, so serde reports `missing field \`quantity\`` at the
+        // ROW ROOT (empty path). The field-recovery re-decode over the original
+        // (blank-retained) pairs must still key the error to `quantity` so it
+        // renders next to the blank input rather than the row-level "" key.
+        let pairs = vec![
+            p("name", "Order"),
+            p("items[0][sku]", "A"),
+            p("items[0][quantity]", ""),
+        ];
+        let cs = decode_nested_urlencoded::<Order, LineItem>(&pairs).expect("parent decodes");
+        assert!(!cs.is_valid());
+        assert_eq!(cs.rows().len(), 1);
+        // Keyed to the offending subfield, so it renders next to the blank input.
+        assert!(!cs.errors_for("items[0].quantity").is_empty());
+        assert!(!cs.rows()[0].errors_for("quantity").is_empty());
+        // NOT stored under the row-level "" / `items[0]` key.
+        assert!(cs.rows()[0].errors_for("").is_empty());
+        assert!(cs.errors_for("items[0]").is_empty());
+        assert!(cs.into_valid().is_err());
+    }
+
+    #[test]
+    fn child_row_with_blank_optional_typed_field_still_decodes_valid() {
+        // Regression guard for the fix: a row with the required field filled and
+        // an OPTIONAL TYPED field present-but-blank (`weight=`) must still decode
+        // to a VALID row. The primary blank-dropping decode drops the blank
+        // `weight=` pair so it resolves to `None` and the decode SUCCEEDS — the
+        // field-recovery re-decode (which runs only on the failed path) is never
+        // reached, and the row must stay valid.
+        #[derive(serde::Deserialize, validator::Validate)]
+        struct Widget {
+            #[validate(length(min = 1, message = "label required"))]
+            label: String,
+            // Typed optional: a blank submission is dropped to `None` by the
+            // blank-optional decode (an empty string is not a valid `i32`).
+            weight: Option<i32>,
+        }
+        impl NestedChild for Widget {
+            const COLLECTION: &'static str = "widgets";
+        }
+
+        let pairs = vec![
+            p("name", "Order"),
+            p("widgets[0][label]", "Bolt"),
+            p("widgets[0][weight]", ""),
+        ];
+        let cs = decode_nested_urlencoded::<Order, Widget>(&pairs).expect("parent decodes");
+        assert!(cs.is_valid());
+        assert_eq!(cs.rows().len(), 1);
+        assert!(cs.errors_for("widgets[0].weight").is_empty());
+        assert!(cs.rows()[0].errors_for("weight").is_empty());
+        let (_order, widgets) = cs.into_valid().unwrap_or_else(|_| panic!("valid"));
+        assert_eq!(widgets.len(), 1);
+        assert_eq!(widgets[0].label, "Bolt");
+        assert_eq!(widgets[0].weight, None);
     }
 
     #[test]
