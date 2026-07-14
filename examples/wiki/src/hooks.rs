@@ -56,16 +56,11 @@ impl MutationHooks for PageHooks {
             draft.after.slug = slugify(&draft.after.title);
         }
 
-        // Enforce state machine transitions; returns 400 for invalid edges or
-        // when the can_publish guard rejects draft -> published.
-        // Evaluate guards against the proposed (after) content by cloning the
-        // new record and restoring the current status, so can_publish sees the
-        // title/body the user is submitting, not the old values.
-        if draft.after.status != draft.before.status {
-            let mut proposed = draft.after.clone();
-            proposed.status = draft.before.status.clone();
-            proposed.transition_status_to(&draft.after.status)?;
-        }
+        // State-machine transitions are no longer enforced here: status changes
+        // flow through the dedicated `POST /pages/{slug}/transitions/status`
+        // route, which calls the macro-generated `Page::transition_status_to`.
+        // The edit form only edits title/body, so `draft.after.status` always
+        // equals `draft.before.status` on this path.
 
         // Maintain the published-page content invariant even when status is
         // unchanged; an edit that clears title/body on an already-published
@@ -183,78 +178,65 @@ mod tests {
         assert!(err.to_string().contains("3"));
     }
 
-    #[tokio::test]
-    async fn test_before_update_allows_valid_status_transition() {
-        let hooks = PageHooks;
-        let mut ctx = MutationContext::new(MutationOp::Update);
-        let before = Page {
+    fn page_with(status: &str, body: &str) -> Page {
+        Page {
             id: 1,
             title: "My Page".into(),
             slug: "my-page".into(),
-            body: "Some content".into(),
-            status: "draft".into(),
+            body: body.into(),
+            status: status.into(),
             lock_version: 0,
             created_at: Utc::now().naive_utc(),
             updated_at: Utc::now().naive_utc(),
-        };
-        let mut after = before.clone();
-        after.status = "published".into();
-
-        let mut draft = UpdateDraft { before, after };
-        hooks.before_update(&mut ctx, &mut draft).await.unwrap();
-
-        assert_eq!(draft.after.status, "published");
+        }
     }
 
-    #[tokio::test]
-    async fn test_before_update_rejects_invalid_status_transition() {
-        let hooks = PageHooks;
-        let mut ctx = MutationContext::new(MutationOp::Update);
-        let before = Page {
-            id: 1,
-            title: "My Page".into(),
-            slug: "my-page".into(),
-            body: "Some content".into(),
-            status: "published".into(),
-            lock_version: 0,
-            created_at: Utc::now().naive_utc(),
-            updated_at: Utc::now().naive_utc(),
-        };
-        let mut after = before.clone();
-        after.status = "draft".into(); // published -> draft is not a defined edge
-
-        let mut draft = UpdateDraft { before, after };
-        let result = hooks.before_update(&mut ctx, &mut draft).await;
-
-        assert!(result.is_err());
+    #[test]
+    fn transition_status_to_allows_draft_to_published() {
+        // draft -> published is a defined edge and the can_publish guard passes
+        // on non-empty content. Enforcement now lives in the macro-generated
+        // state machine, exercised by the transitions route.
+        let page = page_with("draft", "Some content");
+        assert!(page.can_transition_status_to("published"));
+        assert_eq!(page.transition_status_to("published").unwrap(), "published");
     }
 
-    #[tokio::test]
-    async fn test_before_update_guard_sees_proposed_content() {
-        // Updating status AND clearing body in the same request must be rejected —
-        // the guard should evaluate the body being submitted, not the old body.
-        let hooks = PageHooks;
-        let mut ctx = MutationContext::new(MutationOp::Update);
-        let before = Page {
-            id: 1,
-            title: "My Page".into(),
-            slug: "my-page".into(),
-            body: "Has content".into(),
-            status: "draft".into(),
-            lock_version: 0,
-            created_at: Utc::now().naive_utc(),
-            updated_at: Utc::now().naive_utc(),
-        };
-        let mut after = before.clone();
-        after.status = "published".into();
-        after.body = String::new(); // clearing body in the same update
+    #[test]
+    fn transition_status_to_allows_published_to_archived() {
+        // published -> archived is an unguarded defined edge, completing the
+        // draft -> published -> archived chain.
+        let page = page_with("published", "Some content");
+        assert!(page.can_transition_status_to("archived"));
+        assert_eq!(page.transition_status_to("archived").unwrap(), "archived");
+    }
 
-        let mut draft = UpdateDraft { before, after };
-        let result = hooks.before_update(&mut ctx, &mut draft).await;
+    #[test]
+    fn transition_status_to_rejects_invalid_edge() {
+        // published -> draft is not a defined edge, so the state machine rejects
+        // it with a 400.
+        let page = page_with("published", "Some content");
+        assert!(!page.can_transition_status_to("draft"));
+        assert!(page.transition_status_to("draft").is_err());
+    }
 
+    #[test]
+    fn transition_status_to_guard_rejects_publishing_empty_body() {
+        // The can_publish guard blocks draft -> published when body is empty.
+        let page = page_with("draft", "");
+        assert!(!page.can_transition_status_to("published"));
         assert!(
-            result.is_err(),
+            page.transition_status_to("published").is_err(),
             "guard must reject publishing with empty body"
+        );
+    }
+
+    #[test]
+    fn transition_status_to_guard_rejects_whitespace_only_body() {
+        // Whitespace-only body is treated as empty by the can_publish guard.
+        let page = page_with("draft", "   ");
+        assert!(
+            page.transition_status_to("published").is_err(),
+            "guard must reject publishing with whitespace-only body"
         );
     }
 
@@ -334,32 +316,6 @@ mod tests {
         assert!(
             result.is_err(),
             "creating a page with status=archived must fail"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_before_update_rejects_whitespace_only_publish() {
-        let hooks = PageHooks;
-        let mut ctx = MutationContext::new(MutationOp::Update);
-        let before = Page {
-            id: 1,
-            title: "My Page".into(),
-            slug: "my-page".into(),
-            body: "Some content".into(),
-            status: "draft".into(),
-            lock_version: 0,
-            created_at: Utc::now().naive_utc(),
-            updated_at: Utc::now().naive_utc(),
-        };
-        let mut after = before.clone();
-        after.status = "published".into();
-        after.body = "   ".into(); // whitespace-only
-
-        let mut draft = UpdateDraft { before, after };
-        let result = hooks.before_update(&mut ctx, &mut draft).await;
-        assert!(
-            result.is_err(),
-            "guard must reject publishing with whitespace-only body"
         );
     }
 
