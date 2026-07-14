@@ -169,6 +169,17 @@ pub fn plan_model_with_options(
     if backend == autumn_web::config::DatabaseBackend::Sqlite {
         super::reject_sqlite_unsupported_field_kinds(&fields)?;
     }
+    // Sharding (`--sharded`) emits a `#[shard_key]` model plus (via scaffold)
+    // `ShardedDb` routes/migrations that require a `[[database.shards]]`
+    // topology, which `DatabaseConfig::validate_backend_consistency` rejects for
+    // a SQLite primary — so no valid SQLite config could use the generated
+    // resource. SQLite is single-host/single-writer, so this is a PERMANENT
+    // constraint (Postgres-only), not a deferred slice. Reject at generate time
+    // rather than emit a resource no SQLite app can boot (AC #4). `generate
+    // scaffold --sharded` routes through here too, so this one gate covers both.
+    if backend == autumn_web::config::DatabaseBackend::Sqlite && options.sharded {
+        return Err(super::sqlite_sharded_unsupported_error());
+    }
 
     let snake_name = snake(name);
     let table = pluralize(&snake_name);
@@ -2895,6 +2906,86 @@ mod tests {
                 up.contains("id INTEGER PRIMARY KEY AUTOINCREMENT"),
                 "up.sql: {up}"
             );
+        });
+    }
+
+    /// A `--sharded` model on a `SQLite` app is rejected at generate time as
+    /// Postgres-only (issue #1614 AC #4): a sharded resource needs a
+    /// `[[database.shards]]` topology, which config validation rejects for a
+    /// `SQLite` primary, so no valid `SQLite` config could use it. Unlike FTS /
+    /// UUID / unsupported field kinds this is a PERMANENT constraint, so the
+    /// message must NOT cite a "coming soon" issue.
+    #[test]
+    fn sharded_on_sqlite_app_is_rejected_as_postgres_only() {
+        with_no_db_env(|| {
+            let tmp = project_with_db_url("sqlite://app.db");
+            let err = plan_model_with_options(
+                tmp.path(),
+                "Post",
+                &["title:String".into(), "tenant_id:i64".into()],
+                "20260427000000",
+                &ModelOptions {
+                    sharded: true,
+                    shard_key: Some("tenant_id".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                matches!(err, GenerateError::Config(_)),
+                "expected Config error, got: {err:?}"
+            );
+            assert!(
+                msg.contains("Postgres") && msg.contains("--sharded"),
+                "message must point at the Postgres backend requirement: {msg}"
+            );
+            assert!(
+                msg.contains("single-writer"),
+                "message must convey the permanent single-host/single-writer constraint: {msg}"
+            );
+            assert!(
+                !msg.contains("issues/"),
+                "sharding is permanent, not deferred — must not cite a coming-soon issue: {msg}"
+            );
+        });
+    }
+
+    /// The default (non-sharded) `generate model` path is unaffected on a
+    /// `SQLite` app — only `--sharded` is gated.
+    #[test]
+    fn non_sharded_sqlite_model_still_works() {
+        with_no_db_env(|| {
+            let tmp = project_with_db_url("sqlite://app.db");
+            plan_model_with_options(
+                tmp.path(),
+                "Post",
+                &["title:String".into()],
+                "20260427000000",
+                &ModelOptions::default(),
+            )
+            .expect("non-sharded SQLite model must still generate");
+        });
+    }
+
+    /// Regression guard: a `--sharded` model on a Postgres app is unchanged —
+    /// the sharded gate is SQLite-only.
+    #[test]
+    fn postgres_app_sharded_model_is_unchanged() {
+        with_no_db_env(|| {
+            let tmp = project_with_db_url("postgres://localhost/app");
+            plan_model_with_options(
+                tmp.path(),
+                "Post",
+                &["title:String".into(), "tenant_id:i64".into()],
+                "20260427000000",
+                &ModelOptions {
+                    sharded: true,
+                    shard_key: Some("tenant_id".into()),
+                    ..Default::default()
+                },
+            )
+            .expect("sharded model must still generate on Postgres");
         });
     }
 

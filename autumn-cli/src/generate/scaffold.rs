@@ -9842,6 +9842,46 @@ async fn main() {
         );
     }
 
+    /// `generate scaffold --sharded` on a `SQLite` app is rejected via the
+    /// shared `plan_model_with_options` gate (issue #1614 AC #4) — sharding is
+    /// permanently Postgres-only, so scaffold must refuse it the same way the
+    /// model generator does. Proves one gate covers both entry points.
+    #[test]
+    fn scaffold_sharded_on_sqlite_app_is_rejected_as_postgres_only() {
+        temp_env::with_vars(
+            [
+                ("AUTUMN_DATABASE__PRIMARY_URL", None::<&str>),
+                ("AUTUMN_DATABASE__URL", None::<&str>),
+                ("DATABASE_URL", None::<&str>),
+            ],
+            || {
+                let tmp = project_with_main(default_main());
+                fs::write(
+                    tmp.path().join("autumn.toml"),
+                    "[database]\nprimary_url = \"sqlite://app.db\"\n",
+                )
+                .unwrap();
+                let err = plan_scaffold_with_options(
+                    tmp.path(),
+                    "Account",
+                    &["tenant_id:i64".into(), "name:String".into()],
+                    "20260427000000",
+                    &sharded_options_with_key("tenant_id"),
+                )
+                .unwrap_err();
+                let msg = err.to_string();
+                assert!(
+                    matches!(err, GenerateError::Config(_)),
+                    "expected Config error, got: {err:?}"
+                );
+                assert!(
+                    msg.contains("Postgres") && msg.contains("--sharded"),
+                    "scaffold --sharded on SQLite must be rejected as Postgres-only: {msg}"
+                );
+            },
+        );
+    }
+
     #[test]
     fn routes_use_db_when_not_sharded() {
         let tmp = project_with_main(default_main());

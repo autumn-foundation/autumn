@@ -140,6 +140,33 @@ pub fn sqlite_uuid_pk_unsupported_error() -> GenerateError {
     )
 }
 
+/// The generate-time rejection for a sharded model (`--sharded`) on a
+/// `SQLite`-backed app (`SQLite` foundation, issue #1614 AC #4).
+///
+/// `--sharded` emits a `#[shard_key]` model plus (via `generate scaffold`)
+/// `ShardedDb` routes and shard-aware migrations, all of which require a
+/// `[[database.shards]]` topology. But `DatabaseConfig::validate_backend_consistency`
+/// rejects *any* `database.shards` against a `SQLite` primary, so no valid
+/// `SQLite` config can ever use a generated sharded resource. Unlike FTS
+/// (#1910), UUID ids (#1905), or the unsupported field kinds (#1924), this is
+/// **not** a deferred slice: `SQLite` is single-host / single-writer, so
+/// horizontal sharding is Postgres-only and permanently out of scope for
+/// `SQLite` (see `docs/guide/sqlite-in-production.md`). Rather than emit a
+/// resource that no `SQLite` app can boot, generation fails here with an
+/// actionable message (AC #4).
+#[must_use]
+pub fn sqlite_sharded_unsupported_error() -> GenerateError {
+    GenerateError::Config(
+        "sharded models (--sharded) require the Postgres backend: SQLite is single-host, \
+         single-writer, so horizontal sharding is Postgres-only and permanently out of scope \
+         for SQLite. A sharded resource needs a `[[database.shards]]` topology, which config \
+         validation rejects for a SQLite primary — so no SQLite app could use the generated \
+         resource. Drop `--sharded`, or target a Postgres database. See \
+         docs/guide/sqlite-in-production.md for SQLite's supported single-host deployment model."
+            .to_owned(),
+    )
+}
+
 /// The generate-time rejection for an `ALTER TABLE … ADD COLUMN … NOT NULL`
 /// with no `DEFAULT` on a `SQLite`-backed app (`SQLite` foundation, issue #1614
 /// AC #4).

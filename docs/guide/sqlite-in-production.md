@@ -144,11 +144,16 @@ This foundation slice (part of #1614) delivers **config detection, boot-time
 validation, the backend-aware generator, `autumn doctor` awareness, and this
 published support contract** — **not** the runtime. Available **today**:
 
-- **`sqlite://` / file-path config recognition + boot-time validation** — a
-  `sqlite://` (or file-path) target is recognized and validated, and
-  Postgres-only settings (read replicas, shard directory, Postgres-only
-  job/scheduler backends, multi-replica locks) are **refused at boot** with an
-  actionable message rather than silently at first query.
+- **`sqlite:` / `file:` config recognition + boot-time validation** — a SQLite
+  target is recognized and validated when the URL carries one of the accepted
+  schemes: `sqlite:///var/lib/app.db` (canonical `sqlite://` followed by an
+  absolute path), `sqlite:app.db` (the shorter scheme-only form),
+  `sqlite::memory:` (in-memory), or `file:app.db`. A **bare filesystem path**
+  such as `/var/lib/app.db` is intentionally **not** recognized and fails
+  validation — prefix it with `sqlite://` (or `sqlite:` / `file:`). Postgres-only
+  settings (read replicas, shard directory, Postgres-only job/scheduler
+  backends, multi-replica locks) are **refused at boot** with an actionable
+  message rather than silently at first query.
 - **Backend-aware DDL generator** — `autumn generate` emits SQLite column types
   for the supported field kinds (see
   [field-type support](#sqlite-field-type-support)).
