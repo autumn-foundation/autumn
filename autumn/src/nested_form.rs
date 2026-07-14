@@ -579,6 +579,376 @@ where
     }
 }
 
+// ── Maud view helpers ──────────────────────────────────────────────
+
+/// A single row's rendering scope inside [`inputs_for`].
+///
+/// Each scope binds the child collection name, the row's 0-based `index`, and
+/// (for existing/submitted rows) the underlying [`NestedRow`] so its raw values
+/// pre-fill inputs and its per-subfield errors render inline on re-render after
+/// a failed submission. A blank template row carries `row: None` — its inputs
+/// render empty with no error blocks.
+///
+/// The row-scoped input builders mirror the standalone field helpers in
+/// [`crate::form`] (`text_input`, `number_input`, …) but emit **nested** input
+/// names (`items[{index}][{sub}]`) and per-row-unique element ids
+/// (`items-{index}-{sub}`) so ids and `aria-describedby` links stay unique
+/// across repeated rows.
+#[cfg(feature = "maud")]
+pub struct RowScope<'a> {
+    collection: &'a str,
+    index: usize,
+    row: Option<&'a NestedRow>,
+}
+
+#[cfg(feature = "maud")]
+impl RowScope<'_> {
+    /// This row's 0-based position in the collection.
+    #[must_use]
+    pub const fn index(&self) -> usize {
+        self.index
+    }
+
+    /// The nested input `name` for subfield `sub`, i.e.
+    /// `"{collection}[{index}][{sub}]"`.
+    #[must_use]
+    pub fn field_name(&self, sub: &str) -> String {
+        format!("{}[{}][{}]", self.collection, self.index, sub)
+    }
+
+    /// The raw submitted value for subfield `sub`, or `None` for a blank row.
+    #[must_use]
+    pub fn value(&self, sub: &str) -> Option<&str> {
+        self.row.and_then(|r| r.value(sub))
+    }
+
+    /// Validation messages for subfield `sub`, or an empty slice (always empty
+    /// for a blank row).
+    #[must_use]
+    pub fn errors_for(&self, sub: &str) -> &[String] {
+        self.row.map_or(&[], |r| r.errors_for(sub))
+    }
+
+    /// `true` when this (existing) row carried a truthy `_destroy` marker.
+    #[must_use]
+    pub fn is_destroyed(&self) -> bool {
+        self.row.is_some_and(NestedRow::is_destroyed)
+    }
+
+    /// Per-row-unique element id base for subfield `sub`
+    /// (`"{collection}-{index}-{sub}"`), used for `id` / `aria-describedby`
+    /// linkage so repeated rows never collide.
+    fn element_id(&self, sub: &str) -> String {
+        format!("{}-{}-{}", self.collection, self.index, sub)
+    }
+
+    /// Render a labeled row-scoped `<input type="text">` for subfield `sub`.
+    ///
+    /// Mirrors [`crate::form::text_input`]: `autumn-field` wrapper, per-row
+    /// pre-fill, `aria-invalid` / `aria-describedby`, and a `role="alert"`
+    /// error block — but with the nested `name` and a per-row-unique `id`.
+    #[must_use]
+    pub fn text_input(&self, sub: &str, label: &str) -> maud::Markup {
+        self.text_like_input(sub, label, false)
+    }
+
+    /// Like [`RowScope::text_input`] but adds `required` + `aria-required="true"`.
+    #[must_use]
+    pub fn required_text_input(&self, sub: &str, label: &str) -> maud::Markup {
+        self.text_like_input(sub, label, true)
+    }
+
+    /// Shared body for the text-like inputs.
+    fn text_like_input(&self, sub: &str, label: &str, required: bool) -> maud::Markup {
+        let errors = self.errors_for(sub);
+        let has_errors = !errors.is_empty();
+        let value = self.value(sub).unwrap_or_default();
+        let name = self.field_name(sub);
+        let id = self.element_id(sub);
+        let error_id = format!("{id}-error");
+        let wrapper_id = format!("{id}-field");
+
+        maud::html! {
+            div id=(wrapper_id) class="autumn-field" {
+                label for=(id) class="autumn-field__label" { (label) }
+                input
+                    type="text"
+                    id=(id)
+                    name=(name)
+                    value=(value)
+                    required[required]
+                    aria-required=[required.then_some("true")]
+                    class=(if has_errors { "autumn-field__input autumn-field__input--invalid" } else { "autumn-field__input" })
+                    aria-invalid=(if has_errors { "true" } else { "false" })
+                    aria-describedby=(if has_errors { error_id.as_str() } else { "" });
+                @if has_errors {
+                    div id=(error_id) role="alert" class="autumn-field__errors" {
+                        @for error in errors {
+                            p class="autumn-field__error" { (error) }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Render a labeled row-scoped `<input type="number">` for subfield `sub`.
+    ///
+    /// Mirrors [`crate::form::number_input`] (leaving the browser-default
+    /// `step`), with the nested `name` and a per-row-unique `id`.
+    #[must_use]
+    pub fn number_input(&self, sub: &str, label: &str) -> maud::Markup {
+        let errors = self.errors_for(sub);
+        let has_errors = !errors.is_empty();
+        let value = self.value(sub).unwrap_or_default();
+        let name = self.field_name(sub);
+        let id = self.element_id(sub);
+        let error_id = format!("{id}-error");
+        let wrapper_id = format!("{id}-field");
+
+        maud::html! {
+            div id=(wrapper_id) class="autumn-field" {
+                label for=(id) class="autumn-field__label" { (label) }
+                input
+                    type="number"
+                    id=(id)
+                    name=(name)
+                    value=(value)
+                    class=(if has_errors { "autumn-field__input autumn-field__input--invalid" } else { "autumn-field__input" })
+                    aria-invalid=(if has_errors { "true" } else { "false" })
+                    aria-describedby=(if has_errors { error_id.as_str() } else { "" });
+                @if has_errors {
+                    div id=(error_id) role="alert" class="autumn-field__errors" {
+                        @for error in errors {
+                            p class="autumn-field__error" { (error) }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Render a labeled row-scoped `<textarea>` for subfield `sub`.
+    ///
+    /// Mirrors [`crate::form::textarea_input`]: the value is emitted as the
+    /// element body, with the nested `name` and a per-row-unique `id`.
+    #[must_use]
+    pub fn textarea_input(&self, sub: &str, label: &str) -> maud::Markup {
+        let errors = self.errors_for(sub);
+        let has_errors = !errors.is_empty();
+        let value = self.value(sub).unwrap_or_default();
+        let name = self.field_name(sub);
+        let id = self.element_id(sub);
+        let error_id = format!("{id}-error");
+        let wrapper_id = format!("{id}-field");
+
+        maud::html! {
+            div id=(wrapper_id) class="autumn-field" {
+                label for=(id) class="autumn-field__label" { (label) }
+                textarea
+                    id=(id)
+                    name=(name)
+                    class=(if has_errors { "autumn-field__input autumn-field__input--invalid" } else { "autumn-field__input" })
+                    aria-invalid=(if has_errors { "true" } else { "false" })
+                    aria-describedby=(if has_errors { error_id.as_str() } else { "" })
+                    { (value) }
+                @if has_errors {
+                    div id=(error_id) role="alert" class="autumn-field__errors" {
+                        @for error in errors {
+                            p class="autumn-field__error" { (error) }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Render a row-scoped `<input type="hidden">` for subfield `sub`.
+    ///
+    /// Use this to carry an existing child's primary key (e.g. `id`) on an edit
+    /// form so the decoder can match the submitted row back to a persisted record.
+    #[must_use]
+    pub fn hidden_input(&self, sub: &str, value: &str) -> maud::Markup {
+        let name = self.field_name(sub);
+        maud::html! {
+            input type="hidden" name=(name) value=(value);
+        }
+    }
+
+    /// Render the durable no-JS removal control: a `_destroy` checkbox whose
+    /// checked state is preserved on re-render (`checked` iff
+    /// [`RowScope::is_destroyed`]).
+    ///
+    /// The decoder honours a truthy `_destroy` marker
+    /// ([`decode_nested_urlencoded`]), so ticking this box and submitting the
+    /// surrounding form removes the row with no JavaScript. htmx/JS row removal
+    /// (swapping the `.nested-fields__row` node's `outerHTML`) is an optional
+    /// progressive enhancement layered on top; this checkbox is the required
+    /// mechanism.
+    #[must_use]
+    pub fn destroy_checkbox(&self, label: &str) -> maud::Markup {
+        let checked = self.is_destroyed();
+        let name = self.field_name("_destroy");
+        let id = self.element_id("_destroy");
+        maud::html! {
+            div class="autumn-field autumn-field--destroy" {
+                input
+                    type="checkbox"
+                    id=(id)
+                    name=(name)
+                    value="1"
+                    checked[checked]
+                    class="autumn-field__checkbox";
+                label for=(id) class="autumn-field__label" { (label) }
+            }
+        }
+    }
+}
+
+/// Options for [`inputs_for`].
+#[cfg(feature = "maud")]
+pub struct InputsForOptions {
+    /// Number of extra blank rows to pre-render after the existing rows. The
+    /// no-JS fallback lets users fill and submit these without any JavaScript.
+    /// Defaults to `1`; [`inputs_for`] always emits **at least one** blank
+    /// template row even when this is `0`.
+    pub blank_rows: usize,
+    /// Optional htmx URL for the server "Add row" fragment endpoint (see
+    /// [`nested_row_fragment`]). When `None`, no Add button is rendered and the
+    /// no-JS path still works via the pre-rendered blank rows.
+    pub add_row_url: Option<String>,
+    /// Container element id. Defaults to `"{collection}-rows"`.
+    pub container_id: Option<String>,
+}
+
+#[cfg(feature = "maud")]
+impl Default for InputsForOptions {
+    fn default() -> Self {
+        Self {
+            blank_rows: 1,
+            add_row_url: None,
+            container_id: None,
+        }
+    }
+}
+
+/// Render the repeating child field-group block for a nested (`has_many`) form.
+///
+/// Wraps the rows in `<div id="{container_id}" class="nested-fields">`. For each
+/// existing/submitted row (from [`NestedChangeset::rows`], in order — **including**
+/// rows re-submitted after a validation failure) it invokes `render_row` with a
+/// [`RowScope`] carrying that row, so values and per-field errors pre-fill on
+/// re-render. It then appends [`InputsForOptions::blank_rows`] blank rows (always
+/// at least one) whose scopes carry `row: None`. Every row is wrapped in
+/// `<div class="nested-fields__row" data-index="{i}">` so htmx/JS removal can
+/// target the node's `outerHTML`.
+///
+/// When [`InputsForOptions::add_row_url`] is `Some`, an "Add row"
+/// `<button type="button">` is emitted with `hx-get`, `hx-target="#{container_id}"`,
+/// `hx-swap="beforeend"`, and — critically — `hx-params="not _submit_token"` so the
+/// one-time submit token is **not** spent fetching the fragment (mirroring the
+/// inline-validation helpers in [`crate::form`]).
+///
+/// # CSRF
+///
+/// This renders only the child block. The surrounding `<form>` — via
+/// [`crate::form::form_tag`] / `ChangesetForm` — carries the CSRF and submit-token
+/// fields exactly as today; do **not** duplicate them here.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use autumn_web::form::{form_tag, required_text_input, submit_button};
+/// use autumn_web::nested_form::{inputs_for, InputsForOptions};
+///
+/// // `form` is a `NestedChangesetForm<NewOrder, NewLineItem>` re-rendered after
+/// // a failed submit; `changeset` is its inner `NestedChangeset`.
+/// let opts = InputsForOptions {
+///     add_row_url: Some("/orders/line-item-row".into()),
+///     ..InputsForOptions::default()
+/// };
+/// form_tag("/orders", "POST", form.csrf_token(), maud::html! {
+///     // Parent fields (CSRF + submit token are emitted by `form_tag`).
+///     (required_text_input(&changeset.parent, "name", "Order name"))
+///     // Repeating child rows.
+///     (inputs_for(&changeset, &opts, |row| maud::html! {
+///         (row.required_text_input("sku", "SKU"))
+///         (row.number_input("quantity", "Quantity"))
+///         (row.destroy_checkbox("Remove"))
+///     }))
+///     (submit_button("Create order"))
+/// });
+/// ```
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn inputs_for<P, C: NestedChild>(
+    nested: &NestedChangeset<P, C>,
+    opts: &InputsForOptions,
+    render_row: impl Fn(&RowScope) -> maud::Markup,
+) -> maud::Markup {
+    let collection = C::COLLECTION;
+    let container_id = opts
+        .container_id
+        .clone()
+        .unwrap_or_else(|| format!("{collection}-rows"));
+    let rows = nested.rows();
+    // Always emit at least one blank template row so the no-JS path can add a
+    // child even when the caller asked for zero.
+    let blank_count = opts.blank_rows.max(1);
+
+    maud::html! {
+        div id=(container_id) class="nested-fields" {
+            @for (i, row) in rows.iter().enumerate() {
+                @let scope = RowScope { collection, index: i, row: Some(row) };
+                div class="nested-fields__row" data-index=(i) {
+                    (render_row(&scope))
+                }
+            }
+            @for k in 0..blank_count {
+                @let index = rows.len() + k;
+                @let scope = RowScope { collection, index, row: None };
+                div class="nested-fields__row" data-index=(index) {
+                    (render_row(&scope))
+                }
+            }
+            @if let Some(url) = &opts.add_row_url {
+                button
+                    type="button"
+                    class="nested-fields__add"
+                    hx-get=(url)
+                    hx-target=(format!("#{container_id}"))
+                    hx-swap="beforeend"
+                    hx-params="not _submit_token"
+                { "Add row" }
+            }
+        }
+    }
+}
+
+/// Render a single blank child row for the htmx "Add row" fragment endpoint.
+///
+/// Returns one `<div class="nested-fields__row" data-index="{index}">` produced
+/// by `render_row` with a blank [`RowScope`]. Because the decoder tolerates
+/// non-contiguous indices, `index` only needs to be **unique** within the form
+/// (e.g. a monotonically increasing counter the client tracks), not contiguous.
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn nested_row_fragment<C: NestedChild>(
+    index: usize,
+    render_row: impl Fn(&RowScope) -> maud::Markup,
+) -> maud::Markup {
+    let scope = RowScope {
+        collection: C::COLLECTION,
+        index,
+        row: None,
+    };
+    maud::html! {
+        div class="nested-fields__row" data-index=(index) {
+            (render_row(&scope))
+        }
+    }
+}
+
 // ── Tests ──────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -780,5 +1150,166 @@ mod tests {
         assert_eq!(parse_child_key("items[0][sku]x", "items"), None);
         // Non-numeric index.
         assert_eq!(parse_child_key("items[a][sku]", "items"), None);
+    }
+}
+
+#[cfg(all(test, feature = "maud"))]
+mod maud_tests {
+    use super::*;
+
+    #[derive(serde::Deserialize, validator::Validate)]
+    struct Order {
+        #[validate(length(min = 1, message = "name required"))]
+        name: String,
+    }
+
+    #[derive(serde::Deserialize, validator::Validate)]
+    struct LineItem {
+        #[validate(length(min = 1, message = "sku required"))]
+        sku: String,
+        #[validate(range(min = 1, message = "quantity must be >= 1"))]
+        quantity: i32,
+    }
+
+    impl NestedChild for LineItem {
+        const COLLECTION: &'static str = "items";
+    }
+
+    fn p(k: &str, v: &str) -> (String, String) {
+        (k.to_owned(), v.to_owned())
+    }
+
+    /// A changeset with two submitted rows, the second failing child validation
+    /// (`quantity = 0`), so both rows are retained for re-render.
+    fn two_row_changeset() -> NestedChangeset<Order, LineItem> {
+        let pairs = vec![
+            p("name", "Order 1"),
+            p("items[0][sku]", "A-1"),
+            p("items[0][quantity]", "2"),
+            p("items[1][sku]", "B-2"),
+            // quantity = 0 violates range(min = 1): row 1 is retained with an error.
+            p("items[1][quantity]", "0"),
+        ];
+        decode_nested_urlencoded::<Order, LineItem>(&pairs).expect("parent decodes")
+    }
+
+    fn render_row(row: &RowScope) -> maud::Markup {
+        maud::html! {
+            (row.required_text_input("sku", "SKU"))
+            (row.number_input("quantity", "Quantity"))
+            (row.destroy_checkbox("Remove"))
+        }
+    }
+
+    #[test]
+    fn existing_rows_render_indexed_names_and_prefilled_values() {
+        let cs = two_row_changeset();
+        let opts = InputsForOptions::default();
+        let html = inputs_for(&cs, &opts, render_row).into_string();
+
+        assert!(html.contains(r#"name="items[0][sku]""#), "{html}");
+        assert!(html.contains(r#"name="items[1][sku]""#), "{html}");
+        // Pre-filled values from the re-rendered changeset.
+        assert!(html.contains(r#"value="A-1""#), "{html}");
+        assert!(html.contains(r#"value="B-2""#), "{html}");
+        // Container defaults to "{collection}-rows".
+        assert!(html.contains(r#"id="items-rows""#), "{html}");
+    }
+
+    #[test]
+    fn per_row_error_renders_scoped_alert_block() {
+        let cs = two_row_changeset();
+        let opts = InputsForOptions::default();
+        let html = inputs_for(&cs, &opts, render_row).into_string();
+
+        // The failing row's quantity error is scoped to that row's unique id.
+        assert!(html.contains(r#"id="items-1-quantity-error""#), "{html}");
+        assert!(html.contains(r#"role="alert""#), "{html}");
+        assert!(html.contains("quantity must be &gt;= 1"), "{html}");
+        // The valid sibling row's quantity has no error block.
+        assert!(!html.contains(r#"id="items-0-quantity-error""#), "{html}");
+    }
+
+    #[test]
+    fn appends_blank_template_row_with_next_index() {
+        let cs = two_row_changeset();
+        let opts = InputsForOptions::default();
+        let html = inputs_for(&cs, &opts, render_row).into_string();
+
+        // Two existing rows (indices 0,1) plus one blank row at index 2.
+        assert!(html.contains(r#"data-index="0""#), "{html}");
+        assert!(html.contains(r#"data-index="1""#), "{html}");
+        assert!(html.contains(r#"data-index="2""#), "{html}");
+        assert!(html.contains(r#"name="items[2][sku]""#), "{html}");
+    }
+
+    #[test]
+    fn always_emits_a_blank_row_even_when_blank_rows_zero() {
+        let cs = two_row_changeset();
+        let opts = InputsForOptions {
+            blank_rows: 0,
+            ..InputsForOptions::default()
+        };
+        let html = inputs_for(&cs, &opts, render_row).into_string();
+        // Still emits the blank template row at index 2.
+        assert!(html.contains(r#"data-index="2""#), "{html}");
+    }
+
+    #[test]
+    fn destroy_checkbox_emits_indexed_marker() {
+        let cs = two_row_changeset();
+        let opts = InputsForOptions::default();
+        let html = inputs_for(&cs, &opts, render_row).into_string();
+
+        assert!(html.contains(r#"name="items[0][_destroy]""#), "{html}");
+        assert!(html.contains(r#"name="items[1][_destroy]""#), "{html}");
+        assert!(html.contains(r#"type="checkbox""#), "{html}");
+    }
+
+    #[test]
+    fn add_button_renders_only_with_url_and_carries_htmx_attrs() {
+        let cs = two_row_changeset();
+
+        // No URL: no Add button.
+        let none = inputs_for(&cs, &InputsForOptions::default(), render_row).into_string();
+        assert!(!none.contains("Add row"), "{none}");
+
+        // With URL: button carries the submit-token filter and beforeend swap.
+        let opts = InputsForOptions {
+            add_row_url: Some("/orders/line-item-row".into()),
+            ..InputsForOptions::default()
+        };
+        let html = inputs_for(&cs, &opts, render_row).into_string();
+        assert!(html.contains("Add row"), "{html}");
+        assert!(html.contains(r#"hx-params="not _submit_token""#), "{html}");
+        assert!(html.contains(r#"hx-swap="beforeend""#), "{html}");
+        assert!(html.contains(r#"hx-get="/orders/line-item-row""#), "{html}");
+        assert!(html.contains(r##"hx-target="#items-rows""##), "{html}");
+    }
+
+    #[test]
+    fn destroy_checkbox_checked_reflects_destroyed_row() {
+        let pairs = vec![
+            p("name", "Order"),
+            p("items[0][sku]", "A"),
+            p("items[0][quantity]", "1"),
+            p("items[0][_destroy]", "1"),
+        ];
+        let cs = decode_nested_urlencoded::<Order, LineItem>(&pairs).expect("parent decodes");
+        let html = inputs_for(&cs, &InputsForOptions::default(), render_row).into_string();
+        // The destroyed row's checkbox is checked.
+        assert!(
+            html.contains(r#"name="items[0][_destroy]" value="1" checked"#),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn nested_row_fragment_renders_single_row_at_index() {
+        let html = nested_row_fragment::<LineItem>(7, render_row).into_string();
+        assert!(html.contains(r#"data-index="7""#), "{html}");
+        assert!(html.contains(r#"name="items[7][sku]""#), "{html}");
+        // Exactly one row wrapper.
+        assert_eq!(html.matches("nested-fields__row").count(), 1, "{html}");
     }
 }

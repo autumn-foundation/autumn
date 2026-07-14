@@ -494,6 +494,8 @@ pub use form::Changeset;
 pub use form::ChangesetForm;
 /// Trait implemented for all `validator::Validate` types to produce a [`Changeset`].
 pub use form::IntoChangeset;
+#[cfg(feature = "maud")]
+pub use nested_form::{InputsForOptions, RowScope, inputs_for, nested_row_fragment};
 /// Nested (`has_many`) form binding: parent + one child collection.
 pub use nested_form::{
     NestedChangeset, NestedChangesetForm, NestedChild, NestedRow, decode_nested_urlencoded,
