@@ -105,6 +105,8 @@ impl<'de> Deserialize<'de> for TimeZoneConfig {
         #[serde(untagged)]
         enum Repr {
             Scalar(String),
+            // NOTE: keep MANUAL_SCHEMA_SECTIONS in config.rs in sync with these
+            // table fields (schema walker can't see untagged variant fields).
             Table {
                 #[serde(default = "default_time_zone_identifier")]
                 identifier: String,

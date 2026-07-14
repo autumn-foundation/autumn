@@ -337,3 +337,26 @@ fn post_jobs_sections_are_now_schema_covered() {
         "a bogus [resilience] child key must be flagged now, got: {errors:?}"
     );
 }
+
+#[test]
+fn manual_schema_sections_are_registered() {
+    let schema = autumn_web::config::AutumnConfig::get_schema_keys();
+    // Walker-opaque untagged scalar-or-table sections must still expose their
+    // table fields so strict validation descends (see MANUAL_SCHEMA_SECTIONS).
+    let tz = schema
+        .get("time_zone")
+        .expect("time_zone must be in schema");
+    assert!(
+        tz.contains("identifier") && tz.contains("sources"),
+        "time_zone table fields must be registered, got: {tz:?}"
+    );
+    // End-to-end: a typo under [time_zone] is now flagged (was silently accepted).
+    let errors = autumn_web::config::AutumnConfig::validate_toml(
+        "[time_zone]\nidentifer = \"UTC\"\n",
+        &schema,
+    );
+    assert!(
+        errors.iter().any(|(p, _)| p == "time_zone.identifer"),
+        "a bogus [time_zone] child key must be flagged now, got: {errors:?}"
+    );
+}

@@ -391,3 +391,5 @@ tenancy.quota_bytes
 tenancy.session_key
 tenancy.source
 time_zone
+time_zone.identifier
+time_zone.sources

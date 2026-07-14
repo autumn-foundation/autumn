@@ -2619,9 +2619,29 @@ fn unknown_key_was_previously_strict(path: &str) -> bool {
     parent == "profile" || PRE_1890_STRICT_PARENTS.contains(&parent)
 }
 
+/// Child schema keys for config sections whose `Deserialize` is OPAQUE to the
+/// schema walker and must be declared by hand.
+///
+/// `#[serde(untagged)]` "scalar shorthand OR table" enums (e.g. `TimeZoneConfig`:
+/// `time_zone = "UTC"` or `[time_zone] identifier = ...`) deserialize by first
+/// buffering into serde's `Content` and then matching variants against that
+/// buffer — so the table variant's fields are read from the buffer, never from
+/// `SchemaDeserializer`. The walker therefore cannot see them, and the section
+/// would otherwise be a childless leaf that strict validation skips (accepting
+/// typos even under `strict_config_enforce_all`). Register such sections here so
+/// `validate_toml` descends into them.
+///
+/// KEEP IN SYNC with the corresponding type's table fields (serialized names).
+/// The guard test `manual_schema_sections_are_registered` pins the behavior.
+const MANUAL_SCHEMA_SECTIONS: &[(&str, &[&str])] = &[
+    // `crate::time_zone::TimeZoneConfig` — untagged Scalar|Table.
+    ("time_zone", &["identifier", "sources"]),
+];
+
 impl AutumnConfig {
     /// Recursively extracts all valid configuration schema keys and nested fields.
     #[must_use]
+    #[allow(clippy::significant_drop_tightening)]
     pub fn get_schema_keys() -> HashMap<String, HashSet<String>> {
         // Adaptive multi-pass schema walk. `deserialize_any` probes with a scalar
         // by default; any path whose visitor rejects that probe (a seq/map-only
@@ -2674,6 +2694,21 @@ impl AutumnConfig {
                 break;
             }
             prev_rejected = rejected;
+        }
+        // Register walker-opaque sections (untagged scalar-or-table types whose
+        // table fields buffer through serde `Content` and are invisible to the
+        // walk). See MANUAL_SCHEMA_SECTIONS.
+        {
+            let mut schema = de
+                .schema
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for (section, keys) in MANUAL_SCHEMA_SECTIONS {
+                let entry = schema.entry((*section).to_owned()).or_default();
+                for k in *keys {
+                    entry.insert((*k).to_owned());
+                }
+            }
         }
         de.into_schema()
     }
