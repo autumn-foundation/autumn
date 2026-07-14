@@ -136,15 +136,16 @@ impl Field {
     /// through `rust_decimal`'s text representation instead.
     #[must_use]
     pub fn sql_column_type_for(&self, backend: DatabaseBackend) -> String {
-        match (backend, self.kind) {
-            // Postgres decimals keep the exact `NUMERIC(precision,scale)`
-            // rendering (byte-for-byte identical to the historical output).
-            (DatabaseBackend::Postgres, FieldKind::Decimal { .. }) => self.sql_column_type(),
-            // Every other case is the plain per-backend column type. On SQLite
-            // `Decimal` collapses to `TEXT` (see `FieldKind::sqlite_sql_type`)
-            // with no `(p,s)` suffix, since SQLite has no fixed-precision NUMERIC.
-            _ => self.kind.sql_type_for(backend).to_owned(),
+        // Postgres stays byte-for-byte identical to `sql_column_type`, including
+        // the exact `NUMERIC(precision,scale)` rendering for decimals. Mirrors
+        // `schema_type_for`'s structure.
+        if backend == DatabaseBackend::Postgres {
+            return self.sql_column_type();
         }
+        // On SQLite every kind maps to the plain per-backend column type;
+        // `Decimal` collapses to `TEXT` (see `FieldKind::sqlite_sql_type`) with
+        // no `(p,s)` suffix, since SQLite has no fixed-precision NUMERIC.
+        self.kind.sql_type_for(backend).to_owned()
     }
 
     /// The Diesel `schema.rs` type token for the target `backend` (issue
