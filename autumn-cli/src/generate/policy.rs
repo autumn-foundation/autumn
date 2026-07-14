@@ -28,7 +28,7 @@ use super::{GenerateError, ensure_project_root, read_or_empty};
 
 /// Compute the file actions for `autumn generate policy`.
 ///
-/// `for_destroy` selects the caller's [`super::ApplyMode`]: in generate mode the
+/// `for_destroy` selects the caller's `ApplyMode`: in generate mode the
 /// model-existence guard (AC5) fires when the target model is missing, but in
 /// destroy mode it is skipped so `autumn destroy policy` can still tear the
 /// policy down after the model was already destroyed (the plan's `revert` only

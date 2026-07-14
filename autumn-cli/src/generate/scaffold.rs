@@ -5667,7 +5667,7 @@ async fn __PLURAL___write_path_crud() {
 /// process-local stand-in for the persistence layer, no database required, so it
 /// runs green without Docker (unlike the `TestDb`-backed index/api smoke tests,
 /// which are `#[ignore]`d). It drives a zero-JS `multipart/form-data` create
-/// through the real [`Multipart`](autumn_web::extract::Multipart) extractor and
+/// through the real `Multipart` extractor and
 /// the real `save_to_blob_store` against a real
 /// [`LocalBlobStore`](autumn_web::storage::LocalBlobStore), binds the returned
 /// `Blob` on the record, then asserts the persisted record's attachment column

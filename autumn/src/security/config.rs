@@ -119,7 +119,7 @@ const DEMO_VALUES: &[&str] = &[
 ///
 /// Set `secret` via the `AUTUMN_SECURITY__SIGNING_SECRET` environment variable
 /// (or `[security.signing_secret] secret` in `autumn.toml`). The secret must be:
-/// - At least [`MIN_SECRET_LEN`] bytes long.
+/// - At least `MIN_SECRET_LEN` bytes long.
 /// - Not a known template/demo value.
 /// - Stable across restarts and identical on every replica.
 ///
@@ -166,7 +166,7 @@ pub enum SigningSecretError {
     TooShort {
         /// Actual byte length of the supplied secret.
         actual: usize,
-        /// Minimum required byte length ([`MIN_SECRET_LEN`]).
+        /// Minimum required byte length (`MIN_SECRET_LEN`).
         required: usize,
     },
     /// The secret matches a known insecure demo or template value.
@@ -202,7 +202,7 @@ impl std::fmt::Display for SigningSecretError {
 ///
 /// In production:
 /// - `None` → [`SigningSecretError::MissingInProduction`]
-/// - Shorter than [`MIN_SECRET_LEN`] bytes → [`SigningSecretError::TooShort`]
+/// - Shorter than `MIN_SECRET_LEN` bytes → [`SigningSecretError::TooShort`]
 /// - Matches a known demo/template string → [`SigningSecretError::KnownWeakValue`]
 ///
 /// # Errors

@@ -4217,7 +4217,7 @@ const TLS_ENV_VAR_NAMES: [&str; 4] = [
 ];
 
 /// Whether any `[server.tls]` env var is present in `env` (including a
-/// tuning-only var). Reads through the passed [`Env`], so a var supplied only
+/// tuning-only var). Reads through the passed [`Env`](autumn_web::config::Env), so a var supplied only
 /// via the `.env`/`.env.<profile>` overlay counts — the runtime materializes an
 /// (otherwise-empty) `[server.tls]` table for it, so doctor must grade it rather
 /// than emit a false Pass. Presence of any [`TLS_ENV_VAR_NAMES`] key marks
@@ -4595,7 +4595,7 @@ fn parse_acme_http_challenge_port(acme: &toml::Table) -> Result<u16, String> {
 
 /// The `FsAcmeStore` subdirectory label for a parsed `acme.directory`.
 ///
-/// Mirrors [`autumn_web::acme::directory_label`], replicated here because that
+/// Mirrors `autumn_web::acme::directory_label`, replicated here because that
 /// helper lives behind the `acme` feature while this doctor path also compiles
 /// in the feature-less build. Keep in sync with the store — see
 /// `autumn_web::acme::store::FsAcmeStore`, which reads/writes certificates only
@@ -4916,7 +4916,7 @@ fn resolve_acme_stored_cert_data(cert_dir: &std::path::Path, domains: &[String])
 
 /// Locate the stored `{cert_id}.chain.pem` + `{cert_id}.key.pem` pair for the
 /// CONFIGURED domains in `cert_dir`, where `cert_id` is derived from `domains`
-/// exactly as [`autumn_web::acme::store::CertId::from_domains`] does.
+/// exactly as `autumn_web::acme::store::CertId::from_domains` does.
 ///
 /// `cert_dir` MUST be the configured directory namespace
 /// (`{cache_dir}/{directory-label}/`) — the one the runtime's `FsAcmeStore`
@@ -4943,7 +4943,7 @@ fn configured_acme_cert_pair(
 }
 
 /// The stable certificate id for a domain set, replicating
-/// [`autumn_web::acme::store::CertId::from_domains`] (which lives behind the
+/// `autumn_web::acme::store::CertId::from_domains` (which lives behind the
 /// `acme` feature while this doctor path also compiles feature-less). Keep in
 /// EXACT sync with `store.rs`: sort + dedup the domains, SHA-256 each with a
 /// trailing NUL separator, and hex-encode the first 16 digest bytes. A

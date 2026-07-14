@@ -2806,7 +2806,7 @@ fn ensure_dep_feature_status_in_section(
 ///
 /// If the dependency isn't declared in `[dependencies]` at all, the input is
 /// returned unchanged — callers that need the dependency itself present must
-/// add it separately (e.g. via `plan_cargo_deps`/[`ensure_cargo_dependencies`]).
+/// add it separately (e.g. via `plan_cargo_deps`/`ensure_cargo_dependencies`).
 /// Idempotent: a second call is a no-op once the feature is present.
 #[must_use]
 pub(super) fn ensure_dependency_feature(existing: &str, dep_name: &str, feature: &str) -> String {
