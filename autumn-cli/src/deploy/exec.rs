@@ -1,4 +1,4 @@
-//! Injectable remote-execution layer for `autumn deploy` (issue #1607, Slices 1–2).
+//! Injectable remote-execution layer for `autumn deploy` (issue #1607, Slices 1–3).
 //!
 //! This module turns the dry-run deploy plan into REAL execution behind an
 //! injectable [`DeployExecutor`], so the command-construction and execution paths
@@ -25,6 +25,18 @@
 //!   iterate the ops and drive a [`DeployExecutor`]; the `execute_*` entrypoints
 //!   refuse to run if any preflight check failed (AC-6 fail-fast). [`DeployMode`]
 //!   / [`detect_deploy_mode`] pick first-vs-redeploy from a remote probe.
+//! - **Rollback (Slice 3, AC-4):** two forms are real. On a failed redeploy gate
+//!   (migrate or readiness — anything at or before the health-gated flip) traffic
+//!   never moved, so [`execute_redeploy`] AUTO-rolls-back: it drives
+//!   [`candidate_teardown_ops`] (stop + disable the candidate slot unit, remove
+//!   its release dir), leaves the proxy on the still-serving old release, and
+//!   fails with [`DeployExecError::CandidateRolledBack`]. On demand,
+//!   [`resolve_rollback_target`] finds the previous release and [`rollback_ops`] /
+//!   [`execute_rollback`] bring its slot back up, flip the proxy to it, repoint
+//!   `current`, and re-probe `/ready`; with no previous release the resolve fails
+//!   with [`DeployExecError::NoPreviousRelease`] and nothing destructive runs. A
+//!   FIRST deploy has no previous release, so a pre-go-live failure tears the
+//!   candidate down and fails with [`DeployExecError::FirstDeployTornDown`].
 //! - **Proxy:** the kamal-proxy CLI lives entirely in
 //!   [`KamalProxyController`](super::proxy::KamalProxyController); the cutover
 //!   orchestration here talks only to the [`ProxyController`] trait, so a Caddy
@@ -39,11 +51,9 @@
 //!
 //! ## What is deferred (NOT implemented in this slice)
 //!
-//! - **Rollback execution** and auto-rollback on a failed readiness gate — a
-//!   readiness timeout or failed migration here fails loudly with the OLD release
-//!   still serving; automatically re-pointing traffic back is Slice 3.
-//! - The **CI end-to-end container harness** that exercises the real `ssh` path is
-//!   Slice 4 — live ssh is not exercised by these unit tests.
+//! - The **CI end-to-end container harness** that exercises the real `ssh` path
+//!   against a live container — actually driving a rollback over ssh end-to-end —
+//!   is Slice 4; live ssh is not exercised by these unit tests.
 //! - A **Caddy** [`ProxyController`](super::proxy::ProxyController) — kamal-proxy
 //!   is the confirmed proxy; Caddy is only the documented swappable alternative.
 //!
@@ -235,6 +245,40 @@ pub enum DeployExecError {
     PreflightAborted {
         /// Number of failing preflight checks.
         failed: usize,
+    },
+    /// An on-demand rollback found no prior release to roll back to (Slice 3).
+    #[error(
+        "no previous release to roll back to — the current release is the only one on the target"
+    )]
+    NoPreviousRelease,
+    /// A redeploy gate failed before (or at) the cutover flip, so the candidate
+    /// was torn down and the previously-serving release was left untouched
+    /// (Slice 3 auto-rollback, AC-4). Never embeds a secret — only the failing
+    /// step's label and the redacted source error.
+    #[error(
+        "redeploy failed at `{failed_step}`; the candidate was auto-rolled-back and torn down — \
+         the previous release is still serving"
+    )]
+    CandidateRolledBack {
+        /// Label of the step that failed before the flip.
+        failed_step: &'static str,
+        /// The underlying failure (its `Display` is already redacted).
+        #[source]
+        source: Box<Self>,
+    },
+    /// A FIRST deploy failed before the app went live. There is no previous
+    /// release to roll back to, so the just-started candidate was torn down and
+    /// the deploy fails loudly (Slice 3 — the honest first-deploy path).
+    #[error(
+        "first deploy failed at `{failed_step}`; there is no previous release to roll back to — \
+         the candidate was torn down, nothing is serving"
+    )]
+    FirstDeployTornDown {
+        /// Label of the step that failed before the app went live.
+        failed_step: &'static str,
+        /// The underlying failure (its `Display` is already redacted).
+        #[source]
+        source: Box<Self>,
     },
 }
 
@@ -626,6 +670,157 @@ pub fn cutover_ops(
     ]
 }
 
+/// Ops that tear down a failed candidate so a retry starts clean (Slice 3,
+/// AC-4). The candidate slot unit is stopped and disabled and its release dir is
+/// removed; the old release and the proxy's upstream are left untouched.
+///
+/// Pure — `release_id` and the [`SlotPlan`] are injected. Both ops are
+/// best-effort by construction (`|| true` on the unit teardown so a
+/// never-enabled/half-started unit doesn't fail the cleanup), and they are also
+/// driven through [`run_teardown`], which swallows executor errors — so a flaky
+/// cleanup can never mask the real deploy failure. Removing the release dir means
+/// a re-run uploads a fresh copy rather than reusing a half-written one.
+#[must_use]
+pub fn candidate_teardown_ops(
+    cfg: &ResolvedDeployConfig,
+    release_id: &str,
+    plan: &SlotPlan,
+) -> Vec<DeployOp> {
+    let candidate_unit = slot_unit_name(&cfg.service_name, plan.candidate_slot);
+    let release_dir = format!("{}/{release_id}", cfg.releases_dir());
+    vec![
+        DeployOp::Run(RemoteCommand::new(
+            "teardown-candidate-unit",
+            format!("systemctl disable --now {candidate_unit}.service || true"),
+        )),
+        DeployOp::Run(RemoteCommand::new(
+            "teardown-candidate-dir",
+            format!("rm -rf {}", shell_quote(&release_dir)),
+        )),
+    ]
+}
+
+/// The previous release an on-demand rollback repoints to, resolved from the
+/// target by [`resolve_rollback_target`].
+///
+/// In the blue/green scheme the currently-live release serves on the slot named
+/// by the live-slot marker, so the previous release ran on the OTHER slot (it was
+/// drained, not deleted, as long as pruning kept it). Rolling back therefore
+/// means bringing that slot's unit back up and flipping the proxy to its port.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RollbackTarget {
+    /// Absolute release dir the `current` symlink is repointed at.
+    pub release_dir: String,
+    /// Slot the previous release runs on (the slot NOT currently live).
+    pub slot: &'static str,
+    /// Loopback port the previous release binds.
+    pub port: u16,
+}
+
+/// Probe the target to resolve the previous release for an on-demand rollback.
+///
+/// Reads the `current` symlink's target and the release-dir listing (newest
+/// first) to find the newest release that is NOT the current one — the release
+/// `current` pointed at before the last promote — and reads the live-slot marker
+/// to derive the slot that release runs on (the one not currently live). Returns
+/// [`DeployExecError::NoPreviousRelease`] when the target has only the current
+/// release (or none), so the caller can fail loudly with a non-zero status
+/// instead of destroying the only release.
+///
+/// # Errors
+///
+/// Returns [`DeployExecError::NoPreviousRelease`] when there is nothing to roll
+/// back to, or the executor's error if the probe command cannot run.
+pub fn resolve_rollback_target(
+    cfg: &ResolvedDeployConfig,
+    public_port: u16,
+    exec: &impl DeployExecutor,
+) -> Result<RollbackTarget, DeployExecError> {
+    // Emit `prev:<abs-dir>\t<live-slot>` for the newest non-current release, or
+    // `none` when the current release is the only one. `readlink` yields the
+    // absolute release dir the symlink was pointed at (promote uses an absolute
+    // target), which we compare against each absolute release path.
+    let shell = format!(
+        "rel={rel}; cur=$(readlink {current} 2>/dev/null); prev=; \
+         for d in $(cd \"$rel\" 2>/dev/null && ls -1dt */ 2>/dev/null); do \
+         abs=\"$rel/${{d%/}}\"; \
+         if [ \"$abs\" != \"$cur\" ]; then prev=\"$abs\"; break; fi; done; \
+         if [ -z \"$prev\" ]; then printf 'none'; \
+         else printf 'prev:%s\\t%s' \"$prev\" \"$(cat {marker} 2>/dev/null || printf '{blue}')\"; fi",
+        rel = shell_quote(&cfg.releases_dir()),
+        current = shell_quote(&cfg.current_symlink()),
+        marker = shell_quote(&live_slot_marker(cfg)),
+        blue = SLOT_BLUE,
+    );
+    let out = exec.run(&RemoteCommand::new("resolve-previous", shell))?;
+    let stdout = out.stdout.trim();
+    let Some(rest) = stdout.strip_prefix("prev:") else {
+        return Err(DeployExecError::NoPreviousRelease);
+    };
+    let mut parts = rest.splitn(2, '\t');
+    let release_dir = parts.next().unwrap_or_default().trim().to_owned();
+    if release_dir.is_empty() {
+        return Err(DeployExecError::NoPreviousRelease);
+    }
+    let live_slot = canonical_slot(parts.next().unwrap_or(SLOT_BLUE).trim());
+    // The previous release runs on the slot that is NOT currently live.
+    let slot = other_slot(live_slot);
+    Ok(RollbackTarget {
+        release_dir,
+        slot,
+        port: slot_app_port(public_port, slot),
+    })
+}
+
+/// Build the ordered on-demand ROLLBACK sequence (Slice 3, AC-4).
+///
+/// Pure — the [`RollbackTarget`] is resolved up front by
+/// [`resolve_rollback_target`] and injected for determinism. The previous unit is
+/// brought back up on its slot BEFORE the flip because the proxy flip is
+/// health-gated (`kamal-proxy deploy` blocks on the target's `/ready`) and would
+/// time out against a stopped upstream. The sequence:
+///
+/// 1. bring the previous release's slot unit back up (it was drained on the last
+///    cutover, not deleted),
+/// 2. health-gated proxy flip back to the previous release's loopback port,
+/// 3. repoint `current` at the previous release,
+/// 4. record the live slot marker (now the previous slot),
+/// 5. bounded `/ready` re-probe to confirm the rollback is healthy.
+///
+/// The caller runs [`resolve_rollback_target`] first, so its `resolve-previous`
+/// probe precedes these ops in the recorded sequence.
+#[must_use]
+pub fn rollback_ops(
+    cfg: &ResolvedDeployConfig,
+    proxy: &impl ProxyController,
+    target: &RollbackTarget,
+) -> Vec<DeployOp> {
+    let previous_unit = slot_unit_name(&cfg.service_name, target.slot);
+    let current = cfg.current_symlink();
+    vec![
+        DeployOp::Run(RemoteCommand::new(
+            "restart-previous",
+            format!("systemctl enable --now {previous_unit}.service"),
+        )),
+        // Health-gated flip back: the previous unit (brought up above) must pass
+        // /ready before the proxy swaps traffic to it.
+        proxy.flip_op(&cfg.service_name, &loopback_upstream(target.port)),
+        DeployOp::Run(RemoteCommand::new(
+            "link-current",
+            format!(
+                "ln -sfn {} {}",
+                shell_quote(&target.release_dir),
+                shell_quote(&current)
+            ),
+        )),
+        DeployOp::Run(record_live_slot(cfg, target.slot)),
+        DeployOp::Run(RemoteCommand::new(
+            "readiness-gate",
+            readiness_poll_shell(target.port, cfg.readiness_timeout_secs),
+        )),
+    ]
+}
+
 /// The `host:port` loopback upstream string the proxy routes at.
 fn loopback_upstream(port: u16) -> String {
     format!("127.0.0.1:{port}")
@@ -742,17 +937,95 @@ fn readiness_poll_shell(port: u16, timeout_secs: u64) -> String {
     )
 }
 
-/// Execute an op sequence against `exec`, but only after preflight has passed.
+/// Which flavor of auto-rollback a failed pre-cutover step triggers — the two
+/// differ only in the honest error they surface (a redeploy has a previous
+/// release still serving; a first deploy does not).
+#[derive(Debug, Clone, Copy)]
+enum TeardownKind {
+    /// Redeploy: the previous release keeps serving after the candidate is torn
+    /// down (AC-4).
+    PreviousStillServing,
+    /// First deploy: no previous release exists, so nothing serves afterward.
+    NoPreviousRelease,
+}
+
+/// Execute a FIRST-deploy op sequence, gated on preflight, with an honest
+/// teardown of the just-started candidate if it fails before going live.
 ///
-/// If any check failed the function returns [`DeployExecError::PreflightAborted`]
-/// WITHOUT making a single executor call (AC-6 — fail fast before touching the
-/// server).
+/// If any preflight check failed the function returns
+/// [`DeployExecError::PreflightAborted`] WITHOUT making a single executor call
+/// (AC-6 — fail fast before touching the server). If a step fails at or before
+/// the go-live boundary (`proxy-route`), `teardown` runs (best-effort) and the
+/// call fails with [`DeployExecError::FirstDeployTornDown`] — there is no
+/// previous release to fall back to, so the path fails loudly.
+///
+/// # Errors
+///
+/// Returns [`DeployExecError::PreflightAborted`] when any preflight check failed,
+/// [`DeployExecError::FirstDeployTornDown`] on a pre-go-live failure, or the
+/// underlying executor error for a post-go-live failure.
+pub fn execute_first_deploy(
+    checks: &[PreflightCheck],
+    ops: &[DeployOp],
+    teardown: &[DeployOp],
+    exec: &impl DeployExecutor,
+) -> Result<(), DeployExecError> {
+    execute_with_teardown(
+        checks,
+        ops,
+        teardown,
+        "proxy-route",
+        TeardownKind::NoPreviousRelease,
+        exec,
+    )
+}
+
+/// Execute a zero-downtime redeploy cutover sequence, gated on preflight, with an
+/// automatic rollback of the candidate on a failure before the cutover (AC-4).
+///
+/// A failed migration or a readiness timeout — anything at or before the
+/// `proxy-flip` boundary — never flips traffic (the flip is health-gated and
+/// only reached after `/ready` passes). Slice 3 turns that abort into an
+/// explicit, clean auto-rollback: `teardown` stops and disables the candidate
+/// slot unit and removes the candidate release dir, the proxy is left pointing at
+/// the still-serving old release, and the call fails with
+/// [`DeployExecError::CandidateRolledBack`]. A failure AFTER the flip (promote,
+/// drain, prune) does not tear the candidate down — it is already live.
+///
+/// # Errors
+///
+/// Returns [`DeployExecError::PreflightAborted`] when any preflight check failed,
+/// [`DeployExecError::CandidateRolledBack`] on a pre-flip failure, or the
+/// underlying executor error for a post-flip failure.
+pub fn execute_redeploy(
+    checks: &[PreflightCheck],
+    ops: &[DeployOp],
+    teardown: &[DeployOp],
+    exec: &impl DeployExecutor,
+) -> Result<(), DeployExecError> {
+    execute_with_teardown(
+        checks,
+        ops,
+        teardown,
+        "proxy-flip",
+        TeardownKind::PreviousStillServing,
+        exec,
+    )
+}
+
+/// Execute an on-demand rollback op sequence ([`rollback_ops`]), gated on
+/// preflight exactly like the deploy entrypoints.
+///
+/// The previous-release resolution ([`resolve_rollback_target`]) has already run
+/// by the time this is called, so the ops here simply drive the repoint; a
+/// failure surfaces the underlying executor error (there is no further fallback
+/// to roll back to).
 ///
 /// # Errors
 ///
 /// Returns [`DeployExecError::PreflightAborted`] when any preflight check failed,
 /// or the first executor error otherwise.
-pub fn execute_first_deploy(
+pub fn execute_rollback(
     checks: &[PreflightCheck],
     ops: &[DeployOp],
     exec: &impl DeployExecutor,
@@ -764,23 +1037,52 @@ pub fn execute_first_deploy(
     run_ops(ops, exec)
 }
 
-/// Execute a zero-downtime redeploy cutover sequence, gated on preflight exactly
-/// like [`execute_first_deploy`].
-///
-/// The safety of the cutover comes from [`run_ops`] stopping at the first
-/// failure: a failed migration or a readiness timeout returns before the proxy
-/// flip, leaving the old release serving (AC-2/AC-3). Auto-rollback is Slice 3.
-///
-/// # Errors
-///
-/// Returns [`DeployExecError::PreflightAborted`] when any preflight check failed,
-/// or the first executor error otherwise.
-pub fn execute_redeploy(
+/// Shared driver for the deploy entrypoints: gate on preflight, then run `ops`
+/// one at a time; if a step fails at or before `boundary_label` run `teardown`
+/// (best-effort — its own errors are swallowed so they can't mask the real
+/// failure) and surface the honest rollback error named by `kind`. A failure
+/// after the boundary is returned verbatim (the candidate is already live).
+fn execute_with_teardown(
     checks: &[PreflightCheck],
     ops: &[DeployOp],
+    teardown: &[DeployOp],
+    boundary_label: &str,
+    kind: TeardownKind,
     exec: &impl DeployExecutor,
 ) -> Result<(), DeployExecError> {
-    execute_first_deploy(checks, ops, exec)
+    let failed = checks.iter().filter(|c| !c.passed).count();
+    if failed > 0 {
+        return Err(DeployExecError::PreflightAborted { failed });
+    }
+    // The go-live op (flip/route) is the point of no return: a failure at or
+    // before it means traffic never moved, so tearing the candidate down is safe.
+    let boundary = ops.iter().position(|op| op.label() == boundary_label);
+    for (index, op) in ops.iter().enumerate() {
+        if let Err(source) = run_one(op, exec) {
+            let at_or_before_boundary = boundary.is_none_or(|b| index <= b);
+            if !at_or_before_boundary {
+                return Err(source);
+            }
+            eprintln!(
+                "  \u{2717} {} failed — rolling back the candidate\u{2026}",
+                op.label()
+            );
+            run_teardown(teardown, exec);
+            let failed_step = op.label();
+            let source = Box::new(source);
+            return Err(match kind {
+                TeardownKind::PreviousStillServing => DeployExecError::CandidateRolledBack {
+                    failed_step,
+                    source,
+                },
+                TeardownKind::NoPreviousRelease => DeployExecError::FirstDeployTornDown {
+                    failed_step,
+                    source,
+                },
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Drive an op sequence against an executor, stopping at the first failure.
@@ -791,32 +1093,46 @@ pub fn execute_redeploy(
 /// a local temp file for a [`DeployOp::WriteFile`]).
 pub fn run_ops(ops: &[DeployOp], exec: &impl DeployExecutor) -> Result<(), DeployExecError> {
     for op in ops {
-        // Progress logging: only the step label (never a secret) is emitted.
-        eprintln!("  \u{2192} {}", op.label());
-        match op {
-            DeployOp::Run(cmd) => {
-                exec.run(cmd)?;
-            }
-            DeployOp::UploadFile {
-                local,
-                remote_path,
-                mode,
-                ..
-            } => {
-                exec.upload(local, remote_path, *mode)?;
-            }
-            DeployOp::WriteFile {
-                contents,
-                remote_path,
-                mode,
-                ..
-            } => {
-                let staged = stage_temp_file(contents.as_str(), *mode)?;
-                exec.upload(staged.path(), remote_path, *mode)?;
-            }
+        run_one(op, exec)?;
+    }
+    Ok(())
+}
+
+/// Run a single op against the executor, emitting its (secret-free) label first.
+fn run_one(op: &DeployOp, exec: &impl DeployExecutor) -> Result<(), DeployExecError> {
+    // Progress logging: only the step label (never a secret) is emitted.
+    eprintln!("  \u{2192} {}", op.label());
+    match op {
+        DeployOp::Run(cmd) => {
+            exec.run(cmd)?;
+        }
+        DeployOp::UploadFile {
+            local,
+            remote_path,
+            mode,
+            ..
+        } => {
+            exec.upload(local, remote_path, *mode)?;
+        }
+        DeployOp::WriteFile {
+            contents,
+            remote_path,
+            mode,
+            ..
+        } => {
+            let staged = stage_temp_file(contents.as_str(), *mode)?;
+            exec.upload(staged.path(), remote_path, *mode)?;
         }
     }
     Ok(())
+}
+
+/// Run best-effort teardown ops: each is attempted and its errors are ignored so
+/// a flaky cleanup step can never mask the real deploy failure being reported.
+fn run_teardown(ops: &[DeployOp], exec: &impl DeployExecutor) {
+    for op in ops {
+        let _ = run_one(op, exec);
+    }
 }
 
 /// Stage in-memory contents into a local temp file (permissioned to `mode` on
@@ -1239,25 +1555,40 @@ mod tests {
         assert!(pos("drain-old") < pos("prune"), "drain before prune");
     }
 
+    /// The candidate-teardown ops for the redeploy sample (candidate on green).
+    fn sample_teardown_ops() -> Vec<DeployOp> {
+        let cfg = resolved();
+        let plan = SlotPlan::redeploy(3000, SLOT_BLUE);
+        candidate_teardown_ops(&cfg, RELEASE_ID, &plan)
+    }
+
     #[test]
-    fn failed_migration_aborts_before_cutover_leaving_old_serving() {
+    fn redeploy_migration_failure_leaves_old_serving_and_cleans_candidate() {
+        // Updated from the Slice 2 abort test: a failed migration now AUTO-rolls-
+        // back the candidate (AC-4) rather than just aborting.
         let ops = sample_cutover_ops(Secret::new("AUTUMN_SECURITY__SIGNING_SECRET=x\n"));
+        let teardown = sample_teardown_ops();
         // The migrate one-shot fails (as a bad migration would on the host).
         let exec = RecordingExecutor::failing_on("migrate");
-        let err = run_ops(&ops, &exec).expect_err("a failed migration must abort the deploy");
+        let checks = vec![PreflightCheck::pass("ssh_reachability", "ok")];
+        let err = execute_redeploy(&checks, &ops, &teardown, &exec)
+            .expect_err("a failed migration must fail the deploy");
+        // The error names migrate as the failed step and reports the candidate was
+        // rolled back with the previous release still serving.
         assert!(
             matches!(
                 err,
-                DeployExecError::CommandFailed {
-                    label: "migrate",
+                DeployExecError::CandidateRolledBack {
+                    failed_step: "migrate",
                     ..
                 }
             ),
-            "expected a migrate CommandFailed, got {err:?}"
+            "expected a CandidateRolledBack at migrate, got {err:?}"
         );
-        // AC-3: no cutover happened — no flip, no drain, no promote — so the old
-        // release is untouched and still serving.
+
         let labels = exec.run_labels();
+        // AC-3/AC-4: no cutover happened — no flip, no drain, no promote — so the
+        // old release is untouched and still serving.
         assert!(
             !labels.contains(&"proxy-flip"),
             "no flip after a failed migration"
@@ -1265,33 +1596,215 @@ mod tests {
         assert!(!labels.contains(&"drain-old"), "old release not drained");
         assert!(!labels.contains(&"link-current"), "current not repointed");
         assert!(!labels.contains(&"prune"), "nothing pruned");
+        // The candidate is explicitly torn down: its slot unit is stopped/disabled
+        // and its release dir removed so a retry starts clean.
+        assert!(
+            labels.contains(&"teardown-candidate-unit")
+                && labels.contains(&"teardown-candidate-dir"),
+            "candidate must be torn down: {labels:?}"
+        );
+        let td_unit = exec
+            .shell_for("teardown-candidate-unit")
+            .expect("teardown-candidate-unit ran");
+        assert!(
+            td_unit.contains("disable --now myapp-green.service"),
+            "teardown stops+disables the candidate (green) slot unit: {td_unit}"
+        );
+        let td_dir = exec
+            .shell_for("teardown-candidate-dir")
+            .expect("teardown-candidate-dir ran");
+        assert!(
+            td_dir.contains("rm -rf") && td_dir.contains(RELEASE_DIR),
+            "teardown removes the candidate release dir: {td_dir}"
+        );
     }
 
     #[test]
-    fn readiness_timeout_before_cutover_does_not_flip() {
+    fn redeploy_readiness_failure_auto_rolls_back_and_tears_down_candidate() {
+        // Updated from the Slice 2 abort test: a readiness timeout now AUTO-rolls-
+        // back the candidate (AC-4) rather than just aborting.
         let ops = sample_cutover_ops(Secret::new("AUTUMN_SECURITY__SIGNING_SECRET=x\n"));
+        let teardown = sample_teardown_ops();
         // The candidate never reports /ready within the window.
         let exec = RecordingExecutor::failing_on("readiness-gate");
-        let err = run_ops(&ops, &exec).expect_err("a readiness timeout must abort the deploy");
+        let checks = vec![PreflightCheck::pass("ssh_reachability", "ok")];
+        let err = execute_redeploy(&checks, &ops, &teardown, &exec)
+            .expect_err("a readiness timeout must fail the deploy");
         assert!(
             matches!(
                 err,
-                DeployExecError::CommandFailed {
-                    label: "readiness-gate",
+                DeployExecError::CandidateRolledBack {
+                    failed_step: "readiness-gate",
                     ..
                 }
             ),
-            "expected a readiness-gate CommandFailed, got {err:?}"
+            "expected a CandidateRolledBack at readiness-gate, got {err:?}"
         );
-        // AC-2 safety: traffic never flips to an unhealthy candidate. Auto-rollback
-        // itself is Slice 3; here the old release simply keeps serving.
+
         let labels = exec.run_labels();
+        // AC-2 safety: traffic never flips to an unhealthy candidate, and the old
+        // release keeps serving.
         assert!(
             !labels.contains(&"proxy-flip"),
             "no flip on readiness timeout"
         );
         assert!(!labels.contains(&"drain-old"), "old release not drained");
         assert!(!labels.contains(&"link-current"), "current not repointed");
+        // The failed candidate is torn down.
+        assert!(
+            labels.contains(&"teardown-candidate-unit")
+                && labels.contains(&"teardown-candidate-dir"),
+            "candidate must be torn down: {labels:?}"
+        );
+        let td_unit = exec
+            .shell_for("teardown-candidate-unit")
+            .expect("teardown-candidate-unit ran");
+        assert!(
+            td_unit.contains("disable --now myapp-green.service"),
+            "teardown stops+disables the candidate (green) slot unit: {td_unit}"
+        );
+        let td_dir = exec
+            .shell_for("teardown-candidate-dir")
+            .expect("teardown-candidate-dir ran");
+        assert!(
+            td_dir.contains(RELEASE_DIR),
+            "teardown removes the candidate release dir: {td_dir}"
+        );
+    }
+
+    #[test]
+    fn deploy_rollback_produces_exact_ordered_sequence() {
+        // The live release is on green (marker), so the previous release ran on
+        // blue (loopback 3001) — that's what rollback flips back to.
+        let cfg = resolved();
+        let exec = RecordingExecutor::new().with_stdout(
+            "resolve-previous",
+            "prev:/srv/autumn/myapp/releases/20260713T090000Z\tgreen",
+        );
+        let target = resolve_rollback_target(&cfg, 3000, &exec).expect("previous release resolves");
+        assert_eq!(target.slot, SLOT_BLUE);
+        assert_eq!(target.port, 3001);
+        assert_eq!(
+            target.release_dir,
+            "/srv/autumn/myapp/releases/20260713T090000Z"
+        );
+
+        let ops = rollback_ops(&cfg, &proxy(), &target);
+        run_ops(&ops, &exec).expect("recording executor never fails");
+
+        // resolve-previous (the probe) precedes the ordered rollback ops: bring the
+        // previous slot back up → health-gated flip to it → promote → mark live →
+        // re-probe /ready.
+        assert_eq!(
+            exec.run_labels(),
+            vec![
+                "resolve-previous",
+                "restart-previous",
+                "proxy-flip",
+                "link-current",
+                "record-live-slot",
+                "readiness-gate",
+            ],
+            "unexpected rollback sequence"
+        );
+
+        // The previous unit is brought up before the flip (the flip is health-
+        // gated and would time out against a stopped upstream).
+        let restart = exec.shell_for("restart-previous").expect("restart ran");
+        assert!(
+            restart.contains("enable --now myapp-blue.service"),
+            "rollback brings the previous (blue) slot unit up: {restart}"
+        );
+        // The flip targets the PREVIOUS release's loopback address (blue = 3001).
+        let flip = exec.shell_for("proxy-flip").expect("flip ran");
+        assert!(
+            flip.contains("kamal-proxy deploy") && flip.contains("--target '127.0.0.1:3001'"),
+            "flip targets the previous release's address: {flip}"
+        );
+        // `current` is repointed at the previous release dir.
+        let promote = exec.shell_for("link-current").expect("promote ran");
+        assert!(
+            promote.contains("/srv/autumn/myapp/releases/20260713T090000Z")
+                && promote.contains("/srv/autumn/myapp/current"),
+            "current is repointed to the previous release: {promote}"
+        );
+        // The re-probe targets the previous release's port.
+        let gate = exec.shell_for("readiness-gate").expect("gate ran");
+        assert!(gate.contains("127.0.0.1:3001/ready"), "gate: {gate}");
+
+        // Ordering invariants.
+        let labels = exec.run_labels();
+        let pos = |l: &str| labels.iter().position(|&x| x == l).unwrap();
+        assert!(
+            pos("restart-previous") < pos("proxy-flip"),
+            "the previous unit is up before the flip"
+        );
+        assert!(
+            pos("proxy-flip") < pos("link-current"),
+            "flip before promote"
+        );
+        assert!(
+            pos("link-current") < pos("readiness-gate"),
+            "promote before the re-probe"
+        );
+    }
+
+    #[test]
+    fn rollback_with_no_previous_release_errors() {
+        // The target has only the current release (the probe emits `none`): there
+        // is nothing to roll back to.
+        let cfg = resolved();
+        let exec = RecordingExecutor::new().with_stdout("resolve-previous", "none");
+        let err =
+            resolve_rollback_target(&cfg, 3000, &exec).expect_err("no previous release must error");
+        assert!(
+            matches!(err, DeployExecError::NoPreviousRelease),
+            "expected NoPreviousRelease, got {err:?}"
+        );
+        // Only the read-only probe ran — no flip, no promote, nothing destructive.
+        let labels = exec.run_labels();
+        assert_eq!(labels, vec!["resolve-previous"], "only the probe may run");
+        assert!(!labels.contains(&"proxy-flip"), "no flip");
+        assert!(!labels.contains(&"link-current"), "current not repointed");
+        assert!(
+            !labels.iter().any(|l| l.starts_with("teardown")),
+            "nothing torn down"
+        );
+    }
+
+    #[test]
+    fn first_deploy_readiness_failure_tears_down_candidate_no_previous() {
+        // A FIRST deploy has no previous release: a readiness failure before the
+        // app goes live tears the just-started candidate down and fails loudly.
+        let ops = sample_ops(Secret::new("AUTUMN_SECURITY__SIGNING_SECRET=x\n"));
+        let cfg = resolved();
+        let plan = SlotPlan::first(3000);
+        let teardown = candidate_teardown_ops(&cfg, RELEASE_ID, &plan);
+        let exec = RecordingExecutor::failing_on("readiness-gate");
+        let checks = vec![PreflightCheck::pass("ssh_reachability", "ok")];
+        let err = execute_first_deploy(&checks, &ops, &teardown, &exec)
+            .expect_err("first-deploy readiness failure must fail the deploy");
+        assert!(
+            matches!(
+                err,
+                DeployExecError::FirstDeployTornDown {
+                    failed_step: "readiness-gate",
+                    ..
+                }
+            ),
+            "expected FirstDeployTornDown at readiness-gate, got {err:?}"
+        );
+        let labels = exec.run_labels();
+        // The proxy is never routed at an unhealthy first release, and the just-
+        // started candidate (blue) is torn down.
+        assert!(!labels.contains(&"proxy-route"), "no route on failed gate");
+        let td_unit = exec
+            .shell_for("teardown-candidate-unit")
+            .expect("teardown-candidate-unit ran");
+        assert!(
+            td_unit.contains("disable --now myapp-blue.service"),
+            "teardown stops+disables the first-deploy (blue) slot unit: {td_unit}"
+        );
     }
 
     #[test]
@@ -1463,7 +1976,7 @@ mod tests {
             PreflightCheck::fail("ssh_reachability", "no target host configured", "set host"),
         ];
 
-        let err = execute_first_deploy(&checks, &ops, &exec)
+        let err = execute_first_deploy(&checks, &ops, &[], &exec)
             .expect_err("failing preflight must abort the deploy");
         assert!(
             matches!(err, DeployExecError::PreflightAborted { failed: 1 }),
@@ -1481,7 +1994,7 @@ mod tests {
         let ops = sample_ops(Secret::new("AUTUMN_SECURITY__SIGNING_SECRET=x\n"));
         let exec = RecordingExecutor::new();
         let checks = vec![PreflightCheck::pass("ssh_reachability", "reachable")];
-        execute_first_deploy(&checks, &ops, &exec).expect("all checks pass → deploy runs");
+        execute_first_deploy(&checks, &ops, &[], &exec).expect("all checks pass → deploy runs");
         // 2 proxy ops + 9 first-deploy ops + 1 proxy route = 12.
         assert_eq!(exec.calls().len(), 12, "the full op sequence should run");
     }
