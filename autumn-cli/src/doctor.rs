@@ -3000,6 +3000,28 @@ fn check_pending_migrations(database_url: &str) -> CheckResult {
     }
 }
 
+/// `SQLite`-target variant of the pending-migration probe (`SQLite` foundation,
+/// issue #1614). [`check_pending_migrations`] shells out to `diesel migration
+/// pending` and, when the diesel CLI is absent, points users at
+/// `cargo install diesel_cli ... --features postgres` — a Postgres-specific
+/// hint/`--strict` failure that doesn't apply to a `SQLite` app. `SQLite`
+/// migration checks are not yet wired (tracked in #1906), so this is an honest
+/// informational Pass with a deferred note rather than the Postgres diesel probe
+/// or a silent claim that migrations are up to date.
+fn check_pending_migrations_sqlite() -> CheckResult {
+    CheckResult {
+        name: "pending_migrations",
+        status: CheckStatus::Pass,
+        detail: Some(
+            "SQLite app: migration checks are not yet wired; skipping the Postgres diesel probe"
+                .into(),
+        ),
+        hint: Some(
+            "SQLite migration support is tracked in https://github.com/madmax983/autumn/issues/1906",
+        ),
+    }
+}
+
 fn check_replica_migrations(
     primary_url: &str,
     replica_url: &str,
@@ -3657,13 +3679,6 @@ fn resolve_effective_mail_transport(
 /// autumn-web `mail.rs`.
 fn mail_transport_requires_from(transport: &str) -> bool {
     transport == "smtp"
-}
-
-fn resolve_database_topology(table: Option<&toml::Table>) -> DoctorDatabaseTopology {
-    resolve_database_topology_from_sources(
-        |key| std::env::var(key).ok().filter(|value| !value.is_empty()),
-        table,
-    )
 }
 
 fn resolve_database_topology_from_sources<F>(
@@ -5819,13 +5834,30 @@ pub fn run(opts: DoctorOptions) {
     let msrv = read_msrv().unwrap_or_else(|| "1.88.0".to_owned());
     let web_ver = read_autumn_web_version();
     let toml_result = std::fs::read_to_string("autumn.toml");
-    let toml_table = toml_result
-        .as_deref()
-        .ok()
-        .and_then(|content| toml::from_str::<toml::Table>(content).ok())
-        .or_else(read_autumn_toml_table);
-    let db_topology = resolve_database_topology(toml_table.as_ref());
-    let (process_role, jobs_backend) = resolve_process_role_and_backend(toml_table.as_ref());
+    // Resolve doctor's database topology + process role/jobs backend from the
+    // MERGED active-profile config (base autumn.toml + [profile.<env>] +
+    // autumn-<env>.toml) plus the `.env` overlay — the SAME layering the
+    // runtime, generator (`detect_backend`), and `autumn migrate` use — NOT the
+    // raw top-level `autumn.toml` table. A database URL (or `role`/`jobs.backend`)
+    // supplied only by an active profile (`[profile.<env>].database` /
+    // `autumn-<env>.toml`) or by `.env` is invisible to the raw table, so a
+    // raw-table lookup under `AUTUMN_ENV=prod` would MISS a SQLite target and run
+    // the Postgres-only pg_dump/pg_restore + pending-migration checks (finding
+    // F21). Env precedence is preserved: the resolver reads the `.env`-backed
+    // overlay first, then the merged table, mirroring the sibling deploy DB
+    // preflight below.
+    let (db_canonical, db_selected, _) = resolve_active_profiles();
+    let merged_db_toml = get_merged_toml_table_runtime(&db_canonical, &db_selected);
+    let db_denv: Box<dyn autumn_web::config::Env> =
+        match autumn_web::dotenv::os_env_with_dotenv_for_profile(&db_canonical) {
+            Ok(e) => Box::new(e),
+            Err(_) => Box::new(autumn_web::config::OsEnv),
+        };
+    let db_topology = resolve_database_topology_from_sources(
+        |key| db_denv.var(key).ok().filter(|value| !value.is_empty()),
+        Some(&merged_db_toml),
+    );
+    let (process_role, jobs_backend) = resolve_process_role_and_backend(Some(&merged_db_toml));
     let port = resolve_server_port();
     let tailwind = tailwind_enabled();
     let signing_secret = resolve_optional_signing_secret();
@@ -5925,12 +5957,25 @@ pub fn run(opts: DoctorOptions) {
     );
     if let Some(url) = db_topology.primary_url.clone() {
         let primary_for_pending = url.clone();
+        let primary_is_sqlite = autumn_web::config::DatabaseBackend::detect(&url)
+            == Some(autumn_web::config::DatabaseBackend::Sqlite);
         tasks.push(Box::new(move || {
             check_db_connectivity(&url, sqlite_primary_bootable)
         }));
-        tasks.push(Box::new(move || {
-            check_pending_migrations(&primary_for_pending)
-        }));
+        // `check_pending_migrations` shells out to `diesel migration pending` and,
+        // when the CLI is absent, tells users to install `diesel_cli ... --features
+        // postgres` — a Postgres-specific warning / `--strict` failure that doesn't
+        // apply to a SQLite app. SQLite migration tracking is deferred to #1906, so
+        // emit an honest deferred note instead of the Postgres probe (finding F20),
+        // gated off the SAME profile-merged backend detection as the pg_client_tools
+        // skip and the connectivity check.
+        if primary_is_sqlite {
+            tasks.push(Box::new(check_pending_migrations_sqlite));
+        } else {
+            tasks.push(Box::new(move || {
+                check_pending_migrations(&primary_for_pending)
+            }));
+        }
     }
 
     if let Some(url) = db_topology.replica_url.clone() {
@@ -13275,6 +13320,132 @@ foo = "bar"
         let r = check_pg_client_tools_sqlite();
         assert_eq!(r.status, CheckStatus::Pass);
         assert!(r.hint.unwrap_or_default().contains("1909"));
+    }
+
+    /// `SQLite` foundation (issue #1614), finding F20: the pending-migration
+    /// probe must not shell out to `diesel migration pending` or emit the
+    /// Postgres `diesel_cli --features postgres` install hint on a `SQLite` app.
+    /// The `SQLite` variant Passes with an honest deferred note citing #1906
+    /// rather than silently claiming migrations are up to date.
+    #[test]
+    fn pending_migrations_sqlite_variant_passes_and_cites_1906() {
+        let r = check_pending_migrations_sqlite();
+        assert_eq!(r.status, CheckStatus::Pass);
+        let detail = r.detail.unwrap_or_default();
+        assert!(
+            detail.contains("not yet wired"),
+            "detail must be an honest deferred note, got {detail:?}"
+        );
+        assert!(
+            !detail.to_lowercase().contains("no pending"),
+            "must not claim migrations are up to date, got {detail:?}"
+        );
+        assert!(r.hint.unwrap_or_default().contains("1906"));
+    }
+
+    /// Finding F21: doctor must resolve its database topology from the MERGED
+    /// active-profile config, not the raw top-level `autumn.toml`. A `sqlite://`
+    /// primary supplied ONLY under `[profile.prod.database]` (active via
+    /// `AUTUMN_ENV=prod`) must be detected as the `SQLite` target — otherwise the
+    /// `pg_dump`/`pg_restore` + pending-migration probes run against a Postgres
+    /// assumption. Mirrors `tls_section_in_manifest_dir_config_is_detected`:
+    /// builds the merged table from a temp dir (no process-env mutation) and
+    /// feeds `resolve_database_topology_from_sources` the way `run()` does.
+    #[test]
+    fn sqlite_primary_in_active_profile_is_detected_as_sqlite() {
+        use autumn_web::config::DatabaseBackend;
+        let dir = tempfile::tempdir().unwrap();
+        // Base autumn.toml has NO [database]; the URL lives only under the prod
+        // profile overlay — exactly the config the raw-table lookup would miss.
+        std::fs::write(
+            dir.path().join("autumn.toml"),
+            "[profile.prod.database]\nprimary_url = \"sqlite://app.db\"\n",
+        )
+        .unwrap();
+
+        let base = dir.path().to_path_buf();
+        let merged = get_merged_toml_table_runtime_with("prod", "prod", move |f| base.join(f));
+        // Env returns nothing, so the URL must come from the merged profile table.
+        let topology = resolve_database_topology_from_sources(|_| None, Some(&merged));
+
+        assert_eq!(
+            topology.primary_url.as_deref(),
+            Some("sqlite://app.db"),
+            "the [profile.prod.database] primary_url must be resolved from the merged table"
+        );
+        assert_eq!(
+            topology
+                .primary_url
+                .as_deref()
+                .and_then(DatabaseBackend::detect),
+            Some(DatabaseBackend::Sqlite),
+            "profile-merged SQLite primary must be detected as SQLite, gating pg_client_tools \
+             and the pending-migration probe"
+        );
+        assert!(
+            sqlite_primary_target_is_bootable(topology.primary_url.as_deref(), None),
+            "a lone SQLite primary from the active profile is a bootable single-role target"
+        );
+    }
+
+    /// Finding F21, override-file variant: a `sqlite://` primary supplied only by
+    /// the `autumn-prod.toml` override file (selected by `AUTUMN_ENV=prod`) must
+    /// likewise be resolved from the merged table.
+    #[test]
+    fn sqlite_primary_in_override_file_is_detected_as_sqlite() {
+        use autumn_web::config::DatabaseBackend;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("autumn.toml"), "[server]\nport = 8080\n").unwrap();
+        std::fs::write(
+            dir.path().join("autumn-prod.toml"),
+            "[database]\nprimary_url = \"sqlite://prod.db\"\n",
+        )
+        .unwrap();
+
+        let base = dir.path().to_path_buf();
+        let merged = get_merged_toml_table_runtime_with("prod", "prod", move |f| base.join(f));
+        let topology = resolve_database_topology_from_sources(|_| None, Some(&merged));
+
+        assert_eq!(
+            topology
+                .primary_url
+                .as_deref()
+                .and_then(DatabaseBackend::detect),
+            Some(DatabaseBackend::Sqlite),
+            "autumn-prod.toml SQLite primary must be detected as SQLite"
+        );
+    }
+
+    /// Finding F21 counter-case: a base-file Postgres app (no profile overlay)
+    /// must still resolve as Postgres so doctor keeps running the Postgres
+    /// connectivity / `pg_client_tools` / pending-migration checks.
+    #[test]
+    fn base_file_postgres_primary_still_detected_as_postgres() {
+        use autumn_web::config::DatabaseBackend;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("autumn.toml"),
+            "[database]\nprimary_url = \"postgres://db:5432/app\"\n",
+        )
+        .unwrap();
+
+        let base = dir.path().to_path_buf();
+        let merged = get_merged_toml_table_runtime_with("prod", "prod", move |f| base.join(f));
+        let topology = resolve_database_topology_from_sources(|_| None, Some(&merged));
+
+        let backend = topology
+            .primary_url
+            .as_deref()
+            .and_then(DatabaseBackend::detect);
+        assert_eq!(
+            backend,
+            Some(DatabaseBackend::Postgres),
+            "a base-file Postgres app must stay Postgres and run the Postgres checks"
+        );
+        assert!(
+            !sqlite_primary_target_is_bootable(topology.primary_url.as_deref(), None),
+            "a Postgres primary is not a SQLite target"
+        );
     }
 
     fn temp_tailwind_path(temp: &tempfile::TempDir) -> std::path::PathBuf {
