@@ -138,6 +138,11 @@ pub enum LifecycleSubcommands {
     /// state from the initial state, and that every reachable non-terminal state
     /// can reach some terminal state. Exits non-zero when any lifecycle is
     /// unsound (CI-friendly).
+    ///
+    /// Note: this is a best-effort source scanner — it resolves bare, qualified,
+    /// and same-module-aliased `#[lifecycle]` attributes, but not cross-file or
+    /// glob-reexport aliases (tracked in #1925). The compile-time typestate is
+    /// the by-construction guarantee.
     Check {
         /// Project root to scan (defaults to the current directory).
         #[arg(value_name = "PATH", default_value = ".")]

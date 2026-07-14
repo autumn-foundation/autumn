@@ -393,7 +393,8 @@ the edges of the current slice:
   a source scanner (like `autumn a11y verify`): it recognizes the macro under a
   bare, qualified (`#[autumn_web::lifecycle(...)]`), or *same-file*-aliased
   (`use autumn_web::lifecycle as lc; #[lc(...)]`) attribute, but cannot follow an
-  alias introduced in another file or through a glob re-export. That is a gap only
+  alias introduced in another file or through a glob re-export (tracked in #1925).
+  That is a gap only
   for the scanner's report — the typestate still makes every undeclared transition
   a compile error however the macro is spelled.
 
