@@ -617,7 +617,8 @@ pub fn build_deploy_plan(cfg: &ResolvedDeployConfig) -> Vec<DeployStep> {
         DeployStep::new(
             "prune",
             format!(
-                "Prune old releases, retaining the most recent {}",
+                "Prune old releases, retaining the most recent {} — always keeping the releases \
+                 the current symlink and previous-release marker point at (rollback targets)",
                 cfg.keep_releases
             ),
         ),

@@ -604,7 +604,8 @@ pub fn first_deploy_ops(
 /// 11. promote `current` to the new release,
 /// 12. record the live slot marker,
 /// 13. drain (stop) the old release,
-/// 14. prune old releases beyond `keep_releases`.
+/// 14. prune old releases beyond `keep_releases`, always protecting the releases
+///     `current` and the previous-release marker point at (rollback targets).
 #[must_use]
 pub fn cutover_ops(
     cfg: &ResolvedDeployConfig,
@@ -691,7 +692,12 @@ pub fn cutover_ops(
         )),
         DeployOp::Run(RemoteCommand::new(
             "prune",
-            prune_releases_shell(&cfg.releases_dir(), cfg.keep_releases),
+            prune_releases_shell(
+                &cfg.releases_dir(),
+                &current,
+                &previous_release_marker(cfg),
+                cfg.keep_releases,
+            ),
         )),
     ]
 }
@@ -984,18 +990,50 @@ fn release_migrate_command(cfg: &ResolvedDeployConfig, release_dir: &str) -> Rem
     )
 }
 
-/// Prune shell: keep the newest `keep` release dirs, delete the rest. `ls -1dt`
-/// lists dirs newest-first; `tail -n +{keep+1}` skips the newest `keep`.
+/// Prune shell: keep the newest `keep` release dirs, delete the rest — but NEVER
+/// delete the two releases rollback depends on, regardless of their mtime.
 ///
-/// `keep` is clamped to at least 1: a `keep` of 0 would make `tail -n +1` list
-/// EVERY release — including the just-deployed active one — and `rm -rf` it.
+/// A pure mtime prune (`ls -1dt` newest-first, drop the newest `keep`, `rm -rf`
+/// the rest) is unsafe once a rollback is in the history: after
+/// `A→B→rollback-to-A→deploy-C` the `current` symlink and the
+/// `shared/previous-release` marker point at an OLDER release (`A`) while newer
+/// abandoned dirs (`B`) exist, so a naive prune would delete `A` and leave
+/// `current` / the rollback target dangling — the next `deploy rollback` could
+/// not start it.
+///
+/// So this resolves the two PROTECTED release basenames first and excludes them
+/// from the candidate set before applying the count bound:
+///   - `cur` = basename of what `current` resolves to (`readlink -f`), and
+///   - `prev` = basename of the dir field (first tab-separated field) of the
+///     previous-release marker, when that file exists.
+///
+/// The remaining (non-protected) dirs are listed newest-first and everything past
+/// the newest `keep` of THEM is removed. The protected dirs always survive, even
+/// when they are the oldest by mtime; `keep` bounds only the non-protected count.
+///
+/// `keep` is still clamped to at least 1 so at least one non-protected release is
+/// retained. Empty `cur`/`prev` (missing symlink or marker) make their
+/// `grep -vxF ""` a no-op that excludes nothing. POSIX-sh safe; interpolated
+/// paths are shell-quoted.
 #[must_use]
-fn prune_releases_shell(releases_dir: &str, keep: u32) -> String {
+fn prune_releases_shell(
+    releases_dir: &str,
+    current: &str,
+    previous_marker: &str,
+    keep: u32,
+) -> String {
     let keep = keep.max(1);
     format!(
-        "cd {} && ls -1dt */ 2>/dev/null | tail -n +{} | xargs -r rm -rf",
-        shell_quote(releases_dir),
-        keep + 1,
+        "cd {dir} && \
+         cur=$(basename \"$(readlink -f {current} 2>/dev/null)\" 2>/dev/null); \
+         prev=; \
+         if [ -f {marker} ]; then prev=$(basename \"$(cut -f1 {marker} 2>/dev/null)\" 2>/dev/null); fi; \
+         ls -1dt */ 2>/dev/null | sed 's:/$::' | grep -vxF \"$cur\" | grep -vxF \"$prev\" \
+         | tail -n +{tail} | xargs -r rm -rf",
+        dir = shell_quote(releases_dir),
+        current = shell_quote(current),
+        marker = shell_quote(previous_marker),
+        tail = keep + 1,
     )
 }
 
@@ -2220,7 +2258,8 @@ mod tests {
         let exec = RecordingExecutor::new();
         run_ops(&ops, &exec).expect("run ok");
         let prune = exec.shell_for("prune").expect("prune ran");
-        // `tail -n +4` keeps the newest 3 release dirs and deletes the rest.
+        // `tail -n +4` keeps the newest 3 NON-protected release dirs and deletes
+        // the rest.
         assert!(
             prune.contains("ls -1dt */") && prune.contains("tail -n +4"),
             "prune must keep exactly keep_releases (3): {prune}"
@@ -2229,6 +2268,127 @@ mod tests {
             prune.contains("/srv/autumn/myapp/releases"),
             "prune operates on the releases dir: {prune}"
         );
+    }
+
+    #[test]
+    fn prune_preserves_current_and_previous_targets() {
+        // The prune must resolve the releases `current` and the previous-release
+        // marker point at and exclude those basenames from the delete set, so a
+        // rollback target that is OLD by mtime is never pruned (the
+        // A→B→rollback→A→deploy-C hazard).
+        let ops = sample_cutover_ops(Secret::new("AUTUMN_SECURITY__SIGNING_SECRET=x\n"));
+        let exec = RecordingExecutor::new();
+        run_ops(&ops, &exec).expect("run ok");
+        let prune = exec.shell_for("prune").expect("prune ran");
+
+        // Resolves `current` via readlink and the marker's first (dir) field.
+        assert!(
+            prune.contains("readlink -f '/srv/autumn/myapp/current'"),
+            "prune resolves the current symlink target: {prune}"
+        );
+        assert!(
+            prune.contains("cut -f1 '/srv/autumn/myapp/shared/previous-release'"),
+            "prune reads the previous-release marker dir field: {prune}"
+        );
+        // Excludes both protected basenames from the candidate set BEFORE the
+        // count bound (`tail`), so they survive regardless of mtime.
+        let exclude = prune.find("grep -vxF \"$cur\"");
+        let exclude_prev = prune.find("grep -vxF \"$prev\"");
+        let tail = prune.find("tail -n +");
+        assert!(
+            exclude.is_some() && exclude_prev.is_some(),
+            "prune excludes both protected basenames: {prune}"
+        );
+        assert!(
+            exclude < tail && exclude_prev < tail,
+            "protected exclusions precede the keep-count bound: {prune}"
+        );
+    }
+
+    #[test]
+    fn prune_shell_protects_current_and_previous_dirs_end_to_end() {
+        // Behavioral proof: run the generated prune shell against a real tempdir of
+        // fake release dirs, with `current` -> the newest dir and the marker naming
+        // the OLDEST dir. Both protected dirs must survive; an old UNPROTECTED dir
+        // must be removed.
+        let root = std::env::temp_dir().join(format!(
+            "autumn-prune-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let releases = root.join("releases");
+        let shared = root.join("shared");
+        std::fs::create_dir_all(&releases).expect("mk releases");
+        std::fs::create_dir_all(&shared).expect("mk shared");
+
+        // mtime newest -> oldest: cur_new, stale_new, stale_old, prev_old.
+        let dirs = [
+            ("prev_old", 100u64), // oldest, PROTECTED via marker
+            ("stale_old", 200),   // unprotected, should be REMOVED
+            ("stale_new", 300),   // unprotected, newest non-protected -> kept
+            ("cur_new", 400),     // newest, PROTECTED via current symlink
+        ];
+        for (name, mtime) in dirs {
+            let d = releases.join(name);
+            std::fs::create_dir(&d).expect("mk release dir");
+            // Set an explicit mtime (GNU touch, epoch seconds) so newest-first
+            // ordering is deterministic without sleeping between creates.
+            let ok = std::process::Command::new("touch")
+                .arg("-m")
+                .arg("-d")
+                .arg(format!("@{mtime}"))
+                .arg(&d)
+                .status()
+                .expect("run touch")
+                .success();
+            assert!(ok, "touch must set mtime");
+        }
+
+        let current = root.join("current");
+        std::os::unix::fs::symlink(releases.join("cur_new"), &current).expect("symlink current");
+        let marker = shared.join("previous-release");
+        std::fs::write(
+            &marker,
+            format!("{}\tblue", releases.join("prev_old").display()),
+        )
+        .expect("write marker");
+
+        // keep=1 bounds the NON-protected set to its single newest (stale_new),
+        // so stale_old (older, unprotected) is pruned.
+        let shell = prune_releases_shell(
+            releases.to_str().unwrap(),
+            current.to_str().unwrap(),
+            marker.to_str().unwrap(),
+            1,
+        );
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&shell)
+            .status()
+            .expect("run prune shell");
+        assert!(status.success(), "prune shell exited non-zero");
+
+        assert!(
+            releases.join("cur_new").exists(),
+            "current target must survive"
+        );
+        assert!(
+            releases.join("prev_old").exists(),
+            "previous-release target must survive even though it is the oldest"
+        );
+        assert!(
+            releases.join("stale_new").exists(),
+            "newest non-protected release is retained by keep=1"
+        );
+        assert!(
+            !releases.join("stale_old").exists(),
+            "old unprotected release must be pruned"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
