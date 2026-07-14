@@ -273,12 +273,13 @@ pub fn detect_backend(project_root: &Path) -> autumn_web::config::DatabaseBacken
 }
 
 /// Directory-, profile-, and env-parameterized core of [`detect_backend`],
-/// separated so the profile-overlay resolution is unit-testable without
-/// mutating the process-global environment.
+/// separated so the profile-overlay and `.env` resolution is unit-testable
+/// without mutating the process-global environment.
 ///
 /// Loads the same merged, profile-aware config table `autumn migrate` builds
-/// (via [`crate::migrate::read_autumn_toml_table_with_profile_in`]) and applies
-/// the same env-var precedence
+/// (via [`crate::migrate::read_autumn_toml_table_with_profile_in`]), overlays
+/// the project `.env` the same way (via [`autumn_web::dotenv`]), and applies the
+/// same env-var precedence
 /// ([`crate::migrate::resolve_primary_database_url_from_sources`]).
 fn detect_backend_with<F>(
     project_root: &Path,
@@ -290,11 +291,54 @@ where
 {
     use autumn_web::config::DatabaseBackend;
 
+    // Mirror `autumn migrate`: overlay a project `.env` UNDER the real
+    // environment before resolving the DB URL, so a URL that lives only in
+    // `.env` (e.g. `DATABASE_URL=sqlite://app.db`) is honored. Without this a
+    // SQLite app whose URL is only in `.env` mis-detects as Postgres and the
+    // generator emits Postgres DDL (`BIGSERIAL`/`NOW()`) even though migrate and
+    // the running app resolve the SQLite URL. `.env` is read from
+    // `project_root` (the same dir the profile-merged `autumn.toml` is read
+    // from) for the resolved profile, honoring the framework's dotenv gating
+    // (only the `dev`/`test` profiles auto-load unless `AUTUMN_DOTENV=1`) and
+    // profile-selector exclusion. Precedence matches migrate's `DotenvOsEnv`
+    // exactly: the real env (`env_var`) wins, and `.env` only fills keys it does
+    // not define. A malformed `.env` is ignored for detection (a best-effort
+    // hint) — `autumn migrate` still surfaces it loudly at migration time.
+    let base = FnEnv(&env_var);
+    let dotenv_overlay: std::collections::BTreeMap<String, String> =
+        autumn_web::dotenv::resolve_dotenv_vars_in(project_root, profile.unwrap_or("dev"), &base)
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+    let env_with_dotenv = |key: &str| {
+        env_var(key).or_else(|_| {
+            dotenv_overlay
+                .get(key)
+                .cloned()
+                .ok_or(std::env::VarError::NotPresent)
+        })
+    };
+
     let table = crate::migrate::read_autumn_toml_table_with_profile_in(project_root, profile);
-    crate::migrate::resolve_primary_database_url_from_sources(env_var, table.as_ref())
+    crate::migrate::resolve_primary_database_url_from_sources(env_with_dotenv, table.as_ref())
         .as_deref()
         .and_then(DatabaseBackend::detect)
         .unwrap_or(DatabaseBackend::Postgres)
+}
+
+/// Adapter turning an `Fn(&str) -> Result<String, VarError>` env-var lookup into
+/// an [`autumn_web::config::Env`], so [`detect_backend_with`] can feed its
+/// test-injectable env closure to the `.env` resolver without mutating (or
+/// depending on) the real process environment.
+struct FnEnv<F>(F);
+
+impl<F> autumn_web::config::Env for FnEnv<F>
+where
+    F: Fn(&str) -> Result<String, std::env::VarError>,
+{
+    fn var(&self, key: &str) -> Result<String, std::env::VarError> {
+        (self.0)(key)
+    }
 }
 
 /// The generate-time rejection for a DSL field kind whose rendered Rust model
@@ -496,6 +540,96 @@ mod tests {
         assert_eq!(
             detect_backend_with(tmp.path(), Some("dev"), env),
             DatabaseBackend::Sqlite
+        );
+    }
+
+    // ── dotenv-backed backend detection (issue #1614 finding 8) ────────────
+
+    /// A DB URL that lives ONLY in the project `.env` (no `autumn.toml` url, no
+    /// process env) must be detected — `autumn migrate` overlays `.env` before
+    /// resolving the URL, so the generator must too, or a `SQLite` app mis-detects
+    /// as Postgres and emits `BIGSERIAL`/`NOW()` DDL.
+    #[test]
+    fn detect_backend_honors_sqlite_url_in_dotenv() {
+        use autumn_web::config::DatabaseBackend;
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join(".env"), "DATABASE_URL=sqlite://app.db\n").unwrap();
+        assert_eq!(
+            detect_backend_with(tmp.path(), Some("dev"), no_env),
+            DatabaseBackend::Sqlite
+        );
+    }
+
+    /// A real process env var of the same key wins over `.env` — the exact
+    /// precedence migrate's `DotenvOsEnv` uses (real env wins, `.env` only fills
+    /// gaps). A `.env` `SQLite` URL must NOT override a Postgres `DATABASE_URL` in
+    /// the (test-injected) real environment.
+    #[test]
+    fn detect_backend_process_env_wins_over_dotenv() {
+        use autumn_web::config::DatabaseBackend;
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join(".env"), "DATABASE_URL=sqlite://app.db\n").unwrap();
+        let env = |key: &str| {
+            if key == "DATABASE_URL" {
+                Ok("postgres://localhost/app".to_owned())
+            } else {
+                Err(std::env::VarError::NotPresent)
+            }
+        };
+        assert_eq!(
+            detect_backend_with(tmp.path(), Some("dev"), env),
+            DatabaseBackend::Postgres
+        );
+    }
+
+    /// The `.env`-fed env-var layer sits ABOVE the merged `autumn.toml` (matching
+    /// migrate's `resolve_primary_database_url_from_sources` order): a `.env`
+    /// `DATABASE_URL=sqlite://…` wins over a base-file Postgres URL.
+    #[test]
+    fn detect_backend_dotenv_overlays_above_autumn_toml() {
+        use autumn_web::config::DatabaseBackend;
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("autumn.toml"),
+            "[database]\nprimary_url = \"postgres://localhost/app\"\n",
+        )
+        .unwrap();
+        std::fs::write(tmp.path().join(".env"), "DATABASE_URL=sqlite://app.db\n").unwrap();
+        assert_eq!(
+            detect_backend_with(tmp.path(), Some("dev"), no_env),
+            DatabaseBackend::Sqlite
+        );
+    }
+
+    /// No `.env` and a base-file Postgres URL still resolves to Postgres — the
+    /// dotenv overlay is empty and changes nothing.
+    #[test]
+    fn detect_backend_no_dotenv_stays_postgres() {
+        use autumn_web::config::DatabaseBackend;
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("autumn.toml"),
+            "[database]\nprimary_url = \"postgres://localhost/app\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            detect_backend_with(tmp.path(), Some("dev"), no_env),
+            DatabaseBackend::Postgres
+        );
+    }
+
+    /// `.env` auto-loads only for the `dev`/`test` profiles (unless
+    /// `AUTUMN_DOTENV=1`), matching the framework's gating: a `.env` `SQLite` URL
+    /// under an ungated `prod` profile is NOT loaded, so detection falls back to
+    /// Postgres.
+    #[test]
+    fn detect_backend_dotenv_gated_off_for_prod_profile() {
+        use autumn_web::config::DatabaseBackend;
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join(".env"), "DATABASE_URL=sqlite://app.db\n").unwrap();
+        assert_eq!(
+            detect_backend_with(tmp.path(), Some("prod"), no_env),
+            DatabaseBackend::Postgres
         );
     }
 }

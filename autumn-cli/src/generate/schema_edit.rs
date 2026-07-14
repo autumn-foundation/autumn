@@ -903,13 +903,48 @@ pub fn encrypt_columns_down_sql(table: &str, columns: &[String]) -> String {
     out
 }
 
-/// SQL for removing columns from a table.
+/// SQL for removing columns from a table (Postgres default).
+///
+/// Retained as a Postgres-default convenience wrapper for the test suite; the
+/// backend-aware [`remove_columns_up_sql_for`] is what production calls.
+#[cfg(test)]
+#[must_use]
+pub fn remove_columns_up_sql(table: &str, fields: &[Field]) -> String {
+    remove_columns_up_sql_for(DatabaseBackend::Postgres, table, fields, "")
+}
+
+/// [`remove_columns_up_sql`] for a specific database `backend` (issue #1614).
 ///
 /// Prepends an `autumn-safety` comment for each `DROP COLUMN` to make the
 /// rolling-deploy risk visible at a glance and machine-parseable by
 /// `autumn migrate check`.
+///
+/// On `SQLite`, the generator auto-creates an index for a `references` field
+/// (`idx_<table>_<col>`, matching [`add_columns_up_sql_for`] /
+/// [`create_table_sql_with_metadata_and_id`]) and for a `unique` field
+/// ([`unique_index_name`]), and `SQLite` refuses to `DROP COLUMN` while an index
+/// still references it (`cannot drop column: used in an index`). So on the
+/// `SQLite` path this emits `DROP INDEX <name>;` for each removed field the
+/// generator would have indexed, **before** its `DROP COLUMN` — the same fix as
+/// the rollback path ([`add_columns_down_sql_for`]), here on the forward
+/// `RemoveColumns` path. Postgres cascades index drops with the column, so its
+/// output stays byte-for-byte identical (no explicit `DROP INDEX`).
+///
+/// Scope boundary: this only drops indexes the generator itself derives from
+/// the field spec (a `references` field's auto-index, a `unique` field's unique
+/// index). A column indexed for reasons the generator cannot see (a hand-added
+/// index, a composite index) remains the documented limitation of issue #1906.
+///
+/// `existing_schema` mirrors [`add_columns_down_sql_for`] so a `unique` field's
+/// index name matches the one the up path generated.
 #[must_use]
-pub fn remove_columns_up_sql(table: &str, fields: &[Field]) -> String {
+pub fn remove_columns_up_sql_for(
+    backend: DatabaseBackend,
+    table: &str,
+    fields: &[Field],
+    existing_schema: &str,
+) -> String {
+    let collision_fields = fields_with_existing_schema_columns(fields, existing_schema, table);
     let mut out = String::new();
     for f in fields {
         let _ = writeln!(
@@ -918,6 +953,18 @@ pub fn remove_columns_up_sql(table: &str, fields: &[Field]) -> String {
              -- old replicas that reference this column will fail until restarted; \
              use expand/contract"
         );
+        // SQLite: drop the generator's index for this field first (see doc
+        // comment). The generator indexes exactly a `unique` field or a
+        // non-unique `references` field, using the same names the ADD path
+        // derives, so the DROP INDEX matches the existing CREATE INDEX.
+        if backend == DatabaseBackend::Sqlite {
+            if f.unique {
+                let name = unique_index_name(table, &f.name, &collision_fields);
+                let _ = writeln!(out, "DROP INDEX {name};");
+            } else if f.kind.is_reference() {
+                let _ = writeln!(out, "DROP INDEX idx_{table}_{};", f.name);
+            }
+        }
         let _ = writeln!(out, "ALTER TABLE {table} DROP COLUMN {};", f.name);
     }
     out
@@ -5390,6 +5437,71 @@ mod tests {
         assert_eq!(down, "ALTER TABLE posts DROP COLUMN author_id;\n");
         // And the Postgres-default test wrapper matches.
         assert_eq!(add_columns_down_sql("posts", &f), down);
+    }
+
+    /// Forward `RemoveColumns` path (issue #1614 finding 9): `SQLite` refuses to
+    /// `DROP COLUMN` while an index still references it, and the generator
+    /// auto-indexes a `references` field, so the `SQLite` up.sql must `DROP INDEX`
+    /// before `DROP COLUMN`, using the same name the ADD path created.
+    #[test]
+    fn sqlite_remove_columns_up_drops_reference_index_before_column() {
+        let f = fields(&["author:references?"]);
+        let up = remove_columns_up_sql_for(DatabaseBackend::Sqlite, "posts", &f, "");
+        let drop_idx = up
+            .find("DROP INDEX idx_posts_author_id;")
+            .expect("drop index");
+        let drop_col = up
+            .find("ALTER TABLE posts DROP COLUMN author_id;")
+            .expect("drop column");
+        assert!(
+            drop_idx < drop_col,
+            "DROP INDEX must precede DROP COLUMN:\n{up}"
+        );
+    }
+
+    /// Same for a `unique` field: its `CREATE UNIQUE INDEX` must be dropped
+    /// before the column on the `SQLite` forward `RemoveColumns` path, using the
+    /// same derived index name.
+    #[test]
+    fn sqlite_remove_columns_up_drops_unique_index_before_column() {
+        let f = fields(&["email:Option<String>:unique"]);
+        let up = remove_columns_up_sql_for(DatabaseBackend::Sqlite, "users", &f, "");
+        let drop_idx = up
+            .find("DROP INDEX idx_users_email_unique;")
+            .expect("drop index");
+        let drop_col = up
+            .find("ALTER TABLE users DROP COLUMN email;")
+            .expect("drop column");
+        assert!(
+            drop_idx < drop_col,
+            "DROP INDEX must precede DROP COLUMN:\n{up}"
+        );
+    }
+
+    /// A plain, non-indexed field gets only a `DROP COLUMN` on `SQLite` — no
+    /// spurious `DROP INDEX` for a column the generator never indexed.
+    #[test]
+    fn sqlite_remove_columns_up_plain_field_has_no_drop_index() {
+        let f = fields(&["body:String"]);
+        let up = remove_columns_up_sql_for(DatabaseBackend::Sqlite, "posts", &f, "");
+        assert!(
+            !up.contains("DROP INDEX"),
+            "non-indexed column must not emit DROP INDEX:\n{up}"
+        );
+        assert!(up.contains("ALTER TABLE posts DROP COLUMN body;"));
+    }
+
+    /// Postgres cascades index drops with the column, so its forward up.sql
+    /// stays byte-for-byte identical to the legacy `DROP COLUMN`-only output —
+    /// no explicit `DROP INDEX`, even for an indexed `references` field.
+    #[test]
+    fn postgres_remove_columns_up_has_no_explicit_drop_index() {
+        let f = fields(&["author:references?"]);
+        let up = remove_columns_up_sql_for(DatabaseBackend::Postgres, "posts", &f, "");
+        assert!(!up.contains("DROP INDEX"), "up:\n{up}");
+        assert!(up.contains("ALTER TABLE posts DROP COLUMN author_id;"));
+        // And the Postgres-default test wrapper matches.
+        assert_eq!(remove_columns_up_sql("posts", &f), up);
     }
 
     // ── enum field: CHECK constraint (issue #1030) ──────────────────────────

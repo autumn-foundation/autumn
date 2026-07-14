@@ -13,7 +13,7 @@ use super::naming::pascal_to_snake;
 use super::schema_edit::{
     MigrationShape, add_columns_down_sql_for, add_columns_up_sql_for, add_search_down_sql,
     add_search_up_sql, detect_migration_shape, encrypt_columns_down_sql, encrypt_columns_up_sql,
-    parse_model_search_config_for_table, remove_columns_down_sql_for, remove_columns_up_sql,
+    parse_model_search_config_for_table, remove_columns_down_sql_for, remove_columns_up_sql_for,
     singularize,
 };
 use super::{GenerateError, detect_backend, ensure_project_root};
@@ -135,7 +135,7 @@ pub fn plan_migration_with_options(
             let existing_schema =
                 std::fs::read_to_string(project_root.join("src/schema.rs")).unwrap_or_default();
             (
-                remove_columns_up_sql(table, &fields),
+                remove_columns_up_sql_for(backend, table, &fields, &existing_schema),
                 remove_columns_down_sql_for(backend, table, &fields, &existing_schema)?,
             )
         }
