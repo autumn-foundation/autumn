@@ -276,7 +276,7 @@ pub struct NestedChangeset<P, C> {
 
 impl<P, C: NestedChild> NestedChangeset<P, C> {
     /// Build a blank, **non-validating** nested changeset for the initial
-    /// `new` (or `edit`) render, before the user has submitted anything.
+    /// `new` (create) render, before the user has submitted anything.
     ///
     /// Mirrors [`ChangesetForm::blank`](crate::form::ChangesetForm::blank): it
     /// wraps `parent` in a valid [`Changeset`] (via [`Changeset::new`], which
@@ -285,11 +285,15 @@ impl<P, C: NestedChild> NestedChangeset<P, C> {
     /// `errors_for(..)` is empty, `rows()` is empty, and `into_valid()` returns
     /// `Ok((parent, vec![]))` even when a required parent field is still empty.
     ///
-    /// Use this for the initial GET render so the blank page does not show a
-    /// premature "field is required" error or `aria-invalid="true"` before the
-    /// user has typed. Use [`decode_nested_urlencoded`] (or the
-    /// [`NestedChangesetForm`] extractor) for the POST decode that validates a
-    /// real submission and re-renders with inline errors.
+    /// Use this for the initial GET render of an **empty** (create) form so the
+    /// blank page does not show a premature "field is required" error or
+    /// `aria-invalid="true"` before the user has typed. For an **edit** render
+    /// that must display existing child rows (with their persisted ids), use
+    /// [`seeded`](NestedChangeset::seeded) instead — `blank` produces zero child
+    /// rows and cannot pre-fill or preserve existing line items. Use
+    /// [`decode_nested_urlencoded`] (or the [`NestedChangesetForm`] extractor)
+    /// for the POST decode that validates a real submission and re-renders with
+    /// inline errors.
     #[must_use]
     pub fn blank(parent: P) -> Self {
         Self {
@@ -375,6 +379,78 @@ impl<P, C: NestedChild> NestedChangeset<P, C> {
     #[must_use]
     pub const fn collection_name(&self) -> &'static str {
         C::COLLECTION
+    }
+}
+
+/// Edit-render seeding — pre-populate a non-validating changeset with existing
+/// persisted children.
+///
+/// The extra [`serde::Serialize`] bound lives on this `impl` block alone, so the
+/// core [`NestedChild`] trait stays serialize-free; only callers that seed an
+/// edit form need their child type to be serializable.
+impl<P, C: NestedChild + serde::Serialize> NestedChangeset<P, C> {
+    /// Build a **non-validating**, valid nested changeset that pre-renders one
+    /// row per existing `child`, for the initial `edit` render of a form that
+    /// already has persisted children.
+    ///
+    /// Where [`blank`](NestedChangeset::blank) produces **zero** child rows (for
+    /// the create/new page), `seeded` produces exactly one [`NestedRow`] per
+    /// element of `children`, so an edit form can display and preserve existing
+    /// line items — including each child's `id` as a hidden input (via
+    /// [`RowScope::hidden_input`]) — before the first submit. That hidden `id`
+    /// also makes the in-scope `_destroy`-on-existing-children flow usable: the
+    /// row round-trips its identity so ticking Remove on a persisted child
+    /// submits a real, identifiable row for the handler to delete.
+    ///
+    /// Each row's raw `values` are produced by serializing the child with
+    /// [`serde_urlencoded::to_string`] and parsing the result back into the
+    /// per-subfield map — the **same** string representation
+    /// [`decode_nested_urlencoded`] populates from a real submission, so
+    /// [`RowScope::value`] pre-fills a seeded row's inputs identically to a
+    /// re-rendered submitted row.
+    ///
+    /// Like `blank`, this does **not** run [`validator::Validate`]: it wraps
+    /// `parent` in a valid [`Changeset`] (via [`Changeset::new`]) and keeps
+    /// `valid_children = Some(children)`, so `is_valid()` returns `true`,
+    /// `errors_for(..)` is empty, every seeded row reports no errors and is not
+    /// destroyed, and `into_valid()` returns `Ok((parent, children))`. Use the
+    /// POST decode path ([`decode_nested_urlencoded`] / the
+    /// [`NestedChangesetForm`] extractor) to validate the actual edit
+    /// submission.
+    ///
+    /// Deeper reconciliation of persisted children — reordering, or deep-diffing
+    /// submitted rows against the seeded set to compute per-row inserts /
+    /// updates / deletes — is intentionally **out of scope** here (see issue
+    /// #1346's out-of-scope list) and remains a follow-up; `seeded` only
+    /// pre-renders the existing rows so the no-JS edit + `_destroy` flow works.
+    #[must_use]
+    pub fn seeded(parent: P, children: Vec<C>) -> Self {
+        let rows = children
+            .iter()
+            .map(|child| {
+                let mut values: HashMap<String, String> = HashMap::new();
+                // Serialize the child to the same `field=value` wire form the
+                // decoder reads, then parse it back so `RowScope::value` pre-fills
+                // seeded rows identically to a re-rendered submitted row. A
+                // serialization failure (never expected for a plain struct) simply
+                // yields an empty value map rather than panicking on the request path.
+                if let Ok(encoded) = serde_urlencoded::to_string(child) {
+                    for (k, v) in url::form_urlencoded::parse(encoded.as_bytes()) {
+                        values.insert(k.into_owned(), v.into_owned());
+                    }
+                }
+                NestedRow {
+                    values,
+                    errors: HashMap::new(),
+                    destroyed: false,
+                }
+            })
+            .collect();
+        Self {
+            parent: Changeset::new(parent),
+            rows,
+            valid_children: Some(children),
+        }
     }
 }
 
@@ -715,14 +791,16 @@ pub struct NestedChangesetForm<P, C> {
 }
 
 impl<P, C: NestedChild> NestedChangesetForm<P, C> {
-    /// Build a blank nested-form context for the initial `new`/`edit` GET
+    /// Build a blank nested-form context for the initial `new` (create) GET
     /// render, before any submission.
     ///
     /// Mirrors [`ChangesetForm::blank`](crate::form::ChangesetForm::blank): it
     /// wraps `parent` in a **non-validating** [`NestedChangeset::blank`] (no
     /// child rows, no errors) so the initial page renders clean — no premature
     /// "field is required" message or `aria-invalid="true"` before the user has
-    /// typed. Contrast the POST path (the [`NestedChangesetForm`] extractor /
+    /// typed. For an **edit** render that must show existing children, use
+    /// [`seeded`](Self::seeded) instead (`blank` renders zero child rows).
+    /// Contrast the POST path (the [`NestedChangesetForm`] extractor /
     /// [`decode_nested_urlencoded`]), which validates the submission and
     /// re-renders inline errors.
     ///
@@ -895,6 +973,41 @@ impl<P, C: NestedChild> NestedChangesetForm<P, C> {
                 submit_token,
                 submit_field,
             }),
+        }
+    }
+}
+
+/// Edit-render seeding for the form context — mirrors
+/// [`NestedChangeset::seeded`], carrying the extra [`serde::Serialize`] bound on
+/// this `impl` block alone.
+impl<P, C: NestedChild + serde::Serialize> NestedChangesetForm<P, C> {
+    /// Build a nested-form context for the initial `edit` GET render,
+    /// pre-populated with the existing persisted `children`.
+    ///
+    /// Mirrors [`blank`](Self::blank)'s CSRF handling (the CSRF/submit-token
+    /// field names default to `_csrf` / `_submit_token`, and the submit token
+    /// starts `None`), but wraps [`NestedChangeset::seeded`] instead of
+    /// [`NestedChangeset::blank`]: the changeset pre-renders one row per existing
+    /// child so the edit page shows and preserves current line items — with their
+    /// `id`s carried as hidden inputs (via [`RowScope::hidden_input`]) — and the
+    /// no-JS `_destroy` removal of an existing child works before the first
+    /// submit.
+    ///
+    /// The same builder methods used with [`blank`](Self::blank) apply here:
+    /// [`with_csrf_field`](Self::with_csrf_field) for a customized
+    /// `security.csrf.form_field`, and [`with_submit_token`](Self::with_submit_token)
+    /// / [`with_submit_field`](Self::with_submit_field) to emit the one-time
+    /// submit-token hidden input on the initial edit render. `csrf_token` is the
+    /// token from a `CsrfToken` extractor, or `None` when CSRF middleware is not
+    /// active.
+    #[must_use]
+    pub fn seeded(parent: P, children: Vec<C>, csrf_token: Option<String>) -> Self {
+        Self {
+            changeset: NestedChangeset::seeded(parent, children),
+            csrf_token,
+            csrf_field: "_csrf".to_owned(),
+            submit_token: None,
+            submit_field: "_submit_token".to_owned(),
         }
     }
 }
@@ -1534,13 +1647,13 @@ pub fn nested_row_fragment<C: NestedChild>(
 mod tests {
     use super::*;
 
-    #[derive(serde::Deserialize, validator::Validate)]
+    #[derive(serde::Serialize, serde::Deserialize, validator::Validate)]
     struct Order {
         #[validate(length(min = 1, message = "name required"))]
         name: String,
     }
 
-    #[derive(serde::Deserialize, validator::Validate)]
+    #[derive(serde::Serialize, serde::Deserialize, validator::Validate)]
     struct LineItem {
         #[validate(length(min = 1, message = "sku required"))]
         sku: String,
@@ -1986,6 +2099,75 @@ mod tests {
             decode_nested_urlencoded::<Order, LineItem>(&[p("name", "")]).expect("parent decodes");
         assert!(!cs.is_valid());
         assert!(!cs.errors_for("name").is_empty());
+    }
+
+    // ── seeded (edit-render) constructor ───────────────────────────
+
+    #[test]
+    fn seeded_changeset_pre_populates_one_row_per_child() {
+        // The initial `edit`-page path: seed the changeset with the two existing
+        // children so an edit form can display/preserve them before first submit.
+        let cs = NestedChangeset::seeded(
+            Order {
+                name: "Existing order".to_owned(),
+            },
+            vec![
+                LineItem {
+                    sku: "A-1".to_owned(),
+                    quantity: 2,
+                },
+                LineItem {
+                    sku: "B-2".to_owned(),
+                    quantity: 3,
+                },
+            ],
+        );
+
+        // One row per seeded child, each pre-filled with its serialized values —
+        // the same string representation the decoder populates.
+        assert_eq!(cs.rows().len(), 2);
+        assert_eq!(cs.rows()[0].value("sku"), Some("A-1"));
+        assert_eq!(cs.rows()[0].value("quantity"), Some("2"));
+        assert_eq!(cs.rows()[1].value("sku"), Some("B-2"));
+        assert_eq!(cs.rows()[1].value("quantity"), Some("3"));
+
+        // Non-validating and clean: no errors, no destroyed rows.
+        assert!(cs.is_valid());
+        assert!(cs.errors_for("name").is_empty());
+        assert!(cs.errors_for("items[0].sku").is_empty());
+        assert!(cs.errors_for("items[1].quantity").is_empty());
+        assert!(!cs.rows()[0].is_destroyed());
+        assert!(!cs.rows()[1].is_destroyed());
+
+        // `into_valid` returns the seeded parent + children unchanged.
+        let (order, items) = cs
+            .into_valid()
+            .unwrap_or_else(|_| panic!("seeded changeset is valid"));
+        assert_eq!(order.name, "Existing order");
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].sku, "A-1");
+        assert_eq!(items[0].quantity, 2);
+        assert_eq!(items[1].sku, "B-2");
+        assert_eq!(items[1].quantity, 3);
+    }
+
+    #[test]
+    fn seeded_changeset_with_no_children_is_valid_and_empty() {
+        // Seeding zero children behaves like `blank` — a valid changeset with no
+        // rows — so an edit form for a parent that currently has no children is
+        // handled uniformly.
+        let cs = NestedChangeset::<Order, LineItem>::seeded(
+            Order {
+                name: "Empty".to_owned(),
+            },
+            Vec::new(),
+        );
+        assert!(cs.is_valid());
+        assert!(cs.rows().is_empty());
+        let (_order, items) = cs
+            .into_valid()
+            .unwrap_or_else(|_| panic!("seeded changeset is valid"));
+        assert!(items.is_empty());
     }
 }
 
@@ -2448,5 +2630,40 @@ mod maud_tests {
 
         assert!(!html.contains("_submit_token"), "{html}");
         assert!(!html.contains(r#"name="_submit_token""#), "{html}");
+    }
+
+    // ── seeded (edit-render) rendering ──────────────────────────────
+
+    /// A `seeded` changeset pre-renders its existing children through
+    /// `inputs_for`: each seeded row's inputs carry the child's serialized values
+    /// so an edit form shows the current line items, and a trailing blank template
+    /// row is still appended for adding another child with no JS.
+    #[test]
+    fn seeded_rows_render_with_prefilled_values() {
+        let cs = NestedChangeset::seeded(
+            Order {
+                name: "Existing order".to_owned(),
+            },
+            vec![
+                LineItem {
+                    sku: "A-1".to_owned(),
+                    quantity: 2,
+                },
+                LineItem {
+                    sku: "B-2".to_owned(),
+                    quantity: 3,
+                },
+            ],
+        );
+        let html = inputs_for(&cs, &InputsForOptions::default(), render_row).into_string();
+
+        // Both seeded rows render their indexed inputs with pre-filled values.
+        assert!(html.contains(r#"name="items[0][sku]""#), "{html}");
+        assert!(html.contains(r#"value="A-1""#), "{html}");
+        assert!(html.contains(r#"name="items[1][sku]""#), "{html}");
+        assert!(html.contains(r#"value="B-2""#), "{html}");
+        // The trailing blank template row is still appended (index 2).
+        assert!(html.contains(r#"data-index="2""#), "{html}");
+        assert!(html.contains(r#"name="items[2][sku]""#), "{html}");
     }
 }

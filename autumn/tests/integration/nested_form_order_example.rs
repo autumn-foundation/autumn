@@ -55,6 +55,24 @@ impl NestedChild for LineItemForm {
     const COLLECTION: &'static str = "items";
 }
 
+/// The child form for an **edit** render: like [`LineItemForm`] but also
+/// carrying the persisted `id`, so an edit form can round-trip each existing
+/// line item's identity through a hidden input (`items[i][id]`). `Serialize` is
+/// what lets [`NestedChangesetForm::seeded`] pre-fill the row values (including
+/// `id`) from the loaded records.
+#[derive(serde::Serialize, serde::Deserialize, validator::Validate)]
+struct EditLineItemForm {
+    id: i64,
+    #[validate(length(min = 1, message = "SKU is required"))]
+    sku: String,
+    #[validate(range(min = 1, message = "Quantity must be at least 1"))]
+    quantity: i32,
+}
+
+impl NestedChild for EditLineItemForm {
+    const COLLECTION: &'static str = "items";
+}
+
 // ── The view ───────────────────────────────────────────────────────
 
 /// Render the order form: parent field, repeating line-item rows, submit.
@@ -88,6 +106,35 @@ fn render_order_form(form: &NestedChangesetForm<OrderForm, LineItemForm>) -> mau
                 (row.destroy_checkbox("Remove"))
             }))
             (submit_button("Create order"))
+        },
+    )
+}
+
+/// Render the order **edit** form: the parent field plus a pre-rendered row for
+/// every existing line item, each carrying its persisted `id` as a hidden input
+/// (via [`RowScope::hidden_input`] reading the seeded row's `id` value) so the
+/// child round-trips its identity, plus the editable fields and a `_destroy`
+/// checkbox for no-JS removal. Built from [`NestedChangesetForm::seeded`], which
+/// pre-fills each row from the loaded records; `inputs_for` still appends a
+/// trailing blank template row so a user can add another line item without JS.
+fn render_edit_order_form(form: &NestedChangesetForm<OrderForm, EditLineItemForm>) -> maud::Markup {
+    let opts = InputsForOptions::default();
+    form.form_tag(
+        "/orders/1",
+        "PUT",
+        maud::html! {
+            (required_text_input(&form.parent, "name", "Order name"))
+            (inputs_for(&**form, &opts, |row| maud::html! {
+                // Existing (seeded) rows carry their persisted id; the trailing
+                // blank template row has no `id` value, so none is emitted for it.
+                @if let Some(id) = row.value("id") {
+                    (row.hidden_input("id", id))
+                }
+                (row.required_text_input("sku", "SKU"))
+                (row.number_input("quantity", "Quantity"))
+                (row.destroy_checkbox("Remove"))
+            }))
+            (submit_button("Update order"))
         },
     )
 }
@@ -167,6 +214,49 @@ fn failed_submit_re_renders_per_row_errors_and_prefills_values() {
     // The user's values are pre-filled so nothing is retyped.
     assert!(html.contains(r#"value="A-1""#), "{html}");
     assert!(html.contains(r#"value="B-2""#), "{html}");
+}
+
+#[test]
+fn edit_view_seeds_existing_children_with_hidden_ids() {
+    // The initial `edit`-page path: the order already has two persisted line
+    // items. `seeded` pre-renders one row per existing child (pre-filled values +
+    // the persisted `id` as a hidden input) so the edit form shows and preserves
+    // the current line items — and the no-JS `_destroy` removal works — before the
+    // first submit, all without validating the still-loaded parent.
+    let existing = vec![
+        EditLineItemForm {
+            id: 10,
+            sku: "A-1".to_string(),
+            quantity: 2,
+        },
+        EditLineItemForm {
+            id: 20,
+            sku: "B-2".to_string(),
+            quantity: 5,
+        },
+    ];
+    let form = NestedChangesetForm::<OrderForm, EditLineItemForm>::seeded(
+        OrderForm {
+            name: "Widgets order".to_string(),
+        },
+        existing,
+        Some("csrf-token-123".to_owned()),
+    );
+
+    let html = render_edit_order_form(&form).into_string();
+
+    // Each existing child renders pre-filled with its loaded values…
+    assert!(html.contains(r#"value="A-1""#), "{html}");
+    assert!(html.contains(r#"value="B-2""#), "{html}");
+    // …and carries its persisted id as a hidden input so identity round-trips.
+    assert!(html.contains(r#"name="items[0][id]" value="10""#), "{html}");
+    assert!(html.contains(r#"name="items[1][id]" value="20""#), "{html}");
+    // A trailing blank template row is still appended for adding another line
+    // item with no JS — and, being a blank row, it carries NO hidden id input.
+    assert!(html.contains(r#"name="items[2][sku]""#), "{html}");
+    assert!(!html.contains(r#"name="items[2][id]""#), "{html}");
+    // The seeded parent is un-validated: no premature error on the initial render.
+    assert!(!html.contains(r#"aria-invalid="true""#), "{html}");
 }
 
 // ── The create handler + atomic save (DB) ──────────────────────────
