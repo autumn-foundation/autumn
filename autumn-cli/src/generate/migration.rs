@@ -11,7 +11,7 @@ use super::dsl::parse_fields;
 use super::emit::Plan;
 use super::naming::pascal_to_snake;
 use super::schema_edit::{
-    MigrationShape, add_columns_down_sql, add_columns_up_sql_for, add_search_down_sql,
+    MigrationShape, add_columns_down_sql_for, add_columns_up_sql_for, add_search_down_sql,
     add_search_up_sql, detect_migration_shape, encrypt_columns_down_sql, encrypt_columns_up_sql,
     parse_model_search_config_for_table, remove_columns_down_sql_for, remove_columns_up_sql,
     singularize,
@@ -55,6 +55,12 @@ pub fn plan_migration(
 ///
 /// # Errors
 /// Project layout, name, DSL, and unknown-field errors surface here.
+#[allow(
+    clippy::too_many_lines,
+    reason = "a linear match over the migration shapes (add/remove/encrypt/search \
+              columns), each arm emitting its own up/down SQL; splitting an arm out \
+              would not make any single shape clearer"
+)]
 pub fn plan_migration_with_options(
     project_root: &Path,
     name: &str,
@@ -92,6 +98,13 @@ pub fn plan_migration_with_options(
             // anywhere the generator can see — a self-reference here is left
             // unvalidated rather than guessed at.
             super::model::check_reference_targets(&mut plan, project_root, &fields, table, None)?;
+            // A field kind with no working diesel SQLite conversion (Uuid,
+            // Attachment, Decimal) would leak an uncompilable column into the
+            // generated SQLite app, so reject it here too — same guard as
+            // `generate model`/`scaffold` (AC #4, #1924).
+            if backend == autumn_web::config::DatabaseBackend::Sqlite {
+                super::reject_sqlite_unsupported_field_kinds(&fields)?;
+            }
             // `src/schema.rs`'s current content, so a `unique` field being
             // added here can't pick an index name that coincidentally
             // collides with a plain index on some other, already-existing
@@ -102,7 +115,7 @@ pub fn plan_migration_with_options(
                 std::fs::read_to_string(project_root.join("src/schema.rs")).unwrap_or_default();
             (
                 add_columns_up_sql_for(backend, table, &fields, &existing_schema)?,
-                add_columns_down_sql(table, &fields),
+                add_columns_down_sql_for(backend, table, &fields, &existing_schema),
             )
         }
         MigrationShape::RemoveColumns { ref table } if !fields.is_empty() => {
@@ -112,6 +125,13 @@ pub fn plan_migration_with_options(
             // target with a UUID primary key still produces a `down.sql`
             // that fails to apply on rollback.
             super::model::check_reference_targets(&mut plan, project_root, &fields, table, None)?;
+            // The rollback (`down.sql`) re-adds the removed columns via
+            // `ALTER TABLE … ADD COLUMN …`, so a field kind with no working
+            // diesel SQLite conversion would still leak into generated DDL —
+            // reject it up front, matching the AddColumns path (AC #4, #1924).
+            if backend == autumn_web::config::DatabaseBackend::Sqlite {
+                super::reject_sqlite_unsupported_field_kinds(&fields)?;
+            }
             let existing_schema =
                 std::fs::read_to_string(project_root.join("src/schema.rs")).unwrap_or_default();
             (
@@ -714,6 +734,97 @@ pub struct Post {
                 up.contains("ALTER TABLE posts ADD COLUMN note TEXT NULL"),
                 "up.sql: {up}"
             );
+        });
+    }
+
+    /// A `SQLite` `Add…To…` migration that adds a nullable `references` field
+    /// creates an index in `up.sql`, and its `down.sql` must `DROP INDEX` before
+    /// `DROP COLUMN` — `SQLite` refuses to drop a column still used by an index
+    /// (issue #1614 finding 5).
+    #[test]
+    fn add_columns_migration_on_sqlite_drops_index_before_column_on_rollback() {
+        with_no_db_env(|| {
+            let tmp = sqlite_project();
+            let plan = plan_migration(
+                tmp.path(),
+                "AddAuthorToPosts",
+                &["author:references?".into()],
+                "20260427000000",
+            )
+            .unwrap();
+            plan.execute(Flags::default()).unwrap();
+            let dir = tmp
+                .path()
+                .join("migrations/20260427000000_add_author_to_posts");
+            let up = fs::read_to_string(dir.join("up.sql")).unwrap();
+            assert!(
+                up.contains("CREATE INDEX idx_posts_author_id ON posts (author_id);"),
+                "up.sql: {up}"
+            );
+            let down = fs::read_to_string(dir.join("down.sql")).unwrap();
+            let drop_idx = down
+                .find("DROP INDEX idx_posts_author_id;")
+                .expect("drop index");
+            let drop_col = down
+                .find("ALTER TABLE posts DROP COLUMN author_id;")
+                .expect("drop column");
+            assert!(
+                drop_idx < drop_col,
+                "down.sql must DROP INDEX before DROP COLUMN: {down}"
+            );
+        });
+    }
+
+    /// Regression guard: the same `Add…To…` on a Postgres app emits no explicit
+    /// `DROP INDEX` in `down.sql` — Postgres cascades the index drop with the
+    /// column, so the rollback stays byte-for-byte the historical output.
+    #[test]
+    fn add_columns_migration_on_postgres_has_no_explicit_drop_index_on_rollback() {
+        with_no_db_env(|| {
+            let tmp = project();
+            let plan = plan_migration(
+                tmp.path(),
+                "AddAuthorToPosts",
+                &["author:references?".into()],
+                "20260427000000",
+            )
+            .unwrap();
+            plan.execute(Flags::default()).unwrap();
+            let down = fs::read_to_string(
+                tmp.path()
+                    .join("migrations/20260427000000_add_author_to_posts/down.sql"),
+            )
+            .unwrap();
+            assert!(!down.contains("DROP INDEX"), "Postgres down.sql: {down}");
+            assert!(
+                down.contains("ALTER TABLE posts DROP COLUMN author_id;"),
+                "down.sql: {down}"
+            );
+        });
+    }
+
+    /// A `SQLite` `Add…To…` / `Remove…From…` migration rejects field kinds with
+    /// no working diesel `SQLite` conversion (`Uuid`, `Attachment`, `Decimal`) at
+    /// generate time, citing #1924 (issue #1614 AC #4).
+    #[test]
+    fn column_migrations_on_sqlite_reject_unsupported_field_kinds_citing_1924() {
+        with_no_db_env(|| {
+            for name in ["AddTokenToPosts", "RemoveTokenFromPosts"] {
+                let tmp = sqlite_project();
+                let err =
+                    plan_migration(tmp.path(), name, &["token:Uuid".into()], "20260427000000")
+                        .unwrap_err();
+                let msg = err.to_string();
+                assert!(
+                    matches!(err, GenerateError::Config(_)),
+                    "{name}: expected Config error, got: {err:?}"
+                );
+                assert!(msg.contains("1924"), "{name}: must cite #1924: {msg}");
+                assert!(
+                    msg.contains("uuid::Uuid"),
+                    "{name}: message must name the Rust type: {msg}"
+                );
+            }
         });
     }
 

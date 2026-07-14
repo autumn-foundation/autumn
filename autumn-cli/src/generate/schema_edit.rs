@@ -677,7 +677,10 @@ pub fn add_columns_up_sql_for(
         // and maintaining a redundant second btree index).
         if f.kind.is_reference() && !f.unique {
             // Postgres auto-drops this index (and the FK constraint above) when
-            // the column is dropped, so `add_columns_down_sql` needs no change.
+            // the column is dropped, so its `down.sql` needs no explicit DROP
+            // INDEX. SQLite does NOT — it refuses to drop a column still used by
+            // an index — so `add_columns_down_sql_for` emits a matching
+            // `DROP INDEX idx_<table>_<col>` before the DROP COLUMN there.
             let _ = writeln!(
                 out,
                 "CREATE INDEX idx_{table}_{} ON {table} ({});",
@@ -685,20 +688,60 @@ pub fn add_columns_up_sql_for(
             );
         }
         if f.unique {
-            // Postgres auto-drops this index when the column is dropped,
-            // same as the `references` auto-index above, so
-            // `add_columns_down_sql` needs no change.
+            // Same as the `references` auto-index above: Postgres cascades the
+            // drop with the column, but SQLite needs an explicit DROP INDEX in
+            // `add_columns_down_sql_for` (by the same `unique_index_name`).
             out.push_str(&unique_index_sql(table, &f.name, &collision_fields));
         }
     }
     Ok(out)
 }
 
-/// `down.sql` companion to [`add_columns_up_sql`].
+/// `down.sql` companion to [`add_columns_up_sql`]. Postgres-default wrapper
+/// retained for the test suite; production calls the backend-aware
+/// [`add_columns_down_sql_for`].
+#[cfg(test)]
 #[must_use]
 pub fn add_columns_down_sql(table: &str, fields: &[Field]) -> String {
+    add_columns_down_sql_for(DatabaseBackend::Postgres, table, fields, "")
+}
+
+/// [`add_columns_down_sql`] for a specific database `backend` (issue #1614).
+///
+/// On `SQLite`, [`add_columns_up_sql_for`] emits a `CREATE INDEX` for an added
+/// nullable `references` field or a `unique` field, but `SQLite` refuses to
+/// `DROP COLUMN` while an index still references it (`cannot drop column: used
+/// in an index`). So on the `SQLite` path this emits `DROP INDEX <name>;` for
+/// each index the up path created for a field, **before** its `DROP COLUMN`,
+/// reusing the exact index-name derivation the up path used (`idx_<table>_<col>`
+/// for a plain `references` index, [`unique_index_name`] for a `unique` index).
+///
+/// Postgres cascades index drops with the column automatically, so its output
+/// stays byte-for-byte identical to the legacy `DROP COLUMN`-only rollback (no
+/// explicit `DROP INDEX`). `existing_schema` mirrors [`add_columns_up_sql_for`]
+/// so a `unique` field's index name matches the one the up path generated.
+#[must_use]
+pub fn add_columns_down_sql_for(
+    backend: DatabaseBackend,
+    table: &str,
+    fields: &[Field],
+    existing_schema: &str,
+) -> String {
+    let collision_fields = fields_with_existing_schema_columns(fields, existing_schema, table);
     let mut out = String::new();
     for f in fields.iter().rev() {
+        // SQLite: drop the up path's index for this field first (see doc
+        // comment). Only nullable fields reach a SQLite Add migration —
+        // `add_columns_up_sql_for` rejects NOT NULL there — and the up path
+        // indexes exactly a `unique` field or a non-unique `references` field.
+        if backend == DatabaseBackend::Sqlite {
+            if f.unique {
+                let name = unique_index_name(table, &f.name, &collision_fields);
+                let _ = writeln!(out, "DROP INDEX {name};");
+            } else if f.kind.is_reference() {
+                let _ = writeln!(out, "DROP INDEX idx_{table}_{};", f.name);
+            }
+        }
         let _ = writeln!(out, "ALTER TABLE {table} DROP COLUMN {};", f.name);
     }
     out
@@ -5286,6 +5329,67 @@ mod tests {
         let title_pos = sql.find("DROP COLUMN title").unwrap();
         let count_pos = sql.find("DROP COLUMN count").unwrap();
         assert!(count_pos < title_pos);
+    }
+
+    /// `SQLite` refuses to `DROP COLUMN` while an index still references it, so the
+    /// down path must `DROP INDEX` before `DROP COLUMN` for a nullable
+    /// `references` field's auto-index (issue #1614 finding 5). The DROP INDEX
+    /// name must match the CREATE INDEX name the up path generated.
+    #[test]
+    fn sqlite_add_columns_down_drops_reference_index_before_column() {
+        let f = fields(&["author:references?"]);
+        // The up path (SQLite) creates the plain auto-index for the nullable FK.
+        let up = add_columns_up_sql_for(DatabaseBackend::Sqlite, "posts", &f, "").unwrap();
+        assert!(
+            up.contains("CREATE INDEX idx_posts_author_id ON posts (author_id);"),
+            "up:\n{up}"
+        );
+        let down = add_columns_down_sql_for(DatabaseBackend::Sqlite, "posts", &f, "");
+        let drop_idx = down
+            .find("DROP INDEX idx_posts_author_id;")
+            .expect("drop index");
+        let drop_col = down
+            .find("ALTER TABLE posts DROP COLUMN author_id;")
+            .expect("drop column");
+        assert!(
+            drop_idx < drop_col,
+            "DROP INDEX must precede DROP COLUMN:\n{down}"
+        );
+    }
+
+    /// Same for a nullable `unique` field: its `CREATE UNIQUE INDEX` must be
+    /// dropped before the column on `SQLite`, using the same derived index name.
+    #[test]
+    fn sqlite_add_columns_down_drops_unique_index_before_column() {
+        let f = fields(&["email:Option<String>:unique"]);
+        let up = add_columns_up_sql_for(DatabaseBackend::Sqlite, "users", &f, "").unwrap();
+        assert!(
+            up.contains("CREATE UNIQUE INDEX idx_users_email_unique ON users (email);"),
+            "up:\n{up}"
+        );
+        let down = add_columns_down_sql_for(DatabaseBackend::Sqlite, "users", &f, "");
+        let drop_idx = down
+            .find("DROP INDEX idx_users_email_unique;")
+            .expect("drop index");
+        let drop_col = down
+            .find("ALTER TABLE users DROP COLUMN email;")
+            .expect("drop column");
+        assert!(
+            drop_idx < drop_col,
+            "DROP INDEX must precede DROP COLUMN:\n{down}"
+        );
+    }
+
+    /// Postgres cascades index drops with the column, so its down.sql stays
+    /// byte-for-byte identical to the legacy `DROP COLUMN`-only rollback — no
+    /// explicit `DROP INDEX`.
+    #[test]
+    fn postgres_add_columns_down_has_no_explicit_drop_index() {
+        let f = fields(&["author:references?"]);
+        let down = add_columns_down_sql_for(DatabaseBackend::Postgres, "posts", &f, "");
+        assert_eq!(down, "ALTER TABLE posts DROP COLUMN author_id;\n");
+        // And the Postgres-default test wrapper matches.
+        assert_eq!(add_columns_down_sql("posts", &f), down);
     }
 
     // ── enum field: CHECK constraint (issue #1030) ──────────────────────────

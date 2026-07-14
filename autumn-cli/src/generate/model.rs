@@ -160,6 +160,15 @@ pub fn plan_model_with_options(
     if backend == autumn_web::config::DatabaseBackend::Sqlite && options.id_type == IdType::Uuid {
         return Err(super::sqlite_uuid_pk_unsupported_error());
     }
+    // Several DSL field kinds render to Rust model types with no working diesel
+    // SQLite FromSql/ToSql (Uuid, Attachment, Decimal). The SQLite column/schema
+    // mapping changes the DDL, but the `#[model]` struct field keeps its Rust
+    // type, so a generated SQLite app using one of these would fail to compile.
+    // Reject at generate time rather than emit uncompilable code (AC #4); real
+    // conversions are tracked in #1924.
+    if backend == autumn_web::config::DatabaseBackend::Sqlite {
+        super::reject_sqlite_unsupported_field_kinds(&fields)?;
+    }
 
     let snake_name = snake(name);
     let table = pluralize(&snake_name);
@@ -2720,7 +2729,7 @@ mod tests {
                     "title:String".into(),
                     "views:i64".into(),
                     "at:DateTime".into(),
-                    "cover:Attachment".into(),
+                    "naive:NaiveDateTime".into(),
                 ],
                 "20260427000000",
             )
@@ -2739,7 +2748,7 @@ mod tests {
             assert!(up.contains("title TEXT NOT NULL"), "up.sql: {up}");
             assert!(up.contains("views INTEGER NOT NULL"), "up.sql: {up}");
             assert!(up.contains("at TEXT NOT NULL"), "up.sql: {up}");
-            assert!(up.contains("cover TEXT"), "up.sql: {up}");
+            assert!(up.contains("naive TEXT NOT NULL"), "up.sql: {up}");
             assert!(
                 up.contains("created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP"),
                 "up.sql: {up}"
@@ -2750,13 +2759,79 @@ mod tests {
             }
 
             let schema = fs::read_to_string(tmp.path().join("src/schema.rs")).unwrap();
-            assert!(schema.contains("at -> Timestamp,"), "schema: {schema}");
-            for leak in ["Timestamptz", "Jsonb"] {
+            // `DateTime<Utc>` uses the SQLite-specific `TimestamptzSqlite`
+            // sql-type (the only one diesel implements a `DateTime<Utc>`
+            // conversion for on SQLite); `NaiveDateTime` uses `Timestamp`.
+            assert!(
+                schema.contains("at -> TimestamptzSqlite,"),
+                "schema: {schema}"
+            );
+            assert!(schema.contains("naive -> Timestamp,"), "schema: {schema}");
+            // The bare Postgres-only `Timestamptz` / `Jsonb` diesel types must
+            // not leak (note `TimestamptzSqlite` is the SQLite type and is fine).
+            assert!(
+                !schema.contains("-> Timestamptz,"),
+                "SQLite schema.rs leaked Postgres `Timestamptz`: {schema}"
+            );
+            assert!(
+                !schema.contains("Jsonb"),
+                "SQLite schema.rs leaked `Jsonb`: {schema}"
+            );
+        });
+    }
+
+    /// A `SQLite` app rejects field kinds whose Rust model type has no working
+    /// diesel `SQLite` conversion (`Uuid`, `Attachment`, `Decimal`) at generate
+    /// time, citing #1924 (issue #1614 AC #4) — rather than emit a model that
+    /// fails to compile.
+    #[test]
+    fn sqlite_app_rejects_field_kinds_without_diesel_conversion_citing_1924() {
+        with_no_db_env(|| {
+            let tmp = project_with_db_url("sqlite://app.db");
+            for (token, rust_type) in [
+                ("token:Uuid", "uuid::Uuid"),
+                ("cover:Attachment", "autumn_web::storage::Blob"),
+                ("price:decimal{10,2}", "rust_decimal::Decimal"),
+            ] {
+                let err = plan_model(
+                    tmp.path(),
+                    "Post",
+                    &["title:String".into(), token.into()],
+                    "20260427000000",
+                )
+                .unwrap_err();
+                let msg = err.to_string();
                 assert!(
-                    !schema.contains(leak),
-                    "SQLite schema.rs leaked `{leak}`: {schema}"
+                    matches!(err, GenerateError::Config(_)),
+                    "expected Config error for `{token}`, got: {err:?}"
+                );
+                assert!(msg.contains("1924"), "`{token}` must cite #1924: {msg}");
+                assert!(
+                    msg.contains(rust_type),
+                    "`{token}` message must name the Rust type `{rust_type}`: {msg}"
                 );
             }
+        });
+    }
+
+    /// Regression guard: those same field kinds are unchanged on a Postgres app
+    /// — the diesel-conversion gate is SQLite-only.
+    #[test]
+    fn postgres_app_field_kinds_without_sqlite_conversion_are_unchanged() {
+        with_no_db_env(|| {
+            let tmp = project_with_db_url("postgres://localhost/app");
+            plan_model(
+                tmp.path(),
+                "Post",
+                &[
+                    "title:String".into(),
+                    "token:Uuid".into(),
+                    "cover:Attachment".into(),
+                    "price:decimal{10,2}".into(),
+                ],
+                "20260427000000",
+            )
+            .expect("Uuid/Attachment/Decimal fields must still generate on Postgres");
         });
     }
 

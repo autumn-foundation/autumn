@@ -246,9 +246,20 @@ pub fn read_or_empty(path: &Path) -> String {
 ///
 /// Resolves the primary database URL for `project_root` the same way `autumn
 /// migrate` does — the `AUTUMN_DATABASE__PRIMARY_URL` / `AUTUMN_DATABASE__URL`
-/// / `DATABASE_URL` environment variables take precedence, then
-/// `<project_root>/autumn.toml`'s `[database].primary_url` / `url` — and
+/// / `DATABASE_URL` environment variables take precedence, then the merged,
+/// **profile-aware** `autumn.toml` (base ← inline `[profile.<env>]` ←
+/// `autumn-<env>.toml` overlay) `[database].primary_url` / `url` — and
 /// classifies it via [`autumn_web::config::DatabaseBackend::detect`].
+///
+/// The active profile is resolved through
+/// [`crate::migrate::effective_profile`] (`AUTUMN_ENV` preferred, then
+/// `AUTUMN_PROFILE`, then release build-mode, else `dev`), so a database URL
+/// that lives only in an active profile overlay (e.g. `[profile.prod.database]`
+/// or `autumn-prod.toml` under `AUTUMN_ENV=prod`) is honored — matching the
+/// URLs `autumn migrate` and the running app resolve. Reading only the base
+/// `autumn.toml` would miss such an overlay and wrongly fall back to Postgres,
+/// emitting Postgres DDL (`BIGSERIAL`, `TIMESTAMPTZ`, `NOW()`) for a `SQLite`
+/// app.
 ///
 /// Defaults to [`DatabaseBackend::Postgres`] when no URL can be resolved or its
 /// shape is unrecognized, preserving today's Postgres-only generator behavior
@@ -257,15 +268,81 @@ pub fn read_or_empty(path: &Path) -> String {
 /// `SQLite` (AC #4).
 #[must_use]
 pub fn detect_backend(project_root: &Path) -> autumn_web::config::DatabaseBackend {
+    let effective = crate::migrate::effective_profile(None);
+    detect_backend_with(project_root, Some(&effective), |k| std::env::var(k))
+}
+
+/// Directory-, profile-, and env-parameterized core of [`detect_backend`],
+/// separated so the profile-overlay resolution is unit-testable without
+/// mutating the process-global environment.
+///
+/// Loads the same merged, profile-aware config table `autumn migrate` builds
+/// (via [`crate::migrate::read_autumn_toml_table_with_profile_in`]) and applies
+/// the same env-var precedence
+/// ([`crate::migrate::resolve_primary_database_url_from_sources`]).
+fn detect_backend_with<F>(
+    project_root: &Path,
+    profile: Option<&str>,
+    env_var: F,
+) -> autumn_web::config::DatabaseBackend
+where
+    F: Fn(&str) -> Result<String, std::env::VarError>,
+{
     use autumn_web::config::DatabaseBackend;
 
-    let table = std::fs::read_to_string(project_root.join("autumn.toml"))
-        .ok()
-        .and_then(|s| s.parse::<toml::Table>().ok());
-    crate::migrate::resolve_primary_database_url_from_sources(|k| std::env::var(k), table.as_ref())
+    let table = crate::migrate::read_autumn_toml_table_with_profile_in(project_root, profile);
+    crate::migrate::resolve_primary_database_url_from_sources(env_var, table.as_ref())
         .as_deref()
         .and_then(DatabaseBackend::detect)
         .unwrap_or(DatabaseBackend::Postgres)
+}
+
+/// The generate-time rejection for a DSL field kind whose rendered Rust model
+/// type has no working diesel `SQLite` `FromSql`/`ToSql` (`SQLite` foundation,
+/// issue #1614 AC #4).
+///
+/// The `SQLite` column/schema mapping ([`dsl::FieldKind::sqlite_schema_type`])
+/// changes the DDL and diesel sql-type, but the `#[model]` struct field still
+/// renders as its Rust type (`uuid::Uuid`, `autumn_web::storage::Blob`,
+/// `rust_decimal::Decimal`). Diesel implements no conversion for those types on
+/// its `SQLite` backend in a generated app's feature set (diesel
+/// `sqlite`+`chrono`, no `uuid`/`numeric`; `Blob` only implements `Jsonb`/`Pg`),
+/// so a generated `SQLite` app using such a field fails to compile. Rather than
+/// emit uncompilable code, generation fails here with an actionable message
+/// (AC #4). First-class support for these kinds is tracked in issue #1924.
+#[must_use]
+pub fn sqlite_field_kind_unsupported_error(field: &str, rust_type: &str) -> GenerateError {
+    GenerateError::Config(format!(
+        "field `{field}` has no working diesel SQLite conversion for its Rust type \
+         `{rust_type}`: diesel implements no FromSql/ToSql for that type on its SQLite \
+         backend in a generated app's feature set, so a generated SQLite app using this \
+         field would fail to compile. Supported SQLite field kinds are: {kinds}. \
+         First-class SQLite support for Uuid / attachments / Decimal is tracked in \
+         https://github.com/madmax983/autumn/issues/1924 — use a supported field kind, \
+         or target a Postgres database.",
+        kinds = dsl::SQLITE_SUPPORTED_KINDS,
+    ))
+}
+
+/// Reject any field whose kind lacks a working diesel `SQLite` conversion
+/// (issue #1614 AC #4) before any DDL / model / schema is emitted for a
+/// `SQLite`-backed app. Bubbles the first offending field as a
+/// [`sqlite_field_kind_unsupported_error`]. Postgres callers never invoke this,
+/// so their output is unaffected.
+///
+/// # Errors
+/// Returns [`GenerateError::Config`] for the first field whose kind has no
+/// working diesel `SQLite` conversion (`Uuid`, `Attachment`, `Decimal`).
+pub fn reject_sqlite_unsupported_field_kinds(fields: &[dsl::Field]) -> Result<(), GenerateError> {
+    for f in fields {
+        if !f.kind.sqlite_has_diesel_conversion() {
+            return Err(sqlite_field_kind_unsupported_error(
+                &f.name,
+                f.kind.rust_type(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -311,5 +388,113 @@ mod tests {
             ensure_project_root(tmp.path()).unwrap_err(),
             GenerateError::NotInProject
         ));
+    }
+
+    // ── Profile-aware backend detection (issue #1614) ──────────────────────
+
+    /// An empty environment — no `AUTUMN_DATABASE__*` / `DATABASE_URL` set — so
+    /// `detect_backend_with` resolves purely from the merged config table.
+    fn no_env(_key: &str) -> Result<String, std::env::VarError> {
+        Err(std::env::VarError::NotPresent)
+    }
+
+    /// A `SQLite` URL that lives only in an active profile overlay
+    /// (`[profile.prod.database]`, selected by `AUTUMN_ENV=prod`) must be
+    /// detected as `SQLite` — the same merged, profile-aware config `autumn
+    /// migrate` resolves — so generation emits `SQLite` DDL, not Postgres.
+    #[test]
+    fn detect_backend_honors_sqlite_url_in_active_profile_overlay() {
+        use autumn_web::config::DatabaseBackend;
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("autumn.toml"),
+            "[database]\nprimary_url = \"postgres://localhost/app\"\n\n\
+             [profile.prod.database]\nprimary_url = \"sqlite://prod.db\"\n",
+        )
+        .unwrap();
+        // With the prod profile active, the overlay's SQLite URL wins.
+        assert_eq!(
+            detect_backend_with(tmp.path(), Some("prod"), no_env),
+            DatabaseBackend::Sqlite
+        );
+        // Without the prod profile, the base Postgres URL is used.
+        assert_eq!(
+            detect_backend_with(tmp.path(), Some("dev"), no_env),
+            DatabaseBackend::Postgres
+        );
+    }
+
+    /// A `SQLite` URL in a separate `autumn-<profile>.toml` overlay file is
+    /// detected as `SQLite` when that profile is active.
+    #[test]
+    fn detect_backend_honors_sqlite_url_in_profile_overlay_file() {
+        use autumn_web::config::DatabaseBackend;
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("autumn.toml"),
+            "[database]\nprimary_url = \"postgres://localhost/app\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("autumn-prod.toml"),
+            "[database]\nprimary_url = \"sqlite://prod.db\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            detect_backend_with(tmp.path(), Some("prod"), no_env),
+            DatabaseBackend::Sqlite
+        );
+    }
+
+    /// A base-file Postgres URL (no profile overlay) still resolves to Postgres.
+    #[test]
+    fn detect_backend_base_file_postgres_stays_postgres() {
+        use autumn_web::config::DatabaseBackend;
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("autumn.toml"),
+            "[database]\nprimary_url = \"postgres://localhost/app\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            detect_backend_with(tmp.path(), Some("dev"), no_env),
+            DatabaseBackend::Postgres
+        );
+    }
+
+    /// No config and no env → default to Postgres (no regression to today's
+    /// Postgres-only generator behavior).
+    #[test]
+    fn detect_backend_no_config_defaults_to_postgres() {
+        use autumn_web::config::DatabaseBackend;
+        let tmp = tempfile::TempDir::new().unwrap();
+        assert_eq!(
+            detect_backend_with(tmp.path(), Some("dev"), no_env),
+            DatabaseBackend::Postgres
+        );
+    }
+
+    /// Environment variables keep their documented precedence over the merged
+    /// config: a `DATABASE_URL=sqlite://…` wins over a base-file Postgres URL.
+    #[test]
+    fn detect_backend_env_var_overrides_config() {
+        use autumn_web::config::DatabaseBackend;
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("autumn.toml"),
+            "[database]\nprimary_url = \"postgres://localhost/app\"\n",
+        )
+        .unwrap();
+        let env = |key: &str| {
+            if key == "DATABASE_URL" {
+                Ok("sqlite://override.db".to_owned())
+            } else {
+                Err(std::env::VarError::NotPresent)
+            }
+        };
+        assert_eq!(
+            detect_backend_with(tmp.path(), Some("dev"), env),
+            DatabaseBackend::Sqlite
+        );
     }
 }

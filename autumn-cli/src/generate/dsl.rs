@@ -413,7 +413,21 @@ impl FieldKind {
     /// The Postgres-only diesel sql-types (`Timestamptz`, `Jsonb`, `Uuid`,
     /// `Bytea`, `Numeric`) are not implemented for diesel's `SQLite` backend, so
     /// they are remapped to types `SQLite` does support: `Uuid`/`Attachment`/
-    /// `Decimal` -> `Text`, `DateTime` -> `Timestamp`, `Bytea` -> `Binary`.
+    /// `Decimal` -> `Text`, `NaiveDateTime` -> `Timestamp`,
+    /// `DateTime<Utc>` -> `TimestamptzSqlite`, `Bytea` -> `Binary`.
+    ///
+    /// `DateTime<Utc>` maps to `TimestamptzSqlite` (stored as TEXT) rather than
+    /// `Timestamp`: diesel has a working `FromSql`/`ToSql<TimestamptzSqlite,
+    /// Sqlite>` for `chrono::DateTime<Utc>` but none for
+    /// `FromSql<Timestamp, Sqlite>` (that impl targets `NaiveDateTime`), so a
+    /// `Timestamp` mapping would fail to compile in a generated `SQLite` app
+    /// (verified empirically, issue #1614 AC #4).
+    ///
+    /// Kinds whose rendered Rust type has NO working diesel `SQLite` conversion
+    /// (`Uuid`, `Attachment`, `Decimal`) still list a nominal remapping here for
+    /// documentation completeness, but they are rejected at generate time (see
+    /// [`FieldKind::sqlite_has_diesel_conversion`]) so this token never reaches
+    /// a generated `schema.rs`.
     #[must_use]
     #[allow(
         clippy::match_same_arms,
@@ -429,11 +443,30 @@ impl FieldKind {
             Self::F32 => "Float4",
             Self::F64 => "Float8",
             Self::Uuid => "Text",
-            Self::NaiveDateTime | Self::DateTime => "Timestamp",
+            Self::NaiveDateTime => "Timestamp",
+            Self::DateTime => "TimestamptzSqlite",
             Self::Bytea => "Binary",
             Self::Attachment => "Text",
             Self::Decimal { .. } => "Text",
         }
+    }
+
+    /// Whether this kind's rendered Rust model type has a working diesel
+    /// `FromSql`/`ToSql` on diesel's `SQLite` backend in a generated app's
+    /// feature set (diesel `sqlite` + `chrono`, without `uuid`/`numeric`) —
+    /// determined empirically (issue #1614 AC #4).
+    ///
+    /// `Uuid` (`uuid::Uuid`), `Attachment` (`autumn_web::storage::Blob`, which
+    /// only implements `FromSql`/`ToSql<Jsonb, Pg>`), and `Decimal`
+    /// (`rust_decimal::Decimal`) have no such impl, so a generated `SQLite` app
+    /// using them would fail to compile. Rather than emit uncompilable code,
+    /// these kinds are rejected at generate time; first-class `SQLite` support for
+    /// them is tracked in issue #1924. Every other kind — including
+    /// `DateTime<Utc>` via `TimestamptzSqlite` and `NaiveDateTime` via
+    /// `Timestamp` — compiles and is kept.
+    #[must_use]
+    pub const fn sqlite_has_diesel_conversion(self) -> bool {
+        !matches!(self, Self::Uuid | Self::Attachment | Self::Decimal { .. })
     }
 
     /// The diesel `table!` schema type token for the target `backend`
@@ -600,6 +633,14 @@ impl IdType {
 pub const SUPPORTED_TYPES: &str = "String, Text, i32, i64, bool, f32, f64, \
     Uuid, NaiveDateTime, DateTime, Vec<u8>, Bytea, Attachment, references, \
     enum{a,b,…}, decimal{precision,scale}, Option<…>, :unique";
+
+/// The DSL field kinds that map to a working diesel `SQLite` conversion
+/// (issue #1614 AC #4) — the complement of the kinds
+/// [`FieldKind::sqlite_has_diesel_conversion`] rejects (`Uuid`, `Attachment`,
+/// `Decimal`). Used in the generate-time rejection message so the user knows
+/// which field kinds a `SQLite` app supports today.
+pub const SQLITE_SUPPORTED_KINDS: &str = "String, Text, i32, i64, bool, f32, f64, \
+    NaiveDateTime, DateTime, Vec<u8>, Bytea, references, enum{a,b,…}, Option<…>, :unique";
 
 /// Comma-separated list of supported Postgres column types (`udt_name`), for
 /// the `db pull` introspection error message.
@@ -1531,7 +1572,11 @@ mod tests {
     #[test]
     fn sqlite_schema_type_avoids_postgres_only_diesel_types() {
         let cases = [
-            ("at:DateTime", "Timestamp"),
+            // `DateTime<Utc>` maps to `TimestamptzSqlite` (a SQLite-specific
+            // diesel type stored as TEXT), the only sql-type diesel implements a
+            // `DateTime<Utc>` conversion for on SQLite (issue #1614 AC #4).
+            ("at:DateTime", "TimestamptzSqlite"),
+            ("naive:NaiveDateTime", "Timestamp"),
             ("token:Uuid", "Text"),
             // `Attachment` fields are auto-nullable, so `Field::schema_type_for`
             // wraps the SQLite `Text` inner type in `Nullable<…>`.
@@ -1568,6 +1613,45 @@ mod tests {
             assert!(
                 !["Timestamptz", "Jsonb", "Uuid", "Bytea", "Numeric"].contains(&ty.as_str()),
                 "`{token}` -> `{ty}` must not be a Postgres-only diesel type on SQLite"
+            );
+        }
+    }
+
+    /// Only `Uuid`, `Attachment`, and `Decimal` lack a working diesel `SQLite`
+    /// conversion for their rendered Rust type (issue #1614 AC #4); every other
+    /// kind — including `DateTime<Utc>` (via `TimestamptzSqlite`) and
+    /// `NaiveDateTime` — compiles and is kept.
+    #[test]
+    fn sqlite_has_diesel_conversion_rejects_only_uuid_attachment_decimal() {
+        for token in [
+            "title:String",
+            "body:Text",
+            "count:i32",
+            "big:i64",
+            "flag:bool",
+            "ratio:f32",
+            "amount:f64",
+            "naive:NaiveDateTime",
+            "at:DateTime",
+            "data:Bytea",
+            "post:references",
+            "status:enum{draft,published}",
+        ] {
+            assert!(
+                parse_field(token)
+                    .unwrap()
+                    .kind
+                    .sqlite_has_diesel_conversion(),
+                "`{token}` must be a SQLite-supported kind"
+            );
+        }
+        for token in ["token:Uuid", "cover:Attachment", "price:decimal{10,2}"] {
+            assert!(
+                !parse_field(token)
+                    .unwrap()
+                    .kind
+                    .sqlite_has_diesel_conversion(),
+                "`{token}` must have no working diesel SQLite conversion"
             );
         }
     }
