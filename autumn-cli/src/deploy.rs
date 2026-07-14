@@ -7,17 +7,20 @@
 //!   grader fails.
 //! - **`plan`** renders the systemd service unit and the ordered zero-downtime
 //!   rollout plan as a pure dry-run — it touches nothing remote.
-//! - **`rollback`** prints the rollback plan (also a dry-run in this slice).
+//! - **`up`** performs a REAL deploy: it runs the same preflight as `check`
+//!   (aborting before touching the server if anything fails), then drives the
+//!   ordered host-prep + first-deploy or zero-downtime cutover sequence against
+//!   an injectable executor (the real one shells out to system `ssh`/`scp`), with
+//!   auto-rollback of the candidate on a pre-cutover failure. See [`exec`].
+//! - **`rollback`** performs a REAL on-demand rollback (Slice 3, AC-4): it
+//!   resolves the previous release on the target, flips the proxy back to it,
+//!   repoints `current`, and re-probes `/ready` — failing loudly when there is no
+//!   previous release to roll back to.
 //!
-//! - **`up`** performs a REAL first deploy: it runs the same preflight as
-//!   `check` (aborting before touching the server if anything fails), then
-//!   drives an ordered host-prep + first-deploy sequence against an injectable
-//!   executor (the real one shells out to system `ssh`/`scp`). See [`exec`].
-//!
-//! Live zero-downtime cutover, rollback execution, and the CI end-to-end harness
-//! land in follow-up slices. The plan/unit generators here are pure functions so
-//! they can be unit-tested without a server, and the preflight graders are shared
-//! with `autumn doctor`.
+//! Only the CI end-to-end harness that exercises rollback over real ssh against a
+//! container remains (Slice 4). The plan/unit generators here are pure functions
+//! so they can be unit-tested without a server, and the preflight graders are
+//! shared with `autumn doctor`.
 
 pub mod exec;
 pub mod proxy;
@@ -75,7 +78,7 @@ pub enum DeployAction {
     Check,
     /// Print the systemd unit and the ordered deploy plan (dry-run).
     Plan,
-    /// Print the rollback plan (dry-run).
+    /// Run the preflight, then perform a REAL on-demand rollback over SSH.
     Rollback,
     /// Run the preflight, then perform a REAL first deploy over SSH.
     Up,
@@ -614,24 +617,44 @@ pub fn build_deploy_plan(cfg: &ResolvedDeployConfig) -> Vec<DeployStep> {
         DeployStep::new(
             "prune",
             format!(
-                "Prune old releases, retaining the most recent {}",
+                "Prune old releases, retaining the most recent {} — always keeping the releases \
+                 the current symlink and previous-release marker point at (rollback targets)",
                 cfg.keep_releases
             ),
         ),
     ]
 }
 
-/// Build the rollback plan: point `current` back at the previous release,
-/// restart the service, and re-probe `/ready`.
+/// Build the rollback plan, mirroring [`exec::rollback_ops`]'s actual sequence:
+/// restart the previous slot's unit first, flip the proxy upstream back to it,
+/// record the release being rolled back FROM as the new previous-release marker,
+/// repoint `current`, record the live slot, re-probe `/ready`, and finally drain
+/// the slot the rollback flipped traffic away from.
+///
+/// The order matters: the proxy flip is health-gated, so the previous release's
+/// unit must be restarted and up *before* the flip can pass, and the flip
+/// therefore precedes the `current` repoint. The former-live slot is drained last,
+/// after the re-probe confirms the rolled-back release is healthy.
 #[must_use]
 pub fn build_rollback_plan(cfg: &ResolvedDeployConfig) -> Vec<DeployStep> {
     vec![
         DeployStep::new(
-            "select-previous",
+            "restart-previous",
             format!(
-                "Select the previous release under {} to roll back to",
-                cfg.releases_dir()
+                "Restart the previous release's {} slot unit so it is healthy \
+                 before the proxy flips traffic back to it",
+                cfg.service_name
             ),
+        ),
+        DeployStep::new(
+            "proxy-flip",
+            "Flip the reverse-proxy upstream back to the previous release \
+             (health-gated on /ready before traffic moves)",
+        ),
+        DeployStep::new(
+            "record-previous",
+            "Record the release being rolled back FROM (its dir + former-live slot) \
+             as the new previous-release marker so a subsequent rollback returns to it",
         ),
         DeployStep::new(
             "repoint",
@@ -641,11 +664,9 @@ pub fn build_rollback_plan(cfg: &ResolvedDeployConfig) -> Vec<DeployStep> {
             ),
         ),
         DeployStep::new(
-            "restart",
-            format!(
-                "Restart the {} service on the previous release",
-                cfg.service_name
-            ),
+            "record-live-slot",
+            "Record the previous slot as the live slot so the next deploy's mode \
+             detection sees it serving",
         ),
         DeployStep::new(
             "readiness-gate",
@@ -653,6 +674,12 @@ pub fn build_rollback_plan(cfg: &ResolvedDeployConfig) -> Vec<DeployStep> {
                 "Re-probe /ready within {}s to confirm the rollback is healthy",
                 cfg.readiness_timeout_secs
             ),
+        ),
+        DeployStep::new(
+            "drain-rolled-back-slot",
+            "Disable the slot that was live before the rollback (the one traffic \
+             moved away from) so the next deploy sees it genuinely idle and starts \
+             the new binary fresh",
         ),
     ]
 }
@@ -676,10 +703,7 @@ pub fn run(action: DeployAction) -> Result<(), DeployError> {
             print_plan(&resolved);
             Ok(())
         }
-        DeployAction::Rollback => {
-            print_rollback(&resolved);
-            Ok(())
-        }
+        DeployAction::Rollback => run_rollback(&config, &resolved),
         DeployAction::Up => run_up(&config, &resolved),
     }
 }
@@ -824,15 +848,6 @@ fn print_plan(resolved: &ResolvedDeployConfig) {
     }
 }
 
-fn print_rollback(resolved: &ResolvedDeployConfig) {
-    println!("\u{1F342} autumn deploy rollback plan (dry-run)\n");
-    println!("Live rollback lands in a follow-up; this prints the plan only.\n");
-    println!("Rollback steps:");
-    for (i, step) in build_rollback_plan(resolved).iter().enumerate() {
-        println!("  {}. [{}] {}", i + 1, step.label, step.description);
-    }
-}
-
 /// Build the secret env-file body sourced by the systemd unit's
 /// `EnvironmentFile`. Only the values the app needs at runtime (the signing
 /// secret and the writable database URL) are emitted, and the result is wrapped
@@ -882,7 +897,7 @@ fn default_release_id() -> String {
     chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string()
 }
 
-/// Perform a real deploy (issue #1607, Slices 1–2).
+/// Perform a real deploy (issue #1607, Slices 1–3).
 ///
 /// Runs the same preflight as `check` and aborts before touching the server if
 /// anything fails (AC-6). It then probes the target ([`exec::detect_deploy_mode`])
@@ -895,9 +910,11 @@ fn default_release_id() -> String {
 ///   on the idle slot, run migrations before cutover, gate on `/ready`, then have
 ///   the proxy flip live traffic to it and drain the old release (AC-2/AC-3).
 ///
-/// Rollback execution and auto-rollback on a failed gate remain a follow-up slice
-/// (Slice 3): here a failed migration or readiness timeout aborts before the flip
-/// with the old release still serving.
+/// Either path carries a [`exec::candidate_teardown_ops`] plan so a failure
+/// before go-live auto-rolls-back the candidate (AC-4): a redeploy leaves the old
+/// release serving ([`exec::execute_redeploy`]); a first deploy has no previous
+/// release and fails loudly after tearing the candidate down
+/// ([`exec::execute_first_deploy`]).
 fn run_up(config: &AutumnConfig, resolved: &ResolvedDeployConfig) -> Result<(), DeployError> {
     eprintln!("\u{1F342} autumn deploy up\n");
 
@@ -923,7 +940,7 @@ fn run_up(config: &AutumnConfig, resolved: &ResolvedDeployConfig) -> Result<(), 
     let mode = exec::detect_deploy_mode(resolved, &executor)
         .map_err(|e| DeployError::Exec(e.to_string()))?;
 
-    let (ops, banner) = match mode {
+    let (ops, teardown, banner, is_first) = match mode {
         exec::DeployMode::First => {
             let plan = exec::SlotPlan::first(public_port);
             let unit = render_app_unit(
@@ -941,7 +958,12 @@ fn run_up(config: &AutumnConfig, resolved: &ResolvedDeployConfig) -> Result<(), 
                 &release_id,
                 &plan,
             );
-            (ops, "first deploy".to_owned())
+            // First-deploy teardown must also unlink `current` and clear the
+            // live-slot marker that first_deploy_ops creates — otherwise a failed
+            // first deploy leaves them behind and the next `deploy up` wrongly
+            // takes the redeploy path with nothing serving.
+            let teardown = exec::first_deploy_teardown_ops(resolved, &release_id, &plan);
+            (ops, teardown, "first deploy".to_owned(), true)
         }
         exec::DeployMode::Redeploy { live_slot } => {
             let plan = exec::SlotPlan::redeploy(public_port, live_slot);
@@ -960,12 +982,15 @@ fn run_up(config: &AutumnConfig, resolved: &ResolvedDeployConfig) -> Result<(), 
                 &release_id,
                 &plan,
             );
+            let teardown = exec::candidate_teardown_ops(resolved, &release_id, &plan);
             (
                 ops,
+                teardown,
                 format!(
                     "zero-downtime redeploy ({} \u{2192} {})",
                     plan.live_slot, plan.candidate_slot
                 ),
+                false,
             )
         }
     };
@@ -974,10 +999,68 @@ fn run_up(config: &AutumnConfig, resolved: &ResolvedDeployConfig) -> Result<(), 
         "Deploying release {release_id} to {} ({banner})\u{2026}\n",
         resolved.host.as_deref().unwrap_or_default()
     );
-    exec::execute_redeploy(&checks, &ops, &executor)
+    let result = if is_first {
+        exec::execute_first_deploy(&checks, &ops, &teardown, &executor)
+    } else {
+        exec::execute_redeploy(&checks, &ops, &teardown, &executor)
+    };
+    result.map_err(|e| DeployError::Exec(e.to_string()))?;
+
+    eprintln!("\n\u{2705} Deploy complete. Roll back with `autumn deploy rollback`.");
+    Ok(())
+}
+
+/// Perform a real on-demand rollback (issue #1607, Slice 3, AC-4).
+///
+/// Loads config via the same dotenv-aware path and runs the same preflight as
+/// `up`, aborting before touching the server on any failure. It then resolves the
+/// previous release on the target ([`exec::resolve_rollback_target`]) — failing
+/// loudly and non-zero via [`exec::DeployExecError::NoPreviousRelease`] when
+/// there is nothing to roll back to — and drives [`exec::rollback_ops`]: bring the
+/// previous slot's unit back up, flip the proxy back to it, repoint `current`, and
+/// re-probe `/ready`.
+fn run_rollback(config: &AutumnConfig, resolved: &ResolvedDeployConfig) -> Result<(), DeployError> {
+    eprintln!("\u{1F342} autumn deploy rollback\n");
+
+    // Fail fast: same preflight/gate as `up`, before any remote call.
+    let checks = collect_preflight(config, resolved);
+    let failed = report_preflight(&checks);
+    if failed > 0 {
+        return Err(DeployError::PreflightFailed(failed));
+    }
+
+    // Show what a rollback will do before it runs (descriptive, not a dry-run gate).
+    eprintln!("Rollback steps:");
+    for (i, step) in build_rollback_plan(resolved).iter().enumerate() {
+        eprintln!("  {}. [{}] {}", i + 1, step.label, step.description);
+    }
+    eprintln!();
+
+    let target = exec::SshTarget::from_resolved(resolved)
+        .ok_or_else(|| DeployError::Config(DEPLOY_HOST_MISSING_DETAIL.to_owned()))?;
+    let public_port = config.server.port;
+    let proxy = proxy::KamalProxyController::new(resolved.readiness_timeout_secs);
+    let executor = exec::SshExecutor::new(target);
+
+    // Resolve the previous release to roll back to (non-zero error if none).
+    let rollback_target = exec::resolve_rollback_target(resolved, public_port, &executor)
+        .map_err(|e| DeployError::Exec(e.to_string()))?;
+    eprintln!(
+        "Rolling back {} to {} ({})\u{2026}\n",
+        resolved.host.as_deref().unwrap_or_default(),
+        rollback_target.release_dir,
+        rollback_target.slot,
+    );
+
+    let ops = exec::rollback_ops(resolved, &proxy, &rollback_target);
+    // If the rollback fails at or before the health-gated flip, disable the slot it
+    // restarted so the original release is left cleanly serving (the flip never
+    // moved traffic, and no marker is written until after the flip).
+    let teardown = exec::rollback_teardown_ops(resolved, &rollback_target);
+    exec::execute_rollback(&checks, &ops, &teardown, &executor)
         .map_err(|e| DeployError::Exec(e.to_string()))?;
 
-    eprintln!("\n\u{2705} Deploy complete. Rollback execution lands in a later slice.");
+    eprintln!("\n\u{2705} Rollback complete.");
     Ok(())
 }
 
@@ -1145,22 +1228,50 @@ mod tests {
     }
 
     #[test]
-    fn rollback_plan_repoints_restarts_and_reprobes() {
+    fn rollback_plan_matches_rollback_ops_sequence() {
         let resolved = resolved_defaults();
         let plan = build_rollback_plan(&resolved);
         let labels: Vec<&str> = plan.iter().map(|s| s.label).collect();
-        assert!(labels.contains(&"repoint"));
-        let restart = labels
-            .iter()
-            .position(|&l| l == "restart")
-            .expect("restart step");
-        let reprobe = labels
-            .iter()
-            .position(|&l| l == "readiness-gate")
-            .expect("re-probe step");
+        // The printed plan must mirror `exec::rollback_ops`' actual order.
+        assert_eq!(
+            labels,
+            vec![
+                "restart-previous",
+                "proxy-flip",
+                "record-previous",
+                "repoint",
+                "record-live-slot",
+                "readiness-gate",
+                "drain-rolled-back-slot",
+            ],
+            "printed rollback plan must match rollback_ops' execution order"
+        );
+        let pos = |l: &str| labels.iter().position(|&x| x == l).expect("step present");
+        // Restart the previous unit before the health-gated flip, and flip before
+        // repointing `current`; re-probe before draining the former-live slot.
         assert!(
-            restart < reprobe,
+            pos("restart-previous") < pos("proxy-flip"),
+            "previous unit must be up before the health-gated flip"
+        );
+        assert!(
+            pos("proxy-flip") < pos("record-previous"),
+            "flip must precede recording the previous-release marker"
+        );
+        assert!(
+            pos("record-previous") < pos("repoint"),
+            "the previous-release marker is recorded before `current` moves off it"
+        );
+        assert!(
+            pos("proxy-flip") < pos("repoint"),
+            "flip must precede the current-symlink repoint"
+        );
+        assert!(
+            pos("restart-previous") < pos("readiness-gate"),
             "restart must precede the /ready re-probe"
+        );
+        assert!(
+            pos("readiness-gate") < pos("drain-rolled-back-slot"),
+            "the former-live slot is drained last, after the /ready re-probe"
         );
     }
 

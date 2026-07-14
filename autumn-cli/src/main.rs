@@ -1884,17 +1884,21 @@ enum DeployCommands {
     /// Pure dry-run — renders the plan without touching anything remote.
     Plan,
 
-    /// Print the rollback plan (dry-run).
+    /// Run the preflight, then perform a REAL on-demand rollback over SSH.
     ///
-    /// Live rollback lands in a follow-up; this slice prints the plan only.
+    /// Resolves the previous release on the target, brings its slot back up,
+    /// flips the proxy back to it, repoints `current`, and re-probes `/ready`.
+    /// Fails loudly (non-zero) when there is no previous release to roll back to.
     Rollback,
 
-    /// Run the preflight, then perform a REAL first deploy over SSH.
+    /// Run the preflight, then perform a REAL deploy over SSH.
     ///
     /// Aborts before touching the server if preflight fails, then uploads the
     /// `autumn build --embed` release binary, writes the (0600) env file and the
-    /// systemd unit, enables the service, and gates on `/ready`. Zero-downtime
-    /// cutover and rollback land in follow-up slices.
+    /// systemd unit, enables the service, and gates on `/ready` — a first deploy
+    /// installs the proxy and stands the release up behind it; a redeploy runs a
+    /// zero-downtime cutover and auto-rolls-back the candidate on a pre-cutover
+    /// failure.
     Up,
 }
 
