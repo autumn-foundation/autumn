@@ -1317,6 +1317,32 @@ pub use maud::html;
 /// ```
 pub use crate::extract::Json;
 
+/// CSV extractor and response wrapper.
+///
+/// Wraps an iterable of [`CsvSchema`](crate::data::csv::CsvSchema) items and
+/// serializes them as a CSV response with `Content-Type: text/csv`.
+///
+/// # Examples
+///
+/// ```rust,no_run
+/// use autumn_web::prelude::*;
+/// use autumn_web::data::csv::CsvSchema;
+/// use autumn_web::extract::Csv;
+///
+/// struct Item { id: i32 }
+/// impl CsvSchema for Item {
+///     fn csv_columns() -> &'static [&'static str] { &["id"] }
+///     fn to_csv_record(&self) -> Vec<String> { vec![self.id.to_string()] }
+/// }
+///
+/// #[get("/export.csv")]
+/// async fn export() -> Csv<Vec<Item>> {
+///     Csv(vec![Item { id: 1 }])
+/// }
+/// ```
+#[cfg(feature = "csv")]
+pub use crate::extract::Csv;
+
 /// Path extractor.
 ///
 /// Extract typed path parameters from the URL.
