@@ -1295,6 +1295,18 @@ pub struct InputsForOptions {
     /// no-JS path still works via the pre-rendered blank rows.
     pub add_row_url: Option<String>,
     /// Container element id. Defaults to `"{collection}-rows"`.
+    ///
+    /// This id is load-bearing when [`add_row_url`](Self::add_row_url) is set:
+    /// the Add-row button's `hx-target` and its `hx-vals` index scan both select
+    /// `#{container_id}`. HTML ids must be unique in a document, so **when two or
+    /// more nested forms for the same child collection appear on one page, each
+    /// MUST pass a distinct `container_id`.** The `{collection}-rows` default is
+    /// correct for a single such form per page; leaving two same-collection forms
+    /// on the default id produces duplicate ids (invalid HTML) and makes each
+    /// Add-row button resolve against — and append rows / compute indices from —
+    /// whichever container the shared id happens to match first, i.e. the wrong
+    /// form. Distinct ids are the only requirement; any stable, unique string
+    /// (e.g. `"shipping-items-rows"` vs `"billing-items-rows"`) works.
     pub container_id: Option<String>,
 }
 
@@ -1348,13 +1360,29 @@ impl Default for InputsForOptions {
 ///
 /// The button also carries an `hx-vals` (`js:` form) that computes a fresh
 /// `index` for each request — `max(existing data-index) + 1` scanning only
-/// `#{container_id} .nested-fields__row[data-index]` (scoped to this form's
-/// container so multiple nested forms on a page never clash). The endpoint
-/// should read that `index` param and pass it to [`nested_row_fragment`] so
-/// every appended row gets a name unique within the form; a static request
-/// would reuse the same index and emit duplicate control names. This is the
-/// JS-present enhancement path only — the no-JS fallback (pre-rendered blank
-/// rows) needs no such counter and is unaffected.
+/// `#{container_id} .nested-fields__row[data-index]` (scoped by the container
+/// id so a form reads its own rows). The endpoint should read that `index`
+/// param and pass it to [`nested_row_fragment`] so every appended row gets a
+/// name unique within the form; a static request would reuse the same index and
+/// emit duplicate control names. This is the JS-present enhancement path only —
+/// the no-JS fallback (pre-rendered blank rows) needs no such counter and is
+/// unaffected.
+///
+/// # Multiple same-collection forms on one page
+///
+/// Both the Add-row `hx-target` and its `hx-vals` index scan address the
+/// container by its `#{container_id}`. That scoping is only distinct if the ids
+/// are distinct, so **every same-collection nested form that also sets
+/// `add_row_url` must be given its own [`InputsForOptions::container_id`]** when
+/// more than one appears on a page. The default `{collection}-rows` id is right
+/// for a single such form; two forms sharing it emit duplicate HTML ids and each
+/// Add-row button then targets / scans whichever container the shared id resolves
+/// to first (the wrong form). A relative, id-free `hx-vals` scan was evaluated
+/// and rejected: the vendored htmx 2.0.4 evaluates a `js:` `hx-vals` expression
+/// with `Function("return (" + expr + ")")()` — no receiver — so `this` is the
+/// global object, not the triggering button, leaving no reliable handle to walk
+/// to the button's own container. The unique-id contract above is therefore the
+/// supported way to keep several same-collection forms independent.
 ///
 /// # CSRF
 ///
@@ -1426,10 +1454,16 @@ pub fn inputs_for<P, C: NestedChild>(
                 // `nested_row_fragment` requires the returned row's index to be
                 // unique within this form; a static request would keep reusing
                 // the same index and produce duplicate control names. Compute
-                // `max(existing data-index) + 1` from THIS container's rows only
-                // (scoped by `#{container_id}` so multiple nested forms on one
-                // page never clash). The decoder tolerates gaps, so this stays
-                // collision-free even after client-side row removals.
+                // `max(existing data-index) + 1` from this container's rows,
+                // scoped by `#{container_id}`. That scoping is only distinct when
+                // the id is distinct: callers rendering more than one
+                // same-collection nested form on a page MUST give each a unique
+                // `container_id` (see `InputsForOptions::container_id`), because
+                // the vendored htmx 2.0.4 evaluates this `js:` `hx-vals` with no
+                // `this`/`event` bound to the button, so an id-free relative walk
+                // to the button's own container is not available. The decoder
+                // tolerates gaps, so this stays collision-free even after
+                // client-side row removals.
                 //
                 // `hx-params="index"` serializes ONLY the `index` param with
                 // the Add-row GET: per htmx semantics a bare comma-list keeps
@@ -2165,8 +2199,10 @@ mod maud_tests {
     /// unique `index` with each htmx request via `hx-vals` (`js:` form) computed
     /// from THIS container's rows (`max(existing data-index) + 1`), so repeated
     /// clicks never reuse an index and emit duplicate control names. The selector
-    /// is scoped to the form's own container id so multiple nested forms on one
-    /// page do not clash. The pre-existing htmx attrs stay intact.
+    /// is scoped to the form's own container id; keeping several same-collection
+    /// forms independent requires each to pass a distinct `container_id` (see
+    /// `add_button_targets_and_scans_custom_container_id`). The pre-existing htmx
+    /// attrs stay intact.
     #[test]
     fn add_button_hx_vals_sends_fresh_container_scoped_index() {
         let cs = two_row_changeset();
@@ -2191,6 +2227,42 @@ mod maud_tests {
             html.contains("#items-rows .nested-fields__row[data-index]"),
             "{html}"
         );
+    }
+
+    /// Fix (Codex P2, container-id collisions): a caller rendering two nested
+    /// forms for the same child collection on one page must give each a distinct
+    /// `container_id` so their Add-row buttons stay independent. Assert that an
+    /// explicit `container_id` flows through to BOTH the container `id` and the
+    /// Add-row button's `hx-target` + `hx-vals` index scan — proving per-form
+    /// scoping works once ids are distinct — and that the default id is absent.
+    #[test]
+    fn add_button_targets_and_scans_custom_container_id() {
+        let cs = two_row_changeset();
+        let opts = InputsForOptions {
+            add_row_url: Some("/orders/line-item-row".into()),
+            // A second same-collection form on the page would pass its own id;
+            // this one deliberately avoids containing the `items-rows` default so
+            // the negative assertions below are exact substring checks.
+            container_id: Some("shipping-lines".into()),
+            ..InputsForOptions::default()
+        };
+        let html = inputs_for(&cs, &opts, render_row).into_string();
+
+        // The container carries the custom id, not the `{collection}-rows` default.
+        assert!(
+            html.contains(r#"<div id="shipping-lines" class="nested-fields">"#),
+            "{html}"
+        );
+        // The Add-row button targets the custom container…
+        assert!(html.contains(r##"hx-target="#shipping-lines""##), "{html}");
+        // …and its index scan reads that same custom container's rows…
+        assert!(
+            html.contains("#shipping-lines .nested-fields__row[data-index]"),
+            "{html}"
+        );
+        // …with no leftover reference to the default id.
+        assert!(!html.contains("items-rows .nested-fields__row"), "{html}");
+        assert!(!html.contains(r##"hx-target="#items-rows""##), "{html}");
     }
 
     #[test]
