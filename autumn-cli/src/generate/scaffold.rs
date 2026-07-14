@@ -11328,6 +11328,7 @@ async fn main() {
                 variants: Vec::new(),
                 unique: false,
                 constraints: FieldConstraints::default(),
+                state_machine: None,
             },
             Field {
                 name: "author_id".to_string(),
@@ -11336,6 +11337,7 @@ async fn main() {
                 variants: Vec::new(),
                 unique: false,
                 constraints: FieldConstraints::default(),
+                state_machine: None,
             },
         ];
         assert_eq!(
@@ -11383,6 +11385,7 @@ async fn main() {
                 variants: Vec::new(),
                 unique: false,
                 constraints: FieldConstraints::default(),
+                state_machine: None,
             },
             Field {
                 name: "author_id".to_string(),
@@ -11391,6 +11394,7 @@ async fn main() {
                 variants: Vec::new(),
                 unique: false,
                 constraints: FieldConstraints::default(),
+                state_machine: None,
             },
         ];
         let sql = render_reference_stub_tables_sql(&fields, "unrelated_table");
@@ -11493,6 +11497,7 @@ async fn main() {
             variants: vec!["a".to_string(), "b".to_string()],
             unique: false,
             constraints: FieldConstraints::default(),
+            state_machine: None,
         };
         let weight = Field {
             name: "weight".to_string(),
@@ -11504,6 +11509,7 @@ async fn main() {
             variants: Vec::new(),
             unique: false,
             constraints: FieldConstraints::default(),
+            state_machine: None,
         };
         let fields = vec![status.clone(), weight];
         let sql = enum_rejection_insert_sql("items", &fields, &status, &BTreeMap::new());
