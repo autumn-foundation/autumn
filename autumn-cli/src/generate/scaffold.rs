@@ -4381,17 +4381,59 @@ fn decimal_step(scale: u32) -> String {
 /// `step="any"` so fractional input isn't rejected client-side. Returned
 /// attribute string is space-prefixed and ready to splice straight into the
 /// generated maud `input`.
-fn html5_constraint_spec(field: &Field) -> Option<(&'static str, String)> {
-    use std::fmt::Write as _;
+/// A single HTML5 validation constraint derived from a field's DSL modifiers
+/// (issue #1388). One structured source of truth so the same constraint data
+/// can be rendered either as raw `<input>`/`<textarea>` attributes (the
+/// still-raw textarea and live-validation paths) or as typed
+/// `autumn_web::a11y::TextField` builder calls (the routed `form_for` input
+/// path, #1706).
+enum Html5Constraint {
+    MinLength(String),
+    MaxLength(String),
+    Min(String),
+    Max(String),
+    StepAny,
+}
+
+impl Html5Constraint {
+    /// The raw, space-prefixed attribute form (e.g. ` minlength="3"`).
+    fn attr(&self) -> String {
+        match self {
+            Self::MinLength(v) => format!(" minlength=\"{v}\""),
+            Self::MaxLength(v) => format!(" maxlength=\"{v}\""),
+            Self::Min(v) => format!(" min=\"{v}\""),
+            Self::Max(v) => format!(" max=\"{v}\""),
+            Self::StepAny => " step=\"any\"".to_owned(),
+        }
+    }
+
+    /// The typed `a11y::TextField` builder-call form (e.g. `.minlength(3u32)`).
+    fn builder_call(&self) -> String {
+        match self {
+            Self::MinLength(v) => format!(".minlength({v}u32)"),
+            Self::MaxLength(v) => format!(".maxlength({v}u32)"),
+            Self::Min(v) => format!(".min(\"{v}\")"),
+            Self::Max(v) => format!(".max(\"{v}\")"),
+            Self::StepAny => ".step(\"any\")".to_owned(),
+        }
+    }
+}
+
+/// The input `type` plus the structured HTML5 constraints a DSL-constrained
+/// (issue #1388) `String`/`Text`/numeric field needs over its derived control.
+/// Returns `None` when the field carries nothing the derived `FieldControl`
+/// can't already express (a plain `text`/`number` with no constraints), so it
+/// stays in the derived render rather than being needlessly excised.
+fn html5_constraint_parts(field: &Field) -> Option<(&'static str, Vec<Html5Constraint>)> {
     let c = &field.constraints;
-    let mut attrs = String::new();
+    let mut parts = Vec::new();
     let input_type = match field.kind {
         FieldKind::String | FieldKind::Text => {
             if let Some(min) = &c.min {
-                let _ = write!(attrs, " minlength=\"{min}\"");
+                parts.push(Html5Constraint::MinLength(min.clone()));
             }
             if let Some(max) = &c.max {
-                let _ = write!(attrs, " maxlength=\"{max}\"");
+                parts.push(Html5Constraint::MaxLength(max.clone()));
             }
             if c.email {
                 "email"
@@ -4403,19 +4445,19 @@ fn html5_constraint_spec(field: &Field) -> Option<(&'static str, String)> {
         }
         FieldKind::I32 | FieldKind::I64 => {
             if let Some(min) = &c.min {
-                let _ = write!(attrs, " min=\"{min}\"");
+                parts.push(Html5Constraint::Min(min.clone()));
             }
             if let Some(max) = &c.max {
-                let _ = write!(attrs, " max=\"{max}\"");
+                parts.push(Html5Constraint::Max(max.clone()));
             }
             "number"
         }
         FieldKind::F32 | FieldKind::F64 => {
             if let Some(min) = &c.min {
-                let _ = write!(attrs, " min=\"{min}\"");
+                parts.push(Html5Constraint::Min(min.clone()));
             }
             if let Some(max) = &c.max {
-                let _ = write!(attrs, " max=\"{max}\"");
+                parts.push(Html5Constraint::Max(max.clone()));
             }
             // A constrained float must keep `step="any"` — the same step the
             // unconstrained float control (`FieldControl::Number { step: "any" }`)
@@ -4424,11 +4466,11 @@ fn html5_constraint_spec(field: &Field) -> Option<(&'static str, String)> {
             // `ratio:f64{min=0,max=1}` client-side, even though the server-side
             // `range` validator and the `f64` type accept it (issue #1388's
             // "client and server agree"). Only emitted when the field is
-            // actually constrained (min/max present, so `attrs` is non-empty);
+            // actually constrained (min/max present, so `parts` is non-empty);
             // otherwise the early-return below keeps the field in the derived
             // render rather than needlessly excising it.
-            if !attrs.is_empty() {
-                let _ = write!(attrs, " step=\"any\"");
+            if !parts.is_empty() {
+                parts.push(Html5Constraint::StepAny);
             }
             "number"
         }
@@ -4437,10 +4479,31 @@ fn html5_constraint_spec(field: &Field) -> Option<(&'static str, String)> {
     // Nothing to add over the derived control: a plain `text`/`number` with no
     // constraint attributes is exactly what `form_for` already renders, so
     // don't excise-and-reappend it (which would only reorder the field).
-    if attrs.is_empty() && input_type != "email" && input_type != "url" {
+    if parts.is_empty() && input_type != "email" && input_type != "url" {
         return None;
     }
+    Some((input_type, parts))
+}
+
+/// The input `type` plus the raw, space-prefixed HTML5 attribute string (e.g.
+/// ` minlength="3" maxlength="120"`) for the still-raw textarea and
+/// live-validation render paths. Formats [`html5_constraint_parts`].
+fn html5_constraint_spec(field: &Field) -> Option<(&'static str, String)> {
+    let (input_type, parts) = html5_constraint_parts(field)?;
+    let attrs = parts.iter().map(Html5Constraint::attr).collect::<String>();
     Some((input_type, attrs))
+}
+
+/// The input `type` plus the typed `autumn_web::a11y::TextField` builder-call
+/// string (e.g. `.minlength(3u32).maxlength(120u32)`) for the routed `form_for`
+/// input path (#1706). Formats [`html5_constraint_parts`].
+fn html5_constraint_builder_calls(field: &Field) -> Option<(&'static str, String)> {
+    let (input_type, parts) = html5_constraint_parts(field)?;
+    let calls = parts
+        .iter()
+        .map(Html5Constraint::builder_call)
+        .collect::<String>();
+    Some((input_type, calls))
 }
 
 /// Render the raw maud markup for a DSL-constrained (issue #1388)
