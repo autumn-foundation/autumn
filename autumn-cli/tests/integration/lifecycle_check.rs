@@ -645,3 +645,78 @@ pub enum PostState {
         "the DOT document must have balanced braces\n{stdout}"
     );
 }
+
+#[test]
+fn dot_diagram_same_named_enums_in_separate_modules_do_not_collide() {
+    // Two lifecycle enums with the SAME identifier (`State`) declared in two
+    // separate modules must be namespaced by their module-qualified id, so their
+    // clusters and nodes stay distinct instead of merging under a shared
+    // `cluster_State`.
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "src/domain.rs",
+        r"
+mod orders {
+    #[lifecycle(
+        initial = Open,
+        terminal(Closed),
+        transitions(
+            Open -> Closed,
+        )
+    )]
+    pub enum State {
+        Open,
+        Closed,
+    }
+}
+
+mod invoices {
+    #[lifecycle(
+        initial = Draft,
+        terminal(Paid),
+        transitions(
+            Draft -> Paid,
+        )
+    )]
+    pub enum State {
+        Draft,
+        Paid,
+    }
+}
+",
+    );
+    let output = run_lifecycle(dir.path(), &["diagram", "--format", "dot"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "dot render of same-named lifecycles should exit 0\nstdout:\n{stdout}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        stdout.matches("digraph").count(),
+        1,
+        "multiple lifecycles must be one single digraph document\n{stdout}"
+    );
+    assert_eq!(
+        stdout.matches("subgraph cluster_").count(),
+        2,
+        "each lifecycle should be its own cluster subgraph\n{stdout}"
+    );
+    // The module-qualified id `orders::State` sanitizes to `orders__State`
+    // (`::` -> `__`), so the two clusters get DISTINCT ids and never collapse
+    // into a shared `cluster_State`.
+    assert!(
+        stdout.contains("cluster_orders__State"),
+        "the orders lifecycle should be namespaced by its module\n{stdout}"
+    );
+    assert!(
+        stdout.contains("cluster_invoices__State"),
+        "the invoices lifecycle should be namespaced by its module\n{stdout}"
+    );
+    // Their state nodes are namespaced apart, so no id is shared between them.
+    assert!(
+        stdout.contains("\"orders__State.Open\"") && stdout.contains("\"invoices__State.Draft\""),
+        "state nodes must be namespaced by module-qualified id\n{stdout}"
+    );
+}

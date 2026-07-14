@@ -197,7 +197,11 @@ impl Parse for LifecycleArgs {
 /// declaration order), and the parsed `#[lifecycle]` metadata.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LifecycleDef {
-    /// Enum identifier (e.g. `OrderState`).
+    /// Module-qualified identity (e.g. `orders::State`), unique across the scan.
+    /// Used to namespace diagram cluster/node ids so two same-named enums in
+    /// separate modules never collide. Equals `name` for a top-level enum.
+    pub id: String,
+    /// Enum identifier (e.g. `OrderState`) — the human-readable label.
     pub name: String,
     /// Declared variants, in enum declaration order.
     pub states: Vec<String>,
@@ -517,7 +521,8 @@ fn scan_source(src: &str, file: &str, scan: &mut Scan) {
     // with an empty inherited set; each module extends it with its own renames
     // (see `scan_items`) and passes that extended set only to its descendants, so
     // a `use` inside a child module never leaks to a parent or sibling module.
-    scan_items(&ast.items, file, scan, &BTreeSet::new());
+    let mut module_path = Vec::new();
+    scan_items(&ast.items, file, scan, &BTreeSet::new(), &mut module_path);
 }
 
 /// Walk a `use` tree, recording the rename target of any `lifecycle as <alias>`.
@@ -556,6 +561,7 @@ fn scan_items(
     file: &str,
     scan: &mut Scan,
     inherited_aliases: &BTreeSet<String>,
+    module_path: &mut Vec<String>,
 ) {
     // A `use` is visible throughout its module regardless of textual position, so
     // gather this module's own lifecycle renames before scanning any enum here.
@@ -568,11 +574,19 @@ fn scan_items(
     for item in items {
         match item {
             syn::Item::Enum(item_enum) => {
-                collect_lifecycle_enum(item_enum, file, scan, &local_aliases);
+                collect_lifecycle_enum(
+                    item_enum,
+                    file,
+                    scan,
+                    &local_aliases,
+                    module_path.as_slice(),
+                );
             }
             syn::Item::Mod(item_mod) => {
                 if let Some((_, inner)) = &item_mod.content {
-                    scan_items(inner, file, scan, &local_aliases);
+                    module_path.push(item_mod.ident.to_string());
+                    scan_items(inner, file, scan, &local_aliases, module_path);
+                    module_path.pop();
                 }
             }
             _ => {}
@@ -592,6 +606,7 @@ fn collect_lifecycle_enum(
     file: &str,
     scan: &mut Scan,
     aliases: &BTreeSet<String>,
+    module_path: &[String],
 ) {
     // Recognize the attribute as `#[lifecycle]` when it is:
     //  - a single-segment path `lifecycle`, or a same-file alias of it
@@ -612,12 +627,18 @@ fn collect_lifecycle_enum(
     let name = item_enum.ident.to_string();
     match attr.parse_args::<LifecycleArgs>() {
         Ok(args) => {
+            let id = if module_path.is_empty() {
+                name.clone()
+            } else {
+                format!("{}::{}", module_path.join("::"), name)
+            };
             let states = item_enum
                 .variants
                 .iter()
                 .map(|v| v.ident.to_string())
                 .collect();
             scan.lifecycles.push(LifecycleDef {
+                id,
                 name,
                 states,
                 initial: args.initial.to_string(),
@@ -795,7 +816,7 @@ fn render_mermaid_document(lifecycles: &[LifecycleDef]) -> String {
     let mut out = String::new();
     out.push_str("stateDiagram-v2\n");
     for wf in lifecycles {
-        let ns = sanitize_ident(&wf.name);
+        let ns = sanitize_ident(&wf.id);
         let sid = |state: &str| format!("{ns}_{}", sanitize_ident(state));
         let _ = writeln!(out, "    state \"{}\" as {ns} {{", wf.name);
         for state in &wf.states {
@@ -858,7 +879,7 @@ fn render_dot_document(lifecycles: &[LifecycleDef]) -> String {
 /// global namespace, so an un-namespaced state shared across lifecycles would
 /// collapse into one node), and each carries a `label` of its bare state name.
 fn write_dot_cluster(out: &mut String, wf: &LifecycleDef) {
-    let ns = sanitize_ident(&wf.name);
+    let ns = sanitize_ident(&wf.id);
     let nid = |state: &str| dot_id(&format!("{ns}.{state}"));
     let start = dot_id(&format!("{ns}.__start"));
     let _ = writeln!(out, "    subgraph cluster_{ns} {{");
