@@ -5542,6 +5542,81 @@ pub fn check_stored_slot_map(
     ))
 }
 
+/// The cross-backend consistency rule, as a single source of truth.
+///
+/// Shared by boot-time validation ([`DatabaseConfig::validate`], via
+/// [`DatabaseConfig::validate_backend_consistency`]) and out-of-process callers
+/// such as `autumn doctor`, so both agree for *every* role/backend mismatch
+/// without re-deriving the rule.
+///
+/// The roles map to the config fields: `url` is the legacy `database.url`,
+/// `primary_url` is `database.primary_url`, `replica_url` is
+/// `database.replica_url`, and `has_shards` is whether any `[[database.shards]]`
+/// are configured. The effective primary backend is `primary_url` if set, else
+/// the legacy `url` (mirroring [`DatabaseConfig::effective_primary_url`]).
+///
+/// `SQLite` is a valid *target* but a narrower runtime than Postgres, so several
+/// Postgres-only topologies (read replicas, horizontal shards, mixed backends)
+/// are refused up front with actionable messages. The Postgres path is
+/// behaviourally unchanged: a Postgres primary with Postgres roles and no
+/// `SQLite` anywhere hits none of these branches and returns `Ok(())`.
+///
+/// This is the single source of truth for the rule; do not re-implement it.
+///
+/// # Errors
+///
+/// Returns `Err(message)` describing the first offending role when the topology
+/// mixes backends or pairs a `SQLite` primary with a Postgres-only feature. The
+/// message is byte-identical to what boot-time validation reports.
+pub fn database_backend_consistency(
+    url: Option<&str>,
+    primary_url: Option<&str>,
+    replica_url: Option<&str>,
+    has_shards: bool,
+) -> Result<(), String> {
+    let Some(primary_backend) = primary_url.or(url).and_then(DatabaseBackend::detect) else {
+        return Ok(());
+    };
+
+    if primary_backend == DatabaseBackend::Sqlite {
+        // Read replicas are a Postgres topology concept; SQLite has no
+        // replica role to serve reads from.
+        if replica_url.is_some() {
+            return Err(
+                "database.replica_url is set but the primary target is SQLite; \
+                 read replicas require the postgres backend"
+                    .to_owned(),
+            );
+        }
+        // Horizontal sharding is Postgres-only.
+        if has_shards {
+            return Err(
+                "database.shards are configured but the primary target is SQLite; \
+                 database shards require the postgres backend"
+                    .to_owned(),
+            );
+        }
+    }
+
+    // Every configured connection role must name the same backend. Mixing
+    // (e.g. a Postgres primary with a SQLite replica, or vice versa) cannot
+    // work and is a boot-time misconfiguration rather than a first-query
+    // surprise.
+    for (field, url) in [("database.url", url), ("database.replica_url", replica_url)] {
+        if let Some(url) = url
+            && DatabaseBackend::detect(url) != Some(primary_backend)
+        {
+            return Err(format!(
+                "{field} does not match the primary database backend \
+                 ({primary_backend}); every configured database role must use \
+                 the same backend"
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 impl DatabaseConfig {
     /// Resolved primary/write database URL.
     #[must_use]
@@ -5702,53 +5777,16 @@ impl DatabaseConfig {
     /// a Postgres primary with Postgres roles and no `SQLite` anywhere hits none
     /// of these branches.
     fn validate_backend_consistency(&self) -> Result<(), ConfigError> {
-        let Some(primary_backend) = self
-            .effective_primary_url()
-            .and_then(DatabaseBackend::detect)
-        else {
-            return Ok(());
-        };
-
-        if primary_backend == DatabaseBackend::Sqlite {
-            // Read replicas are a Postgres topology concept; SQLite has no
-            // replica role to serve reads from.
-            if self.replica_url.is_some() {
-                return Err(ConfigError::Validation(
-                    "database.replica_url is set but the primary target is SQLite; \
-                     read replicas require the postgres backend"
-                        .to_owned(),
-                ));
-            }
-            // Horizontal sharding is Postgres-only.
-            if !self.shards.is_empty() {
-                return Err(ConfigError::Validation(
-                    "database.shards are configured but the primary target is SQLite; \
-                     database shards require the postgres backend"
-                        .to_owned(),
-                ));
-            }
-        }
-
-        // Every configured connection role must name the same backend. Mixing
-        // (e.g. a Postgres primary with a SQLite replica, or vice versa) cannot
-        // work and is a boot-time misconfiguration rather than a first-query
-        // surprise.
-        for (field, url) in [
-            ("database.url", self.url.as_deref()),
-            ("database.replica_url", self.replica_url.as_deref()),
-        ] {
-            if let Some(url) = url
-                && DatabaseBackend::detect(url) != Some(primary_backend)
-            {
-                return Err(ConfigError::Validation(format!(
-                    "{field} does not match the primary database backend \
-                     ({primary_backend}); every configured database role must use \
-                     the same backend"
-                )));
-            }
-        }
-
-        Ok(())
+        // Single source of truth: delegate to the free
+        // [`database_backend_consistency`] rule so boot and out-of-process
+        // callers (e.g. `autumn doctor`) agree for every role/backend mismatch.
+        database_backend_consistency(
+            self.url.as_deref(),
+            self.primary_url.as_deref(),
+            self.replica_url.as_deref(),
+            !self.shards.is_empty(),
+        )
+        .map_err(ConfigError::Validation)
     }
 
     /// Validate database configuration.
