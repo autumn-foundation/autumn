@@ -1059,7 +1059,12 @@ fn execute_with_teardown(
     let boundary = ops.iter().position(|op| op.label() == boundary_label);
     for (index, op) in ops.iter().enumerate() {
         if let Err(source) = run_one(op, exec) {
-            let at_or_before_boundary = boundary.is_none_or(|b| index <= b);
+            // Fail safe: if the boundary op was never found (`None`), we do NOT
+            // know whether the candidate is already live, so we must never tear
+            // it down — a missing/mislabeled boundary surfaces the raw error
+            // instead of risking teardown of a possibly-live app. Only a known
+            // boundary index at or after the failing step permits teardown.
+            let at_or_before_boundary = boundary.is_some_and(|b| index <= b);
             if !at_or_before_boundary {
                 return Err(source);
             }
@@ -1669,6 +1674,62 @@ mod tests {
         assert!(
             td_dir.contains(RELEASE_DIR),
             "teardown removes the candidate release dir: {td_dir}"
+        );
+    }
+
+    #[test]
+    fn teardown_fails_safe_when_boundary_missing() {
+        // Fail-safe guard (FIX): if the go-live boundary op is absent or
+        // mislabeled, we cannot know whether the candidate is already live, so a
+        // LATE failure must surface the raw error and NEVER run teardown — tearing
+        // down a possibly-live app would be catastrophic.
+        let ops = vec![
+            DeployOp::Run(RemoteCommand::new("upload-release", "true")),
+            // Mislabeled: the real boundary label is "proxy-flip", so the position
+            // lookup resolves to `None` (boundary unknown).
+            DeployOp::Run(RemoteCommand::new("prxy-flip-typo", "true")),
+            // A LATE op — after where the flip would have moved traffic — fails.
+            DeployOp::Run(RemoteCommand::new("record-live-slot", "true")),
+        ];
+        let teardown = vec![
+            DeployOp::Run(RemoteCommand::new("teardown-candidate-unit", "true")),
+            DeployOp::Run(RemoteCommand::new("teardown-candidate-dir", "true")),
+        ];
+        let exec = RecordingExecutor::failing_on("record-live-slot");
+        let checks = vec![PreflightCheck::pass("ssh_reachability", "ok")];
+
+        let err = execute_with_teardown(
+            &checks,
+            &ops,
+            &teardown,
+            "proxy-flip",
+            TeardownKind::PreviousStillServing,
+            &exec,
+        )
+        .expect_err("a late failure must still surface an error");
+
+        // The raw executor error is surfaced verbatim — NOT wrapped as a rollback.
+        assert!(
+            matches!(
+                err,
+                DeployExecError::CommandFailed {
+                    label: "record-live-slot",
+                    ..
+                }
+            ),
+            "an unknown boundary must surface the raw error, not a teardown wrapper: {err:?}"
+        );
+
+        // No teardown ran: the possibly-live candidate is left untouched.
+        let labels = exec.run_labels();
+        assert!(
+            !labels.iter().any(|l| l.starts_with("teardown")),
+            "a missing/mislabeled boundary must never trigger teardown: {labels:?}"
+        );
+        assert!(
+            !labels.contains(&"teardown-candidate-unit")
+                && !labels.contains(&"teardown-candidate-dir"),
+            "candidate must not be disabled or removed on an unknown boundary: {labels:?}"
         );
     }
 

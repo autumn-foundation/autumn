@@ -624,17 +624,28 @@ pub fn build_deploy_plan(cfg: &ResolvedDeployConfig) -> Vec<DeployStep> {
     ]
 }
 
-/// Build the rollback plan: point `current` back at the previous release,
-/// restart the service, and re-probe `/ready`.
+/// Build the rollback plan, mirroring [`exec::rollback_ops`]'s actual sequence:
+/// restart the previous slot's unit first, flip the proxy upstream back to it,
+/// repoint `current`, record the live slot, and re-probe `/ready`.
+///
+/// The order matters: the proxy flip is health-gated, so the previous release's
+/// unit must be restarted and up *before* the flip can pass, and the flip
+/// therefore precedes the `current` repoint.
 #[must_use]
 pub fn build_rollback_plan(cfg: &ResolvedDeployConfig) -> Vec<DeployStep> {
     vec![
         DeployStep::new(
-            "select-previous",
+            "restart-previous",
             format!(
-                "Select the previous release under {} to roll back to",
-                cfg.releases_dir()
+                "Restart the previous release's {} slot unit so it is healthy \
+                 before the proxy flips traffic back to it",
+                cfg.service_name
             ),
+        ),
+        DeployStep::new(
+            "proxy-flip",
+            "Flip the reverse-proxy upstream back to the previous release \
+             (health-gated on /ready before traffic moves)",
         ),
         DeployStep::new(
             "repoint",
@@ -644,11 +655,9 @@ pub fn build_rollback_plan(cfg: &ResolvedDeployConfig) -> Vec<DeployStep> {
             ),
         ),
         DeployStep::new(
-            "restart",
-            format!(
-                "Restart the {} service on the previous release",
-                cfg.service_name
-            ),
+            "record-live-slot",
+            "Record the previous slot as the live slot so the next deploy's mode \
+             detection sees it serving",
         ),
         DeployStep::new(
             "readiness-gate",
@@ -1196,21 +1205,35 @@ mod tests {
     }
 
     #[test]
-    fn rollback_plan_repoints_restarts_and_reprobes() {
+    fn rollback_plan_matches_rollback_ops_sequence() {
         let resolved = resolved_defaults();
         let plan = build_rollback_plan(&resolved);
         let labels: Vec<&str> = plan.iter().map(|s| s.label).collect();
-        assert!(labels.contains(&"repoint"));
-        let restart = labels
-            .iter()
-            .position(|&l| l == "restart")
-            .expect("restart step");
-        let reprobe = labels
-            .iter()
-            .position(|&l| l == "readiness-gate")
-            .expect("re-probe step");
+        // The printed plan must mirror `exec::rollback_ops`' actual order.
+        assert_eq!(
+            labels,
+            vec![
+                "restart-previous",
+                "proxy-flip",
+                "repoint",
+                "record-live-slot",
+                "readiness-gate",
+            ],
+            "printed rollback plan must match rollback_ops' execution order"
+        );
+        let pos = |l: &str| labels.iter().position(|&x| x == l).expect("step present");
+        // Restart the previous unit before the health-gated flip, and flip before
+        // repointing `current`; re-probe last.
         assert!(
-            restart < reprobe,
+            pos("restart-previous") < pos("proxy-flip"),
+            "previous unit must be up before the health-gated flip"
+        );
+        assert!(
+            pos("proxy-flip") < pos("repoint"),
+            "flip must precede the current-symlink repoint"
+        );
+        assert!(
+            pos("restart-previous") < pos("readiness-gate"),
             "restart must precede the /ready re-probe"
         );
     }
