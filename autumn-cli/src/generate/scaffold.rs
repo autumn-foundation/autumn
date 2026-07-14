@@ -3610,6 +3610,30 @@ pub async fn show(
     show_view(db, &row, {flash_arg}, csrf.as_ref(), csrf_field.as_ref()).await
 }}"#
             );
+            // Issue #1326 security fix (IDOR): a transition mutates an existing
+            // row, so when record-policy wiring is on (the default for non-`--api`
+            // scaffolds) the transition handler must record-authorize the actor
+            // against the loaded row *before* writing — using the SAME `"update"`
+            // action the `update` handler uses. Without this, any authenticated
+            // user who knows another row's id could POST a transition and change
+            // its state, bypassing the record policy. Mirrors the `update`/`destroy`
+            // authorize preamble: the full `State(state)` + `session: Session`
+            // extractor pair (a transition handler never carries a multipart
+            // `state`, so there is no attachment-reuse concern) and `&state` as the
+            // `AppState` receiver. When policy wiring is off it emits nothing, so
+            // the handler is exactly `id/db/flash/csrf/body` as before.
+            let transition_authz_params = if authorize {
+                "    autumn_web::extract::State(state): autumn_web::extract::State<autumn_web::AppState>,\n    session: autumn_web::session::Session,\n"
+            } else {
+                ""
+            };
+            let transition_authz_call = if authorize {
+                format!(
+                    "    autumn_web::authorization::authorize::<{pascal_name}>(&state, &session, \"update\", &row).await?;\n"
+                )
+            } else {
+                String::new()
+            };
             let mut transition_handlers = String::new();
             for f in &sm_fields {
                 let field = &f.name;
@@ -3626,7 +3650,7 @@ pub async fn transition_{field}(
     flash: Flash,
     csrf: Option<CsrfToken>,
     csrf_field: Option<CsrfFormField>,
-    body: Bytes,
+{transition_authz_params}    body: Bytes,
 ) -> AutumnResult<autumn_web::reexports::axum::response::Response> {{
     use autumn_web::reexports::axum::response::IntoResponse as _;
     let row: {pascal_name} = {plural}::table
@@ -3635,7 +3659,7 @@ pub async fn transition_{field}(
         .first(&mut *db)
         .await
         .map_err(AutumnError::not_found)?;
-    let submitted: std::collections::HashMap<String, String> =
+{transition_authz_call}    let submitted: std::collections::HashMap<String, String> =
         url::form_urlencoded::parse(body.as_ref()).into_owned().collect();
     let target = submitted.get("{field}").cloned().unwrap_or_default();
     match row.transition_{field}_to(&target) {{
@@ -11002,6 +11026,65 @@ async fn main() {
         assert!(
             routes.contains("transition_status,"),
             "paths! must register the transition route name: {routes}"
+        );
+        // Security (issue #1326 IDOR fix): with record-policy wiring on (the
+        // default for non-`--api` scaffolds), the transition handler threads the
+        // same `State` + `Session` pair as `update` and record-authorizes the
+        // actor against the loaded row with the `"update"` action BEFORE writing,
+        // so a transition cannot bypass the record policy.
+        assert!(
+            routes.contains(
+                "autumn_web::extract::State(state): autumn_web::extract::State<autumn_web::AppState>,"
+            ),
+            "transition handler must thread the State extractor when policy wiring is on: {routes}"
+        );
+        assert!(
+            routes.contains("session: autumn_web::session::Session,"),
+            "transition handler must thread the Session extractor when policy wiring is on: {routes}"
+        );
+        assert!(
+            routes.contains(
+                "autumn_web::authorization::authorize::<Order>(&state, &session, \"update\", &row).await?;"
+            ),
+            "transition handler must record-authorize the actor against the loaded row: {routes}"
+        );
+    }
+
+    #[test]
+    fn scaffold_with_state_machine_no_policy_emits_no_authz_preamble() {
+        // AC5 / IDOR-fix gating: a `--no-policy` scaffold still emits the
+        // transition route, but WITHOUT the authorize preamble — exactly the
+        // pre-fix `id/db/flash/csrf/body` handler. The authz preamble must appear
+        // only in the state-machine transition route AND only when policy is on.
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold_with_options(
+            tmp.path(),
+            "Order",
+            &[
+                "status:String:states(draft -> published: can_publish, published -> archived)"
+                    .into(),
+            ],
+            "20260427000000",
+            &ScaffoldOptions {
+                no_policy: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let routes = action_contents(&plan, "src/routes/orders.rs");
+        // The transition route is still generated…
+        assert!(
+            routes.contains("pub async fn transition_status("),
+            "--no-policy state-machine scaffold must still emit the transition handler: {routes}"
+        );
+        // …but with no record-policy authorization wiring.
+        assert!(
+            !routes.contains("authorize::<Order>"),
+            "--no-policy transition handler must not wire authorize: {routes}"
+        );
+        assert!(
+            !routes.contains("session: autumn_web::session::Session"),
+            "--no-policy transition handler must not thread a Session extractor: {routes}"
         );
     }
 
