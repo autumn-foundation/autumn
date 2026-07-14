@@ -2610,7 +2610,13 @@ fn unknown_key_was_previously_strict(path: &str) -> bool {
     // A top-level key (no `.`) has the root schema as its parent, which is
     // always validated.
     let parent = effective.rfind('.').map_or("", |i| &effective[..i]);
-    PRE_1890_STRICT_PARENTS.contains(&parent)
+    // A malformed top-level profile entry (e.g. `[profile] dev = "prod"` →
+    // error path `profile.dev`) is a structural error that was always fatal
+    // under strict_config — it is NOT a section newly revealed by #1890, so it
+    // must keep hard-failing. `strip_profile_scope` leaves a two-segment
+    // `profile.<name>` path unchanged, so its parent is the literal `profile`;
+    // no real newly-covered schema section ever has `profile` as its parent.
+    parent == "profile" || PRE_1890_STRICT_PARENTS.contains(&parent)
 }
 
 impl AutumnConfig {
@@ -7656,6 +7662,69 @@ mod tests {
         assert!(
             err_str.contains("bogus_zzz"),
             "error should name the key: {err_str}"
+        );
+    }
+
+    // 7c′ (#1890 regression guard): a MALFORMED top-level `[profile]` entry (e.g.
+    // `[profile] dev = "prod"`, whose validation error path is `profile.dev`) is a
+    // structural error that was always fatal under strict_config. It is NOT a
+    // section newly revealed by #1890, so the warn-first classifier must keep it
+    // hard-failing. A genuinely newly-covered section typo (`[resilience]`) with
+    // the same strict_config (enforce_all OFF) must still only warn — proving the
+    // fix is narrow and did not over-broaden into hard-failing new sections.
+    #[test]
+    fn malformed_profile_entry_still_hard_fails() {
+        // Malformed profile block: `dev = "prod"` is a scalar where a nested
+        // profile table is expected -> unknown-key error path `profile.dev`.
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("autumn.toml");
+        std::fs::write(&config_path, "[profile]\ndev = \"prod\"\n").unwrap();
+
+        let env = FakeEnv(
+            [
+                ("AUTUMN_SERVER__STRICT_CONFIG".to_owned(), "true".to_owned()),
+                (
+                    "AUTUMN_MANIFEST_DIR".to_owned(),
+                    temp.path().to_str().unwrap().to_owned(),
+                ),
+            ]
+            .into(),
+        );
+
+        let res = AutumnConfig::load_with_env(&env);
+        assert!(
+            res.is_err(),
+            "a malformed [profile] entry is a structural error that must keep \
+             hard-failing under strict_config (not be demoted to warn-only): {res:?}"
+        );
+        assert!(
+            matches!(res.err().unwrap(), ConfigError::Validation(_)),
+            "malformed profile entry must fail as a validation error"
+        );
+
+        // Narrowness guard: a typo in a section that only became strictly
+        // validated by #1890 (`[resilience]`) must still WARN (not fail) under the
+        // same strict_config with enforce_all OFF.
+        let temp2 = tempfile::tempdir().unwrap();
+        let config_path2 = temp2.path().join("autumn.toml");
+        std::fs::write(&config_path2, "[resilience]\nboguz = 1\n").unwrap();
+
+        let env2 = FakeEnv(
+            [
+                ("AUTUMN_SERVER__STRICT_CONFIG".to_owned(), "true".to_owned()),
+                (
+                    "AUTUMN_MANIFEST_DIR".to_owned(),
+                    temp2.path().to_str().unwrap().to_owned(),
+                ),
+            ]
+            .into(),
+        );
+
+        let res2 = AutumnConfig::load_with_env(&env2);
+        assert!(
+            res2.is_ok(),
+            "a newly-#1890-covered section typo must still only warn under \
+             strict_config (enforce_all off), proving the profile fix is narrow: {res2:?}"
         );
     }
 
