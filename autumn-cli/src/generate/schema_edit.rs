@@ -892,27 +892,54 @@ pub fn remove_columns_up_sql(table: &str, fields: &[Field]) -> String {
 /// `existing_schema` is `src/schema.rs`'s current content (or `""` if
 /// unavailable) — see [`add_columns_up_sql`]'s matching doc comment for why.
 // Retained as a Postgres-default convenience wrapper for the test suite; the
-// backend-aware `remove_columns_down_sql_for` is what production calls.
+// backend-aware `remove_columns_down_sql_for` is what production calls. The
+// Postgres path never rejects, so this unwraps the `Ok` for terse test
+// assertions.
 #[cfg(test)]
 #[must_use]
 pub fn remove_columns_down_sql(table: &str, fields: &[Field], existing_schema: &str) -> String {
     remove_columns_down_sql_for(DatabaseBackend::Postgres, table, fields, existing_schema)
+        .expect("Postgres ADD COLUMN generation never rejects")
 }
 
 /// [`remove_columns_down_sql`] for a specific database `backend` (issue #1614).
 /// The Postgres path stays byte-for-byte identical; the `SQLite` path restores
 /// the dropped column with a `SQLite`-valid type via
 /// [`super::dsl::Field::sql_column_type_for`].
-#[must_use]
+///
+/// # Errors
+/// Returns a generate-time rejection (issue #1614 AC #4) when the `backend` is
+/// `SQLite` and a re-added column is `NOT NULL` with no default. The rollback
+/// (`down.sql`) of a "remove columns" migration regenerates
+/// `ALTER TABLE … ADD COLUMN …` to restore the dropped columns, and `SQLite`
+/// rejects that DDL for a `NOT NULL` column without a `DEFAULT` once the table
+/// has rows — the identical limit the forward path
+/// ([`add_columns_up_sql_for`]) guards. This path carries no per-field default,
+/// so every `NOT NULL` re-added column is rejected on `SQLite`; nullable
+/// re-added columns are unaffected. The Postgres path never rejects and stays
+/// byte-for-byte identical.
 pub fn remove_columns_down_sql_for(
     backend: DatabaseBackend,
     table: &str,
     fields: &[Field],
     existing_schema: &str,
-) -> String {
+) -> Result<String, GenerateError> {
     let collision_fields = fields_with_existing_schema_columns(fields, existing_schema, table);
     let mut out = String::new();
     for f in fields.iter().rev() {
+        // SQLite rejects `ALTER TABLE … ADD COLUMN … NOT NULL` without a
+        // DEFAULT (issue #1614 AC #4). The rollback re-adds the dropped column
+        // with the same `ADD COLUMN` DDL and carries no per-field default, so a
+        // NOT NULL re-added column is rejected at generate time — mirroring the
+        // forward path (`add_columns_up_sql_for`) for a consistent generate
+        // contract. Postgres is unaffected (its output stays byte-for-byte
+        // identical), and a NOT NULL column inside CREATE TABLE is likewise
+        // fine on SQLite.
+        if backend == DatabaseBackend::Sqlite && !f.nullable {
+            return Err(super::sqlite_add_not_null_without_default_error(
+                table, &f.name,
+            ));
+        }
         let _ = write!(
             out,
             "ALTER TABLE {table} ADD COLUMN {} {} {}",
@@ -942,7 +969,7 @@ pub fn remove_columns_down_sql_for(
             out.push_str(&unique_index_sql(table, &f.name, &collision_fields));
         }
     }
-    out
+    Ok(out)
 }
 
 /// Add `mod <name>;` declarations to `src/main.rs` and route entries to the

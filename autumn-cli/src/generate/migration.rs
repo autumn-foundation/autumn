@@ -116,7 +116,7 @@ pub fn plan_migration_with_options(
                 std::fs::read_to_string(project_root.join("src/schema.rs")).unwrap_or_default();
             (
                 remove_columns_up_sql(table, &fields),
-                remove_columns_down_sql_for(backend, table, &fields, &existing_schema),
+                remove_columns_down_sql_for(backend, table, &fields, &existing_schema)?,
             )
         }
         MigrationShape::EncryptColumns {
@@ -739,6 +739,96 @@ pub struct Post {
             assert!(
                 up.contains("ALTER TABLE posts ADD COLUMN views BIGINT NOT NULL"),
                 "up.sql: {up}"
+            );
+        });
+    }
+
+    /// `Remove…From…` on a `SQLite` app is rejected at generate time when the
+    /// rollback would re-add a `NOT NULL` column with no default (issue #1614
+    /// AC #4). The `down.sql` of a "remove columns" migration regenerates
+    /// `ALTER TABLE … ADD COLUMN …` to restore the dropped column, and `SQLite`
+    /// rejects that DDL for a `NOT NULL` column without a `DEFAULT` — the same
+    /// limit the forward path guards
+    /// (`add_columns_migration_on_sqlite_rejects_not_null_without_default`), so
+    /// the reverse path must be consistent.
+    #[test]
+    fn remove_columns_migration_on_sqlite_rejects_not_null_re_add_on_rollback() {
+        with_no_db_env(|| {
+            let tmp = sqlite_project();
+            let err = plan_migration(
+                tmp.path(),
+                "RemoveViewsFromPosts",
+                &["views:i64".into()],
+                "20260427000000",
+            )
+            .unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                matches!(err, GenerateError::Config(_)),
+                "expected Config error, got: {err:?}"
+            );
+            assert!(
+                msg.contains("NOT NULL") && msg.contains("views") && msg.contains("posts"),
+                "message must name the column/table and the constraint: {msg}"
+            );
+            assert!(
+                msg.contains("nullable") || msg.contains("default"),
+                "message must be actionable (nullable / default): {msg}"
+            );
+        });
+    }
+
+    /// A *nullable* re-added column is restored without a default on `SQLite`,
+    /// while the reject above guards the `NOT NULL` case — together they cover
+    /// both branches of the `SQLite` rollback `ADD COLUMN` gate.
+    #[test]
+    fn remove_columns_migration_on_sqlite_allows_nullable_re_add_on_rollback() {
+        with_no_db_env(|| {
+            let tmp = sqlite_project();
+            let plan = plan_migration(
+                tmp.path(),
+                "RemoveNoteFromPosts",
+                &["note:Option<String>".into()],
+                "20260427000000",
+            )
+            .unwrap();
+            plan.execute(Flags::default()).unwrap();
+            let down = fs::read_to_string(
+                tmp.path()
+                    .join("migrations/20260427000000_remove_note_from_posts/down.sql"),
+            )
+            .unwrap();
+            assert!(
+                down.contains("ALTER TABLE posts ADD COLUMN note TEXT NULL"),
+                "down.sql: {down}"
+            );
+        });
+    }
+
+    /// Regression guard: with no `autumn.toml`, the backend defaults to Postgres
+    /// and `Remove…From…`'s rollback re-adds the `NOT NULL` column with the
+    /// historical Postgres column type — byte-for-byte unchanged by the
+    /// `SQLite` reject above.
+    #[test]
+    fn remove_columns_migration_defaults_to_postgres_types_on_rollback() {
+        with_no_db_env(|| {
+            let tmp = project();
+            let plan = plan_migration(
+                tmp.path(),
+                "RemoveViewsFromPosts",
+                &["views:i64".into()],
+                "20260427000000",
+            )
+            .unwrap();
+            plan.execute(Flags::default()).unwrap();
+            let down = fs::read_to_string(
+                tmp.path()
+                    .join("migrations/20260427000000_remove_views_from_posts/down.sql"),
+            )
+            .unwrap();
+            assert!(
+                down.contains("ALTER TABLE posts ADD COLUMN views BIGINT NOT NULL"),
+                "down.sql: {down}"
             );
         });
     }
