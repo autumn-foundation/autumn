@@ -1206,7 +1206,7 @@ pub fn create_shard_set_transactional(
                 .build()
                 .map_err(|source| ShardSetBuildError::Pool {
                     shard: shard.name.clone(),
-                    source,
+                    source: crate::db::PoolError::Build(source),
                 })?;
             Ok(crate::db::DatabaseTopology::primary_only(pool))
         })

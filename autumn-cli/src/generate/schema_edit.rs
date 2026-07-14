@@ -12,6 +12,9 @@ use std::fmt::Write as _;
 
 use sha2::{Digest, Sha256};
 
+use autumn_web::config::DatabaseBackend;
+
+use super::GenerateError;
 use super::dsl::{Field, FieldConstraints, FieldKind, IdType};
 
 /// Append a `pub mod <name>;` line to a `mod.rs` file, returning the new
@@ -51,14 +54,33 @@ pub fn remove_mod_declaration(existing: &str, name: &str) -> String {
 
 /// Build a new `diesel::table!` block for the given table, emitting the `id`
 /// column with the caller-supplied `id_type`.
+// Retained as a Postgres-default convenience wrapper for the test suite; the
+// backend-aware `schema_table_block_with_id_for` is what production calls.
+#[cfg(test)]
 #[must_use]
 pub fn schema_table_block_with_id(table: &str, fields: &[Field], id_type: IdType) -> String {
+    schema_table_block_with_id_for(DatabaseBackend::Postgres, table, fields, id_type)
+}
+
+/// [`schema_table_block_with_id`] for a specific database `backend` (`SQLite`
+/// foundation, issue #1614). The Postgres path is byte-for-byte identical to
+/// the historical output; the `SQLite` path uses the diesel sql-types that
+/// diesel's `SQLite` backend actually implements (`Text` for `Uuid`/`Jsonb`,
+/// `Binary` for `Bytea`, `Timestamp` for `Timestamptz`, …) via
+/// [`super::dsl::Field::schema_type_for`].
+#[must_use]
+pub fn schema_table_block_with_id_for(
+    backend: DatabaseBackend,
+    table: &str,
+    fields: &[Field],
+    id_type: IdType,
+) -> String {
     let mut out = String::with_capacity(fields.len() * 40 + 128);
     out.push_str("diesel::table! {\n");
     let _ = writeln!(out, "    {table} (id) {{");
-    let _ = writeln!(out, "        id -> {},", id_type.schema_type());
+    let _ = writeln!(out, "        id -> {},", id_type.schema_type_for(backend));
     for f in fields {
-        let _ = writeln!(out, "        {} -> {},", f.name, f.schema_type());
+        let _ = writeln!(out, "        {} -> {},", f.name, f.schema_type_for(backend));
     }
     out.push_str("        created_at -> Timestamp,\n");
     out.push_str("    }\n");
@@ -84,10 +106,23 @@ pub fn append_schema_table_with_id(
     fields: &[Field],
     id_type: IdType,
 ) -> String {
+    append_schema_table_with_id_for(DatabaseBackend::Postgres, existing, table, fields, id_type)
+}
+
+/// [`append_schema_table_with_id`] for a specific database `backend` (issue
+/// #1614). The Postgres path stays byte-for-byte identical.
+#[must_use]
+pub fn append_schema_table_with_id_for(
+    backend: DatabaseBackend,
+    existing: &str,
+    table: &str,
+    fields: &[Field],
+    id_type: IdType,
+) -> String {
     if has_table(existing, table) {
         return existing.to_owned();
     }
-    let block = schema_table_block_with_id(table, fields, id_type);
+    let block = schema_table_block_with_id_for(backend, table, fields, id_type);
     if existing.is_empty() {
         return block;
     }
@@ -225,20 +260,51 @@ pub fn create_table_sql_with_metadata_and_id(
     defaults: &BTreeMap<String, String>,
     id_type: IdType,
 ) -> String {
+    create_table_sql_with_metadata_and_id_for(
+        DatabaseBackend::Postgres,
+        table,
+        fields,
+        indexes,
+        defaults,
+        id_type,
+    )
+}
+
+/// [`create_table_sql_with_metadata_and_id`] for a specific database `backend`
+/// (`SQLite` foundation, issue #1614).
+///
+/// The Postgres path is byte-for-byte identical to the historical output. The
+/// `SQLite` path swaps in `SQLite`-valid column types (via
+/// [`super::dsl::Field::sql_column_type_for`] and
+/// [`super::dsl::IdType::pk_sql_for`]) and the `SQLite` `created_at` default
+/// (`TEXT ... DEFAULT CURRENT_TIMESTAMP` rather than Postgres's `TIMESTAMP ...
+/// DEFAULT NOW()`, which `SQLite` lacks). `CHECK` constraints, `REFERENCES`, and
+/// `CREATE INDEX` are portable and unchanged. Every DSL field kind maps to a
+/// working `SQLite` column type, so nothing is rejected at generate time here
+/// (see [`super::dsl::FieldKind::sqlite_sql_type`]).
+#[must_use]
+pub fn create_table_sql_with_metadata_and_id_for(
+    backend: DatabaseBackend,
+    table: &str,
+    fields: &[Field],
+    indexes: &BTreeSet<String>,
+    defaults: &BTreeMap<String, String>,
+    id_type: IdType,
+) -> String {
     let mut sql = String::with_capacity(fields.len() * 64 + indexes.len() * 96 + 256);
-    if let Some(comment) = id_type.migration_comment() {
+    if let Some(comment) = id_type.migration_comment_for(backend) {
         sql.push_str(comment);
         sql.push('\n');
     }
     let _ = writeln!(sql, "CREATE TABLE {table} (");
-    let _ = write!(sql, "    id {}", id_type.pk_sql());
+    let _ = write!(sql, "    id {}", id_type.pk_sql_for(backend));
     for f in fields {
         sql.push_str(",\n");
         let _ = write!(
             sql,
             "    {} {} {}",
             f.name,
-            f.sql_column_type(),
+            f.sql_column_type_for(backend),
             f.sql_nullability()
         );
         if let Some(target) = f.reference_table() {
@@ -251,7 +317,17 @@ pub fn create_table_sql_with_metadata_and_id(
             let _ = write!(sql, " {check}");
         }
     }
-    sql.push_str(",\n    created_at TIMESTAMP NOT NULL DEFAULT NOW()\n);\n");
+    // Postgres uses `TIMESTAMP ... DEFAULT NOW()`; SQLite has neither a
+    // timestamp type nor `NOW()`, so store ISO-8601 text defaulted to
+    // `CURRENT_TIMESTAMP`.
+    match backend {
+        DatabaseBackend::Postgres => {
+            sql.push_str(",\n    created_at TIMESTAMP NOT NULL DEFAULT NOW()\n);\n");
+        }
+        DatabaseBackend::Sqlite => {
+            sql.push_str(",\n    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP\n);\n");
+        }
+    }
     // Every `references` field gets an index automatically (Rails' `add_reference`
     // behaviour), in addition to any explicit `--index` fields. Merging into the
     // same sorted set keeps `CREATE INDEX` output deterministic and de-duplicates
@@ -529,11 +605,49 @@ fn fields_with_existing_schema_columns(
 /// so a `unique` field's index name can't collide with a plain index on some
 /// other, already-existing column from an earlier migration (issue #1032
 /// review follow-up).
+// Retained as a Postgres-default convenience wrapper for the test suite; the
+// backend-aware `add_columns_up_sql_for` is what production calls. The Postgres
+// path never rejects, so this unwraps the `Ok` for terse test assertions.
+#[cfg(test)]
 #[must_use]
 pub fn add_columns_up_sql(table: &str, fields: &[Field], existing_schema: &str) -> String {
+    add_columns_up_sql_for(DatabaseBackend::Postgres, table, fields, existing_schema)
+        .expect("Postgres ADD COLUMN generation never rejects")
+}
+
+/// [`add_columns_up_sql`] for a specific database `backend` (issue #1614). The
+/// Postgres path stays byte-for-byte identical; the `SQLite` path emits
+/// `SQLite`-valid column types via [`super::dsl::Field::sql_column_type_for`].
+///
+/// # Errors
+/// Returns a generate-time rejection (issue #1614 AC #4) when the `backend` is
+/// `SQLite` and a `NOT NULL` column has no default: `SQLite` rejects
+/// `ALTER TABLE … ADD COLUMN … NOT NULL` without a `DEFAULT` once the table has
+/// rows, so the migration would fail to apply. `generate migration Add…To…`
+/// has no way to attach a column default, so every `NOT NULL` added column is
+/// rejected on `SQLite` — the user must make the field nullable (or move it
+/// into the table's `CREATE TABLE`, where `NOT NULL` is fine on `SQLite`). The
+/// Postgres path never rejects and stays byte-for-byte identical.
+pub fn add_columns_up_sql_for(
+    backend: DatabaseBackend,
+    table: &str,
+    fields: &[Field],
+    existing_schema: &str,
+) -> Result<String, GenerateError> {
     let collision_fields = fields_with_existing_schema_columns(fields, existing_schema, table);
     let mut out = String::new();
     for f in fields {
+        // SQLite rejects `ALTER TABLE … ADD COLUMN … NOT NULL` without a
+        // DEFAULT (issue #1614 AC #4). This path carries no per-field default,
+        // so any NOT NULL added column is rejected at generate time rather than
+        // emitting DDL that breaks on SQLite. Postgres is unaffected (its
+        // output stays byte-for-byte identical), and a NOT NULL column inside
+        // CREATE TABLE (the `generate model` path) is likewise fine on SQLite.
+        if backend == DatabaseBackend::Sqlite && !f.nullable {
+            return Err(super::sqlite_add_not_null_without_default_error(
+                table, &f.name,
+            ));
+        }
         if !f.nullable {
             let _ = writeln!(
                 out,
@@ -545,7 +659,7 @@ pub fn add_columns_up_sql(table: &str, fields: &[Field], existing_schema: &str) 
             out,
             "ALTER TABLE {table} ADD COLUMN {} {} {}",
             f.name,
-            f.sql_column_type(),
+            f.sql_column_type_for(backend),
             f.sql_nullability()
         );
         if let Some(target) = f.reference_table() {
@@ -563,7 +677,10 @@ pub fn add_columns_up_sql(table: &str, fields: &[Field], existing_schema: &str) 
         // and maintaining a redundant second btree index).
         if f.kind.is_reference() && !f.unique {
             // Postgres auto-drops this index (and the FK constraint above) when
-            // the column is dropped, so `add_columns_down_sql` needs no change.
+            // the column is dropped, so its `down.sql` needs no explicit DROP
+            // INDEX. SQLite does NOT — it refuses to drop a column still used by
+            // an index — so `add_columns_down_sql_for` emits a matching
+            // `DROP INDEX idx_<table>_<col>` before the DROP COLUMN there.
             let _ = writeln!(
                 out,
                 "CREATE INDEX idx_{table}_{} ON {table} ({});",
@@ -571,20 +688,60 @@ pub fn add_columns_up_sql(table: &str, fields: &[Field], existing_schema: &str) 
             );
         }
         if f.unique {
-            // Postgres auto-drops this index when the column is dropped,
-            // same as the `references` auto-index above, so
-            // `add_columns_down_sql` needs no change.
+            // Same as the `references` auto-index above: Postgres cascades the
+            // drop with the column, but SQLite needs an explicit DROP INDEX in
+            // `add_columns_down_sql_for` (by the same `unique_index_name`).
             out.push_str(&unique_index_sql(table, &f.name, &collision_fields));
         }
     }
-    out
+    Ok(out)
 }
 
-/// `down.sql` companion to [`add_columns_up_sql`].
+/// `down.sql` companion to [`add_columns_up_sql`]. Postgres-default wrapper
+/// retained for the test suite; production calls the backend-aware
+/// [`add_columns_down_sql_for`].
+#[cfg(test)]
 #[must_use]
 pub fn add_columns_down_sql(table: &str, fields: &[Field]) -> String {
+    add_columns_down_sql_for(DatabaseBackend::Postgres, table, fields, "")
+}
+
+/// [`add_columns_down_sql`] for a specific database `backend` (issue #1614).
+///
+/// On `SQLite`, [`add_columns_up_sql_for`] emits a `CREATE INDEX` for an added
+/// nullable `references` field or a `unique` field, but `SQLite` refuses to
+/// `DROP COLUMN` while an index still references it (`cannot drop column: used
+/// in an index`). So on the `SQLite` path this emits `DROP INDEX <name>;` for
+/// each index the up path created for a field, **before** its `DROP COLUMN`,
+/// reusing the exact index-name derivation the up path used (`idx_<table>_<col>`
+/// for a plain `references` index, [`unique_index_name`] for a `unique` index).
+///
+/// Postgres cascades index drops with the column automatically, so its output
+/// stays byte-for-byte identical to the legacy `DROP COLUMN`-only rollback (no
+/// explicit `DROP INDEX`). `existing_schema` mirrors [`add_columns_up_sql_for`]
+/// so a `unique` field's index name matches the one the up path generated.
+#[must_use]
+pub fn add_columns_down_sql_for(
+    backend: DatabaseBackend,
+    table: &str,
+    fields: &[Field],
+    existing_schema: &str,
+) -> String {
+    let collision_fields = fields_with_existing_schema_columns(fields, existing_schema, table);
     let mut out = String::new();
     for f in fields.iter().rev() {
+        // SQLite: drop the up path's index for this field first (see doc
+        // comment). Only nullable fields reach a SQLite Add migration —
+        // `add_columns_up_sql_for` rejects NOT NULL there — and the up path
+        // indexes exactly a `unique` field or a non-unique `references` field.
+        if backend == DatabaseBackend::Sqlite {
+            if f.unique {
+                let name = unique_index_name(table, &f.name, &collision_fields);
+                let _ = writeln!(out, "DROP INDEX {name};");
+            } else if f.kind.is_reference() {
+                let _ = writeln!(out, "DROP INDEX idx_{table}_{};", f.name);
+            }
+        }
         let _ = writeln!(out, "ALTER TABLE {table} DROP COLUMN {};", f.name);
     }
     out
@@ -746,13 +903,53 @@ pub fn encrypt_columns_down_sql(table: &str, columns: &[String]) -> String {
     out
 }
 
-/// SQL for removing columns from a table.
+/// SQL for removing columns from a table (Postgres default).
+///
+/// Retained as a Postgres-default convenience wrapper for the test suite; the
+/// backend-aware [`remove_columns_up_sql_for`] is what production calls.
+#[cfg(test)]
+#[must_use]
+pub fn remove_columns_up_sql(table: &str, fields: &[Field]) -> String {
+    remove_columns_up_sql_for(DatabaseBackend::Postgres, table, fields, "")
+}
+
+/// [`remove_columns_up_sql`] for a specific database `backend` (issue #1614).
 ///
 /// Prepends an `autumn-safety` comment for each `DROP COLUMN` to make the
 /// rolling-deploy risk visible at a glance and machine-parseable by
 /// `autumn migrate check`.
+///
+/// On `SQLite`, the generator auto-creates an index named `idx_<table>_<col>`
+/// for both a plain scaffold `--index <col>` field and a `references` field
+/// (matching [`add_columns_up_sql_for`] /
+/// [`create_table_sql_with_metadata_and_id`]), and a uniquely-named index for a
+/// `unique` field ([`unique_index_name`]), and `SQLite` refuses to `DROP COLUMN`
+/// while an index still references it (`cannot drop column: used in an index`).
+/// The DSL/schema can't tell after the fact whether a removed column carried a
+/// plain `--index`, so on the `SQLite` path this emits
+/// `DROP INDEX IF EXISTS idx_<table>_<col>;` **unconditionally** before each
+/// `DROP COLUMN` (`IF EXISTS` makes it a safe no-op for a column that was never
+/// indexed, and the name is deterministic for both plain `--index` and
+/// `references` fields), plus `DROP INDEX IF EXISTS <unique_index_name>;` for a
+/// `unique` field — the same shape as the rollback path
+/// ([`add_columns_down_sql_for`]), here on the forward `RemoveColumns` path.
+/// Postgres cascades index drops with the column, so its output stays
+/// byte-for-byte identical (no explicit `DROP INDEX`).
+///
+/// Scope boundary: a column indexed for reasons the generator cannot see (a
+/// composite index spanning several columns) remains the documented limitation
+/// of issue #1906.
+///
+/// `existing_schema` mirrors [`add_columns_down_sql_for`] so a `unique` field's
+/// index name matches the one the up path generated.
 #[must_use]
-pub fn remove_columns_up_sql(table: &str, fields: &[Field]) -> String {
+pub fn remove_columns_up_sql_for(
+    backend: DatabaseBackend,
+    table: &str,
+    fields: &[Field],
+    existing_schema: &str,
+) -> String {
+    let collision_fields = fields_with_existing_schema_columns(fields, existing_schema, table);
     let mut out = String::new();
     for f in fields {
         let _ = writeln!(
@@ -761,6 +958,23 @@ pub fn remove_columns_up_sql(table: &str, fields: &[Field]) -> String {
              -- old replicas that reference this column will fail until restarted; \
              use expand/contract"
         );
+        // SQLite: drop the generator's index for this field first (see doc
+        // comment). SQLite refuses `DROP COLUMN` while any index references the
+        // column. The generator names a plain `--index` field's index and a
+        // `references` field's auto-index identically (`idx_<table>_<col>`), and
+        // the DSL/schema can't tell after the fact whether a column carried a
+        // plain index — so emit `DROP INDEX IF EXISTS idx_<table>_<col>;`
+        // unconditionally (a safe no-op via `IF EXISTS` for a non-indexed
+        // column), plus the `unique` field's uniquely-named index. Names are
+        // derived with the same helpers the ADD/CREATE paths use so the DROP
+        // matches the existing CREATE INDEX.
+        if backend == DatabaseBackend::Sqlite {
+            let _ = writeln!(out, "DROP INDEX IF EXISTS idx_{table}_{};", f.name);
+            if f.unique {
+                let name = unique_index_name(table, &f.name, &collision_fields);
+                let _ = writeln!(out, "DROP INDEX IF EXISTS {name};");
+            }
+        }
         let _ = writeln!(out, "ALTER TABLE {table} DROP COLUMN {};", f.name);
     }
     out
@@ -777,16 +991,60 @@ pub fn remove_columns_up_sql(table: &str, fields: &[Field]) -> String {
 ///
 /// `existing_schema` is `src/schema.rs`'s current content (or `""` if
 /// unavailable) — see [`add_columns_up_sql`]'s matching doc comment for why.
+// Retained as a Postgres-default convenience wrapper for the test suite; the
+// backend-aware `remove_columns_down_sql_for` is what production calls. The
+// Postgres path never rejects, so this unwraps the `Ok` for terse test
+// assertions.
+#[cfg(test)]
 #[must_use]
 pub fn remove_columns_down_sql(table: &str, fields: &[Field], existing_schema: &str) -> String {
+    remove_columns_down_sql_for(DatabaseBackend::Postgres, table, fields, existing_schema)
+        .expect("Postgres ADD COLUMN generation never rejects")
+}
+
+/// [`remove_columns_down_sql`] for a specific database `backend` (issue #1614).
+/// The Postgres path stays byte-for-byte identical; the `SQLite` path restores
+/// the dropped column with a `SQLite`-valid type via
+/// [`super::dsl::Field::sql_column_type_for`].
+///
+/// # Errors
+/// Returns a generate-time rejection (issue #1614 AC #4) when the `backend` is
+/// `SQLite` and a re-added column is `NOT NULL` with no default. The rollback
+/// (`down.sql`) of a "remove columns" migration regenerates
+/// `ALTER TABLE … ADD COLUMN …` to restore the dropped columns, and `SQLite`
+/// rejects that DDL for a `NOT NULL` column without a `DEFAULT` once the table
+/// has rows — the identical limit the forward path
+/// ([`add_columns_up_sql_for`]) guards. This path carries no per-field default,
+/// so every `NOT NULL` re-added column is rejected on `SQLite`; nullable
+/// re-added columns are unaffected. The Postgres path never rejects and stays
+/// byte-for-byte identical.
+pub fn remove_columns_down_sql_for(
+    backend: DatabaseBackend,
+    table: &str,
+    fields: &[Field],
+    existing_schema: &str,
+) -> Result<String, GenerateError> {
     let collision_fields = fields_with_existing_schema_columns(fields, existing_schema, table);
     let mut out = String::new();
     for f in fields.iter().rev() {
+        // SQLite rejects `ALTER TABLE … ADD COLUMN … NOT NULL` without a
+        // DEFAULT (issue #1614 AC #4). The rollback re-adds the dropped column
+        // with the same `ADD COLUMN` DDL and carries no per-field default, so a
+        // NOT NULL re-added column is rejected at generate time — mirroring the
+        // forward path (`add_columns_up_sql_for`) for a consistent generate
+        // contract. Postgres is unaffected (its output stays byte-for-byte
+        // identical), and a NOT NULL column inside CREATE TABLE is likewise
+        // fine on SQLite.
+        if backend == DatabaseBackend::Sqlite && !f.nullable {
+            return Err(super::sqlite_add_not_null_without_default_error(
+                table, &f.name,
+            ));
+        }
         let _ = write!(
             out,
             "ALTER TABLE {table} ADD COLUMN {} {} {}",
             f.name,
-            f.sql_column_type(),
+            f.sql_column_type_for(backend),
             f.sql_nullability()
         );
         if let Some(target) = f.reference_table() {
@@ -811,7 +1069,7 @@ pub fn remove_columns_down_sql(table: &str, fields: &[Field], existing_schema: &
             out.push_str(&unique_index_sql(table, &f.name, &collision_fields));
         }
     }
-    out
+    Ok(out)
 }
 
 /// Add `mod <name>;` declarations to `src/main.rs` and route entries to the
@@ -5128,6 +5386,142 @@ mod tests {
         let title_pos = sql.find("DROP COLUMN title").unwrap();
         let count_pos = sql.find("DROP COLUMN count").unwrap();
         assert!(count_pos < title_pos);
+    }
+
+    /// `SQLite` refuses to `DROP COLUMN` while an index still references it, so the
+    /// down path must `DROP INDEX` before `DROP COLUMN` for a nullable
+    /// `references` field's auto-index (issue #1614 finding 5). The DROP INDEX
+    /// name must match the CREATE INDEX name the up path generated.
+    #[test]
+    fn sqlite_add_columns_down_drops_reference_index_before_column() {
+        let f = fields(&["author:references?"]);
+        // The up path (SQLite) creates the plain auto-index for the nullable FK.
+        let up = add_columns_up_sql_for(DatabaseBackend::Sqlite, "posts", &f, "").unwrap();
+        assert!(
+            up.contains("CREATE INDEX idx_posts_author_id ON posts (author_id);"),
+            "up:\n{up}"
+        );
+        let down = add_columns_down_sql_for(DatabaseBackend::Sqlite, "posts", &f, "");
+        let drop_idx = down
+            .find("DROP INDEX idx_posts_author_id;")
+            .expect("drop index");
+        let drop_col = down
+            .find("ALTER TABLE posts DROP COLUMN author_id;")
+            .expect("drop column");
+        assert!(
+            drop_idx < drop_col,
+            "DROP INDEX must precede DROP COLUMN:\n{down}"
+        );
+    }
+
+    /// Same for a nullable `unique` field: its `CREATE UNIQUE INDEX` must be
+    /// dropped before the column on `SQLite`, using the same derived index name.
+    #[test]
+    fn sqlite_add_columns_down_drops_unique_index_before_column() {
+        let f = fields(&["email:Option<String>:unique"]);
+        let up = add_columns_up_sql_for(DatabaseBackend::Sqlite, "users", &f, "").unwrap();
+        assert!(
+            up.contains("CREATE UNIQUE INDEX idx_users_email_unique ON users (email);"),
+            "up:\n{up}"
+        );
+        let down = add_columns_down_sql_for(DatabaseBackend::Sqlite, "users", &f, "");
+        let drop_idx = down
+            .find("DROP INDEX idx_users_email_unique;")
+            .expect("drop index");
+        let drop_col = down
+            .find("ALTER TABLE users DROP COLUMN email;")
+            .expect("drop column");
+        assert!(
+            drop_idx < drop_col,
+            "DROP INDEX must precede DROP COLUMN:\n{down}"
+        );
+    }
+
+    /// Postgres cascades index drops with the column, so its down.sql stays
+    /// byte-for-byte identical to the legacy `DROP COLUMN`-only rollback — no
+    /// explicit `DROP INDEX`.
+    #[test]
+    fn postgres_add_columns_down_has_no_explicit_drop_index() {
+        let f = fields(&["author:references?"]);
+        let down = add_columns_down_sql_for(DatabaseBackend::Postgres, "posts", &f, "");
+        assert_eq!(down, "ALTER TABLE posts DROP COLUMN author_id;\n");
+        // And the Postgres-default test wrapper matches.
+        assert_eq!(add_columns_down_sql("posts", &f), down);
+    }
+
+    /// Forward `RemoveColumns` path (issue #1614 finding 9): `SQLite` refuses to
+    /// `DROP COLUMN` while an index still references it, and the generator
+    /// auto-indexes a `references` field, so the `SQLite` up.sql must `DROP INDEX`
+    /// before `DROP COLUMN`, using the same name the ADD path created.
+    #[test]
+    fn sqlite_remove_columns_up_drops_reference_index_before_column() {
+        let f = fields(&["author:references?"]);
+        let up = remove_columns_up_sql_for(DatabaseBackend::Sqlite, "posts", &f, "");
+        let drop_idx = up
+            .find("DROP INDEX IF EXISTS idx_posts_author_id;")
+            .expect("drop index");
+        let drop_col = up
+            .find("ALTER TABLE posts DROP COLUMN author_id;")
+            .expect("drop column");
+        assert!(
+            drop_idx < drop_col,
+            "DROP INDEX must precede DROP COLUMN:\n{up}"
+        );
+    }
+
+    /// Same for a `unique` field: its `CREATE UNIQUE INDEX` must be dropped
+    /// before the column on the `SQLite` forward `RemoveColumns` path, using the
+    /// same derived index name.
+    #[test]
+    fn sqlite_remove_columns_up_drops_unique_index_before_column() {
+        let f = fields(&["email:Option<String>:unique"]);
+        let up = remove_columns_up_sql_for(DatabaseBackend::Sqlite, "users", &f, "");
+        let drop_idx = up
+            .find("DROP INDEX IF EXISTS idx_users_email_unique;")
+            .expect("drop index");
+        let drop_col = up
+            .find("ALTER TABLE users DROP COLUMN email;")
+            .expect("drop column");
+        assert!(
+            drop_idx < drop_col,
+            "DROP INDEX must precede DROP COLUMN:\n{up}"
+        );
+    }
+
+    /// A column removed via a scaffold `--index <col>` field also has a
+    /// generator-created `idx_<table>_<col>` index, and the DSL/schema can't tell
+    /// after the fact whether the column carried a plain index. So on `SQLite`
+    /// every removed column emits `DROP INDEX IF EXISTS idx_<table>_<col>;`
+    /// before its `DROP COLUMN` (issue #1906 finding F10). `IF EXISTS` makes the
+    /// statement a safe no-op for a column that was never indexed.
+    #[test]
+    fn sqlite_remove_columns_up_drops_plain_index_before_column() {
+        // `RemoveTitleFromPosts`: `title` was created via scaffold `--index`.
+        let f = fields(&["title:String"]);
+        let up = remove_columns_up_sql_for(DatabaseBackend::Sqlite, "posts", &f, "");
+        let drop_idx = up
+            .find("DROP INDEX IF EXISTS idx_posts_title;")
+            .expect("drop index");
+        let drop_col = up
+            .find("ALTER TABLE posts DROP COLUMN title;")
+            .expect("drop column");
+        assert!(
+            drop_idx < drop_col,
+            "DROP INDEX IF EXISTS must precede DROP COLUMN:\n{up}"
+        );
+    }
+
+    /// Postgres cascades index drops with the column, so its forward up.sql
+    /// stays byte-for-byte identical to the legacy `DROP COLUMN`-only output —
+    /// no explicit `DROP INDEX`, even for an indexed `references` field.
+    #[test]
+    fn postgres_remove_columns_up_has_no_explicit_drop_index() {
+        let f = fields(&["author:references?"]);
+        let up = remove_columns_up_sql_for(DatabaseBackend::Postgres, "posts", &f, "");
+        assert!(!up.contains("DROP INDEX"), "up:\n{up}");
+        assert!(up.contains("ALTER TABLE posts DROP COLUMN author_id;"));
+        // And the Postgres-default test wrapper matches.
+        assert_eq!(remove_columns_up_sql("posts", &f), up);
     }
 
     // ── enum field: CHECK constraint (issue #1030) ──────────────────────────

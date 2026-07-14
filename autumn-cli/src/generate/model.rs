@@ -8,10 +8,10 @@ use super::dsl::{Field, FieldConstraints, FieldKind, IdType, parse_fields};
 use super::emit::Plan;
 use super::naming::{pascal, pluralize, snake};
 use super::schema_edit::{
-    add_mod_declaration, add_search_down_sql, add_search_up_sql, append_schema_table_with_id,
-    create_table_sql_with_metadata_and_id, drop_table_sql, link_models_into_seed_bin,
+    add_mod_declaration, add_search_down_sql, add_search_up_sql, append_schema_table_with_id_for,
+    create_table_sql_with_metadata_and_id_for, drop_table_sql, link_models_into_seed_bin,
 };
-use super::{GenerateError, ensure_project_root, read_or_empty};
+use super::{GenerateError, detect_backend, ensure_project_root, read_or_empty};
 
 /// Optional metadata applied to generated model fields.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -145,6 +145,42 @@ pub fn plan_model_with_options(
     validate_enum_field_collisions(&pascal_name, &fields)?;
     let metadata = parse_model_metadata(&fields, options)?;
 
+    // Determine the target app's database backend so the emitted DDL / diesel
+    // schema is backend-aware (SQLite foundation, issue #1614). Postgres FTS
+    // (`--searchable`) has no SQLite equivalent in this slice, so reject it at
+    // generate time rather than emit `tsvector` DDL that breaks on SQLite.
+    let backend = detect_backend(project_root);
+    if backend == autumn_web::config::DatabaseBackend::Sqlite && !metadata.searchable().is_empty() {
+        return Err(super::sqlite_search_unsupported_error());
+    }
+    // A UUID primary key needs app-side id generation on SQLite (no
+    // `gen_random_uuid()`), which is part of the deferred runtime slice #1905;
+    // reject `--id uuid` on a SQLite app at generate time rather than emit a
+    // `TEXT PRIMARY KEY` column that would accept NULL/omitted ids (AC #4).
+    if backend == autumn_web::config::DatabaseBackend::Sqlite && options.id_type == IdType::Uuid {
+        return Err(super::sqlite_uuid_pk_unsupported_error());
+    }
+    // Several DSL field kinds render to Rust model types with no working diesel
+    // SQLite FromSql/ToSql (Uuid, Attachment, Decimal). The SQLite column/schema
+    // mapping changes the DDL, but the `#[model]` struct field keeps its Rust
+    // type, so a generated SQLite app using one of these would fail to compile.
+    // Reject at generate time rather than emit uncompilable code (AC #4); real
+    // conversions are tracked in #1924.
+    if backend == autumn_web::config::DatabaseBackend::Sqlite {
+        super::reject_sqlite_unsupported_field_kinds(&fields)?;
+    }
+    // Sharding (`--sharded`) emits a `#[shard_key]` model plus (via scaffold)
+    // `ShardedDb` routes/migrations that require a `[[database.shards]]`
+    // topology, which `DatabaseConfig::validate_backend_consistency` rejects for
+    // a SQLite primary — so no valid SQLite config could use the generated
+    // resource. SQLite is single-host/single-writer, so this is a PERMANENT
+    // constraint (Postgres-only), not a deferred slice. Reject at generate time
+    // rather than emit a resource no SQLite app can boot (AC #4). `generate
+    // scaffold --sharded` routes through here too, so this one gate covers both.
+    if backend == autumn_web::config::DatabaseBackend::Sqlite && options.sharded {
+        return Err(super::sqlite_sharded_unsupported_error());
+    }
+
     let snake_name = snake(name);
     let table = pluralize(&snake_name);
 
@@ -195,7 +231,8 @@ pub fn plan_model_with_options(
     // (b) Diesel migration
     let migration_dir_name = format!("{timestamp}_create_{table}");
     let migration_dir = project_root.join("migrations").join(&migration_dir_name);
-    let table_sql = create_table_sql_with_metadata_and_id(
+    let table_sql = create_table_sql_with_metadata_and_id_for(
+        backend,
         &table,
         &schema_fields,
         metadata.indexes(),
@@ -237,12 +274,24 @@ pub fn plan_model_with_options(
     let schema_existing = read_or_empty(&schema_path);
     plan.modify(
         schema_path.clone(),
-        append_schema_table_with_id(&schema_existing, &table, &schema_fields, options.id_type),
+        append_schema_table_with_id_for(
+            backend,
+            &schema_existing,
+            &table,
+            &schema_fields,
+            options.id_type,
+        ),
     );
     plan.push_revert(crate::generate::emit::Revert::SchemaTable {
         path: schema_path,
         table: table.clone(),
-        expected_block: append_schema_table_with_id("", &table, &schema_fields, options.id_type),
+        expected_block: append_schema_table_with_id_for(
+            backend,
+            "",
+            &table,
+            &schema_fields,
+            options.id_type,
+        ),
     });
 
     // (d) `Cargo.toml` deps — `#[autumn_web::model]` expands to references
@@ -2652,6 +2701,405 @@ mod tests {
         );
     }
 
+    // ── SQLite backend awareness (issue #1614) ─────────────────────────
+
+    /// Null the database-URL environment variables so backend detection reads
+    /// the temp project's `autumn.toml` deterministically (a stray real
+    /// `DATABASE_URL` in the dev/CI environment would otherwise win).
+    fn with_no_db_env<R>(f: impl FnOnce() -> R) -> R {
+        temp_env::with_vars(
+            [
+                ("AUTUMN_DATABASE__PRIMARY_URL", None::<&str>),
+                ("AUTUMN_DATABASE__URL", None::<&str>),
+                ("DATABASE_URL", None::<&str>),
+            ],
+            f,
+        )
+    }
+
+    fn project_with_db_url(url: &str) -> TempDir {
+        let tmp = project();
+        fs::write(
+            tmp.path().join("autumn.toml"),
+            format!("[database]\nprimary_url = \"{url}\"\n"),
+        )
+        .unwrap();
+        tmp
+    }
+
+    /// A `sqlite://` app emits `SQLite`-valid `CREATE TABLE` DDL and diesel schema
+    /// types — no Postgres-only output that would break on `SQLite` (AC #4).
+    #[test]
+    fn sqlite_app_emits_sqlite_migration_ddl() {
+        with_no_db_env(|| {
+            let tmp = project_with_db_url("sqlite://app.db");
+            let plan = plan_model(
+                tmp.path(),
+                "Post",
+                &[
+                    "title:String".into(),
+                    "views:i64".into(),
+                    "naive:NaiveDateTime".into(),
+                ],
+                "20260427000000",
+            )
+            .unwrap();
+            plan.execute(Flags::default()).unwrap();
+
+            let up = fs::read_to_string(
+                tmp.path()
+                    .join("migrations/20260427000000_create_posts/up.sql"),
+            )
+            .unwrap();
+            assert!(
+                up.contains("id INTEGER PRIMARY KEY AUTOINCREMENT"),
+                "up.sql: {up}"
+            );
+            assert!(up.contains("title TEXT NOT NULL"), "up.sql: {up}");
+            assert!(up.contains("views INTEGER NOT NULL"), "up.sql: {up}");
+            assert!(up.contains("naive TEXT NOT NULL"), "up.sql: {up}");
+            assert!(
+                up.contains("created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP"),
+                "up.sql: {up}"
+            );
+            // No Postgres-only DDL may leak into a SQLite migration.
+            for leak in ["BIGSERIAL", "TIMESTAMPTZ", "NOW()", "JSONB", "BIGINT"] {
+                assert!(!up.contains(leak), "SQLite up.sql leaked `{leak}`: {up}");
+            }
+
+            let schema = fs::read_to_string(tmp.path().join("src/schema.rs")).unwrap();
+            // `NaiveDateTime` uses the core, ungated `Timestamp` sql-type.
+            assert!(schema.contains("naive -> Timestamp,"), "schema: {schema}");
+            // Neither the Postgres-only `Timestamptz` / `Jsonb` diesel types nor
+            // the sqlite-feature-gated `TimestamptzSqlite` (which the generated
+            // app's Postgres-oriented deps do not export) may leak: `DateTime`
+            // is now rejected at generate time (#1924), so no timestamptz sql-
+            // type of any spelling should appear in a SQLite schema.
+            assert!(
+                !schema.contains("Timestamptz"),
+                "SQLite schema.rs leaked a timestamptz sql-type: {schema}"
+            );
+            assert!(
+                !schema.contains("Jsonb"),
+                "SQLite schema.rs leaked `Jsonb`: {schema}"
+            );
+        });
+    }
+
+    /// A `SQLite` app rejects field kinds whose Rust model type has no working
+    /// diesel `SQLite` conversion (`Uuid`, `Attachment`, `Decimal`,
+    /// `DateTime<Utc>`, and `Enum`) at generate time, citing #1924 (issue #1614
+    /// AC #4) — rather than emit a model that fails to compile. `DateTime<Utc>`
+    /// would need the feature-gated `TimestamptzSqlite`; `Enum` renders only
+    /// Postgres (`Pg`) diesel conversions.
+    #[test]
+    fn sqlite_app_rejects_field_kinds_without_diesel_conversion_citing_1924() {
+        with_no_db_env(|| {
+            let tmp = project_with_db_url("sqlite://app.db");
+            for (token, rust_type) in [
+                ("token:Uuid", "uuid::Uuid"),
+                ("cover:Attachment", "autumn_web::storage::Blob"),
+                ("price:decimal{10,2}", "rust_decimal::Decimal"),
+                ("at:DateTime", "chrono::DateTime<chrono::Utc>"),
+                // `Enum` reports its generated enum type name (`Status`), not
+                // the `String` storage-representation fallback.
+                ("status:enum{draft,published}", "Status"),
+            ] {
+                let err = plan_model(
+                    tmp.path(),
+                    "Post",
+                    &["title:String".into(), token.into()],
+                    "20260427000000",
+                )
+                .unwrap_err();
+                let msg = err.to_string();
+                assert!(
+                    matches!(err, GenerateError::Config(_)),
+                    "expected Config error for `{token}`, got: {err:?}"
+                );
+                assert!(msg.contains("1924"), "`{token}` must cite #1924: {msg}");
+                assert!(
+                    msg.contains(rust_type),
+                    "`{token}` message must name the Rust type `{rust_type}`: {msg}"
+                );
+            }
+        });
+    }
+
+    /// Regression guard: those same field kinds are unchanged on a Postgres app
+    /// — the diesel-conversion gate is SQLite-only.
+    #[test]
+    fn postgres_app_field_kinds_without_sqlite_conversion_are_unchanged() {
+        with_no_db_env(|| {
+            let tmp = project_with_db_url("postgres://localhost/app");
+            plan_model(
+                tmp.path(),
+                "Post",
+                &[
+                    "title:String".into(),
+                    "token:Uuid".into(),
+                    "cover:Attachment".into(),
+                    "price:decimal{10,2}".into(),
+                    "at:DateTime".into(),
+                    "status:enum{draft,published}".into(),
+                ],
+                "20260427000000",
+            )
+            .expect("Uuid/Attachment/Decimal/DateTime/enum fields must still generate on Postgres");
+        });
+    }
+
+    /// `generate model --id uuid` on a `SQLite` app is rejected at generate time
+    /// citing #1905 (issue #1614 AC #4): `SQLite` has no `gen_random_uuid()` and
+    /// the generated `New*` insert type omits `#[id]` fields, so a `TEXT PRIMARY
+    /// KEY` column would accept NULL/omitted ids. App-side UUID generation is
+    /// deferred to the runtime slice #1905.
+    #[test]
+    fn sqlite_app_uuid_primary_key_is_rejected_citing_1905() {
+        with_no_db_env(|| {
+            let tmp = project_with_db_url("sqlite://app.db");
+            let err = plan_model_with_options(
+                tmp.path(),
+                "Post",
+                &["title:String".into()],
+                "20260427000000",
+                &ModelOptions {
+                    id_type: IdType::Uuid,
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                matches!(err, GenerateError::Config(_)),
+                "expected Config error, got: {err:?}"
+            );
+            assert!(msg.contains("1905"), "must cite issue #1905: {msg}");
+            assert!(
+                msg.contains("SQLite") && msg.contains("UUID"),
+                "message must be actionable: {msg}"
+            );
+        });
+    }
+
+    /// The default INTEGER primary key still works on a `SQLite` app — only the
+    /// uuid key is gated, so `generate model` without `--id` is unaffected.
+    #[test]
+    fn sqlite_app_integer_primary_key_still_works() {
+        with_no_db_env(|| {
+            let tmp = project_with_db_url("sqlite://app.db");
+            let plan = plan_model_with_options(
+                tmp.path(),
+                "Post",
+                &["title:String".into()],
+                "20260427000000",
+                &ModelOptions::default(),
+            )
+            .expect("default INTEGER primary key must still generate on SQLite");
+            plan.execute(Flags::default()).unwrap();
+            let up = fs::read_to_string(
+                tmp.path()
+                    .join("migrations/20260427000000_create_posts/up.sql"),
+            )
+            .unwrap();
+            assert!(
+                up.contains("id INTEGER PRIMARY KEY AUTOINCREMENT"),
+                "up.sql: {up}"
+            );
+        });
+    }
+
+    /// A `--sharded` model on a `SQLite` app is rejected at generate time as
+    /// Postgres-only (issue #1614 AC #4): a sharded resource needs a
+    /// `[[database.shards]]` topology, which config validation rejects for a
+    /// `SQLite` primary, so no valid `SQLite` config could use it. Unlike FTS /
+    /// UUID / unsupported field kinds this is a PERMANENT constraint, so the
+    /// message must NOT cite a "coming soon" issue.
+    #[test]
+    fn sharded_on_sqlite_app_is_rejected_as_postgres_only() {
+        with_no_db_env(|| {
+            let tmp = project_with_db_url("sqlite://app.db");
+            let err = plan_model_with_options(
+                tmp.path(),
+                "Post",
+                &["title:String".into(), "tenant_id:i64".into()],
+                "20260427000000",
+                &ModelOptions {
+                    sharded: true,
+                    shard_key: Some("tenant_id".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                matches!(err, GenerateError::Config(_)),
+                "expected Config error, got: {err:?}"
+            );
+            assert!(
+                msg.contains("Postgres") && msg.contains("--sharded"),
+                "message must point at the Postgres backend requirement: {msg}"
+            );
+            assert!(
+                msg.contains("single-writer"),
+                "message must convey the permanent single-host/single-writer constraint: {msg}"
+            );
+            assert!(
+                !msg.contains("issues/"),
+                "sharding is permanent, not deferred — must not cite a coming-soon issue: {msg}"
+            );
+        });
+    }
+
+    /// The default (non-sharded) `generate model` path is unaffected on a
+    /// `SQLite` app — only `--sharded` is gated.
+    #[test]
+    fn non_sharded_sqlite_model_still_works() {
+        with_no_db_env(|| {
+            let tmp = project_with_db_url("sqlite://app.db");
+            plan_model_with_options(
+                tmp.path(),
+                "Post",
+                &["title:String".into()],
+                "20260427000000",
+                &ModelOptions::default(),
+            )
+            .expect("non-sharded SQLite model must still generate");
+        });
+    }
+
+    /// Regression guard: a `--sharded` model on a Postgres app is unchanged —
+    /// the sharded gate is SQLite-only.
+    #[test]
+    fn postgres_app_sharded_model_is_unchanged() {
+        with_no_db_env(|| {
+            let tmp = project_with_db_url("postgres://localhost/app");
+            plan_model_with_options(
+                tmp.path(),
+                "Post",
+                &["title:String".into(), "tenant_id:i64".into()],
+                "20260427000000",
+                &ModelOptions {
+                    sharded: true,
+                    shard_key: Some("tenant_id".into()),
+                    ..Default::default()
+                },
+            )
+            .expect("sharded model must still generate on Postgres");
+        });
+    }
+
+    /// Regression guard: `generate model --id uuid` on a Postgres app is
+    /// unchanged — the uuid gate is SQLite-only.
+    #[test]
+    fn postgres_app_uuid_primary_key_is_unchanged() {
+        with_no_db_env(|| {
+            let tmp = project_with_db_url("postgres://localhost/app");
+            let plan = plan_model_with_options(
+                tmp.path(),
+                "Post",
+                &["title:String".into()],
+                "20260427000000",
+                &ModelOptions {
+                    id_type: IdType::Uuid,
+                    ..Default::default()
+                },
+            )
+            .expect("uuid primary key must still generate on Postgres");
+            plan.execute(Flags::default()).unwrap();
+            let up = fs::read_to_string(
+                tmp.path()
+                    .join("migrations/20260427000000_create_posts/up.sql"),
+            )
+            .unwrap();
+            assert!(
+                up.contains("id UUID PRIMARY KEY DEFAULT gen_random_uuid()"),
+                "up.sql: {up}"
+            );
+        });
+    }
+
+    /// Regression guard: a `postgres://` app and an app with no `autumn.toml`
+    /// (backend defaults to Postgres) must both produce the historical,
+    /// byte-for-byte-identical Postgres output.
+    #[test]
+    fn postgres_app_generation_is_unchanged_regression_guard() {
+        with_no_db_env(|| {
+            let fields = &[
+                "title:String".into(),
+                "views:i64".into(),
+                "at:DateTime".into(),
+            ];
+
+            let pg = project_with_db_url("postgres://localhost/app");
+            plan_model(pg.path(), "Post", fields, "20260427000000")
+                .unwrap()
+                .execute(Flags::default())
+                .unwrap();
+            let pg_up = fs::read_to_string(
+                pg.path()
+                    .join("migrations/20260427000000_create_posts/up.sql"),
+            )
+            .unwrap();
+
+            let none = project();
+            plan_model(none.path(), "Post", fields, "20260427000000")
+                .unwrap()
+                .execute(Flags::default())
+                .unwrap();
+            let none_up = fs::read_to_string(
+                none.path()
+                    .join("migrations/20260427000000_create_posts/up.sql"),
+            )
+            .unwrap();
+
+            assert_eq!(
+                pg_up, none_up,
+                "explicit postgres:// and default (no autumn.toml) must be byte-identical"
+            );
+            assert!(
+                pg_up.contains("id BIGSERIAL PRIMARY KEY"),
+                "up.sql: {pg_up}"
+            );
+            assert!(pg_up.contains("views BIGINT NOT NULL"), "up.sql: {pg_up}");
+            assert!(pg_up.contains("at TIMESTAMPTZ NOT NULL"), "up.sql: {pg_up}");
+            assert!(
+                pg_up.contains("created_at TIMESTAMP NOT NULL DEFAULT NOW()"),
+                "up.sql: {pg_up}"
+            );
+        });
+    }
+
+    /// Postgres FTS on a `SQLite` app is rejected at generate time citing #1910
+    /// rather than emitting `tsvector` DDL that `SQLite` cannot run (AC #4).
+    #[test]
+    fn searchable_on_sqlite_app_is_rejected_citing_1910() {
+        with_no_db_env(|| {
+            let tmp = project_with_db_url("sqlite://app.db");
+            let err = plan_model_with_options(
+                tmp.path(),
+                "Post",
+                &["title:String".into(), "body:Text".into()],
+                "20260427000000",
+                &ModelOptions {
+                    searchable: vec!["title".into(), "body".into()],
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                matches!(err, GenerateError::Config(_)),
+                "expected Config error, got: {err:?}"
+            );
+            assert!(msg.contains("1910"), "must cite issue #1910: {msg}");
+            assert!(
+                msg.contains("SQLite") && msg.contains("full-text search"),
+                "message must be actionable: {msg}"
+            );
+        });
+    }
+
     /// Issue #1319: the repository macro's `search_page` is hardcoded to an
     /// `i64`/`BigInt` primary key (`SearchId { id: i64 }`, `Vec<i64>`,
     /// `id.eq_any(&ids)`, `HashMap<i64, _>`), so pairing `--searchable` with a
@@ -2684,7 +3132,7 @@ mod tests {
     }
 
     /// Issue #1319: a model field named `search_vector` collides with the
-    /// generated tsvector column the FTS migration adds, so pairing it with
+    /// generated `tsvector` column the FTS migration adds, so pairing it with
     /// `--searchable` is rejected up front. (Field names parse as lowercase
     /// `snake_case`, so the guard's `eq_ignore_ascii_case` is defensive; the
     /// reachable case is a lowercase `search_vector` field.)

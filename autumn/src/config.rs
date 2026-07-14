@@ -5384,6 +5384,77 @@ impl ShardConfig {
     }
 }
 
+/// Which database engine a configured connection target names.
+///
+/// Autumn recognizes two backends. Postgres is the fully wired runtime; `SQLite`
+/// (issue #1614) is recognized at config time so a `SQLite` target validates and
+/// is reported honestly, while the runtime pool that would serve it refuses at
+/// boot until the pool rework lands (see [`create_pool`](crate::db::create_pool)).
+///
+/// # Detection rules
+///
+/// [`DatabaseBackend::detect`] classifies a target string by its scheme:
+///
+/// - `postgres://` / `postgresql://` URLs, and libpq keyword/value strings
+///   (`host=db user=app sslmode=require`), are [`Postgres`](Self::Postgres) —
+///   exactly the shapes the connection pool already accepts.
+/// - `sqlite://<path>`, `sqlite:<path>`, and `file:<path>` targets are
+///   [`Sqlite`](Self::Sqlite). `sqlite://` is the canonical, unambiguous form
+///   and should be preferred.
+/// - Anything else (including a **bare filesystem path** like
+///   `/var/lib/app.db`) is deliberately *not* recognized and returns `None`.
+///   A bare path is ambiguous — it carries no scheme distinguishing it from a
+///   typo'd URL — so callers must spell `SQLite` targets with an explicit
+///   `sqlite://` (or `sqlite:` / `file:`) scheme.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DatabaseBackend {
+    /// `PostgreSQL` — the fully wired runtime backend.
+    Postgres,
+    /// `SQLite` — recognized at config time; the runtime pool is not yet wired
+    /// (issue #1614).
+    Sqlite,
+}
+
+impl DatabaseBackend {
+    /// Detect the backend named by a database target string, or `None` when the
+    /// target matches no recognized shape. See the [type docs](Self) for the
+    /// full rule table, including why a bare filesystem path is not recognized.
+    #[must_use]
+    pub fn detect(target: &str) -> Option<Self> {
+        // Check the SQLite schemes first: they are unambiguous prefixes and
+        // never overlap with a Postgres URL or keyword/value string.
+        if is_sqlite_target(target) {
+            Some(Self::Sqlite)
+        } else if is_pg_connection_string(target) {
+            Some(Self::Postgres)
+        } else {
+            None
+        }
+    }
+
+    /// Lowercase name used in boot-time error messages.
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Postgres => "postgres",
+            Self::Sqlite => "sqlite",
+        }
+    }
+}
+
+impl std::fmt::Display for DatabaseBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Whether `s` names a `SQLite` target: the canonical `sqlite://<path>` URL, the
+/// shorter `sqlite:<path>` form, or a `file:<path>` target. A bare filesystem
+/// path is intentionally excluded (see [`DatabaseBackend`]).
+fn is_sqlite_target(s: &str) -> bool {
+    // `sqlite://` is subsumed by the `sqlite:` prefix; both are accepted.
+    s.starts_with("sqlite:") || s.starts_with("file:")
+}
+
 /// Database connection configuration.
 ///
 /// When `url` is `None` (the default), the application runs without a
@@ -5663,6 +5734,81 @@ pub fn check_stored_slot_map(
     ))
 }
 
+/// The cross-backend consistency rule, as a single source of truth.
+///
+/// Shared by boot-time validation ([`DatabaseConfig::validate`], via
+/// [`DatabaseConfig::validate_backend_consistency`]) and out-of-process callers
+/// such as `autumn doctor`, so both agree for *every* role/backend mismatch
+/// without re-deriving the rule.
+///
+/// The roles map to the config fields: `url` is the legacy `database.url`,
+/// `primary_url` is `database.primary_url`, `replica_url` is
+/// `database.replica_url`, and `has_shards` is whether any `[[database.shards]]`
+/// are configured. The effective primary backend is `primary_url` if set, else
+/// the legacy `url` (mirroring [`DatabaseConfig::effective_primary_url`]).
+///
+/// `SQLite` is a valid *target* but a narrower runtime than Postgres, so several
+/// Postgres-only topologies (read replicas, horizontal shards, mixed backends)
+/// are refused up front with actionable messages. The Postgres path is
+/// behaviourally unchanged: a Postgres primary with Postgres roles and no
+/// `SQLite` anywhere hits none of these branches and returns `Ok(())`.
+///
+/// This is the single source of truth for the rule; do not re-implement it.
+///
+/// # Errors
+///
+/// Returns `Err(message)` describing the first offending role when the topology
+/// mixes backends or pairs a `SQLite` primary with a Postgres-only feature. The
+/// message is byte-identical to what boot-time validation reports.
+pub fn database_backend_consistency(
+    url: Option<&str>,
+    primary_url: Option<&str>,
+    replica_url: Option<&str>,
+    has_shards: bool,
+) -> Result<(), String> {
+    let Some(primary_backend) = primary_url.or(url).and_then(DatabaseBackend::detect) else {
+        return Ok(());
+    };
+
+    if primary_backend == DatabaseBackend::Sqlite {
+        // Read replicas are a Postgres topology concept; SQLite has no
+        // replica role to serve reads from.
+        if replica_url.is_some() {
+            return Err(
+                "database.replica_url is set but the primary target is SQLite; \
+                 read replicas require the postgres backend"
+                    .to_owned(),
+            );
+        }
+        // Horizontal sharding is Postgres-only.
+        if has_shards {
+            return Err(
+                "database.shards are configured but the primary target is SQLite; \
+                 database shards require the postgres backend"
+                    .to_owned(),
+            );
+        }
+    }
+
+    // Every configured connection role must name the same backend. Mixing
+    // (e.g. a Postgres primary with a SQLite replica, or vice versa) cannot
+    // work and is a boot-time misconfiguration rather than a first-query
+    // surprise.
+    for (field, url) in [("database.url", url), ("database.replica_url", replica_url)] {
+        if let Some(url) = url
+            && DatabaseBackend::detect(url) != Some(primary_backend)
+        {
+            return Err(format!(
+                "{field} does not match the primary database backend \
+                 ({primary_backend}); every configured database role must use \
+                 the same backend"
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 impl DatabaseConfig {
     /// Resolved primary/write database URL.
     #[must_use]
@@ -5815,6 +5961,26 @@ impl DatabaseConfig {
             .collect())
     }
 
+    /// Cross-backend consistency checks (issue #1614).
+    ///
+    /// `SQLite` is a valid *target* but a narrower runtime than Postgres, so
+    /// several Postgres-only knobs are refused at boot (not at first query)
+    /// with actionable messages. The Postgres path is behaviourally unchanged:
+    /// a Postgres primary with Postgres roles and no `SQLite` anywhere hits none
+    /// of these branches.
+    fn validate_backend_consistency(&self) -> Result<(), ConfigError> {
+        // Single source of truth: delegate to the free
+        // [`database_backend_consistency`] rule so boot and out-of-process
+        // callers (e.g. `autumn doctor`) agree for every role/backend mismatch.
+        database_backend_consistency(
+            self.url.as_deref(),
+            self.primary_url.as_deref(),
+            self.replica_url.as_deref(),
+            !self.shards.is_empty(),
+        )
+        .map_err(ConfigError::Validation)
+    }
+
     /// Validate database configuration.
     ///
     /// # Errors
@@ -5827,8 +5993,13 @@ impl DatabaseConfig {
             ("database.primary_url", self.primary_url.as_deref()),
             ("database.replica_url", self.replica_url.as_deref()),
         ] {
+            // A SQLite target (issue #1614) is now a recognized shape and
+            // passes this per-field check; only strings that are neither a
+            // Postgres nor a SQLite target are rejected here. The message is
+            // unchanged for the Postgres-shaped forms so existing deployments
+            // and diagnostics see byte-for-byte identical errors.
             if let Some(url) = url
-                && !is_pg_connection_string(url)
+                && DatabaseBackend::detect(url).is_none()
             {
                 let label = if field == "database.url" {
                     "database URL"
@@ -5848,6 +6019,8 @@ impl DatabaseConfig {
                 "database.replica_url requires database.primary_url or database.url".to_owned(),
             ));
         }
+
+        self.validate_backend_consistency()?;
 
         let mut seen_names = std::collections::HashSet::new();
         for (idx, shard) in self.shards.iter().enumerate() {
@@ -10925,6 +11098,188 @@ path = "/healthz"
                 "the error must stay clear about accepted forms, got: {err}"
             );
         }
+    }
+
+    // ── DatabaseBackend detection tests (issue #1614) ──────────────
+
+    #[test]
+    fn detect_backend_postgres_urls() {
+        for url in [
+            "postgres://localhost/app",
+            "postgresql://user:pass@db:5432/app",
+        ] {
+            assert_eq!(
+                DatabaseBackend::detect(url),
+                Some(DatabaseBackend::Postgres),
+                "{url} should detect as postgres"
+            );
+        }
+    }
+
+    #[test]
+    fn detect_backend_postgres_keyword_value() {
+        // libpq keyword/value strings are a Postgres shape (the pool accepts
+        // them), so they must classify as Postgres, not fall through.
+        assert_eq!(
+            DatabaseBackend::detect("host=db user=app sslmode=require"),
+            Some(DatabaseBackend::Postgres)
+        );
+    }
+
+    #[test]
+    fn detect_backend_sqlite_schemes() {
+        for url in [
+            "sqlite:///var/lib/app.db", // canonical sqlite:// (absolute path)
+            "sqlite://./relative.db",
+            "sqlite::memory:",
+            "sqlite:app.db", // shorter sqlite: form
+            "file:app.db",   // file: form
+        ] {
+            assert_eq!(
+                DatabaseBackend::detect(url),
+                Some(DatabaseBackend::Sqlite),
+                "{url} should detect as sqlite"
+            );
+        }
+    }
+
+    #[test]
+    fn detect_backend_bare_path_is_unrecognized() {
+        // A bare filesystem path carries no scheme distinguishing it from a
+        // typo'd URL, so it is deliberately NOT auto-detected as SQLite. Users
+        // must spell an explicit sqlite:// (or sqlite:/file:) scheme.
+        for target in ["/var/lib/app.db", "./app.db", "app.db", "C:\\db\\app.db"] {
+            assert_eq!(
+                DatabaseBackend::detect(target),
+                None,
+                "{target} must not be auto-detected as a backend"
+            );
+        }
+    }
+
+    #[test]
+    fn detect_backend_garbage_is_unrecognized() {
+        for target in ["mysql://localhost/app", "not a connection string", "host="] {
+            assert_eq!(DatabaseBackend::detect(target), None, "{target}");
+        }
+    }
+
+    // ── SQLite config validation tests (issue #1614) ───────────────
+
+    #[test]
+    fn validate_accepts_sqlite_url() {
+        let config = DatabaseConfig {
+            url: Some("sqlite:///var/lib/app.db".to_owned()),
+            ..Default::default()
+        };
+        assert!(
+            config.validate().is_ok(),
+            "a sqlite:// target must be accepted as valid config: {:?}",
+            config.validate()
+        );
+    }
+
+    #[test]
+    fn validate_accepts_sqlite_primary_url() {
+        let config = DatabaseConfig {
+            primary_url: Some("sqlite::memory:".to_owned()),
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok(), "{:?}", config.validate());
+    }
+
+    #[test]
+    fn validate_rejects_replica_url_on_sqlite() {
+        let config = DatabaseConfig {
+            primary_url: Some("sqlite:///var/lib/app.db".to_owned()),
+            replica_url: Some("sqlite:///var/lib/replica.db".to_owned()),
+            ..Default::default()
+        };
+        let err = config
+            .validate()
+            .expect_err("read replicas must be refused on sqlite")
+            .to_string();
+        assert!(
+            err.contains("read replicas require the postgres backend"),
+            "message must name the postgres requirement, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_shards_on_sqlite() {
+        let config = DatabaseConfig {
+            primary_url: Some("sqlite:///var/lib/app.db".to_owned()),
+            shards: vec![ShardConfig {
+                name: "s0".to_owned(),
+                primary_url: "postgres://db-shard0/app".to_owned(),
+                replica_url: None,
+                slots: None,
+                primary_pool_size: None,
+                replica_pool_size: None,
+                replica_fallback: None,
+            }],
+            ..Default::default()
+        };
+        let err = config
+            .validate()
+            .expect_err("shards must be refused on sqlite")
+            .to_string();
+        assert!(
+            err.contains("database shards require the postgres backend"),
+            "message must name the postgres requirement, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_backend_mismatch_across_roles() {
+        // Postgres primary with a SQLite replica: a boot-time misconfiguration,
+        // not a first-query surprise.
+        let config = DatabaseConfig {
+            primary_url: Some("postgres://db-primary/app".to_owned()),
+            replica_url: Some("sqlite:///var/lib/replica.db".to_owned()),
+            ..Default::default()
+        };
+        let err = config
+            .validate()
+            .expect_err("mixed backends must be refused")
+            .to_string();
+        assert!(
+            err.contains("database.replica_url")
+                && err.contains("does not match the primary database backend"),
+            "message must name the offending field and the mismatch, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_sqlite_primary_with_postgres_url() {
+        // effective_primary_url() prefers primary_url; the legacy `url` role
+        // must agree on the backend.
+        let config = DatabaseConfig {
+            primary_url: Some("sqlite:///var/lib/app.db".to_owned()),
+            url: Some("postgres://db-primary/app".to_owned()),
+            ..Default::default()
+        };
+        let err = config
+            .validate()
+            .expect_err("mixed backends must be refused")
+            .to_string();
+        assert!(
+            err.contains("database.url")
+                && err.contains("does not match the primary database backend"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_postgres_app_with_replica_still_valid() {
+        // Regression guard: the existing Postgres primary + replica path is
+        // unchanged and still validates cleanly.
+        let config = DatabaseConfig {
+            primary_url: Some("postgres://db-primary/app".to_owned()),
+            replica_url: Some("postgres://db-replica/app".to_owned()),
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok(), "{:?}", config.validate());
     }
 
     // ── Profile tests ──────────────────────────────────────────

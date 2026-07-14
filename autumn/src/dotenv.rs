@@ -272,6 +272,30 @@ pub(crate) fn resolve_dotenv_vars(
     Ok(merged)
 }
 
+/// Resolve the merged `.env` variable set for an EXPLICIT directory and profile,
+/// layered under `base` (real env wins).
+///
+/// A public seam over [`resolve_dotenv_vars`] for CLI callers that resolve
+/// config for a specific project directory rather than the process manifest dir
+/// — e.g. `autumn generate`'s backend detection, which reads the profile-merged
+/// `autumn.toml` from a passed `project_root` and must consult the same `.env`
+/// the app / `autumn migrate` would. Same gating ([`should_load`] — only the
+/// `dev`/`test` profiles auto-load unless `AUTUMN_DOTENV=1`), same
+/// profile-selector exclusion ([`PROFILE_SELECTOR_KEYS`]), and same precedence
+/// (`base` wins; the first candidate file to set a key wins over later ones) as
+/// the process-level [`resolve_process_dotenv`].
+///
+/// # Errors
+/// Returns a [`DotenvError`] if a candidate file exists but cannot be read or
+/// parsed.
+pub fn resolve_dotenv_vars_in(
+    dir: &Path,
+    profile: &str,
+    base: &dyn Env,
+) -> Result<Vec<(String, String)>, DotenvError> {
+    resolve_dotenv_vars(dir, profile, base)
+}
+
 /// An [`Env`] that overlays `.env`-derived values UNDER a base environment:
 /// the base (real process env) is consulted first; overlay values only fill
 /// keys the base does not define. Feeds the `AUTUMN_*` env-var layer from

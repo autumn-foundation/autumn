@@ -3641,12 +3641,27 @@ fn run_generate_command(cmd: GenerateCommands, mode: ApplyMode) {
             dry_run,
             force,
         } => {
-            let plan = generate::mailer::plan_mailer(
-                &resolve_cwd(),
-                &name,
-                list_unsubscribe.as_deref(),
-                no_layout,
-            );
+            // The SQLite generate-time rejection is generate-only: `destroy
+            // mailer` recomputes this same plan before reverting it, so the
+            // destroy path passes `for_revert` to skip the reject and let
+            // cleanup remove generated files on a SQLite app (mirrors the auth
+            // destroy path, which uses a distinct `_for_revert` builder).
+            let cwd = resolve_cwd();
+            let plan = match mode {
+                ApplyMode::Generate => generate::mailer::plan_mailer(
+                    &cwd,
+                    &name,
+                    list_unsubscribe.as_deref(),
+                    no_layout,
+                ),
+                ApplyMode::Destroy => generate::mailer::plan_mailer_ex(
+                    &cwd,
+                    &name,
+                    list_unsubscribe.as_deref(),
+                    no_layout,
+                    true,
+                ),
+            };
             apply_plan(plan, generate::Flags { dry_run, force }, mode);
         }
         GenerateCommands::Policy {
