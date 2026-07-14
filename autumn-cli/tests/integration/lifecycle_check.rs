@@ -287,6 +287,91 @@ pub enum OrderState {
 }
 
 #[test]
+fn aliased_lifecycle_attribute_is_detected() {
+    // An aliased `use autumn_web::lifecycle as lc; #[lc(...)]` invocation (valid
+    // Rust) must be recognized by the scanner via same-file alias tracking; the
+    // enum below is unsound (Reopened is an unreachable dead-end), so detection
+    // means a non-zero exit that names it. Skipping the aliased enum would be a
+    // silent false PASS.
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "src/order.rs",
+        r"
+use autumn_web::lifecycle as lc;
+
+#[lc(
+    initial = Pending,
+    terminal(Delivered),
+    transitions(
+        Pending -> Shipped,
+        Shipped -> Delivered,
+    )
+)]
+pub enum OrderState {
+    Pending,
+    Shipped,
+    Delivered,
+    Reopened,
+}
+",
+    );
+    let output = run_lifecycle(dir.path(), &["check"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !output.status.success(),
+        "an aliased #[lc] lifecycle must be detected and flagged\nstdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("OrderState"),
+        "should scan the aliased-attribute lifecycle\n{stdout}"
+    );
+    assert!(
+        stdout.contains("Reopened"),
+        "should name the unsound state in the aliased lifecycle\n{stdout}"
+    );
+    assert!(stdout.contains("FAIL"), "stdout:\n{stdout}");
+}
+
+#[test]
+fn aliased_sound_lifecycle_exits_zero() {
+    // The alias path must not spuriously flag a sound lifecycle: an aliased but
+    // sound enum passes cleanly, proving detection is precise, not a blanket fail.
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "src/order.rs",
+        r"
+use autumn_web::lifecycle as lc;
+
+#[lc(
+    initial = Pending,
+    terminal(Delivered),
+    transitions(
+        Pending -> Shipped,
+        Shipped -> Delivered,
+    )
+)]
+pub enum OrderState {
+    Pending,
+    Shipped,
+    Delivered,
+}
+",
+    );
+    let output = run_lifecycle(dir.path(), &["check"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "an aliased sound lifecycle should exit 0\nstdout:\n{stdout}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(stdout.contains("PASS"), "stdout:\n{stdout}");
+    assert!(stdout.contains("OrderState"), "stdout:\n{stdout}");
+    assert!(stdout.contains("sound"), "stdout:\n{stdout}");
+}
+
+#[test]
 fn lifecycle_nested_in_inline_module_is_detected() {
     // A `#[lifecycle]` enum nested inside `mod orders { ... }` (and one nested a
     // level deeper) must be walked recursively; both are unsound, so detection

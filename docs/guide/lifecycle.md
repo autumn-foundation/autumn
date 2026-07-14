@@ -389,7 +389,13 @@ the edges of the current slice:
   The typestate blocks *illegal* transitions at compile time, but the whole-graph
   properties (reachability, no dead-ends) are proven by `autumn lifecycle check`
   in CI rather than by a `const`-eval compile error. A structurally unsound
-  lifecycle will still *compile* — you must run the gate to catch it.
+  lifecycle will still *compile* — you must run the gate to catch it. The gate is
+  a source scanner (like `autumn a11y verify`): it recognizes the macro under a
+  bare, qualified (`#[autumn_web::lifecycle(...)]`), or *same-file*-aliased
+  (`use autumn_web::lifecycle as lc; #[lc(...)]`) attribute, but cannot follow an
+  alias introduced in another file or through a glob re-export. That is a gap only
+  for the scanner's report — the typestate still makes every undeclared transition
+  a compile error however the macro is spelled.
 
 ---
 

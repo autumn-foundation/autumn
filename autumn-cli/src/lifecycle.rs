@@ -28,6 +28,20 @@
 //! mirrors the macro's grammar exactly (`initial = <Ident>`,
 //! `terminal(<Ident>, ...)`, `transitions(<From> -> <To>, ...)`).
 //!
+//! **Attribute-recognition limits.** The scanner recognizes the `#[lifecycle]`
+//! macro under a bare `#[lifecycle(...)]` path, a qualified path whose last
+//! segment is `lifecycle` (e.g. `#[autumn_web::lifecycle(...)]`), and a
+//! *same-file* alias introduced by `use ...::lifecycle as <alias>;` (matched by
+//! its terminal `lifecycle` rename). Like the `autumn a11y verify`
+//! escape-hatch scanner, this is a best-effort textual pass, not a resolver: it
+//! cannot follow an alias introduced in *another* file, nor one laundered
+//! through a glob re-export (`pub use ...::lifecycle;` then `use crate::x::*;`).
+//! Such an invocation is skipped by the scanner. This is a soundness gap only
+//! for the scanner's reachability report, never for the state machine itself:
+//! the `#[lifecycle]` typestate makes every undeclared transition a *compile
+//! error*, so the by-construction guarantee holds however the macro is spelled —
+//! this pass only adds the reachability-shape checks the type system cannot see.
+//!
 //! `lifecycle check` prints a human-readable report (or `--format json`) and
 //! exits non-zero when any lifecycle is unsound — the CI gate. `lifecycle diagram`
 //! emits a lifecycle diagram per lifecycle in Graphviz DOT or Mermaid
@@ -495,20 +509,66 @@ fn scan_source(src: &str, file: &str, scan: &mut Scan) {
     let Ok(ast) = syn::parse_file(src) else {
         return;
     };
-    scan_items(&ast.items, file, scan);
+    // Aliases are per-file: collect every `use ...::lifecycle as <alias>;` in the
+    // file (at any inline-module depth) up front, then recognize `#[<alias>(...)]`
+    // anywhere in that same file.
+    let mut aliases = BTreeSet::new();
+    collect_lifecycle_aliases(&ast.items, &mut aliases);
+    scan_items(&ast.items, file, scan, &aliases);
+}
+
+/// Recursively collect same-file aliases of the `#[lifecycle]` attribute macro:
+/// for each `use ...::lifecycle as <alias>;` rename found anywhere in the file
+/// (including inside inline modules), record `<alias>`. Only a rename whose
+/// *original* terminal name is `lifecycle` counts; glob and plain-name imports
+/// carry no rename and are ignored (see the module-level attribute-recognition
+/// limits).
+fn collect_lifecycle_aliases(items: &[syn::Item], out: &mut BTreeSet<String>) {
+    for item in items {
+        match item {
+            syn::Item::Use(item_use) => collect_use_tree_aliases(&item_use.tree, out),
+            syn::Item::Mod(item_mod) => {
+                if let Some((_, inner)) = &item_mod.content {
+                    collect_lifecycle_aliases(inner, out);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Walk a `use` tree, recording the rename target of any `lifecycle as <alias>`.
+fn collect_use_tree_aliases(tree: &syn::UseTree, out: &mut BTreeSet<String>) {
+    match tree {
+        syn::UseTree::Path(path) => collect_use_tree_aliases(&path.tree, out),
+        syn::UseTree::Rename(rename) => {
+            if rename.ident == "lifecycle" {
+                out.insert(rename.rename.to_string());
+            }
+        }
+        syn::UseTree::Group(group) => {
+            for item in &group.items {
+                collect_use_tree_aliases(item, out);
+            }
+        }
+        syn::UseTree::Name(_) | syn::UseTree::Glob(_) => {}
+    }
 }
 
 /// Recursively walk a list of items, collecting every `#[lifecycle]` enum —
 /// including those nested inside inline modules (`mod orders { ... }`, stored as
 /// `Item::Mod` with `content`). Modules without inline content (`mod foo;`) have
-/// no items to walk and are ignored.
-fn scan_items(items: &[syn::Item], file: &str, scan: &mut Scan) {
+/// no items to walk and are ignored. `aliases` are the same-file
+/// `lifecycle`-attribute aliases discovered by [`collect_lifecycle_aliases`].
+fn scan_items(items: &[syn::Item], file: &str, scan: &mut Scan, aliases: &BTreeSet<String>) {
     for item in items {
         match item {
-            syn::Item::Enum(item_enum) => collect_lifecycle_enum(item_enum, file, scan),
+            syn::Item::Enum(item_enum) => {
+                collect_lifecycle_enum(item_enum, file, scan, aliases);
+            }
             syn::Item::Mod(item_mod) => {
                 if let Some((_, inner)) = &item_mod.content {
-                    scan_items(inner, file, scan);
+                    scan_items(inner, file, scan, aliases);
                 }
             }
             _ => {}
@@ -518,16 +578,29 @@ fn scan_items(items: &[syn::Item], file: &str, scan: &mut Scan) {
 
 /// If `item_enum` carries a `#[lifecycle(...)]` attribute, parse it into a
 /// [`LifecycleDef`]; a malformed attribute is recorded as an error naming `file`.
-fn collect_lifecycle_enum(item_enum: &syn::ItemEnum, file: &str, scan: &mut Scan) {
-    // Match the attribute by its *last* path segment so both the bare
-    // `#[lifecycle(...)]` and qualified forms like `#[autumn_web::lifecycle(...)]`
-    // (valid Rust) are recognized — matching only `is_ident` would miss the
-    // qualified invocation and silently pass an unsound lifecycle.
+///
+/// `aliases` holds the same-file `use ...::lifecycle as <alias>;` renames, so an
+/// aliased single-segment invocation `#[<alias>(...)]` is recognized too. See the
+/// module-level attribute-recognition limits for what this cannot resolve.
+fn collect_lifecycle_enum(
+    item_enum: &syn::ItemEnum,
+    file: &str,
+    scan: &mut Scan,
+    aliases: &BTreeSet<String>,
+) {
+    // Recognize the attribute as `#[lifecycle]` when it is:
+    //  - a single-segment path `lifecycle`, or a same-file alias of it
+    //    (`use ...::lifecycle as lc; #[lc(...)]`); or
+    //  - a multi-segment path whose *last* segment is `lifecycle`, so qualified
+    //    forms like `#[autumn_web::lifecycle(...)]` (valid Rust) are recognized.
+    // Matching only `is_ident("lifecycle")` would miss both the qualified and the
+    // aliased invocations and silently pass an unsound lifecycle.
     let Some(attr) = item_enum.attrs.iter().find(|a| {
-        a.path()
-            .segments
-            .last()
-            .is_some_and(|s| s.ident == "lifecycle")
+        let path = a.path();
+        path.get_ident().map_or_else(
+            || path.segments.last().is_some_and(|s| s.ident == "lifecycle"),
+            |ident| ident == "lifecycle" || aliases.contains(&ident.to_string()),
+        )
     }) else {
         return;
     };
