@@ -2945,6 +2945,35 @@ fn check_database_backend_consistency(
     }
 }
 
+/// Finding F28: a malformed `[[database.shards]]` entry (a missing `primary_url`
+/// or `name`, a non-table entry, a duplicate shard name) is REJECTED by
+/// [`crate::migrate::try_resolve_shard_database_urls_from_sources`] — the exact
+/// resolver `autumn migrate` and the runtime config loader use — so it is a
+/// boot-blocking problem, not "no shards".
+///
+/// Before F28, `run()` collapsed that `Err` to `has_shards = false`, so a
+/// malformed shard entry on a `sqlite://` primary was treated as an unsharded
+/// lone-primary config: the backend-consistency check Passed and the `SQLite`
+/// primary still received the no-host connectivity Pass, letting `autumn doctor
+/// --strict` greenlight a topology the app cannot boot. This turns the
+/// resolver's rejection into an authoritative doctor Fail (like the F27
+/// `backend_consistent` gate, `run()` also withholds the per-role connectivity
+/// Pass when this fires) so doctor agrees with boot.
+fn check_shard_config_resolvable(resolver_error: &str) -> CheckResult {
+    CheckResult {
+        name: "db_shard_config",
+        status: CheckStatus::Fail,
+        detail: Some(format!(
+            "[[database.shards]] is malformed — doctor cannot validate the database topology: \
+             {resolver_error}"
+        )),
+        hint: Some(
+            "Fix the [[database.shards]] entries so each has a string `name` and `primary_url` \
+             with unique names — the app rejects the same config at boot",
+        ),
+    }
+}
+
 fn check_db_role_connectivity(
     role: &'static str,
     database_url: &str,
@@ -6034,13 +6063,23 @@ pub fn run(opts: DoctorOptions) {
     // presence is resolved
     // through the SAME profile-aware `.env` overlay + merged active-profile table
     // as the topology, reusing the exact migrate resolver so doctor and the real
-    // migration step agree (a malformed shard entry resolves to `Err`, treated as
-    // "no shards" here — the deploy preflight below surfaces the malformed entry).
-    let db_has_shards = crate::migrate::try_resolve_shard_database_urls_from_sources(
+    // migration step agree.
+    //
+    // Finding F28: a malformed `[[database.shards]]` entry resolves to `Err`.
+    // Collapsing that `Err` to "no shards" (as this used to) let a SQLite primary
+    // with a broken shard entry keep the no-host connectivity Pass, so `autumn
+    // doctor --strict` greenlit a config the app cannot boot. Keep the `Result`
+    // so the `Err` can be surfaced as an AUTHORITATIVE Fail below (mirroring the
+    // resolver runtime/migrate use) and the per-role connectivity Pass withheld.
+    let shard_resolution = crate::migrate::try_resolve_shard_database_urls_from_sources(
         |key| db_denv.var(key),
         Some(&merged_db_toml),
-    )
-    .is_ok_and(|shards| !shards.is_empty());
+    );
+    let db_has_shards = shard_resolution
+        .as_ref()
+        .is_ok_and(|shards| !shards.is_empty());
+    let malformed_shard_error = shard_resolution.err();
+    let shards_malformed = malformed_shard_error.is_some();
     // Finding F27: the boot-time backend-consistency rule
     // (`DatabaseConfig::validate`) must run as an UNCONDITIONAL doctor check,
     // independent of which backend is the effective primary. The SQLite-only
@@ -6082,6 +6121,17 @@ pub fn run(opts: DoctorOptions) {
         }));
     }
 
+    // Finding F28: surface a malformed `[[database.shards]]` entry as an
+    // authoritative Fail — the resolver (and runtime/migrate) reject it, so it is
+    // a boot-blocking problem, not "no shards". Emitted independently of
+    // `db_configured`/`backend_consistent` (a shard-only config with a broken
+    // entry resolves no other role) and, like the F27 gate below, it withholds
+    // the per-role connectivity Pass so a "reachable" SQLite primary can't
+    // contradict it.
+    if let Some(err) = malformed_shard_error {
+        tasks.push(Box::new(move || check_shard_config_resolvable(&err)));
+    }
+
     let sqlite_primary_bootable = sqlite_primary_target_is_bootable(
         db_topology.legacy_url.as_deref(),
         db_topology.primary_url.as_deref(),
@@ -6092,8 +6142,11 @@ pub fn run(opts: DoctorOptions) {
     // config: the unconditional consistency FAIL above is the authoritative signal,
     // and a reachable primary must not double-report a contradictory "reachable"
     // Pass (finding F27, part 2). A backend-consistent config runs the ordinary
-    // connectivity/pending-migration probes unchanged.
-    if backend_consistent {
+    // connectivity/pending-migration probes unchanged. Likewise withhold it when
+    // the shard config is malformed (finding F28): the `db_shard_config` FAIL is
+    // authoritative, so a SQLite primary must not receive a misleading no-host
+    // connectivity Pass for a topology the app cannot boot.
+    if backend_consistent && !shards_malformed {
         if let Some(url) = db_topology.primary_url.clone() {
             let primary_for_pending = url.clone();
             let primary_is_sqlite = autumn_web::config::DatabaseBackend::detect(&url)
@@ -13855,6 +13908,160 @@ foo = "bar"
             r.status,
             CheckStatus::Fail,
             "F27: pg primary + sqlite legacy url must Fail the unconditional check"
+        );
+    }
+
+    /// Finding F28: a MALFORMED `[[database.shards]]` entry (here missing
+    /// `primary_url`) on a `sqlite://` primary must Fail doctor, not slip through
+    /// as "no shards". The runtime config loader and `autumn migrate` reject the
+    /// same entry, so doctor must too. Before F28 the resolver's `Err` collapsed
+    /// to `has_shards = false`, leaving the `SQLite` primary a bootable lone-primary
+    /// target — the `db_shard_config` Fail is what now blocks that misleading Pass.
+    #[test]
+    fn sqlite_primary_with_malformed_shard_entry_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        // `name` present but `primary_url` missing → the resolver rejects it.
+        std::fs::write(
+            dir.path().join("autumn.toml"),
+            "[database]\nprimary_url = \"sqlite://app.db\"\n\n\
+             [[database.shards]]\nname = \"shard-a\"\n",
+        )
+        .unwrap();
+
+        let base = dir.path().to_path_buf();
+        let merged = get_merged_toml_table_runtime_with("prod", "prod", move |f| base.join(f));
+
+        // `run()` resolves shard presence with the exact migrate resolver.
+        let shard_resolution = crate::migrate::try_resolve_shard_database_urls_from_sources(
+            |_| Err(std::env::VarError::NotPresent),
+            Some(&merged),
+        );
+        let err = shard_resolution
+            .expect_err("a shard entry missing primary_url must be rejected by the resolver");
+        assert!(
+            err.contains("primary_url"),
+            "the resolver error must name the missing field: {err}"
+        );
+
+        // The bug: collapsed to `has_shards = false`, the SQLite primary looks like
+        // a bootable lone primary — so doctor MUST instead Fail on the shard config.
+        assert!(
+            sqlite_primary_target_is_bootable(None, Some("sqlite://app.db"), None, false),
+            "demonstrates the F28 trap: with the malformed entry dropped, the SQLite \
+             primary would wrongly read as bootable"
+        );
+
+        let r = check_shard_config_resolvable(&err);
+        assert_eq!(
+            r.status,
+            CheckStatus::Fail,
+            "a malformed [[database.shards]] entry must Fail doctor"
+        );
+        let detail = r.detail.unwrap_or_default();
+        assert!(
+            detail.contains("database.shards") && detail.contains("primary_url"),
+            "the Fail detail must name the malformed shard config: {detail}"
+        );
+    }
+
+    /// Finding F28 counter-case: a WELL-FORMED `[[database.shards]]` entry on a
+    /// `sqlite://` primary must still Fail — via the existing backend-consistency
+    /// path (F23/F27), because shards require the postgres backend. The shard
+    /// resolver accepts the entry (`db_has_shards = true`), so no `db_shard_config`
+    /// Fail fires; the consistency check is what rejects the topology.
+    #[test]
+    fn sqlite_primary_with_wellformed_shard_still_fails_via_consistency() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("autumn.toml"),
+            "[database]\nprimary_url = \"sqlite://app.db\"\n\n\
+             [[database.shards]]\nname = \"shard-a\"\nprimary_url = \"sqlite://shard-a.db\"\n",
+        )
+        .unwrap();
+
+        let base = dir.path().to_path_buf();
+        let merged = get_merged_toml_table_runtime_with("prod", "prod", move |f| base.join(f));
+
+        let shards = crate::migrate::try_resolve_shard_database_urls_from_sources(
+            |_| Err(std::env::VarError::NotPresent),
+            Some(&merged),
+        )
+        .expect("a well-formed shard entry must resolve");
+        assert_eq!(shards.len(), 1, "the well-formed shard must be resolved");
+
+        // No malformed-shard Fail; the shards-require-postgres rule catches it.
+        let r = check_database_backend_consistency(None, Some("sqlite://app.db"), None, true);
+        assert_eq!(
+            r.status,
+            CheckStatus::Fail,
+            "a SQLite primary with shards must Fail: shards require postgres"
+        );
+    }
+
+    /// Finding F28 counter-case: a clean single-role `sqlite://` primary with NO
+    /// shards must still Pass — the resolver returns an empty shard list, so no
+    /// `db_shard_config` Fail fires and the lone `SQLite` primary stays bootable.
+    #[test]
+    fn clean_sqlite_primary_without_shards_still_passes() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("autumn.toml"),
+            "[database]\nprimary_url = \"sqlite://app.db\"\n",
+        )
+        .unwrap();
+
+        let base = dir.path().to_path_buf();
+        let merged = get_merged_toml_table_runtime_with("prod", "prod", move |f| base.join(f));
+
+        let shards = crate::migrate::try_resolve_shard_database_urls_from_sources(
+            |_| Err(std::env::VarError::NotPresent),
+            Some(&merged),
+        )
+        .expect("no shard table must resolve to an empty list, not an error");
+        assert!(shards.is_empty(), "a shard-free config has no shards");
+
+        let r = check_database_backend_consistency(None, Some("sqlite://app.db"), None, false);
+        assert_eq!(
+            r.status,
+            CheckStatus::Pass,
+            "a lone SQLite primary is a bootable single-role config"
+        );
+        assert!(
+            sqlite_primary_target_is_bootable(None, Some("sqlite://app.db"), None, false),
+            "the lone SQLite primary target is bootable"
+        );
+    }
+
+    /// Finding F28 counter-case: a WELL-FORMED Postgres shard config is unchanged —
+    /// the resolver accepts every entry, so no `db_shard_config` Fail fires, and
+    /// backend consistency Passes because postgres supports horizontal sharding.
+    #[test]
+    fn wellformed_postgres_shard_config_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("autumn.toml"),
+            "[database]\nprimary_url = \"postgres://db:5432/app\"\n\n\
+             [[database.shards]]\nname = \"shard-a\"\nprimary_url = \"postgres://db:5432/a\"\n\n\
+             [[database.shards]]\nname = \"shard-b\"\nprimary_url = \"postgres://db:5432/b\"\n",
+        )
+        .unwrap();
+
+        let base = dir.path().to_path_buf();
+        let merged = get_merged_toml_table_runtime_with("prod", "prod", move |f| base.join(f));
+
+        let shards = crate::migrate::try_resolve_shard_database_urls_from_sources(
+            |_| Err(std::env::VarError::NotPresent),
+            Some(&merged),
+        )
+        .expect("well-formed postgres shards must resolve without error");
+        assert_eq!(shards.len(), 2, "both postgres shards must resolve");
+
+        let r =
+            check_database_backend_consistency(None, Some("postgres://db:5432/app"), None, true);
+        assert_eq!(
+            r.status,
+            CheckStatus::Pass,
+            "a postgres primary with shards is a consistent, bootable topology"
         );
     }
 
