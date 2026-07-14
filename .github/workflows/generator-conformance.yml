@@ -175,6 +175,7 @@ jobs:
   #   sharded    -> generated_sharded_scaffold_cargo_checks
   #   searchable -> generated_searchable_scaffold_cargo_checks
   #   passkeys   -> generated_auth_passkeys_cargo_checks
+  #   live       -> generated_live_scaffold_cargo_checks
   app-variant-conformance:
     name: App-variant conformance (${{ matrix.variant.name }}, ${{ matrix.toolchain }})
     runs-on: ubuntu-latest
@@ -191,6 +192,8 @@ jobs:
             test: generated_searchable_scaffold_cargo_checks
           - name: passkeys
             test: generated_auth_passkeys_cargo_checks
+          - name: live
+            test: generated_live_scaffold_cargo_checks
     steps:
       - uses: actions/checkout@v7
 
