@@ -317,9 +317,9 @@ pub fn sqlite_field_kind_unsupported_error(field: &str, rust_type: &str) -> Gene
          `{rust_type}`: diesel implements no FromSql/ToSql for that type on its SQLite \
          backend in a generated app's feature set, so a generated SQLite app using this \
          field would fail to compile. Supported SQLite field kinds are: {kinds}. \
-         First-class SQLite support for Uuid / attachments / Decimal is tracked in \
-         https://github.com/madmax983/autumn/issues/1924 — use a supported field kind, \
-         or target a Postgres database.",
+         First-class SQLite support for Uuid / attachments / Decimal / DateTime<Utc> / \
+         enum fields is tracked in https://github.com/madmax983/autumn/issues/1924 — use a \
+         supported field kind, or target a Postgres database.",
         kinds = dsl::SQLITE_SUPPORTED_KINDS,
     ))
 }
@@ -332,14 +332,15 @@ pub fn sqlite_field_kind_unsupported_error(field: &str, rust_type: &str) -> Gene
 ///
 /// # Errors
 /// Returns [`GenerateError::Config`] for the first field whose kind has no
-/// working diesel `SQLite` conversion (`Uuid`, `Attachment`, `Decimal`).
+/// working diesel `SQLite` conversion (`Uuid`, `Attachment`, `Decimal`,
+/// `DateTime<Utc>`, `Enum`).
 pub fn reject_sqlite_unsupported_field_kinds(fields: &[dsl::Field]) -> Result<(), GenerateError> {
     for f in fields {
         if !f.kind.sqlite_has_diesel_conversion() {
-            return Err(sqlite_field_kind_unsupported_error(
-                &f.name,
-                f.kind.rust_type(),
-            ));
+            // `Field::rust_type` (not `FieldKind::rust_type`) so an `Enum`
+            // field reports its generated enum type name rather than the bare
+            // `String` storage-representation fallback.
+            return Err(sqlite_field_kind_unsupported_error(&f.name, &f.rust_type()));
         }
     }
     Ok(())

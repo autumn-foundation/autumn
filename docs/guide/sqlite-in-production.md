@@ -198,15 +198,16 @@ time on SQLite.
 
 | Field kind | On SQLite | SQLite type | Note |
 | --- | :---: | --- | --- |
-| `String` / `Text` / `Enum` | ✅ | `TEXT` | Enum stored as its text representation. |
+| `String` / `Text` | ✅ | `TEXT` | |
 | `i32` | ✅ | `INTEGER` | |
 | `i64` / references (foreign keys) | ✅ | `INTEGER` | Reference columns are `i64` foreign keys. |
 | `bool` | ✅ | `INTEGER` | Stored as `0` / `1`. |
 | `f32` | ✅ | `REAL` | |
 | `f64` | ✅ | `REAL` | |
 | `Bytea` | ✅ | `BLOB` | |
-| `NaiveDateTime` | ✅ | `Timestamp` (TEXT) | |
-| `DateTime<Utc>` | ✅ | `TimestamptzSqlite` (TEXT) | diesel's `TimestamptzSqlite`; stored as TEXT (SQLite has no native tz type). |
+| `NaiveDateTime` | ✅ | `Timestamp` (TEXT) | Core, ungated `diesel::sql_types::Timestamp`. |
+| `DateTime<Utc>` | ⛔ | — | **Rejected at generate time — #1924.** Its only working SQLite conversion needs diesel's `TimestamptzSqlite`, exported only behind diesel's `sqlite` feature, which the generated app's Postgres-oriented deps do not enable. |
+| `Enum` | ⛔ | — | **Rejected at generate time — #1924.** The generated enum emits only Postgres (`Pg`) `ToSql`/`FromSql<Text>` impls, so SQLite repository loads/inserts do not compile. |
 | `Uuid` | ⛔ | — | **Rejected at generate time — #1924.** No working diesel SQLite `FromSql`/`ToSql` in the app's diesel feature set. |
 | `Decimal` | ⛔ | — | **Rejected at generate time — #1924.** Same reason. |
 | `Attachment` / `Blob` | ⛔ | — | **Rejected at generate time — #1924.** Same reason. |

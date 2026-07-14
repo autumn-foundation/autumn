@@ -2728,7 +2728,6 @@ mod tests {
                 &[
                     "title:String".into(),
                     "views:i64".into(),
-                    "at:DateTime".into(),
                     "naive:NaiveDateTime".into(),
                 ],
                 "20260427000000",
@@ -2747,7 +2746,6 @@ mod tests {
             );
             assert!(up.contains("title TEXT NOT NULL"), "up.sql: {up}");
             assert!(up.contains("views INTEGER NOT NULL"), "up.sql: {up}");
-            assert!(up.contains("at TEXT NOT NULL"), "up.sql: {up}");
             assert!(up.contains("naive TEXT NOT NULL"), "up.sql: {up}");
             assert!(
                 up.contains("created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP"),
@@ -2759,19 +2757,16 @@ mod tests {
             }
 
             let schema = fs::read_to_string(tmp.path().join("src/schema.rs")).unwrap();
-            // `DateTime<Utc>` uses the SQLite-specific `TimestamptzSqlite`
-            // sql-type (the only one diesel implements a `DateTime<Utc>`
-            // conversion for on SQLite); `NaiveDateTime` uses `Timestamp`.
-            assert!(
-                schema.contains("at -> TimestamptzSqlite,"),
-                "schema: {schema}"
-            );
+            // `NaiveDateTime` uses the core, ungated `Timestamp` sql-type.
             assert!(schema.contains("naive -> Timestamp,"), "schema: {schema}");
-            // The bare Postgres-only `Timestamptz` / `Jsonb` diesel types must
-            // not leak (note `TimestamptzSqlite` is the SQLite type and is fine).
+            // Neither the Postgres-only `Timestamptz` / `Jsonb` diesel types nor
+            // the sqlite-feature-gated `TimestamptzSqlite` (which the generated
+            // app's Postgres-oriented deps do not export) may leak: `DateTime`
+            // is now rejected at generate time (#1924), so no timestamptz sql-
+            // type of any spelling should appear in a SQLite schema.
             assert!(
-                !schema.contains("-> Timestamptz,"),
-                "SQLite schema.rs leaked Postgres `Timestamptz`: {schema}"
+                !schema.contains("Timestamptz"),
+                "SQLite schema.rs leaked a timestamptz sql-type: {schema}"
             );
             assert!(
                 !schema.contains("Jsonb"),
@@ -2781,9 +2776,11 @@ mod tests {
     }
 
     /// A `SQLite` app rejects field kinds whose Rust model type has no working
-    /// diesel `SQLite` conversion (`Uuid`, `Attachment`, `Decimal`) at generate
-    /// time, citing #1924 (issue #1614 AC #4) — rather than emit a model that
-    /// fails to compile.
+    /// diesel `SQLite` conversion (`Uuid`, `Attachment`, `Decimal`,
+    /// `DateTime<Utc>`, and `Enum`) at generate time, citing #1924 (issue #1614
+    /// AC #4) — rather than emit a model that fails to compile. `DateTime<Utc>`
+    /// would need the feature-gated `TimestamptzSqlite`; `Enum` renders only
+    /// Postgres (`Pg`) diesel conversions.
     #[test]
     fn sqlite_app_rejects_field_kinds_without_diesel_conversion_citing_1924() {
         with_no_db_env(|| {
@@ -2792,6 +2789,10 @@ mod tests {
                 ("token:Uuid", "uuid::Uuid"),
                 ("cover:Attachment", "autumn_web::storage::Blob"),
                 ("price:decimal{10,2}", "rust_decimal::Decimal"),
+                ("at:DateTime", "chrono::DateTime<chrono::Utc>"),
+                // `Enum` reports its generated enum type name (`Status`), not
+                // the `String` storage-representation fallback.
+                ("status:enum{draft,published}", "Status"),
             ] {
                 let err = plan_model(
                     tmp.path(),
@@ -2828,10 +2829,12 @@ mod tests {
                     "token:Uuid".into(),
                     "cover:Attachment".into(),
                     "price:decimal{10,2}".into(),
+                    "at:DateTime".into(),
+                    "status:enum{draft,published}".into(),
                 ],
                 "20260427000000",
             )
-            .expect("Uuid/Attachment/Decimal fields must still generate on Postgres");
+            .expect("Uuid/Attachment/Decimal/DateTime/enum fields must still generate on Postgres");
         });
     }
 
