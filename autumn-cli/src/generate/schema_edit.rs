@@ -252,6 +252,11 @@ fn existing_schema_columns(schema: &str, table: &str) -> Vec<String> {
 /// honouring the caller-supplied `id_type`.
 /// For `Uuid`, prepends a comment documenting the index-locality trade-off and
 /// the `UUIDv7` upgrade path.
+///
+/// Retained as a Postgres-default convenience wrapper for the test suite; the
+/// backend-aware [`create_table_sql_with_metadata_and_id_for`] is what
+/// production calls.
+#[cfg(test)]
 #[must_use]
 pub fn create_table_sql_with_metadata_and_id(
     table: &str,
@@ -919,21 +924,26 @@ pub fn remove_columns_up_sql(table: &str, fields: &[Field]) -> String {
 /// rolling-deploy risk visible at a glance and machine-parseable by
 /// `autumn migrate check`.
 ///
-/// On `SQLite`, the generator auto-creates an index for a `references` field
-/// (`idx_<table>_<col>`, matching [`add_columns_up_sql_for`] /
-/// [`create_table_sql_with_metadata_and_id`]) and for a `unique` field
-/// ([`unique_index_name`]), and `SQLite` refuses to `DROP COLUMN` while an index
-/// still references it (`cannot drop column: used in an index`). So on the
-/// `SQLite` path this emits `DROP INDEX <name>;` for each removed field the
-/// generator would have indexed, **before** its `DROP COLUMN` — the same fix as
-/// the rollback path ([`add_columns_down_sql_for`]), here on the forward
-/// `RemoveColumns` path. Postgres cascades index drops with the column, so its
-/// output stays byte-for-byte identical (no explicit `DROP INDEX`).
+/// On `SQLite`, the generator auto-creates an index named `idx_<table>_<col>`
+/// for both a plain scaffold `--index <col>` field and a `references` field
+/// (matching [`add_columns_up_sql_for`] /
+/// [`create_table_sql_with_metadata_and_id`]), and a uniquely-named index for a
+/// `unique` field ([`unique_index_name`]), and `SQLite` refuses to `DROP COLUMN`
+/// while an index still references it (`cannot drop column: used in an index`).
+/// The DSL/schema can't tell after the fact whether a removed column carried a
+/// plain `--index`, so on the `SQLite` path this emits
+/// `DROP INDEX IF EXISTS idx_<table>_<col>;` **unconditionally** before each
+/// `DROP COLUMN` (`IF EXISTS` makes it a safe no-op for a column that was never
+/// indexed, and the name is deterministic for both plain `--index` and
+/// `references` fields), plus `DROP INDEX IF EXISTS <unique_index_name>;` for a
+/// `unique` field — the same shape as the rollback path
+/// ([`add_columns_down_sql_for`]), here on the forward `RemoveColumns` path.
+/// Postgres cascades index drops with the column, so its output stays
+/// byte-for-byte identical (no explicit `DROP INDEX`).
 ///
-/// Scope boundary: this only drops indexes the generator itself derives from
-/// the field spec (a `references` field's auto-index, a `unique` field's unique
-/// index). A column indexed for reasons the generator cannot see (a hand-added
-/// index, a composite index) remains the documented limitation of issue #1906.
+/// Scope boundary: a column indexed for reasons the generator cannot see (a
+/// composite index spanning several columns) remains the documented limitation
+/// of issue #1906.
 ///
 /// `existing_schema` mirrors [`add_columns_down_sql_for`] so a `unique` field's
 /// index name matches the one the up path generated.
@@ -954,15 +964,20 @@ pub fn remove_columns_up_sql_for(
              use expand/contract"
         );
         // SQLite: drop the generator's index for this field first (see doc
-        // comment). The generator indexes exactly a `unique` field or a
-        // non-unique `references` field, using the same names the ADD path
-        // derives, so the DROP INDEX matches the existing CREATE INDEX.
+        // comment). SQLite refuses `DROP COLUMN` while any index references the
+        // column. The generator names a plain `--index` field's index and a
+        // `references` field's auto-index identically (`idx_<table>_<col>`), and
+        // the DSL/schema can't tell after the fact whether a column carried a
+        // plain index — so emit `DROP INDEX IF EXISTS idx_<table>_<col>;`
+        // unconditionally (a safe no-op via `IF EXISTS` for a non-indexed
+        // column), plus the `unique` field's uniquely-named index. Names are
+        // derived with the same helpers the ADD/CREATE paths use so the DROP
+        // matches the existing CREATE INDEX.
         if backend == DatabaseBackend::Sqlite {
+            let _ = writeln!(out, "DROP INDEX IF EXISTS idx_{table}_{};", f.name);
             if f.unique {
                 let name = unique_index_name(table, &f.name, &collision_fields);
-                let _ = writeln!(out, "DROP INDEX {name};");
-            } else if f.kind.is_reference() {
-                let _ = writeln!(out, "DROP INDEX idx_{table}_{};", f.name);
+                let _ = writeln!(out, "DROP INDEX IF EXISTS {name};");
             }
         }
         let _ = writeln!(out, "ALTER TABLE {table} DROP COLUMN {};", f.name);
@@ -5448,7 +5463,7 @@ mod tests {
         let f = fields(&["author:references?"]);
         let up = remove_columns_up_sql_for(DatabaseBackend::Sqlite, "posts", &f, "");
         let drop_idx = up
-            .find("DROP INDEX idx_posts_author_id;")
+            .find("DROP INDEX IF EXISTS idx_posts_author_id;")
             .expect("drop index");
         let drop_col = up
             .find("ALTER TABLE posts DROP COLUMN author_id;")
@@ -5467,7 +5482,7 @@ mod tests {
         let f = fields(&["email:Option<String>:unique"]);
         let up = remove_columns_up_sql_for(DatabaseBackend::Sqlite, "users", &f, "");
         let drop_idx = up
-            .find("DROP INDEX idx_users_email_unique;")
+            .find("DROP INDEX IF EXISTS idx_users_email_unique;")
             .expect("drop index");
         let drop_col = up
             .find("ALTER TABLE users DROP COLUMN email;")
@@ -5478,17 +5493,27 @@ mod tests {
         );
     }
 
-    /// A plain, non-indexed field gets only a `DROP COLUMN` on `SQLite` — no
-    /// spurious `DROP INDEX` for a column the generator never indexed.
+    /// A column removed via a scaffold `--index <col>` field also has a
+    /// generator-created `idx_<table>_<col>` index, and the DSL/schema can't tell
+    /// after the fact whether the column carried a plain index. So on `SQLite`
+    /// every removed column emits `DROP INDEX IF EXISTS idx_<table>_<col>;`
+    /// before its `DROP COLUMN` (issue #1906 finding F10). `IF EXISTS` makes the
+    /// statement a safe no-op for a column that was never indexed.
     #[test]
-    fn sqlite_remove_columns_up_plain_field_has_no_drop_index() {
-        let f = fields(&["body:String"]);
+    fn sqlite_remove_columns_up_drops_plain_index_before_column() {
+        // `RemoveTitleFromPosts`: `title` was created via scaffold `--index`.
+        let f = fields(&["title:String"]);
         let up = remove_columns_up_sql_for(DatabaseBackend::Sqlite, "posts", &f, "");
+        let drop_idx = up
+            .find("DROP INDEX IF EXISTS idx_posts_title;")
+            .expect("drop index");
+        let drop_col = up
+            .find("ALTER TABLE posts DROP COLUMN title;")
+            .expect("drop column");
         assert!(
-            !up.contains("DROP INDEX"),
-            "non-indexed column must not emit DROP INDEX:\n{up}"
+            drop_idx < drop_col,
+            "DROP INDEX IF EXISTS must precede DROP COLUMN:\n{up}"
         );
-        assert!(up.contains("ALTER TABLE posts DROP COLUMN body;"));
     }
 
     /// Postgres cascades index drops with the column, so its forward up.sql

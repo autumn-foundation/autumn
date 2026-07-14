@@ -168,6 +168,30 @@ pub fn sqlite_add_not_null_without_default_error(table: &str, column: &str) -> G
     ))
 }
 
+/// The generate-time rejection for a code generator that emits Postgres-only
+/// migration DDL on a `SQLite`-backed app (`SQLite` foundation, issue #1614
+/// AC #4).
+///
+/// `generate auth` and `generate mailer` scaffold migrations with
+/// `BIGSERIAL PRIMARY KEY` and `DEFAULT NOW()` — neither of which `SQLite`
+/// accepts — so a generated `SQLite` app's migrations would fail to apply.
+/// Making these generators backend-aware (SQLite-valid `INTEGER PRIMARY KEY`
+/// columns, `CURRENT_TIMESTAMP` defaults, and backend-aware auth/mailer runtime
+/// wiring) is a larger slice tracked in issue #1927. Rather than emit migrations
+/// that break on `SQLite`, generation fails here with an actionable message
+/// (AC #4).
+#[must_use]
+pub fn sqlite_generator_unsupported_error(name: &str) -> GenerateError {
+    GenerateError::Config(format!(
+        "`generate {name}` is not yet supported on SQLite apps: it scaffolds migrations that \
+         emit Postgres-only DDL (`BIGSERIAL PRIMARY KEY`, `DEFAULT NOW()`), which SQLite \
+         rejects, so the generated migrations would fail to apply. Backend-aware auth/mailer \
+         generators for SQLite are tracked in \
+         https://github.com/madmax983/autumn/issues/1927 — target a Postgres database to use \
+         `generate {name}` for now."
+    ))
+}
+
 /// Common flags shared by every `generate` subcommand.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Flags {

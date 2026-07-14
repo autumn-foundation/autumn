@@ -465,6 +465,13 @@ fn plan_auth_with_providers_ex_impl(
     for_revert: bool,
 ) -> Result<Plan, GenerateError> {
     ensure_project_root(project_root)?;
+    // SQLite foundation (issue #1614 AC #4): this generator scaffolds
+    // users/sessions/recovery-code migrations that emit Postgres-only DDL
+    // (`BIGSERIAL PRIMARY KEY`, `DEFAULT NOW()`), so reject before writing any
+    // files on a SQLite app (follow-up: issue #1927).
+    if super::detect_backend(project_root) == autumn_web::config::DatabaseBackend::Sqlite {
+        return Err(super::sqlite_generator_unsupported_error("auth"));
+    }
     super::model::validate_resource_name(name)?;
 
     let pascal_name = pascal(name);
@@ -10973,6 +10980,42 @@ mod tests {
     // deleted, and every shared-file edit recorded via `plan.push_revert(...)`
     // is undone. These tests assert the round trip is byte-identical for the
     // base scaffold plus each optional feature flag.
+
+    /// `SQLite` foundation (issue #1614 AC #4, finding F11): `generate auth`
+    /// scaffolds users/sessions/recovery-code migrations that emit Postgres-only
+    /// DDL, so it must be rejected at generate time on a `SQLite` app, citing the
+    /// backend-aware follow-up (issue #1927) — before any files are written.
+    #[test]
+    fn plan_auth_rejected_on_sqlite_app_citing_1927() {
+        let tmp = project_with_main();
+        fs::write(
+            tmp.path().join("autumn.toml"),
+            "[database]\nprimary_url = \"sqlite://app.db\"\n",
+        )
+        .unwrap();
+        let err = plan_auth(tmp.path(), "User", "20260508000000").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("SQLite"), "message must name SQLite: {msg}");
+        assert!(
+            msg.contains("issues/1927"),
+            "message must cite issue #1927: {msg}"
+        );
+        // No model files written on rejection.
+        assert!(!tmp.path().join("src/models/user.rs").exists());
+    }
+
+    /// A Postgres app (the default) is not rejected — `generate auth` still
+    /// plans its files.
+    #[test]
+    fn plan_auth_not_rejected_on_postgres_app() {
+        let tmp = project_with_main();
+        fs::write(
+            tmp.path().join("autumn.toml"),
+            "[database]\nprimary_url = \"postgres://localhost/app\"\n",
+        )
+        .unwrap();
+        assert!(plan_auth(tmp.path(), "User", "20260508000000").is_ok());
+    }
 
     #[test]
     fn generate_then_destroy_base_auth_round_trips_to_original_project_state() {

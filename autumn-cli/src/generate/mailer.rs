@@ -58,6 +58,12 @@ pub fn plan_mailer(
     no_layout: bool,
 ) -> Result<Plan, GenerateError> {
     ensure_project_root(project_root)?;
+    // SQLite foundation (issue #1614 AC #4): this generator scaffolds a
+    // Postgres-only unsubscribe migration (`BIGSERIAL`/`NOW()`), so reject
+    // before writing any files on a SQLite app (follow-up: issue #1927).
+    if super::detect_backend(project_root) == autumn_web::config::DatabaseBackend::Sqlite {
+        return Err(super::sqlite_generator_unsupported_error("mailer"));
+    }
     validate_resource_name(name)?;
     if let Some(scope) = list_unsubscribe {
         validate_list_unsubscribe_scope(scope)?;
@@ -545,6 +551,42 @@ async fn main() {
         .await;
 }
 "#
+    }
+
+    /// `SQLite` foundation (issue #1614 AC #4, finding F12): `generate mailer`
+    /// scaffolds a Postgres-only unsubscribe migration, so it must be rejected
+    /// at generate time on a `SQLite` app, citing the backend-aware follow-up
+    /// (issue #1927) — before any files are written.
+    #[test]
+    fn plan_mailer_rejected_on_sqlite_app_citing_1927() {
+        let tmp = project_with_main(default_main());
+        fs::write(
+            tmp.path().join("autumn.toml"),
+            "[database]\nprimary_url = \"sqlite://app.db\"\n",
+        )
+        .unwrap();
+        let err = plan_mailer(tmp.path(), "Welcome", None, false).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("SQLite"), "message must name SQLite: {msg}");
+        assert!(
+            msg.contains("issues/1927"),
+            "message must cite issue #1927: {msg}"
+        );
+        // No files written on rejection.
+        assert!(!tmp.path().join("src/mailers/welcome.rs").exists());
+    }
+
+    /// A Postgres app (the default) is not rejected — `generate mailer` still
+    /// plans its files.
+    #[test]
+    fn plan_mailer_not_rejected_on_postgres_app() {
+        let tmp = project_with_main(default_main());
+        fs::write(
+            tmp.path().join("autumn.toml"),
+            "[database]\nprimary_url = \"postgres://localhost/app\"\n",
+        )
+        .unwrap();
+        assert!(plan_mailer(tmp.path(), "Welcome", None, false).is_ok());
     }
 
     #[test]
