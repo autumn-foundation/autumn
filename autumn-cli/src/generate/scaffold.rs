@@ -1839,6 +1839,15 @@ fn render_routes_file(
     let search_enabled = !searchable.is_empty() && !live && !live_validation;
     let validated_fields: Vec<&str> = validations.keys().map(String::as_str).collect();
     let unique_fields: Vec<&Field> = fields.iter().filter(|f| f.unique).collect();
+    // Issue #1326: fields carrying a `:states(…)` state machine. Only these
+    // scaffolds emit a `show_view` helper, per-field `transition_controls`, and a
+    // `POST /{plural}/{{id}}/transitions/{field}` handler. A scaffold with none
+    // (the overwhelming common case) keeps the pre-#1326 output byte-identical.
+    let sm_fields: Vec<&Field> = fields
+        .iter()
+        .filter(|f| f.state_machine.is_some())
+        .collect();
+    let has_state_machine = !sm_fields.is_empty();
     let update_columns = render_update_columns(plural, fields);
     let nullable_field_match = render_nullable_field_match(fields);
     let has_attachments = has_attachment_fields(fields);
@@ -3272,6 +3281,13 @@ pub async fn index(
                 names.push(format!("validate_{field_name}"));
             }
         }
+        // Issue #1326: one transition endpoint per state-machine field, linked
+        // from the show page's `transition_controls` form actions
+        // (`paths::transition_{field}(id)`).
+        for f in &sm_fields {
+            let field = &f.name;
+            names.push(format!("transition_{field}"));
+        }
         let mut out = String::from("\n\nautumn_web::paths![\n");
         for name in &names {
             let _ = writeln!(out, "    {name},");
@@ -3527,6 +3543,157 @@ fn layout(title: &str, flash: Markup, content: Markup) -> Markup {{
 "#
             )
         };
+        // Issue #1326: the `show` detail section. Without a state machine this is
+        // exactly the pre-#1326 inline `show` handler (byte-identical output).
+        // With one or more `:states(…)` fields it becomes a shared `show_view`
+        // helper (rendered by `show` AND each transition handler's 422 re-render),
+        // a `show` handler threading CSRF for the transition forms, and one
+        // `POST /{plural}/{{id}}/transitions/{field}` handler per state-machine
+        // field.
+        let show_section = if has_state_machine {
+            // `show_view` only touches the DB when it must resolve reference
+            // display labels (issue #1146); otherwise the connection is unused, so
+            // name it `_db` (and drop `mut`) to keep the generated crate
+            // warning-free.
+            let show_view_db_param = if show_label_loads.trim().is_empty() {
+                format!("_db: {db_ty}")
+            } else {
+                format!("mut db: {db_ty}")
+            };
+            let mut show_transition_controls = String::new();
+            for f in &sm_fields {
+                let field = &f.name;
+                let field_upper = f.name.to_uppercase();
+                let _ = writeln!(
+                    show_transition_controls,
+                    "        (autumn_web::widgets::transition_controls(&paths::transition_{field}(row.id), \"{field}\", &row.{field}, {pascal_name}::__AUTUMN_SM_{field_upper}_TRANSITIONS, |to| row.can_transition_{field}_to(to), csrf, csrf_field))"
+                );
+            }
+            let show_view_fn = format!(
+                r#"/// Render the {snake_name} detail page — shared by the `show` handler and
+/// each state-machine transition handler's 422 re-render, so the detail-page
+/// markup has a single source of truth (issue #1326).
+async fn show_view(
+    {show_view_db_param},
+    row: &{pascal_name},
+    flash: Markup,
+    csrf: Option<&CsrfToken>,
+    csrf_field: Option<&CsrfFormField>,
+) -> AutumnResult<Markup> {{
+{show_label_loads}    let props: Vec<(&str, maud::Markup)> = vec![
+{show_rows}    ];
+    Ok({layout_fn}(&format!("{pascal_name} #{{}}", row.id), {cp_show}flash, html! {{
+        h1 {{ "{pascal_name} #" (row.id) }}
+        (autumn_web::widgets::property_list(&props))
+{show_transition_controls}        (autumn_web::a11y::Link::new(paths::index(), "Back to list"))
+        " "
+        (autumn_web::a11y::Link::new(paths::edit(row.id), "Edit"))
+    }}))
+}}"#
+            );
+            let show_handler = format!(
+                r#"/// `GET /{plural}/{{id}}` — show one {snake_name}.
+#[get("/{plural}/{{id}}")]
+pub async fn show(
+    id: Path<{id_rust}>,
+    mut db: {db_ty},
+    flash: Flash,
+    csrf: Option<CsrfToken>,
+    csrf_field: Option<CsrfFormField>,
+) -> AutumnResult<Markup> {{
+    let row: {pascal_name} = {plural}::table
+        .find(*id)
+        .select({pascal_name}::as_select())
+        .first(&mut *db)
+        .await
+        .map_err(AutumnError::not_found)?;
+    show_view(db, &row, {flash_arg}, csrf.as_ref(), csrf_field.as_ref()).await
+}}"#
+            );
+            let mut transition_handlers = String::new();
+            for f in &sm_fields {
+                let field = &f.name;
+                let handler = format!(
+                    r#"/// `POST /{plural}/{{id}}/transitions/{field}` — apply a `{field}` state
+/// transition (issue #1326). A legal edge persists the new `{field}` value and
+/// redirects to the detail page; an illegal edge (or a rejected guard)
+/// re-renders that page at 422 with the record left unchanged.
+#[secured]
+#[post("/{plural}/{{id}}/transitions/{field}")]
+pub async fn transition_{field}(
+    id: Path<{id_rust}>,
+    mut db: {db_ty},
+    flash: Flash,
+    csrf: Option<CsrfToken>,
+    csrf_field: Option<CsrfFormField>,
+    body: Bytes,
+) -> AutumnResult<autumn_web::reexports::axum::response::Response> {{
+    use autumn_web::reexports::axum::response::IntoResponse as _;
+    let row: {pascal_name} = {plural}::table
+        .find(*id)
+        .select({pascal_name}::as_select())
+        .first(&mut *db)
+        .await
+        .map_err(AutumnError::not_found)?;
+    let submitted: std::collections::HashMap<String, String> =
+        url::form_urlencoded::parse(body.as_ref()).into_owned().collect();
+    let target = submitted.get("{field}").cloned().unwrap_or_default();
+    match row.transition_{field}_to(&target) {{
+        Ok(new_state) => {{
+            diesel::update({plural}::table.find(*id))
+                .set({plural}::{field}.eq(new_state))
+                .execute(&mut *db)
+                .await?;
+            flash.success("{pascal_name} {field} updated").await;
+            Ok(autumn_web::Redirect::to(&paths::show(*id)).into_response())
+        }}
+        Err(err) => {{
+            flash.error(err.to_string()).await;
+            let view = show_view(
+                db,
+                &row,
+                flash_messages(&flash.consume().await),
+                csrf.as_ref(),
+                csrf_field.as_ref(),
+            )
+            .await?;
+            Ok((autumn_web::reexports::http::StatusCode::UNPROCESSABLE_ENTITY, view).into_response())
+        }}
+    }}
+}}"#
+                );
+                if !transition_handlers.is_empty() {
+                    transition_handlers.push_str("\n\n");
+                }
+                transition_handlers.push_str(&handler);
+            }
+            format!("\n\n{show_view_fn}\n\n{show_handler}\n\n{transition_handlers}\n")
+        } else {
+            format!(
+                r#"
+
+/// `GET /{plural}/{{id}}` — show one {snake_name}.
+#[get("/{plural}/{{id}}")]
+pub async fn show(id: Path<{id_rust}>, mut db: {db_ty}, flash: Flash) -> AutumnResult<Markup> {{
+    let row: {pascal_name} = {plural}::table
+        .find(*id)
+        .select({pascal_name}::as_select())
+        .first(&mut *db)
+        .await
+        .map_err(AutumnError::not_found)?;
+{show_label_loads}    let props: Vec<(&str, maud::Markup)> = vec![
+{show_rows}    ];
+    Ok({layout_fn}(&format!("{pascal_name} #{{}}", row.id), {cp_show}{flash_arg}, html! {{
+        h1 {{ "{pascal_name} #" (row.id) }}
+        (autumn_web::widgets::property_list(&props))
+        (autumn_web::a11y::Link::new(paths::index(), "Back to list"))
+        " "
+        (autumn_web::a11y::Link::new(paths::edit(row.id), "Edit"))
+    }}))
+}}
+"#
+            )
+        };
         format!(
             r#"
 
@@ -3553,28 +3720,7 @@ fn submit_token_input(submit_token: Option<&SubmitToken>, field: Option<&SubmitF
     }}
 }}
 {private_layout}
-{index_handler}
-
-/// `GET /{plural}/{{id}}` — show one {snake_name}.
-#[get("/{plural}/{{id}}")]
-pub async fn show(id: Path<{id_rust}>, mut db: {db_ty}, flash: Flash) -> AutumnResult<Markup> {{
-    let row: {pascal_name} = {plural}::table
-        .find(*id)
-        .select({pascal_name}::as_select())
-        .first(&mut *db)
-        .await
-        .map_err(AutumnError::not_found)?;
-{show_label_loads}    let props: Vec<(&str, maud::Markup)> = vec![
-{show_rows}    ];
-    Ok({layout_fn}(&format!("{pascal_name} #{{}}", row.id), {cp_show}{flash_arg}, html! {{
-        h1 {{ "{pascal_name} #" (row.id) }}
-        (autumn_web::widgets::property_list(&props))
-        (autumn_web::a11y::Link::new(paths::index(), "Back to list"))
-        " "
-        (autumn_web::a11y::Link::new(paths::edit(row.id), "Edit"))
-    }}))
-}}
-
+{index_handler}{show_section}
 /// `GET /{plural}/new` — render the new-{snake_name} form.
 #[secured]
 #[get("/{plural}/new", name = "new")]
@@ -10757,6 +10903,105 @@ async fn main() {
         assert!(
             routes.contains("\"Views\""),
             "show must include defaulted field 'views': {routes}"
+        );
+    }
+
+    // ── state-machine transitions scaffold conformance (issue #1326) ──────
+
+    #[test]
+    fn scaffold_without_state_machine_emits_no_transition_wiring() {
+        // AC5: a model WITHOUT any `:states(…)` field keeps the pre-#1326 `show`
+        // handler and route set byte-for-byte — no `show_view` helper, no
+        // `/transitions/` route, and the original three-arg `show` signature.
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "body:Text".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+        assert!(
+            !routes.contains("/transitions/"),
+            "no-state-machine scaffold must not emit any transition route: {routes}"
+        );
+        assert!(
+            !routes.contains("fn show_view"),
+            "no-state-machine scaffold must not extract a show_view helper: {routes}"
+        );
+        assert!(
+            !routes.contains("transition_controls"),
+            "no-state-machine scaffold must not render transition controls: {routes}"
+        );
+        // The original inline `show` signature is unchanged (no CSRF params).
+        assert!(
+            routes.contains(
+                "pub async fn show(id: Path<i64>, mut db: Db, flash: Flash) -> AutumnResult<Markup> {"
+            ),
+            "no-state-machine `show` signature must be unchanged: {routes}"
+        );
+    }
+
+    #[test]
+    fn scaffold_with_state_machine_emits_transition_route_and_controls() {
+        // A model WITH a `:states(…)` field generates the transition route, the
+        // `transition_{field}_to` call, both the 303 success and 422 error
+        // branches, a shared `show_view`, and a `transition_controls(` call.
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Order",
+            &[
+                "status:String:states(draft -> published: can_publish, published -> archived)"
+                    .into(),
+            ],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let routes = fs::read_to_string(tmp.path().join("src/routes/orders.rs")).unwrap();
+        // The transition route: `POST /orders/{id}/transitions/status`.
+        assert!(
+            routes.contains("#[post(\"/orders/{id}/transitions/status\")]"),
+            "must emit the transition POST route: {routes}"
+        );
+        assert!(
+            routes.contains("pub async fn transition_status("),
+            "must emit the transition handler: {routes}"
+        );
+        // The handler drives the macro-emitted state-machine method.
+        assert!(
+            routes.contains("row.transition_status_to(&target)"),
+            "transition handler must call transition_status_to: {routes}"
+        );
+        // Success branch: 303 redirect to the show page.
+        assert!(
+            routes.contains("Ok(autumn_web::Redirect::to(&paths::show(*id)).into_response())"),
+            "transition handler must 303-redirect on a legal edge: {routes}"
+        );
+        // Error branch: 422 re-render of the detail page, record unchanged.
+        assert!(
+            routes.contains("autumn_web::reexports::http::StatusCode::UNPROCESSABLE_ENTITY"),
+            "transition handler must 422 on an illegal edge: {routes}"
+        );
+        // The detail page markup is shared through `show_view`.
+        assert!(
+            routes.contains("async fn show_view("),
+            "must extract a shared show_view helper: {routes}"
+        );
+        // The show view renders transition controls fed by the macro const.
+        assert!(
+            routes.contains("autumn_web::widgets::transition_controls(&paths::transition_status(row.id), \"status\", &row.status, Order::__AUTUMN_SM_STATUS_TRANSITIONS,"),
+            "show view must render transition_controls for the state-machine field: {routes}"
+        );
+        // The transition endpoint is registered in the paths! module.
+        assert!(
+            routes.contains("transition_status,"),
+            "paths! must register the transition route name: {routes}"
         );
     }
 
