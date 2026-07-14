@@ -5924,17 +5924,25 @@ pub fn run(opts: DoctorOptions) {
         // invisible to the raw table, so a raw-table lookup would fail
         // `deploy_database_url` under `--strict` even though `AutumnConfig::load()`
         // and `autumn deploy check` see it. Env-var precedence is preserved
-        // (`resolve_database_topology` reads env first, then the merged table).
-        let deploy_db_topology = resolve_database_topology(Some(&merged_deploy_toml));
+        // (`resolve_database_topology_from_sources` reads the overlay first, then
+        // the merged table). Resolve through `deploy_denv` — the profile-aware
+        // `.env` overlay — so a URL set only in `.env`/`.env.<profile>` is seen
+        // by doctor exactly as `AutumnConfig::load()`/`deploy check` see it,
+        // instead of the bare process env.
+        let deploy_db_topology = resolve_database_topology_from_sources(
+            |key| deploy_denv.var(key).ok().filter(|value| !value.is_empty()),
+            Some(&merged_deploy_toml),
+        );
         // Shard-only apps declare no control `primary_url`/`url` but still have a
         // usable database: `autumn migrate` targets each `[[database.shards]]`
-        // entry (see `migrate::build_targets`). Resolve the shard URLs from the
-        // SAME merged active-profile table, reusing the exact migrate resolver so
-        // preflight and the real migration step agree, and fall back to the first
-        // shard's primary URL when no control primary resolves. Only writable
-        // targets count — `database.replica_url` is excluded because `autumn
-        // migrate` cannot migrate against a replica. The grader never prints the
-        // value.
+        // entry (see `migrate::build_targets`). Resolve the shard URLs through the
+        // SAME `deploy_denv` overlay + merged active-profile table, reusing the
+        // exact migrate resolver so preflight and the real migration step agree,
+        // and fall back to the first shard's primary URL when no control primary
+        // resolves. Only writable targets count — `database.replica_url` is
+        // excluded because `autumn migrate` cannot migrate against a replica. The
+        // grader never prints the value.
+        //
         // Use the FALLIBLE shard resolver here: the exiting
         // `resolve_shard_database_urls_from_sources` calls `std::process::exit(1)`
         // on a malformed `[[database.shards]]` entry, which — running while
@@ -5943,19 +5951,31 @@ pub fn run(opts: DoctorOptions) {
         // Instead map an `Err` to a failing `deploy_database_url` check below so
         // doctor still produces valid output. `autumn migrate` keeps its
         // print-and-exit behavior via the thin wrapper.
-        let deploy_db_url_result = crate::migrate::try_resolve_shard_database_urls_from_sources(
-            |key| std::env::var(key),
+        //
+        // Lift the resolver into its own binding so it feeds BOTH the
+        // db-configured flag (shard presence) and the writable URL below.
+        let deploy_shards_result = crate::migrate::try_resolve_shard_database_urls_from_sources(
+            |key| deploy_denv.var(key),
             Some(&merged_deploy_toml),
-        )
-        .map(|deploy_shards| {
+        );
+        // Derive db-configured from resolved URL/shard presence, mirroring
+        // `deploy.rs` `collect_preflight` (`url || primary_url || replica_url ||
+        // has_shards()`) — NOT mere `[database]` table presence, which flips true
+        // on a tuning-only table (e.g. `pool_size`) and would falsely fail
+        // `deploy_database_url` for a config `deploy check` accepts. `primary_url`
+        // here folds `url`+`primary_url`. Computed BEFORE the writable-URL `.map()`
+        // below moves `primary_url` (this only borrows it via `.is_some()`).
+        let deploy_db_configured = deploy_db_topology.primary_url.is_some()
+            || deploy_db_topology.replica_url.is_some()
+            || deploy_shards_result
+                .as_ref()
+                .map(|shards| !shards.is_empty())
+                .unwrap_or(false);
+        let deploy_db_url_result = deploy_shards_result.map(|deploy_shards| {
             deploy_db_topology
                 .primary_url
                 .or_else(|| deploy_shards.into_iter().next().map(|(_, url)| url))
         });
-        // A `[database]` present in the merged runtime table marks the app as
-        // database-backed even without a migrations directory, so `grade_database_url`
-        // requires a URL. A DB-free app (no `[database]`, no migrations dir) passes.
-        let deploy_db_configured = merged_deploy_toml.get("database").is_some();
         // A DB-backed runtime feature (jobs.backend/scheduler.backend = postgres)
         // requires a configured pool at startup, so a writable DB URL is required
         // even with no migrations dir and no `[database]` section. Resolved from

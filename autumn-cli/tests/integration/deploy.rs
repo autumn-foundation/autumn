@@ -214,6 +214,79 @@ fn doctor_flags_dotenv_db_backed_runtime_without_db() {
 }
 
 #[test]
+fn doctor_reads_deploy_db_url_from_dotenv() {
+    // Regression: doctor must read the .env-only deploy DB URL like `deploy check`
+    // (Codex P2 on 5a12eb3); bare OsEnv reported it missing. With a `[deploy]`
+    // host (so the deploy preflight runs), a Postgres-backed jobs runtime AND the
+    // writable database URL supplied ONLY via `.env` — never the process env —
+    // the `deploy_database_url` grader must PASS, resolving the URL through the
+    // profile-aware dotenv overlay just as `AutumnConfig::load()`/`deploy check`
+    // do. A bare `OsEnv` would see no URL and fail the check.
+    let dir = project("host = \"deploy.example.test\"\n");
+    // Postgres jobs backend makes the app db-backed; the URL is the writable
+    // target. BOTH arrive only through `.env`, never the process env.
+    fs::write(
+        dir.path().join(".env"),
+        "AUTUMN_JOBS__BACKEND=postgres\n\
+         AUTUMN_DATABASE__URL=postgres://u:p@db.example.test/app\n",
+    )
+    .expect("write .env");
+
+    // `AUTUMN_DOTENV=1` force-loads `.env`; the DB URL itself is NOT in the
+    // process env, so a pass proves the dotenv overlay path.
+    let (stdout, stderr, _code) = run_autumn(dir.path(), &["doctor"], &[("AUTUMN_DOTENV", "1")]);
+    let combined = format!("{stdout}{stderr}");
+    // Passing check renders as `✅ deploy_database_url — database URL is
+    // configured` (see `format_check_line` / `grade_database_url`).
+    assert!(
+        combined.contains("deploy_database_url — database URL is configured"),
+        "doctor must resolve the .env-only deploy DB URL and pass \
+         deploy_database_url (bare OsEnv would report it missing)\nstdout:\n\
+         {stdout}\nstderr:\n{stderr}"
+    );
+}
+
+#[test]
+fn doctor_ignores_tuning_only_deploy_database_table() {
+    // Regression: a tuning-only `[database]` (no url/shards/migrations) must pass
+    // deploy_database_url, matching `deploy check` (Codex P2 on 5a12eb3); mere
+    // `[database]` table presence wrongly failed. doctor now derives
+    // db-configured from resolved URL/shard presence (like `deploy.rs`
+    // `collect_preflight`), so a `[database]` carrying only tuning keys
+    // (`pool_size`) with no writable URL and no migrations dir is treated as
+    // DB-free and PASSES.
+    let dir = tempfile::tempdir().expect("create temp project dir");
+    fs::write(
+        dir.path().join("Cargo.toml"),
+        "[package]\nname = \"demoapp\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .expect("write Cargo.toml");
+    // `[deploy]` host so the preflight runs; `[database]` with ONLY a tuning key,
+    // no url/primary_url/replica_url/shards, and no migrations dir.
+    fs::write(
+        dir.path().join("autumn.toml"),
+        "[deploy]\nhost = \"deploy.example.test\"\n\n[database]\npool_size = 10\n",
+    )
+    .expect("write autumn.toml");
+
+    let (stdout, stderr, _code) = run_autumn(dir.path(), &["doctor"], &[]);
+    let combined = format!("{stdout}{stderr}");
+    // DB-free pass renders as `✅ deploy_database_url — no database configured
+    // (nothing to connect to)` (see `format_check_line` / `grade_database_url`).
+    assert!(
+        combined.contains("deploy_database_url — no database configured (nothing to connect to)"),
+        "a tuning-only [database] must pass deploy_database_url as DB-free, \
+         matching deploy check\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    // And it must NOT surface the missing-URL failure.
+    assert!(
+        !combined.contains("deploy_database_url — no writable database URL"),
+        "a tuning-only [database] must not trigger the missing-URL failure\n\
+         stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+}
+
+#[test]
 fn deploy_help_lists_subcommands() {
     let dir = tempfile::tempdir().expect("temp dir");
     let (stdout, stderr, code) = run_autumn(dir.path(), &["deploy", "--help"], &[]);
