@@ -7622,6 +7622,11 @@ mod tests {
         let env = FakeEnv(
             [
                 ("AUTUMN_SERVER__STRICT_CONFIG".to_owned(), "true".to_owned()),
+                // Pin a non-dev profile: the `dev` smart-defaults inject a
+                // feature-gated `[storage]` table which, with the `storage`
+                // feature off, is flagged as a hard top-level unknown key and
+                // would derail this test regardless of the `[log]` typo.
+                ("AUTUMN_ENV".to_owned(), "prod".to_owned()),
                 (
                     "AUTUMN_MANIFEST_DIR".to_owned(),
                     temp.path().to_str().unwrap().to_owned(),
@@ -7650,10 +7655,17 @@ mod tests {
         .unwrap();
 
         let env = FakeEnv(
-            [(
-                "AUTUMN_MANIFEST_DIR".to_owned(),
-                temp.path().to_str().unwrap().to_owned(),
-            )]
+            [
+                // Non-dev profile so the `dev` smart-defaults' feature-gated
+                // `[storage]` table isn't injected — otherwise (storage feature
+                // off) the test would fail on `storage`, not the `[log]` typo it
+                // is meant to exercise.
+                ("AUTUMN_ENV".to_owned(), "prod".to_owned()),
+                (
+                    "AUTUMN_MANIFEST_DIR".to_owned(),
+                    temp.path().to_str().unwrap().to_owned(),
+                ),
+            ]
             .into(),
         );
 
@@ -7680,6 +7692,10 @@ mod tests {
         let env = FakeEnv(
             [
                 ("AUTUMN_SERVER__STRICT_CONFIG".to_owned(), "true".to_owned()),
+                // Non-dev profile so the `dev` smart-defaults' feature-gated
+                // `[storage]` table isn't injected; this test must fail on the
+                // `[server]` typo, not on `storage` (storage feature off).
+                ("AUTUMN_ENV".to_owned(), "prod".to_owned()),
                 (
                     "AUTUMN_MANIFEST_DIR".to_owned(),
                     temp.path().to_str().unwrap().to_owned(),
@@ -7718,6 +7734,10 @@ mod tests {
         let env = FakeEnv(
             [
                 ("AUTUMN_SERVER__STRICT_CONFIG".to_owned(), "true".to_owned()),
+                // Non-dev profile so the `dev` smart-defaults' feature-gated
+                // `[storage]` table isn't injected; this test must fail on the
+                // malformed `[profile]` entry, not on `storage`.
+                ("AUTUMN_ENV".to_owned(), "prod".to_owned()),
                 (
                     "AUTUMN_MANIFEST_DIR".to_owned(),
                     temp.path().to_str().unwrap().to_owned(),
@@ -7747,6 +7767,11 @@ mod tests {
         let env2 = FakeEnv(
             [
                 ("AUTUMN_SERVER__STRICT_CONFIG".to_owned(), "true".to_owned()),
+                // Non-dev profile so the `dev` smart-defaults' feature-gated
+                // `[storage]` table isn't injected: the `[resilience]` typo must
+                // remain a warn-only (Ok) case, not be masked by a hard-failing
+                // `storage` key when the storage feature is off.
+                ("AUTUMN_ENV".to_owned(), "prod".to_owned()),
                 (
                     "AUTUMN_MANIFEST_DIR".to_owned(),
                     temp2.path().to_str().unwrap().to_owned(),
