@@ -785,7 +785,19 @@ pub fn resolve_rollback_target(
 /// 2. health-gated proxy flip back to the previous release's loopback port,
 /// 3. repoint `current` at the previous release,
 /// 4. record the live slot marker (now the previous slot),
-/// 5. bounded `/ready` re-probe to confirm the rollback is healthy.
+/// 5. bounded `/ready` re-probe to confirm the rollback is healthy,
+/// 6. drain (disable) the slot the rollback flipped traffic AWAY from — the slot
+///    that was live before the rollback (`other_slot(target.slot)`).
+///
+/// Step 6 restores the invariant "only the live slot runs" (symmetric with
+/// [`cutover_ops`]'s `drain-old`). Without it the just-rolled-back slot keeps
+/// running its old binary; the next deploy reads the live-slot marker, reuses that
+/// still-running slot as its idle candidate, and `systemctl enable --now` does NOT
+/// restart an already-active unit — so readiness and the proxy flip would target
+/// the rolled-back binary instead of the newly uploaded release. It runs after the
+/// `/ready` re-probe so the old slot is never torn down until the rolled-back
+/// release is confirmed healthy (the same confirm-before-drain ordering cutover
+/// uses).
 ///
 /// The caller runs [`resolve_rollback_target`] first, so its `resolve-previous`
 /// probe precedes these ops in the recorded sequence.
@@ -796,6 +808,10 @@ pub fn rollback_ops(
     target: &RollbackTarget,
 ) -> Vec<DeployOp> {
     let previous_unit = slot_unit_name(&cfg.service_name, target.slot);
+    // The slot that was live before this rollback — traffic just moved away from
+    // it. `target.slot` is the slot we roll back TO, so the former-live slot is the
+    // OTHER one.
+    let rolled_back_unit = slot_unit_name(&cfg.service_name, other_slot(target.slot));
     let current = cfg.current_symlink();
     vec![
         DeployOp::Run(RemoteCommand::new(
@@ -817,6 +833,15 @@ pub fn rollback_ops(
         DeployOp::Run(RemoteCommand::new(
             "readiness-gate",
             readiness_poll_shell(target.port, cfg.readiness_timeout_secs),
+        )),
+        // Traffic has moved back to the previous slot; disable the slot that was
+        // live before the rollback so the invariant "only the live slot runs"
+        // holds. Otherwise the next deploy reuses this still-running slot as its
+        // idle candidate and `enable --now` won't restart it, serving the
+        // rolled-back binary. Symmetric with cutover_ops' `drain-old`.
+        DeployOp::Run(RemoteCommand::new(
+            "drain-rolled-back-slot",
+            format!("systemctl disable --now {rolled_back_unit}.service"),
         )),
     ]
 }
@@ -1765,6 +1790,7 @@ mod tests {
                 "link-current",
                 "record-live-slot",
                 "readiness-gate",
+                "drain-rolled-back-slot",
             ],
             "unexpected rollback sequence"
         );
@@ -1807,6 +1833,66 @@ mod tests {
         assert!(
             pos("link-current") < pos("readiness-gate"),
             "promote before the re-probe"
+        );
+        // The slot the rollback flipped traffic AWAY from (green, the former-live
+        // slot) is drained AFTER the re-probe confirms the rolled-back release is
+        // healthy — never the slot we rolled back to (blue).
+        let drain = exec.shell_for("drain-rolled-back-slot").expect("drain ran");
+        assert!(
+            drain.contains("disable --now myapp-green.service"),
+            "rollback drains the former-live (green) slot: {drain}"
+        );
+        assert!(
+            !drain.contains("myapp-blue.service"),
+            "rollback must NOT drain the slot it rolled back to (blue): {drain}"
+        );
+        assert!(
+            pos("readiness-gate") < pos("drain-rolled-back-slot"),
+            "drain the former-live slot only after confirming the rollback is healthy"
+        );
+    }
+
+    #[test]
+    fn rollback_drains_the_slot_it_flipped_away_from() {
+        // Regression (Codex P1): rolling back must disable the slot that was live
+        // before the rollback (the slot traffic moved AWAY from). Otherwise it keeps
+        // running its old binary; the next deploy reuses it as the idle candidate
+        // and `enable --now` won't restart it, so readiness and the proxy flip would
+        // target the rolled-back binary instead of the newly uploaded release.
+        let cfg = resolved();
+        // Live slot is blue, so the previous release runs on green → we roll back TO
+        // green and must drain the former-live BLUE slot.
+        let exec = RecordingExecutor::new().with_stdout(
+            "resolve-previous",
+            "prev:/srv/autumn/myapp/releases/20260713T090000Z\tblue",
+        );
+        let target = resolve_rollback_target(&cfg, 3000, &exec).expect("previous release resolves");
+        assert_eq!(target.slot, SLOT_GREEN, "roll back to the non-live slot");
+
+        let ops = rollback_ops(&cfg, &proxy(), &target);
+        run_ops(&ops, &exec).expect("recording executor never fails");
+
+        let labels = exec.run_labels();
+        let pos = |l: &str| labels.iter().position(|&x| x == l).unwrap();
+
+        // The former-live slot's unit is disabled...
+        let drain = exec.shell_for("drain-rolled-back-slot").expect("drain ran");
+        assert!(
+            drain.contains("disable --now myapp-blue.service"),
+            "drain targets other_slot(previous) = the former-live blue slot: {drain}"
+        );
+        assert!(
+            !drain.contains("myapp-green.service"),
+            "drain must NOT target the slot we rolled back to (green): {drain}"
+        );
+        // ...and only AFTER the proxy flip has already moved traffic away.
+        assert!(
+            pos("proxy-flip") < pos("drain-rolled-back-slot"),
+            "drain the former-live slot only after the flip moves traffic off it"
+        );
+        assert!(
+            pos("readiness-gate") < pos("drain-rolled-back-slot"),
+            "drain only after the rolled-back release is confirmed healthy"
         );
     }
 

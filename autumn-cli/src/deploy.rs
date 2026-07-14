@@ -626,11 +626,13 @@ pub fn build_deploy_plan(cfg: &ResolvedDeployConfig) -> Vec<DeployStep> {
 
 /// Build the rollback plan, mirroring [`exec::rollback_ops`]'s actual sequence:
 /// restart the previous slot's unit first, flip the proxy upstream back to it,
-/// repoint `current`, record the live slot, and re-probe `/ready`.
+/// repoint `current`, record the live slot, re-probe `/ready`, and finally drain
+/// the slot the rollback flipped traffic away from.
 ///
 /// The order matters: the proxy flip is health-gated, so the previous release's
 /// unit must be restarted and up *before* the flip can pass, and the flip
-/// therefore precedes the `current` repoint.
+/// therefore precedes the `current` repoint. The former-live slot is drained last,
+/// after the re-probe confirms the rolled-back release is healthy.
 #[must_use]
 pub fn build_rollback_plan(cfg: &ResolvedDeployConfig) -> Vec<DeployStep> {
     vec![
@@ -665,6 +667,12 @@ pub fn build_rollback_plan(cfg: &ResolvedDeployConfig) -> Vec<DeployStep> {
                 "Re-probe /ready within {}s to confirm the rollback is healthy",
                 cfg.readiness_timeout_secs
             ),
+        ),
+        DeployStep::new(
+            "drain-rolled-back-slot",
+            "Disable the slot that was live before the rollback (the one traffic \
+             moved away from) so the next deploy sees it genuinely idle and starts \
+             the new binary fresh",
         ),
     ]
 }
@@ -1218,12 +1226,13 @@ mod tests {
                 "repoint",
                 "record-live-slot",
                 "readiness-gate",
+                "drain-rolled-back-slot",
             ],
             "printed rollback plan must match rollback_ops' execution order"
         );
         let pos = |l: &str| labels.iter().position(|&x| x == l).expect("step present");
         // Restart the previous unit before the health-gated flip, and flip before
-        // repointing `current`; re-probe last.
+        // repointing `current`; re-probe before draining the former-live slot.
         assert!(
             pos("restart-previous") < pos("proxy-flip"),
             "previous unit must be up before the health-gated flip"
@@ -1235,6 +1244,10 @@ mod tests {
         assert!(
             pos("restart-previous") < pos("readiness-gate"),
             "restart must precede the /ready re-probe"
+        );
+        assert!(
+            pos("readiness-gate") < pos("drain-rolled-back-slot"),
+            "the former-live slot is drained last, after the /ready re-probe"
         );
     }
 
