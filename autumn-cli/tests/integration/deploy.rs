@@ -188,6 +188,41 @@ fn doctor_reads_deploy_signing_secret_from_dotenv() {
 }
 
 #[test]
+fn doctor_fails_on_malformed_previous_secrets() {
+    // Regression: doctor silently DROPPED a malformed
+    // `security.signing_secret.previous_secrets` (e.g. `[123]` or a non-array)
+    // via `as_array`/`filter_map`, so `deploy_signing_secret` PASSED with a
+    // strong current secret — but `autumn deploy check` loads via
+    // `AutumnConfig::load()`, which deserializes the field as `Vec<String>` and
+    // HARD-FAILS the same config on every profile. Doctor must surface a FAILING
+    // `deploy_signing_secret` check to match. A strong current secret is supplied
+    // via env so the failure is attributable to the malformed `previous_secrets`,
+    // not a missing current secret.
+    let dir =
+        project("host = \"203.0.113.10\"\n\n[security.signing_secret]\nprevious_secrets = [123]\n");
+    let secret = "a".repeat(64);
+    let (stdout, stderr, code) = run_autumn(
+        dir.path(),
+        &["doctor"],
+        &[("AUTUMN_SECURITY__SIGNING_SECRET", secret.as_str())],
+    );
+    let combined = format!("{stdout}{stderr}");
+    assert_ne!(
+        code,
+        Some(0),
+        "doctor must fail on a malformed previous_secrets\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        combined.contains("deploy_signing_secret"),
+        "doctor must surface the deploy_signing_secret check\n{combined}"
+    );
+    assert!(
+        combined.contains("previous_secrets is present but invalid"),
+        "doctor must report the malformed previous_secrets\n{combined}"
+    );
+}
+
+#[test]
 fn doctor_flags_dotenv_db_backed_runtime_without_db() {
     // Regression: `.env`-only postgres backend must make doctor require a deploy
     // DB, matching `deploy check` (Codex P2 on 2dc71f7); bare OsEnv wrongly

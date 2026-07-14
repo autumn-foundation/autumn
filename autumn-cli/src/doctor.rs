@@ -4094,19 +4094,32 @@ fn resolve_deploy_signing_secret(
 /// read from the merged table alone — matching what `AutumnConfig::load()` and
 /// `autumn deploy check` see. Never returns/prints the values except to the
 /// (secret-safe) grader.
-fn resolve_deploy_previous_signing_secrets(merged: &toml::Table) -> Vec<String> {
-    merged
+///
+/// Returns `Err` on a MALFORMED value — a non-array `previous_secrets` or an
+/// array with any non-string element — to mirror `AutumnConfig::load()`, which
+/// deserializes this field as `Vec<String>` and hard-fails on the same shapes.
+/// An absent key yields `Ok(vec![])`. Empty strings are NOT rejected here
+/// (`load()` accepts them; production value-validation is downstream in the
+/// grader).
+fn resolve_deploy_previous_signing_secrets(merged: &toml::Table) -> Result<Vec<String>, String> {
+    let Some(value) = merged
         .get("security")
         .and_then(|s| s.get("signing_secret"))
         .and_then(|ss| ss.get("previous_secrets"))
-        .and_then(toml::Value::as_array)
-        .map(|arr| {
-            arr.iter()
-                .filter_map(toml::Value::as_str)
-                .map(std::borrow::ToOwned::to_owned)
-                .collect()
-        })
-        .unwrap_or_default()
+    else {
+        return Ok(vec![]);
+    };
+    let Some(arr) = value.as_array() else {
+        return Err("previous_secrets must be an array of strings".into());
+    };
+    let mut out = Vec::with_capacity(arr.len());
+    for (i, elem) in arr.iter().enumerate() {
+        let Some(s) = elem.as_str() else {
+            return Err(format!("previous_secrets[{i}] must be a string"));
+        };
+        out.push(s.to_owned());
+    }
+    Ok(out)
 }
 
 /// Whether any enabled runtime feature requires a configured Postgres pool at
@@ -5912,7 +5925,8 @@ pub fn run(opts: DoctorOptions) {
         // Rotation secrets accepted during a grace window are validated at boot
         // with the same rule as the current secret, so grade them here from the
         // same merged table (no env override exists for `previous_secrets`).
-        let deploy_previous_signing = resolve_deploy_previous_signing_secrets(&merged_deploy_toml);
+        let deploy_previous_signing_result =
+            resolve_deploy_previous_signing_secrets(&merged_deploy_toml);
         // Derive the deploy DB-URL preflight input from the SAME merged
         // active-profile table used for `deploy_cfg` (base autumn.toml +
         // [profile.<env>] + autumn-<env>.toml), exactly like the sibling
@@ -6012,16 +6026,40 @@ pub fn run(opts: DoctorOptions) {
             }));
         }
 
-        tasks.push(Box::new(move || {
-            deploy_preflight_result(
-                "deploy_signing_secret",
-                crate::deploy::grade_signing_secret(
-                    deploy_signing.as_deref(),
-                    &deploy_previous_signing,
-                    is_production,
-                ),
-            )
-        }));
+        match deploy_previous_signing_result {
+            Ok(deploy_previous_signing) => {
+                tasks.push(Box::new(move || {
+                    deploy_preflight_result(
+                        "deploy_signing_secret",
+                        crate::deploy::grade_signing_secret(
+                            deploy_signing.as_deref(),
+                            &deploy_previous_signing,
+                            is_production,
+                        ),
+                    )
+                }));
+            }
+            Err(msg) => {
+                // A non-array `previous_secrets` or a non-string element: surface
+                // it as a FAILING check on EVERY profile (not gated on
+                // production), because `AutumnConfig::load()` deserializes the
+                // field as `Vec<String>` and hard-fails the same config that
+                // `autumn deploy check` loads. Silently dropping it would let a
+                // strong current secret green-light a config the deploy path
+                // rejects.
+                tasks.push(Box::new(move || CheckResult {
+                    name: "deploy_signing_secret",
+                    status: CheckStatus::Fail,
+                    detail: Some(format!(
+                        "security.signing_secret.previous_secrets is present but invalid: {msg}"
+                    )),
+                    hint: Some(
+                        "Set security.signing_secret.previous_secrets to an array of strings \
+                         (see `autumn deploy check`).",
+                    ),
+                }));
+            }
+        }
         match deploy_db_url_result {
             Ok(deploy_db_url) => {
                 tasks.push(Box::new(move || {
@@ -14052,6 +14090,50 @@ redirect_uri = "http://localhost/callback"
         assert!(
             check.detail.unwrap().contains("present but invalid"),
             "detail must explain the [deploy] table is present but invalid"
+        );
+    }
+
+    #[test]
+    fn deploy_previous_secrets_non_string_element_is_malformed() {
+        // `previous_secrets = [123]` deserializes as `Vec<String>` failing in
+        // `AutumnConfig::load()`; doctor must treat it as malformed, not drop it.
+        let table: toml::Table = "[security.signing_secret]\nprevious_secrets = [123]\n"
+            .parse()
+            .unwrap();
+        assert!(
+            resolve_deploy_previous_signing_secrets(&table).is_err(),
+            "a non-string previous_secrets element must be malformed"
+        );
+    }
+
+    #[test]
+    fn deploy_previous_secrets_non_array_is_malformed() {
+        // A scalar `previous_secrets` cannot deserialize into `Vec<String>`.
+        let table: toml::Table = "[security.signing_secret]\nprevious_secrets = \"nope\"\n"
+            .parse()
+            .unwrap();
+        assert!(
+            resolve_deploy_previous_signing_secrets(&table).is_err(),
+            "a non-array previous_secrets must be malformed"
+        );
+    }
+
+    #[test]
+    fn deploy_previous_secrets_absent_or_strings_ok() {
+        // Absent key → empty vec.
+        let empty: toml::Table = toml::Table::new();
+        assert_eq!(
+            resolve_deploy_previous_signing_secrets(&empty).unwrap(),
+            Vec::<String>::new()
+        );
+        // Array of strings → collected; empty strings are NOT rejected (load()
+        // accepts them; value-validation is downstream in the grader).
+        let table: toml::Table = "[security.signing_secret]\nprevious_secrets = [\"a\", \"\"]\n"
+            .parse()
+            .unwrap();
+        assert_eq!(
+            resolve_deploy_previous_signing_secrets(&table).unwrap(),
+            vec!["a".to_owned(), String::new()]
         );
     }
 
