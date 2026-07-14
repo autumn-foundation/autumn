@@ -469,7 +469,15 @@ fn plan_auth_with_providers_ex_impl(
     // users/sessions/recovery-code migrations that emit Postgres-only DDL
     // (`BIGSERIAL PRIMARY KEY`, `DEFAULT NOW()`), so reject before writing any
     // files on a SQLite app (follow-up: issue #1927).
-    if super::detect_backend(project_root) == autumn_web::config::DatabaseBackend::Sqlite {
+    //
+    // Generate-time guard only. `autumn destroy auth` recomputes this same plan
+    // before [`Plan::revert`], so rejecting here on the destroy path would strand
+    // the very files cleanup is meant to remove (including files generated before
+    // the gate landed). Skip it when `for_revert` is set — same rationale as the
+    // shared-layout preflight below.
+    if !for_revert
+        && super::detect_backend(project_root) == autumn_web::config::DatabaseBackend::Sqlite
+    {
         return Err(super::sqlite_generator_unsupported_error("auth"));
     }
     super::model::validate_resource_name(name)?;
@@ -11015,6 +11023,37 @@ mod tests {
         )
         .unwrap();
         assert!(plan_auth(tmp.path(), "User", "20260508000000").is_ok());
+    }
+
+    /// The `SQLite` rejection is generate-only (finding F18): `autumn destroy
+    /// auth` recomputes this same plan via the `for_revert` builder before
+    /// [`Plan::revert`], so it must NOT be rejected on a `SQLite` app — otherwise
+    /// files generated before the gate landed could never be cleaned up.
+    #[test]
+    fn plan_auth_for_revert_not_rejected_on_sqlite_app() {
+        let tmp = project_with_main();
+        fs::write(
+            tmp.path().join("autumn.toml"),
+            "[database]\nprimary_url = \"sqlite://app.db\"\n",
+        )
+        .unwrap();
+        let oauth = AuthOAuthOptions {
+            providers: Vec::new(),
+        };
+        // The destroy/revert plan builder must still produce a plan to revert.
+        assert!(
+            plan_auth_full_ex2_for_revert(
+                tmp.path(),
+                "User",
+                "20260508000000",
+                &oauth,
+                false,
+                false,
+                false,
+            )
+            .is_ok(),
+            "destroy auth must build its revert plan on a SQLite app"
+        );
     }
 
     #[test]

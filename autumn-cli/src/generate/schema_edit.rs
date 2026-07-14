@@ -252,11 +252,6 @@ fn existing_schema_columns(schema: &str, table: &str) -> Vec<String> {
 /// honouring the caller-supplied `id_type`.
 /// For `Uuid`, prepends a comment documenting the index-locality trade-off and
 /// the `UUIDv7` upgrade path.
-///
-/// Retained as a Postgres-default convenience wrapper for the test suite; the
-/// backend-aware [`create_table_sql_with_metadata_and_id_for`] is what
-/// production calls.
-#[cfg(test)]
 #[must_use]
 pub fn create_table_sql_with_metadata_and_id(
     table: &str,

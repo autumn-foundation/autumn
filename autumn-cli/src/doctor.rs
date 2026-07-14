@@ -2851,26 +2851,76 @@ fn check_replica_migration_versions(
     }
 }
 
+/// Whether a `sqlite://` target is a valid backend for the doctor's
+/// primary/replica topology, mirroring
+/// [`autumn_web::config::DatabaseConfig::validate`]'s backend-consistency rule.
+///
+/// `SQLite` is single-writer/single-host: it has no read-replica role and cannot
+/// be mixed with a Postgres role. So a `sqlite://` URL only boots when it is the
+/// lone primary in a single-role config. `validate` rejects a Postgres primary
+/// with a `sqlite://` replica (mixed backends), a `sqlite://` primary paired
+/// with any replica (replicas require postgres), and any backend mismatch
+/// between roles — so `doctor --strict` must not Pass those configs either.
+///
+/// Returns `true` only when a `SQLite` primary is safe (no replica configured
+/// and no backend mismatch); a `SQLite` replica is never valid and callers pass
+/// `false` for the replica role unconditionally.
+fn sqlite_primary_target_is_bootable(primary_url: Option<&str>, replica_url: Option<&str>) -> bool {
+    use autumn_web::config::DatabaseBackend;
+    let Some(primary_backend) = primary_url.and_then(DatabaseBackend::detect) else {
+        return false;
+    };
+    if primary_backend != DatabaseBackend::Sqlite {
+        // Not a SQLite primary; this helper only gates the SQLite Pass.
+        return false;
+    }
+    // A SQLite primary can have no replica (read replicas require postgres) and
+    // no mismatched role — i.e. it must be the single database role.
+    replica_url.is_none()
+}
+
 fn check_db_role_connectivity(
     role: &'static str,
     database_url: &str,
     reachable: impl Fn(&str, u16) -> bool,
+    sqlite_target_bootable: bool,
 ) -> CheckResult {
     // A `sqlite://` target is a valid backend (SQLite foundation, issue #1614):
     // it names a local file, not a host:port service, so TCP reachability and
     // the "switch to postgres://" hint simply don't apply. The SQLite runtime
     // pool itself is deferred to #1905; doctor only confirms the target here
     // and must not mislead a SQLite app into thinking its URL is malformed.
+    //
+    // But SQLite is single-writer/single-host: `DatabaseConfig::validate`
+    // rejects it as a read replica, alongside a Postgres role, or in any
+    // mixed-backend topology (finding F19). Only Pass a SQLite target when it is
+    // the bootable lone primary; otherwise Fail, mirroring `validate`, so
+    // `doctor --strict` cannot greenlight a config that cannot boot.
     if autumn_web::config::DatabaseBackend::detect(database_url)
         == Some(autumn_web::config::DatabaseBackend::Sqlite)
     {
+        if sqlite_target_bootable {
+            return CheckResult {
+                name: "db_connectivity",
+                status: CheckStatus::Pass,
+                detail: Some(format!(
+                    "{role} database is a local SQLite target (no host:port to reach)"
+                )),
+                hint: None,
+            };
+        }
         return CheckResult {
             name: "db_connectivity",
-            status: CheckStatus::Pass,
+            status: CheckStatus::Fail,
             detail: Some(format!(
-                "{role} database is a local SQLite target (no host:port to reach)"
+                "{role} database is a SQLite target, but SQLite is single-writer/single-host: \
+                 read replicas and shards require the postgres backend, and every database role \
+                 must use the same backend"
             )),
-            hint: None,
+            hint: Some(
+                "Use a single SQLite database (no replica_url), or switch every database role to \
+                 postgres://",
+            ),
         };
     }
     match parse_db_host_port(database_url) {
@@ -2899,8 +2949,13 @@ fn check_db_role_connectivity(
     }
 }
 
-fn check_db_connectivity(database_url: &str) -> CheckResult {
-    check_db_role_connectivity("primary", database_url, tcp_reachable)
+fn check_db_connectivity(database_url: &str, sqlite_target_bootable: bool) -> CheckResult {
+    check_db_role_connectivity(
+        "primary",
+        database_url,
+        tcp_reachable,
+        sqlite_target_bootable,
+    )
 }
 
 fn check_pending_migrations(database_url: &str) -> CheckResult {
@@ -5860,9 +5915,19 @@ pub fn run(opts: DoctorOptions) {
         )
     }));
 
+    // A `sqlite://` primary only boots as the lone database role; pair it with a
+    // replica (or mix backends) and `DatabaseConfig::validate` rejects it at
+    // boot, so doctor must not Pass it (finding F19). A `sqlite://` replica is
+    // never bootable, so its connectivity check always passes `false`.
+    let sqlite_primary_bootable = sqlite_primary_target_is_bootable(
+        db_topology.primary_url.as_deref(),
+        db_topology.replica_url.as_deref(),
+    );
     if let Some(url) = db_topology.primary_url.clone() {
         let primary_for_pending = url.clone();
-        tasks.push(Box::new(move || check_db_connectivity(&url)));
+        tasks.push(Box::new(move || {
+            check_db_connectivity(&url, sqlite_primary_bootable)
+        }));
         tasks.push(Box::new(move || {
             check_pending_migrations(&primary_for_pending)
         }));
@@ -5870,7 +5935,7 @@ pub fn run(opts: DoctorOptions) {
 
     if let Some(url) = db_topology.replica_url.clone() {
         tasks.push(Box::new(move || {
-            check_db_role_connectivity("replica", &url, tcp_reachable)
+            check_db_role_connectivity("replica", &url, tcp_reachable, false)
         }));
     }
 
@@ -13098,6 +13163,7 @@ foo = "bar"
                 assert_eq!(port, 5432);
                 false
             },
+            false,
         );
 
         assert_eq!(result.status, CheckStatus::Fail);
@@ -13108,15 +13174,19 @@ foo = "bar"
         assert!(!detail.contains("secret"));
     }
 
-    /// `SQLite` foundation (issue #1614): a `sqlite://` target is valid, so the
-    /// connectivity check must Pass and never nudge the user to "use
-    /// postgres://" nor Fail on an unreachable host (there is no host).
+    /// `SQLite` foundation (issue #1614): a bootable single-role `sqlite://`
+    /// primary is valid, so the connectivity check must Pass and never nudge the
+    /// user to "use postgres://" nor Fail on an unreachable host (there is no
+    /// host).
     #[test]
     fn db_connectivity_sqlite_target_passes_without_postgres_hint() {
         for url in ["sqlite://app.db", "sqlite:data/app.db", "file:app.db"] {
-            let result = check_db_role_connectivity("primary", url, |_, _| {
-                panic!("SQLite target must not attempt TCP reachability")
-            });
+            let result = check_db_role_connectivity(
+                "primary",
+                url,
+                |_, _| panic!("SQLite target must not attempt TCP reachability"),
+                true,
+            );
             assert_eq!(result.status, CheckStatus::Pass, "url={url}");
             let detail = result.detail.unwrap_or_default();
             assert!(detail.contains("SQLite"), "detail={detail}");
@@ -13131,8 +13201,70 @@ foo = "bar"
     /// short-circuit must not swallow a real connectivity failure.
     #[test]
     fn db_connectivity_postgres_target_still_evaluated() {
-        let result = check_db_role_connectivity("primary", "postgres://db:5432/app", |_, _| false);
+        let result =
+            check_db_role_connectivity("primary", "postgres://db:5432/app", |_, _| false, false);
         assert_eq!(result.status, CheckStatus::Fail);
+    }
+
+    /// Finding F19: `doctor` must agree with `DatabaseConfig::validate`, which
+    /// rejects any config that pairs `SQLite` with a read replica or mixes
+    /// backends. A `sqlite://` target that is NOT the bootable lone primary must
+    /// Fail (not blanket-Pass), so `doctor --strict` cannot greenlight a config
+    /// that cannot boot.
+    #[test]
+    fn db_connectivity_sqlite_replica_or_mixed_backend_fails() {
+        // A SQLite replica is never bootable (read replicas require postgres).
+        let replica = check_db_role_connectivity(
+            "replica",
+            "sqlite://replica.db",
+            |_, _| panic!("SQLite target must not attempt TCP reachability"),
+            false,
+        );
+        assert_eq!(replica.status, CheckStatus::Fail);
+        let detail = replica.detail.unwrap_or_default();
+        assert!(detail.contains("replica"), "detail={detail}");
+        assert!(detail.contains("same backend"), "detail={detail}");
+
+        // A SQLite primary is not bootable when a replica is configured.
+        let primary = check_db_role_connectivity(
+            "primary",
+            "sqlite://app.db",
+            |_, _| panic!("SQLite target must not attempt TCP reachability"),
+            false,
+        );
+        assert_eq!(primary.status, CheckStatus::Fail);
+    }
+
+    /// Finding F19: the bootability rule mirrors
+    /// `DatabaseConfig::validate_backend_consistency` for the primary/replica
+    /// topology — a `sqlite://` primary boots only as the single database role.
+    #[test]
+    fn sqlite_primary_bootable_only_as_single_role() {
+        // SQLite primary, no replica → bootable (single role).
+        assert!(sqlite_primary_target_is_bootable(
+            Some("sqlite://app.db"),
+            None
+        ));
+        // SQLite primary + any replica → not bootable (replicas need postgres).
+        assert!(!sqlite_primary_target_is_bootable(
+            Some("sqlite://app.db"),
+            Some("postgres://db:5432/app")
+        ));
+        assert!(!sqlite_primary_target_is_bootable(
+            Some("sqlite://app.db"),
+            Some("sqlite://replica.db")
+        ));
+        // Postgres primary (even with a SQLite replica) is never gated by this
+        // SQLite-only helper — the replica's own check handles the mismatch.
+        assert!(!sqlite_primary_target_is_bootable(
+            Some("postgres://db:5432/app"),
+            Some("sqlite://replica.db")
+        ));
+        // All-postgres is untouched by the SQLite gate.
+        assert!(!sqlite_primary_target_is_bootable(
+            Some("postgres://db:5432/app"),
+            Some("postgres://replica:5432/app")
+        ));
     }
 
     /// `SQLite` foundation (issue #1614): the pg-client-tools check must not warn

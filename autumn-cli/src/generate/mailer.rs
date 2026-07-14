@@ -46,22 +46,45 @@ use super::{GenerateError, ensure_project_root, read_or_empty, timestamp_now};
 ///
 /// # Errors
 /// Project layout and name validation errors surface here.
-#[allow(
-    clippy::too_many_lines,
-    reason = "linear sequence of independent file/revert steps mirroring the files this \
-              generator emits; splitting it up would not make any single step clearer"
-)]
 pub fn plan_mailer(
     project_root: &Path,
     name: &str,
     list_unsubscribe: Option<&str>,
     no_layout: bool,
 ) -> Result<Plan, GenerateError> {
+    plan_mailer_ex(project_root, name, list_unsubscribe, no_layout, false)
+}
+
+/// Shared implementation of [`plan_mailer`]. `for_revert` suppresses the
+/// generate-only `SQLite` rejection so `autumn destroy mailer` (which recomputes
+/// this same plan before [`Plan::revert`]) can remove generated files on a
+/// `SQLite` app — including files scaffolded before the gate landed. `destroy`
+/// only reverts previously written files; it never applies the Postgres-only
+/// unsubscribe migration, so the rejection is generate-path only.
+///
+/// # Errors
+/// Project layout and name validation errors surface here.
+#[allow(
+    clippy::too_many_lines,
+    reason = "linear sequence of independent file/revert steps mirroring the files this \
+              generator emits; splitting it up would not make any single step clearer"
+)]
+pub fn plan_mailer_ex(
+    project_root: &Path,
+    name: &str,
+    list_unsubscribe: Option<&str>,
+    no_layout: bool,
+    for_revert: bool,
+) -> Result<Plan, GenerateError> {
     ensure_project_root(project_root)?;
     // SQLite foundation (issue #1614 AC #4): this generator scaffolds a
     // Postgres-only unsubscribe migration (`BIGSERIAL`/`NOW()`), so reject
     // before writing any files on a SQLite app (follow-up: issue #1927).
-    if super::detect_backend(project_root) == autumn_web::config::DatabaseBackend::Sqlite {
+    // Generate-time guard only — skip it on the destroy/revert path so cleanup
+    // can still remove generated files (see `for_revert` above).
+    if !for_revert
+        && super::detect_backend(project_root) == autumn_web::config::DatabaseBackend::Sqlite
+    {
         return Err(super::sqlite_generator_unsupported_error("mailer"));
     }
     validate_resource_name(name)?;
@@ -587,6 +610,24 @@ async fn main() {
         )
         .unwrap();
         assert!(plan_mailer(tmp.path(), "Welcome", None, false).is_ok());
+    }
+
+    /// The `SQLite` rejection is generate-only (finding F17): `autumn destroy
+    /// mailer` recomputes this same plan with `for_revert` before
+    /// [`Plan::revert`], so it must NOT be rejected on a `SQLite` app — otherwise
+    /// files generated before the gate landed could never be cleaned up.
+    #[test]
+    fn plan_mailer_ex_for_revert_not_rejected_on_sqlite_app() {
+        let tmp = project_with_main(default_main());
+        fs::write(
+            tmp.path().join("autumn.toml"),
+            "[database]\nprimary_url = \"sqlite://app.db\"\n",
+        )
+        .unwrap();
+        assert!(
+            plan_mailer_ex(tmp.path(), "Welcome", None, false, true).is_ok(),
+            "destroy mailer must build its revert plan on a SQLite app"
+        );
     }
 
     #[test]
