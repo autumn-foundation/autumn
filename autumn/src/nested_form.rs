@@ -109,8 +109,8 @@
 //! blocks submission (on a required-field child) or saves an empty row (on an
 //! all-optional child). Supplying [`InputsForOptions::add_row_url`] additionally emits an
 //! htmx "Add row" button (`hx-get` + `hx-swap="beforeend"`, with
-//! `hx-params="none"` so no form fields — and no CSRF/submit token — are
-//! serialized into the fragment request; only the `hx-vals` `index` is sent);
+//! `hx-params="index"` so only the `hx-vals` `index` is sent — no form fields
+//! and no CSRF/submit token — are serialized into the fragment request);
 //! [`nested_row_fragment`] renders the server response
 //! for that endpoint. htmx is a progressive enhancement layered over the no-JS
 //! path — it is never required.
@@ -516,11 +516,12 @@ where
                 // present-but-blank typed field (`quantity=`) before serde sees
                 // it, so the primary error is then `missing field \`quantity\``
                 // reported at the ROW ROOT with an empty path — losing the field
-                // name the row helpers need. `recover_child_error_field` layers a
-                // raw (non-dropping) re-decode and a message parse on top of the
-                // primary path to recover it; see that helper. Only if all layers
-                // fail does it fall back to the row-level "" key, so the error is
-                // never silently dropped.
+                // name the row helpers need. `recover_child_error_field` recovers
+                // it by preferring the primary error's `missing field \`X\``
+                // message (with a raw non-dropping re-decode only as a last
+                // resort); see that helper. Only if all layers fail does it fall
+                // back to the row-level "" key, so the error is never silently
+                // dropped.
                 let field = recover_child_error_field::<C>(&e, &decode_pairs);
                 errors.entry(field).or_default().push(e.to_string());
                 all_children_ok = false;
@@ -637,12 +638,20 @@ fn missing_field_name(msg: &str) -> Option<String> {
 /// 1. The primary decode's `serde_path_to_error` path (last `Map`/`Enum` key).
 ///    For a malformed non-blank value (`quantity=abc`) this already yields the
 ///    field, since that pair is never dropped.
-/// 2. If empty, a raw re-decode over the ORIGINAL row pairs with blanks
-///    RETAINED (no dropping), mirroring the shared helper's deserializer minus
-///    the drop loop. For a present-but-blank typed field serde now fails
-///    parsing `""` AT `.quantity`, recovering the field.
-/// 3. If still empty (a field truly never submitted), the backtick-quoted
-///    identifier in serde's missing-field message.
+/// 2. If empty, the backtick-quoted identifier parsed from the PRIMARY error's
+///    missing-field message. The blank-dropping decode stops on the first typed
+///    field it can't satisfy, so this names the truly-required field even when
+///    an earlier OPTIONAL blank precedes it — e.g. a child with an optional
+///    `weight` before a required `quantity`, both submitted blank, reports the
+///    required `quantity` as missing, not `weight`. It also covers the
+///    present-but-blank required field (dropped → missing) and the field truly
+///    never submitted. This is preferred over the raw re-decode below precisely
+///    so the error lands on the required field, not a harmless optional blank a
+///    non-dropping pass would trip on first.
+/// 3. Only if BOTH are empty (a rare root-level error carrying neither a path
+///    nor a missing-field message), a raw re-decode over the ORIGINAL row pairs
+///    with blanks RETAINED (no dropping), mirroring the shared helper's
+///    deserializer minus the drop loop, and its last `Map`/`Enum` key.
 /// 4. Otherwise `""` (row-level key) so the error is never silently dropped.
 ///
 /// This runs ONLY on the already-failed path to LOCATE the field; it does not
@@ -653,23 +662,27 @@ fn recover_child_error_field<C: serde::de::DeserializeOwned>(
     primary: &serde_path_to_error::Error<serde_urlencoded::de::Error>,
     decode_pairs: &[(String, String)],
 ) -> String {
-    // 1. Primary decode path.
+    // 1. Primary decode path (present-but-malformed value at a real path).
     if let Some(field) = last_path_field(primary.path()) {
         return field;
     }
 
-    // 2. Raw (non-dropping) re-decode over the original row pairs.
+    // 2. The `missing field \`X\`` identifier from the PRIMARY error — names
+    //    the required field the blank-dropping pass actually stopped on.
+    if let Some(field) = missing_field_name(&primary.inner().to_string()) {
+        return field;
+    }
+
+    // 3. Fallback: raw (non-dropping) re-decode over the original row pairs,
+    //    for the rare root-level error with neither a path nor a missing-field
+    //    message.
     let encoded = encode_pairs(decode_pairs);
     let deserializer =
         serde_urlencoded::Deserializer::new(url::form_urlencoded::parse(encoded.as_bytes()));
-    if let Err(raw_err) = serde_path_to_error::deserialize::<_, C>(deserializer) {
-        if let Some(field) = last_path_field(raw_err.path()) {
-            return field;
-        }
-        // 3. Parse serde's stable `missing field \`X\`` message.
-        if let Some(field) = missing_field_name(&raw_err.to_string()) {
-            return field;
-        }
+    if let Err(raw_err) = serde_path_to_error::deserialize::<_, C>(deserializer)
+        && let Some(field) = last_path_field(raw_err.path())
+    {
+        return field;
     }
 
     // 4. Row-level key.
@@ -1325,12 +1338,13 @@ impl Default for InputsForOptions {
 ///
 /// When [`InputsForOptions::add_row_url`] is `Some`, an "Add row"
 /// `<button type="button">` is emitted with `hx-get`, `hx-target="#{container_id}"`,
-/// `hx-swap="beforeend"`, and — critically — `hx-params="none"` so **no**
-/// form-field inputs (and no `_csrf`/submit token) are serialized into the
-/// Add-row GET; per htmx semantics `not X` would include every parameter
-/// except `X`, leaking the current parent + line-item fields into the request
-/// query string / proxy logs. The fragment endpoint needs only the `index`,
-/// which the `hx-vals` below supplies independently of `hx-params` filtering.
+/// `hx-swap="beforeend"`, and — critically — `hx-params="index"` so **only**
+/// the `index` param (supplied by the `hx-vals` below) is serialized into the
+/// Add-row GET; every parent + line-item field, and `_csrf`/submit token, is
+/// dropped, avoiding leaks into the request query string / proxy logs. `"none"`
+/// can NOT be used: the vendored htmx 2.0.4 merges `hx-vals` into the request
+/// `FormData` *before* the `hx-params` filter runs, so `"none"` (an empty
+/// `FormData`) would strip the computed `index` too — naming `index` keeps it.
 ///
 /// The button also carries an `hx-vals` (`js:` form) that computes a fresh
 /// `index` for each request — `max(existing data-index) + 1` scanning only
@@ -1417,14 +1431,18 @@ pub fn inputs_for<P, C: NestedChild>(
                 // page never clash). The decoder tolerates gaps, so this stays
                 // collision-free even after client-side row removals.
                 //
-                // `hx-params="none"` serializes NO form-field inputs with the
-                // Add-row GET: per htmx semantics `not X` would include every
-                // parameter except `X`, leaking the current parent + line-item
-                // fields (and `_csrf`) into the request query string / proxy
-                // logs and risking URL-length limits. The fragment endpoint
-                // needs only the `index`, which `hx-vals` supplies independently
-                // of `hx-params` filtering, so `"none"` sends the `index` and
-                // nothing else (no form fields, no CSRF/submit token).
+                // `hx-params="index"` serializes ONLY the `index` param with
+                // the Add-row GET: per htmx semantics a bare comma-list keeps
+                // just the named params, so every parent + line-item field
+                // (and `_csrf`/submit token) is dropped from the request query
+                // string / proxy logs, avoiding leaks and URL-length limits.
+                // We can NOT use `"none"`: in the vendored htmx 2.0.4 the
+                // `hx-vals` values are merged into the request FormData BEFORE
+                // the `hx-params` filter runs (see `htmx.min.js`: the request
+                // builder does `const v=ln(j,V);let w=hn(v,r)` where `V` is the
+                // resolved `hx-vals` and `hn` is `filterValues`), so `"none"`
+                // (which returns an empty FormData) would strip the `index` we
+                // compute here too. Naming `index` keeps exactly that one value.
                 @let hx_vals = format!(
                     "js:{{\"index\": Math.max(-1, ...Array.from(document.querySelectorAll(\"#{container_id} .nested-fields__row[data-index]\")).map(function(e){{return parseInt(e.dataset.index,10);}})) + 1}}"
                 );
@@ -1434,7 +1452,7 @@ pub fn inputs_for<P, C: NestedChild>(
                     hx-get=(url)
                     hx-target=(format!("#{container_id}"))
                     hx-swap="beforeend"
-                    hx-params="none"
+                    hx-params="index"
                     hx-vals=(hx_vals)
                 { "Add row" }
             }
@@ -1451,7 +1469,7 @@ pub fn inputs_for<P, C: NestedChild>(
 ///
 /// The [`inputs_for`] Add-row button sends this unique value as an `index`
 /// param (via `hx-vals`, computed as `max(existing data-index) + 1`). Because
-/// the button sets `hx-params="none"`, the Add-row request carries ONLY the
+/// the button sets `hx-params="index"`, the Add-row request carries ONLY the
 /// `hx-vals` `index` — no parent/line-item form fields and no CSRF/submit
 /// token are serialized — and `index` is the only value this endpoint needs.
 /// The endpoint should read that param from the query/form and pass it straight
@@ -1725,6 +1743,56 @@ mod tests {
         assert_eq!(widgets.len(), 1);
         assert_eq!(widgets[0].label, "Bolt");
         assert_eq!(widgets[0].weight, None);
+    }
+
+    #[test]
+    fn child_optional_blank_before_required_blank_keys_error_to_required_field() {
+        // Codex P2 follow-on: a child whose OPTIONAL typed field (`weight:
+        // Option<i32>`) is declared BEFORE a REQUIRED typed field (`quantity:
+        // i32`), with BOTH submitted blank. The blank-dropping decode drops both
+        // blank pairs and ends at `missing field \`quantity\`` — the required
+        // one. A raw non-dropping re-decode, by contrast, trips FIRST on the
+        // harmless optional `weight=` (parsing `""` as an `i32` at `.weight`), so
+        // it would mis-key the error to `weight`. The field-recovery therefore
+        // prefers the PRIMARY error's missing-field message over the raw
+        // re-decode, so the inline error lands on `quantity`, not `weight`.
+        #[derive(serde::Deserialize, validator::Validate)]
+        struct Part {
+            #[validate(length(min = 1, message = "sku required"))]
+            sku: String,
+            // Optional, declared FIRST — a blank submission is harmless (→ None).
+            // Never read on this invalid-row path (the row fails to fully decode),
+            // so silence the dead-field lint.
+            #[allow(dead_code)]
+            weight: Option<i32>,
+            // Required, declared AFTER — a blank submission is the real error.
+            #[validate(range(min = 1, message = "quantity must be >= 1"))]
+            quantity: i32,
+        }
+        impl NestedChild for Part {
+            const COLLECTION: &'static str = "items";
+        }
+
+        let pairs = vec![
+            p("name", "Order"),
+            // `sku` filled so the row is retained (not all-blank).
+            p("items[0][sku]", "Widget"),
+            p("items[0][weight]", ""),
+            p("items[0][quantity]", ""),
+        ];
+        let cs = decode_nested_urlencoded::<Order, Part>(&pairs).expect("parent decodes");
+        assert!(!cs.is_valid());
+        assert_eq!(cs.rows().len(), 1);
+        // The error is keyed to the truly-missing REQUIRED field…
+        assert!(!cs.errors_for("items[0].quantity").is_empty());
+        assert!(!cs.rows()[0].errors_for("quantity").is_empty());
+        // …and NOT to the harmless OPTIONAL blank the raw re-decode trips on.
+        assert!(cs.errors_for("items[0].weight").is_empty());
+        assert!(cs.rows()[0].errors_for("weight").is_empty());
+        // Not stored under the row-level "" / `items[0]` key either.
+        assert!(cs.rows()[0].errors_for("").is_empty());
+        assert!(cs.errors_for("items[0]").is_empty());
+        assert!(cs.into_valid().is_err());
     }
 
     #[test]
@@ -2079,15 +2147,15 @@ mod maud_tests {
         let none = inputs_for(&cs, &InputsForOptions::default(), render_row).into_string();
         assert!(!none.contains("Add row"), "{none}");
 
-        // With URL: button serializes no form fields (`hx-params="none"`) and
-        // uses a beforeend swap.
+        // With URL: button serializes only the `index` param (`hx-params="index"`)
+        // and uses a beforeend swap.
         let opts = InputsForOptions {
             add_row_url: Some("/orders/line-item-row".into()),
             ..InputsForOptions::default()
         };
         let html = inputs_for(&cs, &opts, render_row).into_string();
         assert!(html.contains("Add row"), "{html}");
-        assert!(html.contains(r#"hx-params="none""#), "{html}");
+        assert!(html.contains(r#"hx-params="index""#), "{html}");
         assert!(html.contains(r#"hx-swap="beforeend""#), "{html}");
         assert!(html.contains(r#"hx-get="/orders/line-item-row""#), "{html}");
         assert!(html.contains(r##"hx-target="#items-rows""##), "{html}");
@@ -2111,7 +2179,7 @@ mod maud_tests {
         // Pre-existing htmx wiring is preserved.
         assert!(html.contains(r#"hx-get="/orders/line-item-row""#), "{html}");
         assert!(html.contains(r#"hx-swap="beforeend""#), "{html}");
-        assert!(html.contains(r#"hx-params="none""#), "{html}");
+        assert!(html.contains(r#"hx-params="index""#), "{html}");
 
         // A JS-computed `hx-vals` that sends a fresh `index`…
         assert!(html.contains("hx-vals="), "{html}");
