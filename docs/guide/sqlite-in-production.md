@@ -159,12 +159,20 @@ published support contract** — **not** the runtime. Available **today**:
   - `--search` / FTS scaffold — #1910.
   - `ADD COLUMN NOT NULL` without a default (on both the add and rollback re-add
     paths).
-  - `DROP INDEX` emitted before `DROP COLUMN` on the rollback path.
-  - `generate auth` / `generate mailer` on a SQLite app — #1927.
-- **Backend-aware scaffold smoke tests** — the scaffold generators are exercised
-  against a SQLite target.
+  - `DROP INDEX` emitted before `DROP COLUMN` on the forward **and** rollback
+    paths (a plain `--index` is dropped before its column is removed).
+  - `generate auth` / `generate mailer` on a SQLite app — #1927 (a **generate-time**
+    refusal only; `generate destroy`/revert of an existing scaffold is
+    unaffected).
 - **`autumn doctor` SQLite awareness** — a SQLite app is no longer nagged about a
   missing `pg_dump` or a non-`postgres://` URL.
+
+**Not in this slice — scaffold smoke tests on SQLite.** A scaffolded app still
+carries the **Postgres-shaped** (`#[ignore]`d) smoke test. A SQLite-native
+scaffold smoke harness needs the SQLite `TestDb` (a testcontainer) that lands
+with the runtime slice — until then there is no SQLite backend to run
+SQLite-dialect smoke SQL against, so the generated smoke test remains
+Postgres-shaped. Tracked under the runtime slice #1905.
 
 Everything in the support matrix marked **Planned** is *not* in this slice: the
 runtime refuses SQLite at boot (`db.rs` `build_pool` → `UnsupportedBackend`,
@@ -274,15 +282,18 @@ Additional generator shapes are refused on SQLite:
 - **`generate auth` / `generate mailer`** are rejected on a SQLite app at
   generate time — their scaffolds emit Postgres-shaped models and store code with
   no working SQLite mapping yet, so they are refused before any files are written
-  rather than emitted as output that breaks on SQLite. Tracked in #1927.
+  rather than emitted as output that breaks on SQLite. This is a **generate-time**
+  refusal only — `generate destroy`/revert of an existing scaffold still works.
+  Tracked in #1927.
 
-> **Scaffold `--unique`-violation smoke test.** The generated-scaffold smoke test
-> that asserts a duplicate-`unique` rejection is still **Postgres-shaped** — it
-> uses `TRUNCATE … RESTART IDENTITY` and runs only under `cargo test -- --ignored`
-> (it is `#[ignore]`d), so it is not part of the SQLite generate path yet. The
-> backend-aware scaffold smoke tests that ship in this slice cover the SQLite
-> generate path; making the unique-violation smoke test backend-aware is tracked
-> in #1927.
+> **Scaffold smoke tests are still Postgres-shaped.** The generated-scaffold smoke
+> test (including the duplicate-`unique` rejection) uses
+> `autumn_web::test::TestDb`, a **Postgres-only** testcontainer, and
+> `TRUNCATE … RESTART IDENTITY`, and runs only under `cargo test -- --ignored`
+> (it is `#[ignore]`d). There is no SQLite `TestDb` yet — it lands with the
+> runtime slice (#1905) — so a scaffolded SQLite app still carries the
+> Postgres-shaped smoke test rather than a SQLite-native one. A backend-aware
+> scaffold smoke harness is deferred to the runtime slice #1905.
 
 ### Migration mechanics on SQLite
 
