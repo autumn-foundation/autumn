@@ -420,8 +420,9 @@ fn live_slot_marker(cfg: &ResolvedDeployConfig) -> String {
     format!("{}/shared/live-slot", cfg.app_dir)
 }
 
-/// Remote marker file recording the PREVIOUS live release — its absolute dir and
-/// the slot it runs on, stored as `{dir}\t{slot}` — so an on-demand rollback
+/// Remote marker file recording the PREVIOUS live release — its absolute dir, the
+/// slot it runs on, and the loopback port it actually listens on, stored as
+/// `{dir}\t{slot}\t{port}` (older markers omit the trailing port) — so a rollback
 /// returns to the release `current` pointed at before the last promote, instead
 /// of inferring it from release-dir mtimes (which is wrong after an
 /// A→B→rollback→A→deploy-C history). Written whenever `current` is repointed to a
@@ -561,7 +562,11 @@ pub fn first_deploy_ops(
             "enable-now",
             format!("systemctl enable --now {unit_name}.service"),
         )),
-        DeployOp::Run(record_live_slot(cfg, plan.candidate_slot)),
+        DeployOp::Run(record_live_slot(
+            cfg,
+            plan.candidate_slot,
+            plan.candidate_port,
+        )),
         // A first deploy has no previous release: clear any stale previous-release
         // marker so an on-demand rollback correctly reports NoPreviousRelease
         // rather than pointing at a since-removed release from a prior lifecycle.
@@ -676,7 +681,7 @@ pub fn cutover_ops(
         // live slot) as the new "previous release" so a later rollback returns to
         // it. Must run BEFORE `link-current` repoints the symlink, since it reads
         // the pre-repoint `current` target.
-        DeployOp::Run(record_previous_release(cfg, plan.live_slot)),
+        DeployOp::Run(record_previous_release(cfg, plan.live_slot, plan.live_port)),
         DeployOp::Run(RemoteCommand::new(
             "link-current",
             format!(
@@ -685,7 +690,11 @@ pub fn cutover_ops(
                 shell_quote(&current)
             ),
         )),
-        DeployOp::Run(record_live_slot(cfg, plan.candidate_slot)),
+        DeployOp::Run(record_live_slot(
+            cfg,
+            plan.candidate_slot,
+            plan.candidate_port,
+        )),
         DeployOp::Run(RemoteCommand::new(
             "drain-old",
             format!("systemctl disable --now {live_unit}.service"),
@@ -793,8 +802,9 @@ pub struct RollbackTarget {
 /// Reads the explicit **previous-release marker** (`shared/previous-release`),
 /// written whenever `current` was last repointed to a different release (a
 /// redeploy cutover or a prior rollback). The marker stores the previous release's
-/// absolute dir AND the slot it runs on as `{dir}\t{slot}`, so the two are always
-/// consistent — unlike the old mtime scan, which broke after an
+/// absolute dir, the slot it runs on, AND the loopback port it actually listens on
+/// as `{dir}\t{slot}\t{port}`, so all three are always consistent — unlike the old
+/// mtime scan, which broke after an
 /// A→B→rollback→A→deploy-C history (the mtime-newest non-current dir is B, but the
 /// true prior-live release is A). Returns [`DeployExecError::NoPreviousRelease`]
 /// when the marker is absent or empty (a first deploy clears it, and a deployment
@@ -810,9 +820,9 @@ pub fn resolve_rollback_target(
     public_port: u16,
     exec: &impl DeployExecutor,
 ) -> Result<RollbackTarget, DeployExecError> {
-    // Emit `prev:<abs-dir>\t<slot>` from the persisted previous-release marker, or
-    // `none` when the marker is absent/empty. Both the dir and the slot come from
-    // the SAME marker line, so they can never disagree.
+    // Emit `prev:<abs-dir>\t<slot>\t<port>` from the persisted previous-release
+    // marker, or `none` when the marker is absent/empty. The dir, slot, and port all
+    // come from the SAME marker line, so they can never disagree.
     let shell = format!(
         "prev=$(cat {marker} 2>/dev/null); \
          if [ -z \"$prev\" ]; then printf 'none'; else printf 'prev:%s' \"$prev\"; fi",
@@ -823,7 +833,7 @@ pub fn resolve_rollback_target(
     let Some(rest) = stdout.strip_prefix("prev:") else {
         return Err(DeployExecError::NoPreviousRelease);
     };
-    let mut parts = rest.splitn(2, '\t');
+    let mut parts = rest.splitn(3, '\t');
     let release_dir = parts.next().unwrap_or_default().trim().to_owned();
     if release_dir.is_empty() {
         return Err(DeployExecError::NoPreviousRelease);
@@ -831,10 +841,19 @@ pub fn resolve_rollback_target(
     // The marker records the previous release's OWN slot directly (dir + slot are
     // consistent), so no `other_slot` inference is needed.
     let slot = canonical_slot(parts.next().unwrap_or(SLOT_BLUE).trim());
+    // Use the port the previous release ACTUALLY listens on, persisted in the
+    // marker at its deploy time — not `slot_app_port(current server.port, slot)`,
+    // which is wrong if a deploy changed `server.port` since. A marker predating
+    // the port field (older 2-field format) falls back to the derived port so
+    // parsing never fails.
+    let port = parts
+        .next()
+        .and_then(|p| p.trim().parse::<u16>().ok())
+        .unwrap_or_else(|| slot_app_port(public_port, slot));
     Ok(RollbackTarget {
         release_dir,
         slot,
-        port: slot_app_port(public_port, slot),
+        port,
     })
 }
 
@@ -882,6 +901,15 @@ pub fn rollback_ops(
     // OTHER one.
     let rolled_back_unit = slot_unit_name(&cfg.service_name, other_slot(target.slot));
     let current = cfg.current_symlink();
+    // Fallback port for the being-rolled-back-from (former-live) slot, used only if
+    // its live-slot marker predates the port field. Reconstruct the public port
+    // from `target.port` (= `slot_app_port(public, target.slot)`) and re-derive the
+    // other slot's port; in the normal path `record_previous_release` copies the
+    // real port straight from the live-slot marker and ignores this.
+    let public_port = target
+        .port
+        .saturating_sub(if target.slot == SLOT_GREEN { 2 } else { 1 });
+    let former_live_fallback_port = slot_app_port(public_port, other_slot(target.slot));
     vec![
         DeployOp::Run(RemoteCommand::new(
             "restart-previous",
@@ -896,7 +924,11 @@ pub fn rollback_ops(
         // repoints the symlink, since it reads the pre-repoint `current` target.
         // The former-live slot is `other_slot(target.slot)` (the slot traffic just
         // moved away from).
-        DeployOp::Run(record_previous_release(cfg, other_slot(target.slot))),
+        DeployOp::Run(record_previous_release(
+            cfg,
+            other_slot(target.slot),
+            former_live_fallback_port,
+        )),
         DeployOp::Run(RemoteCommand::new(
             "link-current",
             format!(
@@ -905,7 +937,7 @@ pub fn rollback_ops(
                 shell_quote(&current)
             ),
         )),
-        DeployOp::Run(record_live_slot(cfg, target.slot)),
+        DeployOp::Run(record_live_slot(cfg, target.slot, target.port)),
         DeployOp::Run(RemoteCommand::new(
             "readiness-gate",
             readiness_poll_shell(target.port, cfg.readiness_timeout_secs),
@@ -927,36 +959,66 @@ fn loopback_upstream(port: u16) -> String {
     format!("127.0.0.1:{port}")
 }
 
-/// Command that records which slot now serves live traffic (read by the next
-/// redeploy's [`detect_deploy_mode`]).
-fn record_live_slot(cfg: &ResolvedDeployConfig, slot: &str) -> RemoteCommand {
+/// Command that records which slot now serves live traffic AND the loopback
+/// `port` its unit was rendered with, as `{slot}\t{port}` (read by the next
+/// redeploy's [`detect_deploy_mode`], and copied into the previous-release marker
+/// by [`record_previous_release`] so a later rollback targets the real listener).
+///
+/// The port is persisted because it is `slot_app_port(current server.port, slot)`
+/// computed AT THIS deploy — correct at deploy time even if a later deploy changes
+/// `server.port`, which would make re-deriving it from the then-current config
+/// wrong. Readers that only need the slot parse the FIRST field and tolerate the
+/// older slot-only format.
+fn record_live_slot(cfg: &ResolvedDeployConfig, slot: &str, port: u16) -> RemoteCommand {
     RemoteCommand::new(
         "record-live-slot",
         format!(
-            "printf '%s' {} > {}",
+            "printf '%s\\t%s' {} {} > {}",
             shell_quote(slot),
+            port,
             shell_quote(&live_slot_marker(cfg))
         ),
     )
 }
 
-/// Command that records the release being replaced (its absolute dir + the `slot`
-/// it runs on) as the new "previous release", read by a later on-demand rollback's
-/// [`resolve_rollback_target`]. It reads the CURRENT symlink's target — the
-/// release that is live right now, about to be replaced — so it MUST run before
-/// the `link-current` op repoints the symlink. `slot` is the slot that release
-/// runs on (the live slot on a redeploy; the former-live slot on a rollback), so
-/// the marker's dir and slot are always consistent. If `current` is somehow absent
-/// the marker is left untouched (a rollback then degrades to no-previous-release
-/// rather than pointing at a bogus dir).
-fn record_previous_release(cfg: &ResolvedDeployConfig, slot: &str) -> RemoteCommand {
+/// Command that records the release being replaced (its absolute dir + the slot
+/// AND loopback port it runs on) as the new "previous release", stored as
+/// `{dir}\t{slot}\t{port}` and read by a later on-demand rollback's
+/// [`resolve_rollback_target`].
+///
+/// The dir comes from the CURRENT symlink's target — the release live right now,
+/// about to be replaced — so this MUST run before the `link-current` op repoints
+/// the symlink. The slot and port are copied from the CURRENT live-slot marker
+/// (which still describes the being-replaced release, since `record_live_slot`
+/// overwrites it only AFTER this op), so the previous-release marker carries that
+/// release's REAL listener port — the port its unit was actually rendered with,
+/// which may differ from `slot_app_port(current server.port, slot)` if a deploy
+/// changed `server.port`.
+///
+/// `slot` and `fallback_port` (`= slot_app_port(current server.port, slot)`) are
+/// the values to fall back to when the live-slot marker is absent or predates the
+/// port field (older slot-only format), so parsing never fails. If `current` is
+/// somehow absent the marker is left untouched (a rollback then degrades to
+/// no-previous-release rather than pointing at a bogus dir).
+fn record_previous_release(
+    cfg: &ResolvedDeployConfig,
+    slot: &str,
+    fallback_port: u16,
+) -> RemoteCommand {
     RemoteCommand::new(
         "record-previous",
         format!(
             "prev=$(readlink {current} 2>/dev/null); \
-             if [ -n \"$prev\" ]; then printf '%s\\t%s' \"$prev\" {slot} > {marker}; fi",
+             live=$(cat {live_marker} 2>/dev/null); \
+             lslot=$(printf '%s' \"$live\" | cut -f1); \
+             lport=$(printf '%s' \"$live\" | cut -s -f2); \
+             [ -n \"$lslot\" ] || lslot={slot}; \
+             [ -n \"$lport\" ] || lport={fallback_port}; \
+             if [ -n \"$prev\" ]; then printf '%s\\t%s\\t%s' \"$prev\" \"$lslot\" \"$lport\" > {marker}; fi",
             current = shell_quote(&cfg.current_symlink()),
+            live_marker = shell_quote(&live_slot_marker(cfg)),
             slot = shell_quote(slot),
+            fallback_port = fallback_port,
             marker = shell_quote(&previous_release_marker(cfg)),
         ),
     )
@@ -1073,8 +1135,10 @@ pub fn detect_deploy_mode(
         .stdout
         .trim()
         .strip_prefix("redeploy:")
-        .map_or(DeployMode::First, |slot| DeployMode::Redeploy {
-            live_slot: canonical_slot(slot),
+        .map_or(DeployMode::First, |marker| DeployMode::Redeploy {
+            // The live-slot marker is `{slot}\t{port}` (older markers are slot-only);
+            // the slot is the FIRST tab-separated field either way.
+            live_slot: canonical_slot(marker.split('\t').next().unwrap_or(SLOT_BLUE)),
         }))
 }
 
@@ -1711,6 +1775,25 @@ mod tests {
             record_prev.contains("'blue'"),
             "the replaced release ran on the live (blue) slot: {record_prev}"
         );
+        // record-previous copies the being-replaced release's slot+port from the
+        // LIVE-SLOT marker (so it persists that release's REAL listener port),
+        // reading it before record-live-slot overwrites it.
+        assert!(
+            record_prev.contains("/srv/autumn/myapp/shared/live-slot")
+                && record_prev.contains("cut -f1")
+                && record_prev.contains("cut -s -f2"),
+            "record-previous sources slot+port from the live-slot marker: {record_prev}"
+        );
+        // record-live-slot writes `{slot}\t{port}` — the candidate (green) becomes
+        // live on its loopback port 3002.
+        let record_live = exec
+            .shell_for("record-live-slot")
+            .expect("record-live-slot ran");
+        assert!(
+            record_live.contains("printf '%s\\t%s' 'green' 3002")
+                && record_live.contains("/srv/autumn/myapp/shared/live-slot"),
+            "record-live-slot persists slot AND port: {record_live}"
+        );
 
         // Ordering invariants: migrate BEFORE the flip; the flip ONLY after a
         // passing readiness gate.
@@ -1919,9 +2002,10 @@ mod tests {
         // (the marker records the previous release's OWN slot), so rollback flips
         // back to blue (loopback 3001).
         let cfg = resolved();
+        // The marker carries dir + slot + the release's PERSISTED port (3-field).
         let exec = RecordingExecutor::new().with_stdout(
             "resolve-previous",
-            "prev:/srv/autumn/myapp/releases/20260713T090000Z\tblue",
+            "prev:/srv/autumn/myapp/releases/20260713T090000Z\tblue\t3001",
         );
         let target = resolve_rollback_target(&cfg, 3000, &exec).expect("previous release resolves");
         assert_eq!(target.slot, SLOT_BLUE);
@@ -1965,8 +2049,10 @@ mod tests {
             "record-previous reads current and writes the previous-release marker: {record_prev}"
         );
         assert!(
-            record_prev.contains("'green'"),
-            "the rolled-back-from release ran on the former-live (green) slot: {record_prev}"
+            record_prev.contains("'green'")
+                && record_prev.contains("/srv/autumn/myapp/shared/live-slot"),
+            "record-previous records the former-live slot and sources it from the \
+             live-slot marker: {record_prev}"
         );
 
         // The previous unit is brought up before the flip (the flip is health-
@@ -2046,7 +2132,7 @@ mod tests {
         // slot) → we roll back TO green and must drain the former-live BLUE slot.
         let exec = RecordingExecutor::new().with_stdout(
             "resolve-previous",
-            "prev:/srv/autumn/myapp/releases/20260713T090000Z\tgreen",
+            "prev:/srv/autumn/myapp/releases/20260713T090000Z\tgreen\t3002",
         );
         let target = resolve_rollback_target(&cfg, 3000, &exec).expect("previous release resolves");
         assert_eq!(target.slot, SLOT_GREEN, "roll back to the non-live slot");
@@ -2088,7 +2174,7 @@ mod tests {
         let cfg = resolved();
         let marker_a = "/srv/autumn/myapp/releases/20260101T000000Z"; // older, but the marker
         let exec = RecordingExecutor::new()
-            .with_stdout("resolve-previous", format!("prev:{marker_a}\tgreen"));
+            .with_stdout("resolve-previous", format!("prev:{marker_a}\tgreen\t3002"));
         let target =
             resolve_rollback_target(&cfg, 3000, &exec).expect("marker names a previous release");
         assert_eq!(target.release_dir, marker_a, "dir comes from the marker");
@@ -2097,9 +2183,8 @@ mod tests {
             "slot comes from the SAME marker line"
         );
         assert_eq!(
-            target.port,
-            slot_app_port(3000, SLOT_GREEN),
-            "port derives from the marker's slot"
+            target.port, 3002,
+            "port is read from the SAME marker line, not re-derived"
         );
         // The probe is a single read of the previous-release marker — no `ls -1dt`
         // mtime scan and no release-dir listing.
@@ -2126,6 +2211,76 @@ mod tests {
         assert!(
             matches!(err, DeployExecError::NoPreviousRelease),
             "expected NoPreviousRelease, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn rollback_uses_the_persisted_port_not_the_current_config() {
+        // Codex P2: the previous release's app port must come from the PERSISTED
+        // marker (the port it was actually rendered with at its deploy), NOT from
+        // re-deriving `slot_app_port(current server.port, slot)`. Simulate a
+        // server.port change since the previous deploy: the previous blue release
+        // bound loopback 3001 (public 3000 back then), but the CURRENT config's
+        // public port is 4000, so a re-derivation would wrongly yield 4001.
+        let cfg = resolved();
+        let current_public = 4000; // server.port changed since the previous deploy
+        let derived_now = slot_app_port(current_public, SLOT_BLUE);
+        assert_eq!(derived_now, 4001, "re-derivation would give the WRONG port");
+        // The marker carries the release's REAL port (3001), recorded at its deploy.
+        let exec = RecordingExecutor::new().with_stdout(
+            "resolve-previous",
+            "prev:/srv/autumn/myapp/releases/20260713T090000Z\tblue\t3001",
+        );
+        let target = resolve_rollback_target(&cfg, current_public, &exec)
+            .expect("previous release resolves");
+        assert_eq!(
+            target.port, 3001,
+            "RollbackTarget.port is the MARKER's port, not the re-derived one"
+        );
+        assert_ne!(
+            target.port, derived_now,
+            "the persisted port must win over the current-config derivation"
+        );
+
+        // The flip and readiness re-probe both target the persisted port (3001),
+        // so the proxy flips to the listener the previous unit actually binds.
+        let ops = rollback_ops(&cfg, &proxy(), &target);
+        run_ops(&ops, &exec).expect("recording executor never fails");
+        let flip = exec.shell_for("proxy-flip").expect("flip ran");
+        assert!(
+            flip.contains("--target '127.0.0.1:3001'") && !flip.contains("4001"),
+            "flip targets the persisted port, not the re-derived one: {flip}"
+        );
+        let gate = exec.shell_for("readiness-gate").expect("gate ran");
+        assert!(
+            gate.contains("127.0.0.1:3001/ready") && !gate.contains("4001"),
+            "readiness re-probe uses the persisted port: {gate}"
+        );
+        // The restart brings up the previous release's slot unit (blue).
+        let restart = exec.shell_for("restart-previous").expect("restart ran");
+        assert!(
+            restart.contains("enable --now myapp-blue.service"),
+            "restart targets the previous slot unit: {restart}"
+        );
+    }
+
+    #[test]
+    fn resolve_rollback_target_without_port_field_falls_back_to_derived() {
+        // Backward-compat: a previous-release marker written before the port field
+        // existed (2-field `{dir}\t{slot}`) must still parse — the port falls back
+        // to `slot_app_port(current server.port, slot)` rather than crashing.
+        let cfg = resolved();
+        let exec = RecordingExecutor::new().with_stdout(
+            "resolve-previous",
+            "prev:/srv/autumn/myapp/releases/20260713T090000Z\tblue",
+        );
+        let target =
+            resolve_rollback_target(&cfg, 3000, &exec).expect("legacy 2-field marker still parses");
+        assert_eq!(target.slot, SLOT_BLUE);
+        assert_eq!(
+            target.port,
+            slot_app_port(3000, SLOT_BLUE),
+            "a portless marker falls back to the derived port"
         );
     }
 
@@ -2398,9 +2553,20 @@ mod tests {
         let first = RecordingExecutor::new().with_stdout("detect-current", "first");
         assert_eq!(detect_deploy_mode(&cfg, &first).unwrap(), DeployMode::First);
         // `current` present + marker says green → redeploy onto blue candidate.
-        let redeploy = RecordingExecutor::new().with_stdout("detect-current", "redeploy:green");
+        // New-format live-slot marker is `{slot}\t{port}`: the slot is the FIRST
+        // field, the trailing port must not leak into the parsed slot.
+        let redeploy =
+            RecordingExecutor::new().with_stdout("detect-current", "redeploy:green\t3002");
         assert_eq!(
             detect_deploy_mode(&cfg, &redeploy).unwrap(),
+            DeployMode::Redeploy {
+                live_slot: SLOT_GREEN
+            }
+        );
+        // Backward-compat: an older slot-only marker (no port field) still parses.
+        let legacy = RecordingExecutor::new().with_stdout("detect-current", "redeploy:green");
+        assert_eq!(
+            detect_deploy_mode(&cfg, &legacy).unwrap(),
             DeployMode::Redeploy {
                 live_slot: SLOT_GREEN
             }
