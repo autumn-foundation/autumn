@@ -1686,6 +1686,12 @@ fn render_validation_attr(field: &Field, rule: &str) -> Result<String, String> {
             .trim()
             .parse::<u64>()
             .map_err(|_| "length validation bounds must be unsigned integers".to_owned())?;
+        if parsed > u64::from(u32::MAX) {
+            return Err(format!(
+                "length validation bounds must be at most {} (HTML length attributes fit a u32)",
+                u32::MAX
+            ));
+        }
         match key.trim() {
             "min" => min = Some(parsed),
             "max" => max = Some(parsed),

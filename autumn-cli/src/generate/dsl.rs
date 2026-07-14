@@ -833,6 +833,12 @@ fn parse_bound(value: &str, kind: FieldKind) -> Result<String, String> {
             let n = value
                 .parse::<u64>()
                 .map_err(|_| format!("length bound '{value}' must be a non-negative integer"))?;
+            if n > u64::from(u32::MAX) {
+                return Err(format!(
+                    "length bound '{value}' must be at most {} (HTML length attributes fit a u32)",
+                    u32::MAX
+                ));
+            }
             Ok(n.to_string())
         }
         FieldKind::I32 => {

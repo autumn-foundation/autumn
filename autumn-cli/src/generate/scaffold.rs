@@ -4426,17 +4426,11 @@ impl Html5Constraint {
         }
     }
 
-    /// The typed `a11y::TextField` builder-call form (e.g. `.minlength(3u64)`).
-    ///
-    /// Length bounds carry a `u64` suffix (not `u32`): the DSL normalizes
-    /// `String`/`Text` length bounds as `u64` with no `u32` ceiling (a bound
-    /// like `max=5000000000` is valid), so a `u32` literal would overflow and
-    /// fail to compile the generated app. `a11y::TextField::minlength`/`maxlength`
-    /// take `u64` to match.
+    /// The typed `a11y::TextField` builder-call form (e.g. `.minlength(3u32)`).
     fn builder_call(&self) -> String {
         match self {
-            Self::MinLength(v) => format!(".minlength({v}u64)"),
-            Self::MaxLength(v) => format!(".maxlength({v}u64)"),
+            Self::MinLength(v) => format!(".minlength({v}u32)"),
+            Self::MaxLength(v) => format!(".maxlength({v}u32)"),
             Self::Min(v) => format!(".min(\"{v}\")"),
             Self::Max(v) => format!(".max(\"{v}\")"),
             Self::StepAny => ".step(\"any\")".to_owned(),
@@ -4520,7 +4514,7 @@ fn html5_constraint_spec(field: &Field) -> Option<(&'static str, String)> {
 }
 
 /// The input `type` plus the typed `autumn_web::a11y::TextField` builder-call
-/// string (e.g. `.minlength(3u64).maxlength(120u64)`) for the routed `form_for`
+/// string (e.g. `.minlength(3u32).maxlength(120u32)`) for the routed `form_for`
 /// input path (#1706). Formats [`html5_constraint_parts`].
 fn html5_constraint_builder_calls(field: &Field) -> Option<(&'static str, String)> {
     let (input_type, parts) = html5_constraint_parts(field)?;

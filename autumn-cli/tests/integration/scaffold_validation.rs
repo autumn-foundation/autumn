@@ -196,10 +196,10 @@ fn form_inputs_carry_matching_html5_constraints() {
 
     // The constrained fields route through the typed `a11y::TextField`
     // primitive (#1706), so the HTML5 constraints are typed builder calls
-    // (`.minlength(3u64)`) rather than raw `<input>` attributes; the rendered
+    // (`.minlength(3u32)`) rather than raw `<input>` attributes; the rendered
     // element/attributes/values are unchanged, only their source spelling.
     assert!(
-        routes.contains(".minlength(3u64).maxlength(120u64)"),
+        routes.contains(".minlength(3u32).maxlength(120u32)"),
         "title must render minlength/maxlength:\n{routes}"
     );
     assert!(
@@ -215,23 +215,22 @@ fn form_inputs_carry_matching_html5_constraints() {
         "age must render type=number with min/max:\n{routes}"
     );
     assert!(
-        routes.contains(".maxlength(200u64)"),
+        routes.contains(".maxlength(200u32)"),
         "bio must render maxlength:\n{routes}"
     );
 }
 
-/// A `String`/`Text` length bound is a `u64` in the DSL with no `u32` ceiling
-/// (`max=5000000000` is a valid, in-`u64` bound), so the typed
-/// `a11y::TextField` length builder call must carry a `u64` suffix. A `u32`
-/// literal would overflow and fail to compile the generated app — the
-/// regression this guards (the routed `form_for` path previously emitted
-/// `.maxlength(5000000000u32)`).
+/// A `String`/`Text` length bound above `u32::MAX` is meaningless for an HTML
+/// length attribute (which fits a `u32`) and would otherwise reach the typed
+/// `a11y::TextField::maxlength(u32)` codegen as an overflowing `u32` literal
+/// that fails to compile the generated app. The generator rejects it up front
+/// at DSL parse time with an actionable message naming the `u32::MAX` limit.
 #[test]
-fn large_length_bound_emits_u64_not_overflowing_u32() {
+fn length_bound_above_u32_max_is_rejected() {
     let tmp = tempfile::tempdir().expect("tempdir");
     run_autumn_ok(tmp.path(), &["new", "validate-large-len-app"]);
     let project = tmp.path().join("validate-large-len-app");
-    run_autumn_ok(
+    let output = run_autumn(
         &project,
         &[
             "generate",
@@ -240,15 +239,38 @@ fn large_length_bound_emits_u64_not_overflowing_u32() {
             "title:String{max=5000000000}",
         ],
     );
+    assert!(
+        !output.status.success(),
+        "a >u32::MAX length bound must fail the scaffold"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("4294967295"),
+        "the error must name the u32::MAX limit:\n{stderr}"
+    );
+}
+
+/// A length bound exactly at `u32::MAX` is the largest bound that still fits an
+/// HTML length attribute, so it is accepted and emits a plain `u32` literal.
+#[test]
+fn length_bound_at_u32_max_is_accepted() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    run_autumn_ok(tmp.path(), &["new", "validate-max-len-app"]);
+    let project = tmp.path().join("validate-max-len-app");
+    run_autumn_ok(
+        &project,
+        &[
+            "generate",
+            "scaffold",
+            "Doc",
+            "title:String{max=4294967295}",
+        ],
+    );
     let routes = fs::read_to_string(project.join("src/routes/docs.rs")).unwrap();
     let title_input = slice_text_field(&routes, "title");
     assert!(
-        title_input.contains(".maxlength(5000000000u64)"),
-        "a >u32::MAX length bound must emit a u64 literal, not an overflowing u32:\n{title_input}"
-    );
-    assert!(
-        !title_input.contains(".maxlength(5000000000u32)"),
-        "the length builder must not emit an overflowing u32 literal:\n{title_input}"
+        title_input.contains(".maxlength(4294967295u32)"),
+        "a bound at u32::MAX must emit a plain u32 literal:\n{title_input}"
     );
 }
 
