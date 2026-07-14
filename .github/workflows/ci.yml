@@ -122,6 +122,12 @@ jobs:
           # conformance suite) here.
           cargo test -p autumn-web --features offline-sync --test integration_tests offline_sync
           cargo test -p autumn-web --features offline-sync --test integration_tests -- --ignored offline_sync_pg
+          # Nested has_many form atomic-save + persistence tests (#1346, AC5/AC7):
+          # testcontainer-backed `#[ignore]`d tests gated behind `test-support`
+          # (db + maud stay on as defaults). The `nested_form` filter selects the
+          # Docker-dependent cases in nested_form_atomic_save + the persisted
+          # nested_form_order_example tests and nothing else.
+          cargo test -p autumn-web --features test-support --test integration_tests -- --ignored nested_form
 
   coverage:
     name: Coverage

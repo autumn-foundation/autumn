@@ -419,6 +419,7 @@ pub mod job_tracking;
 /// Safe, method-aware link helpers: [`links::link_to`] anchors and
 /// [`links::button_to`] CSRF-protected action buttons.
 pub mod links;
+pub mod nested_form;
 pub mod payload_version;
 pub mod runtime_config;
 #[cfg(feature = "seed")]
@@ -493,6 +494,12 @@ pub use form::Changeset;
 pub use form::ChangesetForm;
 /// Trait implemented for all `validator::Validate` types to produce a [`Changeset`].
 pub use form::IntoChangeset;
+#[cfg(feature = "maud")]
+pub use nested_form::{InputsForOptions, RowScope, inputs_for, nested_row_fragment};
+/// Nested (`has_many`) form binding: parent + one child collection.
+pub use nested_form::{
+    NestedChangeset, NestedChangesetForm, NestedChild, NestedRow, decode_nested_urlencoded,
+};
 pub mod data;
 pub mod normalize;
 pub mod validation;

@@ -121,6 +121,10 @@ mod migrate_checksum_proptest;
 mod model_field_attrs;
 #[cfg(feature = "maud")]
 mod negotiate;
+#[cfg(all(feature = "db", feature = "test-support"))]
+mod nested_form_atomic_save;
+#[cfg(feature = "maud")]
+mod nested_form_order_example;
 #[cfg(feature = "offline-sync")]
 mod offline_sync_conformance;
 #[cfg(feature = "offline-sync")]
