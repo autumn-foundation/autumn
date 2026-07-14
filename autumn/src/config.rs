@@ -2576,6 +2576,43 @@ const fn default_jobs_redis_visibility_timeout_ms() -> u64 {
     30_000
 }
 
+/// Parent config paths whose child keys were already covered by strict
+/// validation BEFORE the #1890 schema-walk fix. Captured verbatim from
+/// `get_schema_keys()` on the pre-fix code (the walk aborted at
+/// `database.statement_timeout`, so only these parents were reachable). Used by
+/// the warn-first rollout: an unknown key whose PARENT is in this set hard-fails
+/// under `strict_config` exactly as before; every key the #1890 fix newly
+/// reveals is warned about instead (until `strict_config_enforce_all` promotes
+/// it). Transitional — removed when enforcement becomes the default.
+const PRE_1890_STRICT_PARENTS: &[&str] = &[
+    "",
+    "database",
+    "deploy",
+    "server",
+    "server.timeouts",
+    "server.tls",
+    "server.tls.acme",
+];
+
+/// Strips a leading `profile.<name>.` scope so a profile-nested key classifies by
+/// its real section, matching how `validate_toml` strips the profile prefix.
+fn strip_profile_scope(path: &str) -> &str {
+    path.strip_prefix("profile.")
+        .and_then(|rest| rest.split_once('.').map(|(_, tail)| tail))
+        .unwrap_or(path)
+}
+
+/// Whether an unknown-key error at `path` was already hard-failing before the
+/// #1890 fix (its parent path was in the pre-fix schema). If so it keeps
+/// hard-failing; otherwise it is a newly-covered section handled warn-first.
+fn unknown_key_was_previously_strict(path: &str) -> bool {
+    let effective = strip_profile_scope(path);
+    // A top-level key (no `.`) has the root schema as its parent, which is
+    // always validated.
+    let parent = effective.rfind('.').map_or("", |i| &effective[..i]);
+    PRE_1890_STRICT_PARENTS.contains(&parent)
+}
+
 impl AutumnConfig {
     /// Recursively extracts all valid configuration schema keys and nested fields.
     #[must_use]
@@ -2864,23 +2901,11 @@ impl AutumnConfig {
             .var("AUTUMN_SERVER__STRICT_CONFIG")
             .is_ok_and(|v| v == "true" || v == "1");
         if config.server.strict_config || is_strict_env {
-            let schema = Self::get_schema_keys();
-            let errors = Self::validate_toml(&toml_str, &schema);
-            if !errors.is_empty() {
-                let err_messages: Vec<String> = errors
-                    .into_iter()
-                    .map(|(path, sug)| {
-                        sug.map_or_else(
-                            || format!("unknown key \"{path}\""),
-                            |s| format!("unknown key \"{path}\" — did you mean \"{s}\"?"),
-                        )
-                    })
-                    .collect();
-                return Err(ConfigError::Validation(format!(
-                    "Strict config check failed. Unknown keys in configuration: {}",
-                    err_messages.join(", ")
-                )));
-            }
+            let enforce_all = config.server.strict_config_enforce_all
+                || env
+                    .var("AUTUMN_SERVER__STRICT_CONFIG_ENFORCE_ALL")
+                    .is_ok_and(|v| v == "true" || v == "1");
+            Self::run_strict_unknown_key_check(&toml_str, enforce_all)?;
         }
 
         // ── Deprecation channel (purely additive; never mutates `config`). ──────
@@ -2938,6 +2963,72 @@ impl AutumnConfig {
         }
 
         Ok(config)
+    }
+
+    /// Runs the strict unknown-key check against the merged `toml_str`.
+    ///
+    /// Unknown keys are partitioned by [`unknown_key_was_previously_strict`]:
+    /// keys whose section was already strictly validated before the #1890
+    /// schema-walk fix (or all keys when `enforce_all` is set) hard-fail; keys
+    /// in sections that only became covered by the fix are warned about but
+    /// tolerated for one release (warn-first rollout).
+    fn run_strict_unknown_key_check(toml_str: &str, enforce_all: bool) -> Result<(), ConfigError> {
+        let schema = Self::get_schema_keys();
+        let errors = Self::validate_toml(toml_str, &schema);
+
+        let mut hard_errors = Vec::new();
+        let mut warn_only = Vec::new();
+        for (path, sug) in errors {
+            if enforce_all || unknown_key_was_previously_strict(&path) {
+                hard_errors.push((path, sug));
+            } else {
+                warn_only.push((path, sug));
+            }
+        }
+
+        // Warn-first rollout (#1890): unknown keys in sections that only became
+        // strictly validated by the schema-walk fix are surfaced loudly but do
+        // NOT fail startup for one release, so configs that silently passed
+        // before keep booting. `eprintln!` guarantees visibility before the
+        // tracing subscriber is installed; the `tracing::warn!` keeps structured
+        // output for apps that pre-install one. Set
+        // `server.strict_config_enforce_all = true` (or
+        // AUTUMN_SERVER__STRICT_CONFIG_ENFORCE_ALL=1) to promote these to hard
+        // errors now.
+        for (path, sug) in &warn_only {
+            let hint = sug
+                .as_deref()
+                .map_or_else(String::new, |s| format!(" — did you mean \"{s}\"?"));
+            eprintln!(
+                "Warning: unknown configuration key \"{path}\"{hint}. It is ignored and \
+                 falls back to defaults. This will become a hard error in a future \
+                 release; set server.strict_config_enforce_all = true to enforce now."
+            );
+            tracing::warn!(
+                unknown_key = path.as_str(),
+                suggestion = sug.as_deref().unwrap_or(""),
+                "unknown configuration key in a section newly covered by strict \
+                 validation; ignored for now (warn-first rollout, #1890), will hard-fail \
+                 once enforcement is promoted"
+            );
+        }
+
+        if !hard_errors.is_empty() {
+            let err_messages: Vec<String> = hard_errors
+                .into_iter()
+                .map(|(path, sug)| {
+                    sug.map_or_else(
+                        || format!("unknown key \"{path}\""),
+                        |s| format!("unknown key \"{path}\" — did you mean \"{s}\"?"),
+                    )
+                })
+                .collect();
+            return Err(ConfigError::Validation(format!(
+                "Strict config check failed. Unknown keys in configuration: {}",
+                err_messages.join(", ")
+            )));
+        }
+        Ok(())
     }
 
     /// Helper method to expand `OAuth2` preset configurations and resolve credentials-backed values.
@@ -4610,6 +4701,17 @@ pub struct ServerConfig {
     /// Exit startup if any unknown config keys are found in autumn.toml/profiles.
     #[serde(default)]
     pub strict_config: bool,
+
+    /// When `strict_config` is enabled, also hard-fail on unknown keys in the
+    /// config sections that only became strictly validated by the #1890
+    /// schema-walk fix (everything except `server`, `deploy`, and `database`,
+    /// whose keys were already validated). Defaults to `false` for one release:
+    /// unknown keys in those newly-covered sections WARN loudly at startup
+    /// instead of failing, so configs that silently passed before keep booting.
+    /// Set to `true` to enforce immediately; a future release makes `true` the
+    /// default and removes this transitional gate.
+    #[serde(default)]
+    pub strict_config_enforce_all: bool,
 
     /// Seconds to wait for in-flight requests during graceful shutdown.
     /// Default: `30`.
@@ -6410,6 +6512,7 @@ impl Default for ServerConfig {
             port: default_port(),
             host: default_host(),
             strict_config: false,
+            strict_config_enforce_all: false,
             shutdown_timeout_secs: default_shutdown_timeout(),
             prestop_grace_secs: default_prestop_grace(),
             timeouts: RequestTimeoutsConfig::default(),
@@ -6906,7 +7009,19 @@ impl<'de> de::Deserializer<'de> for SchemaDeserializer {
     where
         V: Visitor<'de>,
     {
-        visitor.visit_str("")
+        // `deserialize_any` is the probe serde routes self-describing shapes
+        // through: `#[serde(untagged)]` enums, `flatten`, and free-form `Value`
+        // types all buffer via it. Feeding an EMPTY string made any untagged or
+        // custom parser that rejects "" abort the ENTIRE remaining struct walk —
+        // e.g. `deserialize_duration` (via the untagged `DurationOrStr`) rejects
+        // "" and, before this fix (#1890), silently dropped every config section
+        // declared after `database.statement_timeout` from the derived schema,
+        // disabling strict unknown-key validation for them. "0" is the most
+        // permissive scalar probe: it is a valid non-empty string AND parses as
+        // an integer/duration, so untagged string- and number-shaped parsers both
+        // accept it and traversal keeps descending. Mirrors the enum-tag fix in
+        // `deserialize_enum` (#1608).
+        visitor.visit_str("0")
     }
 
     fn deserialize_bool<V>(self, visitor: V) -> Result<V::Value, Self::Error>
@@ -7357,6 +7472,129 @@ mod tests {
         assert!(res.is_err());
         let err_str = format!("{:?}", res.err().unwrap());
         assert!(err_str.contains("primry_url"));
+    }
+
+    // 7a (#1890): a typo in a section that ONLY became strictly validated by the
+    // schema-walk fix (here `[log]`, declared after `database`) must WARN, not
+    // fail, during the one-release warn-first rollout.
+    #[test]
+    fn post_database_section_typo_warns_but_does_not_fail() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("autumn.toml");
+        std::fs::write(&config_path, "[log]\nbogus_zzz = true\n").unwrap();
+
+        let env = FakeEnv(
+            [
+                ("AUTUMN_SERVER__STRICT_CONFIG".to_owned(), "true".to_owned()),
+                (
+                    "AUTUMN_MANIFEST_DIR".to_owned(),
+                    temp.path().to_str().unwrap().to_owned(),
+                ),
+            ]
+            .into(),
+        );
+
+        let res = AutumnConfig::load_with_env(&env);
+        assert!(
+            res.is_ok(),
+            "a post-database section typo must warn (not fail) under warn-first rollout: {res:?}"
+        );
+    }
+
+    // 7b (#1890): with `strict_config_enforce_all` set, the SAME post-database
+    // typo is promoted to a hard error.
+    #[test]
+    fn post_database_section_typo_fails_under_enforce_all() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("autumn.toml");
+        std::fs::write(
+            &config_path,
+            "[server]\nstrict_config = true\nstrict_config_enforce_all = true\n\n[log]\nbogus_zzz = true\n",
+        )
+        .unwrap();
+
+        let env = FakeEnv(
+            [(
+                "AUTUMN_MANIFEST_DIR".to_owned(),
+                temp.path().to_str().unwrap().to_owned(),
+            )]
+            .into(),
+        );
+
+        let res = AutumnConfig::load_with_env(&env);
+        assert!(
+            res.is_err(),
+            "strict_config_enforce_all must hard-fail the post-database typo"
+        );
+        let err_str = format!("{:?}", res.err().unwrap());
+        assert!(
+            err_str.contains("bogus_zzz"),
+            "error should name the key: {err_str}"
+        );
+    }
+
+    // 7c (#1890 regression guard): sections that were strictly validated BEFORE
+    // the fix (here `[server]`) must keep hard-failing on unknown keys.
+    #[test]
+    fn pre_database_section_typo_still_hard_fails() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("autumn.toml");
+        std::fs::write(&config_path, "[server]\nbogus_zzz = true\n").unwrap();
+
+        let env = FakeEnv(
+            [
+                ("AUTUMN_SERVER__STRICT_CONFIG".to_owned(), "true".to_owned()),
+                (
+                    "AUTUMN_MANIFEST_DIR".to_owned(),
+                    temp.path().to_str().unwrap().to_owned(),
+                ),
+            ]
+            .into(),
+        );
+
+        let res = AutumnConfig::load_with_env(&env);
+        assert!(
+            res.is_err(),
+            "an unknown [server] key must still hard-fail (pre-fix strictness preserved)"
+        );
+        let err_str = format!("{:?}", res.err().unwrap());
+        assert!(
+            err_str.contains("bogus_zzz"),
+            "error should name the key: {err_str}"
+        );
+    }
+
+    // 7d (#1890): the `database.statement_timeout` duration field — whose empty
+    // probe used to abort the schema walk — still deserializes correctly at
+    // runtime, in both string and integer (milliseconds) forms.
+    #[test]
+    fn statement_timeout_duration_field_loads() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("autumn.toml");
+
+        std::fs::write(&config_path, "[database]\nstatement_timeout = \"30s\"\n").unwrap();
+        let env = FakeEnv(
+            [(
+                "AUTUMN_MANIFEST_DIR".to_owned(),
+                temp.path().to_str().unwrap().to_owned(),
+            )]
+            .into(),
+        );
+        let config =
+            AutumnConfig::load_with_env(&env).expect("config with duration string must load");
+        assert_eq!(
+            config.database.statement_timeout,
+            Some(std::time::Duration::from_secs(30))
+        );
+
+        // Integer form is interpreted as milliseconds.
+        std::fs::write(&config_path, "[database]\nstatement_timeout = 250\n").unwrap();
+        let config =
+            AutumnConfig::load_with_env(&env).expect("config with integer duration must load");
+        assert_eq!(
+            config.database.statement_timeout,
+            Some(std::time::Duration::from_millis(250))
+        );
     }
 
     #[test]

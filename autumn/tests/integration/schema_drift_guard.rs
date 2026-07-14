@@ -262,3 +262,26 @@ fn deploy_child_keys_are_strictly_validated() {
         "a bogus [deploy] child key must be rejected by strict validation, got: {errors:?}"
     );
 }
+
+/// #1890: config.rs-internal sections declared AFTER `database` used to vanish
+/// from the derived schema because the `statement_timeout` duration field
+/// aborted the `SchemaDeserializer` walk. The tolerant `deserialize_any` probe
+/// keeps the walk descending, so these sections now expose their child keys and
+/// the strict validator can flag typos in them.
+#[test]
+fn post_database_sections_are_now_schema_covered() {
+    let schema = AutumnConfig::get_schema_keys();
+    // Roots confirmed (from the regenerated snapshot) to be config.rs-internal
+    // structs that expand to child keys after the fix.
+    for root in ["log", "cache", "jobs", "telemetry"] {
+        assert!(
+            schema.get(root).is_some_and(|k| !k.is_empty()),
+            "[{root}] must have child keys after the #1890 fix; empty means the walk aborted before it"
+        );
+    }
+    let errors = AutumnConfig::validate_toml("[log]\nnot_a_real_key = true\n", &schema);
+    assert!(
+        errors.iter().any(|(p, _)| p == "log.not_a_real_key"),
+        "a bogus [log] child key must be flagged now, got: {errors:?}"
+    );
+}
