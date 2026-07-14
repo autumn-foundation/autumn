@@ -101,7 +101,7 @@ pub fn plan_migration_with_options(
             let existing_schema =
                 std::fs::read_to_string(project_root.join("src/schema.rs")).unwrap_or_default();
             (
-                add_columns_up_sql_for(backend, table, &fields, &existing_schema),
+                add_columns_up_sql_for(backend, table, &fields, &existing_schema)?,
                 add_columns_down_sql(table, &fields),
             )
         }
@@ -629,7 +629,9 @@ pub struct Post {
     }
 
     /// `Add…To…` on a `SQLite` app emits `SQLite`-valid column types
-    /// (`i64` -> `INTEGER`, not Postgres `BIGINT`).
+    /// (`i64` -> `INTEGER`, not Postgres `BIGINT`). Uses a *nullable* column
+    /// because `SQLite` rejects `ADD COLUMN … NOT NULL` without a default (see
+    /// `add_columns_migration_on_sqlite_rejects_not_null_without_default`).
     #[test]
     fn add_columns_migration_on_sqlite_emits_sqlite_types() {
         with_no_db_env(|| {
@@ -637,7 +639,7 @@ pub struct Post {
             let plan = plan_migration(
                 tmp.path(),
                 "AddViewsToPosts",
-                &["views:i64".into()],
+                &["views:Option<i64>".into()],
                 "20260427000000",
             )
             .unwrap();
@@ -648,10 +650,70 @@ pub struct Post {
             )
             .unwrap();
             assert!(
-                up.contains("ALTER TABLE posts ADD COLUMN views INTEGER NOT NULL"),
+                up.contains("ALTER TABLE posts ADD COLUMN views INTEGER NULL"),
                 "up.sql: {up}"
             );
             assert!(!up.contains("BIGINT"), "SQLite up.sql leaked BIGINT: {up}");
+        });
+    }
+
+    /// `Add…To…` on a `SQLite` app with a `NOT NULL` column and no default is
+    /// rejected at generate time (issue #1614 AC #4): `SQLite` rejects
+    /// `ALTER TABLE … ADD COLUMN … NOT NULL` without a `DEFAULT` once the table
+    /// has rows, and this command has no way to attach a column default, so the
+    /// generated migration would fail to apply. Mirrors the `--search`
+    /// reject-at-generate contract.
+    #[test]
+    fn add_columns_migration_on_sqlite_rejects_not_null_without_default() {
+        with_no_db_env(|| {
+            let tmp = sqlite_project();
+            let err = plan_migration(
+                tmp.path(),
+                "AddViewsToPosts",
+                &["views:i64".into()],
+                "20260427000000",
+            )
+            .unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                matches!(err, GenerateError::Config(_)),
+                "expected Config error, got: {err:?}"
+            );
+            assert!(
+                msg.contains("NOT NULL") && msg.contains("views") && msg.contains("posts"),
+                "message must name the column/table and the constraint: {msg}"
+            );
+            assert!(
+                msg.contains("nullable") || msg.contains("default"),
+                "message must be actionable (nullable / default): {msg}"
+            );
+        });
+    }
+
+    /// A *nullable* `NOT NULL`-free column is added without a default on
+    /// `SQLite`, while the reject above guards the `NOT NULL` case — together
+    /// they cover both branches of the `SQLite` `ADD COLUMN` gate.
+    #[test]
+    fn add_columns_migration_on_sqlite_allows_nullable_without_default() {
+        with_no_db_env(|| {
+            let tmp = sqlite_project();
+            let plan = plan_migration(
+                tmp.path(),
+                "AddNoteToPosts",
+                &["note:Option<String>".into()],
+                "20260427000000",
+            )
+            .unwrap();
+            plan.execute(Flags::default()).unwrap();
+            let up = fs::read_to_string(
+                tmp.path()
+                    .join("migrations/20260427000000_add_note_to_posts/up.sql"),
+            )
+            .unwrap();
+            assert!(
+                up.contains("ALTER TABLE posts ADD COLUMN note TEXT NULL"),
+                "up.sql: {up}"
+            );
         });
     }
 

@@ -153,6 +153,13 @@ pub fn plan_model_with_options(
     if backend == autumn_web::config::DatabaseBackend::Sqlite && !metadata.searchable().is_empty() {
         return Err(super::sqlite_search_unsupported_error());
     }
+    // A UUID primary key needs app-side id generation on SQLite (no
+    // `gen_random_uuid()`), which is part of the deferred runtime slice #1905;
+    // reject `--id uuid` on a SQLite app at generate time rather than emit a
+    // `TEXT PRIMARY KEY` column that would accept NULL/omitted ids (AC #4).
+    if backend == autumn_web::config::DatabaseBackend::Sqlite && options.id_type == IdType::Uuid {
+        return Err(super::sqlite_uuid_pk_unsupported_error());
+    }
 
     let snake_name = snake(name);
     let table = pluralize(&snake_name);
@@ -2750,6 +2757,96 @@ mod tests {
                     "SQLite schema.rs leaked `{leak}`: {schema}"
                 );
             }
+        });
+    }
+
+    /// `generate model --id uuid` on a `SQLite` app is rejected at generate time
+    /// citing #1905 (issue #1614 AC #4): `SQLite` has no `gen_random_uuid()` and
+    /// the generated `New*` insert type omits `#[id]` fields, so a `TEXT PRIMARY
+    /// KEY` column would accept NULL/omitted ids. App-side UUID generation is
+    /// deferred to the runtime slice #1905.
+    #[test]
+    fn sqlite_app_uuid_primary_key_is_rejected_citing_1905() {
+        with_no_db_env(|| {
+            let tmp = project_with_db_url("sqlite://app.db");
+            let err = plan_model_with_options(
+                tmp.path(),
+                "Post",
+                &["title:String".into()],
+                "20260427000000",
+                &ModelOptions {
+                    id_type: IdType::Uuid,
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                matches!(err, GenerateError::Config(_)),
+                "expected Config error, got: {err:?}"
+            );
+            assert!(msg.contains("1905"), "must cite issue #1905: {msg}");
+            assert!(
+                msg.contains("SQLite") && msg.contains("UUID"),
+                "message must be actionable: {msg}"
+            );
+        });
+    }
+
+    /// The default INTEGER primary key still works on a `SQLite` app — only the
+    /// uuid key is gated, so `generate model` without `--id` is unaffected.
+    #[test]
+    fn sqlite_app_integer_primary_key_still_works() {
+        with_no_db_env(|| {
+            let tmp = project_with_db_url("sqlite://app.db");
+            let plan = plan_model_with_options(
+                tmp.path(),
+                "Post",
+                &["title:String".into()],
+                "20260427000000",
+                &ModelOptions::default(),
+            )
+            .expect("default INTEGER primary key must still generate on SQLite");
+            plan.execute(Flags::default()).unwrap();
+            let up = fs::read_to_string(
+                tmp.path()
+                    .join("migrations/20260427000000_create_posts/up.sql"),
+            )
+            .unwrap();
+            assert!(
+                up.contains("id INTEGER PRIMARY KEY AUTOINCREMENT"),
+                "up.sql: {up}"
+            );
+        });
+    }
+
+    /// Regression guard: `generate model --id uuid` on a Postgres app is
+    /// unchanged — the uuid gate is SQLite-only.
+    #[test]
+    fn postgres_app_uuid_primary_key_is_unchanged() {
+        with_no_db_env(|| {
+            let tmp = project_with_db_url("postgres://localhost/app");
+            let plan = plan_model_with_options(
+                tmp.path(),
+                "Post",
+                &["title:String".into()],
+                "20260427000000",
+                &ModelOptions {
+                    id_type: IdType::Uuid,
+                    ..Default::default()
+                },
+            )
+            .expect("uuid primary key must still generate on Postgres");
+            plan.execute(Flags::default()).unwrap();
+            let up = fs::read_to_string(
+                tmp.path()
+                    .join("migrations/20260427000000_create_posts/up.sql"),
+            )
+            .unwrap();
+            assert!(
+                up.contains("id UUID PRIMARY KEY DEFAULT gen_random_uuid()"),
+                "up.sql: {up}"
+            );
         });
     }
 

@@ -113,6 +113,61 @@ pub fn sqlite_search_unsupported_error() -> GenerateError {
     )
 }
 
+/// The generate-time rejection for a UUID primary key (`--id uuid`) on a
+/// `SQLite`-backed app (`SQLite` foundation, issue #1614 AC #4).
+///
+/// Postgres emits `UUID PRIMARY KEY DEFAULT gen_random_uuid()`, so ids are
+/// server-generated. `SQLite` has no `uuid` type nor a `gen_random_uuid()`
+/// default, and the `#[model]` macro's generated `New*` insert type omits
+/// `#[id]` fields — so on `SQLite` an inserted row would get a NULL/omitted id
+/// (a non-integer `PRIMARY KEY` is not implicitly `NOT NULL` in `SQLite`).
+/// Making it work needs app-side UUID generation in the repository insert
+/// codegen, which is runtime-adjacent and belongs to the deferred `SQLite`
+/// runtime slice (issue #1905). Rather than emit a `TEXT PRIMARY KEY` column
+/// that silently accepts NULL ids, generation fails here with an actionable
+/// message (AC #4).
+#[must_use]
+pub fn sqlite_uuid_pk_unsupported_error() -> GenerateError {
+    GenerateError::Config(
+        "UUID primary keys (--id uuid) are not yet supported on SQLite apps; Postgres uses \
+         `UUID PRIMARY KEY DEFAULT gen_random_uuid()`, but SQLite has no uuid type nor a \
+         gen_random_uuid() default, and the generated `New*` insert type omits `#[id]` \
+         fields — so inserted rows would get NULL/omitted ids. App-side UUID generation is \
+         part of the deferred SQLite runtime slice, tracked in \
+         https://github.com/madmax983/autumn/issues/1905 — re-run without `--id uuid` to use \
+         the default INTEGER PRIMARY KEY AUTOINCREMENT, or target a Postgres database."
+            .to_owned(),
+    )
+}
+
+/// The generate-time rejection for an `ALTER TABLE … ADD COLUMN … NOT NULL`
+/// with no `DEFAULT` on a `SQLite`-backed app (`SQLite` foundation, issue #1614
+/// AC #4).
+///
+/// `SQLite` rejects that statement at DDL time once the target table already
+/// has rows (`Cannot add a NOT NULL column with default value NULL`), so a
+/// generated `Add<Field>To<Table>` migration would fail to apply. The
+/// `generate migration Add…To…` command has no way to attach a column
+/// `DEFAULT`, so the only safe shapes on `SQLite` are a nullable column or a
+/// column with a default — neither of which this invocation produced. Rather
+/// than emit DDL that breaks on `SQLite`, generation fails here with an
+/// actionable message (AC #4).
+///
+/// Note: this limit is specific to `ALTER TABLE ADD COLUMN`. A `NOT NULL`
+/// column inside a `CREATE TABLE` (the `generate model` path) is fine on
+/// `SQLite` and is unaffected.
+#[must_use]
+pub fn sqlite_add_not_null_without_default_error(table: &str, column: &str) -> GenerateError {
+    GenerateError::Config(format!(
+        "cannot add NOT NULL column `{column}` to table `{table}` on a SQLite app: SQLite \
+         rejects `ALTER TABLE {table} ADD COLUMN {column} … NOT NULL` without a DEFAULT once \
+         the table has rows (\"Cannot add a NOT NULL column with default value NULL\"). Make \
+         the field nullable (e.g. `{column}:Option<…>`) or give it a default so the column \
+         can be added safely. (A NOT NULL column is fine inside CREATE TABLE — this limit is \
+         specific to ALTER TABLE ADD COLUMN.)"
+    ))
+}
+
 /// Common flags shared by every `generate` subcommand.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Flags {

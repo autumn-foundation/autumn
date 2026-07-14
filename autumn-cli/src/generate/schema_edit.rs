@@ -14,6 +14,7 @@ use sha2::{Digest, Sha256};
 
 use autumn_web::config::DatabaseBackend;
 
+use super::GenerateError;
 use super::dsl::{Field, FieldConstraints, FieldKind, IdType};
 
 /// Append a `pub mod <name>;` line to a `mod.rs` file, returning the new
@@ -605,26 +606,48 @@ fn fields_with_existing_schema_columns(
 /// other, already-existing column from an earlier migration (issue #1032
 /// review follow-up).
 // Retained as a Postgres-default convenience wrapper for the test suite; the
-// backend-aware `add_columns_up_sql_for` is what production calls.
+// backend-aware `add_columns_up_sql_for` is what production calls. The Postgres
+// path never rejects, so this unwraps the `Ok` for terse test assertions.
 #[cfg(test)]
 #[must_use]
 pub fn add_columns_up_sql(table: &str, fields: &[Field], existing_schema: &str) -> String {
     add_columns_up_sql_for(DatabaseBackend::Postgres, table, fields, existing_schema)
+        .expect("Postgres ADD COLUMN generation never rejects")
 }
 
 /// [`add_columns_up_sql`] for a specific database `backend` (issue #1614). The
 /// Postgres path stays byte-for-byte identical; the `SQLite` path emits
 /// `SQLite`-valid column types via [`super::dsl::Field::sql_column_type_for`].
-#[must_use]
+///
+/// # Errors
+/// Returns a generate-time rejection (issue #1614 AC #4) when the `backend` is
+/// `SQLite` and a `NOT NULL` column has no default: `SQLite` rejects
+/// `ALTER TABLE … ADD COLUMN … NOT NULL` without a `DEFAULT` once the table has
+/// rows, so the migration would fail to apply. `generate migration Add…To…`
+/// has no way to attach a column default, so every `NOT NULL` added column is
+/// rejected on `SQLite` — the user must make the field nullable (or move it
+/// into the table's `CREATE TABLE`, where `NOT NULL` is fine on `SQLite`). The
+/// Postgres path never rejects and stays byte-for-byte identical.
 pub fn add_columns_up_sql_for(
     backend: DatabaseBackend,
     table: &str,
     fields: &[Field],
     existing_schema: &str,
-) -> String {
+) -> Result<String, GenerateError> {
     let collision_fields = fields_with_existing_schema_columns(fields, existing_schema, table);
     let mut out = String::new();
     for f in fields {
+        // SQLite rejects `ALTER TABLE … ADD COLUMN … NOT NULL` without a
+        // DEFAULT (issue #1614 AC #4). This path carries no per-field default,
+        // so any NOT NULL added column is rejected at generate time rather than
+        // emitting DDL that breaks on SQLite. Postgres is unaffected (its
+        // output stays byte-for-byte identical), and a NOT NULL column inside
+        // CREATE TABLE (the `generate model` path) is likewise fine on SQLite.
+        if backend == DatabaseBackend::Sqlite && !f.nullable {
+            return Err(super::sqlite_add_not_null_without_default_error(
+                table, &f.name,
+            ));
+        }
         if !f.nullable {
             let _ = writeln!(
                 out,
@@ -668,7 +691,7 @@ pub fn add_columns_up_sql_for(
             out.push_str(&unique_index_sql(table, &f.name, &collision_fields));
         }
     }
-    out
+    Ok(out)
 }
 
 /// `down.sql` companion to [`add_columns_up_sql`].
