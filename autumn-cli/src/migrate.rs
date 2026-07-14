@@ -1109,50 +1109,69 @@ pub fn resolve_shard_database_urls_from_sources<F>(
 where
     F: Fn(&str) -> Result<String, std::env::VarError>,
 {
+    // Thin wrapper over the fallible core: preserve the historical
+    // print-and-exit behavior for command paths (`autumn migrate`, `db backup`,
+    // …) that expect a `Vec` and abort on a malformed shard. Callers that must
+    // NOT exit the process (e.g. `autumn doctor`, which needs to emit a JSON
+    // `CheckResult` instead) call `try_resolve_shard_database_urls_from_sources`
+    // directly and map the `Err` to a failing check.
+    try_resolve_shard_database_urls_from_sources(env_var, table).unwrap_or_else(|msg| {
+        eprintln!("\u{2717} {msg}");
+        std::process::exit(1);
+    })
+}
+
+/// Fallible core of [`resolve_shard_database_urls_from_sources`].
+///
+/// Resolves `(name, primary_url)` for every `[[database.shards]]` entry (TOML +
+/// `AUTUMN_DATABASE__SHARDS__*` env overrides), returning `Err(message)` on a
+/// malformed shard (non-table entry, missing `name`/`primary_url`, or a
+/// duplicate shard name) instead of printing and exiting the process. The
+/// message carries no leading `✗` marker so callers can render it however they
+/// like; the exiting wrapper prepends the marker to keep its stderr output
+/// byte-identical.
+pub fn try_resolve_shard_database_urls_from_sources<F>(
+    env_var: F,
+    table: Option<&toml::Table>,
+) -> Result<Vec<(String, String)>, String>
+where
+    F: Fn(&str) -> Result<String, std::env::VarError>,
+{
     const MAX_ENV_SHARDS: usize = 64;
 
-    let mut shards: Vec<(String, String)> = table
+    let mut shards: Vec<(String, String)> = Vec::new();
+    if let Some(entries) = table
         .and_then(|table| table.get("database"))
         .and_then(toml::Value::as_table)
         .and_then(|database| database.get("shards"))
         .and_then(toml::Value::as_array)
-        .map(|entries| {
-            // Fail fast on a malformed `[[database.shards]]` entry rather than
-            // silently dropping it: the runtime config loader rejects the same
-            // config, so skipping a misspelled shard here would let `autumn
-            // migrate` "succeed" while leaving that shard unmigrated.
-            entries
-                .iter()
-                .enumerate()
-                .map(|(i, entry)| {
-                    let shard = entry.as_table().unwrap_or_else(|| {
-                        eprintln!("\u{2717} [[database.shards]] entry {i} is not a table.");
-                        std::process::exit(1);
-                    });
-                    let name = shard
-                        .get("name")
-                        .and_then(toml::Value::as_str)
-                        .unwrap_or_else(|| {
-                            eprintln!(
-                                "\u{2717} [[database.shards]] entry {i} is missing a string `name`."
-                            );
-                            std::process::exit(1);
-                        });
-                    let url = shard
-                        .get("primary_url")
-                        .and_then(toml::Value::as_str)
-                        .unwrap_or_else(|| {
-                            eprintln!(
-                                "\u{2717} [[database.shards]] entry {i} ({name:?}) is missing a \
-                                 string `primary_url`."
-                            );
-                            std::process::exit(1);
-                        });
-                    (name.to_owned(), url.to_owned())
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+    {
+        // Fail on a malformed `[[database.shards]]` entry rather than silently
+        // dropping it: the runtime config loader rejects the same config, so
+        // skipping a misspelled shard here would let `autumn migrate` "succeed"
+        // while leaving that shard unmigrated.
+        for (i, entry) in entries.iter().enumerate() {
+            let shard = entry
+                .as_table()
+                .ok_or_else(|| format!("[[database.shards]] entry {i} is not a table."))?;
+            let name = shard
+                .get("name")
+                .and_then(toml::Value::as_str)
+                .ok_or_else(|| {
+                    format!("[[database.shards]] entry {i} is missing a string `name`.")
+                })?;
+            let url = shard
+                .get("primary_url")
+                .and_then(toml::Value::as_str)
+                .ok_or_else(|| {
+                    format!(
+                        "[[database.shards]] entry {i} ({name:?}) is missing a string \
+                         `primary_url`."
+                    )
+                })?;
+            shards.push((name.to_owned(), url.to_owned()));
+        }
+    }
 
     for i in 0..MAX_ENV_SHARDS {
         let name_var = format!("AUTUMN_DATABASE__SHARDS__{i}__NAME");
@@ -1178,15 +1197,14 @@ where
     let mut seen = std::collections::HashSet::new();
     for (name, _) in &shards {
         if !seen.insert(name.as_str()) {
-            eprintln!(
-                "\u{2717} Duplicate shard name {name:?} in [[database.shards]] / \
+            return Err(format!(
+                "Duplicate shard name {name:?} in [[database.shards]] / \
                  AUTUMN_DATABASE__SHARDS__* — shard names must be unique."
-            );
-            std::process::exit(1);
+            ));
         }
     }
 
-    shards
+    Ok(shards)
 }
 
 /// Resolve `database.startup_wait_secs` from env and config, mirroring the
@@ -2988,6 +3006,67 @@ primary_url = "postgres://toml:5432/app"
     #[test]
     fn shard_urls_empty_without_shards() {
         assert!(resolve_shard_database_urls_from_sources(no_env, None).is_empty());
+    }
+
+    #[test]
+    fn try_shard_urls_ok_matches_exiting_variant() {
+        let table = toml::from_str::<toml::Table>(
+            r#"
+[[database.shards]]
+name = "shard0"
+primary_url = "postgres://shard0:5432/app"
+"#,
+        )
+        .unwrap();
+        // The fallible core returns the same successful result the exiting wrapper
+        // does, so command paths keep identical behavior.
+        assert_eq!(
+            try_resolve_shard_database_urls_from_sources(no_env, Some(&table)).unwrap(),
+            vec![("shard0".to_owned(), "postgres://shard0:5432/app".to_owned())],
+        );
+    }
+
+    #[test]
+    fn try_shard_urls_missing_primary_url_returns_err_not_exit() {
+        // A malformed `[[database.shards]]` entry (missing `primary_url`) makes the
+        // exiting variant `std::process::exit(1)`. The fallible core must instead
+        // return `Err` so `autumn doctor` can render a failing check rather than
+        // terminating before emitting JSON.
+        let table = toml::from_str::<toml::Table>(
+            r#"
+[[database.shards]]
+name = "shard0"
+"#,
+        )
+        .unwrap();
+        let err = try_resolve_shard_database_urls_from_sources(no_env, Some(&table))
+            .expect_err("a shard missing primary_url must be an Err, not a process exit");
+        assert!(
+            err.contains("primary_url"),
+            "error must name the missing field: {err}"
+        );
+    }
+
+    #[test]
+    fn try_shard_urls_duplicate_name_returns_err() {
+        let table = toml::from_str::<toml::Table>(
+            r#"
+[[database.shards]]
+name = "dup"
+primary_url = "postgres://a:5432/app"
+
+[[database.shards]]
+name = "dup"
+primary_url = "postgres://b:5432/app"
+"#,
+        )
+        .unwrap();
+        let err = try_resolve_shard_database_urls_from_sources(no_env, Some(&table))
+            .expect_err("duplicate shard names must be an Err");
+        assert!(
+            err.contains("Duplicate shard name"),
+            "error must flag the duplicate: {err}"
+        );
     }
 
     // ── deep_merge_toml / profile overlay ──────────────────────────────────

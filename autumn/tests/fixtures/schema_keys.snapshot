@@ -25,6 +25,15 @@ database.slow_query_threshold
 database.startup_wait_secs
 database.statement_timeout
 database.url
+deploy
+deploy.app_dir
+deploy.app_name
+deploy.host
+deploy.keep_releases
+deploy.readiness_timeout_secs
+deploy.service_name
+deploy.ssh_port
+deploy.user
 dev
 health
 http

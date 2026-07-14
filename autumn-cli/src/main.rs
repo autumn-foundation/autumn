@@ -12,6 +12,7 @@ mod credentials;
 mod data;
 mod db;
 mod db_pull;
+mod deploy;
 mod dev;
 mod dev_loop_bench;
 mod dev_loop_scaling;
@@ -524,6 +525,20 @@ enum Commands {
     ///   autumn release init --target docker-compose
     #[command(subcommand, verbatim_doc_comment)]
     Release(ReleaseCommands),
+
+    /// Push-button, zero-downtime deploys to a VPS (issue #1607).
+    ///
+    /// Run from the project root. `check` runs a local preflight, `plan` and
+    /// `rollback` print dry-run plans. Real remote execution lands in a
+    /// follow-up; configure the target under `[deploy]` in autumn.toml.
+    ///
+    /// # Examples
+    ///
+    ///   autumn deploy check
+    ///   autumn deploy plan
+    ///   autumn deploy rollback
+    #[command(subcommand, verbatim_doc_comment)]
+    Deploy(DeployCommands),
 
     /// Simulate a signed webhook request to the local application.
     #[command(subcommand, verbatim_doc_comment)]
@@ -1793,6 +1808,27 @@ enum ReleaseCommands {
     },
 }
 
+/// Subcommands for `autumn deploy`.
+#[derive(Subcommand)]
+enum DeployCommands {
+    /// Run the deploy preflight and report pass/fail.
+    ///
+    /// Checks SSH reachability, signing-secret presence, database URL, and that
+    /// `migrate check` is clean. Exits non-zero if any check fails. Also runs
+    /// (config-gated) as a section of `autumn doctor`.
+    Check,
+
+    /// Print the systemd unit and the ordered zero-downtime deploy plan.
+    ///
+    /// Pure dry-run — renders the plan without touching anything remote.
+    Plan,
+
+    /// Print the rollback plan (dry-run).
+    ///
+    /// Live rollback lands in a follow-up; this slice prints the plan only.
+    Rollback,
+}
+
 /// Subcommands for `autumn generate`.
 #[derive(Subcommand)]
 enum GenerateCommands {
@@ -2848,6 +2884,7 @@ fn run_command(command: Commands) {
             ),
         },
         Commands::Release(cmd) => run_release_command(cmd),
+        Commands::Deploy(cmd) => run_deploy_command(&cmd),
         Commands::Token(cmd) => match cmd {
             TokenCommands::Issue {
                 principal_id,
@@ -3320,6 +3357,18 @@ fn run_release_command(cmd: ReleaseCommands) {
                 split_workers,
             });
         }
+    }
+}
+
+fn run_deploy_command(cmd: &DeployCommands) {
+    let action = match cmd {
+        DeployCommands::Check => deploy::DeployAction::Check,
+        DeployCommands::Plan => deploy::DeployAction::Plan,
+        DeployCommands::Rollback => deploy::DeployAction::Rollback,
+    };
+    if let Err(e) = deploy::run(action) {
+        eprintln!("autumn deploy: {e}");
+        std::process::exit(1);
     }
 }
 

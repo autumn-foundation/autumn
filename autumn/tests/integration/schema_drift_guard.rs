@@ -223,3 +223,42 @@ fn schema_leaf_paths_contains_known_paths() {
          if this changed, revisit the guard's coverage assumptions"
     );
 }
+
+/// Regression guard for the `[deploy]` strict-validation fix.
+///
+/// `DeployConfig` is a config.rs-internal struct with a fixed, known schema, so
+/// the strict unknown-key validator MUST descend into `[deploy]` and reject a
+/// typo like `[deploy] app_dr = "…"`. This only holds because `deploy` is
+/// declared before `database` in `AutumnConfig` — `DatabaseConfig`'s
+/// `deserialize_with` duration field aborts the `SchemaDeserializer` traversal
+/// for every field after it (see the doc comment on `AutumnConfig::deploy`). If
+/// someone moves `deploy` below `database`, its child keys silently vanish from
+/// the schema and this test fails.
+#[test]
+fn deploy_child_keys_are_strictly_validated() {
+    let leaves = AutumnConfig::schema_leaf_paths();
+    for key in [
+        "deploy.host",
+        "deploy.user",
+        "deploy.ssh_port",
+        "deploy.app_name",
+        "deploy.app_dir",
+        "deploy.service_name",
+        "deploy.readiness_timeout_secs",
+        "deploy.keep_releases",
+    ] {
+        assert!(
+            leaves.contains(key),
+            "{key} must be a schema leaf so strict validation descends into [deploy]; \
+             if this fails, `deploy` was likely moved below `database` in AutumnConfig"
+        );
+    }
+
+    // End-to-end: the strict validator flags an unknown child key under [deploy].
+    let schema = AutumnConfig::get_schema_keys();
+    let errors = AutumnConfig::validate_toml("[deploy]\napp_dr = \"/srv/app\"\n", &schema);
+    assert!(
+        errors.iter().any(|(path, _)| path == "deploy.app_dr"),
+        "a bogus [deploy] child key must be rejected by strict validation, got: {errors:?}"
+    );
+}

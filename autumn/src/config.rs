@@ -968,6 +968,36 @@ pub struct AutumnConfig {
     #[serde(default)]
     pub server: ServerConfig,
 
+    /// Push-button VPS deploy settings (`[deploy]` section, issue #1607).
+    ///
+    /// Operator-facing configuration for `autumn deploy` — the SSH-reachable
+    /// target host plus the remote install layout and rollout tuning knobs.
+    /// Top-level (not nested under `[server]`) because it describes *where and
+    /// how* the app is deployed, not how the running server behaves.
+    ///
+    /// Absent by default (`None`), so an app that never runs `autumn deploy`
+    /// is unaffected. A bare `[deploy]` table is valid at rest — `host` is only
+    /// required when a deploy actually runs, enforced by
+    /// [`DeployConfig::validate`].
+    ///
+    /// # Field ordering (load-bearing — do not move below `database`)
+    ///
+    /// `deploy` is declared here, before [`database`](Self::database), so that
+    /// [`get_schema_keys`](Self::get_schema_keys)'s `SchemaDeserializer`
+    /// traversal recurses into [`DeployConfig`]'s child keys and the strict
+    /// unknown-key validator (`validate_toml` / `server.strict_config` /
+    /// `autumn check --config`) rejects a typo like `[deploy] app_dr = "…"`.
+    /// `DatabaseConfig` has a `deserialize_with` duration field
+    /// (`statement_timeout`, via the untagged [`deserialize_duration`] parser)
+    /// whose parser rejects the `SchemaDeserializer`'s placeholder value and
+    /// returns an error, which aborts the remainder of `AutumnConfig`'s field
+    /// traversal — so any section declared *after* `database` is recorded only
+    /// as an opaque root leaf, never descended into. Keeping `deploy` ahead of
+    /// `database` sidesteps that abort. The regression guard
+    /// `deploy_child_keys_are_strictly_validated` fails if this ordering breaks.
+    #[serde(default)]
+    pub deploy: Option<DeployConfig>,
+
     /// Database connection settings (URL, pool size, timeouts).
     #[serde(default)]
     pub database: DatabaseConfig,
@@ -1196,6 +1226,107 @@ pub struct AutumnConfig {
     /// reads/writes still work through `Deref`/`DerefMut`.
     #[serde(default)]
     pub alerts: Box<crate::alerts::AlertConfig>,
+}
+
+/// Push-button VPS deploy settings (`[deploy]` section, issue #1607).
+///
+/// Describes the SSH-reachable target server and the remote install layout for
+/// `autumn deploy`'s zero-downtime rollout. Everything except `host` has a
+/// sensible default, and `app_name`/`app_dir`/`service_name` are resolved from
+/// the project's package name at deploy time (not during deserialization) so an
+/// unset value stays `None` here.
+///
+/// # `autumn.toml` example
+///
+/// ```toml
+/// [deploy]
+/// host = "203.0.113.10"      # required at deploy time; SSH-reachable address
+/// user = "deploy"            # SSH user (default: "root")
+/// ssh_port = 22              # SSH port (default: 22)
+/// app_name = "myapp"         # default: the crate's package name
+/// app_dir = "/srv/myapp"     # default: /srv/autumn/{app_name}
+/// service_name = "myapp"     # systemd unit name; default: {app_name}
+/// readiness_timeout_secs = 60 # readiness window before rollback (default: 60)
+/// keep_releases = 3          # releases retained on the host (default: 3)
+/// ```
+#[derive(Debug, Clone, Deserialize)]
+pub struct DeployConfig {
+    /// SSH-reachable address (hostname or IP) of the target server.
+    ///
+    /// Required when a deploy actually runs (`autumn deploy`), but `None` is
+    /// valid at rest so a bare `[deploy]` table parses. Enforced by
+    /// [`validate`](Self::validate).
+    #[serde(default)]
+    pub host: Option<String>,
+
+    /// SSH user to connect as. Default: `"root"`.
+    #[serde(default = "default_deploy_user")]
+    pub user: String,
+
+    /// SSH port on the target host. Default: `22`.
+    #[serde(default = "default_deploy_ssh_port")]
+    pub ssh_port: u16,
+
+    /// Application name used to derive remote paths and the service unit.
+    /// Resolved to the project's package name when unset (at deploy time, not
+    /// during deserialization).
+    #[serde(default)]
+    pub app_name: Option<String>,
+
+    /// Remote install directory. Resolved to `/srv/autumn/{app_name}` when
+    /// unset (at deploy time).
+    #[serde(default)]
+    pub app_dir: Option<String>,
+
+    /// systemd unit name. Resolved to `{app_name}` when unset (at deploy time).
+    #[serde(default)]
+    pub service_name: Option<String>,
+
+    /// Bounded readiness window, in seconds, the new release has to report
+    /// `/ready` before the deploy rolls back. Default: `60`.
+    #[serde(default = "default_deploy_readiness_timeout_secs")]
+    pub readiness_timeout_secs: u64,
+
+    /// Number of prior releases retained on the host for rollback. Default: `3`.
+    #[serde(default = "default_deploy_keep_releases")]
+    pub keep_releases: u32,
+}
+
+impl Default for DeployConfig {
+    fn default() -> Self {
+        Self {
+            host: None,
+            user: default_deploy_user(),
+            ssh_port: default_deploy_ssh_port(),
+            app_name: None,
+            app_dir: None,
+            service_name: None,
+            readiness_timeout_secs: default_deploy_readiness_timeout_secs(),
+            keep_releases: default_deploy_keep_releases(),
+        }
+    }
+}
+
+impl DeployConfig {
+    /// Validate the `[deploy]` section for a context that actually runs a deploy.
+    ///
+    /// A bare `[deploy]` table is valid at rest, but a deploy needs a target:
+    /// this rejects a missing or blank `host` with an actionable message so the
+    /// operator knows exactly which key to set.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when `host` is unset or empty.
+    pub fn validate(&self) -> Result<(), String> {
+        match self.host.as_deref() {
+            Some(host) if !host.trim().is_empty() => Ok(()),
+            _ => Err(
+                "[deploy] requires a target host: set `[deploy] host = \"<address>\"` in \
+                      autumn.toml to the SSH-reachable hostname or IP of your server"
+                    .to_owned(),
+            ),
+        }
+    }
 }
 
 /// Observability configuration (`[observability]` section in `autumn.toml`).
@@ -3011,6 +3142,7 @@ impl AutumnConfig {
     /// Apply environment overrides using the provided env abstraction.
     pub fn apply_env_overrides_with_env(&mut self, env: &dyn Env) {
         self.apply_server_env_overrides_with_env(env);
+        self.apply_deploy_env_overrides_with_env(env);
         self.apply_database_env_overrides_with_env(env);
         self.apply_log_env_overrides_with_env(env);
         self.apply_telemetry_env_overrides_with_env(env);
@@ -3370,6 +3502,10 @@ impl AutumnConfig {
                 tls.handshake_timeout_secs = handshake;
             }
         }
+    }
+
+    fn apply_deploy_env_overrides_with_env(&mut self, env: &dyn Env) {
+        apply_deploy_env_overrides(&mut self.deploy, env);
     }
 
     fn apply_database_env_overrides_with_env(&mut self, env: &dyn Env) {
@@ -6006,6 +6142,52 @@ pub struct CompressionConfig {
     pub enabled: bool,
 }
 
+/// Apply `AUTUMN_DEPLOY__*` environment overrides to an optional deploy config.
+///
+/// `[deploy]` is a top-level optional section. This materializes it from the
+/// environment when any of its keys are set (seeding the documented defaults if
+/// the section was absent/`None`), so a CI/VPS deploy can keep the target host
+/// out of `autumn.toml` and drive it entirely through `AUTUMN_DEPLOY__*`. Env
+/// overrides win over any TOML-provided values.
+///
+/// Shared by [`AutumnConfig::load`] and `autumn doctor`'s deploy preflight so
+/// both surfaces resolve the identical deploy target (host, `ssh_port`, …) for the
+/// same environment + profile + TOML.
+// Exposed for autumn-cli's `autumn deploy` preflight (doctor) to reuse the deploy env-override logic; not yet a stable public API.
+#[doc(hidden)]
+pub fn apply_deploy_env_overrides(deploy: &mut Option<DeployConfig>, env: &dyn Env) {
+    const KEYS: [&str; 8] = [
+        "AUTUMN_DEPLOY__HOST",
+        "AUTUMN_DEPLOY__USER",
+        "AUTUMN_DEPLOY__SSH_PORT",
+        "AUTUMN_DEPLOY__APP_NAME",
+        "AUTUMN_DEPLOY__APP_DIR",
+        "AUTUMN_DEPLOY__SERVICE_NAME",
+        "AUTUMN_DEPLOY__READINESS_TIMEOUT_SECS",
+        "AUTUMN_DEPLOY__KEEP_RELEASES",
+    ];
+    if !KEYS.iter().any(|key| env.var(key).is_ok()) {
+        return;
+    }
+    let deploy = deploy.get_or_insert_with(DeployConfig::default);
+    parse_env_option_string(env, "AUTUMN_DEPLOY__HOST", &mut deploy.host);
+    parse_env_string(env, "AUTUMN_DEPLOY__USER", &mut deploy.user);
+    parse_env(env, "AUTUMN_DEPLOY__SSH_PORT", &mut deploy.ssh_port);
+    parse_env_option_string(env, "AUTUMN_DEPLOY__APP_NAME", &mut deploy.app_name);
+    parse_env_option_string(env, "AUTUMN_DEPLOY__APP_DIR", &mut deploy.app_dir);
+    parse_env_option_string(env, "AUTUMN_DEPLOY__SERVICE_NAME", &mut deploy.service_name);
+    parse_env(
+        env,
+        "AUTUMN_DEPLOY__READINESS_TIMEOUT_SECS",
+        &mut deploy.readiness_timeout_secs,
+    );
+    parse_env(
+        env,
+        "AUTUMN_DEPLOY__KEEP_RELEASES",
+        &mut deploy.keep_releases,
+    );
+}
+
 /// Parse an environment variable into a typed target, logging a warning on failure.
 fn parse_env<T: std::str::FromStr>(env: &dyn Env, key: &str, target: &mut T) {
     if let Ok(val) = env.var(key) {
@@ -6163,6 +6345,26 @@ const fn default_tls_reload_interval_secs() -> u64 {
 /// handshake while still shedding a stalled connection promptly.
 const fn default_tls_handshake_timeout_secs() -> u64 {
     10
+}
+
+/// Default SSH user for `[deploy]`.
+fn default_deploy_user() -> String {
+    "root".to_owned()
+}
+
+/// Default SSH port for `[deploy]`.
+const fn default_deploy_ssh_port() -> u16 {
+    22
+}
+
+/// Default readiness window (seconds) before an `autumn deploy` rolls back.
+const fn default_deploy_readiness_timeout_secs() -> u64 {
+    60
+}
+
+/// Default number of prior releases retained on the host for rollback.
+const fn default_deploy_keep_releases() -> u32 {
+    3
 }
 
 /// Default directory for the ACME account key and issued certificates
@@ -9538,6 +9740,176 @@ path = "/healthz"
         let mut config = AutumnConfig::default();
         config.apply_env_overrides_with_env(&env);
         assert!(config.server.tls.is_none());
+    }
+
+    // ── deploy (#1607) ────────────────────────────────────────────
+
+    #[test]
+    fn deploy_absent_is_none() {
+        // No [deploy] section → the field stays None so existing apps are
+        // unaffected.
+        let config = AutumnConfig::default();
+        assert!(config.deploy.is_none());
+        let parsed: AutumnConfig = toml::from_str("[server]\nport = 3000\n")
+            .expect("config without [deploy] should parse");
+        assert!(parsed.deploy.is_none());
+    }
+
+    #[test]
+    fn deploy_defaults_from_bare_table() {
+        // A bare [deploy] table materializes the section with every optional
+        // field at its documented default.
+        let config: AutumnConfig =
+            toml::from_str("[deploy]\n").expect("bare [deploy] table should parse");
+        let deploy = config.deploy.expect("deploy configured");
+        assert_eq!(deploy.host, None);
+        assert_eq!(deploy.user, "root");
+        assert_eq!(deploy.ssh_port, 22);
+        assert_eq!(deploy.app_name, None);
+        assert_eq!(deploy.app_dir, None);
+        assert_eq!(deploy.service_name, None);
+        assert_eq!(deploy.readiness_timeout_secs, 60);
+        assert_eq!(deploy.keep_releases, 3);
+    }
+
+    #[test]
+    fn deploy_full_table_parses() {
+        let config: AutumnConfig = toml::from_str(
+            r#"
+            [deploy]
+            host = "203.0.113.10"
+            user = "deploy"
+            ssh_port = 2222
+            app_name = "myapp"
+            app_dir = "/srv/myapp"
+            service_name = "myapp-web"
+            readiness_timeout_secs = 90
+            keep_releases = 5
+            "#,
+        )
+        .expect("full [deploy] table should parse");
+        let deploy = config.deploy.expect("deploy configured");
+        assert_eq!(deploy.host.as_deref(), Some("203.0.113.10"));
+        assert_eq!(deploy.user, "deploy");
+        assert_eq!(deploy.ssh_port, 2222);
+        assert_eq!(deploy.app_name.as_deref(), Some("myapp"));
+        assert_eq!(deploy.app_dir.as_deref(), Some("/srv/myapp"));
+        assert_eq!(deploy.service_name.as_deref(), Some("myapp-web"));
+        assert_eq!(deploy.readiness_timeout_secs, 90);
+        assert_eq!(deploy.keep_releases, 5);
+        assert!(deploy.validate().is_ok());
+    }
+
+    #[test]
+    fn deploy_validate_rejects_missing_host() {
+        // Missing host: a bare table is valid at rest but validate() rejects it.
+        let missing = DeployConfig::default();
+        let err = missing
+            .validate()
+            .expect_err("missing host must be rejected");
+        assert!(
+            err.contains("host"),
+            "error should name the missing key: {err}"
+        );
+
+        // Present-but-blank host is also rejected.
+        let blank = DeployConfig {
+            host: Some("   ".to_owned()),
+            ..DeployConfig::default()
+        };
+        assert!(blank.validate().is_err());
+
+        // A real host passes.
+        let ok = DeployConfig {
+            host: Some("example.com".to_owned()),
+            ..DeployConfig::default()
+        };
+        assert!(ok.validate().is_ok());
+    }
+
+    #[test]
+    fn env_override_materializes_deploy() {
+        // A CI/VPS deploy can keep the target host out of autumn.toml and drive
+        // the whole [deploy] section through AUTUMN_DEPLOY__* env vars.
+        let env = MockEnv::new()
+            .with("AUTUMN_DEPLOY__HOST", "203.0.113.10")
+            .with("AUTUMN_DEPLOY__USER", "deploy")
+            .with("AUTUMN_DEPLOY__SSH_PORT", "2222")
+            .with("AUTUMN_DEPLOY__APP_NAME", "myapp")
+            .with("AUTUMN_DEPLOY__APP_DIR", "/srv/myapp")
+            .with("AUTUMN_DEPLOY__SERVICE_NAME", "myapp-web")
+            .with("AUTUMN_DEPLOY__READINESS_TIMEOUT_SECS", "90")
+            .with("AUTUMN_DEPLOY__KEEP_RELEASES", "5");
+        let mut config = AutumnConfig::default();
+        assert!(config.deploy.is_none());
+        config.apply_env_overrides_with_env(&env);
+        let deploy = config.deploy.expect("env should materialize deploy");
+        assert_eq!(deploy.host.as_deref(), Some("203.0.113.10"));
+        assert_eq!(deploy.user, "deploy");
+        assert_eq!(deploy.ssh_port, 2222);
+        assert_eq!(deploy.app_name.as_deref(), Some("myapp"));
+        assert_eq!(deploy.app_dir.as_deref(), Some("/srv/myapp"));
+        assert_eq!(deploy.service_name.as_deref(), Some("myapp-web"));
+        assert_eq!(deploy.readiness_timeout_secs, 90);
+        assert_eq!(deploy.keep_releases, 5);
+        assert!(deploy.validate().is_ok());
+    }
+
+    #[test]
+    fn env_override_materializes_deploy_from_single_host() {
+        // Setting only AUTUMN_DEPLOY__HOST with no [deploy] in TOML seeds the
+        // section with defaults and fills in the host.
+        let env = MockEnv::new().with("AUTUMN_DEPLOY__HOST", "198.51.100.7");
+        let mut config = AutumnConfig::default();
+        assert!(config.deploy.is_none());
+        config.apply_env_overrides_with_env(&env);
+        let deploy = config.deploy.expect("env should materialize deploy");
+        assert_eq!(deploy.host.as_deref(), Some("198.51.100.7"));
+        // Remaining fields fall back to their documented defaults.
+        assert_eq!(deploy.user, "root");
+        assert_eq!(deploy.ssh_port, 22);
+        assert_eq!(deploy.readiness_timeout_secs, 60);
+        assert_eq!(deploy.keep_releases, 3);
+    }
+
+    #[test]
+    fn env_override_updates_existing_deploy_host() {
+        // An env var overrides just the host of a TOML-configured section,
+        // leaving the other keys intact.
+        let mut config: AutumnConfig = toml::from_str(
+            r#"
+            [deploy]
+            host = "toml-host"
+            user = "deploy"
+            ssh_port = 2200
+            "#,
+        )
+        .unwrap();
+        let env = MockEnv::new().with("AUTUMN_DEPLOY__HOST", "env-host");
+        config.apply_env_overrides_with_env(&env);
+        let deploy = config.deploy.expect("deploy configured");
+        assert_eq!(deploy.host.as_deref(), Some("env-host"));
+        assert_eq!(deploy.user, "deploy");
+        assert_eq!(deploy.ssh_port, 2200);
+    }
+
+    #[test]
+    fn env_override_parses_deploy_ssh_port_u16() {
+        let env = MockEnv::new()
+            .with("AUTUMN_DEPLOY__HOST", "example.com")
+            .with("AUTUMN_DEPLOY__SSH_PORT", "65535");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        let deploy = config.deploy.expect("env should materialize deploy");
+        assert_eq!(deploy.ssh_port, 65_535_u16);
+    }
+
+    #[test]
+    fn no_deploy_env_leaves_deploy_none() {
+        let env = MockEnv::new().with("AUTUMN_SERVER__PORT", "8080");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        assert!(config.deploy.is_none());
     }
 
     // ── server.tls.acme (#1608) ───────────────────────────────────

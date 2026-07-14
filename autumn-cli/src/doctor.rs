@@ -4,7 +4,7 @@
 //! reports each as ✅/⚠️/❌ with a one-line remediation hint, and exits with
 //! code 0 (all clear) or 1 (any failure detected).
 
-use autumn_web::config::ProcessRole;
+use autumn_web::config::{DeployConfig, ProcessRole};
 use serde::Serialize;
 use std::collections::{BTreeSet, HashMap, HashSet};
 
@@ -4059,6 +4059,88 @@ fn resolve_optional_signing_secret() -> Option<String> {
         })
 }
 
+/// Resolve the signing secret the deploy preflight should grade, from the SAME
+/// merged active-profile runtime table used for the deploy config and DB URL
+/// (base autumn.toml + `[profile.<env>]` + autumn-<env>.toml), env first. A
+/// secret supplied only in an active profile
+/// (`[profile.<env>].security.signing_secret` / autumn-<env>.toml) is invisible
+/// to the raw top-level `autumn.toml` that [`resolve_optional_signing_secret`]
+/// reads, so a raw-table lookup would report it MISSING even though
+/// `AutumnConfig::load()` and `autumn deploy check` see it. Never returns/prints
+/// the value except to the (secret-safe) grader. Env-var precedence matches the
+/// runtime loader.
+fn resolve_deploy_signing_secret(
+    merged: &toml::Table,
+    env: &dyn autumn_web::config::Env,
+) -> Option<String> {
+    if let Ok(val) = env.var("AUTUMN_SECURITY__SIGNING_SECRET")
+        && !val.is_empty()
+    {
+        return Some(val);
+    }
+    merged
+        .get("security")
+        .and_then(|s| s.get("signing_secret"))
+        .and_then(|ss| ss.get("secret"))
+        .and_then(toml::Value::as_str)
+        .filter(|v| !v.is_empty())
+        .map(std::borrow::ToOwned::to_owned)
+}
+
+/// Resolve the `previous_secrets` rotation entries the deploy preflight should
+/// grade, from the SAME merged active-profile runtime table used for the current
+/// signing secret. `previous_secrets` has no env override in the runtime loader
+/// (only `AUTUMN_SECURITY__SIGNING_SECRET` sets the current secret), so it is
+/// read from the merged table alone — matching what `AutumnConfig::load()` and
+/// `autumn deploy check` see. Never returns/prints the values except to the
+/// (secret-safe) grader.
+fn resolve_deploy_previous_signing_secrets(merged: &toml::Table) -> Vec<String> {
+    merged
+        .get("security")
+        .and_then(|s| s.get("signing_secret"))
+        .and_then(|ss| ss.get("previous_secrets"))
+        .and_then(toml::Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(toml::Value::as_str)
+                .map(std::borrow::ToOwned::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Whether any enabled runtime feature requires a configured Postgres pool at
+/// startup, resolved from the merged active-profile runtime table (env first).
+/// Mirrors the exact backend conditions the runtime enforces:
+/// - `jobs.backend = "postgres"` → `job::start_postgres_runtime` requires a pool.
+/// - `scheduler.backend = "postgres"` → `scheduler::coordinator_from_config`
+///   requires a pool.
+///
+/// Cache, channels, and idempotency have only in-memory/Redis backends (no
+/// Postgres variant), so they never require a DB pool.
+fn resolve_deploy_db_backed_runtime(
+    merged: &toml::Table,
+    env: &dyn autumn_web::config::Env,
+) -> bool {
+    let env_var = |key: &str| env.var(key).ok().filter(|value| !value.is_empty());
+
+    let jobs = merged.get("jobs").and_then(toml::Value::as_table);
+    let jobs_postgres = first_env(&env_var, &["AUTUMN_JOBS__BACKEND"])
+        .or_else(|| first_toml_string(jobs, &["backend"]))
+        .as_deref()
+        .map(str::trim)
+        == Some("postgres");
+
+    let scheduler = merged.get("scheduler").and_then(toml::Value::as_table);
+    let scheduler_postgres = first_env(&env_var, &["AUTUMN_SCHEDULER__BACKEND"])
+        .or_else(|| first_toml_string(scheduler, &["backend"]))
+        .as_deref()
+        .and_then(autumn_web::config::SchedulerBackend::from_env_value)
+        .is_some_and(|backend| backend == autumn_web::config::SchedulerBackend::Postgres);
+
+    jobs_postgres || scheduler_postgres
+}
+
 fn resolve_trusted_hosts() -> Vec<String> {
     if let Ok(val) = std::env::var("AUTUMN_SECURITY__TRUSTED_HOSTS__HOSTS") {
         return val
@@ -5535,6 +5617,80 @@ fn resolve_compression_enabled() -> bool {
     parse_enabled(&table).unwrap_or(false)
 }
 
+/// Map a shared `autumn deploy` preflight grader result into a doctor
+/// [`CheckResult`] under the given (deploy-namespaced) name. A passing grader
+/// becomes a `Pass`; a failing one becomes a `Fail` so `doctor --strict` treats
+/// a broken deploy target as a hard error, consistent with the other
+/// config-gated checks.
+fn deploy_preflight_result(
+    name: &'static str,
+    check: crate::deploy::PreflightCheck,
+) -> CheckResult {
+    CheckResult {
+        name,
+        status: if check.passed {
+            CheckStatus::Pass
+        } else {
+            CheckStatus::Fail
+        },
+        detail: Some(check.detail),
+        hint: check.hint,
+    }
+}
+
+/// Resolve the `[deploy]` doctor branch from the merged active-profile runtime
+/// table.
+///
+/// Returns `(Some(cfg), None)` when `[deploy]` is present and parses (run the
+/// preflight graders), `(None, None)` when `[deploy]` is absent (skip the
+/// preflight gracefully), and `(None, Some(fail))` when `[deploy]` is present
+/// but a field has the wrong type. That last case is the important one: dropping
+/// the parse error with `.ok()` would silently skip every deploy check while
+/// `autumn deploy` (which loads the same `[deploy]` via `AutumnConfig::load()`)
+/// fails on it — so `doctor --strict` would greenlight a config the deploy path
+/// cannot parse. The `[deploy]` schema carries no secrets, so echoing the serde
+/// error into the check detail is safe.
+fn resolve_deploy_doctor_config(
+    merged: &toml::Table,
+    env: &dyn autumn_web::config::Env,
+) -> (Option<DeployConfig>, Option<CheckResult>) {
+    // First resolve the merged-profile `[deploy]` table (base autumn.toml +
+    // [profile.<env>] + autumn-<env>.toml). A present-but-malformed table is a
+    // hard fail regardless of env, because `AutumnConfig::load()` also fails to
+    // deserialize it, so `autumn deploy` cannot run — surface it loudly instead
+    // of silently skipping.
+    let mut deploy_cfg = match merged.get("deploy").cloned() {
+        Some(value) => match value.try_into::<DeployConfig>() {
+            Ok(cfg) => Some(cfg),
+            Err(err) => {
+                return (
+                    None,
+                    Some(CheckResult {
+                        name: "deploy_config",
+                        status: CheckStatus::Fail,
+                        detail: Some(format!("[deploy] is present but invalid: {err}")),
+                        hint: Some(
+                            "Fix the [deploy] section in autumn.toml so its fields match the \
+                             expected types (see `autumn deploy check`)",
+                        ),
+                    }),
+                );
+            }
+        },
+        None => None,
+    };
+    // Apply `AUTUMN_DEPLOY__*` env overrides on top of the merged-profile value,
+    // exactly like `AutumnConfig::load()` does before `autumn deploy check`
+    // grades `config.deploy`. This makes doctor grade the SAME deploy target as
+    // `deploy check` for the same env + profile + TOML: an env-only
+    // `AUTUMN_DEPLOY__HOST` materializes `Some(DeployConfig)` (so the preflight
+    // runs instead of being skipped), and env values win over TOML. When no
+    // `[deploy]` TOML and no `AUTUMN_DEPLOY__*` env exist, this stays `None` and
+    // the preflight skips gracefully.
+    autumn_web::config::apply_deploy_env_overrides(&mut deploy_cfg, env);
+    (deploy_cfg, None)
+}
+
 // ─── Main entry point ─────────────────────────────────────────────────────────
 
 /// Run all doctor checks and report results.
@@ -5698,6 +5854,210 @@ pub fn run(opts: DoctorOptions) {
     tasks.push(Box::new(move || {
         check_trusted_hosts_impl(&trusted_hosts, is_production)
     }));
+
+    // 8-deploy. Deploy preflight (issue #1607). Config-gated: only runs when a
+    // `[deploy]` section is present, and skips gracefully otherwise. Reuses the
+    // exact graders behind `autumn deploy check`. The offline graders (signing
+    // secret, database URL, migrate check) always run when deploy is configured;
+    // the SSH-reachability network probe is gated behind `--online` so `doctor`
+    // stays offline and non-flaky by default, matching the ACME probes.
+    //
+    // Resolve `[deploy]` from the MERGED active-profile runtime table (base
+    // autumn.toml + [profile.<env>] + autumn-<env>.toml), exactly like the
+    // sibling profile-aware checks (queue pinning, ACME) and the runtime config
+    // loader — NOT the raw top-level `toml_table`. A `[deploy]` block supplied
+    // only by an active profile (`autumn-<env>.toml` / `[profile.<env>].deploy`)
+    // is invisible to the raw table, so a raw-table lookup would skip the deploy
+    // preflight entirely (or `--online` would probe the base host instead of the
+    // effective target) — grading a deploy config the runtime never loads.
+    let (deploy_canonical, deploy_selected, _) = resolve_active_profiles();
+    let merged_deploy_toml = get_merged_toml_table_runtime(&deploy_canonical, &deploy_selected);
+    // Distinguish "[deploy] absent" (skip the preflight gracefully) from
+    // "[deploy] present but malformed". Swallowing the parse error with `.ok()`
+    // would silently drop EVERY deploy check when a field has the wrong type
+    // (e.g. `ssh_port = "22"`, `keep_releases = -1`) — yet `autumn deploy` loads
+    // `AutumnConfig` and fails on the same table, so `doctor --strict` would
+    // greenlight a config the deploy path cannot parse. Surface a failing
+    // `deploy_config` check instead.
+    //
+    // `AUTUMN_DEPLOY__*` env overrides are then applied on top (env wins over
+    // TOML, and an env-only host materializes a deploy config), matching
+    // `AutumnConfig::load()` so doctor grades the same target as `deploy check`
+    // for an env-only or env-overridden deploy — instead of skipping or probing
+    // a stale/base host.
+    // Read AUTUMN_DEPLOY__* through the profile-aware `.env` overlay so doctor
+    // resolves the same deploy target as `autumn deploy check` (AutumnConfig::load
+    // layers dotenv). Real OS env still wins; fall back to bare OS env only if the
+    // overlay can't be built (a malformed `.env`), matching the TLS/offsite-backup checks.
+    let deploy_denv: Box<dyn autumn_web::config::Env> =
+        match autumn_web::dotenv::os_env_with_dotenv_for_profile(&deploy_canonical) {
+            Ok(e) => Box::new(e),
+            Err(_) => Box::new(autumn_web::config::OsEnv),
+        };
+    let (deploy_cfg, deploy_config_check) =
+        resolve_deploy_doctor_config(&merged_deploy_toml, deploy_denv.as_ref());
+    if let Some(check) = deploy_config_check {
+        tasks.push(Box::new(move || check));
+    }
+    if let Some(deploy_cfg) = deploy_cfg {
+        // Resolve the deploy signing secret from the SAME merged active-profile
+        // table used for `deploy_cfg` and the DB URL (env first, then
+        // `merged_deploy_toml`'s `security.signing_secret.secret`) — NOT the raw
+        // top-level `autumn.toml` that `resolve_optional_signing_secret` reads. A
+        // secret supplied only by the active profile is invisible to the raw
+        // table, so a raw lookup would report it MISSING even though
+        // `AutumnConfig::load()` and `autumn deploy check` see it.
+        let deploy_signing =
+            resolve_deploy_signing_secret(&merged_deploy_toml, deploy_denv.as_ref());
+        // Rotation secrets accepted during a grace window are validated at boot
+        // with the same rule as the current secret, so grade them here from the
+        // same merged table (no env override exists for `previous_secrets`).
+        let deploy_previous_signing = resolve_deploy_previous_signing_secrets(&merged_deploy_toml);
+        // Derive the deploy DB-URL preflight input from the SAME merged
+        // active-profile table used for `deploy_cfg` (base autumn.toml +
+        // [profile.<env>] + autumn-<env>.toml), exactly like the sibling
+        // profile-aware checks above — NOT the pre-merge `db_topology` built from
+        // the raw top-level `toml_table`. A database URL supplied only by the
+        // active profile (`[profile.<env>].database` / `autumn-<env>.toml`) is
+        // invisible to the raw table, so a raw-table lookup would fail
+        // `deploy_database_url` under `--strict` even though `AutumnConfig::load()`
+        // and `autumn deploy check` see it. Env-var precedence is preserved
+        // (`resolve_database_topology_from_sources` reads the overlay first, then
+        // the merged table). Resolve through `deploy_denv` — the profile-aware
+        // `.env` overlay — so a URL set only in `.env`/`.env.<profile>` is seen
+        // by doctor exactly as `AutumnConfig::load()`/`deploy check` see it,
+        // instead of the bare process env.
+        let deploy_db_topology = resolve_database_topology_from_sources(
+            |key| deploy_denv.var(key).ok().filter(|value| !value.is_empty()),
+            Some(&merged_deploy_toml),
+        );
+        // Shard-only apps declare no control `primary_url`/`url` but still have a
+        // usable database: `autumn migrate` targets each `[[database.shards]]`
+        // entry (see `migrate::build_targets`). Resolve the shard URLs through the
+        // SAME `deploy_denv` overlay + merged active-profile table, reusing the
+        // exact migrate resolver so preflight and the real migration step agree,
+        // and fall back to the first shard's primary URL when no control primary
+        // resolves. Only writable targets count — `database.replica_url` is
+        // excluded because `autumn migrate` cannot migrate against a replica. The
+        // grader never prints the value.
+        //
+        // Use the FALLIBLE shard resolver here: the exiting
+        // `resolve_shard_database_urls_from_sources` calls `std::process::exit(1)`
+        // on a malformed `[[database.shards]]` entry, which — running while
+        // BUILDING doctor tasks — would terminate `autumn doctor --json` before it
+        // emits its JSON result/summary, bypassing normal `CheckResult` reporting.
+        // Instead map an `Err` to a failing `deploy_database_url` check below so
+        // doctor still produces valid output. `autumn migrate` keeps its
+        // print-and-exit behavior via the thin wrapper.
+        //
+        // Lift the resolver into its own binding so it feeds BOTH the
+        // db-configured flag (shard presence) and the writable URL below.
+        let deploy_shards_result = crate::migrate::try_resolve_shard_database_urls_from_sources(
+            |key| deploy_denv.var(key),
+            Some(&merged_deploy_toml),
+        );
+        // Derive db-configured from resolved URL/shard presence, mirroring
+        // `deploy.rs` `collect_preflight` (`url || primary_url || replica_url ||
+        // has_shards()`) — NOT mere `[database]` table presence, which flips true
+        // on a tuning-only table (e.g. `pool_size`) and would falsely fail
+        // `deploy_database_url` for a config `deploy check` accepts. `primary_url`
+        // here folds `url`+`primary_url`. Computed BEFORE the writable-URL `.map()`
+        // below moves `primary_url` (this only borrows it via `.is_some()`).
+        let deploy_db_configured = deploy_db_topology.primary_url.is_some()
+            || deploy_db_topology.replica_url.is_some()
+            || deploy_shards_result
+                .as_ref()
+                .map(|shards| !shards.is_empty())
+                .unwrap_or(false);
+        let deploy_db_url_result = deploy_shards_result.map(|deploy_shards| {
+            deploy_db_topology
+                .primary_url
+                .or_else(|| deploy_shards.into_iter().next().map(|(_, url)| url))
+        });
+        // A DB-backed runtime feature (jobs.backend/scheduler.backend = postgres)
+        // requires a configured pool at startup, so a writable DB URL is required
+        // even with no migrations dir and no `[database]` section. Resolved from
+        // the SAME merged active-profile table so `doctor` and `deploy check`
+        // apply the identical DB-required rule.
+        let deploy_db_backed_runtime =
+            resolve_deploy_db_backed_runtime(&merged_deploy_toml, deploy_denv.as_ref());
+
+        // Host presence is validated OFFLINE (always, whenever `[deploy]` is
+        // configured): a `[deploy]` table with a missing/blank `host` makes
+        // `autumn deploy check` fail immediately, so default/offline `doctor
+        // --strict` must fail on it too rather than green-lighting a config the
+        // deploy path rejects. Only the actual TCP connect probe is gated behind
+        // `--online`.
+        let host = deploy_cfg.host.clone();
+        tasks.push(Box::new({
+            let host = host.clone();
+            move || {
+                deploy_preflight_result(
+                    "deploy_host",
+                    crate::deploy::grade_deploy_host_present(host.as_deref()),
+                )
+            }
+        }));
+        if opts.online {
+            let ssh_port = deploy_cfg.ssh_port;
+            tasks.push(Box::new(move || {
+                deploy_preflight_result(
+                    "deploy_ssh_reachability",
+                    crate::deploy::grade_ssh_reachability(
+                        host.as_deref(),
+                        ssh_port,
+                        std::time::Duration::from_secs(5),
+                    ),
+                )
+            }));
+        }
+
+        tasks.push(Box::new(move || {
+            deploy_preflight_result(
+                "deploy_signing_secret",
+                crate::deploy::grade_signing_secret(
+                    deploy_signing.as_deref(),
+                    &deploy_previous_signing,
+                    is_production,
+                ),
+            )
+        }));
+        match deploy_db_url_result {
+            Ok(deploy_db_url) => {
+                tasks.push(Box::new(move || {
+                    deploy_preflight_result(
+                        "deploy_database_url",
+                        crate::deploy::grade_database_url(
+                            deploy_db_url.as_deref(),
+                            std::path::Path::new("migrations"),
+                            deploy_db_configured,
+                            deploy_db_backed_runtime,
+                        ),
+                    )
+                }));
+            }
+            Err(msg) => {
+                // A malformed `[[database.shards]]` entry: surface it as a FAILING
+                // check instead of exiting the process, so `autumn doctor --json`
+                // still emits valid JSON with a clear, actionable failure.
+                tasks.push(Box::new(move || CheckResult {
+                    name: "deploy_database_url",
+                    status: CheckStatus::Fail,
+                    detail: Some(format!("[[database.shards]] is present but invalid: {msg}")),
+                    hint: Some(
+                        "Fix the [[database.shards]] entries in autumn.toml so each has a string \
+                         `name` and `primary_url` with unique names (see `autumn deploy check`)",
+                    ),
+                }));
+            }
+        }
+        tasks.push(Box::new(|| {
+            deploy_preflight_result(
+                "deploy_migrate_check",
+                crate::deploy::grade_migrate_check(std::path::Path::new("migrations")),
+            )
+        }));
+    }
 
     // 8a. Direct-HTTPS certificate readiness (issue #1603): validate
     // [server.tls] cert/key and warn on near-expiry / fail on expired.
@@ -13601,6 +13961,112 @@ redirect_uri = "http://localhost/callback"
         assert!(
             json.contains("security.rate_limit.trusted_proxies"),
             "JSON must contain the deprecated key path"
+        );
+    }
+
+    #[test]
+    fn deploy_doctor_config_absent_is_skipped() {
+        use autumn_web::config::MockEnv;
+        // No [deploy] table and no AUTUMN_DEPLOY__* env → no config parsed, no
+        // failing check (graceful skip).
+        let table: toml::Table = "".parse().unwrap();
+        let (cfg, check) = resolve_deploy_doctor_config(&table, &MockEnv::new());
+        assert!(cfg.is_none(), "absent [deploy] must not yield a config");
+        assert!(
+            check.is_none(),
+            "absent [deploy] must not emit a failing check"
+        );
+    }
+
+    #[test]
+    fn deploy_doctor_config_valid_parses() {
+        use autumn_web::config::MockEnv;
+        let table: toml::Table = "[deploy]\nhost = \"203.0.113.10\"\nssh_port = 2222\n"
+            .parse()
+            .unwrap();
+        let (cfg, check) = resolve_deploy_doctor_config(&table, &MockEnv::new());
+        assert!(check.is_none(), "valid [deploy] must not emit a fail check");
+        let cfg = cfg.expect("valid [deploy] must parse into a config");
+        assert_eq!(cfg.host.as_deref(), Some("203.0.113.10"));
+        assert_eq!(cfg.ssh_port, 2222);
+    }
+
+    #[test]
+    fn deploy_doctor_config_env_only_host_materializes_config() {
+        use autumn_web::config::MockEnv;
+        // No [deploy] in TOML, but AUTUMN_DEPLOY__HOST is set: doctor must
+        // materialize a deploy config (Some) so the preflight runs against that
+        // host instead of being skipped — matching `autumn deploy check`, which
+        // grades `AutumnConfig::load().deploy` (env applied).
+        let table: toml::Table = "".parse().unwrap();
+        let env = MockEnv::new()
+            .with("AUTUMN_DEPLOY__HOST", "203.0.113.99")
+            .with("AUTUMN_DEPLOY__SSH_PORT", "2201");
+        let (cfg, check) = resolve_deploy_doctor_config(&table, &env);
+        assert!(
+            check.is_none(),
+            "env-only deploy must not emit a fail check"
+        );
+        let cfg = cfg.expect("env-only AUTUMN_DEPLOY__HOST must materialize a config");
+        assert_eq!(cfg.host.as_deref(), Some("203.0.113.99"));
+        assert_eq!(cfg.ssh_port, 2201);
+    }
+
+    #[test]
+    fn deploy_doctor_config_env_overrides_toml_host() {
+        use autumn_web::config::MockEnv;
+        // A TOML host is present, but AUTUMN_DEPLOY__HOST wins — doctor grades
+        // the same effective target as `autumn deploy check`.
+        let table: toml::Table = "[deploy]\nhost = \"toml.example\"\nssh_port = 22\n"
+            .parse()
+            .unwrap();
+        let env = MockEnv::new().with("AUTUMN_DEPLOY__HOST", "env.example");
+        let (cfg, check) = resolve_deploy_doctor_config(&table, &env);
+        assert!(check.is_none());
+        let cfg = cfg.expect("config must be present");
+        assert_eq!(
+            cfg.host.as_deref(),
+            Some("env.example"),
+            "AUTUMN_DEPLOY__HOST must override the TOML host"
+        );
+        // Unset env fields fall back to the TOML value.
+        assert_eq!(cfg.ssh_port, 22);
+    }
+
+    #[test]
+    fn deploy_doctor_config_bad_type_fails_not_skipped() {
+        use autumn_web::config::MockEnv;
+        // `ssh_port` as a string is a present-but-invalid table: the old `.ok()`
+        // path silently skipped ALL deploy checks; now it must FAIL loudly.
+        let table: toml::Table = "[deploy]\nhost = \"h\"\nssh_port = \"22\"\n"
+            .parse()
+            .unwrap();
+        let (cfg, check) = resolve_deploy_doctor_config(&table, &MockEnv::new());
+        assert!(
+            cfg.is_none(),
+            "an invalid [deploy] must not yield a config to preflight"
+        );
+        let check = check.expect("an invalid [deploy] must emit a failing check");
+        assert_eq!(check.name, "deploy_config");
+        assert_eq!(check.status, CheckStatus::Fail);
+        assert!(
+            check.detail.unwrap().contains("present but invalid"),
+            "detail must explain the [deploy] table is present but invalid"
+        );
+    }
+
+    #[test]
+    fn deploy_doctor_config_negative_keep_releases_fails() {
+        use autumn_web::config::MockEnv;
+        // `keep_releases = -1` cannot deserialize into u32 → fail, not skip.
+        let table: toml::Table = "[deploy]\nhost = \"h\"\nkeep_releases = -1\n"
+            .parse()
+            .unwrap();
+        let (cfg, check) = resolve_deploy_doctor_config(&table, &MockEnv::new());
+        assert!(cfg.is_none());
+        assert_eq!(
+            check.expect("negative keep_releases must fail").status,
+            CheckStatus::Fail
         );
     }
 }
