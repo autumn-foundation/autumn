@@ -2682,6 +2682,19 @@ impl AppBuilder {
             return;
         }
 
+        // ── Migrate one-shot mode ──────────────────────────────────────
+        // When AUTUMN_MIGRATE=1, apply pending embedded migrations to the
+        // configured database(s) and EXIT — never start the HTTP server or bind
+        // a port. Triggered by `autumn deploy`'s redeploy cutover, which runs
+        // migrations BEFORE flipping traffic (issue #1607): a non-zero exit here
+        // aborts the deploy with the old release still serving (AC-3). Unlike the
+        // startup auto-migration path it applies regardless of profile, because
+        // the deploy invokes it explicitly.
+        if is_migrate_only_mode() {
+            self.run_migrate_only_mode().await;
+            return;
+        }
+
         let Self {
             routes,
             api_versions,
@@ -4838,6 +4851,107 @@ impl AppBuilder {
         std::process::exit(0);
     }
 
+    /// Apply pending embedded migrations and exit (the `AUTUMN_MIGRATE=1`
+    /// one-shot), WITHOUT starting the HTTP server or binding a port.
+    ///
+    /// Reuses the exact applier the startup auto-migration path uses
+    /// ([`run_pending_locked`](crate::migrate::run_pending_locked), the public
+    /// wrapper over the same locked engine `auto_migrate` drives) and the same
+    /// framework-migration fold ([`migrations_with_repository_framework_migrations`]),
+    /// so the applied set matches a normal boot. Unlike that path it applies
+    /// regardless of profile — the deploy invokes it explicitly — and it targets
+    /// the writable primary(ies) only (control primary + each shard primary),
+    /// exactly like `autumn migrate` / the deploy DB preflight; replicas are never
+    /// migration targets. The framework-internal directory / shard-map guard
+    /// tables are deliberately NOT applied here: the app applies them
+    /// unconditionally at startup, so the candidate's own boot creates them.
+    ///
+    /// Exits 0 after applying (printing a redacted count — never a URL or secret)
+    /// and 1 on the first failure, so a failed migration aborts the deploy before
+    /// cutover with the old release still serving (AC-3).
+    #[cfg(feature = "db")]
+    async fn run_migrate_only_mode(self) {
+        let Self {
+            migrations,
+            config_loader_factory,
+            telemetry_provider,
+            ..
+        } = self;
+
+        // The telemetry guard is dropped at end of scope; a migrate-only run does
+        // not need tracing wired, but loading config the same way keeps env/profile
+        // resolution identical to a normal boot.
+        let (config, _telemetry_guard) =
+            load_config_and_telemetry(config_loader_factory, telemetry_provider).await;
+
+        // Fold in the framework migration sets a normal boot would apply, using the
+        // SAME helper as `setup_database`, so the applied set is identical.
+        let migrations = migrations_with_repository_framework_migrations(
+            migrations,
+            crate::repository_commit_hooks::has_repository_commit_hook_descriptors(),
+            crate::version_history::has_versioned_repository_descriptors(),
+            RepositoryCommitHookQueueMigrationMode::Runtime,
+        );
+
+        // Writable targets only: the control primary, then each shard primary.
+        let control_url = config.database.effective_primary_url().map(str::to_owned);
+        let shard_targets: Vec<(String, String)> = config
+            .database
+            .shards
+            .iter()
+            .map(|shard| (format!("shard:{}", shard.name), shard.primary_url.clone()))
+            .collect();
+
+        if migrations.is_empty() || (control_url.is_none() && shard_targets.is_empty()) {
+            eprintln!(
+                "autumn migrate: no database configured or no migrations registered — nothing to apply"
+            );
+            std::process::exit(0);
+        }
+
+        // The diesel harness and the advisory-lock poll block, so apply off the
+        // Tokio worker threads. Each target's failure exits non-zero from inside.
+        let applied_total = tokio::task::spawn_blocking(move || {
+            let mut total = 0_usize;
+            if let Some(url) = &control_url {
+                for mig in &migrations {
+                    total += apply_pending_or_exit(url, mig, "control");
+                }
+            }
+            // Shards hold tenant data, not the control-plane schema; skip the
+            // control framework set for shard targets (mirrors `run_startup_migrations`).
+            for (label, url) in &shard_targets {
+                for mig in migrations
+                    .iter()
+                    .filter(|mig| !migration_set_is_control_framework(mig))
+                {
+                    total += apply_pending_or_exit(url, mig, label);
+                }
+            }
+            total
+        })
+        .await
+        .unwrap_or_else(|error| {
+            eprintln!("autumn migrate: migration task panicked: {error}");
+            std::process::exit(1);
+        });
+
+        eprintln!(
+            "autumn migrate: applied {applied_total} pending migration(s); database is up to date"
+        );
+        std::process::exit(0);
+    }
+
+    /// The `AUTUMN_MIGRATE=1` one-shot on a build compiled WITHOUT database
+    /// support: there is nothing to migrate, so report and exit 0 (never starting
+    /// the server) so a DB-free app's deploy still runs the step harmlessly.
+    #[cfg(not(feature = "db"))]
+    #[allow(clippy::unused_async)]
+    async fn run_migrate_only_mode(self) {
+        eprintln!("autumn migrate: this build has no database support — nothing to migrate");
+        std::process::exit(0);
+    }
+
     /// Run a registered one-off task with full application context and exit.
     ///
     /// Triggered by `AUTUMN_RUN_TASK=<name>` from `autumn task <name>`.
@@ -5221,6 +5335,14 @@ pub(crate) fn is_dump_jobs_mode() -> bool {
 
 pub(crate) fn is_list_one_off_tasks_mode() -> bool {
     std::env::var("AUTUMN_LIST_TASKS").as_deref() == Ok("1")
+}
+
+/// Whether `AUTUMN_MIGRATE=1` requests the migrate-only one-shot: apply pending
+/// embedded migrations and exit without starting the HTTP server. Set by
+/// `autumn deploy`'s redeploy cutover (issue #1607) so migrations land before
+/// traffic is flipped to the new release.
+pub(crate) fn is_migrate_only_mode() -> bool {
+    std::env::var("AUTUMN_MIGRATE").as_deref() == Ok("1")
 }
 
 fn one_off_task_name_from_env() -> Option<String> {
@@ -7169,6 +7291,45 @@ async fn setup_database(
 /// `run_pending_locked` polls with `std::thread::sleep` (up to 60 s under
 /// contention), so the whole sequence runs off the Tokio worker threads in
 /// one blocking task that owns the embedded migration sets.
+/// Apply pending migrations for one target in the `AUTUMN_MIGRATE=1` one-shot,
+/// returning the number applied — or exiting non-zero on failure.
+///
+/// Uses the same locked applier the startup path uses
+/// ([`run_pending_locked`](crate::migrate::run_pending_locked)). Failure messages
+/// are REDACTED to a value-free reason plus the target label (`control` /
+/// `shard:<name>`): the underlying [`MigrationError`](crate::migrate::MigrationError)
+/// can wrap a driver string that embeds the connection URL, and the deploy path
+/// must never print a DB URL or secret.
+#[cfg(feature = "db")]
+fn apply_pending_or_exit(
+    database_url: &str,
+    migrations: &crate::migrate::EmbeddedMigrations,
+    target: &str,
+) -> usize {
+    match crate::migrate::run_pending_locked(
+        database_url,
+        crate::migrate::EmbeddedMigrationsRef(migrations),
+        None,
+    ) {
+        Ok(result) => result.applied.len(),
+        Err(error) => {
+            let reason = match error {
+                crate::migrate::MigrationError::Connection(_) => {
+                    "could not connect to the database"
+                }
+                crate::migrate::MigrationError::Migration(_) => "a migration failed to apply",
+                _ => "migration error",
+            };
+            eprintln!("autumn migrate: {reason} (target {target})");
+            // `process::exit` skips `on_shutdown`/`Drop`; stop any managed
+            // Postgres child first so a failure doesn't orphan the data dir/port.
+            #[cfg(feature = "managed-pg")]
+            crate::managed_pg::emergency_stop();
+            std::process::exit(1);
+        }
+    }
+}
+
 #[cfg(feature = "db")]
 #[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
 async fn run_startup_migrations(
@@ -9298,6 +9459,81 @@ mod tests {
         assert!(
             state_initializer < router_build,
             "static builds must install state-initialized resources before rendering routes"
+        );
+    }
+
+    #[test]
+    fn migrate_only_one_shot_applies_and_exits_without_serving() {
+        // The runtime effect (applying against Postgres, exiting without binding a
+        // port) needs a DB + a subprocess harness because `run()` ends in
+        // `process::exit`; that live apply is exercised by the shared
+        // `run_pending_locked` engine's own DB-backed tests. Here we lock the
+        // *dispatch decision* and the *reuse/exit contract* structurally: with
+        // AUTUMN_MIGRATE=1 the migrate-and-exit path is chosen and the
+        // server-start path is NOT taken.
+        let source = include_str!("app.rs").replace("\r\n", "\n");
+        let run_start = source.find("pub async fn run(self)").expect("run() exists");
+        let run_end = source
+            .find("async fn run_build_mode(self)")
+            .expect("build mode follows run()");
+        let run_body = &source[run_start..run_end];
+
+        // The AUTUMN_MIGRATE=1 dispatch is an early one-shot: it sits BEFORE the
+        // server-start machinery (the `let Self {` destructure that begins the
+        // serving path) and returns, so a migrate run never binds a port.
+        let dispatch = run_body
+            .find("if is_migrate_only_mode() {")
+            .expect("run() dispatches the migrate one-shot");
+        let server_start = run_body
+            .find("let Self {")
+            .expect("run() destructures self to start the server");
+        assert!(
+            dispatch < server_start,
+            "AUTUMN_MIGRATE must be handled before the server-start path"
+        );
+        let migrate_branch = &run_body[dispatch..server_start];
+        assert!(
+            migrate_branch.contains("self.run_migrate_only_mode().await;")
+                && migrate_branch.contains("return;"),
+            "the migrate one-shot must run then return before server start"
+        );
+
+        // The handler applies per target and exits — never starting the server.
+        let handler_start = source
+            .find("async fn run_migrate_only_mode(self)")
+            .expect("migrate handler exists");
+        let handler_end = source
+            .find("async fn run_one_off_task_mode(self, requested_name: String)")
+            .expect("one-off task handler follows the migrate handler");
+        let handler = &source[handler_start..handler_end];
+        assert!(
+            handler.contains("apply_pending_or_exit"),
+            "the migrate handler applies pending migrations per target"
+        );
+        assert!(
+            handler.contains("std::process::exit(0)"),
+            "the migrate handler exits after applying"
+        );
+        assert!(
+            !handler.contains("initialize_job_runtime")
+                && !handler.contains("try_build_router_inner"),
+            "the migrate one-shot must not start the server"
+        );
+
+        // The per-target applier reuses `run_pending_locked` (the exact engine
+        // `auto_migrate` drives — no duplicated migration logic) and exits
+        // non-zero on failure so a bad migration aborts before cutover (AC-3).
+        let helper_start = source
+            .find("fn apply_pending_or_exit(")
+            .expect("apply_pending_or_exit exists");
+        let helper = &source[helper_start..helper_start + 1200];
+        assert!(
+            helper.contains("crate::migrate::run_pending_locked("),
+            "must reuse the shared locked applier, not duplicate migration logic"
+        );
+        assert!(
+            helper.contains("std::process::exit(1)"),
+            "a failed migration must exit non-zero (abort before cutover)"
         );
     }
 
