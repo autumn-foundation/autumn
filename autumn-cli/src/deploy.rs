@@ -1053,7 +1053,11 @@ fn run_rollback(config: &AutumnConfig, resolved: &ResolvedDeployConfig) -> Resul
     );
 
     let ops = exec::rollback_ops(resolved, &proxy, &rollback_target);
-    exec::execute_rollback(&checks, &ops, &executor)
+    // If the rollback fails at or before the health-gated flip, disable the slot it
+    // restarted so the original release is left cleanly serving (the flip never
+    // moved traffic, and no marker is written until after the flip).
+    let teardown = exec::rollback_teardown_ops(resolved, &rollback_target);
+    exec::execute_rollback(&checks, &ops, &teardown, &executor)
         .map_err(|e| DeployError::Exec(e.to_string()))?;
 
     eprintln!("\n\u{2705} Rollback complete.");
