@@ -692,6 +692,111 @@ pub fn property_list(rows: &[(&str, maud::Markup)]) -> maud::Markup {
     }
 }
 
+// ── transition_controls ────────────────────────────────────────────────────
+
+/// Render one CSRF-protected, no-JS `POST` form + button per state-machine
+/// transition whose `from` matches `current`.
+///
+/// This wires the field-level `#[state_machine]` attribute (on `#[model]`
+/// structs) into a detail view: the macro emits, per state-machine `String`
+/// field `status`, a public `Model::__AUTUMN_SM_STATUS_TRANSITIONS` constant of
+/// `(from, to, Option<guard>)` tuples plus a `Model::can_transition_status_to`
+/// predicate. Pass those two directly:
+///
+/// - `transitions` is the generated `__AUTUMN_SM_<FIELD>_TRANSITIONS` constant
+///   (`&'static [(&'static str, &'static str, Option<&'static str>)]` coerces to
+///   the `&[(&str, &str, Option<&str>)]` parameter, so it passes as-is).
+/// - `can` is `|to| record.can_transition_<field>_to(to)`.
+///
+/// Because those items are per-field *inherent* items (not a trait), the helper
+/// takes the already-extracted data and the call site supplies the
+/// field-specific bits.
+///
+/// # Behavior
+///
+/// - Only edges whose `from == current` are rendered; edges from any other state
+///   are omitted entirely.
+/// - Each rendered edge is an independent `<form method="post" action=(action)>`
+///   carrying the hidden CSRF input (mirroring the scaffold's `csrf_input`), a
+///   hidden `<input name=(field) value=(to)>` so the server route reads the
+///   target state from the form body, and a single `<button type="submit">`.
+/// - A button whose `can(to)` returns `false` (a legal edge whose guard
+///   currently fails) is still rendered but carries the `disabled` attribute, so
+///   the UI shows the transition as visible-but-blocked. A guard-less edge, or
+///   one whose guard passes, renders an enabled button.
+/// - No JavaScript: plain HTML forms and buttons only.
+/// - When no edge matches `current` (a terminal state), an empty grouping
+///   container is rendered (the `role="group"` `<div>` with no forms inside).
+///
+/// # CSRF
+///
+/// Pass the handler's `csrf: Option<&CsrfToken>` and
+/// `csrf_field: Option<&CsrfFormField>` through unchanged. When `csrf` is
+/// `Some`, each form gets a hidden `<input type="hidden">` named after
+/// `csrf_field` (defaulting to `"_csrf"`), exactly like scaffolded forms.
+///
+/// # CSS hooks
+///
+/// | Selector | Element |
+/// |----------|---------|
+/// | `.autumn-transition-controls` | Grouping `<div role="group">` |
+/// | `.autumn-transition` | Each per-edge `<form>` |
+///
+/// # Example
+///
+/// ```rust
+/// use autumn_web::widgets::transition_controls;
+///
+/// // `Order::__AUTUMN_SM_STATUS_TRANSITIONS` would supply this at a call site.
+/// let transitions: &[(&str, &str, Option<&str>)] = &[
+///     ("draft", "published", Some("can_publish")),
+///     ("published", "archived", None),
+/// ];
+/// let markup = transition_controls(
+///     "/orders/42/transitions/status",
+///     "status",
+///     "draft",
+///     transitions,
+///     |to| to == "published", // |to| order.can_transition_status_to(to)
+///     None,
+///     None,
+/// );
+/// let html = markup.into_string();
+/// assert!(html.contains(r#"class="autumn-transition-controls""#));
+/// assert!(html.contains(r#"action="/orders/42/transitions/status""#));
+/// assert!(html.contains(r#"<input type="hidden" name="status" value="published">"#));
+/// // The `draft -> published` edge is shown; `published -> archived` is not.
+/// assert!(!html.contains(r#"value="archived""#));
+/// ```
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn transition_controls(
+    action: &str,
+    field: &str,
+    current: &str,
+    transitions: &[(&str, &str, Option<&str>)],
+    can: impl Fn(&str) -> bool,
+    csrf: Option<&crate::security::CsrfToken>,
+    csrf_field: Option<&crate::security::CsrfFormField>,
+) -> maud::Markup {
+    let csrf_field_name = csrf_field.map_or("_csrf", |f| f.0.as_str());
+    maud::html! {
+        div class="autumn-transition-controls" role="group" aria-label=(format!("{field} transitions")) {
+            @for (from, to, _guard) in transitions {
+                @if *from == current {
+                    form method="post" action=(action) class="autumn-transition" {
+                        @if let Some(tok) = csrf {
+                            input type="hidden" name=(csrf_field_name) value=(tok.token());
+                        }
+                        input type="hidden" name=(field) value=(to);
+                        button type="submit" disabled[!can(to)] { (format!("Mark as {to}")) }
+                    }
+                }
+            }
+        }
+    }
+}
+
 // ── data_table ────────────────────────────────────────────────────────────
 
 /// Sort direction for a [`data_table`] sortable column header.
@@ -4473,6 +4578,196 @@ pub fn line_chart_with(series: &[(&str, f64)], config: &ChartConfig<'_>) -> maud
 #[cfg(all(test, feature = "maud"))]
 mod tests {
     use super::*;
+
+    // ── transition_controls ────────────────────────────────────────────
+
+    /// A plain literal transition graph: `draft -> published` (guarded),
+    /// `published -> archived` (guard-less). No real model required.
+    const fn sample_transitions() -> &'static [(&'static str, &'static str, Option<&'static str>)] {
+        &[
+            ("draft", "published", Some("can_publish")),
+            ("published", "archived", None),
+        ]
+    }
+
+    #[test]
+    fn transition_controls_only_renders_edges_from_current() {
+        // current = "draft": only the draft -> published edge should appear.
+        let html = transition_controls(
+            "/orders/42/transitions/status",
+            "status",
+            "draft",
+            sample_transitions(),
+            |_to| true,
+            None,
+            None,
+        )
+        .into_string();
+        assert!(html.contains(r#"value="published""#), "{html}");
+        // The published -> archived edge is from a different state: absent.
+        assert!(!html.contains(r#"value="archived""#), "{html}");
+    }
+
+    #[test]
+    fn transition_controls_renders_terminal_current_as_empty_group() {
+        // current = "archived" is terminal: no edges match, empty group only.
+        let html = transition_controls(
+            "/orders/42/transitions/status",
+            "status",
+            "archived",
+            sample_transitions(),
+            |_to| true,
+            None,
+            None,
+        )
+        .into_string();
+        assert!(
+            html.contains(r#"class="autumn-transition-controls""#),
+            "{html}"
+        );
+        assert!(!html.contains("<form"), "{html}");
+        assert!(!html.contains("<button"), "{html}");
+    }
+
+    #[test]
+    fn transition_controls_guard_true_button_is_enabled() {
+        let html = transition_controls(
+            "/orders/42/transitions/status",
+            "status",
+            "draft",
+            sample_transitions(),
+            |to| to == "published", // guard passes for the draft -> published edge
+            None,
+            None,
+        )
+        .into_string();
+        assert!(
+            html.contains("<button type=\"submit\">Mark as published</button>"),
+            "{html}"
+        );
+        assert!(!html.contains("disabled"), "{html}");
+    }
+
+    #[test]
+    fn transition_controls_guard_false_button_is_disabled() {
+        let html = transition_controls(
+            "/orders/42/transitions/status",
+            "status",
+            "draft",
+            sample_transitions(),
+            |_to| false, // guard fails: legal edge, but currently blocked
+            None,
+            None,
+        )
+        .into_string();
+        // Still rendered, but disabled.
+        assert!(html.contains(r#"value="published""#), "{html}");
+        assert!(html.contains("disabled"), "{html}");
+    }
+
+    #[test]
+    fn transition_controls_guardless_edge_from_current_is_enabled() {
+        // current = "published": the guard-less published -> archived edge shows,
+        // enabled (its guard slot is None, and `can` returns true).
+        let html = transition_controls(
+            "/orders/42/transitions/status",
+            "status",
+            "published",
+            sample_transitions(),
+            |_to| true,
+            None,
+            None,
+        )
+        .into_string();
+        assert!(html.contains(r#"value="archived""#), "{html}");
+        assert!(
+            html.contains("<button type=\"submit\">Mark as archived</button>"),
+            "{html}"
+        );
+        assert!(!html.contains("disabled"), "{html}");
+    }
+
+    #[test]
+    fn transition_controls_form_is_post_no_js_and_carries_target_in_body() {
+        let html = transition_controls(
+            "/orders/42/transitions/status",
+            "status",
+            "draft",
+            sample_transitions(),
+            |_to| true,
+            None,
+            None,
+        )
+        .into_string();
+        assert!(
+            html.contains(r#"<form method="post" action="/orders/42/transitions/status""#),
+            "{html}"
+        );
+        // Target state carried in the body as a hidden input under the field name.
+        assert!(
+            html.contains(r#"<input type="hidden" name="status" value="published">"#),
+            "{html}"
+        );
+        // No JavaScript.
+        assert!(!html.contains("onclick"), "{html}");
+        assert!(!html.contains("hx-"), "{html}");
+        assert!(!html.contains("<script"), "{html}");
+    }
+
+    #[test]
+    fn transition_controls_csrf_hidden_input_present_when_token_supplied() {
+        let token = crate::security::CsrfToken::new("secret-token".to_string());
+        let html = transition_controls(
+            "/orders/42/transitions/status",
+            "status",
+            "draft",
+            sample_transitions(),
+            |_to| true,
+            Some(&token),
+            None,
+        )
+        .into_string();
+        assert!(
+            html.contains(r#"<input type="hidden" name="_csrf" value="secret-token">"#),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn transition_controls_csrf_absent_when_no_token() {
+        let html = transition_controls(
+            "/orders/42/transitions/status",
+            "status",
+            "draft",
+            sample_transitions(),
+            |_to| true,
+            None,
+            None,
+        )
+        .into_string();
+        assert!(!html.contains("_csrf"), "{html}");
+    }
+
+    #[test]
+    fn transition_controls_honors_custom_csrf_field_name() {
+        let token = crate::security::CsrfToken::new("secret-token".to_string());
+        let field = crate::security::CsrfFormField("csrf_custom".to_string());
+        let html = transition_controls(
+            "/orders/42/transitions/status",
+            "status",
+            "draft",
+            sample_transitions(),
+            |_to| true,
+            Some(&token),
+            Some(&field),
+        )
+        .into_string();
+        assert!(
+            html.contains(r#"<input type="hidden" name="csrf_custom" value="secret-token">"#),
+            "{html}"
+        );
+        assert!(!html.contains(r#"name="_csrf""#), "{html}");
+    }
 
     // ── build_trigger ──────────────────────────────────────────────────
 
