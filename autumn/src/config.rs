@@ -2576,13 +2576,124 @@ const fn default_jobs_redis_visibility_timeout_ms() -> u64 {
     30_000
 }
 
+/// Parent config paths whose child keys were already covered by strict
+/// validation BEFORE the #1890 schema-walk fix. Captured verbatim from
+/// `get_schema_keys()` on the pre-fix code (the walk aborted at
+/// `database.statement_timeout`, so only these parents were reachable). Used by
+/// the warn-first rollout: an unknown key whose PARENT is in this set hard-fails
+/// under `strict_config` exactly as before; every key the #1890 fix newly
+/// reveals is warned about instead (until `strict_config_enforce_all` promotes
+/// it). Transitional — removed when enforcement becomes the default.
+const PRE_1890_STRICT_PARENTS: &[&str] = &[
+    "",
+    "database",
+    "deploy",
+    "server",
+    "server.timeouts",
+    "server.tls",
+    "server.tls.acme",
+];
+
+/// Whether an unknown-key error whose (profile-stripped, segment-derived) schema
+/// parent is `schema_parent` was already hard-failing before #1890. Malformed
+/// top-level profile entries surface with parent `"profile"` (always fatal
+/// structural errors); everything else keys off the pre-#1890 parent set.
+fn unknown_key_was_previously_strict(schema_parent: &str) -> bool {
+    schema_parent == "profile" || PRE_1890_STRICT_PARENTS.contains(&schema_parent)
+}
+
+/// Child schema keys for config sections whose `Deserialize` is OPAQUE to the
+/// schema walker and must be declared by hand.
+///
+/// `#[serde(untagged)]` "scalar shorthand OR table" enums (e.g. `TimeZoneConfig`:
+/// `time_zone = "UTC"` or `[time_zone] identifier = ...`) deserialize by first
+/// buffering into serde's `Content` and then matching variants against that
+/// buffer — so the table variant's fields are read from the buffer, never from
+/// `SchemaDeserializer`. The walker therefore cannot see them, and the section
+/// would otherwise be a childless leaf that strict validation skips (accepting
+/// typos even under `strict_config_enforce_all`). Register such sections here so
+/// `validate_toml` descends into them.
+///
+/// KEEP IN SYNC with the corresponding type's table fields (serialized names).
+/// The guard test `manual_schema_sections_are_registered` pins the behavior.
+const MANUAL_SCHEMA_SECTIONS: &[(&str, &[&str])] = &[
+    // `crate::time_zone::TimeZoneConfig` — untagged Scalar|Table.
+    ("time_zone", &["identifier", "sources"]),
+];
+
 impl AutumnConfig {
     /// Recursively extracts all valid configuration schema keys and nested fields.
     #[must_use]
+    #[allow(clippy::significant_drop_tightening)]
     pub fn get_schema_keys() -> HashMap<String, HashSet<String>> {
-        let deserializer = SchemaDeserializer::new();
-        let _ = Self::deserialize(deserializer.clone());
-        deserializer.into_schema()
+        // Adaptive multi-pass schema walk. `deserialize_any` probes with a scalar
+        // by default; any path whose visitor rejects that probe (a seq/map-only
+        // type such as `JobQueuesConfig` at `jobs.queues`) is escalated to a
+        // map- then seq-probe on the next pass, so the walk stops aborting there
+        // and enumerates every later section (#1890). Converges in two passes for
+        // the current config; the loop is bounded and monotonic (each escalated
+        // path only advances Str→Map→Seq), so it always terminates.
+        const MAX_PASSES: usize = 8;
+        let de = SchemaDeserializer::new();
+        let mut prev_rejected: Vec<String> = Vec::new();
+        for _ in 0..MAX_PASSES {
+            de.rejected
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clear();
+            let _ = Self::deserialize(de.clone());
+            let mut rejected: Vec<String> = std::mem::take(
+                &mut de
+                    .rejected
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            );
+            rejected.sort();
+            rejected.dedup();
+            if rejected.is_empty() {
+                break;
+            }
+            let mut advanced = false;
+            {
+                let mut probes = de
+                    .any_probe
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                for p in &rejected {
+                    let cur = probes.get(p).copied().unwrap_or(AnyProbe::Str);
+                    let next = match cur {
+                        AnyProbe::Str => AnyProbe::Map,
+                        AnyProbe::Map | AnyProbe::Seq => AnyProbe::Seq,
+                    };
+                    if next != cur {
+                        advanced = true;
+                    }
+                    probes.insert(p.clone(), next);
+                }
+            }
+            // No path could be escalated further and the rejected set is stable:
+            // any remaining aborter accepts none of str/map/seq — stop (leaf it).
+            if !advanced && rejected == prev_rejected {
+                break;
+            }
+            prev_rejected = rejected;
+        }
+        // Register walker-opaque sections (untagged scalar-or-table types whose
+        // table fields buffer through serde `Content` and are invisible to the
+        // walk). See MANUAL_SCHEMA_SECTIONS.
+        {
+            let mut schema = de
+                .schema
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for (section, keys) in MANUAL_SCHEMA_SECTIONS {
+                let entry = schema.entry((*section).to_owned()).or_default();
+                for k in *keys {
+                    entry.insert((*k).to_owned());
+                }
+            }
+        }
+        de.into_schema()
     }
 
     /// Returns a sorted set of all schema leaf key paths (e.g. `"server.port"`).
@@ -2620,6 +2731,22 @@ impl AutumnConfig {
         content: &str,
         schema: &HashMap<String, HashSet<String>>,
     ) -> Vec<(String, Option<String>)> {
+        Self::validate_toml_detailed(content, schema)
+            .into_iter()
+            .map(|(path, sug, _parent)| (path, sug))
+            .collect()
+    }
+
+    /// Like [`validate_toml`](Self::validate_toml), but also returns each error's
+    /// profile-stripped schema parent path (computed from path SEGMENTS, so it is
+    /// correct even for quoted dotted profile names like
+    /// `[profile."prod.eu".server]`). Used by strict-config classification;
+    /// `validate_toml` maps this down to `(path, suggestion)`.
+    #[must_use]
+    pub(crate) fn validate_toml_detailed(
+        content: &str,
+        schema: &HashMap<String, HashSet<String>>,
+    ) -> Vec<(String, Option<String>, String)> {
         let Ok(table) = toml::from_str::<toml::Table>(content) else {
             return Vec::new();
         };
@@ -2635,7 +2762,7 @@ impl AutumnConfig {
         table: &toml::Table,
         path: &mut Vec<String>,
         schema: &HashMap<String, HashSet<String>>,
-        errors: &mut Vec<(String, Option<String>)>,
+        errors: &mut Vec<(String, Option<String>, String)>,
     ) {
         let mut schema_path_parts = Vec::new();
         if path.len() >= 2 && path[0] == "profile" {
@@ -2703,7 +2830,7 @@ impl AutumnConfig {
                         sug_parts.join(".")
                     });
 
-                    errors.push((full_path, suggestion));
+                    errors.push((full_path, suggestion, schema_path.clone()));
                 }
             }
         } else if path.len() == 1 && path[0] == "profile" {
@@ -2715,7 +2842,7 @@ impl AutumnConfig {
                 } else {
                     let mut full_path_parts = path.clone();
                     full_path_parts.push(k.clone());
-                    errors.push((full_path_parts.join("."), None));
+                    errors.push((full_path_parts.join("."), None, schema_path.clone()));
                 }
             }
         } else if path.is_empty() {
@@ -2731,7 +2858,7 @@ impl AutumnConfig {
                             closest = Some(valid_key);
                         }
                     }
-                    errors.push((k.clone(), closest.map(String::from)));
+                    errors.push((k.clone(), closest.map(String::from), schema_path.clone()));
                 } else {
                     path.push(k.clone());
                     match val {
@@ -2864,23 +2991,11 @@ impl AutumnConfig {
             .var("AUTUMN_SERVER__STRICT_CONFIG")
             .is_ok_and(|v| v == "true" || v == "1");
         if config.server.strict_config || is_strict_env {
-            let schema = Self::get_schema_keys();
-            let errors = Self::validate_toml(&toml_str, &schema);
-            if !errors.is_empty() {
-                let err_messages: Vec<String> = errors
-                    .into_iter()
-                    .map(|(path, sug)| {
-                        sug.map_or_else(
-                            || format!("unknown key \"{path}\""),
-                            |s| format!("unknown key \"{path}\" — did you mean \"{s}\"?"),
-                        )
-                    })
-                    .collect();
-                return Err(ConfigError::Validation(format!(
-                    "Strict config check failed. Unknown keys in configuration: {}",
-                    err_messages.join(", ")
-                )));
-            }
+            let enforce_all = config.server.strict_config_enforce_all
+                || env
+                    .var("AUTUMN_SERVER__STRICT_CONFIG_ENFORCE_ALL")
+                    .is_ok_and(|v| v == "true" || v == "1");
+            Self::run_strict_unknown_key_check(&toml_str, enforce_all)?;
         }
 
         // ── Deprecation channel (purely additive; never mutates `config`). ──────
@@ -2938,6 +3053,72 @@ impl AutumnConfig {
         }
 
         Ok(config)
+    }
+
+    /// Runs the strict unknown-key check against the merged `toml_str`.
+    ///
+    /// Unknown keys are partitioned by [`unknown_key_was_previously_strict`]:
+    /// keys whose section was already strictly validated before the #1890
+    /// schema-walk fix (or all keys when `enforce_all` is set) hard-fail; keys
+    /// in sections that only became covered by the fix are warned about but
+    /// tolerated for one release (warn-first rollout).
+    fn run_strict_unknown_key_check(toml_str: &str, enforce_all: bool) -> Result<(), ConfigError> {
+        let schema = Self::get_schema_keys();
+        let errors = Self::validate_toml_detailed(toml_str, &schema);
+
+        let mut hard_errors = Vec::new();
+        let mut warn_only = Vec::new();
+        for (path, sug, schema_parent) in errors {
+            if enforce_all || unknown_key_was_previously_strict(&schema_parent) {
+                hard_errors.push((path, sug));
+            } else {
+                warn_only.push((path, sug));
+            }
+        }
+
+        // Warn-first rollout (#1890): unknown keys in sections that only became
+        // strictly validated by the schema-walk fix are surfaced loudly but do
+        // NOT fail startup for one release, so configs that silently passed
+        // before keep booting. `eprintln!` guarantees visibility before the
+        // tracing subscriber is installed; the `tracing::warn!` keeps structured
+        // output for apps that pre-install one. Set
+        // `server.strict_config_enforce_all = true` (or
+        // AUTUMN_SERVER__STRICT_CONFIG_ENFORCE_ALL=1) to promote these to hard
+        // errors now.
+        for (path, sug) in &warn_only {
+            let hint = sug
+                .as_deref()
+                .map_or_else(String::new, |s| format!(" — did you mean \"{s}\"?"));
+            eprintln!(
+                "Warning: unknown configuration key \"{path}\"{hint}. It is ignored and \
+                 falls back to defaults. This will become a hard error in a future \
+                 release; set server.strict_config_enforce_all = true to enforce now."
+            );
+            tracing::warn!(
+                unknown_key = path.as_str(),
+                suggestion = sug.as_deref().unwrap_or(""),
+                "unknown configuration key in a section newly covered by strict \
+                 validation; ignored for now (warn-first rollout, #1890), will hard-fail \
+                 once enforcement is promoted"
+            );
+        }
+
+        if !hard_errors.is_empty() {
+            let err_messages: Vec<String> = hard_errors
+                .into_iter()
+                .map(|(path, sug)| {
+                    sug.map_or_else(
+                        || format!("unknown key \"{path}\""),
+                        |s| format!("unknown key \"{path}\" — did you mean \"{s}\"?"),
+                    )
+                })
+                .collect();
+            return Err(ConfigError::Validation(format!(
+                "Strict config check failed. Unknown keys in configuration: {}",
+                err_messages.join(", ")
+            )));
+        }
+        Ok(())
     }
 
     /// Helper method to expand `OAuth2` preset configurations and resolve credentials-backed values.
@@ -4610,6 +4791,17 @@ pub struct ServerConfig {
     /// Exit startup if any unknown config keys are found in autumn.toml/profiles.
     #[serde(default)]
     pub strict_config: bool,
+
+    /// When `strict_config` is enabled, also hard-fail on unknown keys in the
+    /// config sections that only became strictly validated by the #1890
+    /// schema-walk fix (everything except `server`, `deploy`, and `database`,
+    /// whose keys were already validated). Defaults to `false` for one release:
+    /// unknown keys in those newly-covered sections WARN loudly at startup
+    /// instead of failing, so configs that silently passed before keep booting.
+    /// Set to `true` to enforce immediately; a future release makes `true` the
+    /// default and removes this transitional gate.
+    #[serde(default)]
+    pub strict_config_enforce_all: bool,
 
     /// Seconds to wait for in-flight requests during graceful shutdown.
     /// Default: `30`.
@@ -6410,6 +6602,7 @@ impl Default for ServerConfig {
             port: default_port(),
             host: default_host(),
             strict_config: false,
+            strict_config_enforce_all: false,
             shutdown_timeout_secs: default_shutdown_timeout(),
             prestop_grace_secs: default_prestop_grace(),
             timeouts: RequestTimeoutsConfig::default(),
@@ -6868,10 +7061,24 @@ use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AnyProbe {
+    Str,
+    Map,
+    Seq,
+}
+
 #[derive(Clone)]
 pub struct SchemaDeserializer {
     path: Vec<String>,
     schema: Arc<Mutex<HashMap<String, HashSet<String>>>>,
+    /// Per-path override for what `deserialize_any` feeds. Absent = `Str`.
+    /// A path is escalated (Str→Map→Seq) across walk passes when its visitor
+    /// rejects the current probe (e.g. `jobs.queues`'s seq/map-only visitor
+    /// rejects the scalar `"0"`). See `get_schema_keys`.
+    any_probe: Arc<Mutex<HashMap<String, AnyProbe>>>,
+    /// Paths whose `deserialize_any` probe was rejected during the current pass.
+    rejected: Arc<Mutex<Vec<String>>>,
 }
 
 impl Default for SchemaDeserializer {
@@ -6886,6 +7093,8 @@ impl SchemaDeserializer {
         Self {
             path: Vec::new(),
             schema: Arc::new(Mutex::new(HashMap::new())),
+            any_probe: Arc::new(Mutex::new(HashMap::new())),
+            rejected: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -6906,7 +7115,46 @@ impl<'de> de::Deserializer<'de> for SchemaDeserializer {
     where
         V: Visitor<'de>,
     {
-        visitor.visit_str("")
+        // `deserialize_any` is inherently ambiguous for a placeholder walker:
+        // untagged SCALAR parsers (e.g. `deserialize_duration`) need a string,
+        // while a visitor that accepts only seq/map (e.g. `JobQueuesConfig` at
+        // `jobs.queues`) rejects a string and aborts the whole remaining walk
+        // (#1890). We can't know which shape a given visitor wants, and serde
+        // seeds can't be retried mid-walk, so we probe with a scalar by default
+        // and let `get_schema_keys` re-run the walk, escalating any REJECTED
+        // path to a map/seq probe on the next pass until none reject.
+        let path = self.path.join(".");
+        let probe = self
+            .any_probe
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&path)
+            .copied()
+            .unwrap_or(AnyProbe::Str);
+        let result = match probe {
+            // "0" is a valid non-empty string that also parses as an int/duration,
+            // so untagged string- and number-shaped scalar parsers both accept it.
+            AnyProbe::Str => visitor.visit_str("0"),
+            // Empty map/seq: a seq/map-only visitor accepts it and yields an empty
+            // value, so the walk records the field as a leaf and CONTINUES past it
+            // (we intentionally do NOT descend — e.g. jobs.queues has dynamic keys).
+            AnyProbe::Map => visitor.visit_map(SchemaMapAccess {
+                fields: [].iter(),
+                current_field: None,
+                deserializer: self.clone(),
+            }),
+            AnyProbe::Seq => visitor.visit_seq(SchemaSeqAccess {
+                done: true,
+                deserializer: self.clone(),
+            }),
+        };
+        if result.is_err() {
+            self.rejected
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(path);
+        }
+        result
     }
 
     fn deserialize_bool<V>(self, visitor: V) -> Result<V::Value, Self::Error>
@@ -7210,6 +7458,8 @@ impl<'de> MapAccess<'de> for SchemaMapAccess {
         let nested = SchemaDeserializer {
             path: new_path,
             schema: self.deserializer.schema.clone(),
+            any_probe: self.deserializer.any_probe.clone(),
+            rejected: self.deserializer.rejected.clone(),
         };
         seed.deserialize(nested)
     }
@@ -7357,6 +7607,296 @@ mod tests {
         assert!(res.is_err());
         let err_str = format!("{:?}", res.err().unwrap());
         assert!(err_str.contains("primry_url"));
+    }
+
+    // 7a (#1890): a typo in a section that ONLY became strictly validated by the
+    // schema-walk fix (here `[log]`, declared after `database`) must WARN, not
+    // fail, during the one-release warn-first rollout.
+    #[test]
+    fn post_database_section_typo_warns_but_does_not_fail() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("autumn.toml");
+        std::fs::write(&config_path, "[log]\nbogus_zzz = true\n").unwrap();
+
+        let env = FakeEnv(
+            [
+                ("AUTUMN_SERVER__STRICT_CONFIG".to_owned(), "true".to_owned()),
+                // Pin a non-dev profile: the `dev` smart-defaults inject a
+                // feature-gated `[storage]` table which, with the `storage`
+                // feature off, is flagged as a hard top-level unknown key and
+                // would derail this test regardless of the `[log]` typo.
+                ("AUTUMN_ENV".to_owned(), "prod".to_owned()),
+                (
+                    "AUTUMN_MANIFEST_DIR".to_owned(),
+                    temp.path().to_str().unwrap().to_owned(),
+                ),
+            ]
+            .into(),
+        );
+
+        let res = AutumnConfig::load_with_env(&env);
+        assert!(
+            res.is_ok(),
+            "a post-database section typo must warn (not fail) under warn-first rollout: {res:?}"
+        );
+    }
+
+    // 7b (#1890): with `strict_config_enforce_all` set, the SAME post-database
+    // typo is promoted to a hard error.
+    #[test]
+    fn post_database_section_typo_fails_under_enforce_all() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("autumn.toml");
+        std::fs::write(
+            &config_path,
+            "[server]\nstrict_config = true\nstrict_config_enforce_all = true\n\n[log]\nbogus_zzz = true\n",
+        )
+        .unwrap();
+
+        let env = FakeEnv(
+            [
+                // Non-dev profile so the `dev` smart-defaults' feature-gated
+                // `[storage]` table isn't injected — otherwise (storage feature
+                // off) the test would fail on `storage`, not the `[log]` typo it
+                // is meant to exercise.
+                ("AUTUMN_ENV".to_owned(), "prod".to_owned()),
+                (
+                    "AUTUMN_MANIFEST_DIR".to_owned(),
+                    temp.path().to_str().unwrap().to_owned(),
+                ),
+            ]
+            .into(),
+        );
+
+        let res = AutumnConfig::load_with_env(&env);
+        assert!(
+            res.is_err(),
+            "strict_config_enforce_all must hard-fail the post-database typo"
+        );
+        let err_str = format!("{:?}", res.err().unwrap());
+        assert!(
+            err_str.contains("bogus_zzz"),
+            "error should name the key: {err_str}"
+        );
+    }
+
+    // 7c (#1890 regression guard): sections that were strictly validated BEFORE
+    // the fix (here `[server]`) must keep hard-failing on unknown keys.
+    #[test]
+    fn pre_database_section_typo_still_hard_fails() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("autumn.toml");
+        std::fs::write(&config_path, "[server]\nbogus_zzz = true\n").unwrap();
+
+        let env = FakeEnv(
+            [
+                ("AUTUMN_SERVER__STRICT_CONFIG".to_owned(), "true".to_owned()),
+                // Non-dev profile so the `dev` smart-defaults' feature-gated
+                // `[storage]` table isn't injected; this test must fail on the
+                // `[server]` typo, not on `storage` (storage feature off).
+                ("AUTUMN_ENV".to_owned(), "prod".to_owned()),
+                (
+                    "AUTUMN_MANIFEST_DIR".to_owned(),
+                    temp.path().to_str().unwrap().to_owned(),
+                ),
+            ]
+            .into(),
+        );
+
+        let res = AutumnConfig::load_with_env(&env);
+        assert!(
+            res.is_err(),
+            "an unknown [server] key must still hard-fail (pre-fix strictness preserved)"
+        );
+        let err_str = format!("{:?}", res.err().unwrap());
+        assert!(
+            err_str.contains("bogus_zzz"),
+            "error should name the key: {err_str}"
+        );
+    }
+
+    // 7c′ (#1890 regression guard): a MALFORMED top-level `[profile]` entry (e.g.
+    // `[profile] dev = "prod"`, whose validation error path is `profile.dev`) is a
+    // structural error that was always fatal under strict_config. It is NOT a
+    // section newly revealed by #1890, so the warn-first classifier must keep it
+    // hard-failing. A genuinely newly-covered section typo (`[resilience]`) with
+    // the same strict_config (enforce_all OFF) must still only warn — proving the
+    // fix is narrow and did not over-broaden into hard-failing new sections.
+    #[test]
+    fn malformed_profile_entry_still_hard_fails() {
+        // Malformed profile block: `dev = "prod"` is a scalar where a nested
+        // profile table is expected -> unknown-key error path `profile.dev`.
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("autumn.toml");
+        std::fs::write(&config_path, "[profile]\ndev = \"prod\"\n").unwrap();
+
+        let env = FakeEnv(
+            [
+                ("AUTUMN_SERVER__STRICT_CONFIG".to_owned(), "true".to_owned()),
+                // Non-dev profile so the `dev` smart-defaults' feature-gated
+                // `[storage]` table isn't injected; this test must fail on the
+                // malformed `[profile]` entry, not on `storage`.
+                ("AUTUMN_ENV".to_owned(), "prod".to_owned()),
+                (
+                    "AUTUMN_MANIFEST_DIR".to_owned(),
+                    temp.path().to_str().unwrap().to_owned(),
+                ),
+            ]
+            .into(),
+        );
+
+        let res = AutumnConfig::load_with_env(&env);
+        assert!(
+            res.is_err(),
+            "a malformed [profile] entry is a structural error that must keep \
+             hard-failing under strict_config (not be demoted to warn-only): {res:?}"
+        );
+        assert!(
+            matches!(res.err().unwrap(), ConfigError::Validation(_)),
+            "malformed profile entry must fail as a validation error"
+        );
+
+        // Narrowness guard: a typo in a section that only became strictly
+        // validated by #1890 (`[resilience]`) must still WARN (not fail) under the
+        // same strict_config with enforce_all OFF.
+        let temp2 = tempfile::tempdir().unwrap();
+        let config_path2 = temp2.path().join("autumn.toml");
+        std::fs::write(&config_path2, "[resilience]\nboguz = 1\n").unwrap();
+
+        let env2 = FakeEnv(
+            [
+                ("AUTUMN_SERVER__STRICT_CONFIG".to_owned(), "true".to_owned()),
+                // Non-dev profile so the `dev` smart-defaults' feature-gated
+                // `[storage]` table isn't injected: the `[resilience]` typo must
+                // remain a warn-only (Ok) case, not be masked by a hard-failing
+                // `storage` key when the storage feature is off.
+                ("AUTUMN_ENV".to_owned(), "prod".to_owned()),
+                (
+                    "AUTUMN_MANIFEST_DIR".to_owned(),
+                    temp2.path().to_str().unwrap().to_owned(),
+                ),
+            ]
+            .into(),
+        );
+
+        let res2 = AutumnConfig::load_with_env(&env2);
+        assert!(
+            res2.is_ok(),
+            "a newly-#1890-covered section typo must still only warn under \
+             strict_config (enforce_all off), proving the profile fix is narrow: {res2:?}"
+        );
+    }
+
+    // 7c″ (#1890 P2 fix): a typo under a QUOTED DOTTED profile name (e.g.
+    // `[profile."prod.eu".server]`) must classify by its real segment-derived
+    // schema parent. The `"prod.eu"` key is ONE TOML key (a literal dot), so the
+    // segmented path is `["profile", "prod.eu", "server"]` and the profile-stripped
+    // schema parent is `server` — a pre-#1890 strict section that must keep
+    // hard-failing, NOT be demoted to warn-only by string-splitting the joined
+    // path. A `[profile."prod.eu".resilience]` typo (a newly-#1890-covered section)
+    // with the same strict_config (enforce_all OFF) must still only warn — proving
+    // the fix stays narrow even under dotted profile names.
+    #[test]
+    fn dotted_profile_name_preserves_strictness() {
+        // Pre-#1890 strict section (`server`) under a quoted dotted profile name:
+        // must hard-fail.
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("autumn.toml");
+        std::fs::write(
+            &config_path,
+            "[profile.\"prod.eu\".server]\nbogus_zzz = true\n",
+        )
+        .unwrap();
+
+        let env = FakeEnv(
+            [
+                ("AUTUMN_SERVER__STRICT_CONFIG".to_owned(), "true".to_owned()),
+                // Non-dev profile so the `dev` smart-defaults' feature-gated
+                // `[storage]` table isn't injected; this test must fail on the
+                // `[server]` typo, not on `storage` (storage feature off).
+                ("AUTUMN_ENV".to_owned(), "prod".to_owned()),
+                (
+                    "AUTUMN_MANIFEST_DIR".to_owned(),
+                    temp.path().to_str().unwrap().to_owned(),
+                ),
+            ]
+            .into(),
+        );
+
+        let res = AutumnConfig::load_with_env(&env);
+        assert!(
+            res.is_err(),
+            "a [server] typo under a quoted dotted profile name must hard-fail \
+             (pre-#1890 strictness must not be downgraded by string-splitting the \
+             joined path): {res:?}"
+        );
+        let err_str = format!("{:?}", res.err().unwrap());
+        assert!(
+            err_str.contains("server") && err_str.contains("bogus_zzz"),
+            "hard-fail must be for the [server] typo (right reason): {err_str}"
+        );
+
+        // Newly-#1890-covered section (`resilience`) under the same quoted dotted
+        // profile name: must still only WARN (enforce_all off) — the fix is narrow.
+        let temp2 = tempfile::tempdir().unwrap();
+        let config_path2 = temp2.path().join("autumn.toml");
+        std::fs::write(
+            &config_path2,
+            "[profile.\"prod.eu\".resilience]\nboguz = 1\n",
+        )
+        .unwrap();
+
+        let env2 = FakeEnv(
+            [
+                ("AUTUMN_SERVER__STRICT_CONFIG".to_owned(), "true".to_owned()),
+                ("AUTUMN_ENV".to_owned(), "prod".to_owned()),
+                (
+                    "AUTUMN_MANIFEST_DIR".to_owned(),
+                    temp2.path().to_str().unwrap().to_owned(),
+                ),
+            ]
+            .into(),
+        );
+
+        let res2 = AutumnConfig::load_with_env(&env2);
+        assert!(
+            res2.is_ok(),
+            "a newly-#1890-covered section typo under a quoted dotted profile name \
+             must still only warn under strict_config (enforce_all off): {res2:?}"
+        );
+    }
+
+    // 7d (#1890): the `database.statement_timeout` duration field — whose empty
+    // probe used to abort the schema walk — still deserializes correctly at
+    // runtime, in both string and integer (milliseconds) forms.
+    #[test]
+    fn statement_timeout_duration_field_loads() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("autumn.toml");
+
+        std::fs::write(&config_path, "[database]\nstatement_timeout = \"30s\"\n").unwrap();
+        let env = FakeEnv(
+            [(
+                "AUTUMN_MANIFEST_DIR".to_owned(),
+                temp.path().to_str().unwrap().to_owned(),
+            )]
+            .into(),
+        );
+        let config =
+            AutumnConfig::load_with_env(&env).expect("config with duration string must load");
+        assert_eq!(
+            config.database.statement_timeout,
+            Some(std::time::Duration::from_secs(30))
+        );
+
+        // Integer form is interpreted as milliseconds.
+        std::fs::write(&config_path, "[database]\nstatement_timeout = 250\n").unwrap();
+        let config =
+            AutumnConfig::load_with_env(&env).expect("config with integer duration must load");
+        assert_eq!(
+            config.database.statement_timeout,
+            Some(std::time::Duration::from_millis(250))
+        );
     }
 
     #[test]
@@ -11881,8 +12421,13 @@ redirect_uri = "http://localhost:3000/auth/github/callback"
 
     #[test]
     fn red_schema_leaf_paths_includes_known_paths() {
-        // The SchemaDeserializer only recurses into structs defined in config.rs itself;
-        // external module types (SecurityConfig, AuthConfig, etc.) appear as root leaves only.
+        // The SchemaDeserializer recurses into any derived-Deserialize struct it
+        // reaches, regardless of module — external-module types (SecurityConfig,
+        // AuthConfig, etc.) now descend too. They were root-only before the #1890
+        // adaptive walk because the walk aborted before them (at the
+        // `statement_timeout` duration / the `jobs.queues` seq-only visitor), not
+        // because of their module. Each still also appears as a bare root leaf
+        // (recorded as a field of the root struct).
         let leaves = AutumnConfig::schema_leaf_paths();
         assert!(
             leaves.contains("server.port"),
@@ -11896,8 +12441,8 @@ redirect_uri = "http://localhost:3000/auth/github/callback"
             leaves.contains("database.url"),
             "database.url must be a schema leaf"
         );
-        // Root-level sections appear as single-segment leaves (the schema records them as
-        // fields of the root struct, but doesn't descend into their external-module types).
+        // Root-level sections also appear as single-segment leaves (recorded as
+        // fields of the root struct), alongside their now-descended child keys.
         assert!(
             leaves.contains("security"),
             "security must appear as a root-level leaf"
