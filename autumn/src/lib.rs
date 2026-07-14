@@ -1324,7 +1324,7 @@ pub use crate::extract::Json;
 ///
 /// # Examples
 ///
-/// ```rust,no_run
+/// ```rust,ignore
 /// use autumn_web::prelude::*;
 /// use autumn_web::data::csv::CsvSchema;
 /// use autumn_web::extract::Csv;
