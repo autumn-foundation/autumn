@@ -108,6 +108,7 @@ together (`0.5.0` published; `0.6.0` on trunk-dev, unpublished).
 | `#[repository]` | CRUD repository and generated API (`db`); `mcp` / `mcp = "read"` expose the generated routes as MCP tools |
 | `#[service]` | Service implementation scaffolding (`db`) |
 | `#[secured]` | Session auth and role guard |
+| `#[public]` | Marks a route handler as deliberately unauthenticated for the `autumn routes audit` coverage manifest — mirrors `#[secured]`, classifying the route `public` vs `gated`/`framework`/`unclassified` (**unreleased** — trunk-dev, #1604) |
 | `#[authorize]` | Record-level policy guard |
 | `#[api_doc]` | Route OpenAPI metadata |
 | `#[oauth2_callback]` | OAuth2/OIDC callback route |
@@ -234,6 +235,15 @@ tenant-scoped repo used via `across_tenants()` rejects the aggregate rather than
 returning a per-shard-partial answer. `DateBucket` and the `GroupedAggregate`
 builder live in `autumn_web::aggregate`. See "Grouped aggregate queries" in
 `docs/guide/repositories.md`.
+
+**(unreleased)** — `ListQuery` extractor + `SortDir` (#1126): an `Infallible`
+query extractor parsing `?sort=<col>`, `?dir=asc|desc`, and
+`?filter[<col>]=<val>`. It **never rejects** — an empty or unknown `sort` falls
+back to the model's default order, and an invalid `dir` falls back to `asc`
+(`SortDir::{Asc, Desc}`). The `#[repository]`-generated `list(&ListQuery,
+&PageRequest)` applies a typed per-column allowlist via Diesel `.into_boxed()`,
+so only real columns can reach SQL (unknown sort/filter columns are ignored, not
+injected).
 
 ## Db transactions
 
@@ -364,6 +374,30 @@ a WCAG 2.1 success criterion. Full narrative in `docs/guide/accessibility.md`.
   .query(qs).hx_target(sel).hx_push_url()` (prelude re-exports).
 - `autumn_web::ui::{WIDGETS_CSS, WIDGETS_CSS_PATH}` widget stylesheet.
 
+### Accessibility primitives (`autumn_web::a11y`, feature `maud`, unreleased — trunk-dev, #1706)
+
+Typed, accessible-by-construction replacements for raw `<img>` / `<button>` /
+`<input>` in `html!`. The accessible name is a **required constructor
+argument** on every primitive — a missing one is a compile error (enforced via
+trybuild), not a runtime `autumn a11y verify` miss.
+
+- `Img::new(src, alt)` — `<img>` with required `alt`; `Img::decorative(src)`
+  renders `alt=""` + `aria-hidden="true"` for a purely decorative image.
+- `Button::new(name)` — `<button>` with a required accessible name;
+  `Button::icon(icon, name)` pairs an icon with an `aria-label`; `ButtonType`
+  selects the rendered `type`.
+- `Link::new(href, text)` — `<a>` with required text; `Link::icon(href, icon,
+  name)` for an icon link; `.new_tab()` adds `target="_blank"` +
+  `rel="noopener noreferrer"`.
+- `MenuItem::new(name)` — renders `role="menuitem"` on a `<button
+  type="button">`, or on an `<a>` when `.href(..)` is set.
+- `TextField::new(...)` → `TextField<NoLabel>`, a typestate that only implements
+  `Render` after a label is supplied: `.label(..)` / `.aria_label(..)` /
+  `.labelled_by(..)` return `TextField<Labeled>`, so an unlabeled field cannot
+  be rendered.
+
+All prelude re-exported (see Prelude contents).
+
 ## Cache read-through (unreleased)
 
 `autumn_web::cache::{get_or_compute, get_or_compute_with,
@@ -464,6 +498,23 @@ building, wired into `Download` and the embedded static-asset path.
   `PolicyContext::has_scope/has_any_scope/has_all_scopes`, `autumn token
   issue --name/--scope/--expires-at | list | rotate`, admin `TokenAdminModel`.
 
+## Submit tokens (unreleased — trunk-dev, #1360)
+
+One-time, at-most-once form submission with no JS — defends against
+double-submits and replays.
+
+- `SubmitToken` extractor, `SubmitFormField` (renders the hidden
+  `_submit_token` field), and `SubmitTokenLayer` middleware.
+- On submit the token is consumed against the idempotency store: a first
+  submission runs the handler, a **replay** returns the cached response, and a
+  **concurrent duplicate** in flight gets `409`.
+- Config `[security.submit_token]`: `enabled` (default `true`), `field_name`
+  (default `_submit_token`), `ttl_secs` (default `600`), `in_flight_ttl_secs`
+  (default `86400`), `backend` (inherits `[idempotency].backend`; an inherited
+  in-memory backend in prod warns, while an explicit `memory` backend in prod
+  fails fast), `exempt_paths`.
+- The layer is applied inner to CSRF.
+
 ## Prelude contents
 
 `use autumn_web::prelude::*;` includes:
@@ -475,6 +526,8 @@ building, wired into `Download` and the embedded static-asset path.
   **Note**: `#[model]` and `#[repository]` are NOT in the prelude — use
   `#[autumn_web::model]` and `#[autumn_web::repository]` (qualified paths).
 - Rendering: `asset_url`, `Markup`, `PreEscaped`, `html!`.
+- Accessibility primitives (`maud` feature, **unreleased** — trunk-dev):
+  `Button`, `ButtonType`, `Img`, `Link`, `MenuItem`, `TextField`.
 - Extractors: `Db`, `Form`, `Json`, `Path`, `Query`, `State`, `Session`,
   `Auth`, `ApiToken`, `RequireApiToken`, `CsrfToken`, `CsrfFormField`,
   `PageRequest`, `Page`, `CursorRequest`, `CursorPage`, `Valid`,
@@ -765,6 +818,29 @@ Frequently used env keys:
 | `AUTUMN_STORAGE__BACKEND` | `storage.backend` |
 | `AUTUMN_CACHE__BACKEND` | `cache.backend` |
 | `AUTUMN_OBSERVABILITY__SERVER_TIMING` | `observability.server_timing` (unreleased — trunk-dev) — bool; `Server-Timing` response header opt-in. Defaults on in `dev`/`development`, off elsewhere. See `docs/guide/observability/server-timing.md`. |
+
+### `[server.tls]` (feature `tls`, unreleased — trunk-dev, #1603)
+
+In-process HTTPS termination on the same host:port (off by default).
+
+- `cert_path`, `key_path` — PEM cert/key.
+- `reload_interval_secs` (default `60`) — certs hot-reload by polling file
+  mtimes.
+- `handshake_timeout_secs` (default `10`).
+- Fail-fast at startup on bad / missing / mismatched / expired PEM.
+
+### `[server.tls.acme]` (feature `acme`, unreleased — trunk-dev, #1608)
+
+Automatic ACME certificate provisioning + renewal; builds on `tls`, off by
+default. Mutually exclusive with static `cert_path` / `key_path`.
+
+- `domains` (required, non-wildcard), `contact_email` (required).
+- `directory` — Let's Encrypt staging by default; `production` or a custom URL.
+- `cache_dir` (default `config/acme`).
+- `http_challenge_port` (default `80`).
+- `renew_before_days` (default `30`, must be `< 90`).
+- Automatic HTTP-01 provisioning + hourly leader-elected renewal. DNS-01 and
+  wildcard certs are out of scope (#1620).
 
 ## reexports module
 
