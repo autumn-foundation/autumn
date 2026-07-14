@@ -203,6 +203,154 @@ pub enum TicketState {
 }
 
 #[test]
+fn terminal_source_transition_fails_and_is_named() {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "src/order.rs",
+        r"
+#[lifecycle(
+    initial = Pending,
+    terminal(Delivered),
+    transitions(
+        Pending -> Shipped,
+        Shipped -> Delivered,
+        Delivered -> Reopened,
+    )
+)]
+pub enum OrderState {
+    Pending,
+    Shipped,
+    Delivered,
+    Reopened,
+}
+",
+    );
+    let output = run_lifecycle(dir.path(), &["check"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !output.status.success(),
+        "a transition out of a terminal state must exit non-zero\nstdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("terminal state 'Delivered'"),
+        "should name the offending terminal state\n{stdout}"
+    );
+    assert!(
+        stdout.contains("terminal-source"),
+        "should tag the terminal-source violation\n{stdout}"
+    );
+    assert!(stdout.contains("FAIL"), "stdout:\n{stdout}");
+}
+
+#[test]
+fn qualified_lifecycle_attribute_is_detected() {
+    // A qualified `#[autumn_web::lifecycle(...)]` invocation (valid Rust) must be
+    // recognized by the scanner; the enum below is unsound (Reopened is an
+    // unreachable dead-end), so detection means a non-zero exit that names it.
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "src/order.rs",
+        r"
+#[autumn_web::lifecycle(
+    initial = Pending,
+    terminal(Delivered),
+    transitions(
+        Pending -> Shipped,
+        Shipped -> Delivered,
+    )
+)]
+pub enum OrderState {
+    Pending,
+    Shipped,
+    Delivered,
+    Reopened,
+}
+",
+    );
+    let output = run_lifecycle(dir.path(), &["check"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !output.status.success(),
+        "a qualified #[autumn_web::lifecycle] must be detected and flagged\nstdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("OrderState"),
+        "should scan the qualified-attribute lifecycle\n{stdout}"
+    );
+    assert!(
+        stdout.contains("Reopened"),
+        "should name the unsound state in the qualified lifecycle\n{stdout}"
+    );
+    assert!(stdout.contains("FAIL"), "stdout:\n{stdout}");
+}
+
+#[test]
+fn lifecycle_nested_in_inline_module_is_detected() {
+    // A `#[lifecycle]` enum nested inside `mod orders { ... }` (and one nested a
+    // level deeper) must be walked recursively; both are unsound, so detection
+    // means a non-zero exit naming the offending states.
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "src/order.rs",
+        r"
+mod orders {
+    #[lifecycle(
+        initial = Pending,
+        terminal(Delivered),
+        transitions(
+            Pending -> Shipped,
+            Shipped -> Delivered,
+        )
+    )]
+    pub enum OrderState {
+        Pending,
+        Shipped,
+        Delivered,
+        Orphan,
+    }
+
+    mod inner {
+        #[lifecycle(
+            initial = Draft,
+            terminal(Published),
+            transitions(
+                Draft -> Published,
+            )
+        )]
+        pub enum PostState {
+            Draft,
+            Published,
+            Ghost,
+        }
+    }
+}
+",
+    );
+    let output = run_lifecycle(dir.path(), &["check"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !output.status.success(),
+        "a lifecycle nested in an inline module must be detected\nstdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("OrderState"),
+        "should scan the module-nested lifecycle\n{stdout}"
+    );
+    assert!(
+        stdout.contains("Orphan"),
+        "should name the unsound state in the module-nested lifecycle\n{stdout}"
+    );
+    assert!(
+        stdout.contains("PostState") && stdout.contains("Ghost"),
+        "should also scan the lifecycle nested one module deeper\n{stdout}"
+    );
+    assert!(stdout.contains("FAIL"), "stdout:\n{stdout}");
+}
+
+#[test]
 fn json_format_on_good_lifecycle_is_valid_and_exits_zero() {
     let dir = good_project();
     let output = run_lifecycle(dir.path(), &["check", "--format", "json"]);

@@ -6,7 +6,7 @@
 //! time*, that every declared `initial`/`terminal`/transition endpoint is a real
 //! enum variant and that only declared edges are callable. What the type system
 //! cannot see is the *shape* of the reachability graph the declared edges form.
-//! This pass closes that gap with three structural checks over the declared
+//! This pass closes that gap with four structural checks over the declared
 //! states and transitions of every `#[lifecycle]` enum in a project's source:
 //!
 //! - **existence** — `initial`, each terminal, and every transition endpoint
@@ -17,6 +17,9 @@
 //!   by following transitions (BFS from `initial`).
 //! - **dead-end** — every reachable, non-terminal state must be able to reach
 //!   *some* terminal state (reverse BFS from the terminals).
+//! - **terminal-source** — a declared terminal state must have no outgoing
+//!   transition (a "movable terminal" is not actually terminal). This mirrors
+//!   the by-construction compile error the macro emits.
 //!
 //! Like `autumn a11y verify` and `autumn i18n check`, this is a source scanner:
 //! it parses each `.rs` file with `syn` and inspects enums carrying a
@@ -202,6 +205,9 @@ pub enum ViolationKind {
     Reachability,
     /// A reachable non-terminal state cannot reach any terminal.
     DeadEnd,
+    /// A declared terminal state has an outgoing transition (a "movable
+    /// terminal"): a terminal state must have no outgoing edges.
+    TerminalSource,
 }
 
 impl ViolationKind {
@@ -210,6 +216,7 @@ impl ViolationKind {
             Self::Existence => "existence",
             Self::Reachability => "reachability",
             Self::DeadEnd => "dead-end",
+            Self::TerminalSource => "terminal-source",
         }
     }
 }
@@ -315,6 +322,21 @@ pub fn analyze(wf: &LifecycleDef) -> LifecycleReport {
         }
     }
 
+    // (d) TERMINAL-SOURCE — a declared terminal state must have no outgoing
+    // transitions, otherwise it is not actually terminal (an unsound "movable
+    // terminal"). This mirrors the by-construction compile error the macro
+    // emits, keeping the CLI gate honest even on source that would not compile.
+    let terminal_set: BTreeSet<&str> = wf.terminals.iter().map(String::as_str).collect();
+    for (from, to) in &wf.transitions {
+        if terminal_set.contains(from.as_str()) {
+            violations.push(Violation {
+                kind: ViolationKind::TerminalSource,
+                states: vec![from.clone()],
+                message: format!("terminal state '{from}' has an outgoing transition to '{to}'"),
+            });
+        }
+    }
+
     // Forward adjacency (from -> [to]) over declared edges.
     let mut forward: HashMap<&str, Vec<&str>> = HashMap::new();
     for (from, to) in &wf.transitions {
@@ -350,7 +372,6 @@ pub fn analyze(wf: &LifecycleDef) -> LifecycleReport {
     for (from, to) in &wf.transitions {
         reverse.entry(to.as_str()).or_default().push(from.as_str());
     }
-    let terminal_set: BTreeSet<&str> = wf.terminals.iter().map(String::as_str).collect();
     let mut can_reach_terminal: BTreeSet<&str> = BTreeSet::new();
     let mut queue: VecDeque<&str> = VecDeque::new();
     for t in &terminal_set {
@@ -474,9 +495,23 @@ fn scan_source(src: &str, file: &str, scan: &mut Scan) {
     let Ok(ast) = syn::parse_file(src) else {
         return;
     };
-    for item in &ast.items {
-        if let syn::Item::Enum(item_enum) = item {
-            collect_lifecycle_enum(item_enum, file, scan);
+    scan_items(&ast.items, file, scan);
+}
+
+/// Recursively walk a list of items, collecting every `#[lifecycle]` enum —
+/// including those nested inside inline modules (`mod orders { ... }`, stored as
+/// `Item::Mod` with `content`). Modules without inline content (`mod foo;`) have
+/// no items to walk and are ignored.
+fn scan_items(items: &[syn::Item], file: &str, scan: &mut Scan) {
+    for item in items {
+        match item {
+            syn::Item::Enum(item_enum) => collect_lifecycle_enum(item_enum, file, scan),
+            syn::Item::Mod(item_mod) => {
+                if let Some((_, inner)) = &item_mod.content {
+                    scan_items(inner, file, scan);
+                }
+            }
+            _ => {}
         }
     }
 }
@@ -484,11 +519,16 @@ fn scan_source(src: &str, file: &str, scan: &mut Scan) {
 /// If `item_enum` carries a `#[lifecycle(...)]` attribute, parse it into a
 /// [`LifecycleDef`]; a malformed attribute is recorded as an error naming `file`.
 fn collect_lifecycle_enum(item_enum: &syn::ItemEnum, file: &str, scan: &mut Scan) {
-    let Some(attr) = item_enum
-        .attrs
-        .iter()
-        .find(|a| a.path().is_ident("lifecycle"))
-    else {
+    // Match the attribute by its *last* path segment so both the bare
+    // `#[lifecycle(...)]` and qualified forms like `#[autumn_web::lifecycle(...)]`
+    // (valid Rust) are recognized — matching only `is_ident` would miss the
+    // qualified invocation and silently pass an unsound lifecycle.
+    let Some(attr) = item_enum.attrs.iter().find(|a| {
+        a.path()
+            .segments
+            .last()
+            .is_some_and(|s| s.ident == "lifecycle")
+    }) else {
         return;
     };
     let name = item_enum.ident.to_string();

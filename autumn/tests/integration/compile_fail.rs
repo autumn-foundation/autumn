@@ -26,6 +26,7 @@ fn compile_fail_tests() {
     t.compile_fail("tests/compile-fail/lifecycle_terminal_has_no_exit.rs");
     t.compile_fail("tests/compile-fail/lifecycle_start_only_on_initial.rs");
     t.compile_fail("tests/compile-fail/lifecycle_unknown_initial.rs");
+    t.compile_fail("tests/compile-fail/lifecycle_terminal_source.rs");
 
     // Model macro failures (require db feature)
     #[cfg(feature = "db")]

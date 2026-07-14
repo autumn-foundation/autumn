@@ -269,6 +269,18 @@ fn expand(item_enum: &ItemEnum, args: &LifecycleArgs) -> syn::Result<TokenStream
                 ),
             ));
         }
+        // Reject transitions *out of* a declared terminal state: a terminal
+        // state must have no outgoing edges, otherwise it is not actually
+        // terminal (an unsound "movable terminal").
+        if args.terminals.contains(&tr.from) {
+            return Err(syn::Error::new_spanned(
+                &tr.from,
+                format!(
+                    "terminal state `{}` cannot have an outgoing transition to `{}`",
+                    tr.from, tr.to
+                ),
+            ));
+        }
         let key = (tr.from.to_string(), tr.to.to_string());
         if seen_edges.contains(&key) {
             return Err(syn::Error::new_spanned(
@@ -589,6 +601,30 @@ mod tests {
         .unwrap();
         let err = expand(&item_enum, &args).unwrap_err();
         assert!(err.to_string().contains("Nowhere"), "{err}");
+    }
+
+    #[test]
+    fn terminal_source_transition_is_error() {
+        let item_enum: ItemEnum = syn::parse2(sample_enum()).unwrap();
+        let args: LifecycleArgs = syn::parse2(quote! {
+            initial = Draft,
+            terminal(Archived),
+            transitions(
+                Draft -> Archived,
+                Archived -> Draft,
+            )
+        })
+        .unwrap();
+        let err = expand(&item_enum, &args).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("terminal state `Archived`"),
+            "error should name the offending terminal: {msg}"
+        );
+        assert!(
+            msg.contains("Draft"),
+            "error should name the transition target: {msg}"
+        );
     }
 
     #[test]
