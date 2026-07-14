@@ -2594,29 +2594,12 @@ const PRE_1890_STRICT_PARENTS: &[&str] = &[
     "server.tls.acme",
 ];
 
-/// Strips a leading `profile.<name>.` scope so a profile-nested key classifies by
-/// its real section, matching how `validate_toml` strips the profile prefix.
-fn strip_profile_scope(path: &str) -> &str {
-    path.strip_prefix("profile.")
-        .and_then(|rest| rest.split_once('.').map(|(_, tail)| tail))
-        .unwrap_or(path)
-}
-
-/// Whether an unknown-key error at `path` was already hard-failing before the
-/// #1890 fix (its parent path was in the pre-fix schema). If so it keeps
-/// hard-failing; otherwise it is a newly-covered section handled warn-first.
-fn unknown_key_was_previously_strict(path: &str) -> bool {
-    let effective = strip_profile_scope(path);
-    // A top-level key (no `.`) has the root schema as its parent, which is
-    // always validated.
-    let parent = effective.rfind('.').map_or("", |i| &effective[..i]);
-    // A malformed top-level profile entry (e.g. `[profile] dev = "prod"` →
-    // error path `profile.dev`) is a structural error that was always fatal
-    // under strict_config — it is NOT a section newly revealed by #1890, so it
-    // must keep hard-failing. `strip_profile_scope` leaves a two-segment
-    // `profile.<name>` path unchanged, so its parent is the literal `profile`;
-    // no real newly-covered schema section ever has `profile` as its parent.
-    parent == "profile" || PRE_1890_STRICT_PARENTS.contains(&parent)
+/// Whether an unknown-key error whose (profile-stripped, segment-derived) schema
+/// parent is `schema_parent` was already hard-failing before #1890. Malformed
+/// top-level profile entries surface with parent `"profile"` (always fatal
+/// structural errors); everything else keys off the pre-#1890 parent set.
+fn unknown_key_was_previously_strict(schema_parent: &str) -> bool {
+    schema_parent == "profile" || PRE_1890_STRICT_PARENTS.contains(&schema_parent)
 }
 
 /// Child schema keys for config sections whose `Deserialize` is OPAQUE to the
@@ -2748,6 +2731,22 @@ impl AutumnConfig {
         content: &str,
         schema: &HashMap<String, HashSet<String>>,
     ) -> Vec<(String, Option<String>)> {
+        Self::validate_toml_detailed(content, schema)
+            .into_iter()
+            .map(|(path, sug, _parent)| (path, sug))
+            .collect()
+    }
+
+    /// Like [`validate_toml`](Self::validate_toml), but also returns each error's
+    /// profile-stripped schema parent path (computed from path SEGMENTS, so it is
+    /// correct even for quoted dotted profile names like
+    /// `[profile."prod.eu".server]`). Used by strict-config classification;
+    /// `validate_toml` maps this down to `(path, suggestion)`.
+    #[must_use]
+    pub(crate) fn validate_toml_detailed(
+        content: &str,
+        schema: &HashMap<String, HashSet<String>>,
+    ) -> Vec<(String, Option<String>, String)> {
         let Ok(table) = toml::from_str::<toml::Table>(content) else {
             return Vec::new();
         };
@@ -2763,7 +2762,7 @@ impl AutumnConfig {
         table: &toml::Table,
         path: &mut Vec<String>,
         schema: &HashMap<String, HashSet<String>>,
-        errors: &mut Vec<(String, Option<String>)>,
+        errors: &mut Vec<(String, Option<String>, String)>,
     ) {
         let mut schema_path_parts = Vec::new();
         if path.len() >= 2 && path[0] == "profile" {
@@ -2831,7 +2830,7 @@ impl AutumnConfig {
                         sug_parts.join(".")
                     });
 
-                    errors.push((full_path, suggestion));
+                    errors.push((full_path, suggestion, schema_path.clone()));
                 }
             }
         } else if path.len() == 1 && path[0] == "profile" {
@@ -2843,7 +2842,7 @@ impl AutumnConfig {
                 } else {
                     let mut full_path_parts = path.clone();
                     full_path_parts.push(k.clone());
-                    errors.push((full_path_parts.join("."), None));
+                    errors.push((full_path_parts.join("."), None, schema_path.clone()));
                 }
             }
         } else if path.is_empty() {
@@ -2859,7 +2858,7 @@ impl AutumnConfig {
                             closest = Some(valid_key);
                         }
                     }
-                    errors.push((k.clone(), closest.map(String::from)));
+                    errors.push((k.clone(), closest.map(String::from), schema_path.clone()));
                 } else {
                     path.push(k.clone());
                     match val {
@@ -3065,12 +3064,12 @@ impl AutumnConfig {
     /// tolerated for one release (warn-first rollout).
     fn run_strict_unknown_key_check(toml_str: &str, enforce_all: bool) -> Result<(), ConfigError> {
         let schema = Self::get_schema_keys();
-        let errors = Self::validate_toml(toml_str, &schema);
+        let errors = Self::validate_toml_detailed(toml_str, &schema);
 
         let mut hard_errors = Vec::new();
         let mut warn_only = Vec::new();
-        for (path, sug) in errors {
-            if enforce_all || unknown_key_was_previously_strict(&path) {
+        for (path, sug, schema_parent) in errors {
+            if enforce_all || unknown_key_was_previously_strict(&schema_parent) {
                 hard_errors.push((path, sug));
             } else {
                 warn_only.push((path, sug));
@@ -7785,6 +7784,85 @@ mod tests {
             res2.is_ok(),
             "a newly-#1890-covered section typo must still only warn under \
              strict_config (enforce_all off), proving the profile fix is narrow: {res2:?}"
+        );
+    }
+
+    // 7c″ (#1890 P2 fix): a typo under a QUOTED DOTTED profile name (e.g.
+    // `[profile."prod.eu".server]`) must classify by its real segment-derived
+    // schema parent. The `"prod.eu"` key is ONE TOML key (a literal dot), so the
+    // segmented path is `["profile", "prod.eu", "server"]` and the profile-stripped
+    // schema parent is `server` — a pre-#1890 strict section that must keep
+    // hard-failing, NOT be demoted to warn-only by string-splitting the joined
+    // path. A `[profile."prod.eu".resilience]` typo (a newly-#1890-covered section)
+    // with the same strict_config (enforce_all OFF) must still only warn — proving
+    // the fix stays narrow even under dotted profile names.
+    #[test]
+    fn dotted_profile_name_preserves_strictness() {
+        // Pre-#1890 strict section (`server`) under a quoted dotted profile name:
+        // must hard-fail.
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("autumn.toml");
+        std::fs::write(
+            &config_path,
+            "[profile.\"prod.eu\".server]\nbogus_zzz = true\n",
+        )
+        .unwrap();
+
+        let env = FakeEnv(
+            [
+                ("AUTUMN_SERVER__STRICT_CONFIG".to_owned(), "true".to_owned()),
+                // Non-dev profile so the `dev` smart-defaults' feature-gated
+                // `[storage]` table isn't injected; this test must fail on the
+                // `[server]` typo, not on `storage` (storage feature off).
+                ("AUTUMN_ENV".to_owned(), "prod".to_owned()),
+                (
+                    "AUTUMN_MANIFEST_DIR".to_owned(),
+                    temp.path().to_str().unwrap().to_owned(),
+                ),
+            ]
+            .into(),
+        );
+
+        let res = AutumnConfig::load_with_env(&env);
+        assert!(
+            res.is_err(),
+            "a [server] typo under a quoted dotted profile name must hard-fail \
+             (pre-#1890 strictness must not be downgraded by string-splitting the \
+             joined path): {res:?}"
+        );
+        let err_str = format!("{:?}", res.err().unwrap());
+        assert!(
+            err_str.contains("server") && err_str.contains("bogus_zzz"),
+            "hard-fail must be for the [server] typo (right reason): {err_str}"
+        );
+
+        // Newly-#1890-covered section (`resilience`) under the same quoted dotted
+        // profile name: must still only WARN (enforce_all off) — the fix is narrow.
+        let temp2 = tempfile::tempdir().unwrap();
+        let config_path2 = temp2.path().join("autumn.toml");
+        std::fs::write(
+            &config_path2,
+            "[profile.\"prod.eu\".resilience]\nboguz = 1\n",
+        )
+        .unwrap();
+
+        let env2 = FakeEnv(
+            [
+                ("AUTUMN_SERVER__STRICT_CONFIG".to_owned(), "true".to_owned()),
+                ("AUTUMN_ENV".to_owned(), "prod".to_owned()),
+                (
+                    "AUTUMN_MANIFEST_DIR".to_owned(),
+                    temp2.path().to_str().unwrap().to_owned(),
+                ),
+            ]
+            .into(),
+        );
+
+        let res2 = AutumnConfig::load_with_env(&env2);
+        assert!(
+            res2.is_ok(),
+            "a newly-#1890-covered section typo under a quoted dotted profile name \
+             must still only warn under strict_config (enforce_all off): {res2:?}"
         );
     }
 
