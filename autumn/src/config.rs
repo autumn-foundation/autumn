@@ -2617,9 +2617,59 @@ impl AutumnConfig {
     /// Recursively extracts all valid configuration schema keys and nested fields.
     #[must_use]
     pub fn get_schema_keys() -> HashMap<String, HashSet<String>> {
-        let deserializer = SchemaDeserializer::new();
-        let _ = Self::deserialize(deserializer.clone());
-        deserializer.into_schema()
+        // Adaptive multi-pass schema walk. `deserialize_any` probes with a scalar
+        // by default; any path whose visitor rejects that probe (a seq/map-only
+        // type such as `JobQueuesConfig` at `jobs.queues`) is escalated to a
+        // map- then seq-probe on the next pass, so the walk stops aborting there
+        // and enumerates every later section (#1890). Converges in two passes for
+        // the current config; the loop is bounded and monotonic (each escalated
+        // path only advances Str→Map→Seq), so it always terminates.
+        const MAX_PASSES: usize = 8;
+        let de = SchemaDeserializer::new();
+        let mut prev_rejected: Vec<String> = Vec::new();
+        for _ in 0..MAX_PASSES {
+            de.rejected
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clear();
+            let _ = Self::deserialize(de.clone());
+            let mut rejected: Vec<String> = std::mem::take(
+                &mut de
+                    .rejected
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            );
+            rejected.sort();
+            rejected.dedup();
+            if rejected.is_empty() {
+                break;
+            }
+            let mut advanced = false;
+            {
+                let mut probes = de
+                    .any_probe
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                for p in &rejected {
+                    let cur = probes.get(p).copied().unwrap_or(AnyProbe::Str);
+                    let next = match cur {
+                        AnyProbe::Str => AnyProbe::Map,
+                        AnyProbe::Map | AnyProbe::Seq => AnyProbe::Seq,
+                    };
+                    if next != cur {
+                        advanced = true;
+                    }
+                    probes.insert(p.clone(), next);
+                }
+            }
+            // No path could be escalated further and the rejected set is stable:
+            // any remaining aborter accepts none of str/map/seq — stop (leaf it).
+            if !advanced && rejected == prev_rejected {
+                break;
+            }
+            prev_rejected = rejected;
+        }
+        de.into_schema()
     }
 
     /// Returns a sorted set of all schema leaf key paths (e.g. `"server.port"`).
@@ -6971,10 +7021,24 @@ use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AnyProbe {
+    Str,
+    Map,
+    Seq,
+}
+
 #[derive(Clone)]
 pub struct SchemaDeserializer {
     path: Vec<String>,
     schema: Arc<Mutex<HashMap<String, HashSet<String>>>>,
+    /// Per-path override for what `deserialize_any` feeds. Absent = `Str`.
+    /// A path is escalated (Str→Map→Seq) across walk passes when its visitor
+    /// rejects the current probe (e.g. `jobs.queues`'s seq/map-only visitor
+    /// rejects the scalar `"0"`). See `get_schema_keys`.
+    any_probe: Arc<Mutex<HashMap<String, AnyProbe>>>,
+    /// Paths whose `deserialize_any` probe was rejected during the current pass.
+    rejected: Arc<Mutex<Vec<String>>>,
 }
 
 impl Default for SchemaDeserializer {
@@ -6989,6 +7053,8 @@ impl SchemaDeserializer {
         Self {
             path: Vec::new(),
             schema: Arc::new(Mutex::new(HashMap::new())),
+            any_probe: Arc::new(Mutex::new(HashMap::new())),
+            rejected: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -7009,19 +7075,46 @@ impl<'de> de::Deserializer<'de> for SchemaDeserializer {
     where
         V: Visitor<'de>,
     {
-        // `deserialize_any` is the probe serde routes self-describing shapes
-        // through: `#[serde(untagged)]` enums, `flatten`, and free-form `Value`
-        // types all buffer via it. Feeding an EMPTY string made any untagged or
-        // custom parser that rejects "" abort the ENTIRE remaining struct walk —
-        // e.g. `deserialize_duration` (via the untagged `DurationOrStr`) rejects
-        // "" and, before this fix (#1890), silently dropped every config section
-        // declared after `database.statement_timeout` from the derived schema,
-        // disabling strict unknown-key validation for them. "0" is the most
-        // permissive scalar probe: it is a valid non-empty string AND parses as
-        // an integer/duration, so untagged string- and number-shaped parsers both
-        // accept it and traversal keeps descending. Mirrors the enum-tag fix in
-        // `deserialize_enum` (#1608).
-        visitor.visit_str("0")
+        // `deserialize_any` is inherently ambiguous for a placeholder walker:
+        // untagged SCALAR parsers (e.g. `deserialize_duration`) need a string,
+        // while a visitor that accepts only seq/map (e.g. `JobQueuesConfig` at
+        // `jobs.queues`) rejects a string and aborts the whole remaining walk
+        // (#1890). We can't know which shape a given visitor wants, and serde
+        // seeds can't be retried mid-walk, so we probe with a scalar by default
+        // and let `get_schema_keys` re-run the walk, escalating any REJECTED
+        // path to a map/seq probe on the next pass until none reject.
+        let path = self.path.join(".");
+        let probe = self
+            .any_probe
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&path)
+            .copied()
+            .unwrap_or(AnyProbe::Str);
+        let result = match probe {
+            // "0" is a valid non-empty string that also parses as an int/duration,
+            // so untagged string- and number-shaped scalar parsers both accept it.
+            AnyProbe::Str => visitor.visit_str("0"),
+            // Empty map/seq: a seq/map-only visitor accepts it and yields an empty
+            // value, so the walk records the field as a leaf and CONTINUES past it
+            // (we intentionally do NOT descend — e.g. jobs.queues has dynamic keys).
+            AnyProbe::Map => visitor.visit_map(SchemaMapAccess {
+                fields: [].iter(),
+                current_field: None,
+                deserializer: self.clone(),
+            }),
+            AnyProbe::Seq => visitor.visit_seq(SchemaSeqAccess {
+                done: true,
+                deserializer: self.clone(),
+            }),
+        };
+        if result.is_err() {
+            self.rejected
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(path);
+        }
+        result
     }
 
     fn deserialize_bool<V>(self, visitor: V) -> Result<V::Value, Self::Error>
@@ -7325,6 +7418,8 @@ impl<'de> MapAccess<'de> for SchemaMapAccess {
         let nested = SchemaDeserializer {
             path: new_path,
             schema: self.deserializer.schema.clone(),
+            any_probe: self.deserializer.any_probe.clone(),
+            rejected: self.deserializer.rejected.clone(),
         };
         seed.deserialize(nested)
     }
@@ -12119,8 +12214,13 @@ redirect_uri = "http://localhost:3000/auth/github/callback"
 
     #[test]
     fn red_schema_leaf_paths_includes_known_paths() {
-        // The SchemaDeserializer only recurses into structs defined in config.rs itself;
-        // external module types (SecurityConfig, AuthConfig, etc.) appear as root leaves only.
+        // The SchemaDeserializer recurses into any derived-Deserialize struct it
+        // reaches, regardless of module — external-module types (SecurityConfig,
+        // AuthConfig, etc.) now descend too. They were root-only before the #1890
+        // adaptive walk because the walk aborted before them (at the
+        // `statement_timeout` duration / the `jobs.queues` seq-only visitor), not
+        // because of their module. Each still also appears as a bare root leaf
+        // (recorded as a field of the root struct).
         let leaves = AutumnConfig::schema_leaf_paths();
         assert!(
             leaves.contains("server.port"),
@@ -12134,8 +12234,8 @@ redirect_uri = "http://localhost:3000/auth/github/callback"
             leaves.contains("database.url"),
             "database.url must be a schema leaf"
         );
-        // Root-level sections appear as single-segment leaves (the schema records them as
-        // fields of the root struct, but doesn't descend into their external-module types).
+        // Root-level sections also appear as single-segment leaves (recorded as
+        // fields of the root struct), alongside their now-descended child keys.
         assert!(
             leaves.contains("security"),
             "security must appear as a root-level leaf"
