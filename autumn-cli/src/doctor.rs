@@ -5881,8 +5881,17 @@ pub fn run(opts: DoctorOptions) {
     // `AutumnConfig::load()` so doctor grades the same target as `deploy check`
     // for an env-only or env-overridden deploy — instead of skipping or probing
     // a stale/base host.
+    // Read AUTUMN_DEPLOY__* through the profile-aware `.env` overlay so doctor
+    // resolves the same deploy target as `autumn deploy check` (AutumnConfig::load
+    // layers dotenv). Real OS env still wins; fall back to bare OS env only if the
+    // overlay can't be built (a malformed `.env`), matching the TLS/offsite-backup checks.
+    let deploy_denv: Box<dyn autumn_web::config::Env> =
+        match autumn_web::dotenv::os_env_with_dotenv_for_profile(&deploy_canonical) {
+            Ok(e) => Box::new(e),
+            Err(_) => Box::new(autumn_web::config::OsEnv),
+        };
     let (deploy_cfg, deploy_config_check) =
-        resolve_deploy_doctor_config(&merged_deploy_toml, &autumn_web::config::OsEnv);
+        resolve_deploy_doctor_config(&merged_deploy_toml, deploy_denv.as_ref());
     if let Some(check) = deploy_config_check {
         tasks.push(Box::new(move || check));
     }

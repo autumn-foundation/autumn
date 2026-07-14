@@ -6148,6 +6148,8 @@ pub struct CompressionConfig {
 /// Shared by [`AutumnConfig::load`] and `autumn doctor`'s deploy preflight so
 /// both surfaces resolve the identical deploy target (host, `ssh_port`, …) for the
 /// same environment + profile + TOML.
+// Exposed for autumn-cli's `autumn deploy` preflight (doctor) to reuse the deploy env-override logic; not yet a stable public API.
+#[doc(hidden)]
 pub fn apply_deploy_env_overrides(deploy: &mut Option<DeployConfig>, env: &dyn Env) {
     const KEYS: [&str; 8] = [
         "AUTUMN_DEPLOY__HOST",

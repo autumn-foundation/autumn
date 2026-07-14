@@ -110,6 +110,45 @@ fn doctor_fails_offline_on_deploy_without_host() {
 }
 
 #[test]
+fn doctor_reads_deploy_host_from_dotenv() {
+    // Regression: doctor must layer .env like `deploy check` (Codex round-10 P2)
+    // — bare OsEnv would skip this. With NO `[deploy]` in autumn.toml and the
+    // deploy host supplied ONLY via `AUTUMN_DEPLOY__HOST` in a `.env` file, the
+    // profile-aware dotenv overlay must materialize the deploy config so the
+    // `deploy_host` preflight RUNS (and passes) instead of being skipped — which
+    // is exactly what happens if doctor resolves through a bare `OsEnv`.
+    let dir = tempfile::tempdir().expect("create temp project dir");
+    // Package name for the app-name default; deliberately NO `[deploy]` section
+    // in autumn.toml so that, absent dotenv, the deploy preflight is skipped.
+    fs::write(
+        dir.path().join("Cargo.toml"),
+        "[package]\nname = \"demoapp\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .expect("write Cargo.toml");
+    fs::write(dir.path().join("autumn.toml"), "").expect("write autumn.toml");
+    // Host arrives ONLY through `.env` — never the process env — so the test
+    // proves the dotenv overlay path, not an OS-env read.
+    fs::write(
+        dir.path().join(".env"),
+        "AUTUMN_DEPLOY__HOST=deploy.example.test\n",
+    )
+    .expect("write .env");
+
+    // `AUTUMN_DOTENV=1` force-loads `.env` regardless of the resolved profile so
+    // the test is deterministic; it does NOT carry the deploy host itself.
+    let (stdout, stderr, _code) = run_autumn(dir.path(), &["doctor"], &[("AUTUMN_DOTENV", "1")]);
+    let combined = format!("{stdout}{stderr}");
+    // Passing check renders as `✅ deploy_host — deploy target host is configured`
+    // (see `format_check_line` / `grade_deploy_host_present`). Its presence means
+    // the env-only host materialized a deploy config and the preflight ran.
+    assert!(
+        combined.contains("deploy_host — deploy target host is configured"),
+        "doctor must resolve the .env-only deploy host and run the deploy_host \
+         check (bare OsEnv would skip it)\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+}
+
+#[test]
 fn deploy_help_lists_subcommands() {
     let dir = tempfile::tempdir().expect("temp dir");
     let (stdout, stderr, code) = run_autumn(dir.path(), &["deploy", "--help"], &[]);
