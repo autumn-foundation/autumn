@@ -460,34 +460,61 @@ fn plan_scaffold_with_options_impl(
             super::policy::OwnerColumn { name, nullable }
         })
     };
-    // Inline authorize/scope wiring is emitted only on the standard (non-live,
-    // non-sharded) diesel path and only when an owner column exists: a
-    // default-deny policy wired into every mutation would make a fresh
-    // no-owner scaffold reject all updates/deletes out of the box. The policy
-    // is still generated and registered in every non-`--api` case either way,
-    // so the resource always ships an enforceable authorization surface.
-    let authorize_wiring = policy_on
-        && owner_column.is_some()
+    // Issue #1830: inline record-level authorization is emitted on EVERY scaffold
+    // variant (standard, `--live`, `--sharded`, attachment) whenever a policy is
+    // generated — including the no-owner case. The per-variant plumbing differs
+    // (repository vs raw diesel vs a reused attachment `State`) but every mutating
+    // handler loads its target row and record-authorizes the actor. Routing the
+    // mutation through the policy gives the developer ONE place to tighten the
+    // rule; the generated no-owner policy authorizes any authenticated user (a
+    // no-regression over the prior `#[secured]`-only handlers, which already let
+    // any authenticated user mutate any row — see `policy.rs`), so a fresh
+    // no-owner scaffold never 403s out of the box.
+    let authorize_routes = policy_on;
+    // Whether the index is owner-scoped: only when an owner column exists. A
+    // no-owner scaffold authorizes its handlers but keeps the unscoped index
+    // (there is no column to filter on).
+    let owner_authorizes = policy_on && owner_column.is_some();
+    // The standard (non-live, non-sharded) diesel OWNER path. Retained as the
+    // signal for the cross-user 403 smoke test, which drives real HTTP create/
+    // update/delete as two users and is only meaningful with an owner column (the
+    // no-owner policy authorizes any authenticated user, so a cross-user denial
+    // would not hold) and only wired for the plain diesel path (the live SSE and
+    // sharded runtimes need extra harness the smoke test doesn't set up).
+    let authorize_wiring = owner_authorizes
         && !options_with_key.model.sharded
         && !options_with_key.live
         && !options_with_key.live_validation;
 
-    // Issue #1319 security guard: the generated `GET /{plural}/search` handler calls
-    // the repository's UNSCOPED `search_page`, which returns rows for ALL users. When
-    // the model is owner-scoped, the index view is `#[secured]` and filters to the
-    // current user's rows — so pairing `--searchable` with owner scoping would leak
-    // other users' rows through the search endpoint that the list view prevents.
-    // Owner-scoped FTS needs a scoped `search_page` in the repository macro (framework
-    // work, tracked in #1841); until then, refuse the unsafe combination. Returns
-    // before the plan is built, so no files are written.
-    if !options_with_key.model.searchable.is_empty() && authorize_wiring {
+    // Issue #1841: owner-scoped full-text search is now supported on the STANDARD
+    // (non-live, non-sharded) Db path. The `#[repository(..., owner = <col>)]`
+    // attr makes the macro emit an owner-filtered `search_page_scoped` (and
+    // `list_scoped`), and the generated `GET /{plural}/search` + owner-scoped
+    // index call ONLY those scoped methods — never the unscoped `search_page`/
+    // `page`. So `--searchable` + owner scoping is safe there and no longer
+    // refused.
+    //
+    // The `--sharded` owner path is NOT yet wired: its index/search still run
+    // through per-shard raw diesel / the unscoped `search_page`, and a scoped
+    // cross-shard FTS is out of scope here (follow-up). Search is force-disabled
+    // for `--live`/`--live-validation` (see `search_enabled`), so the only
+    // remaining unsafe combination is owner-scoped `--sharded` `--searchable` —
+    // keep refusing exactly that. Returns before the plan is built, so no files
+    // are written.
+    if !options_with_key.model.searchable.is_empty()
+        && owner_authorizes
+        && options_with_key.model.sharded
+        && !options_with_key.live
+        && !options_with_key.live_validation
+    {
         return Err(GenerateError::Config(format!(
-            "`--searchable` is not yet supported for owner-scoped models: full-text search \
-             (`search_page`) is not owner-scoped, so the generated `GET /{plural}/search` \
-             endpoint would expose other users' rows that the `#[secured]` index view \
-             filters out (owner column `{owner}`). Remove `--searchable`, drop the owner \
-             column, or pass `--no-policy` to opt out of owner scoping. Track: framework \
-             support for owner-scoped FTS (issue #1841).",
+            "`--searchable` is not yet supported for owner-scoped `--sharded` models: the \
+             sharded index/search run per-shard through the UNSCOPED `search_page`, so the \
+             generated `GET /{plural}/search` endpoint would expose other users' rows in the \
+             same shard that the `#[secured]` index view filters out (owner column `{owner}`). \
+             Drop `--sharded` (the standard Db path supports owner-scoped search), remove \
+             `--searchable`, drop the owner column, or pass `--no-policy` to opt out of owner \
+             scoping. Track: owner-scoped FTS for sharded repositories (follow-up to #1841).",
             owner = owner_column.as_ref().map_or("user_id", |o| o.name.as_str()),
         )));
     }
@@ -594,6 +621,15 @@ fn plan_scaffold_with_options_impl(
             options_with_key.model.sharded,
             options_with_key.live,
             !options_with_key.model.searchable.is_empty(),
+            // Issue #1841: emit `owner = <col>` (→ the macro's `list_scoped` /
+            // `search_page_scoped` codegen) only on the standard owner-scoped Db
+            // path — `authorize_wiring` is exactly `owner present && policy on &&
+            // !sharded && !live && !live_validation`, the path whose index/search
+            // this PR wires to the scoped methods. Live/sharded owner indexes are
+            // left as #1830 emitted them (follow-up), so they get no `owner =`.
+            authorize_wiring
+                .then(|| owner_column.as_ref().map(|o| o.name.as_str()))
+                .flatten(),
         ),
     );
     let repo_mod_path = repos_dir.join("mod.rs");
@@ -674,7 +710,7 @@ fn plan_scaffold_with_options_impl(
                 options_with_key.live_validation,
                 metadata.validations(),
                 &missing_reference_targets,
-                authorize_wiring,
+                authorize_routes,
                 owner_column.as_ref().map(|o| o.name.as_str()),
                 &options_with_key.model.searchable,
             ),
@@ -1299,6 +1335,7 @@ fn render_repository_file(
     sharded: bool,
     live: bool,
     searchable: bool,
+    owner_column: Option<&str>,
 ) -> String {
     let plural = pluralize(snake_name);
     let query_body = render_repository_queries(pascal_name, queries);
@@ -1320,6 +1357,13 @@ fn render_repository_file(
     // `search_page(query, &PageRequest)` methods (backed by the model's
     // `#[searchable]` fields + the migration's `search_vector` column).
     let searchable_attr = if searchable { ", searchable" } else { "" };
+    // Issue #1841: `owner = <col>` makes `#[repository]` emit owner-filtered
+    // `list_scoped` / `search_page_scoped` methods that the owner-scoped index +
+    // `/search` handlers call so they never return another user's rows. Only the
+    // caller's in-scope standard Db path passes `Some`; every other scaffold
+    // (no owner column, `--no-policy`, `--live`, `--sharded`) passes `None` and
+    // the attr — and the scoped methods — are omitted.
+    let owner_attr = owner_column.map_or(String::new(), |col| format!(", owner = {col}"));
     let sharded_note = if sharded {
         format!(
             "//!\n\
@@ -1426,7 +1470,7 @@ fn render_repository_file(
          use crate::models::{snake_name}::{{{pascal_name}, New{pascal_name}, Update{pascal_name}{draft_ext_import}}};\n\
          use crate::schema::{plural};\n\
          \n\
-         #[autumn_web::repository({pascal_name}, api = \"/api/{plural}\"{soft_delete_attr}{broadcasts_attr}{searchable_attr})]\n\
+         #[autumn_web::repository({pascal_name}, api = \"/api/{plural}\"{soft_delete_attr}{broadcasts_attr}{searchable_attr}{owner_attr})]\n\
          pub trait {pascal_name}Repository {{\n\
 {query_body}\
          }}\n\
@@ -1798,22 +1842,69 @@ fn render_routes_file(
     let update_columns = render_update_columns(plural, fields);
     let nullable_field_match = render_nullable_field_match(fields);
     let has_attachments = has_attachment_fields(fields);
-    // Issue #1125: inline record-level authorization on the mutating HTML
-    // handlers + owner-scoped index. The caller only sets `authorize` on the
-    // standard (non-live, non-sharded) path with an owner column; attachment
-    // scaffolds already thread a `state:` param through `into_new`, so they are
-    // excluded here to avoid a conflicting second `state` extractor.
-    let authorize = authorize && !has_attachments;
+    // Issue #1125/#1830: inline record-level authorization on the mutating HTML
+    // handlers + owner-scoped index. The caller sets `authorize` whenever an
+    // owner column exists, on EVERY variant. Attachment scaffolds already thread
+    // a `state: State<AppState>` param through `create`/`update` (for the
+    // multipart upload), so those two handlers reuse it rather than injecting a
+    // second, conflicting `State` extractor — see `create_update_authz_params` /
+    // `create_update_state_expr` below.
     // The owner column name (`user_id`/`author_id`/`owner_id`/a users FK). Only
-    // read when `authorize` is set (so the caller always passed `Some`).
+    // read when `owner_scoped_index` is set (so the caller passed `Some`).
     let owner_col = owner.unwrap_or("user_id");
-    // Extra handler params (`State` + `Session`) the authorize wiring needs.
-    // No trailing comma — each insertion site supplies its own delimiter.
-    let authz_params = if authorize {
+    // Issue #1830: the index is owner-scoped only when an owner column exists. A
+    // no-owner scaffold still record-authorizes its mutating handlers (`authorize`
+    // is set), but its index cannot filter by owner, so it keeps the unscoped
+    // listing.
+    let owner_scoped_index = authorize && owner.is_some();
+    // Issue #1841: the STANDARD (non-live, non-live-validation, non-sharded) Db
+    // owner path is the only one whose repository carries `owner = <col>` (see
+    // `render_repository_file`), so it is the only one whose index/search can call
+    // the macro's owner-filtered `list_scoped` / `search_page_scoped`. That path
+    // gets the sort/filter data_table + the search box, both safely scoped to the
+    // current user. The `--sharded`/`--live`/`--live-validation` owner indexes
+    // keep the #1830 manual owner-filtered query (no scoped repo methods emitted).
+    let owner_scoped_standard = owner_scoped_index && !sharded && !live && !live_validation;
+    // The full extractor pair the authorize wiring needs on handlers that do not
+    // already carry a `state:` wrapper. No trailing comma — each insertion site
+    // supplies its own delimiter.
+    let authz_params_full = if authorize {
         "\n    autumn_web::extract::State(state): autumn_web::extract::State<autumn_web::AppState>,\
          \n    session: autumn_web::session::Session"
     } else {
         ""
+    };
+    // Attachment `create`/`update` already own a `state: State<AppState>` param;
+    // a second `State(state)` would be a duplicate binding (why #1125 excluded
+    // attachments), so those two handlers gain ONLY `session` and deref the
+    // existing wrapper (`&*state`) in their authorize calls. `edit`/`destroy`
+    // never carry `state`, so they take the full pair.
+    let authz_params_session_only = if authorize {
+        "\n    session: autumn_web::session::Session"
+    } else {
+        ""
+    };
+    let create_update_authz_params = if has_attachments {
+        authz_params_session_only
+    } else {
+        authz_params_full
+    };
+    let edit_destroy_authz_params = authz_params_full;
+    // The `AppState` receiver expression for the authorize calls: create/update
+    // deref the reused attachment wrapper (`State<T>` → `T`); everything else
+    // binds `AppState` directly via the injected `State(state)`.
+    let create_update_state_expr = if has_attachments { "&*state" } else { "&state" };
+    let edit_destroy_state_expr = "&state";
+    // The attachment `update` handler loads `current` after parsing the multipart
+    // body (to preserve un-replaced blobs); record-authorize the actor against
+    // that same already-loaded row before writing, instead of a second load.
+    // Spliced into `update_new_block` right after its `current` load.
+    let authz_attachment_update = if authorize && has_attachments {
+        format!(
+            "autumn_web::authorization::authorize::<{pascal_name}>({create_update_state_expr}, &session, \"update\", &current).await?;\n    "
+        )
+    } else {
+        String::new()
     };
     // Every PRESENT `references` field (its target model — and so its
     // `src/schema.rs` entry — is in the project; `missing_reference_targets`
@@ -2065,25 +2156,25 @@ fn render_routes_file(
         String::new()
     };
 
-    // Issue #1125: thread `State` + `Session` into the mutating handlers so they
-    // can run `authorize::<{Pascal}>(...)` (and `authorize_create::<{Pascal}>`
-    // in `create`). Inserted before the body-consuming `Bytes` extractor in
-    // `create`/`update` (axum requires `Bytes` last) and appended to the
-    // `destroy` arg list (no body extractor). Only applied on the standard path
-    // (`authorize` already excludes live/sharded/attachment scaffolds).
+    // Issue #1125/#1830: thread the extractors the authorize wiring needs into
+    // the mutating handlers. Inserted before the body-consuming `Bytes` extractor
+    // in `create`/`update` (axum requires `Bytes` last) and appended to the
+    // `destroy` arg list (no body extractor). `create`/`update` on the attachment
+    // path reuse their existing `state:` wrapper and add only `session`; every
+    // other authorized handler gets the full `State` + `Session` pair.
     let (create_signature, update_signature, destroy_signature_arg) = if authorize {
         (
             create_signature.replacen(
                 "body: Bytes",
-                &format!("{authz_params},\n    body: Bytes"),
+                &format!("{create_update_authz_params},\n    body: Bytes"),
                 1,
             ),
             update_signature.replacen(
                 "\n    body: Bytes",
-                &format!("{authz_params},\n    body: Bytes"),
+                &format!("{create_update_authz_params},\n    body: Bytes"),
                 1,
             ),
-            format!("{destroy_signature_arg},{authz_params}"),
+            format!("{destroy_signature_arg},{edit_destroy_authz_params}"),
         )
     } else {
         (create_signature, update_signature, destroy_signature_arg)
@@ -2301,7 +2392,7 @@ fn render_routes_file(
             let name = &f.name;
             let _ = write!(binds, "\n    new.{name} = {name}_blob.or(current.{name});");
         }
-        format!("{load_current}{into_new_bind}{binds}")
+        format!("{load_current}{authz_attachment_update}{into_new_bind}{binds}")
     } else {
         format!("let new = {into_new_call};")
     };
@@ -2496,7 +2587,7 @@ fn render_routes_file(
     // so this uses `authorize_create` (context-only) rather than `authorize`.
     let authz_create_call = if authorize {
         format!(
-            "autumn_web::authorization::authorize_create::<{pascal_name}>(&state, &session).await?;\n    "
+            "autumn_web::authorization::authorize_create::<{pascal_name}>({create_update_state_expr}, &session).await?;\n    "
         )
     } else {
         String::new()
@@ -2582,32 +2673,61 @@ fn render_routes_file(
              Ok(autumn_web::Redirect::to(&paths::show(*id)).into_response())"
         )
     };
-    // Issue #1125: on the standard authorized path, load the target row and run
-    // the policy check *before* touching it, so a forbidden actor is denied
-    // (404/403 per config) before any write. Loading first also gives the same
-    // not-found behavior the post-update `updated == 0` guard provides.
-    // `update` and `destroy` share the same load-then-authorize preamble; only
-    // the policy action differs.
-    let authz_mutation_preamble = |action: &str| {
-        if authorize {
+    // Issue #1125/#1830: load the target row and run the policy check *before*
+    // touching it, so a forbidden actor is denied (404/403 per config) before any
+    // write. Loading first also gives the same not-found behavior the post-update
+    // `updated == 0` guard provides. The load handle depends on the variant: the
+    // `repo` extractor on `--live`, a `from_shard` repository on `--sharded`, and
+    // raw diesel otherwise — all three yield the same `{Pascal}` row type.
+    let load_current_stmt = |binding: &str| -> String {
+        if live && !sharded {
             format!(
-                "let current: {pascal_name} = {plural}::table\n        \
+                "let {binding}: {pascal_name} = repo.find_by_id(*id).await?\n        \
+                 .ok_or_else(|| AutumnError::not_found_msg(format!(\"{pascal_name} with id {{}} not found\", *id)))?;\n    "
+            )
+        } else if sharded {
+            format!(
+                "let {binding}: {pascal_name} = Pg{pascal_name}Repository::from_shard(&db).find_by_id(*id).await?\n        \
+                 .ok_or_else(|| AutumnError::not_found_msg(format!(\"{pascal_name} with id {{}} not found\", *id)))?;\n    "
+            )
+        } else {
+            format!(
+                "let {binding}: {pascal_name} = {plural}::table\n        \
                  .find(*id)\n        \
                  .select({pascal_name}::as_select())\n        \
                  .first(&mut *db)\n        \
                  .await\n        \
-                 .map_err(AutumnError::not_found)?;\n    \
-                 autumn_web::authorization::authorize::<{pascal_name}>(&state, &session, \"{action}\", &current).await?;\n    "
+                 .map_err(AutumnError::not_found)?;\n    "
             )
-        } else {
-            String::new()
         }
     };
-    let authz_update_preamble = authz_mutation_preamble("update");
-    let authz_destroy_preamble = authz_mutation_preamble("delete");
+    // Update: on the attachment path the handler already loads `current` (after
+    // parsing multipart, to preserve un-replaced blobs) and authorizes there via
+    // `authz_attachment_update`, so no up-front preamble is emitted. Every other
+    // variant loads + authorizes here.
+    let authz_update_preamble = if authorize && !has_attachments {
+        format!(
+            "{load}autumn_web::authorization::authorize::<{pascal_name}>({state}, &session, \"update\", &current).await?;\n    ",
+            load = load_current_stmt("current"),
+            state = create_update_state_expr,
+        )
+    } else {
+        String::new()
+    };
+    // Destroy: no form body, so always load + authorize up front (`&state`, since
+    // `destroy` takes the full `State` pair even on the attachment path).
+    let authz_destroy_preamble = if authorize {
+        format!(
+            "{load}autumn_web::authorization::authorize::<{pascal_name}>({state}, &session, \"delete\", &current).await?;\n    ",
+            load = load_current_stmt("current"),
+            state = edit_destroy_state_expr,
+        )
+    } else {
+        String::new()
+    };
     let authz_edit_call = if authorize {
         format!(
-            "autumn_web::authorization::authorize::<{pascal_name}>(&state, &session, \"edit\", &row).await?;\n    "
+            "autumn_web::authorization::authorize::<{pascal_name}>({edit_destroy_state_expr}, &session, \"edit\", &row).await?;\n    "
         )
     } else {
         String::new()
@@ -2735,12 +2855,12 @@ fn render_routes_file(
     // headers are opted-in per column by `render_columns_vec`.
     let table_render = if live {
         String::new()
-    } else if authorize {
-        // #1125 owner-scoped index: the handler runs a manual owner-filtered
-        // query (not `repo.list`) and does not extract `ListQuery`, so its
-        // data_table stays on the plain (non-sort/filter) config. #1126's
-        // allowlisted sort/filter is not owner-scoped — the same limitation the
-        // `--searchable` guard documents for owner-scoped FTS.
+    } else if owner_scoped_index && !owner_scoped_standard {
+        // #1830 owner-scoped `--sharded`/`--live-validation` index: the handler
+        // runs a manual owner-filtered query (not a scoped repo method) and does
+        // not extract `ListQuery`, so its data_table stays on the plain
+        // (non-sort/filter) config. Wiring owner-scoped sort/filter there is a
+        // follow-up (issue #1841 covers the standard Db path only).
         format!(
             r#"(autumn_web::widgets::data_table(&page_data.content, &columns, &autumn_web::widgets::DataTableConfig::new("No {plural} yet.").base_path(&paths::index())))"#
         )
@@ -2790,12 +2910,67 @@ fn render_routes_file(
     // (issue #1146) before building its property rows.
     let show_label_loads = render_show_reference_label_loads(all_fields, &reference_displays);
 
-    let index_handler = if authorize {
-        // Issue #1125: owner-scoped index. `authorize` implies the standard
-        // (non-live, non-sharded) path, so this branch is the only one that
-        // needs to filter by the owner column. Pagination is preserved by
+    // Issue #1830: the owner-scoped index runs a manual owner-filtered query on
+    // whichever connection the variant threads — `ShardedDb` (pinned to the
+    // current shard, exactly like the generated `show`/`create` handlers) when
+    // `--sharded`, `Db` otherwise. Both deref (`&mut *db`) to a diesel-async
+    // connection the count/load queries run against.
+    let owner_index_db_param = if sharded {
+        "mut db: ShardedDb"
+    } else {
+        "mut db: Db"
+    };
+    let index_handler = if owner_scoped_standard {
+        // Issue #1841: standard owner-scoped index. Delegates to the macro's
+        // owner-filtered `list_scoped(owner_id, &list_query, &page_req)` — the
+        // SECURITY INVARIANT is that this branch NEVER calls the unscoped
+        // `repo.list`/`repo.page`, so the allowlisted sort/filter and (when
+        // searchable) the search box can be exposed while every row stays scoped
+        // to the current user. `owner_id` is resolved from the same
+        // `PolicyContext` the mutating handlers authorize against.
+        format!(
+            r#"/// `GET /{plural}` — paginated, sortable, filterable list of the {snake_name}s
+/// the current user owns.
+///
+/// Accepts `?page=N&size=M` paging plus allowlisted `?sort=col&dir=asc|desc`
+/// and `?filter[col]=val` params (the [`ListQuery`] extractor). Unknown or
+/// malicious sort/filter keys are ignored against the model's column allowlist,
+/// so this never 400s and can never inject SQL. Filtered to the authenticated
+/// user's rows (owner column `{owner_col}`) via the repository's owner-scoped
+/// `list_scoped` — the same rule the registered `{pascal_name}Scope` enforces
+/// for `#[repository(scope = ...)]` index routes. This handler never calls the
+/// unscoped `list`/`page`, so it cannot return another user's rows.
+#[secured]
+#[get("/{plural}")]
+pub async fn index(
+    list_query: ListQuery,
+    RawQuery(raw_query): RawQuery,
+    page_req: PageRequest,
+    autumn_web::extract::State(state): autumn_web::extract::State<autumn_web::AppState>,
+    session: autumn_web::session::Session,
+    repo: Pg{pascal_name}Repository,
+    {index_db_param}flash: Flash,
+) -> AutumnResult<Markup> {{
+    let ctx = autumn_web::authorization::PolicyContext::from_request(&state, &session).await;
+    let owner_id = ctx.user_id_i64().unwrap_or(-1);
+    let page_data: Page<{pascal_name}> = repo.list_scoped(owner_id, &list_query, &page_req).await?;
+    let pager_query = raw_query.as_deref().unwrap_or("");
+{index_label_loads}{index_columns_labeled}    Ok({layout_fn}("{pascal_name} index", {cp_index}{flash_arg}, html! {{
+        h1 {{ "{pascal_name}s" }}
+        a href=(paths::new()) {{ "New {pascal_name}" }}
+        {index_list_block}
+    }}))
+}}"#
+        )
+    } else if owner_scoped_index {
+        // Issue #1125/#1830: owner-scoped index for the `--sharded`/`--live`/
+        // `--live-validation` variants (whose repositories carry no `owner =`
+        // attr, so no scoped repo method exists). Pagination is preserved by
         // running a `COUNT(*)` + `LIMIT/OFFSET` query filtered to the current
-        // user's rows, then wrapping the result in `Page::new`.
+        // user's rows, then wrapping the result in `Page::new`. `{list_render}`
+        // keeps the `--live` SSE `<ul>` island (a data_table for the non-live
+        // variants), so the SSE broadcast contract is unaffected — only the
+        // *initial* server-rendered list is owner-scoped.
         format!(
             r#"/// `GET /{plural}` — paginated list of {snake_name}s the current user owns.
 ///
@@ -2810,7 +2985,7 @@ pub async fn index(
     page_req: PageRequest,
     autumn_web::extract::State(state): autumn_web::extract::State<autumn_web::AppState>,
     session: autumn_web::session::Session,
-    mut db: Db,
+    {owner_index_db_param},
     flash: Flash,
 ) -> AutumnResult<Markup> {{
     let ctx = autumn_web::authorization::PolicyContext::from_request(&state, &session).await;
@@ -3115,7 +3290,74 @@ pub async fn index(
     // The pager preserves the request's raw query string (stripping `page`/
     // `size`) via `PagerOptions::query`, so `q` survives pagination without any
     // hand-rolled percent-encoding.
-    let search_handler = if search_enabled {
+    let search_handler = if search_enabled && owner_scoped_standard {
+        // Issue #1841: owner-scoped FTS handler for the standard Db path. The
+        // SECURITY INVARIANT is that this branch calls ONLY the owner-filtered
+        // repository methods — `repo.search_page_scoped(owner_id, ..)` for a
+        // query, and `repo.list_scoped(owner_id, ..)` for the empty-query
+        // fallback — NEVER the unscoped `repo.search_page`/`repo.page`, so the
+        // `/search` endpoint can never surface another user's rows (the exact
+        // leak the pre-#1841 rejection guarded against). `owner_id` comes from
+        // the same `PolicyContext` the mutating handlers authorize against.
+        let field_list = searchable.join(", ");
+        format!(
+            r#"
+
+/// `GET /{plural}/search` — owner-scoped full-text search over {field_list}.
+///
+/// Powers the `active_search` box on the index list. Ranked by relevance via
+/// the repository's owner-scoped `search_page_scoped`; an empty `q` falls back
+/// to the owner-scoped `list_scoped` listing. htmx requests get only the
+/// results fragment; non-htmx navigations (a bookmarked search URL, or a pager
+/// link) get a full page so search still works without JavaScript. Every result
+/// is filtered to the authenticated user (owner column `{owner_col}`); this
+/// handler never calls the unscoped `search_page`/`page`.
+#[derive(serde::Deserialize)]
+pub struct {pascal_name}SearchQuery {{
+    #[serde(default)]
+    pub q: String,
+}}
+
+#[secured]
+#[get("/{plural}/search")]
+pub async fn search(
+    autumn_web::extract::Query(query): autumn_web::extract::Query<{pascal_name}SearchQuery>,
+    autumn_web::reexports::axum::extract::RawQuery(raw_query): autumn_web::reexports::axum::extract::RawQuery,
+    list_query: ListQuery,
+    page_req: PageRequest,
+    hx: autumn_web::htmx::HxRequest,
+    autumn_web::extract::State(state): autumn_web::extract::State<autumn_web::AppState>,
+    session: autumn_web::session::Session,
+    repo: Pg{pascal_name}Repository,
+    {index_db_param}flash: Flash,
+) -> AutumnResult<Markup> {{
+    let ctx = autumn_web::authorization::PolicyContext::from_request(&state, &session).await;
+    let owner_id = ctx.user_id_i64().unwrap_or(-1);
+    let q = query.q.trim();
+    // Preserve the request's raw query string (already percent-encoded) on pager
+    // links so `q` survives pagination; `PagerOptions::query` strips the stale
+    // `page`/`size` params and re-adds them per link.
+    let pager_query = raw_query.as_deref().unwrap_or("");
+    let page_data: Page<{pascal_name}> = if q.is_empty() {{
+        repo.list_scoped(owner_id, &list_query, &page_req).await?
+    }} else {{
+        repo.search_page_scoped(owner_id, q, &page_req).await?
+    }};
+{index_label_loads}{index_columns_labeled}    let results = html! {{
+        (autumn_web::widgets::data_table(&page_data.content, &columns, &autumn_web::widgets::DataTableConfig::new("No {plural} found.").base_path("/{plural}/search")))
+        (pagination_nav(&page_data, &PagerOptions::new("/{plural}/search").query(pager_query)))
+    }};
+    if hx.is_htmx {{
+        return Ok(results);
+    }}
+    Ok({layout_fn}("Search {pascal_name}s", {cp_index}{flash_arg}, html! {{
+        h1 {{ "Search {pascal_name}s" }}
+        a href="/{plural}" {{ "Back to list" }}
+        div id="{plural}-search-results" {{ (results) }}
+    }}))
+}}"#
+        )
+    } else if search_enabled {
         let field_list = searchable.join(", ");
         let (repo_extractor, repo_bind) = if sharded {
             (
@@ -3361,7 +3603,7 @@ pub async fn edit_form(
     csrf: Option<CsrfToken>,
     csrf_field: Option<CsrfFormField>,
     submit_token: Option<SubmitToken>,
-    submit_field: Option<SubmitFormField>,{authz_params}
+    submit_field: Option<SubmitFormField>,{edit_destroy_authz_params}
 ) -> AutumnResult<Markup> {{
     let row: {pascal_name} = {plural}::table
         .find(*id)
@@ -7708,13 +7950,16 @@ async fn main() {
             routes.contains("use autumn_web::reexports::axum::body::Bytes;"),
             "generated routes must be able to inspect raw form bytes: {routes}"
         );
+        // Issue #1830: no-owner scaffolds now also record-authorize their
+        // mutating handlers, so `State`/`Session` are threaded in before the
+        // body-consuming `Bytes` extractor (which stays last).
         assert!(
-            routes.contains("pub async fn create(flash: Flash, csrf: Option<CsrfToken>, csrf_field: Option<CsrfFormField>, submit_token: Option<SubmitToken>, submit_field: Option<SubmitFormField>, mut db: Db, body: Bytes)"),
+            routes.contains("pub async fn create(flash: Flash, csrf: Option<CsrfToken>, csrf_field: Option<CsrfFormField>, submit_token: Option<SubmitToken>, submit_field: Option<SubmitFormField>, mut db: Db, \n    autumn_web::extract::State(state): autumn_web::extract::State<autumn_web::AppState>,\n    session: autumn_web::session::Session,\n    body: Bytes)"),
             "create must decode after blank nullable normalization: {routes}"
         );
         assert!(
             routes.contains(
-                "pub async fn update(\n    flash: Flash,\n    csrf: Option<CsrfToken>,\n    csrf_field: Option<CsrfFormField>,\n    submit_token: Option<SubmitToken>,\n    submit_field: Option<SubmitFormField>,\n    id: Path<i64>,\n    mut db: Db,\n    body: Bytes,\n)"
+                "pub async fn update(\n    flash: Flash,\n    csrf: Option<CsrfToken>,\n    csrf_field: Option<CsrfFormField>,\n    submit_token: Option<SubmitToken>,\n    submit_field: Option<SubmitFormField>,\n    id: Path<i64>,\n    mut db: Db,\n    autumn_web::extract::State(state): autumn_web::extract::State<autumn_web::AppState>,\n    session: autumn_web::session::Session,\n    body: Bytes,\n)"
             ),
             "update must decode after blank nullable normalization: {routes}"
         );
@@ -9540,8 +9785,17 @@ async fn main() {
 
     #[test]
     fn repository_notes_sharded() {
-        let rendered =
-            render_repository_file("Account", "account", &[], false, false, true, false, false);
+        let rendered = render_repository_file(
+            "Account",
+            "account",
+            &[],
+            false,
+            false,
+            true,
+            false,
+            false,
+            None,
+        );
         assert!(
             rendered.contains("shard-aware"),
             "sharded repository doc must mention shard-aware: {rendered}"
@@ -9554,8 +9808,17 @@ async fn main() {
 
     #[test]
     fn repository_notes_api_sharded_caveat() {
-        let rendered =
-            render_repository_file("Account", "account", &[], false, true, true, false, false);
+        let rendered = render_repository_file(
+            "Account",
+            "account",
+            &[],
+            false,
+            true,
+            true,
+            false,
+            false,
+            None,
+        );
         assert!(
             rendered.contains("control pool"),
             "sharded api repository doc must note control pool: {rendered}"
@@ -9565,7 +9828,7 @@ async fn main() {
     #[test]
     fn repository_no_sharded_note_when_not_sharded() {
         let rendered =
-            render_repository_file("Post", "post", &[], false, false, false, false, false);
+            render_repository_file("Post", "post", &[], false, false, false, false, false, None);
         assert!(
             !rendered.contains("shard-aware"),
             "non-sharded repository must not mention shard-aware: {rendered}"
@@ -9808,17 +10071,19 @@ async fn main() {
         );
     }
 
-    /// Issue #1319 security guard: `--searchable` on an owner-scoped model is
-    /// rejected before any files are written. The owner-scoped index is
-    /// `#[secured]` and filters to the current user, but the FTS `search_page`
-    /// is unscoped, so the `/search` endpoint would leak other users' rows.
+    /// Issue #1841: `--searchable` on a standard owner-scoped model is now
+    /// ALLOWED (was rejected pre-#1841). The repository macro carries the
+    /// `owner = <col>` attr so it emits owner-filtered `list_scoped` /
+    /// `search_page_scoped`, and the generated index + `/search` handlers call
+    /// ONLY those scoped methods — never the unscoped `page`/`search_page` — so
+    /// no cross-user leak. This test asserts that safe wiring is emitted.
     #[test]
-    fn searchable_with_owner_scoped_model_is_rejected() {
+    fn searchable_with_owner_scoped_model_emits_scoped_wiring() {
         let tmp = project_with_main(default_main());
         // `user_id` is an owner column, so the default policy makes the index
         // owner-scoped (`authorize_wiring`). Pairing that with `--searchable`
-        // must be refused.
-        let err = plan_scaffold_with_options(
+        // is now supported via the macro's owner-scoped codegen.
+        let plan = plan_scaffold_with_options(
             tmp.path(),
             "Post",
             &[
@@ -9835,23 +10100,74 @@ async fn main() {
                 ..Default::default()
             },
         )
-        .unwrap_err();
-        let msg = err.to_string();
+        .expect("standard owner-scoped + searchable must be allowed (#1841)");
+        plan.execute(Flags::default()).unwrap();
+
+        // The repository declares `owner = user_id` so the macro generates the
+        // scoped methods.
+        let repo = fs::read_to_string(tmp.path().join("src/repositories/post.rs")).unwrap();
         assert!(
-            matches!(err, GenerateError::Config(_)),
-            "expected Config error, got: {err:?}"
+            repo.contains(", owner = user_id)"),
+            "owner-scoped repository must carry `owner = user_id` on the attr: {repo}"
         );
+
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+        // The `/search` route uses the scoped method (and its empty-query
+        // fallback the scoped list) — never the unscoped `search_page`/`page`.
         assert!(
-            msg.contains("--searchable")
-                && msg.contains("owner-scoped")
-                && msg.contains("search_page"),
-            "error must explain the owner-scoped FTS leak: {msg}"
+            routes.contains("repo.search_page_scoped(owner_id, q, &page_req)"),
+            "owner-scoped /search must call search_page_scoped: {routes}"
         );
-        // No files written: the scaffold plan fails before touching the tree.
+        // The owner-scoped index uses the scoped list with sort/filter.
         assert!(
-            !tmp.path().join("src/models/post.rs").exists()
-                && !tmp.path().join("src/repositories/post.rs").exists(),
-            "rejected owner-scoped +searchable scaffold must not write any files"
+            routes.contains("repo.list_scoped(owner_id, &list_query, &page_req)"),
+            "owner-scoped index/search must call list_scoped: {routes}"
+        );
+        // Sort/filter data_table wiring is present on the owner-scoped standard
+        // index (active_sort / query), closing the #1854 gap.
+        assert!(
+            routes.contains(".active_sort(list_query.sort().unwrap_or_default())"),
+            "owner-scoped standard index must render the sort/filter data_table: {routes}"
+        );
+        // The search box is rendered on the owner-scoped index.
+        assert!(
+            routes.contains("active_search_input"),
+            "owner-scoped searchable index must render the search box: {routes}"
+        );
+    }
+
+    /// Issue #1841 security invariant: the owner-scoped `/search` and index
+    /// branches must NEVER call the unscoped repository methods, or they would
+    /// re-open the pre-#1841 cross-user leak. This is the regression guard: the
+    /// `search`/`index` handler bodies must not contain a bare
+    /// `repo.search_page(`/`repo.page(` call.
+    #[test]
+    fn owner_scoped_searchable_never_calls_unscoped_repo_methods() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &[
+                "user_id:i64".into(),
+                "title:String".into(),
+                "body:Text".into(),
+            ],
+            "20260427000000",
+            &ScaffoldOptions {
+                model: ModelOptions {
+                    searchable: vec!["title".into(), "body".into()],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+        assert!(
+            !routes.contains("repo.search_page(") && !routes.contains("repo.page("),
+            "owner-scoped searchable routes must NEVER call the unscoped \
+             repo.search_page(/repo.page( (cross-user leak): {routes}"
         );
     }
 
@@ -11238,10 +11554,17 @@ async fn main() {
             "create must authorize_create: {routes}"
         );
         assert!(routes.contains("pub async fn create("), "{routes}");
-        // Index applies the owner scope through a filtered paginated query.
+        // Issue #1841: the standard owner-scoped index now applies the owner
+        // scope through the repository's owner-filtered `list_scoped` (which also
+        // brings allowlisted sort/filter), not a hand-rolled diesel query — and
+        // it must NEVER fall back to the unscoped `repo.list`/`repo.page`.
         assert!(
-            routes.contains("posts::user_id.eq(owner_id)"),
-            "index must filter by owner: {routes}"
+            routes.contains("repo.list_scoped(owner_id, &list_query, &page_req)"),
+            "index must scope through list_scoped: {routes}"
+        );
+        assert!(
+            !routes.contains("repo.list(&list_query") && !routes.contains("repo.page("),
+            "owner-scoped index must not call the unscoped list/page: {routes}"
         );
         assert!(
             routes.contains("PolicyContext::from_request(&state, &session)"),
@@ -11254,6 +11577,181 @@ async fn main() {
             "{smoke}"
         );
         assert!(smoke.contains("ForbiddenResponse::Forbidden403"), "{smoke}");
+    }
+
+    #[test]
+    fn live_owner_scaffold_authorizes_mutating_handlers_and_scopes_index() {
+        // Issue #1830: `--live` variants now record-authorize their mutating
+        // handlers and owner-scope the index, loading the current row through the
+        // repository (not raw diesel) while keeping the SSE `<ul>` island.
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "author_id:i64".into()],
+            "20260427000000",
+            &ScaffoldOptions {
+                live: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let routes = action_contents(&plan, "src/routes/posts.rs");
+        // edit / update / destroy each carry an inline authorize call.
+        assert_eq!(
+            routes
+                .matches("autumn_web::authorization::authorize::<Post>")
+                .count(),
+            3,
+            "live edit/update/destroy must each authorize: {routes}"
+        );
+        assert!(routes.contains("\"edit\", &row"), "{routes}");
+        assert!(routes.contains("\"update\", &current"), "{routes}");
+        assert!(routes.contains("\"delete\", &current"), "{routes}");
+        // The row is loaded via the repository extractor, not raw diesel.
+        assert!(
+            routes.contains("let current: Post = repo.find_by_id(*id).await?"),
+            "live variant must load current row via the repository: {routes}"
+        );
+        assert!(
+            routes
+                .contains("autumn_web::authorization::authorize_create::<Post>(&state, &session)"),
+            "live create must authorize_create: {routes}"
+        );
+        // Index is owner-scoped but keeps the SSE list contract.
+        assert!(
+            routes.contains("posts::author_id.eq(owner_id)"),
+            "live index must filter by owner: {routes}"
+        );
+        assert!(
+            routes.contains("PolicyContext::from_request(&state, &session)"),
+            "{routes}"
+        );
+        assert!(
+            routes.contains("ul id=\"posts-list\"")
+                && routes.contains("sse-connect=(paths::events())"),
+            "live owner index must keep the SSE ul island: {routes}"
+        );
+    }
+
+    #[test]
+    fn sharded_owner_scaffold_authorizes_mutating_handlers_and_scopes_index() {
+        // Issue #1830: `--sharded` variants record-authorize their mutating
+        // handlers and owner-scope the index, loading the current row through a
+        // `from_shard` repository and querying the pinned `ShardedDb` connection.
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "author_id:i64".into()],
+            "20260427000000",
+            &ScaffoldOptions {
+                model: ModelOptions {
+                    sharded: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let routes = action_contents(&plan, "src/routes/posts.rs");
+        assert_eq!(
+            routes
+                .matches("autumn_web::authorization::authorize::<Post>")
+                .count(),
+            3,
+            "sharded edit/update/destroy must each authorize: {routes}"
+        );
+        assert!(routes.contains("\"edit\", &row"), "{routes}");
+        assert!(routes.contains("\"update\", &current"), "{routes}");
+        assert!(routes.contains("\"delete\", &current"), "{routes}");
+        // The row is loaded via `from_shard(&db).find_by_id(...)`.
+        assert!(
+            routes.contains(
+                "let current: Post = PgPostRepository::from_shard(&db).find_by_id(*id).await?"
+            ),
+            "sharded variant must load current row via from_shard: {routes}"
+        );
+        assert!(
+            routes
+                .contains("autumn_web::authorization::authorize_create::<Post>(&state, &session)"),
+            "sharded create must authorize_create: {routes}"
+        );
+        // Owner-scoped index runs on the ShardedDb connection (no bare `Db`).
+        assert!(
+            routes.contains("posts::author_id.eq(owner_id)"),
+            "sharded index must filter by owner: {routes}"
+        );
+        assert!(
+            routes.contains("mut db: ShardedDb") && !routes.contains("mut db: Db"),
+            "sharded handlers must use ShardedDb, not Db: {routes}"
+        );
+    }
+
+    #[test]
+    fn attachment_owner_scaffold_authorizes_reusing_state_wrapper() {
+        // Issue #1830: attachment scaffolds already thread a `state:` wrapper for
+        // the multipart upload, so the authorize wiring reuses it (`&*state`) and
+        // adds only `session` — no duplicate `State(state)` extractor.
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &[
+                "title:String".into(),
+                "author_id:i64".into(),
+                "avatar:Attachment".into(),
+            ],
+            "20260427000000",
+        )
+        .unwrap();
+        let routes = action_contents(&plan, "src/routes/posts.rs");
+        // create/update deref the reused wrapper; edit/destroy take the full pair.
+        assert!(
+            routes
+                .contains("autumn_web::authorization::authorize_create::<Post>(&*state, &session)"),
+            "attachment create must authorize_create via &*state: {routes}"
+        );
+        assert!(
+            routes.contains(
+                "autumn_web::authorization::authorize::<Post>(&*state, &session, \"update\", &current)"
+            ),
+            "attachment update must authorize via &*state: {routes}"
+        );
+        assert!(
+            routes.contains(
+                "autumn_web::authorization::authorize::<Post>(&state, &session, \"delete\", &current)"
+            ),
+            "attachment destroy must authorize via &state: {routes}"
+        );
+        assert!(
+            routes.contains(
+                "autumn_web::authorization::authorize::<Post>(&state, &session, \"edit\", &row)"
+            ),
+            "attachment edit must authorize via &state: {routes}"
+        );
+        // The create/update handlers must NOT gain a second `State(state)`
+        // extractor — the reused wrapper stays the sole `state` binding.
+        assert!(
+            !routes.contains(
+                "autumn_web::extract::State(state): autumn_web::extract::State<autumn_web::AppState>,\n    body: Bytes"
+            ) && !routes.contains(
+                "autumn_web::extract::State(state): autumn_web::extract::State<autumn_web::AppState>,\n    mut multipart"
+            ),
+            "attachment create/update must not inject a duplicate State extractor: {routes}"
+        );
+        // Owner-scoped index still emitted for the attachment path. Issue #1841:
+        // the standard Db owner index now scopes via the repository's
+        // owner-filtered `list_scoped` (with sort/filter) rather than a manual
+        // diesel query — and never falls back to the unscoped list/page.
+        assert!(
+            routes.contains("repo.list_scoped(owner_id, &list_query, &page_req)"),
+            "attachment index must scope through list_scoped: {routes}"
+        );
+        assert!(
+            routes.contains("PolicyContext::from_request(&state, &session)"),
+            "attachment index must resolve owner_id from the policy context: {routes}"
+        );
     }
 
     #[test]
@@ -11292,7 +11790,12 @@ async fn main() {
     }
 
     #[test]
-    fn no_owner_scaffold_registers_policy_but_leaves_handlers_secured_only() {
+    fn no_owner_scaffold_authorizes_via_authenticated_policy_without_scoping_index() {
+        // Issue #1830: no-owner scaffolds now record-authorize their mutating
+        // handlers too (routing the mutation through the enforceable policy), and
+        // the generated no-owner policy authorizes any authenticated user — so a
+        // fresh scaffold never 403s out of the box. There is no owner column, so
+        // the index is NOT owner-scoped.
         let tmp = project_with_main(default_main());
         let plan = plan_scaffold(
             tmp.path(),
@@ -11301,23 +11804,44 @@ async fn main() {
             "20260427000000",
         )
         .unwrap();
-        // Policy file still generated (default-deny + TODO) and registered.
+        // Policy generated (authenticated check + SECURITY TODO) and registered.
         let policy = action_contents(&plan, "src/policies/post.rs");
         assert!(
-            policy.contains("// TODO: no owner column detected"),
+            policy.contains("// SECURITY TODO: this only checks authentication"),
             "{policy}"
+        );
+        assert!(
+            policy.contains("Box::pin(async move { ctx.is_authenticated() })"),
+            "no-owner can_update/can_delete must authenticate-check: {policy}"
         );
         let main = action_contents(&plan, "src/main.rs");
         assert!(
             main.contains(".policy::<crate::models::post::Post, _>"),
             "{main}"
         );
-        // But mutating handlers keep #[secured]-only (no inline authorize) since
-        // a default-deny policy would 403 every mutation out of the box.
+        // Mutating handlers are now inline-authorized (edit/update/destroy) and
+        // create runs authorize_create — routed through the enforceable policy.
         let routes = action_contents(&plan, "src/routes/posts.rs");
+        assert_eq!(
+            routes
+                .matches("autumn_web::authorization::authorize::<Post>")
+                .count(),
+            3,
+            "no-owner edit/update/destroy must each authorize: {routes}"
+        );
         assert!(
-            !routes.contains("authorize::<Post>"),
-            "no-owner scaffold must not inline authorize: {routes}"
+            routes
+                .contains("autumn_web::authorization::authorize_create::<Post>(&state, &session)"),
+            "no-owner create must authorize_create: {routes}"
+        );
+        // But the index is NOT owner-scoped (no owner column to filter on).
+        assert!(
+            !routes.contains(".eq(owner_id)"),
+            "no-owner index must not be owner-scoped: {routes}"
+        );
+        assert!(
+            !routes.contains("PolicyContext::from_request(&state, &session)"),
+            "no-owner index must not build a PolicyContext for owner filtering: {routes}"
         );
     }
 

@@ -1789,6 +1789,172 @@ fn generated_nullable_owner_policy_scaffold_cargo_checks() {
     );
 }
 
+/// Issue #1830 companion to [`generated_policy_scaffold_cargo_checks`] for the
+/// `--live` variant: an owner column on a `--live` scaffold now record-authorizes
+/// the mutating handlers (loading the current row through the *repository*, not
+/// raw diesel) and owner-scopes the index while keeping the SSE `<ul>` island.
+/// `cargo check --tests` proves the repository-based authorize wiring compiles
+/// against the real framework.
+///
+/// Ignored by default; run with `cargo test -p autumn-cli -- --ignored`.
+#[test]
+#[ignore = "slow: cargo-checks a fresh project — run with `cargo test -p autumn-cli -- --ignored`"]
+fn generated_live_owner_scaffold_cargo_checks() {
+    let (_tmp, project) = fresh_project("live-owner-scaffold-build");
+    patch_generated_cargo_toml(&project);
+
+    run_autumn(
+        &project,
+        &[
+            "generate",
+            "scaffold",
+            "Post",
+            "title:String",
+            "author_id:i64",
+            "--live",
+        ],
+    );
+
+    let routes = fs::read_to_string(project.join("src/routes/posts.rs")).unwrap();
+    assert!(
+        routes.contains("autumn_web::authorization::authorize::<Post>"),
+        "live routes must authorize mutating handlers:\n{routes}"
+    );
+    assert!(
+        routes.contains("let current: Post = repo.find_by_id(*id).await?"),
+        "live variant must load the current row via the repository:\n{routes}"
+    );
+    assert!(
+        routes.contains("posts::author_id.eq(owner_id)"),
+        "live index must be owner-scoped:\n{routes}"
+    );
+    assert!(
+        routes.contains("sse-connect=(paths::events())"),
+        "live owner index must keep the SSE list contract:\n{routes}"
+    );
+
+    let check = Command::new("cargo")
+        .args(["check", "--tests"])
+        .current_dir(&project)
+        .output()
+        .unwrap();
+    assert!(
+        check.status.success(),
+        "cargo check on generated live-owner scaffold failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&check.stdout),
+        String::from_utf8_lossy(&check.stderr),
+    );
+}
+
+/// Issue #1830 companion for the `--sharded` variant: an owner column on a
+/// `--sharded` scaffold record-authorizes the mutating handlers (loading the
+/// current row through a `from_shard` repository) and owner-scopes the index on
+/// the `ShardedDb` connection. `cargo check --tests` proves the sharded
+/// authorize wiring compiles against the real framework.
+///
+/// Ignored by default; run with `cargo test -p autumn-cli -- --ignored`.
+#[test]
+#[ignore = "slow: cargo-checks a fresh project — run with `cargo test -p autumn-cli -- --ignored`"]
+fn generated_sharded_owner_scaffold_cargo_checks() {
+    let (_tmp, project) = fresh_project("sharded-owner-scaffold-build");
+    patch_generated_cargo_toml(&project);
+
+    run_autumn(
+        &project,
+        &[
+            "generate",
+            "scaffold",
+            "Post",
+            "title:String",
+            "author_id:i64",
+            "--sharded",
+        ],
+    );
+
+    let routes = fs::read_to_string(project.join("src/routes/posts.rs")).unwrap();
+    assert!(
+        routes.contains("autumn_web::authorization::authorize::<Post>"),
+        "sharded routes must authorize mutating handlers:\n{routes}"
+    );
+    assert!(
+        routes.contains(
+            "let current: Post = PgPostRepository::from_shard(&db).find_by_id(*id).await?"
+        ),
+        "sharded variant must load the current row via from_shard:\n{routes}"
+    );
+    assert!(
+        routes.contains("posts::author_id.eq(owner_id)"),
+        "sharded index must be owner-scoped:\n{routes}"
+    );
+    assert!(
+        !routes.contains("mut db: Db"),
+        "sharded handlers must use ShardedDb, not a bare Db extractor:\n{routes}"
+    );
+
+    let check = Command::new("cargo")
+        .args(["check", "--tests"])
+        .current_dir(&project)
+        .output()
+        .unwrap();
+    assert!(
+        check.status.success(),
+        "cargo check on generated sharded-owner scaffold failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&check.stdout),
+        String::from_utf8_lossy(&check.stderr),
+    );
+}
+
+/// Issue #1830 companion for the attachment variant: an owner column on an
+/// attachment scaffold record-authorizes the mutating handlers by REUSING the
+/// `state: State<AppState>` wrapper the multipart upload already threads
+/// (`&*state`) rather than injecting a second, conflicting `State` extractor —
+/// the exact case #1125 excluded. `cargo check --tests` proves the deref-based
+/// authorize wiring compiles against the real framework.
+///
+/// Ignored by default; run with `cargo test -p autumn-cli -- --ignored`.
+#[test]
+#[ignore = "slow: cargo-checks a fresh project — run with `cargo test -p autumn-cli -- --ignored`"]
+fn generated_attachment_owner_scaffold_cargo_checks() {
+    let (_tmp, project) = fresh_project("attachment-owner-scaffold-build");
+    patch_generated_cargo_toml(&project);
+
+    run_autumn(
+        &project,
+        &[
+            "generate",
+            "scaffold",
+            "Post",
+            "title:String",
+            "author_id:i64",
+            "avatar:Attachment",
+        ],
+    );
+
+    let routes = fs::read_to_string(project.join("src/routes/posts.rs")).unwrap();
+    assert!(
+        routes.contains("autumn_web::authorization::authorize_create::<Post>(&*state, &session)"),
+        "attachment create must authorize_create via the reused &*state wrapper:\n{routes}"
+    );
+    assert!(
+        routes.contains(
+            "autumn_web::authorization::authorize::<Post>(&*state, &session, \"update\", &current)"
+        ),
+        "attachment update must authorize via &*state:\n{routes}"
+    );
+
+    let check = Command::new("cargo")
+        .args(["check", "--tests"])
+        .current_dir(&project)
+        .output()
+        .unwrap();
+    assert!(
+        check.status.success(),
+        "cargo check on generated attachment-owner scaffold failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&check.stdout),
+        String::from_utf8_lossy(&check.stderr),
+    );
+}
+
 /// Slow end-to-end check (issue #1124): scaffold a model with a `--validate`
 /// rule and prove the generated changeset round-trip actually compiles *and*
 /// runs — a rejected submission gets 422 with the other field preserved and
@@ -2288,8 +2454,14 @@ fn generate_scaffold_unique_field_update_violation_form_preserves_submitted_valu
 
     // The violation-branch re-render (spliced into `update`) preserves the
     // *submitted* edits by rebuilding the changeset from the decoded form via
-    // `Changeset::from_errors` — no stale `row` refetch (issue #1124).
-    let update_body = &routes[update_start..];
+    // `Changeset::from_errors` — no stale `row` refetch (issue #1124). Scope to
+    // the `update` handler only (the trailing `destroy` handler also loads its
+    // row for the authorize preamble).
+    let update_only = &routes[update_start..];
+    let destroy_off = update_only
+        .find("pub async fn destroy")
+        .expect("destroy handler after update");
+    let update_body = &update_only[..destroy_off];
     assert!(
         update_body.contains("Changeset::from_errors(changeset.into_inner(), errors)"),
         "got:\n{update_body}"
@@ -2300,9 +2472,20 @@ fn generate_scaffold_unique_field_update_violation_form_preserves_submitted_valu
         update_body.contains("user_form_for(&changeset"),
         "got:\n{update_body}"
     );
+    // Issue #1830: the mutating handlers now record-authorize the actor, which
+    // loads the target row ONCE up front (`.first(&mut *db)` → `authorize`). That
+    // load feeds the policy check, NOT the 422 re-render — the violation branch
+    // still rebuilds the changeset from the submitted `form`, never a refetched
+    // row. So the only row load in `update` is the authorize preamble.
+    assert_eq!(
+        update_body.matches(".first(&mut *db)").count(),
+        1,
+        "the update violation path must not re-fetch the row for its re-render; \
+         the only load is the authorize preamble; got:\n{update_body}"
+    );
     assert!(
-        !update_body.contains(".first(&mut *db)"),
-        "the update violation path must not re-fetch the row; got:\n{update_body}"
+        update_body.contains("authorize::<User>(&state, &session, \"update\", &current)"),
+        "the single row load must be the authorize preamble; got:\n{update_body}"
     );
 }
 
@@ -2808,9 +2991,11 @@ fn generate_scaffold_without_unique_field_omits_unique_constraints() {
 
     let routes = fs::read_to_string(project.join("src/routes/posts.rs")).unwrap();
     assert!(!routes.contains("UNIQUE_CONSTRAINTS"), "got:\n{routes}");
+    // Issue #1830: no-owner scaffolds record-authorize their handlers too, so
+    // `State`/`Session` are threaded in before the last `body: Bytes` extractor.
     assert!(
         routes.contains(
-            "pub async fn create(flash: Flash, csrf: Option<CsrfToken>, csrf_field: Option<CsrfFormField>, submit_token: Option<SubmitToken>, submit_field: Option<SubmitFormField>, mut db: Db, body: Bytes) -> AutumnResult<autumn_web::reexports::axum::response::Response>"
+            "pub async fn create(flash: Flash, csrf: Option<CsrfToken>, csrf_field: Option<CsrfFormField>, submit_token: Option<SubmitToken>, submit_field: Option<SubmitFormField>, mut db: Db, \n    autumn_web::extract::State(state): autumn_web::extract::State<autumn_web::AppState>,\n    session: autumn_web::session::Session,\n    body: Bytes) -> AutumnResult<autumn_web::reexports::axum::response::Response>"
         ),
         "got:\n{routes}"
     );
@@ -6188,8 +6373,9 @@ fn generated_sharded_scaffold_cargo_checks() {
 /// the generated `{Model}SearchQuery` extractor type, and the `search_vector`
 /// migration all typecheck against this workspace's `autumn-web`.
 ///
-/// Uses a plain searchable model (no owner scoping — the generator rejects the
-/// owner-scoped + search combination).
+/// Uses a plain searchable model (no owner scoping). The owner-scoped +
+/// searchable combination is covered separately by
+/// [`generated_owner_searchable_scaffold_cargo_checks`] (issue #1841).
 ///
 /// Run with: `cargo test -p autumn-cli -- --ignored generated_searchable_scaffold_cargo_checks`
 #[test]
@@ -6220,6 +6406,133 @@ fn generated_searchable_scaffold_cargo_checks() {
     assert!(
         check.status.success(),
         "cargo check on generated searchable scaffold failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&check.stdout),
+        String::from_utf8_lossy(&check.stderr),
+    );
+}
+
+/// Issue #1841: the critical proof that lifting the owner-scoped `--searchable`
+/// rejection produces a COMPILING app whose search/index are safely owner-scoped.
+///
+/// Scaffolds `Post title:String body:Text author_id:i64 --searchable` — an owner
+/// column (`author_id`) AND full-text search, the exact combination the
+/// generator REJECTED before #1841. The repository macro now emits owner-filtered
+/// `list_scoped` / `search_page_scoped`, and the generated owner-scoped index +
+/// `/search` handlers call ONLY those scoped methods. `cargo check --tests`
+/// proves the whole owner-scoped FTS codegen (the macro's three-phase
+/// owner-filtered `search_page_scoped`, `list_scoped`, and the scoped handlers)
+/// type-checks against this workspace's `autumn-web`.
+///
+/// The security invariant — the owner branch never calls the unscoped
+/// `repo.search_page`/`repo.page` — is asserted directly on the generated source
+/// here and in the `scaffold.rs` unit tests; this test proves it also COMPILES.
+///
+/// Run with:
+/// `cargo test -p autumn-cli --test generate generated_owner_searchable_scaffold_cargo_checks -- --ignored --exact`
+#[test]
+#[ignore = "slow: cargo-checks a fresh owner-scoped searchable project — run with `cargo test -p autumn-cli -- --ignored`"]
+fn generated_owner_searchable_scaffold_cargo_checks() {
+    let (_tmp, project) = fresh_project("owner-searchable-build");
+
+    patch_generated_cargo_toml(&project);
+
+    run_autumn(
+        &project,
+        &[
+            "generate",
+            "scaffold",
+            "Post",
+            "title:String",
+            "body:Text",
+            "author_id:i64",
+            "--searchable",
+            "title,body",
+        ],
+    );
+
+    // The repository carries `owner = author_id` (→ the macro's scoped codegen).
+    let repo = fs::read_to_string(project.join("src/repositories/post.rs")).unwrap();
+    assert!(
+        repo.contains(", owner = author_id)"),
+        "owner-scoped searchable repository must carry `owner = author_id`:\n{repo}"
+    );
+
+    // The owner-scoped /search + index call ONLY the scoped methods — never the
+    // unscoped `repo.search_page(`/`repo.page(` (the cross-user leak guard).
+    let routes = fs::read_to_string(project.join("src/routes/posts.rs")).unwrap();
+    assert!(
+        routes.contains("repo.search_page_scoped(owner_id, q, &page_req)")
+            && routes.contains("repo.list_scoped(owner_id, &list_query, &page_req)"),
+        "owner-scoped search/index must call the scoped repository methods:\n{routes}"
+    );
+    assert!(
+        !routes.contains("repo.search_page(") && !routes.contains("repo.page("),
+        "SECURITY: owner-scoped searchable routes must NEVER call the unscoped \
+         repo.search_page(/repo.page( (cross-user leak):\n{routes}"
+    );
+
+    let check = Command::new("cargo")
+        .args(["check", "--tests"])
+        .current_dir(&project)
+        .output()
+        .unwrap();
+    assert!(
+        check.status.success(),
+        "cargo check on generated owner-scoped searchable scaffold failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&check.stdout),
+        String::from_utf8_lossy(&check.stderr),
+    );
+}
+
+/// Issue #1841 companion proving the *nullable* owner-column + searchable path
+/// compiles: a `user:references?` owner is `Option<i64>`, so the macro's scoped
+/// `.eq(owner_id)` filter (typed hydration) and the raw-SQL owner bind must
+/// compile against a `Nullable<BigInt>` column. A nullable owner never matches
+/// NULL (unowned) rows — semantically correct (unowned rows stay hidden).
+///
+/// Run with:
+/// `cargo test -p autumn-cli --test generate generated_nullable_owner_searchable_scaffold_cargo_checks -- --ignored --exact`
+#[test]
+#[ignore = "slow: cargo-checks a fresh nullable-owner searchable project — run with `cargo test -p autumn-cli -- --ignored`"]
+fn generated_nullable_owner_searchable_scaffold_cargo_checks() {
+    let (_tmp, project) = fresh_project("nullable-owner-searchable-build");
+
+    patch_generated_cargo_toml(&project);
+
+    run_autumn(
+        &project,
+        &[
+            "generate",
+            "scaffold",
+            "Note",
+            "title:String",
+            "body:Text",
+            "user:references?",
+            "--searchable",
+            "title,body",
+        ],
+    );
+
+    let repo = fs::read_to_string(project.join("src/repositories/note.rs")).unwrap();
+    assert!(
+        repo.contains(", owner = user_id)"),
+        "nullable-owner searchable repository must carry `owner = user_id`:\n{repo}"
+    );
+    let routes = fs::read_to_string(project.join("src/routes/notes.rs")).unwrap();
+    assert!(
+        !routes.contains("repo.search_page(") && !routes.contains("repo.page("),
+        "SECURITY: nullable-owner searchable routes must NEVER call the unscoped \
+         repo.search_page(/repo.page(:\n{routes}"
+    );
+
+    let check = Command::new("cargo")
+        .args(["check", "--tests"])
+        .current_dir(&project)
+        .output()
+        .unwrap();
+    assert!(
+        check.status.success(),
+        "cargo check on generated nullable-owner searchable scaffold failed:\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&check.stdout),
         String::from_utf8_lossy(&check.stderr),
     );
