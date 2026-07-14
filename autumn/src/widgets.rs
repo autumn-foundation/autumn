@@ -4583,7 +4583,7 @@ mod tests {
 
     /// A plain literal transition graph: `draft -> published` (guarded),
     /// `published -> archived` (guard-less). No real model required.
-    fn sample_transitions() -> &'static [(&'static str, &'static str, Option<&'static str>)] {
+    const fn sample_transitions() -> &'static [(&'static str, &'static str, Option<&'static str>)] {
         &[
             ("draft", "published", Some("can_publish")),
             ("published", "archived", None),
