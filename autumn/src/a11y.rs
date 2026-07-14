@@ -526,8 +526,8 @@ pub struct TextField<State> {
     label_class: Option<String>,
     aria_invalid: Option<bool>,
     described_by: Option<String>,
-    minlength: Option<u32>,
-    maxlength: Option<u32>,
+    minlength: Option<u64>,
+    maxlength: Option<u64>,
     min: Option<String>,
     max: Option<String>,
     step: Option<String>,
@@ -710,7 +710,7 @@ impl<State> TextField<State> {
     /// Set the HTML5 `minlength` validation constraint (minimum character
     /// count), matching the scaffold generator's `text{min=…}` DSL modifier.
     #[must_use]
-    pub const fn minlength(mut self, minlength: u32) -> Self {
+    pub const fn minlength(mut self, minlength: u64) -> Self {
         self.minlength = Some(minlength);
         self
     }
@@ -718,7 +718,7 @@ impl<State> TextField<State> {
     /// Set the HTML5 `maxlength` validation constraint (maximum character
     /// count), matching the scaffold generator's `text{max=…}` DSL modifier.
     #[must_use]
-    pub const fn maxlength(mut self, maxlength: u32) -> Self {
+    pub const fn maxlength(mut self, maxlength: u64) -> Self {
         self.maxlength = Some(maxlength);
         self
     }
@@ -937,6 +937,19 @@ mod tests {
         assert!(markup.contains("maxlength=\"120\""), "{markup}");
         assert!(markup.contains("required"), "{markup}");
         assert!(markup.contains("aria-required=\"true\""), "{markup}");
+    }
+
+    #[test]
+    fn text_field_maxlength_accepts_large_bound() {
+        // The scaffold DSL normalizes `String`/`Text` length bounds as `u64`
+        // with no `u32` ceiling, so `maxlength` must accept a bound above
+        // `u32::MAX` (e.g. `title:String{max=5000000000}`) without overflowing.
+        let markup = TextField::new("title")
+            .maxlength(5_000_000_000u64)
+            .label("Title")
+            .render()
+            .into_string();
+        assert!(markup.contains("maxlength=\"5000000000\""), "{markup}");
     }
 
     #[test]

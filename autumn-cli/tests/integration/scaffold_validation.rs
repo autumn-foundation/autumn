@@ -196,10 +196,10 @@ fn form_inputs_carry_matching_html5_constraints() {
 
     // The constrained fields route through the typed `a11y::TextField`
     // primitive (#1706), so the HTML5 constraints are typed builder calls
-    // (`.minlength(3u32)`) rather than raw `<input>` attributes; the rendered
+    // (`.minlength(3u64)`) rather than raw `<input>` attributes; the rendered
     // element/attributes/values are unchanged, only their source spelling.
     assert!(
-        routes.contains(".minlength(3u32).maxlength(120u32)"),
+        routes.contains(".minlength(3u64).maxlength(120u64)"),
         "title must render minlength/maxlength:\n{routes}"
     );
     assert!(
@@ -215,8 +215,40 @@ fn form_inputs_carry_matching_html5_constraints() {
         "age must render type=number with min/max:\n{routes}"
     );
     assert!(
-        routes.contains(".maxlength(200u32)"),
+        routes.contains(".maxlength(200u64)"),
         "bio must render maxlength:\n{routes}"
+    );
+}
+
+/// A `String`/`Text` length bound is a `u64` in the DSL with no `u32` ceiling
+/// (`max=5000000000` is a valid, in-`u64` bound), so the typed
+/// `a11y::TextField` length builder call must carry a `u64` suffix. A `u32`
+/// literal would overflow and fail to compile the generated app — the
+/// regression this guards (the routed `form_for` path previously emitted
+/// `.maxlength(5000000000u32)`).
+#[test]
+fn large_length_bound_emits_u64_not_overflowing_u32() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    run_autumn_ok(tmp.path(), &["new", "validate-large-len-app"]);
+    let project = tmp.path().join("validate-large-len-app");
+    run_autumn_ok(
+        &project,
+        &[
+            "generate",
+            "scaffold",
+            "Doc",
+            "title:String{max=5000000000}",
+        ],
+    );
+    let routes = fs::read_to_string(project.join("src/routes/docs.rs")).unwrap();
+    let title_input = slice_text_field(&routes, "title");
+    assert!(
+        title_input.contains(".maxlength(5000000000u64)"),
+        "a >u32::MAX length bound must emit a u64 literal, not an overflowing u32:\n{title_input}"
+    );
+    assert!(
+        !title_input.contains(".maxlength(5000000000u32)"),
+        "the length builder must not emit an overflowing u32 literal:\n{title_input}"
     );
 }
 
