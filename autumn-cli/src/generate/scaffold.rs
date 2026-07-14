@@ -2117,9 +2117,14 @@ fn render_routes_file(
     // Issue #1872: the create/update handlers stream each uploaded file to the
     // blob store *before* changeset validation and the DB write, so any early
     // return after the save would orphan the just-uploaded blob. We record only
-    // the freshly-saved `<field>_blob`s (into `saved_blob_keys`) and best-effort
-    // delete them before every early-return path — never a preserved existing
-    // blob. This snippet is spliced before each such `return`.
+    // the freshly-saved `<field>_blob`s (into `saved_blob_keys`) — pushed at the
+    // point of each save, so the key set is populated incrementally as blobs are
+    // persisted — and best-effort delete them before every early-return path that
+    // can occur after the first save: a later attachment field's save failure,
+    // `decode_form` on malformed scalar input, changeset validation, the
+    // unique-violation 422, the generic DB error, and (update) the current-row
+    // load / not-found. A preserved existing blob is never enrolled. This snippet
+    // is spliced before each such `return`.
     let blob_cleanup = if has_attachments {
         "for key in &saved_blob_keys {\n        let _ = store.delete(key).await;\n    }\n    "
     } else {
@@ -2128,19 +2133,19 @@ fn render_routes_file(
     let form_decode_block = if has_attachments {
         let mut blob_decls = String::new();
         let mut match_arms = String::new();
-        let mut key_captures = String::new();
         for f in &attachment_fields {
             let name = &f.name;
             let _ = writeln!(
                 blob_decls,
                 "    let mut {name}_blob: Option<autumn_web::storage::Blob> = None;"
             );
-            let _ = write!(
-                key_captures,
-                "\n    if let Some(blob) = &{name}_blob {{\n        \
-                 saved_blob_keys.push(blob.key.clone());\n    \
-                 }}"
-            );
+            // Issue #1872: record the freshly-saved blob's key into
+            // `saved_blob_keys` *immediately* after each successful save, so any
+            // later fallible early return (a subsequent attachment field's save,
+            // `decode_form`, validation, the DB write) can best-effort delete it.
+            // The save's own `?` is expanded into an explicit `match` that runs
+            // the cleanup first, covering the case where an earlier attachment
+            // field was already persisted when a later one fails to save.
             let _ = write!(
                 match_arms,
                 "            Some(\"{name}\") => {{\n                \
@@ -2150,7 +2155,14 @@ fn render_routes_file(
                  chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default(),\n                        \
                  uuid::Uuid::new_v4()\n                    \
                  );\n                    \
-                 {name}_blob = Some(field.save_to_blob_store(&*store, key).await?);\n                \
+                 let blob = match field.save_to_blob_store(&*store, key).await {{\n                        \
+                 Ok(blob) => blob,\n                        \
+                 Err(err) => {{\n                            \
+                 {blob_cleanup}return Err(err);\n                        \
+                 }}\n                    \
+                 }};\n                    \
+                 saved_blob_keys.push(blob.key.clone());\n                    \
+                 {name}_blob = Some(blob);\n                \
                  }}\n            \
                  }}\n"
             );
@@ -2161,7 +2173,8 @@ fn render_routes_file(
              .ok_or_else(|| AutumnError::internal_server_error_msg(\"storage not configured\"))?\n        \
              .store()\n        \
              .clone();\n    \
-             let mut form_pairs: Vec<(String, String)> = Vec::new();\n\
+             let mut form_pairs: Vec<(String, String)> = Vec::new();\n    \
+             let mut saved_blob_keys: Vec<String> = Vec::new();\n\
              {blob_decls}    \
              while let Some(field) = multipart.next_field().await? {{\n        \
              let field_name = field.name().map(str::to_owned);\n        \
@@ -2175,13 +2188,15 @@ fn render_routes_file(
              None => {{}}\n        \
              }}\n    \
              }}\n    \
-             let form = {{\n        \
-             let encoded = url::form_urlencoded::Serializer::new(String::new())\n            \
-             .extend_pairs(form_pairs.iter().map(|(key, value)| (key.as_str(), value.as_str())))\n            \
-             .finish();\n        \
-             decode_form(Bytes::from(encoded))?\n    \
-             }};\n    \
-             let mut saved_blob_keys: Vec<String> = Vec::new();{key_captures}"
+             let encoded = url::form_urlencoded::Serializer::new(String::new())\n        \
+             .extend_pairs(form_pairs.iter().map(|(key, value)| (key.as_str(), value.as_str())))\n        \
+             .finish();\n    \
+             let form = match decode_form(Bytes::from(encoded)) {{\n        \
+             Ok(form) => form,\n        \
+             Err(err) => {{\n            \
+             {blob_cleanup}return Err(err);\n        \
+             }}\n    \
+             }};"
         )
     } else {
         format!("let form = {decode_call};")

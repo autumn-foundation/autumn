@@ -390,8 +390,11 @@ fn scaffold_attachment_emits_zero_js_multipart_handlers() {
         routes.contains("mut multipart: autumn_web::extract::Multipart"),
         "{routes}"
     );
+    // Issue #1872: the save's `?` is expanded into an explicit `match` so the
+    // just-saved blob can be cleaned up on a later early return, so the call now
+    // ends in `.await` (no trailing `?`) followed by the `match` arms.
     assert!(
-        routes.contains(".save_to_blob_store(&*store, key).await?"),
+        routes.contains(".save_to_blob_store(&*store, key).await {"),
         "{routes}"
     );
     assert!(routes.contains("multipart.next_field().await?"), "{routes}");
@@ -531,7 +534,34 @@ fn scaffold_attachment_cleans_up_saved_blob_on_early_return() {
         "{routes}"
     );
 
+    // Issue #1872 (codex P2): the save's `?` is expanded into an explicit match
+    // so a *later* early return can clean up an already-saved blob, and the
+    // `decode_form` `?` is likewise expanded so malformed scalar input on the
+    // same request cleans up the just-saved upload.
+    assert!(
+        routes.contains("let blob = match field.save_to_blob_store(&*store, key).await {"),
+        "the multipart save must be a match so a later early return can clean up:\n{routes}"
+    );
+    assert!(
+        routes.contains("let form = match decode_form(Bytes::from(encoded)) {"),
+        "decode_form must be a match so malformed input cleans up the saved blob:\n{routes}"
+    );
+
     let create = handler_body(&routes, "pub async fn create(", "pub async fn update(");
+
+    // The cleanup keys are recorded at save-time — the `saved_blob_keys.push`
+    // must appear *before* the `decode_form(` call in the emitted handler, so the
+    // decode_form early return has the keys available to clean up.
+    let push_at = create
+        .find("saved_blob_keys.push(blob.key.clone());")
+        .unwrap_or_else(|| panic!("missing saved_blob_keys.push in create:\n{create}"));
+    let decode_at = create
+        .find("decode_form(")
+        .unwrap_or_else(|| panic!("missing decode_form( in create:\n{create}"));
+    assert!(
+        push_at < decode_at,
+        "saved_blob_keys must be populated before decode_form in create:\n{create}"
+    );
     // Split create at the success tail: everything up to `flash.success` is the
     // early-return region, everything after is the success path.
     let create_success_at = create
@@ -539,15 +569,17 @@ fn scaffold_attachment_cleans_up_saved_blob_on_early_return() {
         .unwrap_or_else(|| panic!("missing create success in:\n{create}"));
     let (create_early, create_success) = create.split_at(create_success_at);
 
-    // Cleanup guards every create early return: validation 422, `into_new`
-    // parse failure, the unique-violation 422, and the generic DB `Err`.
+    // Cleanup guards every create early return that can occur after the first
+    // blob is saved: the mid-loop subsequent-field save failure, `decode_form` on
+    // malformed scalar input, validation 422, `into_new` parse failure, the
+    // unique-violation 422, and the generic DB `Err`.
     assert_eq!(
         create_early
             .matches("let _ = store.delete(key).await;")
             .count(),
-        4,
-        "create must clean up the saved blob on all four early returns \
-         (validation, into_new, unique-violation, DB error):\n{create}"
+        6,
+        "create must clean up the saved blob on all six early returns \
+         (mid-loop save, decode_form, validation, into_new, unique-violation, DB error):\n{create}"
     );
     // The success path must NOT delete the blob it just persisted.
     assert!(
@@ -560,15 +592,17 @@ fn scaffold_attachment_cleans_up_saved_blob_on_early_return() {
         .find("flash.success(\"Photo updated\")")
         .unwrap_or_else(|| panic!("missing update success in:\n{update}"));
     let (update_early, update_success) = update.split_at(update_success_at);
-    // Cleanup guards every update early return: validation 422, the current-row
-    // load, `into_new`, the unique-violation 422, the generic DB `Err`, and the
-    // not-found (`updated == 0`) guard.
+    // Cleanup guards every update early return that can occur after the first
+    // blob is saved: the mid-loop subsequent-field save failure, `decode_form` on
+    // malformed scalar input, validation 422, the current-row load, `into_new`,
+    // the unique-violation 422, the generic DB `Err`, and the not-found
+    // (`updated == 0`) guard.
     assert_eq!(
         update_early
             .matches("let _ = store.delete(key).await;")
             .count(),
-        6,
-        "update must clean up the saved blob on all six early returns:\n{update}"
+        8,
+        "update must clean up the saved blob on all eight early returns:\n{update}"
     );
     assert!(
         !update_success.contains("store.delete("),
