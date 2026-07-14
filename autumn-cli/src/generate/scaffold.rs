@@ -2126,6 +2126,31 @@ fn render_routes_file(
     // splice into the handler templates in place of the plain `let form = …` /
     // `let new = …` lines.
     let attachment_fields: Vec<&Field> = fields.iter().filter(|f| f.kind.is_attachment()).collect();
+    // Issue #1872: the create/update handlers stream each uploaded file to the
+    // blob store *before* changeset validation and the DB write, so any early
+    // return after the save would orphan the just-uploaded blob. We record only
+    // the freshly-saved `<field>_blob`s (into `saved_blob_keys`) — pushed at the
+    // point of each save, so the key set is populated incrementally as blobs are
+    // persisted — and best-effort delete them before every early-return path that
+    // can occur after the first save.
+    //
+    // Codex P2 (centralized): the *whole* fallible multipart-parse-and-decode
+    // span — `next_field()?`, each `save_to_blob_store()?`, `bytes_limited()?`,
+    // the UTF-8 `map_err(…)?`, and `decode_form(…)?` — runs inside one
+    // `async { … }.await` block typed to the handler's `AutumnError`, whose `Err`
+    // is funneled through a single cleanup path (`form_decode_block`). That covers
+    // every `?` in the span (current and future) without per-line wrapping, so a
+    // malformed boundary / oversized text field / invalid UTF-8 arriving *after* a
+    // blob was saved can no longer leak it. The remaining post-parse early returns
+    // (changeset validation, `into_new`, the unique-violation 422, the generic DB
+    // error, and the update's current-row load / not-found) sit *outside* that
+    // block and keep splicing `{blob_cleanup}` before their `return`. A preserved
+    // existing blob is never enrolled.
+    let blob_cleanup = if has_attachments {
+        "for key in &saved_blob_keys {\n        let _ = store.delete(key).await;\n    }\n    "
+    } else {
+        ""
+    };
     let form_decode_block = if has_attachments {
         let mut blob_decls = String::new();
         let mut match_arms = String::new();
@@ -2135,6 +2160,15 @@ fn render_routes_file(
                 blob_decls,
                 "    let mut {name}_blob: Option<autumn_web::storage::Blob> = None;"
             );
+            // Issue #1872: record the freshly-saved blob's key into
+            // `saved_blob_keys` *immediately* after each successful save, so any
+            // later fallible early return (a subsequent attachment field's save,
+            // `decode_form`, validation, the DB write) can best-effort delete it.
+            // The save's own `?` (and every other fallible `?` in the parse span)
+            // is covered centrally: the whole multipart-parse-and-decode section
+            // runs inside a single `async {…}` block whose `Err` is funneled
+            // through one cleanup path (see `form_decode_block`), so a failed save
+            // cleans up any earlier-saved sibling blobs without per-line wrapping.
             let _ = write!(
                 match_arms,
                 "            Some(\"{name}\") => {{\n                \
@@ -2144,7 +2178,9 @@ fn render_routes_file(
                  chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default(),\n                        \
                  uuid::Uuid::new_v4()\n                    \
                  );\n                    \
-                 {name}_blob = Some(field.save_to_blob_store(&*store, key).await?);\n                \
+                 let blob = field.save_to_blob_store(&*store, key).await?;\n                    \
+                 saved_blob_keys.push(blob.key.clone());\n                    \
+                 {name}_blob = Some(blob);\n                \
                  }}\n            \
                  }}\n"
             );
@@ -2155,10 +2191,12 @@ fn render_routes_file(
              .ok_or_else(|| AutumnError::internal_server_error_msg(\"storage not configured\"))?\n        \
              .store()\n        \
              .clone();\n    \
-             let mut form_pairs: Vec<(String, String)> = Vec::new();\n\
+             let mut saved_blob_keys: Vec<String> = Vec::new();\n\
              {blob_decls}    \
-             while let Some(field) = multipart.next_field().await? {{\n        \
-             let field_name = field.name().map(str::to_owned);\n        \
+             let __parse_result: AutumnResult<{pascal_name}Form> = async {{\n        \
+             let mut form_pairs: Vec<(String, String)> = Vec::new();\n        \
+             while let Some(field) = multipart.next_field().await? {{\n            \
+             let field_name = field.name().map(str::to_owned);\n            \
              match field_name.as_deref() {{\n\
              {match_arms}            \
              Some(other) => {{\n                \
@@ -2167,18 +2205,37 @@ fn render_routes_file(
              form_pairs.push((other.to_owned(), value));\n            \
              }}\n            \
              None => {{}}\n        \
-             }}\n    \
-             }}\n    \
-             let form = {{\n        \
+             }}\n        \
+             }}\n        \
              let encoded = url::form_urlencoded::Serializer::new(String::new())\n            \
              .extend_pairs(form_pairs.iter().map(|(key, value)| (key.as_str(), value.as_str())))\n            \
              .finish();\n        \
-             decode_form(Bytes::from(encoded))?\n    \
+             let form = decode_form(Bytes::from(encoded))?;\n        \
+             Ok(form)\n    \
+             }}\n    \
+             .await;\n    \
+             let form = match __parse_result {{\n        \
+             Ok(form) => form,\n        \
+             Err(err) => {{\n            \
+             {blob_cleanup}return Err(err);\n        \
+             }}\n    \
              }};"
         )
     } else {
         format!("let form = {decode_call};")
     };
+    // Issue #1872: for attachment scaffolds `into_new` runs *after* the blob save,
+    // so its fallible parse (`?`) must first clean up the just-saved blob(s). We
+    // emit an explicit `match` that runs the cleanup then returns the same error
+    // the `?` would have produced.
+    let into_new_bind = format!(
+        "let mut new = match into_new(changeset.data()) {{\n        \
+         Ok(new) => new,\n        \
+         Err(err) => {{\n            \
+         {blob_cleanup}return Err(err);\n        \
+         }}\n    \
+         }};"
+    );
     // Create: build `New{Pascal}` then bind each streamed blob (a `None` blob
     // means no file was submitted — the column stays NULL, satisfying the
     // optional-empty-as-NULL acceptance criterion).
@@ -2188,7 +2245,7 @@ fn render_routes_file(
             let name = &f.name;
             let _ = write!(binds, "\n    new.{name} = {name}_blob;");
         }
-        format!("let mut new = {into_new_call};{binds}")
+        format!("{into_new_bind}{binds}")
     } else {
         format!("let new = {into_new_call};")
     };
@@ -2198,24 +2255,45 @@ fn render_routes_file(
     // through the same handle the update statement uses (repository on the live
     // path, sharded repo on the sharded path, diesel otherwise).
     let update_new_block = if has_attachments {
+        // Issue #1872: loading the current row also happens after the blob save,
+        // so its fallible steps clean up the just-saved blob(s) before returning.
         let load_current = if live && !sharded {
             format!(
-                "let current = repo.find_by_id(*id).await?\n        \
-                 .ok_or_else(|| AutumnError::not_found_msg(format!(\"{pascal_name} with id {{}} not found\", *id)))?;\n    "
+                "let current = match repo.find_by_id(*id).await {{\n        \
+                 Ok(Some(current)) => current,\n        \
+                 Ok(None) => {{\n            \
+                 {blob_cleanup}return Err(AutumnError::not_found_msg(format!(\"{pascal_name} with id {{}} not found\", *id)));\n        \
+                 }}\n        \
+                 Err(err) => {{\n            \
+                 {blob_cleanup}return Err(err);\n        \
+                 }}\n    \
+                 }};\n    "
             )
         } else if sharded {
             format!(
-                "let current = Pg{pascal_name}Repository::from_shard(&db).find_by_id(*id).await?\n        \
-                 .ok_or_else(|| AutumnError::not_found_msg(format!(\"{pascal_name} with id {{}} not found\", *id)))?;\n    "
+                "let current = match Pg{pascal_name}Repository::from_shard(&db).find_by_id(*id).await {{\n        \
+                 Ok(Some(current)) => current,\n        \
+                 Ok(None) => {{\n            \
+                 {blob_cleanup}return Err(AutumnError::not_found_msg(format!(\"{pascal_name} with id {{}} not found\", *id)));\n        \
+                 }}\n        \
+                 Err(err) => {{\n            \
+                 {blob_cleanup}return Err(err);\n        \
+                 }}\n    \
+                 }};\n    "
             )
         } else {
             format!(
-                "let current: {pascal_name} = {plural}::table\n        \
+                "let current: {pascal_name} = match {plural}::table\n        \
                  .find(*id)\n        \
                  .select({pascal_name}::as_select())\n        \
                  .first(&mut *db)\n        \
-                 .await\n        \
-                 .map_err(AutumnError::not_found)?;\n    "
+                 .await\n    \
+                 {{\n        \
+                 Ok(current) => current,\n        \
+                 Err(err) => {{\n            \
+                 {blob_cleanup}return Err(AutumnError::not_found(err));\n        \
+                 }}\n    \
+                 }};\n    "
             )
         };
         let mut binds = String::new();
@@ -2223,7 +2301,7 @@ fn render_routes_file(
             let name = &f.name;
             let _ = write!(binds, "\n    new.{name} = {name}_blob.or(current.{name});");
         }
-        format!("{load_current}let mut new = {into_new_call};{binds}")
+        format!("{load_current}{into_new_bind}{binds}")
     } else {
         format!("let new = {into_new_call};")
     };
@@ -2371,13 +2449,10 @@ fn render_routes_file(
         render_unique_constraints_const(plural, &unique_fields, all_fields)
     };
 
-    let create_insert_block = if unique_fields.is_empty() {
-        format!(
-            "{create_stmt}\n    \
-             flash.success(\"{pascal_name} created\").await;\n    \
-             Ok(autumn_web::Redirect::to(&paths::index()).into_response())"
-        )
-    } else {
+    let create_insert_block = if !unique_fields.is_empty() {
+        // Issue #1872: `{blob_cleanup}` (empty unless the scaffold has attachment
+        // fields) best-effort deletes the just-saved blob(s) on both the
+        // unique-violation 422 and the generic DB-error early returns.
         format!(
             "let result: AutumnResult<()> = async {{\n        \
              {create_stmt}\n        \
@@ -2388,10 +2463,30 @@ fn render_routes_file(
              let mut errors = std::collections::HashMap::new();\n            \
              errors.insert(field.to_string(), vec![message.to_string()]);\n            \
              let changeset = Changeset::from_errors(changeset.into_inner(), errors);\n            \
-             return Ok((autumn_web::reexports::http::StatusCode::UNPROCESSABLE_ENTITY, {new_form_body}).into_response());\n        \
+             {blob_cleanup}return Ok((autumn_web::reexports::http::StatusCode::UNPROCESSABLE_ENTITY, {new_form_body}).into_response());\n        \
              }}\n        \
-             return Err(err);\n    \
+             {blob_cleanup}return Err(err);\n    \
              }}\n    \
+             flash.success(\"{pascal_name} created\").await;\n    \
+             Ok(autumn_web::Redirect::to(&paths::index()).into_response())"
+        )
+    } else if has_attachments {
+        // Issue #1872: no unique constraints to classify, but the DB write can
+        // still fail after the blob save — clean up before returning the error.
+        format!(
+            "let result: AutumnResult<()> = async {{\n        \
+             {create_stmt}\n        \
+             Ok(())\n    \
+             }}.await;\n    \
+             if let Err(err) = result {{\n        \
+             {blob_cleanup}return Err(err);\n    \
+             }}\n    \
+             flash.success(\"{pascal_name} created\").await;\n    \
+             Ok(autumn_web::Redirect::to(&paths::index()).into_response())"
+        )
+    } else {
+        format!(
+            "{create_stmt}\n    \
              flash.success(\"{pascal_name} created\").await;\n    \
              Ok(autumn_web::Redirect::to(&paths::index()).into_response())"
         )
@@ -2417,25 +2512,17 @@ fn render_routes_file(
          {form_decode_block}\n    \
          let changeset = form.into_changeset();\n    \
          if !changeset.is_valid() {{\n        \
-         return Ok((autumn_web::reexports::http::StatusCode::UNPROCESSABLE_ENTITY, {new_form_body}).into_response());\n    \
+         {blob_cleanup}return Ok((autumn_web::reexports::http::StatusCode::UNPROCESSABLE_ENTITY, {new_form_body}).into_response());\n    \
          }}\n    \
          {create_new_block}\n    \
          {create_insert_block}\n\
          }}\n"
     );
 
-    let update_apply_block = if unique_fields.is_empty() {
-        format!(
-            "{update_stmt}\n    \
-             if updated == 0 {{\n        \
-             return Err(AutumnError::not_found_msg(format!(\n            \
-             \"{pascal_name} with id {{}} not found\", *id\n        \
-             )));\n    \
-             }}\n    \
-             flash.success(\"{pascal_name} updated\").await;\n    \
-             Ok(autumn_web::Redirect::to(&paths::show(*id)).into_response())"
-        )
-    } else {
+    let update_apply_block = if !unique_fields.is_empty() {
+        // Issue #1872: `{blob_cleanup}` (empty unless the scaffold has attachment
+        // fields) best-effort deletes the just-saved blob(s) on the
+        // unique-violation 422, the generic DB-error, and the not-found returns.
         format!(
             "let result: AutumnResult<usize> = async {{\n        \
              {update_stmt}\n        \
@@ -2448,11 +2535,44 @@ fn render_routes_file(
              let mut errors = std::collections::HashMap::new();\n                \
              errors.insert(field.to_string(), vec![message.to_string()]);\n                \
              let changeset = Changeset::from_errors(changeset.into_inner(), errors);\n                \
-             return Ok((autumn_web::reexports::http::StatusCode::UNPROCESSABLE_ENTITY, {edit_form_body}).into_response());\n            \
+             {blob_cleanup}return Ok((autumn_web::reexports::http::StatusCode::UNPROCESSABLE_ENTITY, {edit_form_body}).into_response());\n            \
              }}\n            \
-             return Err(err);\n        \
+             {blob_cleanup}return Err(err);\n        \
              }}\n    \
              }};\n    \
+             if updated == 0 {{\n        \
+             {blob_cleanup}return Err(AutumnError::not_found_msg(format!(\n            \
+             \"{pascal_name} with id {{}} not found\", *id\n        \
+             )));\n    \
+             }}\n    \
+             flash.success(\"{pascal_name} updated\").await;\n    \
+             Ok(autumn_web::Redirect::to(&paths::show(*id)).into_response())"
+        )
+    } else if has_attachments {
+        // Issue #1872: no unique constraints, but the update write and the
+        // not-found guard both early-return after the blob save — clean up first.
+        format!(
+            "let result: AutumnResult<usize> = async {{\n        \
+             {update_stmt}\n        \
+             Ok(updated)\n    \
+             }}.await;\n    \
+             let updated = match result {{\n        \
+             Ok(updated) => updated,\n        \
+             Err(err) => {{\n            \
+             {blob_cleanup}return Err(err);\n        \
+             }}\n    \
+             }};\n    \
+             if updated == 0 {{\n        \
+             {blob_cleanup}return Err(AutumnError::not_found_msg(format!(\n            \
+             \"{pascal_name} with id {{}} not found\", *id\n        \
+             )));\n    \
+             }}\n    \
+             flash.success(\"{pascal_name} updated\").await;\n    \
+             Ok(autumn_web::Redirect::to(&paths::show(*id)).into_response())"
+        )
+    } else {
+        format!(
+            "{update_stmt}\n    \
              if updated == 0 {{\n        \
              return Err(AutumnError::not_found_msg(format!(\n            \
              \"{pascal_name} with id {{}} not found\", *id\n        \
@@ -2507,7 +2627,7 @@ fn render_routes_file(
          {form_decode_block}\n    \
          let changeset = form.into_changeset();\n    \
          if !changeset.is_valid() {{\n        \
-         return Ok((autumn_web::reexports::http::StatusCode::UNPROCESSABLE_ENTITY, {edit_form_body}).into_response());\n    \
+         {blob_cleanup}return Ok((autumn_web::reexports::http::StatusCode::UNPROCESSABLE_ENTITY, {edit_form_body}).into_response());\n    \
          }}\n    \
          {update_new_block}\n    \
          {update_apply_block}\n\
