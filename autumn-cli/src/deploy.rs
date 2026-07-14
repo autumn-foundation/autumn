@@ -20,6 +20,7 @@
 //! with `autumn doctor`.
 
 pub mod exec;
+pub mod proxy;
 
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
@@ -504,6 +505,46 @@ pub fn render_systemd_unit(cfg: &ResolvedDeployConfig) -> String {
     )
 }
 
+/// Render the systemd unit for a specific blue/green *slot* release (issue #1607,
+/// Slice 2).
+///
+/// Unlike [`render_systemd_unit`] (which execs the `current` symlink), a slot unit
+/// pins its own `release_dir` and binds a PRIVATE loopback `app_port`, so the blue
+/// and green slots can run different releases side by side across a cutover while
+/// the reverse proxy owns the public port. The unit is named
+/// `{service}-{slot}.service` (see [`exec::slot_unit_name`]).
+#[must_use]
+pub fn render_app_unit(
+    cfg: &ResolvedDeployConfig,
+    release_dir: &str,
+    app_port: u16,
+    slot: &str,
+) -> String {
+    format!(
+        "[Unit]\n\
+         Description=Autumn application: {app} ({slot})\n\
+         After=network-online.target\n\
+         Wants=network-online.target\n\
+         \n\
+         [Service]\n\
+         Type=simple\n\
+         User={user}\n\
+         WorkingDirectory={release_dir}\n\
+         EnvironmentFile={env_file}\n\
+         Environment=AUTUMN_SERVER__HOST=127.0.0.1\n\
+         Environment=AUTUMN_SERVER__PORT={app_port}\n\
+         ExecStart={release_dir}/{app}\n\
+         Restart=on-failure\n\
+         RestartSec=2\n\
+         \n\
+         [Install]\n\
+         WantedBy=multi-user.target\n",
+        app = cfg.app_name,
+        user = cfg.user,
+        env_file = cfg.env_file(),
+    )
+}
+
 /// Build the ordered, zero-downtime deploy plan (AC-2/3/4).
 ///
 /// The sequence encodes the framework's `/live`-`/ready`-drain contract:
@@ -841,17 +882,24 @@ fn default_release_id() -> String {
     chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string()
 }
 
-/// Perform a real FIRST deploy (issue #1607, Slice 1).
+/// Perform a real deploy (issue #1607, Slices 1–2).
 ///
 /// Runs the same preflight as `check` and aborts before touching the server if
-/// anything fails (AC-6), then drives the ordered host-prep + first-deploy
-/// sequence against a real [`exec::SshExecutor`].
+/// anything fails (AC-6). It then probes the target ([`exec::detect_deploy_mode`])
+/// to choose between:
 ///
-/// Scope guard: this is a first-deploy path only. On a redeploy it re-points
-/// `current` at the new release the same way; zero-downtime cutover and rollback
-/// are follow-up slices and are deliberately NOT performed here.
+/// - **first deploy** ([`exec::first_deploy_ops`]) — install the reverse proxy on
+///   the public port and stand the initial release up on a private loopback slot
+///   behind it, or
+/// - **zero-downtime redeploy** ([`exec::cutover_ops`]) — stand the candidate up
+///   on the idle slot, run migrations before cutover, gate on `/ready`, then have
+///   the proxy flip live traffic to it and drain the old release (AC-2/AC-3).
+///
+/// Rollback execution and auto-rollback on a failed gate remain a follow-up slice
+/// (Slice 3): here a failed migration or readiness timeout aborts before the flip
+/// with the old release still serving.
 fn run_up(config: &AutumnConfig, resolved: &ResolvedDeployConfig) -> Result<(), DeployError> {
-    eprintln!("\u{1F342} autumn deploy up (first deploy)\n");
+    eprintln!("\u{1F342} autumn deploy up\n");
 
     // Fail fast: run the full preflight and abort BEFORE any remote call.
     let checks = collect_preflight(config, resolved);
@@ -864,30 +912,72 @@ fn run_up(config: &AutumnConfig, resolved: &ResolvedDeployConfig) -> Result<(), 
     let target = exec::SshTarget::from_resolved(resolved)
         .ok_or_else(|| DeployError::Config(DEPLOY_HOST_MISSING_DETAIL.to_owned()))?;
     let binary = resolve_release_binary(resolved)?;
-    let unit = render_systemd_unit(resolved);
     let env_file = build_env_file(config);
     let release_id = default_release_id();
-
-    let ops = exec::first_deploy_ops(
-        resolved,
-        &unit,
-        env_file,
-        &binary,
-        &release_id,
-        config.server.port,
-    );
+    let public_port = config.server.port;
+    let proxy = proxy::KamalProxyController::new(resolved.readiness_timeout_secs);
     let executor = exec::SshExecutor::new(target);
+    let release_dir = format!("{}/{release_id}", resolved.releases_dir());
 
-    eprintln!(
-        "Deploying release {release_id} to {}\u{2026}\n",
-        resolved.host.as_deref().unwrap_or_default()
-    );
-    exec::execute_first_deploy(&checks, &ops, &executor)
+    // Probe the target to choose first-deploy vs zero-downtime redeploy.
+    let mode = exec::detect_deploy_mode(resolved, &executor)
         .map_err(|e| DeployError::Exec(e.to_string()))?;
 
+    let (ops, banner) = match mode {
+        exec::DeployMode::First => {
+            let plan = exec::SlotPlan::first(public_port);
+            let unit = render_app_unit(
+                resolved,
+                &release_dir,
+                plan.candidate_port,
+                plan.candidate_slot,
+            );
+            let ops = exec::first_deploy_ops(
+                resolved,
+                &proxy,
+                &unit,
+                env_file,
+                &binary,
+                &release_id,
+                &plan,
+            );
+            (ops, "first deploy".to_owned())
+        }
+        exec::DeployMode::Redeploy { live_slot } => {
+            let plan = exec::SlotPlan::redeploy(public_port, live_slot);
+            let unit = render_app_unit(
+                resolved,
+                &release_dir,
+                plan.candidate_port,
+                plan.candidate_slot,
+            );
+            let ops = exec::cutover_ops(
+                resolved,
+                &proxy,
+                &unit,
+                env_file,
+                &binary,
+                &release_id,
+                &plan,
+            );
+            (
+                ops,
+                format!(
+                    "zero-downtime redeploy ({} \u{2192} {})",
+                    plan.live_slot, plan.candidate_slot
+                ),
+            )
+        }
+    };
+
     eprintln!(
-        "\n\u{2705} First deploy complete. Zero-downtime cutover and rollback land in later slices."
+        "Deploying release {release_id} to {} ({banner})\u{2026}\n",
+        resolved.host.as_deref().unwrap_or_default()
     );
+    exec::execute_redeploy(&checks, &ops, &executor)
+        .map_err(|e| DeployError::Exec(e.to_string()))?;
+
+    eprintln!("\n\u{2705} Deploy complete. Rollback execution lands in a later slice.");
     Ok(())
 }
 
