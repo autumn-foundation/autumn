@@ -59,6 +59,60 @@ fn labeled_text_field_associates_label_and_input() {
 }
 
 #[test]
+fn labeled_text_field_carries_scaffold_attributes() {
+    // The attributes raw scaffold form-fields need: presentational `class`,
+    // `aria-invalid`/`aria-describedby` error wiring, and HTML5 validation
+    // constraints — all expressible through `TextField` while it still requires
+    // a label to render.
+    let markup = TextField::new("title")
+        .input_type("text")
+        .class("autumn-field__input autumn-field__input--invalid")
+        .aria_invalid(true)
+        .described_by("title-error")
+        .required()
+        .aria_required()
+        .minlength(3)
+        .maxlength(120)
+        .label("Title")
+        .render()
+        .into_string();
+    assert!(
+        markup.contains("<label for=\"title\">Title</label>"),
+        "{markup}"
+    );
+    assert!(
+        markup.contains("class=\"autumn-field__input autumn-field__input--invalid\""),
+        "{markup}"
+    );
+    assert!(markup.contains("aria-invalid=\"true\""), "{markup}");
+    assert!(
+        markup.contains("aria-describedby=\"title-error\""),
+        "{markup}"
+    );
+    assert!(markup.contains("aria-required=\"true\""), "{markup}");
+    assert!(markup.contains("minlength=\"3\""), "{markup}");
+    assert!(markup.contains("maxlength=\"120\""), "{markup}");
+    assert!(markup.contains("required"), "{markup}");
+}
+
+#[test]
+fn labeled_text_field_carries_numeric_constraints() {
+    let markup = TextField::new("ratio")
+        .input_type("number")
+        .min("0")
+        .max("1")
+        .step("any")
+        .aria_label("Ratio")
+        .render()
+        .into_string();
+    assert!(markup.contains("type=\"number\""), "{markup}");
+    assert!(markup.contains("min=\"0\""), "{markup}");
+    assert!(markup.contains("max=\"1\""), "{markup}");
+    assert!(markup.contains("step=\"any\""), "{markup}");
+    assert!(markup.contains("aria-label=\"Ratio\""), "{markup}");
+}
+
+#[test]
 fn text_field_aria_label_and_labelled_by_variants() {
     let aria = TextField::new("q")
         .aria_label("Search")

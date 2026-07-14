@@ -59,6 +59,10 @@ fn compile_fail_tests() {
     t.compile_fail("tests/compile-fail/a11y_button_missing_name.rs");
     #[cfg(feature = "maud")]
     t.compile_fail("tests/compile-fail/a11y_textfield_unlabeled.rs");
+    // The presentational/validation attributes must not open a render path for
+    // an unlabeled field: setting them all and calling `.render()` still fails.
+    #[cfg(feature = "maud")]
+    t.compile_fail("tests/compile-fail/a11y_textfield_attrs_unlabeled.rs");
     #[cfg(feature = "maud")]
     t.compile_fail("tests/compile-fail/a11y_link_missing_text.rs");
     #[cfg(feature = "maud")]

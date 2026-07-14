@@ -286,6 +286,46 @@ Free functions rendering changeset-aware, accessible inputs:
   values decode; RFC 3339 still accepted). `DateTime` columns with a zone
   other than `Utc`/`Local` render as `Text` (RFC 3339 string), not a picker.
 
+## Typed accessible primitives (`autumn_web::a11y`, unreleased — trunk-dev only)
+
+Render-implementing structs (issue #1706) that make the accessible name a
+**type-level obligation** — the inaccessible form does not compile. Each maps to
+a WCAG 2.1 success criterion. Full narrative in `docs/guide/accessibility.md`.
+
+- `Img::new(src, alt)` (alt required) / `Img::decorative(src)` (explicit
+  `alt=""`); `.class(..)` / `.width(u32)` / `.height(u32)`. WCAG 1.1.1.
+- `Button::new(name)` (visible label) / `Button::icon(markup, name)`
+  (name ⇒ `aria-label`); `.kind(ButtonType)` / `.submit()` / `.button()` /
+  `.class(..)`. WCAG 4.1.2.
+- `Link::new(href, text)` / `Link::icon(href, markup, name)`; `.new_tab()`
+  (`target="_blank"` + `rel="noopener noreferrer"`) / `.class(..)`. WCAG 2.4.4 /
+  4.1.2.
+- `MenuItem::new(name)` (renders `role="menuitem"` on a `<button>`; `.href(..)`
+  switches to `<a>`); `.icon(markup)` (name ⇒ `aria-label`) / `.class(..)`.
+  WCAG 4.1.2.
+- `TextField::new(name)` returns a `TextField<NoLabel>` — a typestate that does
+  **not** implement `Render`. Only after a label is attached —
+  `.label(text)` (visible `<label for=…>`), `.aria_label(text)`, or
+  `.labelled_by(id)` (`aria-labelledby`) — does it become `TextField<Labeled>`,
+  the only state that renders. So an unlabeled field is unrepresentable as
+  markup (WCAG 1.3.1 / 3.3.2 / 4.1.2). Presentational + validation setters are
+  chainable in **either** typestate and none supplies an accessible name, so
+  none lifts the compile-time label obligation — the guarantee is additive:
+  - `.input_type(s)` — input `type` (e.g. `"email"`, `"number"`).
+  - `.value(s)` — initial `value`.
+  - `.required()` — native `required`.
+  - `.aria_required()` — mirroring `aria-required="true"` (matches the scaffold
+    generator's non-nullable ARIA wiring).
+  - `.class(s)` — `class` on the `<input>`.
+  - `.aria_invalid(bool)` — `aria-invalid="true"`/`"false"`; omitted entirely
+    when unset.
+  - `.described_by(id)` — `aria-describedby` referencing an error container's
+    `id`, so AT announces the error with the input.
+  - `.minlength(u32)` / `.maxlength(u32)` — HTML5 length constraints (scaffold
+    `text{min=…}` / `{max=…}`).
+  - `.min(s)` / `.max(s)` — HTML5 numeric bounds (passed through verbatim).
+  - `.step(s)` — HTML5 `step` (e.g. `"any"` for float fields).
+
 ## View widgets and UI (all unreleased — trunk-dev only)
 
 - `autumn_web::widgets`: `card(&body, &CardConfig)`,
