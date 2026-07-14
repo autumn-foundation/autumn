@@ -187,6 +187,59 @@ not streaming replication — is the durability story for this tier.
 
 ---
 
+## SQLite field-type support
+
+The backend-aware generator maps model field kinds to SQLite storage types at
+`autumn generate` time. Like the capability matrix above, this tier lands in
+slices: a field kind is either **mapped** to a working SQLite column type, or
+**rejected at generate time** with an actionable message that names its tracking
+issue — never emitted as output that compiles on Postgres but breaks at migrate
+time on SQLite.
+
+| Field kind | On SQLite | SQLite type | Note |
+| --- | :---: | --- | --- |
+| `String` / `Text` / `Enum` | ✅ | `TEXT` | Enum stored as its text representation. |
+| `i32` | ✅ | `INTEGER` | |
+| `i64` / references (foreign keys) | ✅ | `INTEGER` | Reference columns are `i64` foreign keys. |
+| `bool` | ✅ | `INTEGER` | Stored as `0` / `1`. |
+| `f32` | ✅ | `REAL` | |
+| `f64` | ✅ | `REAL` | |
+| `Bytea` | ✅ | `BLOB` | |
+| `NaiveDateTime` | ✅ | `Timestamp` (TEXT) | |
+| `DateTime<Utc>` | ✅ | `TimestamptzSqlite` (TEXT) | diesel's `TimestamptzSqlite`; stored as TEXT (SQLite has no native tz type). |
+| `Uuid` | ⛔ | — | **Rejected at generate time — #1924.** No working diesel SQLite `FromSql`/`ToSql` in the app's diesel feature set. |
+| `Decimal` | ⛔ | — | **Rejected at generate time — #1924.** Same reason. |
+| `Attachment` / `Blob` | ⛔ | — | **Rejected at generate time — #1924.** Same reason. |
+
+Two additional generator shapes are refused on SQLite:
+
+- **`--id uuid` primary keys** are rejected at generate time — the SQLite primary
+  key is `INTEGER PRIMARY KEY AUTOINCREMENT`, and a UUID primary key has no
+  working conversion yet. Tracked in #1905.
+- **`--search` / FTS scaffold** is rejected at generate time — Postgres FTS uses a
+  `tsvector` generated column and a GIN index, which SQLite lacks. SQLite FTS5 is
+  a later slice. Tracked in #1910.
+
+### Migration mechanics on SQLite
+
+A few SQLite-specific mechanics apply when the generator emits migrations:
+
+- **`ADD COLUMN NOT NULL` requires a default.** SQLite cannot add a `NOT NULL`
+  column to an existing table without a default value, so a re-add that lacks one
+  is **rejected at generate time** — on both the `up` (add) and rollback (re-add)
+  paths — rather than emitting SQL that fails at migrate time.
+- **Rollback drops indexes before columns.** On the SQLite rollback path the
+  generator emits `DROP INDEX` before `DROP COLUMN`, since SQLite will not drop a
+  column that an index still references.
+- **Known limitation — dropping a pre-existing indexed column.** A
+  `Remove…From…` migration that drops a column which was indexed by an *earlier*
+  migration can still fail on SQLite, because the generator has no knowledge of
+  the original table's indexes and so cannot emit the matching `DROP INDEX`
+  first. Drop the index in the same migration, or drop the column via a manual
+  table rebuild. Tracked under the SQLite migrations issue #1906.
+
+---
+
 ## What is NOT supported on SQLite
 
 These are Postgres-only by design. They are not missing features to be filed as
