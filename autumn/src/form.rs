@@ -789,7 +789,7 @@ pub fn form_tag(
 /// audited CSRF/method-override path.
 #[cfg(feature = "maud")]
 #[allow(clippy::needless_pass_by_value)]
-fn form_tag_inner(
+pub(crate) fn form_tag_inner(
     action: &str,
     method: &str,
     csrf_field: &str,

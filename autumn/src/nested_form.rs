@@ -274,6 +274,30 @@ pub struct NestedChangeset<P, C> {
 }
 
 impl<P, C: NestedChild> NestedChangeset<P, C> {
+    /// Build a blank, **non-validating** nested changeset for the initial
+    /// `new` (or `edit`) render, before the user has submitted anything.
+    ///
+    /// Mirrors [`ChangesetForm::blank`](crate::form::ChangesetForm::blank): it
+    /// wraps `parent` in a valid [`Changeset`] (via [`Changeset::new`], which
+    /// records **no** errors — it does **not** run [`validator::Validate`])
+    /// with **zero** child rows. So `is_valid()` returns `true`,
+    /// `errors_for(..)` is empty, `rows()` is empty, and `into_valid()` returns
+    /// `Ok((parent, vec![]))` even when a required parent field is still empty.
+    ///
+    /// Use this for the initial GET render so the blank page does not show a
+    /// premature "field is required" error or `aria-invalid="true"` before the
+    /// user has typed. Use [`decode_nested_urlencoded`] (or the
+    /// [`NestedChangesetForm`] extractor) for the POST decode that validates a
+    /// real submission and re-renders with inline errors.
+    #[must_use]
+    pub fn blank(parent: P) -> Self {
+        Self {
+            parent: Changeset::new(parent),
+            rows: Vec::new(),
+            valid_children: Some(Vec::new()),
+        }
+    }
+
     /// `true` when the parent is valid, every non-destroyed row has no
     /// errors, and the children all parsed and validated.
     #[must_use]
@@ -677,6 +701,69 @@ pub struct NestedChangesetForm<P, C> {
 }
 
 impl<P, C: NestedChild> NestedChangesetForm<P, C> {
+    /// Build a blank nested-form context for the initial `new`/`edit` GET
+    /// render, before any submission.
+    ///
+    /// Mirrors [`ChangesetForm::blank`](crate::form::ChangesetForm::blank): it
+    /// wraps `parent` in a **non-validating** [`NestedChangeset::blank`] (no
+    /// child rows, no errors) so the initial page renders clean — no premature
+    /// "field is required" message or `aria-invalid="true"` before the user has
+    /// typed. Contrast the POST path (the [`NestedChangesetForm`] extractor /
+    /// [`decode_nested_urlencoded`]), which validates the submission and
+    /// re-renders inline errors.
+    ///
+    /// `csrf_token` is the token from a `CsrfToken` extractor, or `None` when
+    /// CSRF middleware is not active. The CSRF and submit-token field names
+    /// default to `_csrf` / `_submit_token` (exactly what the extractor falls
+    /// back to when the corresponding config extensions are absent); when the
+    /// app customizes `security.csrf.form_field`, set it with
+    /// [`with_csrf_field`](Self::with_csrf_field) so
+    /// [`form_tag`](Self::form_tag) emits the right hidden field name.
+    #[must_use]
+    pub fn blank(parent: P, csrf_token: Option<String>) -> Self {
+        Self {
+            changeset: NestedChangeset::blank(parent),
+            csrf_token,
+            csrf_field: "_csrf".to_owned(),
+            submit_token: None,
+            submit_field: "_submit_token".to_owned(),
+        }
+    }
+
+    /// Wrap a pre-built [`NestedChangeset`] (which may already carry validation
+    /// errors) in a form for rendering, with no CSRF/submit token.
+    ///
+    /// Mirrors [`ChangesetForm::from_changeset`](crate::form::ChangesetForm::from_changeset):
+    /// useful in tests and cases where a `NestedChangeset` was produced
+    /// externally (e.g. via [`decode_nested_urlencoded`]) before constructing a
+    /// form for re-render. The CSRF/submit-token field names default to
+    /// `_csrf` / `_submit_token`; add a token with
+    /// [`with_csrf_field`](Self::with_csrf_field) as needed.
+    #[must_use]
+    pub fn from_changeset(changeset: NestedChangeset<P, C>) -> Self {
+        Self {
+            changeset,
+            csrf_token: None,
+            csrf_field: "_csrf".to_owned(),
+            submit_token: None,
+            submit_field: "_submit_token".to_owned(),
+        }
+    }
+
+    /// Override the CSRF form-field name used by [`form_tag`](Self::form_tag).
+    ///
+    /// Mirrors
+    /// [`ChangesetForm::with_csrf_field`](crate::form::ChangesetForm::with_csrf_field):
+    /// call this on a [`blank`](Self::blank) GET-handler form when
+    /// `security.csrf.form_field` is customized (e.g. `"authenticity_token"`).
+    /// The extractor captures the configured name automatically on the POST
+    /// path.
+    #[must_use]
+    pub fn with_csrf_field(mut self, field: impl Into<String>) -> Self {
+        self.csrf_field = field.into();
+        self
+    }
+
     /// The CSRF token captured from the request, if the CSRF middleware is active.
     #[must_use]
     pub fn csrf_token(&self) -> Option<&str> {
@@ -739,6 +826,43 @@ impl<P, C: NestedChild> NestedChangesetForm<P, C> {
                 submit_field,
             }),
         }
+    }
+}
+
+/// Maud rendering — emit the `<form>` open tag with the **captured** CSRF (and
+/// submit-token) hidden fields injected.
+#[cfg(feature = "maud")]
+impl<P, C: NestedChild> NestedChangesetForm<P, C> {
+    /// Render a `<form>` element wrapping `content`, injecting the CSRF hidden
+    /// input under the **captured** field name (honouring
+    /// `security.csrf.form_field`) and — when present — the one-time
+    /// submit-token hidden input under its captured field name.
+    ///
+    /// Mirrors [`ChangesetForm::form_tag`](crate::form::ChangesetForm::form_tag),
+    /// including the `PUT`/`PATCH`/`DELETE` → hidden `_method` override. **Prefer
+    /// this over the standalone [`crate::form::form_tag`]** for a nested-form
+    /// re-render: the standalone helper hardcodes the default `_csrf` field name
+    /// and would emit the wrong hidden field for an app that customized
+    /// `security.csrf.form_field`, so the next submit's CSRF check would reject
+    /// the form. This method uses the field name the extractor captured (or the
+    /// one set via [`with_csrf_field`](Self::with_csrf_field) on a
+    /// [`blank`](Self::blank) form), keeping CSRF parity across the re-render.
+    #[must_use]
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn form_tag(&self, action: &str, method: &str, content: maud::Markup) -> maud::Markup {
+        crate::form::form_tag_inner(
+            action,
+            method,
+            &self.csrf_field,
+            self.csrf_token.as_deref(),
+            None,
+            maud::html! {
+                @if let Some(token) = self.submit_token.as_deref() {
+                    input type="hidden" name=(self.submit_field) value=(token);
+                }
+                (content)
+            },
+        )
     }
 }
 
@@ -1137,20 +1261,23 @@ impl Default for InputsForOptions {
 /// # Example
 ///
 /// ```rust,ignore
-/// use autumn_web::form::{form_tag, required_text_input, submit_button};
+/// use autumn_web::form::{required_text_input, submit_button};
 /// use autumn_web::nested_form::{inputs_for, InputsForOptions};
 ///
 /// // `form` is a `NestedChangesetForm<NewOrder, NewLineItem>` re-rendered after
-/// // a failed submit; `changeset` is its inner `NestedChangeset`.
+/// // a failed submit; it derefs to its inner `NestedChangeset`.
 /// let opts = InputsForOptions {
 ///     add_row_url: Some("/orders/line-item-row".into()),
 ///     ..InputsForOptions::default()
 /// };
-/// form_tag("/orders", "POST", form.csrf_token(), maud::html! {
-///     // Parent fields (CSRF + submit token are emitted by `form_tag`).
-///     (required_text_input(&changeset.parent, "name", "Order name"))
+/// // Prefer `form.form_tag` over the standalone `form_tag`: it emits the CSRF
+/// // hidden field under the app-configured field name (and the submit token),
+/// // so a customized `security.csrf.form_field` survives the re-render.
+/// form.form_tag("/orders", "POST", maud::html! {
+///     // Parent fields (CSRF + submit token are emitted by `form.form_tag`).
+///     (required_text_input(&form.parent, "name", "Order name"))
 ///     // Repeating child rows.
-///     (inputs_for(&changeset, &opts, |row| maud::html! {
+///     (inputs_for(&form, &opts, |row| maud::html! {
 ///         (row.required_text_input("sku", "SKU"))
 ///         (row.number_input("quantity", "Quantity"))
 ///         (row.destroy_checkbox("Remove"))
@@ -1605,19 +1732,51 @@ mod tests {
         // Non-numeric index.
         assert_eq!(parse_child_key("items[a][sku]", "items"), None);
     }
+
+    // ── blank (non-validating) constructor ─────────────────────────
+
+    #[test]
+    fn blank_changeset_is_valid_with_no_rows_or_errors() {
+        // The initial `new`-page path: the required parent `name` is still
+        // empty, but `blank` does NOT validate, so nothing errors before the
+        // user types (unlike `decode_nested_urlencoded`).
+        let cs = NestedChangeset::<Order, LineItem>::blank(Order {
+            name: String::new(),
+        });
+        assert!(cs.is_valid());
+        assert!(cs.errors_for("name").is_empty());
+        assert!(cs.rows().is_empty());
+
+        let (order, items) = cs
+            .into_valid()
+            .unwrap_or_else(|_| panic!("blank changeset is valid"));
+        assert_eq!(order.name, "");
+        assert!(items.is_empty());
+    }
+
+    #[test]
+    fn decoded_empty_parent_errors_unlike_blank() {
+        // Contrast the POST decode path: it DOES validate, so the same empty
+        // required parent surfaces an error — exactly what `blank` avoids on the
+        // initial GET render.
+        let cs =
+            decode_nested_urlencoded::<Order, LineItem>(&[p("name", "")]).expect("parent decodes");
+        assert!(!cs.is_valid());
+        assert!(!cs.errors_for("name").is_empty());
+    }
 }
 
 #[cfg(all(test, feature = "maud"))]
 mod maud_tests {
     use super::*;
 
-    #[derive(serde::Deserialize, validator::Validate)]
+    #[derive(serde::Serialize, serde::Deserialize, validator::Validate)]
     struct Order {
         #[validate(length(min = 1, message = "name required"))]
         name: String,
     }
 
-    #[derive(serde::Deserialize, validator::Validate)]
+    #[derive(serde::Serialize, serde::Deserialize, validator::Validate)]
     struct LineItem {
         #[validate(length(min = 1, message = "sku required"))]
         sku: String,
@@ -1799,5 +1958,117 @@ mod maud_tests {
         assert!(html.contains(r#"name="items[7][sku]""#), "{html}");
         // Exactly one row wrapper.
         assert_eq!(html.matches("nested-fields__row").count(), 1, "{html}");
+    }
+
+    // ── Fix 1: form_tag preserves the captured CSRF/submit-token fields ─
+
+    /// `NestedChangesetForm::form_tag` must emit the CSRF hidden input under the
+    /// **captured/configured** field name — NOT the standalone `form_tag`'s
+    /// hardcoded `_csrf` — so an app with a custom `security.csrf.form_field`
+    /// keeps CSRF parity across a nested re-render.
+    #[test]
+    fn form_tag_emits_custom_csrf_field_name_not_default() {
+        let form = NestedChangesetForm::<Order, LineItem>::blank(
+            Order {
+                name: String::new(),
+            },
+            Some("tok-123".to_owned()),
+        )
+        .with_csrf_field("authenticity_token");
+
+        let html = form
+            .form_tag("/orders", "post", maud::html! {})
+            .into_string();
+
+        // The captured custom field name carries the token…
+        assert!(
+            html.contains(r#"name="authenticity_token" value="tok-123""#),
+            "{html}"
+        );
+        // …and the hardcoded default the standalone `form_tag` would emit does not.
+        assert!(!html.contains(r#"name="_csrf""#), "{html}");
+        assert!(html.contains(r#"action="/orders""#), "{html}");
+        assert!(html.contains(r#"method="post""#), "{html}");
+    }
+
+    /// When a submit token is captured, `form_tag` also emits it under its
+    /// captured field name (alongside the custom CSRF field).
+    #[test]
+    fn form_tag_emits_captured_submit_token_field() {
+        let form = NestedChangesetForm::<Order, LineItem> {
+            changeset: NestedChangeset::blank(Order {
+                name: String::new(),
+            }),
+            csrf_token: Some("tok".to_owned()),
+            csrf_field: "authenticity_token".to_owned(),
+            submit_token: Some("stok-9".to_owned()),
+            submit_field: "_submit_token".to_owned(),
+        };
+
+        let html = form
+            .form_tag("/orders", "post", maud::html! {})
+            .into_string();
+
+        assert!(
+            html.contains(r#"name="authenticity_token" value="tok""#),
+            "{html}"
+        );
+        assert!(
+            html.contains(r#"name="_submit_token" value="stok-9""#),
+            "{html}"
+        );
+        assert!(!html.contains(r#"name="_csrf""#), "{html}");
+    }
+
+    // ── Fix 2: blank render shows no premature parent errors ────────────
+
+    /// The initial `new`-page render from `blank`: the required parent field is
+    /// empty but un-validated, so no error message or `aria-invalid="true"`
+    /// appears before the user types.
+    #[test]
+    fn blank_form_render_shows_no_parent_validation_error() {
+        let form = NestedChangesetForm::<Order, LineItem>::blank(
+            Order {
+                name: String::new(),
+            },
+            Some("tok".to_owned()),
+        );
+
+        let html = form
+            .form_tag(
+                "/orders",
+                "post",
+                maud::html! {
+                    (crate::form::required_text_input(&form.parent, "name", "Order name"))
+                    (inputs_for(&*form, &InputsForOptions::default(), render_row))
+                },
+            )
+            .into_string();
+
+        assert!(!html.contains(r#"aria-invalid="true""#), "{html}");
+        assert!(!html.contains("name required"), "{html}");
+    }
+
+    /// Contrast: a re-render from a failed decode DOES surface the parent error
+    /// and marks the field invalid — the exact behaviour `blank` suppresses on
+    /// the initial GET render.
+    #[test]
+    fn decoded_invalid_parent_render_shows_error_unlike_blank() {
+        let cs =
+            decode_nested_urlencoded::<Order, LineItem>(&[p("name", "")]).expect("parent decodes");
+        let form = NestedChangesetForm::from_changeset(cs);
+
+        let html = form
+            .form_tag(
+                "/orders",
+                "post",
+                maud::html! {
+                    (crate::form::required_text_input(&form.parent, "name", "Order name"))
+                },
+            )
+            .into_string();
+
+        assert!(html.contains(r#"aria-invalid="true""#), "{html}");
+        assert!(html.contains("name required"), "{html}");
     }
 }

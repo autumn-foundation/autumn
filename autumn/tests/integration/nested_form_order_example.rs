@@ -13,9 +13,10 @@
 //!
 //! The flow:
 //!
-//! 1. A Maud `new` view built from [`form_tag`] + a parent
+//! 1. A Maud `new` view built from `NestedChangesetForm::form_tag` + a parent
 //!    [`required_text_input`] + [`inputs_for`] (the repeating child rows) +
-//!    [`submit_button`]. CSRF/submit-token fields ride on the `<form>` tag.
+//!    [`submit_button`]. CSRF/submit-token fields ride on the `<form>` tag,
+//!    emitted under the app-configured field names.
 //! 2. A `create` handler taking `NestedChangesetForm<OrderForm, LineItemForm>`,
 //!    calling `.into_valid()`:
 //!    - `Ok((order, items))` → save atomically in one `Db::tx` (parent insert,
@@ -25,9 +26,9 @@
 
 #![cfg(feature = "maud")]
 
-use autumn_web::form::{form_tag, required_text_input, submit_button};
+use autumn_web::form::{required_text_input, submit_button};
 use autumn_web::nested_form::{
-    InputsForOptions, NestedChangeset, NestedChild, decode_nested_urlencoded, inputs_for,
+    InputsForOptions, NestedChangesetForm, NestedChild, decode_nested_urlencoded, inputs_for,
 };
 
 // ── Form types ─────────────────────────────────────────────────────
@@ -58,29 +59,30 @@ impl NestedChild for LineItemForm {
 
 /// Render the order form: parent field, repeating line-item rows, submit.
 ///
-/// Used both for the initial `new` page (a blank-but-present parent, one blank
-/// child row) and to re-render after a failed submit, where the same
-/// `changeset` carries the user's values and per-row errors.
-fn render_order_form(
-    changeset: &NestedChangeset<OrderForm, LineItemForm>,
-    csrf_token: Option<&str>,
-) -> maud::Markup {
+/// Used both for the initial `new` page (built via
+/// [`NestedChangesetForm::blank`], a blank-but-present parent with one blank
+/// child row) and to re-render after a failed submit, where the same `form`
+/// carries the user's values and per-row errors. Rendering goes through
+/// [`NestedChangesetForm::form_tag`] so the CSRF hidden field is emitted under
+/// the app-configured field name (surviving a custom `security.csrf.form_field`
+/// across the re-render), not the standalone helper's hardcoded `_csrf`.
+fn render_order_form(form: &NestedChangesetForm<OrderForm, LineItemForm>) -> maud::Markup {
     let opts = InputsForOptions {
         // Optional htmx "Add row" endpoint; the no-JS path still works via the
         // pre-rendered blank row `inputs_for` always emits.
         add_row_url: Some("/orders/line-item-row".to_string()),
         ..InputsForOptions::default()
     };
-    form_tag(
+    form.form_tag(
         "/orders",
         "POST",
-        csrf_token,
         maud::html! {
-            // Parent field. The CSRF hidden input is emitted by `form_tag`.
-            (required_text_input(&changeset.parent, "name", "Order name"))
+            // Parent field. The CSRF (and submit-token) hidden inputs are
+            // emitted by `form.form_tag` under the app-configured field names.
+            (required_text_input(&form.parent, "name", "Order name"))
             // Repeating child rows: each submitted row (pre-filled + inline
             // errors) plus a trailing blank template row.
-            (inputs_for(changeset, &opts, |row| maud::html! {
+            (inputs_for(&**form, &opts, |row| maud::html! {
                 (row.required_text_input("sku", "SKU"))
                 (row.number_input("quantity", "Quantity"))
                 (row.destroy_checkbox("Remove"))
@@ -94,16 +96,21 @@ fn render_order_form(
 
 #[test]
 fn new_view_renders_the_form_scaffold() {
-    // A blank `new` page: parent name present-but-empty, no submitted rows.
-    let changeset =
-        decode_nested_urlencoded::<OrderForm, LineItemForm>(&[("name".to_string(), String::new())])
-            .expect("blank parent decodes");
+    // A blank `new` page built via the NON-validating `blank` constructor:
+    // parent name present-but-empty, no submitted rows, and — crucially — no
+    // premature validation error before the user types.
+    let form = NestedChangesetForm::<OrderForm, LineItemForm>::blank(
+        OrderForm {
+            name: String::new(),
+        },
+        Some("csrf-token-123".to_owned()),
+    );
 
-    let html = render_order_form(&changeset, Some("csrf-token-123")).into_string();
+    let html = render_order_form(&form).into_string();
 
     assert!(html.contains(r#"action="/orders""#), "{html}");
     assert!(html.contains(r#"method="post""#), "{html}");
-    // CSRF hidden field emitted by `form_tag`.
+    // CSRF hidden field emitted by `form.form_tag`.
     assert!(
         html.contains(r#"name="_csrf" value="csrf-token-123""#),
         "{html}"
@@ -112,6 +119,10 @@ fn new_view_renders_the_form_scaffold() {
     assert!(html.contains(r#"name="name""#), "{html}");
     assert!(html.contains(r#"name="items[0][sku]""#), "{html}");
     assert!(html.contains("Create order"), "{html}");
+    // The blank page shows NO premature validation error / invalid state for
+    // the still-empty required parent field.
+    assert!(!html.contains(r#"aria-invalid="true""#), "{html}");
+    assert!(!html.contains("Order name is required"), "{html}");
 }
 
 #[test]
@@ -135,7 +146,8 @@ fn failed_submit_re_renders_per_row_errors_and_prefills_values() {
         "the invalid row must surface under its combined key"
     );
 
-    let html = render_order_form(&changeset, Some("t")).into_string();
+    let form = NestedChangesetForm::from_changeset(changeset);
+    let html = render_order_form(&form).into_string();
 
     // The offending row's message renders, scoped to that row's unique id.
     assert!(html.contains("Quantity must be at least 1"), "{html}");
@@ -217,17 +229,17 @@ mod persisted {
         mut db: Db,
         form: NestedChangesetForm<OrderForm, LineItemForm>,
     ) -> axum::response::Response {
-        // Capture the CSRF token before `into_valid` consumes the form, so the
-        // re-render on the error path can carry it forward.
-        let csrf = form.csrf_token().map(str::to_owned);
         match form.into_valid() {
             Ok((order, items)) => match save_order_with_items(&mut db, order, items).await {
                 Ok(id) => (StatusCode::CREATED, format!("created order {id}")).into_response(),
                 Err(e) => e.into_response(),
             },
+            // The `Err` branch retains the CSRF/submit-token context, so
+            // `render_order_form` re-renders via `form.form_tag` with the right
+            // hidden fields — no need to thread the token through by hand.
             Err(form) => (
                 StatusCode::UNPROCESSABLE_ENTITY,
-                Html(render_order_form(&form.changeset, csrf.as_deref()).into_string()),
+                Html(render_order_form(&form).into_string()),
             )
                 .into_response(),
         }
