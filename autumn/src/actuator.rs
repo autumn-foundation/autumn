@@ -3522,6 +3522,15 @@ pub(crate) fn actuator_endpoint_paths(
         #[cfg(feature = "http-client")]
         {
             paths.push(actuator_route_path(prefix, "/webhooks/dlq"));
+            // `/webhooks/replay` is mounted as `POST` (see
+            // `actuator_mutating_routes`), not `GET`, but it is included in this
+            // path set because the runtime startup barrier seeds its actuator
+            // allow-list from this helper (`StartupBarrierState::from_config`).
+            // Without it, the `POST {prefix}/webhooks/replay` mount would no
+            // longer bypass the startup barrier. The GET-only route listing
+            // (`append_framework_routes`) excludes any path also produced by
+            // `actuator_mutating_routes`, so this does not surface as a phantom
+            // GET there.
             paths.push(actuator_route_path(prefix, "/webhooks/replay"));
         }
         #[cfg(feature = "ws")]
@@ -3532,6 +3541,31 @@ pub(crate) fn actuator_endpoint_paths(
     }
 
     paths
+}
+
+/// Enumerate the actuator's mutating (non-`GET`) framework routes, gated to
+/// match the mounts in [`actuator_router_with_prefix`].
+///
+/// Kept separate from [`actuator_endpoint_paths`] (which is `GET`-only and
+/// paths-only) so the route listing can classify these with their real HTTP
+/// method. Returns `(method, path)` pairs using the same
+/// [`actuator_route_path`] helper as the mounting code so paths match
+/// byte-for-byte.
+pub(crate) fn actuator_mutating_routes(
+    prefix: &str,
+    sensitive: bool,
+) -> Vec<(&'static str, String)> {
+    let mut routes: Vec<(&'static str, String)> = Vec::new();
+
+    if sensitive {
+        routes.push(("PUT", actuator_route_path(prefix, "/loggers/{name}")));
+        #[cfg(feature = "http-client")]
+        {
+            routes.push(("POST", actuator_route_path(prefix, "/webhooks/replay")));
+        }
+    }
+
+    routes
 }
 
 /// Build the actuator router with profile-aware endpoint exposure.

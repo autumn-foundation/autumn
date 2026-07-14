@@ -6,6 +6,7 @@ mod generate_references_postgres;
 mod generate_tauri_mobile;
 mod generate_tauri_mobile_offline;
 mod i18n_check;
+mod manifest_posture;
 mod migrate_down;
 mod offsite_backup;
 mod repo_hygiene;

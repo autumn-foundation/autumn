@@ -4746,6 +4746,21 @@ impl AppBuilder {
         let (config, _telemetry_guard) =
             load_config_and_telemetry(config_loader_factory, telemetry_provider).await;
 
+        // Emit the resolved security configuration for the manifest's `declared`
+        // dimensions (CSRF, security headers). Gated on `AUTUMN_DUMP_SECURITY`
+        // so only `autumn routes audit` sees it — kept off stdout so the
+        // routes-only JSON parse path stays byte-compatible.
+        if is_dump_security_mode() {
+            let security = crate::route_listing::SecurityDump::from_config(&config);
+            match serde_json::to_string(&security) {
+                Ok(json) => eprintln!(
+                    "{marker}{json}",
+                    marker = crate::route_listing::SECURITY_CONFIG_MARKER
+                ),
+                Err(e) => eprintln!("Failed to serialize security config: {e}"),
+            }
+        }
+
         let mut infos = match crate::route_listing::collect_route_infos(
             &routes,
             &route_sources,
@@ -5188,6 +5203,16 @@ fn exit_stop_managed_pg() {
 
 pub(crate) fn is_dump_routes_mode() -> bool {
     std::env::var("AUTUMN_DUMP_ROUTES").as_deref() == Ok("1")
+}
+
+/// Whether the dump should also emit the resolved security configuration
+/// ([`SECURITY_CONFIG_MARKER`](crate::route_listing::SECURITY_CONFIG_MARKER)).
+///
+/// Set by `autumn routes audit` (which needs the CSRF / headers config to build
+/// the `declared` manifest dimensions) but not by the plain `autumn routes`
+/// listing, so that command's stderr stays free of the marker line.
+pub(crate) fn is_dump_security_mode() -> bool {
+    std::env::var("AUTUMN_DUMP_SECURITY").as_deref() == Ok("1")
 }
 
 pub(crate) fn is_dump_jobs_mode() -> bool {
