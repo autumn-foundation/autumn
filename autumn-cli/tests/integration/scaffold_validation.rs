@@ -194,25 +194,120 @@ fn form_inputs_carry_matching_html5_constraints() {
         );
     }
 
+    // The constrained fields route through the typed `a11y::TextField`
+    // primitive (#1706), so the HTML5 constraints are typed builder calls
+    // (`.minlength(3u32)`) rather than raw `<input>` attributes; the rendered
+    // element/attributes/values are unchanged, only their source spelling.
     assert!(
-        routes.contains("minlength=\"3\" maxlength=\"120\""),
+        routes.contains(".minlength(3u32).maxlength(120u32)"),
         "title must render minlength/maxlength:\n{routes}"
     );
     assert!(
-        routes.contains("type=\"email\""),
+        routes.contains(".input_type(\"email\")"),
         "contact must render type=email:\n{routes}"
     );
     assert!(
-        routes.contains("type=\"url\""),
+        routes.contains(".input_type(\"url\")"),
         "homepage must render type=url:\n{routes}"
     );
     assert!(
-        routes.contains("type=\"number\"") && routes.contains("min=\"0\" max=\"130\""),
+        routes.contains(".input_type(\"number\")") && routes.contains(".min(\"0\").max(\"130\")"),
         "age must render type=number with min/max:\n{routes}"
     );
     assert!(
-        routes.contains("maxlength=\"200\""),
+        routes.contains(".maxlength(200u32)"),
         "bio must render maxlength:\n{routes}"
+    );
+}
+
+/// A `String`/`Text` length bound above `u32::MAX` is meaningless for an HTML
+/// length attribute (which fits a `u32`) and would otherwise reach the typed
+/// `a11y::TextField::maxlength(u32)` codegen as an overflowing `u32` literal
+/// that fails to compile the generated app. The generator rejects it up front
+/// at DSL parse time with an actionable message naming the `u32::MAX` limit.
+#[test]
+fn length_bound_above_u32_max_is_rejected() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    run_autumn_ok(tmp.path(), &["new", "validate-large-len-app"]);
+    let project = tmp.path().join("validate-large-len-app");
+    let output = run_autumn(
+        &project,
+        &[
+            "generate",
+            "scaffold",
+            "Doc",
+            "title:String{max=5000000000}",
+        ],
+    );
+    assert!(
+        !output.status.success(),
+        "a >u32::MAX length bound must fail the scaffold"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("4294967295"),
+        "the error must name the u32::MAX limit:\n{stderr}"
+    );
+}
+
+/// A length bound exactly at `u32::MAX` is the largest bound that still fits an
+/// HTML length attribute, so it is accepted and emits a plain `u32` literal.
+#[test]
+fn length_bound_at_u32_max_is_accepted() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    run_autumn_ok(tmp.path(), &["new", "validate-max-len-app"]);
+    let project = tmp.path().join("validate-max-len-app");
+    run_autumn_ok(
+        &project,
+        &[
+            "generate",
+            "scaffold",
+            "Doc",
+            "title:String{max=4294967295}",
+        ],
+    );
+    let routes = fs::read_to_string(project.join("src/routes/docs.rs")).unwrap();
+    let title_input = slice_text_field(&routes, "title");
+    assert!(
+        title_input.contains(".maxlength(4294967295u32)"),
+        "a bound at u32::MAX must emit a plain u32 literal:\n{title_input}"
+    );
+}
+
+/// The explicit `--validate name=length:...` form renders solely to the
+/// server-side `#[validate(length(...))]` derive, which the `validator` crate
+/// accepts as a `u64`. Unlike the DSL inline `{max=…}` constraint, it never
+/// populates `FieldConstraints`, so it never reaches the HTML5 length attribute
+/// or the typed `a11y::TextField::maxlength(u32)` codegen. A bound above
+/// `u32::MAX` is therefore legitimate here and must be emitted verbatim rather
+/// than rejected (the `u32` guard belongs only to the DSL/HTML5 path).
+#[test]
+fn explicit_validate_length_bound_above_u32_max_is_accepted() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    run_autumn_ok(tmp.path(), &["new", "validate-server-len-app"]);
+    let project = tmp.path().join("validate-server-len-app");
+    run_autumn_ok(
+        &project,
+        &[
+            "generate",
+            "scaffold",
+            "Doc",
+            "title:String",
+            "--validate",
+            "title=length:max=5000000000",
+        ],
+    );
+    let model = fs::read_to_string(project.join("src/models/doc.rs")).unwrap();
+    assert!(
+        model.contains("#[validate(length(max = 5000000000))]"),
+        "a server-side length bound above u32::MAX must be emitted verbatim:\n{model}"
+    );
+    // It must NOT reach the typed `u32` maxlength builder (that path is fed by
+    // the DSL inline constraint, not the explicit `--validate` form).
+    let routes = fs::read_to_string(project.join("src/routes/docs.rs")).unwrap();
+    assert!(
+        !routes.contains(".maxlength("),
+        "explicit --validate length must not emit an HTML5 maxlength builder:\n{routes}"
     );
 }
 
@@ -230,17 +325,19 @@ fn constrained_float_fields_keep_step_any() {
         &["generate", "scaffold", "Reading", "ratio:f64{min=0,max=1}"],
     );
     let routes = fs::read_to_string(project.join("src/routes/readings.rs")).unwrap();
+    // Routed through `a11y::TextField` (#1706): a `number` input built via
+    // `TextField::new("ratio").input_type("number")` rather than a raw `<input>`.
+    let ratio_input = slice_text_field(&routes, "ratio");
     assert!(
-        routes.contains("type=\"number\" id=\"ratio\""),
-        "the constrained float must render as a number input:\n{routes}"
+        ratio_input.contains(".input_type(\"number\")"),
+        "the constrained float must render as a number input:\n{ratio_input}"
     );
-    let ratio_input = slice_input(&routes, "id=\"ratio\" name=\"ratio\"");
     // Float bounds are canonicalized to valid float literals (`0` -> `0.0`), so
-    // the HTML5 attributes carry the decimal form too.
+    // the typed builder calls carry the decimal form too.
     assert!(
-        ratio_input.contains("min=\"0.0\"")
-            && ratio_input.contains("max=\"1.0\"")
-            && ratio_input.contains("step=\"any\""),
+        ratio_input.contains(".min(\"0.0\")")
+            && ratio_input.contains(".max(\"1.0\")")
+            && ratio_input.contains(".step(\"any\")"),
         "constrained float must carry min/max AND step=any:\n{ratio_input}"
     );
 }
@@ -251,29 +348,33 @@ fn required_only_on_non_nullable_constrained_fields() {
     let routes = fs::read_to_string(project.join("src/routes/posts.rs")).unwrap();
 
     // The non-nullable `title` input keeps the browser-native required signal;
-    // the nullable `bio` input must NOT (leaving it blank is valid).
-    let title_input = slice_input(&routes, "id=\"title\" name=\"title\"");
+    // the nullable `bio` input must NOT (leaving it blank is valid). Both route
+    // through `a11y::TextField` (#1706), so `required`/`aria-required` are the
+    // typed `.required().aria_required()` builder calls.
+    let title_input = slice_text_field(&routes, "title");
     assert!(
-        title_input.contains("required aria-required=\"true\""),
+        title_input.contains(".required().aria_required()"),
         "non-nullable title must be required:\n{title_input}"
     );
-    let bio_input = slice_input(&routes, "id=\"bio\" name=\"bio\"");
+    let bio_input = slice_text_field(&routes, "bio");
     assert!(
         !bio_input.contains("required"),
         "nullable bio must not be required:\n{bio_input}"
     );
 }
 
-/// Slice from an input's id/name marker to the terminating `;` so a
-/// field-scoped attribute assertion doesn't accidentally match a sibling.
-fn slice_input<'a>(routes: &'a str, marker: &str) -> &'a str {
+/// Slice a routed `a11y::TextField` call's field-specific builder calls: from
+/// the `TextField::new("field")` marker up to the shared `.class(` skeleton, so
+/// a field-scoped assertion doesn't accidentally match a sibling. The
+/// input-type/value/constraint/`required` builders all precede `.class(`.
+fn slice_text_field<'a>(routes: &'a str, field: &str) -> &'a str {
+    let marker = format!("TextField::new(\"{field}\")");
     let start = routes
-        .find(marker)
+        .find(&marker)
         .unwrap_or_else(|| panic!("missing {marker} in:\n{routes}"));
-    let end = routes[start..]
-        .find(';')
-        .map_or(routes.len(), |rel| start + rel);
-    &routes[start..end]
+    let rest = &routes[start..];
+    let end = rest.find(".class(").unwrap_or(rest.len());
+    &rest[..end]
 }
 
 #[test]
@@ -283,7 +384,7 @@ fn preserved_value_binding_survives_422_rerender() {
     // The appended control re-fills its value from the changeset, so a 422
     // re-render keeps what the user typed.
     assert!(
-        routes.contains("value=(changeset.field_value(\"title\").unwrap_or_default())"),
+        routes.contains(".value(changeset.field_value(\"title\").unwrap_or_default())"),
         "constrained inputs must re-fill from the changeset:\n{routes}"
     );
 }
@@ -381,23 +482,29 @@ fn text_email_and_url_render_typed_input_not_textarea() {
     );
     let routes = fs::read_to_string(project.join("src/routes/contacts.rs")).unwrap();
 
+    // A `Text{email}`/`Text{url}` field routes through `a11y::TextField`
+    // (#1706): a typed single-line input via `TextField::new(...)` +
+    // `.input_type("email"|"url")`, never a raw `<input>` or a `<textarea>`.
+    let email_input = slice_text_field(&routes, "email_addr");
     assert!(
-        routes.contains("type=\"email\" id=\"email_addr\""),
-        "a Text{{email}} field must render a typed email input:\n{routes}"
+        email_input.contains(".input_type(\"email\")"),
+        "a Text{{email}} field must render a typed email input:\n{email_input}"
     );
+    let site_input = slice_text_field(&routes, "site");
     assert!(
-        routes.contains("type=\"url\" id=\"site\""),
-        "a Text{{url}} field must render a typed url input:\n{routes}"
+        site_input.contains(".input_type(\"url\")"),
+        "a Text{{url}} field must render a typed url input:\n{site_input}"
     );
     // Neither may be a <textarea> (which can't carry type=email/url).
     assert!(
         !routes.contains("textarea id=\"email_addr\"") && !routes.contains("textarea id=\"site\""),
         "type-dependent Text controls must not be textareas:\n{routes}"
     );
-    // The 422 value is carried via the `value=` attribute (input, not content).
+    // The 422 value is carried via the input's `.value(...)` (input, not
+    // textarea content), routed through `a11y::TextField` (#1706).
     assert!(
-        routes.contains("value=(changeset.field_value(\"email_addr\").unwrap_or_default())"),
-        "the typed input must re-fill via a value= attribute:\n{routes}"
+        routes.contains(".value(changeset.field_value(\"email_addr\").unwrap_or_default())"),
+        "the typed input must re-fill via a value builder call:\n{routes}"
     );
 }
 

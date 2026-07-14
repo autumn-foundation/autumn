@@ -505,7 +505,7 @@ enum LabelSource {
 /// name obligation is discharged at compile time.
 ///
 /// The value/type/required attributes — along with the presentational
-/// [`class`](TextField::class), the error-wiring
+/// [`class`](TextField::class) / [`label_class`](TextField::label_class), the error-wiring
 /// [`aria_invalid`](TextField::aria_invalid) /
 /// [`described_by`](TextField::described_by), and the HTML5 validation
 /// constraints [`aria_required`](TextField::aria_required) /
@@ -523,6 +523,7 @@ pub struct TextField<State> {
     required: bool,
     aria_required: bool,
     class: Option<String>,
+    label_class: Option<String>,
     aria_invalid: Option<bool>,
     described_by: Option<String>,
     minlength: Option<u32>,
@@ -545,6 +546,7 @@ impl TextField<NoLabel> {
             required: false,
             aria_required: false,
             class: None,
+            label_class: None,
             aria_invalid: None,
             described_by: None,
             minlength: None,
@@ -586,6 +588,7 @@ impl TextField<NoLabel> {
             required: self.required,
             aria_required: self.aria_required,
             class: self.class,
+            label_class: self.label_class,
             aria_invalid: self.aria_invalid,
             described_by: self.described_by,
             minlength: self.minlength,
@@ -649,6 +652,16 @@ impl<State> TextField<State> {
     #[must_use]
     pub fn class(mut self, class: impl Into<String>) -> Self {
         self.class = Some(class.into());
+        self
+    }
+
+    /// Sets the `class` attribute on the visible `<label>` element.
+    ///
+    /// Only affects rendering when a visible label was set via [`label`](Self::label);
+    /// `aria_label`/`labelled_by` variants render no `<label>` element.
+    #[must_use]
+    pub fn label_class(mut self, class: impl Into<String>) -> Self {
+        self.label_class = Some(class.into());
         self
     }
 
@@ -757,7 +770,7 @@ impl Render for TextField<Labeled> {
         let aria_required = self.aria_required.then_some("true");
         html! {
             @if let Some(text) = visible_label {
-                label for=(self.name) { (text) }
+                label for=(self.name) class=[self.label_class.as_deref()] { (text) }
             }
             input
                 type=(self.input_type)
@@ -940,6 +953,37 @@ mod tests {
         assert!(markup.contains("min=\"0\""), "{markup}");
         assert!(markup.contains("max=\"1\""), "{markup}");
         assert!(markup.contains("step=\"any\""), "{markup}");
+    }
+
+    #[test]
+    fn text_field_label_class_is_emitted() {
+        let html = TextField::new("email")
+            .label("Email address")
+            .label_class("autumn-field__label")
+            .render()
+            .into_string();
+        assert!(
+            html.contains(
+                r#"<label for="email" class="autumn-field__label">Email address</label>"#
+            ),
+            "got: {html}"
+        );
+    }
+
+    #[test]
+    fn text_field_label_class_omitted_when_unset() {
+        let html = TextField::new("email")
+            .label("Email address")
+            .render()
+            .into_string();
+        assert!(
+            html.contains(r#"<label for="email">Email address</label>"#),
+            "got: {html}"
+        );
+        assert!(
+            !html.contains("class="),
+            "label should have no class when unset, got: {html}"
+        );
     }
 
     #[test]
