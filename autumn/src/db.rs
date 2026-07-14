@@ -3128,8 +3128,8 @@ mod tests {
         );
         let msg = err.to_string();
         assert!(
-            msg.contains("SQLite") && msg.contains("1614"),
-            "message must be actionable and point at the tracking issue, got: {msg}"
+            msg.contains("SQLite") && msg.contains("1905"),
+            "message must be actionable and point at the runtime tracking issue, got: {msg}"
         );
     }
 
