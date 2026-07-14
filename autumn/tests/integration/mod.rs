@@ -119,6 +119,8 @@ mod middleware_pipeline;
 mod migrate_checksum_proptest;
 #[cfg(feature = "db")]
 mod model_field_attrs;
+#[cfg(feature = "maud")]
+mod negotiate;
 #[cfg(feature = "offline-sync")]
 mod offline_sync_conformance;
 #[cfg(feature = "offline-sync")]

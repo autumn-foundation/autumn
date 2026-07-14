@@ -4333,8 +4333,7 @@ fn resolve_tls_doctor_data() -> TlsDoctorData {
         let now = i64::try_from(
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0),
+                .map_or(0, |d| d.as_secs()),
         )
         .unwrap_or(i64::MAX);
         match autumn_web::tls::inspect_leaf(&cert, &key, now) {
@@ -4812,8 +4811,7 @@ fn resolve_acme_stored_cert_data(cert_dir: &std::path::Path, domains: &[String])
         let now = i64::try_from(
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0),
+                .map_or(0, |d| d.as_secs()),
         )
         .unwrap_or(i64::MAX);
         match autumn_web::tls::inspect_leaf(&chain, &key, now) {

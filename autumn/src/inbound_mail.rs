@@ -1262,8 +1262,7 @@ fn parse_rfc5322(raw: Bytes) -> InboundEmail {
             let ct_only = ct_lower
                 .split(';')
                 .next()
-                .map(str::trim)
-                .unwrap_or("application/octet-stream")
+                .map_or("application/octet-stream", str::trim)
                 .to_string();
             let data = if cte == "base64" {
                 let stripped: String = String::from_utf8_lossy(body_bytes)
@@ -1272,8 +1271,7 @@ fn parse_rfc5322(raw: Bytes) -> InboundEmail {
                     .collect();
                 base64::engine::general_purpose::STANDARD
                     .decode(stripped.as_bytes())
-                    .map(Bytes::from)
-                    .unwrap_or_else(|_| Bytes::copy_from_slice(body_bytes))
+                    .map_or_else(|_| Bytes::copy_from_slice(body_bytes), Bytes::from)
             } else if cte == "quoted-printable" {
                 Bytes::from(decode_quoted_printable_bytes(body_bytes))
             } else {
@@ -1552,13 +1550,14 @@ fn extract_multipart_bodies(
         let part_ct_lower = part_headers
             .lines()
             .find(|l| l.to_ascii_lowercase().starts_with("content-type:"))
-            .map(|l| l[13..].trim().to_ascii_lowercase())
-            .unwrap_or_else(|| "text/plain".to_string());
+            .map_or_else(
+                || "text/plain".to_string(),
+                |l| l[13..].trim().to_ascii_lowercase(),
+            );
         let part_ct_orig = part_headers
             .lines()
             .find(|l| l.to_ascii_lowercase().starts_with("content-type:"))
-            .map(|l| l[13..].trim().to_string())
-            .unwrap_or_else(|| "text/plain".to_string());
+            .map_or_else(|| "text/plain".to_string(), |l| l[13..].trim().to_string());
         let part_cte = part_headers
             .lines()
             .find(|l| {
@@ -1600,8 +1599,7 @@ fn extract_multipart_bodies(
             let ct_only = part_ct_lower
                 .split(';')
                 .next()
-                .map(str::trim)
-                .unwrap_or("application/octet-stream")
+                .map_or("application/octet-stream", str::trim)
                 .to_string();
             let data = if part_cte == "base64" {
                 let stripped: String = String::from_utf8_lossy(part_body_bytes)
@@ -1610,8 +1608,7 @@ fn extract_multipart_bodies(
                     .collect();
                 base64::engine::general_purpose::STANDARD
                     .decode(stripped.as_bytes())
-                    .map(Bytes::from)
-                    .unwrap_or_else(|_| Bytes::copy_from_slice(part_body_bytes))
+                    .map_or_else(|_| Bytes::copy_from_slice(part_body_bytes), Bytes::from)
             } else if part_cte == "quoted-printable" {
                 // Use the byte-returning decoder to avoid UTF-8 replacement for
                 // non-text attachments whose decoded bytes may not be valid UTF-8.
@@ -1876,8 +1873,7 @@ fn parse_mailgun_form_data(
         // `find_part_end` validates the terminator byte to avoid false matches on
         // boundary-prefix strings (e.g. "\r\n--abc" inside "\r\n--abc123").
         let part_end = find_part_end(&body[part_start..], crlf_delim_bytes, lf_delim_bytes)
-            .map(|p| part_start + p)
-            .unwrap_or(body.len());
+            .map_or(body.len(), |p| part_start + p);
 
         search_from = part_end;
         let part = &body[part_start..part_end];
@@ -1916,16 +1912,17 @@ fn parse_mailgun_form_data(
             let part_ct = headers_str
                 .lines()
                 .find(|l| l.to_ascii_lowercase().starts_with("content-type:"))
-                .map(|l| {
-                    l[13..]
-                        .trim()
-                        .split(';')
-                        .next()
-                        .map(str::trim)
-                        .unwrap_or("application/octet-stream")
-                        .to_ascii_lowercase()
-                })
-                .unwrap_or_else(|| "application/octet-stream".to_string());
+                .map_or_else(
+                    || "application/octet-stream".to_string(),
+                    |l| {
+                        l[13..]
+                            .trim()
+                            .split(';')
+                            .next()
+                            .map_or("application/octet-stream", str::trim)
+                            .to_ascii_lowercase()
+                    },
+                );
             let part_cte = headers_str
                 .lines()
                 .find(|l| {
@@ -1942,8 +1939,7 @@ fn parse_mailgun_form_data(
                     .collect();
                 base64::engine::general_purpose::STANDARD
                     .decode(stripped.as_bytes())
-                    .map(Bytes::from)
-                    .unwrap_or_else(|_| Bytes::copy_from_slice(body_bytes))
+                    .map_or_else(|_| Bytes::copy_from_slice(body_bytes), Bytes::from)
             } else {
                 // Binary (8-bit): copy raw bytes without any string conversion.
                 Bytes::copy_from_slice(body_bytes)

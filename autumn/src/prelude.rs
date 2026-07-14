@@ -111,6 +111,11 @@ pub use crate::mail::{
     MailPreview, MailPreviewError, MailPreviewRegistry, MailTransport, Mailer, SmtpConfig, TlsMode,
     Transport,
 };
+/// Content-negotiated success responder: [`Negotiate`] extractor, its
+/// [`Negotiated`] response, and the [`Format`] it resolves to — serve HTML to
+/// browsers and JSON to API clients from one handler.
+#[cfg(feature = "maud")]
+pub use crate::negotiate::{Format, Negotiate, Negotiated};
 #[cfg(all(feature = "presence", feature = "maud"))]
 pub use crate::presence_badge;
 #[cfg(all(

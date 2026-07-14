@@ -2173,8 +2173,27 @@ where
 {
     // CSRF middleware (only applied when enabled)
     if config.security.csrf.enabled {
+        // The CSRF token scan reads only a bounded prefix of the body
+        // (`security.csrf.token_scan_bytes`, 2 MiB default) and streams the
+        // remainder through, so the cap comes from CSRF config — NOT from
+        // `upload.max_request_size_bytes` (which would force whole uploads into
+        // memory and defeat the streaming upload path).
+        //
+        // Clamp the effective prefix to the global body limit: the CSRF layer
+        // must never buffer more than `upload.max_request_size_bytes`. In the
+        // normal/high-upload case the small `token_scan_bytes` prefix wins (the
+        // `min` keeps it at 2 MiB — it is *not* raised to the upload limit).
+        // Only when an operator deliberately lowers the global limit *below* the
+        // prefix cap does the upload limit clamp the scan down — the whole body
+        // is ≤ that limit anyway, so an early `_csrf` token is still in range,
+        // and anything larger is rejected downstream by `DefaultBodyLimit`.
+        let effective_scan_bytes = config
+            .security
+            .csrf
+            .token_scan_bytes
+            .min(config.security.upload.max_request_size_bytes);
         let mut csrf_layer = crate::security::CsrfLayer::from_config(&config.security.csrf)
-            .with_max_scan_bytes(config.security.upload.max_request_size_bytes);
+            .with_max_scan_bytes(effective_scan_bytes);
         if let Some(keys) = signing_keys {
             csrf_layer = csrf_layer.with_signing_keys(keys);
         }
@@ -7988,6 +8007,27 @@ mod trusted_host_tests {
                 "StartupBarrierState must derive its bypass set from probe_bypass_paths(): missing {path}"
             );
         }
+    }
+
+    /// Regression guard (#1627): the `StartupBarrierState` allow-list, which is
+    /// seeded from `actuator_endpoint_paths`, must permit the mutating
+    /// `POST {prefix}/webhooks/replay` route to bypass the startup barrier. A
+    /// prior fix removed the path from `actuator_endpoint_paths` to kill a
+    /// phantom GET in the route listing, which also silently dropped it from
+    /// this bypass set.
+    #[cfg(feature = "http-client")]
+    #[test]
+    fn startup_barrier_allows_webhook_replay_post_path() {
+        let mut cfg = AutumnConfig::default();
+        cfg.actuator.sensitive = true;
+        let state = crate::state::AppState::for_test();
+        let barrier = StartupBarrierState::from_config(&cfg, &state);
+        let replay_path =
+            crate::actuator::actuator_route_path(&cfg.actuator.prefix, "/webhooks/replay");
+        assert!(
+            barrier.allows_path(&replay_path),
+            "startup barrier must allow {replay_path} to bypass admission"
+        );
     }
 
     #[tokio::test]

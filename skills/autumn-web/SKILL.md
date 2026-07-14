@@ -37,6 +37,13 @@ when their details matter:
 - `references/examples.md` - official 0.5.0 example patterns for minimal apps,
   CRUD, production-ish jobs, Redis channels, S3 storage plugins, and signed
   webhooks. Use this before generating full app code.
+- `docs/guide/accessibility.md` - accessible-by-construction UI. Prefer the
+  typed `autumn_web::a11y` primitives (`Img` / `Button` / `Link` / `MenuItem` /
+  `TextField`) over raw `<img>` / `<button>` / `<input>` in `html!` — the accessible
+  name (alt text, button label, field label) is a required constructor argument,
+  so a missing one is a compile error, not a runtime audit miss. Treat `autumn
+  a11y verify` as an advisory/best-effort CI net, not a guarantee — the typed
+  primitives are the compile-time proof (trunk-dev, #1706).
 
 ## Prefer framework idioms over raw Diesel/Axum
 
@@ -395,10 +402,13 @@ the model instead of the repository **(unreleased — trunk-dev, issues #1738,
   a generated `Model::dependents()`) when no repository-side `dependent(...)` is
   present; the repository attribute wins when both are declared. Ships for
   `destroy`, `delete_all`, `nullify`, and `restrict`, grandchild recursion and
-  the `delete_many` bulk path included; only both-sites conflict diagnostics are
-  a deferred follow-up (when both sites declare, the repository attribute
-  silently wins), and `dependent`/`on_delete` on a `through = <join_table>`
-  association is a compile error (issue #1738).
+  the `delete_many` bulk path included. When both a repository `dependent(...)`
+  and a model-side `#[has_many(..., dependent=...)]` are declared the repository
+  attribute still wins, but a debug-only `tracing::warn!` (emitted in
+  `debug_assertions` builds) now surfaces the silently-inert model-side
+  declaration instead of dropping it without a trace (issue #1788).
+  `dependent`/`on_delete` on a `through = <join_table>` association is a compile
+  error (issue #1738).
 
 See `docs/guide/repositories.md`.
 

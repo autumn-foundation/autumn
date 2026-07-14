@@ -173,3 +173,9 @@ enumerable and are omitted from this listing
 If your application relies heavily on merged/nested raw routers, use `autumn
 routes` output as a partial snapshot and supplement it with manual
 documentation for those routes.
+
+## See also
+
+- [Security Posture Manifest — Provenance Classes](security-posture-manifest.md)
+  — how `autumn routes audit` tags each manifest dimension as `provable`,
+  `declared`, or `runtime-only`.

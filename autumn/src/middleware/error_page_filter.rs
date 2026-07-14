@@ -296,21 +296,116 @@ fn accepts_html<B>(req: &axum::http::Request<B>) -> bool {
     accept_prefers_html(req.headers())
 }
 
+/// Which representation the client's `Accept` header prefers.
+///
+/// Produced by the single canonical negotiator [`accept_preference`]; the
+/// public [`accept_prefers_html`] wrapper is defined in terms of it so all
+/// content negotiation in the crate shares one source of truth.
+// `pub` here is crate-visible only: the enclosing `error_page_filter` module is
+// itself `pub(crate)`, so this never escapes the crate (clippy::redundant_pub_crate).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AcceptPreference {
+    /// `text/html` wins (explicitly or via q-values).
+    Html,
+    /// `application/json` (or `application/problem+json`) wins.
+    Json,
+    /// Only `*/*` present — no concrete html/json preference.
+    Any,
+    /// No `Accept` header, or it was empty.
+    Unspecified,
+}
+
 /// Check whether an Accept header prefers an HTML response over JSON.
 pub fn accept_prefers_html(headers: &axum::http::HeaderMap) -> bool {
+    matches!(
+        accept_preference(headers),
+        AcceptPreference::Html | AcceptPreference::Any
+    )
+}
+
+/// Best `(q-value, list-index)` seen for each media type the crate negotiates
+/// on, parsed from a request's `Accept` header by the one canonical parser
+/// [`accept_qualities`].
+///
+/// `index` is the position of the winning entry in the comma-separated header
+/// (0-based), used to break q-value ties in favour of the earlier entry. Each
+/// field is `None` only when that media type was entirely absent from the
+/// header; a media type listed with `q=0` records `Some((0.0, index))` so an
+/// explicit "not acceptable" exclusion (RFC 7231 §5.3.1) stays distinguishable
+/// from a mere absence. Both [`accept_preference`] (legacy enum resolution) and
+/// the
+/// [`Negotiate`](crate::negotiate::Negotiate) responder (effective-q
+/// resolution) build on this shared parse, so the crate never forks its
+/// `Accept` parsing.
+// `pub` (not `pub(crate)`): the enclosing `error_page_filter` module is itself
+// `pub(crate)`, so these never escape the crate (clippy::redundant_pub_crate).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct AcceptQualities {
+    /// Best match for `text/html`.
+    pub html: Option<(f32, usize)>,
+    /// Best match for the success JSON type `application/json` (only).
+    ///
+    /// Kept separate from [`Self::problem_json`] so the
+    /// [`Negotiate`](crate::negotiate::Negotiate) responder can negotiate the
+    /// success `application/json` body without treating the error-only
+    /// `application/problem+json` signal as accepting it.
+    pub json: Option<(f32, usize)>,
+    /// Best match for `application/problem+json`.
+    ///
+    /// `application/problem+json` is an **error-path** (Problem Details) signal,
+    /// not a success representation. The legacy
+    /// [`accept_preference`]/[`accept_prefers_html`] path folds it into the JSON
+    /// preference (so a client asking for problem+json still gets a JSON error
+    /// body rather than an HTML error page), but the `Negotiate` success
+    /// responder deliberately ignores it: advertising problem+json alone does
+    /// **not** count as accepting the `application/json` success body.
+    pub problem_json: Option<(f32, usize)>,
+    /// Best match for the `text/*` subtype wildcard.
+    ///
+    /// A media range like `text/*` covers `text/html` per RFC 7231 §5.3.2 but is
+    /// less specific than a concrete `text/html`. Recorded like the other slots
+    /// (max-q including `q=0`, plus list index) so the `Negotiate` responder can
+    /// slot it between the concrete type and the `*/*` wildcard. The legacy
+    /// `accept_preference`/`accept_prefers_html` path ignores it.
+    pub text_star: Option<(f32, usize)>,
+    /// Best match for the `application/*` subtype wildcard.
+    ///
+    /// A media range like `application/*` covers `application/json` per RFC 7231
+    /// §5.3.2 but is less specific than a concrete `application/json`. Recorded
+    /// like the other slots (max-q including `q=0`, plus list index) so the
+    /// `Negotiate` responder can slot it between the concrete type and the `*/*`
+    /// wildcard. The legacy `accept_preference`/`accept_prefers_html` path
+    /// ignores it.
+    pub application_star: Option<(f32, usize)>,
+    /// Best match for the `*/*` wildcard.
+    pub wildcard: Option<(f32, usize)>,
+}
+
+/// The one canonical `Accept` parser.
+///
+/// Scans the comma-separated `Accept` header once, recording the best
+/// `(q-value, list-index)` seen for `text/html`, for `application/json`, for
+/// `application/problem+json` (tracked in its own slot — an error-path signal
+/// that does not drive success JSON negotiation), for the `text/*` and
+/// `application/*` subtype wildcards, and for the `*/*` wildcard. Out-of-range
+/// q-values are clamped to `[0.0, 1.0]`. Entries with `q=0` are *retained*
+/// (recorded as `Some((0.0, index))`) so an explicit "not acceptable"
+/// exclusion survives; each consumer decides how to treat them.
+///
+/// Media-range tokens and the quality parameter name are matched
+/// case-insensitively per RFC 7231 §3.1.1.1: `Application/JSON` records the
+/// same slot as `application/json`, and `Q=` is honoured like `q=`.
+///
+/// This is the crate's single source of truth for `Accept` tokenisation; the
+/// two consumers apply their own *resolution policy* on top of the returned
+/// [`AcceptQualities`] (they differ only in policy, not parsing).
+pub fn accept_qualities(headers: &axum::http::HeaderMap) -> AcceptQualities {
     let accept = headers
         .get(axum::http::header::ACCEPT)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
 
-    // If no Accept header, default to JSON (API-first).
-    if accept.is_empty() {
-        return false;
-    }
-
-    let mut html: Option<(f32, usize)> = None;
-    let mut json: Option<(f32, usize)> = None;
-    let mut wildcard: Option<(f32, usize)> = None;
+    let mut qualities = AcceptQualities::default();
 
     for (index, raw_part) in accept.split(',').enumerate() {
         let part = raw_part.trim();
@@ -328,42 +423,148 @@ pub fn accept_prefers_html(headers: &axum::http::HeaderMap) -> bool {
                 continue;
             }
 
-            if let Some(value) = segment.strip_prefix("q=")
+            // Parameter names are case-insensitive (RFC 7231 §3.1.1.1), so the
+            // quality parameter may arrive as `q=` or `Q=`.
+            if let Some((name, value)) = segment.split_once('=')
+                && name.trim().eq_ignore_ascii_case("q")
                 && let Ok(parsed) = value.trim().parse::<f32>()
             {
                 q = parsed.clamp(0.0, 1.0);
             }
         }
-        if q <= 0.0 {
-            continue;
-        }
 
-        match mime {
-            "text/html" if html.is_none_or(|(existing_q, _)| q > existing_q) => {
-                html = Some((q, index));
-            }
-            "application/json" | "application/problem+json"
-                if json.is_none_or(|(existing_q, _)| q > existing_q) =>
-            {
-                json = Some((q, index));
-            }
-            "*/*" if wildcard.is_none_or(|(existing_q, _)| q > existing_q) => {
-                wildcard = Some((q, index));
-            }
-            _ => {}
+        // Record the entry even when `q == 0`: an explicit `q=0` means the type
+        // is *not acceptable* (RFC 7231 §5.3.1), which is distinct from the type
+        // being absent. Consumers that only care about positive preference (the
+        // legacy `accept_preference`/`accept_prefers_html` path) filter these
+        // `q == 0` slots back out; the `Negotiate` responder honours them as
+        // explicit exclusions.
+        // Media types and subtypes are case-insensitive (RFC 7231 §3.1.1.1), so
+        // `Application/JSON` must record the same slot as `application/json`.
+        // Compare without allocating a lowercased copy of the token.
+        if mime.eq_ignore_ascii_case("text/html")
+            && qualities.html.is_none_or(|(existing_q, _)| q > existing_q)
+        {
+            qualities.html = Some((q, index));
+        } else if mime.eq_ignore_ascii_case("application/json")
+            && qualities.json.is_none_or(|(existing_q, _)| q > existing_q)
+        {
+            qualities.json = Some((q, index));
+        } else if mime.eq_ignore_ascii_case("application/problem+json")
+            && qualities
+                .problem_json
+                .is_none_or(|(existing_q, _)| q > existing_q)
+        {
+            qualities.problem_json = Some((q, index));
+        } else if mime.eq_ignore_ascii_case("text/*")
+            && qualities
+                .text_star
+                .is_none_or(|(existing_q, _)| q > existing_q)
+        {
+            qualities.text_star = Some((q, index));
+        } else if mime.eq_ignore_ascii_case("application/*")
+            && qualities
+                .application_star
+                .is_none_or(|(existing_q, _)| q > existing_q)
+        {
+            qualities.application_star = Some((q, index));
+        } else if mime.eq_ignore_ascii_case("*/*")
+            && qualities
+                .wildcard
+                .is_none_or(|(existing_q, _)| q > existing_q)
+        {
+            qualities.wildcard = Some((q, index));
         }
     }
 
+    qualities
+}
+
+/// Merge two `(q-value, list-index)` slots into the single best one — higher q
+/// wins, ties broken by the earlier list index — reproducing the behaviour of
+/// the original single-slot `accept_qualities`, where `application/json` and
+/// `application/problem+json` shared one slot updated by strictly-greater q.
+///
+/// Used by the legacy [`accept_preference`] path to fold the (now separate)
+/// `problem_json` slot back into the JSON signal. The `Negotiate` success
+/// responder does **not** call this: it negotiates on the `json` slot alone.
+fn combine_slots(a: Option<(f32, usize)>, b: Option<(f32, usize)>) -> Option<(f32, usize)> {
+    match (a, b) {
+        (Some((aq, ai)), Some((bq, bi))) => Some(if (aq - bq).abs() < f32::EPSILON {
+            // Equal q: the earlier list entry is the one the single-slot scan
+            // would have kept (it only replaced on strictly-greater q).
+            if ai <= bi { (aq, ai) } else { (bq, bi) }
+        } else if aq > bq {
+            (aq, ai)
+        } else {
+            (bq, bi)
+        }),
+        (a @ Some(_), None) => a,
+        (None, b) => b,
+    }
+}
+
+/// The one canonical q-value `Accept` negotiator (legacy enum resolution).
+///
+/// Returns the client's concrete representation preference. Empty or missing
+/// `Accept` yields [`AcceptPreference::Unspecified`]; a `*/*`-only header
+/// yields [`AcceptPreference::Any`]. When both `text/html` and
+/// `application/json` are present, the higher q-value wins, ties broken by
+/// earlier list position. Parsing is delegated to the shared
+/// [`accept_qualities`]; this function only applies the enum resolution policy.
+pub fn accept_preference(headers: &axum::http::HeaderMap) -> AcceptPreference {
+    // Distinguish a missing/empty `Accept` (no concrete preference at all) from
+    // one that is present but names no html/json/wildcard type. The shared
+    // parser collapses both to all-`None`, so the emptiness check stays here.
+    let accept = headers
+        .get(axum::http::header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if accept.is_empty() {
+        return AcceptPreference::Unspecified;
+    }
+
+    // The legacy enum negotiator predates type wildcards and intentionally does
+    // not consult the `text/*` / `application/*` slots — only the concrete types
+    // and the `*/*` wildcard — so `accept_prefers_html` stays byte-identical.
+    let AcceptQualities {
+        html,
+        json,
+        problem_json,
+        wildcard,
+        ..
+    } = accept_qualities(headers);
+
+    // Legacy resolution treats `application/problem+json` as a JSON signal (a
+    // problem+json client wants a JSON error body, not an HTML page). The shared
+    // parser now records it in its own slot, so recombine the two into one
+    // effective JSON signal here — higher q wins, ties broken by earlier list
+    // index — reproducing the original single-slot `(q, index)` semantics
+    // exactly so this path stays byte-identical.
+    let json = combine_slots(json, problem_json);
+
+    // Legacy resolution only cares about *positive* preference: a `q=0` slot
+    // (now retained by the shared parser) is treated as absent here, exactly
+    // reproducing the pre-`q=0`-aware behaviour of this enum negotiator.
+    let positive = |slot: Option<(f32, usize)>| slot.filter(|&(q, _)| q > 0.0);
+    let (html, json, wildcard) = (positive(html), positive(json), positive(wildcard));
+
     match (html, json, wildcard) {
         (Some((hq, hidx)), Some((jq, jidx)), _) => {
-            if (hq - jq).abs() < f32::EPSILON {
+            let html_wins = if (hq - jq).abs() < f32::EPSILON {
                 hidx < jidx
             } else {
                 hq > jq
+            };
+            if html_wins {
+                AcceptPreference::Html
+            } else {
+                AcceptPreference::Json
             }
         }
-        (Some(_), None, _) | (None, None, Some(_)) => true,
-        (None, Some(_), _) | (None, None, None) => false,
+        (Some(_), None, _) => AcceptPreference::Html,
+        (None, None, Some(_)) => AcceptPreference::Any,
+        (None, Some(_), _) | (None, None, None) => AcceptPreference::Json,
     }
 }
 
@@ -758,6 +959,95 @@ mod tests {
             .body(Body::empty())
             .unwrap();
         assert!(accepts_html(&req));
+    }
+
+    #[test]
+    fn prefers_html_for_ac_tie_case() {
+        // Acceptance-criteria case: html has the higher q-value and wins.
+        let headers = header_map("application/json;q=0.9, text/html;q=1.0");
+        assert!(accept_prefers_html(&headers));
+        assert_eq!(accept_preference(&headers), AcceptPreference::Html);
+    }
+
+    /// Build a `HeaderMap` with a single `Accept` header for direct
+    /// [`accept_preference`] / [`accept_prefers_html`] assertions.
+    fn header_map(accept: &str) -> axum::http::HeaderMap {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::ACCEPT,
+            axum::http::HeaderValue::from_str(accept).unwrap(),
+        );
+        headers
+    }
+
+    #[test]
+    fn accept_preference_maps_cases_and_wrapper_is_unchanged() {
+        // Empty / missing header → Unspecified, wrapper → false.
+        let empty = axum::http::HeaderMap::new();
+        assert_eq!(accept_preference(&empty), AcceptPreference::Unspecified);
+        assert!(!accept_prefers_html(&empty));
+
+        // `*/*` only → Any, wrapper → true.
+        let any = header_map("*/*");
+        assert_eq!(accept_preference(&any), AcceptPreference::Any);
+        assert!(accept_prefers_html(&any));
+
+        // `text/html` → Html, wrapper → true.
+        let html = header_map("text/html");
+        assert_eq!(accept_preference(&html), AcceptPreference::Html);
+        assert!(accept_prefers_html(&html));
+
+        // `application/json` → Json, wrapper → false.
+        let json = header_map("application/json");
+        assert_eq!(accept_preference(&json), AcceptPreference::Json);
+        assert!(!accept_prefers_html(&json));
+    }
+
+    #[test]
+    fn accept_qualities_matches_media_types_case_insensitively() {
+        // Media types are case-insensitive (RFC 7231 §3.1.1.1): a mixed-case
+        // token must record the same slot as its lowercase form.
+        let json = accept_qualities(&header_map("Application/JSON"));
+        assert_eq!(json.json, Some((1.0, 0)));
+        assert_eq!(json.html, None);
+
+        let html = accept_qualities(&header_map("TEXT/HTML"));
+        assert_eq!(html.html, Some((1.0, 0)));
+        assert_eq!(html.json, None);
+
+        // Subtype wildcard is case-insensitive too.
+        let app_star = accept_qualities(&header_map("APPLICATION/*;q=1"));
+        assert_eq!(app_star.application_star, Some((1.0, 0)));
+    }
+
+    #[test]
+    fn accept_qualities_matches_q_parameter_case_insensitively() {
+        // Parameter names are case-insensitive: `Q=` must be honoured like `q=`.
+        let q = accept_qualities(&header_map("text/html;Q=0.9, application/json;Q=1.0"));
+        assert_eq!(q.html, Some((0.9, 0)));
+        assert_eq!(q.json, Some((1.0, 1)));
+    }
+
+    #[test]
+    fn accept_prefers_html_honours_case_insensitive_tokens() {
+        // Mixed-case JSON must not fall back to the HTML default.
+        assert!(!accept_prefers_html(&header_map("Application/JSON")));
+        assert_eq!(
+            accept_preference(&header_map("Application/JSON")),
+            AcceptPreference::Json
+        );
+
+        // Mixed-case HTML still prefers HTML.
+        assert!(accept_prefers_html(&header_map("TEXT/HTML")));
+        assert_eq!(
+            accept_preference(&header_map("TEXT/HTML")),
+            AcceptPreference::Html
+        );
+
+        // Uppercase Q honoured: JSON has the higher q and wins.
+        assert!(!accept_prefers_html(&header_map(
+            "text/html;Q=0.9, application/json;Q=1.0"
+        )));
     }
 
     // ── Integration tests with the full middleware pipeline ──────

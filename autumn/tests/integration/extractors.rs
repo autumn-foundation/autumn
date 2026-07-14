@@ -797,3 +797,265 @@ async fn multipart_declared_essence_ignores_parameters() {
         .unwrap();
     assert_eq!(&out[..], format!("image/png:{}", png.len()).as_bytes());
 }
+
+// ── Issue #1873: empty `filename=""` (optional/empty file input) ─────
+
+#[cfg(feature = "multipart")]
+#[tokio::test]
+async fn multipart_empty_filename_part_skips_allow_list_enforcement() {
+    let boundary = "X-BOUNDARY";
+    // An optional/empty file input submits a part with `filename=""` and a
+    // 0-byte body. Its filename is `Some("")`, so it must be treated as a
+    // non-file field and skip MIME sniffing / allow-list enforcement rather
+    // than aborting the whole request with a 400.
+    let body = single_file_multipart_body(boundary, "file", "", "application/octet-stream", b"");
+
+    let config = autumn_web::security::UploadConfig {
+        allowed_mime_types: vec!["image/png".to_owned()],
+        ..autumn_web::security::UploadConfig::default()
+    };
+
+    let response = run_sniff_upload(config, body, boundary).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let out = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    // No sniff performed and the empty body passes through untouched.
+    assert_eq!(&out[..], b"none:0");
+}
+
+#[cfg(feature = "multipart")]
+#[tokio::test]
+async fn multipart_empty_filename_part_skips_strict_mismatch_enforcement() {
+    let boundary = "X-BOUNDARY";
+    // Same empty-file part, but under strict content-type mismatch mode. The
+    // 0-byte part must still pass through instead of being rejected for having
+    // no verifiable content type.
+    let body = single_file_multipart_body(boundary, "file", "", "application/octet-stream", b"");
+
+    let config = autumn_web::security::UploadConfig {
+        reject_on_content_type_mismatch: true,
+        ..autumn_web::security::UploadConfig::default()
+    };
+
+    let response = run_sniff_upload(config, body, boundary).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let out = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(&out[..], b"none:0");
+}
+
+#[cfg(feature = "multipart")]
+async fn file_name_handler(mut multipart: Multipart) -> autumn_web::AutumnResult<String> {
+    let field = multipart
+        .next_field()
+        .await?
+        .expect("expected one multipart field");
+    // Report the yielded filename so the test can assert behavior: on the sniff
+    // path a genuinely-empty optional input surfaces as `None`, while on the
+    // default path the raw inner value (`Some("")`) streams through verbatim.
+    Ok(field
+        .file_name()
+        .map_or_else(|| "none".to_owned(), |name| format!("some:{name}")))
+}
+
+#[cfg(feature = "multipart")]
+async fn run_file_name_upload(
+    config: autumn_web::security::UploadConfig,
+    body: Vec<u8>,
+    boundary: &str,
+) -> axum::http::Response<Body> {
+    let app = Router::new()
+        .route("/", axum::routing::post(file_name_handler))
+        .layer(axum::middleware::from_fn(
+            move |mut req: axum::extract::Request, next: axum::middleware::Next| {
+                let config = config.clone();
+                async move {
+                    req.extensions_mut().insert(config);
+                    next.run(req).await
+                }
+            },
+        ));
+
+    app.oneshot(
+        Request::builder()
+            .method("POST")
+            .uri("/")
+            .header(
+                "content-type",
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(Body::from(body))
+            .unwrap(),
+    )
+    .await
+    .unwrap()
+}
+
+#[cfg(feature = "multipart")]
+#[tokio::test]
+async fn multipart_empty_filename_default_config_streams_through_verbatim() {
+    let boundary = "X-BOUNDARY";
+    // Default config (no allow-list, no strict-mismatch): the part streams
+    // through UNBUFFERED, exactly as before #1873, and `file_name()` returns
+    // the raw inner value verbatim — `Some("")` for an empty `filename=""`
+    // part. `file_name()` normalization is intentionally scoped to the sniff
+    // path (where an allow-list/strict policy is configured and body emptiness
+    // is known from the bounded prefix); the default path performs no
+    // enforcement/classification, so there is nothing to normalize and it must
+    // not buffer the body to peek at it (codex P2 memory regression). Issue
+    // #1873 only ever affected the configured allow-list path, and default
+    // config was explicitly unchanged.
+    let body = single_file_multipart_body(boundary, "file", "", "application/octet-stream", b"");
+
+    let app = Router::new().route("/", axum::routing::post(file_name_handler));
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/")
+                .header(
+                    "content-type",
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let out = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    // `Some("")` → the handler emits the `some:` prefix with an empty name.
+    assert_eq!(&out[..], b"some:");
+}
+
+#[cfg(feature = "multipart")]
+#[tokio::test]
+async fn multipart_named_part_yields_some_file_name() {
+    let boundary = "X-BOUNDARY";
+    // Counterpart to the empty-filename normalization: a genuinely named part
+    // must still surface its filename unchanged as `Some("real.png")`.
+    let body = single_file_multipart_body(
+        boundary,
+        "file",
+        "real.png",
+        "application/octet-stream",
+        b"data",
+    );
+
+    let app = Router::new().route("/", axum::routing::post(file_name_handler));
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/")
+                .header(
+                    "content-type",
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let out = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(&out[..], b"some:real.png");
+}
+
+#[cfg(feature = "multipart")]
+#[tokio::test]
+async fn multipart_empty_filename_empty_body_allow_list_yields_none_file_name() {
+    let boundary = "X-BOUNDARY";
+    // Sniff path (allow-list configured): a genuinely-empty optional input
+    // (empty filename AND 0-byte body) passes through and `file_name()` must
+    // normalize to `None`, exactly as on the default path. This is the case
+    // `next_field` classifies as a non-file, so the getter must agree.
+    let body = single_file_multipart_body(boundary, "file", "", "application/octet-stream", b"");
+
+    let config = autumn_web::security::UploadConfig {
+        allowed_mime_types: vec!["image/png".to_owned()],
+        ..autumn_web::security::UploadConfig::default()
+    };
+
+    let response = run_file_name_upload(config, body, boundary).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let out = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(&out[..], b"none");
+}
+
+#[cfg(feature = "multipart")]
+#[tokio::test]
+async fn multipart_empty_filename_non_empty_body_allowed_yields_some_file_name() {
+    let boundary = "X-BOUNDARY";
+    // Consistency assertion (codex P2): an empty `filename=""` part with a
+    // NON-empty body is a FILE — `next_field` sniffs and enforces it — so
+    // `file_name()` must classify it as a file too and surface the underlying
+    // `Some("")`, NOT force it to `None`. Otherwise a handler that splits
+    // file-vs-text on `file_name().is_some()` would misclassify attacker bytes
+    // as a text field or silently drop a nameless upload.
+    let png = png_fixture();
+    let body = single_file_multipart_body(boundary, "file", "", "image/png", &png);
+
+    let config = autumn_web::security::UploadConfig {
+        allowed_mime_types: vec!["image/png".to_owned()],
+        ..autumn_web::security::UploadConfig::default()
+    };
+
+    let response = run_file_name_upload(config, body, boundary).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let out = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    // `Some("")` → the handler emits the `some:` prefix with an empty name.
+    assert_eq!(&out[..], b"some:");
+}
+
+#[cfg(feature = "multipart")]
+#[tokio::test]
+async fn multipart_empty_filename_non_empty_body_still_enforced() {
+    let boundary = "X-BOUNDARY";
+    // Security regression (gemini + codex P1): a crafted part can carry
+    // `filename=""` yet a NON-empty, disallowed body. The empty-filename
+    // carve-out must apply only to a genuinely-empty (0-byte) input, so this
+    // part must still be sniffed and rejected under an allow-list rather than
+    // slipping through unenforced.
+    let png = png_fixture();
+    let body = single_file_multipart_body(boundary, "file", "", "image/png", &png);
+
+    let config = autumn_web::security::UploadConfig {
+        allowed_mime_types: vec!["image/jpeg".to_owned()],
+        ..autumn_web::security::UploadConfig::default()
+    };
+
+    let response = run_sniff_upload(config, body, boundary).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[cfg(feature = "multipart")]
+#[tokio::test]
+async fn multipart_named_disallowed_part_still_rejected() {
+    let boundary = "X-BOUNDARY";
+    // Regression guard: a genuinely-named file part with disallowed content
+    // must still be rejected — the empty-filename carve-out must not weaken
+    // enforcement for real uploads.
+    let png = png_fixture();
+    let body = single_file_multipart_body(boundary, "file", "real.png", "image/png", &png);
+
+    let config = autumn_web::security::UploadConfig {
+        allowed_mime_types: vec!["image/jpeg".to_owned()],
+        ..autumn_web::security::UploadConfig::default()
+    };
+
+    let response = run_sniff_upload(config, body, boundary).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}

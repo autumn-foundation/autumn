@@ -80,6 +80,18 @@ omitted. They do not need to be shown unless the user asks:
 If `autumn routes` fails because the project has not been compiled, tell the
 user to run `cargo build` first, then retry.
 
+## Auth-coverage audit (unreleased — trunk-dev, issues #1604, #1850)
+
+On trunk-dev, `autumn routes audit` audits every route's authentication
+exposure. It prints each route's classification — `gated`, `public`,
+`framework`, or `unclassified` — and emits a stable-ordered (by path, then
+method) JSON security manifest. It exits non-zero on any `unclassified` (or
+omitted) route, so it can gate CI.
+
+Mark a deliberately-unauthenticated handler with the new `#[public]` attribute
+(mirrors `#[secured]`) to classify it as `public` and clear it from the
+`unclassified` set.
+
 ## Comparing expected vs actual routes
 
 When the user is debugging a 404, compare the route table with the requested

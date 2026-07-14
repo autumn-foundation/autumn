@@ -28,7 +28,13 @@
 //!   Instructions / 4.1.2 Name, Role, Value. A [`TextField<NoLabel>`] has no
 //!   way to render; only after a label is attached (producing a
 //!   [`TextField<Labeled>`]) does the type implement [`maud::Render`]. An
-//!   unlabeled field is therefore unrepresentable as markup.
+//!   unlabeled field is therefore unrepresentable as markup. The field can
+//!   still carry presentational and validation attributes — `class`,
+//!   `aria-invalid`/`aria-describedby` error wiring, and the HTML5 constraints
+//!   `required`/`aria-required`/`minlength`/`maxlength`/`min`/`max`/`step` —
+//!   without weakening that obligation: those setters are available in both
+//!   states, but none of them supplies an accessible name, so a label is still
+//!   required before the field can render.
 //!
 //! All three implement [`maud::Render`], so they splice directly into an
 //! `html!` block:
@@ -498,13 +504,32 @@ enum LabelSource {
 /// unlabeled field therefore cannot be turned into markup — the accessible
 /// name obligation is discharged at compile time.
 ///
-/// The value/type/required attributes are chainable in either state.
+/// The value/type/required attributes — along with the presentational
+/// [`class`](TextField::class), the error-wiring
+/// [`aria_invalid`](TextField::aria_invalid) /
+/// [`described_by`](TextField::described_by), and the HTML5 validation
+/// constraints [`aria_required`](TextField::aria_required) /
+/// [`minlength`](TextField::minlength) / [`maxlength`](TextField::maxlength) /
+/// [`min`](TextField::min) / [`max`](TextField::max) / [`step`](TextField::step)
+/// — are chainable in either state. None of them provides an accessible name, so
+/// none of them lifts the compile-time label obligation: they can be set on a
+/// `TextField<NoLabel>`, but the field still cannot be rendered until a label is
+/// attached.
 #[derive(Debug, Clone)]
 pub struct TextField<State> {
     name: String,
     input_type: String,
     value: Option<String>,
     required: bool,
+    aria_required: bool,
+    class: Option<String>,
+    aria_invalid: Option<bool>,
+    described_by: Option<String>,
+    minlength: Option<u32>,
+    maxlength: Option<u32>,
+    min: Option<String>,
+    max: Option<String>,
+    step: Option<String>,
     label: Option<LabelSource>,
     _state: std::marker::PhantomData<State>,
 }
@@ -518,6 +543,15 @@ impl TextField<NoLabel> {
             input_type: "text".to_owned(),
             value: None,
             required: false,
+            aria_required: false,
+            class: None,
+            aria_invalid: None,
+            described_by: None,
+            minlength: None,
+            maxlength: None,
+            min: None,
+            max: None,
+            step: None,
             label: None,
             _state: std::marker::PhantomData,
         }
@@ -550,6 +584,15 @@ impl TextField<NoLabel> {
             input_type: self.input_type,
             value: self.value,
             required: self.required,
+            aria_required: self.aria_required,
+            class: self.class,
+            aria_invalid: self.aria_invalid,
+            described_by: self.described_by,
+            minlength: self.minlength,
+            maxlength: self.maxlength,
+            min: self.min,
+            max: self.max,
+            step: self.step,
             label: Some(label),
             _state: std::marker::PhantomData,
         }
@@ -578,42 +621,161 @@ impl<State> TextField<State> {
         self.required = true;
         self
     }
+
+    /// Add a mirroring `aria-required="true"` alongside the native `required`
+    /// attribute, matching the ARIA wiring the scaffold generator emits for
+    /// non-nullable fields. Available before or after a label is attached.
+    ///
+    /// ```rust
+    /// use autumn_web::a11y::TextField;
+    /// use maud::Render;
+    ///
+    /// let markup = TextField::new("name")
+    ///     .required()
+    ///     .aria_required()
+    ///     .label("Name")
+    ///     .render()
+    ///     .into_string();
+    /// assert!(markup.contains("aria-required=\"true\""));
+    /// ```
+    #[must_use]
+    pub const fn aria_required(mut self) -> Self {
+        self.aria_required = true;
+        self
+    }
+
+    /// Set the `class` attribute on the `<input>`. Available before or after a
+    /// label is attached.
+    #[must_use]
+    pub fn class(mut self, class: impl Into<String>) -> Self {
+        self.class = Some(class.into());
+        self
+    }
+
+    /// Set `aria-invalid` to `"true"` or `"false"`, wiring the field to its
+    /// validation state. When left unset the attribute is omitted entirely.
+    ///
+    /// ```rust
+    /// use autumn_web::a11y::TextField;
+    /// use maud::Render;
+    ///
+    /// let markup = TextField::new("email")
+    ///     .aria_invalid(true)
+    ///     .label("Email address")
+    ///     .render()
+    ///     .into_string();
+    /// assert!(markup.contains("aria-invalid=\"true\""));
+    /// ```
+    #[must_use]
+    pub const fn aria_invalid(mut self, invalid: bool) -> Self {
+        self.aria_invalid = Some(invalid);
+        self
+    }
+
+    /// Reference the `id` of the element describing this field (typically an
+    /// inline error container) via `aria-describedby`, so assistive technology
+    /// announces the error alongside the input.
+    ///
+    /// ```rust
+    /// use autumn_web::a11y::TextField;
+    /// use maud::Render;
+    ///
+    /// let markup = TextField::new("email")
+    ///     .described_by("email-error")
+    ///     .aria_invalid(true)
+    ///     .label("Email address")
+    ///     .render()
+    ///     .into_string();
+    /// assert!(markup.contains("aria-describedby=\"email-error\""));
+    /// ```
+    #[must_use]
+    pub fn described_by(mut self, id: impl Into<String>) -> Self {
+        self.described_by = Some(id.into());
+        self
+    }
+
+    /// Set the HTML5 `minlength` validation constraint (minimum character
+    /// count), matching the scaffold generator's `text{min=…}` DSL modifier.
+    #[must_use]
+    pub const fn minlength(mut self, minlength: u32) -> Self {
+        self.minlength = Some(minlength);
+        self
+    }
+
+    /// Set the HTML5 `maxlength` validation constraint (maximum character
+    /// count), matching the scaffold generator's `text{max=…}` DSL modifier.
+    #[must_use]
+    pub const fn maxlength(mut self, maxlength: u32) -> Self {
+        self.maxlength = Some(maxlength);
+        self
+    }
+
+    /// Set the HTML5 `min` validation constraint for numeric inputs. The value
+    /// is passed through verbatim (e.g. an integer or decimal bound), matching
+    /// the scaffold generator's numeric `{min=…}` DSL modifier.
+    #[must_use]
+    pub fn min(mut self, min: impl Into<String>) -> Self {
+        self.min = Some(min.into());
+        self
+    }
+
+    /// Set the HTML5 `max` validation constraint for numeric inputs, matching
+    /// the scaffold generator's numeric `{max=…}` DSL modifier.
+    #[must_use]
+    pub fn max(mut self, max: impl Into<String>) -> Self {
+        self.max = Some(max.into());
+        self
+    }
+
+    /// Set the HTML5 `step` attribute for numeric inputs (e.g. `"any"` for a
+    /// constrained float), matching the scaffold generator's `step="any"` on
+    /// `f32`/`f64` fields.
+    #[must_use]
+    pub fn step(mut self, step: impl Into<String>) -> Self {
+        self.step = Some(step.into());
+        self
+    }
 }
 
 impl Render for TextField<Labeled> {
     fn render(&self) -> Markup {
         // `label` is always `Some` in the `Labeled` state — it is set on every
         // transition out of `NoLabel` — but match defensively rather than
-        // unwrap.
-        match &self.label {
-            Some(LabelSource::Visible(text)) => html! {
+        // unwrap. The label source only changes the label wiring (a preceding
+        // `<label for=…>` vs an `aria-label`/`aria-labelledby` on the input);
+        // every other attribute is shared, so compute the label bits once and
+        // emit a single `<input>`.
+        let (visible_label, aria_label, aria_labelledby) = match &self.label {
+            Some(LabelSource::Visible(text)) => (Some(text.as_str()), None, None),
+            Some(LabelSource::Aria(text)) => (None, Some(text.as_str()), None),
+            Some(LabelSource::LabelledBy(id)) => (None, None, Some(id.as_str())),
+            None => (None, None, None),
+        };
+        let aria_invalid = self
+            .aria_invalid
+            .map(|invalid| if invalid { "true" } else { "false" });
+        let aria_required = self.aria_required.then_some("true");
+        html! {
+            @if let Some(text) = visible_label {
                 label for=(self.name) { (text) }
-                input
-                    type=(self.input_type)
-                    id=(self.name)
-                    name=(self.name)
-                    value=[self.value.as_deref()]
-                    required[self.required];
-            },
-            Some(LabelSource::Aria(text)) => html! {
-                input
-                    type=(self.input_type)
-                    id=(self.name)
-                    name=(self.name)
-                    aria-label=(text)
-                    value=[self.value.as_deref()]
-                    required[self.required];
-            },
-            Some(LabelSource::LabelledBy(id)) => html! {
-                input
-                    type=(self.input_type)
-                    id=(self.name)
-                    name=(self.name)
-                    aria-labelledby=(id)
-                    value=[self.value.as_deref()]
-                    required[self.required];
-            },
-            None => html! {},
+            }
+            input
+                type=(self.input_type)
+                id=(self.name)
+                name=(self.name)
+                aria-label=[aria_label]
+                aria-labelledby=[aria_labelledby]
+                class=[self.class.as_deref()]
+                value=[self.value.as_deref()]
+                minlength=[self.minlength]
+                maxlength=[self.maxlength]
+                min=[self.min.as_deref()]
+                max=[self.max.as_deref()]
+                step=[self.step.as_deref()]
+                aria-invalid=[aria_invalid]
+                aria-describedby=[self.described_by.as_deref()]
+                aria-required=[aria_required]
+                required[self.required];
         }
     }
 }
@@ -700,5 +862,98 @@ mod tests {
             .into_string();
         assert!(markup.contains("value=\"Ada\""));
         assert!(markup.contains("required"));
+    }
+
+    #[test]
+    fn text_field_carries_class_and_error_wiring() {
+        let markup = TextField::new("email")
+            .input_type("email")
+            .class("autumn-field__input autumn-field__input--invalid")
+            .aria_invalid(true)
+            .described_by("email-error")
+            .label("Email address")
+            .render()
+            .into_string();
+        assert!(
+            markup.contains("class=\"autumn-field__input autumn-field__input--invalid\""),
+            "{markup}"
+        );
+        assert!(markup.contains("aria-invalid=\"true\""), "{markup}");
+        assert!(
+            markup.contains("aria-describedby=\"email-error\""),
+            "{markup}"
+        );
+        // The label obligation is still discharged via the visible label.
+        assert!(
+            markup.contains("<label for=\"email\">Email address</label>"),
+            "{markup}"
+        );
+    }
+
+    #[test]
+    fn text_field_aria_invalid_false_renders_explicitly() {
+        let markup = TextField::new("email")
+            .aria_invalid(false)
+            .label("Email address")
+            .render()
+            .into_string();
+        assert!(markup.contains("aria-invalid=\"false\""), "{markup}");
+    }
+
+    #[test]
+    fn text_field_aria_invalid_omitted_when_unset() {
+        let markup = TextField::new("email")
+            .label("Email address")
+            .render()
+            .into_string();
+        assert!(!markup.contains("aria-invalid"), "{markup}");
+        assert!(!markup.contains("aria-describedby"), "{markup}");
+    }
+
+    #[test]
+    fn text_field_string_length_constraints() {
+        let markup = TextField::new("title")
+            .minlength(3)
+            .maxlength(120)
+            .required()
+            .aria_required()
+            .label("Title")
+            .render()
+            .into_string();
+        assert!(markup.contains("minlength=\"3\""), "{markup}");
+        assert!(markup.contains("maxlength=\"120\""), "{markup}");
+        assert!(markup.contains("required"), "{markup}");
+        assert!(markup.contains("aria-required=\"true\""), "{markup}");
+    }
+
+    #[test]
+    fn text_field_numeric_constraints() {
+        let markup = TextField::new("ratio")
+            .input_type("number")
+            .min("0")
+            .max("1")
+            .step("any")
+            .label("Ratio")
+            .render()
+            .into_string();
+        assert!(markup.contains("type=\"number\""), "{markup}");
+        assert!(markup.contains("min=\"0\""), "{markup}");
+        assert!(markup.contains("max=\"1\""), "{markup}");
+        assert!(markup.contains("step=\"any\""), "{markup}");
+    }
+
+    #[test]
+    fn text_field_new_attrs_survive_aria_label_variant() {
+        // The new attributes are set on the `NoLabel` builder before the label
+        // transition; they must survive `with_label` into the `Labeled` state.
+        let markup = TextField::new("q")
+            .class("search")
+            .aria_invalid(true)
+            .aria_label("Search")
+            .render()
+            .into_string();
+        assert!(markup.contains("aria-label=\"Search\""), "{markup}");
+        assert!(markup.contains("class=\"search\""), "{markup}");
+        assert!(markup.contains("aria-invalid=\"true\""), "{markup}");
     }
 }
