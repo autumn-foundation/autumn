@@ -4069,8 +4069,11 @@ fn resolve_optional_signing_secret() -> Option<String> {
 /// `AutumnConfig::load()` and `autumn deploy check` see it. Never returns/prints
 /// the value except to the (secret-safe) grader. Env-var precedence matches the
 /// runtime loader.
-fn resolve_deploy_signing_secret(merged: &toml::Table) -> Option<String> {
-    if let Ok(val) = std::env::var("AUTUMN_SECURITY__SIGNING_SECRET")
+fn resolve_deploy_signing_secret(
+    merged: &toml::Table,
+    env: &dyn autumn_web::config::Env,
+) -> Option<String> {
+    if let Ok(val) = env.var("AUTUMN_SECURITY__SIGNING_SECRET")
         && !val.is_empty()
     {
         return Some(val);
@@ -4115,8 +4118,11 @@ fn resolve_deploy_previous_signing_secrets(merged: &toml::Table) -> Vec<String> 
 ///
 /// Cache, channels, and idempotency have only in-memory/Redis backends (no
 /// Postgres variant), so they never require a DB pool.
-fn resolve_deploy_db_backed_runtime(merged: &toml::Table) -> bool {
-    let env_var = |key: &str| std::env::var(key).ok().filter(|value| !value.is_empty());
+fn resolve_deploy_db_backed_runtime(
+    merged: &toml::Table,
+    env: &dyn autumn_web::config::Env,
+) -> bool {
+    let env_var = |key: &str| env.var(key).ok().filter(|value| !value.is_empty());
 
     let jobs = merged.get("jobs").and_then(toml::Value::as_table);
     let jobs_postgres = first_env(&env_var, &["AUTUMN_JOBS__BACKEND"])
@@ -5903,7 +5909,8 @@ pub fn run(opts: DoctorOptions) {
         // secret supplied only by the active profile is invisible to the raw
         // table, so a raw lookup would report it MISSING even though
         // `AutumnConfig::load()` and `autumn deploy check` see it.
-        let deploy_signing = resolve_deploy_signing_secret(&merged_deploy_toml);
+        let deploy_signing =
+            resolve_deploy_signing_secret(&merged_deploy_toml, deploy_denv.as_ref());
         // Rotation secrets accepted during a grace window are validated at boot
         // with the same rule as the current secret, so grade them here from the
         // same merged table (no env override exists for `previous_secrets`).
@@ -5954,7 +5961,8 @@ pub fn run(opts: DoctorOptions) {
         // even with no migrations dir and no `[database]` section. Resolved from
         // the SAME merged active-profile table so `doctor` and `deploy check`
         // apply the identical DB-required rule.
-        let deploy_db_backed_runtime = resolve_deploy_db_backed_runtime(&merged_deploy_toml);
+        let deploy_db_backed_runtime =
+            resolve_deploy_db_backed_runtime(&merged_deploy_toml, deploy_denv.as_ref());
 
         // Host presence is validated OFFLINE (always, whenever `[deploy]` is
         // configured): a `[deploy]` table with a missing/blank `host` makes

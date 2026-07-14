@@ -149,6 +149,71 @@ fn doctor_reads_deploy_host_from_dotenv() {
 }
 
 #[test]
+fn doctor_reads_deploy_signing_secret_from_dotenv() {
+    // Regression: doctor must read the deploy signing secret through .env like
+    // `deploy check` (Codex P2 on 2dc71f7); bare OsEnv would report it missing
+    // under --strict. With a `[deploy]` host (so the deploy preflight runs) and
+    // a STRONG `AUTUMN_SECURITY__SIGNING_SECRET` supplied ONLY via `.env`, the
+    // production-mode `deploy_signing_secret` grader must PASS — resolving the
+    // secret through the profile-aware dotenv overlay, not a bare `OsEnv` that
+    // would see no secret and fail the check.
+    let dir = project("host = \"deploy.example.test\"\n");
+    // 64 hex chars (>= MIN_SECRET_LEN, not a known demo value): a valid
+    // production secret. Delivered ONLY through `.env`, never the process env.
+    fs::write(
+        dir.path().join(".env"),
+        "AUTUMN_SECURITY__SIGNING_SECRET=\
+         0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n",
+    )
+    .expect("write .env");
+
+    // `AUTUMN_ENV=production` (a profile selector, allowed only from the real
+    // env) puts the signing-secret grader in production mode where a strong
+    // secret is required; `AUTUMN_DOTENV=1` force-loads `.env`. The secret
+    // itself is NOT in the process env.
+    let (stdout, stderr, _code) = run_autumn(
+        dir.path(),
+        &["doctor"],
+        &[("AUTUMN_ENV", "production"), ("AUTUMN_DOTENV", "1")],
+    );
+    let combined = format!("{stdout}{stderr}");
+    // Passing check renders as `✅ deploy_signing_secret — signing secret is
+    // configured` (see `format_check_line` / `grade_signing_secret`).
+    assert!(
+        combined.contains("deploy_signing_secret — signing secret is configured"),
+        "doctor must resolve the .env-only deploy signing secret and pass the \
+         production deploy_signing_secret check (bare OsEnv would report it \
+         missing)\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+}
+
+#[test]
+fn doctor_flags_dotenv_db_backed_runtime_without_db() {
+    // Regression: `.env`-only postgres backend must make doctor require a deploy
+    // DB, matching `deploy check` (Codex P2 on 2dc71f7); bare OsEnv wrongly
+    // passed. With a `[deploy]` host, `AUTUMN_JOBS__BACKEND=postgres` supplied
+    // ONLY via `.env`, and NO database URL / `[database]` / migrations dir
+    // anywhere, the db-backed runtime must be detected from `.env` so the
+    // `deploy_database_url` grader FAILS (a Postgres-backed jobs runtime needs a
+    // writable pool). A bare `OsEnv` would miss the `.env` backend and pass.
+    let dir = project("host = \"deploy.example.test\"\n");
+    fs::write(dir.path().join(".env"), "AUTUMN_JOBS__BACKEND=postgres\n").expect("write .env");
+
+    // `AUTUMN_DOTENV=1` force-loads `.env`; no DATABASE_URL / AUTUMN_DATABASE__URL
+    // is set anywhere, so the grader has no writable target.
+    let (stdout, stderr, _code) = run_autumn(dir.path(), &["doctor"], &[("AUTUMN_DOTENV", "1")]);
+    let combined = format!("{stdout}{stderr}");
+    // Failing check renders as `❌ deploy_database_url — no writable database
+    // URL: ...` (see `format_check_line` / `grade_database_url`).
+    assert!(
+        combined.contains("deploy_database_url — no writable database URL"),
+        "the .env-only postgres jobs backend must make doctor require a deploy \
+         DB and fail deploy_database_url (bare OsEnv would pass)\nstdout:\n\
+         {stdout}\nstderr:\n{stderr}"
+    );
+}
+
+#[test]
 fn deploy_help_lists_subcommands() {
     let dir = tempfile::tempdir().expect("temp dir");
     let (stdout, stderr, code) = run_autumn(dir.path(), &["deploy", "--help"], &[]);
