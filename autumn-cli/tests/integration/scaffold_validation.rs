@@ -274,6 +274,43 @@ fn length_bound_at_u32_max_is_accepted() {
     );
 }
 
+/// The explicit `--validate name=length:...` form renders solely to the
+/// server-side `#[validate(length(...))]` derive, which the `validator` crate
+/// accepts as a `u64`. Unlike the DSL inline `{max=…}` constraint, it never
+/// populates `FieldConstraints`, so it never reaches the HTML5 length attribute
+/// or the typed `a11y::TextField::maxlength(u32)` codegen. A bound above
+/// `u32::MAX` is therefore legitimate here and must be emitted verbatim rather
+/// than rejected (the `u32` guard belongs only to the DSL/HTML5 path).
+#[test]
+fn explicit_validate_length_bound_above_u32_max_is_accepted() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    run_autumn_ok(tmp.path(), &["new", "validate-server-len-app"]);
+    let project = tmp.path().join("validate-server-len-app");
+    run_autumn_ok(
+        &project,
+        &[
+            "generate",
+            "scaffold",
+            "Doc",
+            "title:String",
+            "--validate",
+            "title=length:max=5000000000",
+        ],
+    );
+    let model = fs::read_to_string(project.join("src/models/doc.rs")).unwrap();
+    assert!(
+        model.contains("#[validate(length(max = 5000000000))]"),
+        "a server-side length bound above u32::MAX must be emitted verbatim:\n{model}"
+    );
+    // It must NOT reach the typed `u32` maxlength builder (that path is fed by
+    // the DSL inline constraint, not the explicit `--validate` form).
+    let routes = fs::read_to_string(project.join("src/routes/docs.rs")).unwrap();
+    assert!(
+        !routes.contains(".maxlength("),
+        "explicit --validate length must not emit an HTML5 maxlength builder:\n{routes}"
+    );
+}
+
 #[test]
 fn constrained_float_fields_keep_step_any() {
     // A constrained float must keep `step="any"` so browsers don't default to
