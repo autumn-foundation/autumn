@@ -3928,6 +3928,11 @@ impl AutumnConfig {
             "AUTUMN_SECURITY__CSRF__COOKIE_NAME",
             &mut self.security.csrf.cookie_name,
         );
+        parse_env(
+            env,
+            "AUTUMN_SECURITY__CSRF__TOKEN_SCAN_BYTES",
+            &mut self.security.csrf.token_scan_bytes,
+        );
 
         self.apply_rate_limit_env_overrides_with_env(env);
 
@@ -10908,6 +10913,25 @@ path = "/healthz"
         config.security.allow_unauthorized_repository_api = true;
         config.apply_env_overrides_with_env(&env);
         assert!(!config.security.allow_unauthorized_repository_api);
+    }
+
+    #[test]
+    fn env_override_csrf_token_scan_bytes() {
+        let env = MockEnv::new().with("AUTUMN_SECURITY__CSRF__TOKEN_SCAN_BYTES", "8388608");
+        let mut config = AutumnConfig::default();
+        // Default is 2 MiB; the env override must raise it.
+        assert_eq!(config.security.csrf.token_scan_bytes, 2 * 1024 * 1024);
+        config.apply_env_overrides_with_env(&env);
+        assert_eq!(config.security.csrf.token_scan_bytes, 8_388_608);
+    }
+
+    #[test]
+    fn env_override_csrf_token_scan_bytes_invalid_is_ignored() {
+        let env = MockEnv::new().with("AUTUMN_SECURITY__CSRF__TOKEN_SCAN_BYTES", "not-a-number");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        // Invalid values are ignored, leaving the default intact.
+        assert_eq!(config.security.csrf.token_scan_bytes, 2 * 1024 * 1024);
     }
 
     // ── [openapi] config section tests (RED phase) ─────────────────────────
