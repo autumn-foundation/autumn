@@ -1232,6 +1232,35 @@ pub use autumn_macros::static_routes;
 /// ```
 pub use autumn_macros::static_get;
 
+/// Turn a plain state enum into a statically-verified lifecycle.
+///
+/// Applied to an enum with an `initial` state, one or more `terminal` states,
+/// and a set of `transitions`, this preserves the original enum and appends
+/// metadata consts (`LIFECYCLE_INITIAL`, `LIFECYCLE_TERMINALS`,
+/// `LIFECYCLE_STATES`, `LIFECYCLE_TRANSITIONS`) plus `can_transition_to` on the
+/// enum, and a typestate transition module (named after the enum in
+/// `snake_case`) whose `Machine<S>` only exposes `to_<target>` methods for
+/// declared edges — firing an undeclared transition is a compile error.
+///
+/// # Examples
+///
+/// ```rust,ignore
+/// use autumn_web::lifecycle;
+///
+/// #[lifecycle(
+///     initial = Draft,
+///     terminal(Archived),
+///     transitions(
+///         Draft -> Published,
+///         Published -> Archived,
+///         Published -> Draft,
+///     )
+/// )]
+/// #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// pub enum ArticleState { Draft, Published, Archived }
+/// ```
+pub use autumn_macros::lifecycle;
+
 // ── Maud re-exports ────────────────────────────────────────────────
 
 /// Rendered HTML fragment produced by the [`html!`] macro.

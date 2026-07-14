@@ -23,6 +23,7 @@ mod idempotency_guard;
 mod inbound_mail;
 mod job;
 mod jobs_macro;
+mod lifecycle;
 mod listener;
 mod listeners_macro;
 mod mail_previews_macro;
@@ -1116,4 +1117,44 @@ pub fn ws(attr: TokenStream, item: TokenStream) -> TokenStream {
 #[proc_macro]
 pub fn t(input: TokenStream) -> TokenStream {
     i18n::t_macro(input.into()).into()
+}
+
+/// Turn a plain state enum into a statically-verified lifecycle.
+///
+/// Given a declared `initial` state, one or more `terminal` states, and a set
+/// of `transitions`, `#[lifecycle]` preserves the original enum and appends:
+///
+/// 1. Metadata consts (`LIFECYCLE_INITIAL`, `LIFECYCLE_TERMINALS`,
+///    `LIFECYCLE_STATES`, `LIFECYCLE_TRANSITIONS`) and a `can_transition_to`
+///    runtime check on the enum. Because these reference the enum's own
+///    variants, a declared state that is not a real variant is a compile error.
+/// 2. A typestate transition module named after the enum in `snake_case`, whose
+///    `Machine<S>` exposes a consuming `to_<target>` method *only* for declared
+///    edges — firing an undeclared transition does not compile.
+///
+/// # Example
+///
+/// ```ignore
+/// use autumn_web::lifecycle;
+///
+/// #[lifecycle(
+///     initial = Draft,
+///     terminal(Archived),
+///     transitions(
+///         Draft -> Published,
+///         Published -> Archived,
+///         Published -> Draft,
+///     )
+/// )]
+/// #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// pub enum ArticleState { Draft, Published, Archived }
+///
+/// let m = article_state::Machine::<article_state::Draft>::start();
+/// let m = m.to_published();      // only declared edges exist as methods
+/// assert_eq!(m.current(), ArticleState::Published);
+/// assert!(ArticleState::Draft.can_transition_to(&ArticleState::Published));
+/// ```
+#[proc_macro_attribute]
+pub fn lifecycle(attr: TokenStream, item: TokenStream) -> TokenStream {
+    lifecycle::lifecycle_macro(attr.into(), item.into()).into()
 }

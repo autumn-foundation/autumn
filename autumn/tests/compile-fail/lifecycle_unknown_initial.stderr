@@ -1,0 +1,5 @@
+error: `initial` state `Nonexistent` is not a variant of enum `OrderState`
+ --> tests/compile-fail/lifecycle_unknown_initial.rs:7:15
+  |
+7 |     initial = Nonexistent,
+  |               ^^^^^^^^^^^

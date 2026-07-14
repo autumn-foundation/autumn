@@ -24,6 +24,7 @@ mod generate;
 mod http;
 mod i18n;
 mod jobs;
+mod lifecycle;
 mod maintenance;
 mod migrate;
 mod monitor;
@@ -126,6 +127,43 @@ pub enum A11ySubcommands {
         /// fails, consistent with `autumn i18n check --strict`.
         #[arg(long)]
         strict: bool,
+    },
+}
+
+/// Subcommands for `autumn lifecycle`.
+#[derive(Subcommand, Clone, Debug, PartialEq, Eq)]
+pub enum LifecycleSubcommands {
+    /// Statically verify the soundness of every `#[lifecycle]` state machine in
+    /// the project: existence of every referenced state, reachability of every
+    /// state from the initial state, and that every reachable non-terminal state
+    /// can reach some terminal state. Exits non-zero when any lifecycle is
+    /// unsound (CI-friendly).
+    ///
+    /// Note: this is a best-effort source scanner — it resolves bare, qualified,
+    /// and same-module-aliased `#[lifecycle]` attributes, but not cross-file or
+    /// glob-reexport aliases (tracked in #1925). The compile-time typestate is
+    /// the by-construction guarantee.
+    Check {
+        /// Project root to scan (defaults to the current directory).
+        #[arg(value_name = "PATH", default_value = ".")]
+        path: String,
+        /// Output format: `text` (default) or `json`.
+        #[arg(long, default_value = "text", value_name = "FORMAT")]
+        format: String,
+    },
+    /// Emit a lifecycle diagram for every `#[lifecycle]` state machine, in
+    /// Graphviz DOT or Mermaid `stateDiagram-v2` form (highlighting the initial
+    /// and terminal states).
+    Diagram {
+        /// Project root to scan (defaults to the current directory).
+        #[arg(value_name = "PATH", default_value = ".")]
+        path: String,
+        /// Diagram format: `mermaid` (default) or `dot`.
+        #[arg(long, default_value = "mermaid", value_name = "FORMAT")]
+        format: String,
+        /// Write the diagram(s) to this file instead of stdout.
+        #[arg(long, value_name = "FILE")]
+        out: Option<String>,
     },
 }
 
@@ -680,6 +718,27 @@ enum Commands {
     A11y {
         #[command(subcommand)]
         action: A11ySubcommands,
+    },
+
+    /// Verify the soundness of `#[lifecycle]` state machines and render their
+    /// lifecycle diagrams at build time.
+    ///
+    /// The `#[lifecycle]` macro proves that transition endpoints are real
+    /// variants and that only declared edges are callable. `autumn lifecycle
+    /// check` closes the remaining gap by verifying the *shape* of the
+    /// reachability graph: every referenced state exists, every state is
+    /// reachable from the initial state, and every reachable non-terminal state
+    /// can reach some terminal. Exits non-zero when any lifecycle is unsound.
+    ///
+    /// # Examples
+    ///
+    ///   autumn lifecycle check
+    ///   autumn lifecycle check --format json
+    ///   autumn lifecycle diagram --format mermaid
+    #[command(verbatim_doc_comment)]
+    Lifecycle {
+        #[command(subcommand)]
+        action: LifecycleSubcommands,
     },
 
     /// Inspect the application's background jobs.
@@ -3001,6 +3060,45 @@ fn run_command(command: Commands) {
                 let code = a11y::run_in(
                     std::path::Path::new(&path),
                     a11y::A11yVerifyOptions { format, strict },
+                );
+                std::process::exit(code);
+            }
+        },
+        Commands::Lifecycle { action } => match action {
+            LifecycleSubcommands::Check { path, format } => {
+                let format = match format.as_str() {
+                    "json" => lifecycle::OutputFormat::Json,
+                    "text" => lifecycle::OutputFormat::Text,
+                    other => {
+                        eprintln!(
+                            "autumn lifecycle check: unknown --format `{other}` (expected `text` or `json`)"
+                        );
+                        std::process::exit(2);
+                    }
+                };
+                let code = lifecycle::run_check(
+                    std::path::Path::new(&path),
+                    lifecycle::CheckOptions { format },
+                );
+                std::process::exit(code);
+            }
+            LifecycleSubcommands::Diagram { path, format, out } => {
+                let format = match format.as_str() {
+                    "mermaid" => lifecycle::DiagramFormat::Mermaid,
+                    "dot" => lifecycle::DiagramFormat::Dot,
+                    other => {
+                        eprintln!(
+                            "autumn lifecycle diagram: unknown --format `{other}` (expected `mermaid` or `dot`)"
+                        );
+                        std::process::exit(2);
+                    }
+                };
+                let code = lifecycle::run_diagram(
+                    std::path::Path::new(&path),
+                    &lifecycle::DiagramOptions {
+                        format,
+                        out: out.map(std::path::PathBuf::from),
+                    },
                 );
                 std::process::exit(code);
             }
