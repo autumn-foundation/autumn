@@ -31,23 +31,137 @@
 //! preserve row order. The compacted 0-based position is what appears in
 //! combined error keys and is what a renderer iterates.
 //!
-//! # Example
+//! # Binding and validating
+//!
+//! ```rust
+//! use autumn_web::nested_form::{decode_nested_urlencoded, NestedChild};
+//!
+//! #[derive(serde::Deserialize, validator::Validate)]
+//! struct NewOrder {
+//!     #[validate(length(min = 1))]
+//!     name: String,
+//! }
+//!
+//! #[derive(serde::Deserialize, validator::Validate)]
+//! struct NewLineItem {
+//!     #[validate(length(min = 1))]
+//!     sku: String,
+//!     #[validate(range(min = 1))]
+//!     quantity: i32,
+//! }
+//!
+//! impl NestedChild for NewLineItem {
+//!     const COLLECTION: &'static str = "items";
+//! }
+//!
+//! let pairs = vec![
+//!     ("name".to_string(), "Order 1".to_string()),
+//!     ("items[0][sku]".to_string(), "A-1".to_string()),
+//!     ("items[0][quantity]".to_string(), "2".to_string()),
+//!     // second row is invalid: quantity is below the range minimum
+//!     ("items[1][sku]".to_string(), "B-2".to_string()),
+//!     ("items[1][quantity]".to_string(), "0".to_string()),
+//! ];
+//!
+//! let changeset = decode_nested_urlencoded::<NewOrder, NewLineItem>(&pairs)
+//!     .expect("parent decodes");
+//!
+//! // The invalid child surfaces under its per-row combined key, and the whole
+//! // changeset refuses to yield a valid `(parent, children)` pair.
+//! assert!(!changeset.errors_for("items[1].quantity").is_empty());
+//! assert!(changeset.errors_for("items[0].quantity").is_empty());
+//! assert!(!changeset.is_valid());
+//! assert!(changeset.into_valid().is_err());
+//! ```
+//!
+//! # Per-row error keys
+//!
+//! Errors are addressable with `#[validate(nested)]`-style combined keys of
+//! the shape `"{COLLECTION}[{i}].{sub}"`. A child whose `quantity` fails
+//! validation on the (compacted) second row surfaces under
+//! [`errors_for("items[1].quantity")`](NestedChangeset::errors_for); a bare
+//! `"items[1]"` returns that row's row-level (parse) error. Parent field
+//! errors keep their plain field-name keys and are delegated to
+//! [`Changeset::errors_for`]. This is exactly the key shape a Maud renderer
+//! reads back per row via [`RowScope::errors_for`], so a failed submission
+//! re-renders each field's message inline next to the offending input.
+//!
+//! # `_destroy` marker
+//!
+//! A child subfield named `_destroy` with a truthy value (`"1"`, `"true"`,
+//! `"on"`) marks its row for removal. Destroyed rows are **retained** for
+//! re-rendering (so the checkbox state survives a round-trip) but never
+//! contribute to `valid_children`, so [`into_valid`](NestedChangeset::into_valid)
+//! drops them from the returned child vector. [`RowScope::destroy_checkbox`]
+//! renders the durable no-JS control that drives this.
+//!
+//! # Rendering: `inputs_for` + htmx / no-JS
+//!
+//! With the `maud` feature, [`inputs_for`] renders the repeating child block:
+//! it re-emits every submitted row (values + inline errors) and then appends
+//! at least one blank template row so a user can add a child **without any
+//! JavaScript** — the pre-rendered blank row's `items[n][…]` inputs post like
+//! any other. Supplying [`InputsForOptions::add_row_url`] additionally emits an
+//! htmx "Add row" button (`hx-get` + `hx-swap="beforeend"`, with
+//! `hx-params="not _submit_token"` so the one-time submit token is not spent
+//! fetching the fragment); [`nested_row_fragment`] renders the server response
+//! for that endpoint. htmx is a progressive enhancement layered over the no-JS
+//! path — it is never required.
+//!
+//! # Handler + atomic save
 //!
 //! ```rust,ignore
 //! #[post("/orders")]
-//! async fn create(form: NestedChangesetForm<NewOrder, NewLineItem>) -> impl IntoResponse {
+//! async fn create(
+//!     mut db: Db,
+//!     form: NestedChangesetForm<NewOrder, NewLineItem>,
+//! ) -> impl IntoResponse {
 //!     match form.into_valid() {
-//!         Ok((order, items)) => { /* persist order + items */ }
+//!         Ok((order, items)) => save_order_with_items(&mut db, order, items).await,
 //!         Err(form) => (StatusCode::UNPROCESSABLE_ENTITY, render(&form)).into_response(),
 //!     }
 //! }
 //! ```
 //!
-//! The Maud renderer (`inputs_for`) and the DB integration path are
-//! follow-up work; the row/error accessors here
-//! ([`NestedChangeset::rows`], [`NestedRow::value`],
-//! [`NestedRow::errors_for`], [`NestedRow::is_destroyed`]) expose everything
-//! a per-row renderer and a blank template row need.
+//! A parent and its children must be persisted **atomically** — a half-saved
+//! order with only some of its line items is never acceptable. Do it inside a
+//! **single** [`Db::tx`](crate::db::Db::tx): insert the parent, read back its
+//! generated `id`, stamp each child's foreign key with that `id`, and insert
+//! the children — all on the one `conn` the closure is handed. Returning `Err`
+//! from anywhere in the closure (a failing child, a DB constraint violation)
+//! rolls the **whole** transaction back, so neither the parent nor any child
+//! row is left behind.
+//!
+//! ```rust,ignore
+//! use scoped_futures::ScopedFutureExt;
+//!
+//! db.tx(|conn| async move {
+//!     let order = diesel::insert_into(orders::table)
+//!         .values(&new_order)
+//!         .returning(Order::as_returning())
+//!         .get_result(conn)
+//!         .await?;
+//!     for mut item in new_items {
+//!         item.order_id = order.id; // stamp the FK from the freshly-read parent id
+//!         diesel::insert_into(line_items::table)
+//!             .values(&item)
+//!             .execute(conn)
+//!             .await?; // any Err here rolls back the parent insert too
+//!     }
+//!     Ok::<_, diesel::result::Error>(order.id)
+//! }.scope_boxed())
+//! .await
+//! ```
+//!
+//! Use **raw diesel inserts on `conn`**, not a generated
+//! [`Repository`](crate::repository) `create`: that `create` opens its *own*
+//! `Db::tx`, and `Db::tx` cannot be re-entered on the same connection — the
+//! nested call trips the nested-transaction guard and returns a `400`. Keep the
+//! whole parent-plus-children unit of work in the one outer `tx`.
+//!
+//! See `tests/integration/nested_form_atomic_save.rs` for the rollback
+//! correctness gate (a failing child leaves **zero** rows in either table) and
+//! `tests/integration/nested_form_order_example.rs` for the full create flow.
 
 // autumn-panic-gate: request-path module — production code path must be panic-free.
 // See CONTRIBUTING.md "Request-path panic gate". Justify exceptions with
