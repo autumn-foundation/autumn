@@ -2120,11 +2120,20 @@ fn render_routes_file(
     // the freshly-saved `<field>_blob`s (into `saved_blob_keys`) — pushed at the
     // point of each save, so the key set is populated incrementally as blobs are
     // persisted — and best-effort delete them before every early-return path that
-    // can occur after the first save: a later attachment field's save failure,
-    // `decode_form` on malformed scalar input, changeset validation, the
-    // unique-violation 422, the generic DB error, and (update) the current-row
-    // load / not-found. A preserved existing blob is never enrolled. This snippet
-    // is spliced before each such `return`.
+    // can occur after the first save.
+    //
+    // Codex P2 (centralized): the *whole* fallible multipart-parse-and-decode
+    // span — `next_field()?`, each `save_to_blob_store()?`, `bytes_limited()?`,
+    // the UTF-8 `map_err(…)?`, and `decode_form(…)?` — runs inside one
+    // `async { … }.await` block typed to the handler's `AutumnError`, whose `Err`
+    // is funneled through a single cleanup path (`form_decode_block`). That covers
+    // every `?` in the span (current and future) without per-line wrapping, so a
+    // malformed boundary / oversized text field / invalid UTF-8 arriving *after* a
+    // blob was saved can no longer leak it. The remaining post-parse early returns
+    // (changeset validation, `into_new`, the unique-violation 422, the generic DB
+    // error, and the update's current-row load / not-found) sit *outside* that
+    // block and keep splicing `{blob_cleanup}` before their `return`. A preserved
+    // existing blob is never enrolled.
     let blob_cleanup = if has_attachments {
         "for key in &saved_blob_keys {\n        let _ = store.delete(key).await;\n    }\n    "
     } else {
@@ -2143,9 +2152,11 @@ fn render_routes_file(
             // `saved_blob_keys` *immediately* after each successful save, so any
             // later fallible early return (a subsequent attachment field's save,
             // `decode_form`, validation, the DB write) can best-effort delete it.
-            // The save's own `?` is expanded into an explicit `match` that runs
-            // the cleanup first, covering the case where an earlier attachment
-            // field was already persisted when a later one fails to save.
+            // The save's own `?` (and every other fallible `?` in the parse span)
+            // is covered centrally: the whole multipart-parse-and-decode section
+            // runs inside a single `async {…}` block whose `Err` is funneled
+            // through one cleanup path (see `form_decode_block`), so a failed save
+            // cleans up any earlier-saved sibling blobs without per-line wrapping.
             let _ = write!(
                 match_arms,
                 "            Some(\"{name}\") => {{\n                \
@@ -2155,12 +2166,7 @@ fn render_routes_file(
                  chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default(),\n                        \
                  uuid::Uuid::new_v4()\n                    \
                  );\n                    \
-                 let blob = match field.save_to_blob_store(&*store, key).await {{\n                        \
-                 Ok(blob) => blob,\n                        \
-                 Err(err) => {{\n                            \
-                 {blob_cleanup}return Err(err);\n                        \
-                 }}\n                    \
-                 }};\n                    \
+                 let blob = field.save_to_blob_store(&*store, key).await?;\n                    \
                  saved_blob_keys.push(blob.key.clone());\n                    \
                  {name}_blob = Some(blob);\n                \
                  }}\n            \
@@ -2173,11 +2179,12 @@ fn render_routes_file(
              .ok_or_else(|| AutumnError::internal_server_error_msg(\"storage not configured\"))?\n        \
              .store()\n        \
              .clone();\n    \
-             let mut form_pairs: Vec<(String, String)> = Vec::new();\n    \
              let mut saved_blob_keys: Vec<String> = Vec::new();\n\
              {blob_decls}    \
-             while let Some(field) = multipart.next_field().await? {{\n        \
-             let field_name = field.name().map(str::to_owned);\n        \
+             let __parse_result: AutumnResult<{pascal_name}Form> = async {{\n        \
+             let mut form_pairs: Vec<(String, String)> = Vec::new();\n        \
+             while let Some(field) = multipart.next_field().await? {{\n            \
+             let field_name = field.name().map(str::to_owned);\n            \
              match field_name.as_deref() {{\n\
              {match_arms}            \
              Some(other) => {{\n                \
@@ -2186,12 +2193,16 @@ fn render_routes_file(
              form_pairs.push((other.to_owned(), value));\n            \
              }}\n            \
              None => {{}}\n        \
+             }}\n        \
+             }}\n        \
+             let encoded = url::form_urlencoded::Serializer::new(String::new())\n            \
+             .extend_pairs(form_pairs.iter().map(|(key, value)| (key.as_str(), value.as_str())))\n            \
+             .finish();\n        \
+             let form = decode_form(Bytes::from(encoded))?;\n        \
+             Ok(form)\n    \
              }}\n    \
-             }}\n    \
-             let encoded = url::form_urlencoded::Serializer::new(String::new())\n        \
-             .extend_pairs(form_pairs.iter().map(|(key, value)| (key.as_str(), value.as_str())))\n        \
-             .finish();\n    \
-             let form = match decode_form(Bytes::from(encoded)) {{\n        \
+             .await;\n    \
+             let form = match __parse_result {{\n        \
              Ok(form) => form,\n        \
              Err(err) => {{\n            \
              {blob_cleanup}return Err(err);\n        \
