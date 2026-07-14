@@ -62,6 +62,12 @@ pub fn plan_mailer(
 /// only reverts previously written files; it never applies the Postgres-only
 /// unsubscribe migration, so the rejection is generate-path only.
 ///
+/// The `SQLite` rejection is scoped to the `--list-unsubscribe` path
+/// (`list_unsubscribe.is_some()`): only that branch adds the Postgres-only
+/// `mail_unsubscribes` migration. A plain `generate mailer` emits only
+/// Rust/template files and enables the `mail` feature, so it is allowed on a
+/// `SQLite` app.
+///
 /// # Errors
 /// Project layout and name validation errors surface here.
 #[allow(
@@ -77,15 +83,21 @@ pub fn plan_mailer_ex(
     for_revert: bool,
 ) -> Result<Plan, GenerateError> {
     ensure_project_root(project_root)?;
-    // SQLite foundation (issue #1614 AC #4): this generator scaffolds a
-    // Postgres-only unsubscribe migration (`BIGSERIAL`/`NOW()`), so reject
-    // before writing any files on a SQLite app (follow-up: issue #1927).
-    // Generate-time guard only — skip it on the destroy/revert path so cleanup
-    // can still remove generated files (see `for_revert` above).
+    // SQLite foundation (issue #1614 AC #4): the ONLY Postgres-only output of this
+    // generator is the `--list-unsubscribe` suppression migration
+    // (`mail_unsubscribes`, emitting `BIGSERIAL`/`NOW()`), which is added only
+    // under the `if list_unsubscribe.is_some()` branch below. A plain
+    // `generate mailer` (no `--list-unsubscribe`) emits only Rust/template files
+    // and enables the `mail` feature — nothing SQLite-incompatible — so it must
+    // succeed on a SQLite app. Reject ONLY the unsubscribe-migration path
+    // (follow-up: issue #1927). Generate-time guard only — skip it on the
+    // destroy/revert path so cleanup can still remove generated files (see
+    // `for_revert` above).
     if !for_revert
+        && list_unsubscribe.is_some()
         && super::detect_backend(project_root) == autumn_web::config::DatabaseBackend::Sqlite
     {
-        return Err(super::sqlite_generator_unsupported_error("mailer"));
+        return Err(sqlite_unsubscribe_migration_unsupported_error());
     }
     validate_resource_name(name)?;
     if let Some(scope) = list_unsubscribe {
@@ -222,6 +234,26 @@ pub fn plan_mailer_ex(
     }
 
     Ok(plan)
+}
+
+/// Error for `generate mailer --list-unsubscribe` on a `SQLite` app.
+///
+/// Only the `--list-unsubscribe` path adds the `mail_unsubscribes` suppression
+/// migration, which emits Postgres-only DDL (`BIGSERIAL PRIMARY KEY`,
+/// `DEFAULT NOW()`) that `SQLite` rejects. A plain `generate mailer` is unaffected,
+/// so the message points the user at dropping the flag rather than implying
+/// mailers are wholesale unsupported (follow-up: issue #1927).
+fn sqlite_unsubscribe_migration_unsupported_error() -> GenerateError {
+    GenerateError::Config(
+        "`generate mailer --list-unsubscribe` is not yet supported on SQLite apps: the \
+         unsubscribe-tracking `mail_unsubscribes` migration emits Postgres-only DDL \
+         (`BIGSERIAL PRIMARY KEY`, `DEFAULT NOW()`), which SQLite rejects, so the generated \
+         migration would fail to apply. A plain `generate mailer` (without `--list-unsubscribe`) \
+         works on a SQLite app today. A SQLite-compatible unsubscribe migration is tracked in \
+         https://github.com/madmax983/autumn/issues/1927 — omit `--list-unsubscribe`, or target a \
+         Postgres database, to use unsubscribe tracking for now."
+            .to_owned(),
+    )
 }
 
 /// Validate a `--list-unsubscribe` scope. Restricted to a safe identifier-like
@@ -576,27 +608,64 @@ async fn main() {
 "#
     }
 
-    /// `SQLite` foundation (issue #1614 AC #4, finding F12): `generate mailer`
-    /// scaffolds a Postgres-only unsubscribe migration, so it must be rejected
-    /// at generate time on a `SQLite` app, citing the backend-aware follow-up
-    /// (issue #1927) — before any files are written.
+    /// `SQLite` foundation (issue #1614 AC #4, findings F12/F22): only the
+    /// `--list-unsubscribe` path scaffolds the Postgres-only `mail_unsubscribes`
+    /// migration, so ONLY that path is rejected at generate time on a `SQLite`
+    /// app, citing the backend-aware follow-up (issue #1927) — before any files
+    /// are written. The reject message must name `--list-unsubscribe`
+    /// specifically, not mailers wholesale.
     #[test]
-    fn plan_mailer_rejected_on_sqlite_app_citing_1927() {
+    fn plan_mailer_with_list_unsubscribe_rejected_on_sqlite_app_citing_1927() {
         let tmp = project_with_main(default_main());
         fs::write(
             tmp.path().join("autumn.toml"),
             "[database]\nprimary_url = \"sqlite://app.db\"\n",
         )
         .unwrap();
-        let err = plan_mailer(tmp.path(), "Welcome", None, false).unwrap_err();
+        let err = plan_mailer(tmp.path(), "Welcome", Some("newsletter"), false).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("SQLite"), "message must name SQLite: {msg}");
+        assert!(
+            msg.contains("--list-unsubscribe"),
+            "message must name the --list-unsubscribe path specifically: {msg}"
+        );
         assert!(
             msg.contains("issues/1927"),
             "message must cite issue #1927: {msg}"
         );
         // No files written on rejection.
         assert!(!tmp.path().join("src/mailers/welcome.rs").exists());
+    }
+
+    /// Finding F22: a plain `generate mailer` (no `--list-unsubscribe`) emits only
+    /// Rust/template files and enables the `mail` feature — nothing
+    /// SQLite-incompatible — so it must SUCCEED on a `SQLite` app rather than
+    /// being over-rejected by the unsubscribe-migration gate.
+    #[test]
+    fn plan_mailer_without_list_unsubscribe_succeeds_on_sqlite_app() {
+        let tmp = project_with_main(default_main());
+        fs::write(
+            tmp.path().join("autumn.toml"),
+            "[database]\nprimary_url = \"sqlite://app.db\"\n",
+        )
+        .unwrap();
+        let plan = plan_mailer(tmp.path(), "Welcome", None, false)
+            .expect("a plain mailer must scaffold on a SQLite app");
+        // It plans the Rust file and no unsubscribe migration is present.
+        plan.execute(Flags::default()).unwrap();
+        assert!(tmp.path().join("src/mailers/welcome.rs").exists());
+        let has_unsubscribe_migration =
+            fs::read_dir(tmp.path().join("migrations")).is_ok_and(|rd| {
+                rd.filter_map(Result::ok).any(|e| {
+                    e.file_name()
+                        .to_string_lossy()
+                        .contains("mail_unsubscribes")
+                })
+            });
+        assert!(
+            !has_unsubscribe_migration,
+            "a plain mailer must not scaffold the Postgres-only unsubscribe migration"
+        );
     }
 
     /// A Postgres app (the default) is not rejected — `generate mailer` still
@@ -612,9 +681,10 @@ async fn main() {
         assert!(plan_mailer(tmp.path(), "Welcome", None, false).is_ok());
     }
 
-    /// The `SQLite` rejection is generate-only (finding F17): `autumn destroy
+    /// The `SQLite` rejection is generate-only (findings F17/F22): `autumn destroy
     /// mailer` recomputes this same plan with `for_revert` before
-    /// [`Plan::revert`], so it must NOT be rejected on a `SQLite` app — otherwise
+    /// [`Plan::revert`], so even a `--list-unsubscribe` mailer (whose generate
+    /// path IS rejected on `SQLite`) must NOT be rejected when reverting — otherwise
     /// files generated before the gate landed could never be cleaned up.
     #[test]
     fn plan_mailer_ex_for_revert_not_rejected_on_sqlite_app() {
@@ -625,8 +695,9 @@ async fn main() {
         )
         .unwrap();
         assert!(
-            plan_mailer_ex(tmp.path(), "Welcome", None, false, true).is_ok(),
-            "destroy mailer must build its revert plan on a SQLite app"
+            plan_mailer_ex(tmp.path(), "Welcome", Some("newsletter"), false, true).is_ok(),
+            "destroy mailer must build its revert plan on a SQLite app even for the \
+             --list-unsubscribe variant"
         );
     }
 

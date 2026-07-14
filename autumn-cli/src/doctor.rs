@@ -2855,17 +2855,24 @@ fn check_replica_migration_versions(
 /// primary/replica topology, mirroring
 /// [`autumn_web::config::DatabaseConfig::validate`]'s backend-consistency rule.
 ///
-/// `SQLite` is single-writer/single-host: it has no read-replica role and cannot
-/// be mixed with a Postgres role. So a `sqlite://` URL only boots when it is the
-/// lone primary in a single-role config. `validate` rejects a Postgres primary
-/// with a `sqlite://` replica (mixed backends), a `sqlite://` primary paired
-/// with any replica (replicas require postgres), and any backend mismatch
-/// between roles — so `doctor --strict` must not Pass those configs either.
+/// `SQLite` is single-writer/single-host: it has no read-replica role, cannot be
+/// horizontally sharded, and cannot be mixed with a Postgres role. So a
+/// `sqlite://` URL only boots when it is the lone primary in a single-role
+/// config. `validate` (via `validate_backend_consistency`) rejects a Postgres
+/// primary with a `sqlite://` replica (mixed backends), a `sqlite://` primary
+/// paired with any replica (replicas require postgres), a `sqlite://` primary
+/// with any `[[database.shards]]` (shards require postgres), and any backend
+/// mismatch between roles — so `doctor --strict` must not Pass those configs
+/// either.
 ///
-/// Returns `true` only when a `SQLite` primary is safe (no replica configured
-/// and no backend mismatch); a `SQLite` replica is never valid and callers pass
-/// `false` for the replica role unconditionally.
-fn sqlite_primary_target_is_bootable(primary_url: Option<&str>, replica_url: Option<&str>) -> bool {
+/// Returns `true` only when a `SQLite` primary is safe (no replica configured,
+/// no shards configured, and no backend mismatch); a `SQLite` replica is never
+/// valid and callers pass `false` for the replica role unconditionally.
+fn sqlite_primary_target_is_bootable(
+    primary_url: Option<&str>,
+    replica_url: Option<&str>,
+    has_shards: bool,
+) -> bool {
     use autumn_web::config::DatabaseBackend;
     let Some(primary_backend) = primary_url.and_then(DatabaseBackend::detect) else {
         return false;
@@ -2875,8 +2882,10 @@ fn sqlite_primary_target_is_bootable(primary_url: Option<&str>, replica_url: Opt
         return false;
     }
     // A SQLite primary can have no replica (read replicas require postgres) and
-    // no mismatched role — i.e. it must be the single database role.
-    replica_url.is_none()
+    // no shards (database shards require postgres) and no mismatched role —
+    // i.e. it must be the single, unsharded database role. Mirrors
+    // `DatabaseConfig::validate_backend_consistency`.
+    replica_url.is_none() && !has_shards
 }
 
 fn check_db_role_connectivity(
@@ -5947,13 +5956,24 @@ pub fn run(opts: DoctorOptions) {
         )
     }));
 
-    // A `sqlite://` primary only boots as the lone database role; pair it with a
-    // replica (or mix backends) and `DatabaseConfig::validate` rejects it at
-    // boot, so doctor must not Pass it (finding F19). A `sqlite://` replica is
-    // never bootable, so its connectivity check always passes `false`.
+    // A `sqlite://` primary only boots as the lone, unsharded database role; pair
+    // it with a replica, add `[[database.shards]]`, or mix backends and
+    // `DatabaseConfig::validate` rejects it at boot, so doctor must not Pass it
+    // (findings F19/F23). A `sqlite://` replica is never bootable, so its
+    // connectivity check always passes `false`. Shard presence is resolved
+    // through the SAME profile-aware `.env` overlay + merged active-profile table
+    // as the topology, reusing the exact migrate resolver so doctor and the real
+    // migration step agree (a malformed shard entry resolves to `Err`, treated as
+    // "no shards" here — the deploy preflight below surfaces the malformed entry).
+    let db_has_shards = crate::migrate::try_resolve_shard_database_urls_from_sources(
+        |key| db_denv.var(key),
+        Some(&merged_db_toml),
+    )
+    .is_ok_and(|shards| !shards.is_empty());
     let sqlite_primary_bootable = sqlite_primary_target_is_bootable(
         db_topology.primary_url.as_deref(),
         db_topology.replica_url.as_deref(),
+        db_has_shards,
     );
     if let Some(url) = db_topology.primary_url.clone() {
         let primary_for_pending = url.clone();
@@ -13285,31 +13305,75 @@ foo = "bar"
     /// topology — a `sqlite://` primary boots only as the single database role.
     #[test]
     fn sqlite_primary_bootable_only_as_single_role() {
-        // SQLite primary, no replica → bootable (single role).
+        // SQLite primary, no replica, no shards → bootable (single role).
         assert!(sqlite_primary_target_is_bootable(
             Some("sqlite://app.db"),
-            None
+            None,
+            false
         ));
         // SQLite primary + any replica → not bootable (replicas need postgres).
         assert!(!sqlite_primary_target_is_bootable(
             Some("sqlite://app.db"),
-            Some("postgres://db:5432/app")
+            Some("postgres://db:5432/app"),
+            false
         ));
         assert!(!sqlite_primary_target_is_bootable(
             Some("sqlite://app.db"),
-            Some("sqlite://replica.db")
+            Some("sqlite://replica.db"),
+            false
         ));
         // Postgres primary (even with a SQLite replica) is never gated by this
         // SQLite-only helper — the replica's own check handles the mismatch.
         assert!(!sqlite_primary_target_is_bootable(
             Some("postgres://db:5432/app"),
-            Some("sqlite://replica.db")
+            Some("sqlite://replica.db"),
+            false
         ));
         // All-postgres is untouched by the SQLite gate.
         assert!(!sqlite_primary_target_is_bootable(
             Some("postgres://db:5432/app"),
-            Some("postgres://replica:5432/app")
+            Some("postgres://replica:5432/app"),
+            false
         ));
+    }
+
+    /// Finding F23: the bootability rule must also mirror the shard clause of
+    /// `DatabaseConfig::validate_backend_consistency` — a `sqlite://` primary with
+    /// any `[[database.shards]]` is rejected at boot (database shards require the
+    /// postgres backend), so doctor must Fail it rather than skip the Postgres
+    /// probes. A lone `SQLite` primary with no replica and no shards still Passes.
+    #[test]
+    fn sqlite_primary_with_shards_is_not_bootable() {
+        // SQLite primary + shards → not bootable (shards need postgres).
+        assert!(!sqlite_primary_target_is_bootable(
+            Some("sqlite://app.db"),
+            None,
+            true
+        ));
+        // Replica AND shards together are likewise not bootable.
+        assert!(!sqlite_primary_target_is_bootable(
+            Some("sqlite://app.db"),
+            Some("sqlite://replica.db"),
+            true
+        ));
+        // Lone SQLite primary (no replica, no shards) stays bootable.
+        assert!(sqlite_primary_target_is_bootable(
+            Some("sqlite://app.db"),
+            None,
+            false
+        ));
+    }
+
+    /// Finding F23: `check_db_connectivity` must Fail (not Pass) for a `SQLite`
+    /// primary that is not bootable because shards are present, mirroring
+    /// `validate_backend_consistency`. The Fail detail names shards as a
+    /// postgres-only topology so the operator sees why the config cannot boot.
+    #[test]
+    fn sqlite_primary_with_shards_connectivity_fails_and_cites_shards() {
+        let r = check_db_connectivity("sqlite://app.db", false);
+        assert_eq!(r.status, CheckStatus::Fail);
+        let detail = r.detail.unwrap_or_default();
+        assert!(detail.contains("shards"), "detail={detail}");
     }
 
     /// `SQLite` foundation (issue #1614): the pg-client-tools check must not warn
@@ -13383,7 +13447,7 @@ foo = "bar"
              and the pending-migration probe"
         );
         assert!(
-            sqlite_primary_target_is_bootable(topology.primary_url.as_deref(), None),
+            sqlite_primary_target_is_bootable(topology.primary_url.as_deref(), None, false),
             "a lone SQLite primary from the active profile is a bootable single-role target"
         );
     }
@@ -13443,7 +13507,7 @@ foo = "bar"
             "a base-file Postgres app must stay Postgres and run the Postgres checks"
         );
         assert!(
-            !sqlite_primary_target_is_bootable(topology.primary_url.as_deref(), None),
+            !sqlite_primary_target_is_bootable(topology.primary_url.as_deref(), None, false),
             "a Postgres primary is not a SQLite target"
         );
     }
