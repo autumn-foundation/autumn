@@ -9,10 +9,17 @@
 //!   rollout plan as a pure dry-run — it touches nothing remote.
 //! - **`rollback`** prints the rollback plan (also a dry-run in this slice).
 //!
-//! Real remote SSH execution, live cutover/rollback, and the CI end-to-end
-//! harness land in follow-ups. The plan/unit generators here are pure functions
-//! so they can be unit-tested without a server, and the preflight graders are
-//! shared with `autumn doctor`.
+//! - **`up`** performs a REAL first deploy: it runs the same preflight as
+//!   `check` (aborting before touching the server if anything fails), then
+//!   drives an ordered host-prep + first-deploy sequence against an injectable
+//!   executor (the real one shells out to system `ssh`/`scp`). See [`exec`].
+//!
+//! Live zero-downtime cutover, rollback execution, and the CI end-to-end harness
+//! land in follow-up slices. The plan/unit generators here are pure functions so
+//! they can be unit-tested without a server, and the preflight graders are shared
+//! with `autumn doctor`.
+
+pub mod exec;
 
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
@@ -50,6 +57,14 @@ pub enum DeployError {
          `autumn deploy check`"
     )]
     PreflightFailed(usize),
+
+    /// The release binary to upload was not found on disk.
+    #[error("release binary not found at {0} — run `autumn build --embed` first")]
+    BinaryMissing(String),
+
+    /// Remote execution of the first deploy failed.
+    #[error("deploy execution failed: {0}")]
+    Exec(String),
 }
 
 /// Which `autumn deploy` subcommand to run.
@@ -61,6 +76,8 @@ pub enum DeployAction {
     Plan,
     /// Print the rollback plan (dry-run).
     Rollback,
+    /// Run the preflight, then perform a REAL first deploy over SSH.
+    Up,
 }
 
 /// A `[deploy]` section with all defaults resolved to concrete values.
@@ -622,6 +639,7 @@ pub fn run(action: DeployAction) -> Result<(), DeployError> {
             print_rollback(&resolved);
             Ok(())
         }
+        DeployAction::Up => run_up(&config, &resolved),
     }
 }
 
@@ -717,12 +735,11 @@ fn requires_database_pool(config: &AutumnConfig) -> bool {
         || config.scheduler.backend == autumn_web::config::SchedulerBackend::Postgres
 }
 
-fn run_check(config: &AutumnConfig, resolved: &ResolvedDeployConfig) -> Result<(), DeployError> {
-    eprintln!("\u{1F342} autumn deploy check\n");
-
-    let checks = collect_preflight(config, resolved);
+/// Print each preflight check as a pass/fail line and return the failure count.
+/// Shared by `check` and `up` so both surfaces report graders identically.
+fn report_preflight(checks: &[PreflightCheck]) -> usize {
     let mut failed = 0_usize;
-    for check in &checks {
+    for check in checks {
         if check.passed {
             eprintln!("\u{2705} {}: {}", check.name, check.detail);
         } else {
@@ -734,6 +751,14 @@ fn run_check(config: &AutumnConfig, resolved: &ResolvedDeployConfig) -> Result<(
         }
     }
     eprintln!();
+    failed
+}
+
+fn run_check(config: &AutumnConfig, resolved: &ResolvedDeployConfig) -> Result<(), DeployError> {
+    eprintln!("\u{1F342} autumn deploy check\n");
+
+    let checks = collect_preflight(config, resolved);
+    let failed = report_preflight(&checks);
 
     if failed == 0 {
         eprintln!("\u{2705} All {} preflight check(s) passed.", checks.len());
@@ -765,6 +790,105 @@ fn print_rollback(resolved: &ResolvedDeployConfig) {
     for (i, step) in build_rollback_plan(resolved).iter().enumerate() {
         println!("  {}. [{}] {}", i + 1, step.label, step.description);
     }
+}
+
+/// Build the secret env-file body sourced by the systemd unit's
+/// `EnvironmentFile`. Only the values the app needs at runtime (the signing
+/// secret and the writable database URL) are emitted, and the result is wrapped
+/// in [`exec::Secret`] so it is never logged (AC-5).
+fn build_env_file(config: &AutumnConfig) -> exec::Secret {
+    let mut body = String::new();
+    if let Some(secret) = config
+        .security
+        .signing_secret
+        .secret
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        body.push_str("AUTUMN_SECURITY__SIGNING_SECRET=");
+        body.push_str(secret);
+        body.push('\n');
+    }
+    if let Some(url) = resolve_writable_db_url(&config.database) {
+        body.push_str("AUTUMN_DATABASE__URL=");
+        body.push_str(url);
+        body.push('\n');
+    }
+    exec::Secret::new(body)
+}
+
+/// Resolve the local path to the pre-built release binary this deploy uploads.
+///
+/// Slice 1 does NOT rebuild from source — it uploads the standalone binary
+/// produced by `autumn build --embed` at `target/release/{app_name}`, failing
+/// with an actionable error when it is missing.
+fn resolve_release_binary(resolved: &ResolvedDeployConfig) -> Result<PathBuf, DeployError> {
+    let path = PathBuf::from("target")
+        .join("release")
+        .join(&resolved.app_name);
+    if path.exists() {
+        Ok(path)
+    } else {
+        Err(DeployError::BinaryMissing(path.display().to_string()))
+    }
+}
+
+/// Deterministic-per-second release id used to name the timestamped release dir.
+/// Nondeterministic by design in production; tests inject a fixed id instead
+/// through [`exec::first_deploy_ops`].
+fn default_release_id() -> String {
+    chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string()
+}
+
+/// Perform a real FIRST deploy (issue #1607, Slice 1).
+///
+/// Runs the same preflight as `check` and aborts before touching the server if
+/// anything fails (AC-6), then drives the ordered host-prep + first-deploy
+/// sequence against a real [`exec::SshExecutor`].
+///
+/// Scope guard: this is a first-deploy path only. On a redeploy it re-points
+/// `current` at the new release the same way; zero-downtime cutover and rollback
+/// are follow-up slices and are deliberately NOT performed here.
+fn run_up(config: &AutumnConfig, resolved: &ResolvedDeployConfig) -> Result<(), DeployError> {
+    eprintln!("\u{1F342} autumn deploy up (first deploy)\n");
+
+    // Fail fast: run the full preflight and abort BEFORE any remote call.
+    let checks = collect_preflight(config, resolved);
+    let failed = report_preflight(&checks);
+    if failed > 0 {
+        return Err(DeployError::PreflightFailed(failed));
+    }
+
+    // Host presence is guaranteed by the passing ssh_reachability grader above.
+    let target = exec::SshTarget::from_resolved(resolved)
+        .ok_or_else(|| DeployError::Config(DEPLOY_HOST_MISSING_DETAIL.to_owned()))?;
+    let binary = resolve_release_binary(resolved)?;
+    let unit = render_systemd_unit(resolved);
+    let env_file = build_env_file(config);
+    let release_id = default_release_id();
+
+    let ops = exec::first_deploy_ops(
+        resolved,
+        &unit,
+        env_file,
+        &binary,
+        &release_id,
+        config.server.port,
+    );
+    let executor = exec::SshExecutor::new(target);
+
+    eprintln!(
+        "Deploying release {release_id} to {}\u{2026}\n",
+        resolved.host.as_deref().unwrap_or_default()
+    );
+    exec::execute_first_deploy(&checks, &ops, &executor)
+        .map_err(|e| DeployError::Exec(e.to_string()))?;
+
+    eprintln!(
+        "\n\u{2705} First deploy complete. Zero-downtime cutover and rollback land in later slices."
+    );
+    Ok(())
 }
 
 #[cfg(test)]

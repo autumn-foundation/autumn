@@ -529,14 +529,16 @@ enum Commands {
     /// Push-button, zero-downtime deploys to a VPS (issue #1607).
     ///
     /// Run from the project root. `check` runs a local preflight, `plan` and
-    /// `rollback` print dry-run plans. Real remote execution lands in a
-    /// follow-up; configure the target under `[deploy]` in autumn.toml.
+    /// `rollback` print dry-run plans, and `up` performs a real first deploy over
+    /// SSH (cutover/rollback land in follow-ups). Configure the target under
+    /// `[deploy]` in autumn.toml.
     ///
     /// # Examples
     ///
     ///   autumn deploy check
     ///   autumn deploy plan
     ///   autumn deploy rollback
+    ///   autumn deploy up
     #[command(subcommand, verbatim_doc_comment)]
     Deploy(DeployCommands),
 
@@ -1827,6 +1829,14 @@ enum DeployCommands {
     ///
     /// Live rollback lands in a follow-up; this slice prints the plan only.
     Rollback,
+
+    /// Run the preflight, then perform a REAL first deploy over SSH.
+    ///
+    /// Aborts before touching the server if preflight fails, then uploads the
+    /// `autumn build --embed` release binary, writes the (0600) env file and the
+    /// systemd unit, enables the service, and gates on `/ready`. Zero-downtime
+    /// cutover and rollback land in follow-up slices.
+    Up,
 }
 
 /// Subcommands for `autumn generate`.
@@ -3365,6 +3375,7 @@ fn run_deploy_command(cmd: &DeployCommands) {
         DeployCommands::Check => deploy::DeployAction::Check,
         DeployCommands::Plan => deploy::DeployAction::Plan,
         DeployCommands::Rollback => deploy::DeployAction::Rollback,
+        DeployCommands::Up => deploy::DeployAction::Up,
     };
     if let Err(e) = deploy::run(action) {
         eprintln!("autumn deploy: {e}");
