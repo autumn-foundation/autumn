@@ -4746,7 +4746,9 @@ mod tests {
     fn form_for_append_inserts_before_submit() {
         let cs = Changeset::new(blank_form_for_model());
         let html = form_for(&cs, "/posts", "post")
-            .append(maud::html! { input type="password" name="confirm"; })
+            .append(
+                maud::html! { input type="password" name="confirm" aria-label="Confirm password"; },
+            )
             .render()
             .into_string();
         let append_idx = html

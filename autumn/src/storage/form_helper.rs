@@ -58,6 +58,7 @@ pub fn direct_upload_input(name: &str, presign_url: &str, accept: Option<&str>) 
             input
                 type="file"
                 name=(name)
+                aria-label="File upload"
                 data-direct-upload-target="input"
                 accept=[accept] {}
             div
@@ -87,6 +88,7 @@ mod tests {
         assert!(html.contains("data-direct-upload-url=\"/uploads/presign\""));
         assert!(html.contains("name=\"cover_image\""));
         assert!(html.contains("type=\"file\""));
+        assert!(html.contains("aria-label=\"File upload\""));
         assert!(html.contains("accept=\"image/*\""));
         assert!(html.contains("autumn-upload-progress"));
         assert!(
