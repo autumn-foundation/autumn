@@ -626,6 +626,7 @@ pub fn build_deploy_plan(cfg: &ResolvedDeployConfig) -> Vec<DeployStep> {
 
 /// Build the rollback plan, mirroring [`exec::rollback_ops`]'s actual sequence:
 /// restart the previous slot's unit first, flip the proxy upstream back to it,
+/// record the release being rolled back FROM as the new previous-release marker,
 /// repoint `current`, record the live slot, re-probe `/ready`, and finally drain
 /// the slot the rollback flipped traffic away from.
 ///
@@ -648,6 +649,11 @@ pub fn build_rollback_plan(cfg: &ResolvedDeployConfig) -> Vec<DeployStep> {
             "proxy-flip",
             "Flip the reverse-proxy upstream back to the previous release \
              (health-gated on /ready before traffic moves)",
+        ),
+        DeployStep::new(
+            "record-previous",
+            "Record the release being rolled back FROM (its dir + former-live slot) \
+             as the new previous-release marker so a subsequent rollback returns to it",
         ),
         DeployStep::new(
             "repoint",
@@ -951,7 +957,11 @@ fn run_up(config: &AutumnConfig, resolved: &ResolvedDeployConfig) -> Result<(), 
                 &release_id,
                 &plan,
             );
-            let teardown = exec::candidate_teardown_ops(resolved, &release_id, &plan);
+            // First-deploy teardown must also unlink `current` and clear the
+            // live-slot marker that first_deploy_ops creates — otherwise a failed
+            // first deploy leaves them behind and the next `deploy up` wrongly
+            // takes the redeploy path with nothing serving.
+            let teardown = exec::first_deploy_teardown_ops(resolved, &release_id, &plan);
             (ops, teardown, "first deploy".to_owned(), true)
         }
         exec::DeployMode::Redeploy { live_slot } => {
@@ -1223,6 +1233,7 @@ mod tests {
             vec![
                 "restart-previous",
                 "proxy-flip",
+                "record-previous",
                 "repoint",
                 "record-live-slot",
                 "readiness-gate",
@@ -1236,6 +1247,14 @@ mod tests {
         assert!(
             pos("restart-previous") < pos("proxy-flip"),
             "previous unit must be up before the health-gated flip"
+        );
+        assert!(
+            pos("proxy-flip") < pos("record-previous"),
+            "flip must precede recording the previous-release marker"
+        );
+        assert!(
+            pos("record-previous") < pos("repoint"),
+            "the previous-release marker is recorded before `current` moves off it"
         );
         assert!(
             pos("proxy-flip") < pos("repoint"),

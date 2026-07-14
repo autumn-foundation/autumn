@@ -420,6 +420,17 @@ fn live_slot_marker(cfg: &ResolvedDeployConfig) -> String {
     format!("{}/shared/live-slot", cfg.app_dir)
 }
 
+/// Remote marker file recording the PREVIOUS live release — its absolute dir and
+/// the slot it runs on, stored as `{dir}\t{slot}` — so an on-demand rollback
+/// returns to the release `current` pointed at before the last promote, instead
+/// of inferring it from release-dir mtimes (which is wrong after an
+/// A→B→rollback→A→deploy-C history). Written whenever `current` is repointed to a
+/// DIFFERENT release (redeploy cutover and rollback); cleared on a first deploy.
+/// Mirrors [`live_slot_marker`]'s path convention (both live under `shared/`).
+fn previous_release_marker(cfg: &ResolvedDeployConfig) -> String {
+    format!("{}/shared/previous-release", cfg.app_dir)
+}
+
 /// The resolved blue/green slot layout for a deploy.
 ///
 /// The candidate always takes the slot the live release is NOT using, so both
@@ -484,8 +495,9 @@ impl SlotPlan {
 /// 7. `systemctl daemon-reload`,
 /// 8. `systemctl enable --now {service}-blue.service`,
 /// 9. record the live slot marker,
-/// 10. bounded `/ready` poll on the blue loopback port,
-/// 11. route the proxy at `127.0.0.1:{blue_port}`.
+/// 10. clear the previous-release marker (a first deploy has no previous),
+/// 11. bounded `/ready` poll on the blue loopback port,
+/// 12. route the proxy at `127.0.0.1:{blue_port}`.
 #[must_use]
 pub fn first_deploy_ops(
     cfg: &ResolvedDeployConfig,
@@ -550,6 +562,13 @@ pub fn first_deploy_ops(
             format!("systemctl enable --now {unit_name}.service"),
         )),
         DeployOp::Run(record_live_slot(cfg, plan.candidate_slot)),
+        // A first deploy has no previous release: clear any stale previous-release
+        // marker so an on-demand rollback correctly reports NoPreviousRelease
+        // rather than pointing at a since-removed release from a prior lifecycle.
+        DeployOp::Run(RemoteCommand::new(
+            "clear-previous",
+            format!("rm -f {}", shell_quote(&previous_release_marker(cfg))),
+        )),
         DeployOp::Run(RemoteCommand::new(
             "readiness-gate",
             readiness_poll_shell(plan.candidate_port, cfg.readiness_timeout_secs),
@@ -580,10 +599,12 @@ pub fn first_deploy_ops(
 /// 7. run pending migrations BEFORE cutover (`AUTUMN_MIGRATE=1` one-shot),
 /// 8. bounded `/ready` poll on the candidate's separate loopback port,
 /// 9. health-gated proxy flip old→candidate (THE cutover),
-/// 10. promote `current` to the new release,
-/// 11. record the live slot marker,
-/// 12. drain (stop) the old release,
-/// 13. prune old releases beyond `keep_releases`.
+/// 10. record the previous-release marker (the release being replaced: its dir +
+///     live slot), BEFORE `current` moves off it,
+/// 11. promote `current` to the new release,
+/// 12. record the live slot marker,
+/// 13. drain (stop) the old release,
+/// 14. prune old releases beyond `keep_releases`.
 #[must_use]
 pub fn cutover_ops(
     cfg: &ResolvedDeployConfig,
@@ -650,6 +671,11 @@ pub fn cutover_ops(
         // live traffic to it and drains the old target. Only reached after a
         // passing readiness gate (AC-2).
         proxy.flip_op(&cfg.service_name, &loopback_upstream(plan.candidate_port)),
+        // Persist the release being replaced (the current live release: its dir +
+        // live slot) as the new "previous release" so a later rollback returns to
+        // it. Must run BEFORE `link-current` repoints the symlink, since it reads
+        // the pre-repoint `current` target.
+        DeployOp::Run(record_previous_release(cfg, plan.live_slot)),
         DeployOp::Run(RemoteCommand::new(
             "link-current",
             format!(
@@ -700,13 +726,52 @@ pub fn candidate_teardown_ops(
     ]
 }
 
+/// Teardown for a failed FIRST deploy (Slice 3). A first deploy has no previous
+/// release, so on a pre-go-live failure the just-created state must be undone
+/// COMPLETELY — otherwise the next `deploy up` sees the leftover `current`
+/// symlink and live-slot marker that [`first_deploy_ops`] created and wrongly
+/// takes the redeploy path with nothing actually serving.
+///
+/// This is the redeploy [`candidate_teardown_ops`] (stop+disable the candidate
+/// slot unit, remove its release dir) PLUS removal of the markers first-deploy
+/// created: the `current` symlink and the live-slot marker (and the
+/// previous-release marker for good measure — first deploy clears rather than
+/// writes it, but `rm -f` is harmless). Every op is best-effort (`rm -f` never
+/// fails on a missing path) and driven through [`run_teardown`], which swallows
+/// executor errors so a flaky cleanup can never mask the real deploy failure.
+///
+/// This must NOT be used for a redeploy: the redeploy teardown deliberately
+/// leaves the old release's `current`/live-slot markers intact because that old
+/// release is still serving.
+#[must_use]
+pub fn first_deploy_teardown_ops(
+    cfg: &ResolvedDeployConfig,
+    release_id: &str,
+    plan: &SlotPlan,
+) -> Vec<DeployOp> {
+    let mut ops = candidate_teardown_ops(cfg, release_id, plan);
+    ops.push(DeployOp::Run(RemoteCommand::new(
+        "teardown-current-symlink",
+        format!("rm -f {}", shell_quote(&cfg.current_symlink())),
+    )));
+    ops.push(DeployOp::Run(RemoteCommand::new(
+        "teardown-slot-markers",
+        format!(
+            "rm -f {} {}",
+            shell_quote(&live_slot_marker(cfg)),
+            shell_quote(&previous_release_marker(cfg)),
+        ),
+    )));
+    ops
+}
+
 /// The previous release an on-demand rollback repoints to, resolved from the
 /// target by [`resolve_rollback_target`].
 ///
-/// In the blue/green scheme the currently-live release serves on the slot named
-/// by the live-slot marker, so the previous release ran on the OTHER slot (it was
-/// drained, not deleted, as long as pruning kept it). Rolling back therefore
-/// means bringing that slot's unit back up and flipping the proxy to its port.
+/// In the blue/green scheme the previous release ran on the slot recorded in the
+/// previous-release marker (the slot NOT currently live; it was drained, not
+/// deleted, as long as pruning kept it). Rolling back therefore means bringing
+/// that slot's unit back up and flipping the proxy to its port.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RollbackTarget {
     /// Absolute release dir the `current` symlink is repointed at.
@@ -719,13 +784,16 @@ pub struct RollbackTarget {
 
 /// Probe the target to resolve the previous release for an on-demand rollback.
 ///
-/// Reads the `current` symlink's target and the release-dir listing (newest
-/// first) to find the newest release that is NOT the current one — the release
-/// `current` pointed at before the last promote — and reads the live-slot marker
-/// to derive the slot that release runs on (the one not currently live). Returns
-/// [`DeployExecError::NoPreviousRelease`] when the target has only the current
-/// release (or none), so the caller can fail loudly with a non-zero status
-/// instead of destroying the only release.
+/// Reads the explicit **previous-release marker** (`shared/previous-release`),
+/// written whenever `current` was last repointed to a different release (a
+/// redeploy cutover or a prior rollback). The marker stores the previous release's
+/// absolute dir AND the slot it runs on as `{dir}\t{slot}`, so the two are always
+/// consistent — unlike the old mtime scan, which broke after an
+/// A→B→rollback→A→deploy-C history (the mtime-newest non-current dir is B, but the
+/// true prior-live release is A). Returns [`DeployExecError::NoPreviousRelease`]
+/// when the marker is absent or empty (a first deploy clears it, and a deployment
+/// predating this marker simply has none), so the caller fails loudly with a
+/// non-zero status instead of destroying anything.
 ///
 /// # Errors
 ///
@@ -736,21 +804,13 @@ pub fn resolve_rollback_target(
     public_port: u16,
     exec: &impl DeployExecutor,
 ) -> Result<RollbackTarget, DeployExecError> {
-    // Emit `prev:<abs-dir>\t<live-slot>` for the newest non-current release, or
-    // `none` when the current release is the only one. `readlink` yields the
-    // absolute release dir the symlink was pointed at (promote uses an absolute
-    // target), which we compare against each absolute release path.
+    // Emit `prev:<abs-dir>\t<slot>` from the persisted previous-release marker, or
+    // `none` when the marker is absent/empty. Both the dir and the slot come from
+    // the SAME marker line, so they can never disagree.
     let shell = format!(
-        "rel={rel}; cur=$(readlink {current} 2>/dev/null); prev=; \
-         for d in $(cd \"$rel\" 2>/dev/null && ls -1dt */ 2>/dev/null); do \
-         abs=\"$rel/${{d%/}}\"; \
-         if [ \"$abs\" != \"$cur\" ]; then prev=\"$abs\"; break; fi; done; \
-         if [ -z \"$prev\" ]; then printf 'none'; \
-         else printf 'prev:%s\\t%s' \"$prev\" \"$(cat {marker} 2>/dev/null || printf '{blue}')\"; fi",
-        rel = shell_quote(&cfg.releases_dir()),
-        current = shell_quote(&cfg.current_symlink()),
-        marker = shell_quote(&live_slot_marker(cfg)),
-        blue = SLOT_BLUE,
+        "prev=$(cat {marker} 2>/dev/null); \
+         if [ -z \"$prev\" ]; then printf 'none'; else printf 'prev:%s' \"$prev\"; fi",
+        marker = shell_quote(&previous_release_marker(cfg)),
     );
     let out = exec.run(&RemoteCommand::new("resolve-previous", shell))?;
     let stdout = out.stdout.trim();
@@ -762,9 +822,9 @@ pub fn resolve_rollback_target(
     if release_dir.is_empty() {
         return Err(DeployExecError::NoPreviousRelease);
     }
-    let live_slot = canonical_slot(parts.next().unwrap_or(SLOT_BLUE).trim());
-    // The previous release runs on the slot that is NOT currently live.
-    let slot = other_slot(live_slot);
+    // The marker records the previous release's OWN slot directly (dir + slot are
+    // consistent), so no `other_slot` inference is needed.
+    let slot = canonical_slot(parts.next().unwrap_or(SLOT_BLUE).trim());
     Ok(RollbackTarget {
         release_dir,
         slot,
@@ -783,10 +843,13 @@ pub fn resolve_rollback_target(
 /// 1. bring the previous release's slot unit back up (it was drained on the last
 ///    cutover, not deleted),
 /// 2. health-gated proxy flip back to the previous release's loopback port,
-/// 3. repoint `current` at the previous release,
-/// 4. record the live slot marker (now the previous slot),
-/// 5. bounded `/ready` re-probe to confirm the rollback is healthy,
-/// 6. drain (disable) the slot the rollback flipped traffic AWAY from — the slot
+/// 3. record the previous-release marker as the release we roll back FROM (the
+///    current live release: its dir + the former-live slot), BEFORE `current`
+///    moves off it, so a subsequent rollback returns to it,
+/// 4. repoint `current` at the previous release,
+/// 5. record the live slot marker (now the previous slot),
+/// 6. bounded `/ready` re-probe to confirm the rollback is healthy,
+/// 7. drain (disable) the slot the rollback flipped traffic AWAY from — the slot
 ///    that was live before the rollback (`other_slot(target.slot)`).
 ///
 /// Step 6 restores the invariant "only the live slot runs" (symmetric with
@@ -821,6 +884,13 @@ pub fn rollback_ops(
         // Health-gated flip back: the previous unit (brought up above) must pass
         // /ready before the proxy swaps traffic to it.
         proxy.flip_op(&cfg.service_name, &loopback_upstream(target.port)),
+        // Persist the release we are rolling back FROM (the current live release:
+        // its dir + the former-live slot) as the new "previous release", so a
+        // subsequent rollback returns to it. Must run BEFORE `link-current`
+        // repoints the symlink, since it reads the pre-repoint `current` target.
+        // The former-live slot is `other_slot(target.slot)` (the slot traffic just
+        // moved away from).
+        DeployOp::Run(record_previous_release(cfg, other_slot(target.slot))),
         DeployOp::Run(RemoteCommand::new(
             "link-current",
             format!(
@@ -860,6 +930,28 @@ fn record_live_slot(cfg: &ResolvedDeployConfig, slot: &str) -> RemoteCommand {
             "printf '%s' {} > {}",
             shell_quote(slot),
             shell_quote(&live_slot_marker(cfg))
+        ),
+    )
+}
+
+/// Command that records the release being replaced (its absolute dir + the `slot`
+/// it runs on) as the new "previous release", read by a later on-demand rollback's
+/// [`resolve_rollback_target`]. It reads the CURRENT symlink's target — the
+/// release that is live right now, about to be replaced — so it MUST run before
+/// the `link-current` op repoints the symlink. `slot` is the slot that release
+/// runs on (the live slot on a redeploy; the former-live slot on a rollback), so
+/// the marker's dir and slot are always consistent. If `current` is somehow absent
+/// the marker is left untouched (a rollback then degrades to no-previous-release
+/// rather than pointing at a bogus dir).
+fn record_previous_release(cfg: &ResolvedDeployConfig, slot: &str) -> RemoteCommand {
+    RemoteCommand::new(
+        "record-previous",
+        format!(
+            "prev=$(readlink {current} 2>/dev/null); \
+             if [ -n \"$prev\" ]; then printf '%s\\t%s' \"$prev\" {slot} > {marker}; fi",
+            current = shell_quote(&cfg.current_symlink()),
+            slot = shell_quote(slot),
+            marker = shell_quote(&previous_release_marker(cfg)),
         ),
     )
 }
@@ -1522,6 +1614,7 @@ mod tests {
                 "migrate",
                 "readiness-gate",
                 "proxy-flip",
+                "record-previous",
                 "link-current",
                 "record-live-slot",
                 "drain-old",
@@ -1565,6 +1658,22 @@ mod tests {
         let promote = exec.shell_for("link-current").expect("promote ran");
         assert!(promote.contains(RELEASE_DIR) && promote.contains("/srv/autumn/myapp/current"));
 
+        // The previous-release marker records the release being replaced: it reads
+        // the pre-repoint `current` target and writes it + the LIVE (old, blue)
+        // slot to shared/previous-release.
+        let record_prev = exec
+            .shell_for("record-previous")
+            .expect("record-previous ran");
+        assert!(
+            record_prev.contains("readlink '/srv/autumn/myapp/current'")
+                && record_prev.contains("/srv/autumn/myapp/shared/previous-release"),
+            "record-previous reads current and writes the previous-release marker: {record_prev}"
+        );
+        assert!(
+            record_prev.contains("'blue'"),
+            "the replaced release ran on the live (blue) slot: {record_prev}"
+        );
+
         // Ordering invariants: migrate BEFORE the flip; the flip ONLY after a
         // passing readiness gate.
         let labels = exec.run_labels();
@@ -1573,6 +1682,14 @@ mod tests {
         assert!(
             pos("readiness-gate") < pos("proxy-flip"),
             "flip only after a passing readiness gate"
+        );
+        assert!(
+            pos("proxy-flip") < pos("record-previous"),
+            "flip before recording the previous-release marker"
+        );
+        assert!(
+            pos("record-previous") < pos("link-current"),
+            "record the previous-release marker before `current` moves off it"
         );
         assert!(
             pos("proxy-flip") < pos("link-current"),
@@ -1760,12 +1877,13 @@ mod tests {
 
     #[test]
     fn deploy_rollback_produces_exact_ordered_sequence() {
-        // The live release is on green (marker), so the previous release ran on
-        // blue (loopback 3001) — that's what rollback flips back to.
+        // The previous-release marker names release A on the BLUE slot directly
+        // (the marker records the previous release's OWN slot), so rollback flips
+        // back to blue (loopback 3001).
         let cfg = resolved();
         let exec = RecordingExecutor::new().with_stdout(
             "resolve-previous",
-            "prev:/srv/autumn/myapp/releases/20260713T090000Z\tgreen",
+            "prev:/srv/autumn/myapp/releases/20260713T090000Z\tblue",
         );
         let target = resolve_rollback_target(&cfg, 3000, &exec).expect("previous release resolves");
         assert_eq!(target.slot, SLOT_BLUE);
@@ -1779,20 +1897,38 @@ mod tests {
         run_ops(&ops, &exec).expect("recording executor never fails");
 
         // resolve-previous (the probe) precedes the ordered rollback ops: bring the
-        // previous slot back up → health-gated flip to it → promote → mark live →
-        // re-probe /ready.
+        // previous slot back up → health-gated flip to it → record the release we
+        // roll back FROM as the new previous → promote → mark live → re-probe
+        // /ready → drain the former-live slot.
         assert_eq!(
             exec.run_labels(),
             vec![
                 "resolve-previous",
                 "restart-previous",
                 "proxy-flip",
+                "record-previous",
                 "link-current",
                 "record-live-slot",
                 "readiness-gate",
                 "drain-rolled-back-slot",
             ],
             "unexpected rollback sequence"
+        );
+
+        // The previous-release marker now records the release rolled back FROM: it
+        // reads the pre-repoint `current` and writes it + the FORMER-live (green)
+        // slot, so a subsequent rollback returns to it.
+        let record_prev = exec
+            .shell_for("record-previous")
+            .expect("record-previous ran");
+        assert!(
+            record_prev.contains("readlink '/srv/autumn/myapp/current'")
+                && record_prev.contains("/srv/autumn/myapp/shared/previous-release"),
+            "record-previous reads current and writes the previous-release marker: {record_prev}"
+        );
+        assert!(
+            record_prev.contains("'green'"),
+            "the rolled-back-from release ran on the former-live (green) slot: {record_prev}"
         );
 
         // The previous unit is brought up before the flip (the flip is health-
@@ -1825,6 +1961,14 @@ mod tests {
         assert!(
             pos("restart-previous") < pos("proxy-flip"),
             "the previous unit is up before the flip"
+        );
+        assert!(
+            pos("proxy-flip") < pos("record-previous"),
+            "flip before recording the previous-release marker"
+        );
+        assert!(
+            pos("record-previous") < pos("link-current"),
+            "record the previous-release marker before `current` moves off it"
         );
         assert!(
             pos("proxy-flip") < pos("link-current"),
@@ -1860,11 +2004,11 @@ mod tests {
         // and `enable --now` won't restart it, so readiness and the proxy flip would
         // target the rolled-back binary instead of the newly uploaded release.
         let cfg = resolved();
-        // Live slot is blue, so the previous release runs on green → we roll back TO
-        // green and must drain the former-live BLUE slot.
+        // The previous-release marker names the previous release on GREEN (its own
+        // slot) → we roll back TO green and must drain the former-live BLUE slot.
         let exec = RecordingExecutor::new().with_stdout(
             "resolve-previous",
-            "prev:/srv/autumn/myapp/releases/20260713T090000Z\tblue",
+            "prev:/srv/autumn/myapp/releases/20260713T090000Z\tgreen",
         );
         let target = resolve_rollback_target(&cfg, 3000, &exec).expect("previous release resolves");
         assert_eq!(target.slot, SLOT_GREEN, "roll back to the non-live slot");
@@ -1893,6 +2037,57 @@ mod tests {
         assert!(
             pos("readiness-gate") < pos("drain-rolled-back-slot"),
             "drain only after the rolled-back release is confirmed healthy"
+        );
+    }
+
+    #[test]
+    fn resolve_rollback_target_reads_the_marker_not_the_mtime_newest_dir() {
+        // Codex P1: resolution must come from the explicit previous-release MARKER,
+        // not an `ls -1dt` mtime scan. The marker names release A on green; a
+        // newer-mtime release B also exists on the host, but B must be IGNORED —
+        // the probe reads only `shared/previous-release`, so the resolved target is
+        // A (its dir + slot + port), exactly as the marker records.
+        let cfg = resolved();
+        let marker_a = "/srv/autumn/myapp/releases/20260101T000000Z"; // older, but the marker
+        let exec = RecordingExecutor::new()
+            .with_stdout("resolve-previous", format!("prev:{marker_a}\tgreen"));
+        let target =
+            resolve_rollback_target(&cfg, 3000, &exec).expect("marker names a previous release");
+        assert_eq!(target.release_dir, marker_a, "dir comes from the marker");
+        assert_eq!(
+            target.slot, SLOT_GREEN,
+            "slot comes from the SAME marker line"
+        );
+        assert_eq!(
+            target.port,
+            slot_app_port(3000, SLOT_GREEN),
+            "port derives from the marker's slot"
+        );
+        // The probe is a single read of the previous-release marker — no `ls -1dt`
+        // mtime scan and no release-dir listing.
+        let probe = exec.shell_for("resolve-previous").expect("probe ran");
+        assert!(
+            probe.contains("/srv/autumn/myapp/shared/previous-release"),
+            "the probe reads the previous-release marker: {probe}"
+        );
+        assert!(
+            !probe.contains("ls -1dt"),
+            "the mtime scan must be gone: {probe}"
+        );
+    }
+
+    #[test]
+    fn resolve_rollback_target_absent_marker_degrades_to_no_previous() {
+        // A deployment predating this marker (or right after a first deploy, which
+        // clears it) has no previous-release marker: the probe emits `none` and
+        // resolution degrades to NoPreviousRelease — it must not crash.
+        let cfg = resolved();
+        let exec = RecordingExecutor::new().with_stdout("resolve-previous", "none");
+        let err = resolve_rollback_target(&cfg, 3000, &exec)
+            .expect_err("an absent marker must error, not crash");
+        assert!(
+            matches!(err, DeployExecError::NoPreviousRelease),
+            "expected NoPreviousRelease, got {err:?}"
         );
     }
 
@@ -1926,7 +2121,7 @@ mod tests {
         let ops = sample_ops(Secret::new("AUTUMN_SECURITY__SIGNING_SECRET=x\n"));
         let cfg = resolved();
         let plan = SlotPlan::first(3000);
-        let teardown = candidate_teardown_ops(&cfg, RELEASE_ID, &plan);
+        let teardown = first_deploy_teardown_ops(&cfg, RELEASE_ID, &plan);
         let exec = RecordingExecutor::failing_on("readiness-gate");
         let checks = vec![PreflightCheck::pass("ssh_reachability", "ok")];
         let err = execute_first_deploy(&checks, &ops, &teardown, &exec)
@@ -1951,6 +2146,69 @@ mod tests {
         assert!(
             td_unit.contains("disable --now myapp-blue.service"),
             "teardown stops+disables the first-deploy (blue) slot unit: {td_unit}"
+        );
+    }
+
+    #[test]
+    fn first_deploy_teardown_unlinks_current_and_marker() {
+        // Codex P2: a failed FIRST deploy must undo the `current` symlink AND the
+        // live-slot marker that first_deploy_ops created — not just the candidate
+        // unit/dir — otherwise the next `deploy up` sees `-L current` and wrongly
+        // takes the redeploy path with nothing serving.
+        let cfg = resolved();
+        let plan = SlotPlan::first(3000);
+        let teardown = first_deploy_teardown_ops(&cfg, RELEASE_ID, &plan);
+        let labels: Vec<&str> = teardown.iter().map(DeployOp::label).collect();
+        // It is a superset of the candidate teardown, PLUS the marker cleanup.
+        assert_eq!(
+            labels,
+            vec![
+                "teardown-candidate-unit",
+                "teardown-candidate-dir",
+                "teardown-current-symlink",
+                "teardown-slot-markers",
+            ],
+            "first-deploy teardown must also clean current + markers: {labels:?}"
+        );
+
+        // Drive the teardown and inspect the recorded shells.
+        let exec = RecordingExecutor::new();
+        run_teardown(&teardown, &exec);
+        let rm_current = exec
+            .shell_for("teardown-current-symlink")
+            .expect("teardown-current-symlink ran");
+        assert!(
+            rm_current.contains("rm -f '/srv/autumn/myapp/current'"),
+            "teardown unlinks the current symlink: {rm_current}"
+        );
+        let rm_markers = exec
+            .shell_for("teardown-slot-markers")
+            .expect("teardown-slot-markers ran");
+        assert!(
+            rm_markers.contains("/srv/autumn/myapp/shared/live-slot")
+                && rm_markers.contains("/srv/autumn/myapp/shared/previous-release"),
+            "teardown removes the live-slot and previous-release markers: {rm_markers}"
+        );
+    }
+
+    #[test]
+    fn redeploy_teardown_leaves_current_and_markers_intact() {
+        // The REDEPLOY teardown must NOT remove the old release's current/live-slot
+        // markers — the old release is still serving after a candidate rollback.
+        let teardown = sample_teardown_ops();
+        let labels: Vec<&str> = teardown.iter().map(DeployOp::label).collect();
+        assert_eq!(
+            labels,
+            vec!["teardown-candidate-unit", "teardown-candidate-dir"],
+            "redeploy teardown is candidate-only: {labels:?}"
+        );
+        assert!(
+            !labels.contains(&"teardown-current-symlink"),
+            "redeploy teardown must not unlink current: {labels:?}"
+        );
+        assert!(
+            !labels.contains(&"teardown-slot-markers"),
+            "redeploy teardown must not remove the live-slot marker: {labels:?}"
         );
     }
 
@@ -2142,8 +2400,8 @@ mod tests {
         let exec = RecordingExecutor::new();
         let checks = vec![PreflightCheck::pass("ssh_reachability", "reachable")];
         execute_first_deploy(&checks, &ops, &[], &exec).expect("all checks pass → deploy runs");
-        // 2 proxy ops + 9 first-deploy ops + 1 proxy route = 12.
-        assert_eq!(exec.calls().len(), 12, "the full op sequence should run");
+        // 2 proxy ops + 10 first-deploy ops (incl. clear-previous) + 1 proxy route = 13.
+        assert_eq!(exec.calls().len(), 13, "the full op sequence should run");
     }
 
     #[test]
