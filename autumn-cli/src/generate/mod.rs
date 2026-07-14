@@ -94,6 +94,25 @@ fn format_collisions(paths: &[PathBuf]) -> String {
     out
 }
 
+/// The generate-time rejection for Postgres full-text search (`--search` /
+/// `#[searchable]`) on a `SQLite`-backed app (`SQLite` foundation, issue #1614).
+///
+/// Postgres FTS is emitted as a `tsvector` generated column plus a GIN index,
+/// neither of which `SQLite` has. `SQLite`'s own full-text search (FTS5) is a
+/// later slice tracked in issue #1910, so rather than emit Postgres-only DDL
+/// that would break on `SQLite`, generation fails here with an actionable
+/// message (AC #4).
+#[must_use]
+pub fn sqlite_search_unsupported_error() -> GenerateError {
+    GenerateError::Config(
+        "full-text search (--search / #[searchable]) is not yet supported on SQLite apps; \
+         Postgres FTS uses a tsvector generated column and a GIN index, which SQLite lacks. \
+         SQLite FTS5 support is tracked in https://github.com/madmax983/autumn/issues/1910 — \
+         re-run without the search flag, or target a Postgres database."
+            .to_owned(),
+    )
+}
+
 /// Common flags shared by every `generate` subcommand.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Flags {
@@ -165,6 +184,33 @@ const fn ymd_from_days(days_since_epoch: u64) -> (u64, u64, u64) {
 /// Read a file to `String`, returning an empty string if the file does not exist.
 pub fn read_or_empty(path: &Path) -> String {
     std::fs::read_to_string(path).unwrap_or_default()
+}
+
+/// Determine the target app's database backend at generate time (`SQLite`
+/// foundation, issue #1614).
+///
+/// Resolves the primary database URL for `project_root` the same way `autumn
+/// migrate` does — the `AUTUMN_DATABASE__PRIMARY_URL` / `AUTUMN_DATABASE__URL`
+/// / `DATABASE_URL` environment variables take precedence, then
+/// `<project_root>/autumn.toml`'s `[database].primary_url` / `url` — and
+/// classifies it via [`autumn_web::config::DatabaseBackend::detect`].
+///
+/// Defaults to [`DatabaseBackend::Postgres`] when no URL can be resolved or its
+/// shape is unrecognized, preserving today's Postgres-only generator behavior
+/// with no regression. The emitted DDL / diesel schema is then made
+/// backend-aware so no generator output compiles against Postgres but breaks on
+/// `SQLite` (AC #4).
+#[must_use]
+pub fn detect_backend(project_root: &Path) -> autumn_web::config::DatabaseBackend {
+    use autumn_web::config::DatabaseBackend;
+
+    let table = std::fs::read_to_string(project_root.join("autumn.toml"))
+        .ok()
+        .and_then(|s| s.parse::<toml::Table>().ok());
+    crate::migrate::resolve_primary_database_url_from_sources(|k| std::env::var(k), table.as_ref())
+        .as_deref()
+        .and_then(DatabaseBackend::detect)
+        .unwrap_or(DatabaseBackend::Postgres)
 }
 
 #[cfg(test)]

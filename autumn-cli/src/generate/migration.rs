@@ -11,12 +11,12 @@ use super::dsl::parse_fields;
 use super::emit::Plan;
 use super::naming::pascal_to_snake;
 use super::schema_edit::{
-    MigrationShape, add_columns_down_sql, add_columns_up_sql, add_search_down_sql,
+    MigrationShape, add_columns_down_sql, add_columns_up_sql_for, add_search_down_sql,
     add_search_up_sql, detect_migration_shape, encrypt_columns_down_sql, encrypt_columns_up_sql,
-    parse_model_search_config_for_table, remove_columns_down_sql, remove_columns_up_sql,
+    parse_model_search_config_for_table, remove_columns_down_sql_for, remove_columns_up_sql,
     singularize,
 };
-use super::{GenerateError, ensure_project_root};
+use super::{GenerateError, detect_backend, ensure_project_root};
 
 fn collect_rs_files_recursive(dir: &Path, candidates: &mut Vec<std::path::PathBuf>) {
     if let Ok(entries) = std::fs::read_dir(dir) {
@@ -67,6 +67,10 @@ pub fn plan_migration_with_options(
     let mut fields = parse_fields(field_tokens)?;
     super::model::apply_unique_flags(&mut fields, uniques)?;
 
+    // Determine the target app's database backend so the emitted ALTER TABLE
+    // DDL is backend-aware (SQLite foundation, issue #1614).
+    let backend = detect_backend(project_root);
+
     // The directory uses snake_case (`add_title_to_posts`) but the shape is
     // detected from the original PascalCase form because the keywords `To`
     // and `From` only have an unambiguous meaning at PascalCase chunk
@@ -97,7 +101,7 @@ pub fn plan_migration_with_options(
             let existing_schema =
                 std::fs::read_to_string(project_root.join("src/schema.rs")).unwrap_or_default();
             (
-                add_columns_up_sql(table, &fields, &existing_schema),
+                add_columns_up_sql_for(backend, table, &fields, &existing_schema),
                 add_columns_down_sql(table, &fields),
             )
         }
@@ -112,7 +116,7 @@ pub fn plan_migration_with_options(
                 std::fs::read_to_string(project_root.join("src/schema.rs")).unwrap_or_default();
             (
                 remove_columns_up_sql(table, &fields),
-                remove_columns_down_sql(table, &fields, &existing_schema),
+                remove_columns_down_sql_for(backend, table, &fields, &existing_schema),
             )
         }
         MigrationShape::EncryptColumns {
@@ -123,6 +127,12 @@ pub fn plan_migration_with_options(
             encrypt_columns_down_sql(table, columns),
         ),
         MigrationShape::AddSearch { ref table } => {
+            // Postgres FTS (`tsvector` + GIN) has no SQLite equivalent in this
+            // slice; reject at generate time citing #1910 (issue #1614 AC #4)
+            // rather than emit Postgres-only DDL that breaks on SQLite.
+            if backend == autumn_web::config::DatabaseBackend::Sqlite {
+                return Err(super::sqlite_search_unsupported_error());
+            }
             let singular = singularize(table);
 
             // Collect all potential model file candidates in order of preference
@@ -570,6 +580,105 @@ pub struct Post {
         );
         assert!(down.contains("DROP INDEX IF EXISTS idx_posts_search_vector;"));
         assert!(down.contains("ALTER TABLE posts DROP COLUMN IF EXISTS search_vector;"));
+    }
+
+    // ── SQLite backend awareness (issue #1614) ──────────────────────────────
+
+    /// Null the DB-URL environment variables so backend detection reads the
+    /// temp project's `autumn.toml` deterministically.
+    fn with_no_db_env<R>(f: impl FnOnce() -> R) -> R {
+        temp_env::with_vars(
+            [
+                ("AUTUMN_DATABASE__PRIMARY_URL", None::<&str>),
+                ("AUTUMN_DATABASE__URL", None::<&str>),
+                ("DATABASE_URL", None::<&str>),
+            ],
+            f,
+        )
+    }
+
+    fn sqlite_project() -> TempDir {
+        let tmp = project();
+        fs::write(
+            tmp.path().join("autumn.toml"),
+            "[database]\nprimary_url = \"sqlite://app.db\"\n",
+        )
+        .unwrap();
+        tmp
+    }
+
+    /// `AddSearchTo…` on a `SQLite` app is rejected at generate time citing #1910
+    /// (Postgres `tsvector` FTS has no `SQLite` equivalent in this slice, AC #4).
+    #[test]
+    fn add_search_migration_on_sqlite_is_rejected_citing_1910() {
+        with_no_db_env(|| {
+            let tmp = sqlite_project();
+            let err =
+                plan_migration(tmp.path(), "AddSearchToPosts", &[], "20260427000000").unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                matches!(err, GenerateError::Config(_)),
+                "expected Config error, got: {err:?}"
+            );
+            assert!(msg.contains("1910"), "must cite issue #1910: {msg}");
+            assert!(
+                msg.contains("SQLite") && msg.contains("full-text search"),
+                "message must be actionable: {msg}"
+            );
+        });
+    }
+
+    /// `Add…To…` on a `SQLite` app emits `SQLite`-valid column types
+    /// (`i64` -> `INTEGER`, not Postgres `BIGINT`).
+    #[test]
+    fn add_columns_migration_on_sqlite_emits_sqlite_types() {
+        with_no_db_env(|| {
+            let tmp = sqlite_project();
+            let plan = plan_migration(
+                tmp.path(),
+                "AddViewsToPosts",
+                &["views:i64".into()],
+                "20260427000000",
+            )
+            .unwrap();
+            plan.execute(Flags::default()).unwrap();
+            let up = fs::read_to_string(
+                tmp.path()
+                    .join("migrations/20260427000000_add_views_to_posts/up.sql"),
+            )
+            .unwrap();
+            assert!(
+                up.contains("ALTER TABLE posts ADD COLUMN views INTEGER NOT NULL"),
+                "up.sql: {up}"
+            );
+            assert!(!up.contains("BIGINT"), "SQLite up.sql leaked BIGINT: {up}");
+        });
+    }
+
+    /// Regression guard: with no `autumn.toml`, the backend defaults to Postgres
+    /// and `Add…To…` emits the historical Postgres column type.
+    #[test]
+    fn add_columns_migration_defaults_to_postgres_types() {
+        with_no_db_env(|| {
+            let tmp = project();
+            let plan = plan_migration(
+                tmp.path(),
+                "AddViewsToPosts",
+                &["views:i64".into()],
+                "20260427000000",
+            )
+            .unwrap();
+            plan.execute(Flags::default()).unwrap();
+            let up = fs::read_to_string(
+                tmp.path()
+                    .join("migrations/20260427000000_add_views_to_posts/up.sql"),
+            )
+            .unwrap();
+            assert!(
+                up.contains("ALTER TABLE posts ADD COLUMN views BIGINT NOT NULL"),
+                "up.sql: {up}"
+            );
+        });
     }
 
     // ── `plan_migration_destroy_fallback` (issue #1048 PR review) ───────────

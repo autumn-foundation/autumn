@@ -12,6 +12,8 @@ use std::fmt::Write as _;
 
 use sha2::{Digest, Sha256};
 
+use autumn_web::config::DatabaseBackend;
+
 use super::dsl::{Field, FieldConstraints, FieldKind, IdType};
 
 /// Append a `pub mod <name>;` line to a `mod.rs` file, returning the new
@@ -51,14 +53,33 @@ pub fn remove_mod_declaration(existing: &str, name: &str) -> String {
 
 /// Build a new `diesel::table!` block for the given table, emitting the `id`
 /// column with the caller-supplied `id_type`.
+// Retained as a Postgres-default convenience wrapper for the test suite; the
+// backend-aware `schema_table_block_with_id_for` is what production calls.
+#[cfg(test)]
 #[must_use]
 pub fn schema_table_block_with_id(table: &str, fields: &[Field], id_type: IdType) -> String {
+    schema_table_block_with_id_for(DatabaseBackend::Postgres, table, fields, id_type)
+}
+
+/// [`schema_table_block_with_id`] for a specific database `backend` (`SQLite`
+/// foundation, issue #1614). The Postgres path is byte-for-byte identical to
+/// the historical output; the `SQLite` path uses the diesel sql-types that
+/// diesel's `SQLite` backend actually implements (`Text` for `Uuid`/`Jsonb`,
+/// `Binary` for `Bytea`, `Timestamp` for `Timestamptz`, …) via
+/// [`super::dsl::Field::schema_type_for`].
+#[must_use]
+pub fn schema_table_block_with_id_for(
+    backend: DatabaseBackend,
+    table: &str,
+    fields: &[Field],
+    id_type: IdType,
+) -> String {
     let mut out = String::with_capacity(fields.len() * 40 + 128);
     out.push_str("diesel::table! {\n");
     let _ = writeln!(out, "    {table} (id) {{");
-    let _ = writeln!(out, "        id -> {},", id_type.schema_type());
+    let _ = writeln!(out, "        id -> {},", id_type.schema_type_for(backend));
     for f in fields {
-        let _ = writeln!(out, "        {} -> {},", f.name, f.schema_type());
+        let _ = writeln!(out, "        {} -> {},", f.name, f.schema_type_for(backend));
     }
     out.push_str("        created_at -> Timestamp,\n");
     out.push_str("    }\n");
@@ -84,10 +105,23 @@ pub fn append_schema_table_with_id(
     fields: &[Field],
     id_type: IdType,
 ) -> String {
+    append_schema_table_with_id_for(DatabaseBackend::Postgres, existing, table, fields, id_type)
+}
+
+/// [`append_schema_table_with_id`] for a specific database `backend` (issue
+/// #1614). The Postgres path stays byte-for-byte identical.
+#[must_use]
+pub fn append_schema_table_with_id_for(
+    backend: DatabaseBackend,
+    existing: &str,
+    table: &str,
+    fields: &[Field],
+    id_type: IdType,
+) -> String {
     if has_table(existing, table) {
         return existing.to_owned();
     }
-    let block = schema_table_block_with_id(table, fields, id_type);
+    let block = schema_table_block_with_id_for(backend, table, fields, id_type);
     if existing.is_empty() {
         return block;
     }
@@ -225,20 +259,51 @@ pub fn create_table_sql_with_metadata_and_id(
     defaults: &BTreeMap<String, String>,
     id_type: IdType,
 ) -> String {
+    create_table_sql_with_metadata_and_id_for(
+        DatabaseBackend::Postgres,
+        table,
+        fields,
+        indexes,
+        defaults,
+        id_type,
+    )
+}
+
+/// [`create_table_sql_with_metadata_and_id`] for a specific database `backend`
+/// (`SQLite` foundation, issue #1614).
+///
+/// The Postgres path is byte-for-byte identical to the historical output. The
+/// `SQLite` path swaps in `SQLite`-valid column types (via
+/// [`super::dsl::Field::sql_column_type_for`] and
+/// [`super::dsl::IdType::pk_sql_for`]) and the `SQLite` `created_at` default
+/// (`TEXT ... DEFAULT CURRENT_TIMESTAMP` rather than Postgres's `TIMESTAMP ...
+/// DEFAULT NOW()`, which `SQLite` lacks). `CHECK` constraints, `REFERENCES`, and
+/// `CREATE INDEX` are portable and unchanged. Every DSL field kind maps to a
+/// working `SQLite` column type, so nothing is rejected at generate time here
+/// (see [`super::dsl::FieldKind::sqlite_sql_type`]).
+#[must_use]
+pub fn create_table_sql_with_metadata_and_id_for(
+    backend: DatabaseBackend,
+    table: &str,
+    fields: &[Field],
+    indexes: &BTreeSet<String>,
+    defaults: &BTreeMap<String, String>,
+    id_type: IdType,
+) -> String {
     let mut sql = String::with_capacity(fields.len() * 64 + indexes.len() * 96 + 256);
-    if let Some(comment) = id_type.migration_comment() {
+    if let Some(comment) = id_type.migration_comment_for(backend) {
         sql.push_str(comment);
         sql.push('\n');
     }
     let _ = writeln!(sql, "CREATE TABLE {table} (");
-    let _ = write!(sql, "    id {}", id_type.pk_sql());
+    let _ = write!(sql, "    id {}", id_type.pk_sql_for(backend));
     for f in fields {
         sql.push_str(",\n");
         let _ = write!(
             sql,
             "    {} {} {}",
             f.name,
-            f.sql_column_type(),
+            f.sql_column_type_for(backend),
             f.sql_nullability()
         );
         if let Some(target) = f.reference_table() {
@@ -251,7 +316,17 @@ pub fn create_table_sql_with_metadata_and_id(
             let _ = write!(sql, " {check}");
         }
     }
-    sql.push_str(",\n    created_at TIMESTAMP NOT NULL DEFAULT NOW()\n);\n");
+    // Postgres uses `TIMESTAMP ... DEFAULT NOW()`; SQLite has neither a
+    // timestamp type nor `NOW()`, so store ISO-8601 text defaulted to
+    // `CURRENT_TIMESTAMP`.
+    match backend {
+        DatabaseBackend::Postgres => {
+            sql.push_str(",\n    created_at TIMESTAMP NOT NULL DEFAULT NOW()\n);\n");
+        }
+        DatabaseBackend::Sqlite => {
+            sql.push_str(",\n    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP\n);\n");
+        }
+    }
     // Every `references` field gets an index automatically (Rails' `add_reference`
     // behaviour), in addition to any explicit `--index` fields. Merging into the
     // same sorted set keeps `CREATE INDEX` output deterministic and de-duplicates
@@ -529,8 +604,24 @@ fn fields_with_existing_schema_columns(
 /// so a `unique` field's index name can't collide with a plain index on some
 /// other, already-existing column from an earlier migration (issue #1032
 /// review follow-up).
+// Retained as a Postgres-default convenience wrapper for the test suite; the
+// backend-aware `add_columns_up_sql_for` is what production calls.
+#[cfg(test)]
 #[must_use]
 pub fn add_columns_up_sql(table: &str, fields: &[Field], existing_schema: &str) -> String {
+    add_columns_up_sql_for(DatabaseBackend::Postgres, table, fields, existing_schema)
+}
+
+/// [`add_columns_up_sql`] for a specific database `backend` (issue #1614). The
+/// Postgres path stays byte-for-byte identical; the `SQLite` path emits
+/// `SQLite`-valid column types via [`super::dsl::Field::sql_column_type_for`].
+#[must_use]
+pub fn add_columns_up_sql_for(
+    backend: DatabaseBackend,
+    table: &str,
+    fields: &[Field],
+    existing_schema: &str,
+) -> String {
     let collision_fields = fields_with_existing_schema_columns(fields, existing_schema, table);
     let mut out = String::new();
     for f in fields {
@@ -545,7 +636,7 @@ pub fn add_columns_up_sql(table: &str, fields: &[Field], existing_schema: &str) 
             out,
             "ALTER TABLE {table} ADD COLUMN {} {} {}",
             f.name,
-            f.sql_column_type(),
+            f.sql_column_type_for(backend),
             f.sql_nullability()
         );
         if let Some(target) = f.reference_table() {
@@ -777,8 +868,25 @@ pub fn remove_columns_up_sql(table: &str, fields: &[Field]) -> String {
 ///
 /// `existing_schema` is `src/schema.rs`'s current content (or `""` if
 /// unavailable) — see [`add_columns_up_sql`]'s matching doc comment for why.
+// Retained as a Postgres-default convenience wrapper for the test suite; the
+// backend-aware `remove_columns_down_sql_for` is what production calls.
+#[cfg(test)]
 #[must_use]
 pub fn remove_columns_down_sql(table: &str, fields: &[Field], existing_schema: &str) -> String {
+    remove_columns_down_sql_for(DatabaseBackend::Postgres, table, fields, existing_schema)
+}
+
+/// [`remove_columns_down_sql`] for a specific database `backend` (issue #1614).
+/// The Postgres path stays byte-for-byte identical; the `SQLite` path restores
+/// the dropped column with a `SQLite`-valid type via
+/// [`super::dsl::Field::sql_column_type_for`].
+#[must_use]
+pub fn remove_columns_down_sql_for(
+    backend: DatabaseBackend,
+    table: &str,
+    fields: &[Field],
+    existing_schema: &str,
+) -> String {
     let collision_fields = fields_with_existing_schema_columns(fields, existing_schema, table);
     let mut out = String::new();
     for f in fields.iter().rev() {
@@ -786,7 +894,7 @@ pub fn remove_columns_down_sql(table: &str, fields: &[Field], existing_schema: &
             out,
             "ALTER TABLE {table} ADD COLUMN {} {} {}",
             f.name,
-            f.sql_column_type(),
+            f.sql_column_type_for(backend),
             f.sql_nullability()
         );
         if let Some(target) = f.reference_table() {

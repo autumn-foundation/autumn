@@ -2385,6 +2385,24 @@ fn check_pg_client_tools_with(tools: &crate::db::backup::PgTools) -> CheckResult
     check_pg_client_tools_impl(&missing)
 }
 
+/// `SQLite`-target variant of the pg-client-tools check (`SQLite` foundation,
+/// issue #1614). `pg_dump`/`pg_restore` are Postgres-only, so their absence is
+/// not a problem for a `SQLite` app — warning about them would be misleading.
+/// `SQLite` backup/restore is not yet wired (tracked in #1909), so this is an
+/// honest informational Pass rather than a claim that backups work today.
+fn check_pg_client_tools_sqlite() -> CheckResult {
+    CheckResult {
+        name: "pg_client_tools",
+        status: CheckStatus::Pass,
+        detail: Some(
+            "SQLite app: PostgreSQL client tools (pg_dump/pg_restore) are not required".into(),
+        ),
+        hint: Some(
+            "SQLite backup/restore is tracked in https://github.com/madmax983/autumn/issues/1909",
+        ),
+    }
+}
+
 /// Read the `rust-version` MSRV from the nearest workspace/package `Cargo.toml`.
 fn read_msrv() -> Option<String> {
     let content = std::fs::read_to_string("Cargo.toml").ok()?;
@@ -2838,6 +2856,23 @@ fn check_db_role_connectivity(
     database_url: &str,
     reachable: impl Fn(&str, u16) -> bool,
 ) -> CheckResult {
+    // A `sqlite://` target is a valid backend (SQLite foundation, issue #1614):
+    // it names a local file, not a host:port service, so TCP reachability and
+    // the "switch to postgres://" hint simply don't apply. The SQLite runtime
+    // pool itself is deferred to #1905; doctor only confirms the target here
+    // and must not mislead a SQLite app into thinking its URL is malformed.
+    if autumn_web::config::DatabaseBackend::detect(database_url)
+        == Some(autumn_web::config::DatabaseBackend::Sqlite)
+    {
+        return CheckResult {
+            name: "db_connectivity",
+            status: CheckStatus::Pass,
+            detail: Some(format!(
+                "{role} database is a local SQLite target (no host:port to reach)"
+            )),
+            hint: None,
+        };
+    }
     match parse_db_host_port(database_url) {
         None => CheckResult {
             name: "db_connectivity",
@@ -5857,8 +5892,20 @@ pub fn run(opts: DoctorOptions) {
         tasks.push(Box::new(check_tailwind_binary));
     }
 
-    // 7b. PostgreSQL client tools behind `autumn db backup` / `db restore`.
-    tasks.push(Box::new(check_pg_client_tools));
+    // 7b. PostgreSQL client tools behind `autumn db backup` / `db restore`. On
+    // a SQLite app (issue #1614) these Postgres-only tools don't apply, so a
+    // missing `pg_dump`/`pg_restore` is not a problem — SQLite backup/restore
+    // is tracked in #1909; don't emit a misleading Postgres-only warning.
+    if db_topology
+        .primary_url
+        .as_deref()
+        .and_then(autumn_web::config::DatabaseBackend::detect)
+        == Some(autumn_web::config::DatabaseBackend::Sqlite)
+    {
+        tasks.push(Box::new(check_pg_client_tools_sqlite));
+    } else {
+        tasks.push(Box::new(check_pg_client_tools));
+    }
 
     // 8. Signing-secret readiness (warn in dev, fail in prod when missing/weak)
     tasks.push(Box::new(move || {
@@ -13059,6 +13106,43 @@ foo = "bar"
         assert!(detail.contains("db:5432"));
         assert!(!detail.contains("user"));
         assert!(!detail.contains("secret"));
+    }
+
+    /// `SQLite` foundation (issue #1614): a `sqlite://` target is valid, so the
+    /// connectivity check must Pass and never nudge the user to "use
+    /// postgres://" nor Fail on an unreachable host (there is no host).
+    #[test]
+    fn db_connectivity_sqlite_target_passes_without_postgres_hint() {
+        for url in ["sqlite://app.db", "sqlite:data/app.db", "file:app.db"] {
+            let result = check_db_role_connectivity("primary", url, |_, _| {
+                panic!("SQLite target must not attempt TCP reachability")
+            });
+            assert_eq!(result.status, CheckStatus::Pass, "url={url}");
+            let detail = result.detail.unwrap_or_default();
+            assert!(detail.contains("SQLite"), "detail={detail}");
+            assert!(
+                result.hint.is_none(),
+                "SQLite target must not emit a postgres:// hint (url={url})"
+            );
+        }
+    }
+
+    /// A Postgres target keeps the historical behavior — the `SQLite`
+    /// short-circuit must not swallow a real connectivity failure.
+    #[test]
+    fn db_connectivity_postgres_target_still_evaluated() {
+        let result = check_db_role_connectivity("primary", "postgres://db:5432/app", |_, _| false);
+        assert_eq!(result.status, CheckStatus::Fail);
+    }
+
+    /// `SQLite` foundation (issue #1614): the pg-client-tools check must not warn
+    /// about missing `pg_dump`/`pg_restore` on a `SQLite` app; it Passes and
+    /// points at #1909 (`SQLite` backup/restore is not yet wired).
+    #[test]
+    fn pg_client_tools_sqlite_variant_passes_and_cites_1909() {
+        let r = check_pg_client_tools_sqlite();
+        assert_eq!(r.status, CheckStatus::Pass);
+        assert!(r.hint.unwrap_or_default().contains("1909"));
     }
 
     fn temp_tailwind_path(temp: &tempfile::TempDir) -> std::path::PathBuf {

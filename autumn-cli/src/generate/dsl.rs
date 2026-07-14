@@ -4,6 +4,8 @@
 //! `published:Option<bool>` into a structured [`Field`] that knows both its
 //! Rust type (for the `#[model]` struct) and its SQL type (for the migration).
 
+use autumn_web::config::DatabaseBackend;
+
 use super::GenerateError;
 use super::naming;
 
@@ -123,6 +125,42 @@ impl Field {
         match self.kind {
             FieldKind::Decimal { precision, scale } => format!("NUMERIC({precision},{scale})"),
             _ => self.sql_type().to_owned(),
+        }
+    }
+
+    /// The `CREATE TABLE`/`ADD COLUMN` column type for the target `backend`
+    /// (issue #1614). Identical to [`Field::sql_column_type`] for Postgres.
+    /// On `SQLite`, `Decimal` maps to `TEXT` (see [`FieldKind::sqlite_sql_type`])
+    /// — its `precision`/`scale` are not carried into the column type because
+    /// `SQLite` has no fixed-precision `NUMERIC`; the exact value round-trips
+    /// through `rust_decimal`'s text representation instead.
+    #[must_use]
+    pub fn sql_column_type_for(&self, backend: DatabaseBackend) -> String {
+        match (backend, self.kind) {
+            // Postgres decimals keep the exact `NUMERIC(precision,scale)`
+            // rendering (byte-for-byte identical to the historical output).
+            (DatabaseBackend::Postgres, FieldKind::Decimal { .. }) => self.sql_column_type(),
+            // Every other case is the plain per-backend column type. On SQLite
+            // `Decimal` collapses to `TEXT` (see `FieldKind::sqlite_sql_type`)
+            // with no `(p,s)` suffix, since SQLite has no fixed-precision NUMERIC.
+            _ => self.kind.sql_type_for(backend).to_owned(),
+        }
+    }
+
+    /// The Diesel `schema.rs` type token for the target `backend` (issue
+    /// #1614), including any `Nullable<…>` wrapping. Identical to
+    /// [`Field::schema_type`] for Postgres.
+    #[must_use]
+    pub fn schema_type_for(&self, backend: DatabaseBackend) -> String {
+        // Postgres stays byte-for-byte identical to `schema_type`.
+        if backend == DatabaseBackend::Postgres {
+            return self.schema_type();
+        }
+        let inner = self.kind.schema_type_for(backend);
+        if self.nullable {
+            format!("Nullable<{inner}>")
+        } else {
+            inner.to_string()
         }
     }
 
@@ -321,6 +359,93 @@ impl FieldKind {
         }
     }
 
+    /// `SQLite` column type, without `NOT NULL` / `NULL` (`SQLite` foundation,
+    /// issue #1614). `SQLite`'s storage classes are few and forgiving, so every
+    /// DSL kind maps to a working column type — nothing is rejected at
+    /// generate time on this axis (see [`FieldKind::sql_type_for`]). Notable
+    /// differences from the Postgres mapping:
+    ///
+    /// - `bool` -> `INTEGER` (`SQLite` has no boolean type; `0`/`1`).
+    /// - `f32`/`f64` -> `REAL` (`SQLite` `REAL` is always 8-byte double).
+    /// - `Uuid` -> `TEXT` (no native `uuid`; stored as its canonical string).
+    /// - `NaiveDateTime`/`DateTime` -> `TEXT` (ISO-8601 / RFC 3339 string;
+    ///   `SQLite` has no dedicated timestamp type and its date functions operate
+    ///   on ISO-8601 text).
+    /// - `Bytea` -> `BLOB`.
+    /// - `Attachment` -> `TEXT` (the `Blob` metadata JSON, stored as text
+    ///   rather than Postgres `JSONB`).
+    /// - `Decimal` -> `TEXT` (`SQLite` `NUMERIC` affinity coerces to REAL/INTEGER
+    ///   and would lose exactness; `rust_decimal` round-trips losslessly through
+    ///   text).
+    #[must_use]
+    #[allow(
+        clippy::match_same_arms,
+        reason = "every FieldKind is listed explicitly to document the complete SQLite \
+                  column mapping (AC #4), even where several kinds share a storage type"
+    )]
+    pub const fn sqlite_sql_type(self) -> &'static str {
+        match self {
+            Self::String | Self::Text | Self::Enum => "TEXT",
+            Self::I32 | Self::I64 | Self::References | Self::Bool => "INTEGER",
+            Self::F32 | Self::F64 => "REAL",
+            Self::Uuid => "TEXT",
+            Self::NaiveDateTime | Self::DateTime => "TEXT",
+            Self::Bytea => "BLOB",
+            Self::Attachment => "TEXT",
+            Self::Decimal { .. } => "TEXT",
+        }
+    }
+
+    /// The SQL column type for the target `backend` (issue #1614). Postgres
+    /// keeps [`FieldKind::sql_type`] byte-for-byte; `SQLite` uses
+    /// [`FieldKind::sqlite_sql_type`].
+    #[must_use]
+    pub const fn sql_type_for(self, backend: DatabaseBackend) -> &'static str {
+        match backend {
+            DatabaseBackend::Postgres => self.sql_type(),
+            DatabaseBackend::Sqlite => self.sqlite_sql_type(),
+        }
+    }
+
+    /// Diesel `table!` schema type token for a `SQLite` target (issue #1614).
+    ///
+    /// The Postgres-only diesel sql-types (`Timestamptz`, `Jsonb`, `Uuid`,
+    /// `Bytea`, `Numeric`) are not implemented for diesel's `SQLite` backend, so
+    /// they are remapped to types `SQLite` does support: `Uuid`/`Attachment`/
+    /// `Decimal` -> `Text`, `DateTime` -> `Timestamp`, `Bytea` -> `Binary`.
+    #[must_use]
+    #[allow(
+        clippy::match_same_arms,
+        reason = "every FieldKind is listed explicitly to document the complete SQLite \
+                  diesel-type mapping (AC #4), even where several kinds share a type"
+    )]
+    pub const fn sqlite_schema_type(self) -> &'static str {
+        match self {
+            Self::String | Self::Text | Self::Enum => "Text",
+            Self::I32 => "Int4",
+            Self::I64 | Self::References => "Int8",
+            Self::Bool => "Bool",
+            Self::F32 => "Float4",
+            Self::F64 => "Float8",
+            Self::Uuid => "Text",
+            Self::NaiveDateTime | Self::DateTime => "Timestamp",
+            Self::Bytea => "Binary",
+            Self::Attachment => "Text",
+            Self::Decimal { .. } => "Text",
+        }
+    }
+
+    /// The diesel `table!` schema type token for the target `backend`
+    /// (issue #1614). Postgres keeps [`FieldKind::schema_type`] byte-for-byte;
+    /// `SQLite` uses [`FieldKind::sqlite_schema_type`].
+    #[must_use]
+    pub const fn schema_type_for(self, backend: DatabaseBackend) -> &'static str {
+        match backend {
+            DatabaseBackend::Postgres => self.schema_type(),
+            DatabaseBackend::Sqlite => self.sqlite_schema_type(),
+        }
+    }
+
     /// Returns `true` for field kinds that represent file attachments (blobs).
     ///
     /// Used by the scaffold generator to detect fields that need multipart
@@ -393,8 +518,51 @@ impl IdType {
         }
     }
 
+    /// The primary-key SQL fragment for the target `backend` (issue #1614).
+    /// Postgres keeps [`IdType::pk_sql`] byte-for-byte. On `SQLite`:
+    ///
+    /// - `BigSerial` -> `INTEGER PRIMARY KEY AUTOINCREMENT` — an alias of the
+    ///   `rowid` that never reuses a freed value (`SQLite` has no `BIGSERIAL`).
+    /// - `Uuid` -> `TEXT PRIMARY KEY` — `SQLite` has no `uuid` type nor a
+    ///   `gen_random_uuid()` default, so the application supplies the id.
+    #[must_use]
+    pub const fn pk_sql_for(self, backend: DatabaseBackend) -> &'static str {
+        match backend {
+            DatabaseBackend::Postgres => self.pk_sql(),
+            DatabaseBackend::Sqlite => match self {
+                Self::BigSerial => "INTEGER PRIMARY KEY AUTOINCREMENT",
+                Self::Uuid => "TEXT PRIMARY KEY",
+            },
+        }
+    }
+
+    /// Diesel `table!` schema type token for the primary key on the target
+    /// `backend` (issue #1614). Postgres keeps [`IdType::schema_type`]; `SQLite`
+    /// remaps `Uuid` (unsupported by diesel's `SQLite` backend) to `Text`.
+    #[must_use]
+    pub const fn schema_type_for(self, backend: DatabaseBackend) -> &'static str {
+        match backend {
+            DatabaseBackend::Postgres => self.schema_type(),
+            DatabaseBackend::Sqlite => match self {
+                Self::BigSerial => "Int8",
+                Self::Uuid => "Text",
+            },
+        }
+    }
+
     /// An optional migration comment documenting trade-offs. Only `Uuid`
     /// returns `Some`, pointing developers toward the `UUIDv7` upgrade path.
+    #[must_use]
+    pub const fn migration_comment_for(self, backend: DatabaseBackend) -> Option<&'static str> {
+        match backend {
+            // The comment documents the Postgres-only `gen_random_uuid()` /
+            // `uuid_generate_v7()` upgrade path, which does not apply to a
+            // SQLite target (no such functions; the app supplies the id).
+            DatabaseBackend::Postgres => self.migration_comment(),
+            DatabaseBackend::Sqlite => None,
+        }
+    }
+
     #[must_use]
     pub const fn migration_comment(self) -> Option<&'static str> {
         match self {
@@ -1301,6 +1469,146 @@ mod tests {
         let f = parse_field("created_at:DateTime").unwrap();
         assert_eq!(f.rust_type(), "chrono::DateTime<chrono::Utc>");
         assert_eq!(f.schema_type(), "Timestamptz");
+    }
+
+    // ── SQLite backend-aware column mapping (issue #1614) ──────────────
+
+    /// The complete `SQLite` column-type mapping for every scalar `FieldKind`.
+    /// AC #4: every kind maps to a working `SQLite` type — none is rejected.
+    #[test]
+    fn sqlite_sql_type_covers_every_kind() {
+        let cases = [
+            ("title:String", "TEXT"),
+            ("body:Text", "TEXT"),
+            ("count:i32", "INTEGER"),
+            ("big:i64", "INTEGER"),
+            ("flag:bool", "INTEGER"),
+            ("ratio:f32", "REAL"),
+            ("amount:f64", "REAL"),
+            ("token:Uuid", "TEXT"),
+            ("naive:NaiveDateTime", "TEXT"),
+            ("at:DateTime", "TEXT"),
+            ("data:Bytea", "BLOB"),
+            ("cover:Attachment", "TEXT"),
+            ("post:references", "INTEGER"),
+        ];
+        for (token, expected) in cases {
+            let f = parse_field(token).unwrap();
+            assert_eq!(
+                f.sql_column_type_for(DatabaseBackend::Sqlite),
+                expected,
+                "SQLite column type for `{token}`"
+            );
+            // Postgres path must stay byte-for-byte identical to the legacy output.
+            assert_eq!(
+                f.sql_column_type_for(DatabaseBackend::Postgres),
+                f.sql_column_type(),
+                "Postgres column type for `{token}` must be unchanged"
+            );
+        }
+    }
+
+    #[test]
+    fn sqlite_enum_and_decimal_map_to_text() {
+        let e = parse_field("status:enum{draft,published}").unwrap();
+        assert_eq!(e.sql_column_type_for(DatabaseBackend::Sqlite), "TEXT");
+        assert_eq!(e.sql_column_type_for(DatabaseBackend::Postgres), "TEXT");
+
+        // Decimal collapses to TEXT on SQLite (no fixed-precision NUMERIC),
+        // while Postgres keeps the exact `NUMERIC(precision,scale)` rendering.
+        let d = parse_field("price:decimal{10,2}").unwrap();
+        assert_eq!(d.sql_column_type_for(DatabaseBackend::Sqlite), "TEXT");
+        assert_eq!(
+            d.sql_column_type_for(DatabaseBackend::Postgres),
+            "NUMERIC(10,2)"
+        );
+    }
+
+    /// The diesel `schema.rs` types on the `SQLite` path must be types diesel's
+    /// `SQLite` backend implements — never `Timestamptz`, `Jsonb`, `Uuid`,
+    /// `Bytea`, or `Numeric`.
+    #[test]
+    fn sqlite_schema_type_avoids_postgres_only_diesel_types() {
+        let cases = [
+            ("at:DateTime", "Timestamp"),
+            ("token:Uuid", "Text"),
+            // `Attachment` fields are auto-nullable, so `Field::schema_type_for`
+            // wraps the SQLite `Text` inner type in `Nullable<…>`.
+            ("cover:Attachment", "Nullable<Text>"),
+            ("data:Bytea", "Binary"),
+            ("price:decimal{10,2}", "Text"),
+            ("big:i64", "Int8"),
+            ("flag:bool", "Bool"),
+        ];
+        for (token, expected) in cases {
+            let f = parse_field(token).unwrap();
+            assert_eq!(
+                f.schema_type_for(DatabaseBackend::Sqlite),
+                expected,
+                "SQLite schema type for `{token}`"
+            );
+        }
+        // Nullable wrapping is preserved on the SQLite path.
+        let opt = parse_field("token:Option<Uuid>").unwrap();
+        assert_eq!(
+            opt.schema_type_for(DatabaseBackend::Sqlite),
+            "Nullable<Text>"
+        );
+        // No SQLite schema type may be a Postgres-only diesel type.
+        for token in [
+            "at:DateTime",
+            "token:Uuid",
+            "cover:Attachment",
+            "data:Bytea",
+        ] {
+            let ty = parse_field(token)
+                .unwrap()
+                .schema_type_for(DatabaseBackend::Sqlite);
+            assert!(
+                !["Timestamptz", "Jsonb", "Uuid", "Bytea", "Numeric"].contains(&ty.as_str()),
+                "`{token}` -> `{ty}` must not be a Postgres-only diesel type on SQLite"
+            );
+        }
+    }
+
+    #[test]
+    fn sqlite_primary_key_mapping() {
+        assert_eq!(
+            IdType::BigSerial.pk_sql_for(DatabaseBackend::Sqlite),
+            "INTEGER PRIMARY KEY AUTOINCREMENT"
+        );
+        assert_eq!(
+            IdType::Uuid.pk_sql_for(DatabaseBackend::Sqlite),
+            "TEXT PRIMARY KEY"
+        );
+        // Postgres primary keys stay byte-for-byte identical.
+        assert_eq!(
+            IdType::BigSerial.pk_sql_for(DatabaseBackend::Postgres),
+            IdType::BigSerial.pk_sql()
+        );
+        assert_eq!(
+            IdType::Uuid.pk_sql_for(DatabaseBackend::Postgres),
+            IdType::Uuid.pk_sql()
+        );
+        // The UUIDv7 migration comment is Postgres-only guidance.
+        assert!(
+            IdType::Uuid
+                .migration_comment_for(DatabaseBackend::Postgres)
+                .is_some()
+        );
+        assert!(
+            IdType::Uuid
+                .migration_comment_for(DatabaseBackend::Sqlite)
+                .is_none()
+        );
+        assert_eq!(
+            IdType::BigSerial.schema_type_for(DatabaseBackend::Sqlite),
+            "Int8"
+        );
+        assert_eq!(
+            IdType::Uuid.schema_type_for(DatabaseBackend::Sqlite),
+            "Text"
+        );
     }
 
     #[test]

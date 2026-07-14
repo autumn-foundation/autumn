@@ -8,10 +8,10 @@ use super::dsl::{Field, FieldConstraints, FieldKind, IdType, parse_fields};
 use super::emit::Plan;
 use super::naming::{pascal, pluralize, snake};
 use super::schema_edit::{
-    add_mod_declaration, add_search_down_sql, add_search_up_sql, append_schema_table_with_id,
-    create_table_sql_with_metadata_and_id, drop_table_sql, link_models_into_seed_bin,
+    add_mod_declaration, add_search_down_sql, add_search_up_sql, append_schema_table_with_id_for,
+    create_table_sql_with_metadata_and_id_for, drop_table_sql, link_models_into_seed_bin,
 };
-use super::{GenerateError, ensure_project_root, read_or_empty};
+use super::{GenerateError, detect_backend, ensure_project_root, read_or_empty};
 
 /// Optional metadata applied to generated model fields.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -145,6 +145,15 @@ pub fn plan_model_with_options(
     validate_enum_field_collisions(&pascal_name, &fields)?;
     let metadata = parse_model_metadata(&fields, options)?;
 
+    // Determine the target app's database backend so the emitted DDL / diesel
+    // schema is backend-aware (SQLite foundation, issue #1614). Postgres FTS
+    // (`--searchable`) has no SQLite equivalent in this slice, so reject it at
+    // generate time rather than emit `tsvector` DDL that breaks on SQLite.
+    let backend = detect_backend(project_root);
+    if backend == autumn_web::config::DatabaseBackend::Sqlite && !metadata.searchable().is_empty() {
+        return Err(super::sqlite_search_unsupported_error());
+    }
+
     let snake_name = snake(name);
     let table = pluralize(&snake_name);
 
@@ -195,7 +204,8 @@ pub fn plan_model_with_options(
     // (b) Diesel migration
     let migration_dir_name = format!("{timestamp}_create_{table}");
     let migration_dir = project_root.join("migrations").join(&migration_dir_name);
-    let table_sql = create_table_sql_with_metadata_and_id(
+    let table_sql = create_table_sql_with_metadata_and_id_for(
+        backend,
         &table,
         &schema_fields,
         metadata.indexes(),
@@ -237,12 +247,24 @@ pub fn plan_model_with_options(
     let schema_existing = read_or_empty(&schema_path);
     plan.modify(
         schema_path.clone(),
-        append_schema_table_with_id(&schema_existing, &table, &schema_fields, options.id_type),
+        append_schema_table_with_id_for(
+            backend,
+            &schema_existing,
+            &table,
+            &schema_fields,
+            options.id_type,
+        ),
     );
     plan.push_revert(crate::generate::emit::Revert::SchemaTable {
         path: schema_path,
         table: table.clone(),
-        expected_block: append_schema_table_with_id("", &table, &schema_fields, options.id_type),
+        expected_block: append_schema_table_with_id_for(
+            backend,
+            "",
+            &table,
+            &schema_fields,
+            options.id_type,
+        ),
     });
 
     // (d) `Cargo.toml` deps — `#[autumn_web::model]` expands to references
@@ -2652,6 +2674,166 @@ mod tests {
         );
     }
 
+    // ── SQLite backend awareness (issue #1614) ─────────────────────────
+
+    /// Null the database-URL environment variables so backend detection reads
+    /// the temp project's `autumn.toml` deterministically (a stray real
+    /// `DATABASE_URL` in the dev/CI environment would otherwise win).
+    fn with_no_db_env<R>(f: impl FnOnce() -> R) -> R {
+        temp_env::with_vars(
+            [
+                ("AUTUMN_DATABASE__PRIMARY_URL", None::<&str>),
+                ("AUTUMN_DATABASE__URL", None::<&str>),
+                ("DATABASE_URL", None::<&str>),
+            ],
+            f,
+        )
+    }
+
+    fn project_with_db_url(url: &str) -> TempDir {
+        let tmp = project();
+        fs::write(
+            tmp.path().join("autumn.toml"),
+            format!("[database]\nprimary_url = \"{url}\"\n"),
+        )
+        .unwrap();
+        tmp
+    }
+
+    /// A `sqlite://` app emits `SQLite`-valid `CREATE TABLE` DDL and diesel schema
+    /// types — no Postgres-only output that would break on `SQLite` (AC #4).
+    #[test]
+    fn sqlite_app_emits_sqlite_migration_ddl() {
+        with_no_db_env(|| {
+            let tmp = project_with_db_url("sqlite://app.db");
+            let plan = plan_model(
+                tmp.path(),
+                "Post",
+                &[
+                    "title:String".into(),
+                    "views:i64".into(),
+                    "at:DateTime".into(),
+                    "cover:Attachment".into(),
+                ],
+                "20260427000000",
+            )
+            .unwrap();
+            plan.execute(Flags::default()).unwrap();
+
+            let up = fs::read_to_string(
+                tmp.path()
+                    .join("migrations/20260427000000_create_posts/up.sql"),
+            )
+            .unwrap();
+            assert!(
+                up.contains("id INTEGER PRIMARY KEY AUTOINCREMENT"),
+                "up.sql: {up}"
+            );
+            assert!(up.contains("title TEXT NOT NULL"), "up.sql: {up}");
+            assert!(up.contains("views INTEGER NOT NULL"), "up.sql: {up}");
+            assert!(up.contains("at TEXT NOT NULL"), "up.sql: {up}");
+            assert!(up.contains("cover TEXT"), "up.sql: {up}");
+            assert!(
+                up.contains("created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP"),
+                "up.sql: {up}"
+            );
+            // No Postgres-only DDL may leak into a SQLite migration.
+            for leak in ["BIGSERIAL", "TIMESTAMPTZ", "NOW()", "JSONB", "BIGINT"] {
+                assert!(!up.contains(leak), "SQLite up.sql leaked `{leak}`: {up}");
+            }
+
+            let schema = fs::read_to_string(tmp.path().join("src/schema.rs")).unwrap();
+            assert!(schema.contains("at -> Timestamp,"), "schema: {schema}");
+            for leak in ["Timestamptz", "Jsonb"] {
+                assert!(
+                    !schema.contains(leak),
+                    "SQLite schema.rs leaked `{leak}`: {schema}"
+                );
+            }
+        });
+    }
+
+    /// Regression guard: a `postgres://` app and an app with no `autumn.toml`
+    /// (backend defaults to Postgres) must both produce the historical,
+    /// byte-for-byte-identical Postgres output.
+    #[test]
+    fn postgres_app_generation_is_unchanged_regression_guard() {
+        with_no_db_env(|| {
+            let fields = &[
+                "title:String".into(),
+                "views:i64".into(),
+                "at:DateTime".into(),
+            ];
+
+            let pg = project_with_db_url("postgres://localhost/app");
+            plan_model(pg.path(), "Post", fields, "20260427000000")
+                .unwrap()
+                .execute(Flags::default())
+                .unwrap();
+            let pg_up = fs::read_to_string(
+                pg.path()
+                    .join("migrations/20260427000000_create_posts/up.sql"),
+            )
+            .unwrap();
+
+            let none = project();
+            plan_model(none.path(), "Post", fields, "20260427000000")
+                .unwrap()
+                .execute(Flags::default())
+                .unwrap();
+            let none_up = fs::read_to_string(
+                none.path()
+                    .join("migrations/20260427000000_create_posts/up.sql"),
+            )
+            .unwrap();
+
+            assert_eq!(
+                pg_up, none_up,
+                "explicit postgres:// and default (no autumn.toml) must be byte-identical"
+            );
+            assert!(
+                pg_up.contains("id BIGSERIAL PRIMARY KEY"),
+                "up.sql: {pg_up}"
+            );
+            assert!(pg_up.contains("views BIGINT NOT NULL"), "up.sql: {pg_up}");
+            assert!(pg_up.contains("at TIMESTAMPTZ NOT NULL"), "up.sql: {pg_up}");
+            assert!(
+                pg_up.contains("created_at TIMESTAMP NOT NULL DEFAULT NOW()"),
+                "up.sql: {pg_up}"
+            );
+        });
+    }
+
+    /// Postgres FTS on a `SQLite` app is rejected at generate time citing #1910
+    /// rather than emitting `tsvector` DDL that `SQLite` cannot run (AC #4).
+    #[test]
+    fn searchable_on_sqlite_app_is_rejected_citing_1910() {
+        with_no_db_env(|| {
+            let tmp = project_with_db_url("sqlite://app.db");
+            let err = plan_model_with_options(
+                tmp.path(),
+                "Post",
+                &["title:String".into(), "body:Text".into()],
+                "20260427000000",
+                &ModelOptions {
+                    searchable: vec!["title".into(), "body".into()],
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                matches!(err, GenerateError::Config(_)),
+                "expected Config error, got: {err:?}"
+            );
+            assert!(msg.contains("1910"), "must cite issue #1910: {msg}");
+            assert!(
+                msg.contains("SQLite") && msg.contains("full-text search"),
+                "message must be actionable: {msg}"
+            );
+        });
+    }
+
     /// Issue #1319: the repository macro's `search_page` is hardcoded to an
     /// `i64`/`BigInt` primary key (`SearchId { id: i64 }`, `Vec<i64>`,
     /// `id.eq_any(&ids)`, `HashMap<i64, _>`), so pairing `--searchable` with a
@@ -2684,7 +2866,7 @@ mod tests {
     }
 
     /// Issue #1319: a model field named `search_vector` collides with the
-    /// generated tsvector column the FTS migration adds, so pairing it with
+    /// generated `tsvector` column the FTS migration adds, so pairing it with
     /// `--searchable` is rejected up front. (Field names parse as lowercase
     /// `snake_case`, so the guard's `eq_ignore_ascii_case` is defensive; the
     /// reachable case is a lowercase `search_vector` field.)

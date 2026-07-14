@@ -1061,7 +1061,7 @@ fn build_pool(
         return Err(PoolError::UnsupportedBackend(format!(
             "SQLite is a recognized database backend but its runtime pool is not yet \
              available in this build of autumn-web; follow \
-             https://github.com/madmax983/autumn/issues/1614 for status (target: {url:?})"
+             https://github.com/madmax983/autumn/issues/1905 for status (target: {url:?})"
         )));
     }
 
