@@ -1,8 +1,9 @@
 //! Content-negotiated success responder.
 //!
 //! One handler can serve HTML to browsers and JSON to API clients from a
-//! single source of truth. Declare the [`Negotiate`] extractor, then hand it a
-//! Maud closure and a serializable value via [`Negotiate::respond`]:
+//! single source of truth. Declare the [`Negotiate`](crate::negotiate::Negotiate)
+//! extractor, then hand it a Maud closure and a serializable value via
+//! [`Negotiate::respond`](crate::negotiate::Negotiate::respond):
 //!
 //! ```rust,ignore
 //! use autumn_web::prelude::*;
@@ -18,7 +19,7 @@
 //! ```
 //!
 //! The client's `Accept` header decides the representation, reusing the crate's
-//! one canonical `Accept` parser ([`accept_qualities`]) and resolving over
+//! one canonical `Accept` parser (`accept_qualities`) and resolving over
 //! *effective* q-values that honour the `*/*` wildcard per RFC 7231 content
 //! negotiation.
 //!
@@ -64,8 +65,10 @@
 //!
 //! When the client expresses no concrete preference — a missing/empty `Accept`,
 //! a bare `*/*`, or a wildcard-only tie where neither side is named directly —
-//! the default is [`Format::Html`] (browser-first); override it with
-//! [`Negotiate::default_format`]. Responses carry `Vary: Accept` so shared
+//! the default is [`Format::Html`](crate::negotiate::Format::Html)
+//! (browser-first); override it with
+//! [`Negotiate::default_format`](crate::negotiate::Negotiate::default_format).
+//! Responses carry `Vary: Accept` so shared
 //! caches key the two representations separately — including the `406` arm.
 
 use std::convert::Infallible;
@@ -109,7 +112,7 @@ impl Negotiate {
 
     /// The resolved representation, chosen by *effective* q-value.
     ///
-    /// A convenience view over [`Negotiate::resolve`] that collapses the
+    /// A convenience view over `Negotiate::resolve` that collapses the
     /// not-acceptable case onto the configured `default`: it answers the
     /// question "which representation would be served if one *must* be" and so
     /// cannot express a `406`. Prefer [`Negotiate::respond`] for the full
@@ -283,7 +286,7 @@ where
 /// The response produced by [`Negotiate::respond`].
 ///
 /// Renders the HTML closure or serializes the JSON value depending on the
-/// negotiated [`Resolution`], answers `406 Not Acceptable` when the client
+/// negotiated `Resolution`, answers `406 Not Acceptable` when the client
 /// forbade every producible representation, and always appends `Vary: Accept`.
 pub struct Negotiated<F, J> {
     resolution: Resolution,

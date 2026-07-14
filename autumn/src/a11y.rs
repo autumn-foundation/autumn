@@ -11,23 +11,28 @@
 //! obligation** rather than a convention. Each one maps to a WCAG 2.1 success
 //! criterion and is constructed so that the inaccessible form does not compile:
 //!
-//! - [`Img`] — WCAG 1.1.1 Non-text Content. The alt text is a mandatory
-//!   positional argument of [`Img::new`]; there is no alt-less constructor.
-//!   Decorative images opt in explicitly with [`Img::decorative`].
-//! - [`Button`] — WCAG 4.1.2 Name, Role, Value. The accessible name is a
-//!   required argument; an icon-only button routes it to `aria-label` via
-//!   [`Button::icon`].
-//! - [`Link`] — WCAG 2.4.4 Link Purpose (In Context) / 4.1.2 Name, Role, Value.
-//!   The link text is a required argument of [`Link::new`]; an icon-only link
-//!   routes its name to `aria-label` via [`Link::icon`]. There is no text-less
-//!   constructor.
-//! - [`MenuItem`] — WCAG 4.1.2 Name, Role, Value. A menu item carries an
-//!   explicit `role="menuitem"` and a required accessible name from
-//!   [`MenuItem::new`]; an icon-only item routes that name to `aria-label`.
-//! - [`TextField`] — WCAG 1.3.1 Info and Relationships / 3.3.2 Labels or
-//!   Instructions / 4.1.2 Name, Role, Value. A [`TextField<NoLabel>`] has no
+//! - [`Img`](crate::a11y::Img) — WCAG 1.1.1 Non-text Content. The alt text is a
+//!   mandatory positional argument of [`Img::new`](crate::a11y::Img::new); there
+//!   is no alt-less constructor. Decorative images opt in explicitly with
+//!   [`Img::decorative`](crate::a11y::Img::decorative).
+//! - [`Button`](crate::a11y::Button) — WCAG 4.1.2 Name, Role, Value. The
+//!   accessible name is a required argument; an icon-only button routes it to
+//!   `aria-label` via [`Button::icon`](crate::a11y::Button::icon).
+//! - [`Link`](crate::a11y::Link) — WCAG 2.4.4 Link Purpose (In Context) / 4.1.2
+//!   Name, Role, Value. The link text is a required argument of
+//!   [`Link::new`](crate::a11y::Link::new); an icon-only link routes its name to
+//!   `aria-label` via [`Link::icon`](crate::a11y::Link::icon). There is no
+//!   text-less constructor.
+//! - [`MenuItem`](crate::a11y::MenuItem) — WCAG 4.1.2 Name, Role, Value. A menu
+//!   item carries an explicit `role="menuitem"` and a required accessible name
+//!   from [`MenuItem::new`](crate::a11y::MenuItem::new); an icon-only item routes
+//!   that name to `aria-label`.
+//! - [`TextField`](crate::a11y::TextField) — WCAG 1.3.1 Info and Relationships /
+//!   3.3.2 Labels or Instructions / 4.1.2 Name, Role, Value. A
+//!   [`TextField`](crate::a11y::TextField)`<NoLabel>` has no
 //!   way to render; only after a label is attached (producing a
-//!   [`TextField<Labeled>`]) does the type implement [`maud::Render`]. An
+//!   [`TextField`](crate::a11y::TextField)`<Labeled>`) does the type implement
+//!   [`maud::Render`]. An
 //!   unlabeled field is therefore unrepresentable as markup. The field can
 //!   still carry presentational and validation attributes — `class`,
 //!   `aria-invalid`/`aria-describedby` error wiring, and the HTML5 constraints
