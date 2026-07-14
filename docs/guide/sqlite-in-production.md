@@ -26,10 +26,18 @@ guide is the published contract for exactly which is which.
 > **Status.** The SQLite production tier lands in slices under issue #1614.
 > Postgres remains the default for `autumn new`; SQLite is an opt-in target. The
 > **Status** column in the matrix below reflects the rollout — a row marked
-> *planned* names the slice that delivers it. The boot-refuse guarantees
-> (the "fails fast" rows) are part of the contract from the first
-> SQLite-enabled release, so an unsupported configuration never boots into a
-> surprise at first query.
+> *planned* names the slice that delivers it and is **not available in this
+> build**. The boot-refuse guarantees (the "fails fast" rows) are part of the
+> contract from the first SQLite-enabled release, so an unsupported
+> configuration never boots into a surprise at first query.
+>
+> **This release is the foundation slice.** As of this release, configuring a
+> `sqlite://` target is recognized and validated, but the runtime refuses SQLite
+> at boot with an actionable error (`db.rs` `build_pool` → `UnsupportedBackend`,
+> #1905) — **a SQLite app does not yet boot, migrate, or serve.** This guide is
+> the published support contract for the rollout; rows are marked by the slice
+> that delivers them. What ships *today* is listed under
+> [What ships in this slice](#what-ships-in-this-slice).
 
 ---
 
@@ -91,7 +99,12 @@ not a rewrite.
 
 ## Support matrix
 
-Every framework capability falls into exactly one of three buckets on SQLite:
+The **SQLite** glyph below is the *eventual* single-host contract for each
+capability; the **Status** column tells you which slice delivers it and
+therefore whether it is available **today**. A row whose Status reads
+**Planned** is not in this build — the runtime refuses SQLite at boot (#1905)
+until that slice lands. Every capability falls into one of three eventual
+buckets on SQLite:
 
 - ✅ **Works** — same behavior as Postgres (the mechanism may differ; the
   contract does not).
@@ -102,30 +115,68 @@ Every framework capability falls into exactly one of three buckets on SQLite:
   actionable message, never at first query. This is a genuinely distributed
   feature that has no single-host meaning.
 
-| Capability | Postgres | SQLite | Mechanism / behavior on SQLite | Status |
+| Capability | Postgres | SQLite (eventual) | Mechanism / behavior on SQLite | Status (today) |
 | --- | :---: | :---: | --- | --- |
-| Core models / CRUD / repositories | ✅ | ✅ | Same repository API and query path. | #1614 core |
-| Embedded migrations + `autumn migrate` up/down | ✅ | ✅ | Same embedded migrations run on SQLite. | #1614 core |
-| `autumn migrate check` (production-safety classifier) | ✅ | ✅ | Same classifier; SQLite-specific rewrites classified. | #1614 core |
-| Migration serialization (concurrent boot) | ✅ `pg_advisory_lock` | ⚠️ | Single-host `BEGIN IMMEDIATE` reservation instead of a cluster advisory lock — safe because only one host applies. | #1614 core |
-| Sessions + auth (DB-backed) | ✅ | ✅ | Session/auth tables live in SQLite; no external store. | #1614 core |
-| Durable `#[job]` background jobs | ✅ `FOR UPDATE SKIP LOCKED` | ✅ | Single-writer claim on the jobs table — durable and restart-safe, **no Redis required**. | #1614 core |
-| `#[scheduled]` tasks | ✅ advisory-lock leader election | ⚠️ | Single host is always the leader; every tick fires locally (no election needed). | #1614 core |
-| Distributed lock (`autumn_web::lock`) | ✅ `pg_advisory_lock` | ⚠️ / ⛔ | Single-host mutual exclusion within the process; a multi-replica configuration is refused at boot. | #1614 core |
-| Feature-flag / experiment cache invalidation | ✅ `LISTEN/NOTIFY` | ⚠️ | In-process invalidation only (single host has nothing to notify). | #1614 core |
-| `autumn db backup` / `restore` | ✅ `pg_dump`/`pg_restore` | ✅ | Online-safe snapshot of the data file (safe against a live app). | #1595 |
-| `autumn db scrub` | ✅ | ✅ | Runs against the SQLite file. | #1602 |
-| Retention sweeps | ✅ | ✅ | Runs against the SQLite file. | #1605 |
-| `autumn deploy` data-file persistence | ✅ | ✅ | SQLite data file treated as **persistent state**; deploy/rollback never clobbers it. | #1607 |
-| Read replicas (`replica_url`) | ✅ | ⛔ | **Boot-refuse.** No networked replicas on a single-file DB — out of scope. | contract |
-| Sharding / shard directory | ✅ | ⛔ | **Boot-refuse.** Native sharding is Postgres-only. | contract |
-| Postgres FTS scaffold (`--search`, `tsvector`) | ✅ | ⛔ | **Rejected at generate time.** `tsvector` has no SQLite equivalent; FTS5 is a later slice. | contract |
-| Streaming replication (Litestream-style) | n/a | ⛔ | Out of scope; snapshot backup is the durability story. | contract |
-| Multi-writer / networked SQLite (LiteFS, rqlite) | n/a | ⛔ | Out of scope; single-host, single-writer only. | contract |
+| Core models / CRUD / repositories | ✅ | ✅ | Same repository API and query path once the runtime pool lands. | ⛔ **Planned — runtime #1905** (fails fast at boot today) |
+| Embedded migrations + `autumn migrate` up/down | ✅ | ✅ | Same embedded migrations, run on SQLite by the deferred migration subsystem. | ⛔ **Planned — migrations #1906** (fails fast at boot today) |
+| `autumn migrate check` (production-safety classifier) | ✅ | ✅ | Same classifier; SQLite-specific rewrites classified. | ⛔ **Planned — migrations #1906** |
+| Migration serialization (concurrent boot) | ✅ `pg_advisory_lock` | ⚠️ | Single-host `BEGIN IMMEDIATE` reservation instead of a cluster advisory lock — safe because only one host applies. | ⛔ **Planned — migrations #1906** |
+| Sessions + auth (DB-backed) | ✅ | ✅ | Session/auth tables live in SQLite; no external store. | ⛔ **Planned — #1908** (fails fast at boot today) |
+| Durable `#[job]` background jobs | ✅ `FOR UPDATE SKIP LOCKED` | ✅ | Single-writer claim on the jobs table — durable and restart-safe, **no Redis required**. | ⛔ **Planned — #1907** (fails fast at boot today) |
+| `#[scheduled]` tasks | ✅ advisory-lock leader election | ⚠️ | Single host is always the leader; every tick fires locally (no election needed). | ⛔ **Planned — #1907** (fails fast at boot today) |
+| Distributed lock (`autumn_web::lock`) | ✅ `pg_advisory_lock` | ⚠️ / ⛔ | Single-host mutual exclusion within the process; a multi-replica configuration is refused at boot. | ⛔ **Planned — runtime #1905** (multi-replica boot-refuse ships now; single-host lock needs the runtime) |
+| Feature-flag / experiment cache invalidation | ✅ `LISTEN/NOTIFY` | ⚠️ | In-process invalidation only (single host has nothing to notify). | ⛔ **Planned — runtime #1905** |
+| `autumn db backup` / `restore` | ✅ `pg_dump`/`pg_restore` | ✅ | Online-safe snapshot of the data file (safe against a live app). Backup tooling is still `pg_dump`/`pg_restore`-shaped today. | ⛔ **Planned — #1909** (fails fast at boot today) |
+| `autumn db scrub` | ✅ | ✅ | Runs against the SQLite file. | ⛔ **Planned — #1909** |
+| Retention sweeps | ✅ | ✅ | Runs against the SQLite file. | ⛔ **Planned — #1909** |
+| `autumn deploy` data-file persistence | ✅ | ✅ | SQLite data file treated as **persistent state**; deploy/rollback never clobbers it. | ⛔ **Planned — #1909** |
+| Read replicas (`replica_url`) | ✅ | ⛔ | **Boot-refuse.** No networked replicas on a single-file DB — out of scope. | ✅ **Available now — boot-refuse** |
+| Sharding / shard directory | ✅ | ⛔ | **Boot-refuse.** Native sharding is Postgres-only. | ✅ **Available now — boot-refuse** |
+| Postgres FTS scaffold (`--search`, `tsvector`) | ✅ | ⛔ | **Rejected at generate time.** `tsvector` has no SQLite equivalent; FTS5 is a later slice (#1910). | ✅ **Available now — reject at generate** |
+| Streaming replication (Litestream-style) | n/a | ⛔ | Out of scope; snapshot backup is the durability story. | Contract (out of scope) |
+| Multi-writer / networked SQLite (LiteFS, rqlite) | n/a | ⛔ | Out of scope; single-host, single-writer only. | Contract (out of scope) |
+
+---
+
+## What ships in this slice
+
+This foundation slice (part of #1614) delivers **config detection, boot-time
+validation, the backend-aware generator, `autumn doctor` awareness, and this
+published support contract** — **not** the runtime. Available **today**:
+
+- **`sqlite://` / file-path config recognition + boot-time validation** — a
+  `sqlite://` (or file-path) target is recognized and validated, and
+  Postgres-only settings (read replicas, shard directory, Postgres-only
+  job/scheduler backends, multi-replica locks) are **refused at boot** with an
+  actionable message rather than silently at first query.
+- **Backend-aware DDL generator** — `autumn generate` emits SQLite column types
+  for the supported field kinds (see
+  [field-type support](#sqlite-field-type-support)).
+- **Generate-time rejections**, each naming its tracking issue:
+  - `Uuid` / `Decimal` / `Attachment` / `DateTime<Utc>` / `Enum` field kinds —
+    #1924.
+  - `--id uuid` primary keys — #1905.
+  - `--search` / FTS scaffold — #1910.
+  - `ADD COLUMN NOT NULL` without a default (on both the add and rollback re-add
+    paths).
+  - `DROP INDEX` emitted before `DROP COLUMN` on the rollback path.
+  - `generate auth` / `generate mailer` on a SQLite app — #1927.
+- **Backend-aware scaffold smoke tests** — the scaffold generators are exercised
+  against a SQLite target.
+- **`autumn doctor` SQLite awareness** — a SQLite app is no longer nagged about a
+  missing `pg_dump` or a non-`postgres://` URL.
+
+Everything in the support matrix marked **Planned** is *not* in this slice: the
+runtime refuses SQLite at boot (`db.rs` `build_pool` → `UnsupportedBackend`,
+#1905) until each row's tracking issue lands.
 
 ---
 
 ## How the degrades behave
+
+> These describe the **eventual** single-host behavior once the runtime slice
+> (#1905) lands. Today the runtime refuses SQLite at boot, so none of these
+> paths run yet.
 
 Each ⚠️ row above works on a single host. Here is the exact behavior, so you can
 reason about it rather than guess.
@@ -212,7 +263,7 @@ time on SQLite.
 | `Decimal` | ⛔ | — | **Rejected at generate time — #1924.** Same reason. |
 | `Attachment` / `Blob` | ⛔ | — | **Rejected at generate time — #1924.** Same reason. |
 
-Two additional generator shapes are refused on SQLite:
+Additional generator shapes are refused on SQLite:
 
 - **`--id uuid` primary keys** are rejected at generate time — the SQLite primary
   key is `INTEGER PRIMARY KEY AUTOINCREMENT`, and a UUID primary key has no
@@ -220,6 +271,18 @@ Two additional generator shapes are refused on SQLite:
 - **`--search` / FTS scaffold** is rejected at generate time — Postgres FTS uses a
   `tsvector` generated column and a GIN index, which SQLite lacks. SQLite FTS5 is
   a later slice. Tracked in #1910.
+- **`generate auth` / `generate mailer`** are rejected on a SQLite app at
+  generate time — their scaffolds emit Postgres-shaped models and store code with
+  no working SQLite mapping yet, so they are refused before any files are written
+  rather than emitted as output that breaks on SQLite. Tracked in #1927.
+
+> **Scaffold `--unique`-violation smoke test.** The generated-scaffold smoke test
+> that asserts a duplicate-`unique` rejection is still **Postgres-shaped** — it
+> uses `TRUNCATE … RESTART IDENTITY` and runs only under `cargo test -- --ignored`
+> (it is `#[ignore]`d), so it is not part of the SQLite generate path yet. The
+> backend-aware scaffold smoke tests that ship in this slice cover the SQLite
+> generate path; making the unique-violation smoke test backend-aware is tracked
+> in #1927.
 
 ### Migration mechanics on SQLite
 
