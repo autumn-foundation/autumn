@@ -1,13 +1,13 @@
-//! `autumn workflow check` / `autumn workflow diagram` — a build-time
-//! soundness gate and lifecycle-diagram generator for `#[workflow]` state
+//! `autumn lifecycle check` / `autumn lifecycle diagram` — a build-time
+//! soundness gate and lifecycle-diagram generator for `#[lifecycle]` state
 //! machines (issue #1675).
 //!
-//! The `#[workflow]` proc-macro in `autumn-macros` already proves, *at compile
+//! The `#[lifecycle]` proc-macro in `autumn-macros` already proves, *at compile
 //! time*, that every declared `initial`/`terminal`/transition endpoint is a real
 //! enum variant and that only declared edges are callable. What the type system
 //! cannot see is the *shape* of the reachability graph the declared edges form.
 //! This pass closes that gap with three structural checks over the declared
-//! states and transitions of every `#[workflow]` enum in a project's source:
+//! states and transitions of every `#[lifecycle]` enum in a project's source:
 //!
 //! - **existence** — `initial`, each terminal, and every transition endpoint
 //!   must be a declared variant. (Redundant with the macro's by-construction
@@ -20,17 +20,18 @@
 //!
 //! Like `autumn a11y verify` and `autumn i18n check`, this is a source scanner:
 //! it parses each `.rs` file with `syn` and inspects enums carrying a
-//! `#[workflow(...)]` attribute. It does **not** depend on the proc-macro crate;
+//! `#[lifecycle(...)]` attribute. It does **not** depend on the proc-macro crate;
 //! the attribute grammar is re-parsed here with a standalone `syn` parser that
 //! mirrors the macro's grammar exactly (`initial = <Ident>`,
 //! `terminal(<Ident>, ...)`, `transitions(<From> -> <To>, ...)`).
 //!
-//! `workflow check` prints a human-readable report (or `--format json`) and
-//! exits non-zero when any workflow is unsound — the CI gate. `workflow diagram`
-//! emits a lifecycle diagram per workflow in Graphviz DOT or Mermaid
+//! `lifecycle check` prints a human-readable report (or `--format json`) and
+//! exits non-zero when any lifecycle is unsound — the CI gate. `lifecycle diagram`
+//! emits a lifecycle diagram per lifecycle in Graphviz DOT or Mermaid
 //! `stateDiagram-v2` form, highlighting the initial and terminal states.
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
@@ -38,7 +39,7 @@ use syn::parse::{Parse, ParseStream};
 use syn::punctuated::Punctuated;
 use syn::{Ident, Token};
 
-/// Output format for `autumn workflow check`.
+/// Output format for `autumn lifecycle check`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputFormat {
     /// Human-readable text (default).
@@ -47,7 +48,7 @@ pub enum OutputFormat {
     Json,
 }
 
-/// Diagram rendering format for `autumn workflow diagram`.
+/// Diagram rendering format for `autumn lifecycle diagram`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiagramFormat {
     /// Graphviz DOT (`digraph`).
@@ -56,7 +57,7 @@ pub enum DiagramFormat {
     Mermaid,
 }
 
-// ── Attribute grammar parser (mirrors autumn-macros/src/workflow.rs) ─────────
+// ── Attribute grammar parser (mirrors autumn-macros/src/lifecycle.rs) ─────────
 
 /// A single `From -> To` transition edge from the `transitions(...)` list.
 struct Transition {
@@ -69,19 +70,19 @@ impl Parse for Transition {
         let from: Ident = input.parse()?;
         input.parse::<Token![->]>()?;
         let to: Ident = input.parse()?;
-        Ok(Transition { from, to })
+        Ok(Self { from, to })
     }
 }
 
-/// Parsed `#[workflow(...)]` arguments. The grammar (and its error messages)
+/// Parsed `#[lifecycle(...)]` arguments. The grammar (and its error messages)
 /// intentionally match the proc-macro so the CLI accepts exactly what compiles.
-struct WorkflowArgs {
+struct LifecycleArgs {
     initial: Ident,
     terminals: Vec<Ident>,
     transitions: Vec<Transition>,
 }
 
-impl Parse for WorkflowArgs {
+impl Parse for LifecycleArgs {
     fn parse(input: ParseStream) -> syn::Result<Self> {
         let mut initial: Option<Ident> = None;
         let mut terminals: Option<Vec<Ident>> = None;
@@ -133,7 +134,7 @@ impl Parse for WorkflowArgs {
                     return Err(syn::Error::new_spanned(
                         &key,
                         format!(
-                            "unknown `#[workflow]` argument `{other}` — expected `initial`, `terminal`, or `transitions`"
+                            "unknown `#[lifecycle]` argument `{other}` — expected `initial`, `terminal`, or `transitions`"
                         ),
                     ));
                 }
@@ -146,23 +147,23 @@ impl Parse for WorkflowArgs {
         let initial = initial.ok_or_else(|| {
             syn::Error::new(
                 proc_macro2::Span::call_site(),
-                "missing required `initial = <Variant>` in `#[workflow(...)]`",
+                "missing required `initial = <Variant>` in `#[lifecycle(...)]`",
             )
         })?;
         let terminals = terminals.ok_or_else(|| {
             syn::Error::new(
                 proc_macro2::Span::call_site(),
-                "missing required `terminal(<Variant>, ...)` in `#[workflow(...)]`",
+                "missing required `terminal(<Variant>, ...)` in `#[lifecycle(...)]`",
             )
         })?;
         let transitions = transitions.ok_or_else(|| {
             syn::Error::new(
                 proc_macro2::Span::call_site(),
-                "missing required `transitions(<From> -> <To>, ...)` in `#[workflow(...)]`",
+                "missing required `transitions(<From> -> <To>, ...)` in `#[lifecycle(...)]`",
             )
         })?;
 
-        Ok(WorkflowArgs {
+        Ok(Self {
             initial,
             terminals,
             transitions,
@@ -170,12 +171,12 @@ impl Parse for WorkflowArgs {
     }
 }
 
-// ── Workflow model ───────────────────────────────────────────────────────────
+// ── Lifecycle model ───────────────────────────────────────────────────────────
 
-/// A workflow discovered in source: the enum name, its declared states (in enum
-/// declaration order), and the parsed `#[workflow]` metadata.
+/// A lifecycle discovered in source: the enum name, its declared states (in enum
+/// declaration order), and the parsed `#[lifecycle]` metadata.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WorkflowDef {
+pub struct LifecycleDef {
     /// Enum identifier (e.g. `OrderState`).
     pub name: String,
     /// Declared variants, in enum declaration order.
@@ -219,14 +220,14 @@ pub struct Violation {
     pub kind: ViolationKind,
     /// The offending state name(s).
     pub states: Vec<String>,
-    /// Human-readable description naming the state(s) and workflow.
+    /// Human-readable description naming the state(s) and lifecycle.
     pub message: String,
 }
 
-/// A per-workflow analysis result — its declared shape plus any violations.
+/// A per-lifecycle analysis result — its declared shape plus any violations.
 /// Serializes to the machine-readable lifecycle-graph artifact (AC5).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct WorkflowReport {
+pub struct LifecycleReport {
     pub name: String,
     pub states: Vec<String>,
     pub initial: String,
@@ -235,42 +236,43 @@ pub struct WorkflowReport {
     pub violations: Vec<Violation>,
 }
 
-impl WorkflowReport {
-    fn is_sound(&self) -> bool {
+impl LifecycleReport {
+    const fn is_sound(&self) -> bool {
         self.violations.is_empty()
     }
 }
 
-/// The full result of a `workflow check` run.
+/// The full result of a `lifecycle check` run.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Report {
     /// Number of `.rs` files scanned.
     pub files_scanned: usize,
-    /// Per-workflow analysis results.
-    pub workflows: Vec<WorkflowReport>,
+    /// Per-lifecycle analysis results.
+    pub lifecycles: Vec<LifecycleReport>,
     /// Malformed-attribute errors (each `file: message`). A non-empty list is a
-    /// hard failure — a `#[workflow]` we could not parse is not a pass.
+    /// hard failure — a `#[lifecycle]` we could not parse is not a pass.
     pub errors: Vec<String>,
 }
 
 impl Report {
-    /// Total violation count across every workflow.
+    /// Total violation count across every lifecycle.
     #[must_use]
     pub fn violation_count(&self) -> usize {
-        self.workflows.iter().map(|w| w.violations.len()).sum()
+        self.lifecycles.iter().map(|w| w.violations.len()).sum()
     }
 
-    /// Process exit code: 0 when every workflow is sound and no parse errors
+    /// Process exit code: 0 when every lifecycle is sound and no parse errors
     /// occurred, 1 otherwise.
     #[must_use]
     pub fn exit_code(&self) -> i32 {
-        i32::from(!self.errors.is_empty() || self.workflows.iter().any(|w| !w.is_sound()))
+        i32::from(!self.errors.is_empty() || self.lifecycles.iter().any(|w| !w.is_sound()))
     }
 }
 
-/// Run the three structural checks over one workflow, producing its report.
+/// Run the three structural checks over one lifecycle, producing its report.
 #[must_use]
-pub fn analyze(wf: &WorkflowDef) -> WorkflowReport {
+#[allow(clippy::too_many_lines)]
+pub fn analyze(wf: &LifecycleDef) -> LifecycleReport {
     let states: BTreeSet<&str> = wf.states.iter().map(String::as_str).collect();
     let mut violations = Vec::new();
 
@@ -280,7 +282,7 @@ pub fn analyze(wf: &WorkflowDef) -> WorkflowReport {
             kind: ViolationKind::Existence,
             states: vec![wf.initial.clone()],
             message: format!(
-                "unknown state '{}' referenced as initial state of workflow '{}'",
+                "unknown state '{}' referenced as initial state of lifecycle '{}'",
                 wf.initial, wf.name
             ),
         });
@@ -291,7 +293,7 @@ pub fn analyze(wf: &WorkflowDef) -> WorkflowReport {
                 kind: ViolationKind::Existence,
                 states: vec![t.clone()],
                 message: format!(
-                    "unknown state '{t}' referenced in terminals of workflow '{}'",
+                    "unknown state '{t}' referenced in terminals of lifecycle '{}'",
                     wf.name
                 ),
             });
@@ -305,7 +307,7 @@ pub fn analyze(wf: &WorkflowDef) -> WorkflowReport {
                     kind: ViolationKind::Existence,
                     states: vec![endpoint.clone()],
                     message: format!(
-                        "unknown state '{endpoint}' referenced in transitions of workflow '{}'",
+                        "unknown state '{endpoint}' referenced in transitions of lifecycle '{}'",
                         wf.name
                     ),
                 });
@@ -378,7 +380,7 @@ pub fn analyze(wf: &WorkflowDef) -> WorkflowReport {
         }
     }
 
-    WorkflowReport {
+    LifecycleReport {
         name: wf.name.clone(),
         states: wf.states.clone(),
         initial: wf.initial.clone(),
@@ -411,14 +413,14 @@ fn bfs<'a>(start: &'a str, adj: &HashMap<&'a str, Vec<&'a str>>) -> BTreeSet<&'a
 /// Accumulator threaded through the source scan.
 #[derive(Debug, Default)]
 struct Scan {
-    workflows: Vec<WorkflowDef>,
+    lifecycles: Vec<LifecycleDef>,
     errors: Vec<String>,
     files_scanned: usize,
 }
 
-/// Walk `root` recursively and collect every `#[workflow]` enum in its `.rs`
+/// Walk `root` recursively and collect every `#[lifecycle]` enum in its `.rs`
 /// files. A missing/unreadable scan root is a hard error (mirrors `a11y`): a
-/// zero-workflow run must never be a silent CI pass caused by a path typo.
+/// zero-lifecycle run must never be a silent CI pass caused by a path typo.
 fn scan_project(root: &Path) -> std::io::Result<Scan> {
     std::fs::read_dir(root)?;
     let mut scan = Scan::default();
@@ -466,7 +468,7 @@ fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// Parse one source file and collect every `#[workflow]` enum it declares.
+/// Parse one source file and collect every `#[lifecycle]` enum it declares.
 fn scan_source(src: &str, file: &str, scan: &mut Scan) {
     // A file that does not parse as Rust is skipped (best-effort, like `a11y`).
     let Ok(ast) = syn::parse_file(src) else {
@@ -474,30 +476,30 @@ fn scan_source(src: &str, file: &str, scan: &mut Scan) {
     };
     for item in &ast.items {
         if let syn::Item::Enum(item_enum) = item {
-            collect_workflow_enum(item_enum, file, scan);
+            collect_lifecycle_enum(item_enum, file, scan);
         }
     }
 }
 
-/// If `item_enum` carries a `#[workflow(...)]` attribute, parse it into a
-/// [`WorkflowDef`]; a malformed attribute is recorded as an error naming `file`.
-fn collect_workflow_enum(item_enum: &syn::ItemEnum, file: &str, scan: &mut Scan) {
+/// If `item_enum` carries a `#[lifecycle(...)]` attribute, parse it into a
+/// [`LifecycleDef`]; a malformed attribute is recorded as an error naming `file`.
+fn collect_lifecycle_enum(item_enum: &syn::ItemEnum, file: &str, scan: &mut Scan) {
     let Some(attr) = item_enum
         .attrs
         .iter()
-        .find(|a| a.path().is_ident("workflow"))
+        .find(|a| a.path().is_ident("lifecycle"))
     else {
         return;
     };
     let name = item_enum.ident.to_string();
-    match attr.parse_args::<WorkflowArgs>() {
+    match attr.parse_args::<LifecycleArgs>() {
         Ok(args) => {
             let states = item_enum
                 .variants
                 .iter()
                 .map(|v| v.ident.to_string())
                 .collect();
-            scan.workflows.push(WorkflowDef {
+            scan.lifecycles.push(LifecycleDef {
                 name,
                 states,
                 initial: args.initial.to_string(),
@@ -511,31 +513,31 @@ fn collect_workflow_enum(item_enum: &syn::ItemEnum, file: &str, scan: &mut Scan)
         }
         Err(err) => {
             scan.errors.push(format!(
-                "{file}: malformed #[workflow] on enum '{name}': {err}"
+                "{file}: malformed #[lifecycle] on enum '{name}': {err}"
             ));
         }
     }
 }
 
-/// Build a [`Report`] from a scan, analyzing each discovered workflow.
+/// Build a [`Report`] from a scan, analyzing each discovered lifecycle.
 fn report_from_scan(scan: Scan) -> Report {
-    let workflows = scan.workflows.iter().map(analyze).collect();
+    let lifecycles = scan.lifecycles.iter().map(analyze).collect();
     Report {
         files_scanned: scan.files_scanned,
-        workflows,
+        lifecycles,
         errors: scan.errors,
     }
 }
 
-// ── `workflow check` entry point ─────────────────────────────────────────────
+// ── `lifecycle check` entry point ─────────────────────────────────────────────
 
-/// Options for `autumn workflow check`.
+/// Options for `autumn lifecycle check`.
 #[derive(Debug, Clone, Copy)]
 pub struct CheckOptions {
     pub format: OutputFormat,
 }
 
-/// Scan `root`, analyze every workflow, print the report, and return the process
+/// Scan `root`, analyze every lifecycle, print the report, and return the process
 /// exit code (0 = all sound, 1 = any violation or parse error).
 #[must_use]
 pub fn run_check(root: &Path, opts: CheckOptions) -> i32 {
@@ -557,15 +559,15 @@ pub fn run_check(root: &Path, opts: CheckOptions) -> i32 {
 fn print_check_json(report: &Report) {
     match serde_json::to_string_pretty(report) {
         Ok(json) => println!("{json}"),
-        Err(err) => eprintln!("autumn workflow check: failed to serialize report: {err}"),
+        Err(err) => eprintln!("autumn lifecycle check: failed to serialize report: {err}"),
     }
 }
 
 fn print_check_text(report: &Report) {
-    println!("autumn workflow check");
+    println!("autumn lifecycle check");
     println!(
-        "  scanned {} workflow(s) across {} .rs file(s)",
-        report.workflows.len(),
+        "  scanned {} lifecycle(s) across {} .rs file(s)",
+        report.lifecycles.len(),
         report.files_scanned
     );
 
@@ -573,8 +575,8 @@ fn print_check_text(report: &Report) {
         println!("  error: {err}");
     }
 
-    for wf in &report.workflows {
-        println!("\n  workflow '{}' ({} state(s))", wf.name, wf.states.len());
+    for wf in &report.lifecycles {
+        println!("\n  lifecycle '{}' ({} state(s))", wf.name, wf.states.len());
         println!("    initial:   {}", wf.initial);
         println!("    terminals: {}", wf.terminals.join(", "));
         if wf.violations.is_empty() {
@@ -589,28 +591,28 @@ fn print_check_text(report: &Report) {
 
     let violations = report.violation_count();
     println!(
-        "\n  summary: {} workflow(s), {} violation(s), {} parse error(s)",
-        report.workflows.len(),
+        "\n  summary: {} lifecycle(s), {} violation(s), {} parse error(s)",
+        report.lifecycles.len(),
         violations,
         report.errors.len()
     );
     if report.exit_code() == 0 {
-        println!("Result: PASS — all workflows are sound.");
+        println!("Result: PASS — all lifecycles are sound.");
     } else {
-        println!("Result: FAIL — fix the workflow violations above.");
+        println!("Result: FAIL — fix the lifecycle violations above.");
     }
 }
 
-// ── `workflow diagram` entry point ───────────────────────────────────────────
+// ── `lifecycle diagram` entry point ───────────────────────────────────────────
 
-/// Options for `autumn workflow diagram`.
+/// Options for `autumn lifecycle diagram`.
 #[derive(Debug, Clone)]
 pub struct DiagramOptions {
     pub format: DiagramFormat,
     pub out: Option<PathBuf>,
 }
 
-/// Scan `root`, render a lifecycle diagram per discovered workflow, and write
+/// Scan `root`, render a lifecycle diagram per discovered lifecycle, and write
 /// the result to stdout or `opts.out`. Returns the process exit code.
 #[must_use]
 pub fn run_diagram(root: &Path, opts: &DiagramOptions) -> i32 {
@@ -627,16 +629,16 @@ pub fn run_diagram(root: &Path, opts: &DiagramOptions) -> i32 {
         }
         return 1;
     }
-    if scan.workflows.is_empty() {
+    if scan.lifecycles.is_empty() {
         eprintln!(
-            "autumn workflow diagram: no #[workflow] enums found under '{}'",
+            "autumn lifecycle diagram: no #[lifecycle] enums found under '{}'",
             root.display()
         );
         return 1;
     }
 
     let mut output = String::new();
-    for (i, wf) in scan.workflows.iter().enumerate() {
+    for (i, wf) in scan.lifecycles.iter().enumerate() {
         if i > 0 {
             output.push('\n');
         }
@@ -650,14 +652,14 @@ pub fn run_diagram(root: &Path, opts: &DiagramOptions) -> i32 {
         Some(path) => {
             if let Err(err) = std::fs::write(path, &output) {
                 eprintln!(
-                    "autumn workflow diagram: failed to write '{}': {err}",
+                    "autumn lifecycle diagram: failed to write '{}': {err}",
                     path.display()
                 );
                 return 1;
             }
             println!(
                 "wrote {} diagram(s) to {}",
-                scan.workflows.len(),
+                scan.lifecycles.len(),
                 path.display()
             );
         }
@@ -666,45 +668,46 @@ pub fn run_diagram(root: &Path, opts: &DiagramOptions) -> i32 {
     0
 }
 
-/// Render a workflow as a Mermaid `stateDiagram-v2` block. The initial state is
+/// Render a lifecycle as a Mermaid `stateDiagram-v2` block. The initial state is
 /// entered from `[*]`; each terminal state exits to `[*]`, which is how Mermaid
 /// renders start/end markers.
 #[must_use]
-pub fn render_mermaid(wf: &WorkflowDef) -> String {
+pub fn render_mermaid(wf: &LifecycleDef) -> String {
     let mut out = String::new();
-    out.push_str(&format!("%% workflow: {}\n", wf.name));
+    let _ = writeln!(out, "%% lifecycle: {}", wf.name);
     out.push_str("stateDiagram-v2\n");
-    out.push_str(&format!("    [*] --> {}\n", wf.initial));
+    let _ = writeln!(out, "    [*] --> {}", wf.initial);
     for (from, to) in &wf.transitions {
-        out.push_str(&format!("    {from} --> {to}\n"));
+        let _ = writeln!(out, "    {from} --> {to}");
     }
     for t in &wf.terminals {
-        out.push_str(&format!("    {t} --> [*]\n"));
+        let _ = writeln!(out, "    {t} --> [*]");
     }
     out
 }
 
-/// Render a workflow as a Graphviz DOT `digraph`. The initial state is filled
+/// Render a lifecycle as a Graphviz DOT `digraph`. The initial state is filled
 /// and reached from a start point; terminal states are drawn as double circles.
 #[must_use]
-pub fn render_dot(wf: &WorkflowDef) -> String {
+pub fn render_dot(wf: &LifecycleDef) -> String {
     let mut out = String::new();
     // The graph name is the enum ident — already a valid bare DOT id.
-    out.push_str(&format!("digraph {} {{\n", wf.name));
+    let _ = writeln!(out, "digraph {} {{", wf.name);
     out.push_str("    rankdir=LR;\n");
     out.push_str("    node [shape=box, style=rounded];\n");
     out.push_str("    __start [shape=point, width=0.15];\n");
     // Highlight the initial state (filled) and terminal states (double circle).
-    out.push_str(&format!(
-        "    {} [style=\"rounded,filled\", fillcolor=lightblue];\n",
+    let _ = writeln!(
+        out,
+        "    {} [style=\"rounded,filled\", fillcolor=lightblue];",
         dot_id(&wf.initial)
-    ));
+    );
     for t in &wf.terminals {
-        out.push_str(&format!("    {} [shape=doublecircle];\n", dot_id(t)));
+        let _ = writeln!(out, "    {} [shape=doublecircle];", dot_id(t));
     }
-    out.push_str(&format!("    __start -> {};\n", dot_id(&wf.initial)));
+    let _ = writeln!(out, "    __start -> {};", dot_id(&wf.initial));
     for (from, to) in &wf.transitions {
-        out.push_str(&format!("    {} -> {};\n", dot_id(from), dot_id(to)));
+        let _ = writeln!(out, "    {} -> {};", dot_id(from), dot_id(to));
     }
     out.push_str("}\n");
     out

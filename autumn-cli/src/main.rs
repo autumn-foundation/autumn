@@ -24,6 +24,7 @@ mod generate;
 mod http;
 mod i18n;
 mod jobs;
+mod lifecycle;
 mod maintenance;
 mod migrate;
 mod monitor;
@@ -47,7 +48,6 @@ mod test_cmd;
 mod text_width;
 mod token;
 mod webhook;
-mod workflow;
 /// Subcommands for `autumn check`.
 #[derive(Subcommand, Clone, Debug, PartialEq, Eq)]
 pub enum CheckSubcommands {
@@ -130,13 +130,13 @@ pub enum A11ySubcommands {
     },
 }
 
-/// Subcommands for `autumn workflow`.
+/// Subcommands for `autumn lifecycle`.
 #[derive(Subcommand, Clone, Debug, PartialEq, Eq)]
-pub enum WorkflowSubcommands {
-    /// Statically verify the soundness of every `#[workflow]` state machine in
+pub enum LifecycleSubcommands {
+    /// Statically verify the soundness of every `#[lifecycle]` state machine in
     /// the project: existence of every referenced state, reachability of every
     /// state from the initial state, and that every reachable non-terminal state
-    /// can reach some terminal state. Exits non-zero when any workflow is
+    /// can reach some terminal state. Exits non-zero when any lifecycle is
     /// unsound (CI-friendly).
     Check {
         /// Project root to scan (defaults to the current directory).
@@ -146,7 +146,7 @@ pub enum WorkflowSubcommands {
         #[arg(long, default_value = "text", value_name = "FORMAT")]
         format: String,
     },
-    /// Emit a lifecycle diagram for every `#[workflow]` state machine, in
+    /// Emit a lifecycle diagram for every `#[lifecycle]` state machine, in
     /// Graphviz DOT or Mermaid `stateDiagram-v2` form (highlighting the initial
     /// and terminal states).
     Diagram {
@@ -715,25 +715,25 @@ enum Commands {
         action: A11ySubcommands,
     },
 
-    /// Verify the soundness of `#[workflow]` state machines and render their
+    /// Verify the soundness of `#[lifecycle]` state machines and render their
     /// lifecycle diagrams at build time.
     ///
-    /// The `#[workflow]` macro proves that transition endpoints are real
-    /// variants and that only declared edges are callable. `autumn workflow
+    /// The `#[lifecycle]` macro proves that transition endpoints are real
+    /// variants and that only declared edges are callable. `autumn lifecycle
     /// check` closes the remaining gap by verifying the *shape* of the
     /// reachability graph: every referenced state exists, every state is
     /// reachable from the initial state, and every reachable non-terminal state
-    /// can reach some terminal. Exits non-zero when any workflow is unsound.
+    /// can reach some terminal. Exits non-zero when any lifecycle is unsound.
     ///
     /// # Examples
     ///
-    ///   autumn workflow check
-    ///   autumn workflow check --format json
-    ///   autumn workflow diagram --format mermaid
+    ///   autumn lifecycle check
+    ///   autumn lifecycle check --format json
+    ///   autumn lifecycle diagram --format mermaid
     #[command(verbatim_doc_comment)]
-    Workflow {
+    Lifecycle {
         #[command(subcommand)]
-        action: WorkflowSubcommands,
+        action: LifecycleSubcommands,
     },
 
     /// Inspect the application's background jobs.
@@ -3059,38 +3059,38 @@ fn run_command(command: Commands) {
                 std::process::exit(code);
             }
         },
-        Commands::Workflow { action } => match action {
-            WorkflowSubcommands::Check { path, format } => {
+        Commands::Lifecycle { action } => match action {
+            LifecycleSubcommands::Check { path, format } => {
                 let format = match format.as_str() {
-                    "json" => workflow::OutputFormat::Json,
-                    "text" => workflow::OutputFormat::Text,
+                    "json" => lifecycle::OutputFormat::Json,
+                    "text" => lifecycle::OutputFormat::Text,
                     other => {
                         eprintln!(
-                            "autumn workflow check: unknown --format `{other}` (expected `text` or `json`)"
+                            "autumn lifecycle check: unknown --format `{other}` (expected `text` or `json`)"
                         );
                         std::process::exit(2);
                     }
                 };
-                let code = workflow::run_check(
+                let code = lifecycle::run_check(
                     std::path::Path::new(&path),
-                    workflow::CheckOptions { format },
+                    lifecycle::CheckOptions { format },
                 );
                 std::process::exit(code);
             }
-            WorkflowSubcommands::Diagram { path, format, out } => {
+            LifecycleSubcommands::Diagram { path, format, out } => {
                 let format = match format.as_str() {
-                    "mermaid" => workflow::DiagramFormat::Mermaid,
-                    "dot" => workflow::DiagramFormat::Dot,
+                    "mermaid" => lifecycle::DiagramFormat::Mermaid,
+                    "dot" => lifecycle::DiagramFormat::Dot,
                     other => {
                         eprintln!(
-                            "autumn workflow diagram: unknown --format `{other}` (expected `mermaid` or `dot`)"
+                            "autumn lifecycle diagram: unknown --format `{other}` (expected `mermaid` or `dot`)"
                         );
                         std::process::exit(2);
                     }
                 };
-                let code = workflow::run_diagram(
+                let code = lifecycle::run_diagram(
                     std::path::Path::new(&path),
-                    &workflow::DiagramOptions {
+                    &lifecycle::DiagramOptions {
                         format,
                         out: out.map(std::path::PathBuf::from),
                     },

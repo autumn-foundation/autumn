@@ -1,0 +1,16 @@
+error[E0599]: no method named `to_delivered` found for struct `Machine<order_state::Pending>` in the current scope
+  --> tests/compile-fail/lifecycle_undeclared_transition.rs:28:43
+   |
+ 5 | / #[lifecycle(
+ 6 | |     initial = Pending,
+ 7 | |     terminal(Delivered, Cancelled),
+ 8 | |     transitions(
+...  |
+15 | | )]
+   | |__- method `to_delivered` not found for this struct
+...
+28 |       let _ = order_state::Machine::start().to_delivered();
+   |                                             ^^^^^^^^^^^^ method not found in `Machine<order_state::Pending>`
+   |
+   = note: the method was found for
+           - `Machine<Shipped>`

@@ -1,8 +1,8 @@
-//! Integration tests for `autumn workflow check` / `autumn workflow diagram`
+//! Integration tests for `autumn lifecycle check` / `autumn lifecycle diagram`
 //! (issue #1675).
 //!
 //! Each test scaffolds a throwaway project with a `src/*.rs` file containing a
-//! `#[workflow]` enum in a `TempDir`, runs the real `autumn` binary against it,
+//! `#[lifecycle]` enum in a `TempDir`, runs the real `autumn` binary against it,
 //! and asserts on the exit code and output. The fixture `.rs` files are only
 //! ever *parsed* by the scanner, so they need to be syntactically valid Rust but
 //! need not compile or link.
@@ -26,22 +26,22 @@ fn write(root: &Path, rel: &str, contents: &str) {
     fs::write(path, contents).unwrap();
 }
 
-/// Run `autumn workflow <sub> [args...]` inside `root`.
-fn run_workflow(root: &Path, args: &[&str]) -> Output {
+/// Run `autumn lifecycle <sub> [args...]` inside `root`.
+fn run_lifecycle(root: &Path, args: &[&str]) -> Output {
     Command::new(autumn_bin())
-        .arg("workflow")
+        .arg("lifecycle")
         .args(args)
         .current_dir(root)
         .output()
-        .expect("failed to run autumn workflow")
+        .expect("failed to run autumn lifecycle")
 }
 
-/// A sound order-lifecycle workflow: every state reachable from `Cart`, and
+/// A sound order-lifecycle lifecycle: every state reachable from `Cart`, and
 /// every non-terminal state can reach a terminal (`Delivered`/`Cancelled`).
-const GOOD_ORDER: &str = r#"
-use autumn_web::workflow;
+const GOOD_ORDER: &str = r"
+use autumn_web::lifecycle;
 
-#[workflow(
+#[lifecycle(
     initial = Cart,
     terminal(Delivered, Cancelled),
     transitions(
@@ -62,7 +62,7 @@ pub enum OrderState {
     Delivered,
     Cancelled,
 }
-"#;
+";
 
 fn good_project() -> TempDir {
     let dir = tempfile::tempdir().unwrap();
@@ -71,13 +71,13 @@ fn good_project() -> TempDir {
 }
 
 #[test]
-fn sound_workflow_exits_zero() {
+fn sound_lifecycle_exits_zero() {
     let dir = good_project();
-    let output = run_workflow(dir.path(), &["check"]);
+    let output = run_lifecycle(dir.path(), &["check"]);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         output.status.success(),
-        "a sound workflow should exit 0\nstdout:\n{stdout}\nstderr:\n{}",
+        "a sound lifecycle should exit 0\nstdout:\n{stdout}\nstderr:\n{}",
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(stdout.contains("PASS"), "stdout:\n{stdout}");
@@ -91,8 +91,8 @@ fn unreachable_state_fails_and_is_named() {
     write(
         dir.path(),
         "src/order.rs",
-        r#"
-#[workflow(
+        r"
+#[lifecycle(
     initial = Cart,
     terminal(Delivered),
     transitions(
@@ -106,9 +106,9 @@ pub enum OrderState {
     Delivered,
     Refunded,
 }
-"#,
+",
     );
-    let output = run_workflow(dir.path(), &["check"]);
+    let output = run_lifecycle(dir.path(), &["check"]);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         !output.status.success(),
@@ -131,8 +131,8 @@ fn non_terminal_dead_end_fails_and_is_named() {
     write(
         dir.path(),
         "src/post.rs",
-        r#"
-#[workflow(
+        r"
+#[lifecycle(
     initial = Draft,
     terminal(Published),
     transitions(
@@ -145,9 +145,9 @@ pub enum PostState {
     Published,
     Limbo,
 }
-"#,
+",
     );
-    let output = run_workflow(dir.path(), &["check"]);
+    let output = run_lifecycle(dir.path(), &["check"]);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         !output.status.success(),
@@ -170,8 +170,8 @@ fn unknown_state_reference_fails_and_is_named() {
     write(
         dir.path(),
         "src/ticket.rs",
-        r#"
-#[workflow(
+        r"
+#[lifecycle(
     initial = Open,
     terminal(Closed),
     transitions(
@@ -183,9 +183,9 @@ pub enum TicketState {
     Open,
     Closed,
 }
-"#,
+",
     );
-    let output = run_workflow(dir.path(), &["check"]);
+    let output = run_lifecycle(dir.path(), &["check"]);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         !output.status.success(),
@@ -203,19 +203,19 @@ pub enum TicketState {
 }
 
 #[test]
-fn json_format_on_good_workflow_is_valid_and_exits_zero() {
+fn json_format_on_good_lifecycle_is_valid_and_exits_zero() {
     let dir = good_project();
-    let output = run_workflow(dir.path(), &["check", "--format", "json"]);
+    let output = run_lifecycle(dir.path(), &["check", "--format", "json"]);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         output.status.success(),
-        "sound workflow exits 0 in json mode\nstdout:\n{stdout}"
+        "sound lifecycle exits 0 in json mode\nstdout:\n{stdout}"
     );
     let json: serde_json::Value =
         serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("invalid JSON: {e}\n{stdout}"));
-    let workflows = json["workflows"].as_array().expect("workflows array");
-    assert_eq!(workflows.len(), 1, "one workflow expected\n{stdout}");
-    let wf = &workflows[0];
+    let lifecycles = json["lifecycles"].as_array().expect("lifecycles array");
+    assert_eq!(lifecycles.len(), 1, "one lifecycle expected\n{stdout}");
+    let wf = &lifecycles[0];
     assert_eq!(wf["name"], "OrderState");
     assert_eq!(wf["initial"], "Cart");
     let states = wf["states"].as_array().expect("states array");
@@ -235,14 +235,14 @@ fn json_format_on_good_workflow_is_valid_and_exits_zero() {
             .as_array()
             .expect("violations array")
             .is_empty(),
-        "sound workflow has no violations\n{stdout}"
+        "sound lifecycle has no violations\n{stdout}"
     );
 }
 
 #[test]
 fn diagram_mermaid_emits_state_diagram() {
     let dir = good_project();
-    let output = run_workflow(dir.path(), &["diagram", "--format", "mermaid"]);
+    let output = run_lifecycle(dir.path(), &["diagram", "--format", "mermaid"]);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         output.status.success(),
@@ -266,7 +266,7 @@ fn diagram_mermaid_emits_state_diagram() {
 #[test]
 fn diagram_dot_emits_digraph() {
     let dir = good_project();
-    let output = run_workflow(dir.path(), &["diagram", "--format", "dot"]);
+    let output = run_lifecycle(dir.path(), &["diagram", "--format", "dot"]);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         output.status.success(),

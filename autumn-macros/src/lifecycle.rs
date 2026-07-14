@@ -1,7 +1,7 @@
-//! `#[workflow]` attribute macro implementation.
+//! `#[lifecycle]` attribute macro implementation.
 //!
-//! Applied to an enum, `#[workflow]` turns a plain state enum into a
-//! statically-verified workflow. Given a declared `initial` state, one or more
+//! Applied to an enum, `#[lifecycle]` turns a plain state enum into a
+//! statically-verified lifecycle. Given a declared `initial` state, one or more
 //! `terminal` states, and a set of `transitions`, it generates two things:
 //!
 //! 1. **Metadata consts + `can_transition_to`** on the enum itself, referencing
@@ -13,9 +13,9 @@
 //!    an undeclared transition simply does not compile.
 //!
 //! ```ignore
-//! use autumn_web::workflow;
+//! use autumn_web::lifecycle;
 //!
-//! #[workflow(
+//! #[lifecycle(
 //!     initial = Draft,
 //!     terminal(Archived),
 //!     transitions(
@@ -46,18 +46,18 @@ impl Parse for Transition {
         let from: Ident = input.parse()?;
         input.parse::<Token![->]>()?;
         let to: Ident = input.parse()?;
-        Ok(Transition { from, to })
+        Ok(Self { from, to })
     }
 }
 
-/// Parsed `#[workflow(...)]` attribute arguments.
-struct WorkflowArgs {
+/// Parsed `#[lifecycle(...)]` attribute arguments.
+struct LifecycleArgs {
     initial: Ident,
     terminals: Vec<Ident>,
     transitions: Vec<Transition>,
 }
 
-impl Parse for WorkflowArgs {
+impl Parse for LifecycleArgs {
     fn parse(input: ParseStream) -> syn::Result<Self> {
         let mut initial: Option<Ident> = None;
         let mut terminals: Option<Vec<Ident>> = None;
@@ -118,7 +118,7 @@ impl Parse for WorkflowArgs {
                     return Err(syn::Error::new_spanned(
                         &key,
                         format!(
-                            "unknown `#[workflow]` argument `{other}` — expected `initial`, `terminal`, or `transitions`"
+                            "unknown `#[lifecycle]` argument `{other}` — expected `initial`, `terminal`, or `transitions`"
                         ),
                     ));
                 }
@@ -133,23 +133,23 @@ impl Parse for WorkflowArgs {
         let initial = initial.ok_or_else(|| {
             syn::Error::new(
                 proc_macro2::Span::call_site(),
-                "missing required `initial = <Variant>` in `#[workflow(...)]`",
+                "missing required `initial = <Variant>` in `#[lifecycle(...)]`",
             )
         })?;
         let terminals = terminals.ok_or_else(|| {
             syn::Error::new(
                 proc_macro2::Span::call_site(),
-                "missing required `terminal(<Variant>, ...)` in `#[workflow(...)]`",
+                "missing required `terminal(<Variant>, ...)` in `#[lifecycle(...)]`",
             )
         })?;
         let transitions = transitions.ok_or_else(|| {
             syn::Error::new(
                 proc_macro2::Span::call_site(),
-                "missing required `transitions(<From> -> <To>, ...)` in `#[workflow(...)]`",
+                "missing required `transitions(<From> -> <To>, ...)` in `#[lifecycle(...)]`",
             )
         })?;
 
-        Ok(WorkflowArgs {
+        Ok(Self {
             initial,
             terminals,
             transitions,
@@ -186,19 +186,19 @@ fn snake_case(ident: &Ident) -> String {
 }
 
 /// Core implementation invoked by the thin `#[proc_macro_attribute]` wrapper.
-pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
+pub fn lifecycle_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let item_enum: ItemEnum = match syn::parse2(item) {
         Ok(e) => e,
         Err(_) => {
             return syn::Error::new(
                 proc_macro2::Span::call_site(),
-                "#[workflow] may only be applied to an enum",
+                "#[lifecycle] may only be applied to an enum",
             )
             .to_compile_error();
         }
     };
 
-    let args: WorkflowArgs = match syn::parse2(attr) {
+    let args: LifecycleArgs = match syn::parse2(attr) {
         Ok(a) => a,
         Err(err) => return err.to_compile_error(),
     };
@@ -220,12 +220,12 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     }
 }
 
-fn expand(item_enum: &ItemEnum, args: &WorkflowArgs) -> syn::Result<TokenStream> {
+fn expand(item_enum: &ItemEnum, args: &LifecycleArgs) -> syn::Result<TokenStream> {
     let enum_ident = &item_enum.ident;
 
     // Collect the declared variant idents (as strings) for validation.
     let variants: Vec<&Ident> = item_enum.variants.iter().map(|v| &v.ident).collect();
-    let is_variant = |ident: &Ident| variants.iter().any(|v| *v == ident);
+    let is_variant = |ident: &Ident| variants.contains(&ident);
 
     // Validate `initial`.
     if !is_variant(&args.initial) {
@@ -290,7 +290,7 @@ fn expand(item_enum: &ItemEnum, args: &WorkflowArgs) -> syn::Result<TokenStream>
 
 /// Build the metadata `impl` block on the enum: the four consts plus
 /// `can_transition_to`.
-fn build_metadata(item_enum: &ItemEnum, args: &WorkflowArgs, variants: &[&Ident]) -> TokenStream {
+fn build_metadata(item_enum: &ItemEnum, args: &LifecycleArgs, variants: &[&Ident]) -> TokenStream {
     let enum_ident = &item_enum.ident;
     let initial = &args.initial;
 
@@ -314,14 +314,14 @@ fn build_metadata(item_enum: &ItemEnum, args: &WorkflowArgs, variants: &[&Ident]
 
     quote! {
         impl #enum_ident {
-            /// The declared initial state of this workflow.
-            pub const WORKFLOW_INITIAL: #enum_ident = #enum_ident::#initial;
-            /// The declared terminal states of this workflow.
-            pub const WORKFLOW_TERMINALS: &'static [#enum_ident] = &[#(#terminal_paths),*];
-            /// All states of this workflow, in declaration order.
-            pub const WORKFLOW_STATES: &'static [#enum_ident] = &[#(#state_paths),*];
-            /// All declared `(from, to)` transition edges of this workflow.
-            pub const WORKFLOW_TRANSITIONS: &'static [(#enum_ident, #enum_ident)] = &[
+            /// The declared initial state of this lifecycle.
+            pub const LIFECYCLE_INITIAL: #enum_ident = #enum_ident::#initial;
+            /// The declared terminal states of this lifecycle.
+            pub const LIFECYCLE_TERMINALS: &'static [#enum_ident] = &[#(#terminal_paths),*];
+            /// All states of this lifecycle, in declaration order.
+            pub const LIFECYCLE_STATES: &'static [#enum_ident] = &[#(#state_paths),*];
+            /// All declared `(from, to)` transition edges of this lifecycle.
+            pub const LIFECYCLE_TRANSITIONS: &'static [(#enum_ident, #enum_ident)] = &[
                 #(#transition_pairs),*
             ];
 
@@ -337,7 +337,7 @@ fn build_metadata(item_enum: &ItemEnum, args: &WorkflowArgs, variants: &[&Ident]
 }
 
 /// Build the typestate transition module named after the enum in `snake_case`.
-fn build_module(item_enum: &ItemEnum, args: &WorkflowArgs) -> TokenStream {
+fn build_module(item_enum: &ItemEnum, args: &LifecycleArgs) -> TokenStream {
     let enum_ident = &item_enum.ident;
     let mod_ident = format_ident!("{}", snake_case(enum_ident));
     let initial = &args.initial;
@@ -368,7 +368,7 @@ fn build_module(item_enum: &ItemEnum, args: &WorkflowArgs) -> TokenStream {
     // `start()` only on the initial state.
     let start_impl = quote! {
         impl Machine<#initial> {
-            /// Begin the workflow at its declared initial state.
+            /// Begin the lifecycle at its declared initial state.
             pub fn start() -> Machine<#initial> {
                 Machine { _state: ::core::marker::PhantomData }
             }
@@ -379,7 +379,7 @@ fn build_module(item_enum: &ItemEnum, args: &WorkflowArgs) -> TokenStream {
     // state so each source gets a single `impl Machine<Source>` block.
     let mut sources: Vec<&Ident> = Vec::new();
     for tr in &args.transitions {
-        if !sources.iter().any(|s| *s == &tr.from) {
+        if !sources.contains(&&tr.from) {
             sources.push(&tr.from);
         }
     }
@@ -406,7 +406,7 @@ fn build_module(item_enum: &ItemEnum, args: &WorkflowArgs) -> TokenStream {
     });
 
     quote! {
-        /// Typestate transition module for the workflow: firing an undeclared
+        /// Typestate transition module for the lifecycle: firing an undeclared
         /// transition is a compile error because the method does not exist.
         pub mod #mod_ident {
             use core::marker::PhantomData;
@@ -417,7 +417,7 @@ fn build_module(item_enum: &ItemEnum, args: &WorkflowArgs) -> TokenStream {
                 pub trait Sealed {}
             }
 
-            /// A workflow state marker.
+            /// A lifecycle state marker.
             pub trait State: sealed::Sealed {
                 /// The variant name as a string.
                 const NAME: &'static str;
@@ -427,7 +427,7 @@ fn build_module(item_enum: &ItemEnum, args: &WorkflowArgs) -> TokenStream {
 
             #(#state_impls)*
 
-            /// A workflow machine parameterized by its current state marker.
+            /// A lifecycle machine parameterized by its current state marker.
             pub struct Machine<S: State> {
                 _state: PhantomData<S>,
             }
@@ -453,7 +453,7 @@ mod tests {
 
     fn expand_ok(attr: TokenStream, item: TokenStream) -> String {
         let item_enum: ItemEnum = syn::parse2(item).expect("enum should parse");
-        let args: WorkflowArgs = syn::parse2(attr).expect("args should parse");
+        let args: LifecycleArgs = syn::parse2(attr).expect("args should parse");
         expand(&item_enum, &args)
             .expect("expansion should succeed")
             .to_string()
@@ -484,13 +484,13 @@ mod tests {
     #[test]
     fn emits_metadata_consts_with_expected_names_and_entries() {
         let out = expand_ok(sample_attr(), sample_enum());
-        assert!(out.contains("WORKFLOW_INITIAL"), "{out}");
-        assert!(out.contains("WORKFLOW_TERMINALS"), "{out}");
-        assert!(out.contains("WORKFLOW_STATES"), "{out}");
-        assert!(out.contains("WORKFLOW_TRANSITIONS"), "{out}");
+        assert!(out.contains("LIFECYCLE_INITIAL"), "{out}");
+        assert!(out.contains("LIFECYCLE_TERMINALS"), "{out}");
+        assert!(out.contains("LIFECYCLE_STATES"), "{out}");
+        assert!(out.contains("LIFECYCLE_TRANSITIONS"), "{out}");
         // Initial value.
         assert!(
-            out.contains("WORKFLOW_INITIAL : ArticleState = ArticleState :: Draft"),
+            out.contains("LIFECYCLE_INITIAL : ArticleState = ArticleState :: Draft"),
             "{out}"
         );
         // Terminal list references the enum variant.
@@ -552,7 +552,7 @@ mod tests {
     #[test]
     fn undeclared_initial_is_error() {
         let item_enum: ItemEnum = syn::parse2(sample_enum()).unwrap();
-        let args: WorkflowArgs = syn::parse2(quote! {
+        let args: LifecycleArgs = syn::parse2(quote! {
             initial = Nonexistent,
             terminal(Archived),
             transitions(Draft -> Published)
@@ -568,7 +568,7 @@ mod tests {
     #[test]
     fn undeclared_terminal_is_error() {
         let item_enum: ItemEnum = syn::parse2(sample_enum()).unwrap();
-        let args: WorkflowArgs = syn::parse2(quote! {
+        let args: LifecycleArgs = syn::parse2(quote! {
             initial = Draft,
             terminal(Ghost),
             transitions(Draft -> Published)
@@ -581,7 +581,7 @@ mod tests {
     #[test]
     fn undeclared_transition_endpoint_is_error() {
         let item_enum: ItemEnum = syn::parse2(sample_enum()).unwrap();
-        let args: WorkflowArgs = syn::parse2(quote! {
+        let args: LifecycleArgs = syn::parse2(quote! {
             initial = Draft,
             terminal(Archived),
             transitions(Draft -> Nowhere)
@@ -594,7 +594,7 @@ mod tests {
     #[test]
     fn duplicate_transition_edge_is_error() {
         let item_enum: ItemEnum = syn::parse2(sample_enum()).unwrap();
-        let args: WorkflowArgs = syn::parse2(quote! {
+        let args: LifecycleArgs = syn::parse2(quote! {
             initial = Draft,
             terminal(Archived),
             transitions(
@@ -608,7 +608,7 @@ mod tests {
     }
 
     fn parse_args_err(attr: TokenStream) -> String {
-        let res: syn::Result<WorkflowArgs> = syn::parse2(attr);
+        let res: syn::Result<LifecycleArgs> = syn::parse2(attr);
         match res {
             Ok(_) => panic!("expected a parse error"),
             Err(err) => err.to_string(),

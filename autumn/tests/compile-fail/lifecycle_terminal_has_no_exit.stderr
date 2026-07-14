@@ -1,0 +1,16 @@
+error[E0599]: no method named `to_paid` found for struct `Machine<Delivered>` in the current scope
+  --> tests/compile-fail/lifecycle_terminal_has_no_exit.rs:34:21
+   |
+ 6 | / #[lifecycle(
+ 7 | |     initial = Pending,
+ 8 | |     terminal(Delivered, Cancelled),
+ 9 | |     transitions(
+...  |
+16 | | )]
+   | |__- method `to_paid` not found for this struct
+...
+34 |       let _ = machine.to_paid();
+   |                       ^^^^^^^ method not found in `Machine<Delivered>`
+   |
+   = note: the method was found for
+           - `Machine<order_state::Pending>`

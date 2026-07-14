@@ -23,6 +23,7 @@ mod idempotency_guard;
 mod inbound_mail;
 mod job;
 mod jobs_macro;
+mod lifecycle;
 mod listener;
 mod listeners_macro;
 mod mail_previews_macro;
@@ -49,7 +50,6 @@ mod step_up;
 mod story_macro;
 mod tasks_macro;
 mod throttle;
-mod workflow;
 mod ws;
 
 use proc_macro::TokenStream;
@@ -1119,13 +1119,13 @@ pub fn t(input: TokenStream) -> TokenStream {
     i18n::t_macro(input.into()).into()
 }
 
-/// Turn a plain state enum into a statically-verified workflow.
+/// Turn a plain state enum into a statically-verified lifecycle.
 ///
 /// Given a declared `initial` state, one or more `terminal` states, and a set
-/// of `transitions`, `#[workflow]` preserves the original enum and appends:
+/// of `transitions`, `#[lifecycle]` preserves the original enum and appends:
 ///
-/// 1. Metadata consts (`WORKFLOW_INITIAL`, `WORKFLOW_TERMINALS`,
-///    `WORKFLOW_STATES`, `WORKFLOW_TRANSITIONS`) and a `can_transition_to`
+/// 1. Metadata consts (`LIFECYCLE_INITIAL`, `LIFECYCLE_TERMINALS`,
+///    `LIFECYCLE_STATES`, `LIFECYCLE_TRANSITIONS`) and a `can_transition_to`
 ///    runtime check on the enum. Because these reference the enum's own
 ///    variants, a declared state that is not a real variant is a compile error.
 /// 2. A typestate transition module named after the enum in `snake_case`, whose
@@ -1135,9 +1135,9 @@ pub fn t(input: TokenStream) -> TokenStream {
 /// # Example
 ///
 /// ```ignore
-/// use autumn_web::workflow;
+/// use autumn_web::lifecycle;
 ///
-/// #[workflow(
+/// #[lifecycle(
 ///     initial = Draft,
 ///     terminal(Archived),
 ///     transitions(
@@ -1155,6 +1155,6 @@ pub fn t(input: TokenStream) -> TokenStream {
 /// assert!(ArticleState::Draft.can_transition_to(&ArticleState::Published));
 /// ```
 #[proc_macro_attribute]
-pub fn workflow(attr: TokenStream, item: TokenStream) -> TokenStream {
-    workflow::workflow_macro(attr.into(), item.into()).into()
+pub fn lifecycle(attr: TokenStream, item: TokenStream) -> TokenStream {
+    lifecycle::lifecycle_macro(attr.into(), item.into()).into()
 }

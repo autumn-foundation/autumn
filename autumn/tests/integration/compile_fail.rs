@@ -18,6 +18,15 @@ fn compile_fail_tests() {
     t.compile_fail("tests/compile-fail/static_get_non_async.rs");
     t.compile_fail("tests/compile-fail/static_get_params_no_placeholders.rs");
 
+    // Lifecycle macro failures (always available — the `lifecycle` macro is not
+    // feature-gated). Firing an undeclared transition, leaving a terminal
+    // state, starting from a non-initial state, or naming an unknown initial
+    // state are all compile errors by construction (#1675).
+    t.compile_fail("tests/compile-fail/lifecycle_undeclared_transition.rs");
+    t.compile_fail("tests/compile-fail/lifecycle_terminal_has_no_exit.rs");
+    t.compile_fail("tests/compile-fail/lifecycle_start_only_on_initial.rs");
+    t.compile_fail("tests/compile-fail/lifecycle_unknown_initial.rs");
+
     // Model macro failures (require db feature)
     #[cfg(feature = "db")]
     t.compile_fail("tests/compile-fail/model_on_enum.rs");
@@ -82,6 +91,10 @@ fn compile_pass_tests() {
 
     // Interceptor macro
     t.pass("tests/compile-pass/intercept_basic.rs");
+
+    // Lifecycle macro (always available): a well-formed lifecycle builds and
+    // exercises the typestate machine + metadata (#1675).
+    t.pass("tests/compile-pass/lifecycle_valid.rs");
 
     // Maud + form/json handlers (require maud feature)
     #[cfg(feature = "maud")]
