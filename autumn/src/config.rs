@@ -5737,7 +5737,7 @@ pub fn check_stored_slot_map(
 /// The cross-backend consistency rule, as a single source of truth.
 ///
 /// Shared by boot-time validation ([`DatabaseConfig::validate`], via
-/// [`DatabaseConfig::validate_backend_consistency`]) and out-of-process callers
+/// `DatabaseConfig::validate_backend_consistency`) and out-of-process callers
 /// such as `autumn doctor`, so both agree for *every* role/backend mismatch
 /// without re-deriving the rule.
 ///

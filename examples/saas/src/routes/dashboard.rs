@@ -36,7 +36,7 @@ pub async fn dashboard(
 
             form action="/dashboard/projects" method="post"
                  class="flex gap-2 mb-6 bg-white rounded-lg shadow p-4" {
-                input name="name" required placeholder="New project name"
+                input name="name" required placeholder="New project name" aria-label="New project name"
                       class="flex-1 border rounded px-3 py-2";
                 button type="submit"
                        class="px-4 py-2 bg-indigo-600 text-white rounded hover:bg-indigo-700" {
