@@ -719,6 +719,26 @@ impl<P, C: NestedChild> NestedChangesetForm<P, C> {
     /// app customizes `security.csrf.form_field`, set it with
     /// [`with_csrf_field`](Self::with_csrf_field) so
     /// [`form_tag`](Self::form_tag) emits the right hidden field name.
+    ///
+    /// The submit token starts `None`, so a bare `blank(..).form_tag(..)` emits
+    /// **no** submit-token hidden input and the first submission is not protected
+    /// against double-submit ([`SubmitTokenLayer`](crate::security::submit_token)
+    /// passes tokenless mutating requests through). Supply the minted token on the
+    /// initial GET with [`with_submit_token`](Self::with_submit_token) (and
+    /// [`with_submit_field`](Self::with_submit_field) if the field name is
+    /// customized) so the **first** submit carries a token too:
+    ///
+    /// ```rust,ignore
+    /// #[get("/orders/new")]
+    /// async fn new_order(csrf: CsrfToken, submit: SubmitToken) -> Markup {
+    ///     let form = NestedChangesetForm::<NewOrder, NewLineItem>::blank(
+    ///         NewOrder::default(),
+    ///         Some(csrf.token().to_owned()),
+    ///     )
+    ///     .with_submit_token(Some(submit.token().to_owned()));
+    ///     form.form_tag("/orders", "post", /* … */)
+    /// }
+    /// ```
     #[must_use]
     pub fn blank(parent: P, csrf_token: Option<String>) -> Self {
         Self {
@@ -761,6 +781,42 @@ impl<P, C: NestedChild> NestedChangesetForm<P, C> {
     #[must_use]
     pub fn with_csrf_field(mut self, field: impl Into<String>) -> Self {
         self.csrf_field = field.into();
+        self
+    }
+
+    /// Supply the one-time submit token to a [`blank`](Self::blank) (or
+    /// [`from_changeset`](Self::from_changeset)) GET-handler form so
+    /// [`form_tag`](Self::form_tag) emits the hidden submit-token input on the
+    /// **initial** render — protecting the very first submission against
+    /// double-submit, not just later 422 re-renders.
+    ///
+    /// [`blank`](Self::blank) leaves this `None` (the initial page renders no
+    /// submit-token field otherwise), and [`SubmitTokenLayer`](crate::security::submit_token)
+    /// passes tokenless mutating requests through unchanged — so without calling
+    /// this the first create-form submit is unprotected. Source the token from a
+    /// [`SubmitToken`](crate::security::SubmitToken) extractor on the GET handler.
+    /// The extractor captures it automatically on the POST re-render path.
+    ///
+    /// When the app customizes `security.submit_token.field_name`, pair this with
+    /// [`with_submit_field`](Self::with_submit_field) so the hidden input carries
+    /// the right name.
+    #[must_use]
+    pub fn with_submit_token(mut self, token: Option<String>) -> Self {
+        self.submit_token = token;
+        self
+    }
+
+    /// Override the submit-token form-field name used by
+    /// [`form_tag`](Self::form_tag).
+    ///
+    /// Mirrors [`with_csrf_field`](Self::with_csrf_field): call this on a
+    /// [`blank`](Self::blank) GET-handler form when
+    /// `security.submit_token.field_name` is customized (the default is
+    /// `_submit_token`). The extractor captures the configured name automatically
+    /// on the POST path.
+    #[must_use]
+    pub fn with_submit_field(mut self, field: impl Into<String>) -> Self {
+        self.submit_field = field.into();
         self
     }
 
@@ -847,6 +903,15 @@ impl<P, C: NestedChild> NestedChangesetForm<P, C> {
     /// the form. This method uses the field name the extractor captured (or the
     /// one set via [`with_csrf_field`](Self::with_csrf_field) on a
     /// [`blank`](Self::blank) form), keeping CSRF parity across the re-render.
+    ///
+    /// The submit-token hidden input is emitted only when a submit token is
+    /// present. The POST re-render path captures it automatically; on the initial
+    /// GET render from [`blank`](Self::blank), supply it with
+    /// [`with_submit_token`](Self::with_submit_token) so the **first** submit is
+    /// protected against double-submit too — otherwise a bare
+    /// `blank(..).form_tag(..)` create form carries no submit token and its first
+    /// submission passes through [`SubmitTokenLayer`](crate::security::submit_token)
+    /// unprotected.
     #[must_use]
     #[allow(clippy::needless_pass_by_value)]
     pub fn form_tag(&self, action: &str, method: &str, content: maud::Markup) -> maud::Markup {
@@ -2070,5 +2135,52 @@ mod maud_tests {
 
         assert!(html.contains(r#"aria-invalid="true""#), "{html}");
         assert!(html.contains("name required"), "{html}");
+    }
+
+    // ── Fix 3: blank forms can carry the current submit token ───────────
+
+    /// A `blank` form given a submit token (and a custom submit field name) emits
+    /// the hidden submit-token input on the initial GET render, so the FIRST
+    /// submission is protected against double-submit — not just later 422
+    /// re-renders.
+    #[test]
+    fn blank_form_with_submit_token_emits_hidden_submit_field() {
+        let form = NestedChangesetForm::<Order, LineItem>::blank(
+            Order {
+                name: String::new(),
+            },
+            Some("csrf".to_owned()),
+        )
+        .with_submit_field("authenticity_submit")
+        .with_submit_token(Some("tok".to_owned()));
+
+        let html = form
+            .form_tag("/orders", "post", maud::html! {})
+            .into_string();
+
+        assert!(
+            html.contains(r#"name="authenticity_submit" value="tok""#),
+            "{html}"
+        );
+    }
+
+    /// Without supplying a submit token, a `blank` form emits NO submit-token
+    /// hidden input — documenting the default and that the caller must supply the
+    /// minted token on the initial GET to protect the first submit.
+    #[test]
+    fn blank_form_without_submit_token_omits_submit_field() {
+        let form = NestedChangesetForm::<Order, LineItem>::blank(
+            Order {
+                name: String::new(),
+            },
+            Some("csrf".to_owned()),
+        );
+
+        let html = form
+            .form_tag("/orders", "post", maud::html! {})
+            .into_string();
+
+        assert!(!html.contains("_submit_token"), "{html}");
+        assert!(!html.contains(r#"name="_submit_token""#), "{html}");
     }
 }

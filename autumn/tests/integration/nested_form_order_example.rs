@@ -98,13 +98,17 @@ fn render_order_form(form: &NestedChangesetForm<OrderForm, LineItemForm>) -> mau
 fn new_view_renders_the_form_scaffold() {
     // A blank `new` page built via the NON-validating `blank` constructor:
     // parent name present-but-empty, no submitted rows, and — crucially — no
-    // premature validation error before the user types.
+    // premature validation error before the user types. The GET handler supplies
+    // the minted CSRF token (via `blank`) AND the one-time submit token (via
+    // `with_submit_token`) so the FIRST submission carries both hidden fields and
+    // is protected against double-submit, not just later 422 re-renders.
     let form = NestedChangesetForm::<OrderForm, LineItemForm>::blank(
         OrderForm {
             name: String::new(),
         },
         Some("csrf-token-123".to_owned()),
-    );
+    )
+    .with_submit_token(Some("submit-token-abc".to_owned()));
 
     let html = render_order_form(&form).into_string();
 
@@ -113,6 +117,12 @@ fn new_view_renders_the_form_scaffold() {
     // CSRF hidden field emitted by `form.form_tag`.
     assert!(
         html.contains(r#"name="_csrf" value="csrf-token-123""#),
+        "{html}"
+    );
+    // Submit-token hidden field emitted by `form.form_tag` on the initial GET,
+    // so the first submit is protected against double-submit.
+    assert!(
+        html.contains(r#"name="_submit_token" value="submit-token-abc""#),
         "{html}"
     );
     // Parent field and a blank child row.
