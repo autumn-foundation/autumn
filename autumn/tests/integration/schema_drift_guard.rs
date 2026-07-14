@@ -360,3 +360,81 @@ fn manual_schema_sections_are_registered() {
         "a bogus [time_zone] child key must be flagged now, got: {errors:?}"
     );
 }
+
+#[test]
+fn dynamic_key_sections_are_not_strict_validated() {
+    // Flatten maps and HashMap<String,_> config sections have ARBITRARY valid
+    // child keys the schema walker can't enumerate (e.g. OAuth2 provider names
+    // like `github` under [auth.oauth2], or hosts under
+    // [resilience.circuit_breaker.hosts]). They deserialize via
+    // SchemaDeserializer::deserialize_map, which registers NO schema entry, so
+    // `schema.get(path)` is None and validate_toml_table skips their children —
+    // no false-positive "unknown key". This guards against a future change that
+    // would give these a restrictive schema entry and break valid configs.
+    let schema = autumn_web::config::AutumnConfig::get_schema_keys();
+
+    // Always-present dynamic sections must have NO restrictive schema entry.
+    for dynamic in ["resilience.circuit_breaker.hosts", "jobs.queues"] {
+        let entry = schema.get(dynamic);
+        assert!(
+            entry.is_none(),
+            "{dynamic} is a dynamic-key section and must NOT have a restrictive \
+             schema entry (that would false-positive valid child keys); got {entry:?}",
+        );
+    }
+    // End-to-end: valid dynamic child keys are accepted (no unknown-key error).
+    let errors = autumn_web::config::AutumnConfig::validate_toml(
+        "[resilience.circuit_breaker.hosts.api]\nopen_duration_secs = 5\n",
+        &schema,
+    );
+    assert!(
+        errors
+            .iter()
+            .all(|(p, _)| !p.starts_with("resilience.circuit_breaker.hosts")),
+        "valid keys under a dynamic map section must not be flagged; got {errors:?}"
+    );
+}
+
+#[cfg(feature = "oauth2")]
+#[test]
+fn flattened_oauth2_providers_are_not_flagged() {
+    // Regression guard for the reviewer's exact example: [auth.oauth2.<name>] is
+    // a valid provider via `OAuth2Config::providers` (`#[serde(flatten)]`), so it
+    // must NOT be reported as an unknown key (which would hard-fail under
+    // strict_config_enforce_all).
+    let schema = autumn_web::config::AutumnConfig::get_schema_keys();
+    let entry = schema.get("auth.oauth2");
+    assert!(
+        entry.is_none(),
+        "auth.oauth2 is a flatten map and must have no restrictive schema entry; got {entry:?}",
+    );
+    let errors = autumn_web::config::AutumnConfig::validate_toml(
+        "[auth.oauth2.github]\nclient_id = \"x\"\nclient_secret = \"y\"\n",
+        &schema,
+    );
+    assert!(
+        errors.iter().all(|(p, _)| !p.starts_with("auth.oauth2")),
+        "flattened OAuth2 provider keys must not be flagged as unknown; got {errors:?}"
+    );
+}
+
+#[cfg(feature = "http-client")]
+#[test]
+fn http_client_base_urls_map_is_not_flagged() {
+    let schema = autumn_web::config::AutumnConfig::get_schema_keys();
+    let entry = schema.get("http.client.base_urls");
+    assert!(
+        entry.is_none(),
+        "http.client.base_urls is a HashMap and must have no restrictive schema entry; got {entry:?}",
+    );
+    let errors = autumn_web::config::AutumnConfig::validate_toml(
+        "[http.client.base_urls]\nstripe = \"https://api.stripe.com\"\n",
+        &schema,
+    );
+    assert!(
+        errors
+            .iter()
+            .all(|(p, _)| !p.starts_with("http.client.base_urls")),
+        "arbitrary base_urls map keys must not be flagged; got {errors:?}"
+    );
+}
