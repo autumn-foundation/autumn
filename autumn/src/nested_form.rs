@@ -1084,7 +1084,8 @@ impl RowScope<'_> {
     }
 
     /// Like [`RowScope::text_input`] but adds `required` + `aria-required="true"`
-    /// — **only for real/submitted rows** (`self.row.is_some()`).
+    /// — **only for real/submitted rows that are not marked for destruction**
+    /// (`self.row.is_some() && !self.is_destroyed()`).
     ///
     /// A blank template row (`row: None`, the one [`inputs_for`] auto-appends
     /// for the no-JS "add a child" path) deliberately renders the *same* input
@@ -1092,11 +1093,16 @@ impl RowScope<'_> {
     /// stays leaveable-empty. Otherwise the browser's native constraint
     /// validation would block form submit on the empty trailing template row
     /// *before* the server's all-blank rejection can run — a user who filled one
-    /// child row could not submit while a blank row sat beneath it. Required-ness
-    /// is still enforced server-side for any row the user actually engages: a
-    /// partially-filled row is retained as a `Some` row on re-render and
-    /// re-acquires `required`, and the decoder's all-blank rejection drops the
-    /// untouched template row. This composes with that all-blank rejection so
+    /// child row could not submit while a blank row sat beneath it. A submitted
+    /// row the user ticked `_destroy` on is skipped for the same reason: the
+    /// decoder drops destroyed rows before validation (and from `into_valid()`),
+    /// so re-emitting client-side `required` on an empty destroyed field would
+    /// let the browser block the next submit before the server can honor the
+    /// removal. Required-ness is still enforced server-side for any row the user
+    /// actually engages: a partially-filled, non-destroyed row is retained as a
+    /// `Some` row on re-render and re-acquires `required`, and the decoder's
+    /// all-blank rejection drops the untouched template row. This composes with
+    /// that all-blank rejection so
     /// neither the client nor the server treats the template row as a real child.
     #[must_use]
     pub fn required_text_input(&self, sub: &str, label: &str) -> maud::Markup {
@@ -1106,12 +1112,17 @@ impl RowScope<'_> {
     /// Shared body for the text-like inputs.
     fn text_like_input(&self, sub: &str, label: &str, required: bool) -> maud::Markup {
         // Emit the client-side `required`/`aria-required` constraint only for a
-        // real/submitted row. A blank template row (`row: None`) must stay
-        // leaveable-empty so the browser does not block submit on the trailing
-        // auto-appended blank row before the server's all-blank rejection runs;
-        // server-side validation still enforces required-ness for any row the
-        // user actually fills (it is retained as a `Some` row on re-render).
-        let required = required && self.row.is_some();
+        // real/submitted row that is *not* marked for destruction. A blank
+        // template row (`row: None`) must stay leaveable-empty so the browser
+        // does not block submit on the trailing auto-appended blank row before
+        // the server's all-blank rejection runs; server-side validation still
+        // enforces required-ness for any row the user actually fills (it is
+        // retained as a `Some` row on re-render). A submitted row the user
+        // ticked `_destroy` on is likewise skipped: the decoder drops destroyed
+        // rows before validation, so re-emitting client-side `required` on an
+        // empty destroyed field would let the browser's constraint validation
+        // block the next submit before the server can honor `_destroy`.
+        let required = required && self.row.is_some() && !self.is_destroyed();
         let errors = self.errors_for(sub);
         let has_errors = !errors.is_empty();
         let value = self.value(sub).unwrap_or_default();
@@ -1317,6 +1328,16 @@ impl Default for InputsForOptions {
 /// one-time submit token is **not** spent fetching the fragment (mirroring the
 /// inline-validation helpers in [`crate::form`]).
 ///
+/// The button also carries an `hx-vals` (`js:` form) that computes a fresh
+/// `index` for each request — `max(existing data-index) + 1` scanning only
+/// `#{container_id} .nested-fields__row[data-index]` (scoped to this form's
+/// container so multiple nested forms on a page never clash). The endpoint
+/// should read that `index` param and pass it to [`nested_row_fragment`] so
+/// every appended row gets a name unique within the form; a static request
+/// would reuse the same index and emit duplicate control names. This is the
+/// JS-present enhancement path only — the no-JS fallback (pre-rendered blank
+/// rows) needs no such counter and is unaffected.
+///
 /// # CSRF
 ///
 /// This renders only the child block. The surrounding `<form>` — via
@@ -1383,6 +1404,17 @@ pub fn inputs_for<P, C: NestedChild>(
                 }
             }
             @if let Some(url) = &opts.add_row_url {
+                // Send a *fresh* unique row index with every Add-row request.
+                // `nested_row_fragment` requires the returned row's index to be
+                // unique within this form; a static request would keep reusing
+                // the same index and produce duplicate control names. Compute
+                // `max(existing data-index) + 1` from THIS container's rows only
+                // (scoped by `#{container_id}` so multiple nested forms on one
+                // page never clash). The decoder tolerates gaps, so this stays
+                // collision-free even after client-side row removals.
+                @let hx_vals = format!(
+                    "js:{{\"index\": Math.max(-1, ...Array.from(document.querySelectorAll(\"#{container_id} .nested-fields__row[data-index]\")).map(function(e){{return parseInt(e.dataset.index,10);}})) + 1}}"
+                );
                 button
                     type="button"
                     class="nested-fields__add"
@@ -1390,6 +1422,7 @@ pub fn inputs_for<P, C: NestedChild>(
                     hx-target=(format!("#{container_id}"))
                     hx-swap="beforeend"
                     hx-params="not _submit_token"
+                    hx-vals=(hx_vals)
                 { "Add row" }
             }
         }
@@ -1402,6 +1435,13 @@ pub fn inputs_for<P, C: NestedChild>(
 /// by `render_row` with a blank [`RowScope`]. Because the decoder tolerates
 /// non-contiguous indices, `index` only needs to be **unique** within the form
 /// (e.g. a monotonically increasing counter the client tracks), not contiguous.
+///
+/// The [`inputs_for`] Add-row button sends this unique value as an `index`
+/// param (via `hx-vals`, computed as `max(existing data-index) + 1`). The
+/// endpoint should read that param from the query/form and pass it straight to
+/// `nested_row_fragment(index, ..)`. Uniqueness — not contiguity — is the
+/// contract: the decoder tolerates gaps, so indices left behind by client-side
+/// row removals never cause collisions.
 #[cfg(feature = "maud")]
 #[must_use]
 pub fn nested_row_fragment<C: NestedChild>(
@@ -1955,6 +1995,43 @@ mod maud_tests {
         assert!(!blank.contains("aria-required"), "{blank}");
     }
 
+    /// Fix (Codex P2, near the `required` gate): a submitted row the user ticked
+    /// `_destroy` on must ALSO omit the client-side `required`/`aria-required`,
+    /// exactly like a blank template row. Otherwise, in a 422 re-render where the
+    /// user checked Remove on a row with an empty required field, the browser's
+    /// constraint validation would block the next submit before the server can
+    /// honor `_destroy`. A non-destroyed submitted row in the same render keeps
+    /// the constraint.
+    #[test]
+    fn destroyed_row_omits_client_required_while_submitted_row_keeps_it() {
+        // Row 0: an ordinary submitted row. Row 1: the user ticked Remove on a
+        // row whose required `sku` is empty (it is retained because `quantity`
+        // is non-blank, so the all-blank rejection does not drop it).
+        let pairs = vec![
+            p("name", "Order 1"),
+            p("items[0][sku]", "A-1"),
+            p("items[0][quantity]", "2"),
+            p("items[1][sku]", ""),
+            p("items[1][quantity]", "9"),
+            p("items[1][_destroy]", "1"),
+        ];
+        let cs = decode_nested_urlencoded::<Order, LineItem>(&pairs).expect("parent decodes");
+        assert!(cs.rows()[1].is_destroyed());
+        let html = inputs_for(&cs, &InputsForOptions::default(), render_row).into_string();
+
+        // The non-destroyed submitted row keeps the client-side constraint.
+        let kept = tag_with_name(&html, "items[0][sku]");
+        assert!(kept.contains(" required"), "{kept}");
+        assert!(kept.contains(r#"aria-required="true""#), "{kept}");
+
+        // The destroyed row omits both, exactly like a blank template row, so a
+        // form carrying an empty required field on a to-be-removed row still
+        // submits and the server can honor `_destroy`.
+        let destroyed = tag_with_name(&html, "items[1][sku]");
+        assert!(!destroyed.contains("required"), "{destroyed}");
+        assert!(!destroyed.contains("aria-required"), "{destroyed}");
+    }
+
     #[test]
     fn always_emits_a_blank_row_even_when_blank_rows_zero() {
         let cs = two_row_changeset();
@@ -1997,6 +2074,38 @@ mod maud_tests {
         assert!(html.contains(r#"hx-swap="beforeend""#), "{html}");
         assert!(html.contains(r#"hx-get="/orders/line-item-row""#), "{html}");
         assert!(html.contains(r##"hx-target="#items-rows""##), "{html}");
+    }
+
+    /// Fix (Codex P2, near the Add-row button): the Add-row button sends a fresh
+    /// unique `index` with each htmx request via `hx-vals` (`js:` form) computed
+    /// from THIS container's rows (`max(existing data-index) + 1`), so repeated
+    /// clicks never reuse an index and emit duplicate control names. The selector
+    /// is scoped to the form's own container id so multiple nested forms on one
+    /// page do not clash. The pre-existing htmx attrs stay intact.
+    #[test]
+    fn add_button_hx_vals_sends_fresh_container_scoped_index() {
+        let cs = two_row_changeset();
+        let opts = InputsForOptions {
+            add_row_url: Some("/orders/line-item-row".into()),
+            ..InputsForOptions::default()
+        };
+        let html = inputs_for(&cs, &opts, render_row).into_string();
+
+        // Pre-existing htmx wiring is preserved.
+        assert!(html.contains(r#"hx-get="/orders/line-item-row""#), "{html}");
+        assert!(html.contains(r#"hx-swap="beforeend""#), "{html}");
+        assert!(html.contains(r#"hx-params="not _submit_token""#), "{html}");
+
+        // A JS-computed `hx-vals` that sends a fresh `index`…
+        assert!(html.contains("hx-vals="), "{html}");
+        assert!(html.contains("Math.max(-1"), "{html}");
+        // …referencing the `index` param and reading each row's `data-index`…
+        assert!(html.contains("parseInt(e.dataset.index,10)"), "{html}");
+        // …via a selector scoped to THIS form's container id.
+        assert!(
+            html.contains("#items-rows .nested-fields__row[data-index]"),
+            "{html}"
+        );
     }
 
     #[test]
