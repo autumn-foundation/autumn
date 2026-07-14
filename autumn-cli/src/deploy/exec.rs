@@ -656,10 +656,14 @@ fn record_live_slot(cfg: &ResolvedDeployConfig, slot: &str) -> RemoteCommand {
 /// starting the server.
 fn release_migrate_command(cfg: &ResolvedDeployConfig, release_dir: &str) -> RemoteCommand {
     let bin = format!("{release_dir}/{}", cfg.app_name);
+    // Scope the transient unit to this release so overlapping deploys (or a prior
+    // run whose unit was not yet collected) never collide on "Unit already
+    // exists". The release id is the final path component of the release dir.
+    let release_id = release_dir.rsplit('/').next().unwrap_or(release_dir);
     RemoteCommand::new(
         "migrate",
         format!(
-            "systemd-run --wait --collect --quiet --unit={service}-migrate \
+            "systemd-run --wait --collect --quiet --unit={service}-migrate-{release_id} \
              --property=EnvironmentFile={env} --setenv=AUTUMN_MIGRATE=1 {bin}",
             service = cfg.service_name,
             env = shell_quote(&cfg.env_file()),
@@ -670,8 +674,12 @@ fn release_migrate_command(cfg: &ResolvedDeployConfig, release_dir: &str) -> Rem
 
 /// Prune shell: keep the newest `keep` release dirs, delete the rest. `ls -1dt`
 /// lists dirs newest-first; `tail -n +{keep+1}` skips the newest `keep`.
+///
+/// `keep` is clamped to at least 1: a `keep` of 0 would make `tail -n +1` list
+/// EVERY release — including the just-deployed active one — and `rm -rf` it.
 #[must_use]
 fn prune_releases_shell(releases_dir: &str, keep: u32) -> String {
+    let keep = keep.max(1);
     format!(
         "cd {} && ls -1dt */ 2>/dev/null | tail -n +{} | xargs -r rm -rf",
         shell_quote(releases_dir),
@@ -1147,7 +1155,7 @@ mod tests {
         assert!(gate.contains("127.0.0.1:3001/ready"), "gate: {gate}");
         let route_cmd = exec.shell_for("proxy-route").expect("route ran");
         assert!(
-            route_cmd.contains("--target 127.0.0.1:3001"),
+            route_cmd.contains("--target '127.0.0.1:3001'"),
             "proxy routes at the blue loopback port: {route_cmd}"
         );
     }
@@ -1199,7 +1207,7 @@ mod tests {
         assert!(gate.contains("127.0.0.1:3002/ready"), "gate: {gate}");
         let flip = exec.shell_for("proxy-flip").expect("flip ran");
         assert!(
-            flip.contains("kamal-proxy deploy") && flip.contains("--target 127.0.0.1:3002"),
+            flip.contains("kamal-proxy deploy") && flip.contains("--target '127.0.0.1:3002'"),
             "flip targets the candidate: {flip}"
         );
         // The old (blue) release is drained; current is promoted to the new dir.

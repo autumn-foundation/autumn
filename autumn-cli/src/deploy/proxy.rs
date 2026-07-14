@@ -105,12 +105,15 @@ impl KamalProxyController {
     /// the health-gated flip. Centralized so the exact CLI contract lives in one
     /// place (a Caddy controller would replace THIS with an admin-API call).
     fn deploy_shell(&self, service: &str, target: &str) -> String {
+        // Every string parameter is shell-quoted so a service name, upstream, or
+        // health-check path carrying query params / special chars can't break out
+        // of the command. The numeric timeouts need no quoting.
         format!(
             "kamal-proxy deploy {service} --target {target} \
              --health-check-path {path} --deploy-timeout {deploy}s --drain-timeout {drain}s",
             service = shell_quote(service),
-            target = target,
-            path = self.health_check_path,
+            target = shell_quote(target),
+            path = shell_quote(&self.health_check_path),
             deploy = self.deploy_timeout_secs,
             drain = self.drain_timeout_secs,
         )
@@ -184,8 +187,8 @@ mod tests {
         // candidate's /ready and the deploy timeout is the readiness window.
         assert_eq!(
             cmd.shell,
-            "kamal-proxy deploy 'myapp' --target 127.0.0.1:3002 \
-             --health-check-path /ready --deploy-timeout 60s --drain-timeout 30s",
+            "kamal-proxy deploy 'myapp' --target '127.0.0.1:3002' \
+             --health-check-path '/ready' --deploy-timeout 60s --drain-timeout 30s",
         );
     }
 
