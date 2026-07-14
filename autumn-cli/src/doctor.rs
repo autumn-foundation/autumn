@@ -5981,8 +5981,7 @@ pub fn run(opts: DoctorOptions) {
             || deploy_db_topology.replica_url.is_some()
             || deploy_shards_result
                 .as_ref()
-                .map(|shards| !shards.is_empty())
-                .unwrap_or(false);
+                .is_ok_and(|shards| !shards.is_empty());
         let deploy_db_url_result = deploy_shards_result.map(|deploy_shards| {
             deploy_db_topology
                 .primary_url
