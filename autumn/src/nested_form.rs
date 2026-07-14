@@ -109,8 +109,9 @@
 //! blocks submission (on a required-field child) or saves an empty row (on an
 //! all-optional child). Supplying [`InputsForOptions::add_row_url`] additionally emits an
 //! htmx "Add row" button (`hx-get` + `hx-swap="beforeend"`, with
-//! `hx-params="not _submit_token"` so the one-time submit token is not spent
-//! fetching the fragment); [`nested_row_fragment`] renders the server response
+//! `hx-params="none"` so no form fields — and no CSRF/submit token — are
+//! serialized into the fragment request; only the `hx-vals` `index` is sent);
+//! [`nested_row_fragment`] renders the server response
 //! for that endpoint. htmx is a progressive enhancement layered over the no-JS
 //! path — it is never required.
 //!
@@ -1324,9 +1325,12 @@ impl Default for InputsForOptions {
 ///
 /// When [`InputsForOptions::add_row_url`] is `Some`, an "Add row"
 /// `<button type="button">` is emitted with `hx-get`, `hx-target="#{container_id}"`,
-/// `hx-swap="beforeend"`, and — critically — `hx-params="not _submit_token"` so the
-/// one-time submit token is **not** spent fetching the fragment (mirroring the
-/// inline-validation helpers in [`crate::form`]).
+/// `hx-swap="beforeend"`, and — critically — `hx-params="none"` so **no**
+/// form-field inputs (and no `_csrf`/submit token) are serialized into the
+/// Add-row GET; per htmx semantics `not X` would include every parameter
+/// except `X`, leaking the current parent + line-item fields into the request
+/// query string / proxy logs. The fragment endpoint needs only the `index`,
+/// which the `hx-vals` below supplies independently of `hx-params` filtering.
 ///
 /// The button also carries an `hx-vals` (`js:` form) that computes a fresh
 /// `index` for each request — `max(existing data-index) + 1` scanning only
@@ -1412,6 +1416,15 @@ pub fn inputs_for<P, C: NestedChild>(
                 // (scoped by `#{container_id}` so multiple nested forms on one
                 // page never clash). The decoder tolerates gaps, so this stays
                 // collision-free even after client-side row removals.
+                //
+                // `hx-params="none"` serializes NO form-field inputs with the
+                // Add-row GET: per htmx semantics `not X` would include every
+                // parameter except `X`, leaking the current parent + line-item
+                // fields (and `_csrf`) into the request query string / proxy
+                // logs and risking URL-length limits. The fragment endpoint
+                // needs only the `index`, which `hx-vals` supplies independently
+                // of `hx-params` filtering, so `"none"` sends the `index` and
+                // nothing else (no form fields, no CSRF/submit token).
                 @let hx_vals = format!(
                     "js:{{\"index\": Math.max(-1, ...Array.from(document.querySelectorAll(\"#{container_id} .nested-fields__row[data-index]\")).map(function(e){{return parseInt(e.dataset.index,10);}})) + 1}}"
                 );
@@ -1421,7 +1434,7 @@ pub fn inputs_for<P, C: NestedChild>(
                     hx-get=(url)
                     hx-target=(format!("#{container_id}"))
                     hx-swap="beforeend"
-                    hx-params="not _submit_token"
+                    hx-params="none"
                     hx-vals=(hx_vals)
                 { "Add row" }
             }
@@ -1437,9 +1450,12 @@ pub fn inputs_for<P, C: NestedChild>(
 /// (e.g. a monotonically increasing counter the client tracks), not contiguous.
 ///
 /// The [`inputs_for`] Add-row button sends this unique value as an `index`
-/// param (via `hx-vals`, computed as `max(existing data-index) + 1`). The
-/// endpoint should read that param from the query/form and pass it straight to
-/// `nested_row_fragment(index, ..)`. Uniqueness — not contiguity — is the
+/// param (via `hx-vals`, computed as `max(existing data-index) + 1`). Because
+/// the button sets `hx-params="none"`, the Add-row request carries ONLY the
+/// `hx-vals` `index` — no parent/line-item form fields and no CSRF/submit
+/// token are serialized — and `index` is the only value this endpoint needs.
+/// The endpoint should read that param from the query/form and pass it straight
+/// to `nested_row_fragment(index, ..)`. Uniqueness — not contiguity — is the
 /// contract: the decoder tolerates gaps, so indices left behind by client-side
 /// row removals never cause collisions.
 #[cfg(feature = "maud")]
@@ -2063,14 +2079,15 @@ mod maud_tests {
         let none = inputs_for(&cs, &InputsForOptions::default(), render_row).into_string();
         assert!(!none.contains("Add row"), "{none}");
 
-        // With URL: button carries the submit-token filter and beforeend swap.
+        // With URL: button serializes no form fields (`hx-params="none"`) and
+        // uses a beforeend swap.
         let opts = InputsForOptions {
             add_row_url: Some("/orders/line-item-row".into()),
             ..InputsForOptions::default()
         };
         let html = inputs_for(&cs, &opts, render_row).into_string();
         assert!(html.contains("Add row"), "{html}");
-        assert!(html.contains(r#"hx-params="not _submit_token""#), "{html}");
+        assert!(html.contains(r#"hx-params="none""#), "{html}");
         assert!(html.contains(r#"hx-swap="beforeend""#), "{html}");
         assert!(html.contains(r#"hx-get="/orders/line-item-row""#), "{html}");
         assert!(html.contains(r##"hx-target="#items-rows""##), "{html}");
@@ -2094,7 +2111,7 @@ mod maud_tests {
         // Pre-existing htmx wiring is preserved.
         assert!(html.contains(r#"hx-get="/orders/line-item-row""#), "{html}");
         assert!(html.contains(r#"hx-swap="beforeend""#), "{html}");
-        assert!(html.contains(r#"hx-params="not _submit_token""#), "{html}");
+        assert!(html.contains(r#"hx-params="none""#), "{html}");
 
         // A JS-computed `hx-vals` that sends a fresh `index`…
         assert!(html.contains("hx-vals="), "{html}");
