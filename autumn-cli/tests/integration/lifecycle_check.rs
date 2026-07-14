@@ -514,3 +514,134 @@ fn diagram_dot_emits_digraph() {
         "dot output should mark the initial state\n{stdout}"
     );
 }
+
+#[test]
+fn alias_in_one_module_does_not_leak_to_sibling() {
+    // Regression: a `use autumn_web::lifecycle as lc;` inside `mod a` must be
+    // scoped to `mod a` only. In `mod b`, `lc` is a *different* macro (never
+    // aliased to autumn's lifecycle here), and its arguments are not a valid
+    // lifecycle grammar. If the alias leaked file-wide, the scanner would misparse
+    // `mod b`'s `#[lc(...)]` as a lifecycle and emit a malformed-lifecycle error,
+    // failing the check. With per-module scoping it is skipped, so `Alpha` (sound)
+    // is the only lifecycle scanned and the check passes cleanly.
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "src/lib.rs",
+        r#"
+mod a {
+    use autumn_web::lifecycle as lc;
+
+    #[lc(
+        initial = Draft,
+        terminal(Done),
+        transitions(
+            Draft -> Done,
+        )
+    )]
+    pub enum Alpha {
+        Draft,
+        Done,
+    }
+}
+
+mod b {
+    // `lc` here is NOT autumn's lifecycle: no `use ... as lc` in this module. Its
+    // arguments would be a malformed lifecycle if the sibling alias leaked in.
+    #[lc(role = "admin", audit)]
+    pub enum Beta {
+        Active,
+        Inactive,
+    }
+}
+"#,
+    );
+    let output = run_lifecycle(dir.path(), &["check"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "a sibling module's unrelated `#[lc]` must not be misread as a lifecycle\nstdout:\n{stdout}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains("Alpha"),
+        "the genuinely-aliased lifecycle in module a should be scanned\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("Beta"),
+        "module b's `#[lc]` is not an autumn lifecycle and must be skipped\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("malformed"),
+        "no malformed-lifecycle error should be attributed to the leaked alias\n{stdout}"
+    );
+    assert!(stdout.contains("PASS"), "stdout:\n{stdout}");
+}
+
+#[test]
+fn dot_diagram_with_multiple_lifecycles_is_single_digraph() {
+    // With more than one lifecycle, `--format dot` must emit ONE `digraph`
+    // containing a `subgraph cluster_<name>` per lifecycle — not several
+    // back-to-back `digraph {}` blocks (invalid DOT: one graph per document).
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "src/order.rs",
+        r"
+#[lifecycle(
+    initial = Cart,
+    terminal(Delivered),
+    transitions(
+        Cart -> Delivered,
+    )
+)]
+pub enum OrderState {
+    Cart,
+    Delivered,
+}
+",
+    );
+    write(
+        dir.path(),
+        "src/post.rs",
+        r"
+#[lifecycle(
+    initial = Draft,
+    terminal(Published),
+    transitions(
+        Draft -> Published,
+    )
+)]
+pub enum PostState {
+    Draft,
+    Published,
+}
+",
+    );
+    let output = run_lifecycle(dir.path(), &["diagram", "--format", "dot"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "dot render of multiple lifecycles should exit 0\nstdout:\n{stdout}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        stdout.matches("digraph").count(),
+        1,
+        "multiple lifecycles must be one single digraph document\n{stdout}"
+    );
+    assert_eq!(
+        stdout.matches("subgraph cluster_").count(),
+        2,
+        "each lifecycle should be its own cluster subgraph\n{stdout}"
+    );
+    assert!(
+        stdout.contains("cluster_OrderState") && stdout.contains("cluster_PostState"),
+        "both lifecycles should be present as named clusters\n{stdout}"
+    );
+    assert_eq!(
+        stdout.matches('{').count(),
+        stdout.matches('}').count(),
+        "the DOT document must have balanced braces\n{stdout}"
+    );
+}

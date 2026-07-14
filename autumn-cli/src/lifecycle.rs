@@ -30,9 +30,12 @@
 //!
 //! **Attribute-recognition limits.** The scanner recognizes the `#[lifecycle]`
 //! macro under a bare `#[lifecycle(...)]` path, a qualified path whose last
-//! segment is `lifecycle` (e.g. `#[autumn_web::lifecycle(...)]`), and a
-//! *same-file* alias introduced by `use ...::lifecycle as <alias>;` (matched by
-//! its terminal `lifecycle` rename). Like the `autumn a11y verify`
+//! segment is `lifecycle` (e.g. `#[autumn_web::lifecycle(...)]`), and an
+//! in-scope alias introduced by `use ...::lifecycle as <alias>;` (matched by its
+//! terminal `lifecycle` rename). Such an alias is honored only within the module
+//! subtree where the `use` appears — it does not leak to a parent or sibling
+//! module — so a sibling's unrelated `#[<alias>(...)]` macro is never misread as
+//! a lifecycle. Like the `autumn a11y verify`
 //! escape-hatch scanner, this is a best-effort textual pass, not a resolver: it
 //! cannot follow an alias introduced in *another* file, nor one laundered
 //! through a glob re-export (`pub use ...::lifecycle;` then `use crate::x::*;`).
@@ -509,32 +512,12 @@ fn scan_source(src: &str, file: &str, scan: &mut Scan) {
     let Ok(ast) = syn::parse_file(src) else {
         return;
     };
-    // Aliases are per-file: collect every `use ...::lifecycle as <alias>;` in the
-    // file (at any inline-module depth) up front, then recognize `#[<alias>(...)]`
-    // anywhere in that same file.
-    let mut aliases = BTreeSet::new();
-    collect_lifecycle_aliases(&ast.items, &mut aliases);
-    scan_items(&ast.items, file, scan, &aliases);
-}
-
-/// Recursively collect same-file aliases of the `#[lifecycle]` attribute macro:
-/// for each `use ...::lifecycle as <alias>;` rename found anywhere in the file
-/// (including inside inline modules), record `<alias>`. Only a rename whose
-/// *original* terminal name is `lifecycle` counts; glob and plain-name imports
-/// carry no rename and are ignored (see the module-level attribute-recognition
-/// limits).
-fn collect_lifecycle_aliases(items: &[syn::Item], out: &mut BTreeSet<String>) {
-    for item in items {
-        match item {
-            syn::Item::Use(item_use) => collect_use_tree_aliases(&item_use.tree, out),
-            syn::Item::Mod(item_mod) => {
-                if let Some((_, inner)) = &item_mod.content {
-                    collect_lifecycle_aliases(inner, out);
-                }
-            }
-            _ => {}
-        }
-    }
+    // Aliases are scoped lexically to the module subtree in which the
+    // `use ...::lifecycle as <alias>;` appears. The scan starts at the file root
+    // with an empty inherited set; each module extends it with its own renames
+    // (see `scan_items`) and passes that extended set only to its descendants, so
+    // a `use` inside a child module never leaks to a parent or sibling module.
+    scan_items(&ast.items, file, scan, &BTreeSet::new());
 }
 
 /// Walk a `use` tree, recording the rename target of any `lifecycle as <alias>`.
@@ -558,17 +541,38 @@ fn collect_use_tree_aliases(tree: &syn::UseTree, out: &mut BTreeSet<String>) {
 /// Recursively walk a list of items, collecting every `#[lifecycle]` enum —
 /// including those nested inside inline modules (`mod orders { ... }`, stored as
 /// `Item::Mod` with `content`). Modules without inline content (`mod foo;`) have
-/// no items to walk and are ignored. `aliases` are the same-file
-/// `lifecycle`-attribute aliases discovered by [`collect_lifecycle_aliases`].
-fn scan_items(items: &[syn::Item], file: &str, scan: &mut Scan, aliases: &BTreeSet<String>) {
+/// no items to walk and are ignored.
+///
+/// `inherited_aliases` are the `use ...::lifecycle as <alias>;` renames in scope
+/// from enclosing modules. Aliases are scoped lexically: at this module level we
+/// compute `local_aliases = inherited_aliases ∪ {this module's own lifecycle-use
+/// renames}`, apply it to enums declared directly here, and pass it as the
+/// inherited set when descending into child modules. A `use` in a child module is
+/// therefore invisible to its parent and siblings — so an alias declared in one
+/// module cannot make a sibling module's unrelated `#[alias(...)]` (a different
+/// macro that happens to share the name) be misread as a lifecycle.
+fn scan_items(
+    items: &[syn::Item],
+    file: &str,
+    scan: &mut Scan,
+    inherited_aliases: &BTreeSet<String>,
+) {
+    // A `use` is visible throughout its module regardless of textual position, so
+    // gather this module's own lifecycle renames before scanning any enum here.
+    let mut local_aliases = inherited_aliases.clone();
+    for item in items {
+        if let syn::Item::Use(item_use) = item {
+            collect_use_tree_aliases(&item_use.tree, &mut local_aliases);
+        }
+    }
     for item in items {
         match item {
             syn::Item::Enum(item_enum) => {
-                collect_lifecycle_enum(item_enum, file, scan, aliases);
+                collect_lifecycle_enum(item_enum, file, scan, &local_aliases);
             }
             syn::Item::Mod(item_mod) => {
                 if let Some((_, inner)) = &item_mod.content {
-                    scan_items(inner, file, scan, aliases);
+                    scan_items(inner, file, scan, &local_aliases);
                 }
             }
             _ => {}
@@ -579,8 +583,9 @@ fn scan_items(items: &[syn::Item], file: &str, scan: &mut Scan, aliases: &BTreeS
 /// If `item_enum` carries a `#[lifecycle(...)]` attribute, parse it into a
 /// [`LifecycleDef`]; a malformed attribute is recorded as an error naming `file`.
 ///
-/// `aliases` holds the same-file `use ...::lifecycle as <alias>;` renames, so an
-/// aliased single-segment invocation `#[<alias>(...)]` is recognized too. See the
+/// `aliases` holds the in-scope `use ...::lifecycle as <alias>;` renames (this
+/// module's own plus those inherited from enclosing modules), so an aliased
+/// single-segment invocation `#[<alias>(...)]` is recognized too. See the
 /// module-level attribute-recognition limits for what this cannot resolve.
 fn collect_lifecycle_enum(
     item_enum: &syn::ItemEnum,
@@ -750,16 +755,10 @@ pub fn run_diagram(root: &Path, opts: &DiagramOptions) -> i32 {
         return 1;
     }
 
-    let mut output = String::new();
-    for (i, wf) in scan.lifecycles.iter().enumerate() {
-        if i > 0 {
-            output.push('\n');
-        }
-        match opts.format {
-            DiagramFormat::Dot => output.push_str(&render_dot(wf)),
-            DiagramFormat::Mermaid => output.push_str(&render_mermaid(wf)),
-        }
-    }
+    let output = match opts.format {
+        DiagramFormat::Dot => render_dot_document(&scan.lifecycles),
+        DiagramFormat::Mermaid => render_mermaid_document(&scan.lifecycles),
+    };
 
     match &opts.out {
         Some(path) => {
@@ -781,6 +780,39 @@ pub fn run_diagram(root: &Path, opts: &DiagramOptions) -> i32 {
     0
 }
 
+/// Render every discovered lifecycle as a **single** Mermaid `stateDiagram-v2`
+/// document. A lone lifecycle renders as a plain top-level diagram (unchanged);
+/// multiple lifecycles each become a composite `state "<Name>" as <id> { ... }`
+/// inside one diagram, because concatenating several `stateDiagram-v2` headers is
+/// not a single valid Mermaid document. State ids are namespaced by lifecycle so
+/// a state name shared across lifecycles stays a distinct node, each carrying a
+/// label of its bare state name.
+#[must_use]
+fn render_mermaid_document(lifecycles: &[LifecycleDef]) -> String {
+    if let [single] = lifecycles {
+        return render_mermaid(single);
+    }
+    let mut out = String::new();
+    out.push_str("stateDiagram-v2\n");
+    for wf in lifecycles {
+        let ns = sanitize_ident(&wf.name);
+        let sid = |state: &str| format!("{ns}_{}", sanitize_ident(state));
+        let _ = writeln!(out, "    state \"{}\" as {ns} {{", wf.name);
+        for state in &wf.states {
+            let _ = writeln!(out, "        state \"{state}\" as {}", sid(state));
+        }
+        let _ = writeln!(out, "        [*] --> {}", sid(&wf.initial));
+        for (from, to) in &wf.transitions {
+            let _ = writeln!(out, "        {} --> {}", sid(from), sid(to));
+        }
+        for t in &wf.terminals {
+            let _ = writeln!(out, "        {} --> [*]", sid(t));
+        }
+        out.push_str("    }\n");
+    }
+    out
+}
+
 /// Render a lifecycle as a Mermaid `stateDiagram-v2` block. The initial state is
 /// entered from `[*]`; each terminal state exits to `[*]`, which is how Mermaid
 /// renders start/end markers.
@@ -797,6 +829,72 @@ pub fn render_mermaid(wf: &LifecycleDef) -> String {
         let _ = writeln!(out, "    {t} --> [*]");
     }
     out
+}
+
+/// Render every discovered lifecycle as a **single** Graphviz DOT document. A
+/// lone lifecycle renders as a plain `digraph <Name>` (unchanged); multiple
+/// lifecycles render as one `digraph` containing a `subgraph cluster_<name>` per
+/// lifecycle. Emitting several complete `digraph {}` blocks back-to-back is not a
+/// single valid DOT document (consumers expect one graph per document), so the
+/// multi-lifecycle case must be one graph with clusters.
+#[must_use]
+fn render_dot_document(lifecycles: &[LifecycleDef]) -> String {
+    if let [single] = lifecycles {
+        return render_dot(single);
+    }
+    let mut out = String::new();
+    out.push_str("digraph {\n");
+    out.push_str("    rankdir=LR;\n");
+    out.push_str("    node [shape=box, style=rounded];\n");
+    for wf in lifecycles {
+        write_dot_cluster(&mut out, wf);
+    }
+    out.push_str("}\n");
+    out
+}
+
+/// Write one lifecycle as a `subgraph cluster_<name> { ... }` block. Node ids are
+/// namespaced by the lifecycle name (DOT node ids live in the digraph's single
+/// global namespace, so an un-namespaced state shared across lifecycles would
+/// collapse into one node), and each carries a `label` of its bare state name.
+fn write_dot_cluster(out: &mut String, wf: &LifecycleDef) {
+    let ns = sanitize_ident(&wf.name);
+    let nid = |state: &str| dot_id(&format!("{ns}.{state}"));
+    let start = dot_id(&format!("{ns}.__start"));
+    let _ = writeln!(out, "    subgraph cluster_{ns} {{");
+    let _ = writeln!(out, "        label={};", dot_id(&wf.name));
+    let _ = writeln!(out, "        {start} [shape=point, width=0.15];");
+    for state in &wf.states {
+        let mut attrs = format!("label={}", dot_id(state));
+        if state == &wf.initial {
+            attrs.push_str(", style=\"rounded,filled\", fillcolor=lightblue");
+        }
+        if wf.terminals.contains(state) {
+            attrs.push_str(", shape=doublecircle");
+        }
+        let _ = writeln!(out, "        {} [{attrs}];", nid(state));
+    }
+    let _ = writeln!(out, "        {start} -> {};", nid(&wf.initial));
+    for (from, to) in &wf.transitions {
+        let _ = writeln!(out, "        {} -> {};", nid(from), nid(to));
+    }
+    out.push_str("    }\n");
+}
+
+/// Sanitize an enum/lifecycle name into a bare DOT/Mermaid identifier by
+/// replacing every character that is not ASCII-alphanumeric or `_` with `_`. Rust
+/// idents already satisfy this, but the pass keeps cluster/composite ids valid
+/// regardless of the input.
+fn sanitize_ident(name: &str) -> String {
+    name.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 /// Render a lifecycle as a Graphviz DOT `digraph`. The initial state is filled
