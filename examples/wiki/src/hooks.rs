@@ -56,11 +56,24 @@ impl MutationHooks for PageHooks {
             draft.after.slug = slugify(&draft.after.title);
         }
 
-        // State-machine transitions are no longer enforced here: status changes
-        // flow through the dedicated `POST /pages/{slug}/transitions/status`
-        // route, which calls the macro-generated `Page::transition_status_to`.
-        // The edit form only edits title/body, so `draft.after.status` always
-        // equals `draft.before.status` on this path.
+        // Enforce state-machine transitions on EVERY update path. The HTML edit
+        // form only edits title/body (status changes flow through the dedicated
+        // `POST /pages/{slug}/transitions/status` route), so `draft.after.status`
+        // normally equals `draft.before.status` here. But the JSON API /
+        // repository path (`page_api_update`, mounted in `main.rs`) can set
+        // `UpdatePage.status` directly — e.g. `published -> draft` — which would
+        // otherwise bypass the state machine. When the incoming update changes
+        // `status`, validate it is a legal edge by driving the macro-generated
+        // `Page::transition_status_to` (DRY with the state machine, no hand-rolled
+        // match): build the proposed row (new content, OLD status) so the
+        // `can_publish` guard evaluates against the proposed content, then
+        // propagate the transition's `Err` — an illegal edge or a rejected guard
+        // is a 400 and the write is refused.
+        if draft.after.status != draft.before.status {
+            let mut proposed = draft.after.clone();
+            proposed.status.clone_from(&draft.before.status);
+            proposed.transition_status_to(&draft.after.status)?;
+        }
 
         // Maintain the published-page content invariant even when status is
         // unchanged; an edit that clears title/body on an already-published
@@ -286,6 +299,77 @@ mod tests {
 
         let mut draft = UpdateDraft { before, after };
         hooks.before_update(&mut ctx, &mut draft).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn before_update_allows_legal_draft_to_published_transition() {
+        // The API/repository update path can change status directly. A legal
+        // edge (draft -> published) with publishable content must pass through
+        // `before_update` — proving the hook enforces the state machine, not just
+        // the HTML transition route.
+        let hooks = PageHooks;
+        let mut ctx = MutationContext::new(MutationOp::Update);
+        let before = page_with("draft", "Some content");
+        let mut after = before.clone();
+        after.status = "published".into();
+
+        let mut draft = UpdateDraft { before, after };
+        hooks.before_update(&mut ctx, &mut draft).await.unwrap();
+        assert_eq!(draft.after.status, "published");
+    }
+
+    #[tokio::test]
+    async fn before_update_allows_legal_published_to_archived_transition() {
+        // published -> archived is an unguarded defined edge, completing the
+        // draft -> published -> archived chain through the update hook path.
+        let hooks = PageHooks;
+        let mut ctx = MutationContext::new(MutationOp::Update);
+        let before = page_with("published", "Some content");
+        let mut after = before.clone();
+        after.status = "archived".into();
+
+        let mut draft = UpdateDraft { before, after };
+        hooks.before_update(&mut ctx, &mut draft).await.unwrap();
+        assert_eq!(draft.after.status, "archived");
+    }
+
+    #[tokio::test]
+    async fn before_update_rejects_illegal_transition_via_api_path() {
+        // Regression (issue #1326): `page_api_update` can set `status` directly.
+        // An illegal edge (published -> draft) that never goes through the HTML
+        // transition route must still be REJECTED by `before_update`, so the API
+        // cannot bypass the state machine.
+        let hooks = PageHooks;
+        let mut ctx = MutationContext::new(MutationOp::Update);
+        let before = page_with("published", "Some content");
+        let mut after = before.clone();
+        after.status = "draft".into(); // illegal: no published -> draft edge
+
+        let mut draft = UpdateDraft { before, after };
+        let result = hooks.before_update(&mut ctx, &mut draft).await;
+        assert!(
+            result.is_err(),
+            "an illegal published -> draft transition via the API path must be rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn before_update_transition_guard_rejects_publishing_empty_body() {
+        // The can_publish guard must be enforced on the update-hook transition
+        // path too: draft -> published with an empty body is a rejected guard.
+        let hooks = PageHooks;
+        let mut ctx = MutationContext::new(MutationOp::Update);
+        let before = page_with("draft", "Some content");
+        let mut after = before.clone();
+        after.body = String::new();
+        after.status = "published".into();
+
+        let mut draft = UpdateDraft { before, after };
+        let result = hooks.before_update(&mut ctx, &mut draft).await;
+        assert!(
+            result.is_err(),
+            "publishing with an empty body via the update hook must be rejected by the guard"
+        );
     }
 
     #[tokio::test]
