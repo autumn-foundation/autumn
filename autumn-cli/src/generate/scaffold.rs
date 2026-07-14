@@ -486,29 +486,35 @@ fn plan_scaffold_with_options_impl(
         && !options_with_key.live
         && !options_with_key.live_validation;
 
-    // Issue #1319 security guard: the generated `GET /{plural}/search` handler calls
-    // the repository's UNSCOPED `search_page`, which returns rows for ALL users. When
-    // the model is owner-scoped, the index view is `#[secured]` and filters to the
-    // current user's rows — so pairing `--searchable` with owner scoping would leak
-    // other users' rows through the search endpoint that the list view prevents.
-    // Owner-scoped FTS needs a scoped `search_page` in the repository macro (framework
-    // work, tracked in #1841); until then, refuse the unsafe combination. Returns
-    // before the plan is built, so no files are written.
-    // The leak exists wherever an owner-scoped index coexists with the search
-    // box; search is force-disabled for `--live`/`--live-validation` (see
-    // `search_enabled`), so this covers the standard and `--sharded` owner paths.
+    // Issue #1841: owner-scoped full-text search is now supported on the STANDARD
+    // (non-live, non-sharded) Db path. The `#[repository(..., owner = <col>)]`
+    // attr makes the macro emit an owner-filtered `search_page_scoped` (and
+    // `list_scoped`), and the generated `GET /{plural}/search` + owner-scoped
+    // index call ONLY those scoped methods — never the unscoped `search_page`/
+    // `page`. So `--searchable` + owner scoping is safe there and no longer
+    // refused.
+    //
+    // The `--sharded` owner path is NOT yet wired: its index/search still run
+    // through per-shard raw diesel / the unscoped `search_page`, and a scoped
+    // cross-shard FTS is out of scope here (follow-up). Search is force-disabled
+    // for `--live`/`--live-validation` (see `search_enabled`), so the only
+    // remaining unsafe combination is owner-scoped `--sharded` `--searchable` —
+    // keep refusing exactly that. Returns before the plan is built, so no files
+    // are written.
     if !options_with_key.model.searchable.is_empty()
         && owner_authorizes
+        && options_with_key.model.sharded
         && !options_with_key.live
         && !options_with_key.live_validation
     {
         return Err(GenerateError::Config(format!(
-            "`--searchable` is not yet supported for owner-scoped models: full-text search \
-             (`search_page`) is not owner-scoped, so the generated `GET /{plural}/search` \
-             endpoint would expose other users' rows that the `#[secured]` index view \
-             filters out (owner column `{owner}`). Remove `--searchable`, drop the owner \
-             column, or pass `--no-policy` to opt out of owner scoping. Track: framework \
-             support for owner-scoped FTS (issue #1841).",
+            "`--searchable` is not yet supported for owner-scoped `--sharded` models: the \
+             sharded index/search run per-shard through the UNSCOPED `search_page`, so the \
+             generated `GET /{plural}/search` endpoint would expose other users' rows in the \
+             same shard that the `#[secured]` index view filters out (owner column `{owner}`). \
+             Drop `--sharded` (the standard Db path supports owner-scoped search), remove \
+             `--searchable`, drop the owner column, or pass `--no-policy` to opt out of owner \
+             scoping. Track: owner-scoped FTS for sharded repositories (follow-up to #1841).",
             owner = owner_column.as_ref().map_or("user_id", |o| o.name.as_str()),
         )));
     }
@@ -615,6 +621,15 @@ fn plan_scaffold_with_options_impl(
             options_with_key.model.sharded,
             options_with_key.live,
             !options_with_key.model.searchable.is_empty(),
+            // Issue #1841: emit `owner = <col>` (→ the macro's `list_scoped` /
+            // `search_page_scoped` codegen) only on the standard owner-scoped Db
+            // path — `authorize_wiring` is exactly `owner present && policy on &&
+            // !sharded && !live && !live_validation`, the path whose index/search
+            // this PR wires to the scoped methods. Live/sharded owner indexes are
+            // left as #1830 emitted them (follow-up), so they get no `owner =`.
+            authorize_wiring
+                .then(|| owner_column.as_ref().map(|o| o.name.as_str()))
+                .flatten(),
         ),
     );
     let repo_mod_path = repos_dir.join("mod.rs");
@@ -1320,6 +1335,7 @@ fn render_repository_file(
     sharded: bool,
     live: bool,
     searchable: bool,
+    owner_column: Option<&str>,
 ) -> String {
     let plural = pluralize(snake_name);
     let query_body = render_repository_queries(pascal_name, queries);
@@ -1341,6 +1357,13 @@ fn render_repository_file(
     // `search_page(query, &PageRequest)` methods (backed by the model's
     // `#[searchable]` fields + the migration's `search_vector` column).
     let searchable_attr = if searchable { ", searchable" } else { "" };
+    // Issue #1841: `owner = <col>` makes `#[repository]` emit owner-filtered
+    // `list_scoped` / `search_page_scoped` methods that the owner-scoped index +
+    // `/search` handlers call so they never return another user's rows. Only the
+    // caller's in-scope standard Db path passes `Some`; every other scaffold
+    // (no owner column, `--no-policy`, `--live`, `--sharded`) passes `None` and
+    // the attr — and the scoped methods — are omitted.
+    let owner_attr = owner_column.map_or(String::new(), |col| format!(", owner = {col}"));
     let sharded_note = if sharded {
         format!(
             "//!\n\
@@ -1447,7 +1470,7 @@ fn render_repository_file(
          use crate::models::{snake_name}::{{{pascal_name}, New{pascal_name}, Update{pascal_name}{draft_ext_import}}};\n\
          use crate::schema::{plural};\n\
          \n\
-         #[autumn_web::repository({pascal_name}, api = \"/api/{plural}\"{soft_delete_attr}{broadcasts_attr}{searchable_attr})]\n\
+         #[autumn_web::repository({pascal_name}, api = \"/api/{plural}\"{soft_delete_attr}{broadcasts_attr}{searchable_attr}{owner_attr})]\n\
          pub trait {pascal_name}Repository {{\n\
 {query_body}\
          }}\n\
@@ -1834,6 +1857,14 @@ fn render_routes_file(
     // is set), but its index cannot filter by owner, so it keeps the unscoped
     // listing.
     let owner_scoped_index = authorize && owner.is_some();
+    // Issue #1841: the STANDARD (non-live, non-live-validation, non-sharded) Db
+    // owner path is the only one whose repository carries `owner = <col>` (see
+    // `render_repository_file`), so it is the only one whose index/search can call
+    // the macro's owner-filtered `list_scoped` / `search_page_scoped`. That path
+    // gets the sort/filter data_table + the search box, both safely scoped to the
+    // current user. The `--sharded`/`--live`/`--live-validation` owner indexes
+    // keep the #1830 manual owner-filtered query (no scoped repo methods emitted).
+    let owner_scoped_standard = owner_scoped_index && !sharded && !live && !live_validation;
     // The full extractor pair the authorize wiring needs on handlers that do not
     // already carry a `state:` wrapper. No trailing comma — each insertion site
     // supplies its own delimiter.
@@ -2704,12 +2735,12 @@ fn render_routes_file(
     // headers are opted-in per column by `render_columns_vec`.
     let table_render = if live {
         String::new()
-    } else if owner_scoped_index {
-        // #1125 owner-scoped index: the handler runs a manual owner-filtered
-        // query (not `repo.list`) and does not extract `ListQuery`, so its
-        // data_table stays on the plain (non-sort/filter) config. #1126's
-        // allowlisted sort/filter is not owner-scoped — the same limitation the
-        // `--searchable` guard documents for owner-scoped FTS.
+    } else if owner_scoped_index && !owner_scoped_standard {
+        // #1830 owner-scoped `--sharded`/`--live-validation` index: the handler
+        // runs a manual owner-filtered query (not a scoped repo method) and does
+        // not extract `ListQuery`, so its data_table stays on the plain
+        // (non-sort/filter) config. Wiring owner-scoped sort/filter there is a
+        // follow-up (issue #1841 covers the standard Db path only).
         format!(
             r#"(autumn_web::widgets::data_table(&page_data.content, &columns, &autumn_web::widgets::DataTableConfig::new("No {plural} yet.").base_path(&paths::index())))"#
         )
@@ -2769,13 +2800,57 @@ fn render_routes_file(
     } else {
         "mut db: Db"
     };
-    let index_handler = if owner_scoped_index {
-        // Issue #1125/#1830: owner-scoped index for every variant with an owner
-        // column. Pagination is preserved by running a `COUNT(*)` + `LIMIT/OFFSET`
-        // query filtered to the current user's rows, then wrapping the result in
-        // `Page::new`. `{list_render}` keeps the `--live` SSE `<ul>` island (a
-        // data_table for the non-live variants), so the SSE broadcast contract is
-        // unaffected — only the *initial* server-rendered list is owner-scoped.
+    let index_handler = if owner_scoped_standard {
+        // Issue #1841: standard owner-scoped index. Delegates to the macro's
+        // owner-filtered `list_scoped(owner_id, &list_query, &page_req)` — the
+        // SECURITY INVARIANT is that this branch NEVER calls the unscoped
+        // `repo.list`/`repo.page`, so the allowlisted sort/filter and (when
+        // searchable) the search box can be exposed while every row stays scoped
+        // to the current user. `owner_id` is resolved from the same
+        // `PolicyContext` the mutating handlers authorize against.
+        format!(
+            r#"/// `GET /{plural}` — paginated, sortable, filterable list of the {snake_name}s
+/// the current user owns.
+///
+/// Accepts `?page=N&size=M` paging plus allowlisted `?sort=col&dir=asc|desc`
+/// and `?filter[col]=val` params (the [`ListQuery`] extractor). Unknown or
+/// malicious sort/filter keys are ignored against the model's column allowlist,
+/// so this never 400s and can never inject SQL. Filtered to the authenticated
+/// user's rows (owner column `{owner_col}`) via the repository's owner-scoped
+/// `list_scoped` — the same rule the registered `{pascal_name}Scope` enforces
+/// for `#[repository(scope = ...)]` index routes. This handler never calls the
+/// unscoped `list`/`page`, so it cannot return another user's rows.
+#[secured]
+#[get("/{plural}")]
+pub async fn index(
+    list_query: ListQuery,
+    RawQuery(raw_query): RawQuery,
+    page_req: PageRequest,
+    autumn_web::extract::State(state): autumn_web::extract::State<autumn_web::AppState>,
+    session: autumn_web::session::Session,
+    repo: Pg{pascal_name}Repository,
+    {index_db_param}flash: Flash,
+) -> AutumnResult<Markup> {{
+    let ctx = autumn_web::authorization::PolicyContext::from_request(&state, &session).await;
+    let owner_id = ctx.user_id_i64().unwrap_or(-1);
+    let page_data: Page<{pascal_name}> = repo.list_scoped(owner_id, &list_query, &page_req).await?;
+    let pager_query = raw_query.as_deref().unwrap_or("");
+{index_label_loads}{index_columns_labeled}    Ok({layout_fn}("{pascal_name} index", {cp_index}{flash_arg}, html! {{
+        h1 {{ "{pascal_name}s" }}
+        a href=(paths::new()) {{ "New {pascal_name}" }}
+        {index_list_block}
+    }}))
+}}"#
+        )
+    } else if owner_scoped_index {
+        // Issue #1125/#1830: owner-scoped index for the `--sharded`/`--live`/
+        // `--live-validation` variants (whose repositories carry no `owner =`
+        // attr, so no scoped repo method exists). Pagination is preserved by
+        // running a `COUNT(*)` + `LIMIT/OFFSET` query filtered to the current
+        // user's rows, then wrapping the result in `Page::new`. `{list_render}`
+        // keeps the `--live` SSE `<ul>` island (a data_table for the non-live
+        // variants), so the SSE broadcast contract is unaffected — only the
+        // *initial* server-rendered list is owner-scoped.
         format!(
             r#"/// `GET /{plural}` — paginated list of {snake_name}s the current user owns.
 ///
@@ -3095,7 +3170,74 @@ pub async fn index(
     // The pager preserves the request's raw query string (stripping `page`/
     // `size`) via `PagerOptions::query`, so `q` survives pagination without any
     // hand-rolled percent-encoding.
-    let search_handler = if search_enabled {
+    let search_handler = if search_enabled && owner_scoped_standard {
+        // Issue #1841: owner-scoped FTS handler for the standard Db path. The
+        // SECURITY INVARIANT is that this branch calls ONLY the owner-filtered
+        // repository methods — `repo.search_page_scoped(owner_id, ..)` for a
+        // query, and `repo.list_scoped(owner_id, ..)` for the empty-query
+        // fallback — NEVER the unscoped `repo.search_page`/`repo.page`, so the
+        // `/search` endpoint can never surface another user's rows (the exact
+        // leak the pre-#1841 rejection guarded against). `owner_id` comes from
+        // the same `PolicyContext` the mutating handlers authorize against.
+        let field_list = searchable.join(", ");
+        format!(
+            r#"
+
+/// `GET /{plural}/search` — owner-scoped full-text search over {field_list}.
+///
+/// Powers the `active_search` box on the index list. Ranked by relevance via
+/// the repository's owner-scoped `search_page_scoped`; an empty `q` falls back
+/// to the owner-scoped `list_scoped` listing. htmx requests get only the
+/// results fragment; non-htmx navigations (a bookmarked search URL, or a pager
+/// link) get a full page so search still works without JavaScript. Every result
+/// is filtered to the authenticated user (owner column `{owner_col}`); this
+/// handler never calls the unscoped `search_page`/`page`.
+#[derive(serde::Deserialize)]
+pub struct {pascal_name}SearchQuery {{
+    #[serde(default)]
+    pub q: String,
+}}
+
+#[secured]
+#[get("/{plural}/search")]
+pub async fn search(
+    autumn_web::extract::Query(query): autumn_web::extract::Query<{pascal_name}SearchQuery>,
+    autumn_web::reexports::axum::extract::RawQuery(raw_query): autumn_web::reexports::axum::extract::RawQuery,
+    list_query: ListQuery,
+    page_req: PageRequest,
+    hx: autumn_web::htmx::HxRequest,
+    autumn_web::extract::State(state): autumn_web::extract::State<autumn_web::AppState>,
+    session: autumn_web::session::Session,
+    repo: Pg{pascal_name}Repository,
+    {index_db_param}flash: Flash,
+) -> AutumnResult<Markup> {{
+    let ctx = autumn_web::authorization::PolicyContext::from_request(&state, &session).await;
+    let owner_id = ctx.user_id_i64().unwrap_or(-1);
+    let q = query.q.trim();
+    // Preserve the request's raw query string (already percent-encoded) on pager
+    // links so `q` survives pagination; `PagerOptions::query` strips the stale
+    // `page`/`size` params and re-adds them per link.
+    let pager_query = raw_query.as_deref().unwrap_or("");
+    let page_data: Page<{pascal_name}> = if q.is_empty() {{
+        repo.list_scoped(owner_id, &list_query, &page_req).await?
+    }} else {{
+        repo.search_page_scoped(owner_id, q, &page_req).await?
+    }};
+{index_label_loads}{index_columns_labeled}    let results = html! {{
+        (autumn_web::widgets::data_table(&page_data.content, &columns, &autumn_web::widgets::DataTableConfig::new("No {plural} found.").base_path("/{plural}/search")))
+        (pagination_nav(&page_data, &PagerOptions::new("/{plural}/search").query(pager_query)))
+    }};
+    if hx.is_htmx {{
+        return Ok(results);
+    }}
+    Ok({layout_fn}("Search {pascal_name}s", {cp_index}{flash_arg}, html! {{
+        h1 {{ "Search {pascal_name}s" }}
+        a href="/{plural}" {{ "Back to list" }}
+        div id="{plural}-search-results" {{ (results) }}
+    }}))
+}}"#
+        )
+    } else if search_enabled {
         let field_list = searchable.join(", ");
         let (repo_extractor, repo_bind) = if sharded {
             (
@@ -9523,8 +9665,17 @@ async fn main() {
 
     #[test]
     fn repository_notes_sharded() {
-        let rendered =
-            render_repository_file("Account", "account", &[], false, false, true, false, false);
+        let rendered = render_repository_file(
+            "Account",
+            "account",
+            &[],
+            false,
+            false,
+            true,
+            false,
+            false,
+            None,
+        );
         assert!(
             rendered.contains("shard-aware"),
             "sharded repository doc must mention shard-aware: {rendered}"
@@ -9537,8 +9688,17 @@ async fn main() {
 
     #[test]
     fn repository_notes_api_sharded_caveat() {
-        let rendered =
-            render_repository_file("Account", "account", &[], false, true, true, false, false);
+        let rendered = render_repository_file(
+            "Account",
+            "account",
+            &[],
+            false,
+            true,
+            true,
+            false,
+            false,
+            None,
+        );
         assert!(
             rendered.contains("control pool"),
             "sharded api repository doc must note control pool: {rendered}"
@@ -9548,7 +9708,7 @@ async fn main() {
     #[test]
     fn repository_no_sharded_note_when_not_sharded() {
         let rendered =
-            render_repository_file("Post", "post", &[], false, false, false, false, false);
+            render_repository_file("Post", "post", &[], false, false, false, false, false, None);
         assert!(
             !rendered.contains("shard-aware"),
             "non-sharded repository must not mention shard-aware: {rendered}"
@@ -9791,17 +9951,19 @@ async fn main() {
         );
     }
 
-    /// Issue #1319 security guard: `--searchable` on an owner-scoped model is
-    /// rejected before any files are written. The owner-scoped index is
-    /// `#[secured]` and filters to the current user, but the FTS `search_page`
-    /// is unscoped, so the `/search` endpoint would leak other users' rows.
+    /// Issue #1841: `--searchable` on a standard owner-scoped model is now
+    /// ALLOWED (was rejected pre-#1841). The repository macro carries the
+    /// `owner = <col>` attr so it emits owner-filtered `list_scoped` /
+    /// `search_page_scoped`, and the generated index + `/search` handlers call
+    /// ONLY those scoped methods — never the unscoped `page`/`search_page` — so
+    /// no cross-user leak. This test asserts that safe wiring is emitted.
     #[test]
-    fn searchable_with_owner_scoped_model_is_rejected() {
+    fn searchable_with_owner_scoped_model_emits_scoped_wiring() {
         let tmp = project_with_main(default_main());
         // `user_id` is an owner column, so the default policy makes the index
         // owner-scoped (`authorize_wiring`). Pairing that with `--searchable`
-        // must be refused.
-        let err = plan_scaffold_with_options(
+        // is now supported via the macro's owner-scoped codegen.
+        let plan = plan_scaffold_with_options(
             tmp.path(),
             "Post",
             &[
@@ -9818,23 +9980,74 @@ async fn main() {
                 ..Default::default()
             },
         )
-        .unwrap_err();
-        let msg = err.to_string();
+        .expect("standard owner-scoped + searchable must be allowed (#1841)");
+        plan.execute(Flags::default()).unwrap();
+
+        // The repository declares `owner = user_id` so the macro generates the
+        // scoped methods.
+        let repo = fs::read_to_string(tmp.path().join("src/repositories/post.rs")).unwrap();
         assert!(
-            matches!(err, GenerateError::Config(_)),
-            "expected Config error, got: {err:?}"
+            repo.contains(", owner = user_id)"),
+            "owner-scoped repository must carry `owner = user_id` on the attr: {repo}"
         );
+
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+        // The `/search` route uses the scoped method (and its empty-query
+        // fallback the scoped list) — never the unscoped `search_page`/`page`.
         assert!(
-            msg.contains("--searchable")
-                && msg.contains("owner-scoped")
-                && msg.contains("search_page"),
-            "error must explain the owner-scoped FTS leak: {msg}"
+            routes.contains("repo.search_page_scoped(owner_id, q, &page_req)"),
+            "owner-scoped /search must call search_page_scoped: {routes}"
         );
-        // No files written: the scaffold plan fails before touching the tree.
+        // The owner-scoped index uses the scoped list with sort/filter.
         assert!(
-            !tmp.path().join("src/models/post.rs").exists()
-                && !tmp.path().join("src/repositories/post.rs").exists(),
-            "rejected owner-scoped +searchable scaffold must not write any files"
+            routes.contains("repo.list_scoped(owner_id, &list_query, &page_req)"),
+            "owner-scoped index/search must call list_scoped: {routes}"
+        );
+        // Sort/filter data_table wiring is present on the owner-scoped standard
+        // index (active_sort / query), closing the #1854 gap.
+        assert!(
+            routes.contains(".active_sort(list_query.sort().unwrap_or_default())"),
+            "owner-scoped standard index must render the sort/filter data_table: {routes}"
+        );
+        // The search box is rendered on the owner-scoped index.
+        assert!(
+            routes.contains("active_search_input"),
+            "owner-scoped searchable index must render the search box: {routes}"
+        );
+    }
+
+    /// Issue #1841 security invariant: the owner-scoped `/search` and index
+    /// branches must NEVER call the unscoped repository methods, or they would
+    /// re-open the pre-#1841 cross-user leak. This is the regression guard: the
+    /// `search`/`index` handler bodies must not contain a bare
+    /// `repo.search_page(`/`repo.page(` call.
+    #[test]
+    fn owner_scoped_searchable_never_calls_unscoped_repo_methods() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &[
+                "user_id:i64".into(),
+                "title:String".into(),
+                "body:Text".into(),
+            ],
+            "20260427000000",
+            &ScaffoldOptions {
+                model: ModelOptions {
+                    searchable: vec!["title".into(), "body".into()],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+        assert!(
+            !routes.contains("repo.search_page(") && !routes.contains("repo.page("),
+            "owner-scoped searchable routes must NEVER call the unscoped \
+             repo.search_page(/repo.page( (cross-user leak): {routes}"
         );
     }
 
@@ -11221,10 +11434,17 @@ async fn main() {
             "create must authorize_create: {routes}"
         );
         assert!(routes.contains("pub async fn create("), "{routes}");
-        // Index applies the owner scope through a filtered paginated query.
+        // Issue #1841: the standard owner-scoped index now applies the owner
+        // scope through the repository's owner-filtered `list_scoped` (which also
+        // brings allowlisted sort/filter), not a hand-rolled diesel query — and
+        // it must NEVER fall back to the unscoped `repo.list`/`repo.page`.
         assert!(
-            routes.contains("posts::user_id.eq(owner_id)"),
-            "index must filter by owner: {routes}"
+            routes.contains("repo.list_scoped(owner_id, &list_query, &page_req)"),
+            "index must scope through list_scoped: {routes}"
+        );
+        assert!(
+            !routes.contains("repo.list(&list_query") && !routes.contains("repo.page("),
+            "owner-scoped index must not call the unscoped list/page: {routes}"
         );
         assert!(
             routes.contains("PolicyContext::from_request(&state, &session)"),
@@ -11400,10 +11620,17 @@ async fn main() {
             ),
             "attachment create/update must not inject a duplicate State extractor: {routes}"
         );
-        // Owner-scoped index still emitted for the attachment path.
+        // Owner-scoped index still emitted for the attachment path. Issue #1841:
+        // the standard Db owner index now scopes via the repository's
+        // owner-filtered `list_scoped` (with sort/filter) rather than a manual
+        // diesel query — and never falls back to the unscoped list/page.
         assert!(
-            routes.contains("posts::author_id.eq(owner_id)"),
-            "attachment index must filter by owner: {routes}"
+            routes.contains("repo.list_scoped(owner_id, &list_query, &page_req)"),
+            "attachment index must scope through list_scoped: {routes}"
+        );
+        assert!(
+            routes.contains("PolicyContext::from_request(&state, &session)"),
+            "attachment index must resolve owner_id from the policy context: {routes}"
         );
     }
 
