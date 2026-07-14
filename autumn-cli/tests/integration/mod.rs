@@ -22,3 +22,4 @@ mod serve;
 mod tauri_mobile_thin_client;
 mod test_command;
 mod webhook_sim;
+mod workflow_check;
