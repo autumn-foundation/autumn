@@ -44,6 +44,32 @@ impl FieldConstraints {
     }
 }
 
+/// A single allowed edge in a field's state machine (issue #1326).
+///
+/// Mirrors the `from -> to[: guard]` grammar the `#[state_machine(transitions(…))]`
+/// attribute macro accepts (see `autumn-macros`): `from`/`to` are bare state
+/// identifiers and `guard`, when present, is the plain name of a `&self -> bool`
+/// method that must return `true` for the edge to be taken.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StateTransition {
+    /// The state this edge starts from.
+    pub from: String,
+    /// The state this edge ends at.
+    pub to: String,
+    /// Optional guard: the name of a `&self` bool method gating the edge.
+    pub guard: Option<String>,
+}
+
+/// The parsed state machine declared on a field via the DSL's trailing
+/// `:states(…)` modifier (issue #1326). Carries the ordered set of allowed
+/// [`StateTransition`] edges, which the model generator re-emits as a
+/// `#[state_machine(transitions(…))]` attribute on the field.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StateMachine {
+    /// The allowed transitions, in declaration order.
+    pub transitions: Vec<StateTransition>,
+}
+
 /// A single field parsed from the command line.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Field {
@@ -65,6 +91,11 @@ pub struct Field {
     /// Constraint modifiers from a trailing `{…}` block (issue #1388 /
     /// #1146). Empty ([`FieldConstraints::is_empty`]) for a bare `name:Type`.
     pub constraints: FieldConstraints,
+    /// The state machine declared via a trailing `:states(…)` modifier
+    /// (issue #1326), or `None` for an ordinary field. Only valid on a
+    /// non-nullable `String`/`Text` field — the model generator re-emits it
+    /// as a `#[state_machine(transitions(…))]` attribute.
+    pub state_machine: Option<StateMachine>,
 }
 
 impl Field {
@@ -731,6 +762,23 @@ pub fn parse_field(token: &str) -> Result<Field, GenerateError> {
     // the colon inside the braces — stays unambiguous. Any other stray
     // colon outside the braces is caught as an unknown modifier below.
     let rest = rest.trim();
+    // Peel a trailing `:states(from -> to, …)` state-machine modifier (issue
+    // #1326) *before* the `:unique` split below, so its internal `->`, `,`,
+    // and guard `:` tokens are never mistaken for a `:unique` suffix. The
+    // clause is paren-delimited (like the `{…}` constraint block is
+    // brace-delimited), so it stays unambiguous against the other modifiers.
+    let (rest, state_machine_body) = split_state_machine_modifier(rest);
+    let state_machine = match state_machine_body {
+        Some(body) => {
+            Some(
+                parse_state_machine(body).map_err(|reason| GenerateError::InvalidField {
+                    token: token.to_owned(),
+                    reason,
+                })?,
+            )
+        }
+        None => None,
+    };
     let (ty, unique) = match rest.rsplit_once(':') {
         // A trailing `:unique` (whitespace-tolerant) is the UNIQUE-index
         // modifier. Its colon is always the last one — a `references`
@@ -768,6 +816,12 @@ pub fn parse_field(token: &str) -> Result<Field, GenerateError> {
             reason,
         })?
     {
+        if state_machine.is_some() {
+            return Err(GenerateError::InvalidField {
+                token: token.to_owned(),
+                reason: STATE_MACHINE_STRING_ONLY.to_owned(),
+            });
+        }
         return Ok(Field {
             name: name.to_owned(),
             kind: FieldKind::Enum,
@@ -775,6 +829,7 @@ pub fn parse_field(token: &str) -> Result<Field, GenerateError> {
             variants,
             unique,
             constraints: FieldConstraints::default(),
+            state_machine: None,
         });
     }
 
@@ -784,6 +839,12 @@ pub fn parse_field(token: &str) -> Result<Field, GenerateError> {
             reason,
         })?
     {
+        if state_machine.is_some() {
+            return Err(GenerateError::InvalidField {
+                token: token.to_owned(),
+                reason: STATE_MACHINE_STRING_ONLY.to_owned(),
+            });
+        }
         return Ok(Field {
             name: name.to_owned(),
             kind: FieldKind::Decimal { precision, scale },
@@ -791,6 +852,7 @@ pub fn parse_field(token: &str) -> Result<Field, GenerateError> {
             variants: Vec::new(),
             unique,
             constraints: FieldConstraints::default(),
+            state_machine: None,
         });
     }
 
@@ -842,6 +904,19 @@ pub fn parse_field(token: &str) -> Result<Field, GenerateError> {
         None => FieldConstraints::default(),
     };
 
+    // A state machine (issue #1326) is only meaningful on a plain, non-nullable
+    // `String`/`Text` column — the `#[state_machine]` macro requires the field's
+    // Rust type to be exactly `String`, and the generated `transition_*` methods
+    // operate on `&str`. Reject it anywhere else with a clear message rather than
+    // emitting an attribute the macro will refuse to compile.
+    if state_machine.is_some() && (nullable || !matches!(kind, FieldKind::String | FieldKind::Text))
+    {
+        return Err(GenerateError::InvalidField {
+            token: token.to_owned(),
+            reason: STATE_MACHINE_STRING_ONLY.to_owned(),
+        });
+    }
+
     // `references` fields always end in `_id` — `post:references` resolves to
     // the column `post_id`. Tolerate an already-suffixed name (`post_id:references`)
     // rather than doubling the suffix.
@@ -858,6 +933,7 @@ pub fn parse_field(token: &str) -> Result<Field, GenerateError> {
         variants: Vec::new(),
         unique,
         constraints,
+        state_machine,
     })
 }
 
@@ -876,6 +952,96 @@ fn split_constraint_modifier(ty: &str) -> (&str, Option<&str>) {
         }
     }
     (ty, None)
+}
+
+/// The single error message used when a `:states(…)` state-machine modifier
+/// (issue #1326) is declared on anything but a plain, non-nullable
+/// `String`/`Text` field. Shared so the enum, decimal, and scalar branches of
+/// [`parse_field`] can never drift.
+const STATE_MACHINE_STRING_ONLY: &str =
+    "a `states(…)` state machine is only supported on a non-nullable `String`/`Text` field";
+
+/// Split a field's post-`name:` remainder into its leading part and the body of
+/// a trailing `:states(…)` state-machine modifier (issue #1326), if present.
+///
+/// `"String:states(a -> b)"` -> `("String", Some("a -> b"))`;
+/// `"String:unique:states(a -> b)"` -> `("String:unique", Some("a -> b"))`;
+/// a remainder with no such clause yields `(rest, None)`. The clause is
+/// paren-delimited and must be the final modifier (the `)` closes the token),
+/// mirroring the trailing-modifier style of `:unique` and the `{…}` block.
+fn split_state_machine_modifier(rest: &str) -> (&str, Option<&str>) {
+    let rest = rest.trim();
+    if let Some(pos) = rest.find(":states(")
+        && rest.ends_with(')')
+    {
+        let before = rest[..pos].trim_end();
+        let inner = rest[pos + ":states(".len()..rest.len() - 1].trim();
+        return (before, Some(inner));
+    }
+    (rest, None)
+}
+
+/// Parse the inner body of a `:states(…)` modifier — a comma-separated list of
+/// `from -> to` edges, each with an optional `: guard` plain-identifier suffix
+/// (issue #1326). Mirrors the `#[state_machine(transitions(…))]` macro grammar
+/// so the generator can re-emit the parsed set verbatim.
+///
+/// # Errors
+/// Returns a human-readable message when the list is empty, an edge is missing
+/// its `->`, or any state/guard token is not a valid `snake_case` identifier.
+fn parse_state_machine(body: &str) -> Result<StateMachine, String> {
+    let mut transitions = Vec::new();
+    for segment in body.split(',') {
+        let segment = segment.trim();
+        // Tolerate a trailing comma (`a -> b,`) exactly like the macro grammar.
+        if segment.is_empty() {
+            continue;
+        }
+        let (from, to_and_guard) = segment.split_once("->").ok_or_else(|| {
+            format!("malformed transition '{segment}'; expected `from -> to` (missing `->`)")
+        })?;
+        // Split an optional `: guard` off the right-hand side. The states clause
+        // is peeled whole before any `:unique` handling, so this colon is
+        // unambiguously the guard separator.
+        let (to, guard) = match to_and_guard.split_once(':') {
+            Some((to, guard)) => (to.trim(), Some(guard.trim())),
+            None => (to_and_guard.trim(), None),
+        };
+        let from = from.trim();
+        validate_state_token(from, "state")?;
+        validate_state_token(to, "state")?;
+        if let Some(guard) = guard {
+            validate_state_token(guard, "guard")?;
+        }
+        transitions.push(StateTransition {
+            from: from.to_owned(),
+            to: to.to_owned(),
+            guard: guard.map(str::to_owned),
+        });
+    }
+    if transitions.is_empty() {
+        return Err(
+            "empty `states(…)` modifier; declare at least one `from -> to` transition".to_owned(),
+        );
+    }
+    Ok(StateMachine { transitions })
+}
+
+/// Validate one state name or guard name from a `:states(…)` modifier: it must
+/// be a non-empty `snake_case` identifier and not a Rust keyword, since the
+/// generator emits states as bare identifiers (and guards as method names)
+/// inside the `#[state_machine(transitions(…))]` attribute.
+fn validate_state_token(token: &str, kind: &str) -> Result<(), String> {
+    if token.is_empty() {
+        return Err(format!("empty {kind} name in `states(…)` modifier"));
+    }
+    if !is_valid_ident(token) || is_rust_keyword(token) {
+        return Err(format!(
+            "'{token}' is not a valid {kind} name; expected a plain snake_case identifier such \
+             as `draft` or `can_publish`"
+        ));
+    }
+    Ok(())
 }
 
 /// Format the `min = …, max = …` argument list shared by `length(…)` and
@@ -1347,6 +1513,14 @@ fn parse_decimal_type(ty: &str) -> Result<Option<(u32, u32, bool)>, String> {
 }
 
 /// Parse a list of `name:Type` tokens.
+///
+/// Each token is `name:Type` with optional trailing modifiers: `:unique`
+/// (issue #1032), a `{…}` constraint block (issue #1388 / #1146), and — for a
+/// non-nullable `String`/`Text` field — a `:states(…)` state-machine modifier
+/// (issue #1326). The state-machine clause lists `from -> to` edges, each with
+/// an optional `: guard` method name, e.g.
+/// `status:String:states(draft -> published: can_publish, published -> archived)`.
+/// It re-emits as a `#[state_machine(transitions(…))]` attribute on the field.
 ///
 /// # Errors
 /// Bubbles up the first failed token, and rejects duplicate field names —
@@ -2664,6 +2838,94 @@ mod tests {
             SUPPORTED_TYPES.contains("unique"),
             "SUPPORTED_TYPES must document the :unique modifier"
         );
+    }
+
+    // ── state machine modifier (issue #1326) ────────────────────────────────
+
+    #[test]
+    fn parse_field_without_state_machine_defaults_to_none() {
+        let f = parse_field("title:String").unwrap();
+        assert!(f.state_machine.is_none());
+    }
+
+    #[test]
+    fn parse_state_machine_modifier_captures_transitions() {
+        let f = parse_field(
+            "status:String:states(draft -> published: can_publish, published -> archived)",
+        )
+        .unwrap();
+        assert_eq!(f.kind, FieldKind::String);
+        assert!(!f.nullable);
+        let sm = f.state_machine.expect("state machine should be parsed");
+        assert_eq!(
+            sm.transitions,
+            vec![
+                StateTransition {
+                    from: "draft".to_owned(),
+                    to: "published".to_owned(),
+                    guard: Some("can_publish".to_owned()),
+                },
+                StateTransition {
+                    from: "published".to_owned(),
+                    to: "archived".to_owned(),
+                    guard: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_state_machine_tolerates_trailing_comma_and_whitespace() {
+        let f = parse_field("status:String:states( draft -> published , )").unwrap();
+        let sm = f.state_machine.unwrap();
+        assert_eq!(sm.transitions.len(), 1);
+        assert_eq!(sm.transitions[0].from, "draft");
+        assert_eq!(sm.transitions[0].to, "published");
+        assert!(sm.transitions[0].guard.is_none());
+    }
+
+    #[test]
+    fn state_machine_composes_with_unique_and_text() {
+        let f = parse_field("stage:Text:unique:states(a -> b)").unwrap();
+        assert_eq!(f.kind, FieldKind::Text);
+        assert!(f.unique);
+        assert_eq!(f.state_machine.unwrap().transitions.len(), 1);
+    }
+
+    #[test]
+    fn state_machine_on_nullable_string_is_rejected() {
+        let err = parse_field("status:Option<String>:states(a -> b)").unwrap_err();
+        assert!(err.to_string().contains("non-nullable"), "got: {err}");
+    }
+
+    #[test]
+    fn state_machine_on_non_string_field_is_rejected() {
+        let err = parse_field("count:i64:states(a -> b)").unwrap_err();
+        assert!(err.to_string().contains("String"), "got: {err}");
+    }
+
+    #[test]
+    fn state_machine_on_enum_field_is_rejected() {
+        let err = parse_field("status:enum{a,b}:states(a -> b)").unwrap_err();
+        assert!(err.to_string().contains("String"), "got: {err}");
+    }
+
+    #[test]
+    fn empty_state_machine_modifier_is_rejected() {
+        let err = parse_field("status:String:states()").unwrap_err();
+        assert!(err.to_string().contains("at least one"), "got: {err}");
+    }
+
+    #[test]
+    fn state_machine_missing_arrow_is_rejected() {
+        let err = parse_field("status:String:states(draft published)").unwrap_err();
+        assert!(err.to_string().contains("->"), "got: {err}");
+    }
+
+    #[test]
+    fn state_machine_invalid_state_name_is_rejected() {
+        let err = parse_field("status:String:states(Draft -> published)").unwrap_err();
+        assert!(err.to_string().contains("state name"), "got: {err}");
     }
 
     // ── decimal field kind (issue #1038) ────────────────────────────────────

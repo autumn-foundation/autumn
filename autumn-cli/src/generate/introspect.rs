@@ -1532,6 +1532,7 @@ mod tests {
                 variants: Vec::new(),
                 unique: false,
                 constraints: FieldConstraints::default(),
+                state_machine: None,
             },
             Field {
                 name: "body".into(),
@@ -1540,6 +1541,7 @@ mod tests {
                 variants: Vec::new(),
                 unique: false,
                 constraints: FieldConstraints::default(),
+                state_machine: None,
             },
             Field {
                 name: "published".into(),
@@ -1548,6 +1550,7 @@ mod tests {
                 variants: Vec::new(),
                 unique: false,
                 constraints: FieldConstraints::default(),
+                state_machine: None,
             },
         ];
         let greenfield = render_model_file_for_test("Post", "posts", &fields);

@@ -403,5 +403,32 @@ pub(super) fn builtin_stories() -> Vec<Story> {
                 }
             }
         },
+        story! {
+            "Forms",
+            "Transition controls",
+            {
+                use autumn_web::widgets::transition_controls;
+
+                // A `#[state_machine]` field emits a `(from, to, Option<guard>)`
+                // transitions constant and a `can_transition_<field>_to`
+                // predicate; pass those two straight through. Here they are
+                // inlined so the story is self-contained.
+                let transitions: &[(&str, &str, Option<&str>)] = &[
+                    ("draft", "published", None),
+                    ("published", "archived", None),
+                ];
+                // Only edges leaving `current` ("draft") render, so this shows
+                // the single `draft -> published` action button.
+                transition_controls(
+                    "/orders/1/transitions/status",
+                    "status",
+                    "draft",
+                    transitions,
+                    |_to| true, // |to| order.can_transition_status_to(to)
+                    None,
+                    None,
+                )
+            }
+        },
     ]
 }

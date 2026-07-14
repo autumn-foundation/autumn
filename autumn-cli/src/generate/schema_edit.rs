@@ -588,6 +588,7 @@ fn fields_with_existing_schema_columns(
                 variants: Vec::new(),
                 unique: false,
                 constraints: FieldConstraints::default(),
+                state_machine: None,
             });
         }
     }

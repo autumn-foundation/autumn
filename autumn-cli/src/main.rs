@@ -1926,12 +1926,20 @@ enum GenerateCommands {
     /// `--index`/`--unique` output. `--unique FIELD` is the flag-based
     /// equivalent, mirroring `--index`'s ergonomics.
     ///
+    /// `field:String:states(from -> to, from -> to: guard, ...)` declares a
+    /// state machine on a non-nullable `String`/`Text` field: it emits a
+    /// `#[state_machine(transitions(...))]` attribute so the model gains
+    /// `transition_field_to`/`can_transition_field_to` guard-checked methods.
+    /// Each `from -> to` edge may carry an optional `: guard` plain method
+    /// name. Quote the token in bash/zsh so the shell doesn't split it.
+    ///
     /// Examples:
     ///
     ///   autumn generate model Post title:String body:Text published:bool
     ///   autumn generate model Comment body:Text post:references
     ///   autumn generate model Post 'status:enum{draft,published,archived}'
     ///   autumn generate model User email:String:unique
+    ///   autumn generate model Page 'status:String:states(draft -> published, published -> archived)'
     #[command(verbatim_doc_comment)]
     Model {
         /// Resource name (`PascalCase` or `snake_case`, e.g. `Post`).

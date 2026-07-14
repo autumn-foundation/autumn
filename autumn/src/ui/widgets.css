@@ -1239,6 +1239,37 @@
     border-radius: var(--radius);
 }
 
+/* ── Transition controls (autumn-transition-controls, autumn-transition) ──── */
+
+/* The grouping container holds one no-JS POST form per legal edge leaving the
+   current state; lay them out in a wrapping row of action buttons. */
+.autumn-transition-controls {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+    align-items: center;
+}
+
+/* Each transition is its own inline form so the buttons sit side by side. */
+.autumn-transition {
+    display: inline-flex;
+    margin: 0;
+}
+
+.autumn-transition button {
+    padding: 0.5rem 1rem;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background-color: var(--surface);
+    color: var(--text);
+    cursor: pointer;
+}
+
+.autumn-transition button[disabled] {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
 /* Visually hidden but still exposed to assistive technology — the standard
    clip pattern (never `display:none`, which removes it from the a11y tree). */
 .autumn-visually-hidden {
