@@ -1103,19 +1103,21 @@ impl JobAdminMemoryBackend {
     /// actuator counter for initially-delayed jobs that were already counted at
     /// enqueue time.
     fn record_requeued(&self, id: &str, attempt: u32) -> bool {
-        if let Ok(mut inner) = self.inner.write()
-            && let Some(record) = inner.records.get_mut(id)
-        {
-            let was_scheduled = record.status == JobAdminStatus::Scheduled;
-            record.status = JobAdminStatus::Enqueued;
-            record.enqueued_at = Some(chrono::Utc::now());
-            record.scheduled_for = None;
-            record.started_at = None;
-            record.finished_at = None;
-            record.attempt = attempt;
-            return was_scheduled;
-        }
-        false
+        let Ok(mut inner) = self.inner.write() else {
+            return false;
+        };
+        let Some(record) = inner.records.get_mut(id) else {
+            return false;
+        };
+
+        let was_scheduled = record.status == JobAdminStatus::Scheduled;
+        record.status = JobAdminStatus::Enqueued;
+        record.enqueued_at = Some(chrono::Utc::now());
+        record.scheduled_for = None;
+        record.started_at = None;
+        record.finished_at = None;
+        record.attempt = attempt;
+        was_scheduled
     }
 
     fn try_record_start(&self, id: &str, attempt: u32) -> JobAdminStartDecision {
@@ -1145,54 +1147,69 @@ impl JobAdminMemoryBackend {
     }
 
     fn record_success(&self, id: &str) {
-        if let Ok(mut inner) = self.inner.write()
-            && let Some(record) = inner.records.get_mut(id)
-        {
-            record.status = JobAdminStatus::Completed;
-            record.finished_at = Some(chrono::Utc::now());
-            record.last_error = None;
-            prune_job_admin_history(&mut inner);
-        }
+        let Ok(mut inner) = self.inner.write() else {
+            return;
+        };
+        let Some(record) = inner.records.get_mut(id) else {
+            return;
+        };
+
+        record.status = JobAdminStatus::Completed;
+        record.finished_at = Some(chrono::Utc::now());
+        record.last_error = None;
+        prune_job_admin_history(&mut inner);
     }
 
     fn record_retrying(&self, id: &str, error: &str) {
-        if let Ok(mut inner) = self.inner.write()
-            && let Some(record) = inner.records.get_mut(id)
-        {
-            record.status = JobAdminStatus::Retrying;
-            record.finished_at = Some(chrono::Utc::now());
-            record.last_error = Some(error.to_owned());
-        }
+        let Ok(mut inner) = self.inner.write() else {
+            return;
+        };
+        let Some(record) = inner.records.get_mut(id) else {
+            return;
+        };
+
+        record.status = JobAdminStatus::Retrying;
+        record.finished_at = Some(chrono::Utc::now());
+        record.last_error = Some(error.to_owned());
     }
 
     fn record_failure(&self, id: &str, error: String) {
-        if let Ok(mut inner) = self.inner.write()
-            && let Some(record) = inner.records.get_mut(id)
-        {
-            record.status = JobAdminStatus::Failed;
-            record.finished_at = Some(chrono::Utc::now());
-            record.last_error = Some(error);
-            prune_job_admin_history(&mut inner);
-        }
+        let Ok(mut inner) = self.inner.write() else {
+            return;
+        };
+        let Some(record) = inner.records.get_mut(id) else {
+            return;
+        };
+
+        record.status = JobAdminStatus::Failed;
+        record.finished_at = Some(chrono::Utc::now());
+        record.last_error = Some(error);
+        prune_job_admin_history(&mut inner);
     }
 
     fn record_cancelled(&self, id: &str) {
-        if let Ok(mut inner) = self.inner.write()
-            && let Some(record) = inner.records.get_mut(id)
-        {
-            record.status = JobAdminStatus::Canceled;
-            record.finished_at = Some(chrono::Utc::now());
-        }
+        let Ok(mut inner) = self.inner.write() else {
+            return;
+        };
+        let Some(record) = inner.records.get_mut(id) else {
+            return;
+        };
+
+        record.status = JobAdminStatus::Canceled;
+        record.finished_at = Some(chrono::Utc::now());
     }
 
     fn record_deduplicated(&self, id: &str) {
-        if let Ok(mut inner) = self.inner.write()
-            && let Some(record) = inner.records.get_mut(id)
-        {
-            record.status = JobAdminStatus::Deduplicated;
-            record.finished_at = Some(chrono::Utc::now());
-            prune_job_admin_history(&mut inner);
-        }
+        let Ok(mut inner) = self.inner.write() else {
+            return;
+        };
+        let Some(record) = inner.records.get_mut(id) else {
+            return;
+        };
+
+        record.status = JobAdminStatus::Deduplicated;
+        record.finished_at = Some(chrono::Utc::now());
+        prune_job_admin_history(&mut inner);
     }
 
     fn retry_payload(&self, id: &str) -> AutumnResult<(String, Value)> {
@@ -1217,10 +1234,14 @@ impl JobAdminMemoryBackend {
     }
 
     fn restore_failed_retry(&self, id: &str) {
-        if let Ok(mut inner) = self.inner.write()
-            && let Some(record) = inner.records.get_mut(id)
-            && record.status == JobAdminStatus::Retried
-        {
+        let Ok(mut inner) = self.inner.write() else {
+            return;
+        };
+        let Some(record) = inner.records.get_mut(id) else {
+            return;
+        };
+
+        if record.status == JobAdminStatus::Retried {
             record.status = JobAdminStatus::Failed;
             record.finished_at = Some(chrono::Utc::now());
         }
