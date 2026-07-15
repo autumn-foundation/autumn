@@ -220,7 +220,7 @@ Fields:
 - **Provisioning** is over HTTP-01: the `:80` listener serves the challenge
   token, the CA validates it, and the issued certificate is cached under
   `cache_dir` (default `config/acme`) and swapped into the live resolver.
-- **Renewal** runs on a coordinator-**leader-elected** loop that wakes hourly and
+- **Renewal** runs on a **leader-elected** coordinator loop that wakes hourly and
   renews any certificate within `renew_before_days` of expiry — so in a
   clustered deployment exactly one instance renews, and the refreshed certificate
   hot-swaps in with no restart.

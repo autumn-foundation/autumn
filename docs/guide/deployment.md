@@ -52,7 +52,7 @@ below and are better fits in specific cases:
 > **HTTPS/TLS.** kamal-proxy fronts your app on the public port and terminates
 > TLS, so the app itself serves plain HTTP behind the proxy. TLS termination and
 > ACME certificate issuance — including serving HTTPS directly from the app
-> without a proxy — are covered in the [TLS &amp; HTTPS guide](./tls.md).
+> without a proxy — are covered in the [TLS & HTTPS guide](./tls.md).
 
 > **Version.** The `autumn deploy` subcommands (`check` / `plan` / `up` /
 > `rollback`) are newer than the `autumn-cli 0.5.0` pinned under
