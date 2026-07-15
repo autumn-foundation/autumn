@@ -1,3 +1,4 @@
+mod a11y_verify;
 mod api_scaffold;
 mod cloud_native_scaffold;
 mod db;
