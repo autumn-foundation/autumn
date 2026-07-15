@@ -439,6 +439,86 @@ fn deploy_check_grades_and_uploads_profile_scoped_prod_values() {
 }
 
 #[test]
+fn deploy_check_loads_prod_values_from_dotenv_file() {
+    // Regression (Gemini review on #1966): `autumn deploy` must load the target
+    // deploy profile's `.env.<profile>` file even from a dev shell. `.env.prod`
+    // is a documented place for prod-only values (the signing secret, the DB
+    // URL), but dotenv auto-loading is gated OFF for non-`dev`/`test` profiles
+    // unless `AUTUMN_DOTENV=1` — so before the fix the deploy-time reload
+    // silently SKIPPED `.env.prod` and graded the weak dev secret / reported no
+    // DB. The fix has `ForcedProfileEnv` report `AUTUMN_DOTENV=1` to the dotenv
+    // gating base (without mutating the global env), so `.env.prod` loads.
+    //
+    // Here the strong prod secret and prod DB URL live ONLY in a `.env.prod`
+    // FILE (NOT in `autumn.toml` `[profile.prod]`), the ambient profile is dev
+    // (no `AUTUMN_ENV`), and the test does NOT set `AUTUMN_DOTENV` in its own
+    // env — proving it works out of the box.
+    let dir = tempfile::tempdir().expect("create temp project dir");
+    fs::write(
+        dir.path().join("Cargo.toml"),
+        "[package]\nname = \"demoapp\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .expect("write Cargo.toml");
+    // Base config: deploy host + a weak/demo dev signing secret that would FAIL
+    // production grading if it leaked through. No `[profile.prod]` section and no
+    // database — the prod values come exclusively from `.env.prod` below.
+    fs::write(
+        dir.path().join("autumn.toml"),
+        "[deploy]\n\
+         host = \"deploy.example.test\"\n\
+         \n\
+         [security.signing_secret]\n\
+         secret = \"changeme\"\n",
+    )
+    .expect("write autumn.toml");
+    // Prod-only values live ONLY in `.env.prod` via the highest (`AUTUMN_*`)
+    // config layer. `AUTUMN_ENV=dev` here is a profile-SELECTOR key: the dotenv
+    // overlay strips it unconditionally, so it can never flip the active profile
+    // (safety gate preserved).
+    fs::write(
+        dir.path().join(".env.prod"),
+        "AUTUMN_ENV=dev\n\
+         AUTUMN_SECURITY__SIGNING_SECRET=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n\
+         AUTUMN_DATABASE__PRIMARY_URL=postgres://prod:pw@proddb.internal/app\n",
+    )
+    .expect("write .env.prod");
+
+    // No `AUTUMN_ENV` / `AUTUMN_DOTENV` in the test env: the deploy-profile
+    // reload must opt into `.env.prod` loading on its own.
+    let (stdout, stderr, _code) = run_autumn(dir.path(), &["deploy", "check"], &[]);
+    let combined = format!("{stdout}{stderr}");
+
+    // The strong PROD signing secret from `.env.prod` is loaded and graded
+    // (passes) — the weak base secret never leaks into the grade.
+    assert!(
+        combined.contains("signing_secret: signing secret is configured"),
+        "deploy check must load and pass the PROD signing secret from .env.prod\n\
+         stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        !combined.contains("known demo/template value"),
+        "the weak base/dev secret must not be graded (it would fail as a demo \
+         value)\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        !combined.contains("changeme"),
+        "the demo secret value must never be echoed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    // The PROD DB URL from `.env.prod` is loaded, so the DB check sees a
+    // configured database rather than the dev config's "no database configured".
+    assert!(
+        combined.contains("database_url: database URL is configured"),
+        "deploy check must load the PROD database URL from .env.prod\nstdout:\n\
+         {stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        !combined.contains("no database configured"),
+        "the DB-free base state must not surface once .env.prod is loaded\n\
+         stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+}
+
+#[test]
 fn deploy_help_lists_subcommands() {
     let dir = tempfile::tempdir().expect("temp dir");
     let (stdout, stderr, code) = run_autumn(dir.path(), &["deploy", "--help"], &[]);

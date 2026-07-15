@@ -821,6 +821,18 @@ impl<E: Env> Env for ForcedProfileEnv<E> {
         if key == "AUTUMN_ENV" {
             return Ok(self.profile.clone());
         }
+        // Report `AUTUMN_DOTENV=1` so `should_load` opts the (non-dev) deploy
+        // profile into `.env.<profile>` loading. The operator explicitly ran
+        // `autumn deploy` to gather + upload the target profile's config, and
+        // `.env.<profile>` is a documented place for profile-only values, so
+        // the deploy-time reload reads it without requiring the operator to
+        // export `AUTUMN_DOTENV` by hand. This does not mutate the global env
+        // and does not touch the deployed service's runtime. The
+        // profile-selector-key exclusion in the dotenv overlay still strips
+        // `AUTUMN_ENV`/`AUTUMN_PROFILE`/`AUTUMN_IS_DEBUG` from any `.env` file.
+        if key == "AUTUMN_DOTENV" {
+            return Ok("1".to_owned());
+        }
         self.inner.var(key)
     }
 }
@@ -830,14 +842,27 @@ impl<E: Env> Env for ForcedProfileEnv<E> {
 /// The chicken-and-egg here: the ambient load in [`run`] learns the deploy
 /// profile (`resolved.profile`), and this reload then resolves the full config
 /// under it. The `.env.<profile>` overlay is selected via
-/// [`autumn_web::dotenv::os_env_with_dotenv_for_profile`], and the
-/// [`ForcedProfileEnv`] wrapper forces `AUTUMN_ENV` to `resolved.profile` so the
-/// loader layers `[profile.<profile>]` / `autumn-<profile>.toml` on top. Real OS
-/// env vars still win over `.env` (the overlay only fills gaps), matching
-/// `AutumnConfig::load()`.
+/// [`autumn_web::dotenv::os_env_with_dotenv_for_profile_using`], fed a
+/// [`ForcedProfileEnv`] gating base that reports `AUTUMN_DOTENV=1` so a non-dev
+/// deploy profile still loads `.env.<profile>` (dotenv auto-load is otherwise
+/// gated off outside `dev`/`test`). A second [`ForcedProfileEnv`] wrapper forces
+/// `AUTUMN_ENV` to `resolved.profile` so the loader layers `[profile.<profile>]`
+/// / `autumn-<profile>.toml` on top. Real OS env vars still win over `.env` (the
+/// overlay only fills gaps), and the dotenv profile-selector-key exclusion still
+/// strips `AUTUMN_ENV`/`AUTUMN_PROFILE`/`AUTUMN_IS_DEBUG` from any `.env` file,
+/// matching `AutumnConfig::load()`.
 fn load_runtime_config(resolved: &ResolvedDeployConfig) -> Result<AutumnConfig, DeployError> {
-    let inner = autumn_web::dotenv::os_env_with_dotenv_for_profile(&resolved.profile)
-        .map_err(|e| DeployError::Config(e.to_string()))?;
+    use autumn_web::config::OsEnv;
+    // Gating base: the real OS env, but reports `AUTUMN_DOTENV=1` so
+    // `should_load` loads `.env.<profile>` for a non-dev deploy profile —
+    // without mutating the global process environment.
+    let gating = ForcedProfileEnv {
+        profile: resolved.profile.clone(),
+        inner: OsEnv,
+    };
+    let inner =
+        autumn_web::dotenv::os_env_with_dotenv_for_profile_using(&gating, &resolved.profile)
+            .map_err(|e| DeployError::Config(e.to_string()))?;
     let forced = ForcedProfileEnv {
         profile: resolved.profile.clone(),
         inner,
