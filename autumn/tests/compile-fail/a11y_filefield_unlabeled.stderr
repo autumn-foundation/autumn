@@ -1,0 +1,5 @@
+error[E0599]: no method named `render` found for struct `FileField<State>` in the current scope
+  --> tests/compile-fail/a11y_filefield_unlabeled.rs:10:62
+   |
+10 |     let _markup = FileField::new("avatar").accept("image/*").render();
+   |                                                              ^^^^^^ method not found in `FileField<NoLabel>`
