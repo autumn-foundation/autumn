@@ -626,18 +626,35 @@ pub fn build_deploy_plan(cfg: &ResolvedDeployConfig) -> Vec<DeployStep> {
 }
 
 /// Build the rollback plan, mirroring [`exec::rollback_ops`]'s actual sequence:
-/// restart the previous slot's unit first, flip the proxy upstream back to it,
-/// record the release being rolled back FROM as the new previous-release marker,
-/// repoint `current`, record the live slot, re-probe `/ready`, and finally drain
-/// the slot the rollback flipped traffic away from.
+/// re-render the target slot's unit and `daemon-reload`, restart the previous
+/// slot's unit, flip the proxy upstream back to it, record the release being
+/// rolled back FROM as the new previous-release marker, repoint `current`, record
+/// the live slot, re-probe `/ready`, and finally drain the slot the rollback
+/// flipped traffic away from.
 ///
-/// The order matters: the proxy flip is health-gated, so the previous release's
-/// unit must be restarted and up *before* the flip can pass, and the flip
-/// therefore precedes the `current` repoint. The former-live slot is drained last,
-/// after the re-probe confirms the rolled-back release is healthy.
+/// The order matters: the target unit is re-rendered from the persisted marker
+/// (its dir + port) and `daemon-reload`ed FIRST so the restart never relaunches a
+/// slot unit an earlier failed redeploy clobbered. The proxy flip is health-gated,
+/// so the previous release's unit must be restarted and up *before* the flip can
+/// pass, and the flip therefore precedes the `current` repoint. The former-live
+/// slot is drained last, after the re-probe confirms the rolled-back release is
+/// healthy.
 #[must_use]
 pub fn build_rollback_plan(cfg: &ResolvedDeployConfig) -> Vec<DeployStep> {
     vec![
+        DeployStep::new(
+            "write-target-unit",
+            format!(
+                "Re-render the previous release's {} slot unit from the persisted \
+                 marker (its dir + port) so the restart never relaunches a slot unit \
+                 an earlier failed redeploy left pointing at a removed candidate",
+                cfg.service_name
+            ),
+        ),
+        DeployStep::new(
+            "daemon-reload",
+            "Reload systemd so the restart below loads the freshly re-rendered unit",
+        ),
         DeployStep::new(
             "restart-previous",
             format!(
@@ -1236,6 +1253,8 @@ mod tests {
         assert_eq!(
             labels,
             vec![
+                "write-target-unit",
+                "daemon-reload",
                 "restart-previous",
                 "proxy-flip",
                 "record-previous",
@@ -1247,8 +1266,15 @@ mod tests {
             "printed rollback plan must match rollback_ops' execution order"
         );
         let pos = |l: &str| labels.iter().position(|&x| x == l).expect("step present");
-        // Restart the previous unit before the health-gated flip, and flip before
-        // repointing `current`; re-probe before draining the former-live slot.
+        // Re-render the target unit and daemon-reload before restarting, so the
+        // restart never relaunches a slot unit clobbered by an earlier failed
+        // redeploy. Restart the previous unit before the health-gated flip, and flip
+        // before repointing `current`; re-probe before draining the former-live slot.
+        assert!(
+            pos("write-target-unit") < pos("daemon-reload")
+                && pos("daemon-reload") < pos("restart-previous"),
+            "the target unit is re-rendered and daemon-reloaded before the restart"
+        );
         assert!(
             pos("restart-previous") < pos("proxy-flip"),
             "previous unit must be up before the health-gated flip"

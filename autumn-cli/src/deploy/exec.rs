@@ -902,19 +902,24 @@ pub fn resolve_rollback_target(
 /// health-gated (`kamal-proxy deploy` blocks on the target's `/ready`) and would
 /// time out against a stopped upstream. The sequence:
 ///
-/// 1. bring the previous release's slot unit back up (it was drained on the last
+/// 1. re-render the target release's slot unit from the persisted marker (its dir +
+///    port), so rollback never restarts a slot unit an earlier failed redeploy
+///    clobbered (a slot's unit is per-slot and gets overwritten to point at a new
+///    candidate on any redeploy reusing that slot),
+/// 2. `systemctl daemon-reload` so the restart below loads the freshly written unit,
+/// 3. bring the previous release's slot unit back up (it was drained on the last
 ///    cutover, not deleted),
-/// 2. health-gated proxy flip back to the previous release's loopback port,
-/// 3. record the previous-release marker as the release we roll back FROM (the
+/// 4. health-gated proxy flip back to the previous release's loopback port,
+/// 5. record the previous-release marker as the release we roll back FROM (the
 ///    current live release: its dir + the former-live slot), BEFORE `current`
 ///    moves off it, so a subsequent rollback returns to it,
-/// 4. repoint `current` at the previous release,
-/// 5. record the live slot marker (now the previous slot),
-/// 6. bounded `/ready` re-probe to confirm the rollback is healthy,
-/// 7. drain (disable) the slot the rollback flipped traffic AWAY from — the slot
+/// 6. repoint `current` at the previous release,
+/// 7. record the live slot marker (now the previous slot),
+/// 8. bounded `/ready` re-probe to confirm the rollback is healthy,
+/// 9. drain (disable) the slot the rollback flipped traffic AWAY from — the slot
 ///    that was live before the rollback (`other_slot(target.slot)`).
 ///
-/// Step 6 restores the invariant "only the live slot runs" (symmetric with
+/// Step 9 restores the invariant "only the live slot runs" (symmetric with
 /// [`cutover_ops`]'s `drain-old`). Without it the just-rolled-back slot's former
 /// peer keeps running its old binary and the next deploy would reuse that
 /// still-running slot as its idle candidate. The slot-START ops now force a
@@ -934,6 +939,17 @@ pub fn rollback_ops(
     target: &RollbackTarget,
 ) -> Vec<DeployOp> {
     let previous_unit = slot_unit_name(&cfg.service_name, target.slot);
+    let previous_unit_path = format!("/etc/systemd/system/{previous_unit}.service");
+    // Re-render the TARGET release's slot unit from the persisted marker (dir +
+    // port), so rollback never depends on the slot's on-disk unit being intact. A
+    // redeploy reusing this slot overwrites its unit to point at the new candidate
+    // BEFORE the flip; if that redeploy fails pre-flip its teardown removes the
+    // candidate dir but leaves the slot unit pointing at the now-removed dir. Left
+    // as-is, `restart-previous` below would relaunch that clobbered unit
+    // (ExecStart -> removed dir) instead of the retained previous release. Rendering
+    // from `target.release_dir`/`target.port` (NOT the current live config) restores
+    // the correct unit for the release we roll back to.
+    let target_unit = super::render_app_unit(cfg, &target.release_dir, target.port, target.slot);
     // The slot that was live before this rollback — traffic just moved away from
     // it. `target.slot` is the slot we roll back TO, so the former-live slot is the
     // OTHER one.
@@ -949,13 +965,30 @@ pub fn rollback_ops(
         .saturating_sub(if target.slot == SLOT_GREEN { 2 } else { 1 });
     let former_live_fallback_port = slot_app_port(public_port, other_slot(target.slot));
     vec![
+        // Re-render the target slot's unit BEFORE bringing it up, so rollback can
+        // never restart a slot unit that an earlier failed redeploy clobbered (see
+        // the `target_unit` comment above). The unit is rendered from the target's
+        // own dir + port, not the current live config.
+        DeployOp::WriteFile {
+            label: "write-target-unit",
+            contents: FileContents::Plain(target_unit),
+            remote_path: previous_unit_path,
+            mode: Some(0o644),
+        },
+        // `restart` below loads the on-disk unit, so the freshly written unit must
+        // be picked up first — rollback now rewrites a unit, so a `daemon-reload` is
+        // required here (first_deploy/cutover reload for the same reason).
+        DeployOp::Run(RemoteCommand::new(
+            "daemon-reload",
+            "systemctl daemon-reload",
+        )),
         // enable = boot-persistence; restart = start-or-relaunch. We deliberately
         // use `restart` (not `enable --now`) because the previous slot may still be
         // active with a stale process under drift, and `enable --now` will NOT
         // relaunch an already-active unit — the health-gated flip below would then
-        // target a stale binary. `restart` always relaunches the on-disk unit (the
-        // one written at that release's own deploy; rollback rewrites no unit, so no
-        // daemon-reload is needed here).
+        // target a stale binary. `restart` always relaunches the on-disk unit
+        // (re-rendered and daemon-reloaded immediately above, so it points at the
+        // target release's dir + port).
         DeployOp::Run(RemoteCommand::new(
             "restart-previous",
             format!(
@@ -2172,14 +2205,16 @@ mod tests {
         let ops = rollback_ops(&cfg, &proxy(), &target);
         run_ops(&ops, &exec).expect("recording executor never fails");
 
-        // resolve-previous (the probe) precedes the ordered rollback ops: bring the
-        // previous slot back up → health-gated flip to it → record the release we
-        // roll back FROM as the new previous → promote → mark live → re-probe
-        // /ready → drain the former-live slot.
+        // resolve-previous (the probe) precedes the ordered rollback ops: re-render
+        // the target unit + daemon-reload → bring the previous slot back up → flip →
+        // record previous → promote → mark live → re-probe → drain the former-live
+        // slot. (write-target-unit is a WriteFile — uploaded, so excluded from
+        // `run_labels`; asserted in `rollback_rerenders_target_unit_before_restart`.)
         assert_eq!(
             exec.run_labels(),
             vec![
                 "resolve-previous",
+                "daemon-reload",
                 "restart-previous",
                 "proxy-flip",
                 "record-previous",
@@ -2214,7 +2249,9 @@ mod tests {
         // FORCE-relaunches the on-disk unit — `enable` + `restart`, never
         // `enable --now` — so a previous slot left active with a stale process
         // relaunches rather than letting the health-gated flip target stale bits.
-        // (Rollback rewrites no unit, so there is no daemon-reload in this path.)
+        // (Rollback now re-renders the target unit and daemon-reloads first, so the
+        // restart loads the correct on-disk unit — see
+        // `rollback_rerenders_target_unit_before_restart`.)
         let restart = exec.shell_for("restart-previous").expect("restart ran");
         assert!(
             restart.contains("systemctl enable myapp-blue.service")
@@ -2258,10 +2295,6 @@ mod tests {
             "record the previous-release marker before `current` moves off it"
         );
         assert!(
-            pos("proxy-flip") < pos("link-current"),
-            "flip before promote"
-        );
-        assert!(
             pos("link-current") < pos("readiness-gate"),
             "promote before the re-probe"
         );
@@ -2280,6 +2313,74 @@ mod tests {
         assert!(
             pos("readiness-gate") < pos("drain-rolled-back-slot"),
             "drain the former-live slot only after confirming the rollback is healthy"
+        );
+    }
+
+    #[test]
+    fn rollback_rerenders_target_unit_before_restart() {
+        // Codex P2 (exec.rs): a redeploy reusing a slot overwrites that slot's unit
+        // to point at the new candidate BEFORE the flip; if it fails pre-flip its
+        // teardown removes the candidate dir but leaves the slot unit pointing at
+        // the removed dir. Rollback must therefore RE-RENDER the target slot's unit
+        // from the persisted marker (its own dir + port) and daemon-reload BEFORE
+        // restarting, so it can never relaunch that clobbered unit.
+        let cfg = resolved();
+        // Target = the previous release (blue slot, persisted port 3001, its OWN
+        // release dir), distinct from any current live release/config.
+        let target = RollbackTarget {
+            release_dir: "/srv/autumn/myapp/releases/20260713T090000Z".to_owned(),
+            slot: SLOT_BLUE,
+            port: 3001,
+        };
+        let ops = rollback_ops(&cfg, &proxy(), &target);
+
+        // Locate the write-target-unit WriteFile and inspect its rendered contents.
+        let (unit_idx, unit_path, unit_contents) = ops
+            .iter()
+            .enumerate()
+            .find_map(|(i, op)| match op {
+                DeployOp::WriteFile {
+                    label: "write-target-unit",
+                    remote_path,
+                    contents,
+                    ..
+                } => Some((i, remote_path.clone(), contents.as_str().to_owned())),
+                _ => None,
+            })
+            .expect("rollback re-renders the target unit");
+
+        // Written to the TARGET slot's unit path (blue), not the former-live slot.
+        assert_eq!(
+            unit_path, "/etc/systemd/system/myapp-blue.service",
+            "the re-rendered unit is written to the target slot's unit path"
+        );
+        // The unit points at the TARGET release's dir and persisted port — NOT a
+        // current live dir/port — so rollback restores the correct ExecStart.
+        assert!(
+            unit_contents.contains("ExecStart=/srv/autumn/myapp/releases/20260713T090000Z/myapp"),
+            "re-rendered unit ExecStart references the target release dir: {unit_contents}"
+        );
+        assert!(
+            unit_contents.contains("WorkingDirectory=/srv/autumn/myapp/releases/20260713T090000Z"),
+            "re-rendered unit WorkingDirectory is the target release dir: {unit_contents}"
+        );
+        assert!(
+            unit_contents.contains("AUTUMN_SERVER__PORT=3001"),
+            "re-rendered unit binds the target's persisted port (3001): {unit_contents}"
+        );
+
+        // Ordering: write-target-unit → daemon-reload → restart-previous.
+        let label_idx = |want: &str| {
+            ops.iter()
+                .position(|op| op.label() == want)
+                .unwrap_or_else(|| panic!("op {want} present"))
+        };
+        let reload_idx = label_idx("daemon-reload");
+        let restart_idx = label_idx("restart-previous");
+        assert!(
+            unit_idx < reload_idx && reload_idx < restart_idx,
+            "order must be write-target-unit ({unit_idx}) < daemon-reload ({reload_idx}) \
+             < restart-previous ({restart_idx})"
         );
     }
 
@@ -2471,6 +2572,7 @@ mod tests {
             labels,
             vec![
                 "resolve-previous",
+                "daemon-reload",
                 "restart-previous",
                 "proxy-flip",
                 "record-previous",
@@ -2814,6 +2916,13 @@ mod tests {
         );
     }
 
+    // Linux-only: this behavioral test shells out to `sh -c`, GNU `touch -d @epoch`,
+    // `ls -1dt` (via the generated prune shell), and `std::os::unix::fs::symlink`.
+    // On Windows `std::os::unix` does not exist (compile error), and on macOS the
+    // BSD `touch` rejects `-d @epoch` (runtime panic). The deploy target is Ubuntu,
+    // so gating to Linux is correct. Use `target_os = "linux"`, not `cfg(unix)`,
+    // because macOS is unix but still fails on BSD touch.
+    #[cfg(target_os = "linux")]
     #[test]
     fn prune_shell_protects_current_and_previous_dirs_end_to_end() {
         // Behavioral proof: run the generated prune shell against a real tempdir of
