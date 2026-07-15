@@ -62,7 +62,7 @@ pub fn schema_table_block_with_id(table: &str, fields: &[Field], id_type: IdType
     schema_table_block_with_id_for(DatabaseBackend::Postgres, table, fields, id_type)
 }
 
-/// [`schema_table_block_with_id`] for a specific database `backend` (`SQLite`
+/// `schema_table_block_with_id` for a specific database `backend` (`SQLite`
 /// foundation, issue #1614). The Postgres path is byte-for-byte identical to
 /// the historical output; the `SQLite` path uses the diesel sql-types that
 /// diesel's `SQLite` backend actually implements (`Text` for `Uuid`/`Jsonb`,
@@ -219,7 +219,7 @@ pub fn schema_has_table(schema: &str, table: &str) -> bool {
 /// as [`append_schema_table`] shapes it), or an empty `Vec` if `table` isn't
 /// declared there at all.
 ///
-/// Used by [`add_columns_up_sql`]/[`remove_columns_down_sql`] (issue #1032
+/// Used by `add_columns_up_sql`/`remove_columns_down_sql` (issue #1032
 /// review follow-up) to extend their unique-index collision check beyond the
 /// columns being added/removed in the current `AddXToY`/`RemoveXFromY`
 /// migration: a plain index on some *other*, already-existing column named
@@ -588,6 +588,7 @@ fn fields_with_existing_schema_columns(
                 variants: Vec::new(),
                 unique: false,
                 constraints: FieldConstraints::default(),
+                state_machine: None,
             });
         }
     }
@@ -615,7 +616,7 @@ pub fn add_columns_up_sql(table: &str, fields: &[Field], existing_schema: &str) 
         .expect("Postgres ADD COLUMN generation never rejects")
 }
 
-/// [`add_columns_up_sql`] for a specific database `backend` (issue #1614). The
+/// `add_columns_up_sql` for a specific database `backend` (issue #1614). The
 /// Postgres path stays byte-for-byte identical; the `SQLite` path emits
 /// `SQLite`-valid column types via [`super::dsl::Field::sql_column_type_for`].
 ///
@@ -706,7 +707,7 @@ pub fn add_columns_down_sql(table: &str, fields: &[Field]) -> String {
     add_columns_down_sql_for(DatabaseBackend::Postgres, table, fields, "")
 }
 
-/// [`add_columns_down_sql`] for a specific database `backend` (issue #1614).
+/// `add_columns_down_sql` for a specific database `backend` (issue #1614).
 ///
 /// On `SQLite`, [`add_columns_up_sql_for`] emits a `CREATE INDEX` for an added
 /// nullable `references` field or a `unique` field, but `SQLite` refuses to
@@ -913,7 +914,7 @@ pub fn remove_columns_up_sql(table: &str, fields: &[Field]) -> String {
     remove_columns_up_sql_for(DatabaseBackend::Postgres, table, fields, "")
 }
 
-/// [`remove_columns_up_sql`] for a specific database `backend` (issue #1614).
+/// `remove_columns_up_sql` for a specific database `backend` (issue #1614).
 ///
 /// Prepends an `autumn-safety` comment for each `DROP COLUMN` to make the
 /// rolling-deploy risk visible at a glance and machine-parseable by
@@ -1002,7 +1003,7 @@ pub fn remove_columns_down_sql(table: &str, fields: &[Field], existing_schema: &
         .expect("Postgres ADD COLUMN generation never rejects")
 }
 
-/// [`remove_columns_down_sql`] for a specific database `backend` (issue #1614).
+/// `remove_columns_down_sql` for a specific database `backend` (issue #1614).
 /// The Postgres path stays byte-for-byte identical; the `SQLite` path restores
 /// the dropped column with a `SQLite`-valid type via
 /// [`super::dsl::Field::sql_column_type_for`].

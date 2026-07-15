@@ -312,7 +312,7 @@ pub fn read_or_empty(path: &Path) -> String {
 /// emitting Postgres DDL (`BIGSERIAL`, `TIMESTAMPTZ`, `NOW()`) for a `SQLite`
 /// app.
 ///
-/// Defaults to [`DatabaseBackend::Postgres`] when no URL can be resolved or its
+/// Defaults to [`DatabaseBackend::Postgres`](autumn_web::config::DatabaseBackend::Postgres) when no URL can be resolved or its
 /// shape is unrecognized, preserving today's Postgres-only generator behavior
 /// with no regression. The emitted DDL / diesel schema is then made
 /// backend-aware so no generator output compiles against Postgres but breaks on

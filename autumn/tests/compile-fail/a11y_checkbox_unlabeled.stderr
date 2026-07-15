@@ -1,0 +1,5 @@
+error[E0599]: no method named `render` found for struct `autumn_web::a11y::Checkbox<State>` in the current scope
+  --> tests/compile-fail/a11y_checkbox_unlabeled.rs:10:63
+   |
+10 |     let _markup = Checkbox::new("accept_terms").checked(true).render();
+   |                                                               ^^^^^^ method not found in `autumn_web::a11y::Checkbox<NoLabel>`

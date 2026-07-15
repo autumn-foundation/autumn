@@ -39,6 +39,11 @@ fn compile_fail_tests() {
     #[cfg(feature = "db")]
     t.compile_fail("tests/compile-fail/model_m2m_helper_collision.rs");
 
+    // #1911: `#[state_machine(lifecycle = T)]` where `T` is not a `#[lifecycle]`
+    // enum fails with an unsatisfied `T: Lifecycle` trait bound.
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/state_machine_lifecycle_not_lifecycle.rs");
+
     // Repository hooks failures (require db feature)
     #[cfg(feature = "db")]
     compile_repository_hooks_not_default(&t);
@@ -77,6 +82,17 @@ fn compile_fail_tests() {
     t.compile_fail("tests/compile-fail/a11y_link_missing_text.rs");
     #[cfg(feature = "maud")]
     t.compile_fail("tests/compile-fail/a11y_menuitem_missing_name.rs");
+    // The multi-line / dropdown / boolean / file-input form primitives carry the
+    // same type-level label obligation as `TextField`: an unlabeled one has no
+    // `.render()` and does not build.
+    #[cfg(feature = "maud")]
+    t.compile_fail("tests/compile-fail/a11y_textarea_unlabeled.rs");
+    #[cfg(feature = "maud")]
+    t.compile_fail("tests/compile-fail/a11y_select_unlabeled.rs");
+    #[cfg(feature = "maud")]
+    t.compile_fail("tests/compile-fail/a11y_checkbox_unlabeled.rs");
+    #[cfg(feature = "maud")]
+    t.compile_fail("tests/compile-fail/a11y_filefield_unlabeled.rs");
 }
 
 #[test]
@@ -193,6 +209,11 @@ fn compile_pass_tests() {
     // Declarative state machines: #[state_machine(transitions(...))] (requires db feature)
     #[cfg(feature = "db")]
     t.pass("tests/compile-pass/model_state_machine.rs");
+
+    // #1911: `#[state_machine(lifecycle = Enum)]` derives its table from a
+    // `#[lifecycle]` enum.
+    #[cfg(feature = "db")]
+    t.pass("tests/compile-pass/model_state_machine_lifecycle.rs");
 
     // Soft delete (requires db feature)
     #[cfg(feature = "db")]

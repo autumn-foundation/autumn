@@ -814,7 +814,7 @@ impl<P, C: NestedChild> NestedChangesetForm<P, C> {
     ///
     /// The submit token starts `None`, so a bare `blank(..).form_tag(..)` emits
     /// **no** submit-token hidden input and the first submission is not protected
-    /// against double-submit ([`SubmitTokenLayer`](crate::security::submit_token)
+    /// against double-submit ([`SubmitTokenLayer`](crate::security::SubmitTokenLayer)
     /// passes tokenless mutating requests through). Supply the minted token on the
     /// initial GET with [`with_submit_token`](Self::with_submit_token) (and
     /// [`with_submit_field`](Self::with_submit_field) if the field name is
@@ -883,7 +883,7 @@ impl<P, C: NestedChild> NestedChangesetForm<P, C> {
     /// double-submit, not just later 422 re-renders.
     ///
     /// [`blank`](Self::blank) leaves this `None` (the initial page renders no
-    /// submit-token field otherwise), and [`SubmitTokenLayer`](crate::security::submit_token)
+    /// submit-token field otherwise), and [`SubmitTokenLayer`](crate::security::SubmitTokenLayer)
     /// passes tokenless mutating requests through unchanged — so without calling
     /// this the first create-form submit is unprotected. Source the token from a
     /// [`SubmitToken`](crate::security::SubmitToken) extractor on the GET handler.
@@ -1037,7 +1037,7 @@ impl<P, C: NestedChild> NestedChangesetForm<P, C> {
     /// [`with_submit_token`](Self::with_submit_token) so the **first** submit is
     /// protected against double-submit too — otherwise a bare
     /// `blank(..).form_tag(..)` create form carries no submit token and its first
-    /// submission passes through [`SubmitTokenLayer`](crate::security::submit_token)
+    /// submission passes through [`SubmitTokenLayer`](crate::security::SubmitTokenLayer)
     /// unprotected.
     #[must_use]
     #[allow(clippy::needless_pass_by_value)]

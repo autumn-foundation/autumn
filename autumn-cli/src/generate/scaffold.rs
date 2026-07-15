@@ -783,6 +783,18 @@ fn plan_scaffold_with_options_impl(
     let search_enabled = !options_with_key.model.searchable.is_empty()
         && !options_with_key.live
         && !options_with_key.live_validation;
+    // Issue #1326: the state-machine fields whose `transition_{field}` handler
+    // the generated `routes::{plural}` module emits and `main.rs` must mount.
+    // Only the HTML surface emits these handlers, so this stays empty for `--api`.
+    let sm_field_names: Vec<String> = if options_with_key.api {
+        Vec::new()
+    } else {
+        fields
+            .iter()
+            .filter(|f| f.state_machine.is_some())
+            .map(|f| f.name.clone())
+            .collect()
+    };
     let route_entries = main_route_entries(
         &plural,
         &snake_name,
@@ -790,6 +802,7 @@ fn plan_scaffold_with_options_impl(
         options_with_key.live,
         search_enabled && !options_with_key.api,
         &validated_field_names,
+        &sm_field_names,
     );
     let mut mods = vec!["models", "schema", "repositories"];
     if !options_with_key.api {
@@ -1747,6 +1760,16 @@ fn render_model_form(
             );
             let _ = writeln!(from_row, "            {name}: row.{name}.to_string(),");
         } else {
+            // Issue #1326: a `:states(…)` state-machine column is transition-only,
+            // so the EDIT form omits its input (see `render_form_for_helper`) and
+            // the update submit carries no value for it. `#[serde(default)]` maps
+            // that absence to an empty string instead of a "missing field" 400 —
+            // harmless because the update `.set((…))` tuple excludes the column
+            // (`render_update_columns`), and the create form still submits the
+            // real initial state.
+            if f.state_machine.is_some() {
+                let _ = writeln!(struct_fields, "    #[serde(default)]");
+            }
             // Plain scalars (String/Text, and any nullable numeric/Uuid/Decimal)
             // keep their native type — `Option<T>::default()` is already blank.
             let _ = writeln!(
@@ -1839,6 +1862,15 @@ fn render_routes_file(
     let search_enabled = !searchable.is_empty() && !live && !live_validation;
     let validated_fields: Vec<&str> = validations.keys().map(String::as_str).collect();
     let unique_fields: Vec<&Field> = fields.iter().filter(|f| f.unique).collect();
+    // Issue #1326: fields carrying a `:states(…)` state machine. Only these
+    // scaffolds emit a `show_view` helper, per-field `transition_controls`, and a
+    // `POST /{plural}/{{id}}/transitions/{field}` handler. A scaffold with none
+    // (the overwhelming common case) keeps the pre-#1326 output byte-identical.
+    let sm_fields: Vec<&Field> = fields
+        .iter()
+        .filter(|f| f.state_machine.is_some())
+        .collect();
+    let has_state_machine = !sm_fields.is_empty();
     let update_columns = render_update_columns(plural, fields);
     let nullable_field_match = render_nullable_field_match(fields);
     let has_attachments = has_attachment_fields(fields);
@@ -2497,16 +2529,23 @@ fn render_routes_file(
             );
             let _ = write!(option_args, ", &{name}_options");
         }
+        // Issue #1326: the shared `{snake}_form_for` helper gains an
+        // `exclude_state_fields` flag only when the model has a state-machine
+        // column; the create form keeps the column (initial state) while the
+        // edit form drops it (transition-only). A no-state-machine model passes
+        // no extra argument, keeping the pre-#1326 call byte-identical.
+        let form_exclude_create = if has_state_machine { ", false" } else { "" };
+        let form_exclude_edit = if has_state_machine { ", true" } else { "" };
         let new_form_layout = format!(
             "{layout_fn}(\"New {pascal_name}\", {cp_new}{flash_arg}, html! {{\n        \
              h1 {{ \"New {pascal_name}\" }}\n        \
-             ({snake_name}_form_for(&changeset, paths::create(), \"Create\", csrf.as_ref(), csrf_field.as_ref(), submit_token.as_ref(), submit_field.as_ref(){option_args}))\n    \
+             ({snake_name}_form_for(&changeset, paths::create(), \"Create\", csrf.as_ref(), csrf_field.as_ref(), submit_token.as_ref(), submit_field.as_ref(){option_args}{form_exclude_create}))\n    \
              }})"
         );
         let edit_form_layout = format!(
             "{layout_fn}(&format!(\"Edit {pascal_name} #{{}}\", *id), {cp_edit}{flash_arg}, html! {{\n        \
              h1 {{ \"Edit {pascal_name} #\" (*id) }}\n        \
-             ({snake_name}_form_for(&changeset, paths::update(*id), \"Save\", csrf.as_ref(), csrf_field.as_ref(), submit_token.as_ref(), submit_field.as_ref(){option_args}))\n        \
+             ({snake_name}_form_for(&changeset, paths::update(*id), \"Save\", csrf.as_ref(), csrf_field.as_ref(), submit_token.as_ref(), submit_field.as_ref(){option_args}{form_exclude_edit}))\n        \
              form action=(paths::delete(*id)) method=\"post\" {{\n            \
              (csrf_input(csrf.as_ref(), csrf_field.as_ref()))\n            \
              button type=\"submit\" onclick=\"return confirm('Delete this {pascal_name}?')\" {{ \"Delete\" }}\n        \
@@ -3272,6 +3311,13 @@ pub async fn index(
                 names.push(format!("validate_{field_name}"));
             }
         }
+        // Issue #1326: one transition endpoint per state-machine field, linked
+        // from the show page's `transition_controls` form actions
+        // (`paths::transition_{field}(id)`).
+        for f in &sm_fields {
+            let field = &f.name;
+            names.push(format!("transition_{field}"));
+        }
         let mut out = String::from("\n\nautumn_web::paths![\n");
         for name in &names {
             let _ = writeln!(out, "    {name},");
@@ -3527,6 +3573,181 @@ fn layout(title: &str, flash: Markup, content: Markup) -> Markup {{
 "#
             )
         };
+        // Issue #1326: the `show` detail section. Without a state machine this is
+        // exactly the pre-#1326 inline `show` handler (byte-identical output).
+        // With one or more `:states(…)` fields it becomes a shared `show_view`
+        // helper (rendered by `show` AND each transition handler's 422 re-render),
+        // a `show` handler threading CSRF for the transition forms, and one
+        // `POST /{plural}/{{id}}/transitions/{field}` handler per state-machine
+        // field.
+        let show_section = if has_state_machine {
+            // `show_view` only touches the DB when it must resolve reference
+            // display labels (issue #1146); otherwise the connection is unused, so
+            // name it `_db` (and drop `mut`) to keep the generated crate
+            // warning-free.
+            let show_view_db_param = if show_label_loads.trim().is_empty() {
+                format!("_db: {db_ty}")
+            } else {
+                format!("mut db: {db_ty}")
+            };
+            let mut show_transition_controls = String::new();
+            for f in &sm_fields {
+                let field = &f.name;
+                let field_upper = f.name.to_uppercase();
+                let _ = writeln!(
+                    show_transition_controls,
+                    "        (autumn_web::widgets::transition_controls(&paths::transition_{field}(row.id), \"{field}\", &row.{field}, {pascal_name}::__AUTUMN_SM_{field_upper}_TRANSITIONS, |to| row.can_transition_{field}_to(to), csrf, csrf_field))"
+                );
+            }
+            let show_view_fn = format!(
+                r#"/// Render the {snake_name} detail page — shared by the `show` handler and
+/// each state-machine transition handler's 422 re-render, so the detail-page
+/// markup has a single source of truth (issue #1326).
+async fn show_view(
+    {show_view_db_param},
+    row: &{pascal_name},
+    flash: Markup,
+    csrf: Option<&CsrfToken>,
+    csrf_field: Option<&CsrfFormField>,
+) -> AutumnResult<Markup> {{
+{show_label_loads}    let props: Vec<(&str, maud::Markup)> = vec![
+{show_rows}    ];
+    Ok({layout_fn}(&format!("{pascal_name} #{{}}", row.id), {cp_show}flash, html! {{
+        h1 {{ "{pascal_name} #" (row.id) }}
+        (autumn_web::widgets::property_list(&props))
+{show_transition_controls}        (autumn_web::a11y::Link::new(paths::index(), "Back to list"))
+        " "
+        (autumn_web::a11y::Link::new(paths::edit(row.id), "Edit"))
+    }}))
+}}"#
+            );
+            let show_handler = format!(
+                r#"/// `GET /{plural}/{{id}}` — show one {snake_name}.
+#[get("/{plural}/{{id}}")]
+pub async fn show(
+    id: Path<{id_rust}>,
+    mut db: {db_ty},
+    flash: Flash,
+    csrf: Option<CsrfToken>,
+    csrf_field: Option<CsrfFormField>,
+) -> AutumnResult<Markup> {{
+    let row: {pascal_name} = {plural}::table
+        .find(*id)
+        .select({pascal_name}::as_select())
+        .first(&mut *db)
+        .await
+        .map_err(AutumnError::not_found)?;
+    show_view(db, &row, {flash_arg}, csrf.as_ref(), csrf_field.as_ref()).await
+}}"#
+            );
+            // Issue #1326 security fix (IDOR): a transition mutates an existing
+            // row, so when record-policy wiring is on (the default for non-`--api`
+            // scaffolds) the transition handler must record-authorize the actor
+            // against the loaded row *before* writing — using the SAME `"update"`
+            // action the `update` handler uses. Without this, any authenticated
+            // user who knows another row's id could POST a transition and change
+            // its state, bypassing the record policy. Mirrors the `update`/`destroy`
+            // authorize preamble: the full `State(state)` + `session: Session`
+            // extractor pair (a transition handler never carries a multipart
+            // `state`, so there is no attachment-reuse concern) and `&state` as the
+            // `AppState` receiver. When policy wiring is off it emits nothing, so
+            // the handler is exactly `id/db/flash/csrf/body` as before.
+            let transition_authz_params = if authorize {
+                "    autumn_web::extract::State(state): autumn_web::extract::State<autumn_web::AppState>,\n    session: autumn_web::session::Session,\n"
+            } else {
+                ""
+            };
+            let transition_authz_call = if authorize {
+                format!(
+                    "    autumn_web::authorization::authorize::<{pascal_name}>(&state, &session, \"update\", &row).await?;\n"
+                )
+            } else {
+                String::new()
+            };
+            let mut transition_handlers = String::new();
+            for f in &sm_fields {
+                let field = &f.name;
+                let handler = format!(
+                    r#"/// `POST /{plural}/{{id}}/transitions/{field}` — apply a `{field}` state
+/// transition (issue #1326). A legal edge persists the new `{field}` value and
+/// redirects to the detail page; an illegal edge (or a rejected guard)
+/// re-renders that page at 422 with the record left unchanged.
+#[secured]
+#[post("/{plural}/{{id}}/transitions/{field}")]
+pub async fn transition_{field}(
+    id: Path<{id_rust}>,
+    mut db: {db_ty},
+    flash: Flash,
+    csrf: Option<CsrfToken>,
+    csrf_field: Option<CsrfFormField>,
+{transition_authz_params}    body: Bytes,
+) -> AutumnResult<autumn_web::reexports::axum::response::Response> {{
+    use autumn_web::reexports::axum::response::IntoResponse as _;
+    let row: {pascal_name} = {plural}::table
+        .find(*id)
+        .select({pascal_name}::as_select())
+        .first(&mut *db)
+        .await
+        .map_err(AutumnError::not_found)?;
+{transition_authz_call}    let submitted: std::collections::HashMap<String, String> =
+        url::form_urlencoded::parse(body.as_ref()).into_owned().collect();
+    let target = submitted.get("{field}").cloned().unwrap_or_default();
+    match row.transition_{field}_to(&target) {{
+        Ok(new_state) => {{
+            diesel::update({plural}::table.find(*id))
+                .set({plural}::{field}.eq(new_state))
+                .execute(&mut *db)
+                .await?;
+            flash.success("{pascal_name} {field} updated").await;
+            Ok(autumn_web::Redirect::to(&paths::show(*id)).into_response())
+        }}
+        Err(err) => {{
+            flash.error(err.to_string()).await;
+            let view = show_view(
+                db,
+                &row,
+                flash_messages(&flash.consume().await),
+                csrf.as_ref(),
+                csrf_field.as_ref(),
+            )
+            .await?;
+            Ok((autumn_web::reexports::http::StatusCode::UNPROCESSABLE_ENTITY, view).into_response())
+        }}
+    }}
+}}"#
+                );
+                if !transition_handlers.is_empty() {
+                    transition_handlers.push_str("\n\n");
+                }
+                transition_handlers.push_str(&handler);
+            }
+            format!("\n\n{show_view_fn}\n\n{show_handler}\n\n{transition_handlers}\n")
+        } else {
+            format!(
+                r#"
+
+/// `GET /{plural}/{{id}}` — show one {snake_name}.
+#[get("/{plural}/{{id}}")]
+pub async fn show(id: Path<{id_rust}>, mut db: {db_ty}, flash: Flash) -> AutumnResult<Markup> {{
+    let row: {pascal_name} = {plural}::table
+        .find(*id)
+        .select({pascal_name}::as_select())
+        .first(&mut *db)
+        .await
+        .map_err(AutumnError::not_found)?;
+{show_label_loads}    let props: Vec<(&str, maud::Markup)> = vec![
+{show_rows}    ];
+    Ok({layout_fn}(&format!("{pascal_name} #{{}}", row.id), {cp_show}{flash_arg}, html! {{
+        h1 {{ "{pascal_name} #" (row.id) }}
+        (autumn_web::widgets::property_list(&props))
+        (autumn_web::a11y::Link::new(paths::index(), "Back to list"))
+        " "
+        (autumn_web::a11y::Link::new(paths::edit(row.id), "Edit"))
+    }}))
+}}
+"#
+            )
+        };
         format!(
             r#"
 
@@ -3553,28 +3774,7 @@ fn submit_token_input(submit_token: Option<&SubmitToken>, field: Option<&SubmitF
     }}
 }}
 {private_layout}
-{index_handler}
-
-/// `GET /{plural}/{{id}}` — show one {snake_name}.
-#[get("/{plural}/{{id}}")]
-pub async fn show(id: Path<{id_rust}>, mut db: {db_ty}, flash: Flash) -> AutumnResult<Markup> {{
-    let row: {pascal_name} = {plural}::table
-        .find(*id)
-        .select({pascal_name}::as_select())
-        .first(&mut *db)
-        .await
-        .map_err(AutumnError::not_found)?;
-{show_label_loads}    let props: Vec<(&str, maud::Markup)> = vec![
-{show_rows}    ];
-    Ok({layout_fn}(&format!("{pascal_name} #{{}}", row.id), {cp_show}{flash_arg}, html! {{
-        h1 {{ "{pascal_name} #" (row.id) }}
-        (autumn_web::widgets::property_list(&props))
-        (autumn_web::a11y::Link::new(paths::index(), "Back to list"))
-        " "
-        (autumn_web::a11y::Link::new(paths::edit(row.id), "Edit"))
-    }}))
-}}
-
+{index_handler}{show_section}
 /// `GET /{plural}/new` — render the new-{snake_name} form.
 #[secured]
 #[get("/{plural}/new", name = "new")]
@@ -3961,6 +4161,29 @@ fn render_form_for_helper(
             }
         }
     }
+    // Issue #1326: a `:states(…)` state-machine column is transition-only. The
+    // create form keeps it (initial state), but the EDIT form must not offer it
+    // as an editable input — status changes flow only through the dedicated
+    // `POST /{plural}/{{id}}/transitions/{field}` route. The helper is shared by
+    // both forms, so it takes an `exclude_state_fields` flag: the edit call
+    // passes `true` and the create call `false`. A model with no state-machine
+    // field emits neither the parameter nor the block, keeping the pre-#1326
+    // helper byte-identical.
+    let sm_field_names: Vec<&str> = fields
+        .iter()
+        .filter(|f| f.state_machine.is_some())
+        .map(|f| f.name.as_str())
+        .collect();
+    let sm_exclude_block = if sm_field_names.is_empty() {
+        String::new()
+    } else {
+        let _ = write!(extra_params, ",\n    exclude_state_fields: bool");
+        let mut excludes = String::new();
+        for name in &sm_field_names {
+            let _ = write!(excludes, "\n        form = form.exclude(\"{name}\");");
+        }
+        format!("\n    if exclude_state_fields {{{excludes}\n    }}\n    ")
+    };
     format!(
         "/// Render the create/edit form in a single `form_for` call (issue #1135).\n\
          ///\n\
@@ -3980,7 +4203,7 @@ fn render_form_for_helper(
          ) -> Markup {{\n\
          {preludes}    \
          let mut form = autumn_web::form::form_for(changeset, action, \"post\")\n        \
-         .submit_label(submit_label){builder_calls}{appends};\n    \
+         .submit_label(submit_label){builder_calls}{appends};\n{sm_exclude_block}    \
          // Emit the one-time submit token at the FRONT of the form (issue #1360):\n    \
          // `SubmitTokenLayer` only scans the first chunk of the URL-encoded body,\n    \
          // so a large earlier textarea could otherwise push an appended token past\n    \
@@ -4963,7 +5186,19 @@ fn render_update_columns(plural: &str, fields: &[Field]) -> String {
     use std::fmt::Write;
     // Estimate 50 chars per field
     let mut out = String::with_capacity(fields.len() * 50);
-    for (i, f) in fields.iter().enumerate() {
+    // Issue #1326: a `:states(…)` state-machine column is transition-only — it is
+    // mutated exclusively through the dedicated `POST /{plural}/{{id}}/transitions/
+    // {field}` handler (a direct `diesel::update(...).set({field}.eq(new_state))`),
+    // never the ordinary update path. Excluding it from the update `.set((…))`
+    // tuple (and, in `render_form_for_helper`, from the edit form) stops a plain
+    // `POST /{plural}/{{id}}/update` from setting `status=<anything>` and bypassing
+    // `transition_{field}_to` / its guards. A model with no state-machine field
+    // emits the exact pre-#1326 column set.
+    for (i, f) in fields
+        .iter()
+        .filter(|f| f.state_machine.is_none())
+        .enumerate()
+    {
         if i > 0 {
             out.push_str(", ");
         }
@@ -6552,6 +6787,7 @@ fn main_route_entries(
     live: bool,
     search: bool,
     validated_field_names: &[String],
+    sm_field_names: &[String],
 ) -> Vec<String> {
     if api {
         let mut entries = vec![
@@ -6585,6 +6821,14 @@ fn main_route_entries(
         }
         for field_name in validated_field_names {
             entries.push(format!("routes::{plural}::validate_{field_name}"));
+        }
+        // Issue #1326: mount the `POST /{plural}/{{id}}/transitions/{field}`
+        // handler emitted for each state-machine field, so the show page's
+        // `transition_controls` form actions resolve to a real route rather than
+        // 404ing. A scaffold with no state-machine field pushes nothing here and
+        // keeps the pre-#1326 mounted route set byte-identical.
+        for field_name in sm_field_names {
+            entries.push(format!("routes::{plural}::transition_{field_name}"));
         }
         entries.push(format!("repositories::{snake_name}::{snake_name}_api_list"));
         entries.push(format!("repositories::{snake_name}::{snake_name}_api_get"));
@@ -10800,6 +11044,325 @@ async fn main() {
         );
     }
 
+    // ── state-machine transitions scaffold conformance (issue #1326) ──────
+
+    #[test]
+    fn scaffold_without_state_machine_emits_no_transition_wiring() {
+        // AC5: a model WITHOUT any `:states(…)` field keeps the pre-#1326 `show`
+        // handler and route set byte-for-byte — no `show_view` helper, no
+        // `/transitions/` route, and the original three-arg `show` signature.
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "body:Text".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+        assert!(
+            !routes.contains("/transitions/"),
+            "no-state-machine scaffold must not emit any transition route: {routes}"
+        );
+        assert!(
+            !routes.contains("fn show_view"),
+            "no-state-machine scaffold must not extract a show_view helper: {routes}"
+        );
+        assert!(
+            !routes.contains("transition_controls"),
+            "no-state-machine scaffold must not render transition controls: {routes}"
+        );
+        // The original inline `show` signature is unchanged (no CSRF params).
+        assert!(
+            routes.contains(
+                "pub async fn show(id: Path<i64>, mut db: Db, flash: Flash) -> AutumnResult<Markup> {"
+            ),
+            "no-state-machine `show` signature must be unchanged: {routes}"
+        );
+    }
+
+    #[test]
+    fn scaffold_with_state_machine_emits_transition_route_and_controls() {
+        // A model WITH a `:states(…)` field generates the transition route, the
+        // `transition_{field}_to` call, both the 303 success and 422 error
+        // branches, a shared `show_view`, and a `transition_controls(` call.
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Order",
+            &[
+                "status:String:states(draft -> published: can_publish, published -> archived)"
+                    .into(),
+            ],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let routes = fs::read_to_string(tmp.path().join("src/routes/orders.rs")).unwrap();
+        // The transition route: `POST /orders/{id}/transitions/status`.
+        assert!(
+            routes.contains("#[post(\"/orders/{id}/transitions/status\")]"),
+            "must emit the transition POST route: {routes}"
+        );
+        assert!(
+            routes.contains("pub async fn transition_status("),
+            "must emit the transition handler: {routes}"
+        );
+        // The handler drives the macro-emitted state-machine method.
+        assert!(
+            routes.contains("row.transition_status_to(&target)"),
+            "transition handler must call transition_status_to: {routes}"
+        );
+        // Success branch: 303 redirect to the show page.
+        assert!(
+            routes.contains("Ok(autumn_web::Redirect::to(&paths::show(*id)).into_response())"),
+            "transition handler must 303-redirect on a legal edge: {routes}"
+        );
+        // Error branch: 422 re-render of the detail page, record unchanged.
+        assert!(
+            routes.contains("autumn_web::reexports::http::StatusCode::UNPROCESSABLE_ENTITY"),
+            "transition handler must 422 on an illegal edge: {routes}"
+        );
+        // The detail page markup is shared through `show_view`.
+        assert!(
+            routes.contains("async fn show_view("),
+            "must extract a shared show_view helper: {routes}"
+        );
+        // The show view renders transition controls fed by the macro const.
+        assert!(
+            routes.contains("autumn_web::widgets::transition_controls(&paths::transition_status(row.id), \"status\", &row.status, Order::__AUTUMN_SM_STATUS_TRANSITIONS,"),
+            "show view must render transition_controls for the state-machine field: {routes}"
+        );
+        // The transition endpoint is registered in the paths! module.
+        assert!(
+            routes.contains("transition_status,"),
+            "paths! must register the transition route name: {routes}"
+        );
+        // Security (issue #1326 IDOR fix): with record-policy wiring on (the
+        // default for non-`--api` scaffolds), the transition handler threads the
+        // same `State` + `Session` pair as `update` and record-authorizes the
+        // actor against the loaded row with the `"update"` action BEFORE writing,
+        // so a transition cannot bypass the record policy.
+        assert!(
+            routes.contains(
+                "autumn_web::extract::State(state): autumn_web::extract::State<autumn_web::AppState>,"
+            ),
+            "transition handler must thread the State extractor when policy wiring is on: {routes}"
+        );
+        assert!(
+            routes.contains("session: autumn_web::session::Session,"),
+            "transition handler must thread the Session extractor when policy wiring is on: {routes}"
+        );
+        assert!(
+            routes.contains(
+                "autumn_web::authorization::authorize::<Order>(&state, &session, \"update\", &row).await?;"
+            ),
+            "transition handler must record-authorize the actor against the loaded row: {routes}"
+        );
+    }
+
+    #[test]
+    fn scaffold_with_state_machine_no_policy_emits_no_authz_preamble() {
+        // AC5 / IDOR-fix gating: a `--no-policy` scaffold still emits the
+        // transition route, but WITHOUT the authorize preamble — exactly the
+        // pre-fix `id/db/flash/csrf/body` handler. The authz preamble must appear
+        // only in the state-machine transition route AND only when policy is on.
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold_with_options(
+            tmp.path(),
+            "Order",
+            &[
+                "status:String:states(draft -> published: can_publish, published -> archived)"
+                    .into(),
+            ],
+            "20260427000000",
+            &ScaffoldOptions {
+                no_policy: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let routes = action_contents(&plan, "src/routes/orders.rs");
+        // The transition route is still generated…
+        assert!(
+            routes.contains("pub async fn transition_status("),
+            "--no-policy state-machine scaffold must still emit the transition handler: {routes}"
+        );
+        // …but with no record-policy authorization wiring.
+        assert!(
+            !routes.contains("authorize::<Order>"),
+            "--no-policy transition handler must not wire authorize: {routes}"
+        );
+        assert!(
+            !routes.contains("session: autumn_web::session::Session"),
+            "--no-policy transition handler must not thread a Session extractor: {routes}"
+        );
+    }
+
+    #[test]
+    fn scaffold_with_state_machine_mounts_transition_route_in_main() {
+        // P1 (issue #1326): the generated `main.rs` router must actually MOUNT
+        // each state-machine field's `transition_{field}` handler — otherwise the
+        // show page's `transition_controls` form POSTs to an unmounted route and
+        // 404s. The handler being present in the `routes::{plural}` module and in
+        // the name-only `paths!` helper is not enough; it must be in the router's
+        // `routes![…]` set.
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Order",
+            &[
+                "status:String:states(draft -> published, published -> archived)".into(),
+                "title:String".into(),
+            ],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let main = fs::read_to_string(tmp.path().join("src/main.rs")).unwrap();
+        assert!(
+            main.contains("routes::orders::transition_status"),
+            "main.rs must MOUNT the transition handler, not just declare it in paths!: {main}"
+        );
+        // Mounted alongside the standard CRUD handlers.
+        assert!(
+            main.contains("routes::orders::update") && main.contains("routes::orders::destroy"),
+            "standard CRUD handlers must still be mounted: {main}"
+        );
+    }
+
+    #[test]
+    fn scaffold_without_state_machine_mounts_no_transition_route_in_main() {
+        // AC5: a model with no `:states(…)` field mounts exactly the pre-#1326
+        // route set — no `transition_` entry, no `/transitions/` path.
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "body:Text".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let main = fs::read_to_string(tmp.path().join("src/main.rs")).unwrap();
+        assert!(
+            !main.contains("transition_"),
+            "no-state-machine scaffold must mount no transition route: {main}"
+        );
+        assert!(
+            !main.contains("/transitions/"),
+            "no-state-machine scaffold must reference no transition path: {main}"
+        );
+    }
+
+    #[test]
+    fn scaffold_state_machine_field_is_transition_only_on_update() {
+        // P2 (issue #1326): a `:states(…)` column is transition-only. It must be
+        // EXCLUDED from the ordinary update surfaces — the edit-form input and the
+        // update handler's `.set((…))` tuple — so a plain `POST /{plural}/{id}/
+        // update` (or a JSON body) cannot set `status=<anything>` and bypass
+        // `transition_status_to` / its guards. It must be KEPT on the create
+        // surface (initial state), the `New{Model}` insert path, and the show
+        // page's transition controls.
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Order",
+            &[
+                "status:String:states(draft -> published, published -> archived)".into(),
+                "title:String".into(),
+            ],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/orders.rs")).unwrap();
+
+        // ── excluded from the ordinary UPDATE path ───────────────────────────
+        // The update handler's `.set((…))` tuple must NOT set the state column
+        // (that form — `orders::status.eq(new.status.clone())` — is the bypass;
+        // the transition route instead sets `orders::status.eq(new_state)`).
+        assert!(
+            !routes.contains("orders::status.eq(new.status.clone())"),
+            "the update `.set((…))` tuple must exclude the state-machine column: {routes}"
+        );
+        assert!(
+            routes.contains("orders::title.eq(new.title.clone())"),
+            "the update `.set((…))` tuple must still set non-state columns: {routes}"
+        );
+        // The edit form drops the state input; the shared helper takes the flag
+        // and the edit call passes `true`.
+        assert!(
+            routes.contains("exclude_state_fields: bool"),
+            "the shared form helper must take an exclude_state_fields flag: {routes}"
+        );
+        assert!(
+            routes.contains("form = form.exclude(\"status\");"),
+            "the form helper must exclude the state column when asked: {routes}"
+        );
+        assert!(
+            routes.contains(
+                "order_form_for(&changeset, paths::update(*id), \"Save\", csrf.as_ref(), csrf_field.as_ref(), submit_token.as_ref(), submit_field.as_ref(), true)"
+            ),
+            "the EDIT form call must exclude the state field (pass `true`): {routes}"
+        );
+
+        // ── kept on the CREATE path + New{Model} insert ──────────────────────
+        assert!(
+            routes.contains(
+                "order_form_for(&changeset, paths::create(), \"Create\", csrf.as_ref(), csrf_field.as_ref(), submit_token.as_ref(), submit_field.as_ref(), false)"
+            ),
+            "the CREATE form call must keep the state field (pass `false`): {routes}"
+        );
+        // `OrderForm` keeps the column (serde-defaulted so an update submit that
+        // omits it still decodes) and `into_new` seeds the initial state.
+        assert!(
+            routes.contains("#[serde(default)]\n    pub status: String,"),
+            "OrderForm must keep a serde-defaulted state column: {routes}"
+        );
+        assert!(
+            routes.contains("status: form.status.clone(),"),
+            "into_new must seed the initial state on create: {routes}"
+        );
+
+        // ── kept on the SHOW page's transition controls ──────────────────────
+        assert!(
+            routes.contains("transition_controls(&paths::transition_status(row.id), \"status\""),
+            "the show view must still render the state column's transition controls: {routes}"
+        );
+    }
+
+    #[test]
+    fn scaffold_without_state_machine_keeps_field_on_update_surfaces() {
+        // AC5: a no-state-machine model's update form/handler are unchanged — no
+        // exclude flag, every field set on the update path.
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "body:Text".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+
+        assert!(
+            !routes.contains("exclude_state_fields"),
+            "no-state-machine form helper must not gain an exclude flag: {routes}"
+        );
+        assert!(
+            routes.contains("posts::title.eq(new.title.clone())")
+                && routes.contains("posts::body.eq(new.body.clone())"),
+            "no-state-machine update must set every column: {routes}"
+        );
+    }
+
     #[test]
     fn smoke_test_default_value_containing_semicolon_does_not_corrupt_sql() {
         // Regression test (PR review, issue #1023): `create_table_sql_with_metadata_and_id`
@@ -11368,6 +11931,7 @@ async fn main() {
                 variants: Vec::new(),
                 unique: false,
                 constraints: FieldConstraints::default(),
+                state_machine: None,
             },
             Field {
                 name: "author_id".to_string(),
@@ -11376,6 +11940,7 @@ async fn main() {
                 variants: Vec::new(),
                 unique: false,
                 constraints: FieldConstraints::default(),
+                state_machine: None,
             },
         ];
         assert_eq!(
@@ -11423,6 +11988,7 @@ async fn main() {
                 variants: Vec::new(),
                 unique: false,
                 constraints: FieldConstraints::default(),
+                state_machine: None,
             },
             Field {
                 name: "author_id".to_string(),
@@ -11431,6 +11997,7 @@ async fn main() {
                 variants: Vec::new(),
                 unique: false,
                 constraints: FieldConstraints::default(),
+                state_machine: None,
             },
         ];
         let sql = render_reference_stub_tables_sql(&fields, "unrelated_table");
@@ -11533,6 +12100,7 @@ async fn main() {
             variants: vec!["a".to_string(), "b".to_string()],
             unique: false,
             constraints: FieldConstraints::default(),
+            state_machine: None,
         };
         let weight = Field {
             name: "weight".to_string(),
@@ -11544,6 +12112,7 @@ async fn main() {
             variants: Vec::new(),
             unique: false,
             constraints: FieldConstraints::default(),
+            state_machine: None,
         };
         let fields = vec![status.clone(), weight];
         let sql = enum_rejection_insert_sql("items", &fields, &status, &BTreeMap::new());

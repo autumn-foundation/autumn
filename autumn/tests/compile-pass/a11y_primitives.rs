@@ -3,7 +3,10 @@
 //! Each primitive can only be constructed with an accessible name, and only a
 //! labeled `TextField` can be rendered — these are exactly those forms.
 
-use autumn_web::a11y::{Button, ButtonType, Img, Link, MenuItem, TextField};
+use autumn_web::a11y::{
+    Button, ButtonType, Checkbox, FileField, Img, Link, MenuItem, Select, SelectOption, TextArea,
+    TextField,
+};
 use autumn_web::html;
 use maud::Render;
 
@@ -78,4 +81,56 @@ fn main() {
     // Icon-only menu item keeps its accessible name via aria-label.
     let cog = html! { span aria-hidden="true" { "*" } };
     let _icon_item = MenuItem::new("Settings").icon(cog).class("item").render();
+
+    // A labeled text area is renderable; the value rides as text content.
+    let _bio = TextArea::new("bio")
+        .rows(6)
+        .cols(40)
+        .maxlength(500)
+        .value("Hello")
+        .label("Bio")
+        .render();
+
+    // A labeled select renders its typed options.
+    let _role = Select::new("role")
+        .option("", "— Select —")
+        .options([
+            SelectOption::new("admin", "Admin").selected(),
+            SelectOption::new("user", "User"),
+        ])
+        .selected_value("user")
+        .required()
+        .aria_required()
+        .label("Role")
+        .render();
+
+    // A labeled checkbox for a boolean field.
+    let _terms = Checkbox::new("accept_terms")
+        .value("true")
+        .checked(true)
+        .required()
+        .label("I accept the terms")
+        .render();
+
+    // A labeled file field — no derived aria-label competes with the visible label.
+    let _avatar = FileField::new("avatar")
+        .accept("image/*")
+        .multiple()
+        .label("Avatar")
+        .render();
+
+    // The hx-* escape hatch keeps the typed label obligation on the htmx path.
+    let _live = TextField::new("username")
+        .hx("post", "/validate/username")
+        .hx("trigger", "blur")
+        .label("Username")
+        .render();
+    let _live_area = TextArea::new("bio").hx("post", "/validate/bio").aria_label("Bio").render();
+    let _live_select = Select::new("role")
+        .option("user", "User")
+        .hx("get", "/roles")
+        .aria_label("Role")
+        .render();
+    let _live_check = Checkbox::new("subscribe").hx("post", "/toggle").aria_label("Subscribe").render();
+    let _live_file = FileField::new("doc").hx("post", "/scan").labelled_by("doc-heading").render();
 }

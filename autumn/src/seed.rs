@@ -149,7 +149,7 @@ impl SeedContext {
     ///
     /// Useful for APIs that take a `&Pool<AsyncPgConnection>` directly, such as
     /// factory `create_many(count, pool)` and
-    /// [`fake_seed_model`](crate::seed::fake_seed_model).
+    /// [`fake_seed_model`].
     #[must_use]
     pub const fn pool(&self) -> &Pool<AsyncPgConnection> {
         &self.pool

@@ -92,10 +92,15 @@ jobs:
           # guarantee these on PATH, so install the client package explicitly.
           # (postgresql-client installs pg_dump/pg_restore into /usr/bin via the
           # pg_wrapper symlinks, so no extra PATH tweak is needed.)
+          # openssh-client (ssh/scp) is also installed here: the AC-7 deploy
+          # end-to-end test (#1607) drives the real `autumn deploy` over ssh/scp
+          # against a privileged systemd container, and ubuntu-latest does not
+          # guarantee the ssh *client* on PATH.
           sudo apt-get update
-          sudo apt-get install -y postgresql-client
+          sudo apt-get install -y postgresql-client openssh-client
           pg_dump --version
           pg_restore --version
+          ssh -V
       - name: Run Docker-dependent tests
         if: runner.os == 'Linux'
         timeout-minutes: 30
@@ -142,6 +147,14 @@ jobs:
           cargo test -p autumn-web --features "test-support,offline-sync" --test integration_tests -- \
             --ignored \
             --skip per_request_overhead_is_under_50_microseconds_p99
+          # AC-7 deploy end-to-end (#1607, Slice 4): drives the real `autumn
+          # deploy up`/`rollback` over ssh/scp against a privileged systemd
+          # container (first deploy, zero-downtime redeploy, on-demand rollback,
+          # forced-failure auto-rollback). Isolated `--test deploy_e2e` binary; it
+          # builds its own fixture image (extracting kamal-proxy from the
+          # basecamp/kamal-proxy Docker Hub image) and needs the ssh client
+          # installed above.
+          cargo test -p autumn-cli --test deploy_e2e -- --ignored
 
   coverage:
     name: Coverage

@@ -724,6 +724,7 @@ pub(super) fn augment_fields_for_soft_delete(
         variants: Vec::new(),
         unique: false,
         constraints: FieldConstraints::default(),
+        state_machine: None,
     });
     Ok(std::borrow::Cow::Owned(augmented))
 }
@@ -2104,6 +2105,25 @@ fn render_model_file(
         if metadata.defaults.contains_key(&f.name) {
             out.push_str("    #[default]\n");
         }
+        // A `:states(…)` DSL modifier (issue #1326) re-emits as a
+        // `#[state_machine(transitions(…))]` attribute, in the exact grammar the
+        // `autumn_web::model` macro accepts: bare-ident states, an optional
+        // `: "guard"` string. Absent when the field declared no state machine —
+        // that no-op path is what keeps the non-state-machine output
+        // byte-identical to before this feature.
+        if let Some(sm) = &f.state_machine {
+            let mut inner = String::new();
+            for (i, t) in sm.transitions.iter().enumerate() {
+                if i > 0 {
+                    inner.push_str(", ");
+                }
+                let _ = write!(inner, "{} -> {}", t.from, t.to);
+                if let Some(guard) = &t.guard {
+                    let _ = write!(inner, ": \"{guard}\"");
+                }
+            }
+            let _ = writeln!(out, "    #[state_machine(transitions({inner}))]");
+        }
         let _ = writeln!(out, "    pub {}: {},", f.name, f.rust_type());
     }
     if soft_delete {
@@ -2474,6 +2494,47 @@ mod tests {
         assert!(model.contains("Published,"), "got:\n{model}");
         assert!(model.contains("Archived,"), "got:\n{model}");
         assert!(model.contains("pub status: Status,"), "got:\n{model}");
+    }
+
+    // ── state machine field emission (issue #1326) ──────────────────────────
+
+    /// AC5: a model with no state-machine field must render exactly as before
+    /// this feature — no `#[state_machine]` attribute leaks into the no-SM path.
+    /// (The unchanged pre-existing golden/model tests are the primary
+    /// byte-identical proof; this is the explicit no-leak assertion.)
+    #[test]
+    fn model_file_without_state_machine_emits_no_attribute() {
+        let fields = crate::generate::dsl::parse_fields(&[
+            "title:String".into(),
+            "body:Text".into(),
+            "published:bool".into(),
+        ])
+        .unwrap();
+        let model = render_model_file_for_test("Post", "posts", &fields);
+        assert!(
+            !model.contains("#[state_machine"),
+            "no state machine declared, so no attribute should render; got:\n{model}"
+        );
+    }
+
+    /// A `:states(…)` field renders a `#[state_machine(transitions(…))]`
+    /// attribute in the exact grammar the `autumn_web::model` macro accepts
+    /// (bare-ident states, an optional `: \"guard\"` string), on a `String` field.
+    #[test]
+    fn model_file_emits_state_machine_attribute() {
+        let fields = crate::generate::dsl::parse_fields(&[
+            "status:String:states(draft -> published: can_publish, published -> archived)".into(),
+        ])
+        .unwrap();
+        let model = render_model_file_for_test("Page", "pages", &fields);
+        assert!(
+            model.contains(
+                "#[state_machine(transitions(draft -> published: \"can_publish\", \
+                 published -> archived))]"
+            ),
+            "got:\n{model}"
+        );
+        assert!(model.contains("pub status: String,"), "got:\n{model}");
     }
 
     #[test]
