@@ -3227,11 +3227,10 @@ pub async fn index(
             // shed those client-side guards. The swapped-in field re-wires its
             // own htmx trigger from the identical `validate_url`.
             let constrained = field.and_then(|f| {
-                html5_constraint_spec(f).and_then(|(input_type, attrs)| {
+                html5_constraint_spec(f).and_then(|(input_type, _attrs)| {
                     // Numerics don't take the htmx path (no wrapper to swap), so
                     // only the text-family constrained controls need a fragment.
-                    matches!(f.kind, FieldKind::String | FieldKind::Text)
-                        .then_some((f, input_type, attrs))
+                    matches!(f.kind, FieldKind::String | FieldKind::Text).then_some((f, input_type))
                 })
             });
             let _ = write!(
@@ -3254,12 +3253,11 @@ pub async fn index(
             vh.push_str("        return autumn_web::html! {};\n");
             vh.push_str("    };\n");
             vh.push_str("    let changeset = form.into_changeset();\n");
-            if let Some((f, input_type, attrs)) = constrained {
+            if let Some((f, input_type)) = constrained {
                 // The validate endpoint URL is emitted as a typed path-helper
-                // call expression (issue #1133), spliced into `hx-post=(…)`.
+                // call expression (issue #1133), spliced into `.hx("post", …)`.
                 let url = format!("paths::validate_{field_name}()");
-                let markup =
-                    render_live_constrained_field(f, "changeset", input_type, &attrs, Some(&url));
+                let markup = render_live_constrained_field(f, "changeset", input_type, Some(&url));
                 let _ = writeln!(vh, "    autumn_web::html! {{\n        {markup}\n    }}");
             } else {
                 // Match `render_changeset_form_inputs`'s helper choice: a
@@ -3305,7 +3303,7 @@ pub async fn index(
             names.push("events".to_owned());
         }
         // One inline-validation endpoint per validated field (live-validation
-        // only), each linked from the form's `hx-post=(paths::validate_{f}())`.
+        // only), each linked from the form's `.hx("post", paths::validate_{f}())`.
         if live_validation {
             for field_name in validations.keys() {
                 names.push(format!("validate_{field_name}"));
@@ -4424,8 +4422,12 @@ fn resolve_reference_display(
 /// `role="alert"`) come for free — and the identical markup is emitted by
 /// `new_form`, `edit_form`, and both 422 re-render branches. `FieldKind` maps to
 /// the matching helper (`text_input`, `number_input`, `datetime_input`,
-/// `checkbox_input`, `select_input`); attachments stay a plain `<input
-/// type="file">` (a file input can't be repopulated).
+/// `checkbox_input`, `select_input`). DSL-constrained text/textarea fields, the
+/// `belongs_to` parent `<select>`, and attachments route through the typed
+/// accessible `a11y::TextField`/`TextArea`/`Select`/`FileField` primitives
+/// (issues #1750/#1951), so the inline-validation controls keep the
+/// compile-time label obligation; a file input still can't be repopulated
+/// (browser security).
 #[allow(clippy::too_many_lines)]
 fn render_changeset_form_inputs(
     fields: &[Field],
@@ -4454,17 +4456,17 @@ fn render_changeset_form_inputs(
             // belongs_to parent dropdown (issue #1146), restored in the
             // `--live-validation` per-field path (issue #1750).
             render_live_reference_select(f, cv)
-        } else if let (true, Some((input_type, attrs))) = (
+        } else if let (true, Some((input_type, _attrs))) = (
             matches!(
                 f.kind,
                 FieldKind::I32 | FieldKind::I64 | FieldKind::F32 | FieldKind::F64
             ),
             &constraint,
         ) {
-            // A constrained numeric renders a raw number input carrying its
+            // A constrained numeric renders a number input carrying its
             // `min`/`max` (and `step="any"` for floats). Numerics don't take the
             // htmx inline-validation path, so no `validate_url`.
-            render_live_constrained_field(f, cv, input_type, attrs, None)
+            render_live_constrained_field(f, cv, input_type, None)
         } else if f.kind.is_attachment() {
             // Issue #1236: a plain file input, no hidden key. The enclosing
             // `<form>` carries `enctype="multipart/form-data"` so the browser
@@ -4472,7 +4474,13 @@ fn render_changeset_form_inputs(
             // re-upload preserves the current attachment server-side (the
             // handler binds `streamed.or(current)`). A file input itself can't be
             // repopulated — browser security.
-            format!("label {{ \"{label}\" }} input type=\"file\" name=\"{name}\";")
+            //
+            // Issue #1951: route it through the typed accessible `a11y::FileField`
+            // primitive so the file input carries a programmatically-associated
+            // `<label for>` (the previous raw `label { … } input;` had an
+            // unassociated label). No htmx wiring — attachments never take the
+            // inline-validation path.
+            format!("(autumn_web::a11y::FileField::new(\"{name}\").label(\"{label}\"))")
         } else {
             // A required (non-nullable) field uses the framework's
             // `required_*` sibling helper — `required` + `aria-required="true"`
@@ -4550,27 +4558,22 @@ fn render_changeset_form_inputs(
                     // `length` rule) doesn't leave a blank required field with
                     // no client-side guard at all.
                     let validated_htmx = live_validation && validated.contains(&name.as_str());
-                    if let Some((input_type, attrs)) = &constraint {
+                    if let Some((input_type, _attrs)) = &constraint {
                         // Issue #1750: a DSL-constrained `String`/`Text` field
                         // carries the #1388 client-side HTML5 attributes
                         // (`minlength`/`maxlength`, `type="email"`/`url`, and a
                         // `<textarea>` for long-form `Text`) the shipped helpers
-                        // can't express. Render it as raw markup mirroring the
-                        // standard `form_for` path, threading the htmx
-                        // inline-validation wiring on when the field is validated
-                        // so real-time validation keeps working alongside the
-                        // static constraints. (A constrained field always has a
-                        // validator rule, so this is the validated path; the
-                        // `validate_url` is threaded only when `live_validation`.)
+                        // can't express. Route it through the typed a11y
+                        // primitives mirroring the standard `form_for` path
+                        // (issue #1951), threading the htmx inline-validation
+                        // wiring on via `.hx()` when the field is validated so
+                        // real-time validation keeps working alongside the static
+                        // constraints. (A constrained field always has a validator
+                        // rule, so this is the validated path; the `validate_url`
+                        // is threaded only when `live_validation`.)
                         let validate_url =
                             validated_htmx.then(|| format!("paths::validate_{name}()"));
-                        render_live_constrained_field(
-                            f,
-                            cv,
-                            input_type,
-                            attrs,
-                            validate_url.as_deref(),
-                        )
+                        render_live_constrained_field(f, cv, input_type, validate_url.as_deref())
                     } else if validated_htmx {
                         let helper = if f.nullable {
                             "text_input_htmx"
@@ -4759,43 +4762,54 @@ fn html5_constraint_builder_calls(field: &Field) -> Option<(&'static str, String
     Some((input_type, calls))
 }
 
-/// Render the raw maud markup for a DSL-constrained (issue #1388)
+/// Render the maud markup for a DSL-constrained (issue #1388)
 /// `String`/`Text`/numeric field in the `--live-validation` per-field path
 /// (issue #1750).
 ///
-/// The shipped `autumn_web::form::*` helpers take no HTML5-constraint params,
-/// so the live path renders the constrained control as raw markup instead —
-/// the same inline-error/ARIA skeleton those helpers emit, plus the
-/// `input_type` override and `constraint_attrs`
-/// (`minlength`/`maxlength`/`min`/`max`/`step`) from [`html5_constraint_spec`],
-/// exactly mirroring the standard `form_for` path's `.exclude()` + `.append()`
-/// output. When `validate_url` is `Some`, the htmx inline-validation wiring
-/// (`hx-post`/`hx-trigger`/`hx-target`/`hx-swap`/`hx-include` +
-/// `hx-params="not _submit_token"` + the `data-autumn-field-wrapper` swap
-/// marker) is threaded on too, matching `required_text_input_htmx`. The
-/// `hx-params` filter keeps the inline-validation POST (which `hx-include`s the
-/// whole form) from carrying the one-time `_submit_token`, so validation never
-/// consumes the token the real create/update submit needs (issue #1360). Shared
-/// by [`render_changeset_form_inputs`] and
-/// the inline-validate handlers so the initially-rendered field and the
+/// The control is routed through the typed accessible `a11y::TextField` /
+/// `a11y::TextArea` primitives (issue #1951): the raw wrapper `<div>` and the
+/// inline-error `<div>` skeleton stay as maud lines (mirroring the shipped
+/// `autumn_web::form::*` helpers and the standard `form_for` path's
+/// `.exclude()` + `.append()` output), but the labelled control itself is a
+/// primitive builder chain, so the inline-validation field keeps the
+/// compile-time label obligation instead of dropping to raw markup. The
+/// `input_type` override and the HTML5 constraints
+/// (`minlength`/`maxlength`/`min`/`max`/`step`) become typed builder calls from
+/// the same [`html5_constraint_builder_calls`] source the standard path uses.
+///
+/// When `validate_url` is `Some`, the htmx inline-validation wiring is threaded
+/// on too — the `data-autumn-field-wrapper` swap marker stays a raw attribute
+/// on the wrapper `<div>`, and the control carries the
+/// `hx-post`/`hx-trigger`/`hx-target`/`hx-swap`/`hx-include` +
+/// `hx-params="not _submit_token"` attributes via the primitive's `.hx()`
+/// escape hatch. The `hx-params` filter keeps the inline-validation POST (which
+/// `hx-include`s the whole form) from carrying the one-time `_submit_token`, so
+/// validation never consumes the token the real create/update submit needs
+/// (issue #1360). Shared by [`render_changeset_form_inputs`] and the
+/// inline-validate handlers so the initially-rendered field and the
 /// htmx-swapped fragment are byte-identical.
 fn render_live_constrained_field(
     field: &Field,
     changeset_var: &str,
     input_type: &str,
-    constraint_attrs: &str,
     // A Rust expression (as source text) producing the inline-validation URL —
     // the typed path helper `paths::validate_{field}()` (issue #1133). Spliced
-    // into `hx-post=(…)` so the URL has a single source of truth.
+    // into `.hx("post", …)` so the URL has a single source of truth.
     validate_url: Option<&str>,
 ) -> String {
     let name = &field.name;
     let label = humanize_label(name);
     let cv = changeset_var;
-    let required_attr = if field.nullable {
+    // Typed HTML5-constraint builder calls (`.minlength(3u32)`, `.min("0")`,
+    // `.step("any")`, …) from the same `html5_constraint_parts` source the
+    // standard `form_for` input path uses, so the two paths can't drift.
+    let constraint_builders = html5_constraint_builder_calls(field)
+        .map(|(_, calls)| calls)
+        .unwrap_or_default();
+    let required_builders = if field.nullable {
         ""
     } else {
-        " required aria-required=\"true\""
+        ".required().aria_required()"
     };
     // A constrained `Text` column is long-form (Postgres `TEXT`), so it renders
     // a `<textarea>` (matching the derived `FieldControl::Textarea` and the
@@ -4803,18 +4817,21 @@ fn render_live_constrained_field(
     // single-line (its `input_type` is `email`/`url`), so it takes the `<input>`
     // branch — a textarea can't carry those types.
     let is_textarea = matches!(field.kind, FieldKind::Text) && input_type == "text";
-    // htmx inline-validation wiring + the swap-target marker on the wrapper.
-    let (wrapper_marker, htmx_attrs) = validate_url.map_or_else(
+    // htmx inline-validation wiring: the swap-target marker stays a raw
+    // attribute on the wrapper `<div>`, while the control carries the htmx
+    // attributes through the primitive's `.hx()` escape hatch (issue #1951).
+    let (wrapper_marker, hx_builders) = validate_url.map_or_else(
         || (String::new(), String::new()),
         |url| {
             (
                 format!(" data-autumn-field-wrapper=\"{name}\""),
                 format!(
-                    "\n                    hx-post=({url})\n                    \
-                     hx-trigger=\"change\"\n                    \
-                     hx-target=\"closest [data-autumn-field-wrapper]\"\n                    \
-                     hx-swap=\"outerHTML\"\n                    hx-include=\"closest form\"\n                    \
-                     hx-params=\"not _submit_token\""
+                    "\n                    .hx(\"post\", {url})\n                    \
+                     .hx(\"trigger\", \"change\")\n                    \
+                     .hx(\"target\", \"closest [data-autumn-field-wrapper]\")\n                    \
+                     .hx(\"swap\", \"outerHTML\")\n                    \
+                     .hx(\"include\", \"closest form\")\n                    \
+                     .hx(\"params\", \"not _submit_token\")"
                 ),
             )
         },
@@ -4831,36 +4848,44 @@ fn render_live_constrained_field(
         format!(
             "div id=\"{name}-field\" class=\"autumn-field\"{wrapper_marker} {{\n                \
              @let errors = {cv}.errors_for(\"{name}\");\n                \
-             label for=\"{name}\" class=\"autumn-field__label\" {{ \"{label}\" }}\n                \
-             textarea id=\"{name}\" name=\"{name}\"{constraint_attrs}{required_attr}\n                    \
-             class=(if errors.is_empty() {{ \"autumn-field__input\" }} else {{ \"autumn-field__input autumn-field__input--invalid\" }})\n                    \
-             aria-invalid=(if errors.is_empty() {{ \"false\" }} else {{ \"true\" }})\n                    \
-             aria-describedby=(if errors.is_empty() {{ \"\" }} else {{ \"{name}-error\" }}){htmx_attrs} {{\n                        \
-             ({cv}.field_value(\"{name}\").unwrap_or_default())\n                    \
-             }}{errors_tail}"
+             (autumn_web::a11y::TextArea::new(\"{name}\")\n                    \
+             .label(\"{label}\")\n                    \
+             .label_class(\"autumn-field__label\")\n                    \
+             .value({cv}.field_value(\"{name}\").unwrap_or_default())\n                    \
+             {constraint_builders}{required_builders}\n                    \
+             .class(if errors.is_empty() {{ \"autumn-field__input\" }} else {{ \"autumn-field__input autumn-field__input--invalid\" }})\n                    \
+             .aria_invalid(!errors.is_empty())\n                    \
+             .described_by(if errors.is_empty() {{ \"\" }} else {{ \"{name}-error\" }}){hx_builders}){errors_tail}"
         )
     } else {
         format!(
             "div id=\"{name}-field\" class=\"autumn-field\"{wrapper_marker} {{\n                \
              @let errors = {cv}.errors_for(\"{name}\");\n                \
-             label for=\"{name}\" class=\"autumn-field__label\" {{ \"{label}\" }}\n                \
-             input type=\"{input_type}\" id=\"{name}\" name=\"{name}\"\n                    \
-             value=({cv}.field_value(\"{name}\").unwrap_or_default()){constraint_attrs}{required_attr}\n                    \
-             class=(if errors.is_empty() {{ \"autumn-field__input\" }} else {{ \"autumn-field__input autumn-field__input--invalid\" }})\n                    \
-             aria-invalid=(if errors.is_empty() {{ \"false\" }} else {{ \"true\" }})\n                    \
-             aria-describedby=(if errors.is_empty() {{ \"\" }} else {{ \"{name}-error\" }}){htmx_attrs};{errors_tail}"
+             (autumn_web::a11y::TextField::new(\"{name}\")\n                    \
+             .label(\"{label}\")\n                    \
+             .label_class(\"autumn-field__label\")\n                    \
+             .input_type(\"{input_type}\")\n                    \
+             .value({cv}.field_value(\"{name}\").unwrap_or_default())\n                    \
+             {constraint_builders}{required_builders}\n                    \
+             .class(if errors.is_empty() {{ \"autumn-field__input\" }} else {{ \"autumn-field__input autumn-field__input--invalid\" }})\n                    \
+             .aria_invalid(!errors.is_empty())\n                    \
+             .described_by(if errors.is_empty() {{ \"\" }} else {{ \"{name}-error\" }}){hx_builders}){errors_tail}"
         )
     }
 }
 
-/// Render the raw maud markup for a `belongs_to` parent `<select>` in the
+/// Render the maud markup for a `belongs_to` parent `<select>` in the
 /// `--live-validation` per-field path (issue #1750). The standard path renders
 /// this through a `form_for` `FieldControl::Select` override, but the per-field
-/// path has no `form_for`, so it emits a raw `<select>` populated at request
-/// time from the `{name}_options` loader (a `Vec<(String, String)>` of
-/// id/display pairs) — a blank placeholder plus `selected` driven by the
-/// changeset value so a 422 re-render keeps the chosen parent. The
-/// `{name}_options` binding is loaded into scope by the calling handler.
+/// path has no `form_for`, so it routes the control through the typed
+/// accessible `a11y::Select` primitive (issue #1951) — the raw wrapper `<div>`
+/// and inline-error `<div>` skeleton stay as maud lines, while the labelled
+/// `<select>` is a primitive builder chain populated at request time from the
+/// `{name}_options` loader (a `Vec<(String, String)>` of id/display pairs). A
+/// blank placeholder plus `selected_value` driven by the changeset value keeps
+/// the chosen parent through a 422 re-render. The `{name}_options` binding is
+/// loaded into scope by the calling handler. (There is no htmx wiring here — the
+/// `belongs_to` select carries no inline-validation attributes.)
 fn render_live_reference_select(field: &Field, changeset_var: &str) -> String {
     let name = &field.name;
     let label = humanize_label(name);
@@ -4870,24 +4895,24 @@ fn render_live_reference_select(field: &Field, changeset_var: &str) -> String {
     } else {
         "— Select —"
     };
-    let required_attr = if field.nullable {
+    let required_builders = if field.nullable {
         ""
     } else {
-        " required aria-required=\"true\""
+        ".required().aria_required()"
     };
     format!(
         "div id=\"{name}-field\" class=\"autumn-field\" {{\n                \
          @let errors = {cv}.errors_for(\"{name}\");\n                \
-         label for=\"{name}\" class=\"autumn-field__label\" {{ \"{label}\" }}\n                \
-         select id=\"{name}\" name=\"{name}\"{required_attr}\n                    \
-         class=(if errors.is_empty() {{ \"autumn-field__input\" }} else {{ \"autumn-field__input autumn-field__input--invalid\" }})\n                    \
-         aria-invalid=(if errors.is_empty() {{ \"false\" }} else {{ \"true\" }})\n                    \
-         aria-describedby=(if errors.is_empty() {{ \"\" }} else {{ \"{name}-error\" }}) {{\n                        \
-         option value=\"\" {{ \"{placeholder}\" }}\n                        \
-         @for (opt_value, opt_label) in {name}_options.iter() {{\n                            \
-         option value=(opt_value) selected[{cv}.field_value(\"{name}\").as_deref() == Some(opt_value.as_str())] {{ (opt_label) }}\n                        \
-         }}\n                    \
-         }}\n                \
+         (autumn_web::a11y::Select::new(\"{name}\")\n                    \
+         .label(\"{label}\")\n                    \
+         .label_class(\"autumn-field__label\")\n                    \
+         {required_builders}\n                    \
+         .class(if errors.is_empty() {{ \"autumn-field__input\" }} else {{ \"autumn-field__input autumn-field__input--invalid\" }})\n                    \
+         .aria_invalid(!errors.is_empty())\n                    \
+         .described_by(if errors.is_empty() {{ \"\" }} else {{ \"{name}-error\" }})\n                    \
+         .option(\"\", \"{placeholder}\")\n                    \
+         .options({name}_options.iter().map(|(opt_value, opt_label)| autumn_web::a11y::SelectOption::new(opt_value.as_str(), opt_label.as_str())))\n                    \
+         .selected_value({cv}.field_value(\"{name}\").unwrap_or_default()))\n                \
          @if !errors.is_empty() {{\n                    \
          div id=\"{name}-error\" role=\"alert\" class=\"autumn-field__errors\" {{\n                        \
          @for error in errors {{ p class=\"autumn-field__error\" {{ (error) }} }}\n                    \
@@ -8170,7 +8195,8 @@ async fn main() {
         // while the real create/update form still embeds it.
         let tmp = project_with_main(default_main());
         // A DSL-constrained `String` auto-derives a `length` rule, so `title` is
-        // validated and renders through the raw-markup htmx constrained control.
+        // validated and renders through the typed `a11y::TextField` primitive
+        // carrying the htmx wiring via `.hx()` (issue #1951).
         let plan = plan_scaffold_with_options(
             tmp.path(),
             "Post",
@@ -8187,16 +8213,16 @@ async fn main() {
         let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
 
         // The constrained validated input keeps its inline-validation wiring,
-        // now routed through the typed path helper (#1823) rather than a
-        // hardcoded URL.
+        // now threaded through the primitive's `.hx()` escape hatch and the
+        // typed path helper (#1823/#1951) rather than a raw `hx-post` attribute.
         assert!(
-            routes.contains("hx-post=(paths::validate_title())"),
-            "title must keep its htmx inline-validation wiring:\n{routes}"
+            routes.contains(".hx(\"post\", paths::validate_title())"),
+            "title must keep its htmx inline-validation wiring via `.hx()`:\n{routes}"
         );
         // ...but filters the one-time submit token out of that POST so the
         // inline validation never consumes it.
         assert!(
-            routes.contains("hx-params=\"not _submit_token\""),
+            routes.contains(".hx(\"params\", \"not _submit_token\")"),
             "live-validation inputs must drop _submit_token from the inline POST:\n{routes}"
         );
         // The inline-validate handler returns the SAME fragment (byte-identical
@@ -8208,7 +8234,7 @@ async fn main() {
             validate_title[..validate_title[1..]
                 .find("#[post(")
                 .map_or(validate_title.len(), |rel| rel + 1)]
-                .contains("hx-params=\"not _submit_token\""),
+                .contains(".hx(\"params\", \"not _submit_token\")"),
             "the validate_title fragment must also drop the submit token:\n{validate_title}"
         );
         // The real create/update form still embeds the submit token so the
@@ -8216,6 +8242,53 @@ async fn main() {
         assert!(
             routes.contains("submit_token_input(submit_token.as_ref(), submit_field.as_ref())"),
             "the create/update form must still carry the submit token:\n{routes}"
+        );
+
+        // Issue #1951 byte-identity guarantee: htmx swaps `outerHTML` on the
+        // whole `[data-autumn-field-wrapper]`, so the field the form first
+        // renders and the fragment the `validate_title` handler returns must be
+        // byte-identical. Both are emitted by the shared
+        // `render_live_constrained_field`, so extract the `title-field` wrapper
+        // block from the first (form) occurrence and from the validate handler
+        // and assert they match after normalizing insignificant leading
+        // whitespace (which maud does not render).
+        let extract_block = |src: &str, start: usize| -> String {
+            let open = src[start..].find('{').expect("wrapper `{`") + start;
+            let mut depth = 0usize;
+            for (i, ch) in src[open..].char_indices() {
+                match ch {
+                    '{' => depth += 1,
+                    '}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return src[start..=open + i].to_owned();
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            panic!("unbalanced wrapper block");
+        };
+        let normalize =
+            |block: &str| -> String { block.lines().map(str::trim).collect::<Vec<_>>().join("\n") };
+        let form_start = routes
+            .find("div id=\"title-field\"")
+            .expect("form title-field");
+        let form_block = extract_block(&routes, form_start);
+        let frag_offset = routes
+            .find("pub async fn validate_title(")
+            .expect("validate_title handler");
+        let frag_start = frag_offset
+            + routes[frag_offset..]
+                .find("div id=\"title-field\"")
+                .expect("fragment title-field");
+        let frag_block = extract_block(&routes, frag_start);
+        assert_eq!(
+            normalize(&form_block),
+            normalize(&frag_block),
+            "the initial-rendered field and the validate_title fragment must be \
+             byte-identical (modulo insignificant whitespace) for the htmx \
+             outerHTML swap"
         );
     }
 

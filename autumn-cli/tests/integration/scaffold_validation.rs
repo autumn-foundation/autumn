@@ -565,44 +565,58 @@ fn live_validation_forms_carry_html5_constraints() {
     );
     let routes = fs::read_to_string(project.join("src/routes/posts.rs")).unwrap();
 
-    // The string length constraint on the htmx-validated `title` input.
+    // Issue #1951: the constrained fields now route through the typed
+    // `a11y::TextField`/`TextArea` primitives, so the HTML5 constraints are
+    // typed builder calls (`.minlength(3u32)`), not raw attributes. The title
+    // input carries its length rule via the `TextField` primitive.
     assert!(
-        routes.contains("minlength=\"3\" maxlength=\"120\""),
-        "title must render minlength/maxlength in live-validation mode:\n{routes}"
+        routes.contains("autumn_web::a11y::TextField::new(\"title\")")
+            && routes.contains(".minlength(3u32).maxlength(120u32)"),
+        "title must render minlength/maxlength via the TextField primitive in live-validation mode:\n{routes}"
     );
-    // Typed inputs (email/url) instead of a bare text input.
+    // Typed inputs (email/url) instead of a bare text input — now via
+    // `.input_type(..)` on the primitive.
     assert!(
-        routes.contains("type=\"email\" id=\"contact\""),
-        "contact must render type=email in live-validation mode:\n{routes}"
+        routes.contains("autumn_web::a11y::TextField::new(\"contact\")")
+            && routes.contains(".input_type(\"email\")"),
+        "contact must render type=email via the TextField primitive in live-validation mode:\n{routes}"
     );
     assert!(
-        routes.contains("type=\"url\" id=\"homepage\""),
-        "homepage must render type=url in live-validation mode:\n{routes}"
+        routes.contains("autumn_web::a11y::TextField::new(\"homepage\")")
+            && routes.contains(".input_type(\"url\")"),
+        "homepage must render type=url via the TextField primitive in live-validation mode:\n{routes}"
     );
-    // Numeric min/max on the number input.
+    // Numeric min/max on the number input (numerics take no htmx path, so no
+    // `.hx(..)` — but they still route through `TextField`).
     assert!(
-        routes.contains("type=\"number\"") && routes.contains("min=\"0\" max=\"130\""),
-        "age must render type=number with min/max in live-validation mode:\n{routes}"
+        routes.contains("autumn_web::a11y::TextField::new(\"age\")")
+            && routes.contains(".input_type(\"number\")")
+            && routes.contains(".min(\"0\").max(\"130\")"),
+        "age must render type=number with min/max via the TextField primitive in live-validation mode:\n{routes}"
     );
-    // A constrained `Text` column becomes a <textarea> carrying its length rule.
+    // A constrained `Text` column becomes a `TextArea` primitive carrying its
+    // length rule.
     assert!(
-        routes.contains("textarea id=\"notes\" name=\"notes\"")
-            && routes.contains("maxlength=\"500\""),
-        "constrained Text `notes` must render a <textarea> with maxlength:\n{routes}"
+        routes.contains("autumn_web::a11y::TextArea::new(\"notes\")")
+            && routes.contains(".maxlength(500u32)"),
+        "constrained Text `notes` must render an a11y::TextArea with maxlength:\n{routes}"
     );
-    // The nullable `bio` keeps its maxlength.
+    // The nullable `bio` keeps its maxlength via the primitive.
     assert!(
-        routes.contains("maxlength=\"200\""),
-        "bio must render maxlength in live-validation mode:\n{routes}"
+        routes.contains("autumn_web::a11y::TextField::new(\"bio\")")
+            && routes.contains(".maxlength(200u32)"),
+        "bio must render maxlength via the TextField primitive in live-validation mode:\n{routes}"
     );
 
-    // The htmx inline-validation wiring survives on a constrained validated
-    // input (real-time validation still works alongside the static constraints),
-    // and its swap wrapper marker is present.
+    // Issue #1951: the htmx inline-validation wiring survives on a constrained
+    // validated input, now threaded through the primitive's `.hx()` escape
+    // hatch (real-time validation still works alongside the static
+    // constraints), and its swap wrapper marker stays a raw attribute on the
+    // wrapper `<div>`.
     assert!(
-        routes.contains("hx-post=(paths::validate_title())")
+        routes.contains(".hx(\"post\", paths::validate_title())")
             && routes.contains("data-autumn-field-wrapper=\"title\""),
-        "the constrained title input must keep its htmx inline-validation wiring (via typed path helper):\n{routes}"
+        "the constrained title input must keep its htmx inline-validation wiring (via `.hx()` + typed path helper):\n{routes}"
     );
 
     // Issue #1360 (finding F): the inline-validation POST `hx-include`s the whole
@@ -610,10 +624,11 @@ fn live_validation_forms_carry_html5_constraints() {
     // the first field validation would consume the token on the guarded
     // `/validate/...` route, and the real create submit would replay the
     // validation fragment instead of running the mutation. The htmx input must
-    // drop the token via `hx-params`, while the real create form keeps it.
+    // drop the token via `hx-params` (now `.hx("params", ..)`), while the real
+    // create form keeps it.
     assert!(
-        routes.contains("hx-params=\"not _submit_token\""),
-        "live-validation inputs must drop _submit_token from the inline POST:\n{routes}"
+        routes.contains(".hx(\"params\", \"not _submit_token\")"),
+        "live-validation inputs must drop _submit_token from the inline POST via `.hx()`:\n{routes}"
     );
     assert!(
         routes.contains("submit_token_input(submit_token.as_ref(), submit_field.as_ref())"),
@@ -624,11 +639,11 @@ fn live_validation_forms_carry_html5_constraints() {
     // swapped-in field doesn't drop the client-side attributes on first change.
     let validate_title = slice_fn(&routes, "pub async fn validate_title(");
     assert!(
-        validate_title.contains("minlength=\"3\" maxlength=\"120\""),
+        validate_title.contains(".minlength(3u32).maxlength(120u32)"),
         "the validate_title fragment must also carry the HTML5 constraints:\n{validate_title}"
     );
     assert!(
-        !validate_title.contains("type=\"email\""),
+        !validate_title.contains(".input_type(\"email\")"),
         "sanity: the validate_title slice must be bounded to its own handler:\n{validate_title}"
     );
 }
