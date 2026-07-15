@@ -43,6 +43,28 @@ use tracing::Instrument as _;
 use crate::config::DatabaseConfig;
 use crate::error::AutumnError;
 
+/// The database connection type the runtime is built against.
+///
+/// Defaults to Postgres (`AsyncPgConnection`). Enabling the crate's `sqlite`
+/// feature flips it to a SQLite connection. Threading this alias (instead of a
+/// hard-coded `AsyncPgConnection`) through the connection-typed surface — the
+/// pool, the pooled connection, the transaction/query helpers, and the
+/// `#[repository]`/`#[model]` generated code — is what lets the same codebase
+/// target either backend.
+///
+/// FEATURE-UNIFICATION HAZARD: the `sqlite` feature must ONLY be enabled by an
+/// end application (or an explicit `--features sqlite` build). If any workspace
+/// crate or dev-dependency enables it, cargo feature unification flips this
+/// alias for every consumer in the graph and breaks the Postgres default. See
+/// the doc comment above `sqlite = []` in `autumn/Cargo.toml`.
+#[cfg(not(feature = "sqlite"))]
+pub type RuntimeConnection = diesel_async::AsyncPgConnection;
+/// See [`RuntimeConnection`] (Postgres variant) for the full contract. Under
+/// the `sqlite` feature the runtime is built against a SQLite connection.
+#[cfg(feature = "sqlite")]
+pub type RuntimeConnection =
+    diesel_async::sync_connection_wrapper::SyncConnectionWrapper<diesel::SqliteConnection>;
+
 // ── After-commit callback infrastructure ─────────────────────────────────────
 
 /// A boxed async callback registered for post-transaction execution.
@@ -558,7 +580,7 @@ where
 /// and the central `AppState`.
 pub trait DbState {
     /// Returns the database connection pool, if configured.
-    fn pool(&self) -> Option<&Pool<AsyncPgConnection>>;
+    fn pool(&self) -> Option<&Pool<RuntimeConnection>>;
 
     /// Returns the metrics collector, if configured.
     fn metrics(&self) -> Option<&crate::middleware::MetricsCollector> {
@@ -566,14 +588,14 @@ pub trait DbState {
     }
 
     /// Returns the read/replica connection pool, if configured.
-    fn replica_pool(&self) -> Option<&Pool<AsyncPgConnection>> {
+    fn replica_pool(&self) -> Option<&Pool<RuntimeConnection>> {
         None
     }
 
     /// Returns the pool used for read-only work.
     ///
     /// Defaults to the replica role when present, otherwise the primary role.
-    fn read_pool(&self) -> Option<&Pool<AsyncPgConnection>> {
+    fn read_pool(&self) -> Option<&Pool<RuntimeConnection>> {
         self.replica_pool().or_else(|| self.pool())
     }
 
@@ -973,8 +995,8 @@ pub enum PoolError {
 /// Primary plus optional read-replica database pools.
 #[derive(Clone)]
 pub struct DatabaseTopology {
-    primary: Pool<AsyncPgConnection>,
-    replica: Option<Pool<AsyncPgConnection>>,
+    primary: Pool<RuntimeConnection>,
+    replica: Option<Pool<RuntimeConnection>>,
     /// Connection URL to target with startup migrations, when the provider
     /// resolved one at runtime that the static config doesn't carry (e.g. the
     /// managed-Postgres provider whose socket URL is only known after boot).
@@ -989,8 +1011,8 @@ impl DatabaseTopology {
     /// need to create or decorate both roles themselves.
     #[must_use]
     pub const fn from_pools(
-        primary: Pool<AsyncPgConnection>,
-        replica: Option<Pool<AsyncPgConnection>>,
+        primary: Pool<RuntimeConnection>,
+        replica: Option<Pool<RuntimeConnection>>,
     ) -> Self {
         Self {
             primary,
@@ -1001,7 +1023,7 @@ impl DatabaseTopology {
 
     /// Build a topology from a primary pool only.
     #[must_use]
-    pub const fn primary_only(primary: Pool<AsyncPgConnection>) -> Self {
+    pub const fn primary_only(primary: Pool<RuntimeConnection>) -> Self {
         Self {
             primary,
             replica: None,
@@ -1029,19 +1051,19 @@ impl DatabaseTopology {
 
     /// Primary/write role pool.
     #[must_use]
-    pub const fn primary(&self) -> &Pool<AsyncPgConnection> {
+    pub const fn primary(&self) -> &Pool<RuntimeConnection> {
         &self.primary
     }
 
     /// Optional read/replica role pool.
     #[must_use]
-    pub const fn replica(&self) -> Option<&Pool<AsyncPgConnection>> {
+    pub const fn replica(&self) -> Option<&Pool<RuntimeConnection>> {
         self.replica.as_ref()
     }
 
     /// Pool used for read-only work.
     #[must_use]
-    pub fn read(&self) -> &Pool<AsyncPgConnection> {
+    pub fn read(&self) -> &Pool<RuntimeConnection> {
         self.replica.as_ref().unwrap_or(&self.primary)
     }
 }
@@ -1050,7 +1072,7 @@ fn build_pool(
     url: &str,
     pool_size: usize,
     connect_timeout_secs: u64,
-) -> Result<Pool<AsyncPgConnection>, PoolError> {
+) -> Result<Pool<RuntimeConnection>, PoolError> {
     // A SQLite target is recognized (issue #1614) but the runtime pool that
     // would serve it is not wired into this build yet — the pool below is a
     // Postgres pool (`Pool<AsyncPgConnection>`). Refuse here, at pool-build
@@ -1065,28 +1087,48 @@ fn build_pool(
         )));
     }
 
-    let timeout = Duration::from_secs(connect_timeout_secs);
-    // When the URL's `sslmode` asks for TLS, plug a rustls-backed connector
-    // into the pool via a custom setup callback — diesel-async's default
-    // establish path hardcodes `NoTls`, which cannot satisfy
-    // `sslmode=require` at all. `sslmode` absent/`disable`/`prefer` keeps the
-    // default (NoTls) path, so existing configurations behave exactly as
-    // before. See [`tls`] for the full posture table.
-    let manager = match tls::TlsPosture::from_database_url(url) {
-        tls::TlsPosture::Off => AsyncDieselConnectionManager::<AsyncPgConnection>::new(url),
-        posture => {
-            let mut config =
-                diesel_async::pooled_connection::ManagerConfig::<AsyncPgConnection>::default();
-            config.custom_setup = tls::setup_callback(posture);
-            AsyncDieselConnectionManager::<AsyncPgConnection>::new_with_config(url, config)
-        }
-    };
-    Ok(Pool::builder(manager)
-        .max_size(pool_size.max(1))
-        .wait_timeout(Some(timeout))
-        .create_timeout(Some(timeout))
-        .runtime(deadpool::Runtime::Tokio1)
-        .build()?)
+    // Under the `sqlite` feature `RuntimeConnection` is a SQLite connection, so
+    // the Postgres pool/manager built below does not type-check against
+    // `Pool<RuntimeConnection>` — and, per PR1 (issue #1614), no SQLite runtime
+    // pool is wired yet. Refuse all pool construction here so the alias can flip
+    // without a working backend; the real SQLite pool is PR2. This keeps the
+    // "SQLite pool construction stays refused at runtime" guarantee while
+    // letting the feature-on build compile.
+    #[cfg(feature = "sqlite")]
+    {
+        let _ = (pool_size, connect_timeout_secs);
+        return Err(PoolError::UnsupportedBackend(format!(
+            "the SQLite runtime pool is not yet wired into this build of \
+             autumn-web (built with --features sqlite); follow \
+             https://github.com/madmax983/autumn/issues/1905 for status (target: {url:?})"
+        )));
+    }
+
+    #[cfg(not(feature = "sqlite"))]
+    {
+        let timeout = Duration::from_secs(connect_timeout_secs);
+        // When the URL's `sslmode` asks for TLS, plug a rustls-backed connector
+        // into the pool via a custom setup callback — diesel-async's default
+        // establish path hardcodes `NoTls`, which cannot satisfy
+        // `sslmode=require` at all. `sslmode` absent/`disable`/`prefer` keeps the
+        // default (NoTls) path, so existing configurations behave exactly as
+        // before. See [`tls`] for the full posture table.
+        let manager = match tls::TlsPosture::from_database_url(url) {
+            tls::TlsPosture::Off => AsyncDieselConnectionManager::<AsyncPgConnection>::new(url),
+            posture => {
+                let mut config =
+                    diesel_async::pooled_connection::ManagerConfig::<AsyncPgConnection>::default();
+                config.custom_setup = tls::setup_callback(posture);
+                AsyncDieselConnectionManager::<AsyncPgConnection>::new_with_config(url, config)
+            }
+        };
+        Ok(Pool::builder(manager)
+            .max_size(pool_size.max(1))
+            .wait_timeout(Some(timeout))
+            .create_timeout(Some(timeout))
+            .runtime(deadpool::Runtime::Tokio1)
+            .build()?)
+    }
 }
 
 /// Create a connection pool from the database configuration.
@@ -1099,7 +1141,7 @@ fn build_pool(
 ///
 /// Returns [`PoolError`] if the pool cannot be built (e.g., invalid
 /// max-size configuration).
-pub fn create_pool(config: &DatabaseConfig) -> Result<Option<Pool<AsyncPgConnection>>, PoolError> {
+pub fn create_pool(config: &DatabaseConfig) -> Result<Option<Pool<RuntimeConnection>>, PoolError> {
     let Some(url) = config.effective_primary_url() else {
         return Ok(None);
     };
@@ -1572,7 +1614,7 @@ where
 // ── Db extractor ─────────────────────────────────────────────
 
 /// Connection type managed by the deadpool pool.
-pub type PooledConnection = diesel_async::pooled_connection::deadpool::Object<AsyncPgConnection>;
+pub type PooledConnection = diesel_async::pooled_connection::deadpool::Object<RuntimeConnection>;
 
 struct TxDepthGuard<'a> {
     depth: &'a mut usize,
@@ -1970,7 +2012,7 @@ impl Db {
 }
 
 impl std::ops::Deref for Db {
-    type Target = AsyncPgConnection;
+    type Target = RuntimeConnection;
     fn deref(&self) -> &Self::Target {
         assert!(
             !self.tx_poisoned,
@@ -1997,7 +2039,7 @@ impl std::ops::DerefMut for Db {
 /// span, interceptor, statement-timeout, and slow-query treatment.
 pub(crate) struct DbCheckoutParams<'a> {
     /// Pool to check the connection out of.
-    pub pool: &'a Pool<AsyncPgConnection>,
+    pub pool: &'a Pool<RuntimeConnection>,
     /// Role label surfaced to [`DbConnectionInterceptor`]s, e.g. `"primary"`
     /// or `"shard:<name>:primary"`.
     pub pool_name: &'a str,
@@ -2144,7 +2186,7 @@ impl Db {
     ///
     /// Returns [`AutumnError`] if a connection cannot be acquired from `pool`.
     #[cfg(feature = "test-support")]
-    pub async fn connect_for_test(pool: &Pool<AsyncPgConnection>) -> Result<Self, AutumnError> {
+    pub async fn connect_for_test(pool: &Pool<RuntimeConnection>) -> Result<Self, AutumnError> {
         Self::checkout(DbCheckoutParams {
             pool,
             pool_name: "test",
@@ -2311,7 +2353,7 @@ pub trait DatabasePoolProvider: Send + Sync + 'static {
     fn create_pool(
         &self,
         config: &DatabaseConfig,
-    ) -> impl std::future::Future<Output = Result<Option<Pool<AsyncPgConnection>>, PoolError>> + Send;
+    ) -> impl std::future::Future<Output = Result<Option<Pool<RuntimeConnection>>, PoolError>> + Send;
 
     /// Create primary and optional replica pools from the resolved
     /// [`DatabaseConfig`].
@@ -2386,7 +2428,7 @@ impl DatabasePoolProvider for DieselDeadpoolPoolProvider {
     async fn create_pool(
         &self,
         config: &DatabaseConfig,
-    ) -> Result<Option<Pool<AsyncPgConnection>>, PoolError> {
+    ) -> Result<Option<Pool<RuntimeConnection>>, PoolError> {
         create_pool(config)
     }
 }

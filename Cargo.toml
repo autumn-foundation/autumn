@@ -55,7 +55,7 @@ pq-sys = { version = "0.7", features = ["bundled_without_openssl"] }
 # diesel_migrations) over an async connection — used to run startup
 # migrations and wait checks through the rustls TLS connector, since the
 # bundled libpq (`pq-sys` below) has no SSL support.
-diesel-async = { version = "0.9", features = ["deadpool", "postgres", "async-connection-wrapper"] }
+diesel-async = { version = "0.9", features = ["deadpool", "postgres", "async-connection-wrapper", "sync-connection-wrapper"] }
 diesel_migrations = "2"
 http = "1"
 libsqlite3-sys = { version = "0.37", features = ["bundled"] }
