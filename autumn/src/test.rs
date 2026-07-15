@@ -267,9 +267,16 @@ use crate::route::Route;
 
 use crate::state::AppState;
 
-#[cfg(feature = "db")]
+// Only the `test-support`-gated `TestDb` (a Postgres testcontainer helper) names
+// `AsyncPgConnection` by its short name now; the `TestClient` pool fields use the
+// `RuntimeConnection` alias, and the transactional establish path uses the fully
+// qualified path — so without `test-support` this import would be unused.
+#[cfg(all(feature = "db", feature = "test-support"))]
 use diesel_async::AsyncPgConnection;
-#[cfg(feature = "db")]
+// Used by the Postgres transactional establish path and by the `test-support`
+// `TestDb`; neither is compiled in a `--features sqlite` build without
+// `test-support`, so this import would otherwise be unused there.
+#[cfg(all(feature = "db", any(not(feature = "sqlite"), feature = "test-support")))]
 use diesel_async::RunQueryDsl;
 #[cfg(feature = "db")]
 use diesel_async::pooled_connection::deadpool::Pool;
@@ -716,9 +723,9 @@ pub struct TestApp {
     #[cfg(feature = "mcp")]
     mcp: Option<crate::mcp::McpRuntime>,
     #[cfg(feature = "db")]
-    pool: Option<Pool<AsyncPgConnection>>,
+    pool: Option<Pool<crate::db::RuntimeConnection>>,
     #[cfg(feature = "db")]
-    replica_pool: Option<Pool<AsyncPgConnection>>,
+    replica_pool: Option<Pool<crate::db::RuntimeConnection>>,
     #[cfg(feature = "db")]
     transactional: bool,
     #[cfg(feature = "db")]
@@ -1478,7 +1485,7 @@ impl TestApp {
     /// Attach a database connection pool to the test app.
     #[cfg(feature = "db")]
     #[must_use]
-    pub fn with_db(mut self, pool: Pool<AsyncPgConnection>) -> Self {
+    pub fn with_db(mut self, pool: Pool<crate::db::RuntimeConnection>) -> Self {
         self.pool = Some(pool);
         self
     }
@@ -1596,7 +1603,16 @@ impl TestApp {
         // leak into this one (it is re-installed below).
         crate::events::clear_global_event_bus();
 
-        #[cfg(feature = "db")]
+        // Postgres transactional test isolation (`begin_test_transaction` +
+        // SAVEPOINT rollback on a `max_size(1)` control pool) is Postgres-only;
+        // SQLite has no equivalent, so under the `sqlite` feature the harness
+        // uses the configured pool directly (no per-test rollback isolation).
+        #[cfg(all(feature = "db", feature = "sqlite"))]
+        let (pool, replica_pool, db_interceptor) = {
+            let _ = self.transactional;
+            (self.pool, self.replica_pool, self.db_interceptor)
+        };
+        #[cfg(all(feature = "db", not(feature = "sqlite")))]
         let (pool, replica_pool, db_interceptor) = if self.transactional {
             let url = self.transactional_url.as_deref()
                 .or_else(|| self.config.database.effective_primary_url())
@@ -1707,7 +1723,7 @@ impl TestApp {
             // the control pool above) so writes routed to a shard are rolled
             // back at the end of the test — the same isolation the control pool
             // gets. Replicas are skipped; all shard reads run on the primary.
-            #[cfg(feature = "db")]
+            #[cfg(all(feature = "db", not(feature = "sqlite")))]
             shards: if self.transactional {
                 crate::sharding::create_shard_set_transactional(
                     &self.config.database,
@@ -1718,6 +1734,12 @@ impl TestApp {
                 crate::sharding::create_shard_set(&self.config.database, shard_router.clone())
                     .expect("test shard pools should build from config")
             },
+            // The transactional shard-set builder is Postgres-only (per-shard
+            // `begin_test_transaction` isolation); under the `sqlite` feature the
+            // harness always uses the plain builder (no shard rollback isolation).
+            #[cfg(all(feature = "db", feature = "sqlite"))]
+            shards: crate::sharding::create_shard_set(&self.config.database, shard_router.clone())
+                .expect("test shard pools should build from config"),
             profile: self.config.profile.clone(),
             role: self.config.role,
             started_at: std::time::Instant::now(),
@@ -3706,10 +3728,12 @@ impl TestResponse {
     }
 }
 
-#[cfg(feature = "db")]
+// Constructed only by the Postgres transactional test-isolation establish path,
+// which is cfg'd out under the `sqlite` feature — so gate these out too.
+#[cfg(all(feature = "db", not(feature = "sqlite")))]
 struct TransactionalDbInterceptor;
 
-#[cfg(feature = "db")]
+#[cfg(all(feature = "db", not(feature = "sqlite")))]
 impl crate::interceptor::DbConnectionInterceptor for TransactionalDbInterceptor {
     fn intercept_checkout<'a>(
         &'a self,
@@ -3779,13 +3803,15 @@ impl crate::interceptor::DbConnectionInterceptor for TransactionalDbInterceptor 
     }
 }
 
-#[cfg(feature = "db")]
+// See `TransactionalDbInterceptor`: only the Postgres transactional establish
+// path composes interceptors, so this is dead under the `sqlite` feature.
+#[cfg(all(feature = "db", not(feature = "sqlite")))]
 struct ComposedDbInterceptor {
     first: std::sync::Arc<dyn crate::interceptor::DbConnectionInterceptor>,
     second: std::sync::Arc<dyn crate::interceptor::DbConnectionInterceptor>,
 }
 
-#[cfg(feature = "db")]
+#[cfg(all(feature = "db", not(feature = "sqlite")))]
 impl crate::interceptor::DbConnectionInterceptor for ComposedDbInterceptor {
     fn intercept_checkout<'a>(
         &'a self,

@@ -1087,10 +1087,12 @@ fn build_pool(
     // Under the `sqlite` feature `RuntimeConnection` is a SQLite connection, so
     // the pool must be built over `SyncConnectionWrapper<SqliteConnection>`
     // rather than the Postgres manager below. Route to the dedicated SQLite
-    // builder (PR2, issue #1614).
+    // builder (PR2, issue #1614). This block is the whole function body under
+    // the feature (the Postgres arms below are cfg'd out), so it is the tail
+    // expression — no `return` needed.
     #[cfg(feature = "sqlite")]
     {
-        return build_sqlite_pool(url, pool_size, connect_timeout_secs);
+        build_sqlite_pool(url, pool_size, connect_timeout_secs)
     }
 
     // Default (Postgres) build. A SQLite target is recognized here but its
@@ -1135,12 +1137,12 @@ fn build_pool(
     }
 }
 
-/// Normalize a configured SQLite target into the filename token diesel's
+/// Normalize a configured `SQLite` target into the filename token diesel's
 /// `SqliteConnection` understands.
 ///
-/// diesel's SQLite backend passes the string straight to `sqlite3_open`, which
+/// diesel's `SQLite` backend passes the string straight to `sqlite3_open`, which
 /// understands a filesystem path, a `file:` URI, or the special `:memory:`
-/// token — but **not** a `sqlite:` URL scheme. Strip the recognized SQLite URL
+/// token — but **not** a `sqlite:` URL scheme. Strip the recognized `SQLite` URL
 /// spellings down to that: `sqlite::memory:`, `sqlite://:memory:`, and an empty
 /// `sqlite://` all become an in-memory database; `sqlite:///path` /
 /// `sqlite://path` / `sqlite:path` reduce to their path; a `file:` URI or a
@@ -1160,7 +1162,7 @@ fn normalize_sqlite_target(url: &str) -> String {
     rest.to_owned()
 }
 
-/// Whether a normalized SQLite target names an in-memory database (each such
+/// Whether a normalized `SQLite` target names an in-memory database (each such
 /// connection is its own private database, so the pool must be single-slot to
 /// stay consistent — see [`build_sqlite_pool`]).
 #[cfg(feature = "sqlite")]
@@ -1169,11 +1171,11 @@ fn sqlite_target_is_memory(target: &str) -> bool {
 }
 
 /// Build a deadpool pool over `SyncConnectionWrapper<SqliteConnection>` for a
-/// SQLite target (issue #1614, PR2).
+/// `SQLite` target (issue #1614, PR2).
 ///
 /// `SyncConnectionWrapper` runs synchronous diesel `SqliteConnection` calls on
 /// Tokio's blocking pool, so this integrates with the async runtime like the
-/// Postgres path. Pool sizing is deliberately conservative: SQLite is
+/// Postgres path. Pool sizing is deliberately conservative: `SQLite` is
 /// single-writer, so a large pool only multiplies `SQLITE_BUSY` contention, and
 /// an in-memory database is **private per connection** — a multi-slot pool over
 /// `:memory:` would hand out connections that each see a different, empty
@@ -2027,7 +2029,10 @@ impl Db {
                 .await;
             span.record("db.tx.attempts", 1u32);
             guard.disarmed = true;
-            return match result {
+            // This block is the whole remaining function body under the feature
+            // (the Postgres retry loop below is cfg'd out), so the `match` is the
+            // tail expression — no `return` needed.
+            match result {
                 Ok(value) => {
                     let callbacks: Vec<CommitCallback> = {
                         let mut reg = registry.lock().expect("registry lock");
@@ -2039,7 +2044,7 @@ impl Db {
                     Ok(value)
                 }
                 Err(user_error) => Err(crate::error::AutumnError::from(user_error)),
-            };
+            }
         }
 
         #[cfg(not(feature = "sqlite"))]
@@ -3215,7 +3220,7 @@ mod tests {
         async fn create_pool(
             &self,
             _config: &DatabaseConfig,
-        ) -> Result<Option<Pool<AsyncPgConnection>>, PoolError> {
+        ) -> Result<Option<Pool<crate::db::RuntimeConnection>>, PoolError> {
             Ok(None)
         }
     }
@@ -3463,18 +3468,18 @@ mod tests {
     struct TestDbState;
 
     impl DbState for TestDbState {
-        fn pool(&self) -> Option<&Pool<AsyncPgConnection>> {
+        fn pool(&self) -> Option<&Pool<crate::db::RuntimeConnection>> {
             None
         }
     }
 
     #[derive(Clone)]
     struct TestReadState {
-        primary: Pool<AsyncPgConnection>,
+        primary: Pool<crate::db::RuntimeConnection>,
     }
 
     impl DbState for TestReadState {
-        fn pool(&self) -> Option<&Pool<AsyncPgConnection>> {
+        fn pool(&self) -> Option<&Pool<crate::db::RuntimeConnection>> {
             Some(&self.primary)
         }
     }

@@ -8733,14 +8733,14 @@ async fn pg_enqueued_and_scheduled_pages(
     Ok((enqueued, scheduled))
 }
 
-/// SQLite stub for the Postgres job runtime.
+/// `SQLite` stub for the Postgres job runtime.
 ///
 /// The durable Postgres job backend uses `LISTEN`/`NOTIFY`, `FOR UPDATE SKIP
-/// LOCKED` claiming, and advisory locks — none of which SQLite provides — so
+/// LOCKED` claiming, and advisory locks — none of which `SQLite` provides — so
 /// under the `sqlite` feature the runtime pool (`RuntimeConnection`) is a
-/// SQLite pool that cannot drive the Postgres worker loops. Refuse a
+/// `SQLite` pool that cannot drive the Postgres worker loops. Refuse a
 /// `jobs.backend = "postgres"` configuration with a clear message instead of
-/// mis-typing; SQLite deployments use the in-process `local` job backend
+/// mis-typing; `SQLite` deployments use the in-process `local` job backend
 /// (the default).
 #[cfg(all(feature = "db", feature = "sqlite"))]
 fn start_postgres_runtime(

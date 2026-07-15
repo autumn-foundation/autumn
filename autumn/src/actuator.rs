@@ -5102,13 +5102,16 @@ mod tests {
     #[tokio::test]
     #[cfg(feature = "db")]
     async fn actuator_metrics_returns_db_stats_when_pool_present() {
-        use diesel_async::AsyncPgConnection;
         use diesel_async::pooled_connection::AsyncDieselConnectionManager;
         use diesel_async::pooled_connection::deadpool::Pool;
 
         let mut state = test_state();
 
-        let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(
+        // `RuntimeConnection` is `AsyncPgConnection` in the default build and a
+        // SQLite connection under `--features sqlite`; using the alias keeps this
+        // test compiling on both (it only exercises pool metrics, and is not run
+        // under the sqlite feature).
+        let manager = AsyncDieselConnectionManager::<crate::db::RuntimeConnection>::new(
             "postgres://postgres:postgres@localhost:5432/postgres",
         );
         let pool = Pool::builder(manager).build().unwrap();

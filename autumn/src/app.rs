@@ -9170,9 +9170,7 @@ mod tests {
                 config: &crate::config::DatabaseConfig,
             ) -> Result<
                 Option<
-                    diesel_async::pooled_connection::deadpool::Pool<
-                        diesel_async::AsyncPgConnection,
-                    >,
+                    diesel_async::pooled_connection::deadpool::Pool<crate::db::RuntimeConnection>,
                 >,
                 crate::db::PoolError,
             > {
@@ -9324,9 +9322,7 @@ mod tests {
                 config: &crate::config::DatabaseConfig,
             ) -> Result<
                 Option<
-                    diesel_async::pooled_connection::deadpool::Pool<
-                        diesel_async::AsyncPgConnection,
-                    >,
+                    diesel_async::pooled_connection::deadpool::Pool<crate::db::RuntimeConnection>,
                 >,
                 crate::db::PoolError,
             > {

@@ -1,4 +1,4 @@
-//! Boot + serve proof for the SQLite runtime lane (issue #1614, PR2).
+//! Boot + serve proof for the `SQLite` runtime lane (issue #1614, PR2).
 //!
 //! Exercises the whole PR2 chain end to end under the `sqlite` feature:
 //!
@@ -7,10 +7,10 @@
 //!    real deadpool pool over `SyncConnectionWrapper<SqliteConnection>`
 //!    (`autumn_web::db::RuntimeConnection` under this feature).
 //! 2. **Schema applies** — a minimal table is created and seeded on a checked-out
-//!    connection, proving the pooled SQLite connection runs real DDL/DML.
-//! 3. **Serves a request backed by SQLite** — a minimal Axum router holds the
+//!    connection, proving the pooled `SQLite` connection runs real DDL/DML.
+//! 3. **Serves a request backed by `SQLite`** — a minimal Axum router holds the
 //!    pool in state and a handler answers an HTTP request by `SELECT`ing the
-//!    seeded row, driving one real request/response through the SQLite pool.
+//!    seeded row, driving one real request/response through the `SQLite` pool.
 //!
 //! This is deliberately a public-API demo (a "minimal router using the pool");
 //! the crate's Postgres transactional `TestApp` harness is Postgres-only and not
@@ -45,7 +45,7 @@ struct Greeting {
     message: String,
 }
 
-/// Answers `/greet` by reading the seeded row from SQLite through the pool.
+/// Answers `/greet` by reading the seeded row from `SQLite` through the pool.
 async fn greet(State(pool): State<SqlitePool>) -> Result<String, StatusCode> {
     let mut conn = pool
         .get()
