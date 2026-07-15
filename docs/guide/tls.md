@@ -235,7 +235,7 @@ Fields:
 |---|---|---|
 | `domains` | required | One or more non-wildcard domains to issue for. |
 | `contact_email` | required | Contact address registered with the ACME account. |
-| `directory` | Let's Encrypt **staging** | ACME directory: `production`, or a custom directory URL. |
+| `directory` | Let's Encrypt **staging** | ACME directory. Built-in endpoints are the bare strings `"staging"` (default) and `"production"`. A private CA / Pebble uses the inline table `{ custom = { url = "https://your-ca.example/dir" } }` — a bare URL string is **not** accepted (see below). |
 | `cache_dir` | `config/acme` | Where the account key and issued certificate are cached. |
 | `http_challenge_port` | `80` | Port the HTTP-01 challenge (and HTTP→HTTPS redirect) listens on. |
 | `renew_before_days` | `30` | Renew this many days before expiry (must be `< 90`). |
@@ -251,6 +251,21 @@ Fields:
 > publicly-trusted certificate. The `renew_before_days` window (default 30) keeps
 > renewals well ahead of the 90-day certificate lifetime so a transient failure
 > has many days of retries before anything expires.
+
+> **Pointing at a private CA (e.g. Pebble).** `directory` is an enum: the
+> built-in endpoints are the bare strings `directory = "staging"` and
+> `directory = "production"`, but a custom directory must be given as an inline
+> table naming the `custom` variant:
+>
+> ```toml
+> [server.tls.acme]
+> domains = ["app.example.com"]
+> contact_email = "admin@example.com"
+> directory = { custom = { url = "https://pebble.test/dir" } }
+> ```
+>
+> A bare URL string (`directory = "https://pebble.test/dir"`) is **not** a valid
+> value and makes the config fail to load at startup — use the inline-table form.
 
 ### How issuance and renewal work
 
