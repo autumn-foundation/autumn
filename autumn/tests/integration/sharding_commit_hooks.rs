@@ -193,11 +193,20 @@ mod sharding_commit_hook_tests {
             .idempotent()
             .build();
 
+        // Idempotency keys must be unique per invocation: `TestDb::shared()`
+        // hands out one Postgres for the whole consolidated test binary, and the
+        // idempotency store lives in that shared DB. A fixed key can collide with
+        // a record left by another test (or an earlier run) and replay as a 409
+        // instead of running the handler. Derive fresh keys from a per-run UUID.
+        let run_id = uuid::Uuid::new_v4();
+        let key_k1 = format!("note-k1-{run_id}");
+        let key_k2 = format!("note-k2-{run_id}");
+
         // 1. First create with idempotency key k1.
         client
             .post("/notes")
             .header("X-Tenant", "tenant-a")
-            .header("idempotency-key", "note-k1")
+            .header("idempotency-key", key_k1.as_str())
             .json(&serde_json::json!({"title": "first"}))
             .send()
             .await
@@ -232,7 +241,7 @@ mod sharding_commit_hook_tests {
         client
             .post("/notes")
             .header("X-Tenant", "tenant-a")
-            .header("idempotency-key", "note-k1")
+            .header("idempotency-key", key_k1.as_str())
             .json(&serde_json::json!({"title": "first"}))
             .send()
             .await
@@ -258,7 +267,7 @@ mod sharding_commit_hook_tests {
         client
             .post("/notes")
             .header("X-Tenant", "tenant-a")
-            .header("idempotency-key", "note-k2")
+            .header("idempotency-key", key_k2.as_str())
             .json(&serde_json::json!({"title": "second"}))
             .send()
             .await
