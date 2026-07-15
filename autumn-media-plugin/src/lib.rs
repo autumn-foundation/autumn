@@ -38,17 +38,21 @@
 //! First-party plugin: `autumn-<name>-plugin`.
 
 pub mod config;
+pub mod error;
+pub mod storage;
 
 pub use config::{
     MediaConfig, MediaConfigError, MediaMtxConfig, MediaStorageBackend, MediaStorageConfig,
     RecordingConfig,
 };
+pub use error::MediaError;
+pub use storage::{MediaStorage, S3MediaStorage, StoredObject};
 
 /// Common downstream imports for configuring and mounting the media plugin.
 pub mod prelude {
     pub use crate::{
-        MediaConfig, MediaConfigError, MediaMtxConfig, MediaPlugin, MediaStorageBackend,
-        MediaStorageConfig, RecordingConfig,
+        MediaConfig, MediaConfigError, MediaError, MediaMtxConfig, MediaPlugin, MediaStorage,
+        MediaStorageBackend, MediaStorageConfig, RecordingConfig, S3MediaStorage, StoredObject,
     };
 }
 
