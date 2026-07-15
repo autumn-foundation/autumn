@@ -4074,15 +4074,9 @@ fn render_form_for_helper(
             // changeset so the 422 re-render keeps entered input, and the
             // inline-error/ARIA skeleton matches the derived controls.
             _ => {
-                if let Some((input_type, constraint_attrs)) = html5_constraint_spec(f) {
+                if let Some((input_type, _)) = html5_constraint_spec(f) {
                     let label = humanize_label(name);
-                    let required_attr = if f.nullable {
-                        ""
-                    } else {
-                        " required aria-required=\"true\""
-                    };
                     let _ = write!(builder_calls, "\n        .exclude(\"{name}\")");
-                    // Constrained textareas stay raw: a11y::TextField renders only <input> (see #1706 follow-up).
                     if matches!(f.kind, FieldKind::Text) && input_type == "text" {
                         // A `text` DSL column with a length/plain constraint is a
                         // long-form field (Postgres `TEXT`), so its control is a
@@ -4091,25 +4085,42 @@ fn render_form_for_helper(
                         // (A `text{email}`/`text{url}` field has `input_type` ==
                         // `email`/`url`, which a textarea can't carry — those
                         // inherently single-line, type-dependent controls take the
-                        // `<input type="…">` branch below instead.) Only the
-                        // attributes a textarea honours carry over: the length
-                        // rules in `constraint_attrs` (`minlength`/`maxlength`)
+                        // `<input type="…">` branch below instead.)
+                        //
+                        // Route the constrained multi-line `<textarea>` through the
+                        // typed accessible `a11y::TextArea` primitive (#1933): the
+                        // rendered element/attributes/values carry over unchanged
+                        // (the label now carries `autumn-field__label`), only
+                        // TextArea's attribute order differs. Only the attributes a
+                        // textarea honours apply — the length rules from
+                        // `html5_constraint_builder_calls` (`minlength`/`maxlength`)
                         // and `required`; the input-only `type`/`min`/`max` are
                         // dropped. The 422 re-render value is the element's text
                         // content (not a `value=` attribute) so entered input
-                        // survives, matching `form::textarea_input`.
+                        // survives, matching `form::textarea_input`. The wrapper
+                        // `<div>` and inline-error `<div>` skeleton stay raw and
+                        // identical to the single-line `<input>` branch below.
+                        let constraint_builders = html5_constraint_builder_calls(f)
+                            .map(|(_, calls)| calls)
+                            .unwrap_or_default();
+                        let required_builders = if f.nullable {
+                            ""
+                        } else {
+                            ".required().aria_required()"
+                        };
                         let _ = write!(
                             appends,
                             "\n        .append(html! {{\n            \
                              @let errors = changeset.errors_for(\"{name}\");\n            \
                              div id=\"{name}-field\" class=\"autumn-field\" {{\n                \
-                             label for=\"{name}\" class=\"autumn-field__label\" {{ \"{label}\" }}\n                \
-                             textarea id=\"{name}\" name=\"{name}\"{constraint_attrs}{required_attr}\n                    \
-                             class=(if errors.is_empty() {{ \"autumn-field__input\" }} else {{ \"autumn-field__input autumn-field__input--invalid\" }})\n                    \
-                             aria-invalid=(if errors.is_empty() {{ \"false\" }} else {{ \"true\" }})\n                    \
-                             aria-describedby=(if errors.is_empty() {{ \"\" }} else {{ \"{name}-error\" }}) {{\n                        \
-                             (changeset.field_value(\"{name}\").unwrap_or_default())\n                    \
-                             }}\n                \
+                             (autumn_web::a11y::TextArea::new(\"{name}\")\n                    \
+                             .label(\"{label}\")\n                    \
+                             .label_class(\"autumn-field__label\")\n                    \
+                             .value(changeset.field_value(\"{name}\").unwrap_or_default())\n                    \
+                             {constraint_builders}{required_builders}\n                    \
+                             .class(if errors.is_empty() {{ \"autumn-field__input\" }} else {{ \"autumn-field__input autumn-field__input--invalid\" }})\n                    \
+                             .aria_invalid(!errors.is_empty())\n                    \
+                             .described_by(if errors.is_empty() {{ \"\" }} else {{ \"{name}-error\" }}))\n                \
                              @if !errors.is_empty() {{\n                    \
                              div id=\"{name}-error\" role=\"alert\" class=\"autumn-field__errors\" {{\n                        \
                              @for error in errors {{ p class=\"autumn-field__error\" {{ (error) }} }}\n                    \

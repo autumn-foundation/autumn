@@ -410,15 +410,26 @@ fn text_columns_render_constrained_textarea_not_input() {
     );
     let routes = fs::read_to_string(project.join("src/routes/articles.rs")).unwrap();
 
-    // Both text columns are excised from the derived render and re-appended.
+    // Both text columns are excised from the derived render and re-appended,
+    // routed through the typed accessible `a11y::TextArea` primitive (#1933) —
+    // never a raw `<textarea>`, and never the single-line `a11y::TextField`
+    // (the multi-line control must stay a textarea).
     for field in ["body", "notes"] {
         assert!(
             routes.contains(&format!(".exclude(\"{field}\")")),
             "{field} must be excluded from the derived render:\n{routes}"
         );
         assert!(
-            routes.contains(&format!("textarea id=\"{field}\" name=\"{field}\"")),
-            "{field} must render a <textarea>:\n{routes}"
+            routes.contains(&format!("autumn_web::a11y::TextArea::new(\"{field}\")")),
+            "{field} must render through a11y::TextArea:\n{routes}"
+        );
+        assert!(
+            !routes.contains(&format!("textarea id=\"{field}\" name=\"{field}\"")),
+            "{field} must no longer emit a raw <textarea>:\n{routes}"
+        );
+        assert!(
+            !routes.contains(&format!("TextField::new(\"{field}\")")),
+            "the multi-line {field} must be a TextArea, not a single-line TextField:\n{routes}"
         );
     }
 
@@ -429,20 +440,22 @@ fn text_columns_render_constrained_textarea_not_input() {
         "body must not render a single-line text input:\n{routes}"
     );
 
-    // The non-nullable `body` carries the length rules + required, and its
-    // value is the element's text content, not a `value=` attribute.
-    let body_attrs = slice_textarea_attrs(&routes, "textarea id=\"body\" name=\"body\"");
+    // The non-nullable `body` carries the length rules + required as typed
+    // builder calls, and its value is the element's text content — TextArea
+    // renders `.value(...)` between `<textarea>…</textarea>`, not a `value=`
+    // attribute.
+    let body_attrs = slice_textarea_attrs(&routes, "body");
     assert!(
-        body_attrs.contains("minlength=\"10\"") && body_attrs.contains("maxlength=\"5000\""),
-        "body textarea must carry minlength/maxlength:\n{body_attrs}"
+        body_attrs.contains(".minlength(10u32)") && body_attrs.contains(".maxlength(5000u32)"),
+        "body textarea must carry minlength/maxlength builder calls:\n{body_attrs}"
     );
     assert!(
-        body_attrs.contains("required aria-required=\"true\""),
+        body_attrs.contains(".required().aria_required()"),
         "non-nullable body textarea must be required:\n{body_attrs}"
     );
     assert!(
-        routes.contains("(changeset.field_value(\"body\").unwrap_or_default())"),
-        "body textarea must re-fill from the changeset:\n{routes}"
+        body_attrs.contains(".value(changeset.field_value(\"body\").unwrap_or_default())"),
+        "body textarea must re-fill its value from the changeset:\n{body_attrs}"
     );
     assert!(
         !routes.contains("value=(changeset.field_value(\"body\")"),
@@ -450,9 +463,9 @@ fn text_columns_render_constrained_textarea_not_input() {
     );
 
     // The nullable `notes` keeps only its maxlength — no required, no minlength.
-    let notes_attrs = slice_textarea_attrs(&routes, "textarea id=\"notes\" name=\"notes\"");
+    let notes_attrs = slice_textarea_attrs(&routes, "notes");
     assert!(
-        notes_attrs.contains("maxlength=\"1000\""),
+        notes_attrs.contains(".maxlength(1000u32)"),
         "notes textarea must carry maxlength:\n{notes_attrs}"
     );
     assert!(
@@ -508,15 +521,17 @@ fn text_email_and_url_render_typed_input_not_textarea() {
     );
 }
 
-/// Slice a textarea's field-specific attributes: from the `id`/`name` marker
-/// up to the shared `class=` skeleton, so an assertion can't match a sibling
-/// control's attributes.
-fn slice_textarea_attrs<'a>(routes: &'a str, marker: &str) -> &'a str {
+/// Slice a routed `a11y::TextArea` call's field-specific builder calls: from
+/// the `TextArea::new("field")` marker up to the shared `.class(` skeleton, so
+/// a field-scoped assertion doesn't accidentally match a sibling. The
+/// value/constraint/`required` builders all precede `.class(`.
+fn slice_textarea_attrs<'a>(routes: &'a str, field: &str) -> &'a str {
+    let marker = format!("TextArea::new(\"{field}\")");
     let start = routes
-        .find(marker)
+        .find(&marker)
         .unwrap_or_else(|| panic!("missing {marker} in:\n{routes}"));
     let rest = &routes[start..];
-    let end = rest.find("class=").unwrap_or(rest.len());
+    let end = rest.find(".class(").unwrap_or(rest.len());
     &rest[..end]
 }
 
