@@ -399,6 +399,83 @@ fn hx_escape_hatch_escapes_attribute_values() {
 }
 
 #[test]
+fn hx_lands_on_visible_labeled_control_not_the_label() {
+    // Decisive regression guard (PR #1946 review). Every primitive renders a
+    // visible `<label>` as a *sibling* of the control, and `with_hx_attrs` is
+    // applied to the control sub-element ALONE — so the "first `>`" the splice
+    // targets is the control's own opening tag, never the preceding `<label>`.
+    // This pins that: with a visible label present, the `hx-*` attributes must
+    // land inside the CONTROL's opening tag and must NOT appear on the `<label>`.
+
+    // Returns the opening-tag substring `<tag …>` for the first `<tag` in `s`.
+    fn opening_tag<'a>(s: &'a str, tag: &str) -> &'a str {
+        let start = s
+            .find(tag)
+            .unwrap_or_else(|| panic!("{tag} present in: {s}"));
+        let rel_end = s[start..].find('>').expect("opening tag closes with >");
+        &s[start..=start + rel_end]
+    }
+
+    // `<label>` precedes `<textarea>` / `<select>` / file `<input>` / text
+    // `<input>`; the checkbox emits `<input>` before `<label>`. In every case
+    // the splice must target the control tag, not the label tag.
+    let cases: [(&str, String); 5] = [
+        (
+            "<textarea",
+            TextArea::new("bio")
+                .label("Bio")
+                .hx("post", "/v")
+                .render()
+                .into_string(),
+        ),
+        (
+            "<select",
+            Select::new("role")
+                .option("admin", "Admin")
+                .label("Role")
+                .hx("post", "/v")
+                .render()
+                .into_string(),
+        ),
+        (
+            "<input",
+            FileField::new("avatar")
+                .label("Avatar")
+                .hx("post", "/v")
+                .render()
+                .into_string(),
+        ),
+        (
+            "<input",
+            TextField::new("email")
+                .label("Email")
+                .hx("post", "/v")
+                .render()
+                .into_string(),
+        ),
+        (
+            "<input",
+            Checkbox::new("terms")
+                .label("I accept")
+                .hx("post", "/v")
+                .render()
+                .into_string(),
+        ),
+    ];
+
+    for (control_tag, markup) in &cases {
+        assert!(
+            opening_tag(markup, control_tag).contains("hx-post=\"/v\""),
+            "hx-post must be inside the {control_tag} opening tag: {markup}"
+        );
+        assert!(
+            !opening_tag(markup, "<label").contains("hx-post"),
+            "hx-post must NOT be spliced onto the <label>: {markup}"
+        );
+    }
+}
+
+#[test]
 fn splices_inside_html_block() {
     let page = html! {
         (Img::new("/logo.svg", "Autumn logo"))
