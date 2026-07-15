@@ -46,7 +46,7 @@ use crate::error::AutumnError;
 /// The database connection type the runtime is built against.
 ///
 /// Defaults to Postgres (`AsyncPgConnection`). Enabling the crate's `sqlite`
-/// feature flips it to a SQLite connection. Threading this alias (instead of a
+/// feature flips it to a `SQLite` connection. Threading this alias (instead of a
 /// hard-coded `AsyncPgConnection`) through the connection-typed surface — the
 /// pool, the pooled connection, the transaction/query helpers, and the
 /// `#[repository]`/`#[model]` generated code — is what lets the same codebase
@@ -60,7 +60,7 @@ use crate::error::AutumnError;
 #[cfg(not(feature = "sqlite"))]
 pub type RuntimeConnection = diesel_async::AsyncPgConnection;
 /// See [`RuntimeConnection`] (Postgres variant) for the full contract. Under
-/// the `sqlite` feature the runtime is built against a SQLite connection.
+/// the `sqlite` feature the runtime is built against a `SQLite` connection.
 #[cfg(feature = "sqlite")]
 pub type RuntimeConnection =
     diesel_async::sync_connection_wrapper::SyncConnectionWrapper<diesel::SqliteConnection>;
