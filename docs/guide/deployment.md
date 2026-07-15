@@ -58,8 +58,8 @@ below and are better fits in specific cases:
 > [Prerequisites](#prerequisites) — that build does not include them — and they
 > are not yet part of a published release. Until the next autumn-cli release
 > ships them, install the CLI from the latest source (`cargo install autumn-cli
-> --git https://github.com/madmax983/autumn`) and confirm the subcommand is
-> present with `autumn deploy --help`.
+> --git https://github.com/madmax983/autumn --force`) and confirm the subcommand
+> is present with `autumn deploy --help`.
 
 ### Preconditions
 
