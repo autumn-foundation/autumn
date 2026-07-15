@@ -1737,6 +1737,7 @@ mod tests {
             },
             "myapp",
         )
+        .expect("deploy config resolves")
     }
 
     const RELEASE_ID: &str = "20260714T120000Z";

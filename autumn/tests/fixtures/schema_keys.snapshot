@@ -120,6 +120,9 @@ deploy.profile
 deploy.readiness_timeout_secs
 deploy.service_name
 deploy.ssh_port
+deploy.tls
+deploy.tls.enabled
+deploy.tls.host
 deploy.user
 dev
 dev.inspector_capacity

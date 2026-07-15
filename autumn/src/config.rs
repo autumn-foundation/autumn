@@ -1228,6 +1228,39 @@ pub struct AutumnConfig {
     pub alerts: Box<crate::alerts::AlertConfig>,
 }
 
+/// Opt-in TLS termination at the deploy-managed reverse proxy (`[deploy.tls]`
+/// table, issue #1969).
+///
+/// Absent/disabled by default, so a deploy without this table is byte-for-byte
+/// the historical HTTP-only behavior. When `enabled = true`, `autumn deploy`
+/// wires the public `host` into kamal-proxy (`--host`/`--tls`) so the proxy
+/// terminates TLS on 443 with an automatic Let's Encrypt certificate.
+///
+/// TLS terminates at the PROXY only — the app itself keeps serving plain HTTP on
+/// its private loopback port, and its readiness/health probes are unaffected. Do
+/// NOT also enable in-process `[server.tls]`/ACME on a deploy-managed app.
+///
+/// # `autumn.toml` example
+///
+/// ```toml
+/// [deploy.tls]
+/// enabled = true
+/// host = "app.example.com"
+/// ```
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct DeployTlsConfig {
+    /// Whether the deploy-managed proxy terminates TLS on 443. Default: `false`
+    /// (HTTP-only, unchanged behavior).
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Public hostname the certificate is issued for (the DNS name pointing at
+    /// the server). Required when `enabled = true`; enforced at resolve time by
+    /// the CLI's `ResolvedDeployConfig::resolve`.
+    #[serde(default)]
+    pub host: Option<String>,
+}
+
 /// Push-button VPS deploy settings (`[deploy]` section, issue #1607).
 ///
 /// Describes the SSH-reachable target server and the remote install layout for
@@ -1298,6 +1331,12 @@ pub struct DeployConfig {
     /// for non-prod targets.
     #[serde(default = "default_deploy_profile")]
     pub profile: String,
+
+    /// Opt-in TLS termination at the deploy-managed reverse proxy
+    /// (`[deploy.tls]`). Disabled by default — an absent table is byte-for-byte
+    /// the historical HTTP-only behavior. See [`DeployTlsConfig`].
+    #[serde(default)]
+    pub tls: DeployTlsConfig,
 }
 
 impl Default for DeployConfig {
@@ -1312,6 +1351,7 @@ impl Default for DeployConfig {
             readiness_timeout_secs: default_deploy_readiness_timeout_secs(),
             keep_releases: default_deploy_keep_releases(),
             profile: default_deploy_profile(),
+            tls: DeployTlsConfig::default(),
         }
     }
 }
