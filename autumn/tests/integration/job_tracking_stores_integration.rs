@@ -231,11 +231,15 @@ async fn postgres_backend_persists_tracked_job_and_expires_it() {
 
     let key = autumn_web::auth::hash_api_token(&handle.token);
     let mut conn = pool.get().await.expect("get connection");
-    let row = diesel::sql_query("SELECT record FROM autumn_job_tracking WHERE key = $1")
-        .bind::<diesel::sql_types::Text, _>(&key)
-        .get_result::<RecordRow>(&mut *conn)
-        .await
-        .expect("tracked record should be persisted in postgres");
+    // Cast to ::TEXT to match the store's own read path (job_tracking.rs); this
+    // strips the binary JSONB header so `record` is proper JSON text, not a
+    // 0x01-prefixed blob that serde_json::from_str would reject.
+    let row =
+        diesel::sql_query("SELECT record::TEXT AS record FROM autumn_job_tracking WHERE key = $1")
+            .bind::<diesel::sql_types::Text, _>(&key)
+            .get_result::<RecordRow>(&mut *conn)
+            .await
+            .expect("tracked record should be persisted in postgres");
     let record: Value = serde_json::from_str(&row.record).expect("stored record is valid JSON");
     assert!(
         record["status"].is_string(),
