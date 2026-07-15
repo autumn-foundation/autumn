@@ -146,6 +146,7 @@ jobs:
           cargo test -p autumn-web --features "test-support,offline-sync" --test integration_tests offline_sync
           cargo test -p autumn-web --features "test-support,offline-sync" --test integration_tests -- \
             --ignored \
+            --test-threads=1 \
             --skip per_request_overhead_is_under_50_microseconds_p99
           # AC-7 deploy end-to-end (#1607, Slice 4): drives the real `autumn
           # deploy up`/`rollback` over ssh/scp against a privileged systemd
