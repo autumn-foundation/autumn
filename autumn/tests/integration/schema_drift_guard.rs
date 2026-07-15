@@ -70,6 +70,17 @@ const fn feature_gated_roots() -> [(bool, &'static str); 6] {
     ]
 }
 
+/// Feature-gated NESTED keys (not whole root sections). `auth` is always
+/// present, but its `webauthn` subtree only compiles under the `webauthn`
+/// feature, so when that feature is off these snapshot leaves are legitimately
+/// absent from `schema_leaf_paths()` — exclude by prefix rather than failing.
+/// Keep in sync with `config.rs`'s `#[cfg(feature = "...")]` nested fields —
+/// [`feature_gated_leaf_prefixes_match_config_when_enabled`] below self-checks
+/// this list whenever a listed feature happens to be enabled.
+const fn feature_gated_leaf_prefixes() -> [(bool, &'static str); 1] {
+    [(cfg!(feature = "webauthn"), "auth.webauthn")]
+}
+
 const SNAPSHOT_PATH: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/fixtures/schema_keys.snapshot",
@@ -121,15 +132,27 @@ fn schema_keys_snapshot_guard() {
         .filter(|(enabled, _)| !enabled)
         .map(|(_, root)| root)
         .collect();
+    let disabled_leaf_prefixes: Vec<&str> = feature_gated_leaf_prefixes()
+        .into_iter()
+        .filter(|(enabled, _)| !enabled)
+        .map(|(_, prefix)| prefix)
+        .collect();
 
     // Keys in snapshot but absent from current schema without a registry
     // entry, excluding root sections whose gating feature isn't compiled
-    // into this test binary (see module docs).
+    // into this test binary, and nested subtrees whose gating feature is off
+    // (e.g. `auth.webauthn.*` under the always-present `auth` root — see module
+    // docs and `feature_gated_leaf_prefixes`).
     let removed_without_deprecation: Vec<&str> = snapshot
         .iter()
         .filter(|k| !current.contains(k.as_str()))
         .filter(|k| !registry.contains(k.as_str()))
         .filter(|k| !disabled_roots.contains(k.split('.').next().unwrap_or(k.as_str())))
+        .filter(|k| {
+            !disabled_leaf_prefixes
+                .iter()
+                .any(|p| k.as_str() == *p || k.strip_prefix(p).is_some_and(|r| r.starts_with('.')))
+        })
         .map(String::as_str)
         .collect();
 
@@ -202,6 +225,35 @@ fn feature_gated_roots_mapping_matches_config_when_enabled() {
         "feature_gated_roots() in this file is stale: these features are enabled in this \
          build but their mapped root section is missing from the compiled schema: {stale:?}\n\
          Update the mapping to match config.rs's current #[cfg(feature = \"...\")] fields.",
+    );
+}
+
+/// Self-check for [`feature_gated_leaf_prefixes`]: whenever a listed feature
+/// happens to be enabled in this build (e.g. via `--all-features`, or workspace
+/// feature unification with `cargo test --workspace`), its mapped nested prefix
+/// must actually appear in the compiled schema. Catches the prefix list going
+/// stale (a feature renamed, or the nested field renamed/removed) instead of
+/// silently letting a real removal slip past the guard above as "expected".
+#[test]
+fn feature_gated_leaf_prefixes_match_config_when_enabled() {
+    let current = AutumnConfig::schema_leaf_paths();
+    let stale: Vec<&str> = feature_gated_leaf_prefixes()
+        .into_iter()
+        .filter(|(enabled, _)| *enabled)
+        .map(|(_, prefix)| prefix)
+        .filter(|prefix| {
+            !current.iter().any(|k| {
+                k.as_str() == *prefix || k.strip_prefix(*prefix).is_some_and(|r| r.starts_with('.'))
+            })
+        })
+        .collect();
+
+    assert!(
+        stale.is_empty(),
+        "feature_gated_leaf_prefixes() in this file is stale: these features are enabled in \
+         this build but their mapped nested prefix is missing from the compiled schema: \
+         {stale:?}\nUpdate the mapping to match config.rs's current \
+         #[cfg(feature = \"...\")] nested fields.",
     );
 }
 
