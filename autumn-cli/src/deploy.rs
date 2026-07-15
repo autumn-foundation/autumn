@@ -205,17 +205,13 @@ impl ResolvedDeployConfig {
         // the render/deploy commands changes. When enabled, a non-blank `host` is
         // mandatory (the certificate is issued for it).
         let tls_host = if cfg.tls.enabled {
-            match non_blank(&cfg.tls.host) {
-                Some(host) => Some(host),
-                None => {
-                    return Err(
-                        "[deploy.tls] requires a non-empty `host` when enabled: set \
-                         `[deploy.tls] host = \"<public-hostname>\"` in autumn.toml to the DNS \
-                         name the TLS certificate should be issued for"
-                            .to_owned(),
-                    );
-                }
-            }
+            let host = non_blank(&cfg.tls.host).ok_or_else(|| {
+                "[deploy.tls] requires a non-empty `host` when enabled: set \
+                 `[deploy.tls] host = \"<public-hostname>\"` in autumn.toml to the DNS \
+                 name the TLS certificate should be issued for"
+                    .to_owned()
+            })?;
+            Some(host)
         } else {
             None
         };
