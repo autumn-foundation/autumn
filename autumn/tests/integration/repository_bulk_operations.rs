@@ -863,6 +863,33 @@ async fn test_tenant_scoped_versioned_upsert_many_filters_cross_tenant_silently(
         err_str.contains("onflict"),
         "expected a conflict error for a stale lock version, got: {err_str}"
     );
+
+    // ── Codex P2 (raced-insert) reconciliation — documented, not concurrency-tested ──
+    //
+    // The versioned tenant-scoped upsert can silently DROP a row for two distinct
+    // reasons: a tenant_id mismatch (cross-tenant → must stay SILENT, asserted in
+    // step 2) OR a lock_version mismatch (same-tenant → must be LOUD 409). The
+    // pre-upsert per-row check (step 3) catches a lock conflict only when the row
+    // is already present in the FOR UPDATE `existing_rows` snapshot. A row inserted
+    // by a DIFFERENT write path (raw insert / save / another repo — none of which
+    // take versioned `upsert_many`'s `pg_advisory_xact_lock`) BETWEEN that snapshot
+    // and the upsert is invisible to the pre-upsert check. The generated
+    // drop-triggered reconciliation covers exactly that gap: when a drop occurs it
+    // re-selects the dropped ids UNDER THE CURRENT TENANT SCOPE and fails closed
+    // (Conflict) iff a dropped id still exists under this tenant (proving the drop
+    // was a lock mismatch, not a cross-tenant filter).
+    //
+    // The raced-insert path requires a concurrent writer landing a row between the
+    // snapshot and the upsert, which cannot be reproduced DETERMINISTICALLY in a
+    // single-threaded ignored test (and a threaded race would be flaky), so it is
+    // intentionally NOT exercised as a live concurrency test here. Its correctness
+    // is pinned instead by (a) the cross-tenant-silent assertion above — the
+    // reconciliation must re-select under tenant scope and stay silent for a
+    // cross-tenant drop, so it can never reintroduce the #1963 false positive — and
+    // (b) the macro-level codegen test
+    // `repository_macro_tenant_scoped_upsert_many_reconciles_dropped_rows_fail_closed`
+    // in `autumn-macros/src/repository.rs`, which asserts the reconciliation
+    // re-selects the dropped ids under tenant scope before returning a Conflict.
 }
 
 #[tokio::test]
