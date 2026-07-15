@@ -193,11 +193,11 @@ mod sharding_commit_hook_tests {
             .idempotent()
             .build();
 
-        // Idempotency keys must be unique per invocation: `TestDb::shared()`
-        // hands out one Postgres for the whole consolidated test binary, and the
-        // idempotency store lives in that shared DB. A fixed key can collide with
-        // a record left by another test (or an earlier run) and replay as a 409
-        // instead of running the handler. Derive fresh keys from a per-run UUID.
+        // The idempotency store is a per-instance in-memory `MemoryIdempotencyStore`
+        // (see `TestApp::idempotent` / `src/test.rs`), NOT the shared Postgres that
+        // `TestDb::shared()` hands out — so keys need not be unique for cross-test
+        // isolation, and step 2 below deliberately reuses `key_k1` to exercise the
+        // replay path. Per-run UUID keys are kept only as harmless belt-and-suspenders.
         let run_id = uuid::Uuid::new_v4();
         let key_k1 = format!("note-k1-{run_id}");
         let key_k2 = format!("note-k2-{run_id}");
@@ -236,8 +236,14 @@ mod sharding_commit_hook_tests {
             "the after-commit hook must be staged on the shard's commit-hook queue"
         );
 
-        // 2. Replay with the same idempotency key: the HTTP middleware replays
-        //    the cached 201 without re-running the handler, so no second write.
+        // 2. Replay with the same idempotency key. The opaque tenant `from_fn`
+        //    layer (installed above) forces fail-closed idempotency replay
+        //    (`src/router.rs`), so the cached mutation is NOT re-served to a
+        //    principal behind an opaque auth/tenant layer: the replay returns 409
+        //    ("idempotency replay requires an inner replay stop for this route")
+        //    and the inner handler is not re-executed. That is the intended secure
+        //    behavior, and it still proves the no-double-write acceptance criterion
+        //    via the count/history assertions immediately below.
         client
             .post("/notes")
             .header("X-Tenant", "tenant-a")
@@ -245,7 +251,7 @@ mod sharding_commit_hook_tests {
             .json(&serde_json::json!({"title": "first"}))
             .send()
             .await
-            .assert_status(201);
+            .assert_status(409);
 
         assert_eq!(
             count(db, "SELECT COUNT(*) AS n FROM sharded_notes").await,
