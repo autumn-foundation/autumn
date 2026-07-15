@@ -336,16 +336,17 @@ fn live_validation_keeps_parent_display_on_index_and_show() {
     );
     // Issue #1750: the in-FORM belongs_to `<select>` is now rendered in
     // live-validation too — the FK no longer leaks out as a raw per-field text
-    // input. The per-field path emits a raw `<select>` (not a `form_for`
+    // input. The per-field path emits the `<select>` (not a `form_for`
     // `.override_field` override, which live-validation never uses) populated
-    // from the runtime option loader.
+    // from the runtime option loader. Issue #1951 routes it through the typed
+    // `a11y::Select` primitive.
     assert!(
         routes.contains("let post_id_options = post_id_select_options(&mut db).await?;"),
         "live-validation must load the belongs_to select options in the form handler:\n{routes}"
     );
     assert!(
-        routes.contains("select id=\"post_id\" name=\"post_id\""),
-        "the FK form control must be a populated <select> in live-validation:\n{routes}"
+        routes.contains("autumn_web::a11y::Select::new(\"post_id\")"),
+        "the FK form control must be a populated a11y::Select in live-validation:\n{routes}"
     );
     assert!(
         !routes.contains("required_text_input(&changeset, \"post_id\", \"Post Id\")"),
@@ -385,19 +386,27 @@ fn live_validation_renders_populated_belongs_to_select() {
         routes.contains("let post_id_options = post_id_select_options(&mut db).await?;"),
         "the options must be loaded in the form handler:\n{routes}"
     );
-    // The `<select>` is populated from those options with changeset `selected`.
+    // Issue #1951: the `<select>` is routed through the typed `a11y::Select`
+    // primitive, populated from those options with changeset-driven selection.
     assert!(
-        routes.contains("select id=\"post_id\" name=\"post_id\""),
-        "a <select> must be rendered for the belongs_to parent:\n{routes}"
+        routes.contains("autumn_web::a11y::Select::new(\"post_id\")"),
+        "an a11y::Select must be rendered for the belongs_to parent:\n{routes}"
     );
     assert!(
-        routes.contains("@for (opt_value, opt_label) in post_id_options.iter()"),
-        "the <select> options must come from the runtime loader:\n{routes}"
+        routes.contains(
+            "post_id_options.iter().map(|(opt_value, opt_label)| \
+             autumn_web::a11y::SelectOption::new(opt_value.as_str(), opt_label.as_str()))"
+        ),
+        "the <select> options must come from the runtime loader (mapped to SelectOption):\n{routes}"
     );
     assert!(
-        routes
-            .contains("changeset.field_value(\"post_id\").as_deref() == Some(opt_value.as_str())"),
+        routes.contains(".selected_value(changeset.field_value(\"post_id\").unwrap_or_default())"),
         "the selected option must be driven by the changeset value (422 re-render):\n{routes}"
+    );
+    // The placeholder is the first option on the primitive.
+    assert!(
+        routes.contains(".option(\"\", \"— Select —\")"),
+        "the belongs_to select must carry a blank placeholder option:\n{routes}"
     );
 }
 
