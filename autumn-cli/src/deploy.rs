@@ -124,7 +124,13 @@ pub struct ResolvedDeployConfig {
 /// value falls back to the deploy default `"prod"` (matching
 /// `autumn_web::config::default_deploy_profile`). Keep this in sync if the
 /// runtime rules ever change.
-fn canonicalize_deploy_profile(raw: &str) -> String {
+// `pub(crate)` (not `pub`): reachable from `doctor` so it grades the deploy
+// signing secret against the same normalized deploy profile, but kept
+// crate-internal. In this bin-only crate `deploy` is a private module, so clippy
+// flags the `pub(crate)` as redundant; we keep it to document the intended
+// visibility rather than widening to `pub`.
+#[allow(clippy::redundant_pub_crate)]
+pub(crate) fn canonicalize_deploy_profile(raw: &str) -> String {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return "prod".to_owned();
@@ -144,6 +150,26 @@ fn canonicalize_deploy_profile(raw: &str) -> String {
     }
 
     // Preserve user-specified case for custom profile names.
+    trimmed.to_owned()
+}
+
+/// Trim a deploy profile string, preserving the operator's raw spelling.
+///
+/// This is what gets stored on [`ResolvedDeployConfig::profile`] and written to
+/// `AUTUMN_ENV`, so the host's runtime override-file lookup
+/// (`autumn_web::config::profile_override_file_lookup_names`) sees the exact
+/// selector the operator wrote — e.g. `autumn-production.toml` is preferred over
+/// `autumn-prod.toml` when the raw input was `production`. Alias folding here
+/// would flip that precedence, so we deliberately do NOT fold: trims whitespace;
+/// for a blank/empty value falls back to the deploy default `"prod"` (matching
+/// `autumn_web::config::default_deploy_profile`); otherwise returns the trimmed
+/// string verbatim (no alias folding, no case change). Grading normalizes
+/// separately via [`canonicalize_deploy_profile`] at the grade site.
+fn trimmed_deploy_profile(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return "prod".to_owned();
+    }
     trimmed.to_owned()
 }
 
@@ -171,7 +197,7 @@ impl ResolvedDeployConfig {
             service_name,
             readiness_timeout_secs: cfg.readiness_timeout_secs,
             keep_releases: cfg.keep_releases,
-            profile: canonicalize_deploy_profile(&cfg.profile),
+            profile: trimmed_deploy_profile(&cfg.profile),
         }
     }
 
@@ -828,7 +854,11 @@ fn collect_preflight(
         grade_signing_secret(
             config.security.signing_secret.secret.as_deref(),
             &config.security.signing_secret.previous_secrets,
-            is_production_profile(Some(&resolved.profile)),
+            // `resolved.profile` holds the operator's trimmed RAW spelling (so the
+            // AUTUMN_ENV value preserves override-file precedence). Normalize it to
+            // the canonical profile only here, for grading, so `PROD`/`Production`/
+            // ` production ` are still held to the production strength rules.
+            is_production_profile(Some(&canonicalize_deploy_profile(&resolved.profile))),
         ),
         grade_database_url(
             resolve_writable_db_url(&config.database),
@@ -844,7 +874,11 @@ fn collect_preflight(
 /// path uses in `fail_fast_on_invalid_signing_secret`
 /// (`matches!(config.profile.as_deref(), Some("prod" | "production"))`).
 #[must_use]
-fn is_production_profile(profile: Option<&str>) -> bool {
+// `pub(crate)` (not `pub`): reachable from `doctor` for deploy-profile grading
+// but kept crate-internal. See the note on `canonicalize_deploy_profile` re: the
+// clippy allow (private module in a bin-only crate).
+#[allow(clippy::redundant_pub_crate)]
+pub(crate) fn is_production_profile(profile: Option<&str>) -> bool {
     matches!(profile, Some("prod" | "production"))
 }
 
@@ -1250,17 +1284,19 @@ mod tests {
     }
 
     #[test]
-    fn resolve_canonicalizes_non_canonical_production_profile_spellings() {
+    fn resolve_preserves_raw_profile_alias_while_grading_normalized() {
         // Regression: the app's runtime resolver
         // (`autumn_web::config::normalize_profile_name`) trims and case-folds
         // profile aliases, so `PROD`, `Production`, and ` production ` all boot
-        // under the canonical `prod`. If deploy stored the raw spelling, preflight
-        // graded it NON-production (exact/case-sensitive `is_production_profile`)
-        // and a weak secret sailed through — but `build_env_file` wrote that same
-        // raw string to `AUTUMN_ENV`, the host normalized it to `prod`, and the
-        // app rejected the weak secret at boot (fail AFTER touching the host). The
-        // fix canonicalizes the profile at resolve time so both the grade and the
-        // env-file value use one spelling.
+        // under the canonical `prod`. But the host's override-file lookup
+        // (`profile_override_file_lookup_names`) keys off the RAW selector
+        // spelling — it prefers `autumn-production.toml` over `autumn-prod.toml`
+        // when the raw input was `production`. So `resolved.profile` (and the
+        // `AUTUMN_ENV` value written from it) must preserve the operator's trimmed
+        // raw spelling, NOT the alias-folded form, or override-file precedence
+        // flips on hosts that have both files. Grading is normalized separately
+        // (canonicalize at the grade site) so a weak secret under `PROD`/
+        // `Production`/` production ` still FAILS preflight locally.
         let find_signing = |checks: &[PreflightCheck]| {
             checks
                 .iter()
@@ -1272,9 +1308,14 @@ mod tests {
         let mut config = AutumnConfig::default();
         config.security.signing_secret.secret = Some("changeme".to_owned());
 
-        // Non-canonical production spellings must canonicalize to `prod`, be
-        // graded as production, and thus FAIL the weak secret locally.
-        for raw in ["PROD", "Production", " production "] {
+        // Non-canonical production spellings preserve the operator's trimmed raw
+        // spelling in `resolved.profile` / AUTUMN_ENV, yet still grade as
+        // production (canonicalize-at-grade) and thus FAIL the weak secret.
+        for (raw, expected) in [
+            ("PROD", "PROD"),
+            ("Production", "Production"),
+            (" production ", "production"),
+        ] {
             let resolved = ResolvedDeployConfig::resolve(
                 &DeployConfig {
                     profile: raw.to_owned(),
@@ -1283,20 +1324,23 @@ mod tests {
                 "myapp",
             );
             assert_eq!(
-                resolved.profile, "prod",
-                "profile {raw:?} should canonicalize to `prod`"
+                resolved.profile, expected,
+                "profile {raw:?} should preserve the trimmed raw spelling"
             );
-            // The value written to AUTUMN_ENV is the same canonical profile.
+            // The value written to AUTUMN_ENV is that same trimmed raw spelling,
+            // so the host's override-file precedence is preserved.
+            let expected_env = format!("AUTUMN_ENV={expected}");
             assert!(
                 build_env_file(&config, &resolved)
                     .expose()
                     .lines()
-                    .any(|l| l == "AUTUMN_ENV=prod"),
-                "env file should pin AUTUMN_ENV=prod for raw profile {raw:?}"
+                    .any(|l| l == expected_env),
+                "env file should pin {expected_env:?} for raw profile {raw:?}"
             );
+            // Grading normalizes the raw spelling, so it still grades production.
             assert!(
-                is_production_profile(Some(&resolved.profile)),
-                "canonical `prod` must grade as production for raw profile {raw:?}"
+                is_production_profile(Some(&canonicalize_deploy_profile(&resolved.profile))),
+                "normalized profile must grade as production for raw profile {raw:?}"
             );
             let check = find_signing(&collect_preflight(&config, &resolved));
             assert!(
