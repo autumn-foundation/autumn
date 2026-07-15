@@ -135,6 +135,14 @@ AUTUMN_DATABASE__URL=postgres://user:pass@db-host:5432/myapp_prod
 > deploy; provision such secrets out of band on the host (or via the systemd
 > unit environment) and re-apply them after each deploy.
 
+> **Known gap:** Values set only under `[profile.prod]` or `.env.prod` aren't yet
+> used by `autumn deploy` — it currently reads the database URL and signing secret
+> from config resolved under your ambient profile while running the service as
+> `prod`. A follow-up will resolve the deploy config under the target profile;
+> until then, make sure the values you want deployed are visible to the profile you
+> run `autumn deploy` from (e.g. export `AUTUMN_ENV=prod` or keep them in the base
+> config).
+
 > **`autumn deploy` runs the app under the production profile by default.** The
 > deploy writes `AUTUMN_ENV=prod` into the host env file, so the deployed app
 > boots under the `prod` profile and its production smart-defaults apply — strict
