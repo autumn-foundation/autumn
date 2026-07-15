@@ -348,6 +348,13 @@ path = "tests/actuator_live_logger_reload.rs"
 name = "db_hooks_lifecycle"
 path = "tests/db_hooks_lifecycle.rs"
 
+# #1911: field-level `#[state_machine(lifecycle = Enum)]` ≡ inline equivalence.
+# Pure in-memory unit tests over the generated validation logic — no DB
+# connection, runs without Docker. Isolated so it is cheap to compile/run alone.
+[[test]]
+name = "state_machine_lifecycle"
+path = "tests/state_machine_lifecycle.rs"
+
 [[test]]
 name = "repository_shard_replica_routing"
 path = "tests/repository_shard_replica_routing.rs"

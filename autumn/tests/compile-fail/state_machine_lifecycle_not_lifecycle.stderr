@@ -1,0 +1,11 @@
+error[E0277]: the trait bound `NotALifecycle: Lifecycle` is not satisfied
+  --> tests/compile-fail/state_machine_lifecycle_not_lifecycle.rs:27:33
+   |
+27 |     #[state_machine(lifecycle = NotALifecycle)]
+   |                                 ^^^^^^^^^^^^^ unsatisfied trait bound
+   |
+help: the trait `Lifecycle` is not implemented for `NotALifecycle`
+  --> tests/compile-fail/state_machine_lifecycle_not_lifecycle.rs:11:1
+   |
+11 | pub enum NotALifecycle {
+   | ^^^^^^^^^^^^^^^^^^^^^^

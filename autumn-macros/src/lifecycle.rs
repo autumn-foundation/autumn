@@ -318,6 +318,17 @@ fn build_metadata(item_enum: &ItemEnum, args: &LifecycleArgs, variants: &[&Ident
         })
         .collect::<Vec<_>>();
 
+    // String-keyed transition table for `#[state_machine(lifecycle = ...)]`
+    // derivation (issue #1911). Each edge is `(from_name, to_name, None)` — the
+    // variant names as strings (matching the model's `String` column value),
+    // with an always-`None` guard slot since lifecycle transitions are
+    // unguarded. Shape mirrors the field-level inline table exactly.
+    let transition_name_triples = args.transitions.iter().map(|tr| {
+        let from = variant_name_str(&tr.from);
+        let to = variant_name_str(&tr.to);
+        quote!((#from, #to, ::core::option::Option::None))
+    });
+
     let match_arms = args.transitions.iter().map(|tr| {
         let from = &tr.from;
         let to = &tr.to;
@@ -345,7 +356,25 @@ fn build_metadata(item_enum: &ItemEnum, args: &LifecycleArgs, variants: &[&Ident
                 }
             }
         }
+
+        impl ::autumn_web::Lifecycle for #enum_ident {
+            const STATE_MACHINE_TRANSITIONS: &'static [(
+                &'static str,
+                &'static str,
+                ::core::option::Option<&'static str>,
+            )] = &[
+                #(#transition_name_triples),*
+            ];
+        }
     }
+}
+
+/// Render a variant ident as the string used in the derived state-machine
+/// table (raw-identifier `r#` prefix stripped), matching the typestate
+/// module's `State::NAME`.
+fn variant_name_str(ident: &Ident) -> String {
+    let name = ident.to_string();
+    name.strip_prefix("r#").unwrap_or(&name).to_string()
 }
 
 /// Build the typestate transition module named after the enum in `snake_case`.
@@ -512,6 +541,47 @@ mod tests {
             out.contains(
                 "& [ArticleState :: Draft , ArticleState :: Published , ArticleState :: Archived]"
             ),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn emits_lifecycle_trait_impl_with_string_transition_table() {
+        let out = expand_ok(sample_attr(), sample_enum());
+        // Implements the marker trait used by `#[state_machine(lifecycle = ...)]`.
+        assert!(
+            out.contains("impl :: autumn_web :: Lifecycle for ArticleState"),
+            "{out}"
+        );
+        assert!(out.contains("const STATE_MACHINE_TRANSITIONS"), "{out}");
+        // Edges rendered as (from_name, to_name, None) string triples.
+        assert!(
+            out.contains("(\"Draft\" , \"Published\" , :: core :: option :: Option :: None)"),
+            "{out}"
+        );
+        assert!(
+            out.contains("(\"Published\" , \"Archived\" , :: core :: option :: Option :: None)"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn lifecycle_transition_table_strips_raw_identifier_prefix() {
+        let item = quote! {
+            pub enum KindState {
+                Draft,
+                r#type,
+            }
+        };
+        let attr = quote! {
+            initial = Draft,
+            terminal(r#type),
+            transitions(Draft -> r#type)
+        };
+        let out = expand_ok(attr, item);
+        // The stored string uses the bare `type`, not `r#type`.
+        assert!(
+            out.contains("(\"Draft\" , \"type\" , :: core :: option :: Option :: None)"),
             "{out}"
         );
     }

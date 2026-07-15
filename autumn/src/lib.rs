@@ -1268,6 +1268,37 @@ pub use autumn_macros::static_get;
 /// ```
 pub use autumn_macros::lifecycle;
 
+/// Marker trait implemented by every `#[lifecycle]` enum, exposing that
+/// lifecycle's transition edges as a string-keyed table.
+///
+/// This is the bridge that lets a field-level `#[state_machine(lifecycle = X)]`
+/// on a `#[model]` derive its runtime transitions table from a `#[lifecycle]`
+/// enum `X` instead of an inline `transitions(...)` list — "transitions defined
+/// once, typed" (issue #1911). The `#[lifecycle]` macro is the *only* thing that
+/// implements this trait; referencing a type that is not a `#[lifecycle]` enum in
+/// `#[state_machine(lifecycle = ...)]` therefore fails to compile with an
+/// unsatisfied `T: Lifecycle` trait bound rather than a cryptic
+/// "no associated const" error.
+///
+/// [`STATE_MACHINE_TRANSITIONS`](Lifecycle::STATE_MACHINE_TRANSITIONS) has the
+/// exact `(from, to, guard)` shape the field-level `#[state_machine]` inline
+/// table uses, so a lifecycle-derived state machine is byte-for-byte the same
+/// runtime construct as the equivalent inline one. Lifecycle transitions carry
+/// no guards, so every `guard` slot is `None` (see the `#[state_machine]` docs
+/// for the guards rationale).
+pub trait Lifecycle {
+    /// This lifecycle's declared transition edges as
+    /// `(from_variant_name, to_variant_name, guard)` triples, where the variant
+    /// names are the enum variants rendered as strings (matching the value
+    /// stored in the model's `String` column). The `guard` slot is always
+    /// `None` — lifecycle transitions are unguarded.
+    const STATE_MACHINE_TRANSITIONS: &'static [(
+        &'static str,
+        &'static str,
+        ::core::option::Option<&'static str>,
+    )];
+}
+
 // ── Maud re-exports ────────────────────────────────────────────────
 
 /// Rendered HTML fragment produced by the [`html!`] macro.
