@@ -132,6 +132,24 @@ AUTUMN_DATABASE__URL=postgres://user:pass@db-host:5432/myapp_prod
 > `app_dir/shared/autumn.env` on the server, or add it to the systemd unit
 > environment.
 
+> **Your `autumn.toml` is not deployed — non-secret settings fall back to
+> defaults on the host.** `autumn deploy up` uploads the release binary and
+> writes the host env file, but it does **not** copy your project's
+> `autumn.toml`. The systemd unit runs the binary with its working directory set
+> to the release dir (which holds only the binary), so at startup the app finds
+> no `autumn.toml` and every non-secret runtime setting — auth, the jobs and
+> scheduler backends, health/telemetry paths, CORS, signing-secret rotation
+> (`security.signing_secret.previous_secrets`), and so on — resolves to its
+> **default**, regardless of what you configured and tested locally. Only the two
+> values in the host env file (`AUTUMN_SECURITY__SIGNING_SECRET` and, for
+> database-backed apps, `AUTUMN_DATABASE__URL`) make the trip. To run the
+> configuration you actually tested, provision it on the host yourself: place
+> your `autumn.toml` in the release/app dir on the server, or set the matching
+> `AUTUMN_*` environment overrides in `app_dir/shared/autumn.env` (the env-file
+> route persists across releases; a file dropped into a timestamped release dir
+> does not). Otherwise the deployed app can run a different configuration than the
+> one you tested locally.
+
 Generate the signing secret once and store it somewhere durable:
 
 ```bash
@@ -220,6 +238,16 @@ the proxy back to it (health-gated on `/ready`), repoints `current`, and
 re-probes `/ready`. It fails loudly and non-zero when there is no previous
 release to return to.
 
+> **Rollback runs the same local preflight as `deploy up` first.** Before it
+> makes any remote call — before it even resolves the previous release on the
+> host — `autumn deploy rollback` runs the identical local preflight graders
+> (signing secret, database URL, migrate-safety) and aborts non-zero if any fail.
+> So it needs the same local inputs as a deploy — your project's `.env`/signing
+> secret and database URL, and the `migrations/` dir — available **wherever you
+> invoke it**: an emergency rollback from a bare CI checkout or a machine without
+> the project's secrets fails preflight before it ever reaches the host. Keep the
+> deploy inputs available where you would run a rollback.
+
 ### Inspect the plan without touching the server
 
 ```bash
@@ -274,6 +302,16 @@ or error messages.
   `autumn deploy` serializes just `AUTUMN_SECURITY__SIGNING_SECRET` and (for
   database-backed apps) `AUTUMN_DATABASE__URL`; any other runtime secret
   (OAuth/SMTP/Redis/storage/etc.) must be provisioned on the target separately.
+- **Your project's `autumn.toml` is not deployed.** `autumn deploy up` uploads
+  the release binary and writes the host env file (signing secret + database
+  URL) but does not copy `autumn.toml`, and the app runs from the release dir
+  where none is present — so every non-secret runtime setting (auth, jobs and
+  scheduler backends, health/telemetry paths, CORS, signing-secret rotation
+  `previous_secrets`, etc.) resolves to its **default** on the server. Provision
+  it separately if you need it: place `autumn.toml` in the release/app dir on the
+  host, or set the matching `AUTUMN_*` overrides in `app_dir/shared/autumn.env`.
+  Otherwise the deployed app can run a different configuration than the one you
+  tested locally.
 - **Migrations run on redeploys, not on the very first deploy.** The pre-cutover
   migration one-shot is part of the zero-downtime redeploy path; the initial
   `deploy up` stands the release up and health-gates it. For a database-backed
