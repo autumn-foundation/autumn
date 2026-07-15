@@ -396,8 +396,10 @@ pub fn try_build_probe_only_router(
     state: AppState,
 ) -> Result<axum::Router, RouterBuildError> {
     let barrier_state = state.clone();
+    // A worker replica serves no user routes, so nothing can shadow a probe.
+    let no_user_routes = std::collections::HashSet::new();
     let (mounted_probe_paths, router) =
-        mount_probe_endpoints(axum::Router::<AppState>::new(), config);
+        mount_probe_endpoints(axum::Router::<AppState>::new(), config, &no_user_routes);
     let router = mount_actuator_endpoints(router, config, &mounted_probe_paths)?;
     let router = router.with_state(state);
     Ok(apply_startup_barrier(router, config, &barrier_state))
@@ -564,6 +566,11 @@ fn build_router_pre_state(
         custom_layers_require_fail_closed_idempotency(&ctx.custom_layers)
             || custom_layers_require_fail_closed_idempotency(&ctx.static_gate_layers)
     });
+    // Capture the paths a user handler already owns BEFORE `route_list` is
+    // consumed below, so the auto-mounted probes can yield to a user route at
+    // the same path instead of panicking on an overlapping `GET` (issue #1971).
+    let user_get_paths = collect_user_get_paths(&route_list, &ctx.scoped_groups);
+
     let mut router = group_and_mount_routes(
         route_list,
         idempotency_layers.as_ref(),
@@ -575,7 +582,8 @@ fn build_router_pre_state(
 
     router = mount_framework_routes(router, config, dev_reload_enabled);
 
-    let (mounted_probe_paths, router_with_probes) = mount_probe_endpoints(router, config);
+    let (mounted_probe_paths, router_with_probes) =
+        mount_probe_endpoints(router, config, &user_get_paths);
     router = router_with_probes;
 
     router = mount_actuator_endpoints(router, config, &mounted_probe_paths)?;
@@ -1151,6 +1159,40 @@ fn validate_route_path(field: &'static str, value: &str) -> Result<(), RouterBui
         return reject("(OpenAPI mount paths must be static; `{…}` captures are not allowed)");
     }
     Ok(())
+}
+
+/// Collect the exact `GET`/`WS` paths owned by the user's *typed* route table
+/// (top-level routes plus scoped-group routes, after scope-prefix resolution).
+///
+/// Unlike [`collect_claimed_get_paths`], this deliberately excludes every
+/// framework-mounted path: its sole purpose is to let the auto-mounted probe
+/// endpoints ([`mount_probe_endpoints`]) detect when a *user* handler already
+/// owns a probe path and yield to it, rather than panicking inside
+/// `axum::Router::route` on an overlapping `GET` (issue #1971). A `WS` route is
+/// a `GET` under the hood, so it claims the path too (mirroring
+/// [`collect_claimed_get_paths`]). Opaque routers registered via
+/// [`AppBuilder::merge`](crate::app::AppBuilder::merge) /
+/// [`AppBuilder::nest`](crate::app::AppBuilder::nest) are not introspectable
+/// and so are not covered here — the same limitation the OpenAPI/MCP collision
+/// preflights carry.
+fn collect_user_get_paths(
+    route_list: &[Route],
+    scoped_groups: &[ScopedGroup],
+) -> std::collections::HashSet<String> {
+    let mut owned: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for route in route_list {
+        if route.method == http::Method::GET || route.method.as_str() == "WS" {
+            owned.insert(route.path.to_owned());
+        }
+    }
+    for group in scoped_groups {
+        for route in &group.routes {
+            if route.method == http::Method::GET || route.method.as_str() == "WS" {
+                owned.insert(join_nested_path(&group.prefix, route.path));
+            }
+        }
+    }
+    owned
 }
 
 /// Gather every path that a `GET` (or `WS`, which mounts as a `GET`) handler
@@ -1942,38 +1984,64 @@ fn mount_framework_routes(
 fn mount_probe_endpoints<S>(
     mut router: axum::Router<S>,
     config: &AutumnConfig,
+    user_get_paths: &std::collections::HashSet<String>,
 ) -> (std::collections::HashSet<String>, axum::Router<S>)
 where
     S: Clone + Send + Sync + 'static,
     AppState: axum::extract::FromRef<S>,
 {
-    // Probe endpoints (auto-mounted)
+    // Probe endpoints (auto-mounted). Each probe is a `GET`; when a user route
+    // already owns that exact path, yield to the user handler instead of
+    // handing axum a second `GET` for the same path — which panics at startup
+    // with a raw "Overlapping method route" message that names none of the
+    // user's code (issue #1971). A user who hand-writes `GET /health` clearly
+    // wants their handler, so the built-in steps aside and logs the override.
     let mut mounted_probe_paths = std::collections::HashSet::new();
 
-    if mounted_probe_paths.insert(config.health.live_path.clone()) {
-        router = router.route(
-            &config.health.live_path,
-            axum::routing::get(crate::probe::live_handler::<AppState>),
-        );
-    }
-    if mounted_probe_paths.insert(config.health.ready_path.clone()) {
-        router = router.route(
-            &config.health.ready_path,
-            axum::routing::get(crate::probe::ready_handler::<AppState>),
-        );
-    }
-    if mounted_probe_paths.insert(config.health.startup_path.clone()) {
-        router = router.route(
-            &config.health.startup_path,
-            axum::routing::get(crate::probe::startup_handler::<AppState>),
-        );
-    }
-    if mounted_probe_paths.insert(config.health.path.clone()) {
-        router = router.route(
-            &config.health.path,
-            axum::routing::get(crate::health::handler::<AppState>),
-        );
-    }
+    let mut mount_probe = |mut router: axum::Router<S>,
+                           path: &str,
+                           label: &'static str,
+                           handler: axum::routing::MethodRouter<S>|
+     -> axum::Router<S> {
+        if user_get_paths.contains(path) {
+            tracing::info!(
+                probe = label,
+                path,
+                "a user route already owns this path; the built-in probe was \
+                 not auto-mounted (the user handler wins)"
+            );
+            return router;
+        }
+        if mounted_probe_paths.insert(path.to_owned()) {
+            router = router.route(path, handler);
+        }
+        router
+    };
+
+    router = mount_probe(
+        router,
+        &config.health.live_path,
+        "liveness",
+        axum::routing::get(crate::probe::live_handler::<AppState>),
+    );
+    router = mount_probe(
+        router,
+        &config.health.ready_path,
+        "readiness",
+        axum::routing::get(crate::probe::ready_handler::<AppState>),
+    );
+    router = mount_probe(
+        router,
+        &config.health.startup_path,
+        "startup",
+        axum::routing::get(crate::probe::startup_handler::<AppState>),
+    );
+    router = mount_probe(
+        router,
+        &config.health.path,
+        "health",
+        axum::routing::get(crate::health::handler::<AppState>),
+    );
     tracing::debug!(
         health = %config.health.path,
         live = %config.health.live_path,
@@ -4457,6 +4525,81 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// Issue #1971: a user route registered at the auto-mounted health path
+    /// must WIN. The router build succeeds — no raw axum "Overlapping method
+    /// route. Handler for GET /health already exists" panic — the user's own
+    /// handler serves `/health`, and the remaining built-in probes (`/live`,
+    /// `/ready`, `/startup`) still mount and respond.
+    #[tokio::test]
+    async fn user_route_at_health_path_overrides_builtin_probe() {
+        async fn user_health() -> &'static str {
+            "user-health-handler"
+        }
+
+        let config = AutumnConfig::default();
+        // Precondition: the default health alias is exactly the path we shadow.
+        assert_eq!(config.health.path, "/health");
+
+        let route = Route {
+            method: http::Method::GET,
+            path: "/health",
+            handler: axum::routing::get(user_health),
+            name: "user_health",
+            api_doc: crate::openapi::ApiDoc {
+                method: "GET",
+                path: "/health",
+                operation_id: "user_health",
+                success_status: 200,
+                ..Default::default()
+            },
+            repository: None,
+            idempotency: crate::route::RouteIdempotency::Direct,
+            timeout: crate::route::RouteTimeout::Inherit,
+            api_version: None,
+            sunset_opt_out: false,
+        };
+
+        // Before the fix this panicked inside `axum::Router::route`; now it
+        // builds cleanly (`build_router` panics on any RouterBuildError, so a
+        // successful return also proves no structured error is raised).
+        let app = build_router(vec![route], &config, test_state());
+
+        // `/health` is served by the USER handler, not the framework probe.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            &body[..],
+            b"user-health-handler",
+            "user route must win at the health path"
+        );
+
+        // The other built-in probes are untouched and still respond.
+        for path in ["/live", "/ready", "/startup"] {
+            let resp = app
+                .clone()
+                .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_ne!(
+                resp.status(),
+                StatusCode::NOT_FOUND,
+                "built-in probe {path} should still be mounted"
+            );
+        }
     }
 
     /// The framework-owned widget stylesheet (#1215) is served the same way
