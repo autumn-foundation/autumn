@@ -122,7 +122,7 @@ async fn redis_backend_persists_tracked_job_and_expires_it() {
 async fn postgres_backend_persists_tracked_job_and_expires_it() {
     use diesel_async::pooled_connection::AsyncDieselConnectionManager;
     use diesel_async::pooled_connection::deadpool::Pool;
-    use diesel_async::{AsyncPgConnection, RunQueryDsl};
+    use diesel_async::{AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
     use testcontainers::runners::AsyncRunner;
     use testcontainers_modules::postgres::Postgres;
 
@@ -163,14 +163,17 @@ async fn postgres_backend_persists_tracked_job_and_expires_it() {
 
     {
         let mut conn = pool.get().await.expect("get connection");
-        diesel::sql_query(CREATE_AUTUMN_JOBS)
-            .execute(&mut *conn)
+        // Apply the migration `up.sql` scripts through the simple-query
+        // protocol (`batch_execute`), matching the production migration runner:
+        // these files contain multiple statements, which the prepared/extended
+        // query path (`sql_query(..).execute(..)`) rejects with "cannot insert
+        // multiple commands into a prepared statement".
+        conn.batch_execute(CREATE_AUTUMN_JOBS)
             .await
             .expect("apply create_job_queue migration");
         // Proves the migration in this PR actually creates the table the
         // store depends on — not just that hand-written SQL happens to work.
-        diesel::sql_query(CREATE_JOB_TRACKING)
-            .execute(&mut *conn)
+        conn.batch_execute(CREATE_JOB_TRACKING)
             .await
             .expect("apply create_job_tracking migration");
     }
