@@ -95,8 +95,9 @@ Every key also has an environment override (`AUTUMN_DEPLOY__HOST`,
 `AUTUMN_DEPLOY__USER`, `AUTUMN_DEPLOY__SSH_PORT`, …) if you prefer to keep the
 host out of the file.
 
-Put your secrets in a project `.env` (git-ignored — never committed). They are
-read by the deploy and written to a `0600` env file **on the server only**:
+Put these two values in a project `.env` (git-ignored — never committed). The
+deploy reads them and writes **only** them to a `0600` env file
+(`app_dir/shared/autumn.env`) **on the server**:
 
 ```bash
 # .env
@@ -104,6 +105,16 @@ AUTUMN_SECURITY__SIGNING_SECRET=<paste `openssl rand -hex 32` here>
 # Only if your app is database-backed:
 AUTUMN_DATABASE__URL=postgres://user:pass@db-host:5432/myapp_prod
 ```
+
+> **Only the signing secret and the database URL are deployed.** `autumn deploy`
+> serializes exactly two variables to the host env file:
+> `AUTUMN_SECURITY__SIGNING_SECRET` and — for database-backed apps —
+> `AUTUMN_DATABASE__URL`. **Any other runtime secret** (OAuth client secrets,
+> SMTP credentials, a Redis URL, object-storage keys, etc.) placed in `.env` is
+> **not** transferred to the server, so those features fail in production unless
+> you provision the secret on the target host yourself — append it to
+> `app_dir/shared/autumn.env` on the server, or add it to the systemd unit
+> environment.
 
 Generate the signing secret once and store it somewhere durable:
 
@@ -227,6 +238,10 @@ or error messages.
   `/usr/local/bin/kamal-proxy`) before the first deploy. `autumn deploy up`
   configures and supervises the proxy but does not download its binary —
   provision it as part of host bootstrap.
+- **Only the signing secret and database URL are written to the host env file.**
+  `autumn deploy` serializes just `AUTUMN_SECURITY__SIGNING_SECRET` and (for
+  database-backed apps) `AUTUMN_DATABASE__URL`; any other runtime secret
+  (OAuth/SMTP/Redis/storage/etc.) must be provisioned on the target separately.
 - **Migrations run on redeploys, not on the very first deploy.** The pre-cutover
   migration one-shot is part of the zero-downtime redeploy path; the initial
   `deploy up` stands the release up and health-gates it. For a database-backed
