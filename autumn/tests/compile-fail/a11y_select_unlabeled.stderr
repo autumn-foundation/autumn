@@ -1,0 +1,5 @@
+error[E0599]: no method named `render` found for struct `autumn_web::a11y::Select<State>` in the current scope
+  --> tests/compile-fail/a11y_select_unlabeled.rs:10:64
+   |
+10 |     let _markup = Select::new("role").option("admin", "Admin").render();
+   |                                                                ^^^^^^ method not found in `autumn_web::a11y::Select<NoLabel>`

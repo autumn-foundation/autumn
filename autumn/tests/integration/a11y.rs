@@ -8,7 +8,9 @@
 //!
 #![cfg(feature = "maud")]
 
-use autumn_web::a11y::{Button, Img, Link, MenuItem, TextField};
+use autumn_web::a11y::{
+    Button, Checkbox, FileField, Img, Link, MenuItem, Select, SelectOption, TextArea, TextField,
+};
 use autumn_web::html;
 use maud::Render;
 
@@ -178,6 +180,222 @@ fn icon_menu_item_uses_aria_label() {
     let markup = MenuItem::new("Settings").icon(cog).render().into_string();
     assert!(markup.contains("role=\"menuitem\""), "{markup}");
     assert!(markup.contains("aria-label=\"Settings\""), "{markup}");
+}
+
+#[test]
+fn text_area_carries_value_as_text_content_not_attribute() {
+    let markup = TextArea::new("bio")
+        .value("Hello world")
+        .rows(6)
+        .cols(40)
+        .maxlength(500)
+        .label("Bio")
+        .render()
+        .into_string();
+    assert!(
+        markup.contains("<label for=\"bio\">Bio</label>"),
+        "{markup}"
+    );
+    // The value rides as the element's text content, never a `value=` attribute.
+    assert!(
+        markup.contains("<textarea") && markup.contains(">Hello world</textarea>"),
+        "{markup}"
+    );
+    assert!(
+        !markup.contains("value="),
+        "value must not be an attribute: {markup}"
+    );
+    assert!(markup.contains("rows=\"6\""), "{markup}");
+    assert!(markup.contains("cols=\"40\""), "{markup}");
+    assert!(markup.contains("maxlength=\"500\""), "{markup}");
+}
+
+#[test]
+fn text_area_aria_label_variant() {
+    let markup = TextArea::new("note")
+        .aria_label("Note")
+        .render()
+        .into_string();
+    assert!(markup.contains("aria-label=\"Note\""), "{markup}");
+    assert!(!markup.contains("<label"), "{markup}");
+}
+
+#[test]
+fn select_renders_each_option_with_value_label_and_selected() {
+    let markup = Select::new("role")
+        .option("", "— Select —")
+        .options([
+            SelectOption::new("admin", "Admin"),
+            SelectOption::new("user", "User"),
+        ])
+        .selected_value("user")
+        .required()
+        .aria_required()
+        .label("Role")
+        .render()
+        .into_string();
+    assert!(
+        markup.contains("<label for=\"role\">Role</label>"),
+        "{markup}"
+    );
+    assert!(markup.contains("<select"), "{markup}");
+    assert!(markup.contains("id=\"role\""), "{markup}");
+    assert!(markup.contains("aria-required=\"true\""), "{markup}");
+    assert!(markup.contains("required"), "{markup}");
+    // Each option carries its value + visible label.
+    assert!(markup.contains("value=\"admin\""), "{markup}");
+    assert!(markup.contains(">Admin<"), "{markup}");
+    assert!(markup.contains("value=\"user\""), "{markup}");
+    assert!(markup.contains(">User<"), "{markup}");
+    // The matching option (and only it) is selected.
+    assert!(
+        markup.contains("value=\"user\" selected"),
+        "user option must be selected: {markup}"
+    );
+    assert!(
+        !markup.contains("value=\"admin\" selected"),
+        "admin option must not be selected: {markup}"
+    );
+}
+
+#[test]
+fn select_placeholder_option_can_be_disabled() {
+    let markup = Select::new("role")
+        .options([SelectOption::new("", "— Select —").disabled()])
+        .labelled_by("role-heading")
+        .render()
+        .into_string();
+    assert!(
+        markup.contains("aria-labelledby=\"role-heading\""),
+        "{markup}"
+    );
+    assert!(markup.contains("disabled"), "{markup}");
+}
+
+#[test]
+fn checkbox_renders_type_checked_and_label_association() {
+    let markup = Checkbox::new("accept_terms")
+        .value("true")
+        .checked(true)
+        .required()
+        .label("I accept the terms")
+        .render()
+        .into_string();
+    assert!(markup.contains("type=\"checkbox\""), "{markup}");
+    assert!(markup.contains("id=\"accept_terms\""), "{markup}");
+    assert!(markup.contains("value=\"true\""), "{markup}");
+    assert!(markup.contains("checked"), "{markup}");
+    assert!(markup.contains("required"), "{markup}");
+    // The `<label for>` associates with the input by id.
+    assert!(
+        markup.contains("<label for=\"accept_terms\">I accept the terms</label>"),
+        "{markup}"
+    );
+    // Layout: input precedes the label for a checkbox.
+    let input_pos = markup.find("<input").expect("input present");
+    let label_pos = markup.find("<label").expect("label present");
+    assert!(input_pos < label_pos, "input must precede label: {markup}");
+}
+
+#[test]
+fn checkbox_unchecked_by_default() {
+    let markup = Checkbox::new("subscribe")
+        .aria_label("Subscribe")
+        .render()
+        .into_string();
+    assert!(markup.contains("type=\"checkbox\""), "{markup}");
+    assert!(!markup.contains("checked"), "{markup}");
+    assert!(markup.contains("aria-label=\"Subscribe\""), "{markup}");
+}
+
+#[test]
+fn file_field_renders_type_accept_and_multiple() {
+    let markup = FileField::new("docs")
+        .accept("application/pdf")
+        .multiple()
+        .aria_label("Documents")
+        .render()
+        .into_string();
+    assert!(markup.contains("type=\"file\""), "{markup}");
+    assert!(markup.contains("accept=\"application/pdf\""), "{markup}");
+    assert!(markup.contains("multiple"), "{markup}");
+    assert!(markup.contains("aria-label=\"Documents\""), "{markup}");
+}
+
+#[test]
+fn visible_labeled_file_field_emits_no_competing_aria_label() {
+    // The key #1933 fix: a caller's visible `<label for>` is the accessible name,
+    // so the field emits NO derived `aria-label` to override it (the precedence
+    // caveat of `direct_upload_input`).
+    let markup = FileField::new("avatar")
+        .accept("image/*")
+        .label("Avatar")
+        .render()
+        .into_string();
+    assert!(
+        markup.contains("<label for=\"avatar\">Avatar</label>"),
+        "{markup}"
+    );
+    assert!(markup.contains("type=\"file\""), "{markup}");
+    assert!(
+        !markup.contains("aria-label"),
+        "a visible-labeled file field must not emit a competing aria-label: {markup}"
+    );
+}
+
+#[test]
+fn hx_escape_hatch_renders_attributes_in_order() {
+    let markup = TextField::new("username")
+        .hx("post", "/x")
+        .hx("params", "not _submit_token")
+        .label("Username")
+        .render()
+        .into_string();
+    assert!(markup.contains("hx-post=\"/x\""), "{markup}");
+    assert!(
+        markup.contains("hx-params=\"not _submit_token\""),
+        "{markup}"
+    );
+    // Insertion order is preserved.
+    let post_pos = markup.find("hx-post").expect("hx-post present");
+    let params_pos = markup.find("hx-params").expect("hx-params present");
+    assert!(
+        post_pos < params_pos,
+        "hx order must be preserved: {markup}"
+    );
+}
+
+#[test]
+fn hx_escape_hatch_is_a_noop_when_empty() {
+    // An empty hx set must render byte-identically to no escape hatch at all.
+    let with_hx = TextField::new("email")
+        .label("Email")
+        .render()
+        .into_string();
+    let plain = TextField::new("email")
+        .label("Email")
+        .render()
+        .into_string();
+    assert_eq!(with_hx, plain, "empty hx must not change output");
+    assert!(!with_hx.contains("hx-"), "{with_hx}");
+}
+
+#[test]
+fn hx_escape_hatch_escapes_attribute_values() {
+    let markup = Select::new("q")
+        .option("a", "A")
+        .hx("vals", "{\"x\": \"<b>&\"}")
+        .aria_label("Query")
+        .render()
+        .into_string();
+    // The value is HTML-attribute-escaped, never injected raw.
+    assert!(markup.contains("hx-vals="), "{markup}");
+    assert!(markup.contains("&lt;b&gt;"), "{markup}");
+    assert!(markup.contains("&amp;"), "{markup}");
+    assert!(
+        !markup.contains("<b>&\""),
+        "raw value must not leak: {markup}"
+    );
 }
 
 #[test]

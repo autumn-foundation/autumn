@@ -1,0 +1,5 @@
+error[E0599]: no method named `render` found for struct `TextArea<State>` in the current scope
+  --> tests/compile-fail/a11y_textarea_unlabeled.rs:10:40
+   |
+10 |     let _markup = TextArea::new("bio").render();
+   |                                        ^^^^^^ method not found in `TextArea<NoLabel>`

@@ -77,6 +77,17 @@ fn compile_fail_tests() {
     t.compile_fail("tests/compile-fail/a11y_link_missing_text.rs");
     #[cfg(feature = "maud")]
     t.compile_fail("tests/compile-fail/a11y_menuitem_missing_name.rs");
+    // The multi-line / dropdown / boolean / file-input form primitives carry the
+    // same type-level label obligation as `TextField`: an unlabeled one has no
+    // `.render()` and does not build.
+    #[cfg(feature = "maud")]
+    t.compile_fail("tests/compile-fail/a11y_textarea_unlabeled.rs");
+    #[cfg(feature = "maud")]
+    t.compile_fail("tests/compile-fail/a11y_select_unlabeled.rs");
+    #[cfg(feature = "maud")]
+    t.compile_fail("tests/compile-fail/a11y_checkbox_unlabeled.rs");
+    #[cfg(feature = "maud")]
+    t.compile_fail("tests/compile-fail/a11y_filefield_unlabeled.rs");
 }
 
 #[test]
