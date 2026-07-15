@@ -355,6 +355,14 @@ harness = false
 name = "integration_tests"
 path = "tests/integration_tests.rs"
 
+# SQLite runtime-lane boot+serve proof (issue #1614, PR2). Only meaningful under
+# `--features sqlite`; the file is `#![cfg(feature = "sqlite")]` so a default
+# `cargo test` compiles it to an empty (passing) binary. Run explicitly:
+# `cargo test -p autumn-web --features sqlite --test sqlite_boot_serve`.
+[[test]]
+name = "sqlite_boot_serve"
+path = "tests/sqlite_boot_serve.rs"
+
 # Isolated: sets process-wide proxy env vars (HTTP_PROXY/HTTPS_PROXY/ALL_PROXY)
 # to verify pinned SSRF-safe clients bypass env proxies. Cannot share the
 # consolidated binary — those vars would race the inline network tests.

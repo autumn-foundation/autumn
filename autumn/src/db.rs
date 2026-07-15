@@ -3286,11 +3286,15 @@ mod tests {
         assert!(pool.is_some());
     }
 
+    // In the default (Postgres) build a SQLite target has no runtime pool, so
+    // pool construction must refuse at boot with an actionable message pointing
+    // at the `--features sqlite` build — never reaching a first-query failure or
+    // panic. Under `--features sqlite` the same target instead builds a real
+    // pool (see the `sqlite_boot_serve` integration test), so this refusal
+    // contract only applies to the default build.
+    #[cfg(not(feature = "sqlite"))]
     #[test]
     fn create_pool_with_sqlite_url_fails_fast() {
-        // SQLite is a recognized target (issue #1614) but its runtime pool is
-        // not wired yet, so pool construction must refuse at boot with an
-        // actionable message — never reaching a first-query failure or panic.
         let config = DatabaseConfig {
             url: Some("sqlite:///var/lib/app.db".into()),
             ..Default::default()
@@ -3306,11 +3310,12 @@ mod tests {
         );
         let msg = err.to_string();
         assert!(
-            msg.contains("SQLite") && msg.contains("1905"),
-            "message must be actionable and point at the runtime tracking issue, got: {msg}"
+            msg.contains("SQLite") && msg.contains("--features sqlite"),
+            "message must be actionable and name the sqlite build, got: {msg}"
         );
     }
 
+    #[cfg(not(feature = "sqlite"))]
     #[test]
     fn create_topology_with_sqlite_url_fails_fast() {
         let config = DatabaseConfig {
@@ -3321,6 +3326,50 @@ mod tests {
             panic!("sqlite target must refuse at topology build");
         };
         assert!(matches!(err, PoolError::UnsupportedBackend(_)), "{err:?}");
+    }
+
+    // Under `--features sqlite` the same targets that refuse above instead build
+    // a real pool/topology over `SyncConnectionWrapper<SqliteConnection>`.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn create_pool_with_sqlite_url_builds_under_feature() {
+        let config = DatabaseConfig {
+            primary_url: Some("sqlite::memory:".into()),
+            ..Default::default()
+        };
+        let pool = create_pool(&config).expect("sqlite pool builds under the feature");
+        assert!(pool.is_some(), "a configured sqlite url yields a pool");
+    }
+
+    // A Postgres URL in a sqlite build is a misconfiguration and must refuse.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn create_pool_with_postgres_url_refuses_under_sqlite_feature() {
+        let config = DatabaseConfig {
+            url: Some("postgres://localhost/test".into()),
+            ..Default::default()
+        };
+        let Err(err) = create_pool(&config) else {
+            panic!("a Postgres url must refuse under the sqlite feature");
+        };
+        assert!(matches!(err, PoolError::UnsupportedBackend(_)), "{err:?}");
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn normalize_sqlite_target_strips_schemes() {
+        assert_eq!(normalize_sqlite_target("sqlite::memory:"), ":memory:");
+        assert_eq!(normalize_sqlite_target("sqlite://:memory:"), ":memory:");
+        assert_eq!(normalize_sqlite_target("sqlite://"), ":memory:");
+        assert_eq!(
+            normalize_sqlite_target("sqlite:///var/lib/app.db"),
+            "/var/lib/app.db"
+        );
+        assert_eq!(normalize_sqlite_target("sqlite:app.db"), "app.db");
+        assert_eq!(
+            normalize_sqlite_target("file:/var/lib/app.db"),
+            "file:/var/lib/app.db"
+        );
     }
 
     #[test]
