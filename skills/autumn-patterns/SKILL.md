@@ -22,9 +22,12 @@ check the "Prefer framework idioms over raw Diesel/Axum" table in
 When a model has a status/phase column with legal transitions, declare them
 with `#[state_machine(transitions(...))]` on the field and enforce with the
 generated `transition_{field}_to` in `before_update` — never write your own
-`match (old, new)` validation in hooks or handlers. See
-`docs/guide/state-machines.md` and the worked example in
-`skills/autumn-web/references/examples.md`.
+`match (old, new)` validation in hooks or handlers. To reuse one transition
+graph across fields/models, define a `#[lifecycle]` enum and reference it with
+`#[state_machine(lifecycle = Enum)]` (trunk-dev, #1916); `autumn lifecycle
+check` statically verifies soundness and `autumn lifecycle diagram` emits a
+DOT/Mermaid state diagram. See `docs/guide/state-machines.md` and the worked
+example in `skills/autumn-web/references/examples.md`.
 
 ## Testing with TestApp and TestClient
 

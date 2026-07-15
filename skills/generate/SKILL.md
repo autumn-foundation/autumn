@@ -83,6 +83,17 @@ by hand in the generated migration's `up.sql`. On trunk-dev, use `:unique` /
 **Do not use UUID as a primary key.** Primary keys are always `i64` /
 `BIGSERIAL`. Use `Uuid` as a secondary column for external correlation only.
 
+**SQLite backend (trunk-dev, #1614)**: the generator auto-detects the target
+backend from the resolved database URL (`sqlite://…` in config / env / dotenv →
+SQLite, else Postgres) and emits SQLite-appropriate DDL (e.g. `TEXT` for
+`Decimal`, `TEXT PRIMARY KEY`/`Timestamp` remaps). Field kinds with no working
+diesel SQLite conversion in the generated app's feature set — `Uuid`,
+`Attachment`, `Decimal`, `DateTime` (`DateTime<Utc>`), and `enum{…}` — are
+**rejected at generate time** (with an actionable error) rather than emitting
+uncompilable code; `--searchable`, UUID primary keys, `--sharded`, and
+`generate auth` are likewise Postgres-only. First-class SQLite support for the
+rejected kinds is tracked in #1924.
+
 **Scaffold form behavior (trunk-dev)**: generated `create`/`update` handlers
 build a `Changeset` and, on a rejected submission, respond **422** and
 re-render the form with all submitted values preserved and per-field inline

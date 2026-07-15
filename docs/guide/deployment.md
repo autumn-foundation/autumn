@@ -49,9 +49,22 @@ below and are better fits in specific cases:
   [How the production image works](#how-the-production-image-works)) — a
   portable OCI image you run on Kubernetes, ECS, Nomad, or any Docker host.
 
-> **HTTPS/TLS.** kamal-proxy fronts your app on the public port. TLS termination
-> and ACME certificate issuance are covered in the TLS guide (tracked in
-> [#1860](https://github.com/madmax983/autumn/issues/1860)).
+> **HTTPS/TLS.** kamal-proxy fronts your app on the public port, but as
+> configured by `autumn deploy` today it listens on plain **HTTP** and does
+> **not** provision a TLS certificate — so following this path as shipped serves
+> HTTP on the public port. To serve HTTPS on the deploy path, place an
+> **external TLS terminator in front of** the deploy-managed kamal-proxy: a
+> TLS-terminating load balancer or reverse proxy that owns the certificate and
+> forwards plain HTTP to the kamal-proxy public port. The deploy-managed
+> kamal-proxy is HTTP-only — `autumn deploy` runs it as `kamal-proxy run
+> --http-port` and issues `kamal-proxy deploy --target --health-check-path` with
+> no `--host`/`--tls`, so it can't create or preserve TLS on that proxy. Don't
+> enable in-process
+> `[server.tls]`/ACME on a deploy-managed app — deploy binds each slot to a
+> private loopback HTTP port that the readiness gate and kamal-proxy target over
+> plain HTTP, so a TLS listener there breaks its health checks. See the [TLS &
+> HTTPS guide](./tls.md) for the full picture, including in-process TLS for
+> self-run apps.
 
 > **Version.** The `autumn deploy` subcommands (`check` / `plan` / `up` /
 > `rollback`) are newer than the `autumn-cli 0.5.0` pinned under

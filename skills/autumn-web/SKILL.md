@@ -38,12 +38,20 @@ when their details matter:
   CRUD, production-ish jobs, Redis channels, S3 storage plugins, and signed
   webhooks. Use this before generating full app code.
 - `docs/guide/accessibility.md` - accessible-by-construction UI. Prefer the
-  typed `autumn_web::a11y` primitives (`Img` / `Button` / `Link` / `MenuItem` /
-  `TextField`) over raw `<img>` / `<button>` / `<input>` in `html!` — the accessible
-  name (alt text, button label, field label) is a required constructor argument,
-  so a missing one is a compile error, not a runtime audit miss. Treat `autumn
-  a11y verify` as an advisory/best-effort CI net, not a guarantee — the typed
-  primitives are the compile-time proof (trunk-dev, #1706).
+  typed `autumn_web::a11y` primitives (`Img` / `Button` / `Link` / `MenuItem`
+  plus the labeled-typestate form controls `TextField` / `TextArea` / `Select`
+  (+ `SelectOption`) / `Checkbox` / `FileField`) over raw `<img>` / `<button>` /
+  `<input>` / `<textarea>` / `<select>` in `html!` — the accessible name (alt
+  text, button label, field label) is a required constructor argument (a form
+  control cannot render until `.label()` / `.aria_label()` / `.labelled_by()`
+  supplies one), so a missing one is a compile error, not a runtime audit miss.
+  The form controls also carry validation/ARIA setters (`.required()`,
+  `.aria_required()`, `.aria_invalid()`, `.described_by()`, per-type
+  min/max/length) plus a `.hx(name, value)` escape hatch for arbitrary `hx-*`
+  attributes. Treat `autumn a11y verify` as an advisory/best-effort CI net, not
+  a guarantee — the typed primitives are the compile-time proof (trunk-dev,
+  #1706). See `skills/autumn-web/references/api-reference.md` for the full
+  setter surface.
 
 ## Prefer framework idioms over raw Diesel/Axum
 
@@ -469,6 +477,14 @@ async fn before_update(
     Ok(())
 }
 ```
+
+Instead of inline `transitions(...)`, a field can reference a reusable
+`#[lifecycle]` enum — `#[state_machine(lifecycle = OrderState)]` — whose typed
+edges become the field's transition table (#1911/#1916). The `autumn lifecycle
+check` CLI command statically verifies every `#[lifecycle]` state machine
+(referenced-state existence, reachability, that every non-terminal state can
+reach a terminal one; exits non-zero when unsound), and `autumn lifecycle
+diagram` emits a Graphviz DOT or Mermaid `stateDiagram-v2` per lifecycle.
 
 See `docs/guide/state-machines.md` and `examples/wiki` (`Page` model,
 `draft → published → archived`).
@@ -1016,6 +1032,16 @@ RFC 3339 JSON bodies). Serde-renamed columns pre-fill correctly via
 `autumn generate scaffold` views render through a single shared
 `{snake}_form_for` helper built on this (except `--live-validation`, which
 keeps per-field htmx emission).
+
+For **master-detail** (has-many) forms saved atomically — an order plus its
+line items in one submit — use `autumn_web::nested_form` (unreleased —
+trunk-dev, #1915) instead of hand-wiring indexed field names: implement
+`NestedChild` on the child new-model, render the child rows with
+`inputs_for(&nested, &InputsForOptions, |row| …)` (add/remove rows + a
+`destroy_checkbox` for deletes) off a `NestedChangesetForm<Parent, Child>`, and
+decode the flat submission back into parent + children with
+`decode_nested_urlencoded`, so the parent and its children validate and persist
+as one transaction.
 
 ## Resumable SSE streams (unreleased — trunk-dev, issue #1356)
 
