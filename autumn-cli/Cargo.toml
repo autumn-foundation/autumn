@@ -79,7 +79,9 @@ nix = { version = "0.31.2", features = ["fs", "signal", "socket", "user"] }
 reqwest = { version = "0.13", features = ["blocking", "rustls"], default-features = false }
 proptest = "1.4"
 temp-env = { version = "0.3.6", features = ["async_closure"] }
-testcontainers = { workspace = true }
+# `blocking` enables the synchronous `SyncRunner` used by the deploy_e2e harness
+# (which is a procedural, non-async test).
+testcontainers = { workspace = true, features = ["blocking"] }
 testcontainers-modules = { workspace = true }
 
 [lints]
@@ -108,3 +110,10 @@ path = "tests/e2e.rs"
 [[test]]
 name = "generate"
 path = "tests/generate.rs"
+
+# Isolated per CLAUDE.md: the AC-7 deploy end-to-end test (#1607, Slice 4) spawns
+# privileged systemd containers over real ssh/scp and is targeted independently in
+# the Docker-dependent CI step, so it is NOT part of the consolidated cli_tests.
+[[test]]
+name = "deploy_e2e"
+path = "tests/deploy_e2e.rs"
