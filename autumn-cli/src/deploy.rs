@@ -830,8 +830,19 @@ impl<E: Env> Env for ForcedProfileEnv<E> {
         // and does not touch the deployed service's runtime. The
         // profile-selector-key exclusion in the dotenv overlay still strips
         // `AUTUMN_ENV`/`AUTUMN_PROFILE`/`AUTUMN_IS_DEBUG` from any `.env` file.
+        //
+        // But only SYNTHESIZE `1` when the inner env has no explicit value: an
+        // operator who runs `AUTUMN_DOTENV=0 autumn deploy ...` (or `false`) is
+        // deliberately opting OUT of `.env.<profile>` loading, and `should_load`
+        // honors `0`/`false` as the documented off switch (see dotenv.rs). So
+        // delegate to the inner env when it provides `AUTUMN_DOTENV`, preserving
+        // an explicit `0`/`false`/`1`/`true`, and fall back to `1` only when it
+        // is unset.
         if key == "AUTUMN_DOTENV" {
-            return Ok("1".to_owned());
+            return self
+                .inner
+                .var("AUTUMN_DOTENV")
+                .or_else(|_| Ok("1".to_owned()));
         }
         self.inner.var(key)
     }
@@ -845,9 +856,13 @@ impl<E: Env> Env for ForcedProfileEnv<E> {
 /// [`autumn_web::dotenv::os_env_with_dotenv_for_profile_using`], fed a
 /// [`ForcedProfileEnv`] gating base that reports `AUTUMN_DOTENV=1` so a non-dev
 /// deploy profile still loads `.env.<profile>` (dotenv auto-load is otherwise
-/// gated off outside `dev`/`test`). A second [`ForcedProfileEnv`] wrapper forces
-/// `AUTUMN_ENV` to `resolved.profile` so the loader layers `[profile.<profile>]`
-/// / `autumn-<profile>.toml` on top. Real OS env vars still win over `.env` (the
+/// gated off outside `dev`/`test`). The overlay is selected by the CANONICAL
+/// profile ([`canonicalize_deploy_profile`]) so a `[deploy] profile` alias like
+/// `production` still reads `.env.prod` (matching `AutumnConfig::load()`), not
+/// `.env.production`. A second [`ForcedProfileEnv`] wrapper forces `AUTUMN_ENV`
+/// to the RAW `resolved.profile` so the loader layers `[profile.<profile>]` /
+/// `autumn-<profile>.toml` on top with the operator's exact spelling. Real OS
+/// env vars still win over `.env` (the
 /// overlay only fills gaps), and the dotenv profile-selector-key exclusion still
 /// strips `AUTUMN_ENV`/`AUTUMN_PROFILE`/`AUTUMN_IS_DEBUG` from any `.env` file,
 /// matching `AutumnConfig::load()`.
@@ -860,9 +875,15 @@ fn load_runtime_config(resolved: &ResolvedDeployConfig) -> Result<AutumnConfig, 
         profile: resolved.profile.clone(),
         inner: OsEnv,
     };
-    let inner =
-        autumn_web::dotenv::os_env_with_dotenv_for_profile_using(&gating, &resolved.profile)
-            .map_err(|e| DeployError::Config(e.to_string()))?;
+    // Select the `.env.<profile>` overlay by the CANONICAL profile, so a
+    // `[deploy] profile` alias like `production`/`PROD` still picks the same
+    // `.env.prod` file that `AutumnConfig::load()` reads after profile
+    // normalization — not `.env.production`/`.env.PROD`. Only the dotenv-overlay
+    // SELECTION is canonicalized; `AUTUMN_ENV` and the TOML override-file
+    // precedence (handled by `load_with_env`) still see the RAW spelling below.
+    let dotenv_profile = canonicalize_deploy_profile(&resolved.profile);
+    let inner = autumn_web::dotenv::os_env_with_dotenv_for_profile_using(&gating, &dotenv_profile)
+        .map_err(|e| DeployError::Config(e.to_string()))?;
     let forced = ForcedProfileEnv {
         profile: resolved.profile.clone(),
         inner,
@@ -1416,6 +1437,40 @@ mod tests {
         assert_eq!(forced.var("AUTUMN_ENV").as_deref(), Ok("prod"));
         assert_eq!(forced.var("SOME_OTHER_KEY").as_deref(), Ok("kept"));
         assert!(forced.var("UNSET_KEY").is_err());
+    }
+
+    #[test]
+    fn forced_profile_env_honors_explicit_autumn_dotenv() {
+        // The wrapper synthesizes `AUTUMN_DOTENV=1` only when the inner env has
+        // NO explicit value. An operator running `AUTUMN_DOTENV=0 autumn deploy`
+        // (or `false`) is deliberately opting OUT of `.env.<profile>` loading, so
+        // the explicit value must be delegated through unchanged (`should_load`
+        // honors `0`/`false` as the documented off switch).
+        use autumn_web::config::MockEnv;
+
+        // Explicit `0` is preserved (off).
+        let off = ForcedProfileEnv {
+            profile: "prod".to_owned(),
+            inner: MockEnv::new().with("AUTUMN_DOTENV", "0"),
+        };
+        assert_eq!(off.var("AUTUMN_DOTENV").as_deref(), Ok("0"));
+        // AUTUMN_ENV is still forced to the deploy profile.
+        assert_eq!(off.var("AUTUMN_ENV").as_deref(), Ok("prod"));
+
+        // Unset inner value → synthesize `1` (opt the deploy profile into the
+        // `.env.<profile>` overlay).
+        let unset = ForcedProfileEnv {
+            profile: "prod".to_owned(),
+            inner: MockEnv::new(),
+        };
+        assert_eq!(unset.var("AUTUMN_DOTENV").as_deref(), Ok("1"));
+
+        // Explicit truthy values are also delegated verbatim.
+        let on = ForcedProfileEnv {
+            profile: "prod".to_owned(),
+            inner: MockEnv::new().with("AUTUMN_DOTENV", "true"),
+        };
+        assert_eq!(on.var("AUTUMN_DOTENV").as_deref(), Ok("true"));
     }
 
     #[test]
