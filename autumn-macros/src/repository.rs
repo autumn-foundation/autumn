@@ -1683,7 +1683,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             #[allow(clippy::too_many_arguments)]
             pub fn __autumn_apply_dependent_on_conn<'__dep>(
                 &'__dep self,
-                conn: &'__dep mut ::autumn_web::reexports::diesel_async::AsyncPgConnection,
+                conn: &'__dep mut ::autumn_web::RuntimeConnection,
                 __fk_column: &'__dep str,
                 __parent_id: i64,
                 __action: ::autumn_web::repository::DependentAction,
@@ -2967,7 +2967,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 &self,
             ) -> ::autumn_web::AutumnResult<
                 ::autumn_web::reexports::diesel_async::pooled_connection::deadpool::Object<
-                    ::autumn_web::reexports::diesel_async::AsyncPgConnection,
+                    ::autumn_web::RuntimeConnection,
                 >,
             > {
                 self.__autumn_acquire_conn().await
@@ -3049,7 +3049,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 #[must_use]
                 pub fn __autumn_test_with_broadcast(
                     pool: ::autumn_web::reexports::diesel_async::pooled_connection::deadpool::Pool<
-                        ::autumn_web::reexports::diesel_async::AsyncPgConnection,
+                        ::autumn_web::RuntimeConnection,
                     >,
                     broadcast: ::autumn_web::channels::Broadcast,
                 ) -> Self {
@@ -3126,7 +3126,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             #[must_use]
             pub fn with_pool_untracked(
                 pool: ::autumn_web::reexports::diesel_async::pooled_connection::deadpool::Pool<
-                    ::autumn_web::reexports::diesel_async::AsyncPgConnection,
+                    ::autumn_web::RuntimeConnection,
                 >,
             ) -> Self {
                 #register_hooks
@@ -3197,7 +3197,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
         let struct_fields = quote! {
             pool: ::autumn_web::reexports::diesel_async::pooled_connection::deadpool::Pool<
-                ::autumn_web::reexports::diesel_async::AsyncPgConnection,
+                ::autumn_web::RuntimeConnection,
             >,
             hooks: #hooks_ident,
             #idempotency_struct_field
@@ -6794,7 +6794,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
         let struct_fields = quote! {
             pool: ::autumn_web::reexports::diesel_async::pooled_connection::deadpool::Pool<
-                ::autumn_web::reexports::diesel_async::AsyncPgConnection,
+                ::autumn_web::RuntimeConnection,
             >,
             #tenant_struct_field
             #shards_struct_field
@@ -14551,7 +14551,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             pub fn __autumn_write_pool(
                 &self,
             ) -> &::autumn_web::reexports::diesel_async::pooled_connection::deadpool::Pool<
-                ::autumn_web::reexports::diesel_async::AsyncPgConnection,
+                ::autumn_web::RuntimeConnection,
             > {
                 &self.pool
             }
@@ -14578,7 +14578,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 &self,
             ) -> ::autumn_web::AutumnResult<
                 ::autumn_web::reexports::diesel_async::pooled_connection::deadpool::Object<
-                    ::autumn_web::reexports::diesel_async::AsyncPgConnection,
+                    ::autumn_web::RuntimeConnection,
                 >,
             > {
                 let result = self.__autumn_acquire_from(&self.pool).await;
@@ -14600,7 +14600,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 &self,
             ) -> ::autumn_web::AutumnResult<
                 ::autumn_web::reexports::diesel_async::pooled_connection::deadpool::Object<
-                    ::autumn_web::reexports::diesel_async::AsyncPgConnection,
+                    ::autumn_web::RuntimeConnection,
                 >,
             > {
                 // Match by reference to avoid cloning `ReadRoute` on the common
@@ -14637,11 +14637,11 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             async fn __autumn_acquire_from(
                 &self,
                 pool: &::autumn_web::reexports::diesel_async::pooled_connection::deadpool::Pool<
-                    ::autumn_web::reexports::diesel_async::AsyncPgConnection,
+                    ::autumn_web::RuntimeConnection,
                 >,
             ) -> ::autumn_web::AutumnResult<
                 ::autumn_web::reexports::diesel_async::pooled_connection::deadpool::Object<
-                    ::autumn_web::reexports::diesel_async::AsyncPgConnection,
+                    ::autumn_web::RuntimeConnection,
                 >,
             > {
                 use ::autumn_web::reexports::diesel_async::RunQueryDsl as _;
@@ -14690,7 +14690,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             where
                 F: for<'c> ::core::ops::FnOnce(
                     #model_name,
-                    &'c mut ::autumn_web::reexports::diesel_async::AsyncPgConnection,
+                    &'c mut ::autumn_web::RuntimeConnection,
                 ) -> ::autumn_web::reexports::scoped_futures::ScopedBoxFuture<'c, 'c, ::autumn_web::AutumnResult<T>>
                     + ::core::marker::Send + 'static,
                 T: ::core::marker::Send + 'static,
