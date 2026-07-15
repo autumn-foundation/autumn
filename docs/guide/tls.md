@@ -220,13 +220,27 @@ Fields:
 - **Provisioning** is over HTTP-01: the `:80` listener serves the challenge
   token, the CA validates it, and the issued certificate is cached under
   `cache_dir` (default `config/acme`) and swapped into the live resolver.
-- **Renewal** runs on a **leader-elected** coordinator loop that wakes hourly and
-  renews any certificate within `renew_before_days` of expiry — so in a
-  clustered deployment exactly one instance renews, and the refreshed certificate
-  hot-swaps in with no restart.
+- **Renewal** runs on a coordinator loop that wakes hourly and renews any
+  certificate within `renew_before_days` of expiry; the refreshed certificate
+  hot-swaps into the live resolver with no restart. Leader election only
+  serializes **which** instance orders a certificate — it does **not** make ACME
+  fleet-safe (see the caveat below).
 - **Mutual exclusion.** ACME and static `cert_path` / `key_path` are mutually
   exclusive — configure exactly one. Set `[server.tls.acme]` to auto-issue, or
   `[server.tls]` with `cert_path` / `key_path` to serve your own certificate.
+
+> **Single-process / single-host only.** This in-process ACME flow keeps the
+> HTTP-01 challenge token map in the process and the issued certificate in a
+> local on-disk cache (`cache_dir`). Behind a load balancer, or with more than
+> one replica, the CA's `:80` challenge can be routed to a replica that lacks the
+> token (issuance and renewal 404), and non-leader replicas cannot adopt a
+> certificate renewed on another instance from that non-shared store. Leader
+> election only decides **which** instance orders a certificate; it does not make
+> multi-replica ACME work — the app logs a loud startup warning when a
+> distributed scheduler backend is configured. For multi-replica or clustered
+> deployments, terminate TLS at a shared reverse proxy / load balancer (or a
+> single dedicated TLS-terminating instance) instead of in-process ACME
+> ([#1620](https://github.com/madmax983/autumn/issues/1620)).
 
 ### Scope
 
