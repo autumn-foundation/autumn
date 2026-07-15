@@ -55,6 +55,28 @@ key_path = "/etc/letsencrypt/live/app.example.com/privkey.pem"
 # handshake_timeout_secs = 10    # TLS handshake timeout (default)
 ```
 
+The `[features]` block above only *defines* the forwarding feature — because
+`tls` is off by default you must also build/run **with it enabled**, otherwise
+the TLS stack is never linked:
+
+- `cargo run --features tls` (or `cargo build --release --features tls`) — uses
+  the `tls = ["autumn-web/tls"]` forwarding feature declared above.
+- Or turn it on directly without the forwarding feature:
+  `cargo run --features autumn-web/tls`.
+- For a CLI-built single binary: `autumn build --embed --features tls` — the
+  `--features` flag is forwarded to cargo through every build phase.
+
+**Configuring `[server.tls]` without the `tls` feature compiled in is a
+fail-fast boot error, not a silent fallback.** `AppBuilder::run` validates the
+wiring before binding anything and exits non-zero with:
+
+> `[server.tls] is configured but this binary was built without the `tls`
+> feature; rebuild with `--features tls`, or remove [server.tls] to serve plain
+> HTTP`
+
+so a build that forgot the feature can never quietly serve plain HTTP on a port
+you expect to be HTTPS.
+
 Fields:
 
 | Field | Default | Meaning |
@@ -187,6 +209,21 @@ contact_email = "admin@example.com"
 directory = "production"          # omit for Let's Encrypt STAGING (see below)
 ```
 
+As with the `tls` feature, ACME is off by default, so build and run **with the
+`acme` feature enabled** (it turns on `tls` transitively):
+
+- `cargo run --features acme` — uses the `acme = ["autumn-web/acme"]` forwarding
+  feature declared above (or `cargo run --features autumn-web/acme` without it).
+- `autumn build --embed --features acme` for a CLI-built single binary.
+
+**Configuring `[server.tls.acme]` without the `acme` feature compiled in is a
+fail-fast boot error**, exactly like the `tls` guard above — `AppBuilder::run`
+exits non-zero with:
+
+> `[server.tls.acme] is configured but this binary was built without the `acme`
+> feature; rebuild with `--features acme`, or configure a static
+> cert_path/key_path instead`
+
 On first boot the app answers the ACME HTTP-01 challenge on `http_challenge_port`
 (default `80`), obtains a certificate for `domains`, and starts serving HTTPS.
 That same `:80` listener also **redirects plain HTTP to HTTPS**, so visitors who
@@ -263,13 +300,22 @@ path installs **kamal-proxy** in front of your app, but as shipped it configures
 the proxy on the plain **HTTP** public port and does **not** provision a
 certificate — so that path serves HTTP, not HTTPS, until you add termination
 (see the deployment guide's [HTTPS/TLS note](./deployment.md#push-button-deploy-to-your-own-server-autumn-deploy)).
-To get HTTPS, either front the public port with a **TLS-terminating load
-balancer or reverse proxy** (including kamal-proxy with TLS configured yourself),
-or serve TLS **in-process** from the app via
-[`[server.tls]`](#direct-in-process-tls-servertls) or
-[ACME](#automatic-acme-certificates-servertlsacme). When TLS is terminated in
-front, the app needs **neither** the `tls` **nor** the `acme` cargo feature and
-**no** `[server.tls]` section — the terminating proxy owns the certificate.
+To get HTTPS on the `autumn deploy` path, terminate TLS **in front of** the
+app — a **TLS-terminating load balancer or reverse proxy**, or kamal-proxy
+configured with TLS by you. Do **not** enable in-process `[server.tls]`/ACME on
+a deploy-managed app: `autumn deploy` binds each app slot to a private loopback
+**HTTP** port (the slot systemd unit sets `AUTUMN_SERVER__HOST=127.0.0.1`), the
+readiness gate probes it over plain HTTP (`curl http://127.0.0.1:{port}/ready`),
+and kamal-proxy routes to a plain `127.0.0.1:{port}` target — so putting a TLS
+listener there would fail both the health checks and the plain-HTTP proxy hop.
+When TLS is terminated in front, the app needs **neither** the `tls` **nor** the
+`acme` cargo feature and **no** `[server.tls]` section — the terminating proxy
+owns the certificate.
+
+In-process [`[server.tls]`](#direct-in-process-tls-servertls) and
+[ACME](#automatic-acme-certificates-servertlsacme) (the sections above) remain
+the right choice for a **self-run / standalone** app you start yourself — one
+that owns its own public host:port, not one deployed via `autumn deploy`.
 
 The same applies to any terminating proxy (nginx, Caddy, a cloud load balancer):
 point the proxy's certificate at the public `https://` port and forward to the

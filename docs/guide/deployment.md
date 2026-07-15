@@ -52,11 +52,14 @@ below and are better fits in specific cases:
 > **HTTPS/TLS.** kamal-proxy fronts your app on the public port, but as
 > configured by `autumn deploy` today it listens on plain **HTTP** and does
 > **not** provision a TLS certificate — so following this path as shipped serves
-> HTTP on the public port. To serve HTTPS you either front the app with a
-> TLS-terminating load balancer or reverse proxy, or serve TLS in-process from
-> the app via ACME or a `[server.tls]` certificate. Both options — including
-> serving HTTPS directly from the app without a proxy — are covered in the
-> [TLS & HTTPS guide](./tls.md).
+> HTTP on the public port. To serve HTTPS on the deploy path, terminate TLS **in
+> front of** the app: a TLS-terminating load balancer or reverse proxy, or
+> kamal-proxy configured with TLS by you. Don't enable in-process
+> `[server.tls]`/ACME on a deploy-managed app — deploy binds each slot to a
+> private loopback HTTP port that the readiness gate and kamal-proxy target over
+> plain HTTP, so a TLS listener there breaks its health checks. See the [TLS &
+> HTTPS guide](./tls.md) for the full picture, including in-process TLS for
+> self-run apps.
 
 > **Version.** The `autumn deploy` subcommands (`check` / `plan` / `up` /
 > `rollback`) are newer than the `autumn-cli 0.5.0` pinned under
