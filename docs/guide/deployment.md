@@ -31,6 +31,337 @@ internet connection.
 
 ---
 
+## Push-button deploy to your own server (`autumn deploy`)
+
+`autumn deploy` takes a fresh project to a live, zero-downtime service on a
+single Linux VPS you control — no Dockerfile, no container registry, no PaaS
+account. It uploads a single embedded binary, supervises it with systemd behind
+a reverse proxy, migrates before cutover, health-gates on `/ready`, and flips
+traffic atomically. Re-running it is a zero-downtime redeploy; one command rolls
+back.
+
+This is the **primary** deployment path. Two alternatives remain documented
+below and are better fits in specific cases:
+
+- **[Deploy to fly.io](#deploy-to-flyio)** — a managed platform (machines,
+  built-in metrics scraping, `fly deploy`).
+- **The container path** ([Step 1](#step-1--create-the-project) through
+  [How the production image works](#how-the-production-image-works)) — a
+  portable OCI image you run on Kubernetes, ECS, Nomad, or any Docker host.
+
+> **HTTPS/TLS.** kamal-proxy fronts your app on the public port. TLS termination
+> and ACME certificate issuance are covered in the TLS guide (tracked in
+> [#1860](https://github.com/madmax983/autumn/issues/1860)).
+
+> **Version.** The `autumn deploy` subcommands (`check` / `plan` / `up` /
+> `rollback`) are newer than the `autumn-cli 0.5.0` pinned under
+> [Prerequisites](#prerequisites) — that build does not include them — and they
+> are not yet part of a published release. Until the next autumn-cli release
+> ships them, install the CLI from the latest source (`cargo install autumn-cli
+> --git https://github.com/madmax983/autumn --force`) and confirm the subcommand
+> is present with `autumn deploy --help`.
+
+### Preconditions
+
+Everything except two host prerequisites is automated by `autumn deploy up`:
+
+- **Key-based SSH access as `root` (or an equivalently privileged account) to a
+  stock Ubuntu LTS (or other systemd) host.** The deploy runs non-interactively
+  (`BatchMode=yes`) as the configured user (`[deploy] user`, default `root`) —
+  no password prompts, so your SSH key must already be authorized on the target.
+  `autumn deploy` runs its remote steps **directly over SSH, without `sudo`**: it
+  writes units into `/etc/systemd/system/`, runs `systemctl`
+  (`daemon-reload`/`enable`/`restart`/`disable`) and `systemd-run`, and writes
+  under the app directory. The `[deploy] user` must therefore be `root` (the
+  default) or an account that **already holds those permissions directly**. A
+  plain non-root SSH login passes preflight (which only checks reachability and
+  secrets, not privilege) and then fails once it tries to write the unit or
+  invoke `systemctl`.
+- **The `kamal-proxy` binary present at `/usr/local/bin/kamal-proxy`.** The
+  deploy writes and supervises the proxy's systemd unit, but does **not**
+  download the binary itself — install it once as part of host bootstrap. (See
+  [Limitations](#limitations-and-known-gaps).)
+- **A local Rust toolchain** to build the release binary (`autumn build
+  --embed`).
+
+The reverse proxy, install directories, systemd units, release layout, and the
+secret env file are all created for you.
+
+### First deploy: from `autumn new` to a live app
+
+```bash
+# 1. Scaffold a project (its package name becomes the deploy app name).
+autumn new myapp
+cd myapp
+```
+
+Point the deploy at your server by adding a `[deploy]` section to `autumn.toml`:
+
+```toml
+[deploy]
+host = "203.0.113.10"     # SSH-reachable IP or hostname of your VPS (required)
+# user = "root"           # SSH user (default: root)
+# ssh_port = 22           # SSH port (default: 22)
+# app_dir = "/srv/autumn/myapp"   # remote install dir (default: /srv/autumn/<app_name>)
+# readiness_timeout_secs = 60     # /ready window before rollback (default: 60)
+# keep_releases = 3               # prior releases retained for rollback (default: 3)
+```
+
+Every key also has an environment override (`AUTUMN_DEPLOY__HOST`,
+`AUTUMN_DEPLOY__USER`, `AUTUMN_DEPLOY__SSH_PORT`, …) if you prefer to keep the
+host out of the file.
+
+Put these two values in a project `.env` (git-ignored — never committed). The
+deploy reads them and writes **only** them to a `0600` env file
+(`app_dir/shared/autumn.env`) **on the server**:
+
+```bash
+# .env
+AUTUMN_SECURITY__SIGNING_SECRET=<paste `openssl rand -hex 32` here>
+# Only if your app is database-backed:
+AUTUMN_DATABASE__URL=postgres://user:pass@db-host:5432/myapp_prod
+```
+
+> **The signing secret, the database URL, and the profile selector are
+> deployed.** `autumn deploy` serializes exactly three variables to the host env
+> file: `AUTUMN_SECURITY__SIGNING_SECRET`, — for database-backed apps —
+> `AUTUMN_DATABASE__URL`, and `AUTUMN_ENV` (the deploy profile, `prod` by
+> default — see below). **Any other runtime secret** (OAuth client secrets, SMTP
+> credentials, a Redis URL, object-storage keys, etc.) placed in `.env` is
+> **not** transferred to the server, so those features fail in production unless
+> you provision the secret on the target host yourself. The env file is
+> **rebuilt from scratch on every `deploy up`**, so hand-adding entries to
+> `app_dir/shared/autumn.env` is not durable — they are overwritten on the next
+> deploy; provision such secrets out of band on the host (or via the systemd
+> unit environment) and re-apply them after each deploy.
+
+> **Known gap:** Values set only under `[profile.prod]` or `.env.prod` aren't yet
+> used by `autumn deploy` — it currently reads the database URL and signing secret
+> from config resolved under your ambient profile while running the service as
+> `prod`. A follow-up will resolve the deploy config under the target profile;
+> until then, make sure the values you want deployed are visible to the profile you
+> run `autumn deploy` from (e.g. export `AUTUMN_ENV=prod` or keep them in the base
+> config).
+
+> **`autumn deploy` runs the app under the production profile by default.** The
+> deploy writes `AUTUMN_ENV=prod` into the host env file, so the deployed app
+> boots under the `prod` profile and its production smart-defaults apply — strict
+> CORS, minimal actuators, prod CSRF/session hardening, and strict
+> signing-secret enforcement. To deploy a non-production target, set `[deploy]
+> profile = "staging"` in `autumn.toml` (or `AUTUMN_DEPLOY__PROFILE=staging`);
+> the deploy writes that value as `AUTUMN_ENV` instead.
+
+> **Your `autumn.toml` is not deployed — non-secret settings fall back to
+> defaults on the host.** `autumn deploy up` uploads the release binary and
+> writes the host env file, but it does **not** copy your project's
+> `autumn.toml`. The systemd unit runs the binary with its working directory set
+> to the release dir (which holds only the binary), so at startup the app finds
+> no `autumn.toml` and every non-secret runtime setting — auth, the jobs and
+> scheduler backends, health/telemetry paths, CORS, signing-secret rotation
+> (`security.signing_secret.previous_secrets`), and so on — resolves to its
+> **default**, regardless of what you configured and tested locally (the `prod`
+> profile still applies its smart-defaults). Only the three values in the host
+> env file (`AUTUMN_SECURITY__SIGNING_SECRET`; for database-backed apps,
+> `AUTUMN_DATABASE__URL`; and `AUTUMN_ENV`, the profile selector) make the trip.
+> This is a known gap tracked in
+> [#1952](https://github.com/madmax983/autumn/issues/1952). Do **not** try to
+> work around it by hand-editing `app_dir/shared/autumn.env`: the deploy
+> **rebuilds that file from scratch on every `deploy up`** (writing exactly the
+> signing secret, database URL, and `AUTUMN_ENV`), so any overrides you add there
+> are overwritten on the next deploy. Until #1952 lands, re-apply the non-secret
+> configuration you need out of band on the host after each deploy. Otherwise the
+> deployed app can run a different configuration than the one you tested locally.
+
+Generate the signing secret once and store it somewhere durable:
+
+```bash
+openssl rand -hex 32
+```
+
+Run the preflight — it checks SSH reachability, the signing secret, the database
+URL (when the app is DB-backed), and, via an offline scan of your local
+`migrations/` directory, that every migration file is safe for a rolling deploy.
+That scan does not consult the database, so it does not distinguish already-applied
+from pending migrations — an old destructive migration file left in the directory
+fails the check even after it has been applied. Keep `migrations/` rolling-safe
+(remove or adjust an already-applied destructive migration if it trips the scan).
+The preflight exits non-zero if anything fails, so nothing touches the server
+until it is green:
+
+```bash
+autumn deploy check      # doctor --online runs the same graders (plain doctor skips network probes)
+```
+
+Build the single embedded binary, then deploy:
+
+```bash
+autumn build --embed     # produces target/release/myapp (assets + i18n baked in)
+autumn deploy up
+```
+
+`autumn deploy up` re-runs the full preflight, aborts before any remote call if
+it fails, then on this first run:
+
+1. installs and supervises **kamal-proxy** on the public port
+   (`server.port`, default `3000`),
+2. creates the release + `shared` directories under `app_dir`,
+3. uploads the binary into a timestamped release dir (`0755`),
+4. writes the signing secret, database URL, and `AUTUMN_ENV` (the profile,
+   `prod` by default) to `app_dir/shared/autumn.env` (`0600`, sourced by
+   systemd — never printed, never on a command line; rebuilt each deploy),
+5. writes the app's systemd unit (bound to a private `127.0.0.1` port),
+   points `current` at the release, and starts it,
+6. health-gates on `GET /ready` within `readiness_timeout_secs`, then
+7. routes the proxy at the freshly-ready release.
+
+On success it prints:
+
+```
+✅ Deploy complete. Roll back with `autumn deploy rollback`.
+```
+
+Verify it is serving (the public port is your configured `server.port`):
+
+```bash
+curl http://203.0.113.10:3000/health   # -> {"status":"ok", ...}
+curl http://203.0.113.10:3000/ready    # readiness probe used during cutover
+```
+
+### Zero-downtime redeploy
+
+Ship a new version by re-running the exact same command:
+
+```bash
+autumn build --embed
+autumn deploy up
+```
+
+On a host that is already serving, `up` performs a blue/green cutover with **no
+dropped requests**:
+
+1. stands the new release up on the **idle** loopback slot while the current
+   release keeps serving,
+2. runs **pending migrations on the host before cutover** (`AUTUMN_MIGRATE=1`
+   one-shot) — a failed migration aborts here with the old version still live,
+3. health-gates the candidate on `/ready` within the readiness window,
+4. does an **atomic kamal-proxy upstream flip** old → new,
+5. drains and stops the old release, then
+6. prunes old releases, keeping the most recent `keep_releases` (default `3`)
+   plus any rollback targets.
+
+Because the run stops at the first failure, a bad migration or a candidate that
+never reports `/ready` leaves the previous version serving and tears the
+candidate down automatically — there is no half-deployed state serving traffic.
+
+### Rollback
+
+Roll back to the previous release on demand:
+
+```bash
+autumn deploy rollback
+```
+
+This resolves the previous release on the host, brings its slot back up, flips
+the proxy back to it (health-gated on `/ready`), repoints `current`, and
+re-probes `/ready`. It fails loudly and non-zero when there is no previous
+release to return to.
+
+> **Rollback runs the same local preflight as `deploy up` first.** Before it
+> makes any remote call — before it even resolves the previous release on the
+> host — `autumn deploy rollback` runs the identical local preflight graders
+> (signing secret, database URL, migrate-safety) and aborts non-zero if any fail.
+> So it needs the same local inputs as a deploy — your project's `.env`/signing
+> secret and database URL, and the `migrations/` dir — available **wherever you
+> invoke it**: an emergency rollback from a bare CI checkout or a machine without
+> the project's secrets fails preflight before it ever reaches the host. Keep the
+> deploy inputs available where you would run a rollback.
+
+### Inspect the plan without touching the server
+
+```bash
+autumn deploy plan
+```
+
+`plan` is a pure dry-run: it prints a **representative** systemd unit and the
+ordered zero-downtime rollout steps for review, without connecting to the host.
+The printed unit is illustrative — it mirrors the shape of what gets installed
+(`User`, working directory, `EnvironmentFile`, restart policy) but is **not**
+byte-for-byte what a real `deploy up` writes. Live deploys write **slot-specific**
+units named `{service}-blue.service` / `{service}-green.service`, each pinned to
+its own release directory and bound to a private `127.0.0.1` port, so the blue
+and green slots can run side by side for the health-gated cutover while the proxy
+owns the public port.
+
+The step **order** is illustrative too: the list shows the overall rollout shape
+for review, but its exact order can differ from a live `deploy up` — for example,
+`plan` lists the migration step before starting the candidate, whereas a real
+redeploy starts the candidate first and then runs the pre-cutover migration. Use
+`plan` to review the shape and what happens, not as a byte-exact order or unit
+reference.
+
+### Where secrets live
+
+The signing secret and database URL are written **only** to
+`app_dir/shared/autumn.env` on the target, with mode `0600`, and are sourced by
+the systemd unit via `EnvironmentFile`. They are never inlined into the
+world-readable unit, never placed on a command line, and never printed to logs
+or error messages.
+
+### Troubleshooting
+
+- **Preflight is failing.** Run `autumn deploy check` (or `autumn doctor --online`)
+  — each failing grader prints the exact problem and a one-line fix (missing
+  `[deploy] host`, unreachable SSH port, missing/weak signing secret, missing
+  writable database URL, or an unsafe migration in your local `migrations/`
+  directory). `autumn deploy check`
+  always probes SSH reachability; plain `autumn doctor` skips network probes, so
+  use `autumn doctor --online` to include the SSH-reachability grader.
+- **`release binary not found …`** — run `autumn build --embed` first; `deploy
+  up` uploads the pre-built binary, it does not build for you.
+- **Nothing answers on the public port** — confirm the app's `server.port`
+  matches the port you are curling, and that the host firewall allows it.
+
+### Limitations and known gaps
+
+- **The `kamal-proxy` binary must be installed on the host** (at
+  `/usr/local/bin/kamal-proxy`) before the first deploy. `autumn deploy up`
+  configures and supervises the proxy but does not download its binary —
+  provision it as part of host bootstrap.
+- **Only the signing secret, database URL, and profile selector are written to
+  the host env file.** `autumn deploy` serializes just
+  `AUTUMN_SECURITY__SIGNING_SECRET`, (for database-backed apps)
+  `AUTUMN_DATABASE__URL`, and `AUTUMN_ENV` (the deploy profile, `prod` by
+  default); any other runtime secret (OAuth/SMTP/Redis/storage/etc.) must be
+  provisioned on the target separately. The file is rebuilt on every `deploy
+  up`, so hand-added entries do not persist.
+- **Your project's `autumn.toml` is not deployed**
+  ([#1952](https://github.com/madmax983/autumn/issues/1952)). `autumn deploy up`
+  uploads the release binary and writes the host env file (signing secret +
+  database URL + `AUTUMN_ENV`) but does not copy `autumn.toml`, and the app runs
+  from the release dir where none is present — so every non-secret runtime
+  setting (auth, jobs and scheduler backends, health/telemetry paths, CORS,
+  signing-secret rotation `previous_secrets`, etc.) resolves to its **default**
+  on the server. Hand-editing `app_dir/shared/autumn.env` is not a workaround —
+  the file is rebuilt on every `deploy up` — so until #1952 lands, re-apply any
+  non-secret config you need out of band on the host after each deploy.
+  Otherwise the deployed app can run a different configuration than the one you
+  tested locally.
+- **Migrations run on redeploys, not on the very first deploy.** The pre-cutover
+  migration one-shot is part of the zero-downtime redeploy path; the initial
+  `deploy up` stands the release up and health-gates it. For a database-backed
+  app, ensure the schema is applied (e.g. a follow-up `autumn deploy up`, or an
+  out-of-band `autumn migrate` against the primary) before relying on DB routes.
+- **Single host.** `[deploy] host` targets one server; there is no multi-host
+  fan-out. For horizontally scaled setups behind a shared load balancer, see
+  [Multi-replica setup](#multi-replica-setup).
+- **Remote state is updated step-by-step, not transactionally** (#1938). The
+  `current` symlink and the live/previous-release markers are written by
+  individual SSH commands, so an interrupted deploy can leave state mid-flight;
+  a subsequent `autumn deploy up` or `autumn deploy rollback` is the intended
+  recovery.
+
+---
+
 ## Step 1 — Create the project
 
 ```bash
