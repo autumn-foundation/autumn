@@ -171,9 +171,14 @@ openssl rand -hex 32
 ```
 
 Run the preflight — it checks SSH reachability, the signing secret, the database
-URL (when the app is DB-backed), and that pending migrations are safe for a
-rolling deploy. It exits non-zero if anything fails, so nothing touches the
-server until it is green:
+URL (when the app is DB-backed), and, via an offline scan of your local
+`migrations/` directory, that every migration file is safe for a rolling deploy.
+That scan does not consult the database, so it does not distinguish already-applied
+from pending migrations — an old destructive migration file left in the directory
+fails the check even after it has been applied. Keep `migrations/` rolling-safe
+(remove or adjust an already-applied destructive migration if it trips the scan).
+The preflight exits non-zero if anything fails, so nothing touches the server
+until it is green:
 
 ```bash
 autumn deploy check      # doctor --online runs the same graders (plain doctor skips network probes)
@@ -299,7 +304,8 @@ or error messages.
 - **Preflight is failing.** Run `autumn deploy check` (or `autumn doctor --online`)
   — each failing grader prints the exact problem and a one-line fix (missing
   `[deploy] host`, unreachable SSH port, missing/weak signing secret, missing
-  writable database URL, or an unsafe pending migration). `autumn deploy check`
+  writable database URL, or an unsafe migration in your local `migrations/`
+  directory). `autumn deploy check`
   always probes SSH reachability; plain `autumn doctor` skips network probes, so
   use `autumn doctor --online` to include the SSH-reachability grader.
 - **`release binary not found …`** — run `autumn build --embed` first; `deploy
