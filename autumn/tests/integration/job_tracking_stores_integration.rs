@@ -119,6 +119,7 @@ async fn redis_backend_persists_tracked_job_and_expires_it() {
 #[cfg(feature = "db")]
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
+#[allow(clippy::too_many_lines)]
 async fn postgres_backend_persists_tracked_job_and_expires_it() {
     use diesel_async::pooled_connection::AsyncDieselConnectionManager;
     use diesel_async::pooled_connection::deadpool::Pool;
