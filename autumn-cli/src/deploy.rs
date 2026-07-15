@@ -107,6 +107,9 @@ pub struct ResolvedDeployConfig {
     pub readiness_timeout_secs: u64,
     /// Prior releases retained on the host.
     pub keep_releases: u32,
+    /// Profile the deployed app runs under (written to the host env file as
+    /// `AUTUMN_ENV`). Defaults to the production profile (`"prod"`).
+    pub profile: String,
 }
 
 impl ResolvedDeployConfig {
@@ -133,6 +136,7 @@ impl ResolvedDeployConfig {
             service_name,
             readiness_timeout_secs: cfg.readiness_timeout_secs,
             keep_releases: cfg.keep_releases,
+            profile: cfg.profile.clone(),
         }
     }
 
@@ -866,11 +870,17 @@ fn print_plan(resolved: &ResolvedDeployConfig) {
 }
 
 /// Build the secret env-file body sourced by the systemd unit's
-/// `EnvironmentFile`. Only the values the app needs at runtime (the signing
-/// secret and the writable database URL) are emitted, and the result is wrapped
-/// in [`exec::Secret`] so it is never logged (AC-5).
-fn build_env_file(config: &AutumnConfig) -> exec::Secret {
+/// `EnvironmentFile`. Emits the runtime profile selector (`AUTUMN_ENV`, from the
+/// resolved `[deploy] profile`, default `prod`) so the deployed app never
+/// silently boots under the `dev` fallback, alongside the values the app needs
+/// at runtime (the signing secret and the writable database URL). The result is
+/// wrapped in [`exec::Secret`] so it is never logged (AC-5). The profile is a
+/// plain non-secret value; secret handling is unchanged.
+fn build_env_file(config: &AutumnConfig, resolved: &ResolvedDeployConfig) -> exec::Secret {
     let mut body = String::new();
+    body.push_str("AUTUMN_ENV=");
+    body.push_str(&resolved.profile);
+    body.push('\n');
     if let Some(secret) = config
         .security
         .signing_secret
@@ -946,7 +956,7 @@ fn run_up(config: &AutumnConfig, resolved: &ResolvedDeployConfig) -> Result<(), 
     let target = exec::SshTarget::from_resolved(resolved)
         .ok_or_else(|| DeployError::Config(DEPLOY_HOST_MISSING_DETAIL.to_owned()))?;
     let binary = resolve_release_binary(resolved)?;
-    let env_file = build_env_file(config);
+    let env_file = build_env_file(config, resolved);
     let release_id = default_release_id();
     let public_port = config.server.port;
     let proxy = proxy::KamalProxyController::new(resolved.readiness_timeout_secs);
@@ -1100,6 +1110,40 @@ mod tests {
         assert_eq!(resolved.readiness_timeout_secs, 60);
         assert_eq!(resolved.keep_releases, 3);
         assert_eq!(resolved.host, None);
+        assert_eq!(resolved.profile, "prod");
+    }
+
+    #[test]
+    fn build_env_file_sets_production_profile_by_default() {
+        // With no `[deploy] profile` set, the host env file must pin the app to
+        // the production profile so the deployed service never silently boots
+        // under the `dev` fallback.
+        let config = AutumnConfig::default();
+        let resolved = ResolvedDeployConfig::resolve(&DeployConfig::default(), "myapp");
+        let env_file = build_env_file(&config, &resolved);
+        assert!(
+            env_file.expose().lines().any(|l| l == "AUTUMN_ENV=prod"),
+            "env file should pin AUTUMN_ENV=prod by default, got: {:?}",
+            env_file.expose()
+        );
+    }
+
+    #[test]
+    fn build_env_file_honors_deploy_profile_override() {
+        // A non-prod target (e.g. staging) sets `[deploy] profile` and the host
+        // env file carries that value verbatim.
+        let config = AutumnConfig::default();
+        let cfg = DeployConfig {
+            profile: "staging".to_owned(),
+            ..DeployConfig::default()
+        };
+        let resolved = ResolvedDeployConfig::resolve(&cfg, "myapp");
+        let env_file = build_env_file(&config, &resolved);
+        assert!(
+            env_file.expose().lines().any(|l| l == "AUTUMN_ENV=staging"),
+            "env file should honor the [deploy] profile override, got: {:?}",
+            env_file.expose()
+        );
     }
 
     #[test]
