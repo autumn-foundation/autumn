@@ -245,10 +245,17 @@ let the app serve plain HTTP behind it. This is the right choice for the managed
 balancer.
 
 The push-button [`autumn deploy`](./deployment.md#push-button-deploy-to-your-own-server-autumn-deploy)
-path already works this way: **kamal-proxy fronts your app on the public port and
-terminates TLS**, while the app binds a private loopback port and serves HTTP.
-In this topology the app needs **neither** the `tls` **nor** the `acme` cargo
-feature and **no** `[server.tls]` section — the proxy owns the certificate.
+path installs **kamal-proxy** in front of your app, but as shipped it configures
+the proxy on the plain **HTTP** public port and does **not** provision a
+certificate — so that path serves HTTP, not HTTPS, until you add termination
+(see the deployment guide's [HTTPS/TLS note](./deployment.md#push-button-deploy-to-your-own-server-autumn-deploy)).
+To get HTTPS, either front the public port with a **TLS-terminating load
+balancer or reverse proxy** (including kamal-proxy with TLS configured yourself),
+or serve TLS **in-process** from the app via
+[`[server.tls]`](#direct-in-process-tls-servertls) or
+[ACME](#automatic-acme-certificates-servertlsacme). When TLS is terminated in
+front, the app needs **neither** the `tls` **nor** the `acme` cargo feature and
+**no** `[server.tls]` section — the terminating proxy owns the certificate.
 
 The same applies to any terminating proxy (nginx, Caddy, a cloud load balancer):
 point the proxy's certificate at the public `https://` port and forward to the

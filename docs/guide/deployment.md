@@ -49,10 +49,14 @@ below and are better fits in specific cases:
   [How the production image works](#how-the-production-image-works)) — a
   portable OCI image you run on Kubernetes, ECS, Nomad, or any Docker host.
 
-> **HTTPS/TLS.** kamal-proxy fronts your app on the public port and terminates
-> TLS, so the app itself serves plain HTTP behind the proxy. TLS termination and
-> ACME certificate issuance — including serving HTTPS directly from the app
-> without a proxy — are covered in the [TLS & HTTPS guide](./tls.md).
+> **HTTPS/TLS.** kamal-proxy fronts your app on the public port, but as
+> configured by `autumn deploy` today it listens on plain **HTTP** and does
+> **not** provision a TLS certificate — so following this path as shipped serves
+> HTTP on the public port. To serve HTTPS you either front the app with a
+> TLS-terminating load balancer or reverse proxy, or serve TLS in-process from
+> the app via ACME or a `[server.tls]` certificate. Both options — including
+> serving HTTPS directly from the app without a proxy — are covered in the
+> [TLS & HTTPS guide](./tls.md).
 
 > **Version.** The `autumn deploy` subcommands (`check` / `plan` / `up` /
 > `rollback`) are newer than the `autumn-cli 0.5.0` pinned under
