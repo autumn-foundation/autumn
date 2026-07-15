@@ -6345,6 +6345,19 @@ pub fn run(opts: DoctorOptions) {
         let deploy_db_backed_runtime =
             resolve_deploy_db_backed_runtime(&merged_deploy_toml, deploy_denv.as_ref());
 
+        // Grade DEPLOY-target checks against the resolved `[deploy] profile`
+        // (default `prod`), NOT the ambient CLI runtime profile (`is_production`,
+        // read from AUTUMN_ENV/AUTUMN_PROFILE, dev/false on a dev box). Otherwise
+        // `autumn doctor --strict` green-lights a weak deploy signing secret that
+        // `autumn deploy check`/`deploy up` FAIL, since those grade against the
+        // deploy profile the uploaded unit boots under. Normalize the profile the
+        // same way `deploy check` does so alias spellings (`PROD`/`Production`)
+        // still grade as production. Ambient (non-deploy) checks keep using
+        // `is_production` unchanged.
+        let deploy_is_production = crate::deploy::is_production_profile(Some(
+            &crate::deploy::canonicalize_deploy_profile(&deploy_cfg.profile),
+        ));
+
         // Host presence is validated OFFLINE (always, whenever `[deploy]` is
         // configured): a `[deploy]` table with a missing/blank `host` makes
         // `autumn deploy check` fail immediately, so default/offline `doctor
@@ -6383,7 +6396,7 @@ pub fn run(opts: DoctorOptions) {
                         crate::deploy::grade_signing_secret(
                             deploy_signing.as_deref(),
                             &deploy_previous_signing,
-                            is_production,
+                            deploy_is_production,
                         ),
                     )
                 }));

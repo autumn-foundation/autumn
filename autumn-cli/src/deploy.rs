@@ -107,6 +107,70 @@ pub struct ResolvedDeployConfig {
     pub readiness_timeout_secs: u64,
     /// Prior releases retained on the host.
     pub keep_releases: u32,
+    /// Profile the deployed app runs under (written to the host env file as
+    /// `AUTUMN_ENV`). Defaults to the production profile (`"prod"`).
+    pub profile: String,
+}
+
+/// Canonicalize a deploy profile string to the value the app's runtime resolver
+/// would produce, so the preflight grade and the `AUTUMN_ENV` written to the
+/// host env file agree on a single spelling.
+///
+/// Mirrors `autumn_web::config::normalize_profile_name` (the source of truth) so
+/// non-canonical spellings can't slip past preflight and then be rejected at
+/// host boot: trims whitespace; case-insensitively folds `production`/`prod` →
+/// `"prod"` and `development`/`dev` → `"dev"`; preserves any other non-empty
+/// value verbatim (custom profiles like `staging`/`QA`); and for a blank/empty
+/// value falls back to the deploy default `"prod"` (matching
+/// `autumn_web::config::default_deploy_profile`). Keep this in sync if the
+/// runtime rules ever change.
+// `pub(crate)` (not `pub`): reachable from `doctor` so it grades the deploy
+// signing secret against the same normalized deploy profile, but kept
+// crate-internal. In this bin-only crate `deploy` is a private module, so clippy
+// flags the `pub(crate)` as redundant; we keep it to document the intended
+// visibility rather than widening to `pub`.
+#[allow(clippy::redundant_pub_crate)]
+pub(crate) fn canonicalize_deploy_profile(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return "prod".to_owned();
+    }
+
+    if trimmed.eq_ignore_ascii_case("production") {
+        return "prod".to_owned();
+    }
+    if trimmed.eq_ignore_ascii_case("development") {
+        return "dev".to_owned();
+    }
+    if trimmed.eq_ignore_ascii_case("prod") {
+        return "prod".to_owned();
+    }
+    if trimmed.eq_ignore_ascii_case("dev") {
+        return "dev".to_owned();
+    }
+
+    // Preserve user-specified case for custom profile names.
+    trimmed.to_owned()
+}
+
+/// Trim a deploy profile string, preserving the operator's raw spelling.
+///
+/// This is what gets stored on [`ResolvedDeployConfig::profile`] and written to
+/// `AUTUMN_ENV`, so the host's runtime override-file lookup
+/// (`autumn_web::config::profile_override_file_lookup_names`) sees the exact
+/// selector the operator wrote — e.g. `autumn-production.toml` is preferred over
+/// `autumn-prod.toml` when the raw input was `production`. Alias folding here
+/// would flip that precedence, so we deliberately do NOT fold: trims whitespace;
+/// for a blank/empty value falls back to the deploy default `"prod"` (matching
+/// `autumn_web::config::default_deploy_profile`); otherwise returns the trimmed
+/// string verbatim (no alias folding, no case change). Grading normalizes
+/// separately via [`canonicalize_deploy_profile`] at the grade site.
+fn trimmed_deploy_profile(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return "prod".to_owned();
+    }
+    trimmed.to_owned()
 }
 
 impl ResolvedDeployConfig {
@@ -133,6 +197,7 @@ impl ResolvedDeployConfig {
             service_name,
             readiness_timeout_secs: cfg.readiness_timeout_secs,
             keep_releases: cfg.keep_releases,
+            profile: trimmed_deploy_profile(&cfg.profile),
         }
     }
 
@@ -778,10 +843,22 @@ fn collect_preflight(
             resolved.ssh_port,
             SSH_PROBE_TIMEOUT,
         ),
+        // Grade the signing secret against the SAME profile that will be written
+        // to the host env file (`AUTUMN_ENV=<resolved.profile>`, default `prod`),
+        // not the local CLI runtime profile (`config.profile`, dev/None on a dev
+        // box). Otherwise a weak/demo secret passes preflight locally but the
+        // uploaded unit boots under `prod` and exits in
+        // `fail_fast_on_invalid_signing_secret` — failing the deploy only AFTER
+        // touching the host. Keeping the grader and env-file profile coherent
+        // catches the weak secret locally, before any remote call.
         grade_signing_secret(
             config.security.signing_secret.secret.as_deref(),
             &config.security.signing_secret.previous_secrets,
-            is_production_profile(config.profile.as_deref()),
+            // `resolved.profile` holds the operator's trimmed RAW spelling (so the
+            // AUTUMN_ENV value preserves override-file precedence). Normalize it to
+            // the canonical profile only here, for grading, so `PROD`/`Production`/
+            // ` production ` are still held to the production strength rules.
+            is_production_profile(Some(&canonicalize_deploy_profile(&resolved.profile))),
         ),
         grade_database_url(
             resolve_writable_db_url(&config.database),
@@ -797,7 +874,11 @@ fn collect_preflight(
 /// path uses in `fail_fast_on_invalid_signing_secret`
 /// (`matches!(config.profile.as_deref(), Some("prod" | "production"))`).
 #[must_use]
-fn is_production_profile(profile: Option<&str>) -> bool {
+// `pub(crate)` (not `pub`): reachable from `doctor` for deploy-profile grading
+// but kept crate-internal. See the note on `canonicalize_deploy_profile` re: the
+// clippy allow (private module in a bin-only crate).
+#[allow(clippy::redundant_pub_crate)]
+pub(crate) fn is_production_profile(profile: Option<&str>) -> bool {
     matches!(profile, Some("prod" | "production"))
 }
 
@@ -866,11 +947,17 @@ fn print_plan(resolved: &ResolvedDeployConfig) {
 }
 
 /// Build the secret env-file body sourced by the systemd unit's
-/// `EnvironmentFile`. Only the values the app needs at runtime (the signing
-/// secret and the writable database URL) are emitted, and the result is wrapped
-/// in [`exec::Secret`] so it is never logged (AC-5).
-fn build_env_file(config: &AutumnConfig) -> exec::Secret {
+/// `EnvironmentFile`. Emits the runtime profile selector (`AUTUMN_ENV`, from the
+/// resolved `[deploy] profile`, default `prod`) so the deployed app never
+/// silently boots under the `dev` fallback, alongside the values the app needs
+/// at runtime (the signing secret and the writable database URL). The result is
+/// wrapped in [`exec::Secret`] so it is never logged (AC-5). The profile is a
+/// plain non-secret value; secret handling is unchanged.
+fn build_env_file(config: &AutumnConfig, resolved: &ResolvedDeployConfig) -> exec::Secret {
     let mut body = String::new();
+    body.push_str("AUTUMN_ENV=");
+    body.push_str(&resolved.profile);
+    body.push('\n');
     if let Some(secret) = config
         .security
         .signing_secret
@@ -946,7 +1033,7 @@ fn run_up(config: &AutumnConfig, resolved: &ResolvedDeployConfig) -> Result<(), 
     let target = exec::SshTarget::from_resolved(resolved)
         .ok_or_else(|| DeployError::Config(DEPLOY_HOST_MISSING_DETAIL.to_owned()))?;
     let binary = resolve_release_binary(resolved)?;
-    let env_file = build_env_file(config);
+    let env_file = build_env_file(config, resolved);
     let release_id = default_release_id();
     let public_port = config.server.port;
     let proxy = proxy::KamalProxyController::new(resolved.readiness_timeout_secs);
@@ -1100,6 +1187,187 @@ mod tests {
         assert_eq!(resolved.readiness_timeout_secs, 60);
         assert_eq!(resolved.keep_releases, 3);
         assert_eq!(resolved.host, None);
+        assert_eq!(resolved.profile, "prod");
+    }
+
+    #[test]
+    fn build_env_file_sets_production_profile_by_default() {
+        // With no `[deploy] profile` set, the host env file must pin the app to
+        // the production profile so the deployed service never silently boots
+        // under the `dev` fallback.
+        let config = AutumnConfig::default();
+        let resolved = ResolvedDeployConfig::resolve(&DeployConfig::default(), "myapp");
+        let env_file = build_env_file(&config, &resolved);
+        assert!(
+            env_file.expose().lines().any(|l| l == "AUTUMN_ENV=prod"),
+            "env file should pin AUTUMN_ENV=prod by default, got: {:?}",
+            env_file.expose()
+        );
+    }
+
+    #[test]
+    fn build_env_file_honors_deploy_profile_override() {
+        // A non-prod target (e.g. staging) sets `[deploy] profile` and the host
+        // env file carries that value verbatim.
+        let config = AutumnConfig::default();
+        let cfg = DeployConfig {
+            profile: "staging".to_owned(),
+            ..DeployConfig::default()
+        };
+        let resolved = ResolvedDeployConfig::resolve(&cfg, "myapp");
+        let env_file = build_env_file(&config, &resolved);
+        assert!(
+            env_file.expose().lines().any(|l| l == "AUTUMN_ENV=staging"),
+            "env file should honor the [deploy] profile override, got: {:?}",
+            env_file.expose()
+        );
+    }
+
+    #[test]
+    fn preflight_grades_signing_secret_against_resolved_deploy_profile() {
+        // Regression: preflight must grade the signing secret against the SAME
+        // profile that `build_env_file` writes to the host env file
+        // (`AUTUMN_ENV=<resolved.profile>`, default `prod`), NOT the local CLI
+        // runtime profile (`config.profile`, dev/None on a dev box). Otherwise a
+        // weak/demo secret sails through `deploy check`/`deploy up` locally, but
+        // the uploaded unit boots under `prod` and exits in
+        // `fail_fast_on_invalid_signing_secret` — failing the deploy only AFTER
+        // touching the host. The fix catches the weak secret locally.
+        let find_signing = |checks: &[PreflightCheck]| {
+            checks
+                .iter()
+                .find(|c| c.name == "signing_secret")
+                .expect("preflight includes a signing_secret check")
+                .clone()
+        };
+
+        // A weak/demo secret on a dev box: `config.profile` is None (non-prod),
+        // so the OLD behavior (grading against `config.profile`) would PASS.
+        let mut config = AutumnConfig::default();
+        config.security.signing_secret.secret = Some("changeme".to_owned());
+        assert!(
+            !is_production_profile(config.profile.as_deref()),
+            "guard: the local runtime profile is non-production in this test"
+        );
+
+        // Default deploy profile is `prod` (what the env file will pin), so the
+        // weak secret must FAIL preflight locally, before any remote call.
+        let prod_resolved = ResolvedDeployConfig::resolve(&DeployConfig::default(), "myapp");
+        assert_eq!(prod_resolved.profile, "prod");
+        let prod_check = find_signing(&collect_preflight(&config, &prod_resolved));
+        assert!(
+            !prod_check.passed,
+            "weak secret must fail preflight under the default (prod) deploy \
+             profile: {}",
+            prod_check.detail
+        );
+        // Never echo the secret value, even a known demo one.
+        assert!(!prod_check.detail.contains("changeme"));
+
+        // With a non-production deploy profile (e.g. staging) the same weak
+        // secret still passes — a dev/staging deploy is not held to the
+        // production strength rules, and the env file pins that same profile.
+        let staging_resolved = ResolvedDeployConfig::resolve(
+            &DeployConfig {
+                profile: "staging".to_owned(),
+                ..DeployConfig::default()
+            },
+            "myapp",
+        );
+        let staging_check = find_signing(&collect_preflight(&config, &staging_resolved));
+        assert!(
+            staging_check.passed,
+            "weak secret should pass preflight under a non-production deploy \
+             profile: {}",
+            staging_check.detail
+        );
+    }
+
+    #[test]
+    fn resolve_preserves_raw_profile_alias_while_grading_normalized() {
+        // Regression: the app's runtime resolver
+        // (`autumn_web::config::normalize_profile_name`) trims and case-folds
+        // profile aliases, so `PROD`, `Production`, and ` production ` all boot
+        // under the canonical `prod`. But the host's override-file lookup
+        // (`profile_override_file_lookup_names`) keys off the RAW selector
+        // spelling — it prefers `autumn-production.toml` over `autumn-prod.toml`
+        // when the raw input was `production`. So `resolved.profile` (and the
+        // `AUTUMN_ENV` value written from it) must preserve the operator's trimmed
+        // raw spelling, NOT the alias-folded form, or override-file precedence
+        // flips on hosts that have both files. Grading is normalized separately
+        // (canonicalize at the grade site) so a weak secret under `PROD`/
+        // `Production`/` production ` still FAILS preflight locally.
+        let find_signing = |checks: &[PreflightCheck]| {
+            checks
+                .iter()
+                .find(|c| c.name == "signing_secret")
+                .expect("preflight includes a signing_secret check")
+                .clone()
+        };
+
+        let mut config = AutumnConfig::default();
+        config.security.signing_secret.secret = Some("changeme".to_owned());
+
+        // Non-canonical production spellings preserve the operator's trimmed raw
+        // spelling in `resolved.profile` / AUTUMN_ENV, yet still grade as
+        // production (canonicalize-at-grade) and thus FAIL the weak secret.
+        for (raw, expected) in [
+            ("PROD", "PROD"),
+            ("Production", "Production"),
+            (" production ", "production"),
+        ] {
+            let resolved = ResolvedDeployConfig::resolve(
+                &DeployConfig {
+                    profile: raw.to_owned(),
+                    ..DeployConfig::default()
+                },
+                "myapp",
+            );
+            assert_eq!(
+                resolved.profile, expected,
+                "profile {raw:?} should preserve the trimmed raw spelling"
+            );
+            // The value written to AUTUMN_ENV is that same trimmed raw spelling,
+            // so the host's override-file precedence is preserved.
+            let expected_env = format!("AUTUMN_ENV={expected}");
+            assert!(
+                build_env_file(&config, &resolved)
+                    .expose()
+                    .lines()
+                    .any(|l| l == expected_env),
+                "env file should pin {expected_env:?} for raw profile {raw:?}"
+            );
+            // Grading normalizes the raw spelling, so it still grades production.
+            assert!(
+                is_production_profile(Some(&canonicalize_deploy_profile(&resolved.profile))),
+                "normalized profile must grade as production for raw profile {raw:?}"
+            );
+            let check = find_signing(&collect_preflight(&config, &resolved));
+            assert!(
+                !check.passed,
+                "weak secret must fail preflight for production spelling {raw:?}: {}",
+                check.detail
+            );
+            assert!(!check.detail.contains("changeme"));
+        }
+
+        // A custom profile is preserved verbatim and grades non-production, so
+        // the same weak secret passes (custom deploys aren't held to prod rules).
+        let staging = ResolvedDeployConfig::resolve(
+            &DeployConfig {
+                profile: "staging".to_owned(),
+                ..DeployConfig::default()
+            },
+            "myapp",
+        );
+        assert_eq!(staging.profile, "staging");
+        assert!(!is_production_profile(Some(&staging.profile)));
+        let staging_check = find_signing(&collect_preflight(&config, &staging));
+        assert!(
+            staging_check.passed,
+            "weak secret should pass preflight under the custom `staging` profile: {}",
+            staging_check.detail
+        );
     }
 
     #[test]

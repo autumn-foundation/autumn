@@ -223,6 +223,49 @@ fn doctor_fails_on_malformed_previous_secrets() {
 }
 
 #[test]
+fn doctor_grades_deploy_signing_secret_against_deploy_profile() {
+    // Regression: doctor must grade the DEPLOY signing secret against the resolved
+    // `[deploy] profile` (default `prod`), NOT the ambient CLI runtime profile.
+    // On a dev box with the ambient profile dev (no `AUTUMN_ENV=production`) and a
+    // WEAK/demo deploy signing secret, the OLD behavior graded `deploy_signing_secret`
+    // with the ambient (non-production) flag and PASSED it — even though
+    // `autumn deploy check`/`deploy up` grade against the deploy profile (`prod`)
+    // and FAIL the same weak secret. Doctor and `deploy check` must agree: the
+    // check must FAIL here.
+    let dir = project("host = \"deploy.example.test\"\n");
+    // A known demo/template value ("changeme") — invalid under production grading.
+    // Delivered via the process env (resolved env-first like `deploy check`).
+    // Crucially, `AUTUMN_ENV=production` is NOT set, so the ambient profile is dev:
+    // only the deploy-profile-aware grade can catch this weak secret.
+    let (stdout, stderr, code) = run_autumn(
+        dir.path(),
+        &["doctor"],
+        &[("AUTUMN_SECURITY__SIGNING_SECRET", "changeme")],
+    );
+    let combined = format!("{stdout}{stderr}");
+    assert_ne!(
+        code,
+        Some(0),
+        "doctor must fail on a weak deploy signing secret under the default (prod) \
+         deploy profile, even with an ambient dev profile\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        combined.contains("deploy_signing_secret"),
+        "doctor must surface the deploy_signing_secret check\n{combined}"
+    );
+    assert!(
+        combined.contains("known demo/template value not allowed in production"),
+        "doctor must fail the deploy signing secret as a known demo value under the \
+         deploy profile\n{combined}"
+    );
+    // The demo secret value must never be echoed.
+    assert!(
+        !combined.contains("changeme"),
+        "doctor must not echo the demo secret value\n{combined}"
+    );
+}
+
+#[test]
 fn doctor_flags_dotenv_db_backed_runtime_without_db() {
     // Regression: `.env`-only postgres backend must make doctor require a deploy
     // DB, matching `deploy check` (Codex P2 on 2dc71f7); bare OsEnv wrongly

@@ -1248,6 +1248,7 @@ pub struct AutumnConfig {
 /// service_name = "myapp"     # systemd unit name; default: {app_name}
 /// readiness_timeout_secs = 60 # readiness window before rollback (default: 60)
 /// keep_releases = 3          # releases retained on the host (default: 3)
+/// profile = "prod"           # profile the deployed app runs under (default: "prod")
 /// ```
 #[derive(Debug, Clone, Deserialize)]
 pub struct DeployConfig {
@@ -1290,6 +1291,13 @@ pub struct DeployConfig {
     /// Number of prior releases retained on the host for rollback. Default: `3`.
     #[serde(default = "default_deploy_keep_releases")]
     pub keep_releases: u32,
+
+    /// The profile the deployed app runs under (written into the host env file
+    /// as `AUTUMN_ENV`). Defaults to the production profile (`"prod"`) so a
+    /// deploy never silently runs the `dev` profile; set to e.g. `"staging"`
+    /// for non-prod targets.
+    #[serde(default = "default_deploy_profile")]
+    pub profile: String,
 }
 
 impl Default for DeployConfig {
@@ -1303,6 +1311,7 @@ impl Default for DeployConfig {
             service_name: None,
             readiness_timeout_secs: default_deploy_readiness_timeout_secs(),
             keep_releases: default_deploy_keep_releases(),
+            profile: default_deploy_profile(),
         }
     }
 }
@@ -6521,7 +6530,7 @@ pub struct CompressionConfig {
 // Exposed for autumn-cli's `autumn deploy` preflight (doctor) to reuse the deploy env-override logic; not yet a stable public API.
 #[doc(hidden)]
 pub fn apply_deploy_env_overrides(deploy: &mut Option<DeployConfig>, env: &dyn Env) {
-    const KEYS: [&str; 8] = [
+    const KEYS: [&str; 9] = [
         "AUTUMN_DEPLOY__HOST",
         "AUTUMN_DEPLOY__USER",
         "AUTUMN_DEPLOY__SSH_PORT",
@@ -6530,6 +6539,7 @@ pub fn apply_deploy_env_overrides(deploy: &mut Option<DeployConfig>, env: &dyn E
         "AUTUMN_DEPLOY__SERVICE_NAME",
         "AUTUMN_DEPLOY__READINESS_TIMEOUT_SECS",
         "AUTUMN_DEPLOY__KEEP_RELEASES",
+        "AUTUMN_DEPLOY__PROFILE",
     ];
     if !KEYS.iter().any(|key| env.var(key).is_ok()) {
         return;
@@ -6551,6 +6561,7 @@ pub fn apply_deploy_env_overrides(deploy: &mut Option<DeployConfig>, env: &dyn E
         "AUTUMN_DEPLOY__KEEP_RELEASES",
         &mut deploy.keep_releases,
     );
+    parse_env_string(env, "AUTUMN_DEPLOY__PROFILE", &mut deploy.profile);
 }
 
 /// Parse an environment variable into a typed target, logging a warning on failure.
@@ -6730,6 +6741,12 @@ const fn default_deploy_readiness_timeout_secs() -> u64 {
 /// Default number of prior releases retained on the host for rollback.
 const fn default_deploy_keep_releases() -> u32 {
     3
+}
+
+/// Default profile the deployed app runs under. Defaults to the production
+/// profile so an `autumn deploy` never silently boots under the `dev` profile.
+fn default_deploy_profile() -> String {
+    "prod".to_owned()
 }
 
 /// Default directory for the ACME account key and issued certificates
@@ -10552,7 +10569,8 @@ path = "/healthz"
             .with("AUTUMN_DEPLOY__APP_DIR", "/srv/myapp")
             .with("AUTUMN_DEPLOY__SERVICE_NAME", "myapp-web")
             .with("AUTUMN_DEPLOY__READINESS_TIMEOUT_SECS", "90")
-            .with("AUTUMN_DEPLOY__KEEP_RELEASES", "5");
+            .with("AUTUMN_DEPLOY__KEEP_RELEASES", "5")
+            .with("AUTUMN_DEPLOY__PROFILE", "staging");
         let mut config = AutumnConfig::default();
         assert!(config.deploy.is_none());
         config.apply_env_overrides_with_env(&env);
@@ -10565,7 +10583,44 @@ path = "/healthz"
         assert_eq!(deploy.service_name.as_deref(), Some("myapp-web"));
         assert_eq!(deploy.readiness_timeout_secs, 90);
         assert_eq!(deploy.keep_releases, 5);
+        assert_eq!(deploy.profile, "staging");
         assert!(deploy.validate().is_ok());
+    }
+
+    #[test]
+    fn deploy_profile_defaults_to_production() {
+        // A bare `[deploy]` table (or one omitting `profile`) resolves to the
+        // production profile so a deploy never silently runs the `dev` profile.
+        let config: AutumnConfig = toml::from_str(
+            r#"
+            [deploy]
+            host = "203.0.113.10"
+            "#,
+        )
+        .unwrap();
+        let deploy = config.deploy.expect("deploy configured");
+        assert_eq!(deploy.profile, "prod");
+        // The type default matches the serde default.
+        assert_eq!(DeployConfig::default().profile, "prod");
+    }
+
+    #[test]
+    fn deploy_profile_honors_toml_and_env_override() {
+        // TOML sets a non-prod profile...
+        let mut config: AutumnConfig = toml::from_str(
+            r#"
+            [deploy]
+            host = "toml-host"
+            profile = "staging"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(config.deploy.as_ref().unwrap().profile, "staging");
+
+        // ...and `AUTUMN_DEPLOY__PROFILE` wins over the TOML value.
+        let env = MockEnv::new().with("AUTUMN_DEPLOY__PROFILE", "prod");
+        config.apply_env_overrides_with_env(&env);
+        assert_eq!(config.deploy.unwrap().profile, "prod");
     }
 
     #[test]
