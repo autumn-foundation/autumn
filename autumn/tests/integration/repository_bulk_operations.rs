@@ -664,7 +664,7 @@ async fn test_zero_col_bulk_insert() {
 
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
-async fn test_tenant_scoped_upsert_many_mismatch() {
+async fn test_tenant_scoped_upsert_many_filters_cross_tenant_silently() {
     use autumn_web::tenancy::with_tenant;
 
     let (pool, _container) = setup_pool().await;
@@ -680,25 +680,51 @@ async fn test_tenant_scoped_upsert_many_mismatch() {
     })
     .await;
 
-    // 2. Try to upsert the same ID under tenant-b context
-    let stale_or_mismatched = with_tenant("tenant-b".to_string(), async {
+    // 2. Try to upsert that same ID under tenant-b context.
+    //
+    //    A NON-versioned (`!has_lock`) tenant-scoped repo SILENTLY FILTERS a
+    //    cross-tenant row: the SQL `WHERE tenant_id` scoping simply never matches
+    //    the tenant-a row, so it is left out of the result rather than provoking a
+    //    loud `bad_request` "Tenant conflict" error. This mirrors single-op tenant
+    //    scoping and the sibling bulk `update_many` / `delete_many` contract
+    //    (`tenancy::test_bulk_ops_tenant_scoping`). Isolation is still fully
+    //    enforced — the foreign-tenant row is neither returned nor mutated.
+    //    (The loud 409 path is only for a *versioned* repo hitting a genuine
+    //    optimistic-lock conflict; see `test_lock_version_upsert_many_conflict`.)
+    let upserted = with_tenant("tenant-b".to_string(), async {
         let mut to_upsert = record_a.clone();
-        to_upsert.name = "B".to_string(); // Try to overwrite it or update it
-
+        to_upsert.name = "B".to_string(); // Attempt to overwrite the tenant-a row
         repo.upsert_many(&[to_upsert]).await
     })
-    .await;
+    .await
+    .expect(
+        "non-versioned tenant-scoped upsert_many must silently filter a cross-tenant row (Ok, not Err)",
+    );
 
-    // This must return a conflict/bad_request error due to tenant mismatch
+    // The cross-tenant row must NOT be upserted: nothing was in scope for
+    // tenant-b, so the returned vec excludes it (and is empty here).
     assert!(
-        stale_or_mismatched.is_err(),
-        "Expected tenant mismatch error, but it succeeded!"
+        !upserted.iter().any(|r| r.name == "B"),
+        "cross-tenant row must not appear in the upserted result, got: {upserted:?}"
     );
-    let err_str = stale_or_mismatched.unwrap_err().to_string();
     assert!(
-        err_str.contains("Tenant conflict") || err_str.contains("potential cross-tenant conflict"),
-        "Expected cross-tenant conflict error, got: {err_str}"
+        upserted.is_empty(),
+        "no in-scope rows existed for tenant-b, so nothing should be upserted, got: {upserted:?}"
     );
+
+    // Security property (unchanged): the foreign tenant-a row is UNTOUCHED — the
+    // tenant-b upsert never hijacked it to name "B".
+    let tenant_a_row = repo
+        .across_tenants()
+        .find_by_id(record_a.id)
+        .await
+        .unwrap()
+        .expect("tenant-a row still exists");
+    assert_eq!(
+        tenant_a_row.name, "A",
+        "tenant-a row must remain unchanged (no cross-tenant hijack)"
+    );
+    assert_eq!(tenant_a_row.tenant_id, "tenant-a");
 }
 
 #[tokio::test]
