@@ -52,9 +52,14 @@ below and are better fits in specific cases:
 > **HTTPS/TLS.** kamal-proxy fronts your app on the public port, but as
 > configured by `autumn deploy` today it listens on plain **HTTP** and does
 > **not** provision a TLS certificate — so following this path as shipped serves
-> HTTP on the public port. To serve HTTPS on the deploy path, terminate TLS **in
-> front of** the app: a TLS-terminating load balancer or reverse proxy, or
-> kamal-proxy configured with TLS by you. Don't enable in-process
+> HTTP on the public port. To serve HTTPS on the deploy path, place an
+> **external TLS terminator in front of** the deploy-managed kamal-proxy: a
+> TLS-terminating load balancer or reverse proxy that owns the certificate and
+> forwards plain HTTP to the kamal-proxy public port. The deploy-managed
+> kamal-proxy is HTTP-only — `autumn deploy` runs it as `kamal-proxy run
+> --http-port` and issues `kamal-proxy deploy --target --health-check-path` with
+> no `--host`/`--tls`, so it can't create or preserve TLS on that proxy. Don't
+> enable in-process
 > `[server.tls]`/ACME on a deploy-managed app — deploy binds each slot to a
 > private loopback HTTP port that the readiness gate and kamal-proxy target over
 > plain HTTP, so a TLS listener there breaks its health checks. See the [TLS &
