@@ -53,14 +53,30 @@ below and are better fits in specific cases:
 > and ACME certificate issuance are covered in the TLS guide (tracked in
 > [#1860](https://github.com/madmax983/autumn/issues/1860)).
 
+> **Version.** The `autumn deploy` subcommands (`check` / `plan` / `up` /
+> `rollback`) are newer than the `autumn-cli 0.5.0` pinned under
+> [Prerequisites](#prerequisites) — that build does not include them — and they
+> are not yet part of a published release. Until the next autumn-cli release
+> ships them, install the CLI from the latest source (`cargo install autumn-cli
+> --git https://github.com/madmax983/autumn`) and confirm the subcommand is
+> present with `autumn deploy --help`.
+
 ### Preconditions
 
 Everything except two host prerequisites is automated by `autumn deploy up`:
 
-- **Key-based SSH access to a stock Ubuntu LTS (or other systemd) host.** The
-  deploy runs non-interactively (`BatchMode=yes`) as the configured user
-  (`[deploy] user`, default `root`) — no password prompts, so your SSH key must
-  already be authorized on the target.
+- **Key-based SSH access as `root` (or an equivalently privileged account) to a
+  stock Ubuntu LTS (or other systemd) host.** The deploy runs non-interactively
+  (`BatchMode=yes`) as the configured user (`[deploy] user`, default `root`) —
+  no password prompts, so your SSH key must already be authorized on the target.
+  `autumn deploy` runs its remote steps **directly over SSH, without `sudo`**: it
+  writes units into `/etc/systemd/system/`, runs `systemctl`
+  (`daemon-reload`/`enable`/`restart`/`disable`) and `systemd-run`, and writes
+  under the app directory. The `[deploy] user` must therefore be `root` (the
+  default) or an account that **already holds those permissions directly**. A
+  plain non-root SSH login passes preflight (which only checks reachability and
+  secrets, not privilege) and then fails once it tries to write the unit or
+  invoke `systemctl`.
 - **The `kamal-proxy` binary present at `/usr/local/bin/kamal-proxy`.** The
   deploy writes and supervises the proxy's systemd unit, but does **not**
   download the binary itself — install it once as part of host bootstrap. (See
@@ -210,8 +226,15 @@ release to return to.
 autumn deploy plan
 ```
 
-`plan` is a pure dry-run: it prints the exact systemd unit and the ordered
-zero-downtime rollout steps without connecting to the host.
+`plan` is a pure dry-run: it prints a **representative** systemd unit and the
+ordered zero-downtime rollout steps for review, without connecting to the host.
+The printed unit is illustrative — it mirrors the shape of what gets installed
+(`User`, working directory, `EnvironmentFile`, restart policy) but is **not**
+byte-for-byte what a real `deploy up` writes. Live deploys write **slot-specific**
+units named `{service}-blue.service` / `{service}-green.service`, each pinned to
+its own release directory and bound to a private `127.0.0.1` port, so the blue
+and green slots can run side by side for the health-gated cutover while the proxy
+owns the public port.
 
 ### Where secrets live
 
