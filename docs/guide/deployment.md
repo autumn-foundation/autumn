@@ -122,15 +122,26 @@ AUTUMN_SECURITY__SIGNING_SECRET=<paste `openssl rand -hex 32` here>
 AUTUMN_DATABASE__URL=postgres://user:pass@db-host:5432/myapp_prod
 ```
 
-> **Only the signing secret and the database URL are deployed.** `autumn deploy`
-> serializes exactly two variables to the host env file:
-> `AUTUMN_SECURITY__SIGNING_SECRET` and — for database-backed apps —
-> `AUTUMN_DATABASE__URL`. **Any other runtime secret** (OAuth client secrets,
-> SMTP credentials, a Redis URL, object-storage keys, etc.) placed in `.env` is
+> **The signing secret, the database URL, and the profile selector are
+> deployed.** `autumn deploy` serializes exactly three variables to the host env
+> file: `AUTUMN_SECURITY__SIGNING_SECRET`, — for database-backed apps —
+> `AUTUMN_DATABASE__URL`, and `AUTUMN_ENV` (the deploy profile, `prod` by
+> default — see below). **Any other runtime secret** (OAuth client secrets, SMTP
+> credentials, a Redis URL, object-storage keys, etc.) placed in `.env` is
 > **not** transferred to the server, so those features fail in production unless
-> you provision the secret on the target host yourself — append it to
-> `app_dir/shared/autumn.env` on the server, or add it to the systemd unit
-> environment.
+> you provision the secret on the target host yourself. The env file is
+> **rebuilt from scratch on every `deploy up`**, so hand-adding entries to
+> `app_dir/shared/autumn.env` is not durable — they are overwritten on the next
+> deploy; provision such secrets out of band on the host (or via the systemd
+> unit environment) and re-apply them after each deploy.
+
+> **`autumn deploy` runs the app under the production profile by default.** The
+> deploy writes `AUTUMN_ENV=prod` into the host env file, so the deployed app
+> boots under the `prod` profile and its production smart-defaults apply — strict
+> CORS, minimal actuators, prod CSRF/session hardening, and strict
+> signing-secret enforcement. To deploy a non-production target, set `[deploy]
+> profile = "staging"` in `autumn.toml` (or `AUTUMN_DEPLOY__PROFILE=staging`);
+> the deploy writes that value as `AUTUMN_ENV` instead.
 
 > **Your `autumn.toml` is not deployed — non-secret settings fall back to
 > defaults on the host.** `autumn deploy up` uploads the release binary and
@@ -140,15 +151,18 @@ AUTUMN_DATABASE__URL=postgres://user:pass@db-host:5432/myapp_prod
 > no `autumn.toml` and every non-secret runtime setting — auth, the jobs and
 > scheduler backends, health/telemetry paths, CORS, signing-secret rotation
 > (`security.signing_secret.previous_secrets`), and so on — resolves to its
-> **default**, regardless of what you configured and tested locally. Only the two
-> values in the host env file (`AUTUMN_SECURITY__SIGNING_SECRET` and, for
-> database-backed apps, `AUTUMN_DATABASE__URL`) make the trip. To run the
-> configuration you actually tested, provision it on the host yourself: place
-> your `autumn.toml` in the release/app dir on the server, or set the matching
-> `AUTUMN_*` environment overrides in `app_dir/shared/autumn.env` (the env-file
-> route persists across releases; a file dropped into a timestamped release dir
-> does not). Otherwise the deployed app can run a different configuration than the
-> one you tested locally.
+> **default**, regardless of what you configured and tested locally (the `prod`
+> profile still applies its smart-defaults). Only the three values in the host
+> env file (`AUTUMN_SECURITY__SIGNING_SECRET`; for database-backed apps,
+> `AUTUMN_DATABASE__URL`; and `AUTUMN_ENV`, the profile selector) make the trip.
+> This is a known gap tracked in
+> [#1952](https://github.com/madmax983/autumn/issues/1952). Do **not** try to
+> work around it by hand-editing `app_dir/shared/autumn.env`: the deploy
+> **rebuilds that file from scratch on every `deploy up`** (writing exactly the
+> signing secret, database URL, and `AUTUMN_ENV`), so any overrides you add there
+> are overwritten on the next deploy. Until #1952 lands, re-apply the non-secret
+> configuration you need out of band on the host after each deploy. Otherwise the
+> deployed app can run a different configuration than the one you tested locally.
 
 Generate the signing secret once and store it somewhere durable:
 
@@ -179,8 +193,9 @@ it fails, then on this first run:
    (`server.port`, default `3000`),
 2. creates the release + `shared` directories under `app_dir`,
 3. uploads the binary into a timestamped release dir (`0755`),
-4. writes your secrets to `app_dir/shared/autumn.env` (`0600`, sourced by
-   systemd — never printed, never on a command line),
+4. writes the signing secret, database URL, and `AUTUMN_ENV` (the profile,
+   `prod` by default) to `app_dir/shared/autumn.env` (`0600`, sourced by
+   systemd — never printed, never on a command line; rebuilt each deploy),
 5. writes the app's systemd unit (bound to a private `127.0.0.1` port),
    points `current` at the release, and starts it,
 6. health-gates on `GET /ready` within `readiness_timeout_secs`, then
@@ -298,18 +313,23 @@ or error messages.
   `/usr/local/bin/kamal-proxy`) before the first deploy. `autumn deploy up`
   configures and supervises the proxy but does not download its binary —
   provision it as part of host bootstrap.
-- **Only the signing secret and database URL are written to the host env file.**
-  `autumn deploy` serializes just `AUTUMN_SECURITY__SIGNING_SECRET` and (for
-  database-backed apps) `AUTUMN_DATABASE__URL`; any other runtime secret
-  (OAuth/SMTP/Redis/storage/etc.) must be provisioned on the target separately.
-- **Your project's `autumn.toml` is not deployed.** `autumn deploy up` uploads
-  the release binary and writes the host env file (signing secret + database
-  URL) but does not copy `autumn.toml`, and the app runs from the release dir
-  where none is present — so every non-secret runtime setting (auth, jobs and
-  scheduler backends, health/telemetry paths, CORS, signing-secret rotation
-  `previous_secrets`, etc.) resolves to its **default** on the server. Provision
-  it separately if you need it: place `autumn.toml` in the release/app dir on the
-  host, or set the matching `AUTUMN_*` overrides in `app_dir/shared/autumn.env`.
+- **Only the signing secret, database URL, and profile selector are written to
+  the host env file.** `autumn deploy` serializes just
+  `AUTUMN_SECURITY__SIGNING_SECRET`, (for database-backed apps)
+  `AUTUMN_DATABASE__URL`, and `AUTUMN_ENV` (the deploy profile, `prod` by
+  default); any other runtime secret (OAuth/SMTP/Redis/storage/etc.) must be
+  provisioned on the target separately. The file is rebuilt on every `deploy
+  up`, so hand-added entries do not persist.
+- **Your project's `autumn.toml` is not deployed**
+  ([#1952](https://github.com/madmax983/autumn/issues/1952)). `autumn deploy up`
+  uploads the release binary and writes the host env file (signing secret +
+  database URL + `AUTUMN_ENV`) but does not copy `autumn.toml`, and the app runs
+  from the release dir where none is present — so every non-secret runtime
+  setting (auth, jobs and scheduler backends, health/telemetry paths, CORS,
+  signing-secret rotation `previous_secrets`, etc.) resolves to its **default**
+  on the server. Hand-editing `app_dir/shared/autumn.env` is not a workaround —
+  the file is rebuilt on every `deploy up` — so until #1952 lands, re-apply any
+  non-secret config you need out of band on the host after each deploy.
   Otherwise the deployed app can run a different configuration than the one you
   tested locally.
 - **Migrations run on redeploys, not on the very first deploy.** The pre-cutover
