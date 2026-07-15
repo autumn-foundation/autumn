@@ -122,12 +122,27 @@ async fn redis_backend_persists_tracked_job_and_expires_it() {
 async fn postgres_backend_persists_tracked_job_and_expires_it() {
     use diesel_async::pooled_connection::AsyncDieselConnectionManager;
     use diesel_async::pooled_connection::deadpool::Pool;
-    use diesel_async::{AsyncPgConnection, RunQueryDsl};
+    use diesel_async::{AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
     use testcontainers::runners::AsyncRunner;
     use testcontainers_modules::postgres::Postgres;
 
     const CREATE_AUTUMN_JOBS: &str =
         include_str!("../../migrations/20260513000000_create_job_queue/up.sql");
+    // The base `create_job_queue` table predates several additive `autumn_jobs`
+    // columns the store's enqueue path writes (trace context, uniqueness /
+    // concurrency keys, the pending-unique-key, and — critically — the named
+    // `queue` column added by `add_queue_to_jobs`). Seed the same additive
+    // migrations the production runner applies on top of the base table so the
+    // schema matches production at enqueue time; otherwise enqueue fails with
+    // `column "queue" of relation "autumn_jobs" does not exist`.
+    const ADD_TRACE_CONTEXT_TO_JOBS: &str =
+        include_str!("../../migrations/20260519000000_add_trace_context_to_jobs/up.sql");
+    const ADD_JOB_UNIQUENESS_CONCURRENCY: &str =
+        include_str!("../../migrations/20260610000000_add_job_uniqueness_concurrency/up.sql");
+    const ADD_PENDING_UNIQUE_KEY_TO_JOBS: &str =
+        include_str!("../../migrations/20260611000000_add_pending_unique_key_to_jobs/up.sql");
+    const ADD_QUEUE_TO_JOBS: &str =
+        include_str!("../../migrations/20260628000000_add_queue_to_jobs/up.sql");
     const CREATE_JOB_TRACKING: &str =
         include_str!("../../migrations/20260702000000_create_job_tracking/up.sql");
 
@@ -163,14 +178,32 @@ async fn postgres_backend_persists_tracked_job_and_expires_it() {
 
     {
         let mut conn = pool.get().await.expect("get connection");
-        diesel::sql_query(CREATE_AUTUMN_JOBS)
-            .execute(&mut *conn)
+        // Apply the migration `up.sql` scripts through the simple-query
+        // protocol (`batch_execute`), matching the production migration runner:
+        // these files contain multiple statements, which the prepared/extended
+        // query path (`sql_query(..).execute(..)`) rejects with "cannot insert
+        // multiple commands into a prepared statement".
+        conn.batch_execute(CREATE_AUTUMN_JOBS)
             .await
             .expect("apply create_job_queue migration");
+        // Bring `autumn_jobs` up to the full production schema (in migration
+        // order) so every column the enqueue path writes — including `queue` —
+        // exists before `enqueue_tracked` runs.
+        conn.batch_execute(ADD_TRACE_CONTEXT_TO_JOBS)
+            .await
+            .expect("apply add_trace_context_to_jobs migration");
+        conn.batch_execute(ADD_JOB_UNIQUENESS_CONCURRENCY)
+            .await
+            .expect("apply add_job_uniqueness_concurrency migration");
+        conn.batch_execute(ADD_PENDING_UNIQUE_KEY_TO_JOBS)
+            .await
+            .expect("apply add_pending_unique_key_to_jobs migration");
+        conn.batch_execute(ADD_QUEUE_TO_JOBS)
+            .await
+            .expect("apply add_queue_to_jobs migration");
         // Proves the migration in this PR actually creates the table the
         // store depends on — not just that hand-written SQL happens to work.
-        diesel::sql_query(CREATE_JOB_TRACKING)
-            .execute(&mut *conn)
+        conn.batch_execute(CREATE_JOB_TRACKING)
             .await
             .expect("apply create_job_tracking migration");
     }

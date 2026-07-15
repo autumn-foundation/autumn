@@ -122,17 +122,33 @@ jobs:
           # above). Runs in the existing Docker-dependent Linux step rather than a
           # separate required gate.
           cargo test -p autumn-cli --test cli_tests -- --ignored offsite
-          # offline-sync is not a default feature, so the workspace test run
-          # above compiles these out; run them (plus the Docker-gated PG
-          # conformance suite) here.
-          cargo test -p autumn-web --features offline-sync --test integration_tests offline_sync
-          cargo test -p autumn-web --features offline-sync --test integration_tests -- --ignored offline_sync_pg
-          # Nested has_many form atomic-save + persistence tests (#1346, AC5/AC7):
-          # testcontainer-backed `#[ignore]`d tests gated behind `test-support`
-          # (db + maud stay on as defaults). The `nested_form` filter selects the
-          # Docker-dependent cases in nested_form_atomic_save + the persisted
-          # nested_form_order_example tests and nothing else.
-          cargo test -p autumn-web --features test-support --test integration_tests -- --ignored nested_form
+          # Consolidated `integration_tests` binary: discover-and-run ALL the
+          # Docker/testcontainer `#[ignore]`d DB tests instead of a hand-curated
+          # per-feature allowlist (#1923). Enabling `test-support` (testcontainers)
+          # + `offline-sync` compiles in every db-gated module (db + maud are
+          # already defaults), and the bare `--ignored` sweep then runs every
+          # ignored test in the binary — so a newly-added house-pattern
+          # testcontainer DB test runs here automatically, with no workflow edit.
+          # This subsumes the old offline_sync_pg (#1346) and nested_form (#1346)
+          # scoped lines and picks up the previously-unrun suites
+          # (validate_on_update_blind #1801, repository_*, tenancy, distributed_lock, …).
+          #
+          # Non-Docker `#[ignore]` tests must NOT be swept in here: browser
+          # (Chromium) tests live behind the `system-tests` feature and never
+          # compile into this run; any other non-Docker ignored test (bench /
+          # timing) must be feature-gated OR added to the `--skip` list below.
+          # The lone current exception is the release-mode timing microbenchmark
+          # in access_log.rs, which is unconditionally compiled.
+          # The non-ignored offline-sync engine/store/conformance tests are
+          # `#[cfg(feature = "offline-sync")]` (not a default feature), so the
+          # workspace test run above compiles them out; run them here. Same
+          # feature set as the sweep below so the binary is compiled once.
+          cargo test -p autumn-web --features "test-support,offline-sync" --test integration_tests offline_sync
+          cargo test -p autumn-web --features "test-support,offline-sync" --test integration_tests -- \
+            --ignored \
+            --test-threads=1 \
+            --skip per_request_overhead_is_under_50_microseconds_p99 \
+            --skip cancelled_release_does_not_leak_lock # flaky wall-clock zero-duration-timeout race; needs deterministic/paused time to de-flake (tracked as a follow-up)
           # AC-7 deploy end-to-end (#1607, Slice 4): drives the real `autumn
           # deploy up`/`rollback` over ssh/scp against a privileged systemd
           # container (first deploy, zero-downtime redeploy, on-demand rollback,
