@@ -2612,23 +2612,29 @@ struct StateMachineTransition {
     guard: Option<String>,
 }
 
-/// Parsed `#[state_machine(transitions(...))]` spec for one field.
-struct StateMachineSpec {
-    field_ident: syn::Ident,
-    transitions: Vec<StateMachineTransition>,
+/// The declared source of a field's transition table: either an inline
+/// `transitions(...)` list (the original shorthand) or a reference to a
+/// `#[lifecycle]` enum whose typed edges are the source of truth (issue #1911).
+enum StateMachineSource {
+    /// `#[state_machine(transitions(a -> b, ...))]`.
+    Inline(Vec<StateMachineTransition>),
+    /// `#[state_machine(lifecycle = SomeEnum)]` — transitions derived from the
+    /// referenced `#[lifecycle]` enum's `Lifecycle::STATE_MACHINE_TRANSITIONS`.
+    Lifecycle(syn::Path),
 }
 
-/// Parse the inner `transitions(a -> b, b -> c: "guard", ...)` token tree.
-fn parse_transitions(
-    input: syn::parse::ParseStream<'_>,
-) -> syn::Result<Vec<StateMachineTransition>> {
-    let kw: syn::Ident = input.parse()?;
-    if kw != "transitions" {
-        return Err(syn::Error::new(kw.span(), "expected `transitions(...)`"));
-    }
-    let content;
-    syn::parenthesized!(content in input);
+/// Parsed `#[state_machine(...)]` spec for one field.
+struct StateMachineSpec {
+    field_ident: syn::Ident,
+    source: StateMachineSource,
+}
 
+/// Parse the inner `a -> b, b -> c: "guard", ...` edge list of a
+/// `transitions(...)` group (the surrounding `transitions(` / `)` already
+/// consumed by the caller).
+fn parse_transition_list(
+    content: syn::parse::ParseStream<'_>,
+) -> syn::Result<Vec<StateMachineTransition>> {
     let mut transitions = Vec::new();
     while !content.is_empty() {
         let from: syn::Ident = content.parse()?;
@@ -2665,7 +2671,32 @@ fn parse_transitions(
     Ok(transitions)
 }
 
-/// Parse `#[state_machine(transitions(...))]` from a field, returning the spec when present.
+/// Parse the `#[state_machine(...)]` argument as either `transitions(...)` or
+/// `lifecycle = <Path>`.
+fn parse_state_machine_source(
+    input: syn::parse::ParseStream<'_>,
+) -> syn::Result<StateMachineSource> {
+    let key: syn::Ident = input.parse()?;
+    if key == "transitions" {
+        let content;
+        syn::parenthesized!(content in input);
+        Ok(StateMachineSource::Inline(parse_transition_list(&content)?))
+    } else if key == "lifecycle" {
+        input.parse::<syn::Token![=]>()?;
+        let path: syn::Path = input.parse()?;
+        Ok(StateMachineSource::Lifecycle(path))
+    } else {
+        Err(syn::Error::new(
+            key.span(),
+            "expected `transitions(...)` or `lifecycle = <Enum>`",
+        ))
+    }
+}
+
+/// Parse `#[state_machine(...)]` from a field, returning the spec when present.
+///
+/// Accepts either the inline `transitions(...)` shorthand or a
+/// `lifecycle = <Enum>` reference to a `#[lifecycle]` enum (issue #1911).
 ///
 /// Validates:
 /// - Only `String` fields are supported (the generated `.as_str()` call requires it).
@@ -2691,32 +2722,74 @@ fn parse_state_machine_spec(field: &syn::Field) -> syn::Result<Option<StateMachi
                     "`#[state_machine]` is only supported on `String` fields",
                 ));
             }
-            let transitions = attr.parse_args_with(parse_transitions)?;
+            let source = attr.parse_args_with(parse_state_machine_source)?;
             spec = Some(StateMachineSpec {
                 field_ident: ident.clone(),
-                transitions,
+                source,
             });
         }
     }
     Ok(spec)
 }
 
-/// Emit the three state machine items for one field: a transitions constant,
-/// a `can_transition_{field}_to` predicate, and a `transition_{field}_to` method.
-fn emit_state_machine_impl(model_name: &syn::Ident, spec: &StateMachineSpec) -> TokenStream {
-    let field = &spec.field_ident;
+/// Names of the three generated state-machine items for a field.
+struct StateMachineNames {
+    const_name: syn::Ident,
+    can_fn: syn::Ident,
+    transition_fn: syn::Ident,
+    /// The raw-prefix-stripped field name, for use in generated messages.
+    field_str: String,
+}
+
+fn state_machine_names(field: &syn::Ident) -> StateMachineNames {
     let raw_field_str = field.to_string();
     // Strip the raw-identifier prefix so `r#type` produces `type`-derived names
     // rather than trying to create identifiers like `can_transition_r#type_to`.
-    let field_str = raw_field_str.strip_prefix("r#").unwrap_or(&raw_field_str);
+    let field_str = raw_field_str
+        .strip_prefix("r#")
+        .unwrap_or(&raw_field_str)
+        .to_string();
     let field_upper = field_str.to_uppercase();
+    StateMachineNames {
+        const_name: format_ident!("__AUTUMN_SM_{field_upper}_TRANSITIONS"),
+        can_fn: format_ident!("can_transition_{field_str}_to"),
+        transition_fn: format_ident!("transition_{field_str}_to"),
+        field_str,
+    }
+}
 
-    let const_name = format_ident!("__AUTUMN_SM_{field_upper}_TRANSITIONS");
-    let can_fn = format_ident!("can_transition_{field_str}_to");
-    let transition_fn = format_ident!("transition_{field_str}_to");
+/// Emit the three state machine items for one field: a transitions constant,
+/// a `can_transition_{field}_to` predicate, and a `transition_{field}_to` method.
+///
+/// Dispatches on the declared [`StateMachineSource`]: an inline
+/// `transitions(...)` list generates a literal table + match arms (guards
+/// supported), while a `lifecycle = <Enum>` reference derives its table from the
+/// enum's `Lifecycle::STATE_MACHINE_TRANSITIONS` const (issue #1911).
+fn emit_state_machine_impl(model_name: &syn::Ident, spec: &StateMachineSpec) -> TokenStream {
+    match &spec.source {
+        StateMachineSource::Inline(transitions) => {
+            emit_state_machine_inline(model_name, &spec.field_ident, transitions)
+        }
+        StateMachineSource::Lifecycle(path) => {
+            emit_state_machine_lifecycle(model_name, &spec.field_ident, path)
+        }
+    }
+}
 
-    let const_entries: Vec<TokenStream> = spec
-        .transitions
+/// Emit the state-machine items for an inline `transitions(...)` list.
+fn emit_state_machine_inline(
+    model_name: &syn::Ident,
+    field: &syn::Ident,
+    transitions: &[StateMachineTransition],
+) -> TokenStream {
+    let StateMachineNames {
+        const_name,
+        can_fn,
+        transition_fn,
+        field_str,
+    } = state_machine_names(field);
+
+    let const_entries: Vec<TokenStream> = transitions
         .iter()
         .map(|t| {
             let from = &t.from;
@@ -2728,8 +2801,7 @@ fn emit_state_machine_impl(model_name: &syn::Ident, spec: &StateMachineSpec) -> 
         })
         .collect();
 
-    let match_arms: Vec<TokenStream> = spec
-        .transitions
+    let match_arms: Vec<TokenStream> = transitions
         .iter()
         .map(|t| {
             let from = &t.from;
@@ -2764,6 +2836,74 @@ fn emit_state_machine_impl(model_name: &syn::Ident, spec: &StateMachineSpec) -> 
             /// Attempts to transition `{field}` to `target`, returning the new state value.
             ///
             /// Returns `Err` if the transition is not defined or a guard rejects it.
+            pub fn #transition_fn(&self, target: &str) -> ::autumn_web::AutumnResult<::std::string::String> {
+                if self.#can_fn(target) {
+                    ::core::result::Result::Ok(::std::string::String::from(target))
+                } else {
+                    ::core::result::Result::Err(::autumn_web::AutumnError::bad_request_msg(
+                        ::std::format!(
+                            "Cannot transition `{}` from `{}` to `{}`",
+                            #field_str,
+                            self.#field,
+                            target,
+                        ),
+                    ))
+                }
+            }
+        }
+    }
+}
+
+/// Emit the state-machine items for a `lifecycle = <Enum>` reference (#1911).
+///
+/// The transitions constant is an alias of the referenced enum's
+/// `<#path as ::autumn_web::Lifecycle>::STATE_MACHINE_TRANSITIONS`, so the table
+/// lives in exactly one place and stays typed. Because the concrete edge strings
+/// are not known at macro-expansion time (they come from the enum in another
+/// module/crate), the predicate iterates that table at runtime rather than
+/// emitting literal match arms — producing an allowed/denied set identical to the
+/// equivalent inline table. Referencing a type that does not implement
+/// `Lifecycle` (i.e. is not a `#[lifecycle]` enum) fails to compile with an
+/// unsatisfied trait bound.
+///
+/// Lifecycle transitions are unguarded (every table `guard` slot is `None`), and
+/// a runtime string table cannot dispatch a named guard method anyway, so the
+/// predicate requires the guard slot to be absent — guards remain an
+/// inline-only shorthand feature (see the `Lifecycle` trait docs for the
+/// rationale).
+fn emit_state_machine_lifecycle(
+    model_name: &syn::Ident,
+    field: &syn::Ident,
+    path: &syn::Path,
+) -> TokenStream {
+    let StateMachineNames {
+        const_name,
+        can_fn,
+        transition_fn,
+        field_str,
+    } = state_machine_names(field);
+
+    quote! {
+        impl #model_name {
+            #[doc(hidden)]
+            pub const #const_name: &'static [(&'static str, &'static str, ::core::option::Option<&'static str>)] =
+                <#path as ::autumn_web::Lifecycle>::STATE_MACHINE_TRANSITIONS;
+
+            /// Returns `true` when this record's `{field}` can transition to `target`.
+            ///
+            /// Derived from the referenced `#[lifecycle]` enum's transition table.
+            pub fn #can_fn(&self, target: &str) -> bool {
+                let __current: &str = &self.#field;
+                Self::#const_name
+                    .iter()
+                    .any(|&(__from, __to, __guard)| {
+                        __from == __current && __to == target && __guard.is_none()
+                    })
+            }
+
+            /// Attempts to transition `{field}` to `target`, returning the new state value.
+            ///
+            /// Returns `Err` if the transition is not defined by the referenced lifecycle.
             pub fn #transition_fn(&self, target: &str) -> ::autumn_web::AutumnResult<::std::string::String> {
                 if self.#can_fn(target) {
                     ::core::result::Result::Ok(::std::string::String::from(target))
@@ -7400,6 +7540,139 @@ mod tests {
         assert!(
             generated.contains("__AUTUMN_SM_TYPE_TRANSITIONS"),
             "raw identifier field must strip r# prefix for generated const name: {generated}"
+        );
+    }
+
+    // ── #[state_machine(lifecycle = Enum)] derivation (#1911) ─────────────────
+
+    #[test]
+    fn state_machine_lifecycle_const_aliases_trait_table() {
+        let output = model_macro(
+            TokenStream::new(),
+            quote! {
+                pub struct Order {
+                    #[id]
+                    pub id: i64,
+                    #[state_machine(lifecycle = OrderState)]
+                    pub status: String,
+                }
+            },
+        );
+        let generated = output.to_string();
+        // The transitions const is an alias of the enum's Lifecycle trait const,
+        // so the table is defined once on the enum and stays typed.
+        assert!(
+            generated.contains("__AUTUMN_SM_STATUS_TRANSITIONS"),
+            "lifecycle SM must emit the transitions const: {generated}"
+        );
+        assert!(
+            generated.contains(
+                "< OrderState as :: autumn_web :: Lifecycle > :: STATE_MACHINE_TRANSITIONS"
+            ),
+            "lifecycle SM const must alias the enum's Lifecycle trait table: {generated}"
+        );
+        // No inline string edges are baked into the model — the source of truth
+        // is the enum.
+        assert!(
+            !generated.contains("(\"pending\""),
+            "lifecycle SM must not inline literal edge strings: {generated}"
+        );
+    }
+
+    #[test]
+    fn state_machine_lifecycle_emits_predicate_and_transition_methods() {
+        let output = model_macro(
+            TokenStream::new(),
+            quote! {
+                pub struct Order {
+                    #[id]
+                    pub id: i64,
+                    #[state_machine(lifecycle = OrderState)]
+                    pub status: String,
+                }
+            },
+        );
+        let generated = output.to_string();
+        assert!(
+            generated.contains("can_transition_status_to"),
+            "lifecycle SM must emit `can_transition_status_to`: {generated}"
+        );
+        assert!(
+            generated.contains("transition_status_to"),
+            "lifecycle SM must emit `transition_status_to`: {generated}"
+        );
+        assert!(
+            generated.contains("AutumnResult"),
+            "lifecycle SM `transition_*_to` must return AutumnResult: {generated}"
+        );
+        // The predicate iterates the derived table (no literal match arms are
+        // possible — the edge strings live on the enum).
+        assert!(
+            generated.contains(". iter ()") && generated.contains(". any"),
+            "lifecycle SM predicate must iterate the derived table: {generated}"
+        );
+    }
+
+    #[test]
+    fn state_machine_lifecycle_accepts_path_reference() {
+        // A module-qualified path to the lifecycle enum is accepted.
+        let output = model_macro(
+            TokenStream::new(),
+            quote! {
+                pub struct Order {
+                    #[id]
+                    pub id: i64,
+                    #[state_machine(lifecycle = crate::states::OrderState)]
+                    pub status: String,
+                }
+            },
+        );
+        let generated = output.to_string();
+        assert!(
+            generated.contains(
+                "< crate :: states :: OrderState as :: autumn_web :: Lifecycle > :: STATE_MACHINE_TRANSITIONS"
+            ),
+            "lifecycle SM must accept a qualified path to the enum: {generated}"
+        );
+    }
+
+    #[test]
+    fn state_machine_lifecycle_on_non_string_field_is_rejected() {
+        let output = model_macro(
+            TokenStream::new(),
+            quote! {
+                pub struct Order {
+                    #[id]
+                    pub id: i64,
+                    #[state_machine(lifecycle = OrderState)]
+                    pub amount: i64,
+                }
+            },
+        );
+        let generated = output.to_string();
+        assert!(
+            generated.contains("only supported on `String` fields"),
+            "lifecycle SM on a non-String field must be rejected: {generated}"
+        );
+    }
+
+    #[test]
+    fn state_machine_unknown_argument_is_rejected() {
+        let output = model_macro(
+            TokenStream::new(),
+            quote! {
+                pub struct Order {
+                    #[id]
+                    pub id: i64,
+                    #[state_machine(bogus(pending -> processing))]
+                    pub status: String,
+                }
+            },
+        );
+        let generated = output.to_string();
+        assert!(
+            generated.contains("expected `transitions(...)` or `lifecycle = <Enum>`"),
+            "an unknown #[state_machine] argument must be rejected: {generated}"
         );
     }
 
