@@ -782,10 +782,18 @@ fn collect_preflight(
             resolved.ssh_port,
             SSH_PROBE_TIMEOUT,
         ),
+        // Grade the signing secret against the SAME profile that will be written
+        // to the host env file (`AUTUMN_ENV=<resolved.profile>`, default `prod`),
+        // not the local CLI runtime profile (`config.profile`, dev/None on a dev
+        // box). Otherwise a weak/demo secret passes preflight locally but the
+        // uploaded unit boots under `prod` and exits in
+        // `fail_fast_on_invalid_signing_secret` — failing the deploy only AFTER
+        // touching the host. Keeping the grader and env-file profile coherent
+        // catches the weak secret locally, before any remote call.
         grade_signing_secret(
             config.security.signing_secret.secret.as_deref(),
             &config.security.signing_secret.previous_secrets,
-            is_production_profile(config.profile.as_deref()),
+            is_production_profile(Some(&resolved.profile)),
         ),
         grade_database_url(
             resolve_writable_db_url(&config.database),
@@ -1143,6 +1151,66 @@ mod tests {
             env_file.expose().lines().any(|l| l == "AUTUMN_ENV=staging"),
             "env file should honor the [deploy] profile override, got: {:?}",
             env_file.expose()
+        );
+    }
+
+    #[test]
+    fn preflight_grades_signing_secret_against_resolved_deploy_profile() {
+        // Regression: preflight must grade the signing secret against the SAME
+        // profile that `build_env_file` writes to the host env file
+        // (`AUTUMN_ENV=<resolved.profile>`, default `prod`), NOT the local CLI
+        // runtime profile (`config.profile`, dev/None on a dev box). Otherwise a
+        // weak/demo secret sails through `deploy check`/`deploy up` locally, but
+        // the uploaded unit boots under `prod` and exits in
+        // `fail_fast_on_invalid_signing_secret` — failing the deploy only AFTER
+        // touching the host. The fix catches the weak secret locally.
+        let find_signing = |checks: &[PreflightCheck]| {
+            checks
+                .iter()
+                .find(|c| c.name == "signing_secret")
+                .expect("preflight includes a signing_secret check")
+                .clone()
+        };
+
+        // A weak/demo secret on a dev box: `config.profile` is None (non-prod),
+        // so the OLD behavior (grading against `config.profile`) would PASS.
+        let mut config = AutumnConfig::default();
+        config.security.signing_secret.secret = Some("changeme".to_owned());
+        assert!(
+            !is_production_profile(config.profile.as_deref()),
+            "guard: the local runtime profile is non-production in this test"
+        );
+
+        // Default deploy profile is `prod` (what the env file will pin), so the
+        // weak secret must FAIL preflight locally, before any remote call.
+        let prod_resolved = ResolvedDeployConfig::resolve(&DeployConfig::default(), "myapp");
+        assert_eq!(prod_resolved.profile, "prod");
+        let prod_check = find_signing(&collect_preflight(&config, &prod_resolved));
+        assert!(
+            !prod_check.passed,
+            "weak secret must fail preflight under the default (prod) deploy \
+             profile: {}",
+            prod_check.detail
+        );
+        // Never echo the secret value, even a known demo one.
+        assert!(!prod_check.detail.contains("changeme"));
+
+        // With a non-production deploy profile (e.g. staging) the same weak
+        // secret still passes — a dev/staging deploy is not held to the
+        // production strength rules, and the env file pins that same profile.
+        let staging_resolved = ResolvedDeployConfig::resolve(
+            &DeployConfig {
+                profile: "staging".to_owned(),
+                ..DeployConfig::default()
+            },
+            "myapp",
+        );
+        let staging_check = find_signing(&collect_preflight(&config, &staging_resolved));
+        assert!(
+            staging_check.passed,
+            "weak secret should pass preflight under a non-production deploy \
+             profile: {}",
+            staging_check.detail
         );
     }
 
