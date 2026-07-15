@@ -144,7 +144,7 @@ rolling deploy. It exits non-zero if anything fails, so nothing touches the
 server until it is green:
 
 ```bash
-autumn deploy check      # same graders also run inside `autumn doctor`
+autumn deploy check      # doctor --online runs the same graders (plain doctor skips network probes)
 ```
 
 Build the single embedded binary, then deploy:
@@ -236,6 +236,13 @@ its own release directory and bound to a private `127.0.0.1` port, so the blue
 and green slots can run side by side for the health-gated cutover while the proxy
 owns the public port.
 
+The step **order** is illustrative too: the list shows the overall rollout shape
+for review, but its exact order can differ from a live `deploy up` — for example,
+`plan` lists the migration step before starting the candidate, whereas a real
+redeploy starts the candidate first and then runs the pre-cutover migration. Use
+`plan` to review the shape and what happens, not as a byte-exact order or unit
+reference.
+
 ### Where secrets live
 
 The signing secret and database URL are written **only** to
@@ -246,10 +253,12 @@ or error messages.
 
 ### Troubleshooting
 
-- **Preflight is failing.** Run `autumn deploy check` (or `autumn doctor`) — each
-  failing grader prints the exact problem and a one-line fix (missing
+- **Preflight is failing.** Run `autumn deploy check` (or `autumn doctor --online`)
+  — each failing grader prints the exact problem and a one-line fix (missing
   `[deploy] host`, unreachable SSH port, missing/weak signing secret, missing
-  writable database URL, or an unsafe pending migration).
+  writable database URL, or an unsafe pending migration). `autumn deploy check`
+  always probes SSH reachability; plain `autumn doctor` skips network probes, so
+  use `autumn doctor --online` to include the SSH-reachability grader.
 - **`release binary not found …`** — run `autumn build --embed` first; `deploy
   up` uploads the pre-built binary, it does not build for you.
 - **Nothing answers on the public port** — confirm the app's `server.port`
