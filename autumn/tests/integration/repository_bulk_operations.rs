@@ -185,6 +185,31 @@ pub struct TenantBulkRecord {
 #[autumn_web::repository(TenantBulkRecord, table = "test_tenant_bulk_records", tenant_scoped)]
 pub trait TenantBulkRecordRepository {}
 
+// ── Schema & models for tenant-scoped + optimistic locking (issue #1963) ──────
+
+diesel::table! {
+    test_tenant_lock_records (id) {
+        id -> Int8,
+        name -> Text,
+        tenant_id -> Text,
+        lock_version -> Int8,
+    }
+}
+
+#[autumn_web::model(table = "test_tenant_lock_records")]
+pub struct TenantLockRecord {
+    #[id]
+    pub id: i64,
+    pub name: String,
+    #[default]
+    pub tenant_id: String,
+    #[lock_version]
+    pub lock_version: i64,
+}
+
+#[autumn_web::repository(TenantLockRecord, table = "test_tenant_lock_records", tenant_scoped)]
+pub trait TenantLockRecordRepository {}
+
 // ── Schema & models with hooks ───────────────────────────────────────────────
 
 diesel::table! {
@@ -316,6 +341,10 @@ async fn setup_pool() -> (
         .execute(&mut conn)
         .await
         .expect("create test_tenant_bulk_records");
+    diesel::sql_query("CREATE TABLE IF NOT EXISTS test_tenant_lock_records (id BIGSERIAL PRIMARY KEY, name TEXT NOT NULL, tenant_id TEXT NOT NULL, lock_version INT8 NOT NULL DEFAULT 1)")
+        .execute(&mut conn)
+        .await
+        .expect("create test_tenant_lock_records");
     diesel::sql_query("CREATE TABLE IF NOT EXISTS test_hooked_versioned_records (id BIGSERIAL PRIMARY KEY, name TEXT NOT NULL, value INT NOT NULL)")
         .execute(&mut conn)
         .await
@@ -383,6 +412,17 @@ const fn build_zero_col_repo(pool: Pool<AsyncPgConnection>) -> PgZeroColRecordRe
 
 const fn build_tenant_bulk_repo(pool: Pool<AsyncPgConnection>) -> PgTenantBulkRecordRepository {
     PgTenantBulkRecordRepository {
+        pool,
+        across_tenants: false,
+        __autumn_read_route: autumn_web::repository::ReadRoute::Primary,
+        __autumn_statement_timeout_ms: 0,
+        __autumn_slow_threshold: std::time::Duration::from_millis(500),
+        __autumn_route: None,
+    }
+}
+
+const fn build_tenant_lock_repo(pool: Pool<AsyncPgConnection>) -> PgTenantLockRecordRepository {
+    PgTenantLockRecordRepository {
         pool,
         across_tenants: false,
         __autumn_read_route: autumn_web::repository::ReadRoute::Primary,
@@ -725,6 +765,104 @@ async fn test_tenant_scoped_upsert_many_filters_cross_tenant_silently() {
         "tenant-a row must remain unchanged (no cross-tenant hijack)"
     );
     assert_eq!(tenant_a_row.tenant_id, "tenant-a");
+}
+
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn test_tenant_scoped_versioned_upsert_many_filters_cross_tenant_silently() {
+    use autumn_web::tenancy::with_tenant;
+
+    let (pool, _container) = setup_pool().await;
+    let repo = build_tenant_lock_repo(pool);
+
+    // 1. Create a versioned record for tenant-a.
+    let record_a = with_tenant("tenant-a".to_string(), async {
+        repo.save(&NewTenantLockRecord {
+            name: "A".to_string(),
+        })
+        .await
+        .unwrap()
+    })
+    .await;
+    assert_eq!(record_a.lock_version, 1);
+
+    // 2. Try to upsert that same ID under tenant-b context (with a changed name).
+    //
+    //    This is the #1963 fix: a VERSIONED (`has_lock`) tenant-scoped repo must
+    //    behave exactly like the non-versioned path — the SQL
+    //    `ON CONFLICT ... WHERE tenant_id = $t` predicate simply never matches the
+    //    tenant-a row, so it is silently filtered out of the result rather than
+    //    provoking a loud 409. Before the fix, the coarse post-upsert size check
+    //    (`upserted.len() != records.len()`) false-positived on the cross-tenant
+    //    filter and wrongly returned a conflict error. Tenant isolation is still
+    //    fully enforced (the foreign-tenant row is neither returned nor mutated).
+    let upserted = with_tenant("tenant-b".to_string(), async {
+        let mut to_upsert = record_a.clone();
+        to_upsert.name = "B".to_string(); // Attempt to overwrite the tenant-a row
+        repo.upsert_many(&[to_upsert]).await
+    })
+    .await
+    .expect(
+        "versioned tenant-scoped upsert_many must silently filter a cross-tenant row (Ok, not Err) — #1963",
+    );
+
+    // The cross-tenant row must NOT be upserted: nothing was in scope for
+    // tenant-b, so the returned vec excludes it (and is empty here).
+    assert!(
+        !upserted.iter().any(|r| r.name == "B"),
+        "cross-tenant row must not appear in the upserted result, got: {upserted:?}"
+    );
+    assert!(
+        upserted.is_empty(),
+        "no in-scope rows existed for tenant-b, so nothing should be upserted, got: {upserted:?}"
+    );
+
+    // Security property: the foreign tenant-a row is UNTOUCHED — the tenant-b
+    // upsert never hijacked it to name "B", and its lock version is unchanged.
+    let tenant_a_row = repo
+        .across_tenants()
+        .find_by_id(record_a.id)
+        .await
+        .unwrap()
+        .expect("tenant-a row still exists");
+    assert_eq!(
+        tenant_a_row.name, "A",
+        "tenant-a row must remain unchanged (no cross-tenant hijack)"
+    );
+    assert_eq!(tenant_a_row.tenant_id, "tenant-a");
+    assert_eq!(
+        tenant_a_row.lock_version, 1,
+        "tenant-a row lock version must be untouched by the cross-tenant upsert"
+    );
+
+    // 3. FAIL-CLOSED GUARD: a genuine same-tenant optimistic-lock conflict must
+    //    still be caught loudly (proves the fix did not weaken lock detection).
+    //    First bump the version with a valid same-tenant upsert...
+    let bumped = with_tenant("tenant-a".to_string(), async {
+        let mut valid = record_a.clone();
+        valid.name = "A (updated)".to_string();
+        repo.upsert_many(&[valid]).await.unwrap()
+    })
+    .await;
+    assert_eq!(bumped.len(), 1);
+    assert_eq!(bumped[0].lock_version, 2, "DB increments the lock version");
+
+    //    ...then upsert the STALE copy (still lock_version = 1) → must conflict.
+    let stale_res = with_tenant("tenant-a".to_string(), async {
+        let mut stale = record_a.clone(); // lock_version = 1, DB now at 2
+        stale.name = "A (stale)".to_string();
+        repo.upsert_many(&[stale]).await
+    })
+    .await;
+    assert!(
+        stale_res.is_err(),
+        "genuine same-tenant stale optimistic-lock upsert must still fail loudly, but it succeeded"
+    );
+    let err_str = stale_res.unwrap_err().to_string();
+    assert!(
+        err_str.contains("onflict"),
+        "expected a conflict error for a stale lock version, got: {err_str}"
+    );
 }
 
 #[tokio::test]

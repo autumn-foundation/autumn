@@ -8631,22 +8631,21 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             };
 
             let size_check = if config.tenant_scoped {
-                quote! {
-                    // A tenant-scoped upsert silently filters rows belonging to
-                    // another tenant (the ON CONFLICT ... WHERE tenant_id = $t
-                    // upsert never touches them), mirroring single-op cross-tenant
-                    // scoping and the sibling bulk update_many/delete_many. Only a
-                    // genuine optimistic-lock conflict on a versioned record is loud.
-                    if has_lock && upserted.len() != records.len() {
-                        return Err(::autumn_web::AutumnError::conflict_msg(
-                            format!(
-                                "Conflict: only {} of {} records were upserted (potential lock-version/optimistic lock or tenant conflict)",
-                                upserted.len(),
-                                records.len()
-                            )
-                        ));
-                    }
-                }
+                // Tenant-scoped path: intentionally emit NO coarse post-upsert size
+                // check (ref #1963, mirrors the non-versioned #1962 path and the
+                // sibling bulk update_many/delete_many). A tenant-scoped upsert
+                // silently filters rows belonging to another tenant — the
+                // `ON CONFLICT ... WHERE tenant_id = $t` predicate never touches
+                // them — so a dropped row here is ALWAYS a cross-tenant filter, not
+                // a lock conflict. The coarse `upserted.len() != records.len()`
+                // check cannot disambiguate a cross-tenant filter from a genuine
+                // optimistic-lock conflict and only ever false-positives on
+                // cross-tenant filtering, so it is omitted. Tenant isolation stays
+                // enforced by the SQL WHERE clause; genuine same-tenant
+                // optimistic-lock conflicts stay caught loudly and precisely by the
+                // pre-upsert per-row lock check above (which operates on the
+                // tenant-filtered, FOR UPDATE `existing_rows`).
+                quote! {}
             } else {
                 quote! {
                     if has_lock && upserted.len() != records.len() {
@@ -18429,21 +18428,30 @@ mod tests {
         )
         .to_string();
 
-        // Silent cross-tenant filtering applies to the NON-versioned tenant-scoped
-        // path only (this `Post, tenant_scoped` repo has no lock): the SQL
+        // Silent cross-tenant filtering applies to the tenant-scoped path: the SQL
         // ON CONFLICT ... WHERE tenant_id = $t never touches cross-tenant rows, so
         // it must NOT emit the old `!has_lock` partial rejection — matching
         // single-op cross-tenant scoping and sibling bulk update_many/delete_many.
-        // A versioned (`has_lock`) repo is intentionally different: its
-        // optimistic-lock conflict check stays loud (still 409s), so the retained
-        // `has_lock && ...` branch below must remain present.
         assert!(
             !generated.contains("! has_lock && upserted . len () != records . len ()"),
             "tenant-scoped upsert_many must not loudly reject cross-tenant-filtered partial upserts: {generated}"
         );
+        // #1963: the coarse post-upsert size check is intentionally omitted from
+        // the tenant-scoped path entirely (versioned and non-versioned alike). It
+        // cannot disambiguate a cross-tenant filter from a genuine lock conflict and
+        // only ever false-positives on cross-tenant filtering, so a versioned
+        // tenant-scoped bulk upsert that drops a cross-tenant row no longer 409s.
         assert!(
-            generated.contains("has_lock && upserted . len () != records . len ()"),
-            "tenant-scoped upsert_many must still reject genuine optimistic-lock conflicts: {generated}"
+            !generated.contains("has_lock && upserted . len () != records . len ()"),
+            "tenant-scoped upsert_many must not emit the coarse post-upsert size check (#1963): {generated}"
+        );
+        // Genuine same-tenant optimistic-lock conflicts stay caught loudly and
+        // precisely by the PRE-upsert per-row lock detector (operating on the
+        // tenant-filtered, FOR UPDATE `existing_rows`), which must remain present.
+        assert!(
+            generated.contains("incoming_lock != db_lock")
+                && generated.contains("expected_version : incoming_lock"),
+            "tenant-scoped upsert_many must retain the pre-upsert optimistic-lock conflict detector: {generated}"
         );
     }
 
