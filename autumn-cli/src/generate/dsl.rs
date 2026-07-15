@@ -3164,3 +3164,147 @@ mod tests {
         assert!(sql_type_to_field_kind("numeric").is_none());
     }
 }
+
+/// Parity tests locking `dsl::FieldKind` / `dsl::IdType` to the canonical
+/// `autumn-schema-core` IR (declarative schema wave, tracking issue #1975).
+///
+/// This module is the **drift lock**: for every `FieldKind` / `IdType` it
+/// asserts the schema-core equivalent yields byte-identical Rust / diesel / SQL
+/// mappings on both backends. If either side changes a mapping without the
+/// other agreeing, one of these assertions fails. It exercises no `dsl.rs`
+/// runtime behaviour — it only reads the existing mapping functions.
+#[cfg(test)]
+mod schema_core_parity {
+    use super::{Field, FieldConstraints, FieldKind, IdType};
+    use autumn_schema_core::{Backend, ColumnType, IdKind};
+    use autumn_web::config::DatabaseBackend;
+
+    /// Build a minimal, non-null `Field` wrapping `kind` so we can call the
+    /// `Field`-level `sql_column_type_for` — the method that renders the full
+    /// `NUMERIC(precision,scale)` for decimals (the bare `FieldKind::sql_type_for`
+    /// returns only `"NUMERIC"`), i.e. the exact string that reaches DDL.
+    fn field_of(kind: FieldKind, variants: Vec<String>) -> Field {
+        Field {
+            name: "col".to_owned(),
+            kind,
+            nullable: false,
+            variants,
+            unique: false,
+            constraints: FieldConstraints::default(),
+            state_machine: None,
+        }
+    }
+
+    #[test]
+    fn field_kind_mappings_match_schema_core() {
+        // (FieldKind, schema-core ColumnType, enum variants for the Field).
+        // `References` maps to `Int64` — a foreign key is a `Column` property in
+        // the IR, not a distinct column type. `Enum` compares the `String`/`TEXT`
+        // storage fallback (the concrete enum type is a later-slice concern).
+        let cases: Vec<(FieldKind, ColumnType, Vec<String>)> = vec![
+            (FieldKind::String, ColumnType::Text, vec![]),
+            (FieldKind::Text, ColumnType::Text, vec![]),
+            (FieldKind::I32, ColumnType::Int32, vec![]),
+            (FieldKind::I64, ColumnType::Int64, vec![]),
+            (FieldKind::References, ColumnType::Int64, vec![]),
+            (FieldKind::Bool, ColumnType::Bool, vec![]),
+            (FieldKind::F32, ColumnType::Float32, vec![]),
+            (FieldKind::F64, ColumnType::Float64, vec![]),
+            (FieldKind::Uuid, ColumnType::Uuid, vec![]),
+            (FieldKind::NaiveDateTime, ColumnType::Timestamp, vec![]),
+            (FieldKind::DateTime, ColumnType::TimestampTz, vec![]),
+            (FieldKind::Bytea, ColumnType::Bytes, vec![]),
+            (FieldKind::Attachment, ColumnType::Attachment, vec![]),
+            (
+                FieldKind::Decimal {
+                    precision: 12,
+                    scale: 2,
+                },
+                ColumnType::Decimal {
+                    precision: 12,
+                    scale: 2,
+                },
+                vec![],
+            ),
+            (
+                FieldKind::Enum,
+                ColumnType::Enum {
+                    variants: vec!["a".to_owned(), "b".to_owned(), "c".to_owned()],
+                },
+                vec!["a".to_owned(), "b".to_owned(), "c".to_owned()],
+            ),
+        ];
+
+        for (fk, ct, variants) in cases {
+            let field = field_of(fk, variants);
+
+            // Rust `#[model]` type (storage fallback for Enum: `String`).
+            assert_eq!(
+                fk.rust_type(),
+                ct.rust_type(),
+                "rust_type parity for {fk:?}"
+            );
+
+            // Diesel `schema.rs` token, both backends.
+            assert_eq!(
+                fk.schema_type_for(DatabaseBackend::Postgres),
+                ct.diesel_type(Backend::Postgres),
+                "pg diesel token parity for {fk:?}"
+            );
+            assert_eq!(
+                fk.schema_type_for(DatabaseBackend::Sqlite),
+                ct.diesel_type(Backend::Sqlite),
+                "sqlite diesel token parity for {fk:?}"
+            );
+
+            // SQL DDL type, both backends — via the `Field`-level renderer so a
+            // decimal's `NUMERIC(precision,scale)` is compared in full.
+            assert_eq!(
+                field.sql_column_type_for(DatabaseBackend::Postgres),
+                ct.sql_type(Backend::Postgres),
+                "pg sql type parity for {fk:?}"
+            );
+            assert_eq!(
+                field.sql_column_type_for(DatabaseBackend::Sqlite),
+                ct.sql_type(Backend::Sqlite),
+                "sqlite sql type parity for {fk:?}"
+            );
+
+            // SQLite diesel-conversion eligibility.
+            assert_eq!(
+                fk.sqlite_has_diesel_conversion(),
+                ct.sqlite_has_diesel_conversion(),
+                "sqlite diesel-conversion parity for {fk:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn id_type_mappings_match_schema_core() {
+        for (idt, idk) in [
+            (IdType::BigSerial, IdKind::BigSerial),
+            (IdType::Uuid, IdKind::Uuid),
+        ] {
+            assert_eq!(
+                idt.rust_type(),
+                idk.rust_type(),
+                "id rust_type parity for {idt:?}"
+            );
+            for (db, be) in [
+                (DatabaseBackend::Postgres, Backend::Postgres),
+                (DatabaseBackend::Sqlite, Backend::Sqlite),
+            ] {
+                assert_eq!(
+                    idt.pk_sql_for(db),
+                    idk.pk_sql(be),
+                    "pk_sql parity for {idt:?} on {db:?}"
+                );
+                assert_eq!(
+                    idt.schema_type_for(db),
+                    idk.diesel_type(be),
+                    "id diesel token parity for {idt:?} on {db:?}"
+                );
+            }
+        }
+    }
+}

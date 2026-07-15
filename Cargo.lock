@@ -409,6 +409,7 @@ dependencies = [
 name = "autumn-cli"
 version = "0.6.0"
 dependencies = [
+ "autumn-schema-core",
  "autumn-web",
  "base64 0.22.1",
  "chrono",
@@ -458,6 +459,14 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.118",
+]
+
+[[package]]
+name = "autumn-schema-core"
+version = "0.6.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
