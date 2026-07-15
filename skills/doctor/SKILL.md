@@ -170,6 +170,28 @@ probes, gated behind the CLI `acme` feature:
 
 Offline stored-cert expiry is also graded. See issue #1858.
 
+## Deploy preflight checks (unreleased — trunk-dev, issue #1607)
+
+When a `[deploy]` section is present in `autumn.toml`, `autumn doctor` runs the
+deploy preflight as a config-gated section, emitting deploy-namespaced checks:
+`deploy_config` (the `[deploy]` section parses), `deploy_host` (`[deploy] host`
+is set / SSH-reachable), `deploy_signing_secret`, and `deploy_database_url`. The
+same graders back the standalone `autumn deploy check`, so the offline `doctor`
+and online `deploy check` surfaces report identically. The `[deploy]` profile
+defaults to the **production** profile (`"prod"`). The full flow is
+`autumn deploy {check | plan | up | rollback}` (SSH: install proxy on first
+deploy, zero-downtime cutover with auto-rollback on redeploy, and on-demand
+`rollback`).
+
+## SQLite backend awareness (unreleased — trunk-dev, issue #1614)
+
+For an app whose resolved primary database is `sqlite://…`, `autumn doctor`
+adapts Postgres-specific checks: the `pg_dump`/`pg_restore` client-tools check
+reports informationally (those tools are not required for a SQLite app;
+SQLite backup/restore is tracked in #1909) rather than warning misleadingly. A
+`sqlite://` URL is only accepted as the lone primary in a single-role,
+single-host topology (SQLite is single-writer / no read-replica role).
+
 ## Secrets redaction
 
 Before displaying any output, redact values that look like secrets:

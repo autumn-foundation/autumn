@@ -296,14 +296,20 @@ Free functions rendering changeset-aware, accessible inputs:
   values decode; RFC 3339 still accepted). `DateTime` columns with a zone
   other than `Utc`/`Local` render as `Text` (RFC 3339 string), not a picker.
 
-## Typed accessible primitives (`autumn_web::a11y`, unreleased — trunk-dev only)
+## Typed accessible primitives (`autumn_web::a11y`, feature `maud`, unreleased — trunk-dev only, #1706)
 
-Render-implementing structs (issue #1706) that make the accessible name a
-**type-level obligation** — the inaccessible form does not compile. Each maps to
-a WCAG 2.1 success criterion. Full narrative in `docs/guide/accessibility.md`.
+Render-implementing structs that make the accessible name a **type-level
+obligation** — the inaccessible form does not compile (the missing name is a
+compile error enforced via trybuild, not a runtime `autumn a11y verify` miss).
+Each maps to a WCAG 2.1 success criterion. Full narrative in
+`docs/guide/accessibility.md`. `Img`, `Button`, `ButtonType`, `Link`,
+`MenuItem`, and `TextField` are prelude re-exported; the remaining form
+primitives (`TextArea`, `Select` + `SelectOption`, `Checkbox`, `FileField`) are
+reached via the `autumn_web::a11y` path.
 
 - `Img::new(src, alt)` (alt required) / `Img::decorative(src)` (explicit
-  `alt=""`); `.class(..)` / `.width(u32)` / `.height(u32)`. WCAG 1.1.1.
+  `alt=""` + `aria-hidden="true"`); `.class(..)` / `.width(u32)` /
+  `.height(u32)`. WCAG 1.1.1.
 - `Button::new(name)` (visible label) / `Button::icon(markup, name)`
   (name ⇒ `aria-label`); `.kind(ButtonType)` / `.submit()` / `.button()` /
   `.class(..)`. WCAG 4.1.2.
@@ -313,28 +319,42 @@ a WCAG 2.1 success criterion. Full narrative in `docs/guide/accessibility.md`.
 - `MenuItem::new(name)` (renders `role="menuitem"` on a `<button>`; `.href(..)`
   switches to `<a>`); `.icon(markup)` (name ⇒ `aria-label`) / `.class(..)`.
   WCAG 4.1.2.
-- `TextField::new(name)` returns a `TextField<NoLabel>` — a typestate that does
-  **not** implement `Render`. Only after a label is attached —
-  `.label(text)` (visible `<label for=…>`), `.aria_label(text)`, or
-  `.labelled_by(id)` (`aria-labelledby`) — does it become `TextField<Labeled>`,
-  the only state that renders. So an unlabeled field is unrepresentable as
-  markup (WCAG 1.3.1 / 3.3.2 / 4.1.2). Presentational + validation setters are
-  chainable in **either** typestate and none supplies an accessible name, so
-  none lifts the compile-time label obligation — the guarantee is additive:
-  - `.input_type(s)` — input `type` (e.g. `"email"`, `"number"`).
-  - `.value(s)` — initial `value`.
-  - `.required()` — native `required`.
-  - `.aria_required()` — mirroring `aria-required="true"` (matches the scaffold
-    generator's non-nullable ARIA wiring).
-  - `.class(s)` — `class` on the `<input>`.
-  - `.aria_invalid(bool)` — `aria-invalid="true"`/`"false"`; omitted entirely
-    when unset.
-  - `.described_by(id)` — `aria-describedby` referencing an error container's
-    `id`, so AT announces the error with the input.
-  - `.minlength(u32)` / `.maxlength(u32)` — HTML5 length constraints (scaffold
-    `text{min=…}` / `{max=…}`).
-  - `.min(s)` / `.max(s)` — HTML5 numeric bounds (passed through verbatim).
-  - `.step(s)` — HTML5 `step` (e.g. `"any"` for float fields).
+
+### Labeled-typestate form primitives (`TextField` / `TextArea` / `Select` / `Checkbox` / `FileField`)
+
+Each starts in a `NoLabel` typestate that does **not** implement `Render`. Only
+after a label is attached — `.label(text)` (visible `<label for=…>`),
+`.aria_label(text)`, or `.labelled_by(id)` (`aria-labelledby`) — does it become
+the `Labeled` state, the only one that renders (e.g. `TextField::new(name)`
+returns `TextField<NoLabel>` → `TextField<Labeled>`). So an unlabeled field is
+unrepresentable as markup (WCAG 1.3.1 / 3.3.2 / 4.1.2). Presentational and
+validation setters are chainable in **either** typestate and none supplies an
+accessible name, so none lifts the compile-time label obligation — the guarantee
+is additive.
+
+Shared setters on all five: `.required()` (native `required`),
+`.aria_required()` (mirroring `aria-required="true"`, matching the scaffold
+generator's non-nullable ARIA wiring), `.class(s)` (on the control),
+`.label_class(s)` (on the visible `<label>`), `.aria_invalid(bool)`
+(`aria-invalid="true"`/`"false"`; omitted entirely when unset),
+`.described_by(id)` (`aria-describedby` referencing an error container's `id` so
+AT announces the error with the input), and — the **`.hx(name, value)` escape
+hatch** — an arbitrary `hx-*` attribute (the `name` is the suffix after `hx-`),
+emitted in insertion order, preserving the typed label obligation.
+
+Per-primitive setters (in addition to the shared set):
+
+- **`TextField::new(name)`** — `.input_type(s)` (e.g. `"email"`, `"number"`),
+  `.value(s)`, `.minlength(u32)` / `.maxlength(u32)` (scaffold
+  `text{min=…}` / `{max=…}`), `.min(s)` / `.max(s)` (HTML5 numeric bounds,
+  passed through verbatim), `.step(s)` (e.g. `"any"` for float fields).
+- **`TextArea::new(name)`** — `.value(s)`, `.minlength(u32)` /
+  `.maxlength(u32)`, `.rows(u32)` / `.cols(u32)`.
+- **`Select::new(name)`** — `.option(value, label)` / `.options(iter of
+  SelectOption)` (`SelectOption::new(value, label)`), `.selected_value(s)`.
+- **`Checkbox::new(name)`** — `.value(s)`, `.checked(bool)`.
+- **`FileField::new(name)`** — `.accept(s)` (MIME/extension filter),
+  `.multiple()` (sets the `multiple` attribute).
 
 ## View widgets and UI (all unreleased — trunk-dev only)
 
@@ -342,6 +362,15 @@ a WCAG 2.1 success criterion. Full narrative in `docs/guide/accessibility.md`.
   `stat_card(label, value, link)`, `tabs(id, &[(id, label, markup)])`,
   `modal(id, title, &body, &ModalConfig)`, `modal_trigger`,
   `modal_close_button`, `confirm_action(...)`.
+- `autumn_web::widgets::transition_controls(action, field, current,
+  transitions, can, csrf, csrf_field)` (#1917) — renders one CSRF-protected,
+  no-JS `POST` form + submit button per field-level `#[state_machine]`
+  transition whose `from == current` (a terminal state renders an empty
+  `role="group"` container). `transitions` is the macro-generated
+  `Model::__AUTUMN_SM_<FIELD>_TRANSITIONS` constant (`&[(from, to,
+  Option<guard>)]`) and `can` is `|to| record.can_transition_<field>_to(to)`;
+  a legal edge whose guard currently fails still renders but as a `disabled`
+  button. CSS hooks `.autumn-transition-controls` / `.autumn-transition`.
 - `autumn_web::widgets` display atoms: `badge(label, BadgeVariant)` /
   `badge_with(..., &BadgeConfig)` / `status_tag(label)` with
   `BadgeVariant::{Neutral,Info,Success,Warning,Danger}` and
@@ -374,29 +403,9 @@ a WCAG 2.1 success criterion. Full narrative in `docs/guide/accessibility.md`.
   .query(qs).hx_target(sel).hx_push_url()` (prelude re-exports).
 - `autumn_web::ui::{WIDGETS_CSS, WIDGETS_CSS_PATH}` widget stylesheet.
 
-### Accessibility primitives (`autumn_web::a11y`, feature `maud`, unreleased — trunk-dev, #1706)
-
-Typed, accessible-by-construction replacements for raw `<img>` / `<button>` /
-`<input>` in `html!`. The accessible name is a **required constructor
-argument** on every primitive — a missing one is a compile error (enforced via
-trybuild), not a runtime `autumn a11y verify` miss.
-
-- `Img::new(src, alt)` — `<img>` with required `alt`; `Img::decorative(src)`
-  renders `alt=""` + `aria-hidden="true"` for a purely decorative image.
-- `Button::new(name)` — `<button>` with a required accessible name;
-  `Button::icon(icon, name)` pairs an icon with an `aria-label`; `ButtonType`
-  selects the rendered `type`.
-- `Link::new(href, text)` — `<a>` with required text; `Link::icon(href, icon,
-  name)` for an icon link; `.new_tab()` adds `target="_blank"` +
-  `rel="noopener noreferrer"`.
-- `MenuItem::new(name)` — renders `role="menuitem"` on a `<button
-  type="button">`, or on an `<a>` when `.href(..)` is set.
-- `TextField::new(...)` → `TextField<NoLabel>`, a typestate that only implements
-  `Render` after a label is supplied: `.label(..)` / `.aria_label(..)` /
-  `.labelled_by(..)` return `TextField<Labeled>`, so an unlabeled field cannot
-  be rendered.
-
-All prelude re-exported (see Prelude contents).
+(Typed accessible primitives — `Img` / `Button` / `Link` / `MenuItem` /
+`TextField` / `TextArea` / `Select` / `Checkbox` / `FileField` — are documented
+in **Typed accessible primitives** above.)
 
 ## Cache read-through (unreleased)
 
