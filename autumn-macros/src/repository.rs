@@ -7007,16 +7007,24 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         } else {
             quote! {}
         };
+        // Shared not-found→404 tail spliced into both merged-validation knobs
+        // (non-tenant and tenant): map any load error to an `AutumnError` and
+        // turn a missing row into the correct 404 rather than a foreign-row 422.
+        // `#model_name` and `id` are in scope here (same fn), so the interpolated
+        // tokens match what was previously inlined identically in both knobs.
+        let not_found_to_404 = quote! {
+            .optional()
+            .map_err(::autumn_web::AutumnError::from)?
+            .ok_or_else(|| ::autumn_web::AutumnError::not_found_msg(
+                format!("{} with id {} not found", stringify!(#model_name), id)
+            ))
+        };
         let knob_load_and_validate = if config.validate_on_update_fetch {
             quote! {
                 let __merged_current = #table_ident::table.find(id)
                     .first::<#model_name>(&mut conn)
                     .await
-                    .optional()
-                    .map_err(::autumn_web::AutumnError::from)?
-                    .ok_or_else(|| ::autumn_web::AutumnError::not_found_msg(
-                        format!("{} with id {} not found", stringify!(#model_name), id)
-                    ))?;
+                    #not_found_to_404 ?;
                 { let _ = <::autumn_web::hooks::UpdateDraft<#model_name> as #draft_ext_trait>::from_patch(&__merged_current, changes)?; }
             }
         } else {
@@ -7032,11 +7040,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 } else {
                     #table_ident::table.find(id).first::<#model_name>(&mut conn).await
                 }
-                .optional()
-                .map_err(::autumn_web::AutumnError::from)?
-                .ok_or_else(|| ::autumn_web::AutumnError::not_found_msg(
-                    format!("{} with id {} not found", stringify!(#model_name), id)
-                ))?;
+                #not_found_to_404 ?;
                 { let _ = <::autumn_web::hooks::UpdateDraft<#model_name> as #draft_ext_trait>::from_patch(&__merged_current, changes)?; }
             }
         } else {
@@ -18417,18 +18421,22 @@ mod tests {
     }
 
     #[test]
-    fn repository_macro_tenant_scoped_upsert_many_filters_cross_tenant_silently() {
+    fn repository_macro_tenant_scoped_upsert_many_filters_cross_tenant_silently_for_non_versioned()
+    {
         let generated = repository_macro(
             quote! { Post, tenant_scoped },
             quote! { pub trait PostRepository {} },
         )
         .to_string();
 
-        // A tenant-scoped upsert_many silently filters cross-tenant rows (the SQL
-        // ON CONFLICT ... WHERE tenant_id = $t never touches them), matching
+        // Silent cross-tenant filtering applies to the NON-versioned tenant-scoped
+        // path only (this `Post, tenant_scoped` repo has no lock): the SQL
+        // ON CONFLICT ... WHERE tenant_id = $t never touches cross-tenant rows, so
+        // it must NOT emit the old `!has_lock` partial rejection — matching
         // single-op cross-tenant scoping and sibling bulk update_many/delete_many.
-        // It must NOT emit the old `!has_lock` partial rejection; only a versioned
-        // optimistic-lock conflict stays loud.
+        // A versioned (`has_lock`) repo is intentionally different: its
+        // optimistic-lock conflict check stays loud (still 409s), so the retained
+        // `has_lock && ...` branch below must remain present.
         assert!(
             !generated.contains("! has_lock && upserted . len () != records . len ()"),
             "tenant-scoped upsert_many must not loudly reject cross-tenant-filtered partial upserts: {generated}"
