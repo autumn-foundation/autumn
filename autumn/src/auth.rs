@@ -1982,10 +1982,94 @@ impl InMemoryApiTokenStore {
         self
     }
 
+    /// Seed a known raw token for `principal_id`, returning the store for
+    /// chaining.
+    ///
+    /// The raw value is hashed with [`hash_api_token`] and stored exactly like a
+    /// minted token, so it resolves through the same [`ApiTokenStore::verify`] /
+    /// [`ApiTokenStore::verify_scoped`] path as a minted one — there is no second
+    /// verification code path. This exists for the dev / single-tenant case where
+    /// the server's bearer token comes from an env var and the operator pastes
+    /// that same value into their MCP client config. **Not suitable for
+    /// production** — a database-backed [`ApiTokenStore`] remains the production
+    /// answer.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use autumn_web::auth::{ApiTokenStore, InMemoryApiTokenStore};
+    ///
+    /// # tokio::runtime::Runtime::new().unwrap().block_on(async {
+    /// let store = InMemoryApiTokenStore::default().with_token("dev-token", "user:dev");
+    /// assert_eq!(
+    ///     store.verify("dev-token").await.unwrap(),
+    ///     Some("user:dev".to_owned())
+    /// );
+    /// # });
+    /// ```
+    #[must_use]
+    pub fn with_token(self, raw_token: &str, principal_id: &str) -> Self {
+        self.with_scoped_token(raw_token, principal_id, &[])
+    }
+
+    /// Seed a known raw token carrying `scopes` for `principal_id`.
+    ///
+    /// Like [`Self::with_token`], but grants scopes so the seeded token also
+    /// satisfies [`ApiTokenStore::verify_scoped`] and the
+    /// `#[secured(scopes = [...])]` gate. Hashes via [`hash_api_token`] and
+    /// stores through the same path as a minted token.
+    #[must_use]
+    pub fn with_scoped_token(self, raw_token: &str, principal_id: &str, scopes: &[String]) -> Self {
+        self.store_raw_token(
+            raw_token,
+            &IssueTokenSpec {
+                principal_id,
+                scopes,
+                ..Default::default()
+            },
+        );
+        self
+    }
+
+    /// Build a store seeded with the raw token read from environment variable
+    /// `var`, registered for `principal_id`.
+    ///
+    /// The one-liner for a dev / single-tenant MCP server whose bearer token is
+    /// supplied out-of-band (an env var) and pasted verbatim into the MCP client
+    /// config. Delegates to [`Self::with_token`], so the seeded token verifies
+    /// through the same path as a minted one. **Not suitable for production.**
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `var` is unset or holds an empty / whitespace-only
+    /// value — a seeding store with no usable token would silently reject every
+    /// request, so this fails loudly at startup instead.
+    pub fn from_env(var: &str, principal_id: &str) -> crate::AutumnResult<Self> {
+        let raw = std::env::var(var).unwrap_or_default();
+        if raw.trim().is_empty() {
+            return Err(crate::AutumnError::internal_server_error_msg(format!(
+                "InMemoryApiTokenStore::from_env: environment variable `{var}` is unset or empty"
+            )));
+        }
+        Ok(Self::default().with_token(&raw, principal_id))
+    }
+
     /// Insert a freshly-minted token and return its raw value.
     fn insert_token(&self, spec: &IssueTokenSpec<'_>) -> String {
         let raw = generate_raw_token();
-        let hash = hash_api_token(&raw);
+        self.store_raw_token(&raw, spec);
+        raw
+    }
+
+    /// Store `raw_token` for `spec`, hashing it with [`hash_api_token`] into the
+    /// same `hash → StoredToken` map that [`Self::resolve_used`] reads.
+    ///
+    /// Shared by both the random-mint path ([`Self::insert_token`]) and the
+    /// seeding builders ([`Self::with_token`] / [`Self::with_scoped_token`]), so
+    /// a seeded token flows through the exact same verification path as a minted
+    /// one — there is never a second hashing or lookup scheme.
+    fn store_raw_token(&self, raw_token: &str, spec: &IssueTokenSpec<'_>) {
+        let hash = hash_api_token(raw_token);
         let id = self
             .next_id
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -2003,7 +2087,6 @@ impl InMemoryApiTokenStore {
             .write()
             .expect("api token store lock poisoned")
             .insert(hash, stored);
-        raw
     }
 
     /// Resolve a live token by raw value, stamping `last_used_at`.
@@ -4353,6 +4436,64 @@ mod api_token_tests {
         let raw = store.issue("user:6").await.unwrap();
         revoke_api_token(&store, &raw).await.unwrap();
         assert_eq!(store.verify(&raw).await.unwrap(), None);
+    }
+
+    // ── Seeding a known token (issue #1970) ──────────────────────────────────
+
+    #[tokio::test]
+    async fn with_token_seeds_token_resolvable_through_same_path() {
+        // A seeded token must flow through the exact `verify` / `verify_scoped`
+        // path a minted token uses — no second hashing or lookup scheme.
+        let store = InMemoryApiTokenStore::default().with_token("known-dev-token", "user:dev");
+        assert_eq!(
+            store.verify("known-dev-token").await.unwrap(),
+            Some("user:dev".to_owned()),
+        );
+        // The stored hash is exactly `hash_api_token(raw)` — a tampered raw
+        // hashes differently and must miss.
+        assert_eq!(store.verify("known-dev-tokenx").await.unwrap(), None);
+        // And it resolves through the scoped path too (empty scopes).
+        let verified = store
+            .verify_scoped("known-dev-token")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(verified.principal_id, "user:dev");
+        assert!(verified.scopes.is_empty());
+        // Revocation uses the same hash → the seeded token can be revoked.
+        store.revoke("known-dev-token").await.unwrap();
+        assert_eq!(store.verify("known-dev-token").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn with_scoped_token_seeds_scopes_via_verify_scoped() {
+        let granted = scopes(&["reports:read", "reports:write"]);
+        let store = InMemoryApiTokenStore::default().with_scoped_token(
+            "scoped-dev-token",
+            "svc:reports",
+            &granted,
+        );
+        let verified = store
+            .verify_scoped("scoped-dev-token")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(verified.principal_id, "svc:reports");
+        assert_eq!(verified.scopes, granted);
+    }
+
+    #[test]
+    fn from_env_errors_when_variable_unset() {
+        // The crate is `#![forbid(unsafe_code)]`, and `std::env::set_var` is
+        // `unsafe` in edition 2024, so a test cannot mutate the process
+        // environment to exercise the positive path here — the seeding core is
+        // proven by the `with_token` / `with_scoped_token` tests above. This
+        // proves `from_env` consults exactly the named variable and rejects an
+        // unset one (a uniquely-named var is naturally absent, so no mutation is
+        // needed).
+        const VAR: &str = "AUTUMN_TEST_MCP_TOKEN_1970_UNSET";
+        assert!(std::env::var(VAR).is_err(), "test var must be unset");
+        assert!(InMemoryApiTokenStore::from_env(VAR, "user:mcp").is_err());
     }
 
     // ── Scoped service tokens (issue #1158) ──────────────────────────────────
