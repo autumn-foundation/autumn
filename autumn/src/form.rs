@@ -2610,6 +2610,46 @@ impl<T: Serialize> Serialize for PrefillAlias<'_, T> {
     }
 }
 
+/// Wrap a primitive-rendered control (its own `<label>` + input) in the
+/// changeset field skeleton shared by every routed control: the stable
+/// `<div id="{field}-field" class="autumn-field">` htmx target and, when the
+/// field has errors, the `role="alert"` inline-error block keyed to
+/// `{field}-error`. This is the same wrapper/error markup the hand-written
+/// `*_input` helpers emit; only the inner control now comes from an
+/// `a11y` primitive.
+#[cfg(feature = "maud")]
+fn wrap_field_control(
+    field_name: &str,
+    control: impl maud::Render,
+    errors: &[String],
+) -> maud::Markup {
+    let error_id = format!("{field_name}-error");
+    let wrapper_id = format!("{field_name}-field");
+    maud::html! {
+        div id=(wrapper_id) class="autumn-field" {
+            (control)
+            @if !errors.is_empty() {
+                div id=(error_id) role="alert" class="autumn-field__errors" {
+                    @for error in errors {
+                        p class="autumn-field__error" { (error) }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The `class` a routed control carries, mirroring the `*_input` helpers:
+/// `autumn-field__input`, plus the `--invalid` modifier when the field errored.
+#[cfg(feature = "maud")]
+const fn field_control_class(has_errors: bool) -> &'static str {
+    if has_errors {
+        "autumn-field__input autumn-field__input--invalid"
+    } else {
+        "autumn-field__input"
+    }
+}
+
 /// Render a single [`FormField`], routing the pre-fill lookup through the
 /// field's serialized key ([`FormField::value_name`]) when it differs from
 /// the rendered input name — see [`PrefillAlias`]. Everything else (input
@@ -2645,7 +2685,21 @@ fn render_form_control<T: Serialize>(changeset: &Changeset<T>, field: &FormField
                 text_input(changeset, &field.name, &field.label)
             }
         }
-        FieldControl::Textarea => textarea_input(changeset, &field.name, &field.label),
+        FieldControl::Textarea => {
+            let errors = changeset.errors_for(&field.name);
+            let has_errors = !errors.is_empty();
+            let value = changeset.field_value(&field.name).unwrap_or_default();
+            let mut control = crate::a11y::TextArea::new(field.name.as_str())
+                .label(field.label.as_str())
+                .label_class("autumn-field__label")
+                .value(value)
+                .class(field_control_class(has_errors))
+                .aria_invalid(has_errors);
+            if has_errors {
+                control = control.described_by(format!("{}-error", field.name));
+            }
+            wrap_field_control(&field.name, control, errors)
+        }
         FieldControl::Password => password_input(changeset, &field.name, &field.label),
         FieldControl::Number { step } => {
             if field.required {
@@ -2654,7 +2708,22 @@ fn render_form_control<T: Serialize>(changeset: &Changeset<T>, field: &FormField
                 number_input(changeset, &field.name, &field.label, step.as_deref())
             }
         }
-        FieldControl::Checkbox => checkbox_input(changeset, &field.name, &field.label),
+        FieldControl::Checkbox => {
+            let errors = changeset.errors_for(&field.name);
+            let has_errors = !errors.is_empty();
+            let checked = changeset.field_value(&field.name).as_deref() == Some("true");
+            let mut control = crate::a11y::Checkbox::new(field.name.as_str())
+                .label(field.label.as_str())
+                .label_class("autumn-field__label")
+                .value("true")
+                .checked(checked)
+                .class(field_control_class(has_errors))
+                .aria_invalid(has_errors);
+            if has_errors {
+                control = control.described_by(format!("{}-error", field.name));
+            }
+            wrap_field_control(&field.name, control, errors)
+        }
         FieldControl::Date => {
             if field.required {
                 required_date_input(changeset, &field.name, &field.label)
@@ -2670,46 +2739,48 @@ fn render_form_control<T: Serialize>(changeset: &Changeset<T>, field: &FormField
             }
         }
         FieldControl::Select { options } => {
-            let opts: Vec<(&str, &str)> = options
-                .iter()
-                .map(|(v, l)| (v.as_str(), l.as_str()))
-                .collect();
-            if field.required {
-                required_select_input(changeset, &field.name, &field.label, &opts)
-            } else {
-                select_input(changeset, &field.name, &field.label, &opts)
-            }
-        }
-        FieldControl::File => {
-            // No dedicated file helper exists upstream, so this arm renders
-            // the same inline-error/ARIA/wrapper skeleton the changeset-aware
-            // helpers emit (a file input can't be value-prefilled — browser
-            // security — so only the value attribute is omitted).
             let errors = changeset.errors_for(&field.name);
             let has_errors = !errors.is_empty();
-            let error_id = format!("{}-error", field.name);
-            let wrapper_id = format!("{}-field", field.name);
-            maud::html! {
-                div id=(wrapper_id) class="autumn-field" {
-                    label for=(field.name) class="autumn-field__label" { (field.label) }
-                    input
-                        type="file"
-                        id=(field.name)
-                        name=(field.name)
-                        required[field.required]
-                        aria-required=[field.required.then_some("true")]
-                        class=(if has_errors { "autumn-field__input autumn-field__input--invalid" } else { "autumn-field__input" })
-                        aria-invalid=(if has_errors { "true" } else { "false" })
-                        aria-describedby=(if has_errors { error_id.as_str() } else { "" });
-                    @if has_errors {
-                        div id=(error_id) role="alert" class="autumn-field__errors" {
-                            @for error in errors {
-                                p class="autumn-field__error" { (error) }
-                            }
-                        }
-                    }
-                }
+            let current = changeset.field_value(&field.name).unwrap_or_default();
+            let mut control = crate::a11y::Select::new(field.name.as_str())
+                .label(field.label.as_str())
+                .label_class("autumn-field__label")
+                .options(options.iter().map(|(value, label)| {
+                    crate::a11y::SelectOption::new(value.as_str(), label.as_str())
+                }))
+                .selected_value(current)
+                .class(field_control_class(has_errors))
+                .aria_invalid(has_errors);
+            if field.required {
+                control = control.required().aria_required();
             }
+            if has_errors {
+                control = control.described_by(format!("{}-error", field.name));
+            }
+            wrap_field_control(&field.name, control, errors)
+        }
+        FieldControl::File => {
+            // A file input can't be value-prefilled (browser security), so the
+            // typed [`crate::a11y::FileField`] primitive — which deliberately
+            // carries no `value` — is a natural fit; it also drops the
+            // competing derived `aria-label` in favour of the visible
+            // `<label for=…>`. Multipart encoding is unchanged: the
+            // `FieldControl::File` variant (not its rendering) still drives the
+            // `is_multipart` gate on the parent form.
+            let errors = changeset.errors_for(&field.name);
+            let has_errors = !errors.is_empty();
+            let mut control = crate::a11y::FileField::new(field.name.as_str())
+                .label(field.label.as_str())
+                .label_class("autumn-field__label")
+                .class(field_control_class(has_errors))
+                .aria_invalid(has_errors);
+            if field.required {
+                control = control.required().aria_required();
+            }
+            if has_errors {
+                control = control.described_by(format!("{}-error", field.name));
+            }
+            wrap_field_control(&field.name, control, errors)
         }
     }
 }
@@ -4879,6 +4950,59 @@ mod tests {
         assert!(html.contains(r#"id="published-field""#), "{html}");
         assert!(html.contains(r#"aria-invalid="false""#), "{html}");
         assert!(!html.contains(r#"aria-required="true""#), "{html}");
+    }
+
+    /// Slice 3b (issue #1933): `render_form_control` routes the Textarea,
+    /// Checkbox, Select, and File arms through the typed `a11y` primitives
+    /// while preserving the `{field}-field` wrapper + `role="alert"` error
+    /// skeleton. This pins the two intentional accessibility improvements the
+    /// primitives introduce over the hand-written `*_input` helpers: (1) an
+    /// error-free control omits the old empty `aria-describedby=""` (an IDREF
+    /// referencing nothing), and (2) a visible-label checkbox emits the
+    /// `<input>` before its `<label for=…>` (the conventional checkbox layout;
+    /// the `for`/`id` association is unchanged).
+    #[cfg(feature = "maud")]
+    #[test]
+    fn form_for_routes_controls_through_a11y_primitives() {
+        // Error-free controls drop the empty `aria-describedby=""` no-op.
+        let cs = Changeset::new(blank_form_for_model());
+        let html = form_for(&cs, "/posts", "post")
+            .exclude("views")
+            .exclude("published")
+            .override_field("title", FieldControl::Textarea)
+            .render()
+            .into_string();
+        assert!(html.contains("<textarea"), "{html}");
+        assert!(html.contains(r#"aria-invalid="false""#), "{html}");
+        assert!(
+            !html.contains(r#"aria-describedby="""#),
+            "error-free textarea must not emit an empty aria-describedby: {html}"
+        );
+
+        // Checkbox: the visible label's `for`/`id` association is preserved and
+        // the `<input>` precedes the `<label>`.
+        let cs = Changeset::new(blank_form_for_model());
+        let html = form_for(&cs, "/posts", "post")
+            .exclude("views")
+            .exclude("title")
+            .render()
+            .into_string();
+        assert!(html.contains(r#"type="checkbox""#), "{html}");
+        assert!(html.contains(r#"<label for="published""#), "{html}");
+        let input_idx = html
+            .find(r#"type="checkbox""#)
+            .expect("checkbox input missing");
+        let label_idx = html
+            .find(r#"<label for="published""#)
+            .expect("checkbox label missing");
+        assert!(
+            input_idx < label_idx,
+            "checkbox input must precede its label (conventional layout): {html}"
+        );
+        assert!(
+            !html.contains(r#"aria-describedby="""#),
+            "error-free checkbox must not emit an empty aria-describedby: {html}"
+        );
     }
 
     /// Duplicate `.override_field`/`.override_label` calls on the same field
