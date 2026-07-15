@@ -3665,7 +3665,12 @@ impl AppBuilder {
         // it on the process role exactly like the `#[job]` runtime above: a `web`
         // replica must not claim/execute hook rows (that work belongs to the
         // worker tier), while `worker`/`combined` replicas keep running it.
-        #[cfg(feature = "db")]
+        // The durable commit-hook worker drains rows via a Postgres queue
+        // (LISTEN/NOTIFY + row-locked claiming); under the `sqlite` feature the
+        // runtime pool is a SQLite pool the Postgres worker cannot drive, so
+        // the worker is not spawned. (SQLite single-node boot does not run the
+        // durable-hook worker tier.)
+        #[cfg(all(feature = "db", not(feature = "sqlite")))]
         if role.runs_workers()
             && let Some(pool) = state.pool().cloned()
         {
@@ -3688,7 +3693,7 @@ impl AppBuilder {
         // commit hooks into that shard's queue table; drain each one too — again
         // only on a role that runs workers, so a web replica leaves shard hook
         // rows for the worker tier.
-        #[cfg(feature = "db")]
+        #[cfg(all(feature = "db", not(feature = "sqlite")))]
         if role.runs_workers()
             && let Some(shards) = state.shards()
         {
@@ -5204,7 +5209,9 @@ impl AppBuilder {
             crate::repository_commit_hooks::set_global_channels(state.channels().clone());
         }
 
-        #[cfg(feature = "db")]
+        // Postgres-only durable commit-hook worker; not spawned under sqlite
+        // (the runtime pool is a SQLite pool the Postgres worker cannot drive).
+        #[cfg(all(feature = "db", not(feature = "sqlite")))]
         if let Some(pool) = state.pool().cloned() {
             #[cfg(feature = "ws")]
             {
@@ -5223,7 +5230,7 @@ impl AppBuilder {
         }
         // Repositories built over a shard pool (`with_pool`) enqueue durable
         // commit hooks into that shard's queue table; drain each one too.
-        #[cfg(feature = "db")]
+        #[cfg(all(feature = "db", not(feature = "sqlite")))]
         if let Some(shards) = state.shards() {
             for shard in shards.iter() {
                 #[cfg(feature = "ws")]
@@ -7619,7 +7626,23 @@ pub async fn run_shard_map_guard(
 /// - no shards configured,
 /// - no control database topology, or
 /// - the slot map uses explicit `slots` declarations (auto-split is inactive).
-#[cfg(feature = "db")]
+// Sharding (the shard-map guard, auto-split, and control-DB shard map) is a
+// Postgres-only feature: `run_shard_map_guard` drives Postgres `sql_query`
+// against a `Pool<AsyncPgConnection>` control pool. Under the `sqlite` feature
+// the runtime topology's pool is a SQLite pool that cannot feed it, and SQLite
+// deployments are single-node/unsharded, so the guard is a no-op.
+#[cfg(all(feature = "db", feature = "sqlite"))]
+#[allow(clippy::unused_async)]
+async fn enforce_shard_map_guard(
+    config: &AutumnConfig,
+    topology: Option<&crate::db::DatabaseTopology>,
+    runtime_boot: bool,
+) -> Result<(), String> {
+    let _ = (config, topology, runtime_boot);
+    Ok(())
+}
+
+#[cfg(all(feature = "db", not(feature = "sqlite")))]
 async fn enforce_shard_map_guard(
     config: &AutumnConfig,
     topology: Option<&crate::db::DatabaseTopology>,

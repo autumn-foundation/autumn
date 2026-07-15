@@ -27,6 +27,10 @@
 
 use axum::extract::FromRequestParts;
 use diesel;
+// Named by the default Postgres pool builder/TLS connector and by the
+// Postgres migration connection (`MigrationConnection`), which stays compiled
+// under the `sqlite` feature (diesel's `postgres` backend is still in the graph
+// via `db`), so this import is used on both builds.
 use diesel_async::AsyncPgConnection;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::pooled_connection::deadpool::Pool;
@@ -447,10 +451,17 @@ pub static TX_RETRIES_TOTAL: AtomicU64 = AtomicU64::new(0);
 /// succeeding, since process start. Exposed as `autumn_tx_retry_exhausted_total`.
 pub static TX_RETRY_EXHAUSTED_TOTAL: AtomicU64 = AtomicU64::new(0);
 
+// The transaction serialization-failure retry loop is Postgres-only (SQLite's
+// `tx_with` runs a single plain transaction), so these retry-metric helpers are
+// unused in a `--features sqlite` library build. They are still exercised by the
+// crate's unit tests, so keep them compiled and only silence the dead-code
+// warning under the feature.
+#[cfg_attr(feature = "sqlite", allow(dead_code))]
 pub(crate) fn record_tx_retry() -> u64 {
     TX_RETRIES_TOTAL.fetch_add(1, Ordering::Relaxed) + 1
 }
 
+#[cfg_attr(feature = "sqlite", allow(dead_code))]
 pub(crate) fn record_tx_retry_exhausted() -> u64 {
     TX_RETRY_EXHAUSTED_TOTAL.fetch_add(1, Ordering::Relaxed) + 1
 }
@@ -1073,34 +1084,27 @@ fn build_pool(
     pool_size: usize,
     connect_timeout_secs: u64,
 ) -> Result<Pool<RuntimeConnection>, PoolError> {
-    // A SQLite target is recognized (issue #1614) but the runtime pool that
-    // would serve it is not wired into this build yet — the pool below is a
-    // Postgres pool (`Pool<AsyncPgConnection>`). Refuse here, at pool-build
-    // (boot) time, with an actionable message so a SQLite misconfiguration
-    // fails fast rather than reaching a confusing first-query failure. The
-    // Postgres path is unchanged: a Postgres target skips this branch entirely.
-    if crate::config::DatabaseBackend::detect(url) == Some(crate::config::DatabaseBackend::Sqlite) {
-        return Err(PoolError::UnsupportedBackend(format!(
-            "SQLite is a recognized database backend but its runtime pool is not yet \
-             available in this build of autumn-web; follow \
-             https://github.com/madmax983/autumn/issues/1905 for status (target: {url:?})"
-        )));
-    }
-
     // Under the `sqlite` feature `RuntimeConnection` is a SQLite connection, so
-    // the Postgres pool/manager built below does not type-check against
-    // `Pool<RuntimeConnection>` — and, per PR1 (issue #1614), no SQLite runtime
-    // pool is wired yet. Refuse all pool construction here so the alias can flip
-    // without a working backend; the real SQLite pool is PR2. This keeps the
-    // "SQLite pool construction stays refused at runtime" guarantee while
-    // letting the feature-on build compile.
+    // the pool must be built over `SyncConnectionWrapper<SqliteConnection>`
+    // rather than the Postgres manager below. Route to the dedicated SQLite
+    // builder (PR2, issue #1614).
     #[cfg(feature = "sqlite")]
     {
-        let _ = (pool_size, connect_timeout_secs);
+        return build_sqlite_pool(url, pool_size, connect_timeout_secs);
+    }
+
+    // Default (Postgres) build. A SQLite target is recognized here but its
+    // runtime pool only exists in a `--features sqlite` build — the pool below
+    // is a Postgres pool (`Pool<AsyncPgConnection>`). Refuse at pool-build
+    // (boot) time with an actionable message so a SQLite misconfiguration fails
+    // fast rather than reaching a confusing first-query failure. A Postgres
+    // target skips this branch entirely.
+    #[cfg(not(feature = "sqlite"))]
+    if crate::config::DatabaseBackend::detect(url) == Some(crate::config::DatabaseBackend::Sqlite) {
         return Err(PoolError::UnsupportedBackend(format!(
-            "the SQLite runtime pool is not yet wired into this build of \
-             autumn-web (built with --features sqlite); follow \
-             https://github.com/madmax983/autumn/issues/1905 for status (target: {url:?})"
+            "SQLite is a recognized database backend but its runtime pool is only available in \
+             a build of autumn-web compiled with `--features sqlite`; this is a default \
+             (Postgres) build (target: {url:?})"
         )));
     }
 
@@ -1129,6 +1133,85 @@ fn build_pool(
             .runtime(deadpool::Runtime::Tokio1)
             .build()?)
     }
+}
+
+/// Normalize a configured SQLite target into the filename token diesel's
+/// `SqliteConnection` understands.
+///
+/// diesel's SQLite backend passes the string straight to `sqlite3_open`, which
+/// understands a filesystem path, a `file:` URI, or the special `:memory:`
+/// token — but **not** a `sqlite:` URL scheme. Strip the recognized SQLite URL
+/// spellings down to that: `sqlite::memory:`, `sqlite://:memory:`, and an empty
+/// `sqlite://` all become an in-memory database; `sqlite:///path` /
+/// `sqlite://path` / `sqlite:path` reduce to their path; a `file:` URI or a
+/// bare path passes through unchanged.
+#[cfg(feature = "sqlite")]
+fn normalize_sqlite_target(url: &str) -> String {
+    if url.starts_with("file:") {
+        return url.to_owned();
+    }
+    let rest = url
+        .strip_prefix("sqlite://")
+        .or_else(|| url.strip_prefix("sqlite:"))
+        .unwrap_or(url);
+    if rest.is_empty() || rest == ":memory:" {
+        return String::from(":memory:");
+    }
+    rest.to_owned()
+}
+
+/// Whether a normalized SQLite target names an in-memory database (each such
+/// connection is its own private database, so the pool must be single-slot to
+/// stay consistent — see [`build_sqlite_pool`]).
+#[cfg(feature = "sqlite")]
+fn sqlite_target_is_memory(target: &str) -> bool {
+    target == ":memory:" || target.contains("mode=memory")
+}
+
+/// Build a deadpool pool over `SyncConnectionWrapper<SqliteConnection>` for a
+/// SQLite target (issue #1614, PR2).
+///
+/// `SyncConnectionWrapper` runs synchronous diesel `SqliteConnection` calls on
+/// Tokio's blocking pool, so this integrates with the async runtime like the
+/// Postgres path. Pool sizing is deliberately conservative: SQLite is
+/// single-writer, so a large pool only multiplies `SQLITE_BUSY` contention, and
+/// an in-memory database is **private per connection** — a multi-slot pool over
+/// `:memory:` would hand out connections that each see a different, empty
+/// database (so migrations applied on one would be invisible on another).
+/// In-memory targets are therefore forced to a single slot; file targets
+/// respect the configured size (still small by convention).
+#[cfg(feature = "sqlite")]
+fn build_sqlite_pool(
+    url: &str,
+    pool_size: usize,
+    connect_timeout_secs: u64,
+) -> Result<Pool<RuntimeConnection>, PoolError> {
+    // Under the `sqlite` feature the runtime targets SQLite. A Postgres URL here
+    // is a misconfiguration — refuse with an actionable message rather than
+    // trying to open a file literally named "postgres://…".
+    if crate::config::DatabaseBackend::detect(url) == Some(crate::config::DatabaseBackend::Postgres)
+    {
+        return Err(PoolError::UnsupportedBackend(format!(
+            "this build of autumn-web targets SQLite (compiled with `--features sqlite`) but the \
+             configured database URL is a Postgres target; configure a `sqlite:` URL instead \
+             (target: {url:?})"
+        )));
+    }
+
+    let timeout = Duration::from_secs(connect_timeout_secs);
+    let target = normalize_sqlite_target(url);
+    let max_size = if sqlite_target_is_memory(&target) {
+        1
+    } else {
+        pool_size.max(1)
+    };
+    let manager = AsyncDieselConnectionManager::<RuntimeConnection>::new(target);
+    Ok(Pool::builder(manager)
+        .max_size(max_size)
+        .wait_timeout(Some(timeout))
+        .create_timeout(Some(timeout))
+        .runtime(deadpool::Runtime::Tokio1)
+        .build()?)
 }
 
 /// Create a connection pool from the database configuration.
@@ -1370,6 +1453,9 @@ impl TxOptions {
     /// retry loop calls this instead of reading the field directly, so `0`
     /// always behaves like `1` (run the closure once, no retry) rather than
     /// skipping the closure entirely.
+    // Only the Postgres retry loop consults this; unused in a `--features
+    // sqlite` library build (still unit-tested, so keep it compiled).
+    #[cfg_attr(feature = "sqlite", allow(dead_code))]
     const fn effective_max_attempts(&self) -> u32 {
         if self.max_attempts < 1 {
             1
@@ -1394,6 +1480,11 @@ impl TxOptions {
 }
 
 /// Whether the retry loop should re-run the closure or return the error.
+// The whole serialization-failure retry machinery is Postgres-only (see
+// `Db::tx_with`); these items are unused in a `--features sqlite` library build
+// but remain unit-tested, so keep them compiled and silence dead-code under the
+// feature.
+#[cfg_attr(feature = "sqlite", allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RetryDecision {
     Retry,
@@ -1404,6 +1495,7 @@ enum RetryDecision {
 ///
 /// `attempt` is the 1-indexed number of the attempt that just failed. A retry
 /// happens only when the error is retryable **and** attempts remain.
+#[cfg_attr(feature = "sqlite", allow(dead_code))]
 const fn retry_decision(attempt: u32, max_attempts: u32, retryable: bool) -> RetryDecision {
     if retryable && attempt < max_attempts {
         RetryDecision::Retry
@@ -1417,6 +1509,7 @@ const fn retry_decision(attempt: u32, max_attempts: u32, retryable: bool) -> Ret
 ///
 /// Mirrors the jobs system's backoff shape (`pg_retry_delay_ms`) plus the cap
 /// idiom from the migrate startup loop. Kept jitter-free so it is unit-testable.
+#[cfg_attr(feature = "sqlite", allow(dead_code))]
 fn retry_backoff_base(initial: Duration, max: Duration, attempt: u32) -> Duration {
     // Cap the shift so `2^shift` never overflows and huge attempts saturate.
     let shift = attempt.saturating_sub(1).min(31);
@@ -1431,6 +1524,7 @@ fn retry_backoff_base(initial: Duration, max: Duration, attempt: u32) -> Duratio
 /// re-implementing the RNG/fallback logic) so there's one jitter
 /// implementation in the crate, including its `getrandom`-failure fallback to
 /// `SystemTime` entropy instead of silently degrading to no jitter.
+#[cfg_attr(feature = "sqlite", allow(dead_code))]
 fn retry_backoff_delay(initial: Duration, max: Duration, attempt: u32) -> Duration {
     let base = retry_backoff_base(initial, max, attempt);
     crate::cache::jittered_ttl(base, 0.2).min(max)
@@ -1474,6 +1568,7 @@ fn retry_backoff_delay(initial: Duration, max: Duration, attempt: u32) -> Durati
 /// match above: retrying based on bare text risks misclassifying an unrelated
 /// domain/validation error as a transient conflict, silently re-running a
 /// non-idempotent closure and delaying the response.
+#[cfg_attr(feature = "sqlite", allow(dead_code))]
 fn is_retryable_txn_error(err: &AutumnError) -> bool {
     use tokio_postgres::error::SqlState;
 
@@ -1835,6 +1930,9 @@ impl Db {
     /// Panics if the internal after-commit registry mutex is poisoned (only
     /// possible if a previous thread holding the lock panicked).
     #[allow(clippy::too_many_lines)]
+    // The Postgres path re-borrows `f` per retry attempt (`&mut f`); the SQLite
+    // path consumes it once, so `mut` is unused there.
+    #[cfg_attr(feature = "sqlite", allow(unused_mut))]
     pub async fn tx_with<'a, T, E, F>(
         &'a mut self,
         opts: TxOptions,
@@ -1844,11 +1942,14 @@ impl Db {
         T: Send + 'a,
         E: From<diesel::result::Error> + Send + Sync + 'a,
         crate::error::AutumnError: From<E>,
-        // The closure receives `&mut AsyncPgConnection` (not `&mut PooledConnection`
-        // as `tx` does): isolation levels require `build_transaction()`, which is
-        // inherent on `AsyncPgConnection`. Diesel query methods work on either.
+        // The closure receives `&mut RuntimeConnection` (not `&mut PooledConnection`
+        // as `tx` does): on Postgres, isolation levels require `build_transaction()`,
+        // which is inherent on `AsyncPgConnection` (the default `RuntimeConnection`).
+        // Diesel query methods work on either backend. Under the `sqlite` feature
+        // `RuntimeConnection` is a SQLite connection and the isolation/retry path
+        // below degrades to a single plain transaction.
         F: for<'r> FnMut(
-                &'r mut AsyncPgConnection,
+                &'r mut RuntimeConnection,
             ) -> scoped_futures::ScopedBoxFuture<'a, 'r, Result<T, E>>
             + Send
             + 'a,
@@ -1895,7 +1996,7 @@ impl Db {
             // outer test transaction, so there is nothing to retry against a
             // single test-harness connection.
             let registry: Arc<Mutex<Vec<CommitCallback>>> = Arc::new(Mutex::new(Vec::new()));
-            let conn: &mut AsyncPgConnection = &mut self.conn;
+            let conn: &mut RuntimeConnection = &mut self.conn;
             let result = AFTER_COMMIT_REGISTRY
                 .scope(registry, scoped_transaction::<T, E, _, _>(conn, f))
                 .instrument(span.clone())
@@ -1909,50 +2010,25 @@ impl Db {
             return result;
         }
 
-        let max_attempts = opts.effective_max_attempts();
-        let mut attempt: u32 = 0;
-
-        let outcome: Result<T, crate::error::AutumnError> = loop {
-            attempt += 1;
-
-            // A fresh registry per attempt: a rolled-back attempt's after-commit
-            // callbacks are discarded simply by dropping this `Arc` undrained.
+        // SQLite has no `SET TRANSACTION ISOLATION LEVEL` / read-only /
+        // deferrable transaction builder and no serialization-failure retry
+        // semantics, so run the closure once inside a single plain transaction.
+        // The requested isolation level, read-only, deferrable, and retry
+        // options are Postgres-only and are ignored here (documented).
+        // After-commit callbacks still fire on commit, exactly as on the
+        // Postgres path.
+        #[cfg(feature = "sqlite")]
+        {
             let registry: Arc<Mutex<Vec<CommitCallback>>> = Arc::new(Mutex::new(Vec::new()));
-
-            let attempt_result: Result<T, E> = {
-                // *** LOAD-BEARING ORDER: borrow `f` BEFORE `build_transaction()`.
-                // diesel-async's `TransactionBuilder::run` bounds the closure by
-                // the connection-borrow lifetime; `&mut f`'s region must start
-                // earlier than that borrow or it fails to compile. Do not reorder.
-                let f_ref = &mut f;
-
-                let mut builder = self.conn.build_transaction();
-                builder = match opts.isolation {
-                    IsolationLevel::ReadCommitted => builder.read_committed(),
-                    IsolationLevel::RepeatableRead => builder.repeatable_read(),
-                    IsolationLevel::Serializable => builder.serializable(),
-                };
-                if opts.read_only {
-                    builder = builder.read_only();
-                }
-                if opts.deferrable {
-                    builder = builder.deferrable();
-                }
-
-                AFTER_COMMIT_REGISTRY
-                    .scope(
-                        registry.clone(),
-                        builder.run::<T, E, _>(async move |conn| f_ref(conn).await),
-                    )
-                    .instrument(span.clone())
-                    .await
-            };
-
-            match attempt_result {
+            let conn: &mut RuntimeConnection = &mut self.conn;
+            let result: Result<T, E> = AFTER_COMMIT_REGISTRY
+                .scope(registry.clone(), scoped_transaction::<T, E, _, _>(conn, f))
+                .instrument(span.clone())
+                .await;
+            span.record("db.tx.attempts", 1u32);
+            guard.disarmed = true;
+            return match result {
                 Ok(value) => {
-                    // Commit path: drain THIS attempt's callbacks and spawn
-                    // them. (The `is_test_tx` case already returned above, so
-                    // spawning here is always live.)
                     let callbacks: Vec<CommitCallback> = {
                         let mut reg = registry.lock().expect("registry lock");
                         std::mem::take(&mut *reg)
@@ -1960,54 +2036,114 @@ impl Db {
                     if !callbacks.is_empty() {
                         let _ = spawn_committed_after_commit_callbacks(callbacks);
                     }
-                    break Ok(value);
+                    Ok(value)
                 }
-                Err(e) => {
-                    // Convert to AutumnError first, then classify on it.
-                    let ae = crate::error::AutumnError::from(e);
-                    let retryable = is_retryable_txn_error(&ae);
-                    match retry_decision(attempt, max_attempts, retryable) {
-                        RetryDecision::Retry => {
-                            let retries_total = record_tx_retry();
-                            let delay = retry_backoff_delay(
-                                opts.initial_backoff,
-                                opts.max_backoff,
-                                attempt,
-                            );
-                            tracing::debug!(
-                                parent: &span,
-                                attempt,
-                                max_attempts,
-                                delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
-                                autumn.tx.retries_total = retries_total,
-                                "retrying transaction after serialization/deadlock failure"
-                            );
-                            // `registry` drops here → rolled-back attempt's
-                            // after-commit callbacks are discarded; the loop
-                            // then re-runs the closure.
-                            tokio::time::sleep(delay).await;
+                Err(user_error) => Err(crate::error::AutumnError::from(user_error)),
+            };
+        }
+
+        #[cfg(not(feature = "sqlite"))]
+        {
+            let max_attempts = opts.effective_max_attempts();
+            let mut attempt: u32 = 0;
+
+            let outcome: Result<T, crate::error::AutumnError> = loop {
+                attempt += 1;
+
+                // A fresh registry per attempt: a rolled-back attempt's after-commit
+                // callbacks are discarded simply by dropping this `Arc` undrained.
+                let registry: Arc<Mutex<Vec<CommitCallback>>> = Arc::new(Mutex::new(Vec::new()));
+
+                let attempt_result: Result<T, E> = {
+                    // *** LOAD-BEARING ORDER: borrow `f` BEFORE `build_transaction()`.
+                    // diesel-async's `TransactionBuilder::run` bounds the closure by
+                    // the connection-borrow lifetime; `&mut f`'s region must start
+                    // earlier than that borrow or it fails to compile. Do not reorder.
+                    let f_ref = &mut f;
+
+                    let mut builder = self.conn.build_transaction();
+                    builder = match opts.isolation {
+                        IsolationLevel::ReadCommitted => builder.read_committed(),
+                        IsolationLevel::RepeatableRead => builder.repeatable_read(),
+                        IsolationLevel::Serializable => builder.serializable(),
+                    };
+                    if opts.read_only {
+                        builder = builder.read_only();
+                    }
+                    if opts.deferrable {
+                        builder = builder.deferrable();
+                    }
+
+                    AFTER_COMMIT_REGISTRY
+                        .scope(
+                            registry.clone(),
+                            builder.run::<T, E, _>(async move |conn| f_ref(conn).await),
+                        )
+                        .instrument(span.clone())
+                        .await
+                };
+
+                match attempt_result {
+                    Ok(value) => {
+                        // Commit path: drain THIS attempt's callbacks and spawn
+                        // them. (The `is_test_tx` case already returned above, so
+                        // spawning here is always live.)
+                        let callbacks: Vec<CommitCallback> = {
+                            let mut reg = registry.lock().expect("registry lock");
+                            std::mem::take(&mut *reg)
+                        };
+                        if !callbacks.is_empty() {
+                            let _ = spawn_committed_after_commit_callbacks(callbacks);
                         }
-                        RetryDecision::Stop => {
-                            if retryable {
-                                let exhausted_total = record_tx_retry_exhausted();
-                                tracing::warn!(
+                        break Ok(value);
+                    }
+                    Err(e) => {
+                        // Convert to AutumnError first, then classify on it.
+                        let ae = crate::error::AutumnError::from(e);
+                        let retryable = is_retryable_txn_error(&ae);
+                        match retry_decision(attempt, max_attempts, retryable) {
+                            RetryDecision::Retry => {
+                                let retries_total = record_tx_retry();
+                                let delay = retry_backoff_delay(
+                                    opts.initial_backoff,
+                                    opts.max_backoff,
+                                    attempt,
+                                );
+                                tracing::debug!(
                                     parent: &span,
                                     attempt,
                                     max_attempts,
-                                    autumn.tx.retry_exhausted_total = exhausted_total,
-                                    "transaction retry budget exhausted; returning final error"
+                                    delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
+                                    autumn.tx.retries_total = retries_total,
+                                    "retrying transaction after serialization/deadlock failure"
                                 );
+                                // `registry` drops here → rolled-back attempt's
+                                // after-commit callbacks are discarded; the loop
+                                // then re-runs the closure.
+                                tokio::time::sleep(delay).await;
                             }
-                            break Err(ae);
+                            RetryDecision::Stop => {
+                                if retryable {
+                                    let exhausted_total = record_tx_retry_exhausted();
+                                    tracing::warn!(
+                                        parent: &span,
+                                        attempt,
+                                        max_attempts,
+                                        autumn.tx.retry_exhausted_total = exhausted_total,
+                                        "transaction retry budget exhausted; returning final error"
+                                    );
+                                }
+                                break Err(ae);
+                            }
                         }
                     }
                 }
-            }
-        };
+            };
 
-        span.record("db.tx.attempts", attempt);
-        guard.disarmed = true;
-        outcome
+            span.record("db.tx.attempts", attempt);
+            guard.disarmed = true;
+            outcome
+        }
     }
 }
 
@@ -3954,6 +4090,9 @@ mod tls {
     }
 
     /// Build the pool's custom connection-setup callback for a TLS posture.
+    // Only the default (Postgres) `build_pool` arm installs this custom TLS
+    // setup; unused in a `--features sqlite` build (SQLite has no TLS transport).
+    #[cfg_attr(feature = "sqlite", allow(dead_code))]
     pub(super) fn setup_callback(posture: TlsPosture) -> SetupCallback<AsyncPgConnection> {
         Box::new(move |url: &str| {
             let posture = posture.clone();

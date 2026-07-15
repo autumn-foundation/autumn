@@ -1474,6 +1474,13 @@ pub mod reexports {
 pub(crate) mod state;
 #[cfg(feature = "system-tests")]
 pub mod system_test;
+// The `test` harness (`TestClient`/`TestApp`/`TestDb`) is Postgres-only: it
+// provides per-test rollback isolation by establishing a Postgres control pool
+// with a `begin_test_transaction` hook and drives Postgres directory-shard
+// routing — semantics SQLite does not share. It is therefore not compiled under
+// the `sqlite` feature; SQLite integration tests use their own harness. (Only
+// intra-doc links reference it elsewhere, which do not affect build/clippy.)
+#[cfg(not(feature = "sqlite"))]
 #[allow(
     clippy::missing_panics_doc,
     clippy::must_use_candidate,
@@ -1481,7 +1488,10 @@ pub mod system_test;
 )]
 pub mod test;
 /// Dependency-free HTML parser + CSS-selector matcher backing the structural
-/// HTML assertions on [`test::TestResponse`].
+/// HTML assertions on [`test::TestResponse`]. Only the (Postgres-only) `test`
+/// harness consumes it, so it is compiled together with that module — not under
+/// the `sqlite` feature.
+#[cfg(not(feature = "sqlite"))]
 mod test_html;
 pub use config::ProcessRole;
 pub use state::AppState;
