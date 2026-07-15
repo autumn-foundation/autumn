@@ -2068,7 +2068,22 @@ impl InMemoryApiTokenStore {
     /// seeding builders ([`Self::with_token`] / [`Self::with_scoped_token`]), so
     /// a seeded token flows through the exact same verification path as a minted
     /// one — there is never a second hashing or lookup scheme.
+    ///
+    /// A blank (empty or whitespace-only) `raw_token` is a **safe no-op**: it is
+    /// skipped with a `warn!` rather than stored, so a config typo on the
+    /// infallible seeding builders can never mint a `hash("")` credential that a
+    /// blank `Authorization: Bearer ` header would then satisfy. This mirrors the
+    /// empty/whitespace rejection [`Self::from_env`] applies (which fails loudly
+    /// before ever reaching here). Minted tokens ([`Self::insert_token`]) are
+    /// never blank, so the guard is a no-op on that path.
     fn store_raw_token(&self, raw_token: &str, spec: &IssueTokenSpec<'_>) {
+        if raw_token.trim().is_empty() {
+            tracing::warn!(
+                "InMemoryApiTokenStore: ignoring a blank (empty or whitespace-only) seed token; \
+                 no credential was stored"
+            );
+            return;
+        }
         let hash = hash_api_token(raw_token);
         let id = self
             .next_id
@@ -4480,6 +4495,39 @@ mod api_token_tests {
             .unwrap();
         assert_eq!(verified.principal_id, "svc:reports");
         assert_eq!(verified.scopes, granted);
+    }
+
+    #[tokio::test]
+    async fn blank_seed_token_stores_no_credential() {
+        // A blank (empty or whitespace-only) seed on the infallible builders must
+        // be a safe no-op — never minting a `hash("")` credential that a blank
+        // `Authorization: Bearer ` header could satisfy. `with_token` and
+        // `with_scoped_token` both route through the same `store_raw_token` guard.
+        for blank in ["", "   ", "\t\n"] {
+            let store = InMemoryApiTokenStore::default().with_token(blank, "user:oops");
+            // Neither the blank raw value nor an empty bearer resolves anything.
+            assert_eq!(store.verify(blank).await.unwrap(), None);
+            assert_eq!(store.verify("").await.unwrap(), None);
+            assert!(store.verify_scoped(blank).await.unwrap().is_none());
+            assert!(store.verify_scoped("").await.unwrap().is_none());
+
+            // The scoped builder shares the guard.
+            let scoped = InMemoryApiTokenStore::default().with_scoped_token(
+                blank,
+                "svc:oops",
+                &scopes(&["reports:read"]),
+            );
+            assert_eq!(scoped.verify(blank).await.unwrap(), None);
+            assert!(scoped.verify_scoped("").await.unwrap().is_none());
+        }
+
+        // A normal non-blank seed alongside still works, proving the guard only
+        // drops the blank one.
+        let store = InMemoryApiTokenStore::default().with_token("real-token", "user:ok");
+        assert_eq!(
+            store.verify("real-token").await.unwrap(),
+            Some("user:ok".to_owned()),
+        );
     }
 
     #[test]
