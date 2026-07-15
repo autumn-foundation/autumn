@@ -112,6 +112,41 @@ pub struct ResolvedDeployConfig {
     pub profile: String,
 }
 
+/// Canonicalize a deploy profile string to the value the app's runtime resolver
+/// would produce, so the preflight grade and the `AUTUMN_ENV` written to the
+/// host env file agree on a single spelling.
+///
+/// Mirrors `autumn_web::config::normalize_profile_name` (the source of truth) so
+/// non-canonical spellings can't slip past preflight and then be rejected at
+/// host boot: trims whitespace; case-insensitively folds `production`/`prod` →
+/// `"prod"` and `development`/`dev` → `"dev"`; preserves any other non-empty
+/// value verbatim (custom profiles like `staging`/`QA`); and for a blank/empty
+/// value falls back to the deploy default `"prod"` (matching
+/// `autumn_web::config::default_deploy_profile`). Keep this in sync if the
+/// runtime rules ever change.
+fn canonicalize_deploy_profile(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return "prod".to_owned();
+    }
+
+    if trimmed.eq_ignore_ascii_case("production") {
+        return "prod".to_owned();
+    }
+    if trimmed.eq_ignore_ascii_case("development") {
+        return "dev".to_owned();
+    }
+    if trimmed.eq_ignore_ascii_case("prod") {
+        return "prod".to_owned();
+    }
+    if trimmed.eq_ignore_ascii_case("dev") {
+        return "dev".to_owned();
+    }
+
+    // Preserve user-specified case for custom profile names.
+    trimmed.to_owned()
+}
+
 impl ResolvedDeployConfig {
     /// Resolve a [`DeployConfig`] against the project name, filling in the
     /// `app_name` → `app_dir` → `service_name` default chain.
@@ -136,7 +171,7 @@ impl ResolvedDeployConfig {
             service_name,
             readiness_timeout_secs: cfg.readiness_timeout_secs,
             keep_releases: cfg.keep_releases,
-            profile: cfg.profile.clone(),
+            profile: canonicalize_deploy_profile(&cfg.profile),
         }
     }
 
@@ -1210,6 +1245,83 @@ mod tests {
             staging_check.passed,
             "weak secret should pass preflight under a non-production deploy \
              profile: {}",
+            staging_check.detail
+        );
+    }
+
+    #[test]
+    fn resolve_canonicalizes_non_canonical_production_profile_spellings() {
+        // Regression: the app's runtime resolver
+        // (`autumn_web::config::normalize_profile_name`) trims and case-folds
+        // profile aliases, so `PROD`, `Production`, and ` production ` all boot
+        // under the canonical `prod`. If deploy stored the raw spelling, preflight
+        // graded it NON-production (exact/case-sensitive `is_production_profile`)
+        // and a weak secret sailed through — but `build_env_file` wrote that same
+        // raw string to `AUTUMN_ENV`, the host normalized it to `prod`, and the
+        // app rejected the weak secret at boot (fail AFTER touching the host). The
+        // fix canonicalizes the profile at resolve time so both the grade and the
+        // env-file value use one spelling.
+        let find_signing = |checks: &[PreflightCheck]| {
+            checks
+                .iter()
+                .find(|c| c.name == "signing_secret")
+                .expect("preflight includes a signing_secret check")
+                .clone()
+        };
+
+        let mut config = AutumnConfig::default();
+        config.security.signing_secret.secret = Some("changeme".to_owned());
+
+        // Non-canonical production spellings must canonicalize to `prod`, be
+        // graded as production, and thus FAIL the weak secret locally.
+        for raw in ["PROD", "Production", " production "] {
+            let resolved = ResolvedDeployConfig::resolve(
+                &DeployConfig {
+                    profile: raw.to_owned(),
+                    ..DeployConfig::default()
+                },
+                "myapp",
+            );
+            assert_eq!(
+                resolved.profile, "prod",
+                "profile {raw:?} should canonicalize to `prod`"
+            );
+            // The value written to AUTUMN_ENV is the same canonical profile.
+            assert!(
+                build_env_file(&config, &resolved)
+                    .expose()
+                    .lines()
+                    .any(|l| l == "AUTUMN_ENV=prod"),
+                "env file should pin AUTUMN_ENV=prod for raw profile {raw:?}"
+            );
+            assert!(
+                is_production_profile(Some(&resolved.profile)),
+                "canonical `prod` must grade as production for raw profile {raw:?}"
+            );
+            let check = find_signing(&collect_preflight(&config, &resolved));
+            assert!(
+                !check.passed,
+                "weak secret must fail preflight for production spelling {raw:?}: {}",
+                check.detail
+            );
+            assert!(!check.detail.contains("changeme"));
+        }
+
+        // A custom profile is preserved verbatim and grades non-production, so
+        // the same weak secret passes (custom deploys aren't held to prod rules).
+        let staging = ResolvedDeployConfig::resolve(
+            &DeployConfig {
+                profile: "staging".to_owned(),
+                ..DeployConfig::default()
+            },
+            "myapp",
+        );
+        assert_eq!(staging.profile, "staging");
+        assert!(!is_production_profile(Some(&staging.profile)));
+        let staging_check = find_signing(&collect_preflight(&config, &staging));
+        assert!(
+            staging_check.passed,
+            "weak secret should pass preflight under the custom `staging` profile: {}",
             staging_check.detail
         );
     }
