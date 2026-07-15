@@ -29,7 +29,7 @@ use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use autumn_web::config::{AutumnConfig, DeployConfig};
+use autumn_web::config::{AutumnConfig, DeployConfig, Env};
 
 /// Bounded timeout for the SSH-reachability preflight probe. Kept short so the
 /// check fails fast on an unreachable host instead of hanging on a dropped SYN.
@@ -775,19 +775,120 @@ pub fn build_rollback_plan(cfg: &ResolvedDeployConfig) -> Vec<DeployStep> {
 /// Returns [`DeployError::Config`] when the project config cannot be loaded and
 /// [`DeployError::PreflightFailed`] when `check` finds a failing grader.
 pub fn run(action: DeployAction) -> Result<(), DeployError> {
-    let config = AutumnConfig::load().map_err(|e| DeployError::Config(e.to_string()))?;
-    let deploy_cfg = config.deploy.clone().unwrap_or_default();
+    // Ambient load (the operator's shell profile, `dev` by default): used ONLY to
+    // read `[deploy]` and compute `resolved` — in particular `resolved.profile`,
+    // the profile the deployed service will actually boot under (default `prod`).
+    let ambient_config = AutumnConfig::load().map_err(|e| DeployError::Config(e.to_string()))?;
+    let deploy_cfg = ambient_config.deploy.unwrap_or_default();
     let resolved = ResolvedDeployConfig::resolve(&deploy_cfg, &resolve_project_name());
 
     match action {
-        DeployAction::Check => run_check(&config, &resolved),
+        // `plan` is a pure dry-run over `resolved` alone — it never grades or
+        // uploads runtime VALUES, so it needs no reload under the target profile.
         DeployAction::Plan => {
             print_plan(&resolved);
             Ok(())
         }
-        DeployAction::Rollback => run_rollback(&config, &resolved),
-        DeployAction::Up => run_up(&config, &resolved),
+        // `check`/`rollback`/`up` grade and (for `up`) upload the signing secret
+        // and DB URL, so they must see those VALUES resolved under the TARGET
+        // deploy profile — not the operator's ambient/dev config. Reload here.
+        DeployAction::Check => run_check(&load_runtime_config(&resolved)?, &resolved),
+        DeployAction::Rollback => run_rollback(&load_runtime_config(&resolved)?, &resolved),
+        DeployAction::Up => run_up(&load_runtime_config(&resolved)?, &resolved),
     }
+}
+
+/// An [`Env`] that forces `AUTUMN_ENV` to a specific deploy profile while
+/// delegating every other lookup to an inner env.
+///
+/// [`AutumnConfig::load_with_env`] re-derives the active profile from
+/// `resolve_profile_input`, which reads `AUTUMN_ENV`.
+/// [`autumn_web::dotenv::os_env_with_dotenv_for_profile`] only selects the
+/// `.env.<profile>` overlay — it does NOT set `AUTUMN_ENV` — so on a dev box the
+/// loader would still resolve `dev` and never layer `[profile.prod]` /
+/// `autumn-prod.toml`. Reporting `AUTUMN_ENV=<profile>` here makes the reload
+/// resolve the target deploy profile, so profile-scoped prod values (the signing
+/// secret, the DB URL) are loaded, graded, and uploaded.
+struct ForcedProfileEnv<E: Env> {
+    /// The deploy profile forced onto `AUTUMN_ENV`.
+    profile: String,
+    /// Inner env every other key delegates to (the profile-aware dotenv overlay).
+    inner: E,
+}
+
+impl<E: Env> Env for ForcedProfileEnv<E> {
+    fn var(&self, key: &str) -> Result<String, std::env::VarError> {
+        if key == "AUTUMN_ENV" {
+            return Ok(self.profile.clone());
+        }
+        // Report `AUTUMN_DOTENV=1` so `should_load` opts the (non-dev) deploy
+        // profile into `.env.<profile>` loading. The operator explicitly ran
+        // `autumn deploy` to gather + upload the target profile's config, and
+        // `.env.<profile>` is a documented place for profile-only values, so
+        // the deploy-time reload reads it without requiring the operator to
+        // export `AUTUMN_DOTENV` by hand. This does not mutate the global env
+        // and does not touch the deployed service's runtime. The
+        // profile-selector-key exclusion in the dotenv overlay still strips
+        // `AUTUMN_ENV`/`AUTUMN_PROFILE`/`AUTUMN_IS_DEBUG` from any `.env` file.
+        //
+        // But only SYNTHESIZE `1` when the inner env has no explicit value: an
+        // operator who runs `AUTUMN_DOTENV=0 autumn deploy ...` (or `false`) is
+        // deliberately opting OUT of `.env.<profile>` loading, and `should_load`
+        // honors `0`/`false` as the documented off switch (see dotenv.rs). So
+        // delegate to the inner env when it provides `AUTUMN_DOTENV`, preserving
+        // an explicit `0`/`false`/`1`/`true`, and fall back to `1` only when it
+        // is unset.
+        if key == "AUTUMN_DOTENV" {
+            return self
+                .inner
+                .var("AUTUMN_DOTENV")
+                .or_else(|_| Ok("1".to_owned()));
+        }
+        self.inner.var(key)
+    }
+}
+
+/// Reload the deploy config under the TARGET deploy profile.
+///
+/// The chicken-and-egg here: the ambient load in [`run`] learns the deploy
+/// profile (`resolved.profile`), and this reload then resolves the full config
+/// under it. The `.env.<profile>` overlay is selected via
+/// [`autumn_web::dotenv::os_env_with_dotenv_for_profile_using`], fed a
+/// [`ForcedProfileEnv`] gating base that reports `AUTUMN_DOTENV=1` so a non-dev
+/// deploy profile still loads `.env.<profile>` (dotenv auto-load is otherwise
+/// gated off outside `dev`/`test`). The overlay is selected by the CANONICAL
+/// profile ([`canonicalize_deploy_profile`]) so a `[deploy] profile` alias like
+/// `production` still reads `.env.prod` (matching `AutumnConfig::load()`), not
+/// `.env.production`. A second [`ForcedProfileEnv`] wrapper forces `AUTUMN_ENV`
+/// to the RAW `resolved.profile` so the loader layers `[profile.<profile>]` /
+/// `autumn-<profile>.toml` on top with the operator's exact spelling. Real OS
+/// env vars still win over `.env` (the
+/// overlay only fills gaps), and the dotenv profile-selector-key exclusion still
+/// strips `AUTUMN_ENV`/`AUTUMN_PROFILE`/`AUTUMN_IS_DEBUG` from any `.env` file,
+/// matching `AutumnConfig::load()`.
+fn load_runtime_config(resolved: &ResolvedDeployConfig) -> Result<AutumnConfig, DeployError> {
+    use autumn_web::config::OsEnv;
+    // Gating base: the real OS env, but reports `AUTUMN_DOTENV=1` so
+    // `should_load` loads `.env.<profile>` for a non-dev deploy profile —
+    // without mutating the global process environment.
+    let gating = ForcedProfileEnv {
+        profile: resolved.profile.clone(),
+        inner: OsEnv,
+    };
+    // Select the `.env.<profile>` overlay by the CANONICAL profile, so a
+    // `[deploy] profile` alias like `production`/`PROD` still picks the same
+    // `.env.prod` file that `AutumnConfig::load()` reads after profile
+    // normalization — not `.env.production`/`.env.PROD`. Only the dotenv-overlay
+    // SELECTION is canonicalized; `AUTUMN_ENV` and the TOML override-file
+    // precedence (handled by `load_with_env`) still see the RAW spelling below.
+    let dotenv_profile = canonicalize_deploy_profile(&resolved.profile);
+    let inner = autumn_web::dotenv::os_env_with_dotenv_for_profile_using(&gating, &dotenv_profile)
+        .map_err(|e| DeployError::Config(e.to_string()))?;
+    let forced = ForcedProfileEnv {
+        profile: resolved.profile.clone(),
+        inner,
+    };
+    AutumnConfig::load_with_env(&forced).map_err(|e| DeployError::Config(e.to_string()))
 }
 
 /// Resolve the project's package name (for the `app_name` default), falling back
@@ -1221,6 +1322,155 @@ mod tests {
             "env file should honor the [deploy] profile override, got: {:?}",
             env_file.expose()
         );
+    }
+
+    #[test]
+    fn runtime_config_loads_profile_scoped_prod_values_for_env_file_and_grading() {
+        // Regression (P1 follow-up to #1956): `autumn deploy` must reload its
+        // config under the TARGET deploy profile (default `prod`), so a signing
+        // secret and DB URL that live ONLY under `[profile.prod]` are loaded,
+        // graded, and uploaded — instead of the operator's ambient/dev values.
+        //
+        // This exercises the exact seam `run` → `load_runtime_config` uses: a
+        // `ForcedProfileEnv` (which reports `AUTUMN_ENV=<deploy profile>`) fed to
+        // `AutumnConfig::load_with_env`, so the loader layers `[profile.prod]` on
+        // top. `AUTUMN_MANIFEST_DIR` points config loading at the temp project
+        // WITHOUT mutating the process env or CWD (a `MockEnv` inner supplies it).
+        use autumn_web::config::MockEnv;
+
+        let dir = tempfile::TempDir::new().expect("temp project dir");
+        // Base/dev values are weak/placeholder and DIFFERENT from prod. The prod
+        // signing secret (64 hex chars, not a demo value) and prod DB URL live
+        // ONLY under `[profile.prod]`, exactly the combo that motivated the fix.
+        let prod_secret = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let prod_db_url = "postgres://prod_user:prod_pw@proddb.internal/app";
+        std::fs::write(
+            dir.path().join("autumn.toml"),
+            format!(
+                "[deploy]\n\
+                 host = \"deploy.example.test\"\n\
+                 \n\
+                 [database]\n\
+                 primary_url = \"postgres://dev:dev@localhost/devapp\"\n\
+                 \n\
+                 [security.signing_secret]\n\
+                 secret = \"changeme\"\n\
+                 \n\
+                 [profile.prod.database]\n\
+                 primary_url = \"{prod_db_url}\"\n\
+                 \n\
+                 [profile.prod.security.signing_secret]\n\
+                 secret = \"{prod_secret}\"\n"
+            ),
+        )
+        .expect("write autumn.toml");
+
+        // Deploy profile defaults to `prod`; no host so the ssh_reachability
+        // grader fails fast without any network I/O (we only assert on the
+        // signing-secret grade below).
+        let resolved = ResolvedDeployConfig::resolve(&DeployConfig::default(), "demoapp");
+        assert_eq!(resolved.profile, "prod");
+
+        // Force `AUTUMN_ENV=prod` (as `load_runtime_config` does) and point config
+        // loading at the temp dir via a MockEnv-supplied AUTUMN_MANIFEST_DIR.
+        let forced = ForcedProfileEnv {
+            profile: resolved.profile.clone(),
+            inner: MockEnv::new().with("AUTUMN_MANIFEST_DIR", dir.path().to_str().unwrap()),
+        };
+        let runtime_config =
+            AutumnConfig::load_with_env(&forced).expect("load config under prod profile");
+
+        // The env file the deploy would upload carries the PROD values and pins
+        // AUTUMN_ENV to the deploy profile — never the dev/base placeholders.
+        let env_file = build_env_file(&runtime_config, &resolved);
+        let body = env_file.expose();
+        assert!(
+            body.lines().any(|l| l == "AUTUMN_ENV=prod"),
+            "env file must pin AUTUMN_ENV to the deploy profile, got: {body:?}"
+        );
+        assert!(
+            body.lines()
+                .any(|l| l == format!("AUTUMN_SECURITY__SIGNING_SECRET={prod_secret}")),
+            "env file must carry the PROD signing secret, got: {body:?}"
+        );
+        assert!(
+            body.lines()
+                .any(|l| l == format!("AUTUMN_DATABASE__URL={prod_db_url}")),
+            "env file must carry the PROD database URL, got: {body:?}"
+        );
+        // The dev/base placeholders must NOT leak into the uploaded env file.
+        assert!(
+            !body.contains("changeme"),
+            "env file must not ship the dev/base signing secret"
+        );
+        assert!(
+            !body.contains("devapp"),
+            "env file must not ship the dev/base database URL"
+        );
+
+        // Preflight grades the PROD signing secret: a strong prod secret PASSES
+        // even though the weak base `changeme` would fail production grading. This
+        // proves the weak base secret never leaks through the grade.
+        let signing = collect_preflight(&runtime_config, &resolved)
+            .into_iter()
+            .find(|c| c.name == "signing_secret")
+            .expect("preflight includes a signing_secret check");
+        assert!(
+            signing.passed,
+            "the strong PROD signing secret must pass preflight: {}",
+            signing.detail
+        );
+    }
+
+    #[test]
+    fn forced_profile_env_overrides_only_autumn_env() {
+        // The wrapper reports the forced deploy profile for AUTUMN_ENV and
+        // delegates every other key to the inner env unchanged.
+        use autumn_web::config::MockEnv;
+
+        let forced = ForcedProfileEnv {
+            profile: "prod".to_owned(),
+            inner: MockEnv::new()
+                .with("AUTUMN_ENV", "dev")
+                .with("SOME_OTHER_KEY", "kept"),
+        };
+        assert_eq!(forced.var("AUTUMN_ENV").as_deref(), Ok("prod"));
+        assert_eq!(forced.var("SOME_OTHER_KEY").as_deref(), Ok("kept"));
+        assert!(forced.var("UNSET_KEY").is_err());
+    }
+
+    #[test]
+    fn forced_profile_env_honors_explicit_autumn_dotenv() {
+        // The wrapper synthesizes `AUTUMN_DOTENV=1` only when the inner env has
+        // NO explicit value. An operator running `AUTUMN_DOTENV=0 autumn deploy`
+        // (or `false`) is deliberately opting OUT of `.env.<profile>` loading, so
+        // the explicit value must be delegated through unchanged (`should_load`
+        // honors `0`/`false` as the documented off switch).
+        use autumn_web::config::MockEnv;
+
+        // Explicit `0` is preserved (off).
+        let off = ForcedProfileEnv {
+            profile: "prod".to_owned(),
+            inner: MockEnv::new().with("AUTUMN_DOTENV", "0"),
+        };
+        assert_eq!(off.var("AUTUMN_DOTENV").as_deref(), Ok("0"));
+        // AUTUMN_ENV is still forced to the deploy profile.
+        assert_eq!(off.var("AUTUMN_ENV").as_deref(), Ok("prod"));
+
+        // Unset inner value → synthesize `1` (opt the deploy profile into the
+        // `.env.<profile>` overlay).
+        let unset = ForcedProfileEnv {
+            profile: "prod".to_owned(),
+            inner: MockEnv::new(),
+        };
+        assert_eq!(unset.var("AUTUMN_DOTENV").as_deref(), Ok("1"));
+
+        // Explicit truthy values are also delegated verbatim.
+        let on = ForcedProfileEnv {
+            profile: "prod".to_owned(),
+            inner: MockEnv::new().with("AUTUMN_DOTENV", "true"),
+        };
+        assert_eq!(on.var("AUTUMN_DOTENV").as_deref(), Ok("true"));
     }
 
     #[test]

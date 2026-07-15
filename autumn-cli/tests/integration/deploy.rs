@@ -365,6 +365,303 @@ fn doctor_ignores_tuning_only_deploy_database_table() {
 }
 
 #[test]
+fn deploy_check_grades_and_uploads_profile_scoped_prod_values() {
+    // Regression (P1 follow-up to #1956): `autumn deploy` must reload its config
+    // under the TARGET deploy profile (default `prod`), so a signing secret and a
+    // DB URL that live ONLY under `[profile.prod]` are loaded and graded — instead
+    // of the operator's ambient/dev config. Here the ambient profile is dev (no
+    // `AUTUMN_ENV`), the base/dev signing secret is a weak demo value, and the
+    // strong prod secret + prod DB URL exist ONLY under `[profile.prod]`.
+    //
+    // Under the OLD behavior (config loaded under the ambient dev profile), the
+    // signing-secret grader would see the weak `changeme`, grade it as production
+    // (per #1956), and FAIL; and `database_url` would report "no database
+    // configured" because the dev config has no DB. With the fix, the reload under
+    // `prod` loads the strong prod secret (PASS) and the prod DB URL (configured).
+    let dir = tempfile::tempdir().expect("create temp project dir");
+    fs::write(
+        dir.path().join("Cargo.toml"),
+        "[package]\nname = \"demoapp\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .expect("write Cargo.toml");
+    // 64 hex chars (>= MIN_SECRET_LEN, not a known demo value): a valid production
+    // secret, present ONLY under `[profile.prod]`. The base/dev secret is a known
+    // demo value that would FAIL production grading if it leaked through.
+    fs::write(
+        dir.path().join("autumn.toml"),
+        "[deploy]\n\
+         host = \"deploy.example.test\"\n\
+         \n\
+         [security.signing_secret]\n\
+         secret = \"changeme\"\n\
+         \n\
+         [profile.prod.database]\n\
+         primary_url = \"postgres://prod:pw@proddb.internal/app\"\n\
+         \n\
+         [profile.prod.security.signing_secret]\n\
+         secret = \"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\"\n",
+    )
+    .expect("write autumn.toml");
+
+    // No `AUTUMN_ENV` → the ambient CLI profile is dev; only the deploy-profile
+    // reload can surface the prod-only values.
+    let (stdout, stderr, _code) = run_autumn(dir.path(), &["deploy", "check"], &[]);
+    let combined = format!("{stdout}{stderr}");
+
+    // The strong PROD signing secret is graded (and passes) — the weak base secret
+    // never leaks into the grade.
+    assert!(
+        combined.contains("signing_secret: signing secret is configured"),
+        "deploy check must load and pass the PROD-only signing secret\nstdout:\n\
+         {stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        !combined.contains("known demo/template value"),
+        "the weak base/dev secret must not be graded (it would fail as a demo \
+         value)\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        !combined.contains("changeme"),
+        "the demo secret value must never be echoed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    // The PROD-only DB URL is loaded, so the DB check sees a configured database
+    // rather than reporting the dev config's "no database configured".
+    assert!(
+        combined.contains("database_url: database URL is configured"),
+        "deploy check must load the PROD-only database URL\nstdout:\n{stdout}\n\
+         stderr:\n{stderr}"
+    );
+    assert!(
+        !combined.contains("no database configured"),
+        "the dev config's DB-free state must not surface once reloaded under \
+         prod\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+}
+
+#[test]
+fn deploy_check_loads_prod_values_from_dotenv_file() {
+    // Regression (Gemini review on #1966): `autumn deploy` must load the target
+    // deploy profile's `.env.<profile>` file even from a dev shell. `.env.prod`
+    // is a documented place for prod-only values (the signing secret, the DB
+    // URL), but dotenv auto-loading is gated OFF for non-`dev`/`test` profiles
+    // unless `AUTUMN_DOTENV=1` — so before the fix the deploy-time reload
+    // silently SKIPPED `.env.prod` and graded the weak dev secret / reported no
+    // DB. The fix has `ForcedProfileEnv` report `AUTUMN_DOTENV=1` to the dotenv
+    // gating base (without mutating the global env), so `.env.prod` loads.
+    //
+    // Here the strong prod secret and prod DB URL live ONLY in a `.env.prod`
+    // FILE (NOT in `autumn.toml` `[profile.prod]`), the ambient profile is dev
+    // (no `AUTUMN_ENV`), and the test does NOT set `AUTUMN_DOTENV` in its own
+    // env — proving it works out of the box.
+    let dir = tempfile::tempdir().expect("create temp project dir");
+    fs::write(
+        dir.path().join("Cargo.toml"),
+        "[package]\nname = \"demoapp\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .expect("write Cargo.toml");
+    // Base config: deploy host + a weak/demo dev signing secret that would FAIL
+    // production grading if it leaked through. No `[profile.prod]` section and no
+    // database — the prod values come exclusively from `.env.prod` below.
+    fs::write(
+        dir.path().join("autumn.toml"),
+        "[deploy]\n\
+         host = \"deploy.example.test\"\n\
+         \n\
+         [security.signing_secret]\n\
+         secret = \"changeme\"\n",
+    )
+    .expect("write autumn.toml");
+    // Prod-only values live ONLY in `.env.prod` via the highest (`AUTUMN_*`)
+    // config layer. `AUTUMN_ENV=dev` here is a profile-SELECTOR key: the dotenv
+    // overlay strips it unconditionally, so it can never flip the active profile
+    // (safety gate preserved).
+    fs::write(
+        dir.path().join(".env.prod"),
+        "AUTUMN_ENV=dev\n\
+         AUTUMN_SECURITY__SIGNING_SECRET=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n\
+         AUTUMN_DATABASE__PRIMARY_URL=postgres://prod:pw@proddb.internal/app\n",
+    )
+    .expect("write .env.prod");
+
+    // No `AUTUMN_ENV` / `AUTUMN_DOTENV` in the test env: the deploy-profile
+    // reload must opt into `.env.prod` loading on its own.
+    let (stdout, stderr, _code) = run_autumn(dir.path(), &["deploy", "check"], &[]);
+    let combined = format!("{stdout}{stderr}");
+
+    // The strong PROD signing secret from `.env.prod` is loaded and graded
+    // (passes) — the weak base secret never leaks into the grade.
+    assert!(
+        combined.contains("signing_secret: signing secret is configured"),
+        "deploy check must load and pass the PROD signing secret from .env.prod\n\
+         stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        !combined.contains("known demo/template value"),
+        "the weak base/dev secret must not be graded (it would fail as a demo \
+         value)\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        !combined.contains("changeme"),
+        "the demo secret value must never be echoed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    // The PROD DB URL from `.env.prod` is loaded, so the DB check sees a
+    // configured database rather than the dev config's "no database configured".
+    assert!(
+        combined.contains("database_url: database URL is configured"),
+        "deploy check must load the PROD database URL from .env.prod\nstdout:\n\
+         {stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        !combined.contains("no database configured"),
+        "the DB-free base state must not surface once .env.prod is loaded\n\
+         stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+}
+
+#[test]
+fn deploy_check_loads_dotenv_for_production_alias() {
+    // Regression (Codex P2 on #1966): the `.env.<profile>` overlay must be
+    // selected by the CANONICAL deploy profile, not the operator's raw
+    // `[deploy] profile` spelling. A `production` (or `PROD`) alias normalizes to
+    // the canonical `prod` in `AutumnConfig::load()`, so the prod-only values
+    // live in `.env.prod`. Before the fix, the deploy-time reload passed the RAW
+    // `production` alias to the dotenv overlay and looked for `.env.production`,
+    // silently missing `.env.prod` and grading the weak dev secret / no DB.
+    //
+    // Here `[deploy] profile = "production"` (the ALIAS), the strong prod secret
+    // and prod DB URL live ONLY in `.env.prod`, the ambient profile is dev (no
+    // `AUTUMN_ENV`), and the test does NOT set `AUTUMN_DOTENV` — proving the
+    // canonical `.env.prod` is selected despite the `production` alias.
+    let dir = tempfile::tempdir().expect("create temp project dir");
+    fs::write(
+        dir.path().join("Cargo.toml"),
+        "[package]\nname = \"demoapp\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .expect("write Cargo.toml");
+    // Base config: deploy host + a weak/demo dev signing secret that would FAIL
+    // production grading if it leaked through. `[deploy] profile` is the
+    // `production` ALIAS (not the canonical `prod`). No `[profile.*]` section and
+    // no database — the prod values come exclusively from `.env.prod` below.
+    fs::write(
+        dir.path().join("autumn.toml"),
+        "[deploy]\n\
+         host = \"deploy.example.test\"\n\
+         profile = \"production\"\n\
+         \n\
+         [security.signing_secret]\n\
+         secret = \"changeme\"\n",
+    )
+    .expect("write autumn.toml");
+    // Prod-only values live ONLY in the CANONICAL `.env.prod` (NOT
+    // `.env.production`), matching how `AutumnConfig::load()` reads them after
+    // profile normalization.
+    fs::write(
+        dir.path().join(".env.prod"),
+        "AUTUMN_ENV=dev\n\
+         AUTUMN_SECURITY__SIGNING_SECRET=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n\
+         AUTUMN_DATABASE__PRIMARY_URL=postgres://prod:pw@proddb.internal/app\n",
+    )
+    .expect("write .env.prod");
+
+    // No `AUTUMN_ENV` / `AUTUMN_DOTENV` in the test env: the deploy-profile
+    // reload must opt into the canonical `.env.prod` on its own.
+    let (stdout, stderr, _code) = run_autumn(dir.path(), &["deploy", "check"], &[]);
+    let combined = format!("{stdout}{stderr}");
+
+    // The strong PROD signing secret from `.env.prod` is loaded and graded
+    // (passes) even though `[deploy] profile` is the `production` alias.
+    assert!(
+        combined.contains("signing_secret: signing secret is configured"),
+        "deploy check must load and pass the PROD signing secret from .env.prod \
+         via the canonical `prod` selection\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        !combined.contains("known demo/template value"),
+        "the weak base/dev secret must not be graded (it would fail as a demo \
+         value)\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        !combined.contains("changeme"),
+        "the demo secret value must never be echoed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    // The PROD DB URL from `.env.prod` is loaded, so the DB check sees a
+    // configured database rather than the base config's "no database configured".
+    assert!(
+        combined.contains("database_url: database URL is configured"),
+        "deploy check must load the PROD database URL from the canonical \
+         .env.prod\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        !combined.contains("no database configured"),
+        "the DB-free base state must not surface once .env.prod is loaded via \
+         the canonical selection\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+}
+
+#[test]
+fn deploy_check_respects_explicit_autumn_dotenv_off() {
+    // Regression (Codex P2 on #1966): an operator who runs
+    // `AUTUMN_DOTENV=0 autumn deploy ...` deliberately opts OUT of
+    // `.env.<profile>` loading. Before the fix `ForcedProfileEnv` synthesized
+    // `AUTUMN_DOTENV=1` UNCONDITIONALLY, overriding the explicit `0`, so
+    // `.env.prod` loaded anyway. The fix delegates to the inner env when it
+    // provides `AUTUMN_DOTENV`, preserving the explicit off switch.
+    //
+    // Here the strong prod secret + prod DB URL live ONLY in `.env.prod`, but the
+    // deploy child env sets `AUTUMN_DOTENV=0`, so `.env.prod` must NOT load: the
+    // weak base `changeme` secret is graded (and flagged as a demo value) and the
+    // DB-free base state surfaces instead.
+    let dir = tempfile::tempdir().expect("create temp project dir");
+    fs::write(
+        dir.path().join("Cargo.toml"),
+        "[package]\nname = \"demoapp\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .expect("write Cargo.toml");
+    fs::write(
+        dir.path().join("autumn.toml"),
+        "[deploy]\n\
+         host = \"deploy.example.test\"\n\
+         \n\
+         [security.signing_secret]\n\
+         secret = \"changeme\"\n",
+    )
+    .expect("write autumn.toml");
+    fs::write(
+        dir.path().join(".env.prod"),
+        "AUTUMN_ENV=dev\n\
+         AUTUMN_SECURITY__SIGNING_SECRET=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n\
+         AUTUMN_DATABASE__PRIMARY_URL=postgres://prod:pw@proddb.internal/app\n",
+    )
+    .expect("write .env.prod");
+
+    // Explicit `AUTUMN_DOTENV=0` in the deploy child env opts OUT of dotenv.
+    let (stdout, stderr, _code) =
+        run_autumn(dir.path(), &["deploy", "check"], &[("AUTUMN_DOTENV", "0")]);
+    let combined = format!("{stdout}{stderr}");
+
+    // The prod signing secret from `.env.prod` must NOT be loaded: the weak base
+    // `changeme` is graded and flagged as a demo/template value.
+    assert!(
+        combined.contains("known demo/template value"),
+        "with AUTUMN_DOTENV=0 the weak base secret must be graded (a demo value), \
+         proving .env.prod was NOT loaded\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    // The prod DB URL from `.env.prod` must NOT be loaded: the DB-free base state
+    // surfaces instead.
+    assert!(
+        combined.contains("no database configured"),
+        "with AUTUMN_DOTENV=0 the base config's DB-free state must surface, \
+         proving .env.prod was NOT loaded\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    // The prod-only DB URL never appears.
+    assert!(
+        !combined.contains("proddb.internal"),
+        "the prod DB URL from .env.prod must not be loaded when AUTUMN_DOTENV=0\n\
+         stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+}
+
+#[test]
 fn deploy_help_lists_subcommands() {
     let dir = tempfile::tempdir().expect("temp dir");
     let (stdout, stderr, code) = run_autumn(dir.path(), &["deploy", "--help"], &[]);
