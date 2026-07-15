@@ -522,6 +522,22 @@ enum LabelSource {
     LabelledBy(String),
 }
 
+/// Returns `true` when `name` is a valid `hx-*` attribute suffix: a non-empty
+/// run of ASCII lowercase letters, digits, or `-`.
+///
+/// This mirrors the attribute-name validation in [`crate::links`]
+/// (`is_valid_attr_name`) but narrows the alphabet to the `hx-*` suffix
+/// grammar. It deliberately excludes whitespace and `=` — which
+/// [`maud::Escaper`] does **not** escape — so a caller-supplied name can never
+/// break out of the `hx-{name}="…"` attribute into a separate, injected
+/// attribute.
+fn is_valid_hx_suffix(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
 /// Splice a dynamic set of `hx-*` attributes into an already-rendered element.
 ///
 /// maud requires a *static* attribute name (its `Named` attribute parses an
@@ -530,9 +546,14 @@ enum LabelSource {
 /// permitted in attribute position either. Because maud escapes every `>` in
 /// text and attribute values to `&gt;`, the first literal `>` in a rendered
 /// element is always the end of its opening tag, so inserting the attributes
-/// immediately before it is unambiguous. Each name and value is
-/// HTML-attribute-escaped via [`maud::Escaper`], preserving maud's own escaping
-/// guarantees. An empty set returns the element byte-for-byte unchanged.
+/// immediately before it is unambiguous. The value is HTML-attribute-escaped
+/// via [`maud::Escaper`], preserving maud's own escaping guarantees. An empty
+/// set returns the element byte-for-byte unchanged.
+///
+/// Each attribute name is validated against [`is_valid_hx_suffix`]: an invalid
+/// name trips a [`debug_assert`] (surfacing the developer error in debug
+/// builds) and is skipped in release builds, so a malformed or injected
+/// attribute is never emitted.
 fn with_hx_attrs(element: Markup, hx: &[(String, String)]) -> Markup {
     if hx.is_empty() {
         return element;
@@ -540,8 +561,19 @@ fn with_hx_attrs(element: Markup, hx: &[(String, String)]) -> Markup {
     let rendered = element.into_string();
     let mut attrs = String::new();
     for (name, value) in hx {
+        debug_assert!(
+            is_valid_hx_suffix(name),
+            "invalid hx-* attribute name {name:?}: only lowercase ASCII letters, \
+             digits, and '-' are permitted"
+        );
+        if !is_valid_hx_suffix(name) {
+            continue;
+        }
         attrs.push_str(" hx-");
-        let _ = write!(Escaper::new(&mut attrs), "{name}");
+        // `name` is validated to the safe `[a-z0-9-]` alphabet, so it needs no
+        // escaping (mirroring `links::push_attr`, which pushes the validated
+        // name verbatim); the value keeps maud's attribute escaping.
+        attrs.push_str(name);
         attrs.push_str("=\"");
         let _ = write!(Escaper::new(&mut attrs), "{value}");
         attrs.push('"');
@@ -1262,15 +1294,16 @@ impl<State> Select<State> {
         self
     }
 
-    /// Mark the option whose `value` matches as `selected` (all others are left
-    /// unchanged).
+    /// Authoritatively set the single selected option: the option whose `value`
+    /// matches is marked `selected` and every other option's `selected` flag is
+    /// cleared. `<select>` is single-select, so this guarantees at most one
+    /// `selected` option in the rendered markup — any prior selection (e.g. from
+    /// [`SelectOption::selected`]) is overridden.
     #[must_use]
     pub fn selected_value(mut self, value: impl Into<String>) -> Self {
         let value = value.into();
         for opt in &mut self.options {
-            if opt.value == value {
-                opt.selected = true;
-            }
+            opt.selected = opt.value == value;
         }
         self
     }
@@ -1982,5 +2015,23 @@ mod tests {
         assert!(markup.contains("aria-label=\"Search\""), "{markup}");
         assert!(markup.contains("class=\"search\""), "{markup}");
         assert!(markup.contains("aria-invalid=\"true\""), "{markup}");
+    }
+
+    #[test]
+    fn is_valid_hx_suffix_accepts_safe_alphabet_only() {
+        // Valid suffixes: lowercase letters, digits, and '-', non-empty.
+        assert!(is_valid_hx_suffix("post"));
+        assert!(is_valid_hx_suffix("trigger"));
+        assert!(is_valid_hx_suffix("on-2"));
+        assert!(is_valid_hx_suffix("swap-oob"));
+        // Invalid: empty, whitespace, '=', and other injection characters that
+        // `maud::Escaper` does not escape.
+        assert!(!is_valid_hx_suffix(""));
+        assert!(!is_valid_hx_suffix("post autofocus"));
+        assert!(!is_valid_hx_suffix("post=x"));
+        assert!(!is_valid_hx_suffix("Post"));
+        assert!(!is_valid_hx_suffix("po st"));
+        assert!(!is_valid_hx_suffix("post\"onload"));
+        assert!(!is_valid_hx_suffix("hx_post"));
     }
 }

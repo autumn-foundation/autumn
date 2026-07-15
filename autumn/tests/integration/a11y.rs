@@ -476,6 +476,103 @@ fn hx_lands_on_visible_labeled_control_not_the_label() {
 }
 
 #[test]
+fn selected_value_is_exclusive_and_clears_prior_selection() {
+    // FIX (PR #1946 review): `<select>` is single-select, so `selected_value`
+    // must authoritatively set exactly one selected option and clear any option
+    // previously marked via `SelectOption::selected()`. Otherwise the rendered
+    // markup carries two `selected` options (invalid HTML).
+    let markup = Select::new("role")
+        .options([
+            SelectOption::new("admin", "Admin").selected(),
+            SelectOption::new("user", "User"),
+            SelectOption::new("other", "Other"),
+        ])
+        .selected_value("other")
+        .aria_label("Role")
+        .render()
+        .into_string();
+    // Exactly one `selected` occurrence, on the "other" option.
+    assert_eq!(
+        markup.matches(" selected").count(),
+        1,
+        "exactly one option may be selected: {markup}"
+    );
+    assert!(
+        markup.contains("value=\"other\" selected"),
+        "the chosen option must be selected: {markup}"
+    );
+    assert!(
+        !markup.contains("value=\"admin\" selected"),
+        "the pre-marked option must no longer be selected: {markup}"
+    );
+}
+
+#[test]
+fn hx_valid_multi_attr_chain_renders_all_in_order() {
+    // A valid chain of `hx-*` attributes still renders every attribute, in
+    // insertion order, with escaped values.
+    let markup = Select::new("q")
+        .option("a", "A")
+        .hx("post", "/submit")
+        .hx("target", "#result")
+        .hx("swap", "outerHTML")
+        .aria_label("Query")
+        .render()
+        .into_string();
+    assert!(markup.contains("hx-post=\"/submit\""), "{markup}");
+    assert!(markup.contains("hx-target=\"#result\""), "{markup}");
+    assert!(markup.contains("hx-swap=\"outerHTML\""), "{markup}");
+    let post = markup.find("hx-post").expect("hx-post present");
+    let target = markup.find("hx-target").expect("hx-target present");
+    let swap = markup.find("hx-swap").expect("hx-swap present");
+    assert!(post < target && target < swap, "order preserved: {markup}");
+}
+
+#[test]
+fn hx_rejects_attribute_name_injection() {
+    // FIX (PR #1946 review): a name containing whitespace or `=` — which
+    // `maud::Escaper` does NOT escape — must never break out into a separate,
+    // injected attribute. In debug builds this trips a `debug_assert!`; in
+    // release builds the malformed attribute is dropped (fail-safe). Either way,
+    // no standalone `autofocus` / broken-out `="/v"` may appear in the output.
+    let build = || {
+        Select::new("q")
+            .option("a", "A")
+            .hx("post autofocus", "/v")
+            .aria_label("Query")
+            .render()
+            .into_string()
+    };
+
+    #[cfg(debug_assertions)]
+    {
+        // The debug_assert! surfaces the developer error as a panic.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(build));
+        assert!(
+            result.is_err(),
+            "an invalid hx name must trip debug_assert! in debug builds"
+        );
+    }
+
+    #[cfg(not(debug_assertions))]
+    {
+        let markup = build();
+        assert!(
+            !markup.contains("autofocus"),
+            "the injected attribute must not be emitted: {markup}"
+        );
+        assert!(
+            !markup.contains("=\"/v\""),
+            "the broken-out value must not be emitted: {markup}"
+        );
+        assert!(
+            !markup.contains("hx-post autofocus"),
+            "the malformed name must not be emitted: {markup}"
+        );
+    }
+}
+
+#[test]
 fn splices_inside_html_block() {
     let page = html! {
         (Img::new("/logo.svg", "Autumn logo"))
