@@ -27,6 +27,10 @@
 
 use axum::extract::FromRequestParts;
 use diesel;
+// Named by the default Postgres pool builder/TLS connector and by the
+// Postgres migration connection (`MigrationConnection`), which stays compiled
+// under the `sqlite` feature (diesel's `postgres` backend is still in the graph
+// via `db`), so this import is used on both builds.
 use diesel_async::AsyncPgConnection;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::pooled_connection::deadpool::Pool;
@@ -447,10 +451,17 @@ pub static TX_RETRIES_TOTAL: AtomicU64 = AtomicU64::new(0);
 /// succeeding, since process start. Exposed as `autumn_tx_retry_exhausted_total`.
 pub static TX_RETRY_EXHAUSTED_TOTAL: AtomicU64 = AtomicU64::new(0);
 
+// The transaction serialization-failure retry loop is Postgres-only (SQLite's
+// `tx_with` runs a single plain transaction), so these retry-metric helpers are
+// unused in a `--features sqlite` library build. They are still exercised by the
+// crate's unit tests, so keep them compiled and only silence the dead-code
+// warning under the feature.
+#[cfg_attr(feature = "sqlite", allow(dead_code))]
 pub(crate) fn record_tx_retry() -> u64 {
     TX_RETRIES_TOTAL.fetch_add(1, Ordering::Relaxed) + 1
 }
 
+#[cfg_attr(feature = "sqlite", allow(dead_code))]
 pub(crate) fn record_tx_retry_exhausted() -> u64 {
     TX_RETRY_EXHAUSTED_TOTAL.fetch_add(1, Ordering::Relaxed) + 1
 }
@@ -1073,34 +1084,29 @@ fn build_pool(
     pool_size: usize,
     connect_timeout_secs: u64,
 ) -> Result<Pool<RuntimeConnection>, PoolError> {
-    // A SQLite target is recognized (issue #1614) but the runtime pool that
-    // would serve it is not wired into this build yet — the pool below is a
-    // Postgres pool (`Pool<AsyncPgConnection>`). Refuse here, at pool-build
-    // (boot) time, with an actionable message so a SQLite misconfiguration
-    // fails fast rather than reaching a confusing first-query failure. The
-    // Postgres path is unchanged: a Postgres target skips this branch entirely.
-    if crate::config::DatabaseBackend::detect(url) == Some(crate::config::DatabaseBackend::Sqlite) {
-        return Err(PoolError::UnsupportedBackend(format!(
-            "SQLite is a recognized database backend but its runtime pool is not yet \
-             available in this build of autumn-web; follow \
-             https://github.com/madmax983/autumn/issues/1905 for status (target: {url:?})"
-        )));
-    }
-
     // Under the `sqlite` feature `RuntimeConnection` is a SQLite connection, so
-    // the Postgres pool/manager built below does not type-check against
-    // `Pool<RuntimeConnection>` — and, per PR1 (issue #1614), no SQLite runtime
-    // pool is wired yet. Refuse all pool construction here so the alias can flip
-    // without a working backend; the real SQLite pool is PR2. This keeps the
-    // "SQLite pool construction stays refused at runtime" guarantee while
-    // letting the feature-on build compile.
+    // the pool must be built over `SyncConnectionWrapper<SqliteConnection>`
+    // rather than the Postgres manager below. Route to the dedicated SQLite
+    // builder (PR2, issue #1614). This block is the whole function body under
+    // the feature (the Postgres arms below are cfg'd out), so it is the tail
+    // expression — no `return` needed.
     #[cfg(feature = "sqlite")]
     {
-        let _ = (pool_size, connect_timeout_secs);
+        build_sqlite_pool(url, pool_size, connect_timeout_secs)
+    }
+
+    // Default (Postgres) build. A SQLite target is recognized here but its
+    // runtime pool only exists in a `--features sqlite` build — the pool below
+    // is a Postgres pool (`Pool<AsyncPgConnection>`). Refuse at pool-build
+    // (boot) time with an actionable message so a SQLite misconfiguration fails
+    // fast rather than reaching a confusing first-query failure. A Postgres
+    // target skips this branch entirely.
+    #[cfg(not(feature = "sqlite"))]
+    if crate::config::DatabaseBackend::detect(url) == Some(crate::config::DatabaseBackend::Sqlite) {
         return Err(PoolError::UnsupportedBackend(format!(
-            "the SQLite runtime pool is not yet wired into this build of \
-             autumn-web (built with --features sqlite); follow \
-             https://github.com/madmax983/autumn/issues/1905 for status (target: {url:?})"
+            "SQLite is a recognized database backend but its runtime pool is only available in \
+             a build of autumn-web compiled with `--features sqlite`; this is a default \
+             (Postgres) build (target: {url:?})"
         )));
     }
 
@@ -1131,6 +1137,187 @@ fn build_pool(
     }
 }
 
+/// Normalize a configured `SQLite` target into the filename token diesel's
+/// `SqliteConnection` understands.
+///
+/// diesel's `SQLite` backend passes the string straight to `sqlite3_open`, which
+/// understands a filesystem path, a `file:` URI, or the special `:memory:`
+/// token — but **not** a `sqlite:` URL scheme. Strip the recognized `SQLite` URL
+/// spellings down to that: `sqlite::memory:`, `sqlite://:memory:`, and an empty
+/// `sqlite://` all become an in-memory database; `sqlite:///path` /
+/// `sqlite://path` / `sqlite:path` reduce to their path; a `file:` URI or a
+/// bare path passes through unchanged.
+#[cfg(feature = "sqlite")]
+fn normalize_sqlite_target(url: &str) -> String {
+    if url.starts_with("file:") {
+        return url.to_owned();
+    }
+    let rest = url
+        .strip_prefix("sqlite://")
+        .or_else(|| url.strip_prefix("sqlite:"))
+        .unwrap_or(url);
+    if rest.is_empty() || rest == ":memory:" {
+        return String::from(":memory:");
+    }
+    rest.to_owned()
+}
+
+/// Whether a normalized `SQLite` target names a **private** in-memory database
+/// (each such connection is its own private database, so the pool must be
+/// single-slot to stay consistent — see [`build_sqlite_pool`]).
+///
+/// Covers every in-memory spelling `SQLite` accepts through this pool: the bare
+/// `:memory:` token, the `file:` URI form `file::memory:` (with or without a
+/// query string — addresses Codex P1: the multi-slot default would otherwise
+/// hand out connections that each see a different, empty in-memory database),
+/// and any `file:` URI that asks for `mode=memory`.
+///
+/// A **shared-cache** in-memory database (`cache=shared`) is the deliberate
+/// exception: it IS shareable across the pool's connections within one process,
+/// so it must NOT be forced single-slot and returns `false` here.
+#[cfg(feature = "sqlite")]
+fn sqlite_target_is_memory(target: &str) -> bool {
+    if target.contains("cache=shared") {
+        return false;
+    }
+    target == ":memory:"
+        || target == "file::memory:"
+        || target.starts_with("file::memory:?")
+        || target.contains("mode=memory")
+}
+
+/// Whether a normalized `SQLite` target names a **read-only** database via its
+/// URI query string (`mode=ro`, or `immutable=1`/`immutable=true`).
+///
+/// A read-only target rejects any write, so the per-connection setup batch must
+/// skip the write-affecting pragmas (`journal_mode = WAL`) that would otherwise
+/// fail with "attempt to write a readonly database" and take the whole pool 503
+/// (see [`build_sqlite_pool`]). The query string is parsed key-by-key
+/// (case-insensitive keys and values) rather than substring-matched, so an
+/// unrelated value that merely contains `ro` never trips it.
+///
+/// A plain file path, an in-memory target (`mode=memory`, which is not
+/// read-only), and a `cache=shared` target all return `false`.
+#[cfg(feature = "sqlite")]
+fn sqlite_target_is_read_only(target: &str) -> bool {
+    let Some((_, query)) = target.split_once('?') else {
+        return false;
+    };
+    for pair in query.split('&') {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        let (key, value) = (key.trim(), value.trim());
+        if key.eq_ignore_ascii_case("mode") && value.eq_ignore_ascii_case("ro") {
+            return true;
+        }
+        if key.eq_ignore_ascii_case("immutable")
+            && (value == "1" || value.eq_ignore_ascii_case("true"))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Build a deadpool pool over `SyncConnectionWrapper<SqliteConnection>` for a
+/// `SQLite` target (issue #1614, PR2).
+///
+/// `SyncConnectionWrapper` runs synchronous diesel `SqliteConnection` calls on
+/// Tokio's blocking pool, so this integrates with the async runtime like the
+/// Postgres path. Pool sizing is deliberately conservative: `SQLite` is
+/// single-writer, so a large pool only multiplies `SQLITE_BUSY` contention, and
+/// an in-memory database is **private per connection** — a multi-slot pool over
+/// `:memory:` would hand out connections that each see a different, empty
+/// database (so migrations applied on one would be invisible on another).
+/// In-memory targets are therefore forced to a single slot; file targets
+/// respect the configured size (still small by convention).
+#[cfg(feature = "sqlite")]
+fn build_sqlite_pool(
+    url: &str,
+    pool_size: usize,
+    connect_timeout_secs: u64,
+) -> Result<Pool<RuntimeConnection>, PoolError> {
+    // Under the `sqlite` feature the runtime targets SQLite. A Postgres URL here
+    // is a misconfiguration — refuse with an actionable message rather than
+    // trying to open a file literally named "postgres://…".
+    if crate::config::DatabaseBackend::detect(url) == Some(crate::config::DatabaseBackend::Postgres)
+    {
+        return Err(PoolError::UnsupportedBackend(format!(
+            "this build of autumn-web targets SQLite (compiled with `--features sqlite`) but the \
+             configured database URL is a Postgres target; configure a `sqlite:` URL instead \
+             (target: {url:?})"
+        )));
+    }
+
+    let timeout = Duration::from_secs(connect_timeout_secs);
+    let target = normalize_sqlite_target(url);
+    let max_size = if sqlite_target_is_memory(&target) {
+        1
+    } else {
+        pool_size.max(1)
+    };
+    // SQLite starts every connection with `foreign_keys` OFF, so a bare manager
+    // would hand out pooled connections that silently ignore `REFERENCES`
+    // constraints — orphan rows and referential-integrity violations become
+    // possible for the whole app (addresses Codex P1). It also uses a default
+    // busy handler that returns `SQLITE_BUSY` *immediately* when another pooled
+    // connection holds the single writer lock, so ordinary overlapping writes on
+    // a >1 slot file pool fail as 5xx instead of waiting briefly for the lock to
+    // clear (addresses Codex P1). Install both pragmas — plus a deliberate WAL
+    // journal mode with `synchronous = NORMAL` for better write concurrency —
+    // during EVERY pooled connection's setup, mirroring how the sync store
+    // configures its own SQLite connection (see `crate::sync::store`:
+    // `busy_timeout = 5000`, `journal_mode = WAL`, `synchronous = NORMAL`,
+    // `foreign_keys = ON`). `busy_timeout` is set FIRST so everything after it
+    // (and every later query) queues on the timeout instead of failing on a
+    // held lock; `journal_mode = WAL` is a harmless no-op for a pure `:memory:`
+    // database. A `custom_setup` callback on the manager runs once per
+    // newly-created connection, which is exactly the per-connection hook we need
+    // (the same mechanism the Postgres path uses to install TLS).
+    //
+    // A **read-only** URI target (`mode=ro` / `immutable`, e.g.
+    // `sqlite://file:/srv/reference.db?mode=ro`) is the exception: `journal_mode
+    // = WAL` writes to the database (it rewrites the file header and creates the
+    // `-wal`/`-shm` sidecars), so it fails with "attempt to write a readonly
+    // database" — `custom_setup` would propagate that as a connection-setup
+    // error and the pool could not service even read-only queries (`Db` routes
+    // 503). For such targets we install only the non-writing per-connection
+    // pragmas (`busy_timeout`, `foreign_keys`) and skip the write-affecting
+    // ones, so a read-only pool builds and serves reads. In-memory targets are
+    // NOT read-only and keep the full batch.
+    let mut config = diesel_async::pooled_connection::ManagerConfig::<RuntimeConnection>::default();
+    config.custom_setup = Box::new(|url: &str| {
+        use diesel_async::{AsyncConnection as _, SimpleAsyncConnection as _};
+        let url = url.to_owned();
+        async move {
+            let mut conn = RuntimeConnection::establish(&url).await?;
+            let pragmas = if sqlite_target_is_read_only(&url) {
+                // Non-writing pragmas only — WAL + synchronous would write and
+                // fail on a read-only database.
+                "PRAGMA busy_timeout = 5000; \
+                 PRAGMA foreign_keys = ON;"
+            } else {
+                "PRAGMA busy_timeout = 5000; \
+                 PRAGMA journal_mode = WAL; \
+                 PRAGMA synchronous = NORMAL; \
+                 PRAGMA foreign_keys = ON;"
+            };
+            conn.batch_execute(pragmas)
+                .await
+                .map_err(diesel::ConnectionError::CouldntSetupConfiguration)?;
+            Ok(conn)
+        }
+        .boxed()
+    });
+    let manager =
+        AsyncDieselConnectionManager::<RuntimeConnection>::new_with_config(target, config);
+    Ok(Pool::builder(manager)
+        .max_size(max_size)
+        .wait_timeout(Some(timeout))
+        .create_timeout(Some(timeout))
+        .runtime(deadpool::Runtime::Tokio1)
+        .build()?)
+}
+
 /// Create a connection pool from the database configuration.
 ///
 /// Returns `Ok(None)` if no primary database URL is configured
@@ -1155,6 +1342,35 @@ pub fn create_pool(config: &DatabaseConfig) -> Result<Option<Pool<RuntimeConnect
     Ok(Some(pool))
 }
 
+/// Reject a `SQLite` `replica_url` that cannot act as a real read replica for the
+/// given `primary_url`.
+///
+/// Under the `sqlite` feature a configured replica cannot replicate: `SQLite` has
+/// no primary/replica replication in this pool architecture. Two single-slot
+/// `:memory:` pools are two *private* empty databases, and a distinct replica
+/// *file* has nothing replicating into it, so read-routed queries would hit an
+/// empty replica after writes and schema setup went to the primary. Reject an
+/// in-memory or distinct-file replica with an actionable boot error (addresses
+/// Codex P2). A replica that normalizes to the SAME file as the primary is the
+/// same database — harmless — so it is allowed. `normalize_sqlite_target` is
+/// reused so "same file" matches how the pool actually opens the file, and
+/// `sqlite_target_is_memory` so pool sizing and this guard agree on what
+/// "in-memory" means. Shared by the control-database and per-shard topologies so
+/// the two rejection rules cannot drift.
+#[cfg(feature = "sqlite")]
+fn reject_unusable_sqlite_replica(primary_url: &str, replica_url: &str) -> Result<(), PoolError> {
+    let replica_target = normalize_sqlite_target(replica_url);
+    let primary_target = normalize_sqlite_target(primary_url);
+    if sqlite_target_is_memory(&replica_target) || replica_target != primary_target {
+        return Err(PoolError::UnsupportedBackend(format!(
+            "SQLite does not support a separate read replica: replica_url {replica_url:?} \
+             is in-memory or differs from primary_url {primary_url:?}. Configure only a \
+             primary, or point the replica at the same database file as the primary."
+        )));
+    }
+    Ok(())
+}
+
 /// Create primary and optional replica pools from the database configuration.
 ///
 /// Returns `Ok(None)` when neither `database.primary_url` nor the legacy
@@ -1173,6 +1389,12 @@ pub fn create_topology(config: &DatabaseConfig) -> Result<Option<DatabaseTopolog
         config.effective_primary_pool_size(),
         config.connect_timeout_secs,
     )?;
+
+    #[cfg(feature = "sqlite")]
+    if let Some(replica_url) = config.replica_url.as_deref() {
+        reject_unusable_sqlite_replica(primary_url, replica_url)?;
+    }
+
     let replica = config
         .replica_url
         .as_deref()
@@ -1203,6 +1425,17 @@ pub fn create_shard_topology(
         shard.effective_primary_pool_size(defaults),
         defaults.connect_timeout_secs,
     )?;
+
+    // A per-shard `replica_url` is subject to the same SQLite-replica rule as the
+    // control database: without it a SQLite `[[database.shards]]` entry with a
+    // distinct or in-memory replica would boot and route reads to an unrelated,
+    // empty database. Reuse the exact same helper so the two rejections cannot
+    // drift (addresses Codex P2).
+    #[cfg(feature = "sqlite")]
+    if let Some(replica_url) = shard.replica_url.as_deref() {
+        reject_unusable_sqlite_replica(&shard.primary_url, replica_url)?;
+    }
+
     let replica = shard
         .replica_url
         .as_deref()
@@ -1370,6 +1603,9 @@ impl TxOptions {
     /// retry loop calls this instead of reading the field directly, so `0`
     /// always behaves like `1` (run the closure once, no retry) rather than
     /// skipping the closure entirely.
+    // Only the Postgres retry loop consults this; unused in a `--features
+    // sqlite` library build (still unit-tested, so keep it compiled).
+    #[cfg_attr(feature = "sqlite", allow(dead_code))]
     const fn effective_max_attempts(&self) -> u32 {
         if self.max_attempts < 1 {
             1
@@ -1394,6 +1630,11 @@ impl TxOptions {
 }
 
 /// Whether the retry loop should re-run the closure or return the error.
+// The whole serialization-failure retry machinery is Postgres-only (see
+// `Db::tx_with`); these items are unused in a `--features sqlite` library build
+// but remain unit-tested, so keep them compiled and silence dead-code under the
+// feature.
+#[cfg_attr(feature = "sqlite", allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RetryDecision {
     Retry,
@@ -1404,6 +1645,7 @@ enum RetryDecision {
 ///
 /// `attempt` is the 1-indexed number of the attempt that just failed. A retry
 /// happens only when the error is retryable **and** attempts remain.
+#[cfg_attr(feature = "sqlite", allow(dead_code))]
 const fn retry_decision(attempt: u32, max_attempts: u32, retryable: bool) -> RetryDecision {
     if retryable && attempt < max_attempts {
         RetryDecision::Retry
@@ -1417,6 +1659,7 @@ const fn retry_decision(attempt: u32, max_attempts: u32, retryable: bool) -> Ret
 ///
 /// Mirrors the jobs system's backoff shape (`pg_retry_delay_ms`) plus the cap
 /// idiom from the migrate startup loop. Kept jitter-free so it is unit-testable.
+#[cfg_attr(feature = "sqlite", allow(dead_code))]
 fn retry_backoff_base(initial: Duration, max: Duration, attempt: u32) -> Duration {
     // Cap the shift so `2^shift` never overflows and huge attempts saturate.
     let shift = attempt.saturating_sub(1).min(31);
@@ -1431,6 +1674,7 @@ fn retry_backoff_base(initial: Duration, max: Duration, attempt: u32) -> Duratio
 /// re-implementing the RNG/fallback logic) so there's one jitter
 /// implementation in the crate, including its `getrandom`-failure fallback to
 /// `SystemTime` entropy instead of silently degrading to no jitter.
+#[cfg_attr(feature = "sqlite", allow(dead_code))]
 fn retry_backoff_delay(initial: Duration, max: Duration, attempt: u32) -> Duration {
     let base = retry_backoff_base(initial, max, attempt);
     crate::cache::jittered_ttl(base, 0.2).min(max)
@@ -1474,6 +1718,7 @@ fn retry_backoff_delay(initial: Duration, max: Duration, attempt: u32) -> Durati
 /// match above: retrying based on bare text risks misclassifying an unrelated
 /// domain/validation error as a transient conflict, silently re-running a
 /// non-idempotent closure and delaying the response.
+#[cfg_attr(feature = "sqlite", allow(dead_code))]
 fn is_retryable_txn_error(err: &AutumnError) -> bool {
     use tokio_postgres::error::SqlState;
 
@@ -1830,11 +2075,22 @@ impl Db {
     /// non-retryable error is returned immediately; when the retry budget is
     /// exhausted, the **final** underlying error is returned (never swallowed).
     ///
+    /// Under the `sqlite` feature there is no transaction builder that can
+    /// enforce `READ ONLY`, so a request carrying [`TxOptions::read_only`]
+    /// returns an unsupported-options error **before the closure runs** rather
+    /// than silently executing a writable transaction (which would let writes
+    /// commit under a read-only contract). A normal read-write transaction is
+    /// unaffected. The Postgres path enforces read-only via the transaction
+    /// builder and never rejects.
+    ///
     /// # Panics
     ///
     /// Panics if the internal after-commit registry mutex is poisoned (only
     /// possible if a previous thread holding the lock panicked).
     #[allow(clippy::too_many_lines)]
+    // The Postgres path re-borrows `f` per retry attempt (`&mut f`); the SQLite
+    // path consumes it once, so `mut` is unused there.
+    #[cfg_attr(feature = "sqlite", allow(unused_mut))]
     pub async fn tx_with<'a, T, E, F>(
         &'a mut self,
         opts: TxOptions,
@@ -1844,11 +2100,14 @@ impl Db {
         T: Send + 'a,
         E: From<diesel::result::Error> + Send + Sync + 'a,
         crate::error::AutumnError: From<E>,
-        // The closure receives `&mut AsyncPgConnection` (not `&mut PooledConnection`
-        // as `tx` does): isolation levels require `build_transaction()`, which is
-        // inherent on `AsyncPgConnection`. Diesel query methods work on either.
+        // The closure receives `&mut RuntimeConnection` (not `&mut PooledConnection`
+        // as `tx` does): on Postgres, isolation levels require `build_transaction()`,
+        // which is inherent on `AsyncPgConnection` (the default `RuntimeConnection`).
+        // Diesel query methods work on either backend. Under the `sqlite` feature
+        // `RuntimeConnection` is a SQLite connection and the isolation/retry path
+        // below degrades to a single plain transaction.
         F: for<'r> FnMut(
-                &'r mut AsyncPgConnection,
+                &'r mut RuntimeConnection,
             ) -> scoped_futures::ScopedBoxFuture<'a, 'r, Result<T, E>>
             + Send
             + 'a,
@@ -1864,6 +2123,28 @@ impl Db {
             ));
         }
         reject_ambient_after_commit_registry_for_tx()?;
+
+        // Under the SQLite runtime there is no transaction builder that can
+        // enforce `READ ONLY` semantics — the `sqlite` arm below runs a single
+        // plain, writable transaction. Silently honoring a caller's
+        // `TxOptions::read_only()` by running a writable transaction anyway would
+        // let writes succeed and commit under a contract that promised none — a
+        // safety regression for any code relying on a read-only transaction to
+        // prevent mutation. So reject the request up front, BEFORE the closure
+        // can run, rather than pretending to honor it. (Real `query_only`
+        // enforcement is avoided deliberately: deadpool's `custom_setup` runs on
+        // CREATE only, so a leaked `PRAGMA query_only = ON` would poison a pooled
+        // connection for its lifetime.) The Postgres path enforces read-only via
+        // the transaction builder's `read_only()` and is unaffected.
+        #[cfg(feature = "sqlite")]
+        if opts.read_only {
+            return Err(crate::error::AutumnError::bad_request_msg(
+                "SQLite runtime does not support read-only transactions \
+                 (TxOptions::read_only); this build cannot enforce read-only \
+                 semantics on SQLite. Remove the read_only option or run on \
+                 Postgres.",
+            ));
+        }
 
         self.tx_depth += 1;
         let mut guard = TxDepthGuard {
@@ -1895,7 +2176,7 @@ impl Db {
             // outer test transaction, so there is nothing to retry against a
             // single test-harness connection.
             let registry: Arc<Mutex<Vec<CommitCallback>>> = Arc::new(Mutex::new(Vec::new()));
-            let conn: &mut AsyncPgConnection = &mut self.conn;
+            let conn: &mut RuntimeConnection = &mut self.conn;
             let result = AFTER_COMMIT_REGISTRY
                 .scope(registry, scoped_transaction::<T, E, _, _>(conn, f))
                 .instrument(span.clone())
@@ -1909,50 +2190,28 @@ impl Db {
             return result;
         }
 
-        let max_attempts = opts.effective_max_attempts();
-        let mut attempt: u32 = 0;
-
-        let outcome: Result<T, crate::error::AutumnError> = loop {
-            attempt += 1;
-
-            // A fresh registry per attempt: a rolled-back attempt's after-commit
-            // callbacks are discarded simply by dropping this `Arc` undrained.
+        // SQLite has no `SET TRANSACTION ISOLATION LEVEL` / read-only /
+        // deferrable transaction builder and no serialization-failure retry
+        // semantics, so run the closure once inside a single plain transaction.
+        // The requested isolation level, read-only, deferrable, and retry
+        // options are Postgres-only and are ignored here (documented).
+        // After-commit callbacks still fire on commit, exactly as on the
+        // Postgres path.
+        #[cfg(feature = "sqlite")]
+        {
             let registry: Arc<Mutex<Vec<CommitCallback>>> = Arc::new(Mutex::new(Vec::new()));
-
-            let attempt_result: Result<T, E> = {
-                // *** LOAD-BEARING ORDER: borrow `f` BEFORE `build_transaction()`.
-                // diesel-async's `TransactionBuilder::run` bounds the closure by
-                // the connection-borrow lifetime; `&mut f`'s region must start
-                // earlier than that borrow or it fails to compile. Do not reorder.
-                let f_ref = &mut f;
-
-                let mut builder = self.conn.build_transaction();
-                builder = match opts.isolation {
-                    IsolationLevel::ReadCommitted => builder.read_committed(),
-                    IsolationLevel::RepeatableRead => builder.repeatable_read(),
-                    IsolationLevel::Serializable => builder.serializable(),
-                };
-                if opts.read_only {
-                    builder = builder.read_only();
-                }
-                if opts.deferrable {
-                    builder = builder.deferrable();
-                }
-
-                AFTER_COMMIT_REGISTRY
-                    .scope(
-                        registry.clone(),
-                        builder.run::<T, E, _>(async move |conn| f_ref(conn).await),
-                    )
-                    .instrument(span.clone())
-                    .await
-            };
-
-            match attempt_result {
+            let conn: &mut RuntimeConnection = &mut self.conn;
+            let result: Result<T, E> = AFTER_COMMIT_REGISTRY
+                .scope(registry.clone(), scoped_transaction::<T, E, _, _>(conn, f))
+                .instrument(span.clone())
+                .await;
+            span.record("db.tx.attempts", 1u32);
+            guard.disarmed = true;
+            // This block is the whole remaining function body under the feature
+            // (the Postgres retry loop below is cfg'd out), so the `match` is the
+            // tail expression — no `return` needed.
+            match result {
                 Ok(value) => {
-                    // Commit path: drain THIS attempt's callbacks and spawn
-                    // them. (The `is_test_tx` case already returned above, so
-                    // spawning here is always live.)
                     let callbacks: Vec<CommitCallback> = {
                         let mut reg = registry.lock().expect("registry lock");
                         std::mem::take(&mut *reg)
@@ -1960,54 +2219,114 @@ impl Db {
                     if !callbacks.is_empty() {
                         let _ = spawn_committed_after_commit_callbacks(callbacks);
                     }
-                    break Ok(value);
+                    Ok(value)
                 }
-                Err(e) => {
-                    // Convert to AutumnError first, then classify on it.
-                    let ae = crate::error::AutumnError::from(e);
-                    let retryable = is_retryable_txn_error(&ae);
-                    match retry_decision(attempt, max_attempts, retryable) {
-                        RetryDecision::Retry => {
-                            let retries_total = record_tx_retry();
-                            let delay = retry_backoff_delay(
-                                opts.initial_backoff,
-                                opts.max_backoff,
-                                attempt,
-                            );
-                            tracing::debug!(
-                                parent: &span,
-                                attempt,
-                                max_attempts,
-                                delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
-                                autumn.tx.retries_total = retries_total,
-                                "retrying transaction after serialization/deadlock failure"
-                            );
-                            // `registry` drops here → rolled-back attempt's
-                            // after-commit callbacks are discarded; the loop
-                            // then re-runs the closure.
-                            tokio::time::sleep(delay).await;
+                Err(user_error) => Err(crate::error::AutumnError::from(user_error)),
+            }
+        }
+
+        #[cfg(not(feature = "sqlite"))]
+        {
+            let max_attempts = opts.effective_max_attempts();
+            let mut attempt: u32 = 0;
+
+            let outcome: Result<T, crate::error::AutumnError> = loop {
+                attempt += 1;
+
+                // A fresh registry per attempt: a rolled-back attempt's after-commit
+                // callbacks are discarded simply by dropping this `Arc` undrained.
+                let registry: Arc<Mutex<Vec<CommitCallback>>> = Arc::new(Mutex::new(Vec::new()));
+
+                let attempt_result: Result<T, E> = {
+                    // *** LOAD-BEARING ORDER: borrow `f` BEFORE `build_transaction()`.
+                    // diesel-async's `TransactionBuilder::run` bounds the closure by
+                    // the connection-borrow lifetime; `&mut f`'s region must start
+                    // earlier than that borrow or it fails to compile. Do not reorder.
+                    let f_ref = &mut f;
+
+                    let mut builder = self.conn.build_transaction();
+                    builder = match opts.isolation {
+                        IsolationLevel::ReadCommitted => builder.read_committed(),
+                        IsolationLevel::RepeatableRead => builder.repeatable_read(),
+                        IsolationLevel::Serializable => builder.serializable(),
+                    };
+                    if opts.read_only {
+                        builder = builder.read_only();
+                    }
+                    if opts.deferrable {
+                        builder = builder.deferrable();
+                    }
+
+                    AFTER_COMMIT_REGISTRY
+                        .scope(
+                            registry.clone(),
+                            builder.run::<T, E, _>(async move |conn| f_ref(conn).await),
+                        )
+                        .instrument(span.clone())
+                        .await
+                };
+
+                match attempt_result {
+                    Ok(value) => {
+                        // Commit path: drain THIS attempt's callbacks and spawn
+                        // them. (The `is_test_tx` case already returned above, so
+                        // spawning here is always live.)
+                        let callbacks: Vec<CommitCallback> = {
+                            let mut reg = registry.lock().expect("registry lock");
+                            std::mem::take(&mut *reg)
+                        };
+                        if !callbacks.is_empty() {
+                            let _ = spawn_committed_after_commit_callbacks(callbacks);
                         }
-                        RetryDecision::Stop => {
-                            if retryable {
-                                let exhausted_total = record_tx_retry_exhausted();
-                                tracing::warn!(
+                        break Ok(value);
+                    }
+                    Err(e) => {
+                        // Convert to AutumnError first, then classify on it.
+                        let ae = crate::error::AutumnError::from(e);
+                        let retryable = is_retryable_txn_error(&ae);
+                        match retry_decision(attempt, max_attempts, retryable) {
+                            RetryDecision::Retry => {
+                                let retries_total = record_tx_retry();
+                                let delay = retry_backoff_delay(
+                                    opts.initial_backoff,
+                                    opts.max_backoff,
+                                    attempt,
+                                );
+                                tracing::debug!(
                                     parent: &span,
                                     attempt,
                                     max_attempts,
-                                    autumn.tx.retry_exhausted_total = exhausted_total,
-                                    "transaction retry budget exhausted; returning final error"
+                                    delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
+                                    autumn.tx.retries_total = retries_total,
+                                    "retrying transaction after serialization/deadlock failure"
                                 );
+                                // `registry` drops here → rolled-back attempt's
+                                // after-commit callbacks are discarded; the loop
+                                // then re-runs the closure.
+                                tokio::time::sleep(delay).await;
                             }
-                            break Err(ae);
+                            RetryDecision::Stop => {
+                                if retryable {
+                                    let exhausted_total = record_tx_retry_exhausted();
+                                    tracing::warn!(
+                                        parent: &span,
+                                        attempt,
+                                        max_attempts,
+                                        autumn.tx.retry_exhausted_total = exhausted_total,
+                                        "transaction retry budget exhausted; returning final error"
+                                    );
+                                }
+                                break Err(ae);
+                            }
                         }
                     }
                 }
-            }
-        };
+            };
 
-        span.record("db.tx.attempts", attempt);
-        guard.disarmed = true;
-        outcome
+            span.record("db.tx.attempts", attempt);
+            guard.disarmed = true;
+            outcome
+        }
     }
 }
 
@@ -2063,7 +2382,16 @@ impl Db {
     /// `SET statement_timeout`, and the metrics captured for the
     /// slow-query warning on `Drop`.
     pub(crate) async fn checkout(params: DbCheckoutParams<'_>) -> Result<Self, AutumnError> {
+        // `SET statement_timeout` (and its i32-cap arithmetic below) is a
+        // Postgres session GUC. Under the `sqlite` feature the runtime backend
+        // is entirely SQLite (the `RuntimeConnection` alias flips wholesale —
+        // see `build_sqlite_pool`), which rejects the statement and would turn
+        // every `Db`-using route into a 503. The const, the `RunQueryDsl`
+        // import, the timeout arithmetic, and the `SET` itself are therefore all
+        // gated off on the SQLite build; the Postgres path is byte-identical.
+        #[cfg(not(feature = "sqlite"))]
         const PG_TIMEOUT_MAX_MS: u64 = i32::MAX as u64;
+        #[cfg(not(feature = "sqlite"))]
         use diesel_async::RunQueryDsl as _;
 
         // Span covers the full time the connection is held — from
@@ -2102,8 +2430,16 @@ impl Db {
 
         let mut conn = checkout_future.instrument(span.clone()).await?;
 
+        // `statement_timeout` is a Postgres session GUC; it is intentionally
+        // unused on the SQLite backend (see the gating note below), so consume
+        // it here to keep the shared `DbCheckoutParams` field from reading as
+        // dead code under `--features sqlite`.
+        #[cfg(feature = "sqlite")]
+        let _ = params.statement_timeout;
+
         // Postgres statement_timeout is a signed 32-bit integer (milliseconds).
         // Cap at i32::MAX to avoid a confusing 503 for very large configured values.
+        #[cfg(not(feature = "sqlite"))]
         let timeout_ms = params.statement_timeout.map_or(0u64, |d| {
             u64::try_from(d.as_millis())
                 .unwrap_or(PG_TIMEOUT_MAX_MS)
@@ -2148,6 +2484,9 @@ impl Db {
             }
         }
 
+        // Postgres-only per-checkout initialization; see the gating note above.
+        // SQLite builds skip it entirely (it would 503 every `Db`-using route).
+        #[cfg(not(feature = "sqlite"))]
         diesel::sql_query(format!("SET statement_timeout = {timeout_ms}"))
             .execute(&mut conn)
             .await
@@ -2372,6 +2711,24 @@ pub trait DatabasePoolProvider: Send + Sync + 'static {
             let Some(primary) = self.create_pool(config).await? else {
                 return Ok(None);
             };
+
+            // A custom provider that overrides only `create_pool` still gets its
+            // replica built by this default here, so the SQLite-replica rule must
+            // be enforced on this path too -- otherwise a provider configuring a
+            // distinct/in-memory `database.replica_url` would boot two unrelated
+            // SQLite databases and route reads to an empty/stale replica. Reuse
+            // the same helper `create_topology`/`create_shard_topology` use so the
+            // rejection rule cannot drift (addresses Codex P2). The primary URL is
+            // whatever `effective_primary_url` resolves; a provider returning a
+            // pool for a `None` primary URL has no URL to compare, so skip then.
+            #[cfg(feature = "sqlite")]
+            if let (Some(primary_url), Some(replica_url)) = (
+                config.effective_primary_url(),
+                config.replica_url.as_deref(),
+            ) {
+                reject_unusable_sqlite_replica(primary_url, replica_url)?;
+            }
+
             let replica = config
                 .replica_url
                 .as_deref()
@@ -3079,7 +3436,7 @@ mod tests {
         async fn create_pool(
             &self,
             _config: &DatabaseConfig,
-        ) -> Result<Option<Pool<AsyncPgConnection>>, PoolError> {
+        ) -> Result<Option<Pool<crate::db::RuntimeConnection>>, PoolError> {
             Ok(None)
         }
     }
@@ -3150,11 +3507,15 @@ mod tests {
         assert!(pool.is_some());
     }
 
+    // In the default (Postgres) build a SQLite target has no runtime pool, so
+    // pool construction must refuse at boot with an actionable message pointing
+    // at the `--features sqlite` build — never reaching a first-query failure or
+    // panic. Under `--features sqlite` the same target instead builds a real
+    // pool (see the `sqlite_boot_serve` integration test), so this refusal
+    // contract only applies to the default build.
+    #[cfg(not(feature = "sqlite"))]
     #[test]
     fn create_pool_with_sqlite_url_fails_fast() {
-        // SQLite is a recognized target (issue #1614) but its runtime pool is
-        // not wired yet, so pool construction must refuse at boot with an
-        // actionable message — never reaching a first-query failure or panic.
         let config = DatabaseConfig {
             url: Some("sqlite:///var/lib/app.db".into()),
             ..Default::default()
@@ -3170,11 +3531,12 @@ mod tests {
         );
         let msg = err.to_string();
         assert!(
-            msg.contains("SQLite") && msg.contains("1905"),
-            "message must be actionable and point at the runtime tracking issue, got: {msg}"
+            msg.contains("SQLite") && msg.contains("--features sqlite"),
+            "message must be actionable and name the sqlite build, got: {msg}"
         );
     }
 
+    #[cfg(not(feature = "sqlite"))]
     #[test]
     fn create_topology_with_sqlite_url_fails_fast() {
         let config = DatabaseConfig {
@@ -3185,6 +3547,368 @@ mod tests {
             panic!("sqlite target must refuse at topology build");
         };
         assert!(matches!(err, PoolError::UnsupportedBackend(_)), "{err:?}");
+    }
+
+    // Under `--features sqlite` the same targets that refuse above instead build
+    // a real pool/topology over `SyncConnectionWrapper<SqliteConnection>`.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn create_pool_with_sqlite_url_builds_under_feature() {
+        let config = DatabaseConfig {
+            primary_url: Some("sqlite::memory:".into()),
+            ..Default::default()
+        };
+        let pool = create_pool(&config).expect("sqlite pool builds under the feature");
+        assert!(pool.is_some(), "a configured sqlite url yields a pool");
+    }
+
+    // A Postgres URL in a sqlite build is a misconfiguration and must refuse.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn create_pool_with_postgres_url_refuses_under_sqlite_feature() {
+        let config = DatabaseConfig {
+            url: Some("postgres://localhost/test".into()),
+            ..Default::default()
+        };
+        let Err(err) = create_pool(&config) else {
+            panic!("a Postgres url must refuse under the sqlite feature");
+        };
+        assert!(matches!(err, PoolError::UnsupportedBackend(_)), "{err:?}");
+    }
+
+    // A SQLite runtime has no primary/replica replication in this pool
+    // architecture, so a separate replica pool would serve reads from an empty
+    // database. `create_topology` must reject an in-memory or distinct-file
+    // replica with an actionable boot error (addresses Codex P2).
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn create_topology_rejects_in_memory_sqlite_replica() {
+        let config = DatabaseConfig {
+            primary_url: Some("sqlite:///var/lib/app.db".into()),
+            replica_url: Some("sqlite::memory:".into()),
+            ..Default::default()
+        };
+        let Err(err) = create_topology(&config) else {
+            panic!("an in-memory sqlite replica must be rejected");
+        };
+        assert!(matches!(err, PoolError::UnsupportedBackend(_)), "{err:?}");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("separate read replica") && msg.contains("primary"),
+            "message must be actionable: {msg}"
+        );
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn create_topology_rejects_distinct_file_sqlite_replica() {
+        let config = DatabaseConfig {
+            primary_url: Some("sqlite:///var/lib/primary.db".into()),
+            replica_url: Some("sqlite:///var/lib/replica.db".into()),
+            ..Default::default()
+        };
+        let Err(err) = create_topology(&config) else {
+            panic!("a distinct-file sqlite replica must be rejected");
+        };
+        assert!(matches!(err, PoolError::UnsupportedBackend(_)), "{err:?}");
+    }
+
+    // A replica that normalizes to the SAME file as the primary is the same
+    // database — harmless — so it is allowed and the topology builds.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn create_topology_allows_same_file_sqlite_replica() {
+        let config = DatabaseConfig {
+            primary_url: Some("sqlite:///var/lib/app.db".into()),
+            replica_url: Some("sqlite:///var/lib/app.db".into()),
+            ..Default::default()
+        };
+        let topology = create_topology(&config)
+            .expect("same-file sqlite replica must be allowed")
+            .expect("a configured primary yields a topology");
+        assert!(
+            topology.replica().is_some(),
+            "same-file replica pool should be built"
+        );
+    }
+
+    // The no-replica happy path still builds a topology fine under the feature.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn create_topology_sqlite_primary_only_builds() {
+        let config = DatabaseConfig {
+            primary_url: Some("sqlite::memory:".into()),
+            ..Default::default()
+        };
+        let topology = create_topology(&config)
+            .expect("sqlite primary-only topology builds")
+            .expect("a configured primary yields a topology");
+        assert!(topology.replica().is_none(), "no replica configured");
+    }
+
+    // A custom provider that overrides ONLY `create_pool` still has its replica
+    // built by the trait DEFAULT `create_topology`. That default path must apply
+    // the same SQLite-replica rule as the free `create_topology` /
+    // `create_shard_topology`, or a provider could boot a distinct/in-memory
+    // replica and route reads to an unrelated, empty database (addresses Codex
+    // P2). This minimal provider delegates `create_pool` to the default factory
+    // and leaves `create_topology` as the trait default — exactly the path under
+    // test.
+    #[cfg(feature = "sqlite")]
+    struct PrimaryOnlyProvider;
+
+    #[cfg(feature = "sqlite")]
+    impl DatabasePoolProvider for PrimaryOnlyProvider {
+        async fn create_pool(
+            &self,
+            config: &DatabaseConfig,
+        ) -> Result<Option<Pool<RuntimeConnection>>, PoolError> {
+            create_pool(config)
+        }
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn default_provider_topology_rejects_distinct_file_sqlite_replica() {
+        let config = DatabaseConfig {
+            primary_url: Some("sqlite:///var/lib/primary.db".into()),
+            replica_url: Some("sqlite:///var/lib/replica.db".into()),
+            ..Default::default()
+        };
+        let Err(err) = PrimaryOnlyProvider.create_topology(&config).await else {
+            panic!("the default-topology path must reject a distinct-file sqlite replica");
+        };
+        assert!(matches!(err, PoolError::UnsupportedBackend(_)), "{err:?}");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("separate read replica") && msg.contains("primary"),
+            "message must be actionable: {msg}"
+        );
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn default_provider_topology_rejects_in_memory_sqlite_replica() {
+        let config = DatabaseConfig {
+            primary_url: Some("sqlite:///var/lib/app.db".into()),
+            replica_url: Some("sqlite::memory:".into()),
+            ..Default::default()
+        };
+        let Err(err) = PrimaryOnlyProvider.create_topology(&config).await else {
+            panic!("an in-memory sqlite replica must be rejected by the default topology");
+        };
+        assert!(matches!(err, PoolError::UnsupportedBackend(_)), "{err:?}");
+    }
+
+    // A same-file replica is the same database (harmless) and still builds
+    // through the default topology; a primary-only config builds with no replica.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn default_provider_topology_allows_same_file_and_primary_only() {
+        let same_file = DatabaseConfig {
+            primary_url: Some("sqlite:///var/lib/app.db".into()),
+            replica_url: Some("sqlite:///var/lib/app.db".into()),
+            ..Default::default()
+        };
+        let topology = PrimaryOnlyProvider
+            .create_topology(&same_file)
+            .await
+            .expect("same-file replica must be allowed by the default topology")
+            .expect("a configured primary yields a topology");
+        assert!(
+            topology.replica().is_some(),
+            "same-file replica pool should be built"
+        );
+
+        let primary_only = DatabaseConfig {
+            primary_url: Some("sqlite::memory:".into()),
+            ..Default::default()
+        };
+        let topology = PrimaryOnlyProvider
+            .create_topology(&primary_only)
+            .await
+            .expect("primary-only default topology builds")
+            .expect("a configured primary yields a topology");
+        assert!(topology.replica().is_none(), "no replica configured");
+    }
+
+    // The per-shard replica is subject to the SAME SQLite-replica rule as the
+    // control database (addresses Codex P2): an in-memory or distinct-file shard
+    // replica would route reads to an unrelated, empty database, so it must be
+    // rejected; a shard with only a primary (or a same-file replica) must build.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn create_shard_topology_rejects_in_memory_sqlite_replica() {
+        let defaults = DatabaseConfig::default();
+        let shard = crate::config::ShardConfig {
+            name: "shard0".into(),
+            primary_url: "sqlite:///var/lib/shard0.db".into(),
+            replica_url: Some("sqlite::memory:".into()),
+            ..Default::default()
+        };
+        let Err(err) = create_shard_topology(&shard, &defaults) else {
+            panic!("an in-memory sqlite shard replica must be rejected");
+        };
+        assert!(matches!(err, PoolError::UnsupportedBackend(_)), "{err:?}");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("separate read replica") && msg.contains("primary"),
+            "message must be actionable: {msg}"
+        );
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn create_shard_topology_rejects_distinct_file_sqlite_replica() {
+        let defaults = DatabaseConfig::default();
+        let shard = crate::config::ShardConfig {
+            name: "shard0".into(),
+            primary_url: "sqlite:///var/lib/shard0-primary.db".into(),
+            replica_url: Some("sqlite:///var/lib/shard0-replica.db".into()),
+            ..Default::default()
+        };
+        let Err(err) = create_shard_topology(&shard, &defaults) else {
+            panic!("a distinct-file sqlite shard replica must be rejected");
+        };
+        assert!(matches!(err, PoolError::UnsupportedBackend(_)), "{err:?}");
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn create_shard_topology_allows_same_file_sqlite_replica() {
+        let defaults = DatabaseConfig::default();
+        let shard = crate::config::ShardConfig {
+            name: "shard0".into(),
+            primary_url: "sqlite:///var/lib/shard0.db".into(),
+            replica_url: Some("sqlite:///var/lib/shard0.db".into()),
+            ..Default::default()
+        };
+        let topology = create_shard_topology(&shard, &defaults)
+            .expect("same-file sqlite shard replica must be allowed");
+        assert!(
+            topology.replica().is_some(),
+            "same-file shard replica pool should be built"
+        );
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn create_shard_topology_sqlite_primary_only_builds() {
+        let defaults = DatabaseConfig::default();
+        let shard = crate::config::ShardConfig {
+            name: "shard0".into(),
+            primary_url: "sqlite::memory:".into(),
+            ..Default::default()
+        };
+        let topology = create_shard_topology(&shard, &defaults)
+            .expect("sqlite primary-only shard topology builds");
+        assert!(topology.replica().is_none(), "no shard replica configured");
+    }
+
+    // `file::memory:` (and its query-string form) is a private in-memory target
+    // and must be forced single-slot; a shared-cache in-memory DB is shareable
+    // and must NOT be (addresses Codex P1).
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn sqlite_target_is_memory_covers_file_memory() {
+        assert!(sqlite_target_is_memory(":memory:"));
+        assert!(sqlite_target_is_memory("file::memory:"));
+        assert!(sqlite_target_is_memory("file::memory:?foo=bar"));
+        assert!(sqlite_target_is_memory("file:app?mode=memory"));
+        // Shared-cache in-memory databases are shareable across connections.
+        assert!(!sqlite_target_is_memory("file::memory:?cache=shared"));
+        assert!(!sqlite_target_is_memory(
+            "file:app?mode=memory&cache=shared"
+        ));
+        // Plain file targets are not in-memory.
+        assert!(!sqlite_target_is_memory("/var/lib/app.db"));
+    }
+
+    // A read-only URI target (`mode=ro` / `immutable`) must be detected so the
+    // per-connection setup batch skips the write-affecting `journal_mode = WAL`
+    // pragma, which otherwise fails with "attempt to write a readonly database"
+    // and 503s the whole pool (Codex P2).
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn sqlite_target_is_read_only_detects_ro_and_immutable() {
+        assert!(sqlite_target_is_read_only("file:/srv/ref.db?mode=ro"));
+        // Case-insensitive key/value.
+        assert!(sqlite_target_is_read_only("file:/srv/ref.db?MODE=RO"));
+        assert!(sqlite_target_is_read_only("file:/srv/ref.db?immutable=1"));
+        assert!(sqlite_target_is_read_only(
+            "file:/srv/ref.db?immutable=true"
+        ));
+        assert!(sqlite_target_is_read_only(
+            "file:/srv/ref.db?immutable=TRUE"
+        ));
+        // Read-only marker alongside other params.
+        assert!(sqlite_target_is_read_only(
+            "file:/srv/ref.db?cache=shared&mode=ro"
+        ));
+
+        // A plain file, an in-memory target, and a writable/shared-cache target
+        // are NOT read-only.
+        assert!(!sqlite_target_is_read_only("/var/lib/app.db"));
+        assert!(!sqlite_target_is_read_only(":memory:"));
+        assert!(!sqlite_target_is_read_only("file::memory:?cache=shared"));
+        assert!(!sqlite_target_is_read_only("file:app?mode=memory"));
+        assert!(!sqlite_target_is_read_only("file:/srv/ref.db?mode=rwc"));
+        assert!(!sqlite_target_is_read_only("file:/srv/ref.db?immutable=0"));
+        // A value that merely CONTAINS `ro` must not trip the substring trap.
+        assert!(!sqlite_target_is_read_only("file:/srv/ro-data.db"));
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn file_memory_sqlite_pool_is_single_slot() {
+        let config = DatabaseConfig {
+            primary_url: Some("file::memory:".into()),
+            pool_size: 5,
+            ..Default::default()
+        };
+        let pool = create_pool(&config)
+            .expect("file::memory: sqlite pool builds")
+            .expect("a configured url yields a pool");
+        assert_eq!(
+            pool.status().max_size,
+            1,
+            "a private in-memory target must be forced single-slot"
+        );
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn shared_cache_in_memory_sqlite_pool_is_not_forced_single_slot() {
+        let config = DatabaseConfig {
+            primary_url: Some("file::memory:?cache=shared".into()),
+            pool_size: 5,
+            ..Default::default()
+        };
+        let pool = create_pool(&config)
+            .expect("shared-cache in-memory sqlite pool builds")
+            .expect("a configured url yields a pool");
+        assert_eq!(
+            pool.status().max_size,
+            5,
+            "a shared-cache in-memory target must respect the configured size"
+        );
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn normalize_sqlite_target_strips_schemes() {
+        assert_eq!(normalize_sqlite_target("sqlite::memory:"), ":memory:");
+        assert_eq!(normalize_sqlite_target("sqlite://:memory:"), ":memory:");
+        assert_eq!(normalize_sqlite_target("sqlite://"), ":memory:");
+        assert_eq!(
+            normalize_sqlite_target("sqlite:///var/lib/app.db"),
+            "/var/lib/app.db"
+        );
+        assert_eq!(normalize_sqlite_target("sqlite:app.db"), "app.db");
+        assert_eq!(
+            normalize_sqlite_target("file:/var/lib/app.db"),
+            "file:/var/lib/app.db"
+        );
     }
 
     #[test]
@@ -3278,18 +4002,18 @@ mod tests {
     struct TestDbState;
 
     impl DbState for TestDbState {
-        fn pool(&self) -> Option<&Pool<AsyncPgConnection>> {
+        fn pool(&self) -> Option<&Pool<crate::db::RuntimeConnection>> {
             None
         }
     }
 
     #[derive(Clone)]
     struct TestReadState {
-        primary: Pool<AsyncPgConnection>,
+        primary: Pool<crate::db::RuntimeConnection>,
     }
 
     impl DbState for TestReadState {
-        fn pool(&self) -> Option<&Pool<AsyncPgConnection>> {
+        fn pool(&self) -> Option<&Pool<crate::db::RuntimeConnection>> {
             Some(&self.primary)
         }
     }
@@ -3954,6 +4678,9 @@ mod tls {
     }
 
     /// Build the pool's custom connection-setup callback for a TLS posture.
+    // Only the default (Postgres) `build_pool` arm installs this custom TLS
+    // setup; unused in a `--features sqlite` build (SQLite has no TLS transport).
+    #[cfg_attr(feature = "sqlite", allow(dead_code))]
     pub(super) fn setup_callback(posture: TlsPosture) -> SetupCallback<AsyncPgConnection> {
         Box::new(move |url: &str| {
             let posture = posture.clone();

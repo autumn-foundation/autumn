@@ -1160,6 +1160,12 @@ pub fn create_shard_set(
 ///
 /// Returns [`ShardSetBuildError`] when no shards are configured, any pool
 /// cannot be built, or the slot map is invalid.
+///
+/// Postgres-only: each shard pool is established with a `begin_test_transaction`
+/// rollback hook (Postgres transactional test isolation), so this helper is not
+/// compiled under the `sqlite` feature — its sole caller, the Postgres
+/// transactional `TestApp` harness (`crate::test`), is likewise Postgres-only.
+#[cfg(not(feature = "sqlite"))]
 pub fn create_shard_set_transactional(
     config: &DatabaseConfig,
     router: Arc<dyn ShardRouter>,
@@ -1952,7 +1958,7 @@ impl ShardedDb {
         E: From<diesel::result::Error> + Send + Sync + 'a,
         AutumnError: From<E>,
         F: for<'r> FnMut(
-                &'r mut diesel_async::AsyncPgConnection,
+                &'r mut crate::db::RuntimeConnection,
             ) -> scoped_futures::ScopedBoxFuture<'a, 'r, Result<T, E>>
             + Send
             + 'a,

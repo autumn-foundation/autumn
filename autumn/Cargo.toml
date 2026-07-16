@@ -76,6 +76,12 @@ offline-sync = ["db", "http-client"]
 # breaks the Postgres default build. Feature-on testing is done via explicit
 # `cargo build -p autumn-web --features sqlite` invocations only.
 #
+# Do NOT enable via `--all-features` — this is a backend-flip feature, so
+# `--all-features` turns it on ALONGSIDE the Postgres-assuming features and
+# fails autumn-web's lib to compile. CI/scripts that want the Postgres backend
+# must use an explicit `--features` list that EXCLUDES `sqlite` (see
+# `.github/workflows/ci.yml`).
+#
 # PR1 is a no-op refactor: enabling it switches the connection *type alias* but
 # the SQLite pool CONSTRUCTION stays refused at runtime
 # (`PoolError::UnsupportedBackend`); a working pool is PR2. Needs no extra deps
@@ -351,6 +357,102 @@ harness = false
 [[test]]
 name = "integration_tests"
 path = "tests/integration_tests.rs"
+
+# SQLite runtime-lane boot+serve proof (issue #1614, PR2). Only meaningful under
+# `--features sqlite`; the file is `#![cfg(feature = "sqlite")]` so a default
+# `cargo test` compiles it to an empty (passing) binary. Run explicitly:
+# `cargo test -p autumn-web --features sqlite --test sqlite_boot_serve`.
+[[test]]
+name = "sqlite_boot_serve"
+path = "tests/sqlite_boot_serve.rs"
+
+# SQLite pooled-connection foreign-key enforcement proof (issue #1614, Codex P1).
+# Only meaningful under `--features sqlite`; the file is
+# `#![cfg(feature = "sqlite")]` so a default `cargo test` compiles it to an empty
+# (passing) binary. Run explicitly:
+# `cargo test -p autumn-web --features sqlite --test sqlite_foreign_keys`.
+[[test]]
+name = "sqlite_foreign_keys"
+path = "tests/sqlite_foreign_keys.rs"
+
+# SQLite `Db`-extractor proof (issue #1614, Codex P1). Drives the real framework
+# `Db` extractor over HTTP against a `sqlite:` target and asserts 200 (not the
+# 503 a Postgres-only `SET statement_timeout` in `Db::checkout` would produce).
+# Only meaningful under `--features sqlite`; the file is
+# `#![cfg(feature = "sqlite")]` so a default `cargo test` compiles it to an empty
+# (passing) binary. Run explicitly:
+# `cargo test -p autumn-web --features sqlite --test sqlite_db_extractor`.
+[[test]]
+name = "sqlite_db_extractor"
+path = "tests/sqlite_db_extractor.rs"
+
+# SQLite pooled-connection PRAGMA proof (issue #1614, Codex P1). Asserts every
+# pool-issued connection carries the configured `busy_timeout` and the deliberate
+# WAL `journal_mode` (mirroring `crate::sync::store`), so overlapping writes wait
+# on the lock instead of failing fast with `SQLITE_BUSY`. Only meaningful under
+# `--features sqlite`; the file is `#![cfg(feature = "sqlite")]` so a default
+# `cargo test` compiles it to an empty (passing) binary. Run explicitly:
+# `cargo test -p autumn-web --features sqlite --test sqlite_pool_pragmas`.
+[[test]]
+name = "sqlite_pool_pragmas"
+path = "tests/sqlite_pool_pragmas.rs"
+
+# SQLite read-only-target pool proof (issue #1614, Codex P2). The per-connection
+# setup batch runs `PRAGMA journal_mode = WAL`, which WRITES — so against a
+# read-only URI target (`mode=ro`/`immutable`) it fails with "attempt to write a
+# readonly database", propagates out of `custom_setup`, and the pool can serve
+# no query (`Db` routes 503). `build_sqlite_pool` now skips the write-affecting
+# pragmas for read-only targets while keeping `foreign_keys` + `busy_timeout`.
+# Asserts the read-only pool builds, serves a committed read, keeps foreign_keys,
+# and rejects writes. Only meaningful under `--features sqlite`; the file is
+# `#![cfg(feature = "sqlite")]` so a default `cargo test` compiles it to an empty
+# (passing) binary. Run explicitly:
+# `cargo test -p autumn-web --features sqlite --test sqlite_read_only_pool`.
+[[test]]
+name = "sqlite_read_only_pool"
+path = "tests/sqlite_read_only_pool.rs"
+
+# SQLite scope-threading compile proof (issue #1614, Codex P1). Pins that
+# `Scope::list` / `ScopeQuery::load` accept `&mut RuntimeConnection` (the SQLite
+# wrapper under this feature) — the connection the repository macro passes into a
+# scoped list route — rather than a hard-coded `&mut AsyncPgConnection`. Fails to
+# compile before the threading; no-op for Postgres. (Deliberately scope-surface
+# only: a full `#[repository]`'s Pg-specific CRUD codegen is a separate SQLite
+# concern.) Only meaningful under `--features sqlite`; the file is
+# `#![cfg(feature = "sqlite")]` so a default `cargo test` compiles it to an empty
+# (passing) binary. Run explicitly:
+# `cargo test -p autumn-web --features sqlite --test sqlite_scoped_repository`.
+[[test]]
+name = "sqlite_scoped_repository"
+path = "tests/sqlite_scoped_repository.rs"
+
+# SQLite read-only-transaction safety proof (issue #1614, Codex P2). The SQLite
+# arm of `Db::tx_with` cannot enforce `READ ONLY`, so a `TxOptions::read_only()`
+# request is rejected before the closure runs rather than silently running a
+# writable transaction (which would let writes commit under a read-only
+# contract). Asserts the rejection commits nothing and that a normal read-write
+# transaction still commits. Needs `test-support` too (the public
+# `Db::connect_for_test` harness helper); the file is
+# `#![cfg(all(feature = "sqlite", feature = "test-support"))]` so a default
+# `cargo test` (and a bare `--features sqlite` run) compiles it to an empty
+# (passing) binary. Run explicitly:
+# `cargo test -p autumn-web --features "sqlite,test-support" --test sqlite_read_only_tx`.
+[[test]]
+name = "sqlite_read_only_tx"
+path = "tests/sqlite_read_only_tx.rs"
+
+# Explicit-URL pool proof for the SQLite test harness (issue #1614, Codex P2):
+# `TestApp::with_transactional_db("sqlite:...")` must build a real (plain, non-
+# transactional) SQLite pool from the recorded URL instead of dropping it and
+# leaving a `Db`-backed route to 503. Needs `test-support` for the public
+# `TestApp` harness; the file is
+# `#![cfg(all(feature = "sqlite", feature = "test-support"))]` so a default
+# `cargo test` (and a bare `--features sqlite` run) compiles it to an empty
+# (passing) binary. Run explicitly:
+# `cargo test -p autumn-web --features "sqlite,test-support" --test sqlite_transactional_url_pool`.
+[[test]]
+name = "sqlite_transactional_url_pool"
+path = "tests/sqlite_transactional_url_pool.rs"
 
 # Isolated: sets process-wide proxy env vars (HTTP_PROXY/HTTPS_PROXY/ALL_PROXY)
 # to verify pinned SSRF-safe clients bypass env proxies. Cannot share the
