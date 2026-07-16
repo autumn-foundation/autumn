@@ -293,6 +293,105 @@ fn colliding_derive_names_resolve_to_distinct_schemas() {
     );
 }
 
+// A `$ref` emitted *inside* a derived schema body must resolve through the same
+// collision index in the MCP `$defs` projection (issue #1972 P1 follow-up): a
+// wrapper tool whose field is a `create::Args` must inline the CREATE Args under
+// its own `$defs` key, distinct from a sibling tool's `update::Args`.
+mod wrap_create_mcp {
+    use super::{Deserialize, OpenApiSchema, Serialize};
+    #[derive(Serialize, Deserialize, OpenApiSchema)]
+    pub struct Args {
+        pub create_only_field: String,
+    }
+}
+
+mod wrap_update_mcp {
+    use super::{Deserialize, OpenApiSchema, Serialize};
+    #[derive(Serialize, Deserialize, OpenApiSchema)]
+    pub struct Args {
+        pub update_only_field: i64,
+    }
+}
+
+#[derive(Serialize, Deserialize, OpenApiSchema)]
+struct WrapEnvelope {
+    payload: wrap_create_mcp::Args,
+    note: String,
+}
+
+#[post("/api/mcp-wrap-envelope")]
+#[api_doc(mcp, summary = "Envelope whose field is a nested create Args")]
+async fn wrap_envelope_tool(Json(_e): Json<WrapEnvelope>) -> AutumnResult<Json<serde_json::Value>> {
+    Ok(Json(serde_json::json!({})))
+}
+
+#[post("/api/mcp-wrap-update")]
+#[api_doc(mcp, summary = "Body arg named Args (update module)")]
+async fn wrap_update_tool(
+    Json(_b): Json<wrap_update_mcp::Args>,
+) -> AutumnResult<Json<serde_json::Value>> {
+    Ok(Json(serde_json::json!({})))
+}
+
+#[test]
+fn nested_derived_ref_resolves_in_mcp_defs() {
+    let docs = vec![
+        __autumn_route_info_wrap_envelope_tool().api_doc,
+        __autumn_route_info_wrap_update_tool().api_doc,
+    ];
+    let tools = derive_tools(&docs, false, None);
+    let envelope_tool = tools
+        .iter()
+        .find(|t| t.name() == "wrap_envelope_tool")
+        .unwrap();
+    let update_tool = tools
+        .iter()
+        .find(|t| t.name() == "wrap_update_tool")
+        .unwrap();
+
+    // Resolve the envelope body → its nested `payload` ref, both through `$defs`.
+    let schema = envelope_tool.input_schema();
+    let envelope_schema = resolve_ref(schema, &schema["properties"]["body"]);
+    let payload_ref = &envelope_schema["properties"]["payload"];
+    let payload_schema = resolve_ref(schema, payload_ref);
+    assert!(
+        payload_schema["properties"]
+            .get("create_only_field")
+            .is_some(),
+        "nested MCP ref must resolve to CREATE Args (not a placeholder, not update): {payload_schema}"
+    );
+    assert!(
+        payload_schema["properties"]
+            .get("update_only_field")
+            .is_none(),
+        "nested MCP ref must NOT resolve to UPDATE Args: {payload_schema}"
+    );
+
+    // The nested payload inlines under a DISTINCT `$defs` key from the sibling
+    // update tool's body — neither shadows the other.
+    let payload_key = payload_ref["$ref"]
+        .as_str()
+        .expect("payload is a $ref")
+        .trim_start_matches("#/$defs/");
+    let update_body = &update_tool.input_schema()["properties"]["body"];
+    let update_key = update_body["$ref"]
+        .as_str()
+        .expect("update body is a $ref")
+        .trim_start_matches("#/$defs/");
+    assert_ne!(
+        payload_key, update_key,
+        "create and update Args must inline under distinct $defs keys: {payload_key} == {update_key}"
+    );
+    // And the update tool's body resolves to its OWN field.
+    let update_schema = resolve_ref(update_tool.input_schema(), update_body);
+    assert!(
+        update_schema["properties"]
+            .get("update_only_field")
+            .is_some(),
+        "update tool body must expose its own field: {update_schema}"
+    );
+}
+
 /// If `value` is a `{ "$ref": "#/$defs/X" }` pointer, resolve it against the
 /// schema's `$defs`; otherwise return the value unchanged.
 fn resolve_ref(root: &serde_json::Value, value: &serde_json::Value) -> serde_json::Value {

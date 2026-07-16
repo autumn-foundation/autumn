@@ -719,6 +719,15 @@ impl SchemaComponentIndex {
             .unwrap_or_else(|| component_key(entry.name))
     }
 
+    /// Resolve a raw schema *identity* string (`type_name`) to its display key,
+    /// or `None` when the identity is not part of this index. Used by the
+    /// finalize body-ref rewrite to map a nested derived-schema `$ref` (emitted
+    /// as the field type's full `type_name`) to its collision-resolved component
+    /// key (issue #1972).
+    fn display_key_for_identity(&self, identity: &str) -> Option<&str> {
+        self.by_identity.get(identity).map(String::as_str)
+    }
+
     /// Iterate `(identity, display_key)` pairs — used by the back-fill to
     /// register a component under its display key keyed by identity.
     fn iter(&self) -> impl Iterator<Item = (&String, &String)> {
@@ -742,32 +751,60 @@ fn qualified_suffix_key(identity: &str, depth: usize) -> String {
 #[cfg(feature = "openapi")]
 #[must_use]
 pub fn build_schema_component_index(routes: &[&ApiDoc]) -> SchemaComponentIndex {
-    // Collect (identity, base-display) for every referenced Ref entry.
-    let mut refs: Vec<(&'static str, String)> = Vec::new();
-    let mut collect = |entry: &SchemaEntry| {
-        for e in flatten_ref_entries(entry) {
-            refs.push((e.identity_key(), component_key(e.name)));
-        }
-    };
+    // Collect (identity, base-display) for every referenced Ref entry, deduped
+    // by identity. `seen` gives the identity-graph closure below an O(1) "already
+    // queued?" check.
+    let mut refs: Vec<(String, String)> = Vec::new();
+    let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for api_doc in routes {
         if api_doc.hidden {
             continue;
         }
-        if let Some(e) = &api_doc.request_body {
-            collect(e);
+        for entry in [
+            api_doc.request_body.as_ref(),
+            api_doc.response.as_ref(),
+            api_doc.query_schema.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            for e in flatten_ref_entries(entry) {
+                let identity = e.identity_key().to_owned();
+                if seen.insert(identity.clone()) {
+                    refs.push((identity, component_key(e.name)));
+                }
+            }
         }
-        if let Some(e) = &api_doc.response {
-            collect(e);
-        }
-        if let Some(e) = &api_doc.query_schema {
-            collect(e);
+    }
+
+    // Close the identity graph: a `$ref` emitted *inside* a derived schema body
+    // (a nested named-struct field) can reference an identity that no route
+    // mentions directly. Fetch each derived body and recursively collect the
+    // identities it refers to, to a fixpoint, so nested-only types participate
+    // in collision detection and each earns its own component (issue #1972).
+    let mut queue: Vec<String> = refs.iter().map(|(id, _)| id.clone()).collect();
+    while let Some(identity) = queue.pop() {
+        let Some(body) = registered_derived_schema(&identity) else {
+            continue;
+        };
+        let mut nested: Vec<String> = Vec::new();
+        collect_body_ref_identities(&body, &mut nested);
+        for n in nested {
+            if seen.insert(n.clone()) {
+                let base = base_display_for_identity(&n);
+                refs.push((n.clone(), base));
+                queue.push(n);
+            }
         }
     }
 
     // Which base display keys are shared by more than one distinct identity?
-    let mut by_base: BTreeMap<String, std::collections::BTreeSet<&'static str>> = BTreeMap::new();
+    let mut by_base: BTreeMap<String, std::collections::BTreeSet<&str>> = BTreeMap::new();
     for (identity, base) in &refs {
-        by_base.entry(base.clone()).or_default().insert(identity);
+        by_base
+            .entry(base.clone())
+            .or_default()
+            .insert(identity.as_str());
     }
 
     let mut by_identity: BTreeMap<String, String> = BTreeMap::new();
@@ -779,19 +816,17 @@ pub fn build_schema_component_index(routes: &[&ApiDoc]) -> SchemaComponentIndex 
     for (identity, base) in &refs {
         let collides = by_base[base].len() > 1 && identity.contains("::");
         if !collides {
-            by_identity
-                .entry((*identity).to_owned())
-                .or_insert_with(|| {
-                    used.insert(base.clone());
-                    base.clone()
-                });
+            by_identity.entry(identity.clone()).or_insert_with(|| {
+                used.insert(base.clone());
+                base.clone()
+            });
         }
     }
 
     // Second pass: qualify each genuinely-colliding real type path with the
     // fewest trailing module segments that make its key unique.
     for (identity, _base) in &refs {
-        if by_identity.contains_key(*identity) {
+        if by_identity.contains_key(identity) {
             continue;
         }
         let depth_max = identity.split("::").count();
@@ -805,10 +840,96 @@ pub fn build_schema_component_index(routes: &[&ApiDoc]) -> SchemaComponentIndex 
         }
         let display = display.unwrap_or_else(|| component_key(identity));
         used.insert(display.clone());
-        by_identity.insert((*identity).to_owned(), display);
+        by_identity.insert(identity.clone(), display);
     }
 
     SchemaComponentIndex { by_identity }
+}
+
+/// The base (short) display key for a raw schema *identity* string: its last
+/// `::`-segment (ignoring any generic argument list), sanitized into a component
+/// key. Mirrors what the macros derive from `last_segment_name` for a top-level
+/// route ref, so a nested-only identity groups under the same base as a route
+/// ref of the same short name (issue #1972).
+#[cfg(feature = "openapi")]
+fn base_display_for_identity(identity: &str) -> String {
+    let without_generics = identity.split('<').next().unwrap_or(identity);
+    let last = without_generics
+        .rsplit("::")
+        .next()
+        .unwrap_or(without_generics);
+    component_key(last)
+}
+
+/// Recursively collect every `#/components/schemas/<identity>` ref target found
+/// inside a (derived) schema body, pushing each raw identity string into `out`.
+///
+/// The macro emits a nested named-struct field's `$ref` as the field type's full
+/// `type_name` identity, so the strings gathered here are exactly the identity
+/// keys the collision index resolves.
+#[cfg(feature = "openapi")]
+fn collect_body_ref_identities(value: &serde_json::Value, out: &mut Vec<String>) {
+    match value {
+        serde_json::Value::Object(map) => {
+            if let Some(serde_json::Value::String(reference)) = map.get("$ref")
+                && let Some(id) = reference.strip_prefix("#/components/schemas/")
+            {
+                out.push(id.to_owned());
+            }
+            for v in map.values() {
+                collect_body_ref_identities(v, out);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for v in items {
+                collect_body_ref_identities(v, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Rewrite every body-internal `#/components/schemas/<identity>` ref in each
+/// registered component to its collision-resolved display key.
+///
+/// A ref whose target is not a known identity (e.g. the pagination envelope's
+/// short `#/components/schemas/<Model>` ref, which is already a display key) is
+/// left untouched, so the common non-colliding case produces exactly the short
+/// key it did before (no churn — issue #1972).
+#[cfg(feature = "openapi")]
+fn rewrite_component_body_refs(
+    components: &mut BTreeMap<String, serde_json::Value>,
+    index: &SchemaComponentIndex,
+) {
+    for schema in components.values_mut() {
+        rewrite_identity_refs(schema, index);
+    }
+}
+
+#[cfg(feature = "openapi")]
+fn rewrite_identity_refs(value: &mut serde_json::Value, index: &SchemaComponentIndex) {
+    match value {
+        serde_json::Value::Object(map) => {
+            if let Some(serde_json::Value::String(reference)) = map.get_mut("$ref") {
+                let replacement = reference
+                    .strip_prefix("#/components/schemas/")
+                    .and_then(|identity| index.display_key_for_identity(identity))
+                    .map(|display| format!("#/components/schemas/{display}"));
+                if let Some(new_ref) = replacement {
+                    *reference = new_ref;
+                }
+            }
+            for v in map.values_mut() {
+                rewrite_identity_refs(v, index);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for v in items {
+                rewrite_identity_refs(v, index);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Flatten an entry, yielding each leaf `Ref` entry reached through
@@ -926,7 +1047,14 @@ pub fn generate_spec_at(
         );
     }
 
-    let components_map = registry.into_map();
+    let mut components_map = registry.into_map();
+    // Rewrite every `$ref` that appears *inside* a component body from its raw
+    // schema identity (`type_name`) to its collision-resolved display key, so a
+    // nested derived-schema ref resolves to the same component the top-level
+    // route refs use (issue #1972). Top-level operation refs are already emitted
+    // as display keys by `operation_for`/`schema_value_for`; this closes the
+    // body-internal half of the `$ref` graph.
+    rewrite_component_body_refs(&mut components_map, &index);
     let components = if !components_map.is_empty() || !security_schemes.is_empty() {
         Some(Components {
             schemas: components_map,

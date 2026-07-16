@@ -2549,8 +2549,18 @@ fn emit_json_schema_tokens(ty: &syn::Type) -> TokenStream {
     let name = type_name_str(ty);
     crate::api_doc::primitive_json_type(&name).map_or_else(
         || {
-            let ref_path = format!("#/components/schemas/{name}");
-            quote! { ::autumn_web::reexports::serde_json::json!({ "$ref": #ref_path }) }
+            // Emit the `$ref` against the field type's FULL `type_name` identity
+            // (built at runtime), NOT its short last segment, so the finalize
+            // collision index can match this nested ref to the exact producing
+            // type and rewrite it to the same display key the top-level route
+            // refs use — even when two types share a last segment (issue #1972).
+            quote! {{
+                let __ref_path = ::std::format!(
+                    "#/components/schemas/{}",
+                    ::core::any::type_name::<#ty>()
+                );
+                ::autumn_web::reexports::serde_json::json!({ "$ref": __ref_path })
+            }}
         },
         |json_type| {
             quote! { ::autumn_web::reexports::serde_json::json!({ "type": #json_type }) }

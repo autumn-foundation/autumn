@@ -800,3 +800,179 @@ fn openapi_spec_disambiguates_same_named_component_schemas() {
         "no shadow: {update_schema}"
     );
 }
+
+// ── Nested derived-schema refs resolve through the collision index (issue #1972,
+//    Part 2 / P1 follow-up) ──
+//
+// A `$ref` emitted *inside* a derived schema body (a nested named-struct field)
+// must carry the field type's `type_name` identity and be rewritten to the same
+// collision-resolved display key the top-level route refs use — so a wrapper
+// whose field is a `create::Args` resolves correctly even when a sibling route
+// references a same-last-segment `update::Args`.
+
+mod wrap_create {
+    use autumn_web::openapi::OpenApiSchema;
+    #[derive(serde::Serialize, serde::Deserialize, OpenApiSchema)]
+    pub struct Args {
+        pub create_only: String,
+    }
+}
+
+mod wrap_update {
+    use autumn_web::openapi::OpenApiSchema;
+    #[derive(serde::Serialize, serde::Deserialize, OpenApiSchema)]
+    pub struct Args {
+        pub update_only: i64,
+    }
+}
+
+// A wrapper whose `payload` field is the CREATE Args — the nested-only type that
+// no route references directly (Mode 1 back-fill + collision closure).
+#[derive(serde::Serialize, serde::Deserialize, autumn_web::openapi::OpenApiSchema)]
+struct WrapEnvelope {
+    pub payload: wrap_create::Args,
+    pub note: String,
+}
+
+#[post("/api/wrap-envelope")]
+async fn wrap_envelope_route(Json(_e): Json<WrapEnvelope>) -> axum::Json<serde_json::Value> {
+    axum::Json(serde_json::json!({}))
+}
+
+#[post("/api/wrap-update")]
+async fn wrap_update_route(Json(_u): Json<wrap_update::Args>) -> axum::Json<serde_json::Value> {
+    axum::Json(serde_json::json!({}))
+}
+
+fn request_body_ref(spec: &autumn_web::openapi::OpenApiSpec, path: &str) -> String {
+    spec.paths[path]
+        .post
+        .as_ref()
+        .unwrap()
+        .request_body
+        .as_ref()
+        .unwrap()
+        .content["application/json"]
+        .schema["$ref"]
+        .as_str()
+        .unwrap()
+        .to_owned()
+}
+
+#[test]
+fn nested_derived_ref_resolves_through_collision_index() {
+    let envelope = __autumn_route_info_wrap_envelope_route().api_doc;
+    let update = __autumn_route_info_wrap_update_route().api_doc;
+    let config = OpenApiConfig::new("Demo", "1.0.0");
+    let spec = autumn_web::openapi::generate_spec(&config, &[&envelope, &update]);
+
+    let envelope_ref = request_body_ref(&spec, "/api/wrap-envelope");
+    let update_ref = request_body_ref(&spec, "/api/wrap-update");
+    let components = spec.components.expect("components");
+
+    // The two `Args` collide (create is nested in the envelope, update is a route
+    // ref), so both must qualify away from the bare `Args` key.
+    assert_ne!(
+        update_ref, "#/components/schemas/Args",
+        "colliding update Args must qualify: {update_ref}"
+    );
+
+    // The envelope's nested `payload` ref must resolve to the CREATE Args — not
+    // dangle, not carry a raw `type_name` identity, and not point at update.
+    let envelope_key = envelope_ref.trim_start_matches("#/components/schemas/");
+    let envelope_schema = components
+        .schemas
+        .get(envelope_key)
+        .expect("envelope component present");
+    let payload_ref = envelope_schema["properties"]["payload"]["$ref"]
+        .as_str()
+        .expect("envelope payload is a $ref");
+    let payload_key = payload_ref.trim_start_matches("#/components/schemas/");
+    assert!(
+        !payload_key.contains("::"),
+        "nested ref must be a display key, not a raw identity: {payload_ref}"
+    );
+    let payload_schema = components
+        .schemas
+        .get(payload_key)
+        .expect("nested CREATE Args component present (not dangling)");
+    assert!(
+        payload_schema["properties"].get("create_only").is_some(),
+        "nested ref must resolve to CREATE Args: {payload_schema}"
+    );
+    assert!(
+        payload_schema["properties"].get("update_only").is_none(),
+        "nested ref must NOT resolve to UPDATE Args: {payload_schema}"
+    );
+
+    // The update route's own component is the OTHER, distinct Args.
+    let update_key = update_ref.trim_start_matches("#/components/schemas/");
+    assert_ne!(
+        update_key, payload_key,
+        "create and update Args must be distinct components: {update_key} == {payload_key}"
+    );
+    let update_schema = components
+        .schemas
+        .get(update_key)
+        .expect("update Args component present");
+    assert!(
+        update_schema["properties"].get("update_only").is_some(),
+        "update component must expose its own field: {update_schema}"
+    );
+}
+
+// ── No-collision nested ref: no churn + nested-only back-fill (Mode 1) ──
+
+mod ncnest {
+    use autumn_web::openapi::OpenApiSchema;
+    #[derive(serde::Serialize, serde::Deserialize, OpenApiSchema)]
+    pub struct NestedFoo {
+        pub value: String,
+    }
+    #[derive(serde::Serialize, serde::Deserialize, OpenApiSchema)]
+    pub struct OuterBar {
+        pub foo: NestedFoo,
+        pub label: String,
+    }
+}
+
+#[post("/api/nc-outer")]
+async fn nc_outer_route(Json(_o): Json<ncnest::OuterBar>) -> axum::Json<serde_json::Value> {
+    axum::Json(serde_json::json!({}))
+}
+
+#[test]
+fn non_colliding_nested_ref_stays_short_with_no_churn() {
+    let outer = __autumn_route_info_nc_outer_route().api_doc;
+    let config = OpenApiConfig::new("Demo", "1.0.0");
+    let spec = autumn_web::openapi::generate_spec(&config, &[&outer]);
+
+    let outer_ref = request_body_ref(&spec, "/api/nc-outer");
+    assert_eq!(
+        outer_ref, "#/components/schemas/OuterBar",
+        "top-level ref stays short"
+    );
+    let components = spec.components.expect("components");
+    let outer_schema = components
+        .schemas
+        .get("OuterBar")
+        .expect("outer component present");
+    let nested_ref = outer_schema["properties"]["foo"]["$ref"]
+        .as_str()
+        .expect("nested foo is a $ref");
+    // No churn: a non-colliding nested ref stays the short last-segment key.
+    assert_eq!(
+        nested_ref, "#/components/schemas/NestedFoo",
+        "non-colliding nested ref must stay the short key (no churn): {nested_ref}"
+    );
+    // Mode 1: the nested-only type (no direct route ref) is back-filled with its
+    // real field-accurate schema.
+    let nested_schema = components
+        .schemas
+        .get("NestedFoo")
+        .expect("nested-only component back-filled");
+    assert!(
+        nested_schema["properties"].get("value").is_some(),
+        "nested-only component carries its real fields: {nested_schema}"
+    );
+}
