@@ -505,6 +505,7 @@ fn schema_entry_for_type(ty: &syn::Type) -> TokenStream {
             ::autumn_web::openapi::SchemaEntry {
                 name: "array",
                 kind: ::autumn_web::openapi::SchemaKind::Array(&#inner_tokens),
+                identity: ::core::option::Option::None,
             }
         };
     }
@@ -515,6 +516,7 @@ fn schema_entry_for_type(ty: &syn::Type) -> TokenStream {
             ::autumn_web::openapi::SchemaEntry {
                 name: "nullable",
                 kind: ::autumn_web::openapi::SchemaKind::Nullable(&#inner_tokens),
+                identity: ::core::option::Option::None,
             }
         };
     }
@@ -527,13 +529,20 @@ fn schema_entry_for_type(ty: &syn::Type) -> TokenStream {
             ::autumn_web::openapi::SchemaEntry {
                 name: #name_lit,
                 kind: ::autumn_web::openapi::SchemaKind::Primitive(#json_lit),
+                identity: ::core::option::Option::None,
             }
         }
     } else {
+        // A named object ref carries its globally-unique `type_name` identity so
+        // the spec/MCP back-fill can disambiguate two distinct types that share
+        // this last path segment (issue #1972).
         quote! {
             ::autumn_web::openapi::SchemaEntry {
                 name: #name_lit,
                 kind: ::autumn_web::openapi::SchemaKind::Ref,
+                identity: ::core::option::Option::Some(
+                    ::autumn_web::openapi::type_name_of::<#ty>
+                ),
             }
         }
     }

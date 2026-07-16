@@ -157,13 +157,89 @@ pub struct ApiDoc {
 }
 
 /// Reference to a schema definition, produced by the route macros.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug)]
 pub struct SchemaEntry {
-    /// Short human-readable type name (used as `#/components/schemas/Name`).
+    /// Short human-readable type name, used as the *default* component
+    /// display key (`#/components/schemas/Name`) when it does not collide.
     pub name: &'static str,
     /// Whether this is a primitive JSON type (string/number/bool/array) as
     /// opposed to a named object ref.
     pub kind: SchemaKind,
+    /// Globally-unique schema *identity* for a `Ref` entry, as a fn pointer to
+    /// [`type_name_of`] (i.e. `::core::any::type_name::<T>()`). This is what
+    /// matches a route reference to its producer (`#[derive(OpenApiSchema)]`
+    /// descriptor / registered schema) and disambiguates two distinct types
+    /// that share a last path segment (e.g. `create::Args` vs `update::Args`)
+    /// so neither silently shadows the other (issue #1972).
+    ///
+    /// A fn pointer (rather than the `&'static str` directly) keeps a nested
+    /// `SchemaEntry` const-promotable to `&'static` in `Array` / `Nullable`
+    /// wrappers, since `type_name` is not yet a stably-const fn.
+    ///
+    /// `None` for primitives and for the `Array` / `Nullable` wrapper entries
+    /// (whose `name` is the sentinel `"array"` / `"nullable"`), and for legacy
+    /// short-name refs (e.g. the repository macro's model refs) which keep their
+    /// last-segment display key.
+    pub identity: Option<fn() -> &'static str>,
+}
+
+impl SchemaEntry {
+    /// The globally-unique identity key for this entry: its `type_name` when an
+    /// `identity` fn is present, otherwise the short `name` (legacy behavior).
+    #[must_use]
+    pub fn identity_key(&self) -> &'static str {
+        self.identity.map_or(self.name, |f| f())
+    }
+}
+
+// `PartialEq`/`Eq` are implemented by hand rather than derived: deriving them
+// would compare the `identity` field's fn *pointers*, which the
+// `unpredictable_function_pointer_comparisons` lint (rightly) flags as
+// meaningless. Comparing the *resolved* identity strings is both meaningful and
+// what callers actually want (two entries are equal iff they describe the same
+// type the same way).
+impl PartialEq for SchemaEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name
+            && self.kind == other.kind
+            && self.identity_key() == other.identity_key()
+    }
+}
+
+impl Eq for SchemaEntry {}
+
+/// Monomorphized `::core::any::type_name::<T>()` behind a fn pointer.
+///
+/// The route macros emit `Some(type_name_of::<T>)` as a [`SchemaEntry::identity`]
+/// so producer and consumer agree on a globally-unique schema identity by
+/// construction (both are the `type_name` of the same `T`). Using a fn pointer
+/// keeps nested entries const-promotable to `&'static` (see
+/// [`SchemaEntry::identity`]).
+#[must_use]
+pub fn type_name_of<T: ?Sized>() -> &'static str {
+    core::any::type_name::<T>()
+}
+
+/// Sanitize a schema identity into a valid OpenAPI component key.
+///
+/// OpenAPI restricts component keys to `^[A-Za-z0-9._-]+$`, so a Rust
+/// `type_name` (`crate::module::Args`, `Vec<T>`) cannot be used verbatim. `::`
+/// collapses to `.` (utoipa-style) and any other out-of-range character maps to
+/// `_`. Centralizing this here means the registration side and the `$ref` side
+/// always derive the exact same key from the same identity.
+#[must_use]
+pub fn component_key(raw: &str) -> String {
+    let dotted = raw.replace("::", ".");
+    dotted
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 /// Classifier for how a type should appear in the spec.
@@ -358,26 +434,32 @@ impl_primitive_schema!(serde_json::Value, "object", "object");
 /// entry unconditionally, and the `openapi`-gated spec builder consults it only
 /// when that feature is compiled in.
 pub struct DerivedSchemaDescriptor {
-    /// Component schema name. Matches `OpenApiSchema::schema_name()` and the
-    /// `$ref` component name emitted for `Query<T>` / `Json<T>` handler args
-    /// (the type's last path segment).
+    /// Short display hint (the type's last path segment / `schema_name()`).
     pub name: &'static str,
+    /// The type's globally-unique *identity* (`type_name`), behind a fn pointer.
+    /// The spec/MCP back-fill matches a route reference to this descriptor by
+    /// identity, so two distinct types sharing a last segment resolve to their
+    /// own schema instead of whichever inventory entry link-order hit first
+    /// (issue #1972).
+    pub identity: fn() -> &'static str,
     /// Produces the JSON schema for the type (the type's `OpenApiSchema::schema`).
     pub schema: fn() -> serde_json::Value,
 }
 
 inventory::collect!(DerivedSchemaDescriptor);
 
-/// Look up the derived component schema for `name`.
+/// Look up the derived component schema for a schema *identity* (`type_name`).
 ///
-/// Returns the schema when a `#[derive(OpenApiSchema)]` type with that schema
-/// name was linked into the binary, or `None` when no such derive exists (so
-/// callers fall back to the generic placeholder).
+/// Returns the schema when a `#[derive(OpenApiSchema)]` type with that identity
+/// was linked into the binary, or `None` when no such derive exists (so callers
+/// fall back to the generic placeholder). Matching by identity — not the short
+/// last-segment name — is what keeps two distinct `Args` types from shadowing
+/// each other in the back-fill.
 #[must_use]
-pub fn registered_derived_schema(name: &str) -> Option<serde_json::Value> {
+pub fn registered_derived_schema(identity: &str) -> Option<serde_json::Value> {
     inventory::iter::<DerivedSchemaDescriptor>
         .into_iter()
-        .find(|descriptor| descriptor.name == name)
+        .find(|descriptor| (descriptor.identity)() == identity)
         .map(|descriptor| (descriptor.schema)())
 }
 
@@ -605,6 +687,141 @@ pub fn write_openapi_spec_to_dist(
     Ok(())
 }
 
+/// Resolves each referenced schema *identity* (`type_name`) to a readable,
+/// collision-free OpenAPI component *display key* (issue #1972).
+///
+/// Built once at spec-finalize (and re-derivable purely from the routes so the
+/// MCP tool builder computes the identical mapping). A short last-segment key
+/// (`Args`) is used whenever it is unambiguous; only when two *distinct*
+/// identities would collide on the same last segment is each qualified with
+/// enough trailing module segments to disambiguate (`create.Args` /
+/// `update.Args`). Both the component registration and every `$ref` go through
+/// this map, so a route reference can never resolve to the wrong schema.
+#[cfg(feature = "openapi")]
+#[derive(Default, Debug, Clone)]
+pub struct SchemaComponentIndex {
+    /// identity key (`type_name` or legacy short name) → display component key.
+    by_identity: BTreeMap<String, String>,
+}
+
+#[cfg(feature = "openapi")]
+impl SchemaComponentIndex {
+    /// The component display key for a `Ref` entry — the value emitted in its
+    /// `#/components/schemas/{key}` `$ref`. Falls back to the sanitized short
+    /// name for an identity that was not part of the indexed route set (e.g. a
+    /// hand-built entry in a unit test).
+    #[must_use]
+    pub fn display_key(&self, entry: &SchemaEntry) -> String {
+        let identity = entry.identity_key();
+        self.by_identity
+            .get(identity)
+            .cloned()
+            .unwrap_or_else(|| component_key(entry.name))
+    }
+
+    /// Iterate `(identity, display_key)` pairs — used by the back-fill to
+    /// register a component under its display key keyed by identity.
+    fn iter(&self) -> impl Iterator<Item = (&String, &String)> {
+        self.by_identity.iter()
+    }
+}
+
+/// The trailing `n` `::`-segments of a `type_name`, joined with `.` and
+/// sanitized into a component key (`a::b::Args`, n=2 → `b.Args`).
+#[cfg(feature = "openapi")]
+fn qualified_suffix_key(identity: &str, depth: usize) -> String {
+    let segments: Vec<&str> = identity.split("::").collect();
+    let start = segments.len().saturating_sub(depth);
+    component_key(&segments[start..].join("::"))
+}
+
+/// Build the identity→display-key map for every schema referenced by `routes`.
+///
+/// Pure over the route set, so [`generate_spec_at`] and the MCP tool builder
+/// derive the exact same keys.
+#[cfg(feature = "openapi")]
+#[must_use]
+pub fn build_schema_component_index(routes: &[&ApiDoc]) -> SchemaComponentIndex {
+    // Collect (identity, base-display) for every referenced Ref entry.
+    let mut refs: Vec<(&'static str, String)> = Vec::new();
+    let mut collect = |entry: &SchemaEntry| {
+        for e in flatten_ref_entries(entry) {
+            refs.push((e.identity_key(), component_key(e.name)));
+        }
+    };
+    for api_doc in routes {
+        if api_doc.hidden {
+            continue;
+        }
+        if let Some(e) = &api_doc.request_body {
+            collect(e);
+        }
+        if let Some(e) = &api_doc.response {
+            collect(e);
+        }
+        if let Some(e) = &api_doc.query_schema {
+            collect(e);
+        }
+    }
+
+    // Which base display keys are shared by more than one distinct identity?
+    let mut by_base: BTreeMap<String, std::collections::BTreeSet<&'static str>> = BTreeMap::new();
+    for (identity, base) in &refs {
+        by_base.entry(base.clone()).or_default().insert(identity);
+    }
+
+    let mut by_identity: BTreeMap<String, String> = BTreeMap::new();
+    let mut used: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+
+    // First pass: assign the plain last-segment key to every identity whose base
+    // is unambiguous, and to legacy short-name identities (no `::` path — the
+    // repository macro's model refs) which cannot be qualified anyway.
+    for (identity, base) in &refs {
+        let collides = by_base[base].len() > 1 && identity.contains("::");
+        if !collides {
+            by_identity
+                .entry((*identity).to_owned())
+                .or_insert_with(|| {
+                    used.insert(base.clone());
+                    base.clone()
+                });
+        }
+    }
+
+    // Second pass: qualify each genuinely-colliding real type path with the
+    // fewest trailing module segments that make its key unique.
+    for (identity, _base) in &refs {
+        if by_identity.contains_key(*identity) {
+            continue;
+        }
+        let depth_max = identity.split("::").count();
+        let mut display = None;
+        for depth in 2..=depth_max {
+            let candidate = qualified_suffix_key(identity, depth);
+            if !used.contains(&candidate) {
+                display = Some(candidate);
+                break;
+            }
+        }
+        let display = display.unwrap_or_else(|| component_key(identity));
+        used.insert(display.clone());
+        by_identity.insert((*identity).to_owned(), display);
+    }
+
+    SchemaComponentIndex { by_identity }
+}
+
+/// Flatten an entry, yielding each leaf `Ref` entry reached through
+/// `Array` / `Nullable` wrappers (so a `Json<Vec<User>>` contributes `User`).
+#[cfg(feature = "openapi")]
+fn flatten_ref_entries(entry: &SchemaEntry) -> Vec<&SchemaEntry> {
+    match entry.kind {
+        SchemaKind::Ref => vec![entry],
+        SchemaKind::Array(inner) | SchemaKind::Nullable(inner) => flatten_ref_entries(inner),
+        SchemaKind::Primitive(_) => Vec::new(),
+    }
+}
+
 /// Build an [`OpenApiSpec`] from a collection of routes and user config.
 ///
 /// This is the core of the auto-generation: every route's [`ApiDoc`] is
@@ -630,13 +847,10 @@ pub fn generate_spec_at(
     }
     registry.insert("ProblemDetails", problem_details_schema());
 
-    // Collect every named schema reference produced by any operation so
-    // we can back-fill component entries for types the user didn't
-    // explicitly register. Without this, auto-inferred `Json<MyDto>`
-    // payloads would emit `$ref`s pointing at nonexistent component
-    // schemas — an invalid OpenAPI document.
-    let mut referenced_names: std::collections::BTreeSet<&'static str> =
-        std::collections::BTreeSet::new();
+    // Resolve every referenced schema identity to a collision-free component
+    // display key up front, so both the `$ref` sites (via `operation_for`) and
+    // the back-fill below register/reference the exact same key (issue #1972).
+    let index = build_schema_component_index(routes);
 
     let mut any_secured = false;
     let mut any_scoped = false;
@@ -655,17 +869,7 @@ pub fn generate_spec_at(
             (register)(&mut registry);
         }
 
-        if let Some(entry) = &api_doc.request_body {
-            collect_ref_names(entry, &mut referenced_names);
-        }
-        if let Some(entry) = &api_doc.response {
-            collect_ref_names(entry, &mut referenced_names);
-        }
-        if let Some(entry) = &api_doc.query_schema {
-            collect_ref_names(entry, &mut referenced_names);
-        }
-
-        let operation = operation_for(api_doc, &config.api_versions, now);
+        let operation = operation_for(api_doc, &config.api_versions, now, &index);
         let entry = paths.entry(api_doc.path.to_owned()).or_default();
         match api_doc.method {
             "GET" => entry.get = Some(operation),
@@ -679,21 +883,22 @@ pub fn generate_spec_at(
         }
     }
 
-    // Back-fill a schema for every referenced name the user didn't already
-    // register. A `#[derive(OpenApiSchema)]` type advertises a real
-    // field-accurate schema through the compile-time inventory (issue #1972),
-    // which we consult first; only a name with no derived schema (and no
+    // Back-fill a schema for every referenced identity the user didn't already
+    // register, under its resolved display key. A `#[derive(OpenApiSchema)]`
+    // type advertises a real field-accurate schema through the compile-time
+    // inventory (matched by identity, so two same-named types never shadow each
+    // other — issue #1972); only an identity with no derived schema (and no
     // explicit `OpenApiConfig::register_schema`) falls back to the minimal
     // `{"type": "object", "title": "X"}` placeholder.
-    for name in referenced_names {
-        if !registry.schemas().contains_key(name) {
-            let schema = registered_derived_schema(name).unwrap_or_else(|| {
+    for (identity, display_key) in index.iter() {
+        if !registry.schemas().contains_key(display_key) {
+            let schema = registered_derived_schema(identity).unwrap_or_else(|| {
                 serde_json::json!({
                     "type": "object",
-                    "title": name,
+                    "title": display_key,
                 })
             });
-            registry.insert(name, schema);
+            registry.insert(display_key.clone(), schema);
         }
     }
 
@@ -749,6 +954,7 @@ fn operation_for(
     api_doc: &ApiDoc,
     api_versions: &[crate::app::ApiVersion],
     now: chrono::DateTime<chrono::Utc>,
+    index: &SchemaComponentIndex,
 ) -> Operation {
     let mut tags = if api_doc.tags.is_empty() {
         default_tag(api_doc.path)
@@ -797,7 +1003,7 @@ fn operation_for(
             name: query_entry.name.to_owned(),
             location: "query".to_owned(),
             required: false,
-            schema: schema_value_for(query_entry),
+            schema: schema_value_for(query_entry, index),
             style: Some("form".to_owned()),
             explode: Some(true),
         });
@@ -808,7 +1014,7 @@ fn operation_for(
         content: std::iter::once((
             "application/json".to_owned(),
             MediaType {
-                schema: schema_value_for(entry),
+                schema: schema_value_for(entry, index),
             },
         ))
         .collect(),
@@ -828,7 +1034,7 @@ fn operation_for(
             content.insert(
                 "application/json".to_owned(),
                 MediaType {
-                    schema: schema_value_for(entry),
+                    schema: schema_value_for(entry, index),
                 },
             );
             content
@@ -912,22 +1118,29 @@ fn operation_for(
 /// Produces the same shape the OpenAPI generator emits. Exposed so the MCP
 /// projection can derive a tool's `inputSchema` from the exact same typed
 /// contract — guaranteeing the tool schema cannot drift from the handler.
+///
+/// `index` resolves each `Ref` to its collision-free component display key
+/// (issue #1972); build it once with [`build_schema_component_index`] over the
+/// same route set so tool `$ref`s match the served OpenAPI components exactly.
 #[cfg(feature = "openapi")]
 #[must_use]
-pub fn schema_entry_to_value(entry: &SchemaEntry) -> serde_json::Value {
-    schema_value_for(entry)
+pub fn schema_entry_to_value(
+    entry: &SchemaEntry,
+    index: &SchemaComponentIndex,
+) -> serde_json::Value {
+    schema_value_for(entry, index)
 }
 
 #[cfg(feature = "openapi")]
-fn schema_value_for(entry: &SchemaEntry) -> serde_json::Value {
+fn schema_value_for(entry: &SchemaEntry, index: &SchemaComponentIndex) -> serde_json::Value {
     match entry.kind {
         SchemaKind::Primitive(json_type) => serde_json::json!({ "type": json_type }),
         SchemaKind::Ref => {
-            serde_json::json!({ "$ref": format!("#/components/schemas/{}", entry.name) })
+            serde_json::json!({ "$ref": format!("#/components/schemas/{}", index.display_key(entry)) })
         }
         SchemaKind::Array(items) => serde_json::json!({
             "type": "array",
-            "items": schema_value_for(items),
+            "items": schema_value_for(items, index),
         }),
         SchemaKind::Nullable(inner) => {
             // OpenAPI 3.1 aligns with JSON Schema 2020-12, which supports
@@ -941,7 +1154,7 @@ fn schema_value_for(entry: &SchemaEntry) -> serde_json::Value {
                 SchemaKind::Ref | SchemaKind::Array(_) | SchemaKind::Nullable(_) => {
                     serde_json::json!({
                         "oneOf": [
-                            schema_value_for(inner),
+                            schema_value_for(inner, index),
                             { "type": "null" },
                         ],
                     })
@@ -951,20 +1164,6 @@ fn schema_value_for(entry: &SchemaEntry) -> serde_json::Value {
                 }
             }
         }
-    }
-}
-
-/// Walk into a `SchemaEntry` and yield every named ref reached through
-/// `Array` / `Nullable` wrappers. Back-fill logic uses this so a
-/// `Json<Vec<User>>` response registers a `User` component schema.
-#[cfg(feature = "openapi")]
-fn collect_ref_names(entry: &SchemaEntry, out: &mut std::collections::BTreeSet<&'static str>) {
-    match entry.kind {
-        SchemaKind::Ref => {
-            out.insert(entry.name);
-        }
-        SchemaKind::Array(inner) | SchemaKind::Nullable(inner) => collect_ref_names(inner, out),
-        SchemaKind::Primitive(_) => {}
     }
 }
 
@@ -1293,6 +1492,7 @@ mod tests {
         doc.request_body = Some(SchemaEntry {
             name: "CreateUser",
             kind: SchemaKind::Ref,
+            identity: None,
         });
         doc.success_status = 201;
 
@@ -1315,6 +1515,7 @@ mod tests {
         doc.response = Some(SchemaEntry {
             name: "string",
             kind: SchemaKind::Primitive("string"),
+            identity: None,
         });
         let config = OpenApiConfig::new("Demo", "1.0.0");
         let spec = generate_spec(&config, &[&doc]);
@@ -1367,10 +1568,12 @@ mod tests {
         doc.request_body = Some(SchemaEntry {
             name: "CreateUser",
             kind: SchemaKind::Ref,
+            identity: None,
         });
         doc.response = Some(SchemaEntry {
             name: "User",
             kind: SchemaKind::Ref,
+            identity: None,
         });
 
         let config = OpenApiConfig::new("Demo", "1.0.0");
@@ -1396,6 +1599,7 @@ mod tests {
         doc.response = Some(SchemaEntry {
             name: "User",
             kind: SchemaKind::Ref,
+            identity: None,
         });
 
         let user_schema = serde_json::json!({
@@ -1460,12 +1664,14 @@ mod tests {
         static INNER: SchemaEntry = SchemaEntry {
             name: "User",
             kind: SchemaKind::Ref,
+            identity: None,
         };
         let entry = SchemaEntry {
             name: "nullable",
             kind: SchemaKind::Nullable(&INNER),
+            identity: None,
         };
-        let value = schema_value_for(&entry);
+        let value = schema_value_for(&entry, &SchemaComponentIndex::default());
         assert!(
             value.get("nullable").is_none(),
             "3.1 must not emit `nullable: true` (that is 3.0 only)"
@@ -1495,12 +1701,14 @@ mod tests {
         static INNER: SchemaEntry = SchemaEntry {
             name: "integer",
             kind: SchemaKind::Primitive("integer"),
+            identity: None,
         };
         let entry = SchemaEntry {
             name: "nullable",
             kind: SchemaKind::Nullable(&INNER),
+            identity: None,
         };
-        let value = schema_value_for(&entry);
+        let value = schema_value_for(&entry, &SchemaComponentIndex::default());
         assert!(
             value.get("nullable").is_none(),
             "3.1 must not emit `nullable: true`"

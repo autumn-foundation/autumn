@@ -705,3 +705,98 @@ fn generated_spec_reuses_problem_details_schema_for_errors() {
         );
     }
 }
+
+// ── Collision-proof schema component identity (issue #1972, Part 2 / Item 2) ──
+
+mod spec_create {
+    use autumn_web::openapi::OpenApiSchema;
+    #[derive(serde::Serialize, serde::Deserialize, OpenApiSchema)]
+    pub struct Payload {
+        pub create_only: String,
+    }
+}
+
+mod spec_update {
+    use autumn_web::openapi::OpenApiSchema;
+    #[derive(serde::Serialize, serde::Deserialize, OpenApiSchema)]
+    pub struct Payload {
+        pub update_only: i64,
+    }
+}
+
+#[post("/api/spec-create")]
+async fn spec_create_route(Json(_p): Json<spec_create::Payload>) -> axum::Json<serde_json::Value> {
+    axum::Json(serde_json::json!({}))
+}
+
+#[post("/api/spec-update")]
+async fn spec_update_route(Json(_p): Json<spec_update::Payload>) -> axum::Json<serde_json::Value> {
+    axum::Json(serde_json::json!({}))
+}
+
+#[test]
+fn openapi_spec_disambiguates_same_named_component_schemas() {
+    let create = __autumn_route_info_spec_create_route().api_doc;
+    let update = __autumn_route_info_spec_update_route().api_doc;
+    let config = OpenApiConfig::new("Demo", "1.0.0");
+    let spec = autumn_web::openapi::generate_spec(&config, &[&create, &update]);
+
+    // The two request-body `$ref`s must be distinct component keys.
+    let create_ref = spec.paths["/api/spec-create"]
+        .post
+        .as_ref()
+        .unwrap()
+        .request_body
+        .as_ref()
+        .unwrap()
+        .content["application/json"]
+        .schema["$ref"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let update_ref = spec.paths["/api/spec-update"]
+        .post
+        .as_ref()
+        .unwrap()
+        .request_body
+        .as_ref()
+        .unwrap()
+        .content["application/json"]
+        .schema["$ref"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_ne!(
+        create_ref, update_ref,
+        "distinct types must not share a $ref"
+    );
+
+    // Both refs must resolve to their own field-accurate component schema.
+    let components = spec.components.expect("components");
+    let create_key = create_ref.trim_start_matches("#/components/schemas/");
+    let update_key = update_ref.trim_start_matches("#/components/schemas/");
+    let create_schema = components
+        .schemas
+        .get(create_key)
+        .expect("create component present");
+    let update_schema = components
+        .schemas
+        .get(update_key)
+        .expect("update component present");
+    assert!(
+        create_schema["properties"].get("create_only").is_some(),
+        "{create_schema}"
+    );
+    assert!(
+        create_schema["properties"].get("update_only").is_none(),
+        "no shadow: {create_schema}"
+    );
+    assert!(
+        update_schema["properties"].get("update_only").is_some(),
+        "{update_schema}"
+    );
+    assert!(
+        update_schema["properties"].get("create_only").is_none(),
+        "no shadow: {update_schema}"
+    );
+}

@@ -63,7 +63,12 @@ pub fn derive_openapi_schema(input: TokenStream) -> TokenStream {
     // `Vec<&&Field>` the model macro collects); build that shape here.
     let field_refs: Vec<&syn::Field> = fields.iter().collect();
     let field_ref_refs: Vec<&&syn::Field> = field_refs.iter().collect();
-    let schema_body = crate::model::emit_schema_fn_body(&field_ref_refs, false);
+    // Honor a container `#[serde(rename_all = "...")]` on the derived struct so
+    // the advertised property names + `required` entries match the serialized
+    // wire names — same helper/precedence `#[model]` and `FormModel` use.
+    let rename_all_rule = crate::model::serde_rename_all_serialize_rule(&input.attrs);
+    let schema_body =
+        crate::model::emit_schema_fn_body(&field_ref_refs, false, rename_all_rule.as_deref());
 
     quote! {
         impl ::autumn_web::openapi::OpenApiSchema for #name {
@@ -80,6 +85,7 @@ pub fn derive_openapi_schema(input: TokenStream) -> TokenStream {
         ::autumn_web::reexports::inventory::submit! {
             ::autumn_web::openapi::DerivedSchemaDescriptor {
                 name: ::core::stringify!(#name),
+                identity: ::autumn_web::openapi::type_name_of::<#name>,
                 schema: <#name as ::autumn_web::openapi::OpenApiSchema>::schema,
             }
         }

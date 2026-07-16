@@ -12249,12 +12249,14 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             ::autumn_web::openapi::SchemaEntry {
                                 name: #list_query_schema_name,
                                 kind: ::autumn_web::openapi::SchemaKind::Ref,
+                                identity: ::core::option::Option::None,
                             }
                         ),
                         response: ::core::option::Option::Some(
                             ::autumn_web::openapi::SchemaEntry {
                                 name: #list_response_schema_name,
                                 kind: ::autumn_web::openapi::SchemaKind::Ref,
+                                identity: ::core::option::Option::None,
                             }
                         ),
                         register_schemas: ::core::option::Option::Some(#list_schema_fn),
@@ -12309,6 +12311,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             ::autumn_web::openapi::SchemaEntry {
                                 name: ::core::stringify!(#model_name),
                                 kind: ::autumn_web::openapi::SchemaKind::Ref,
+                                identity: ::core::option::Option::None,
                             }
                         ),
                         mcp_tool: #mcp_get_op,
@@ -12353,12 +12356,14 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             ::autumn_web::openapi::SchemaEntry {
                                 name: ::core::stringify!(#new_name),
                                 kind: ::autumn_web::openapi::SchemaKind::Ref,
+                                identity: ::core::option::Option::None,
                             }
                         ),
                         response: ::core::option::Option::Some(
                             ::autumn_web::openapi::SchemaEntry {
                                 name: ::core::stringify!(#model_name),
                                 kind: ::autumn_web::openapi::SchemaKind::Ref,
+                                identity: ::core::option::Option::None,
                             }
                         ),
                         mcp_tool: #mcp_create_op,
@@ -12405,12 +12410,14 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             ::autumn_web::openapi::SchemaEntry {
                                 name: ::core::stringify!(#update_name),
                                 kind: ::autumn_web::openapi::SchemaKind::Ref,
+                                identity: ::core::option::Option::None,
                             }
                         ),
                         response: ::core::option::Option::Some(
                             ::autumn_web::openapi::SchemaEntry {
                                 name: ::core::stringify!(#model_name),
                                 kind: ::autumn_web::openapi::SchemaKind::Ref,
+                                identity: ::core::option::Option::None,
                             }
                         ),
                         mcp_tool: #mcp_update_op,

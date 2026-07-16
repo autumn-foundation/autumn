@@ -144,6 +144,25 @@ where
 ///
 /// Wraps [`axum::extract::Query`] so query parse failures use Autumn's
 /// Problem Details error contract.
+///
+/// # Query strings are flat
+///
+/// Deserialization goes through
+/// [`serde_urlencoded`](https://docs.rs/serde_urlencoded), which is **strictly
+/// flat**. It decodes scalar fields (`?q=foo&page=2`) and a sequence field from
+/// repeated keys (`?tags=a&tags=b`), but it **cannot** deserialize a nested
+/// struct by any encoding — neither bracketed (`key[sub]=`) nor
+/// JSON-in-a-string. If a request needs structured/nested input, take it as a
+/// JSON body ([`Json<T>`](crate::extract::Json)) instead of a query struct.
+///
+/// This also shapes MCP tool exposure (issue #1972): a `Query<T>` becomes the
+/// tool's `query` object property, and dispatch renders it as flat `key=value`
+/// pairs. A `Query<T>` whose schema has a nested object / array-of-object field
+/// therefore cannot round-trip, and Autumn emits a build-time `tracing::warn`
+/// steering that input to a JSON body. See the [MCP guide]'s "Query is flat"
+/// note.
+///
+/// [MCP guide]: https://docs.rs/autumn-web (guide/mcp.md)
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Query<T>(pub T);
 

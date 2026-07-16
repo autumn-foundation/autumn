@@ -332,3 +332,80 @@ fn option_field_emits_nullable_schema() {
         "oneOf should include string type"
     );
 }
+
+// ── Serde-rename fidelity on `#[model]` (issue #1972, Part 2 / Item 1) ──
+
+mod schema_rename {
+    autumn_web::reexports::diesel::table! {
+        renamed_rows (id) {
+            id -> Int8,
+            word_count -> Int8,
+            category -> Text,
+            active -> Nullable<Bool>,
+        }
+    }
+}
+
+use schema_rename::renamed_rows;
+
+#[autumn_web::model(table = "renamed_rows")]
+#[serde(rename_all = "camelCase")]
+pub struct RenamedRow {
+    #[id]
+    pub id: i64,
+    pub word_count: i64,
+    #[serde(rename = "kind")]
+    pub category: String,
+    pub active: Option<bool>,
+}
+
+#[test]
+fn model_schema_honors_serde_rename_all_and_field_rename() {
+    use autumn_web::openapi::OpenApiSchema;
+    let schema = RenamedRow::schema();
+    let props = schema["properties"].as_object().expect("properties");
+
+    // container rename_all = camelCase.
+    assert!(props.contains_key("wordCount"), "camelCased: {schema}");
+    assert!(!props.contains_key("word_count"), "no raw key: {schema}");
+    // field-level rename wins over rename_all.
+    assert!(props.contains_key("kind"), "field rename wins: {schema}");
+    assert!(!props.contains_key("category"), "raw field gone: {schema}");
+    // optional field still camelCased (id is not renamed — already flat).
+    assert!(props.contains_key("active"), "optional present: {schema}");
+
+    let required: Vec<&str> = schema["required"]
+        .as_array()
+        .expect("required")
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .collect();
+    assert!(
+        required.contains(&"wordCount"),
+        "required camelCased: {required:?}"
+    );
+    assert!(
+        required.contains(&"kind"),
+        "required field rename: {required:?}"
+    );
+    assert!(
+        !required.contains(&"active"),
+        "optional not required: {required:?}"
+    );
+    assert!(!required.contains(&"word_count"));
+    assert!(!required.contains(&"category"));
+}
+
+#[test]
+fn new_model_schema_honors_serde_renames() {
+    use autumn_web::openapi::OpenApiSchema;
+    // NewRenamedRow drops the id; the rename rules still apply to the rest.
+    let schema = NewRenamedRow::schema();
+    let props = schema["properties"].as_object().expect("properties");
+    assert!(
+        props.contains_key("wordCount"),
+        "camelCased on New: {schema}"
+    );
+    assert!(props.contains_key("kind"), "field rename on New: {schema}");
+    assert!(!props.contains_key("id"), "New excludes id: {schema}");
+}

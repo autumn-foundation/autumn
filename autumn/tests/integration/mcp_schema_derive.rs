@@ -34,6 +34,71 @@ struct PlainArgs {
     a: String,
 }
 
+// Serde-rename fidelity (issue #1972, Part 2 / Item 1): a container
+// `rename_all`, a field-level `rename`, and a raw-ident field must all be
+// reflected in the advertised property names + `required` entries.
+#[derive(Serialize, Deserialize, OpenApiSchema)]
+#[serde(rename_all = "camelCase")]
+struct RenamedArgs {
+    word_count: i64,
+    #[serde(rename = "kind")]
+    category: String,
+    r#type: String,
+    maybe_flag: Option<bool>,
+}
+
+#[test]
+fn derived_schema_honors_serde_renames_and_raw_idents() {
+    let schema = <RenamedArgs as OpenApiSchema>::schema();
+    let props = schema["properties"].as_object().expect("properties object");
+
+    // container rename_all = camelCase → snake_case field advertised camelCased.
+    assert!(props.contains_key("wordCount"), "camelCased key: {schema}");
+    assert!(!props.contains_key("word_count"), "raw key gone: {schema}");
+    // field-level rename wins over rename_all.
+    assert!(props.contains_key("kind"), "field rename wins: {schema}");
+    assert!(!props.contains_key("category"), "raw field gone: {schema}");
+    // raw ident `r#type` advertises the bare `type`, never `r#type`.
+    assert!(props.contains_key("type"), "raw-ident stripped: {schema}");
+    assert!(
+        !props.contains_key("r#type"),
+        "no r# prefix leaks: {schema}"
+    );
+    // optional field is still camelCased.
+    assert!(
+        props.contains_key("maybeFlag"),
+        "optional camelCased: {schema}"
+    );
+
+    // `required` uses the same resolved names (and excludes the Option).
+    let required: Vec<&str> = schema["required"]
+        .as_array()
+        .expect("required list")
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .collect();
+    assert!(
+        required.contains(&"wordCount"),
+        "required camelCased: {required:?}"
+    );
+    assert!(
+        required.contains(&"kind"),
+        "required field-rename: {required:?}"
+    );
+    assert!(
+        required.contains(&"type"),
+        "required raw-ident: {required:?}"
+    );
+    assert!(
+        !required.contains(&"maybeFlag"),
+        "optional not required: {required:?}"
+    );
+    // no stale raw names leak into required.
+    assert!(!required.contains(&"word_count"));
+    assert!(!required.contains(&"category"));
+    assert!(!required.contains(&"r#type"));
+}
+
 #[post("/api/derived-body")]
 #[api_doc(mcp, summary = "Body arg with a derived schema")]
 async fn derived_body(Json(_body): Json<DerivedArgs>) -> AutumnResult<Json<DerivedArgs>> {
@@ -139,6 +204,92 @@ fn mcp_body_without_derive_stays_placeholder() {
                 .as_object()
                 .is_none_or(serde_json::Map::is_empty),
         "a struct without the derive must stay a bare placeholder: {resolved}"
+    );
+}
+
+// Collision-proof schema identity (issue #1972, Part 2 / Item 2): two derived
+// structs sharing a final identifier (`create::Args` / `update::Args`) used as
+// route args must resolve to DISTINCT, correctly-referenced component schemas —
+// neither may shadow the other in the back-fill.
+mod create {
+    use super::{Deserialize, OpenApiSchema, Serialize};
+    #[derive(Serialize, Deserialize, OpenApiSchema)]
+    pub struct Args {
+        pub create_only_field: String,
+    }
+}
+
+mod update {
+    use super::{Deserialize, OpenApiSchema, Serialize};
+    #[derive(Serialize, Deserialize, OpenApiSchema)]
+    pub struct Args {
+        pub update_only_field: i64,
+    }
+}
+
+#[get("/api/collide-create")]
+#[api_doc(mcp, summary = "Query arg named Args (create module)")]
+async fn collide_create(Query(_q): Query<create::Args>) -> AutumnResult<Json<serde_json::Value>> {
+    Ok(Json(serde_json::json!({})))
+}
+
+#[post("/api/collide-update")]
+#[api_doc(mcp, summary = "Body arg named Args (update module)")]
+async fn collide_update(Json(_b): Json<update::Args>) -> AutumnResult<Json<serde_json::Value>> {
+    Ok(Json(serde_json::json!({})))
+}
+
+#[test]
+fn colliding_derive_names_resolve_to_distinct_schemas() {
+    let docs = vec![
+        __autumn_route_info_collide_create().api_doc,
+        __autumn_route_info_collide_update().api_doc,
+    ];
+    let tools = derive_tools(&docs, false, None);
+
+    let create_tool = tools.iter().find(|t| t.name() == "collide_create").unwrap();
+    let update_tool = tools.iter().find(|t| t.name() == "collide_update").unwrap();
+
+    let create_query = &create_tool.input_schema()["properties"]["query"];
+    let update_body = &update_tool.input_schema()["properties"]["body"];
+
+    // The two refs must be DISTINCT component keys — otherwise one shadows the
+    // other and both would resolve to the same schema.
+    let create_ref = create_query["$ref"]
+        .as_str()
+        .expect("create query is a $ref");
+    let update_ref = update_body["$ref"].as_str().expect("update body is a $ref");
+    assert_ne!(
+        create_ref, update_ref,
+        "distinct types must not share a component key: {create_ref} == {update_ref}"
+    );
+
+    // Each ref must resolve to its OWN field, never the other's.
+    let create_schema = resolve_ref(create_tool.input_schema(), create_query);
+    let update_schema = resolve_ref(update_tool.input_schema(), update_body);
+    assert!(
+        create_schema["properties"]
+            .get("create_only_field")
+            .is_some(),
+        "create Args must expose its own field: {create_schema}"
+    );
+    assert!(
+        create_schema["properties"]
+            .get("update_only_field")
+            .is_none(),
+        "create Args must NOT be shadowed by update Args: {create_schema}"
+    );
+    assert!(
+        update_schema["properties"]
+            .get("update_only_field")
+            .is_some(),
+        "update Args must expose its own field: {update_schema}"
+    );
+    assert!(
+        update_schema["properties"]
+            .get("create_only_field")
+            .is_none(),
+        "update Args must NOT be shadowed by create Args: {update_schema}"
     );
 }
 
