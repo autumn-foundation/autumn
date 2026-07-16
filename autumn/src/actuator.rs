@@ -295,7 +295,7 @@ pub trait ProvideActuatorState {
     #[cfg(feature = "db")]
     fn pool(
         &self,
-    ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>>;
+    ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<crate::db::RuntimeConnection>>;
 
     /// Returns the configured shard set, used to expose per-shard pool
     /// metrics in the `/actuator/metrics` endpoint. Defaults to `None`.
@@ -4177,9 +4177,7 @@ mod tests {
         #[cfg(feature = "http-client")]
         webhook_outbound: Option<crate::webhook_outbound::WebhookOutboundManager>,
         #[cfg(feature = "db")]
-        pool: Option<
-            diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
-        >,
+        pool: Option<diesel_async::pooled_connection::deadpool::Pool<crate::db::RuntimeConnection>>,
         #[cfg(feature = "db")]
         shards: Option<crate::sharding::ShardSet>,
         #[cfg(feature = "ws")]
@@ -4223,7 +4221,7 @@ mod tests {
         #[cfg(feature = "db")]
         fn pool(
             &self,
-        ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>>
+        ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<crate::db::RuntimeConnection>>
         {
             self.pool.as_ref()
         }
@@ -5104,13 +5102,16 @@ mod tests {
     #[tokio::test]
     #[cfg(feature = "db")]
     async fn actuator_metrics_returns_db_stats_when_pool_present() {
-        use diesel_async::AsyncPgConnection;
         use diesel_async::pooled_connection::AsyncDieselConnectionManager;
         use diesel_async::pooled_connection::deadpool::Pool;
 
         let mut state = test_state();
 
-        let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(
+        // `RuntimeConnection` is `AsyncPgConnection` in the default build and a
+        // SQLite connection under `--features sqlite`; using the alias keeps this
+        // test compiling on both (it only exercises pool metrics, and is not run
+        // under the sqlite feature).
+        let manager = AsyncDieselConnectionManager::<crate::db::RuntimeConnection>::new(
             "postgres://postgres:postgres@localhost:5432/postgres",
         );
         let pool = Pool::builder(manager).build().unwrap();

@@ -18,6 +18,15 @@
         clippy::indexing_slicing,
     )
 )]
+// The durable Postgres job backend (queue claiming, worker/maintenance loops,
+// lifecycle recording, admin paging — everything reachable only from the
+// `start_postgres_runtime` entry point) is Postgres-only and is refused under
+// the `sqlite` feature (SQLite has no LISTEN/NOTIFY or advisory-lock queue).
+// Those helpers therefore become dead in a `--features sqlite` build while the
+// local/redis backends stay live; silence dead-code just for that build rather
+// than cfg-gating dozens of individual pg-only items. No effect on the default
+// (Postgres) build.
+#![cfg_attr(feature = "sqlite", allow(dead_code))]
 
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
@@ -8724,8 +8733,32 @@ async fn pg_enqueued_and_scheduled_pages(
     Ok((enqueued, scheduled))
 }
 
+/// `SQLite` stub for the Postgres job runtime.
+///
+/// The durable Postgres job backend uses `LISTEN`/`NOTIFY`, `FOR UPDATE SKIP
+/// LOCKED` claiming, and advisory locks — none of which `SQLite` provides — so
+/// under the `sqlite` feature the runtime pool (`RuntimeConnection`) is a
+/// `SQLite` pool that cannot drive the Postgres worker loops. Refuse a
+/// `jobs.backend = "postgres"` configuration with a clear message instead of
+/// mis-typing; `SQLite` deployments use the in-process `local` job backend
+/// (the default).
+#[cfg(all(feature = "db", feature = "sqlite"))]
+fn start_postgres_runtime(
+    jobs: Vec<JobInfo>,
+    state: &AppState,
+    shutdown: &tokio_util::sync::CancellationToken,
+    config: &crate::config::JobConfig,
+    run_workers: bool,
+) -> AutumnResult<()> {
+    let _ = (jobs, state, shutdown, config, run_workers);
+    Err(AutumnError::internal_server_error(std::io::Error::other(
+        "jobs.backend=postgres is unsupported under the sqlite feature; SQLite has no \
+         LISTEN/NOTIFY or advisory-lock queue. Use jobs.backend=local (the default).",
+    )))
+}
+
 /// Start the Postgres job runtime.
-#[cfg(feature = "db")]
+#[cfg(all(feature = "db", not(feature = "sqlite")))]
 #[allow(clippy::too_many_lines)]
 fn start_postgres_runtime(
     jobs: Vec<JobInfo>,
