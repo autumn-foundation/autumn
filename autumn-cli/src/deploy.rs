@@ -172,7 +172,14 @@ pub(crate) fn canonicalize_deploy_profile(raw: &str) -> String {
 /// `autumn_web::config::default_deploy_profile`); otherwise returns the trimmed
 /// string verbatim (no alias folding, no case change). Grading normalizes
 /// separately via [`canonicalize_deploy_profile`] at the grade site.
-fn trimmed_deploy_profile(raw: &str) -> String {
+// `pub(crate)` (not `pub`): reachable from `doctor` so its deploy secret/DB
+// value graders derive the RAW deploy-profile spelling exactly like
+// [`ResolvedDeployConfig::resolve`] stores it (trimmed, empty → `prod`), rather
+// than re-deriving (and drifting from) that rule. Kept crate-internal. In this
+// bin-only crate `deploy` is a private module, so clippy flags the `pub(crate)`
+// as redundant; we keep it to document the intended visibility.
+#[allow(clippy::redundant_pub_crate)]
+pub(crate) fn trimmed_deploy_profile(raw: &str) -> String {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return "prod".to_owned();
@@ -924,12 +931,43 @@ impl<E: Env> Env for ForcedProfileEnv<E> {
 /// strips `AUTUMN_ENV`/`AUTUMN_PROFILE`/`AUTUMN_IS_DEBUG` from any `.env` file,
 /// matching `AutumnConfig::load()`.
 fn load_runtime_config(resolved: &ResolvedDeployConfig) -> Result<AutumnConfig, DeployError> {
+    let forced = deploy_profile_env_overlay(&resolved.profile)?;
+    AutumnConfig::load_with_env(&forced).map_err(|e| DeployError::Config(e.to_string()))
+}
+
+/// Build the profile-aware env overlay that [`load_runtime_config`] resolves the
+/// deploy config under — the `.env.<profile>` overlay plus a forced
+/// `AUTUMN_ENV` — WITHOUT loading [`AutumnConfig`].
+///
+/// `profile_raw` is the operator's trimmed RAW `[deploy] profile` spelling (as
+/// stored on [`ResolvedDeployConfig::profile`] by [`trimmed_deploy_profile`]).
+/// The `.env.<profile>` overlay is selected by the CANONICAL profile
+/// ([`canonicalize_deploy_profile`]) so a `[deploy] profile` alias like
+/// `production`/`PROD` still reads `.env.prod` (matching `AutumnConfig::load()`),
+/// while the returned [`ForcedProfileEnv`] forces `AUTUMN_ENV` to the RAW
+/// spelling so the loader layers `[profile.<profile>]` / `autumn-<profile>.toml`
+/// under the operator's exact profile name, and reports `AUTUMN_DOTENV=1` so a
+/// non-dev deploy profile still loads `.env.<profile>`.
+///
+/// `doctor` reuses this so its deploy secret/DB value graders resolve under the
+/// `[deploy] profile` EXACTLY like `autumn deploy check` — same overlay
+/// selection and same forced profile — rather than replicating (and risking
+/// drift from) the layering.
+///
+/// # Errors
+/// Returns [`DeployError::Config`] when a project-root `.env` file exists but
+/// cannot be read or parsed.
+// `pub(crate)`: reachable from `doctor`, kept crate-internal. In this bin-only
+// crate `deploy` is a private module, so clippy flags the `pub(crate)` as
+// redundant; we keep it to document the intended visibility.
+#[allow(clippy::redundant_pub_crate)]
+pub(crate) fn deploy_profile_env_overlay(profile_raw: &str) -> Result<impl Env, DeployError> {
     use autumn_web::config::OsEnv;
     // Gating base: the real OS env, but reports `AUTUMN_DOTENV=1` so
     // `should_load` loads `.env.<profile>` for a non-dev deploy profile —
     // without mutating the global process environment.
     let gating = ForcedProfileEnv {
-        profile: resolved.profile.clone(),
+        profile: profile_raw.to_owned(),
         inner: OsEnv,
     };
     // Select the `.env.<profile>` overlay by the CANONICAL profile, so a
@@ -938,14 +976,13 @@ fn load_runtime_config(resolved: &ResolvedDeployConfig) -> Result<AutumnConfig, 
     // normalization — not `.env.production`/`.env.PROD`. Only the dotenv-overlay
     // SELECTION is canonicalized; `AUTUMN_ENV` and the TOML override-file
     // precedence (handled by `load_with_env`) still see the RAW spelling below.
-    let dotenv_profile = canonicalize_deploy_profile(&resolved.profile);
+    let dotenv_profile = canonicalize_deploy_profile(profile_raw);
     let inner = autumn_web::dotenv::os_env_with_dotenv_for_profile_using(&gating, &dotenv_profile)
         .map_err(|e| DeployError::Config(e.to_string()))?;
-    let forced = ForcedProfileEnv {
-        profile: resolved.profile.clone(),
+    Ok(ForcedProfileEnv {
+        profile: profile_raw.to_owned(),
         inner,
-    };
-    AutumnConfig::load_with_env(&forced).map_err(|e| DeployError::Config(e.to_string()))
+    })
 }
 
 /// Resolve the project's package name (for the `app_name` default), falling back
