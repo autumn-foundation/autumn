@@ -515,14 +515,15 @@ pub(crate) fn spawn_committed_after_commit_callbacks(
 }
 
 fn after_commit_panic_message(payload: &(dyn Any + Send)) -> String {
-    match (
-        payload.downcast_ref::<&'static str>(),
-        payload.downcast_ref::<String>(),
-    ) {
-        (Some(message), _) => (*message).to_owned(),
-        (_, Some(message)) => message.clone(),
-        (None, None) => "non-string panic payload".to_owned(),
+    if let Some(message) = payload.downcast_ref::<&'static str>() {
+        return (*message).to_owned();
     }
+
+    if let Some(message) = payload.downcast_ref::<String>() {
+        return message.clone();
+    }
+
+    "non-string panic payload".to_owned()
 }
 
 /// Register a callback to run after the current database transaction commits.
