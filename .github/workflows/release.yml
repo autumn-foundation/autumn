@@ -26,6 +26,8 @@ jobs:
     if: |
       github.event.workflow_run.conclusion == 'success' &&
       github.event.workflow_run.event == 'push'
+    outputs:
+      tag: ${{ steps.tag.outputs.name }}
     steps:
       - name: Download release artifacts
         uses: actions/download-artifact@v8
@@ -60,3 +62,12 @@ jobs:
           body_path: RELEASE_NOTES.md
           draft: false
           prerelease: ${{ steps.tag.outputs.prerelease == 'true' }}
+
+  binaries:
+    name: Build & attach CLI binaries
+    needs: release
+    permissions:
+      contents: write
+    uses: ./.github/workflows/cli-release.yml
+    with:
+      tag: ${{ needs.release.outputs.tag }}

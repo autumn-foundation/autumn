@@ -3,14 +3,20 @@ name: CLI Release Binaries
 # Builds prebuilt `autumn` CLI binaries for Linux + macOS (x86_64 + aarch64)
 # and attaches them — with sha256 checksums — to a GitHub Release.
 #
-# Binaries correspond to DELIBERATE, TAGGED CRATE RELEASES, not trunk. The canonical
-# trigger is `release: published`, which fires only when a release is cut from a
-# version tag (release.yml runs on `v[0-9]+.*` tags) — cutting a release is always an
-# explicit maintainer action. The binary is built from that tag's source, so
-# `releases/latest/download/...` always means "the latest RELEASED version"; there
-# are no rolling/nightly trunk-dev builds.
+# Binaries correspond to DELIBERATE, TAGGED CRATE RELEASES, not trunk. This is a
+# reusable workflow invoked by `release.yml` (its `binaries` job) right after the
+# GitHub Release for a `v[0-9]+.*` tag is created — so it runs only once the Publish
+# Gate has passed and the release exists, and it uploads to that release. Cutting a
+# release is always an explicit maintainer action; there are no rolling/nightly
+# trunk-dev builds, and `releases/latest/download/...` always means "the latest
+# RELEASED version".
 #
-# `workflow_dispatch` is a manual escape hatch only: supply a `tag` to (re)build a
+# It is deliberately NOT triggered by `on: release`: release.yml creates the release
+# with the default GITHUB_TOKEN, and events raised by GITHUB_TOKEN do not start new
+# workflow runs, so an `on: release` trigger would silently never fire. Invoking it
+# as a reusable job from release.yml side-steps that entirely and is deterministic.
+#
+# `workflow_dispatch` is a manual escape hatch: supply a `tag` to (re)build a
 # specific released tag and attach to its release, or leave it blank to build the
 # current ref for validation (uploads workflow artifacts, no release upload).
 #
@@ -22,8 +28,12 @@ name: CLI Release Binaries
 # natively on macOS runners. Windows is a documented follow-up (see #2005).
 
 on:
-  release:
-    types: [published]
+  workflow_call:
+    inputs:
+      tag:
+        description: "Release tag to build from and attach binaries to (e.g. v0.6.0)."
+        required: true
+        type: string
   workflow_dispatch:
     inputs:
       tag:
@@ -35,7 +45,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: cli-release-${{ github.event.release.tag_name || inputs.tag || github.run_id }}
+  group: cli-release-${{ inputs.tag || github.run_id }}
   cancel-in-progress: false
 
 jobs:
@@ -62,7 +72,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.release.tag_name || inputs.tag || github.ref }}
+          ref: ${{ inputs.tag || github.ref }}
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -109,10 +119,10 @@ jobs:
           if-no-files-found: error
 
       - name: Attach to release
-        if: github.event_name == 'release' || inputs.tag != ''
+        if: ${{ inputs.tag != '' }}
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.event.release.tag_name || inputs.tag }}
+          TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
           gh release upload "$TAG" \
