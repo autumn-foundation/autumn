@@ -197,19 +197,6 @@ fn storage_key(token: &str) -> String {
 
 // ── Multipart / body scanning helpers ─────────────────────────────────────────
 
-/// Extract the `boundary` parameter from a `multipart/form-data` Content-Type.
-///
-/// The parameter NAME is matched case-insensitively (RFC 9110 8.3.1), while the
-/// boundary VALUE is returned verbatim (RFC 2046 boundaries are case-sensitive).
-fn extract_multipart_boundary(content_type: &str) -> Option<&str> {
-    content_type.split(';').find_map(|part| {
-        let (name, value) = part.trim().split_once('=')?;
-        name.trim()
-            .eq_ignore_ascii_case("boundary")
-            .then(|| value.trim().trim_matches('"'))
-    })
-}
-
 /// Return the byte position of the first occurrence of `needle` in `haystack`.
 fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() {
@@ -365,16 +352,23 @@ async fn extract_submitted_token(
         .get(axum::http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .unwrap_or_default();
-    // Media types are case-insensitive (RFC 9110 8.3.1); the header may also carry
-    // leading whitespace. Match the type/subtype token case-insensitively, but keep
-    // the boundary VALUE case-sensitive (extract it from the original header).
-    let normalized_type = content_type.trim_start().to_ascii_lowercase();
-    let is_urlencoded = normalized_type.starts_with("application/x-www-form-urlencoded");
-    let boundary = if normalized_type.starts_with("multipart/form-data") {
-        extract_multipart_boundary(content_type).map(str::to_owned)
-    } else {
-        None
-    };
+    // Media types are case-insensitive (RFC 9110 8.3.1) and the header may carry
+    // leading whitespace; normalize the type token for the urlencoded check.
+    let is_urlencoded = content_type
+        .trim_start()
+        .to_ascii_lowercase()
+        .starts_with("application/x-www-form-urlencoded");
+    // Parse the boundary with `multer::parse_boundary` — the exact parser
+    // `axum::extract::Multipart` uses downstream (via `mime`) — so the guard and
+    // the extractor can never disagree about the boundary. A hand-rolled
+    // `split(';')` diverges on quoted values: `mime` permits a `;` inside a
+    // quoted parameter value, so `boundary="x;y"` parses to the boundary `x;y`
+    // in the real extractor while a split truncates it to `x`, leaving the form
+    // to be handled while its `_submit_token` is never scanned/consumed (the
+    // request stays REPLAYABLE). `parse_boundary` is case-insensitive on the
+    // media type / `boundary` param name and preserves the boundary VALUE's
+    // case; it returns `Err` for a non-multipart type, so `.ok()` yields `None`.
+    let boundary = multer::parse_boundary(content_type).ok();
     // content_type borrow ends here.
 
     if !is_urlencoded && boundary.is_none() {
@@ -988,6 +982,67 @@ mod tests {
         let token = "tok-mp-mixed";
         let ct = "Multipart/Form-Data; Boundary=BoUnDaRy-XyZ-123";
         let boundary = "BoUnDaRy-XyZ-123";
+
+        let first = app
+            .clone()
+            .oneshot(multipart_post(ct, boundary, token))
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        assert!(first.headers().get(SUBMIT_TOKEN_REPLAYED).is_none());
+
+        let second = app
+            .clone()
+            .oneshot(multipart_post(ct, boundary, token))
+            .await
+            .unwrap();
+        assert_eq!(second.status(), StatusCode::OK);
+        assert_eq!(
+            second
+                .headers()
+                .get(SUBMIT_TOKEN_REPLAYED)
+                .map(|v| v.to_str().unwrap()),
+            Some("true")
+        );
+
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            1,
+            "handler must run exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn quoted_semicolon_boundary_consumes_token_and_replay_short_circuits() {
+        // A `;` inside a QUOTED boundary parameter is a valid RFC 2046 /
+        // `mime` restricted quoted char, so `boundary="x;y"` parses to the
+        // boundary `x;y` in the `multer`/`mime` parser axum's Multipart
+        // extractor uses downstream. A hand-rolled `split(';')` truncates it
+        // to `x`, so the guard fails to find/consume `_submit_token` while the
+        // handler still parses and acts on the form — leaving the request
+        // REPLAYABLE. The boundary parser must match the extractor's so the
+        // token is consumed and a replay is short-circuited. Fully lowercase,
+        // RFC-shaped multipart — no casing trick.
+        let store: Arc<dyn IdempotencyStore> =
+            Arc::new(MemoryIdempotencyStore::new(Duration::from_secs(600)));
+        let count = Arc::new(AtomicUsize::new(0));
+        let count_inner = count.clone();
+        let app = Router::new()
+            .route(
+                "/submit",
+                post(move || {
+                    let count = count_inner.clone();
+                    async move {
+                        count.fetch_add(1, Ordering::SeqCst);
+                        "created"
+                    }
+                }),
+            )
+            .layer(layer_with_store(store));
+
+        let token = "tok-mp-quoted-semi";
+        let ct = "multipart/form-data; boundary=\"x;y\"";
+        let boundary = "x;y";
 
         let first = app
             .clone()

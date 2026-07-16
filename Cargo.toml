@@ -35,6 +35,12 @@ repository = "https://github.com/madmax983/autumn"
 [workspace.dependencies]
 # Runtime
 axum = { version = "0.8", features = ["macros", "ws"] }
+# Multipart boundary parsing for the submit-token replay guard. `multer` is the
+# exact parser axum's `Multipart` extractor uses downstream (via `mime`), so the
+# guard and the extractor can never disagree about the boundary. Already in the
+# graph transitively (axum/tower-http); this only adds the direct edge. Pinned to
+# the version already resolved in Cargo.lock.
+multer = "3.1"
 tokio-util = "0.7"
 # Automatic ACME (Let's Encrypt) certificate provisioning (issue #1608, the
 # `acme` feature on autumn-web). `default-features = false` + `ring` is load
