@@ -1186,6 +1186,38 @@ fn sqlite_target_is_memory(target: &str) -> bool {
         || target.contains("mode=memory")
 }
 
+/// Whether a normalized `SQLite` target names a **read-only** database via its
+/// URI query string (`mode=ro`, or `immutable=1`/`immutable=true`).
+///
+/// A read-only target rejects any write, so the per-connection setup batch must
+/// skip the write-affecting pragmas (`journal_mode = WAL`) that would otherwise
+/// fail with "attempt to write a readonly database" and take the whole pool 503
+/// (see [`build_sqlite_pool`]). The query string is parsed key-by-key
+/// (case-insensitive keys and values) rather than substring-matched, so an
+/// unrelated value that merely contains `ro` never trips it.
+///
+/// A plain file path, an in-memory target (`mode=memory`, which is not
+/// read-only), and a `cache=shared` target all return `false`.
+#[cfg(feature = "sqlite")]
+fn sqlite_target_is_read_only(target: &str) -> bool {
+    let Some((_, query)) = target.split_once('?') else {
+        return false;
+    };
+    for pair in query.split('&') {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        let (key, value) = (key.trim(), value.trim());
+        if key.eq_ignore_ascii_case("mode") && value.eq_ignore_ascii_case("ro") {
+            return true;
+        }
+        if key.eq_ignore_ascii_case("immutable")
+            && (value == "1" || value.eq_ignore_ascii_case("true"))
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// Build a deadpool pool over `SyncConnectionWrapper<SqliteConnection>` for a
 /// `SQLite` target (issue #1614, PR2).
 ///
@@ -1241,20 +1273,37 @@ fn build_sqlite_pool(
     // database. A `custom_setup` callback on the manager runs once per
     // newly-created connection, which is exactly the per-connection hook we need
     // (the same mechanism the Postgres path uses to install TLS).
+    //
+    // A **read-only** URI target (`mode=ro` / `immutable`, e.g.
+    // `sqlite://file:/srv/reference.db?mode=ro`) is the exception: `journal_mode
+    // = WAL` writes to the database (it rewrites the file header and creates the
+    // `-wal`/`-shm` sidecars), so it fails with "attempt to write a readonly
+    // database" — `custom_setup` would propagate that as a connection-setup
+    // error and the pool could not service even read-only queries (`Db` routes
+    // 503). For such targets we install only the non-writing per-connection
+    // pragmas (`busy_timeout`, `foreign_keys`) and skip the write-affecting
+    // ones, so a read-only pool builds and serves reads. In-memory targets are
+    // NOT read-only and keep the full batch.
     let mut config = diesel_async::pooled_connection::ManagerConfig::<RuntimeConnection>::default();
     config.custom_setup = Box::new(|url: &str| {
         use diesel_async::{AsyncConnection as _, SimpleAsyncConnection as _};
         let url = url.to_owned();
         async move {
             let mut conn = RuntimeConnection::establish(&url).await?;
-            conn.batch_execute(
+            let pragmas = if sqlite_target_is_read_only(&url) {
+                // Non-writing pragmas only — WAL + synchronous would write and
+                // fail on a read-only database.
+                "PRAGMA busy_timeout = 5000; \
+                 PRAGMA foreign_keys = ON;"
+            } else {
                 "PRAGMA busy_timeout = 5000; \
                  PRAGMA journal_mode = WAL; \
                  PRAGMA synchronous = NORMAL; \
-                 PRAGMA foreign_keys = ON;",
-            )
-            .await
-            .map_err(diesel::ConnectionError::CouldntSetupConfiguration)?;
+                 PRAGMA foreign_keys = ON;"
+            };
+            conn.batch_execute(pragmas)
+                .await
+                .map_err(diesel::ConnectionError::CouldntSetupConfiguration)?;
             Ok(conn)
         }
         .boxed()
@@ -3773,6 +3822,40 @@ mod tests {
         ));
         // Plain file targets are not in-memory.
         assert!(!sqlite_target_is_memory("/var/lib/app.db"));
+    }
+
+    // A read-only URI target (`mode=ro` / `immutable`) must be detected so the
+    // per-connection setup batch skips the write-affecting `journal_mode = WAL`
+    // pragma, which otherwise fails with "attempt to write a readonly database"
+    // and 503s the whole pool (Codex P2).
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn sqlite_target_is_read_only_detects_ro_and_immutable() {
+        assert!(sqlite_target_is_read_only("file:/srv/ref.db?mode=ro"));
+        // Case-insensitive key/value.
+        assert!(sqlite_target_is_read_only("file:/srv/ref.db?MODE=RO"));
+        assert!(sqlite_target_is_read_only("file:/srv/ref.db?immutable=1"));
+        assert!(sqlite_target_is_read_only(
+            "file:/srv/ref.db?immutable=true"
+        ));
+        assert!(sqlite_target_is_read_only(
+            "file:/srv/ref.db?immutable=TRUE"
+        ));
+        // Read-only marker alongside other params.
+        assert!(sqlite_target_is_read_only(
+            "file:/srv/ref.db?cache=shared&mode=ro"
+        ));
+
+        // A plain file, an in-memory target, and a writable/shared-cache target
+        // are NOT read-only.
+        assert!(!sqlite_target_is_read_only("/var/lib/app.db"));
+        assert!(!sqlite_target_is_read_only(":memory:"));
+        assert!(!sqlite_target_is_read_only("file::memory:?cache=shared"));
+        assert!(!sqlite_target_is_read_only("file:app?mode=memory"));
+        assert!(!sqlite_target_is_read_only("file:/srv/ref.db?mode=rwc"));
+        assert!(!sqlite_target_is_read_only("file:/srv/ref.db?immutable=0"));
+        // A value that merely CONTAINS `ro` must not trip the substring trap.
+        assert!(!sqlite_target_is_read_only("file:/srv/ro-data.db"));
     }
 
     #[cfg(feature = "sqlite")]

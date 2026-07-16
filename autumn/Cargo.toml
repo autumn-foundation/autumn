@@ -394,6 +394,21 @@ path = "tests/sqlite_db_extractor.rs"
 name = "sqlite_pool_pragmas"
 path = "tests/sqlite_pool_pragmas.rs"
 
+# SQLite read-only-target pool proof (issue #1614, Codex P2). The per-connection
+# setup batch runs `PRAGMA journal_mode = WAL`, which WRITES — so against a
+# read-only URI target (`mode=ro`/`immutable`) it fails with "attempt to write a
+# readonly database", propagates out of `custom_setup`, and the pool can serve
+# no query (`Db` routes 503). `build_sqlite_pool` now skips the write-affecting
+# pragmas for read-only targets while keeping `foreign_keys` + `busy_timeout`.
+# Asserts the read-only pool builds, serves a committed read, keeps foreign_keys,
+# and rejects writes. Only meaningful under `--features sqlite`; the file is
+# `#![cfg(feature = "sqlite")]` so a default `cargo test` compiles it to an empty
+# (passing) binary. Run explicitly:
+# `cargo test -p autumn-web --features sqlite --test sqlite_read_only_pool`.
+[[test]]
+name = "sqlite_read_only_pool"
+path = "tests/sqlite_read_only_pool.rs"
+
 # SQLite scope-threading compile proof (issue #1614, Codex P1). Pins that
 # `Scope::list` / `ScopeQuery::load` accept `&mut RuntimeConnection` (the SQLite
 # wrapper under this feature) — the connection the repository macro passes into a
