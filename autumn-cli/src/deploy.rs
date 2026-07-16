@@ -1305,7 +1305,7 @@ fn manifest_preflight_notice(uploads: &[exec::ManifestUpload]) -> String {
 /// Perform a real deploy (issue #1607, Slices 1–3).
 ///
 /// Runs the same preflight as `check` and aborts before touching the server if
-/// anything fails (AC-6). It then probes the target ([`exec::detect_deploy_mode`])
+/// anything fails (AC-6). It then probes the target ([`exec::probe_deploy_state`])
 /// to choose between:
 ///
 /// - **first deploy** ([`exec::first_deploy_ops`]) — install the reverse proxy on
@@ -1403,11 +1403,13 @@ fn run_up(config: &AutumnConfig, resolved: &ResolvedDeployConfig) -> Result<(), 
     let executor = exec::SshExecutor::new(target);
     let release_dir = format!("{}/{release_id}", resolved.releases_dir());
 
-    // Probe the target to choose first-deploy vs zero-downtime redeploy.
-    let mode = exec::detect_deploy_mode(resolved, &executor)
+    // Probe the target to choose first-deploy vs zero-downtime redeploy. The same
+    // round-trip also captures `kamal-proxy list` so a drifted live-slot marker
+    // can be reconciled against the live proxy before slot-selection (#1938).
+    let probe = exec::probe_deploy_state(resolved, &executor)
         .map_err(|e| DeployError::Exec(e.to_string()))?;
 
-    let (ops, teardown, banner, is_first) = match mode {
+    let (ops, teardown, banner, is_first) = match probe.mode {
         exec::DeployMode::First => {
             let plan = exec::SlotPlan::first(public_port);
             let unit = render_app_unit(
@@ -1434,14 +1436,32 @@ fn run_up(config: &AutumnConfig, resolved: &ResolvedDeployConfig) -> Result<(), 
             (ops, teardown, "first deploy".to_owned(), true)
         }
         exec::DeployMode::Redeploy { live_slot } => {
-            let plan = exec::SlotPlan::redeploy(public_port, live_slot);
+            // Reconcile the (possibly stale) live-slot marker against the live
+            // proxy before choosing the candidate slot. On an UNAMBIGUOUS
+            // proxy-vs-marker disagreement the proxy is authoritative (so the
+            // candidate takes the genuinely-idle slot and never restarts the live
+            // one); on any absent/unclear proxy signal this is exactly the
+            // marker-based behavior as before (#1938, fail-safe).
+            let reconcile = exec::reconcile_live_slot(
+                live_slot,
+                &probe.proxy_list,
+                &resolved.service_name,
+                public_port,
+            );
+            if let Some(warn) = &reconcile.warn {
+                // Loud + observable: drift is surfaced, not silently papered over.
+                // (autumn-cli installs no tracing subscriber, so the deploy module
+                // reports operator-facing state via eprintln! throughout.)
+                eprintln!("\u{26A0}\u{FE0F}  {warn}");
+            }
+            let plan = exec::SlotPlan::redeploy(public_port, reconcile.live_slot);
             let unit = render_app_unit(
                 resolved,
                 &release_dir,
                 plan.candidate_port,
                 plan.candidate_slot,
             );
-            let ops = exec::cutover_ops(
+            let mut ops = exec::cutover_ops(
                 resolved,
                 &proxy,
                 &unit,
@@ -1451,6 +1471,15 @@ fn run_up(config: &AutumnConfig, resolved: &ResolvedDeployConfig) -> Result<(), 
                 &release_id,
                 &plan,
             );
+            // Repair the drifted marker as an early op — before the cutover's
+            // record-previous-release reads it — so the on-disk marker matches the
+            // proxy truth even if the rest of the deploy is later interrupted.
+            if reconcile.repair {
+                ops.insert(
+                    0,
+                    exec::live_slot_marker_repair_op(resolved, plan.live_slot, public_port),
+                );
+            }
             let teardown = exec::candidate_teardown_ops(resolved, &release_id, &plan);
             (
                 ops,
