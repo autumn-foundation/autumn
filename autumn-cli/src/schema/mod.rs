@@ -61,7 +61,10 @@ pub enum SchemaAction {
         #[arg(long, value_name = "PATH")]
         from: Option<PathBuf>,
         /// Where to write the snapshot. Defaults to `.autumn/schema-snapshot.json`.
-        #[arg(long, value_name = "PATH")]
+        /// Mutually exclusive with `--stdout` (writing a file and printing to
+        /// stdout are two different output modes). The default is applied in
+        /// code when omitted, so `conflicts_with` never misfires on the default.
+        #[arg(long, value_name = "PATH", conflicts_with = "stdout")]
         out: Option<PathBuf>,
         /// The dialect to tag the snapshot with. Defaults to the project's
         /// configured database backend (`detect_backend`).
@@ -350,6 +353,50 @@ mod tests {
         assert!(
             msg.contains("Autumn project"),
             "the generic project-root message: {msg}"
+        );
+    }
+
+    /// A minimal `clap::Parser` wrapper so the `SchemaAction` subcommand args
+    /// (a `Subcommand`, not a `Parser`) can be exercised at parse time.
+    #[derive(clap::Parser, Debug)]
+    struct TestCli {
+        #[command(subcommand)]
+        action: SchemaAction,
+    }
+
+    #[test]
+    fn out_and_stdout_are_mutually_exclusive() {
+        use clap::Parser;
+        // clap rejects `--out` together with `--stdout` before `run_snapshot`
+        // ever runs, so the misleading "printed but `--out` file unwritten" case
+        // is impossible.
+        let err = TestCli::try_parse_from([
+            "autumn",
+            "snapshot",
+            "--from",
+            "models.rs",
+            "--out",
+            "snap.json",
+            "--stdout",
+        ])
+        .unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+
+        // Each mode alone still parses.
+        assert!(
+            TestCli::try_parse_from(["autumn", "snapshot", "--from", "models.rs", "--stdout"])
+                .is_ok()
+        );
+        assert!(
+            TestCli::try_parse_from([
+                "autumn",
+                "snapshot",
+                "--from",
+                "models.rs",
+                "--out",
+                "snap.json"
+            ])
+            .is_ok()
         );
     }
 

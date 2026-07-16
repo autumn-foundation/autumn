@@ -207,21 +207,47 @@ fn canonical_tables(tables: &[Table]) -> Vec<Table> {
 /// Write `snapshot` canonically to `path`, creating any missing parent
 /// directories (e.g. the conventional `.autumn/` dir).
 ///
+/// The replacement is **atomic**: the canonical JSON is written to a
+/// same-directory temporary file, flushed and `fsync`ed, then `rename`d over the
+/// destination (an atomic swap on the same filesystem). A disk-full or
+/// interrupted write therefore leaves the previously-committed baseline intact
+/// instead of truncating or corrupting it, and readers never observe a
+/// half-written file. On any failure the temp file is cleaned up (best-effort)
+/// and the error is returned.
+///
 /// # Errors
 ///
 /// Returns [`SnapshotError::Io`] if a parent directory cannot be created or the
-/// file cannot be written.
+/// snapshot cannot be written and swapped into place.
 pub fn write_snapshot(path: &Path, snapshot: &SchemaSnapshot) -> Result<(), SnapshotError> {
+    use std::io::Write;
+
+    let io_error = |source: std::io::Error| SnapshotError::Io {
+        path: path.display().to_string(),
+        source,
+    };
+
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         std::fs::create_dir_all(parent).map_err(|source| SnapshotError::Io {
             path: parent.display().to_string(),
             source,
         })?;
     }
-    std::fs::write(path, to_canonical_json(snapshot)).map_err(|source| SnapshotError::Io {
-        path: path.display().to_string(),
-        source,
-    })
+
+    // Stage into a temp file in the *same directory* as the destination so the
+    // final `rename` is an atomic same-filesystem swap. `NamedTempFile` picks a
+    // collision-resistant name and removes the temp file on drop, so any early
+    // return below (or a failed `persist`) cleans it up automatically.
+    let dir = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    let mut temp = tempfile::NamedTempFile::new_in(dir).map_err(io_error)?;
+    temp.write_all(to_canonical_json(snapshot).as_bytes())
+        .and_then(|()| temp.as_file().sync_all())
+        .map_err(io_error)?;
+    temp.persist(path).map_err(|e| io_error(e.error))?;
+    Ok(())
 }
 
 /// Read and validate a snapshot from `path`.
@@ -486,6 +512,35 @@ mod tests {
         // produces the same output (input order does not matter).
         let reparsed = parse_snapshot_str(&json, "<test>").expect("parse");
         assert_eq!(to_canonical_json(&reparsed), json);
+    }
+
+    #[test]
+    fn write_snapshot_atomically_replaces_existing_file_without_leftover_temp() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("schema-snapshot.json");
+
+        // Seed a pre-existing (stale) baseline at the destination.
+        std::fs::write(&path, "OLD STALE CONTENT").expect("seed old baseline");
+
+        let snapshot = SchemaSnapshot::new(Backend::Postgres, fixture_tables());
+        write_snapshot(&path, &snapshot).expect("write");
+
+        // The destination now holds the fresh canonical JSON (replacement worked).
+        let written = std::fs::read_to_string(&path).expect("read back");
+        assert_eq!(written, to_canonical_json(&snapshot));
+        assert!(!written.contains("OLD STALE CONTENT"));
+
+        // No temp file leaked into the directory on success: the destination is
+        // the only entry.
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("read_dir")
+            .map(|e| e.expect("entry").file_name())
+            .collect();
+        assert_eq!(
+            entries,
+            vec![std::ffi::OsString::from("schema-snapshot.json")],
+            "the atomic write must leave no leftover temp file: {entries:?}"
+        );
     }
 
     #[test]
