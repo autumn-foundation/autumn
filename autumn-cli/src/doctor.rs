@@ -5913,6 +5913,47 @@ fn resolve_deploy_doctor_config(
     (deploy_cfg, None)
 }
 
+/// Strict-load guard mirroring what `autumn deploy check` does
+/// (`deploy.rs::load_runtime_config`): attempt to load the full runtime
+/// [`autumn_web::config::AutumnConfig`] under the DEPLOY profile via the SAME
+/// `AutumnConfig::load_with_env` call, using the profile-forced env overlay
+/// (`deploy::deploy_profile_env_overlay`) the caller already built.
+///
+/// `run()`'s deploy value graders build the merged TOML table with
+/// [`get_merged_toml_table_runtime`], whose profile-override read swallows a
+/// parse/IO error with `.ok()` — so a MALFORMED or unreadable
+/// `autumn-<profile>.toml` override is silently DROPPED and doctor grades only
+/// the base values, PASSING `--strict`. `autumn deploy check`, by contrast,
+/// loads `AutumnConfig::load_with_env` under the deploy profile and FAILS on the
+/// same override. This guard closes that gap: when the deploy-profile load
+/// errors it returns a FAILING `deploy_config` check reporting the load error;
+/// when it succeeds it returns `None` and the existing value grading proceeds.
+///
+/// Additive: on a well-formed, deployable config the load succeeds — that is
+/// exactly what lets `autumn deploy check` pass — so this never newly fails a
+/// valid override.
+fn deploy_profile_config_load_check(
+    deploy_profile_raw: &str,
+    env: &dyn autumn_web::config::Env,
+) -> Option<CheckResult> {
+    match autumn_web::config::AutumnConfig::load_with_env(env) {
+        Ok(_) => None,
+        Err(err) => Some(CheckResult {
+            name: "deploy_config",
+            status: CheckStatus::Fail,
+            detail: Some(format!(
+                "deploy profile config failed to load under `[deploy] profile = \
+                 {deploy_profile_raw}`: {err} — `autumn deploy check` would reject this"
+            )),
+            hint: Some(
+                "Fix the deploy-profile config (e.g. a malformed or unreadable \
+                 autumn-<profile>.toml override) so it loads under the deploy profile \
+                 (see `autumn deploy check`)",
+            ),
+        }),
+    }
+}
+
 // ─── Main entry point ─────────────────────────────────────────────────────────
 
 /// Run all doctor checks and report results.
@@ -6303,6 +6344,23 @@ pub fn run(opts: DoctorOptions) {
                 Ok(e) => Box::new(e),
                 Err(_) => Box::new(autumn_web::config::OsEnv),
             };
+        // STRICT-LOAD GUARD (Codex review): the value graders below build
+        // `merged_deploy_toml` via `get_merged_toml_table_runtime`, whose
+        // profile-override read swallows a parse/IO error with `.ok()` — so a
+        // MALFORMED or unreadable `autumn-<profile>.toml` override is silently
+        // DROPPED and doctor would grade only the base values and PASS `--strict`,
+        // while `autumn deploy check` (which loads `AutumnConfig::load_with_env`
+        // under the deploy profile) FAILS on the same file. Mirror `deploy check`'s
+        // exact load here — through the SAME profile-forced `deploy_denv` overlay
+        // `load_runtime_config` uses — and surface any error as a failing
+        // `deploy_config` check so the two agree. On a well-formed (deployable)
+        // config the load succeeds, so this never newly fails a valid override;
+        // the existing value grading below proceeds unchanged.
+        if let Some(check) =
+            deploy_profile_config_load_check(&deploy_profile_raw, deploy_denv.as_ref())
+        {
+            tasks.push(Box::new(move || check));
+        }
         // Resolve the deploy signing secret from the SAME merged active-profile
         // table used for `deploy_cfg` and the DB URL (env first, then
         // `merged_deploy_toml`'s `security.signing_secret.secret`) — NOT the raw
@@ -15293,6 +15351,73 @@ redirect_uri = "http://localhost/callback"
             resolve_deploy_signing_secret(&deploy_merged, &MockEnv::new()),
             None,
             "a dev-only secret is not keyed by the deploy grade under the prod profile"
+        );
+    }
+
+    /// Codex review (P2): doctor's deploy value graders build the merged TOML via
+    /// `get_merged_toml_table_runtime`, whose profile-override read uses `.ok()`,
+    /// so a MALFORMED `autumn-<profile>.toml` is silently dropped — doctor would
+    /// then grade only the base values and PASS `--strict`, while `autumn deploy
+    /// check` (which loads `AutumnConfig::load_with_env` under the deploy profile)
+    /// FAILS on the same file. `deploy_profile_config_load_check` closes that gap:
+    /// a malformed deploy-profile override FAILS the `deploy_config` check; a
+    /// well-formed one does NOT newly fail. Uses an `AUTUMN_MANIFEST_DIR`-scoped
+    /// `MockEnv` (the same mechanism the runtime's own config tests use) so
+    /// `load_with_env` reads the temp-dir files with no process-env mutation.
+    #[test]
+    fn malformed_deploy_profile_override_fails_deploy_config_load_check() {
+        use autumn_web::config::MockEnv;
+        let dir = tempfile::tempdir().unwrap();
+        // `[deploy] profile = "prod"`, ambient = dev. The prod override file is
+        // present but MALFORMED (invalid TOML) — exactly the case
+        // `get_merged_toml_table_runtime`'s `.ok()` merge silently drops.
+        std::fs::write(
+            dir.path().join("autumn.toml"),
+            "[deploy]\nhost = \"deploy.example.com\"\nprofile = \"prod\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("autumn-prod.toml"),
+            "this line has no equals sign and is not valid toml\n",
+        )
+        .unwrap();
+
+        // Resolve config files from the temp dir under the prod (deploy) profile
+        // without mutating the process env — the same mechanism the runtime's
+        // config tests use (`AUTUMN_MANIFEST_DIR` selects the dir, `AUTUMN_ENV`
+        // selects the profile that pulls in `autumn-prod.toml`).
+        let env = MockEnv::new()
+            .with("AUTUMN_MANIFEST_DIR", dir.path().to_str().unwrap())
+            .with("AUTUMN_ENV", "prod");
+
+        let check = deploy_profile_config_load_check("prod", &env)
+            .expect("a malformed autumn-prod.toml must fail the deploy_config load check");
+        assert_eq!(check.name, "deploy_config");
+        assert!(
+            matches!(check.status, CheckStatus::Fail),
+            "the malformed override must FAIL, not pass"
+        );
+        let detail = check.detail.unwrap_or_default();
+        assert!(
+            detail.contains("prod"),
+            "the failure names the deploy profile: {detail}"
+        );
+        assert!(
+            detail.contains("failed to load"),
+            "the failure surfaces the load error: {detail}"
+        );
+
+        // Companion: a WELL-FORMED prod override under the same layout does NOT
+        // trigger this new failure — the normal case still passes (mirroring how
+        // `autumn deploy check` loads it without error).
+        std::fs::write(
+            dir.path().join("autumn-prod.toml"),
+            "[server]\nport = 8443\n",
+        )
+        .unwrap();
+        assert!(
+            deploy_profile_config_load_check("prod", &env).is_none(),
+            "a well-formed autumn-prod.toml must not newly fail the deploy_config check"
         );
     }
 
