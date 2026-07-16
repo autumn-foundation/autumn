@@ -388,7 +388,16 @@ fn write_concat_list(input_paths: &[PathBuf], near_path: &Path) -> Result<PathBu
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("clip");
-    let list_path = parent.join(format!(".{stem}.concat.txt"));
+    // Make the concat-list filename unique per invocation so two concurrent
+    // multi-segment encodes that share an output stem (e.g. `clip.mp4` and its
+    // `clip.jpg` poster, both `file_stem() == "clip"`) never collide on one
+    // `.clip.concat.txt` — otherwise one would truncate/read the file while the
+    // other's `ConcatListGuard` deletes it. Process id + a monotonic counter is
+    // dependency-free (no `tempfile` runtime dep) and keeps the file hidden and
+    // in the same parent dir, so relative concat resolution is unchanged.
+    let seq = CONCAT_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let pid = std::process::id();
+    let list_path = parent.join(format!(".{stem}.{pid}-{seq}.concat.txt"));
     let mut list_file =
         std::fs::File::create(&list_path).map_err(|source| MediaError::ConcatList {
             path: list_path.display().to_string(),
@@ -396,17 +405,36 @@ fn write_concat_list(input_paths: &[PathBuf], near_path: &Path) -> Result<PathBu
         })?;
     for path in input_paths {
         let absolute = absolutize_for_concat(path)?;
-        // FFmpeg's concat demuxer needs literal POSIX-style escaping; the
-        // recording paths produced by the ingest layer never contain single
-        // quotes, so basic quoting is sufficient here.
-        writeln!(list_file, "file '{}'", absolute.display()).map_err(|source| {
-            MediaError::ConcatList {
-                path: list_path.display().to_string(),
-                source,
-            }
+        // FFmpeg's concat demuxer parses each entry as a single-quoted string:
+        // a literal single quote is written as `'\''` (close-quote,
+        // backslash-escaped quote, reopen-quote). Backslashes are literal
+        // inside the quotes for the demuxer, so Windows paths need no escaping.
+        writeln!(
+            list_file,
+            "file '{}'",
+            concat_escape(&absolute.display().to_string())
+        )
+        .map_err(|source| MediaError::ConcatList {
+            path: list_path.display().to_string(),
+            source,
         })?;
     }
     Ok(list_path)
+}
+
+/// Process-global monotonic counter making concat-list filenames unique per
+/// invocation (paired with the process id) so concurrent same-stem encodes
+/// never share a list file.
+static CONCAT_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Escape a path for a single-quoted `FFmpeg` concat-demuxer `file` entry.
+///
+/// The demuxer treats everything inside the single quotes literally except the
+/// closing quote, so only `'` needs escaping — as `'\''` (close-quote,
+/// backslash-escaped quote, reopen-quote). Backslashes stay literal, so Windows
+/// paths pass through unchanged.
+fn concat_escape(path: &str) -> String {
+    path.replace('\'', "'\\''")
 }
 
 fn absolutize_for_concat(path: &Path) -> Result<PathBuf, MediaError> {
@@ -1134,10 +1162,10 @@ mod tests {
         let near = dir.path().join("clip.mp4");
 
         let list = super::write_concat_list(&[a.clone(), b.clone()], &near).unwrap();
-        assert_eq!(
-            list.file_name().unwrap().to_str().unwrap(),
-            ".clip.concat.txt"
-        );
+        let name = list.file_name().unwrap().to_str().unwrap();
+        // Filename is unique per invocation: `.{stem}.{pid}-{seq}.concat.txt`.
+        assert!(name.starts_with(".clip."), "name: {name}");
+        assert!(name.ends_with(".concat.txt"), "name: {name}");
 
         let body = std::fs::read_to_string(&list).unwrap();
         let lines: Vec<&str> = body.lines().collect();
@@ -1159,6 +1187,75 @@ mod tests {
             assert!(list.exists());
         }
         assert!(!list.exists(), "guard drop must remove the concat list");
+    }
+
+    #[test]
+    fn concat_escape_handles_single_quotes_and_leaves_others_literal() {
+        // A single quote becomes the demuxer's close/escape/reopen sequence.
+        assert_eq!(
+            super::concat_escape("creator's-stream/seg.mp4"),
+            "creator'\\''s-stream/seg.mp4"
+        );
+        // Multiple quotes each get the treatment.
+        assert_eq!(super::concat_escape("a'b'c"), "a'\\''b'\\''c");
+        // Backslashes are literal for the demuxer (Windows paths untouched).
+        assert_eq!(super::concat_escape(r"C:\rec\seg.mp4"), r"C:\rec\seg.mp4");
+        // A normal path is unchanged.
+        assert_eq!(super::concat_escape("/rec/seg.mp4"), "/rec/seg.mp4");
+    }
+
+    #[test]
+    fn write_concat_list_escapes_apostrophes_in_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("creator's-stream");
+        std::fs::create_dir_all(&sub).unwrap();
+        let a = sub.join("seg.mp4");
+        File::create(&a).unwrap();
+        let near = dir.path().join("clip.mp4");
+
+        let list = super::write_concat_list(std::slice::from_ref(&a), &near).unwrap();
+        let _guard = super::ConcatListGuard::new(list.clone());
+        let body = std::fs::read_to_string(&list).unwrap();
+        let line = body.lines().next().unwrap();
+
+        // The quoted path contains the exact `'\''` escape for the apostrophe.
+        assert!(line.contains("'\\''"), "line: {line}");
+        // And it round-trips: applying the demuxer's unescape (replace `'\''`
+        // back with `'`) on the quoted inner yields the original absolute path.
+        let inner = &line["file '".len()..line.len() - 1];
+        let unescaped = inner.replace("'\\''", "'");
+        let expected = super::absolutize_for_concat(&a).unwrap();
+        assert_eq!(unescaped, expected.display().to_string());
+    }
+
+    #[test]
+    fn write_concat_list_uses_unique_filenames_per_invocation() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.mp4");
+        let b = dir.path().join("b.mp4");
+        File::create(&a).unwrap();
+        File::create(&b).unwrap();
+        // Same output stem for both calls (e.g. `clip.mp4` and `clip.jpg`).
+        let near_mp4 = dir.path().join("clip.mp4");
+        let near_jpg = dir.path().join("clip.jpg");
+
+        let list1 = super::write_concat_list(&[a.clone(), b.clone()], &near_mp4).unwrap();
+        let g1 = super::ConcatListGuard::new(list1.clone());
+        let list2 = super::write_concat_list(&[a, b], &near_jpg).unwrap();
+        let g2 = super::ConcatListGuard::new(list2.clone());
+
+        assert_ne!(
+            list1, list2,
+            "same-stem concurrent encodes must not collide"
+        );
+        assert!(list1.exists());
+        assert!(list2.exists());
+
+        drop(g1);
+        assert!(!list1.exists(), "guard removes its own file");
+        assert!(list2.exists(), "the other list is untouched");
+        drop(g2);
+        assert!(!list2.exists());
     }
 
     // ── Segment discovery ───────────────────────────────────────────────────
