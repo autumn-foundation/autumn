@@ -40,8 +40,11 @@
 pub mod config;
 pub mod encode;
 pub mod error;
+pub mod retention;
+pub mod sink;
 pub mod storage;
 pub mod transport;
+pub mod workflows;
 
 pub use config::{
     MediaConfig, MediaConfigError, MediaMtxConfig, MediaStorageBackend, MediaStorageConfig,
@@ -55,6 +58,14 @@ pub use encode::{
     recording_segments_covering_window, slugify,
 };
 pub use error::MediaError;
+pub use retention::{
+    RetentionDefer, RetentionReport, is_expired, recording_expires_at, spawn_retention_sweep_loop,
+    sweep_recordings_root, within_root,
+};
+pub use sink::{
+    MediaArtifact, MediaArtifactFile, MediaArtifactKind, MediaArtifactSink, MediaArtifactSinkExt,
+    MediaSinkFuture,
+};
 pub use storage::{MediaStorage, S3MediaStorage, StoredObject};
 pub use transport::{
     IngestStatus, MediaMtxClient, MediaUrls, StreamQualityStats, StreamStatus, ViewerCount,
@@ -62,16 +73,24 @@ pub use transport::{
     recording_available, recording_mediamtx_path, stream_status_from_path_json,
     viewer_count_from_path_json, viewer_counts_from_paths_json,
 };
+pub use workflows::{
+    FinalizeRecordingJobArgs, MediaWorkflowDelegate, MediaWorkflowDelegateExt,
+    MediaWorkflowRequest, MediaWorkflows, PreviewJobArgs, ThumbnailJobArgs, TranscodeJobArgs,
+    media_job_infos,
+};
 
 /// Common downstream imports for configuring and mounting the media plugin.
 pub mod prelude {
     pub use crate::{
         FfmpegClipTailCommand, FfmpegHighlightCommand, FfmpegLiveThumbnailCommand,
-        FfmpegPosterCommand, FfmpegPreviewSpriteCommand, MediaConfig, MediaConfigError, MediaError,
-        MediaMtxConfig, MediaPlugin, MediaStorage, MediaStorageBackend, MediaStorageConfig,
-        PREVIEW_CELL_HEIGHT, PREVIEW_CELL_WIDTH, PREVIEW_FRAME_INTERVAL_SECONDS,
-        PREVIEW_SPRITE_COLUMNS, RecordingConfig, S3MediaStorage, StoredObject,
-        build_preview_webvtt, newest_recording_file, newest_recording_files,
+        FfmpegPosterCommand, FfmpegPreviewSpriteCommand, FinalizeRecordingJobArgs, MediaArtifact,
+        MediaArtifactFile, MediaArtifactKind, MediaArtifactSink, MediaArtifactSinkExt, MediaConfig,
+        MediaConfigError, MediaError, MediaMtxConfig, MediaPlugin, MediaStorage,
+        MediaStorageBackend, MediaStorageConfig, MediaWorkflowDelegate, MediaWorkflowDelegateExt,
+        MediaWorkflowRequest, MediaWorkflows, PREVIEW_CELL_HEIGHT, PREVIEW_CELL_WIDTH,
+        PREVIEW_FRAME_INTERVAL_SECONDS, PREVIEW_SPRITE_COLUMNS, PreviewJobArgs, RecordingConfig,
+        RetentionDefer, S3MediaStorage, StoredObject, ThumbnailJobArgs, TranscodeJobArgs,
+        build_preview_webvtt, media_job_infos, newest_recording_file, newest_recording_files,
         newest_recording_files_since, recording_segments_covering_window, slugify,
     };
     pub use crate::{
@@ -83,11 +102,16 @@ pub mod prelude {
 }
 
 use std::borrow::Cow;
+use std::path::PathBuf;
+use std::sync::Arc;
 
 use autumn_web::app::AppBuilder;
 use autumn_web::plugin::Plugin;
 
 use crate::config::DEFAULT_ROOM_MAX_PARTICIPANTS;
+use crate::retention::RetentionDefer as RetentionDeferHook;
+use crate::sink::MediaArtifactSink as MediaArtifactSinkTrait;
+use crate::workflows::MediaWorkflowDelegate as MediaWorkflowDelegateHook;
 
 /// The live-streaming media plugin.
 ///
@@ -107,12 +131,23 @@ pub struct MediaPlugin {
     enable_rooms: bool,
     /// Hard cap on mesh-room participants.
     room_max_participants: usize,
-    /// Harvest/job queue name used by media encode work (later slices).
+    /// Job queue name the built-in media encode jobs are registered on.
     queue: String,
     /// URL prefix for the plugin's API routes (later slices).
     api_prefix: String,
-    // slice N: no encode-sink / retention-defer wiring yet — those depend on
-    // types introduced in later slices and are intentionally omitted here.
+    /// App-supplied artifact completion callback (parallels the
+    /// `OutboundWebhookHandler` store).
+    artifact_sink: Option<Arc<dyn MediaArtifactSinkTrait>>,
+    /// Optional runtime delegate that overrides the built-in `#[job]` engine
+    /// (e.g. an external Harvest adapter).
+    workflow_delegate: Option<MediaWorkflowDelegateHook>,
+    /// Retention window override (days). `None` uses `config.recording.retention_days`.
+    retention_days: Option<u32>,
+    /// Filesystem root the retention sweep operates on. `None` disables the
+    /// sweep (there is nothing to sweep without a recordings root).
+    recordings_root: Option<PathBuf>,
+    /// App-overridable retention-defer predicate.
+    retention_defer: Option<RetentionDeferHook>,
 }
 
 impl MediaPlugin {
@@ -128,6 +163,11 @@ impl MediaPlugin {
             room_max_participants: DEFAULT_ROOM_MAX_PARTICIPANTS,
             queue: "media".to_owned(),
             api_prefix: "/api/media".to_owned(),
+            artifact_sink: None,
+            workflow_delegate: None,
+            retention_days: None,
+            recordings_root: None,
+            retention_defer: None,
         }
     }
 
@@ -187,6 +227,52 @@ impl MediaPlugin {
         self.config.ffmpeg.bin = bin.into();
         self
     }
+
+    /// Install the app-supplied [`MediaArtifactSink`](sink::MediaArtifactSink)
+    /// the built-in workflow jobs invoke on completion.
+    ///
+    /// Without a sink, a completed workflow persists its output but logs that
+    /// no sink recorded it (parallels leaving `OutboundWebhookHandler` unset).
+    #[must_use]
+    pub fn artifact_sink(mut self, sink: Arc<dyn MediaArtifactSinkTrait>) -> Self {
+        self.artifact_sink = Some(sink);
+        self
+    }
+
+    /// Install a runtime workflow delegate that overrides the built-in `#[job]`
+    /// engine (e.g. an external Harvest adapter maintained outside this
+    /// workspace). When set, every [`MediaWorkflows`] `queue_*` call routes
+    /// through the delegate instead of enqueuing the built-in job.
+    #[must_use]
+    pub fn workflow_delegate(mut self, delegate: MediaWorkflowDelegateHook) -> Self {
+        self.workflow_delegate = Some(delegate);
+        self
+    }
+
+    /// Override the recording-retention window, in days (`0` disables the
+    /// sweep). Defaults to `config.recording.retention_days`.
+    #[must_use]
+    pub const fn retention_days(mut self, days: u32) -> Self {
+        self.retention_days = Some(days);
+        self
+    }
+
+    /// Set the filesystem root the retention sweep deletes expired recordings
+    /// from. Required to spawn the sweep — without it, no retention loop runs.
+    #[must_use]
+    pub fn recordings_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.recordings_root = Some(root.into());
+        self
+    }
+
+    /// Install the app-overridable retention-defer predicate: return `true` for
+    /// a path to hold it back this sweep (e.g. a still-encoding workflow
+    /// references it).
+    #[must_use]
+    pub fn retention_defer(mut self, defer: RetentionDeferHook) -> Self {
+        self.retention_defer = Some(defer);
+        self
+    }
 }
 
 impl Default for MediaPlugin {
@@ -208,7 +294,14 @@ impl Plugin for MediaPlugin {
             room_max_participants,
             queue,
             api_prefix,
+            artifact_sink,
+            workflow_delegate,
+            retention_days,
+            recordings_root,
+            retention_defer,
         } = self;
+
+        let retention_days = retention_days.unwrap_or(config.recording.retention_days);
 
         tracing::info!(
             broadcast = %enable_broadcast,
@@ -217,22 +310,79 @@ impl Plugin for MediaPlugin {
             storage_backend = config.storage.backend.as_str(),
             queue = %queue,
             api_prefix = %api_prefix,
+            has_artifact_sink = artifact_sink.is_some(),
+            has_workflow_delegate = workflow_delegate.is_some(),
+            retention_days,
             "🍂 Autumn Media configured"
         );
 
-        // slice 1 (storage): insert the resolved MediaProfile / MediaStorage
-        //   extensions and register the recording-retention sweep.
-        // slice 2 (encode): register the FFmpeg encode jobs on `queue`.
-        // slice 3 (transport): the `transport` module (MediaMtxClient + MediaUrls
-        //   + status parsers) now exists and is re-exported, but its AppState
-        //   extension wiring lands with the consumer slice (the broadcast/room
-        //   router) — no consumers yet, so nothing is inserted here.
-        // slice 3+ (rooms): insert the MediaMtxClient / MediaUrls extensions and
+        // Resolve the storage backend up front so a misconfiguration surfaces
+        // as one error line here rather than inside a job. On failure we still
+        // register the (empty) route surface, but install no encode wiring.
+        let storage = match storage::MediaStorage::from_config(&config.storage) {
+            Ok(storage) => storage,
+            Err(error) => {
+                tracing::error!(
+                    %error,
+                    "🍂 Autumn Media: storage config invalid; encode workflows disabled"
+                );
+                return app.declare_plugin_routes(media_route_infos(&api_prefix));
+            }
+        };
+
+        let ffmpeg_bin = config.ffmpeg.bin;
+        let workflows = workflows::MediaWorkflows::new(ffmpeg_bin, queue.clone());
+
+        // slice 3 (transport/rooms): the `transport` module (MediaMtxClient +
+        //   MediaUrls + status parsers) now exists and is re-exported; its
+        //   AppState extension wiring lands with the consumer slice — insert the
+        //   MediaMtxClient / MediaUrls extensions and
         //   nest the broadcast + room routers under `api_prefix`.
         //
-        // Slice 0 declares no routes and installs no extensions; the empty
-        // declaration keeps `autumn routes audit` clean and explicit.
-        app.declare_plugin_routes(media_route_infos(&api_prefix))
+        // Extensions are installed via `state_initializer` (not `on_startup`)
+        // so they exist BEFORE job workers start — mirroring autumn-web's
+        // outbound-webhook plugin, whose manager must be present before the
+        // first job runs.
+        let app = app
+            .declare_plugin_routes(media_route_infos(&api_prefix))
+            .state_initializer(move |state| {
+                state.insert_extension(storage.clone());
+                state.insert_extension(workflows.clone());
+                if let Some(sink) = &artifact_sink {
+                    state.insert_extension(sink::MediaArtifactSinkExt(sink.clone()));
+                }
+                if let Some(delegate) = &workflow_delegate {
+                    state.insert_extension(workflows::MediaWorkflowDelegateExt(delegate.clone()));
+                }
+            })
+            // Register the built-in encode jobs with the queue overridden to
+            // `queue` (the JobInfo's `queue` field, not the `#[job]` literal, is
+            // what the enqueue chokepoint routes on). autumn-web's worker
+            // auto-registers any declared-but-unconfigured queue at lowest
+            // priority, so the media queue drains without extra config.
+            .jobs(workflows::media_job_infos(&queue));
+
+        // Recording-retention sweep: spawn only when a recordings root is
+        // configured and retention is enabled. Spawned from `on_startup` so it
+        // shares the running app's runtime, matching how the thumbnail/retention
+        // loops are spawned in an Autumn app.
+        if let Some(root) = recordings_root {
+            app.on_startup(move |_state| {
+                let root = root.clone();
+                let defer = retention_defer.clone();
+                async move {
+                    retention::spawn_retention_sweep_loop(root, retention_days, defer);
+                    Ok(())
+                }
+            })
+        } else {
+            if retention_days > 0 {
+                tracing::debug!(
+                    "🍂 Autumn Media: retention window set but no recordings_root; sweep not spawned"
+                );
+            }
+            app
+        }
     }
 }
 
