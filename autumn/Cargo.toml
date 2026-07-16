@@ -61,6 +61,27 @@ db = [
 # compile (diesel's sqlite backend and the bundled libsqlite3-sys are
 # already in the graph) — zero new dependencies.
 offline-sync = ["db", "http-client"]
+# SQLite runtime lane (issue #1614). Flips the `db::RuntimeConnection` alias
+# from Postgres (`AsyncPgConnection`) to a SQLite connection
+# (`SyncConnectionWrapper<SqliteConnection>`) for the whole build graph.
+#
+# ⚠️ FEATURE-UNIFICATION HAZARD — READ BEFORE ADDING ANY EDGE ⚠️
+# This feature must ONLY ever be enabled by an END APPLICATION or an explicit
+# `--features sqlite` build invocation. It must NEVER be enabled by an
+# inter-crate dependency edge or a dev-dependency anywhere in the workspace
+# (e.g. `autumn-web = { ..., features = ["sqlite"] }` in autumn-cli /
+# autumn-admin-plugin / autumn-macros / examples/*, or an autumn-web
+# dev-dependency). Cargo feature unification is global: a single such edge
+# flips `RuntimeConnection` to SQLite for EVERY consumer in the graph and
+# breaks the Postgres default build. Feature-on testing is done via explicit
+# `cargo build -p autumn-web --features sqlite` invocations only.
+#
+# PR1 is a no-op refactor: enabling it switches the connection *type alias* but
+# the SQLite pool CONSTRUCTION stays refused at runtime
+# (`PoolError::UnsupportedBackend`); a working pool is PR2. Needs no extra deps
+# — diesel's sqlite backend and diesel-async's sync-connection-wrapper are
+# already in the graph.
+sqlite = ["diesel/sqlite", "diesel-async/sync-connection-wrapper"]
 test-support = ["dep:testcontainers", "dep:testcontainers-modules"]
 telemetry-otlp = [
     "dep:opentelemetry",
