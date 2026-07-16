@@ -51,7 +51,7 @@ jobs:
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-fuzz
-      - uses: Swatinem/rust-cache@v2.7.8
+      - uses: Swatinem/rust-cache@v2
         with:
           workspaces: fuzz
       # Restore the accumulated corpus for THIS target from the previous run.

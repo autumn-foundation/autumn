@@ -45,7 +45,7 @@ jobs:
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-fuzz
-      - uses: Swatinem/rust-cache@v2.7.8
+      - uses: Swatinem/rust-cache@v2
         with:
           workspaces: fuzz
       - name: Fuzz ${{ matrix.target }} (30s burst, seeded from committed corpus)

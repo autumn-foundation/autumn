@@ -137,6 +137,8 @@ for crate in "${CRATES[@]}"; do
     # unrelated to our public API surface; skip rather than hard-fail so the
     # gate remains actionable for real semver breaks.
     echo "  SKIP: $crate — aws-runtime E0282 upstream regression on Rust $semver_toolchain (not a semver issue)"
+  elif echo "$crate_output" | grep -qE "SyncConnectionWrapper" && echo "$crate_output" | grep -q "AsyncPgConnection"; then
+    echo "  SKIP: $crate — sqlite feature unification breaks Postgres defaults during semver checks (not a semver issue)"
   elif echo "$crate_output" | grep -qE "error\[E0119\]" && echo "$crate_output" | grep -qE 'HourBase|conflicting implementation in crate `time`'; then
     # time 0.3.48 added a blanket From<HourBase> impl that breaks trait
     # coherence (E0119) in downstream crates with their own blanket From

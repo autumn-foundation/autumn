@@ -23,7 +23,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2.7.8
+      - uses: Swatinem/rust-cache@v2
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Clippy
@@ -79,7 +79,7 @@ jobs:
           sudo docker image prune --all --force || true
           df -h
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2.7.8
+      - uses: Swatinem/rust-cache@v2
         continue-on-error: true
       - name: Run tests
         run: cargo test --workspace
@@ -188,7 +188,7 @@ jobs:
           sudo docker image prune --all --force || true
           df -h
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2.7.8
+      - uses: Swatinem/rust-cache@v2
       - name: Install cargo-llvm-cov
         # Pin @v2 and pass the tool explicitly. The bare @cargo-llvm-cov tag form can
         # resolve with an empty tool input and install nothing (broke the Fuzz
@@ -234,7 +234,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.88.0
-      - uses: Swatinem/rust-cache@v2.7.8
+      - uses: Swatinem/rust-cache@v2
       - name: Check MSRV alignment
         run: ./scripts/check-msrv.sh
       - name: Check MSRV compiles
@@ -255,7 +255,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2.7.8
+      - uses: Swatinem/rust-cache@v2
       - name: Run loom model checks
         run: cargo test -p autumn-web --release --test loom_models
         env:

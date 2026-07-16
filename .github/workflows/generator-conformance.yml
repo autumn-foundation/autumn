@@ -101,7 +101,7 @@ jobs:
         with:
           toolchain: ${{ matrix.toolchain }}
 
-      - uses: Swatinem/rust-cache@v2.7.8
+      - uses: Swatinem/rust-cache@v2
         continue-on-error: true
 
       - name: generated_project_compiles_runs_and_serves
@@ -225,7 +225,7 @@ jobs:
         with:
           toolchain: ${{ matrix.toolchain }}
 
-      - uses: Swatinem/rust-cache@v2.7.8
+      - uses: Swatinem/rust-cache@v2
         continue-on-error: true
 
       - name: Pre-fetch TOTP deps (absent from workspace Cargo.lock)
@@ -283,7 +283,7 @@ jobs:
         with:
           toolchain: ${{ matrix.toolchain }}
 
-      - uses: Swatinem/rust-cache@v2.7.8
+      - uses: Swatinem/rust-cache@v2
         continue-on-error: true
 
       - name: Install diesel_cli
