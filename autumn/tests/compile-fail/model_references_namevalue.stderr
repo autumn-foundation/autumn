@@ -1,0 +1,5 @@
+error: `#[references]` must be a bare attribute or have the form `#[references(table = "...")]`
+  --> tests/compile-fail/model_references_namevalue.rs:11:5
+   |
+11 |     #[references = "accounts"]
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^

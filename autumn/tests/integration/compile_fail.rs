@@ -39,6 +39,20 @@ fn compile_fail_tests() {
     #[cfg(feature = "db")]
     t.compile_fail("tests/compile-fail/model_m2m_helper_collision.rs");
 
+    // Declarative-schema markers (#1975, slice 3.5): the `#[model]` macro
+    // ACCEPTS `#[model(managed)]` / `#[unique]` / `#[references(...)]` but
+    // rejects malformed shapes with a clear, actionable `compile_error!`.
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/model_bogus_arg.rs");
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/model_managed_with_args.rs");
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/model_unique_with_args.rs");
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/model_references_bad_key.rs");
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/model_references_namevalue.rs");
+
     // #1911: `#[state_machine(lifecycle = T)]` where `T` is not a `#[lifecycle]`
     // enum fails with an unsatisfied `T: Lifecycle` trait bound.
     #[cfg(feature = "db")]
@@ -124,6 +138,12 @@ fn compile_pass_tests() {
     // Model derive (requires db feature)
     #[cfg(feature = "db")]
     t.pass("tests/compile-pass/model_derive.rs");
+
+    // Declarative-schema markers (#1975, slice 3.5): `#[model(managed)]`,
+    // `#[unique]`, and `#[references(...)]` are accepted, validated, and
+    // stripped — the model still generates its normal write types.
+    #[cfg(feature = "db")]
+    t.pass("tests/compile-pass/model_schema_markers.rs");
 
     // Model field enum (requires db feature)
     #[cfg(feature = "db")]
