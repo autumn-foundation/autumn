@@ -13,12 +13,24 @@ categories = ["web-programming", "multimedia"]
 
 [dependencies]
 autumn-web = { version = "0.6.0", path = "../autumn" }
+chrono = { workspace = true }
 percent-encoding = "2"
 serde = { workspace = true }
+serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 toml = { workspace = true }
 tracing = { workspace = true }
+
+# ── HTTP client (MediaMTX control API + recorded-VOD availability probe) ──────
+# Production MediaMTX origins can be https (Fly), so TLS is required. This pin
+# matches the `autumn` crate's own reqwest pin (0.12, default-features off,
+# json + rustls-tls) so the workspace resolves a SINGLE rustls crypto backend
+# (aws-lc-rs, shared with the aws-sdk-s3 default-https-client stack) — no
+# ring/native-tls second backend is pulled in. Added directly to this crate
+# (not hoisted to [workspace.dependencies]), matching the slice-1 aws-deps
+# precedent.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 # ── AWS SDK (S3 media storage) ────────────────────────────────────────────────
 # These pins are copied VERBATIM from autumn-storage-s3/Cargo.toml. They are

@@ -41,6 +41,7 @@ pub mod config;
 pub mod encode;
 pub mod error;
 pub mod storage;
+pub mod transport;
 
 pub use config::{
     MediaConfig, MediaConfigError, MediaMtxConfig, MediaStorageBackend, MediaStorageConfig,
@@ -55,6 +56,12 @@ pub use encode::{
 };
 pub use error::MediaError;
 pub use storage::{MediaStorage, S3MediaStorage, StoredObject};
+pub use transport::{
+    IngestStatus, MediaMtxClient, MediaUrls, StreamQualityStats, StreamStatus, ViewerCount,
+    duration_seconds_param, ingest_statuses_from_paths_json, quality_stats_from_path_json,
+    recording_available, recording_mediamtx_path, stream_status_from_path_json,
+    viewer_count_from_path_json, viewer_counts_from_paths_json,
+};
 
 /// Common downstream imports for configuring and mounting the media plugin.
 pub mod prelude {
@@ -66,6 +73,12 @@ pub mod prelude {
         PREVIEW_SPRITE_COLUMNS, RecordingConfig, S3MediaStorage, StoredObject,
         build_preview_webvtt, newest_recording_file, newest_recording_files,
         newest_recording_files_since, recording_segments_covering_window, slugify,
+    };
+    pub use crate::{
+        IngestStatus, MediaMtxClient, MediaUrls, StreamQualityStats, StreamStatus, ViewerCount,
+        duration_seconds_param, ingest_statuses_from_paths_json, quality_stats_from_path_json,
+        recording_available, recording_mediamtx_path, stream_status_from_path_json,
+        viewer_count_from_path_json, viewer_counts_from_paths_json,
     };
 }
 
@@ -210,7 +223,11 @@ impl Plugin for MediaPlugin {
         // slice 1 (storage): insert the resolved MediaProfile / MediaStorage
         //   extensions and register the recording-retention sweep.
         // slice 2 (encode): register the FFmpeg encode jobs on `queue`.
-        // slice 3 (transport/rooms): insert the MediaMtxClient extension and
+        // slice 3 (transport): the `transport` module (MediaMtxClient + MediaUrls
+        //   + status parsers) now exists and is re-exported, but its AppState
+        //   extension wiring lands with the consumer slice (the broadcast/room
+        //   router) — no consumers yet, so nothing is inserted here.
+        // slice 3+ (rooms): insert the MediaMtxClient / MediaUrls extensions and
         //   nest the broadcast + room routers under `api_prefix`.
         //
         // Slice 0 declares no routes and installs no extensions; the empty
