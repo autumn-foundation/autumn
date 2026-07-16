@@ -49,7 +49,7 @@
 //! 12-step table-rebuild that slice 5 owns, so those return
 //! [`EmitError::UnsupportedOnBackend`] here.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
 use autumn_schema_core::{
@@ -196,6 +196,23 @@ pub enum SchemaChange {
         /// The table whose primary key changed.
         table: String,
     },
+
+    /// A same-named column whose **existing** explicit foreign key changed target
+    /// (e.g. `author_id` from `users(id)` to `accounts(id)`). A non-emittable
+    /// marker: [`guard_plan`] refuses any plan containing it (with no override).
+    ///
+    /// It exists because a conservative engine cannot safely retarget an FK: it
+    /// has no `DropForeignKey` variant to remove the baseline constraint (whose
+    /// name is PG's default `<table>_<column>_fkey`), so blindly emitting an
+    /// `AddForeignKey` would collide on that constraint name and the migration
+    /// would fail. Retargeting an FK is deferred (a later slice can drop+recreate
+    /// once it can observe FK constraints reliably); until then it is refused.
+    ForeignKeyChange {
+        /// The owning table name.
+        table: String,
+        /// The column whose FK target changed.
+        column: String,
+    },
 }
 
 /// Diff policy knobs.
@@ -248,6 +265,22 @@ pub enum DiffError {
         /// The table whose primary key changed.
         table: String,
     },
+
+    /// An existing explicit foreign key changed its target (unsupported this
+    /// slice, no override — see [`SchemaChange::ForeignKeyChange`]).
+    #[error(
+        "foreign-key retarget on `{table}.{column}` is not supported in this slice: \
+         the baseline already has a foreign key on this column, and this engine has no \
+         way to drop it before adding the new one without colliding on the \
+         `{table}_{column}_fkey` constraint name. Retargeting a foreign key is deferred \
+         to a later slice."
+    )]
+    ForeignKeyChange {
+        /// The owning table name.
+        table: String,
+        /// The column whose FK target changed.
+        column: String,
+    },
 }
 
 /// A single destructive operation, for [`DiffError::Destructive`] inspection.
@@ -275,6 +308,21 @@ pub enum EmitError {
         kind: &'static str,
         /// The backend it could not be rendered on.
         backend: Backend,
+    },
+
+    /// Two or more newly-created tables reference each other through inline
+    /// foreign keys, so no `CREATE TABLE` order satisfies all of them. Inline
+    /// `REFERENCES` cannot express a cycle (it needs a deferred `ALTER TABLE ADD
+    /// CONSTRAINT` after all the `CREATE`s, deferred to a later slice), so this
+    /// slice refuses rather than emitting a migration that cannot apply.
+    #[error(
+        "cannot order the new tables for creation: a foreign-key dependency cycle exists among \
+         [{}]. Inline-FK cycles are not supported in this slice.",
+        .tables.join(", ")
+    )]
+    CyclicTableDependencies {
+        /// The tables participating in the cycle (sorted, for a stable message).
+        tables: Vec<String>,
     },
 }
 
@@ -426,16 +474,30 @@ fn diff_column(table: &str, base: &Column, want: &Column, changes: &mut Vec<Sche
         });
     }
 
-    // Rule B: only emit the *add* direction. A desired `None` is "unknown,
+    // Rule B: only emit the *add* direction, and only for a column that did not
+    // already have an explicit foreign key. A desired `None` is "unknown,
     // retained" — never a DropForeignKey.
-    if let Some(fk) = &want.references
-        && base.references.as_ref() != Some(fk)
-    {
-        changes.push(SchemaChange::AddForeignKey {
-            table: table.to_owned(),
-            column: want.name.clone(),
-            foreign_key: fk.clone(),
-        });
+    //
+    // The three sub-cases when the desired side has an explicit FK:
+    //   * baseline had none            → a genuinely-new FK  → `AddForeignKey`.
+    //   * baseline had the same FK     → no change.
+    //   * baseline had a *different* FK → a retarget we cannot safely emit
+    //     (there is no `DropForeignKey`, and re-`ADD CONSTRAINT`-ing the default
+    //     `<table>_<column>_fkey` name would collide) → the refused
+    //     `ForeignKeyChange` marker, mirroring `PrimaryKeyChange`.
+    if let Some(fk) = &want.references {
+        match &base.references {
+            None => changes.push(SchemaChange::AddForeignKey {
+                table: table.to_owned(),
+                column: want.name.clone(),
+                foreign_key: fk.clone(),
+            }),
+            Some(existing) if existing == fk => {}
+            Some(_) => changes.push(SchemaChange::ForeignKeyChange {
+                table: table.to_owned(),
+                column: want.name.clone(),
+            }),
+        }
     }
 }
 
@@ -523,9 +585,10 @@ fn plan_backend(baseline: &[Table], desired: &ParsedSchema) -> Backend {
 /// structurally computable but unsafe to emit unless permitted.
 ///
 /// Guard order (most specific / most dangerous first, so the user sees the most
-/// actionable message): **`PrimaryKeyChange` → `PossibleRename` → `Destructive`**.
-/// `--allow-destructive` overrides the rename and destructive tiers; a
-/// primary-key change has no override.
+/// actionable message): **`PrimaryKeyChange` → `ForeignKeyChange` →
+/// `PossibleRename` → `Destructive`**. `--allow-destructive` overrides the rename
+/// and destructive tiers; a primary-key change and a foreign-key retarget have no
+/// override.
 ///
 /// # Errors
 ///
@@ -540,11 +603,19 @@ pub fn guard_plan(plan: &MigrationPlan, opts: DiffOptions) -> Result<(), DiffErr
         return Err(DiffError::PrimaryKeyChange { table });
     }
 
+    // 2. Foreign-key retarget — no override (there is no safe drop+recreate).
+    if let Some((table, column)) = plan.changes.iter().find_map(|c| match c {
+        SchemaChange::ForeignKeyChange { table, column } => Some((table.clone(), column.clone())),
+        _ => None,
+    }) {
+        return Err(DiffError::ForeignKeyChange { table, column });
+    }
+
     if opts.allow_destructive {
         return Ok(());
     }
 
-    // 2. Possible rename — a single table that both dropped and added columns.
+    // 3. Possible rename — a single table that both dropped and added columns.
     //    Grouped in a BTreeMap so the reported table is deterministic (sorted).
     let mut per_table: BTreeMap<String, (Vec<String>, Vec<String>)> = BTreeMap::new();
     for change in &plan.changes {
@@ -577,7 +648,7 @@ pub fn guard_plan(plan: &MigrationPlan, opts: DiffOptions) -> Result<(), DiffErr
         });
     }
 
-    // 3. Destructive drops.
+    // 4. Destructive drops.
     let destructive_ops: Vec<DestructiveOp> = plan
         .changes
         .iter()
@@ -622,7 +693,7 @@ pub fn guard_plan(plan: &MigrationPlan, opts: DiffOptions) -> Result<(), DiffErr
 /// Returns [`EmitError::UnsupportedOnBackend`] for an `ALTER`-family change on
 /// `SQLite` (slice 5 owns the `SQLite` table-rebuild path).
 pub fn emit_up_sql(plan: &MigrationPlan) -> Result<String, EmitError> {
-    let ordered = up_ordered(&plan.changes);
+    let ordered = up_ordered(&plan.changes)?;
     let mut groups = Vec::new();
     for change in ordered {
         let sql = emit_change_up(change, plan.backend)?;
@@ -642,7 +713,7 @@ pub fn emit_up_sql(plan: &MigrationPlan) -> Result<String, EmitError> {
 /// Returns [`EmitError::UnsupportedOnBackend`] for an `ALTER`-family change on
 /// `SQLite`.
 pub fn emit_down_sql(plan: &MigrationPlan) -> Result<String, EmitError> {
-    let mut ordered = up_ordered(&plan.changes);
+    let mut ordered = up_ordered(&plan.changes)?;
     ordered.reverse();
     let mut groups = Vec::new();
     for change in ordered {
@@ -668,10 +739,143 @@ fn join_groups(groups: &[String]) -> String {
 
 /// Order the changes into the canonical up-buckets (a valid dependency order),
 /// stable within a bucket (`diff_schema` already emits a deterministic order).
-fn up_ordered(changes: &[SchemaChange]) -> Vec<&SchemaChange> {
-    let mut ordered: Vec<&SchemaChange> = changes.iter().collect();
-    ordered.sort_by_key(|c| up_bucket(c));
-    ordered
+///
+/// Two orderings need context the plain per-change bucket cannot provide, so they
+/// are handled here rather than in [`up_bucket`]:
+///
+/// * **New-table FK dependencies** — `CREATE TABLE`s are **topologically** sorted
+///   so a table referenced by an inline `REFERENCES` is created before the table
+///   that references it (a cycle is [`EmitError::CyclicTableDependencies`]).
+/// * **Replaced indexes** — a same-named index that is both dropped and re-added
+///   (a shape change) must `DROP INDEX` **before** the `CREATE INDEX`, else the
+///   create collides with the still-existing old index; such a "replacement drop"
+///   is ordered just before the `AddIndex` bucket instead of in the general
+///   `DropIndex` bucket.
+///
+/// # Errors
+///
+/// Returns [`EmitError::CyclicTableDependencies`] when the new tables reference
+/// each other in a cycle that inline foreign keys cannot express.
+fn up_ordered(changes: &[SchemaChange]) -> Result<Vec<&SchemaChange>, EmitError> {
+    let replaced = replaced_index_names(changes);
+
+    // `CreateTable`s are the first bucket; order them topologically so referenced
+    // tables precede their referencers.
+    let mut creates: Vec<&SchemaChange> = changes
+        .iter()
+        .filter(|c| matches!(c, SchemaChange::CreateTable(_)))
+        .collect();
+    topo_sort_creates(&mut creates)?;
+
+    // Everything else keeps its bucket order; the replacement-drop key threads
+    // through so a replaced index drops before its re-add.
+    let mut rest: Vec<&SchemaChange> = changes
+        .iter()
+        .filter(|c| !matches!(c, SchemaChange::CreateTable(_)))
+        .collect();
+    rest.sort_by_key(|c| up_sort_key(c, &replaced));
+
+    let mut ordered = creates;
+    ordered.extend(rest);
+    Ok(ordered)
+}
+
+/// The set of index names that appear in **both** an `AddIndex` and a `DropIndex`
+/// in the same plan — i.e. a same-named index whose shape changed
+/// ([`diff_indexes`] emits it as a drop + a re-add). Such a drop must precede its
+/// re-add in `up.sql`.
+fn replaced_index_names(changes: &[SchemaChange]) -> BTreeSet<String> {
+    let added: BTreeSet<&str> = changes
+        .iter()
+        .filter_map(|c| match c {
+            SchemaChange::AddIndex { index, .. } => Some(index.name.as_str()),
+            _ => None,
+        })
+        .collect();
+    changes
+        .iter()
+        .filter_map(|c| match c {
+            SchemaChange::DropIndex { index, .. } if added.contains(index.name.as_str()) => {
+                Some(index.name.clone())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// The up-order sort key for a non-`CreateTable` change. A two-level key so a
+/// **replacement** `DropIndex` (its name is also re-added) sorts *just before* the
+/// `AddIndex` bucket while every other change keeps its plain bucket.
+fn up_sort_key(change: &SchemaChange, replaced: &BTreeSet<String>) -> (u8, u8) {
+    match change {
+        // Replacement drop: same bucket as AddIndex, but ordered before it.
+        SchemaChange::DropIndex { index, .. } if replaced.contains(&index.name) => (3, 0),
+        SchemaChange::AddIndex { .. } => (3, 1),
+        other => (up_bucket(other), 1),
+    }
+}
+
+/// Topologically order `creates` (all `CreateTable` changes) so a table referenced
+/// by another's inline `REFERENCES` is created first. Only intra-batch
+/// dependencies matter — a reference to a pre-existing baseline table imposes no
+/// ordering. Deterministic (Kahn's algorithm, always taking the
+/// lexicographically-smallest ready table).
+///
+/// # Errors
+///
+/// Returns [`EmitError::CyclicTableDependencies`] if the new tables form a
+/// reference cycle (inline foreign keys cannot express one).
+fn topo_sort_creates(creates: &mut [&SchemaChange]) -> Result<(), EmitError> {
+    if creates.len() < 2 {
+        return Ok(());
+    }
+    let tables: BTreeMap<&str, &Table> = creates
+        .iter()
+        .filter_map(|c| match c {
+            SchemaChange::CreateTable(t) => Some((t.name.as_str(), t)),
+            _ => None,
+        })
+        .collect();
+    let names: BTreeSet<&str> = tables.keys().copied().collect();
+
+    // deps[name] = the in-batch tables `name` references (must be created first).
+    let mut deps: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+    for (&name, table) in &tables {
+        let mut d = BTreeSet::new();
+        for col in &table.columns {
+            if let Some(fk) = &col.references {
+                let target = fk.table.as_str();
+                if target != name && names.contains(target) {
+                    d.insert(target);
+                }
+            }
+        }
+        deps.insert(name, d);
+    }
+
+    // Kahn: repeatedly place the smallest name whose deps are all already placed.
+    let mut remaining: BTreeSet<&str> = names;
+    let mut order: BTreeMap<&str, usize> = BTreeMap::new();
+    while !remaining.is_empty() {
+        let ready = remaining
+            .iter()
+            .copied()
+            .find(|n| deps[n].iter().all(|d| !remaining.contains(d)));
+        if let Some(n) = ready {
+            order.insert(n, order.len());
+            remaining.remove(n);
+        } else {
+            let mut cyc: Vec<String> = remaining.iter().map(|s| (*s).to_owned()).collect();
+            cyc.sort();
+            return Err(EmitError::CyclicTableDependencies { tables: cyc });
+        }
+    }
+
+    creates.sort_by_key(|c| match c {
+        SchemaChange::CreateTable(t) => order.get(t.name.as_str()).copied().unwrap_or(usize::MAX),
+        _ => usize::MAX,
+    });
+    Ok(())
 }
 
 /// The canonical up-order bucket for a change (lower = earlier).
@@ -688,8 +892,8 @@ const fn up_bucket(change: &SchemaChange) -> u8 {
         SchemaChange::DropIndex { .. } => 5,
         SchemaChange::DropColumn { .. } => 6,
         SchemaChange::DropTable(_) => 7,
-        // Non-emittable marker; guard refuses it before emission is reached.
-        SchemaChange::PrimaryKeyChange { .. } => 9,
+        // Non-emittable markers; the guard refuses them before emission is reached.
+        SchemaChange::PrimaryKeyChange { .. } | SchemaChange::ForeignKeyChange { .. } => 9,
     }
 }
 
@@ -760,9 +964,11 @@ fn emit_change_up(change: &SchemaChange, backend: Backend) -> Result<String, Emi
                 foreign_key.table, foreign_key.column
             ))
         }
-        // Non-emittable marker: guard refuses it, so it never reaches here in the
-        // command flow. Render nothing defensively rather than panicking.
-        SchemaChange::PrimaryKeyChange { .. } => Ok(String::new()),
+        // Non-emittable markers: the guard refuses them, so they never reach here
+        // in the command flow. Render nothing defensively rather than panicking.
+        SchemaChange::PrimaryKeyChange { .. } | SchemaChange::ForeignKeyChange { .. } => {
+            Ok(String::new())
+        }
     }
 }
 
@@ -841,7 +1047,9 @@ fn emit_change_down(change: &SchemaChange, backend: Backend) -> Result<String, E
         SchemaChange::AddForeignKey { table, column, .. } => Ok(format!(
             "ALTER TABLE {table} DROP CONSTRAINT {table}_{column}_fkey;\n"
         )),
-        SchemaChange::PrimaryKeyChange { .. } => Ok(String::new()),
+        SchemaChange::PrimaryKeyChange { .. } | SchemaChange::ForeignKeyChange { .. } => {
+            Ok(String::new())
+        }
     }
 }
 
@@ -906,8 +1114,16 @@ fn emit_create_table(table: &Table, backend: Backend) -> String {
 }
 
 /// Render an `ALTER TABLE … ADD COLUMN`, mirroring the generator's house
-/// conventions (the `-- autumn-safety` comment for a `NOT NULL`-without-default
-/// column, and the auto-index for a non-unique `references` column).
+/// convention for the `-- autumn-safety` comment on a `NOT NULL`-without-default
+/// column.
+///
+/// **Index ownership:** this renderer emits **only** the column, never a
+/// `CREATE INDEX`. A reference column's auto-index (`idx_<table>_<column>`) is
+/// folded into the parser's table index set, so it arrives as its own
+/// [`SchemaChange::AddIndex`] and is rendered by [`index_sql`] exactly once. If
+/// `ADD COLUMN` also rendered the index inline it would be created twice and the
+/// migration would fail. `diff_indexes`/`AddIndex` (and, for a brand-new table,
+/// [`emit_create_table`]) is the single owner of index creation.
 fn emit_add_column(table: &str, column: &Column, backend: Backend) -> Result<String, EmitError> {
     // `SQLite` rejects `ADD COLUMN … NOT NULL` without a DEFAULT — a slice-5 concern.
     if backend == Backend::Sqlite && !column.nullable && column.default.is_none() {
@@ -929,14 +1145,6 @@ fn emit_add_column(table: &str, column: &Column, backend: Backend) -> Result<Str
         "ALTER TABLE {table} ADD COLUMN {};",
         render_column_def(column, backend)
     );
-    // Mirror the generator's auto-index for a plain (non-unique) reference column.
-    if column.references.is_some() && !column.unique {
-        let _ = writeln!(
-            out,
-            "CREATE INDEX idx_{table}_{0} ON {table} ({0});",
-            column.name
-        );
-    }
     Ok(out)
 }
 
@@ -1083,6 +1291,9 @@ fn describe_change(change: &SchemaChange) -> String {
         SchemaChange::PrimaryKeyChange { table } => {
             format!("! PRIMARY KEY CHANGE on {table} (refused)")
         }
+        SchemaChange::ForeignKeyChange { table, column } => {
+            format!("! FOREIGN KEY RETARGET on {table}.{column} (refused)")
+        }
     }
 }
 
@@ -1108,6 +1319,18 @@ mod tests {
         t.primary_key.push("id".to_owned());
         t.columns.push(id);
         t.columns.extend(columns);
+        t
+    }
+
+    /// A managed table `name` with a `BigSerial` `id` PK plus one extra column
+    /// (used to build cross-referencing new tables in the topo-order tests).
+    fn posts_ref_table(name: &str, extra: Column) -> Table {
+        let mut t = Table::new(name, Backend::Postgres);
+        let mut id = col("id", ColumnType::Int64);
+        id.primary_key = true;
+        t.primary_key.push("id".to_owned());
+        t.columns.push(id);
+        t.columns.push(extra);
         t
     }
 
@@ -1460,6 +1683,71 @@ mod tests {
         );
     }
 
+    #[test]
+    fn fk_retarget_is_a_refused_marker_not_a_duplicate_add() {
+        // Regression (finding 1): baseline `author_id` already has an explicit FK
+        // to users(id); desired retargets it to accounts(id). Emitting a plain
+        // `AddForeignKey` would `ADD CONSTRAINT posts_author_id_fkey` a second
+        // time and collide with the baseline constraint of the same name. The diff
+        // must instead surface the refused `ForeignKeyChange` marker (never an
+        // `AddForeignKey`).
+        let mut base_author = col("author_id", ColumnType::Int64);
+        base_author.references = Some(ForeignKey::new("users", "id"));
+        let base = vec![posts_with(vec![base_author])];
+
+        let mut want_author = col("author_id", ColumnType::Int64);
+        want_author.references = Some(ForeignKey::new("accounts", "id"));
+        let want = parsed(vec![posts_with(vec![want_author])], vec![]);
+
+        let plan = diff_schema(&base, &want, DEFAULT_OPTS);
+        assert_eq!(
+            plan.changes,
+            vec![SchemaChange::ForeignKeyChange {
+                table: "posts".to_owned(),
+                column: "author_id".to_owned(),
+            }],
+            "an FK retarget is the refused marker, not an AddForeignKey: {plan:?}"
+        );
+        assert!(
+            !plan
+                .changes
+                .iter()
+                .any(|c| matches!(c, SchemaChange::AddForeignKey { .. })),
+            "must never emit a duplicate AddForeignKey on retarget"
+        );
+
+        // The guard refuses it — with no override, like a PK change.
+        let err = guard_plan(&plan, DEFAULT_OPTS).unwrap_err();
+        assert!(
+            matches!(err, DiffError::ForeignKeyChange { .. }),
+            "guard refuses the retarget: {err:?}"
+        );
+        assert!(
+            err.to_string().contains("posts_author_id_fkey"),
+            "the error explains the constraint-name collision: {err}"
+        );
+        // --allow-destructive does NOT override it (no safe drop+recreate).
+        assert!(matches!(
+            guard_plan(&plan, ALLOW).unwrap_err(),
+            DiffError::ForeignKeyChange { .. }
+        ));
+    }
+
+    #[test]
+    fn fk_unchanged_target_is_no_change() {
+        // Same explicit FK on both sides → nothing to do (not a retarget marker).
+        let mut base_author = col("author_id", ColumnType::Int64);
+        base_author.references = Some(ForeignKey::new("users", "id"));
+        let mut want_author = col("author_id", ColumnType::Int64);
+        want_author.references = Some(ForeignKey::new("users", "id"));
+        let plan = diff_schema(
+            &[posts_with(vec![base_author])],
+            &parsed(vec![posts_with(vec![want_author])], vec![]),
+            DEFAULT_OPTS,
+        );
+        assert!(plan.is_empty(), "unchanged FK → empty plan: {plan:?}");
+    }
+
     // -- 13.3 guards ---------------------------------------------------------
 
     fn drop_column_plan() -> MigrationPlan {
@@ -1726,7 +2014,12 @@ mod tests {
     }
 
     #[test]
-    fn add_reference_column_emits_auto_index() {
+    fn add_column_renders_only_the_column_not_the_index() {
+        // The `AddColumn` renderer is NOT the index owner: a lone `AddColumn` for a
+        // reference column emits the column + its FK clause but no `CREATE INDEX`.
+        // The reference auto-index arrives as a separate `AddIndex` (see
+        // `add_reference_column_emits_index_exactly_once`), so rendering it inline
+        // here would double it and the migration would fail.
         let mut author = col("author_id", ColumnType::Int64);
         author.nullable = true;
         author.references = Some(ForeignKey::new("users", "id"));
@@ -1740,8 +2033,39 @@ mod tests {
         let up = emit_up_sql(&plan).expect("emit");
         assert!(up.contains("REFERENCES users(id)"), "fk clause: {up}");
         assert!(
-            up.contains("CREATE INDEX idx_posts_author_id ON posts (author_id);"),
-            "auto-index: {up}"
+            !up.contains("CREATE INDEX"),
+            "the reference index is a separate AddIndex change, not inline: {up}"
+        );
+    }
+
+    #[test]
+    fn add_reference_column_emits_index_exactly_once() {
+        // Regression (finding 2): the slice-2 parser folds `idx_<t>_<c>` into
+        // `table.indexes` AND the column carries `references`. Diffing a new
+        // reference column onto an existing table therefore yields both an
+        // `AddColumn` and an `AddIndex` for that index — the emitted up.sql must
+        // contain the `CREATE INDEX` exactly once, never a duplicate.
+        let base = vec![posts_with(vec![])];
+        let mut author = col("author_id", ColumnType::Int64);
+        author.nullable = true;
+        author.references = Some(ForeignKey::new("users", "id"));
+        let mut want_table = posts_with(vec![author]);
+        want_table.indexes.push(Index {
+            name: "idx_posts_author_id".to_owned(),
+            columns: vec!["author_id".to_owned()],
+            unique: false,
+        });
+        let plan = diff_schema(&base, &parsed(vec![want_table], vec![]), DEFAULT_OPTS);
+        let up = emit_up_sql(&plan).expect("emit");
+        assert_eq!(
+            up.matches("CREATE INDEX idx_posts_author_id").count(),
+            1,
+            "the reference index must be emitted exactly once: {up}"
+        );
+        // And the column itself is still added.
+        assert!(
+            up.contains("ALTER TABLE posts ADD COLUMN author_id BIGINT NULL REFERENCES users(id);"),
+            "the column is still added: {up}"
         );
     }
 
@@ -1844,6 +2168,146 @@ mod tests {
         assert!(add < index, "add before index");
         assert!(index < drop_col, "index before drop col");
         assert!(drop_col < drop_table, "drop col before drop table");
+    }
+
+    #[test]
+    fn replaced_index_drops_before_add_in_up_and_inverts_in_down() {
+        // Regression (finding 3): a same-named index whose shape changed becomes a
+        // DropIndex(old) + AddIndex(new). In up.sql the DROP must precede the
+        // CREATE (same name) or PG rejects the create; in down.sql the inverse
+        // must drop the new before recreating the old.
+        let old = Index {
+            name: "idx_posts_slug".to_owned(),
+            columns: vec!["slug".to_owned()],
+            unique: false,
+        };
+        let new = Index {
+            name: "idx_posts_slug".to_owned(),
+            columns: vec!["slug".to_owned()],
+            unique: true,
+        };
+        let mut base_table = posts_with(vec![col("slug", ColumnType::Text)]);
+        base_table.indexes.push(old);
+        let mut want_table = posts_with(vec![col("slug", ColumnType::Text)]);
+        want_table.indexes.push(new);
+
+        let plan = diff_schema(
+            &[base_table],
+            &parsed(vec![want_table], vec![]),
+            DEFAULT_OPTS,
+        );
+        // Sanity: it really is a drop+add of the same name.
+        assert_eq!(plan.changes.len(), 2, "drop+add of the same name: {plan:?}");
+
+        let up = emit_up_sql(&plan).expect("emit");
+        let drop = up
+            .find("DROP INDEX idx_posts_slug;")
+            .expect("up drop present");
+        let create = up
+            .find("CREATE UNIQUE INDEX idx_posts_slug")
+            .expect("up create present");
+        assert!(
+            drop < create,
+            "DROP must precede CREATE for a replaced index: {up}"
+        );
+
+        let down = emit_down_sql(&plan).expect("emit");
+        let d_drop = down
+            .find("DROP INDEX idx_posts_slug;")
+            .expect("down drop present");
+        let d_create = down
+            .find("CREATE INDEX idx_posts_slug ON posts (slug);")
+            .expect("down recreate (old, non-unique) present");
+        assert!(
+            d_drop < d_create,
+            "down: drop the new before recreating the old: {down}"
+        );
+    }
+
+    #[test]
+    fn unrelated_drop_index_still_after_add_index() {
+        // A DropIndex whose name is NOT re-added keeps the general (late) drop
+        // bucket, so an unrelated add still renders before it.
+        let plan = MigrationPlan {
+            backend: Backend::Postgres,
+            changes: vec![
+                SchemaChange::DropIndex {
+                    table: "posts".to_owned(),
+                    index: Index {
+                        name: "idx_posts_old".to_owned(),
+                        columns: vec!["old".to_owned()],
+                        unique: false,
+                    },
+                },
+                SchemaChange::AddIndex {
+                    table: "posts".to_owned(),
+                    index: Index {
+                        name: "idx_posts_new".to_owned(),
+                        columns: vec!["new".to_owned()],
+                        unique: false,
+                    },
+                },
+            ],
+        };
+        let up = emit_up_sql(&plan).expect("emit");
+        let add = up.find("CREATE INDEX idx_posts_new").expect("add present");
+        let drop = up.find("DROP INDEX idx_posts_old;").expect("drop present");
+        assert!(
+            add < drop,
+            "an unrelated add still precedes an unrelated drop: {up}"
+        );
+    }
+
+    #[test]
+    fn create_tables_topologically_ordered_by_fk() {
+        // Regression (finding 4): two new managed tables where `comments`
+        // references `posts`. Lexically `comments` < `posts`, so a naive sort
+        // would CREATE comments (REFERENCES posts) before posts exists → invalid.
+        // The referenced table must be created first, and dropped last.
+        let posts = posts_with(vec![col("body", ColumnType::Text)]);
+        let mut post_ref = col("post_id", ColumnType::Int64);
+        post_ref.references = Some(ForeignKey::new("posts", "id"));
+        let comments = posts_ref_table("comments", post_ref);
+
+        let plan = diff_schema(&[], &parsed(vec![comments, posts], vec![]), DEFAULT_OPTS);
+        let up = emit_up_sql(&plan).expect("emit");
+        let p = up.find("CREATE TABLE posts").expect("posts present");
+        let c = up.find("CREATE TABLE comments").expect("comments present");
+        assert!(
+            p < c,
+            "referenced `posts` must be created before referencing `comments`: {up}"
+        );
+
+        let down = emit_down_sql(&plan).expect("emit");
+        let dp = down.find("DROP TABLE posts").expect("down posts");
+        let dc = down.find("DROP TABLE comments").expect("down comments");
+        assert!(
+            dc < dp,
+            "down: drop referencing `comments` before referenced `posts`: {down}"
+        );
+    }
+
+    #[test]
+    fn create_table_fk_cycle_is_refused() {
+        // Two new tables referencing each other via inline FKs → unsatisfiable
+        // (inline REFERENCES cannot express a cycle) → refused, not invalid SQL.
+        let mut a_b = col("b_id", ColumnType::Int64);
+        a_b.references = Some(ForeignKey::new("b", "id"));
+        let table_a = posts_ref_table("a", a_b);
+        let mut b_a = col("a_id", ColumnType::Int64);
+        b_a.references = Some(ForeignKey::new("a", "id"));
+        let table_b = posts_ref_table("b", b_a);
+
+        let plan = diff_schema(&[], &parsed(vec![table_a, table_b], vec![]), DEFAULT_OPTS);
+        let err = emit_up_sql(&plan).unwrap_err();
+        let EmitError::CyclicTableDependencies { tables } = &err else {
+            panic!("expected CyclicTableDependencies, got {err:?}");
+        };
+        assert_eq!(
+            *tables,
+            vec!["a".to_owned(), "b".to_owned()],
+            "names the cycle"
+        );
     }
 
     #[test]
