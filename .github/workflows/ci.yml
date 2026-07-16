@@ -257,6 +257,49 @@ jobs:
       - name: Check MSRV compiles
         run: cargo check --workspace
 
+  # SQLite runtime lane gate (issue #1614, AC#11). This is the ONLY place in CI
+  # that enables autumn-web's `sqlite` feature, and it does so via an EXPLICIT
+  # `--features sqlite` on each dedicated invocation below — NEVER via
+  # `--all-features` and never via a workspace dependency edge. `sqlite` is a
+  # backend-flip feature: it flips `db::RuntimeConnection` from `AsyncPgConnection`
+  # to a SQLite connection, so unifying it with the Postgres-assuming features
+  # breaks compilation (the earlier trunk-red). Keep it isolated to this job.
+  #
+  # No Postgres `services:` / Docker: the sqlite tests use tempfile/in-memory
+  # SQLite with no external DB. The job builds + lints autumn-web under the
+  # sqlite backend and runs the sqlite integration suite by NAMED `[[test]]`
+  # target — a bare `cargo test --features sqlite` is unsafe (it would compile
+  # the Postgres `integration_tests` binary and the pg-URL lib unit tests under
+  # the flipped backend and fail).
+  sqlite-runtime:
+    name: SQLite runtime (feature=sqlite)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2.7.8
+      - name: Build autumn-web under the sqlite backend
+        run: cargo build -p autumn-web --features sqlite
+      - name: Clippy (autumn-web lib, sqlite backend)
+        run: cargo clippy -p autumn-web --features sqlite --lib -- -D warnings
+      - name: Run the sqlite integration suite
+        # Named sqlite `[[test]]` targets only. `test-support` is required by the
+        # TestApp/Db-extractor-based tests (sqlite_db_extractor, sqlite_read_only_tx,
+        # sqlite_transactional_url_pool) and is additive/harmless for the rest.
+        run: |
+          cargo test -p autumn-web --features "sqlite,test-support" \
+            --test sqlite_boot_serve \
+            --test sqlite_migrations \
+            --test sqlite_foreign_keys \
+            --test sqlite_db_extractor \
+            --test sqlite_pool_pragmas \
+            --test sqlite_read_only_pool \
+            --test sqlite_scoped_repository \
+            --test sqlite_read_only_tx \
+            --test sqlite_transactional_url_pool
+
   # Genuine loom model checks: the loom_models test binary uses loom::sync::*
   # unconditionally, so loom::model() exhaustively explores thread interleavings
   # here. We gate the binary with a NEUTRAL custom cfg (loom_models) rather than
