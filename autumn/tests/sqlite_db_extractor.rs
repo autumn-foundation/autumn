@@ -94,10 +94,12 @@ async fn db_extractor_serves_a_sqlite_backed_request_with_200() {
             .execute(&mut *conn)
             .await
             .expect("create table on sqlite");
-        diesel::sql_query("INSERT INTO greetings (id, message) VALUES (1, 'hello via Db extractor')")
-            .execute(&mut *conn)
-            .await
-            .expect("seed row on sqlite");
+        diesel::sql_query(
+            "INSERT INTO greetings (id, message) VALUES (1, 'hello via Db extractor')",
+        )
+        .execute(&mut *conn)
+        .await
+        .expect("seed row on sqlite");
     }
 
     // A minimal app whose handler extracts `Db` — this is the path that used to
