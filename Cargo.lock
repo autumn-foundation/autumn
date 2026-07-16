@@ -462,6 +462,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "autumn-media-plugin"
+version = "0.6.0"
+dependencies = [
+ "autumn-web",
+ "serde",
+ "thiserror 2.0.18",
+ "toml 1.1.2+spec-1.1.0",
+ "tracing",
+]
+
+[[package]]
 name = "autumn-schema-core"
 version = "0.6.0"
 dependencies = [
