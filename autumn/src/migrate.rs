@@ -264,6 +264,61 @@ pub fn pending_migrations(
     })
 }
 
+/// Actionable error surfaced when a **private** in-memory `SQLite` target is
+/// configured together with registered startup migrations (issue #1614
+/// follow-up).
+///
+/// A private in-memory database (`sqlite::memory:` / `:memory:` /
+/// `file::memory:` without `cache=shared`) gives every connection its own
+/// isolated, empty database, so migrations applied on the throwaway migration
+/// connection can never become visible to the runtime pool. The remedy is a
+/// file-backed database or a shared-cache in-memory URL, both of which retain
+/// the migrated schema for the pool.
+#[cfg(feature = "sqlite")]
+pub(crate) const PRIVATE_IN_MEMORY_MIGRATION_MSG: &str = "Private in-memory SQLite (`sqlite::memory:` / `:memory:`) cannot retain startup \
+     migrations for the runtime pool \u{2014} each connection gets its own empty database. \
+     Use a file-backed SQLite database, or a shared-cache in-memory URL \
+     (`file::memory:?cache=shared`), when registering migrations.";
+
+/// Return the [`PRIVATE_IN_MEMORY_MIGRATION_MSG`] reject error when
+/// `database_url` is a **private** in-memory `SQLite` target AND `migrations`
+/// carries at least one registered migration to apply; otherwise `None`.
+///
+/// This is the single decision point the `SQLite` migration-application paths
+/// share (the boot [`auto_migrate_sqlite`], the pub [`run_pending_sqlite`], and
+/// the `AUTUMN_MIGRATE=1` `apply_pending_sqlite_or_exit`), so they cannot drift.
+/// It performs no I/O — the target is classified from the URL string
+/// ([`crate::db::sqlite_target_is_private_in_memory`], which reuses the same
+/// helpers pool sizing uses) and the registered set is enumerated in-memory —
+/// so it runs **before** any throwaway migration connection is opened.
+///
+/// An empty migration set returns `None`: a private in-memory target with no
+/// registered migrations is a legitimate configuration (it is the default test
+/// harness), so it is never rejected. A file-backed or shared-cache in-memory
+/// target likewise returns `None` — those retain migrations for the pool.
+#[cfg(feature = "sqlite")]
+pub(crate) fn reject_private_in_memory_migrations<S>(
+    database_url: &str,
+    migrations: &S,
+) -> Option<MigrationError>
+where
+    S: diesel::migration::MigrationSource<diesel::sqlite::Sqlite>,
+{
+    if !crate::db::sqlite_target_is_private_in_memory(database_url) {
+        return None;
+    }
+    // Only reject when there is actually a migration to apply. If the set can't
+    // be enumerated, treat it as non-empty (the apply would fail anyway) so the
+    // doomed configuration is still surfaced rather than silently proceeding.
+    let has_registered = migrations.migrations().map_or(true, |m| !m.is_empty());
+    if !has_registered {
+        return None;
+    }
+    Some(MigrationError::Migration(
+        PRIVATE_IN_MEMORY_MIGRATION_MSG.to_owned(),
+    ))
+}
+
 /// Run all pending migrations against a `SQLite` database URL (issue #1614, PR3).
 ///
 /// The `SQLite` counterpart to [`run_pending`]. `SQLite` is a single-writer local
@@ -288,6 +343,14 @@ pub fn run_pending_sqlite(
     database_url: &str,
     migrations: impl diesel::migration::MigrationSource<diesel::sqlite::Sqlite>,
 ) -> Result<MigrationResult, MigrationError> {
+    // Reject a PRIVATE in-memory target with registered migrations before
+    // opening the (throwaway) migration connection: each such connection is its
+    // own empty database, so migrations applied here can never reach the runtime
+    // pool (issue #1614 follow-up). A file-backed or shared-cache in-memory
+    // target is unaffected.
+    if let Some(err) = reject_private_in_memory_migrations(database_url, &migrations) {
+        return Err(err);
+    }
     let mut conn = crate::db::establish_sqlite_migration_connection(database_url)
         .map_err(|e| MigrationError::Connection(e.to_string()))?;
     let mut harness = HarnessWithOutput::write_to_stdout(&mut conn);
@@ -2339,6 +2402,22 @@ pub(crate) fn auto_migrate_sqlite(
     migrations: &EmbeddedMigrations,
     target: &str,
 ) {
+    // A private in-memory target with registered migrations cannot work: each
+    // connection is its own empty database, so migrations applied on the
+    // throwaway migration connection never reach the runtime pool. Fail startup
+    // fast with an actionable message — in both the auto-apply and
+    // report-pending profiles — rather than booting into a schema-less pool
+    // whose every DB-backed request 500s (issue #1614 follow-up).
+    if let Some(err) =
+        reject_private_in_memory_migrations(database_url, &EmbeddedMigrationsRef(migrations))
+    {
+        tracing::error!(
+            target = %target,
+            error = %err,
+            "Refusing to run SQLite migrations against a private in-memory target",
+        );
+        std::process::exit(1);
+    }
     if should_auto_apply(profile, allow_auto_migrate_in_production) {
         tracing::info!(target = %target, "Running pending SQLite database migrations...");
         match run_pending_sqlite(database_url, EmbeddedMigrationsRef(migrations)) {

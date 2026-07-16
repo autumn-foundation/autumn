@@ -161,3 +161,47 @@ async fn registered_migrations_apply_to_sqlite_and_serve() {
         "response body is the row written to and read from the migrated `widgets` table"
     );
 }
+
+/// A **private** in-memory target with registered migrations is rejected up
+/// front with an actionable error (issue #1614 follow-up). Each `:memory:`
+/// connection is its own empty database, so migrations applied on the throwaway
+/// migration connection could never reach the runtime pool — surfacing the
+/// error beats silently applying to a database the pool never sees.
+#[test]
+fn private_in_memory_target_with_registered_migrations_is_rejected() {
+    for url in [
+        "sqlite::memory:",
+        ":memory:",
+        "sqlite://:memory:",
+        "file::memory:",
+    ] {
+        let err = run_pending_sqlite(url, MIGRATIONS)
+            .expect_err("private in-memory + registered migrations must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("in-memory"),
+            "error names the in-memory problem (got {msg:?})"
+        );
+        assert!(
+            msg.contains("file-backed") && msg.contains("cache=shared"),
+            "error gives the file-backed / shared-cache remedy (got {msg:?})"
+        );
+    }
+}
+
+/// A **shared-cache** in-memory target (`file::memory:?cache=shared`) is shared
+/// across connections within one process, so it retains migrations for the
+/// runtime pool and is NOT rejected — the migration applies exactly like a
+/// file-backed target. (The private-vs-shared classification itself is unit
+/// tested in `db::sqlite_target_is_private_in_memory_classifies_targets`.)
+#[test]
+fn shared_cache_in_memory_target_is_not_rejected() {
+    let result = run_pending_sqlite("file::memory:?cache=shared", MIGRATIONS)
+        .expect("shared-cache in-memory retains migrations for the pool and is not rejected");
+    assert_eq!(
+        result.applied.len(),
+        1,
+        "the one registered migration applies on a shared-cache in-memory target (got {:?})",
+        result.applied
+    );
+}

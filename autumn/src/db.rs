@@ -1186,6 +1186,28 @@ fn sqlite_target_is_memory(target: &str) -> bool {
         || target.contains("mode=memory")
 }
 
+/// Whether a `SQLite` database URL (any accepted spelling) resolves to a
+/// **private** in-memory target — `sqlite::memory:` / `:memory:` /
+/// `file::memory:` *without* `cache=shared`.
+///
+/// Each connection to a private in-memory database gets its own, isolated,
+/// empty database (see [`normalize_sqlite_target`]). That is why the runtime
+/// pool forces such targets single-slot, and why a throwaway synchronous
+/// migration connection can never make its schema visible to the async runtime
+/// pool: the two connections are different databases. Callers registering
+/// startup migrations use this to reject the doomed configuration up front.
+///
+/// A **file-backed** target (persists on disk, shared by every connection) and
+/// a **shared-cache** in-memory target (`file::memory:?cache=shared`, shared
+/// across connections within one process) both return `false` — they retain
+/// migrations for the pool and must not be rejected. This is exactly
+/// [`sqlite_target_is_memory`] applied to the normalized URL, so pool sizing and
+/// this guard agree on what "private in-memory" means.
+#[cfg(feature = "sqlite")]
+pub(crate) fn sqlite_target_is_private_in_memory(url: &str) -> bool {
+    sqlite_target_is_memory(&normalize_sqlite_target(url))
+}
+
 /// Whether a normalized `SQLite` target names a **read-only** database via its
 /// URI query string (`mode=ro`, or `immutable=1`/`immutable=true`).
 ///
@@ -3822,6 +3844,37 @@ mod tests {
         ));
         // Plain file targets are not in-memory.
         assert!(!sqlite_target_is_memory("/var/lib/app.db"));
+    }
+
+    // `sqlite_target_is_private_in_memory` classifies raw URLs (every accepted
+    // spelling) so the startup-migration path can reject a private in-memory
+    // target that would apply migrations to a throwaway connection the runtime
+    // pool never sees (issue #1614 follow-up). It is exactly
+    // `sqlite_target_is_memory` over the normalized URL: private in-memory →
+    // true; file-backed and shared-cache in-memory → false.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn sqlite_target_is_private_in_memory_classifies_targets() {
+        // Private in-memory spellings the runtime pool accepts.
+        assert!(sqlite_target_is_private_in_memory(":memory:"));
+        assert!(sqlite_target_is_private_in_memory("sqlite::memory:"));
+        assert!(sqlite_target_is_private_in_memory("sqlite://:memory:"));
+        assert!(sqlite_target_is_private_in_memory("sqlite://"));
+        assert!(sqlite_target_is_private_in_memory("file::memory:"));
+        assert!(sqlite_target_is_private_in_memory("file::memory:?foo=bar"));
+        // Shared-cache in-memory is shareable across connections — NOT private.
+        assert!(!sqlite_target_is_private_in_memory(
+            "file::memory:?cache=shared"
+        ));
+        assert!(!sqlite_target_is_private_in_memory(
+            "file:app?mode=memory&cache=shared"
+        ));
+        // File-backed targets persist and are shared — NOT private in-memory.
+        assert!(!sqlite_target_is_private_in_memory(
+            "sqlite:///var/lib/app.db"
+        ));
+        assert!(!sqlite_target_is_private_in_memory("/var/lib/app.db"));
+        assert!(!sqlite_target_is_private_in_memory("file:/var/lib/app.db"));
     }
 
     // A read-only URI target (`mode=ro` / `immutable`) must be detected so the

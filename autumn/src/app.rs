@@ -7444,6 +7444,18 @@ fn apply_pending_sqlite_or_exit(
     migrations: &crate::migrate::EmbeddedMigrations,
     target: &str,
 ) -> usize {
+    // Reject a private in-memory target with registered migrations up front,
+    // BEFORE `run_pending_sqlite` (whose `Migration` error would be redacted to
+    // a value-free reason below, hiding the guidance). Each `:memory:`
+    // connection is its own empty database, so migrations here never reach the
+    // runtime pool (issue #1614 follow-up).
+    if let Some(err) = crate::migrate::reject_private_in_memory_migrations(
+        database_url,
+        &crate::migrate::EmbeddedMigrationsRef(migrations),
+    ) {
+        eprintln!("autumn migrate: {err} (target {target})");
+        std::process::exit(1);
+    }
     match crate::migrate::run_pending_sqlite(
         database_url,
         crate::migrate::EmbeddedMigrationsRef(migrations),
