@@ -48,7 +48,7 @@ pub enum ReadRoute {
     /// or the primary when the replica is unready and the
     /// [`ReplicaFallback::Primary`](crate::config::ReplicaFallback) policy
     /// applies.
-    ReadPool(diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>),
+    ReadPool(diesel_async::pooled_connection::deadpool::Pool<crate::db::RuntimeConnection>),
     /// A replica is configured but currently unready, and the
     /// [`ReplicaFallback::FailReadiness`](crate::config::ReplicaFallback)
     /// policy forbids falling back to the primary. Generated reads fail

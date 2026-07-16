@@ -763,6 +763,7 @@ pub async fn show(
                                  class="flex items-center gap-2 mt-3 text-sm" {
                                 input type="hidden" name="_csrf" value=(csrf.token());
                                 input type="text" name="tags"
+                                      aria-label="Post tags"
                                       value=(post_tags.iter().map(|t| t.slug.clone()).collect::<Vec<_>>().join(", "))
                                       placeholder="tags, comma separated"
                                       class="flex-1 border border-gray-300 rounded px-2 py-1 text-xs \
@@ -798,6 +799,7 @@ pub async fn show(
                      class="bg-white rounded-lg shadow-sm border border-gray-200 p-4 mb-6" {
                     input type="hidden" name="_csrf" value=(csrf.token());
                     textarea name="body" rows="4" required
+                             aria-label="Comment body"
                              placeholder="What are your thoughts?"
                              class="w-full border border-gray-300 rounded px-3 py-2 text-sm mb-3 \
                                     focus:outline-none focus:ring-2 focus:ring-orange-400" {}

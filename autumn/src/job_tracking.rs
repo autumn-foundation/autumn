@@ -473,7 +473,13 @@ fn store_for_config(
                  in-memory job tracking store (tracked job status will not survive a restart)"
             );
         }
-        #[cfg(feature = "db")]
+        // The Postgres tracking store persists to a Postgres table; under the
+        // `sqlite` feature `state.pool()` is a SQLite pool that cannot satisfy
+        // its Postgres connection type. SQLite deployments fall through to the
+        // in-memory tracking store (the same fallback used when no pool is
+        // configured). The Postgres job backend itself is refused earlier under
+        // sqlite (see `start_postgres_runtime`).
+        #[cfg(all(feature = "db", not(feature = "sqlite")))]
         "postgres" => {
             if let Some(pool) = state.pool() {
                 return Arc::new(PgJobTrackingStore::new(
@@ -580,6 +586,9 @@ pub(crate) async fn settle_tracked_payload_as_failed(
 /// that operate directly against a queue backend with no `AppState` in
 /// hand — an operator cancelling a job that hasn't reached a worker yet
 /// goes through these paths, not `run_job_handler`.
+// Only the Postgres/Redis admin backends call this; under `--features sqlite`
+// (Postgres tracking store refused, redis off) it is unused.
+#[cfg_attr(feature = "sqlite", allow(dead_code))]
 pub(crate) async fn settle_tracked_payload_as_failed_globally(payload: &Value, message: &str) {
     settle_tracked_payload_with_store(global_tracking_store(), payload, message).await;
 }

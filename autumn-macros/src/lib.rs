@@ -34,6 +34,7 @@ mod model;
 mod oauth2_callback;
 mod one_off_task;
 mod one_off_tasks_macro;
+mod openapi_schema;
 mod param_helpers;
 mod parse;
 mod paths_macro;
@@ -442,6 +443,38 @@ pub fn story(input: TokenStream) -> TokenStream {
 #[proc_macro_attribute]
 pub fn model(attr: TokenStream, item: TokenStream) -> TokenStream {
     model::model_macro(attr.into(), item.into()).into()
+}
+
+/// Derive a field-accurate `OpenApiSchema` impl for a plain struct with named
+/// fields (issue #1972).
+///
+/// Use it on a handler-arg struct — a `Query<T>` param struct or a
+/// non-`#[model]` `Json<T>` request body — so its `OpenAPI` component schema and
+/// MCP tool `inputSchema` describe the real fields instead of degrading to a
+/// generic `{"type":"object"}` placeholder, without a hand-written impl or an
+/// `OpenApiConfig::register_schema` call.
+///
+/// Each field becomes a JSON-schema property (nullable `Option<T>`, `Vec<T>`
+/// arrays, inline primitives, `$ref`s for other named types) and every
+/// non-`Option` field is `required` — mirroring the schema `#[model]` already
+/// generates. The derive also registers the schema in the compile-time
+/// inventory the spec/MCP back-fill consults, so the referencing route resolves
+/// it automatically.
+///
+/// # Examples
+///
+/// ```ignore
+/// use autumn_web::openapi::OpenApiSchema;
+///
+/// #[derive(serde::Deserialize, OpenApiSchema)]
+/// struct SearchParams {
+///     q: String,
+///     limit: Option<i32>,
+/// }
+/// ```
+#[proc_macro_derive(OpenApiSchema)]
+pub fn derive_openapi_schema(input: TokenStream) -> TokenStream {
+    openapi_schema::derive_openapi_schema(input)
 }
 
 /// Derive a repository with CRUD operations and derived queries.
