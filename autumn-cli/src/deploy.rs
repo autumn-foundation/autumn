@@ -1155,16 +1155,58 @@ fn default_release_id() -> String {
 /// `proxy::DEFAULT_HTTPS_PORT`; a public/HTTP port equal to it collides.
 const PROXY_HTTPS_PORT: u16 = 443;
 
-/// Reject a deploy public/HTTP port that collides with the proxy's fixed HTTPS
-/// listener. kamal-proxy `run` always establishes both its `--http-port` (the
-/// deploy public port) and `--https-port 443` listeners, so a public port of 443
-/// makes the two collide and the proxy can never start. The guard is
-/// unconditional (not TLS-gated) because 443 is always bound.
-fn validate_public_port(public_port: u16) -> Result<(), String> {
-    if public_port == PROXY_HTTPS_PORT {
+/// The public/HTTP port automatic TLS requires. Let's Encrypt HTTP-01 validation
+/// arrives on port 80, and kamal-proxy's HTTP→HTTPS redirect expects HTTP on 80,
+/// so `[deploy.tls]` deployments must serve HTTP on 80.
+const ACME_HTTP_PORT: u16 = 80;
+
+/// Reject a deploy public/HTTP port that cannot work with the proxy topology.
+///
+/// Two independent guards run here, before any remote work:
+///
+/// 1. **443 collision (unconditional).** kamal-proxy `run` always establishes
+///    both its `--http-port` (the deploy public port) and `--https-port 443`
+///    listeners, and each blue/green slot binds a private loopback port derived
+///    from the public port ([`exec::slot_app_port`]: blue = `public + 1`, green =
+///    `public + 2`). If the proxy's HTTP port *or* either slot port lands on 443
+///    it collides with the always-bound HTTPS listener and the proxy can never
+///    start. With blue/green at `+1`/`+2`, that rejects `public ∈ {441, 442,
+///    443}`. This is unconditional because 443 is always bound, TLS or not.
+/// 2. **Automatic-TLS requires port 80 (TLS-gated).** When `[deploy.tls]` is
+///    enabled the public HTTP port must be 80, or ACME HTTP-01 validation and the
+///    HTTP→HTTPS redirect can't reliably work.
+fn validate_public_port(public_port: u16, tls_enabled: bool) -> Result<(), String> {
+    // Guard 1: no port (proxy HTTP or a blue/green slot) may land on 443. Compute
+    // the slot ports from the same offsets the deploy uses so the guard tracks the
+    // real arithmetic instead of a hardcoded {441, 442, 443} set.
+    let blue_port = exec::slot_app_port(public_port, exec::SLOT_BLUE);
+    let green_port = exec::slot_app_port(public_port, exec::SLOT_GREEN);
+    let collision = if public_port == PROXY_HTTPS_PORT {
+        Some("the proxy's HTTP listener")
+    } else if blue_port == PROXY_HTTPS_PORT {
+        Some("the blue app slot")
+    } else if green_port == PROXY_HTTPS_PORT {
+        Some("the green app slot")
+    } else {
+        None
+    };
+    if let Some(which) = collision {
         return Err(format!(
-            "deploy public/HTTP port cannot be {PROXY_HTTPS_PORT} — kamal-proxy reserves \
-             {PROXY_HTTPS_PORT} for its HTTPS listener; use 80 (the default) or another port",
+            "deploy public/HTTP port {public_port} is invalid — {which} would land on \
+             {PROXY_HTTPS_PORT}, which kamal-proxy reserves for its HTTPS listener \
+             (blue/green app slots bind `public+1`/`public+2`); use 80 (the default) or \
+             another port outside {}\u{2013}{PROXY_HTTPS_PORT}",
+            PROXY_HTTPS_PORT - 2,
+        ));
+    }
+
+    // Guard 2: automatic TLS needs the public HTTP port on 80 for ACME/redirect.
+    if tls_enabled && public_port != ACME_HTTP_PORT {
+        return Err(format!(
+            "automatic TLS (`[deploy.tls]`) requires the deploy public HTTP port to be \
+             {ACME_HTTP_PORT} — Let's Encrypt HTTP-01 validation and the HTTP\u{2192}HTTPS \
+             redirect use port {ACME_HTTP_PORT}; set `server.port = {ACME_HTTP_PORT}` \
+             (currently {public_port})",
         ));
     }
     Ok(())
@@ -1188,11 +1230,12 @@ fn run_up(config: &AutumnConfig, resolved: &ResolvedDeployConfig) -> Result<(), 
     let release_id = default_release_id();
     let public_port = config.server.port;
     // kamal-proxy `run` ALWAYS binds 443 for its HTTPS listener (regardless of any
-    // app's TLS flag), so a public/HTTP port of 443 would render
-    // `run --http-port 443 --https-port 443` and the proxy would fail to start.
-    // Reject it up front with an actionable message instead of a cryptic runtime
-    // bind failure on the host. Unconditional — 443 is always bound.
-    validate_public_port(public_port).map_err(DeployError::Config)?;
+    // app's TLS flag), so a public/HTTP port whose proxy-HTTP or blue/green slot
+    // port lands on 443 would collide and the proxy would fail to start. And when
+    // `[deploy.tls]` is enabled the public HTTP port must be 80 for ACME HTTP-01
+    // validation and the HTTP→HTTPS redirect. Reject both up front with actionable
+    // messages instead of a cryptic runtime bind/validation failure on the host.
+    validate_public_port(public_port, resolved.tls_enabled).map_err(DeployError::Config)?;
     let proxy = proxy::KamalProxyController::new(resolved.readiness_timeout_secs)
         .with_tls_host(resolved.tls_host.clone());
     let executor = exec::SshExecutor::new(target);
@@ -1341,14 +1384,56 @@ mod tests {
         // kamal-proxy always binds 443 for HTTPS, so a public/HTTP port of 443
         // collides and the proxy can't start — the guard rejects it up front with
         // an actionable message. It is unconditional (not TLS-gated).
-        let err = validate_public_port(443).expect_err("port 443 must be rejected");
+        let err = validate_public_port(443, false).expect_err("port 443 must be rejected");
         assert!(
-            err.contains("cannot be 443") && err.contains("kamal-proxy reserves 443"),
-            "collision message must be actionable, got: {err}",
+            err.contains("443")
+                && err.contains("HTTPS listener")
+                && err.contains("proxy's HTTP listener"),
+            "collision message must name 443/the HTTPS listener/the proxy HTTP port, got: {err}",
         );
         // A normal public port (the default 80, or any other) is accepted.
-        assert!(validate_public_port(80).is_ok());
-        assert!(validate_public_port(8080).is_ok());
+        assert!(validate_public_port(80, false).is_ok());
+        assert!(validate_public_port(8080, false).is_ok());
+    }
+
+    #[test]
+    fn public_ports_whose_slots_reach_443_are_rejected() {
+        // Blue/green slots bind `public+1`/`public+2`, so 441 (green slot → 443)
+        // and 442 (blue slot → 443) collide with the proxy's always-bound HTTPS
+        // listener just as 443 itself does. All three are rejected unconditionally.
+        let green = validate_public_port(441, false).expect_err("441 (green slot=443) rejected");
+        assert!(
+            green.contains("green app slot") && green.contains("443"),
+            "441 message must name the green slot landing on 443, got: {green}",
+        );
+        let blue = validate_public_port(442, false).expect_err("442 (blue slot=443) rejected");
+        assert!(
+            blue.contains("blue app slot") && blue.contains("443"),
+            "442 message must name the blue slot landing on 443, got: {blue}",
+        );
+        // The collision guard is TLS-independent — it fires with TLS on too.
+        assert!(validate_public_port(443, true).is_err());
+        // A safe non-{441,442,443} port is accepted (with TLS off).
+        assert!(validate_public_port(440, false).is_ok());
+        assert!(validate_public_port(444, false).is_ok());
+        assert!(validate_public_port(8080, false).is_ok());
+    }
+
+    #[test]
+    fn automatic_tls_requires_public_port_80() {
+        // With `[deploy.tls]` enabled, the public HTTP port must be 80 for ACME
+        // HTTP-01 validation and the HTTP→HTTPS redirect; anything else is rejected
+        // with a message naming port 80 and the ACME/redirect reason.
+        let err = validate_public_port(3000, true).expect_err("TLS + port 3000 must be rejected");
+        assert!(
+            err.contains("automatic TLS") && err.contains("80") && err.contains("HTTP-01"),
+            "TLS message must name port 80 and ACME HTTP-01, got: {err}",
+        );
+        // Port 80 with TLS enabled is accepted.
+        assert!(validate_public_port(80, true).is_ok());
+        // With TLS disabled, 80 and other non-collision ports stay accepted.
+        assert!(validate_public_port(80, false).is_ok());
+        assert!(validate_public_port(3000, false).is_ok());
     }
 
     #[test]
