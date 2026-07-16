@@ -102,6 +102,7 @@ pub mod prelude {
 }
 
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -169,6 +170,49 @@ impl MediaPlugin {
             recordings_root: None,
             retention_defer: None,
         }
+    }
+
+    /// Build a fully-wired broadcast [`MediaPlugin`] from an Arroyo operator's
+    /// existing `ARROYO_*` environment — the ratified migration shim (issue
+    /// #1974, slice 5). One call maps the operator's env onto a plugin ready to
+    /// install, so adopting `autumn-media-plugin` changes no ops config:
+    ///
+    /// - the `[media]` config surface — `MediaMTX` origins, `FFmpeg` bin, the
+    ///   local/S3 storage selection (including Arroyo's Tigris `auto` region /
+    ///   `t3.storage.dev` endpoint / `highlights` key-prefix defaults), and the
+    ///   retention window — via
+    ///   [`MediaConfig::from_arroyo_env`](config::MediaConfig::from_arroyo_env);
+    /// - the **broadcast** primitive enabled (Arroyo is one-to-many and uses no
+    ///   rooms), so the plugin is watch-path-ready without a further builder
+    ///   call;
+    /// - the retention sweep's recordings root from `ARROYO_RECORDINGS_ROOT`
+    ///   (default `recordings`, matching Arroyo's own
+    ///   `configured_recordings_root()` fallback), so the hourly retention loop
+    ///   is wired exactly as before.
+    ///
+    /// The returned value is a normal builder: chain
+    /// [`artifact_sink`](Self::artifact_sink) (the app writes its own tables on
+    /// completion), [`workflow_delegate`](Self::workflow_delegate),
+    /// [`retention_defer`](Self::retention_defer), etc. This reads the process
+    /// environment; the pure mapping lives in
+    /// [`from_arroyo_env_pairs`](Self::from_arroyo_env_pairs) for testability.
+    #[must_use]
+    pub fn from_arroyo_env() -> Self {
+        let env: HashMap<String, String> = std::env::vars().collect();
+        Self::from_arroyo_env_pairs(&env)
+    }
+
+    /// Pure core of [`from_arroyo_env`](Self::from_arroyo_env): map the supplied
+    /// `ARROYO_*` environment map onto a wired [`MediaPlugin`] without touching
+    /// process-global environment (mirroring
+    /// [`MediaConfig::from_arroyo_env_pairs`](config::MediaConfig::from_arroyo_env_pairs)).
+    #[must_use]
+    pub fn from_arroyo_env_pairs(env: &HashMap<String, String>) -> Self {
+        let config = MediaConfig::from_arroyo_env_pairs(env);
+        Self::new()
+            .config(config)
+            .with_broadcast()
+            .recordings_root(arroyo_recordings_root(env))
     }
 
     /// Supply the resolved `[media]` configuration.
@@ -386,6 +430,25 @@ impl Plugin for MediaPlugin {
     }
 }
 
+/// Recordings root an Arroyo deployment uses when `ARROYO_RECORDINGS_ROOT` is
+/// unset — mirrors Arroyo's own `configured_recordings_root()` fallback, so the
+/// migration shim wires the retention sweep the same way with no ops change.
+const DEFAULT_ARROYO_RECORDINGS_ROOT: &str = "recordings";
+
+/// Resolve the Arroyo recordings root from an env map: a non-blank
+/// `ARROYO_RECORDINGS_ROOT`, else [`DEFAULT_ARROYO_RECORDINGS_ROOT`]. Blank /
+/// whitespace-only values are treated as unset (parity with
+/// [`MediaConfig::from_arroyo_env_pairs`](config::MediaConfig::from_arroyo_env_pairs)).
+fn arroyo_recordings_root(env: &HashMap<String, String>) -> PathBuf {
+    env.get("ARROYO_RECORDINGS_ROOT")
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map_or_else(
+            || PathBuf::from(DEFAULT_ARROYO_RECORDINGS_ROOT),
+            PathBuf::from,
+        )
+}
+
 /// The route metadata `MediaPlugin` declares for `autumn routes` listing.
 ///
 /// **Slice 0: empty.** Later slices will fill this in with the broadcast and
@@ -393,6 +456,110 @@ impl Plugin for MediaPlugin {
 /// nests. Extracted so the empty slice-0 declaration is directly testable.
 const fn media_route_infos(_api_prefix: &str) -> Vec<autumn_web::route_listing::RouteInfo> {
     Vec::new()
+}
+
+// ── Arroyo migration shim (slice 5) ─────────────────────────────────────────
+
+#[cfg(test)]
+mod arroyo_shim_tests {
+    use super::{DEFAULT_ARROYO_RECORDINGS_ROOT, MediaPlugin, arroyo_recordings_root};
+    use crate::config::MediaStorageBackend;
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+
+    fn env(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+            .collect()
+    }
+
+    #[test]
+    fn empty_env_is_wired_broadcast_local_plugin() {
+        let plugin = MediaPlugin::from_arroyo_env_pairs(&HashMap::new());
+        // Broadcast is enabled (Arroyo is one-to-many); rooms are not.
+        assert!(plugin.enable_broadcast, "broadcast must be enabled");
+        assert!(!plugin.enable_rooms, "rooms must stay disabled");
+        // Config maps through with neutral defaults for an empty env.
+        assert_eq!(plugin.config.storage.backend, MediaStorageBackend::Local);
+        assert_eq!(plugin.config.mediamtx.api_base, "http://127.0.0.1:9997");
+        assert_eq!(plugin.config.ffmpeg.bin, "/usr/bin/ffmpeg");
+        // Retention sweep is wired to Arroyo's default recordings root, so the
+        // hourly loop runs exactly as it did pre-migration.
+        assert_eq!(
+            plugin.recordings_root.as_deref(),
+            Some(std::path::Path::new(DEFAULT_ARROYO_RECORDINGS_ROOT))
+        );
+        // The produced config is valid to hand to MediaStorage::from_config.
+        assert!(plugin.config.validate().is_ok());
+    }
+
+    #[test]
+    fn maps_full_s3_environment_and_validates() {
+        let vars = env(&[
+            ("ARROYO_VIDEO_STORAGE_BACKEND", "s3"),
+            ("BUCKET_NAME", "arroyo-bucket"),
+            ("AWS_ACCESS_KEY_ID", "AKIA"),
+            ("AWS_SECRET_ACCESS_KEY", "secret"),
+            ("ARROYO_MEDIAMTX_API_BASE", "http://mtx:9997"),
+            ("ARROYO_FFMPEG_BIN", "/opt/ffmpeg"),
+            ("ARROYO_RECORDING_RETENTION_DAYS", "21"),
+            ("ARROYO_RECORDINGS_ROOT", "/data/recordings"),
+        ]);
+        let plugin = MediaPlugin::from_arroyo_env_pairs(&vars);
+        assert!(plugin.enable_broadcast);
+        assert_eq!(plugin.config.storage.backend, MediaStorageBackend::S3);
+        assert_eq!(
+            plugin.config.storage.bucket.as_deref(),
+            Some("arroyo-bucket")
+        );
+        // Arroyo's Tigris S3 defaults flow through the config-level shim.
+        assert_eq!(plugin.config.storage.region.as_deref(), Some("auto"));
+        assert_eq!(
+            plugin.config.storage.endpoint_url.as_deref(),
+            Some("https://t3.storage.dev")
+        );
+        assert_eq!(plugin.config.storage.key_prefix, "highlights");
+        assert_eq!(plugin.config.mediamtx.api_base, "http://mtx:9997");
+        assert_eq!(plugin.config.ffmpeg.bin, "/opt/ffmpeg");
+        // Retention window flows from ARROYO_RECORDING_RETENTION_DAYS into the
+        // config (the plugin resolves the effective days from it at build time).
+        assert_eq!(plugin.config.recording.retention_days, 21);
+        assert_eq!(
+            plugin.recordings_root.as_deref(),
+            Some(std::path::Path::new("/data/recordings"))
+        );
+        assert!(plugin.config.validate().is_ok());
+    }
+
+    #[test]
+    fn recordings_root_honors_env_and_defaults() {
+        assert_eq!(
+            arroyo_recordings_root(&env(&[("ARROYO_RECORDINGS_ROOT", "/mnt/rec")])),
+            PathBuf::from("/mnt/rec")
+        );
+        // Blank / whitespace-only is treated as unset → Arroyo's default.
+        assert_eq!(
+            arroyo_recordings_root(&env(&[("ARROYO_RECORDINGS_ROOT", "   ")])),
+            PathBuf::from(DEFAULT_ARROYO_RECORDINGS_ROOT)
+        );
+        assert_eq!(
+            arroyo_recordings_root(&HashMap::new()),
+            PathBuf::from(DEFAULT_ARROYO_RECORDINGS_ROOT)
+        );
+    }
+
+    #[test]
+    fn returned_plugin_stays_chainable() {
+        // The shim returns a normal builder, so an app can layer its own
+        // overrides (queue name, retention window) on top of the mapped env.
+        let plugin = MediaPlugin::from_arroyo_env_pairs(&HashMap::new())
+            .queue("arroyo-media")
+            .retention_days(30);
+        assert!(plugin.enable_broadcast);
+        assert_eq!(plugin.queue, "arroyo-media");
+        assert_eq!(plugin.retention_days, Some(30));
+    }
 }
 
 // ── Conformance reference tests ─────────────────────────────────────────────
