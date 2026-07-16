@@ -120,6 +120,32 @@ Because every piece comes from the same `SchemaEntry` data the OpenAPI
 generator uses, **there is no second schema to maintain** and no way for the
 tool catalog to drift from the handler.
 
+### Query is flat — put structured input in the body
+
+`Query<T>` deserializes with
+[`serde_urlencoded`](https://docs.rs/serde_urlencoded), which is **strictly
+flat**: it can decode scalars (`?q=foo&page=2`) and repeated keys for a
+sequence field (`?tags=a&tags=b`), but it **cannot** deserialize a nested
+struct by any encoding — not `key[sub]=`, not JSON-in-a-string. MCP `tools/call`
+dispatch honors this: query values are rendered as flat `key=value` pairs
+(arrays expand to repeated keys), so a query field that is itself an object or
+an array of objects could never round-trip back to the handler.
+
+So keep query parameters flat and **steer structured/nested input to a JSON
+body** (`Json<T>`), which round-trips losslessly through the tool's `body`
+property. When assembling `/mcp`, Autumn emits a build-time `tracing::warn` for
+a tool whose:
+
+- `query` or `body` resolves to a bare `{"type":"object"}` placeholder — the
+  arg type has no `OpenApiSchema`, so its fields aren't advertised. Fix it by
+  deriving (`#[derive(OpenApiSchema)]`) or implementing `OpenApiSchema` on the
+  arg type.
+- `query` advertises a nested object / array-of-object field — move that input
+  to a `Json<T>` body.
+
+These are warnings, not errors: the app still builds and the tool is still
+exposed.
+
 ### Safety annotations
 
 The HTTP method maps to MCP safety hints so agents and UIs can reason about

@@ -12245,16 +12245,23 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         path: #api_path,
                         operation_id: ::core::stringify!(#list_fn),
                         success_status: 200,
+                        // The pagination query/response envelopes are synthetic,
+                        // runtime-inserted component schemas (`PageRequest` /
+                        // `CursorRequest` / `<Model>Page` / `<Model>CursorPage`)
+                        // with no addressable Rust type, so they carry no
+                        // `type_name` identity and key off their short name.
                         query_schema: ::core::option::Option::Some(
                             ::autumn_web::openapi::SchemaEntry {
                                 name: #list_query_schema_name,
                                 kind: ::autumn_web::openapi::SchemaKind::Ref,
+                                identity: ::core::option::Option::None,
                             }
                         ),
                         response: ::core::option::Option::Some(
                             ::autumn_web::openapi::SchemaEntry {
                                 name: #list_response_schema_name,
                                 kind: ::autumn_web::openapi::SchemaKind::Ref,
+                                identity: ::core::option::Option::None,
                             }
                         ),
                         register_schemas: ::core::option::Option::Some(#list_schema_fn),
@@ -12309,6 +12316,9 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             ::autumn_web::openapi::SchemaEntry {
                                 name: ::core::stringify!(#model_name),
                                 kind: ::autumn_web::openapi::SchemaKind::Ref,
+                                identity: ::core::option::Option::Some(
+                                    ::autumn_web::openapi::type_name_of::<#model_name>
+                                ),
                             }
                         ),
                         mcp_tool: #mcp_get_op,
@@ -12353,12 +12363,18 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             ::autumn_web::openapi::SchemaEntry {
                                 name: ::core::stringify!(#new_name),
                                 kind: ::autumn_web::openapi::SchemaKind::Ref,
+                                identity: ::core::option::Option::Some(
+                                    ::autumn_web::openapi::type_name_of::<#new_name>
+                                ),
                             }
                         ),
                         response: ::core::option::Option::Some(
                             ::autumn_web::openapi::SchemaEntry {
                                 name: ::core::stringify!(#model_name),
                                 kind: ::autumn_web::openapi::SchemaKind::Ref,
+                                identity: ::core::option::Option::Some(
+                                    ::autumn_web::openapi::type_name_of::<#model_name>
+                                ),
                             }
                         ),
                         mcp_tool: #mcp_create_op,
@@ -12405,12 +12421,18 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             ::autumn_web::openapi::SchemaEntry {
                                 name: ::core::stringify!(#update_name),
                                 kind: ::autumn_web::openapi::SchemaKind::Ref,
+                                identity: ::core::option::Option::Some(
+                                    ::autumn_web::openapi::type_name_of::<#update_name>
+                                ),
                             }
                         ),
                         response: ::core::option::Option::Some(
                             ::autumn_web::openapi::SchemaEntry {
                                 name: ::core::stringify!(#model_name),
                                 kind: ::autumn_web::openapi::SchemaKind::Ref,
+                                identity: ::core::option::Option::Some(
+                                    ::autumn_web::openapi::type_name_of::<#model_name>
+                                ),
                             }
                         ),
                         mcp_tool: #mcp_update_op,
