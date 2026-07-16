@@ -58,6 +58,25 @@ autumn dev
 Visit <http://localhost:3000>. Autumn also auto-mounts `/health`,
 `/actuator/health`, `/actuator/info`, and `/static/js/htmx.min.js`.
 
+### Install a prebuilt binary (macOS & Linux)
+
+Get the `autumn` CLI without compiling from source — no Rust toolchain required:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/madmax983/autumn/trunk-dev/scripts/install.sh | sh
+```
+
+The installer detects your OS and architecture (macOS or Linux, x86_64 or aarch64), downloads the matching prebuilt binary, verifies its sha256 checksum, and installs it to `~/.local/bin/autumn` — printing the line to add if that directory isn't on your `PATH`. Override the target dir with `AUTUMN_INSTALL_DIR`, or pin a version with `AUTUMN_VERSION=vX.Y.Z` (or `--version vX.Y.Z`).
+
+Prefer a manual download? Grab the tarball plus its `.sha256`:
+
+- Latest: `https://github.com/madmax983/autumn/releases/latest/download/autumn-<target>.tar.gz`
+- Pinned: `https://github.com/madmax983/autumn/releases/download/<tag>/autumn-<target>.tar.gz`
+
+where `<target>` is one of `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`, `x86_64-apple-darwin`, or `aarch64-apple-darwin` (Linux binaries are static musl — no glibc version dependency). Binaries track tagged crate releases (e.g. `v0.6.0`); `latest` is the most recent released version — there are no rolling trunk-dev builds. Windows is a documented follow-up (see #2005); build from source there for now.
+
+Prefer building from source? `cargo install --path autumn-cli` still works.
+
 ### Watching custom directories
 
 `autumn dev` always watches `src/`, `static/`, `templates/`, and `migrations/`
