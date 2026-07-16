@@ -1305,6 +1305,50 @@ pub trait Lifecycle {
     )];
 }
 
+/// Context payload delivered to an `on_commit` transition-effect job
+/// (issue #1973).
+///
+/// When a `#[state_machine]` edge declares `on_commit = SomeJob`, firing that
+/// edge via the generated `transition_{field}_to_on_conn` method enqueues
+/// `SomeJob` **transactionally** on the caller's connection with an instance of
+/// this struct as its payload. Because the enqueue writes the job row inside the
+/// caller's own transaction, a rollback drops the effect; the durable worker
+/// runs it post-commit with full `AppState` (at-least-once delivery).
+///
+/// Declare the job to receive it, deduping on the derived key so a retried
+/// transition coalesces into a single delivery:
+///
+/// ```rust,ignore
+/// #[job(name = "send_shipped_email", unique, by = ["idempotency_key"])]
+/// async fn send_shipped_email(
+///     state: AppState,
+///     effect: TransitionEffect,
+/// ) -> AutumnResult<()> {
+///     // effect.model / .field / .record_id / .from_state / .to_state
+///     Ok(())
+/// }
+/// ```
+///
+/// The [`idempotency_key`](TransitionEffect::idempotency_key) is derived from
+/// `(model, field, record_id, from_state, to_state)`, so declaring the job
+/// `unique, by = ["idempotency_key"]` gives idempotent, coalescing delivery.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TransitionEffect {
+    /// The model type name whose field transitioned (e.g. `"Order"`).
+    pub model: String,
+    /// The state-machine field name that transitioned (e.g. `"status"`).
+    pub field: String,
+    /// The record's primary-key value, rendered as a string.
+    pub record_id: String,
+    /// The state the field moved from.
+    pub from_state: String,
+    /// The state the field moved to.
+    pub to_state: String,
+    /// Derived dedup key:
+    /// `"{model}:{field}:{record_id}:{from_state}:{to_state}"`.
+    pub idempotency_key: String,
+}
+
 // ── Maud re-exports ────────────────────────────────────────────────
 
 /// Rendered HTML fragment produced by the [`html!`] macro.
