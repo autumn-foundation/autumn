@@ -264,6 +264,66 @@ pub fn pending_migrations(
     })
 }
 
+/// Run all pending migrations against a `SQLite` database URL (issue #1614, PR3).
+///
+/// The `SQLite` counterpart to [`run_pending`]. `SQLite` is a single-writer local
+/// database, so — unlike the Postgres path — there is **no advisory lock**: no
+/// cross-process serialization is needed and `SQLite` has no `pg_advisory_lock`
+/// primitive. Establishes a synchronous `SqliteConnection` (via
+/// [`crate::db::establish_sqlite_migration_connection`]) and applies pending
+/// migrations through diesel's `MigrationHarness`.
+///
+/// The migration set is taken as a [`MigrationSource<Sqlite>`](diesel::migration::MigrationSource);
+/// the framework's [`EmbeddedMigrations`] (and [`EmbeddedMigrationsRef`]) satisfy
+/// this for the `SQLite` backend exactly as they do for Postgres, so a set
+/// registered via [`AppBuilder::migrations`](crate::app::AppBuilder::migrations)
+/// runs here unchanged.
+///
+/// # Errors
+///
+/// Returns [`MigrationError::Connection`] if the database cannot be opened, or
+/// [`MigrationError::Migration`] if a migration fails.
+#[cfg(feature = "sqlite")]
+pub fn run_pending_sqlite(
+    database_url: &str,
+    migrations: impl diesel::migration::MigrationSource<diesel::sqlite::Sqlite>,
+) -> Result<MigrationResult, MigrationError> {
+    let mut conn = crate::db::establish_sqlite_migration_connection(database_url)
+        .map_err(|e| MigrationError::Connection(e.to_string()))?;
+    let mut harness = HarnessWithOutput::write_to_stdout(&mut conn);
+    let applied = harness
+        .run_pending_migrations(migrations)
+        .map_err(|e| MigrationError::Migration(e.to_string()))?;
+    Ok(MigrationResult {
+        applied: applied.iter().map(|m| format!("{m}")).collect(),
+    })
+}
+
+/// Return names of pending (not yet applied) migrations on a `SQLite` target.
+///
+/// The `SQLite` status counterpart to [`pending_migrations`], used by
+/// [`auto_migrate_sqlite`] to report pending work without applying it.
+///
+/// # Errors
+///
+/// Returns [`MigrationError::Connection`] if the database cannot be opened, or
+/// [`MigrationError::Migration`] if status cannot be determined.
+#[cfg(feature = "sqlite")]
+fn pending_migrations_sqlite(
+    database_url: &str,
+    migrations: impl diesel::migration::MigrationSource<diesel::sqlite::Sqlite>,
+) -> Result<Vec<String>, MigrationError> {
+    let mut conn = crate::db::establish_sqlite_migration_connection(database_url)
+        .map_err(|e| MigrationError::Connection(e.to_string()))?;
+    let pending = conn
+        .pending_migrations(migrations)
+        .map_err(|e| MigrationError::Migration(e.to_string()))?;
+    Ok(pending
+        .iter()
+        .map(|m| m.name().version().to_string())
+        .collect())
+}
+
 pub(crate) fn compare_replica_migration_versions(
     primary: &[String],
     replica: &[String],
@@ -2233,6 +2293,79 @@ pub(crate) fn auto_migrate(
                          rolling deploy (expand/contract pattern)."
                     );
                 }
+                tracing::warn!(
+                    count = pending.len(),
+                    target = %target,
+                    "Pending migrations detected. Run `autumn migrate` to apply them."
+                );
+                for name in &pending {
+                    tracing::warn!(migration = %name, target = %target, "Pending migration");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, target = %target, "Could not check migration status");
+            }
+        }
+    }
+}
+
+/// Run migrations against a `SQLite` control target at startup (issue #1614, PR3).
+///
+/// The `SQLite` counterpart to [`auto_migrate`]: it honors the same profile
+/// policy via [`should_auto_apply`] (dev / development auto-applies; prod /
+/// production applies only when `allow_auto_migrate_in_production` is set;
+/// otherwise it reports pending work), and fails fast (`process::exit(1)`) on an
+/// apply error exactly like the Postgres path.
+///
+/// It deliberately omits the two Postgres-specific mechanisms
+/// [`auto_migrate`] relies on:
+///
+///   * **the advisory lock** — `SQLite` is single-writer; there is no
+///     `pg_advisory_lock` and no cross-process migration race to serialize
+///     (`run_pending_sqlite` applies directly, unlocked).
+///   * **the content-checksum drift guard** — its `autumn_migration_checksums`
+///     bookkeeping is Postgres DDL (`TIMESTAMPTZ`, `now()`, `to_regclass`) and
+///     is not ported to `SQLite` in this PR.
+///
+/// Sharding (directory / shard-map control tables, per-shard fan-out) is
+/// Postgres-only and is rejected upstream at boot
+/// (`sqlite_sharding_unsupported_guard`), so this only ever applies the
+/// registered control migration set.
+#[cfg(feature = "sqlite")]
+pub(crate) fn auto_migrate_sqlite(
+    database_url: &str,
+    profile: Option<&str>,
+    allow_auto_migrate_in_production: bool,
+    migrations: &EmbeddedMigrations,
+    target: &str,
+) {
+    if should_auto_apply(profile, allow_auto_migrate_in_production) {
+        tracing::info!(target = %target, "Running pending SQLite database migrations...");
+        match run_pending_sqlite(database_url, EmbeddedMigrationsRef(migrations)) {
+            Ok(result) if result.applied.is_empty() => {
+                tracing::info!(target = %target, "No pending migrations");
+            }
+            Ok(result) => {
+                for name in &result.applied {
+                    tracing::info!(migration = %name, target = %target, "Applied migration");
+                }
+                tracing::info!(
+                    count = result.applied.len(),
+                    target = %target,
+                    "All pending migrations applied"
+                );
+            }
+            Err(e) => {
+                tracing::error!(error = %e, target = %target, "Failed to run migrations");
+                std::process::exit(1);
+            }
+        }
+    } else {
+        match pending_migrations_sqlite(database_url, EmbeddedMigrationsRef(migrations)) {
+            Ok(pending) if pending.is_empty() => {
+                tracing::info!(target = %target, "Database migrations are up to date");
+            }
+            Ok(pending) => {
                 tracing::warn!(
                     count = pending.len(),
                     target = %target,
