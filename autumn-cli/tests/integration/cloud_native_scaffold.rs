@@ -382,6 +382,26 @@ fn ci_workflow_contains_expected_jobs() {
 }
 
 #[test]
+fn ci_workflow_runs_a11y_verify() {
+    let temp_dir = scaffold("ci-a11y-app");
+    let project_dir = temp_dir.path().join("ci-a11y-app");
+    let ci = fs::read_to_string(project_dir.join(".github/workflows/ci.yml")).unwrap();
+
+    assert!(
+        ci.contains("a11y verify"),
+        "ci.yml must run `autumn a11y verify`"
+    );
+    assert!(
+        ci.contains("scripts/install.sh"),
+        "ci.yml must install the autumn CLI via the install script"
+    );
+    assert!(
+        ci.contains(&format!("v{}", env!("CARGO_PKG_VERSION"))),
+        "ci.yml must pin the installed CLI to this app's autumn version"
+    );
+}
+
+#[test]
 fn ci_workflow_pins_msrv_toolchain() {
     let temp_dir = scaffold("ci-msrv-app");
     let project_dir = temp_dir.path().join("ci-msrv-app");
