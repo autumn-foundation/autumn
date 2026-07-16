@@ -127,12 +127,83 @@ fn collect_files(root: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
+/// The result of the synchronous scan phase: expired candidates plus the tallies
+/// for files decided without needing the (async) defer hook.
+#[derive(Default)]
+struct RecordingScan {
+    /// Expired files awaiting the async defer decision + deletion.
+    expired: Vec<PathBuf>,
+    /// Files kept because not yet expired or with an unreadable mtime.
+    kept: usize,
+    /// Files whose metadata could not be read.
+    errors: usize,
+}
+
+/// Traverse `root` and classify each regular file as expired / kept / error.
+///
+/// Pure synchronous filesystem work (`read_dir` + `metadata`), intended to run
+/// under [`tokio::task::spawn_blocking`] so it never blocks the async executor.
+/// The async defer decision and deletion are handled by the caller.
+fn scan_recordings_root(root: &Path, retention_days: u32, now: SystemTime) -> RecordingScan {
+    let mut scan = RecordingScan::default();
+    let mut files = Vec::new();
+    collect_files(root, &mut files);
+    for path in files {
+        let Ok(metadata) = std::fs::metadata(&path) else {
+            scan.errors += 1;
+            continue;
+        };
+        let Ok(modified) = metadata.modified() else {
+            scan.kept += 1;
+            continue;
+        };
+        if is_expired(modified, now, retention_days) {
+            scan.expired.push(path);
+        } else {
+            scan.kept += 1;
+        }
+    }
+    scan
+}
+
+/// Delete the given (already expired, non-deferred) files, re-checking
+/// [`within_root`] for each. Returns `(deleted, errors)`.
+///
+/// Pure synchronous filesystem work (`canonicalize` + `remove_file`), intended
+/// to run under [`tokio::task::spawn_blocking`].
+fn delete_expired_files(root: &Path, paths: &[PathBuf]) -> (usize, usize) {
+    let mut deleted = 0;
+    let mut errors = 0;
+    for path in paths {
+        if !within_root(root, path) {
+            // Should not happen for a path collected from within root, but the
+            // guard keeps a symlinked entry from escaping.
+            errors += 1;
+            continue;
+        }
+        match delete_recording_file(path) {
+            Ok(()) => deleted += 1,
+            Err(error) => {
+                tracing::warn!(path = %path.display(), %error, "media retention: failed to delete recording file");
+                errors += 1;
+            }
+        }
+    }
+    (deleted, errors)
+}
+
 /// Sweep `root` once, deleting recording files older than the retention window.
 ///
 /// `now` is taken as a parameter (never the wall clock) so the decision is
 /// deterministic for tests. A `retention_days` of `0` disables the sweep and
 /// returns an empty report. `defer`, when provided, can hold back an
 /// otherwise-expired file for the next tick.
+///
+/// The blocking filesystem work (directory traversal + `metadata`, then
+/// `canonicalize` + `remove_file`) runs on [`tokio::task::spawn_blocking`]
+/// threads so it never stalls the async executor; the app-overridable async
+/// [`RetentionDefer`] hook is consulted between the two phases, preserving its
+/// per-file semantics.
 pub async fn sweep_recordings_root(
     root: &Path,
     retention_days: u32,
@@ -144,42 +215,37 @@ pub async fn sweep_recordings_root(
         return report;
     }
 
-    let mut files = Vec::new();
-    collect_files(root, &mut files);
+    // Phase 1 — scan off the executor.
+    let scan = {
+        let root = root.to_path_buf();
+        tokio::task::spawn_blocking(move || scan_recordings_root(&root, retention_days, now))
+            .await
+            .unwrap_or_default()
+    };
+    report.kept = scan.kept;
+    report.errors = scan.errors;
 
-    for path in files {
-        let Ok(metadata) = std::fs::metadata(&path) else {
-            report.errors += 1;
-            continue;
-        };
-        let Ok(modified) = metadata.modified() else {
-            report.kept += 1;
-            continue;
-        };
-        if !is_expired(modified, now, retention_days) {
-            report.kept += 1;
-            continue;
-        }
+    // Between phases — consult the async defer hook per expired file.
+    let mut to_delete = Vec::with_capacity(scan.expired.len());
+    for path in scan.expired {
         if let Some(defer) = defer
             && defer(path.clone()).await
         {
             report.deferred += 1;
             continue;
         }
-        if !within_root(root, &path) {
-            // Should not happen for a path collected from within root, but the
-            // guard keeps a symlinked entry from escaping.
-            report.errors += 1;
-            continue;
-        }
-        match delete_recording_file(&path) {
-            Ok(()) => report.deleted += 1,
-            Err(error) => {
-                tracing::warn!(path = %path.display(), %error, "media retention: failed to delete recording file");
-                report.errors += 1;
-            }
-        }
+        to_delete.push(path);
     }
+
+    // Phase 2 — delete off the executor.
+    let (deleted, delete_errors) = {
+        let root = root.to_path_buf();
+        tokio::task::spawn_blocking(move || delete_expired_files(&root, &to_delete))
+            .await
+            .unwrap_or((0, 0))
+    };
+    report.deleted = deleted;
+    report.errors += delete_errors;
 
     report
 }

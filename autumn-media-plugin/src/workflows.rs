@@ -110,11 +110,24 @@ pub struct FinalizeRecordingJobArgs {
 
 // ── Built-in `#[job]` handlers (the default engine) ──────────────────────────
 
+// `unique_by = "workflow_id"` + a TTL window make a re-enqueue of the same
+// workflow_id a coalesced no-op (returns `Ok(())`, spawns no second job). This
+// is what keeps `finalize_recording`'s partial-failure retry idempotent: if the
+// thumbnail enqueue succeeds but the preview enqueue then fails, the retried
+// orchestration re-enqueues the thumbnail as a dedup no-op (only the missing
+// preview is filled), so the app-supplied `MediaArtifactSink::on_completed` is
+// not invoked twice for the same artifact via that path. The TTL (5 min) simply
+// has to outlast the finalize retry envelope (3 attempts, 1s exponential
+// backoff); it is keyed on the caller's own `workflow_id`, so it only ever
+// coalesces work the caller already labelled as one logical workflow.
 #[job(
     name = "autumn_media_extract_thumbnail",
     max_attempts = 3,
     backoff_ms = 1000,
-    queue = "media"
+    queue = "media",
+    unique,
+    unique_by = "workflow_id",
+    unique_for_ms = 300_000
 )]
 async fn extract_thumbnail(state: AppState, args: ThumbnailJobArgs) -> AutumnResult<()> {
     let (storage, ffmpeg) = resolve_engine(&state)?;
@@ -123,11 +136,16 @@ async fn extract_thumbnail(state: AppState, args: ThumbnailJobArgs) -> AutumnRes
     deliver_result(&state, MediaArtifactKind::Thumbnail, workflow_id, result).await
 }
 
+// See `extract_thumbnail`: the same workflow_id-keyed TTL dedup makes the
+// finalize retry re-enqueue of the preview a coalesced no-op.
 #[job(
     name = "autumn_media_extract_preview",
     max_attempts = 3,
     backoff_ms = 1000,
-    queue = "media"
+    queue = "media",
+    unique,
+    unique_by = "workflow_id",
+    unique_for_ms = 300_000
 )]
 async fn extract_preview(state: AppState, args: PreviewJobArgs) -> AutumnResult<()> {
     let (storage, ffmpeg) = resolve_engine(&state)?;
@@ -159,6 +177,16 @@ async fn finalize_recording(state: AppState, args: FinalizeRecordingJobArgs) -> 
     // Orchestration: dispatch the two derived-artifact jobs through the same
     // seam, so an installed delegate governs the sub-work too and each gets its
     // own durable retry envelope.
+    //
+    // Partial-failure retry safety: if `queue_thumbnail` succeeds but
+    // `queue_preview` then fails, this job returns `Err` and is retried. The two
+    // sub-jobs are `unique`-keyed on their `workflow_id` (see `extract_thumbnail`
+    // / `extract_preview`), so the retry re-enqueues the already-queued thumbnail
+    // as a coalesced no-op and only fills the missing preview — no duplicate
+    // sub-job, and therefore no duplicate `on_completed` for the same artifact
+    // via this orchestration path. (The durable engine is still at-least-once, so
+    // the app-side sink must remain idempotent by `workflow_id` + `kind` for the
+    // general worker-crash-after-persist case, which no enqueue key can remove.)
     let workflows = state.extension::<MediaWorkflows>().ok_or_else(|| {
         AutumnError::internal_server_error_msg("MediaWorkflows extension is not installed")
     })?;
@@ -391,7 +419,7 @@ async fn run_thumbnail(
     storage: &MediaStorage,
     args: ThumbnailJobArgs,
 ) -> Result<MediaArtifact, MediaError> {
-    let (output_path, ephemeral) = staged_output(storage, &args.output_key, "jpg");
+    let (output_path, ephemeral) = staged_output(storage, &args.output_key, "jpg")?;
     let command = FfmpegPosterCommand::new(
         ffmpeg_bin,
         args.source_paths.clone(),
@@ -425,7 +453,7 @@ async fn run_preview(
 ) -> Result<MediaArtifact, MediaError> {
     let cols = PREVIEW_SPRITE_COLUMNS;
     let rows = args.frame_count.div_ceil(cols).max(1);
-    let (sprite_path, sprite_ephemeral) = staged_output(storage, &args.sprite_key, "jpg");
+    let (sprite_path, sprite_ephemeral) = staged_output(storage, &args.sprite_key, "jpg")?;
     let command = FfmpegPreviewSpriteCommand::new(
         ffmpeg_bin,
         args.source_paths.clone(),
@@ -454,7 +482,7 @@ async fn run_preview(
         PREVIEW_CELL_HEIGHT,
         &sprite_file.public_url,
     );
-    let (vtt_path, vtt_ephemeral) = staged_output(storage, &args.vtt_key, "vtt");
+    let (vtt_path, vtt_ephemeral) = staged_output(storage, &args.vtt_key, "vtt")?;
     write_text_file(&vtt_path, &vtt).await?;
     let vtt_bytes = u64::try_from(vtt.len()).unwrap_or(u64::MAX);
     let vtt_file = persist_and_cleanup(
@@ -484,7 +512,7 @@ async fn run_transcode(
     storage: &MediaStorage,
     args: TranscodeJobArgs,
 ) -> Result<MediaArtifact, MediaError> {
-    let (output_path, ephemeral) = staged_output(storage, &args.output_key, "mp4");
+    let (output_path, ephemeral) = staged_output(storage, &args.output_key, "mp4")?;
     let command = FfmpegHighlightCommand::new(
         ffmpeg_bin,
         args.source_path.clone(),
@@ -531,12 +559,71 @@ where
 /// cleaned up. The **S3** backend stages to a unique temp file that is uploaded
 /// and then removed — so the returned `bool` reports whether the path is
 /// ephemeral.
-fn staged_output(storage: &MediaStorage, key: &str, ext: &str) -> (PathBuf, bool) {
+///
+/// # Errors
+///
+/// Returns [`MediaError::ArtifactWrite`] when a local output key would escape
+/// the storage root (see [`join_within_root`]). The S3 arm cannot fail (it
+/// stages under [`std::env::temp_dir`]).
+fn staged_output(
+    storage: &MediaStorage,
+    key: &str,
+    ext: &str,
+) -> Result<(PathBuf, bool), MediaError> {
     match storage {
-        MediaStorage::Local { root, .. } => (root.join(storage.object_key(key)), false),
-        MediaStorage::S3(_) => (
+        MediaStorage::Local { root, .. } => {
+            // `object_key` only slash-trims a local key — it does not reject a
+            // `..`/absolute segment — so guard the join against traversal before
+            // an encode writes to `root/{object_key}`.
+            let path = join_within_root(root, &storage.object_key(key))?;
+            Ok((path, false))
+        }
+        MediaStorage::S3(_) => Ok((
             std::env::temp_dir().join(format!("autumn-media-{}.{ext}", uuid::Uuid::new_v4())),
             true,
+        )),
+    }
+}
+
+/// Join an already-slash-trimmed caller key onto the local backend `root`,
+/// rejecting any key that could escape it.
+///
+/// Slice-1's key resolution ([`MediaStorage::object_key`]) only slash-trims a
+/// local key; its dot-segment handling is URL-only (`encode_key_for_url`), so
+/// nothing upstream stops a `..`/absolute/drive-prefix segment from reaching the
+/// on-disk join here — and the local encode output is written straight to
+/// `root/{object_key}`. This guard rejects such keys before the join (defense in
+/// depth), keeping every staged local output inside `root`. Only
+/// [`std::path::Component::Normal`] segments are allowed; a `ParentDir` (`..`),
+/// a `RootDir`/`Prefix` (absolute), a leading `CurDir` (`.`), or an
+/// empty/dot-only key is rejected.
+fn join_within_root(root: &Path, key: &str) -> Result<PathBuf, MediaError> {
+    use std::path::Component;
+    let relative = Path::new(key);
+    let mut has_normal = false;
+    for component in relative.components() {
+        match component {
+            Component::Normal(_) => has_normal = true,
+            _ => return Err(rejected_output_key(key)),
+        }
+    }
+    if !has_normal {
+        // Empty or dot-only key: nothing legitimate to write under `root`.
+        return Err(rejected_output_key(key));
+    }
+    Ok(root.join(relative))
+}
+
+/// Build the traversal-rejection error for an unsafe local output key, reusing
+/// [`MediaError::ArtifactWrite`] (the crate's "could not write this artifact
+/// path" error) rather than introducing a new variant.
+fn rejected_output_key(key: &str) -> MediaError {
+    MediaError::ArtifactWrite {
+        path: key.to_owned(),
+        source: std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "media output key must stay within the storage root \
+             (no `..`, absolute, or dot-only path segments)",
         ),
     }
 }
@@ -632,6 +719,42 @@ mod tests {
     }
 
     #[test]
+    fn derived_sub_jobs_dedup_on_workflow_id() {
+        use autumn_web::job::JobUniquenessWindow;
+        // The thumbnail and preview jobs are `unique` on `workflow_id` with a TTL
+        // window, so a `finalize_recording` partial-failure retry coalesces the
+        // already-enqueued sub-job instead of spawning a duplicate. The transcode
+        // and orchestration jobs carry no dedup.
+        let infos = media_job_infos("media");
+        let uniqueness = |name: &str| {
+            infos
+                .iter()
+                .find(|info| info.name == name)
+                .expect("job registered")
+                .uniqueness
+                .clone()
+        };
+        for name in [
+            "autumn_media_extract_thumbnail",
+            "autumn_media_extract_preview",
+        ] {
+            let u = uniqueness(name).unwrap_or_else(|| panic!("{name} must be unique"));
+            assert_eq!(
+                u.by,
+                vec!["workflow_id".to_owned()],
+                "{name} keys on workflow_id"
+            );
+            assert!(
+                matches!(u.window, JobUniquenessWindow::TtlMs(ms) if ms > 0),
+                "{name} must use a TTL dedup window, got {:?}",
+                u.window
+            );
+        }
+        assert!(uniqueness("autumn_media_transcode_window").is_none());
+        assert!(uniqueness("autumn_media_finalize_recording").is_none());
+    }
+
+    #[test]
     fn job_args_round_trip_through_json() {
         let args = thumbnail_args(PathBuf::from("/rec/seg.mp4"));
         let json = serde_json::to_string(&args).expect("serialize");
@@ -667,9 +790,36 @@ mod tests {
     #[test]
     fn staged_output_is_final_for_local_and_ephemeral_for_temp() {
         let storage = local_storage(std::path::Path::new("/srv/media"));
-        let (path, ephemeral) = staged_output(&storage, "/thumbnails/7.jpg", "jpg");
+        let (path, ephemeral) =
+            staged_output(&storage, "/thumbnails/7.jpg", "jpg").expect("normal key");
         assert!(!ephemeral, "local backend writes to its served location");
         assert_eq!(path, PathBuf::from("/srv/media/thumbnails/7.jpg"));
+    }
+
+    #[test]
+    fn staged_output_rejects_local_traversal_keys() {
+        let storage = local_storage(std::path::Path::new("/srv/media"));
+        // A `..` segment would escape the media root — must be rejected, not
+        // joined into `/srv/media/../../etc/...`. (A plain absolute key like
+        // `/etc/passwd` is *not* traversal here: `object_key` slash-trims it to
+        // the benign in-root relative key `etc/passwd`, so it is not in this set.)
+        for key in [
+            "../../etc/passwd",
+            "clips/../../../etc/passwd",
+            "..",
+            ".",
+            "",
+        ] {
+            let err = staged_output(&storage, key, "jpg")
+                .expect_err("traversal/degenerate key must be rejected");
+            assert!(
+                matches!(err, super::MediaError::ArtifactWrite { .. }),
+                "expected ArtifactWrite rejection for {key:?}, got {err:?}"
+            );
+        }
+        // A normal nested key still resolves inside the root.
+        let (path, _) = staged_output(&storage, "previews/7.vtt", "vtt").expect("normal key");
+        assert_eq!(path, PathBuf::from("/srv/media/previews/7.vtt"));
     }
 
     #[tokio::test]
@@ -742,7 +892,8 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let storage = local_storage(temp.path());
         // Stage a real "encoded" file at the served location.
-        let (output_path, ephemeral) = staged_output(&storage, "clips/7.mp4", "mp4");
+        let (output_path, ephemeral) =
+            staged_output(&storage, "clips/7.mp4", "mp4").expect("normal key");
         std::fs::create_dir_all(output_path.parent().expect("parent")).expect("mkdir");
         std::fs::write(&output_path, b"encoded-bytes").expect("write");
 
