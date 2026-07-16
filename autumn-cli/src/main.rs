@@ -38,6 +38,7 @@ mod release;
 mod routes;
 mod routes_audit;
 mod scaling_driver;
+mod schema;
 mod seed;
 mod serve;
 mod setup;
@@ -347,6 +348,14 @@ enum Commands {
         /// When omitted, the config value is used (default `0` = fail fast).
         #[arg(long, value_name = "SECS")]
         wait: Option<u64>,
+    },
+    /// Declarative schema tooling (experimental; wave-15).
+    ///
+    /// Reads `#[model]` structs into the shared schema IR. Slice 2 ships only
+    /// the read-only `parse` action; `diff`/`snapshot`/… arrive in later slices.
+    Schema {
+        #[command(subcommand)]
+        action: schema::SchemaAction,
     },
     /// Create, drop, or reset the database itself.
     ///
@@ -2642,6 +2651,7 @@ fn run_command(command: Commands) {
                 },
             );
         }
+        Commands::Schema { action } => schema::run(action),
         Commands::Migrate {
             action,
             with_maintenance,
