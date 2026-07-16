@@ -96,6 +96,16 @@ wait_for_ssh() { # <timeout-secs>
 # failures. Writes "total failures" to the given file on stop.
 start_prober() { # <outfile>
   local out="$1"
+  # The `>/dev/null 2>&1` on the backgrounded subshell is load-bearing when the
+  # caller captures the PID via `$(start_prober ...)`. Command substitution reads
+  # from a pipe and only returns once EVERY process holding that pipe's write end
+  # (fd 1) has closed it. Without this redirect the backgrounded subshell inherits
+  # the substitution's fd 1 and keeps it open for its entire lifetime — which ends
+  # only at stop_prober, much later — so `$(...)` would block here (hanging the
+  # redeploy/rollback until the job timeout). Redirecting the subshell's stdout to
+  # /dev/null detaches it from the substitution pipe, so `echo $!` is the sole
+  # writer left and the capture returns immediately while the prober keeps running.
+  # The subshell already reports its result via the `${out}` file, not stdout.
   (
     total=0; fail=0
     while [ ! -f "${WORK}/prober.stop" ]; do
@@ -104,7 +114,7 @@ start_prober() { # <outfile>
       sleep 0.1
     done
     echo "${total} ${fail}" > "${out}"
-  ) &
+  ) >/dev/null 2>&1 &
   echo $!
 }
 stop_prober() { touch "${WORK}/prober.stop"; wait "$1" 2>/dev/null || true; rm -f "${WORK}/prober.stop"; }
