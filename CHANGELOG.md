@@ -5,7 +5,7 @@ All notable changes to the Autumn framework will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.5.0] - 2026-06-16
 
 ### Added
 
@@ -2227,6 +2227,18 @@ To opt out of the generated `page` method: implement your own list handler using
 - Expose recent structured logs via GET /actuator/logfile (#1168, #1184).
 - **cli:** Add `--api` flag for JSON-only scaffold generation (#1153).
 - Add transactional test isolation for database tests (#1055).
+- **0.5.0-cleanup:** CSRF multipart fix, reddit-clone feature expansi… (#1250)([12bbb7f](https://github.com/madmax983/autumn/commit/12bbb7f15b4a1b84ad7092efe42581ad1319f6f7))
+- Expose recent structured logs via GET /actuator/logfile (#1168) (#1184)([f6dabc0](https://github.com/madmax983/autumn/commit/f6dabc07cc3072dfe321a0dc6828857826c778cb))
+- **cli:** Add --api flag for json-only scaffold generation (#1153)([c9b96d1](https://github.com/madmax983/autumn/commit/c9b96d12be11e047ec33dc5e6c2c1f6f6d999028))
+- First-class API versioning with deprecation & sunset lifecycles (#1077)([490022b](https://github.com/madmax983/autumn/commit/490022b97991b87d83baf400d5bd8834b50509f5))
+- Add transactional test isolation for database tests (#1055)([bb42459](https://github.com/madmax983/autumn/commit/bb42459ba4429d80f1fd10c580478c152f9fe558))
+- **cli:** Write autumn.toml stubs, generate OAuth login buttons, and require PKCE verifiers([b922a05](https://github.com/madmax983/autumn/commit/b922a050e9c014f8d7913f5d92e973070a195ee3))
+- Implement outbound signed webhooks with retries, DLQ, and actuator endpoints (#792) (#923)([e6e535c](https://github.com/madmax983/autumn/commit/e6e535c5f32010ce9277729a320e6307a9f44df6))
+- Postgres full-text search (FTS) with dynamic migrations and repository macros (#842) (#905)([fbc2bf5](https://github.com/madmax983/autumn/commit/fbc2bf50e68a0e5c76071f8e30479dbecf5399fa))
+- High-performance bulk repository CRUD operations (issue #841) (#881)([45e39f6](https://github.com/madmax983/autumn/commit/45e39f6ba3e2f2263782ab7d8649ef4b05e482a7))
+- **tenancy:** Implement first-class opt-in row-level multi-tenancy (#876)([15029e7](https://github.com/madmax983/autumn/commit/15029e724a620ce9ca04aca585be29f7dbc210b2))
+- **db:** Per-query statement timeouts and slow-query telemetry (#826) (#865)([37bfed2](https://github.com/madmax983/autumn/commit/37bfed2b77b2291c2438c92451d43e2e9fb3b12e))
+- Expose plugin hooks at framework-owned dependency boundaries (#690) (#862)([ca1b6ce](https://github.com/madmax983/autumn/commit/ca1b6cea0b9b793e3af5ab963fec601638199dfd))
 
 ### Fixed
 
