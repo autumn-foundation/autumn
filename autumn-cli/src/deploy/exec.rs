@@ -1822,24 +1822,21 @@ mod tests {
         // The proxy unit is written to the public port; the app unit is a
         // slot-scoped unit on a SEPARATE loopback port (never the public port).
         let proxy_unit = exec.shell_for("proxy-install").expect("proxy-install ran");
-        assert!(proxy_unit.contains("enable --now kamal-proxy.service"));
-        // The proxy unit is STAGED next to the live unit (`.new` suffix), then the
-        // proxy-install op commits it into place with `mv` only when it differs —
-        // so the shared proxy is restarted only when its listener actually changed.
+        assert_eq!(
+            proxy_unit,
+            "systemctl daemon-reload && systemctl enable --now kamal-proxy.service",
+        );
+        // The proxy unit is written directly to its FINAL path — no `.new` staging
+        // path, so concurrent shared-host deploys can't race on a fixed staging
+        // file (the reworked unit is invariant to per-app TLS, so there is nothing
+        // to diff/restart to adopt).
         assert!(
             exec.calls().iter().any(|c| matches!(
                 c,
                 RecordedCall::Upload { remote_path, .. }
-                    if remote_path == "/etc/systemd/system/kamal-proxy.service.new"
+                    if remote_path == "/etc/systemd/system/kamal-proxy.service"
             )),
-            "the proxy systemd unit is staged for a diff"
-        );
-        assert!(
-            proxy_unit.contains(
-                "mv '/etc/systemd/system/kamal-proxy.service.new' \
-                '/etc/systemd/system/kamal-proxy.service'"
-            ),
-            "proxy-install commits the staged unit into place: {proxy_unit}"
+            "the proxy systemd unit is written to its final path"
         );
         let enable = exec.shell_for("enable-now").expect("enable-now ran");
         assert!(

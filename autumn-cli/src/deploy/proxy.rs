@@ -47,14 +47,6 @@ const KAMAL_PROXY_BIN: &str = "/usr/local/bin/kamal-proxy";
 /// Systemd unit path supervising the proxy process.
 const KAMAL_PROXY_UNIT_PATH: &str = "/etc/systemd/system/kamal-proxy.service";
 
-/// Staging path the freshly-rendered proxy unit is written to first, so
-/// [`KamalProxyController::ensure_installed_ops`] can diff it against the live
-/// unit and restart the shared proxy ONLY when its listener actually changed.
-/// It sits on the same filesystem as [`KAMAL_PROXY_UNIT_PATH`] so committing it
-/// is an atomic `mv`, and its `.new` suffix (not `.service`) keeps systemd from
-/// ever loading it as a unit.
-const KAMAL_PROXY_UNIT_STAGING_PATH: &str = "/etc/systemd/system/kamal-proxy.service.new";
-
 /// Controls the reverse proxy that fronts the public port.
 ///
 /// The methods return ordered [`DeployOp`]s (rather than driving the executor
@@ -194,41 +186,26 @@ impl KamalProxyController {
 impl ProxyController for KamalProxyController {
     fn ensure_installed_ops(&self, public_port: u16) -> Vec<DeployOp> {
         vec![
-            // Stage the freshly-rendered unit next to the live one so the install
-            // op can diff the two before committing.
+            // Write the freshly-rendered unit directly to its final path. The unit
+            // is invariant to any app's TLS state — `run` always binds both the
+            // HTTP and HTTPS listeners (see [`Self::render_proxy_unit`]) — so it
+            // does not change when an app opts into TLS, and there is nothing to
+            // "restart to adopt". Writing straight to the final path (rather than a
+            // fixed staging path + diff/`mv`) also avoids a concurrent-deploy race:
+            // kamal-proxy is SHARED ingress, and two `deploy up` runs against the
+            // same host would otherwise interleave on one fixed staging file.
             DeployOp::WriteFile {
                 label: "proxy-write-unit",
                 contents: FileContents::Plain(Self::render_proxy_unit(public_port)),
-                remote_path: KAMAL_PROXY_UNIT_STAGING_PATH.to_owned(),
+                remote_path: KAMAL_PROXY_UNIT_PATH.to_owned(),
                 mode: Some(0o644),
             },
-            // The proxy is SHARED ingress for every app on the host, so restarting
-            // it blips them all — it must be (re)started ONLY when its unit actually
-            // changed. `enable --now` alone is insufficient: it starts a stopped
-            // proxy but will NOT restart an already-running one, so a change to the
-            // listener ports (e.g. bumping the public `--http-port`) on a proxy that
-            // is already up would keep serving the old process. So: if the staged
-            // unit matches the live one, drop the staging copy and just make sure
-            // the proxy is enabled+running (idempotent, no restart, no blip);
-            // otherwise commit the new unit atomically, `daemon-reload`, and restart
-            // so the new listener takes effect. Because the unit no longer varies
-            // with any app's TLS state (both listeners are always bound), a plain
-            // non-TLS app deploy renders an identical unit and takes the no-restart
-            // branch. `restart` also cleanly covers the first-ever install, where
-            // the live unit is absent (cmp differs) and there is no running process
-            // yet — it simply starts.
+            // Reload systemd so the (possibly first-ever) unit is picked up, then
+            // `enable --now` to make sure the shared proxy is enabled and running.
+            // Idempotent and safe on every deploy.
             DeployOp::Run(RemoteCommand::new(
                 "proxy-install",
-                format!(
-                    "if cmp -s {staging} {unit}; then \
-                     rm -f {staging}; systemctl enable --now kamal-proxy.service; \
-                     else \
-                     mv {staging} {unit}; systemctl daemon-reload; \
-                     systemctl enable kamal-proxy.service; \
-                     systemctl restart kamal-proxy.service; fi",
-                    staging = shell_quote(KAMAL_PROXY_UNIT_STAGING_PATH),
-                    unit = shell_quote(KAMAL_PROXY_UNIT_PATH),
-                ),
+                "systemctl daemon-reload && systemctl enable --now kamal-proxy.service".to_owned(),
             )),
         ]
     }
@@ -368,8 +345,9 @@ mod tests {
         let proxy = KamalProxyController::new(60);
         let ops = proxy.ensure_installed_ops(8080);
         assert_eq!(ops.len(), 2);
-        // First stages the proxy systemd unit (bound to the public port) next to
-        // the live unit, so the install op can diff before committing.
+        // Writes the proxy systemd unit (bound to the public port) directly to its
+        // FINAL path — no staging path, no diff/`mv`, so concurrent shared-host
+        // deploys can't race on a fixed staging file.
         match &ops[0] {
             DeployOp::WriteFile {
                 label,
@@ -378,7 +356,7 @@ mod tests {
                 ..
             } => {
                 assert_eq!(*label, "proxy-write-unit");
-                assert_eq!(remote_path, KAMAL_PROXY_UNIT_STAGING_PATH);
+                assert_eq!(remote_path, KAMAL_PROXY_UNIT_PATH);
                 let FileContents::Plain(unit) = contents else {
                     panic!("proxy unit must be plain text");
                 };
@@ -386,81 +364,16 @@ mod tests {
             }
             other => panic!("op 0 should write the proxy unit, got {other:?}"),
         }
-        // …then diffs it against the live unit and daemon-reloads/(re)starts it.
-        assert_eq!(ops[1].label(), "proxy-install");
-    }
-
-    /// Extract the (identical-unit, changed-unit) branch bodies of the
-    /// `proxy-install` op's `if cmp -s … ; then … else … fi` shell, so a test can
-    /// assert which systemctl actions each branch performs.
-    fn proxy_install_branches(proxy: &KamalProxyController) -> (String, String) {
-        let ops = proxy.ensure_installed_ops(8080);
+        // …then a single idempotent daemon-reload + enable --now — no change-gated
+        // restart (the unit is invariant to per-app TLS, so there is nothing to
+        // restart to adopt).
         let DeployOp::Run(cmd) = &ops[1] else {
             panic!("op 1 must be the proxy-install Run op");
         };
         assert_eq!(cmd.label, "proxy-install");
-        // Guard the restart on an actual unit diff so shared ingress is not blipped
-        // on every deploy.
-        assert!(
-            cmd.shell.contains("cmp -s"),
-            "install must diff staged vs live unit, got: {}",
+        assert_eq!(
             cmd.shell,
-        );
-        let after_then = cmd
-            .shell
-            .split_once("; then ")
-            .expect("install shell must have a then-branch")
-            .1;
-        let (then_branch, else_branch) = after_then
-            .split_once(" else ")
-            .expect("install shell must have an else-branch");
-        (then_branch.to_owned(), else_branch.to_owned())
-    }
-
-    #[test]
-    fn proxy_restart_only_fires_when_the_unit_changed() {
-        // The changed-unit branch commits the new unit, reloads, and RESTARTS so a
-        // changed listener (e.g. a bumped public `--http-port`) actually takes
-        // effect; the no-change branch must NOT restart the shared proxy (no blip).
-        let (then_branch, else_branch) = proxy_install_branches(&KamalProxyController::new(60));
-
-        // No-change branch: never restarts.
-        assert!(
-            !then_branch.contains("restart"),
-            "no-change branch must not restart the shared proxy, got: {then_branch}",
-        );
-        // Changed branch: commit + daemon-reload BEFORE restart, so the restart
-        // loads the freshly written unit.
-        assert!(
-            else_branch.contains("mv") && else_branch.contains("systemctl daemon-reload"),
-            "changed branch must commit the unit and daemon-reload, got: {else_branch}",
-        );
-        assert!(
-            else_branch.contains("systemctl restart kamal-proxy.service"),
-            "changed branch must restart the proxy, got: {else_branch}",
-        );
-        let reload = else_branch
-            .find("systemctl daemon-reload")
-            .expect("daemon-reload present");
-        let restart = else_branch
-            .find("systemctl restart")
-            .expect("restart present");
-        assert!(
-            reload < restart,
-            "daemon-reload must precede restart, got: {else_branch}",
-        );
-    }
-
-    #[test]
-    fn proxy_install_no_change_branch_keeps_proxy_enabled_and_running() {
-        // When the unit is unchanged the proxy is left untouched apart from an
-        // idempotent `enable --now` (starts it if a reboot left it down, no-op —
-        // never a restart — when it is already up), matching the prior guarantee
-        // that the proxy is up after install without blipping a running one.
-        let (then_branch, _else_branch) = proxy_install_branches(&KamalProxyController::new(60));
-        assert!(
-            then_branch.contains("systemctl enable --now kamal-proxy.service"),
-            "no-change branch must keep the proxy enabled and running, got: {then_branch}",
+            "systemctl daemon-reload && systemctl enable --now kamal-proxy.service",
         );
     }
 }
