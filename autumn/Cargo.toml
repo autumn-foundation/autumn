@@ -394,6 +394,20 @@ path = "tests/sqlite_db_extractor.rs"
 name = "sqlite_pool_pragmas"
 path = "tests/sqlite_pool_pragmas.rs"
 
+# SQLite scope-threading compile proof (issue #1614, Codex P1). Pins that
+# `Scope::list` / `ScopeQuery::load` accept `&mut RuntimeConnection` (the SQLite
+# wrapper under this feature) — the connection the repository macro passes into a
+# scoped list route — rather than a hard-coded `&mut AsyncPgConnection`. Fails to
+# compile before the threading; no-op for Postgres. (Deliberately scope-surface
+# only: a full `#[repository]`'s Pg-specific CRUD codegen is a separate SQLite
+# concern.) Only meaningful under `--features sqlite`; the file is
+# `#![cfg(feature = "sqlite")]` so a default `cargo test` compiles it to an empty
+# (passing) binary. Run explicitly:
+# `cargo test -p autumn-web --features sqlite --test sqlite_scoped_repository`.
+[[test]]
+name = "sqlite_scoped_repository"
+path = "tests/sqlite_scoped_repository.rs"
+
 # Isolated: sets process-wide proxy env vars (HTTP_PROXY/HTTPS_PROXY/ALL_PROXY)
 # to verify pinned SSRF-safe clients bypass env proxies. Cannot share the
 # consolidated binary — those vars would race the inline network tests.

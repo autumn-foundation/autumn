@@ -8490,7 +8490,7 @@ mod validate_repository_api_policies_tests {
         fn list<'a>(
             &'a self,
             _ctx: &'a PolicyContext,
-            _conn: &'a mut diesel_async::AsyncPgConnection,
+            _conn: &'a mut crate::db::RuntimeConnection,
         ) -> BoxFuture<'a, crate::AutumnResult<Vec<TestPost>>> {
             Box::pin(async { Ok(Vec::new()) })
         }

@@ -406,15 +406,16 @@ pub trait Scope<R: Send + Sync + 'static>: Send + Sync + 'static {
     fn list<'a>(
         &'a self,
         _ctx: &'a PolicyContext,
-        _conn: &'a mut diesel_async::AsyncPgConnection,
+        _conn: &'a mut crate::db::RuntimeConnection,
     ) -> BoxFuture<'a, crate::AutumnResult<Vec<R>>> {
         Box::pin(async { Ok(Vec::new()) })
     }
 }
 
 /// `Scope` companion that compiles when the `db` feature is off.
-/// The `db`-gated form takes `&mut AsyncPgConnection`; this one
-/// has no connection arg.
+/// The `db`-gated form takes `&mut RuntimeConnection` (the runtime
+/// pool connection — `AsyncPgConnection` by default, the `SQLite`
+/// wrapper under `--features sqlite`); this one has no connection arg.
 #[cfg(not(feature = "db"))]
 pub trait Scope<R: Send + Sync + 'static>: Send + Sync + 'static {
     fn list<'a>(&'a self, _ctx: &'a PolicyContext) -> BoxFuture<'a, crate::AutumnResult<Vec<R>>> {
@@ -450,7 +451,7 @@ impl<R: Send + Sync + 'static> ScopeQuery<'_, R> {
     /// scope's own errors otherwise.
     pub async fn load(
         self,
-        conn: &mut diesel_async::AsyncPgConnection,
+        conn: &mut crate::db::RuntimeConnection,
     ) -> crate::AutumnResult<Vec<R>> {
         let scope = self.ctx.policy_registry.scope::<R>().ok_or_else(|| {
             crate::AutumnError::from(std::io::Error::other(format!(
