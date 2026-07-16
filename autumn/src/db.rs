@@ -1207,7 +1207,31 @@ fn build_sqlite_pool(
     } else {
         pool_size.max(1)
     };
-    let manager = AsyncDieselConnectionManager::<RuntimeConnection>::new(target);
+    // SQLite starts every connection with `foreign_keys` OFF, so a bare manager
+    // would hand out pooled connections that silently ignore `REFERENCES`
+    // constraints — orphan rows and referential-integrity violations become
+    // possible for the whole app (addresses Codex P1). Turn foreign-key
+    // enforcement ON during EVERY pooled connection's setup, mirroring how the
+    // sync store enables it for its own SQLite connection (see
+    // `crate::sync::store` — `PRAGMA foreign_keys = ON`). A `custom_setup`
+    // callback on the manager runs once per newly-created connection, which is
+    // exactly the per-connection hook we need (the same mechanism the Postgres
+    // path uses to install TLS).
+    let mut config = diesel_async::pooled_connection::ManagerConfig::<RuntimeConnection>::default();
+    config.custom_setup = Box::new(|url: &str| {
+        use diesel_async::{AsyncConnection as _, SimpleAsyncConnection as _};
+        let url = url.to_owned();
+        async move {
+            let mut conn = RuntimeConnection::establish(&url).await?;
+            conn.batch_execute("PRAGMA foreign_keys = ON")
+                .await
+                .map_err(diesel::ConnectionError::CouldntSetupConfiguration)?;
+            Ok(conn)
+        }
+        .boxed()
+    });
+    let manager =
+        AsyncDieselConnectionManager::<RuntimeConnection>::new_with_config(target, config);
     Ok(Pool::builder(manager)
         .max_size(max_size)
         .wait_timeout(Some(timeout))
