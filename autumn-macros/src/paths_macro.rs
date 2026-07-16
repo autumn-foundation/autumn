@@ -66,3 +66,64 @@ pub fn paths_macro(input: TokenStream) -> TokenStream {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use quote::quote;
+
+    #[test]
+    fn test_empty_input() {
+        let input = quote! {};
+        let output = paths_macro(input);
+        let expected = quote! {
+            pub mod paths {}
+        };
+        assert_eq!(output.to_string(), expected.to_string());
+    }
+
+    #[test]
+    fn test_single_simple_path() {
+        let input = quote! { handler_a };
+        let output = paths_macro(input);
+        let expected = quote! {
+            pub mod paths {
+                pub use super::__autumn_path_handler_a as handler_a;
+            }
+        };
+        assert_eq!(output.to_string(), expected.to_string());
+    }
+
+    #[test]
+    fn test_module_qualified_paths() {
+        let input = quote! { posts::show, users::index };
+        let output = paths_macro(input);
+        let expected = quote! {
+            pub mod paths {
+                pub use super::posts::__autumn_path_show as show;
+                pub use super::users::__autumn_path_index as index;
+            }
+        };
+        assert_eq!(output.to_string(), expected.to_string());
+    }
+
+    #[test]
+    fn test_absolute_paths() {
+        let input = quote! { crate::posts::show, ::users::index };
+        let output = paths_macro(input);
+        let expected = quote! {
+            pub mod paths {
+                pub use crate::posts::__autumn_path_show as show;
+                pub use ::users::__autumn_path_index as index;
+            }
+        };
+        assert_eq!(output.to_string(), expected.to_string());
+    }
+
+    #[test]
+    fn test_syntax_error() {
+        let input = quote! { not a path };
+        let output = paths_macro(input);
+        assert!(output.to_string().contains("compile_error"));
+    }
+}
