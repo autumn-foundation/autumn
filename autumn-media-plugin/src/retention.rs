@@ -84,14 +84,25 @@ pub fn within_root(root: &Path, path: &Path) -> bool {
     let Ok(canonical_root) = std::fs::canonicalize(root) else {
         return false;
     };
+    within_canonical_root(&canonical_root, path)
+}
+
+/// Strict containment check with **no lexical fast path**, used on the delete
+/// path (see [`delete_expired_files`]): fully resolve `path` — following
+/// symlinks in every component, including a parent directory that may have been
+/// swapped for a symlink after the scan — and confirm it is still inside the
+/// already-canonicalized `canonical_root`. A file whose parent is gone is
+/// reconstructed from its canonical parent so an in-flight concurrent delete is
+/// still judged correctly.
+fn within_canonical_root(canonical_root: &Path, path: &Path) -> bool {
     if let Ok(canonical_path) = std::fs::canonicalize(path) {
-        return canonical_path.starts_with(&canonical_root);
+        return canonical_path.starts_with(canonical_root);
     }
     if let Some(parent) = path.parent()
         && let Ok(canonical_parent) = std::fs::canonicalize(parent)
     {
         let reconstructed = canonical_parent.join(path.file_name().unwrap_or_default());
-        return reconstructed.starts_with(&canonical_root);
+        return reconstructed.starts_with(canonical_root);
     }
     false
 }
@@ -166,20 +177,59 @@ fn scan_recordings_root(root: &Path, retention_days: u32, now: SystemTime) -> Re
     scan
 }
 
-/// Delete the given (already expired, non-deferred) files, re-checking
-/// [`within_root`] for each. Returns `(deleted, errors)`.
+/// Delete the given (already expired, non-deferred) files. Returns
+/// `(deleted, kept, errors)`.
 ///
-/// Pure synchronous filesystem work (`canonicalize` + `remove_file`), intended
-/// to run under [`tokio::task::spawn_blocking`].
-fn delete_expired_files(root: &Path, paths: &[PathBuf]) -> (usize, usize) {
+/// Pure synchronous filesystem work (`canonicalize` + `metadata` + `remove_file`),
+/// intended to run under [`tokio::task::spawn_blocking`]. Because the async
+/// defer hook awaits between the scan and this phase, each candidate is
+/// re-validated immediately before unlinking:
+///
+/// * **Containment (TOCTOU on the parent):** a strict, non-lexical canonical
+///   check ([`within_canonical_root`]) — a parent directory swapped for a
+///   symlink after the scan would still satisfy the lexical [`within_root`] fast
+///   path, so re-resolve here and skip anything that now escapes `root`.
+/// * **Freshness (TOCTOU on the file):** re-`stat` and re-check expiry against
+///   the same `now`/`retention_days` used by the scan — a file touched or
+///   replaced during the await may no longer be expired and must not be deleted
+///   on the stale decision. A vanished/again-fresh file is a normal race
+///   outcome, not an error.
+fn delete_expired_files(
+    root: &Path,
+    paths: &[PathBuf],
+    retention_days: u32,
+    now: SystemTime,
+) -> (usize, usize, usize) {
     let mut deleted = 0;
+    let mut kept = 0;
     let mut errors = 0;
+    let canonical_root = std::fs::canonicalize(root).ok();
     for path in paths {
-        if !within_root(root, path) {
-            // Should not happen for a path collected from within root, but the
-            // guard keeps a symlinked entry from escaping.
+        // Strict canonical containment when root canonicalizes; otherwise fall
+        // back to the lexical guard rather than mass-deleting on an
+        // unverifiable root.
+        let contained = canonical_root.as_ref().map_or_else(
+            || within_root(root, path),
+            |canonical_root| within_canonical_root(canonical_root, path),
+        );
+        if !contained {
+            // A parent was swapped for a symlink escaping root (or the entry is
+            // otherwise no longer within it): refuse to follow it out.
             errors += 1;
             continue;
+        }
+        match std::fs::metadata(path) {
+            Ok(metadata) => match metadata.modified() {
+                Ok(modified) if is_expired(modified, now, retention_days) => {}
+                // Freshened between scan and delete, or its mtime is no longer
+                // readable — do not delete on an unconfirmed decision.
+                Ok(_) | Err(_) => {
+                    kept += 1;
+                    continue;
+                }
+            },
+            // Vanished (or now unreadable) since the scan — a benign race, skip.
+            Err(_) => continue,
         }
         match delete_recording_file(path) {
             Ok(()) => deleted += 1,
@@ -189,7 +239,7 @@ fn delete_expired_files(root: &Path, paths: &[PathBuf]) -> (usize, usize) {
             }
         }
     }
-    (deleted, errors)
+    (deleted, kept, errors)
 }
 
 /// Sweep `root` once, deleting recording files older than the retention window.
@@ -237,14 +287,18 @@ pub async fn sweep_recordings_root(
         to_delete.push(path);
     }
 
-    // Phase 2 — delete off the executor.
-    let (deleted, delete_errors) = {
+    // Phase 2 — delete off the executor, re-validating each candidate against
+    // the scan→delete race window (containment + freshness).
+    let (deleted, kept, delete_errors) = {
         let root = root.to_path_buf();
-        tokio::task::spawn_blocking(move || delete_expired_files(&root, &to_delete))
-            .await
-            .unwrap_or((0, 0))
+        tokio::task::spawn_blocking(move || {
+            delete_expired_files(&root, &to_delete, retention_days, now)
+        })
+        .await
+        .unwrap_or((0, 0, 0))
     };
     report.deleted = deleted;
+    report.kept += kept;
     report.errors += delete_errors;
 
     report
@@ -343,6 +397,94 @@ mod tests {
         assert_eq!(report.deferred, 1);
         assert_eq!(report.deleted, 0);
         assert!(old.exists(), "deferred file must survive the sweep");
+    }
+
+    #[tokio::test]
+    async fn sweep_skips_file_freshened_between_scan_and_delete() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let racy = temp.path().join("racy.mp4");
+        let normal = temp.path().join("normal.mp4");
+        write_with_mtime(&racy, b"racy", 100 * DAY);
+        write_with_mtime(&normal, b"normal", 100 * DAY);
+
+        // The defer hook runs between the scan (phase 1) and the delete
+        // (phase 2). Use it to freshen `racy`'s mtime mid-sweep — standing in
+        // for a concurrent touch/replace during the async await — while never
+        // actually deferring.
+        let racy_for_defer = racy.clone();
+        let defer: RetentionDefer = Arc::new(move |path| {
+            let racy = racy_for_defer.clone();
+            Box::pin(async move {
+                if path == racy {
+                    std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(&racy)
+                        .expect("open for mtime")
+                        .set_modified(SystemTime::now())
+                        .expect("set_modified");
+                }
+                false
+            })
+        });
+
+        let report = sweep_recordings_root(temp.path(), 14, SystemTime::now(), Some(&defer)).await;
+
+        assert!(
+            racy.exists(),
+            "a file freshened between scan and delete must not be deleted"
+        );
+        assert!(!normal.exists(), "a still-expired file is still deleted");
+        assert_eq!(report.deleted, 1);
+        assert_eq!(
+            report.kept, 1,
+            "the freshened file counts as kept, not deleted"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sweep_rejects_parent_symlink_swap_on_delete() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().join("root");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(root.join("subdir")).expect("mkdir subdir");
+        std::fs::create_dir_all(&outside).expect("mkdir outside");
+
+        // A fresh file outside root, sharing the candidate's file name. If the
+        // delete path followed the swapped parent symlink it would be unlinked.
+        let victim = outside.join("seg.mp4");
+        write_with_mtime(&victim, b"victim", 60);
+
+        let expired = root.join("subdir").join("seg.mp4");
+        write_with_mtime(&expired, b"seg", 100 * DAY);
+
+        // Between scan and delete, swap root/subdir (a real dir at scan time)
+        // for a symlink to `outside`. root/subdir/seg.mp4 still satisfies the
+        // lexical within_root fast path but now resolves outside root.
+        let root_subdir = root.join("subdir");
+        let outside_for_defer = outside.clone();
+        let defer: RetentionDefer = Arc::new(move |_path| {
+            let root_subdir = root_subdir.clone();
+            let outside = outside_for_defer.clone();
+            Box::pin(async move {
+                std::fs::remove_dir_all(&root_subdir).expect("rm subdir");
+                symlink(&outside, &root_subdir).expect("symlink");
+                false
+            })
+        });
+
+        let report = sweep_recordings_root(&root, 14, SystemTime::now(), Some(&defer)).await;
+
+        assert!(
+            victim.exists(),
+            "a file outside root must never be unlinked via a swapped parent symlink"
+        );
+        assert_eq!(
+            report.deleted, 0,
+            "nothing inside root was actually deleted"
+        );
     }
 
     #[tokio::test]
