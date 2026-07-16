@@ -61,27 +61,25 @@ jobs:
       # Per-run names so parallel/aborted runs never collide or leak.
       HCLOUD_SERVER_NAME: autumn-rvps-${{ github.run_id }}-${{ github.run_attempt }}
       HCLOUD_SSH_KEY_NAME: autumn-rvps-key-${{ github.run_id }}-${{ github.run_attempt }}
+      # Credentials are consumed from the environment (job-level indirection), not
+      # re-referenced per step. HCLOUD_TOKEN is the ONLY required one; the signing
+      # secret is optional — a later step generates one per run when it is unset.
+      HCLOUD_TOKEN: ${{ secrets.HCLOUD_TOKEN }}
+      AUTUMN_DEPLOY_SIGNING_SECRET: ${{ secrets.AUTUMN_DEPLOY_SIGNING_SECRET }}
     steps:
-      # ── Constraint 1: fail CLEARLY and early on missing secrets. NO credential
-      # is ever hardcoded or defaulted — everything comes from `secrets.*`. ─────
-      - name: Check required secrets are present
-        env:
-          HCLOUD_TOKEN: ${{ secrets.HCLOUD_TOKEN }}
-          AUTUMN_DEPLOY_SIGNING_SECRET: ${{ secrets.AUTUMN_DEPLOY_SIGNING_SECRET }}
+      # ── Constraint 1: fail CLEARLY and early when the ONE required credential
+      # is absent. The workflow reads `HCLOUD_TOKEN` from the environment (a repo
+      # secret, or however you configure Actions env) — nothing is hardcoded. The
+      # app signing secret is intentionally NOT required here: it is read from the
+      # environment when provided and otherwise generated per run (see below). ──
+      - name: Check required credential is present
         run: |
-          missing=""
           if [ -z "${HCLOUD_TOKEN}" ]; then
-            missing="${missing}\n  - HCLOUD_TOKEN (Hetzner Cloud API token, Read & Write; from https://console.hetzner.cloud → project → Security → API Tokens)"
-          fi
-          if [ -z "${AUTUMN_DEPLOY_SIGNING_SECRET}" ]; then
-            missing="${missing}\n  - AUTUMN_DEPLOY_SIGNING_SECRET (64 hex chars; e.g. \`openssl rand -hex 32\`)"
-          fi
-          if [ -n "${missing}" ]; then
-            echo "::error::Real-VPS validation requires repository secrets that are not set."
-            printf 'Create these repository secrets (Settings → Secrets and variables → Actions), then re-run:%b\n' "${missing}"
+            echo "::error::Real-VPS validation reads HCLOUD_TOKEN from the environment, but it is not set."
+            printf 'Supply HCLOUD_TOKEN (Hetzner Cloud API token, Read & Write; from https://console.hetzner.cloud → project → Security → API Tokens) — e.g. as a repository secret (Settings → Secrets and variables → Actions) — then re-run.\n'
             exit 1
           fi
-          echo "Required secrets are present."
+          echo "HCLOUD_TOKEN is present."
 
       - uses: actions/checkout@v7
 
@@ -107,8 +105,6 @@ jobs:
       # different provider without touching the lifecycle script below. ────────
       - name: Provision throwaway VM (Hetzner Cloud)
         id: provision
-        env:
-          HCLOUD_TOKEN: ${{ secrets.HCLOUD_TOKEN }}
         run: |
           set -euo pipefail
           hcloud ssh-key create --name "${HCLOUD_SSH_KEY_NAME}" --public-key-from-file "${SSH_KEY}.pub"
@@ -122,11 +118,27 @@ jobs:
           echo "Provisioned ${HCLOUD_SERVER_NAME} at ${ip}"
           echo "TARGET_HOST=${ip}" >> "${GITHUB_ENV}"
 
+      # The app signing secret is env-provided WHEN PRESENT, per-run GENERATED
+      # when absent (a throwaway VM never needs a persistent secret). Either way
+      # the effective value is masked so it never prints, then exported as
+      # SIGNING_SECRET for the lifecycle script.
+      - name: Resolve app signing secret (env-provided or generated per run)
+        run: |
+          set -euo pipefail
+          if [ -n "${AUTUMN_DEPLOY_SIGNING_SECRET}" ]; then
+            secret="${AUTUMN_DEPLOY_SIGNING_SECRET}"
+            echo "Using AUTUMN_DEPLOY_SIGNING_SECRET from the environment."
+          else
+            secret="$(openssl rand -hex 32)"
+            echo "AUTUMN_DEPLOY_SIGNING_SECRET not set — generated a per-run signing secret."
+          fi
+          echo "::add-mask::${secret}"
+          echo "SIGNING_SECRET=${secret}" >> "${GITHUB_ENV}"
+
       - name: Run real-VPS deploy lifecycle assertions
         env:
           AUTUMN_BIN: ${{ github.workspace }}/target/release/autumn
           SSH_PORT: "22"
-          SIGNING_SECRET: ${{ secrets.AUTUMN_DEPLOY_SIGNING_SECRET }}
           KAMAL_PROXY_VERSION: ${{ inputs.kamal_proxy_version || 'latest' }}
         run: |
           chmod +x scripts/deploy-real-vps-validate.sh
@@ -137,8 +149,6 @@ jobs:
       # lingering/billing VM is ever left behind. ──────────────────────────────
       - name: Destroy VM and deregister SSH key
         if: always()
-        env:
-          HCLOUD_TOKEN: ${{ secrets.HCLOUD_TOKEN }}
         run: |
           hcloud server delete "${HCLOUD_SERVER_NAME}" || echo "server already gone / never created"
           hcloud ssh-key delete "${HCLOUD_SSH_KEY_NAME}" || echo "ssh-key already gone / never created"

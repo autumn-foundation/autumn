@@ -404,14 +404,15 @@ systemd + kamal-proxy — nothing is mocked:
   pushes, because it costs a real VM and must never block or bill routine CI. It
   always destroys the VM on exit (even on failure), so nothing lingers.
 
-  It requires two repository secrets (Settings → Secrets and variables →
-  Actions); the job's first step fails with a clear message naming them if either
-  is missing, and no credential is ever hardcoded:
+  The only credential it needs is `HCLOUD_TOKEN`. The workflow reads it from the
+  environment (supply it however you configure Actions env — e.g. a repository
+  secret under Settings → Secrets and variables → Actions); the job's first step
+  fails with a clear message if it is unset, and no credential is ever hardcoded:
 
-  | Secret | What it is |
+  | Env var | What it is |
   |---|---|
-  | `HCLOUD_TOKEN` | A Hetzner Cloud API token (Read & Write) from the Hetzner console → project → Security → API Tokens. Used to provision and destroy the throwaway VM. |
-  | `AUTUMN_DEPLOY_SIGNING_SECRET` | A 64-hex-char app signing secret (e.g. `openssl rand -hex 32`) passed as `AUTUMN_SECURITY__SIGNING_SECRET` so the deployed app passes production preflight. |
+  | `HCLOUD_TOKEN` | A Hetzner Cloud API token (Read & Write) from the Hetzner console → project → Security → API Tokens. Used to provision and destroy the throwaway VM. **Required.** |
+  | `AUTUMN_DEPLOY_SIGNING_SECRET` | Optional. The app signing secret (`AUTUMN_SECURITY__SIGNING_SECRET`, 64 hex chars) so the deployed app passes production preflight. Taken from the environment when provided; otherwise a throwaway secret is generated per run — the VM is destroyed on exit, so it never needs a persistent value. |
 
   The lifecycle is a self-contained shell script
   (`scripts/deploy-real-vps-validate.sh`) that mirrors the container
