@@ -70,6 +70,7 @@ percent-encoding = "2.3"
 
 tempfile = "3"
 directories = "6.0.0"
+shlex = "2.0.1"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
