@@ -202,47 +202,6 @@ impl DeployOp {
     }
 }
 
-/// A project config manifest file to upload into the persistent `shared/` dir so
-/// the deployed app loads the intended (non-secret) config instead of silently
-/// falling back to built-in defaults (issue #1952).
-///
-/// `local` is the on-disk source in the project directory (e.g. `./autumn.toml`
-/// or a profile sibling `./autumn-prod.toml`); `remote_basename` is the file name
-/// written under `{app_dir}/shared/`. The systemd unit sets `AUTUMN_MANIFEST_DIR`
-/// to that shared dir so the app's config loader reads these files at boot.
-///
-/// The RAW manifest is uploaded, NOT a flattened/merged config: the app applies
-/// its `[profile.<AUTUMN_ENV>]` overlay at runtime (`AUTUMN_ENV` is set in the env
-/// file), so shipping the raw manifest(s) preserves profile structure and matches
-/// the repo exactly.
-#[derive(Debug, Clone)]
-pub struct ManifestUpload {
-    /// Local source path in the project directory.
-    pub local: PathBuf,
-    /// File name to write under `{app_dir}/shared/`.
-    pub remote_basename: String,
-}
-
-/// Build the config-manifest upload ops (issue #1952).
-///
-/// Each manifest is uploaded at mode `0644` (world-readable is acceptable for
-/// non-secret project config — a repo `autumn.toml` is not a secret; secrets stay
-/// exclusively in the `0600` env file, which overrides the toml at load time).
-/// Re-uploaded on every deploy (both first deploy and cutover) so the config on
-/// the server always matches the shipped binary.
-fn manifest_upload_ops(shared_dir: &str, manifests: &[ManifestUpload]) -> Vec<DeployOp> {
-    manifests
-        .iter()
-        .map(|m| DeployOp::UploadFile {
-            label: "upload-config",
-            local: m.local.clone(),
-            remote_path: format!("{shared_dir}/{}", m.remote_basename),
-            // 0644: non-secret project config. Secrets never live here.
-            mode: Some(0o644),
-        })
-        .collect()
-}
-
 /// Errors surfaced by the deploy executor. None of these variants ever embeds a
 /// secret value — messages carry labels, remote paths, and redacted transport
 /// stderr only.
@@ -558,48 +517,39 @@ impl SlotPlan {
 /// 11. bounded `/ready` poll on the blue loopback port,
 /// 12. route the proxy at `127.0.0.1:{blue_port}`.
 #[must_use]
-// One cohesive op-plan builder; each param is a distinct injected input
-// (config, proxy, unit text, secret env, binary path, config manifests, release
-// id, slot plan) kept as parameters for pure/testable determinism.
-#[allow(clippy::too_many_arguments)]
 pub fn first_deploy_ops(
     cfg: &ResolvedDeployConfig,
     proxy: &impl ProxyController,
     unit: &str,
     env_file: Secret,
     binary_local: &Path,
-    manifests: &[ManifestUpload],
     release_id: &str,
     plan: &SlotPlan,
 ) -> Vec<DeployOp> {
     let release_dir = format!("{}/{release_id}", cfg.releases_dir());
     let remote_binary = format!("{release_dir}/{}", cfg.app_name);
-    let shared_dir = cfg.shared_dir();
+    let shared_dir = format!("{}/shared", cfg.app_dir);
     let env_path = cfg.env_file();
     let current = cfg.current_symlink();
     let unit_name = slot_unit_name(&cfg.service_name, plan.candidate_slot);
     let unit_path = format!("/etc/systemd/system/{unit_name}.service");
 
     let mut ops = proxy.ensure_installed_ops(plan.public_port);
-    ops.push(DeployOp::Run(RemoteCommand::new(
-        "prepare-dirs",
-        format!(
-            "mkdir -p {} {}",
-            shell_quote(&release_dir),
-            shell_quote(&shared_dir)
-        ),
-    )));
-    ops.push(DeployOp::UploadFile {
-        label: "upload-binary",
-        local: binary_local.to_path_buf(),
-        remote_path: remote_binary,
-        mode: Some(0o755),
-    });
-    // Upload the project config manifest(s) into the persistent shared dir so the
-    // deployed app loads the intended config instead of silent built-in defaults
-    // (#1952). The systemd unit points AUTUMN_MANIFEST_DIR here.
-    ops.extend(manifest_upload_ops(&shared_dir, manifests));
     ops.extend([
+        DeployOp::Run(RemoteCommand::new(
+            "prepare-dirs",
+            format!(
+                "mkdir -p {} {}",
+                shell_quote(&release_dir),
+                shell_quote(&shared_dir)
+            ),
+        )),
+        DeployOp::UploadFile {
+            label: "upload-binary",
+            local: binary_local.to_path_buf(),
+            remote_path: remote_binary,
+            mode: Some(0o755),
+        },
         DeployOp::WriteFile {
             label: "write-env",
             contents: FileContents::Secret(env_file),
@@ -689,29 +639,25 @@ pub fn first_deploy_ops(
 /// 14. prune old releases beyond `keep_releases`, always protecting the releases
 ///     `current` and the previous-release marker point at (rollback targets).
 #[must_use]
-// One cohesive op-plan builder; each param is a distinct injected input kept as a
-// parameter for pure/testable determinism (mirrors `first_deploy_ops`).
-#[allow(clippy::too_many_arguments)]
 pub fn cutover_ops(
     cfg: &ResolvedDeployConfig,
     proxy: &impl ProxyController,
     unit: &str,
     env_file: Secret,
     binary_local: &Path,
-    manifests: &[ManifestUpload],
     release_id: &str,
     plan: &SlotPlan,
 ) -> Vec<DeployOp> {
     let release_dir = format!("{}/{release_id}", cfg.releases_dir());
     let remote_binary = format!("{release_dir}/{}", cfg.app_name);
-    let shared_dir = cfg.shared_dir();
+    let shared_dir = format!("{}/shared", cfg.app_dir);
     let env_path = cfg.env_file();
     let current = cfg.current_symlink();
     let candidate_unit = slot_unit_name(&cfg.service_name, plan.candidate_slot);
     let candidate_unit_path = format!("/etc/systemd/system/{candidate_unit}.service");
     let live_unit = slot_unit_name(&cfg.service_name, plan.live_slot);
 
-    let mut ops = vec![
+    vec![
         DeployOp::Run(RemoteCommand::new(
             "prepare-dirs",
             format!(
@@ -726,11 +672,6 @@ pub fn cutover_ops(
             remote_path: remote_binary,
             mode: Some(0o755),
         },
-    ];
-    // Re-upload the project config manifest(s) on every redeploy so the config on
-    // the server always matches the shipped binary (#1952).
-    ops.extend(manifest_upload_ops(&shared_dir, manifests));
-    ops.extend([
         DeployOp::WriteFile {
             label: "write-env",
             contents: FileContents::Secret(env_file),
@@ -804,8 +745,7 @@ pub fn cutover_ops(
                 cfg.keep_releases,
             ),
         )),
-    ]);
-    ops
+    ]
 }
 
 /// Ops that tear down a failed candidate so a retry starts clean (Slice 3,
@@ -1824,25 +1764,9 @@ mod tests {
             &unit,
             env,
             Path::new("/local/target/release/myapp"),
-            &sample_manifests(),
             RELEASE_ID,
             &plan,
         )
-    }
-
-    /// A representative config-manifest set (base + a prod profile sibling) whose
-    /// local paths need not exist — op building never touches the filesystem.
-    fn sample_manifests() -> Vec<ManifestUpload> {
-        vec![
-            ManifestUpload {
-                local: PathBuf::from("/local/autumn.toml"),
-                remote_basename: "autumn.toml".to_owned(),
-            },
-            ManifestUpload {
-                local: PathBuf::from("/local/autumn-prod.toml"),
-                remote_basename: "autumn-prod.toml".to_owned(),
-            },
-        ]
     }
 
     /// Redeploy cutover ops: the live release is on blue, so the candidate takes
@@ -1862,7 +1786,6 @@ mod tests {
             &unit,
             env,
             Path::new("/local/target/release/myapp"),
-            &sample_manifests(),
             RELEASE_ID,
             &plan,
         )
@@ -3194,96 +3117,6 @@ mod tests {
         );
     }
 
-    /// #1952: the project config manifest is uploaded into the persistent shared
-    /// dir at 0644 on a FIRST deploy, so the app loads the intended config instead
-    /// of silent built-in defaults.
-    #[test]
-    fn first_deploy_uploads_config_manifest_to_shared_at_0644() {
-        let ops = sample_ops(Secret::new("AUTUMN_SECURITY__SIGNING_SECRET=x\n"));
-        let base = ops
-            .iter()
-            .find(|op| {
-                matches!(op, DeployOp::UploadFile { label: "upload-config", remote_path, .. }
-                    if remote_path == "/srv/autumn/myapp/shared/autumn.toml")
-            })
-            .expect("base autumn.toml is uploaded to shared/");
-        match base {
-            DeployOp::UploadFile { mode, .. } => {
-                assert_eq!(
-                    *mode,
-                    Some(0o644),
-                    "config manifest must be world-readable 0644"
-                );
-            }
-            other => panic!("upload-config should be an UploadFile op, got {other:?}"),
-        }
-        // The prod profile sibling is uploaded alongside it.
-        assert!(
-            ops.iter().any(|op| matches!(
-                op,
-                DeployOp::UploadFile { label: "upload-config", remote_path, mode: Some(0o644), .. }
-                    if remote_path == "/srv/autumn/myapp/shared/autumn-prod.toml"
-            )),
-            "profile sibling autumn-prod.toml is uploaded to shared/"
-        );
-        // The manifest lands before the unit is written / daemon-reloaded.
-        let cfg_idx = ops
-            .iter()
-            .position(|op| op.label() == "upload-config")
-            .expect("upload-config present");
-        let reload_idx = ops
-            .iter()
-            .position(|op| op.label() == "daemon-reload")
-            .expect("daemon-reload present");
-        assert!(
-            cfg_idx < reload_idx,
-            "config is uploaded before daemon-reload"
-        );
-    }
-
-    /// #1952: the manifest is re-uploaded on every redeploy so the server config
-    /// always matches the shipped binary.
-    #[test]
-    fn cutover_uploads_config_manifest_to_shared_at_0644() {
-        let ops = sample_cutover_ops(Secret::new("AUTUMN_SECURITY__SIGNING_SECRET=x\n"));
-        assert!(
-            ops.iter().any(|op| matches!(
-                op,
-                DeployOp::UploadFile { label: "upload-config", remote_path, mode: Some(0o644), .. }
-                    if remote_path == "/srv/autumn/myapp/shared/autumn.toml"
-            )),
-            "redeploy re-uploads autumn.toml to shared/ at 0644"
-        );
-    }
-
-    /// #1952: with no manifests to ship, no upload-config op is emitted (the loud
-    /// operator warning is handled at the call site, not in the op list).
-    #[test]
-    fn no_manifest_means_no_config_upload_op() {
-        let cfg = resolved();
-        let plan = SlotPlan::first(3000);
-        let unit = super::super::render_app_unit(
-            &cfg,
-            RELEASE_DIR,
-            plan.candidate_port,
-            plan.candidate_slot,
-        );
-        let ops = first_deploy_ops(
-            &cfg,
-            &proxy(),
-            &unit,
-            Secret::new("AUTUMN_SECURITY__SIGNING_SECRET=x\n"),
-            Path::new("/local/target/release/myapp"),
-            &[],
-            RELEASE_ID,
-            &plan,
-        );
-        assert!(
-            !ops.iter().any(|op| op.label() == "upload-config"),
-            "no manifest → no upload-config op"
-        );
-    }
-
     #[test]
     fn secret_debug_and_display_are_redacted() {
         let secret = Secret::new("hunter2");
@@ -3367,10 +3200,8 @@ mod tests {
         let exec = RecordingExecutor::new();
         let checks = vec![PreflightCheck::pass("ssh_reachability", "reachable")];
         execute_first_deploy(&checks, &ops, &[], &exec).expect("all checks pass → deploy runs");
-        // 2 proxy ops + 10 first-deploy ops (incl. clear-previous) + 2 config-manifest
-        // uploads (sample_manifests: autumn.toml + autumn-prod.toml, #1952) + 1 proxy
-        // route = 15.
-        assert_eq!(exec.calls().len(), 15, "the full op sequence should run");
+        // 2 proxy ops + 10 first-deploy ops (incl. clear-previous) + 1 proxy route = 13.
+        assert_eq!(exec.calls().len(), 13, "the full op sequence should run");
     }
 
     #[test]
