@@ -1188,7 +1188,7 @@ fn manifest_uploads_in(dir: &Path, profile: &str) -> Vec<exec::ManifestUpload> {
     let mut uploads = Vec::new();
 
     let base = dir.join("autumn.toml");
-    if base.exists() {
+    if base.is_file() {
         uploads.push(exec::ManifestUpload {
             local: base,
             remote_basename: "autumn.toml".to_owned(),
@@ -1209,7 +1209,7 @@ fn manifest_uploads_in(dir: &Path, profile: &str) -> Vec<exec::ManifestUpload> {
             continue;
         }
         let sibling = dir.join(&basename);
-        if sibling.exists() {
+        if sibling.is_file() {
             uploads.push(exec::ManifestUpload {
                 local: sibling,
                 remote_basename: basename,
