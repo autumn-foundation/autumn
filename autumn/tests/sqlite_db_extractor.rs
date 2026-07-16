@@ -4,7 +4,7 @@
 //! **directly** (`pool.get()`), so it never runs the per-checkout initialization
 //! SQL that the framework's [`autumn_web::db::Db`] extractor issues in
 //! `Db::checkout`. That gap hid a Codex P1: `Db::checkout` unconditionally ran
-//! the Postgres session GUC `SET statement_timeout = …`, which SQLite rejects —
+//! the Postgres session GUC `SET statement_timeout = …`, which `SQLite` rejects —
 //! turning **every** route that extracts `Db` into a 503 under `--features
 //! sqlite`, even though a plain `pool.get()` worked fine.
 //!
@@ -12,7 +12,7 @@
 //! Axum app whose handler takes `Db` and runs a real query through it, served
 //! over HTTP against a `sqlite:` target. It must answer **200** (not 503),
 //! proving the checkout hot path no longer issues Postgres-only initialization
-//! SQL on the SQLite backend.
+//! SQL on the `SQLite` backend.
 //!
 //! Run it explicitly (never via a members-enable edge — that would trip the
 //! feature-unification hazard):
@@ -38,7 +38,7 @@ use tower::ServiceExt as _; // for `oneshot`
 /// to `SyncConnectionWrapper<SqliteConnection>`.
 type SqlitePool = Pool<RuntimeConnection>;
 
-/// Minimal app state exposing the SQLite pool to the `Db` extractor.
+/// Minimal app state exposing the `SQLite` pool to the `Db` extractor.
 #[derive(Clone)]
 struct AppState {
     pool: SqlitePool,
@@ -58,7 +58,7 @@ struct Greeting {
 
 /// Answers `/greet` by reading the seeded row **through the real `Db`
 /// extractor** — so this handler only runs if `Db::checkout` succeeded on the
-/// SQLite backend (i.e. it did not issue Postgres-only initialization SQL).
+/// `SQLite` backend (i.e. it did not issue Postgres-only initialization SQL).
 async fn greet(mut db: Db) -> Result<String, StatusCode> {
     let rows: Vec<Greeting> = diesel::sql_query("SELECT message FROM greetings WHERE id = 1")
         .load(&mut *db)

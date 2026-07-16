@@ -1,6 +1,6 @@
 //! Foreign-key enforcement proof for the `SQLite` runtime pool (issue #1614).
 //!
-//! SQLite leaves `foreign_keys` OFF by default on every new connection, so a
+//! `SQLite` leaves `foreign_keys` OFF by default on every new connection, so a
 //! bare pool manager would hand out connections that silently accept orphan
 //! rows and violate referential integrity (Codex P1). `build_sqlite_pool` now
 //! runs `PRAGMA foreign_keys = ON` in the manager's per-connection setup

@@ -1,7 +1,7 @@
 //! Per-connection PRAGMA proof for the `SQLite` runtime pool (issue #1614).
 //!
 //! The file-backed pool defaults to size 10, so ordinary overlapping writes on
-//! separate pooled connections would hit SQLite's default busy handler, which
+//! separate pooled connections would hit `SQLite`'s default busy handler, which
 //! returns `SQLITE_BUSY` *immediately* when another connection holds the writer
 //! lock — surfacing as spurious 5xx instead of waiting briefly (Codex P1).
 //! `build_sqlite_pool` now installs `PRAGMA busy_timeout` (plus a deliberate
