@@ -2026,6 +2026,14 @@ impl Db {
     /// non-retryable error is returned immediately; when the retry budget is
     /// exhausted, the **final** underlying error is returned (never swallowed).
     ///
+    /// Under the `sqlite` feature there is no transaction builder that can
+    /// enforce `READ ONLY`, so a request carrying [`TxOptions::read_only`]
+    /// returns an unsupported-options error **before the closure runs** rather
+    /// than silently executing a writable transaction (which would let writes
+    /// commit under a read-only contract). A normal read-write transaction is
+    /// unaffected. The Postgres path enforces read-only via the transaction
+    /// builder and never rejects.
+    ///
     /// # Panics
     ///
     /// Panics if the internal after-commit registry mutex is poisoned (only
@@ -2066,6 +2074,28 @@ impl Db {
             ));
         }
         reject_ambient_after_commit_registry_for_tx()?;
+
+        // Under the SQLite runtime there is no transaction builder that can
+        // enforce `READ ONLY` semantics — the `sqlite` arm below runs a single
+        // plain, writable transaction. Silently honoring a caller's
+        // `TxOptions::read_only()` by running a writable transaction anyway would
+        // let writes succeed and commit under a contract that promised none — a
+        // safety regression for any code relying on a read-only transaction to
+        // prevent mutation. So reject the request up front, BEFORE the closure
+        // can run, rather than pretending to honor it. (Real `query_only`
+        // enforcement is avoided deliberately: deadpool's `custom_setup` runs on
+        // CREATE only, so a leaked `PRAGMA query_only = ON` would poison a pooled
+        // connection for its lifetime.) The Postgres path enforces read-only via
+        // the transaction builder's `read_only()` and is unaffected.
+        #[cfg(feature = "sqlite")]
+        if opts.read_only {
+            return Err(crate::error::AutumnError::bad_request_msg(
+                "SQLite runtime does not support read-only transactions \
+                 (TxOptions::read_only); this build cannot enforce read-only \
+                 semantics on SQLite. Remove the read_only option or run on \
+                 Postgres.",
+            ));
+        }
 
         self.tx_depth += 1;
         let mut guard = TxDepthGuard {

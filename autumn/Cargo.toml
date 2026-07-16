@@ -408,6 +408,21 @@ path = "tests/sqlite_pool_pragmas.rs"
 name = "sqlite_scoped_repository"
 path = "tests/sqlite_scoped_repository.rs"
 
+# SQLite read-only-transaction safety proof (issue #1614, Codex P2). The SQLite
+# arm of `Db::tx_with` cannot enforce `READ ONLY`, so a `TxOptions::read_only()`
+# request is rejected before the closure runs rather than silently running a
+# writable transaction (which would let writes commit under a read-only
+# contract). Asserts the rejection commits nothing and that a normal read-write
+# transaction still commits. Needs `test-support` too (the public
+# `Db::connect_for_test` harness helper); the file is
+# `#![cfg(all(feature = "sqlite", feature = "test-support"))]` so a default
+# `cargo test` (and a bare `--features sqlite` run) compiles it to an empty
+# (passing) binary. Run explicitly:
+# `cargo test -p autumn-web --features "sqlite,test-support" --test sqlite_read_only_tx`.
+[[test]]
+name = "sqlite_read_only_tx"
+path = "tests/sqlite_read_only_tx.rs"
+
 # Isolated: sets process-wide proxy env vars (HTTP_PROXY/HTTPS_PROXY/ALL_PROXY)
 # to verify pinned SSRF-safe clients bypass env proxies. Cannot share the
 # consolidated binary — those vars would race the inline network tests.
