@@ -372,6 +372,17 @@ path = "tests/sqlite_boot_serve.rs"
 name = "sqlite_foreign_keys"
 path = "tests/sqlite_foreign_keys.rs"
 
+# SQLite `Db`-extractor proof (issue #1614, Codex P1). Drives the real framework
+# `Db` extractor over HTTP against a `sqlite:` target and asserts 200 (not the
+# 503 a Postgres-only `SET statement_timeout` in `Db::checkout` would produce).
+# Only meaningful under `--features sqlite`; the file is
+# `#![cfg(feature = "sqlite")]` so a default `cargo test` compiles it to an empty
+# (passing) binary. Run explicitly:
+# `cargo test -p autumn-web --features sqlite --test sqlite_db_extractor`.
+[[test]]
+name = "sqlite_db_extractor"
+path = "tests/sqlite_db_extractor.rs"
+
 # Isolated: sets process-wide proxy env vars (HTTP_PROXY/HTTPS_PROXY/ALL_PROXY)
 # to verify pinned SSRF-safe clients bypass env proxies. Cannot share the
 # consolidated binary — those vars would race the inline network tests.

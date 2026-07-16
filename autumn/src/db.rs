@@ -2228,7 +2228,16 @@ impl Db {
     /// `SET statement_timeout`, and the metrics captured for the
     /// slow-query warning on `Drop`.
     pub(crate) async fn checkout(params: DbCheckoutParams<'_>) -> Result<Self, AutumnError> {
+        // `SET statement_timeout` (and its i32-cap arithmetic below) is a
+        // Postgres session GUC. Under the `sqlite` feature the runtime backend
+        // is entirely SQLite (the `RuntimeConnection` alias flips wholesale —
+        // see `build_sqlite_pool`), which rejects the statement and would turn
+        // every `Db`-using route into a 503. The const, the `RunQueryDsl`
+        // import, the timeout arithmetic, and the `SET` itself are therefore all
+        // gated off on the SQLite build; the Postgres path is byte-identical.
+        #[cfg(not(feature = "sqlite"))]
         const PG_TIMEOUT_MAX_MS: u64 = i32::MAX as u64;
+        #[cfg(not(feature = "sqlite"))]
         use diesel_async::RunQueryDsl as _;
 
         // Span covers the full time the connection is held — from
@@ -2267,8 +2276,16 @@ impl Db {
 
         let mut conn = checkout_future.instrument(span.clone()).await?;
 
+        // `statement_timeout` is a Postgres session GUC; it is intentionally
+        // unused on the SQLite backend (see the gating note below), so consume
+        // it here to keep the shared `DbCheckoutParams` field from reading as
+        // dead code under `--features sqlite`.
+        #[cfg(feature = "sqlite")]
+        let _ = params.statement_timeout;
+
         // Postgres statement_timeout is a signed 32-bit integer (milliseconds).
         // Cap at i32::MAX to avoid a confusing 503 for very large configured values.
+        #[cfg(not(feature = "sqlite"))]
         let timeout_ms = params.statement_timeout.map_or(0u64, |d| {
             u64::try_from(d.as_millis())
                 .unwrap_or(PG_TIMEOUT_MAX_MS)
@@ -2313,6 +2330,9 @@ impl Db {
             }
         }
 
+        // Postgres-only per-checkout initialization; see the gating note above.
+        // SQLite builds skip it entirely (it would 503 every `Db`-using route).
+        #[cfg(not(feature = "sqlite"))]
         diesel::sql_query(format!("SET statement_timeout = {timeout_ms}"))
             .execute(&mut conn)
             .await
