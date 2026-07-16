@@ -225,9 +225,12 @@ pub struct ManifestUpload {
 
 /// Build the config-manifest upload ops (issue #1952).
 ///
-/// Each manifest is uploaded at mode `0644` (world-readable is acceptable for
-/// non-secret project config — a repo `autumn.toml` is not a secret; secrets stay
-/// exclusively in the `0600` env file, which overrides the toml at load time).
+/// Each manifest is uploaded at mode `0600` (owner-only). The deployed app runs
+/// as the same deploy user that owns `shared/` — the user that already reads the
+/// `0600` `autumn.env` — so a `0600` manifest still loads at boot, while no other
+/// local account can read it. Owner-only matters because a project `autumn.toml`
+/// can legitimately carry inline credentials (e.g. `[security.signing_secret]`);
+/// world-readable (`0644`) would expose those to every account on the host.
 /// Re-uploaded on every deploy (both first deploy and cutover) so the config on
 /// the server always matches the shipped binary.
 fn manifest_upload_ops(shared_dir: &str, manifests: &[ManifestUpload]) -> Vec<DeployOp> {
@@ -237,8 +240,9 @@ fn manifest_upload_ops(shared_dir: &str, manifests: &[ManifestUpload]) -> Vec<De
             label: "upload-config",
             local: m.local.clone(),
             remote_path: format!("{shared_dir}/{}", m.remote_basename),
-            // 0644: non-secret project config. Secrets never live here.
-            mode: Some(0o644),
+            // 0600: owner-only. The deploy user (which runs the app) reads it;
+            // other local accounts can't, so inline config secrets stay private.
+            mode: Some(0o600),
         })
         .collect()
 }
@@ -3184,10 +3188,10 @@ mod tests {
     }
 
     /// #1952: the project config manifest is uploaded into the persistent shared
-    /// dir at 0644 on a FIRST deploy, so the app loads the intended config instead
+    /// dir at 0600 on a FIRST deploy, so the app loads the intended config instead
     /// of silent built-in defaults.
     #[test]
-    fn first_deploy_uploads_config_manifest_to_shared_at_0644() {
+    fn first_deploy_uploads_config_manifest_to_shared_at_0600() {
         let ops = sample_ops(Secret::new("AUTUMN_SECURITY__SIGNING_SECRET=x\n"));
         let base = ops
             .iter()
@@ -3200,8 +3204,8 @@ mod tests {
             DeployOp::UploadFile { mode, .. } => {
                 assert_eq!(
                     *mode,
-                    Some(0o644),
-                    "config manifest must be world-readable 0644"
+                    Some(0o600),
+                    "config manifest must be owner-only 0600"
                 );
             }
             other => panic!("upload-config should be an UploadFile op, got {other:?}"),
@@ -3210,7 +3214,7 @@ mod tests {
         assert!(
             ops.iter().any(|op| matches!(
                 op,
-                DeployOp::UploadFile { label: "upload-config", remote_path, mode: Some(0o644), .. }
+                DeployOp::UploadFile { label: "upload-config", remote_path, mode: Some(0o600), .. }
                     if remote_path == "/srv/autumn/myapp/shared/autumn-prod.toml"
             )),
             "profile sibling autumn-prod.toml is uploaded to shared/"
@@ -3233,15 +3237,15 @@ mod tests {
     /// #1952: the manifest is re-uploaded on every redeploy so the server config
     /// always matches the shipped binary.
     #[test]
-    fn cutover_uploads_config_manifest_to_shared_at_0644() {
+    fn cutover_uploads_config_manifest_to_shared_at_0600() {
         let ops = sample_cutover_ops(Secret::new("AUTUMN_SECURITY__SIGNING_SECRET=x\n"));
         assert!(
             ops.iter().any(|op| matches!(
                 op,
-                DeployOp::UploadFile { label: "upload-config", remote_path, mode: Some(0o644), .. }
+                DeployOp::UploadFile { label: "upload-config", remote_path, mode: Some(0o600), .. }
                     if remote_path == "/srv/autumn/myapp/shared/autumn.toml"
             )),
-            "redeploy re-uploads autumn.toml to shared/ at 0644"
+            "redeploy re-uploads autumn.toml to shared/ at 0600"
         );
     }
 

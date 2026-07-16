@@ -170,8 +170,9 @@ AUTUMN_DATABASE__URL=postgres://user:pass@db-host:5432/myapp_prod
 > every `deploy up` so the config on the server always matches the shipped binary.
 > If no `autumn.toml` is found in the project directory, the deploy prints a loud
 > warning and the app runs built-in defaults for all non-secret settings.
-> **Secrets never go in the manifest** — the manifest is world-readable (`0644`),
-> while the signing secret, database URL, and `AUTUMN_ENV` continue to travel only
+> **Secrets never go in the manifest** — the manifest is owner-only (`0600`), so
+> any inline config secrets are never exposed to other local accounts, while the
+> signing secret, database URL, and `AUTUMN_ENV` continue to travel only
 > in the `0600` host env file (`app_dir/shared/autumn.env`), which overrides the
 > `autumn.toml` at load time.
 
@@ -340,7 +341,8 @@ or error messages.
 - **Your project's `autumn.toml` is deployed**
   ([#1952](https://github.com/madmax983/autumn/issues/1952)). `autumn deploy up`
   uploads your `autumn.toml` (and the profile sibling `autumn-<profile>.toml`
-  when present) into `app_dir/shared/` at mode `0644` and sets
+  when present) into `app_dir/shared/` at mode `0600` (owner-only, so secrets are
+  never exposed to other local accounts) and sets
   `AUTUMN_MANIFEST_DIR=app_dir/shared` in the systemd unit, so the app loads the
   same non-secret configuration (auth, jobs and scheduler backends,
   health/telemetry paths, CORS, signing-secret rotation `previous_secrets`, etc.)
