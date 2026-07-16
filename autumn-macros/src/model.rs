@@ -2534,7 +2534,7 @@ fn emit_json_schema_tokens(ty: &syn::Type) -> TokenStream {
 ///
 /// `all_optional` is `true` for `UpdateX` structs where every field is
 /// conceptually optional (backed by `Patch<T>`).
-fn emit_schema_fn_body(fields: &[&&Field], all_optional: bool) -> TokenStream {
+pub fn emit_schema_fn_body(fields: &[&&Field], all_optional: bool) -> TokenStream {
     emit_schema_fn_body_ext(fields, all_optional, &[])
 }
 
