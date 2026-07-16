@@ -26,13 +26,32 @@ info() { printf 'autumn-install: %s\n' "$1" >&2; }
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --version) VERSION="${2:?--version requires a value}"; shift 2 ;;
+    --version)
+      [ $# -ge 2 ] || err "--version requires a value"
+      VERSION="$2"; shift 2 ;;
     --version=*) VERSION="${1#*=}"; shift ;;
-    --dir) INSTALL_DIR="${2:?--dir requires a value}"; shift 2 ;;
+    --dir)
+      [ $# -ge 2 ] || err "--dir requires a value"
+      INSTALL_DIR="$2"; shift 2 ;;
     --dir=*) INSTALL_DIR="${1#*=}"; shift ;;
-    --target) TARGET="${2:?--target requires a value}"; shift 2 ;;
+    --target)
+      [ $# -ge 2 ] || err "--target requires a value"
+      TARGET="$2"; shift 2 ;;
     --target=*) TARGET="${1#*=}"; shift ;;
-    -h|--help) sed -n '2,15p' "$0" 2>/dev/null || true; exit 0 ;;
+    -h|--help)
+      cat <<'EOF'
+Autumn CLI installer.
+
+Downloads a prebuilt autumn binary from GitHub Releases, verifies its sha256
+checksum, and installs it. Linux x86_64 and aarch64 are supported.
+
+Environment overrides (flags --version/--dir/--target mirror them):
+  AUTUMN_VERSION      version tag to install, or "latest" (default: latest)
+  AUTUMN_INSTALL_DIR  install directory (default: $HOME/.local/bin)
+  AUTUMN_TARGET       force target triple (default: autodetected)
+  AUTUMN_BASE_URL     release base URL (default: https://github.com/madmax983/autumn/releases)
+EOF
+      exit 0 ;;
     *) err "unknown argument: $1 (try --help)" ;;
   esac
 done
@@ -70,12 +89,13 @@ info "downloading ${asset} (${VERSION})"
 download "$url" "$tmp/$asset" || err "download failed: $url"
 download "${url}.sha256" "$tmp/$asset.sha256" || err "checksum download failed: ${url}.sha256"
 
-expected="$(awk '{print $1}' "$tmp/$asset.sha256")"
+expected=""
+read -r expected _ < "$tmp/$asset.sha256" 2>/dev/null || true
 [ -n "$expected" ] || err "empty checksum from ${url}.sha256"
 if command -v sha256sum >/dev/null 2>&1; then
-  actual="$(sha256sum "$tmp/$asset" | awk '{print $1}')"
+  actual="$(sha256sum "$tmp/$asset")"; actual="${actual%% *}"
 elif command -v shasum >/dev/null 2>&1; then
-  actual="$(shasum -a 256 "$tmp/$asset" | awk '{print $1}')"
+  actual="$(shasum -a 256 "$tmp/$asset")"; actual="${actual%% *}"
 else
   err "need sha256sum or shasum to verify the download"
 fi
