@@ -93,10 +93,15 @@ pub struct S3MediaStorage {
     /// Lazily-built, cached aws-sdk-s3 client shared across operations.
     ///
     /// Private (unlike the config fields): an internal cache, not part of the
-    /// resolved configuration. The AWS SDK recommends one long-lived client
-    /// whose credential provider self-refreshes, so it is built once via
-    /// [`tokio::sync::OnceCell`] and reused. Wrapped in [`std::sync::Arc`] so a
-    /// `#[derive(Clone)]` of `S3MediaStorage` shares the same cache.
+    /// resolved configuration. The AWS SDK recommends one long-lived client, so
+    /// it is built once via [`tokio::sync::OnceCell`] and reused. Wrapped in
+    /// [`std::sync::Arc`] so a `#[derive(Clone)]` of `S3MediaStorage` shares the
+    /// same cache. Whether the cached client's credentials can *refresh* depends
+    /// on how it was built (see [`MediaStorage::build_client`]): a client built
+    /// from the explicit `access_key_id` / `secret_access_key` (with or without a
+    /// `session_token`) carries those static values verbatim and cannot refresh
+    /// them; only the ambient-provider-chain path (used when the explicit keys
+    /// are unset) refreshes credentials on its own.
     client: std::sync::Arc<tokio::sync::OnceCell<Client>>,
 }
 
@@ -372,13 +377,22 @@ impl MediaStorage {
     ///
     /// The client is built lazily on first use and cached in the backend's
     /// [`tokio::sync::OnceCell`], so every operation reuses one long-lived
-    /// client (the AWS SDK recommendation — its credential provider
-    /// self-refreshes) instead of rebuilding per operation. The endpoint is set
-    /// **only when configured** (an improvement over Arroyo's always-set
-    /// endpoint, borrowed from `autumn-storage-s3`): an unset endpoint leaves
-    /// the SDK default in place. When both credentials are present they are used
-    /// as hard-coded `SigV4` credentials; otherwise the ambient AWS credential
-    /// chain is loaded.
+    /// client (the AWS SDK recommendation) instead of rebuilding per operation.
+    /// The endpoint is set **only when configured** (an improvement over
+    /// Arroyo's always-set endpoint, borrowed from `autumn-storage-s3`): an
+    /// unset endpoint leaves the SDK default in place.
+    ///
+    /// **Credential source and refresh semantics.** When both explicit
+    /// credentials are present they are used as **static** `SigV4` credentials
+    /// (with the optional `session_token`): the config is loaded once at
+    /// construction and is not hot-reloaded, so a client built this way cannot
+    /// refresh its credentials — it is the right choice for permanent static
+    /// keys (e.g. Tigris) or a fixed, short-lived token for a short-lived task.
+    /// When the explicit `access_key_id` / `secret_access_key` are unset, the
+    /// **ambient AWS credential chain** is loaded instead (env / IMDS / ECS /
+    /// STS), and that provider refreshes rotating/temporary credentials
+    /// automatically — so a long-running service with rotating creds should
+    /// leave the explicit credential fields empty and rely on the ambient chain.
     ///
     /// # Panics
     ///
@@ -461,6 +475,13 @@ pub fn join_key_prefix(prefix: &str, key: &str) -> String {
 /// browser-facing URL, preserving `/` separators. Unreserved RFC 3986 chars
 /// (`A-Z a-z 0-9 - . _ ~`) pass through; everything else (e.g. `#`, `?`, `%`,
 /// space) is percent-encoded so the URL addresses exactly the stored object.
+///
+/// A whole-segment `.` or `..` is special-cased: while an ordinary filename dot
+/// (`my-clip_1.mp4`) stays readable, leaving a bare `.`/`..` segment literal
+/// would let a browser/proxy path-normalize `clips/../other.mp4` down to
+/// `other.mp4` *before* the request — addressing a different object than the
+/// stored key. Those dot-only segments therefore have their dots percent-encoded
+/// (`.` → `%2E`, `..` → `%2E%2E`) so the URL survives normalization intact.
 fn encode_key_for_url(key: &str) -> String {
     use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
     // NON_ALPHANUMERIC encodes everything except ASCII alphanumerics; add back
@@ -471,7 +492,15 @@ fn encode_key_for_url(key: &str) -> String {
         .remove(b'_')
         .remove(b'~');
     key.split('/')
-        .map(|seg| utf8_percent_encode(seg, SEGMENT).to_string())
+        .map(|seg| {
+            if seg == "." || seg == ".." {
+                // Encode the dot(s) of a dot-only segment so path normalization
+                // can't collapse the URL to a different object.
+                seg.replace('.', "%2E")
+            } else {
+                utf8_percent_encode(seg, SEGMENT).to_string()
+            }
+        })
         .collect::<Vec<_>>()
         .join("/")
 }
@@ -654,6 +683,54 @@ mod tests {
         assert_eq!(
             storage.public_url("clips/a b?c%d.mp4"),
             "/media/clips/a%20b%3Fc%25d.mp4"
+        );
+    }
+
+    #[test]
+    fn public_url_encodes_dotdot_segment() {
+        let storage = MediaStorage::Local {
+            root: PathBuf::from("media"),
+            public_base_url: "/media".to_owned(),
+        };
+        let url = storage.public_url("clips/../other.mp4");
+        // The `..` segment is encoded so a browser/proxy can't normalize the URL
+        // down to `/media/other.mp4` and address a different object.
+        assert_eq!(url, "/media/clips/%2E%2E/other.mp4");
+        assert!(
+            !url.contains("/../"),
+            "literal `..` traversal must not survive: {url}"
+        );
+    }
+
+    #[test]
+    fn public_url_encodes_single_dot_segment() {
+        let storage = MediaStorage::Local {
+            root: PathBuf::from("media"),
+            public_base_url: "/media".to_owned(),
+        };
+        let url = storage.public_url("clips/./a.mp4");
+        // The whole-segment `.` is encoded; the filename dot in `a.mp4` is not.
+        assert_eq!(url, "/media/clips/%2E/a.mp4");
+        assert!(
+            !url.contains("/./"),
+            "literal `.` current-dir segment must not survive: {url}"
+        );
+    }
+
+    #[test]
+    fn encode_key_for_url_preserves_ordinary_filename_dot() {
+        // A normal filename dot is untouched — only whole-segment `.`/`..` are
+        // encoded.
+        assert_eq!(encode_key_for_url("clips/a.mp4"), "clips/a.mp4");
+        assert!(!encode_key_for_url("clips/a.mp4").contains("%2E"));
+        // And the dot-only segments still encode.
+        assert_eq!(
+            encode_key_for_url("clips/../other.mp4"),
+            "clips/%2E%2E/other.mp4"
+        );
+        assert_eq!(
+            encode_key_for_url("clips/./other.mp4"),
+            "clips/%2E/other.mp4"
         );
     }
 

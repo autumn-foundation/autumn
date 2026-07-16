@@ -199,7 +199,12 @@ impl MediaStorageBackend {
 }
 
 /// Media object storage settings (local filesystem or S3-compatible).
-#[derive(Debug, Clone, Deserialize)]
+///
+/// `secret_access_key` and `session_token` are redacted by the hand-written
+/// [`std::fmt::Debug`] impl (mirroring [`crate::storage::S3MediaStorage`]), so a
+/// `MediaStorageConfig` — or the enclosing [`MediaConfig`], whose derived
+/// `Debug` delegates here — can be logged without leaking bearer credentials.
+#[derive(Clone, Deserialize)]
 #[serde(default)]
 pub struct MediaStorageConfig {
     /// Selected backend. Defaults to [`MediaStorageBackend::Local`].
@@ -216,8 +221,14 @@ pub struct MediaStorageConfig {
     pub access_key_id: Option<String>,
     /// S3 secret access key (paired with `access_key_id`).
     pub secret_access_key: Option<String>,
-    /// S3 session token for temporary/rotating credentials (Lambda/ECS). `None`
-    /// selects permanent static keys or the ambient chain.
+    /// S3 session token for a fixed short-lived credential (paired with the
+    /// explicit `access_key_id` / `secret_access_key`). Config-supplied
+    /// credentials are **static** — loaded once at construction and never
+    /// hot-reloaded — so this is for a token that stays valid for the task's
+    /// lifetime; it does not self-refresh. For rotating/temporary credentials in
+    /// a long-running service, leave the explicit credential fields unset so the
+    /// ambient AWS provider chain (env / IMDS / ECS / STS) resolves and refreshes
+    /// them. `None` selects permanent static keys or the ambient chain.
     pub session_token: Option<String>,
     /// Public base URL served objects resolve under.
     pub public_base_url: Option<String>,
@@ -225,6 +236,36 @@ pub struct MediaStorageConfig {
     pub key_prefix: String,
     /// Whether to force S3 path-style addressing.
     pub force_path_style: bool,
+}
+
+impl std::fmt::Debug for MediaStorageConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Render every non-secret field verbatim so the Debug stays useful, but
+        // redact the two bearer credentials (`secret_access_key`,
+        // `session_token`) — matching `S3MediaStorage`'s redaction so the two
+        // never drift. `access_key_id`, region, bucket, endpoint, etc. are not
+        // secret and are shown as-is.
+        formatter
+            .debug_struct("MediaStorageConfig")
+            .field("backend", &self.backend)
+            .field("root", &self.root)
+            .field("bucket", &self.bucket)
+            .field("endpoint_url", &self.endpoint_url)
+            .field("region", &self.region)
+            .field("access_key_id", &self.access_key_id)
+            .field(
+                "secret_access_key",
+                &self.secret_access_key.as_ref().map(|_| "** redacted **"),
+            )
+            .field(
+                "session_token",
+                &self.session_token.as_ref().map(|_| "** redacted **"),
+            )
+            .field("public_base_url", &self.public_base_url)
+            .field("key_prefix", &self.key_prefix)
+            .field("force_path_style", &self.force_path_style)
+            .finish()
+    }
 }
 
 impl Default for MediaStorageConfig {
@@ -1011,6 +1052,78 @@ mod tests {
         ]);
         let config = MediaConfig::from_arroyo_env_pairs(&vars);
         assert_eq!(config.storage.backend, MediaStorageBackend::S3);
+    }
+
+    #[test]
+    fn storage_config_debug_redacts_secret_and_session_token() {
+        let config = MediaStorageConfig {
+            backend: MediaStorageBackend::S3,
+            bucket: Some("b".to_owned()),
+            access_key_id: Some("AKIA-visible".to_owned()),
+            secret_access_key: Some("s3kr3t-value-xyz".to_owned()),
+            session_token: Some("session-token-value-abc".to_owned()),
+            ..MediaStorageConfig::default()
+        };
+        let rendered = format!("{config:?}");
+        // The bearer credentials must never appear in cleartext.
+        assert!(
+            !rendered.contains("s3kr3t-value-xyz"),
+            "secret value must not appear: {rendered}"
+        );
+        assert!(
+            !rendered.contains("session-token-value-abc"),
+            "session token value must not appear: {rendered}"
+        );
+        // Both present secrets render redacted.
+        assert!(
+            rendered.contains("secret_access_key: Some(\"** redacted **\")"),
+            "secret must render redacted when present: {rendered}"
+        );
+        assert!(
+            rendered.contains("session_token: Some(\"** redacted **\")"),
+            "session token must render redacted when present: {rendered}"
+        );
+        // Non-secret fields stay visible so the Debug is still useful.
+        assert!(
+            rendered.contains("AKIA-visible"),
+            "access_key_id is not secret and must stay visible: {rendered}"
+        );
+    }
+
+    #[test]
+    fn storage_config_debug_renders_absent_secrets_as_none() {
+        // Absent credentials render as `None`, never a redaction marker.
+        let rendered = format!("{:?}", MediaStorageConfig::default());
+        assert!(
+            rendered.contains("secret_access_key: None"),
+            "absent secret must render None: {rendered}"
+        );
+        assert!(
+            rendered.contains("session_token: None"),
+            "absent session token must render None: {rendered}"
+        );
+    }
+
+    #[test]
+    fn media_config_debug_propagates_storage_redaction() {
+        // The enclosing MediaConfig's derived Debug delegates to the storage
+        // field's hand-written impl, so secrets stay redacted there too.
+        let mut config = MediaConfig::default();
+        config.storage.secret_access_key = Some("s3kr3t-value-xyz".to_owned());
+        config.storage.session_token = Some("session-token-value-abc".to_owned());
+        let rendered = format!("{config:?}");
+        assert!(
+            !rendered.contains("s3kr3t-value-xyz"),
+            "secret value must not appear via MediaConfig: {rendered}"
+        );
+        assert!(
+            !rendered.contains("session-token-value-abc"),
+            "session token value must not appear via MediaConfig: {rendered}"
+        );
+        assert!(
+            rendered.contains("** redacted **"),
+            "redaction marker must propagate through MediaConfig: {rendered}"
+        );
     }
 
     #[test]
