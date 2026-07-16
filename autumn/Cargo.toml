@@ -376,6 +376,13 @@ path = "tests/db_hooks_lifecycle.rs"
 name = "state_machine_lifecycle"
 path = "tests/state_machine_lifecycle.rs"
 
+# Issue #1973: `on_commit` transition-effect codegen — pure validation +
+# compile-time type-check of the generated connection-taking method. No DB
+# connection, runs without Docker. Isolated so it is cheap to compile/run alone.
+[[test]]
+name = "state_machine_on_commit"
+path = "tests/state_machine_on_commit.rs"
+
 [[test]]
 name = "repository_shard_replica_routing"
 path = "tests/repository_shard_replica_routing.rs"

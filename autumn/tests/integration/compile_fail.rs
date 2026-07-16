@@ -215,6 +215,11 @@ fn compile_pass_tests() {
     #[cfg(feature = "db")]
     t.pass("tests/compile-pass/model_state_machine_lifecycle.rs");
 
+    // #1973: an `on_commit = <Job>` edge emits the connection-taking
+    // `transition_{field}_to_on_conn` method; guards + effects compose.
+    #[cfg(feature = "db")]
+    t.pass("tests/compile-pass/model_state_machine_on_commit.rs");
+
     // Soft delete (requires db feature)
     #[cfg(feature = "db")]
     t.pass("tests/compile-pass/repository_soft_delete.rs");

@@ -2610,6 +2610,11 @@ struct StateMachineTransition {
     to: String,
     /// Optional guard: name of a `&self` bool method that must return `true`.
     guard: Option<String>,
+    /// Optional after-commit effect (issue #1973): the path of a `#[job]`
+    /// struct to enqueue transactionally when this specific edge fires. Only
+    /// meaningful for inline `transitions(...)` machines — lifecycle-derived
+    /// tables carry no effects.
+    on_commit: Option<syn::Path>,
 }
 
 /// The declared source of a field's transition table: either an inline
@@ -2629,9 +2634,31 @@ struct StateMachineSpec {
     source: StateMachineSource,
 }
 
-/// Parse the inner `a -> b, b -> c: "guard", ...` edge list of a
-/// `transitions(...)` group (the surrounding `transitions(` / `)` already
-/// consumed by the caller).
+/// Validate that a guard name literal is a plain Rust identifier so that
+/// `format_ident!` doesn't panic on names like `"can-ship"` or `"can ship"`.
+fn validate_guard_ident(lit: &syn::LitStr) -> syn::Result<String> {
+    let guard_str = lit.value();
+    syn::parse_str::<syn::Ident>(&guard_str).map_err(|_| {
+        syn::Error::new_spanned(
+            lit,
+            format!(
+                "`{guard_str}` is not a valid Rust identifier; \
+                 guard names must be a plain function name such as `can_ship`"
+            ),
+        )
+    })?;
+    Ok(guard_str)
+}
+
+/// Parse the inner edge list of a `transitions(...)` group (the surrounding
+/// `transitions(` / `)` already consumed by the caller).
+///
+/// Each edge is `From -> To` with an optional per-edge suffix after `:`:
+/// - the legacy bare-string guard shorthand `From -> To: "guard"`, or
+/// - a `key = value` meta list `From -> To: guard = "guard", on_commit = Job`
+///   (issue #1973), where `guard` names a `&self -> bool` method and
+///   `on_commit` names a `#[job]` struct to enqueue transactionally when the
+///   edge fires. Keys may appear in either order and are each optional.
 fn parse_transition_list(
     content: syn::parse::ParseStream<'_>,
 ) -> syn::Result<Vec<StateMachineTransition>> {
@@ -2640,29 +2667,64 @@ fn parse_transition_list(
         let from: syn::Ident = content.parse()?;
         content.parse::<syn::Token![->]>()?;
         let to: syn::Ident = content.parse()?;
-        let guard = if content.peek(syn::Token![:]) {
+        let mut guard: Option<String> = None;
+        let mut on_commit: Option<syn::Path> = None;
+        if content.peek(syn::Token![:]) {
             content.parse::<syn::Token![:]>()?;
-            let lit: syn::LitStr = content.parse()?;
-            let guard_str = lit.value();
-            // Validate that the guard name is a plain Rust identifier so that
-            // format_ident! doesn't panic on names like "can-ship" or "can ship".
-            syn::parse_str::<syn::Ident>(&guard_str).map_err(|_| {
-                syn::Error::new_spanned(
-                    &lit,
-                    format!(
-                        "`{guard_str}` is not a valid Rust identifier; \
-                         guard names must be a plain function name such as `can_ship`"
-                    ),
-                )
-            })?;
-            Some(guard_str)
-        } else {
-            None
-        };
+            if content.peek(syn::LitStr) {
+                // Legacy shorthand: `: "guard"`.
+                let lit: syn::LitStr = content.parse()?;
+                guard = Some(validate_guard_ident(&lit)?);
+            } else {
+                // New `key = value[, key = value]` meta list (issue #1973).
+                loop {
+                    let key: syn::Ident = content.parse()?;
+                    content.parse::<syn::Token![=]>()?;
+                    if key == "guard" {
+                        if guard.is_some() {
+                            return Err(syn::Error::new_spanned(
+                                &key,
+                                "duplicate `guard` on a single transition",
+                            ));
+                        }
+                        let lit: syn::LitStr = content.parse()?;
+                        guard = Some(validate_guard_ident(&lit)?);
+                    } else if key == "on_commit" {
+                        if on_commit.is_some() {
+                            return Err(syn::Error::new_spanned(
+                                &key,
+                                "duplicate `on_commit` on a single transition",
+                            ));
+                        }
+                        on_commit = Some(content.parse::<syn::Path>()?);
+                    } else {
+                        return Err(syn::Error::new_spanned(
+                            &key,
+                            "expected `guard = \"...\"` or `on_commit = <Job>`",
+                        ));
+                    }
+                    // Continue the meta list only when a `, <ident> =` follows
+                    // (another key for this edge). A `, <State> ->` (or the end)
+                    // belongs to the next edge, so leave the comma for the edge
+                    // separator below.
+                    if !content.peek(syn::Token![,]) {
+                        break;
+                    }
+                    let ahead = content.fork();
+                    ahead.parse::<syn::Token![,]>()?;
+                    if ahead.peek(syn::Ident) && ahead.peek2(syn::Token![=]) {
+                        content.parse::<syn::Token![,]>()?;
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
         transitions.push(StateMachineTransition {
             from: from.to_string(),
             to: to.to_string(),
             guard,
+            on_commit,
         });
         if content.peek(syn::Token![,]) {
             content.parse::<syn::Token![,]>()?;
@@ -2765,10 +2827,14 @@ fn state_machine_names(field: &syn::Ident) -> StateMachineNames {
 /// `transitions(...)` list generates a literal table + match arms (guards
 /// supported), while a `lifecycle = <Enum>` reference derives its table from the
 /// enum's `Lifecycle::STATE_MACHINE_TRANSITIONS` const (issue #1911).
-fn emit_state_machine_impl(model_name: &syn::Ident, spec: &StateMachineSpec) -> TokenStream {
+fn emit_state_machine_impl(
+    model_name: &syn::Ident,
+    spec: &StateMachineSpec,
+    pk_ident: Option<&syn::Ident>,
+) -> TokenStream {
     match &spec.source {
         StateMachineSource::Inline(transitions) => {
-            emit_state_machine_inline(model_name, &spec.field_ident, transitions)
+            emit_state_machine_inline(model_name, &spec.field_ident, transitions, pk_ident)
         }
         StateMachineSource::Lifecycle(path) => {
             emit_state_machine_lifecycle(model_name, &spec.field_ident, path)
@@ -2777,10 +2843,18 @@ fn emit_state_machine_impl(model_name: &syn::Ident, spec: &StateMachineSpec) -> 
 }
 
 /// Emit the state-machine items for an inline `transitions(...)` list.
+///
+/// When at least one edge declares `on_commit = <Job>` (issue #1973) this also
+/// emits a `transition_{field}_to_on_conn` method that validates the transition
+/// (via the pure `transition_{field}_to`) and, for the fired edge, enqueues the
+/// named job transactionally on the caller's connection with a derived
+/// idempotency key. Fields with no `on_commit` edge generate byte-for-byte the
+/// same items as before — the new method is purely additive/opt-in.
 fn emit_state_machine_inline(
     model_name: &syn::Ident,
     field: &syn::Ident,
     transitions: &[StateMachineTransition],
+    pk_ident: Option<&syn::Ident>,
 ) -> TokenStream {
     let StateMachineNames {
         const_name,
@@ -2816,6 +2890,18 @@ fn emit_state_machine_inline(
         })
         .collect();
 
+    // After-commit transition effects (issue #1973): only emitted when at least
+    // one edge names an `on_commit` job. This keeps no-`on_commit` models
+    // byte-for-byte identical to before (purely additive/opt-in).
+    let on_conn_impl = emit_state_machine_on_conn(
+        model_name,
+        field,
+        &field_str,
+        &transition_fn,
+        transitions,
+        pk_ident,
+    );
+
     quote! {
         impl #model_name {
             #[doc(hidden)]
@@ -2849,6 +2935,100 @@ fn emit_state_machine_inline(
                         ),
                     ))
                 }
+            }
+        }
+
+        #on_conn_impl
+    }
+}
+
+/// Emit the connection-taking `transition_{field}_to_on_conn` method for an
+/// inline state machine that declares one or more `on_commit` effects (issue
+/// #1973). Returns an empty token stream when no edge names a job, so machines
+/// without effects generate exactly the pre-existing items.
+///
+/// The generated method: (1) validates the transition via the pure
+/// `transition_{field}_to` (returning its `Err` unchanged when the edge is
+/// disallowed or a guard rejects it), (2) for the specific fired `(from, to)`
+/// edge that carries an `on_commit` job, enqueues that job **transactionally**
+/// on `conn` (so a rollback drops it) with a [`TransitionEffect`] payload whose
+/// `idempotency_key` is derived from `(model, field, record_id, from, to)`, and
+/// (3) returns the new state string for the caller to persist — mirroring the
+/// explicit-call contract of `transition_{field}_to`.
+fn emit_state_machine_on_conn(
+    model_name: &syn::Ident,
+    field: &syn::Ident,
+    field_str: &str,
+    transition_fn: &syn::Ident,
+    transitions: &[StateMachineTransition],
+    pk_ident: Option<&syn::Ident>,
+) -> TokenStream {
+    let has_effects = transitions.iter().any(|t| t.on_commit.is_some());
+    if !has_effects {
+        return TokenStream::new();
+    }
+
+    let on_conn_fn = format_ident!("{transition_fn}_on_conn");
+    let model_str = model_name.to_string();
+
+    // The record id renders through `Debug` so any primary-key type works
+    // (i32/i64/Uuid/String all implement it). A model with an `on_commit` edge
+    // is a `#[model]`, so a primary key is always present; the empty-string
+    // fallback is defensive only.
+    let record_id_expr = pk_ident.map_or_else(
+        || quote! { ::std::string::String::new() },
+        |pk| quote! { ::std::format!("{:?}", self.#pk) },
+    );
+
+    let effect_arms: Vec<TokenStream> = transitions
+        .iter()
+        .filter_map(|t| {
+            let job = t.on_commit.as_ref()?;
+            let from = &t.from;
+            let to = &t.to;
+            Some(quote! {
+                (#from, #to) => {
+                    let __record_id: ::std::string::String = #record_id_expr;
+                    let __idempotency_key = ::std::format!(
+                        "{}:{}:{}:{}:{}",
+                        #model_str, #field_str, __record_id, #from, #to,
+                    );
+                    let __effect = ::autumn_web::TransitionEffect {
+                        model: ::std::string::String::from(#model_str),
+                        field: ::std::string::String::from(#field_str),
+                        record_id: __record_id,
+                        from_state: ::std::string::String::from(#from),
+                        to_state: ::std::string::String::from(#to),
+                        idempotency_key: __idempotency_key,
+                    };
+                    ::autumn_web::job::enqueue_on_conn(
+                        <#job>::NAME,
+                        &__effect,
+                        conn,
+                    ).await?;
+                }
+            })
+        })
+        .collect();
+
+    quote! {
+        impl #model_name {
+            /// Validates a `{field}` transition and, for an edge declaring
+            /// `on_commit = <Job>`, enqueues that job transactionally on `conn`
+            /// so it runs after the surrounding transaction commits
+            /// (issue #1973). Returns the new state value for the caller to
+            /// persist; the enqueue rolls back with the caller's transaction.
+            pub async fn #on_conn_fn(
+                &self,
+                conn: &mut ::autumn_web::reexports::diesel_async::AsyncPgConnection,
+                target: &str,
+            ) -> ::autumn_web::AutumnResult<::std::string::String> {
+                let __new_state = self.#transition_fn(target)?;
+                match (&*self.#field, target) {
+                    #(#effect_arms,)*
+                    _ => {}
+                }
+                ::core::result::Result::Ok(__new_state)
             }
         }
     }
@@ -3006,18 +3186,6 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     }
 
-    // Collect state machine specs from all fields (RED → GREEN: declarative SM support).
-    let mut state_machine_impls: Vec<TokenStream> = Vec::new();
-    for field in &all_fields {
-        match parse_state_machine_spec(field) {
-            Ok(Some(spec)) => {
-                state_machine_impls.push(emit_state_machine_impl(name, &spec));
-            }
-            Ok(None) => {}
-            Err(err) => return err.to_compile_error(),
-        }
-    }
-
     let mut search_field_names = Vec::new();
     let mut search_field_weights = Vec::new();
 
@@ -3092,6 +3260,22 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             .first()
             .and_then(|f| f.ident.as_ref().map(|id| (id, &f.ty)))
     };
+
+    // Collect state machine specs from all fields (RED → GREEN: declarative SM
+    // support). Emitted here — after the primary key is resolved — so an
+    // `on_commit` effect (issue #1973) can derive its idempotency key from the
+    // record's primary-key value.
+    let sm_pk_ident: Option<&syn::Ident> = pk_field_for_factory.map(|(id, _)| id);
+    let mut state_machine_impls: Vec<TokenStream> = Vec::new();
+    for field in &all_fields {
+        match parse_state_machine_spec(field) {
+            Ok(Some(spec)) => {
+                state_machine_impls.push(emit_state_machine_impl(name, &spec, sm_pk_ident));
+            }
+            Ok(None) => {}
+            Err(err) => return err.to_compile_error(),
+        }
+    }
 
     // Fields for NewX: exclude #[id], #[default], #[lock_version], and auto-detected ID fields
     let fields_for_new: Vec<&&Field> = all_fields
@@ -7540,6 +7724,196 @@ mod tests {
         assert!(
             generated.contains("__AUTUMN_SM_TYPE_TRANSITIONS"),
             "raw identifier field must strip r# prefix for generated const name: {generated}"
+        );
+    }
+
+    // ── on_commit transition effects (#1973) ──────────────────────────────────
+
+    #[test]
+    fn state_machine_without_on_commit_does_not_emit_on_conn_method() {
+        // A machine with no `on_commit` edge is byte-for-byte unchanged: no
+        // `_on_conn` method and no `TransitionEffect`/`enqueue_on_conn` code.
+        let output = model_macro(
+            TokenStream::new(),
+            quote! {
+                pub struct Order {
+                    #[id]
+                    pub id: i64,
+                    #[state_machine(transitions(
+                        pending -> processing,
+                        processing -> shipped: "can_ship",
+                    ))]
+                    pub status: String,
+                }
+            },
+        );
+        let generated = output.to_string();
+        assert!(
+            !generated.contains("transition_status_to_on_conn"),
+            "no `on_commit` edge must not emit the `_on_conn` method: {generated}"
+        );
+        assert!(
+            !generated.contains("TransitionEffect") && !generated.contains("enqueue_on_conn"),
+            "no `on_commit` edge must not emit any effect codegen: {generated}"
+        );
+    }
+
+    #[test]
+    fn state_machine_on_commit_emits_on_conn_method() {
+        let output = model_macro(
+            TokenStream::new(),
+            quote! {
+                pub struct Order {
+                    #[id]
+                    pub id: i64,
+                    #[state_machine(transitions(
+                        pending -> processing,
+                        processing -> shipped: on_commit = SendShippedEmailJob,
+                    ))]
+                    pub status: String,
+                }
+            },
+        );
+        let generated = output.to_string();
+        assert!(
+            generated.contains("transition_status_to_on_conn"),
+            "an `on_commit` edge must emit the connection-taking method: {generated}"
+        );
+        assert!(
+            generated.contains("AsyncPgConnection"),
+            "the `_on_conn` method must take a connection: {generated}"
+        );
+        // The job is enqueued transactionally by its registered NAME.
+        assert!(
+            generated.contains("enqueue_on_conn")
+                && generated.contains("< SendShippedEmailJob > :: NAME"),
+            "the effect must enqueue the named job on the connection: {generated}"
+        );
+    }
+
+    #[test]
+    fn state_machine_on_commit_enqueues_only_on_the_named_edge() {
+        // Only `processing -> shipped` carries an effect; `pending -> processing`
+        // must not enqueue anything. The effect arm keys on both from/to states.
+        let output = model_macro(
+            TokenStream::new(),
+            quote! {
+                pub struct Order {
+                    #[id]
+                    pub id: i64,
+                    #[state_machine(transitions(
+                        pending -> processing,
+                        processing -> shipped: on_commit = SendShippedEmailJob,
+                    ))]
+                    pub status: String,
+                }
+            },
+        );
+        let generated = output.to_string();
+        // Exactly one enqueue call is generated (the single effect edge).
+        assert_eq!(
+            generated.matches("enqueue_on_conn").count(),
+            1,
+            "exactly the one `on_commit` edge must enqueue: {generated}"
+        );
+        // The effect arm dispatches on the fired edge's from/to pair.
+        assert!(
+            generated.contains("(\"processing\" , \"shipped\")"),
+            "the effect arm must match the fired edge: {generated}"
+        );
+    }
+
+    #[test]
+    fn state_machine_on_commit_derives_idempotency_key_from_edge_context() {
+        let output = model_macro(
+            TokenStream::new(),
+            quote! {
+                pub struct Order {
+                    #[id]
+                    pub id: i64,
+                    #[state_machine(transitions(
+                        processing -> shipped: on_commit = SendShippedEmailJob,
+                    ))]
+                    pub status: String,
+                }
+            },
+        );
+        let generated = output.to_string();
+        // The idempotency key is model:field:record_id:from:to and is carried on
+        // the TransitionEffect payload so a `unique, by = ["idempotency_key"]`
+        // job coalesces a retried transition.
+        assert!(
+            generated.contains("idempotency_key"),
+            "the effect must carry a derived idempotency key: {generated}"
+        );
+        assert!(
+            generated.contains("\"{}:{}:{}:{}:{}\""),
+            "the idempotency key must combine model/field/record_id/from/to: {generated}"
+        );
+        assert!(
+            generated.contains("\"Order\"") && generated.contains("\"status\""),
+            "the key must embed the model and field names: {generated}"
+        );
+        // The record id is derived from the primary-key field.
+        assert!(
+            generated.contains("self . id"),
+            "the record id must come from the primary key: {generated}"
+        );
+    }
+
+    #[test]
+    fn state_machine_guard_and_on_commit_compose_on_one_edge() {
+        let output = model_macro(
+            TokenStream::new(),
+            quote! {
+                pub struct Article {
+                    #[id]
+                    pub id: i64,
+                    #[state_machine(transitions(
+                        draft -> published,
+                        published -> archived: guard = "can_archive", on_commit = AnnounceArchiveJob,
+                    ))]
+                    pub status: String,
+                }
+            },
+        );
+        let generated = output.to_string();
+        // The guard is still stored in the const table and dispatched in can_*.
+        assert!(
+            generated.contains("Some (\"can_archive\")"),
+            "guard must remain in the transition table when composed with on_commit: {generated}"
+        );
+        assert!(
+            generated.contains("self . can_archive ()"),
+            "guarded+effect edge must still call the guard in `can_transition_*`: {generated}"
+        );
+        // The effect is emitted for the same edge.
+        assert!(
+            generated.contains("transition_status_to_on_conn")
+                && generated.contains("< AnnounceArchiveJob > :: NAME"),
+            "the composed edge must also enqueue its on_commit job: {generated}"
+        );
+    }
+
+    #[test]
+    fn state_machine_on_commit_unknown_meta_key_is_rejected() {
+        let output = model_macro(
+            TokenStream::new(),
+            quote! {
+                pub struct Order {
+                    #[id]
+                    pub id: i64,
+                    #[state_machine(transitions(
+                        processing -> shipped: bogus = "x",
+                    ))]
+                    pub status: String,
+                }
+            },
+        );
+        let generated = output.to_string();
+        assert!(
+            generated.contains("compile_error") && generated.contains("on_commit = <Job>"),
+            "an unknown per-edge meta key must emit a compile error: {generated}"
         );
     }
 
