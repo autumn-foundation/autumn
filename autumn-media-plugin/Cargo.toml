@@ -72,5 +72,11 @@ aws-smithy-runtime-api = ">=1.11, <1.11.4"
 # MSRV and the aws-smithy-* ceilings above.
 aws-sdk-s3 = { version = ">=1.122, <1.123", default-features = false, features = ["sigv4a", "default-https-client", "rt-tokio"] }
 
+[dev-dependencies]
+# Encode arg-vector / concat / segment-discovery tests stage files in a temp
+# dir; `std::fs::File::set_modified` (stable, MSRV 1.88) sets mtimes, so no
+# `filetime` dep is needed.
+tempfile = "3"
+
 [lints]
 workspace = true

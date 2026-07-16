@@ -38,6 +38,7 @@
 //! First-party plugin: `autumn-<name>-plugin`.
 
 pub mod config;
+pub mod encode;
 pub mod error;
 pub mod storage;
 
@@ -45,14 +46,26 @@ pub use config::{
     MediaConfig, MediaConfigError, MediaMtxConfig, MediaStorageBackend, MediaStorageConfig,
     RecordingConfig,
 };
+pub use encode::{
+    FfmpegClipTailCommand, FfmpegHighlightCommand, FfmpegLiveThumbnailCommand, FfmpegPosterCommand,
+    FfmpegPreviewSpriteCommand, PREVIEW_CELL_HEIGHT, PREVIEW_CELL_WIDTH,
+    PREVIEW_FRAME_INTERVAL_SECONDS, PREVIEW_SPRITE_COLUMNS, build_preview_webvtt,
+    newest_recording_file, newest_recording_files, newest_recording_files_since,
+    recording_segments_covering_window, slugify,
+};
 pub use error::MediaError;
 pub use storage::{MediaStorage, S3MediaStorage, StoredObject};
 
 /// Common downstream imports for configuring and mounting the media plugin.
 pub mod prelude {
     pub use crate::{
-        MediaConfig, MediaConfigError, MediaError, MediaMtxConfig, MediaPlugin, MediaStorage,
-        MediaStorageBackend, MediaStorageConfig, RecordingConfig, S3MediaStorage, StoredObject,
+        FfmpegClipTailCommand, FfmpegHighlightCommand, FfmpegLiveThumbnailCommand,
+        FfmpegPosterCommand, FfmpegPreviewSpriteCommand, MediaConfig, MediaConfigError, MediaError,
+        MediaMtxConfig, MediaPlugin, MediaStorage, MediaStorageBackend, MediaStorageConfig,
+        PREVIEW_CELL_HEIGHT, PREVIEW_CELL_WIDTH, PREVIEW_FRAME_INTERVAL_SECONDS,
+        PREVIEW_SPRITE_COLUMNS, RecordingConfig, S3MediaStorage, StoredObject,
+        build_preview_webvtt, newest_recording_file, newest_recording_files,
+        newest_recording_files_since, recording_segments_covering_window, slugify,
     };
 }
 
