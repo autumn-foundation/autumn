@@ -21,6 +21,9 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 toml = { workspace = true }
 tracing = { workspace = true }
+# Fresh workflow ids for staged (S3) encode outputs. Matches the pin autumn
+# itself uses (`uuid = { version = "1", features = ["v4"] }`).
+uuid = { version = "1", features = ["v4"] }
 
 # ── HTTP client (MediaMTX control API + recorded-VOD availability probe) ──────
 # Production MediaMTX origins can be https (Fly), so TLS is required. This pin
@@ -89,6 +92,8 @@ aws-sdk-s3 = { version = ">=1.122, <1.123", default-features = false, features =
 # dir; `std::fs::File::set_modified` (stable, MSRV 1.88) sets mtimes, so no
 # `filetime` dep is needed.
 tempfile = "3"
+# Job-arg / artifact (de)serialization round-trip tests.
+serde_json = { workspace = true }
 
 [lints]
 workspace = true

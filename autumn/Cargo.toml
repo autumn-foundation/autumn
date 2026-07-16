@@ -87,7 +87,7 @@ offline-sync = ["db", "http-client"]
 # (`PoolError::UnsupportedBackend`); a working pool is PR2. Needs no extra deps
 # — diesel's sqlite backend and diesel-async's sync-connection-wrapper are
 # already in the graph.
-sqlite = ["diesel/sqlite", "diesel-async/sync-connection-wrapper"]
+sqlite = ["diesel/sqlite", "diesel/returning_clauses_for_sqlite_3_35", "diesel-async/sync-connection-wrapper"]
 test-support = ["dep:testcontainers", "dep:testcontainers-modules"]
 telemetry-otlp = [
     "dep:opentelemetry",
@@ -493,6 +493,14 @@ path = "tests/state_machine_lifecycle.rs"
 [[test]]
 name = "state_machine_on_commit"
 path = "tests/state_machine_on_commit.rs"
+
+# Issue #1973: sync `on = "handler"` in-transaction transition effect — pure
+# validation + compile-time type-check of the generated connection-taking
+# method. No DB connection, runs without Docker. Isolated so it is cheap to
+# compile/run alone.
+[[test]]
+name = "state_machine_on"
+path = "tests/state_machine_on.rs"
 
 [[test]]
 name = "repository_shard_replica_routing"

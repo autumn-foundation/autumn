@@ -113,6 +113,28 @@ pub enum MediaError {
         #[source]
         source: std::io::Error,
     },
+
+    /// A derived media artifact (e.g. a seek-preview `WebVTT` track) could not
+    /// be written to its staging path before persistence.
+    #[error("failed to write media artifact `{path}`: {source}")]
+    ArtifactWrite {
+        /// The artifact (or parent directory) path involved.
+        path: String,
+        /// The underlying I/O error.
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// The blocking encode task panicked or was cancelled before completing.
+    ///
+    /// The encode primitives run synchronously on a blocking thread
+    /// ([`tokio::task::spawn_blocking`]); a panic there surfaces here rather
+    /// than unwinding the async worker.
+    #[error("media encode task did not complete: {message}")]
+    EncodeTaskJoin {
+        /// The stringified join error.
+        message: String,
+    },
 }
 
 /// Maximum number of stderr bytes carried in [`MediaError::FfmpegNonZeroExit`].

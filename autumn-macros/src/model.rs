@@ -2751,6 +2751,11 @@ struct StateMachineTransition {
     /// meaningful for inline `transitions(...)` machines — lifecycle-derived
     /// tables carry no effects.
     on_commit: Option<syn::Path>,
+    /// Optional sync in-transaction effect (issue #1973): the name of an
+    /// `async fn(&self, conn) -> AutumnResult<()>` method run inside the
+    /// transition's transaction when this edge fires. `Err` rolls the
+    /// transition back (mirrors `before_*` mutation hooks). Inline-only.
+    on: Option<String>,
 }
 
 /// The declared source of a field's transition table: either an inline
@@ -2791,10 +2796,12 @@ fn validate_guard_ident(lit: &syn::LitStr) -> syn::Result<String> {
 ///
 /// Each edge is `From -> To` with an optional per-edge suffix after `:`:
 /// - the legacy bare-string guard shorthand `From -> To: "guard"`, or
-/// - a `key = value` meta list `From -> To: guard = "guard", on_commit = Job`
-///   (issue #1973), where `guard` names a `&self -> bool` method and
+/// - a `key = value` meta list `From -> To: guard = "guard", on = "handler",
+///   on_commit = Job` (issue #1973), where `guard` names a `&self -> bool`
+///   method, `on` names an `async fn(&self, conn) -> AutumnResult<()>` method
+///   run in the transition's transaction (`Err` rolls it back), and
 ///   `on_commit` names a `#[job]` struct to enqueue transactionally when the
-///   edge fires. Keys may appear in either order and are each optional.
+///   edge fires. Keys may appear in any order and are each optional.
 fn parse_transition_list(
     content: syn::parse::ParseStream<'_>,
 ) -> syn::Result<Vec<StateMachineTransition>> {
@@ -2805,6 +2812,7 @@ fn parse_transition_list(
         let to: syn::Ident = content.parse()?;
         let mut guard: Option<String> = None;
         let mut on_commit: Option<syn::Path> = None;
+        let mut on: Option<String> = None;
         if content.peek(syn::Token![:]) {
             content.parse::<syn::Token![:]>()?;
             if content.peek(syn::LitStr) {
@@ -2833,10 +2841,19 @@ fn parse_transition_list(
                             ));
                         }
                         on_commit = Some(content.parse::<syn::Path>()?);
+                    } else if key == "on" {
+                        if on.is_some() {
+                            return Err(syn::Error::new_spanned(
+                                &key,
+                                "duplicate `on` on a single transition",
+                            ));
+                        }
+                        let lit: syn::LitStr = content.parse()?;
+                        on = Some(validate_guard_ident(&lit)?);
                     } else {
                         return Err(syn::Error::new_spanned(
                             &key,
-                            "expected `guard = \"...\"` or `on_commit = <Job>`",
+                            "expected `guard = \"...\"`, `on = \"...\"`, or `on_commit = <Job>`",
                         ));
                     }
                     // Continue the meta list only when a `, <ident> =` follows
@@ -2861,6 +2878,7 @@ fn parse_transition_list(
             to: to.to_string(),
             guard,
             on_commit,
+            on,
         });
         if content.peek(syn::Token![,]) {
             content.parse::<syn::Token![,]>()?;
@@ -3079,18 +3097,21 @@ fn emit_state_machine_inline(
 }
 
 /// Emit the connection-taking `transition_{field}_to_on_conn` method for an
-/// inline state machine that declares one or more `on_commit` effects (issue
-/// #1973). Returns an empty token stream when no edge names a job, so machines
-/// without effects generate exactly the pre-existing items.
+/// inline state machine that declares one or more per-edge effects — a sync
+/// `on = "handler"` and/or an `on_commit = <Job>` (issue #1973). Returns an
+/// empty token stream when no edge declares an effect, so machines without
+/// effects generate exactly the pre-existing items.
 ///
 /// The generated method: (1) validates the transition via the pure
 /// `transition_{field}_to` (returning its `Err` unchanged when the edge is
 /// disallowed or a guard rejects it), (2) for the specific fired `(from, to)`
-/// edge that carries an `on_commit` job, enqueues that job **transactionally**
-/// on `conn` (so a rollback drops it) with a [`TransitionEffect`] payload whose
-/// `idempotency_key` is derived from `(model, field, record_id, from, to)`, and
-/// (3) returns the new state string for the caller to persist — mirroring the
-/// explicit-call contract of `transition_{field}_to`.
+/// edge, first runs its declared sync `on` handler on `conn` inside the
+/// transaction (an `Err` propagates out, rolling the transition back), then
+/// enqueues its `on_commit` job **transactionally** on `conn` (so a rollback
+/// drops it) with a [`TransitionEffect`] payload whose `idempotency_key` is
+/// derived from `(model, field, record_id, from, to)`, and (3) returns the new
+/// state string for the caller to persist — mirroring the explicit-call
+/// contract of `transition_{field}_to`.
 fn emit_state_machine_on_conn(
     model_name: &syn::Ident,
     field: &syn::Ident,
@@ -3099,7 +3120,9 @@ fn emit_state_machine_on_conn(
     transitions: &[StateMachineTransition],
     pk_ident: Option<&syn::Ident>,
 ) -> TokenStream {
-    let has_effects = transitions.iter().any(|t| t.on_commit.is_some());
+    let has_effects = transitions
+        .iter()
+        .any(|t| t.on_commit.is_some() || t.on.is_some());
     if !has_effects {
         return TokenStream::new();
     }
@@ -3119,11 +3142,20 @@ fn emit_state_machine_on_conn(
     let effect_arms: Vec<TokenStream> = transitions
         .iter()
         .filter_map(|t| {
-            let job = t.on_commit.as_ref()?;
+            if t.on.is_none() && t.on_commit.is_none() {
+                return None;
+            }
             let from = &t.from;
             let to = &t.to;
-            Some(quote! {
-                (#from, #to) => {
+            // Sync in-transaction effect: runs first; `?` rolls the transition
+            // back (mirrors a failing `before_*` mutation hook).
+            let sync_effect = t.on.as_ref().map(|name| {
+                let handler = format_ident!("{name}");
+                quote! { self.#handler(conn).await?; }
+            });
+            // After-commit effect: enqueued transactionally, dispatched post-commit.
+            let commit_effect = t.on_commit.as_ref().map(|job| {
+                quote! {
                     let __record_id: ::std::string::String = #record_id_expr;
                     let __idempotency_key = ::std::format!(
                         "{}:{}:{}:{}:{}",
@@ -3143,17 +3175,25 @@ fn emit_state_machine_on_conn(
                         conn,
                     ).await?;
                 }
+            });
+            Some(quote! {
+                (#from, #to) => {
+                    #sync_effect
+                    #commit_effect
+                }
             })
         })
         .collect();
 
     quote! {
         impl #model_name {
-            /// Validates a `{field}` transition and, for an edge declaring
-            /// `on_commit = <Job>`, enqueues that job transactionally on `conn`
-            /// so it runs after the surrounding transaction commits
-            /// (issue #1973). Returns the new state value for the caller to
-            /// persist; the enqueue rolls back with the caller's transaction.
+            /// Validates a `{field}` transition and, for the fired edge, runs
+            /// its declared effects on `conn` (issue #1973): first a sync
+            /// `on = "handler"` method inside the transaction (an `Err` rolls
+            /// the transition back), then an `on_commit = <Job>` enqueue that
+            /// runs after the surrounding transaction commits. Returns the new
+            /// state value for the caller to persist; both effects roll back
+            /// with the caller's transaction.
             pub async fn #on_conn_fn(
                 &self,
                 conn: &mut ::autumn_web::reexports::diesel_async::AsyncPgConnection,
@@ -8297,6 +8337,170 @@ mod tests {
         assert!(
             generated.contains("compile_error") && generated.contains("on_commit = <Job>"),
             "an unknown per-edge meta key must emit a compile error: {generated}"
+        );
+        // The refreshed unknown-key message now also advertises `on = "..."`.
+        assert!(
+            generated.contains("`on = "),
+            "the unknown per-edge meta key error must mention `on = \"...\"`: {generated}"
+        );
+    }
+
+    // ── sync `on = "handler"` transition effects (#1973) ──────────────────────
+
+    #[test]
+    fn state_machine_on_sync_effect_emits_on_conn_method() {
+        // An edge with a sync `on = "handler"` emits the connection-taking
+        // method whose fired-edge arm calls `self.<handler>(conn).await?`.
+        let output = model_macro(
+            TokenStream::new(),
+            quote! {
+                pub struct Order {
+                    #[id]
+                    pub id: i64,
+                    #[state_machine(transitions(
+                        pending -> processing,
+                        processing -> shipped: on = "record_audit",
+                    ))]
+                    pub status: String,
+                }
+            },
+        );
+        let generated = output.to_string();
+        assert!(
+            generated.contains("transition_status_to_on_conn"),
+            "an `on` edge must emit the connection-taking method: {generated}"
+        );
+        assert!(
+            generated.contains("AsyncPgConnection"),
+            "the `_on_conn` method must take a connection: {generated}"
+        );
+        // The sync effect calls the named `&self` handler with the connection.
+        assert!(
+            generated.contains("self . record_audit (conn) . await ?"),
+            "the `on` edge must call its handler in-transaction: {generated}"
+        );
+    }
+
+    #[test]
+    fn state_machine_on_sync_effect_only_does_not_enqueue() {
+        // An `on`-only machine (no `on_commit` anywhere) emits the method but no
+        // after-commit enqueue/`TransitionEffect` codegen.
+        let output = model_macro(
+            TokenStream::new(),
+            quote! {
+                pub struct Order {
+                    #[id]
+                    pub id: i64,
+                    #[state_machine(transitions(
+                        processing -> shipped: on = "record_audit",
+                    ))]
+                    pub status: String,
+                }
+            },
+        );
+        let generated = output.to_string();
+        assert!(
+            generated.contains("transition_status_to_on_conn"),
+            "an `on` edge must still emit the connection-taking method: {generated}"
+        );
+        assert!(
+            !generated.contains("enqueue_on_conn") && !generated.contains("TransitionEffect"),
+            "an `on`-only machine must not emit after-commit effect codegen: {generated}"
+        );
+    }
+
+    #[test]
+    fn state_machine_on_and_on_commit_compose_on_one_edge() {
+        // A single edge with both `on` and `on_commit` emits both effects, with
+        // the sync handler call ordered BEFORE the after-commit enqueue.
+        let output = model_macro(
+            TokenStream::new(),
+            quote! {
+                pub struct Order {
+                    #[id]
+                    pub id: i64,
+                    #[state_machine(transitions(
+                        processing -> shipped: on = "record_audit", on_commit = SendShippedEmailJob,
+                    ))]
+                    pub status: String,
+                }
+            },
+        );
+        let generated = output.to_string();
+        let sync_at = generated
+            .find("self . record_audit (conn) . await ?")
+            .expect("sync handler call must be emitted");
+        let commit_at = generated
+            .find("enqueue_on_conn")
+            .expect("on_commit enqueue must be emitted");
+        assert!(
+            sync_at < commit_at,
+            "the sync `on` handler must run before the `on_commit` enqueue: {generated}"
+        );
+        assert!(
+            generated.contains("< SendShippedEmailJob > :: NAME"),
+            "the composed edge must enqueue its on_commit job: {generated}"
+        );
+    }
+
+    #[test]
+    fn state_machine_guard_and_on_and_on_commit_compose() {
+        // Guard + sync `on` + `on_commit` on one edge: the guard stays in the
+        // const table and `can_*` dispatch; both effects emit.
+        let output = model_macro(
+            TokenStream::new(),
+            quote! {
+                pub struct Article {
+                    #[id]
+                    pub id: i64,
+                    #[state_machine(transitions(
+                        draft -> published,
+                        published -> archived: guard = "can_archive", on = "audit", on_commit = AnnounceArchiveJob,
+                    ))]
+                    pub status: String,
+                }
+            },
+        );
+        let generated = output.to_string();
+        // Guard remains in the transition table and `can_*` dispatch.
+        assert!(
+            generated.contains("Some (\"can_archive\")"),
+            "guard must remain in the transition table when composed: {generated}"
+        );
+        assert!(
+            generated.contains("self . can_archive ()"),
+            "guarded edge must still call the guard in `can_transition_*`: {generated}"
+        );
+        // Both effects emit on the composed edge.
+        assert!(
+            generated.contains("self . audit (conn) . await ?"),
+            "the composed edge must run its sync `on` handler: {generated}"
+        );
+        assert!(
+            generated.contains("< AnnounceArchiveJob > :: NAME"),
+            "the composed edge must enqueue its on_commit job: {generated}"
+        );
+    }
+
+    #[test]
+    fn state_machine_duplicate_on_is_rejected() {
+        let output = model_macro(
+            TokenStream::new(),
+            quote! {
+                pub struct Order {
+                    #[id]
+                    pub id: i64,
+                    #[state_machine(transitions(
+                        processing -> shipped: on = "a", on = "b",
+                    ))]
+                    pub status: String,
+                }
+            },
+        );
+        let generated = output.to_string();
+        assert!(
+            generated.contains("compile_error") && generated.contains("duplicate `on`"),
+            "a duplicate `on` on one edge must emit a compile error: {generated}"
         );
     }
 

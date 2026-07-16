@@ -697,12 +697,13 @@ pub fn first_deploy_ops(
 /// 7. run pending migrations BEFORE cutover (`AUTUMN_MIGRATE=1` one-shot),
 /// 8. bounded `/ready` poll on the candidate's separate loopback port,
 /// 9. health-gated proxy flip old→candidate (THE cutover),
-/// 10. record the previous-release marker (the release being replaced: its dir +
-///     live slot), BEFORE `current` moves off it,
-/// 11. promote `current` to the new release,
-/// 12. record the live slot marker,
-/// 13. drain (stop) the old release,
-/// 14. prune old releases beyond `keep_releases`, always protecting the releases
+/// 10. commit the state markers as ONE atomic remote op (#1938): record the
+///     previous-release marker (the release being replaced: its dir + live slot)
+///     BEFORE `current` moves off it, promote `current` to the new release, then
+///     record the live slot marker — each marker written via temp-file + `mv`,
+///     the whole thing landing or failing as a unit,
+/// 11. drain (stop) the old release,
+/// 12. prune old releases beyond `keep_releases`, always protecting the releases
 ///     `current` and the previous-release marker point at (rollback targets).
 #[must_use]
 // One cohesive op-plan builder; each param is a distinct injected input kept as a
@@ -790,23 +791,24 @@ pub fn cutover_ops(
         // live traffic to it and drains the old target. Only reached after a
         // passing readiness gate (AC-2).
         proxy.flip_op(&cfg.service_name, &loopback_upstream(plan.candidate_port)),
-        // Persist the release being replaced (the current live release: its dir +
-        // live slot) as the new "previous release" so a later rollback returns to
-        // it. Must run BEFORE `link-current` repoints the symlink, since it reads
-        // the pre-repoint `current` target.
-        DeployOp::Run(record_previous_release(cfg, plan.live_slot, plan.live_port)),
-        DeployOp::Run(RemoteCommand::new(
-            "link-current",
-            format!(
-                "ln -sfn {} {}",
-                shell_quote(&release_dir),
-                shell_quote(&current)
-            ),
-        )),
-        DeployOp::Run(record_live_slot(
+        // Commit the on-disk state markers as ONE remote transaction after the flip
+        // (#1938): a single SSH round-trip that either lands as a unit or fails as a
+        // unit, so a failure between the flip and completing the markers can no
+        // longer leave the proxy on the new release while the markers still describe
+        // the old one. Internally it (1) records the release being replaced (its dir
+        // + live slot) as the new "previous release" — read from `current` +
+        // live-slot BEFORE they change — then (2) repoints `current` to the new
+        // release, then (3) records the new live slot. Each marker file is written
+        // via temp-file + `mv` (atomic rename), not a truncating redirect.
+        DeployOp::Run(commit_markers_command(
             cfg,
+            &release_dir,
             plan.candidate_slot,
             plan.candidate_port,
+            PrevMarkerFallback {
+                slot: plan.live_slot,
+                port: plan.live_port,
+            },
         )),
         DeployOp::Run(RemoteCommand::new(
             "drain-old",
@@ -1031,11 +1033,10 @@ pub fn rollback_ops(
     // it. `target.slot` is the slot we roll back TO, so the former-live slot is the
     // OTHER one.
     let rolled_back_unit = slot_unit_name(&cfg.service_name, other_slot(target.slot));
-    let current = cfg.current_symlink();
     // Fallback port for the being-rolled-back-from (former-live) slot, used only if
     // its live-slot marker predates the port field. Reconstruct the public port
     // from `target.port` (= `slot_app_port(public, target.slot)`) and re-derive the
-    // other slot's port; in the normal path `record_previous_release` copies the
+    // other slot's port; in the normal path `commit_markers_command` copies the
     // real port straight from the live-slot marker and ignores this.
     let public_port = target
         .port
@@ -1076,26 +1077,27 @@ pub fn rollback_ops(
         // Health-gated flip back: the previous unit (brought up above) must pass
         // /ready before the proxy swaps traffic to it.
         proxy.flip_op(&cfg.service_name, &loopback_upstream(target.port)),
-        // Persist the release we are rolling back FROM (the current live release:
-        // its dir + the former-live slot) as the new "previous release", so a
-        // subsequent rollback returns to it. Must run BEFORE `link-current`
-        // repoints the symlink, since it reads the pre-repoint `current` target.
-        // The former-live slot is `other_slot(target.slot)` (the slot traffic just
-        // moved away from).
-        DeployOp::Run(record_previous_release(
+        // Commit the on-disk state markers as ONE remote transaction after the flip
+        // (#1938), symmetric with cutover: a single SSH round-trip that lands or
+        // fails as a unit, so a failure between the flip and completing the markers
+        // cannot leave the proxy on the rolled-back release while the markers still
+        // describe the release we rolled back FROM. Internally it (1) records the
+        // release we are rolling back FROM (its dir + the former-live slot,
+        // `other_slot(target.slot)`) as the new "previous release" — read from
+        // `current` + live-slot BEFORE they change — then (2) repoints `current` to
+        // the target release, then (3) records the target's live slot. Each marker
+        // file is written via temp-file + `mv` (atomic rename), not a truncating
+        // redirect.
+        DeployOp::Run(commit_markers_command(
             cfg,
-            other_slot(target.slot),
-            former_live_fallback_port,
+            &target.release_dir,
+            target.slot,
+            target.port,
+            PrevMarkerFallback {
+                slot: other_slot(target.slot),
+                port: former_live_fallback_port,
+            },
         )),
-        DeployOp::Run(RemoteCommand::new(
-            "link-current",
-            format!(
-                "ln -sfn {} {}",
-                shell_quote(&target.release_dir),
-                shell_quote(&current)
-            ),
-        )),
-        DeployOp::Run(record_live_slot(cfg, target.slot, target.port)),
         DeployOp::Run(RemoteCommand::new(
             "readiness-gate",
             readiness_poll_shell(target.port, cfg.readiness_timeout_secs),
@@ -1123,9 +1125,10 @@ pub fn rollback_ops(
 ///
 /// It does NOT remove the target's release dir — that is a real, retained release
 /// (a rollback target), not a half-written candidate, so it must survive for a
-/// future rollback. This cleanup is PURE: every marker write in [`rollback_ops`]
-/// (record-previous, link-current, record-live-slot) runs strictly AFTER the flip,
-/// so a pre-/at-flip failure has touched no marker. Best-effort by construction
+/// future rollback. This cleanup is PURE: the single `commit-markers` op in
+/// [`rollback_ops`] (which records previous-release, repoints `current`, and
+/// records live-slot) runs strictly AFTER the flip, so a pre-/at-flip failure has
+/// touched no marker. Best-effort by construction
 /// (`|| true` so a never-started unit doesn't fail the cleanup) and driven through
 /// [`run_teardown`], which swallows executor errors so a flaky cleanup can never
 /// mask the real rollback failure.
@@ -1165,45 +1168,90 @@ fn record_live_slot(cfg: &ResolvedDeployConfig, slot: &str, port: u16) -> Remote
     )
 }
 
-/// Command that records the release being replaced (its absolute dir + the slot
-/// AND loopback port it runs on) as the new "previous release", stored as
-/// `{dir}\t{slot}\t{port}` and read by a later on-demand rollback's
-/// [`resolve_rollback_target`].
+/// Fallback slot + loopback port for the previous-release marker, used only when
+/// the CURRENT live-slot marker is absent or predates the port field (older
+/// slot-only format), so parsing never fails. In the normal path the real slot +
+/// port are copied straight from the live-slot marker and these are ignored.
 ///
-/// The dir comes from the CURRENT symlink's target — the release live right now,
-/// about to be replaced — so this MUST run before the `link-current` op repoints
-/// the symlink. The slot and port are copied from the CURRENT live-slot marker
-/// (which still describes the being-replaced release, since `record_live_slot`
-/// overwrites it only AFTER this op), so the previous-release marker carries that
-/// release's REAL listener port — the port its unit was actually rendered with,
-/// which may differ from `slot_app_port(current server.port, slot)` if a deploy
-/// changed `server.port`.
+/// `slot` is the being-replaced release's live slot and `port`
+/// (`= slot_app_port(current server.port, slot)`) its derived loopback port.
+#[derive(Clone, Copy)]
+struct PrevMarkerFallback<'a> {
+    slot: &'a str,
+    port: u16,
+}
+
+/// Command that commits ALL post-flip on-disk state markers as ONE remote
+/// transaction (#1938), shared verbatim by [`cutover_ops`] and [`rollback_ops`]
+/// so the two paths can never drift.
 ///
-/// `slot` and `fallback_port` (`= slot_app_port(current server.port, slot)`) are
-/// the values to fall back to when the live-slot marker is absent or predates the
-/// port field (older slot-only format), so parsing never fails. If `current` is
-/// somehow absent the marker is left untouched (a rollback then degrades to
-/// no-previous-release rather than pointing at a bogus dir).
-fn record_previous_release(
+/// Collapsing what used to be three separate SSH ops (record-previous,
+/// link-current, record-live-slot) into a single `&&`-joined shell line removes
+/// the multi-round-trip window in which a failure between the flip and completing
+/// the markers could leave the proxy serving the new/rolled-back release while the
+/// markers still described the old one (drift that then mis-picks the slot on the
+/// next deploy). The combined op either lands as a unit or fails as a unit, and it
+/// stays positioned strictly AFTER the `proxy-flip` op so the existing "post-flip
+/// failure surfaces the raw error and runs NO teardown" fail-safe still holds.
+///
+/// The shell runs, in this exact order (order is load-bearing — the
+/// previous-release marker must read `current` + live-slot BEFORE they change):
+///   1. compute `prev` from `readlink current` + the CURRENT live-slot marker
+///      (falling back to [`PrevMarkerFallback`] when the marker is absent/older),
+///      and — only if `prev` is non-empty — write `{dir}\t{slot}\t{port}` to a
+///      unique temp file in the shared dir and `mv` it onto `previous-release`;
+///   2. `ln -sfn {release_dir} current` (already atomic);
+///   3. write `{slot}\t{port}` to a unique temp file in the shared dir and `mv` it
+///      onto `live-slot`.
+///
+/// Each individual marker file is updated via temp-file + `mv` (an atomic,
+/// same-filesystem rename — the temp files are `mktemp`'d in the marker's own
+/// `shared/` dir), never a truncating `>` redirect onto the live marker, so a
+/// reader never observes a half-written marker. The marker FORMATS are unchanged
+/// (`{slot}\t{port}` for live-slot, `{dir}\t{slot}\t{port}` for previous-release),
+/// and the "only write previous-release when `prev` is non-empty" guard is
+/// preserved.
+///
+/// `release_dir` is the release `current` is repointed to; `slot`/`port` are the
+/// now-live slot and its loopback port (candidate on cutover, target on rollback).
+fn commit_markers_command(
     cfg: &ResolvedDeployConfig,
+    release_dir: &str,
     slot: &str,
-    fallback_port: u16,
+    port: u16,
+    prev_fallback: PrevMarkerFallback<'_>,
 ) -> RemoteCommand {
+    let shared = cfg.shared_dir();
+    let prev_tmpl = format!("{shared}/previous-release.tmp.XXXXXX");
+    let live_tmpl = format!("{shared}/live-slot.tmp.XXXXXX");
     RemoteCommand::new(
-        "record-previous",
+        "commit-markers",
         format!(
             "prev=$(readlink {current} 2>/dev/null); \
              live=$(cat {live_marker} 2>/dev/null); \
              lslot=$(printf '%s' \"$live\" | cut -f1); \
              lport=$(printf '%s' \"$live\" | cut -s -f2); \
-             [ -n \"$lslot\" ] || lslot={slot}; \
-             [ -n \"$lport\" ] || lport={fallback_port}; \
-             if [ -n \"$prev\" ]; then printf '%s\\t%s\\t%s' \"$prev\" \"$lslot\" \"$lport\" > {marker}; fi",
+             [ -n \"$lslot\" ] || lslot={prev_slot}; \
+             [ -n \"$lport\" ] || lport={prev_port}; \
+             if [ -n \"$prev\" ]; then \
+                 ptmp=$(mktemp {prev_tmpl}) && \
+                 printf '%s\\t%s\\t%s' \"$prev\" \"$lslot\" \"$lport\" > \"$ptmp\" && \
+                 mv -f \"$ptmp\" {prev_marker}; \
+             fi && \
+             ln -sfn {release_dir} {current} && \
+             ltmp=$(mktemp {live_tmpl}) && \
+             printf '%s\\t%s' {slot} {port} > \"$ltmp\" && \
+             mv -f \"$ltmp\" {live_marker}",
             current = shell_quote(&cfg.current_symlink()),
             live_marker = shell_quote(&live_slot_marker(cfg)),
+            prev_slot = shell_quote(prev_fallback.slot),
+            prev_port = prev_fallback.port,
+            prev_tmpl = shell_quote(&prev_tmpl),
+            prev_marker = shell_quote(&previous_release_marker(cfg)),
+            release_dir = shell_quote(release_dir),
+            live_tmpl = shell_quote(&live_tmpl),
             slot = shell_quote(slot),
-            fallback_port = fallback_port,
-            marker = shell_quote(&previous_release_marker(cfg)),
+            port = port,
         ),
     )
 }
@@ -1499,7 +1547,7 @@ pub fn reconcile_live_slot(
 
 /// Op that repairs a drifted live-slot marker to the proxy-authoritative slot.
 ///
-/// Prepended to the redeploy sequence (before [`record_previous_release`] reads
+/// Prepended to the redeploy sequence (before [`commit_markers_command`] reads
 /// the marker) so the marker on disk is corrected as an early, atomic deploy op.
 /// Reuses [`record_live_slot`]'s single marker-writer; the persisted port is
 /// `slot_app_port(public_port, slot)`, which — since the reconcile only fires when
@@ -2177,9 +2225,7 @@ mod tests {
                 "migrate",
                 "readiness-gate",
                 "proxy-flip",
-                "record-previous",
-                "link-current",
-                "record-live-slot",
+                "commit-markers",
                 "drain-old",
                 "prune",
             ],
@@ -2212,48 +2258,79 @@ mod tests {
             flip.contains("kamal-proxy deploy") && flip.contains("--target '127.0.0.1:3002'"),
             "flip targets the candidate: {flip}"
         );
-        // The old (blue) release is drained; current is promoted to the new dir.
+        // The old (blue) release is drained.
         let drain = exec.shell_for("drain-old").expect("drain ran");
         assert!(
             drain.contains("disable --now myapp-blue.service"),
             "{drain}"
         );
-        let promote = exec.shell_for("link-current").expect("promote ran");
-        assert!(promote.contains(RELEASE_DIR) && promote.contains("/srv/autumn/myapp/current"));
 
-        // The previous-release marker records the release being replaced: it reads
-        // the pre-repoint `current` target and writes it + the LIVE (old, blue)
-        // slot to shared/previous-release.
-        let record_prev = exec
-            .shell_for("record-previous")
-            .expect("record-previous ran");
+        // #1938: the three post-flip markers are now committed by ONE atomic op.
+        // It reads the pre-repoint `current` target and the LIVE (blue) slot marker,
+        // records them as the previous release, repoints `current` to the new dir,
+        // and records the candidate (green) as live — in that internal order, with
+        // each marker written via a temp file + `mv` (never a truncating redirect
+        // onto the live marker).
+        let commit = exec
+            .shell_for("commit-markers")
+            .expect("commit-markers ran");
+        // (1) previous-release: reads current + the live-slot marker (slot AND port,
+        // so it persists the replaced release's REAL listener port), falls back to
+        // the live (blue) slot, and writes {dir}\t{slot}\t{port}.
         assert!(
-            record_prev.contains("readlink '/srv/autumn/myapp/current'")
-                && record_prev.contains("/srv/autumn/myapp/shared/previous-release"),
-            "record-previous reads current and writes the previous-release marker: {record_prev}"
+            commit.contains("readlink '/srv/autumn/myapp/current'")
+                && commit.contains("cut -f1")
+                && commit.contains("cut -s -f2")
+                && commit.contains("|| lslot='blue'"),
+            "commit-markers reads current + the live-slot marker for previous-release: {commit}"
         );
         assert!(
-            record_prev.contains("'blue'"),
-            "the replaced release ran on the live (blue) slot: {record_prev}"
+            commit.contains("printf '%s\\t%s\\t%s' \"$prev\" \"$lslot\" \"$lport\""),
+            "commit-markers writes the {{dir}}\\t{{slot}}\\t{{port}} previous-release format: {commit}"
         );
-        // record-previous copies the being-replaced release's slot+port from the
-        // LIVE-SLOT marker (so it persists that release's REAL listener port),
-        // reading it before record-live-slot overwrites it.
+        // (2) current is repointed to the new release dir.
         assert!(
-            record_prev.contains("/srv/autumn/myapp/shared/live-slot")
-                && record_prev.contains("cut -f1")
-                && record_prev.contains("cut -s -f2"),
-            "record-previous sources slot+port from the live-slot marker: {record_prev}"
+            commit.contains("ln -sfn")
+                && commit.contains(RELEASE_DIR)
+                && commit.contains("'/srv/autumn/myapp/current'"),
+            "commit-markers repoints current to the new release: {commit}"
         );
-        // record-live-slot writes `{slot}\t{port}` — the candidate (green) becomes
-        // live on its loopback port 3002.
-        let record_live = exec
-            .shell_for("record-live-slot")
-            .expect("record-live-slot ran");
+        // (3) live-slot: the candidate (green) becomes live on loopback port 3002,
+        // in the exact {slot}\t{port} format.
         assert!(
-            record_live.contains("printf '%s\\t%s' 'green' 3002")
-                && record_live.contains("/srv/autumn/myapp/shared/live-slot"),
-            "record-live-slot persists slot AND port: {record_live}"
+            commit.contains("printf '%s\\t%s' 'green' 3002"),
+            "commit-markers writes the {{slot}}\\t{{port}} live-slot format: {commit}"
+        );
+        // Atomic writes: each marker is updated via a unique temp file + `mv -f`,
+        // and neither live marker is ever the target of a bare `>` truncation.
+        assert!(
+            commit.contains("$(mktemp '/srv/autumn/myapp/shared/previous-release.tmp.XXXXXX')")
+                && commit.contains("mv -f \"$ptmp\" '/srv/autumn/myapp/shared/previous-release'"),
+            "previous-release is written via temp-file + mv (atomic): {commit}"
+        );
+        assert!(
+            commit.contains("$(mktemp '/srv/autumn/myapp/shared/live-slot.tmp.XXXXXX')")
+                && commit.contains("mv -f \"$ltmp\" '/srv/autumn/myapp/shared/live-slot'"),
+            "live-slot is written via temp-file + mv (atomic): {commit}"
+        );
+        assert!(
+            !commit.contains("> '/srv/autumn/myapp/shared/live-slot'")
+                && !commit.contains("> '/srv/autumn/myapp/shared/previous-release'"),
+            "no bare `>` truncation onto a live marker (temp+mv only): {commit}"
+        );
+        // Internal order (load-bearing): previous-release write < current repoint <
+        // live-slot write — the previous-release marker must be captured from the
+        // pre-repoint state before `current`/live-slot change.
+        let prev_write = commit
+            .find("mv -f \"$ptmp\"")
+            .expect("previous-release mv present");
+        let link = commit.find("ln -sfn").expect("ln -sfn present");
+        let live_write = commit
+            .find("mv -f \"$ltmp\"")
+            .expect("live-slot mv present");
+        assert!(
+            prev_write < link && link < live_write,
+            "commit-markers order must be previous-release write < ln -sfn < live-slot write: {commit}"
         );
 
         // Ordering invariants: migrate BEFORE the flip; the flip ONLY after a
@@ -2287,20 +2364,12 @@ mod tests {
             "flip only after a passing readiness gate"
         );
         assert!(
-            pos("proxy-flip") < pos("record-previous"),
-            "flip before recording the previous-release marker"
+            pos("proxy-flip") < pos("commit-markers"),
+            "flip before committing the state markers"
         );
         assert!(
-            pos("record-previous") < pos("link-current"),
-            "record the previous-release marker before `current` moves off it"
-        );
-        assert!(
-            pos("proxy-flip") < pos("link-current"),
-            "flip before promote"
-        );
-        assert!(
-            pos("link-current") < pos("drain-old"),
-            "promote before drain"
+            pos("commit-markers") < pos("drain-old"),
+            "commit the markers before draining the old release"
         );
         assert!(pos("drain-old") < pos("prune"), "drain before prune");
     }
@@ -2344,7 +2413,10 @@ mod tests {
             "no flip after a failed migration"
         );
         assert!(!labels.contains(&"drain-old"), "old release not drained");
-        assert!(!labels.contains(&"link-current"), "current not repointed");
+        assert!(
+            !labels.contains(&"commit-markers"),
+            "current not repointed (commit-markers never ran)"
+        );
         assert!(!labels.contains(&"prune"), "nothing pruned");
         // The candidate is explicitly torn down: its slot unit is stopped/disabled
         // and its release dir removed so a retry starts clean.
@@ -2399,7 +2471,10 @@ mod tests {
             "no flip on readiness timeout"
         );
         assert!(!labels.contains(&"drain-old"), "old release not drained");
-        assert!(!labels.contains(&"link-current"), "current not repointed");
+        assert!(
+            !labels.contains(&"commit-markers"),
+            "current not repointed (commit-markers never ran)"
+        );
         // The failed candidate is torn down.
         assert!(
             labels.contains(&"teardown-candidate-unit")
@@ -2434,13 +2509,15 @@ mod tests {
             // lookup resolves to `None` (boundary unknown).
             DeployOp::Run(RemoteCommand::new("prxy-flip-typo", "true")),
             // A LATE op — after where the flip would have moved traffic — fails.
-            DeployOp::Run(RemoteCommand::new("record-live-slot", "true")),
+            // This is the real post-flip marker op (#1938 collapsed the three
+            // separate marker ops into one `commit-markers`).
+            DeployOp::Run(RemoteCommand::new("commit-markers", "true")),
         ];
         let teardown = vec![
             DeployOp::Run(RemoteCommand::new("teardown-candidate-unit", "true")),
             DeployOp::Run(RemoteCommand::new("teardown-candidate-dir", "true")),
         ];
-        let exec = RecordingExecutor::failing_on("record-live-slot");
+        let exec = RecordingExecutor::failing_on("commit-markers");
         let checks = vec![PreflightCheck::pass("ssh_reachability", "ok")];
 
         let err = execute_with_teardown(
@@ -2458,7 +2535,7 @@ mod tests {
             matches!(
                 err,
                 DeployExecError::CommandFailed {
-                    label: "record-live-slot",
+                    label: "commit-markers",
                     ..
                 }
             ),
@@ -2479,6 +2556,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn deploy_rollback_produces_exact_ordered_sequence() {
         // The previous-release marker names release A on the BLUE slot directly
         // (the marker records the previous release's OWN slot), so rollback flips
@@ -2502,7 +2580,7 @@ mod tests {
 
         // resolve-previous (the probe) precedes the ordered rollback ops: re-render
         // the target unit + daemon-reload → bring the previous slot back up → flip →
-        // record previous → promote → mark live → re-probe → drain the former-live
+        // commit the markers atomically (#1938) → re-probe → drain the former-live
         // slot. (write-target-unit is a WriteFile — uploaded, so excluded from
         // `run_labels`; asserted in `rollback_rerenders_target_unit_before_restart`.)
         assert_eq!(
@@ -2512,31 +2590,73 @@ mod tests {
                 "daemon-reload",
                 "restart-previous",
                 "proxy-flip",
-                "record-previous",
-                "link-current",
-                "record-live-slot",
+                "commit-markers",
                 "readiness-gate",
                 "drain-rolled-back-slot",
             ],
             "unexpected rollback sequence"
         );
 
-        // The previous-release marker now records the release rolled back FROM: it
-        // reads the pre-repoint `current` and writes it + the FORMER-live (green)
-        // slot, so a subsequent rollback returns to it.
-        let record_prev = exec
-            .shell_for("record-previous")
-            .expect("record-previous ran");
+        // #1938: the post-flip markers are committed by ONE atomic op, symmetric
+        // with cutover. It records the release rolled back FROM (its dir + the
+        // FORMER-live green slot, read from current + the live-slot marker) as the
+        // new previous-release, repoints `current` to the target release, then marks
+        // the target (blue) live — in that internal order, each via temp-file + mv.
+        let commit = exec
+            .shell_for("commit-markers")
+            .expect("commit-markers ran");
+        // (1) previous-release: reads current + the live-slot marker, falls back to
+        // the former-live (green) slot, and writes the {dir}\t{slot}\t{port} format.
         assert!(
-            record_prev.contains("readlink '/srv/autumn/myapp/current'")
-                && record_prev.contains("/srv/autumn/myapp/shared/previous-release"),
-            "record-previous reads current and writes the previous-release marker: {record_prev}"
+            commit.contains("readlink '/srv/autumn/myapp/current'")
+                && commit.contains("cut -f1")
+                && commit.contains("cut -s -f2")
+                && commit.contains("|| lslot='green'"),
+            "commit-markers reads current + the live-slot marker for previous-release: {commit}"
         );
         assert!(
-            record_prev.contains("'green'")
-                && record_prev.contains("/srv/autumn/myapp/shared/live-slot"),
-            "record-previous records the former-live slot and sources it from the \
-             live-slot marker: {record_prev}"
+            commit.contains("printf '%s\\t%s\\t%s' \"$prev\" \"$lslot\" \"$lport\""),
+            "commit-markers writes the {{dir}}\\t{{slot}}\\t{{port}} previous-release format: {commit}"
+        );
+        // (2) current is repointed to the target (previous) release dir.
+        assert!(
+            commit.contains("ln -sfn")
+                && commit.contains("/srv/autumn/myapp/releases/20260713T090000Z")
+                && commit.contains("'/srv/autumn/myapp/current'"),
+            "commit-markers repoints current to the target release: {commit}"
+        );
+        // (3) live-slot: the target (blue) becomes live on loopback port 3001, in
+        // the exact {slot}\t{port} format.
+        assert!(
+            commit.contains("printf '%s\\t%s' 'blue' 3001"),
+            "commit-markers writes the {{slot}}\\t{{port}} live-slot format: {commit}"
+        );
+        // Atomic writes: each marker via temp-file + `mv -f`, never a bare `>`
+        // truncation onto a live marker.
+        assert!(
+            commit.contains("$(mktemp '/srv/autumn/myapp/shared/previous-release.tmp.XXXXXX')")
+                && commit.contains("mv -f \"$ptmp\" '/srv/autumn/myapp/shared/previous-release'")
+                && commit.contains("$(mktemp '/srv/autumn/myapp/shared/live-slot.tmp.XXXXXX')")
+                && commit.contains("mv -f \"$ltmp\" '/srv/autumn/myapp/shared/live-slot'"),
+            "both markers are written via temp-file + mv (atomic): {commit}"
+        );
+        assert!(
+            !commit.contains("> '/srv/autumn/myapp/shared/live-slot'")
+                && !commit.contains("> '/srv/autumn/myapp/shared/previous-release'"),
+            "no bare `>` truncation onto a live marker (temp+mv only): {commit}"
+        );
+        // Internal order (load-bearing): previous-release write < current repoint <
+        // live-slot write.
+        let prev_write = commit
+            .find("mv -f \"$ptmp\"")
+            .expect("previous-release mv present");
+        let link = commit.find("ln -sfn").expect("ln -sfn present");
+        let live_write = commit
+            .find("mv -f \"$ltmp\"")
+            .expect("live-slot mv present");
+        assert!(
+            prev_write < link && link < live_write,
+            "commit-markers order must be previous-release write < ln -sfn < live-slot write: {commit}"
         );
 
         // The previous unit is brought up before the flip (the flip is health-
@@ -2563,13 +2683,6 @@ mod tests {
             flip.contains("kamal-proxy deploy") && flip.contains("--target '127.0.0.1:3001'"),
             "flip targets the previous release's address: {flip}"
         );
-        // `current` is repointed at the previous release dir.
-        let promote = exec.shell_for("link-current").expect("promote ran");
-        assert!(
-            promote.contains("/srv/autumn/myapp/releases/20260713T090000Z")
-                && promote.contains("/srv/autumn/myapp/current"),
-            "current is repointed to the previous release: {promote}"
-        );
         // The re-probe targets the previous release's port.
         let gate = exec.shell_for("readiness-gate").expect("gate ran");
         assert!(gate.contains("127.0.0.1:3001/ready"), "gate: {gate}");
@@ -2582,16 +2695,12 @@ mod tests {
             "the previous unit is up before the flip"
         );
         assert!(
-            pos("proxy-flip") < pos("record-previous"),
-            "flip before recording the previous-release marker"
+            pos("proxy-flip") < pos("commit-markers"),
+            "flip before committing the state markers"
         );
         assert!(
-            pos("record-previous") < pos("link-current"),
-            "record the previous-release marker before `current` moves off it"
-        );
-        assert!(
-            pos("link-current") < pos("readiness-gate"),
-            "promote before the re-probe"
+            pos("commit-markers") < pos("readiness-gate"),
+            "commit the markers before the re-probe"
         );
         // The slot the rollback flipped traffic AWAY from (green, the former-live
         // slot) is drained AFTER the re-probe confirms the rolled-back release is
@@ -2608,6 +2717,67 @@ mod tests {
         assert!(
             pos("readiness-gate") < pos("drain-rolled-back-slot"),
             "drain the former-live slot only after confirming the rollback is healthy"
+        );
+    }
+
+    #[test]
+    fn commit_markers_writes_both_markers_atomically_via_temp_and_mv() {
+        // #1938: the collapsed post-flip marker op writes each on-disk marker via a
+        // unique temp file + `mv` (atomic same-filesystem rename), never a
+        // truncating `>` redirect onto the live marker — so a crash mid-write can
+        // never leave a reader observing a half-written marker — and it preserves
+        // the exact wire formats the reader (`detect_deploy_mode` / rollback
+        // resolution) parses: `{slot}\t{port}` for live-slot and
+        // `{dir}\t{slot}\t{port}` for previous-release.
+        let ops = sample_cutover_ops(Secret::new("AUTUMN_SECURITY__SIGNING_SECRET=x\n"));
+        let exec = RecordingExecutor::new();
+        run_ops(&ops, &exec).expect("recording executor never fails");
+        let commit = exec
+            .shell_for("commit-markers")
+            .expect("commit-markers ran");
+
+        // live-slot: temp file in the marker's own shared/ dir, populated, then
+        // atomically renamed onto the live marker. The `>` redirect targets ONLY the
+        // temp file, and the exact `{slot}\t{port}` format is preserved.
+        assert!(
+            commit.contains("ltmp=$(mktemp '/srv/autumn/myapp/shared/live-slot.tmp.XXXXXX')"),
+            "live-slot temp is mktemp'd in the shared dir (same-fs atomic mv): {commit}"
+        );
+        assert!(
+            commit.contains("printf '%s\\t%s' 'green' 3002 > \"$ltmp\""),
+            "live-slot payload ({{slot}}\\t{{port}}) is written to the temp file: {commit}"
+        );
+        assert!(
+            commit.contains("mv -f \"$ltmp\" '/srv/autumn/myapp/shared/live-slot'"),
+            "live-slot is committed by an atomic mv of the temp file: {commit}"
+        );
+
+        // previous-release: same temp+mv shape, guarded so it only writes when a
+        // previous release exists, preserving the `{dir}\t{slot}\t{port}` format.
+        assert!(
+            commit
+                .contains("ptmp=$(mktemp '/srv/autumn/myapp/shared/previous-release.tmp.XXXXXX')"),
+            "previous-release temp is mktemp'd in the shared dir: {commit}"
+        );
+        assert!(
+            commit.contains("printf '%s\\t%s\\t%s' \"$prev\" \"$lslot\" \"$lport\" > \"$ptmp\""),
+            "previous-release payload ({{dir}}\\t{{slot}}\\t{{port}}) is written to the temp file: {commit}"
+        );
+        assert!(
+            commit.contains("mv -f \"$ptmp\" '/srv/autumn/myapp/shared/previous-release'"),
+            "previous-release is committed by an atomic mv of the temp file: {commit}"
+        );
+        // The "only write previous-release when a prev exists" guard is preserved.
+        assert!(
+            commit.contains("if [ -n \"$prev\" ]; then"),
+            "previous-release write stays guarded on a non-empty prev: {commit}"
+        );
+
+        // Neither LIVE marker is ever the target of a bare truncating redirect.
+        assert!(
+            !commit.contains("> '/srv/autumn/myapp/shared/live-slot'")
+                && !commit.contains("> '/srv/autumn/myapp/shared/previous-release'"),
+            "markers are updated only via temp+mv, never a bare `>` truncation: {commit}"
         );
     }
 
@@ -2824,12 +2994,10 @@ mod tests {
             "the target release dir must NOT be removed: {:?}",
             exec.calls()
         );
-        // No marker was written — every marker write in rollback_ops runs AFTER the
-        // flip, so a pre-/at-flip failure has touched none of them.
+        // No marker was written — the single commit-markers op in rollback_ops runs
+        // AFTER the flip, so a pre-/at-flip failure has touched none of them.
         assert!(
-            !labels.contains(&"record-previous")
-                && !labels.contains(&"link-current")
-                && !labels.contains(&"record-live-slot"),
+            !labels.contains(&"commit-markers"),
             "no marker may be written on a pre-/at-flip failure: {labels:?}"
         );
         // Nothing past the flip ran either.
@@ -2877,9 +3045,7 @@ mod tests {
             "no flip after a restart-previous failure: {labels:?}"
         );
         assert!(
-            !labels.contains(&"record-previous")
-                && !labels.contains(&"link-current")
-                && !labels.contains(&"record-live-slot"),
+            !labels.contains(&"commit-markers"),
             "no marker may be written: {labels:?}"
         );
         assert!(
@@ -2912,9 +3078,7 @@ mod tests {
                 "daemon-reload",
                 "restart-previous",
                 "proxy-flip",
-                "record-previous",
-                "link-current",
-                "record-live-slot",
+                "commit-markers",
                 "readiness-gate",
                 "drain-rolled-back-slot",
             ],
@@ -3093,7 +3257,10 @@ mod tests {
         let labels = exec.run_labels();
         assert_eq!(labels, vec!["resolve-previous"], "only the probe may run");
         assert!(!labels.contains(&"proxy-flip"), "no flip");
-        assert!(!labels.contains(&"link-current"), "current not repointed");
+        assert!(
+            !labels.contains(&"commit-markers"),
+            "current not repointed (commit-markers never ran)"
+        );
         assert!(
             !labels.iter().any(|l| l.starts_with("teardown")),
             "nothing torn down"

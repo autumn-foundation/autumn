@@ -68,6 +68,18 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
 
+      # Accessibility gate: install the prebuilt `autumn` CLI matching this app's
+      # autumn-web version and scan raw html! markup for a11y violations. Non-blocking
+      # (continue-on-error) until the pinned autumn release publishes its prebuilt
+      # binaries; remove `continue-on-error` to make this an enforcing gate.
+      - name: Accessibility (a11y) verify
+        continue-on-error: true
+        run: |
+          curl -fsSL "https://raw.githubusercontent.com/madmax983/autumn/v{{autumn_version}}/scripts/install.sh" \
+            | sh -s -- --version "v{{autumn_version}}"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/autumn" a11y verify .
+
       - name: Build
         run: cargo build
 
