@@ -7232,6 +7232,23 @@ async fn setup_database(
     // migration path is Postgres-only, so a `sqlite://` control URL with
     // registered migrations must fail fast here rather than crash inside
     // `PgConnection::establish` before serving. See `sqlite_startup_migration_guard`.
+    // The shard loop in `run_startup_migrations` migrates each `shard.primary_url`
+    // through the same Postgres-only harness, gated by `shards.is_some()` and the
+    // presence of registered migrations — independently of the control topology.
+    // Collect the shard targets so the guard can reject a SQLite shard the same
+    // way it rejects a SQLite control target (Codex P1). Empty when unsharded or
+    // when the shard loop won't run, so the Postgres path is unaffected.
+    #[cfg(feature = "sqlite")]
+    let sqlite_guard_shard_urls: Vec<&str> = if shards.is_some() {
+        config
+            .database
+            .shards
+            .iter()
+            .map(|shard| shard.primary_url.as_str())
+            .collect()
+    } else {
+        Vec::new()
+    };
     #[cfg(feature = "sqlite")]
     #[allow(clippy::question_mark)] // managed-pg child must be stopped before returning
     if let Err(e) = sqlite_startup_migration_guard(
@@ -7243,6 +7260,8 @@ async fn setup_database(
             None
         },
         !migrations.is_empty() || directory_migration_required || shard_map_migration_required,
+        &sqlite_guard_shard_urls,
+        !migrations.is_empty(),
     ) {
         #[cfg(feature = "managed-pg")]
         crate::managed_pg::emergency_stop_async().await;
@@ -7378,20 +7397,42 @@ fn apply_pending_or_exit(
 /// manual-schema path is fully supported, so boot proceeds. Uses the same
 /// [`crate::config::DatabaseBackend::detect`] predicate as `db::build_pool`, so
 /// the gate and the pool routing agree on what "is a `SQLite` URL" means.
+///
+/// The same crash lurks on the **shard** targets: the shard loop in
+/// [`run_startup_migrations`] migrates every `shard.primary_url` through the same
+/// Postgres-only harness, independently of the control topology. A shards-only
+/// app (control `topology` is `None`, so the control check above permits boot)
+/// with `sqlite:` shard `primary_url`s and registered migrations would hit the
+/// exact pre-serve crash this guard exists to prevent, so any `SQLite` shard
+/// target with migrations pending is rejected here too (issue #1614 review,
+/// Codex P1). `shard_urls` is empty when the app is unsharded or the shard loop
+/// won't run, so the Postgres path is unaffected.
 #[cfg(feature = "sqlite")]
 fn sqlite_startup_migration_guard(
     control_url: Option<&str>,
     control_has_migrations: bool,
+    shard_urls: &[&str],
+    shard_has_migrations: bool,
 ) -> Result<(), String> {
-    let targets_sqlite = control_url.is_some_and(|url| {
+    fn is_sqlite(url: &str) -> bool {
         crate::config::DatabaseBackend::detect(url) == Some(crate::config::DatabaseBackend::Sqlite)
-    });
-    if targets_sqlite && control_has_migrations {
+    }
+    if control_url.is_some_and(is_sqlite) && control_has_migrations {
         return Err(
             "SQLite startup migrations are not yet supported in this build of autumn-web. \
              Registered migrations cannot be applied to a SQLite target here \u{2014} apply \
              your schema out-of-band, or boot without registered migrations. Tracking: SQLite \
              migration support is a follow-up to #1614."
+                .to_owned(),
+        );
+    }
+    if shard_has_migrations && shard_urls.iter().copied().any(is_sqlite) {
+        return Err(
+            "SQLite startup migrations are not yet supported in this build of autumn-web. \
+             A configured shard targets a SQLite database, and registered migrations cannot be \
+             applied to a SQLite target here \u{2014} apply your shard schema out-of-band, or \
+             boot without registered migrations. Tracking: SQLite migration support is a \
+             follow-up to #1614."
                 .to_owned(),
         );
     }
@@ -7412,7 +7453,7 @@ mod sqlite_startup_migration_guard_tests {
             "sqlite://./relative.db",
             "sqlite::memory:",
         ] {
-            let err = sqlite_startup_migration_guard(Some(url), true)
+            let err = sqlite_startup_migration_guard(Some(url), true, &[], false)
                 .expect_err("sqlite target + registered migrations must be rejected");
             assert!(
                 err.contains("SQLite startup migrations are not yet supported"),
@@ -7430,7 +7471,8 @@ mod sqlite_startup_migration_guard_tests {
         // The manual-schema path (the `sqlite_boot_serve` scenario): a sqlite
         // target with no registered migrations must boot normally.
         assert!(
-            sqlite_startup_migration_guard(Some("sqlite:///var/lib/app.db"), false).is_ok(),
+            sqlite_startup_migration_guard(Some("sqlite:///var/lib/app.db"), false, &[], false)
+                .is_ok(),
             "sqlite target + no migrations must boot"
         );
     }
@@ -7444,11 +7486,11 @@ mod sqlite_startup_migration_guard_tests {
             "host=db user=app sslmode=require",
         ] {
             assert!(
-                sqlite_startup_migration_guard(Some(url), true).is_ok(),
+                sqlite_startup_migration_guard(Some(url), true, &[], false).is_ok(),
                 "postgres target must never be gated: {url}"
             );
             assert!(
-                sqlite_startup_migration_guard(Some(url), false).is_ok(),
+                sqlite_startup_migration_guard(Some(url), false, &[], false).is_ok(),
                 "postgres target must never be gated: {url}"
             );
         }
@@ -7457,8 +7499,58 @@ mod sqlite_startup_migration_guard_tests {
     #[test]
     fn absent_control_url_boots() {
         // No control URL (no-DB / opt-out provider): nothing to gate.
-        assert!(sqlite_startup_migration_guard(None, true).is_ok());
-        assert!(sqlite_startup_migration_guard(None, false).is_ok());
+        assert!(sqlite_startup_migration_guard(None, true, &[], false).is_ok());
+        assert!(sqlite_startup_migration_guard(None, false, &[], false).is_ok());
+    }
+
+    #[test]
+    fn sqlite_shard_target_with_registered_migrations_fails_fast() {
+        // The Codex P1: a shards-only app (no control topology, so the control
+        // arg is None) with a `sqlite:` shard primary_url and registered
+        // migrations must NOT reach the Postgres shard-migration harness; it
+        // must return the actionable, SQLite-named boot error instead.
+        let err = sqlite_startup_migration_guard(
+            None,
+            false,
+            &["sqlite:///var/lib/shard0.db", "postgres://u@h/shard1"],
+            true,
+        )
+        .expect_err("a sqlite shard target + registered migrations must be rejected");
+        assert!(
+            err.contains("SQLite startup migrations are not yet supported")
+                && err.contains("shard"),
+            "message must name the SQLite shard situation clearly: {err}"
+        );
+        assert!(
+            err.contains("#1614"),
+            "message must point at the tracking follow-up: {err}"
+        );
+    }
+
+    #[test]
+    fn sqlite_shard_target_without_migrations_boots() {
+        // A sqlite shard with no registered migrations (manual-schema shards)
+        // must boot normally.
+        assert!(
+            sqlite_startup_migration_guard(None, false, &["sqlite:///var/lib/shard0.db"], false)
+                .is_ok(),
+            "sqlite shard + no migrations must boot"
+        );
+    }
+
+    #[test]
+    fn postgres_shard_targets_are_unchanged() {
+        // All-Postgres shards are never gated, migrations registered or not.
+        assert!(
+            sqlite_startup_migration_guard(
+                Some("postgres://u@h/control"),
+                true,
+                &["postgres://u@h/shard0", "postgres://u@h/shard1"],
+                true,
+            )
+            .is_ok(),
+            "all-postgres shard targets must never be gated"
+        );
     }
 }
 

@@ -1162,12 +1162,28 @@ fn normalize_sqlite_target(url: &str) -> String {
     rest.to_owned()
 }
 
-/// Whether a normalized `SQLite` target names an in-memory database (each such
-/// connection is its own private database, so the pool must be single-slot to
-/// stay consistent — see [`build_sqlite_pool`]).
+/// Whether a normalized `SQLite` target names a **private** in-memory database
+/// (each such connection is its own private database, so the pool must be
+/// single-slot to stay consistent — see [`build_sqlite_pool`]).
+///
+/// Covers every in-memory spelling `SQLite` accepts through this pool: the bare
+/// `:memory:` token, the `file:` URI form `file::memory:` (with or without a
+/// query string — addresses Codex P1: the multi-slot default would otherwise
+/// hand out connections that each see a different, empty in-memory database),
+/// and any `file:` URI that asks for `mode=memory`.
+///
+/// A **shared-cache** in-memory database (`cache=shared`) is the deliberate
+/// exception: it IS shareable across the pool's connections within one process,
+/// so it must NOT be forced single-slot and returns `false` here.
 #[cfg(feature = "sqlite")]
 fn sqlite_target_is_memory(target: &str) -> bool {
-    target == ":memory:" || target.contains("mode=memory")
+    if target.contains("cache=shared") {
+        return false;
+    }
+    target == ":memory:"
+        || target == "file::memory:"
+        || target.starts_with("file::memory:?")
+        || target.contains("mode=memory")
 }
 
 /// Build a deadpool pool over `SyncConnectionWrapper<SqliteConnection>` for a
@@ -1282,6 +1298,32 @@ pub fn create_topology(config: &DatabaseConfig) -> Result<Option<DatabaseTopolog
         config.effective_primary_pool_size(),
         config.connect_timeout_secs,
     )?;
+
+    // Under the `sqlite` feature a configured `replica_url` cannot act as a real
+    // read replica: SQLite has no primary/replica replication in this pool
+    // architecture. Two single-slot `:memory:` pools are two *private* empty
+    // databases, and a distinct replica *file* has nothing replicating into it,
+    // so read-routed queries would hit an empty replica after writes and schema
+    // setup went to the primary. Reject an in-memory or distinct-file replica
+    // with an actionable boot error (addresses Codex P2). A replica that
+    // normalizes to the SAME file as the primary is the same database — harmless
+    // — so it is allowed and simply builds a second pool over that file below.
+    // `normalize_sqlite_target` is reused so "same file" matches how the pool
+    // actually opens the file, and `sqlite_target_is_memory` so pool sizing and
+    // this guard agree on what "in-memory" means.
+    #[cfg(feature = "sqlite")]
+    if let Some(replica_url) = config.replica_url.as_deref() {
+        let replica_target = normalize_sqlite_target(replica_url);
+        let primary_target = normalize_sqlite_target(primary_url);
+        if sqlite_target_is_memory(&replica_target) || replica_target != primary_target {
+            return Err(PoolError::UnsupportedBackend(format!(
+                "SQLite does not support a separate read replica: replica_url {replica_url:?} \
+                 is in-memory or differs from primary_url {primary_url:?}. Configure only a \
+                 primary, or point the replica at the same database file as the primary."
+            )));
+        }
+    }
+
     let replica = config
         .replica_url
         .as_deref()
@@ -3402,6 +3444,131 @@ mod tests {
             panic!("a Postgres url must refuse under the sqlite feature");
         };
         assert!(matches!(err, PoolError::UnsupportedBackend(_)), "{err:?}");
+    }
+
+    // A SQLite runtime has no primary/replica replication in this pool
+    // architecture, so a separate replica pool would serve reads from an empty
+    // database. `create_topology` must reject an in-memory or distinct-file
+    // replica with an actionable boot error (addresses Codex P2).
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn create_topology_rejects_in_memory_sqlite_replica() {
+        let config = DatabaseConfig {
+            primary_url: Some("sqlite:///var/lib/app.db".into()),
+            replica_url: Some("sqlite::memory:".into()),
+            ..Default::default()
+        };
+        let Err(err) = create_topology(&config) else {
+            panic!("an in-memory sqlite replica must be rejected");
+        };
+        assert!(matches!(err, PoolError::UnsupportedBackend(_)), "{err:?}");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("separate read replica") && msg.contains("primary"),
+            "message must be actionable: {msg}"
+        );
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn create_topology_rejects_distinct_file_sqlite_replica() {
+        let config = DatabaseConfig {
+            primary_url: Some("sqlite:///var/lib/primary.db".into()),
+            replica_url: Some("sqlite:///var/lib/replica.db".into()),
+            ..Default::default()
+        };
+        let Err(err) = create_topology(&config) else {
+            panic!("a distinct-file sqlite replica must be rejected");
+        };
+        assert!(matches!(err, PoolError::UnsupportedBackend(_)), "{err:?}");
+    }
+
+    // A replica that normalizes to the SAME file as the primary is the same
+    // database — harmless — so it is allowed and the topology builds.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn create_topology_allows_same_file_sqlite_replica() {
+        let config = DatabaseConfig {
+            primary_url: Some("sqlite:///var/lib/app.db".into()),
+            replica_url: Some("sqlite:///var/lib/app.db".into()),
+            ..Default::default()
+        };
+        let topology = create_topology(&config)
+            .expect("same-file sqlite replica must be allowed")
+            .expect("a configured primary yields a topology");
+        assert!(
+            topology.replica().is_some(),
+            "same-file replica pool should be built"
+        );
+    }
+
+    // The no-replica happy path still builds a topology fine under the feature.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn create_topology_sqlite_primary_only_builds() {
+        let config = DatabaseConfig {
+            primary_url: Some("sqlite::memory:".into()),
+            ..Default::default()
+        };
+        let topology = create_topology(&config)
+            .expect("sqlite primary-only topology builds")
+            .expect("a configured primary yields a topology");
+        assert!(topology.replica().is_none(), "no replica configured");
+    }
+
+    // `file::memory:` (and its query-string form) is a private in-memory target
+    // and must be forced single-slot; a shared-cache in-memory DB is shareable
+    // and must NOT be (addresses Codex P1).
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn sqlite_target_is_memory_covers_file_memory() {
+        assert!(sqlite_target_is_memory(":memory:"));
+        assert!(sqlite_target_is_memory("file::memory:"));
+        assert!(sqlite_target_is_memory("file::memory:?foo=bar"));
+        assert!(sqlite_target_is_memory("file:app?mode=memory"));
+        // Shared-cache in-memory databases are shareable across connections.
+        assert!(!sqlite_target_is_memory("file::memory:?cache=shared"));
+        assert!(!sqlite_target_is_memory(
+            "file:app?mode=memory&cache=shared"
+        ));
+        // Plain file targets are not in-memory.
+        assert!(!sqlite_target_is_memory("/var/lib/app.db"));
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn file_memory_sqlite_pool_is_single_slot() {
+        let config = DatabaseConfig {
+            primary_url: Some("file::memory:".into()),
+            pool_size: 5,
+            ..Default::default()
+        };
+        let pool = create_pool(&config)
+            .expect("file::memory: sqlite pool builds")
+            .expect("a configured url yields a pool");
+        assert_eq!(
+            pool.status().max_size,
+            1,
+            "a private in-memory target must be forced single-slot"
+        );
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn shared_cache_in_memory_sqlite_pool_is_not_forced_single_slot() {
+        let config = DatabaseConfig {
+            primary_url: Some("file::memory:?cache=shared".into()),
+            pool_size: 5,
+            ..Default::default()
+        };
+        let pool = create_pool(&config)
+            .expect("shared-cache in-memory sqlite pool builds")
+            .expect("a configured url yields a pool");
+        assert_eq!(
+            pool.status().max_size,
+            5,
+            "a shared-cache in-memory target must respect the configured size"
+        );
     }
 
     #[cfg(feature = "sqlite")]
