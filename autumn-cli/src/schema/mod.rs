@@ -125,6 +125,41 @@ fn resolve_default_models_path(project_root: &Path) -> Result<PathBuf, String> {
     ))
 }
 
+/// Whether the `snapshot` command requires the current directory to be the
+/// project root. It does whenever any input falls back to a project-relative
+/// default: the source (`--from` omitted → `src/models`), the default output
+/// file (`--out` omitted while not writing to stdout → `.autumn/…`), or the
+/// auto-detected backend (`--backend` omitted — detection reads the root's
+/// `autumn.toml` / `.env`, so anywhere else it would silently mis-detect
+/// Postgres).
+///
+/// A fully explicit invocation — `--from` plus `--out`/`--stdout` plus
+/// `--backend` — needs no project root and can run from anywhere. Kept pure so
+/// the decision matrix is unit-testable without touching the process CWD.
+const fn needs_project_root(
+    from: Option<&Path>,
+    out: Option<&Path>,
+    stdout: bool,
+    backend: Option<BackendArg>,
+) -> bool {
+    from.is_none() || (out.is_none() && !stdout) || backend.is_none()
+}
+
+/// The error surfaced when the `snapshot` command needs the project root but the
+/// current directory is not one. When auto-detecting the backend is one of the
+/// reasons, the message names `--backend` so the user can either run from the
+/// root or opt out of detection; otherwise it is the generic project-root
+/// message (a default path, not the backend, forced the requirement).
+fn project_root_required_error(backend_is_a_reason: bool) -> String {
+    if backend_is_a_reason {
+        "cannot auto-detect the database backend outside the project root — \
+         run from the project root or pass --backend pg|sqlite"
+            .to_string()
+    } else {
+        crate::generate::GenerateError::NotInProject.to_string()
+    }
+}
+
 /// Assemble a snapshot from the declared models and either write it to `out`
 /// (default [`SNAPSHOT_DEFAULT_PATH`]) or print it to stdout.
 ///
@@ -148,15 +183,21 @@ fn run_snapshot(
     let project_root = std::env::current_dir()
         .map_err(|e| format!("failed to resolve the current directory: {e}"))?;
 
-    // When either default is in play — `src/models` for the source (no `--from`)
-    // or `.autumn/…` for the output (no `--out`, writing a file) — the command
-    // assumes the current directory is the project root. Fail fast with a clear
-    // message instead of a confusing IO error (`src/models` / `.autumn/` not
-    // found) when it is run from a subdirectory. A fully explicit invocation
-    // (`--from` plus either `--out` or `--stdout`) needs no project root and
-    // skips the check.
-    if from.is_none() || (out.is_none() && !stdout) {
-        crate::generate::ensure_project_root(&project_root).map_err(|e| e.to_string())?;
+    // When any input falls back to a project-relative default the command needs
+    // the current directory to be the project root (see `needs_project_root`):
+    // the source (`--from` omitted → `src/models`), the default output file
+    // (`--out` omitted while writing a file), or — critically — the auto-detected
+    // backend (`--backend` omitted → detection reads the root's `autumn.toml` /
+    // `.env`). Run from a subdirectory without `--backend`, `detect_backend`
+    // would find no config and silently tag the snapshot Postgres, producing a
+    // wrong baseline for a SQLite app. Fail fast with a clear message instead of
+    // a confusing IO error or a mis-tagged snapshot. A fully explicit invocation
+    // (`--from` plus `--out`/`--stdout` plus `--backend`) needs no project root.
+    let backend_given = backend.is_some();
+    if needs_project_root(from, out, stdout, backend)
+        && crate::generate::ensure_project_root(&project_root).is_err()
+    {
+        return Err(project_root_required_error(!backend_given));
     }
 
     let models_path = match from {
@@ -232,6 +273,84 @@ mod tests {
 
         let resolved = resolve_default_models_path(root.path()).expect("resolve");
         assert_eq!(resolved, file);
+    }
+
+    #[test]
+    fn fully_explicit_invocation_needs_no_project_root() {
+        let from = Path::new("models.rs");
+        let out = Path::new("snap.json");
+        // `--from` + `--out` + `--backend`: nothing is defaulted, so the command
+        // can run from any directory.
+        assert!(!needs_project_root(
+            Some(from),
+            Some(out),
+            false,
+            Some(BackendArg::Sqlite)
+        ));
+        // `--from` + `--stdout` + `--backend` likewise.
+        assert!(!needs_project_root(
+            Some(from),
+            None,
+            true,
+            Some(BackendArg::Sqlite)
+        ));
+    }
+
+    #[test]
+    fn missing_backend_requires_project_root_even_with_explicit_paths() {
+        let from = Path::new("models.rs");
+        let out = Path::new("snap.json");
+        // Explicit `--from` and `--out`/`--stdout`, but no `--backend`: detection
+        // needs the root's config, so the root is still required.
+        assert!(needs_project_root(Some(from), Some(out), false, None));
+        assert!(needs_project_root(Some(from), None, true, None));
+    }
+
+    #[test]
+    fn default_paths_require_project_root() {
+        let from = Path::new("models.rs");
+        let out = Path::new("snap.json");
+        // Missing `--from` defaults the source to `src/models`.
+        assert!(needs_project_root(
+            None,
+            Some(out),
+            false,
+            Some(BackendArg::Sqlite)
+        ));
+        // Missing `--out` while not writing to stdout defaults the output file.
+        assert!(needs_project_root(
+            Some(from),
+            None,
+            false,
+            Some(BackendArg::Sqlite)
+        ));
+        // Bare `snapshot` (everything defaulted) certainly needs the root.
+        assert!(needs_project_root(None, None, false, None));
+    }
+
+    #[test]
+    fn root_required_error_names_backend_when_detection_is_a_reason() {
+        let msg = project_root_required_error(true);
+        assert!(
+            msg.contains("--backend"),
+            "guides the user to --backend: {msg}"
+        );
+        assert!(
+            msg.contains("auto-detect"),
+            "explains the auto-detection failure: {msg}"
+        );
+    }
+
+    #[test]
+    fn root_required_error_is_generic_when_backend_is_explicit() {
+        // Backend was given, so only a default path forced the requirement — the
+        // generic project-root message is used (no misleading --backend hint).
+        let msg = project_root_required_error(false);
+        assert!(!msg.contains("--backend"), "no --backend hint: {msg}");
+        assert!(
+            msg.contains("Autumn project"),
+            "the generic project-root message: {msg}"
+        );
     }
 
     #[test]
