@@ -124,11 +124,15 @@ pub fn viewer_counts_from_paths_json(json: &serde_json::Value) -> Option<HashMap
     let items = json.get("items")?.as_array()?;
     let mut counts = HashMap::new();
     for item in items {
-        let path = item.get("name").and_then(serde_json::Value::as_str)?;
+        let Some(path) = item.get("name").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
         let Some(stream_key) = path.strip_prefix("live/") else {
             continue;
         };
-        let count = viewer_count_from_path_json(item)?;
+        let Some(count) = viewer_count_from_path_json(item) else {
+            continue;
+        };
         counts.insert(stream_key.to_owned(), count);
     }
     Some(counts)
@@ -688,6 +692,27 @@ mod tests {
         );
 
         assert!(viewer_counts_from_paths_json(&serde_json::json!({"nope": true})).is_none());
+    }
+
+    #[test]
+    fn viewer_counts_skip_malformed_items_and_keep_valid_ones() {
+        let json = serde_json::json!({
+            "items": [
+                { "name": "live/foo", "readers": [ {}, {} ] },
+                { "readers": [ {} ] },
+                { "name": "live/bar", "readers": [ {}, {}, {} ] },
+                { "name": "other/baz", "readers": [ {} ] }
+            ]
+        });
+        let counts = viewer_counts_from_paths_json(&json)
+            .expect("a single malformed item must not blank the whole snapshot");
+        assert_eq!(counts.get("foo"), Some(&2));
+        assert_eq!(counts.get("bar"), Some(&3));
+        assert!(
+            !counts.contains_key("baz"),
+            "non-live/ paths must be skipped"
+        );
+        assert_eq!(counts.len(), 2, "only the two valid live/ items are kept");
     }
 
     #[test]
