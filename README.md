@@ -58,6 +58,23 @@ autumn dev
 Visit <http://localhost:3000>. Autumn also auto-mounts `/health`,
 `/actuator/health`, `/actuator/info`, and `/static/js/htmx.min.js`.
 
+### Install a prebuilt binary (Linux)
+
+Grab the `autumn` CLI without compiling from source:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/madmax983/autumn/trunk-dev/scripts/install.sh | sh
+```
+
+This downloads the prebuilt binary for your architecture (x86_64 or aarch64), verifies its sha256 checksum, and installs it to `~/.local/bin/autumn`. Override the target dir with `AUTUMN_INSTALL_DIR`, or pin a version with `AUTUMN_VERSION=vX.Y.Z` (or `--version vX.Y.Z`).
+
+Direct download URLs (static musl binaries — no glibc version dependency):
+
+- Latest: `https://github.com/madmax983/autumn/releases/latest/download/autumn-x86_64-unknown-linux-musl.tar.gz`
+- Pinned: `https://github.com/madmax983/autumn/releases/download/<tag>/autumn-x86_64-unknown-linux-musl.tar.gz`
+
+Each tarball ships a companion `.sha256`. Prefer source? `cargo install --path autumn-cli` still works.
+
 ### Watching custom directories
 
 `autumn dev` always watches `src/`, `static/`, `templates/`, and `migrations/`
