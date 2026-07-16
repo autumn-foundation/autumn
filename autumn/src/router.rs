@@ -2010,6 +2010,14 @@ where
                 "a user route already owns this path; the built-in probe was \
                  not auto-mounted (the user handler wins)"
             );
+            // Still record the ceded path: `mount_actuator_endpoints` keys its
+            // overlap guard off this set, and a configured probe path stays a
+            // collision hazard for the actuator even when a user route (not the
+            // built-in probe) owns it. Dropping it here would let an actuator at
+            // prefix "/" merge its own `GET /health` onto the user's `GET
+            // /health` and axum would panic during construction instead of
+            // returning a checked `FrameworkRouteOverlap` (issue #1971 P2).
+            mounted_probe_paths.insert(path.to_owned());
             return router;
         }
         if mounted_probe_paths.insert(path.to_owned()) {
@@ -5040,6 +5048,68 @@ mod tests {
         assert!(
             result.unwrap().is_err(),
             "route overlap should be reported as a checked router build error"
+        );
+    }
+
+    /// Regression for issue #1971 P2: when a user route already owns `/health`,
+    /// the built-in probe cedes that path (#1971) — but a root-prefix actuator
+    /// still normalizes its own `GET /health` onto it. The ceded probe path must
+    /// remain visible to the actuator overlap guard so this surfaces as a checked
+    /// `FrameworkRouteOverlap` rather than an axum construction panic (matching
+    /// the no-user-route case in
+    /// `try_build_router_returns_error_for_probe_actuator_path_overlap`).
+    #[test]
+    fn probe_actuator_overlap_detected_when_user_route_owns_probe_path() {
+        async fn user_health() -> &'static str {
+            "user-health-handler"
+        }
+
+        let mut config = AutumnConfig::default();
+        config.actuator.prefix = "/".to_owned();
+        // Precondition: the user route, the ceded probe, and the actuator all
+        // land on exactly `/health`.
+        assert_eq!(config.health.path, "/health");
+
+        let route = Route {
+            method: http::Method::GET,
+            path: "/health",
+            handler: axum::routing::get(user_health),
+            name: "user_health",
+            api_doc: crate::openapi::ApiDoc {
+                method: "GET",
+                path: "/health",
+                operation_id: "user_health",
+                success_status: 200,
+                ..Default::default()
+            },
+            repository: None,
+            idempotency: crate::route::RouteIdempotency::Direct,
+            timeout: crate::route::RouteTimeout::Inherit,
+            api_version: None,
+            sunset_opt_out: false,
+        };
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            try_build_router(vec![route], &config, test_state())
+        }));
+
+        assert!(
+            result.is_ok(),
+            "try_build_router panicked instead of returning a checked overlap error"
+        );
+        let build = result.unwrap();
+        assert!(
+            matches!(
+                &build,
+                Err(RouterBuildError::FrameworkRouteOverlap {
+                    path,
+                    incoming: "actuator endpoint",
+                    ..
+                }) if path == "/health"
+            ),
+            "root-prefix actuator over a user-owned probe path must yield a checked \
+             FrameworkRouteOverlap for /health, got: {:?}",
+            build.as_ref().map(|_| "Ok(router)"),
         );
     }
 
