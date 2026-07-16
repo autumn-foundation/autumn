@@ -307,7 +307,9 @@ mod tests {
         )
         .to_string();
         assert!(
-            generated.contains("Static route has no path parameters but a `params` function was provided"),
+            generated.contains(
+                "Static route has no path parameters but a `params` function was provided"
+            ),
             "non-parameterized route with params_fn should emit compile error: {generated}"
         );
     }
