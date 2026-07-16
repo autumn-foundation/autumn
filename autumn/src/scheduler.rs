@@ -286,7 +286,7 @@ pub fn coordinator_from_config(
     match config.backend {
         SchedulerBackend::InProcess => Ok(Arc::new(InProcessSchedulerCoordinator::new(replica_id))),
         SchedulerBackend::Postgres => {
-            #[cfg(feature = "db")]
+            #[cfg(all(feature = "db", not(feature = "sqlite")))]
             {
                 let pool = state.pool().cloned().ok_or_else(|| {
                     AutumnError::service_unavailable_msg(
@@ -298,6 +298,20 @@ pub fn coordinator_from_config(
                     replica_id,
                     config.key_prefix.clone(),
                 )))
+            }
+
+            // The Postgres advisory-lock scheduler coordinator is Postgres-only
+            // (it leases via `pg_advisory_lock`). Under the `sqlite` feature the
+            // runtime pool is a SQLite pool with no such primitive, so refuse
+            // rather than mis-type. Single-node SQLite runs the in-process
+            // coordinator (`scheduler.backend = "in_process"`, the default).
+            #[cfg(all(feature = "db", feature = "sqlite"))]
+            {
+                let _ = (state, replica_id);
+                Err(AutumnError::service_unavailable_msg(
+                    "scheduler.backend = \"postgres\" requires the Postgres backend and is \
+                     unsupported under the sqlite feature; use scheduler.backend = \"in_process\"",
+                ))
             }
 
             #[cfg(not(feature = "db"))]

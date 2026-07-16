@@ -293,6 +293,22 @@ pub trait OpenApiSchema {
     fn schema() -> serde_json::Value;
 }
 
+/// Derive a field-accurate [`OpenApiSchema`] impl for a plain struct with named
+/// fields (issue #1972), so a handler-arg struct used in `Query<T>` / `Json<T>`
+/// advertises its real fields in the OpenAPI spec and the MCP tool `inputSchema`
+/// instead of collapsing to a generic `{"type":"object"}` placeholder — with no
+/// hand-written impl or `OpenApiConfig::register_schema` call.
+///
+/// Each field becomes a JSON-schema property (nullable `Option<T>` via
+/// `oneOf [T, null]`, `Vec<T>` as an array, primitives inline, other named types
+/// as `$ref`s), and every non-`Option` field is listed as `required` — mirroring
+/// the schema `#[model]` already generates. The derive also registers the schema
+/// in the compile-time inventory the spec/MCP back-fill consults, so a
+/// `Query<MyArgs>` / `Json<MyArgs>` handler picks it up automatically.
+///
+/// Bring it into scope alongside the trait: `use autumn_web::openapi::OpenApiSchema;`.
+pub use autumn_macros::OpenApiSchema;
+
 macro_rules! impl_primitive_schema {
     ($ty:ty, $name:literal, $json:literal) => {
         impl OpenApiSchema for $ty {
@@ -320,6 +336,50 @@ impl_primitive_schema!(u64, "integer", "integer");
 impl_primitive_schema!(f32, "number", "number");
 impl_primitive_schema!(f64, "number", "number");
 impl_primitive_schema!(serde_json::Value, "object", "object");
+
+// ──────────────────────────────────────────────────────────────────
+// Compile-time inventory of `#[derive(OpenApiSchema)]` component schemas.
+// ──────────────────────────────────────────────────────────────────
+
+/// Compile-time registration of a plain struct's derived `OpenApiSchema`,
+/// emitted by `#[derive(OpenApiSchema)]` (issue #1972).
+///
+/// The spec generator and the MCP tool-catalog builder both back-fill component
+/// schemas for referenced type names they did not otherwise register. Without a
+/// hand-written `OpenApiSchema` impl + `OpenApiConfig::register_schema`, a plain
+/// handler-arg struct (a `Query<T>` param struct or a non-`#[model]` `Json<T>`
+/// body) used to resolve to a generic `{"type":"object","title":"X"}`
+/// placeholder — so the argument's real fields lived only in prose. This
+/// descriptor lets a `#[derive(OpenApiSchema)]` struct advertise its
+/// field-accurate schema by name, which the back-fill loops pick up
+/// automatically (no manual registration).
+///
+/// This is deliberately not feature-gated: `#[derive(OpenApiSchema)]` submits an
+/// entry unconditionally, and the `openapi`-gated spec builder consults it only
+/// when that feature is compiled in.
+pub struct DerivedSchemaDescriptor {
+    /// Component schema name. Matches `OpenApiSchema::schema_name()` and the
+    /// `$ref` component name emitted for `Query<T>` / `Json<T>` handler args
+    /// (the type's last path segment).
+    pub name: &'static str,
+    /// Produces the JSON schema for the type (the type's `OpenApiSchema::schema`).
+    pub schema: fn() -> serde_json::Value,
+}
+
+inventory::collect!(DerivedSchemaDescriptor);
+
+/// Look up the derived component schema for `name`.
+///
+/// Returns the schema when a `#[derive(OpenApiSchema)]` type with that schema
+/// name was linked into the binary, or `None` when no such derive exists (so
+/// callers fall back to the generic placeholder).
+#[must_use]
+pub fn registered_derived_schema(name: &str) -> Option<serde_json::Value> {
+    inventory::iter::<DerivedSchemaDescriptor>
+        .into_iter()
+        .find(|descriptor| descriptor.name == name)
+        .map(|descriptor| (descriptor.schema)())
+}
 
 // ──────────────────────────────────────────────────────────────────
 // Runtime registry of component schemas populated while building the spec.
@@ -619,19 +679,21 @@ pub fn generate_spec_at(
         }
     }
 
-    // Back-fill a minimal `{"type": "object", "title": "X"}` schema for
-    // every referenced name the user didn't already register. Types that
-    // implement OpenApiSchema can be registered explicitly via
-    // OpenApiConfig::register_schema to replace the placeholder.
+    // Back-fill a schema for every referenced name the user didn't already
+    // register. A `#[derive(OpenApiSchema)]` type advertises a real
+    // field-accurate schema through the compile-time inventory (issue #1972),
+    // which we consult first; only a name with no derived schema (and no
+    // explicit `OpenApiConfig::register_schema`) falls back to the minimal
+    // `{"type": "object", "title": "X"}` placeholder.
     for name in referenced_names {
         if !registry.schemas().contains_key(name) {
-            registry.insert(
-                name,
+            let schema = registered_derived_schema(name).unwrap_or_else(|| {
                 serde_json::json!({
                     "type": "object",
                     "title": name,
-                }),
-            );
+                })
+            });
+            registry.insert(name, schema);
         }
     }
 
