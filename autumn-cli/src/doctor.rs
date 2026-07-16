@@ -6263,6 +6263,46 @@ pub fn run(opts: DoctorOptions) {
         tasks.push(Box::new(move || check));
     }
     if let Some(deploy_cfg) = deploy_cfg {
+        // PHASE 2 (issue found via #1966 review): re-derive the value-resolution
+        // inputs — the merged TOML table and the `.env` overlay — under the
+        // `[deploy] profile`, NOT the AMBIENT CLI runtime profile.
+        //
+        // Phase 1 above resolved `deploy_cfg` (and its `.profile`) from the
+        // `[deploy]` table under the ambient profile — reading the `[deploy]`
+        // table itself under the ambient profile is fine (it decides the target
+        // profile). But the deploy SECRET / DB VALUES (signing secret, database
+        // URL, shard URLs, db-backed-runtime DB requirement) must be resolved
+        // under the DEPLOY profile the uploaded unit boots under: a value
+        // supplied only under the deploy profile (`[profile.prod]` / `.env.prod`)
+        // is invisible to the ambient (default `dev`) resolution, so grading it
+        // there would falsely report it MISSING/insecure even though `autumn
+        // deploy check` (fixed for the deploy command in #1966) resolves it
+        // correctly. Strictness grading below already keys on the deploy profile.
+        //
+        // This mirrors `deploy.rs` `load_runtime_config`'s own two-phase reload
+        // (the same chicken-and-egg: learn the profile, then resolve under it).
+        // Reuse `deploy::deploy_profile_env_overlay` — the EXACT overlay
+        // `load_runtime_config` uses (`.env.<canonical>` selection + forced RAW
+        // `AUTUMN_ENV`) — rather than replicating the layering, so doctor and
+        // `deploy check` cannot drift. `trimmed_deploy_profile` yields the raw
+        // spelling exactly as `ResolvedDeployConfig::resolve` stores it.
+        let deploy_profile_raw = crate::deploy::trimmed_deploy_profile(&deploy_cfg.profile);
+        let deploy_profile_canonical =
+            crate::deploy::canonicalize_deploy_profile(&deploy_profile_raw);
+        // Rebuild the merged TOML under the deploy profile (canonical + raw
+        // selected), matching how `resolve_active_profiles`' (canonical, selected)
+        // tuple feeds `get_merged_toml_table_runtime` above.
+        let merged_deploy_toml =
+            get_merged_toml_table_runtime(&deploy_profile_canonical, &deploy_profile_raw);
+        // Rebuild the `.env` overlay under the deploy profile via the SAME path as
+        // `load_runtime_config`, so `.env.<deploy>` loads and `AUTUMN_ENV` reads
+        // as the deploy profile. Fall back to bare OS env on a malformed `.env`,
+        // matching the phase-1 fallback above.
+        let deploy_denv: Box<dyn autumn_web::config::Env> =
+            match crate::deploy::deploy_profile_env_overlay(&deploy_profile_raw) {
+                Ok(e) => Box::new(e),
+                Err(_) => Box::new(autumn_web::config::OsEnv),
+            };
         // Resolve the deploy signing secret from the SAME merged active-profile
         // table used for `deploy_cfg` and the DB URL (env first, then
         // `merged_deploy_toml`'s `security.signing_secret.secret`) — NOT the raw
@@ -15106,6 +15146,153 @@ redirect_uri = "http://localhost/callback"
         assert!(
             check.detail.unwrap().contains("present but invalid"),
             "detail must explain the [deploy] table is present but invalid"
+        );
+    }
+
+    /// Issue found via #1966 review: doctor must resolve the deploy SIGNING
+    /// SECRET under the `[deploy] profile`, NOT the ambient CLI runtime profile
+    /// (default `dev`). A secret supplied only under `[profile.prod]` is invisible
+    /// to the ambient (dev) resolution, so grading it there falsely reports it
+    /// MISSING even though `autumn deploy check` (fixed in #1966) resolves it.
+    /// This mirrors `run()`'s two-phase deploy resolution the way the F21 DB tests
+    /// mirror `run()`'s DB resolution — via the injectable
+    /// `get_merged_toml_table_runtime_with`, no process-env mutation.
+    #[test]
+    fn deploy_signing_secret_in_deploy_profile_is_resolved_under_that_profile() {
+        use autumn_web::config::MockEnv;
+        let dir = tempfile::tempdir().unwrap();
+        // Base declares `[deploy] profile = "prod"`; the signing secret lives ONLY
+        // under `[profile.prod]` — exactly the value the ambient (dev) lookup misses.
+        std::fs::write(
+            dir.path().join("autumn.toml"),
+            "[deploy]\nhost = \"deploy.example.com\"\nprofile = \"prod\"\n\
+             [profile.prod.security.signing_secret]\n\
+             secret = \"prod-only-32-char-strong-secret-value-xyz\"\n",
+        )
+        .unwrap();
+        let base = dir.path().to_path_buf();
+
+        // PHASE 1 (unchanged): learn the deploy target profile from the `[deploy]`
+        // table resolved under the AMBIENT (dev) merged table, as `run()` does.
+        let base_dev = base.clone();
+        let ambient_merged =
+            get_merged_toml_table_runtime_with("dev", "dev", move |f| base_dev.join(f));
+        let (deploy_cfg, config_check) =
+            resolve_deploy_doctor_config(&ambient_merged, &MockEnv::new());
+        assert!(
+            config_check.is_none(),
+            "the [deploy] table parses under the ambient profile"
+        );
+        let deploy_cfg = deploy_cfg.expect("[deploy] present");
+        assert_eq!(
+            crate::deploy::trimmed_deploy_profile(&deploy_cfg.profile),
+            "prod",
+            "deploy target profile is learned from the ambient [deploy] table"
+        );
+
+        // Regression guard (the BUG): resolving the secret under the ambient (dev)
+        // merged table does NOT see the prod-only secret — this is what falsely
+        // reported it missing before the fix.
+        assert_eq!(
+            resolve_deploy_signing_secret(&ambient_merged, &MockEnv::new()),
+            None,
+            "prod-only secret is invisible under the ambient dev profile (the bug)"
+        );
+
+        // PHASE 2 (the FIX): re-derive the merged table under the `[deploy] profile`
+        // and resolve the secret there — the exact re-derivation `run()` now does.
+        let deploy_profile_raw = crate::deploy::trimmed_deploy_profile(&deploy_cfg.profile);
+        let deploy_profile_canonical =
+            crate::deploy::canonicalize_deploy_profile(&deploy_profile_raw);
+        let deploy_merged = get_merged_toml_table_runtime_with(
+            &deploy_profile_canonical,
+            &deploy_profile_raw,
+            move |f| base.join(f),
+        );
+        assert_eq!(
+            resolve_deploy_signing_secret(&deploy_merged, &MockEnv::new()).as_deref(),
+            Some("prod-only-32-char-strong-secret-value-xyz"),
+            "the fix: doctor resolves the deploy signing secret under the [deploy] profile"
+        );
+    }
+
+    /// Companion to the signing-secret case for the deploy DATABASE URL: a
+    /// `primary_url` supplied only under `[profile.prod.database]` must be resolved
+    /// under the `[deploy] profile`, not the ambient (dev) profile — otherwise
+    /// `deploy_database_url` falsely fails under `--strict` even though `autumn
+    /// deploy check` (fixed in #1966) resolves it.
+    #[test]
+    fn deploy_database_url_in_deploy_profile_is_resolved_under_that_profile() {
+        use autumn_web::config::MockEnv;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("autumn.toml"),
+            "[deploy]\nhost = \"deploy.example.com\"\nprofile = \"prod\"\n\
+             [profile.prod.database]\n\
+             primary_url = \"postgres://prod-host/appdb\"\n",
+        )
+        .unwrap();
+        let base = dir.path().to_path_buf();
+
+        // PHASE 1: learn the deploy profile from the ambient `[deploy]` table.
+        let base_dev = base.clone();
+        let ambient_merged =
+            get_merged_toml_table_runtime_with("dev", "dev", move |f| base_dev.join(f));
+        let (deploy_cfg, _) = resolve_deploy_doctor_config(&ambient_merged, &MockEnv::new());
+        let deploy_cfg = deploy_cfg.expect("[deploy] present");
+
+        // Bug parity: the prod-only DB URL is invisible under the ambient dev merge.
+        let ambient_topology =
+            resolve_database_topology_from_sources(|_| None, Some(&ambient_merged));
+        assert_eq!(
+            ambient_topology.primary_url, None,
+            "prod-only DB URL is invisible under the ambient dev profile (the bug)"
+        );
+
+        // PHASE 2 (the FIX): resolve the DB topology under the `[deploy] profile`.
+        let deploy_profile_raw = crate::deploy::trimmed_deploy_profile(&deploy_cfg.profile);
+        let deploy_profile_canonical =
+            crate::deploy::canonicalize_deploy_profile(&deploy_profile_raw);
+        let deploy_merged = get_merged_toml_table_runtime_with(
+            &deploy_profile_canonical,
+            &deploy_profile_raw,
+            move |f| base.join(f),
+        );
+        let deploy_topology =
+            resolve_database_topology_from_sources(|_| None, Some(&deploy_merged));
+        assert_eq!(
+            deploy_topology.primary_url.as_deref(),
+            Some("postgres://prod-host/appdb"),
+            "the fix: doctor resolves the deploy DB URL under the [deploy] profile"
+        );
+    }
+
+    /// Negative/parity: a signing secret present ONLY under the AMBIENT (dev)
+    /// profile — while `[deploy] profile = "prod"` — must NOT be what the deploy
+    /// grade keys on. The deploy grade reflects the `[deploy] profile`'s config, so
+    /// resolving under prod does not see the dev-only value. This proves the fix
+    /// keys strictly on the deploy profile, not a leaky ambient value.
+    #[test]
+    fn deploy_signing_secret_only_under_ambient_profile_is_not_keyed_by_deploy_grade() {
+        use autumn_web::config::MockEnv;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("autumn.toml"),
+            "[deploy]\nhost = \"deploy.example.com\"\nprofile = \"prod\"\n\
+             [profile.dev.security.signing_secret]\n\
+             secret = \"dev-only-secret-not-for-prod-grade-xyz\"\n",
+        )
+        .unwrap();
+        let base = dir.path().to_path_buf();
+
+        // The deploy grade resolves under the `[deploy] profile` (prod), so the
+        // dev-only secret is NOT seen — the deploy grade reflects prod config only.
+        let deploy_merged =
+            get_merged_toml_table_runtime_with("prod", "prod", move |f| base.join(f));
+        assert_eq!(
+            resolve_deploy_signing_secret(&deploy_merged, &MockEnv::new()),
+            None,
+            "a dev-only secret is not keyed by the deploy grade under the prod profile"
         );
     }
 
