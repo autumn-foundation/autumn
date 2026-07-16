@@ -7141,6 +7141,9 @@ async fn resolve_shard_set(
 }
 
 #[cfg(feature = "db")]
+// The `sqlite` feature adds a small fail-fast startup-migration guard block
+// (issue #1614) that pushes this orchestration fn just over the line limit.
+#[allow(clippy::too_many_lines)]
 async fn setup_database(
     config: &AutumnConfig,
     migrations: Vec<crate::migrate::EmbeddedMigrations>,
@@ -7224,6 +7227,28 @@ async fn setup_database(
         .as_ref()
         .and_then(|t| t.migration_url())
         .map(str::to_owned);
+
+    // SQLite startup-migration guard (issue #1614 follow-up): the startup
+    // migration path is Postgres-only, so a `sqlite://` control URL with
+    // registered migrations must fail fast here rather than crash inside
+    // `PgConnection::establish` before serving. See `sqlite_startup_migration_guard`.
+    #[cfg(feature = "sqlite")]
+    #[allow(clippy::question_mark)] // managed-pg child must be stopped before returning
+    if let Err(e) = sqlite_startup_migration_guard(
+        if topology.is_some() {
+            provider_migration_url
+                .as_deref()
+                .or_else(|| config.database.effective_primary_url())
+        } else {
+            None
+        },
+        !migrations.is_empty() || directory_migration_required || shard_map_migration_required,
+    ) {
+        #[cfg(feature = "managed-pg")]
+        crate::managed_pg::emergency_stop_async().await;
+        return Err(e);
+    }
+
     run_startup_migrations(
         config,
         topology.is_some(),
@@ -7334,6 +7359,106 @@ fn apply_pending_or_exit(
             crate::managed_pg::emergency_stop();
             std::process::exit(1);
         }
+    }
+}
+
+/// Guard the startup-migration path against a `SQLite` control target.
+///
+/// The Rust startup-migration harness is Postgres-only — it applies
+/// `MigrationSource<Pg>` through [`crate::db::establish_migration_connection`],
+/// which calls `PgConnection::establish`. A `sqlite://` URL routed there would
+/// try to open a Postgres connection against a `SQLite` target and crash before
+/// the app ever serves (issue #1614 review, Codex P1). Full `SQLite` migration
+/// support (a `MigrationHarness<Sqlite>` path) is a deliberate follow-up; until
+/// then, registering migrations with a `SQLite` target fails fast here with an
+/// actionable message rather than deep inside the Postgres engine.
+///
+/// Returns `Ok(())` unless the control target is `SQLite` **and** at least one
+/// migration would be applied to it. With no registered migrations the
+/// manual-schema path is fully supported, so boot proceeds. Uses the same
+/// [`crate::config::DatabaseBackend::detect`] predicate as `db::build_pool`, so
+/// the gate and the pool routing agree on what "is a `SQLite` URL" means.
+#[cfg(feature = "sqlite")]
+fn sqlite_startup_migration_guard(
+    control_url: Option<&str>,
+    control_has_migrations: bool,
+) -> Result<(), String> {
+    let targets_sqlite = control_url.is_some_and(|url| {
+        crate::config::DatabaseBackend::detect(url) == Some(crate::config::DatabaseBackend::Sqlite)
+    });
+    if targets_sqlite && control_has_migrations {
+        return Err(
+            "SQLite startup migrations are not yet supported in this build of autumn-web. \
+             Registered migrations cannot be applied to a SQLite target here \u{2014} apply \
+             your schema out-of-band, or boot without registered migrations. Tracking: SQLite \
+             migration support is a follow-up to #1614."
+                .to_owned(),
+        );
+    }
+    Ok(())
+}
+
+#[cfg(all(test, feature = "sqlite"))]
+mod sqlite_startup_migration_guard_tests {
+    use super::sqlite_startup_migration_guard;
+
+    #[test]
+    fn sqlite_target_with_registered_migrations_fails_fast() {
+        // The exact bug the Codex P1 flags: a sqlite:// control URL with
+        // registered migrations must NOT reach `PgConnection::establish`; it
+        // must return the actionable, SQLite-named boot error instead.
+        for url in [
+            "sqlite:///var/lib/app.db",
+            "sqlite://./relative.db",
+            "sqlite::memory:",
+        ] {
+            let err = sqlite_startup_migration_guard(Some(url), true)
+                .expect_err("sqlite target + registered migrations must be rejected");
+            assert!(
+                err.contains("SQLite startup migrations are not yet supported"),
+                "message must name the SQLite situation clearly: {err}"
+            );
+            assert!(
+                err.contains("#1614"),
+                "message must point at the tracking follow-up: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn sqlite_target_without_migrations_boots() {
+        // The manual-schema path (the `sqlite_boot_serve` scenario): a sqlite
+        // target with no registered migrations must boot normally.
+        assert!(
+            sqlite_startup_migration_guard(Some("sqlite:///var/lib/app.db"), false).is_ok(),
+            "sqlite target + no migrations must boot"
+        );
+    }
+
+    #[test]
+    fn postgres_target_is_unchanged() {
+        // The default Postgres path is untouched, migrations registered or not.
+        for url in [
+            "postgres://u@h/db",
+            "postgresql://user:pass@db:5432/app",
+            "host=db user=app sslmode=require",
+        ] {
+            assert!(
+                sqlite_startup_migration_guard(Some(url), true).is_ok(),
+                "postgres target must never be gated: {url}"
+            );
+            assert!(
+                sqlite_startup_migration_guard(Some(url), false).is_ok(),
+                "postgres target must never be gated: {url}"
+            );
+        }
+    }
+
+    #[test]
+    fn absent_control_url_boots() {
+        // No control URL (no-DB / opt-out provider): nothing to gate.
+        assert!(sqlite_startup_migration_guard(None, true).is_ok());
+        assert!(sqlite_startup_migration_guard(None, false).is_ok());
     }
 }
 
