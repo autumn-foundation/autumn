@@ -574,9 +574,33 @@ fn is_opaque_object(schema: &Value) -> bool {
             .is_none_or(|map| !map.contains_key("properties"))
 }
 
+/// True when a `oneOf`/`anyOf` branch is the `{"type":"null"}` arm the
+/// `OpenApiSchema` derive emits for the `None` case of an `Option<T>` field.
+fn is_null_branch(branch: &Value) -> bool {
+    branch.get("type").and_then(Value::as_str) == Some("null")
+}
+
 /// True when `schema` (already ref-resolved) is a nested object or an array of
 /// objects — the shapes flat `serde_urlencoded` query decoding cannot handle.
+///
+/// A nullable query field (`Option<Struct>`, `Option<Vec<Struct>>`) derives to a
+/// `oneOf`/`anyOf` with the nested-shape branch plus a `{"type":"null"}` branch
+/// and therefore carries no top-level `type`; unwrap those wrappers and treat the
+/// field as nested when ANY non-null branch is itself nested, so a nullable
+/// structured query field warns exactly like its non-nullable form (issue #1972).
 fn is_nested_query_shape(root: &Value, schema: &Value) -> bool {
+    if let Some(branches) = schema
+        .get("oneOf")
+        .or_else(|| schema.get("anyOf"))
+        .and_then(Value::as_array)
+    {
+        return branches
+            .iter()
+            .filter(|branch| !is_null_branch(branch))
+            .map(|branch| resolve_local_ref(root, branch))
+            .any(|branch| is_nested_query_shape(root, branch));
+    }
+
     match schema.get("type").and_then(Value::as_str) {
         // A non-placeholder object nested under a query field.
         Some("object") => schema
@@ -2526,6 +2550,83 @@ mod tests {
         assert!(
             detect_schema_degradations(&schema, true, false)
                 .contains(&SchemaDegradation::NestedQuery)
+        );
+    }
+
+    #[test]
+    fn detect_degradation_flags_nullable_nested_query_field() {
+        // `filter: Option<Filter>` derives to a nullable `oneOf` (the nested
+        // object branch + a `{"type":"null"}` branch) with no top-level `type`.
+        // The detector must still flag it — `serde_urlencoded` cannot decode the
+        // structured value whether or not the field is optional (issue #1972).
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "object",
+                    "properties": {
+                        "filter": { "oneOf": [ { "$ref": "#/$defs/Filter" }, { "type": "null" } ] },
+                    },
+                },
+            },
+            "$defs": { "Filter": { "type": "object", "properties": { "min": { "type": "integer" } } } },
+        });
+        let degradations = detect_schema_degradations(&schema, true, false);
+        assert!(
+            degradations.contains(&SchemaDegradation::NestedQuery),
+            "nullable nested query field must warn: {degradations:?}"
+        );
+    }
+
+    #[test]
+    fn detect_degradation_flags_nullable_array_of_objects_query_field() {
+        // `filter: Option<Vec<Filter>>` → `oneOf[{array of $ref}, {null}]`.
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "object",
+                    "properties": {
+                        "filters": { "oneOf": [
+                            { "type": "array", "items": { "$ref": "#/$defs/Filter" } },
+                            { "type": "null" },
+                        ] },
+                    },
+                },
+            },
+            "$defs": { "Filter": { "type": "object", "properties": { "min": { "type": "integer" } } } },
+        });
+        assert!(
+            detect_schema_degradations(&schema, true, false)
+                .contains(&SchemaDegradation::NestedQuery),
+            "nullable array-of-objects query field must warn"
+        );
+    }
+
+    #[test]
+    fn detect_degradation_ignores_nullable_scalar_query_field() {
+        // `q: Option<String>` → `oneOf[{type:string}, {type:null}]` and
+        // `tags: Option<Vec<String>>` → `oneOf[{array of scalar}, {null}]`: both
+        // are flat-encodable, so neither may produce a false positive.
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "object",
+                    "properties": {
+                        "q": { "oneOf": [ { "type": "string" }, { "type": "null" } ] },
+                        "tags": { "oneOf": [
+                            { "type": "array", "items": { "type": "string" } },
+                            { "type": "null" },
+                        ] },
+                    },
+                },
+            },
+        });
+        assert!(
+            !detect_schema_degradations(&schema, true, false)
+                .contains(&SchemaDegradation::NestedQuery),
+            "nullable scalar / scalar-array query fields must NOT warn"
         );
     }
 

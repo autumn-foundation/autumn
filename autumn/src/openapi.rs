@@ -798,9 +798,32 @@ pub fn build_schema_component_index(routes: &[&ApiDoc]) -> SchemaComponentIndex 
         }
     }
 
+    SchemaComponentIndex {
+        by_identity: assign_display_keys(&refs),
+    }
+}
+
+/// Assign a **unique, deterministic** display component key to every referenced
+/// schema identity. `refs` is `(identity, base_display)` pairs; identities are
+/// assumed already deduped. Pure over its input and independent of the order the
+/// pairs are supplied (identities are qualified in a stable sorted order), so the
+/// same route set always yields the same keys across runs and link orders.
+///
+/// Every distinct identity is guaranteed a distinct display key: the collision
+/// ladder (fewest trailing `::`-segments that make the key unique → full
+/// sanitized fallback) can be exhausted, and a colliding identity's fallback key
+/// can equal a key another colliding identity already claimed (e.g. crate `app`
+/// with `app::app::Args` claiming `app.Args` at depth 2 while `app::Args`
+/// exhausts its ladder and falls back to the same `app.Args`). When the best
+/// candidate is still taken, a deterministic `-N` disambiguator is appended until
+/// the key is free. `-` never appears in a `component_key` output derived from a
+/// real Rust `type_name` (Rust paths contain no `-`), so the disambiguator can
+/// never collide with a naturally-produced key (issue #1972).
+#[cfg(feature = "openapi")]
+fn assign_display_keys(refs: &[(String, String)]) -> BTreeMap<String, String> {
     // Which base display keys are shared by more than one distinct identity?
     let mut by_base: BTreeMap<String, std::collections::BTreeSet<&str>> = BTreeMap::new();
-    for (identity, base) in &refs {
+    for (identity, base) in refs {
         by_base
             .entry(base.clone())
             .or_default()
@@ -813,7 +836,7 @@ pub fn build_schema_component_index(routes: &[&ApiDoc]) -> SchemaComponentIndex 
     // First pass: assign the plain last-segment key to every identity whose base
     // is unambiguous, and to legacy short-name identities (no `::` path — the
     // repository macro's model refs) which cannot be qualified anyway.
-    for (identity, base) in &refs {
+    for (identity, base) in refs {
         let collides = by_base[base].len() > 1 && identity.contains("::");
         if !collides {
             by_identity.entry(identity.clone()).or_insert_with(|| {
@@ -824,26 +847,39 @@ pub fn build_schema_component_index(routes: &[&ApiDoc]) -> SchemaComponentIndex 
     }
 
     // Second pass: qualify each genuinely-colliding real type path with the
-    // fewest trailing module segments that make its key unique.
-    for (identity, _base) in &refs {
-        if by_identity.contains_key(identity) {
-            continue;
-        }
+    // fewest trailing module segments that make its key unique. Iterate in a
+    // stable sorted order so the assignment is deterministic regardless of the
+    // order pairs were collected, and guarantee the final key is free even when
+    // the suffix ladder and the full-sanitized fallback are both exhausted.
+    let mut pending: Vec<&String> = refs
+        .iter()
+        .map(|(identity, _)| identity)
+        .filter(|identity| !by_identity.contains_key(*identity))
+        .collect();
+    pending.sort_unstable();
+    for identity in pending {
         let depth_max = identity.split("::").count();
-        let mut display = None;
-        for depth in 2..=depth_max {
-            let candidate = qualified_suffix_key(identity, depth);
-            if !used.contains(&candidate) {
-                display = Some(candidate);
-                break;
+        let mut display = (2..=depth_max)
+            .map(|depth| qualified_suffix_key(identity, depth))
+            .find(|candidate| !used.contains(candidate))
+            .unwrap_or_else(|| component_key(identity));
+        if used.contains(&display) {
+            let base = display.clone();
+            let mut n = 2u32;
+            loop {
+                let candidate = format!("{base}-{n}");
+                if !used.contains(&candidate) {
+                    display = candidate;
+                    break;
+                }
+                n += 1;
             }
         }
-        let display = display.unwrap_or_else(|| component_key(identity));
         used.insert(display.clone());
         by_identity.insert(identity.clone(), display);
     }
 
-    SchemaComponentIndex { by_identity }
+    by_identity
 }
 
 /// The base (short) display key for a raw schema *identity* string: its last
@@ -2049,5 +2085,61 @@ mod tests {
         let spec = generate_spec(&config, &[&unscoped]);
         let schemes = &spec.components.as_ref().unwrap().security_schemes;
         assert!(!schemes.contains_key("BearerAuth"));
+    }
+
+    // Regression (issue #1972): the fallback display-key assignment must be
+    // collision-proof. This generalizes the reviewer's `app::app::Args` /
+    // `app::Args` example to a pair that still clashes under the deterministic
+    // sorted assignment order: `a::x::Args` sorts first and claims the 2-segment
+    // suffix `x.Args`, then `x::Args` exhausts its suffix ladder (its only
+    // qualified candidate IS `x.Args`) and falls back to
+    // `component_key("x::Args")` == `x.Args` — the exact key `a::x::Args` already
+    // took. Without the disambiguator both identities would map to `x.Args`, so
+    // the second schema would silently overwrite the first.
+    #[test]
+    fn colliding_fallback_keys_are_disambiguated() {
+        let refs = vec![
+            ("a::x::Args".to_owned(), "Args".to_owned()),
+            ("x::Args".to_owned(), "Args".to_owned()),
+        ];
+        let by_identity = assign_display_keys(&refs);
+
+        let a = by_identity.get("a::x::Args").expect("a::x::Args assigned");
+        let b = by_identity.get("x::Args").expect("x::Args assigned");
+        assert_ne!(
+            a, b,
+            "distinct identities must map to distinct display keys, got {a} == {b}"
+        );
+        // `a::x::Args` claims the suffix key; `x::Args` must be pushed onto the
+        // deterministic `-N` disambiguator rather than overwriting it — pinning
+        // this proves the disambiguator branch actually ran.
+        assert_eq!(a, "x.Args");
+        assert_eq!(b, "x.Args-2");
+        // Both keys are valid OpenAPI component keys.
+        for key in [a, b] {
+            assert!(
+                key.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_')),
+                "display key {key} is not a valid component key"
+            );
+        }
+    }
+
+    // Determinism: the same identity set must yield the same keys regardless of
+    // the order the `(identity, base)` pairs are supplied.
+    #[test]
+    fn assign_display_keys_is_order_independent() {
+        let forward = vec![
+            ("app::app::Args".to_owned(), "Args".to_owned()),
+            ("app::Args".to_owned(), "Args".to_owned()),
+            ("other::mod::Args".to_owned(), "Args".to_owned()),
+        ];
+        let mut reversed = forward.clone();
+        reversed.reverse();
+        assert_eq!(
+            assign_display_keys(&forward),
+            assign_display_keys(&reversed),
+            "display-key assignment must not depend on input order"
+        );
     }
 }
