@@ -26,10 +26,12 @@
 //! - `#[id]` — primary-key column (macro PK resolution is mirrored: explicit
 //!   `#[id]` fields win, else the first `i32`/`i64` field, else a reserved `id`).
 //! - `#[indexed]` — a non-unique secondary index on the column.
-//! - `#[default]` — a column default. The `NOW()` default is recovered only for
-//!   the reserved `created_at` column (→ [`ColumnDefault::Now`]); other
-//!   `#[default]` fields carry no inferred DB default (their default, if any,
-//!   lives in the migration). See the slice-3+ limitation below.
+//! - `#[default]` — a column default. Convention defaults the generator emits are
+//!   recovered by [`convention_default`]: the reserved `created_at` column gets a
+//!   `NOW()` default (→ [`ColumnDefault::Now`]) and a UUID primary key on Postgres
+//!   gets `gen_random_uuid()` (→ [`ColumnDefault::Sql`]). Every other `#[default]`
+//!   field carries no inferred DB default (their default, if any, lives in the
+//!   migration). See the slice-3+ limitation below.
 //! - `#[references]` / `#[references(table = "...")]` — a foreign-key column
 //!   (forces [`ColumnType::Int64`], infers the target table from the column name
 //!   via the generator's `<name>`-minus-`_id`-then-pluralize convention, and adds
@@ -62,9 +64,11 @@
 //!   foreign key from that convention (or from the association attribute) requires
 //!   cross-model resolution and is deferred; today only an explicit
 //!   `#[references]` field attribute yields a [`ForeignKey`].
-//! - **Non-`created_at` `#[default]` fields**: the `NOW()` default is recovered
-//!   only for the reserved `created_at` column; other `#[default]` fields carry
-//!   no inferred DB default (their default, if any, lives in the migration). A
+//! - **Non-convention `#[default]` fields**: only the two conventions
+//!   [`convention_default`] knows about are recovered from the struct alone — the
+//!   reserved `created_at` `NOW()` default and a Postgres UUID primary key's
+//!   `gen_random_uuid()` default. Every other `#[default]` field carries no
+//!   inferred DB default (their default, if any, lives in the migration). A
 //!   soft-delete `deleted_at` carries `#[default]` solely to exclude it from the
 //!   generated `New*`/`Update*` structs — the migration leaves its column default
 //!   UNSET (new rows stay NULL), so the parser must not infer `Now` for it. A
@@ -291,12 +295,10 @@ enum ReferenceSpec {
 }
 
 /// A field's parsed schema-relevant attributes.
-#[allow(clippy::struct_excessive_bools)] // independent field markers, not a state machine
 struct FieldAttrs {
     is_id: bool,
     is_indexed: bool,
     is_unique: bool,
-    is_default: bool,
     reference: ReferenceSpec,
 }
 
@@ -305,7 +307,6 @@ fn parse_field_attrs(field: &syn::Field) -> FieldAttrs {
         is_id: false,
         is_indexed: false,
         is_unique: false,
-        is_default: false,
         reference: ReferenceSpec::None,
     };
     for attr in &field.attrs {
@@ -316,7 +317,9 @@ fn parse_field_attrs(field: &syn::Field) -> FieldAttrs {
             "id" => out.is_id = true,
             "indexed" => out.is_indexed = true,
             "unique" => out.is_unique = true,
-            "default" => out.is_default = true,
+            // `#[default]` no longer changes a column's parsed shape: DB column
+            // defaults the generator emits are recovered by `convention_default`
+            // from the column name/type/PK, not the attribute's presence.
             "references" => {
                 let mut target = None;
                 if !matches!(attr.meta, syn::Meta::Path(_)) {
@@ -444,24 +447,16 @@ fn build_table(
         column.primary_key = is_pk;
         column.unique = raw.attrs.is_unique;
 
-        // Default (slice-3+): the NOW() default is recovered only for the
-        // reserved `created_at` column; other `#[default]` fields carry no
-        // inferred DB default (their default, if any, lives in the migration).
-        // The generator gives a DB `DEFAULT NOW()` (Postgres) / `CURRENT_TIMESTAMP`
-        // (sqlite) *only* to `created_at`. A soft-delete `deleted_at` also carries
-        // `#[default]`, but purely to exclude it from the generated `New*`/`Update*`
-        // insert structs — the migration leaves its column default UNSET so new
-        // rows stay NULL. Inferring `Now` for it (or for any user `#[default]`
-        // timestamp) would fabricate a wrong desired-state IR, so restrict the
-        // inference to the `created_at` convention. The `#[default]`→exclude-from-
-        // insert semantics are orthogonal to the IR `default`, which represents the
-        // DB column default only.
-        if raw.name == "created_at"
-            && raw.attrs.is_default
-            && matches!(ty, ColumnType::Timestamp | ColumnType::TimestampTz)
-        {
-            column.default = Some(ColumnDefault::Now);
-        }
+        // Default (slice-3+): recover only the DB column defaults the generator
+        // emits *by convention* (see `convention_default`) — the `created_at`
+        // NOW() default and a Postgres UUID primary key's `gen_random_uuid()`.
+        // The convention is a fallback: it never overwrites an already-parsed
+        // explicit default. Non-convention `#[default]` fields (a soft-delete
+        // `deleted_at`, an enum/numeric literal) carry no inferred DB default —
+        // their value lives in the migration, not the struct.
+        column.default = column
+            .default
+            .or_else(|| convention_default(&raw.name, &ty, is_pk, backend));
 
         // Foreign key: infer the target table from the generator's convention
         // (`<name>` minus a trailing `_id`, pluralized) unless overridden.
@@ -525,6 +520,36 @@ fn build_table(
     }
 
     table
+}
+
+/// Recover the DB column default the generator emits *by convention*, so the
+/// desired-state IR matches what `autumn generate` actually produced.
+///
+/// Known conventions:
+/// - the reserved `created_at` (timestamp) column -> `NOW()` / `CURRENT_TIMESTAMP`
+///   (the generator gives a DB default only to `created_at`, not to any other
+///   `#[default]` timestamp such as a soft-delete `deleted_at`);
+/// - a UUID `PRIMARY KEY` on Postgres -> `gen_random_uuid()` (the only primary
+///   key that carries an explicit column `DEFAULT`; a `BIGSERIAL`/serial PK is
+///   type-encoded with no `DEFAULT` clause, and on sqlite a UUID PK is `TEXT
+///   PRIMARY KEY` with no default — indeed `uuid::Uuid` is a rejected type there).
+///
+/// Everything else is `None` — a non-convention default lives in the migration
+/// and is recovered in a later slice. This is a *fallback*: the caller applies it
+/// only when a column has no already-parsed explicit default.
+fn convention_default(
+    name: &str,
+    ty: &ColumnType,
+    is_primary_key: bool,
+    backend: Backend,
+) -> Option<ColumnDefault> {
+    if name == "created_at" && matches!(ty, ColumnType::Timestamp | ColumnType::TimestampTz) {
+        return Some(ColumnDefault::Now);
+    }
+    if is_primary_key && *ty == ColumnType::Uuid && backend == Backend::Postgres {
+        return Some(ColumnDefault::Sql("gen_random_uuid()".to_owned()));
+    }
+    None
 }
 
 /// Resolve the primary-key column name(s) from the lifted fields, mirroring the
@@ -812,6 +837,77 @@ mod tests {
         assert!(deleted_at.nullable);
         // `created_at` still recovers its NOW() default.
         assert_eq!(col(&table, "created_at").default, Some(ColumnDefault::Now));
+    }
+
+    #[test]
+    fn uuid_primary_key_recovers_gen_random_uuid_default_on_postgres() {
+        // `autumn generate model --id uuid` emits `#[id] pub id: uuid::Uuid`, and
+        // its Postgres migration declares the PK as
+        // `id UUID PRIMARY KEY DEFAULT gen_random_uuid()`. The parser must recover
+        // that convention default, or a later snapshot/diff would read the live
+        // DB's `gen_random_uuid()` default as drift and try to REMOVE it.
+        let src = r#"
+            #[autumn_web::model]
+            pub struct Session {
+                #[id]
+                pub id: uuid::Uuid,
+                pub token: String,
+                #[default]
+                pub created_at: chrono::NaiveDateTime,
+            }
+        "#;
+        let table = parse_one(src);
+        let id = col(&table, "id");
+        assert_eq!(id.ty, ColumnType::Uuid);
+        assert!(id.primary_key);
+        assert_eq!(
+            id.default,
+            Some(ColumnDefault::Sql("gen_random_uuid()".to_owned()))
+        );
+    }
+
+    #[test]
+    fn non_pk_uuid_field_has_no_inferred_default() {
+        // The `gen_random_uuid()` convention is PRIMARY-KEY-only: a plain
+        // `uuid::Uuid` column carries no DB default (its value, if any, lives in
+        // the migration), so the parser must report `default == None` for it.
+        let src = r#"
+            #[autumn_web::model]
+            pub struct ApiKey {
+                #[id]
+                pub id: i64,
+                pub external_ref: uuid::Uuid,
+                #[default]
+                pub created_at: chrono::NaiveDateTime,
+            }
+        "#;
+        let table = parse_one(src);
+        let external = col(&table, "external_ref");
+        assert_eq!(external.ty, ColumnType::Uuid);
+        assert!(!external.primary_key);
+        assert_eq!(external.default, None);
+    }
+
+    #[test]
+    fn bigserial_primary_key_has_no_inferred_default() {
+        // A `BIGSERIAL PRIMARY KEY` is type-encoded — the serial type IS the
+        // default, there is no separate `DEFAULT` clause — so an `i64` `#[id]` PK
+        // must NOT pick up `gen_random_uuid()` (which is UUID-PK-only).
+        let src = r#"
+            #[autumn_web::model]
+            pub struct Post {
+                #[id]
+                pub id: i64,
+                pub title: String,
+                #[default]
+                pub created_at: chrono::NaiveDateTime,
+            }
+        "#;
+        let table = parse_one(src);
+        let id = col(&table, "id");
+        assert_eq!(id.ty, ColumnType::Int64);
+        assert!(id.primary_key);
+        assert_eq!(id.default, None);
     }
 
     #[test]
