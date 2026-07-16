@@ -15,7 +15,7 @@ separate, deliberate step the user asks for by name.
 
 - **Build**: `cargo build --workspace`
 - **Check**: `cargo check --workspace`
-- **Lint**: `cargo fmt --all && argo clippy --workspace --all-targets -- -D warnings`
+- **Lint**: `cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings`
 - **Test all**: `cargo test --workspace`
 - **Test specific package**: `cargo test -p <pkg>`
 - **Test specific target**: `cargo test -p <pkg> --test <target>`
