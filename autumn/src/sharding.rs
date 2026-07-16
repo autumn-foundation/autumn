@@ -38,7 +38,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::db::RuntimeConnection;
 use diesel_async::AsyncPgConnection;
 use diesel_async::pooled_connection::deadpool::Pool;
 
@@ -259,7 +258,7 @@ impl ShardRouter for HashShardRouter {
 /// Only string keys are looked up in the directory (tenants are strings);
 /// numeric/byte keys route straight through the fallback.
 pub struct DirectoryShardRouter {
-    control_pool: Pool<RuntimeConnection>,
+    control_pool: Pool<AsyncPgConnection>,
     fallback: Arc<dyn ShardRouter>,
     cache: std::sync::RwLock<HashMap<String, DirectoryCacheEntry>>,
     ttl: std::time::Duration,
@@ -337,7 +336,7 @@ impl DirectoryShardRouter {
     /// Build a directory router over the given control pool, falling back to
     /// [`HashShardRouter`] and using [`DEFAULT_DIRECTORY_CACHE_TTL`].
     #[must_use]
-    pub fn new(control_pool: Pool<RuntimeConnection>) -> Self {
+    pub fn new(control_pool: Pool<AsyncPgConnection>) -> Self {
         Self::with_fallback(control_pool, Arc::new(HashShardRouter))
     }
 
@@ -345,7 +344,7 @@ impl DirectoryShardRouter {
     /// default cache TTL.
     #[must_use]
     pub fn with_fallback(
-        control_pool: Pool<RuntimeConnection>,
+        control_pool: Pool<AsyncPgConnection>,
         fallback: Arc<dyn ShardRouter>,
     ) -> Self {
         Self {
@@ -760,13 +759,13 @@ impl Shard {
 
     /// This shard's primary/write pool.
     #[must_use]
-    pub const fn primary_pool(&self) -> &Pool<RuntimeConnection> {
+    pub const fn primary_pool(&self) -> &Pool<AsyncPgConnection> {
         self.topology.primary()
     }
 
     /// This shard's replica pool, when configured.
     #[must_use]
-    pub const fn replica_pool(&self) -> Option<&Pool<RuntimeConnection>> {
+    pub const fn replica_pool(&self) -> Option<&Pool<AsyncPgConnection>> {
         self.topology.replica()
     }
 
@@ -779,7 +778,7 @@ impl Shard {
     /// - replica unready, fallback `primary` → the primary pool;
     /// - replica unready, fallback `fail_readiness` → `None`.
     #[must_use]
-    pub fn read_pool(&self) -> Option<&Pool<RuntimeConnection>> {
+    pub fn read_pool(&self) -> Option<&Pool<AsyncPgConnection>> {
         self.read_pool_with_role().map(|(pool, _)| pool)
     }
 
@@ -823,7 +822,7 @@ impl Shard {
     /// Backs [`ShardedReadDb`], which always requires a healthy replica.
     ///
     /// [`read_pool`]: Self::read_pool
-    pub(crate) fn replica_read_pool(&self) -> Option<&Pool<RuntimeConnection>> {
+    pub(crate) fn replica_read_pool(&self) -> Option<&Pool<AsyncPgConnection>> {
         if self.runtime.replica_configured && self.runtime.replica_ready() {
             self.topology.replica()
         } else {
@@ -833,7 +832,7 @@ impl Shard {
 
     /// [`read_pool`](Self::read_pool) plus the role label of the returned
     /// pool, for interceptor/metric naming.
-    pub(crate) fn read_pool_with_role(&self) -> Option<(&Pool<RuntimeConnection>, &'static str)> {
+    pub(crate) fn read_pool_with_role(&self) -> Option<(&Pool<AsyncPgConnection>, &'static str)> {
         if !self.runtime.replica_configured {
             return Some((self.topology.primary(), "primary"));
         }
@@ -1761,7 +1760,7 @@ impl Shards {
     async fn checkout(
         &self,
         shard: &Shard,
-        pool: &Pool<RuntimeConnection>,
+        pool: &Pool<AsyncPgConnection>,
         role: &str,
     ) -> Result<crate::db::Db, AutumnError> {
         let ctx = self.ctx.clone();
@@ -1798,7 +1797,7 @@ impl Shards {
 #[doc(hidden)]
 #[derive(Clone)]
 pub struct ShardRepositorySeed {
-    pub pool: Pool<RuntimeConnection>,
+    pub pool: Pool<AsyncPgConnection>,
     /// Statement timeout in milliseconds (`0` = no limit, matching the
     /// Postgres `statement_timeout = 0` convention).  Capped at
     /// `i32::MAX` ms to match the Postgres signed-integer constraint.
@@ -1816,7 +1815,7 @@ pub struct ShardRepositorySeed {
 
 impl ShardRepositorySeed {
     pub(crate) fn from_ctx(
-        pool: &Pool<RuntimeConnection>,
+        pool: &Pool<AsyncPgConnection>,
         ctx: &crate::db::RequestDbContext,
         shard_name: &str,
         read_route: crate::repository::ReadRoute,
@@ -1984,7 +1983,7 @@ impl ShardedDb {
 }
 
 impl std::ops::Deref for ShardedDb {
-    type Target = RuntimeConnection;
+    type Target = AsyncPgConnection;
     fn deref(&self) -> &Self::Target {
         &self.db
     }
@@ -2121,7 +2120,7 @@ impl ShardedReadDb {
 }
 
 impl std::ops::Deref for ShardedReadDb {
-    type Target = RuntimeConnection;
+    type Target = AsyncPgConnection;
     fn deref(&self) -> &Self::Target {
         &self.db
     }

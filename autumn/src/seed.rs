@@ -58,8 +58,8 @@
 use std::path::Path;
 
 use crate::config::DatabaseConfig;
-use crate::db::RuntimeConnection;
 use crate::db::create_pool;
+use diesel_async::AsyncPgConnection;
 use diesel_async::pooled_connection::deadpool::{Object, Pool};
 use futures::future::BoxFuture;
 
@@ -100,7 +100,7 @@ pub enum SeedContextError {
 /// # }
 /// ```
 pub struct SeedContext {
-    pool: Pool<RuntimeConnection>,
+    pool: Pool<AsyncPgConnection>,
     profile: String,
 }
 
@@ -151,7 +151,7 @@ impl SeedContext {
     /// factory `create_many(count, pool)` and
     /// [`fake_seed_model`].
     #[must_use]
-    pub const fn pool(&self) -> &Pool<RuntimeConnection> {
+    pub const fn pool(&self) -> &Pool<AsyncPgConnection> {
         &self.pool
     }
 
@@ -165,7 +165,7 @@ impl SeedContext {
     ///
     /// Returns [`SeedContextError::Connection`] if the pool is exhausted or
     /// the connection cannot be established.
-    pub async fn conn(&self) -> Result<Object<RuntimeConnection>, SeedContextError> {
+    pub async fn conn(&self) -> Result<Object<AsyncPgConnection>, SeedContextError> {
         self.pool
             .get()
             .await
@@ -269,7 +269,7 @@ pub struct FakeSeeder {
     pub model: &'static str,
     /// Insert `count` faked rows via the model's factory and return how many
     /// were inserted.
-    pub run: fn(&Pool<RuntimeConnection>, usize) -> BoxFuture<'_, usize>,
+    pub run: fn(&Pool<AsyncPgConnection>, usize) -> BoxFuture<'_, usize>,
 }
 
 inventory::collect!(FakeSeeder);
@@ -330,7 +330,7 @@ fn find_fake_seeder(name: &str) -> Option<&'static FakeSeeder> {
 pub async fn fake_seed_model(
     name: &str,
     count: usize,
-    pool: &Pool<RuntimeConnection>,
+    pool: &Pool<AsyncPgConnection>,
 ) -> Result<usize, FakeSeedError> {
     if let Some(seeder) = find_fake_seeder(name) {
         return Ok((seeder.run)(pool, count).await);
@@ -370,7 +370,7 @@ pub async fn fake_seed_model(
 /// Returns [`FakeSeedError::InvalidCount`] when `AUTUMN_SEED_COUNT` is set but
 /// does not parse as a non-negative integer, or [`FakeSeedError::UnknownModel`]
 /// when `AUTUMN_SEED_MODEL` names no registered `#[model]`.
-pub async fn maybe_fake_seed(pool: &Pool<RuntimeConnection>) -> Result<bool, FakeSeedError> {
+pub async fn maybe_fake_seed(pool: &Pool<AsyncPgConnection>) -> Result<bool, FakeSeedError> {
     let (Ok(model), Ok(count)) = (
         std::env::var("AUTUMN_SEED_MODEL"),
         std::env::var("AUTUMN_SEED_COUNT"),
@@ -459,7 +459,7 @@ mod tests {
     /// A lazily-built pool (deadpool does not connect until first use), so these
     /// tests exercise `maybe_fake_seed`'s pre-connection branches without a live
     /// database.
-    fn lazy_pool() -> Pool<RuntimeConnection> {
+    fn lazy_pool() -> Pool<AsyncPgConnection> {
         crate::db::create_pool(&DatabaseConfig {
             primary_url: Some("postgres://localhost/unused".to_string()),
             ..DatabaseConfig::default()

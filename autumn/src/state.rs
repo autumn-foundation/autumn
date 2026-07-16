@@ -64,12 +64,12 @@ pub struct AppState {
     /// `database.primary_url` or legacy `database.url` is configured.
     #[cfg(feature = "db")]
     pub(crate) pool:
-        Option<diesel_async::pooled_connection::deadpool::Pool<crate::db::RuntimeConnection>>,
+        Option<diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>>,
 
     /// Read-replica connection pool, or `None` when no replica role is configured.
     #[cfg(feature = "db")]
     pub(crate) replica_pool:
-        Option<diesel_async::pooled_connection::deadpool::Pool<crate::db::RuntimeConnection>>,
+        Option<diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>>,
 
     /// Configured shard set, or `None` when no `[[database.shards]]`
     /// entries exist. The `pool`/`replica_pool` roles above are the
@@ -195,7 +195,7 @@ impl crate::authorization::ProvideAuthorizationState for AppState {
     #[cfg(feature = "db")]
     fn pool(
         &self,
-    ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<crate::db::RuntimeConnection>>
+    ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>>
     {
         self.pool.as_ref()
     }
@@ -292,7 +292,7 @@ impl AppState {
     #[must_use]
     pub const fn pool(
         &self,
-    ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<crate::db::RuntimeConnection>>
+    ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>>
     {
         self.pool.as_ref()
     }
@@ -302,7 +302,7 @@ impl AppState {
     #[must_use]
     pub const fn replica_pool(
         &self,
-    ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<crate::db::RuntimeConnection>>
+    ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>>
     {
         self.replica_pool.as_ref()
     }
@@ -323,7 +323,7 @@ impl AppState {
     #[must_use]
     pub fn read_pool(
         &self,
-    ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<crate::db::RuntimeConnection>>
+    ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>>
     {
         if self.replica_pool.is_some() && self.probes.should_route_reads_to_replica() {
             self.replica_pool.as_ref()
@@ -428,7 +428,7 @@ impl AppState {
     #[must_use]
     pub fn with_pool(
         mut self,
-        pool: diesel_async::pooled_connection::deadpool::Pool<crate::db::RuntimeConnection>,
+        pool: diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
     ) -> Self {
         self.pool = Some(pool);
         self
@@ -439,7 +439,7 @@ impl AppState {
     #[must_use]
     pub fn with_replica_pool(
         mut self,
-        pool: diesel_async::pooled_connection::deadpool::Pool<crate::db::RuntimeConnection>,
+        pool: diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
     ) -> Self {
         self.replica_pool = Some(pool);
         self
@@ -754,21 +754,21 @@ impl DbState for AppState {
 
     fn pool(
         &self,
-    ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<crate::db::RuntimeConnection>>
+    ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>>
     {
         self.pool.as_ref()
     }
 
     fn replica_pool(
         &self,
-    ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<crate::db::RuntimeConnection>>
+    ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>>
     {
         self.replica_pool.as_ref()
     }
 
     fn read_pool(
         &self,
-    ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<crate::db::RuntimeConnection>>
+    ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>>
     {
         Self::read_pool(self)
     }
@@ -817,7 +817,7 @@ impl crate::probe::ProvideProbeState for AppState {
     #[cfg(feature = "db")]
     fn pool(
         &self,
-    ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<crate::db::RuntimeConnection>>
+    ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>>
     {
         self.pool.as_ref()
     }
@@ -825,7 +825,7 @@ impl crate::probe::ProvideProbeState for AppState {
     #[cfg(feature = "db")]
     fn replica_pool(
         &self,
-    ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<crate::db::RuntimeConnection>>
+    ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>>
     {
         self.replica_pool.as_ref()
     }
@@ -896,7 +896,7 @@ impl crate::actuator::ProvideActuatorState for AppState {
     #[cfg(feature = "db")]
     fn pool(
         &self,
-    ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<crate::db::RuntimeConnection>>
+    ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>>
     {
         self.pool.as_ref()
     }
