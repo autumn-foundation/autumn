@@ -198,11 +198,15 @@ fn storage_key(token: &str) -> String {
 // ── Multipart / body scanning helpers ─────────────────────────────────────────
 
 /// Extract the `boundary` parameter from a `multipart/form-data` Content-Type.
+///
+/// The parameter NAME is matched case-insensitively (RFC 9110 8.3.1), while the
+/// boundary VALUE is returned verbatim (RFC 2046 boundaries are case-sensitive).
 fn extract_multipart_boundary(content_type: &str) -> Option<&str> {
     content_type.split(';').find_map(|part| {
-        part.trim()
-            .strip_prefix("boundary=")
-            .map(|b| b.trim_matches('"'))
+        let (name, value) = part.trim().split_once('=')?;
+        name.trim()
+            .eq_ignore_ascii_case("boundary")
+            .then(|| value.trim().trim_matches('"'))
     })
 }
 
@@ -361,8 +365,12 @@ async fn extract_submitted_token(
         .get(axum::http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .unwrap_or_default();
-    let is_urlencoded = content_type.starts_with("application/x-www-form-urlencoded");
-    let boundary = if content_type.starts_with("multipart/form-data") {
+    // Media types are case-insensitive (RFC 9110 8.3.1); the header may also carry
+    // leading whitespace. Match the type/subtype token case-insensitively, but keep
+    // the boundary VALUE case-sensitive (extract it from the original header).
+    let normalized_type = content_type.trim_start().to_ascii_lowercase();
+    let is_urlencoded = normalized_type.starts_with("application/x-www-form-urlencoded");
+    let boundary = if normalized_type.starts_with("multipart/form-data") {
         extract_multipart_boundary(content_type).map(str::to_owned)
     } else {
         None
@@ -794,6 +802,26 @@ mod tests {
             .unwrap()
     }
 
+    /// Build a `multipart/form-data` POST carrying `_submit_token`. The raw
+    /// `content_type` header value and the `boundary` used for the body
+    /// delimiters are supplied separately so tests can vary the media-type
+    /// casing independently of the (case-sensitive) boundary value.
+    fn multipart_post(content_type: &str, boundary: &str, token: &str) -> Request<Body> {
+        let body = format!(
+            "--{boundary}\r\n\
+             Content-Disposition: form-data; name=\"_submit_token\"\r\n\
+             \r\n\
+             {token}\r\n\
+             --{boundary}--\r\n"
+        );
+        Request::builder()
+            .method("POST")
+            .uri("/submit")
+            .header("Content-Type", content_type)
+            .body(Body::from(body))
+            .unwrap()
+    }
+
     #[test]
     fn submit_token_extractor_exposes_value() {
         let token = SubmitToken::new("abc-123".to_owned());
@@ -870,6 +898,170 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(&second_body[..], b"created");
+
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            1,
+            "handler must run exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn lowercase_multipart_consumes_token_and_replay_short_circuits() {
+        // Positive control: a conventionally-cased multipart body already works.
+        // This proves the multipart body format the tests build is correct, so
+        // any failure of the mixed-case test below is unambiguously about casing.
+        let store: Arc<dyn IdempotencyStore> =
+            Arc::new(MemoryIdempotencyStore::new(Duration::from_secs(600)));
+        let count = Arc::new(AtomicUsize::new(0));
+        let count_inner = count.clone();
+        let app = Router::new()
+            .route(
+                "/submit",
+                post(move || {
+                    let count = count_inner.clone();
+                    async move {
+                        count.fetch_add(1, Ordering::SeqCst);
+                        "created"
+                    }
+                }),
+            )
+            .layer(layer_with_store(store));
+
+        let token = "tok-mp-lower";
+        let ct = "multipart/form-data; boundary=simpleboundary123";
+        let boundary = "simpleboundary123";
+
+        let first = app
+            .clone()
+            .oneshot(multipart_post(ct, boundary, token))
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        assert!(first.headers().get(SUBMIT_TOKEN_REPLAYED).is_none());
+
+        let second = app
+            .clone()
+            .oneshot(multipart_post(ct, boundary, token))
+            .await
+            .unwrap();
+        assert_eq!(second.status(), StatusCode::OK);
+        assert_eq!(
+            second
+                .headers()
+                .get(SUBMIT_TOKEN_REPLAYED)
+                .map(|v| v.to_str().unwrap()),
+            Some("true")
+        );
+
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            1,
+            "handler must run exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn mixed_case_multipart_consumes_token_and_replay_short_circuits() {
+        // Media types are case-insensitive (RFC 9110); the Multipart extractor
+        // accepts `Multipart/Form-Data` with a `Boundary=` parameter. The body
+        // scanner must recognize it and consume the token so a replay is caught.
+        // The weird-case boundary value is identical in the header and the body
+        // delimiters, which also proves the boundary VALUE stays case-sensitive.
+        let store: Arc<dyn IdempotencyStore> =
+            Arc::new(MemoryIdempotencyStore::new(Duration::from_secs(600)));
+        let count = Arc::new(AtomicUsize::new(0));
+        let count_inner = count.clone();
+        let app = Router::new()
+            .route(
+                "/submit",
+                post(move || {
+                    let count = count_inner.clone();
+                    async move {
+                        count.fetch_add(1, Ordering::SeqCst);
+                        "created"
+                    }
+                }),
+            )
+            .layer(layer_with_store(store));
+
+        let token = "tok-mp-mixed";
+        let ct = "Multipart/Form-Data; Boundary=BoUnDaRy-XyZ-123";
+        let boundary = "BoUnDaRy-XyZ-123";
+
+        let first = app
+            .clone()
+            .oneshot(multipart_post(ct, boundary, token))
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        assert!(first.headers().get(SUBMIT_TOKEN_REPLAYED).is_none());
+
+        let second = app
+            .clone()
+            .oneshot(multipart_post(ct, boundary, token))
+            .await
+            .unwrap();
+        assert_eq!(second.status(), StatusCode::OK);
+        assert_eq!(
+            second
+                .headers()
+                .get(SUBMIT_TOKEN_REPLAYED)
+                .map(|v| v.to_str().unwrap()),
+            Some("true")
+        );
+
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            1,
+            "handler must run exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn uppercase_urlencoded_consumes_token_and_replay_short_circuits() {
+        // The urlencoded branch has the same casing hole and is fixed by the
+        // same media-type normalization.
+        let store: Arc<dyn IdempotencyStore> =
+            Arc::new(MemoryIdempotencyStore::new(Duration::from_secs(600)));
+        let count = Arc::new(AtomicUsize::new(0));
+        let count_inner = count.clone();
+        let app = Router::new()
+            .route(
+                "/submit",
+                post(move || {
+                    let count = count_inner.clone();
+                    async move {
+                        count.fetch_add(1, Ordering::SeqCst);
+                        "created"
+                    }
+                }),
+            )
+            .layer(layer_with_store(store));
+
+        let token = "tok-ue-upper";
+        let make_req = || {
+            Request::builder()
+                .method("POST")
+                .uri("/submit")
+                .header("Content-Type", "APPLICATION/X-WWW-FORM-URLENCODED")
+                .body(Body::from(format!("_submit_token={token}&title=hello")))
+                .unwrap()
+        };
+
+        let first = app.clone().oneshot(make_req()).await.unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        assert!(first.headers().get(SUBMIT_TOKEN_REPLAYED).is_none());
+
+        let second = app.clone().oneshot(make_req()).await.unwrap();
+        assert_eq!(second.status(), StatusCode::OK);
+        assert_eq!(
+            second
+                .headers()
+                .get(SUBMIT_TOKEN_REPLAYED)
+                .map(|v| v.to_str().unwrap()),
+            Some("true")
+        );
 
         assert_eq!(
             count.load(Ordering::SeqCst),
