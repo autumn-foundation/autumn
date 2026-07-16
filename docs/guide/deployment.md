@@ -49,15 +49,16 @@ below and are better fits in specific cases:
   [How the production image works](#how-the-production-image-works)) — a
   portable OCI image you run on Kubernetes, ECS, Nomad, or any Docker host.
 
-> **HTTPS/TLS.** kamal-proxy fronts your app on the public port. By default
-> `autumn deploy` listens on plain **HTTP** and provisions no certificate, so the
-> path serves HTTP until you opt in. Set `[deploy.tls] enabled = true` and
-> `host = "app.example.com"` in `autumn.toml` to have `autumn deploy` wire
-> `--host`/`--tls` into kamal-proxy (and open `--https-port 443`), so the proxy
-> terminates TLS on 443 with an **automatic Let's Encrypt** certificate. (An
-> external TLS terminator in front of the HTTP proxy — a load balancer or reverse
-> proxy that owns the certificate and forwards plain HTTP — remains a valid
-> alternative when a platform already handles certificates.) Either way TLS
+> **HTTPS/TLS.** kamal-proxy fronts your app and always listens on both 80 and
+> **443** (its defaults), but by default `autumn deploy` provisions no
+> certificate for your app, so nothing is served over HTTPS until you opt in. Set
+> `[deploy.tls] enabled = true` and `host = "app.example.com"` in `autumn.toml`
+> to have `autumn deploy` pass `--host`/`--tls` on your app's kamal-proxy
+> route/flip, so kamal-proxy provisions an **automatic Let's Encrypt** certificate
+> for that host on-demand and terminates TLS for it on the already-bound 443
+> listener. (An external TLS terminator in front of the proxy — a load balancer or
+> reverse proxy that owns the certificate and forwards plain HTTP — remains a
+> valid alternative when a platform already handles certificates.) Either way TLS
 > terminates at the **proxy**: don't enable in-process
 > `[server.tls]`/ACME on a deploy-managed app — deploy binds each slot to a
 > private loopback HTTP port that the readiness gate and kamal-proxy target over

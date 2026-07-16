@@ -6570,7 +6570,7 @@ pub struct CompressionConfig {
 // Exposed for autumn-cli's `autumn deploy` preflight (doctor) to reuse the deploy env-override logic; not yet a stable public API.
 #[doc(hidden)]
 pub fn apply_deploy_env_overrides(deploy: &mut Option<DeployConfig>, env: &dyn Env) {
-    const KEYS: [&str; 9] = [
+    const KEYS: [&str; 11] = [
         "AUTUMN_DEPLOY__HOST",
         "AUTUMN_DEPLOY__USER",
         "AUTUMN_DEPLOY__SSH_PORT",
@@ -6580,6 +6580,8 @@ pub fn apply_deploy_env_overrides(deploy: &mut Option<DeployConfig>, env: &dyn E
         "AUTUMN_DEPLOY__READINESS_TIMEOUT_SECS",
         "AUTUMN_DEPLOY__KEEP_RELEASES",
         "AUTUMN_DEPLOY__PROFILE",
+        "AUTUMN_DEPLOY__TLS__ENABLED",
+        "AUTUMN_DEPLOY__TLS__HOST",
     ];
     if !KEYS.iter().any(|key| env.var(key).is_ok()) {
         return;
@@ -6602,6 +6604,10 @@ pub fn apply_deploy_env_overrides(deploy: &mut Option<DeployConfig>, env: &dyn E
         &mut deploy.keep_releases,
     );
     parse_env_string(env, "AUTUMN_DEPLOY__PROFILE", &mut deploy.profile);
+    // Opt-in TLS for the deploy-managed proxy (#1969). Env wins over TOML, matching
+    // every other deploy override above.
+    parse_env_bool(env, "AUTUMN_DEPLOY__TLS__ENABLED", &mut deploy.tls.enabled);
+    parse_env_option_string(env, "AUTUMN_DEPLOY__TLS__HOST", &mut deploy.tls.host);
 }
 
 /// Parse an environment variable into a typed target, logging a warning on failure.
@@ -10625,6 +10631,49 @@ path = "/healthz"
         assert_eq!(deploy.keep_releases, 5);
         assert_eq!(deploy.profile, "staging");
         assert!(deploy.validate().is_ok());
+    }
+
+    #[test]
+    fn env_override_sets_deploy_tls_enabled_and_host() {
+        // Opt-in TLS (#1969) can be driven entirely from the environment: setting
+        // both keys materializes `[deploy]` with TLS on and the host — the exact
+        // precondition under which the CLI resolves `tls_host == Some(host)`.
+        let env = MockEnv::new()
+            .with("AUTUMN_DEPLOY__TLS__ENABLED", "true")
+            .with("AUTUMN_DEPLOY__TLS__HOST", "app.example.com");
+        let mut config = AutumnConfig::default();
+        assert!(config.deploy.is_none());
+        config.apply_env_overrides_with_env(&env);
+        let deploy = config.deploy.expect("env should materialize deploy");
+        assert!(deploy.tls.enabled);
+        assert_eq!(deploy.tls.host.as_deref(), Some("app.example.com"));
+    }
+
+    #[test]
+    fn env_override_wins_over_toml_deploy_tls_host() {
+        // TOML configures a TLS host...
+        let mut config: AutumnConfig = toml::from_str(
+            r#"
+            [deploy]
+            host = "203.0.113.10"
+
+            [deploy.tls]
+            enabled = true
+            host = "toml.example.com"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.deploy.as_ref().unwrap().tls.host.as_deref(),
+            Some("toml.example.com"),
+        );
+
+        // ...and the env var overrides it, matching every other deploy override.
+        let env = MockEnv::new().with("AUTUMN_DEPLOY__TLS__HOST", "env.example.com");
+        config.apply_env_overrides_with_env(&env);
+        let deploy = config.deploy.unwrap();
+        assert!(deploy.tls.enabled);
+        assert_eq!(deploy.tls.host.as_deref(), Some("env.example.com"));
     }
 
     #[test]

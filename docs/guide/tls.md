@@ -311,11 +311,12 @@ let the app serve plain HTTP behind it. This is the right choice for the managed
 balancer.
 
 The push-button [`autumn deploy`](./deployment.md#push-button-deploy-to-your-own-server-autumn-deploy)
-path installs **kamal-proxy** in front of your app. By default it configures the
-proxy on the plain **HTTP** public port and does **not** provision a
-certificate — so that path serves HTTP until you opt in to TLS. You can enable
-TLS termination **at the deploy-managed proxy** with an opt-in `[deploy.tls]`
-table:
+path installs **kamal-proxy** in front of your app. kamal-proxy always listens on
+both 80 and **443** (its defaults) — the supervised `run` unit binds both ports
+regardless of any app's TLS setting — but by default `autumn deploy` provisions
+**no** certificate for your app, so nothing is served over HTTPS until you opt
+in. You enable TLS termination **at the deploy-managed proxy** with an opt-in
+`[deploy.tls]` table:
 
 ```toml
 [deploy.tls]
@@ -323,15 +324,14 @@ enabled = true
 host = "app.example.com"   # public DNS name the certificate is issued for
 ```
 
-With `[deploy.tls] enabled = true`, `autumn deploy` wires `--host <host> --tls`
-into every kamal-proxy `route`/`flip` and opens `--https-port 443` on the
-supervised `run` unit, so kamal-proxy terminates TLS on 443 with an **automatic
-Let's Encrypt** certificate for `host`. With the table absent (the default) the
-proxy stays **HTTP-only** — `kamal-proxy run --http-port {port}` and every
-route/flip with **no** `--host`/`--tls`, byte-for-byte the historical behavior.
-(An external TLS terminator in front of the HTTP proxy — nginx, Caddy, a cloud
-load balancer — remains a valid alternative, e.g. when a platform already owns
-the certificate.)
+With `[deploy.tls] enabled = true`, `autumn deploy` passes `--host <host> --tls`
+on every kamal-proxy `route`/`flip` for your app, so kamal-proxy provisions an
+**automatic Let's Encrypt** certificate for `host` on-demand and terminates TLS
+for it on the already-bound 443 listener. With the table absent (the default)
+the route/flip commands carry **no** `--host`/`--tls`, so the proxy serves your
+app over plain HTTP only — byte-for-byte the historical behavior. (An external
+TLS terminator in front of the proxy — nginx, Caddy, a cloud load balancer —
+remains a valid alternative, e.g. when a platform already owns the certificate.)
 
 Either way TLS terminates at the **proxy**, not the app. Do **not** enable
 in-process `[server.tls]`/ACME on a deploy-managed app: `autumn deploy` binds each app slot to a private loopback

@@ -1151,6 +1151,25 @@ fn default_release_id() -> String {
 /// release serving ([`exec::execute_redeploy`]); a first deploy has no previous
 /// release and fails loudly after tearing the candidate down
 /// ([`exec::execute_first_deploy`]).
+/// The HTTPS port kamal-proxy binds unconditionally. Kept in lock-step with
+/// `proxy::DEFAULT_HTTPS_PORT`; a public/HTTP port equal to it collides.
+const PROXY_HTTPS_PORT: u16 = 443;
+
+/// Reject a deploy public/HTTP port that collides with the proxy's fixed HTTPS
+/// listener. kamal-proxy `run` always establishes both its `--http-port` (the
+/// deploy public port) and `--https-port 443` listeners, so a public port of 443
+/// makes the two collide and the proxy can never start. The guard is
+/// unconditional (not TLS-gated) because 443 is always bound.
+fn validate_public_port(public_port: u16) -> Result<(), String> {
+    if public_port == PROXY_HTTPS_PORT {
+        return Err(format!(
+            "deploy public/HTTP port cannot be {PROXY_HTTPS_PORT} — kamal-proxy reserves \
+             {PROXY_HTTPS_PORT} for its HTTPS listener; use 80 (the default) or another port",
+        ));
+    }
+    Ok(())
+}
+
 fn run_up(config: &AutumnConfig, resolved: &ResolvedDeployConfig) -> Result<(), DeployError> {
     eprintln!("\u{1F342} autumn deploy up\n");
 
@@ -1168,6 +1187,12 @@ fn run_up(config: &AutumnConfig, resolved: &ResolvedDeployConfig) -> Result<(), 
     let env_file = build_env_file(config, resolved);
     let release_id = default_release_id();
     let public_port = config.server.port;
+    // kamal-proxy `run` ALWAYS binds 443 for its HTTPS listener (regardless of any
+    // app's TLS flag), so a public/HTTP port of 443 would render
+    // `run --http-port 443 --https-port 443` and the proxy would fail to start.
+    // Reject it up front with an actionable message instead of a cryptic runtime
+    // bind failure on the host. Unconditional — 443 is always bound.
+    validate_public_port(public_port).map_err(DeployError::Config)?;
     let proxy = proxy::KamalProxyController::new(resolved.readiness_timeout_secs)
         .with_tls_host(resolved.tls_host.clone());
     let executor = exec::SshExecutor::new(target);
@@ -1309,6 +1334,21 @@ mod tests {
     fn resolved_defaults() -> ResolvedDeployConfig {
         ResolvedDeployConfig::resolve(&DeployConfig::default(), "myapp")
             .expect("deploy config resolves")
+    }
+
+    #[test]
+    fn public_port_443_is_rejected_as_a_proxy_https_collision() {
+        // kamal-proxy always binds 443 for HTTPS, so a public/HTTP port of 443
+        // collides and the proxy can't start — the guard rejects it up front with
+        // an actionable message. It is unconditional (not TLS-gated).
+        let err = validate_public_port(443).expect_err("port 443 must be rejected");
+        assert!(
+            err.contains("cannot be 443") && err.contains("kamal-proxy reserves 443"),
+            "collision message must be actionable, got: {err}",
+        );
+        // A normal public port (the default 80, or any other) is accepted.
+        assert!(validate_public_port(80).is_ok());
+        assert!(validate_public_port(8080).is_ok());
     }
 
     #[test]
