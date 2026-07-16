@@ -44,10 +44,6 @@ pub const DEFAULT_CONTENT_TYPE: &str = "video/mp4";
 /// specify one.
 const DEFAULT_LOCAL_PUBLIC_BASE: &str = "/media";
 
-/// Region used when the S3 config leaves the region blank (matches the Arroyo /
-/// Tigris `auto` default).
-const DEFAULT_S3_REGION: &str = "auto";
-
 /// The location a completed media object was persisted to.
 ///
 /// The generalized form of Arroyo's `StoredVideo`: `backend` is `"local"` or
@@ -73,8 +69,12 @@ pub struct S3MediaStorage {
     pub bucket: String,
     /// Endpoint URL. `None` uses the AWS SDK default endpoint.
     pub endpoint_url: Option<String>,
-    /// Region (e.g. `auto` for Tigris).
-    pub region: String,
+    /// Region, when explicitly configured (e.g. `auto` for Tigris). `None`
+    /// leaves region resolution to the ambient AWS chain (`AWS_REGION`, the
+    /// shared config/profile, IMDS) — the correct behaviour for a generic AWS
+    /// S3 deployment on the SDK default endpoint, where forcing `auto` would
+    /// break signing/resolution.
+    pub region: Option<String>,
     /// Access key id. Empty together with `secret_access_key` selects the
     /// ambient AWS credential chain.
     pub access_key_id: String,
@@ -143,12 +143,14 @@ pub enum MediaStorage {
 impl MediaStorage {
     /// Build a [`MediaStorage`] from a resolved [`MediaStorageConfig`].
     ///
-    /// Defaults applied here: a blank S3 region becomes `auto`; an unset S3
-    /// public base is derived from the bucket + key prefix via the Tigris
-    /// convention ([`default_tigris_public_base`]); an unset local public base
-    /// becomes `/media`. An unset S3 endpoint stays `None` (the SDK default) —
-    /// no Tigris endpoint is hard-coded generically here (the
-    /// `from_arroyo_env` shim is where the Tigris endpoint default lives).
+    /// Defaults applied here: a blank S3 region stays `None` (ambient AWS
+    /// resolution — no generic `auto` default; the Tigris `auto` region is set
+    /// by the `from_arroyo_env` shim); an unset S3 public base is derived from
+    /// the bucket + key prefix via the Tigris convention
+    /// ([`default_tigris_public_base`]); an unset local public base becomes
+    /// `/media`. An unset S3 endpoint stays `None` (the SDK default) — no Tigris
+    /// endpoint is hard-coded generically here (the `from_arroyo_env` shim is
+    /// where the Tigris endpoint default lives).
     ///
     /// # Errors
     ///
@@ -179,9 +181,12 @@ impl MediaStorage {
                     return Err(MediaError::PartialS3Credentials);
                 }
 
-                let region = non_empty(cfg.region.as_deref())
-                    .unwrap_or(DEFAULT_S3_REGION)
-                    .to_owned();
+                // Region is threaded through only when explicitly configured;
+                // an unset region stays `None` so the ambient AWS chain resolves
+                // it. No generic `auto` default here — that value is
+                // Tigris/arroyo-specific and is applied by the `from_arroyo_env`
+                // shim, not this generic path.
+                let region = non_empty(cfg.region.as_deref()).map(ToOwned::to_owned);
                 let key_prefix = cfg.key_prefix.trim_matches('/').to_owned();
                 let public_base_url = non_empty(cfg.public_base_url.as_deref()).map_or_else(
                     || default_tigris_public_base(&bucket, &key_prefix),
@@ -298,20 +303,35 @@ impl MediaStorage {
     /// `{key_prefix}/{key_prefix}/…` that would target the wrong object and leak
     /// the real one.
     ///
-    /// Returns `Some(key)` only for a well-formed S3 URI whose key is non-empty
-    /// after prefix stripping; a local path, a non-`s3://` URI, a degenerate
-    /// URI, or a key that is nothing but the prefix returns `None`, so callers
-    /// never issue a delete against an empty key.
+    /// For the S3 backend the URI's bucket must match the currently-configured
+    /// bucket: a URI from a **different** bucket (a legacy record, or one written
+    /// before `media.storage.bucket` was changed) returns `None`. Otherwise the
+    /// caller-relative key handed back would target the wrong bucket and, fed to
+    /// [`Self::remove_object_if_present`], delete an unrelated object out of the
+    /// currently-configured bucket.
+    ///
+    /// Returns `Some(key)` only for a well-formed S3 URI in this backend's bucket
+    /// whose key is non-empty after prefix stripping; a local path, a non-`s3://`
+    /// URI, a degenerate URI, a foreign-bucket URI, or a key that is nothing but
+    /// the prefix returns `None`, so callers never issue a delete against an empty
+    /// key or the wrong bucket.
     #[must_use]
     pub fn parse_s3_uri_key(&self, uri: &str) -> Option<String> {
         let rest = uri.strip_prefix("s3://")?;
-        let (_bucket, stored_key) = rest.split_once('/')?;
+        let (bucket, stored_key) = rest.split_once('/')?;
         if stored_key.is_empty() {
             return None;
         }
         let relative = match self {
             Self::Local { .. } => stored_key.trim_matches('/').to_owned(),
-            Self::S3(config) => strip_key_prefix(&config.key_prefix, stored_key),
+            Self::S3(config) => {
+                // Refuse a key from a different bucket — deleting it against the
+                // configured bucket would hit an unrelated object.
+                if bucket != config.bucket {
+                    return None;
+                }
+                strip_key_prefix(&config.key_prefix, stored_key)
+            }
         };
         if relative.is_empty() {
             return None;
@@ -459,6 +479,12 @@ impl MediaStorage {
         config
             .client
             .get_or_init(|| async {
+                // Only an explicitly-configured region is threaded in; when
+                // unset, region is resolved from the ambient AWS chain instead
+                // of being forced to a Tigris-specific `auto` that would break a
+                // generic AWS S3 deployment.
+                let explicit_region = non_empty(config.region.as_deref())
+                    .map(|region| Region::new(region.to_owned()));
                 if !config.access_key_id.is_empty() && !config.secret_access_key.is_empty() {
                     let credentials = Credentials::new(
                         config.access_key_id.clone(),
@@ -467,20 +493,39 @@ impl MediaStorage {
                         None,
                         "autumn-media-plugin",
                     );
+                    // Static-credential path builds the S3 config directly, so
+                    // there is no ambient loader to supply a region. Use the
+                    // explicit region when set (e.g. Tigris `auto`), otherwise
+                    // resolve it from the ambient default chain so a generic AWS
+                    // deployment with static keys + `AWS_REGION`/profile works.
+                    let region = match explicit_region {
+                        Some(region) => Some(region),
+                        None => aws_config::defaults(BehaviorVersion::latest())
+                            .load()
+                            .await
+                            .region()
+                            .cloned(),
+                    };
                     let mut builder = aws_sdk_s3::Config::builder()
                         .behavior_version(BehaviorVersion::latest())
-                        .region(Region::new(config.region.clone()))
                         .credentials_provider(credentials)
                         .force_path_style(config.force_path_style);
+                    if let Some(region) = region {
+                        builder = builder.region(region);
+                    }
                     if let Some(endpoint) = &config.endpoint_url {
                         builder = builder.endpoint_url(endpoint);
                     }
                     Client::from_conf(builder.build())
                 } else {
-                    let shared = aws_config::defaults(BehaviorVersion::latest())
-                        .region(Region::new(config.region.clone()))
-                        .load()
-                        .await;
+                    // Ambient-credential path: the default loader already carries
+                    // the ambient region chain, so only override it when a region
+                    // is explicitly configured.
+                    let mut loader = aws_config::defaults(BehaviorVersion::latest());
+                    if let Some(region) = explicit_region {
+                        loader = loader.region(region);
+                    }
+                    let shared = loader.load().await;
                     let mut builder = aws_sdk_s3::config::Builder::from(&shared)
                         .force_path_style(config.force_path_style);
                     if let Some(endpoint) = &config.endpoint_url {
@@ -874,6 +919,23 @@ mod tests {
     }
 
     #[test]
+    fn parse_s3_uri_key_foreign_bucket_is_none() {
+        // A URI naming a DIFFERENT bucket must not yield a key: handing it to
+        // remove_object_if_present would delete an unrelated object out of the
+        // currently-configured bucket.
+        let storage = MediaStorage::from_config(&s3_config(Some("bucket"))).unwrap();
+        assert_eq!(
+            storage.parse_s3_uri_key("s3://other-bucket/media/clips/1.mp4"),
+            None
+        );
+        // The matching-bucket URI still round-trips to the caller-relative key.
+        assert_eq!(
+            storage.parse_s3_uri_key("s3://bucket/media/clips/1.mp4"),
+            Some("clips/1.mp4".to_owned())
+        );
+    }
+
+    #[test]
     fn parse_s3_uri_key_prefix_only_is_none() {
         // A URI whose whole key is exactly the prefix has no caller-relative
         // key, so it is None (callers never delete an empty key).
@@ -1017,13 +1079,14 @@ mod tests {
     }
 
     #[test]
-    fn from_config_s3_with_bucket_defaults_region_and_tigris_base() {
+    fn from_config_s3_with_bucket_no_region_and_tigris_base() {
         let storage = MediaStorage::from_config(&s3_config(Some("my-bucket"))).unwrap();
         match storage {
             MediaStorage::S3(config) => {
                 assert_eq!(config.bucket, "my-bucket");
-                // blank region → "auto"
-                assert_eq!(config.region, DEFAULT_S3_REGION);
+                // blank region stays None on the generic path (ambient-resolved);
+                // no `auto` default here — that is Tigris/arroyo-only.
+                assert_eq!(config.region, None);
                 // unset endpoint stays None (SDK default)
                 assert_eq!(config.endpoint_url, None);
                 // unset public base → tigris fallback using the "media" prefix
@@ -1045,12 +1108,37 @@ mod tests {
         let MediaStorage::S3(config) = MediaStorage::from_config(&cfg).unwrap() else {
             panic!("expected s3 backend");
         };
-        assert_eq!(config.region, "us-east-1");
+        assert_eq!(config.region.as_deref(), Some("us-east-1"));
         assert_eq!(
             config.endpoint_url.as_deref(),
             Some("https://example.r2.cloudflarestorage.com")
         );
         assert_eq!(config.public_base_url, "https://cdn.example.com");
+    }
+
+    #[test]
+    fn from_config_s3_no_region_yields_none() {
+        // The generic S3 path leaves region unset (`None`) so the ambient AWS
+        // chain (AWS_REGION / profile / IMDS) resolves it — a generic AWS
+        // deployment on the SDK default endpoint is not signed for `auto`.
+        let MediaStorage::S3(config) = MediaStorage::from_config(&s3_config(Some("b"))).unwrap()
+        else {
+            panic!("expected s3 backend");
+        };
+        assert_eq!(config.region, None);
+    }
+
+    #[test]
+    fn from_config_s3_threads_explicit_auto_region() {
+        // The arroyo/Tigris shim resolves region to `auto` in the config; a
+        // `Some("auto")` region must be threaded through verbatim (only the
+        // no-region generic path yields `None`).
+        let mut cfg = s3_config(Some("b"));
+        cfg.region = Some("auto".to_owned());
+        let MediaStorage::S3(config) = MediaStorage::from_config(&cfg).unwrap() else {
+            panic!("expected s3 backend");
+        };
+        assert_eq!(config.region.as_deref(), Some("auto"));
     }
 
     #[test]
@@ -1177,5 +1265,21 @@ mod tests {
         let storage = MediaStorage::from_config(&cfg).unwrap();
         // Should return a constructed client; nothing here reaches the network.
         let _client = storage.build_client().await;
+    }
+
+    #[tokio::test]
+    async fn build_client_threads_explicit_region_into_client() {
+        // An explicitly-configured region must be threaded into the built S3
+        // client's config (e.g. Tigris `auto`, or a real AWS region).
+        let mut cfg = s3_config(Some("test-bucket"));
+        cfg.region = Some("eu-west-2".to_owned());
+        cfg.endpoint_url = Some("http://127.0.0.1:9".to_owned());
+        cfg.force_path_style = true;
+        let storage = MediaStorage::from_config(&cfg).unwrap();
+        let client = storage.build_client().await;
+        assert_eq!(
+            client.config().region().map(Region::as_ref),
+            Some("eu-west-2")
+        );
     }
 }

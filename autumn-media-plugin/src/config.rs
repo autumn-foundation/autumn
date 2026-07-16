@@ -622,10 +622,11 @@ impl MediaConfig {
         // `highlights`, and an unset public base → the Tigris bucket URL derived
         // from the (resolved) bucket + key prefix. These are applied ONLY for
         // the S3 backend and ONLY in this compatibility shim — the generic
-        // `[media]` path keeps the neutral `MediaConfig` defaults (blank region
-        // → `auto` and the Tigris public-base fallback are re-derived at
-        // `MediaStorage::from_config` time; the endpoint and key-prefix defaults
-        // are Arroyo-specific and live here).
+        // `[media]` path keeps the neutral `MediaConfig` defaults (an unset
+        // region stays `None`/ambient-resolved and the Tigris public-base
+        // fallback is re-derived at `MediaStorage::from_config` time; the `auto`
+        // region, endpoint, and key-prefix defaults are Arroyo-specific and are
+        // set here, so the Tigris path always carries region `Some("auto")`).
         if config.storage.backend == MediaStorageBackend::S3 {
             if config.storage.region.is_none() {
                 config.storage.region = Some("auto".to_owned());
