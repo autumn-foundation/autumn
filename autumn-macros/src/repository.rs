@@ -1683,7 +1683,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             #[allow(clippy::too_many_arguments)]
             pub fn __autumn_apply_dependent_on_conn<'__dep>(
                 &'__dep self,
-                conn: &'__dep mut ::autumn_web::reexports::diesel_async::AsyncPgConnection,
+                conn: &'__dep mut ::autumn_web::RuntimeConnection,
                 __fk_column: &'__dep str,
                 __parent_id: i64,
                 __action: ::autumn_web::repository::DependentAction,
@@ -2967,7 +2967,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 &self,
             ) -> ::autumn_web::AutumnResult<
                 ::autumn_web::reexports::diesel_async::pooled_connection::deadpool::Object<
-                    ::autumn_web::reexports::diesel_async::AsyncPgConnection,
+                    ::autumn_web::RuntimeConnection,
                 >,
             > {
                 self.__autumn_acquire_conn().await
@@ -3049,7 +3049,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 #[must_use]
                 pub fn __autumn_test_with_broadcast(
                     pool: ::autumn_web::reexports::diesel_async::pooled_connection::deadpool::Pool<
-                        ::autumn_web::reexports::diesel_async::AsyncPgConnection,
+                        ::autumn_web::RuntimeConnection,
                     >,
                     broadcast: ::autumn_web::channels::Broadcast,
                 ) -> Self {
@@ -3126,7 +3126,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             #[must_use]
             pub fn with_pool_untracked(
                 pool: ::autumn_web::reexports::diesel_async::pooled_connection::deadpool::Pool<
-                    ::autumn_web::reexports::diesel_async::AsyncPgConnection,
+                    ::autumn_web::RuntimeConnection,
                 >,
             ) -> Self {
                 #register_hooks
@@ -3197,7 +3197,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
         let struct_fields = quote! {
             pool: ::autumn_web::reexports::diesel_async::pooled_connection::deadpool::Pool<
-                ::autumn_web::reexports::diesel_async::AsyncPgConnection,
+                ::autumn_web::RuntimeConnection,
             >,
             hooks: #hooks_ident,
             #idempotency_struct_field
@@ -6794,7 +6794,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
         let struct_fields = quote! {
             pool: ::autumn_web::reexports::diesel_async::pooled_connection::deadpool::Pool<
-                ::autumn_web::reexports::diesel_async::AsyncPgConnection,
+                ::autumn_web::RuntimeConnection,
             >,
             #tenant_struct_field
             #shards_struct_field
@@ -8631,20 +8631,91 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             };
 
             let size_check = if config.tenant_scoped {
+                // Tenant-scoped path: replace the old coarse post-upsert size check
+                // with a drop-triggered, tenant-scoped RECONCILIATION (ref #1963 +
+                // the Codex P2 fail-closed follow-up).
+                //
+                // The versioned tenant-scoped upsert SQL is
+                //   INSERT ... ON CONFLICT (id) DO UPDATE SET ..., lock_version = lock_version + 1
+                //   WHERE lock_version = excluded.lock_version AND tenant_id = $t RETURNING *
+                // so a row can be silently dropped (not RETURNed) for EITHER of two
+                // reasons: (1) a tenant_id mismatch — a cross-tenant row we must NOT
+                // touch and must stay SILENT about (this is exactly the #1963
+                // false-positive we are avoiding); or (2) a lock_version mismatch — a
+                // genuine SAME-tenant optimistic-lock conflict that must be LOUD (409).
+                //
+                // The pre-upsert per-row lock check above only sees rows present in
+                // `existing_rows` at load time. A row inserted by a DIFFERENT write
+                // path (raw insert / save / save_many / another repo — none of which
+                // take this upsert's `pg_advisory_xact_lock`, which only versioned
+                // `upsert_many` acquires) BETWEEN our FOR UPDATE snapshot and the
+                // upsert is invisible to it. With the old size check gone entirely, a
+                // real same-tenant lock conflict on such a raced-in row was returned
+                // as `Ok` instead of a 409 — the Codex P2 bug.
+                //
+                // The fix is fail-closed AND cannot reintroduce the #1963 false
+                // positive: only when a drop actually happened do we re-select the
+                // dropped ids UNDER THE CURRENT TENANT SCOPE (mirroring `load_expr`).
+                // If a dropped id is STILL PRESENT under this tenant, its tenant_id
+                // matched, so the only reason it was dropped is a lock_version
+                // mismatch (reason 2) → we fail closed with the SAME `Conflict` shape
+                // the pre-upsert detector emits. If NONE of the dropped ids are
+                // present under this tenant, every drop was cross-tenant/absent
+                // (reason 1) → we stay SILENT (`Ok`), preserving the #1963 behavior.
+                // Because it fires ONLY when a dropped id still exists under the
+                // current tenant, a cross-tenant row — filtered out of this re-select
+                // by construction — can never trip it.
+                //
+                // Gated at runtime by `has_lock` (mirroring the pre-upsert detector):
+                // a non-versioned tenant-scoped model has no `lock_version`, so its
+                // drops are ALWAYS cross-tenant and this reconciliation never fires,
+                // leaving that path a silent no-op exactly as #1963 requires.
                 quote! {
-                    // A tenant-scoped upsert silently filters rows belonging to
-                    // another tenant (the ON CONFLICT ... WHERE tenant_id = $t
-                    // upsert never touches them), mirroring single-op cross-tenant
-                    // scoping and the sibling bulk update_many/delete_many. Only a
-                    // genuine optimistic-lock conflict on a versioned record is loud.
                     if has_lock && upserted.len() != records.len() {
-                        return Err(::autumn_web::AutumnError::conflict_msg(
-                            format!(
-                                "Conflict: only {} of {} records were upserted (potential lock-version/optimistic lock or tenant conflict)",
-                                upserted.len(),
-                                records.len()
-                            )
-                        ));
+                        let __autumn_done: ::std::collections::HashSet<_> =
+                            upserted.iter().map(|r| r.id).collect();
+                        let __autumn_dropped_ids: Vec<_> = records
+                            .iter()
+                            .map(|r| r.id)
+                            .filter(|id| !__autumn_done.contains(id))
+                            .collect();
+                        let __autumn_still_present: Vec<#model_name> =
+                            if let ::core::option::Option::Some(ref t) = tenant_id {
+                                #table_ident::table
+                                    .filter(#table_ident::id.eq_any(&__autumn_dropped_ids))
+                                    .filter(#table_ident::tenant_id.eq(t.clone()))
+                                    .for_update()
+                                    .load::<#model_name>(conn)
+                                    .await
+                                    .map_err(::autumn_web::AutumnError::from)?
+                            } else {
+                                #table_ident::table
+                                    .filter(#table_ident::id.eq_any(&__autumn_dropped_ids))
+                                    .for_update()
+                                    .load::<#model_name>(conn)
+                                    .await
+                                    .map_err(::autumn_web::AutumnError::from)?
+                            };
+                        // NOTE: `.iter().next()` (not `.first()`) — the generated
+                        // block imports `diesel_async::RunQueryDsl`, whose `first`
+                        // trait method matches on the `&Vec<_>` receiver before the
+                        // slice inherent `first`, which would resolve to the diesel
+                        // query builder and blow up trait resolution (`LimitDsl`).
+                        if let ::core::option::Option::Some(existing) = __autumn_still_present.iter().next() {
+                            if let ::core::option::Option::Some(db_lock) = existing.__autumn_lock_version_actual() {
+                                if let ::core::option::Option::Some(incoming) = records.iter().find(|r| r.id == existing.id) {
+                                    if let ::core::option::Option::Some(incoming_lock) = incoming.__autumn_lock_version_actual() {
+                                        return Err(::autumn_web::AutumnError::conflict(
+                                            ::autumn_web::RepositoryError::Conflict {
+                                                id: existing.id,
+                                                expected_version: incoming_lock,
+                                                actual_version: ::core::option::Option::Some(db_lock),
+                                            },
+                                        ));
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             } else {
@@ -14551,7 +14622,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             pub fn __autumn_write_pool(
                 &self,
             ) -> &::autumn_web::reexports::diesel_async::pooled_connection::deadpool::Pool<
-                ::autumn_web::reexports::diesel_async::AsyncPgConnection,
+                ::autumn_web::RuntimeConnection,
             > {
                 &self.pool
             }
@@ -14578,7 +14649,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 &self,
             ) -> ::autumn_web::AutumnResult<
                 ::autumn_web::reexports::diesel_async::pooled_connection::deadpool::Object<
-                    ::autumn_web::reexports::diesel_async::AsyncPgConnection,
+                    ::autumn_web::RuntimeConnection,
                 >,
             > {
                 let result = self.__autumn_acquire_from(&self.pool).await;
@@ -14600,7 +14671,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 &self,
             ) -> ::autumn_web::AutumnResult<
                 ::autumn_web::reexports::diesel_async::pooled_connection::deadpool::Object<
-                    ::autumn_web::reexports::diesel_async::AsyncPgConnection,
+                    ::autumn_web::RuntimeConnection,
                 >,
             > {
                 // Match by reference to avoid cloning `ReadRoute` on the common
@@ -14637,11 +14708,11 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             async fn __autumn_acquire_from(
                 &self,
                 pool: &::autumn_web::reexports::diesel_async::pooled_connection::deadpool::Pool<
-                    ::autumn_web::reexports::diesel_async::AsyncPgConnection,
+                    ::autumn_web::RuntimeConnection,
                 >,
             ) -> ::autumn_web::AutumnResult<
                 ::autumn_web::reexports::diesel_async::pooled_connection::deadpool::Object<
-                    ::autumn_web::reexports::diesel_async::AsyncPgConnection,
+                    ::autumn_web::RuntimeConnection,
                 >,
             > {
                 use ::autumn_web::reexports::diesel_async::RunQueryDsl as _;
@@ -14690,7 +14761,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             where
                 F: for<'c> ::core::ops::FnOnce(
                     #model_name,
-                    &'c mut ::autumn_web::reexports::diesel_async::AsyncPgConnection,
+                    &'c mut ::autumn_web::RuntimeConnection,
                 ) -> ::autumn_web::reexports::scoped_futures::ScopedBoxFuture<'c, 'c, ::autumn_web::AutumnResult<T>>
                     + ::core::marker::Send + 'static,
                 T: ::core::marker::Send + 'static,
@@ -18421,29 +18492,92 @@ mod tests {
     }
 
     #[test]
-    fn repository_macro_tenant_scoped_upsert_many_filters_cross_tenant_silently_for_non_versioned()
-    {
+    fn repository_macro_tenant_scoped_upsert_many_reconciles_dropped_rows_fail_closed() {
         let generated = repository_macro(
             quote! { Post, tenant_scoped },
             quote! { pub trait PostRepository {} },
         )
         .to_string();
 
-        // Silent cross-tenant filtering applies to the NON-versioned tenant-scoped
-        // path only (this `Post, tenant_scoped` repo has no lock): the SQL
-        // ON CONFLICT ... WHERE tenant_id = $t never touches cross-tenant rows, so
-        // it must NOT emit the old `!has_lock` partial rejection — matching
-        // single-op cross-tenant scoping and sibling bulk update_many/delete_many.
-        // A versioned (`has_lock`) repo is intentionally different: its
-        // optimistic-lock conflict check stays loud (still 409s), so the retained
-        // `has_lock && ...` branch below must remain present.
+        // The tenant-scoped path must NOT emit the old `!has_lock` partial
+        // rejection — a cross-tenant-filtered row is dropped by the SQL
+        // ON CONFLICT ... WHERE tenant_id = $t predicate and must stay silent,
+        // matching single-op cross-tenant scoping and sibling update_many/delete_many.
         assert!(
             !generated.contains("! has_lock && upserted . len () != records . len ()"),
             "tenant-scoped upsert_many must not loudly reject cross-tenant-filtered partial upserts: {generated}"
         );
+
+        // (a) #1963 + Codex P2 fail-closed reconciliation: on a drop, the
+        // tenant-scoped path re-selects the DROPPED ids UNDER THE CURRENT TENANT
+        // SCOPE and only then decides. The distinctive reconciliation tokens must
+        // be present.
         assert!(
-            generated.contains("has_lock && upserted . len () != records . len ()"),
-            "tenant-scoped upsert_many must still reject genuine optimistic-lock conflicts: {generated}"
+            generated.contains("__autumn_dropped_ids")
+                && generated.contains("__autumn_still_present"),
+            "tenant-scoped upsert_many must emit the drop-triggered tenant-scoped reconciliation: {generated}"
+        );
+
+        // (b) It must NOT be the OLD blanket "409 on ANY size mismatch" behavior:
+        // the size-mismatch guard must lead into a tenant-scoped RE-SELECT of the
+        // dropped ids BEFORE any Conflict is returned — i.e. the ordering is
+        //   guard  <  dropped-id computation  <  tenant re-select  <  Conflict return
+        // and a `tenant_id . eq` tenant filter sits inside that reconciliation.
+        let guard_pos = generated
+            .find("has_lock && upserted . len () != records . len ()")
+            .expect("reconciliation must be guarded by the size-mismatch check");
+        let dropped_pos = generated
+            .find("__autumn_dropped_ids")
+            .expect("reconciliation must compute the dropped ids");
+        let still_present_pos = generated
+            .find("__autumn_still_present")
+            .expect("reconciliation must re-select the dropped ids under tenant scope");
+        // The Conflict returned by the reconciliation is the one that appears
+        // AFTER the tenant re-select (the earlier Conflict is the pre-upsert
+        // detector). Its presence proves we fail closed on a genuine same-tenant
+        // lock conflict discovered post-upsert.
+        let recon_conflict_rel = generated[still_present_pos..]
+            .find("RepositoryError :: Conflict")
+            .expect("reconciliation must fail closed with a Conflict once a dropped row is still present under the tenant");
+        let recon_conflict_pos = still_present_pos + recon_conflict_rel;
+        assert!(
+            guard_pos < dropped_pos
+                && dropped_pos < still_present_pos
+                && still_present_pos < recon_conflict_pos,
+            "reconciliation must re-select dropped ids under tenant scope before returning a Conflict: {generated}"
+        );
+        // The reconciliation's re-select must be tenant-scoped (a second
+        // `tenant_id . eq` filter and a FOR UPDATE lock sit between the guard and
+        // the Conflict return), so a cross-tenant row is filtered out and cannot
+        // reintroduce the #1963 false positive.
+        let recon_body = &generated[guard_pos..recon_conflict_pos];
+        assert!(
+            recon_body.contains("tenant_id . eq") && recon_body.contains("for_update"),
+            "reconciliation re-select must filter by tenant and lock FOR UPDATE: {generated}"
+        );
+
+        // (c) Genuine same-tenant optimistic-lock conflicts are ALSO caught up
+        // front by the PRE-upsert per-row lock detector (operating on the
+        // tenant-filtered, FOR UPDATE `existing_rows`), which must remain present.
+        // `incoming_lock != db_lock` is unique to that pre-upsert detector.
+        assert!(
+            generated.contains("incoming_lock != db_lock")
+                && generated.contains("expected_version : incoming_lock"),
+            "tenant-scoped upsert_many must retain the pre-upsert optimistic-lock conflict detector: {generated}"
+        );
+
+        // (d) The NON-tenant branch is unchanged: it still emits the coarse
+        // post-upsert size check with its `conflict_msg`. (Generated from a
+        // non-tenant-scoped versioned repo so the `else` branch is selected.)
+        let non_tenant = repository_macro(
+            quote! { Post, versioned = true },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        assert!(
+            non_tenant.contains("has_lock && upserted . len () != records . len ()")
+                && non_tenant.contains("potential lock-version/optimistic lock conflict"),
+            "non-tenant upsert_many must retain its coarse post-upsert size check: {non_tenant}"
         );
     }
 

@@ -40,16 +40,15 @@ jobs:
         run: cargo clippy -p autumn-web --features "ws,mail,offline-sync,redis" --all-targets -- -D warnings
       - name: Panic-free request-path gate
         run: ./scripts/check-panic-gate.sh
-      - name: Accessibility gate (raw html! escape hatches in framework source)
+      - name: Accessibility gate (raw html! escape hatches across the repo)
         # `autumn a11y verify` statically audits raw `html!` markup for fields
         # that bypass the typed a11y primitives and lack an accessible name.
-        # Scoped to the framework's own source (autumn/src + autumn-cli/src);
-        # examples/ and the admin plugin are tracked separately. The verifier
-        # takes a single path, so scan each dir in its own invocation; either
-        # non-zero exit fails the job.
-        run: |
-          cargo run -p autumn-cli --bin autumn -- a11y verify autumn/src
-          cargo run -p autumn-cli --bin autumn -- a11y verify autumn-cli/src
+        # Scoped to the whole repo root now that the framework source, the admin
+        # plugin, and every example are clean (issue #1934). The scanner skips
+        # `target/`, dot-dirs, and `tests/` directories (test scaffolding and the
+        # committed red/green fixtures), so a single invocation over `.` fails the
+        # job on any real product finding.
+        run: cargo run -p autumn-cli --bin autumn -- a11y verify .
 
   test:
     name: Test (${{ matrix.os }})
@@ -103,7 +102,7 @@ jobs:
           ssh -V
       - name: Run Docker-dependent tests
         if: runner.os == 'Linux'
-        timeout-minutes: 30
+        timeout-minutes: 45
         run: |
           cargo test -p autumn-web --test db_hooks_lifecycle -- --ignored
           cargo test -p autumn-web --test repository_shard_replica_routing -- --ignored
@@ -143,8 +142,17 @@ jobs:
           # `#[cfg(feature = "offline-sync")]` (not a default feature), so the
           # workspace test run above compiles them out; run them here. Same
           # feature set as the sweep below so the binary is compiled once.
-          cargo test -p autumn-web --features "test-support,offline-sync" --test integration_tests offline_sync
-          cargo test -p autumn-web --features "test-support,offline-sync" --test integration_tests -- \
+          #
+          # The feature set also enables `ws`, `mail`, and `redis` (#1945): those
+          # gate previously-unreachable testcontainer-managed Docker `#[ignore]`d
+          # tests (the `ws` live_broadcast OOB-fragment suite, the `redis` worker-
+          # gating/dedicated-capacity/rate-limit suites, and the `mail` newsletter
+          # unsubscribe test) which never compiled into this binary and so were
+          # never swept. All are Postgres/Redis testcontainer-managed, so no CI
+          # `services:` block is needed. Chromium/browser tests stay OUT — they
+          # live behind `system-tests` and require a browser this runner lacks.
+          cargo test -p autumn-web --features "test-support,offline-sync,ws,mail,redis" --test integration_tests offline_sync
+          cargo test -p autumn-web --features "test-support,offline-sync,ws,mail,redis" --test integration_tests -- \
             --ignored \
             --test-threads=1 \
             --skip per_request_overhead_is_under_50_microseconds_p99 \

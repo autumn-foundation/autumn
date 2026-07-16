@@ -46,6 +46,10 @@ auth.sessions.last_seen_update_secs
 auth.sessions.revoke_on_credential_change
 auth.step_up
 auth.step_up.default_max_age_secs
+auth.webauthn
+auth.webauthn.rp_id
+auth.webauthn.rp_name
+auth.webauthn.rp_origin
 backup
 backup.offsite
 backup.offsite.allow_shared_bucket

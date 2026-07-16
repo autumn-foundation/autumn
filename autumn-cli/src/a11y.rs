@@ -314,7 +314,14 @@ fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
         let name = entry.file_name();
         let name = name.to_string_lossy();
         if file_type.is_dir() {
-            if name == "target" || name.starts_with('.') {
+            // Skip build output, dot-dirs, and any `tests` directory. Test code
+            // (integration tests, system-test scaffolding, committed fixtures)
+            // is not shipped product markup, so a raw-`html!` defect there is not
+            // a product accessibility bug (issue #1934). The skip is scan-root
+            // RELATIVE: the a11y-verify integration test passes a fixture dir as
+            // the scan root itself, so no `tests` path component exists below
+            // that root and the fixture is still scanned/flagged there.
+            if name == "target" || name == "tests" || name.starts_with('.') {
                 continue;
             }
             collect_rs_files(&path, out);
@@ -339,6 +346,15 @@ fn find_html_blocks(stream: &TokenStream, file: &str, scan: &mut Scan) {
     let trees: Vec<TokenTree> = stream.clone().into_iter().collect();
     let mut i = 0;
     while i < trees.len() {
+        // A `#[cfg(test)]`-annotated item (`mod tests { … }`, a test `fn`) is
+        // test-only scaffolding, not shipped product markup — an inline
+        // `html!` defect inside it is intentional test data, not a product
+        // accessibility bug (issue #1934, the #1930 `form.rs` case). Skip the
+        // whole item without descending into its body.
+        if is_cfg_test_attr(&trees, i) {
+            i = skip_cfg_test_item(&trees, i + 2);
+            continue;
+        }
         if let TokenTree::Ident(ident) = &trees[i]
             && *ident == "html"
             && matches!(trees.get(i + 1), Some(TokenTree::Punct(p)) if p.as_char() == '!')
@@ -368,6 +384,61 @@ fn find_html_blocks(stream: &TokenStream, file: &str, scan: &mut Scan) {
         }
         i += 1;
     }
+}
+
+/// Whether `trees[i]` begins a `#[cfg(test)]` outer attribute — a `#` punct
+/// immediately followed by a `[cfg(test)]` bracket group. Such an attribute
+/// precedes a test-only item whose body is scaffolding the scanner must not
+/// descend into (issue #1934). Matching is deliberately precise (`cfg` then a
+/// parenthesized single `test` ident): it never fires on `#[cfg(not(test))]`
+/// (production code) or `#[cfg(feature = "…")]`, so it can only ever exclude a
+/// genuine test item.
+fn is_cfg_test_attr(trees: &[TokenTree], i: usize) -> bool {
+    let Some(TokenTree::Punct(p)) = trees.get(i) else {
+        return false;
+    };
+    if p.as_char() != '#' {
+        return false;
+    }
+    let Some(TokenTree::Group(g)) = trees.get(i + 1) else {
+        return false;
+    };
+    if g.delimiter() != Delimiter::Bracket {
+        return false;
+    }
+    let inner: Vec<TokenTree> = g.stream().into_iter().collect();
+    matches!(inner.first(), Some(TokenTree::Ident(id)) if *id == "cfg")
+        && matches!(
+            inner.get(1),
+            Some(TokenTree::Group(paren))
+                if paren.delimiter() == Delimiter::Parenthesis
+                    && is_single_test_ident(&paren.stream())
+        )
+}
+
+/// Whether a token stream is exactly the single ident `test` (the body of a
+/// `cfg(test)` predicate).
+fn is_single_test_ident(stream: &TokenStream) -> bool {
+    let trees: Vec<TokenTree> = stream.clone().into_iter().collect();
+    trees.len() == 1 && matches!(&trees[0], TokenTree::Ident(id) if *id == "test")
+}
+
+/// Advance past a `#[cfg(test)]`-annotated item without descending into its
+/// body, starting at `start` (the token just past the attribute's bracket
+/// group). The item body is the first top-level brace group (`mod tests { … }`,
+/// `fn … { … }`); a body-less item (`#[cfg(test)] use …;`) ends at its `;`.
+/// Not descending into that brace is the whole point — any `html!` markup
+/// inside is intentionally excluded from the scan.
+fn skip_cfg_test_item(trees: &[TokenTree], start: usize) -> usize {
+    let mut i = start;
+    while i < trees.len() {
+        match &trees[i] {
+            TokenTree::Group(g) if g.delimiter() == Delimiter::Brace => return i + 1,
+            TokenTree::Punct(p) if p.as_char() == ';' => return i + 1,
+            _ => i += 1,
+        }
+    }
+    i
 }
 
 /// Whether an `html!` body is JSX/Yew-style angle-bracket markup rather than
@@ -2879,5 +2950,80 @@ mod tests {
             strict: false,
         };
         assert_eq!(run_in(dir.path(), opts), 0);
+    }
+
+    // ── Test-scaffolding skips (issue #1934) ───────────────────────────────
+
+    #[test]
+    fn defect_in_inline_cfg_test_module_is_not_flagged() {
+        // A raw-`html!` defect inside a `#[cfg(test)] mod tests { … }` is test
+        // scaffolding, not shipped product markup, so it must not be flagged —
+        // while a real product defect in the same file still is (issue #1934,
+        // the #1930 `form.rs` case).
+        let src = r#"
+            fn view() { let _ = html! { img src="product.png"; }; }
+            #[cfg(test)]
+            mod tests {
+                fn t() { let _ = html! { img src="scaffold.png"; }; }
+            }
+        "#;
+        let f = findings_for(src);
+        assert_eq!(f.len(), 1, "only the product defect should flag: {f:?}");
+        assert_eq!(f[0].rule_id, "image-alt");
+    }
+
+    #[test]
+    fn defect_in_inline_cfg_test_fn_is_not_flagged() {
+        // The `#[cfg(test)]` skip also covers a bare test `fn`, not just `mod`.
+        let src = r"
+            #[cfg(test)]
+            fn helper() { let _ = html! { button { } }; }
+        ";
+        assert!(findings_for(src).is_empty(), "{:?}", findings_for(src));
+    }
+
+    #[test]
+    fn cfg_not_test_module_is_still_scanned() {
+        // The skip is precise: `#[cfg(not(test))]` is production code and its
+        // defects must still be flagged (only a literal `cfg(test)` is skipped).
+        let src = r#"
+            #[cfg(not(test))]
+            mod prod {
+                fn v() { let _ = html! { img src="x.png"; }; }
+            }
+        "#;
+        let f = findings_for(src);
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert_eq!(f[0].rule_id, "image-alt");
+    }
+
+    #[test]
+    fn defect_under_tests_subdir_is_skipped_but_flagged_at_root() {
+        // The `tests/`-directory skip is scan-root RELATIVE: the SAME defect is
+        // ignored under a `tests/` subdir of the scan root but flagged when it
+        // sits at the root — proving the skip never neuters the fixture-dir
+        // integration test, which passes a fixture dir AS the scan root
+        // (issue #1934).
+        let dir = tempfile::tempdir().unwrap();
+        let opts = A11yVerifyOptions {
+            format: OutputFormat::Text,
+            strict: false,
+        };
+
+        let tests_dir = dir.path().join("tests");
+        std::fs::create_dir(&tests_dir).unwrap();
+        std::fs::write(tests_dir.join("view.rs"), wrap(r#"img src="x.png";"#)).unwrap();
+        assert_eq!(
+            run_in(dir.path(), opts),
+            0,
+            "a defect under a tests/ subdir must not be flagged",
+        );
+
+        std::fs::write(dir.path().join("view.rs"), wrap(r#"img src="x.png";"#)).unwrap();
+        assert_eq!(
+            run_in(dir.path(), opts),
+            1,
+            "the same defect at the scan root must be flagged",
+        );
     }
 }

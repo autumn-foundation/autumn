@@ -586,6 +586,12 @@ pub use db::Db;
 #[cfg(feature = "db")]
 pub use db::{IsolationLevel, TxOptions, savepoint};
 
+/// The runtime database connection type (Postgres by default; `SQLite` under the
+/// `sqlite` feature). Named by generated `#[repository]`/`#[model]` code as
+/// `::autumn_web::RuntimeConnection`. See [`db::RuntimeConnection`].
+#[cfg(feature = "db")]
+pub use db::RuntimeConnection;
+
 /// Framework error type and result alias.
 ///
 /// [`AutumnError`] wraps any `Error + Send + Sync` with an HTTP status code.

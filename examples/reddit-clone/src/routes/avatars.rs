@@ -97,6 +97,7 @@ pub async fn avatar_form(
                      class="space-y-3" {
                     input type="hidden" name="_csrf" value=(csrf.token());
                     input type="file" name="avatar" accept="image/png,image/jpeg,image/webp"
+                          aria-label="Choose avatar image"
                           required class="block w-full text-sm";
                     button type="submit"
                            class="bg-orange-500 text-white py-2 px-4 rounded font-medium \
