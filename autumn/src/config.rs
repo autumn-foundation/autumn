@@ -152,6 +152,8 @@
 //! | `AUTUMN_AUTH__LOCKOUT__THRESHOLD` | `auth.lockout.threshold` | `i32` |
 //! | `AUTUMN_AUTH__LOCKOUT__WINDOW_SECS` | `auth.lockout.window_secs` | `u64` |
 //! | `AUTUMN_AUTH__LOCKOUT__COOLOFF_SECS` | `auth.lockout.cooloff_secs` | `u64` |
+//! | `AUTUMN_AUTH__MAGIC_LINK__TTL_MINUTES` | `auth.magic_link.ttl_minutes` | `u64` |
+//! | `AUTUMN_AUTH__MAGIC_LINK__EMAIL_COOLDOWN_SECS` | `auth.magic_link.email_cooldown_secs` | `u64` |
 //! | `AUTUMN_TIME_ZONE__IDENTIFIER` | `time_zone.identifier` | IANA id `String` |
 
 use std::path::{Path, PathBuf};
@@ -4222,6 +4224,16 @@ impl AutumnConfig {
             env,
             "AUTUMN_AUTH__REMEMBER__COOKIE_NAME",
             &mut self.auth.remember.cookie_name,
+        );
+        parse_env(
+            env,
+            "AUTUMN_AUTH__MAGIC_LINK__TTL_MINUTES",
+            &mut self.auth.magic_link.ttl_minutes,
+        );
+        parse_env(
+            env,
+            "AUTUMN_AUTH__MAGIC_LINK__EMAIL_COOLDOWN_SECS",
+            &mut self.auth.magic_link.email_cooldown_secs,
         );
         #[cfg(feature = "oauth2")]
         {
@@ -9326,6 +9338,60 @@ path = "/healthz"
         let mut config = AutumnConfig::default();
         config.apply_env_overrides_with_env(&env);
         assert_eq!(config.database.pool_size, 10);
+    }
+
+    // ── auth.magic_link env overrides ─────────────────────────────────────────
+
+    #[test]
+    fn env_override_magic_link_ttl_minutes() {
+        let env = MockEnv::new().with("AUTUMN_AUTH__MAGIC_LINK__TTL_MINUTES", "45");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        assert_eq!(config.auth.magic_link.ttl_minutes, 45);
+    }
+
+    #[test]
+    fn env_override_magic_link_email_cooldown_secs() {
+        let env = MockEnv::new().with("AUTUMN_AUTH__MAGIC_LINK__EMAIL_COOLDOWN_SECS", "120");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        assert_eq!(config.auth.magic_link.email_cooldown_secs, 120);
+    }
+
+    #[test]
+    fn env_override_magic_link_overrides_toml_value() {
+        let env = MockEnv::new()
+            .with("AUTUMN_AUTH__MAGIC_LINK__TTL_MINUTES", "45")
+            .with("AUTUMN_AUTH__MAGIC_LINK__EMAIL_COOLDOWN_SECS", "120");
+        let mut config = AutumnConfig::default();
+        // Simulate values loaded from autumn.toml.
+        config.auth.magic_link.ttl_minutes = 30;
+        config.auth.magic_link.email_cooldown_secs = 200;
+        config.apply_env_overrides_with_env(&env);
+        assert_eq!(config.auth.magic_link.ttl_minutes, 45);
+        assert_eq!(config.auth.magic_link.email_cooldown_secs, 120);
+    }
+
+    #[test]
+    fn env_unset_leaves_magic_link_toml_value_intact() {
+        let env = MockEnv::new();
+        let mut config = AutumnConfig::default();
+        // Simulate values loaded from autumn.toml.
+        config.auth.magic_link.ttl_minutes = 30;
+        config.auth.magic_link.email_cooldown_secs = 200;
+        config.apply_env_overrides_with_env(&env);
+        assert_eq!(config.auth.magic_link.ttl_minutes, 30);
+        assert_eq!(config.auth.magic_link.email_cooldown_secs, 200);
+    }
+
+    #[test]
+    fn env_override_invalid_magic_link_ttl_minutes_ignored() {
+        let env = MockEnv::new().with("AUTUMN_AUTH__MAGIC_LINK__TTL_MINUTES", "not_a_number");
+        let mut config = AutumnConfig::default();
+        // Simulate a value loaded from autumn.toml.
+        config.auth.magic_link.ttl_minutes = 30;
+        config.apply_env_overrides_with_env(&env);
+        assert_eq!(config.auth.magic_link.ttl_minutes, 30);
     }
 
     // ── startup_wait_secs ─────────────────────────────────────────────────────
