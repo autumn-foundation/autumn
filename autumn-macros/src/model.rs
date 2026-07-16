@@ -4932,7 +4932,7 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         ::autumn_web::reexports::diesel::helper_types::IntoBoxed<
             '__lq,
             #table_ident::table,
-            ::autumn_web::reexports::diesel::pg::Pg,
+            ::autumn_web::RuntimeBackend,
         >
     };
     // Single primary key used for the default order + tie-break. Absent for
@@ -5167,7 +5167,7 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             #[doc(hidden)]
             pub fn __autumn_upsert_set() -> impl ::autumn_web::reexports::diesel::query_builder::AsChangeset<
                 Target = #table_ident::table,
-                Changeset = impl ::autumn_web::reexports::diesel::query_builder::QueryFragment<::autumn_web::reexports::diesel::pg::Pg> + ::core::marker::Send + ::core::marker::Sync + 'static
+                Changeset = impl ::autumn_web::reexports::diesel::query_builder::QueryFragment<::autumn_web::RuntimeBackend> + ::core::marker::Send + ::core::marker::Sync + 'static
             > + ::core::marker::Send + ::core::marker::Sync + 'static {
                 use ::autumn_web::reexports::diesel::ExpressionMethods as _;
                 (#(#upsert_columns,)*)
@@ -5182,16 +5182,46 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 use ::autumn_web::reexports::diesel::prelude::*;
                 use ::autumn_web::reexports::diesel_async::RunQueryDsl;
 
-                let stmt = ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
-                    // Owned `Vec` (not `&[Self]`): encrypted columns use diesel
-                    // `serialize_as`, which only implements `Insertable` for owned
-                    // values. `to_vec()` also works for plain models.
-                    .values(chunk.to_vec())
-                    .on_conflict(#table_ident::id)
-                    .do_update()
-                    .set(Self::__autumn_upsert_set());
+                // Postgres builds one batched `INSERT … ON CONFLICT … DO UPDATE …
+                // RETURNING` over the whole chunk; SQLite cannot express a
+                // multi-row `VALUES` with the `DEFAULT` keyword (`BatchInsert<…,
+                // false>` has no `QueryFragment<Sqlite>`), so it upserts row by
+                // row, each `INSERT … ON CONFLICT(id) DO UPDATE … RETURNING`
+                // (valid single-row on SQLite with the `returning_clauses`
+                // flag). The caller (`save_many`/`upsert_many`) already runs this
+                // inside a transaction, so the per-row loop stays atomic. The
+                // tenant/lock-version RETURNING refinements in `#execute_upsert_body`
+                // are Postgres-only (`pg::upsert::excluded`) and belong to the
+                // scoped/versioned/upsert-trait waves; the SQLite arm upserts the
+                // plain row set (issue #1996).
+                ::autumn_web::backend_select! {
+                    pg => {
+                        let stmt = ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
+                            // Owned `Vec` (not `&[Self]`): encrypted columns use diesel
+                            // `serialize_as`, which only implements `Insertable` for owned
+                            // values. `to_vec()` also works for plain models.
+                            .values(chunk.to_vec())
+                            .on_conflict(#table_ident::id)
+                            .do_update()
+                            .set(Self::__autumn_upsert_set());
 
-                #execute_upsert_body
+                        #execute_upsert_body
+                    },
+                    sqlite => {
+                        let mut __autumn_upserted = ::std::vec::Vec::new();
+                        for __autumn_row in chunk.to_vec() {
+                            let __autumn_r = ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
+                                .values(__autumn_row)
+                                .on_conflict(#table_ident::id)
+                                .do_update()
+                                .set(Self::__autumn_upsert_set())
+                                .get_result::<Self>(conn)
+                                .await?;
+                            __autumn_upserted.push(__autumn_r);
+                        }
+                        ::core::result::Result::Ok(__autumn_upserted)
+                    },
+                }
             }
 
 

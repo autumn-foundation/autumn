@@ -435,6 +435,18 @@ path = "tests/sqlite_read_only_pool.rs"
 name = "sqlite_scoped_repository"
 path = "tests/sqlite_scoped_repository.rs"
 
+# Basic `#[repository]` CRUD proof on the SQLite backend (issue #1996, wave B+C):
+# instantiates a simple model + repository and exercises the always-emitted CRUD
+# (save/find_by_id/update/count/save_many/delete_by_id) on an in-memory SQLite
+# pool, proving the FOR UPDATE removal + on_conflict/batch dialect port compile
+# AND run with no Docker. Only meaningful under `--features sqlite`; the file is
+# `#![cfg(feature = "sqlite")]` so a default `cargo test` compiles it to an empty
+# (passing) binary. Run explicitly:
+# `cargo test -p autumn-web --features sqlite --test sqlite_crud_basic`.
+[[test]]
+name = "sqlite_crud_basic"
+path = "tests/sqlite_crud_basic.rs"
+
 # SQLite read-only-transaction safety proof (issue #1614, Codex P2). The SQLite
 # arm of `Db::tx_with` cannot enforce `READ ONLY`, so a `TxOptions::read_only()`
 # request is rejected before the closure runs rather than silently running a

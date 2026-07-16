@@ -27,6 +27,88 @@
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+/// Backend-portable `FOR UPDATE` seam for generated `#[repository]` CRUD.
+///
+/// Postgres pessimistic-lock reads chain `.for_update()` onto a select query to
+/// take a row lock, but diesel's `LockingClause` only implements
+/// `QueryFragment<Pg>` — the same query is not constructible against the
+/// `SQLite` backend at all, so even a *simple* repository's always-emitted lock
+/// reads would fail to compile under `--features sqlite`. Worse, diesel's
+/// `FOR UPDATE` lock marker is `pub(crate)`, so no generic extension trait in a
+/// downstream crate can name the bound `for_update()` needs — a portable seam
+/// cannot be a plain trait.
+///
+/// This macro is that seam: the `#[repository]` macro emits
+/// `::autumn_web::maybe_for_update!(<query>)` where it used to chain
+/// `<query>.for_update()`, and the returned query is still loadable
+/// (`.first(...)`/`.load(...)`), so the generated call chains compose
+/// identically on either backend. Because the `#[cfg]` that selects the
+/// expansion lives on the macro **definition**, it is evaluated in
+/// **autumn-web's** compilation (where the `sqlite` feature actually lives) —
+/// not the consumer crate's — so a downstream app needs no `sqlite` feature of
+/// its own for the right arm to be chosen.
+///
+/// - **Postgres** (default): expands to `QueryDsl::for_update(<query>)` — the
+///   `FOR UPDATE` locking clause, unchanged. Marker resolution happens at the
+///   concrete call site, so no unnameable bound is ever written.
+/// - **`SQLite`**: expands to `<query>` verbatim — `SQLite` has no
+///   `SELECT … FOR UPDATE` (it serializes writers with a database-level lock),
+///   so the row-lock read degrades to a plain read. Write-write correctness
+///   still rests on the optimistic `lock_version` check plus the pool's
+///   `busy_timeout`; see [`crate::db::RuntimeConnection`] and issue #1996 for
+///   the residual single-writer concurrency caveat.
+#[cfg(all(feature = "db", not(feature = "sqlite")))]
+#[macro_export]
+macro_rules! maybe_for_update {
+    ($query:expr $(,)?) => {
+        $crate::reexports::diesel::query_dsl::QueryDsl::for_update($query)
+    };
+}
+
+/// `SQLite` arm of [`maybe_for_update!`] — the identity. See the Postgres
+/// definition for the full contract; `SQLite` has no `SELECT … FOR UPDATE`, so a
+/// pessimistic-lock read degrades to a plain read.
+#[cfg(all(feature = "db", feature = "sqlite"))]
+#[macro_export]
+macro_rules! maybe_for_update {
+    ($query:expr $(,)?) => {
+        $query
+    };
+}
+
+/// Compile-time backend block selector for generated `#[repository]`/`#[model]`
+/// CRUD where the two backends need *structurally different* code (not just a
+/// swapped receiver), e.g. Postgres multi-row batch insert vs. the `SQLite`
+/// per-row loop, or the batched `ON CONFLICT` upsert vs. `SQLite`'s per-row
+/// upsert.
+///
+/// The `#[cfg]` selecting the arm lives on the macro **definition**, so it is
+/// evaluated in **autumn-web's** compilation (where the `sqlite` feature lives)
+/// — the un-selected arm's tokens are never even type-checked, which is what
+/// lets each arm use backend-specific diesel fragments (Postgres `DEFAULT`-keyword
+/// batch inserts, `SQLite` per-row `RETURNING`) that would not compile against
+/// the other backend.
+///
+/// Expands to the chosen block as an expression:
+/// `::autumn_web::backend_select! { pg => { … }, sqlite => { … } }`.
+#[cfg(all(feature = "db", not(feature = "sqlite")))]
+#[macro_export]
+macro_rules! backend_select {
+    (pg => $pg:block, sqlite => $sqlite:block $(,)?) => {
+        $pg
+    };
+}
+
+/// `SQLite` arm of [`backend_select!`]. See the Postgres definition for the
+/// contract.
+#[cfg(all(feature = "db", feature = "sqlite"))]
+#[macro_export]
+macro_rules! backend_select {
+    (pg => $pg:block, sqlite => $sqlite:block $(,)?) => {
+        $sqlite
+    };
+}
+
 /// Where a generated repository routes its read-only methods (`find_by_id`,
 /// `find_all`, `count`, `paginate`, `cursor_page`, derived `find_by_*`,
 /// full-text-search reads, …).
@@ -85,6 +167,23 @@ impl std::fmt::Debug for ReadRoute {
         }
     }
 }
+
+/// Upper bound on bound parameters in one prepared statement, per backend —
+/// used by generated bulk-write CRUD to size insert/update chunks so a batch
+/// never exceeds the driver's placeholder limit.
+///
+/// Postgres caps a statement at 65535 (`u16`) parameters; `SQLite`'s default
+/// `SQLITE_MAX_VARIABLE_NUMBER` is 32766 (since 3.32.0). The generated code
+/// divides this by the per-row column count to pick a chunk size, so the
+/// value tracks the active backend via the same `sqlite` feature that flips
+/// [`crate::db::RuntimeConnection`]. (The `SQLite` write path also inserts
+/// row-by-row, so this bound is a conservative belt-and-suspenders there.)
+#[cfg(not(feature = "sqlite"))]
+pub const MAX_BIND_PARAMS: usize = 65535;
+/// See [`MAX_BIND_PARAMS`] (Postgres). `SQLite`'s default
+/// `SQLITE_MAX_VARIABLE_NUMBER` is 32766.
+#[cfg(feature = "sqlite")]
+pub const MAX_BIND_PARAMS: usize = 32766;
 
 /// Typed errors returned by generated repository methods.
 ///

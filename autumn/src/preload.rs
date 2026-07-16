@@ -350,7 +350,7 @@ macro_rules! impl_preloadable_leaf {
             fn load_associations<'__a>(
                 _records: &'__a mut [$crate::preload::Preloaded<Self>],
                 _spec: &'__a Self::Spec,
-                _conn: &'__a mut $crate::reexports::diesel_async::AsyncPgConnection,
+                _conn: &'__a mut $crate::RuntimeConnection,
             ) -> $crate::preload::PreloadFuture<'__a> {
                 ::std::boxed::Box::pin(async move { ::core::result::Result::Ok(()) })
             }
@@ -392,7 +392,7 @@ mod db_support {
         fn load_associations<'a>(
             records: &'a mut [Preloaded<Self>],
             spec: &'a Self::Spec,
-            conn: &'a mut crate::reexports::diesel_async::AsyncPgConnection,
+            conn: &'a mut crate::db::RuntimeConnection,
         ) -> PreloadFuture<'a>;
     }
 }

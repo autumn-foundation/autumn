@@ -592,6 +592,13 @@ pub use db::{IsolationLevel, TxOptions, savepoint};
 #[cfg(feature = "db")]
 pub use db::RuntimeConnection;
 
+/// The runtime diesel query backend (`diesel::pg::Pg` by default;
+/// `diesel::sqlite::Sqlite` under the `sqlite` feature). Named by generated
+/// `#[repository]`/`#[model]` code as `::autumn_web::RuntimeBackend`. See
+/// [`db::RuntimeBackend`].
+#[cfg(feature = "db")]
+pub use db::RuntimeBackend;
+
 /// Framework error type and result alias.
 ///
 /// [`AutumnError`] wraps any `Error + Send + Sync` with an HTTP status code.

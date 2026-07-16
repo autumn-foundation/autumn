@@ -69,6 +69,25 @@ pub type RuntimeConnection = diesel_async::AsyncPgConnection;
 pub type RuntimeConnection =
     diesel_async::sync_connection_wrapper::SyncConnectionWrapper<diesel::SqliteConnection>;
 
+/// The diesel query backend the runtime is built against — the companion of
+/// [`RuntimeConnection`].
+///
+/// Defaults to Postgres (`diesel::pg::Pg`); the `sqlite` feature flips it to
+/// `diesel::sqlite::Sqlite`. Generated `#[repository]`/`#[model]` CRUD names
+/// this alias (as `::autumn_web::RuntimeBackend`) wherever a diesel
+/// `QueryFragment<_>` / `SelectableHelper<_>` bound must resolve to the *active*
+/// backend rather than a hard-coded `Pg`. Threading it (instead of `Pg`) through
+/// the always-emitted upsert set-clause and boxed-query types is what lets the
+/// same generated code type-check on either backend. Genuinely Postgres-only
+/// query fragments (advisory-lock upserts, FTS `searchable`) keep an explicit
+/// `Pg` bound — they are not portable and are cfg-gated off under `sqlite`.
+#[cfg(not(feature = "sqlite"))]
+pub type RuntimeBackend = diesel::pg::Pg;
+/// See [`RuntimeBackend`] (Postgres variant). Under the `sqlite` feature the
+/// runtime query backend is `diesel::sqlite::Sqlite`.
+#[cfg(feature = "sqlite")]
+pub type RuntimeBackend = diesel::sqlite::Sqlite;
+
 // ── After-commit callback infrastructure ─────────────────────────────────────
 
 /// A boxed async callback registered for post-transaction execution.
