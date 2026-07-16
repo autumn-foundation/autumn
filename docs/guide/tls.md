@@ -312,14 +312,11 @@ balancer.
 
 The push-button [`autumn deploy`](./deployment.md#push-button-deploy-to-your-own-server-autumn-deploy)
 path installs **kamal-proxy** in front of your app. kamal-proxy listens on your
-configured public HTTP port (`server.port`) and **443** — the supervised `run`
-unit binds both ports regardless of any app's TLS setting. **For automatic TLS,
-set `server.port = 80`** so Let's Encrypt HTTP-01 validation and the HTTP→HTTPS
-redirect (both of which use port 80) work; the deploy enforces this when
-`[deploy.tls]` is enabled. By default `autumn deploy` provisions **no**
-certificate for your app, so nothing is served over HTTPS until you opt in. You
-enable TLS termination **at the deploy-managed proxy** with an opt-in
-`[deploy.tls]` table:
+configured public HTTP port (`server.port`) and, **by default, 443** — its HTTPS
+listener is always bound and cannot be disabled, regardless of any app's TLS
+setting. By default `autumn deploy` provisions **no** certificate for your app,
+so nothing is served over HTTPS until you opt in. You enable TLS termination
+**at the deploy-managed proxy** with an opt-in `[deploy.tls]` table:
 
 ```toml
 [deploy.tls]
@@ -330,11 +327,23 @@ host = "app.example.com"   # public DNS name the certificate is issued for
 With `[deploy.tls] enabled = true`, `autumn deploy` passes `--host <host> --tls`
 on every kamal-proxy `route`/`flip` for your app, so kamal-proxy provisions an
 **automatic Let's Encrypt** certificate for `host` on-demand and terminates TLS
-for it on the already-bound 443 listener. With the table absent (the default)
+for it on its always-bound 443 listener. This needs **no `server.port` change**
+— issuance uses TLS-ALPN-01 on the already-bound 443, so it works on both the
+first deploy and a later redeploy (enabling TLS on an already-deployed app never
+restarts or reconfigures the shared proxy). With the table absent (the default)
 the route/flip commands carry **no** `--host`/`--tls`, so the proxy serves your
-app over plain HTTP only — byte-for-byte the historical behavior. (An external
-TLS terminator in front of the proxy — nginx, Caddy, a cloud load balancer —
-remains a valid alternative, e.g. when a platform already owns the certificate.)
+app over plain HTTP only — byte-for-byte the historical behavior.
+
+**Setting `server.port = 80` is recommended** (it is the default) so the proxy
+also serves plain HTTP on 80 and can offer the HTTP→HTTPS redirect for visitors
+who hit `http://`. It is **not required** for certificate issuance.
+
+> **An external TLS terminator sharing the same host is not supported.** Because
+> kamal-proxy always binds 443 and its HTTPS listener cannot be disabled, you
+> cannot put your own nginx/Caddy/load-balancer TLS terminator on 443 on the
+> same host as the deploy-managed proxy — the two would collide. Terminate TLS
+> at kamal-proxy via `[deploy.tls]`, or run the terminator on a **separate**
+> host/load balancer in front of the deploy host.
 
 Either way TLS terminates at the **proxy**, not the app. Do **not** enable
 in-process `[server.tls]`/ACME on a deploy-managed app: `autumn deploy` binds each app slot to a private loopback

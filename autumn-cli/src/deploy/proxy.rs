@@ -89,19 +89,14 @@ pub struct KamalProxyController {
     /// --tls`, which is what actually turns TLS on for the app (kamal-proxy
     /// provisions a Let's Encrypt cert on-demand for that host). `None` (the
     /// default) leaves the per-app deploy commands byte-for-byte HTTP-only. This
-    /// does NOT affect the shared `run` unit, which always binds both listeners
-    /// (see [`Self::render_proxy_unit`]).
+    /// does NOT affect the shared `run` unit, which is TLS-invariant — 443 is
+    /// bound by kamal-proxy's default HTTPS listener either way (see
+    /// [`Self::render_proxy_unit`]).
     tls_host: Option<String>,
 }
 
 /// Default drain window for the old target after a swap.
 const DEFAULT_DRAIN_TIMEOUT_SECS: u64 = 30;
-
-/// HTTPS port kamal-proxy binds. kamal-proxy `run` establishes both its HTTP
-/// (80/`--http-port`) and HTTPS (443/`--https-port`) listeners unconditionally,
-/// regardless of whether any app has TLS enabled; per-app TLS is turned on at
-/// `deploy` time via `--host <h> --tls`.
-const DEFAULT_HTTPS_PORT: u16 = 443;
 
 impl KamalProxyController {
     /// Build a controller whose flip health-check points at the candidate's
@@ -156,13 +151,16 @@ impl KamalProxyController {
     /// Render the systemd unit that supervises `kamal-proxy run` on the public
     /// port. Pure — exposed for unit assertions.
     ///
-    /// The `run` command ALWAYS opens both `--http-port {public_port}` and
-    /// `--https-port 443`: kamal-proxy establishes both listeners unconditionally
-    /// regardless of any app's TLS state, so the shared/global proxy unit is
-    /// identical whether or not any single app opts into TLS — a non-TLS app
-    /// deploy therefore never rewrites (and never restarts) the shared proxy.
-    /// Per-app TLS is enabled separately at `deploy` time via `--host <h> --tls`
-    /// (see [`Self::deploy_shell`]).
+    /// The `run` command passes only `--http-port {public_port}`. kamal-proxy
+    /// binds its HTTPS listener on 443 BY DEFAULT and that listener cannot be
+    /// disabled, so 443 is served with no explicit `--https-port` — the flag
+    /// would change no ports and only make the unit differ cosmetically. The
+    /// unit is therefore TLS-invariant: it is byte-for-byte identical whether or
+    /// not any app opts into TLS, so a non-TLS app deploy never rewrites (and
+    /// never restarts) the shared proxy. Per-app TLS is enabled separately at
+    /// `deploy` time via `--host <h> --tls` (see [`Self::deploy_shell`]), which
+    /// makes kamal-proxy provision a Let's Encrypt cert on-demand for that host
+    /// on the always-bound 443.
     #[must_use]
     pub fn render_proxy_unit(public_port: u16) -> String {
         format!(
@@ -173,7 +171,7 @@ impl KamalProxyController {
              \n\
              [Service]\n\
              Type=simple\n\
-             ExecStart={KAMAL_PROXY_BIN} run --http-port {public_port} --https-port {DEFAULT_HTTPS_PORT}\n\
+             ExecStart={KAMAL_PROXY_BIN} run --http-port {public_port}\n\
              Restart=on-failure\n\
              RestartSec=2\n\
              \n\
@@ -264,13 +262,16 @@ mod tests {
     }
 
     #[test]
-    fn tls_host_wires_host_and_tls_into_deploy_and_https_port_into_run() {
+    fn tls_host_wires_host_and_tls_into_deploy_and_leaves_run_unit_unchanged() {
         // Opt-in TLS (#1969): `[deploy.tls] enabled = true, host = "app.example.com"`
         // resolves to a controller with `tls_host = Some(..)`.
         let proxy = KamalProxyController::new(60).with_tls_host(Some("app.example.com".to_owned()));
 
         // The flip (and the identical route) carry `--host '<host>' --tls` in the
-        // STABLE position between the health-check path and the timeouts.
+        // STABLE position between the health-check path and the timeouts. This is
+        // the ONLY place TLS shows up — it turns TLS on for the app by making
+        // kamal-proxy provision a Let's Encrypt cert on-demand for that host on
+        // the always-bound 443.
         let DeployOp::Run(flip) = proxy.flip_op("myapp", "127.0.0.1:3002") else {
             panic!("flip_op must be a Run op");
         };
@@ -288,10 +289,10 @@ mod tests {
             "route and flip share the TLS contract"
         );
 
-        // The supervised `run` unit opens the HTTPS port alongside the HTTP port.
-        // (This is unconditional — see `run_unit_always_binds_both_ports` — so
-        // enabling TLS does not change the shared unit; it is asserted here only to
-        // document that a TLS app is served on 443 by the always-bound listener.)
+        // The supervised `run` unit passes ONLY `--http-port` — 443 is bound by
+        // kamal-proxy's default HTTPS listener, so no explicit `--https-port` is
+        // rendered. Enabling TLS therefore does not change the shared unit (see
+        // `run_unit_is_tls_invariant`).
         let ops = proxy.ensure_installed_ops(8080);
         let DeployOp::WriteFile {
             contents: FileContents::Plain(unit),
@@ -301,17 +302,22 @@ mod tests {
             panic!("op 0 must write the proxy unit");
         };
         assert!(
-            unit.contains("kamal-proxy run --http-port 8080 --https-port 443"),
-            "run unit must open both ports, got: {unit}",
+            unit.contains("ExecStart=/usr/local/bin/kamal-proxy run --http-port 8080\n"),
+            "run unit must pass only --http-port (443 is kamal-proxy's default), got: {unit}",
+        );
+        assert!(
+            !unit.contains("--https-port"),
+            "run unit must NOT pass an explicit --https-port, got: {unit}",
         );
     }
 
     #[test]
-    fn run_unit_always_binds_both_ports_regardless_of_tls() {
-        // kamal-proxy `run` establishes BOTH its HTTP and HTTPS listeners
-        // unconditionally, so the shared/global proxy unit is byte-for-byte
-        // identical whether or not any app has TLS enabled — a non-TLS app deploy
-        // never rewrites (and so never restarts) the shared proxy.
+    fn run_unit_is_tls_invariant() {
+        // The `run` unit passes only `--http-port` (443 is kamal-proxy's default
+        // HTTPS listener, always bound), so the shared/global proxy unit is
+        // byte-for-byte identical whether or not any app has TLS enabled — a
+        // non-TLS app deploy never rewrites (and so never restarts) the shared
+        // proxy.
         let http_only = KamalProxyController::new(60);
         let with_tls =
             KamalProxyController::new(60).with_tls_host(Some("app.example.com".to_owned()));
@@ -330,8 +336,12 @@ mod tests {
 
         let http_only_unit = unit_for(&http_only);
         assert!(
-            http_only_unit.contains("kamal-proxy run --http-port 8080 --https-port 443"),
-            "run unit must ALWAYS open both ports even with no app TLS, got: {http_only_unit}",
+            http_only_unit.contains("ExecStart=/usr/local/bin/kamal-proxy run --http-port 8080\n"),
+            "run unit must pass only --http-port, got: {http_only_unit}",
+        );
+        assert!(
+            !http_only_unit.contains("--https-port"),
+            "run unit must NOT pass an explicit --https-port, got: {http_only_unit}",
         );
         assert_eq!(
             http_only_unit,
@@ -360,7 +370,10 @@ mod tests {
                 let FileContents::Plain(unit) = contents else {
                     panic!("proxy unit must be plain text");
                 };
-                assert!(unit.contains("kamal-proxy run --http-port 8080 --https-port 443"));
+                assert!(
+                    unit.contains("ExecStart=/usr/local/bin/kamal-proxy run --http-port 8080\n")
+                );
+                assert!(!unit.contains("--https-port"));
             }
             other => panic!("op 0 should write the proxy unit, got {other:?}"),
         }

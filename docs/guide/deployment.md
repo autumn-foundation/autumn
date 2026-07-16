@@ -50,24 +50,25 @@ below and are better fits in specific cases:
   portable OCI image you run on Kubernetes, ECS, Nomad, or any Docker host.
 
 > **HTTPS/TLS.** kamal-proxy fronts your app and listens on your configured
-> public HTTP port (`server.port`) and **443**. **For automatic TLS, set
-> `server.port = 80`** so Let's Encrypt HTTP-01 validation and the HTTP→HTTPS
-> redirect (both of which use port 80) work — the deploy enforces this when
-> `[deploy.tls]` is enabled. By default `autumn deploy` provisions no
-> certificate for your app, so nothing is served over HTTPS until you opt in. Set
-> `[deploy.tls] enabled = true` and `host = "app.example.com"` in `autumn.toml`
-> to have `autumn deploy` pass `--host`/`--tls` on your app's kamal-proxy
-> route/flip, so kamal-proxy provisions an **automatic Let's Encrypt** certificate
-> for that host on-demand and terminates TLS for it on the already-bound 443
-> listener. (An external TLS terminator in front of the proxy — a load balancer or
-> reverse proxy that owns the certificate and forwards plain HTTP — remains a
-> valid alternative when a platform already handles certificates.) Either way TLS
-> terminates at the **proxy**: don't enable in-process
-> `[server.tls]`/ACME on a deploy-managed app — deploy binds each slot to a
-> private loopback HTTP port that the readiness gate and kamal-proxy target over
-> plain HTTP, so a TLS listener there breaks its health checks. See the [TLS &
-> HTTPS guide](./tls.md) for the full picture, including in-process TLS for
-> self-run apps.
+> public HTTP port (`server.port`) and, **by default, 443** — its HTTPS listener
+> is always bound and cannot be disabled. By default `autumn deploy` provisions
+> no certificate for your app, so nothing is served over HTTPS until you opt in.
+> Set `[deploy.tls] enabled = true` and `host = "app.example.com"` in
+> `autumn.toml` to have `autumn deploy` pass `--host`/`--tls` on your app's
+> kamal-proxy route/flip, so kamal-proxy provisions an **automatic Let's
+> Encrypt** certificate for that host on-demand and terminates TLS for it on its
+> always-bound 443 listener. This needs **no `server.port` change** — issuance
+> uses TLS-ALPN-01 on the already-bound 443, so it works on both the first deploy
+> and a later redeploy. Setting `server.port = 80` is **recommended** (it is the
+> default) so the proxy also serves HTTP on 80 for the HTTP→HTTPS redirect, but
+> it is not required. An external TLS terminator sharing the same host is **not**
+> supported (kamal-proxy always binds 443 and cannot release it); run such a
+> terminator on a separate host in front of the deploy host instead. Either way
+> TLS terminates at the **proxy**: don't enable in-process `[server.tls]`/ACME on
+> a deploy-managed app — deploy binds each slot to a private loopback HTTP port
+> that the readiness gate and kamal-proxy target over plain HTTP, so a TLS
+> listener there breaks its health checks. See the [TLS & HTTPS guide](./tls.md)
+> for the full picture, including in-process TLS for self-run apps.
 
 > **Version.** The `autumn deploy` subcommands (`check` / `plan` / `up` /
 > `rollback`) are newer than the `autumn-cli 0.5.0` pinned under
