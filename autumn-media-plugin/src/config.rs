@@ -199,7 +199,12 @@ impl MediaStorageBackend {
 }
 
 /// Media object storage settings (local filesystem or S3-compatible).
-#[derive(Debug, Clone, Deserialize)]
+///
+/// `secret_access_key` and `session_token` are redacted by the hand-written
+/// [`std::fmt::Debug`] impl (mirroring [`crate::storage::S3MediaStorage`]), so a
+/// `MediaStorageConfig` — or the enclosing [`MediaConfig`], whose derived
+/// `Debug` delegates here — can be logged without leaking bearer credentials.
+#[derive(Clone, Deserialize)]
 #[serde(default)]
 pub struct MediaStorageConfig {
     /// Selected backend. Defaults to [`MediaStorageBackend::Local`].
@@ -216,12 +221,51 @@ pub struct MediaStorageConfig {
     pub access_key_id: Option<String>,
     /// S3 secret access key (paired with `access_key_id`).
     pub secret_access_key: Option<String>,
+    /// S3 session token for a fixed short-lived credential (paired with the
+    /// explicit `access_key_id` / `secret_access_key`). Config-supplied
+    /// credentials are **static** — loaded once at construction and never
+    /// hot-reloaded — so this is for a token that stays valid for the task's
+    /// lifetime; it does not self-refresh. For rotating/temporary credentials in
+    /// a long-running service, leave the explicit credential fields unset so the
+    /// ambient AWS provider chain (env / IMDS / ECS / STS) resolves and refreshes
+    /// them. `None` selects permanent static keys or the ambient chain.
+    pub session_token: Option<String>,
     /// Public base URL served objects resolve under.
     pub public_base_url: Option<String>,
     /// Object key prefix (namespace) for stored media.
     pub key_prefix: String,
     /// Whether to force S3 path-style addressing.
     pub force_path_style: bool,
+}
+
+impl std::fmt::Debug for MediaStorageConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Render every non-secret field verbatim so the Debug stays useful, but
+        // redact the two bearer credentials (`secret_access_key`,
+        // `session_token`) — matching `S3MediaStorage`'s redaction so the two
+        // never drift. `access_key_id`, region, bucket, endpoint, etc. are not
+        // secret and are shown as-is.
+        formatter
+            .debug_struct("MediaStorageConfig")
+            .field("backend", &self.backend)
+            .field("root", &self.root)
+            .field("bucket", &self.bucket)
+            .field("endpoint_url", &self.endpoint_url)
+            .field("region", &self.region)
+            .field("access_key_id", &self.access_key_id)
+            .field(
+                "secret_access_key",
+                &self.secret_access_key.as_ref().map(|_| "** redacted **"),
+            )
+            .field(
+                "session_token",
+                &self.session_token.as_ref().map(|_| "** redacted **"),
+            )
+            .field("public_base_url", &self.public_base_url)
+            .field("key_prefix", &self.key_prefix)
+            .field("force_path_style", &self.force_path_style)
+            .finish()
+    }
 }
 
 impl Default for MediaStorageConfig {
@@ -234,6 +278,7 @@ impl Default for MediaStorageConfig {
             region: None,
             access_key_id: None,
             secret_access_key: None,
+            session_token: None,
             public_base_url: None,
             key_prefix: default_s3_key_prefix(),
             force_path_style: false,
@@ -373,6 +418,7 @@ impl MediaConfig {
         interpolate_opt(&mut self.storage.region, env);
         interpolate_opt(&mut self.storage.access_key_id, env);
         interpolate_opt(&mut self.storage.secret_access_key, env);
+        interpolate_opt(&mut self.storage.session_token, env);
         interpolate_opt(&mut self.storage.public_base_url, env);
         interpolate(&mut self.storage.key_prefix, env);
     }
@@ -455,6 +501,11 @@ impl MediaConfig {
             &mut self.storage.secret_access_key,
             env,
             "AUTUMN_MEDIA__STORAGE__SECRET_ACCESS_KEY",
+        );
+        override_opt(
+            &mut self.storage.session_token,
+            env,
+            "AUTUMN_MEDIA__STORAGE__SESSION_TOKEN",
         );
         override_opt(
             &mut self.storage.public_base_url,
@@ -549,6 +600,9 @@ impl MediaConfig {
         config.storage.bucket = bucket;
         config.storage.access_key_id = access_key_id;
         config.storage.secret_access_key = secret_access_key;
+        // Standard AWS env var for temporary/rotating credentials; Arroyo has no
+        // ARROYO_-prefixed equivalent, so only the AWS_ name is read.
+        config.storage.session_token = arroyo_value(env, "AWS_SESSION_TOKEN");
         config.storage.endpoint_url = arroyo_value(env, "ARROYO_S3_ENDPOINT_URL")
             .or_else(|| arroyo_value(env, "AWS_ENDPOINT_URL_S3"));
         config.storage.region =
@@ -560,6 +614,37 @@ impl MediaConfig {
         }
         if let Some(value) = arroyo_value(env, "ARROYO_S3_FORCE_PATH_STYLE") {
             config.storage.force_path_style = matches_bool(&value);
+        }
+
+        // Reproduce Arroyo's `VideoStorageConfig::from_env_pairs` S3 defaults so
+        // a migrating operator changes NO env: an unset region → `auto`, an
+        // unset endpoint → `https://t3.storage.dev`, an unset key prefix →
+        // `highlights`, and an unset public base → the Tigris bucket URL derived
+        // from the (resolved) bucket + key prefix. These are applied ONLY for
+        // the S3 backend and ONLY in this compatibility shim — the generic
+        // `[media]` path keeps the neutral `MediaConfig` defaults (an unset
+        // region stays `None`/ambient-resolved and the Tigris public-base
+        // fallback is re-derived at `MediaStorage::from_config` time; the `auto`
+        // region, endpoint, and key-prefix defaults are Arroyo-specific and are
+        // set here, so the Tigris path always carries region `Some("auto")`).
+        if config.storage.backend == MediaStorageBackend::S3 {
+            if config.storage.region.is_none() {
+                config.storage.region = Some("auto".to_owned());
+            }
+            if config.storage.endpoint_url.is_none() {
+                config.storage.endpoint_url = Some("https://t3.storage.dev".to_owned());
+            }
+            if arroyo_value(env, "ARROYO_S3_KEY_PREFIX").is_none() {
+                "highlights".clone_into(&mut config.storage.key_prefix);
+            }
+            if config.storage.public_base_url.is_none()
+                && let Some(bucket) = config.storage.bucket.as_deref()
+            {
+                config.storage.public_base_url = Some(crate::storage::default_tigris_public_base(
+                    bucket,
+                    &config.storage.key_prefix,
+                ));
+            }
         }
 
         // Recording retention.
@@ -868,7 +953,95 @@ mod tests {
             config.storage.public_base_url.as_deref(),
             Some("https://cdn.example.com/media")
         );
+        // No AWS_SESSION_TOKEN set → session token stays None (permanent keys).
+        assert_eq!(config.storage.session_token, None);
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn arroyo_env_maps_session_token_from_aws_var() {
+        let vars = env(&[
+            ("ARROYO_VIDEO_STORAGE_BACKEND", "s3"),
+            ("BUCKET_NAME", "arroyo-bucket"),
+            ("AWS_ACCESS_KEY_ID", "AKIA"),
+            ("AWS_SECRET_ACCESS_KEY", "secret"),
+            ("AWS_SESSION_TOKEN", "temporary-session-token"),
+        ]);
+        let config = MediaConfig::from_arroyo_env_pairs(&vars);
+        assert_eq!(
+            config.storage.session_token.as_deref(),
+            Some("temporary-session-token")
+        );
+    }
+
+    #[test]
+    fn env_override_applies_session_token() {
+        let overrides = env(&[("AUTUMN_MEDIA__STORAGE__SESSION_TOKEN", "override-token")]);
+        let config = MediaConfig::from_toml_str_with_env("[media]\n", &overrides).unwrap();
+        assert_eq!(
+            config.storage.session_token.as_deref(),
+            Some("override-token")
+        );
+    }
+
+    #[test]
+    fn arroyo_env_s3_defaults_match_arroyo() {
+        // No endpoint / region / key-prefix / public-base vars set: the shim
+        // must reproduce Arroyo's `from_env_pairs` S3 defaults verbatim.
+        let vars = env(&[
+            ("ARROYO_VIDEO_STORAGE_BACKEND", "s3"),
+            ("BUCKET_NAME", "arroyo-bucket"),
+            ("AWS_ACCESS_KEY_ID", "AKIA"),
+            ("AWS_SECRET_ACCESS_KEY", "secret"),
+        ]);
+        let config = MediaConfig::from_arroyo_env_pairs(&vars);
+        assert_eq!(config.storage.backend, MediaStorageBackend::S3);
+        assert_eq!(config.storage.region.as_deref(), Some("auto"));
+        assert_eq!(
+            config.storage.endpoint_url.as_deref(),
+            Some("https://t3.storage.dev")
+        );
+        assert_eq!(config.storage.key_prefix, "highlights");
+        assert_eq!(
+            config.storage.public_base_url.as_deref(),
+            Some("https://arroyo-bucket.t3.tigrisfiles.io/highlights")
+        );
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn arroyo_env_s3_defaults_do_not_override_explicit_vars() {
+        let vars = env(&[
+            ("ARROYO_VIDEO_STORAGE_BACKEND", "s3"),
+            ("BUCKET_NAME", "b"),
+            ("AWS_ACCESS_KEY_ID", "AKIA"),
+            ("AWS_SECRET_ACCESS_KEY", "secret"),
+            ("ARROYO_S3_REGION", "us-east-1"),
+            ("ARROYO_S3_ENDPOINT_URL", "https://example.r2.dev"),
+            ("ARROYO_S3_KEY_PREFIX", "vids"),
+            ("ARROYO_S3_PUBLIC_BASE_URL", "https://cdn.example.com/vids"),
+        ]);
+        let config = MediaConfig::from_arroyo_env_pairs(&vars);
+        assert_eq!(config.storage.region.as_deref(), Some("us-east-1"));
+        assert_eq!(
+            config.storage.endpoint_url.as_deref(),
+            Some("https://example.r2.dev")
+        );
+        assert_eq!(config.storage.key_prefix, "vids");
+        assert_eq!(
+            config.storage.public_base_url.as_deref(),
+            Some("https://cdn.example.com/vids")
+        );
+    }
+
+    #[test]
+    fn arroyo_env_local_keeps_neutral_defaults() {
+        // The S3-default block must not touch the local backend.
+        let config = MediaConfig::from_arroyo_env_pairs(&HashMap::new());
+        assert_eq!(config.storage.backend, MediaStorageBackend::Local);
+        assert_eq!(config.storage.endpoint_url, None);
+        assert_eq!(config.storage.region, None);
+        assert_eq!(config.storage.key_prefix, "media");
     }
 
     #[test]
@@ -880,6 +1053,78 @@ mod tests {
         ]);
         let config = MediaConfig::from_arroyo_env_pairs(&vars);
         assert_eq!(config.storage.backend, MediaStorageBackend::S3);
+    }
+
+    #[test]
+    fn storage_config_debug_redacts_secret_and_session_token() {
+        let config = MediaStorageConfig {
+            backend: MediaStorageBackend::S3,
+            bucket: Some("b".to_owned()),
+            access_key_id: Some("AKIA-visible".to_owned()),
+            secret_access_key: Some("s3kr3t-value-xyz".to_owned()),
+            session_token: Some("session-token-value-abc".to_owned()),
+            ..MediaStorageConfig::default()
+        };
+        let rendered = format!("{config:?}");
+        // The bearer credentials must never appear in cleartext.
+        assert!(
+            !rendered.contains("s3kr3t-value-xyz"),
+            "secret value must not appear: {rendered}"
+        );
+        assert!(
+            !rendered.contains("session-token-value-abc"),
+            "session token value must not appear: {rendered}"
+        );
+        // Both present secrets render redacted.
+        assert!(
+            rendered.contains("secret_access_key: Some(\"** redacted **\")"),
+            "secret must render redacted when present: {rendered}"
+        );
+        assert!(
+            rendered.contains("session_token: Some(\"** redacted **\")"),
+            "session token must render redacted when present: {rendered}"
+        );
+        // Non-secret fields stay visible so the Debug is still useful.
+        assert!(
+            rendered.contains("AKIA-visible"),
+            "access_key_id is not secret and must stay visible: {rendered}"
+        );
+    }
+
+    #[test]
+    fn storage_config_debug_renders_absent_secrets_as_none() {
+        // Absent credentials render as `None`, never a redaction marker.
+        let rendered = format!("{:?}", MediaStorageConfig::default());
+        assert!(
+            rendered.contains("secret_access_key: None"),
+            "absent secret must render None: {rendered}"
+        );
+        assert!(
+            rendered.contains("session_token: None"),
+            "absent session token must render None: {rendered}"
+        );
+    }
+
+    #[test]
+    fn media_config_debug_propagates_storage_redaction() {
+        // The enclosing MediaConfig's derived Debug delegates to the storage
+        // field's hand-written impl, so secrets stay redacted there too.
+        let mut config = MediaConfig::default();
+        config.storage.secret_access_key = Some("s3kr3t-value-xyz".to_owned());
+        config.storage.session_token = Some("session-token-value-abc".to_owned());
+        let rendered = format!("{config:?}");
+        assert!(
+            !rendered.contains("s3kr3t-value-xyz"),
+            "secret value must not appear via MediaConfig: {rendered}"
+        );
+        assert!(
+            !rendered.contains("session-token-value-abc"),
+            "session token value must not appear via MediaConfig: {rendered}"
+        );
+        assert!(
+            rendered.contains("** redacted **"),
+            "redaction marker must propagate through MediaConfig: {rendered}"
+        );
     }
 
     #[test]
