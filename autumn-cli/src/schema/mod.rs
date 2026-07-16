@@ -12,6 +12,7 @@
 //! later diff engine consumes. These are the first actions of the eventual full
 //! `autumn schema` group.
 
+pub mod diff;
 pub mod parse;
 pub mod snapshot;
 
@@ -75,6 +76,31 @@ pub enum SchemaAction {
         #[arg(long)]
         stdout: bool,
     },
+    /// Diff the declared `#[model]` structs against the checked-in snapshot and
+    /// either print the pending migration (default) or write it as a diesel
+    /// `up.sql`/`down.sql` pair (`--write-migration`). Destructive drops are
+    /// refused unless `--allow-destructive` is passed.
+    Diff {
+        /// Models source (a `.rs` file or a directory). Defaults to `src/models`
+        /// then `src/models.rs`.
+        #[arg(long, value_name = "PATH")]
+        from: Option<PathBuf>,
+        /// Baseline snapshot. Defaults to `.autumn/schema-snapshot.json`.
+        #[arg(long, value_name = "PATH")]
+        snapshot: Option<PathBuf>,
+        /// The dialect. Defaults to the project's configured backend.
+        #[arg(long, value_enum)]
+        backend: Option<BackendArg>,
+        /// Write `migrations/<timestamp>_<name>/{up,down}.sql` instead of printing.
+        #[arg(long)]
+        write_migration: bool,
+        /// Migration directory suffix when writing. Defaults to `schema_update`.
+        #[arg(long, value_name = "NAME")]
+        name: Option<String>,
+        /// Permit destructive drops / an independent drop+add (tier-2 guard).
+        #[arg(long)]
+        allow_destructive: bool,
+    },
 }
 
 /// Run an `autumn schema` action. Prints to stdout on success; on error, writes
@@ -89,6 +115,21 @@ pub fn run(action: SchemaAction) {
             backend,
             stdout,
         } => run_snapshot(from.as_deref(), out.as_deref(), backend, stdout),
+        SchemaAction::Diff {
+            from,
+            snapshot,
+            backend,
+            write_migration,
+            name,
+            allow_destructive,
+        } => run_diff(
+            from.as_deref(),
+            snapshot.as_deref(),
+            backend,
+            write_migration,
+            name.as_deref(),
+            allow_destructive,
+        ),
     };
     if let Err(message) = result {
         eprintln!("error: {message}");
@@ -234,6 +275,139 @@ fn run_snapshot(
     Ok(())
 }
 
+/// Diff the declared models against the checked-in snapshot baseline and either
+/// print the pending migration or write it as a diesel `up.sql`/`down.sql` pair.
+///
+/// **Provider-lock ordering (caller-owned):** the snapshot is loaded and its
+/// backend tag is validated against the desired backend *before* the models are
+/// parsed or diffed, so a dialect-mismatched snapshot fails cleanly with
+/// [`snapshot::SnapshotError::BackendMismatch`] and no diff work runs. This is
+/// the first caller of [`SchemaSnapshot::ensure_backend_matches`].
+fn run_diff(
+    from: Option<&Path>,
+    snapshot_path: Option<&Path>,
+    backend: Option<BackendArg>,
+    write_migration: bool,
+    name: Option<&str>,
+    allow_destructive: bool,
+) -> Result<(), String> {
+    let project_root = std::env::current_dir()
+        .map_err(|e| format!("failed to resolve the current directory: {e}"))?;
+    diff_at(
+        &project_root,
+        from,
+        snapshot_path,
+        backend,
+        write_migration,
+        name,
+        allow_destructive,
+    )
+}
+
+/// The body of [`run_diff`], taking an explicit `project_root` (rather than the
+/// process CWD) so the command wiring is testable without mutating the current
+/// directory.
+fn diff_at(
+    project_root: &Path,
+    from: Option<&Path>,
+    snapshot_path: Option<&Path>,
+    backend: Option<BackendArg>,
+    write_migration: bool,
+    name: Option<&str>,
+    allow_destructive: bool,
+) -> Result<(), String> {
+    // When any input falls back to a project-relative default (the models
+    // source, the default snapshot path, or the auto-detected backend), the
+    // command needs the current directory to be the project root — mirroring
+    // `run_snapshot`.
+    let backend_given = backend.is_some();
+    if (from.is_none() || snapshot_path.is_none() || backend.is_none())
+        && crate::generate::ensure_project_root(project_root).is_err()
+    {
+        return Err(project_root_required_error(!backend_given));
+    }
+
+    // (a) Resolve the desired backend: `--backend`, else the project's configured
+    //     backend.
+    let backend: Backend = backend.map_or_else(
+        || map_detected_backend(crate::generate::detect_backend(project_root)),
+        Backend::from,
+    );
+
+    // (b) Load the baseline snapshot (default `SNAPSHOT_DEFAULT_PATH`). A missing
+    //     file is a friendly "run `autumn schema snapshot` first" error.
+    let snapshot_path = snapshot_path.map_or_else(
+        || project_root.join(SNAPSHOT_DEFAULT_PATH),
+        Path::to_path_buf,
+    );
+    let baseline = snapshot::load_snapshot(&snapshot_path).map_err(|e| match e {
+        snapshot::SnapshotError::Io { source, .. }
+            if source.kind() == std::io::ErrorKind::NotFound =>
+        {
+            format!(
+                "no schema snapshot at {} — run `autumn schema snapshot` first to create the diff baseline",
+                snapshot_path.display()
+            )
+        }
+        other => other.to_string(),
+    })?;
+
+    // (c) PROVIDER-LOCK GUARD — before parsing/diffing.
+    baseline
+        .ensure_backend_matches(backend)
+        .map_err(|e| e.to_string())?;
+
+    // (d) Parse the desired state with the SAME backend tag.
+    let models_path = match from {
+        Some(path) => path.to_path_buf(),
+        None => resolve_default_models_path(project_root)?,
+    };
+    let desired = parse_models_path(&models_path, backend).map_err(|e| e.to_string())?;
+    for d in &desired.diagnostics {
+        eprintln!("warning: {}", d.message);
+    }
+
+    // (e) Diff (pure) then guard (policy).
+    let opts = diff::DiffOptions { allow_destructive };
+    let plan = diff::diff_schema(&baseline.tables, &desired, opts);
+    if plan.is_empty() {
+        println!("No schema changes — models match the snapshot baseline.");
+        return Ok(());
+    }
+    diff::guard_plan(&plan, opts).map_err(|e| e.to_string())?;
+
+    let up = diff::emit_up_sql(&plan).map_err(|e| e.to_string())?;
+    let down = diff::emit_down_sql(&plan).map_err(|e| e.to_string())?;
+
+    if !write_migration {
+        print!("{}", diff::describe_plan(&plan));
+        println!("\n-- up.sql\n{up}\n-- down.sql\n{down}");
+        return Ok(());
+    }
+
+    // (f) Write the migration dir, matching the generator's naming convention.
+    let ts = crate::generate::timestamp_now();
+    let suffix = crate::generate::naming::snake(name.unwrap_or("schema_update"));
+    let dir = project_root
+        .join("migrations")
+        .join(format!("{ts}_{suffix}"));
+    std::fs::create_dir_all(&dir).map_err(|e| {
+        format!(
+            "failed to create migration directory {}: {e}",
+            dir.display()
+        )
+    })?;
+    std::fs::write(dir.join("up.sql"), &up).map_err(|e| format!("failed to write up.sql: {e}"))?;
+    std::fs::write(dir.join("down.sql"), &down)
+        .map_err(|e| format!("failed to write down.sql: {e}"))?;
+    println!(
+        "wrote migration {} ({} change(s))",
+        dir.display(),
+        plan.changes.len()
+    );
+    Ok(())
+}
+
 /// Parse a file or directory and render the tables as pretty JSON, surfacing any
 /// per-field diagnostics on stderr. Split out (returning `Result`) so it is
 /// testable without a process exit.
@@ -251,8 +425,215 @@ fn run_parse(path: &Path) -> Result<String, String> {
 }
 
 #[cfg(test)]
+#[allow(clippy::needless_raw_string_hashes)]
 mod tests {
     use super::*;
+
+    // -- `diff` command wiring (tempdir, explicit project root) --------------
+
+    /// Write a project scaffold: a `Cargo.toml` (so `ensure_project_root`
+    /// passes), a single-file `src/models.rs`, and a snapshot at the default
+    /// path. Returns the tempdir (kept alive by the caller).
+    fn scaffold_project(models: &str, snapshot_json: &str) -> tempfile::TempDir {
+        let root = tempfile::tempdir().expect("tempdir");
+        std::fs::write(root.path().join("Cargo.toml"), "[package]\nname=\"x\"\n")
+            .expect("Cargo.toml");
+        let src = root.path().join("src");
+        std::fs::create_dir_all(&src).expect("mkdir src");
+        std::fs::write(src.join("models.rs"), models).expect("models.rs");
+        let snap = root.path().join(".autumn");
+        std::fs::create_dir_all(&snap).expect("mkdir .autumn");
+        std::fs::write(snap.join("schema-snapshot.json"), snapshot_json).expect("snapshot");
+        root
+    }
+
+    const POST_MODEL: &str = r#"
+        #[autumn_web::model(managed)]
+        pub struct Post {
+            #[id]
+            pub id: i64,
+            pub title: String,
+        }
+    "#;
+
+    /// A version-1 snapshot for a `posts(id, title)` table, matching `POST_MODEL`.
+    fn posts_snapshot(backend: &str) -> String {
+        format!(
+            r#"{{
+  "snapshot_version": 1,
+  "backend": "{backend}",
+  "tables": [
+    {{
+      "name": "posts",
+      "columns": [
+        {{ "name": "id", "ty": "Int64", "nullable": false, "primary_key": true, "unique": false, "default": null, "references": null }},
+        {{ "name": "title", "ty": "Text", "nullable": false, "primary_key": false, "unique": false, "default": null, "references": null }},
+        {{ "name": "created_at", "ty": "Timestamp", "nullable": false, "primary_key": false, "unique": false, "default": "Now", "references": null }}
+      ],
+      "primary_key": ["id"],
+      "indexes": [],
+      "checks": [],
+      "backend": "{backend}",
+      "managed": true
+    }}
+  ]
+}}
+"#
+        )
+    }
+
+    #[test]
+    fn diff_backend_mismatch_errors_before_diff() {
+        // A Sqlite-tagged snapshot diffed with `--backend pg` must fail with the
+        // provider-lock guard BEFORE any parse/diff work.
+        let root = scaffold_project(POST_MODEL, &posts_snapshot("Sqlite"));
+        let err = diff_at(
+            root.path(),
+            None,
+            None,
+            Some(BackendArg::Pg),
+            false,
+            None,
+            false,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("does not match") && err.to_lowercase().contains("backend"),
+            "backend mismatch surfaced: {err}"
+        );
+    }
+
+    #[test]
+    fn diff_missing_snapshot_is_friendly_error() {
+        let root = tempfile::tempdir().expect("tempdir");
+        std::fs::write(root.path().join("Cargo.toml"), "[package]\nname=\"x\"\n")
+            .expect("Cargo.toml");
+        let src = root.path().join("src");
+        std::fs::create_dir_all(&src).expect("mkdir");
+        std::fs::write(src.join("models.rs"), POST_MODEL).expect("models.rs");
+        // No snapshot file written.
+        let err = diff_at(
+            root.path(),
+            None,
+            None,
+            Some(BackendArg::Pg),
+            false,
+            None,
+            false,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("autumn schema snapshot"),
+            "friendly 'run snapshot first' message: {err}"
+        );
+    }
+
+    #[test]
+    fn diff_no_op_writes_nothing() {
+        // Models match the snapshot → no-op → no migration directory.
+        let root = scaffold_project(POST_MODEL, &posts_snapshot("Postgres"));
+        diff_at(
+            root.path(),
+            None,
+            None,
+            Some(BackendArg::Pg),
+            true,
+            None,
+            false,
+        )
+        .expect("no-op diff ok");
+        assert!(
+            !root.path().join("migrations").exists(),
+            "a no-op must not create a migrations directory"
+        );
+    }
+
+    #[test]
+    fn write_migration_creates_up_and_down() {
+        // Add a `body` column to the model that the snapshot lacks → one AddColumn.
+        let models = r#"
+            #[autumn_web::model(managed)]
+            pub struct Post {
+                #[id]
+                pub id: i64,
+                pub title: String,
+                pub body: Option<String>,
+            }
+        "#;
+        let root = scaffold_project(models, &posts_snapshot("Postgres"));
+        diff_at(
+            root.path(),
+            None,
+            None,
+            Some(BackendArg::Pg),
+            true,
+            Some("add_body"),
+            false,
+        )
+        .expect("write migration ok");
+
+        // Exactly one migration directory named `<ts>_add_body` with the pair.
+        let migrations = root.path().join("migrations");
+        let entries: Vec<_> = std::fs::read_dir(&migrations)
+            .expect("read migrations dir")
+            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(entries.len(), 1, "one migration dir: {entries:?}");
+        assert!(
+            entries[0].ends_with("_add_body"),
+            "named suffix: {entries:?}"
+        );
+        let dir = migrations.join(&entries[0]);
+        let up = std::fs::read_to_string(dir.join("up.sql")).expect("up.sql");
+        let down = std::fs::read_to_string(dir.join("down.sql")).expect("down.sql");
+        assert!(
+            up.contains("ALTER TABLE posts ADD COLUMN body TEXT NULL;"),
+            "up: {up}"
+        );
+        assert!(
+            down.contains("ALTER TABLE posts DROP COLUMN body;"),
+            "down: {down}"
+        );
+    }
+
+    #[test]
+    fn diff_destructive_refused_without_flag_then_allowed() {
+        // Snapshot has a `title` the model dropped → DropColumn → refused by default.
+        let models = r#"
+            #[autumn_web::model(managed)]
+            pub struct Post {
+                #[id]
+                pub id: i64,
+            }
+        "#;
+        let root = scaffold_project(models, &posts_snapshot("Postgres"));
+        let err = diff_at(
+            root.path(),
+            None,
+            None,
+            Some(BackendArg::Pg),
+            false,
+            None,
+            false,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("--allow-destructive"),
+            "refusal names the flag: {err}"
+        );
+
+        // With the flag it succeeds (prints the plan).
+        diff_at(
+            root.path(),
+            None,
+            None,
+            Some(BackendArg::Pg),
+            false,
+            None,
+            true,
+        )
+        .expect("allowed with --allow-destructive");
+    }
 
     #[test]
     fn default_resolver_prefers_src_models_dir() {
