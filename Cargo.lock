@@ -472,6 +472,7 @@ dependencies = [
  "aws-smithy-async",
  "aws-smithy-runtime-api",
  "aws-smithy-types",
+ "percent-encoding",
  "serde",
  "thiserror 2.0.18",
  "time",

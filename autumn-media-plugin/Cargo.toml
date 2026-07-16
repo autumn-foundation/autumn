@@ -13,6 +13,7 @@ categories = ["web-programming", "multimedia"]
 
 [dependencies]
 autumn-web = { version = "0.6.0", path = "../autumn" }
+percent-encoding = "2"
 serde = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }

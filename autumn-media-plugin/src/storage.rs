@@ -223,13 +223,19 @@ impl MediaStorage {
 
     /// The public URL a browser fetches the object at — the backend's public
     /// base joined with the caller key.
+    ///
+    /// The key's path segments are percent-encoded (preserving `/`
+    /// separators) so a caller key containing URL-reserved characters (e.g.
+    /// `#`, `?`, space) addresses exactly the stored object rather than being
+    /// reinterpreted as a fragment/query by the browser.
     #[must_use]
     pub fn public_url(&self, key: &str) -> String {
+        let encoded = encode_key_for_url(key);
         match self {
             Self::Local {
                 public_base_url, ..
-            } => join_url(public_base_url, key),
-            Self::S3(config) => join_url(&config.public_base_url, key),
+            } => join_url(public_base_url, &encoded),
+            Self::S3(config) => join_url(&config.public_base_url, &encoded),
         }
     }
 
@@ -451,6 +457,25 @@ pub fn join_key_prefix(prefix: &str, key: &str) -> String {
     }
 }
 
+/// Percent-encode each path segment of a storage key for safe inclusion in a
+/// browser-facing URL, preserving `/` separators. Unreserved RFC 3986 chars
+/// (`A-Z a-z 0-9 - . _ ~`) pass through; everything else (e.g. `#`, `?`, `%`,
+/// space) is percent-encoded so the URL addresses exactly the stored object.
+fn encode_key_for_url(key: &str) -> String {
+    use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
+    // NON_ALPHANUMERIC encodes everything except ASCII alphanumerics; add back
+    // the RFC 3986 unreserved marks so `.mp4`, `-`, `_`, `~` stay readable.
+    const SEGMENT: &AsciiSet = &NON_ALPHANUMERIC
+        .remove(b'-')
+        .remove(b'.')
+        .remove(b'_')
+        .remove(b'~');
+    key.split('/')
+        .map(|seg| utf8_percent_encode(seg, SEGMENT).to_string())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 /// Join a base URL and a path with exactly one separating slash. An empty path
 /// yields the trailing-slash-trimmed base alone.
 #[must_use]
@@ -588,6 +613,47 @@ mod tests {
         assert_eq!(
             storage.public_url("/clips/1.mp4"),
             "https://cdn.example.com/media/clips/1.mp4"
+        );
+    }
+
+    #[test]
+    fn public_url_percent_encodes_reserved_char() {
+        let storage = MediaStorage::Local {
+            root: PathBuf::from("media"),
+            public_base_url: "/media".to_owned(),
+        };
+        let url = storage.public_url("clips/a#b.mp4");
+        // The `#` is encoded so the browser fetches the object, not a fragment.
+        assert_eq!(url, "/media/clips/a%23b.mp4");
+        assert!(!url.contains("a#b"), "reserved `#` must be encoded: {url}");
+        // `/` separators are preserved.
+        assert!(url.contains("/clips/"), "path separators preserved: {url}");
+    }
+
+    #[test]
+    fn public_url_passes_through_unreserved_chars() {
+        let storage = MediaStorage::Local {
+            root: PathBuf::from("media"),
+            public_base_url: "/media".to_owned(),
+        };
+        let url = storage.public_url("highlights/my-clip_1.mp4");
+        // Unreserved RFC 3986 chars (`.`, `-`, `_`) are untouched — no encoding.
+        assert_eq!(url, "/media/highlights/my-clip_1.mp4");
+        assert!(
+            !url.contains('%'),
+            "no percent-encoding for slug key: {url}"
+        );
+    }
+
+    #[test]
+    fn public_url_encodes_space_question_and_percent() {
+        let storage = MediaStorage::Local {
+            root: PathBuf::from("media"),
+            public_base_url: "/media".to_owned(),
+        };
+        assert_eq!(
+            storage.public_url("clips/a b?c%d.mp4"),
+            "/media/clips/a%20b%3Fc%25d.mp4"
         );
     }
 
