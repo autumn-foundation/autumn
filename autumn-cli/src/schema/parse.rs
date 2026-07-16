@@ -183,7 +183,14 @@ pub fn parse_models_dir(dir: &Path, backend: Backend) -> Result<ParsedSchema, Sc
             source,
         })?;
         let path = entry.path();
-        if path.extension().is_some_and(|ext| ext == "rs") {
+        // Query the entry's type directly (one syscall, from the DirEntry) rather
+        // than an extra `Path::is_file` metadata stat, and skip anything that is
+        // not a regular file — e.g. a subdirectory named `something.rs`.
+        let file_type = entry.file_type().map_err(|source| SchemaParseError::Io {
+            path: path.display().to_string(),
+            source,
+        })?;
+        if file_type.is_file() && path.extension().is_some_and(|ext| ext == "rs") {
             paths.push(path);
         }
     }
@@ -235,23 +242,26 @@ fn parse_model_args(attr: &syn::Attribute) -> ModelArgs {
         return args;
     }
     // `parse_nested_meta` errors on the first argument whose value we do not
-    // consume; to stay forward-compatible we consume-and-ignore unknown ones.
+    // consume; to stay forward-compatible we consume-and-ignore unknown ones so
+    // a future `#[model(...)]` argument never breaks parsing of the known ones.
     let _ = attr.parse_nested_meta(|meta| {
-        if meta.path.is_ident("table") {
-            if let Ok(value) = meta.value()
-                && let Ok(lit) = value.parse::<syn::LitStr>()
-            {
-                args.table = Some(lit.value());
-            }
+        if meta.path.is_ident("table")
+            && let Ok(value) = meta.value()
+            && let Ok(lit) = value.parse::<syn::LitStr>()
+        {
+            args.table = Some(lit.value());
         } else if meta.path.is_ident("managed") {
             args.managed = true;
-        } else if meta.path.is_ident("schema") {
-            if let Ok(value) = meta.value()
-                && let Ok(lit) = value.parse::<syn::LitStr>()
-                && lit.value() == "managed"
-            {
-                args.managed = true;
-            }
+        } else if meta.path.is_ident("schema")
+            && let Ok(value) = meta.value()
+            && let Ok(lit) = value.parse::<syn::LitStr>()
+            && lit.value() == "managed"
+        {
+            args.managed = true;
+        } else if meta.input.peek(syn::token::Paren) {
+            // Unknown nested list `key(...)` — consume it so parsing can
+            // continue to the next comma-separated argument.
+            let _ = meta.parse_nested_meta(|_| Ok(()));
         } else if let Ok(value) = meta.value() {
             // Unknown `key = value` — consume the value token so parsing can
             // continue to the next comma-separated argument.
@@ -304,12 +314,20 @@ fn parse_field_attrs(field: &syn::Field) -> FieldAttrs {
             "references" => {
                 let mut target = None;
                 if !matches!(attr.meta, syn::Meta::Path(_)) {
+                    // Extract the known `table = "..."` override, but consume any
+                    // other nested list / `key = value` pair so a future arg
+                    // (e.g. `on_delete = "cascade"`) never aborts target
+                    // extraction.
                     let _ = attr.parse_nested_meta(|meta| {
                         if meta.path.is_ident("table")
                             && let Ok(value) = meta.value()
                             && let Ok(lit) = value.parse::<syn::LitStr>()
                         {
                             target = Some(lit.value());
+                        } else if meta.input.peek(syn::token::Paren) {
+                            let _ = meta.parse_nested_meta(|_| Ok(()));
+                        } else if let Ok(value) = meta.value() {
+                            let _ = value.parse::<syn::Lit>();
                         }
                         Ok(())
                     });
@@ -977,5 +995,60 @@ mod tests {
         "#;
         let parsed = parse_model_source(src, Backend::Sqlite).expect("parse");
         assert_eq!(parsed.tables[0].backend, Backend::Sqlite);
+    }
+
+    #[test]
+    fn model_unknown_kv_arg_is_ignored_and_known_args_survive() {
+        // A future `key = value` arg must not abort parsing of `table`.
+        let src = r#"
+            #[model(table = "widgets", future_unknown = "x")]
+            pub struct Widget {
+                #[id]
+                pub id: i64,
+                #[default]
+                pub created_at: chrono::NaiveDateTime,
+            }
+        "#;
+        let table = parse_one(src);
+        assert_eq!(table.name, "widgets");
+    }
+
+    #[test]
+    fn model_unknown_nested_list_arg_is_consumed_and_managed_survives() {
+        // A future nested-list arg `key(...)` must be consumed, not abort the
+        // `managed` marker that precedes it.
+        let src = r#"
+            #[model(managed, future_list(a = 1, b = 2))]
+            pub struct Account {
+                #[id]
+                pub id: i64,
+                #[default]
+                pub created_at: chrono::NaiveDateTime,
+            }
+        "#;
+        let table = parse_one(src);
+        assert!(table.managed, "unknown nested list must not drop `managed`");
+    }
+
+    #[test]
+    fn references_unknown_kv_arg_is_ignored_and_target_survives() {
+        // A future `#[references(table = "...", on_delete = "...")]` arg must
+        // not abort extraction of the `table` target.
+        let src = r#"
+            #[model]
+            pub struct Comment {
+                #[id]
+                pub id: i64,
+                #[references(table = "users", on_delete = "cascade")]
+                pub author_id: i64,
+                #[default]
+                pub created_at: chrono::NaiveDateTime,
+            }
+        "#;
+        let table = parse_one(src);
+        assert_eq!(
+            col(&table, "author_id").references,
+            Some(ForeignKey::new("users", "id"))
+        );
     }
 }
