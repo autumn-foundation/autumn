@@ -49,8 +49,11 @@ below and are better fits in specific cases:
   [How the production image works](#how-the-production-image-works)) — a
   portable OCI image you run on Kubernetes, ECS, Nomad, or any Docker host.
 
-> **HTTPS/TLS.** kamal-proxy fronts your app and always listens on both 80 and
-> **443** (its defaults), but by default `autumn deploy` provisions no
+> **HTTPS/TLS.** kamal-proxy fronts your app and listens on your configured
+> public HTTP port (`server.port`) and **443**. **For automatic TLS, set
+> `server.port = 80`** so Let's Encrypt HTTP-01 validation and the HTTP→HTTPS
+> redirect (both of which use port 80) work — the deploy enforces this when
+> `[deploy.tls]` is enabled. By default `autumn deploy` provisions no
 > certificate for your app, so nothing is served over HTTPS until you opt in. Set
 > `[deploy.tls] enabled = true` and `host = "app.example.com"` in `autumn.toml`
 > to have `autumn deploy` pass `--host`/`--tls` on your app's kamal-proxy

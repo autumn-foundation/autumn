@@ -311,11 +311,14 @@ let the app serve plain HTTP behind it. This is the right choice for the managed
 balancer.
 
 The push-button [`autumn deploy`](./deployment.md#push-button-deploy-to-your-own-server-autumn-deploy)
-path installs **kamal-proxy** in front of your app. kamal-proxy always listens on
-both 80 and **443** (its defaults) — the supervised `run` unit binds both ports
-regardless of any app's TLS setting — but by default `autumn deploy` provisions
-**no** certificate for your app, so nothing is served over HTTPS until you opt
-in. You enable TLS termination **at the deploy-managed proxy** with an opt-in
+path installs **kamal-proxy** in front of your app. kamal-proxy listens on your
+configured public HTTP port (`server.port`) and **443** — the supervised `run`
+unit binds both ports regardless of any app's TLS setting. **For automatic TLS,
+set `server.port = 80`** so Let's Encrypt HTTP-01 validation and the HTTP→HTTPS
+redirect (both of which use port 80) work; the deploy enforces this when
+`[deploy.tls]` is enabled. By default `autumn deploy` provisions **no**
+certificate for your app, so nothing is served over HTTPS until you opt in. You
+enable TLS termination **at the deploy-managed proxy** with an opt-in
 `[deploy.tls]` table:
 
 ```toml
