@@ -96,16 +96,19 @@ wait_for_ssh() { # <timeout-secs>
 # failures. Writes "total failures" to the given file on stop.
 start_prober() { # <outfile>
   local out="$1"
-  # The `>/dev/null 2>&1` on the backgrounded subshell is load-bearing when the
-  # caller captures the PID via `$(start_prober ...)`. Command substitution reads
-  # from a pipe and only returns once EVERY process holding that pipe's write end
-  # (fd 1) has closed it. Without this redirect the backgrounded subshell inherits
-  # the substitution's fd 1 and keeps it open for its entire lifetime — which ends
-  # only at stop_prober, much later — so `$(...)` would block here (hanging the
-  # redeploy/rollback until the job timeout). Redirecting the subshell's stdout to
-  # /dev/null detaches it from the substitution pipe, so `echo $!` is the sole
-  # writer left and the capture returns immediately while the prober keeps running.
-  # The subshell already reports its result via the `${out}` file, not stdout.
+  # Background the prober as this function's LAST statement, and DO NOT echo the
+  # PID / use command substitution to launch it. A shell function runs in the
+  # current (main) shell — it is not forked — so `( ... ) &` here backgrounds a
+  # job that is a genuine child of the main shell, and the caller reads its PID
+  # from `$!` in the main shell right after the call. This matters because
+  # stop_prober's `wait "$pid"` only works on a child of the calling shell: if we
+  # instead launched via `prober_pid="$(start_prober ...)"`, the `&` job would run
+  # inside the command-substitution subshell and be reparented to init the moment
+  # `$(...)` returned, so the captured PID would not be our child — `wait` would
+  # error ("not a child of this shell") and stop_prober would delete prober.stop
+  # before the prober ever saw it or wrote ${out}, failing every real-VPS run.
+  # The `>/dev/null 2>&1` stays so the subshell can never block on / spew to the
+  # log; the result is reported via the `${out}` file, not stdout.
   (
     total=0; fail=0
     while [ ! -f "${WORK}/prober.stop" ]; do
@@ -115,7 +118,6 @@ start_prober() { # <outfile>
     done
     echo "${total} ${fail}" > "${out}"
   ) >/dev/null 2>&1 &
-  echo $!
 }
 stop_prober() { touch "${WORK}/prober.stop"; wait "$1" 2>/dev/null || true; rm -f "${WORK}/prober.stop"; }
 
@@ -252,7 +254,11 @@ log "reboot survival OK — serves ${body}, kamal-proxy + app units active"
 log "zero-downtime redeploy to v2 under a background prober"
 sleep 2   # distinct per-second release id
 stage_release "${WORK}/app_v2"
-prober_pid="$(start_prober "${WORK}/prober.out")"
+# Launch in the main shell (no command substitution) so the prober is a child of
+# THIS shell and `$!` is its PID — required for stop_prober's `wait` to join it.
+# Capture `$!` immediately; nothing else may background before this read.
+start_prober "${WORK}/prober.out"
+prober_pid=$!
 autumn_deploy up || { stop_prober "${prober_pid}"; fail "redeploy 'deploy up' failed"; }
 stop_prober "${prober_pid}"
 read -r total failures < "${WORK}/prober.out"
