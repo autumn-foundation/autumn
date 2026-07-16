@@ -121,6 +121,18 @@ fn run_snapshot(
 ) -> Result<(), String> {
     let project_root = std::env::current_dir()
         .map_err(|e| format!("failed to resolve the current directory: {e}"))?;
+
+    // When either default is in play — `src/models` for the source (no `--from`)
+    // or `.autumn/…` for the output (no `--out`, writing a file) — the command
+    // assumes the current directory is the project root. Fail fast with a clear
+    // message instead of a confusing IO error (`src/models` / `.autumn/` not
+    // found) when it is run from a subdirectory. A fully explicit invocation
+    // (`--from` plus either `--out` or `--stdout`) needs no project root and
+    // skips the check.
+    if from.is_none() || (out.is_none() && !stdout) {
+        crate::generate::ensure_project_root(&project_root).map_err(|e| e.to_string())?;
+    }
+
     let models_dir = from.map_or_else(
         || project_root.join("src").join("models"),
         Path::to_path_buf,
