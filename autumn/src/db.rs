@@ -5277,6 +5277,28 @@ pub(crate) fn establish_migration_connection(
     })
 }
 
+/// Establish a synchronous diesel [`diesel::SqliteConnection`] for the `SQLite`
+/// startup-migration path (issue #1614, PR3).
+///
+/// The `SQLite` counterpart to [`establish_migration_connection`], and much
+/// thinner: `SQLite` is a single-writer local database, so there is no TLS
+/// negotiation and no advisory-lock connection wrapper — diesel's
+/// `MigrationHarness` runs directly on a plain `SqliteConnection`. The URL is
+/// normalized through the same [`normalize_sqlite_target`] the runtime pool
+/// uses, so the migration connection and the pool open the same database file.
+///
+/// # Errors
+///
+/// Returns the underlying [`diesel::ConnectionError`] when the database cannot
+/// be opened.
+#[cfg(feature = "sqlite")]
+pub(crate) fn establish_sqlite_migration_connection(
+    database_url: &str,
+) -> Result<diesel::SqliteConnection, diesel::ConnectionError> {
+    use diesel::Connection as _;
+    diesel::SqliteConnection::establish(&normalize_sqlite_target(database_url))
+}
+
 #[cfg(test)]
 mod migration_connection_tests {
     use super::migration_connection_needs_rustls;

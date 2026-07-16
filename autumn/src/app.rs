@@ -4914,27 +4914,22 @@ impl AppBuilder {
             std::process::exit(0);
         }
 
-        // SQLite migrate-only guard (issue #1614 follow-up): the per-target applier
-        // below routes every target through the same Postgres-only `run_pending_locked`
-        // harness the normal-boot path uses, so a `sqlite:` control or shard target
-        // with registered migrations would attempt a `PgConnection::establish`
-        // against a SQLite URL and exit with a generic connection failure instead of
-        // the explicit, actionable "SQLite startup migrations not supported" error.
-        // Apply the SAME `sqlite_startup_migration_guard` here as normal boot, BEFORE
-        // the migration loop, so the boot and migrate-only paths cannot drift. The
-        // migration set is non-empty at this point (checked above), so both the
-        // control and shard "has migrations" flags mirror the boot call's
-        // `!migrations.is_empty()`. An all-Postgres / empty-shard configuration is
-        // never gated, leaving the Postgres path byte-identical.
+        // SQLite migrate-only guard (issue #1614, PR3): sharding is Postgres-only,
+        // so a `sqlite:` control target with shards configured, or any `sqlite:`
+        // shard target, fails fast here with the actionable sharding error — the
+        // SAME `sqlite_sharding_unsupported_guard` normal boot applies, so the two
+        // paths cannot drift. A plain `sqlite:` control target (no shards) is NOT
+        // gated: its migrations are applied by the SQLite apply path in the loop
+        // below. An all-Postgres / empty-shard configuration is never gated,
+        // leaving the Postgres path byte-identical.
         #[cfg(feature = "sqlite")]
         {
             let sqlite_guard_shard_urls: Vec<&str> =
                 shard_targets.iter().map(|(_, url)| url.as_str()).collect();
-            if let Err(e) = sqlite_startup_migration_guard(
+            if let Err(e) = sqlite_sharding_unsupported_guard(
                 control_url.as_deref(),
-                !migrations.is_empty(),
+                !shard_targets.is_empty(),
                 &sqlite_guard_shard_urls,
-                !migrations.is_empty(),
             ) {
                 eprintln!("autumn migrate: {e}");
                 // `process::exit` skips `on_shutdown`/`Drop`; stop any managed
@@ -4950,12 +4945,31 @@ impl AppBuilder {
         let applied_total = tokio::task::spawn_blocking(move || {
             let mut total = 0_usize;
             if let Some(url) = &control_url {
-                for mig in &migrations {
-                    total += apply_pending_or_exit(url, mig, "control");
+                // SQLite single-writer control target (issue #1614, PR3): apply with
+                // NO advisory lock via the SQLite harness. Sharding is rejected above,
+                // so a SQLite control target here is always unsharded (shard_targets
+                // is empty). Every non-SQLite target keeps the byte-identical locked
+                // Postgres applier.
+                #[cfg(feature = "sqlite")]
+                let is_sqlite_control = crate::config::DatabaseBackend::detect(url)
+                    == Some(crate::config::DatabaseBackend::Sqlite);
+                #[cfg(not(feature = "sqlite"))]
+                let is_sqlite_control = false;
+                if is_sqlite_control {
+                    #[cfg(feature = "sqlite")]
+                    for mig in &migrations {
+                        total += apply_pending_sqlite_or_exit(url, mig, "control");
+                    }
+                } else {
+                    for mig in &migrations {
+                        total += apply_pending_or_exit(url, mig, "control");
+                    }
                 }
             }
             // Shards hold tenant data, not the control-plane schema; skip the
             // control framework set for shard targets (mirrors `run_startup_migrations`).
+            // A `sqlite:` shard is rejected by the guard above, so every shard here
+            // is Postgres.
             for (label, url) in &shard_targets {
                 for mig in migrations
                     .iter()
@@ -7259,16 +7273,17 @@ async fn setup_database(
         .and_then(|t| t.migration_url())
         .map(str::to_owned);
 
-    // SQLite startup-migration guard (issue #1614 follow-up): the startup
-    // migration path is Postgres-only, so a `sqlite://` control URL with
-    // registered migrations must fail fast here rather than crash inside
-    // `PgConnection::establish` before serving. See `sqlite_startup_migration_guard`.
-    // The shard loop in `run_startup_migrations` migrates each `shard.primary_url`
-    // through the same Postgres-only harness, gated by `shards.is_some()` and the
-    // presence of registered migrations — independently of the control topology.
-    // Collect the shard targets so the guard can reject a SQLite shard the same
-    // way it rejects a SQLite control target (Codex P1). Empty when unsharded or
-    // when the shard loop won't run, so the Postgres path is unaffected.
+    // SQLite sharding guard (issue #1614, PR3): the SQLite startup-migration
+    // path now applies registered migrations to a `sqlite://` control target
+    // (`run_startup_migrations` routes them through
+    // `crate::migrate::auto_migrate_sqlite`), so registered migrations no longer
+    // fail fast here. What remains unsupported on SQLite is **sharding** — the
+    // directory/shard-map control migrations and per-shard fan-out are
+    // Postgres/sharding-specific — so a sqlite control target with sharding
+    // enabled fails fast here, as does any `sqlite:` shard `primary_url` (the
+    // shard loop routes each shard through the Postgres-only harness). Empty when
+    // unsharded or when the shard loop won't run, so the Postgres path is
+    // unaffected. See `sqlite_sharding_unsupported_guard`.
     #[cfg(feature = "sqlite")]
     let sqlite_guard_shard_urls: Vec<&str> = if shards.is_some() {
         config
@@ -7282,7 +7297,7 @@ async fn setup_database(
     };
     #[cfg(feature = "sqlite")]
     #[allow(clippy::question_mark)] // managed-pg child must be stopped before returning
-    if let Err(e) = sqlite_startup_migration_guard(
+    if let Err(e) = sqlite_sharding_unsupported_guard(
         if topology.is_some() {
             provider_migration_url
                 .as_deref()
@@ -7290,9 +7305,10 @@ async fn setup_database(
         } else {
             None
         },
-        !migrations.is_empty() || directory_migration_required || shard_map_migration_required,
+        directory_migration_required
+            || shard_map_migration_required
+            || config.database.has_shards(),
         &sqlite_guard_shard_urls,
-        !migrations.is_empty(),
     ) {
         #[cfg(feature = "managed-pg")]
         crate::managed_pg::emergency_stop_async().await;
@@ -7412,58 +7428,95 @@ fn apply_pending_or_exit(
     }
 }
 
-/// Guard the startup-migration path against a `SQLite` control target.
+/// Apply pending migrations for one `SQLite` target in the `AUTUMN_MIGRATE=1`
+/// one-shot, returning the number applied — or exiting non-zero on failure
+/// (issue #1614, PR3).
 ///
-/// The Rust startup-migration harness is Postgres-only — it applies
-/// `MigrationSource<Pg>` through [`crate::db::establish_migration_connection`],
-/// which calls `PgConnection::establish`. A `sqlite://` URL routed there would
-/// try to open a Postgres connection against a `SQLite` target and crash before
-/// the app ever serves (issue #1614 review, Codex P1). Full `SQLite` migration
-/// support (a `MigrationHarness<Sqlite>` path) is a deliberate follow-up; until
-/// then, registering migrations with a `SQLite` target fails fast here with an
-/// actionable message rather than deep inside the Postgres engine.
-///
-/// Returns `Ok(())` unless the control target is `SQLite` **and** at least one
-/// migration would be applied to it. With no registered migrations the
-/// manual-schema path is fully supported, so boot proceeds. Uses the same
-/// [`crate::config::DatabaseBackend::detect`] predicate as `db::build_pool`, so
-/// the gate and the pool routing agree on what "is a `SQLite` URL" means.
-///
-/// The same crash lurks on the **shard** targets: the shard loop in
-/// [`run_startup_migrations`] migrates every `shard.primary_url` through the same
-/// Postgres-only harness, independently of the control topology. A shards-only
-/// app (control `topology` is `None`, so the control check above permits boot)
-/// with `sqlite:` shard `primary_url`s and registered migrations would hit the
-/// exact pre-serve crash this guard exists to prevent, so any `SQLite` shard
-/// target with migrations pending is rejected here too (issue #1614 review,
-/// Codex P1). `shard_urls` is empty when the app is unsharded or the shard loop
-/// won't run, so the Postgres path is unaffected.
+/// The `SQLite` counterpart to [`apply_pending_or_exit`]: it uses the unlocked
+/// [`run_pending_sqlite`](crate::migrate::run_pending_sqlite) harness (`SQLite`
+/// is single-writer, so there is no advisory lock and no cross-process race to
+/// serialize) and REDACTS failure messages to a value-free reason plus the
+/// target label, exactly like the Postgres path, so a driver string embedding
+/// the database path is never printed.
 #[cfg(feature = "sqlite")]
-fn sqlite_startup_migration_guard(
+fn apply_pending_sqlite_or_exit(
+    database_url: &str,
+    migrations: &crate::migrate::EmbeddedMigrations,
+    target: &str,
+) -> usize {
+    match crate::migrate::run_pending_sqlite(
+        database_url,
+        crate::migrate::EmbeddedMigrationsRef(migrations),
+    ) {
+        Ok(result) => result.applied.len(),
+        Err(error) => {
+            let reason = match error {
+                crate::migrate::MigrationError::Connection(_) => {
+                    "could not connect to the database"
+                }
+                crate::migrate::MigrationError::Migration(_) => "a migration failed to apply",
+                _ => "migration error",
+            };
+            eprintln!("autumn migrate: {reason} (target {target})");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Guard the startup-migration path against a **sharded** `SQLite` deployment.
+///
+/// PR3 (#1614) wired a working `SQLite` startup-migration path: registered
+/// migrations now apply to a `sqlite://` control target through diesel's
+/// `MigrationHarness` on a `SqliteConnection`, with no advisory lock (see
+/// [`crate::migrate::run_pending_sqlite`] / [`crate::migrate::auto_migrate_sqlite`],
+/// routed from [`run_startup_migrations`]). So registered migrations are no
+/// longer rejected here — a `sqlite://` control target with `.migrations(...)`
+/// boots and applies its schema.
+///
+/// What remains unsupported is **sharding on `SQLite`**: the shard-directory and
+/// shard-map control tables and the per-shard fan-out are Postgres/sharding
+/// primitives (advisory locks, Postgres DDL), and a single-node `SQLite`
+/// deployment has no shards. Two situations are therefore rejected here with an
+/// actionable message rather than attempting to create Postgres-shaped sharding
+/// tables on `SQLite`:
+///
+///   * a `SQLite` **control** target for which the sharding control migrations
+///     are required or shards are configured (`control_sharding_required` —
+///     `directory_migration_required || shard_map_migration_required ||
+///     config.database.has_shards()`); and
+///   * any `SQLite` **shard** `primary_url`: the shard loop in
+///     [`run_startup_migrations`] migrates every shard through the Postgres-only
+///     harness, so a `sqlite:` shard is sharding-on-`SQLite` regardless of the
+///     control backend. `shard_urls` is empty when the app is unsharded or the
+///     shard loop won't run, so the Postgres path is unaffected.
+///
+/// Uses the same [`crate::config::DatabaseBackend::detect`] predicate as
+/// `db::build_pool`, so the gate and the pool routing agree on what "is a
+/// `SQLite` URL" means.
+#[cfg(feature = "sqlite")]
+fn sqlite_sharding_unsupported_guard(
     control_url: Option<&str>,
-    control_has_migrations: bool,
+    control_sharding_required: bool,
     shard_urls: &[&str],
-    shard_has_migrations: bool,
 ) -> Result<(), String> {
     fn is_sqlite(url: &str) -> bool {
         crate::config::DatabaseBackend::detect(url) == Some(crate::config::DatabaseBackend::Sqlite)
     }
-    if control_url.is_some_and(is_sqlite) && control_has_migrations {
+    if control_url.is_some_and(is_sqlite) && control_sharding_required {
         return Err(
-            "SQLite startup migrations are not yet supported in this build of autumn-web. \
-             Registered migrations cannot be applied to a SQLite target here \u{2014} apply \
-             your schema out-of-band, or boot without registered migrations. Tracking: SQLite \
-             migration support is a follow-up to #1614."
+            "SQLite deployments do not support sharding. The configured sqlite:// control target \
+             has sharding enabled (shards and/or the directory/shard-map control migrations), \
+             which is a Postgres-only capability \u{2014} remove the shard configuration to run \
+             on SQLite, or use a Postgres control database. Tracking: #1614."
                 .to_owned(),
         );
     }
-    if shard_has_migrations && shard_urls.iter().copied().any(is_sqlite) {
+    if shard_urls.iter().copied().any(is_sqlite) {
         return Err(
-            "SQLite startup migrations are not yet supported in this build of autumn-web. \
-             A configured shard targets a SQLite database, and registered migrations cannot be \
-             applied to a SQLite target here \u{2014} apply your shard schema out-of-band, or \
-             boot without registered migrations. Tracking: SQLite migration support is a \
-             follow-up to #1614."
+            "SQLite deployments do not support sharding. A configured shard targets a SQLite \
+             database, and per-shard migration/fan-out is a Postgres-only capability \u{2014} \
+             remove the SQLite shard configuration to run on SQLite, or use Postgres shard \
+             targets. Tracking: #1614."
                 .to_owned(),
         );
     }
@@ -7471,57 +7524,61 @@ fn sqlite_startup_migration_guard(
 }
 
 #[cfg(all(test, feature = "sqlite"))]
-mod sqlite_startup_migration_guard_tests {
-    use super::sqlite_startup_migration_guard;
+mod sqlite_sharding_unsupported_guard_tests {
+    use super::sqlite_sharding_unsupported_guard;
 
     #[test]
-    fn sqlite_target_with_registered_migrations_fails_fast() {
-        // The exact bug the Codex P1 flags: a sqlite:// control URL with
-        // registered migrations must NOT reach `PgConnection::establish`; it
-        // must return the actionable, SQLite-named boot error instead.
+    fn sqlite_control_target_with_sharding_fails_fast() {
+        // PR3: a sqlite:// control URL with sharding enabled must fail fast with
+        // an actionable, sharding-named boot error — sharding is Postgres-only.
         for url in [
             "sqlite:///var/lib/app.db",
             "sqlite://./relative.db",
             "sqlite::memory:",
         ] {
-            let err = sqlite_startup_migration_guard(Some(url), true, &[], false)
-                .expect_err("sqlite target + registered migrations must be rejected");
+            let err = sqlite_sharding_unsupported_guard(Some(url), true, &[])
+                .expect_err("sqlite control target + sharding must be rejected");
             assert!(
-                err.contains("SQLite startup migrations are not yet supported"),
-                "message must name the SQLite situation clearly: {err}"
+                err.contains("do not support sharding"),
+                "message must name the sharding situation clearly: {err}"
             );
             assert!(
                 err.contains("#1614"),
-                "message must point at the tracking follow-up: {err}"
+                "message must point at the tracking issue: {err}"
             );
         }
     }
 
     #[test]
-    fn sqlite_target_without_migrations_boots() {
-        // The manual-schema path (the `sqlite_boot_serve` scenario): a sqlite
-        // target with no registered migrations must boot normally.
-        assert!(
-            sqlite_startup_migration_guard(Some("sqlite:///var/lib/app.db"), false, &[], false)
-                .is_ok(),
-            "sqlite target + no migrations must boot"
-        );
+    fn sqlite_control_target_without_sharding_boots() {
+        // PR3 behavior: a sqlite target with registered (non-sharding)
+        // migrations now boots — they are applied by `auto_migrate_sqlite`.
+        for url in [
+            "sqlite:///var/lib/app.db",
+            "sqlite://./relative.db",
+            "sqlite::memory:",
+        ] {
+            assert!(
+                sqlite_sharding_unsupported_guard(Some(url), false, &[]).is_ok(),
+                "sqlite target without sharding must boot (migrations now applied): {url}"
+            );
+        }
     }
 
     #[test]
     fn postgres_target_is_unchanged() {
-        // The default Postgres path is untouched, migrations registered or not.
+        // The default Postgres path is untouched, sharding required or not.
         for url in [
             "postgres://u@h/db",
             "postgresql://user:pass@db:5432/app",
             "host=db user=app sslmode=require",
         ] {
             assert!(
-                sqlite_startup_migration_guard(Some(url), true, &[], false).is_ok(),
+                sqlite_sharding_unsupported_guard(Some(url), true, &[]).is_ok(),
                 "postgres target must never be gated: {url}"
             );
             assert!(
-                sqlite_startup_migration_guard(Some(url), false, &[], false).is_ok(),
+                sqlite_sharding_unsupported_guard(Some(url), false, &[]).is_ok(),
                 "postgres target must never be gated: {url}"
             );
         }
@@ -7530,54 +7587,41 @@ mod sqlite_startup_migration_guard_tests {
     #[test]
     fn absent_control_url_boots() {
         // No control URL (no-DB / opt-out provider): nothing to gate.
-        assert!(sqlite_startup_migration_guard(None, true, &[], false).is_ok());
-        assert!(sqlite_startup_migration_guard(None, false, &[], false).is_ok());
+        assert!(sqlite_sharding_unsupported_guard(None, true, &[]).is_ok());
+        assert!(sqlite_sharding_unsupported_guard(None, false, &[]).is_ok());
     }
 
     #[test]
-    fn sqlite_shard_target_with_registered_migrations_fails_fast() {
-        // The Codex P1: a shards-only app (no control topology, so the control
-        // arg is None) with a `sqlite:` shard primary_url and registered
-        // migrations must NOT reach the Postgres shard-migration harness; it
-        // must return the actionable, SQLite-named boot error instead.
-        let err = sqlite_startup_migration_guard(
-            None,
-            false,
-            &["sqlite:///var/lib/shard0.db", "postgres://u@h/shard1"],
-            true,
-        )
-        .expect_err("a sqlite shard target + registered migrations must be rejected");
-        assert!(
-            err.contains("SQLite startup migrations are not yet supported")
-                && err.contains("shard"),
-            "message must name the SQLite shard situation clearly: {err}"
-        );
-        assert!(
-            err.contains("#1614"),
-            "message must point at the tracking follow-up: {err}"
-        );
-    }
-
-    #[test]
-    fn sqlite_shard_target_without_migrations_boots() {
-        // A sqlite shard with no registered migrations (manual-schema shards)
-        // must boot normally.
-        assert!(
-            sqlite_startup_migration_guard(None, false, &["sqlite:///var/lib/shard0.db"], false)
-                .is_ok(),
-            "sqlite shard + no migrations must boot"
-        );
+    fn sqlite_shard_target_fails_fast() {
+        // A `sqlite:` shard `primary_url` is sharding-on-SQLite regardless of the
+        // control backend and regardless of migrations — the shard loop routes it
+        // through the Postgres-only harness. It must be rejected with the
+        // actionable sharding error.
+        for shards in [
+            &["sqlite:///var/lib/shard0.db"][..],
+            &["sqlite:///var/lib/shard0.db", "postgres://u@h/shard1"][..],
+        ] {
+            let err = sqlite_sharding_unsupported_guard(None, false, shards)
+                .expect_err("a sqlite shard target must be rejected");
+            assert!(
+                err.contains("do not support sharding") && err.contains("shard"),
+                "message must name the SQLite shard situation clearly: {err}"
+            );
+            assert!(
+                err.contains("#1614"),
+                "message must point at the tracking issue: {err}"
+            );
+        }
     }
 
     #[test]
     fn postgres_shard_targets_are_unchanged() {
-        // All-Postgres shards are never gated, migrations registered or not.
+        // All-Postgres shards are never gated, sharding required or not.
         assert!(
-            sqlite_startup_migration_guard(
+            sqlite_sharding_unsupported_guard(
                 Some("postgres://u@h/control"),
                 true,
                 &["postgres://u@h/shard0", "postgres://u@h/shard1"],
-                true,
             )
             .is_ok(),
             "all-postgres shard targets must never be gated"
@@ -7586,55 +7630,48 @@ mod sqlite_startup_migration_guard_tests {
 
     #[test]
     fn migrate_only_mode_reuses_the_boot_guard_for_sqlite_targets() {
-        // `run_migrate_only_mode` (the `AUTUMN_MIGRATE=1` one-shot) now applies the
-        // SAME guard as normal boot BEFORE its migration loop, so a SQLite migrate
-        // target with registered migrations exits with the actionable error rather
-        // than attempting a `PgConnection` through the Postgres-only harness. The
-        // migrate-only path always has a non-empty migration set at the guard point,
-        // so it passes `control_has_migrations = shard_has_migrations = true`.
+        // `run_migrate_only_mode` (the `AUTUMN_MIGRATE=1` one-shot) applies the
+        // SAME guard as normal boot BEFORE its migration loop, so the boot and
+        // migrate-only paths cannot drift. A sqlite control/shard target with
+        // sharding still fails fast; a plain sqlite control target now proceeds
+        // (its migrations are applied by the sqlite apply path).
 
-        // A sqlite CONTROL migrate target + registered migrations → actionable error.
-        let err = sqlite_startup_migration_guard(Some("sqlite:///var/lib/app.db"), true, &[], true)
-            .expect_err("sqlite migrate control target must be rejected, not sent to PgConnection");
+        // A sqlite CONTROL migrate target with sharding → actionable error.
+        let err = sqlite_sharding_unsupported_guard(Some("sqlite:///var/lib/app.db"), true, &[])
+            .expect_err("sqlite migrate control target with sharding must be rejected");
         assert!(
-            err.contains("SQLite startup migrations are not yet supported")
-                && err.contains("#1614"),
-            "migrate-only sqlite control error must be the actionable boot message: {err}"
+            err.contains("do not support sharding") && err.contains("#1614"),
+            "migrate-only sqlite control error must be the actionable sharding message: {err}"
         );
 
-        // A sqlite SHARD migrate target + registered migrations → actionable error.
-        let shard_err = sqlite_startup_migration_guard(
+        // A sqlite SHARD migrate target → actionable error.
+        let shard_err = sqlite_sharding_unsupported_guard(
             Some("postgres://u@h/control"),
             true,
             &["sqlite:///var/lib/shard0.db"],
-            true,
         )
-        .expect_err("sqlite migrate shard target must be rejected, not sent to PgConnection");
+        .expect_err("sqlite migrate shard target must be rejected");
         assert!(
-            shard_err.contains("SQLite startup migrations are not yet supported")
-                && shard_err.contains("shard"),
-            "migrate-only sqlite shard error must be the actionable boot message: {shard_err}"
+            shard_err.contains("do not support sharding") && shard_err.contains("shard"),
+            "migrate-only sqlite shard error must be the actionable sharding message: {shard_err}"
         );
 
         // An all-Postgres migrate configuration (control + shards) is never gated.
         assert!(
-            sqlite_startup_migration_guard(
+            sqlite_sharding_unsupported_guard(
                 Some("postgres://u@h/control"),
                 true,
                 &["postgres://u@h/shard0"],
-                true,
             )
             .is_ok(),
             "an all-postgres migrate configuration must proceed unchanged"
         );
 
-        // A sqlite migrate target with NO registered migrations (manual-schema) is
-        // impossible in migrate-only (it early-exits before the guard), but the
-        // helper still returns Ok, confirming the guard only fires on real applies.
+        // A plain sqlite migrate control target (no sharding) proceeds — its
+        // migrations are applied by the sqlite apply path.
         assert!(
-            sqlite_startup_migration_guard(Some("sqlite:///var/lib/app.db"), false, &[], false)
-                .is_ok(),
-            "sqlite target with no migrations must never be gated"
+            sqlite_sharding_unsupported_guard(Some("sqlite:///var/lib/app.db"), false, &[]).is_ok(),
+            "sqlite control target without sharding must never be gated"
         );
     }
 }
@@ -7674,6 +7711,31 @@ async fn run_startup_migrations(
     let profile = config.profile.clone();
     let auto_in_prod = config.database.auto_migrate_in_production;
     let migration_result = tokio::task::spawn_blocking(move || {
+        // SQLite single-writer startup-migration path (issue #1614, PR3): apply
+        // the registered migrations to a `sqlite://` control target with NO
+        // advisory lock. Sharding (directory / shard-map / per-shard fan-out) is
+        // Postgres-only and is rejected upstream in `setup_database`
+        // (`sqlite_sharding_unsupported_guard`), so there is nothing shard- or
+        // directory-related to do on this path — the directory/shard-map framework
+        // migrations below are skipped for a SQLite control target. The Postgres
+        // path is left byte-identical for every non-SQLite target.
+        #[cfg(feature = "sqlite")]
+        if let Some(url) = control_url.as_deref()
+            && crate::config::DatabaseBackend::detect(url)
+                == Some(crate::config::DatabaseBackend::Sqlite)
+        {
+            for mig in &migrations {
+                crate::migrate::auto_migrate_sqlite(
+                    url,
+                    profile.as_deref(),
+                    auto_in_prod,
+                    mig,
+                    "control",
+                );
+            }
+            return;
+        }
+
         if let Some(url) = control_url {
             for mig in &migrations {
                 crate::migrate::auto_migrate(
@@ -9836,14 +9898,14 @@ mod tests {
             "the migrate handler exits after applying"
         );
 
-        // Issue #1614 follow-up: the migrate one-shot must apply the SAME SQLite
-        // guard as normal boot BEFORE its migration loop, so a `sqlite:` target with
-        // registered migrations exits with the actionable unsupported-migrations
-        // error instead of a generic `PgConnection` failure — and the two paths
-        // cannot drift because both call `sqlite_startup_migration_guard`.
+        // Issue #1614, PR3: the migrate one-shot must apply the SAME SQLite
+        // sharding guard as normal boot BEFORE its migration loop, so a sharded
+        // `sqlite:` target exits with the actionable sharding error instead of a
+        // generic `PgConnection` failure — and the two paths cannot drift because
+        // both call `sqlite_sharding_unsupported_guard`.
         let guard_call = handler
-            .find("sqlite_startup_migration_guard(")
-            .expect("migrate handler applies the SQLite migrate guard");
+            .find("sqlite_sharding_unsupported_guard(")
+            .expect("migrate handler applies the SQLite sharding guard");
         let first_apply = handler
             .find("apply_pending_or_exit")
             .expect("migrate handler applies per target");
