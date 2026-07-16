@@ -40,16 +40,15 @@ jobs:
         run: cargo clippy -p autumn-web --features "ws,mail,offline-sync,redis" --all-targets -- -D warnings
       - name: Panic-free request-path gate
         run: ./scripts/check-panic-gate.sh
-      - name: Accessibility gate (raw html! escape hatches in framework source)
+      - name: Accessibility gate (raw html! escape hatches across the repo)
         # `autumn a11y verify` statically audits raw `html!` markup for fields
         # that bypass the typed a11y primitives and lack an accessible name.
-        # Scoped to the framework's own source (autumn/src + autumn-cli/src);
-        # examples/ and the admin plugin are tracked separately. The verifier
-        # takes a single path, so scan each dir in its own invocation; either
-        # non-zero exit fails the job.
-        run: |
-          cargo run -p autumn-cli --bin autumn -- a11y verify autumn/src
-          cargo run -p autumn-cli --bin autumn -- a11y verify autumn-cli/src
+        # Scoped to the whole repo root now that the framework source, the admin
+        # plugin, and every example are clean (issue #1934). The scanner skips
+        # `target/`, dot-dirs, and `tests/` directories (test scaffolding and the
+        # committed red/green fixtures), so a single invocation over `.` fails the
+        # job on any real product finding.
+        run: cargo run -p autumn-cli --bin autumn -- a11y verify .
 
   test:
     name: Test (${{ matrix.os }})
@@ -64,7 +63,7 @@ jobs:
       - name: Free disk space (Linux)
         if: runner.os == 'Linux'
         run: |
-          # The full workspace build (especially the --all-features +
+          # The full workspace build (especially the wide-feature +
           # Postgres-container step below) sits near the runner's disk
           # ceiling; a cold-cache PR build tips it over ("No space left on
           # device"). Reclaim the preinstalled toolchains a Rust build never
@@ -103,11 +102,18 @@ jobs:
           ssh -V
       - name: Run Docker-dependent tests
         if: runner.os == 'Linux'
-        timeout-minutes: 30
+        timeout-minutes: 45
         run: |
           cargo test -p autumn-web --test db_hooks_lifecycle -- --ignored
           cargo test -p autumn-web --test repository_shard_replica_routing -- --ignored
-          cargo test -p autumn-web --all-features --test feature_flags_pg_integration -- --ignored
+          # NOTE: explicit feature list (NOT `--all-features`). `--all-features`
+          # would enable the backend-flip `sqlite` feature, which flips
+          # `db::RuntimeConnection` from `AsyncPgConnection` to a SQLite
+          # connection and fails to compile the Postgres-assuming modules
+          # (db.rs/managed_pg.rs/state.rs/job.rs/repository.rs/sharding.rs). This
+          # list is every autumn-web feature EXCEPT `sqlite` (i.e. the Postgres
+          # backend, which this pg-integration test requires). See #1614.
+          cargo test -p autumn-web --features "ws,presence,flash,cache-moka,maud,htmx,multipart,tailwind,http-client,oauth2,webauthn,openapi,mcp,markdown,db,offline-sync,test-support,telemetry-otlp,redis,i18n,embed-assets,storage,variants,reporting,mail,inbound-mail,inbound-mailgun,inbound-ses,seed,system-info,csv,system-tests,managed-pg,managed-pg-bundled,tls,acme" --test feature_flags_pg_integration -- --ignored
           cargo test -p autumn-web --test scoped_tokens_db -- --ignored
           cargo test -p autumn-admin-plugin --test token_admin_db -- --ignored
           cargo test -p autumn-cache-redis -- --ignored
@@ -143,8 +149,17 @@ jobs:
           # `#[cfg(feature = "offline-sync")]` (not a default feature), so the
           # workspace test run above compiles them out; run them here. Same
           # feature set as the sweep below so the binary is compiled once.
-          cargo test -p autumn-web --features "test-support,offline-sync" --test integration_tests offline_sync
-          cargo test -p autumn-web --features "test-support,offline-sync" --test integration_tests -- \
+          #
+          # The feature set also enables `ws`, `mail`, and `redis` (#1945): those
+          # gate previously-unreachable testcontainer-managed Docker `#[ignore]`d
+          # tests (the `ws` live_broadcast OOB-fragment suite, the `redis` worker-
+          # gating/dedicated-capacity/rate-limit suites, and the `mail` newsletter
+          # unsubscribe test) which never compiled into this binary and so were
+          # never swept. All are Postgres/Redis testcontainer-managed, so no CI
+          # `services:` block is needed. Chromium/browser tests stay OUT — they
+          # live behind `system-tests` and require a browser this runner lacks.
+          cargo test -p autumn-web --features "test-support,offline-sync,ws,mail,redis" --test integration_tests offline_sync
+          cargo test -p autumn-web --features "test-support,offline-sync,ws,mail,redis" --test integration_tests -- \
             --ignored \
             --test-threads=1 \
             --skip per_request_overhead_is_under_50_microseconds_p99 \
@@ -197,14 +212,24 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           cargo llvm-cov clean --workspace
-          cargo llvm-cov --workspace --all-features --no-report
-          cargo llvm-cov --no-report -p autumn-web --all-features \
+          # `--all-features` is unsafe here: it would enable autumn-web's
+          # backend-flip `sqlite` feature alongside the Postgres-assuming
+          # features, flipping `db::RuntimeConnection` to SQLite and failing
+          # autumn-web's lib to compile (#1614). Cargo has no "all-features
+          # except one crate feature" flag, so cover the rest of the workspace
+          # with `--all-features --exclude autumn-web`, then cover autumn-web
+          # separately with an explicit Postgres feature list (every autumn-web
+          # feature EXCEPT `sqlite`). Both accumulate into the same profile set.
+          PG_FEATURES="ws,presence,flash,cache-moka,maud,htmx,multipart,tailwind,http-client,oauth2,webauthn,openapi,mcp,markdown,db,offline-sync,test-support,telemetry-otlp,redis,i18n,embed-assets,storage,variants,reporting,mail,inbound-mail,inbound-mailgun,inbound-ses,seed,system-info,csv,system-tests,managed-pg,managed-pg-bundled,tls,acme"
+          cargo llvm-cov --workspace --exclude autumn-web --all-features --no-report
+          cargo llvm-cov --no-report -p autumn-web --features "$PG_FEATURES"
+          cargo llvm-cov --no-report -p autumn-web --features "$PG_FEATURES" \
             --test db_hooks_lifecycle -- --ignored
-          cargo llvm-cov --no-report -p autumn-web --all-features \
+          cargo llvm-cov --no-report -p autumn-web --features "$PG_FEATURES" \
             --test repository_shard_replica_routing -- --ignored
-          cargo llvm-cov --no-report -p autumn-web --all-features \
+          cargo llvm-cov --no-report -p autumn-web --features "$PG_FEATURES" \
             --test feature_flags_pg_integration -- --ignored
-          cargo llvm-cov --no-report -p autumn-web --all-features \
+          cargo llvm-cov --no-report -p autumn-web --features "$PG_FEATURES" \
             --test scoped_tokens_db -- --ignored
           cargo llvm-cov --no-report -p autumn-admin-plugin \
             --test token_admin_db -- --ignored

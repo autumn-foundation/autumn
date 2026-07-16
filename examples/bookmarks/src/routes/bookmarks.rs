@@ -204,6 +204,7 @@ pub async fn show(id: Path<i64>, mut db: Db) -> AutumnResult<Markup> {
                     "Edit"
                 }
                 button
+                    aria-label="Delete bookmark"
                     hx-delete=(format!("/api/bookmarks/{}", row.id))
                     hx-confirm="Delete this bookmark?"
                     hx-on--after-request="if(event.detail.successful) window.location='/bookmarks'"
