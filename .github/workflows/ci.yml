@@ -63,7 +63,7 @@ jobs:
       - name: Free disk space (Linux)
         if: runner.os == 'Linux'
         run: |
-          # The full workspace build (especially the --all-features +
+          # The full workspace build (especially the wide-feature +
           # Postgres-container step below) sits near the runner's disk
           # ceiling; a cold-cache PR build tips it over ("No space left on
           # device"). Reclaim the preinstalled toolchains a Rust build never
@@ -106,7 +106,14 @@ jobs:
         run: |
           cargo test -p autumn-web --test db_hooks_lifecycle -- --ignored
           cargo test -p autumn-web --test repository_shard_replica_routing -- --ignored
-          cargo test -p autumn-web --all-features --test feature_flags_pg_integration -- --ignored
+          # NOTE: explicit feature list (NOT `--all-features`). `--all-features`
+          # would enable the backend-flip `sqlite` feature, which flips
+          # `db::RuntimeConnection` from `AsyncPgConnection` to a SQLite
+          # connection and fails to compile the Postgres-assuming modules
+          # (db.rs/managed_pg.rs/state.rs/job.rs/repository.rs/sharding.rs). This
+          # list is every autumn-web feature EXCEPT `sqlite` (i.e. the Postgres
+          # backend, which this pg-integration test requires). See #1614.
+          cargo test -p autumn-web --features "ws,presence,flash,cache-moka,maud,htmx,multipart,tailwind,http-client,oauth2,webauthn,openapi,mcp,markdown,db,offline-sync,test-support,telemetry-otlp,redis,i18n,embed-assets,storage,variants,reporting,mail,inbound-mail,inbound-mailgun,inbound-ses,seed,system-info,csv,system-tests,managed-pg,managed-pg-bundled,tls,acme" --test feature_flags_pg_integration -- --ignored
           cargo test -p autumn-web --test scoped_tokens_db -- --ignored
           cargo test -p autumn-admin-plugin --test token_admin_db -- --ignored
           cargo test -p autumn-cache-redis -- --ignored
@@ -205,14 +212,24 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           cargo llvm-cov clean --workspace
-          cargo llvm-cov --workspace --all-features --no-report
-          cargo llvm-cov --no-report -p autumn-web --all-features \
+          # `--all-features` is unsafe here: it would enable autumn-web's
+          # backend-flip `sqlite` feature alongside the Postgres-assuming
+          # features, flipping `db::RuntimeConnection` to SQLite and failing
+          # autumn-web's lib to compile (#1614). Cargo has no "all-features
+          # except one crate feature" flag, so cover the rest of the workspace
+          # with `--all-features --exclude autumn-web`, then cover autumn-web
+          # separately with an explicit Postgres feature list (every autumn-web
+          # feature EXCEPT `sqlite`). Both accumulate into the same profile set.
+          PG_FEATURES="ws,presence,flash,cache-moka,maud,htmx,multipart,tailwind,http-client,oauth2,webauthn,openapi,mcp,markdown,db,offline-sync,test-support,telemetry-otlp,redis,i18n,embed-assets,storage,variants,reporting,mail,inbound-mail,inbound-mailgun,inbound-ses,seed,system-info,csv,system-tests,managed-pg,managed-pg-bundled,tls,acme"
+          cargo llvm-cov --workspace --exclude autumn-web --all-features --no-report
+          cargo llvm-cov --no-report -p autumn-web --features "$PG_FEATURES"
+          cargo llvm-cov --no-report -p autumn-web --features "$PG_FEATURES" \
             --test db_hooks_lifecycle -- --ignored
-          cargo llvm-cov --no-report -p autumn-web --all-features \
+          cargo llvm-cov --no-report -p autumn-web --features "$PG_FEATURES" \
             --test repository_shard_replica_routing -- --ignored
-          cargo llvm-cov --no-report -p autumn-web --all-features \
+          cargo llvm-cov --no-report -p autumn-web --features "$PG_FEATURES" \
             --test feature_flags_pg_integration -- --ignored
-          cargo llvm-cov --no-report -p autumn-web --all-features \
+          cargo llvm-cov --no-report -p autumn-web --features "$PG_FEATURES" \
             --test scoped_tokens_db -- --ignored
           cargo llvm-cov --no-report -p autumn-admin-plugin \
             --test token_admin_db -- --ignored
