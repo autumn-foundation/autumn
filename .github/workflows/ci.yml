@@ -205,7 +205,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           cargo llvm-cov clean --workspace
-          cargo llvm-cov --workspace --all-features --no-report
+          cargo llvm-cov --workspace --no-report
           cargo llvm-cov --no-report -p autumn-web --all-features \
             --test db_hooks_lifecycle -- --ignored
           cargo llvm-cov --no-report -p autumn-web --all-features \
