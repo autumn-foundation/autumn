@@ -80,6 +80,10 @@ pub struct S3MediaStorage {
     pub access_key_id: String,
     /// Secret access key (redacted in `Debug`).
     pub secret_access_key: String,
+    /// Session token for temporary/rotating credentials (Lambda/ECS), if any.
+    /// `None` selects permanent static keys (e.g. Tigris) or the ambient chain.
+    /// Sensitive — redacted in `Debug`.
+    pub session_token: Option<String>,
     /// Public base URL that stored objects resolve under.
     pub public_base_url: String,
     /// Object key prefix (namespace) prepended to caller keys.
@@ -105,6 +109,10 @@ impl std::fmt::Debug for S3MediaStorage {
             .field("region", &self.region)
             .field("access_key_id", &self.access_key_id)
             .field("secret_access_key", &"** redacted **")
+            .field(
+                "session_token",
+                &self.session_token.as_ref().map(|_| "** redacted **"),
+            )
             .field("public_base_url", &self.public_base_url)
             .field("key_prefix", &self.key_prefix)
             .field("force_path_style", &self.force_path_style)
@@ -181,6 +189,7 @@ impl MediaStorage {
                     region,
                     access_key_id: access_key_id.unwrap_or_default().to_owned(),
                     secret_access_key: secret_access_key.unwrap_or_default().to_owned(),
+                    session_token: non_empty(cfg.session_token.as_deref()).map(ToOwned::to_owned),
                     public_base_url,
                     key_prefix,
                     force_path_style: cfg.force_path_style,
@@ -381,7 +390,7 @@ impl MediaStorage {
                     let credentials = Credentials::new(
                         config.access_key_id.clone(),
                         config.secret_access_key.clone(),
-                        None,
+                        config.session_token.clone(),
                         None,
                         "autumn-media-plugin",
                     );
@@ -740,6 +749,7 @@ mod tests {
     fn secret_access_key_is_redacted_in_debug() {
         let mut cfg = s3_config(Some("b"));
         cfg.secret_access_key = Some("s3kr3t-value-xyz".to_owned());
+        cfg.session_token = Some("session-token-value-abc".to_owned());
         let storage = MediaStorage::from_config(&cfg).unwrap();
         let rendered = format!("{storage:?}");
         assert!(rendered.contains("** redacted **"));
@@ -749,6 +759,58 @@ mod tests {
             !rendered.contains("s3kr3t-value-xyz"),
             "secret value must not appear: {rendered}"
         );
+        // The session token is equally sensitive: its value must never appear,
+        // and its `Some(_)` presence must render as `** redacted **`.
+        assert!(
+            !rendered.contains("session-token-value-abc"),
+            "session token value must not appear: {rendered}"
+        );
+        assert!(
+            rendered.contains("session_token: Some(\"** redacted **\")"),
+            "session token must render redacted when present: {rendered}"
+        );
+    }
+
+    #[test]
+    fn session_token_is_none_in_debug_when_absent() {
+        // An absent session token renders as `None`, never a redaction marker.
+        let storage = MediaStorage::from_config(&s3_config(Some("b"))).unwrap();
+        let rendered = format!("{storage:?}");
+        assert!(
+            rendered.contains("session_token: None"),
+            "absent session token must render None: {rendered}"
+        );
+    }
+
+    #[test]
+    fn from_config_threads_session_token() {
+        let mut cfg = s3_config(Some("b"));
+        cfg.session_token = Some("temp-creds-token".to_owned());
+        let MediaStorage::S3(config) = MediaStorage::from_config(&cfg).unwrap() else {
+            panic!("expected s3 backend");
+        };
+        assert_eq!(config.session_token.as_deref(), Some("temp-creds-token"));
+    }
+
+    #[test]
+    fn from_config_blank_session_token_is_none() {
+        // A blank token is normalized to `None`, matching the access-key /
+        // secret-key non-empty handling.
+        let mut cfg = s3_config(Some("b"));
+        cfg.session_token = Some("   ".to_owned());
+        let MediaStorage::S3(config) = MediaStorage::from_config(&cfg).unwrap() else {
+            panic!("expected s3 backend");
+        };
+        assert_eq!(config.session_token, None);
+    }
+
+    #[test]
+    fn from_config_absent_session_token_is_none() {
+        let MediaStorage::S3(config) = MediaStorage::from_config(&s3_config(Some("b"))).unwrap()
+        else {
+            panic!("expected s3 backend");
+        };
+        assert_eq!(config.session_token, None);
     }
 
     // ── client-builder smoke test (no network) ───────────────────────────────

@@ -216,6 +216,9 @@ pub struct MediaStorageConfig {
     pub access_key_id: Option<String>,
     /// S3 secret access key (paired with `access_key_id`).
     pub secret_access_key: Option<String>,
+    /// S3 session token for temporary/rotating credentials (Lambda/ECS). `None`
+    /// selects permanent static keys or the ambient chain.
+    pub session_token: Option<String>,
     /// Public base URL served objects resolve under.
     pub public_base_url: Option<String>,
     /// Object key prefix (namespace) for stored media.
@@ -234,6 +237,7 @@ impl Default for MediaStorageConfig {
             region: None,
             access_key_id: None,
             secret_access_key: None,
+            session_token: None,
             public_base_url: None,
             key_prefix: default_s3_key_prefix(),
             force_path_style: false,
@@ -373,6 +377,7 @@ impl MediaConfig {
         interpolate_opt(&mut self.storage.region, env);
         interpolate_opt(&mut self.storage.access_key_id, env);
         interpolate_opt(&mut self.storage.secret_access_key, env);
+        interpolate_opt(&mut self.storage.session_token, env);
         interpolate_opt(&mut self.storage.public_base_url, env);
         interpolate(&mut self.storage.key_prefix, env);
     }
@@ -455,6 +460,11 @@ impl MediaConfig {
             &mut self.storage.secret_access_key,
             env,
             "AUTUMN_MEDIA__STORAGE__SECRET_ACCESS_KEY",
+        );
+        override_opt(
+            &mut self.storage.session_token,
+            env,
+            "AUTUMN_MEDIA__STORAGE__SESSION_TOKEN",
         );
         override_opt(
             &mut self.storage.public_base_url,
@@ -549,6 +559,9 @@ impl MediaConfig {
         config.storage.bucket = bucket;
         config.storage.access_key_id = access_key_id;
         config.storage.secret_access_key = secret_access_key;
+        // Standard AWS env var for temporary/rotating credentials; Arroyo has no
+        // ARROYO_-prefixed equivalent, so only the AWS_ name is read.
+        config.storage.session_token = arroyo_value(env, "AWS_SESSION_TOKEN");
         config.storage.endpoint_url = arroyo_value(env, "ARROYO_S3_ENDPOINT_URL")
             .or_else(|| arroyo_value(env, "AWS_ENDPOINT_URL_S3"));
         config.storage.region =
@@ -898,7 +911,35 @@ mod tests {
             config.storage.public_base_url.as_deref(),
             Some("https://cdn.example.com/media")
         );
+        // No AWS_SESSION_TOKEN set → session token stays None (permanent keys).
+        assert_eq!(config.storage.session_token, None);
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn arroyo_env_maps_session_token_from_aws_var() {
+        let vars = env(&[
+            ("ARROYO_VIDEO_STORAGE_BACKEND", "s3"),
+            ("BUCKET_NAME", "arroyo-bucket"),
+            ("AWS_ACCESS_KEY_ID", "AKIA"),
+            ("AWS_SECRET_ACCESS_KEY", "secret"),
+            ("AWS_SESSION_TOKEN", "temporary-session-token"),
+        ]);
+        let config = MediaConfig::from_arroyo_env_pairs(&vars);
+        assert_eq!(
+            config.storage.session_token.as_deref(),
+            Some("temporary-session-token")
+        );
+    }
+
+    #[test]
+    fn env_override_applies_session_token() {
+        let overrides = env(&[("AUTUMN_MEDIA__STORAGE__SESSION_TOKEN", "override-token")]);
+        let config = MediaConfig::from_toml_str_with_env("[media]\n", &overrides).unwrap();
+        assert_eq!(
+            config.storage.session_token.as_deref(),
+            Some("override-token")
+        );
     }
 
     #[test]
