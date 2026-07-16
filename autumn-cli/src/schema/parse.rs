@@ -26,9 +26,10 @@
 //! - `#[id]` — primary-key column (macro PK resolution is mirrored: explicit
 //!   `#[id]` fields win, else the first `i32`/`i64` field, else a reserved `id`).
 //! - `#[indexed]` — a non-unique secondary index on the column.
-//! - `#[default]` — a column default. Recoverable from the struct only for a
-//!   `created_at`-style timestamp field (→ [`ColumnDefault::Now`]); see the
-//!   slice-3+ limitation below.
+//! - `#[default]` — a column default. The `NOW()` default is recovered only for
+//!   the reserved `created_at` column (→ [`ColumnDefault::Now`]); other
+//!   `#[default]` fields carry no inferred DB default (their default, if any,
+//!   lives in the migration). See the slice-3+ limitation below.
 //! - `#[references]` / `#[references(table = "...")]` — a foreign-key column
 //!   (forces [`ColumnType::Int64`], infers the target table from the column name
 //!   via the generator's `<name>`-minus-`_id`-then-pluralize convention, and adds
@@ -61,10 +62,15 @@
 //!   foreign key from that convention (or from the association attribute) requires
 //!   cross-model resolution and is deferred; today only an explicit
 //!   `#[references]` field attribute yields a [`ForeignKey`].
-//! - **Non-timestamp default literals**: a `#[default]` on a non-timestamp field
-//!   (an enum default `'draft'`, a numeric default) does not carry its literal in
-//!   the struct — the value lives in the migration/DSL. Only the `created_at`
-//!   `NOW()` default is recoverable here; recovering the rest is a later slice.
+//! - **Non-`created_at` `#[default]` fields**: the `NOW()` default is recovered
+//!   only for the reserved `created_at` column; other `#[default]` fields carry
+//!   no inferred DB default (their default, if any, lives in the migration). A
+//!   soft-delete `deleted_at` carries `#[default]` solely to exclude it from the
+//!   generated `New*`/`Update*` structs — the migration leaves its column default
+//!   UNSET (new rows stay NULL), so the parser must not infer `Now` for it. A
+//!   `#[default]` on any other field (an enum default `'draft'`, a numeric
+//!   default) likewise does not carry its literal in the struct — the value lives
+//!   in the migration/DSL. Recovering those from the migration is a later slice.
 //! - **Unique-index name disambiguation**: the generator disambiguates a unique
 //!   index name past Postgres's 63-byte identifier limit (see
 //!   `schema_edit::unique_index_name`). The parser uses the plain
@@ -438,10 +444,22 @@ fn build_table(
         column.primary_key = is_pk;
         column.unique = raw.attrs.is_unique;
 
-        // Default: recoverable from the struct only for a `created_at`-style
-        // timestamp `#[default]` (→ NOW()); non-timestamp default literals live
-        // in the migration and are a later slice.
-        if raw.attrs.is_default && matches!(ty, ColumnType::Timestamp | ColumnType::TimestampTz) {
+        // Default (slice-3+): the NOW() default is recovered only for the
+        // reserved `created_at` column; other `#[default]` fields carry no
+        // inferred DB default (their default, if any, lives in the migration).
+        // The generator gives a DB `DEFAULT NOW()` (Postgres) / `CURRENT_TIMESTAMP`
+        // (sqlite) *only* to `created_at`. A soft-delete `deleted_at` also carries
+        // `#[default]`, but purely to exclude it from the generated `New*`/`Update*`
+        // insert structs — the migration leaves its column default UNSET so new
+        // rows stay NULL. Inferring `Now` for it (or for any user `#[default]`
+        // timestamp) would fabricate a wrong desired-state IR, so restrict the
+        // inference to the `created_at` convention. The `#[default]`→exclude-from-
+        // insert semantics are orthogonal to the IR `default`, which represents the
+        // DB column default only.
+        if raw.name == "created_at"
+            && raw.attrs.is_default
+            && matches!(ty, ColumnType::Timestamp | ColumnType::TimestampTz)
+        {
             column.default = Some(ColumnDefault::Now);
         }
 
@@ -747,7 +765,11 @@ mod tests {
     }
 
     #[test]
-    fn default_on_timestamp_is_now() {
+    fn now_default_only_for_created_at_not_other_timestamps() {
+        // A `#[default]` on a non-`created_at` timestamp field must NOT infer a
+        // NOW() default: the generator gives a DB `DEFAULT NOW()` only to the
+        // reserved `created_at` column. A non-`created_at` `#[default]`'s DB
+        // default (if any) lives in the migration, not the struct.
         let src = r#"
             #[model]
             pub struct Event {
@@ -760,7 +782,36 @@ mod tests {
             }
         "#;
         let table = parse_one(src);
-        assert_eq!(col(&table, "occurred_at").default, Some(ColumnDefault::Now));
+        assert_eq!(col(&table, "occurred_at").default, None);
+        assert_eq!(col(&table, "created_at").default, Some(ColumnDefault::Now));
+    }
+
+    #[test]
+    fn soft_delete_deleted_at_has_no_inferred_default() {
+        // The generator emits a nullable `deleted_at` with `#[default]` ONLY to
+        // exclude it from the `New*`/`Update*` insert structs — the migration
+        // leaves its column default UNSET, so new rows stay NULL. The parser must
+        // report `default == None` (never `Some(Now)`), or a later snapshot/diff
+        // would read a spurious "add DEFAULT NOW()" change that, if applied, would
+        // make newly inserted rows appear soft-deleted.
+        let src = r#"
+            #[model]
+            pub struct Post {
+                #[id]
+                pub id: i64,
+                pub title: String,
+                #[default]
+                pub deleted_at: Option<chrono::NaiveDateTime>,
+                #[default]
+                pub created_at: chrono::NaiveDateTime,
+            }
+        "#;
+        let table = parse_one(src);
+        let deleted_at = col(&table, "deleted_at");
+        assert_eq!(deleted_at.default, None);
+        assert!(deleted_at.nullable);
+        // `created_at` still recovers its NOW() default.
+        assert_eq!(col(&table, "created_at").default, Some(ColumnDefault::Now));
     }
 
     #[test]
