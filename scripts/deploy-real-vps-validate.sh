@@ -238,11 +238,25 @@ rssh "systemctl is-enabled ${APP_NAME}-blue.service" | grep -q enabled \
   || fail "blue slot unit is not enabled for boot survival"
 
 # ── 2. REAL reboot survival (item 1) ─────────────────────────────────────────
-log "rebooting the VM (real kernel power-cycle)"
+# Capture the kernel boot id BEFORE the reboot. /proc/sys/kernel/random/boot_id
+# is regenerated on every boot, so a changed value proves a real power-cycle
+# actually happened — not just an SSH reconnect to the still-running VM. Without
+# this, a rejected/failed `systemctl reboot` (hidden by `|| true`) would leave
+# the original box up, `wait_for_ssh` would succeed immediately, and the service
+# assertions would pass — falsely reporting "reboot survival" without a reboot.
+old_boot_id="$(rssh 'cat /proc/sys/kernel/random/boot_id' 2>/dev/null || true)"
+[ -n "${old_boot_id}" ] || fail "could not read boot_id before reboot (ssh problem?)"
+log "rebooting the VM (real kernel power-cycle) — boot_id before: ${old_boot_id}"
 rssh 'systemctl reboot' || true   # connection drops as the box goes down
 sleep 20
 wait_for_ssh 300
-log "VM back up — asserting app AND kamal-proxy serve after reboot"
+# Require the boot id to have changed. An empty read (failed rssh) or an
+# unchanged id means the box never actually rebooted → hard failure.
+new_boot_id="$(rssh 'cat /proc/sys/kernel/random/boot_id' 2>/dev/null || true)"
+[ -n "${new_boot_id}" ] || fail "VM did not actually reboot — boot_id unreadable after wait_for_ssh"
+[ "${new_boot_id}" != "${old_boot_id}" ] \
+  || fail "VM did not actually reboot — boot_id unchanged (${old_boot_id}); reboot was likely rejected"
+log "VM back up — boot_id after: ${new_boot_id} — asserting app AND kamal-proxy serve after reboot"
 body="$(wait_for_serving / "${APP_NAME} v1" 120)"
 rssh 'systemctl is-active kamal-proxy.service' | grep -q '^active' \
   || fail "kamal-proxy.service is not active after reboot"
