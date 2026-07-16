@@ -111,14 +111,20 @@ vendor_in_tree_autumn_web() {
   mkdir -p "${vendor_dir}"
 
   # autumn (= autumn-web) and its path-dep autumn-macros are the only crates the
-  # scaffold's framework dependency needs. The shared target/ lives at the
-  # workspace root, so these crate dirs are source-only and cheap to copy.
+  # scaffold's framework dependency needs. autumn-cli is vendored so it can be
+  # installed from source (see inject_local_autumn_binary), and autumn-schema-core
+  # is vendored because autumn-cli now carries a `path = "../autumn-schema-core"`
+  # dependency on it — without the crate on disk `cargo install --path
+  # ./vendor/autumn-cli` fails to read `vendor/autumn-schema-core/Cargo.toml`. The
+  # shared target/ lives at the workspace root, so these crate dirs are
+  # source-only and cheap to copy.
   cp -R "${REPO_ROOT}/autumn" "${vendor_dir}/autumn"
   cp -R "${REPO_ROOT}/autumn-macros" "${vendor_dir}/autumn-macros"
   cp -R "${REPO_ROOT}/autumn-cli" "${vendor_dir}/autumn-cli"
+  cp -R "${REPO_ROOT}/autumn-schema-core" "${vendor_dir}/autumn-schema-core"
   # Drop any stray build artifacts so the context stays small and deterministic.
   rm -rf "${vendor_dir}/autumn/target" "${vendor_dir}/autumn-macros/target" \
-         "${vendor_dir}/autumn-cli/target"
+         "${vendor_dir}/autumn-cli/target" "${vendor_dir}/autumn-schema-core/target"
   # Copy the monorepo Cargo.lock into vendor/ so `cargo install --locked` inside
   # Docker uses the same pinned dependency versions as the main workspace (e.g.
   # time=0.3.47, which is compatible with cookie-0.18.1; free resolution picks
@@ -127,13 +133,15 @@ vendor_in_tree_autumn_web() {
 
   # A workspace root so the vendored crates' `*.workspace = true` keys,
   # `[workspace.dependencies]`, and `[workspace.lints]` resolve exactly as in the
-  # real tree. Derived from the real root manifest (members trimmed to the three
+  # real tree. Derived from the real root manifest (members trimmed to the four
   # vendored crates) so it stays in sync automatically.
   # autumn-cli is included so that `cargo install --path ./vendor/autumn-cli` (used
   # by inject_local_autumn_binary) resolves workspace dependencies correctly and
   # compiles inside Docker against the builder's glibc — avoiding the glibc version
   # mismatch that arises when copying a runner-built binary into the container.
-  sed 's|^members = \[.*\]|members = ["autumn", "autumn-macros", "autumn-cli"]|' \
+  # autumn-schema-core is a member because autumn-cli path-depends on it and it
+  # inherits `*.workspace = true` keys that must resolve against this root.
+  sed 's|^members = \[.*\]|members = ["autumn", "autumn-macros", "autumn-cli", "autumn-schema-core"]|' \
     "${REPO_ROOT}/Cargo.toml" > "${vendor_dir}/Cargo.toml"
 
   # The scaffold's own Cargo.toml declares an (empty) `[workspace]`, which makes
