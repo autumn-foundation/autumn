@@ -409,6 +409,7 @@ dependencies = [
 name = "autumn-cli"
 version = "0.6.0"
 dependencies = [
+ "autumn-schema-core",
  "autumn-web",
  "base64 0.22.1",
  "chrono",
@@ -469,6 +470,14 @@ dependencies = [
  "thiserror 2.0.18",
  "toml 1.1.2+spec-1.1.0",
  "tracing",
+]
+
+[[package]]
+name = "autumn-schema-core"
+version = "0.6.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

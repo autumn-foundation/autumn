@@ -1,0 +1,21 @@
+[package]
+name = "autumn-schema-core"
+description = "Canonical, dialect-independent schema IR + type mappings for the Autumn web framework"
+edition.workspace = true
+rust-version.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage = "https://github.com/madmax983/autumn"
+readme = "README.md"
+keywords = ["web", "schema", "codegen", "diesel", "fullstack"]
+categories = ["web-programming", "database"]
+
+[dependencies]
+serde = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

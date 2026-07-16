@@ -36,6 +36,7 @@ acme = ["tls", "autumn-web/acme"]
 autumn-web = { version = "0.6.0", path = "../autumn", default-features = false, features = [
     "db", "htmx", "maud", "mail", "storage", "i18n", "telemetry-otlp", "redis", "cache-moka", "http-client", "reporting"
 ] }
+autumn-schema-core = { path = "../autumn-schema-core" }
 base64 = "0.22"
 clap = { version = "4", features = ["derive", "env"] }
 diesel = { workspace = true }
