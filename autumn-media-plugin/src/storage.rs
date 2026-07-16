@@ -213,29 +213,54 @@ impl MediaStorage {
         }
     }
 
-    /// Resolve the caller key into the backend's stored object key.
+    /// Resolve a caller-relative key into the backend's fully-resolved stored
+    /// object key — the **single authority** for key-prefix + slash
+    /// normalization.
     ///
-    /// The local backend passes the key through unchanged; the S3 backend
-    /// prepends the configured key prefix (slash-trimmed) via
-    /// [`join_key_prefix`].
-    #[must_use]
-    pub fn object_key(&self, key: &str) -> String {
+    /// The local backend slash-trims the key; the S3 backend prepends the
+    /// configured key prefix (both ends slash-trimmed) via [`join_key_prefix`].
+    /// Every method that needs the stored key ([`Self::object_key`],
+    /// [`Self::storage_uri`], [`Self::persist_file_with_content_type`], and
+    /// [`Self::remove_object_if_present`]) routes through this one helper, so
+    /// they can never diverge on prefix or slash handling.
+    fn resolved_key(&self, key: &str) -> String {
         match self {
-            Self::Local { .. } => key.to_owned(),
+            Self::Local { .. } => key.trim_matches('/').to_owned(),
             Self::S3(config) => join_key_prefix(&config.key_prefix, key),
         }
+    }
+
+    /// Resolve the caller-relative key into the backend's stored object key.
+    ///
+    /// The local backend slash-trims the key; the S3 backend prepends the
+    /// configured key prefix (slash-trimmed). This is the same resolution used
+    /// by [`Self::persist_file`], [`Self::storage_uri`], and
+    /// [`Self::remove_object_if_present`], so the key advertised here is exactly
+    /// the key those methods store, address, and delete.
+    #[must_use]
+    pub fn object_key(&self, key: &str) -> String {
+        self.resolved_key(key)
     }
 
     /// The public URL a browser fetches the object at — the backend's public
     /// base joined with the caller key.
     ///
-    /// The key's path segments are percent-encoded (preserving `/`
-    /// separators) so a caller key containing URL-reserved characters (e.g.
-    /// `#`, `?`, space) addresses exactly the stored object rather than being
-    /// reinterpreted as a fragment/query by the browser.
+    /// The caller key is slash-trimmed first (identically to the stored key —
+    /// see [`Self::resolved_key`] / [`join_key_prefix`]) so a trailing slash can
+    /// never advertise a URL (`…/clips/a.mp4/`) that differs from the object
+    /// actually stored (`…/clips/a.mp4`). The key's path segments are then
+    /// percent-encoded (preserving `/` separators) so a caller key containing
+    /// URL-reserved characters (e.g. `#`, `?`, space) addresses exactly the
+    /// stored object rather than being reinterpreted as a fragment/query by the
+    /// browser.
+    ///
+    /// The S3 public base already embeds the key prefix (see
+    /// [`default_tigris_public_base`]), so this joins the base with the
+    /// caller-relative key and — unlike the stored key — does **not** re-apply
+    /// the prefix here.
     #[must_use]
     pub fn public_url(&self, key: &str) -> String {
-        let encoded = encode_key_for_url(key);
+        let encoded = encode_key_for_url(key.trim_matches('/'));
         match self {
             Self::Local {
                 public_base_url, ..
@@ -245,31 +270,53 @@ impl MediaStorage {
     }
 
     /// The stored object URI: the on-disk path for the local backend, or an
-    /// `s3://{bucket}/{key}` URI for the S3 backend.
+    /// `s3://{bucket}/{stored_key}` URI for the S3 backend.
     ///
-    /// The S3 form uses the *stored* object key ([`Self::object_key`]).
+    /// The S3 form embeds the fully-resolved stored key ([`Self::resolved_key`],
+    /// prefix-inclusive) — the same key [`Self::persist_file`] uploads to and
+    /// [`Self::parse_s3_uri_key`] round-trips back into a caller-relative key.
     #[must_use]
     pub fn storage_uri(&self, key: &str, local_path: &Path) -> String {
         match self {
             Self::Local { .. } => local_path.display().to_string(),
-            Self::S3(config) => format!("s3://{}/{}", config.bucket, self.object_key(key)),
+            Self::S3(config) => format!("s3://{}/{}", config.bucket, self.resolved_key(key)),
         }
     }
 
-    /// Extract the object key from an `s3://{bucket}/{key}` URI.
+    /// Extract the **caller-relative** object key from an `s3://{bucket}/{key}`
+    /// URI (e.g. one produced by [`Self::storage_uri`]).
     ///
-    /// The generalized form of Arroyo's `highlight_storage_object_key`: returns
-    /// `Some(key)` only for a well-formed S3 URI with a non-empty key; a local
-    /// path, a non-`s3://` URI, or a degenerate URI returns `None`, so callers
+    /// The generalized form of Arroyo's `highlight_storage_object_key`, but with
+    /// a load-bearing difference: the stored key embedded in the URI is
+    /// prefix-**inclusive** (`{key_prefix}/{caller_key}`), whereas this crate's
+    /// public methods ([`Self::persist_file`], [`Self::remove_object_if_present`],
+    /// [`Self::public_url`]) take a caller-**relative** key and apply the prefix
+    /// internally. This method therefore strips the configured `key_prefix` back
+    /// off, so a key round-tripped through the URI can be handed straight to
+    /// [`Self::remove_object_if_present`] and delete the **same** object
+    /// [`Self::persist_file`] created — never a double-prefixed
+    /// `{key_prefix}/{key_prefix}/…` that would target the wrong object and leak
+    /// the real one.
+    ///
+    /// Returns `Some(key)` only for a well-formed S3 URI whose key is non-empty
+    /// after prefix stripping; a local path, a non-`s3://` URI, a degenerate
+    /// URI, or a key that is nothing but the prefix returns `None`, so callers
     /// never issue a delete against an empty key.
     #[must_use]
-    pub fn parse_s3_uri_key(uri: &str) -> Option<String> {
+    pub fn parse_s3_uri_key(&self, uri: &str) -> Option<String> {
         let rest = uri.strip_prefix("s3://")?;
-        let (_bucket, key) = rest.split_once('/')?;
-        if key.is_empty() {
+        let (_bucket, stored_key) = rest.split_once('/')?;
+        if stored_key.is_empty() {
             return None;
         }
-        Some(key.to_owned())
+        let relative = match self {
+            Self::Local { .. } => stored_key.trim_matches('/').to_owned(),
+            Self::S3(config) => strip_key_prefix(&config.key_prefix, stored_key),
+        };
+        if relative.is_empty() {
+            return None;
+        }
+        Some(relative)
     }
 
     /// Persist a completed local file under `key`, defaulting the content type
@@ -311,7 +358,7 @@ impl MediaStorage {
                 uri: self.storage_uri(key, local_path),
             }),
             Self::S3(config) => {
-                let stored_key = join_key_prefix(&config.key_prefix, key);
+                let stored_key = self.resolved_key(key);
                 let body = ByteStream::from_path(local_path).await.map_err(|error| {
                     MediaError::LocalRead {
                         path: local_path.display().to_string(),
@@ -341,7 +388,13 @@ impl MediaStorage {
         }
     }
 
-    /// Best-effort delete of a stored object by caller key.
+    /// Best-effort delete of a stored object by **caller-relative** key.
+    ///
+    /// The key is resolved the same way [`Self::persist_file`] resolves it (via
+    /// [`Self::resolved_key`] — prefix applied exactly once), so passing the
+    /// same caller key you persisted deletes exactly that object. A key obtained
+    /// from [`Self::parse_s3_uri_key`] is already caller-relative, so it too can
+    /// be passed here directly without double-prefixing.
     ///
     /// The local backend is a no-op (the caller manages the staged file). The
     /// S3 backend issues a `DeleteObject`; S3 returns success for both existing
@@ -355,7 +408,7 @@ impl MediaStorage {
         match self {
             Self::Local { .. } => Ok(()),
             Self::S3(config) => {
-                let stored_key = join_key_prefix(&config.key_prefix, key);
+                let stored_key = self.resolved_key(key);
                 let client = self.build_client().await;
                 client
                     .delete_object()
@@ -469,6 +522,33 @@ pub fn join_key_prefix(prefix: &str, key: &str) -> String {
     } else {
         format!("{prefix}/{key}")
     }
+}
+
+/// The inverse of [`join_key_prefix`]: strip a leading `{prefix}/` from a stored
+/// object key, yielding the caller-relative key. Both ends are slash-trimmed.
+///
+/// The prefix is only stripped on a path-segment boundary — a stored key of
+/// `media-extra/x` is **not** stripped by the prefix `media` — so a coincidental
+/// textual prefix can never corrupt the returned key. An empty prefix, or a key
+/// that does not carry the prefix, returns the slash-trimmed key unchanged.
+#[must_use]
+pub fn strip_key_prefix(prefix: &str, stored_key: &str) -> String {
+    let prefix = prefix.trim_matches('/');
+    let stored_key = stored_key.trim_matches('/');
+    if prefix.is_empty() {
+        return stored_key.to_owned();
+    }
+    if let Some(rest) = stored_key.strip_prefix(prefix) {
+        // Only a boundary match counts: `rest` is empty (key == prefix) or the
+        // next char is the `/` separator.
+        if rest.is_empty() {
+            return String::new();
+        }
+        if let Some(after) = rest.strip_prefix('/') {
+            return after.trim_matches('/').to_owned();
+        }
+    }
+    stored_key.to_owned()
 }
 
 /// Percent-encode each path segment of a storage key for safe inclusion in a
@@ -760,30 +840,157 @@ mod tests {
     // ── parse_s3_uri_key ─────────────────────────────────────────────────────
 
     #[test]
-    fn parse_s3_uri_key_valid() {
+    fn parse_s3_uri_key_strips_prefix_to_caller_relative() {
+        // The stored key embedded in the URI is prefix-inclusive; parse strips
+        // the configured `key_prefix` ("media") back off so the returned key is
+        // caller-relative and safe to re-feed to remove_object_if_present.
+        let storage = MediaStorage::from_config(&s3_config(Some("bucket"))).unwrap();
         assert_eq!(
-            MediaStorage::parse_s3_uri_key("s3://bucket/media/clips/1.mp4"),
-            Some("media/clips/1.mp4".to_owned())
+            storage.parse_s3_uri_key("s3://bucket/media/clips/1.mp4"),
+            Some("clips/1.mp4".to_owned())
         );
     }
 
     #[test]
-    fn parse_s3_uri_key_nested() {
+    fn parse_s3_uri_key_empty_prefix_returns_full_key() {
+        let mut cfg = s3_config(Some("bucket"));
+        cfg.key_prefix = String::new();
+        let storage = MediaStorage::from_config(&cfg).unwrap();
         assert_eq!(
-            MediaStorage::parse_s3_uri_key("s3://bucket/a/b/c.jpg"),
+            storage.parse_s3_uri_key("s3://bucket/a/b/c.jpg"),
             Some("a/b/c.jpg".to_owned())
         );
     }
 
     #[test]
+    fn parse_s3_uri_key_foreign_prefix_left_intact() {
+        // A stored key that does not carry the configured prefix (nor a
+        // coincidental textual match) is returned unchanged.
+        let storage = MediaStorage::from_config(&s3_config(Some("bucket"))).unwrap();
+        assert_eq!(
+            storage.parse_s3_uri_key("s3://bucket/media-extra/x.jpg"),
+            Some("media-extra/x.jpg".to_owned())
+        );
+    }
+
+    #[test]
+    fn parse_s3_uri_key_prefix_only_is_none() {
+        // A URI whose whole key is exactly the prefix has no caller-relative
+        // key, so it is None (callers never delete an empty key).
+        let storage = MediaStorage::from_config(&s3_config(Some("bucket"))).unwrap();
+        assert_eq!(storage.parse_s3_uri_key("s3://bucket/media"), None);
+    }
+
+    #[test]
     fn parse_s3_uri_key_empty_key_is_none() {
-        assert_eq!(MediaStorage::parse_s3_uri_key("s3://bucket/"), None);
+        let storage = MediaStorage::from_config(&s3_config(Some("bucket"))).unwrap();
+        assert_eq!(storage.parse_s3_uri_key("s3://bucket/"), None);
     }
 
     #[test]
     fn parse_s3_uri_key_non_s3_is_none() {
-        assert_eq!(MediaStorage::parse_s3_uri_key("/local/path/1.mp4"), None);
-        assert_eq!(MediaStorage::parse_s3_uri_key("https://x/y"), None);
+        let storage = MediaStorage::from_config(&s3_config(Some("bucket"))).unwrap();
+        assert_eq!(storage.parse_s3_uri_key("/local/path/1.mp4"), None);
+        assert_eq!(storage.parse_s3_uri_key("https://x/y"), None);
+    }
+
+    // ── contract round-trip: persist ⇄ storage_uri ⇄ parse ⇄ remove ──────────
+
+    #[test]
+    fn key_resolution_is_consistent_across_object_key_storage_uri_and_parse() {
+        // With key_prefix = "media", a caller key `clips/a.mp4` must resolve to
+        // `media/clips/a.mp4` EVERYWHERE, and the parse→remove path must target
+        // that same key — never a double-prefixed `media/media/clips/a.mp4`.
+        let storage = MediaStorage::from_config(&s3_config(Some("bucket"))).unwrap();
+        let caller_key = "clips/a.mp4";
+
+        // object_key and the s3:// URI embed the same resolved key.
+        assert_eq!(storage.object_key(caller_key), "media/clips/a.mp4");
+        let uri = storage.storage_uri(caller_key, Path::new("/tmp/staged/a.mp4"));
+        assert_eq!(uri, "s3://bucket/media/clips/a.mp4");
+
+        // Parsing the URI yields the ORIGINAL caller-relative key back.
+        let parsed = storage.parse_s3_uri_key(&uri).unwrap();
+        assert_eq!(parsed, caller_key);
+
+        // Re-resolving the parsed key targets the SAME object (no double prefix).
+        assert_eq!(storage.object_key(&parsed), "media/clips/a.mp4");
+        assert_ne!(storage.object_key(&parsed), "media/media/clips/a.mp4");
+    }
+
+    #[test]
+    fn key_resolution_round_trips_with_empty_prefix() {
+        let mut cfg = s3_config(Some("bucket"));
+        cfg.key_prefix = String::new();
+        let storage = MediaStorage::from_config(&cfg).unwrap();
+        let caller_key = "clips/a.mp4";
+        let uri = storage.storage_uri(caller_key, Path::new("/tmp/a.mp4"));
+        assert_eq!(uri, "s3://bucket/clips/a.mp4");
+        assert_eq!(storage.parse_s3_uri_key(&uri).as_deref(), Some(caller_key));
+    }
+
+    #[test]
+    fn public_url_and_stored_key_agree_on_trailing_slash() {
+        // A caller key with a trailing slash must be advertised at the SAME URL
+        // the stored key resolves to — never `…/clips/a.mp4/` (a 404) while the
+        // object is stored at `…/clips/a.mp4`.
+        let mut cfg = s3_config(Some("bucket"));
+        cfg.public_base_url = Some("https://cdn.example.com/media/".to_owned());
+        let storage = MediaStorage::from_config(&cfg).unwrap();
+        // Stored key trims the trailing slash.
+        assert_eq!(storage.object_key("clips/a.mp4/"), "media/clips/a.mp4");
+        // Public URL trims it identically — no advertised trailing slash.
+        assert_eq!(
+            storage.public_url("clips/a.mp4/"),
+            "https://cdn.example.com/media/clips/a.mp4"
+        );
+        // And a leading slash is handled the same way.
+        assert_eq!(
+            storage.public_url("/clips/a.mp4/"),
+            "https://cdn.example.com/media/clips/a.mp4"
+        );
+    }
+
+    #[test]
+    fn public_url_local_trailing_slash_matches_object_key() {
+        let storage = MediaStorage::Local {
+            root: PathBuf::from("media"),
+            public_base_url: "/media".to_owned(),
+        };
+        assert_eq!(storage.object_key("clips/a.mp4/"), "clips/a.mp4");
+        assert_eq!(storage.public_url("clips/a.mp4/"), "/media/clips/a.mp4");
+    }
+
+    // ── strip_key_prefix ─────────────────────────────────────────────────────
+
+    #[test]
+    fn strip_key_prefix_removes_boundary_prefix() {
+        assert_eq!(
+            strip_key_prefix("media", "media/clips/1.mp4"),
+            "clips/1.mp4"
+        );
+        assert_eq!(
+            strip_key_prefix("/media/", "media/clips/1.mp4"),
+            "clips/1.mp4"
+        );
+    }
+
+    #[test]
+    fn strip_key_prefix_leaves_non_boundary_and_foreign_keys() {
+        // Coincidental textual prefix is not a path boundary.
+        assert_eq!(strip_key_prefix("media", "media-extra/x"), "media-extra/x");
+        // Foreign key without the prefix is unchanged.
+        assert_eq!(strip_key_prefix("media", "other/x"), "other/x");
+    }
+
+    #[test]
+    fn strip_key_prefix_empty_prefix_trims_only() {
+        assert_eq!(strip_key_prefix("", "/clips/1.mp4/"), "clips/1.mp4");
+    }
+
+    #[test]
+    fn strip_key_prefix_key_equal_to_prefix_is_empty() {
+        assert_eq!(strip_key_prefix("media", "media"), "");
     }
 
     // ── from_config ──────────────────────────────────────────────────────────
