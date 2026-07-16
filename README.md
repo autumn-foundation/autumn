@@ -58,24 +58,24 @@ autumn dev
 Visit <http://localhost:3000>. Autumn also auto-mounts `/health`,
 `/actuator/health`, `/actuator/info`, and `/static/js/htmx.min.js`.
 
-### Install a prebuilt binary (Linux)
+### Install a prebuilt binary (macOS & Linux)
 
-Grab the `autumn` CLI without compiling from source:
+Get the `autumn` CLI without compiling from source — no Rust toolchain required:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/madmax983/autumn/trunk-dev/scripts/install.sh | sh
 ```
 
-This downloads the prebuilt binary for your architecture (x86_64 or aarch64), verifies its sha256 checksum, and installs it to `~/.local/bin/autumn`. Override the target dir with `AUTUMN_INSTALL_DIR`, or pin a version with `AUTUMN_VERSION=vX.Y.Z` (or `--version vX.Y.Z`).
+The installer detects your OS and architecture (macOS or Linux, x86_64 or aarch64), downloads the matching prebuilt binary, verifies its sha256 checksum, and installs it to `~/.local/bin/autumn` — printing the line to add if that directory isn't on your `PATH`. Override the target dir with `AUTUMN_INSTALL_DIR`, or pin a version with `AUTUMN_VERSION=vX.Y.Z` (or `--version vX.Y.Z`).
 
-Direct download URLs (static musl binaries — no glibc version dependency):
+Prefer a manual download? Grab the tarball plus its `.sha256`:
 
-- Latest: `https://github.com/madmax983/autumn/releases/latest/download/autumn-x86_64-unknown-linux-musl.tar.gz`
-- Pinned: `https://github.com/madmax983/autumn/releases/download/<tag>/autumn-x86_64-unknown-linux-musl.tar.gz`
+- Latest: `https://github.com/madmax983/autumn/releases/latest/download/autumn-<target>.tar.gz`
+- Pinned: `https://github.com/madmax983/autumn/releases/download/<tag>/autumn-<target>.tar.gz`
 
-Binaries track tagged crate releases (e.g. `v0.6.0`); `latest` is the most recent released version — there are no rolling trunk-dev builds.
+where `<target>` is one of `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`, `x86_64-apple-darwin`, or `aarch64-apple-darwin` (Linux binaries are static musl — no glibc version dependency). Binaries track tagged crate releases (e.g. `v0.6.0`); `latest` is the most recent released version — there are no rolling trunk-dev builds. Windows is a documented follow-up (see #2005); build from source there for now.
 
-Each tarball ships a companion `.sha256`. Prefer source? `cargo install --path autumn-cli` still works.
+Prefer building from source? `cargo install --path autumn-cli` still works.
 
 ### Watching custom directories
 

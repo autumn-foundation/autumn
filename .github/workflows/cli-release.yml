@@ -1,6 +1,6 @@
 name: CLI Release Binaries
 
-# Builds prebuilt `autumn` CLI binaries for Linux (x86_64 + aarch64, static musl)
+# Builds prebuilt `autumn` CLI binaries for Linux + macOS (x86_64 + aarch64)
 # and attaches them — with sha256 checksums — to a GitHub Release.
 #
 # Binaries correspond to DELIBERATE, TAGGED CRATE RELEASES, not trunk. The canonical
@@ -18,6 +18,8 @@ name: CLI Release Binaries
 #   - Version-pinned: .../releases/download/<tag>/autumn-<target>.tar.gz
 #   - Stable latest:  .../releases/latest/download/autumn-<target>.tar.gz
 # Asset names are intentionally version-less so the latest/download URL is stable.
+# Linux targets build via `cross` (musl, no glibc dependency); macOS targets build
+# natively on macOS runners. Windows is a documented follow-up (see #2005).
 
 on:
   release:
@@ -39,13 +41,23 @@ concurrency:
 jobs:
   build:
     name: build (${{ matrix.target }})
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            cross: true
           - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            cross: true
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            cross: false
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            cross: false
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -58,12 +70,18 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Install cross
+        if: ${{ matrix.cross }}
         uses: taiki-e/install-action@v2
         with:
           tool: cross
 
-      - name: Build autumn (${{ matrix.target }})
+      - name: Build autumn via cross (${{ matrix.target }})
+        if: ${{ matrix.cross }}
         run: cross build --locked -p autumn-cli --release --bin autumn --target ${{ matrix.target }}
+
+      - name: Build autumn via cargo (${{ matrix.target }})
+        if: ${{ ! matrix.cross }}
+        run: cargo build --locked -p autumn-cli --release --bin autumn --target ${{ matrix.target }}
 
       - name: Package tarball + checksum
         run: |
@@ -73,7 +91,11 @@ jobs:
           cp "target/${{ matrix.target }}/release/autumn" "$staging/autumn"
           cp LICENSE-MIT LICENSE-APACHE "$staging/" 2>/dev/null || true
           tar -C "$staging" -czf "$asset" .
-          sha256sum "$asset" > "$asset.sha256"
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$asset" > "$asset.sha256"
+          else
+            shasum -a 256 "$asset" > "$asset.sha256"
+          fi
           echo "--- checksum ---"
           cat "$asset.sha256"
 

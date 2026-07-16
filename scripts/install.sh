@@ -4,7 +4,7 @@
 #   curl -fsSL https://raw.githubusercontent.com/madmax983/autumn/trunk-dev/scripts/install.sh | sh
 #
 # Downloads a prebuilt `autumn` binary from GitHub Releases, verifies its sha256
-# checksum, and installs it. Linux x86_64 and aarch64 are supported.
+# checksum, and installs it. Linux and macOS (x86_64 and aarch64) are supported.
 # Binaries correspond to tagged crate releases; "latest" is the most recent release.
 #
 # Environment overrides (flags --version/--dir/--target mirror them):
@@ -68,12 +68,17 @@ fi
 if [ -z "$TARGET" ]; then
   os="$(uname -s)"
   arch="$(uname -m)"
-  [ "$os" = "Linux" ] || err "unsupported OS: $os (prebuilt binaries are Linux-only for now; build from source with 'cargo install --path autumn-cli')"
+  case "$os" in
+    Linux) os_part="unknown-linux-musl" ;;
+    Darwin) os_part="apple-darwin" ;;
+    *) err "unsupported OS: $os (prebuilt binaries cover Linux and macOS; build from source with 'cargo install --path autumn-cli')" ;;
+  esac
   case "$arch" in
-    x86_64|amd64) TARGET="x86_64-unknown-linux-musl" ;;
-    aarch64|arm64) TARGET="aarch64-unknown-linux-musl" ;;
+    x86_64|amd64) arch_part="x86_64" ;;
+    aarch64|arm64) arch_part="aarch64" ;;
     *) err "unsupported architecture: $arch (build from source with 'cargo install --path autumn-cli')" ;;
   esac
+  TARGET="${arch_part}-${os_part}"
 fi
 
 asset="autumn-${TARGET}.tar.gz"
