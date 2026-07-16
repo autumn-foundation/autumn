@@ -383,6 +383,17 @@ path = "tests/sqlite_foreign_keys.rs"
 name = "sqlite_db_extractor"
 path = "tests/sqlite_db_extractor.rs"
 
+# SQLite pooled-connection PRAGMA proof (issue #1614, Codex P1). Asserts every
+# pool-issued connection carries the configured `busy_timeout` and the deliberate
+# WAL `journal_mode` (mirroring `crate::sync::store`), so overlapping writes wait
+# on the lock instead of failing fast with `SQLITE_BUSY`. Only meaningful under
+# `--features sqlite`; the file is `#![cfg(feature = "sqlite")]` so a default
+# `cargo test` compiles it to an empty (passing) binary. Run explicitly:
+# `cargo test -p autumn-web --features sqlite --test sqlite_pool_pragmas`.
+[[test]]
+name = "sqlite_pool_pragmas"
+path = "tests/sqlite_pool_pragmas.rs"
+
 # Isolated: sets process-wide proxy env vars (HTTP_PROXY/HTTPS_PROXY/ALL_PROXY)
 # to verify pinned SSRF-safe clients bypass env proxies. Cannot share the
 # consolidated binary — those vars would race the inline network tests.

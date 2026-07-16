@@ -1226,22 +1226,35 @@ fn build_sqlite_pool(
     // SQLite starts every connection with `foreign_keys` OFF, so a bare manager
     // would hand out pooled connections that silently ignore `REFERENCES`
     // constraints — orphan rows and referential-integrity violations become
-    // possible for the whole app (addresses Codex P1). Turn foreign-key
-    // enforcement ON during EVERY pooled connection's setup, mirroring how the
-    // sync store enables it for its own SQLite connection (see
-    // `crate::sync::store` — `PRAGMA foreign_keys = ON`). A `custom_setup`
-    // callback on the manager runs once per newly-created connection, which is
-    // exactly the per-connection hook we need (the same mechanism the Postgres
-    // path uses to install TLS).
+    // possible for the whole app (addresses Codex P1). It also uses a default
+    // busy handler that returns `SQLITE_BUSY` *immediately* when another pooled
+    // connection holds the single writer lock, so ordinary overlapping writes on
+    // a >1 slot file pool fail as 5xx instead of waiting briefly for the lock to
+    // clear (addresses Codex P1). Install both pragmas — plus a deliberate WAL
+    // journal mode with `synchronous = NORMAL` for better write concurrency —
+    // during EVERY pooled connection's setup, mirroring how the sync store
+    // configures its own SQLite connection (see `crate::sync::store`:
+    // `busy_timeout = 5000`, `journal_mode = WAL`, `synchronous = NORMAL`,
+    // `foreign_keys = ON`). `busy_timeout` is set FIRST so everything after it
+    // (and every later query) queues on the timeout instead of failing on a
+    // held lock; `journal_mode = WAL` is a harmless no-op for a pure `:memory:`
+    // database. A `custom_setup` callback on the manager runs once per
+    // newly-created connection, which is exactly the per-connection hook we need
+    // (the same mechanism the Postgres path uses to install TLS).
     let mut config = diesel_async::pooled_connection::ManagerConfig::<RuntimeConnection>::default();
     config.custom_setup = Box::new(|url: &str| {
         use diesel_async::{AsyncConnection as _, SimpleAsyncConnection as _};
         let url = url.to_owned();
         async move {
             let mut conn = RuntimeConnection::establish(&url).await?;
-            conn.batch_execute("PRAGMA foreign_keys = ON")
-                .await
-                .map_err(diesel::ConnectionError::CouldntSetupConfiguration)?;
+            conn.batch_execute(
+                "PRAGMA busy_timeout = 5000; \
+                 PRAGMA journal_mode = WAL; \
+                 PRAGMA synchronous = NORMAL; \
+                 PRAGMA foreign_keys = ON;",
+            )
+            .await
+            .map_err(diesel::ConnectionError::CouldntSetupConfiguration)?;
             Ok(conn)
         }
         .boxed()
@@ -1280,6 +1293,35 @@ pub fn create_pool(config: &DatabaseConfig) -> Result<Option<Pool<RuntimeConnect
     Ok(Some(pool))
 }
 
+/// Reject a `SQLite` `replica_url` that cannot act as a real read replica for the
+/// given `primary_url`.
+///
+/// Under the `sqlite` feature a configured replica cannot replicate: `SQLite` has
+/// no primary/replica replication in this pool architecture. Two single-slot
+/// `:memory:` pools are two *private* empty databases, and a distinct replica
+/// *file* has nothing replicating into it, so read-routed queries would hit an
+/// empty replica after writes and schema setup went to the primary. Reject an
+/// in-memory or distinct-file replica with an actionable boot error (addresses
+/// Codex P2). A replica that normalizes to the SAME file as the primary is the
+/// same database — harmless — so it is allowed. `normalize_sqlite_target` is
+/// reused so "same file" matches how the pool actually opens the file, and
+/// `sqlite_target_is_memory` so pool sizing and this guard agree on what
+/// "in-memory" means. Shared by the control-database and per-shard topologies so
+/// the two rejection rules cannot drift.
+#[cfg(feature = "sqlite")]
+fn reject_unusable_sqlite_replica(primary_url: &str, replica_url: &str) -> Result<(), PoolError> {
+    let replica_target = normalize_sqlite_target(replica_url);
+    let primary_target = normalize_sqlite_target(primary_url);
+    if sqlite_target_is_memory(&replica_target) || replica_target != primary_target {
+        return Err(PoolError::UnsupportedBackend(format!(
+            "SQLite does not support a separate read replica: replica_url {replica_url:?} \
+             is in-memory or differs from primary_url {primary_url:?}. Configure only a \
+             primary, or point the replica at the same database file as the primary."
+        )));
+    }
+    Ok(())
+}
+
 /// Create primary and optional replica pools from the database configuration.
 ///
 /// Returns `Ok(None)` when neither `database.primary_url` nor the legacy
@@ -1299,29 +1341,9 @@ pub fn create_topology(config: &DatabaseConfig) -> Result<Option<DatabaseTopolog
         config.connect_timeout_secs,
     )?;
 
-    // Under the `sqlite` feature a configured `replica_url` cannot act as a real
-    // read replica: SQLite has no primary/replica replication in this pool
-    // architecture. Two single-slot `:memory:` pools are two *private* empty
-    // databases, and a distinct replica *file* has nothing replicating into it,
-    // so read-routed queries would hit an empty replica after writes and schema
-    // setup went to the primary. Reject an in-memory or distinct-file replica
-    // with an actionable boot error (addresses Codex P2). A replica that
-    // normalizes to the SAME file as the primary is the same database — harmless
-    // — so it is allowed and simply builds a second pool over that file below.
-    // `normalize_sqlite_target` is reused so "same file" matches how the pool
-    // actually opens the file, and `sqlite_target_is_memory` so pool sizing and
-    // this guard agree on what "in-memory" means.
     #[cfg(feature = "sqlite")]
     if let Some(replica_url) = config.replica_url.as_deref() {
-        let replica_target = normalize_sqlite_target(replica_url);
-        let primary_target = normalize_sqlite_target(primary_url);
-        if sqlite_target_is_memory(&replica_target) || replica_target != primary_target {
-            return Err(PoolError::UnsupportedBackend(format!(
-                "SQLite does not support a separate read replica: replica_url {replica_url:?} \
-                 is in-memory or differs from primary_url {primary_url:?}. Configure only a \
-                 primary, or point the replica at the same database file as the primary."
-            )));
-        }
+        reject_unusable_sqlite_replica(primary_url, replica_url)?;
     }
 
     let replica = config
@@ -1354,6 +1376,17 @@ pub fn create_shard_topology(
         shard.effective_primary_pool_size(defaults),
         defaults.connect_timeout_secs,
     )?;
+
+    // A per-shard `replica_url` is subject to the same SQLite-replica rule as the
+    // control database: without it a SQLite `[[database.shards]]` entry with a
+    // distinct or in-memory replica would boot and route reads to an unrelated,
+    // empty database. Reuse the exact same helper so the two rejections cannot
+    // drift (addresses Codex P2).
+    #[cfg(feature = "sqlite")]
+    if let Some(replica_url) = shard.replica_url.as_deref() {
+        reject_unusable_sqlite_replica(&shard.primary_url, replica_url)?;
+    }
+
     let replica = shard
         .replica_url
         .as_deref()
@@ -3514,6 +3547,79 @@ mod tests {
             .expect("sqlite primary-only topology builds")
             .expect("a configured primary yields a topology");
         assert!(topology.replica().is_none(), "no replica configured");
+    }
+
+    // The per-shard replica is subject to the SAME SQLite-replica rule as the
+    // control database (addresses Codex P2): an in-memory or distinct-file shard
+    // replica would route reads to an unrelated, empty database, so it must be
+    // rejected; a shard with only a primary (or a same-file replica) must build.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn create_shard_topology_rejects_in_memory_sqlite_replica() {
+        let defaults = DatabaseConfig::default();
+        let shard = crate::config::ShardConfig {
+            name: "shard0".into(),
+            primary_url: "sqlite:///var/lib/shard0.db".into(),
+            replica_url: Some("sqlite::memory:".into()),
+            ..Default::default()
+        };
+        let Err(err) = create_shard_topology(&shard, &defaults) else {
+            panic!("an in-memory sqlite shard replica must be rejected");
+        };
+        assert!(matches!(err, PoolError::UnsupportedBackend(_)), "{err:?}");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("separate read replica") && msg.contains("primary"),
+            "message must be actionable: {msg}"
+        );
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn create_shard_topology_rejects_distinct_file_sqlite_replica() {
+        let defaults = DatabaseConfig::default();
+        let shard = crate::config::ShardConfig {
+            name: "shard0".into(),
+            primary_url: "sqlite:///var/lib/shard0-primary.db".into(),
+            replica_url: Some("sqlite:///var/lib/shard0-replica.db".into()),
+            ..Default::default()
+        };
+        let Err(err) = create_shard_topology(&shard, &defaults) else {
+            panic!("a distinct-file sqlite shard replica must be rejected");
+        };
+        assert!(matches!(err, PoolError::UnsupportedBackend(_)), "{err:?}");
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn create_shard_topology_allows_same_file_sqlite_replica() {
+        let defaults = DatabaseConfig::default();
+        let shard = crate::config::ShardConfig {
+            name: "shard0".into(),
+            primary_url: "sqlite:///var/lib/shard0.db".into(),
+            replica_url: Some("sqlite:///var/lib/shard0.db".into()),
+            ..Default::default()
+        };
+        let topology = create_shard_topology(&shard, &defaults)
+            .expect("same-file sqlite shard replica must be allowed");
+        assert!(
+            topology.replica().is_some(),
+            "same-file shard replica pool should be built"
+        );
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn create_shard_topology_sqlite_primary_only_builds() {
+        let defaults = DatabaseConfig::default();
+        let shard = crate::config::ShardConfig {
+            name: "shard0".into(),
+            primary_url: "sqlite::memory:".into(),
+            ..Default::default()
+        };
+        let topology = create_shard_topology(&shard, &defaults)
+            .expect("sqlite primary-only shard topology builds");
+        assert!(topology.replica().is_none(), "no shard replica configured");
     }
 
     // `file::memory:` (and its query-string form) is a private in-memory target
