@@ -494,6 +494,14 @@ path = "tests/state_machine_lifecycle.rs"
 name = "state_machine_on_commit"
 path = "tests/state_machine_on_commit.rs"
 
+# Issue #1973: sync `on = "handler"` in-transaction transition effect — pure
+# validation + compile-time type-check of the generated connection-taking
+# method. No DB connection, runs without Docker. Isolated so it is cheap to
+# compile/run alone.
+[[test]]
+name = "state_machine_on"
+path = "tests/state_machine_on.rs"
+
 [[test]]
 name = "repository_shard_replica_routing"
 path = "tests/repository_shard_replica_routing.rs"

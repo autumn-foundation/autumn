@@ -240,6 +240,11 @@ fn compile_pass_tests() {
     #[cfg(feature = "db")]
     t.pass("tests/compile-pass/model_state_machine_on_commit.rs");
 
+    // #1973: a sync `on = "handler"` edge also emits the connection-taking
+    // method; `on` composes with `guard` and `on_commit` on one edge.
+    #[cfg(feature = "db")]
+    t.pass("tests/compile-pass/model_state_machine_on.rs");
+
     // Soft delete (requires db feature)
     #[cfg(feature = "db")]
     t.pass("tests/compile-pass/repository_soft_delete.rs");
