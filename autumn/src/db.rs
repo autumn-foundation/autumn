@@ -1186,26 +1186,35 @@ fn sqlite_target_is_memory(target: &str) -> bool {
         || target.contains("mode=memory")
 }
 
-/// Whether a `SQLite` database URL (any accepted spelling) resolves to a
-/// **private** in-memory target — `sqlite::memory:` / `:memory:` /
-/// `file::memory:` *without* `cache=shared`.
+/// Whether a `SQLite` database URL (any accepted spelling) resolves to **any**
+/// in-memory target — the private spellings (`sqlite::memory:` / `:memory:` /
+/// `file::memory:`) AND the shared-cache in-memory form
+/// (`file::memory:?cache=shared`, `file:app?mode=memory&cache=shared`).
 ///
-/// Each connection to a private in-memory database gets its own, isolated,
-/// empty database (see [`normalize_sqlite_target`]). That is why the runtime
-/// pool forces such targets single-slot, and why a throwaway synchronous
-/// migration connection can never make its schema visible to the async runtime
-/// pool: the two connections are different databases. Callers registering
-/// startup migrations use this to reject the doomed configuration up front.
+/// This is deliberately broader than [`sqlite_target_is_memory`] (the pool
+/// *sizing* predicate): it does NOT exempt `cache=shared`. It is the predicate
+/// the startup-migration reject uses, because **no** in-memory target — private
+/// or shared-cache — can retain a registered migration for the runtime pool. The
+/// migration runs on a transient synchronous connection; `SQLite` destroys a
+/// shared in-memory database the moment its *last* connection closes, and the
+/// runtime deadpool is created lazily (it may not have checked out a connection
+/// yet), so the pool's first checkout opens a fresh, empty in-memory database and
+/// every DB-backed request then 500s with "no such table". Only a **file-backed**
+/// database survives the migration connection closing, so that is the sole
+/// supported remedy.
 ///
-/// A **file-backed** target (persists on disk, shared by every connection) and
-/// a **shared-cache** in-memory target (`file::memory:?cache=shared`, shared
-/// across connections within one process) both return `false` — they retain
-/// migrations for the pool and must not be rejected. This is exactly
-/// [`sqlite_target_is_memory`] applied to the normalized URL, so pool sizing and
-/// this guard agree on what "private in-memory" means.
+/// Pool *sizing* deliberately keeps using [`sqlite_target_is_memory`] instead:
+/// a shared-cache in-memory database IS shareable across the pool's connections
+/// within one live process, so it must NOT be forced single-slot. The two
+/// predicates answer different questions ("share across the pool?" vs. "survive
+/// the migration connection closing?") and must not be conflated.
 #[cfg(feature = "sqlite")]
-pub(crate) fn sqlite_target_is_private_in_memory(url: &str) -> bool {
-    sqlite_target_is_memory(&normalize_sqlite_target(url))
+pub(crate) fn sqlite_target_is_any_in_memory(url: &str) -> bool {
+    let target = normalize_sqlite_target(url);
+    target == ":memory:"
+        || target == "file::memory:"
+        || target.starts_with("file::memory:?")
+        || target.contains("mode=memory")
 }
 
 /// Whether a normalized `SQLite` target names a **read-only** database via its
@@ -3846,35 +3855,77 @@ mod tests {
         assert!(!sqlite_target_is_memory("/var/lib/app.db"));
     }
 
-    // `sqlite_target_is_private_in_memory` classifies raw URLs (every accepted
-    // spelling) so the startup-migration path can reject a private in-memory
-    // target that would apply migrations to a throwaway connection the runtime
-    // pool never sees (issue #1614 follow-up). It is exactly
-    // `sqlite_target_is_memory` over the normalized URL: private in-memory →
-    // true; file-backed and shared-cache in-memory → false.
+    // `sqlite_target_is_any_in_memory` is the broader predicate the
+    // startup-migration reject uses: it classifies EVERY in-memory spelling —
+    // private AND shared-cache — as in-memory, because none of them survive the
+    // transient migration connection closing to reach the runtime pool (issue
+    // #1614 follow-up). It must diverge from `sqlite_target_is_memory` (pool
+    // sizing) precisely on `cache=shared`, which sizing keeps NOT-in-memory so a
+    // shared-cache DB is never forced single-slot.
     #[cfg(feature = "sqlite")]
     #[test]
-    fn sqlite_target_is_private_in_memory_classifies_targets() {
-        // Private in-memory spellings the runtime pool accepts.
-        assert!(sqlite_target_is_private_in_memory(":memory:"));
-        assert!(sqlite_target_is_private_in_memory("sqlite::memory:"));
-        assert!(sqlite_target_is_private_in_memory("sqlite://:memory:"));
-        assert!(sqlite_target_is_private_in_memory("sqlite://"));
-        assert!(sqlite_target_is_private_in_memory("file::memory:"));
-        assert!(sqlite_target_is_private_in_memory("file::memory:?foo=bar"));
-        // Shared-cache in-memory is shareable across connections — NOT private.
-        assert!(!sqlite_target_is_private_in_memory(
-            "file::memory:?cache=shared"
-        ));
-        assert!(!sqlite_target_is_private_in_memory(
+    fn sqlite_target_is_any_in_memory_covers_shared_cache() {
+        // Private in-memory spellings — in-memory for BOTH predicates.
+        assert!(sqlite_target_is_any_in_memory(":memory:"));
+        assert!(sqlite_target_is_any_in_memory("sqlite::memory:"));
+        assert!(sqlite_target_is_any_in_memory("sqlite://:memory:"));
+        assert!(sqlite_target_is_any_in_memory("sqlite://"));
+        assert!(sqlite_target_is_any_in_memory("file::memory:"));
+        assert!(sqlite_target_is_any_in_memory("file::memory:?foo=bar"));
+        // Shared-cache in-memory: `any_in_memory` → true (rejected for
+        // migrations), but pool sizing's `sqlite_target_is_memory` → false (NOT
+        // forced single-slot). This divergence is the whole point.
+        assert!(sqlite_target_is_any_in_memory("file::memory:?cache=shared"));
+        assert!(sqlite_target_is_any_in_memory(
             "file:app?mode=memory&cache=shared"
         ));
-        // File-backed targets persist and are shared — NOT private in-memory.
-        assert!(!sqlite_target_is_private_in_memory(
-            "sqlite:///var/lib/app.db"
+        assert!(!sqlite_target_is_memory("file::memory:?cache=shared"));
+        assert!(!sqlite_target_is_memory(
+            "file:app?mode=memory&cache=shared"
         ));
-        assert!(!sqlite_target_is_private_in_memory("/var/lib/app.db"));
-        assert!(!sqlite_target_is_private_in_memory("file:/var/lib/app.db"));
+        // File-backed targets are never in-memory under either predicate.
+        assert!(!sqlite_target_is_any_in_memory("sqlite:///var/lib/app.db"));
+        assert!(!sqlite_target_is_any_in_memory("/var/lib/app.db"));
+        assert!(!sqlite_target_is_any_in_memory("file:/var/lib/app.db"));
+    }
+
+    // The transient SQLite migration connection must carry `PRAGMA busy_timeout`
+    // (mirroring the runtime pool's per-connection setup) so a concurrent
+    // migrator or a briefly-held write lock WAITS instead of failing immediately
+    // with SQLITE_BUSY and aborting `auto_migrate_sqlite` (Codex P1). Proof: a
+    // fresh migration connection reports the configured non-zero timeout.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn sqlite_migration_connection_sets_busy_timeout() {
+        use diesel::RunQueryDsl as _;
+
+        #[derive(diesel::QueryableByName)]
+        struct BusyTimeout {
+            #[diesel(sql_type = diesel::sql_types::Integer)]
+            timeout: i32,
+        }
+
+        // A tempfile-backed target (not `:memory:`) so the connection maps to a
+        // real database the pragma read reflects.
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let db_path = tmp.path().join("migration.db");
+        let url = format!("sqlite://{}", db_path.display());
+
+        let mut conn = super::establish_sqlite_migration_connection(&url)
+            .expect("establish sqlite migration connection");
+        let rows: Vec<BusyTimeout> = diesel::sql_query("PRAGMA busy_timeout")
+            .load(&mut conn)
+            .expect("read busy_timeout pragma");
+        let timeout = rows
+            .into_iter()
+            .next()
+            .expect("busy_timeout pragma returns a row")
+            .timeout;
+        assert_eq!(
+            timeout, 5000,
+            "the migration connection must carry the configured busy_timeout (ms) \
+             so concurrent/locked migrators wait rather than hitting SQLITE_BUSY"
+        );
     }
 
     // A read-only URI target (`mode=ro` / `immutable`) must be detected so the
@@ -5340,16 +5391,32 @@ pub(crate) fn establish_migration_connection(
 /// normalized through the same [`normalize_sqlite_target`] the runtime pool
 /// uses, so the migration connection and the pool open the same database file.
 ///
+/// The connection sets `PRAGMA busy_timeout = 5000` right after opening,
+/// mirroring the runtime pool's per-connection `custom_setup` (see
+/// [`build_sqlite_pool`]): without it, a second concurrent migrator — or a write
+/// lock briefly held by the runtime pool — makes this connection fail
+/// *immediately* with `SQLITE_BUSY`, and `auto_migrate_sqlite` exits the process.
+/// With the timeout, migration statements WAIT up to 5s for the lock to clear
+/// instead of aborting; diesel migrations are idempotent, so a migrator that
+/// waits and then finds migrations already applied is fine. Only `busy_timeout`
+/// is set here — NOT `foreign_keys`/`journal_mode`, because `foreign_keys = ON`
+/// can break table-recreating migrations.
+///
 /// # Errors
 ///
 /// Returns the underlying [`diesel::ConnectionError`] when the database cannot
-/// be opened.
+/// be opened, or [`diesel::ConnectionError::CouldntSetupConfiguration`] if the
+/// `busy_timeout` pragma cannot be applied.
 #[cfg(feature = "sqlite")]
 pub(crate) fn establish_sqlite_migration_connection(
     database_url: &str,
 ) -> Result<diesel::SqliteConnection, diesel::ConnectionError> {
     use diesel::Connection as _;
-    diesel::SqliteConnection::establish(&normalize_sqlite_target(database_url))
+    use diesel::connection::SimpleConnection as _;
+    let mut conn = diesel::SqliteConnection::establish(&normalize_sqlite_target(database_url))?;
+    conn.batch_execute("PRAGMA busy_timeout = 5000;")
+        .map_err(diesel::ConnectionError::CouldntSetupConfiguration)?;
+    Ok(conn)
 }
 
 #[cfg(test)]

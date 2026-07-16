@@ -164,9 +164,10 @@ async fn registered_migrations_apply_to_sqlite_and_serve() {
 
 /// A **private** in-memory target with registered migrations is rejected up
 /// front with an actionable error (issue #1614 follow-up). Each `:memory:`
-/// connection is its own empty database, so migrations applied on the throwaway
+/// connection is its own empty database, so migrations applied on the transient
 /// migration connection could never reach the runtime pool — surfacing the
-/// error beats silently applying to a database the pool never sees.
+/// error beats silently applying to a database the pool never sees. The remedy
+/// is a **file-backed** database only.
 #[test]
 fn private_in_memory_target_with_registered_migrations_is_rejected() {
     for url in [
@@ -179,29 +180,45 @@ fn private_in_memory_target_with_registered_migrations_is_rejected() {
             .expect_err("private in-memory + registered migrations must be rejected");
         let msg = err.to_string();
         assert!(
-            msg.contains("in-memory"),
+            msg.to_lowercase().contains("in-memory"),
             "error names the in-memory problem (got {msg:?})"
         );
         assert!(
-            msg.contains("file-backed") && msg.contains("cache=shared"),
-            "error gives the file-backed / shared-cache remedy (got {msg:?})"
+            msg.contains("file-backed"),
+            "error gives the file-backed remedy (got {msg:?})"
         );
     }
 }
 
-/// A **shared-cache** in-memory target (`file::memory:?cache=shared`) is shared
-/// across connections within one process, so it retains migrations for the
-/// runtime pool and is NOT rejected — the migration applies exactly like a
-/// file-backed target. (The private-vs-shared classification itself is unit
-/// tested in `db::sqlite_target_is_private_in_memory_classifies_targets`.)
+/// A **shared-cache** in-memory target (`file::memory:?cache=shared`) with
+/// registered migrations is ALSO rejected up front (issue #1614 follow-up).
+/// Although a shared-cache database is shareable across the runtime pool's live
+/// connections, the migration runs on a *transient* synchronous connection and
+/// SQLite destroys a shared in-memory database the moment its last connection
+/// closes; the runtime deadpool is created lazily and may not have anchored a
+/// connection yet, so the pool's first checkout opens a fresh, empty database
+/// and every DB-backed request then 500s. The remedy is a **file-backed**
+/// database — the corrected recommendation no longer suggests `cache=shared`.
+/// (The private-vs-shared sizing classification stays unchanged and is unit
+/// tested in `db::sqlite_target_is_any_in_memory_covers_shared_cache`.)
 #[test]
-fn shared_cache_in_memory_target_is_not_rejected() {
-    let result = run_pending_sqlite("file::memory:?cache=shared", MIGRATIONS)
-        .expect("shared-cache in-memory retains migrations for the pool and is not rejected");
-    assert_eq!(
-        result.applied.len(),
-        1,
-        "the one registered migration applies on a shared-cache in-memory target (got {:?})",
-        result.applied
+fn shared_cache_in_memory_target_with_registered_migrations_is_rejected() {
+    let err = run_pending_sqlite("file::memory:?cache=shared", MIGRATIONS).expect_err(
+        "shared-cache in-memory + registered migrations must be rejected: the schema is \
+         lost before the runtime pool anchors it",
+    );
+    let msg = err.to_string();
+    assert!(
+        msg.to_lowercase().contains("in-memory"),
+        "error names the in-memory problem (got {msg:?})"
+    );
+    assert!(
+        msg.contains("file-backed"),
+        "error gives the file-backed remedy (got {msg:?})"
+    );
+    assert!(
+        !msg.contains("`file::memory:?cache=shared`"),
+        "the corrected message no longer recommends a shared-cache in-memory URL as a remedy \
+         (got {msg:?})"
     );
 }

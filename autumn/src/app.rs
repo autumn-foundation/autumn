@@ -7444,12 +7444,13 @@ fn apply_pending_sqlite_or_exit(
     migrations: &crate::migrate::EmbeddedMigrations,
     target: &str,
 ) -> usize {
-    // Reject a private in-memory target with registered migrations up front,
-    // BEFORE `run_pending_sqlite` (whose `Migration` error would be redacted to
-    // a value-free reason below, hiding the guidance). Each `:memory:`
-    // connection is its own empty database, so migrations here never reach the
-    // runtime pool (issue #1614 follow-up).
-    if let Some(err) = crate::migrate::reject_private_in_memory_migrations(
+    // Reject ANY in-memory target (private OR shared-cache) with registered
+    // migrations up front, BEFORE `run_pending_sqlite` (whose `Migration` error
+    // would be redacted to a value-free reason below, hiding the guidance). The
+    // migrated schema never survives to the runtime pool — a private `:memory:`
+    // connection is its own empty database, and a shared in-memory database is
+    // destroyed when its last connection closes (issue #1614 follow-up).
+    if let Some(err) = crate::migrate::reject_in_memory_migrations(
         database_url,
         &crate::migrate::EmbeddedMigrationsRef(migrations),
     ) {
