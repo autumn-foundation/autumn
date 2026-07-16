@@ -409,3 +409,84 @@ fn new_model_schema_honors_serde_renames() {
     assert!(props.contains_key("kind"), "field rename on New: {schema}");
     assert!(!props.contains_key("id"), "New excludes id: {schema}");
 }
+
+// ── Model referenced by BOTH a `#[repository]` and a hand-written
+//    `#[api_doc]` handler stays ONE short component (issue #1972, Part 2 / Item 2)
+//
+// The repository's model-typed refs (get/create/update responses, new/update
+// bodies) now carry the same `type_name` identity as a hand-written handler's
+// `Json<T>` ref, so `build_schema_component_index` sees a single identity under
+// base `Gadget` — no false collision, no module-path-qualified duplicate. Before
+// the fix the repository refs keyed on the short name while the handler ref keyed
+// on `type_name`, splitting `Gadget` into `Gadget` + `<module>.Gadget`.
+
+#[autumn_web::post("/api/gadgets/echo")]
+async fn echo_gadget(
+    autumn_web::prelude::Json(g): autumn_web::prelude::Json<Gadget>,
+) -> autumn_web::prelude::Json<Gadget> {
+    autumn_web::prelude::Json(g)
+}
+
+#[test]
+fn model_shared_by_repository_and_handwritten_route_is_one_short_component() {
+    use autumn_web::openapi::{OpenApiConfig, generate_spec};
+
+    // `Gadget` is referenced by its repository (create response, `/api/gadgets`)
+    // and by the hand-written `echo_gadget` handler (`Json<Gadget>` body, at
+    // `/api/gadgets/echo`).
+    let create = __autumn_route_info_gadget_api_create().api_doc;
+    let echo = __autumn_route_info_echo_gadget().api_doc;
+    let config = OpenApiConfig::new("Demo", "1.0.0");
+    let spec = generate_spec(&config, &[&create, &echo]);
+
+    // Repository create route's 201 response references the model.
+    let repo_ref = spec.paths["/api/gadgets"].post.as_ref().unwrap().responses["201"]
+        .content["application/json"]
+        .schema["$ref"]
+        .as_str()
+        .expect("repository create response $ref")
+        .to_owned();
+    // Hand-written route's request body references the same model.
+    let handwritten_ref = spec.paths["/api/gadgets/echo"]
+        .post
+        .as_ref()
+        .unwrap()
+        .request_body
+        .as_ref()
+        .unwrap()
+        .content["application/json"]
+        .schema["$ref"]
+        .as_str()
+        .expect("hand-written request-body $ref")
+        .to_owned();
+
+    // Both resolve to the SAME single short component key — no module-path leak,
+    // no duplicate opaque component.
+    assert_eq!(
+        repo_ref, "#/components/schemas/Gadget",
+        "repository ref must stay the short `Gadget` key"
+    );
+    assert_eq!(
+        handwritten_ref, "#/components/schemas/Gadget",
+        "hand-written ref must share the short `Gadget` key, not `<module>.Gadget`"
+    );
+
+    // Exactly one component key for `Gadget` — nothing module-qualified alongside it.
+    let components = spec.components.expect("components");
+    assert!(
+        components.schemas.contains_key("Gadget"),
+        "single `Gadget` component present"
+    );
+    let gadget_like: Vec<&String> = components
+        .schemas
+        .keys()
+        .filter(|k| {
+            k.ends_with("Gadget") && k.as_str() != "NewGadget" && k.as_str() != "UpdateGadget"
+        })
+        .collect();
+    assert_eq!(
+        gadget_like,
+        vec![&"Gadget".to_owned()],
+        "the model must not split into a second module-qualified component: {gadget_like:?}"
+    );
+}
