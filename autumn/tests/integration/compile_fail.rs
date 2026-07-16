@@ -45,9 +45,13 @@ fn compile_fail_tests() {
     #[cfg(feature = "db")]
     t.compile_fail("tests/compile-fail/model_bogus_arg.rs");
     #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/model_managed_with_args.rs");
+    #[cfg(feature = "db")]
     t.compile_fail("tests/compile-fail/model_unique_with_args.rs");
     #[cfg(feature = "db")]
     t.compile_fail("tests/compile-fail/model_references_bad_key.rs");
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/model_references_namevalue.rs");
 
     // #1911: `#[state_machine(lifecycle = T)]` where `T` is not a `#[lifecycle]`
     // enum fails with an unsatisfied `T: Lifecycle` trait bound.

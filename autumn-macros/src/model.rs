@@ -47,9 +47,10 @@ fn parse_attr_args(attr: TokenStream) -> syn::Result<ModelArgs> {
             args.table = Some(value.value());
             Ok(())
         } else if meta.path.is_ident("managed") {
-            // The required form is a bare `managed` path. `managed = <expr>` is
-            // rejected with a clear message rather than silently accepted.
-            if meta.input.peek(syn::Token![=]) {
+            // The required form is a bare `managed` path. Both `managed = <expr>`
+            // and `managed(...)` are rejected with a clear message rather than
+            // falling through to a generic `syn` parser error.
+            if meta.input.peek(syn::Token![=]) || meta.input.peek(syn::token::Paren) {
                 return Err(
                     meta.error("`managed` takes no value; write a bare `#[model(managed)]`")
                 );
@@ -99,6 +100,16 @@ fn validate_field_schema_markers(field: &Field) -> syn::Result<()> {
             // Bare `#[references]` is valid (target inferred from field name).
             if matches!(attr.meta, syn::Meta::Path(_)) {
                 continue;
+            }
+            // Only the list form `#[references(...)]` carries arguments. A
+            // name-value shape like `#[references = "accounts"]` would make
+            // `parse_nested_meta` fail with a generic "expected attribute list"
+            // error, so reject it here with an actionable message.
+            if !matches!(attr.meta, syn::Meta::List(_)) {
+                return Err(syn::Error::new_spanned(
+                    attr,
+                    "`#[references]` must be a bare attribute or have the form `#[references(table = \"...\")]`",
+                ));
             }
             attr.parse_nested_meta(|meta| {
                 if meta.path.is_ident("table") {
@@ -7354,6 +7365,53 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("unsupported `#[references(...)]` argument"),
+            "unexpected message: {err}"
+        );
+    }
+
+    #[test]
+    fn model_managed_with_paren_args_rejected() {
+        // `#[model(managed(foo))]` (parenthesized) must produce our clear
+        // message, not a generic `syn` "expected identifier" parser error.
+        let err =
+            parse_attr_args(quote! { managed(foo) }).expect_err("`managed(...)` must be rejected");
+        assert!(
+            err.to_string().contains("`managed` takes no value"),
+            "unexpected message: {err}"
+        );
+    }
+
+    #[test]
+    fn references_namevalue_rejected() {
+        // `#[references = "accounts"]` (name-value) must produce our clear
+        // message, not a generic `parse_nested_meta` "expected attribute list"
+        // error.
+        let field: syn::Field = syn::parse_quote! {
+            #[references = "accounts"]
+            pub account_id: i64
+        };
+        let err = validate_field_schema_markers(&field)
+            .expect_err("`#[references = \"...\"]` must be rejected");
+        assert!(
+            err.to_string()
+                .contains("`#[references]` must be a bare attribute"),
+            "unexpected message: {err}"
+        );
+    }
+
+    #[test]
+    fn unique_namevalue_rejected() {
+        // `#[unique = "x"]` (name-value) is already covered by the existing
+        // Path-only check; assert it yields the clear message rather than a
+        // generic parser error.
+        let field: syn::Field = syn::parse_quote! {
+            #[unique = "x"]
+            pub account_id: i64
+        };
+        let err = validate_field_schema_markers(&field)
+            .expect_err("`#[unique = \"x\"]` must be rejected");
+        assert!(
+            err.to_string().contains("`#[unique]` takes no arguments"),
             "unexpected message: {err}"
         );
     }
