@@ -264,6 +264,134 @@ pub fn pending_migrations(
     })
 }
 
+/// Actionable error surfaced when **any** in-memory `SQLite` target is
+/// configured together with registered startup migrations (issue #1614
+/// follow-up).
+///
+/// No in-memory database — private (`sqlite::memory:` / `:memory:` /
+/// `file::memory:`) OR shared-cache (`file::memory:?cache=shared`) — can retain
+/// a registered migration for the runtime pool. The migration runs on a
+/// transient synchronous connection; a *private* in-memory database gives every
+/// connection its own empty database, and a *shared* in-memory database is
+/// destroyed the moment its last connection closes — and because the runtime
+/// deadpool is created lazily (it may not have checked out a connection yet), the
+/// pool's first checkout opens a fresh, empty database. Either way the migrated
+/// schema is gone before the pool anchors it. The only remedy is a **file-backed**
+/// database, which persists on disk across the migration connection closing.
+#[cfg(feature = "sqlite")]
+pub(crate) const IN_MEMORY_MIGRATION_MSG: &str = "In-memory SQLite (`:memory:` / `sqlite::memory:` / `file::memory:`, including \
+     `cache=shared`) cannot be used with registered startup migrations \u{2014} the \
+     schema is applied on a transient connection and is lost before the runtime \
+     pool anchors it. Use a file-backed SQLite database.";
+
+/// Return the [`IN_MEMORY_MIGRATION_MSG`] reject error when `database_url` is
+/// **any** in-memory `SQLite` target (private OR shared-cache) AND `migrations`
+/// carries at least one registered migration to apply; otherwise `None`.
+///
+/// This is the single decision point the `SQLite` migration-application paths
+/// share (the boot [`auto_migrate_sqlite`], the pub [`run_pending_sqlite`], and
+/// the `AUTUMN_MIGRATE=1` `apply_pending_sqlite_or_exit`), so they cannot drift.
+/// It performs no I/O — the target is classified from the URL string
+/// ([`crate::db::sqlite_target_is_any_in_memory`]) and the registered set is
+/// enumerated in-memory — so it runs **before** any transient migration
+/// connection is opened.
+///
+/// An empty migration set returns `None`: an in-memory target with no registered
+/// migrations is a legitimate configuration (it is the default test harness), so
+/// it is never rejected. A file-backed target likewise returns `None` — only it
+/// retains the migrated schema for the pool.
+#[cfg(feature = "sqlite")]
+pub(crate) fn reject_in_memory_migrations<S>(
+    database_url: &str,
+    migrations: &S,
+) -> Option<MigrationError>
+where
+    S: diesel::migration::MigrationSource<diesel::sqlite::Sqlite>,
+{
+    if !crate::db::sqlite_target_is_any_in_memory(database_url) {
+        return None;
+    }
+    // Only reject when there is actually a migration to apply. If the set can't
+    // be enumerated, treat it as non-empty (the apply would fail anyway) so the
+    // doomed configuration is still surfaced rather than silently proceeding.
+    let has_registered = migrations.migrations().map_or(true, |m| !m.is_empty());
+    if !has_registered {
+        return None;
+    }
+    Some(MigrationError::Migration(
+        IN_MEMORY_MIGRATION_MSG.to_owned(),
+    ))
+}
+
+/// Run all pending migrations against a `SQLite` database URL (issue #1614, PR3).
+///
+/// The `SQLite` counterpart to [`run_pending`]. `SQLite` is a single-writer local
+/// database, so — unlike the Postgres path — there is **no advisory lock**: no
+/// cross-process serialization is needed and `SQLite` has no `pg_advisory_lock`
+/// primitive. Establishes a synchronous `SqliteConnection` (via
+/// [`crate::db::establish_sqlite_migration_connection`]) and applies pending
+/// migrations through diesel's `MigrationHarness`.
+///
+/// The migration set is taken as a [`MigrationSource<Sqlite>`](diesel::migration::MigrationSource);
+/// the framework's [`EmbeddedMigrations`] (and [`EmbeddedMigrationsRef`]) satisfy
+/// this for the `SQLite` backend exactly as they do for Postgres, so a set
+/// registered via [`AppBuilder::migrations`](crate::app::AppBuilder::migrations)
+/// runs here unchanged.
+///
+/// # Errors
+///
+/// Returns [`MigrationError::Connection`] if the database cannot be opened, or
+/// [`MigrationError::Migration`] if a migration fails.
+#[cfg(feature = "sqlite")]
+pub fn run_pending_sqlite(
+    database_url: &str,
+    migrations: impl diesel::migration::MigrationSource<diesel::sqlite::Sqlite>,
+) -> Result<MigrationResult, MigrationError> {
+    // Reject ANY in-memory target (private OR shared-cache) with registered
+    // migrations before opening the (transient) migration connection: the
+    // migrated schema is lost before the runtime pool anchors it — a private
+    // in-memory connection is its own empty database, and a shared in-memory
+    // database is destroyed when its last connection closes (issue #1614
+    // follow-up). Only a file-backed target is unaffected.
+    if let Some(err) = reject_in_memory_migrations(database_url, &migrations) {
+        return Err(err);
+    }
+    let mut conn = crate::db::establish_sqlite_migration_connection(database_url)
+        .map_err(|e| MigrationError::Connection(e.to_string()))?;
+    let mut harness = HarnessWithOutput::write_to_stdout(&mut conn);
+    let applied = harness
+        .run_pending_migrations(migrations)
+        .map_err(|e| MigrationError::Migration(e.to_string()))?;
+    Ok(MigrationResult {
+        applied: applied.iter().map(|m| format!("{m}")).collect(),
+    })
+}
+
+/// Return names of pending (not yet applied) migrations on a `SQLite` target.
+///
+/// The `SQLite` status counterpart to [`pending_migrations`], used by
+/// [`auto_migrate_sqlite`] to report pending work without applying it.
+///
+/// # Errors
+///
+/// Returns [`MigrationError::Connection`] if the database cannot be opened, or
+/// [`MigrationError::Migration`] if status cannot be determined.
+#[cfg(feature = "sqlite")]
+fn pending_migrations_sqlite(
+    database_url: &str,
+    migrations: impl diesel::migration::MigrationSource<diesel::sqlite::Sqlite>,
+) -> Result<Vec<String>, MigrationError> {
+    let mut conn = crate::db::establish_sqlite_migration_connection(database_url)
+        .map_err(|e| MigrationError::Connection(e.to_string()))?;
+    let pending = conn
+        .pending_migrations(migrations)
+        .map_err(|e| MigrationError::Migration(e.to_string()))?;
+    Ok(pending
+        .iter()
+        .map(|m| m.name().version().to_string())
+        .collect())
+}
+
 pub(crate) fn compare_replica_migration_versions(
     primary: &[String],
     replica: &[String],
@@ -2233,6 +2361,95 @@ pub(crate) fn auto_migrate(
                          rolling deploy (expand/contract pattern)."
                     );
                 }
+                tracing::warn!(
+                    count = pending.len(),
+                    target = %target,
+                    "Pending migrations detected. Run `autumn migrate` to apply them."
+                );
+                for name in &pending {
+                    tracing::warn!(migration = %name, target = %target, "Pending migration");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, target = %target, "Could not check migration status");
+            }
+        }
+    }
+}
+
+/// Run migrations against a `SQLite` control target at startup (issue #1614, PR3).
+///
+/// The `SQLite` counterpart to [`auto_migrate`]: it honors the same profile
+/// policy via [`should_auto_apply`] (dev / development auto-applies; prod /
+/// production applies only when `allow_auto_migrate_in_production` is set;
+/// otherwise it reports pending work), and fails fast (`process::exit(1)`) on an
+/// apply error exactly like the Postgres path.
+///
+/// It deliberately omits the two Postgres-specific mechanisms
+/// [`auto_migrate`] relies on:
+///
+///   * **the advisory lock** — `SQLite` is single-writer; there is no
+///     `pg_advisory_lock` and no cross-process migration race to serialize
+///     (`run_pending_sqlite` applies directly, unlocked).
+///   * **the content-checksum drift guard** — its `autumn_migration_checksums`
+///     bookkeeping is Postgres DDL (`TIMESTAMPTZ`, `now()`, `to_regclass`) and
+///     is not ported to `SQLite` in this PR.
+///
+/// Sharding (directory / shard-map control tables, per-shard fan-out) is
+/// Postgres-only and is rejected upstream at boot
+/// (`sqlite_sharding_unsupported_guard`), so this only ever applies the
+/// registered control migration set.
+#[cfg(feature = "sqlite")]
+pub(crate) fn auto_migrate_sqlite(
+    database_url: &str,
+    profile: Option<&str>,
+    allow_auto_migrate_in_production: bool,
+    migrations: &EmbeddedMigrations,
+    target: &str,
+) {
+    // An in-memory target (private OR shared-cache) with registered migrations
+    // cannot work: the migrated schema is lost before the runtime pool anchors
+    // it — a private connection is its own empty database, and a shared in-memory
+    // database is destroyed when its last connection closes. Fail startup fast
+    // with an actionable message — in both the auto-apply and report-pending
+    // profiles — rather than booting into a schema-less pool whose every
+    // DB-backed request 500s (issue #1614 follow-up).
+    if let Some(err) = reject_in_memory_migrations(database_url, &EmbeddedMigrationsRef(migrations))
+    {
+        tracing::error!(
+            target = %target,
+            error = %err,
+            "Refusing to run SQLite migrations against an in-memory target",
+        );
+        std::process::exit(1);
+    }
+    if should_auto_apply(profile, allow_auto_migrate_in_production) {
+        tracing::info!(target = %target, "Running pending SQLite database migrations...");
+        match run_pending_sqlite(database_url, EmbeddedMigrationsRef(migrations)) {
+            Ok(result) if result.applied.is_empty() => {
+                tracing::info!(target = %target, "No pending migrations");
+            }
+            Ok(result) => {
+                for name in &result.applied {
+                    tracing::info!(migration = %name, target = %target, "Applied migration");
+                }
+                tracing::info!(
+                    count = result.applied.len(),
+                    target = %target,
+                    "All pending migrations applied"
+                );
+            }
+            Err(e) => {
+                tracing::error!(error = %e, target = %target, "Failed to run migrations");
+                std::process::exit(1);
+            }
+        }
+    } else {
+        match pending_migrations_sqlite(database_url, EmbeddedMigrationsRef(migrations)) {
+            Ok(pending) if pending.is_empty() => {
+                tracing::info!(target = %target, "Database migrations are up to date");
+            }
+            Ok(pending) => {
                 tracing::warn!(
                     count = pending.len(),
                     target = %target,
