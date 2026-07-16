@@ -1,0 +1,22 @@
+[package]
+name = "autumn-media-plugin"
+description = "Live-streaming media plugin (broadcast + rooms) for autumn-web applications"
+edition.workspace = true
+rust-version.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage = "https://github.com/madmax983/autumn"
+readme = "README.md"
+keywords = ["web", "media", "streaming", "webrtc", "axum"]
+categories = ["web-programming", "multimedia"]
+
+[dependencies]
+autumn-web = { version = "0.6.0", path = "../autumn" }
+serde = { workspace = true }
+thiserror = { workspace = true }
+toml = { workspace = true }
+tracing = { workspace = true }
+
+[lints]
+workspace = true
