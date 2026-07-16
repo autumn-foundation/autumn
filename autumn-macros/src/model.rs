@@ -17,30 +17,102 @@ use quote::{format_ident, quote};
 use syn::parse::Parser as _;
 use syn::{DeriveInput, Field, LitStr};
 
-/// Process `#[model]` or `#[model(table = "...")]` attribute arguments.
-fn parse_attr_args(attr: TokenStream) -> syn::Result<Option<String>> {
+/// Parsed `#[model(...)]` attribute arguments.
+///
+/// `managed` is a declarative-schema opt-in marker (#1975, Decision 4). It is
+/// accepted and validated here, but has **zero effect on generated code** —
+/// the marker is schema-authoritative for the CLI toolchain only; the codegen
+/// side is wired in a later slice.
+#[derive(Default, Debug)]
+struct ModelArgs {
+    /// Explicit `table = "..."` override, if any.
+    table: Option<String>,
+    /// Whether the model opted into declarative-schema management via
+    /// `#[model(managed)]`. Captured but intentionally unused by codegen.
+    #[allow(dead_code)]
+    managed: bool,
+}
+
+/// Process `#[model]`, `#[model(table = "...")]`, and `#[model(managed)]`
+/// attribute arguments.
+fn parse_attr_args(attr: TokenStream) -> syn::Result<ModelArgs> {
+    let mut args = ModelArgs::default();
     if attr.is_empty() {
-        return Ok(None);
+        return Ok(args);
     }
 
-    let mut table = None;
     syn::meta::parser(|meta| {
         if meta.path.is_ident("table") {
             let value: LitStr = meta.value()?.parse()?;
-            table = Some(value.value());
+            args.table = Some(value.value());
+            Ok(())
+        } else if meta.path.is_ident("managed") {
+            // The required form is a bare `managed` path. `managed = <expr>` is
+            // rejected with a clear message rather than silently accepted.
+            if meta.input.peek(syn::Token![=]) {
+                return Err(
+                    meta.error("`managed` takes no value; write a bare `#[model(managed)]`")
+                );
+            }
+            args.managed = true;
             Ok(())
         } else {
-            Err(meta.error("unsupported model attribute"))
+            Err(meta.error(
+                "unsupported `#[model(...)]` argument; expected `table = \"...\"` or `managed`",
+            ))
         }
     })
     .parse2(attr)?;
 
-    Ok(table)
+    Ok(args)
 }
 
 /// Check if a field has the `#[id]` attribute.
 fn has_attr(field: &Field, name: &str) -> bool {
     field.attrs.iter().any(|a| a.path().is_ident(name))
+}
+
+/// Validate the declarative-schema field markers `#[unique]` and
+/// `#[references(...)]` (#1975).
+///
+/// These markers are schema-authoritative for the CLI toolchain (the slice-2
+/// syn parser reads them from source text); the `#[model]` macro only needs to
+/// **accept** them and reject malformed shapes with a clear, actionable error.
+/// No FK/index codegen is produced here — the markers are validated then
+/// stripped by [`user_attrs`], leaving generated code byte-for-byte unchanged.
+///
+/// Accepted shapes (mirroring `autumn-cli`'s `schema::parse`):
+/// - `#[unique]` — a bare marker; any argument (`#[unique(...)]` / `#[unique =
+///   ...]`) is an error.
+/// - `#[references]` — bare; the target table is inferred from the field name.
+/// - `#[references(table = "other_table")]` — an explicit target table.
+fn validate_field_schema_markers(field: &Field) -> syn::Result<()> {
+    for attr in &field.attrs {
+        if attr.path().is_ident("unique") {
+            if !matches!(attr.meta, syn::Meta::Path(_)) {
+                return Err(syn::Error::new_spanned(
+                    attr,
+                    "`#[unique]` takes no arguments; write a bare `#[unique]`",
+                ));
+            }
+        } else if attr.path().is_ident("references") {
+            // Bare `#[references]` is valid (target inferred from field name).
+            if matches!(attr.meta, syn::Meta::Path(_)) {
+                continue;
+            }
+            attr.parse_nested_meta(|meta| {
+                if meta.path.is_ident("table") {
+                    let _value: LitStr = meta.value()?.parse()?;
+                    Ok(())
+                } else {
+                    Err(meta.error(
+                        "unsupported `#[references(...)]` argument; expected `table = \"...\"`",
+                    ))
+                }
+            })?;
+        }
+    }
+    Ok(())
 }
 
 /// The three declarative association kinds supported on `#[model]`.
@@ -1362,6 +1434,11 @@ fn user_attrs(field: &Field) -> Vec<&syn::Attribute> {
                 && !a.path().is_ident("private")
                 && !a.path().is_ident("normalize")
                 && !a.path().is_ident("state_machine")
+                // Declarative-schema field markers (#1975). Accepted and
+                // validated, but stripped from the generated query struct so
+                // they never leak onto the Diesel derives; codegen is unchanged.
+                && !a.path().is_ident("unique")
+                && !a.path().is_ident("references")
         })
         .collect()
 }
@@ -3171,7 +3248,9 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     };
 
     let table_name = match parse_attr_args(attr) {
-        Ok(explicit) => explicit.unwrap_or_else(|| infer_table_name(&input.ident)),
+        Ok(model_args) => model_args
+            .table
+            .unwrap_or_else(|| infer_table_name(&input.ident)),
         Err(err) => return err.to_compile_error(),
     };
 
@@ -3214,6 +3293,15 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     // Classify fields
     let all_fields: Vec<&Field> = fields.named.iter().collect();
+
+    // Validate the declarative-schema field markers (#1975) before any codegen,
+    // so a malformed `#[unique]` / `#[references(...)]` yields a single clean
+    // compile error rather than a cascade of downstream failures.
+    for field in &all_fields {
+        if let Err(err) = validate_field_schema_markers(field) {
+            return err.to_compile_error();
+        }
+    }
 
     // Validate that the declared shard_key names an existing field (or "id").
     if let Some(ref key) = shard_key_field {
@@ -7153,6 +7241,156 @@ mod tests {
         // The lock_version attribute must not leak onto the generated Diesel
         // struct — Diesel doesn't know about it and would emit a warning/error.
         assert!(attrs.is_empty());
+    }
+
+    // --- Declarative-schema markers (#1975, slice 3.5) -------------------
+    // Acceptance-only: the `#[model]` macro must ACCEPT `#[model(managed)]`
+    // and the `#[unique]` / `#[references(...)]` field markers, validate their
+    // shapes, strip them from generated code, and change NO codegen behavior.
+
+    #[test]
+    fn model_managed_arg_accepted_by_parse_attr_args() {
+        let args = parse_attr_args(quote! { managed }).expect("`managed` must parse");
+        assert!(
+            args.managed,
+            "`#[model(managed)]` must set the managed flag"
+        );
+        assert!(args.table.is_none());
+    }
+
+    #[test]
+    fn model_managed_and_table_accepted_together() {
+        let args =
+            parse_attr_args(quote! { table = "accounts", managed }).expect("both args must parse");
+        assert!(args.managed);
+        assert_eq!(args.table.as_deref(), Some("accounts"));
+    }
+
+    #[test]
+    fn model_managed_with_value_rejected() {
+        let err = parse_attr_args(quote! { managed = true })
+            .expect_err("`managed = ...` must be rejected");
+        assert!(
+            err.to_string().contains("`managed` takes no value"),
+            "unexpected message: {err}"
+        );
+    }
+
+    #[test]
+    fn model_unknown_arg_still_rejected() {
+        let err =
+            parse_attr_args(quote! { bogus }).expect_err("an unknown `#[model]` arg must error");
+        assert!(
+            err.to_string()
+                .contains("unsupported `#[model(...)]` argument"),
+            "unexpected message: {err}"
+        );
+    }
+
+    #[test]
+    fn empty_model_args_default() {
+        let args = parse_attr_args(TokenStream::new()).expect("empty args must parse");
+        assert!(!args.managed);
+        assert!(args.table.is_none());
+    }
+
+    #[test]
+    fn unique_and_references_filtered_from_user_attrs() {
+        let field: syn::Field = syn::parse_quote! {
+            #[unique]
+            #[references(table = "accounts")]
+            pub account_id: i64
+        };
+        let attrs = user_attrs(&field);
+        // Neither marker may leak onto the generated Diesel query struct.
+        assert!(
+            attrs.is_empty(),
+            "`#[unique]` / `#[references]` must be stripped: {attrs:?}",
+            attrs = attrs
+                .iter()
+                .map(|a| quote!(#a).to_string())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn bare_unique_and_references_pass_validation() {
+        let field: syn::Field = syn::parse_quote! {
+            #[unique]
+            #[references]
+            pub account_id: i64
+        };
+        validate_field_schema_markers(&field).expect("bare markers must validate");
+
+        let explicit: syn::Field = syn::parse_quote! {
+            #[references(table = "accounts")]
+            pub account_id: i64
+        };
+        validate_field_schema_markers(&explicit).expect("explicit references must validate");
+    }
+
+    #[test]
+    fn unique_with_args_rejected() {
+        let field: syn::Field = syn::parse_quote! {
+            #[unique(x)]
+            pub account_id: i64
+        };
+        let err =
+            validate_field_schema_markers(&field).expect_err("`#[unique(...)]` must be rejected");
+        assert!(
+            err.to_string().contains("`#[unique]` takes no arguments"),
+            "unexpected message: {err}"
+        );
+    }
+
+    #[test]
+    fn references_with_bad_key_rejected() {
+        let field: syn::Field = syn::parse_quote! {
+            #[references(bogus = "x")]
+            pub account_id: i64
+        };
+        let err = validate_field_schema_markers(&field)
+            .expect_err("`#[references(bogus = ...)]` must be rejected");
+        assert!(
+            err.to_string()
+                .contains("unsupported `#[references(...)]` argument"),
+            "unexpected message: {err}"
+        );
+    }
+
+    #[test]
+    fn schema_markers_do_not_change_codegen() {
+        // The generated output for a model that USES the markers must be
+        // identical (modulo the stripped marker attrs) to the same model
+        // WITHOUT them — i.e. the markers contribute nothing to codegen.
+        let with_markers = model_macro(
+            quote! { managed },
+            quote! {
+                pub struct Membership {
+                    #[id]
+                    pub id: i64,
+                    #[unique]
+                    #[references(table = "accounts")]
+                    pub account_id: i64,
+                }
+            },
+        )
+        .to_string();
+        let without_markers = model_macro(
+            TokenStream::new(),
+            quote! {
+                pub struct Membership {
+                    #[id]
+                    pub id: i64,
+                    pub account_id: i64,
+                }
+            },
+        )
+        .to_string();
+        assert_eq!(
+            with_markers, without_markers,
+            "schema markers must not alter generated code"
+        );
     }
 
     #[test]

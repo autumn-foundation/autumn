@@ -1,0 +1,5 @@
+error: unsupported `#[references(...)]` argument; expected `table = "..."`
+ --> tests/compile-fail/model_references_bad_key.rs:8:18
+  |
+8 |     #[references(bogus = "x")]
+  |                  ^^^^^
