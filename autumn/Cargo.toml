@@ -87,7 +87,7 @@ offline-sync = ["db", "http-client"]
 # (`PoolError::UnsupportedBackend`); a working pool is PR2. Needs no extra deps
 # — diesel's sqlite backend and diesel-async's sync-connection-wrapper are
 # already in the graph.
-sqlite = ["diesel/sqlite", "diesel-async/sync-connection-wrapper"]
+sqlite = ["diesel/sqlite", "diesel/returning_clauses_for_sqlite_3_35", "diesel-async/sync-connection-wrapper"]
 test-support = ["dep:testcontainers", "dep:testcontainers-modules"]
 telemetry-otlp = [
     "dep:opentelemetry",

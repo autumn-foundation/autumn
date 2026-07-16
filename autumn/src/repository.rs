@@ -180,8 +180,8 @@ pub type RuntimeDependentCascadeFuture<'a> = ::std::pin::Pin<
 /// All references share one lifetime so the returned future can borrow the
 /// connection and all three guard sets for exactly as long as it is awaited.
 pub type RuntimeDependentCascadeFn = for<'a> fn(
-    &'a ::diesel_async::pooled_connection::deadpool::Pool<::diesel_async::AsyncPgConnection>,
-    &'a mut ::diesel_async::AsyncPgConnection,
+    &'a ::diesel_async::pooled_connection::deadpool::Pool<crate::db::RuntimeConnection>,
+    &'a mut crate::db::RuntimeConnection,
     i64,
     bool,
     &'a mut ::std::collections::HashSet<(&'static str, i64)>,
@@ -360,7 +360,7 @@ pub trait AutumnUpsertExecutionExt {
     fn __autumn_execute_upsert<'a>(
         chunk: &'a [Self::Model],
         tenant_id: ::core::option::Option<&'a str>,
-        conn: &'a mut ::diesel_async::AsyncPgConnection,
+        conn: &'a mut crate::db::RuntimeConnection,
     ) -> impl ::std::future::Future<
         Output = ::core::result::Result<::std::vec::Vec<Self::Model>, ::diesel::result::Error>,
     > + Send
@@ -420,7 +420,7 @@ pub trait M2mConnSource: Send + Sync {
         &self,
     ) -> impl ::std::future::Future<
         Output = crate::AutumnResult<
-            diesel_async::pooled_connection::deadpool::Object<diesel_async::AsyncPgConnection>,
+            diesel_async::pooled_connection::deadpool::Object<crate::db::RuntimeConnection>,
         >,
     > + Send;
 }
