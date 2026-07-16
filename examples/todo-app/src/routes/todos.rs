@@ -176,6 +176,7 @@ fn title_field_partial(form: &ChangesetForm<TodoForm>) -> Markup {
     html! {
         div id="title-field" data-autumn-field-wrapper="title" class="flex-1 flex flex-col gap-1" {
             input type="text" name="title"
+                  aria-label="Todo title"
                   value=(value)
                   placeholder="What needs to be done?"
                   autocomplete="off"
