@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 
 use autumn_schema_core::Backend;
 
-use parse::{parse_model_source, parse_models_dir};
+use parse::parse_models_path;
 use snapshot::{SNAPSHOT_DEFAULT_PATH, SchemaSnapshot};
 
 /// A `--backend pg|sqlite` override for the `snapshot` action, mapping onto the
@@ -56,8 +56,9 @@ pub enum SchemaAction {
     /// `#[model]` structs — the checked-in diff baseline a later slice's diff
     /// engine compares the desired state against. Read-only w.r.t. the models.
     Snapshot {
-        /// The models directory to snapshot. Defaults to the app's `src/models`.
-        #[arg(long, value_name = "DIR")]
+        /// A `.rs` model file or a directory of them to snapshot. Defaults to
+        /// the app's `src/models` directory, else `src/models.rs`.
+        #[arg(long, value_name = "PATH")]
         from: Option<PathBuf>,
         /// Where to write the snapshot. Defaults to `.autumn/schema-snapshot.json`.
         #[arg(long, value_name = "PATH")]
@@ -101,13 +102,38 @@ const fn map_detected_backend(detected: autumn_web::config::DatabaseBackend) -> 
     }
 }
 
+/// Resolve the default models source when `--from` is omitted: the app's
+/// `src/models` directory if it exists, else the single-file `src/models.rs`
+/// layout, else a clear error telling the user to pass `--from`. Autumn supports
+/// both layouts, so the snapshot default must accept either.
+///
+/// Takes an explicit `project_root` (rather than reading the process CWD) so it
+/// is testable without mutating the current directory.
+fn resolve_default_models_path(project_root: &Path) -> Result<PathBuf, String> {
+    let dir = project_root.join("src").join("models");
+    if dir.is_dir() {
+        return Ok(dir);
+    }
+    let file = project_root.join("src").join("models.rs");
+    if file.is_file() {
+        return Ok(file);
+    }
+    Err(format!(
+        "no models found at {} or {} — pass --from to point at your models file or directory",
+        dir.display(),
+        file.display()
+    ))
+}
+
 /// Assemble a snapshot from the declared models and either write it to `out`
 /// (default [`SNAPSHOT_DEFAULT_PATH`]) or print it to stdout.
 ///
 /// The backend is `--backend` when given, else the project's configured backend
 /// (`generate::detect_backend`, the same pg-vs-sqlite resolution the generator
-/// uses). The source is `--from`, else the project's `src/models` directory.
-/// Parser diagnostics are surfaced on stderr (non-fatal), mirroring `parse`.
+/// uses). The source is `--from` (a `.rs` file or a directory), else the
+/// project's default models path (`src/models` directory, else `src/models.rs`;
+/// see [`resolve_default_models_path`]). Parser diagnostics are surfaced on
+/// stderr (non-fatal), mirroring `parse`.
 ///
 /// Building the baseline from the declared models (not a live DB) is deliberate:
 /// at adoption time the models and the database agree, so this establishes the
@@ -133,17 +159,17 @@ fn run_snapshot(
         crate::generate::ensure_project_root(&project_root).map_err(|e| e.to_string())?;
     }
 
-    let models_dir = from.map_or_else(
-        || project_root.join("src").join("models"),
-        Path::to_path_buf,
-    );
+    let models_path = match from {
+        Some(path) => path.to_path_buf(),
+        None => resolve_default_models_path(&project_root)?,
+    };
 
     let backend = backend.map_or_else(
         || map_detected_backend(crate::generate::detect_backend(&project_root)),
         Backend::from,
     );
 
-    let parsed = parse_models_dir(&models_dir, backend).map_err(|e| e.to_string())?;
+    let parsed = parse_models_path(&models_path, backend).map_err(|e| e.to_string())?;
     for diag in &parsed.diagnostics {
         eprintln!("warning: {}", diag.message);
     }
@@ -171,18 +197,52 @@ fn run_parse(path: &Path) -> Result<String, String> {
     // The parser IR is backend-tagged; `parse` defaults to Postgres (the fully
     // wired runtime backend). A backend flag is a later-slice concern.
     let backend = Backend::Postgres;
-    let parsed = if path.is_dir() {
-        parse_models_dir(path, backend)
-    } else {
-        let src = std::fs::read_to_string(path)
-            .map_err(|e| format!("failed to read {}: {e}", path.display()))?;
-        parse_model_source(&src, backend)
-    }
-    .map_err(|e| e.to_string())?;
+    let parsed = parse_models_path(path, backend).map_err(|e| e.to_string())?;
 
     for diag in &parsed.diagnostics {
         eprintln!("warning: {}", diag.message);
     }
 
     serde_json::to_string_pretty(&parsed.tables).map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_resolver_prefers_src_models_dir() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let dir = root.path().join("src").join("models");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        // A `src/models.rs` file also present must not win over the directory.
+        std::fs::write(root.path().join("src").join("models.rs"), "").expect("write file");
+
+        let resolved = resolve_default_models_path(root.path()).expect("resolve");
+        assert_eq!(resolved, dir);
+    }
+
+    #[test]
+    fn default_resolver_falls_back_to_single_file() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let src = root.path().join("src");
+        std::fs::create_dir_all(&src).expect("mkdir");
+        let file = src.join("models.rs");
+        std::fs::write(&file, "").expect("write file");
+
+        let resolved = resolve_default_models_path(root.path()).expect("resolve");
+        assert_eq!(resolved, file);
+    }
+
+    #[test]
+    fn default_resolver_errors_when_neither_exists() {
+        let root = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(root.path().join("src")).expect("mkdir");
+
+        let err = resolve_default_models_path(root.path()).unwrap_err();
+        assert!(
+            err.contains("--from"),
+            "error tells the user to pass --from"
+        );
+    }
 }

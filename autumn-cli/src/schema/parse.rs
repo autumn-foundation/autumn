@@ -227,6 +227,40 @@ pub fn parse_models_dir(dir: &Path, backend: Backend) -> Result<ParsedSchema, Sc
     Ok(out)
 }
 
+/// Parse the `#[model]` structs at `path`, dispatching on what the path is:
+/// a DIRECTORY is walked via [`parse_models_dir`]; a `.rs` FILE is read and
+/// parsed via [`parse_model_source`] (the single-file `src/models.rs` layout);
+/// a path that is neither (does not exist) yields a clear error naming it.
+///
+/// This is the one file-vs-directory dispatch both `autumn schema parse` and
+/// `autumn schema snapshot` route through, so the two commands accept the same
+/// `src/models/` (directory) and single-file `src/models.rs` layouts and can
+/// never drift.
+///
+/// # Errors
+///
+/// Returns [`SchemaParseError::Io`] if `path` does not exist or cannot be read,
+/// or [`SchemaParseError::Syntax`] if a file is not valid Rust.
+pub fn parse_models_path(path: &Path, backend: Backend) -> Result<ParsedSchema, SchemaParseError> {
+    if path.is_dir() {
+        parse_models_dir(path, backend)
+    } else if path.is_file() {
+        let src = std::fs::read_to_string(path).map_err(|source| SchemaParseError::Io {
+            path: path.display().to_string(),
+            source,
+        })?;
+        parse_model_source(&src, backend)
+    } else {
+        Err(SchemaParseError::Io {
+            path: path.display().to_string(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "expected a `.rs` model file or a directory of model files",
+            ),
+        })
+    }
+}
+
 /// Find the `#[model]` / `#[autumn_web::model]` attribute on a struct, if any.
 /// The last path segment must be `model`, so both the bare and fully-qualified
 /// spellings match.
@@ -1261,5 +1295,54 @@ mod tests {
             col(&table, "author_id").references,
             Some(ForeignKey::new("users", "id"))
         );
+    }
+
+    const SINGLE_FILE_MODEL: &str = r#"
+        #[model]
+        pub struct Post {
+            #[id]
+            pub id: i64,
+            pub body: String,
+        }
+    "#;
+
+    #[test]
+    fn parse_models_path_reads_a_single_rs_file() {
+        // The single-file `src/models.rs` layout: `--from` points at a `.rs`
+        // file, not a directory.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("models.rs");
+        std::fs::write(&file, SINGLE_FILE_MODEL).expect("write model file");
+
+        let parsed = parse_models_path(&file, Backend::Postgres).expect("parse single file");
+        assert_eq!(parsed.tables.len(), 1);
+        assert_eq!(parsed.tables[0].name, "posts");
+    }
+
+    #[test]
+    fn parse_models_path_reads_a_directory() {
+        // The `src/models/` directory layout with one `*.rs` file.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let models_dir = dir.path().join("models");
+        std::fs::create_dir(&models_dir).expect("mkdir");
+        std::fs::write(models_dir.join("post.rs"), SINGLE_FILE_MODEL).expect("write model file");
+
+        let parsed = parse_models_path(&models_dir, Backend::Postgres).expect("parse dir");
+        assert_eq!(parsed.tables.len(), 1);
+        assert_eq!(parsed.tables[0].name, "posts");
+    }
+
+    #[test]
+    fn parse_models_path_missing_path_is_a_clear_io_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("does_not_exist.rs");
+
+        let err = parse_models_path(&missing, Backend::Postgres).unwrap_err();
+        match err {
+            SchemaParseError::Io { path, .. } => {
+                assert!(path.contains("does_not_exist.rs"), "path names the input");
+            }
+            other @ SchemaParseError::Syntax { .. } => panic!("expected Io error, got {other:?}"),
+        }
     }
 }
