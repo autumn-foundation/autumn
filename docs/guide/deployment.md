@@ -162,18 +162,27 @@ AUTUMN_DATABASE__URL=postgres://user:pass@db-host:5432/myapp_prod
 
 > **Your `autumn.toml` is deployed alongside the binary.** `autumn deploy up`
 > uploads your project's `autumn.toml` (and, when present, the profile sibling
-> `autumn-<profile>.toml`) into `app_dir/shared/` and sets
-> `AUTUMN_MANIFEST_DIR=app_dir/shared` in the systemd unit, so at startup the app
-> loads the same non-secret configuration you tested locally — auth, the jobs and
-> scheduler backends, health/telemetry paths, CORS, signing-secret rotation
+> `autumn-<profile>.toml`) into the **per-release directory** — next to the
+> binary it shipped with — and sets `AUTUMN_MANIFEST_DIR` to that release dir in
+> the systemd unit, so at startup the app loads the same non-secret configuration
+> you tested locally — auth, the jobs and scheduler backends, health/telemetry
+> paths, CORS, signing-secret rotation
 > (`security.signing_secret.previous_secrets`), and so on — instead of falling
 > back to built-in defaults (fixes
-> [#1952](https://github.com/madmax983/autumn/issues/1952)). The raw manifest is
-> uploaded, not a flattened copy, so the app still applies its
-> `[profile.<AUTUMN_ENV>]` overlay at runtime; the manifest is re-uploaded on
-> every `deploy up` so the config on the server always matches the shipped binary.
-> If no `autumn.toml` is found in the project directory, the deploy prints a loud
-> warning and the app runs built-in defaults for all non-secret settings.
+> [#1952](https://github.com/madmax983/autumn/issues/1952)). Coupling the config
+> to the release (rather than a single shared dir) means a **rollback loads the
+> rolled-back release's own config** — never the latest deploy's — and **removing
+> a local override and redeploying no longer leaves a stale one loaded**, because
+> a fresh release dir carries only the manifests uploaded that deploy. The
+> profile sibling is picked the same way the host runtime picks it: the deploy
+> normalizes the profile and uploads the first matching `autumn-<profile>.toml`
+> (e.g. `profile = "Production"` uploads `autumn-production.toml`, matching the
+> file the app loads first). The raw manifest is uploaded, not a flattened copy,
+> so the app still applies its `[profile.<AUTUMN_ENV>]` overlay at runtime; the
+> manifest is re-uploaded on every `deploy up` so the config on the server always
+> matches the shipped binary. If no `autumn.toml` is found in the project
+> directory, the deploy prints a loud warning and the app runs built-in defaults
+> for all non-secret settings.
 > **Secrets never go in the manifest** — the manifest is owner-only (`0600`), so
 > any inline config secrets are never exposed to other local accounts, while the
 > signing secret, database URL, and `AUTUMN_ENV` continue to travel only
@@ -345,16 +354,20 @@ or error messages.
 - **Your project's `autumn.toml` is deployed**
   ([#1952](https://github.com/madmax983/autumn/issues/1952)). `autumn deploy up`
   uploads your `autumn.toml` (and the profile sibling `autumn-<profile>.toml`
-  when present) into `app_dir/shared/` at mode `0600` (owner-only, so secrets are
-  never exposed to other local accounts) and sets
-  `AUTUMN_MANIFEST_DIR=app_dir/shared` in the systemd unit, so the app loads the
-  same non-secret configuration (auth, jobs and scheduler backends,
+  when present) into the **per-release directory** at mode `0600` (owner-only, so
+  secrets are never exposed to other local accounts) and sets
+  `AUTUMN_MANIFEST_DIR` to that release dir in the systemd unit, so the app loads
+  the same non-secret configuration (auth, jobs and scheduler backends,
   health/telemetry paths, CORS, signing-secret rotation `previous_secrets`, etc.)
-  you tested locally rather than falling back to built-in defaults. The manifest
-  is re-uploaded on every `deploy up`; secrets never go in it — they stay in the
-  `0600` host env file, which overrides `autumn.toml` at load time. When no
-  `autumn.toml` is found locally the deploy prints a loud warning and the app
-  runs built-in defaults.
+  you tested locally rather than falling back to built-in defaults. Because the
+  manifest is coupled to the release, a **rollback loads the rolled-back
+  release's own config** and **removing a local override then redeploying doesn't
+  leave a stale one lingering**. The profile sibling is normalized and chosen
+  exactly as the host runtime chooses it (e.g. `profile = "Production"` uploads
+  `autumn-production.toml`). The manifest is re-uploaded on every `deploy up`;
+  secrets never go in it — they stay in the `0600` host env file, which overrides
+  `autumn.toml` at load time. When no `autumn.toml` is found locally the deploy
+  prints a loud warning and the app runs built-in defaults.
 - **Migrations run on redeploys, not on the very first deploy.** The pre-cutover
   migration one-shot is part of the zero-downtime redeploy path; the initial
   `deploy up` stands the release up and health-gates it. For a database-backed

@@ -567,23 +567,25 @@ fn deploy_e2e_full_lifecycle() {
     );
     eprintln!("[e2e]    (simulated reboot survival: {APP_NAME}-blue.service is enabled)");
 
-    // AC (#1952): the project `autumn.toml` is uploaded into the persistent
-    // shared dir and the slot unit points AUTUMN_MANIFEST_DIR at it, so the
-    // deployed app loads the intended config instead of silent built-in defaults.
+    // AC (#1952): the project `autumn.toml` is uploaded into the per-release dir
+    // (coupled to the binary) and the slot unit points AUTUMN_MANIFEST_DIR at that
+    // release dir, so the deployed app loads the intended config instead of silent
+    // built-in defaults — and a rollback reads the rolled-back release's own copy.
+    // The live release dir is reachable through the `current` symlink.
     let manifest_present = ws.ssh(
         ssh_port,
         &format!(
-            "test -f /srv/autumn/{APP_NAME}/shared/autumn.toml && echo present || echo missing"
+            "test -f /srv/autumn/{APP_NAME}/current/autumn.toml && echo present || echo missing"
         ),
     );
     assert_eq!(
         String::from_utf8_lossy(&manifest_present.stdout).trim(),
         "present",
-        "the project autumn.toml should be uploaded to the shared dir (#1952)"
+        "the project autumn.toml should be uploaded to the release dir (#1952)"
     );
     let unit_has_manifest_dir = ws.ssh(
         ssh_port,
-        &format!("grep -c 'AUTUMN_MANIFEST_DIR=/srv/autumn/{APP_NAME}/shared' /etc/systemd/system/{APP_NAME}-blue.service || true"),
+        &format!("grep -c 'AUTUMN_MANIFEST_DIR=/srv/autumn/{APP_NAME}/releases/' /etc/systemd/system/{APP_NAME}-blue.service || true"),
     );
     assert!(
         String::from_utf8_lossy(&unit_has_manifest_dir.stdout)
@@ -591,9 +593,11 @@ fn deploy_e2e_full_lifecycle() {
             .parse::<u32>()
             .unwrap_or(0)
             >= 1,
-        "the slot unit should set AUTUMN_MANIFEST_DIR to the shared dir (#1952)"
+        "the slot unit should set AUTUMN_MANIFEST_DIR to the release dir (#1952)"
     );
-    eprintln!("[e2e]    (#1952: autumn.toml uploaded to shared/ and AUTUMN_MANIFEST_DIR set)");
+    eprintln!(
+        "[e2e]    (#1952: autumn.toml uploaded to the release dir and AUTUMN_MANIFEST_DIR set)"
+    );
 
     // ── 2. Zero-downtime redeploy (v2) under load (AC-2) ────────────────────
     thread::sleep(Duration::from_millis(1200)); // distinct per-second release id

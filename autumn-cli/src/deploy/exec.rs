@@ -202,14 +202,16 @@ impl DeployOp {
     }
 }
 
-/// A project config manifest file to upload into the persistent `shared/` dir so
+/// A project config manifest file to upload into the per-release dir so
 /// the deployed app loads the intended (non-secret) config instead of silently
 /// falling back to built-in defaults (issue #1952).
 ///
 /// `local` is the on-disk source in the project directory (e.g. `./autumn.toml`
 /// or a profile sibling `./autumn-prod.toml`); `remote_basename` is the file name
-/// written under `{app_dir}/shared/`. The systemd unit sets `AUTUMN_MANIFEST_DIR`
-/// to that shared dir so the app's config loader reads these files at boot.
+/// written under the release dir. The systemd unit sets `AUTUMN_MANIFEST_DIR`
+/// to that release dir so the app's config loader reads these files at boot —
+/// coupling the config to the binary it shipped with, so a rollback reads the
+/// rolled-back release's own manifest.
 ///
 /// The RAW manifest is uploaded, NOT a flattened/merged config: the app applies
 /// its `[profile.<AUTUMN_ENV>]` overlay at runtime (`AUTUMN_ENV` is set in the env
@@ -219,27 +221,34 @@ impl DeployOp {
 pub struct ManifestUpload {
     /// Local source path in the project directory.
     pub local: PathBuf,
-    /// File name to write under `{app_dir}/shared/`.
+    /// File name to write under the release dir.
     pub remote_basename: String,
 }
 
 /// Build the config-manifest upload ops (issue #1952).
 ///
 /// Each manifest is uploaded at mode `0600` (owner-only). The deployed app runs
-/// as the same deploy user that owns `shared/` — the user that already reads the
-/// `0600` `autumn.env` — so a `0600` manifest still loads at boot, while no other
-/// local account can read it. Owner-only matters because a project `autumn.toml`
-/// can legitimately carry inline credentials (e.g. `[security.signing_secret]`);
-/// world-readable (`0644`) would expose those to every account on the host.
-/// Re-uploaded on every deploy (both first deploy and cutover) so the config on
-/// the server always matches the shipped binary.
-fn manifest_upload_ops(shared_dir: &str, manifests: &[ManifestUpload]) -> Vec<DeployOp> {
+/// as the same deploy user that owns the release dir — the user that already
+/// reads the `0600` `autumn.env` — so a `0600` manifest still loads at boot,
+/// while no other local account can read it. Owner-only matters because a
+/// project `autumn.toml` can legitimately carry inline credentials (e.g.
+/// `[security.signing_secret]`); world-readable (`0644`) would expose those to
+/// every account on the host.
+///
+/// The manifest is written into the per-release dir (NOT the shared dir) so the
+/// config is coupled to the binary it shipped with: a rollback that re-renders
+/// the unit from the target release dir automatically reads that release's OWN
+/// manifest, and a fresh release dir only carries the manifests uploaded THIS
+/// deploy (so removing a local override and redeploying no longer leaves a
+/// stale one loaded). Re-uploaded on every deploy (both first deploy and
+/// cutover).
+fn manifest_upload_ops(release_dir: &str, manifests: &[ManifestUpload]) -> Vec<DeployOp> {
     manifests
         .iter()
         .map(|m| DeployOp::UploadFile {
             label: "upload-config",
             local: m.local.clone(),
-            remote_path: format!("{shared_dir}/{}", m.remote_basename),
+            remote_path: format!("{release_dir}/{}", m.remote_basename),
             // 0600: owner-only. The deploy user (which runs the app) reads it;
             // other local accounts can't, so inline config secrets stay private.
             mode: Some(0o600),
@@ -599,10 +608,13 @@ pub fn first_deploy_ops(
         remote_path: remote_binary,
         mode: Some(0o755),
     });
-    // Upload the project config manifest(s) into the persistent shared dir so the
+    // Upload the project config manifest(s) into the per-release dir so the
     // deployed app loads the intended config instead of silent built-in defaults
-    // (#1952). The systemd unit points AUTUMN_MANIFEST_DIR here.
-    ops.extend(manifest_upload_ops(&shared_dir, manifests));
+    // (#1952). The manifest is coupled to the binary it shipped with: the slot
+    // unit points AUTUMN_MANIFEST_DIR at this release dir, so a rollback that
+    // re-renders the unit from the rolled-back release dir reads that release's
+    // OWN manifest.
+    ops.extend(manifest_upload_ops(&release_dir, manifests));
     ops.extend([
         DeployOp::WriteFile {
             label: "write-env",
@@ -731,9 +743,10 @@ pub fn cutover_ops(
             mode: Some(0o755),
         },
     ];
-    // Re-upload the project config manifest(s) on every redeploy so the config on
-    // the server always matches the shipped binary (#1952).
-    ops.extend(manifest_upload_ops(&shared_dir, manifests));
+    // Re-upload the project config manifest(s) into the per-release dir on every
+    // redeploy so the config on the server always matches the shipped binary and
+    // is coupled to it for rollback (#1952).
+    ops.extend(manifest_upload_ops(&release_dir, manifests));
     ops.extend([
         DeployOp::WriteFile {
             label: "write-env",
@@ -2474,6 +2487,48 @@ mod tests {
     }
 
     #[test]
+    fn rollback_reads_target_release_own_manifest_and_uploads_none() {
+        // #1952 P1: the manifest is coupled to the release dir, so a rollback that
+        // re-renders the target slot's unit from `target.release_dir` automatically
+        // sets AUTUMN_MANIFEST_DIR to THAT release dir — the app then loads the
+        // rolled-back release's OWN uploaded manifest, not the latest deploy's.
+        // rollback_ops takes no manifests and must upload none (the retained
+        // release dir still carries the manifest shipped with that binary).
+        let cfg = resolved();
+        let target = RollbackTarget {
+            release_dir: "/srv/autumn/myapp/releases/20260713T090000Z".to_owned(),
+            slot: SLOT_BLUE,
+            port: 3001,
+        };
+        let ops = rollback_ops(&cfg, &proxy(), &target);
+
+        let unit_contents = ops
+            .iter()
+            .find_map(|op| match op {
+                DeployOp::WriteFile {
+                    label: "write-target-unit",
+                    contents,
+                    ..
+                } => Some(contents.as_str().to_owned()),
+                _ => None,
+            })
+            .expect("rollback re-renders the target unit");
+        assert!(
+            unit_contents.contains(
+                "Environment=AUTUMN_MANIFEST_DIR=/srv/autumn/myapp/releases/20260713T090000Z"
+            ),
+            "rolled-back unit points AUTUMN_MANIFEST_DIR at the target release dir \
+             (its own manifest): {unit_contents}"
+        );
+
+        assert!(
+            !ops.iter().any(|op| op.label() == "upload-config"),
+            "rollback uploads no manifest — the target release dir already carries \
+             the manifest it shipped with"
+        );
+    }
+
+    #[test]
     fn rollback_drains_the_slot_it_flipped_away_from() {
         // Regression (Codex P1): rolling back must disable the slot that was live
         // before the rollback (the slot traffic moved AWAY from), so the invariant
@@ -3195,19 +3250,21 @@ mod tests {
         );
     }
 
-    /// #1952: the project config manifest is uploaded into the persistent shared
-    /// dir at 0600 on a FIRST deploy, so the app loads the intended config instead
-    /// of silent built-in defaults.
+    /// #1952: the project config manifest is uploaded into the per-release dir
+    /// at 0600 on a FIRST deploy (coupled to the binary), so the app loads the
+    /// intended config instead of silent built-in defaults and a rollback reads
+    /// the rolled-back release's own manifest.
     #[test]
-    fn first_deploy_uploads_config_manifest_to_shared_at_0600() {
+    fn first_deploy_uploads_config_manifest_to_release_at_0600() {
         let ops = sample_ops(Secret::new("AUTUMN_SECURITY__SIGNING_SECRET=x\n"));
+        let base_path = format!("{RELEASE_DIR}/autumn.toml");
         let base = ops
             .iter()
             .find(|op| {
                 matches!(op, DeployOp::UploadFile { label: "upload-config", remote_path, .. }
-                    if remote_path == "/srv/autumn/myapp/shared/autumn.toml")
+                    if *remote_path == base_path)
             })
-            .expect("base autumn.toml is uploaded to shared/");
+            .expect("base autumn.toml is uploaded to the release dir");
         match base {
             DeployOp::UploadFile { mode, .. } => {
                 assert_eq!(
@@ -3218,14 +3275,15 @@ mod tests {
             }
             other => panic!("upload-config should be an UploadFile op, got {other:?}"),
         }
-        // The prod profile sibling is uploaded alongside it.
+        // The prod profile sibling is uploaded alongside it, into the release dir.
+        let sibling_path = format!("{RELEASE_DIR}/autumn-prod.toml");
         assert!(
             ops.iter().any(|op| matches!(
                 op,
                 DeployOp::UploadFile { label: "upload-config", remote_path, mode: Some(0o600), .. }
-                    if remote_path == "/srv/autumn/myapp/shared/autumn-prod.toml"
+                    if *remote_path == sibling_path
             )),
-            "profile sibling autumn-prod.toml is uploaded to shared/"
+            "profile sibling autumn-prod.toml is uploaded to the release dir"
         );
         // The manifest lands before the unit is written / daemon-reloaded.
         let cfg_idx = ops
@@ -3242,18 +3300,19 @@ mod tests {
         );
     }
 
-    /// #1952: the manifest is re-uploaded on every redeploy so the server config
-    /// always matches the shipped binary.
+    /// #1952: the manifest is re-uploaded on every redeploy into the per-release
+    /// dir so the server config always matches the shipped binary.
     #[test]
-    fn cutover_uploads_config_manifest_to_shared_at_0600() {
+    fn cutover_uploads_config_manifest_to_release_at_0600() {
         let ops = sample_cutover_ops(Secret::new("AUTUMN_SECURITY__SIGNING_SECRET=x\n"));
+        let base_path = format!("{RELEASE_DIR}/autumn.toml");
         assert!(
             ops.iter().any(|op| matches!(
                 op,
                 DeployOp::UploadFile { label: "upload-config", remote_path, mode: Some(0o600), .. }
-                    if remote_path == "/srv/autumn/myapp/shared/autumn.toml"
+                    if *remote_path == base_path
             )),
-            "redeploy re-uploads autumn.toml to shared/ at 0600"
+            "redeploy re-uploads autumn.toml to the release dir at 0600"
         );
     }
 
