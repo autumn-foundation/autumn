@@ -423,6 +423,19 @@ path = "tests/sqlite_scoped_repository.rs"
 name = "sqlite_read_only_tx"
 path = "tests/sqlite_read_only_tx.rs"
 
+# Explicit-URL pool proof for the SQLite test harness (issue #1614, Codex P2):
+# `TestApp::with_transactional_db("sqlite:...")` must build a real (plain, non-
+# transactional) SQLite pool from the recorded URL instead of dropping it and
+# leaving a `Db`-backed route to 503. Needs `test-support` for the public
+# `TestApp` harness; the file is
+# `#![cfg(all(feature = "sqlite", feature = "test-support"))]` so a default
+# `cargo test` (and a bare `--features sqlite` run) compiles it to an empty
+# (passing) binary. Run explicitly:
+# `cargo test -p autumn-web --features "sqlite,test-support" --test sqlite_transactional_url_pool`.
+[[test]]
+name = "sqlite_transactional_url_pool"
+path = "tests/sqlite_transactional_url_pool.rs"
+
 # Isolated: sets process-wide proxy env vars (HTTP_PROXY/HTTPS_PROXY/ALL_PROXY)
 # to verify pinned SSRF-safe clients bypass env proxies. Cannot share the
 # consolidated binary — those vars would race the inline network tests.

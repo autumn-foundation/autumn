@@ -2662,6 +2662,24 @@ pub trait DatabasePoolProvider: Send + Sync + 'static {
             let Some(primary) = self.create_pool(config).await? else {
                 return Ok(None);
             };
+
+            // A custom provider that overrides only `create_pool` still gets its
+            // replica built by this default here, so the SQLite-replica rule must
+            // be enforced on this path too -- otherwise a provider configuring a
+            // distinct/in-memory `database.replica_url` would boot two unrelated
+            // SQLite databases and route reads to an empty/stale replica. Reuse
+            // the same helper `create_topology`/`create_shard_topology` use so the
+            // rejection rule cannot drift (addresses Codex P2). The primary URL is
+            // whatever `effective_primary_url` resolves; a provider returning a
+            // pool for a `None` primary URL has no URL to compare, so skip then.
+            #[cfg(feature = "sqlite")]
+            if let (Some(primary_url), Some(replica_url)) = (
+                config.effective_primary_url(),
+                config.replica_url.as_deref(),
+            ) {
+                reject_unusable_sqlite_replica(primary_url, replica_url)?;
+            }
+
             let replica = config
                 .replica_url
                 .as_deref()
@@ -3575,6 +3593,92 @@ mod tests {
         };
         let topology = create_topology(&config)
             .expect("sqlite primary-only topology builds")
+            .expect("a configured primary yields a topology");
+        assert!(topology.replica().is_none(), "no replica configured");
+    }
+
+    // A custom provider that overrides ONLY `create_pool` still has its replica
+    // built by the trait DEFAULT `create_topology`. That default path must apply
+    // the same SQLite-replica rule as the free `create_topology` /
+    // `create_shard_topology`, or a provider could boot a distinct/in-memory
+    // replica and route reads to an unrelated, empty database (addresses Codex
+    // P2). This minimal provider delegates `create_pool` to the default factory
+    // and leaves `create_topology` as the trait default — exactly the path under
+    // test.
+    #[cfg(feature = "sqlite")]
+    struct PrimaryOnlyProvider;
+
+    #[cfg(feature = "sqlite")]
+    impl DatabasePoolProvider for PrimaryOnlyProvider {
+        async fn create_pool(
+            &self,
+            config: &DatabaseConfig,
+        ) -> Result<Option<Pool<RuntimeConnection>>, PoolError> {
+            create_pool(config)
+        }
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn default_provider_topology_rejects_distinct_file_sqlite_replica() {
+        let config = DatabaseConfig {
+            primary_url: Some("sqlite:///var/lib/primary.db".into()),
+            replica_url: Some("sqlite:///var/lib/replica.db".into()),
+            ..Default::default()
+        };
+        let Err(err) = PrimaryOnlyProvider.create_topology(&config).await else {
+            panic!("the default-topology path must reject a distinct-file sqlite replica");
+        };
+        assert!(matches!(err, PoolError::UnsupportedBackend(_)), "{err:?}");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("separate read replica") && msg.contains("primary"),
+            "message must be actionable: {msg}"
+        );
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn default_provider_topology_rejects_in_memory_sqlite_replica() {
+        let config = DatabaseConfig {
+            primary_url: Some("sqlite:///var/lib/app.db".into()),
+            replica_url: Some("sqlite::memory:".into()),
+            ..Default::default()
+        };
+        let Err(err) = PrimaryOnlyProvider.create_topology(&config).await else {
+            panic!("an in-memory sqlite replica must be rejected by the default topology");
+        };
+        assert!(matches!(err, PoolError::UnsupportedBackend(_)), "{err:?}");
+    }
+
+    // A same-file replica is the same database (harmless) and still builds
+    // through the default topology; a primary-only config builds with no replica.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn default_provider_topology_allows_same_file_and_primary_only() {
+        let same_file = DatabaseConfig {
+            primary_url: Some("sqlite:///var/lib/app.db".into()),
+            replica_url: Some("sqlite:///var/lib/app.db".into()),
+            ..Default::default()
+        };
+        let topology = PrimaryOnlyProvider
+            .create_topology(&same_file)
+            .await
+            .expect("same-file replica must be allowed by the default topology")
+            .expect("a configured primary yields a topology");
+        assert!(
+            topology.replica().is_some(),
+            "same-file replica pool should be built"
+        );
+
+        let primary_only = DatabaseConfig {
+            primary_url: Some("sqlite::memory:".into()),
+            ..Default::default()
+        };
+        let topology = PrimaryOnlyProvider
+            .create_topology(&primary_only)
+            .await
+            .expect("primary-only default topology builds")
             .expect("a configured primary yields a topology");
         assert!(topology.replica().is_none(), "no replica configured");
     }

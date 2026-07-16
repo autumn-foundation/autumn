@@ -1610,7 +1610,32 @@ impl TestApp {
         #[cfg(all(feature = "db", feature = "sqlite"))]
         let (pool, replica_pool, db_interceptor) = {
             let _ = self.transactional;
-            (self.pool, self.replica_pool, self.db_interceptor)
+            // SQLite has no equivalent of the Postgres transactional-rollback
+            // isolation (`begin_test_transaction` + SAVEPOINT on a `max_size(1)`
+            // control pool), so a SQLite test DB gets a real pool but NOT
+            // per-test transactional isolation. Even so, `with_transactional_db`
+            // records an explicit SQLite database URL, and dropping it here would
+            // leave a `TestApp` built that way with no pool at all -- every route
+            // using the `Db` extractor would then return 503. So when no pool was
+            // attached via `with_db` but an explicit URL was given, build a plain
+            // (non-transactional) SQLite pool from it, reusing the runtime
+            // `create_pool` path so the pool matches production behavior.
+            let pool = if let Some(pool) = self.pool {
+                Some(pool)
+            } else if let Some(url) = self.transactional_url.as_deref() {
+                let mut db_config = self.config.database.clone();
+                db_config.primary_url = Some(url.to_owned());
+                Some(
+                    crate::db::create_pool(&db_config)
+                        .expect("failed to build SQLite test pool from with_transactional_db URL")
+                        .expect(
+                            "with_transactional_db URL did not yield a SQLite pool (empty URL?)",
+                        ),
+                )
+            } else {
+                None
+            };
+            (pool, self.replica_pool, self.db_interceptor)
         };
         #[cfg(all(feature = "db", not(feature = "sqlite")))]
         let (pool, replica_pool, db_interceptor) = if self.transactional {
