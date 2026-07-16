@@ -479,9 +479,9 @@ fn emit_dependents_impl(model_ident: &syn::Ident, assocs: &[Association]) -> Tok
         thunk_fns.push(quote! {
             fn #thunk_ident<'__a>(
                 __pool: &'__a ::autumn_web::reexports::diesel_async::pooled_connection::deadpool::Pool<
-                    ::autumn_web::reexports::diesel_async::AsyncPgConnection,
+                    ::autumn_web::RuntimeConnection,
                 >,
-                __conn: &'__a mut ::autumn_web::reexports::diesel_async::AsyncPgConnection,
+                __conn: &'__a mut ::autumn_web::RuntimeConnection,
                 __parent_id: i64,
                 __parent_soft: bool,
                 // Codex round-5-B: the active recursion path (cycle-break) and the
@@ -1163,7 +1163,7 @@ fn emit_association_items(
             fn load_associations<'__a>(
                 records: &'__a mut [::autumn_web::preload::Preloaded<Self>],
                 spec: &'__a Self::Spec,
-                conn: &'__a mut ::autumn_web::reexports::diesel_async::AsyncPgConnection,
+                conn: &'__a mut ::autumn_web::RuntimeConnection,
             ) -> ::autumn_web::preload::PreloadFuture<'__a> {
                 ::std::boxed::Box::pin(async move {
                     #[allow(unused_imports)]
@@ -2534,7 +2534,7 @@ fn emit_json_schema_tokens(ty: &syn::Type) -> TokenStream {
 ///
 /// `all_optional` is `true` for `UpdateX` structs where every field is
 /// conceptually optional (backed by `Patch<T>`).
-fn emit_schema_fn_body(fields: &[&&Field], all_optional: bool) -> TokenStream {
+pub fn emit_schema_fn_body(fields: &[&&Field], all_optional: bool) -> TokenStream {
     emit_schema_fn_body_ext(fields, all_optional, &[])
 }
 
@@ -4152,7 +4152,7 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             pub async fn create(
                 self,
                 pool: &::autumn_web::reexports::diesel_async::pooled_connection::deadpool::Pool<
-                    ::autumn_web::reexports::diesel_async::AsyncPgConnection,
+                    ::autumn_web::RuntimeConnection,
                 >,
             ) -> #name {
                 let __depth = ::autumn_web::__private::FACTORY_DEPTH
@@ -4178,7 +4178,7 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             pub async fn create(
                 self,
                 pool: &::autumn_web::reexports::diesel_async::pooled_connection::deadpool::Pool<
-                    ::autumn_web::reexports::diesel_async::AsyncPgConnection,
+                    ::autumn_web::RuntimeConnection,
                 >,
             ) -> #name {
                 #create_inner_body
@@ -4202,7 +4202,7 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             self,
             count: usize,
             pool: &::autumn_web::reexports::diesel_async::pooled_connection::deadpool::Pool<
-                ::autumn_web::reexports::diesel_async::AsyncPgConnection,
+                ::autumn_web::RuntimeConnection,
             >,
         ) -> ::std::vec::Vec<#name> {
             let mut out = ::std::vec::Vec::with_capacity(count);
@@ -4800,7 +4800,7 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             pub async fn __autumn_execute_upsert(
                 chunk: &[Self],
                 tenant_id: ::core::option::Option<&str>,
-                conn: &mut ::autumn_web::reexports::diesel_async::AsyncPgConnection,
+                conn: &mut ::autumn_web::RuntimeConnection,
             ) -> ::core::result::Result<::std::vec::Vec<Self>, ::autumn_web::reexports::diesel::result::Error> {
                 use ::autumn_web::reexports::diesel::prelude::*;
                 use ::autumn_web::reexports::diesel_async::RunQueryDsl;
@@ -4868,7 +4868,7 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             async fn __autumn_execute_upsert(
                 chunk: &[Self::Model],
                 tenant_id: ::core::option::Option<&str>,
-                conn: &mut ::autumn_web::reexports::diesel_async::AsyncPgConnection,
+                conn: &mut ::autumn_web::RuntimeConnection,
             ) -> ::core::result::Result<::std::vec::Vec<Self::Model>, ::autumn_web::reexports::diesel::result::Error> {
                 Self::__autumn_execute_upsert(chunk, tenant_id, conn).await
             }

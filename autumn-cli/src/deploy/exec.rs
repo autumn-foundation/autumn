@@ -1801,6 +1801,7 @@ mod tests {
             },
             "myapp",
         )
+        .expect("deploy config resolves")
     }
 
     const RELEASE_ID: &str = "20260714T120000Z";
@@ -1902,14 +1903,21 @@ mod tests {
         // The proxy unit is written to the public port; the app unit is a
         // slot-scoped unit on a SEPARATE loopback port (never the public port).
         let proxy_unit = exec.shell_for("proxy-install").expect("proxy-install ran");
-        assert!(proxy_unit.contains("enable --now kamal-proxy.service"));
+        assert_eq!(
+            proxy_unit,
+            "systemctl daemon-reload && systemctl enable --now kamal-proxy.service",
+        );
+        // The proxy unit is written directly to its FINAL path — no `.new` staging
+        // path, so concurrent shared-host deploys can't race on a fixed staging
+        // file (the reworked unit is invariant to per-app TLS, so there is nothing
+        // to diff/restart to adopt).
         assert!(
             exec.calls().iter().any(|c| matches!(
                 c,
                 RecordedCall::Upload { remote_path, .. }
                     if remote_path == "/etc/systemd/system/kamal-proxy.service"
             )),
-            "the proxy systemd unit is written"
+            "the proxy systemd unit is written to its final path"
         );
         let enable = exec.shell_for("enable-now").expect("enable-now ran");
         assert!(

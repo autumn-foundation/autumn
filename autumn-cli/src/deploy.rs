@@ -110,6 +110,13 @@ pub struct ResolvedDeployConfig {
     /// Profile the deployed app runs under (written to the host env file as
     /// `AUTUMN_ENV`). Defaults to the production profile (`"prod"`).
     pub profile: String,
+    /// Whether the deploy-managed proxy terminates TLS on 443 (`[deploy.tls]
+    /// enabled`). `false` (unchanged HTTP-only behavior) unless opted in.
+    pub tls_enabled: bool,
+    /// Public hostname the proxy's TLS certificate is issued for. `Some` ONLY
+    /// when TLS is enabled and a non-blank host was configured; `None` when TLS
+    /// is disabled.
+    pub tls_host: Option<String>,
 }
 
 /// Canonicalize a deploy profile string to the value the app's runtime resolver
@@ -176,8 +183,14 @@ fn trimmed_deploy_profile(raw: &str) -> String {
 impl ResolvedDeployConfig {
     /// Resolve a [`DeployConfig`] against the project name, filling in the
     /// `app_name` → `app_dir` → `service_name` default chain.
-    #[must_use]
-    pub fn resolve(cfg: &DeployConfig, project_name: &str) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when `[deploy.tls] enabled = true` but no non-blank
+    /// `host` is configured — TLS cannot be provisioned without a hostname for
+    /// the certificate, so the misconfiguration is rejected before any remote
+    /// command runs.
+    pub fn resolve(cfg: &DeployConfig, project_name: &str) -> Result<Self, String> {
         let non_blank = |s: &Option<String>| {
             s.as_ref()
                 .map(|v| v.trim().to_owned())
@@ -188,7 +201,22 @@ impl ResolvedDeployConfig {
         let app_dir = non_blank(&cfg.app_dir).unwrap_or_else(|| format!("/srv/autumn/{app_name}"));
         let service_name = non_blank(&cfg.service_name).unwrap_or_else(|| app_name.clone());
 
-        Self {
+        // TLS is opt-in: when disabled, `tls_host` stays `None` and nothing about
+        // the render/deploy commands changes. When enabled, a non-blank `host` is
+        // mandatory (the certificate is issued for it).
+        let tls_host = if cfg.tls.enabled {
+            let host = non_blank(&cfg.tls.host).ok_or_else(|| {
+                "[deploy.tls] requires a non-empty `host` when enabled: set \
+                 `[deploy.tls] host = \"<public-hostname>\"` in autumn.toml to the DNS \
+                 name the TLS certificate should be issued for"
+                    .to_owned()
+            })?;
+            Some(host)
+        } else {
+            None
+        };
+
+        Ok(Self {
             host: non_blank(&cfg.host),
             user: cfg.user.clone(),
             ssh_port: cfg.ssh_port,
@@ -198,7 +226,9 @@ impl ResolvedDeployConfig {
             readiness_timeout_secs: cfg.readiness_timeout_secs,
             keep_releases: cfg.keep_releases,
             profile: trimmed_deploy_profile(&cfg.profile),
-        }
+            tls_enabled: cfg.tls.enabled,
+            tls_host,
+        })
     }
 
     /// Persistent per-app dir shared across releases (holds the secret env file
@@ -801,7 +831,8 @@ pub fn run(action: DeployAction) -> Result<(), DeployError> {
     // the profile the deployed service will actually boot under (default `prod`).
     let ambient_config = AutumnConfig::load().map_err(|e| DeployError::Config(e.to_string()))?;
     let deploy_cfg = ambient_config.deploy.unwrap_or_default();
-    let resolved = ResolvedDeployConfig::resolve(&deploy_cfg, &resolve_project_name());
+    let resolved = ResolvedDeployConfig::resolve(&deploy_cfg, &resolve_project_name())
+        .map_err(DeployError::Config)?;
 
     match action {
         // `plan` is a pure dry-run over `resolved` alone — it never grades or
@@ -1228,6 +1259,54 @@ fn manifest_preflight_notice(uploads: &[exec::ManifestUpload]) -> String {
 /// release serving ([`exec::execute_redeploy`]); a first deploy has no previous
 /// release and fails loudly after tearing the candidate down
 /// ([`exec::execute_first_deploy`]).
+/// The HTTPS port kamal-proxy binds by default (and cannot disable). A
+/// public/HTTP port — or a blue/green slot port derived from it — equal to this
+/// collides with the always-bound HTTPS listener.
+const PROXY_HTTPS_PORT: u16 = 443;
+
+/// Reject a deploy public/HTTP port that cannot work with the proxy topology.
+///
+/// One guard runs here, before any remote work, and it is **unconditional** (it
+/// does not depend on whether TLS is enabled): kamal-proxy `run` binds its
+/// `--https-port 443` listener by DEFAULT and that listener cannot be disabled,
+/// and each blue/green slot binds a private loopback port derived from the
+/// public port ([`exec::slot_app_port`]: blue = `public + 1`, green =
+/// `public + 2`). If the proxy's HTTP port *or* either slot port lands on 443 it
+/// collides with the always-bound HTTPS listener and the proxy can never start.
+/// With blue/green at `+1`/`+2`, that rejects `public ∈ {441, 442, 443}`.
+///
+/// There is deliberately **no** TLS-gated port-80 requirement: per-app TLS is
+/// provisioned by kamal-proxy on its always-bound 443 via `deploy --host --tls`
+/// (TLS-ALPN-01, no port 80 needed), so enabling `[deploy.tls]` works on any
+/// non-colliding public port — on both first deploy and redeploy — without a
+/// proxy HTTP-port change.
+fn validate_public_port(public_port: u16) -> Result<(), String> {
+    // No port (proxy HTTP or a blue/green slot) may land on 443. Compute the slot
+    // ports from the same offsets the deploy uses so the guard tracks the real
+    // arithmetic instead of a hardcoded {441, 442, 443} set.
+    let blue_port = exec::slot_app_port(public_port, exec::SLOT_BLUE);
+    let green_port = exec::slot_app_port(public_port, exec::SLOT_GREEN);
+    let collision = if public_port == PROXY_HTTPS_PORT {
+        Some("the proxy's HTTP listener")
+    } else if blue_port == PROXY_HTTPS_PORT {
+        Some("the blue app slot")
+    } else if green_port == PROXY_HTTPS_PORT {
+        Some("the green app slot")
+    } else {
+        None
+    };
+    if let Some(which) = collision {
+        return Err(format!(
+            "deploy public/HTTP port {public_port} is invalid — {which} would land on \
+             {PROXY_HTTPS_PORT}, which kamal-proxy reserves for its HTTPS listener \
+             (blue/green app slots bind `public+1`/`public+2`); use 80 (the default) or \
+             another port outside {}\u{2013}{PROXY_HTTPS_PORT}",
+            PROXY_HTTPS_PORT - 2,
+        ));
+    }
+    Ok(())
+}
+
 fn run_up(config: &AutumnConfig, resolved: &ResolvedDeployConfig) -> Result<(), DeployError> {
     eprintln!("\u{1F342} autumn deploy up\n");
 
@@ -1251,7 +1330,15 @@ fn run_up(config: &AutumnConfig, resolved: &ResolvedDeployConfig) -> Result<(), 
     eprintln!("{}", manifest_preflight_notice(&manifests));
     let release_id = default_release_id();
     let public_port = config.server.port;
-    let proxy = proxy::KamalProxyController::new(resolved.readiness_timeout_secs);
+    // kamal-proxy `run` binds 443 for its HTTPS listener BY DEFAULT (regardless of
+    // any app's TLS flag, and it cannot be disabled), so a public/HTTP port whose
+    // proxy-HTTP or blue/green slot port lands on 443 would collide and the proxy
+    // would fail to start. Reject that up front with an actionable message instead
+    // of a cryptic runtime bind failure on the host. TLS imposes no port-80
+    // requirement — it is provisioned per app on the always-bound 443.
+    validate_public_port(public_port).map_err(DeployError::Config)?;
+    let proxy = proxy::KamalProxyController::new(resolved.readiness_timeout_secs)
+        .with_tls_host(resolved.tls_host.clone());
     let executor = exec::SshExecutor::new(target);
     let release_dir = format!("{}/{release_id}", resolved.releases_dir());
 
@@ -1360,7 +1447,8 @@ fn run_rollback(config: &AutumnConfig, resolved: &ResolvedDeployConfig) -> Resul
     let target = exec::SshTarget::from_resolved(resolved)
         .ok_or_else(|| DeployError::Config(DEPLOY_HOST_MISSING_DETAIL.to_owned()))?;
     let public_port = config.server.port;
-    let proxy = proxy::KamalProxyController::new(resolved.readiness_timeout_secs);
+    let proxy = proxy::KamalProxyController::new(resolved.readiness_timeout_secs)
+        .with_tls_host(resolved.tls_host.clone());
     let executor = exec::SshExecutor::new(target);
 
     // Resolve the previous release to roll back to (non-zero error if none).
@@ -1391,6 +1479,59 @@ mod tests {
 
     fn resolved_defaults() -> ResolvedDeployConfig {
         ResolvedDeployConfig::resolve(&DeployConfig::default(), "myapp")
+            .expect("deploy config resolves")
+    }
+
+    #[test]
+    fn public_port_443_is_rejected_as_a_proxy_https_collision() {
+        // kamal-proxy binds 443 for HTTPS by default (and can't disable it), so a
+        // public/HTTP port of 443 collides and the proxy can't start — the guard
+        // rejects it up front with an actionable message. It is unconditional (not
+        // TLS-gated).
+        let err = validate_public_port(443).expect_err("port 443 must be rejected");
+        assert!(
+            err.contains("443")
+                && err.contains("HTTPS listener")
+                && err.contains("proxy's HTTP listener"),
+            "collision message must name 443/the HTTPS listener/the proxy HTTP port, got: {err}",
+        );
+        // A normal public port (the default 80, or any other) is accepted.
+        assert!(validate_public_port(80).is_ok());
+        assert!(validate_public_port(8080).is_ok());
+    }
+
+    #[test]
+    fn public_ports_whose_slots_reach_443_are_rejected() {
+        // Blue/green slots bind `public+1`/`public+2`, so 441 (green slot → 443)
+        // and 442 (blue slot → 443) collide with the proxy's always-bound HTTPS
+        // listener just as 443 itself does. All three are rejected unconditionally.
+        let green = validate_public_port(441).expect_err("441 (green slot=443) rejected");
+        assert!(
+            green.contains("green app slot") && green.contains("443"),
+            "441 message must name the green slot landing on 443, got: {green}",
+        );
+        let blue = validate_public_port(442).expect_err("442 (blue slot=443) rejected");
+        assert!(
+            blue.contains("blue app slot") && blue.contains("443"),
+            "442 message must name the blue slot landing on 443, got: {blue}",
+        );
+        assert!(validate_public_port(443).is_err());
+        // A safe non-{441,442,443} port is accepted — regardless of TLS, since the
+        // guard is TLS-independent and TLS imposes no port requirement.
+        assert!(validate_public_port(440).is_ok());
+        assert!(validate_public_port(444).is_ok());
+        assert!(validate_public_port(8080).is_ok());
+    }
+
+    #[test]
+    fn tls_does_not_gate_the_public_port() {
+        // There is NO TLS-gated port-80 requirement: per-app TLS is provisioned by
+        // kamal-proxy on its always-bound 443 (TLS-ALPN-01), so a normal public
+        // port is accepted whether or not `[deploy.tls]` is enabled. Only the
+        // unconditional 443 collision applies.
+        assert!(validate_public_port(80).is_ok());
+        assert!(validate_public_port(3000).is_ok());
+        assert!(validate_public_port(8080).is_ok());
     }
 
     #[test]
@@ -1405,6 +1546,54 @@ mod tests {
         assert_eq!(resolved.keep_releases, 3);
         assert_eq!(resolved.host, None);
         assert_eq!(resolved.profile, "prod");
+        // TLS is opt-in: an absent `[deploy.tls]` table leaves it disabled.
+        assert!(!resolved.tls_enabled);
+        assert_eq!(resolved.tls_host, None);
+    }
+
+    #[test]
+    fn tls_absent_table_leaves_tls_disabled() {
+        // The default `DeployConfig` (no `[deploy.tls]`) resolves to TLS off with
+        // no host — byte-for-byte the historical HTTP-only behavior.
+        let resolved = resolved_defaults();
+        assert!(!resolved.tls_enabled);
+        assert_eq!(resolved.tls_host, None);
+    }
+
+    #[test]
+    fn tls_enabled_with_host_resolves_tls_host() {
+        let cfg = DeployConfig {
+            tls: autumn_web::config::DeployTlsConfig {
+                enabled: true,
+                host: Some("app.example.com".to_owned()),
+            },
+            ..DeployConfig::default()
+        };
+        let resolved =
+            ResolvedDeployConfig::resolve(&cfg, "myapp").expect("enabled + host resolves");
+        assert!(resolved.tls_enabled);
+        assert_eq!(resolved.tls_host.as_deref(), Some("app.example.com"));
+    }
+
+    #[test]
+    fn tls_enabled_without_host_is_a_resolve_error() {
+        // Enabling TLS without a hostname cannot provision a certificate — a hard
+        // resolve-time error, before any remote command runs.
+        for host in [None, Some(String::new()), Some("   ".to_owned())] {
+            let cfg = DeployConfig {
+                tls: autumn_web::config::DeployTlsConfig {
+                    enabled: true,
+                    host,
+                },
+                ..DeployConfig::default()
+            };
+            let err = ResolvedDeployConfig::resolve(&cfg, "myapp")
+                .expect_err("enabled TLS without a host must be rejected");
+            assert!(
+                err.contains("[deploy.tls]") && err.contains("host"),
+                "error should name the section and the missing key, got: {err}",
+            );
+        }
     }
 
     #[test]
@@ -1413,7 +1602,8 @@ mod tests {
         // the production profile so the deployed service never silently boots
         // under the `dev` fallback.
         let config = AutumnConfig::default();
-        let resolved = ResolvedDeployConfig::resolve(&DeployConfig::default(), "myapp");
+        let resolved = ResolvedDeployConfig::resolve(&DeployConfig::default(), "myapp")
+            .expect("deploy config resolves");
         let env_file = build_env_file(&config, &resolved);
         assert!(
             env_file.expose().lines().any(|l| l == "AUTUMN_ENV=prod"),
@@ -1431,7 +1621,8 @@ mod tests {
             profile: "staging".to_owned(),
             ..DeployConfig::default()
         };
-        let resolved = ResolvedDeployConfig::resolve(&cfg, "myapp");
+        let resolved =
+            ResolvedDeployConfig::resolve(&cfg, "myapp").expect("deploy config resolves");
         let env_file = build_env_file(&config, &resolved);
         assert!(
             env_file.expose().lines().any(|l| l == "AUTUMN_ENV=staging"),
@@ -1484,7 +1675,8 @@ mod tests {
         // Deploy profile defaults to `prod`; no host so the ssh_reachability
         // grader fails fast without any network I/O (we only assert on the
         // signing-secret grade below).
-        let resolved = ResolvedDeployConfig::resolve(&DeployConfig::default(), "demoapp");
+        let resolved =
+            ResolvedDeployConfig::resolve(&DeployConfig::default(), "demoapp").expect("resolves");
         assert_eq!(resolved.profile, "prod");
 
         // Force `AUTUMN_ENV=prod` (as `load_runtime_config` does) and point config
@@ -1618,7 +1810,8 @@ mod tests {
 
         // Default deploy profile is `prod` (what the env file will pin), so the
         // weak secret must FAIL preflight locally, before any remote call.
-        let prod_resolved = ResolvedDeployConfig::resolve(&DeployConfig::default(), "myapp");
+        let prod_resolved =
+            ResolvedDeployConfig::resolve(&DeployConfig::default(), "myapp").expect("resolves");
         assert_eq!(prod_resolved.profile, "prod");
         let prod_check = find_signing(&collect_preflight(&config, &prod_resolved));
         assert!(
@@ -1639,7 +1832,8 @@ mod tests {
                 ..DeployConfig::default()
             },
             "myapp",
-        );
+        )
+        .expect("deploy config resolves");
         let staging_check = find_signing(&collect_preflight(&config, &staging_resolved));
         assert!(
             staging_check.passed,
@@ -1688,7 +1882,8 @@ mod tests {
                     ..DeployConfig::default()
                 },
                 "myapp",
-            );
+            )
+            .expect("deploy config resolves");
             assert_eq!(
                 resolved.profile, expected,
                 "profile {raw:?} should preserve the trimmed raw spelling"
@@ -1725,7 +1920,8 @@ mod tests {
                 ..DeployConfig::default()
             },
             "myapp",
-        );
+        )
+        .expect("deploy config resolves");
         assert_eq!(staging.profile, "staging");
         assert!(!is_production_profile(Some(&staging.profile)));
         let staging_check = find_signing(&collect_preflight(&config, &staging));
@@ -1745,7 +1941,8 @@ mod tests {
             service_name: Some("web-svc".to_owned()),
             ..DeployConfig::default()
         };
-        let resolved = ResolvedDeployConfig::resolve(&cfg, "ignored");
+        let resolved =
+            ResolvedDeployConfig::resolve(&cfg, "ignored").expect("deploy config resolves");
         assert_eq!(resolved.app_name, "web");
         assert_eq!(resolved.app_dir, "/opt/web");
         assert_eq!(resolved.service_name, "web-svc");
@@ -1759,7 +1956,8 @@ mod tests {
             app_dir: Some(String::new()),
             ..DeployConfig::default()
         };
-        let resolved = ResolvedDeployConfig::resolve(&cfg, "fallback");
+        let resolved =
+            ResolvedDeployConfig::resolve(&cfg, "fallback").expect("deploy config resolves");
         assert_eq!(resolved.app_name, "fallback");
         assert_eq!(resolved.app_dir, "/srv/autumn/fallback");
     }
@@ -1774,7 +1972,8 @@ mod tests {
                 ..DeployConfig::default()
             },
             "shop",
-        );
+        )
+        .expect("deploy config resolves");
         let unit = render_systemd_unit(&cfg);
         assert!(unit.contains("Description=Autumn application: shop"));
         assert!(unit.contains("User=deploy"));
@@ -1806,7 +2005,8 @@ mod tests {
                 ..DeployConfig::default()
             },
             "shop",
-        );
+        )
+        .expect("deploy config resolves");
         let unit = render_app_unit(&cfg, "/srv/autumn/shop/releases/r1", 3001, "blue");
         assert!(
             unit.contains("Environment=AUTUMN_MANIFEST_DIR=/srv/autumn/shop/shared"),

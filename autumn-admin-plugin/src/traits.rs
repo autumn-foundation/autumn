@@ -429,28 +429,28 @@ pub trait AdminModel: Send + Sync + 'static {
     /// List records with pagination, search, sort, and filters.
     fn list(
         &self,
-        pool: &diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
+        pool: &diesel_async::pooled_connection::deadpool::Pool<::autumn_web::RuntimeConnection>,
         params: ListParams,
     ) -> AdminFuture<'_, ListResult>;
 
     /// Get a single record by ID.
     fn get(
         &self,
-        pool: &diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
+        pool: &diesel_async::pooled_connection::deadpool::Pool<::autumn_web::RuntimeConnection>,
         id: i64,
     ) -> AdminFuture<'_, Option<Value>>;
 
     /// Create a new record from form data.
     fn create(
         &self,
-        pool: &diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
+        pool: &diesel_async::pooled_connection::deadpool::Pool<::autumn_web::RuntimeConnection>,
         data: Value,
     ) -> AdminFuture<'_, Value>;
 
     /// Update an existing record.
     fn update(
         &self,
-        pool: &diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
+        pool: &diesel_async::pooled_connection::deadpool::Pool<::autumn_web::RuntimeConnection>,
         id: i64,
         data: Value,
     ) -> AdminFuture<'_, Value>;
@@ -458,7 +458,7 @@ pub trait AdminModel: Send + Sync + 'static {
     /// Delete a record by ID.
     fn delete(
         &self,
-        pool: &diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
+        pool: &diesel_async::pooled_connection::deadpool::Pool<::autumn_web::RuntimeConnection>,
         id: i64,
     ) -> AdminFuture<'_, ()>;
 
@@ -475,7 +475,7 @@ pub trait AdminModel: Send + Sync + 'static {
     /// `false`, so models that opt in must override this method.
     fn restore<'a>(
         &'a self,
-        _pool: &'a diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
+        _pool: &'a diesel_async::pooled_connection::deadpool::Pool<::autumn_web::RuntimeConnection>,
         _id: i64,
     ) -> AdminFuture<'a, ()> {
         Box::pin(async move {
@@ -493,7 +493,7 @@ pub trait AdminModel: Send + Sync + 'static {
     /// `false`.
     fn purge<'a>(
         &'a self,
-        _pool: &'a diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
+        _pool: &'a diesel_async::pooled_connection::deadpool::Pool<::autumn_web::RuntimeConnection>,
         _id: i64,
     ) -> AdminFuture<'a, ()> {
         Box::pin(async move {
@@ -511,7 +511,7 @@ pub trait AdminModel: Send + Sync + 'static {
     /// `false`.
     fn list_deleted<'a>(
         &'a self,
-        _pool: &'a diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
+        _pool: &'a diesel_async::pooled_connection::deadpool::Pool<::autumn_web::RuntimeConnection>,
         _params: ListParams,
     ) -> AdminFuture<'a, ListResult> {
         Box::pin(async move {
@@ -526,7 +526,7 @@ pub trait AdminModel: Send + Sync + 'static {
     /// Execute a bulk action on the given IDs.
     fn execute_action(
         &self,
-        pool: &diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
+        pool: &diesel_async::pooled_connection::deadpool::Pool<::autumn_web::RuntimeConnection>,
         action: &str,
         ids: Vec<i64>,
     ) -> AdminFuture<'_, u64> {
@@ -596,7 +596,7 @@ pub trait AdminModel: Send + Sync + 'static {
     /// Override if the backend can count without materializing records.
     fn count(
         &self,
-        pool: &diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
+        pool: &diesel_async::pooled_connection::deadpool::Pool<::autumn_web::RuntimeConnection>,
     ) -> AdminFuture<'_, u64> {
         let params = ListParams {
             page: 1,
@@ -689,7 +689,7 @@ pub trait AdminModel: Send + Sync + 'static {
     /// [`supports_csv_import`]: AdminModel::supports_csv_import
     fn import_csv_row<'a>(
         &'a self,
-        _pool: &'a diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
+        _pool: &'a diesel_async::pooled_connection::deadpool::Pool<::autumn_web::RuntimeConnection>,
         _line: u64,
         _row: std::collections::HashMap<String, String>,
         _mode: CsvImportMode,
@@ -711,7 +711,7 @@ pub trait AdminModel: Send + Sync + 'static {
     /// that do not opt in get a clear error instead of a silent no-op.
     fn get_history<'a>(
         &'a self,
-        _pool: &'a diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
+        _pool: &'a diesel_async::pooled_connection::deadpool::Pool<::autumn_web::RuntimeConnection>,
         _record_id: i64,
         _page: u64,
         _per_page: u64,

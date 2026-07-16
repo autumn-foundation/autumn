@@ -300,10 +300,30 @@ mod db_impl {
             state: &S,
             name: impl Into<String>,
         ) -> Result<Self, LockError> {
-            let pool = state.pool().ok_or_else(|| {
-                LockError::PoolUnavailable("no primary database pool configured".to_string())
-            })?;
-            Ok(Self::new(pool.clone(), name))
+            // Advisory locks are a Postgres-only primitive (`pg_advisory_lock`);
+            // SQLite has no server-side, cross-connection analog. Under the
+            // `sqlite` feature `state.pool()` yields a `Pool<RuntimeConnection>`
+            // that is a SQLite pool, which cannot satisfy `Lock`'s Postgres
+            // connection type — and even if it could, there is no lock to take.
+            // Refuse (documented-unsupported) rather than silently pretend to
+            // hold a distributed lock; single-node SQLite boot does not need
+            // cross-instance advisory locking.
+            #[cfg(feature = "sqlite")]
+            {
+                let _ = (state, name);
+                Err(LockError::PoolUnavailable(
+                    "advisory locks require the Postgres backend and are unsupported under the \
+                     sqlite feature"
+                        .to_string(),
+                ))
+            }
+            #[cfg(not(feature = "sqlite"))]
+            {
+                let pool = state.pool().ok_or_else(|| {
+                    LockError::PoolUnavailable("no primary database pool configured".to_string())
+                })?;
+                Ok(Self::new(pool.clone(), name))
+            }
         }
 
         /// The lock's name.

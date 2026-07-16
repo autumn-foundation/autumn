@@ -984,6 +984,7 @@ pub fn model_list_page(
                 // every input in the form, including the filter hiddens).
                 form class="search-bar" method="get" {
                     input type="search" name="q" placeholder="Search…"
+                        aria-label="Search records"
                         value=(search_query)
                         hx-get={ (prefix) "/" (model_slug) }
                         hx-trigger="input changed delay:300ms"
@@ -1008,7 +1009,7 @@ pub fn model_list_page(
                             tr {
                                 th class="checkbox-cell" {
                                     // Wired up by admin.js via event delegation on #select-all.
-                                    input type="checkbox" id="select-all";
+                                    input type="checkbox" id="select-all" aria-label="Select all rows";
                                 }
                                 @for field in &list_fields {
                                     @let is_sorted = sort_by == Some(field.name);
@@ -1053,6 +1054,7 @@ pub fn model_list_page(
                                         // the wrong record.
                                         @if let Some(id) = row_id {
                                             input type="checkbox" class="row-check"
+                                                aria-label="Select row"
                                                 name="ids" value=(id);
                                         }
                                     }
@@ -1632,6 +1634,7 @@ pub fn config_page(
                                             style="display: flex; gap: 0.25rem; align-items: center;" {
                                             (csrf_hidden_input(csrf_token, csrf_form_field))
                                             input type="text" name="value"
+                                                aria-label=(format!("Value for {}", entry.name))
                                                 value=(entry.current.to_raw())
                                                 style="width: 11rem; font-size: 0.8125rem; padding: 0.25rem 0.5rem; border: 1px solid var(--border); border-radius: 0.25rem;" {}
                                             button type="submit" class="btn btn-sm btn-primary" { "Save" }

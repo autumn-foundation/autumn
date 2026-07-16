@@ -112,6 +112,8 @@ mod mcp_plugin;
 #[cfg(all(feature = "db", feature = "mcp"))]
 mod mcp_repository;
 #[cfg(feature = "mcp")]
+mod mcp_schema_derive;
+#[cfg(feature = "mcp")]
 mod mcp_streaming;
 mod middleware_introspection;
 mod middleware_pipeline;
