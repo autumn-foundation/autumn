@@ -1,10 +1,18 @@
 name: CLI Release Binaries
 
 # Builds prebuilt `autumn` CLI binaries for Linux (x86_64 + aarch64, static musl)
-# and attaches them — with sha256 checksums — to the GitHub Release that triggered
-# the run. Also workflow_dispatch-able for validation before any tag exists: a manual
-# run builds and uploads the binaries as workflow artifacts (and, when an existing
-# release `tag` input is supplied, also attaches them to that release).
+# and attaches them — with sha256 checksums — to a GitHub Release.
+#
+# Binaries correspond to DELIBERATE, TAGGED CRATE RELEASES, not trunk. The canonical
+# trigger is `release: published`, which fires only when a release is cut from a
+# version tag (release.yml runs on `v[0-9]+.*` tags) — cutting a release is always an
+# explicit maintainer action. The binary is built from that tag's source, so
+# `releases/latest/download/...` always means "the latest RELEASED version"; there
+# are no rolling/nightly trunk-dev builds.
+#
+# `workflow_dispatch` is a manual escape hatch only: supply a `tag` to (re)build a
+# specific released tag and attach to its release, or leave it blank to build the
+# current ref for validation (uploads workflow artifacts, no release upload).
 #
 # Distribution contract (see scripts/install.sh and the README "Install" section):
 #   - Version-pinned: .../releases/download/<tag>/autumn-<target>.tar.gz
@@ -17,7 +25,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Existing release tag to attach binaries to (blank = build-only validation, artifacts only)."
+        description: "Released tag to build from and attach to (e.g. v0.6.0). Blank = build the current ref for validation only (artifacts, no release upload)."
         required: false
         type: string
 
@@ -41,6 +49,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name || inputs.tag || github.ref }}
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable

@@ -73,6 +73,8 @@ Direct download URLs (static musl binaries — no glibc version dependency):
 - Latest: `https://github.com/madmax983/autumn/releases/latest/download/autumn-x86_64-unknown-linux-musl.tar.gz`
 - Pinned: `https://github.com/madmax983/autumn/releases/download/<tag>/autumn-x86_64-unknown-linux-musl.tar.gz`
 
+Binaries track tagged crate releases (e.g. `v0.6.0`); `latest` is the most recent released version — there are no rolling trunk-dev builds.
+
 Each tarball ships a companion `.sha256`. Prefer source? `cargo install --path autumn-cli` still works.
 
 ### Watching custom directories

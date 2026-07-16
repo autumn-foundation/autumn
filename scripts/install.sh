@@ -5,6 +5,7 @@
 #
 # Downloads a prebuilt `autumn` binary from GitHub Releases, verifies its sha256
 # checksum, and installs it. Linux x86_64 and aarch64 are supported.
+# Binaries correspond to tagged crate releases; "latest" is the most recent release.
 #
 # Environment overrides (flags --version/--dir/--target mirror them):
 #   AUTUMN_VERSION      version tag to install, or "latest" (default: latest)
