@@ -72,7 +72,7 @@ pub trait ProvideAuthorizationState: Send + Sync {
     #[cfg(feature = "db")]
     fn pool(
         &self,
-    ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>>;
+    ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<crate::db::RuntimeConnection>>;
 }
 
 /// Boxed future returned by [`Policy`] and [`Scope`] methods so the
@@ -116,8 +116,7 @@ pub struct PolicyContext {
     /// that need to consult related rows (e.g. group membership)
     /// can borrow a connection here.
     #[cfg(feature = "db")]
-    pub pool:
-        Option<diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>>,
+    pub pool: Option<diesel_async::pooled_connection::deadpool::Pool<crate::db::RuntimeConnection>>,
 
     /// Registered [`Policy`] / [`Scope`] map, cloned from
     /// `AppState`. Lets the [`Scoped`] blanket trait resolve a
@@ -294,7 +293,7 @@ impl PolicyContext {
     #[must_use]
     pub fn with_pool(
         mut self,
-        pool: diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
+        pool: diesel_async::pooled_connection::deadpool::Pool<crate::db::RuntimeConnection>,
     ) -> Self {
         self.pool = Some(pool);
         self
@@ -407,15 +406,16 @@ pub trait Scope<R: Send + Sync + 'static>: Send + Sync + 'static {
     fn list<'a>(
         &'a self,
         _ctx: &'a PolicyContext,
-        _conn: &'a mut diesel_async::AsyncPgConnection,
+        _conn: &'a mut crate::db::RuntimeConnection,
     ) -> BoxFuture<'a, crate::AutumnResult<Vec<R>>> {
         Box::pin(async { Ok(Vec::new()) })
     }
 }
 
 /// `Scope` companion that compiles when the `db` feature is off.
-/// The `db`-gated form takes `&mut AsyncPgConnection`; this one
-/// has no connection arg.
+/// The `db`-gated form takes `&mut RuntimeConnection` (the runtime
+/// pool connection — `AsyncPgConnection` by default, the `SQLite`
+/// wrapper under `--features sqlite`); this one has no connection arg.
 #[cfg(not(feature = "db"))]
 pub trait Scope<R: Send + Sync + 'static>: Send + Sync + 'static {
     fn list<'a>(&'a self, _ctx: &'a PolicyContext) -> BoxFuture<'a, crate::AutumnResult<Vec<R>>> {
@@ -451,7 +451,7 @@ impl<R: Send + Sync + 'static> ScopeQuery<'_, R> {
     /// scope's own errors otherwise.
     pub async fn load(
         self,
-        conn: &mut diesel_async::AsyncPgConnection,
+        conn: &mut crate::db::RuntimeConnection,
     ) -> crate::AutumnResult<Vec<R>> {
         let scope = self.ctx.policy_registry.scope::<R>().ok_or_else(|| {
             crate::AutumnError::from(std::io::Error::other(format!(
@@ -1362,7 +1362,7 @@ mod tests {
         #[cfg(feature = "db")]
         fn pool(
             &self,
-        ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>>
+        ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<crate::db::RuntimeConnection>>
         {
             None
         }

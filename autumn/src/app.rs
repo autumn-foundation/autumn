@@ -3665,7 +3665,12 @@ impl AppBuilder {
         // it on the process role exactly like the `#[job]` runtime above: a `web`
         // replica must not claim/execute hook rows (that work belongs to the
         // worker tier), while `worker`/`combined` replicas keep running it.
-        #[cfg(feature = "db")]
+        // The durable commit-hook worker drains rows via a Postgres queue
+        // (LISTEN/NOTIFY + row-locked claiming); under the `sqlite` feature the
+        // runtime pool is a SQLite pool the Postgres worker cannot drive, so
+        // the worker is not spawned. (SQLite single-node boot does not run the
+        // durable-hook worker tier.)
+        #[cfg(all(feature = "db", not(feature = "sqlite")))]
         if role.runs_workers()
             && let Some(pool) = state.pool().cloned()
         {
@@ -3688,7 +3693,7 @@ impl AppBuilder {
         // commit hooks into that shard's queue table; drain each one too — again
         // only on a role that runs workers, so a web replica leaves shard hook
         // rows for the worker tier.
-        #[cfg(feature = "db")]
+        #[cfg(all(feature = "db", not(feature = "sqlite")))]
         if role.runs_workers()
             && let Some(shards) = state.shards()
         {
@@ -4909,6 +4914,37 @@ impl AppBuilder {
             std::process::exit(0);
         }
 
+        // SQLite migrate-only guard (issue #1614 follow-up): the per-target applier
+        // below routes every target through the same Postgres-only `run_pending_locked`
+        // harness the normal-boot path uses, so a `sqlite:` control or shard target
+        // with registered migrations would attempt a `PgConnection::establish`
+        // against a SQLite URL and exit with a generic connection failure instead of
+        // the explicit, actionable "SQLite startup migrations not supported" error.
+        // Apply the SAME `sqlite_startup_migration_guard` here as normal boot, BEFORE
+        // the migration loop, so the boot and migrate-only paths cannot drift. The
+        // migration set is non-empty at this point (checked above), so both the
+        // control and shard "has migrations" flags mirror the boot call's
+        // `!migrations.is_empty()`. An all-Postgres / empty-shard configuration is
+        // never gated, leaving the Postgres path byte-identical.
+        #[cfg(feature = "sqlite")]
+        {
+            let sqlite_guard_shard_urls: Vec<&str> =
+                shard_targets.iter().map(|(_, url)| url.as_str()).collect();
+            if let Err(e) = sqlite_startup_migration_guard(
+                control_url.as_deref(),
+                !migrations.is_empty(),
+                &sqlite_guard_shard_urls,
+                !migrations.is_empty(),
+            ) {
+                eprintln!("autumn migrate: {e}");
+                // `process::exit` skips `on_shutdown`/`Drop`; stop any managed
+                // Postgres child first, mirroring `apply_pending_or_exit`.
+                #[cfg(feature = "managed-pg")]
+                crate::managed_pg::emergency_stop();
+                std::process::exit(1);
+            }
+        }
+
         // The diesel harness and the advisory-lock poll block, so apply off the
         // Tokio worker threads. Each target's failure exits non-zero from inside.
         let applied_total = tokio::task::spawn_blocking(move || {
@@ -5204,7 +5240,9 @@ impl AppBuilder {
             crate::repository_commit_hooks::set_global_channels(state.channels().clone());
         }
 
-        #[cfg(feature = "db")]
+        // Postgres-only durable commit-hook worker; not spawned under sqlite
+        // (the runtime pool is a SQLite pool the Postgres worker cannot drive).
+        #[cfg(all(feature = "db", not(feature = "sqlite")))]
         if let Some(pool) = state.pool().cloned() {
             #[cfg(feature = "ws")]
             {
@@ -5223,7 +5261,7 @@ impl AppBuilder {
         }
         // Repositories built over a shard pool (`with_pool`) enqueue durable
         // commit hooks into that shard's queue table; drain each one too.
-        #[cfg(feature = "db")]
+        #[cfg(all(feature = "db", not(feature = "sqlite")))]
         if let Some(shards) = state.shards() {
             for shard in shards.iter() {
                 #[cfg(feature = "ws")]
@@ -7134,6 +7172,9 @@ async fn resolve_shard_set(
 }
 
 #[cfg(feature = "db")]
+// The `sqlite` feature adds a small fail-fast startup-migration guard block
+// (issue #1614) that pushes this orchestration fn just over the line limit.
+#[allow(clippy::too_many_lines)]
 async fn setup_database(
     config: &AutumnConfig,
     migrations: Vec<crate::migrate::EmbeddedMigrations>,
@@ -7217,6 +7258,47 @@ async fn setup_database(
         .as_ref()
         .and_then(|t| t.migration_url())
         .map(str::to_owned);
+
+    // SQLite startup-migration guard (issue #1614 follow-up): the startup
+    // migration path is Postgres-only, so a `sqlite://` control URL with
+    // registered migrations must fail fast here rather than crash inside
+    // `PgConnection::establish` before serving. See `sqlite_startup_migration_guard`.
+    // The shard loop in `run_startup_migrations` migrates each `shard.primary_url`
+    // through the same Postgres-only harness, gated by `shards.is_some()` and the
+    // presence of registered migrations — independently of the control topology.
+    // Collect the shard targets so the guard can reject a SQLite shard the same
+    // way it rejects a SQLite control target (Codex P1). Empty when unsharded or
+    // when the shard loop won't run, so the Postgres path is unaffected.
+    #[cfg(feature = "sqlite")]
+    let sqlite_guard_shard_urls: Vec<&str> = if shards.is_some() {
+        config
+            .database
+            .shards
+            .iter()
+            .map(|shard| shard.primary_url.as_str())
+            .collect()
+    } else {
+        Vec::new()
+    };
+    #[cfg(feature = "sqlite")]
+    #[allow(clippy::question_mark)] // managed-pg child must be stopped before returning
+    if let Err(e) = sqlite_startup_migration_guard(
+        if topology.is_some() {
+            provider_migration_url
+                .as_deref()
+                .or_else(|| config.database.effective_primary_url())
+        } else {
+            None
+        },
+        !migrations.is_empty() || directory_migration_required || shard_map_migration_required,
+        &sqlite_guard_shard_urls,
+        !migrations.is_empty(),
+    ) {
+        #[cfg(feature = "managed-pg")]
+        crate::managed_pg::emergency_stop_async().await;
+        return Err(e);
+    }
+
     run_startup_migrations(
         config,
         topology.is_some(),
@@ -7327,6 +7409,233 @@ fn apply_pending_or_exit(
             crate::managed_pg::emergency_stop();
             std::process::exit(1);
         }
+    }
+}
+
+/// Guard the startup-migration path against a `SQLite` control target.
+///
+/// The Rust startup-migration harness is Postgres-only — it applies
+/// `MigrationSource<Pg>` through [`crate::db::establish_migration_connection`],
+/// which calls `PgConnection::establish`. A `sqlite://` URL routed there would
+/// try to open a Postgres connection against a `SQLite` target and crash before
+/// the app ever serves (issue #1614 review, Codex P1). Full `SQLite` migration
+/// support (a `MigrationHarness<Sqlite>` path) is a deliberate follow-up; until
+/// then, registering migrations with a `SQLite` target fails fast here with an
+/// actionable message rather than deep inside the Postgres engine.
+///
+/// Returns `Ok(())` unless the control target is `SQLite` **and** at least one
+/// migration would be applied to it. With no registered migrations the
+/// manual-schema path is fully supported, so boot proceeds. Uses the same
+/// [`crate::config::DatabaseBackend::detect`] predicate as `db::build_pool`, so
+/// the gate and the pool routing agree on what "is a `SQLite` URL" means.
+///
+/// The same crash lurks on the **shard** targets: the shard loop in
+/// [`run_startup_migrations`] migrates every `shard.primary_url` through the same
+/// Postgres-only harness, independently of the control topology. A shards-only
+/// app (control `topology` is `None`, so the control check above permits boot)
+/// with `sqlite:` shard `primary_url`s and registered migrations would hit the
+/// exact pre-serve crash this guard exists to prevent, so any `SQLite` shard
+/// target with migrations pending is rejected here too (issue #1614 review,
+/// Codex P1). `shard_urls` is empty when the app is unsharded or the shard loop
+/// won't run, so the Postgres path is unaffected.
+#[cfg(feature = "sqlite")]
+fn sqlite_startup_migration_guard(
+    control_url: Option<&str>,
+    control_has_migrations: bool,
+    shard_urls: &[&str],
+    shard_has_migrations: bool,
+) -> Result<(), String> {
+    fn is_sqlite(url: &str) -> bool {
+        crate::config::DatabaseBackend::detect(url) == Some(crate::config::DatabaseBackend::Sqlite)
+    }
+    if control_url.is_some_and(is_sqlite) && control_has_migrations {
+        return Err(
+            "SQLite startup migrations are not yet supported in this build of autumn-web. \
+             Registered migrations cannot be applied to a SQLite target here \u{2014} apply \
+             your schema out-of-band, or boot without registered migrations. Tracking: SQLite \
+             migration support is a follow-up to #1614."
+                .to_owned(),
+        );
+    }
+    if shard_has_migrations && shard_urls.iter().copied().any(is_sqlite) {
+        return Err(
+            "SQLite startup migrations are not yet supported in this build of autumn-web. \
+             A configured shard targets a SQLite database, and registered migrations cannot be \
+             applied to a SQLite target here \u{2014} apply your shard schema out-of-band, or \
+             boot without registered migrations. Tracking: SQLite migration support is a \
+             follow-up to #1614."
+                .to_owned(),
+        );
+    }
+    Ok(())
+}
+
+#[cfg(all(test, feature = "sqlite"))]
+mod sqlite_startup_migration_guard_tests {
+    use super::sqlite_startup_migration_guard;
+
+    #[test]
+    fn sqlite_target_with_registered_migrations_fails_fast() {
+        // The exact bug the Codex P1 flags: a sqlite:// control URL with
+        // registered migrations must NOT reach `PgConnection::establish`; it
+        // must return the actionable, SQLite-named boot error instead.
+        for url in [
+            "sqlite:///var/lib/app.db",
+            "sqlite://./relative.db",
+            "sqlite::memory:",
+        ] {
+            let err = sqlite_startup_migration_guard(Some(url), true, &[], false)
+                .expect_err("sqlite target + registered migrations must be rejected");
+            assert!(
+                err.contains("SQLite startup migrations are not yet supported"),
+                "message must name the SQLite situation clearly: {err}"
+            );
+            assert!(
+                err.contains("#1614"),
+                "message must point at the tracking follow-up: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn sqlite_target_without_migrations_boots() {
+        // The manual-schema path (the `sqlite_boot_serve` scenario): a sqlite
+        // target with no registered migrations must boot normally.
+        assert!(
+            sqlite_startup_migration_guard(Some("sqlite:///var/lib/app.db"), false, &[], false)
+                .is_ok(),
+            "sqlite target + no migrations must boot"
+        );
+    }
+
+    #[test]
+    fn postgres_target_is_unchanged() {
+        // The default Postgres path is untouched, migrations registered or not.
+        for url in [
+            "postgres://u@h/db",
+            "postgresql://user:pass@db:5432/app",
+            "host=db user=app sslmode=require",
+        ] {
+            assert!(
+                sqlite_startup_migration_guard(Some(url), true, &[], false).is_ok(),
+                "postgres target must never be gated: {url}"
+            );
+            assert!(
+                sqlite_startup_migration_guard(Some(url), false, &[], false).is_ok(),
+                "postgres target must never be gated: {url}"
+            );
+        }
+    }
+
+    #[test]
+    fn absent_control_url_boots() {
+        // No control URL (no-DB / opt-out provider): nothing to gate.
+        assert!(sqlite_startup_migration_guard(None, true, &[], false).is_ok());
+        assert!(sqlite_startup_migration_guard(None, false, &[], false).is_ok());
+    }
+
+    #[test]
+    fn sqlite_shard_target_with_registered_migrations_fails_fast() {
+        // The Codex P1: a shards-only app (no control topology, so the control
+        // arg is None) with a `sqlite:` shard primary_url and registered
+        // migrations must NOT reach the Postgres shard-migration harness; it
+        // must return the actionable, SQLite-named boot error instead.
+        let err = sqlite_startup_migration_guard(
+            None,
+            false,
+            &["sqlite:///var/lib/shard0.db", "postgres://u@h/shard1"],
+            true,
+        )
+        .expect_err("a sqlite shard target + registered migrations must be rejected");
+        assert!(
+            err.contains("SQLite startup migrations are not yet supported")
+                && err.contains("shard"),
+            "message must name the SQLite shard situation clearly: {err}"
+        );
+        assert!(
+            err.contains("#1614"),
+            "message must point at the tracking follow-up: {err}"
+        );
+    }
+
+    #[test]
+    fn sqlite_shard_target_without_migrations_boots() {
+        // A sqlite shard with no registered migrations (manual-schema shards)
+        // must boot normally.
+        assert!(
+            sqlite_startup_migration_guard(None, false, &["sqlite:///var/lib/shard0.db"], false)
+                .is_ok(),
+            "sqlite shard + no migrations must boot"
+        );
+    }
+
+    #[test]
+    fn postgres_shard_targets_are_unchanged() {
+        // All-Postgres shards are never gated, migrations registered or not.
+        assert!(
+            sqlite_startup_migration_guard(
+                Some("postgres://u@h/control"),
+                true,
+                &["postgres://u@h/shard0", "postgres://u@h/shard1"],
+                true,
+            )
+            .is_ok(),
+            "all-postgres shard targets must never be gated"
+        );
+    }
+
+    #[test]
+    fn migrate_only_mode_reuses_the_boot_guard_for_sqlite_targets() {
+        // `run_migrate_only_mode` (the `AUTUMN_MIGRATE=1` one-shot) now applies the
+        // SAME guard as normal boot BEFORE its migration loop, so a SQLite migrate
+        // target with registered migrations exits with the actionable error rather
+        // than attempting a `PgConnection` through the Postgres-only harness. The
+        // migrate-only path always has a non-empty migration set at the guard point,
+        // so it passes `control_has_migrations = shard_has_migrations = true`.
+
+        // A sqlite CONTROL migrate target + registered migrations → actionable error.
+        let err = sqlite_startup_migration_guard(Some("sqlite:///var/lib/app.db"), true, &[], true)
+            .expect_err("sqlite migrate control target must be rejected, not sent to PgConnection");
+        assert!(
+            err.contains("SQLite startup migrations are not yet supported")
+                && err.contains("#1614"),
+            "migrate-only sqlite control error must be the actionable boot message: {err}"
+        );
+
+        // A sqlite SHARD migrate target + registered migrations → actionable error.
+        let shard_err = sqlite_startup_migration_guard(
+            Some("postgres://u@h/control"),
+            true,
+            &["sqlite:///var/lib/shard0.db"],
+            true,
+        )
+        .expect_err("sqlite migrate shard target must be rejected, not sent to PgConnection");
+        assert!(
+            shard_err.contains("SQLite startup migrations are not yet supported")
+                && shard_err.contains("shard"),
+            "migrate-only sqlite shard error must be the actionable boot message: {shard_err}"
+        );
+
+        // An all-Postgres migrate configuration (control + shards) is never gated.
+        assert!(
+            sqlite_startup_migration_guard(
+                Some("postgres://u@h/control"),
+                true,
+                &["postgres://u@h/shard0"],
+                true,
+            )
+            .is_ok(),
+            "an all-postgres migrate configuration must proceed unchanged"
+        );
+
+        // A sqlite migrate target with NO registered migrations (manual-schema) is
+        // impossible in migrate-only (it early-exits before the guard), but the
+        // helper still returns Ok, confirming the guard only fires on real applies.
+        assert!(
+            sqlite_startup_migration_guard(Some("sqlite:///var/lib/app.db"), false, &[], false)
+                .is_ok(),
+            "sqlite target with no migrations must never be gated"
+        );
     }
 }
 
@@ -7619,7 +7928,23 @@ pub async fn run_shard_map_guard(
 /// - no shards configured,
 /// - no control database topology, or
 /// - the slot map uses explicit `slots` declarations (auto-split is inactive).
-#[cfg(feature = "db")]
+// Sharding (the shard-map guard, auto-split, and control-DB shard map) is a
+// Postgres-only feature: `run_shard_map_guard` drives Postgres `sql_query`
+// against a `Pool<AsyncPgConnection>` control pool. Under the `sqlite` feature
+// the runtime topology's pool is a SQLite pool that cannot feed it, and SQLite
+// deployments are single-node/unsharded, so the guard is a no-op.
+#[cfg(all(feature = "db", feature = "sqlite"))]
+#[allow(clippy::unused_async)]
+async fn enforce_shard_map_guard(
+    config: &AutumnConfig,
+    topology: Option<&crate::db::DatabaseTopology>,
+    runtime_boot: bool,
+) -> Result<(), String> {
+    let _ = (config, topology, runtime_boot);
+    Ok(())
+}
+
+#[cfg(all(feature = "db", not(feature = "sqlite")))]
 async fn enforce_shard_map_guard(
     config: &AutumnConfig,
     topology: Option<&crate::db::DatabaseTopology>,
@@ -8250,7 +8575,7 @@ mod validate_repository_api_policies_tests {
         fn list<'a>(
             &'a self,
             _ctx: &'a PolicyContext,
-            _conn: &'a mut diesel_async::AsyncPgConnection,
+            _conn: &'a mut crate::db::RuntimeConnection,
         ) -> BoxFuture<'a, crate::AutumnResult<Vec<TestPost>>> {
             Box::pin(async { Ok(Vec::new()) })
         }
@@ -9147,9 +9472,7 @@ mod tests {
                 config: &crate::config::DatabaseConfig,
             ) -> Result<
                 Option<
-                    diesel_async::pooled_connection::deadpool::Pool<
-                        diesel_async::AsyncPgConnection,
-                    >,
+                    diesel_async::pooled_connection::deadpool::Pool<crate::db::RuntimeConnection>,
                 >,
                 crate::db::PoolError,
             > {
@@ -9301,9 +9624,7 @@ mod tests {
                 config: &crate::config::DatabaseConfig,
             ) -> Result<
                 Option<
-                    diesel_async::pooled_connection::deadpool::Pool<
-                        diesel_async::AsyncPgConnection,
-                    >,
+                    diesel_async::pooled_connection::deadpool::Pool<crate::db::RuntimeConnection>,
                 >,
                 crate::db::PoolError,
             > {
@@ -9513,6 +9834,22 @@ mod tests {
         assert!(
             handler.contains("std::process::exit(0)"),
             "the migrate handler exits after applying"
+        );
+
+        // Issue #1614 follow-up: the migrate one-shot must apply the SAME SQLite
+        // guard as normal boot BEFORE its migration loop, so a `sqlite:` target with
+        // registered migrations exits with the actionable unsupported-migrations
+        // error instead of a generic `PgConnection` failure — and the two paths
+        // cannot drift because both call `sqlite_startup_migration_guard`.
+        let guard_call = handler
+            .find("sqlite_startup_migration_guard(")
+            .expect("migrate handler applies the SQLite migrate guard");
+        let first_apply = handler
+            .find("apply_pending_or_exit")
+            .expect("migrate handler applies per target");
+        assert!(
+            guard_call < first_apply,
+            "the SQLite guard must run BEFORE the migration loop / apply_pending_or_exit"
         );
         assert!(
             !handler.contains("initialize_job_runtime")
