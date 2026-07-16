@@ -231,11 +231,20 @@ impl ResolvedDeployConfig {
         })
     }
 
+    /// Persistent per-app dir shared across releases (holds the secret env file
+    /// and, since #1952, the uploaded config manifest[s]). The deployed systemd
+    /// unit sets `AUTUMN_MANIFEST_DIR` to this path so the app's config loader
+    /// reads the uploaded `autumn.toml` here at boot.
+    #[must_use]
+    pub fn shared_dir(&self) -> String {
+        format!("{}/shared", self.app_dir)
+    }
+
     /// Remote path to the `EnvironmentFile` holding secrets (mode `0600`), kept
     /// out of the world-readable systemd unit.
     #[must_use]
     pub fn env_file(&self) -> String {
-        format!("{}/shared/autumn.env", self.app_dir)
+        format!("{}/autumn.env", self.shared_dir())
     }
 
     /// Directory holding timestamped release dirs.
@@ -590,6 +599,7 @@ pub fn render_systemd_unit(cfg: &ResolvedDeployConfig) -> String {
          User={user}\n\
          WorkingDirectory={current}\n\
          EnvironmentFile={env_file}\n\
+         Environment=AUTUMN_MANIFEST_DIR={manifest_dir}\n\
          ExecStart={current}/{app}\n\
          Restart=on-failure\n\
          RestartSec=2\n\
@@ -600,6 +610,13 @@ pub fn render_systemd_unit(cfg: &ResolvedDeployConfig) -> String {
         user = cfg.user,
         current = cfg.current_symlink(),
         env_file = cfg.env_file(),
+        // Point the app's config loader at `current` (this unit's
+        // WorkingDirectory), where the active release's uploaded autumn.toml
+        // lives, so the deployed app loads the intended config instead of
+        // built-in defaults (#1952). The manifest is coupled to the release, not
+        // the shared dir. Non-secret, so it lives in the unit's Environment= (not
+        // the 0600 env file).
+        manifest_dir = cfg.current_symlink(),
     )
 }
 
@@ -629,6 +646,7 @@ pub fn render_app_unit(
          User={user}\n\
          WorkingDirectory={release_dir}\n\
          EnvironmentFile={env_file}\n\
+         Environment=AUTUMN_MANIFEST_DIR={manifest_dir}\n\
          Environment=AUTUMN_SERVER__HOST=127.0.0.1\n\
          Environment=AUTUMN_SERVER__PORT={app_port}\n\
          ExecStart={release_dir}/{app}\n\
@@ -640,6 +658,14 @@ pub fn render_app_unit(
         app = cfg.app_name,
         user = cfg.user,
         env_file = cfg.env_file(),
+        // Point the app's config loader at this release dir (this unit's
+        // WorkingDirectory), where the uploaded autumn.toml lives, so the deployed
+        // app loads the intended config instead of built-in defaults (#1952). The
+        // manifest is coupled to the binary in the retained per-release dir, so a
+        // rollback re-rendering this unit from the target release dir reads that
+        // release's OWN manifest. Non-secret → unit Environment=, not the 0600 env
+        // file.
+        manifest_dir = release_dir,
     )
 }
 
@@ -1133,6 +1159,112 @@ fn default_release_id() -> String {
     chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string()
 }
 
+/// Resolve the ordered local project directories the deploy reads config from.
+///
+/// Mirrors autumn-web's `find_config_file_named`, which is a *per-file*
+/// manifest-dir-then-CWD fallback: `{AUTUMN_MANIFEST_DIR}/{file}` wins when it
+/// exists, otherwise `{file}` relative to the CWD. So when `AUTUMN_MANIFEST_DIR`
+/// is set we return `[manifest_dir, cwd]` (a file absent from the manifest dir
+/// falls back to the CWD copy, exactly as the runtime would load it); when it is
+/// unset we return `[cwd]` — the project root the rest of the deploy already
+/// treats as authoritative (the release binary is resolved as
+/// `target/release/<app>`).
+fn manifest_project_dirs() -> Vec<PathBuf> {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    if let Ok(dir) = std::env::var("AUTUMN_MANIFEST_DIR")
+        && !dir.trim().is_empty()
+    {
+        let manifest_dir = PathBuf::from(dir);
+        if manifest_dir == cwd {
+            return vec![cwd];
+        }
+        return vec![manifest_dir, cwd];
+    }
+    vec![cwd]
+}
+
+/// First directory in `dirs` that holds `filename` as a regular file — the
+/// deploy-side mirror of the runtime's `find_config_file_named` per-file
+/// manifest-dir-then-CWD fallback.
+fn first_dir_with_file(dirs: &[PathBuf], filename: &str) -> Option<PathBuf> {
+    dirs.iter().map(|d| d.join(filename)).find(|p| p.is_file())
+}
+
+/// Locate the RAW project config manifest file(s) to upload for #1952: the base
+/// `autumn.toml` plus, when present, the profile-override sibling
+/// `autumn-<profile>.toml` for the target deploy profile.
+///
+/// Pure over the passed `dirs`/`profile` so it is unit-testable against temp
+/// dirs. We upload the raw files (NOT a flattened/merged config) because the app
+/// applies its `[profile.<AUTUMN_ENV>]` overlay at runtime — `AUTUMN_ENV` is already
+/// set in the uploaded env file — so shipping the raw manifest(s) preserves the
+/// profile structure and matches the repo exactly.
+///
+/// The sibling lookup reuses the runtime's own pure profile helpers
+/// (`autumn_web::config::normalize_profile_name` +
+/// `profile_override_file_lookup_names`) so the deploy picks the SAME
+/// `autumn-<profile>.toml` the host runtime will load — a single source of truth
+/// prevents drift. The ordered lookup list is first-existing-wins (e.g.
+/// `[deploy] profile = "Production"` prefers `autumn-production.toml` over
+/// `autumn-prod.toml`, matching the runtime). `dirs` is the ordered
+/// manifest-dir-then-CWD search path from [`manifest_project_dirs`]; each file is
+/// resolved against it with the same per-file fallback the runtime's
+/// `find_config_file_named` applies.
+fn manifest_uploads_in(dirs: &[PathBuf], profile: &str) -> Vec<exec::ManifestUpload> {
+    let mut uploads = Vec::new();
+
+    if let Some(base) = first_dir_with_file(dirs, "autumn.toml") {
+        uploads.push(exec::ManifestUpload {
+            local: base,
+            remote_basename: "autumn.toml".to_owned(),
+        });
+    }
+
+    // Mirror the runtime: normalize the raw profile, then walk the ordered
+    // override-file lookup names and upload the FIRST that exists locally (under
+    // its own name), exactly as the host runtime loads the first that exists and
+    // stops. Empty profile falls back to the deploy default `"prod"` (matching
+    // `canonicalize_deploy_profile` / `default_deploy_profile`).
+    let normalized =
+        autumn_web::config::normalize_profile_name(profile).unwrap_or_else(|| "prod".to_owned());
+    for name in autumn_web::config::profile_override_file_lookup_names(&normalized, profile) {
+        let basename = format!("autumn-{name}.toml");
+        if let Some(local) = first_dir_with_file(dirs, &basename) {
+            uploads.push(exec::ManifestUpload {
+                local,
+                remote_basename: basename,
+            });
+            break;
+        }
+    }
+
+    uploads
+}
+
+/// Locate the config manifest(s) to upload for the resolved deploy, reading from
+/// the local project directories ([`manifest_project_dirs`]).
+fn locate_manifest_uploads(resolved: &ResolvedDeployConfig) -> Vec<exec::ManifestUpload> {
+    manifest_uploads_in(&manifest_project_dirs(), &resolved.profile)
+}
+
+/// Format the operator-facing preflight line for the config-manifest upload
+/// (#1952). Pure/testable: either a LOUD no-manifest warning (kills the previous
+/// silent-defaults footgun) or a confirming line naming the uploaded file(s).
+fn manifest_preflight_notice(uploads: &[exec::ManifestUpload]) -> String {
+    if uploads.is_empty() {
+        return "\u{26A0}\u{FE0F}  warning: no autumn.toml found in the project directory; the \
+                deployed app will run built-in defaults for all non-secret settings (secrets \
+                still come from the env file). Add an autumn.toml to control the deployed \
+                configuration."
+            .to_owned();
+    }
+    let names: Vec<&str> = uploads.iter().map(|u| u.remote_basename.as_str()).collect();
+    format!(
+        "Uploading project config to the release dir: {}",
+        names.join(", ")
+    )
+}
+
 /// Perform a real deploy (issue #1607, Slices 1–3).
 ///
 /// Runs the same preflight as `check` and aborts before touching the server if
@@ -1214,6 +1346,12 @@ fn run_up(config: &AutumnConfig, resolved: &ResolvedDeployConfig) -> Result<(), 
         .ok_or_else(|| DeployError::Config(DEPLOY_HOST_MISSING_DETAIL.to_owned()))?;
     let binary = resolve_release_binary(resolved)?;
     let env_file = build_env_file(config, resolved);
+    // Locate the project config manifest(s) to upload so the deployed app loads
+    // the intended config rather than silent built-in defaults (#1952), and print
+    // a loud line either confirming the upload or warning when there is no
+    // autumn.toml to ship.
+    let manifests = locate_manifest_uploads(resolved);
+    eprintln!("{}", manifest_preflight_notice(&manifests));
     let release_id = default_release_id();
     let public_port = config.server.port;
     // kamal-proxy `run` binds 443 for its HTTPS listener BY DEFAULT (regardless of
@@ -1247,6 +1385,7 @@ fn run_up(config: &AutumnConfig, resolved: &ResolvedDeployConfig) -> Result<(), 
                 &unit,
                 env_file,
                 &binary,
+                &manifests,
                 &release_id,
                 &plan,
             );
@@ -1271,6 +1410,7 @@ fn run_up(config: &AutumnConfig, resolved: &ResolvedDeployConfig) -> Result<(), 
                 &unit,
                 env_file,
                 &binary,
+                &manifests,
                 &release_id,
                 &plan,
             );
@@ -1872,6 +2012,250 @@ mod tests {
         // Secrets come from an EnvironmentFile, never inlined into the unit.
         assert!(unit.contains("EnvironmentFile=/srv/autumn/shop/shared/autumn.env"));
         assert!(!unit.contains("Environment=SECRET"));
+        // #1952: `render_systemd_unit` execs the `current` symlink, so it points
+        // config loading at `current` (matching its WorkingDirectory), where the
+        // active release's uploaded autumn.toml is reachable.
+        assert!(unit.contains("Environment=AUTUMN_MANIFEST_DIR=/srv/autumn/shop/current"));
+    }
+
+    #[test]
+    fn app_unit_sets_manifest_dir_to_release_for_uploaded_config() {
+        // #1952: the deployed slot unit (the one actually written by a deploy)
+        // sets AUTUMN_MANIFEST_DIR to THIS release dir — where the manifest is
+        // uploaded, coupled to the binary — so the app's config loader reads the
+        // uploaded autumn.toml instead of built-in defaults, and a rollback that
+        // re-renders the unit from the target release dir reads that release's OWN
+        // manifest. It matches the unit's WorkingDirectory. Non-secret → an
+        // `Environment=` line, not the 0600 env file.
+        let cfg = ResolvedDeployConfig::resolve(
+            &DeployConfig {
+                app_name: Some("shop".to_owned()),
+                ..DeployConfig::default()
+            },
+            "shop",
+        )
+        .expect("deploy config resolves");
+        let release_dir = "/srv/autumn/shop/releases/r1";
+        let unit = render_app_unit(&cfg, release_dir, 3001, "blue");
+        assert!(
+            unit.contains(&format!("Environment=AUTUMN_MANIFEST_DIR={release_dir}")),
+            "slot unit must set AUTUMN_MANIFEST_DIR to the release dir: {unit}"
+        );
+        // It matches the unit's WorkingDirectory (both pinned to the release dir).
+        assert!(unit.contains(&format!("WorkingDirectory={release_dir}")));
+        // The env file (secrets) still lives in the shared dir at 0600.
+        assert!(unit.contains("EnvironmentFile=/srv/autumn/shop/shared/autumn.env"));
+    }
+
+    #[test]
+    fn render_systemd_unit_sets_manifest_dir_to_current_symlink() {
+        // #1952: `autumn deploy render` (the `render_systemd_unit` renderer) execs
+        // the `current` symlink, so its AUTUMN_MANIFEST_DIR must point at `current`
+        // (matching its WorkingDirectory) — where the active release's manifest is
+        // reachable — keeping the two renderers in lockstep.
+        let cfg = ResolvedDeployConfig::resolve(
+            &DeployConfig {
+                app_name: Some("shop".to_owned()),
+                ..DeployConfig::default()
+            },
+            "shop",
+        )
+        .expect("deploy config resolves");
+        let unit = render_systemd_unit(&cfg);
+        let current = cfg.current_symlink();
+        assert!(
+            unit.contains(&format!("Environment=AUTUMN_MANIFEST_DIR={current}")),
+            "render_systemd_unit must set AUTUMN_MANIFEST_DIR to the current symlink: {unit}"
+        );
+        assert!(unit.contains(&format!("WorkingDirectory={current}")));
+    }
+
+    #[test]
+    fn manifest_uploads_base_only_when_no_profile_sibling() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("autumn.toml"), "[server]\nport = 8080\n")
+            .expect("write autumn.toml");
+        let dirs = vec![dir.path().to_path_buf()];
+        let uploads = manifest_uploads_in(&dirs, "prod");
+        assert_eq!(uploads.len(), 1, "only autumn.toml is present");
+        assert_eq!(uploads[0].remote_basename, "autumn.toml");
+        assert_eq!(uploads[0].local, dir.path().join("autumn.toml"));
+    }
+
+    #[test]
+    fn manifest_uploads_include_profile_sibling_when_present() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("autumn.toml"), "[server]\n").expect("write base");
+        std::fs::write(dir.path().join("autumn-prod.toml"), "[server]\n").expect("write sibling");
+        let dirs = vec![dir.path().to_path_buf()];
+        let uploads = manifest_uploads_in(&dirs, "prod");
+        let names: Vec<&str> = uploads.iter().map(|u| u.remote_basename.as_str()).collect();
+        assert_eq!(names, vec!["autumn.toml", "autumn-prod.toml"]);
+    }
+
+    #[test]
+    fn manifest_uploads_normalize_production_to_canonical_sibling() {
+        // `[deploy] profile = "Production"` must resolve the SAME override file
+        // the host runtime loads first. The runtime's ordered lookup for a raw
+        // `Production` is ["production", "prod"], so a local `autumn-production.toml`
+        // is uploaded under that exact name — never `autumn-Production.toml`.
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("autumn.toml"), "[server]\n").expect("write base");
+        std::fs::write(dir.path().join("autumn-production.toml"), "[server]\n")
+            .expect("write sibling");
+        let dirs = vec![dir.path().to_path_buf()];
+        let uploads = manifest_uploads_in(&dirs, "Production");
+        let names: Vec<&str> = uploads.iter().map(|u| u.remote_basename.as_str()).collect();
+        assert_eq!(names, vec!["autumn.toml", "autumn-production.toml"]);
+        assert!(
+            !uploads
+                .iter()
+                .any(|u| u.remote_basename == "autumn-Production.toml"),
+            "must not upload the raw-cased spelling"
+        );
+    }
+
+    #[test]
+    fn manifest_uploads_check_canonical_profile_sibling() {
+        // `[deploy] profile = "production"` should still ship the canonical
+        // `autumn-prod.toml` if that is what the repo carries, matching the
+        // runtime's own override-file lookup (production → ["production","prod"];
+        // production absent, prod present → prod wins).
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("autumn.toml"), "[server]\n").expect("write base");
+        std::fs::write(dir.path().join("autumn-prod.toml"), "[server]\n").expect("write sibling");
+        let dirs = vec![dir.path().to_path_buf()];
+        let uploads = manifest_uploads_in(&dirs, "production");
+        assert!(
+            uploads
+                .iter()
+                .any(|u| u.remote_basename == "autumn-prod.toml"),
+            "canonical prod sibling is uploaded for raw profile `production`"
+        );
+    }
+
+    #[test]
+    fn manifest_uploads_raw_prod_prefers_prod_sibling_first() {
+        // Raw `prod` → ordered lookup ["prod","production"], so when only the
+        // canonical `autumn-prod.toml` exists it is chosen.
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("autumn.toml"), "[server]\n").expect("write base");
+        std::fs::write(dir.path().join("autumn-prod.toml"), "[server]\n").expect("write sibling");
+        let dirs = vec![dir.path().to_path_buf()];
+        let uploads = manifest_uploads_in(&dirs, "prod");
+        let names: Vec<&str> = uploads.iter().map(|u| u.remote_basename.as_str()).collect();
+        assert_eq!(names, vec!["autumn.toml", "autumn-prod.toml"]);
+    }
+
+    #[test]
+    fn manifest_uploads_custom_profile_uses_verbatim_sibling() {
+        // A custom profile has no aliases: raw `staging` → ["staging"], uploaded
+        // as `autumn-staging.toml`.
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("autumn.toml"), "[server]\n").expect("write base");
+        std::fs::write(dir.path().join("autumn-staging.toml"), "[server]\n")
+            .expect("write sibling");
+        let dirs = vec![dir.path().to_path_buf()];
+        let uploads = manifest_uploads_in(&dirs, "staging");
+        let names: Vec<&str> = uploads.iter().map(|u| u.remote_basename.as_str()).collect();
+        assert_eq!(names, vec!["autumn.toml", "autumn-staging.toml"]);
+    }
+
+    #[test]
+    fn manifest_uploads_first_lookup_name_wins_when_both_present() {
+        // When BOTH `autumn-production.toml` and `autumn-prod.toml` exist, the one
+        // matching the runtime's FIRST lookup name for the raw spelling is chosen
+        // (first-existing-wins), so the deploy uploads exactly what the host loads.
+        // Raw `production` → ["production","prod"] → production wins.
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("autumn.toml"), "[server]\n").expect("write base");
+        std::fs::write(dir.path().join("autumn-production.toml"), "[server]\n")
+            .expect("write production");
+        std::fs::write(dir.path().join("autumn-prod.toml"), "[server]\n").expect("write prod");
+        let dirs = vec![dir.path().to_path_buf()];
+        let uploads = manifest_uploads_in(&dirs, "production");
+        let siblings: Vec<&str> = uploads
+            .iter()
+            .map(|u| u.remote_basename.as_str())
+            .filter(|n| n.starts_with("autumn-"))
+            .collect();
+        assert_eq!(
+            siblings,
+            vec!["autumn-production.toml"],
+            "only the first-lookup-name sibling is uploaded, matching the runtime"
+        );
+    }
+
+    #[test]
+    fn manifest_uploads_base_falls_back_to_cwd_dir() {
+        // Mirror the runtime's find_config_file_named per-file fallback: when the
+        // primary (manifest) dir has no autumn.toml but a fallback (CWD) dir does,
+        // the base manifest is picked up from the fallback dir. The sibling honors
+        // the same fallback.
+        let manifest_dir = tempfile::tempdir().expect("manifest dir");
+        let cwd = tempfile::tempdir().expect("cwd dir");
+        // Manifest dir is empty; CWD carries the real config.
+        std::fs::write(cwd.path().join("autumn.toml"), "[server]\n").expect("write base");
+        std::fs::write(cwd.path().join("autumn-prod.toml"), "[server]\n").expect("write sibling");
+        let dirs = vec![manifest_dir.path().to_path_buf(), cwd.path().to_path_buf()];
+        let uploads = manifest_uploads_in(&dirs, "prod");
+        assert_eq!(
+            uploads.len(),
+            2,
+            "base + sibling picked up from the CWD fallback"
+        );
+        assert_eq!(uploads[0].remote_basename, "autumn.toml");
+        assert_eq!(uploads[0].local, cwd.path().join("autumn.toml"));
+        assert_eq!(uploads[1].remote_basename, "autumn-prod.toml");
+        assert_eq!(uploads[1].local, cwd.path().join("autumn-prod.toml"));
+    }
+
+    #[test]
+    fn manifest_uploads_primary_dir_wins_over_fallback() {
+        // When both the manifest dir and the CWD fallback have autumn.toml, the
+        // primary (manifest) dir wins — matching find_config_file_named.
+        let manifest_dir = tempfile::tempdir().expect("manifest dir");
+        let cwd = tempfile::tempdir().expect("cwd dir");
+        std::fs::write(manifest_dir.path().join("autumn.toml"), "[server]\n").expect("primary");
+        std::fs::write(cwd.path().join("autumn.toml"), "[server]\n").expect("fallback");
+        let dirs = vec![manifest_dir.path().to_path_buf(), cwd.path().to_path_buf()];
+        let uploads = manifest_uploads_in(&dirs, "prod");
+        assert_eq!(uploads[0].local, manifest_dir.path().join("autumn.toml"));
+    }
+
+    #[test]
+    fn manifest_uploads_empty_when_no_manifest() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dirs = vec![dir.path().to_path_buf()];
+        let uploads = manifest_uploads_in(&dirs, "prod");
+        assert!(uploads.is_empty(), "no autumn.toml → nothing to upload");
+    }
+
+    #[test]
+    fn manifest_notice_warns_loudly_when_no_manifest() {
+        let notice = manifest_preflight_notice(&[]);
+        assert!(
+            notice.contains("no autumn.toml") && notice.contains("built-in defaults"),
+            "no-manifest notice must loudly warn about silent defaults: {notice}"
+        );
+    }
+
+    #[test]
+    fn manifest_notice_confirms_uploaded_files() {
+        let uploads = vec![
+            exec::ManifestUpload {
+                local: PathBuf::from("/x/autumn.toml"),
+                remote_basename: "autumn.toml".to_owned(),
+            },
+            exec::ManifestUpload {
+                local: PathBuf::from("/x/autumn-prod.toml"),
+                remote_basename: "autumn-prod.toml".to_owned(),
+            },
+        ];
+        let notice = manifest_preflight_notice(&uploads);
+        assert!(notice.contains("autumn.toml"));
+        assert!(notice.contains("autumn-prod.toml"));
+        assert!(!notice.contains("no autumn.toml"));
     }
 
     #[test]

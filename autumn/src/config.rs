@@ -355,7 +355,12 @@ fn resolve_profile_input(env: &dyn Env) -> String {
 /// - `development` -> `dev`
 /// - `prod`/`PROD` -> `prod`
 /// - `dev`/`DEV` -> `dev`
-fn normalize_profile_name(profile: &str) -> Option<String> {
+///
+/// `pub` so the deploy CLI (`autumn-cli`) can mirror the runtime's profile
+/// normalization exactly when picking which local `autumn-<profile>.toml` to
+/// upload — a single source of truth prevents deploy/runtime drift (#1952).
+#[must_use]
+pub fn normalize_profile_name(profile: &str) -> Option<String> {
     let trimmed = profile.trim();
     if trimmed.is_empty() {
         return None;
@@ -394,7 +399,15 @@ fn profile_lookup_names(profile: &str) -> Vec<&str> {
 ///
 /// Only one profile override file is loaded: the first existing file in this
 /// ordered list. The order prefers the explicitly-selected spelling.
-fn profile_override_file_lookup_names(profile: &str, selected_profile_input: &str) -> Vec<String> {
+///
+/// `pub` so the deploy CLI (`autumn-cli`) can mirror the runtime's
+/// override-file lookup exactly when picking which local `autumn-<profile>.toml`
+/// to upload — a single source of truth prevents deploy/runtime drift (#1952).
+#[must_use]
+pub fn profile_override_file_lookup_names(
+    profile: &str,
+    selected_profile_input: &str,
+) -> Vec<String> {
     match profile {
         "prod" if selected_profile_input.eq_ignore_ascii_case("production") => {
             vec!["production".to_owned(), "prod".to_owned()]
