@@ -67,7 +67,7 @@ pub struct StoredObject {
 ///
 /// `secret_access_key` is redacted by the hand-written [`std::fmt::Debug`]
 /// impl, so a `MediaStorage` can be safely logged.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct S3MediaStorage {
     /// Bucket name.
     pub bucket: String,
@@ -86,6 +86,14 @@ pub struct S3MediaStorage {
     pub key_prefix: String,
     /// Whether to force S3 path-style addressing.
     pub force_path_style: bool,
+    /// Lazily-built, cached aws-sdk-s3 client shared across operations.
+    ///
+    /// Private (unlike the config fields): an internal cache, not part of the
+    /// resolved configuration. The AWS SDK recommends one long-lived client
+    /// whose credential provider self-refreshes, so it is built once via
+    /// [`tokio::sync::OnceCell`] and reused. Wrapped in [`std::sync::Arc`] so a
+    /// `#[derive(Clone)]` of `S3MediaStorage` shares the same cache.
+    client: std::sync::Arc<tokio::sync::OnceCell<Client>>,
 }
 
 impl std::fmt::Debug for S3MediaStorage {
@@ -100,7 +108,8 @@ impl std::fmt::Debug for S3MediaStorage {
             .field("public_base_url", &self.public_base_url)
             .field("key_prefix", &self.key_prefix)
             .field("force_path_style", &self.force_path_style)
-            .finish()
+            // `client` (the cached aws-sdk-s3 client) is intentionally omitted.
+            .finish_non_exhaustive()
     }
 }
 
@@ -175,6 +184,7 @@ impl MediaStorage {
                     public_base_url,
                     key_prefix,
                     force_path_style: cfg.force_path_style,
+                    client: std::sync::Arc::new(tokio::sync::OnceCell::new()),
                 }))
             }
         }
@@ -285,7 +295,7 @@ impl MediaStorage {
                 let body = ByteStream::from_path(local_path).await.map_err(|error| {
                     MediaError::LocalRead {
                         path: local_path.display().to_string(),
-                        source: std::io::Error::other(error.to_string()),
+                        source: std::io::Error::other(error),
                     }
                 })?;
                 let client = self.build_client().await;
@@ -343,14 +353,17 @@ impl MediaStorage {
         }
     }
 
-    /// Build a fresh aws-sdk-s3 client for the S3 backend.
+    /// Return the S3 backend's cached aws-sdk-s3 client, building it once.
     ///
-    /// A new client is built per operation (matching Arroyo), so it does not
-    /// need to be cached on the enum. The endpoint is set **only when
-    /// configured** (an improvement over Arroyo's always-set endpoint, borrowed
-    /// from `autumn-storage-s3`): an unset endpoint leaves the SDK default in
-    /// place. When both credentials are present they are used as hard-coded
-    /// `SigV4` credentials; otherwise the ambient AWS credential chain is loaded.
+    /// The client is built lazily on first use and cached in the backend's
+    /// [`tokio::sync::OnceCell`], so every operation reuses one long-lived
+    /// client (the AWS SDK recommendation — its credential provider
+    /// self-refreshes) instead of rebuilding per operation. The endpoint is set
+    /// **only when configured** (an improvement over Arroyo's always-set
+    /// endpoint, borrowed from `autumn-storage-s3`): an unset endpoint leaves
+    /// the SDK default in place. When both credentials are present they are used
+    /// as hard-coded `SigV4` credentials; otherwise the ambient AWS credential
+    /// chain is loaded.
     ///
     /// # Panics
     ///
@@ -361,35 +374,41 @@ impl MediaStorage {
             unreachable!("build_client is only called for the S3 backend");
         };
 
-        if !config.access_key_id.is_empty() && !config.secret_access_key.is_empty() {
-            let credentials = Credentials::new(
-                config.access_key_id.clone(),
-                config.secret_access_key.clone(),
-                None,
-                None,
-                "autumn-media-plugin",
-            );
-            let mut builder = aws_sdk_s3::Config::builder()
-                .behavior_version(BehaviorVersion::latest())
-                .region(Region::new(config.region.clone()))
-                .credentials_provider(credentials)
-                .force_path_style(config.force_path_style);
-            if let Some(endpoint) = &config.endpoint_url {
-                builder = builder.endpoint_url(endpoint);
-            }
-            Client::from_conf(builder.build())
-        } else {
-            let shared = aws_config::defaults(BehaviorVersion::latest())
-                .region(Region::new(config.region.clone()))
-                .load()
-                .await;
-            let mut builder = aws_sdk_s3::config::Builder::from(&shared)
-                .force_path_style(config.force_path_style);
-            if let Some(endpoint) = &config.endpoint_url {
-                builder = builder.endpoint_url(endpoint);
-            }
-            Client::from_conf(builder.build())
-        }
+        config
+            .client
+            .get_or_init(|| async {
+                if !config.access_key_id.is_empty() && !config.secret_access_key.is_empty() {
+                    let credentials = Credentials::new(
+                        config.access_key_id.clone(),
+                        config.secret_access_key.clone(),
+                        None,
+                        None,
+                        "autumn-media-plugin",
+                    );
+                    let mut builder = aws_sdk_s3::Config::builder()
+                        .behavior_version(BehaviorVersion::latest())
+                        .region(Region::new(config.region.clone()))
+                        .credentials_provider(credentials)
+                        .force_path_style(config.force_path_style);
+                    if let Some(endpoint) = &config.endpoint_url {
+                        builder = builder.endpoint_url(endpoint);
+                    }
+                    Client::from_conf(builder.build())
+                } else {
+                    let shared = aws_config::defaults(BehaviorVersion::latest())
+                        .region(Region::new(config.region.clone()))
+                        .load()
+                        .await;
+                    let mut builder = aws_sdk_s3::config::Builder::from(&shared)
+                        .force_path_style(config.force_path_style);
+                    if let Some(endpoint) = &config.endpoint_url {
+                        builder = builder.endpoint_url(endpoint);
+                    }
+                    Client::from_conf(builder.build())
+                }
+            })
+            .await
+            .clone()
     }
 }
 
