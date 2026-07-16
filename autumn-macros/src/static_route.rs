@@ -261,6 +261,86 @@ mod tests {
     }
 
     #[test]
+    fn static_get_requires_path() {
+        let generated = static_get_macro(
+            quote! { "" },
+            quote! { async fn about() -> &'static str { "about" } },
+        )
+        .to_string();
+        assert!(
+            generated.contains("Route path must not be empty"),
+            "empty path should emit compile error: {generated}"
+        );
+    }
+
+    #[test]
+    fn static_get_requires_path_start_with_slash() {
+        let generated = static_get_macro(
+            quote! { "about" },
+            quote! { async fn about() -> &'static str { "about" } },
+        )
+        .to_string();
+        assert!(
+            generated.contains("Route path must start with '/'"),
+            "path without leading slash should emit compile error: {generated}"
+        );
+    }
+
+    #[test]
+    fn static_get_parameterized_requires_params_fn() {
+        let generated = static_get_macro(
+            quote! { "/posts/{slug}" },
+            quote! { async fn about() -> &'static str { "about" } },
+        )
+        .to_string();
+        assert!(
+            generated.contains("Parameterized static routes require a `params` function"),
+            "parameterized route without params_fn should emit compile error: {generated}"
+        );
+    }
+
+    #[test]
+    fn static_get_non_parameterized_rejects_params_fn() {
+        let generated = static_get_macro(
+            quote! { "/about", params = my_params },
+            quote! { async fn about() -> &'static str { "about" } },
+        )
+        .to_string();
+        assert!(
+            generated.contains(
+                "Static route has no path parameters but a `params` function was provided"
+            ),
+            "non-parameterized route with params_fn should emit compile error: {generated}"
+        );
+    }
+
+    #[test]
+    fn static_get_invalid_attribute() {
+        let generated = static_get_macro(
+            quote! { "/about", unknown = 123 },
+            quote! { async fn about() -> &'static str { "about" } },
+        )
+        .to_string();
+        assert!(
+            generated.contains("Unknown attribute `unknown`"),
+            "unknown attribute should emit compile error: {generated}"
+        );
+    }
+
+    #[test]
+    fn static_get_parses_revalidate() {
+        let generated = static_get_macro(
+            quote! { "/about", revalidate = 60 },
+            quote! { async fn about() -> &'static str { "about" } },
+        )
+        .to_string();
+        assert!(
+            generated.contains("Some (60u64)"),
+            "revalidate attribute should be parsed: {generated}"
+        );
+    }
+
+    #[test]
     fn static_get_marks_public_from_expanded_marker() {
         // Ordering B: `#[public]` written above `#[static_get]`, so it expands
         // first and injects the `__AUTUMN_PUBLIC` marker into the body; the
