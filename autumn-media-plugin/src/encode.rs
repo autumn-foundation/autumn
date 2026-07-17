@@ -736,6 +736,17 @@ const ROOM_COMPOSITE_MAX_INPUTS: usize = 6;
 /// encoders. The composite needs `2..=6` participant recordings (the mesh-room
 /// cap); one input per participant, so — unlike the clip/poster encoders — it
 /// never concatenates.
+///
+/// # Audio-stream assumption
+///
+/// This composite assumes **each participant recording carries an audio
+/// stream**: the `-filter_complex` graph references every input's audio and
+/// mixes them with `amix`, so a **video-only participant recording (no audio
+/// stream) is not supported for composition this slice** — `FFmpeg` would fail
+/// on the missing stream. The **per-participant recordings themselves are
+/// unaffected**; this limitation is only about the composited grid output.
+/// Robust handling (per-input audio detection / silence synthesis) is recorded
+/// future work on the epic.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FfmpegRoomCompositeCommand {
     ffmpeg_bin: String,

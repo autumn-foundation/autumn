@@ -394,10 +394,18 @@ impl Plugin for MediaPlugin {
         // builder, so this single check covers both the TOML and builder paths;
         // `InMemoryRoomStore::create_room` re-checks the fixed 6 ceiling as a
         // defense-in-depth backstop, and `MediaConfig::validate` stays the
-        // opt-in strict check for consumers who validate config up front. The
-        // storage backend keeps its own degrade path below (unchanged), so this
-        // only fails fast on the room cap.
-        if let Some(message) = room_max_participants_error(room_max_participants) {
+        // opt-in strict check for consumers who validate config up front.
+        //
+        // A configured `room_namespace` is prepended to every room path, so an
+        // invalid one (a slash, a dot segment, whitespace) would likewise mount
+        // the router fine yet make every `POST /rooms` fail `InvalidSegment` —
+        // another config that can never serve a request. It fails fast here too,
+        // via the same `on_startup` abort but its own specific message.
+        // The storage backend keeps its own degrade path below (unchanged), so
+        // this only fails fast on the room cap and room namespace.
+        if let Some(message) = room_max_participants_error(room_max_participants)
+            .or_else(|| room_namespace_error(config.room_namespace.as_deref()))
+        {
             tracing::error!(
                 room_max_participants,
                 ceiling = DEFAULT_ROOM_MAX_PARTICIPANTS,
@@ -525,6 +533,26 @@ fn room_max_participants_error(configured: usize) -> Option<String> {
     } else {
         None
     }
+}
+
+/// Validate a configured mesh-room `MediaMTX` path namespace at boot.
+///
+/// The namespace is prepended to every room / participant `MediaMTX` path, so a
+/// value [`rooms::validate_room_segment`] would reject (a slash, a `.` / `..`
+/// dot segment, whitespace, or other non-`[A-Za-z0-9_-]` label) mounts the
+/// router fine but makes every `POST /rooms` fail with `InvalidSegment` — a
+/// config that can never serve a request must instead refuse to boot. Returns
+/// the specific, fail-fast error message — naming the offending value and the
+/// allowed charset — when the namespace is present-and-invalid, or `None` when
+/// it is absent, empty, or a valid segment.
+fn room_namespace_error(namespace: Option<&str>) -> Option<String> {
+    let ns = namespace?;
+    if ns.is_empty() || rooms::validate_room_segment(ns).is_ok() {
+        return None;
+    }
+    Some(format!(
+        "media.room_namespace {ns:?} is not a valid room path segment: use only ASCII letters, digits, '_' or '-' (no '/', '.', or empty)"
+    ))
 }
 
 /// Recordings root an Arroyo deployment uses when `ARROYO_RECORDINGS_ROOT` is
@@ -701,6 +729,57 @@ mod room_cap_tests {
         let from_config = MediaPlugin::new().config(config);
         assert_eq!(from_config.room_max_participants, 50);
         assert!(room_max_participants_error(from_config.room_max_participants).is_some());
+    }
+}
+
+// ── Room-namespace fail-fast (Fix P2-a) ─────────────────────────────────────
+
+#[cfg(test)]
+mod room_namespace_tests {
+    use super::{MediaPlugin, room_namespace_error};
+
+    #[test]
+    fn absent_empty_and_valid_namespaces_are_accepted() {
+        // Absent and empty mean "no namespace" → no boot error; a valid segment
+        // passes through untouched.
+        assert!(room_namespace_error(None).is_none());
+        assert!(room_namespace_error(Some("")).is_none());
+        assert!(room_namespace_error(Some("tenant-a")).is_none());
+        assert!(room_namespace_error(Some("room_1")).is_none());
+    }
+
+    #[test]
+    fn invalid_namespace_is_a_specific_fail_fast_error() {
+        // A slash, either dot segment, or embedded whitespace fails loud, naming
+        // the offending value and the allowed charset — never a silent mount
+        // that 500s every request.
+        for bad in ["tenant/a", ".", "..", "a b"] {
+            let message = room_namespace_error(Some(bad))
+                .unwrap_or_else(|| panic!("{bad:?} must be rejected"));
+            assert!(
+                message.contains(bad),
+                "names the offending value: {message}"
+            );
+            assert!(
+                message.contains("letters") && message.contains('-'),
+                "mentions the allowed charset: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn room_namespace_builder_feeds_the_effective_value_that_boot_rejects() {
+        // The `room_namespace("tenant/a")` builder stores what it was given;
+        // `build()` is what rejects it fail-fast, so an invalid builder value
+        // produces the specific error at boot.
+        let bad = MediaPlugin::new().with_rooms().room_namespace("tenant/a");
+        assert_eq!(bad.config.room_namespace.as_deref(), Some("tenant/a"));
+        assert!(room_namespace_error(bad.config.room_namespace.as_deref()).is_some());
+
+        // A valid namespace flows through untouched → a real namespaced room.
+        let ok = MediaPlugin::new().with_rooms().room_namespace("tenant-a");
+        assert_eq!(ok.config.room_namespace.as_deref(), Some("tenant-a"));
+        assert!(room_namespace_error(ok.config.room_namespace.as_deref()).is_none());
     }
 }
 
