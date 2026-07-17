@@ -15,6 +15,9 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  meta:
+    uses: ./.github/workflows/runner-routing.yml
+
   lint:
     name: Lint
     runs-on: ubuntu-latest
@@ -52,12 +55,12 @@ jobs:
 
   test:
     name: Test (${{ matrix.os }})
-    needs: lint
+    needs: [lint, meta]
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.os == 'ubuntu-latest' && fromJSON(needs.meta.outputs.heavy_runs_on) || matrix.os }}
     steps:
       - uses: actions/checkout@v7
       - name: Free disk space (Linux)
@@ -175,8 +178,8 @@ jobs:
 
   coverage:
     name: Coverage
-    needs: test
-    runs-on: ubuntu-latest
+    needs: [test, meta]
+    runs-on: ${{ fromJSON(needs.meta.outputs.heavy_runs_on) }}
     steps:
       - uses: actions/checkout@v7
       - name: Free disk space
@@ -316,8 +319,8 @@ jobs:
   # the preemption budget + job timeout bound the state-space search.
   loom:
     name: Loom
-    needs: test
-    runs-on: ubuntu-latest
+    needs: [test, meta]
+    runs-on: ${{ fromJSON(needs.meta.outputs.heavy_runs_on) }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7

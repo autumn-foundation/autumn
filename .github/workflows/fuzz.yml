@@ -27,9 +27,13 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  meta:
+    uses: ./.github/workflows/runner-routing.yml
+
   fuzz:
     name: Fuzz (${{ matrix.target }})
-    runs-on: ubuntu-latest
+    needs: meta
+    runs-on: ${{ fromJSON(needs.meta.outputs.heavy_runs_on) }}
     strategy:
       fail-fast: false
       matrix:
