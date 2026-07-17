@@ -515,6 +515,8 @@ pub mod ws;
 #[doc(hidden)]
 pub mod __private {
     #[cfg(feature = "db")]
+    pub use crate::db::scoped_immediate_transaction;
+    #[cfg(feature = "db")]
     pub use crate::db::scoped_transaction;
     #[cfg(all(feature = "db", feature = "ws"))]
     pub use crate::repository_commit_hooks::CURRENT_CHANNELS;
@@ -1326,7 +1328,7 @@ pub trait Lifecycle {
 /// transition coalesces into a single delivery:
 ///
 /// ```rust,ignore
-/// #[job(name = "send_shipped_email", unique, by = ["idempotency_key"])]
+/// #[job(name = "send_shipped_email", unique_by = "idempotency_key")]
 /// async fn send_shipped_email(
 ///     state: AppState,
 ///     effect: TransitionEffect,
@@ -1338,7 +1340,7 @@ pub trait Lifecycle {
 ///
 /// The [`idempotency_key`](TransitionEffect::idempotency_key) is derived from
 /// `(model, field, record_id, from_state, to_state)`, so declaring the job
-/// `unique, by = ["idempotency_key"]` gives idempotent, coalescing delivery.
+/// `unique_by = "idempotency_key"` gives idempotent, coalescing delivery.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TransitionEffect {
     /// The model type name whose field transitioned (e.g. `"Order"`).

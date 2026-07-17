@@ -1033,6 +1033,10 @@ fn is_string_param_type(ty: &syn::Type) -> bool {
 /// - `before_expr` — token stream for the "before" record value for updates
 ///   (same type; ignored for inserts/deletes).
 /// - `conn_ident` — identifier of the `&mut AsyncPgConnection`-like variable
+// #1996: the write path forks into pg / sqlite `backend_select!` arms (drop the
+// `$7::jsonb` cast, bind `recorded_at` explicitly on SQLite), which pushes this
+// token builder just past the line lint.
+#[allow(clippy::too_many_lines)]
 fn vh_insert_ts(
     table_name_str: &str,
     op: &str,
@@ -1115,21 +1119,52 @@ fn vh_insert_ts(
             };
             let __vh_actor: ::std::string::String = #actor_ts;
             let __vh_request_id: ::core::option::Option<&str> = #request_id_ts;
-            ::autumn_web::reexports::diesel::sql_query(
-                "INSERT INTO _autumn_version_history \
-                 (table_name, tenant_id, record_id, op, actor, request_id, changes) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)"
-            )
-            .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(#table_name_ts)
-            .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>, _>(__vh_tenant_id)
-            .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(__vh_record_id)
-            .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(#op)
-            .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__vh_actor)
-            .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>, _>(__vh_request_id)
-            .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__vh_changes_str)
-            .execute(#conn_ident)
-            .await
-            .map_err(::autumn_web::AutumnError::from)?;
+            // #1996: the Postgres arm keeps the `$7::jsonb` cast (`changes` is a
+            // JSONB column). The SQLite arm drops the cast (JSON is stored as
+            // TEXT) and additionally binds `recorded_at` explicitly: the DDL
+            // `DEFAULT CURRENT_TIMESTAMP` yields `YYYY-MM-DD HH:MM:SS` (no
+            // offset), which is not lexicographically comparable with the
+            // offset-bearing encoding diesel produces for a bound `DateTime<Utc>`
+            // filter value — binding the timestamp here makes stored and filter
+            // values share one encoding so the `recorded_at >= / <=` TEXT
+            // comparisons in `version_history()` stay monotonic.
+            ::autumn_web::backend_select! {
+                pg => {
+                    ::autumn_web::reexports::diesel::sql_query(
+                        "INSERT INTO _autumn_version_history \
+                         (table_name, tenant_id, record_id, op, actor, request_id, changes) \
+                         VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)"
+                    )
+                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(#table_name_ts)
+                    .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>, _>(__vh_tenant_id)
+                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(__vh_record_id)
+                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(#op)
+                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__vh_actor)
+                    .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>, _>(__vh_request_id)
+                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__vh_changes_str)
+                    .execute(#conn_ident)
+                    .await
+                    .map_err(::autumn_web::AutumnError::from)?;
+                },
+                sqlite => {
+                    ::autumn_web::reexports::diesel::sql_query(
+                        "INSERT INTO _autumn_version_history \
+                         (table_name, tenant_id, record_id, op, actor, request_id, changes, recorded_at) \
+                         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)"
+                    )
+                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(#table_name_ts)
+                    .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>, _>(__vh_tenant_id)
+                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(__vh_record_id)
+                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(#op)
+                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__vh_actor)
+                    .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>, _>(__vh_request_id)
+                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__vh_changes_str)
+                    .bind::<::autumn_web::reexports::diesel::sql_types::TimestamptzSqlite, _>(::autumn_web::reexports::chrono::Utc::now())
+                    .execute(#conn_ident)
+                    .await
+                    .map_err(::autumn_web::AutumnError::from)?;
+                },
+            }
         }
     }
 }
@@ -4108,7 +4143,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
                     Self::__autumn_register_repository_commit_hooks();
                     let mut conn = self.__autumn_acquire_conn().await?;
-                    let (record, mut ctx, __autumn_commit_hook_id, __autumn_commit_hook_owner, __autumn_commit_hook_record, __autumn_previous_topic, __autumn_previous_id) = ::autumn_web::__private::scoped_transaction::<(#model_name, MutationContext, ::std::string::String, ::std::string::String, ::autumn_web::reexports::serde_json::Value, ::core::option::Option<::std::string::String>, ::core::option::Option<::std::string::String>), ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
+                    let (record, mut ctx, __autumn_commit_hook_id, __autumn_commit_hook_owner, __autumn_commit_hook_record, __autumn_previous_topic, __autumn_previous_id) = ::autumn_web::__private::scoped_immediate_transaction::<(#model_name, MutationContext, ::std::string::String, ::std::string::String, ::autumn_web::reexports::serde_json::Value, ::core::option::Option<::std::string::String>, ::core::option::Option<::std::string::String>), ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                             async move {
                                 let mut ctx = MutationContext::new(MutationOp::Update);
                                 let mut __autumn_commit_hook_discriminator: ::core::option::Option<::std::string::String> =
@@ -4326,7 +4361,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     };
 
                     let mut conn = self.__autumn_acquire_conn().await?;
-                    let (record, mut ctx) = ::autumn_web::__private::scoped_transaction::<(#model_name, MutationContext), ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
+                    let (record, mut ctx) = ::autumn_web::__private::scoped_immediate_transaction::<(#model_name, MutationContext), ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                             async move {
                                 let mut ctx = MutationContext::new(MutationOp::Update);
                                 let (record, __vh_before): (#model_name, ::core::option::Option<#model_name>) = if let ::core::option::Option::Some(expected_version) =
@@ -4450,7 +4485,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
                     Self::__autumn_register_repository_commit_hooks();
                     let mut conn = self.__autumn_acquire_conn().await?;
-                    let (record, mut ctx, __autumn_commit_hook_id, __autumn_commit_hook_owner, __autumn_commit_hook_record, __autumn_previous_topic, __autumn_previous_id) = ::autumn_web::__private::scoped_transaction::<(#model_name, MutationContext, ::std::string::String, ::std::string::String, ::autumn_web::reexports::serde_json::Value, ::core::option::Option<::std::string::String>, ::core::option::Option<::std::string::String>), ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
+                    let (record, mut ctx, __autumn_commit_hook_id, __autumn_commit_hook_owner, __autumn_commit_hook_record, __autumn_previous_topic, __autumn_previous_id) = ::autumn_web::__private::scoped_immediate_transaction::<(#model_name, MutationContext, ::std::string::String, ::std::string::String, ::autumn_web::reexports::serde_json::Value, ::core::option::Option<::std::string::String>, ::core::option::Option<::std::string::String>), ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                             async move {
                                 let mut ctx = MutationContext::new(MutationOp::Update);
                                 let mut __autumn_commit_hook_discriminator: ::core::option::Option<::std::string::String> =
@@ -4643,7 +4678,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     use ::autumn_web::repository::{AutumnLockVersionModelExt as _, AutumnLockVersionUpdateExt as _};
 
                     let mut conn = self.__autumn_acquire_conn().await?;
-                    let (record, mut ctx) = ::autumn_web::__private::scoped_transaction::<(#model_name, MutationContext), ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
+                    let (record, mut ctx) = ::autumn_web::__private::scoped_immediate_transaction::<(#model_name, MutationContext), ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                             async move {
                                 let mut ctx = MutationContext::new(MutationOp::Update);
                                 let (record, __vh_before): (#model_name, #model_name) = if let ::core::option::Option::Some(expected_version) =
@@ -4731,7 +4766,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     use ::autumn_web::repository::{AutumnLockVersionModelExt as _, AutumnLockVersionUpdateExt as _};
 
                     let mut conn = self.__autumn_acquire_conn().await?;
-                    let (record, mut ctx) = ::autumn_web::__private::scoped_transaction::<(#model_name, MutationContext), ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
+                    let (record, mut ctx) = ::autumn_web::__private::scoped_immediate_transaction::<(#model_name, MutationContext), ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                             async move {
                                 let mut ctx = MutationContext::new(MutationOp::Update);
                                 let record: #model_name = if let ::core::option::Option::Some(expected_version) =
@@ -4879,7 +4914,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     #tenant_id_setup
                     Self::__autumn_register_repository_commit_hooks();
                     let mut conn = self.__autumn_acquire_conn().await?;
-                    ::autumn_web::__private::scoped_transaction::<(), ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
+                    ::autumn_web::__private::scoped_immediate_transaction::<(), ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                             async move {
                                 let mut ctx = MutationContext::new(MutationOp::Delete);
                                 let mut __autumn_commit_hook_discriminator: ::core::option::Option<::std::string::String> =
@@ -4943,7 +4978,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
                     #tenant_id_setup
                     let mut conn = self.__autumn_acquire_conn().await?;
-                    ::autumn_web::__private::scoped_transaction::<(), ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
+                    ::autumn_web::__private::scoped_immediate_transaction::<(), ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                             async move {
                                 let mut ctx = MutationContext::new(MutationOp::Delete);
 
@@ -4985,7 +5020,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
                 Self::__autumn_register_repository_commit_hooks();
                 let mut conn = self.__autumn_acquire_conn().await?;
-                ::autumn_web::__private::scoped_transaction::<(), ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
+                ::autumn_web::__private::scoped_immediate_transaction::<(), ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                         async move {
                             let mut ctx = MutationContext::new(MutationOp::Delete);
                             let mut __autumn_commit_hook_discriminator: ::core::option::Option<::std::string::String> =
@@ -5051,7 +5086,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 use ::autumn_web::hooks::{MutationContext, MutationOp, MutationHooks};
 
                 let mut conn = self.__autumn_acquire_conn().await?;
-                ::autumn_web::__private::scoped_transaction::<(), ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
+                ::autumn_web::__private::scoped_immediate_transaction::<(), ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                         async move {
                             let mut ctx = MutationContext::new(MutationOp::Delete);
 
@@ -5087,7 +5122,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 use ::autumn_web::hooks::{MutationContext, MutationOp, MutationHooks};
 
                 let mut conn = self.__autumn_acquire_conn().await?;
-                ::autumn_web::__private::scoped_transaction::<(), ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
+                ::autumn_web::__private::scoped_immediate_transaction::<(), ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                         async move {
                             let mut ctx = MutationContext::new(MutationOp::Delete);
 
@@ -7204,7 +7239,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     ::core::option::Option::Some(t)
                 };
                 let mut conn = self.__autumn_acquire_conn().await?;
-                ::autumn_web::__private::scoped_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
+                ::autumn_web::__private::scoped_immediate_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                     async move {
                         let load_query = #table_ident::table.find(id);
                         let current = if let ::core::option::Option::Some(expected_version) =
@@ -7289,7 +7324,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     use ::autumn_web::reexports::diesel_async::AsyncConnection;
                     use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
 
-                    ::autumn_web::__private::scoped_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
+                    ::autumn_web::__private::scoped_immediate_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                         async move {
                             // SELECT FOR UPDATE grabs an exclusive row lock so
                             // no concurrent writer can commit between our
@@ -7383,7 +7418,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 use ::autumn_web::repository::{AutumnLockVersionModelExt as _, AutumnLockVersionUpdateExt as _};
                 let mut conn = self.__autumn_acquire_conn().await?;
 
-                ::autumn_web::__private::scoped_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
+                ::autumn_web::__private::scoped_immediate_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                     async move {
                         let load_query = #table_ident::table.find(id);
                         let current = if let ::core::option::Option::Some(expected_version) =
@@ -7445,7 +7480,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     use ::autumn_web::reexports::diesel_async::AsyncConnection;
                     use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
 
-                    ::autumn_web::__private::scoped_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
+                    ::autumn_web::__private::scoped_immediate_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                         async move {
                             let load_query = #table_ident::table.find(id);
                             let current = ::autumn_web::maybe_for_update!(load_query).first::<#model_name>(conn).await
@@ -7522,7 +7557,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     #tenant_id_setup
                     let __now = ::autumn_web::reexports::chrono::Utc::now().naive_utc();
                     let mut conn = self.__autumn_acquire_conn().await?;
-                    ::autumn_web::__private::scoped_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| async move {
+                    ::autumn_web::__private::scoped_immediate_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| async move {
                         let load_query = #table_ident::table.find(id).filter(#table_ident::deleted_at.is_null());
                         let record = if let ::core::option::Option::Some(ref t) = tenant_id {
                             ::autumn_web::maybe_for_update!(load_query.filter(#table_ident::tenant_id.eq(t))).first::<#model_name>(conn).await
@@ -7601,7 +7636,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
                     #tenant_id_setup
                     let mut conn = self.__autumn_acquire_conn().await?;
-                    ::autumn_web::__private::scoped_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| async move {
+                    ::autumn_web::__private::scoped_immediate_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| async move {
                         let load_query = #table_ident::table.find(id);
                         let record = if let ::core::option::Option::Some(ref t) = tenant_id {
                             ::autumn_web::maybe_for_update!(load_query.filter(#table_ident::tenant_id.eq(t))).first::<#model_name>(conn).await
@@ -7677,7 +7712,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
                     let __now = ::autumn_web::reexports::chrono::Utc::now().naive_utc();
                     let mut conn = self.__autumn_acquire_conn().await?;
-                    ::autumn_web::__private::scoped_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| async move {
+                    ::autumn_web::__private::scoped_immediate_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| async move {
                         let record = ::autumn_web::maybe_for_update!(#table_ident::table.find(id)
                             .filter(#table_ident::deleted_at.is_null()))
 
@@ -7741,7 +7776,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 use ::autumn_web::reexports::diesel_async::AsyncConnection;
                 use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
                 let mut conn = self.__autumn_acquire_conn().await?;
-                ::autumn_web::__private::scoped_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| async move {
+                ::autumn_web::__private::scoped_immediate_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| async move {
                     let record = ::autumn_web::maybe_for_update!(#table_ident::table.find(id))
 
                         .first::<#model_name>(conn)
@@ -9439,7 +9474,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     // (#1369). Accumulated inside the tx and returned on commit, so a
                     // rollback drops them and no spurious client deletes are published.
                     let __autumn_dep_broadcasts: ::std::vec::Vec<(::std::string::String, ::std::string::String)> =
-                        ::autumn_web::__private::scoped_transaction::<
+                        ::autumn_web::__private::scoped_immediate_transaction::<
                             ::std::vec::Vec<(::std::string::String, ::std::string::String)>,
                             ::autumn_web::AutumnError, _, _,
                         >(
@@ -11539,7 +11574,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     Self::__autumn_register_repository_commit_hooks();
                     let mut conn = self.__autumn_acquire_conn().await?;
                     let __outcome: ::core::option::Option<(#model_name, MutationContext, ::std::string::String, ::std::string::String, ::autumn_web::reexports::serde_json::Value)> =
-                        ::autumn_web::__private::scoped_transaction::<::core::option::Option<(#model_name, MutationContext, ::std::string::String, ::std::string::String, ::autumn_web::reexports::serde_json::Value)>, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
+                        ::autumn_web::__private::scoped_immediate_transaction::<::core::option::Option<(#model_name, MutationContext, ::std::string::String, ::std::string::String, ::autumn_web::reexports::serde_json::Value)>, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                             async move {
                                 let mut input = new.clone();
                                 let mut ctx = MutationContext::new(MutationOp::Create);
@@ -11592,7 +11627,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     #foc_tenant_id_let
                     let mut conn = self.__autumn_acquire_conn().await?;
                     let __outcome: ::core::option::Option<(#model_name, MutationContext)> =
-                        ::autumn_web::__private::scoped_transaction::<::core::option::Option<(#model_name, MutationContext)>, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
+                        ::autumn_web::__private::scoped_immediate_transaction::<::core::option::Option<(#model_name, MutationContext)>, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                             async move {
                                 let mut input = new.clone();
                                 let mut ctx = MutationContext::new(MutationOp::Create);
@@ -11625,7 +11660,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     #foc_tenant_id_let
                     let mut conn = self.__autumn_acquire_conn().await?;
                     let __inserted: ::core::option::Option<#model_name> =
-                        ::autumn_web::__private::scoped_transaction::<::core::option::Option<#model_name>, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
+                        ::autumn_web::__private::scoped_immediate_transaction::<::core::option::Option<#model_name>, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                             async move {
                                 let __rec_opt: ::core::option::Option<#model_name> = #insert_new_txconn;
                                 if let ::core::option::Option::Some(ref __record) = __rec_opt {
@@ -13702,6 +13737,34 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
         };
 
+        // #1996 SQLite full-text-search fallback. Postgres uses tsvector ranked
+        // search (`websearch_to_tsquery`/`ts_rank_cd`); SQLite has no tsvector, so
+        // the `backend_select!` sqlite arm below matches each `SEARCH_FIELDS`
+        // column with a case-insensitive `lower(col) LIKE '%term%'` substring test,
+        // ORed together, ordered `id DESC` (unranked — FTS5 ranking is deferred to
+        // #1910). This fragment builds the shared `__autumn_like_where` OR-clause
+        // (positional `$1` pattern, reused across every column — SQLite collapses a
+        // repeated `$1` to one bind) and the `__autumn_pattern` search term with
+        // LIKE metacharacters (`\`, `%`, `_`) escaped so they match literally and a
+        // query can never become a match-everything wildcard. It is spliced into
+        // each sqlite arm (never the pg arm), so the pattern/where are only built
+        // where they are used.
+        let sqlite_like_setup = quote! {
+            let mut __autumn_like_clauses: ::std::vec::Vec<::std::string::String> = ::std::vec::Vec::new();
+            for (__autumn_field, _) in <#model_name as ::autumn_web::repository::AutumnSearchableModel>::SEARCH_FIELDS {
+                __autumn_like_clauses.push(::std::format!("lower(\"{__autumn_field}\") LIKE $1 ESCAPE '\\'"));
+            }
+            let __autumn_like_where = __autumn_like_clauses.join(" OR ");
+            let mut __autumn_escaped = ::std::string::String::new();
+            for __autumn_ch in query.to_lowercase().chars() {
+                if ::core::matches!(__autumn_ch, '\\' | '%' | '_') {
+                    __autumn_escaped.push('\\');
+                }
+                __autumn_escaped.push(__autumn_ch);
+            }
+            let __autumn_pattern = ::std::format!("%{__autumn_escaped}%");
+        };
+
         // §1d: under across_tenants on a sharded repo the `Vec`-returning
         // `search` fans out across every shard and concatenates results (ranking
         // is per-shard; the merged order is the per-shard ranking concatenated).
@@ -13758,41 +13821,81 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
                 #tenant_id_setup
                 let mut conn = self.__autumn_acquire_read_conn().await?;
-                let language = <#model_name as ::autumn_web::repository::AutumnSearchableModel>::SEARCH_LANGUAGE;
 
-                let mut sql = format!(
-                    "SELECT id FROM \"{}\" WHERE search_vector @@ websearch_to_tsquery($1::regconfig, $2)",
-                    #table_name
-                );
-                if #config_soft_delete {
-                    sql.push_str(" AND deleted_at IS NULL");
-                }
-                if let ::core::option::Option::Some(ref _t) = tenant_id {
-                    sql.push_str(" AND tenant_id = $3");
-                }
-                sql.push_str(" ORDER BY ts_rank_cd(search_vector, websearch_to_tsquery($1::regconfig, $2)) DESC, id DESC");
+                let ids = ::autumn_web::backend_select! {
+                    pg => {{
+                        let language = <#model_name as ::autumn_web::repository::AutumnSearchableModel>::SEARCH_LANGUAGE;
 
-                let ids = if #config_tenant_scoped {
-                    if let ::core::option::Option::Some(ref t) = tenant_id {
-                        ::autumn_web::reexports::diesel::sql_query(sql)
-                            .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(language)
-                            .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(query)
-                            .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(t)
-                            .load::<SearchId>(&mut conn)
-                            .await?
-                    } else {
-                        ::autumn_web::reexports::diesel::sql_query(sql)
-                            .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(language)
-                            .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(query)
-                            .load::<SearchId>(&mut conn)
-                            .await?
-                    }
-                } else {
-                    ::autumn_web::reexports::diesel::sql_query(sql)
-                        .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(language)
-                        .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(query)
-                        .load::<SearchId>(&mut conn)
-                        .await?
+                        let mut sql = format!(
+                            "SELECT id FROM \"{}\" WHERE search_vector @@ websearch_to_tsquery($1::regconfig, $2)",
+                            #table_name
+                        );
+                        if #config_soft_delete {
+                            sql.push_str(" AND deleted_at IS NULL");
+                        }
+                        if let ::core::option::Option::Some(ref _t) = tenant_id {
+                            sql.push_str(" AND tenant_id = $3");
+                        }
+                        sql.push_str(" ORDER BY ts_rank_cd(search_vector, websearch_to_tsquery($1::regconfig, $2)) DESC, id DESC");
+
+                        if #config_tenant_scoped {
+                            if let ::core::option::Option::Some(ref t) = tenant_id {
+                                ::autumn_web::reexports::diesel::sql_query(sql)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(language)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(query)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(t)
+                                    .load::<SearchId>(&mut conn)
+                                    .await?
+                            } else {
+                                ::autumn_web::reexports::diesel::sql_query(sql)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(language)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(query)
+                                    .load::<SearchId>(&mut conn)
+                                    .await?
+                            }
+                        } else {
+                            ::autumn_web::reexports::diesel::sql_query(sql)
+                                .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(language)
+                                .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(query)
+                                .load::<SearchId>(&mut conn)
+                                .await?
+                        }
+                    }},
+                    sqlite => {{
+                        #sqlite_like_setup
+
+                        let mut sql = ::std::format!(
+                            "SELECT id FROM \"{}\" WHERE ({})",
+                            #table_name, __autumn_like_where
+                        );
+                        if #config_soft_delete {
+                            sql.push_str(" AND deleted_at IS NULL");
+                        }
+                        if let ::core::option::Option::Some(ref _t) = tenant_id {
+                            sql.push_str(" AND tenant_id = $2");
+                        }
+                        sql.push_str(" ORDER BY id DESC");
+
+                        if #config_tenant_scoped {
+                            if let ::core::option::Option::Some(ref t) = tenant_id {
+                                ::autumn_web::reexports::diesel::sql_query(sql)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__autumn_pattern)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(t)
+                                    .load::<SearchId>(&mut conn)
+                                    .await?
+                            } else {
+                                ::autumn_web::reexports::diesel::sql_query(sql)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__autumn_pattern)
+                                    .load::<SearchId>(&mut conn)
+                                    .await?
+                            }
+                        } else {
+                            ::autumn_web::reexports::diesel::sql_query(sql)
+                                .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__autumn_pattern)
+                                .load::<SearchId>(&mut conn)
+                                .await?
+                        }
+                    }},
                 };
 
                 let id_list: Vec<i64> = ids.into_iter().map(|s| s.id).collect();
@@ -13874,90 +13977,179 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
                 #tenant_id_setup
                 let mut conn = self.__autumn_acquire_read_conn().await?;
-                let language = <#model_name as ::autumn_web::repository::AutumnSearchableModel>::SEARCH_LANGUAGE;
                 let limit = req.limit();
                 let offset = req.offset();
 
-                let mut count_sql = format!(
-                    "SELECT COUNT(*) AS count FROM \"{}\" WHERE search_vector @@ websearch_to_tsquery($1::regconfig, $2)",
-                    #table_name
-                );
-                if #config_soft_delete {
-                    count_sql.push_str(" AND deleted_at IS NULL");
-                }
-                if let ::core::option::Option::Some(ref _t) = tenant_id {
-                    count_sql.push_str(" AND tenant_id = $3");
-                }
+                let total = ::autumn_web::backend_select! {
+                    pg => {{
+                        let language = <#model_name as ::autumn_web::repository::AutumnSearchableModel>::SEARCH_LANGUAGE;
+                        let mut count_sql = format!(
+                            "SELECT COUNT(*) AS count FROM \"{}\" WHERE search_vector @@ websearch_to_tsquery($1::regconfig, $2)",
+                            #table_name
+                        );
+                        if #config_soft_delete {
+                            count_sql.push_str(" AND deleted_at IS NULL");
+                        }
+                        if let ::core::option::Option::Some(ref _t) = tenant_id {
+                            count_sql.push_str(" AND tenant_id = $3");
+                        }
 
-                let total = if #config_tenant_scoped {
-                    if let ::core::option::Option::Some(ref t) = tenant_id {
-                        ::autumn_web::reexports::diesel::sql_query(count_sql)
-                            .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(language)
-                            .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(query)
-                            .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(t)
-                            .get_result::<SearchCount>(&mut conn)
-                            .await?
-                            .count
-                    } else {
-                        ::autumn_web::reexports::diesel::sql_query(count_sql)
-                            .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(language)
-                            .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(query)
-                            .get_result::<SearchCount>(&mut conn)
-                            .await?
-                            .count
-                    }
-                } else {
-                    ::autumn_web::reexports::diesel::sql_query(count_sql)
-                        .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(language)
-                        .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(query)
-                        .get_result::<SearchCount>(&mut conn)
-                        .await?
-                        .count
+                        if #config_tenant_scoped {
+                            if let ::core::option::Option::Some(ref t) = tenant_id {
+                                ::autumn_web::reexports::diesel::sql_query(count_sql)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(language)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(query)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(t)
+                                    .get_result::<SearchCount>(&mut conn)
+                                    .await?
+                                    .count
+                            } else {
+                                ::autumn_web::reexports::diesel::sql_query(count_sql)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(language)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(query)
+                                    .get_result::<SearchCount>(&mut conn)
+                                    .await?
+                                    .count
+                            }
+                        } else {
+                            ::autumn_web::reexports::diesel::sql_query(count_sql)
+                                .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(language)
+                                .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(query)
+                                .get_result::<SearchCount>(&mut conn)
+                                .await?
+                                .count
+                        }
+                    }},
+                    sqlite => {{
+                        #sqlite_like_setup
+                        let mut count_sql = ::std::format!(
+                            "SELECT COUNT(*) AS count FROM \"{}\" WHERE ({})",
+                            #table_name, __autumn_like_where
+                        );
+                        if #config_soft_delete {
+                            count_sql.push_str(" AND deleted_at IS NULL");
+                        }
+                        if let ::core::option::Option::Some(ref _t) = tenant_id {
+                            count_sql.push_str(" AND tenant_id = $2");
+                        }
+
+                        if #config_tenant_scoped {
+                            if let ::core::option::Option::Some(ref t) = tenant_id {
+                                ::autumn_web::reexports::diesel::sql_query(count_sql)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__autumn_pattern)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(t)
+                                    .get_result::<SearchCount>(&mut conn)
+                                    .await?
+                                    .count
+                            } else {
+                                ::autumn_web::reexports::diesel::sql_query(count_sql)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__autumn_pattern)
+                                    .get_result::<SearchCount>(&mut conn)
+                                    .await?
+                                    .count
+                            }
+                        } else {
+                            ::autumn_web::reexports::diesel::sql_query(count_sql)
+                                .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__autumn_pattern)
+                                .get_result::<SearchCount>(&mut conn)
+                                .await?
+                                .count
+                        }
+                    }},
                 };
 
-                let mut select_sql = format!(
-                    "SELECT id FROM \"{}\" WHERE search_vector @@ websearch_to_tsquery($1::regconfig, $2)",
-                    #table_name
-                );
-                if #config_soft_delete {
-                    select_sql.push_str(" AND deleted_at IS NULL");
-                }
-                if let ::core::option::Option::Some(ref _t) = tenant_id {
-                    select_sql.push_str(" AND tenant_id = $3");
-                    select_sql.push_str(" ORDER BY ts_rank_cd(search_vector, websearch_to_tsquery($1::regconfig, $2)) DESC, id DESC");
-                    select_sql.push_str(" LIMIT $4 OFFSET $5");
-                } else {
-                    select_sql.push_str(" ORDER BY ts_rank_cd(search_vector, websearch_to_tsquery($1::regconfig, $2)) DESC, id DESC");
-                    select_sql.push_str(" LIMIT $3 OFFSET $4");
-                }
+                let ids = ::autumn_web::backend_select! {
+                    pg => {{
+                        let language = <#model_name as ::autumn_web::repository::AutumnSearchableModel>::SEARCH_LANGUAGE;
+                        let mut select_sql = format!(
+                            "SELECT id FROM \"{}\" WHERE search_vector @@ websearch_to_tsquery($1::regconfig, $2)",
+                            #table_name
+                        );
+                        if #config_soft_delete {
+                            select_sql.push_str(" AND deleted_at IS NULL");
+                        }
+                        if let ::core::option::Option::Some(ref _t) = tenant_id {
+                            select_sql.push_str(" AND tenant_id = $3");
+                            select_sql.push_str(" ORDER BY ts_rank_cd(search_vector, websearch_to_tsquery($1::regconfig, $2)) DESC, id DESC");
+                            select_sql.push_str(" LIMIT $4 OFFSET $5");
+                        } else {
+                            select_sql.push_str(" ORDER BY ts_rank_cd(search_vector, websearch_to_tsquery($1::regconfig, $2)) DESC, id DESC");
+                            select_sql.push_str(" LIMIT $3 OFFSET $4");
+                        }
 
-                let ids = if #config_tenant_scoped {
-                    if let ::core::option::Option::Some(ref t) = tenant_id {
-                        ::autumn_web::reexports::diesel::sql_query(select_sql)
-                            .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(language)
-                            .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(query)
-                            .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(t)
-                            .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(limit)
-                            .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(offset)
-                            .load::<SearchId>(&mut conn)
-                            .await?
-                    } else {
-                        ::autumn_web::reexports::diesel::sql_query(select_sql)
-                            .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(language)
-                            .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(query)
-                            .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(limit)
-                            .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(offset)
-                            .load::<SearchId>(&mut conn)
-                            .await?
-                    }
-                } else {
-                    ::autumn_web::reexports::diesel::sql_query(select_sql)
-                        .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(language)
-                        .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(query)
-                        .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(limit)
-                        .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(offset)
-                        .load::<SearchId>(&mut conn)
-                        .await?
+                        if #config_tenant_scoped {
+                            if let ::core::option::Option::Some(ref t) = tenant_id {
+                                ::autumn_web::reexports::diesel::sql_query(select_sql)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(language)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(query)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(t)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(limit)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(offset)
+                                    .load::<SearchId>(&mut conn)
+                                    .await?
+                            } else {
+                                ::autumn_web::reexports::diesel::sql_query(select_sql)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(language)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(query)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(limit)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(offset)
+                                    .load::<SearchId>(&mut conn)
+                                    .await?
+                            }
+                        } else {
+                            ::autumn_web::reexports::diesel::sql_query(select_sql)
+                                .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(language)
+                                .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(query)
+                                .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(limit)
+                                .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(offset)
+                                .load::<SearchId>(&mut conn)
+                                .await?
+                        }
+                    }},
+                    sqlite => {{
+                        #sqlite_like_setup
+                        let mut select_sql = ::std::format!(
+                            "SELECT id FROM \"{}\" WHERE ({})",
+                            #table_name, __autumn_like_where
+                        );
+                        if #config_soft_delete {
+                            select_sql.push_str(" AND deleted_at IS NULL");
+                        }
+                        if let ::core::option::Option::Some(ref _t) = tenant_id {
+                            select_sql.push_str(" AND tenant_id = $2");
+                            select_sql.push_str(" ORDER BY id DESC");
+                            select_sql.push_str(" LIMIT $3 OFFSET $4");
+                        } else {
+                            select_sql.push_str(" ORDER BY id DESC");
+                            select_sql.push_str(" LIMIT $2 OFFSET $3");
+                        }
+
+                        if #config_tenant_scoped {
+                            if let ::core::option::Option::Some(ref t) = tenant_id {
+                                ::autumn_web::reexports::diesel::sql_query(select_sql)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__autumn_pattern)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(t)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(limit)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(offset)
+                                    .load::<SearchId>(&mut conn)
+                                    .await?
+                            } else {
+                                ::autumn_web::reexports::diesel::sql_query(select_sql)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__autumn_pattern)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(limit)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(offset)
+                                    .load::<SearchId>(&mut conn)
+                                    .await?
+                            }
+                        } else {
+                            ::autumn_web::reexports::diesel::sql_query(select_sql)
+                                .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__autumn_pattern)
+                                .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(limit)
+                                .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(offset)
+                                .load::<SearchId>(&mut conn)
+                                .await?
+                        }
+                    }},
                 };
 
                 let id_list: Vec<i64> = ids.into_iter().map(|s| s.id).collect();
@@ -14019,6 +14211,14 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         let owner_and_p3 = format!(" AND {owner_col_name} = $3");
         let owner_and_p4 = format!(" AND {owner_col_name} = $4");
 
+        // #1996 SQLite owner clause literals. The sqlite arm renumbers positional
+        // slots from `$1` (the LIKE pattern replaces Postgres's `$1`/`$2`
+        // language+query pair), so the owner filter lands on `$2` (no tenant) or
+        // `$3` (tenant occupies `$2`). Same trusted developer-declared identifier
+        // as the pg literals — never request input.
+        let owner_sqlite_p2 = format!(" AND \"{owner_col_name}\" = $2");
+        let owner_sqlite_p3 = format!(" AND \"{owner_col_name}\" = $3");
+
         let tenant_id_setup = if config.tenant_scoped {
             quote! {
                 let tenant_id = if self.across_tenants {
@@ -14033,6 +14233,25 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             quote! {
                 let tenant_id = ::core::option::Option::None::<::std::string::String>;
             }
+        };
+        // #1996 SQLite LIKE-substring fallback for the owner-scoped search (see the
+        // sibling `sqlite_like_setup` in the unscoped searchable block for the full
+        // rationale). Recomputed locally here because the scoped block is a separate
+        // `if let` and cannot see the unscoped block's binding.
+        let sqlite_like_setup = quote! {
+            let mut __autumn_like_clauses: ::std::vec::Vec<::std::string::String> = ::std::vec::Vec::new();
+            for (__autumn_field, _) in <#model_name as ::autumn_web::repository::AutumnSearchableModel>::SEARCH_FIELDS {
+                __autumn_like_clauses.push(::std::format!("lower(\"{__autumn_field}\") LIKE $1 ESCAPE '\\'"));
+            }
+            let __autumn_like_where = __autumn_like_clauses.join(" OR ");
+            let mut __autumn_escaped = ::std::string::String::new();
+            for __autumn_ch in query.to_lowercase().chars() {
+                if ::core::matches!(__autumn_ch, '\\' | '%' | '_') {
+                    __autumn_escaped.push('\\');
+                }
+                __autumn_escaped.push(__autumn_ch);
+            }
+            let __autumn_pattern = ::std::format!("%{__autumn_escaped}%");
         };
         let search_page_cross_shard_guard = if config.sharded && config.tenant_scoped {
             quote! {
@@ -14097,113 +14316,223 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
                 #tenant_id_setup
                 let mut conn = self.__autumn_acquire_read_conn().await?;
-                let language = <#model_name as ::autumn_web::repository::AutumnSearchableModel>::SEARCH_LANGUAGE;
                 let limit = req.limit();
                 let offset = req.offset();
 
                 // ── COUNT (owner-filtered) ──
-                let mut count_sql = format!(
-                    "SELECT COUNT(*) AS count FROM \"{}\" WHERE search_vector @@ websearch_to_tsquery($1::regconfig, $2)",
-                    #table_name
-                );
-                if #config_soft_delete {
-                    count_sql.push_str(" AND deleted_at IS NULL");
-                }
-                if #config_tenant_scoped {
-                    if let ::core::option::Option::Some(ref _t) = tenant_id {
-                        count_sql.push_str(" AND tenant_id = $3");
-                        count_sql.push_str(#owner_and_p4);
-                    } else {
-                        count_sql.push_str(#owner_and_p3);
-                    }
-                } else {
-                    count_sql.push_str(#owner_and_p3);
-                }
+                let total = ::autumn_web::backend_select! {
+                    pg => {{
+                        let language = <#model_name as ::autumn_web::repository::AutumnSearchableModel>::SEARCH_LANGUAGE;
+                        let mut count_sql = format!(
+                            "SELECT COUNT(*) AS count FROM \"{}\" WHERE search_vector @@ websearch_to_tsquery($1::regconfig, $2)",
+                            #table_name
+                        );
+                        if #config_soft_delete {
+                            count_sql.push_str(" AND deleted_at IS NULL");
+                        }
+                        if #config_tenant_scoped {
+                            if let ::core::option::Option::Some(ref _t) = tenant_id {
+                                count_sql.push_str(" AND tenant_id = $3");
+                                count_sql.push_str(#owner_and_p4);
+                            } else {
+                                count_sql.push_str(#owner_and_p3);
+                            }
+                        } else {
+                            count_sql.push_str(#owner_and_p3);
+                        }
 
-                let total = if #config_tenant_scoped {
-                    if let ::core::option::Option::Some(ref t) = tenant_id {
-                        ::autumn_web::reexports::diesel::sql_query(count_sql)
-                            .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(language)
-                            .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(query)
-                            .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(t)
-                            .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(owner_id)
-                            .get_result::<SearchCount>(&mut conn)
-                            .await?
-                            .count
-                    } else {
-                        ::autumn_web::reexports::diesel::sql_query(count_sql)
-                            .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(language)
-                            .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(query)
-                            .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(owner_id)
-                            .get_result::<SearchCount>(&mut conn)
-                            .await?
-                            .count
-                    }
-                } else {
-                    ::autumn_web::reexports::diesel::sql_query(count_sql)
-                        .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(language)
-                        .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(query)
-                        .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(owner_id)
-                        .get_result::<SearchCount>(&mut conn)
-                        .await?
-                        .count
+                        if #config_tenant_scoped {
+                            if let ::core::option::Option::Some(ref t) = tenant_id {
+                                ::autumn_web::reexports::diesel::sql_query(count_sql)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(language)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(query)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(t)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(owner_id)
+                                    .get_result::<SearchCount>(&mut conn)
+                                    .await?
+                                    .count
+                            } else {
+                                ::autumn_web::reexports::diesel::sql_query(count_sql)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(language)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(query)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(owner_id)
+                                    .get_result::<SearchCount>(&mut conn)
+                                    .await?
+                                    .count
+                            }
+                        } else {
+                            ::autumn_web::reexports::diesel::sql_query(count_sql)
+                                .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(language)
+                                .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(query)
+                                .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(owner_id)
+                                .get_result::<SearchCount>(&mut conn)
+                                .await?
+                                .count
+                        }
+                    }},
+                    sqlite => {{
+                        #sqlite_like_setup
+                        let mut count_sql = ::std::format!(
+                            "SELECT COUNT(*) AS count FROM \"{}\" WHERE ({})",
+                            #table_name, __autumn_like_where
+                        );
+                        if #config_soft_delete {
+                            count_sql.push_str(" AND deleted_at IS NULL");
+                        }
+                        if #config_tenant_scoped {
+                            if let ::core::option::Option::Some(ref _t) = tenant_id {
+                                count_sql.push_str(" AND tenant_id = $2");
+                                count_sql.push_str(#owner_sqlite_p3);
+                            } else {
+                                count_sql.push_str(#owner_sqlite_p2);
+                            }
+                        } else {
+                            count_sql.push_str(#owner_sqlite_p2);
+                        }
+
+                        if #config_tenant_scoped {
+                            if let ::core::option::Option::Some(ref t) = tenant_id {
+                                ::autumn_web::reexports::diesel::sql_query(count_sql)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__autumn_pattern)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(t)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(owner_id)
+                                    .get_result::<SearchCount>(&mut conn)
+                                    .await?
+                                    .count
+                            } else {
+                                ::autumn_web::reexports::diesel::sql_query(count_sql)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__autumn_pattern)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(owner_id)
+                                    .get_result::<SearchCount>(&mut conn)
+                                    .await?
+                                    .count
+                            }
+                        } else {
+                            ::autumn_web::reexports::diesel::sql_query(count_sql)
+                                .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__autumn_pattern)
+                                .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(owner_id)
+                                .get_result::<SearchCount>(&mut conn)
+                                .await?
+                                .count
+                        }
+                    }},
                 };
 
                 // ── ranked id SELECT (owner-filtered) ──
-                let mut select_sql = format!(
-                    "SELECT id FROM \"{}\" WHERE search_vector @@ websearch_to_tsquery($1::regconfig, $2)",
-                    #table_name
-                );
-                if #config_soft_delete {
-                    select_sql.push_str(" AND deleted_at IS NULL");
-                }
-                if #config_tenant_scoped {
-                    if let ::core::option::Option::Some(ref _t) = tenant_id {
-                        select_sql.push_str(" AND tenant_id = $3");
-                        select_sql.push_str(#owner_and_p4);
-                        select_sql.push_str(" ORDER BY ts_rank_cd(search_vector, websearch_to_tsquery($1::regconfig, $2)) DESC, id DESC");
-                        select_sql.push_str(" LIMIT $5 OFFSET $6");
-                    } else {
-                        select_sql.push_str(#owner_and_p3);
-                        select_sql.push_str(" ORDER BY ts_rank_cd(search_vector, websearch_to_tsquery($1::regconfig, $2)) DESC, id DESC");
-                        select_sql.push_str(" LIMIT $4 OFFSET $5");
-                    }
-                } else {
-                    select_sql.push_str(#owner_and_p3);
-                    select_sql.push_str(" ORDER BY ts_rank_cd(search_vector, websearch_to_tsquery($1::regconfig, $2)) DESC, id DESC");
-                    select_sql.push_str(" LIMIT $4 OFFSET $5");
-                }
+                let ids = ::autumn_web::backend_select! {
+                    pg => {{
+                        let language = <#model_name as ::autumn_web::repository::AutumnSearchableModel>::SEARCH_LANGUAGE;
+                        let mut select_sql = format!(
+                            "SELECT id FROM \"{}\" WHERE search_vector @@ websearch_to_tsquery($1::regconfig, $2)",
+                            #table_name
+                        );
+                        if #config_soft_delete {
+                            select_sql.push_str(" AND deleted_at IS NULL");
+                        }
+                        if #config_tenant_scoped {
+                            if let ::core::option::Option::Some(ref _t) = tenant_id {
+                                select_sql.push_str(" AND tenant_id = $3");
+                                select_sql.push_str(#owner_and_p4);
+                                select_sql.push_str(" ORDER BY ts_rank_cd(search_vector, websearch_to_tsquery($1::regconfig, $2)) DESC, id DESC");
+                                select_sql.push_str(" LIMIT $5 OFFSET $6");
+                            } else {
+                                select_sql.push_str(#owner_and_p3);
+                                select_sql.push_str(" ORDER BY ts_rank_cd(search_vector, websearch_to_tsquery($1::regconfig, $2)) DESC, id DESC");
+                                select_sql.push_str(" LIMIT $4 OFFSET $5");
+                            }
+                        } else {
+                            select_sql.push_str(#owner_and_p3);
+                            select_sql.push_str(" ORDER BY ts_rank_cd(search_vector, websearch_to_tsquery($1::regconfig, $2)) DESC, id DESC");
+                            select_sql.push_str(" LIMIT $4 OFFSET $5");
+                        }
 
-                let ids = if #config_tenant_scoped {
-                    if let ::core::option::Option::Some(ref t) = tenant_id {
-                        ::autumn_web::reexports::diesel::sql_query(select_sql)
-                            .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(language)
-                            .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(query)
-                            .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(t)
-                            .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(owner_id)
-                            .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(limit)
-                            .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(offset)
-                            .load::<SearchId>(&mut conn)
-                            .await?
-                    } else {
-                        ::autumn_web::reexports::diesel::sql_query(select_sql)
-                            .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(language)
-                            .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(query)
-                            .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(owner_id)
-                            .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(limit)
-                            .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(offset)
-                            .load::<SearchId>(&mut conn)
-                            .await?
-                    }
-                } else {
-                    ::autumn_web::reexports::diesel::sql_query(select_sql)
-                        .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(language)
-                        .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(query)
-                        .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(owner_id)
-                        .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(limit)
-                        .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(offset)
-                        .load::<SearchId>(&mut conn)
-                        .await?
+                        if #config_tenant_scoped {
+                            if let ::core::option::Option::Some(ref t) = tenant_id {
+                                ::autumn_web::reexports::diesel::sql_query(select_sql)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(language)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(query)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(t)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(owner_id)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(limit)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(offset)
+                                    .load::<SearchId>(&mut conn)
+                                    .await?
+                            } else {
+                                ::autumn_web::reexports::diesel::sql_query(select_sql)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(language)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(query)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(owner_id)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(limit)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(offset)
+                                    .load::<SearchId>(&mut conn)
+                                    .await?
+                            }
+                        } else {
+                            ::autumn_web::reexports::diesel::sql_query(select_sql)
+                                .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(language)
+                                .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(query)
+                                .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(owner_id)
+                                .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(limit)
+                                .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(offset)
+                                .load::<SearchId>(&mut conn)
+                                .await?
+                        }
+                    }},
+                    sqlite => {{
+                        #sqlite_like_setup
+                        let mut select_sql = ::std::format!(
+                            "SELECT id FROM \"{}\" WHERE ({})",
+                            #table_name, __autumn_like_where
+                        );
+                        if #config_soft_delete {
+                            select_sql.push_str(" AND deleted_at IS NULL");
+                        }
+                        if #config_tenant_scoped {
+                            if let ::core::option::Option::Some(ref _t) = tenant_id {
+                                select_sql.push_str(" AND tenant_id = $2");
+                                select_sql.push_str(#owner_sqlite_p3);
+                                select_sql.push_str(" ORDER BY id DESC");
+                                select_sql.push_str(" LIMIT $4 OFFSET $5");
+                            } else {
+                                select_sql.push_str(#owner_sqlite_p2);
+                                select_sql.push_str(" ORDER BY id DESC");
+                                select_sql.push_str(" LIMIT $3 OFFSET $4");
+                            }
+                        } else {
+                            select_sql.push_str(#owner_sqlite_p2);
+                            select_sql.push_str(" ORDER BY id DESC");
+                            select_sql.push_str(" LIMIT $3 OFFSET $4");
+                        }
+
+                        if #config_tenant_scoped {
+                            if let ::core::option::Option::Some(ref t) = tenant_id {
+                                ::autumn_web::reexports::diesel::sql_query(select_sql)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__autumn_pattern)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(t)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(owner_id)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(limit)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(offset)
+                                    .load::<SearchId>(&mut conn)
+                                    .await?
+                            } else {
+                                ::autumn_web::reexports::diesel::sql_query(select_sql)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__autumn_pattern)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(owner_id)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(limit)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(offset)
+                                    .load::<SearchId>(&mut conn)
+                                    .await?
+                            }
+                        } else {
+                            ::autumn_web::reexports::diesel::sql_query(select_sql)
+                                .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__autumn_pattern)
+                                .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(owner_id)
+                                .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(limit)
+                                .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(offset)
+                                .load::<SearchId>(&mut conn)
+                                .await?
+                        }
+                    }},
                 };
 
                 let id_list: Vec<i64> = ids.into_iter().map(|s| s.id).collect();
@@ -14349,6 +14678,51 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         quote! {}
     };
 
+    // #1996: version-history read fork. The Postgres and SQLite arms differ in
+    // three ways that must be forked through `backend_select!` (each arm names
+    // its own diesel types / SQL so the unselected arm is never type-checked):
+    //   1. the `recorded_at` column type — Postgres `Timestamptz` has no
+    //      `FromSql<_, Sqlite>`; SQLite must use `TimestamptzSqlite`;
+    //   2. the raw SQL casts — `COUNT(*)::bigint`, `$n::text`, `$n::timestamptz`
+    //      and `changes::text` are Postgres-only and SQLite rejects them;
+    //   3. the timestamp-filter bind types (`Nullable<Timestamptz>` vs
+    //      `Nullable<TimestamptzSqlite>`).
+    // The count row struct and the row→`VersionEntry` mapping are backend-agnostic
+    // (the SQLite `recorded_at` still deserializes into `DateTime<Utc>`), so they
+    // are built once here and spliced into both arms.
+    let vh_count_struct = quote! {
+        #[derive(::autumn_web::reexports::diesel::QueryableByName)]
+        struct __AutumnVersionHistoryCount {
+            #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::BigInt)]
+            count: i64,
+        }
+    };
+    let vh_map_rows = quote! {
+        raw_rows
+            .into_iter()
+            .map(|row| {
+                let op = match row.op.as_str() {
+                    "insert" => ::autumn_web::version_history::VersionOp::Insert,
+                    "delete" => ::autumn_web::version_history::VersionOp::Delete,
+                    _ => ::autumn_web::version_history::VersionOp::Update,
+                };
+                let changes: Vec<::autumn_web::version_history::ColumnChange> =
+                    ::autumn_web::reexports::serde_json::from_str(&row.changes)
+                        .unwrap_or_default();
+                ::autumn_web::version_history::VersionEntry {
+                    id: row.id,
+                    table_name: row.table_name,
+                    record_id: row.record_id,
+                    op,
+                    actor: row.actor,
+                    request_id: row.request_id,
+                    changes,
+                    recorded_at: row.recorded_at,
+                }
+            })
+            .collect::<Vec<::autumn_web::version_history::VersionEntry>>()
+    };
+
     let versioned_history_impl = if config.versioned {
         quote! {
             impl #pg_name {
@@ -14374,33 +14748,6 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     // access rather than silently consulting one shard.
                     #version_history_cross_shard_guard
 
-                    // Private helper struct that can be deserialized from a raw SQL row.
-                    #[derive(::autumn_web::reexports::diesel::QueryableByName)]
-                    struct __AutumnVersionHistoryRow {
-                        #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::BigInt)]
-                        id: i64,
-                        #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Text)]
-                        table_name: ::std::string::String,
-                        #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::BigInt)]
-                        record_id: i64,
-                        #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Text)]
-                        op: ::std::string::String,
-                        #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Text)]
-                        actor: ::std::string::String,
-                        #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>)]
-                        request_id: ::core::option::Option<::std::string::String>,
-                        #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Text)]
-                        changes: ::std::string::String,
-                        #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Timestamptz)]
-                        recorded_at: ::autumn_web::reexports::chrono::DateTime<::autumn_web::reexports::chrono::Utc>,
-                    }
-
-                    #[derive(::autumn_web::reexports::diesel::QueryableByName)]
-                    struct __AutumnVersionHistoryCount {
-                        #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::BigInt)]
-                        count: i64,
-                    }
-
                     let __table_name: &str = #table_name;
                     let (limit, offset) = filter.limit_offset();
                     let page = filter.page();
@@ -14409,108 +14756,218 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
                     let mut conn = self.__autumn_acquire_read_conn().await?;
 
-                    // Execute count query, optionally filtered by timestamp range.
-                    let total: u64 = if filter.from.is_some() || filter.to.is_some() {
-                        let rows = ::autumn_web::reexports::diesel::sql_query(
-                            "SELECT COUNT(*)::bigint AS count \
-                             FROM _autumn_version_history \
-                             WHERE table_name = $1 AND record_id = $2 \
-                             AND ($3::text IS NULL OR tenant_id = $3) \
-                             AND ($4::timestamptz IS NULL OR recorded_at >= $4) \
-                             AND ($5::timestamptz IS NULL OR recorded_at <= $5)"
-                        )
-                        .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__table_name)
-                        .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(record_id)
-                        .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>, _>(__version_history_tenant_id)
-                        .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Timestamptz>, _>(filter.from)
-                        .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Timestamptz>, _>(filter.to)
-                        .get_results::<__AutumnVersionHistoryCount>(&mut conn)
-                        .await
-                        .map_err(::autumn_web::AutumnError::from)?;
-                        rows.into_iter().next().map(|r| r.count).unwrap_or(0).max(0) as u64
-                    } else {
-                        let rows = ::autumn_web::reexports::diesel::sql_query(
-                            "SELECT COUNT(*)::bigint AS count \
-                             FROM _autumn_version_history \
-                             WHERE table_name = $1 AND record_id = $2 \
-                             AND ($3::text IS NULL OR tenant_id = $3)"
-                        )
-                        .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__table_name)
-                        .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(record_id)
-                        .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>, _>(__version_history_tenant_id)
-                        .get_results::<__AutumnVersionHistoryCount>(&mut conn)
-                        .await
-                        .map_err(::autumn_web::AutumnError::from)?;
-                        rows.into_iter().next().map(|r| r.count).unwrap_or(0).max(0) as u64
-                    };
+                    // #1996: the whole count + fetch + map is backend-forked. The
+                    // Postgres arm keeps the `::bigint` / `::text` / `::timestamptz`
+                    // / `changes::text` casts and the `Timestamptz` row/bind types;
+                    // the SQLite arm drops every cast and uses `TimestamptzSqlite`
+                    // (there is no `FromSql<Timestamptz, Sqlite>`), while producing
+                    // the identical `(total, entries)` pair. The row struct + queries
+                    // live inside each arm so only the selected arm is type-checked.
+                    let (total, entries): (u64, Vec<::autumn_web::version_history::VersionEntry>) =
+                        ::autumn_web::backend_select! {
+                            pg => {{
+                                #[derive(::autumn_web::reexports::diesel::QueryableByName)]
+                                struct __AutumnVersionHistoryRow {
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::BigInt)]
+                                    id: i64,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Text)]
+                                    table_name: ::std::string::String,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::BigInt)]
+                                    record_id: i64,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Text)]
+                                    op: ::std::string::String,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Text)]
+                                    actor: ::std::string::String,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>)]
+                                    request_id: ::core::option::Option<::std::string::String>,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Text)]
+                                    changes: ::std::string::String,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Timestamptz)]
+                                    recorded_at: ::autumn_web::reexports::chrono::DateTime<::autumn_web::reexports::chrono::Utc>,
+                                }
+                                #vh_count_struct
 
-                    // Execute the entries query.
-                    let raw_rows: Vec<__AutumnVersionHistoryRow> = if filter.from.is_some() || filter.to.is_some() {
-                        ::autumn_web::reexports::diesel::sql_query(
-                            "SELECT id, table_name, record_id, op, actor, request_id, \
-                             changes::text AS changes, recorded_at \
-                             FROM _autumn_version_history \
-                             WHERE table_name = $1 AND record_id = $2 \
-                             AND ($3::text IS NULL OR tenant_id = $3) \
-                             AND ($4::timestamptz IS NULL OR recorded_at >= $4) \
-                             AND ($5::timestamptz IS NULL OR recorded_at <= $5) \
-                             ORDER BY recorded_at ASC, id ASC \
-                             LIMIT $6 OFFSET $7"
-                        )
-                        .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__table_name)
-                        .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(record_id)
-                        .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>, _>(__version_history_tenant_id)
-                        .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Timestamptz>, _>(filter.from)
-                        .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Timestamptz>, _>(filter.to)
-                        .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(limit)
-                        .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(offset)
-                        .get_results::<__AutumnVersionHistoryRow>(&mut conn)
-                        .await
-                        .map_err(::autumn_web::AutumnError::from)?
-                    } else {
-                        ::autumn_web::reexports::diesel::sql_query(
-                            "SELECT id, table_name, record_id, op, actor, request_id, \
-                             changes::text AS changes, recorded_at \
-                             FROM _autumn_version_history \
-                             WHERE table_name = $1 AND record_id = $2 \
-                             AND ($3::text IS NULL OR tenant_id = $3) \
-                             ORDER BY recorded_at ASC, id ASC \
-                             LIMIT $4 OFFSET $5"
-                        )
-                        .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__table_name)
-                        .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(record_id)
-                        .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>, _>(__version_history_tenant_id)
-                        .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(limit)
-                        .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(offset)
-                        .get_results::<__AutumnVersionHistoryRow>(&mut conn)
-                        .await
-                        .map_err(::autumn_web::AutumnError::from)?
-                    };
+                                let total: u64 = if filter.from.is_some() || filter.to.is_some() {
+                                    let rows = ::autumn_web::reexports::diesel::sql_query(
+                                        "SELECT COUNT(*)::bigint AS count \
+                                         FROM _autumn_version_history \
+                                         WHERE table_name = $1 AND record_id = $2 \
+                                         AND ($3::text IS NULL OR tenant_id = $3) \
+                                         AND ($4::timestamptz IS NULL OR recorded_at >= $4) \
+                                         AND ($5::timestamptz IS NULL OR recorded_at <= $5)"
+                                    )
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__table_name)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(record_id)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>, _>(__version_history_tenant_id)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Timestamptz>, _>(filter.from)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Timestamptz>, _>(filter.to)
+                                    .get_results::<__AutumnVersionHistoryCount>(&mut conn)
+                                    .await
+                                    .map_err(::autumn_web::AutumnError::from)?;
+                                    rows.into_iter().next().map(|r| r.count).unwrap_or(0).max(0) as u64
+                                } else {
+                                    let rows = ::autumn_web::reexports::diesel::sql_query(
+                                        "SELECT COUNT(*)::bigint AS count \
+                                         FROM _autumn_version_history \
+                                         WHERE table_name = $1 AND record_id = $2 \
+                                         AND ($3::text IS NULL OR tenant_id = $3)"
+                                    )
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__table_name)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(record_id)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>, _>(__version_history_tenant_id)
+                                    .get_results::<__AutumnVersionHistoryCount>(&mut conn)
+                                    .await
+                                    .map_err(::autumn_web::AutumnError::from)?;
+                                    rows.into_iter().next().map(|r| r.count).unwrap_or(0).max(0) as u64
+                                };
 
-                    // Map raw rows to VersionEntry.
-                    let entries: Vec<::autumn_web::version_history::VersionEntry> = raw_rows
-                        .into_iter()
-                        .map(|row| {
-                            let op = match row.op.as_str() {
-                                "insert" => ::autumn_web::version_history::VersionOp::Insert,
-                                "delete" => ::autumn_web::version_history::VersionOp::Delete,
-                                _ => ::autumn_web::version_history::VersionOp::Update,
-                            };
-                            let changes: Vec<::autumn_web::version_history::ColumnChange> =
-                                ::autumn_web::reexports::serde_json::from_str(&row.changes)
-                                    .unwrap_or_default();
-                            ::autumn_web::version_history::VersionEntry {
-                                id: row.id,
-                                table_name: row.table_name,
-                                record_id: row.record_id,
-                                op,
-                                actor: row.actor,
-                                request_id: row.request_id,
-                                changes,
-                                recorded_at: row.recorded_at,
-                            }
-                        })
-                        .collect();
+                                let raw_rows: Vec<__AutumnVersionHistoryRow> = if filter.from.is_some() || filter.to.is_some() {
+                                    ::autumn_web::reexports::diesel::sql_query(
+                                        "SELECT id, table_name, record_id, op, actor, request_id, \
+                                         changes::text AS changes, recorded_at \
+                                         FROM _autumn_version_history \
+                                         WHERE table_name = $1 AND record_id = $2 \
+                                         AND ($3::text IS NULL OR tenant_id = $3) \
+                                         AND ($4::timestamptz IS NULL OR recorded_at >= $4) \
+                                         AND ($5::timestamptz IS NULL OR recorded_at <= $5) \
+                                         ORDER BY recorded_at ASC, id ASC \
+                                         LIMIT $6 OFFSET $7"
+                                    )
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__table_name)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(record_id)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>, _>(__version_history_tenant_id)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Timestamptz>, _>(filter.from)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Timestamptz>, _>(filter.to)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(limit)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(offset)
+                                    .get_results::<__AutumnVersionHistoryRow>(&mut conn)
+                                    .await
+                                    .map_err(::autumn_web::AutumnError::from)?
+                                } else {
+                                    ::autumn_web::reexports::diesel::sql_query(
+                                        "SELECT id, table_name, record_id, op, actor, request_id, \
+                                         changes::text AS changes, recorded_at \
+                                         FROM _autumn_version_history \
+                                         WHERE table_name = $1 AND record_id = $2 \
+                                         AND ($3::text IS NULL OR tenant_id = $3) \
+                                         ORDER BY recorded_at ASC, id ASC \
+                                         LIMIT $4 OFFSET $5"
+                                    )
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__table_name)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(record_id)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>, _>(__version_history_tenant_id)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(limit)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(offset)
+                                    .get_results::<__AutumnVersionHistoryRow>(&mut conn)
+                                    .await
+                                    .map_err(::autumn_web::AutumnError::from)?
+                                };
+
+                                let entries = #vh_map_rows;
+                                (total, entries)
+                            }},
+                            sqlite => {{
+                                #[derive(::autumn_web::reexports::diesel::QueryableByName)]
+                                struct __AutumnVersionHistoryRow {
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::BigInt)]
+                                    id: i64,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Text)]
+                                    table_name: ::std::string::String,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::BigInt)]
+                                    record_id: i64,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Text)]
+                                    op: ::std::string::String,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Text)]
+                                    actor: ::std::string::String,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>)]
+                                    request_id: ::core::option::Option<::std::string::String>,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Text)]
+                                    changes: ::std::string::String,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::TimestamptzSqlite)]
+                                    recorded_at: ::autumn_web::reexports::chrono::DateTime<::autumn_web::reexports::chrono::Utc>,
+                                }
+                                #vh_count_struct
+
+                                let total: u64 = if filter.from.is_some() || filter.to.is_some() {
+                                    let rows = ::autumn_web::reexports::diesel::sql_query(
+                                        "SELECT COUNT(*) AS count \
+                                         FROM _autumn_version_history \
+                                         WHERE table_name = $1 AND record_id = $2 \
+                                         AND ($3 IS NULL OR tenant_id = $3) \
+                                         AND ($4 IS NULL OR recorded_at >= $4) \
+                                         AND ($5 IS NULL OR recorded_at <= $5)"
+                                    )
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__table_name)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(record_id)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>, _>(__version_history_tenant_id)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::TimestamptzSqlite>, _>(filter.from)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::TimestamptzSqlite>, _>(filter.to)
+                                    .get_results::<__AutumnVersionHistoryCount>(&mut conn)
+                                    .await
+                                    .map_err(::autumn_web::AutumnError::from)?;
+                                    rows.into_iter().next().map(|r| r.count).unwrap_or(0).max(0) as u64
+                                } else {
+                                    let rows = ::autumn_web::reexports::diesel::sql_query(
+                                        "SELECT COUNT(*) AS count \
+                                         FROM _autumn_version_history \
+                                         WHERE table_name = $1 AND record_id = $2 \
+                                         AND ($3 IS NULL OR tenant_id = $3)"
+                                    )
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__table_name)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(record_id)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>, _>(__version_history_tenant_id)
+                                    .get_results::<__AutumnVersionHistoryCount>(&mut conn)
+                                    .await
+                                    .map_err(::autumn_web::AutumnError::from)?;
+                                    rows.into_iter().next().map(|r| r.count).unwrap_or(0).max(0) as u64
+                                };
+
+                                let raw_rows: Vec<__AutumnVersionHistoryRow> = if filter.from.is_some() || filter.to.is_some() {
+                                    ::autumn_web::reexports::diesel::sql_query(
+                                        "SELECT id, table_name, record_id, op, actor, request_id, \
+                                         changes, recorded_at \
+                                         FROM _autumn_version_history \
+                                         WHERE table_name = $1 AND record_id = $2 \
+                                         AND ($3 IS NULL OR tenant_id = $3) \
+                                         AND ($4 IS NULL OR recorded_at >= $4) \
+                                         AND ($5 IS NULL OR recorded_at <= $5) \
+                                         ORDER BY recorded_at ASC, id ASC \
+                                         LIMIT $6 OFFSET $7"
+                                    )
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__table_name)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(record_id)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>, _>(__version_history_tenant_id)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::TimestamptzSqlite>, _>(filter.from)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::TimestamptzSqlite>, _>(filter.to)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(limit)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(offset)
+                                    .get_results::<__AutumnVersionHistoryRow>(&mut conn)
+                                    .await
+                                    .map_err(::autumn_web::AutumnError::from)?
+                                } else {
+                                    ::autumn_web::reexports::diesel::sql_query(
+                                        "SELECT id, table_name, record_id, op, actor, request_id, \
+                                         changes, recorded_at \
+                                         FROM _autumn_version_history \
+                                         WHERE table_name = $1 AND record_id = $2 \
+                                         AND ($3 IS NULL OR tenant_id = $3) \
+                                         ORDER BY recorded_at ASC, id ASC \
+                                         LIMIT $4 OFFSET $5"
+                                    )
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__table_name)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(record_id)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>, _>(__version_history_tenant_id)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(limit)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(offset)
+                                    .get_results::<__AutumnVersionHistoryRow>(&mut conn)
+                                    .await
+                                    .map_err(::autumn_web::AutumnError::from)?
+                                };
+
+                                let entries = #vh_map_rows;
+                                (total, entries)
+                            }},
+                        };
 
                     Ok(::autumn_web::version_history::VersionPage {
                         entries,
@@ -15076,10 +15533,20 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 let timeout_ms = timeout_ms.min(i32::MAX as u64);
 
                 // `SET statement_timeout` is Postgres session syntax; SQLite
-                // rejects it ("near \"SET\": syntax error"). SQLite has no
-                // per-statement timeout SQL — the pool already installs
-                // `busy_timeout` at connection setup — so the SQLite arm skips
-                // it. A true SQLite statement timeout is a later wave (#1996).
+                // rejects it ("near \"SET\": syntax error"). SQLite also cannot
+                // enforce a per-statement wall-clock timeout at all through the
+                // async connection wrapper (diesel's SqliteConnection exposes no
+                // interrupt/progress-handler hook), so this arm CANNOT honor a
+                // configured `database.statement_timeout`. Rather than silently
+                // ignore it here, autumn-web fails the boot fast whenever a
+                // non-zero `statement_timeout` is configured under the sqlite
+                // backend (`reject_sqlite_statement_timeout`, called from
+                // `create_pool` / `create_topology` / `create_shard_topology` in
+                // db.rs). That boot guard guarantees `timeout_ms` is always 0 by
+                // the time it reaches this arm, so the no-op below is correct and
+                // reachable-with-a-real-timeout never happens — not a silent gap.
+                // `busy_timeout` (installed at connection setup) still bounds lock
+                // waits; a real statement timeout is tracked by #1996/#1910.
                 ::autumn_web::backend_select! {
                     pg => {{
                         ::autumn_web::reexports::diesel::sql_query(
@@ -15097,6 +15564,9 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         })?;
                     }},
                     sqlite => {{
+                        // Unreachable with a non-zero value: the boot guard
+                        // `db::reject_sqlite_statement_timeout` fail-closes before
+                        // any pool is built when `statement_timeout` is set.
                         let _ = timeout_ms;
                     }},
                 }
@@ -15137,7 +15607,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 #cross_shard_write_guard
 
                 let mut conn = self.__autumn_acquire_conn().await?;
-                ::autumn_web::__private::scoped_transaction::<T, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
+                ::autumn_web::__private::scoped_immediate_transaction::<T, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                     async move {
                         let row = ::autumn_web::maybe_for_update!(#table_ident::table
                             .find(id))
@@ -16840,6 +17310,69 @@ mod tests {
         &rest[..end]
     }
 
+    #[test]
+    fn repository_macro_write_rmw_uses_immediate_transaction_and_reads_stay_deferred() {
+        // #1996 item 3: the write read-modify-write paths (with_lock, update,
+        // delete_by_id) open the write lock up front through
+        // `scoped_immediate_transaction` (BEGIN IMMEDIATE on SQLite; the
+        // unchanged deferred `scoped_transaction` on Postgres). Read paths never
+        // take a write transaction, and the deferred primitive is still used by
+        // non-RMW writes (save/bulk), so the seam is not a blanket swap.
+        let generated =
+            repository_macro(quote! { Post }, quote! { pub trait PostRepository {} }).to_string();
+
+        // with_lock is the canonical pessimistic write RMW.
+        let wl_start = generated
+            .find("pub async fn with_lock")
+            .expect("repository must generate with_lock");
+        let with_lock = &generated[wl_start..];
+        assert!(
+            with_lock.contains("scoped_immediate_transaction"),
+            "with_lock must route through the immediate write transaction: {with_lock}"
+        );
+
+        // update is an RMW write (load + mutate) → immediate.
+        let update = update_section(&generated);
+        assert!(
+            update.contains("scoped_immediate_transaction"),
+            "update must route through the immediate write transaction: {update}"
+        );
+
+        // A dependent-cascade delete_by_id opens a write transaction (load →
+        // cascade children → parent DELETE); it must be immediate too. (A plain
+        // delete is a single atomic DELETE with no transaction, so there is
+        // nothing to make immediate there.)
+        let dep = repository_macro(
+            quote! { Post, dependent(PgCommentRepository, fk = "post_id", on_delete = destroy) },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        let delete = delete_by_id_section(&dep);
+        assert!(
+            delete.contains("scoped_immediate_transaction"),
+            "dependent delete_by_id must route through the immediate write transaction: {delete}"
+        );
+
+        // Read path stays off the write-lock primitive: find_by_id opens no
+        // immediate transaction.
+        let find_start = generated
+            .find("async fn find_by_id")
+            .expect("repository must generate find_by_id");
+        let rest = &generated[find_start + "async fn find_by_id".len()..];
+        let find_by_id = &rest[..rest.find("async fn ").map_or(rest.len(), |p| p)];
+        assert!(
+            !find_by_id.contains("scoped_immediate_transaction"),
+            "find_by_id (read) must not open an immediate write transaction: {find_by_id}"
+        );
+
+        // The deferred primitive is still present (save/bulk insert paths keep
+        // it) — the write-RMW adoption is targeted, not a blanket rename.
+        assert!(
+            generated.contains(":: scoped_transaction"),
+            "non-RMW write paths (save/bulk) must keep the deferred scoped_transaction"
+        );
+    }
+
     /// Helper: slice the `Destroy` match arm of the generated
     /// `__autumn_apply_dependent_on_conn` helper, bounded to the helper method
     /// (which ends right before the always-generated `pub fn on_primary`), so
@@ -17183,8 +17716,9 @@ mod tests {
 
     #[test]
     fn repository_macro_dependent_delete_cascades_inside_transaction_before_parent_delete() {
-        // AC2 + AC6: cascade runs inside a single scoped_transaction and before
-        // the parent DELETE (children removed first → no FK/orphan).
+        // AC2 + AC6: cascade runs inside a single (immediate, per #1996) write
+        // transaction and before the parent DELETE (children removed first → no
+        // FK/orphan).
         let generated = repository_macro(
             quote! { Post, dependent(PgCommentRepository, fk = "post_id", on_delete = destroy) },
             quote! { pub trait PostRepository {} },
@@ -17192,8 +17726,8 @@ mod tests {
         .to_string();
         let section = delete_by_id_section(&generated);
         assert!(
-            section.contains("scoped_transaction"),
-            "dependent delete_by_id must open a transaction: {section}"
+            section.contains("scoped_immediate_transaction"),
+            "dependent delete_by_id must open an immediate write transaction (#1996): {section}"
         );
         let cascade_pos = section
             .find("__autumn_apply_dependent_on_conn")
@@ -17967,8 +18501,8 @@ mod tests {
         // (post-commit), i.e. after the connection is dropped.
         let section = delete_by_id_section(&generated);
         let tx_pos = section
-            .find("scoped_transaction")
-            .expect("dependent delete_by_id opens a transaction");
+            .find("scoped_immediate_transaction")
+            .expect("dependent delete_by_id opens an immediate write transaction (#1996)");
         let drop_pos = section
             .find("mem :: drop")
             .expect("dependent delete_by_id drops the conn after the tx");
@@ -18107,7 +18641,11 @@ mod tests {
         let pos = generated
             .find("async fn search_page_scoped")
             .expect("search_page_scoped impl present");
-        let body = &generated[pos..(pos + 9000).min(generated.len())];
+        // #1996: the pg/sqlite `backend_select!` fork roughly doubled this method
+        // body, so widen the window from 9000 to 24000 to still reach the typed
+        // hydration owner filter (the filter itself is unchanged — the pg + sqlite
+        // COUNT/SELECT arms are simply emitted before it).
+        let body = &generated[pos..(pos + 24000).min(generated.len())];
         // (a) COUNT raw SQL owner clause, (b) id-SELECT raw SQL owner clause —
         // both go through the `" AND author_id = $3"` literal appended to
         // count_sql / select_sql.
@@ -18792,6 +19330,196 @@ mod tests {
         );
     }
 
+    /// #1996: the version-history writer and reader must fork through
+    /// `backend_select!` so a `versioned = true` repository runs on `SQLite`.
+    ///
+    /// The Postgres arm keeps its `::jsonb` / `::bigint` / `::timestamptz` /
+    /// `changes::text` casts and the `Timestamptz` diesel type verbatim; the
+    /// `SQLite` arm drops every cast (JSON is stored as TEXT) and names
+    /// `TimestamptzSqlite` (there is no `FromSql<Timestamptz, Sqlite>`), and the
+    /// writer additionally binds `recorded_at` so TEXT range comparisons stay
+    /// monotonic. This assertion pins each of those forks in the generated tokens.
+    #[test]
+    fn repository_macro_versioned_history_forks_sqlite_dialect() {
+        let generated = repository_macro(
+            quote! { Post, versioned = true },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        // Both the writer and the reader route through the backend seam.
+        assert!(
+            generated.contains("backend_select ! { pg =>"),
+            "versioned repository must emit a backend_select! fork: {generated}"
+        );
+
+        // ── Write path ────────────────────────────────────────────────
+        // Postgres keeps the jsonb cast; SQLite drops it and binds recorded_at.
+        let write_pos = generated
+            .find("INSERT INTO _autumn_version_history")
+            .expect("versioned repository must write history");
+        let write_section = &generated[write_pos..];
+        assert!(
+            write_section.contains("$7 :: jsonb") || write_section.contains("$7::jsonb"),
+            "the Postgres write arm must keep the $7::jsonb cast: {write_section}"
+        );
+        // The SQLite insert names all eight columns (recorded_at bound
+        // explicitly) and uses uncast $1..$8 placeholders. The literal preserves
+        // its `\`-continuations, so the column list and the VALUES clause are on
+        // separate source lines — assert each single-line fragment independently.
+        assert!(
+            generated.contains(
+                "(table_name, tenant_id, record_id, op, actor, request_id, changes, recorded_at)"
+            ),
+            "the SQLite write arm must bind recorded_at as an 8th column: {generated}"
+        );
+        assert!(
+            generated.contains("VALUES ($1, $2, $3, $4, $5, $6, $7, $8)"),
+            "the SQLite write arm must use uncast $1..$8 placeholders: {generated}"
+        );
+        // The SQLite write arm binds the explicit timestamp via chrono Utc::now().
+        assert!(
+            generated.contains("Utc :: now ())"),
+            "the SQLite write arm must bind recorded_at explicitly (Utc::now()): {generated}"
+        );
+
+        // ── Read path (SQLite arm drops every Postgres cast) ──────────
+        assert!(
+            generated.contains("SELECT COUNT(*) AS count"),
+            "the SQLite count arm must drop the ::bigint cast: {generated}"
+        );
+        assert!(
+            generated.contains("($3 IS NULL OR tenant_id = $3)"),
+            "the SQLite read arm must drop the $3::text tenant cast: {generated}"
+        );
+        assert!(
+            generated.contains("($4 IS NULL OR recorded_at >= $4)")
+                && generated.contains("($5 IS NULL OR recorded_at <= $5)"),
+            "the SQLite read arm must drop the ::timestamptz range casts: {generated}"
+        );
+        // The SQLite read arm must name TimestamptzSqlite (there is no
+        // FromSql<Timestamptz, Sqlite>) for the recorded_at column type and the
+        // range-filter binds.
+        assert!(
+            generated.contains("TimestamptzSqlite"),
+            "the SQLite read arm must use TimestamptzSqlite: {generated}"
+        );
+
+        // The Postgres arm must still carry its casts verbatim (no regression).
+        assert!(
+            generated.contains("SELECT COUNT(*)::bigint AS count")
+                && generated.contains("($3::text IS NULL OR tenant_id = $3)")
+                && generated.contains("($4::timestamptz IS NULL OR recorded_at >= $4)")
+                && generated.contains("changes::text AS changes"),
+            "the Postgres read arm must keep its ::bigint/::text/::timestamptz/changes::text casts: {generated}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_searchable_forks_sqlite_like_fallback() {
+        // #1996: the full-text search codegen must fork into pg/sqlite
+        // `backend_select!` arms. Postgres keeps tsvector ranked search; SQLite
+        // falls back to case-insensitive `lower(col) LIKE '%term%'` substring
+        // matching over SEARCH_FIELDS, ordered `id DESC` (no rank function).
+        let generated = repository_macro(
+            quote! { Post, searchable },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        // The search methods must route through the backend seam.
+        assert!(
+            generated.contains("backend_select ! { pg =>"),
+            "a searchable repository must emit a backend_select! fork: {generated}"
+        );
+
+        // ── SQLite arm: LIKE substring fallback, no tsvector functions ──
+        assert!(
+            generated.contains("LIKE $1 ESCAPE"),
+            "the SQLite search arm must emit a LIKE substring predicate: {generated}"
+        );
+        assert!(
+            generated.contains("lower(\\\"{__autumn_field}\\\")"),
+            "the SQLite search arm must lower() each SEARCH_FIELD column: {generated}"
+        );
+        assert!(
+            generated.contains("SEARCH_FIELDS"),
+            "the SQLite search arm must build its predicate from SEARCH_FIELDS: {generated}"
+        );
+        assert!(
+            generated.contains("ORDER BY id DESC"),
+            "the SQLite search arm must order by id DESC (unranked): {generated}"
+        );
+
+        // ── Postgres arm: tsvector ranked search preserved (no regression) ──
+        assert!(
+            generated.contains("websearch_to_tsquery"),
+            "the Postgres search arm must keep websearch_to_tsquery: {generated}"
+        );
+        assert!(
+            generated.contains("ts_rank_cd"),
+            "the Postgres search arm must keep ts_rank_cd ranking: {generated}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_tenant_scoped_searchable_filters_tenant_in_both_arms() {
+        // #1996: tenant isolation is load-bearing — BOTH the pg (tsvector) and
+        // sqlite (LIKE) arms must carry the `tenant_id = $n` predicate so a search
+        // never crosses tenants on either backend. The pg arm binds tenant at $3;
+        // the sqlite arm renumbers to $2 (the LIKE pattern is $1).
+        let generated = repository_macro(
+            quote! { Post, tenant_scoped, searchable },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("AND tenant_id = $3"),
+            "the Postgres search arm must filter tenant_id = $3: {generated}"
+        );
+        assert!(
+            generated.contains("AND tenant_id = $2"),
+            "the SQLite search arm must filter tenant_id = $2: {generated}"
+        );
+        // The pg arm still ranks; the sqlite arm still substring-matches.
+        assert!(
+            generated.contains("websearch_to_tsquery") && generated.contains("LIKE $1 ESCAPE"),
+            "both search arms must survive tenant scoping: {generated}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_owner_scoped_searchable_forks_sqlite_like_fallback() {
+        // #1996: the owner-scoped search_page_scoped (#1841) path must fork too,
+        // and the owner filter must survive in BOTH arms so an owner-scoped search
+        // never leaks another user's rows. pg binds owner at $3; sqlite renumbers
+        // the owner filter to $2 (LIKE pattern is $1).
+        let generated = repository_macro(
+            quote! { Post, owner = user_id, searchable },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("search_page_scoped"),
+            "an owner-scoped searchable repository must emit search_page_scoped: {generated}"
+        );
+        // Postgres owner filter (ranked) and SQLite owner filter (LIKE).
+        assert!(
+            generated.contains("AND user_id = $3"),
+            "the Postgres owner-scoped arm must filter user_id = $3: {generated}"
+        );
+        assert!(
+            generated.contains("AND \\\"user_id\\\" = $2"),
+            "the SQLite owner-scoped arm must filter \"user_id\" = $2: {generated}"
+        );
+        assert!(
+            generated.contains("websearch_to_tsquery") && generated.contains("LIKE $1 ESCAPE"),
+            "both owner-scoped search arms must be present: {generated}"
+        );
+    }
+
     #[test]
     fn repository_macro_versioned_update_locks_before_history_diff_without_expected_version() {
         let generated = repository_macro(
@@ -19271,6 +19999,56 @@ mod tests {
                 || generated
                     .contains("__autumn_statement_timeout_ms: self.__autumn_statement_timeout_ms"),
             "sub-repo must preserve the parent statement timeout: {generated}"
+        );
+    }
+
+    /// The connection-acquire helper forks `statement_timeout` per backend
+    /// (issue #1996, item 4). The Postgres arm keeps `SET statement_timeout`
+    /// exactly; the `SQLite` arm is a deliberate no-op — `SQLite` cannot enforce
+    /// a per-statement timeout through the async connection wrapper, so autumn-web
+    /// fail-closes at boot (`db::reject_sqlite_statement_timeout`) whenever a
+    /// non-zero timeout is configured under the sqlite backend, which guarantees
+    /// `timeout_ms` is always 0 by the time it reaches the `SQLite` arm. This test
+    /// pins BOTH arms so a future edit cannot (a) drop the Postgres `SET`, or
+    /// (b) turn the `SQLite` arm into something that silently applies/misuses a
+    /// real timeout value.
+    #[test]
+    fn statement_timeout_forks_per_backend_with_sqlite_noop() {
+        let generated =
+            repository_macro(quote! { Post }, quote! { pub trait PostRepository {} }).to_string();
+
+        // The value is threaded and capped before the fork.
+        assert!(
+            generated.contains("let timeout_ms = self . __autumn_statement_timeout_ms")
+                || generated.contains("let timeout_ms = self.__autumn_statement_timeout_ms"),
+            "must read the threaded statement timeout: {generated}"
+        );
+
+        // Postgres arm: the `SET statement_timeout` session statement is emitted
+        // verbatim (Postgres behavior must be 100% unchanged).
+        assert!(
+            generated.contains("SET statement_timeout = {timeout_ms}"),
+            "pg arm must still emit `SET statement_timeout`: {generated}"
+        );
+
+        // SQLite arm: an explicit `let _ = timeout_ms ;` no-op — NOT a
+        // `SET statement_timeout`, NOT any other application of the value. The
+        // boot guard (asserted by the runtime test
+        // `sqlite_statement_timeout_fail_closed`) makes this no-op correct rather
+        // than a silent swallow of a configured guarantee.
+        let sqlite_arm_start = generated
+            .find("sqlite => { { let _ = timeout_ms ;")
+            .or_else(|| generated.find("sqlite => {{ let _ = timeout_ms ;"));
+        assert!(
+            sqlite_arm_start.is_some(),
+            "sqlite arm must be the deliberate `let _ = timeout_ms;` no-op backed by \
+             the boot guard: {generated}"
+        );
+
+        // The two arms live inside one `backend_select!` seam.
+        assert!(
+            generated.contains("backend_select ! { pg => { {"),
+            "the fork must be a backend_select! seam: {generated}"
         );
     }
 

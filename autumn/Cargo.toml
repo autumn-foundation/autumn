@@ -461,6 +461,67 @@ path = "tests/sqlite_crud_basic.rs"
 name = "sqlite_upsert_isolation"
 path = "tests/sqlite_upsert_isolation.rs"
 
+# SQLite version-history end-to-end proof (issue #1996). Drives a
+# `versioned = true` repository against an in-memory SQLite pool: a create +
+# update + delete each append a `_autumn_version_history` row, `version_history()`
+# reads them back (op/actor/changes/time-range), and — the adversarial assertion —
+# `version_history()` scoped to tenant B never returns tenant A's rows
+# (fail-closed isolation). Exercises the forked writer (no `$7::jsonb`), reader
+# (no `::bigint`/`::text`/`::timestamptz`/`changes::text`, `TimestamptzSqlite`),
+# and the SQLite `_autumn_version_history` DDL. Only meaningful under
+# `--features sqlite`; the file is `#![cfg(feature = "sqlite")]` so a default
+# `cargo test` compiles it to an empty (passing) binary. Run explicitly:
+# `cargo test -p autumn-web --features "sqlite,test-support" --test sqlite_version_history`.
+[[test]]
+name = "sqlite_version_history"
+path = "tests/sqlite_version_history.rs"
+
+# SQLite searchable-repository fallback proof (issue #1996). Drives
+# `#[repository(searchable)]` against an in-memory SQLite pool: substring matches
+# are found case-insensitively, non-matches excluded, LIKE metacharacters (`%`,
+# `_`) match literally (never a match-everything wildcard), `search_page`
+# paginates, and — the adversarial assertions — a search under tenant B never
+# returns tenant A's rows and `search_page_scoped` never returns another owner's
+# rows (fail-closed isolation). Exercises the forked search codegen (SQLite arm =
+# `lower(col) LIKE '%term%'` over SEARCH_FIELDS, ordered id DESC, no tsvector).
+# Only meaningful under `--features sqlite`; the file is
+# `#![cfg(feature = "sqlite")]` so a default `cargo test` compiles it to an empty
+# (passing) binary. Run explicitly:
+# `cargo test -p autumn-web --features "sqlite,test-support" --test sqlite_searchable_repository`.
+[[test]]
+name = "sqlite_searchable_repository"
+path = "tests/sqlite_searchable_repository.rs"
+
+# SQLite `BEGIN IMMEDIATE` write-transaction proof (issue #1996, item 3). The
+# generated write-RMW paths (with_lock / update / delete_by_id / find_or_create)
+# route through `scoped_immediate_transaction`, whose SQLite arm takes the write
+# lock up front so a second concurrent writer queues on `busy_timeout` instead of
+# failing its deferred snapshot upgrade with `SQLITE_BUSY_SNAPSHOT`. This test
+# proves that on a shared tempfile DB: two concurrent writers serialize with no
+# lost update / no busy error, a queued update commits and bumps lock_version, a
+# single-writer update commits, and an errored RMW rolls back. Only meaningful
+# under `--features sqlite`; the file is `#![cfg(feature = "sqlite")]` so a
+# default `cargo test` compiles it to an empty (passing) binary. Run explicitly:
+# `cargo test -p autumn-web --features "sqlite,test-support" --test sqlite_immediate_transaction`.
+[[test]]
+name = "sqlite_immediate_transaction"
+path = "tests/sqlite_immediate_transaction.rs"
+
+# SQLite `statement_timeout` fail-closed boot guard (issue #1996, item 4). SQLite
+# cannot enforce a per-statement wall-clock timeout through the async connection
+# wrapper (diesel's SqliteConnection exposes no interrupt/progress-handler hook),
+# so `db::reject_sqlite_statement_timeout` fails the boot fast — from every
+# pool-construction entry point — when a non-zero `database.statement_timeout` is
+# configured under the sqlite backend, instead of silently ignoring it. This test
+# proves the loud, typed rejection (naming the config key + SQLite) and that a
+# `None`/zero timeout still boots cleanly. Only meaningful under
+# `--features sqlite`; the file is `#![cfg(feature = "sqlite")]` so a default
+# `cargo test` compiles it to an empty (passing) binary. Run explicitly:
+# `cargo test -p autumn-web --features sqlite --test sqlite_statement_timeout_fail_closed`.
+[[test]]
+name = "sqlite_statement_timeout_fail_closed"
+path = "tests/sqlite_statement_timeout_fail_closed.rs"
+
 # SQLite `dependent(..., on_delete = destroy)` cascade proof (issue #1996, PR
 # #2021). The Destroy arm selects child ids with a hand-built SQL string that
 # used to emit a trailing `FOR UPDATE` (rejected by SQLite) — outside the
