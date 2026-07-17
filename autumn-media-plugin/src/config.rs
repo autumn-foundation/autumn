@@ -956,16 +956,24 @@ mod tests {
         assert_eq!(config.rooms.namespace.as_deref(), Some("tenant-b"));
         assert!(config.validate().is_ok());
 
-        // Above the hard cap → rejected by validate().
+        // Above the hard cap → rejected by validate() with a specific message
+        // naming the offending value and the ceiling (fail-fast, never clamp).
         let mut over = MediaConfig::default();
         over.rooms.max_participants = 7;
+        let err = over.validate().expect_err("7 > 6 must be rejected");
         assert!(matches!(
-            over.validate(),
-            Err(MediaConfigError::InvalidRoomMaxParticipants {
+            err,
+            MediaConfigError::InvalidRoomMaxParticipants {
                 requested: 7,
                 cap: DEFAULT_ROOM_MAX_PARTICIPANTS
-            })
+            }
         ));
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains('7'),
+            "names the offending value: {rendered}"
+        );
+        assert!(rendered.contains('6'), "names the ceiling: {rendered}");
 
         // Zero participants → rejected.
         let mut zero = MediaConfig::default();

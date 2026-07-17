@@ -380,6 +380,35 @@ impl Plugin for MediaPlugin {
 
         let retention_days = retention_days.unwrap_or(config.recording.retention_days);
 
+        // The mesh is O(N²), so `DEFAULT_ROOM_MAX_PARTICIPANTS` (6) is an
+        // ABSOLUTE ceiling with no SFU: the `[media.rooms]` config and the
+        // `room_max_participants` builder may set a per-room seat count only
+        // within `1..=6`. An out-of-range value (0 or >6) is a fatal
+        // misconfiguration — fail fast and LOUD at boot, never a silent clamp.
+        // `Plugin::build` returns an `AppBuilder` (not a `Result`), so the
+        // specific error is surfaced from an `on_startup` hook, which aborts
+        // boot with `process::exit(1)` exactly as a failed init would (see
+        // autumn-web's `run_startup_hooks`). `room_max_participants` is the
+        // effective seat count sourced from either `config(..)` (which copies
+        // `rooms.max_participants` into it) or the `room_max_participants(..)`
+        // builder, so this single check covers both the TOML and builder paths;
+        // `InMemoryRoomStore::create_room` re-checks the fixed 6 ceiling as a
+        // defense-in-depth backstop, and `MediaConfig::validate` stays the
+        // opt-in strict check for consumers who validate config up front. The
+        // storage backend keeps its own degrade path below (unchanged), so this
+        // only fails fast on the room cap.
+        if let Some(message) = room_max_participants_error(room_max_participants) {
+            tracing::error!(
+                room_max_participants,
+                ceiling = DEFAULT_ROOM_MAX_PARTICIPANTS,
+                "🍂 Autumn Media: {message}"
+            );
+            return app.on_startup(move |_state| {
+                let message = message.clone();
+                async move { Err(autumn_web::AutumnError::internal_server_error_msg(message)) }
+            });
+        }
+
         tracing::info!(
             broadcast = %enable_broadcast,
             rooms = %enable_rooms,
@@ -475,6 +504,26 @@ impl Plugin for MediaPlugin {
             }
             app
         }
+    }
+}
+
+/// Validate an effective mesh-room seat count against the ABSOLUTE ceiling.
+///
+/// Mesh WebRTC is O(N²), so [`DEFAULT_ROOM_MAX_PARTICIPANTS`] (6) is a hard cap
+/// with no SFU, and a room must seat at least one participant. Returns the
+/// specific, fail-fast error message — naming the offending value and the cap —
+/// when `configured` is outside `1..=6`, or `None` when it is in range.
+fn room_max_participants_error(configured: usize) -> Option<String> {
+    if configured == 0 {
+        Some(format!(
+            "a room must allow at least 1 participant; got {configured}"
+        ))
+    } else if configured > DEFAULT_ROOM_MAX_PARTICIPANTS {
+        Some(format!(
+            "mesh rooms are capped at {DEFAULT_ROOM_MAX_PARTICIPANTS} participants (no SFU); got {configured}"
+        ))
+    } else {
+        None
     }
 }
 
@@ -598,6 +647,58 @@ mod arroyo_shim_tests {
         assert!(plugin.enable_broadcast);
         assert_eq!(plugin.queue, "arroyo-media");
         assert_eq!(plugin.retention_days, Some(30));
+    }
+}
+
+// ── Absolute room-cap enforcement (Fix 1) ───────────────────────────────────
+
+#[cfg(test)]
+mod room_cap_tests {
+    use super::{DEFAULT_ROOM_MAX_PARTICIPANTS, MediaPlugin, room_max_participants_error};
+    use crate::config::MediaConfig;
+
+    #[test]
+    fn out_of_range_room_cap_is_a_specific_fail_fast_error() {
+        // >6 fails loud, naming the offending value and the ceiling — never a
+        // clamp.
+        let over = room_max_participants_error(50).expect("50 > 6 must be rejected");
+        assert!(over.contains("50"), "names the offending value: {over}");
+        assert!(over.contains('6'), "names the ceiling: {over}");
+        assert!(over.contains("no SFU"), "explains why: {over}");
+        // 0 fails loud with its own message.
+        let zero = room_max_participants_error(0).expect("0 must be rejected");
+        assert!(zero.contains("at least 1 participant"), "0 message: {zero}");
+        assert!(zero.contains('0'), "names the value: {zero}");
+    }
+
+    #[test]
+    fn in_range_room_cap_is_accepted() {
+        assert!(room_max_participants_error(1).is_none());
+        assert!(room_max_participants_error(4).is_none());
+        assert!(room_max_participants_error(DEFAULT_ROOM_MAX_PARTICIPANTS).is_none());
+    }
+
+    #[test]
+    fn builder_and_config_paths_feed_the_same_effective_cap_that_boot_rejects() {
+        // The `room_max_participants(50)` builder stores what it was given;
+        // `build()` is what rejects it fail-fast (no clamp), so an out-of-range
+        // builder value produces the specific error at boot.
+        let over = MediaPlugin::new().with_rooms().room_max_participants(50);
+        assert_eq!(over.room_max_participants, 50);
+        assert!(room_max_participants_error(over.room_max_participants).is_some());
+
+        // `room_max_participants(4)` stays in range → a real 4-seat room.
+        let ok = MediaPlugin::new().with_rooms().room_max_participants(4);
+        assert_eq!(ok.room_max_participants, 4);
+        assert!(room_max_participants_error(ok.room_max_participants).is_none());
+
+        // The `[media.rooms] max_participants = 50` config path flows into the
+        // same effective field via `config(..)`, so it is rejected identically.
+        let mut config = MediaConfig::default();
+        config.rooms.max_participants = 50;
+        let from_config = MediaPlugin::new().config(config);
+        assert_eq!(from_config.room_max_participants, 50);
+        assert!(room_max_participants_error(from_config.room_max_participants).is_some());
     }
 }
 

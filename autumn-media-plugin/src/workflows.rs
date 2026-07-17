@@ -596,23 +596,29 @@ async fn run_room_composite(
     storage: &MediaStorage,
     args: RoomCompositeJobArgs,
 ) -> Result<MediaArtifact, MediaError> {
-    let (output_path, ephemeral) = staged_output(storage, &args.output_key, "mp4")?;
-    let command =
-        FfmpegRoomCompositeCommand::new(ffmpeg_bin, args.source_paths.clone(), output_path.clone());
+    let RoomCompositeJobArgs {
+        source_paths,
+        output_key,
+        content_type,
+        workflow_id,
+        source_id,
+    } = args;
+    let (output_path, ephemeral) = staged_output(storage, &output_key, "mp4")?;
+    let command = FfmpegRoomCompositeCommand::new(ffmpeg_bin, source_paths, output_path.clone());
     let bytes = run_blocking(move || command.run()).await?;
     let file = persist_and_cleanup(
         storage,
-        &args.output_key,
+        &output_key,
         &output_path,
-        &args.content_type,
+        &content_type,
         bytes,
         ephemeral,
     )
     .await?;
     Ok(MediaArtifact {
         kind: MediaArtifactKind::Transcode,
-        workflow_id: args.workflow_id,
-        source_id: args.source_id,
+        workflow_id,
+        source_id,
         primary: file,
         secondary: None,
         metadata: BTreeMap::new(),

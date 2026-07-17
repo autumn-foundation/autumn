@@ -717,6 +717,14 @@ pub const ROOM_COMPOSITE_CELL_WIDTH: u32 = 640;
 /// Height, in pixels, of one participant cell in a room-composite grid (16:9).
 pub const ROOM_COMPOSITE_CELL_HEIGHT: u32 = 360;
 
+/// Maximum participant recordings a room composite accepts.
+///
+/// Tied to the mesh-room seat cap
+/// ([`crate::config::DEFAULT_ROOM_MAX_PARTICIPANTS`], 6): a mesh call never
+/// exceeds 6 participants, so a composite never tiles more. Kept as a local
+/// const so this dependency-free encode module needs no `config` import.
+const ROOM_COMPOSITE_MAX_INPUTS: usize = 6;
+
 /// Grid-composite encoder for a finished mesh-room recording.
 ///
 /// Tiles each participant's recording into a grid — `2x1` for two participants,
@@ -783,14 +791,20 @@ impl FfmpegRoomCompositeCommand {
     ///
     /// # Errors
     ///
-    /// Returns an error when there are fewer than two source recordings, a
-    /// source is missing, the output directory cannot be created, `FFmpeg`
-    /// fails, or the output cannot be inspected after a successful run.
+    /// Returns an error when there are fewer than two or more than six source
+    /// recordings (the `2..=6` mesh-room band), a source is missing, the output
+    /// directory cannot be created, `FFmpeg` fails, or the output cannot be
+    /// inspected after a successful run.
     pub fn run(&self) -> Result<u64, MediaError> {
         require_sources(&self.input_paths)?;
         if self.input_paths.len() < 2 {
             return Err(MediaError::FfmpegSourceMissing {
                 path: "<room composite needs at least two participant recordings>".to_owned(),
+            });
+        }
+        if self.input_paths.len() > ROOM_COMPOSITE_MAX_INPUTS {
+            return Err(MediaError::FfmpegSourceMissing {
+                path: "<room composite accepts at most six participant recordings>".to_owned(),
             });
         }
         create_output_parent(&self.output_path)?;
@@ -1299,6 +1313,25 @@ mod tests {
             FfmpegRoomCompositeCommand::new("ffmpeg", vec![only], dir.path().join("room.mp4"));
         // A one-participant composite is meaningless; run() must reject it
         // before spawning FFmpeg.
+        assert!(matches!(
+            cmd.run(),
+            Err(super::MediaError::FfmpegSourceMissing { .. })
+        ));
+    }
+
+    #[test]
+    fn room_composite_run_rejects_more_than_six_participants() {
+        let dir = tempfile::tempdir().unwrap();
+        // Seven present sources: `require_sources` passes, then the `2..=6`
+        // upper bound rejects before spawning FFmpeg (mesh rooms cap at six).
+        let sources: Vec<PathBuf> = (0..7)
+            .map(|i| {
+                let path = dir.path().join(format!("p{i}.mp4"));
+                File::create(&path).unwrap();
+                path
+            })
+            .collect();
+        let cmd = FfmpegRoomCompositeCommand::new("ffmpeg", sources, dir.path().join("room.mp4"));
         assert!(matches!(
             cmd.run(),
             Err(super::MediaError::FfmpegSourceMissing { .. })

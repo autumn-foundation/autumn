@@ -349,11 +349,16 @@ pub trait RoomStore: Send + Sync {
     /// Create a room in `namespace` capped at `max_participants`, returning its
     /// snapshot.
     ///
+    /// `max_participants` must be within `1..=`
+    /// [`DEFAULT_ROOM_MAX_PARTICIPANTS`](crate::config::DEFAULT_ROOM_MAX_PARTICIPANTS)
+    /// — 6 is the absolute mesh ceiling (no SFU), a per-room seat count is
+    /// configurable only within that range, and `0` is nonsense.
+    ///
     /// # Errors
     ///
     /// [`RoomError::InvalidSegment`] for an invalid non-empty namespace, and
-    /// [`RoomError::InvalidMaxParticipants`] when the cap exceeds the store's
-    /// hard cap.
+    /// [`RoomError::InvalidMaxParticipants`] when `max_participants` is `0` or
+    /// exceeds the absolute ceiling.
     fn create_room(
         &self,
         namespace: &str,
@@ -408,6 +413,13 @@ pub struct InMemoryRoomStore {
 
 impl InMemoryRoomStore {
     /// Create an empty store whose rooms may hold up to `hard_cap` participants.
+    ///
+    /// `hard_cap` is further bounded by the absolute mesh ceiling: a room can
+    /// never seat more than
+    /// [`DEFAULT_ROOM_MAX_PARTICIPANTS`](crate::config::DEFAULT_ROOM_MAX_PARTICIPANTS)
+    /// (6, no SFU) regardless of `hard_cap`, so with a larger `hard_cap`
+    /// [`create_room`](RoomStore::create_room) still rejects any request above 6
+    /// as a backstop.
     #[must_use]
     pub fn new(hard_cap: usize) -> Self {
         Self {
@@ -432,15 +444,18 @@ impl RoomStore for InMemoryRoomStore {
         if !namespace.is_empty() {
             validate_room_segment(namespace)?;
         }
-        if max_participants > self.hard_cap {
+        // The mesh is O(N²), so the absolute ceiling is a fixed
+        // `DEFAULT_ROOM_MAX_PARTICIPANTS` (6) — enforced here structurally, so
+        // this backstop stays non-vacuous even if a larger `hard_cap` slipped
+        // past the builder/config clamp. A 0-seat room is nonsense. Both are
+        // rejected outright (no lower clamp).
+        let ceiling = self.hard_cap.min(DEFAULT_ROOM_MAX_PARTICIPANTS);
+        if max_participants == 0 || max_participants > ceiling {
             return Err(RoomError::InvalidMaxParticipants {
                 requested: max_participants,
-                cap: self.hard_cap,
+                cap: ceiling,
             });
         }
-        // Clamp the lower bound: a 0 cap is meaningless, so a room always seats
-        // at least one participant.
-        let max_participants = max_participants.max(1);
         let id = Uuid::new_v4().to_string();
         let room = Room {
             id: id.clone(),
@@ -700,12 +715,27 @@ pub struct JoinRequest {
 }
 
 /// Body of a room-leave request.
-#[derive(Debug, serde::Deserialize)]
+///
+/// [`std::fmt::Debug`] renders `participant_id` verbatim but redacts
+/// `session_token` (it prints `<redacted>`, mirroring [`SessionToken`] and the
+/// storage-layer redaction discipline) so a request body cannot leak the secret
+/// into logs.
+#[derive(serde::Deserialize)]
 pub struct LeaveRequest {
     /// The participant id being removed.
     pub participant_id: String,
     /// The session token minted at join time.
     pub session_token: String,
+}
+
+impl std::fmt::Debug for LeaveRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LeaveRequest")
+            .field("participant_id", &self.participant_id)
+            .field("session_token", &"<redacted>")
+            .finish()
+    }
 }
 
 /// Resolve the installed [`RoomService`] or fail with a `500`.
@@ -814,9 +844,9 @@ fn room_route(method: &str, path: String, handler: &str) -> RouteInfo {
 #[cfg(test)]
 mod tests {
     use super::{
-        InMemoryRoomStore, JoinRequest, RoomError, RoomService, RoomStore, SessionToken,
-        room_participant_path, room_route_infos, rooms_create, rooms_join, rooms_roster,
-        validate_room_segment,
+        InMemoryRoomStore, JoinRequest, LeaveRequest, RoomError, RoomService, RoomStore,
+        SessionToken, room_participant_path, room_route_infos, rooms_create, rooms_join,
+        rooms_roster, validate_room_segment,
     };
     use crate::config::MediaMtxConfig;
     use crate::transport::MediaUrls;
@@ -930,6 +960,24 @@ mod tests {
     }
 
     #[test]
+    fn leave_request_debug_redacts_session_token() {
+        let req = LeaveRequest {
+            participant_id: "part-123".to_owned(),
+            session_token: "super-secret-token-value".to_owned(),
+        };
+        let rendered = format!("{req:?}");
+        assert!(
+            !rendered.contains("super-secret-token-value"),
+            "raw token must not appear in Debug: {rendered}"
+        );
+        assert!(
+            rendered.contains("part-123"),
+            "participant id must appear: {rendered}"
+        );
+        assert!(rendered.contains("<redacted>"), "Debug: {rendered}");
+    }
+
+    #[test]
     fn session_token_serializes_the_real_value() {
         let token = SessionToken::generate();
         let json = serde_json::to_string(&token).unwrap();
@@ -939,17 +987,23 @@ mod tests {
     // ── Create / cap ─────────────────────────────────────────────────────────
 
     #[test]
-    fn create_room_mints_uuid_id_and_clamps_and_rejects_cap() {
+    fn create_room_mints_uuid_id_and_rejects_out_of_range_cap() {
         let store = InMemoryRoomStore::new(6);
         let snapshot = store.create_room("", 4).unwrap();
         assert_eq!(uuid::Uuid::parse_str(&snapshot.id).map(|_| ()), Ok(()));
         assert_eq!(snapshot.max_participants, 4);
         assert!(snapshot.participants.is_empty());
 
-        // A 0 cap clamps up to 1 (a room always seats at least one).
-        assert_eq!(store.create_room("", 0).unwrap().max_participants, 1);
+        // A 0-seat room is nonsense → rejected (never clamped up to 1).
+        assert!(matches!(
+            store.create_room("", 0),
+            Err(RoomError::InvalidMaxParticipants {
+                requested: 0,
+                cap: 6
+            })
+        ));
 
-        // Above the hard cap → rejected.
+        // Above the absolute ceiling → rejected.
         assert!(matches!(
             store.create_room("", 7),
             Err(RoomError::InvalidMaxParticipants {
@@ -957,6 +1011,23 @@ mod tests {
                 cap: 6
             })
         ));
+    }
+
+    #[test]
+    fn create_room_backstops_the_absolute_ceiling_even_with_a_larger_hard_cap() {
+        // Defense-in-depth: even if a larger `hard_cap` slipped past the
+        // builder/config fail-fast, the store enforces the fixed 6 ceiling — a
+        // 50-seat request is rejected, reporting the effective ceiling (6).
+        let store = InMemoryRoomStore::new(50);
+        assert!(matches!(
+            store.create_room("", 50),
+            Err(RoomError::InvalidMaxParticipants {
+                requested: 50,
+                cap: 6
+            })
+        ));
+        // A within-ceiling value still works, capped at the absolute 6.
+        assert_eq!(store.create_room("", 6).unwrap().max_participants, 6);
     }
 
     // ── Join / mesh URLs / cap enforcement ───────────────────────────────────
