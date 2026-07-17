@@ -83,7 +83,12 @@ pub struct VhTenantNote {
     pub tenant_id: String,
 }
 
-#[autumn_web::repository(VhTenantNote, table = "vh_tenant_notes", tenant_scoped, versioned = true)]
+#[autumn_web::repository(
+    VhTenantNote,
+    table = "vh_tenant_notes",
+    tenant_scoped,
+    versioned = true
+)]
 pub trait VhTenantNoteRepository {}
 
 /// The SQLite `_autumn_version_history` DDL — the exact fork shipped in
@@ -255,7 +260,10 @@ async fn version_history_time_range_filter_on_sqlite() {
         )
         .await
         .expect("wide range read");
-    assert_eq!(wide.total, 1, "the insert falls inside the straddling window");
+    assert_eq!(
+        wide.total, 1,
+        "the insert falls inside the straddling window"
+    );
     assert_eq!(wide.entries.len(), 1);
 
     // A future-only window excludes it.

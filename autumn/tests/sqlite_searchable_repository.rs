@@ -96,7 +96,12 @@ pub struct TenantSearchNote {
     pub tenant_id: String,
 }
 
-#[autumn_web::repository(TenantSearchNote, table = "tenant_search_notes", tenant_scoped, searchable)]
+#[autumn_web::repository(
+    TenantSearchNote,
+    table = "tenant_search_notes",
+    tenant_scoped,
+    searchable
+)]
 pub trait TenantSearchNoteRepository {}
 
 // Owner-scoped searchable repository — for the `search_page_scoped` proof.
@@ -197,15 +202,23 @@ async fn search_matches_substrings_case_insensitively_on_sqlite() {
     // Case-insensitive: lowercase query "rust" matches "Rust ..." (title) and
     // "... RUST-free ..." (body), but never the gardening row.
     let hits = repo.search("rust").await.expect("search rust");
-    assert_eq!(hits.len(), 2, "both rust rows match, gardening excluded: {hits:?}");
+    assert_eq!(
+        hits.len(),
+        2,
+        "both rust rows match, gardening excluded: {hits:?}"
+    );
     assert!(
-        hits.iter().all(|n| n.title.to_lowercase().contains("rust")
-            || n.body.to_lowercase().contains("rust")),
+        hits.iter()
+            .all(|n| n.title.to_lowercase().contains("rust")
+                || n.body.to_lowercase().contains("rust")),
         "every hit must actually contain the term: {hits:?}"
     );
 
     // Uppercase query still matches (case folded on both sides).
-    let hits_upper = repo.search("PROGRAMMING").await.expect("search PROGRAMMING");
+    let hits_upper = repo
+        .search("PROGRAMMING")
+        .await
+        .expect("search PROGRAMMING");
     assert_eq!(hits_upper.len(), 1, "one programming row: {hits_upper:?}");
     assert_eq!(hits_upper[0].title, "Rust Programming");
 
@@ -253,7 +266,10 @@ async fn search_treats_like_metacharacters_literally_on_sqlite() {
     // `%` is escaped: "50%" matches only the literal-percent row, NOT "50X".
     let pct = repo.search("50%").await.expect("search 50%");
     assert_eq!(pct.len(), 1, "only the literal 50% row matches: {pct:?}");
-    assert!(pct[0].body.contains("50% off"), "matched the wrong row: {pct:?}");
+    assert!(
+        pct[0].body.contains("50% off"),
+        "matched the wrong row: {pct:?}"
+    );
 
     // `_` is escaped: "a_b" matches only the literal-underscore row, NOT "axb"
     // (an unescaped `_` would match any single char and catch "axb" too).
@@ -263,7 +279,10 @@ async fn search_treats_like_metacharacters_literally_on_sqlite() {
         1,
         "only the literal a_b row matches, not axb: {underscore:?}"
     );
-    assert!(underscore[0].body.contains("a_b"), "matched the wrong row: {underscore:?}");
+    assert!(
+        underscore[0].body.contains("a_b"),
+        "matched the wrong row: {underscore:?}"
+    );
 
     // A bare `%` must NOT return everything (it would with an unescaped LIKE).
     let bare_pct = repo.search("%").await.expect("search bare %");
@@ -297,8 +316,14 @@ async fn search_page_paginates_on_sqlite() {
     .expect("save gadget");
 
     let req = PageRequest::new(1, 2);
-    let page = repo.search_page("widget", &req).await.expect("search_page widget");
-    assert_eq!(page.total_elements, 3, "three widgets match, gadget excluded");
+    let page = repo
+        .search_page("widget", &req)
+        .await
+        .expect("search_page widget");
+    assert_eq!(
+        page.total_elements, 3,
+        "three widgets match, gadget excluded"
+    );
     assert_eq!(page.content.len(), 2, "first page holds two rows");
     // id DESC ordering: newest widgets first.
     assert!(
@@ -308,8 +333,15 @@ async fn search_page_paginates_on_sqlite() {
     );
 
     let req2 = PageRequest::new(2, 2);
-    let page2 = repo.search_page("widget", &req2).await.expect("search_page page 2");
-    assert_eq!(page2.content.len(), 1, "second page holds the remaining row");
+    let page2 = repo
+        .search_page("widget", &req2)
+        .await
+        .expect("search_page page 2");
+    assert_eq!(
+        page2.content.len(),
+        1,
+        "second page holds the remaining row"
+    );
     assert_eq!(page2.total_elements, 3);
 }
 
@@ -433,5 +465,9 @@ async fn search_page_scoped_isolates_owner_on_sqlite() {
         .search_page_scoped(3, "report", &req)
         .await
         .expect("scoped search for owner 3");
-    assert_eq!(p3.total_elements, 0, "owner 3 owns no matching rows: {:?}", p3.content);
+    assert_eq!(
+        p3.total_elements, 0,
+        "owner 3 owns no matching rows: {:?}",
+        p3.content
+    );
 }

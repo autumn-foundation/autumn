@@ -17318,8 +17318,8 @@ mod tests {
         // unchanged deferred `scoped_transaction` on Postgres). Read paths never
         // take a write transaction, and the deferred primitive is still used by
         // non-RMW writes (save/bulk), so the seam is not a blanket swap.
-        let generated = repository_macro(quote! { Post }, quote! { pub trait PostRepository {} })
-            .to_string();
+        let generated =
+            repository_macro(quote! { Post }, quote! { pub trait PostRepository {} }).to_string();
 
         // with_lock is the canonical pessimistic write RMW.
         let wl_start = generated
@@ -19360,8 +19360,7 @@ mod tests {
             .expect("versioned repository must write history");
         let write_section = &generated[write_pos..];
         assert!(
-            write_section.contains("$7 :: jsonb")
-                || write_section.contains("$7::jsonb"),
+            write_section.contains("$7 :: jsonb") || write_section.contains("$7::jsonb"),
             "the Postgres write arm must keep the $7::jsonb cast: {write_section}"
         );
         // The SQLite insert names all eight columns (recorded_at bound
@@ -19369,7 +19368,9 @@ mod tests {
         // its `\`-continuations, so the column list and the VALUES clause are on
         // separate source lines — assert each single-line fragment independently.
         assert!(
-            generated.contains("(table_name, tenant_id, record_id, op, actor, request_id, changes, recorded_at)"),
+            generated.contains(
+                "(table_name, tenant_id, record_id, op, actor, request_id, changes, recorded_at)"
+            ),
             "the SQLite write arm must bind recorded_at as an 8th column: {generated}"
         );
         assert!(

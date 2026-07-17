@@ -131,12 +131,7 @@ async fn concurrent_immediate_rmw_writers_serialize_without_lost_update() {
     let pool = boot_pool(&tmp.path().join("serialize.db")).await;
     let repo = PgCounterRepository::with_pool_untracked(pool);
 
-    let base = repo
-        .save(&NewCounter {
-            value: 0,
-        })
-        .await
-        .expect("seed row");
+    let base = repo.save(&NewCounter { value: 0 }).await.expect("seed row");
 
     // Writer A holds the immediate write lock for 150ms, then +10.
     // Writer B starts ~40ms later so A already owns the lock; its own
@@ -156,7 +151,10 @@ async fn concurrent_immediate_rmw_writers_serialize_without_lost_update() {
         .expect("find")
         .expect("row exists");
     // Both increments landed on top of A's committed value → no lost update.
-    assert_eq!(final_row.value, 15, "both writers' increments are reflected");
+    assert_eq!(
+        final_row.value, 15,
+        "both writers' increments are reflected"
+    );
 }
 
 #[tokio::test]
@@ -165,12 +163,7 @@ async fn update_queued_behind_held_write_lock_commits() {
     let pool = boot_pool(&tmp.path().join("queued.db")).await;
     let repo = PgCounterRepository::with_pool_untracked(pool);
 
-    let base = repo
-        .save(&NewCounter {
-            value: 1,
-        })
-        .await
-        .expect("seed row");
+    let base = repo.save(&NewCounter { value: 1 }).await.expect("seed row");
 
     // A holds the write lock 150ms; B is the generated `update` RMW (also
     // BEGIN IMMEDIATE) — it must queue and then succeed, never erroring.
@@ -211,12 +204,7 @@ async fn single_writer_update_commits_and_bumps_lock_version() {
     let pool = boot_pool(&tmp.path().join("single.db")).await;
     let repo = PgCounterRepository::with_pool_untracked(pool);
 
-    let base = repo
-        .save(&NewCounter {
-            value: 7,
-        })
-        .await
-        .expect("seed row");
+    let base = repo.save(&NewCounter { value: 7 }).await.expect("seed row");
 
     let updated = repo
         .update(
@@ -238,12 +226,7 @@ async fn errored_rmw_rolls_back_the_immediate_transaction() {
     let pool = boot_pool(&tmp.path().join("rollback.db")).await;
     let repo = PgCounterRepository::with_pool_untracked(pool);
 
-    let base = repo
-        .save(&NewCounter {
-            value: 5,
-        })
-        .await
-        .expect("seed row");
+    let base = repo.save(&NewCounter { value: 5 }).await.expect("seed row");
 
     // Mutate inside the immediate transaction, then return Err → the SQLite arm
     // must ROLLBACK, leaving the row untouched.
