@@ -120,6 +120,8 @@ Because every piece comes from the same `SchemaEntry` data the OpenAPI
 generator uses, **there is no second schema to maintain** and no way for the
 tool catalog to drift from the handler.
 
+The per-tool `inputSchema` is generated from the request types via the `OpenApiSchema` derive, so there is no second schema to hand-maintain; serde `rename`s are honoured, tool identity is collision-proof, and a build-time guard warns when a nested `Query<T>` field should instead be carried as a `Json<T>` body.
+
 ### Query is flat — put structured input in the body
 
 `Query<T>` deserializes with
@@ -346,6 +348,8 @@ autumn_web::app()
     .run()
     .await;
 ```
+
+The store is seedable for tests and local development: `InMemoryApiTokenStore::default().with_token("dev-token", "user:dev")` (or `.with_scoped_token(raw, principal, &scopes)`), and `InMemoryApiTokenStore::from_env("AUTUMN_API_TOKEN", "user:dev")` reads the raw token from an environment variable (erroring if it is unset or empty). Both are for tests/local runs — not production token storage.
 
 A `tools/call` with no token is rejected by `RequireApiToken` and surfaces as
 `isError: true`; the same call with a valid `Authorization: Bearer <token>`
@@ -622,7 +626,9 @@ that from convention to a structural guarantee.)
 > chosen `mount_mcp` path is free. If a real handler is already mounted at the
 > same path, `axum` panics at startup on the duplicate route (loud and early,
 > not a silent failure). Pick a path you don't otherwise serve — `/mcp` is the
-> convention.
+> convention. Relatedly, a user-defined route at an auto-mounted probe path
+> (`GET /health`, `/live`, `/ready`, `/startup`) now wins over the built-in
+> probe and logs an INFO override rather than panicking at startup.
 
 ---
 

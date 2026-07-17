@@ -41,6 +41,17 @@ guide is the published contract for exactly which is which.
 
 ---
 
+> **Update (this release):** the SQLite *runtime* has now landed behind the `sqlite` cargo feature. The sections further down that describe SQLite being *refused at boot* or list runtime rows as *planned* predate that work; the runtime now boots, migrates, and serves against a `sqlite://` database as described immediately below.
+
+## Runtime (behind the `sqlite` feature)
+
+Enable the runtime by building the application with the `sqlite` cargo feature (it must be enabled only by the end application, never by a library). Autumn then boots and serves against a `sqlite://` URL:
+
+- **Connection type.** A `RuntimeConnection` alias abstracts the backend: `diesel_async::AsyncPgConnection` by default, and a `SyncConnectionWrapper<SqliteConnection>` under the `sqlite` feature. Generated repositories and hand-written queries take `&mut RuntimeConnection`, so they compile against either backend.
+- **Pool pragmas.** Each pooled connection is set up with `PRAGMA busy_timeout = 5000` (first, so later statements queue on it), `PRAGMA journal_mode = WAL`, `PRAGMA synchronous = NORMAL`, and `PRAGMA foreign_keys = ON`. A read-only SQLite target skips the two writing pragmas (WAL + `synchronous`). An in-memory database is pinned to a single pooled connection.
+- **Migrations.** Startup migrations run through diesel's `MigrationHarness` on a plain `SqliteConnection` with **no advisory lock** (SQLite is single-writer, so there is nothing to coordinate). Only `busy_timeout` is set on the migration connection — `foreign_keys = ON` is deliberately *omitted* there because it breaks table-recreating migrations.
+- **Repository CRUD.** Generated `#[repository]` / `#[model]` CRUD targets SQLite via two seams: `maybe_for_update!` expands to a plain read on SQLite (which has no `SELECT … FOR UPDATE`), so a pessimistic-lock read degrades to a plain read while write-write correctness still rests on the optimistic `lock_version` check plus the pool `busy_timeout`; and `backend_select! { pg => {…}, sqlite => {…} }` picks backend-specific SQL for the shapes that differ (multi-row batch insert vs. per-row loop, batched `ON CONFLICT` upsert vs. per-row upsert, and `RETURNING` handling). Tenant scoping and `lock_version` semantics are preserved on both backends.
+
 ## When to choose SQLite vs Postgres
 
 SQLite is an excellent production database when your workload fits inside its
@@ -339,6 +350,10 @@ actionable message:
   GIN indexes) — rejected at generate time because `tsvector` has no SQLite
   column type. SQLite FTS5 is a later slice, not this one; see
   [Full-text search](./full-text-search.md).
+- **Scoped / searchable repositories** (`--search` / full-text-search repos) are Postgres-only and are not generated on the SQLite backend.
+- **Version-history (`jsonb`) columns** rely on Postgres `jsonb` semantics and are not supported on the SQLite runtime.
+- **A server-side statement timeout** has no SQLite equivalent; long-running statements are bounded by `busy_timeout` (lock contention) only, not a wall-clock cap.
+- **Explicit `BEGIN IMMEDIATE` write reservation** is used only where migration serialization requires it; general application transactions use SQLite's default deferred behaviour.
 
 ---
 
