@@ -388,24 +388,60 @@ fn diff_at(
     // (f) Write the migration dir, matching the generator's naming convention.
     let ts = crate::generate::timestamp_now();
     let suffix = crate::generate::naming::snake(name.unwrap_or("schema_update"));
-    let dir = project_root
-        .join("migrations")
-        .join(format!("{ts}_{suffix}"));
-    std::fs::create_dir_all(&dir).map_err(|e| {
-        format!(
-            "failed to create migration directory {}: {e}",
-            dir.display()
-        )
-    })?;
-    std::fs::write(dir.join("up.sql"), &up).map_err(|e| format!("failed to write up.sql: {e}"))?;
-    std::fs::write(dir.join("down.sql"), &down)
-        .map_err(|e| format!("failed to write down.sql: {e}"))?;
+    let dir = write_migration_dir(project_root, &ts, &suffix, &up, &down)?;
     println!(
         "wrote migration {} ({} change(s))",
         dir.display(),
         plan.changes.len()
     );
     Ok(())
+}
+
+/// Write a `migrations/<ts>_<suffix>/{up,down}.sql` pair, creating the leaf
+/// directory **exclusively**.
+///
+/// `create_dir_all` on the leaf would silently succeed if the directory already
+/// existed and the following `fs::write`s would then OVERWRITE any `up.sql` /
+/// `down.sql` already there — and because `timestamp_now` has 1-second
+/// resolution, two `--write-migration --name <same>` runs in the same second
+/// resolve to the same directory. So the parent `migrations/` is created
+/// idempotently but the leaf is created with `create_dir`, which fails with
+/// `AlreadyExists` if it is already present; that case is mapped to a clear
+/// refusal and **neither** SQL file is written, so an already-generated (and
+/// possibly committed or applied) migration is never clobbered.
+fn write_migration_dir(
+    project_root: &Path,
+    ts: &str,
+    suffix: &str,
+    up: &str,
+    down: &str,
+) -> Result<std::path::PathBuf, String> {
+    let migrations_dir = project_root.join("migrations");
+    let dir = migrations_dir.join(format!("{ts}_{suffix}"));
+    std::fs::create_dir_all(&migrations_dir).map_err(|e| {
+        format!(
+            "failed to create migrations directory {}: {e}",
+            migrations_dir.display()
+        )
+    })?;
+    std::fs::create_dir(&dir).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::AlreadyExists {
+            format!(
+                "refusing to overwrite existing migration directory {}; a migration with this \
+                 timestamp and name already exists",
+                dir.display()
+            )
+        } else {
+            format!(
+                "failed to create migration directory {}: {e}",
+                dir.display()
+            )
+        }
+    })?;
+    std::fs::write(dir.join("up.sql"), up).map_err(|e| format!("failed to write up.sql: {e}"))?;
+    std::fs::write(dir.join("down.sql"), down)
+        .map_err(|e| format!("failed to write down.sql: {e}"))?;
+    Ok(dir)
 }
 
 /// Parse a file or directory and render the tables as pretty JSON, surfacing any
@@ -593,6 +629,54 @@ mod tests {
         assert!(
             down.contains("ALTER TABLE posts DROP COLUMN body;"),
             "down: {down}"
+        );
+    }
+
+    /// Round 3 / Finding X: a second `--write-migration` resolving to an
+    /// already-existing `migrations/<ts>_<suffix>/` directory (two runs in the
+    /// same 1-second-resolution timestamp) is REFUSED rather than silently
+    /// overwriting the first migration's SQL. Drives `write_migration_dir`
+    /// directly with a fixed timestamp so the collision is deterministic.
+    #[test]
+    fn write_migration_refuses_to_overwrite_existing_dir() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let dir = write_migration_dir(
+            root.path(),
+            "20260101120000",
+            "add_body",
+            "UP-ONE",
+            "DOWN-ONE",
+        )
+        .expect("first write ok");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("up.sql")).expect("up.sql"),
+            "UP-ONE"
+        );
+
+        // A second write to the same <ts>_<suffix> is refused with a clear error.
+        let err = write_migration_dir(
+            root.path(),
+            "20260101120000",
+            "add_body",
+            "UP-TWO",
+            "DOWN-TWO",
+        )
+        .expect_err("second write to the same dir must be refused");
+        assert!(
+            err.contains("refusing to overwrite") && err.contains("add_body"),
+            "clear refusal naming the colliding dir: {err}"
+        );
+
+        // The first migration's contents are left intact (not clobbered).
+        assert_eq!(
+            std::fs::read_to_string(dir.join("up.sql")).expect("up.sql"),
+            "UP-ONE",
+            "first up.sql untouched"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("down.sql")).expect("down.sql"),
+            "DOWN-ONE",
+            "first down.sql untouched"
         );
     }
 

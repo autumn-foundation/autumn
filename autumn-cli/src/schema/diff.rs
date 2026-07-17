@@ -301,11 +301,12 @@ pub enum DiffError {
         column: String,
     },
 
-    /// A table is dropped while a retained table still references it (unsupported
-    /// this slice, **no override** — `--allow-destructive` does not permit it).
+    /// A table is dropped while another table (a retained baseline table, or a
+    /// new/retained desired table) references it (unsupported this slice, **no
+    /// override** — `--allow-destructive` does not permit it).
     #[error(
-        "cannot drop table `{table}`: the retained table `{referencing_table}.{referencing_column}` \
-         still has a foreign key referencing it. Dropping `{table}` would violate that constraint, \
+        "cannot drop table `{table}`: `{referencing_table}.{referencing_column}` \
+         has a foreign key referencing it. Dropping `{table}` would violate that constraint, \
          and this engine has no way to drop the inbound foreign key first. Drop or retarget \
          `{referencing_table}.{referencing_column}` first. (--allow-destructive does not override \
          this: it authorizes losing this table's data, not breaking another table's integrity.)"
@@ -313,7 +314,7 @@ pub enum DiffError {
     DropTableInboundReference {
         /// The table that cannot be dropped.
         table: String,
-        /// The retained table holding the inbound foreign key.
+        /// The table holding the inbound foreign key.
         referencing_table: String,
         /// The column carrying the inbound foreign key.
         referencing_column: String,
@@ -442,20 +443,33 @@ pub fn diff_schema(baseline: &[Table], desired: &ParsedSchema, opts: DiffOptions
         }
     }
 
-    detect_inbound_fk_blocks(baseline, &mut changes);
+    detect_inbound_fk_blocks(baseline, desired, &mut changes);
 
     MigrationPlan { backend, changes }
 }
 
-/// Post-pass: for every dropped table, flag a retained table that still holds a
-/// baseline foreign key referencing it. Such a `DROP TABLE` is unappliable (PG
-/// rejects it and this engine has no `DropForeignKey`), so a non-emittable
+/// Post-pass: for every dropped table, flag any table that still holds a foreign
+/// key referencing it. Such a `DROP TABLE` is unappliable (PG rejects it and this
+/// engine has no `DropForeignKey`), so a non-emittable
 /// [`SchemaChange::DropTableBlockedByInboundFk`] marker is appended for
-/// [`guard_plan`] to refuse. Self-referential FKs and FKs from a table that is
-/// itself being dropped are excluded — those constraints go away with their
-/// table. Deterministic: markers are sorted by (dropped, referencing table,
-/// referencing column).
-fn detect_inbound_fk_blocks(baseline: &[Table], changes: &mut Vec<SchemaChange>) {
+/// [`guard_plan`] to refuse.
+///
+/// Two referencer sources are scanned: the **baseline** side (a retained table
+/// whose pre-existing FK targets a dropped table) and the **desired** side (a new
+/// table, or a retained table with a newly-added FK column, referencing a dropped
+/// table — the case the baseline scan cannot see, e.g. drop `users` while adding
+/// `posts.author_id #[references(table = "users")]`). A dropped table is absent
+/// from `desired`, so a self-referential FK and an FK from a co-dropped table are
+/// excluded structurally on the desired side; the baseline scan excludes a
+/// referencer that is itself being dropped — either way those constraints go away
+/// with their table. Markers are deduplicated (a pre-existing FK on a retained
+/// table appears on both sides) and, via the `BTreeSet`, deterministically sorted
+/// by (dropped, referencing table, referencing column).
+fn detect_inbound_fk_blocks(
+    baseline: &[Table],
+    desired: &ParsedSchema,
+    changes: &mut Vec<SchemaChange>,
+) {
     let dropped: BTreeSet<&str> = changes
         .iter()
         .filter_map(|c| match c {
@@ -467,7 +481,11 @@ fn detect_inbound_fk_blocks(baseline: &[Table], changes: &mut Vec<SchemaChange>)
         return;
     }
 
-    let mut blocks: Vec<(String, String, String)> = Vec::new();
+    // (dropped table, referencing table, referencing column); BTreeSet dedups the
+    // baseline/desired overlap and keeps the emission order deterministic.
+    let mut blocks: BTreeSet<(String, String, String)> = BTreeSet::new();
+
+    // Baseline side: a retained table whose baseline FK targets a dropped table.
     for table in baseline {
         // A referencer that is itself being dropped takes its FK with it.
         if dropped.contains(table.name.as_str()) {
@@ -477,11 +495,27 @@ fn detect_inbound_fk_blocks(baseline: &[Table], changes: &mut Vec<SchemaChange>)
             if let Some(fk) = &column.references
                 && dropped.contains(fk.table.as_str())
             {
-                blocks.push((fk.table.clone(), table.name.clone(), column.name.clone()));
+                blocks.insert((fk.table.clone(), table.name.clone(), column.name.clone()));
             }
         }
     }
-    blocks.sort();
+
+    // Desired side: a managed new-or-retained table whose FK targets a dropped
+    // table (only managed desired tables emit any SQL). Dropped tables are absent
+    // from `desired`, so self-references and co-dropped referencers never appear.
+    for table in &desired.tables {
+        if !table.managed {
+            continue;
+        }
+        for column in &table.columns {
+            if let Some(fk) = &column.references
+                && dropped.contains(fk.table.as_str())
+            {
+                blocks.insert((fk.table.clone(), table.name.clone(), column.name.clone()));
+            }
+        }
+    }
+
     changes.extend(
         blocks
             .into_iter()
@@ -2908,6 +2942,50 @@ mod tests {
         let users = posts_ref_table("users", parent);
         let plan = diff_schema(&[users], &parsed(vec![], vec![]), ALLOW);
         guard_plan(&plan, ALLOW).expect("self-referential FK goes away with the table");
+    }
+
+    /// Round 3 / Finding Y: a DESIRED-side FK to a table being dropped in the
+    /// same plan is refused. Drop `users` while adding `posts.author_id ->
+    /// users`; the emitted `CREATE TABLE posts ... REFERENCES users` would depend
+    /// on the dropped `users`, so PG rejects. The round-2 baseline-only guard
+    /// missed this — only desired-side references catch it.
+    #[test]
+    fn desired_side_fk_to_dropped_table_is_refused() {
+        // baseline: users (managed, no inbound FK). desired: users gone, new
+        // posts.author_id -> users.
+        let users = Table::new("users", Backend::Postgres);
+        let mut author_fk = col("author_id", ColumnType::Int64);
+        author_fk.references = Some(ForeignKey::new("users", "id"));
+        let posts = posts_ref_table("posts", author_fk);
+        let plan = diff_schema(&[users], &parsed(vec![posts], vec![]), ALLOW);
+        let err = guard_plan(&plan, ALLOW)
+            .expect_err("new posts.author_id -> users blocks DROP TABLE users");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("users") && msg.contains("posts.author_id"),
+            "names the dropped table and the desired-side referencer: {msg}"
+        );
+    }
+
+    /// Round 3 / Finding Y control: a desired-side FK pointing at a RETAINED
+    /// table is NOT a blocker even while an unrelated table is dropped — only
+    /// references to a *dropped* table are refused (no over-refusal).
+    #[test]
+    fn desired_side_fk_to_retained_table_is_allowed() {
+        // baseline: users (retained) + stale (dropped). desired: users retained,
+        // stale gone, new posts.author_id -> users (a retained table).
+        let users = Table::new("users", Backend::Postgres);
+        let stale = Table::new("stale", Backend::Postgres);
+        let mut author_fk = col("author_id", ColumnType::Int64);
+        author_fk.references = Some(ForeignKey::new("users", "id"));
+        let posts = posts_ref_table("posts", author_fk);
+        let plan = diff_schema(
+            &[users.clone(), stale],
+            &parsed(vec![users, posts], vec![]),
+            ALLOW,
+        );
+        guard_plan(&plan, ALLOW)
+            .expect("FK to a retained table is fine even while another table is dropped");
     }
 
     /// Finding B: a non-implicit type change (`TEXT` → `INTEGER`) has no implicit
