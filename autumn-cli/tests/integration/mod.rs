@@ -21,6 +21,7 @@ mod scaffold_validation;
 mod schema_migrate;
 #[cfg(feature = "sqlite")]
 mod schema_migrate_sqlite;
+mod schema_pull;
 mod seed_model_linking;
 #[cfg(unix)]
 mod serve;
