@@ -101,6 +101,23 @@ pub enum ColumnType {
         /// The allowed variant labels, in declaration order.
         variants: Vec<String>,
     },
+    /// A Postgres type outside Autumn's mapped surface, **preserved verbatim** by
+    /// database introspection (`autumn schema pull`) so an unmappable column is
+    /// never silently dropped from the snapshot IR.
+    ///
+    /// This variant is **introspection/snapshot-only**: it records the raw
+    /// Postgres type name (e.g. `inet`, `citext`, `macaddr`) exactly as read from
+    /// the catalog. [`sql_type`](Self::sql_type) emits `pg_type` verbatim (on both
+    /// backends), so a pulled snapshot round-trips the raw type. It is deliberately
+    /// **not** intended for Rust codegen in this slice — [`rust_type`](Self::rust_type)
+    /// and [`diesel_type`](Self::diesel_type) return a safe `String`/`Text`
+    /// sentinel rather than a faithful mapping (an opaque type has no known Rust
+    /// representation), and there is no forward DSL / `#[model]` source that
+    /// produces it.
+    Opaque {
+        /// The raw Postgres type name (`udt_name`), preserved exactly.
+        pg_type: String,
+    },
 }
 
 impl ColumnType {
@@ -114,7 +131,10 @@ impl ColumnType {
     #[must_use]
     pub fn rust_type(&self) -> String {
         match self {
-            Self::Text | Self::Enum { .. } => "String",
+            // `Opaque` is introspection-only and has no known Rust representation,
+            // so it shares the `String` storage-fallback sentinel (it is not
+            // intended for Rust codegen in this slice — never panics).
+            Self::Text | Self::Enum { .. } | Self::Opaque { .. } => "String",
             Self::Int32 => "i32",
             Self::Int64 => "i64",
             Self::Bool => "bool",
@@ -141,7 +161,9 @@ impl ColumnType {
     pub const fn diesel_type(&self, backend: Backend) -> &'static str {
         match backend {
             Backend::Postgres => match self {
-                Self::Text | Self::Enum { .. } => "Text",
+                // `Opaque` shares the `Text` diesel sentinel (introspection-only,
+                // not intended for diesel codegen).
+                Self::Text | Self::Enum { .. } | Self::Opaque { .. } => "Text",
                 Self::Int32 => "Int4",
                 Self::Int64 => "Int8",
                 Self::Bool => "Bool",
@@ -155,11 +177,13 @@ impl ColumnType {
                 Self::Decimal { .. } => "Numeric",
             },
             Backend::Sqlite => match self {
+                // `Opaque` shares the `Text` diesel sentinel (introspection-only).
                 Self::Text
                 | Self::Uuid
                 | Self::Attachment
                 | Self::Decimal { .. }
-                | Self::Enum { .. } => "Text",
+                | Self::Enum { .. }
+                | Self::Opaque { .. } => "Text",
                 Self::Int32 => "Int4",
                 Self::Int64 => "Int8",
                 Self::Bool => "Bool",
@@ -197,6 +221,8 @@ impl ColumnType {
                 Self::Bytes => "BYTEA".to_owned(),
                 Self::Attachment => "JSONB".to_owned(),
                 Self::Decimal { precision, scale } => format!("NUMERIC({precision},{scale})"),
+                // Preserved verbatim: the raw Postgres type name round-trips.
+                Self::Opaque { pg_type } => pg_type.clone(),
             },
             Backend::Sqlite => match self {
                 Self::Text
@@ -209,6 +235,10 @@ impl ColumnType {
                 Self::Int32 | Self::Int64 | Self::Bool => "INTEGER".to_owned(),
                 Self::Float32 | Self::Float64 => "REAL".to_owned(),
                 Self::Bytes => "BLOB".to_owned(),
+                // Preserved verbatim (an `Opaque` is only ever produced by
+                // Postgres introspection, but the arm is emitted on both backends
+                // for exhaustiveness and never loses the raw type name).
+                Self::Opaque { pg_type } => pg_type.clone(),
             },
         }
     }
@@ -232,6 +262,8 @@ impl ColumnType {
                 | Self::Decimal { .. }
                 | Self::TimestampTz
                 | Self::Enum { .. }
+                // Introspection-only: an opaque type has no known diesel conversion.
+                | Self::Opaque { .. }
         )
     }
 
@@ -268,6 +300,58 @@ impl ColumnType {
             // `jsonb` (ambiguous Blob-vs-JSON) and `numeric` (missing
             // precision/scale) are intentionally unsupported — see the doc above.
             _ => None,
+        }
+    }
+
+    /// The centralized database-introspection inverse used by `autumn schema
+    /// pull`: resolve a Postgres `udt_name` plus its catalog `numeric_precision`
+    /// / `numeric_scale` (only meaningful for `numeric`/`decimal`) to a
+    /// [`ColumnType`] that is **always** produced — an unmappable type is
+    /// preserved as [`Opaque`](Self::Opaque) rather than dropped.
+    ///
+    /// Resolution order:
+    ///
+    /// 1. [`from_pg_udt`](Self::from_pg_udt) — the shared mapped surface
+    ///    (`text`/`int4`/`int8`/`bool`/`float4`/`float8`/`uuid`/`timestamp`/
+    ///    `timestamptz`/`bytea`).
+    /// 2. `numeric` / `decimal` **with** a precision (and scale) available →
+    ///    [`Decimal`](Self::Decimal). A bare `numeric` with no precision carries
+    ///    no `(p, s)` to reconstruct, so it falls through to `Opaque` rather than
+    ///    guessing.
+    /// 3. `jsonb` → [`Attachment`](Self::Attachment). Autumn only ever emits
+    ///    `jsonb` for an [`Attachment`](Self::Attachment) column, so a pulled
+    ///    `jsonb` column is round-tripped as an attachment. (This is the
+    ///    deliberate introspection counterpart to
+    ///    [`from_pg_udt`](Self::from_pg_udt) returning `None` for `jsonb` — that
+    ///    inverse is used by the model-scaffolding `db pull`, which must not
+    ///    guess `Blob` for arbitrary brownfield JSON; the declarative-schema
+    ///    `schema pull` instead prioritises a clean round-trip of Autumn-owned
+    ///    tables.)
+    /// 4. Anything else → [`Opaque`](Self::Opaque) carrying the raw `udt`, so the
+    ///    column is never silently lost.
+    #[must_use]
+    pub fn from_pg_introspection(
+        udt: &str,
+        numeric_precision: Option<i32>,
+        numeric_scale: Option<i32>,
+    ) -> Self {
+        if let Some(mapped) = Self::from_pg_udt(udt) {
+            return mapped;
+        }
+        if matches!(udt, "numeric" | "decimal")
+            && let Some(precision) = numeric_precision
+        {
+            let precision = u8::try_from(precision).unwrap_or(u8::MAX);
+            let scale = numeric_scale
+                .and_then(|s| u8::try_from(s).ok())
+                .unwrap_or(0);
+            return Self::Decimal { precision, scale };
+        }
+        if udt == "jsonb" {
+            return Self::Attachment;
+        }
+        Self::Opaque {
+            pg_type: udt.to_owned(),
         }
     }
 
@@ -552,7 +636,9 @@ mod tests {
     fn rust_type_mapping_is_exhaustive_and_exact() {
         for ct in all_column_types() {
             let expected = match &ct {
-                ColumnType::Text | ColumnType::Enum { .. } => "String",
+                // `Opaque` shares the `String` sentinel; `all_column_types()`
+                // never yields it, but the match must stay exhaustive.
+                ColumnType::Text | ColumnType::Enum { .. } | ColumnType::Opaque { .. } => "String",
                 ColumnType::Int32 => "i32",
                 ColumnType::Int64 => "i64",
                 ColumnType::Bool => "bool",
@@ -765,6 +851,91 @@ mod tests {
         assert_eq!(ColumnType::from_pg_udt("jsonb"), None);
         assert_eq!(ColumnType::from_pg_udt("numeric"), None);
         assert_eq!(ColumnType::from_pg_udt("wat"), None);
+    }
+
+    #[test]
+    fn from_pg_introspection_maps_the_shared_surface() {
+        // Every type the shared `from_pg_udt` maps resolves identically here.
+        for (udt, expected) in [
+            ("text", ColumnType::Text),
+            ("varchar", ColumnType::Text),
+            ("bpchar", ColumnType::Text),
+            ("int4", ColumnType::Int32),
+            ("int8", ColumnType::Int64),
+            ("bool", ColumnType::Bool),
+            ("float4", ColumnType::Float32),
+            ("float8", ColumnType::Float64),
+            ("uuid", ColumnType::Uuid),
+            ("timestamp", ColumnType::Timestamp),
+            ("timestamptz", ColumnType::TimestampTz),
+            ("bytea", ColumnType::Bytes),
+        ] {
+            assert_eq!(
+                ColumnType::from_pg_introspection(udt, None, None),
+                expected,
+                "from_pg_introspection for {udt}"
+            );
+        }
+    }
+
+    #[test]
+    fn from_pg_introspection_numeric_with_precision_is_decimal() {
+        assert_eq!(
+            ColumnType::from_pg_introspection("numeric", Some(12), Some(2)),
+            ColumnType::Decimal {
+                precision: 12,
+                scale: 2
+            }
+        );
+        // `decimal` alias, and a scale that defaults to 0 when NULL.
+        assert_eq!(
+            ColumnType::from_pg_introspection("decimal", Some(8), None),
+            ColumnType::Decimal {
+                precision: 8,
+                scale: 0
+            }
+        );
+        // A bare `numeric` with no precision cannot be reconstructed → Opaque.
+        assert_eq!(
+            ColumnType::from_pg_introspection("numeric", None, None),
+            ColumnType::Opaque {
+                pg_type: "numeric".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn from_pg_introspection_jsonb_is_attachment() {
+        assert_eq!(
+            ColumnType::from_pg_introspection("jsonb", None, None),
+            ColumnType::Attachment
+        );
+    }
+
+    #[test]
+    fn from_pg_introspection_unknown_types_are_preserved_opaque() {
+        for udt in ["inet", "citext", "macaddr", "tsvector", "point"] {
+            assert_eq!(
+                ColumnType::from_pg_introspection(udt, None, None),
+                ColumnType::Opaque {
+                    pg_type: udt.to_owned()
+                },
+                "unmapped {udt} must be preserved as Opaque"
+            );
+        }
+    }
+
+    #[test]
+    fn opaque_sql_type_round_trips_the_raw_name_verbatim() {
+        let ct = ColumnType::from_pg_introspection("inet", None, None);
+        // The raw Postgres type name is emitted verbatim on both backends, so a
+        // pulled snapshot never loses the type.
+        assert_eq!(ct.sql_type(Backend::Postgres), "inet");
+        assert_eq!(ct.sql_type(Backend::Sqlite), "inet");
+        // The codegen sentinels are safe (introspection-only, never panics).
+        assert_eq!(ct.rust_type(), "String");
+        assert_eq!(ct.diesel_type(Backend::Postgres), "Text");
+        assert!(!ct.sqlite_has_diesel_conversion());
     }
 
     #[test]
