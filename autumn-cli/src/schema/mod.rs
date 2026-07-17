@@ -13,6 +13,8 @@
 //! `autumn schema` group.
 
 pub mod diff;
+pub mod doctor;
+pub mod migrate;
 pub mod parse;
 pub mod snapshot;
 
@@ -101,6 +103,28 @@ pub enum SchemaAction {
         #[arg(long)]
         allow_destructive: bool,
     },
+    /// Apply pending migrations against the configured database, then advance the
+    /// checked-in snapshot baseline to the freshly-applied state. Provider-locked
+    /// against the snapshot's dialect; the destructive-change guards ran at diff
+    /// time, so migration files apply verbatim here.
+    Migrate {
+        /// Config profile whose database URL to apply against (defaults to the
+        /// ambient profile resolution the other CLI commands use).
+        #[arg(long, value_name = "PROFILE")]
+        profile: Option<String>,
+    },
+    /// Read-only diagnosis of the declarative-schema state: filesystem, snapshot,
+    /// model drift, backend provider-lock, and pending migrations. Exits
+    /// non-zero when any check is an actionable error.
+    Doctor {
+        /// Config profile whose database URL to probe (defaults to the ambient
+        /// profile resolution the other CLI commands use).
+        #[arg(long, value_name = "PROFILE")]
+        profile: Option<String>,
+        /// Emit the checks as JSON instead of the aligned text report.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// Run an `autumn schema` action. Prints to stdout on success; on error, writes
@@ -130,6 +154,8 @@ pub fn run(action: SchemaAction) {
             name.as_deref(),
             allow_destructive,
         ),
+        SchemaAction::Migrate { profile } => migrate::run_migrate(profile.as_deref()),
+        SchemaAction::Doctor { profile, json } => doctor::run_doctor(profile.as_deref(), json),
     };
     if let Err(message) = result {
         eprintln!("error: {message}");
@@ -144,6 +170,31 @@ const fn map_detected_backend(detected: autumn_web::config::DatabaseBackend) -> 
         autumn_web::config::DatabaseBackend::Postgres => Backend::Postgres,
         autumn_web::config::DatabaseBackend::Sqlite => Backend::Sqlite,
     }
+}
+
+/// Resolve the schema-command backend for an explicit `--profile`, from the
+/// already profile-resolved primary database `url`.
+///
+/// When a URL is configured its scheme is authoritative
+/// ([`DatabaseBackend::detect`](autumn_web::config::DatabaseBackend::detect)),
+/// so `--profile <name>` selects the apply path / provider-lock of the database
+/// it actually acts against; only when no URL is configured does it fall back to
+/// the profile-aware project default
+/// ([`crate::generate::detect_backend_for_profile`]). Shared by `schema migrate`
+/// and `schema doctor` so the two commands can never derive the backend
+/// inconsistently for the same profile. With `profile == None` the resolution is
+/// unchanged from the ambient behavior.
+fn backend_for_url(project_root: &Path, profile: Option<&str>, url: Option<&str>) -> Backend {
+    url.and_then(autumn_web::config::DatabaseBackend::detect)
+        .map_or_else(
+            || {
+                map_detected_backend(crate::generate::detect_backend_for_profile(
+                    project_root,
+                    profile,
+                ))
+            },
+            map_detected_backend,
+        )
 }
 
 /// Resolve the default models source when `--from` is omitted: the app's
@@ -167,6 +218,24 @@ fn resolve_default_models_path(project_root: &Path) -> Result<PathBuf, String> {
         dir.display(),
         file.display()
     ))
+}
+
+/// Resolve the declarative models source only when it actually exists.
+///
+/// Mirrors [`resolve_default_models_path`]'s `src/models` dir → `src/models.rs`
+/// file precedence, but returns `None` (not an error) when neither is present —
+/// so callers that must degrade gracefully on absence (the `migrate` snapshot
+/// refresh, `doctor`'s drift check) share one resolver instead of duplicating it.
+fn existing_models_path(project_root: &Path) -> Option<PathBuf> {
+    let dir = project_root.join("src").join("models");
+    if dir.is_dir() {
+        return Some(dir);
+    }
+    let file = project_root.join("src").join("models.rs");
+    if file.is_file() {
+        return Some(file);
+    }
+    None
 }
 
 /// Whether the `snapshot` command requires the current directory to be the
@@ -956,6 +1025,45 @@ mod tests {
             ])
             .is_ok()
         );
+    }
+
+    /// Findings 2 & 3 (#2036): the schema-command backend derives from the
+    /// profile-resolved URL when one is configured (its scheme is authoritative),
+    /// and only falls back to the project default when no URL is present — so
+    /// `--profile <name>` picks the apply path / provider-lock of the database it
+    /// acts against, not the ambient project default.
+    #[test]
+    fn backend_for_url_prefers_url_scheme_over_project_default() {
+        // A tempdir with no config → the project default is Postgres.
+        let root = tempfile::tempdir().expect("tempdir");
+        // A configured SQLite URL is authoritative regardless of that default.
+        assert_eq!(
+            backend_for_url(root.path(), None, Some("sqlite://app.db")),
+            Backend::Sqlite
+        );
+        // A configured Postgres URL likewise.
+        assert_eq!(
+            backend_for_url(root.path(), None, Some("postgres://u@h/db")),
+            Backend::Postgres
+        );
+        // No URL → falls back to the profile-aware project default (Postgres here).
+        assert_eq!(backend_for_url(root.path(), None, None), Backend::Postgres);
+    }
+
+    #[test]
+    fn existing_models_path_prefers_dir_then_file_then_none() {
+        let root = tempfile::tempdir().expect("tempdir");
+        assert!(existing_models_path(root.path()).is_none());
+
+        let src = root.path().join("src");
+        std::fs::create_dir_all(&src).expect("mkdir src");
+        let file = src.join("models.rs");
+        std::fs::write(&file, "").expect("write file");
+        assert_eq!(existing_models_path(root.path()), Some(file));
+
+        let dir = src.join("models");
+        std::fs::create_dir_all(&dir).expect("mkdir models");
+        assert_eq!(existing_models_path(root.path()), Some(dir));
     }
 
     #[test]
