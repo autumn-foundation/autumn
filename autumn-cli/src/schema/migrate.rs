@@ -96,11 +96,24 @@ fn migrate_at(project_root: &Path, profile: Option<&str>) -> Result<(), String> 
             .to_string()
     })?;
 
-    // No migrations directory (or an empty one) is a clean success, not an error.
+    // The `migrations/` path is handled in three distinct cases: an absent path
+    // or a readable-but-empty directory is a clean success (no DB call); an
+    // unreadable path or a regular file is an ERROR — never silently skipped, so
+    // a deployment can never boot against an outdated schema by treating an
+    // unreadable directory as "nothing to apply".
     let migrations_dir = project_root.join("migrations");
-    if migrations_dir_is_empty(&migrations_dir) {
-        println!("No migrations to apply.");
-        return Ok(());
+    match classify_migrations_dir(&migrations_dir) {
+        MigrationsDir::Absent | MigrationsDir::Empty => {
+            println!("No migrations to apply.");
+            return Ok(());
+        }
+        MigrationsDir::Unreadable(e) => {
+            return Err(format!(
+                "failed to read migrations directory {}: {e}",
+                migrations_dir.display()
+            ));
+        }
+        MigrationsDir::HasMigrations => {}
     }
 
     // Apply. The destructive-change guards already ran at diff time; migration
@@ -215,12 +228,54 @@ fn file_based_migrations(migrations_dir: &Path) -> Result<FileBasedMigrations, S
     })
 }
 
-/// True when there is nothing to apply: the `migrations/` directory is absent or
-/// contains no migration subdirectories.
-fn migrations_dir_is_empty(migrations_dir: &Path) -> bool {
-    std::fs::read_dir(migrations_dir).map_or(true, |entries| {
-        !entries.filter_map(Result::ok).any(|e| e.path().is_dir())
-    })
+/// Classification of the `migrations/` path for the apply decision.
+///
+/// Distinguishes the three cases the apply path must treat differently: an
+/// absent path and a readable-but-empty directory are both clean no-ops, but an
+/// unreadable path (an I/O error, or a regular file where a directory was
+/// expected) must be surfaced as an error so a deployment can never silently
+/// skip required migrations and boot against an outdated schema.
+#[derive(Debug)]
+enum MigrationsDir {
+    /// The path does not exist — nothing to apply, clean no-op.
+    Absent,
+    /// A readable directory with no migration subdirectories — clean no-op.
+    Empty,
+    /// A readable directory containing at least one migration subdirectory.
+    HasMigrations,
+    /// The path exists but could not be read as a directory (an I/O error, or it
+    /// is a regular file, not a directory) — the caller must error.
+    Unreadable(std::io::Error),
+}
+
+/// Classify the `migrations/` path into [`MigrationsDir`].
+///
+/// An absent path is [`MigrationsDir::Absent`]. Otherwise the path must be a
+/// readable directory: a `read_dir` failure — including the "path is a regular
+/// file" case, on which `read_dir` errors — is [`MigrationsDir::Unreadable`],
+/// never silently treated as empty. A readable directory is
+/// [`MigrationsDir::HasMigrations`] when it contains at least one migration
+/// subdirectory (the diesel layout) and [`MigrationsDir::Empty`] otherwise. Pure
+/// over the filesystem so the decision is testable without a database.
+fn classify_migrations_dir(migrations_dir: &Path) -> MigrationsDir {
+    match migrations_dir.try_exists() {
+        Ok(false) => return MigrationsDir::Absent,
+        Ok(true) => {}
+        // The path's very existence is unknowable (e.g. a permission error on a
+        // parent) — treat as unreadable, NOT as an absent/empty no-op.
+        Err(e) => return MigrationsDir::Unreadable(e),
+    }
+
+    match std::fs::read_dir(migrations_dir) {
+        Ok(entries) => {
+            if entries.filter_map(Result::ok).any(|e| e.path().is_dir()) {
+                MigrationsDir::HasMigrations
+            } else {
+                MigrationsDir::Empty
+            }
+        }
+        Err(e) => MigrationsDir::Unreadable(e),
+    }
 }
 
 /// Print the applied-migration summary (mirrors `autumn migrate` reporting).
@@ -277,20 +332,83 @@ mod tests {
     use super::*;
 
     #[test]
-    fn migrations_dir_is_empty_true_when_missing_or_no_subdirs() {
+    fn classify_absent_path_is_a_no_op() {
         let root = tempfile::tempdir().expect("tempdir");
-        // Missing entirely.
-        assert!(migrations_dir_is_empty(&root.path().join("migrations")));
-        // Present but empty.
+        // Missing entirely → Absent (clean no-op, no DB call).
+        assert!(matches!(
+            classify_migrations_dir(&root.path().join("migrations")),
+            MigrationsDir::Absent
+        ));
+    }
+
+    #[test]
+    fn classify_readable_empty_dir_is_a_no_op() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let migrations = root.path().join("migrations");
+        // Present but empty → Empty (clean no-op).
+        std::fs::create_dir_all(&migrations).expect("mkdir");
+        assert!(matches!(
+            classify_migrations_dir(&migrations),
+            MigrationsDir::Empty
+        ));
+        // A stray file (not a migration dir) still classifies as Empty.
+        std::fs::write(migrations.join("README.md"), "x").expect("write");
+        assert!(matches!(
+            classify_migrations_dir(&migrations),
+            MigrationsDir::Empty
+        ));
+    }
+
+    #[test]
+    fn classify_dir_with_migration_subdir_proceeds() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let migrations = root.path().join("migrations");
+        std::fs::create_dir_all(migrations.join("20260101000000_init")).expect("mkdir");
+        // A real migration subdir → HasMigrations (proceed to apply).
+        assert!(matches!(
+            classify_migrations_dir(&migrations),
+            MigrationsDir::HasMigrations
+        ));
+    }
+
+    #[test]
+    fn classify_regular_file_is_unreadable_error() {
+        let root = tempfile::tempdir().expect("tempdir");
+        // `migrations` is a regular FILE, not a directory: `read_dir` errors, so
+        // it must classify as Unreadable (an error) — never as an empty no-op.
+        let migrations = root.path().join("migrations");
+        std::fs::write(&migrations, "not a directory").expect("write");
+        assert!(matches!(
+            classify_migrations_dir(&migrations),
+            MigrationsDir::Unreadable(_)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn classify_unreadable_dir_is_an_error() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // A directory with no read permission cannot be listed. Skipped when the
+        // process can bypass the permission bits (e.g. running as root, where
+        // chmod 000 is ignored), which would otherwise make this non-deterministic.
+        let root = tempfile::tempdir().expect("tempdir");
         let migrations = root.path().join("migrations");
         std::fs::create_dir_all(&migrations).expect("mkdir");
-        assert!(migrations_dir_is_empty(&migrations));
-        // A stray file (not a migration dir) still counts as empty.
-        std::fs::write(migrations.join("README.md"), "x").expect("write");
-        assert!(migrations_dir_is_empty(&migrations));
-        // A real migration subdir flips it to non-empty.
-        std::fs::create_dir_all(migrations.join("20260101000000_init")).expect("mkdir");
-        assert!(!migrations_dir_is_empty(&migrations));
+        std::fs::set_permissions(&migrations, std::fs::Permissions::from_mode(0o000))
+            .expect("chmod");
+
+        let can_still_read = std::fs::read_dir(&migrations).is_ok();
+        let classified = classify_migrations_dir(&migrations);
+        // Restore permissions so the tempdir can be cleaned up.
+        std::fs::set_permissions(&migrations, std::fs::Permissions::from_mode(0o755))
+            .expect("restore chmod");
+
+        if can_still_read {
+            // Permission bits were bypassed (root) — the guard cannot be exercised.
+            return;
+        }
+        assert!(matches!(classified, MigrationsDir::Unreadable(_)));
     }
 
     #[test]
