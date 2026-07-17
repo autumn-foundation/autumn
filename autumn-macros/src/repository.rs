@@ -8844,24 +8844,36 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             };
             let vh_upsert_lock_keys = if config.versioned {
                 let table_name = table_name.clone();
+                // `pg_advisory_xact_lock` is a Postgres-only function; SQLite has
+                // no equivalent and would fail at runtime. Cfg-gate the advisory
+                // lock to Postgres via `backend_select!` and skip it on SQLite:
+                // SQLite is single-writer (a write transaction locks the whole
+                // database), so the cross-connection serialization the advisory
+                // lock provides on Postgres is already guaranteed there — nothing
+                // to acquire (issue #1996, PR #2021).
                 quote! {
-                    let mut __autumn_upsert_lock_ids: Vec<_> =
-                        records.iter().map(|r| r.id).collect();
-                    __autumn_upsert_lock_ids.sort_unstable();
-                    __autumn_upsert_lock_ids.dedup();
-                    for __autumn_upsert_lock_id in __autumn_upsert_lock_ids {
-                        let __autumn_upsert_lock_key =
-                            ::autumn_web::repository::repository_upsert_advisory_lock_key(
-                                #table_name,
-                                __autumn_upsert_lock_id,
-                            );
-                        ::autumn_web::reexports::diesel::sql_query("SELECT pg_advisory_xact_lock($1)")
-                            .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(
-                                __autumn_upsert_lock_key,
-                            )
-                            .execute(conn)
-                            .await
-                            .map_err(::autumn_web::AutumnError::from)?;
+                    ::autumn_web::backend_select! {
+                        pg => {
+                            let mut __autumn_upsert_lock_ids: Vec<_> =
+                                records.iter().map(|r| r.id).collect();
+                            __autumn_upsert_lock_ids.sort_unstable();
+                            __autumn_upsert_lock_ids.dedup();
+                            for __autumn_upsert_lock_id in __autumn_upsert_lock_ids {
+                                let __autumn_upsert_lock_key =
+                                    ::autumn_web::repository::repository_upsert_advisory_lock_key(
+                                        #table_name,
+                                        __autumn_upsert_lock_id,
+                                    );
+                                ::autumn_web::reexports::diesel::sql_query("SELECT pg_advisory_xact_lock($1)")
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(
+                                        __autumn_upsert_lock_key,
+                                    )
+                                    .execute(conn)
+                                    .await
+                                    .map_err(::autumn_web::AutumnError::from)?;
+                            }
+                        },
+                        sqlite => {},
                     }
                 }
             } else {
@@ -18822,6 +18834,42 @@ mod tests {
         assert!(
             generated.contains("records . iter () . map (| r | r . id)"),
             "versioned upsert_many lock set must be collected from all input records, not the current chunk: {generated}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_versioned_upsert_many_gates_advisory_lock_to_postgres_only() {
+        // Bug 1 (#1996, PR #2021): `pg_advisory_xact_lock` is a Postgres-only
+        // function; emitting it unconditionally made versioned `upsert_many` fail
+        // at runtime on SQLite. The advisory-lock acquisition must now sit inside
+        // a `backend_select!` whose `pg` arm holds it and whose `sqlite` arm is
+        // empty — SQLite is single-writer, so the serialization is already
+        // guaranteed and nothing must be acquired.
+        let generated = repository_macro(
+            quote! { Post, versioned = true },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        let select_pos = generated
+            .find("backend_select")
+            .expect("versioned upsert_many must wrap the advisory lock in a backend_select!");
+        let lock_pos = generated
+            .find("pg_advisory_xact_lock")
+            .expect("versioned upsert_many must still acquire the advisory lock on Postgres");
+        assert!(
+            select_pos < lock_pos,
+            "the advisory lock must be emitted inside the backend_select! (pg arm), not before it: {generated}"
+        );
+        // The `pg =>` selector must precede the advisory lock, proving it lives in
+        // the Postgres arm (skipped on SQLite where the arm is empty).
+        let pg_arm_pos = generated[select_pos..]
+            .find("pg =>")
+            .map(|p| select_pos + p)
+            .expect("backend_select! must have a pg arm");
+        assert!(
+            pg_arm_pos < lock_pos,
+            "pg_advisory_xact_lock must be inside the `pg =>` arm of the backend_select!: {generated}"
         );
     }
 

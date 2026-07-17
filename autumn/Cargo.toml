@@ -447,6 +447,20 @@ path = "tests/sqlite_scoped_repository.rs"
 name = "sqlite_crud_basic"
 path = "tests/sqlite_crud_basic.rs"
 
+# SQLite upsert isolation + optimistic-lock proof (issue #1996, PR #2021): the two
+# P1 fixes on the cfg-dual `__autumn_execute_upsert` SQLite arm. Proves (Bug 2,
+# SECURITY) a tenant-scoped `upsert_many` under tenant B with tenant A's id leaves
+# tenant A's row untouched (no cross-tenant leak) and (Bug 2, lock) a stale
+# `lock_version` upsert surfaces a 409 — matching Postgres. Runs on an in-memory
+# SQLite pool with no Docker. Bug 1 (advisory-lock cfg-gate) is pinned by the
+# autumn-macros expansion test. Only meaningful under `--features sqlite`; the
+# file is `#![cfg(feature = "sqlite")]` so a default `cargo test` compiles it to
+# an empty (passing) binary. Run explicitly:
+# `cargo test -p autumn-web --features sqlite --test sqlite_upsert_isolation`.
+[[test]]
+name = "sqlite_upsert_isolation"
+path = "tests/sqlite_upsert_isolation.rs"
+
 # SQLite read-only-transaction safety proof (issue #1614, Codex P2). The SQLite
 # arm of `Db::tx_with` cannot enforce `READ ONLY`, so a `TxOptions::read_only()`
 # request is rejected before the closure runs rather than silently running a
