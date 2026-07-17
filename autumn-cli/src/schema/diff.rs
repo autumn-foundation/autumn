@@ -64,6 +64,31 @@
 //! (`DROP NOT NULL`, making a column nullable) is always safe and is emitted
 //! normally.
 //!
+//! # Generated identifiers must fit Postgres's 63-byte limit
+//!
+//! This engine derives some identifiers by unbounded interpolation — the foreign-key
+//! constraint name `{table}_{column}_fkey` (`ADD CONSTRAINT` up, `DROP CONSTRAINT`
+//! down — both derive it identically, so they always agree) — and emits the
+//! parser-provided index names (`idx_<table>_<field>`) verbatim. Postgres silently
+//! truncates any identifier to 63 bytes (`NAMEDATALEN - 1`). A generated name over
+//! that limit is therefore (a) *silently renamed* on apply, risking a mismatch with
+//! hand-written SQL that spells the untruncated name, and (b) a *collision* hazard:
+//! if two generated names in the same migration share their first 63 bytes, PG
+//! accepts the first `ADD CONSTRAINT`/`CREATE INDEX` and rejects the second as a
+//! duplicate relation — an unappliable migration.
+//!
+//! [`guard_plan`] refuses (no override — the SQL is unappliable, not merely lossy)
+//! any Postgres plan that generates an FK-constraint or index identifier **longer
+//! than 63 bytes**, plus (defensively) any pair of generated names that collide
+//! after truncation ([`DiffError::GeneratedIdentifierTooLong`]). Refusing >63-byte
+//! names is the precise rule, not merely a conservative over-refusal: 63 bytes is
+//! exactly the threshold at which PG truncation — and hence both hazards — can
+//! occur, so a name at or under the limit is safe. The check is **Postgres-only**:
+//! `SQLite` has no comparably short identifier limit and does not truncate. Refusal
+//! is the proportionate slice-4 choice; generating a bounded, collision-resistant
+//! name (truncate + short hash suffix, kept in sync across the up and down
+//! renderers) is deferred future work.
+//!
 //! # `SQLite` boundary
 //!
 //! Slice 4 is **pg-first**: it renders Postgres fully and the portable `SQLite`
@@ -435,6 +460,24 @@ pub enum DiffError {
         table: String,
         /// The column whose type change is blocked by an FK constraint.
         column: String,
+    },
+
+    /// A generated FK-constraint or index identifier exceeds Postgres's 63-byte
+    /// identifier limit — or collides with another generated name after PG
+    /// truncates both to 63 bytes (unsupported this slice, **no override** — the
+    /// SQL is unappliable, not merely lossy). Postgres silently truncates any
+    /// identifier to `NAMEDATALEN - 1` (63) bytes, so an over-long generated name
+    /// is both renamed on apply (risking a mismatch with hand-written SQL) and a
+    /// duplicate-relation hazard when two names share their first 63 bytes.
+    /// Postgres-only: `SQLite` has no comparable short limit.
+    #[error(
+        "generated constraint/index name `{name}` exceeds PostgreSQL's 63-byte identifier limit \
+         (or collides with another generated name after truncation to 63 bytes); \
+         shorten the table/column names."
+    )]
+    GeneratedIdentifierTooLong {
+        /// The offending generated identifier.
+        name: String,
     },
 }
 
@@ -1002,6 +1045,16 @@ pub fn guard_plan(plan: &MigrationPlan, opts: DiffOptions) -> Result<(), DiffErr
         return Err(err);
     }
 
+    // 4c. Generated identifier over Postgres's 63-byte limit (or a post-truncation
+    //     collision) — no override. PG silently truncates identifiers to 63 bytes,
+    //     so an over-long FK-constraint / index name is renamed on apply and can
+    //     collide with a sibling generated name (duplicate-relation error). Unappliable
+    //     SQL, not merely lossy, so it always refuses. Postgres-only (SQLite does not
+    //     truncate). See the module docs' 63-byte-limit section.
+    if let Some(err) = find_identifier_limit_violation(plan) {
+        return Err(err);
+    }
+
     // 5. Possible rename — a single table that both dropped and added columns.
     //    Overridable, so it is only enforced when destructive changes are not
     //    allowed. Deliberately checked *before* the required-column guard below so
@@ -1115,6 +1168,74 @@ fn find_fk_type_change_block(plan: &MigrationPlan) -> Option<DiffError> {
         }
         _ => None,
     })
+}
+
+/// Postgres's identifier byte limit (`NAMEDATALEN - 1`). Names longer than this are
+/// silently truncated on apply.
+const PG_MAX_IDENTIFIER_BYTES: usize = 63;
+
+/// The identifiers this engine generates for a plan, in change order: the
+/// `{table}_{column}_fkey` FK-constraint name for each [`SchemaChange::AddForeignKey`]
+/// (rendered as `ADD CONSTRAINT` up / `DROP CONSTRAINT` down, both from this same
+/// derivation), and every index name emitted as a top-level `CREATE INDEX` — the
+/// [`SchemaChange::AddIndex`] index name plus each index on a [`SchemaChange::CreateTable`].
+/// These are exactly the names Postgres would truncate to 63 bytes.
+fn generated_identifiers(plan: &MigrationPlan) -> Vec<String> {
+    let mut names = Vec::new();
+    for change in &plan.changes {
+        match change {
+            SchemaChange::AddForeignKey { table, column, .. } => {
+                names.push(format!("{table}_{column}_fkey"));
+            }
+            SchemaChange::AddIndex { index, .. } => names.push(index.name.clone()),
+            SchemaChange::CreateTable(table) => {
+                names.extend(table.indexes.iter().map(|i| i.name.clone()));
+            }
+            _ => {}
+        }
+    }
+    names
+}
+
+/// `name` truncated to Postgres's 63-byte identifier limit, on a UTF-8 char boundary
+/// (PG truncates by byte; generated names are ASCII, but stay codepoint-safe anyway).
+fn truncate_pg_identifier(name: &str) -> &str {
+    if name.len() <= PG_MAX_IDENTIFIER_BYTES {
+        return name;
+    }
+    let mut end = PG_MAX_IDENTIFIER_BYTES;
+    while !name.is_char_boundary(end) {
+        end -= 1;
+    }
+    &name[..end]
+}
+
+/// The [`DiffError::GeneratedIdentifierTooLong`] refusal when the plan generates an
+/// FK-constraint or index identifier over Postgres's 63-byte limit, or two generated
+/// names that collide after truncation to 63 bytes. Postgres-only — `SQLite` does not
+/// truncate identifiers to a short limit, so the hazard does not apply there.
+fn find_identifier_limit_violation(plan: &MigrationPlan) -> Option<DiffError> {
+    if plan.backend != Backend::Postgres {
+        return None;
+    }
+    let mut by_truncated: BTreeMap<String, String> = BTreeMap::new();
+    for name in generated_identifiers(plan) {
+        // Over the limit: PG truncates it silently — refuse outright (this alone
+        // catches every post-truncation collision, since a collision requires at
+        // least one name to exceed 63 bytes).
+        if name.len() > PG_MAX_IDENTIFIER_BYTES {
+            return Some(DiffError::GeneratedIdentifierTooLong { name });
+        }
+        // Defensive precise check: two within-limit names truncate to themselves,
+        // so this fires only on an exact duplicate generated name.
+        if let Some(prev) =
+            by_truncated.insert(truncate_pg_identifier(&name).to_owned(), name.clone())
+            && prev != name
+        {
+            return Some(DiffError::GeneratedIdentifierTooLong { name });
+        }
+    }
+    None
 }
 
 /// The [`DiffError::PossibleRename`] refusal for the first both-present table that
@@ -2403,6 +2524,107 @@ mod tests {
             DEFAULT_OPTS,
         );
         assert!(plan.is_empty(), "unchanged FK → empty plan: {plan:?}");
+    }
+
+    #[test]
+    fn fk_constraint_name_collision_after_truncation_is_refused() {
+        // A >63-byte table name plus two added FK columns whose derived
+        // `{table}_{column}_fkey` names share their first 63 bytes. PG truncates
+        // both `ADD CONSTRAINT` names to the same 63-byte identifier, accepts the
+        // first and rejects the second as a duplicate relation — an unappliable
+        // migration. The guard refuses it (no override).
+        let long_table = "a".repeat(60); // {table}_{col}_fkey is well over 63 bytes.
+        let plan = MigrationPlan {
+            backend: Backend::Postgres,
+            changes: vec![
+                SchemaChange::AddForeignKey {
+                    table: long_table.clone(),
+                    column: "author_id".to_owned(),
+                    foreign_key: ForeignKey::new("users", "id"),
+                },
+                SchemaChange::AddForeignKey {
+                    table: long_table,
+                    column: "editor_id".to_owned(),
+                    foreign_key: ForeignKey::new("users", "id"),
+                },
+            ],
+        };
+        let err = guard_plan(&plan, DEFAULT_OPTS).unwrap_err();
+        assert!(
+            matches!(err, DiffError::GeneratedIdentifierTooLong { .. }),
+            "over-long FK constraint name is refused: {err:?}"
+        );
+        assert!(
+            err.to_string().contains("63-byte"),
+            "the error explains the 63-byte limit: {err}"
+        );
+        // No override — the SQL is unappliable, not merely lossy.
+        assert!(matches!(
+            guard_plan(&plan, ALLOW).unwrap_err(),
+            DiffError::GeneratedIdentifierTooLong { .. }
+        ));
+    }
+
+    #[test]
+    fn normal_length_fk_names_are_allowed() {
+        // Ordinary table/column names produce a `posts_author_id_fkey` well under
+        // 63 bytes — the guard passes and the plan emits.
+        let plan = MigrationPlan {
+            backend: Backend::Postgres,
+            changes: vec![SchemaChange::AddForeignKey {
+                table: "posts".to_owned(),
+                column: "author_id".to_owned(),
+                foreign_key: ForeignKey::new("users", "id"),
+            }],
+        };
+        assert!(
+            guard_plan(&plan, DEFAULT_OPTS).is_ok(),
+            "normal-length FK names must not be refused"
+        );
+    }
+
+    #[test]
+    fn over_long_index_name_is_refused() {
+        // The same 63-byte hazard applies to generated index names emitted as
+        // top-level `CREATE INDEX`. An index name over the limit is refused.
+        let plan = MigrationPlan {
+            backend: Backend::Postgres,
+            changes: vec![SchemaChange::AddIndex {
+                table: "posts".to_owned(),
+                index: Index {
+                    name: format!("idx_{}", "x".repeat(70)),
+                    columns: vec!["body".to_owned()],
+                    unique: false,
+                },
+            }],
+        };
+        let err = guard_plan(&plan, DEFAULT_OPTS).unwrap_err();
+        assert!(
+            matches!(err, DiffError::GeneratedIdentifierTooLong { .. }),
+            "over-long index name is refused: {err:?}"
+        );
+    }
+
+    #[test]
+    fn over_long_generated_name_is_allowed_on_sqlite() {
+        // SQLite has no comparable short identifier limit, so the check is
+        // Postgres-only. (AddForeignKey does not render on SQLite anyway, but the
+        // guard must not refuse the plan on backend grounds.)
+        let plan = MigrationPlan {
+            backend: Backend::Sqlite,
+            changes: vec![SchemaChange::AddIndex {
+                table: "posts".to_owned(),
+                index: Index {
+                    name: format!("idx_{}", "x".repeat(70)),
+                    columns: vec!["body".to_owned()],
+                    unique: false,
+                },
+            }],
+        };
+        assert!(
+            guard_plan(&plan, DEFAULT_OPTS).is_ok(),
+            "the 63-byte guard is Postgres-only"
+        );
     }
 
     // -- 13.3 guards ---------------------------------------------------------
