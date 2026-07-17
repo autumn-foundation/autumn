@@ -105,10 +105,13 @@ pub enum SchemaAction {
         #[arg(long)]
         allow_destructive: bool,
     },
-    /// Apply pending migrations against the configured database, then advance the
-    /// checked-in snapshot baseline to the freshly-applied state. Provider-locked
-    /// against the snapshot's dialect; the destructive-change guards ran at diff
-    /// time, so migration files apply verbatim here.
+    /// Apply pending migration files against the configured database.
+    ///
+    /// Does NOT modify the checked-in schema snapshot: the baseline advances at
+    /// generation time via `schema diff --write-migration`, so this command only
+    /// applies pending migrations. Provider-locked against the snapshot's dialect;
+    /// the destructive-change guards ran at diff time, so migration files apply
+    /// verbatim here.
     Migrate {
         /// Config profile whose database URL to apply against (defaults to the
         /// ambient profile resolution the other CLI commands use).
