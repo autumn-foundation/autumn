@@ -20,7 +20,7 @@ RUNNER_VERSION="${RUNNER_VERSION:-}"   # empty => resolve the latest release at 
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
 apt-get install -y ca-certificates curl jq git tar gzip build-essential \
-  pkg-config libssl-dev postgresql-client openssh-client iptables
+  pkg-config libssl-dev postgresql-client openssh-client iptables iptables-persistent
 
 # --- Docker (testcontainers used by the ci.yml Docker-dependent test sweep) ---
 install -m 0755 -d /etc/apt/keyrings
@@ -45,6 +45,10 @@ chmod 0440 /etc/sudoers.d/90-autumn-runner
 # --- harden: deny the runner user access to the cloud metadata service so a job
 #     can never read Hetzner instance metadata / injected data. ---
 iptables -I OUTPUT -m owner ! --uid-owner 0 -d 169.254.169.254 -j REJECT || true
+# Docker bridge networking forwards CONTAINER traffic through the FORWARD chain,
+# not OUTPUT — so a testcontainer in a CI job would otherwise bypass the rule
+# above and reach the metadata IP. Block forwarded traffic to it as well.
+iptables -I FORWARD -d 169.254.169.254 -j REJECT || true
 mkdir -p /etc/iptables
 iptables-save > /etc/iptables/rules.v4 || true
 
@@ -60,8 +64,10 @@ for i in $(seq 1 "${RUNNER_COUNT}"); do
   slot="${RUNNER_HOME}/slot-${i}"
   mkdir -p "${slot}"
   tar -xzf /tmp/actions-runner.tar.gz -C "${slot}"
-  "${slot}/bin/installdependencies.sh" || true
 done
+# installdependencies.sh installs host-wide apt packages, so once is enough for
+# all slots.
+"${RUNNER_HOME}/slot-1/bin/installdependencies.sh" || true
 chown -R "${RUNNER_USER}:${RUNNER_USER}" "${RUNNER_HOME}"
 
 # --- config dir; the PAT lands here over SSH (root-only) after boot ---

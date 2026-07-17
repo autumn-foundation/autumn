@@ -46,10 +46,18 @@ close that hole. Do not weaken one without understanding the others.
   state is carried from one job to the next, which defeats the "poison the
   runner for the next job" persistence attack. (Even with trusted-only routing,
   this is the belt to that suspenders.)
-- **(c) Metadata service firewalled off.** The bootstrap adds an `iptables`
-  `OUTPUT` rule rejecting any non-root (i.e. the `runner` user's) traffic to
-  `169.254.169.254`, so a job can never read the Hetzner cloud metadata service
-  or any data injected through it.
+- **(c) Metadata service firewalled off.** The bootstrap adds `iptables` rules
+  rejecting traffic to `169.254.169.254` on both the `OUTPUT` chain (any non-root
+  host process, i.e. the `runner` user) and the `FORWARD` chain (Docker /
+  testcontainer traffic, which bridges through `FORWARD` and would otherwise
+  bypass the `OUTPUT`-owner rule), so a job can never read the Hetzner cloud
+  metadata service or any data injected through it. The rules are saved to
+  `/etc/iptables/rules.v4` and restored on boot by `netfilter-persistent`, so the
+  block survives reboot. **Caveat:** because the `runner` user holds NOPASSWD
+  `sudo` (required by ci.yml's `sudo` steps), a trusted job could still `sudo`
+  its way to the metadata service as root — an accepted limitation consistent
+  with the PAT residual risk below, since only trusted, same-repo code ever runs
+  on the box.
 - **(d) Repo-scoped registration PAT, root-only.** `RUNNER_REG_PAT` is a
   fine-grained PAT scoped to **this repo only** with **Administration: Read and
   write** — it can mint runner registration tokens for `madmax983/autumn` and
