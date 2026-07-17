@@ -1935,7 +1935,7 @@ fn emit_down_sql_sqlite(plan: &MigrationPlan, ctx: &SchemaContext) -> Result<Str
 /// marker.
 #[derive(Debug, Clone, Copy)]
 enum RebuildLeg {
-    /// Rebuild to the desired shape (`ctx.desired`).
+    /// Rebuild to the post-migration shape (`ctx.baseline` + diff deltas).
     Up,
     /// Rebuild back to the baseline shape (`ctx.baseline`).
     Down,
@@ -1955,8 +1955,11 @@ enum RebuildLeg {
 /// parser's partial `ctx.desired` table — so any baseline facet the parser cannot
 /// see (a non-convention default, a skipped `CHECK`/enum, an association foreign
 /// key) survives a rebuild triggered by an unrelated change. The **down** leg
-/// targets the baseline shape directly (its source is `ctx.desired`); the baseline
-/// already carries every facet, so it needs no delta folding.
+/// targets the baseline shape directly and copies from the actual post-migration
+/// shape (`baseline` + this table's diff deltas — the same value the up leg builds
+/// as its target), **not** the parser's partial `ctx.desired`, so a
+/// retained-but-parser-invisible column is copied back on rollback rather than
+/// dropped.
 fn emit_sqlite_rebuild(
     table: &str,
     ctx: &SchemaContext,
@@ -1977,7 +1980,10 @@ fn emit_sqlite_rebuild(
             ),
         });
     }
-    let desired = ctx
+    // Fetched as a validated precondition (a missing desired shape is a directed
+    // error, exercised by the up leg's missing-context path); neither leg copies
+    // from the parser's partial desired table any more.
+    let _desired = ctx
         .desired
         .get(table)
         .ok_or_else(|| missing_rebuild_shape(table, "desired"))?;
@@ -1994,9 +2000,18 @@ fn emit_sqlite_rebuild(
             let new_shape = baseline_with_changes_applied(baseline, changes, table);
             Ok(render_sqlite_rebuild(table, &new_shape, baseline, leg))
         }
-        // The down leg rolls back to the rich baseline shape (source: the desired
-        // table). Unchanged — the baseline already carries every facet.
-        RebuildLeg::Down => Ok(render_sqlite_rebuild(table, baseline, desired, leg)),
+        // The down leg rolls back to the rich baseline shape. Its copy SOURCE is the
+        // actual post-migration table — `baseline + this table's diff deltas`, the same
+        // shape the up leg built as its target — NOT the parser's partial `ctx.desired`:
+        // a retained-but-parser-invisible column (a skipped enum/association) is absent
+        // from `desired`, so sourcing from it would drop that column from the rollback
+        // INSERT..SELECT and lose its data. Intersecting the baseline target with the
+        // post-migration source copies back every baseline column the up migration did
+        // not drop, in baseline order.
+        RebuildLeg::Down => {
+            let post_migration = baseline_with_changes_applied(baseline, changes, table);
+            Ok(render_sqlite_rebuild(table, baseline, &post_migration, leg))
+        }
     }
 }
 
@@ -2167,7 +2182,17 @@ fn render_sqlite_rebuild(
     let _ = writeln!(out, "INSERT INTO {new_table} ({col_list})");
     let _ = writeln!(out, "    SELECT {col_list} FROM {table};");
     let _ = writeln!(out, "DROP TABLE {table};");
+    // Wrap the staging rename in `PRAGMA legacy_alter_table=ON`…`OFF`. Under the modern
+    // default (`legacy_alter_table=OFF`), `ALTER TABLE ... RENAME` descends into every
+    // dependent VIEW to rewrite references and aborts because the just-dropped table no
+    // longer resolves ("error in view v: no such table"). The offline emitter cannot see
+    // or recreate views, so it emits this blind, always-present pragma pair: it makes the
+    // rename a "dumb" rename that does not validate views, so the migration applies and
+    // the view re-validates against the recreated table. Unlike `foreign_keys`, this
+    // pragma is honoured inside a transaction (proven by `sqlite_rebuild_survives_dependent_view`).
+    let _ = writeln!(out, "PRAGMA legacy_alter_table=ON;");
     let _ = writeln!(out, "ALTER TABLE {new_table} RENAME TO {table};");
+    let _ = writeln!(out, "PRAGMA legacy_alter_table=OFF;");
     let mut indexes: Vec<&Index> = new_shape.indexes.iter().collect();
     indexes.sort_by(|a, b| a.name.cmp(&b.name));
     for index in indexes {
@@ -4949,7 +4974,9 @@ CREATE TABLE posts__autumn_new (
 INSERT INTO posts__autumn_new (id, views, body)
     SELECT id, views, body FROM posts;
 DROP TABLE posts;
+PRAGMA legacy_alter_table=ON;
 ALTER TABLE posts__autumn_new RENAME TO posts;
+PRAGMA legacy_alter_table=OFF;
 CREATE INDEX idx_posts_body ON posts (body);
 UPDATE sqlite_sequence SET seq = (SELECT seq FROM _autumn_seq_posts)
     WHERE name = 'posts' AND (SELECT seq FROM _autumn_seq_posts) IS NOT NULL;
@@ -4987,7 +5014,9 @@ CREATE TABLE posts__autumn_new (
 INSERT INTO posts__autumn_new (id, views, body)
     SELECT id, views, body FROM posts;
 DROP TABLE posts;
+PRAGMA legacy_alter_table=ON;
 ALTER TABLE posts__autumn_new RENAME TO posts;
+PRAGMA legacy_alter_table=OFF;
 UPDATE sqlite_sequence SET seq = (SELECT seq FROM _autumn_seq_posts)
     WHERE name = 'posts' AND (SELECT seq FROM _autumn_seq_posts) IS NOT NULL;
 INSERT INTO sqlite_sequence (name, seq)
@@ -4999,6 +5028,69 @@ PRAGMA foreign_key_check;
 PRAGMA foreign_keys=ON;
 ";
         assert_eq!(down, expected, "SQLite down rebuild golden:\n{down}");
+    }
+
+    #[test]
+    fn sqlite_down_rebuild_preserves_parser_invisible_column() {
+        // A rebuild triggered by an UNRELATED change (`views` Int32 -> Int64) must,
+        // on the DOWN leg, copy back a baseline column the partial parser cannot see
+        // (here `status`, absent from `ctx.desired`). The post-migration table (what
+        // is actually in the DB at rollback time) is `baseline + deltas`, which still
+        // carries `status`, so the down-leg INSERT..SELECT source must be that shape —
+        // not `ctx.desired`, whose partial view would omit `status` and lose its data.
+        let mut status_baseline = col("status", ColumnType::Text);
+        status_baseline.default = Some(ColumnDefault::Sql("'draft'".to_owned()));
+        let baseline = sqlite_table(
+            "posts",
+            vec![
+                col("views", ColumnType::Int32),
+                col("body", ColumnType::Text),
+                status_baseline,
+            ],
+            vec![],
+        );
+        // The parser's blind spot: `status` is absent from the desired view entirely.
+        let desired = sqlite_table(
+            "posts",
+            vec![
+                col("views", ColumnType::Int64),
+                col("body", ColumnType::Text),
+            ],
+            vec![],
+        );
+        let plan = MigrationPlan {
+            backend: Backend::Sqlite,
+            changes: vec![SchemaChange::AlterColumnType {
+                table: "posts".to_owned(),
+                column: "views".to_owned(),
+                from: ColumnType::Int32,
+                to: ColumnType::Int64,
+            }],
+        };
+        let ctx = SchemaContext::from_tables(
+            std::slice::from_ref(&desired),
+            std::slice::from_ref(&baseline),
+        );
+
+        let down = emit_down_sql_with_context(&plan, &ctx).expect("emit down");
+        assert!(
+            down.contains(
+                "INSERT INTO posts__autumn_new (id, views, body, status)\n    \
+                 SELECT id, views, body, status FROM posts;"
+            ),
+            "the down rollback copies back the parser-invisible retained column: {down}"
+        );
+
+        // Pin the up leg too: it copies from the baseline (which carries `status`) into
+        // the baseline+deltas shape (which also carries it), so `status` round-trips.
+        let up = emit_up_sql_with_context(&plan, &ctx).expect("emit up");
+        assert!(
+            up.contains(
+                "INSERT INTO posts__autumn_new (id, views, body, status)\n    \
+                 SELECT id, views, body, status FROM posts;"
+            ),
+            "the up rebuild also carries the parser-invisible retained column: {up}"
+        );
     }
 
     #[test]
@@ -5086,9 +5178,13 @@ PRAGMA foreign_keys=ON;
             ),
             "copies only the surviving columns: {up}"
         );
+        // The dropped column is absent from the recreated table shape (and therefore
+        // never copied). Match `legacy TEXT` (the column definition) specifically rather
+        // than the bare substring `legacy`, which now also appears in the unrelated
+        // `PRAGMA legacy_alter_table` rename guard.
         assert!(
-            !up.contains("legacy"),
-            "dropped column is never copied: {up}"
+            !up.contains("legacy TEXT"),
+            "dropped column is absent from the recreated shape: {up}"
         );
     }
 
@@ -5267,6 +5363,53 @@ PRAGMA foreign_keys=ON;
             .expect("run PRAGMA integrity_check");
         assert_eq!(integrity.len(), 1, "integrity_check returns one row");
         assert_eq!(integrity[0].status, "ok", "integrity_check is clean");
+    }
+
+    #[test]
+    fn sqlite_rebuild_survives_dependent_view() {
+        // A SQLite view referencing the rebuilt table makes the post-`DROP TABLE`
+        // `ALTER TABLE ... RENAME` fail ("error in view v: no such table: main.posts")
+        // under the modern default `legacy_alter_table=OFF`. The offline emitter cannot
+        // see or recreate views, so the rebuild wraps the rename with
+        // `PRAGMA legacy_alter_table=ON`…`OFF`, a blind "dumb" rename that does not
+        // descend into / validate views — so the migration applies and the view
+        // re-validates against the recreated table. This exercises the REAL in-transaction
+        // path (diesel wraps each migration in one) to confirm the pragma is not a
+        // mid-transaction no-op like `foreign_keys`.
+        use diesel::connection::SimpleConnection as _;
+        use diesel::prelude::*;
+
+        #[derive(QueryableByName)]
+        struct ViewRow {
+            #[diesel(sql_type = diesel::sql_types::BigInt)]
+            id: i64,
+            #[diesel(sql_type = diesel::sql_types::Text)]
+            body: String,
+        }
+
+        let mut conn = SqliteConnection::establish(":memory:").expect("open in-memory sqlite");
+        conn.batch_execute(
+            "CREATE TABLE posts (\n    id INTEGER PRIMARY KEY AUTOINCREMENT,\n    \
+             views INTEGER NOT NULL,\n    body TEXT NOT NULL\n);\n\
+             INSERT INTO posts (views, body) VALUES (3, 'hello');\n\
+             CREATE VIEW posts_v AS SELECT id, body FROM posts;",
+        )
+        .expect("seed the original table and a dependent view");
+
+        let (plan, ctx) = sqlite_rebuild_fixture();
+        let up = emit_up_sql_with_context(&plan, &ctx).expect("emit up");
+
+        // Run the generated rebuild INSIDE an explicit transaction — the real path diesel
+        // uses — so a mid-transaction pragma no-op would surface here as a rename error.
+        conn.transaction::<_, diesel::result::Error, _>(|conn| conn.batch_execute(&up))
+            .expect("the rebuild applies inside a transaction with a dependent view present");
+
+        // The view is still valid against the recreated table and the row survived.
+        let rows: Vec<ViewRow> = diesel::sql_query("SELECT id, body FROM posts_v ORDER BY id")
+            .load(&mut conn)
+            .expect("the dependent view is still queryable after the rebuild");
+        assert_eq!(rows.len(), 1, "the view still resolves one row");
+        assert_eq!((rows[0].id, rows[0].body.as_str()), (1, "hello"));
     }
 
     #[test]
