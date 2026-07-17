@@ -133,9 +133,9 @@ buckets on SQLite:
 | Capability | Postgres | SQLite (eventual) | Mechanism / behavior on SQLite | Status (today) |
 | --- | :---: | :---: | --- | --- |
 | Core models / CRUD / repositories | ✅ | ✅ | Same repository API and query path on the SQLite runtime pool. | ✅ **Available now** (behind the `sqlite` feature) |
-| Embedded migrations + `autumn migrate` up/down | ✅ | ✅ | Same embedded migrations, run on SQLite through diesel's `MigrationHarness` at startup. | ✅ **Available now** (behind the `sqlite` feature) |
-| `autumn migrate check` (production-safety classifier) | ✅ | ✅ | Same classifier; SQLite-specific rewrites classified. | ✅ **Available now** (behind the `sqlite` feature) |
-| Migration serialization (concurrent boot) | ✅ `pg_advisory_lock` | ⚠️ | Single-host `BEGIN IMMEDIATE` reservation instead of a cluster advisory lock — safe because only one host applies. | ✅ **Available now** (behind the `sqlite` feature; single-host `BEGIN IMMEDIATE` reservation) |
+| Embedded migrations + `autumn migrate` up/down | ✅ | ✅ | **Startup** migrations apply on SQLite through diesel's `MigrationHarness` (unlocked). The `autumn migrate` CLI up/down still routes through the Postgres advisory-lock path (`hold_migration_lock` → `PgConnection`), so it is not available for a `sqlite://` URL yet. | ⚠️ **Partial** — startup migrations apply (MigrationHarness); `autumn migrate` CLI up/down is Postgres-only (planned) |
+| `autumn migrate check` (production-safety classifier) | ✅ | ✅ | Offline SQL-file safety linter (reads no DB URL, so it does not fail on a `sqlite://` target); its safety rules target Postgres migration semantics — there is no SQLite-specific classification yet. | ⚠️ **Partial** — the linter runs (no DB connection), but its rules are Postgres-oriented; no SQLite-specific classification |
+| Migration serialization (concurrent boot) | ✅ `pg_advisory_lock` | ⚠️ | Startup migrations run **unlocked** — no advisory lock and no `BEGIN IMMEDIATE` reservation. Concurrent same-host starts are not serialized by an explicit reservation; they rely on SQLite's single-writer semantics plus the pool `busy_timeout`. | ⚠️ **Not serialized** — no advisory lock / no `BEGIN IMMEDIATE`; explicit reservation is a known gap (planned) |
 | Sessions + auth (DB-backed) | ✅ | ✅ | Session/auth tables live in SQLite; no external store. | ⛔ **Planned — #1908** |
 | Durable `#[job]` background jobs | ✅ `FOR UPDATE SKIP LOCKED` | ✅ | Single-writer claim on the jobs table — durable and restart-safe, **no Redis required**. | ⛔ **Planned — #1907** |
 | `#[scheduled]` tasks | ✅ advisory-lock leader election | ⚠️ | Single host is always the leader; every tick fires locally (no election needed). | ⛔ **Planned — #1907** |
@@ -208,9 +208,9 @@ tracking issue lands.
 ## How the degrades behave
 
 > These describe the single-host behavior on the SQLite runtime. The runtime now
-> boots and serves, so the behaviors for landed capabilities (e.g. migration
-> serialization) apply today; those tied to a still-**Planned** subsystem take
-> effect when that subsystem's SQLite slice lands.
+> boots and serves, so the behaviors for landed capabilities apply today; those
+> tied to a still-**Planned** subsystem take effect when that subsystem's SQLite
+> slice lands.
 
 Each ⚠️ row above works on a single host. Here is the exact behavior, so you can
 reason about it rather than guess.
@@ -220,10 +220,14 @@ reason about it rather than guess.
 On Postgres, concurrent booters race for a `pg_advisory_lock` so that exactly
 one process applies pending migrations while the rest wait and then observe no
 pending work (see [Migrations](./migrations.md)). On SQLite there is only one
-host, so there is nothing to serialize *across* — but Autumn still guards the
-apply with a **`BEGIN IMMEDIATE`** reservation so that two processes on the same
-box (for example an old and new binary overlapping during a restart) cannot
-interleave DDL. The safety property is identical; the primitive is local.
+host, so there is nothing to serialize *across*. The startup path applies
+migrations through diesel's `MigrationHarness` **unlocked** — there is no
+advisory lock and, today, **no `BEGIN IMMEDIATE`** reservation. Two processes on
+the same box overlapping during a restart (an old and new binary) are therefore
+not serialized by an explicit reservation; they rely on SQLite's single-writer
+semantics plus the pool `busy_timeout`. An explicit `BEGIN IMMEDIATE`
+reservation to close that same-host overlap window is **planned, not yet
+implemented**.
 
 ### `#[scheduled]` tasks
 
@@ -363,7 +367,7 @@ actionable message:
 - **Scoped / searchable repositories** (`--search` / full-text-search repos) are Postgres-only and are not generated on the SQLite backend.
 - **Version-history (`jsonb`) columns** rely on Postgres `jsonb` semantics and are not supported on the SQLite runtime.
 - **A server-side statement timeout** has no SQLite equivalent; long-running statements are bounded by `busy_timeout` (lock contention) only, not a wall-clock cap.
-- **Explicit `BEGIN IMMEDIATE` write reservation** is used only where migration serialization requires it; general application transactions use SQLite's default deferred behaviour.
+- **Explicit `BEGIN IMMEDIATE` write reservation** is not issued anywhere in the migration path today — migration serialization is not implemented via one (it is planned) — and general application transactions use SQLite's default deferred behaviour.
 
 ---
 
