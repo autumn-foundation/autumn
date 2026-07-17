@@ -1508,3 +1508,62 @@ pub(crate) fn install_registry_from_config(
     state.insert_extension(registry);
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_stripe_signature_valid() {
+        let header = "t=1614556800,v1=signature1,v1=signature2,v0=ignored";
+        let (timestamp, signatures) = parse_stripe_signature(header).unwrap();
+        assert_eq!(timestamp, 1_614_556_800);
+        assert_eq!(signatures, vec!["signature1", "signature2"]);
+    }
+
+    #[test]
+    fn test_parse_stripe_signature_missing_timestamp() {
+        let header = "v1=signature1";
+        let err = parse_stripe_signature(header).unwrap_err();
+        assert!(matches!(err, WebhookVerifyError::MalformedTimestamp));
+    }
+
+    #[test]
+    fn test_parse_stripe_signature_missing_signatures() {
+        let header = "t=1614556800";
+        let err = parse_stripe_signature(header).unwrap_err();
+        assert!(matches!(err, WebhookVerifyError::MalformedSignature));
+    }
+
+    #[test]
+    fn test_parse_stripe_signature_malformed_parts() {
+        let header = "t=1614556800,v1";
+        let err = parse_stripe_signature(header).unwrap_err();
+        assert!(matches!(err, WebhookVerifyError::MalformedSignature));
+    }
+
+    #[test]
+    fn test_parse_stripe_signature_malformed_timestamp() {
+        let header = "t=not_a_number,v1=signature1";
+        let err = parse_stripe_signature(header).unwrap_err();
+        assert!(matches!(err, WebhookVerifyError::MalformedTimestamp));
+    }
+
+    #[test]
+    fn test_verify_timestamp_valid() {
+        let received_at = UNIX_EPOCH + Duration::from_secs(1_614_556_800);
+        assert!(verify_timestamp(1_614_556_800, received_at, 300).is_ok());
+        assert!(verify_timestamp(1_614_556_800 + 300, received_at, 300).is_ok());
+        assert!(verify_timestamp(1_614_556_800 - 300, received_at, 300).is_ok());
+    }
+
+    #[test]
+    fn test_verify_timestamp_stale() {
+        let received_at = UNIX_EPOCH + Duration::from_secs(1_614_556_800);
+        let err = verify_timestamp(1_614_556_800 + 301, received_at, 300).unwrap_err();
+        assert!(matches!(err, WebhookVerifyError::StaleTimestamp));
+
+        let err2 = verify_timestamp(1_614_556_800 - 301, received_at, 300).unwrap_err();
+        assert!(matches!(err2, WebhookVerifyError::StaleTimestamp));
+    }
+}
