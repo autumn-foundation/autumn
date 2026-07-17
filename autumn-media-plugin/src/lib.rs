@@ -53,8 +53,9 @@ pub use config::{
 };
 pub use encode::{
     FfmpegClipTailCommand, FfmpegHighlightCommand, FfmpegLiveThumbnailCommand, FfmpegPosterCommand,
-    FfmpegPreviewSpriteCommand, PREVIEW_CELL_HEIGHT, PREVIEW_CELL_WIDTH,
-    PREVIEW_FRAME_INTERVAL_SECONDS, PREVIEW_SPRITE_COLUMNS, build_preview_webvtt,
+    FfmpegPreviewSpriteCommand, FfmpegRoomCompositeCommand, PREVIEW_CELL_HEIGHT,
+    PREVIEW_CELL_WIDTH, PREVIEW_FRAME_INTERVAL_SECONDS, PREVIEW_SPRITE_COLUMNS,
+    ROOM_COMPOSITE_CELL_HEIGHT, ROOM_COMPOSITE_CELL_WIDTH, build_preview_webvtt,
     newest_recording_file, newest_recording_files, newest_recording_files_since,
     recording_segments_covering_window, slugify,
 };
@@ -82,22 +83,24 @@ pub use transport::{
 };
 pub use workflows::{
     FinalizeRecordingJobArgs, MediaWorkflowDelegate, MediaWorkflowDelegateExt,
-    MediaWorkflowRequest, MediaWorkflows, PreviewJobArgs, ThumbnailJobArgs, TranscodeJobArgs,
-    media_job_infos,
+    MediaWorkflowRequest, MediaWorkflows, PreviewJobArgs, RoomCompositeJobArgs, ThumbnailJobArgs,
+    TranscodeJobArgs, media_job_infos,
 };
 
 /// Common downstream imports for configuring and mounting the media plugin.
 pub mod prelude {
     pub use crate::{
         FfmpegClipTailCommand, FfmpegHighlightCommand, FfmpegLiveThumbnailCommand,
-        FfmpegPosterCommand, FfmpegPreviewSpriteCommand, FinalizeRecordingJobArgs, MediaArtifact,
-        MediaArtifactFile, MediaArtifactKind, MediaArtifactSink, MediaArtifactSinkExt, MediaConfig,
-        MediaConfigError, MediaError, MediaMtxConfig, MediaPlugin, MediaStorage,
-        MediaStorageBackend, MediaStorageConfig, MediaWorkflowDelegate, MediaWorkflowDelegateExt,
-        MediaWorkflowRequest, MediaWorkflows, PREVIEW_CELL_HEIGHT, PREVIEW_CELL_WIDTH,
-        PREVIEW_FRAME_INTERVAL_SECONDS, PREVIEW_SPRITE_COLUMNS, PreviewJobArgs, RecordingConfig,
-        RetentionDefer, S3MediaStorage, StoredObject, ThumbnailJobArgs, TranscodeJobArgs,
-        build_preview_webvtt, media_job_infos, newest_recording_file, newest_recording_files,
+        FfmpegPosterCommand, FfmpegPreviewSpriteCommand, FfmpegRoomCompositeCommand,
+        FinalizeRecordingJobArgs, MediaArtifact, MediaArtifactFile, MediaArtifactKind,
+        MediaArtifactSink, MediaArtifactSinkExt, MediaConfig, MediaConfigError, MediaError,
+        MediaMtxConfig, MediaPlugin, MediaStorage, MediaStorageBackend, MediaStorageConfig,
+        MediaWorkflowDelegate, MediaWorkflowDelegateExt, MediaWorkflowRequest, MediaWorkflows,
+        PREVIEW_CELL_HEIGHT, PREVIEW_CELL_WIDTH, PREVIEW_FRAME_INTERVAL_SECONDS,
+        PREVIEW_SPRITE_COLUMNS, PreviewJobArgs, ROOM_COMPOSITE_CELL_HEIGHT,
+        ROOM_COMPOSITE_CELL_WIDTH, RecordingConfig, RetentionDefer, RoomCompositeJobArgs,
+        S3MediaStorage, StoredObject, ThumbnailJobArgs, TranscodeJobArgs, build_preview_webvtt,
+        media_job_infos, newest_recording_file, newest_recording_files,
         newest_recording_files_since, recording_segments_covering_window, slugify,
     };
     pub use crate::{
