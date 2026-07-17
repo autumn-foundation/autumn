@@ -213,6 +213,25 @@ pub enum SchemaChange {
         /// The column whose FK target changed.
         column: String,
     },
+
+    /// A managed table is dropped while a **retained** table still holds a
+    /// baseline foreign key pointing at it (e.g. drop `users` while
+    /// `posts.user_id REFERENCES users(id)` survives). A non-emittable marker:
+    /// [`guard_plan`] refuses any plan containing it, with **no override** — even
+    /// `--allow-destructive` cannot permit it, because that flag authorizes losing
+    /// the dropped table's own data, not silently breaking another table's
+    /// referential integrity (PG rejects the bare `DROP TABLE`, and this engine has
+    /// no `DropForeignKey` variant to clear the constraint first). Self-referential
+    /// FKs and FKs from a table that is itself being dropped do **not** produce
+    /// this marker — those constraints go away with their table.
+    DropTableBlockedByInboundFk {
+        /// The table being dropped.
+        table: String,
+        /// The retained table whose FK references the dropped table.
+        referencing_table: String,
+        /// The column on `referencing_table` carrying the blocking FK.
+        referencing_column: String,
+    },
 }
 
 /// Diff policy knobs.
@@ -280,6 +299,42 @@ pub enum DiffError {
         table: String,
         /// The column whose FK target changed.
         column: String,
+    },
+
+    /// A table is dropped while a retained table still references it (unsupported
+    /// this slice, **no override** — `--allow-destructive` does not permit it).
+    #[error(
+        "cannot drop table `{table}`: the retained table `{referencing_table}.{referencing_column}` \
+         still has a foreign key referencing it. Dropping `{table}` would violate that constraint, \
+         and this engine has no way to drop the inbound foreign key first. Drop or retarget \
+         `{referencing_table}.{referencing_column}` first. (--allow-destructive does not override \
+         this: it authorizes losing this table's data, not breaking another table's integrity.)"
+    )]
+    DropTableInboundReference {
+        /// The table that cannot be dropped.
+        table: String,
+        /// The retained table holding the inbound foreign key.
+        referencing_table: String,
+        /// The column carrying the inbound foreign key.
+        referencing_column: String,
+    },
+
+    /// A column type change PG cannot cast implicitly (needs a manual `USING`
+    /// clause), so a bare `ALTER COLUMN ... TYPE` would be rejected (unsupported
+    /// this slice, **no override** — the SQL is unappliable, not merely lossy).
+    #[error(
+        "non-implicit type conversion on `{table}.{column}` from {from} to {to} requires a manual \
+         migration with a USING clause — not supported in this slice"
+    )]
+    NonImplicitTypeConversion {
+        /// The owning table name.
+        table: String,
+        /// The column name.
+        column: String,
+        /// The baseline SQL type.
+        from: String,
+        /// The desired SQL type.
+        to: String,
     },
 }
 
@@ -387,7 +442,57 @@ pub fn diff_schema(baseline: &[Table], desired: &ParsedSchema, opts: DiffOptions
         }
     }
 
+    detect_inbound_fk_blocks(baseline, &mut changes);
+
     MigrationPlan { backend, changes }
+}
+
+/// Post-pass: for every dropped table, flag a retained table that still holds a
+/// baseline foreign key referencing it. Such a `DROP TABLE` is unappliable (PG
+/// rejects it and this engine has no `DropForeignKey`), so a non-emittable
+/// [`SchemaChange::DropTableBlockedByInboundFk`] marker is appended for
+/// [`guard_plan`] to refuse. Self-referential FKs and FKs from a table that is
+/// itself being dropped are excluded — those constraints go away with their
+/// table. Deterministic: markers are sorted by (dropped, referencing table,
+/// referencing column).
+fn detect_inbound_fk_blocks(baseline: &[Table], changes: &mut Vec<SchemaChange>) {
+    let dropped: BTreeSet<&str> = changes
+        .iter()
+        .filter_map(|c| match c {
+            SchemaChange::DropTable(t) => Some(t.name.as_str()),
+            _ => None,
+        })
+        .collect();
+    if dropped.is_empty() {
+        return;
+    }
+
+    let mut blocks: Vec<(String, String, String)> = Vec::new();
+    for table in baseline {
+        // A referencer that is itself being dropped takes its FK with it.
+        if dropped.contains(table.name.as_str()) {
+            continue;
+        }
+        for column in &table.columns {
+            if let Some(fk) = &column.references
+                && dropped.contains(fk.table.as_str())
+            {
+                blocks.push((fk.table.clone(), table.name.clone(), column.name.clone()));
+            }
+        }
+    }
+    blocks.sort();
+    changes.extend(
+        blocks
+            .into_iter()
+            .map(|(table, referencing_table, referencing_column)| {
+                SchemaChange::DropTableBlockedByInboundFk {
+                    table,
+                    referencing_table,
+                    referencing_column,
+                }
+            }),
+    );
 }
 
 /// Diff a table present on both sides (already known Autumn-managed on the
@@ -611,6 +716,18 @@ pub fn guard_plan(plan: &MigrationPlan, opts: DiffOptions) -> Result<(), DiffErr
         return Err(DiffError::ForeignKeyChange { table, column });
     }
 
+    // 3. Drop of a table a retained table still references — no override (even
+    //    --allow-destructive cannot break another table's integrity).
+    if let Some(err) = find_inbound_fk_block(plan) {
+        return Err(err);
+    }
+
+    // 4. Non-implicit column type conversion (pg) — no override; the bare
+    //    `ALTER COLUMN ... TYPE` is unappliable without a `USING` clause.
+    if let Some(err) = find_non_implicit_conversion(plan) {
+        return Err(err);
+    }
+
     if opts.allow_destructive {
         return Ok(());
     }
@@ -679,6 +796,63 @@ pub fn guard_plan(plan: &MigrationPlan, opts: DiffOptions) -> Result<(), DiffErr
     }
 
     Ok(())
+}
+
+/// The [`DiffError::DropTableInboundReference`] refusal for the first
+/// [`SchemaChange::DropTableBlockedByInboundFk`] marker in `plan`, if any.
+fn find_inbound_fk_block(plan: &MigrationPlan) -> Option<DiffError> {
+    plan.changes.iter().find_map(|c| match c {
+        SchemaChange::DropTableBlockedByInboundFk {
+            table,
+            referencing_table,
+            referencing_column,
+        } => Some(DiffError::DropTableInboundReference {
+            table: table.clone(),
+            referencing_table: referencing_table.clone(),
+            referencing_column: referencing_column.clone(),
+        }),
+        _ => None,
+    })
+}
+
+/// The [`DiffError::NonImplicitTypeConversion`] refusal for the first
+/// non-implicit `AlterColumnType` in `plan`, if any. Postgres-only: on `SQLite`
+/// every `AlterColumnType` already returns [`EmitError::UnsupportedOnBackend`] at
+/// emit time (slice 5's table-rebuild path owns it), so the classifier stays out
+/// of the `SQLite` boundary.
+fn find_non_implicit_conversion(plan: &MigrationPlan) -> Option<DiffError> {
+    if plan.backend != Backend::Postgres {
+        return None;
+    }
+    plan.changes.iter().find_map(|c| match c {
+        SchemaChange::AlterColumnType {
+            table,
+            column,
+            from,
+            to,
+        } if !is_implicit_pg_type_cast(from, to) => Some(DiffError::NonImplicitTypeConversion {
+            table: table.clone(),
+            column: column.clone(),
+            from: from.sql_type(plan.backend),
+            to: to.sql_type(plan.backend),
+        }),
+        _ => None,
+    })
+}
+
+/// True when PG casts `from` → `to` **implicitly**, without a `USING`
+/// clause — the only type changes this slice renders as a bare
+/// `ALTER COLUMN ... TYPE`. Deliberately conservative: only the lossless numeric
+/// widenings PG auto-casts (`int4` → `int8`, `float4` → `float8`). Every other
+/// pair (e.g. `TEXT` → `INTEGER`/`UUID`, `BOOLEAN` → `INTEGER`, `NUMERIC`
+/// narrowing) needs a manual `USING` migration and is refused by [`guard_plan`].
+/// The IR does not distinguish `TEXT` from a `VARCHAR` family, so no string
+/// widening pair exists to admit here.
+const fn is_implicit_pg_type_cast(from: &ColumnType, to: &ColumnType) -> bool {
+    matches!(
+        (from, to),
+        (ColumnType::Int32, ColumnType::Int64) | (ColumnType::Float32, ColumnType::Float64)
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -767,16 +941,28 @@ fn up_ordered(changes: &[SchemaChange]) -> Result<Vec<&SchemaChange>, EmitError>
         .collect();
     topo_sort_creates(&mut creates)?;
 
+    // `DropTable`s are the last bucket; order them in REVERSE topological order so
+    // a table that references another (via its baseline inline FK) is dropped
+    // before the table it references. `emit_down_sql` reverses the whole plan, so
+    // this reverse-topo up-order becomes a forward-topo (referenced-first) recreate
+    // on the down leg.
+    let mut drops: Vec<&SchemaChange> = changes
+        .iter()
+        .filter(|c| matches!(c, SchemaChange::DropTable(_)))
+        .collect();
+    topo_sort_drops(&mut drops)?;
+
     // Everything else keeps its bucket order; the replacement-drop key threads
     // through so a replaced index drops before its re-add.
     let mut rest: Vec<&SchemaChange> = changes
         .iter()
-        .filter(|c| !matches!(c, SchemaChange::CreateTable(_)))
+        .filter(|c| !matches!(c, SchemaChange::CreateTable(_) | SchemaChange::DropTable(_)))
         .collect();
     rest.sort_by_key(|c| up_sort_key(c, &replaced));
 
     let mut ordered = creates;
     ordered.extend(rest);
+    ordered.extend(drops);
     Ok(ordered)
 }
 
@@ -878,6 +1064,76 @@ fn topo_sort_creates(creates: &mut [&SchemaChange]) -> Result<(), EmitError> {
     Ok(())
 }
 
+/// Topologically order `drops` (all `DropTable` changes) in **reverse** dependency
+/// order so a table that references another (via its own baseline inline FK) is
+/// dropped **before** the table it references — PG rejects dropping a referenced
+/// table while a referencing one still exists. The dependency graph is built from
+/// the dropped tables' baseline FKs (carried on the [`SchemaChange::DropTable`]
+/// payload). Only intra-batch dependencies matter: a retained referencer is a
+/// separate concern handled by [`guard_plan`]'s inbound-FK refusal. Deterministic
+/// (Kahn's algorithm, always taking the lexicographically-smallest ready table).
+///
+/// # Errors
+///
+/// Returns [`EmitError::CyclicTableDependencies`] if the dropped tables form a
+/// reference cycle (the same refusal the [`SchemaChange::CreateTable`] path uses).
+fn topo_sort_drops(drops: &mut [&SchemaChange]) -> Result<(), EmitError> {
+    if drops.len() < 2 {
+        return Ok(());
+    }
+    let tables: BTreeMap<&str, &Table> = drops
+        .iter()
+        .filter_map(|c| match c {
+            SchemaChange::DropTable(t) => Some((t.name.as_str(), t)),
+            _ => None,
+        })
+        .collect();
+    let names: BTreeSet<&str> = tables.keys().copied().collect();
+
+    // deps[name] = the in-batch tables that must be dropped BEFORE `name`, i.e.
+    // the tables that reference `name` (referencers drop first). This is the edge
+    // set of `topo_sort_creates` inverted.
+    let mut deps: BTreeMap<&str, BTreeSet<&str>> =
+        names.iter().map(|&n| (n, BTreeSet::new())).collect();
+    for (&name, table) in &tables {
+        for col in &table.columns {
+            if let Some(fk) = &col.references {
+                let target = fk.table.as_str();
+                if target != name && names.contains(target) {
+                    // `name` references `target` ⇒ `name` must drop before `target`.
+                    deps.get_mut(target)
+                        .expect("target is an in-batch name")
+                        .insert(name);
+                }
+            }
+        }
+    }
+
+    // Kahn: repeatedly place the smallest name whose deps are all already placed.
+    let mut remaining: BTreeSet<&str> = names;
+    let mut order: BTreeMap<&str, usize> = BTreeMap::new();
+    while !remaining.is_empty() {
+        let ready = remaining
+            .iter()
+            .copied()
+            .find(|n| deps[n].iter().all(|d| !remaining.contains(d)));
+        if let Some(n) = ready {
+            order.insert(n, order.len());
+            remaining.remove(n);
+        } else {
+            let mut cyc: Vec<String> = remaining.iter().map(|s| (*s).to_owned()).collect();
+            cyc.sort();
+            return Err(EmitError::CyclicTableDependencies { tables: cyc });
+        }
+    }
+
+    drops.sort_by_key(|c| match c {
+        SchemaChange::DropTable(t) => order.get(t.name.as_str()).copied().unwrap_or(usize::MAX),
+        _ => usize::MAX,
+    });
+    Ok(())
+}
+
 /// The canonical up-order bucket for a change (lower = earlier).
 const fn up_bucket(change: &SchemaChange) -> u8 {
     match change {
@@ -893,7 +1149,9 @@ const fn up_bucket(change: &SchemaChange) -> u8 {
         SchemaChange::DropColumn { .. } => 6,
         SchemaChange::DropTable(_) => 7,
         // Non-emittable markers; the guard refuses them before emission is reached.
-        SchemaChange::PrimaryKeyChange { .. } | SchemaChange::ForeignKeyChange { .. } => 9,
+        SchemaChange::PrimaryKeyChange { .. }
+        | SchemaChange::ForeignKeyChange { .. }
+        | SchemaChange::DropTableBlockedByInboundFk { .. } => 9,
     }
 }
 
@@ -966,9 +1224,9 @@ fn emit_change_up(change: &SchemaChange, backend: Backend) -> Result<String, Emi
         }
         // Non-emittable markers: the guard refuses them, so they never reach here
         // in the command flow. Render nothing defensively rather than panicking.
-        SchemaChange::PrimaryKeyChange { .. } | SchemaChange::ForeignKeyChange { .. } => {
-            Ok(String::new())
-        }
+        SchemaChange::PrimaryKeyChange { .. }
+        | SchemaChange::ForeignKeyChange { .. }
+        | SchemaChange::DropTableBlockedByInboundFk { .. } => Ok(String::new()),
     }
 }
 
@@ -1047,9 +1305,9 @@ fn emit_change_down(change: &SchemaChange, backend: Backend) -> Result<String, E
         SchemaChange::AddForeignKey { table, column, .. } => Ok(format!(
             "ALTER TABLE {table} DROP CONSTRAINT {table}_{column}_fkey;\n"
         )),
-        SchemaChange::PrimaryKeyChange { .. } | SchemaChange::ForeignKeyChange { .. } => {
-            Ok(String::new())
-        }
+        SchemaChange::PrimaryKeyChange { .. }
+        | SchemaChange::ForeignKeyChange { .. }
+        | SchemaChange::DropTableBlockedByInboundFk { .. } => Ok(String::new()),
     }
 }
 
@@ -1294,6 +1552,13 @@ fn describe_change(change: &SchemaChange) -> String {
         SchemaChange::ForeignKeyChange { table, column } => {
             format!("! FOREIGN KEY RETARGET on {table}.{column} (refused)")
         }
+        SchemaChange::DropTableBlockedByInboundFk {
+            table,
+            referencing_table,
+            referencing_column,
+        } => format!(
+            "! DROP TABLE {table} blocked by retained FK {referencing_table}.{referencing_column} (refused)"
+        ),
     }
 }
 
@@ -2606,5 +2871,142 @@ mod tests {
         assert!(text.contains("2 change(s)"), "counts changes: {text}");
         assert!(text.contains("CREATE TABLE posts"), "{text}");
         assert!(text.contains("ADD COLUMN posts.body"), "{text}");
+    }
+
+    // -- 13.6 Codex round-2 regressions -------------------------------------
+
+    /// Finding A: dropping a table while a RETAINED table still holds a baseline
+    /// FK to it emits an unappliable `DROP TABLE`. Must be refused — even under
+    /// `--allow-destructive` (that flag permits losing the dropped table's own
+    /// data, not breaking another table's referential integrity).
+    #[test]
+    fn drop_table_with_retained_inbound_fk_is_refused_even_with_allow_destructive() {
+        // baseline: users (dropped) + posts (retained) with posts.user_id → users.
+        let users = Table::new("users", Backend::Postgres);
+        let mut user_fk = col("user_id", ColumnType::Int64);
+        user_fk.references = Some(ForeignKey::new("users", "id"));
+        let posts = posts_ref_table("posts", user_fk);
+        let baseline = vec![users, posts.clone()];
+        // desired keeps posts unchanged; users is gone.
+        let plan = diff_schema(&baseline, &parsed(vec![posts], vec![]), ALLOW);
+        let err = guard_plan(&plan, ALLOW)
+            .expect_err("retained posts.user_id → users blocks DROP TABLE users");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("users") && msg.contains("posts.user_id"),
+            "names the dropped table and the retained referencer: {msg}"
+        );
+    }
+
+    /// Finding A: a self-referential FK on the dropped table does NOT block its
+    /// own drop, and neither does an FK from another table that is also dropped.
+    #[test]
+    fn drop_table_self_ref_and_co_dropped_ref_do_not_block() {
+        // users has a self-FK (parent_id → users) and is dropped alone.
+        let mut parent = col("parent_id", ColumnType::Int64);
+        parent.references = Some(ForeignKey::new("users", "id"));
+        let users = posts_ref_table("users", parent);
+        let plan = diff_schema(&[users], &parsed(vec![], vec![]), ALLOW);
+        guard_plan(&plan, ALLOW).expect("self-referential FK goes away with the table");
+    }
+
+    /// Finding B: a non-implicit type change (`TEXT` → `INTEGER`) has no implicit
+    /// PG cast, so a bare `ALTER COLUMN ... TYPE` is unappliable. Must be refused
+    /// (needs a manual `USING`), regardless of `--allow-destructive`.
+    #[test]
+    fn non_implicit_type_conversion_is_refused() {
+        let base = vec![posts_with(vec![col("views", ColumnType::Text)])];
+        let want = parsed(
+            vec![posts_with(vec![col("views", ColumnType::Int32)])],
+            vec![],
+        );
+        let plan = diff_schema(&base, &want, DEFAULT_OPTS);
+        let err = guard_plan(&plan, ALLOW).expect_err("TEXT→INTEGER needs a USING clause");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("USING") && msg.contains("views"),
+            "explains the USING requirement and names the column: {msg}"
+        );
+    }
+
+    /// Finding B: an implicit widening (`Int32` → `Int64`, i.e. int4 → int8) IS
+    /// emittable as a bare `ALTER COLUMN ... TYPE` — the classifier must not
+    /// over-refuse.
+    #[test]
+    fn implicit_widening_type_conversion_is_allowed() {
+        let base = vec![posts_with(vec![col("views", ColumnType::Int32)])];
+        let want = parsed(
+            vec![posts_with(vec![col("views", ColumnType::Int64)])],
+            vec![],
+        );
+        let plan = diff_schema(&base, &want, DEFAULT_OPTS);
+        guard_plan(&plan, DEFAULT_OPTS).expect("Int32→Int64 is an implicit widening");
+        let up = emit_up_sql(&plan).expect("emit");
+        assert!(
+            up.contains("ALTER TABLE posts ALTER COLUMN views TYPE BIGINT;"),
+            "emits the bare ALTER TYPE for the widening: {up}"
+        );
+    }
+
+    /// Finding C: two managed tables both dropped, `audit_logs.account_id` →
+    /// `accounts`. Lexically `accounts` < `audit_logs`, so a naive order would
+    /// `DROP TABLE accounts` (referenced) before `audit_logs` (referencing) → PG
+    /// rejects. Drops must be REVERSE-topological (referencing first); the down
+    /// leg recreates FORWARD (referenced first).
+    #[test]
+    fn drop_tables_reverse_topologically_ordered_by_fk() {
+        let accounts = posts_ref_table("accounts", col("name", ColumnType::Text));
+        let mut acct_fk = col("account_id", ColumnType::Int64);
+        acct_fk.references = Some(ForeignKey::new("accounts", "id"));
+        let audit = posts_ref_table("audit_logs", acct_fk);
+        let baseline = vec![accounts, audit];
+        let plan = diff_schema(&baseline, &parsed(vec![], vec![]), ALLOW);
+        // Both tables are dropped, so nothing retained references either.
+        guard_plan(&plan, ALLOW).expect("both dropped — no retained inbound reference");
+
+        let up = emit_up_sql(&plan).expect("emit");
+        let referenced = up.find("DROP TABLE accounts").expect("accounts dropped");
+        let referencing = up
+            .find("DROP TABLE audit_logs")
+            .expect("audit_logs dropped");
+        assert!(
+            referencing < referenced,
+            "drop referencing `audit_logs` before referenced `accounts`: {up}"
+        );
+
+        let down = emit_down_sql(&plan).expect("emit");
+        let d_referenced = down.find("CREATE TABLE accounts").expect("down accounts");
+        let d_referencing = down
+            .find("CREATE TABLE audit_logs")
+            .expect("down audit_logs");
+        assert!(
+            d_referenced < d_referencing,
+            "down recreates referenced `accounts` before referencing `audit_logs`: {down}"
+        );
+    }
+
+    /// Finding C: a cycle among dropped tables is refused (reuses the existing
+    /// `CyclicTableDependencies` error), never emitted as unorderable SQL.
+    #[test]
+    fn drop_tables_fk_cycle_is_refused() {
+        let mut a_b = col("b_id", ColumnType::Int64);
+        a_b.references = Some(ForeignKey::new("b", "id"));
+        let table_a = posts_ref_table("a", a_b);
+        let mut b_a = col("a_id", ColumnType::Int64);
+        b_a.references = Some(ForeignKey::new("a", "id"));
+        let table_b = posts_ref_table("b", b_a);
+        let plan = diff_schema(&[table_a, table_b], &parsed(vec![], vec![]), ALLOW);
+        // (The inbound-FK guard excludes co-dropped referencers, so the cycle
+        // surfaces at emission, mirroring the CreateTable cycle case.)
+        guard_plan(&plan, ALLOW).expect("co-dropped tables never trip the inbound guard");
+        let err = emit_up_sql(&plan).unwrap_err();
+        let EmitError::CyclicTableDependencies { tables } = &err else {
+            panic!("expected CyclicTableDependencies, got {err:?}");
+        };
+        assert_eq!(
+            *tables,
+            vec!["a".to_owned(), "b".to_owned()],
+            "names the cycle"
+        );
     }
 }
