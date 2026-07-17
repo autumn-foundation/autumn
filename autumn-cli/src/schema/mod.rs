@@ -473,6 +473,19 @@ fn pull_at(
         return Ok(());
     }
 
+    // A file that is present on disk but did not load (`existing` is `None` while
+    // the path exists) is corrupt/unreadable-as-absent — a non-dry-run pull is
+    // about to replace it. Tell the user rather than silently clobber it. An
+    // absent snapshot stays silent (it exists nowhere to overwrite); a readable
+    // but backend-mismatched snapshot never reaches here (provider-lock refused
+    // above).
+    if existing.is_none() && out_path.exists() {
+        eprintln!(
+            "note: existing snapshot at {} was unreadable; replacing it.",
+            out_path.display()
+        );
+    }
+
     snapshot::write_snapshot(&out_path, &snapshot).map_err(|e| e.to_string())?;
     println!(
         "pulled schema snapshot for {} table(s) from the database to {}",
