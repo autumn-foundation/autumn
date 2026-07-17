@@ -1444,7 +1444,14 @@ fn find_inbound_fk_block(plan: &MigrationPlan) -> Option<DiffError> {
 
 /// The [`DiffError::TypeChangeOnForeignKeyColumn`] refusal for the first
 /// [`SchemaChange::AlterColumnTypeBlockedByFk`] marker in `plan`, if any.
+/// Postgres-only: on `SQLite` an FK-bound type change is safely expressed by the
+/// table-recreate path (the plan still carries the real `AlterColumnType`
+/// alongside the blocked marker, and the rebuild applies it while preserving the
+/// inline `REFERENCES`), so the guard stays out of the `SQLite` boundary.
 fn find_fk_type_change_block(plan: &MigrationPlan) -> Option<DiffError> {
+    if plan.backend != Backend::Postgres {
+        return None;
+    }
     plan.changes.iter().find_map(|c| match c {
         SchemaChange::AlterColumnTypeBlockedByFk { table, column } => {
             Some(DiffError::TypeChangeOnForeignKeyColumn {
@@ -1848,6 +1855,24 @@ fn sqlite_rebuild_tables(changes: &[SchemaChange]) -> BTreeSet<String> {
         .collect()
 }
 
+/// The sorted, de-duplicated column names of every
+/// [`SchemaChange::AlterColumnTypeBlockedByFk`] marker in `changes` that targets
+/// `table`. Non-empty only when this table's `SQLite` rebuild is (partly) driven
+/// by an FK-bound type change — the trigger for the FK type-consistency advisory.
+fn fk_type_change_columns(changes: &[&SchemaChange], table: &str) -> Vec<String> {
+    changes
+        .iter()
+        .filter_map(|c| match c {
+            SchemaChange::AlterColumnTypeBlockedByFk { table: t, column } if t == table => {
+                Some(column.clone())
+            }
+            _ => None,
+        })
+        .collect::<BTreeSet<String>>()
+        .into_iter()
+        .collect()
+}
+
 /// The table a change targets, for rebuild-membership tests.
 const fn change_table_name(change: &SchemaChange) -> &str {
     match change {
@@ -1998,7 +2023,10 @@ fn emit_sqlite_rebuild(
         // i.e. the actual existing table.
         RebuildLeg::Up => {
             let new_shape = baseline_with_changes_applied(baseline, changes, table);
-            Ok(render_sqlite_rebuild(table, &new_shape, baseline, leg))
+            let fk_cols = fk_type_change_columns(changes, table);
+            Ok(render_sqlite_rebuild(
+                table, &new_shape, baseline, leg, &fk_cols,
+            ))
         }
         // The down leg rolls back to the rich baseline shape. Its copy SOURCE is the
         // actual post-migration table — `baseline + this table's diff deltas`, the same
@@ -2010,7 +2038,14 @@ fn emit_sqlite_rebuild(
         // not drop, in baseline order.
         RebuildLeg::Down => {
             let post_migration = baseline_with_changes_applied(baseline, changes, table);
-            Ok(render_sqlite_rebuild(table, baseline, &post_migration, leg))
+            let fk_cols = fk_type_change_columns(changes, table);
+            Ok(render_sqlite_rebuild(
+                table,
+                baseline,
+                &post_migration,
+                leg,
+                &fk_cols,
+            ))
         }
     }
 }
@@ -2109,6 +2144,7 @@ fn render_sqlite_rebuild(
     new_shape: &Table,
     source_shape: &Table,
     leg: RebuildLeg,
+    fk_type_change_cols: &[String],
 ) -> String {
     let new_table = format!("{table}__autumn_new");
     let source_cols: BTreeSet<&str> = source_shape
@@ -2155,6 +2191,17 @@ fn render_sqlite_rebuild(
         out,
         "-- autumn-safety: `PRAGMA foreign_key_check` below only REPORTS violation rows (it does not raise); the recreate copies existing values verbatim and introduces no new orphans, but the migration runner must inspect the pragma's output to treat any pre-existing orphan as an error."
     );
+    // When an FK-bound column's type is changed by this recreate, warn that SQLite
+    // (unlike Postgres, which refuses the change outright) does not enforce that the
+    // column still matches the referenced key's type — that consistency is now the
+    // author's responsibility.
+    if !fk_type_change_cols.is_empty() {
+        let cols = fk_type_change_cols.join(", ");
+        let _ = writeln!(
+            out,
+            "-- autumn-safety: foreign-key column(s) {cols} have their type changed by this recreate; SQLite does not enforce that they still match the referenced key's type, so ensure the referenced column stays type-compatible (Postgres rejects this change outright, which is why it is emitted only for SQLite)."
+        );
+    }
     // Preserve the AUTOINCREMENT high-water mark only when BOTH the copy SOURCE and
     // the target shape's single PK are `BigSerial` (an `INTEGER PRIMARY KEY
     // AUTOINCREMENT` column). Such a source table has a `sqlite_sequence` row that
@@ -5444,7 +5491,7 @@ PRAGMA foreign_keys=ON;
             "the fixture PK resolves to Uuid"
         );
         for leg in [RebuildLeg::Up, RebuildLeg::Down] {
-            let sql = render_sqlite_rebuild("posts", &desired, &baseline, leg);
+            let sql = render_sqlite_rebuild("posts", &desired, &baseline, leg, &[]);
             assert!(
                 !sql.contains("sqlite_sequence"),
                 "no sqlite_sequence statements for a Uuid PK ({leg:?}): {sql}"
@@ -6024,6 +6071,223 @@ PRAGMA foreign_keys=ON;
         assert!(
             up.contains("ALTER TABLE posts ALTER COLUMN views TYPE BIGINT;"),
             "emits the bare ALTER TYPE for the plain-column widening: {up}"
+        );
+    }
+
+    /// A `users(id)` table for the `SQLite` FK-type-change fixtures.
+    fn sqlite_users_table() -> Table {
+        let mut t = Table::new("users", Backend::Sqlite);
+        let mut id = col("id", ColumnType::Int64);
+        id.primary_key = true;
+        t.primary_key.push("id".to_owned());
+        t.columns.push(id);
+        t
+    }
+
+    /// A `posts(id, author_id -> users.id)` `SQLite` table whose `author_id` FK
+    /// column carries `ty`, for the `SQLite` FK-type-change fixtures.
+    fn sqlite_posts_with_author(ty: ColumnType) -> Table {
+        let mut t = Table::new("posts", Backend::Sqlite);
+        let mut id = col("id", ColumnType::Int64);
+        id.primary_key = true;
+        t.primary_key.push("id".to_owned());
+        t.columns.push(id);
+        let mut author = col("author_id", ty);
+        author.nullable = true;
+        author.references = Some(ForeignKey::new("users", "id"));
+        t.columns.push(author);
+        t
+    }
+
+    /// The `SQLite` counterpart to `type_change_on_referencing_fk_column_is_refused`:
+    /// the FK-bound-type-change guard is `Postgres`-only, so on `SQLite` an FK
+    /// column's type change (`posts.author_id` `Int32` → `Int64`, still
+    /// `REFERENCES users(id)`) is NOT refused — it flows to the table-recreate,
+    /// which applies the new type, preserves the inline `REFERENCES`, and emits the
+    /// FK type-consistency advisory naming the column. The `Postgres` plan with the
+    /// same change still refuses with `TypeChangeOnForeignKeyColumn` (the backend
+    /// contrast).
+    #[test]
+    fn sqlite_fk_column_type_change_recreates_with_advisory() {
+        let baseline = vec![
+            sqlite_users_table(),
+            sqlite_posts_with_author(ColumnType::Int32),
+        ];
+        let desired = vec![
+            sqlite_users_table(),
+            sqlite_posts_with_author(ColumnType::Int64),
+        ];
+        let plan = diff_schema(&baseline, &parsed(desired.clone(), vec![]), ALLOW);
+
+        // The plan is a SQLite plan carrying the real type change AND the blocked
+        // marker appended alongside it.
+        assert_eq!(plan.backend, Backend::Sqlite);
+        assert!(
+            plan.changes.iter().any(|c| matches!(
+                c,
+                SchemaChange::AlterColumnType { table, column, to, .. }
+                    if table == "posts" && column == "author_id" && *to == ColumnType::Int64
+            )),
+            "the real AlterColumnType (→ Int64) rides in the plan: {:?}",
+            plan.changes
+        );
+        assert!(
+            plan.changes.iter().any(|c| matches!(
+                c,
+                SchemaChange::AlterColumnTypeBlockedByFk { table, column }
+                    if table == "posts" && column == "author_id"
+            )),
+            "the FK-bound type-change marker is still recorded: {:?}",
+            plan.changes
+        );
+
+        // (a) The Postgres-only gate lets SQLite through the guard.
+        guard_plan(&plan, ALLOW)
+            .expect("SQLite FK-column type change flows to the table recreate, not a refusal");
+
+        // (b) The recreate applies the new type (Int64 → SQLite INTEGER), preserves
+        //     the inline REFERENCES, and carries the FK type-consistency advisory.
+        let ctx = SchemaContext::from_tables(&desired, &baseline);
+        let up = emit_up_sql_with_context(&plan, &ctx).expect("emit sqlite rebuild");
+        assert!(
+            up.contains("author_id INTEGER NULL REFERENCES users(id)"),
+            "the recreate expresses author_id with its (widened) type and keeps the \
+             inline REFERENCES: {up}"
+        );
+        assert!(
+            up.contains(
+                "-- autumn-safety: foreign-key column(s) author_id have their type \
+                 changed by this recreate; SQLite does not enforce that they still \
+                 match the referenced key's type, so ensure the referenced column \
+                 stays type-compatible (Postgres rejects this change outright, which \
+                 is why it is emitted only for SQLite)."
+            ),
+            "emits the FK type-consistency advisory naming the column: {up}"
+        );
+        // The down leg carries it too.
+        let down = emit_down_sql_with_context(&plan, &ctx).expect("emit sqlite down rebuild");
+        assert!(
+            down.contains("-- autumn-safety: foreign-key column(s) author_id have their type"),
+            "the down rebuild also carries the FK type-consistency advisory: {down}"
+        );
+
+        // (c) The Postgres plan with the same change still refuses (backend contrast).
+        let mut users_pg = Table::new("users", Backend::Postgres);
+        let mut uid = col("id", ColumnType::Int64);
+        uid.primary_key = true;
+        users_pg.primary_key.push("id".to_owned());
+        users_pg.columns.push(uid);
+        let mut author_base = col("author_id", ColumnType::Int32);
+        author_base.nullable = true;
+        author_base.references = Some(ForeignKey::new("users", "id"));
+        let mut author_want = col("author_id", ColumnType::Int64);
+        author_want.nullable = true;
+        author_want.references = Some(ForeignKey::new("users", "id"));
+        let pg_baseline = vec![users_pg.clone(), posts_with(vec![author_base])];
+        let pg_desired = parsed(vec![users_pg, posts_with(vec![author_want])], vec![]);
+        let pg_plan = diff_schema(&pg_baseline, &pg_desired, ALLOW);
+        let err = guard_plan(&pg_plan, ALLOW)
+            .expect_err("Postgres still refuses the FK-column type change");
+        assert!(
+            matches!(
+                err,
+                DiffError::TypeChangeOnForeignKeyColumn { ref table, ref column }
+                    if table == "posts" && column == "author_id"
+            ),
+            "Postgres refuses with TypeChangeOnForeignKeyColumn: {err:?}"
+        );
+    }
+
+    /// An ordinary `SQLite` rebuild (no FK-bound type change) must NOT carry the FK
+    /// type-consistency advisory — the line is emitted only when a blocked marker
+    /// for that table is present.
+    #[test]
+    fn sqlite_plain_rebuild_omits_fk_type_advisory() {
+        // A plain (non-FK) column widening on `posts` triggers a table rebuild but
+        // no `AlterColumnTypeBlockedByFk` marker.
+        let mut base = Table::new("posts", Backend::Sqlite);
+        let mut id = col("id", ColumnType::Int64);
+        id.primary_key = true;
+        base.primary_key.push("id".to_owned());
+        base.columns.push(id);
+        base.columns.push(col("views", ColumnType::Int32));
+        let mut want = base.clone();
+        want.columns[1].ty = ColumnType::Int64;
+
+        let baseline = vec![base];
+        let desired = vec![want];
+        let plan = diff_schema(&baseline, &parsed(desired.clone(), vec![]), ALLOW);
+        let ctx = SchemaContext::from_tables(&desired, &baseline);
+        let up = emit_up_sql_with_context(&plan, &ctx).expect("emit sqlite rebuild");
+        assert!(
+            !up.contains("foreign-key column(s)"),
+            "a rebuild with no FK-type-change marker carries no FK advisory: {up}"
+        );
+    }
+
+    /// A real in-memory `SQLite` database applies the generated FK-column-type-change
+    /// recreate without error and the seeded referencing row survives.
+    #[test]
+    fn sqlite_fk_column_type_change_recreate_applies_in_memory() {
+        use diesel::connection::SimpleConnection as _;
+        use diesel::{Connection as _, RunQueryDsl as _, SqliteConnection};
+
+        #[derive(diesel::QueryableByName)]
+        struct BigRow {
+            #[diesel(sql_type = diesel::sql_types::BigInt, column_name = "v")]
+            v: i64,
+        }
+        #[derive(diesel::QueryableByName)]
+        struct FkRow {
+            #[diesel(sql_type = diesel::sql_types::Text, column_name = "table")]
+            table: String,
+        }
+
+        let baseline = vec![
+            sqlite_users_table(),
+            sqlite_posts_with_author(ColumnType::Int32),
+        ];
+        let desired = vec![
+            sqlite_users_table(),
+            sqlite_posts_with_author(ColumnType::Int64),
+        ];
+        let plan = diff_schema(&baseline, &parsed(desired.clone(), vec![]), ALLOW);
+        guard_plan(&plan, ALLOW).expect("SQLite FK-column type change is emittable");
+        let ctx = SchemaContext::from_tables(&desired, &baseline);
+        let up = emit_up_sql_with_context(&plan, &ctx).expect("emit up");
+
+        let mut conn = SqliteConnection::establish(":memory:").expect("open in-memory sqlite");
+        conn.batch_execute(
+            "CREATE TABLE users (\n    id INTEGER PRIMARY KEY AUTOINCREMENT\n);\n\
+             CREATE TABLE posts (\n    id INTEGER PRIMARY KEY AUTOINCREMENT,\n    \
+             author_id BIGINT NULL REFERENCES users(id)\n);\n\
+             INSERT INTO users (id) VALUES (1);\n\
+             INSERT INTO posts (id, author_id) VALUES (1, 1);",
+        )
+        .expect("seed the referenced + referencing tables and a row");
+
+        // Apply the generated recreate inside a single transaction (as diesel runs a
+        // migration).
+        conn.transaction::<_, diesel::result::Error, _>(|conn| conn.batch_execute(&up))
+            .expect("apply the FK-column-type-change recreate in a transaction");
+
+        // The seeded referencing row survived the rebuild, still pointing at users(1).
+        let survivors: Vec<BigRow> =
+            diesel::sql_query("SELECT COUNT(*) AS v FROM posts WHERE id = 1 AND author_id = 1")
+                .load(&mut conn)
+                .expect("count the surviving row");
+        assert_eq!(
+            survivors[0].v, 1,
+            "the seeded post row survives the FK-column type-change recreate"
+        );
+
+        // The recreated `posts` still declares the foreign key to `users`.
+        let fks: Vec<FkRow> = diesel::sql_query("PRAGMA foreign_key_list(posts)")
+            .load(&mut conn)
+            .expect("read posts foreign keys");
+        assert!(
+            fks.iter().any(|f| f.table == "users"),
+            "the recreate preserves the posts.author_id -> users foreign key"
         );
     }
 
