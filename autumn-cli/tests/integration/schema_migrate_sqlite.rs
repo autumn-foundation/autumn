@@ -1,4 +1,4 @@
-//! SQLite integration test for `autumn schema migrate` (issue #1975 slice 6).
+//! `SQLite` integration test for `autumn schema migrate` (issue #1975 slice 6).
 //!
 //! Compiles and runs **only** under the non-default `sqlite` cargo feature (the
 //! backend-flip). A default `cargo test -p autumn-cli` neither compiles nor
@@ -6,7 +6,7 @@
 //! `tests/integration/mod.rs` and additionally guarded here.
 //!
 //! Unlike the Postgres path this needs **no Docker**: it applies against a
-//! temp-FILE SQLite database (not `:memory:`, which the runtime rejects for
+//! temp-FILE `SQLite` database (not `:memory:`, which the runtime rejects for
 //! migrations), so it is a real, runnable end-to-end check:
 //!
 //!   `cargo test -p autumn-cli --features sqlite --test cli_tests schema_migrate_sqlite`

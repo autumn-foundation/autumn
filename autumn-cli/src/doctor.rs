@@ -1800,21 +1800,28 @@ fn is_valid_alert_mailbox_doctor(value: &str) -> bool {
         .is_ok()
 }
 
-/// SQLite backend-flip build fallback: the `mail` feature (and its `lettre`
-/// re-export) is not compiled under `--features sqlite`, so this conservative
-/// syntactic check stands in for the lettre `Mailbox` parser. The alert-email
-/// doctor check is a Postgres-runtime concern; the fallback keeps the sqlite CLI
-/// compiling without pulling the pg-only `mail` path, accepting a bare
-/// `local@domain` mailbox and rejecting scheme-prefixed / whitespaced / empty
-/// values. Exact lettre parity (including RFC 5322 display-name forms) applies to
-/// the default build only.
+/// `SQLite` backend-flip build fallback: the `mail` feature (and its `lettre`
+/// re-export) is not compiled under `--features sqlite`, so this syntactic check
+/// stands in for the lettre `Mailbox` parser. The alert-email doctor check is a
+/// Postgres-runtime concern; the fallback keeps the sqlite CLI compiling without
+/// pulling the pg-only `mail` path while agreeing with lettre for the cases
+/// doctor validates: it accepts a bare `local@domain` mailbox and the RFC 5322
+/// display-name form `Name <local@domain>` (validating the bracketed address),
+/// and rejects scheme-prefixed / whitespaced / `@`-malformed / empty values. Full
+/// lettre parity applies to the default (Postgres) build.
 #[cfg(not(feature = "postgres"))]
 fn is_valid_alert_mailbox_doctor(value: &str) -> bool {
     let value = value.trim();
-    if value.is_empty() || value.contains(':') || value.contains(char::is_whitespace) {
+    // Accept `Name <local@domain>` by validating the bracketed address; the
+    // display-name text before `<` is free-form and not checked.
+    let addr = match (value.rfind('<'), value.rfind('>')) {
+        (Some(lt), Some(gt)) if gt > lt => value[lt + 1..gt].trim(),
+        _ => value,
+    };
+    if addr.is_empty() || addr.contains(':') || addr.contains(char::is_whitespace) {
         return false;
     }
-    let mut parts = value.split('@');
+    let mut parts = addr.split('@');
     match (parts.next(), parts.next(), parts.next()) {
         (Some(local), Some(domain), None) => {
             !local.is_empty() && !domain.is_empty() && domain.contains('.')
@@ -12353,6 +12360,11 @@ foo = "bar"
         assert_eq!(r.status, CheckStatus::Pass);
     }
 
+    // `KNOWN_TOML_SECTIONS` lists `mail`, but autumn-web's config schema
+    // (`get_schema_keys`) drops the `[mail]` section under the sqlite backend-flip
+    // build (mail feature off), so this static-list-vs-runtime-schema parity check
+    // is gated to the default (Postgres) build where `[mail]` is compiled in.
+    #[cfg(feature = "postgres")]
     #[test]
     fn check_toml_content_all_known_sections_pass() {
         let content: String = KNOWN_TOML_SECTIONS
