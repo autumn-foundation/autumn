@@ -14,6 +14,7 @@
 
 pub mod diff;
 pub mod doctor;
+pub mod introspect;
 pub mod migrate;
 pub mod parse;
 pub mod snapshot;
@@ -105,6 +106,30 @@ pub enum SchemaAction {
         #[arg(long)]
         allow_destructive: bool,
     },
+    /// Introspect the configured Postgres database and write a canonical,
+    /// dialect-tagged snapshot of its live shape — the DB-derived diff baseline.
+    ///
+    /// Read-only w.r.t. the database (only catalog reads). Unlike `snapshot`
+    /// (which derives the baseline from the declared `#[model]` structs), `pull`
+    /// derives it from the live database, so a brownfield schema — or a schema
+    /// that drifted from the models — is captured exactly as it exists. Postgres
+    /// only in this slice; a `SQLite` URL is refused with a clear message.
+    Pull {
+        /// Config profile whose database URL to introspect (defaults to the
+        /// ambient profile resolution the other CLI commands use).
+        #[arg(long, value_name = "PROFILE")]
+        profile: Option<String>,
+        /// Where to write the snapshot. Defaults to `.autumn/schema-snapshot.json`.
+        #[arg(long, value_name = "PATH")]
+        out: Option<PathBuf>,
+        /// Override the dialect tag / apply-path selection. Defaults to the
+        /// backend implied by the resolved database URL.
+        #[arg(long, value_enum)]
+        backend: Option<BackendArg>,
+        /// Print what would change without writing the snapshot file.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Apply pending migration files against the configured database.
     ///
     /// Does NOT modify the checked-in schema snapshot: the baseline advances at
@@ -159,6 +184,12 @@ pub fn run(action: SchemaAction) {
             name.as_deref(),
             allow_destructive,
         ),
+        SchemaAction::Pull {
+            profile,
+            out,
+            backend,
+            dry_run,
+        } => run_pull(profile.as_deref(), out.as_deref(), backend, dry_run),
         SchemaAction::Migrate { profile } => migrate::run_migrate(profile.as_deref()),
         SchemaAction::Doctor { profile, json } => doctor::run_doctor(profile.as_deref(), json),
     };
@@ -347,6 +378,155 @@ fn run_snapshot(
         out_path.display()
     );
     Ok(())
+}
+
+/// Introspect the configured Postgres database and write (or, with `--dry-run`,
+/// describe) a canonical, dialect-tagged snapshot of its live shape.
+///
+/// This is the DB-introspection counterpart to `snapshot` (which derives the
+/// baseline from the declared models). The resolution order — project root, then
+/// the profile-resolved database URL, then the URL-implied backend (honoring a
+/// `--backend` override) — mirrors `schema migrate` / `schema doctor`, so the
+/// three commands can never derive the backend inconsistently for one profile.
+///
+/// Postgres only in this slice: a resolved `SQLite` backend is refused loudly (no
+/// partial support, no partial write). Before writing, a **provider-lock** guard
+/// refuses to clobber an existing snapshot tagged for another backend.
+fn run_pull(
+    profile: Option<&str>,
+    out: Option<&Path>,
+    backend: Option<BackendArg>,
+    dry_run: bool,
+) -> Result<(), String> {
+    let project_root = std::env::current_dir()
+        .map_err(|e| format!("failed to resolve the current directory: {e}"))?;
+    pull_at(&project_root, profile, out, backend, dry_run)
+}
+
+/// The body of [`run_pull`], taking an explicit `project_root` so the wiring is
+/// testable without mutating the process CWD (mirrors `diff_at` / `migrate_at`).
+fn pull_at(
+    project_root: &Path,
+    profile: Option<&str>,
+    out: Option<&Path>,
+    backend: Option<BackendArg>,
+    dry_run: bool,
+) -> Result<(), String> {
+    crate::generate::ensure_project_root(project_root)
+        .map_err(|_| crate::generate::GenerateError::NotInProject.to_string())?;
+
+    // Resolve the write/primary database URL exactly as the other schema commands
+    // do, honoring an explicit `--profile`.
+    let url = crate::migrate::resolve_primary_url(profile).ok_or_else(|| {
+        "no database URL configured — set AUTUMN_DATABASE__URL or DATABASE_URL, or add a \
+         [database] primary_url to autumn.toml"
+            .to_string()
+    })?;
+
+    // Backend from the SAME profile-resolved context as the URL (its scheme is
+    // authoritative), honoring an explicit `--backend` override.
+    let backend: Backend = backend.map_or_else(
+        || backend_for_url(project_root, profile, Some(url.as_str())),
+        Backend::from,
+    );
+
+    // SQLite introspection is a future slice of #1975 — fail loud, never partial.
+    if backend == Backend::Sqlite {
+        return Err(
+            "`autumn schema pull` currently supports Postgres only — SQLite database \
+             introspection is a future slice of the declarative-schema work (#1975). No \
+             snapshot was written."
+                .to_string(),
+        );
+    }
+
+    let out_path = out.map_or_else(
+        || project_root.join(SNAPSHOT_DEFAULT_PATH),
+        Path::to_path_buf,
+    );
+
+    // PROVIDER-LOCK: refuse to overwrite an existing snapshot tagged for another
+    // backend (mirrors `ensure_backend_matches` / the doctor provider-lock check).
+    // A missing or unreadable-as-absent snapshot is fine — this is the first
+    // baseline. The existing tables also serve as the `--dry-run` diff baseline.
+    let existing = load_existing_snapshot(&out_path);
+    if let Some(existing) = &existing
+        && existing.backend != backend
+    {
+        return Err(format!(
+            "refusing to overwrite the existing snapshot at {} (backend {:?}) with a {:?} pull \
+             — the snapshot is provider-locked to {:?}. Point --out elsewhere or remove the \
+             mismatched snapshot first.",
+            out_path.display(),
+            existing.backend,
+            backend,
+            existing.backend
+        ));
+    }
+
+    // Introspect the live database into the IR.
+    let tables = introspect::introspect_postgres(&url).map_err(|e| e.to_string())?;
+    let snapshot = SchemaSnapshot::new(backend, tables);
+
+    if dry_run {
+        report_pull_dry_run(&snapshot, existing.as_ref(), &out_path);
+        return Ok(());
+    }
+
+    snapshot::write_snapshot(&out_path, &snapshot).map_err(|e| e.to_string())?;
+    println!(
+        "pulled schema snapshot for {} table(s) from the database to {}",
+        snapshot.tables.len(),
+        out_path.display()
+    );
+    Ok(())
+}
+
+/// Load the snapshot at `path` for the pull's provider-lock / dry-run baseline.
+/// A missing OR unreadable file is treated as **absent** (`Ok(None)`) — a pull
+/// establishes a fresh baseline, so a corrupt prior file is not fatal — but a
+/// backend-mismatched *readable* snapshot still surfaces to the provider-lock
+/// caller (it loaded fine; only its backend disagrees).
+fn load_existing_snapshot(path: &Path) -> Option<SchemaSnapshot> {
+    snapshot::load_snapshot(path).ok()
+}
+
+/// Print what a `--dry-run` pull would change: the pending migration plan between
+/// the existing snapshot (baseline) and the freshly-pulled tables (desired),
+/// without writing anything.
+fn report_pull_dry_run(
+    pulled: &SchemaSnapshot,
+    existing: Option<&SchemaSnapshot>,
+    out_path: &Path,
+) {
+    match existing {
+        None => {
+            println!(
+                "--dry-run: no existing snapshot at {} — would create a new baseline with {} \
+                 table(s) from the database.",
+                out_path.display(),
+                pulled.tables.len()
+            );
+        }
+        Some(existing) => {
+            let desired = parse::ParsedSchema::from_tables(pulled.tables.clone());
+            let plan = diff::diff_schema(&existing.tables, &desired, diff::DiffOptions::default());
+            if plan.is_empty() {
+                println!(
+                    "--dry-run: the snapshot at {} is up to date — the database matches it.",
+                    out_path.display()
+                );
+            } else {
+                println!(
+                    "--dry-run: the database differs from the snapshot at {} — {} change(s) would \
+                     be captured (nothing written):",
+                    out_path.display(),
+                    plan.changes.len()
+                );
+                print!("{}", diff::describe_plan(&plan));
+            }
+        }
+    }
 }
 
 /// Diff the declared models against the checked-in snapshot baseline and either
@@ -1442,6 +1622,22 @@ mod tests {
         let dir = src.join("models");
         std::fs::create_dir_all(&dir).expect("mkdir models");
         assert_eq!(existing_models_path(root.path()), Some(dir));
+    }
+
+    #[test]
+    fn load_existing_snapshot_absent_and_corrupt_are_none_valid_is_some() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let path = root.path().join("snap.json");
+        // Missing file → treated as absent (fresh baseline).
+        assert!(load_existing_snapshot(&path).is_none());
+        // Corrupt/unreadable-as-absent → also None (a pull re-establishes it).
+        std::fs::write(&path, "{ not json").expect("write corrupt");
+        assert!(load_existing_snapshot(&path).is_none());
+        // A valid snapshot loads and surfaces its backend to the provider-lock.
+        let snap = SchemaSnapshot::new(Backend::Sqlite, Vec::new());
+        snapshot::write_snapshot(&path, &snap).expect("write valid");
+        let loaded = load_existing_snapshot(&path).expect("some");
+        assert_eq!(loaded.backend, Backend::Sqlite);
     }
 
     #[test]
