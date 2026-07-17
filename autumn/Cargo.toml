@@ -87,7 +87,15 @@ offline-sync = ["db", "http-client"]
 # (`PoolError::UnsupportedBackend`); a working pool is PR2. Needs no extra deps
 # — diesel's sqlite backend and diesel-async's sync-connection-wrapper are
 # already in the graph.
-sqlite = ["diesel/sqlite", "diesel/returning_clauses_for_sqlite_3_35", "diesel-async/sync-connection-wrapper"]
+# `dep:libsqlite3-sys` is listed so the `sqlite` feature is self-sufficient: it
+# guarantees the BUNDLED SQLite amalgamation (workspace dep pins
+# `features = ["bundled"]`), which compiles with `SQLITE_ENABLE_FTS5` defined —
+# so FTS5 full-text search (issue #1910: searchable repositories emit FTS5
+# virtual tables + bm25 ranking) is always available, even under
+# `--no-default-features --features sqlite`. The default `db` feature already
+# pulls it in, so this adds nothing to the Postgres/default lane (which never
+# enables `sqlite`).
+sqlite = ["dep:libsqlite3-sys", "diesel/sqlite", "diesel/returning_clauses_for_sqlite_3_35", "diesel-async/sync-connection-wrapper"]
 test-support = ["dep:testcontainers", "dep:testcontainers-modules"]
 telemetry-otlp = [
     "dep:opentelemetry",
