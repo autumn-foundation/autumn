@@ -23,7 +23,7 @@
 //! skipped WARN rather than failing — doctor references no `SQLite` symbol and so
 //! compiles identically with or without the `sqlite` feature.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use autumn_schema_core::{Backend, Table};
 use diesel_migrations::FileBasedMigrations;
@@ -175,7 +175,7 @@ fn probe_snapshot(project_root: &Path, _detected: Backend) -> SnapshotState {
 /// Diff the declared models (parsed with the snapshot's backend) against the
 /// baseline tables to decide the drift verdict.
 fn compute_drift(project_root: &Path, backend: Backend, baseline: &[Table]) -> DriftState {
-    let Some(models_path) = existing_models_path(project_root) else {
+    let Some(models_path) = super::existing_models_path(project_root) else {
         return DriftState::ModelsError(
             "no declarative models found under src/ to compare against the snapshot".to_string(),
         );
@@ -206,12 +206,43 @@ fn gather_pending(project_root: &Path, profile: Option<&str>, local: &LocalFacts
             local.detected_backend
         ));
     }
-    let migrations_dir = project_root.join("migrations");
-    // No/unreadable migrations dir: nothing to be pending, treat as reachable-empty.
-    let Ok(migrations) = FileBasedMigrations::from_path(&migrations_dir) else {
-        return PendingState::Reachable(Vec::new());
+    probe_pending(&url, &project_root.join("migrations"))
+}
+
+/// Probe pending migrations against `url` using the project's `migrations_dir`.
+///
+/// A present, readable dir is the migration source. When it is missing/unreadable
+/// we must NOT short-circuit to "up to date" — that would let a missing migrations
+/// directory mask an offline or misconfigured database (a false OK). Instead we
+/// probe connectivity with a freshly-created, guaranteed-empty temp directory:
+/// with zero available migrations `pending_migrations` still connects, returning
+/// an empty set on a reachable DB (correctly "up to date") and an error on an
+/// unreachable one (surfaced as [`PendingState::Unreachable`], i.e. a WARN).
+fn probe_pending(url: &str, migrations_dir: &Path) -> PendingState {
+    // Deferred-init tempdir guard: bound in this scope so, when used, it outlives
+    // the `pending_migrations` call below.
+    let fallback_dir;
+    let migrations = if let Ok(source) = FileBasedMigrations::from_path(migrations_dir) {
+        source
+    } else {
+        fallback_dir = match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(e) => {
+                return PendingState::Unreachable(format!(
+                    "could not create a temp directory to probe the database: {e}"
+                ));
+            }
+        };
+        match FileBasedMigrations::from_path(fallback_dir.path()) {
+            Ok(source) => source,
+            Err(e) => {
+                return PendingState::Unreachable(format!(
+                    "could not build an empty migration source to probe the database: {e}"
+                ));
+            }
+        }
     };
-    match autumn_web::migrate::pending_migrations(&url, migrations) {
+    match autumn_web::migrate::pending_migrations(url, migrations) {
         Ok(names) => PendingState::Reachable(names),
         // MigrationError Display is secret-free.
         Err(e) => PendingState::Unreachable(e.to_string()),
@@ -453,21 +484,6 @@ fn finish(checks: &[Check]) -> Result<(), String> {
     }
 }
 
-/// Resolve the declarative models source when it exists (dir precedence, then
-/// single file), else `None`. Mirrors the parent module's resolver but non-fatal
-/// on absence (doctor reports the absence, it does not error out on it).
-fn existing_models_path(project_root: &Path) -> Option<PathBuf> {
-    let dir = project_root.join("src").join("models");
-    if dir.is_dir() {
-        return Some(dir);
-    }
-    let file = project_root.join("src").join("models.rs");
-    if file.is_file() {
-        return Some(file);
-    }
-    None
-}
-
 #[cfg(test)]
 #[allow(clippy::needless_raw_string_hashes)]
 mod tests {
@@ -608,6 +624,27 @@ mod tests {
             .find(|c| c.name == "snapshot-present")
             .unwrap();
         assert_eq!(snap.status, Status::Error, "{snap:?}");
+    }
+
+    /// Finding 1 (connectivity false-positive): a MISSING migrations dir must not
+    /// short-circuit `probe_pending` to `Reachable(empty)` — with a configured URL
+    /// the probe must still attempt a connection, so an offline/misconfigured
+    /// database surfaces as `Unreachable` (a WARN) rather than a false "database is
+    /// up to date". Uses a loopback port with nothing listening (immediate
+    /// connection-refused — fast and deterministic, no network egress). Gated to
+    /// the default Postgres lane since the pending probe is Postgres-only.
+    #[cfg(not(feature = "sqlite"))]
+    #[test]
+    fn missing_migrations_dir_still_probes_the_database() {
+        let root = tempfile::tempdir().expect("tempdir"); // no migrations/ dir
+        let state = probe_pending(
+            "postgres://user:pw@127.0.0.1:1/db",
+            &root.path().join("migrations"),
+        );
+        assert!(
+            matches!(state, PendingState::Unreachable(_)),
+            "missing dir + unreachable DB must be Unreachable, got {state:?}"
+        );
     }
 
     #[test]

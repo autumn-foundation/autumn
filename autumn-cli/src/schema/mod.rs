@@ -195,6 +195,24 @@ fn resolve_default_models_path(project_root: &Path) -> Result<PathBuf, String> {
     ))
 }
 
+/// Resolve the declarative models source only when it actually exists.
+///
+/// Mirrors [`resolve_default_models_path`]'s `src/models` dir → `src/models.rs`
+/// file precedence, but returns `None` (not an error) when neither is present —
+/// so callers that must degrade gracefully on absence (the `migrate` snapshot
+/// refresh, `doctor`'s drift check) share one resolver instead of duplicating it.
+fn existing_models_path(project_root: &Path) -> Option<PathBuf> {
+    let dir = project_root.join("src").join("models");
+    if dir.is_dir() {
+        return Some(dir);
+    }
+    let file = project_root.join("src").join("models.rs");
+    if file.is_file() {
+        return Some(file);
+    }
+    None
+}
+
 /// Whether the `snapshot` command requires the current directory to be the
 /// project root. It does whenever any input falls back to a project-relative
 /// default: the source (`--from` omitted → `src/models`), the default output
@@ -982,6 +1000,22 @@ mod tests {
             ])
             .is_ok()
         );
+    }
+
+    #[test]
+    fn existing_models_path_prefers_dir_then_file_then_none() {
+        let root = tempfile::tempdir().expect("tempdir");
+        assert!(existing_models_path(root.path()).is_none());
+
+        let src = root.path().join("src");
+        std::fs::create_dir_all(&src).expect("mkdir src");
+        let file = src.join("models.rs");
+        std::fs::write(&file, "").expect("write file");
+        assert_eq!(existing_models_path(root.path()), Some(file));
+
+        let dir = src.join("models");
+        std::fs::create_dir_all(&dir).expect("mkdir models");
+        assert_eq!(existing_models_path(root.path()), Some(dir));
     }
 
     #[test]

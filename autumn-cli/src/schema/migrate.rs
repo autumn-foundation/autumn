@@ -25,7 +25,7 @@
 //! `SQLite` backend yields a clear "rebuild with `--features sqlite`" error; no
 //! `SQLite` symbol is referenced unless the feature is on.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use autumn_schema_core::Backend;
 use diesel_migrations::FileBasedMigrations;
@@ -72,7 +72,7 @@ fn migrate_at(project_root: &Path, profile: Option<&str>) -> Result<(), String> 
     // snapshot is not fatal here (the DB may be pre-snapshot), but we note it.
     let snapshot_path = project_root.join(SNAPSHOT_DEFAULT_PATH);
     if !enforce_provider_lock(&snapshot_path, backend)? {
-        println!(
+        eprintln!(
             "note: no schema snapshot at {} — applying migrations without a provider-lock check; \
              run `autumn schema snapshot` to establish the baseline.",
             snapshot_path.display()
@@ -214,8 +214,8 @@ fn report_applied(result: &MigrationResult) {
 /// warning (never surfaced as an apply failure), and a missing models source is
 /// a benign note.
 fn refresh_snapshot_after_apply(project_root: &Path, backend: Backend) {
-    let Some(models_path) = existing_models_path(project_root) else {
-        println!(
+    let Some(models_path) = super::existing_models_path(project_root) else {
+        eprintln!(
             "note: no declarative models found under src/ — migrations applied, but the schema \
              snapshot was not refreshed (nothing to snapshot)."
         );
@@ -225,7 +225,7 @@ fn refresh_snapshot_after_apply(project_root: &Path, backend: Backend) {
     let desired = match parse_models_path(&models_path, backend) {
         Ok(parsed) => parsed,
         Err(e) => {
-            println!(
+            eprintln!(
                 "warning: migrations applied, but re-parsing models to refresh the snapshot \
                  failed: {e}"
             );
@@ -237,28 +237,11 @@ fn refresh_snapshot_after_apply(project_root: &Path, backend: Backend) {
     let out = project_root.join(SNAPSHOT_DEFAULT_PATH);
     match write_snapshot(&out, &snapshot) {
         Ok(()) => println!("refreshed schema snapshot at {}", out.display()),
-        Err(e) => println!(
+        Err(e) => eprintln!(
             "warning: migrations applied, but refreshing the schema snapshot at {} failed: {e}",
             out.display()
         ),
     }
-}
-
-/// Resolve the declarative models source only when it actually exists, so the
-/// snapshot refresh can skip cleanly when the project has no models. Mirrors the
-/// `src/models` dir → `src/models.rs` file precedence the parent module's
-/// `resolve_default_models_path` uses, but returns `None` (not an error) when
-/// neither is present.
-fn existing_models_path(project_root: &Path) -> Option<PathBuf> {
-    let dir = project_root.join("src").join("models");
-    if dir.is_dir() {
-        return Some(dir);
-    }
-    let file = project_root.join("src").join("models.rs");
-    if file.is_file() {
-        return Some(file);
-    }
-    None
 }
 
 #[cfg(test)]
@@ -337,21 +320,5 @@ mod tests {
             err.contains("--features sqlite") && err.contains("SQLite"),
             "seam error names the feature: {err}"
         );
-    }
-
-    #[test]
-    fn existing_models_path_prefers_dir_then_file_then_none() {
-        let root = tempfile::tempdir().expect("tempdir");
-        assert!(existing_models_path(root.path()).is_none());
-
-        let src = root.path().join("src");
-        std::fs::create_dir_all(&src).expect("mkdir src");
-        let file = src.join("models.rs");
-        std::fs::write(&file, "").expect("write file");
-        assert_eq!(existing_models_path(root.path()), Some(file));
-
-        let dir = src.join("models");
-        std::fs::create_dir_all(&dir).expect("mkdir models");
-        assert_eq!(existing_models_path(root.path()), Some(dir));
     }
 }
