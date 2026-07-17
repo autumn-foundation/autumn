@@ -41,6 +41,7 @@ pub mod config;
 pub mod encode;
 pub mod error;
 pub mod retention;
+pub mod rooms;
 pub mod sink;
 pub mod storage;
 pub mod transport;
@@ -48,7 +49,7 @@ pub mod workflows;
 
 pub use config::{
     MediaConfig, MediaConfigError, MediaMtxConfig, MediaStorageBackend, MediaStorageConfig,
-    RecordingConfig,
+    RecordingConfig, RoomConfig,
 };
 pub use encode::{
     FfmpegClipTailCommand, FfmpegHighlightCommand, FfmpegLiveThumbnailCommand, FfmpegPosterCommand,
@@ -61,6 +62,12 @@ pub use error::MediaError;
 pub use retention::{
     RetentionDefer, RetentionReport, is_expired, recording_expires_at, spawn_retention_sweep_loop,
     sweep_recordings_root, within_root,
+};
+pub use rooms::{
+    InMemoryRoomStore, JoinRecord, JoinRequest, JoinResponse, LeaveRequest, ParticipantView,
+    PublishTarget, RoomError, RoomLeaveResponse, RoomService, RoomSnapshot, RoomStore,
+    SessionToken, SubscribeTarget, room_participant_path, room_route_infos, room_router,
+    validate_room_segment,
 };
 pub use sink::{
     MediaArtifact, MediaArtifactFile, MediaArtifactKind, MediaArtifactSink, MediaArtifactSinkExt,
@@ -94,6 +101,11 @@ pub mod prelude {
         newest_recording_files_since, recording_segments_covering_window, slugify,
     };
     pub use crate::{
+        InMemoryRoomStore, JoinRecord, JoinResponse, ParticipantView, RoomConfig, RoomError,
+        RoomService, RoomSnapshot, RoomStore, SessionToken, room_participant_path,
+        room_route_infos, room_router, validate_room_segment,
+    };
+    pub use crate::{
         IngestStatus, MediaMtxClient, MediaUrls, StreamQualityStats, StreamStatus, ViewerCount,
         duration_seconds_param, ingest_statuses_from_paths_json, quality_stats_from_path_json,
         recording_available, recording_mediamtx_path, stream_status_from_path_json,
@@ -121,8 +133,10 @@ use crate::workflows::MediaWorkflowDelegate as MediaWorkflowDelegateHook;
 /// [`MediaConfig`](config::MediaConfig) with [`config`](Self::config), then
 /// install with `app.plugin(...)`.
 ///
-/// This is the slice-0 skeleton: [`build`](Plugin::build) currently declares no
-/// routes and installs no extensions.
+/// When [`with_rooms`](Self::with_rooms) is enabled, [`build`](Plugin::build)
+/// nests the [`rooms::room_router`] under the API prefix and installs a
+/// [`rooms::RoomService`] extension; the broadcast surface installs the storage
+/// / encode wiring.
 pub struct MediaPlugin {
     /// Resolved `[media]` configuration.
     config: MediaConfig,
@@ -221,10 +235,10 @@ impl MediaPlugin {
     /// after [`Plugin::build`] runs; resolve it up front with
     /// [`MediaConfig::from_autumn_toml`](config::MediaConfig::from_autumn_toml)
     /// or [`MediaConfig::from_arroyo_env`](config::MediaConfig::from_arroyo_env)
-    /// and pass it here. Adopts the config's `room_max_participants`.
+    /// and pass it here. Adopts the config's `rooms.max_participants`.
     #[must_use]
     pub fn config(mut self, config: MediaConfig) -> Self {
-        self.room_max_participants = config.room_max_participants;
+        self.room_max_participants = config.rooms.max_participants;
         self.config = config;
         self
     }
@@ -247,6 +261,22 @@ impl MediaPlugin {
     #[must_use]
     pub const fn room_max_participants(mut self, max: usize) -> Self {
         self.room_max_participants = max;
+        self
+    }
+
+    /// Override the mesh-room session-token lifetime, in seconds (shortcut for
+    /// `config.rooms.token_ttl_seconds`).
+    #[must_use]
+    pub const fn room_token_ttl_seconds(mut self, seconds: u32) -> Self {
+        self.config.rooms.token_ttl_seconds = seconds;
+        self
+    }
+
+    /// Override the mesh-room `MediaMTX` path namespace (shortcut for
+    /// `config.rooms.namespace`).
+    #[must_use]
+    pub fn room_namespace(mut self, namespace: impl Into<String>) -> Self {
+        self.config.rooms.namespace = Some(namespace.into());
         self
     }
 
@@ -360,9 +390,31 @@ impl Plugin for MediaPlugin {
             "🍂 Autumn Media configured"
         );
 
+        // Rooms are storage-independent, so mount the room signaling router and
+        // install the `RoomService` extension up front — they must stay
+        // available even if the storage backend below fails to resolve. The
+        // `nest` + `declare_plugin_routes` pair keeps the room routes both
+        // served and audit-visible under `api_prefix`.
+        let mut app = app;
+        if enable_rooms {
+            let room_service = rooms::RoomService::new(
+                Arc::new(rooms::InMemoryRoomStore::new(room_max_participants)),
+                transport::MediaUrls::from_config(&config.mediamtx),
+                config.rooms.namespace.clone().unwrap_or_default(),
+                chrono::Duration::seconds(i64::from(config.rooms.token_ttl_seconds)),
+                room_max_participants,
+            );
+            app = app
+                .nest(&api_prefix, rooms::room_router())
+                .declare_plugin_routes(rooms::room_route_infos(&api_prefix))
+                .state_initializer(move |state| {
+                    state.insert_extension(room_service);
+                });
+        }
+
         // Resolve the storage backend up front so a misconfiguration surfaces
-        // as one error line here rather than inside a job. On failure we still
-        // register the (empty) route surface, but install no encode wiring.
+        // as one error line here rather than inside a job. On failure the plugin
+        // still serves any mounted room routes, but installs no encode wiring.
         let storage = match storage::MediaStorage::from_config(&config.storage) {
             Ok(storage) => storage,
             Err(error) => {
@@ -370,25 +422,18 @@ impl Plugin for MediaPlugin {
                     %error,
                     "🍂 Autumn Media: storage config invalid; encode workflows disabled"
                 );
-                return app.declare_plugin_routes(media_route_infos(&api_prefix));
+                return app;
             }
         };
 
         let ffmpeg_bin = config.ffmpeg.bin;
         let workflows = workflows::MediaWorkflows::new(ffmpeg_bin, queue.clone());
 
-        // slice 3 (transport/rooms): the `transport` module (MediaMtxClient +
-        //   MediaUrls + status parsers) now exists and is re-exported; its
-        //   AppState extension wiring lands with the consumer slice — insert the
-        //   MediaMtxClient / MediaUrls extensions and
-        //   nest the broadcast + room routers under `api_prefix`.
-        //
         // Extensions are installed via `state_initializer` (not `on_startup`)
         // so they exist BEFORE job workers start — mirroring autumn-web's
         // outbound-webhook plugin, whose manager must be present before the
         // first job runs.
         let app = app
-            .declare_plugin_routes(media_route_infos(&api_prefix))
             .state_initializer(move |state| {
                 state.insert_extension(storage.clone());
                 state.insert_extension(workflows.clone());
@@ -447,15 +492,6 @@ fn arroyo_recordings_root(env: &HashMap<String, String>) -> PathBuf {
             || PathBuf::from(DEFAULT_ARROYO_RECORDINGS_ROOT),
             PathBuf::from,
         )
-}
-
-/// The route metadata `MediaPlugin` declares for `autumn routes` listing.
-///
-/// **Slice 0: empty.** Later slices will fill this in with the broadcast and
-/// room routers' routes under `api_prefix`, kept in sync with what `build`
-/// nests. Extracted so the empty slice-0 declaration is directly testable.
-const fn media_route_infos(_api_prefix: &str) -> Vec<autumn_web::route_listing::RouteInfo> {
-    Vec::new()
 }
 
 // ── Arroyo migration shim (slice 5) ─────────────────────────────────────────
@@ -564,14 +600,12 @@ mod arroyo_shim_tests {
 
 // ── Conformance reference tests ─────────────────────────────────────────────
 //
-// Slice 0's `build()` declares **zero** routes (asserted directly). The
-// conformance harness, however, treats a plugin that declares no routes as a
-// FAIL — it expects every plugin to eventually declare at least one route. So,
-// mirroring `autumn-admin-plugin`'s `conformance_tests`, the harness checks run
-// against a small **representative** future route set attributed to the plugin
-// under `/api/media`: this proves the plugin's naming/prefix conventions are
-// conformance-clean the moment routes land in a later slice, so a later slice
-// that adds routes must consciously keep them conformant.
+// The room signaling routes `MediaPlugin::build` declares under `/api/media`
+// (via `rooms::room_route_infos`) are run through autumn-web's plugin
+// conformance harness — the same checks `autumn-admin-plugin`'s
+// `conformance_tests` uses — so the plugin's naming / prefix / attribution
+// conventions stay clean and a future slice that touches the room routes must
+// consciously keep them conformant.
 
 #[cfg(test)]
 mod conformance_tests {
@@ -582,35 +616,35 @@ mod conformance_tests {
     use autumn_web::route_listing::{RouteInfo, RouteSource};
 
     const PLUGIN_NAME: &str = "autumn-media-plugin";
+    const API_PREFIX: &str = "/api/media";
 
-    /// Slice-0 `MediaPlugin` declares **no** routes.
-    #[test]
-    fn media_plugin_declares_no_routes_in_slice_0() {
-        assert!(
-            super::media_route_infos("/api/media").is_empty(),
-            "slice 0 must declare no routes"
-        );
-    }
-
-    /// A representative route set attributed to the plugin, all under the
-    /// plugin's `/api/media` prefix. Stands in for the routes later slices will
-    /// declare, so the conformance conventions are pinned now.
-    fn representative_routes() -> Vec<RouteInfo> {
-        ["/api/media/broadcasts", "/api/media/rooms"]
+    /// The real room routes `build` declares, attributed to the plugin exactly
+    /// as `declare_plugin_routes` attributes them at runtime.
+    fn declared_room_routes() -> Vec<RouteInfo> {
+        super::rooms::room_route_infos(API_PREFIX)
             .into_iter()
-            .map(|path| RouteInfo {
-                method: "GET".to_owned(),
-                path: path.to_owned(),
-                handler: format!("media::{}", path.rsplit('/').next().unwrap_or("handler")),
-                source: RouteSource::Plugin(PLUGIN_NAME.to_owned()),
-                ..Default::default()
+            .map(|mut route| {
+                route.source = RouteSource::Plugin(PLUGIN_NAME.to_owned());
+                route
             })
             .collect()
     }
 
     #[test]
-    fn representative_routes_are_attributed_to_plugin_name() {
-        let result = check_route_attribution(PLUGIN_NAME, &representative_routes());
+    fn build_declares_the_four_room_routes_when_rooms_enabled() {
+        let routes = super::rooms::room_route_infos(API_PREFIX);
+        assert_eq!(routes.len(), 4, "rooms declare exactly four routes");
+        assert!(
+            routes
+                .iter()
+                .all(|route| route.path.starts_with(API_PREFIX)),
+            "every declared room route lives under the API prefix"
+        );
+    }
+
+    #[test]
+    fn room_routes_are_attributed_to_plugin_name() {
+        let result = check_route_attribution(PLUGIN_NAME, &declared_room_routes());
         assert_eq!(
             result.status,
             CheckStatus::Pass,
@@ -620,8 +654,8 @@ mod conformance_tests {
     }
 
     #[test]
-    fn representative_routes_live_under_api_prefix() {
-        let result = check_route_prefix(PLUGIN_NAME, "/api/media", &[], &representative_routes());
+    fn room_routes_live_under_api_prefix() {
+        let result = check_route_prefix(PLUGIN_NAME, API_PREFIX, &[], &declared_room_routes());
         assert_eq!(
             result.status,
             CheckStatus::Pass,
@@ -631,8 +665,8 @@ mod conformance_tests {
     }
 
     #[test]
-    fn representative_routes_have_no_collisions_in_isolation() {
-        let (result, _) = check_collisions(&representative_routes());
+    fn room_routes_have_no_collisions_in_isolation() {
+        let (result, _) = check_collisions(&declared_room_routes());
         assert_eq!(
             result.status,
             CheckStatus::Pass,
@@ -642,8 +676,8 @@ mod conformance_tests {
     }
 
     #[test]
-    fn representative_routes_have_no_undeclared_sensitive_surfaces() {
-        let result = check_sensitive_surfaces(PLUGIN_NAME, &representative_routes(), &[]);
+    fn room_routes_have_no_undeclared_sensitive_surfaces() {
+        let result = check_sensitive_surfaces(PLUGIN_NAME, &declared_room_routes(), &[]);
         assert_eq!(
             result.status,
             CheckStatus::Pass,
@@ -653,8 +687,8 @@ mod conformance_tests {
     }
 
     #[test]
-    fn representative_single_registration_passes_duplicate_check() {
-        let result = check_duplicate_registration(PLUGIN_NAME, &representative_routes());
+    fn room_single_registration_passes_duplicate_check() {
+        let result = check_duplicate_registration(PLUGIN_NAME, &declared_room_routes());
         assert_eq!(
             result.status,
             CheckStatus::Pass,
@@ -664,9 +698,9 @@ mod conformance_tests {
     }
 
     #[test]
-    fn representative_routes_pass_full_conformance() {
-        let config = ConformanceConfig::new(PLUGIN_NAME).prefix("/api/media");
-        let report = run_conformance(&config, &representative_routes());
+    fn room_routes_pass_full_conformance() {
+        let config = ConformanceConfig::new(PLUGIN_NAME).prefix(API_PREFIX);
+        let report = run_conformance(&config, &declared_room_routes());
         assert!(
             report.passed(),
             "MediaPlugin conformance failed:\n{}",
@@ -677,8 +711,8 @@ mod conformance_tests {
     #[test]
     fn duplicate_registration_detected() {
         // Installing the plugin twice would double its routes → FAIL.
-        let mut routes = representative_routes();
-        routes.extend(representative_routes());
+        let mut routes = declared_room_routes();
+        routes.extend(declared_room_routes());
         let result = check_duplicate_registration(PLUGIN_NAME, &routes);
         assert_eq!(
             result.status,
@@ -691,11 +725,11 @@ mod conformance_tests {
     fn collision_with_host_route_detected() {
         // Sanity check the harness is wired: a host route colliding with a
         // plugin route is flagged.
-        let mut routes = representative_routes();
+        let mut routes = declared_room_routes();
         routes.push(RouteInfo {
             method: "GET".to_owned(),
-            path: "/api/media/broadcasts".to_owned(),
-            handler: "host::list".to_owned(),
+            path: format!("{API_PREFIX}/rooms/{{room_id}}"),
+            handler: "host::roster".to_owned(),
             source: RouteSource::User,
             ..Default::default()
         });

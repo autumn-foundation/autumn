@@ -529,6 +529,28 @@ impl MediaUrls {
         format!("{}/live/{stream_key}/whip", self.webrtc_base)
     }
 
+    /// `WHIP` publish URL for an arbitrary `MediaMTX` `path`.
+    ///
+    /// Unlike [`whip_publish_url`](Self::whip_publish_url) — the broadcast
+    /// helper that inserts the `live/` segment — this takes the full
+    /// `MediaMTX` path verbatim, so the rooms surface (whose participant paths
+    /// are `room/…`, not `live/…`) composes publish URLs through it.
+    #[must_use]
+    pub fn whip_publish_url_for_path(&self, path: &str) -> String {
+        format!("{}/{path}/whip", self.webrtc_base)
+    }
+
+    /// `WHEP` read (subscribe) URL for an arbitrary `MediaMTX` `path`.
+    ///
+    /// Mirrors [`whip_publish_url_for_path`](Self::whip_publish_url_for_path)
+    /// for the subscribe side: the rooms surface builds each peer's subscribe
+    /// URL with it (the broadcast [`webrtc_playback_url`](Self::webrtc_playback_url)
+    /// only serves `live/…` paths).
+    #[must_use]
+    pub fn whep_read_url(&self, path: &str) -> String {
+        format!("{}/{path}/whep", self.webrtc_base)
+    }
+
     /// Browser-facing recorded-`VOD` playback URL for a finished recording.
     ///
     /// Returns `None` when the recording path does not resolve to a
@@ -868,6 +890,20 @@ mod tests {
             "http://127.0.0.1:8889/live/sk/whip"
         );
         assert_eq!(urls.api_base(), "http://127.0.0.1:9997");
+    }
+
+    #[test]
+    fn raw_path_whip_whep_urls_take_the_path_verbatim() {
+        let urls = MediaUrls::from_config(&MediaMtxConfig::default());
+        // No `live/` insertion — the room path is used exactly as given.
+        assert_eq!(
+            urls.whip_publish_url_for_path("room/tenant-a/room1/part1"),
+            "http://127.0.0.1:8889/room/tenant-a/room1/part1/whip"
+        );
+        assert_eq!(
+            urls.whep_read_url("room/tenant-a/room1/part1"),
+            "http://127.0.0.1:8889/room/tenant-a/room1/part1/whep"
+        );
     }
 
     #[test]
