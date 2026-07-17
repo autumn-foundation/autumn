@@ -582,18 +582,22 @@ pub enum DiffError {
         column: String,
     },
 
-    /// A generated FK-constraint or index identifier exceeds Postgres's 63-byte
-    /// identifier limit — or collides with another generated name after PG
-    /// truncates both to 63 bytes (unsupported this slice, **no override** — the
-    /// SQL is unappliable, not merely lossy). Postgres silently truncates any
-    /// identifier to `NAMEDATALEN - 1` (63) bytes, so an over-long generated name
-    /// is both renamed on apply (risking a mismatch with hand-written SQL) and a
-    /// duplicate-relation hazard when two names share their first 63 bytes.
-    /// Postgres-only: `SQLite` has no comparable short limit.
+    /// A generated FK-constraint or index identifier is emitted more than once, or
+    /// exceeds Postgres's 63-byte identifier limit, or collides with another
+    /// generated name after PG truncates both to 63 bytes (unsupported this slice,
+    /// **no override** — the SQL is unappliable, not merely lossy). Postgres
+    /// silently truncates any identifier to `NAMEDATALEN - 1` (63) bytes, so an
+    /// over-long generated name is both renamed on apply (risking a mismatch with
+    /// hand-written SQL) and a duplicate-relation hazard when two names share their
+    /// first 63 bytes. A second, distinct hazard: two generated names that are
+    /// *exactly* identical (e.g. a `#[unique] foo` field and a separate field named
+    /// `foo_unique` both yield `idx_<table>_foo_unique`) — PG accepts the first
+    /// `CREATE INDEX`/`ADD CONSTRAINT` and rejects the second as a duplicate
+    /// relation. Postgres-only: `SQLite` has no comparable short limit.
     #[error(
-        "generated constraint/index name `{name}` exceeds PostgreSQL's 63-byte identifier limit \
-         (or collides with another generated name after truncation to 63 bytes); \
-         shorten the table/column names."
+        "generated constraint/index name `{name}` is emitted more than once, or exceeds \
+         PostgreSQL's 63-byte identifier limit (colliding with another generated name after \
+         truncation to 63 bytes); rename the offending field or shorten the table/column names."
     )]
     GeneratedIdentifierTooLong {
         /// The offending generated identifier.
@@ -1424,9 +1428,12 @@ fn truncate_pg_identifier(name: &str) -> &str {
 }
 
 /// The [`DiffError::GeneratedIdentifierTooLong`] refusal when the plan generates an
-/// FK-constraint or index identifier over Postgres's 63-byte limit, or two generated
-/// names that collide after truncation to 63 bytes. Postgres-only — `SQLite` does not
-/// truncate identifiers to a short limit, so the hazard does not apply there.
+/// FK-constraint or index identifier over Postgres's 63-byte limit, two distinct
+/// generated names that collide after truncation to 63 bytes, or two generated names
+/// that are *exactly* identical. Postgres-only — `SQLite` does not truncate identifiers
+/// to a short limit, so the truncation hazard does not apply there (an exact-duplicate
+/// relation name would still be rejected, but the parser only produces the colliding
+/// `idx_<table>_<field>_unique` shape for a Postgres plan).
 fn find_identifier_limit_violation(plan: &MigrationPlan) -> Option<DiffError> {
     if plan.backend != Backend::Postgres {
         return None;
@@ -1434,16 +1441,22 @@ fn find_identifier_limit_violation(plan: &MigrationPlan) -> Option<DiffError> {
     let mut by_truncated: BTreeMap<String, String> = BTreeMap::new();
     for name in generated_identifiers(plan) {
         // Over the limit: PG truncates it silently — refuse outright (this alone
-        // catches every post-truncation collision, since a collision requires at
-        // least one name to exceed 63 bytes).
+        // catches every *distinct*-name post-truncation collision, since such a
+        // collision requires at least one name to exceed 63 bytes).
         if name.len() > PG_MAX_IDENTIFIER_BYTES {
             return Some(DiffError::GeneratedIdentifierTooLong { name });
         }
-        // Defensive precise check: two within-limit names truncate to themselves,
-        // so this fires only on an exact duplicate generated name.
-        if let Some(prev) =
-            by_truncated.insert(truncate_pg_identifier(&name).to_owned(), name.clone())
-            && prev != name
+        // Any collision on the on-apply (truncated) identifier is a duplicate-relation
+        // hazard: PG accepts the first `CREATE INDEX`/`ADD CONSTRAINT` and rejects the
+        // second. Because over-limit names are refused above, every name here truncates
+        // to itself — so this fires on an *exact duplicate* generated name (e.g. a
+        // `#[unique] foo` field plus a separate field named `foo_unique`, both yielding
+        // `idx_<table>_foo_unique`), which PG would reject as a duplicate relation. This
+        // must NOT dedup or skip the `prev == name` case: identical names are precisely
+        // the hazard.
+        if by_truncated
+            .insert(truncate_pg_identifier(&name).to_owned(), name.clone())
+            .is_some()
         {
             return Some(DiffError::GeneratedIdentifierTooLong { name });
         }
@@ -3077,6 +3090,115 @@ mod tests {
         assert!(
             guard_plan(&plan, DEFAULT_OPTS).is_ok(),
             "the 63-byte guard is Postgres-only"
+        );
+    }
+
+    #[test]
+    fn duplicate_generated_index_names_are_refused() {
+        // A `#[unique] foo` field yields `idx_<table>_foo_unique` while a separate
+        // field literally named `foo_unique` yields the *same* `idx_<table>_foo_unique`
+        // (parse.rs). Both are within 63 bytes, so the truncation-collision path never
+        // fires — but PG accepts the first `CREATE INDEX` and rejects the second as a
+        // duplicate relation. The guard must refuse the plan and name the duplicate.
+        let dup = "idx_posts_foo_unique".to_owned();
+        let plan = MigrationPlan {
+            backend: Backend::Postgres,
+            changes: vec![
+                SchemaChange::AddIndex {
+                    table: "posts".to_owned(),
+                    index: Index {
+                        name: dup.clone(),
+                        columns: vec!["foo".to_owned()],
+                        unique: true,
+                    },
+                },
+                SchemaChange::AddIndex {
+                    table: "posts".to_owned(),
+                    index: Index {
+                        name: dup.clone(),
+                        columns: vec!["foo_unique".to_owned()],
+                        unique: false,
+                    },
+                },
+            ],
+        };
+        let err = guard_plan(&plan, DEFAULT_OPTS).unwrap_err();
+        assert!(
+            matches!(err, DiffError::GeneratedIdentifierTooLong { .. }),
+            "an exact-duplicate generated index name is refused: {err:?}"
+        );
+        assert!(
+            err.to_string().contains(&dup),
+            "the error names the duplicated identifier: {err}"
+        );
+        // No override — the SQL is unappliable, not merely lossy.
+        assert!(matches!(
+            guard_plan(&plan, ALLOW).unwrap_err(),
+            DiffError::GeneratedIdentifierTooLong { .. }
+        ));
+    }
+
+    #[test]
+    fn duplicate_generated_names_on_create_table_are_refused() {
+        // The same collision emitted inline on a brand-new table's `CREATE TABLE`
+        // (both indexes live on `table.indexes`) is likewise refused.
+        let dup = "idx_posts_foo_unique".to_owned();
+        let mut table = posts_with(vec![
+            col("foo", ColumnType::Text),
+            col("foo_unique", ColumnType::Text),
+        ]);
+        table.indexes = vec![
+            Index {
+                name: dup.clone(),
+                columns: vec!["foo".to_owned()],
+                unique: true,
+            },
+            Index {
+                name: dup.clone(),
+                columns: vec!["foo_unique".to_owned()],
+                unique: false,
+            },
+        ];
+        let plan = MigrationPlan {
+            backend: Backend::Postgres,
+            changes: vec![SchemaChange::CreateTable(table)],
+        };
+        let err = guard_plan(&plan, DEFAULT_OPTS).unwrap_err();
+        assert!(
+            matches!(err, DiffError::GeneratedIdentifierTooLong { .. }),
+            "duplicate inline index names on CREATE TABLE are refused: {err:?}"
+        );
+        assert!(err.to_string().contains(&dup), "names the duplicate: {err}");
+    }
+
+    #[test]
+    fn distinct_index_names_are_allowed() {
+        // Control: two legitimately-distinct index names (both well under 63 bytes)
+        // must not be treated as a collision.
+        let plan = MigrationPlan {
+            backend: Backend::Postgres,
+            changes: vec![
+                SchemaChange::AddIndex {
+                    table: "posts".to_owned(),
+                    index: Index {
+                        name: "idx_posts_foo".to_owned(),
+                        columns: vec!["foo".to_owned()],
+                        unique: false,
+                    },
+                },
+                SchemaChange::AddIndex {
+                    table: "posts".to_owned(),
+                    index: Index {
+                        name: "idx_posts_bar".to_owned(),
+                        columns: vec!["bar".to_owned()],
+                        unique: false,
+                    },
+                },
+            ],
+        };
+        assert!(
+            guard_plan(&plan, DEFAULT_OPTS).is_ok(),
+            "distinct index names must not be refused as a collision"
         );
     }
 
