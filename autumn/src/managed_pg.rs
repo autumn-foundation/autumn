@@ -514,7 +514,7 @@ impl DatabasePoolProvider for ManagedPostgresPoolProvider {
     async fn create_pool(
         &self,
         config: &DatabaseConfig,
-    ) -> Result<Option<Pool<AsyncPgConnection>>, PoolError> {
+    ) -> Result<Option<Pool<crate::db::RuntimeConnection>>, PoolError> {
         // Reject a sharded config before starting anything. When the provider is
         // installed only as the *pool* provider (`.with_pool_provider`),
         // `resolve_shard_set` builds the shards directly from config and never

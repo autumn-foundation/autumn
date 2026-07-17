@@ -780,7 +780,7 @@ where
     Ok((context, record))
 }
 
-#[cfg(feature = "ws")]
+#[cfg(all(feature = "ws", not(feature = "sqlite")))]
 pub fn start_repository_commit_hook_worker(
     pool: PgPool,
     channels: Option<crate::channels::Channels>,
@@ -826,7 +826,7 @@ pub fn start_repository_commit_hook_worker(
     });
 }
 
-#[cfg(not(feature = "ws"))]
+#[cfg(all(not(feature = "ws"), not(feature = "sqlite")))]
 pub fn start_repository_commit_hook_worker(pool: PgPool, shutdown: CancellationToken) {
     register_inventory_repository_commit_hook_runners();
     if !should_start_repository_commit_hook_worker(&registered_handler_keys()) {
@@ -1571,6 +1571,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(feature = "sqlite"))]
     #[test]
     fn dispatcher_kick_state_coalesces_pending_notifications() {
         let state = RepositoryCommitHookKickState::default();

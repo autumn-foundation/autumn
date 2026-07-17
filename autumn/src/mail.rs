@@ -4081,13 +4081,13 @@ pub mod suppression {
         /// ```
         #[derive(Clone)]
         pub struct PgSuppressionStore {
-            pool: Pool<AsyncPgConnection>,
+            pool: Pool<crate::db::RuntimeConnection>,
         }
 
         impl PgSuppressionStore {
             /// Create a store backed by `pool`.
             #[must_use]
-            pub const fn new(pool: Pool<AsyncPgConnection>) -> Self {
+            pub const fn new(pool: Pool<crate::db::RuntimeConnection>) -> Self {
                 Self { pool }
             }
         }
@@ -4207,13 +4207,13 @@ pub mod db_suppression {
     /// `autumn generate mailer --list-unsubscribe` writes into the app.
     #[derive(Clone)]
     pub struct DbSuppressionStore {
-        pool: Pool<AsyncPgConnection>,
+        pool: Pool<crate::db::RuntimeConnection>,
     }
 
     impl DbSuppressionStore {
         /// Create a store backed by `pool`.
         #[must_use]
-        pub const fn new(pool: Pool<AsyncPgConnection>) -> Self {
+        pub const fn new(pool: Pool<crate::db::RuntimeConnection>) -> Self {
             Self { pool }
         }
     }
