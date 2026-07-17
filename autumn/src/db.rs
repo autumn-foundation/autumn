@@ -1407,18 +1407,24 @@ pub fn create_pool(config: &DatabaseConfig) -> Result<Option<Pool<RuntimeConnect
 /// A `None` or zero timeout (the default) asks for no guarantee and boots
 /// cleanly, so ordinary `SQLite` apps are unaffected — only an operator who
 /// explicitly configured a timeout we cannot meet is stopped. This is the single
-/// choke point for every pool-construction entry point: `create_pool`,
-/// `create_topology`, and `create_shard_topology` all call it before the pool is
-/// built, so no configured timeout can reach a live `SQLite` pool. `busy_timeout`
-/// still bounds lock waits; a real per-statement timeout is tracked by
-/// #1996/#1910.
+/// choke point for every pool-construction entry point: the built-in
+/// `create_pool`, `create_topology`, and `create_shard_topology` factories all
+/// call it before the pool is built, and `setup_database` calls it once more at
+/// the pool-provider dispatch boundary so a custom
+/// [`DatabasePoolProvider`](crate::db::DatabasePoolProvider) — whose
+/// `create_topology`/`create_shard_topology` need not route through those
+/// factories — cannot bypass the guard. No configured timeout can reach a live
+/// `SQLite` pool. `busy_timeout` still bounds lock waits; a real per-statement
+/// timeout is tracked by #1996/#1910.
 ///
 /// # Errors
 ///
 /// Returns [`PoolError::UnsupportedBackend`] when `statement_timeout` is `Some`
 /// and non-zero.
 #[cfg(feature = "sqlite")]
-fn reject_sqlite_statement_timeout(statement_timeout: Option<Duration>) -> Result<(), PoolError> {
+pub(crate) fn reject_sqlite_statement_timeout(
+    statement_timeout: Option<Duration>,
+) -> Result<(), PoolError> {
     let Some(timeout) = statement_timeout.filter(|t| !t.is_zero()) else {
         return Ok(());
     };
@@ -1972,7 +1978,25 @@ where
             let outcome = AssertUnwindSafe(f(&mut *conn)).catch_unwind().await;
             match outcome {
                 Ok(Ok(value)) => {
-                    conn.batch_execute("COMMIT").await.map_err(E::from)?;
+                    // A COMMIT failure leaves the manual `BEGIN IMMEDIATE` txn
+                    // open. Because we bypass diesel's transaction-manager depth
+                    // counter, deadpool would see a "clean" TM and recycle this
+                    // connection with the uncommitted write txn still open, so a
+                    // later borrower would read uncommitted state or fail a nested
+                    // BEGIN. Roll back before returning the commit error. There is
+                    // no clean way to mark the pooled connection broken through the
+                    // `&mut C` surface here, so if even the ROLLBACK fails we log
+                    // loudly and still surface the commit error (documented
+                    // limitation: the connection may be recycled dirty in that rare
+                    // double-failure case).
+                    if let Err(commit_err) = conn.batch_execute("COMMIT").await {
+                        if let Err(rollback_err) = conn.batch_execute("ROLLBACK").await {
+                            tracing::error!(
+                                "failed to roll back immediate transaction after COMMIT failure: {rollback_err}"
+                            );
+                        }
+                        return Err(E::from(commit_err));
+                    }
                     Ok(value)
                 }
                 Ok(Err(user_error)) => {

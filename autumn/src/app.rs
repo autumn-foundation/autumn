@@ -7228,6 +7228,21 @@ async fn setup_database(
     let shard_map_migration_required =
         shard_map_migration_is_required(config.database.has_shards(), hook_queue_migration_mode);
     let check_replica_migrations = !migrations.is_empty();
+    // Fail-closed statement-timeout guard at the pool-provider dispatch boundary.
+    // The built-in `create_topology`/`create_shard_topology` factories validate
+    // `database.statement_timeout` internally, but a custom `with_pool_provider`
+    // provider can build its own SQLite pool without routing through them — the
+    // default `DatabasePoolProvider::create_topology` only delegates to the
+    // provider's `create_pool`, and both `create_topology`/`create_shard_topology`
+    // are overridable — so a custom provider could silently discard the timeout
+    // and break the fail-closed guarantee. Enforce the same shared check here,
+    // once, before both the control-topology dispatch below and the shard-topology
+    // dispatch in `resolve_shard_set` (both keyed on `database.statement_timeout`),
+    // so the guard is universal regardless of which provider builds the pool. This
+    // is idempotent with the built-in factories' own checks (double-guard is safe).
+    #[cfg(feature = "sqlite")]
+    crate::db::reject_sqlite_statement_timeout(config.database.statement_timeout)
+        .map_err(|e| format!("Failed to create database pool: {e}"))?;
     let topology = match pool_provider {
         Some(factory) => factory(config.database.clone()).await,
         None => crate::db::create_topology(&config.database),
@@ -9603,6 +9618,64 @@ mod tests {
         assert!(state.read_pool().is_none());
         let (status, _) = crate::probe::readiness_response(&state).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    // Finding 2 (Codex P2): the fail-closed `statement_timeout` guard must fire at
+    // the pool-provider DISPATCH boundary, not only inside the built-in factory. A
+    // custom provider can build its own SQLite pool without routing through
+    // `create_topology`/`create_pool` (the default `create_topology` only delegates
+    // to the provider's `create_pool`, and both are overridable), so
+    // `setup_database` enforces the guard once before invoking ANY provider. Prove
+    // it with a provider that PANICS if invoked: boot must fail-closed with the
+    // actionable error before the provider ever runs. (CI's sqlite job runs the
+    // named integration targets, not `--lib`; `setup_database` and the shared guard
+    // are crate-private, so this boundary is only reachable from a unit test —
+    // hence a focused `--lib` test rather than an entry in the runtime target.)
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn custom_pool_provider_cannot_bypass_sqlite_statement_timeout_guard() {
+        struct PanickingProvider;
+
+        impl crate::db::DatabasePoolProvider for PanickingProvider {
+            async fn create_pool(
+                &self,
+                _config: &crate::config::DatabaseConfig,
+            ) -> Result<
+                Option<
+                    diesel_async::pooled_connection::deadpool::Pool<crate::db::RuntimeConnection>,
+                >,
+                crate::db::PoolError,
+            > {
+                panic!("boundary guard must reject before the custom provider is invoked");
+            }
+        }
+
+        let mut config = AutumnConfig::default();
+        config.database.primary_url = Some("sqlite::memory:".to_owned());
+        config.database.statement_timeout = Some(std::time::Duration::from_secs(30));
+        let AppBuilder {
+            pool_provider_factory,
+            shard_provider_factory,
+            ..
+        } = app().with_pool_provider(PanickingProvider);
+
+        let Err(err) = setup_database(
+            &config,
+            Vec::new(),
+            pool_provider_factory,
+            shard_provider_factory,
+            None,
+            false,
+            RepositoryCommitHookQueueMigrationMode::Runtime,
+        )
+        .await
+        else {
+            panic!("sqlite + statement_timeout must fail closed at the provider boundary");
+        };
+        assert!(
+            err.contains("database.statement_timeout") && err.contains("SQLite"),
+            "boundary guard error must name the config key and SQLite, got: {err}"
+        );
     }
 
     #[cfg(feature = "db")]

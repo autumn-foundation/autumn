@@ -16,7 +16,11 @@
 //!    bumps the optimistic `lock_version`);
 //! 3. a single-writer `update` commits and bumps `lock_version`;
 //! 4. a write-RMW closure that returns `Err` rolls the immediate transaction
-//!    back (the row is unchanged).
+//!    back (the row is unchanged);
+//! 5. a COMMIT-time failure (a deferred foreign-key violation) rolls the
+//!    transaction back so the pooled connection is left reusable — a subsequent
+//!    write on the same connection commits, never "cannot start a transaction
+//!    within a transaction" (issue #1996 Finding 3).
 //!
 //! Only meaningful under `--features sqlite`; the file is
 //! `#![cfg(feature = "sqlite")]` so a default `cargo test` compiles it to an
@@ -254,4 +258,83 @@ async fn errored_rmw_rolls_back_the_immediate_transaction() {
         .expect("row exists");
     assert_eq!(after.value, 5, "the mutation was rolled back");
     assert_eq!(after.lock_version, 1, "no lock_version bump on rollback");
+}
+
+// Finding 3 (Codex P2): a COMMIT failure in the SQLite immediate arm must ROLL
+// BACK before surfacing the error, so deadpool cannot recycle the connection with
+// an open write transaction (which would make a later borrower read uncommitted
+// state or fail a nested BEGIN with "cannot start a transaction within a
+// transaction"). A deferred foreign-key violation is accepted mid-transaction and
+// only checked at COMMIT, so it deterministically forces a COMMIT-time failure.
+#[tokio::test]
+async fn commit_failure_rolls_back_and_leaves_connection_reusable() {
+    use diesel_async::SimpleAsyncConnection as _;
+
+    let tmp = tempfile::TempDir::new().expect("temp dir");
+    let url = format!("sqlite://{}", tmp.path().join("commit_fail.db").display());
+    let config = DatabaseConfig {
+        url: Some(url),
+        // A single-slot pool guarantees the reuse below checks out the SAME
+        // connection whose COMMIT just failed.
+        primary_pool_size: Some(1),
+        ..Default::default()
+    };
+    let pool: SqlitePool = create_pool(&config)
+        .expect("sqlite pool builds")
+        .expect("a url is configured");
+
+    let mut conn = pool.get().await.expect("checkout a sqlite connection");
+    // Deferred-FK schema: a child→parent violation is accepted at INSERT and only
+    // enforced at COMMIT. `foreign_keys = ON` is installed by the pool's
+    // per-connection setup, so the deferred check actually fires.
+    conn.batch_execute(
+        "CREATE TABLE parent (id INTEGER PRIMARY KEY); \
+         CREATE TABLE child (\
+             id INTEGER PRIMARY KEY, \
+             parent_id INTEGER NOT NULL REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED\
+         );",
+    )
+    .await
+    .expect("create deferred-fk schema");
+
+    // A write-RMW whose body inserts a child referencing a missing parent: the
+    // INSERT is accepted (deferred), the closure returns Ok, so the COMMIT path
+    // runs, the FK check fires, and COMMIT fails.
+    let doomed: autumn_web::AutumnResult<()> =
+        autumn_web::__private::scoped_immediate_transaction(&mut *conn, |c| {
+            async move {
+                diesel::sql_query("INSERT INTO child (id, parent_id) VALUES (1, 999)")
+                    .execute(c)
+                    .await
+                    .map_err(autumn_web::AutumnError::from)?;
+                Ok::<(), autumn_web::AutumnError>(())
+            }
+            .scope_boxed()
+        })
+        .await;
+    assert!(
+        doomed.is_err(),
+        "a deferred-FK violation must fail the transaction at COMMIT"
+    );
+
+    // The connection must be left usable: a fresh immediate transaction on the
+    // SAME pooled connection begins, writes, and commits — proving no open txn
+    // lingered from the failed COMMIT (the ROLLBACK ran) and the doomed txn left
+    // nothing behind.
+    let reused: autumn_web::AutumnResult<i64> =
+        autumn_web::__private::scoped_immediate_transaction(&mut *conn, |c| {
+            async move {
+                diesel::sql_query("INSERT INTO parent (id) VALUES (1)")
+                    .execute(c)
+                    .await
+                    .map_err(autumn_web::AutumnError::from)?;
+                Ok::<i64, autumn_web::AutumnError>(1)
+            }
+            .scope_boxed()
+        })
+        .await;
+    assert_eq!(
+        reused.expect("connection is reusable after the COMMIT failure"),
+        1
+    );
 }
