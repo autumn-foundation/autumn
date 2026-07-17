@@ -1356,6 +1356,53 @@ pub struct TransitionEffect {
     pub idempotency_key: String,
 }
 
+/// Internal: returns `true` if `(from, to)` appears as an edge in a
+/// `#[lifecycle]` enum's `STATE_MACHINE_TRANSITIONS` table. Used by
+/// `#[state_machine(lifecycle = ..., effects(...))]` codegen to reject at
+/// compile time an effect declared on an edge the lifecycle does not permit
+/// (which would otherwise silently drop the effect). Not part of the public API.
+#[doc(hidden)]
+#[must_use]
+pub const fn __transition_edge_declared(
+    table: &[(&str, &str, ::core::option::Option<&str>)],
+    from: &str,
+    to: &str,
+) -> bool {
+    // Iterators/`for` are not permitted in a const fn, so index with `while`.
+    #[allow(clippy::needless_range_loop)]
+    let mut i = 0;
+    while i < table.len() {
+        let (f, t, _) = table[i];
+        if __const_str_eq(f, from) && __const_str_eq(t, to) {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Internal: byte-wise `&str` equality usable in a const context (where the
+/// `PartialEq` `==` operator on `str` is not available). Not part of the
+/// public API.
+#[doc(hidden)]
+#[must_use]
+pub const fn __const_str_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    // Iterators/`for` are not permitted in a const fn, so index with `while`.
+    #[allow(clippy::needless_range_loop)]
+    let mut i = 0;
+    while i < a.len() {
+        if a[i] != b[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
 // ── Maud re-exports ────────────────────────────────────────────────
 
 /// Rendered HTML fragment produced by the [`html!`] macro.
