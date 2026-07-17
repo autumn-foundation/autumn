@@ -27,19 +27,25 @@ could run attacker-controlled code (build scripts, test code, `run:` steps) on
 your own hardware, with your network position. Every control below exists to
 close that hole. Do not weaken one without understanding the others.
 
-- **(a) Trusted-only routing.** All routing decisions flow through
-  `.github/workflows/runner-routing.yml`, a reusable workflow whose single job
-  emits the `runs-on` value for heavy lanes. It marks an event **trusted** only
-  when:
-  - the event is `push`, `workflow_dispatch`, or `schedule` — all of which run
-    against the base repo by definition (there is no fork context); **or**
-  - the event is `pull_request` **and**
-    `github.event.pull_request.head.repo.full_name == github.repository` — i.e.
-    the PR's HEAD branch lives in this same repo, not a fork. A fork PR's
-    `head.repo.full_name` is the fork's `owner/repo`, which never equals the
-    base `github.repository`, so **fork PRs are always classified untrusted**
-    and routed to `ubuntu-latest`. Arbitrary fork code can never reach the
-    self-hosted box.
+- **(a) Base-repo-event routing (the structural fork boundary).** All routing
+  decisions flow through `.github/workflows/runner-routing.yml`, a reusable
+  workflow whose single job emits the `runs-on` value for heavy lanes. It selects
+  the self-hosted lane **only** for events whose workflow *definition* comes from
+  the base repo — `push`, `workflow_dispatch`, and `schedule`. **Every
+  `pull_request` — fork AND same-repo — stays on `ubuntu-latest`**, so
+  fork-controlled workflow code can never select the self-hosted runner. This is
+  a structural boundary (which events may reach the lane at all), enforced by
+  construction, not by an in-workflow check.
+
+  **Why an in-workflow `head.repo == base` check is insufficient:** for a
+  `pull_request`, GitHub executes the workflow files *from the PR head*, which a
+  fork controls. A fork could therefore edit `runner-routing.yml` itself (or a
+  caller's `runs-on`) to emit the self-hosted labels and delete any
+  `head.repo.full_name == github.repository` comparison guarding them — the check
+  runs on code the attacker supplied, so it cannot be trusted to keep forks off
+  the box. Excluding `pull_request` from the lane entirely closes that hole:
+  because `push` / `workflow_dispatch` / `schedule` run the workflow definition
+  from the base repo, the routing logic itself is always base-repo-controlled.
 - **(b) Ephemeral runners.** Each runner registers with `--ephemeral`, so it
   accepts exactly **one job**, then deregisters and the systemd unit restarts
   the slot to re-register fresh. No workspace, environment, cache, or process
@@ -72,12 +78,14 @@ close that hole. Do not weaken one without understanding the others.
   repo-scoped and easily rotated. **If you ever suspect compromise, revoke and
   re-issue the PAT immediately** (regenerate at
   Settings → Developer settings → Fine-grained tokens) and re-provision the box.
-- **(e) Require approval for external contributors.** As belt-and-suspenders,
-  set **Settings → Actions → General → Fork pull request workflows from outside
+- **(e) Require approval for external contributors.** The fork boundary is
+  already closed structurally by control **a** (no `pull_request` ever routes to
+  self-hosted), so this is no longer the sole/primary defense — but keep it as
+  recommended defense-in-depth for Actions security generally: set
+  **Settings → Actions → General → Fork pull request workflows from outside
   collaborators → "Require approval for all external contributors"** (or the
-  strictest option your plan offers). Combined with control **a**, this means a
-  fork PR neither runs on the self-hosted box *nor* runs any workflow at all
-  until a maintainer approves it.
+  strictest option your plan offers) so a fork PR does not run any workflow at
+  all — hosted or otherwise — until a maintainer approves it.
 
 ## 3. Architecture
 
@@ -100,6 +108,12 @@ each  autumn-runner@N  systemd unit  ──▶  run-ephemeral.sh N
     └──▶ job finishes ▶ runner deregisters ▶ systemd Restart=always ▶ repeat
          (labels advertised: self-hosted, hetzner, linux, x64)
 ```
+
+On each restart `run-ephemeral.sh` clears the slot's local runner config
+(`.runner` / `.credentials`) before re-running `config.sh`, so an ephemeral slot
+re-registers cleanly and keeps taking jobs beyond the first — otherwise the
+leftover local config would make `config.sh` refuse with "already configured"
+and the slot would die after a single job.
 
 ## 4. Prerequisites — secrets & variables
 
@@ -153,8 +167,11 @@ each  autumn-runner@N  systemd unit  ──▶  run-ephemeral.sh N
 
 ## 6. Which lanes route
 
-Routed to self-hosted **only when trusted AND opted-in** (otherwise
-`ubuntu-latest`):
+Routed to self-hosted **only on a base-repo-controlled event AND when opted-in**
+(otherwise `ubuntu-latest`) — i.e. only on **push to trunk/trunk-dev,
+`workflow_dispatch`, and `schedule`**. **PR-time heavy jobs deliberately stay on
+`ubuntu-latest`** (the security trade-off from control **a**: a `pull_request`
+runs fork-controlled workflow files, so it is never allowed to select the lane):
 
 | Workflow | Job(s) routed | Notes |
 |----------|---------------|-------|
@@ -168,7 +185,8 @@ Routed to self-hosted **only when trusted AND opted-in** (otherwise
 - `ci.yml`: `lint`, `msrv`, `sqlite-runtime` — light/short Linux jobs; the `meta`
   routing job itself always runs hosted.
 - `ci.yml` `test` macOS/Windows legs — the self-hosted box is Linux/x64 only.
-- **All fork PRs** — untrusted by control **a**, always hosted.
+- **All pull requests (fork AND same-repo)** — never routed by control **a**
+  (a `pull_request` runs fork-controlled workflow files), always hosted.
 - **Benchmark / timing workflows** — `cold-start-latency.yml`,
   `dev-loop-latency.yml`, `dev-loop-scaling.yml`, `runtime-latency.yml`. These
   measure latency / cold-start / throughput, where result fidelity depends on a
@@ -179,6 +197,15 @@ Routed to self-hosted **only when trusted AND opted-in** (otherwise
   `plugin-freshness.yml`, `publish-gate.yml`, `quickstart-gate.yml`,
   `release-image-boot.yml`, `fuzz-nightly.yml`, `claude*.yml`) are out of scope
   for this change.
+
+**Future: PR-time offload.** Keeping PR fan-out on hosted runners is the current
+cost of the structural boundary, not a permanent limit. The PR-time heavy jobs
+can be safely offloaded later without ever exposing forks, via either a **merge
+queue** (`merge_group` trigger — base-repo-controlled, so it may route to
+self-hosted just like `push`) or a **maintainer-gated label + `workflow_dispatch`**
+that re-runs the heavy lanes on demand once a maintainer has vetted the PR. Both
+keep the "workflow definition comes from the base repo" invariant that control
+**a** relies on.
 
 ## 7. Fallback / flip back in one move
 

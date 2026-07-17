@@ -95,6 +95,12 @@ reg_token="$(curl -fsSL -X POST \
   -H "X-GitHub-Api-Version: 2022-11-28" \
   "https://api.github.com/repos/${GH_OWNER}/${GH_REPO}/actions/runners/registration-token" \
   | jq -r .token)"
+# An --ephemeral runner deregisters server-side after its single job, but a
+# prior run (or a crash) can leave this slot's LOCAL config in place, which
+# makes config.sh refuse with "already configured" (--replace only reconciles
+# the REMOTE same-named runner). Clear the local config so every restart
+# re-registers cleanly and the slot keeps taking jobs.
+sudo -u runner rm -f .runner .credentials .credentials_rsaparams 2>/dev/null || true
 sudo -u runner ./config.sh --unattended --replace \
   --url "https://github.com/${GH_OWNER}/${GH_REPO}" \
   --token "${reg_token}" \
