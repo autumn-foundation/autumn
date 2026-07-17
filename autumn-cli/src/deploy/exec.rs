@@ -24,7 +24,7 @@
 //! - **Execution:** [`run_ops`] / [`execute_first_deploy`] / [`execute_redeploy`]
 //!   iterate the ops and drive a [`DeployExecutor`]; the `execute_*` entrypoints
 //!   refuse to run if any preflight check failed (AC-6 fail-fast). [`DeployMode`]
-//!   / [`detect_deploy_mode`] pick first-vs-redeploy from a remote probe.
+//!   / [`probe_deploy_state`] pick first-vs-redeploy from a remote probe.
 //! - **Rollback (Slice 3, AC-4):** two forms are real. On a failed redeploy gate
 //!   (migrate or readiness — anything at or before the health-gated flip) traffic
 //!   never moved, so [`execute_redeploy`] AUTO-rolls-back: it drives
@@ -1148,7 +1148,7 @@ fn loopback_upstream(port: u16) -> String {
 
 /// Command that records which slot now serves live traffic AND the loopback
 /// `port` its unit was rendered with, as `{slot}\t{port}` (read by the next
-/// redeploy's [`detect_deploy_mode`], and copied into the previous-release marker
+/// redeploy's [`probe_deploy_state`], and copied into the previous-release marker
 /// by [`record_previous_release`] so a later rollback targets the real listener).
 ///
 /// The port is persisted because it is `slot_app_port(current server.port, slot)`
@@ -1344,34 +1344,227 @@ pub enum DeployMode {
     },
 }
 
-/// Probe the target over the executor to decide first-vs-redeploy: a redeploy is
-/// signalled by an existing `current` symlink, and the live slot is read from the
-/// marker (defaulting to blue if the marker is missing).
+/// Delimiter appended by the deploy-start probe between the first-vs-redeploy
+/// detection and the raw `kamal-proxy list` output, so both are captured in ONE
+/// remote round-trip and split apart by the Rust side. Deliberately distinctive
+/// so it can never collide with a marker/slot value.
+const PROXY_LIST_DELIM: &str = "---autumn-kamal-proxy-list---";
+
+/// The outcome of the deploy-start probe: the first-vs-redeploy [`DeployMode`]
+/// PLUS the raw `kamal-proxy list` output captured in the SAME remote round-trip,
+/// so a drifted live-slot marker can be reconciled against the live proxy without
+/// a second probe.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeployProbe {
+    /// First-vs-redeploy decision (parsed exactly as before from the marker).
+    pub mode: DeployMode,
+    /// Raw `kamal-proxy list` stdout (empty when the proxy could not be listed —
+    /// the reconcile then falls back to the marker, fail-safe).
+    pub proxy_list: String,
+}
+
+/// The full deploy-start probe: first-vs-redeploy mode AND the raw `kamal-proxy
+/// list` output, captured in a SINGLE remote round-trip.
+///
+/// The probe shell keeps the existing `current`/`live-slot` detection byte-for-
+/// byte (its meaning is unchanged), then appends a delimited section running
+/// `kamal-proxy list` best-effort (`|| true`, stderr suppressed) so a missing
+/// binary, dead control socket, or unlisted service can never fail the probe.
+/// The two sections are split on [`PROXY_LIST_DELIM`]; when the delimiter is
+/// absent (older recorded output / a scripted test) the whole stdout is treated
+/// as the mode section and the proxy list is empty — the reconcile then falls
+/// back to the marker.
 ///
 /// # Errors
 ///
 /// Returns the executor's error if the probe command cannot run.
-pub fn detect_deploy_mode(
+pub fn probe_deploy_state(
     cfg: &ResolvedDeployConfig,
     exec: &impl DeployExecutor,
-) -> Result<DeployMode, DeployExecError> {
+) -> Result<DeployProbe, DeployExecError> {
     let shell = format!(
         "if [ -L {current} ]; then printf 'redeploy:'; cat {marker} 2>/dev/null || printf '{blue}'; \
-         else printf 'first'; fi",
+         else printf 'first'; fi; \
+         printf '\\n{delim}\\n'; \
+         kamal-proxy list 2>/dev/null || true",
         current = shell_quote(&cfg.current_symlink()),
         marker = shell_quote(&live_slot_marker(cfg)),
         blue = SLOT_BLUE,
+        delim = PROXY_LIST_DELIM,
     );
     let out = exec.run(&RemoteCommand::new("detect-current", shell))?;
-    Ok(out
+    let (mode_part, proxy_list) = out
         .stdout
+        .split_once(PROXY_LIST_DELIM)
+        .unwrap_or((out.stdout.as_str(), ""));
+    let mode = mode_part
         .trim()
         .strip_prefix("redeploy:")
         .map_or(DeployMode::First, |marker| DeployMode::Redeploy {
             // The live-slot marker is `{slot}\t{port}` (older markers are slot-only);
             // the slot is the FIRST tab-separated field either way.
             live_slot: canonical_slot(marker.split('\t').next().unwrap_or(SLOT_BLUE)),
-        }))
+        });
+    Ok(DeployProbe {
+        mode,
+        proxy_list: proxy_list.to_owned(),
+    })
+}
+
+/// Map a live loopback port back to its slot using the public port: blue binds
+/// `public + 1`, green `public + 2` ([`slot_app_port`]). Any other offset (or a
+/// port below the public port) is not a recognized slot port → `None`.
+fn slot_for_port(public_port: u16, port: u16) -> Option<&'static str> {
+    match port.checked_sub(public_port)? {
+        1 => Some(SLOT_BLUE),
+        2 => Some(SLOT_GREEN),
+        _ => None,
+    }
+}
+
+/// Parse the loopback port out of a `127.0.0.1:<port>` target field (optionally
+/// scheme-prefixed, e.g. `http://127.0.0.1:3001`), else `None`.
+///
+/// Anchored to the EXACT loopback host [`loopback_upstream`] routes upstreams at,
+/// so a stray `host:port` in some other `kamal-proxy list` column (a public host,
+/// a timestamp) can never be mistaken for the app target. A non-empty alphanumeric
+/// run immediately after the digits (e.g. `127.0.0.1:3001x`) is rejected rather
+/// than partially parsed.
+fn loopback_port(field: &str) -> Option<u16> {
+    const HOST: &str = "127.0.0.1:";
+    let start = field.find(HOST)? + HOST.len();
+    let rest = &field[start..];
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    if digits.is_empty() {
+        return None;
+    }
+    if rest[digits.len()..]
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphanumeric())
+    {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+/// The slot `kamal-proxy list` UNAMBIGUOUSLY reports serving `service_name`, or
+/// `None` when the signal is absent or unclear (→ caller falls back to the marker).
+///
+/// A definite slot is returned ONLY when: exactly one output row carries
+/// `service_name` as a standalone whitespace field (the header row never does, and
+/// a service listed twice is ambiguous → `None`), that row carries exactly one
+/// distinct `127.0.0.1:<port>` target, and `port - public_port` maps to a slot
+/// (1=blue, 2=green). Every other shape — service absent, no/garbled target, two
+/// different target ports, a port mapping to neither slot — yields `None`.
+fn proxy_live_slot(
+    list_stdout: &str,
+    service_name: &str,
+    public_port: u16,
+) -> Option<&'static str> {
+    let service = service_name.trim();
+    if service.is_empty() {
+        return None;
+    }
+    let mut rows = list_stdout
+        .lines()
+        .filter(|line| line.split_whitespace().any(|field| field == service));
+    let row = rows.next()?;
+    // The service is listed more than once → ambiguous, fall back.
+    if rows.next().is_some() {
+        return None;
+    }
+    // Collect the distinct loopback target port(s) named in the row.
+    let mut port: Option<u16> = None;
+    for field in row.split_whitespace() {
+        if let Some(p) = loopback_port(field) {
+            match port {
+                None => port = Some(p),
+                Some(existing) if existing == p => {}
+                // Two DIFFERENT loopback ports in one row → ambiguous, fall back.
+                Some(_) => return None,
+            }
+        }
+    }
+    slot_for_port(public_port, port?)
+}
+
+/// The decision from reconciling the live-slot marker against the live proxy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlotReconcile {
+    /// Slot to plan the redeploy from — the proxy-authoritative slot on an
+    /// unambiguous disagreement, otherwise the marker's slot (unchanged behavior).
+    pub live_slot: &'static str,
+    /// Whether the on-host live-slot marker should be repaired to `live_slot`.
+    /// `true` ONLY on an unambiguous proxy-vs-marker disagreement.
+    pub repair: bool,
+    /// A loud drift-warning line, present ONLY on genuine disagreement so drift
+    /// stays observable; `None` on agreement or any fall-back.
+    pub warn: Option<String>,
+}
+
+/// Decide the live slot for redeploy planning by reconciling the live-slot marker
+/// (`marker_slot`) against `kamal-proxy list` output — a pure, fully testable
+/// function (issue #1938 drift elimination).
+///
+/// The residual drift #1938 addresses: an interrupted post-flip marker write can
+/// leave the `live-slot` marker naming the slot the proxy is NOT serving, so the
+/// next redeploy would pick the already-live slot and restart it, interrupting the
+/// live upstream. kamal-proxy knows the truth (its routed target), so:
+///
+/// - Proxy UNAMBIGUOUSLY names a slot that DIFFERS from the marker → treat the
+///   proxy as authoritative: plan from the proxy slot (so the candidate takes the
+///   genuinely-idle slot), flag `repair = true`, and return a loud `warn` naming
+///   the disagreement (drift stays observable, not silently papered over).
+/// - Proxy agrees, OR the proxy signal is absent/ambiguous/unparseable (list
+///   failed, service unlisted or listed twice, target unparseable, port maps to
+///   neither slot) → keep the marker's slot EXACTLY as today: no repair, no warn,
+///   no planner change. A reconcile never changes a deploy on an unclear signal.
+#[must_use]
+pub fn reconcile_live_slot(
+    marker_slot: &str,
+    proxy_list_stdout: &str,
+    service_name: &str,
+    public_port: u16,
+) -> SlotReconcile {
+    let marker_slot = canonical_slot(marker_slot);
+    match proxy_live_slot(proxy_list_stdout, service_name, public_port) {
+        Some(proxy_slot) if proxy_slot != marker_slot => SlotReconcile {
+            live_slot: proxy_slot,
+            repair: true,
+            warn: Some(format!(
+                "deploy state drift: live-slot marker says {marker_slot} but \
+                 kamal-proxy is serving {proxy_slot}; reconciling from proxy"
+            )),
+        },
+        _ => SlotReconcile {
+            live_slot: marker_slot,
+            repair: false,
+            warn: None,
+        },
+    }
+}
+
+/// Op that repairs a drifted live-slot marker to the proxy-authoritative slot.
+///
+/// Prepended to the redeploy sequence (before [`commit_markers_command`] reads
+/// the marker) so the marker on disk is corrected as an early, atomic deploy op.
+/// Reuses [`record_live_slot`]'s single marker-writer; the persisted port is
+/// `slot_app_port(public_port, slot)`, which — since the reconcile only fires when
+/// the proxy port already mapped to `slot` via `public_port` — equals the port the
+/// proxy reported.
+#[must_use]
+pub fn live_slot_marker_repair_op(
+    cfg: &ResolvedDeployConfig,
+    slot: &str,
+    public_port: u16,
+) -> DeployOp {
+    let slot = canonical_slot(slot);
+    DeployOp::Run(record_live_slot(
+        cfg,
+        slot,
+        slot_app_port(public_port, slot),
+    ))
 }
 
 /// Build the bounded remote readiness-poll shell line: loop on
@@ -1785,7 +1978,7 @@ mod tests {
         }
 
         /// Script the stdout returned for a given command label (used to drive
-        /// [`detect_deploy_mode`]'s first-vs-redeploy probe).
+        /// [`probe_deploy_state`]'s first-vs-redeploy probe).
         fn with_stdout(mut self, label: &'static str, stdout: impl Into<String>) -> Self {
             self.stdout_by_label.push((label, stdout.into()));
             self
@@ -3323,16 +3516,23 @@ mod tests {
     #[test]
     fn detect_deploy_mode_picks_first_vs_redeploy() {
         let cfg = resolved();
+        // The mode parse is unchanged — these assert the exact first-vs-redeploy
+        // behavior the marker-only path has always had (now read off the single
+        // probe's `.mode`, which also captures the proxy list for the reconcile).
+        //
         // No `current` symlink → first deploy.
         let first = RecordingExecutor::new().with_stdout("detect-current", "first");
-        assert_eq!(detect_deploy_mode(&cfg, &first).unwrap(), DeployMode::First);
+        assert_eq!(
+            probe_deploy_state(&cfg, &first).unwrap().mode,
+            DeployMode::First
+        );
         // `current` present + marker says green → redeploy onto blue candidate.
         // New-format live-slot marker is `{slot}\t{port}`: the slot is the FIRST
         // field, the trailing port must not leak into the parsed slot.
         let redeploy =
             RecordingExecutor::new().with_stdout("detect-current", "redeploy:green\t3002");
         assert_eq!(
-            detect_deploy_mode(&cfg, &redeploy).unwrap(),
+            probe_deploy_state(&cfg, &redeploy).unwrap().mode,
             DeployMode::Redeploy {
                 live_slot: SLOT_GREEN
             }
@@ -3340,7 +3540,7 @@ mod tests {
         // Backward-compat: an older slot-only marker (no port field) still parses.
         let legacy = RecordingExecutor::new().with_stdout("detect-current", "redeploy:green");
         assert_eq!(
-            detect_deploy_mode(&cfg, &legacy).unwrap(),
+            probe_deploy_state(&cfg, &legacy).unwrap().mode,
             DeployMode::Redeploy {
                 live_slot: SLOT_GREEN
             }
@@ -3348,11 +3548,181 @@ mod tests {
         // A missing/blank marker on a redeploy defaults the live slot to blue.
         let default_blue = RecordingExecutor::new().with_stdout("detect-current", "redeploy:");
         assert_eq!(
-            detect_deploy_mode(&cfg, &default_blue).unwrap(),
+            probe_deploy_state(&cfg, &default_blue).unwrap().mode,
             DeployMode::Redeploy {
                 live_slot: SLOT_BLUE
             }
         );
+    }
+
+    /// A sample `kamal-proxy list` table serving `service` at `127.0.0.1:{port}`.
+    /// Mirrors the shape kamal-proxy prints: a header row then one row per service.
+    fn proxy_list_serving(service: &str, port: u16) -> String {
+        format!(
+            "Service   Host          Target            State    TLS\n\
+             {service}     example.com   127.0.0.1:{port}   running  no\n"
+        )
+    }
+
+    #[test]
+    fn probe_deploy_state_captures_the_proxy_list_section() {
+        let cfg = resolved();
+        // Real probe stdout: the redeploy mode line, the delimiter, then the list.
+        let stdout = format!(
+            "redeploy:blue\t3001\n---autumn-kamal-proxy-list---\n{}",
+            proxy_list_serving("myapp", 3001)
+        );
+        let exec = RecordingExecutor::new().with_stdout("detect-current", stdout);
+        let probe = probe_deploy_state(&cfg, &exec).unwrap();
+        assert_eq!(
+            probe.mode,
+            DeployMode::Redeploy {
+                live_slot: SLOT_BLUE
+            }
+        );
+        assert!(
+            probe.proxy_list.contains("127.0.0.1:3001"),
+            "proxy list section captured: {}",
+            probe.proxy_list
+        );
+        // The probe shell folds `kamal-proxy list` into the SAME round-trip and
+        // never lets it fail the probe (best-effort `|| true`).
+        let shell = exec.shell_for("detect-current").expect("probe ran");
+        assert!(
+            shell.contains("kamal-proxy list") && shell.contains("|| true"),
+            "probe runs kamal-proxy list best-effort: {shell}"
+        );
+        // No delimiter in the output (older/scripted) → empty list, mode unchanged.
+        let legacy = RecordingExecutor::new().with_stdout("detect-current", "redeploy:green\t3002");
+        let probe = probe_deploy_state(&cfg, &legacy).unwrap();
+        assert_eq!(
+            probe.mode,
+            DeployMode::Redeploy {
+                live_slot: SLOT_GREEN
+            }
+        );
+        assert!(
+            probe.proxy_list.is_empty(),
+            "no delimiter → empty proxy list"
+        );
+    }
+
+    #[test]
+    fn reconcile_uses_proxy_slot_and_warns_on_disagreement() {
+        // Marker says green, but the proxy is serving blue (127.0.0.1:3001 with
+        // public 3000 → blue). The proxy is authoritative: plan from blue, repair
+        // the marker, and warn loudly.
+        let list = proxy_list_serving("myapp", 3001);
+        let decision = reconcile_live_slot(SLOT_GREEN, &list, "myapp", 3000);
+        assert_eq!(decision.live_slot, SLOT_BLUE);
+        assert!(decision.repair, "a genuine disagreement repairs the marker");
+        let warn = decision.warn.expect("disagreement warns");
+        assert!(
+            warn.contains("drift") && warn.contains(SLOT_GREEN) && warn.contains(SLOT_BLUE),
+            "warn names the disagreement: {warn}"
+        );
+        // Planning from the reconciled slot puts the candidate on the genuinely
+        // idle slot (green) — NOT the already-live blue slot.
+        let plan = SlotPlan::redeploy(3000, decision.live_slot);
+        assert_eq!(plan.live_slot, SLOT_BLUE);
+        assert_eq!(plan.candidate_slot, SLOT_GREEN);
+        assert_eq!(plan.candidate_port, 3002);
+
+        // The repair op reuses the atomic marker writer and records the blue slot.
+        let cfg = resolved();
+        let op = live_slot_marker_repair_op(&cfg, decision.live_slot, 3000);
+        match op {
+            DeployOp::Run(cmd) => {
+                assert_eq!(cmd.label, "record-live-slot");
+                assert!(
+                    cmd.shell.contains(SLOT_BLUE) && cmd.shell.contains("3001"),
+                    "repair op writes the proxy slot+port: {}",
+                    cmd.shell
+                );
+            }
+            other => panic!("repair should be a Run op, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reconcile_agreement_keeps_marker_without_warn_or_repair() {
+        // Proxy serves green (127.0.0.1:3002, public 3000) and the marker agrees.
+        let list = proxy_list_serving("myapp", 3002);
+        let decision = reconcile_live_slot(SLOT_GREEN, &list, "myapp", 3000);
+        assert_eq!(decision.live_slot, SLOT_GREEN);
+        assert!(!decision.repair, "agreement never repairs");
+        assert!(decision.warn.is_none(), "agreement never warns");
+    }
+
+    #[test]
+    fn reconcile_falls_back_to_marker_on_absent_or_unclear_proxy_signal() {
+        // Every one of these must behave EXACTLY as the marker-only path: keep the
+        // marker slot, no repair, no warn.
+        let cases: &[(&str, &str)] = &[
+            ("empty output", ""),
+            (
+                "service absent from the list",
+                "Service   Target\nother   127.0.0.1:3001\n",
+            ),
+            (
+                "target has no loopback port (unparseable)",
+                "Service   Target\nmyapp   example.com:3001\n",
+            ),
+            (
+                "loopback port maps to neither slot (public+3)",
+                "Service   Target\nmyapp   127.0.0.1:3003\n",
+            ),
+            (
+                "trailing junk after the port is not partially parsed",
+                "Service   Target\nmyapp   127.0.0.1:3001x\n",
+            ),
+        ];
+        for (name, list) in cases {
+            let decision = reconcile_live_slot(SLOT_BLUE, list, "myapp", 3000);
+            assert_eq!(
+                decision.live_slot, SLOT_BLUE,
+                "fall back keeps marker: {name}"
+            );
+            assert!(!decision.repair, "no repair on unclear signal: {name}");
+            assert!(decision.warn.is_none(), "no warn on unclear signal: {name}");
+        }
+    }
+
+    #[test]
+    fn reconcile_falls_back_when_the_service_is_ambiguous() {
+        // Service listed twice (with conflicting targets) → ambiguous → fall back
+        // to the marker, no repair, no warn.
+        let list = "Service   Target\n\
+                    myapp   127.0.0.1:3001\n\
+                    myapp   127.0.0.1:3002\n";
+        let decision = reconcile_live_slot(SLOT_GREEN, list, "myapp", 3000);
+        assert_eq!(decision.live_slot, SLOT_GREEN, "ambiguous → keep marker");
+        assert!(!decision.repair);
+        assert!(decision.warn.is_none());
+
+        // Two DIFFERENT loopback ports in a SINGLE row is also ambiguous.
+        let two_ports = "Service   Target             Prev\n\
+                         myapp   127.0.0.1:3001   127.0.0.1:3002\n";
+        let decision = reconcile_live_slot(SLOT_GREEN, two_ports, "myapp", 3000);
+        assert_eq!(decision.live_slot, SLOT_GREEN);
+        assert!(!decision.repair);
+        assert!(decision.warn.is_none());
+    }
+
+    #[test]
+    fn reconcile_scopes_strictly_to_the_target_service_name() {
+        // A different service serving blue must NOT reconcile our (green) marker —
+        // the row is matched by exact service field, and a substring service name
+        // ("myapp" vs "myapp-staging") is not the same field.
+        let list = "Service          Target\n\
+                    myapp-staging   127.0.0.1:3001\n";
+        let decision = reconcile_live_slot(SLOT_GREEN, list, "myapp", 3000);
+        assert_eq!(
+            decision.live_slot, SLOT_GREEN,
+            "substring service not matched"
+        );
+        assert!(!decision.repair);
+        assert!(decision.warn.is_none());
     }
 
     #[test]

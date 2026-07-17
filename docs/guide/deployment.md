@@ -380,7 +380,15 @@ or error messages.
   `current` symlink and the live/previous-release markers are written by
   individual SSH commands, so an interrupted deploy can leave state mid-flight;
   a subsequent `autumn deploy up` or `autumn deploy rollback` is the intended
-  recovery.
+  recovery. To keep the most damaging drift self-correcting, each `autumn deploy
+  up` **reconciles the `live-slot` marker against the live proxy at deploy-start**:
+  the same probe that decides first-vs-redeploy also reads `kamal-proxy list`, and
+  when the proxy is unambiguously serving a slot the marker disagrees with (a
+  stale marker from an interrupted previous run), the deploy treats the proxy as
+  authoritative — it plans the cutover onto the genuinely idle slot (so it never
+  restarts the live one), warns loudly about the disagreement, and repairs the
+  marker on disk. If the proxy signal is absent or unclear it falls back to the
+  marker exactly as before, so the reconcile never changes a healthy deploy.
 
 ### How the deploy path is validated in CI
 
