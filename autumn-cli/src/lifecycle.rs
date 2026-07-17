@@ -50,7 +50,7 @@
 //! emits a lifecycle diagram per lifecycle in Graphviz DOT or Mermaid
 //! `stateDiagram-v2` form, highlighting the initial and terminal states.
 
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
@@ -211,6 +211,22 @@ pub struct LifecycleDef {
     pub terminals: Vec<String>,
     /// Declared `(from, to)` edges.
     pub transitions: Vec<(String, String)>,
+}
+
+/// An effect declared on a `#[state_machine(lifecycle = Enum, effects(...))]`
+/// binding (issue #1973), correlated to a `#[lifecycle]` enum's diagram by enum
+/// name (the last segment of the `lifecycle = <Path>`). This rides in a separate
+/// structure consulted only by the diagram renderers, so the `check` command,
+/// the JSON artifact, and [`LifecycleDef::transitions`] stay byte-identical.
+#[derive(Debug)]
+struct EffectEdge {
+    from: String,
+    to: String,
+    /// The `on = "<handler>"` sync in-transaction effect, if declared.
+    on: Option<String>,
+    /// The `on_commit = <Job>` after-commit effect (its `syn::Path`'s last
+    /// segment rendered as the job name), if declared.
+    on_commit: Option<String>,
 }
 
 // ── Analysis ─────────────────────────────────────────────────────────────────
@@ -458,6 +474,10 @@ struct Scan {
     lifecycles: Vec<LifecycleDef>,
     errors: Vec<String>,
     files_scanned: usize,
+    /// Per-enum-name transition effects collected from
+    /// `#[state_machine(lifecycle = Enum, effects(...))]` bindings (issue #1973),
+    /// keyed by the bound enum name. Consulted only by the diagram renderers.
+    effect_edges: HashMap<String, Vec<EffectEdge>>,
 }
 
 /// Walk `root` recursively and collect every `#[lifecycle]` enum in its `.rs`
@@ -582,6 +602,9 @@ fn scan_items(
                     module_path.as_slice(),
                 );
             }
+            syn::Item::Struct(item_struct) => {
+                collect_state_machine_effects(item_struct, scan);
+            }
             syn::Item::Mod(item_mod) => {
                 if let Some((_, inner)) = &item_mod.content {
                     module_path.push(item_mod.ident.to_string());
@@ -656,6 +679,202 @@ fn collect_lifecycle_enum(
             ));
         }
     }
+}
+
+/// Collect per-edge transition effects from any `#[state_machine(...)]` field
+/// attribute on `item_struct` (issue #1973). Only the
+/// `#[state_machine(lifecycle = <Enum>, effects(...))]` form — the one whose
+/// edges correlate to an existing `#[lifecycle]` enum diagram — is collected;
+/// an inline `#[state_machine(transitions(...))]` machine has no `#[lifecycle]`
+/// enum (and thus no diagram surface today) and is skipped. Parsing is tolerant:
+/// a miss on one attribute is skipped and never aborts the scan.
+fn collect_state_machine_effects(item_struct: &syn::ItemStruct, scan: &mut Scan) {
+    for field in &item_struct.fields {
+        for attr in &field.attrs {
+            if !is_state_machine_attr(attr) {
+                continue;
+            }
+            // Tolerant: an unrelated `transitions(...)` form → `Ok(None)`, and a
+            // parse miss → `Err`; both simply skip this attribute.
+            if let Ok(Some((enum_name, edges))) = attr.parse_args_with(parse_state_machine_effects)
+                && !edges.is_empty()
+            {
+                scan.effect_edges
+                    .entry(enum_name)
+                    .or_default()
+                    .extend(edges);
+            }
+        }
+    }
+}
+
+/// Recognize a `#[state_machine(...)]` attribute under a bare `state_machine`
+/// path or any qualified path whose last segment is `state_machine`.
+fn is_state_machine_attr(attr: &syn::Attribute) -> bool {
+    let path = attr.path();
+    path.get_ident().map_or_else(
+        || {
+            path.segments
+                .last()
+                .is_some_and(|s| s.ident == "state_machine")
+        },
+        |ident| ident == "state_machine",
+    )
+}
+
+/// Parse the inside of a `#[state_machine(...)]` attribute, returning the bound
+/// enum name (last path segment of `lifecycle = <Path>`) and its declared
+/// `effects(...)` edges. Returns `Ok(None)` for the inline `transitions(...)`
+/// form (out of scope — no `#[lifecycle]` enum, no diagram surface). Mirrors the
+/// macro grammar in `autumn-macros/src/model.rs` (`parse_state_machine_source`).
+fn parse_state_machine_effects(
+    input: ParseStream,
+) -> syn::Result<Option<(String, Vec<EffectEdge>)>> {
+    let key: Ident = input.parse()?;
+    if key == "transitions" {
+        return Ok(None);
+    }
+    if key != "lifecycle" {
+        return Err(syn::Error::new_spanned(
+            &key,
+            "expected `transitions(...)` or `lifecycle = <Enum>`",
+        ));
+    }
+    input.parse::<Token![=]>()?;
+    let path: syn::Path = input.parse()?;
+    let enum_name = path.segments.last().map_or_else(
+        || {
+            Err(syn::Error::new_spanned(
+                &path,
+                "`lifecycle = <Enum>` requires a non-empty path",
+            ))
+        },
+        |seg| Ok(seg.ident.to_string()),
+    )?;
+    let edges = if input.peek(Token![,]) {
+        input.parse::<Token![,]>()?;
+        let effects_kw: Ident = input.parse()?;
+        if effects_kw != "effects" {
+            return Err(syn::Error::new_spanned(
+                &effects_kw,
+                "expected `effects(...)` after `lifecycle = <Enum>`",
+            ));
+        }
+        let content;
+        syn::parenthesized!(content in input);
+        parse_effect_edges(&content)?
+    } else {
+        Vec::new()
+    };
+    Ok(Some((enum_name, edges)))
+}
+
+/// Parse the inner edge list of an `effects(...)` group (surrounding parens
+/// already consumed), extracting each edge's `on = "..."` and/or
+/// `on_commit = <Job>` effect. Mirrors `parse_transition_list` in the macro
+/// (including the `, <ident> =` vs `, <State> ->` comma disambiguation); any
+/// `guard = "..."` present is parsed and ignored (effects-only).
+fn parse_effect_edges(content: ParseStream) -> syn::Result<Vec<EffectEdge>> {
+    let mut edges = Vec::new();
+    while !content.is_empty() {
+        let from: Ident = content.parse()?;
+        content.parse::<Token![->]>()?;
+        let to: Ident = content.parse()?;
+        let mut on: Option<String> = None;
+        let mut on_commit: Option<String> = None;
+        if content.peek(Token![:]) {
+            content.parse::<Token![:]>()?;
+            if content.peek(syn::LitStr) {
+                // Legacy bare-string guard shorthand `: "guard"` — ignored.
+                let _: syn::LitStr = content.parse()?;
+            } else {
+                loop {
+                    let mkey: Ident = content.parse()?;
+                    content.parse::<Token![=]>()?;
+                    if mkey == "guard" {
+                        let _: syn::LitStr = content.parse()?;
+                    } else if mkey == "on_commit" {
+                        let job: syn::Path = content.parse()?;
+                        on_commit = job.segments.last().map(|seg| seg.ident.to_string());
+                    } else if mkey == "on" {
+                        let lit: syn::LitStr = content.parse()?;
+                        on = Some(lit.value());
+                    } else {
+                        return Err(syn::Error::new_spanned(
+                            &mkey,
+                            "expected `guard = \"...\"`, `on = \"...\"`, or `on_commit = <Job>`",
+                        ));
+                    }
+                    // Continue the meta list only on a following `, <ident> =`
+                    // (another key for this edge); a `, <State> ->` (or the end)
+                    // begins the next edge and its comma is left for the
+                    // separator below.
+                    if !content.peek(Token![,]) {
+                        break;
+                    }
+                    let ahead = content.fork();
+                    ahead.parse::<Token![,]>()?;
+                    if ahead.peek(Ident) && ahead.peek2(Token![=]) {
+                        content.parse::<Token![,]>()?;
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
+        edges.push(EffectEdge {
+            from: from.to_string(),
+            to: to.to_string(),
+            on,
+            on_commit,
+        });
+        if content.peek(Token![,]) {
+            content.parse::<Token![,]>()?;
+        }
+    }
+    Ok(edges)
+}
+
+/// Build the diagram edge-label lookup for one lifecycle from its collected
+/// effect edges: `(from, to) -> "on: <h>[, on_commit: <J>]"`. Multiple bindings
+/// touching the same edge are merged — the `on` / `on_commit` values are unioned
+/// and rendered in a stable (sorted) order so the output is deterministic. Edges
+/// with no effect are absent from the map (and so render without a label).
+fn build_edge_labels(effects: Option<&Vec<EffectEdge>>) -> BTreeMap<(String, String), String> {
+    let mut acc: BTreeMap<(String, String), (BTreeSet<String>, BTreeSet<String>)> = BTreeMap::new();
+    if let Some(effects) = effects {
+        for edge in effects {
+            let entry = acc.entry((edge.from.clone(), edge.to.clone())).or_default();
+            if let Some(on) = &edge.on {
+                entry.0.insert(on.clone());
+            }
+            if let Some(on_commit) = &edge.on_commit {
+                entry.1.insert(on_commit.clone());
+            }
+        }
+    }
+    acc.into_iter()
+        .filter_map(|(edge, (ons, commits))| {
+            let mut parts = Vec::new();
+            parts.extend(ons.iter().map(|on| format!("on: {on}")));
+            parts.extend(
+                commits
+                    .iter()
+                    .map(|on_commit| format!("on_commit: {on_commit}")),
+            );
+            if parts.is_empty() {
+                None
+            } else {
+                Some((edge, parts.join(", ")))
+            }
+        })
+        .collect()
+}
+
+/// Escape a DOT label's `"`/`\` so an effect handler/job name can never break
+/// out of the quoted `label="..."` attribute (defensive — names are idents).
+fn dot_label_escape(label: &str) -> String {
+    label.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 /// Build a [`Report`] from a scan, analyzing each discovered lifecycle.
@@ -777,8 +996,8 @@ pub fn run_diagram(root: &Path, opts: &DiagramOptions) -> i32 {
     }
 
     let output = match opts.format {
-        DiagramFormat::Dot => render_dot_document(&scan.lifecycles),
-        DiagramFormat::Mermaid => render_mermaid_document(&scan.lifecycles),
+        DiagramFormat::Dot => render_dot_document(&scan.lifecycles, &scan.effect_edges),
+        DiagramFormat::Mermaid => render_mermaid_document(&scan.lifecycles, &scan.effect_edges),
     };
 
     match &opts.out {
@@ -809,13 +1028,17 @@ pub fn run_diagram(root: &Path, opts: &DiagramOptions) -> i32 {
 /// a state name shared across lifecycles stays a distinct node, each carrying a
 /// label of its bare state name.
 #[must_use]
-fn render_mermaid_document(lifecycles: &[LifecycleDef]) -> String {
+fn render_mermaid_document(
+    lifecycles: &[LifecycleDef],
+    effects: &HashMap<String, Vec<EffectEdge>>,
+) -> String {
     if let [single] = lifecycles {
-        return render_mermaid(single);
+        return render_mermaid(single, &build_edge_labels(effects.get(&single.name)));
     }
     let mut out = String::new();
     out.push_str("stateDiagram-v2\n");
     for wf in lifecycles {
+        let labels = build_edge_labels(effects.get(&wf.name));
         let ns = sanitize_ident(&wf.id);
         let sid = |state: &str| format!("{ns}_{}", sanitize_ident(state));
         let _ = writeln!(out, "    state \"{}\" as {ns} {{", wf.name);
@@ -824,7 +1047,11 @@ fn render_mermaid_document(lifecycles: &[LifecycleDef]) -> String {
         }
         let _ = writeln!(out, "        [*] --> {}", sid(&wf.initial));
         for (from, to) in &wf.transitions {
-            let _ = writeln!(out, "        {} --> {}", sid(from), sid(to));
+            if let Some(label) = labels.get(&(from.clone(), to.clone())) {
+                let _ = writeln!(out, "        {} --> {} : {label}", sid(from), sid(to));
+            } else {
+                let _ = writeln!(out, "        {} --> {}", sid(from), sid(to));
+            }
         }
         for t in &wf.terminals {
             let _ = writeln!(out, "        {} --> [*]", sid(t));
@@ -838,13 +1065,17 @@ fn render_mermaid_document(lifecycles: &[LifecycleDef]) -> String {
 /// entered from `[*]`; each terminal state exits to `[*]`, which is how Mermaid
 /// renders start/end markers.
 #[must_use]
-pub fn render_mermaid(wf: &LifecycleDef) -> String {
+pub fn render_mermaid(wf: &LifecycleDef, labels: &BTreeMap<(String, String), String>) -> String {
     let mut out = String::new();
     let _ = writeln!(out, "%% lifecycle: {}", wf.name);
     out.push_str("stateDiagram-v2\n");
     let _ = writeln!(out, "    [*] --> {}", wf.initial);
     for (from, to) in &wf.transitions {
-        let _ = writeln!(out, "    {from} --> {to}");
+        if let Some(label) = labels.get(&(from.clone(), to.clone())) {
+            let _ = writeln!(out, "    {from} --> {to} : {label}");
+        } else {
+            let _ = writeln!(out, "    {from} --> {to}");
+        }
     }
     for t in &wf.terminals {
         let _ = writeln!(out, "    {t} --> [*]");
@@ -859,16 +1090,19 @@ pub fn render_mermaid(wf: &LifecycleDef) -> String {
 /// single valid DOT document (consumers expect one graph per document), so the
 /// multi-lifecycle case must be one graph with clusters.
 #[must_use]
-fn render_dot_document(lifecycles: &[LifecycleDef]) -> String {
+fn render_dot_document(
+    lifecycles: &[LifecycleDef],
+    effects: &HashMap<String, Vec<EffectEdge>>,
+) -> String {
     if let [single] = lifecycles {
-        return render_dot(single);
+        return render_dot(single, &build_edge_labels(effects.get(&single.name)));
     }
     let mut out = String::new();
     out.push_str("digraph {\n");
     out.push_str("    rankdir=LR;\n");
     out.push_str("    node [shape=box, style=rounded];\n");
     for wf in lifecycles {
-        write_dot_cluster(&mut out, wf);
+        write_dot_cluster(&mut out, wf, &build_edge_labels(effects.get(&wf.name)));
     }
     out.push_str("}\n");
     out
@@ -878,7 +1112,11 @@ fn render_dot_document(lifecycles: &[LifecycleDef]) -> String {
 /// namespaced by the lifecycle name (DOT node ids live in the digraph's single
 /// global namespace, so an un-namespaced state shared across lifecycles would
 /// collapse into one node), and each carries a `label` of its bare state name.
-fn write_dot_cluster(out: &mut String, wf: &LifecycleDef) {
+fn write_dot_cluster(
+    out: &mut String,
+    wf: &LifecycleDef,
+    labels: &BTreeMap<(String, String), String>,
+) {
     let ns = sanitize_ident(&wf.id);
     let nid = |state: &str| dot_id(&format!("{ns}.{state}"));
     let start = dot_id(&format!("{ns}.__start"));
@@ -897,7 +1135,17 @@ fn write_dot_cluster(out: &mut String, wf: &LifecycleDef) {
     }
     let _ = writeln!(out, "        {start} -> {};", nid(&wf.initial));
     for (from, to) in &wf.transitions {
-        let _ = writeln!(out, "        {} -> {};", nid(from), nid(to));
+        if let Some(label) = labels.get(&(from.clone(), to.clone())) {
+            let _ = writeln!(
+                out,
+                "        {} -> {} [label=\"{}\"];",
+                nid(from),
+                nid(to),
+                dot_label_escape(label)
+            );
+        } else {
+            let _ = writeln!(out, "        {} -> {};", nid(from), nid(to));
+        }
     }
     out.push_str("    }\n");
 }
@@ -921,7 +1169,7 @@ fn sanitize_ident(name: &str) -> String {
 /// Render a lifecycle as a Graphviz DOT `digraph`. The initial state is filled
 /// and reached from a start point; terminal states are drawn as double circles.
 #[must_use]
-pub fn render_dot(wf: &LifecycleDef) -> String {
+pub fn render_dot(wf: &LifecycleDef, labels: &BTreeMap<(String, String), String>) -> String {
     let mut out = String::new();
     // The graph name is the enum ident — already a valid bare DOT id.
     let _ = writeln!(out, "digraph {} {{", wf.name);
@@ -939,7 +1187,17 @@ pub fn render_dot(wf: &LifecycleDef) -> String {
     }
     let _ = writeln!(out, "    __start -> {};", dot_id(&wf.initial));
     for (from, to) in &wf.transitions {
-        let _ = writeln!(out, "    {} -> {};", dot_id(from), dot_id(to));
+        if let Some(label) = labels.get(&(from.clone(), to.clone())) {
+            let _ = writeln!(
+                out,
+                "    {} -> {} [label=\"{}\"];",
+                dot_id(from),
+                dot_id(to),
+                dot_label_escape(label)
+            );
+        } else {
+            let _ = writeln!(out, "    {} -> {};", dot_id(from), dot_id(to));
+        }
     }
     out.push_str("}\n");
     out

@@ -720,3 +720,137 @@ mod invoices {
         "state nodes must be namespaced by module-qualified id\n{stdout}"
     );
 }
+
+/// A `#[lifecycle]` enum whose diagram edges carry transition effects declared
+/// on a `#[state_machine(lifecycle = OrderState, effects(...))]` binding on a
+/// separate `#[model]` struct field (issue #1973). The fixture only needs to
+/// parse — it is scanned, not compiled.
+const EFFECTS_FIXTURE: &str = r#"
+use autumn_web::lifecycle;
+
+#[lifecycle(
+    initial = Draft,
+    terminal(Archived),
+    transitions(
+        Draft -> Published,
+        Published -> Archived,
+    )
+)]
+pub enum OrderState {
+    Draft,
+    Published,
+    Archived,
+}
+
+#[model]
+pub struct Article {
+    #[state_machine(
+        lifecycle = OrderState,
+        effects(
+            Draft -> Published: on_commit = AnnouncePublishJob,
+            Published -> Archived: on = "write_archive_audit",
+        )
+    )]
+    pub status: String,
+}
+"#;
+
+#[test]
+fn diagram_mermaid_shows_effect_labels() {
+    // The Mermaid diagram annotates each edge that has a correlated
+    // `#[state_machine(... effects(...))]` binding with its effect label
+    // (`on: ...` / `on_commit: ...`), leaving effect-free edges unchanged.
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "src/article.rs", EFFECTS_FIXTURE);
+    let output = run_lifecycle(dir.path(), &["diagram", "--format", "mermaid"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "diagram render should exit 0\nstdout:\n{stdout}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains("Draft --> Published"),
+        "the effect edge should still render its transition\n{stdout}"
+    );
+    assert!(
+        stdout.contains("on_commit: AnnouncePublishJob"),
+        "the on_commit effect should be annotated on its edge\n{stdout}"
+    );
+    assert!(
+        stdout.contains("on: write_archive_audit"),
+        "the on effect should be annotated on its edge\n{stdout}"
+    );
+}
+
+#[test]
+fn diagram_dot_shows_effect_labels() {
+    // The DOT diagram annotates effect edges with a `[label="..."]` carrying the
+    // same effect text.
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "src/article.rs", EFFECTS_FIXTURE);
+    let output = run_lifecycle(dir.path(), &["diagram", "--format", "dot"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "dot render should exit 0\nstdout:\n{stdout}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains("[label=\"on_commit: AnnouncePublishJob\"]"),
+        "the on_commit effect should be a DOT edge label\n{stdout}"
+    );
+    assert!(
+        stdout.contains("[label=\"on: write_archive_audit\"]"),
+        "the on effect should be a DOT edge label\n{stdout}"
+    );
+}
+
+/// A plain `#[lifecycle]` enum with no `#[state_machine]` effects binding — its
+/// diagram edges must be byte-identical to the pre-#1973 output (no labels).
+const PLAIN_LIFECYCLE: &str = r"
+#[lifecycle(
+    initial = Draft,
+    terminal(Archived),
+    transitions(
+        Draft -> Published,
+        Published -> Archived,
+    )
+)]
+pub enum OrderState {
+    Draft,
+    Published,
+    Archived,
+}
+";
+
+#[test]
+fn diagram_without_effects_has_no_edge_labels() {
+    // With no effects binding, an edge renders with no ` : ` label (Mermaid) and
+    // no `[label=` (DOT) — the byte-identical guarantee.
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "src/order.rs", PLAIN_LIFECYCLE);
+
+    let mermaid = run_lifecycle(dir.path(), &["diagram", "--format", "mermaid"]);
+    let mstdout = String::from_utf8_lossy(&mermaid.stdout);
+    assert!(
+        mermaid.status.success(),
+        "mermaid render should exit 0\n{mstdout}"
+    );
+    assert!(
+        mstdout.contains("Draft --> Published"),
+        "the transition edge should render\n{mstdout}"
+    );
+    assert!(
+        !mstdout.contains(" : "),
+        "an effect-free lifecycle must render no edge labels\n{mstdout}"
+    );
+
+    let dot = run_lifecycle(dir.path(), &["diagram", "--format", "dot"]);
+    let dstdout = String::from_utf8_lossy(&dot.stdout);
+    assert!(dot.status.success(), "dot render should exit 0\n{dstdout}");
+    assert!(
+        !dstdout.contains("[label="),
+        "an effect-free single-lifecycle DOT diagram must render no edge labels\n{dstdout}"
+    );
+}
