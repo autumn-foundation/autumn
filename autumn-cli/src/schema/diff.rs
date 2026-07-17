@@ -370,6 +370,27 @@ pub enum SchemaChange {
         /// The pre-existing column that gained an explicit foreign key.
         column: String,
     },
+
+    /// A brand-new managed table whose model has one or more fields the parser
+    /// could not represent (a generated enum, a bare `pub user: User` association)
+    /// and therefore recorded a [`SchemaDiagnostic`](crate::schema::parse::SchemaDiagnostic)
+    /// for instead of a column. A non-emittable marker: [`guard_plan`] refuses any
+    /// plan containing it (with **no override**).
+    ///
+    /// It exists because emitting `CREATE TABLE` from the partial parser output
+    /// would produce DDL that OMITS the skipped column(s) — the generated model
+    /// still queries them, so the app would hit "column does not exist" at runtime
+    /// the moment it touches the new table. A table missing a column the app
+    /// queries is as broken as unappliable SQL, so the conservative stance refuses
+    /// and directs the user to a manual migration rather than emit incomplete DDL.
+    /// This fires ONLY for a table being CREATED; an existing table with a skipped
+    /// column is handled by the `DropColumn`/`DropIndex` suppressions instead.
+    CreateTableBlockedBySkippedField {
+        /// The table that cannot be safely created.
+        table: String,
+        /// The parser-skipped field name(s) that would be missing from the DDL.
+        fields: Vec<String>,
+    },
 }
 
 /// Diff policy knobs.
@@ -578,6 +599,30 @@ pub enum DiffError {
         /// The offending generated identifier.
         name: String,
     },
+
+    /// A brand-new managed table whose model has field(s) the schema parser could
+    /// not represent (a generated enum, a bare association like `pub user: User`),
+    /// so the parser recorded a diagnostic and skipped the column(s) (unsupported
+    /// this slice, **no override** — the DDL would be incomplete, not merely lossy).
+    /// Emitting `CREATE TABLE` from that partial output would omit the skipped
+    /// column(s), but the generated model still queries them, so the app would fail
+    /// with "column does not exist" at runtime. A table missing a queried column is
+    /// as broken as unappliable SQL, so the engine refuses rather than emit
+    /// incomplete DDL. This applies only to a table being CREATED — an existing
+    /// table with a skipped column keeps that column via the drop suppressions.
+    #[error(
+        "cannot generate `CREATE TABLE {table}`: the model has field(s) the schema parser \
+         could not represent ({}), so the generated DDL would omit those column(s) and the \
+         application would query a missing column at runtime. Write this table's migration \
+         manually.",
+        .fields.join(", ")
+    )]
+    CreateTableWithSkippedField {
+        /// The table that cannot be safely created.
+        table: String,
+        /// The parser-skipped field name(s) that would be missing from the DDL.
+        fields: Vec<String>,
+    },
 }
 
 /// A single destructive operation, for [`DiffError::Destructive`] inspection.
@@ -668,10 +713,22 @@ pub fn diff_schema(baseline: &[Table], desired: &ParsedSchema, opts: DiffOptions
                     diff_table(base, want, desired, &mut changes);
                 }
             }
-            // Desired only — create it if Autumn owns it.
+            // Desired only — create it if Autumn owns it. But if the parser
+            // skipped any of the model's fields (a diagnostic for this table), the
+            // parsed `Table` is incomplete: emitting `CREATE TABLE` from it would
+            // omit those column(s) while the generated model still queries them, so
+            // refuse via a non-emittable marker rather than emit broken DDL.
             (None, Some(want)) => {
                 if want.managed {
-                    changes.push(SchemaChange::CreateTable((*want).clone()));
+                    let skipped = skipped_columns(&want.name, desired);
+                    if skipped.is_empty() {
+                        changes.push(SchemaChange::CreateTable((*want).clone()));
+                    } else {
+                        changes.push(SchemaChange::CreateTableBlockedBySkippedField {
+                            table: want.name.clone(),
+                            fields: skipped.into_iter().collect(),
+                        });
+                    }
                 }
             }
             // Baseline only — drop it only if Autumn ever owned it.
@@ -941,7 +998,7 @@ fn diff_table(base: &Table, want: &Table, desired: &ParsedSchema, changes: &mut 
         }
     }
 
-    diff_indexes(&want.name, base, want, changes);
+    diff_indexes(&want.name, base, want, &skipped, changes);
     diff_checks(&want.name, base, want, changes);
 }
 
@@ -1019,7 +1076,23 @@ fn diff_column(table: &str, base: &Column, want: &Column, changes: &mut Vec<Sche
 
 /// Diff a table's indexes by name. A same-named index whose shape changed is a
 /// drop-then-add (neither is destructive — an index drops no rows).
-fn diff_indexes(table: &str, base: &Table, want: &Table, changes: &mut Vec<SchemaChange>) {
+///
+/// A `DropIndex` is **suppressed** when the baseline index references ANY column in
+/// `skipped` (a parser-skipped column, per [`skipped_columns`]): the parser never
+/// saw the column, so it never saw the column's indexes either — their absence from
+/// the desired side is a parser gap, not proof the index was removed. Dropping such
+/// an index would silently lose a constraint (e.g. a UNIQUE index → duplicate data
+/// becomes possible) the same way an unsuppressed `DropColumn` would lose the
+/// column. This mirrors the `DropColumn` suppression in [`diff_table`]. A composite
+/// index touching even one skipped column is suppressed whole, since the parser
+/// cannot authoritatively say it was removed.
+fn diff_indexes(
+    table: &str,
+    base: &Table,
+    want: &Table,
+    skipped: &BTreeSet<String>,
+    changes: &mut Vec<SchemaChange>,
+) {
     let base_by_name: BTreeMap<&str, &Index> =
         base.indexes.iter().map(|i| (i.name.as_str(), i)).collect();
     let want_by_name: BTreeMap<&str, &Index> =
@@ -1046,7 +1119,9 @@ fn diff_indexes(table: &str, base: &Table, want: &Table, changes: &mut Vec<Schem
     }
 
     for base_idx in &base.indexes {
-        if !want_by_name.contains_key(base_idx.name.as_str()) {
+        if !want_by_name.contains_key(base_idx.name.as_str())
+            && !base_idx.columns.iter().any(|c| skipped.contains(c))
+        {
             changes.push(SchemaChange::DropIndex {
                 table: table.to_owned(),
                 index: base_idx.clone(),
@@ -1144,6 +1219,22 @@ pub fn guard_plan(plan: &MigrationPlan, opts: DiffOptions) -> Result<(), DiffErr
         _ => None,
     }) {
         return Err(DiffError::AddForeignKeyToPreexistingColumn { table, column });
+    }
+
+    // 2c. Create of a table whose model has parser-skipped field(s) — no override.
+    //     The parsed table omits the skipped column(s), so emitting `CREATE TABLE`
+    //     from it would produce DDL missing a column the generated model queries →
+    //     runtime "column does not exist". Incomplete DDL is as broken as
+    //     unappliable SQL, so it refuses and directs to a manual migration. Only a
+    //     table being CREATED carries this marker (an existing table's skipped
+    //     column is retained by the drop suppressions, not this refusal).
+    if let Some((table, fields)) = plan.changes.iter().find_map(|c| match c {
+        SchemaChange::CreateTableBlockedBySkippedField { table, fields } => {
+            Some((table.clone(), fields.clone()))
+        }
+        _ => None,
+    }) {
+        return Err(DiffError::CreateTableWithSkippedField { table, fields });
     }
 
     // 3. Drop of a table a retained table still references — no override (even
@@ -1733,7 +1824,8 @@ const fn up_bucket(change: &SchemaChange) -> u8 {
         | SchemaChange::ForeignKeyChange { .. }
         | SchemaChange::DropTableBlockedByInboundFk { .. }
         | SchemaChange::AlterColumnTypeBlockedByFk { .. }
-        | SchemaChange::AddForeignKeyToExistingColumn { .. } => 9,
+        | SchemaChange::AddForeignKeyToExistingColumn { .. }
+        | SchemaChange::CreateTableBlockedBySkippedField { .. } => 9,
     }
 }
 
@@ -1817,7 +1909,8 @@ fn emit_change_up(change: &SchemaChange, backend: Backend) -> Result<String, Emi
         | SchemaChange::ForeignKeyChange { .. }
         | SchemaChange::DropTableBlockedByInboundFk { .. }
         | SchemaChange::AlterColumnTypeBlockedByFk { .. }
-        | SchemaChange::AddForeignKeyToExistingColumn { .. } => Ok(String::new()),
+        | SchemaChange::AddForeignKeyToExistingColumn { .. }
+        | SchemaChange::CreateTableBlockedBySkippedField { .. } => Ok(String::new()),
     }
 }
 
@@ -1900,7 +1993,8 @@ fn emit_change_down(change: &SchemaChange, backend: Backend) -> Result<String, E
         | SchemaChange::ForeignKeyChange { .. }
         | SchemaChange::DropTableBlockedByInboundFk { .. }
         | SchemaChange::AlterColumnTypeBlockedByFk { .. }
-        | SchemaChange::AddForeignKeyToExistingColumn { .. } => Ok(String::new()),
+        | SchemaChange::AddForeignKeyToExistingColumn { .. }
+        | SchemaChange::CreateTableBlockedBySkippedField { .. } => Ok(String::new()),
     }
 }
 
@@ -2159,6 +2253,12 @@ fn describe_change(change: &SchemaChange) -> String {
         }
         SchemaChange::AddForeignKeyToExistingColumn { table, column } => {
             format!("! ADD FOREIGN KEY on pre-existing column {table}.{column} (refused)")
+        }
+        SchemaChange::CreateTableBlockedBySkippedField { table, fields } => {
+            format!(
+                "! CREATE TABLE {table} blocked by parser-skipped field(s) [{}] (refused)",
+                fields.join(", ")
+            )
         }
     }
 }
@@ -2577,6 +2677,162 @@ mod tests {
         let plan = diff_schema(&base, &want, DEFAULT_OPTS);
         assert_eq!(plan.changes.len(), 1);
         assert!(matches!(plan.changes[0], SchemaChange::DropColumn { .. }));
+    }
+
+    #[test]
+    fn index_on_diagnostic_skipped_column_is_not_dropped() {
+        // baseline: an enum `status` column carrying a UNIQUE index. The parser
+        // skips the enum field (diagnostic) so desired omits BOTH the column and
+        // its index. The `DropColumn` is already suppressed; the `DropIndex` must
+        // be too — otherwise the retained column silently loses its UNIQUE
+        // constraint and duplicate data becomes possible.
+        let mut base_table = posts_with(vec![col(
+            "status",
+            ColumnType::Enum {
+                variants: vec!["draft".into(), "live".into()],
+            },
+        )]);
+        base_table.indexes.push(Index {
+            name: "idx_posts_status".to_owned(),
+            columns: vec!["status".to_owned()],
+            unique: true,
+        });
+        let want = parsed(
+            vec![posts_with(vec![])],
+            vec![diag("Post", "posts", "status")],
+        );
+        let plan = diff_schema(&[base_table], &want, DEFAULT_OPTS);
+        assert!(
+            !plan
+                .changes
+                .iter()
+                .any(|c| matches!(c, SchemaChange::DropIndex { .. })),
+            "index on a parser-skipped column must not be dropped: {plan:?}"
+        );
+        assert!(
+            plan.is_empty(),
+            "column and its index both suppressed → empty plan: {plan:?}"
+        );
+    }
+
+    #[test]
+    fn index_on_normal_column_still_dropped() {
+        // Control: an ordinary removed index (no diagnostic) still drops — the
+        // suppression is exact, not blanket.
+        let idx = Index {
+            name: "idx_posts_body".to_owned(),
+            columns: vec!["body".to_owned()],
+            unique: false,
+        };
+        let mut base_table = posts_with(vec![col("body", ColumnType::Text)]);
+        base_table.indexes.push(idx.clone());
+        let want = parsed(
+            vec![posts_with(vec![col("body", ColumnType::Text)])],
+            vec![],
+        );
+        let plan = diff_schema(&[base_table], &want, DEFAULT_OPTS);
+        assert_eq!(
+            plan.changes,
+            vec![SchemaChange::DropIndex {
+                table: "posts".to_owned(),
+                index: idx,
+            }]
+        );
+    }
+
+    #[test]
+    fn composite_index_touching_skipped_column_is_not_dropped() {
+        // A composite UNIQUE index over (author_id, status) where `status` is
+        // parser-skipped. If ANY column is skipped the whole drop is suppressed —
+        // the parser cannot authoritatively say the index was removed, and
+        // dropping it would silently lose the multi-column uniqueness.
+        let mut base_table = posts_with(vec![
+            col("author_id", ColumnType::Int64),
+            col(
+                "status",
+                ColumnType::Enum {
+                    variants: vec!["draft".into(), "live".into()],
+                },
+            ),
+        ]);
+        base_table.indexes.push(Index {
+            name: "idx_posts_author_status".to_owned(),
+            columns: vec!["author_id".to_owned(), "status".to_owned()],
+            unique: true,
+        });
+        // desired retains `author_id` but the enum `status` is skipped (diagnostic),
+        // so the parser never sees the composite index either.
+        let want = parsed(
+            vec![posts_with(vec![col("author_id", ColumnType::Int64)])],
+            vec![diag("Post", "posts", "status")],
+        );
+        let plan = diff_schema(&[base_table], &want, DEFAULT_OPTS);
+        assert!(
+            !plan
+                .changes
+                .iter()
+                .any(|c| matches!(c, SchemaChange::DropIndex { .. })),
+            "composite index touching a skipped column must not be dropped: {plan:?}"
+        );
+    }
+
+    #[test]
+    fn create_table_with_diagnostic_skipped_field_is_refused() {
+        // A brand-new managed table whose model has a skipped enum field parses to
+        // a `Table` OMITTING that column (only a diagnostic is recorded). Emitting
+        // `CREATE TABLE` from that partial output would create a table missing a
+        // column the generated model queries → runtime "column does not exist". The
+        // diff must surface the refused marker, and `guard_plan` must reject it
+        // (with no override) naming the missing field.
+        let mut new_table = Table::new("events", Backend::Postgres);
+        new_table.managed = true;
+        let mut id = col("id", ColumnType::Int64);
+        id.primary_key = true;
+        new_table.columns.push(id);
+        new_table.primary_key.push("id".to_owned());
+        // The `kind` enum field is skipped by the parser → not a column, only a diag.
+        let want = parsed(vec![new_table], vec![diag("Event", "events", "kind")]);
+        let plan = diff_schema(&[], &want, DEFAULT_OPTS);
+        assert_eq!(
+            plan.changes,
+            vec![SchemaChange::CreateTableBlockedBySkippedField {
+                table: "events".to_owned(),
+                fields: vec!["kind".to_owned()],
+            }],
+            "a diagnostic-skipped new table must not emit CREATE TABLE: {plan:?}"
+        );
+        match guard_plan(&plan, DEFAULT_OPTS) {
+            Err(DiffError::CreateTableWithSkippedField { table, fields }) => {
+                assert_eq!(table, "events");
+                assert_eq!(fields, vec!["kind".to_owned()]);
+            }
+            other => panic!("expected CreateTableWithSkippedField refusal, got {other:?}"),
+        }
+        // No override — even --allow-destructive refuses (incomplete DDL, not lossy).
+        assert!(matches!(
+            guard_plan(&plan, ALLOW),
+            Err(DiffError::CreateTableWithSkippedField { .. })
+        ));
+        // The message names both the table and the missing field.
+        let msg = guard_plan(&plan, DEFAULT_OPTS).unwrap_err().to_string();
+        assert!(
+            msg.contains("events") && msg.contains("kind"),
+            "refusal message names table + field: {msg}"
+        );
+    }
+
+    #[test]
+    fn create_table_without_diagnostics_is_allowed() {
+        // Control: a clean new managed table (no skipped fields) still emits
+        // CREATE TABLE and passes the guard.
+        let new_table = posts_ref_table("events", col("title", ColumnType::Text));
+        let want = parsed(vec![new_table.clone()], vec![]);
+        let plan = diff_schema(&[], &want, DEFAULT_OPTS);
+        assert_eq!(plan.changes, vec![SchemaChange::CreateTable(new_table)]);
+        assert!(
+            guard_plan(&plan, DEFAULT_OPTS).is_ok(),
+            "a clean new table is emittable"
+        );
     }
 
     #[test]
