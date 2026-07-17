@@ -11,6 +11,10 @@
 //! Docker):
 //!
 //! * substring matches are found case-insensitively and non-matches excluded;
+//! * case-insensitivity is **ASCII-only** (the query is folded with
+//!   `to_ascii_lowercase()` to match `SQLite`'s ASCII-only `lower()`): ASCII
+//!   terms fold both ways, but a non-ASCII letter matches only with matching
+//!   case — full-Unicode/ICU folding is deferred to #1910;
 //! * `LIKE` metacharacters (`%`, `_`) in the query match **literally** and can
 //!   never become a match-everything wildcard;
 //! * `search_page` returns the right page + total;
@@ -229,6 +233,60 @@ async fn search_matches_substrings_case_insensitively_on_sqlite() {
     // Blank query short-circuits to empty (shared guard, both backends).
     let blank = repo.search("   ").await.expect("blank search");
     assert!(blank.is_empty(), "blank query returns nothing: {blank:?}");
+}
+
+/// The `SQLite` search case-insensitivity is **ASCII-only** (issue #1996): the
+/// query side is folded with `to_ascii_lowercase()` to match `SQLite`'s built-in
+/// `lower()`, which folds only ASCII A–Z. So an ASCII term matches
+/// case-insensitively, and even an accented term's ASCII characters fold — but a
+/// non-ASCII letter matches only with matching case (full-Unicode/ICU folding is
+/// deferred to #1910 with FTS5 ranking). This test pins both halves so the code
+/// and the documented divergence agree.
+#[tokio::test]
+async fn search_case_insensitivity_is_ascii_only_on_sqlite() {
+    let pool = boot_pool("search_ascii_fold").await;
+    let repo = PgSearchNoteRepository::with_pool_untracked(pool);
+
+    repo.save(&NewSearchNote {
+        title: "Äpfel Tart".to_string(),
+        body: "a German apple dessert".to_string(),
+    })
+    .await
+    .expect("save accented row");
+
+    // ── ASCII case-folding works ──
+    // A pure-ASCII term matches case-insensitively (uppercase query vs lowercase
+    // stored "apple").
+    let ascii = repo.search("APPLE").await.expect("search APPLE");
+    assert_eq!(
+        ascii.len(),
+        1,
+        "ASCII term matches case-insensitively: {ascii:?}"
+    );
+
+    // Even alongside a non-ASCII letter, the ASCII characters fold: query "ÄP"
+    // lowercases (ASCII-only) to "Äp", whose pattern `%Äp%` still matches the
+    // stored "Äpfel Tart" because SQLite's `lower()` leaves the non-ASCII "Ä"
+    // untouched on BOTH sides. (The old full-Unicode `to_lowercase()` folded the
+    // query's "Ä"→"ä", producing `%äp%` that never matched — the F4 bug.)
+    let mixed = repo.search("ÄP").await.expect("search ÄP");
+    assert_eq!(
+        mixed.len(),
+        1,
+        "ASCII 'P' folds even next to a non-ASCII letter, so 'ÄP' matches 'Äpfel': {mixed:?}"
+    );
+
+    // ── The ASCII-only limitation, documented ──
+    // A differently-cased non-ASCII query letter does NOT match: query "äpfel"
+    // (lowercase ä, U+00E4) folds to itself (ASCII-only), but the stored "Äpfel"
+    // keeps its uppercase "Ä" (U+00C4) through SQLite's ASCII-only `lower()`, so
+    // the two non-ASCII codepoints differ and no row matches. Full-Unicode case
+    // folding would match here; it is intentionally deferred (#1910).
+    let non_ascii = repo.search("äpfel").await.expect("search äpfel");
+    assert!(
+        non_ascii.is_empty(),
+        "non-ASCII case is NOT folded (ASCII-only limitation): 'äpfel' must not match 'Äpfel': {non_ascii:?}"
+    );
 }
 
 /// LIKE metacharacters (`%`, `_`) in the query match literally — a query

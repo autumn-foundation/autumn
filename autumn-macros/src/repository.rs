@@ -13742,13 +13742,18 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         // the `backend_select!` sqlite arm below matches each `SEARCH_FIELDS`
         // column with a case-insensitive `lower(col) LIKE '%term%'` substring test,
         // ORed together, ordered `id DESC` (unranked — FTS5 ranking is deferred to
-        // #1910). This fragment builds the shared `__autumn_like_where` OR-clause
-        // (positional `$1` pattern, reused across every column — SQLite collapses a
-        // repeated `$1` to one bind) and the `__autumn_pattern` search term with
-        // LIKE metacharacters (`\`, `%`, `_`) escaped so they match literally and a
-        // query can never become a match-everything wildcard. It is spliced into
-        // each sqlite arm (never the pg arm), so the pattern/where are only built
-        // where they are used.
+        // #1910). Case-insensitivity here is ASCII-only: SQLite's built-in `lower()`
+        // folds only ASCII A–Z, so the query side is folded with the matching
+        // `to_ascii_lowercase()` (NOT Rust's full-Unicode `to_lowercase()`) to keep
+        // both sides consistent — a non-ASCII term (e.g. `Äpfel`) matches only with
+        // matching case. Full-Unicode/ICU case folding is deferred to #1910 (with
+        // FTS5 ranking). This fragment builds the shared `__autumn_like_where`
+        // OR-clause (positional `$1` pattern, reused across every column — SQLite
+        // collapses a repeated `$1` to one bind) and the `__autumn_pattern` search
+        // term with LIKE metacharacters (`\`, `%`, `_`) escaped so they match
+        // literally and a query can never become a match-everything wildcard. It is
+        // spliced into each sqlite arm (never the pg arm), so the pattern/where are
+        // only built where they are used.
         let sqlite_like_setup = quote! {
             let mut __autumn_like_clauses: ::std::vec::Vec<::std::string::String> = ::std::vec::Vec::new();
             for (__autumn_field, _) in <#model_name as ::autumn_web::repository::AutumnSearchableModel>::SEARCH_FIELDS {
@@ -13756,7 +13761,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
             let __autumn_like_where = __autumn_like_clauses.join(" OR ");
             let mut __autumn_escaped = ::std::string::String::new();
-            for __autumn_ch in query.to_lowercase().chars() {
+            for __autumn_ch in query.to_ascii_lowercase().chars() {
                 if ::core::matches!(__autumn_ch, '\\' | '%' | '_') {
                     __autumn_escaped.push('\\');
                 }
@@ -14236,8 +14241,10 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         };
         // #1996 SQLite LIKE-substring fallback for the owner-scoped search (see the
         // sibling `sqlite_like_setup` in the unscoped searchable block for the full
-        // rationale). Recomputed locally here because the scoped block is a separate
-        // `if let` and cannot see the unscoped block's binding.
+        // rationale, including the ASCII-only case-folding note — the query side is
+        // `to_ascii_lowercase()` to match SQLite's ASCII-only `lower()`). Recomputed
+        // locally here because the scoped block is a separate `if let` and cannot
+        // see the unscoped block's binding.
         let sqlite_like_setup = quote! {
             let mut __autumn_like_clauses: ::std::vec::Vec<::std::string::String> = ::std::vec::Vec::new();
             for (__autumn_field, _) in <#model_name as ::autumn_web::repository::AutumnSearchableModel>::SEARCH_FIELDS {
@@ -14245,7 +14252,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
             let __autumn_like_where = __autumn_like_clauses.join(" OR ");
             let mut __autumn_escaped = ::std::string::String::new();
-            for __autumn_ch in query.to_lowercase().chars() {
+            for __autumn_ch in query.to_ascii_lowercase().chars() {
                 if ::core::matches!(__autumn_ch, '\\' | '%' | '_') {
                     __autumn_escaped.push('\\');
                 }
