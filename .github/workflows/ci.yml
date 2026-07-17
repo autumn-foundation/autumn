@@ -298,7 +298,8 @@ jobs:
             --test sqlite_read_only_pool \
             --test sqlite_scoped_repository \
             --test sqlite_read_only_tx \
-            --test sqlite_transactional_url_pool
+            --test sqlite_transactional_url_pool \
+            --test sqlite_version_history
 
   # Genuine loom model checks: the loom_models test binary uses loom::sync::*
   # unconditionally, so loom::model() exhaustively explores thread interleavings

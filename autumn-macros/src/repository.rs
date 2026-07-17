@@ -1033,6 +1033,10 @@ fn is_string_param_type(ty: &syn::Type) -> bool {
 /// - `before_expr` — token stream for the "before" record value for updates
 ///   (same type; ignored for inserts/deletes).
 /// - `conn_ident` — identifier of the `&mut AsyncPgConnection`-like variable
+// #1996: the write path forks into pg / sqlite `backend_select!` arms (drop the
+// `$7::jsonb` cast, bind `recorded_at` explicitly on SQLite), which pushes this
+// token builder just past the line lint.
+#[allow(clippy::too_many_lines)]
 fn vh_insert_ts(
     table_name_str: &str,
     op: &str,
@@ -1115,21 +1119,52 @@ fn vh_insert_ts(
             };
             let __vh_actor: ::std::string::String = #actor_ts;
             let __vh_request_id: ::core::option::Option<&str> = #request_id_ts;
-            ::autumn_web::reexports::diesel::sql_query(
-                "INSERT INTO _autumn_version_history \
-                 (table_name, tenant_id, record_id, op, actor, request_id, changes) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)"
-            )
-            .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(#table_name_ts)
-            .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>, _>(__vh_tenant_id)
-            .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(__vh_record_id)
-            .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(#op)
-            .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__vh_actor)
-            .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>, _>(__vh_request_id)
-            .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__vh_changes_str)
-            .execute(#conn_ident)
-            .await
-            .map_err(::autumn_web::AutumnError::from)?;
+            // #1996: the Postgres arm keeps the `$7::jsonb` cast (`changes` is a
+            // JSONB column). The SQLite arm drops the cast (JSON is stored as
+            // TEXT) and additionally binds `recorded_at` explicitly: the DDL
+            // `DEFAULT CURRENT_TIMESTAMP` yields `YYYY-MM-DD HH:MM:SS` (no
+            // offset), which is not lexicographically comparable with the
+            // offset-bearing encoding diesel produces for a bound `DateTime<Utc>`
+            // filter value — binding the timestamp here makes stored and filter
+            // values share one encoding so the `recorded_at >= / <=` TEXT
+            // comparisons in `version_history()` stay monotonic.
+            ::autumn_web::backend_select! {
+                pg => {
+                    ::autumn_web::reexports::diesel::sql_query(
+                        "INSERT INTO _autumn_version_history \
+                         (table_name, tenant_id, record_id, op, actor, request_id, changes) \
+                         VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)"
+                    )
+                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(#table_name_ts)
+                    .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>, _>(__vh_tenant_id)
+                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(__vh_record_id)
+                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(#op)
+                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__vh_actor)
+                    .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>, _>(__vh_request_id)
+                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__vh_changes_str)
+                    .execute(#conn_ident)
+                    .await
+                    .map_err(::autumn_web::AutumnError::from)?;
+                },
+                sqlite => {
+                    ::autumn_web::reexports::diesel::sql_query(
+                        "INSERT INTO _autumn_version_history \
+                         (table_name, tenant_id, record_id, op, actor, request_id, changes, recorded_at) \
+                         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)"
+                    )
+                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(#table_name_ts)
+                    .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>, _>(__vh_tenant_id)
+                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(__vh_record_id)
+                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(#op)
+                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__vh_actor)
+                    .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>, _>(__vh_request_id)
+                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__vh_changes_str)
+                    .bind::<::autumn_web::reexports::diesel::sql_types::TimestamptzSqlite, _>(::autumn_web::reexports::chrono::Utc::now())
+                    .execute(#conn_ident)
+                    .await
+                    .map_err(::autumn_web::AutumnError::from)?;
+                },
+            }
         }
     }
 }
@@ -14349,6 +14384,51 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         quote! {}
     };
 
+    // #1996: version-history read fork. The Postgres and SQLite arms differ in
+    // three ways that must be forked through `backend_select!` (each arm names
+    // its own diesel types / SQL so the unselected arm is never type-checked):
+    //   1. the `recorded_at` column type — Postgres `Timestamptz` has no
+    //      `FromSql<_, Sqlite>`; SQLite must use `TimestamptzSqlite`;
+    //   2. the raw SQL casts — `COUNT(*)::bigint`, `$n::text`, `$n::timestamptz`
+    //      and `changes::text` are Postgres-only and SQLite rejects them;
+    //   3. the timestamp-filter bind types (`Nullable<Timestamptz>` vs
+    //      `Nullable<TimestamptzSqlite>`).
+    // The count row struct and the row→`VersionEntry` mapping are backend-agnostic
+    // (the SQLite `recorded_at` still deserializes into `DateTime<Utc>`), so they
+    // are built once here and spliced into both arms.
+    let vh_count_struct = quote! {
+        #[derive(::autumn_web::reexports::diesel::QueryableByName)]
+        struct __AutumnVersionHistoryCount {
+            #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::BigInt)]
+            count: i64,
+        }
+    };
+    let vh_map_rows = quote! {
+        raw_rows
+            .into_iter()
+            .map(|row| {
+                let op = match row.op.as_str() {
+                    "insert" => ::autumn_web::version_history::VersionOp::Insert,
+                    "delete" => ::autumn_web::version_history::VersionOp::Delete,
+                    _ => ::autumn_web::version_history::VersionOp::Update,
+                };
+                let changes: Vec<::autumn_web::version_history::ColumnChange> =
+                    ::autumn_web::reexports::serde_json::from_str(&row.changes)
+                        .unwrap_or_default();
+                ::autumn_web::version_history::VersionEntry {
+                    id: row.id,
+                    table_name: row.table_name,
+                    record_id: row.record_id,
+                    op,
+                    actor: row.actor,
+                    request_id: row.request_id,
+                    changes,
+                    recorded_at: row.recorded_at,
+                }
+            })
+            .collect::<Vec<::autumn_web::version_history::VersionEntry>>()
+    };
+
     let versioned_history_impl = if config.versioned {
         quote! {
             impl #pg_name {
@@ -14374,33 +14454,6 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     // access rather than silently consulting one shard.
                     #version_history_cross_shard_guard
 
-                    // Private helper struct that can be deserialized from a raw SQL row.
-                    #[derive(::autumn_web::reexports::diesel::QueryableByName)]
-                    struct __AutumnVersionHistoryRow {
-                        #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::BigInt)]
-                        id: i64,
-                        #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Text)]
-                        table_name: ::std::string::String,
-                        #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::BigInt)]
-                        record_id: i64,
-                        #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Text)]
-                        op: ::std::string::String,
-                        #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Text)]
-                        actor: ::std::string::String,
-                        #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>)]
-                        request_id: ::core::option::Option<::std::string::String>,
-                        #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Text)]
-                        changes: ::std::string::String,
-                        #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Timestamptz)]
-                        recorded_at: ::autumn_web::reexports::chrono::DateTime<::autumn_web::reexports::chrono::Utc>,
-                    }
-
-                    #[derive(::autumn_web::reexports::diesel::QueryableByName)]
-                    struct __AutumnVersionHistoryCount {
-                        #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::BigInt)]
-                        count: i64,
-                    }
-
                     let __table_name: &str = #table_name;
                     let (limit, offset) = filter.limit_offset();
                     let page = filter.page();
@@ -14409,108 +14462,218 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
                     let mut conn = self.__autumn_acquire_read_conn().await?;
 
-                    // Execute count query, optionally filtered by timestamp range.
-                    let total: u64 = if filter.from.is_some() || filter.to.is_some() {
-                        let rows = ::autumn_web::reexports::diesel::sql_query(
-                            "SELECT COUNT(*)::bigint AS count \
-                             FROM _autumn_version_history \
-                             WHERE table_name = $1 AND record_id = $2 \
-                             AND ($3::text IS NULL OR tenant_id = $3) \
-                             AND ($4::timestamptz IS NULL OR recorded_at >= $4) \
-                             AND ($5::timestamptz IS NULL OR recorded_at <= $5)"
-                        )
-                        .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__table_name)
-                        .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(record_id)
-                        .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>, _>(__version_history_tenant_id)
-                        .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Timestamptz>, _>(filter.from)
-                        .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Timestamptz>, _>(filter.to)
-                        .get_results::<__AutumnVersionHistoryCount>(&mut conn)
-                        .await
-                        .map_err(::autumn_web::AutumnError::from)?;
-                        rows.into_iter().next().map(|r| r.count).unwrap_or(0).max(0) as u64
-                    } else {
-                        let rows = ::autumn_web::reexports::diesel::sql_query(
-                            "SELECT COUNT(*)::bigint AS count \
-                             FROM _autumn_version_history \
-                             WHERE table_name = $1 AND record_id = $2 \
-                             AND ($3::text IS NULL OR tenant_id = $3)"
-                        )
-                        .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__table_name)
-                        .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(record_id)
-                        .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>, _>(__version_history_tenant_id)
-                        .get_results::<__AutumnVersionHistoryCount>(&mut conn)
-                        .await
-                        .map_err(::autumn_web::AutumnError::from)?;
-                        rows.into_iter().next().map(|r| r.count).unwrap_or(0).max(0) as u64
-                    };
+                    // #1996: the whole count + fetch + map is backend-forked. The
+                    // Postgres arm keeps the `::bigint` / `::text` / `::timestamptz`
+                    // / `changes::text` casts and the `Timestamptz` row/bind types;
+                    // the SQLite arm drops every cast and uses `TimestamptzSqlite`
+                    // (there is no `FromSql<Timestamptz, Sqlite>`), while producing
+                    // the identical `(total, entries)` pair. The row struct + queries
+                    // live inside each arm so only the selected arm is type-checked.
+                    let (total, entries): (u64, Vec<::autumn_web::version_history::VersionEntry>) =
+                        ::autumn_web::backend_select! {
+                            pg => {{
+                                #[derive(::autumn_web::reexports::diesel::QueryableByName)]
+                                struct __AutumnVersionHistoryRow {
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::BigInt)]
+                                    id: i64,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Text)]
+                                    table_name: ::std::string::String,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::BigInt)]
+                                    record_id: i64,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Text)]
+                                    op: ::std::string::String,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Text)]
+                                    actor: ::std::string::String,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>)]
+                                    request_id: ::core::option::Option<::std::string::String>,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Text)]
+                                    changes: ::std::string::String,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Timestamptz)]
+                                    recorded_at: ::autumn_web::reexports::chrono::DateTime<::autumn_web::reexports::chrono::Utc>,
+                                }
+                                #vh_count_struct
 
-                    // Execute the entries query.
-                    let raw_rows: Vec<__AutumnVersionHistoryRow> = if filter.from.is_some() || filter.to.is_some() {
-                        ::autumn_web::reexports::diesel::sql_query(
-                            "SELECT id, table_name, record_id, op, actor, request_id, \
-                             changes::text AS changes, recorded_at \
-                             FROM _autumn_version_history \
-                             WHERE table_name = $1 AND record_id = $2 \
-                             AND ($3::text IS NULL OR tenant_id = $3) \
-                             AND ($4::timestamptz IS NULL OR recorded_at >= $4) \
-                             AND ($5::timestamptz IS NULL OR recorded_at <= $5) \
-                             ORDER BY recorded_at ASC, id ASC \
-                             LIMIT $6 OFFSET $7"
-                        )
-                        .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__table_name)
-                        .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(record_id)
-                        .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>, _>(__version_history_tenant_id)
-                        .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Timestamptz>, _>(filter.from)
-                        .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Timestamptz>, _>(filter.to)
-                        .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(limit)
-                        .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(offset)
-                        .get_results::<__AutumnVersionHistoryRow>(&mut conn)
-                        .await
-                        .map_err(::autumn_web::AutumnError::from)?
-                    } else {
-                        ::autumn_web::reexports::diesel::sql_query(
-                            "SELECT id, table_name, record_id, op, actor, request_id, \
-                             changes::text AS changes, recorded_at \
-                             FROM _autumn_version_history \
-                             WHERE table_name = $1 AND record_id = $2 \
-                             AND ($3::text IS NULL OR tenant_id = $3) \
-                             ORDER BY recorded_at ASC, id ASC \
-                             LIMIT $4 OFFSET $5"
-                        )
-                        .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__table_name)
-                        .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(record_id)
-                        .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>, _>(__version_history_tenant_id)
-                        .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(limit)
-                        .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(offset)
-                        .get_results::<__AutumnVersionHistoryRow>(&mut conn)
-                        .await
-                        .map_err(::autumn_web::AutumnError::from)?
-                    };
+                                let total: u64 = if filter.from.is_some() || filter.to.is_some() {
+                                    let rows = ::autumn_web::reexports::diesel::sql_query(
+                                        "SELECT COUNT(*)::bigint AS count \
+                                         FROM _autumn_version_history \
+                                         WHERE table_name = $1 AND record_id = $2 \
+                                         AND ($3::text IS NULL OR tenant_id = $3) \
+                                         AND ($4::timestamptz IS NULL OR recorded_at >= $4) \
+                                         AND ($5::timestamptz IS NULL OR recorded_at <= $5)"
+                                    )
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__table_name)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(record_id)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>, _>(__version_history_tenant_id)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Timestamptz>, _>(filter.from)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Timestamptz>, _>(filter.to)
+                                    .get_results::<__AutumnVersionHistoryCount>(&mut conn)
+                                    .await
+                                    .map_err(::autumn_web::AutumnError::from)?;
+                                    rows.into_iter().next().map(|r| r.count).unwrap_or(0).max(0) as u64
+                                } else {
+                                    let rows = ::autumn_web::reexports::diesel::sql_query(
+                                        "SELECT COUNT(*)::bigint AS count \
+                                         FROM _autumn_version_history \
+                                         WHERE table_name = $1 AND record_id = $2 \
+                                         AND ($3::text IS NULL OR tenant_id = $3)"
+                                    )
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__table_name)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(record_id)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>, _>(__version_history_tenant_id)
+                                    .get_results::<__AutumnVersionHistoryCount>(&mut conn)
+                                    .await
+                                    .map_err(::autumn_web::AutumnError::from)?;
+                                    rows.into_iter().next().map(|r| r.count).unwrap_or(0).max(0) as u64
+                                };
 
-                    // Map raw rows to VersionEntry.
-                    let entries: Vec<::autumn_web::version_history::VersionEntry> = raw_rows
-                        .into_iter()
-                        .map(|row| {
-                            let op = match row.op.as_str() {
-                                "insert" => ::autumn_web::version_history::VersionOp::Insert,
-                                "delete" => ::autumn_web::version_history::VersionOp::Delete,
-                                _ => ::autumn_web::version_history::VersionOp::Update,
-                            };
-                            let changes: Vec<::autumn_web::version_history::ColumnChange> =
-                                ::autumn_web::reexports::serde_json::from_str(&row.changes)
-                                    .unwrap_or_default();
-                            ::autumn_web::version_history::VersionEntry {
-                                id: row.id,
-                                table_name: row.table_name,
-                                record_id: row.record_id,
-                                op,
-                                actor: row.actor,
-                                request_id: row.request_id,
-                                changes,
-                                recorded_at: row.recorded_at,
-                            }
-                        })
-                        .collect();
+                                let raw_rows: Vec<__AutumnVersionHistoryRow> = if filter.from.is_some() || filter.to.is_some() {
+                                    ::autumn_web::reexports::diesel::sql_query(
+                                        "SELECT id, table_name, record_id, op, actor, request_id, \
+                                         changes::text AS changes, recorded_at \
+                                         FROM _autumn_version_history \
+                                         WHERE table_name = $1 AND record_id = $2 \
+                                         AND ($3::text IS NULL OR tenant_id = $3) \
+                                         AND ($4::timestamptz IS NULL OR recorded_at >= $4) \
+                                         AND ($5::timestamptz IS NULL OR recorded_at <= $5) \
+                                         ORDER BY recorded_at ASC, id ASC \
+                                         LIMIT $6 OFFSET $7"
+                                    )
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__table_name)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(record_id)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>, _>(__version_history_tenant_id)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Timestamptz>, _>(filter.from)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Timestamptz>, _>(filter.to)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(limit)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(offset)
+                                    .get_results::<__AutumnVersionHistoryRow>(&mut conn)
+                                    .await
+                                    .map_err(::autumn_web::AutumnError::from)?
+                                } else {
+                                    ::autumn_web::reexports::diesel::sql_query(
+                                        "SELECT id, table_name, record_id, op, actor, request_id, \
+                                         changes::text AS changes, recorded_at \
+                                         FROM _autumn_version_history \
+                                         WHERE table_name = $1 AND record_id = $2 \
+                                         AND ($3::text IS NULL OR tenant_id = $3) \
+                                         ORDER BY recorded_at ASC, id ASC \
+                                         LIMIT $4 OFFSET $5"
+                                    )
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__table_name)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(record_id)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>, _>(__version_history_tenant_id)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(limit)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(offset)
+                                    .get_results::<__AutumnVersionHistoryRow>(&mut conn)
+                                    .await
+                                    .map_err(::autumn_web::AutumnError::from)?
+                                };
+
+                                let entries = #vh_map_rows;
+                                (total, entries)
+                            }},
+                            sqlite => {{
+                                #[derive(::autumn_web::reexports::diesel::QueryableByName)]
+                                struct __AutumnVersionHistoryRow {
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::BigInt)]
+                                    id: i64,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Text)]
+                                    table_name: ::std::string::String,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::BigInt)]
+                                    record_id: i64,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Text)]
+                                    op: ::std::string::String,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Text)]
+                                    actor: ::std::string::String,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>)]
+                                    request_id: ::core::option::Option<::std::string::String>,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Text)]
+                                    changes: ::std::string::String,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::TimestamptzSqlite)]
+                                    recorded_at: ::autumn_web::reexports::chrono::DateTime<::autumn_web::reexports::chrono::Utc>,
+                                }
+                                #vh_count_struct
+
+                                let total: u64 = if filter.from.is_some() || filter.to.is_some() {
+                                    let rows = ::autumn_web::reexports::diesel::sql_query(
+                                        "SELECT COUNT(*) AS count \
+                                         FROM _autumn_version_history \
+                                         WHERE table_name = $1 AND record_id = $2 \
+                                         AND ($3 IS NULL OR tenant_id = $3) \
+                                         AND ($4 IS NULL OR recorded_at >= $4) \
+                                         AND ($5 IS NULL OR recorded_at <= $5)"
+                                    )
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__table_name)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(record_id)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>, _>(__version_history_tenant_id)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::TimestamptzSqlite>, _>(filter.from)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::TimestamptzSqlite>, _>(filter.to)
+                                    .get_results::<__AutumnVersionHistoryCount>(&mut conn)
+                                    .await
+                                    .map_err(::autumn_web::AutumnError::from)?;
+                                    rows.into_iter().next().map(|r| r.count).unwrap_or(0).max(0) as u64
+                                } else {
+                                    let rows = ::autumn_web::reexports::diesel::sql_query(
+                                        "SELECT COUNT(*) AS count \
+                                         FROM _autumn_version_history \
+                                         WHERE table_name = $1 AND record_id = $2 \
+                                         AND ($3 IS NULL OR tenant_id = $3)"
+                                    )
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__table_name)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(record_id)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>, _>(__version_history_tenant_id)
+                                    .get_results::<__AutumnVersionHistoryCount>(&mut conn)
+                                    .await
+                                    .map_err(::autumn_web::AutumnError::from)?;
+                                    rows.into_iter().next().map(|r| r.count).unwrap_or(0).max(0) as u64
+                                };
+
+                                let raw_rows: Vec<__AutumnVersionHistoryRow> = if filter.from.is_some() || filter.to.is_some() {
+                                    ::autumn_web::reexports::diesel::sql_query(
+                                        "SELECT id, table_name, record_id, op, actor, request_id, \
+                                         changes, recorded_at \
+                                         FROM _autumn_version_history \
+                                         WHERE table_name = $1 AND record_id = $2 \
+                                         AND ($3 IS NULL OR tenant_id = $3) \
+                                         AND ($4 IS NULL OR recorded_at >= $4) \
+                                         AND ($5 IS NULL OR recorded_at <= $5) \
+                                         ORDER BY recorded_at ASC, id ASC \
+                                         LIMIT $6 OFFSET $7"
+                                    )
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__table_name)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(record_id)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>, _>(__version_history_tenant_id)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::TimestamptzSqlite>, _>(filter.from)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::TimestamptzSqlite>, _>(filter.to)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(limit)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(offset)
+                                    .get_results::<__AutumnVersionHistoryRow>(&mut conn)
+                                    .await
+                                    .map_err(::autumn_web::AutumnError::from)?
+                                } else {
+                                    ::autumn_web::reexports::diesel::sql_query(
+                                        "SELECT id, table_name, record_id, op, actor, request_id, \
+                                         changes, recorded_at \
+                                         FROM _autumn_version_history \
+                                         WHERE table_name = $1 AND record_id = $2 \
+                                         AND ($3 IS NULL OR tenant_id = $3) \
+                                         ORDER BY recorded_at ASC, id ASC \
+                                         LIMIT $4 OFFSET $5"
+                                    )
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__table_name)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(record_id)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>, _>(__version_history_tenant_id)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(limit)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(offset)
+                                    .get_results::<__AutumnVersionHistoryRow>(&mut conn)
+                                    .await
+                                    .map_err(::autumn_web::AutumnError::from)?
+                                };
+
+                                let entries = #vh_map_rows;
+                                (total, entries)
+                            }},
+                        };
 
                     Ok(::autumn_web::version_history::VersionPage {
                         entries,
@@ -18789,6 +18952,90 @@ mod tests {
                 && generated.contains("tenant_id = $3")
                 && generated.contains("self . across_tenants"),
             "tenant-scoped version_history must default to CURRENT_TENANT and only bypass through across_tenants(): {generated}"
+        );
+    }
+
+    /// #1996: the version-history writer and reader must fork through
+    /// `backend_select!` so a `versioned = true` repository runs on SQLite.
+    ///
+    /// The Postgres arm keeps its `::jsonb` / `::bigint` / `::timestamptz` /
+    /// `changes::text` casts and the `Timestamptz` diesel type verbatim; the
+    /// SQLite arm drops every cast (JSON is stored as TEXT) and names
+    /// `TimestamptzSqlite` (there is no `FromSql<Timestamptz, Sqlite>`), and the
+    /// writer additionally binds `recorded_at` so TEXT range comparisons stay
+    /// monotonic. This assertion pins each of those forks in the generated tokens.
+    #[test]
+    fn repository_macro_versioned_history_forks_sqlite_dialect() {
+        let generated = repository_macro(
+            quote! { Post, versioned = true },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        // Both the writer and the reader route through the backend seam.
+        assert!(
+            generated.contains("backend_select ! { pg =>"),
+            "versioned repository must emit a backend_select! fork: {generated}"
+        );
+
+        // ── Write path ────────────────────────────────────────────────
+        // Postgres keeps the jsonb cast; SQLite drops it and binds recorded_at.
+        let write_pos = generated
+            .find("INSERT INTO _autumn_version_history")
+            .expect("versioned repository must write history");
+        let write_section = &generated[write_pos..];
+        assert!(
+            write_section.contains("$7 :: jsonb")
+                || write_section.contains("$7::jsonb"),
+            "the Postgres write arm must keep the $7::jsonb cast: {write_section}"
+        );
+        // The SQLite insert names all eight columns (recorded_at bound
+        // explicitly) and uses uncast $1..$8 placeholders. The literal preserves
+        // its `\`-continuations, so the column list and the VALUES clause are on
+        // separate source lines — assert each single-line fragment independently.
+        assert!(
+            generated.contains("(table_name, tenant_id, record_id, op, actor, request_id, changes, recorded_at)"),
+            "the SQLite write arm must bind recorded_at as an 8th column: {generated}"
+        );
+        assert!(
+            generated.contains("VALUES ($1, $2, $3, $4, $5, $6, $7, $8)"),
+            "the SQLite write arm must use uncast $1..$8 placeholders: {generated}"
+        );
+        // The SQLite write arm binds the explicit timestamp via chrono Utc::now().
+        assert!(
+            generated.contains("Utc :: now ())"),
+            "the SQLite write arm must bind recorded_at explicitly (Utc::now()): {generated}"
+        );
+
+        // ── Read path (SQLite arm drops every Postgres cast) ──────────
+        assert!(
+            generated.contains("SELECT COUNT(*) AS count"),
+            "the SQLite count arm must drop the ::bigint cast: {generated}"
+        );
+        assert!(
+            generated.contains("($3 IS NULL OR tenant_id = $3)"),
+            "the SQLite read arm must drop the $3::text tenant cast: {generated}"
+        );
+        assert!(
+            generated.contains("($4 IS NULL OR recorded_at >= $4)")
+                && generated.contains("($5 IS NULL OR recorded_at <= $5)"),
+            "the SQLite read arm must drop the ::timestamptz range casts: {generated}"
+        );
+        // The SQLite read arm must name TimestamptzSqlite (there is no
+        // FromSql<Timestamptz, Sqlite>) for the recorded_at column type and the
+        // range-filter binds.
+        assert!(
+            generated.contains("TimestamptzSqlite"),
+            "the SQLite read arm must use TimestamptzSqlite: {generated}"
+        );
+
+        // The Postgres arm must still carry its casts verbatim (no regression).
+        assert!(
+            generated.contains("SELECT COUNT(*)::bigint AS count")
+                && generated.contains("($3::text IS NULL OR tenant_id = $3)")
+                && generated.contains("($4::timestamptz IS NULL OR recorded_at >= $4)")
+                && generated.contains("changes::text AS changes"),
+            "the Postgres read arm must keep its ::bigint/::text/::timestamptz/changes::text casts: {generated}"
         );
     }
 

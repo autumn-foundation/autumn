@@ -461,6 +461,21 @@ path = "tests/sqlite_crud_basic.rs"
 name = "sqlite_upsert_isolation"
 path = "tests/sqlite_upsert_isolation.rs"
 
+# SQLite version-history end-to-end proof (issue #1996). Drives a
+# `versioned = true` repository against an in-memory SQLite pool: a create +
+# update + delete each append a `_autumn_version_history` row, `version_history()`
+# reads them back (op/actor/changes/time-range), and — the adversarial assertion —
+# `version_history()` scoped to tenant B never returns tenant A's rows
+# (fail-closed isolation). Exercises the forked writer (no `$7::jsonb`), reader
+# (no `::bigint`/`::text`/`::timestamptz`/`changes::text`, `TimestamptzSqlite`),
+# and the SQLite `_autumn_version_history` DDL. Only meaningful under
+# `--features sqlite`; the file is `#![cfg(feature = "sqlite")]` so a default
+# `cargo test` compiles it to an empty (passing) binary. Run explicitly:
+# `cargo test -p autumn-web --features "sqlite,test-support" --test sqlite_version_history`.
+[[test]]
+name = "sqlite_version_history"
+path = "tests/sqlite_version_history.rs"
+
 # SQLite `dependent(..., on_delete = destroy)` cascade proof (issue #1996, PR
 # #2021). The Destroy arm selects child ids with a hand-built SQL string that
 # used to emit a trailing `FOR UPDATE` (rejected by SQLite) — outside the
