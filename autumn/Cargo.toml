@@ -435,6 +435,46 @@ path = "tests/sqlite_read_only_pool.rs"
 name = "sqlite_scoped_repository"
 path = "tests/sqlite_scoped_repository.rs"
 
+# Basic `#[repository]` CRUD proof on the SQLite backend (issue #1996, wave B+C):
+# instantiates a simple model + repository and exercises the always-emitted CRUD
+# (save/find_by_id/update/count/save_many/delete_by_id) on an in-memory SQLite
+# pool, proving the FOR UPDATE removal + on_conflict/batch dialect port compile
+# AND run with no Docker. Only meaningful under `--features sqlite`; the file is
+# `#![cfg(feature = "sqlite")]` so a default `cargo test` compiles it to an empty
+# (passing) binary. Run explicitly:
+# `cargo test -p autumn-web --features sqlite --test sqlite_crud_basic`.
+[[test]]
+name = "sqlite_crud_basic"
+path = "tests/sqlite_crud_basic.rs"
+
+# SQLite upsert isolation + optimistic-lock proof (issue #1996, PR #2021): the two
+# P1 fixes on the cfg-dual `__autumn_execute_upsert` SQLite arm. Proves (Bug 2,
+# SECURITY) a tenant-scoped `upsert_many` under tenant B with tenant A's id leaves
+# tenant A's row untouched (no cross-tenant leak) and (Bug 2, lock) a stale
+# `lock_version` upsert surfaces a 409 — matching Postgres. Runs on an in-memory
+# SQLite pool with no Docker. Bug 1 (advisory-lock cfg-gate) is pinned by the
+# autumn-macros expansion test. Only meaningful under `--features sqlite`; the
+# file is `#![cfg(feature = "sqlite")]` so a default `cargo test` compiles it to
+# an empty (passing) binary. Run explicitly:
+# `cargo test -p autumn-web --features sqlite --test sqlite_upsert_isolation`.
+[[test]]
+name = "sqlite_upsert_isolation"
+path = "tests/sqlite_upsert_isolation.rs"
+
+# SQLite `dependent(..., on_delete = destroy)` cascade proof (issue #1996, PR
+# #2021). The Destroy arm selects child ids with a hand-built SQL string that
+# used to emit a trailing `FOR UPDATE` (rejected by SQLite) — outside the
+# `maybe_for_update!` DSL seam. This test proves the `backend_select!`-gated fix:
+# `delete_by_id` on a parent with a `destroy` child succeeds on an in-memory
+# SQLite pool and actually deletes the dependent child rows, with no Docker. Only
+# meaningful under `--features sqlite`; the file is `#![cfg(feature = "sqlite")]`
+# so a default `cargo test` compiles it to an empty (passing) binary. Run
+# explicitly:
+# `cargo test -p autumn-web --features sqlite --test sqlite_dependent_destroy`.
+[[test]]
+name = "sqlite_dependent_destroy"
+path = "tests/sqlite_dependent_destroy.rs"
+
 # SQLite read-only-transaction safety proof (issue #1614, Codex P2). The SQLite
 # arm of `Db::tx_with` cannot enforce `READ ONLY`, so a `TxOptions::read_only()`
 # request is rejected before the closure runs rather than silently running a

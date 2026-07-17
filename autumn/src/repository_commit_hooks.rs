@@ -8,10 +8,11 @@ use std::any::Any;
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{
-    Arc, OnceLock, RwLock,
-    atomic::{AtomicBool, Ordering},
-};
+use std::sync::{Arc, OnceLock, RwLock};
+// `AtomicBool`/`Ordering` back the Postgres kick-worker's pending flag, which is
+// `cfg`-gated off under `sqlite` (the durable hook worker is Postgres-only).
+#[cfg(not(feature = "sqlite"))]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use diesel::OptionalExtension as _;
@@ -21,6 +22,8 @@ use futures::FutureExt as _;
 use serde::Serialize;
 use serde_json::Value;
 use sha2::Digest as _;
+// `Notify` backs the Postgres kick-worker, `cfg`-gated off under `sqlite`.
+#[cfg(not(feature = "sqlite"))]
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
@@ -146,10 +149,12 @@ const HOOK_RECOVER_STALE_PENDING_SQL: &str = "UPDATE autumn_repository_commit_ho
 static REPOSITORY_COMMIT_HOOK_RUNNERS: OnceLock<
     RwLock<HashMap<String, RepositoryCommitHookRegistration>>,
 > = OnceLock::new();
+#[cfg(not(feature = "sqlite"))]
 static REPOSITORY_COMMIT_HOOK_KICKERS: OnceLock<
     RwLock<HashMap<usize, Arc<RepositoryCommitHookKickState>>>,
 > = OnceLock::new();
 
+#[cfg(not(feature = "sqlite"))]
 struct RepositoryCommitHookKickState {
     notify: Notify,
     pending: AtomicBool,
@@ -157,6 +162,7 @@ struct RepositoryCommitHookKickState {
     channels: OnceLock<crate::channels::Channels>,
 }
 
+#[cfg(not(feature = "sqlite"))]
 impl Default for RepositoryCommitHookKickState {
     fn default() -> Self {
         Self {
@@ -168,6 +174,7 @@ impl Default for RepositoryCommitHookKickState {
     }
 }
 
+#[cfg(not(feature = "sqlite"))]
 impl RepositoryCommitHookKickState {
     fn request_kick(&self) -> bool {
         !self.pending.swap(true, Ordering::AcqRel)
@@ -842,6 +849,7 @@ pub fn start_repository_commit_hook_worker(pool: PgPool, shutdown: CancellationT
 
 /// Nudge dispatch after a mutation commits, without relying on this replica for
 /// durability. Polling workers on all replicas can still claim the row later.
+#[cfg(not(feature = "sqlite"))]
 pub fn kick_repository_commit_hook_dispatcher(pool: &PgPool) {
     register_inventory_repository_commit_hook_runners();
     if !should_start_repository_commit_hook_worker(&registered_handler_keys()) {
@@ -854,6 +862,19 @@ pub fn kick_repository_commit_hook_dispatcher(pool: &PgPool) {
     }
 }
 
+/// `SQLite` no-op variant of the commit-hook dispatcher kick.
+///
+/// The durable dispatcher is a Postgres queue worker (`LISTEN/NOTIFY` +
+/// `FOR UPDATE SKIP LOCKED` row claiming + `unnest`/`Array` bulk binds) that is
+/// never spawned under the `sqlite` feature (see the cfg-gated worker start in
+/// `app.rs`). Generated `#[repository]` CRUD still emits the kick call — over the
+/// runtime pool, which is a `SQLite` pool here — so this signature accepts a
+/// `Pool<RuntimeConnection>` and does nothing. Threading the real Postgres worker
+/// onto `SQLite` is a later wave (issue #1996).
+#[cfg(feature = "sqlite")]
+pub const fn kick_repository_commit_hook_dispatcher(_pool: &Pool<crate::db::RuntimeConnection>) {}
+
+#[cfg(not(feature = "sqlite"))]
 fn repository_commit_hook_kick_state(pool: &PgPool) -> Arc<RepositoryCommitHookKickState> {
     let key = repository_commit_hook_pool_key(pool);
     let registry = REPOSITORY_COMMIT_HOOK_KICKERS.get_or_init(|| RwLock::new(HashMap::new()));
@@ -880,10 +901,12 @@ fn repository_commit_hook_kick_state(pool: &PgPool) -> Arc<RepositoryCommitHookK
     state
 }
 
+#[cfg(not(feature = "sqlite"))]
 fn repository_commit_hook_pool_key(pool: &PgPool) -> usize {
     std::ptr::from_ref(pool.manager()).addr()
 }
 
+#[cfg(not(feature = "sqlite"))]
 fn spawn_repository_commit_hook_kick_worker(
     pool: PgPool,
     state: Arc<RepositoryCommitHookKickState>,

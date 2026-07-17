@@ -4198,6 +4198,99 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         )
     };
 
+    // SQLite counterpart of `#execute_upsert_body`: the per-row loop body that
+    // builds one `INSERT … ON CONFLICT(id) DO UPDATE …` statement, applies the
+    // SAME tenant/lock-version `DO UPDATE … WHERE` refinements Postgres uses
+    // (SQLite's `ON CONFLICT DO UPDATE` supports a `WHERE` clause), runs it, and
+    // pushes any RETURNING row (issue #1996, PR #2021). Matching Postgres' WHERE
+    // is load-bearing for two reasons:
+    //   * tenant isolation (SECURITY): the conflict target is `id` only and the
+    //     shared set-clause (`__autumn_upsert_set`) writes `tenant_id`, so
+    //     without `WHERE tenant_id = <current>` an id owned by another tenant
+    //     would be MOVED into the caller's tenant. With the predicate the DO
+    //     UPDATE simply does not fire for a cross-tenant id → the row is left
+    //     untouched and drops out of RETURNING (silent, no leak).
+    //   * optimistic locking: `WHERE lock_version = excluded.lock_version` leaves
+    //     a stale-version row untouched, dropping it from RETURNING.
+    // A dropped row yields no RETURNING output, so per-row `get_result` returns
+    // `Error::NotFound`; `.optional()?` maps that to `None` so the row is simply
+    // absent from the returned Vec — exactly like Postgres' `get_results` omits
+    // filtered rows. The caller's fail-closed reconciliation (re-select dropped
+    // ids under tenant scope → 409 only if still present for this tenant) then
+    // behaves identically on both backends.
+    let execute_upsert_body_sqlite = {
+        let build_stmt = quote! {
+            let stmt = ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
+                .values(__autumn_row)
+                .on_conflict(#table_ident::id)
+                .do_update()
+                .set(Self::__autumn_upsert_set());
+        };
+        if has_tenant_id {
+            lock_version_field.map_or_else(
+                || quote! {
+                    #build_stmt
+                    let __autumn_r = if let ::core::option::Option::Some(t) = tenant_id {
+                        ::autumn_web::reexports::diesel::query_dsl::methods::FilterDsl::filter(stmt, #table_ident::tenant_id.eq(t.to_string()))
+                            .get_result::<Self>(conn)
+                            .await
+                            .optional()?
+                    } else {
+                        stmt.get_result::<Self>(conn).await.optional()?
+                    };
+                    if let ::core::option::Option::Some(__autumn_r) = __autumn_r {
+                        __autumn_upserted.push(__autumn_r);
+                    }
+                },
+                |lv_field| {
+                    let lv_ident = lv_field.ident.as_ref().unwrap();
+                    quote! {
+                        #build_stmt
+                        let lv_cond = #table_ident::#lv_ident.eq(::autumn_web::reexports::diesel::upsert::excluded(#table_ident::#lv_ident));
+                        let __autumn_r = if let ::core::option::Option::Some(t) = tenant_id {
+                            ::autumn_web::reexports::diesel::query_dsl::methods::FilterDsl::filter(stmt, lv_cond.and(#table_ident::tenant_id.eq(t.to_string())))
+                                .get_result::<Self>(conn)
+                                .await
+                                .optional()?
+                        } else {
+                            ::autumn_web::reexports::diesel::query_dsl::methods::FilterDsl::filter(stmt, lv_cond)
+                                .get_result::<Self>(conn)
+                                .await
+                                .optional()?
+                        };
+                        if let ::core::option::Option::Some(__autumn_r) = __autumn_r {
+                            __autumn_upserted.push(__autumn_r);
+                        }
+                    }
+                },
+            )
+        } else {
+            lock_version_field.map_or_else(
+                || quote! {
+                    #build_stmt
+                    let __autumn_r = stmt.get_result::<Self>(conn).await.optional()?;
+                    if let ::core::option::Option::Some(__autumn_r) = __autumn_r {
+                        __autumn_upserted.push(__autumn_r);
+                    }
+                },
+                |lv_field| {
+                    let lv_ident = lv_field.ident.as_ref().unwrap();
+                    quote! {
+                        #build_stmt
+                        let lv_cond = #table_ident::#lv_ident.eq(::autumn_web::reexports::diesel::upsert::excluded(#table_ident::#lv_ident));
+                        let __autumn_r = ::autumn_web::reexports::diesel::query_dsl::methods::FilterDsl::filter(stmt, lv_cond)
+                            .get_result::<Self>(conn)
+                            .await
+                            .optional()?;
+                        if let ::core::option::Option::Some(__autumn_r) = __autumn_r {
+                            __autumn_upserted.push(__autumn_r);
+                        }
+                    }
+                },
+            )
+        }
+    };
+
     let compare_fields = fields_for_new.iter().map(|f| {
         let ident = &f.ident;
         quote! { input.#ident == record.#ident }
@@ -4932,7 +5025,7 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         ::autumn_web::reexports::diesel::helper_types::IntoBoxed<
             '__lq,
             #table_ident::table,
-            ::autumn_web::reexports::diesel::pg::Pg,
+            ::autumn_web::RuntimeBackend,
         >
     };
     // Single primary key used for the default order + tie-break. Absent for
@@ -5167,7 +5260,7 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             #[doc(hidden)]
             pub fn __autumn_upsert_set() -> impl ::autumn_web::reexports::diesel::query_builder::AsChangeset<
                 Target = #table_ident::table,
-                Changeset = impl ::autumn_web::reexports::diesel::query_builder::QueryFragment<::autumn_web::reexports::diesel::pg::Pg> + ::core::marker::Send + ::core::marker::Sync + 'static
+                Changeset = impl ::autumn_web::reexports::diesel::query_builder::QueryFragment<::autumn_web::RuntimeBackend> + ::core::marker::Send + ::core::marker::Sync + 'static
             > + ::core::marker::Send + ::core::marker::Sync + 'static {
                 use ::autumn_web::reexports::diesel::ExpressionMethods as _;
                 (#(#upsert_columns,)*)
@@ -5182,16 +5275,43 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 use ::autumn_web::reexports::diesel::prelude::*;
                 use ::autumn_web::reexports::diesel_async::RunQueryDsl;
 
-                let stmt = ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
-                    // Owned `Vec` (not `&[Self]`): encrypted columns use diesel
-                    // `serialize_as`, which only implements `Insertable` for owned
-                    // values. `to_vec()` also works for plain models.
-                    .values(chunk.to_vec())
-                    .on_conflict(#table_ident::id)
-                    .do_update()
-                    .set(Self::__autumn_upsert_set());
+                // Postgres builds one batched `INSERT … ON CONFLICT … DO UPDATE …
+                // RETURNING` over the whole chunk; SQLite cannot express a
+                // multi-row `VALUES` with the `DEFAULT` keyword (`BatchInsert<…,
+                // false>` has no `QueryFragment<Sqlite>`), so it upserts row by
+                // row, each `INSERT … ON CONFLICT(id) DO UPDATE … WHERE … RETURNING`
+                // (valid single-row on SQLite with the `returning_clauses`
+                // flag). The caller (`save_many`/`upsert_many`) already runs this
+                // inside a transaction, so the per-row loop stays atomic. The
+                // per-row body (`#execute_upsert_body_sqlite`) applies the SAME
+                // tenant/lock-version `DO UPDATE … WHERE` refinements as the
+                // Postgres arm — `diesel::upsert::excluded` is the backend-agnostic
+                // form (vs. `pg::upsert::excluded`) and SQLite's `ON CONFLICT DO
+                // UPDATE` supports a `WHERE` clause — so cross-tenant ids are left
+                // untouched (SECURITY: no cross-tenant row movement) and stale
+                // lock-version rows drop out of RETURNING, matching Postgres
+                // exactly (issue #1996, PR #2021).
+                ::autumn_web::backend_select! {
+                    pg => {
+                        let stmt = ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
+                            // Owned `Vec` (not `&[Self]`): encrypted columns use diesel
+                            // `serialize_as`, which only implements `Insertable` for owned
+                            // values. `to_vec()` also works for plain models.
+                            .values(chunk.to_vec())
+                            .on_conflict(#table_ident::id)
+                            .do_update()
+                            .set(Self::__autumn_upsert_set());
 
-                #execute_upsert_body
+                        #execute_upsert_body
+                    },
+                    sqlite => {
+                        let mut __autumn_upserted = ::std::vec::Vec::new();
+                        for __autumn_row in chunk.to_vec() {
+                            #execute_upsert_body_sqlite
+                        }
+                        ::core::result::Result::Ok(__autumn_upserted)
+                    },
+                }
             }
 
 

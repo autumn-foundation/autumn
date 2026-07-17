@@ -1817,9 +1817,22 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         // hard child deletes (the `#destroy_live_filter` gate is applied
                         // BEFORE `FOR UPDATE`, so the locked row set matches the rows
                         // the pre-scan + mutating pass operate on).
+                        // The `FOR UPDATE` locking clause is emitted only on
+                        // Postgres. `SQLite` rejects `SELECT … FOR UPDATE`
+                        // outright, and it needs no such clause: its single-writer
+                        // database-level lock already serializes concurrent
+                        // cascades (the same rationale that degrades the DSL
+                        // `maybe_for_update!` seam to a plain read on `SQLite`).
+                        // The suffix is selected in autumn-web's compilation via
+                        // `backend_select!`, so the Postgres SQL is byte-identical
+                        // to before and the `SQLite` form simply drops the clause.
+                        let __for_update: &str = ::autumn_web::backend_select! {
+                            pg => { " FOR UPDATE" },
+                            sqlite => { "" },
+                        };
                         let __q = format!(
-                            "SELECT id FROM \"{}\" WHERE \"{}\" = $1{} ORDER BY id FOR UPDATE",
-                            __table, __fk_column, #destroy_live_filter
+                            "SELECT id FROM \"{}\" WHERE \"{}\" = $1{} ORDER BY id{}",
+                            __table, __fk_column, #destroy_live_filter, __for_update
                         );
                         let __ids: ::std::vec::Vec<__AutumnDepId> =
                             ::autumn_web::reexports::diesel::sql_query(__q)
@@ -1905,8 +1918,8 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             // skip the hard delete, and leave the row to FK-fail
                             // the parent DELETE. The id set is authoritative for
                             // the parent kind; the row is locked with `for_update`.
-                            let __record = #table_ident::table.find(__cid)
-                                .for_update()
+                            let __record = ::autumn_web::maybe_for_update!(#table_ident::table.find(__cid))
+
                                 .first::<#model_name>(conn)
                                 .await
                                 .optional()
@@ -2020,20 +2033,20 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 #delete_many_live_filter;
             let __autumn_dep_rows: ::std::vec::Vec<#model_name> =
                 if let ::core::option::Option::Some(t) = tenant_id {
-                    __autumn_dep_q.filter(#table_ident::tenant_id.eq(t)).for_update()
+                    ::autumn_web::maybe_for_update!(__autumn_dep_q.filter(#table_ident::tenant_id.eq(t)))
                         .load::<#model_name>(conn).await
                 } else {
-                    __autumn_dep_q.for_update().load::<#model_name>(conn).await
+                    ::autumn_web::maybe_for_update!(__autumn_dep_q).load::<#model_name>(conn).await
                 }
                 .map_err(::autumn_web::AutumnError::from)?;
         }
     } else {
         quote! {
             let __autumn_dep_rows: ::std::vec::Vec<#model_name> =
-                #table_ident::table
+                ::autumn_web::maybe_for_update!(#table_ident::table
                     .filter(#table_ident::id.eq_any(chunk))
-                    #delete_many_live_filter
-                    .for_update()
+                    #delete_many_live_filter)
+
                     .load::<#model_name>(conn).await
                     .map_err(::autumn_web::AutumnError::from)?;
         }
@@ -4110,9 +4123,9 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 {
                                     let load_query = #table_ident::table.find(id);
                                     let current = if let ::core::option::Option::Some(ref t) = tenant_id {
-                                        load_query.filter(#table_ident::tenant_id.eq(t)).for_update().first::<#model_name>(conn).await
+                                        ::autumn_web::maybe_for_update!(load_query.filter(#table_ident::tenant_id.eq(t))).first::<#model_name>(conn).await
                                     } else {
-                                        load_query.for_update().first::<#model_name>(conn).await
+                                        ::autumn_web::maybe_for_update!(load_query).first::<#model_name>(conn).await
                                     }
                                     .optional()
                                     .map_err(::autumn_web::AutumnError::from)?
@@ -4162,9 +4175,9 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 } else {
                                     let load_query = #table_ident::table.find(id);
                                     let current = if let ::core::option::Option::Some(ref t) = tenant_id {
-                                        load_query.filter(#table_ident::tenant_id.eq(t)).for_update().first::<#model_name>(conn).await
+                                        ::autumn_web::maybe_for_update!(load_query.filter(#table_ident::tenant_id.eq(t))).first::<#model_name>(conn).await
                                     } else {
-                                        load_query.for_update().first::<#model_name>(conn).await
+                                        ::autumn_web::maybe_for_update!(load_query).first::<#model_name>(conn).await
                                     }
                                     .optional()
                                     .map_err(::autumn_web::AutumnError::from)?
@@ -4321,9 +4334,9 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 {
                                     let load_query = #table_ident::table.find(id);
                                     let current = if let ::core::option::Option::Some(ref t) = tenant_id {
-                                        load_query.filter(#table_ident::tenant_id.eq(t)).for_update().first::<#model_name>(conn).await
+                                        ::autumn_web::maybe_for_update!(load_query.filter(#table_ident::tenant_id.eq(t))).first::<#model_name>(conn).await
                                     } else {
-                                        load_query.for_update().first::<#model_name>(conn).await
+                                        ::autumn_web::maybe_for_update!(load_query).first::<#model_name>(conn).await
                                     }
                                     .optional()
                                     .map_err(::autumn_web::AutumnError::from)?
@@ -4373,9 +4386,9 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 } else {
                                     let load_query = #table_ident::table.find(id);
                                     let current = if let ::core::option::Option::Some(ref t) = tenant_id {
-                                        load_query.filter(#table_ident::tenant_id.eq(t)).for_update().first::<#model_name>(conn).await
+                                        ::autumn_web::maybe_for_update!(load_query.filter(#table_ident::tenant_id.eq(t))).first::<#model_name>(conn).await
                                     } else {
-                                        load_query.for_update().first::<#model_name>(conn).await
+                                        ::autumn_web::maybe_for_update!(load_query).first::<#model_name>(conn).await
                                     }
                                     .optional()
                                     .map_err(::autumn_web::AutumnError::from)?
@@ -4453,9 +4466,9 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                     // SELECT FOR UPDATE grabs an exclusive row lock so
                                     // no concurrent writer can commit between our
                                     // version check and the UPDATE below.
-                                    let current = #table_ident::table
-                                        .find(id)
-                                        .for_update()
+                                    let current = ::autumn_web::maybe_for_update!(#table_ident::table
+                                        .find(id))
+
                                         .first::<#model_name>(conn)
                                         .await
                                         .optional()
@@ -4491,9 +4504,9 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                     (updated, ::core::option::Option::Some(__vh_before_inner))
                                 } else {
                                     // Load current record
-                                    let current = #table_ident::table
-                                        .find(id)
-                                        .for_update()
+                                    let current = ::autumn_web::maybe_for_update!(#table_ident::table
+                                        .find(id))
+
                                         .first::<#model_name>(conn)
                                         .await
                                         .optional()
@@ -4636,9 +4649,9 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 let (record, __vh_before): (#model_name, #model_name) = if let ::core::option::Option::Some(expected_version) =
                                     changes.__autumn_lock_version_expected()
                                 {
-                                    let current = #table_ident::table
-                                        .find(id)
-                                        .for_update()
+                                    let current = ::autumn_web::maybe_for_update!(#table_ident::table
+                                        .find(id))
+
                                         .first::<#model_name>(conn)
                                         .await
                                         .optional()
@@ -4724,9 +4737,9 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 let record: #model_name = if let ::core::option::Option::Some(expected_version) =
                                     changes.__autumn_lock_version_expected()
                                 {
-                                    let current = #table_ident::table
-                                        .find(id)
-                                        .for_update()
+                                    let current = ::autumn_web::maybe_for_update!(#table_ident::table
+                                        .find(id))
+
                                         .first::<#model_name>(conn)
                                         .await
                                         .optional()
@@ -4882,9 +4895,9 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 // hooks only run when the row is actually deletable.
                                 let load_query = #table_ident::table.find(id) #sd_filter;
                                 let record = if let ::core::option::Option::Some(ref t) = tenant_id {
-                                    load_query.filter(#table_ident::tenant_id.eq(t)).for_update().first::<#model_name>(conn).await
+                                    ::autumn_web::maybe_for_update!(load_query.filter(#table_ident::tenant_id.eq(t))).first::<#model_name>(conn).await
                                 } else {
-                                    load_query.for_update().first::<#model_name>(conn).await
+                                    ::autumn_web::maybe_for_update!(load_query).first::<#model_name>(conn).await
                                 }
                                 .optional()
                                 .map_err(::autumn_web::AutumnError::from)?
@@ -4936,9 +4949,9 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
                                 let load_query = #table_ident::table.find(id);
                                 let record = if let ::core::option::Option::Some(ref t) = tenant_id {
-                                    load_query.filter(#table_ident::tenant_id.eq(t)).for_update().first::<#model_name>(conn).await
+                                    ::autumn_web::maybe_for_update!(load_query.filter(#table_ident::tenant_id.eq(t))).first::<#model_name>(conn).await
                                 } else {
-                                    load_query.for_update().first::<#model_name>(conn).await
+                                    ::autumn_web::maybe_for_update!(load_query).first::<#model_name>(conn).await
                                 }
                                 .optional()
                                 .map_err(::autumn_web::AutumnError::from)?
@@ -4985,7 +4998,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
                             // Load current record for before_delete context.
                             let load_query = #table_ident::table.find(id) #sd_filter;
-                            let record = load_query.for_update().first::<#model_name>(conn).await
+                            let record = ::autumn_web::maybe_for_update!(load_query).first::<#model_name>(conn).await
                             .optional()
                             .map_err(::autumn_web::AutumnError::from)?
                             .ok_or_else(|| ::autumn_web::AutumnError::not_found_msg(
@@ -5043,7 +5056,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             let mut ctx = MutationContext::new(MutationOp::Delete);
 
                             let load_query = #table_ident::table.find(id);
-                            let record = load_query.for_update().first::<#model_name>(conn).await
+                            let record = ::autumn_web::maybe_for_update!(load_query).first::<#model_name>(conn).await
                             .optional()
                             .map_err(::autumn_web::AutumnError::from)?
                             .ok_or_else(|| ::autumn_web::AutumnError::not_found_msg(
@@ -5079,7 +5092,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             let mut ctx = MutationContext::new(MutationOp::Delete);
 
                             let load_query = #table_ident::table.find(id);
-                            let record = load_query.for_update().first::<#model_name>(conn).await
+                            let record = ::autumn_web::maybe_for_update!(load_query).first::<#model_name>(conn).await
                             .optional()
                             .map_err(::autumn_web::AutumnError::from)?
                             .ok_or_else(|| ::autumn_web::AutumnError::not_found_msg(
@@ -5122,25 +5135,85 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     {
                         if let ::core::option::Option::Some(t) = tenant_id {
                             let values: Vec<_> = chunk.iter().cloned().map(|item| ::autumn_web::tenancy::TenantInsertable::tenant_values(item, t)).collect();
+                            ::autumn_web::backend_select! {
+                        pg => {
                             ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
                                 .values(values)
                                 .get_results::<#model_name>(conn)
                                 .await
+                        },
+                        sqlite => {
+                            let mut __autumn_inserted = ::std::vec::Vec::new();
+                            let mut __autumn_res: ::core::result::Result<(), ::autumn_web::reexports::diesel::result::Error> =
+                                ::core::result::Result::Ok(());
+                            for __autumn_row in values {
+                                match ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
+                                    .values(__autumn_row)
+                                    .get_result::<#model_name>(conn)
+                                    .await
+                                {
+                                    ::core::result::Result::Ok(__r) => __autumn_inserted.push(__r),
+                                    ::core::result::Result::Err(__e) => { __autumn_res = ::core::result::Result::Err(__e); break; }
+                                }
+                            }
+                            __autumn_res.map(|()| __autumn_inserted)
+                        },
+                    }
                         } else {
+                            ::autumn_web::backend_select! {
+                        pg => {
                             ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
                                 .values(chunk.to_vec())
                                 .get_results::<#model_name>(conn)
                                 .await
+                        },
+                        sqlite => {
+                            let mut __autumn_inserted = ::std::vec::Vec::new();
+                            let mut __autumn_res: ::core::result::Result<(), ::autumn_web::reexports::diesel::result::Error> =
+                                ::core::result::Result::Ok(());
+                            for __autumn_row in chunk.to_vec() {
+                                match ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
+                                    .values(__autumn_row)
+                                    .get_result::<#model_name>(conn)
+                                    .await
+                                {
+                                    ::core::result::Result::Ok(__r) => __autumn_inserted.push(__r),
+                                    ::core::result::Result::Err(__e) => { __autumn_res = ::core::result::Result::Err(__e); break; }
+                                }
+                            }
+                            __autumn_res.map(|()| __autumn_inserted)
+                        },
+                    }
                         }
                     }
                 }
             } else {
                 quote! {
                     {
-                        ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
-                            .values(chunk.to_vec())
-                            .get_results::<#model_name>(conn)
-                            .await
+                        ::autumn_web::backend_select! {
+                        pg => {
+                            ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
+                                .values(chunk.to_vec())
+                                .get_results::<#model_name>(conn)
+                                .await
+                        },
+                        sqlite => {
+                            let mut __autumn_inserted = ::std::vec::Vec::new();
+                            let mut __autumn_res: ::core::result::Result<(), ::autumn_web::reexports::diesel::result::Error> =
+                                ::core::result::Result::Ok(());
+                            for __autumn_row in chunk.to_vec() {
+                                match ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
+                                    .values(__autumn_row)
+                                    .get_result::<#model_name>(conn)
+                                    .await
+                                {
+                                    ::core::result::Result::Ok(__r) => __autumn_inserted.push(__r),
+                                    ::core::result::Result::Err(__e) => { __autumn_res = ::core::result::Result::Err(__e); break; }
+                                }
+                            }
+                            __autumn_res.map(|()| __autumn_inserted)
+                        },
+                    }
                     }
                 }
             };
@@ -5206,7 +5279,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             let mut global_indices = Vec::new();
                             let mut offset = 0;
                             let cols = (&new[0]).__autumn_column_count() + #tenant_extra;
-                            let chunk_size = if cols == 0 { 1000 } else { (65535usize / cols).min(1000).max(1) };
+                            let chunk_size = if cols == 0 { 1000 } else { (::autumn_web::repository::MAX_BIND_PARAMS / cols).min(1000).max(1) };
                             for chunk in inputs.chunks(chunk_size) {
                                 let chunk_inserted = (#insert_expr)
                                     .map_err(::autumn_web::AutumnError::from)?;
@@ -5389,7 +5462,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             let mut inserted = Vec::new();
                             let mut offset = 0;
                             let cols = (&new[0]).__autumn_column_count() + #tenant_extra;
-                            let chunk_size = if cols == 0 { 1000 } else { (65535usize / cols).min(1000).max(1) };
+                            let chunk_size = if cols == 0 { 1000 } else { (::autumn_web::repository::MAX_BIND_PARAMS / cols).min(1000).max(1) };
                             for chunk in inputs_ref.chunks(chunk_size) {
                                 let chunk_inserted = (#insert_expr)
                                     .map_err(::autumn_web::AutumnError::from)?;
@@ -5448,16 +5521,56 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     {
                         if let ::core::option::Option::Some(t) = tenant_id {
                             let values: Vec<_> = chunk.iter().map(|item| ::autumn_web::tenancy::TenantInsertable::tenant_values(item.0.clone(), t)).collect();
+                            ::autumn_web::backend_select! {
+                        pg => {
                             ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
                                 .values(values)
                                 .get_results::<#model_name>(conn)
                                 .await
+                        },
+                        sqlite => {
+                            let mut __autumn_inserted = ::std::vec::Vec::new();
+                            let mut __autumn_res: ::core::result::Result<(), ::autumn_web::reexports::diesel::result::Error> =
+                                ::core::result::Result::Ok(());
+                            for __autumn_row in values {
+                                match ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
+                                    .values(__autumn_row)
+                                    .get_result::<#model_name>(conn)
+                                    .await
+                                {
+                                    ::core::result::Result::Ok(__r) => __autumn_inserted.push(__r),
+                                    ::core::result::Result::Err(__e) => { __autumn_res = ::core::result::Result::Err(__e); break; }
+                                }
+                            }
+                            __autumn_res.map(|()| __autumn_inserted)
+                        },
+                    }
                         } else {
                             let values: Vec<_> = chunk.iter().map(|item| item.0.clone()).collect();
+                            ::autumn_web::backend_select! {
+                        pg => {
                             ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
                                 .values(values)
                                 .get_results::<#model_name>(conn)
                                 .await
+                        },
+                        sqlite => {
+                            let mut __autumn_inserted = ::std::vec::Vec::new();
+                            let mut __autumn_res: ::core::result::Result<(), ::autumn_web::reexports::diesel::result::Error> =
+                                ::core::result::Result::Ok(());
+                            for __autumn_row in values {
+                                match ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
+                                    .values(__autumn_row)
+                                    .get_result::<#model_name>(conn)
+                                    .await
+                                {
+                                    ::core::result::Result::Ok(__r) => __autumn_inserted.push(__r),
+                                    ::core::result::Result::Err(__e) => { __autumn_res = ::core::result::Result::Err(__e); break; }
+                                }
+                            }
+                            __autumn_res.map(|()| __autumn_inserted)
+                        },
+                    }
                         }
                     }
                 }
@@ -5465,10 +5578,30 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 quote! {
                     {
                         let values: Vec<_> = chunk.iter().map(|item| item.0.clone()).collect();
-                        ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
-                            .values(values)
-                            .get_results::<#model_name>(conn)
-                            .await
+                        ::autumn_web::backend_select! {
+                        pg => {
+                            ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
+                                .values(values)
+                                .get_results::<#model_name>(conn)
+                                .await
+                        },
+                        sqlite => {
+                            let mut __autumn_inserted = ::std::vec::Vec::new();
+                            let mut __autumn_res: ::core::result::Result<(), ::autumn_web::reexports::diesel::result::Error> =
+                                ::core::result::Result::Ok(());
+                            for __autumn_row in values {
+                                match ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
+                                    .values(__autumn_row)
+                                    .get_result::<#model_name>(conn)
+                                    .await
+                                {
+                                    ::core::result::Result::Ok(__r) => __autumn_inserted.push(__r),
+                                    ::core::result::Result::Err(__e) => { __autumn_res = ::core::result::Result::Err(__e); break; }
+                                }
+                            }
+                            __autumn_res.map(|()| __autumn_inserted)
+                        },
+                    }
                     }
                 }
             };
@@ -5519,7 +5652,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         return Ok((successes, failures));
                     }
                     let cols = (&valid_items[0].0).__autumn_column_count() + #tenant_extra;
-                    let chunk_size = if cols == 0 { 1000 } else { (65535usize / cols).min(1000).max(1) };
+                    let chunk_size = if cols == 0 { 1000 } else { (::autumn_web::repository::MAX_BIND_PARAMS / cols).min(1000).max(1) };
                     let mut offset = 0;
                     for chunk in valid_items.chunks(chunk_size) {
                         let batch_res = ::autumn_web::__private::scoped_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
@@ -5788,7 +5921,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         return Ok((successes, failures));
                     }
                     let cols = (&valid_items[0].0).__autumn_column_count() + #tenant_extra;
-                    let chunk_size = if cols == 0 { 1000 } else { (65535usize / cols).min(1000).max(1) };
+                    let chunk_size = if cols == 0 { 1000 } else { (::autumn_web::repository::MAX_BIND_PARAMS / cols).min(1000).max(1) };
                     for chunk in valid_items.chunks(chunk_size) {
                         let batch_res = ::autumn_web::__private::scoped_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                             async move {
@@ -5963,14 +6096,14 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             let load_expr = if config.tenant_scoped {
                 quote! {
                     if let ::core::option::Option::Some(t) = tenant_id {
-                        load_query.filter(#table_ident::tenant_id.eq(t)).for_update().load::<#model_name>(conn).await
+                        ::autumn_web::maybe_for_update!(load_query.filter(#table_ident::tenant_id.eq(t))).load::<#model_name>(conn).await
                     } else {
-                        load_query.for_update().load::<#model_name>(conn).await
+                        ::autumn_web::maybe_for_update!(load_query).load::<#model_name>(conn).await
                     }
                 }
             } else {
                 quote! {
-                    load_query.for_update().load::<#model_name>(conn).await
+                    ::autumn_web::maybe_for_update!(load_query).load::<#model_name>(conn).await
                 }
             };
 
@@ -6431,28 +6564,28 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 if config.soft_delete {
                     quote! {
                         if let ::core::option::Option::Some(t) = tenant_id {
-                            load_query.filter(#table_ident::tenant_id.eq(t)).filter(#table_ident::deleted_at.is_null()).for_update().load::<#model_name>(conn).await
+                            ::autumn_web::maybe_for_update!(load_query.filter(#table_ident::tenant_id.eq(t)).filter(#table_ident::deleted_at.is_null())).load::<#model_name>(conn).await
                         } else {
-                            load_query.filter(#table_ident::deleted_at.is_null()).for_update().load::<#model_name>(conn).await
+                            ::autumn_web::maybe_for_update!(load_query.filter(#table_ident::deleted_at.is_null())).load::<#model_name>(conn).await
                         }
                     }
                 } else {
                     quote! {
                         if let ::core::option::Option::Some(t) = tenant_id {
-                            load_query.filter(#table_ident::tenant_id.eq(t)).for_update().load::<#model_name>(conn).await
+                            ::autumn_web::maybe_for_update!(load_query.filter(#table_ident::tenant_id.eq(t))).load::<#model_name>(conn).await
                         } else {
-                            load_query.for_update().load::<#model_name>(conn).await
+                            ::autumn_web::maybe_for_update!(load_query).load::<#model_name>(conn).await
                         }
                     }
                 }
             } else {
                 if config.soft_delete {
                     quote! {
-                        load_query.filter(#table_ident::deleted_at.is_null()).for_update().load::<#model_name>(conn).await
+                        ::autumn_web::maybe_for_update!(load_query.filter(#table_ident::deleted_at.is_null())).load::<#model_name>(conn).await
                     }
                 } else {
                     quote! {
-                        load_query.for_update().load::<#model_name>(conn).await
+                        ::autumn_web::maybe_for_update!(load_query).load::<#model_name>(conn).await
                     }
                 }
             };
@@ -7078,9 +7211,9 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             changes.__autumn_lock_version_expected()
                         {
                             let c = if let ::core::option::Option::Some(ref t) = tenant_id {
-                                load_query.filter(#table_ident::tenant_id.eq(t)).for_update().first::<#model_name>(conn).await
+                                ::autumn_web::maybe_for_update!(load_query.filter(#table_ident::tenant_id.eq(t))).first::<#model_name>(conn).await
                             } else {
-                                load_query.for_update().first::<#model_name>(conn).await
+                                ::autumn_web::maybe_for_update!(load_query).first::<#model_name>(conn).await
                             }
                             .optional()
                             .map_err(::autumn_web::AutumnError::from)?
@@ -7101,9 +7234,9 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             c
                         } else {
                             if let ::core::option::Option::Some(ref t) = tenant_id {
-                                load_query.filter(#table_ident::tenant_id.eq(t)).for_update().first::<#model_name>(conn).await
+                                ::autumn_web::maybe_for_update!(load_query.filter(#table_ident::tenant_id.eq(t))).first::<#model_name>(conn).await
                             } else {
-                                load_query.for_update().first::<#model_name>(conn).await
+                                ::autumn_web::maybe_for_update!(load_query).first::<#model_name>(conn).await
                             }
                             .optional()
                             .map_err(::autumn_web::AutumnError::from)?
@@ -7163,9 +7296,9 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             // version check and the UPDATE below.
                             let load_query = #table_ident::table.find(id);
                             let current = if let ::core::option::Option::Some(ref t) = tenant_id {
-                                load_query.filter(#table_ident::tenant_id.eq(t)).for_update().first::<#model_name>(conn).await
+                                ::autumn_web::maybe_for_update!(load_query.filter(#table_ident::tenant_id.eq(t))).first::<#model_name>(conn).await
                             } else {
-                                load_query.for_update().first::<#model_name>(conn).await
+                                ::autumn_web::maybe_for_update!(load_query).first::<#model_name>(conn).await
                             }
                             .optional()
                             .map_err(::autumn_web::AutumnError::from)?
@@ -7256,7 +7389,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         let current = if let ::core::option::Option::Some(expected_version) =
                             changes.__autumn_lock_version_expected()
                         {
-                            let c = load_query.for_update().first::<#model_name>(conn).await
+                            let c = ::autumn_web::maybe_for_update!(load_query).first::<#model_name>(conn).await
                                 .optional()
                                 .map_err(::autumn_web::AutumnError::from)?
                                 .ok_or_else(|| ::autumn_web::AutumnError::not_found_msg(
@@ -7277,7 +7410,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             }
                             c
                         } else {
-                            load_query.for_update().first::<#model_name>(conn).await
+                            ::autumn_web::maybe_for_update!(load_query).first::<#model_name>(conn).await
                                 .optional()
                                 .map_err(::autumn_web::AutumnError::from)?
                                 .ok_or_else(|| ::autumn_web::AutumnError::not_found_msg(
@@ -7315,7 +7448,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     ::autumn_web::__private::scoped_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                         async move {
                             let load_query = #table_ident::table.find(id);
-                            let current = load_query.for_update().first::<#model_name>(conn).await
+                            let current = ::autumn_web::maybe_for_update!(load_query).first::<#model_name>(conn).await
                             .optional()
                             .map_err(::autumn_web::AutumnError::from)?
                             .ok_or_else(|| ::autumn_web::AutumnError::not_found_msg(
@@ -7392,9 +7525,9 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     ::autumn_web::__private::scoped_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| async move {
                         let load_query = #table_ident::table.find(id).filter(#table_ident::deleted_at.is_null());
                         let record = if let ::core::option::Option::Some(ref t) = tenant_id {
-                            load_query.filter(#table_ident::tenant_id.eq(t)).for_update().first::<#model_name>(conn).await
+                            ::autumn_web::maybe_for_update!(load_query.filter(#table_ident::tenant_id.eq(t))).first::<#model_name>(conn).await
                         } else {
-                            load_query.for_update().first::<#model_name>(conn).await
+                            ::autumn_web::maybe_for_update!(load_query).first::<#model_name>(conn).await
                         }
                         .optional()
                         .map_err(::autumn_web::AutumnError::from)?
@@ -7471,9 +7604,9 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     ::autumn_web::__private::scoped_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| async move {
                         let load_query = #table_ident::table.find(id);
                         let record = if let ::core::option::Option::Some(ref t) = tenant_id {
-                            load_query.filter(#table_ident::tenant_id.eq(t)).for_update().first::<#model_name>(conn).await
+                            ::autumn_web::maybe_for_update!(load_query.filter(#table_ident::tenant_id.eq(t))).first::<#model_name>(conn).await
                         } else {
-                            load_query.for_update().first::<#model_name>(conn).await
+                            ::autumn_web::maybe_for_update!(load_query).first::<#model_name>(conn).await
                         }
                         .optional()
                         .map_err(::autumn_web::AutumnError::from)?
@@ -7545,9 +7678,9 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     let __now = ::autumn_web::reexports::chrono::Utc::now().naive_utc();
                     let mut conn = self.__autumn_acquire_conn().await?;
                     ::autumn_web::__private::scoped_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| async move {
-                        let record = #table_ident::table.find(id)
-                            .filter(#table_ident::deleted_at.is_null())
-                            .for_update()
+                        let record = ::autumn_web::maybe_for_update!(#table_ident::table.find(id)
+                            .filter(#table_ident::deleted_at.is_null()))
+
                             .first::<#model_name>(conn)
                             .await
                             .optional()
@@ -7609,8 +7742,8 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
                 let mut conn = self.__autumn_acquire_conn().await?;
                 ::autumn_web::__private::scoped_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| async move {
-                    let record = #table_ident::table.find(id)
-                        .for_update()
+                    let record = ::autumn_web::maybe_for_update!(#table_ident::table.find(id))
+
                         .first::<#model_name>(conn)
                         .await
                         .optional()
@@ -7685,19 +7818,59 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     async move {
                         let mut inserted = Vec::new();
                         let cols = (&new[0]).__autumn_column_count() + #tenant_extra;
-                        let chunk_size = if cols == 0 { 1000 } else { (65535usize / cols).min(1000).max(1) };
+                        let chunk_size = if cols == 0 { 1000 } else { (::autumn_web::repository::MAX_BIND_PARAMS / cols).min(1000).max(1) };
                         for chunk in new.chunks(chunk_size) {
                             let chunk_inserted = if let ::core::option::Option::Some(t) = tenant_id {
                                 let values: Vec<_> = chunk.iter().cloned().map(|item| ::autumn_web::tenancy::TenantInsertable::tenant_values(item, t)).collect();
-                                ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
-                                    .values(values)
-                                    .get_results::<#model_name>(conn)
+                                ::autumn_web::backend_select! {
+                        pg => {
+                            ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
+                                .values(values)
+                                .get_results::<#model_name>(conn)
+                                .await
+                        },
+                        sqlite => {
+                            let mut __autumn_inserted = ::std::vec::Vec::new();
+                            let mut __autumn_res: ::core::result::Result<(), ::autumn_web::reexports::diesel::result::Error> =
+                                ::core::result::Result::Ok(());
+                            for __autumn_row in values {
+                                match ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
+                                    .values(__autumn_row)
+                                    .get_result::<#model_name>(conn)
                                     .await
+                                {
+                                    ::core::result::Result::Ok(__r) => __autumn_inserted.push(__r),
+                                    ::core::result::Result::Err(__e) => { __autumn_res = ::core::result::Result::Err(__e); break; }
+                                }
+                            }
+                            __autumn_res.map(|()| __autumn_inserted)
+                        },
+                    }
                             } else {
-                                ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
-                                    .values(chunk.to_vec())
-                                    .get_results::<#model_name>(conn)
+                                ::autumn_web::backend_select! {
+                        pg => {
+                            ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
+                                .values(chunk.to_vec())
+                                .get_results::<#model_name>(conn)
+                                .await
+                        },
+                        sqlite => {
+                            let mut __autumn_inserted = ::std::vec::Vec::new();
+                            let mut __autumn_res: ::core::result::Result<(), ::autumn_web::reexports::diesel::result::Error> =
+                                ::core::result::Result::Ok(());
+                            for __autumn_row in chunk.to_vec() {
+                                match ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
+                                    .values(__autumn_row)
+                                    .get_result::<#model_name>(conn)
                                     .await
+                                {
+                                    ::core::result::Result::Ok(__r) => __autumn_inserted.push(__r),
+                                    ::core::result::Result::Err(__e) => { __autumn_res = ::core::result::Result::Err(__e); break; }
+                                }
+                            }
+                            __autumn_res.map(|()| __autumn_inserted)
+                        },
+                    }
                             }
                             .map_err(::autumn_web::AutumnError::from)?;
                             for r in &chunk_inserted {
@@ -7736,19 +7909,59 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     async move {
                         let mut inserted = Vec::new();
                         let cols = (&new[0]).__autumn_column_count() + #tenant_extra;
-                        let chunk_size = if cols == 0 { 1000 } else { (65535usize / cols).min(1000).max(1) };
+                        let chunk_size = if cols == 0 { 1000 } else { (::autumn_web::repository::MAX_BIND_PARAMS / cols).min(1000).max(1) };
                         for chunk in new.chunks(chunk_size) {
                             let chunk_inserted = if let ::core::option::Option::Some(t) = tenant_id {
                                 let values: Vec<_> = chunk.iter().cloned().map(|item| ::autumn_web::tenancy::TenantInsertable::tenant_values(item, t)).collect();
-                                ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
-                                    .values(values)
-                                    .get_results::<#model_name>(conn)
+                                ::autumn_web::backend_select! {
+                        pg => {
+                            ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
+                                .values(values)
+                                .get_results::<#model_name>(conn)
+                                .await
+                        },
+                        sqlite => {
+                            let mut __autumn_inserted = ::std::vec::Vec::new();
+                            let mut __autumn_res: ::core::result::Result<(), ::autumn_web::reexports::diesel::result::Error> =
+                                ::core::result::Result::Ok(());
+                            for __autumn_row in values {
+                                match ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
+                                    .values(__autumn_row)
+                                    .get_result::<#model_name>(conn)
                                     .await
+                                {
+                                    ::core::result::Result::Ok(__r) => __autumn_inserted.push(__r),
+                                    ::core::result::Result::Err(__e) => { __autumn_res = ::core::result::Result::Err(__e); break; }
+                                }
+                            }
+                            __autumn_res.map(|()| __autumn_inserted)
+                        },
+                    }
                             } else {
-                                ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
-                                    .values(chunk.to_vec())
-                                    .get_results::<#model_name>(conn)
+                                ::autumn_web::backend_select! {
+                        pg => {
+                            ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
+                                .values(chunk.to_vec())
+                                .get_results::<#model_name>(conn)
+                                .await
+                        },
+                        sqlite => {
+                            let mut __autumn_inserted = ::std::vec::Vec::new();
+                            let mut __autumn_res: ::core::result::Result<(), ::autumn_web::reexports::diesel::result::Error> =
+                                ::core::result::Result::Ok(());
+                            for __autumn_row in chunk.to_vec() {
+                                match ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
+                                    .values(__autumn_row)
+                                    .get_result::<#model_name>(conn)
                                     .await
+                                {
+                                    ::core::result::Result::Ok(__r) => __autumn_inserted.push(__r),
+                                    ::core::result::Result::Err(__e) => { __autumn_res = ::core::result::Result::Err(__e); break; }
+                                }
+                            }
+                            __autumn_res.map(|()| __autumn_inserted)
+                        },
+                    }
                             }
                             .map_err(::autumn_web::AutumnError::from)?;
                             inserted.extend(chunk_inserted);
@@ -7785,12 +7998,32 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     async move {
                         let mut inserted = Vec::new();
                         let cols = (&new[0]).__autumn_column_count() + #tenant_extra;
-                        let chunk_size = if cols == 0 { 1000 } else { (65535usize / cols).min(1000).max(1) };
+                        let chunk_size = if cols == 0 { 1000 } else { (::autumn_web::repository::MAX_BIND_PARAMS / cols).min(1000).max(1) };
                         for chunk in new.chunks(chunk_size) {
-                            let chunk_inserted = ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
+                            let chunk_inserted = ::autumn_web::backend_select! {
+                        pg => {
+                            ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
                                 .values(chunk.to_vec())
                                 .get_results::<#model_name>(conn)
                                 .await
+                        },
+                        sqlite => {
+                            let mut __autumn_inserted = ::std::vec::Vec::new();
+                            let mut __autumn_res: ::core::result::Result<(), ::autumn_web::reexports::diesel::result::Error> =
+                                ::core::result::Result::Ok(());
+                            for __autumn_row in chunk.to_vec() {
+                                match ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
+                                    .values(__autumn_row)
+                                    .get_result::<#model_name>(conn)
+                                    .await
+                                {
+                                    ::core::result::Result::Ok(__r) => __autumn_inserted.push(__r),
+                                    ::core::result::Result::Err(__e) => { __autumn_res = ::core::result::Result::Err(__e); break; }
+                                }
+                            }
+                            __autumn_res.map(|()| __autumn_inserted)
+                        },
+                    }
                                 .map_err(::autumn_web::AutumnError::from)?;
                             for r in &chunk_inserted {
                                 #vh_r
@@ -7820,12 +8053,32 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     async move {
                         let mut inserted = Vec::new();
                         let cols = (&new[0]).__autumn_column_count() + #tenant_extra;
-                        let chunk_size = if cols == 0 { 1000 } else { (65535usize / cols).min(1000).max(1) };
+                        let chunk_size = if cols == 0 { 1000 } else { (::autumn_web::repository::MAX_BIND_PARAMS / cols).min(1000).max(1) };
                         for chunk in new.chunks(chunk_size) {
-                            let chunk_inserted = ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
+                            let chunk_inserted = ::autumn_web::backend_select! {
+                        pg => {
+                            ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
                                 .values(chunk.to_vec())
                                 .get_results::<#model_name>(conn)
                                 .await
+                        },
+                        sqlite => {
+                            let mut __autumn_inserted = ::std::vec::Vec::new();
+                            let mut __autumn_res: ::core::result::Result<(), ::autumn_web::reexports::diesel::result::Error> =
+                                ::core::result::Result::Ok(());
+                            for __autumn_row in chunk.to_vec() {
+                                match ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
+                                    .values(__autumn_row)
+                                    .get_result::<#model_name>(conn)
+                                    .await
+                                {
+                                    ::core::result::Result::Ok(__r) => __autumn_inserted.push(__r),
+                                    ::core::result::Result::Err(__e) => { __autumn_res = ::core::result::Result::Err(__e); break; }
+                                }
+                            }
+                            __autumn_res.map(|()| __autumn_inserted)
+                        },
+                    }
                                 .map_err(::autumn_web::AutumnError::from)?;
                             inserted.extend(chunk_inserted);
                         }
@@ -7886,23 +8139,83 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 quote! {
                     if let ::core::option::Option::Some(t) = tenant_id {
                         let values: Vec<_> = chunk.iter().cloned().map(|item| ::autumn_web::tenancy::TenantInsertable::tenant_values(item, t)).collect();
-                        ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
-                            .values(values)
-                            .get_results::<#model_name>(conn)
-                            .await
+                        ::autumn_web::backend_select! {
+                        pg => {
+                            ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
+                                .values(values)
+                                .get_results::<#model_name>(conn)
+                                .await
+                        },
+                        sqlite => {
+                            let mut __autumn_inserted = ::std::vec::Vec::new();
+                            let mut __autumn_res: ::core::result::Result<(), ::autumn_web::reexports::diesel::result::Error> =
+                                ::core::result::Result::Ok(());
+                            for __autumn_row in values {
+                                match ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
+                                    .values(__autumn_row)
+                                    .get_result::<#model_name>(conn)
+                                    .await
+                                {
+                                    ::core::result::Result::Ok(__r) => __autumn_inserted.push(__r),
+                                    ::core::result::Result::Err(__e) => { __autumn_res = ::core::result::Result::Err(__e); break; }
+                                }
+                            }
+                            __autumn_res.map(|()| __autumn_inserted)
+                        },
+                    }
                     } else {
-                        ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
-                            .values(chunk.to_vec())
-                            .get_results::<#model_name>(conn)
-                            .await
+                        ::autumn_web::backend_select! {
+                        pg => {
+                            ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
+                                .values(chunk.to_vec())
+                                .get_results::<#model_name>(conn)
+                                .await
+                        },
+                        sqlite => {
+                            let mut __autumn_inserted = ::std::vec::Vec::new();
+                            let mut __autumn_res: ::core::result::Result<(), ::autumn_web::reexports::diesel::result::Error> =
+                                ::core::result::Result::Ok(());
+                            for __autumn_row in chunk.to_vec() {
+                                match ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
+                                    .values(__autumn_row)
+                                    .get_result::<#model_name>(conn)
+                                    .await
+                                {
+                                    ::core::result::Result::Ok(__r) => __autumn_inserted.push(__r),
+                                    ::core::result::Result::Err(__e) => { __autumn_res = ::core::result::Result::Err(__e); break; }
+                                }
+                            }
+                            __autumn_res.map(|()| __autumn_inserted)
+                        },
+                    }
                     }
                 }
             } else {
                 quote! {
-                    ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
-                        .values(chunk.to_vec())
-                        .get_results::<#model_name>(conn)
-                        .await
+                    ::autumn_web::backend_select! {
+                        pg => {
+                            ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
+                                .values(chunk.to_vec())
+                                .get_results::<#model_name>(conn)
+                                .await
+                        },
+                        sqlite => {
+                            let mut __autumn_inserted = ::std::vec::Vec::new();
+                            let mut __autumn_res: ::core::result::Result<(), ::autumn_web::reexports::diesel::result::Error> =
+                                ::core::result::Result::Ok(());
+                            for __autumn_row in chunk.to_vec() {
+                                match ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
+                                    .values(__autumn_row)
+                                    .get_result::<#model_name>(conn)
+                                    .await
+                                {
+                                    ::core::result::Result::Ok(__r) => __autumn_inserted.push(__r),
+                                    ::core::result::Result::Err(__e) => { __autumn_res = ::core::result::Result::Err(__e); break; }
+                                }
+                            }
+                            __autumn_res.map(|()| __autumn_inserted)
+                        },
+                    }
                 }
             };
 
@@ -7949,7 +8262,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
                 let mut offset = 0;
                 let cols = (&new[0]).__autumn_column_count() + #tenant_extra;
-                let chunk_size = if cols == 0 { 1000 } else { (65535usize / cols).min(1000).max(1) };
+                let chunk_size = if cols == 0 { 1000 } else { (::autumn_web::repository::MAX_BIND_PARAMS / cols).min(1000).max(1) };
                 for chunk in new.chunks(chunk_size) {
                     let batch_res = ::autumn_web::__private::scoped_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                         async move {
@@ -8046,14 +8359,14 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             let vh_load_before_map_no_lock_expr = if config.tenant_scoped {
                 quote! {
                     if let ::core::option::Option::Some(t) = tenant_id {
-                        load_query.filter(#table_ident::tenant_id.eq(t)).for_update().load::<#model_name>(conn).await
+                        ::autumn_web::maybe_for_update!(load_query.filter(#table_ident::tenant_id.eq(t))).load::<#model_name>(conn).await
                     } else {
-                        load_query.for_update().load::<#model_name>(conn).await
+                        ::autumn_web::maybe_for_update!(load_query).load::<#model_name>(conn).await
                     }
                 }
             } else {
                 quote! {
-                    load_query.for_update().load::<#model_name>(conn).await
+                    ::autumn_web::maybe_for_update!(load_query).load::<#model_name>(conn).await
                 }
             };
             let vh_load_before_map_no_lock = if config.versioned {
@@ -8098,14 +8411,14 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             let load_expr = if config.tenant_scoped {
                 quote! {
                     if let ::core::option::Option::Some(t) = tenant_id {
-                        load_query.filter(#table_ident::tenant_id.eq(t)).for_update().load::<#model_name>(conn).await
+                        ::autumn_web::maybe_for_update!(load_query.filter(#table_ident::tenant_id.eq(t))).load::<#model_name>(conn).await
                     } else {
-                        load_query.for_update().load::<#model_name>(conn).await
+                        ::autumn_web::maybe_for_update!(load_query).load::<#model_name>(conn).await
                     }
                 }
             } else {
                 quote! {
-                    load_query.for_update().load::<#model_name>(conn).await
+                    ::autumn_web::maybe_for_update!(load_query).load::<#model_name>(conn).await
                 }
             };
 
@@ -8237,9 +8550,9 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             .filter(#table_ident::id.eq_any(chunk))
                             #soft_delete_filter;
                         let chunk_rows = if let ::core::option::Option::Some(t) = tenant_id {
-                            load_query.filter(#table_ident::tenant_id.eq(t)).for_update().load::<#model_name>(conn).await
+                            ::autumn_web::maybe_for_update!(load_query.filter(#table_ident::tenant_id.eq(t))).load::<#model_name>(conn).await
                         } else {
-                            load_query.for_update().load::<#model_name>(conn).await
+                            ::autumn_web::maybe_for_update!(load_query).load::<#model_name>(conn).await
                         }
                         .map_err(::autumn_web::AutumnError::from)?;
                     }
@@ -8248,7 +8561,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         let load_query = #table_ident::table
                             .filter(#table_ident::id.eq_any(chunk))
                             #soft_delete_filter;
-                        let chunk_rows = load_query.for_update().load::<#model_name>(conn).await
+                        let chunk_rows = ::autumn_web::maybe_for_update!(load_query).load::<#model_name>(conn).await
                             .map_err(::autumn_web::AutumnError::from)?;
                     }
                 };
@@ -8544,24 +8857,36 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             };
             let vh_upsert_lock_keys = if config.versioned {
                 let table_name = table_name.clone();
+                // `pg_advisory_xact_lock` is a Postgres-only function; SQLite has
+                // no equivalent and would fail at runtime. Cfg-gate the advisory
+                // lock to Postgres via `backend_select!` and skip it on SQLite:
+                // SQLite is single-writer (a write transaction locks the whole
+                // database), so the cross-connection serialization the advisory
+                // lock provides on Postgres is already guaranteed there — nothing
+                // to acquire (issue #1996, PR #2021).
                 quote! {
-                    let mut __autumn_upsert_lock_ids: Vec<_> =
-                        records.iter().map(|r| r.id).collect();
-                    __autumn_upsert_lock_ids.sort_unstable();
-                    __autumn_upsert_lock_ids.dedup();
-                    for __autumn_upsert_lock_id in __autumn_upsert_lock_ids {
-                        let __autumn_upsert_lock_key =
-                            ::autumn_web::repository::repository_upsert_advisory_lock_key(
-                                #table_name,
-                                __autumn_upsert_lock_id,
-                            );
-                        ::autumn_web::reexports::diesel::sql_query("SELECT pg_advisory_xact_lock($1)")
-                            .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(
-                                __autumn_upsert_lock_key,
-                            )
-                            .execute(conn)
-                            .await
-                            .map_err(::autumn_web::AutumnError::from)?;
+                    ::autumn_web::backend_select! {
+                        pg => {
+                            let mut __autumn_upsert_lock_ids: Vec<_> =
+                                records.iter().map(|r| r.id).collect();
+                            __autumn_upsert_lock_ids.sort_unstable();
+                            __autumn_upsert_lock_ids.dedup();
+                            for __autumn_upsert_lock_id in __autumn_upsert_lock_ids {
+                                let __autumn_upsert_lock_key =
+                                    ::autumn_web::repository::repository_upsert_advisory_lock_key(
+                                        #table_name,
+                                        __autumn_upsert_lock_id,
+                                    );
+                                ::autumn_web::reexports::diesel::sql_query("SELECT pg_advisory_xact_lock($1)")
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(
+                                        __autumn_upsert_lock_key,
+                                    )
+                                    .execute(conn)
+                                    .await
+                                    .map_err(::autumn_web::AutumnError::from)?;
+                            }
+                        },
+                        sqlite => {},
                     }
                 }
             } else {
@@ -8596,25 +8921,25 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             let load_expr = if config.tenant_scoped {
                 quote! {
                     if let ::core::option::Option::Some(ref t) = tenant_id {
-                        #table_ident::table
+                        ::autumn_web::maybe_for_update!(#table_ident::table
                             .filter(#table_ident::id.eq_any(&chunk_ids))
-                            .filter(#table_ident::tenant_id.eq(t.clone()))
-                            .for_update()
+                            .filter(#table_ident::tenant_id.eq(t.clone())))
+
                             .load::<#model_name>(conn)
                             .await
                     } else {
-                        #table_ident::table
-                            .filter(#table_ident::id.eq_any(&chunk_ids))
-                            .for_update()
+                        ::autumn_web::maybe_for_update!(#table_ident::table
+                            .filter(#table_ident::id.eq_any(&chunk_ids)))
+
                             .load::<#model_name>(conn)
                             .await
                     }
                 }
             } else {
                 quote! {
-                    #table_ident::table
-                        .filter(#table_ident::id.eq_any(&chunk_ids))
-                        .for_update()
+                    ::autumn_web::maybe_for_update!(#table_ident::table
+                        .filter(#table_ident::id.eq_any(&chunk_ids)))
+
                         .load::<#model_name>(conn)
                         .await
                 }
@@ -8681,17 +9006,17 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             .collect();
                         let __autumn_still_present: Vec<#model_name> =
                             if let ::core::option::Option::Some(ref t) = tenant_id {
-                                #table_ident::table
+                                ::autumn_web::maybe_for_update!(#table_ident::table
                                     .filter(#table_ident::id.eq_any(&__autumn_dropped_ids))
-                                    .filter(#table_ident::tenant_id.eq(t.clone()))
-                                    .for_update()
+                                    .filter(#table_ident::tenant_id.eq(t.clone())))
+
                                     .load::<#model_name>(conn)
                                     .await
                                     .map_err(::autumn_web::AutumnError::from)?
                             } else {
-                                #table_ident::table
-                                    .filter(#table_ident::id.eq_any(&__autumn_dropped_ids))
-                                    .for_update()
+                                ::autumn_web::maybe_for_update!(#table_ident::table
+                                    .filter(#table_ident::id.eq_any(&__autumn_dropped_ids)))
+
                                     .load::<#model_name>(conn)
                                     .await
                                     .map_err(::autumn_web::AutumnError::from)?
@@ -8771,7 +9096,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     async move {
                         let mut upserted = Vec::new();
                         let cols = (&records[0]).__autumn_column_count() + #tenant_extra;
-                        let chunk_size = if cols == 0 { 1000 } else { (65535usize / cols).min(1000).max(1) };
+                        let chunk_size = if cols == 0 { 1000 } else { (::autumn_web::repository::MAX_BIND_PARAMS / cols).min(1000).max(1) };
                         #vh_upsert_lock_keys
                         for chunk in records.chunks(chunk_size) {
                             let chunk_ids: Vec<_> = chunk.iter().map(|r| r.id).collect();
@@ -8920,9 +9245,9 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             quote! {
                 let __load_query = #table_ident::table.find(id) #sd_filter;
                 let #parent_record_bind = if let ::core::option::Option::Some(ref t) = tenant_id {
-                    __load_query.filter(#table_ident::tenant_id.eq(t)).for_update().first::<#model_name>(conn).await
+                    ::autumn_web::maybe_for_update!(__load_query.filter(#table_ident::tenant_id.eq(t))).first::<#model_name>(conn).await
                 } else {
-                    __load_query.for_update().first::<#model_name>(conn).await
+                    ::autumn_web::maybe_for_update!(__load_query).first::<#model_name>(conn).await
                 }
                 .optional()
                 .map_err(::autumn_web::AutumnError::from)?
@@ -8932,8 +9257,8 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
         } else {
             quote! {
-                let #parent_record_bind = #table_ident::table.find(id) #sd_filter
-                    .for_update()
+                let #parent_record_bind = ::autumn_web::maybe_for_update!(#table_ident::table.find(id) #sd_filter)
+
                     .first::<#model_name>(conn)
                     .await
                     .optional()
@@ -14750,19 +15075,31 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 // Postgres statement_timeout is a signed 32-bit integer; cap to be safe.
                 let timeout_ms = timeout_ms.min(i32::MAX as u64);
 
-                ::autumn_web::reexports::diesel::sql_query(
-                    ::std::format!("SET statement_timeout = {timeout_ms}")
-                )
-                .execute(&mut conn)
-                .await
-                .map_err(|e| {
-                    ::autumn_web::reexports::tracing::error!(
-                        "repository: failed to set statement_timeout to {timeout_ms}ms: {e}"
-                    );
-                    ::autumn_web::AutumnError::service_unavailable_msg(
-                        ::std::format!("Database initialization error: {e}")
-                    )
-                })?;
+                // `SET statement_timeout` is Postgres session syntax; SQLite
+                // rejects it ("near \"SET\": syntax error"). SQLite has no
+                // per-statement timeout SQL — the pool already installs
+                // `busy_timeout` at connection setup — so the SQLite arm skips
+                // it. A true SQLite statement timeout is a later wave (#1996).
+                ::autumn_web::backend_select! {
+                    pg => {{
+                        ::autumn_web::reexports::diesel::sql_query(
+                            ::std::format!("SET statement_timeout = {timeout_ms}")
+                        )
+                        .execute(&mut conn)
+                        .await
+                        .map_err(|e| {
+                            ::autumn_web::reexports::tracing::error!(
+                                "repository: failed to set statement_timeout to {timeout_ms}ms: {e}"
+                            );
+                            ::autumn_web::AutumnError::service_unavailable_msg(
+                                ::std::format!("Database initialization error: {e}")
+                            )
+                        })?;
+                    }},
+                    sqlite => {{
+                        let _ = timeout_ms;
+                    }},
+                }
                 ::core::result::Result::Ok(conn)
             }
 
@@ -14802,9 +15139,9 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 let mut conn = self.__autumn_acquire_conn().await?;
                 ::autumn_web::__private::scoped_transaction::<T, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                     async move {
-                        let row = #table_ident::table
-                            .find(id)
-                            .for_update()
+                        let row = ::autumn_web::maybe_for_update!(#table_ident::table
+                            .find(id))
+
                             .first::<#model_name>(conn)
                             .await
                             .optional()
@@ -16354,9 +16691,15 @@ mod tests {
             .find("MutationOp :: Delete")
             .expect("delete path should still be generated");
         let delete_generated = &generated[delete_start..];
+        // The delete path now locks the row through the `maybe_for_update!`
+        // backend seam (`FOR UPDATE` on Postgres, a plain read on `SQLite`)
+        // instead of a bare `.for_update()` chain. The lock must still be
+        // applied to the load that precedes `before_delete`.
         let delete_lock = delete_generated
-            .find(". for_update ()")
-            .expect("delete path should lock the row before before_delete");
+            .find("maybe_for_update ! (load_query)")
+            .expect(
+                "delete path should lock the row (maybe_for_update! seam) before before_delete",
+            );
         let before_delete = delete_generated
             .find("before_delete")
             .expect("before_delete hook should still be generated");
@@ -17090,8 +17433,10 @@ mod tests {
         // is already parent-soft-gated, so on a HARD parent delete it returns
         // already-soft-deleted children too; a live-only reload would return
         // `None`, skip the hard delete, and leave the FK to fail the parent
-        // DELETE. Assert the reload goes straight `find(__cid).for_update()` with
-        // no intervening `deleted_at` filter, even for a soft_delete child.
+        // DELETE. Assert the reload loads the selected id straight into the
+        // `maybe_for_update!` lock seam (`FOR UPDATE` on Postgres, a plain read
+        // on `SQLite`) with no intervening `deleted_at` filter, even for a
+        // soft_delete child.
         let generated = repository_macro(
             quote! { Comment, soft_delete, dependent(PgReplyRepository, fk = "comment_id", on_delete = destroy) },
             quote! { pub trait CommentRepository {} },
@@ -17099,9 +17444,10 @@ mod tests {
         .to_string();
         let destroy_arm = dependent_destroy_arm(&generated);
         assert!(
-            destroy_arm.contains("find (__cid) . for_update"),
-            "the per-ID reload must load the selected id straight to for_update, \
-             with no deleted_at filter that could drop a pre-soft-deleted child: {destroy_arm}"
+            destroy_arm.contains("maybe_for_update ! (comments :: table . find (__cid))"),
+            "the per-ID reload must load the selected id straight into the \
+             maybe_for_update! lock wrapper, with no deleted_at filter that could \
+             drop a pre-soft-deleted child: {destroy_arm}"
         );
     }
 
@@ -17277,8 +17623,15 @@ mod tests {
         // through to a raw FK error (or a soft delete proceeds despite a live
         // restrict dependent). Holding `FOR UPDATE` on the child row blocks the
         // concurrent grandchild insert's `FOR KEY SHARE` on that referenced row,
-        // closing the TOCTOU window between probe and hook/delete. Structurally:
-        // the `SELECT id ... ORDER BY id FOR UPDATE` id query must precede the
+        // closing the TOCTOU window between probe and hook/delete.
+        //
+        // The child-id SELECT now appends a backend-gated lock suffix rather than
+        // a hard-coded `FOR UPDATE`: `... ORDER BY id{}` where the `{}` binding
+        // (`__for_update`) is `" FOR UPDATE"` on Postgres and `""` on `SQLite`
+        // (which rejects `SELECT … FOR UPDATE`), selected in autumn-web's
+        // compilation via `backend_select!`. The Postgres SQL is byte-identical to
+        // before. Structurally: the backend-gated `FOR UPDATE` lock must still be
+        // applied to the `SELECT id ... ORDER BY id` query, which must precede the
         // `for __row in & __ids` pre-scan loop.
         let generated = repository_macro(
             quote! {
@@ -17291,10 +17644,17 @@ mod tests {
         )
         .to_string();
         let destroy_arm = dependent_destroy_arm(&generated);
-        // The child-id selection SQL literal must acquire the row lock.
-        let id_lock_pos = destroy_arm.find("ORDER BY id FOR UPDATE").expect(
-            "Codex P2: the child-id selection feeding the restrict pre-scan must \
-             acquire FOR UPDATE (SELECT id ... ORDER BY id FOR UPDATE)",
+        // The Postgres arm of the backend-gated lock suffix must still emit
+        // `FOR UPDATE`, bound into the child-id SELECT's `ORDER BY id{}` clause.
+        let pg_lock_pos = destroy_arm
+            .find("backend_select ! { pg => { \" FOR UPDATE\" } , sqlite => { \"\" } , }")
+            .expect(
+                "Codex P2: the child-id selection feeding the restrict pre-scan must \
+                 acquire FOR UPDATE on Postgres via the backend_select! lock seam",
+            );
+        let ordered_lock_pos = destroy_arm.find("ORDER BY id{}").expect(
+            "Codex P2: the child-id SELECT must append the backend-gated lock \
+             suffix to its ORDER BY id clause (SELECT id ... ORDER BY id{})",
         );
         let id_select_pos = destroy_arm
             .find("SELECT id FROM")
@@ -17302,12 +17662,16 @@ mod tests {
         let prescan_pos = destroy_arm
             .find("for __row in & __ids")
             .expect("the restrict pre-scan loop must be emitted");
+        // The backend-gated FOR UPDATE lock belongs to the child-id SELECT: the
+        // `__for_update` suffix binding is emitted just before the `format!`, and
+        // the `ORDER BY id{}` clause consumes it in the same query.
         assert!(
-            id_select_pos <= id_lock_pos,
-            "Codex P2: FOR UPDATE must belong to the child-id SELECT: {destroy_arm}"
+            pg_lock_pos < id_select_pos && id_select_pos < ordered_lock_pos,
+            "Codex P2: the backend-gated FOR UPDATE lock must belong to the child-id \
+             SELECT (ORDER BY id{{}} suffix): {destroy_arm}"
         );
         assert!(
-            id_lock_pos < prescan_pos,
+            id_select_pos < prescan_pos && ordered_lock_pos < prescan_pos,
             "Codex P2: the locked child-id SELECT must run BEFORE the restrict \
              pre-scan EXISTS pass so no FK insert can slip between probe and hook: \
              {destroy_arm}"
@@ -18436,13 +18800,19 @@ mod tests {
         )
         .to_string();
 
+        // The versioned-update load was reshaped: a single `load_query` is now
+        // declared once, and the no-expected-version arm is the `else` branch that
+        // loads the before image through the `maybe_for_update!` lock seam
+        // (`FOR UPDATE` on Postgres, a plain read on `SQLite`) instead of a bare
+        // `.for_update()` chain. That branch must still lock the row before the
+        // history diff (`INSERT INTO _autumn_version_history`) is computed.
         let no_expected_branch = generated
-            .find("} else { load_query")
+            .find("} else { :: autumn_web :: maybe_for_update ! (load_query)")
             .expect("versioned update should have a no-expected-version load branch");
         let section = &generated[no_expected_branch..];
         let lock_pos = section
-            .find(". for_update ()")
-            .expect("versioned update must lock the row before computing history diff");
+            .find("maybe_for_update ! (load_query)")
+            .expect("versioned update must lock the row (maybe_for_update! seam) before computing history diff");
         let first_pos = section
             .find(". first :: < Post >")
             .expect("versioned update should load the row before applying the update");
@@ -18452,7 +18822,7 @@ mod tests {
 
         assert!(
             lock_pos < first_pos && first_pos < history_pos,
-            "versioned update must SELECT FOR UPDATE before loading the before image and writing history: {section}"
+            "versioned update must lock (maybe_for_update! → FOR UPDATE on Postgres) before loading the before image and writing history: {section}"
         );
     }
 
@@ -18510,6 +18880,42 @@ mod tests {
         assert!(
             generated.contains("records . iter () . map (| r | r . id)"),
             "versioned upsert_many lock set must be collected from all input records, not the current chunk: {generated}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_versioned_upsert_many_gates_advisory_lock_to_postgres_only() {
+        // Bug 1 (#1996, PR #2021): `pg_advisory_xact_lock` is a Postgres-only
+        // function; emitting it unconditionally made versioned `upsert_many` fail
+        // at runtime on SQLite. The advisory-lock acquisition must now sit inside
+        // a `backend_select!` whose `pg` arm holds it and whose `sqlite` arm is
+        // empty — SQLite is single-writer, so the serialization is already
+        // guaranteed and nothing must be acquired.
+        let generated = repository_macro(
+            quote! { Post, versioned = true },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        let select_pos = generated
+            .find("backend_select")
+            .expect("versioned upsert_many must wrap the advisory lock in a backend_select!");
+        let lock_pos = generated
+            .find("pg_advisory_xact_lock")
+            .expect("versioned upsert_many must still acquire the advisory lock on Postgres");
+        assert!(
+            select_pos < lock_pos,
+            "the advisory lock must be emitted inside the backend_select! (pg arm), not before it: {generated}"
+        );
+        // The `pg =>` selector must precede the advisory lock, proving it lives in
+        // the Postgres arm (skipped on SQLite where the arm is empty).
+        let pg_arm_pos = generated[select_pos..]
+            .find("pg =>")
+            .map(|p| select_pos + p)
+            .expect("backend_select! must have a pg arm");
+        assert!(
+            pg_arm_pos < lock_pos,
+            "pg_advisory_xact_lock must be inside the `pg =>` arm of the backend_select!: {generated}"
         );
     }
 
