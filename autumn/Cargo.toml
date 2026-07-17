@@ -502,6 +502,14 @@ path = "tests/state_machine_on_commit.rs"
 name = "state_machine_on"
 path = "tests/state_machine_on.rs"
 
+# Issue #1973: `lifecycle = <Enum>` + binding-site `effects(...)` per-edge
+# effects converged onto the shared connection-taking method — pure validation +
+# compile-time type-check of the generated method. No DB connection, runs
+# without Docker. Isolated so it is cheap to compile/run alone.
+[[test]]
+name = "state_machine_lifecycle_effects"
+path = "tests/state_machine_lifecycle_effects.rs"
+
 [[test]]
 name = "repository_shard_replica_routing"
 path = "tests/repository_shard_replica_routing.rs"

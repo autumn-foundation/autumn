@@ -245,6 +245,12 @@ fn compile_pass_tests() {
     #[cfg(feature = "db")]
     t.pass("tests/compile-pass/model_state_machine_on.rs");
 
+    // Issue #1973: `lifecycle = <Enum>` + binding-site `effects(...)` per-edge
+    // effects converge onto the shared connection-taking method; the transition
+    // table still comes from the enum.
+    #[cfg(feature = "db")]
+    t.pass("tests/compile-pass/model_state_machine_lifecycle_effects.rs");
+
     // Soft delete (requires db feature)
     #[cfg(feature = "db")]
     t.pass("tests/compile-pass/repository_soft_delete.rs");

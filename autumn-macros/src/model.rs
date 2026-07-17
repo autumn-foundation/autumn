@@ -2747,14 +2747,17 @@ struct StateMachineTransition {
     /// Optional guard: name of a `&self` bool method that must return `true`.
     guard: Option<String>,
     /// Optional after-commit effect (issue #1973): the path of a `#[job]`
-    /// struct to enqueue transactionally when this specific edge fires. Only
-    /// meaningful for inline `transitions(...)` machines — lifecycle-derived
-    /// tables carry no effects.
+    /// struct to enqueue transactionally when this specific edge fires.
+    /// Declarable on both the inline `transitions(...)` path and the
+    /// `lifecycle = <Enum>` path's `effects(...)` clause (issue #1973); both
+    /// route through the same effect codegen.
     on_commit: Option<syn::Path>,
     /// Optional sync in-transaction effect (issue #1973): the name of an
     /// `async fn(&self, conn) -> AutumnResult<()>` method run inside the
     /// transition's transaction when this edge fires. `Err` rolls the
-    /// transition back (mirrors `before_*` mutation hooks). Inline-only.
+    /// transition back (mirrors `before_*` mutation hooks). Declarable on both
+    /// the inline `transitions(...)` path and the `lifecycle = <Enum>` path's
+    /// `effects(...)` clause.
     on: Option<String>,
 }
 
@@ -2766,7 +2769,13 @@ enum StateMachineSource {
     Inline(Vec<StateMachineTransition>),
     /// `#[state_machine(lifecycle = SomeEnum)]` — transitions derived from the
     /// referenced `#[lifecycle]` enum's `Lifecycle::STATE_MACHINE_TRANSITIONS`.
-    Lifecycle(syn::Path),
+    Lifecycle {
+        path: syn::Path,
+        /// Per-edge effects declared at the binding site via `effects(...)`.
+        /// Empty when no clause is present (byte-identical to pre-#1973). Guards
+        /// are rejected here — lifecycle transitions are unguarded.
+        effects: Vec<StateMachineTransition>,
+    },
 }
 
 /// Parsed `#[state_machine(...)]` spec for one field.
@@ -2900,7 +2909,42 @@ fn parse_state_machine_source(
     } else if key == "lifecycle" {
         input.parse::<syn::Token![=]>()?;
         let path: syn::Path = input.parse()?;
-        Ok(StateMachineSource::Lifecycle(path))
+        // Optionally consume a trailing `, effects(...)` clause declaring
+        // per-edge effects at the binding site (issue #1973). Absent → no
+        // effects (byte-identical to a plain `lifecycle = <Enum>`).
+        let effects: Vec<StateMachineTransition> = if input.peek(syn::Token![,]) {
+            input.parse::<syn::Token![,]>()?;
+            let effects_kw: syn::Ident = input.parse()?;
+            if effects_kw != "effects" {
+                return Err(syn::Error::new(
+                    effects_kw.span(),
+                    "expected `effects(...)` after `lifecycle = <Enum>`",
+                ));
+            }
+            let content;
+            syn::parenthesized!(content in input);
+            let parsed = parse_transition_list(&content)?;
+            // Reject guards + require at least one effect per edge.
+            for t in &parsed {
+                if t.guard.is_some() {
+                    return Err(syn::Error::new(
+                        effects_kw.span(),
+                        "guards are not supported on `lifecycle = <Enum>` effects; \
+                         lifecycle transitions are unguarded (declare effects only)",
+                    ));
+                }
+                if t.on.is_none() && t.on_commit.is_none() {
+                    return Err(syn::Error::new(
+                        effects_kw.span(),
+                        "each `effects(...)` edge must declare `on = \"...\"` and/or `on_commit = <Job>`",
+                    ));
+                }
+            }
+            parsed
+        } else {
+            Vec::new()
+        };
+        Ok(StateMachineSource::Lifecycle { path, effects })
     } else {
         Err(syn::Error::new(
             key.span(),
@@ -2990,8 +3034,8 @@ fn emit_state_machine_impl(
         StateMachineSource::Inline(transitions) => {
             emit_state_machine_inline(model_name, &spec.field_ident, transitions, pk_ident)
         }
-        StateMachineSource::Lifecycle(path) => {
-            emit_state_machine_lifecycle(model_name, &spec.field_ident, path)
+        StateMachineSource::Lifecycle { path, effects } => {
+            emit_state_machine_lifecycle(model_name, &spec.field_ident, path, effects, pk_ident)
         }
     }
 }
@@ -3227,10 +3271,19 @@ fn emit_state_machine_on_conn(
 /// predicate requires the guard slot to be absent — guards remain an
 /// inline-only shorthand feature (see the `Lifecycle` trait docs for the
 /// rationale).
+///
+/// Per-edge effects (a sync `on = "handler"` and/or an `on_commit = <Job>`)
+/// declared at the binding site via `effects(...)` (issue #1973) route through
+/// the shared [`emit_state_machine_on_conn`], so the lifecycle path emits the
+/// identical `transition_{field}_to_on_conn` method as the inline path. When
+/// `effects` is empty the helper returns an empty token stream, keeping the
+/// lifecycle codegen byte-for-byte identical to before.
 fn emit_state_machine_lifecycle(
     model_name: &syn::Ident,
     field: &syn::Ident,
     path: &syn::Path,
+    effects: &[StateMachineTransition],
+    pk_ident: Option<&syn::Ident>,
 ) -> TokenStream {
     let StateMachineNames {
         const_name,
@@ -3238,6 +3291,18 @@ fn emit_state_machine_lifecycle(
         transition_fn,
         field_str,
     } = state_machine_names(field);
+
+    // Per-edge effect method (issue #1973): only emitted when the binding site
+    // declares one or more `effects(...)` edges. Empty `effects` returns an
+    // empty token stream, so a plain `lifecycle = <Enum>` is unchanged.
+    let on_conn_impl = emit_state_machine_on_conn(
+        model_name,
+        field,
+        &field_str,
+        &transition_fn,
+        effects,
+        pk_ident,
+    );
 
     quote! {
         impl #model_name {
@@ -3275,6 +3340,8 @@ fn emit_state_machine_lifecycle(
                 }
             }
         }
+
+        #on_conn_impl
     }
 }
 
@@ -8614,6 +8681,200 @@ mod tests {
         assert!(
             generated.contains("only supported on `String` fields"),
             "lifecycle SM on a non-String field must be rejected: {generated}"
+        );
+    }
+
+    // ── lifecycle `effects(...)` per-edge effects (#1973) ─────────────────────
+
+    #[test]
+    fn state_machine_lifecycle_with_effects_emits_on_conn_method() {
+        // An `effects(...)` clause routes the lifecycle path through the shared
+        // `_on_conn` emitter: the connection-taking method is emitted, keyed on
+        // the fired edge, and enqueues the named job.
+        let output = model_macro(
+            TokenStream::new(),
+            quote! {
+                pub struct Order {
+                    #[id]
+                    pub id: i64,
+                    #[state_machine(lifecycle = OrderState, effects(
+                        processing -> shipped: on_commit = SendShippedEmailJob,
+                    ))]
+                    pub status: String,
+                }
+            },
+        );
+        let generated = output.to_string();
+        assert!(
+            generated.contains("transition_status_to_on_conn"),
+            "a lifecycle `effects` edge must emit the connection-taking method: {generated}"
+        );
+        // The const still aliases the enum's trait table (transitions come from
+        // the enum, effects come from the binding site).
+        assert!(
+            generated.contains(
+                "< OrderState as :: autumn_web :: Lifecycle > :: STATE_MACHINE_TRANSITIONS"
+            ),
+            "lifecycle `effects` must not replace the enum-derived transition table: {generated}"
+        );
+        assert!(
+            generated.contains("enqueue_on_conn")
+                && generated.contains("< SendShippedEmailJob > :: NAME"),
+            "the effect must enqueue the named job on the connection: {generated}"
+        );
+        assert!(
+            generated.contains("(\"processing\" , \"shipped\")"),
+            "the effect arm must match the fired edge: {generated}"
+        );
+    }
+
+    #[test]
+    fn state_machine_lifecycle_without_effects_emits_no_on_conn_method() {
+        // A plain `lifecycle = <Enum>` (no `effects(...)`) is byte-for-byte
+        // unchanged: no `_on_conn` method and no after-commit effect codegen.
+        let output = model_macro(
+            TokenStream::new(),
+            quote! {
+                pub struct Order {
+                    #[id]
+                    pub id: i64,
+                    #[state_machine(lifecycle = OrderState)]
+                    pub status: String,
+                }
+            },
+        );
+        let generated = output.to_string();
+        assert!(
+            !generated.contains("transition_status_to_on_conn"),
+            "a lifecycle SM with no `effects` must not emit the `_on_conn` method: {generated}"
+        );
+        assert!(
+            !generated.contains("enqueue_on_conn"),
+            "a lifecycle SM with no `effects` must not emit after-commit effect codegen: {generated}"
+        );
+    }
+
+    #[test]
+    fn state_machine_lifecycle_effects_sync_on_emits_handler_call() {
+        // An `on = "handler"` effect edge emits the in-transaction handler call
+        // and, being `on`-only, no after-commit enqueue.
+        let output = model_macro(
+            TokenStream::new(),
+            quote! {
+                pub struct Order {
+                    #[id]
+                    pub id: i64,
+                    #[state_machine(lifecycle = OrderState, effects(
+                        shipped -> archived: on = "audit",
+                    ))]
+                    pub status: String,
+                }
+            },
+        );
+        let generated = output.to_string();
+        assert!(
+            generated.contains("transition_status_to_on_conn"),
+            "a lifecycle `on` effect edge must emit the connection-taking method: {generated}"
+        );
+        assert!(
+            generated.contains("self . audit (conn) . await ?"),
+            "the `on` effect must call its handler in-transaction: {generated}"
+        );
+        assert!(
+            !generated.contains("enqueue_on_conn"),
+            "an `on`-only lifecycle effect must not emit after-commit codegen: {generated}"
+        );
+    }
+
+    #[test]
+    fn state_machine_lifecycle_effects_guard_is_rejected() {
+        // Guards are meaningless on lifecycle edges (the runtime table validator
+        // ignores them), so declaring one on an `effects(...)` edge is an error.
+        let output = model_macro(
+            TokenStream::new(),
+            quote! {
+                pub struct Order {
+                    #[id]
+                    pub id: i64,
+                    #[state_machine(lifecycle = OrderState, effects(
+                        processing -> shipped: guard = "can_ship",
+                    ))]
+                    pub status: String,
+                }
+            },
+        );
+        let generated = output.to_string();
+        assert!(
+            generated.contains("compile_error"),
+            "a guard on a lifecycle `effects` edge must be rejected: {generated}"
+        );
+        assert!(
+            generated.contains("guards are not supported"),
+            "the rejection must mention guards not being supported: {generated}"
+        );
+    }
+
+    #[test]
+    fn state_machine_lifecycle_effects_empty_edge_is_rejected() {
+        // An `effects(...)` edge with neither `on` nor `on_commit` is pointless
+        // and rejected — declare it in the enum's transition table instead.
+        let output = model_macro(
+            TokenStream::new(),
+            quote! {
+                pub struct Order {
+                    #[id]
+                    pub id: i64,
+                    #[state_machine(lifecycle = OrderState, effects(
+                        processing -> shipped,
+                    ))]
+                    pub status: String,
+                }
+            },
+        );
+        let generated = output.to_string();
+        assert!(
+            generated.contains("compile_error"),
+            "an effect-less `effects` edge must be rejected: {generated}"
+        );
+        assert!(
+            generated.contains("must declare `on"),
+            "the rejection must require an `on`/`on_commit` effect: {generated}"
+        );
+    }
+
+    #[test]
+    fn state_machine_lifecycle_effects_derive_idempotency_key() {
+        // The lifecycle path reuses the identical idempotency-key derivation as
+        // the inline path: model:field:record_id:from:to.
+        let output = model_macro(
+            TokenStream::new(),
+            quote! {
+                pub struct Order {
+                    #[id]
+                    pub id: i64,
+                    #[state_machine(lifecycle = OrderState, effects(
+                        processing -> shipped: on_commit = SendShippedEmailJob,
+                    ))]
+                    pub status: String,
+                }
+            },
+        );
+        let generated = output.to_string();
+        assert!(
+            generated.contains("idempotency_key"),
+            "the effect must carry a derived idempotency key: {generated}"
+        );
+        assert!(
+            generated.contains("\"{}:{}:{}:{}:{}\""),
+            "the idempotency key must combine model/field/record_id/from/to: {generated}"
+        );
+        assert!(
+            generated.contains("\"Order\"") && generated.contains("\"status\""),
+            "the key must embed the model and field names: {generated}"
+        );
+        assert!(
+            generated.contains("self . id"),
+            "the record id must come from the primary key: {generated}"
         );
     }
 
