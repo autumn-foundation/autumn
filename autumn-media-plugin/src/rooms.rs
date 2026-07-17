@@ -28,6 +28,21 @@
 //! namespace resolves to [`RoomError::RoomNotFound`], never another namespace's
 //! room.
 //!
+//! # Security & host responsibilities
+//!
+//! The room signaling router ([`room_router`]) ships **no built-in
+//! authentication or rate limiting** on create/join in this slice — `POST
+//! {prefix}/rooms` and `POST {prefix}/rooms/{room_id}/join` are open. It
+//! therefore **MUST be mounted behind the host application's auth / rate-limit
+//! middleware**; the plugin does not gate who may create or join a room. As a
+//! defense-in-depth backstop against unbounded memory growth from a create loop
+//! (a created-but-never-joined room is only reaped when its last participant
+//! leaves), [`InMemoryRoomStore`] caps the registry at [`MAX_ROOMS`] rooms and
+//! rejects further creation with [`RoomError::RegistryFull`] (mapped to a
+//! transient `503`). Empty/idle-room reaping remains recorded future work (see
+//! *Known limitations*) — the cap is a backstop, not a substitute for the host
+//! auth/rate-limit layer.
+//!
 //! # Operator requirements
 //!
 //! - **`MediaMTX` path matcher**: this crate ships no `mediamtx.yml` (the
@@ -231,6 +246,16 @@ pub enum RoomError {
         /// The hard cap.
         cap: usize,
     },
+
+    /// The in-memory room registry is at its capacity backstop of [`MAX_ROOMS`]
+    /// rooms, so no new room can be created right now. A transient overload
+    /// condition, not a client error — mapped to a `503`. The message names no
+    /// internals beyond the cap.
+    #[error("room registry is at capacity ({max} rooms); try again later")]
+    RegistryFull {
+        /// The registry capacity that was reached.
+        max: usize,
+    },
 }
 
 impl RoomError {
@@ -250,6 +275,9 @@ impl RoomError {
             }
             // A full room is a genuine conflict (409), distinct from a bad request.
             Self::RoomFull { .. } => AutumnError::conflict_msg(self.to_string()),
+            // A full registry is a transient overload condition (503), not a
+            // client error — the caller can retry once rooms drain.
+            Self::RegistryFull { .. } => AutumnError::service_unavailable_msg(self.to_string()),
             Self::Unauthorized => AutumnError::unauthorized_msg(self.to_string()),
             Self::InvalidSegment { .. } | Self::InvalidMaxParticipants { .. } => {
                 AutumnError::bad_request_msg(self.to_string())
@@ -449,13 +477,27 @@ pub trait RoomStore: Send + Sync {
     ) -> Result<RoomSnapshot, RoomError>;
 }
 
+/// Capacity backstop on the number of rooms an [`InMemoryRoomStore`] holds.
+///
+/// `rooms_create` is unauthenticated in this slice and a created-but-never-joined
+/// room is only reaped when its last participant leaves, so an unbounded create
+/// loop would grow process memory for the lifetime of the process. This cap is a
+/// defense-in-depth backstop against that (mirroring the workspace's
+/// `MAX_BUCKETS` capacity-cap idiom for in-memory registries), **not** a
+/// substitute for the host app's auth / rate-limit middleware — see the
+/// module-level *Security & host responsibilities* note.
+pub const MAX_ROOMS: usize = 10_000;
+
 /// A single-process, in-memory [`RoomStore`].
 ///
 /// Keyed on `(namespace, room_id)` under one `RwLock`. When the last
 /// participant leaves a room, the room is dropped so an idle room never lingers.
+/// The registry is capped at `max_rooms` (default [`MAX_ROOMS`]) as a
+/// memory-growth backstop.
 pub struct InMemoryRoomStore {
     rooms: RwLock<HashMap<(String, String), Room>>,
     hard_cap: usize,
+    max_rooms: usize,
 }
 
 impl InMemoryRoomStore {
@@ -466,13 +508,25 @@ impl InMemoryRoomStore {
     /// [`DEFAULT_ROOM_MAX_PARTICIPANTS`](crate::config::DEFAULT_ROOM_MAX_PARTICIPANTS)
     /// (6, no SFU) regardless of `hard_cap`, so with a larger `hard_cap`
     /// [`create_room`](RoomStore::create_room) still rejects any request above 6
-    /// as a backstop.
+    /// as a backstop. The registry-size cap defaults to [`MAX_ROOMS`]; override
+    /// it with [`with_max_rooms`](Self::with_max_rooms).
     #[must_use]
     pub fn new(hard_cap: usize) -> Self {
         Self {
             rooms: RwLock::new(HashMap::new()),
             hard_cap,
+            max_rooms: MAX_ROOMS,
         }
+    }
+
+    /// Override the registry-size backstop (the maximum number of rooms the
+    /// store holds before [`create_room`](RoomStore::create_room) rejects with
+    /// [`RoomError::RegistryFull`]). Chiefly for tests that need a tiny cap
+    /// without allocating [`MAX_ROOMS`] rooms.
+    #[must_use]
+    pub const fn with_max_rooms(mut self, max_rooms: usize) -> Self {
+        self.max_rooms = max_rooms;
+        self
     }
 }
 
@@ -512,10 +566,19 @@ impl RoomStore for InMemoryRoomStore {
             participants: HashMap::new(),
         };
         let snapshot = room.snapshot();
-        self.rooms
-            .write()
-            .expect("room store lock poisoned")
-            .insert((namespace.to_owned(), id), room);
+        let mut rooms = self.rooms.write().expect("room store lock poisoned");
+        // Registry capacity backstop: reject once the store is at `max_rooms`
+        // rooms (checked under the write lock, so no create can race past it).
+        // The signaling router is unauthenticated in this slice, so this guards
+        // against unbounded memory growth from a create loop — a transient 503,
+        // not a client error.
+        if rooms.len() >= self.max_rooms {
+            return Err(RoomError::RegistryFull {
+                max: self.max_rooms,
+            });
+        }
+        rooms.insert((namespace.to_owned(), id), room);
+        drop(rooms);
         Ok(snapshot)
     }
 
@@ -1094,6 +1157,13 @@ mod tests {
             .status(),
             StatusCode::BAD_REQUEST
         );
+        // A full registry is a transient overload → 503, not a client error.
+        assert_eq!(
+            RoomError::RegistryFull { max: 10_000 }
+                .into_autumn()
+                .status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
     }
 
     // ── Session token ────────────────────────────────────────────────────────
@@ -1180,6 +1250,23 @@ mod tests {
         ));
         // A within-ceiling value still works, capped at the absolute 6.
         assert_eq!(store.create_room("", 6).unwrap().max_participants, 6);
+    }
+
+    #[test]
+    fn create_room_rejects_once_registry_is_at_capacity() {
+        // Inject a tiny registry cap so we can trip it without allocating
+        // MAX_ROOMS rooms: two creates succeed, the third is RegistryFull.
+        let store = InMemoryRoomStore::new(6).with_max_rooms(2);
+        assert!(store.create_room("", 4).is_ok());
+        assert!(store.create_room("", 4).is_ok());
+        assert!(matches!(
+            store.create_room("", 4),
+            Err(RoomError::RegistryFull { max: 2 })
+        ));
+
+        // The default cap is the MAX_ROOMS backstop — an ordinary store never
+        // trips it under a normal number of rooms.
+        assert_eq!(super::MAX_ROOMS, 10_000);
     }
 
     // ── Join / mesh URLs / cap enforcement ───────────────────────────────────

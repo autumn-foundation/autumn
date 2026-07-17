@@ -49,7 +49,7 @@ pub mod workflows;
 
 pub use config::{
     MediaConfig, MediaConfigError, MediaMtxConfig, MediaStorageBackend, MediaStorageConfig,
-    RecordingConfig, RoomConfig,
+    RecordingConfig,
 };
 pub use encode::{
     FfmpegClipTailCommand, FfmpegHighlightCommand, FfmpegLiveThumbnailCommand, FfmpegPosterCommand,
@@ -104,9 +104,9 @@ pub mod prelude {
         newest_recording_files_since, recording_segments_covering_window, slugify,
     };
     pub use crate::{
-        InMemoryRoomStore, JoinRecord, JoinResponse, ParticipantView, RoomConfig, RoomError,
-        RoomService, RoomSnapshot, RoomStore, SessionToken, room_participant_path,
-        room_route_infos, room_router, validate_room_segment,
+        InMemoryRoomStore, JoinRecord, JoinResponse, ParticipantView, RoomError, RoomService,
+        RoomSnapshot, RoomStore, SessionToken, room_participant_path, room_route_infos,
+        room_router, validate_room_segment,
     };
     pub use crate::{
         IngestStatus, MediaMtxClient, MediaUrls, StreamQualityStats, StreamStatus, ViewerCount,
@@ -238,10 +238,10 @@ impl MediaPlugin {
     /// after [`Plugin::build`] runs; resolve it up front with
     /// [`MediaConfig::from_autumn_toml`](config::MediaConfig::from_autumn_toml)
     /// or [`MediaConfig::from_arroyo_env`](config::MediaConfig::from_arroyo_env)
-    /// and pass it here. Adopts the config's `rooms.max_participants`.
+    /// and pass it here. Adopts the config's `room_max_participants`.
     #[must_use]
     pub fn config(mut self, config: MediaConfig) -> Self {
-        self.room_max_participants = config.rooms.max_participants;
+        self.room_max_participants = config.room_max_participants;
         self.config = config;
         self
     }
@@ -268,18 +268,18 @@ impl MediaPlugin {
     }
 
     /// Override the mesh-room session-token lifetime, in seconds (shortcut for
-    /// `config.rooms.token_ttl_seconds`).
+    /// `config.room_token_ttl_seconds`).
     #[must_use]
     pub const fn room_token_ttl_seconds(mut self, seconds: u32) -> Self {
-        self.config.rooms.token_ttl_seconds = seconds;
+        self.config.room_token_ttl_seconds = seconds;
         self
     }
 
     /// Override the mesh-room `MediaMTX` path namespace (shortcut for
-    /// `config.rooms.namespace`).
+    /// `config.room_namespace`).
     #[must_use]
     pub fn room_namespace(mut self, namespace: impl Into<String>) -> Self {
-        self.config.rooms.namespace = Some(namespace.into());
+        self.config.room_namespace = Some(namespace.into());
         self
     }
 
@@ -381,7 +381,7 @@ impl Plugin for MediaPlugin {
         let retention_days = retention_days.unwrap_or(config.recording.retention_days);
 
         // The mesh is O(N²), so `DEFAULT_ROOM_MAX_PARTICIPANTS` (6) is an
-        // ABSOLUTE ceiling with no SFU: the `[media.rooms]` config and the
+        // ABSOLUTE ceiling with no SFU: the `[media]` room config and the
         // `room_max_participants` builder may set a per-room seat count only
         // within `1..=6`. An out-of-range value (0 or >6) is a fatal
         // misconfiguration — fail fast and LOUD at boot, never a silent clamp.
@@ -390,7 +390,7 @@ impl Plugin for MediaPlugin {
         // boot with `process::exit(1)` exactly as a failed init would (see
         // autumn-web's `run_startup_hooks`). `room_max_participants` is the
         // effective seat count sourced from either `config(..)` (which copies
-        // `rooms.max_participants` into it) or the `room_max_participants(..)`
+        // `room_max_participants` into it) or the `room_max_participants(..)`
         // builder, so this single check covers both the TOML and builder paths;
         // `InMemoryRoomStore::create_room` re-checks the fixed 6 ceiling as a
         // defense-in-depth backstop, and `MediaConfig::validate` stays the
@@ -432,8 +432,8 @@ impl Plugin for MediaPlugin {
             let room_service = rooms::RoomService::new(
                 Arc::new(rooms::InMemoryRoomStore::new(room_max_participants)),
                 transport::MediaUrls::from_config(&config.mediamtx),
-                config.rooms.namespace.clone().unwrap_or_default(),
-                chrono::Duration::seconds(i64::from(config.rooms.token_ttl_seconds)),
+                config.room_namespace.clone().unwrap_or_default(),
+                chrono::Duration::seconds(i64::from(config.room_token_ttl_seconds)),
                 room_max_participants,
             );
             app = app
@@ -692,10 +692,12 @@ mod room_cap_tests {
         assert_eq!(ok.room_max_participants, 4);
         assert!(room_max_participants_error(ok.room_max_participants).is_none());
 
-        // The `[media.rooms] max_participants = 50` config path flows into the
+        // The `[media] room_max_participants = 50` config path flows into the
         // same effective field via `config(..)`, so it is rejected identically.
-        let mut config = MediaConfig::default();
-        config.rooms.max_participants = 50;
+        let config = MediaConfig {
+            room_max_participants: 50,
+            ..MediaConfig::default()
+        };
         let from_config = MediaPlugin::new().config(config);
         assert_eq!(from_config.room_max_participants, 50);
         assert!(room_max_participants_error(from_config.room_max_participants).is_some());

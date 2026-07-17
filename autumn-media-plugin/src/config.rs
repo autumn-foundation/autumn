@@ -11,9 +11,10 @@
 //! [`Plugin::build`]: autumn_web::plugin::Plugin::build
 //!
 //! ```toml
-//! [media.rooms]
-//! max_participants = 6
-//! token_ttl_seconds = 300
+//! [media]
+//! room_max_participants = 6
+//! room_token_ttl_seconds = 300
+//! # room_namespace = "tenant-a"   # optional MediaMTX path namespace
 //!
 //! [media.mediamtx]
 //! api_base = "http://127.0.0.1:9997"
@@ -101,10 +102,10 @@ pub enum MediaConfigError {
          media.storage.secret_access_key must both be set, or neither"
     )]
     MissingS3Credential,
-    /// `[media.rooms].max_participants` was `0` or exceeded the hard cap of
+    /// `[media].room_max_participants` was `0` or exceeded the hard cap of
     /// [`DEFAULT_ROOM_MAX_PARTICIPANTS`] (mesh rooms have no SFU).
     #[error(
-        "media.rooms.max_participants must be between 1 and {cap} (mesh rooms have no SFU), got {requested}"
+        "media.room_max_participants must be between 1 and {cap} (mesh rooms have no SFU), got {requested}"
     )]
     InvalidRoomMaxParticipants {
         /// The rejected value.
@@ -320,37 +321,15 @@ impl Default for RecordingConfig {
     }
 }
 
-/// Mesh-room (`[media.rooms]`) settings.
+/// The full `[media]` configuration surface.
 ///
-/// Rooms are small mesh calls with **no SFU**, so `max_participants` is capped
-/// at [`DEFAULT_ROOM_MAX_PARTICIPANTS`]; a joining participant is issued a
-/// session token that stays valid for `token_ttl_seconds`, and `namespace`
+/// The mesh-room knobs are flat `[media]` keys (`room_max_participants`,
+/// `room_token_ttl_seconds`, `room_namespace`): rooms are small mesh calls with
+/// **no SFU**, so `room_max_participants` is capped at
+/// [`DEFAULT_ROOM_MAX_PARTICIPANTS`]; a joining participant is issued a session
+/// token that stays valid for `room_token_ttl_seconds`, and `room_namespace`
 /// optionally isolates one deployment's room paths from another's.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
-pub struct RoomConfig {
-    /// Hard cap on participants in one mesh room (must be `1..=`
-    /// [`DEFAULT_ROOM_MAX_PARTICIPANTS`]).
-    pub max_participants: usize,
-    /// Seconds a minted room session token stays valid after a join.
-    pub token_ttl_seconds: u32,
-    /// Optional `MediaMTX` path namespace isolating this deployment's rooms
-    /// (empty / `None` inserts no namespace segment).
-    pub namespace: Option<String>,
-}
-
-impl Default for RoomConfig {
-    fn default() -> Self {
-        Self {
-            max_participants: default_room_max_participants(),
-            token_ttl_seconds: default_room_token_ttl_seconds(),
-            namespace: None,
-        }
-    }
-}
-
-/// The full `[media]` configuration surface.
-#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct MediaConfig {
     /// `MediaMTX` origin URLs.
@@ -361,8 +340,31 @@ pub struct MediaConfig {
     pub storage: MediaStorageConfig,
     /// Recording retention policy.
     pub recording: RecordingConfig,
-    /// Mesh-room settings.
-    pub rooms: RoomConfig,
+    /// Hard cap on participants in one mesh room (must be `1..=`
+    /// [`DEFAULT_ROOM_MAX_PARTICIPANTS`]; mesh, no SFU).
+    #[serde(default = "default_room_max_participants")]
+    pub room_max_participants: usize,
+    /// Seconds a minted room session token stays valid after a join.
+    #[serde(default = "default_room_token_ttl_seconds")]
+    pub room_token_ttl_seconds: u32,
+    /// Optional `MediaMTX` path namespace isolating this deployment's rooms
+    /// (empty / `None` inserts no namespace segment).
+    #[serde(default)]
+    pub room_namespace: Option<String>,
+}
+
+impl Default for MediaConfig {
+    fn default() -> Self {
+        Self {
+            mediamtx: MediaMtxConfig::default(),
+            ffmpeg: FfmpegConfig::default(),
+            storage: MediaStorageConfig::default(),
+            recording: RecordingConfig::default(),
+            room_max_participants: default_room_max_participants(),
+            room_token_ttl_seconds: default_room_token_ttl_seconds(),
+            room_namespace: None,
+        }
+    }
 }
 
 /// The `[media]` table wrapper used to deserialize a full `autumn.toml`.
@@ -383,7 +385,7 @@ impl MediaConfig {
     /// without a bucket, and [`MediaConfigError::MissingS3Credential`] when
     /// exactly one of the access-key / secret-key pair is set.
     pub fn validate(&self) -> Result<(), MediaConfigError> {
-        let max = self.rooms.max_participants;
+        let max = self.room_max_participants;
         if max == 0 || max > DEFAULT_ROOM_MAX_PARTICIPANTS {
             return Err(MediaConfigError::InvalidRoomMaxParticipants {
                 requested: max,
@@ -464,30 +466,31 @@ impl MediaConfig {
         interpolate_opt(&mut self.storage.session_token, env);
         interpolate_opt(&mut self.storage.public_base_url, env);
         interpolate(&mut self.storage.key_prefix, env);
-        interpolate_opt(&mut self.rooms.namespace, env);
+        interpolate_opt(&mut self.room_namespace, env);
     }
 
-    /// Apply the `AUTUMN_MEDIA__ROOMS__*` scalar leaf overrides.
+    /// Apply the flat `AUTUMN_MEDIA__ROOM_*` scalar leaf overrides.
     fn apply_room_env_overrides(&mut self, env: &HashMap<String, String>) {
-        if let Some(value) = env.get("AUTUMN_MEDIA__ROOMS__MAX_PARTICIPANTS")
+        if let Some(value) = env.get("AUTUMN_MEDIA__ROOM_MAX_PARTICIPANTS")
             && let Ok(parsed) = value.parse::<usize>()
         {
-            self.rooms.max_participants = parsed;
+            self.room_max_participants = parsed;
         }
-        if let Some(value) = env.get("AUTUMN_MEDIA__ROOMS__TOKEN_TTL_SECONDS")
+        if let Some(value) = env.get("AUTUMN_MEDIA__ROOM_TOKEN_TTL_SECONDS")
             && let Ok(parsed) = value.parse::<u32>()
         {
-            self.rooms.token_ttl_seconds = parsed;
+            self.room_token_ttl_seconds = parsed;
         }
         override_opt(
-            &mut self.rooms.namespace,
+            &mut self.room_namespace,
             env,
-            "AUTUMN_MEDIA__ROOMS__NAMESPACE",
+            "AUTUMN_MEDIA__ROOM_NAMESPACE",
         );
     }
 
     /// Apply `AUTUMN_MEDIA__<TABLE>__<FIELD>` scalar leaf overrides
-    /// (double-underscore = table nesting).
+    /// (double-underscore = table nesting; flat `[media]` leaves use a single
+    /// segment, e.g. `AUTUMN_MEDIA__ROOM_MAX_PARTICIPANTS`).
     fn apply_env_overrides(&mut self, env: &HashMap<String, String>) {
         self.apply_room_env_overrides(env);
 
@@ -813,9 +816,9 @@ mod tests {
         assert_eq!(config.storage.key_prefix, "media");
         assert!(!config.storage.force_path_style);
         assert_eq!(config.recording.retention_days, 14);
-        assert_eq!(config.rooms.max_participants, DEFAULT_ROOM_MAX_PARTICIPANTS);
-        assert_eq!(config.rooms.token_ttl_seconds, 300);
-        assert_eq!(config.rooms.namespace, None);
+        assert_eq!(config.room_max_participants, DEFAULT_ROOM_MAX_PARTICIPANTS);
+        assert_eq!(config.room_token_ttl_seconds, 300);
+        assert_eq!(config.room_namespace, None);
     }
 
     #[test]
@@ -884,10 +887,10 @@ mod tests {
     #[test]
     fn from_toml_parses_media_table() {
         let toml_str = r#"
-            [media.rooms]
-            max_participants = 4
-            token_ttl_seconds = 120
-            namespace = "tenant-a"
+            [media]
+            room_max_participants = 4
+            room_token_ttl_seconds = 120
+            room_namespace = "tenant-a"
 
             [media.mediamtx]
             api_base = "http://mtx:9997"
@@ -902,9 +905,9 @@ mod tests {
             retention_days = 30
         "#;
         let config = MediaConfig::from_toml_str_with_env(toml_str, &HashMap::new()).unwrap();
-        assert_eq!(config.rooms.max_participants, 4);
-        assert_eq!(config.rooms.token_ttl_seconds, 120);
-        assert_eq!(config.rooms.namespace.as_deref(), Some("tenant-a"));
+        assert_eq!(config.room_max_participants, 4);
+        assert_eq!(config.room_token_ttl_seconds, 120);
+        assert_eq!(config.room_namespace.as_deref(), Some("tenant-a"));
         assert_eq!(config.mediamtx.api_base, "http://mtx:9997");
         assert_eq!(config.mediamtx.hls_probe_base(), "http://mediamtx:8888");
         assert_eq!(config.storage.backend, MediaStorageBackend::S3);
@@ -927,39 +930,41 @@ mod tests {
             ("AUTUMN_MEDIA__STORAGE__BACKEND", "s3"),
             ("AUTUMN_MEDIA__STORAGE__BUCKET", "env-bucket"),
             ("AUTUMN_MEDIA__RECORDING__RETENTION_DAYS", "7"),
-            ("AUTUMN_MEDIA__ROOMS__MAX_PARTICIPANTS", "3"),
+            ("AUTUMN_MEDIA__ROOM_MAX_PARTICIPANTS", "3"),
         ]);
         let config = MediaConfig::from_toml_str_with_env("[media]\n", &overrides).unwrap();
         assert_eq!(config.mediamtx.api_base, "http://override:9997");
         assert_eq!(config.storage.backend, MediaStorageBackend::S3);
         assert_eq!(config.storage.bucket.as_deref(), Some("env-bucket"));
         assert_eq!(config.recording.retention_days, 7);
-        assert_eq!(config.rooms.max_participants, 3);
+        assert_eq!(config.room_max_participants, 3);
     }
 
     #[test]
-    fn room_config_parses_table_and_env_override_and_validates_cap() {
-        // `[media.rooms]` parses, then `AUTUMN_MEDIA__ROOMS__*` overrides win.
+    fn room_flat_config_parses_env_override_and_validates_cap() {
+        // Flat `[media]` room keys parse, then `AUTUMN_MEDIA__ROOM_*` overrides win.
         let toml_str = r"
-            [media.rooms]
-            max_participants = 4
-            token_ttl_seconds = 90
+            [media]
+            room_max_participants = 4
+            room_token_ttl_seconds = 90
         ";
         let overrides = env(&[
-            ("AUTUMN_MEDIA__ROOMS__MAX_PARTICIPANTS", "5"),
-            ("AUTUMN_MEDIA__ROOMS__TOKEN_TTL_SECONDS", "600"),
-            ("AUTUMN_MEDIA__ROOMS__NAMESPACE", "tenant-b"),
+            ("AUTUMN_MEDIA__ROOM_MAX_PARTICIPANTS", "5"),
+            ("AUTUMN_MEDIA__ROOM_TOKEN_TTL_SECONDS", "600"),
+            ("AUTUMN_MEDIA__ROOM_NAMESPACE", "tenant-b"),
         ]);
         let config = MediaConfig::from_toml_str_with_env(toml_str, &overrides).unwrap();
-        assert_eq!(config.rooms.max_participants, 5);
-        assert_eq!(config.rooms.token_ttl_seconds, 600);
-        assert_eq!(config.rooms.namespace.as_deref(), Some("tenant-b"));
+        assert_eq!(config.room_max_participants, 5);
+        assert_eq!(config.room_token_ttl_seconds, 600);
+        assert_eq!(config.room_namespace.as_deref(), Some("tenant-b"));
         assert!(config.validate().is_ok());
 
         // Above the hard cap → rejected by validate() with a specific message
         // naming the offending value and the ceiling (fail-fast, never clamp).
-        let mut over = MediaConfig::default();
-        over.rooms.max_participants = 7;
+        let over = MediaConfig {
+            room_max_participants: 7,
+            ..MediaConfig::default()
+        };
         let err = over.validate().expect_err("7 > 6 must be rejected");
         assert!(matches!(
             err,
@@ -976,8 +981,10 @@ mod tests {
         assert!(rendered.contains('6'), "names the ceiling: {rendered}");
 
         // Zero participants → rejected.
-        let mut zero = MediaConfig::default();
-        zero.rooms.max_participants = 0;
+        let zero = MediaConfig {
+            room_max_participants: 0,
+            ..MediaConfig::default()
+        };
         assert!(matches!(
             zero.validate(),
             Err(MediaConfigError::InvalidRoomMaxParticipants { requested: 0, .. })
