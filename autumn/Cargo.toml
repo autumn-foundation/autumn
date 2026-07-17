@@ -461,6 +461,20 @@ path = "tests/sqlite_crud_basic.rs"
 name = "sqlite_upsert_isolation"
 path = "tests/sqlite_upsert_isolation.rs"
 
+# SQLite `dependent(..., on_delete = destroy)` cascade proof (issue #1996, PR
+# #2021). The Destroy arm selects child ids with a hand-built SQL string that
+# used to emit a trailing `FOR UPDATE` (rejected by SQLite) — outside the
+# `maybe_for_update!` DSL seam. This test proves the `backend_select!`-gated fix:
+# `delete_by_id` on a parent with a `destroy` child succeeds on an in-memory
+# SQLite pool and actually deletes the dependent child rows, with no Docker. Only
+# meaningful under `--features sqlite`; the file is `#![cfg(feature = "sqlite")]`
+# so a default `cargo test` compiles it to an empty (passing) binary. Run
+# explicitly:
+# `cargo test -p autumn-web --features sqlite --test sqlite_dependent_destroy`.
+[[test]]
+name = "sqlite_dependent_destroy"
+path = "tests/sqlite_dependent_destroy.rs"
+
 # SQLite read-only-transaction safety proof (issue #1614, Codex P2). The SQLite
 # arm of `Db::tx_with` cannot enforce `READ ONLY`, so a `TxOptions::read_only()`
 # request is rejected before the closure runs rather than silently running a

@@ -1817,9 +1817,22 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         // hard child deletes (the `#destroy_live_filter` gate is applied
                         // BEFORE `FOR UPDATE`, so the locked row set matches the rows
                         // the pre-scan + mutating pass operate on).
+                        // The `FOR UPDATE` locking clause is emitted only on
+                        // Postgres. `SQLite` rejects `SELECT … FOR UPDATE`
+                        // outright, and it needs no such clause: its single-writer
+                        // database-level lock already serializes concurrent
+                        // cascades (the same rationale that degrades the DSL
+                        // `maybe_for_update!` seam to a plain read on `SQLite`).
+                        // The suffix is selected in autumn-web's compilation via
+                        // `backend_select!`, so the Postgres SQL is byte-identical
+                        // to before and the `SQLite` form simply drops the clause.
+                        let __for_update: &str = ::autumn_web::backend_select! {
+                            pg => { " FOR UPDATE" },
+                            sqlite => { "" },
+                        };
                         let __q = format!(
-                            "SELECT id FROM \"{}\" WHERE \"{}\" = $1{} ORDER BY id FOR UPDATE",
-                            __table, __fk_column, #destroy_live_filter
+                            "SELECT id FROM \"{}\" WHERE \"{}\" = $1{} ORDER BY id{}",
+                            __table, __fk_column, #destroy_live_filter, __for_update
                         );
                         let __ids: ::std::vec::Vec<__AutumnDepId> =
                             ::autumn_web::reexports::diesel::sql_query(__q)
@@ -16678,9 +16691,15 @@ mod tests {
             .find("MutationOp :: Delete")
             .expect("delete path should still be generated");
         let delete_generated = &generated[delete_start..];
+        // The delete path now locks the row through the `maybe_for_update!`
+        // backend seam (`FOR UPDATE` on Postgres, a plain read on `SQLite`)
+        // instead of a bare `.for_update()` chain. The lock must still be
+        // applied to the load that precedes `before_delete`.
         let delete_lock = delete_generated
-            .find(". for_update ()")
-            .expect("delete path should lock the row before before_delete");
+            .find("maybe_for_update ! (load_query)")
+            .expect(
+                "delete path should lock the row (maybe_for_update! seam) before before_delete",
+            );
         let before_delete = delete_generated
             .find("before_delete")
             .expect("before_delete hook should still be generated");
@@ -17414,8 +17433,10 @@ mod tests {
         // is already parent-soft-gated, so on a HARD parent delete it returns
         // already-soft-deleted children too; a live-only reload would return
         // `None`, skip the hard delete, and leave the FK to fail the parent
-        // DELETE. Assert the reload goes straight `find(__cid).for_update()` with
-        // no intervening `deleted_at` filter, even for a soft_delete child.
+        // DELETE. Assert the reload loads the selected id straight into the
+        // `maybe_for_update!` lock seam (`FOR UPDATE` on Postgres, a plain read
+        // on `SQLite`) with no intervening `deleted_at` filter, even for a
+        // soft_delete child.
         let generated = repository_macro(
             quote! { Comment, soft_delete, dependent(PgReplyRepository, fk = "comment_id", on_delete = destroy) },
             quote! { pub trait CommentRepository {} },
@@ -17423,9 +17444,10 @@ mod tests {
         .to_string();
         let destroy_arm = dependent_destroy_arm(&generated);
         assert!(
-            destroy_arm.contains("find (__cid) . for_update"),
-            "the per-ID reload must load the selected id straight to for_update, \
-             with no deleted_at filter that could drop a pre-soft-deleted child: {destroy_arm}"
+            destroy_arm.contains("maybe_for_update ! (comments :: table . find (__cid))"),
+            "the per-ID reload must load the selected id straight into the \
+             maybe_for_update! lock wrapper, with no deleted_at filter that could \
+             drop a pre-soft-deleted child: {destroy_arm}"
         );
     }
 
@@ -17601,8 +17623,15 @@ mod tests {
         // through to a raw FK error (or a soft delete proceeds despite a live
         // restrict dependent). Holding `FOR UPDATE` on the child row blocks the
         // concurrent grandchild insert's `FOR KEY SHARE` on that referenced row,
-        // closing the TOCTOU window between probe and hook/delete. Structurally:
-        // the `SELECT id ... ORDER BY id FOR UPDATE` id query must precede the
+        // closing the TOCTOU window between probe and hook/delete.
+        //
+        // The child-id SELECT now appends a backend-gated lock suffix rather than
+        // a hard-coded `FOR UPDATE`: `... ORDER BY id{}` where the `{}` binding
+        // (`__for_update`) is `" FOR UPDATE"` on Postgres and `""` on `SQLite`
+        // (which rejects `SELECT … FOR UPDATE`), selected in autumn-web's
+        // compilation via `backend_select!`. The Postgres SQL is byte-identical to
+        // before. Structurally: the backend-gated `FOR UPDATE` lock must still be
+        // applied to the `SELECT id ... ORDER BY id` query, which must precede the
         // `for __row in & __ids` pre-scan loop.
         let generated = repository_macro(
             quote! {
@@ -17615,10 +17644,17 @@ mod tests {
         )
         .to_string();
         let destroy_arm = dependent_destroy_arm(&generated);
-        // The child-id selection SQL literal must acquire the row lock.
-        let id_lock_pos = destroy_arm.find("ORDER BY id FOR UPDATE").expect(
-            "Codex P2: the child-id selection feeding the restrict pre-scan must \
-             acquire FOR UPDATE (SELECT id ... ORDER BY id FOR UPDATE)",
+        // The Postgres arm of the backend-gated lock suffix must still emit
+        // `FOR UPDATE`, bound into the child-id SELECT's `ORDER BY id{}` clause.
+        let pg_lock_pos = destroy_arm
+            .find("backend_select ! { pg => { \" FOR UPDATE\" } , sqlite => { \"\" } , }")
+            .expect(
+                "Codex P2: the child-id selection feeding the restrict pre-scan must \
+                 acquire FOR UPDATE on Postgres via the backend_select! lock seam",
+            );
+        let ordered_lock_pos = destroy_arm.find("ORDER BY id{}").expect(
+            "Codex P2: the child-id SELECT must append the backend-gated lock \
+             suffix to its ORDER BY id clause (SELECT id ... ORDER BY id{})",
         );
         let id_select_pos = destroy_arm
             .find("SELECT id FROM")
@@ -17626,12 +17662,16 @@ mod tests {
         let prescan_pos = destroy_arm
             .find("for __row in & __ids")
             .expect("the restrict pre-scan loop must be emitted");
+        // The backend-gated FOR UPDATE lock belongs to the child-id SELECT: the
+        // `__for_update` suffix binding is emitted just before the `format!`, and
+        // the `ORDER BY id{}` clause consumes it in the same query.
         assert!(
-            id_select_pos <= id_lock_pos,
-            "Codex P2: FOR UPDATE must belong to the child-id SELECT: {destroy_arm}"
+            pg_lock_pos < id_select_pos && id_select_pos < ordered_lock_pos,
+            "Codex P2: the backend-gated FOR UPDATE lock must belong to the child-id \
+             SELECT (ORDER BY id{{}} suffix): {destroy_arm}"
         );
         assert!(
-            id_lock_pos < prescan_pos,
+            id_select_pos < prescan_pos && ordered_lock_pos < prescan_pos,
             "Codex P2: the locked child-id SELECT must run BEFORE the restrict \
              pre-scan EXISTS pass so no FK insert can slip between probe and hook: \
              {destroy_arm}"
@@ -18760,13 +18800,19 @@ mod tests {
         )
         .to_string();
 
+        // The versioned-update load was reshaped: a single `load_query` is now
+        // declared once, and the no-expected-version arm is the `else` branch that
+        // loads the before image through the `maybe_for_update!` lock seam
+        // (`FOR UPDATE` on Postgres, a plain read on `SQLite`) instead of a bare
+        // `.for_update()` chain. That branch must still lock the row before the
+        // history diff (`INSERT INTO _autumn_version_history`) is computed.
         let no_expected_branch = generated
-            .find("} else { load_query")
+            .find("} else { :: autumn_web :: maybe_for_update ! (load_query)")
             .expect("versioned update should have a no-expected-version load branch");
         let section = &generated[no_expected_branch..];
         let lock_pos = section
-            .find(". for_update ()")
-            .expect("versioned update must lock the row before computing history diff");
+            .find("maybe_for_update ! (load_query)")
+            .expect("versioned update must lock the row (maybe_for_update! seam) before computing history diff");
         let first_pos = section
             .find(". first :: < Post >")
             .expect("versioned update should load the row before applying the update");
@@ -18776,7 +18822,7 @@ mod tests {
 
         assert!(
             lock_pos < first_pos && first_pos < history_pos,
-            "versioned update must SELECT FOR UPDATE before loading the before image and writing history: {section}"
+            "versioned update must lock (maybe_for_update! → FOR UPDATE on Postgres) before loading the before image and writing history: {section}"
         );
     }
 
