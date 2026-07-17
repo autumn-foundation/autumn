@@ -13,6 +13,8 @@
 //! `autumn schema` group.
 
 pub mod diff;
+pub mod doctor;
+pub mod migrate;
 pub mod parse;
 pub mod snapshot;
 
@@ -101,6 +103,28 @@ pub enum SchemaAction {
         #[arg(long)]
         allow_destructive: bool,
     },
+    /// Apply pending migrations against the configured database, then advance the
+    /// checked-in snapshot baseline to the freshly-applied state. Provider-locked
+    /// against the snapshot's dialect; the destructive-change guards ran at diff
+    /// time, so migration files apply verbatim here.
+    Migrate {
+        /// Config profile whose database URL to apply against (defaults to the
+        /// ambient profile resolution the other CLI commands use).
+        #[arg(long, value_name = "PROFILE")]
+        profile: Option<String>,
+    },
+    /// Read-only diagnosis of the declarative-schema state: filesystem, snapshot,
+    /// model drift, backend provider-lock, and pending migrations. Exits
+    /// non-zero when any check is an actionable error.
+    Doctor {
+        /// Config profile whose database URL to probe (defaults to the ambient
+        /// profile resolution the other CLI commands use).
+        #[arg(long, value_name = "PROFILE")]
+        profile: Option<String>,
+        /// Emit the checks as JSON instead of the aligned text report.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// Run an `autumn schema` action. Prints to stdout on success; on error, writes
@@ -130,6 +154,8 @@ pub fn run(action: SchemaAction) {
             name.as_deref(),
             allow_destructive,
         ),
+        SchemaAction::Migrate { profile } => migrate::run_migrate(profile.as_deref()),
+        SchemaAction::Doctor { profile, json } => doctor::run_doctor(profile.as_deref(), json),
     };
     if let Err(message) = result {
         eprintln!("error: {message}");

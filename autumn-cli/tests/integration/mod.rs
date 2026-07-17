@@ -14,6 +14,9 @@ mod migrate_down;
 mod offsite_backup;
 mod repo_hygiene;
 mod scaffold_belongs_to;
+mod schema_migrate;
+#[cfg(feature = "sqlite")]
+mod schema_migrate_sqlite;
 mod scaffold_form_for;
 mod scaffold_search;
 mod scaffold_sort_filter;
