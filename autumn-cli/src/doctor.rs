@@ -1790,12 +1790,37 @@ fn is_valid_mailto_address_doctor(value: &str) -> bool {
 /// value fails EVERY delivery with `MailError::InvalidAddress`.
 ///
 /// lettre is reachable from the CLI via `autumn_web`'s `mail`-gated re-export
-/// (`autumn_web::reexports::lettre`); `autumn-cli` enables that feature, so no
-/// direct `lettre` dependency is required.
+/// (`autumn_web::reexports::lettre`); the default (Postgres) CLI enables that
+/// feature via the `postgres` bundle, so no direct `lettre` dependency is
+/// required.
+#[cfg(feature = "postgres")]
 fn is_valid_alert_mailbox_doctor(value: &str) -> bool {
     value
         .parse::<autumn_web::reexports::lettre::message::Mailbox>()
         .is_ok()
+}
+
+/// SQLite backend-flip build fallback: the `mail` feature (and its `lettre`
+/// re-export) is not compiled under `--features sqlite`, so this conservative
+/// syntactic check stands in for the lettre `Mailbox` parser. The alert-email
+/// doctor check is a Postgres-runtime concern; the fallback keeps the sqlite CLI
+/// compiling without pulling the pg-only `mail` path, accepting a bare
+/// `local@domain` mailbox and rejecting scheme-prefixed / whitespaced / empty
+/// values. Exact lettre parity (including RFC 5322 display-name forms) applies to
+/// the default build only.
+#[cfg(not(feature = "postgres"))]
+fn is_valid_alert_mailbox_doctor(value: &str) -> bool {
+    let value = value.trim();
+    if value.is_empty() || value.contains(':') || value.contains(char::is_whitespace) {
+        return false;
+    }
+    let mut parts = value.split('@');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(local), Some(domain), None) => {
+            !local.is_empty() && !domain.is_empty() && domain.contains('.')
+        }
+        _ => false,
+    }
 }
 
 // ─── Pure helper functions (fully unit-testable) ──────────────────────────────
@@ -8553,6 +8578,11 @@ pub struct Vault {
         assert!(!is_absolute_http_url_doctor("http://"));
     }
 
+    // Exercises the lettre-backed parser + its runtime parity, so it is gated to
+    // the default (Postgres) build where the `mail` re-export is compiled. The
+    // sqlite-build fallback (a coarse syntactic check) is deliberately not held to
+    // lettre parity.
+    #[cfg(feature = "postgres")]
     #[test]
     fn is_valid_alert_mailbox_matches_lettre_and_accepts_display_name() {
         // Bare recipient mailboxes are accepted (this is what lettre parses at
