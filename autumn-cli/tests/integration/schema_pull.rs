@@ -106,9 +106,13 @@ fn assert_no_secret_leak(stdout: &str, stderr: &str) {
     );
 }
 
-/// Two well-behaved models covering the full mapped type surface plus a foreign
+/// Three well-behaved models covering the full mapped type surface plus a foreign
 /// key (`Post.author_id → authors`), a unique column, a `NUMERIC` decimal, a
-/// `JSONB` attachment, and a `TIMESTAMPTZ`.
+/// `JSONB` attachment, and a `TIMESTAMPTZ`. `Session` additionally exercises the
+/// key judgment call end-to-end: a **UUID primary key** (`id UUID PRIMARY KEY
+/// DEFAULT gen_random_uuid()`), whose `gen_random_uuid()` default must survive the
+/// round-trip (the model parser recovers it, so pulling it back is not read as
+/// drift), plus a `DOUBLE PRECISION` float and a nullable column.
 const ROUND_TRIP_MODELS: &str = r"
 #[autumn_web::model(managed)]
 pub struct Author {
@@ -133,6 +137,17 @@ pub struct Post {
     pub rating: rust_decimal::Decimal,
     pub metadata: autumn_web::storage::Blob,
     pub launched_at: chrono::DateTime<chrono::Utc>,
+    #[default]
+    pub created_at: chrono::NaiveDateTime,
+}
+
+#[autumn_web::model(managed)]
+pub struct Session {
+    #[id]
+    pub id: uuid::Uuid,
+    pub label: String,
+    pub weight: f64,
+    pub note: Option<String>,
     #[default]
     pub created_at: chrono::NaiveDateTime,
 }
@@ -188,7 +203,7 @@ async fn schema_pull_round_trips_models_through_the_database() {
     //    model-derived baseline with the DB-introspected one.
     let (pull_out, pull_err) = run_autumn_ok(&project, &["schema", "pull"], &envs);
     assert!(
-        pull_out.contains("pulled schema snapshot") && pull_out.contains("2 table(s)"),
+        pull_out.contains("pulled schema snapshot") && pull_out.contains("3 table(s)"),
         "pull reports the table count: {pull_out}"
     );
     assert_no_secret_leak(&pull_out, &pull_err);
@@ -225,6 +240,23 @@ async fn schema_pull_round_trips_models_through_the_database() {
     assert!(
         snap.contains("\"TimestampTz\""),
         "timestamptz preserved: {snap}"
+    );
+    // The UUID-PK judgment call: the sessions table pulls back with a UUID id
+    // whose `gen_random_uuid()` default is preserved (so the round-trip below is
+    // clean rather than flagging the default as drift), plus a float and a
+    // nullable column.
+    assert!(
+        snap.contains("\"name\": \"sessions\""),
+        "sessions table: {snap}"
+    );
+    assert!(snap.contains("\"Uuid\""), "uuid PK type preserved: {snap}");
+    assert!(
+        snap.contains("gen_random_uuid()"),
+        "uuid PK default preserved: {snap}"
+    );
+    assert!(
+        snap.contains("\"Float64\""),
+        "float column preserved: {snap}"
     );
     // No framework/bookkeeping tables leaked into the pulled snapshot.
     assert!(
