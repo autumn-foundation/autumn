@@ -28,6 +28,13 @@
 //!
 //! # Deferred blind spots (documented, not silently dropped)
 //!
+//! - **Long-identifier unique index names**: Postgres truncates (or hashes) an
+//!   index/constraint identifier to `NAMEDATALEN` (63 bytes), but the model parser
+//!   emits the un-truncated derived name. So a `#[unique]` field with a long name
+//!   pulls back under the truncated DB identifier while the model side keeps the
+//!   full one — a pre-existing parser gap that makes a round-trip diff non-empty
+//!   for long field names. Introspection records the DB's identifier faithfully;
+//!   reconciling the two names is a later slice.
 //! - **Composite index key order**: multi-column index columns are ordered by
 //!   `attnum`, not the true index key order. The model parser only ever emits
 //!   single-column indexes (exact here), so this affects only hand-authored
@@ -240,9 +247,17 @@ fn fetch_columns(
     conn: &mut PgConnection,
     tables: &[String],
 ) -> Result<BTreeMap<String, Vec<ColumnRow>>, IntrospectError> {
+    // `numeric_precision` / `numeric_scale` are the `information_schema`
+    // `cardinal_number` domain, not a plain `int4`. Decoding that domain as diesel
+    // `Nullable<Integer>` on the wire is unproven (no sibling query reads them), and
+    // if it does not present as `int4` the whole column query would error and every
+    // pull would fail. Cast both to a plain `integer` in SQL so the output type is
+    // guaranteed `int4` regardless of the domain. The `AS <name>` aliases keep the
+    // result column names aligned with the `ColumnRow` field bindings.
     let query = format!(
         "SELECT table_name, column_name, udt_name, is_nullable, column_default, \
-         numeric_precision, numeric_scale FROM information_schema.columns \
+         numeric_precision::integer AS numeric_precision, \
+         numeric_scale::integer AS numeric_scale FROM information_schema.columns \
          WHERE table_schema = 'public' AND table_name IN ({}) \
          ORDER BY table_name, ordinal_position",
         quoted_in_list(tables)
