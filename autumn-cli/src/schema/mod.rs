@@ -18,10 +18,12 @@ pub mod migrate;
 pub mod parse;
 pub mod snapshot;
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use autumn_schema_core::Backend;
+use autumn_schema_core::{Backend, Column, Table};
 
+use diff::{MigrationPlan, SchemaChange};
 use parse::parse_models_path;
 use snapshot::{SNAPSHOT_DEFAULT_PATH, SchemaSnapshot};
 
@@ -103,10 +105,13 @@ pub enum SchemaAction {
         #[arg(long)]
         allow_destructive: bool,
     },
-    /// Apply pending migrations against the configured database, then advance the
-    /// checked-in snapshot baseline to the freshly-applied state. Provider-locked
-    /// against the snapshot's dialect; the destructive-change guards ran at diff
-    /// time, so migration files apply verbatim here.
+    /// Apply pending migration files against the configured database.
+    ///
+    /// Does NOT modify the checked-in schema snapshot: the baseline advances at
+    /// generation time via `schema diff --write-migration`, so this command only
+    /// applies pending migrations. Provider-locked against the snapshot's dialect;
+    /// the destructive-change guards ran at diff time, so migration files apply
+    /// verbatim here.
     Migrate {
         /// Config profile whose database URL to apply against (defaults to the
         /// ambient profile resolution the other CLI commands use).
@@ -462,12 +467,152 @@ fn diff_at(
     let ts = crate::generate::timestamp_now();
     let suffix = crate::generate::naming::snake(name.unwrap_or("schema_update"));
     let dir = write_migration_dir(project_root, &ts, &suffix, &up, &down)?;
+
+    // (g) Advance the checked-in snapshot to the state this migration converges
+    // the database on. The snapshot now moves at GENERATION time (here), not at
+    // apply time — `schema migrate` only applies files. The target is the guarded
+    // `plan` PROJECTED onto the baseline (not `desired.tables` wholesale), so a
+    // change the guard reduced or refused is never baked into the baseline: the
+    // snapshot tracks exactly what the emitted SQL produces. A plain `schema diff`
+    // (no `--write-migration`) returned above (step e), so it never reaches here
+    // and never touches the snapshot.
+    //
+    // The migration files and the checked-in snapshot must advance together: if
+    // the snapshot write fails (read-only dir, full disk, ...) after the
+    // migration is on disk, retrying `schema diff --write-migration` would
+    // regenerate the same SQL as a second migration (baseline never advanced)
+    // and applying both would fail on duplicate DDL. Roll the migration dir back
+    // on a snapshot-write failure so the pre-command state is left intact.
+    let target_tables = project_plan_target(&baseline.tables, &plan);
+    if let Err(e) =
+        snapshot::write_snapshot(&snapshot_path, &SchemaSnapshot::new(backend, target_tables))
+    {
+        let _ = std::fs::remove_dir_all(&dir);
+        return Err(e.to_string());
+    }
+
     println!(
         "wrote migration {} ({} change(s))",
         dir.display(),
         plan.changes.len()
     );
+    println!("advanced schema snapshot at {}", snapshot_path.display());
     Ok(())
+}
+
+/// Project the guarded migration `plan` onto the `baseline` tables to compute the
+/// state the database will be in once the migration applies — the new snapshot
+/// baseline `schema diff --write-migration` advances to.
+///
+/// Each [`SchemaChange`] carries the full desired objects/values (they come from
+/// the desired state), so applying them onto a clone of the baseline is verbatim
+/// and convergent: the result equals what the emitted `up.sql` produces. This is
+/// deliberately NOT a snapshot of `desired.tables` wholesale — the guard may have
+/// reduced or refused parts of the delta, and the snapshot must track only what
+/// the migration actually does. Table order is irrelevant here: `write_snapshot`
+/// re-sorts tables by name canonically.
+fn project_plan_target(baseline: &[Table], plan: &MigrationPlan) -> Vec<Table> {
+    // Name-keyed working set cloned from the baseline.
+    let mut tables: BTreeMap<String, Table> = baseline
+        .iter()
+        .map(|t| (t.name.clone(), t.clone()))
+        .collect();
+
+    // Exhaustive match with NO wildcard arm: a future `SchemaChange` variant
+    // forces a compile error here rather than silently mis-projecting the target.
+    for change in &plan.changes {
+        match change {
+            SchemaChange::CreateTable(table) => {
+                tables.insert(table.name.clone(), table.clone());
+            }
+            SchemaChange::DropTable(table) => {
+                tables.remove(&table.name);
+            }
+            SchemaChange::AddColumn { table, column } => {
+                if let Some(t) = tables.get_mut(table) {
+                    t.columns.push(column.clone());
+                }
+            }
+            SchemaChange::DropColumn { table, column } => {
+                if let Some(t) = tables.get_mut(table) {
+                    t.columns.retain(|c| c.name != column.name);
+                }
+            }
+            SchemaChange::AlterColumnType {
+                table, column, to, ..
+            } => {
+                if let Some(c) = column_mut(&mut tables, table, column) {
+                    c.ty = to.clone();
+                }
+            }
+            SchemaChange::SetNotNull { table, column } => {
+                if let Some(c) = column_mut(&mut tables, table, column) {
+                    c.nullable = false;
+                }
+            }
+            SchemaChange::DropNotNull { table, column } => {
+                if let Some(c) = column_mut(&mut tables, table, column) {
+                    c.nullable = true;
+                }
+            }
+            SchemaChange::SetDefault {
+                table, column, to, ..
+            } => {
+                if let Some(c) = column_mut(&mut tables, table, column) {
+                    c.default = Some(to.clone());
+                }
+            }
+            SchemaChange::AddForeignKey {
+                table,
+                column,
+                foreign_key,
+            } => {
+                if let Some(c) = column_mut(&mut tables, table, column) {
+                    c.references = Some(foreign_key.clone());
+                }
+            }
+            SchemaChange::AddIndex { table, index } => {
+                if let Some(t) = tables.get_mut(table) {
+                    t.indexes.push(index.clone());
+                }
+            }
+            SchemaChange::DropIndex { table, index } => {
+                if let Some(t) = tables.get_mut(table) {
+                    t.indexes.retain(|i| i.name != index.name);
+                }
+            }
+            SchemaChange::AddCheck { table, check } => {
+                if let Some(t) = tables.get_mut(table) {
+                    t.checks.push(check.clone());
+                }
+            }
+            // The non-emittable marker variants: `guard_plan` refuses these before
+            // we get here (a guarded plan never carries one), so projecting them is
+            // a no-op — never a panic.
+            SchemaChange::PrimaryKeyChange { .. }
+            | SchemaChange::ForeignKeyChange { .. }
+            | SchemaChange::DropTableBlockedByInboundFk { .. }
+            | SchemaChange::AlterColumnTypeBlockedByFk { .. }
+            | SchemaChange::AddForeignKeyToExistingColumn { .. }
+            | SchemaChange::CreateTableBlockedBySkippedField { .. } => {}
+        }
+    }
+
+    tables.into_values().collect()
+}
+
+/// Find a mutable column by name within a named table in the working set — the
+/// column-facet helper [`project_plan_target`] uses to apply the `Alter*` /
+/// `Set*` / `Drop*Null` column changes. Returns `None` when the table or column
+/// is absent (a guarded plan never carries such a change, so a miss is a no-op).
+fn column_mut<'a>(
+    tables: &'a mut BTreeMap<String, Table>,
+    table: &str,
+    column: &str,
+) -> Option<&'a mut Column> {
+    tables
+        .get_mut(table)
+        .and_then(|t| t.columns.iter_mut().find(|c| c.name == column))
 }
 
 /// Write a `migrations/<ts>_<suffix>/{up,down}.sql` pair, creating the leaf
@@ -677,8 +822,12 @@ mod tests {
 
     #[test]
     fn diff_no_op_writes_nothing() {
-        // Models match the snapshot → no-op → no migration directory.
+        // Models match the snapshot → no-op → no migration directory AND the
+        // checked-in snapshot is left byte-for-byte unchanged (a no-op diff must
+        // not advance the baseline).
         let root = scaffold_project(POST_MODEL, &posts_snapshot("Postgres"));
+        let snapshot_path = root.path().join(".autumn/schema-snapshot.json");
+        let before = std::fs::read_to_string(&snapshot_path).expect("snapshot before");
         diff_at(
             root.path(),
             None,
@@ -692,6 +841,11 @@ mod tests {
         assert!(
             !root.path().join("migrations").exists(),
             "a no-op must not create a migrations directory"
+        );
+        let after = std::fs::read_to_string(&snapshot_path).expect("snapshot after");
+        assert_eq!(
+            before, after,
+            "a no-op diff must leave the snapshot byte-for-byte unchanged"
         );
     }
 
@@ -740,6 +894,226 @@ mod tests {
         assert!(
             down.contains("ALTER TABLE posts DROP COLUMN body;"),
             "down: {down}"
+        );
+
+        // The checked-in snapshot ADVANCED to the plan's target state: it now
+        // carries the `body` column the migration adds. Load it back and check.
+        let snapshot_path = root.path().join(".autumn/schema-snapshot.json");
+        let advanced = snapshot::load_snapshot(&snapshot_path).expect("load advanced snapshot");
+        let posts = advanced
+            .tables
+            .iter()
+            .find(|t| t.name == "posts")
+            .expect("posts table in advanced snapshot");
+        assert!(
+            posts.columns.iter().any(|c| c.name == "body"),
+            "advanced snapshot must contain the new `body` column: {:?}",
+            posts.columns.iter().map(|c| &c.name).collect::<Vec<_>>()
+        );
+    }
+
+    // The migration files and the checked-in snapshot must advance together
+    // (Codex P1): if the snapshot write fails after `write_migration_dir` has
+    // already left a complete migration on disk, the baseline never advances, so
+    // retrying `schema diff --write-migration` regenerates the same SQL as a
+    // SECOND migration and applying both fails on duplicate DDL. `diff_at` rolls
+    // the migration dir back on a snapshot-write failure. Reproduce that failure
+    // portably by making the snapshot's parent dir (`.autumn`) read-only so the
+    // earlier snapshot LOAD still succeeds but `write_snapshot`'s tempfile
+    // create+rename cannot, then assert the command errors and left no migration.
+    #[cfg(unix)]
+    #[test]
+    fn write_migration_rolls_back_on_snapshot_write_failure() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Add a `body` column the snapshot lacks → a non-empty plan that would
+        // write a migration and then advance the snapshot.
+        let models = r#"
+            #[autumn_web::model(managed)]
+            pub struct Post {
+                #[id]
+                pub id: i64,
+                pub title: String,
+                pub body: Option<String>,
+            }
+        "#;
+        let root = scaffold_project(models, &posts_snapshot("Postgres"));
+        let autumn_dir = root.path().join(".autumn");
+
+        // Make the snapshot's parent directory read-only so a new tempfile cannot
+        // be created in it (the earlier read of the existing snapshot still works).
+        std::fs::set_permissions(&autumn_dir, std::fs::Permissions::from_mode(0o555))
+            .expect("chmod .autumn read-only");
+
+        // Skipped when the process can bypass the permission bits (e.g. running as
+        // root, where a read-only dir is still writable), which would otherwise
+        // make this non-deterministic — mirrors `classify_unreadable_dir_is_an_error`.
+        let can_still_write = tempfile::NamedTempFile::new_in(&autumn_dir).is_ok();
+        if can_still_write {
+            std::fs::set_permissions(&autumn_dir, std::fs::Permissions::from_mode(0o755))
+                .expect("restore chmod");
+            return;
+        }
+
+        let result = diff_at(
+            root.path(),
+            None,
+            None,
+            Some(BackendArg::Pg),
+            true,
+            Some("add_body"),
+            false,
+        );
+
+        // Restore permissions so the tempdir can be cleaned up (and the migrations
+        // assertion below can read the dir regardless of outcome).
+        std::fs::set_permissions(&autumn_dir, std::fs::Permissions::from_mode(0o755))
+            .expect("restore chmod");
+
+        // (a) The command surfaced the snapshot-write failure as an error.
+        assert!(
+            result.is_err(),
+            "a snapshot-write failure must surface as an error, got: {result:?}"
+        );
+
+        // (b) The just-created migration was rolled back: no migration directory
+        // is left behind, so a retry regenerates a single migration (not a second).
+        let migrations = root.path().join("migrations");
+        let leftover: Vec<_> = std::fs::read_dir(&migrations)
+            .map(|rd| {
+                rd.map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(
+            leftover.is_empty(),
+            "the migration dir must be rolled back on a snapshot-write failure, found: {leftover:?}"
+        );
+    }
+
+    /// The core drift scenario from #2041: `schema diff --write-migration`
+    /// advances the snapshot to the GENERATED plan's target, so a later,
+    /// still-ungenerated model edit diffs on top of it (only the *new* delta),
+    /// never re-generating the already-generated change.
+    #[test]
+    #[allow(clippy::too_many_lines)] // linear scenario reads clearest end-to-end
+    fn write_migration_advances_snapshot_so_later_edits_diff_on_top() {
+        // Change A: add `body`. Baseline is the posts(id,title,created_at) snapshot.
+        let models_a = r#"
+            #[autumn_web::model(managed)]
+            pub struct Post {
+                #[id]
+                pub id: i64,
+                pub title: String,
+                pub body: Option<String>,
+            }
+        "#;
+        let root = scaffold_project(models_a, &posts_snapshot("Postgres"));
+        let snapshot_path = root.path().join(".autumn/schema-snapshot.json");
+
+        // Generate change A. The snapshot advances to include `body`.
+        diff_at(
+            root.path(),
+            None,
+            None,
+            Some(BackendArg::Pg),
+            true,
+            Some("add_body"),
+            false,
+        )
+        .expect("write migration A ok");
+
+        let after_a = snapshot::load_snapshot(&snapshot_path).expect("load snapshot after A");
+        let posts_a = after_a
+            .tables
+            .iter()
+            .find(|t| t.name == "posts")
+            .expect("posts after A");
+        assert!(
+            posts_a.columns.iter().any(|c| c.name == "body"),
+            "snapshot advanced to include `body`"
+        );
+        // The not-yet-added `draft` column is NOT in the snapshot yet.
+        assert!(
+            !posts_a.columns.iter().any(|c| c.name == "draft"),
+            "snapshot must not contain the not-yet-added `draft` column"
+        );
+
+        // Convergence: re-running with the SAME models is now a no-op — no second
+        // migration directory is written (the snapshot already matches).
+        diff_at(
+            root.path(),
+            None,
+            None,
+            Some(BackendArg::Pg),
+            true,
+            Some("add_body_again"),
+            false,
+        )
+        .expect("second (converged) diff ok");
+        let dir_count = std::fs::read_dir(root.path().join("migrations"))
+            .expect("read migrations")
+            .count();
+        assert_eq!(
+            dir_count, 1,
+            "a converged re-run must not write a second migration"
+        );
+
+        // Now edit the models to add `draft` on top of the already-generated
+        // `body`. Because the snapshot advanced to change A, the next diff
+        // generates ONLY `draft` — proving the baseline moved to the plan target,
+        // not that it stayed at the original baseline.
+        std::fs::write(
+            root.path().join("src").join("models.rs"),
+            r#"
+                #[autumn_web::model(managed)]
+                pub struct Post {
+                    #[id]
+                    pub id: i64,
+                    pub title: String,
+                    pub body: Option<String>,
+                    pub draft: Option<String>,
+                }
+            "#,
+        )
+        .expect("edit models to add draft");
+
+        diff_at(
+            root.path(),
+            None,
+            None,
+            Some(BackendArg::Pg),
+            true,
+            Some("add_draft"),
+            false,
+        )
+        .expect("write migration B (draft) ok");
+
+        // Exactly two migration dirs; the newest carries `draft` but NOT `body`.
+        let mut names: Vec<String> = std::fs::read_dir(root.path().join("migrations"))
+            .expect("read migrations")
+            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names.len(), 2, "two migration dirs now: {names:?}");
+        let draft_dir = names
+            .iter()
+            .find(|n| n.ends_with("_add_draft"))
+            .expect("add_draft dir");
+        let up = std::fs::read_to_string(
+            root.path()
+                .join("migrations")
+                .join(draft_dir)
+                .join("up.sql"),
+        )
+        .expect("draft up.sql");
+        assert!(
+            up.contains("draft"),
+            "the second migration still generates `draft`: {up}"
+        );
+        assert!(
+            !up.contains("body"),
+            "the second migration must NOT re-generate the already-added `body`: {up}"
         );
     }
 
