@@ -504,9 +504,16 @@ fn load_existing_snapshot(path: &Path) -> Option<SchemaSnapshot> {
     snapshot::load_snapshot(path).ok()
 }
 
-/// Print what a `--dry-run` pull would change: the pending migration plan between
-/// the existing snapshot (baseline) and the freshly-pulled tables (desired),
-/// without writing anything.
+/// Print what a `--dry-run` pull would change between the existing snapshot
+/// (baseline) and the freshly-pulled tables, without writing anything.
+///
+/// Drift is computed BIDIRECTIONALLY (via [`doctor::compute_db_schema_drift`]) so
+/// the dry-run never under-reports: the forward plan is what pulling would change
+/// in the snapshot, but a manually-dropped default / FK / CHECK in the live DB is
+/// invisible to the forward pass (a desired `None` is "retained") and only surfaces
+/// in the reverse plan. When the forward plan has changes it is printed via
+/// [`diff::describe_plan`]; when only the reverse plan does, a short note names the
+/// dropped-facet differences so they are not silently omitted.
 fn report_pull_dry_run(
     pulled: &SchemaSnapshot,
     existing: Option<&SchemaSnapshot>,
@@ -522,21 +529,31 @@ fn report_pull_dry_run(
             );
         }
         Some(existing) => {
-            let desired = parse::ParsedSchema::from_tables(pulled.tables.clone());
-            let plan = diff::diff_schema(&existing.tables, &desired, diff::DiffOptions::default());
-            if plan.is_empty() {
-                println!(
-                    "--dry-run: the snapshot at {} is up to date — the database matches it.",
-                    out_path.display()
-                );
-            } else {
+            let drift = doctor::compute_db_schema_drift(&existing.tables, &pulled.tables);
+            if !drift.forward.is_empty() {
                 println!(
                     "--dry-run: the database differs from the snapshot at {} — {} change(s) would \
                      be captured (nothing written):",
                     out_path.display(),
-                    plan.changes.len()
+                    drift.forward.changes.len()
                 );
-                print!("{}", diff::describe_plan(&plan));
+                print!("{}", diff::describe_plan(&drift.forward));
+            } else if !drift.reverse.is_empty() {
+                // The forward pass found nothing to pull, but the reverse pass did:
+                // the live DB dropped a default / foreign key / CHECK the snapshot
+                // still carries. Name it rather than falsely report "up to date".
+                println!(
+                    "--dry-run: the database at {} has {} dropped-default/foreign-key/CHECK \
+                     difference(s) the snapshot still carries — run `autumn schema diff \
+                     --write-migration` to generate a migration (nothing written).",
+                    out_path.display(),
+                    drift.reverse.changes.len()
+                );
+            } else {
+                println!(
+                    "--dry-run: the snapshot at {} is up to date — the database matches it.",
+                    out_path.display()
+                );
             }
         }
     }

@@ -29,7 +29,7 @@ use autumn_schema_core::{Backend, Table};
 use diesel_migrations::FileBasedMigrations;
 use serde::Serialize;
 
-use super::diff::{DiffOptions, diff_schema};
+use super::diff::{DiffOptions, MigrationPlan, diff_schema};
 use super::introspect::introspect_postgres;
 use super::parse::{ParsedSchema, parse_models_path};
 use super::snapshot::{SNAPSHOT_DEFAULT_PATH, SnapshotError, load_snapshot};
@@ -309,17 +309,72 @@ fn gather_db_schema_drift(
     };
     match introspect_postgres(&url) {
         Ok(tables) => {
-            let desired = ParsedSchema::from_tables(tables);
-            let plan = diff_schema(&snapshot.tables, &desired, DiffOptions::default());
-            if plan.is_empty() {
+            let drift = compute_db_schema_drift(&snapshot.tables, &tables);
+            if drift.is_clean() {
                 DbSchemaState::Clean
             } else {
-                DbSchemaState::Drifted(plan.changes.len())
+                DbSchemaState::Drifted(drift.reported_count())
             }
         }
         // IntrospectError Display is credential-safe.
         Err(e) => DbSchemaState::Unreachable(e.to_string()),
     }
+}
+
+/// Bidirectional database-vs-snapshot drift, computed purely from two table sets
+/// (no I/O) so both `schema doctor` and `schema pull --dry-run` share one engine.
+///
+/// The **forward** diff (`snapshot` baseline → introspected `db` desired) is what a
+/// `schema pull` would change in the snapshot: it catches column/index/table
+/// adds+drops and type changes. But because [`diff_column`](super::diff) /
+/// `diff_checks` treat a desired-side `None` as "unknown, retained" (never a
+/// `DropDefault` / `DropForeignKey` / `DropCheck`), the forward pass MISSES a
+/// manually-dropped default, foreign key, or CHECK in the live DB. Running the diff
+/// in the **reverse** direction (`db` baseline → `snapshot` desired) surfaces
+/// exactly those dropped-facet cases, so drift is the union of the two passes.
+pub struct DbSchemaDrift {
+    /// What a `schema pull` would change in the snapshot baseline.
+    pub forward: MigrationPlan,
+    /// The reverse diff — catches the dropped default/FK/CHECK cases the forward
+    /// pass misses.
+    pub reverse: MigrationPlan,
+}
+
+impl DbSchemaDrift {
+    /// True when neither direction reports any change.
+    pub const fn is_clean(&self) -> bool {
+        self.forward.is_empty() && self.reverse.is_empty()
+    }
+
+    /// The advisory change count to report. Prefers the forward plan's length when
+    /// it is non-empty (the common single-direction case), else the reverse plan's
+    /// — avoiding the worst double-counting without over-engineering dedup.
+    pub const fn reported_count(&self) -> usize {
+        if self.forward.is_empty() {
+            self.reverse.changes.len()
+        } else {
+            self.forward.changes.len()
+        }
+    }
+}
+
+/// Compute [`DbSchemaDrift`] between the checked-in `snapshot_tables` baseline and
+/// the live `db_tables` introspected from the database. Pure and unit-testable —
+/// runs [`diff_schema`] in both directions (see [`DbSchemaDrift`]).
+pub fn compute_db_schema_drift(snapshot_tables: &[Table], db_tables: &[Table]) -> DbSchemaDrift {
+    // Forward: what pulling the DB would change in the snapshot baseline.
+    let forward = diff_schema(
+        snapshot_tables,
+        &ParsedSchema::from_tables(db_tables.to_vec()),
+        DiffOptions::default(),
+    );
+    // Reverse: catches the dropped-default/FK/CHECK cases the forward pass misses.
+    let reverse = diff_schema(
+        db_tables,
+        &ParsedSchema::from_tables(snapshot_tables.to_vec()),
+        DiffOptions::default(),
+    );
+    DbSchemaDrift { forward, reverse }
 }
 
 /// Pure check computation over gathered facts. Ordered filesystem → snapshot →
@@ -541,8 +596,8 @@ fn db_schema_drift_check(state: &DbSchemaState) -> Check {
             name,
             status: Status::Warn,
             detail: format!(
-                "database schema differs from the snapshot in {n} place(s) — run \
-                 `autumn schema pull` to update the baseline or generate a migration"
+                "database schema differs from the snapshot baseline ({n} difference(s)); \
+                 run `autumn schema pull` to update the baseline or generate a migration"
             ),
         },
         DbSchemaState::Unreachable(reason) => Check {
@@ -899,7 +954,7 @@ mod tests {
         // Drifted → WARN, names the remediation.
         let drifted = db_schema_drift_check(&DbSchemaState::Drifted(3));
         assert_eq!(drifted.status, Status::Warn);
-        assert!(drifted.detail.contains("3 place(s)"), "{drifted:?}");
+        assert!(drifted.detail.contains("3 difference(s)"), "{drifted:?}");
         assert!(drifted.detail.contains("autumn schema pull"), "{drifted:?}");
         // Unreachable → WARN (never an error; doctor stays offline-runnable).
         let down = db_schema_drift_check(&DbSchemaState::Unreachable("refused".to_string()));
@@ -939,5 +994,122 @@ mod tests {
             assert_ne!(db.status, Status::Error, "{db:?}");
             assert!(finish(&checks).is_ok(), "checks: {checks:?}");
         }
+    }
+
+    // --- Bidirectional drift (`compute_db_schema_drift`) --------------------
+    //
+    // The forward pass alone (`diff_column` treats a desired `None` as "unknown,
+    // retained") silently MISSES a manually-dropped default / FK / CHECK in the
+    // live DB. These pure tests pin that the union of the two directions catches
+    // those cases, while the forward-caught cases (adds/type changes) still count.
+
+    /// A Postgres `posts(id BIGINT PK, created_at TIMESTAMP DEFAULT now())`-shaped
+    /// table, built with the schema-core constructors, so drift tests can vary a
+    /// single facet (a default, an FK, an extra column) against a clone.
+    fn drift_posts_table(created_at_default: Option<autumn_schema_core::ColumnDefault>) -> Table {
+        use autumn_schema_core::{Column, ColumnType};
+        let mut id = Column::new("id".to_string(), ColumnType::Int64);
+        id.primary_key = true;
+        let mut created_at = Column::new("created_at".to_string(), ColumnType::Timestamp);
+        created_at.default = created_at_default;
+        let mut table = Table::new("posts", Backend::Postgres);
+        table.managed = true;
+        table.primary_key = vec!["id".to_string()];
+        table.columns = vec![id, created_at];
+        table
+    }
+
+    #[test]
+    fn compute_db_schema_drift_identical_is_clean() {
+        let snapshot = vec![drift_posts_table(Some(
+            autumn_schema_core::ColumnDefault::Now,
+        ))];
+        let db = snapshot.clone();
+        let drift = compute_db_schema_drift(&snapshot, &db);
+        assert!(drift.is_clean(), "identical table sets must be clean");
+        assert_eq!(drift.reported_count(), 0);
+    }
+
+    #[test]
+    fn compute_db_schema_drift_catches_dropped_default() {
+        // Snapshot keeps `created_at DEFAULT now()`; the live DB dropped the
+        // default (default: None). The FORWARD pass misses this (a desired `None`
+        // is "retained"); the reverse pass catches it, so the union is drift.
+        let snapshot = vec![drift_posts_table(Some(
+            autumn_schema_core::ColumnDefault::Now,
+        ))];
+        let db = vec![drift_posts_table(None)];
+        let drift = compute_db_schema_drift(&snapshot, &db);
+        assert!(
+            drift.forward.is_empty(),
+            "forward pass alone must miss the dropped default: {:?}",
+            drift.forward.changes
+        );
+        assert!(
+            !drift.reverse.is_empty(),
+            "reverse pass must catch the dropped default"
+        );
+        assert!(!drift.is_clean(), "dropped default is drift");
+        assert!(drift.reported_count() >= 1);
+    }
+
+    #[test]
+    fn compute_db_schema_drift_catches_dropped_foreign_key() {
+        use autumn_schema_core::{Column, ColumnType, ForeignKey};
+        // Both tables share the same columns; the snapshot's `author_id` carries an
+        // FK the live DB dropped. Forward misses it (desired `None` retained);
+        // reverse catches it.
+        let build = |with_fk: bool| {
+            let mut id = Column::new("id".to_string(), ColumnType::Int64);
+            id.primary_key = true;
+            let mut author_id = Column::new("author_id".to_string(), ColumnType::Int64);
+            if with_fk {
+                author_id.references = Some(ForeignKey::new("authors", "id"));
+            }
+            let mut table = Table::new("posts", Backend::Postgres);
+            table.managed = true;
+            table.primary_key = vec!["id".to_string()];
+            table.columns = vec![id, author_id];
+            table
+        };
+        let snapshot = vec![build(true)];
+        let db = vec![build(false)];
+        let drift = compute_db_schema_drift(&snapshot, &db);
+        assert!(
+            drift.forward.is_empty(),
+            "forward pass alone must miss the dropped FK: {:?}",
+            drift.forward.changes
+        );
+        assert!(
+            !drift.reverse.is_empty(),
+            "reverse pass must catch the dropped FK"
+        );
+        assert!(!drift.is_clean(), "dropped FK is drift");
+    }
+
+    #[test]
+    fn compute_db_schema_drift_catches_added_column() {
+        use autumn_schema_core::{Column, ColumnType};
+        // The live DB gained a column the snapshot lacks — the FORWARD pass catches
+        // this as an AddColumn, so the reported count comes from the forward plan.
+        let snapshot = vec![drift_posts_table(Some(
+            autumn_schema_core::ColumnDefault::Now,
+        ))];
+        let mut db_table = drift_posts_table(Some(autumn_schema_core::ColumnDefault::Now));
+        db_table
+            .columns
+            .push(Column::new("extra".to_string(), ColumnType::Text));
+        let db = vec![db_table];
+        let drift = compute_db_schema_drift(&snapshot, &db);
+        assert!(
+            !drift.forward.is_empty(),
+            "forward pass must catch the added column"
+        );
+        assert!(!drift.is_clean(), "added column is drift");
+        assert_eq!(
+            drift.reported_count(),
+            drift.forward.changes.len(),
+            "reported count prefers the non-empty forward plan"
+        );
     }
 }
