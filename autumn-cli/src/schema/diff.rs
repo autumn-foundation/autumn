@@ -34,6 +34,47 @@
 //! genuine-removal case is recovered by later slices (`#[renamed_from]`, richer
 //! parsing, a shadow-DB oracle).
 //!
+//! # Invisible `#[belongs_to(...)]` association foreign keys (offline limitation)
+//!
+//! The slice-2 parser cannot see a generated `#[belongs_to(...)]` association
+//! foreign key: real generator output models it as a plain `<name>_id: i64`
+//! column plus a **struct-level** `#[belongs_to(...)]` attribute, and the parser
+//! lifts the `i64` field as an ordinary `Int64` column with `references: None` and
+//! **no diagnostic** (only an *unresolvable field type* — a generated enum, or an
+//! association written as a bare struct-typed field `pub user: User` — records a
+//! [`SchemaDiagnostic`](crate::schema::parse::SchemaDiagnostic), and even that
+//! carries no target-table). So the diff engine has **no offline signal** for the
+//! presence, column, or target of an association FK. This produces two
+//! consequences the engine handles conservatively:
+//!
+//! 1. **Adding a foreign key to a pre-existing column is refused**
+//!    ([`DiffError::AddForeignKeyToPreexistingColumn`]). When a column present on
+//!    both sides gains an explicit `#[references]` where the baseline recorded
+//!    none, the baseline `references: None` is *unknown*, not proof the database
+//!    lacks a constraint — the column may already carry an inline `REFERENCES`
+//!    named `<table>_<column>_fkey` from the original association-FK generation, so
+//!    a fresh `ADD CONSTRAINT <table>_<column>_fkey` would collide and the
+//!    migration would not apply. The engine refuses (no override) rather than emit
+//!    it; the fix is a manual migration or an authoritative re-snapshot. A
+//!    **brand-new** FK column (an `AddColumn` whose `REFERENCES` renders inline) is
+//!    safe and is emitted normally — there is no pre-existing constraint to hit.
+//!
+//! 2. **`DROP TABLE` cannot be checked against invisible inbound association
+//!    FKs.** The inbound-reference scan ([`detect_inbound_fk_blocks`]) refuses a
+//!    drop whenever a retained table holds a **visible** `references` to the
+//!    dropped table (rounds 2/3/5, unchanged and still enforced). But an invisible
+//!    `#[belongs_to(...)]` association FK on a retained table produces no
+//!    `Column.references` and no diagnostic, so it cannot be detected offline —
+//!    the resulting `DROP TABLE` (already `--allow-destructive`-gated) may fail to
+//!    apply because the real `<retained>_<col>_fkey` constraint still depends on
+//!    the dropped table. A precise guard is impossible without schema introspection
+//!    (a future slice's shadow-DB / `--dev-url` oracle); a blanket "refuse every
+//!    table drop" would make the common case useless and is deliberately **not**
+//!    done. Instead every emitted `DROP TABLE` carries an advisory
+//!    `-- autumn-safety:` comment naming this exact gap so the operator verifies
+//!    (introspection or a manual FK drop) before applying. This is a documented
+//!    limitation of the offline approach, not a bug.
+//!
 //! # Uniqueness is diffed only through indexes
 //!
 //! `Column.unique` is treated as informational metadata and is **not** separately
@@ -198,7 +239,18 @@ pub enum SchemaChange {
         /// The baseline default, if any (for the down leg).
         from: Option<ColumnDefault>,
     },
-    /// An explicit foreign key added to a column (added, or newly-explicit).
+    /// An explicit foreign key added as a **standalone** `ADD CONSTRAINT ...
+    /// FOREIGN KEY` statement.
+    ///
+    /// Not currently produced by [`diff_schema`]: a **new** FK column renders its
+    /// `REFERENCES` inline in the `ADD COLUMN`, and adding an FK to a
+    /// **pre-existing** column is refused (see
+    /// [`SchemaChange::AddForeignKeyToExistingColumn`] — the parser cannot see a
+    /// generated association FK, so it cannot prove the constraint is absent). The
+    /// variant and its renderer are retained for the future slice that can observe
+    /// FK constraints reliably (schema introspection / a shadow-DB oracle) and can
+    /// therefore safely emit a standalone FK add on an existing column.
+    #[allow(dead_code)]
     AddForeignKey {
         /// The owning table name.
         table: String,
@@ -293,6 +345,29 @@ pub enum SchemaChange {
         /// The owning table name.
         table: String,
         /// The column whose type change is blocked by an FK constraint.
+        column: String,
+    },
+
+    /// A **pre-existing** baseline column (present on both sides) that gained an
+    /// explicit `#[references]` where the baseline recorded no foreign key. A
+    /// non-emittable marker: [`guard_plan`] refuses any plan containing it (with
+    /// **no override**).
+    ///
+    /// It exists because the slice-2 parser cannot see a generated
+    /// `#[belongs_to(...)]` association FK — a `<name>_id: i64` column is parsed as
+    /// a plain `Int64` with `references: None`, producing *no* diagnostic. So a
+    /// baseline `references: None` on a pre-existing column is **unknown**, not
+    /// proof the database has no constraint: the column may already carry an inline
+    /// `REFERENCES` constraint named `<table>_<column>_fkey` from the original
+    /// association-FK generation. Emitting `AddForeignKey` would
+    /// `ADD CONSTRAINT <table>_<column>_fkey` a second time and collide with that
+    /// existing constraint — an unappliable migration. A **newly-added** FK column
+    /// (an [`SchemaChange::AddColumn`], which renders its `REFERENCES` inline) is
+    /// safe and is never flagged; only a pre-existing column gaining an FK is.
+    AddForeignKeyToExistingColumn {
+        /// The owning table name.
+        table: String,
+        /// The pre-existing column that gained an explicit foreign key.
         column: String,
     },
 }
@@ -459,6 +534,30 @@ pub enum DiffError {
         /// The owning table name.
         table: String,
         /// The column whose type change is blocked by an FK constraint.
+        column: String,
+    },
+
+    /// An explicit foreign key was added to a **pre-existing** column whose
+    /// baseline recorded no foreign key (unsupported this slice, **no override** —
+    /// the SQL may be unappliable, not merely lossy). Because the slice-2 parser
+    /// cannot see a generated `#[belongs_to(...)]` association FK (a `<name>_id`
+    /// column parses as a plain `Int64` with `references: None` and no diagnostic),
+    /// a baseline `references: None` on a pre-existing column is *unknown*, not
+    /// proof the database lacks a constraint: the column may already carry an
+    /// inline `REFERENCES` named `<table>_<column>_fkey`, so a fresh
+    /// `ADD CONSTRAINT` of that same name would collide. A brand-new FK column (an
+    /// `ADD COLUMN` with an inline `REFERENCES`) is safe and is never refused.
+    #[error(
+        "cannot add a foreign key to the pre-existing column `{table}.{column}`: the offline \
+         snapshot cannot confirm whether the database already has a constraint for it (e.g. a \
+         generated association foreign key), and adding a duplicate `{table}_{column}_fkey` would \
+         fail. Add the foreign key via a manual migration, or re-snapshot from an authoritative \
+         source."
+    )]
+    AddForeignKeyToPreexistingColumn {
+        /// The owning table name.
+        table: String,
+        /// The pre-existing column that gained an explicit foreign key.
         column: String,
     },
 
@@ -882,23 +981,32 @@ fn diff_column(table: &str, base: &Column, want: &Column, changes: &mut Vec<Sche
         });
     }
 
-    // Rule B: only emit the *add* direction, and only for a column that did not
-    // already have an explicit foreign key. A desired `None` is "unknown,
-    // retained" — never a DropForeignKey.
+    // Rule B: only the *add* direction is ever considered (a desired `None` is
+    // "unknown, retained" — never a DropForeignKey). `diff_column` only runs for a
+    // column present on BOTH sides — i.e. a pre-existing column — so an added FK
+    // here is on a pre-existing column, which is unsafe: the parser cannot see a
+    // generated `#[belongs_to(...)]` association FK, so a baseline `references:
+    // None` is *unknown*, not proof the DB has no `<table>_<column>_fkey`
+    // constraint — emitting `ADD CONSTRAINT` could collide with an existing one.
     //
-    // The three sub-cases when the desired side has an explicit FK:
-    //   * baseline had none            → a genuinely-new FK  → `AddForeignKey`.
+    // The three sub-cases when the desired side has an explicit FK on a
+    // pre-existing column:
+    //   * baseline had none            → the FK may (invisibly) already exist →
+    //     the refused `AddForeignKeyToExistingColumn` marker (no override).
     //   * baseline had the same FK     → no change.
     //   * baseline had a *different* FK → a retarget we cannot safely emit
     //     (there is no `DropForeignKey`, and re-`ADD CONSTRAINT`-ing the default
     //     `<table>_<column>_fkey` name would collide) → the refused
     //     `ForeignKeyChange` marker, mirroring `PrimaryKeyChange`.
+    //
+    // A genuinely-new FK column arrives as an `AddColumn` (whose `REFERENCES` is
+    // rendered inline, never as a separate `AddForeignKey`), so it never reaches
+    // this branch and is emitted normally.
     if let Some(fk) = &want.references {
         match &base.references {
-            None => changes.push(SchemaChange::AddForeignKey {
+            None => changes.push(SchemaChange::AddForeignKeyToExistingColumn {
                 table: table.to_owned(),
                 column: want.name.clone(),
-                foreign_key: fk.clone(),
             }),
             Some(existing) if existing == fk => {}
             Some(_) => changes.push(SchemaChange::ForeignKeyChange {
@@ -1022,6 +1130,20 @@ pub fn guard_plan(plan: &MigrationPlan, opts: DiffOptions) -> Result<(), DiffErr
         _ => None,
     }) {
         return Err(DiffError::ForeignKeyChange { table, column });
+    }
+
+    // 2b. Foreign key added to a pre-existing column — no override. A baseline
+    //     `references: None` is *unknown* (the parser cannot see an association
+    //     FK), so the DB may already carry the `<table>_<column>_fkey` constraint;
+    //     emitting `ADD CONSTRAINT` would collide. A new FK column (an `AddColumn`
+    //     with an inline `REFERENCES`) is safe and never reaches this marker.
+    if let Some((table, column)) = plan.changes.iter().find_map(|c| match c {
+        SchemaChange::AddForeignKeyToExistingColumn { table, column } => {
+            Some((table.clone(), column.clone()))
+        }
+        _ => None,
+    }) {
+        return Err(DiffError::AddForeignKeyToPreexistingColumn { table, column });
     }
 
     // 3. Drop of a table a retained table still references — no override (even
@@ -1610,7 +1732,8 @@ const fn up_bucket(change: &SchemaChange) -> u8 {
         SchemaChange::PrimaryKeyChange { .. }
         | SchemaChange::ForeignKeyChange { .. }
         | SchemaChange::DropTableBlockedByInboundFk { .. }
-        | SchemaChange::AlterColumnTypeBlockedByFk { .. } => 9,
+        | SchemaChange::AlterColumnTypeBlockedByFk { .. }
+        | SchemaChange::AddForeignKeyToExistingColumn { .. } => 9,
     }
 }
 
@@ -1618,7 +1741,14 @@ const fn up_bucket(change: &SchemaChange) -> u8 {
 fn emit_change_up(change: &SchemaChange, backend: Backend) -> Result<String, EmitError> {
     match change {
         SchemaChange::CreateTable(table) => Ok(emit_create_table(table, backend)),
-        SchemaChange::DropTable(table) => Ok(format!("DROP TABLE {};\n", table.name)),
+        SchemaChange::DropTable(table) => Ok(format!(
+            "-- autumn-safety: this DROP TABLE is not checked against generated \
+             #[belongs_to(...)] association foreign keys, which the offline snapshot cannot see; \
+             if a retained table has an invisible association FK to `{0}`, this will fail to apply \
+             -- verify with schema introspection or drop the FK manually first\n\
+             DROP TABLE {0};\n",
+            table.name
+        )),
         SchemaChange::AddColumn { table, column } => emit_add_column(table, column, backend),
         SchemaChange::DropColumn { table, column } => Ok(format!(
             "ALTER TABLE {table} DROP COLUMN {};\n",
@@ -1686,7 +1816,8 @@ fn emit_change_up(change: &SchemaChange, backend: Backend) -> Result<String, Emi
         SchemaChange::PrimaryKeyChange { .. }
         | SchemaChange::ForeignKeyChange { .. }
         | SchemaChange::DropTableBlockedByInboundFk { .. }
-        | SchemaChange::AlterColumnTypeBlockedByFk { .. } => Ok(String::new()),
+        | SchemaChange::AlterColumnTypeBlockedByFk { .. }
+        | SchemaChange::AddForeignKeyToExistingColumn { .. } => Ok(String::new()),
     }
 }
 
@@ -1768,7 +1899,8 @@ fn emit_change_down(change: &SchemaChange, backend: Backend) -> Result<String, E
         SchemaChange::PrimaryKeyChange { .. }
         | SchemaChange::ForeignKeyChange { .. }
         | SchemaChange::DropTableBlockedByInboundFk { .. }
-        | SchemaChange::AlterColumnTypeBlockedByFk { .. } => Ok(String::new()),
+        | SchemaChange::AlterColumnTypeBlockedByFk { .. }
+        | SchemaChange::AddForeignKeyToExistingColumn { .. } => Ok(String::new()),
     }
 }
 
@@ -2024,6 +2156,9 @@ fn describe_change(change: &SchemaChange) -> String {
             format!(
                 "! ALTER COLUMN {table}.{column} TYPE blocked by foreign-key constraint (refused)"
             )
+        }
+        SchemaChange::AddForeignKeyToExistingColumn { table, column } => {
+            format!("! ADD FOREIGN KEY on pre-existing column {table}.{column} (refused)")
         }
     }
 }
@@ -2445,7 +2580,15 @@ mod tests {
     }
 
     #[test]
-    fn fk_added_when_desired_explicit() {
+    fn add_fk_to_preexisting_column_is_refused() {
+        // Finding 902: a PRE-EXISTING generated association column (`author_id`,
+        // present in the baseline with `references: None` because the parser cannot
+        // see the `#[belongs_to(...)]` association FK) is changed to an explicit
+        // `#[references]`. The DB may already carry the inline `posts_author_id_fkey`
+        // constraint from the original association-FK generation, so emitting
+        // `ADD CONSTRAINT posts_author_id_fkey` would collide → an unappliable
+        // migration. The diff must surface the refused marker, never an
+        // `AddForeignKey`.
         let base = vec![posts_with(vec![col("author_id", ColumnType::Int64)])];
         let mut author = col("author_id", ColumnType::Int64);
         author.references = Some(ForeignKey::new("users", "id"));
@@ -2453,11 +2596,65 @@ mod tests {
         let plan = diff_schema(&base, &want, DEFAULT_OPTS);
         assert_eq!(
             plan.changes,
-            vec![SchemaChange::AddForeignKey {
+            vec![SchemaChange::AddForeignKeyToExistingColumn {
                 table: "posts".to_owned(),
                 column: "author_id".to_owned(),
-                foreign_key: ForeignKey::new("users", "id"),
-            }]
+            }],
+            "an FK added to a pre-existing column is the refused marker, never an AddForeignKey: \
+             {plan:?}"
+        );
+        assert!(
+            !plan
+                .changes
+                .iter()
+                .any(|c| matches!(c, SchemaChange::AddForeignKey { .. })),
+            "must never emit an AddForeignKey on a pre-existing column"
+        );
+
+        // The guard refuses it — with no override (the SQL may be unappliable).
+        let err = guard_plan(&plan, DEFAULT_OPTS).unwrap_err();
+        assert!(
+            matches!(err, DiffError::AddForeignKeyToPreexistingColumn { .. }),
+            "guard refuses the pre-existing-column FK add: {err:?}"
+        );
+        assert!(
+            err.to_string().contains("posts_author_id_fkey"),
+            "the error explains the constraint-name collision: {err}"
+        );
+        // --allow-destructive does NOT override it (no safe way to skip a duplicate).
+        assert!(matches!(
+            guard_plan(&plan, ALLOW).unwrap_err(),
+            DiffError::AddForeignKeyToPreexistingColumn { .. }
+        ));
+    }
+
+    #[test]
+    fn add_fk_on_new_column_is_allowed() {
+        // Control for finding 902: a BRAND-NEW FK column (absent from the baseline)
+        // is safe — there is no pre-existing constraint to collide with. It arrives
+        // as an `AddColumn` whose `REFERENCES` renders inline in the `ADD COLUMN`
+        // (never as a separate `AddForeignKey`), so it is neither refused nor a
+        // marker, and the emitted SQL carries the foreign key.
+        let base = vec![posts_with(vec![])];
+        let mut author = col("author_id", ColumnType::Int64);
+        author.nullable = true;
+        author.references = Some(ForeignKey::new("users", "id"));
+        let want = parsed(vec![posts_with(vec![author.clone()])], vec![]);
+        let plan = diff_schema(&base, &want, DEFAULT_OPTS);
+        assert_eq!(
+            plan.changes,
+            vec![SchemaChange::AddColumn {
+                table: "posts".to_owned(),
+                column: author,
+            }],
+            "a new FK column is a plain AddColumn, not a refused marker: {plan:?}"
+        );
+        // It passes the guard and emits the inline REFERENCES.
+        guard_plan(&plan, DEFAULT_OPTS).expect("a new FK column is emittable");
+        let up = emit_up_sql(&plan).expect("emit up");
+        assert!(
+            up.contains("ADD COLUMN author_id BIGINT NULL REFERENCES users(id)"),
+            "the new FK column emits its inline REFERENCES: {up}"
         );
     }
 
@@ -3664,6 +3861,42 @@ mod tests {
         assert!(
             msg.contains("users") && msg.contains("posts.user_id"),
             "names the dropped table and the retained referencer: {msg}"
+        );
+    }
+
+    /// Finding 667 (documented limitation): the slice-2 parser cannot see a
+    /// generated `#[belongs_to(...)]` association FK — a `<name>_id: i64` column is
+    /// lifted as a plain `Int64` with `references: None` and NO diagnostic — so an
+    /// invisible inbound association FK on a *retained* table cannot be detected
+    /// offline, and this engine emits an unchecked `DROP TABLE` for it. A precise
+    /// guard is impossible without schema introspection (a future slice); a blanket
+    /// refuse-all-drops would make the common case useless. Instead every emitted
+    /// `DROP TABLE` carries an advisory `-- autumn-safety:` comment naming this gap.
+    /// This test pins that advisory (no behavioral test is possible for the
+    /// invisible case — by definition the engine has no signal for it). The
+    /// *visible*-FK protection is unaffected — see
+    /// `drop_table_with_retained_inbound_fk_is_refused_even_with_allow_destructive`
+    /// above, which still refuses a drop blocked by an observable `references`.
+    #[test]
+    fn drop_table_emits_invisible_association_fk_advisory() {
+        let plan = MigrationPlan {
+            backend: Backend::Postgres,
+            changes: vec![SchemaChange::DropTable(posts_with(vec![]))],
+        };
+        guard_plan(&plan, ALLOW).expect("a plain DROP TABLE (no visible inbound FK) is allowed");
+        let up = emit_up_sql(&plan).expect("emit up");
+        assert!(
+            up.contains("-- autumn-safety:")
+                && up.contains("#[belongs_to(...)]")
+                && up.contains("the offline snapshot cannot see"),
+            "the DROP TABLE carries the invisible-association-FK advisory: {up}"
+        );
+        // The advisory precedes the statement, and the real statement is still emitted.
+        let advisory = up.find("-- autumn-safety:").expect("advisory present");
+        let stmt = up.find("DROP TABLE posts;").expect("statement present");
+        assert!(
+            advisory < stmt,
+            "advisory comment precedes the DROP TABLE: {up}"
         );
     }
 
