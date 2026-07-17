@@ -41,6 +41,19 @@
 //! `idx_<table>_<field>_unique` unique index, so the index set already carries
 //! the uniqueness signal; diffing both would double-count.
 //!
+//! # Required-column additions need a default
+//!
+//! Adding a `NOT NULL` column **without a default** to an *existing* table is
+//! refused ([`DiffError::RequiredColumnWithoutDefault`]): Postgres validates the
+//! constraint against existing rows the instant the column is added, so the
+//! `ALTER TABLE ... ADD COLUMN ... NOT NULL` fails on any table that already has
+//! rows, and the offline diff engine has no backfill value to synthesize (the
+//! safe nullable → backfill → `SET NOT NULL` sequence is a manual multi-step
+//! migration). Give the field a `#[default(...)]` (including a synthesized one
+//! like `created_at DEFAULT NOW()`) or make it nullable (`Option<...>`). A
+//! `NOT NULL`, no-default column inside a brand-new `CreateTable` is fine — the
+//! table is empty — and is not refused.
+//!
 //! # `SQLite` boundary
 //!
 //! Slice 4 is **pg-first**: it renders Postgres fully and the portable `SQLite`
@@ -336,6 +349,26 @@ pub enum DiffError {
         from: String,
         /// The desired SQL type.
         to: String,
+    },
+
+    /// An `ADD COLUMN` of a `NOT NULL` column without a default, to an existing
+    /// table (unsupported this slice, **no override** — the SQL is unappliable on
+    /// a table that already has rows, not merely lossy). Postgres validates the
+    /// `NOT NULL` against existing rows the moment the column is added, so
+    /// `ALTER TABLE t ADD COLUMN c <type> NOT NULL` fails on any non-empty table;
+    /// the offline diff engine has no backfill value to synthesize. A brand-new
+    /// [`SchemaChange::CreateTable`] carrying such a column is fine (the table is
+    /// empty) and is **not** refused.
+    #[error(
+        "cannot add required column `{table}.{column}`: a NOT NULL column without a default \
+         fails on a table that already has rows. Add a default (`#[default(...)]`) or make the \
+         column nullable (`Option<...>`)."
+    )]
+    RequiredColumnWithoutDefault {
+        /// The table gaining the column.
+        table: String,
+        /// The required column name.
+        column: String,
     },
 }
 
@@ -762,44 +795,71 @@ pub fn guard_plan(plan: &MigrationPlan, opts: DiffOptions) -> Result<(), DiffErr
         return Err(err);
     }
 
+    // 5. Possible rename — a single table that both dropped and added columns.
+    //    Overridable, so it is only enforced when destructive changes are not
+    //    allowed. Deliberately checked *before* the required-column guard below so
+    //    a rename-shaped drop+add reports the more-actionable `#[renamed_from]`
+    //    guidance rather than "add a default". Grouped in a BTreeMap so the
+    //    reported table is deterministic (sorted).
+    if !opts.allow_destructive {
+        let mut per_table: BTreeMap<String, (Vec<String>, Vec<String>)> = BTreeMap::new();
+        for change in &plan.changes {
+            match change {
+                SchemaChange::DropColumn { table, column } => {
+                    per_table
+                        .entry(table.clone())
+                        .or_default()
+                        .0
+                        .push(column.name.clone());
+                }
+                SchemaChange::AddColumn { table, column } => {
+                    per_table
+                        .entry(table.clone())
+                        .or_default()
+                        .1
+                        .push(column.name.clone());
+                }
+                _ => {}
+            }
+        }
+        if let Some((table, (dropped, added))) = per_table
+            .into_iter()
+            .find(|(_, (dropped, added))| !dropped.is_empty() && !added.is_empty())
+        {
+            return Err(DiffError::PossibleRename {
+                table,
+                dropped,
+                added,
+            });
+        }
+    }
+
+    // 6. Add of a required column (NOT NULL, no default) to an existing table —
+    //    no override. Postgres validates the NOT NULL against existing rows the
+    //    instant the column is added, so `ADD COLUMN ... NOT NULL` fails on any
+    //    non-empty table; the offline engine has no backfill value to synthesize,
+    //    so it refuses rather than emit an unappliable migration. This matches
+    //    only `AddColumn` (altering an existing baseline table) — a NOT NULL,
+    //    no-default column inlined in a brand-new `CreateTable` is empty-table-safe
+    //    and is never matched here. It is not destructive, so it always refuses,
+    //    regardless of `--allow-destructive` (checked in both branches: the
+    //    `allow_destructive` short-circuit below is only reached after this guard).
+    if let Some((table, column)) = plan.changes.iter().find_map(|c| match c {
+        SchemaChange::AddColumn { table, column }
+            if !column.nullable && column.default.is_none() =>
+        {
+            Some((table.clone(), column.name.clone()))
+        }
+        _ => None,
+    }) {
+        return Err(DiffError::RequiredColumnWithoutDefault { table, column });
+    }
+
     if opts.allow_destructive {
         return Ok(());
     }
 
-    // 3. Possible rename — a single table that both dropped and added columns.
-    //    Grouped in a BTreeMap so the reported table is deterministic (sorted).
-    let mut per_table: BTreeMap<String, (Vec<String>, Vec<String>)> = BTreeMap::new();
-    for change in &plan.changes {
-        match change {
-            SchemaChange::DropColumn { table, column } => {
-                per_table
-                    .entry(table.clone())
-                    .or_default()
-                    .0
-                    .push(column.name.clone());
-            }
-            SchemaChange::AddColumn { table, column } => {
-                per_table
-                    .entry(table.clone())
-                    .or_default()
-                    .1
-                    .push(column.name.clone());
-            }
-            _ => {}
-        }
-    }
-    if let Some((table, (dropped, added))) = per_table
-        .into_iter()
-        .find(|(_, (dropped, added))| !dropped.is_empty() && !added.is_empty())
-    {
-        return Err(DiffError::PossibleRename {
-            table,
-            dropped,
-            added,
-        });
-    }
-
-    // 4. Destructive drops.
+    // 7. Destructive drops.
     let destructive_ops: Vec<DestructiveOp> = plan
         .changes
         .iter()
@@ -2140,6 +2200,13 @@ mod tests {
 
     #[test]
     fn possible_rename_overridden_by_allow_destructive() {
+        // The added `handle` is nullable so it is itself appliable — this test
+        // exercises the rename→independent-drop/add override in isolation, not the
+        // orthogonal required-column guard (an independent add of a NOT NULL,
+        // no-default column is unappliable and is refused even under --allow-destructive;
+        // see `add_not_null_column_without_default_is_refused`).
+        let mut handle = col("handle", ColumnType::Text);
+        handle.nullable = true;
         let plan = MigrationPlan {
             backend: Backend::Postgres,
             changes: vec![
@@ -2149,7 +2216,7 @@ mod tests {
                 },
                 SchemaChange::AddColumn {
                     table: "users".to_owned(),
-                    column: col("handle", ColumnType::Text),
+                    column: handle,
                 },
             ],
         };
@@ -2310,6 +2377,100 @@ mod tests {
             up.contains("ALTER TABLE posts ADD COLUMN bio TEXT NULL;"),
             "{up}"
         );
+    }
+
+    #[test]
+    fn add_not_null_column_without_default_is_refused() {
+        // Adding a NOT NULL, no-default column to an *existing* table is unappliable
+        // on a table that already has rows — refused, with no override.
+        let plan = MigrationPlan {
+            backend: Backend::Postgres,
+            changes: vec![SchemaChange::AddColumn {
+                table: "posts".to_owned(),
+                column: col("title", ColumnType::Text),
+            }],
+        };
+        let err = guard_plan(&plan, DEFAULT_OPTS).unwrap_err();
+        match &err {
+            DiffError::RequiredColumnWithoutDefault { table, column } => {
+                assert_eq!(table, "posts");
+                assert_eq!(column, "title");
+            }
+            other => panic!("expected RequiredColumnWithoutDefault, got {other:?}"),
+        }
+        assert!(
+            err.to_string()
+                .contains("cannot add required column `posts.title`"),
+            "message: {err}"
+        );
+        // No override — --allow-destructive does not permit it (it is unappliable,
+        // not merely destructive).
+        assert!(
+            matches!(
+                guard_plan(&plan, ALLOW).unwrap_err(),
+                DiffError::RequiredColumnWithoutDefault { .. }
+            ),
+            "must refuse even with --allow-destructive"
+        );
+    }
+
+    #[test]
+    fn add_not_null_column_with_default_is_allowed() {
+        // A NOT NULL column WITH a default is appliable (existing rows get the
+        // default) — emit it normally, do not refuse.
+        let mut created = col("created_at", ColumnType::Timestamp);
+        created.default = Some(ColumnDefault::Now);
+        let plan = MigrationPlan {
+            backend: Backend::Postgres,
+            changes: vec![SchemaChange::AddColumn {
+                table: "posts".to_owned(),
+                column: created,
+            }],
+        };
+        guard_plan(&plan, DEFAULT_OPTS).expect("NOT NULL with a default is appliable");
+        let up = emit_up_sql(&plan).expect("emit");
+        assert!(
+            up.contains(
+                "ALTER TABLE posts ADD COLUMN created_at TIMESTAMP NOT NULL DEFAULT NOW();"
+            ),
+            "{up}"
+        );
+    }
+
+    #[test]
+    fn add_nullable_column_is_allowed() {
+        // A nullable added column is always appliable.
+        let mut bio = col("bio", ColumnType::Text);
+        bio.nullable = true;
+        let plan = MigrationPlan {
+            backend: Backend::Postgres,
+            changes: vec![SchemaChange::AddColumn {
+                table: "posts".to_owned(),
+                column: bio,
+            }],
+        };
+        guard_plan(&plan, DEFAULT_OPTS).expect("nullable add is appliable");
+        let up = emit_up_sql(&plan).expect("emit");
+        assert!(
+            up.contains("ALTER TABLE posts ADD COLUMN bio TEXT NULL;"),
+            "{up}"
+        );
+    }
+
+    #[test]
+    fn create_table_with_not_null_no_default_column_is_not_refused() {
+        // A NOT NULL, no-default column inside a brand-new CreateTable is fine —
+        // the table is empty — so the required-column guard must NOT fire on it.
+        let plan = MigrationPlan {
+            backend: Backend::Postgres,
+            changes: vec![SchemaChange::CreateTable(posts_with(vec![col(
+                "title",
+                ColumnType::Text,
+            )]))],
+        };
+        guard_plan(&plan, DEFAULT_OPTS).expect("CreateTable with a NOT NULL column is empty-safe");
+        let up = emit_up_sql(&plan).expect("emit");
+        assert!(up.contains("title TEXT NOT NULL"), "{up}");
     }
 
     #[test]
