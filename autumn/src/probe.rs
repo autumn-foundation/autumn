@@ -77,7 +77,7 @@ pub trait ProvideProbeState {
     ///     fn profile(&self) -> &str { "dev" }
     ///     fn uptime_display(&self) -> String { String::new() }
     ///     #[cfg(feature = "db")]
-    ///     fn pool(&self) -> Option<&diesel_async::pooled_connection::deadpool::Pool<crate::db::RuntimeConnection>> { None }
+    ///     fn pool(&self) -> Option<&autumn_web::reexports::diesel_async::pooled_connection::deadpool::Pool<autumn_web::db::RuntimeConnection>> { None }
     /// }
     ///
     /// let state = MyState { probes: ProbeState::pending_startup() };
