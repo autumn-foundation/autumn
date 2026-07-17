@@ -133,9 +133,10 @@ pub enum ReadRoute {
     ReadPool(diesel_async::pooled_connection::deadpool::Pool<crate::db::RuntimeConnection>),
     /// A replica is configured but currently unready, and the
     /// [`ReplicaFallback::FailReadiness`](crate::config::ReplicaFallback)
-    /// policy forbids falling back to the primary. Generated reads fail
-    /// fast with `503 Service Unavailable` instead of silently serving
-    /// from the wrong role.
+    /// policy forbids falling back to the primary.
+    ///
+    /// Generated reads fail fast with `503 Service Unavailable` instead of
+    /// silently serving from the wrong role.
     Unavailable,
 }
 
@@ -348,8 +349,9 @@ pub trait AutumnDependents {
 // resolves to the empty slice.
 impl<T: ?Sized> AutumnDependents for T {}
 
-/// Publish a batch of deferred dependent-cascade OOB *delete* broadcasts,
-/// accumulated during a `dependent = destroy` cascade over `broadcasts = true`
+/// Publish a batch of deferred dependent-cascade OOB *delete* broadcasts.
+///
+/// Accumulated during a `dependent = destroy` cascade over `broadcasts = true`
 /// children and published **after** the parent transaction commits (#1369).
 ///
 /// Each entry is `(topic, dom_id)`; the fragment is empty and the swap is
@@ -387,9 +389,10 @@ pub fn publish_deferred_dependent_broadcasts(broadcasts: Vec<(String, String)>) 
     }
 }
 
-/// No-op fallback when live broadcasting is not compiled in. The accumulation
-/// side only runs for `broadcasts = true` children (which require these
-/// features), so the buffer is always empty in this configuration.
+/// No-op fallback when live broadcasting is not compiled in.
+///
+/// The accumulation side only runs for `broadcasts = true` children (which
+/// require these features), so the buffer is always empty in this configuration.
 #[cfg(not(all(feature = "ws", feature = "maud", feature = "htmx")))]
 #[doc(hidden)]
 pub fn publish_deferred_dependent_broadcasts(_broadcasts: Vec<(String, String)>) {}
@@ -495,7 +498,9 @@ pub trait ModelPrimaryKey {
 
 /// Framework plumbing bridging a `#[repository]`-generated struct to the
 /// many-to-many (`#[has_many(Target, through = join_table)]`) mutation
-/// helpers `#[model]` generates. `#[repository(Model, ...)]` implements this
+/// helpers `#[model]` generates.
+///
+/// `#[repository(Model, ...)]` implements this
 /// once, unconditionally, alongside the model's other generated impls; the
 /// `Model` associated type is what keeps `add_*`/`remove_*`/`set_*` method
 /// resolution unambiguous when more than one m2m trait is in scope (e.g. two
@@ -512,9 +517,10 @@ pub trait M2mConnSource: Send + Sync {
     type Model;
 
     /// Acquire a primary-pool connection for an `add_*`/`remove_*`/`set_*`
-    /// many-to-many mutation. Mirrors the write-connection acquisition every
-    /// other mutating generated method uses (marks the read-your-writes pin
-    /// on success).
+    /// many-to-many mutation.
+    ///
+    /// Mirrors the write-connection acquisition every other mutating generated
+    /// method uses (marks the read-your-writes pin on success).
     fn __autumn_m2m_write_conn(
         &self,
     ) -> impl ::std::future::Future<
