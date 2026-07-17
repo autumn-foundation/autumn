@@ -30,7 +30,8 @@ use diesel_migrations::FileBasedMigrations;
 use serde::Serialize;
 
 use super::diff::{DiffOptions, diff_schema};
-use super::parse::parse_models_path;
+use super::introspect::introspect_postgres;
+use super::parse::{ParsedSchema, parse_models_path};
 use super::snapshot::{SNAPSHOT_DEFAULT_PATH, SnapshotError, load_snapshot};
 
 /// A single diagnostic check outcome.
@@ -104,6 +105,25 @@ enum PendingState {
     Unreachable(String),
 }
 
+/// Database-vs-snapshot drift probe outcome (the live database introspected and
+/// diffed against the checked-in snapshot baseline). Offline-safe: an
+/// unreachable database is a distinct, non-failing state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DbSchemaState {
+    /// No database URL is configured — the check is skipped.
+    NotConfigured,
+    /// The backend/build cannot run this check (e.g. non-Postgres backend).
+    Skipped(String),
+    /// No readable snapshot baseline to diff the database against.
+    SnapshotMissing,
+    /// The database could not be reached/introspected (secret-free reason).
+    Unreachable(String),
+    /// The live database matches the snapshot baseline.
+    Clean,
+    /// The database diverges from the snapshot baseline by this many changes.
+    Drifted(usize),
+}
+
 /// Filesystem/snapshot/backend facts gathered without touching the database.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LocalFacts {
@@ -127,7 +147,8 @@ pub fn run_doctor(profile: Option<&str>, json: bool) -> Result<(), String> {
         .map_err(|e| format!("failed to resolve the current directory: {e}"))?;
     let local = gather_local_facts(&project_root, profile);
     let pending = gather_pending(&project_root, profile, &local);
-    let checks = compute_checks(&local, &pending);
+    let db_schema = gather_db_schema_drift(&project_root, profile, &local);
+    let checks = compute_checks(&local, &pending, &db_schema);
     render(&checks, json)?;
     finish(&checks)
 }
@@ -256,9 +277,59 @@ fn probe_pending(url: &str, migrations_dir: &Path) -> PendingState {
     }
 }
 
+/// Probe the live database schema and diff it against the checked-in snapshot.
+///
+/// Offline-safe by construction (mirrors [`gather_pending`]): no URL →
+/// [`DbSchemaState::NotConfigured`]; a non-Postgres backend →
+/// [`DbSchemaState::Skipped`] (introspection is Postgres-only in this slice); a
+/// missing/unreadable snapshot → [`DbSchemaState::SnapshotMissing`]; a
+/// connect/query failure → [`DbSchemaState::Unreachable`] (a WARN, never an
+/// error — doctor must stay runnable offline). Only when all of those pass does
+/// it diff the introspected tables (desired) against the snapshot tables
+/// (baseline) into [`DbSchemaState::Clean`] / [`DbSchemaState::Drifted`].
+fn gather_db_schema_drift(
+    project_root: &Path,
+    profile: Option<&str>,
+    local: &LocalFacts,
+) -> DbSchemaState {
+    let Some(url) = crate::migrate::resolve_primary_url(profile) else {
+        return DbSchemaState::NotConfigured;
+    };
+    if local.detected_backend != Backend::Postgres {
+        return DbSchemaState::Skipped(format!(
+            "database-schema drift check is Postgres-only; detected {:?} backend",
+            local.detected_backend
+        ));
+    }
+    // Reload the snapshot baseline from disk (offline, cheap). A missing or
+    // unreadable snapshot means there is nothing to diff the database against.
+    let snapshot_path = project_root.join(SNAPSHOT_DEFAULT_PATH);
+    let Ok(snapshot) = load_snapshot(&snapshot_path) else {
+        return DbSchemaState::SnapshotMissing;
+    };
+    match introspect_postgres(&url) {
+        Ok(tables) => {
+            let desired = ParsedSchema::from_tables(tables);
+            let plan = diff_schema(&snapshot.tables, &desired, DiffOptions::default());
+            if plan.is_empty() {
+                DbSchemaState::Clean
+            } else {
+                DbSchemaState::Drifted(plan.changes.len())
+            }
+        }
+        // IntrospectError Display is credential-safe.
+        Err(e) => DbSchemaState::Unreachable(e.to_string()),
+    }
+}
+
 /// Pure check computation over gathered facts. Ordered filesystem → snapshot →
-/// drift → backend (provider-lock, then dialect-vs-DB) → database.
-fn compute_checks(local: &LocalFacts, pending: &PendingState) -> Vec<Check> {
+/// drift → backend (provider-lock, then dialect-vs-DB) → database
+/// (pending-migrations, then database-schema drift).
+fn compute_checks(
+    local: &LocalFacts,
+    pending: &PendingState,
+    db_schema: &DbSchemaState,
+) -> Vec<Check> {
     let mut checks = Vec::new();
 
     // 1. project-root
@@ -316,6 +387,9 @@ fn compute_checks(local: &LocalFacts, pending: &PendingState) -> Vec<Check> {
 
     // 6. pending-migrations
     checks.push(pending_check(pending));
+
+    // 7. database-schema-drift (live DB introspected vs the snapshot baseline)
+    checks.push(db_schema_drift_check(db_schema));
 
     checks
 }
@@ -451,6 +525,49 @@ fn pending_check(pending: &PendingState) -> Check {
     }
 }
 
+/// The `database-schema-drift` row (live database introspected vs the snapshot
+/// baseline). Never an `Error`: an unreachable/misconfigured/non-Postgres
+/// database is a WARN so doctor stays runnable offline (mirroring
+/// `pending-migrations` / `snapshot-dialect-vs-db`).
+fn db_schema_drift_check(state: &DbSchemaState) -> Check {
+    let name = "database-schema-drift".to_string();
+    match state {
+        DbSchemaState::Clean => Check {
+            name,
+            status: Status::Ok,
+            detail: "database schema matches the snapshot baseline".to_string(),
+        },
+        DbSchemaState::Drifted(n) => Check {
+            name,
+            status: Status::Warn,
+            detail: format!(
+                "database schema differs from the snapshot in {n} place(s) — run \
+                 `autumn schema pull` to update the baseline or generate a migration"
+            ),
+        },
+        DbSchemaState::Unreachable(reason) => Check {
+            name,
+            status: Status::Warn,
+            detail: format!("could not reach the database: {reason}"),
+        },
+        DbSchemaState::NotConfigured => Check {
+            name,
+            status: Status::Warn,
+            detail: "no database configured — skipped".to_string(),
+        },
+        DbSchemaState::Skipped(reason) => Check {
+            name,
+            status: Status::Warn,
+            detail: reason.clone(),
+        },
+        DbSchemaState::SnapshotMissing => Check {
+            name,
+            status: Status::Warn,
+            detail: "skipped — no readable snapshot baseline".to_string(),
+        },
+    }
+}
+
 /// Print the report as an aligned table, or as JSON when `json` is set.
 fn render(checks: &[Check], json: bool) -> Result<(), String> {
     if json {
@@ -553,7 +670,11 @@ mod tests {
     fn missing_project_root_is_error() {
         let root = tempfile::tempdir().expect("tempdir"); // no Cargo.toml
         let local = gather_local_facts(root.path(), None);
-        let checks = compute_checks(&local, &PendingState::NotConfigured);
+        let checks = compute_checks(
+            &local,
+            &PendingState::NotConfigured,
+            &DbSchemaState::NotConfigured,
+        );
         let pr = checks.iter().find(|c| c.name == "project-root").unwrap();
         assert_eq!(pr.status, Status::Error, "{pr:?}");
         // finish() turns it into a non-zero exit.
@@ -564,7 +685,11 @@ mod tests {
     fn matching_models_report_drift_ok() {
         let root = scaffold(POST_MODEL, Some(&posts_snapshot("Postgres")));
         let local = gather_local_facts(root.path(), None);
-        let checks = compute_checks(&local, &PendingState::NotConfigured);
+        let checks = compute_checks(
+            &local,
+            &PendingState::NotConfigured,
+            &DbSchemaState::NotConfigured,
+        );
         let drift = checks.iter().find(|c| c.name == "snapshot-drift").unwrap();
         assert_eq!(drift.status, Status::Ok, "{drift:?}");
         // No ERROR checks (detected Postgres matches the Postgres snapshot).
@@ -585,7 +710,11 @@ mod tests {
         "#;
         let root = scaffold(models, Some(&posts_snapshot("Postgres")));
         let local = gather_local_facts(root.path(), None);
-        let checks = compute_checks(&local, &PendingState::NotConfigured);
+        let checks = compute_checks(
+            &local,
+            &PendingState::NotConfigured,
+            &DbSchemaState::NotConfigured,
+        );
         let drift = checks.iter().find(|c| c.name == "snapshot-drift").unwrap();
         assert_eq!(drift.status, Status::Warn, "{drift:?}");
         assert!(drift.detail.contains("pending model change"), "{drift:?}");
@@ -612,7 +741,11 @@ mod tests {
             detected_backend: Backend::Sqlite,
             url_backend: Some(Backend::Sqlite),
         };
-        let checks = compute_checks(&local, &PendingState::NotConfigured);
+        let checks = compute_checks(
+            &local,
+            &PendingState::NotConfigured,
+            &DbSchemaState::NotConfigured,
+        );
         let lock = checks.iter().find(|c| c.name == "provider-lock").unwrap();
         assert_eq!(lock.status, Status::Ok, "{lock:?}");
         // No ERROR overall: the selected Sqlite backend agrees with the snapshot.
@@ -625,7 +758,11 @@ mod tests {
         let root = scaffold(POST_MODEL, Some(&posts_snapshot("Sqlite")));
         let local = gather_local_facts(root.path(), None);
         assert_eq!(local.detected_backend, Backend::Postgres);
-        let checks = compute_checks(&local, &PendingState::NotConfigured);
+        let checks = compute_checks(
+            &local,
+            &PendingState::NotConfigured,
+            &DbSchemaState::NotConfigured,
+        );
         let lock = checks.iter().find(|c| c.name == "provider-lock").unwrap();
         assert_eq!(lock.status, Status::Error, "{lock:?}");
         assert!(finish(&checks).is_err());
@@ -635,7 +772,11 @@ mod tests {
     fn missing_snapshot_is_snapshot_present_error() {
         let root = scaffold(POST_MODEL, None); // .autumn present, no snapshot file
         let local = gather_local_facts(root.path(), None);
-        let checks = compute_checks(&local, &PendingState::NotConfigured);
+        let checks = compute_checks(
+            &local,
+            &PendingState::NotConfigured,
+            &DbSchemaState::NotConfigured,
+        );
         let snap = checks
             .iter()
             .find(|c| c.name == "snapshot-present")
@@ -651,7 +792,11 @@ mod tests {
     fn unreadable_snapshot_is_snapshot_present_error() {
         let root = scaffold(POST_MODEL, Some("{ not valid json"));
         let local = gather_local_facts(root.path(), None);
-        let checks = compute_checks(&local, &PendingState::NotConfigured);
+        let checks = compute_checks(
+            &local,
+            &PendingState::NotConfigured,
+            &DbSchemaState::NotConfigured,
+        );
         let snap = checks
             .iter()
             .find(|c| c.name == "snapshot-present")
@@ -724,7 +869,11 @@ mod tests {
     fn report_ordering_is_filesystem_then_snapshot_then_db() {
         let root = scaffold(POST_MODEL, Some(&posts_snapshot("Postgres")));
         let local = gather_local_facts(root.path(), None);
-        let checks = compute_checks(&local, &PendingState::NotConfigured);
+        let checks = compute_checks(
+            &local,
+            &PendingState::NotConfigured,
+            &DbSchemaState::NotConfigured,
+        );
         let names: Vec<&str> = checks.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(
             names,
@@ -735,7 +884,60 @@ mod tests {
                 "provider-lock",
                 "snapshot-dialect-vs-db",
                 "pending-migrations",
+                "database-schema-drift",
             ]
         );
+    }
+
+    #[test]
+    fn db_schema_drift_states_map_to_expected_status() {
+        // Clean → OK.
+        assert_eq!(
+            db_schema_drift_check(&DbSchemaState::Clean).status,
+            Status::Ok
+        );
+        // Drifted → WARN, names the remediation.
+        let drifted = db_schema_drift_check(&DbSchemaState::Drifted(3));
+        assert_eq!(drifted.status, Status::Warn);
+        assert!(drifted.detail.contains("3 place(s)"), "{drifted:?}");
+        assert!(drifted.detail.contains("autumn schema pull"), "{drifted:?}");
+        // Unreachable → WARN (never an error; doctor stays offline-runnable).
+        let down = db_schema_drift_check(&DbSchemaState::Unreachable("refused".to_string()));
+        assert_eq!(down.status, Status::Warn);
+        assert!(down.detail.contains("could not reach the database"));
+        // Non-Postgres skip / not-configured / no-snapshot → WARN, never error.
+        assert_eq!(
+            db_schema_drift_check(&DbSchemaState::Skipped("sqlite".to_string())).status,
+            Status::Warn
+        );
+        assert_eq!(
+            db_schema_drift_check(&DbSchemaState::NotConfigured).status,
+            Status::Warn
+        );
+        assert_eq!(
+            db_schema_drift_check(&DbSchemaState::SnapshotMissing).status,
+            Status::Warn
+        );
+    }
+
+    #[test]
+    fn db_schema_drift_never_fails_the_command() {
+        // Even a drifted/unreachable database keeps the whole report non-failing
+        // (a WARN alone never trips `finish`) — doctor must run clean offline.
+        let root = scaffold(POST_MODEL, Some(&posts_snapshot("Postgres")));
+        let local = gather_local_facts(root.path(), None);
+        for state in [
+            DbSchemaState::Drifted(5),
+            DbSchemaState::Unreachable("connection refused".to_string()),
+            DbSchemaState::Clean,
+        ] {
+            let checks = compute_checks(&local, &PendingState::NotConfigured, &state);
+            let db = checks
+                .iter()
+                .find(|c| c.name == "database-schema-drift")
+                .unwrap();
+            assert_ne!(db.status, Status::Error, "{db:?}");
+            assert!(finish(&checks).is_ok(), "checks: {checks:?}");
+        }
     }
 }
