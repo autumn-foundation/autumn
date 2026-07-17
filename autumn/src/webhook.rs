@@ -1517,7 +1517,7 @@ mod tests {
     fn test_parse_stripe_signature_valid() {
         let header = "t=1614556800,v1=signature1,v1=signature2,v0=ignored";
         let (timestamp, signatures) = parse_stripe_signature(header).unwrap();
-        assert_eq!(timestamp, 1614556800);
+        assert_eq!(timestamp, 1_614_556_800);
         assert_eq!(signatures, vec!["signature1", "signature2"]);
     }
 
@@ -1551,19 +1551,19 @@ mod tests {
 
     #[test]
     fn test_verify_timestamp_valid() {
-        let received_at = UNIX_EPOCH + Duration::from_secs(1614556800);
-        assert!(verify_timestamp(1614556800, received_at, 300).is_ok());
-        assert!(verify_timestamp(1614556800 + 300, received_at, 300).is_ok());
-        assert!(verify_timestamp(1614556800 - 300, received_at, 300).is_ok());
+        let received_at = UNIX_EPOCH + Duration::from_secs(1_614_556_800);
+        assert!(verify_timestamp(1_614_556_800, received_at, 300).is_ok());
+        assert!(verify_timestamp(1_614_556_800 + 300, received_at, 300).is_ok());
+        assert!(verify_timestamp(1_614_556_800 - 300, received_at, 300).is_ok());
     }
 
     #[test]
     fn test_verify_timestamp_stale() {
-        let received_at = UNIX_EPOCH + Duration::from_secs(1614556800);
-        let err = verify_timestamp(1614556800 + 301, received_at, 300).unwrap_err();
+        let received_at = UNIX_EPOCH + Duration::from_secs(1_614_556_800);
+        let err = verify_timestamp(1_614_556_800 + 301, received_at, 300).unwrap_err();
         assert!(matches!(err, WebhookVerifyError::StaleTimestamp));
 
-        let err2 = verify_timestamp(1614556800 - 301, received_at, 300).unwrap_err();
+        let err2 = verify_timestamp(1_614_556_800 - 301, received_at, 300).unwrap_err();
         assert!(matches!(err2, WebhookVerifyError::StaleTimestamp));
     }
 }
