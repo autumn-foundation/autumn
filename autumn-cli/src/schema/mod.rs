@@ -445,8 +445,12 @@ fn diff_at(
     }
     diff::guard_plan(&plan, opts).map_err(|e| e.to_string())?;
 
-    let up = diff::emit_up_sql(&plan).map_err(|e| e.to_string())?;
-    let down = diff::emit_down_sql(&plan).map_err(|e| e.to_string())?;
+    // The SQLite table-recreate path needs each affected table's full desired (up)
+    // / baseline (down) shape, which the per-change deltas don't carry; thread them
+    // in via the context. Postgres ignores it (identical output).
+    let ctx = diff::SchemaContext::from_tables(&desired.tables, &baseline.tables);
+    let up = diff::emit_up_sql_with_context(&plan, &ctx).map_err(|e| e.to_string())?;
+    let down = diff::emit_down_sql_with_context(&plan, &ctx).map_err(|e| e.to_string())?;
 
     if !write_migration {
         print!("{}", diff::describe_plan(&plan));

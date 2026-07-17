@@ -118,25 +118,39 @@
 //! accepts the first `ADD CONSTRAINT`/`CREATE INDEX` and rejects the second as a
 //! duplicate relation — an unappliable migration.
 //!
-//! [`guard_plan`] refuses (no override — the SQL is unappliable, not merely lossy)
-//! any Postgres plan that generates an FK-constraint or index identifier **longer
-//! than 63 bytes**, plus (defensively) any pair of generated names that collide
-//! after truncation ([`DiffError::GeneratedIdentifierTooLong`]). Refusing >63-byte
-//! names is the precise rule, not merely a conservative over-refusal: 63 bytes is
-//! exactly the threshold at which PG truncation — and hence both hazards — can
-//! occur, so a name at or under the limit is safe. The check is **Postgres-only**:
-//! `SQLite` has no comparably short identifier limit and does not truncate. Refusal
-//! is the proportionate slice-4 choice; generating a bounded, collision-resistant
-//! name (truncate + short hash suffix, kept in sync across the up and down
-//! renderers) is deferred future work.
+//! The **engine-generated FK-constraint name** is purely internal (Postgres would
+//! otherwise auto-name the constraint), so it is safe to rename: when
+//! `{table}_{column}_fkey` would exceed 63 bytes it is passed through
+//! [`bounded_pg_identifier`], which truncates the head and appends a short,
+//! deterministic hex suffix (a digest of the full untruncated name) so the result
+//! is a valid `≤ 63`-byte identifier. The **same** helper drives both the up
+//! `ADD CONSTRAINT` and the down `DROP CONSTRAINT`, and the [`guard_plan`] length
+//! check, so all three always agree on the emitted name. A short FK name (the
+//! common case) is returned unchanged, so Postgres output is byte-stable.
+//!
+//! Parser-provided index names (`idx_<table>_<field>`) are **not** renamed — the
+//! app spells them elsewhere — so [`guard_plan`] still refuses (no override — the
+//! SQL is unappliable, not merely lossy) any Postgres plan that generates an index
+//! identifier **longer than 63 bytes**, plus (defensively) any pair of generated
+//! names that collide after truncation ([`DiffError::GeneratedIdentifierTooLong`]).
+//! The check is **Postgres-only**: `SQLite` has no comparably short identifier
+//! limit and does not truncate.
 //!
 //! # `SQLite` boundary
 //!
-//! Slice 4 is **pg-first**: it renders Postgres fully and the portable `SQLite`
-//! subset (`CREATE TABLE`, `DROP TABLE`, `ADD COLUMN`, `CREATE`/`DROP INDEX`).
-//! The `ALTER`-family on `SQLite` (`ALTER COLUMN`, `ADD CONSTRAINT`) needs the
-//! 12-step table-rebuild that slice 5 owns, so those return
-//! [`EmitError::UnsupportedOnBackend`] here.
+//! Slice 5 renders both dialects. Postgres emits the direct `ALTER`-family
+//! statements; `SQLite` — which has no `ALTER COLUMN TYPE` / `SET`/`DROP NOT NULL`
+//! / `SET DEFAULT` / `ADD CHECK` / `ADD CONSTRAINT` — realises those via the
+//! **table-recreate** strategy ([`emit_up_sql_with_context`]): `CREATE` a new table
+//! with the desired shape, `INSERT .. SELECT` the surviving rows, `DROP` the old
+//! table, `RENAME` the new one into place, and recreate the desired indexes,
+//! wrapped with `PRAGMA foreign_keys` + a `PRAGMA foreign_key_check`. The recreate
+//! needs a table's full desired (up) / baseline (down) shape, which the per-change
+//! [`SchemaChange`] deltas do not carry, so it is threaded in via a
+//! [`SchemaContext`]; the context-free [`emit_up_sql`] / [`emit_down_sql`] cover
+//! Postgres and the portable `SQLite` subset (`CREATE TABLE`, `DROP TABLE`,
+//! `ADD COLUMN`, `CREATE`/`DROP INDEX`) and return [`EmitError::SqliteRebuildUnsupported`]
+//! if a `SQLite` rebuild is required without the shapes to build it.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -694,6 +708,21 @@ pub enum EmitError {
     CyclicTableDependencies {
         /// The tables participating in the cycle (sorted, for a stable message).
         tables: Vec<String>,
+    },
+
+    /// A `SQLite` `ALTER`-family change needs the table-recreate strategy, but the
+    /// full table shape required to rebuild it is unavailable (the context-free
+    /// [`emit_up_sql`] / [`emit_down_sql`] were used, or the shape is missing from
+    /// the [`SchemaContext`]). Use [`emit_up_sql_with_context`] /
+    /// [`emit_down_sql_with_context`] with a populated context.
+    #[error("cannot rebuild SQLite table `{table}` for change `{kind}`: {reason}")]
+    SqliteRebuildUnsupported {
+        /// The table that could not be rebuilt.
+        table: String,
+        /// The kind of rebuild that was attempted.
+        kind: &'static str,
+        /// Why the rebuild could not be rendered.
+        reason: String,
     },
 }
 
@@ -1415,7 +1444,14 @@ fn find_inbound_fk_block(plan: &MigrationPlan) -> Option<DiffError> {
 
 /// The [`DiffError::TypeChangeOnForeignKeyColumn`] refusal for the first
 /// [`SchemaChange::AlterColumnTypeBlockedByFk`] marker in `plan`, if any.
+/// Postgres-only: on `SQLite` an FK-bound type change is safely expressed by the
+/// table-recreate path (the plan still carries the real `AlterColumnType`
+/// alongside the blocked marker, and the rebuild applies it while preserving the
+/// inline `REFERENCES`), so the guard stays out of the `SQLite` boundary.
 fn find_fk_type_change_block(plan: &MigrationPlan) -> Option<DiffError> {
+    if plan.backend != Backend::Postgres {
+        return None;
+    }
     plan.changes.iter().find_map(|c| match c {
         SchemaChange::AlterColumnTypeBlockedByFk { table, column } => {
             Some(DiffError::TypeChangeOnForeignKeyColumn {
@@ -1480,7 +1516,11 @@ fn generated_identifiers(plan: &MigrationPlan) -> Vec<String> {
     for change in &plan.changes {
         match change {
             SchemaChange::AddForeignKey { table, column, .. } => {
-                names.push(format!("{table}_{column}_fkey"));
+                // The FK-constraint name is engine-generated and safe to rename, so it
+                // goes through `bounded_pg_identifier` (matching the `ADD`/`DROP
+                // CONSTRAINT` emitters). A short name is returned unchanged; only an
+                // over-limit one is truncate+hashed — so this never trips the guard.
+                names.push(bounded_pg_identifier(&format!("{table}_{column}_fkey")));
             }
             SchemaChange::AddIndex { index, .. } => names.push(index.name.clone()),
             SchemaChange::CreateTable(table) => {
@@ -1492,17 +1532,67 @@ fn generated_identifiers(plan: &MigrationPlan) -> Vec<String> {
     names
 }
 
-/// `name` truncated to Postgres's 63-byte identifier limit, on a UTF-8 char boundary
-/// (PG truncates by byte; generated names are ASCII, but stay codepoint-safe anyway).
-fn truncate_pg_identifier(name: &str) -> &str {
-    if name.len() <= PG_MAX_IDENTIFIER_BYTES {
+/// `name` truncated to at most `max` bytes, on a UTF-8 char boundary.
+fn truncate_to_bytes(name: &str, max: usize) -> &str {
+    if name.len() <= max {
         return name;
     }
-    let mut end = PG_MAX_IDENTIFIER_BYTES;
+    let mut end = max;
     while !name.is_char_boundary(end) {
         end -= 1;
     }
     &name[..end]
+}
+
+/// `name` truncated to Postgres's 63-byte identifier limit, on a UTF-8 char boundary
+/// (PG truncates by byte; generated names are ASCII, but stay codepoint-safe anyway).
+fn truncate_pg_identifier(name: &str) -> &str {
+    truncate_to_bytes(name, PG_MAX_IDENTIFIER_BYTES)
+}
+
+/// A short, deterministic 8-hex-char digest of `raw`, for collision-resistant
+/// identifier suffixing.
+///
+/// Uses a hand-rolled FNV-1a 64-bit hash (fully specified, dependency-free) rather
+/// than `DefaultHasher`, whose output is not guaranteed stable across Rust versions —
+/// this schema emitter must derive the same suffix on every toolchain, and the up and
+/// down renderers must agree.
+fn short_identifier_hash(raw: &str) -> String {
+    let digest = fnv1a_64(raw.as_bytes());
+    format!("{digest:016x}")[..8].to_owned()
+}
+
+/// FNV-1a 64-bit hash of `bytes` (offset basis `0xcbf29ce484222325`, prime
+/// `0x100000001b3`), fully specified so the digest is deterministic everywhere.
+const fn fnv1a_64(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    let prime: u64 = 0x0000_0100_0000_01b3;
+    let mut i = 0;
+    while i < bytes.len() {
+        hash ^= bytes[i] as u64;
+        hash = hash.wrapping_mul(prime);
+        i += 1;
+    }
+    hash
+}
+
+/// A Postgres-safe (`≤ 63`-byte) identifier for `raw`.
+///
+/// Returns `raw` unchanged when it already fits, so short names — the common case —
+/// are byte-stable. An over-limit name is truncated and suffixed with
+/// `_<8-hex-hash>` of the **full untruncated** name, yielding a deterministic,
+/// collision-resistant identifier that always fits. Applied only to
+/// engine-generated FK-constraint names (safe to rename), never to parser-provided
+/// index names.
+fn bounded_pg_identifier(raw: &str) -> String {
+    if raw.len() <= PG_MAX_IDENTIFIER_BYTES {
+        return raw.to_owned();
+    }
+    let hash = short_identifier_hash(raw);
+    // suffix is "_" + 8 hex chars = 9 bytes; leave room for it within the 63 limit.
+    let head_budget = PG_MAX_IDENTIFIER_BYTES - (hash.len() + 1);
+    let head = truncate_to_bytes(raw, head_budget);
+    format!("{head}_{hash}")
 }
 
 /// The [`DiffError::GeneratedIdentifierTooLong`] refusal when the plan generates an
@@ -1579,9 +1669,9 @@ fn find_possible_rename(plan: &MigrationPlan) -> Option<DiffError> {
 
 /// The [`DiffError::NonImplicitTypeConversion`] refusal for the first
 /// non-implicit `AlterColumnType` in `plan`, if any. Postgres-only: on `SQLite`
-/// every `AlterColumnType` already returns [`EmitError::UnsupportedOnBackend`] at
-/// emit time (slice 5's table-rebuild path owns it), so the classifier stays out
-/// of the `SQLite` boundary.
+/// every `AlterColumnType` is realised by the table-recreate path (which restates
+/// the whole column shape, so an implicit-vs-explicit cast distinction does not
+/// apply), so the classifier stays out of the `SQLite` boundary.
 fn find_non_implicit_conversion(plan: &MigrationPlan) -> Option<DiffError> {
     if plan.backend != Backend::Postgres {
         return None;
@@ -1618,17 +1708,108 @@ const fn is_implicit_pg_type_cast(from: &ColumnType, to: &ColumnType) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// SQL emission (pg-first)
+// SQL emission (pg + sqlite)
 // ---------------------------------------------------------------------------
 
-/// Render the plan's forward SQL (pg-first). One statement group per change, in
-/// canonical up-order, groups separated by a blank line.
+/// Full desired + baseline table shapes, keyed by table name.
+///
+/// The `SQLite` table-recreate path needs a table's complete shape (all columns,
+/// PK, checks, indexes), which the per-change [`SchemaChange`] deltas don't carry,
+/// so the schema-aware [`emit_up_sql_with_context`] / [`emit_down_sql_with_context`]
+/// entry points thread it in. Postgres never rebuilds and so ignores it.
+#[derive(Debug, Clone, Default)]
+pub struct SchemaContext {
+    /// Desired (post-migration) tables, by name — the "new shape" for an up rebuild.
+    pub desired: BTreeMap<String, Table>,
+    /// Baseline (pre-migration) tables, by name — the "new shape" for a down rebuild.
+    pub baseline: BTreeMap<String, Table>,
+}
+
+impl SchemaContext {
+    /// Build a context from the desired + baseline table lists (as passed to
+    /// [`diff_schema`]).
+    #[must_use]
+    pub fn from_tables(desired: &[Table], baseline: &[Table]) -> Self {
+        Self {
+            desired: desired
+                .iter()
+                .map(|t| (t.name.clone(), t.clone()))
+                .collect(),
+            baseline: baseline
+                .iter()
+                .map(|t| (t.name.clone(), t.clone()))
+                .collect(),
+        }
+    }
+}
+
+/// Render the plan's forward SQL without a schema context.
+///
+/// Sufficient for Postgres and the portable `SQLite` subset. If the plan needs a
+/// `SQLite` table rebuild, prefer [`emit_up_sql_with_context`].
 ///
 /// # Errors
 ///
-/// Returns [`EmitError::UnsupportedOnBackend`] for an `ALTER`-family change on
-/// `SQLite` (slice 5 owns the `SQLite` table-rebuild path).
+/// Returns [`EmitError::SqliteRebuildUnsupported`] when a `SQLite` `ALTER`-family
+/// change needs a table rebuild but no shape context was supplied, or
+/// [`EmitError::CyclicTableDependencies`] on an unorderable new-table FK cycle.
+// Retained context-free public API (the command wiring and the SQLite rebuild path
+// use the `_with_context` entry points; this signature is consumed by the parallel
+// slice-6 lane and the diff tests).
+#[allow(dead_code)]
 pub fn emit_up_sql(plan: &MigrationPlan) -> Result<String, EmitError> {
+    emit_up_sql_with_context(plan, &SchemaContext::default())
+}
+
+/// Render the plan's reverse SQL without a schema context.
+///
+/// # Errors
+///
+/// See [`emit_up_sql`].
+#[allow(dead_code)]
+pub fn emit_down_sql(plan: &MigrationPlan) -> Result<String, EmitError> {
+    emit_down_sql_with_context(plan, &SchemaContext::default())
+}
+
+/// Render the plan's forward SQL, using `ctx` for any `SQLite` table rebuild.
+///
+/// Postgres emits the per-change `ALTER`-family statements directly; `SQLite`
+/// coalesces every `ALTER`-family change on a table into a single table-recreate
+/// block built from `ctx.desired`.
+///
+/// # Errors
+///
+/// Returns [`EmitError::SqliteRebuildUnsupported`] when a rebuild is required but
+/// the table's desired/baseline shape is missing from `ctx`, or
+/// [`EmitError::CyclicTableDependencies`] on an unorderable new-table FK cycle.
+pub fn emit_up_sql_with_context(
+    plan: &MigrationPlan,
+    ctx: &SchemaContext,
+) -> Result<String, EmitError> {
+    match plan.backend {
+        Backend::Postgres => emit_up_sql_pg(plan),
+        Backend::Sqlite => emit_up_sql_sqlite(plan, ctx),
+    }
+}
+
+/// Render the plan's reverse SQL, using `ctx` for any `SQLite` table rebuild.
+///
+/// # Errors
+///
+/// See [`emit_up_sql_with_context`].
+pub fn emit_down_sql_with_context(
+    plan: &MigrationPlan,
+    ctx: &SchemaContext,
+) -> Result<String, EmitError> {
+    match plan.backend {
+        Backend::Postgres => emit_down_sql_pg(plan),
+        Backend::Sqlite => emit_down_sql_sqlite(plan, ctx),
+    }
+}
+
+/// The Postgres forward path: one statement group per change, canonical up-order,
+/// groups blank-line separated. Unchanged from the pg-first slice.
+fn emit_up_sql_pg(plan: &MigrationPlan) -> Result<String, EmitError> {
     let ordered = up_ordered(&plan.changes)?;
     let mut groups = Vec::new();
     for change in ordered {
@@ -1641,14 +1822,9 @@ pub fn emit_up_sql(plan: &MigrationPlan) -> Result<String, EmitError> {
     Ok(join_groups(&groups))
 }
 
-/// Render the plan's reverse SQL: the changes reversed and individually inverted,
-/// with `-- irreversible:` markers where data cannot round-trip.
-///
-/// # Errors
-///
-/// Returns [`EmitError::UnsupportedOnBackend`] for an `ALTER`-family change on
-/// `SQLite`.
-pub fn emit_down_sql(plan: &MigrationPlan) -> Result<String, EmitError> {
+/// The Postgres reverse path: changes reversed and individually inverted, with
+/// `-- irreversible:` markers where data cannot round-trip.
+fn emit_down_sql_pg(plan: &MigrationPlan) -> Result<String, EmitError> {
     let mut ordered = up_ordered(&plan.changes)?;
     ordered.reverse();
     let mut groups = Vec::new();
@@ -1660,6 +1836,440 @@ pub fn emit_down_sql(plan: &MigrationPlan) -> Result<String, EmitError> {
         }
     }
     Ok(join_groups(&groups))
+}
+
+/// The change kinds whose `SQLite` realisation is a full table recreate: the
+/// `ALTER`-family Postgres would express as `ALTER COLUMN` / `ADD CHECK` /
+/// `ADD CONSTRAINT`, none of which `SQLite` supports.
+fn sqlite_rebuild_tables(changes: &[SchemaChange]) -> BTreeSet<String> {
+    changes
+        .iter()
+        .filter_map(|c| match c {
+            SchemaChange::AlterColumnType { table, .. }
+            | SchemaChange::DropNotNull { table, .. }
+            | SchemaChange::SetDefault { table, .. }
+            | SchemaChange::AddCheck { table, .. }
+            | SchemaChange::AddForeignKey { table, .. } => Some(table.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The sorted, de-duplicated column names of every
+/// [`SchemaChange::AlterColumnTypeBlockedByFk`] marker in `changes` that targets
+/// `table`. Non-empty only when this table's `SQLite` rebuild is (partly) driven
+/// by an FK-bound type change — the trigger for the FK type-consistency advisory.
+fn fk_type_change_columns(changes: &[&SchemaChange], table: &str) -> Vec<String> {
+    changes
+        .iter()
+        .filter_map(|c| match c {
+            SchemaChange::AlterColumnTypeBlockedByFk { table: t, column } if t == table => {
+                Some(column.clone())
+            }
+            _ => None,
+        })
+        .collect::<BTreeSet<String>>()
+        .into_iter()
+        .collect()
+}
+
+/// The table a change targets, for rebuild-membership tests.
+const fn change_table_name(change: &SchemaChange) -> &str {
+    match change {
+        SchemaChange::CreateTable(t) | SchemaChange::DropTable(t) => t.name.as_str(),
+        SchemaChange::AddColumn { table, .. }
+        | SchemaChange::DropColumn { table, .. }
+        | SchemaChange::AlterColumnType { table, .. }
+        | SchemaChange::SetNotNull { table, .. }
+        | SchemaChange::DropNotNull { table, .. }
+        | SchemaChange::SetDefault { table, .. }
+        | SchemaChange::AddForeignKey { table, .. }
+        | SchemaChange::AddIndex { table, .. }
+        | SchemaChange::DropIndex { table, .. }
+        | SchemaChange::AddCheck { table, .. }
+        | SchemaChange::PrimaryKeyChange { table }
+        | SchemaChange::ForeignKeyChange { table, .. }
+        | SchemaChange::DropTableBlockedByInboundFk { table, .. }
+        | SchemaChange::AlterColumnTypeBlockedByFk { table, .. }
+        | SchemaChange::AddForeignKeyToExistingColumn { table, .. }
+        | SchemaChange::CreateTableBlockedBySkippedField { table, .. } => table.as_str(),
+    }
+}
+
+/// The `SQLite` forward path. Every `ALTER`-family change on a table is coalesced
+/// into a single table-recreate block (emitted once, at the first change touching
+/// that table); all of that table's other changes are folded into the recreate,
+/// which already targets its full desired shape. Non-rebuild tables emit through
+/// the portable per-change path unchanged.
+fn emit_up_sql_sqlite(plan: &MigrationPlan, ctx: &SchemaContext) -> Result<String, EmitError> {
+    let ordered = up_ordered(&plan.changes)?;
+    let rebuild = sqlite_rebuild_tables(&plan.changes);
+    let mut emitted: BTreeSet<String> = BTreeSet::new();
+    let mut groups = Vec::new();
+    for change in &ordered {
+        let table = change_table_name(change);
+        if rebuild.contains(table) {
+            if emitted.insert(table.to_owned()) {
+                let block = emit_sqlite_rebuild(table, ctx, &ordered, RebuildLeg::Up)?;
+                let block = block.trim_end();
+                if !block.is_empty() {
+                    groups.push(block.to_owned());
+                }
+            }
+            continue;
+        }
+        let sql = emit_change_up(change, plan.backend)?;
+        let sql = sql.trim_end();
+        if !sql.is_empty() {
+            groups.push(sql.to_owned());
+        }
+    }
+    Ok(join_groups(&groups))
+}
+
+/// The `SQLite` reverse path: the mirror of [`emit_up_sql_sqlite`], with each
+/// rebuild block rolled back to the table's baseline shape.
+fn emit_down_sql_sqlite(plan: &MigrationPlan, ctx: &SchemaContext) -> Result<String, EmitError> {
+    let mut ordered = up_ordered(&plan.changes)?;
+    ordered.reverse();
+    let rebuild = sqlite_rebuild_tables(&plan.changes);
+    let mut emitted: BTreeSet<String> = BTreeSet::new();
+    let mut groups = Vec::new();
+    for change in &ordered {
+        let table = change_table_name(change);
+        if rebuild.contains(table) {
+            if emitted.insert(table.to_owned()) {
+                let block = emit_sqlite_rebuild(table, ctx, &ordered, RebuildLeg::Down)?;
+                let block = block.trim_end();
+                if !block.is_empty() {
+                    groups.push(block.to_owned());
+                }
+            }
+            continue;
+        }
+        let sql = emit_change_down(change, plan.backend)?;
+        let sql = sql.trim_end();
+        if !sql.is_empty() {
+            groups.push(sql.to_owned());
+        }
+    }
+    Ok(join_groups(&groups))
+}
+
+/// Which leg a `SQLite` rebuild renders — governs the target shape and the leading
+/// marker.
+#[derive(Debug, Clone, Copy)]
+enum RebuildLeg {
+    /// Rebuild to the post-migration shape (`ctx.baseline` + diff deltas).
+    Up,
+    /// Rebuild back to the baseline shape (`ctx.baseline`).
+    Down,
+}
+
+/// Render the `SQLite` table-recreate block for `table` on the given leg, drawing
+/// the target and source shapes from `ctx` and, on the up leg, the plan's own
+/// `changes`.
+///
+/// The block `CREATE`s a `{table}__autumn_new` staging table with the target shape,
+/// copies the columns common to both shapes, drops the old table, renames the
+/// staging table into place, recreates the target shape's indexes, and validates
+/// referential integrity — all wrapped in `PRAGMA foreign_keys` toggles.
+///
+/// The **up** leg's target shape is the rich baseline table with this table's
+/// explicit diff deltas folded in ([`baseline_with_changes_applied`]) — **not** the
+/// parser's partial `ctx.desired` table — so any baseline facet the parser cannot
+/// see (a non-convention default, a skipped `CHECK`/enum, an association foreign
+/// key) survives a rebuild triggered by an unrelated change. The **down** leg
+/// targets the baseline shape directly and copies from the actual post-migration
+/// shape (`baseline` + this table's diff deltas — the same value the up leg builds
+/// as its target), **not** the parser's partial `ctx.desired`, so a
+/// retained-but-parser-invisible column is copied back on rollback rather than
+/// dropped.
+fn emit_sqlite_rebuild(
+    table: &str,
+    ctx: &SchemaContext,
+    changes: &[&SchemaChange],
+    leg: RebuildLeg,
+) -> Result<String, EmitError> {
+    // The `{table}__autumn_new` staging name is not guaranteed collision-free: if a
+    // real table already carries that name, the rebuild's CREATE/RENAME would clobber
+    // it. Refuse rather than emit unappliable SQL.
+    let staging = format!("{table}__autumn_new");
+    if ctx.desired.contains_key(&staging) || ctx.baseline.contains_key(&staging) {
+        return Err(EmitError::SqliteRebuildUnsupported {
+            table: table.to_owned(),
+            kind: "table rebuild",
+            reason: format!(
+                "staging table name `{staging}` collides with an existing table; \
+                 rename the model to free that name"
+            ),
+        });
+    }
+    // Fetched as a validated precondition (a missing desired shape is a directed
+    // error, exercised by the up leg's missing-context path); neither leg copies
+    // from the parser's partial desired table any more.
+    let _desired = ctx
+        .desired
+        .get(table)
+        .ok_or_else(|| missing_rebuild_shape(table, "desired"))?;
+    let baseline = ctx
+        .baseline
+        .get(table)
+        .ok_or_else(|| missing_rebuild_shape(table, "baseline"))?;
+    match leg {
+        // Build the up-leg target from the rich baseline with this table's explicit
+        // diff deltas applied, preserving every unchanged baseline facet the parser
+        // could not observe; the source (INSERT..SELECT) columns are the baseline's,
+        // i.e. the actual existing table.
+        RebuildLeg::Up => {
+            let new_shape = baseline_with_changes_applied(baseline, changes, table);
+            let fk_cols = fk_type_change_columns(changes, table);
+            Ok(render_sqlite_rebuild(
+                table, &new_shape, baseline, leg, &fk_cols,
+            ))
+        }
+        // The down leg rolls back to the rich baseline shape. Its copy SOURCE is the
+        // actual post-migration table — `baseline + this table's diff deltas`, the same
+        // shape the up leg built as its target — NOT the parser's partial `ctx.desired`:
+        // a retained-but-parser-invisible column (a skipped enum/association) is absent
+        // from `desired`, so sourcing from it would drop that column from the rollback
+        // INSERT..SELECT and lose its data. Intersecting the baseline target with the
+        // post-migration source copies back every baseline column the up migration did
+        // not drop, in baseline order.
+        RebuildLeg::Down => {
+            let post_migration = baseline_with_changes_applied(baseline, changes, table);
+            let fk_cols = fk_type_change_columns(changes, table);
+            Ok(render_sqlite_rebuild(
+                table,
+                baseline,
+                &post_migration,
+                leg,
+                &fk_cols,
+            ))
+        }
+    }
+}
+
+/// Apply the table's own plan changes to its baseline shape, preserving every
+/// baseline facet the diff did not explicitly change (parser-invisible defaults,
+/// `CHECK`s, and so on) — the `SQLite` recreate's "new shape" for the up leg.
+///
+/// The slice-2 parser is deliberately partial (see the module header): it cannot
+/// see a non-convention `#[default]`, some `CHECK`/enum facets, or an association
+/// foreign key, and this engine has no `DropDefault` / `DropCheck` /
+/// `DropForeignKey` variant. Rebuilding the whole table from the raw `ctx.desired`
+/// (partial) shape would therefore silently drop any baseline facet the parser
+/// could not observe. Folding the explicit diff deltas into the rich baseline
+/// clone instead leaves every unchanged baseline facet intact, upholding the
+/// engine's "never destroy parser-invisible state" invariant that the Postgres
+/// per-change `ALTER` path already honours.
+///
+/// Only changes whose table is `table` are folded in; anything else (including the
+/// non-emittable guard markers) is ignored.
+fn baseline_with_changes_applied(
+    baseline: &Table,
+    changes: &[&SchemaChange],
+    table: &str,
+) -> Table {
+    let mut shape = baseline.clone();
+    for change in changes {
+        if change_table_name(change) != table {
+            continue;
+        }
+        match change {
+            SchemaChange::AddColumn { column, .. } => shape.columns.push(column.clone()),
+            SchemaChange::DropColumn { column, .. } => {
+                shape.columns.retain(|c| c.name != column.name);
+                shape.primary_key.retain(|n| n != &column.name);
+            }
+            SchemaChange::AlterColumnType { column, to, .. } => {
+                if let Some(c) = shape.columns.iter_mut().find(|c| &c.name == column) {
+                    c.ty = to.clone();
+                }
+            }
+            SchemaChange::DropNotNull { column, .. } => {
+                if let Some(c) = shape.columns.iter_mut().find(|c| &c.name == column) {
+                    c.nullable = true;
+                }
+            }
+            SchemaChange::SetNotNull { column, .. } => {
+                if let Some(c) = shape.columns.iter_mut().find(|c| &c.name == column) {
+                    c.nullable = false;
+                }
+            }
+            SchemaChange::SetDefault { column, to, .. } => {
+                if let Some(c) = shape.columns.iter_mut().find(|c| &c.name == column) {
+                    c.default = Some(to.clone());
+                }
+            }
+            SchemaChange::AddCheck { check, .. } => shape.checks.push(check.clone()),
+            SchemaChange::AddForeignKey {
+                column,
+                foreign_key,
+                ..
+            } => {
+                if let Some(c) = shape.columns.iter_mut().find(|c| &c.name == column) {
+                    c.references = Some(foreign_key.clone());
+                }
+            }
+            SchemaChange::AddIndex { index, .. } => shape.indexes.push(index.clone()),
+            SchemaChange::DropIndex { index, .. } => {
+                shape.indexes.retain(|i| i.name != index.name);
+            }
+            _ => {}
+        }
+    }
+    shape
+}
+
+/// The [`EmitError::SqliteRebuildUnsupported`] for a rebuild whose `which`
+/// (`"desired"` / `"baseline"`) table shape is absent from the context.
+fn missing_rebuild_shape(table: &str, which: &'static str) -> EmitError {
+    EmitError::SqliteRebuildUnsupported {
+        table: table.to_owned(),
+        kind: "table rebuild",
+        reason: format!(
+            "the {which} table shape is unavailable — call \
+             emit_up_sql_with_context / emit_down_sql_with_context with a \
+             SchemaContext populated from the desired and baseline tables"
+        ),
+    }
+}
+
+/// Render the recreate block: staging `CREATE`, `INSERT .. SELECT` of the columns
+/// common to both shapes (in `new_shape` order), `DROP`, `RENAME`, index recreate,
+/// and the integrity check. `leg` only prepends the down-leg irreversibility marker.
+fn render_sqlite_rebuild(
+    table: &str,
+    new_shape: &Table,
+    source_shape: &Table,
+    leg: RebuildLeg,
+    fk_type_change_cols: &[String],
+) -> String {
+    let new_table = format!("{table}__autumn_new");
+    let source_cols: BTreeSet<&str> = source_shape
+        .columns
+        .iter()
+        .map(|c| c.name.as_str())
+        .collect();
+    let common: Vec<&str> = new_shape
+        .columns
+        .iter()
+        .map(|c| c.name.as_str())
+        .filter(|n| source_cols.contains(n))
+        .collect();
+    let col_list = common.join(", ");
+
+    let mut out = String::new();
+    if matches!(leg, RebuildLeg::Down) {
+        let _ = writeln!(
+            out,
+            "-- irreversible: a SQLite table rebuild rolled back to the prior shape may not restore data lost by a narrowing type change or dropped column"
+        );
+    }
+    let _ = writeln!(
+        out,
+        "-- autumn: SQLite table rebuild for `{table}` — ALTER-family changes require a full table recreate."
+    );
+    let _ = writeln!(
+        out,
+        "-- Transaction semantics: this migration must run inside a single transaction (diesel wraps each"
+    );
+    let _ = writeln!(
+        out,
+        "-- migration in one). NOTE: `PRAGMA foreign_keys` is a no-op inside a transaction, so the harness"
+    );
+    let _ = writeln!(
+        out,
+        "-- must ensure foreign-key enforcement is disabled around the migration."
+    );
+    let _ = writeln!(
+        out,
+        "-- autumn-safety: this recreate copies columns and re-creates indexes only. DROP TABLE drops the table's TRIGGERS (not restored here); VIEWS that reference the table are not dropped and may be left dangling or block the rename — re-create triggers and repair dependent views in a manual migration."
+    );
+    let _ = writeln!(
+        out,
+        "-- autumn-safety: `PRAGMA foreign_key_check` below only REPORTS violation rows (it does not raise); the recreate copies existing values verbatim and introduces no new orphans, but the migration runner must inspect the pragma's output to treat any pre-existing orphan as an error."
+    );
+    // When an FK-bound column's type is changed by this recreate, warn that SQLite
+    // (unlike Postgres, which refuses the change outright) does not enforce that the
+    // column still matches the referenced key's type — that consistency is now the
+    // author's responsibility.
+    if !fk_type_change_cols.is_empty() {
+        let cols = fk_type_change_cols.join(", ");
+        let _ = writeln!(
+            out,
+            "-- autumn-safety: foreign-key column(s) {cols} have their type changed by this recreate; SQLite does not enforce that they still match the referenced key's type, so ensure the referenced column stays type-compatible (Postgres rejects this change outright, which is why it is emitted only for SQLite)."
+        );
+    }
+    // Preserve the AUTOINCREMENT high-water mark only when BOTH the copy SOURCE and
+    // the target shape's single PK are `BigSerial` (an `INTEGER PRIMARY KEY
+    // AUTOINCREMENT` column). Such a source table has a `sqlite_sequence` row that
+    // `DROP TABLE` would discard, resetting the high-water to the max surviving id and
+    // letting a later insert reuse an id that was previously issued and deleted.
+    // Gating on the source too is load-bearing: `sqlite_sequence` is created LAZILY by
+    // SQLite (only once some AUTOINCREMENT table exists), so a migration that
+    // INTRODUCES autoincrement (an `i32`->`i64` PK change) on a database with no prior
+    // AUTOINCREMENT table has no `sqlite_sequence` table, and the capture SELECT would
+    // fail with `no such table: sqlite_sequence`. The high-water only needs preserving
+    // when the SOURCE was already AUTOINCREMENT — and in that case its `sqlite_sequence`
+    // row is guaranteed to exist, so the capture can't fail. When the source is not
+    // AUTOINCREMENT there is no prior high-water to preserve (the new autoincrement
+    // table correctly starts fresh from the max copied id), so skipping is also correct.
+    // Uuid / composite / non-single PK tables have no `sqlite_sequence` entry either, so
+    // they emit none of these statements.
+    let preserve_seq = matches!(single_pk_column(source_shape), Some((_, IdKind::BigSerial)))
+        && matches!(single_pk_column(new_shape), Some((_, IdKind::BigSerial)));
+
+    let _ = writeln!(out, "PRAGMA foreign_keys=OFF;");
+    if preserve_seq {
+        let _ = writeln!(
+            out,
+            "-- preserve the AUTOINCREMENT high-water mark so IDs issued-then-deleted are never reused"
+        );
+        let _ = writeln!(
+            out,
+            "CREATE TEMP TABLE _autumn_seq_{table} AS SELECT seq FROM sqlite_sequence WHERE name = '{table}';"
+        );
+    }
+    out.push_str(&render_create_table_body(
+        &new_table,
+        new_shape,
+        Backend::Sqlite,
+    ));
+    let _ = writeln!(out, "INSERT INTO {new_table} ({col_list})");
+    let _ = writeln!(out, "    SELECT {col_list} FROM {table};");
+    let _ = writeln!(out, "DROP TABLE {table};");
+    // Wrap the staging rename in `PRAGMA legacy_alter_table=ON`…`OFF`. Under the modern
+    // default (`legacy_alter_table=OFF`), `ALTER TABLE ... RENAME` descends into every
+    // dependent VIEW to rewrite references and aborts because the just-dropped table no
+    // longer resolves ("error in view v: no such table"). The offline emitter cannot see
+    // or recreate views, so it emits this blind, always-present pragma pair: it makes the
+    // rename a "dumb" rename that does not validate views, so the migration applies and
+    // the view re-validates against the recreated table. Unlike `foreign_keys`, this
+    // pragma is honoured inside a transaction (proven by `sqlite_rebuild_survives_dependent_view`).
+    let _ = writeln!(out, "PRAGMA legacy_alter_table=ON;");
+    let _ = writeln!(out, "ALTER TABLE {new_table} RENAME TO {table};");
+    let _ = writeln!(out, "PRAGMA legacy_alter_table=OFF;");
+    let mut indexes: Vec<&Index> = new_shape.indexes.iter().collect();
+    indexes.sort_by(|a, b| a.name.cmp(&b.name));
+    for index in indexes {
+        let _ = writeln!(out, "{}", index_sql(table, index));
+    }
+    if preserve_seq {
+        let _ = writeln!(
+            out,
+            "UPDATE sqlite_sequence SET seq = (SELECT seq FROM _autumn_seq_{table})\n    WHERE name = '{table}' AND (SELECT seq FROM _autumn_seq_{table}) IS NOT NULL;"
+        );
+        let _ = writeln!(
+            out,
+            "INSERT INTO sqlite_sequence (name, seq)\n    SELECT '{table}', (SELECT seq FROM _autumn_seq_{table})\n    WHERE (SELECT seq FROM _autumn_seq_{table}) IS NOT NULL\n      AND NOT EXISTS (SELECT 1 FROM sqlite_sequence WHERE name = '{table}');"
+        );
+        let _ = writeln!(out, "DROP TABLE _autumn_seq_{table};");
+    }
+    let _ = writeln!(out, "PRAGMA foreign_key_check;");
+    let _ = writeln!(out, "PRAGMA foreign_keys=ON;");
+    out
 }
 
 /// Join statement groups with a blank line and a trailing newline (empty for an
@@ -1988,8 +2598,9 @@ fn emit_change_up(change: &SchemaChange, backend: Backend) -> Result<String, Emi
             foreign_key,
         } => {
             require_pg(backend, "AddForeignKey")?;
+            let constraint = bounded_pg_identifier(&format!("{table}_{column}_fkey"));
             Ok(format!(
-                "ALTER TABLE {table} ADD CONSTRAINT {table}_{column}_fkey \
+                "ALTER TABLE {table} ADD CONSTRAINT {constraint} \
                  FOREIGN KEY ({column}) REFERENCES {}({});\n",
                 foreign_key.table, foreign_key.column
             ))
@@ -2077,9 +2688,12 @@ fn emit_change_down(change: &SchemaChange, backend: Backend) -> Result<String, E
             || "-- manual: unnamed CHECK cannot be auto-dropped\n".to_owned(),
             |name| format!("ALTER TABLE {table} DROP CONSTRAINT {name};\n"),
         )),
-        SchemaChange::AddForeignKey { table, column, .. } => Ok(format!(
-            "ALTER TABLE {table} DROP CONSTRAINT {table}_{column}_fkey;\n"
-        )),
+        SchemaChange::AddForeignKey { table, column, .. } => {
+            let constraint = bounded_pg_identifier(&format!("{table}_{column}_fkey"));
+            Ok(format!(
+                "ALTER TABLE {table} DROP CONSTRAINT {constraint};\n"
+            ))
+        }
         SchemaChange::PrimaryKeyChange { .. }
         | SchemaChange::ForeignKeyChange { .. }
         | SchemaChange::DropTableBlockedByInboundFk { .. }
@@ -2105,6 +2719,25 @@ const fn require_pg(backend: Backend, kind: &'static str) -> Result<(), EmitErro
 /// A `CREATE TABLE` is always renderable (the portable `SQLite` subset covers it),
 /// so this is infallible.
 fn emit_create_table(table: &Table, backend: Backend) -> String {
+    let mut out = render_create_table_body(&table.name, table, backend);
+
+    // Indexes, name-sorted for determinism.
+    let mut indexes: Vec<&Index> = table.indexes.iter().collect();
+    indexes.sort_by(|a, b| a.name.cmp(&b.name));
+    for index in indexes {
+        let _ = writeln!(out, "{}", index_sql(&table.name, index));
+    }
+    out
+}
+
+/// Render just the `CREATE TABLE {name} (…columns/PK/checks…);` statement (no index
+/// `CREATE`s) for `table`'s shape, under an arbitrary `name`.
+///
+/// Split out of [`emit_create_table`] so the `SQLite` table-rebuild path can emit
+/// the `{table}__autumn_new` staging table (whose indexes are recreated separately,
+/// after the rename). [`emit_create_table`] recomposes this body plus its indexes,
+/// so its output is unchanged.
+fn render_create_table_body(name: &str, table: &Table, backend: Backend) -> String {
     let single_pk = single_pk_column(table);
     let mut lines: Vec<String> = Vec::with_capacity(table.columns.len() + 2);
 
@@ -2130,23 +2763,15 @@ fn emit_create_table(table: &Table, backend: Backend) -> String {
     // Table-level checks (rare — the parser emits none today).
     for check in &table.checks {
         match &check.name {
-            Some(name) => lines.push(format!(
-                "    CONSTRAINT {name} CHECK ({})",
+            Some(cname) => lines.push(format!(
+                "    CONSTRAINT {cname} CHECK ({})",
                 check.expression
             )),
             None => lines.push(format!("    CHECK ({})", check.expression)),
         }
     }
 
-    let mut out = format!("CREATE TABLE {} (\n{}\n);\n", table.name, lines.join(",\n"));
-
-    // Indexes, name-sorted for determinism.
-    let mut indexes: Vec<&Index> = table.indexes.iter().collect();
-    indexes.sort_by(|a, b| a.name.cmp(&b.name));
-    for index in indexes {
-        let _ = writeln!(out, "{}", index_sql(&table.name, index));
-    }
-    out
+    format!("CREATE TABLE {name} (\n{}\n);\n", lines.join(",\n"))
 }
 
 /// Render an `ALTER TABLE … ADD COLUMN`, mirroring the generator's house
@@ -3071,12 +3696,12 @@ mod tests {
     }
 
     #[test]
-    fn fk_constraint_name_collision_after_truncation_is_refused() {
-        // A >63-byte table name plus two added FK columns whose derived
-        // `{table}_{column}_fkey` names share their first 63 bytes. PG truncates
-        // both `ADD CONSTRAINT` names to the same 63-byte identifier, accepts the
-        // first and rejects the second as a duplicate relation — an unappliable
-        // migration. The guard refuses it (no override).
+    fn colliding_over_long_fk_names_get_distinct_bounded_names() {
+        // Deferred item #4: a >63-byte table name plus two added FK columns whose
+        // raw `{table}_{column}_fkey` names share their first 63 bytes would, under
+        // plain PG truncation, collide into one duplicate relation. The bounded
+        // scheme appends a hash of the FULL untruncated name, so the two now get
+        // DISTINCT valid ≤63-byte names and the plan is accepted, not refused.
         let long_table = "a".repeat(60); // {table}_{col}_fkey is well over 63 bytes.
         let plan = MigrationPlan {
             backend: Backend::Postgres,
@@ -3087,26 +3712,28 @@ mod tests {
                     foreign_key: ForeignKey::new("users", "id"),
                 },
                 SchemaChange::AddForeignKey {
-                    table: long_table,
+                    table: long_table.clone(),
                     column: "editor_id".to_owned(),
                     foreign_key: ForeignKey::new("users", "id"),
                 },
             ],
         };
-        let err = guard_plan(&plan, DEFAULT_OPTS).unwrap_err();
+        guard_plan(&plan, DEFAULT_OPTS).expect("distinct bounded FK names are no longer refused");
+
+        let author = bounded_pg_identifier(&format!("{long_table}_author_id_fkey"));
+        let editor = bounded_pg_identifier(&format!("{long_table}_editor_id_fkey"));
         assert!(
-            matches!(err, DiffError::GeneratedIdentifierTooLong { .. }),
-            "over-long FK constraint name is refused: {err:?}"
+            author.len() <= PG_MAX_IDENTIFIER_BYTES && editor.len() <= PG_MAX_IDENTIFIER_BYTES,
+            "both bounded names fit the limit: {author} / {editor}"
         );
-        assert!(
-            err.to_string().contains("63-byte"),
-            "the error explains the 63-byte limit: {err}"
+        assert_ne!(
+            author, editor,
+            "the hash suffix keeps the two colliding-prefix names distinct"
         );
-        // No override — the SQL is unappliable, not merely lossy.
-        assert!(matches!(
-            guard_plan(&plan, ALLOW).unwrap_err(),
-            DiffError::GeneratedIdentifierTooLong { .. }
-        ));
+
+        let up = emit_up_sql(&plan).expect("emit up");
+        assert!(up.contains(&format!("ADD CONSTRAINT {author} ")), "{up}");
+        assert!(up.contains(&format!("ADD CONSTRAINT {editor} ")), "{up}");
     }
 
     #[test]
@@ -4324,8 +4951,171 @@ mod tests {
         );
     }
 
+    /// A `SQLite`-tagged table: a `BigSerial` `id` PK plus the given extra columns
+    /// and indexes.
+    fn sqlite_table(name: &str, extra: Vec<Column>, indexes: Vec<Index>) -> Table {
+        let mut t = Table::new(name, Backend::Sqlite);
+        let mut id = col("id", ColumnType::Int64);
+        id.primary_key = true;
+        t.primary_key.push("id".to_owned());
+        t.columns.push(id);
+        t.columns.extend(extra);
+        t.indexes = indexes;
+        t
+    }
+
+    /// The shared fixture for the `SQLite` rebuild golden/coalescing/real-DB tests:
+    /// `posts` alters `views` `Int32` → `Int64` and adds an index on `body`.
+    fn sqlite_rebuild_fixture() -> (MigrationPlan, SchemaContext) {
+        let idx = Index {
+            name: "idx_posts_body".to_owned(),
+            columns: vec!["body".to_owned()],
+            unique: false,
+        };
+        let baseline = sqlite_table(
+            "posts",
+            vec![
+                col("views", ColumnType::Int32),
+                col("body", ColumnType::Text),
+            ],
+            vec![],
+        );
+        let desired = sqlite_table(
+            "posts",
+            vec![
+                col("views", ColumnType::Int64),
+                col("body", ColumnType::Text),
+            ],
+            vec![idx.clone()],
+        );
+        let plan = MigrationPlan {
+            backend: Backend::Sqlite,
+            changes: vec![
+                SchemaChange::AlterColumnType {
+                    table: "posts".to_owned(),
+                    column: "views".to_owned(),
+                    from: ColumnType::Int32,
+                    to: ColumnType::Int64,
+                },
+                SchemaChange::AddIndex {
+                    table: "posts".to_owned(),
+                    index: idx,
+                },
+            ],
+        };
+        let ctx = SchemaContext::from_tables(
+            std::slice::from_ref(&desired),
+            std::slice::from_ref(&baseline),
+        );
+        (plan, ctx)
+    }
+
     #[test]
-    fn sqlite_alter_type_is_unsupported_error() {
+    fn sqlite_alter_type_renders_table_rebuild_up_golden() {
+        let (plan, ctx) = sqlite_rebuild_fixture();
+        let up = emit_up_sql_with_context(&plan, &ctx).expect("emit up");
+        let expected = "\
+-- autumn: SQLite table rebuild for `posts` — ALTER-family changes require a full table recreate.
+-- Transaction semantics: this migration must run inside a single transaction (diesel wraps each
+-- migration in one). NOTE: `PRAGMA foreign_keys` is a no-op inside a transaction, so the harness
+-- must ensure foreign-key enforcement is disabled around the migration.
+-- autumn-safety: this recreate copies columns and re-creates indexes only. DROP TABLE drops the table's TRIGGERS (not restored here); VIEWS that reference the table are not dropped and may be left dangling or block the rename — re-create triggers and repair dependent views in a manual migration.
+-- autumn-safety: `PRAGMA foreign_key_check` below only REPORTS violation rows (it does not raise); the recreate copies existing values verbatim and introduces no new orphans, but the migration runner must inspect the pragma's output to treat any pre-existing orphan as an error.
+PRAGMA foreign_keys=OFF;
+-- preserve the AUTOINCREMENT high-water mark so IDs issued-then-deleted are never reused
+CREATE TEMP TABLE _autumn_seq_posts AS SELECT seq FROM sqlite_sequence WHERE name = 'posts';
+CREATE TABLE posts__autumn_new (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    views INTEGER NOT NULL,
+    body TEXT NOT NULL
+);
+INSERT INTO posts__autumn_new (id, views, body)
+    SELECT id, views, body FROM posts;
+DROP TABLE posts;
+PRAGMA legacy_alter_table=ON;
+ALTER TABLE posts__autumn_new RENAME TO posts;
+PRAGMA legacy_alter_table=OFF;
+CREATE INDEX idx_posts_body ON posts (body);
+UPDATE sqlite_sequence SET seq = (SELECT seq FROM _autumn_seq_posts)
+    WHERE name = 'posts' AND (SELECT seq FROM _autumn_seq_posts) IS NOT NULL;
+INSERT INTO sqlite_sequence (name, seq)
+    SELECT 'posts', (SELECT seq FROM _autumn_seq_posts)
+    WHERE (SELECT seq FROM _autumn_seq_posts) IS NOT NULL
+      AND NOT EXISTS (SELECT 1 FROM sqlite_sequence WHERE name = 'posts');
+DROP TABLE _autumn_seq_posts;
+PRAGMA foreign_key_check;
+PRAGMA foreign_keys=ON;
+";
+        assert_eq!(up, expected, "SQLite up rebuild golden:\n{up}");
+    }
+
+    #[test]
+    fn sqlite_alter_type_renders_table_rebuild_down_golden() {
+        let (plan, ctx) = sqlite_rebuild_fixture();
+        let down = emit_down_sql_with_context(&plan, &ctx).expect("emit down");
+        let expected = "\
+-- irreversible: a SQLite table rebuild rolled back to the prior shape may not restore data lost by a narrowing type change or dropped column
+-- autumn: SQLite table rebuild for `posts` — ALTER-family changes require a full table recreate.
+-- Transaction semantics: this migration must run inside a single transaction (diesel wraps each
+-- migration in one). NOTE: `PRAGMA foreign_keys` is a no-op inside a transaction, so the harness
+-- must ensure foreign-key enforcement is disabled around the migration.
+-- autumn-safety: this recreate copies columns and re-creates indexes only. DROP TABLE drops the table's TRIGGERS (not restored here); VIEWS that reference the table are not dropped and may be left dangling or block the rename — re-create triggers and repair dependent views in a manual migration.
+-- autumn-safety: `PRAGMA foreign_key_check` below only REPORTS violation rows (it does not raise); the recreate copies existing values verbatim and introduces no new orphans, but the migration runner must inspect the pragma's output to treat any pre-existing orphan as an error.
+PRAGMA foreign_keys=OFF;
+-- preserve the AUTOINCREMENT high-water mark so IDs issued-then-deleted are never reused
+CREATE TEMP TABLE _autumn_seq_posts AS SELECT seq FROM sqlite_sequence WHERE name = 'posts';
+CREATE TABLE posts__autumn_new (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    views INTEGER NOT NULL,
+    body TEXT NOT NULL
+);
+INSERT INTO posts__autumn_new (id, views, body)
+    SELECT id, views, body FROM posts;
+DROP TABLE posts;
+PRAGMA legacy_alter_table=ON;
+ALTER TABLE posts__autumn_new RENAME TO posts;
+PRAGMA legacy_alter_table=OFF;
+UPDATE sqlite_sequence SET seq = (SELECT seq FROM _autumn_seq_posts)
+    WHERE name = 'posts' AND (SELECT seq FROM _autumn_seq_posts) IS NOT NULL;
+INSERT INTO sqlite_sequence (name, seq)
+    SELECT 'posts', (SELECT seq FROM _autumn_seq_posts)
+    WHERE (SELECT seq FROM _autumn_seq_posts) IS NOT NULL
+      AND NOT EXISTS (SELECT 1 FROM sqlite_sequence WHERE name = 'posts');
+DROP TABLE _autumn_seq_posts;
+PRAGMA foreign_key_check;
+PRAGMA foreign_keys=ON;
+";
+        assert_eq!(down, expected, "SQLite down rebuild golden:\n{down}");
+    }
+
+    #[test]
+    fn sqlite_down_rebuild_preserves_parser_invisible_column() {
+        // A rebuild triggered by an UNRELATED change (`views` Int32 -> Int64) must,
+        // on the DOWN leg, copy back a baseline column the partial parser cannot see
+        // (here `status`, absent from `ctx.desired`). The post-migration table (what
+        // is actually in the DB at rollback time) is `baseline + deltas`, which still
+        // carries `status`, so the down-leg INSERT..SELECT source must be that shape —
+        // not `ctx.desired`, whose partial view would omit `status` and lose its data.
+        let mut status_baseline = col("status", ColumnType::Text);
+        status_baseline.default = Some(ColumnDefault::Sql("'draft'".to_owned()));
+        let baseline = sqlite_table(
+            "posts",
+            vec![
+                col("views", ColumnType::Int32),
+                col("body", ColumnType::Text),
+                status_baseline,
+            ],
+            vec![],
+        );
+        // The parser's blind spot: `status` is absent from the desired view entirely.
+        let desired = sqlite_table(
+            "posts",
+            vec![
+                col("views", ColumnType::Int64),
+                col("body", ColumnType::Text),
+            ],
+            vec![],
+        );
         let plan = MigrationPlan {
             backend: Backend::Sqlite,
             changes: vec![SchemaChange::AlterColumnType {
@@ -4335,14 +5125,547 @@ mod tests {
                 to: ColumnType::Int64,
             }],
         };
+        let ctx = SchemaContext::from_tables(
+            std::slice::from_ref(&desired),
+            std::slice::from_ref(&baseline),
+        );
+
+        let down = emit_down_sql_with_context(&plan, &ctx).expect("emit down");
+        assert!(
+            down.contains(
+                "INSERT INTO posts__autumn_new (id, views, body, status)\n    \
+                 SELECT id, views, body, status FROM posts;"
+            ),
+            "the down rollback copies back the parser-invisible retained column: {down}"
+        );
+
+        // Pin the up leg too: it copies from the baseline (which carries `status`) into
+        // the baseline+deltas shape (which also carries it), so `status` round-trips.
+        let up = emit_up_sql_with_context(&plan, &ctx).expect("emit up");
+        assert!(
+            up.contains(
+                "INSERT INTO posts__autumn_new (id, views, body, status)\n    \
+                 SELECT id, views, body, status FROM posts;"
+            ),
+            "the up rebuild also carries the parser-invisible retained column: {up}"
+        );
+    }
+
+    #[test]
+    fn postgres_alter_type_still_emits_plain_alter_column() {
+        // The same logical change on Postgres emits the direct ALTER, never a rebuild.
+        let plan = MigrationPlan {
+            backend: Backend::Postgres,
+            changes: vec![SchemaChange::AlterColumnType {
+                table: "posts".to_owned(),
+                column: "views".to_owned(),
+                from: ColumnType::Int32,
+                to: ColumnType::Int64,
+            }],
+        };
+        let up = emit_up_sql(&plan).expect("emit up");
+        assert_eq!(
+            up, "ALTER TABLE posts ALTER COLUMN views TYPE BIGINT;\n",
+            "{up}"
+        );
+        assert!(!up.contains("__autumn_new"), "no rebuild on Postgres: {up}");
+    }
+
+    #[test]
+    fn sqlite_rebuild_coalesces_alter_and_index_into_one_block() {
+        // An AlterColumnType and an AddIndex on the same table produce exactly ONE
+        // rebuild block; the index is recreated inside it (after the rename), never
+        // as a separate top-level CREATE INDEX.
+        let (plan, ctx) = sqlite_rebuild_fixture();
+        let up = emit_up_sql_with_context(&plan, &ctx).expect("emit up");
+        assert_eq!(
+            up.matches("CREATE TABLE posts__autumn_new").count(),
+            1,
+            "exactly one rebuild block: {up}"
+        );
+        assert_eq!(
+            up.matches("CREATE INDEX idx_posts_body").count(),
+            1,
+            "the index is created exactly once: {up}"
+        );
+        let rename = up.find("RENAME TO posts").expect("rename present");
+        let index = up
+            .find("CREATE INDEX idx_posts_body ON posts (body);")
+            .expect("index recreated");
+        assert!(
+            index > rename,
+            "the index is recreated as part of the rebuild, after the rename: {up}"
+        );
+    }
+
+    #[test]
+    fn sqlite_rebuild_copies_only_surviving_columns() {
+        // A rebuild that also drops a column copies only the columns common to both
+        // shapes — the dropped `legacy` column is never named in INSERT..SELECT.
+        let mut legacy = col("legacy", ColumnType::Text);
+        legacy.nullable = true;
+        let baseline = sqlite_table(
+            "posts",
+            vec![col("views", ColumnType::Int32), legacy.clone()],
+            vec![],
+        );
+        let desired = sqlite_table("posts", vec![col("views", ColumnType::Int64)], vec![]);
+        let plan = MigrationPlan {
+            backend: Backend::Sqlite,
+            changes: vec![
+                SchemaChange::AlterColumnType {
+                    table: "posts".to_owned(),
+                    column: "views".to_owned(),
+                    from: ColumnType::Int32,
+                    to: ColumnType::Int64,
+                },
+                SchemaChange::DropColumn {
+                    table: "posts".to_owned(),
+                    column: legacy,
+                },
+            ],
+        };
+        let ctx = SchemaContext::from_tables(
+            std::slice::from_ref(&desired),
+            std::slice::from_ref(&baseline),
+        );
+        let up = emit_up_sql_with_context(&plan, &ctx).expect("emit up");
+        assert!(
+            up.contains(
+                "INSERT INTO posts__autumn_new (id, views)\n    SELECT id, views FROM posts;"
+            ),
+            "copies only the surviving columns: {up}"
+        );
+        // The dropped column is absent from the recreated table shape (and therefore
+        // never copied). Match `legacy TEXT` (the column definition) specifically rather
+        // than the bare substring `legacy`, which now also appears in the unrelated
+        // `PRAGMA legacy_alter_table` rename guard.
+        assert!(
+            !up.contains("legacy TEXT"),
+            "dropped column is absent from the recreated shape: {up}"
+        );
+    }
+
+    #[test]
+    fn sqlite_rebuild_preserves_parser_invisible_baseline_default() {
+        // A rebuild triggered by an UNRELATED change (here `views` Int32 -> Int64)
+        // must not silently drop a baseline facet the partial parser cannot see. The
+        // baseline `status` column carries a non-convention default (`'draft'`) and
+        // the table a hand-written CHECK; the desired (parser) view records neither
+        // and emits NO SetDefault/DropDefault/DropCheck (the engine has no such
+        // variant). Building the up-leg recreate shape from `baseline + deltas`
+        // instead of the raw `desired` table preserves both.
+        let mut status_baseline = col("status", ColumnType::Text);
+        status_baseline.default = Some(ColumnDefault::Sql("'draft'".to_owned()));
+        let mut baseline = sqlite_table(
+            "posts",
+            vec![col("views", ColumnType::Int32), status_baseline],
+            vec![],
+        );
+        baseline.checks.push(CheckConstraint {
+            name: None,
+            expression: "length(status) > 0".to_owned(),
+        });
+
+        // The parser's blind spot: `status.default` recorded as None and the CHECK
+        // absent, plus the unrelated `views` widening that triggers the rebuild.
+        let desired = sqlite_table(
+            "posts",
+            vec![
+                col("views", ColumnType::Int64),
+                col("status", ColumnType::Text),
+            ],
+            vec![],
+        );
+
+        let plan = MigrationPlan {
+            backend: Backend::Sqlite,
+            changes: vec![SchemaChange::AlterColumnType {
+                table: "posts".to_owned(),
+                column: "views".to_owned(),
+                from: ColumnType::Int32,
+                to: ColumnType::Int64,
+            }],
+        };
+        let ctx = SchemaContext::from_tables(
+            std::slice::from_ref(&desired),
+            std::slice::from_ref(&baseline),
+        );
+
+        let up = emit_up_sql_with_context(&plan, &ctx).expect("emit up");
+        assert!(
+            up.contains("status TEXT NOT NULL DEFAULT 'draft'"),
+            "the parser-invisible baseline default is preserved in the recreate: {up}"
+        );
+        assert!(
+            up.contains("CHECK (length(status) > 0)"),
+            "the parser-invisible baseline CHECK is preserved in the recreate: {up}"
+        );
+    }
+
+    #[test]
+    fn sqlite_rebuild_without_context_is_a_clear_error() {
+        // The context-free entry cannot build a rebuild; it returns a directed error
+        // rather than a broken/partial rebuild.
+        let (plan, _ctx) = sqlite_rebuild_fixture();
         let err = emit_up_sql(&plan).unwrap_err();
-        assert!(matches!(
-            err,
-            EmitError::UnsupportedOnBackend {
-                backend: Backend::Sqlite,
-                ..
-            }
-        ));
+        assert!(
+            matches!(err, EmitError::SqliteRebuildUnsupported { .. }),
+            "missing-context rebuild is a clear error: {err:?}"
+        );
+        assert!(
+            err.to_string().contains("emit_up_sql_with_context"),
+            "the error directs the caller to the context-aware entry: {err}"
+        );
+    }
+
+    #[test]
+    fn sqlite_rebuild_refuses_on_staging_name_collision() {
+        // A real table already named `posts__autumn_new` would be clobbered by the
+        // rebuild's staging CREATE/RENAME, so the emitter refuses rather than emit
+        // unappliable SQL.
+        let (plan, ctx) = sqlite_rebuild_fixture();
+        let collider = sqlite_table(
+            "posts__autumn_new",
+            vec![col("body", ColumnType::Text)],
+            vec![],
+        );
+        let mut ctx = ctx;
+        ctx.desired.insert(collider.name.clone(), collider.clone());
+        ctx.baseline.insert(collider.name.clone(), collider);
+
+        let err = emit_up_sql_with_context(&plan, &ctx).unwrap_err();
+        assert!(
+            matches!(err, EmitError::SqliteRebuildUnsupported { .. }),
+            "staging-name collision is refused: {err:?}"
+        );
+        assert!(
+            err.to_string().contains("posts__autumn_new") && err.to_string().contains("collides"),
+            "the error names the colliding staging table: {err}"
+        );
+    }
+
+    #[test]
+    fn sqlite_rebuild_preserves_rows_on_real_sqlite() {
+        // Exercise the generated UP rebuild against a real in-memory SQLite DB
+        // (diesel's `sqlite` backend is a workspace dependency), asserting the rows
+        // survive with the new shape and the integrity/foreign-key checks are clean.
+        use diesel::connection::SimpleConnection as _;
+        use diesel::prelude::*;
+
+        #[derive(QueryableByName)]
+        struct PostRow {
+            #[diesel(sql_type = diesel::sql_types::BigInt)]
+            id: i64,
+            #[diesel(sql_type = diesel::sql_types::BigInt)]
+            views: i64,
+            #[diesel(sql_type = diesel::sql_types::Text)]
+            body: String,
+        }
+
+        // `PRAGMA foreign_key_check` REPORTS violation rows (child table / rowid /
+        // parent / fkid); an empty result set means no violations.
+        #[derive(QueryableByName)]
+        struct FkViolation {
+            #[diesel(sql_type = diesel::sql_types::Text, column_name = "table")]
+            _child_table: String,
+        }
+
+        // `PRAGMA integrity_check` returns a single `TEXT` row; a clean DB reports `ok`.
+        #[derive(QueryableByName)]
+        struct IntegrityRow {
+            #[diesel(sql_type = diesel::sql_types::Text, column_name = "integrity_check")]
+            status: String,
+        }
+
+        let mut conn = SqliteConnection::establish(":memory:").expect("open in-memory sqlite");
+        conn.batch_execute(
+            "CREATE TABLE posts (\n    id INTEGER PRIMARY KEY AUTOINCREMENT,\n    \
+             views INTEGER NOT NULL,\n    body TEXT NOT NULL\n);\n\
+             INSERT INTO posts (views, body) VALUES (3, 'hello'), (7, 'world');",
+        )
+        .expect("seed the original table");
+
+        let (plan, ctx) = sqlite_rebuild_fixture();
+        let up = emit_up_sql_with_context(&plan, &ctx).expect("emit up");
+        conn.batch_execute(&up)
+            .expect("apply the generated rebuild");
+
+        let rows: Vec<PostRow> = diesel::sql_query("SELECT id, views, body FROM posts ORDER BY id")
+            .load(&mut conn)
+            .expect("query the rebuilt table");
+        assert_eq!(rows.len(), 2, "both rows survived the rebuild");
+        assert_eq!(
+            (rows[0].id, rows[0].views, rows[0].body.as_str()),
+            (1, 3, "hello")
+        );
+        assert_eq!(
+            (rows[1].id, rows[1].views, rows[1].body.as_str()),
+            (2, 7, "world")
+        );
+
+        // `PRAGMA foreign_key_check` only REPORTS violation rows — it does not raise —
+        // so actually READ its output and assert it is empty, rather than firing it via
+        // `batch_execute`, which discards the rows and would pass even on a violation.
+        let violations: Vec<FkViolation> = diesel::sql_query("PRAGMA foreign_key_check")
+            .load(&mut conn)
+            .expect("run PRAGMA foreign_key_check");
+        assert!(
+            violations.is_empty(),
+            "foreign_key_check reported {} violation row(s)",
+            violations.len()
+        );
+
+        let integrity: Vec<IntegrityRow> = diesel::sql_query("PRAGMA integrity_check")
+            .load(&mut conn)
+            .expect("run PRAGMA integrity_check");
+        assert_eq!(integrity.len(), 1, "integrity_check returns one row");
+        assert_eq!(integrity[0].status, "ok", "integrity_check is clean");
+    }
+
+    #[test]
+    fn sqlite_rebuild_survives_dependent_view() {
+        // A SQLite view referencing the rebuilt table makes the post-`DROP TABLE`
+        // `ALTER TABLE ... RENAME` fail ("error in view v: no such table: main.posts")
+        // under the modern default `legacy_alter_table=OFF`. The offline emitter cannot
+        // see or recreate views, so the rebuild wraps the rename with
+        // `PRAGMA legacy_alter_table=ON`…`OFF`, a blind "dumb" rename that does not
+        // descend into / validate views — so the migration applies and the view
+        // re-validates against the recreated table. This exercises the REAL in-transaction
+        // path (diesel wraps each migration in one) to confirm the pragma is not a
+        // mid-transaction no-op like `foreign_keys`.
+        use diesel::connection::SimpleConnection as _;
+        use diesel::prelude::*;
+
+        #[derive(QueryableByName)]
+        struct ViewRow {
+            #[diesel(sql_type = diesel::sql_types::BigInt)]
+            id: i64,
+            #[diesel(sql_type = diesel::sql_types::Text)]
+            body: String,
+        }
+
+        let mut conn = SqliteConnection::establish(":memory:").expect("open in-memory sqlite");
+        conn.batch_execute(
+            "CREATE TABLE posts (\n    id INTEGER PRIMARY KEY AUTOINCREMENT,\n    \
+             views INTEGER NOT NULL,\n    body TEXT NOT NULL\n);\n\
+             INSERT INTO posts (views, body) VALUES (3, 'hello');\n\
+             CREATE VIEW posts_v AS SELECT id, body FROM posts;",
+        )
+        .expect("seed the original table and a dependent view");
+
+        let (plan, ctx) = sqlite_rebuild_fixture();
+        let up = emit_up_sql_with_context(&plan, &ctx).expect("emit up");
+
+        // Run the generated rebuild INSIDE an explicit transaction — the real path diesel
+        // uses — so a mid-transaction pragma no-op would surface here as a rename error.
+        conn.transaction::<_, diesel::result::Error, _>(|conn| conn.batch_execute(&up))
+            .expect("the rebuild applies inside a transaction with a dependent view present");
+
+        // The view is still valid against the recreated table and the row survived.
+        let rows: Vec<ViewRow> = diesel::sql_query("SELECT id, body FROM posts_v ORDER BY id")
+            .load(&mut conn)
+            .expect("the dependent view is still queryable after the rebuild");
+        assert_eq!(rows.len(), 1, "the view still resolves one row");
+        assert_eq!((rows[0].id, rows[0].body.as_str()), (1, "hello"));
+    }
+
+    #[test]
+    fn sqlite_rebuild_uuid_pk_emits_no_sequence_preservation() {
+        // A table whose single PK is `Uuid` has no `sqlite_sequence` row, so the
+        // rebuild must emit none of the high-water preservation statements — those
+        // apply only to `BigSerial` (`INTEGER PRIMARY KEY AUTOINCREMENT`) PKs.
+        let uuid_table = |name: &str| -> Table {
+            let mut t = Table::new(name, Backend::Sqlite);
+            let mut id = col("id", ColumnType::Uuid);
+            id.primary_key = true;
+            t.primary_key.push("id".to_owned());
+            t.columns.push(id);
+            t.columns.push(col("body", ColumnType::Text));
+            t
+        };
+        let baseline = uuid_table("posts");
+        let desired = uuid_table("posts");
+        assert!(
+            matches!(single_pk_column(&desired), Some((_, IdKind::Uuid))),
+            "the fixture PK resolves to Uuid"
+        );
+        for leg in [RebuildLeg::Up, RebuildLeg::Down] {
+            let sql = render_sqlite_rebuild("posts", &desired, &baseline, leg, &[]);
+            assert!(
+                !sql.contains("sqlite_sequence"),
+                "no sqlite_sequence statements for a Uuid PK ({leg:?}): {sql}"
+            );
+            assert!(
+                !sql.contains("_autumn_seq_"),
+                "no high-water temp table for a Uuid PK ({leg:?}): {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn sqlite_rebuild_preserves_autoincrement_sequence() {
+        // The definitive non-reuse proof: after a table recreate, an id that was
+        // issued-then-deleted must NOT be handed out again. Seed ids 1..5, delete
+        // 2..5 (the `sqlite_sequence` high-water stays 5), apply the generated
+        // rebuild, then insert a new row and assert its id is 6 — not the reused 2.
+        use diesel::connection::SimpleConnection as _;
+        use diesel::prelude::*;
+
+        #[derive(QueryableByName)]
+        struct BigRow {
+            #[diesel(sql_type = diesel::sql_types::BigInt, column_name = "v")]
+            v: i64,
+        }
+
+        // `PRAGMA integrity_check` returns a single `TEXT` row; a clean DB reports `ok`.
+        #[derive(QueryableByName)]
+        struct IntegrityRow {
+            #[diesel(sql_type = diesel::sql_types::Text, column_name = "integrity_check")]
+            status: String,
+        }
+
+        let mut conn = SqliteConnection::establish(":memory:").expect("open in-memory sqlite");
+        conn.batch_execute(
+            "CREATE TABLE posts (\n    id INTEGER PRIMARY KEY AUTOINCREMENT,\n    \
+             views INTEGER NOT NULL,\n    body TEXT NOT NULL\n);\n\
+             INSERT INTO posts (views, body) VALUES \
+             (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd'), (5, 'e');",
+        )
+        .expect("seed five rows -> ids 1..5");
+
+        // The AUTOINCREMENT high-water is 5 after five inserts.
+        let seq: Vec<BigRow> =
+            diesel::sql_query("SELECT seq AS v FROM sqlite_sequence WHERE name = 'posts'")
+                .load(&mut conn)
+                .expect("read sqlite_sequence");
+        assert_eq!(seq.len(), 1, "sqlite_sequence has a row for posts");
+        assert_eq!(seq[0].v, 5, "high-water is 5 before the delete");
+
+        // Delete every row but id=1; the high-water in sqlite_sequence stays 5.
+        conn.batch_execute("DELETE FROM posts WHERE id > 1;")
+            .expect("delete ids 2..5");
+
+        let (plan, ctx) = sqlite_rebuild_fixture();
+        let up = emit_up_sql_with_context(&plan, &ctx).expect("emit up");
+        conn.batch_execute(&up)
+            .expect("apply the generated rebuild");
+
+        // A fresh insert must NOT reuse a deleted id: the next id is 6, not 2.
+        conn.batch_execute("INSERT INTO posts (views, body) VALUES (9, 'new');")
+            .expect("insert a new row after the rebuild");
+        let max: Vec<BigRow> = diesel::sql_query("SELECT MAX(id) AS v FROM posts")
+            .load(&mut conn)
+            .expect("max id after rebuild");
+        assert_eq!(
+            max[0].v, 6,
+            "the next id after the rebuild does not reuse a deleted id"
+        );
+
+        // The surviving id=1 row is untouched by the rebuild.
+        let survivors: Vec<BigRow> =
+            diesel::sql_query("SELECT COUNT(*) AS v FROM posts WHERE id = 1")
+                .load(&mut conn)
+                .expect("count id=1");
+        assert_eq!(survivors[0].v, 1, "the surviving id=1 row is intact");
+
+        let integrity: Vec<IntegrityRow> = diesel::sql_query("PRAGMA integrity_check")
+            .load(&mut conn)
+            .expect("run PRAGMA integrity_check");
+        assert_eq!(integrity.len(), 1, "integrity_check returns one row");
+        assert_eq!(integrity[0].status, "ok", "integrity_check is clean");
+    }
+
+    #[test]
+    fn sqlite_rebuild_skips_sequence_when_source_not_autoincrement() {
+        // A migration that INTRODUCES autoincrement (an `id` Int32 -> Int64 primary-key
+        // change) must NOT emit the `sqlite_sequence` high-water capture/restore: the
+        // copy SOURCE is not AUTOINCREMENT, so there is no prior high-water to preserve,
+        // and — because SQLite creates `sqlite_sequence` LAZILY — capturing from it on a
+        // database with no existing AUTOINCREMENT table would fail with
+        // `no such table: sqlite_sequence`, aborting an otherwise-valid migration.
+        use diesel::connection::SimpleConnection as _;
+        use diesel::{Connection as _, RunQueryDsl as _, SqliteConnection};
+
+        #[derive(diesel::QueryableByName)]
+        struct BigRow {
+            #[diesel(sql_type = diesel::sql_types::BigInt, column_name = "v")]
+            v: i64,
+        }
+
+        let int32_pk_table = |name: &str| -> Table {
+            let mut t = Table::new(name, Backend::Sqlite);
+            let mut id = col("id", ColumnType::Int32);
+            id.primary_key = true;
+            t.primary_key.push("id".to_owned());
+            t.columns.push(id);
+            t.columns.push(col("views", ColumnType::Int32));
+            t.columns.push(col("body", ColumnType::Text));
+            t
+        };
+        let baseline = int32_pk_table("posts");
+        // The desired shape only changes the `id` column type Int32 -> Int64 (BigSerial).
+        let mut desired = int32_pk_table("posts");
+        desired.columns[0].ty = ColumnType::Int64;
+
+        // Sanity: the copy source (baseline) is NOT BigSerial; the target IS.
+        assert!(
+            !matches!(single_pk_column(&baseline), Some((_, IdKind::BigSerial))),
+            "the baseline (copy source) PK is Int32, not BigSerial"
+        );
+        assert!(
+            matches!(single_pk_column(&desired), Some((_, IdKind::BigSerial))),
+            "the target PK resolves to BigSerial"
+        );
+
+        let plan = MigrationPlan {
+            backend: Backend::Sqlite,
+            changes: vec![SchemaChange::AlterColumnType {
+                table: "posts".to_owned(),
+                column: "id".to_owned(),
+                from: ColumnType::Int32,
+                to: ColumnType::Int64,
+            }],
+        };
+        let ctx = SchemaContext::from_tables(
+            std::slice::from_ref(&desired),
+            std::slice::from_ref(&baseline),
+        );
+        let up = emit_up_sql_with_context(&plan, &ctx).expect("emit up");
+
+        // The gate is false (source not BigSerial), so no capture/restore is emitted.
+        assert!(
+            !up.contains("sqlite_sequence"),
+            "no sqlite_sequence statements when the source is not AUTOINCREMENT:\n{up}"
+        );
+        assert!(
+            !up.contains("_autumn_seq_"),
+            "no high-water temp table when the source is not AUTOINCREMENT:\n{up}"
+        );
+
+        // Real SQLite: a fresh DB with a non-AUTOINCREMENT `posts` (`INTEGER PRIMARY KEY`
+        // WITHOUT `AUTOINCREMENT`, so `sqlite_sequence` does not exist) and a seeded row.
+        let mut conn = SqliteConnection::establish(":memory:").expect("open in-memory sqlite");
+        conn.batch_execute(
+            "CREATE TABLE posts (\n    id INTEGER PRIMARY KEY,\n    \
+             views INTEGER NOT NULL,\n    body TEXT NOT NULL\n);\n\
+             INSERT INTO posts (id, views, body) VALUES (1, 9, 'a');",
+        )
+        .expect("seed a non-AUTOINCREMENT table");
+
+        // The generated rebuild applies without `no such table: sqlite_sequence`.
+        conn.batch_execute(&up)
+            .expect("apply the generated rebuild");
+
+        // The seeded row survived the rebuild.
+        let survivors: Vec<BigRow> =
+            diesel::sql_query("SELECT COUNT(*) AS v FROM posts WHERE id = 1 AND views = 9")
+                .load(&mut conn)
+                .expect("count the surviving row");
+        assert_eq!(
+            survivors[0].v, 1,
+            "the seeded id=1 row survives the rebuild"
+        );
     }
 
     #[test]
@@ -4387,6 +5710,116 @@ mod tests {
             emit_up_sql(&plan).unwrap_err(),
             EmitError::UnsupportedOnBackend { .. }
         ));
+    }
+
+    #[test]
+    fn down_drops_fk_column_before_dropping_referenced_table() {
+        // Deferred item #1: baseline `posts(id)` only; desired adds a `target` table
+        // plus `posts.target_id` (nullable FK → target.id). The down leg must DROP
+        // COLUMN target_id BEFORE DROP TABLE target, else the rollback is unappliable.
+        // Pins `emit_down_sql` as a pure reverse of `up_ordered` for the create-table
+        // + add-FK-column pattern.
+        let baseline = vec![posts_with(vec![])];
+
+        let mut target_id = col("target_id", ColumnType::Int64);
+        target_id.nullable = true;
+        target_id.references = Some(ForeignKey::new("target", "id"));
+        let desired_posts = posts_with(vec![target_id]);
+
+        let mut target = Table::new("target", Backend::Postgres);
+        let mut tid = col("id", ColumnType::Int64);
+        tid.primary_key = true;
+        target.primary_key.push("id".to_owned());
+        target.columns.push(tid);
+
+        let desired = parsed(vec![desired_posts, target], vec![]);
+        let plan = diff_schema(&baseline, &desired, DEFAULT_OPTS);
+        guard_plan(&plan, DEFAULT_OPTS).expect("emittable");
+        let down = emit_down_sql(&plan).expect("emit down");
+
+        let drop_col = down
+            .find("ALTER TABLE posts DROP COLUMN target_id")
+            .expect("down drops the FK column");
+        let drop_table = down
+            .find("DROP TABLE target")
+            .expect("down drops the referenced table");
+        assert!(
+            drop_col < drop_table,
+            "DROP COLUMN target_id must precede DROP TABLE target:\n{down}"
+        );
+    }
+
+    #[test]
+    fn over_long_fkey_constraint_name_is_bounded_not_refused() {
+        // Deferred item #4: an engine-generated FK-constraint name over 63 bytes is
+        // truncate+hashed to a valid ≤63-byte identifier — the SAME name in the up
+        // ADD and the down DROP — and the guard no longer refuses it.
+        let table = "a".repeat(40);
+        let column = "b".repeat(40);
+        let raw = format!("{table}_{column}_fkey");
+        assert!(
+            raw.len() > PG_MAX_IDENTIFIER_BYTES,
+            "the raw name is over the limit"
+        );
+
+        let plan = MigrationPlan {
+            backend: Backend::Postgres,
+            changes: vec![SchemaChange::AddForeignKey {
+                table,
+                column,
+                foreign_key: ForeignKey::new("targets", "id"),
+            }],
+        };
+        guard_plan(&plan, DEFAULT_OPTS)
+            .expect("the length guard no longer refuses a bounded FK name");
+
+        let bounded = bounded_pg_identifier(&raw);
+        assert!(
+            bounded.len() <= PG_MAX_IDENTIFIER_BYTES,
+            "the bounded name fits the limit: {bounded}"
+        );
+        assert_ne!(bounded, raw, "the over-long name is actually shortened");
+
+        let up = emit_up_sql(&plan).expect("emit up");
+        let down = emit_down_sql(&plan).expect("emit down");
+        assert!(
+            up.contains(&format!("ADD CONSTRAINT {bounded} ")),
+            "up uses the bounded name: {up}"
+        );
+        assert!(
+            down.contains(&format!("DROP CONSTRAINT {bounded};")),
+            "down uses the SAME bounded name: {down}"
+        );
+    }
+
+    #[test]
+    fn short_fkey_constraint_name_is_unchanged() {
+        // A normal (short) FK-constraint name passes through unchanged, so Postgres
+        // output stays byte-stable.
+        assert_eq!(
+            bounded_pg_identifier("posts_author_id_fkey"),
+            "posts_author_id_fkey"
+        );
+        let plan = MigrationPlan {
+            backend: Backend::Postgres,
+            changes: vec![SchemaChange::AddForeignKey {
+                table: "posts".to_owned(),
+                column: "author_id".to_owned(),
+                foreign_key: ForeignKey::new("users", "id"),
+            }],
+        };
+        let up = emit_up_sql(&plan).expect("emit up");
+        assert!(
+            up.contains(
+                "ADD CONSTRAINT posts_author_id_fkey FOREIGN KEY (author_id) REFERENCES users(id);"
+            ),
+            "{up}"
+        );
+        let down = emit_down_sql(&plan).expect("emit down");
+        assert!(
+            down.contains("DROP CONSTRAINT posts_author_id_fkey;"),
+            "{down}"
+        );
     }
 
     #[test]
@@ -4638,6 +6071,223 @@ mod tests {
         assert!(
             up.contains("ALTER TABLE posts ALTER COLUMN views TYPE BIGINT;"),
             "emits the bare ALTER TYPE for the plain-column widening: {up}"
+        );
+    }
+
+    /// A `users(id)` table for the `SQLite` FK-type-change fixtures.
+    fn sqlite_users_table() -> Table {
+        let mut t = Table::new("users", Backend::Sqlite);
+        let mut id = col("id", ColumnType::Int64);
+        id.primary_key = true;
+        t.primary_key.push("id".to_owned());
+        t.columns.push(id);
+        t
+    }
+
+    /// A `posts(id, author_id -> users.id)` `SQLite` table whose `author_id` FK
+    /// column carries `ty`, for the `SQLite` FK-type-change fixtures.
+    fn sqlite_posts_with_author(ty: ColumnType) -> Table {
+        let mut t = Table::new("posts", Backend::Sqlite);
+        let mut id = col("id", ColumnType::Int64);
+        id.primary_key = true;
+        t.primary_key.push("id".to_owned());
+        t.columns.push(id);
+        let mut author = col("author_id", ty);
+        author.nullable = true;
+        author.references = Some(ForeignKey::new("users", "id"));
+        t.columns.push(author);
+        t
+    }
+
+    /// The `SQLite` counterpart to `type_change_on_referencing_fk_column_is_refused`:
+    /// the FK-bound-type-change guard is `Postgres`-only, so on `SQLite` an FK
+    /// column's type change (`posts.author_id` `Int32` → `Int64`, still
+    /// `REFERENCES users(id)`) is NOT refused — it flows to the table-recreate,
+    /// which applies the new type, preserves the inline `REFERENCES`, and emits the
+    /// FK type-consistency advisory naming the column. The `Postgres` plan with the
+    /// same change still refuses with `TypeChangeOnForeignKeyColumn` (the backend
+    /// contrast).
+    #[test]
+    fn sqlite_fk_column_type_change_recreates_with_advisory() {
+        let baseline = vec![
+            sqlite_users_table(),
+            sqlite_posts_with_author(ColumnType::Int32),
+        ];
+        let desired = vec![
+            sqlite_users_table(),
+            sqlite_posts_with_author(ColumnType::Int64),
+        ];
+        let plan = diff_schema(&baseline, &parsed(desired.clone(), vec![]), ALLOW);
+
+        // The plan is a SQLite plan carrying the real type change AND the blocked
+        // marker appended alongside it.
+        assert_eq!(plan.backend, Backend::Sqlite);
+        assert!(
+            plan.changes.iter().any(|c| matches!(
+                c,
+                SchemaChange::AlterColumnType { table, column, to, .. }
+                    if table == "posts" && column == "author_id" && *to == ColumnType::Int64
+            )),
+            "the real AlterColumnType (→ Int64) rides in the plan: {:?}",
+            plan.changes
+        );
+        assert!(
+            plan.changes.iter().any(|c| matches!(
+                c,
+                SchemaChange::AlterColumnTypeBlockedByFk { table, column }
+                    if table == "posts" && column == "author_id"
+            )),
+            "the FK-bound type-change marker is still recorded: {:?}",
+            plan.changes
+        );
+
+        // (a) The Postgres-only gate lets SQLite through the guard.
+        guard_plan(&plan, ALLOW)
+            .expect("SQLite FK-column type change flows to the table recreate, not a refusal");
+
+        // (b) The recreate applies the new type (Int64 → SQLite INTEGER), preserves
+        //     the inline REFERENCES, and carries the FK type-consistency advisory.
+        let ctx = SchemaContext::from_tables(&desired, &baseline);
+        let up = emit_up_sql_with_context(&plan, &ctx).expect("emit sqlite rebuild");
+        assert!(
+            up.contains("author_id INTEGER NULL REFERENCES users(id)"),
+            "the recreate expresses author_id with its (widened) type and keeps the \
+             inline REFERENCES: {up}"
+        );
+        assert!(
+            up.contains(
+                "-- autumn-safety: foreign-key column(s) author_id have their type \
+                 changed by this recreate; SQLite does not enforce that they still \
+                 match the referenced key's type, so ensure the referenced column \
+                 stays type-compatible (Postgres rejects this change outright, which \
+                 is why it is emitted only for SQLite)."
+            ),
+            "emits the FK type-consistency advisory naming the column: {up}"
+        );
+        // The down leg carries it too.
+        let down = emit_down_sql_with_context(&plan, &ctx).expect("emit sqlite down rebuild");
+        assert!(
+            down.contains("-- autumn-safety: foreign-key column(s) author_id have their type"),
+            "the down rebuild also carries the FK type-consistency advisory: {down}"
+        );
+
+        // (c) The Postgres plan with the same change still refuses (backend contrast).
+        let mut users_pg = Table::new("users", Backend::Postgres);
+        let mut uid = col("id", ColumnType::Int64);
+        uid.primary_key = true;
+        users_pg.primary_key.push("id".to_owned());
+        users_pg.columns.push(uid);
+        let mut author_base = col("author_id", ColumnType::Int32);
+        author_base.nullable = true;
+        author_base.references = Some(ForeignKey::new("users", "id"));
+        let mut author_want = col("author_id", ColumnType::Int64);
+        author_want.nullable = true;
+        author_want.references = Some(ForeignKey::new("users", "id"));
+        let pg_baseline = vec![users_pg.clone(), posts_with(vec![author_base])];
+        let pg_desired = parsed(vec![users_pg, posts_with(vec![author_want])], vec![]);
+        let pg_plan = diff_schema(&pg_baseline, &pg_desired, ALLOW);
+        let err = guard_plan(&pg_plan, ALLOW)
+            .expect_err("Postgres still refuses the FK-column type change");
+        assert!(
+            matches!(
+                err,
+                DiffError::TypeChangeOnForeignKeyColumn { ref table, ref column }
+                    if table == "posts" && column == "author_id"
+            ),
+            "Postgres refuses with TypeChangeOnForeignKeyColumn: {err:?}"
+        );
+    }
+
+    /// An ordinary `SQLite` rebuild (no FK-bound type change) must NOT carry the FK
+    /// type-consistency advisory — the line is emitted only when a blocked marker
+    /// for that table is present.
+    #[test]
+    fn sqlite_plain_rebuild_omits_fk_type_advisory() {
+        // A plain (non-FK) column widening on `posts` triggers a table rebuild but
+        // no `AlterColumnTypeBlockedByFk` marker.
+        let mut base = Table::new("posts", Backend::Sqlite);
+        let mut id = col("id", ColumnType::Int64);
+        id.primary_key = true;
+        base.primary_key.push("id".to_owned());
+        base.columns.push(id);
+        base.columns.push(col("views", ColumnType::Int32));
+        let mut want = base.clone();
+        want.columns[1].ty = ColumnType::Int64;
+
+        let baseline = vec![base];
+        let desired = vec![want];
+        let plan = diff_schema(&baseline, &parsed(desired.clone(), vec![]), ALLOW);
+        let ctx = SchemaContext::from_tables(&desired, &baseline);
+        let up = emit_up_sql_with_context(&plan, &ctx).expect("emit sqlite rebuild");
+        assert!(
+            !up.contains("foreign-key column(s)"),
+            "a rebuild with no FK-type-change marker carries no FK advisory: {up}"
+        );
+    }
+
+    /// A real in-memory `SQLite` database applies the generated FK-column-type-change
+    /// recreate without error and the seeded referencing row survives.
+    #[test]
+    fn sqlite_fk_column_type_change_recreate_applies_in_memory() {
+        use diesel::connection::SimpleConnection as _;
+        use diesel::{Connection as _, RunQueryDsl as _, SqliteConnection};
+
+        #[derive(diesel::QueryableByName)]
+        struct BigRow {
+            #[diesel(sql_type = diesel::sql_types::BigInt, column_name = "v")]
+            v: i64,
+        }
+        #[derive(diesel::QueryableByName)]
+        struct FkRow {
+            #[diesel(sql_type = diesel::sql_types::Text, column_name = "table")]
+            table: String,
+        }
+
+        let baseline = vec![
+            sqlite_users_table(),
+            sqlite_posts_with_author(ColumnType::Int32),
+        ];
+        let desired = vec![
+            sqlite_users_table(),
+            sqlite_posts_with_author(ColumnType::Int64),
+        ];
+        let plan = diff_schema(&baseline, &parsed(desired.clone(), vec![]), ALLOW);
+        guard_plan(&plan, ALLOW).expect("SQLite FK-column type change is emittable");
+        let ctx = SchemaContext::from_tables(&desired, &baseline);
+        let up = emit_up_sql_with_context(&plan, &ctx).expect("emit up");
+
+        let mut conn = SqliteConnection::establish(":memory:").expect("open in-memory sqlite");
+        conn.batch_execute(
+            "CREATE TABLE users (\n    id INTEGER PRIMARY KEY AUTOINCREMENT\n);\n\
+             CREATE TABLE posts (\n    id INTEGER PRIMARY KEY AUTOINCREMENT,\n    \
+             author_id BIGINT NULL REFERENCES users(id)\n);\n\
+             INSERT INTO users (id) VALUES (1);\n\
+             INSERT INTO posts (id, author_id) VALUES (1, 1);",
+        )
+        .expect("seed the referenced + referencing tables and a row");
+
+        // Apply the generated recreate inside a single transaction (as diesel runs a
+        // migration).
+        conn.transaction::<_, diesel::result::Error, _>(|conn| conn.batch_execute(&up))
+            .expect("apply the FK-column-type-change recreate in a transaction");
+
+        // The seeded referencing row survived the rebuild, still pointing at users(1).
+        let survivors: Vec<BigRow> =
+            diesel::sql_query("SELECT COUNT(*) AS v FROM posts WHERE id = 1 AND author_id = 1")
+                .load(&mut conn)
+                .expect("count the surviving row");
+        assert_eq!(
+            survivors[0].v, 1,
+            "the seeded post row survives the FK-column type-change recreate"
+        );
+
+        // The recreated `posts` still declares the foreign key to `users`.
+        let fks: Vec<FkRow> = diesel::sql_query("PRAGMA foreign_key_list(posts)")
+            .load(&mut conn)
+            .expect("read posts foreign keys");
+        assert!(
+            fks.iter().any(|f| f.table == "users"),
+            "the recreate preserves the posts.author_id -> users foreign key"
         );
     }
 
