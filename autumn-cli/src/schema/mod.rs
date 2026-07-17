@@ -464,11 +464,6 @@ fn diff_at(
     let ts = crate::generate::timestamp_now();
     let suffix = crate::generate::naming::snake(name.unwrap_or("schema_update"));
     let dir = write_migration_dir(project_root, &ts, &suffix, &up, &down)?;
-    println!(
-        "wrote migration {} ({} change(s))",
-        dir.display(),
-        plan.changes.len()
-    );
 
     // (g) Advance the checked-in snapshot to the state this migration converges
     // the database on. The snapshot now moves at GENERATION time (here), not at
@@ -478,9 +473,26 @@ fn diff_at(
     // snapshot tracks exactly what the emitted SQL produces. A plain `schema diff`
     // (no `--write-migration`) returned above (step e), so it never reaches here
     // and never touches the snapshot.
+    //
+    // The migration files and the checked-in snapshot must advance together: if
+    // the snapshot write fails (read-only dir, full disk, ...) after the
+    // migration is on disk, retrying `schema diff --write-migration` would
+    // regenerate the same SQL as a second migration (baseline never advanced)
+    // and applying both would fail on duplicate DDL. Roll the migration dir back
+    // on a snapshot-write failure so the pre-command state is left intact.
     let target_tables = project_plan_target(&baseline.tables, &plan);
-    snapshot::write_snapshot(&snapshot_path, &SchemaSnapshot::new(backend, target_tables))
-        .map_err(|e| e.to_string())?;
+    if let Err(e) =
+        snapshot::write_snapshot(&snapshot_path, &SchemaSnapshot::new(backend, target_tables))
+    {
+        let _ = std::fs::remove_dir_all(&dir);
+        return Err(e.to_string());
+    }
+
+    println!(
+        "wrote migration {} ({} change(s))",
+        dir.display(),
+        plan.changes.len()
+    );
     println!("advanced schema snapshot at {}", snapshot_path.display());
     Ok(())
 }
@@ -894,6 +906,85 @@ mod tests {
             posts.columns.iter().any(|c| c.name == "body"),
             "advanced snapshot must contain the new `body` column: {:?}",
             posts.columns.iter().map(|c| &c.name).collect::<Vec<_>>()
+        );
+    }
+
+    // The migration files and the checked-in snapshot must advance together
+    // (Codex P1): if the snapshot write fails after `write_migration_dir` has
+    // already left a complete migration on disk, the baseline never advances, so
+    // retrying `schema diff --write-migration` regenerates the same SQL as a
+    // SECOND migration and applying both fails on duplicate DDL. `diff_at` rolls
+    // the migration dir back on a snapshot-write failure. Reproduce that failure
+    // portably by making the snapshot's parent dir (`.autumn`) read-only so the
+    // earlier snapshot LOAD still succeeds but `write_snapshot`'s tempfile
+    // create+rename cannot, then assert the command errors and left no migration.
+    #[cfg(unix)]
+    #[test]
+    fn write_migration_rolls_back_on_snapshot_write_failure() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Add a `body` column the snapshot lacks → a non-empty plan that would
+        // write a migration and then advance the snapshot.
+        let models = r#"
+            #[autumn_web::model(managed)]
+            pub struct Post {
+                #[id]
+                pub id: i64,
+                pub title: String,
+                pub body: Option<String>,
+            }
+        "#;
+        let root = scaffold_project(models, &posts_snapshot("Postgres"));
+        let autumn_dir = root.path().join(".autumn");
+
+        // Make the snapshot's parent directory read-only so a new tempfile cannot
+        // be created in it (the earlier read of the existing snapshot still works).
+        std::fs::set_permissions(&autumn_dir, std::fs::Permissions::from_mode(0o555))
+            .expect("chmod .autumn read-only");
+
+        // Skipped when the process can bypass the permission bits (e.g. running as
+        // root, where a read-only dir is still writable), which would otherwise
+        // make this non-deterministic — mirrors `classify_unreadable_dir_is_an_error`.
+        let can_still_write = tempfile::NamedTempFile::new_in(&autumn_dir).is_ok();
+        if can_still_write {
+            std::fs::set_permissions(&autumn_dir, std::fs::Permissions::from_mode(0o755))
+                .expect("restore chmod");
+            return;
+        }
+
+        let result = diff_at(
+            root.path(),
+            None,
+            None,
+            Some(BackendArg::Pg),
+            true,
+            Some("add_body"),
+            false,
+        );
+
+        // Restore permissions so the tempdir can be cleaned up (and the migrations
+        // assertion below can read the dir regardless of outcome).
+        std::fs::set_permissions(&autumn_dir, std::fs::Permissions::from_mode(0o755))
+            .expect("restore chmod");
+
+        // (a) The command surfaced the snapshot-write failure as an error.
+        assert!(
+            result.is_err(),
+            "a snapshot-write failure must surface as an error, got: {result:?}"
+        );
+
+        // (b) The just-created migration was rolled back: no migration directory
+        // is left behind, so a retry regenerates a single migration (not a second).
+        let migrations = root.path().join("migrations");
+        let leftover: Vec<_> = std::fs::read_dir(&migrations)
+            .map(|rd| {
+                rd.map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(
+            leftover.is_empty(),
+            "the migration dir must be rolled back on a snapshot-write failure, found: {leftover:?}"
         );
     }
 
