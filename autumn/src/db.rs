@@ -1976,11 +1976,17 @@ where
                     Ok(value)
                 }
                 Ok(Err(user_error)) => {
-                    let _ = conn.batch_execute("ROLLBACK").await;
+                    if let Err(e) = conn.batch_execute("ROLLBACK").await {
+                        tracing::warn!("failed to roll back immediate transaction after error: {e}");
+                    }
                     Err(user_error)
                 }
                 Err(panic) => {
-                    let _ = conn.batch_execute("ROLLBACK").await;
+                    if let Err(e) = conn.batch_execute("ROLLBACK").await {
+                        tracing::error!(
+                            "failed to roll back immediate transaction during panic: {e}"
+                        );
+                    }
                     std::panic::resume_unwind(panic);
                 }
             }
