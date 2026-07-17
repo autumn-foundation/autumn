@@ -2155,13 +2155,24 @@ fn render_sqlite_rebuild(
         out,
         "-- autumn-safety: `PRAGMA foreign_key_check` below only REPORTS violation rows (it does not raise); the recreate copies existing values verbatim and introduces no new orphans, but the migration runner must inspect the pragma's output to treat any pre-existing orphan as an error."
     );
-    // Preserve the AUTOINCREMENT high-water mark only when the target shape's single
-    // PK is `BigSerial` (an `INTEGER PRIMARY KEY AUTOINCREMENT` column). Such a table
-    // has a `sqlite_sequence` row that `DROP TABLE` would discard, resetting the
-    // high-water to the max surviving id and letting a later insert reuse an id that
-    // was previously issued and deleted. Uuid / composite / non-single PK tables have
-    // no `sqlite_sequence` entry, so they emit none of these statements.
-    let preserve_seq = matches!(single_pk_column(new_shape), Some((_, IdKind::BigSerial)));
+    // Preserve the AUTOINCREMENT high-water mark only when BOTH the copy SOURCE and
+    // the target shape's single PK are `BigSerial` (an `INTEGER PRIMARY KEY
+    // AUTOINCREMENT` column). Such a source table has a `sqlite_sequence` row that
+    // `DROP TABLE` would discard, resetting the high-water to the max surviving id and
+    // letting a later insert reuse an id that was previously issued and deleted.
+    // Gating on the source too is load-bearing: `sqlite_sequence` is created LAZILY by
+    // SQLite (only once some AUTOINCREMENT table exists), so a migration that
+    // INTRODUCES autoincrement (an `i32`->`i64` PK change) on a database with no prior
+    // AUTOINCREMENT table has no `sqlite_sequence` table, and the capture SELECT would
+    // fail with `no such table: sqlite_sequence`. The high-water only needs preserving
+    // when the SOURCE was already AUTOINCREMENT — and in that case its `sqlite_sequence`
+    // row is guaranteed to exist, so the capture can't fail. When the source is not
+    // AUTOINCREMENT there is no prior high-water to preserve (the new autoincrement
+    // table correctly starts fresh from the max copied id), so skipping is also correct.
+    // Uuid / composite / non-single PK tables have no `sqlite_sequence` entry either, so
+    // they emit none of these statements.
+    let preserve_seq = matches!(single_pk_column(source_shape), Some((_, IdKind::BigSerial)))
+        && matches!(single_pk_column(new_shape), Some((_, IdKind::BigSerial)));
 
     let _ = writeln!(out, "PRAGMA foreign_keys=OFF;");
     if preserve_seq {
@@ -5516,6 +5527,98 @@ PRAGMA foreign_keys=ON;
             .expect("run PRAGMA integrity_check");
         assert_eq!(integrity.len(), 1, "integrity_check returns one row");
         assert_eq!(integrity[0].status, "ok", "integrity_check is clean");
+    }
+
+    #[test]
+    fn sqlite_rebuild_skips_sequence_when_source_not_autoincrement() {
+        // A migration that INTRODUCES autoincrement (an `id` Int32 -> Int64 primary-key
+        // change) must NOT emit the `sqlite_sequence` high-water capture/restore: the
+        // copy SOURCE is not AUTOINCREMENT, so there is no prior high-water to preserve,
+        // and — because SQLite creates `sqlite_sequence` LAZILY — capturing from it on a
+        // database with no existing AUTOINCREMENT table would fail with
+        // `no such table: sqlite_sequence`, aborting an otherwise-valid migration.
+        use diesel::connection::SimpleConnection as _;
+        use diesel::{Connection as _, RunQueryDsl as _, SqliteConnection};
+
+        #[derive(diesel::QueryableByName)]
+        struct BigRow {
+            #[diesel(sql_type = diesel::sql_types::BigInt, column_name = "v")]
+            v: i64,
+        }
+
+        let int32_pk_table = |name: &str| -> Table {
+            let mut t = Table::new(name, Backend::Sqlite);
+            let mut id = col("id", ColumnType::Int32);
+            id.primary_key = true;
+            t.primary_key.push("id".to_owned());
+            t.columns.push(id);
+            t.columns.push(col("views", ColumnType::Int32));
+            t.columns.push(col("body", ColumnType::Text));
+            t
+        };
+        let baseline = int32_pk_table("posts");
+        // The desired shape only changes the `id` column type Int32 -> Int64 (BigSerial).
+        let mut desired = int32_pk_table("posts");
+        desired.columns[0].ty = ColumnType::Int64;
+
+        // Sanity: the copy source (baseline) is NOT BigSerial; the target IS.
+        assert!(
+            !matches!(single_pk_column(&baseline), Some((_, IdKind::BigSerial))),
+            "the baseline (copy source) PK is Int32, not BigSerial"
+        );
+        assert!(
+            matches!(single_pk_column(&desired), Some((_, IdKind::BigSerial))),
+            "the target PK resolves to BigSerial"
+        );
+
+        let plan = MigrationPlan {
+            backend: Backend::Sqlite,
+            changes: vec![SchemaChange::AlterColumnType {
+                table: "posts".to_owned(),
+                column: "id".to_owned(),
+                from: ColumnType::Int32,
+                to: ColumnType::Int64,
+            }],
+        };
+        let ctx = SchemaContext::from_tables(
+            std::slice::from_ref(&desired),
+            std::slice::from_ref(&baseline),
+        );
+        let up = emit_up_sql_with_context(&plan, &ctx).expect("emit up");
+
+        // The gate is false (source not BigSerial), so no capture/restore is emitted.
+        assert!(
+            !up.contains("sqlite_sequence"),
+            "no sqlite_sequence statements when the source is not AUTOINCREMENT:\n{up}"
+        );
+        assert!(
+            !up.contains("_autumn_seq_"),
+            "no high-water temp table when the source is not AUTOINCREMENT:\n{up}"
+        );
+
+        // Real SQLite: a fresh DB with a non-AUTOINCREMENT `posts` (`INTEGER PRIMARY KEY`
+        // WITHOUT `AUTOINCREMENT`, so `sqlite_sequence` does not exist) and a seeded row.
+        let mut conn = SqliteConnection::establish(":memory:").expect("open in-memory sqlite");
+        conn.batch_execute(
+            "CREATE TABLE posts (\n    id INTEGER PRIMARY KEY,\n    \
+             views INTEGER NOT NULL,\n    body TEXT NOT NULL\n);\n\
+             INSERT INTO posts (id, views, body) VALUES (1, 9, 'a');",
+        )
+        .expect("seed a non-AUTOINCREMENT table");
+
+        // The generated rebuild applies without `no such table: sqlite_sequence`.
+        conn.batch_execute(&up)
+            .expect("apply the generated rebuild");
+
+        // The seeded row survived the rebuild.
+        let survivors: Vec<BigRow> =
+            diesel::sql_query("SELECT COUNT(*) AS v FROM posts WHERE id = 1 AND views = 9")
+                .load(&mut conn)
+                .expect("count the surviving row");
+        assert_eq!(
+            survivors[0].v, 1,
+            "the seeded id=1 row survives the rebuild"
+        );
     }
 
     #[test]
