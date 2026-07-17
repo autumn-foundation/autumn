@@ -418,6 +418,23 @@ async fn commit_failure_leaves_pool_yielding_reusable_connection() {
         .get()
         .await
         .expect("checkout after the failed COMMIT yields a usable connection");
+    // The failed COMMIT must have rolled back atomically: the doomed child
+    // INSERT left no partial data behind. Query the `child` table on this fresh
+    // connection and assert it is empty.
+    #[derive(diesel::QueryableByName)]
+    struct CountRow {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        n: i64,
+    }
+    let child_rows = diesel::sql_query("SELECT COUNT(*) AS n FROM child")
+        .load::<CountRow>(&mut *conn2)
+        .await
+        .expect("count child rows on the reused connection");
+    assert_eq!(
+        child_rows.into_iter().next().map(|r| r.n),
+        Some(0),
+        "the failed COMMIT rolled back — no partial child rows persisted"
+    );
     let reused: autumn_web::AutumnResult<i64> =
         autumn_web::__private::scoped_immediate_transaction(&mut *conn2, |c| {
             async move {
