@@ -214,10 +214,14 @@ pub struct LifecycleDef {
 }
 
 /// An effect declared on a `#[state_machine(lifecycle = Enum, effects(...))]`
-/// binding (issue #1973), correlated to a `#[lifecycle]` enum's diagram by enum
-/// name (the last segment of the `lifecycle = <Path>`). This rides in a separate
-/// structure consulted only by the diagram renderers, so the `check` command,
-/// the JSON artifact, and [`LifecycleDef::transitions`] stay byte-identical.
+/// binding (issue #1973), correlated to a `#[lifecycle]` enum's diagram by that
+/// enum's module-qualified [`LifecycleDef::id`] (the `lifecycle = <Path>`
+/// resolved relative to the binding's module — see [`resolve_lifecycle_id`]).
+/// Keying by the qualified id, not the bare enum name, keeps two same-named
+/// lifecycle enums in different modules from cross-contaminating each other's
+/// effect labels. This rides in a separate structure consulted only by the
+/// diagram renderers, so the `check` command, the JSON artifact, and
+/// [`LifecycleDef::transitions`] stay byte-identical.
 #[derive(Debug)]
 struct EffectEdge {
     from: String,
@@ -474,9 +478,13 @@ struct Scan {
     lifecycles: Vec<LifecycleDef>,
     errors: Vec<String>,
     files_scanned: usize,
-    /// Per-enum-name transition effects collected from
+    /// Transition effects collected from
     /// `#[state_machine(lifecycle = Enum, effects(...))]` bindings (issue #1973),
-    /// keyed by the bound enum name. Consulted only by the diagram renderers.
+    /// keyed by the bound lifecycle enum's module-qualified [`LifecycleDef::id`]
+    /// (the `lifecycle = <Path>` resolved relative to the binding's module). A
+    /// binding whose path cannot be resolved to that id scheme is left
+    /// uncorrelated (dropped) rather than matched by bare name. Consulted only by
+    /// the diagram renderers.
     effect_edges: HashMap<String, Vec<EffectEdge>>,
 }
 
@@ -603,7 +611,7 @@ fn scan_items(
                 );
             }
             syn::Item::Struct(item_struct) => {
-                collect_state_machine_effects(item_struct, scan);
+                collect_state_machine_effects(item_struct, scan, module_path.as_slice());
             }
             syn::Item::Mod(item_mod) => {
                 if let Some((_, inner)) = &item_mod.content {
@@ -688,7 +696,19 @@ fn collect_lifecycle_enum(
 /// an inline `#[state_machine(transitions(...))]` machine has no `#[lifecycle]`
 /// enum (and thus no diagram surface today) and is skipped. Parsing is tolerant:
 /// a miss on one attribute is skipped and never aborts the scan.
-fn collect_state_machine_effects(item_struct: &syn::ItemStruct, scan: &mut Scan) {
+///
+/// `module_path` is the inline-module context the binding is declared in (the
+/// same context [`collect_lifecycle_enum`] uses to build a [`LifecycleDef::id`]).
+/// The binding's `lifecycle = <Path>` is resolved to that qualified-id scheme via
+/// [`resolve_lifecycle_id`], so effects are keyed by the *same* id the renderers
+/// look the lifecycle up by. A path that cannot be resolved is left uncorrelated
+/// (dropped) — a safe failure (missing labels) strictly better than the previous
+/// bare-name matching, which could label an unrelated same-named lifecycle.
+fn collect_state_machine_effects(
+    item_struct: &syn::ItemStruct,
+    scan: &mut Scan,
+    module_path: &[String],
+) {
     for field in &item_struct.fields {
         for attr in &field.attrs {
             if !is_state_machine_attr(attr) {
@@ -696,16 +716,60 @@ fn collect_state_machine_effects(item_struct: &syn::ItemStruct, scan: &mut Scan)
             }
             // Tolerant: an unrelated `transitions(...)` form → `Ok(None)`, and a
             // parse miss → `Err`; both simply skip this attribute.
-            if let Ok(Some((enum_name, edges))) = attr.parse_args_with(parse_state_machine_effects)
+            if let Ok(Some((lifecycle_path, edges))) =
+                attr.parse_args_with(parse_state_machine_effects)
                 && !edges.is_empty()
+                && let Some(id) = resolve_lifecycle_id(module_path, &lifecycle_path)
             {
-                scan.effect_edges
-                    .entry(enum_name)
-                    .or_default()
-                    .extend(edges);
+                scan.effect_edges.entry(id).or_default().extend(edges);
             }
         }
     }
+}
+
+/// Resolve a `#[state_machine(lifecycle = <Path>)]` binding's enum path to the
+/// module-qualified [`LifecycleDef::id`] scheme (`a::b::State`), relative to the
+/// binding's inline-module `module_path`, mirroring how [`collect_lifecycle_enum`]
+/// roots enum ids (at the crate root, without a crate-name prefix). Returns
+/// `None` when the path cannot be confidently resolved (empty, or more `super::`
+/// hops than there are enclosing modules), so the binding stays uncorrelated
+/// rather than being force-matched.
+///
+/// - Bare single-segment (`State`) → `<module_path>::State` (same module — the
+///   common case).
+/// - Leading `crate::` → rooted at the crate root (empty prefix), matching a
+///   top-level enum's bare id.
+/// - Leading `self::` → the binding's own module.
+/// - Leading `super::` (one per hop) → pops one enclosing module per `super`.
+/// - Otherwise relative (`a::State`) → nested under the binding's module.
+fn resolve_lifecycle_id(module_path: &[String], path: &syn::Path) -> Option<String> {
+    let segs: Vec<String> = path.segments.iter().map(|s| s.ident.to_string()).collect();
+    if segs.is_empty() {
+        return None;
+    }
+    let (mut prefix, rest): (Vec<String>, &[String]) = match segs[0].as_str() {
+        // `crate::…` is rooted at the crate root; the scanner ids are also rooted
+        // there with no crate-name segment, so the prefix is empty.
+        "crate" => (Vec::new(), &segs[1..]),
+        "self" => (module_path.to_vec(), &segs[1..]),
+        "super" => {
+            let mut prefix = module_path.to_vec();
+            let mut i = 0;
+            while i < segs.len() && segs[i] == "super" {
+                // More `super` hops than enclosing modules → cannot resolve.
+                prefix.pop()?;
+                i += 1;
+            }
+            (prefix, &segs[i..])
+        }
+        // A plain relative path resolves under the binding's own module.
+        _ => (module_path.to_vec(), &segs[..]),
+    };
+    if rest.is_empty() {
+        return None;
+    }
+    prefix.extend(rest.iter().cloned());
+    Some(prefix.join("::"))
 }
 
 /// Recognize a `#[state_machine(...)]` attribute under a bare `state_machine`
@@ -718,13 +782,14 @@ fn is_state_machine_attr(attr: &syn::Attribute) -> bool {
 }
 
 /// Parse the inside of a `#[state_machine(...)]` attribute, returning the bound
-/// enum name (last path segment of `lifecycle = <Path>`) and its declared
-/// `effects(...)` edges. Returns `Ok(None)` for the inline `transitions(...)`
-/// form (out of scope — no `#[lifecycle]` enum, no diagram surface). Mirrors the
-/// macro grammar in `autumn-macros/src/model.rs` (`parse_state_machine_source`).
+/// enum's full `lifecycle = <Path>` (resolved to a module-qualified id by the
+/// caller via [`resolve_lifecycle_id`]) and its declared `effects(...)` edges.
+/// Returns `Ok(None)` for the inline `transitions(...)` form (out of scope — no
+/// `#[lifecycle]` enum, no diagram surface). Mirrors the macro grammar in
+/// `autumn-macros/src/model.rs` (`parse_state_machine_source`).
 fn parse_state_machine_effects(
     input: ParseStream,
-) -> syn::Result<Option<(String, Vec<EffectEdge>)>> {
+) -> syn::Result<Option<(syn::Path, Vec<EffectEdge>)>> {
     let key: Ident = input.parse()?;
     if key == "transitions" {
         return Ok(None);
@@ -737,15 +802,12 @@ fn parse_state_machine_effects(
     }
     input.parse::<Token![=]>()?;
     let path: syn::Path = input.parse()?;
-    let enum_name = path.segments.last().map_or_else(
-        || {
-            Err(syn::Error::new_spanned(
-                &path,
-                "`lifecycle = <Enum>` requires a non-empty path",
-            ))
-        },
-        |seg| Ok(seg.ident.to_string()),
-    )?;
+    if path.segments.is_empty() {
+        return Err(syn::Error::new_spanned(
+            &path,
+            "`lifecycle = <Enum>` requires a non-empty path",
+        ));
+    }
     let edges = if input.peek(Token![,]) {
         input.parse::<Token![,]>()?;
         let effects_kw: Ident = input.parse()?;
@@ -761,7 +823,7 @@ fn parse_state_machine_effects(
     } else {
         Vec::new()
     };
-    Ok(Some((enum_name, edges)))
+    Ok(Some((path, edges)))
 }
 
 /// Parse the inner edge list of an `effects(...)` group (surrounding parens
@@ -1028,12 +1090,12 @@ fn render_mermaid_document(
     effects: &HashMap<String, Vec<EffectEdge>>,
 ) -> String {
     if let [single] = lifecycles {
-        return render_mermaid(single, &build_edge_labels(effects.get(&single.name)));
+        return render_mermaid(single, &build_edge_labels(effects.get(&single.id)));
     }
     let mut out = String::new();
     out.push_str("stateDiagram-v2\n");
     for wf in lifecycles {
-        let labels = build_edge_labels(effects.get(&wf.name));
+        let labels = build_edge_labels(effects.get(&wf.id));
         let ns = sanitize_ident(&wf.id);
         let sid = |state: &str| format!("{ns}_{}", sanitize_ident(state));
         let _ = writeln!(out, "    state \"{}\" as {ns} {{", wf.name);
@@ -1090,14 +1152,14 @@ fn render_dot_document(
     effects: &HashMap<String, Vec<EffectEdge>>,
 ) -> String {
     if let [single] = lifecycles {
-        return render_dot(single, &build_edge_labels(effects.get(&single.name)));
+        return render_dot(single, &build_edge_labels(effects.get(&single.id)));
     }
     let mut out = String::new();
     out.push_str("digraph {\n");
     out.push_str("    rankdir=LR;\n");
     out.push_str("    node [shape=box, style=rounded];\n");
     for wf in lifecycles {
-        write_dot_cluster(&mut out, wf, &build_edge_labels(effects.get(&wf.name)));
+        write_dot_cluster(&mut out, wf, &build_edge_labels(effects.get(&wf.id)));
     }
     out.push_str("}\n");
     out
