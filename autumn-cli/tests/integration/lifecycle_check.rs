@@ -720,3 +720,383 @@ mod invoices {
         "state nodes must be namespaced by module-qualified id\n{stdout}"
     );
 }
+
+/// A `#[lifecycle]` enum whose diagram edges carry transition effects declared
+/// on a `#[state_machine(lifecycle = OrderState, effects(...))]` binding on a
+/// separate `#[model]` struct field (issue #1973). The fixture only needs to
+/// parse — it is scanned, not compiled.
+const EFFECTS_FIXTURE: &str = r#"
+use autumn_web::lifecycle;
+
+#[lifecycle(
+    initial = Draft,
+    terminal(Archived),
+    transitions(
+        Draft -> Published,
+        Published -> Archived,
+    )
+)]
+pub enum OrderState {
+    Draft,
+    Published,
+    Archived,
+}
+
+#[model]
+pub struct Article {
+    #[state_machine(
+        lifecycle = OrderState,
+        effects(
+            Draft -> Published: on_commit = AnnouncePublishJob,
+            Published -> Archived: on = "write_archive_audit",
+        )
+    )]
+    pub status: String,
+}
+"#;
+
+#[test]
+fn diagram_mermaid_shows_effect_labels() {
+    // The Mermaid diagram annotates each edge that has a correlated
+    // `#[state_machine(... effects(...))]` binding with its effect label
+    // (`on: ...` / `on_commit: ...`), leaving effect-free edges unchanged.
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "src/article.rs", EFFECTS_FIXTURE);
+    let output = run_lifecycle(dir.path(), &["diagram", "--format", "mermaid"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "diagram render should exit 0\nstdout:\n{stdout}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains("Draft --> Published"),
+        "the effect edge should still render its transition\n{stdout}"
+    );
+    assert!(
+        stdout.contains("on_commit: AnnouncePublishJob"),
+        "the on_commit effect should be annotated on its edge\n{stdout}"
+    );
+    assert!(
+        stdout.contains("on: write_archive_audit"),
+        "the on effect should be annotated on its edge\n{stdout}"
+    );
+}
+
+#[test]
+fn diagram_dot_shows_effect_labels() {
+    // The DOT diagram annotates effect edges with a `[label="..."]` carrying the
+    // same effect text.
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "src/article.rs", EFFECTS_FIXTURE);
+    let output = run_lifecycle(dir.path(), &["diagram", "--format", "dot"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "dot render should exit 0\nstdout:\n{stdout}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains("[label=\"on_commit: AnnouncePublishJob\"]"),
+        "the on_commit effect should be a DOT edge label\n{stdout}"
+    );
+    assert!(
+        stdout.contains("[label=\"on: write_archive_audit\"]"),
+        "the on effect should be a DOT edge label\n{stdout}"
+    );
+}
+
+/// Two `#[lifecycle]` enums with the SAME identifier (`State`) and identical
+/// edges declared in two separate modules, where ONLY the `orders` module also
+/// carries a `#[state_machine(lifecycle = State, effects(...))]` binding. The
+/// effect label must be correlated by the module-qualified `LifecycleDef::id`
+/// (`orders::State`), so it annotates the `orders` diagram only and never bleeds
+/// onto the unrelated same-named `invoices::State` (issue #2029 Codex P2).
+const SAME_NAMED_EFFECTS_FIXTURE: &str = r"
+mod orders {
+    #[lifecycle(
+        initial = Draft,
+        terminal(Published),
+        transitions(
+            Draft -> Published,
+        )
+    )]
+    pub enum State {
+        Draft,
+        Published,
+    }
+
+    #[model]
+    pub struct Order {
+        #[state_machine(
+            lifecycle = State,
+            effects(
+                Draft -> Published: on_commit = SomeJob,
+            )
+        )]
+        pub status: String,
+    }
+}
+
+mod invoices {
+    #[lifecycle(
+        initial = Draft,
+        terminal(Published),
+        transitions(
+            Draft -> Published,
+        )
+    )]
+    pub enum State {
+        Draft,
+        Published,
+    }
+}
+";
+
+#[test]
+fn effect_labels_do_not_bleed_across_same_named_enums_in_separate_modules() {
+    // The `orders` binding must label only the `orders::State` diagram; the
+    // same-named `invoices::State` (no binding) must render its `Draft ->
+    // Published` edge with no effect label. Step 1 (qualified match) pins the
+    // binding to its co-located `orders::State`; the bare name `State` is
+    // ambiguous (two same-named enums), so the step-2 fallback never fires and
+    // cannot bleed the label onto `invoices::State`.
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "src/domain.rs", SAME_NAMED_EFFECTS_FIXTURE);
+
+    // DOT: node ids are namespaced by module-qualified id, so the two clusters'
+    // edges are distinguishable and the label is pinned to exactly one edge.
+    let dot = run_lifecycle(dir.path(), &["diagram", "--format", "dot"]);
+    let dstdout = String::from_utf8_lossy(&dot.stdout);
+    assert!(
+        dot.status.success(),
+        "dot render should exit 0\nstdout:\n{dstdout}\nstderr:\n{}",
+        String::from_utf8_lossy(&dot.stderr)
+    );
+    assert_eq!(
+        dstdout.matches("on_commit: SomeJob").count(),
+        1,
+        "the effect label must appear exactly once (only on the enum with the binding)\n{dstdout}"
+    );
+    assert!(
+        dstdout.contains(
+            "\"orders__State.Draft\" -> \"orders__State.Published\" [label=\"on_commit: SomeJob\"];"
+        ),
+        "the effect label must annotate the orders::State edge that has the binding\n{dstdout}"
+    );
+    assert!(
+        dstdout.contains("\"invoices__State.Draft\" -> \"invoices__State.Published\";"),
+        "the unrelated invoices::State edge must render with no effect label\n{dstdout}"
+    );
+
+    // Mermaid: the composite document must carry the label exactly once, too.
+    let mermaid = run_lifecycle(dir.path(), &["diagram", "--format", "mermaid"]);
+    let mstdout = String::from_utf8_lossy(&mermaid.stdout);
+    assert!(
+        mermaid.status.success(),
+        "mermaid render should exit 0\nstdout:\n{mstdout}\nstderr:\n{}",
+        String::from_utf8_lossy(&mermaid.stderr)
+    );
+    assert_eq!(
+        mstdout.matches("on_commit: SomeJob").count(),
+        1,
+        "the effect label must appear exactly once in the mermaid document\n{mstdout}"
+    );
+}
+
+/// A `#[lifecycle]` enum declared in one module (`states`) and *imported* into
+/// another (`models`) that binds it with a bare `#[state_machine(lifecycle =
+/// OrderState, effects(...))]`. Rust resolves the bare `OrderState` to
+/// `states::OrderState` via the `use`, but the binding's own module prefix would
+/// mis-qualify it to `models::OrderState` (no such lifecycle). The unique-bare-name
+/// fallback must correlate the effect to the single scanned `OrderState` diagram
+/// (issue #2029 Codex P2 — the imported-lifecycle case).
+const IMPORTED_LIFECYCLE_EFFECTS_FIXTURE: &str = r"
+mod states {
+    #[lifecycle(
+        initial = Draft,
+        terminal(Published),
+        transitions(
+            Draft -> Published,
+        )
+    )]
+    pub enum OrderState {
+        Draft,
+        Published,
+    }
+}
+
+mod models {
+    use crate::states::OrderState;
+
+    #[model]
+    pub struct Order {
+        #[state_machine(
+            lifecycle = OrderState,
+            effects(
+                Draft -> Published: on_commit = SomeJob,
+            )
+        )]
+        pub status: String,
+    }
+}
+";
+
+#[test]
+fn effect_labels_apply_to_imported_lifecycle_via_unique_bare_name() {
+    // The binding's qualified id (`models::OrderState`) is not a scanned
+    // lifecycle, so correlation falls back to the globally-unique bare enum name
+    // `OrderState` and labels the `states::OrderState` diagram.
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "src/domain.rs",
+        IMPORTED_LIFECYCLE_EFFECTS_FIXTURE,
+    );
+
+    let mermaid = run_lifecycle(dir.path(), &["diagram", "--format", "mermaid"]);
+    let mstdout = String::from_utf8_lossy(&mermaid.stdout);
+    assert!(
+        mermaid.status.success(),
+        "mermaid render should exit 0\nstdout:\n{mstdout}\nstderr:\n{}",
+        String::from_utf8_lossy(&mermaid.stderr)
+    );
+    assert_eq!(
+        mstdout.matches("on_commit: SomeJob").count(),
+        1,
+        "the imported-lifecycle effect must be correlated exactly once\n{mstdout}"
+    );
+
+    let dot = run_lifecycle(dir.path(), &["diagram", "--format", "dot"]);
+    let dstdout = String::from_utf8_lossy(&dot.stdout);
+    assert!(
+        dot.status.success(),
+        "dot render should exit 0\nstdout:\n{dstdout}\nstderr:\n{}",
+        String::from_utf8_lossy(&dot.stderr)
+    );
+    assert!(
+        dstdout.contains("[label=\"on_commit: SomeJob\"]"),
+        "the imported-lifecycle effect should be a DOT edge label\n{dstdout}"
+    );
+}
+
+/// Two `#[lifecycle]` enums that SHARE the bare name `OrderState` in different
+/// modules, plus an imported-style bare `#[state_machine(lifecycle = OrderState,
+/// effects(...))]` binding in a third module. The binding's qualified id does not
+/// name a scanned lifecycle *and* the bare name is ambiguous (two candidates), so
+/// the unique-bare-name fallback must NOT fire — the effect is dropped rather than
+/// guessed onto an arbitrary same-named enum (issue #2029 Codex P2 — safe failure).
+const AMBIGUOUS_IMPORTED_FIXTURE: &str = r"
+mod states {
+    #[lifecycle(
+        initial = Draft,
+        terminal(Published),
+        transitions(
+            Draft -> Published,
+        )
+    )]
+    pub enum OrderState {
+        Draft,
+        Published,
+    }
+}
+
+mod other {
+    #[lifecycle(
+        initial = Draft,
+        terminal(Published),
+        transitions(
+            Draft -> Published,
+        )
+    )]
+    pub enum OrderState {
+        Draft,
+        Published,
+    }
+}
+
+mod models {
+    #[model]
+    pub struct Order {
+        #[state_machine(
+            lifecycle = OrderState,
+            effects(
+                Draft -> Published: on_commit = SomeJob,
+            )
+        )]
+        pub status: String,
+    }
+}
+";
+
+#[test]
+fn effect_labels_dropped_when_bare_name_is_ambiguous_across_modules() {
+    // An ambiguous bare name (two same-named enums) means the fallback cannot
+    // pick a lifecycle, so the effect must be dropped — no diagram gets the label.
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "src/domain.rs", AMBIGUOUS_IMPORTED_FIXTURE);
+
+    for format in ["mermaid", "dot"] {
+        let output = run_lifecycle(dir.path(), &["diagram", "--format", format]);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "{format} render should exit 0\nstdout:\n{stdout}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            stdout.matches("on_commit: SomeJob").count(),
+            0,
+            "an ambiguous bare-name binding must never label a same-named enum ({format})\n{stdout}"
+        );
+    }
+}
+
+/// A plain `#[lifecycle]` enum with no `#[state_machine]` effects binding — its
+/// diagram edges must be byte-identical to the pre-#1973 output (no labels).
+const PLAIN_LIFECYCLE: &str = r"
+#[lifecycle(
+    initial = Draft,
+    terminal(Archived),
+    transitions(
+        Draft -> Published,
+        Published -> Archived,
+    )
+)]
+pub enum OrderState {
+    Draft,
+    Published,
+    Archived,
+}
+";
+
+#[test]
+fn diagram_without_effects_has_no_edge_labels() {
+    // With no effects binding, an edge renders with no ` : ` label (Mermaid) and
+    // no `[label=` (DOT) — the byte-identical guarantee.
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "src/order.rs", PLAIN_LIFECYCLE);
+
+    let mermaid = run_lifecycle(dir.path(), &["diagram", "--format", "mermaid"]);
+    let mstdout = String::from_utf8_lossy(&mermaid.stdout);
+    assert!(
+        mermaid.status.success(),
+        "mermaid render should exit 0\n{mstdout}"
+    );
+    assert!(
+        mstdout.contains("Draft --> Published"),
+        "the transition edge should render\n{mstdout}"
+    );
+    assert!(
+        !mstdout.contains(" : "),
+        "an effect-free lifecycle must render no edge labels\n{mstdout}"
+    );
+
+    let dot = run_lifecycle(dir.path(), &["diagram", "--format", "dot"]);
+    let dstdout = String::from_utf8_lossy(&dot.stdout);
+    assert!(dot.status.success(), "dot render should exit 0\n{dstdout}");
+    assert!(
+        !dstdout.contains("[label="),
+        "an effect-free single-lifecycle DOT diagram must render no edge labels\n{dstdout}"
+    );
+}
