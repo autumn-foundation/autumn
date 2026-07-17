@@ -5,7 +5,7 @@ All notable changes to the Autumn framework will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.5.0] - 2026-06-16
+## [Unreleased]
 
 ### Added
 
@@ -1425,6 +1425,370 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **cli:** the deploy-managed kamal-proxy can terminate TLS on an always-bound port 443 via opt-in `--host` / `--tls` (#1980, closes #1969). `autumn deploy` now uploads the app's `autumn.toml` so the server runs the intended config (#2000), writes per-release manifests, and commits deploy-state markers atomically after the proxy flip (#2015).
 - **dist:** prebuilt, curl-installable `autumn` CLI binaries. A tag-triggered release workflow builds Linux musl and macOS (x86_64 + aarch64), and `scripts/install.sh` provides an OS/arch-detecting, sha256-verified `curl … | sh` installer (#2011, closes #2005). Generated-app CI runs `autumn a11y verify` through the same installer (#2018, closes #1931).
 
+- **auth:** Active session management with device list and revocation in the auth starter (#819)
+  - `autumn generate auth` now persists a `{user}_sessions` row per login
+    (SHA-256 digest of the opaque session id — never the raw id — plus user id,
+    IP at login, raw + parsed User-Agent, optional device label, `created_at`,
+    `last_seen_at`), created on password login, email confirmation, TOTP verify,
+    and passkey login, and removed on logout.
+  - Generated handler APIs on the user model: `sessions()`, `revoke_session(id)`,
+    `revoke_other_sessions(current_digest)`, and `revoke_all_sessions()`, plus a
+    `require_tracked_session` gate used by every generated authenticated route.
+    The row is the source of truth: revoking it makes the device's **next**
+    request 401 (the cookie session is destroyed too), with no reliance on
+    cookie expiry. `last_seen_at` writes are throttled to at most one per
+    `[auth.sessions].last_seen_update_secs` (default 60 s) per session.
+  - New `/account/sessions` Maud + htmx page: per-session revoke buttons,
+    device labels, and a one-click "Sign out everywhere else".
+  - Credential-changing events — password reset, TOTP enrollment/disable, and
+    passkey add/remove — revoke all *other* sessions by default, configurable
+    via the new `[auth.sessions] revoke_on_credential_change` flag (default on).
+  - New `autumn_web::user_agent` module: a dependency-free heuristic
+    `parse_user_agent` (browser family / OS / device class) with a documented
+    one-line swap point for custom parsers.
+  - Generated `tests/auth_sessions.rs` covers the two-client flow (log in twice,
+    revoke from one client, the other's replayed cookie 401s) and generated
+    `docs/guide/session-management.md` documents the APIs, the privacy posture
+    for stored IP/UA (purpose limitation, retention scrubbing SQL, IP
+    truncation), and the migration path for existing auth-starter apps.
+  - Additive only: one new table in the auth-starter migration; no public API
+    removed.
+
+- **jobs:** Job uniqueness keys and concurrency limits for `#[job]` (#829)
+  - `#[job(unique)]` dedupes enqueues on a stable hash of the full args;
+    `unique_by = "field, …"` derives the key from selected args fields. The
+    uniqueness window is configurable: `unique_window = "running"` (default:
+    held while pending or running), `"pending"` (released when execution
+    starts), or `unique_for_ms = N` (TTL debounce from enqueue time). A
+    coalesced enqueue is a no-op `Ok(())` — N identical enqueues in a burst
+    execute exactly once.
+  - `#[job(concurrency = N)]` caps simultaneously-executing jobs of the type;
+    `concurrency_key = "field"` scopes the cap per distinct args value
+    (e.g. at most one `recalculate_account` per account). Excess jobs wait
+    for a slot rather than running or being dropped.
+  - Enforced consistently on all three backends and distributed-safe on the
+    durable ones: Postgres uses an additive schema (nullable columns + a
+    partial unique index with `ON CONFLICT DO NOTHING`) and concurrency-aware
+    claims serialized by a transaction-scoped advisory lock only when a
+    limited job is registered; Redis uses `SET NX PX` unique locks and atomic
+    Lua claim/settle scripts with a parked-jobs zset.
+  - Keys and slots are released on success, terminal failure, and worker
+    crash (visibility-timeout recovery / TTL backstop), so a dead worker
+    cannot deadlock a unique key or leak a concurrency slot. Retries keep
+    the key held but free the slot during backoff.
+  - Observability: `/actuator/jobs` adds `total_deduplicated` and
+    `blocked_on_concurrency` per job, and the job admin model gains the
+    `deduplicated` status.
+  - Additive and non-breaking: jobs without the new attributes behave
+    exactly as before; the `autumn_jobs` schema change is additive; minor
+    version bump.
+
+- **db:** Declarative associations and eager loading for `#[model]` / `#[repository]` (#835)
+  - `#[model]` accepts struct-level `#[belongs_to(Target, fk = ...)]`,
+    `#[has_many(Target, fk = ...)]`, and `#[has_one(Target, fk = ...)]`.
+    Foreign keys are inferred by convention (`belongs_to` → `{target}_id` on
+    this model; `has_many`/`has_one` → `{source}_id` on the target) and
+    overridable with `fk = …`. The accessor/store name is derived by
+    convention and overridable with `name = …`, so multiple associations can
+    target the same model (e.g. `authored` / `approved` both → `Post`) without
+    colliding. The schema and association set live in one place — no per-pair
+    `Related` impl.
+  - Codegen emits a `{Model}Preload` spec builder (`Model::preload()`), a
+    `{Model}Associations` accessor trait implemented for `Preloaded<Model>`,
+    and a `Preloadable` impl that issues the batched queries.
+  - `#[repository]` gains `preload(records, spec)` returning
+    `Vec<Preloaded<Model>>`. It issues **at most one** `WHERE ... IN (...)`
+    statement per association per level (`belongs_to`/`has_one` keyed on the
+    parent/target id; `has_many` grouped client-side), with **no** per-row
+    fetches and **no** implicit lazy loading. Nested paths are supported, e.g.
+    `Post::preload().author().comments_with(Comment::preload().author())`.
+  - New `autumn_web::preload` module: `Preloaded<T>` (derefs to the record),
+    the type-erased `Associations` store, the typed `NotLoaded` accessor error
+    (accessing an un-preloaded association is an error, never SQL), the
+    `Preloadable` trait, and the `impl_preloadable_leaf!` macro for
+    hand-written association targets.
+  - Preload SQL runs on the **same read role** as the parent finder (the
+    repository's snapshotted `ReadRoute`); `on_primary()` pins the whole chain.
+    With `CursorPage`, preloads execute **after** the overfetch/truncate.
+  - Preloaded associations honor the target's **read scoping**, keyed off the
+    target's `#[repository]` config (not field presence): when the target
+    repository is `soft_delete`, soft-deleted rows (`deleted_at IS NOT NULL`)
+    are hidden; when it is `tenant_scoped`, rows outside the ambient
+    `CURRENT_TENANT` are hidden — mirroring the target's finders. A
+    `deleted_at`/`tenant_id` column on a model whose repository does *not* opt
+    in is left unfiltered. `repo.across_tenants().preload(...)` skips the
+    tenant predicate at every level, matching `across_tenants()` finders.
+  - `examples/reddit-clone` migrated: the front page and single-post view drop
+    their hand-written joins / per-row author lookups for `preload`. See
+    `docs/adr/0008-associations-and-eager-loading.md`.
+
+- **middleware:** `AppBuilder::static_gate` — auth gating for SSG/ISG routes
+  via a pre-static middleware hook (#848)
+  - Cached SSG/ISG pages are served by the static-first middleware before the
+    inner router (session, auth) is reached, so framework auth layers could not
+    gate pre-rendered responses. `static_gate` registers a Tower layer that runs
+    **outermost** — outside the session layer and ahead of the static cache —
+    so it can redirect or reject a request before a cached page is served
+    (Autumn's analogue of Next.js Edge Middleware).
+  - Runs in the same outermost position in both SSG/ISG and fully-dynamic
+    modes, so gating code is portable. Has access to request headers/cookies but
+    **not** the session `Extension` (verify a signed/JWT cookie directly).
+  - Plugin pre-flight helpers `has_static_gate::<L>()` /
+    `get_static_gate_types()`, and a matching `TestApp::static_gate` for tests.
+  - Additive only; documented in `docs/guide/middleware.md`.
+
+- **actuator:** Decouple the Prometheus scrape endpoint from sensitive mode (#857)
+  - New `actuator.prometheus` config flag (default `true`) controls
+    `/actuator/prometheus` **independently of** `actuator.sensitive`. Production
+    apps can expose Prometheus metrics for platform scraping (e.g. Fly.io
+    `[metrics]`) while keeping `sensitive = false`, so `/actuator/env`,
+    `/actuator/configprops`, `/actuator/loggers`, `/actuator/tasks`,
+    `/actuator/jobs`, and the actuator task UI stay off the public surface.
+  - Set `actuator.prometheus = false` (or `AUTUMN_ACTUATOR__PROMETHEUS=false`)
+    to remove the scrape endpoint entirely (it then returns `404`). The flag is
+    surfaced in `/actuator/configprops`.
+  - The `[actuator]` section now honors environment overrides
+    (`AUTUMN_ACTUATOR__PREFIX`, `AUTUMN_ACTUATOR__SENSITIVE`,
+    `AUTUMN_ACTUATOR__PROMETHEUS`), matching the documented
+    `AUTUMN_SECTION__FIELD` convention. Previously the actuator section was only
+    configurable via TOML.
+  - Docs: `docs/guide/deployment.md` now describes the safe Fly.io deployment
+    shape, including scraping a private/non-public metrics port, and clarifies
+    that OTLP tracing and the Prometheus scrape endpoint are separate telemetry
+    paths — enabling OTLP does not add OpenTelemetry metrics to
+    `/actuator/prometheus` without an explicit bridge/exporter.
+
+- **log:** Structured per-request access log, on by default (#999)
+  - Every served HTTP request now emits **exactly one** structured access-log
+    event (`tracing` target `autumn::access`, level `INFO`) at the response
+    boundary, carrying `method`, `route` (the matched low-cardinality template,
+    e.g. `/users/{id}` — never the raw path), `status`, `duration_ms`, and the
+    `request_id` that matches the `x-request-id` header and error pages.
+  - Dual placement: the **primary** layer emits inside the request
+    span/log context (correlated, request id from the request extension) and
+    marks the response; an **outermost fallback** at the router assembly
+    boundary logs only responses the primary never saw — startup 503s,
+    pre-built static (SSG/ISR) page hits, session-store outage 503s, and
+    requests to the late-mounted MCP endpoint — with the wire status and no
+    request id (those paths never run `RequestIdLayer`).
+  - Rendered by the standard subscriber, so it honors `log.format`: a readable
+    line under `pretty`, a single JSON object per line under `json`. Works with
+    **no** `telemetry-otlp` feature and no OTLP collector — operators on
+    `docker logs` / platform log drains get request-level visibility for free.
+  - Steady-state probe/asset noise is excluded by default (`/health`,
+    `/live`, `/ready`, `/startup`, `/actuator/*`, `/static/*`); the set is
+    configurable via `log.access_log_exclude` (whole-segment prefix matching)
+    or `AUTUMN_LOG__ACCESS_LOG_EXCLUDE` (comma-separated). Unmatched requests
+    log the low-cardinality `_unmatched` route label.
+  - On by default; turn off with `log.access_log = false` in `autumn.toml`
+    or `AUTUMN_LOG__ACCESS_LOG=false` — no recompile needed.
+  - The line never includes query strings, headers, or bodies, preserving the
+    log-scrubbing posture established for logs (#697) by construction.
+  - Additive `LogConfig` fields only (`access_log`, `access_log_exclude`);
+    non-breaking, minor version bump.
+
+- **mcp:** Expose typed endpoints as Model Context Protocol (MCP) tools so AI agents can call your API (#1117)
+  - New `mcp` Cargo feature (implies `openapi`). `AppBuilder::mount_mcp("/mcp")` serves a spec-compliant MCP endpoint over Streamable HTTP, handling `initialize`, `tools/list`, and `tools/call`.
+  - Endpoints opt in per-route via `#[api_doc(mcp)]`; nothing is exposed implicitly. `#[api_doc(mcp = false)]` force-excludes a route.
+  - A whole-API hatch, `AppBuilder::expose_all_as_mcp()`, auto-includes every eligible `GET`, but mutating verbs (`POST`/`PUT`/`PATCH`/`DELETE`) still require an explicit `#[api_doc(mcp)]` opt-in, and per-endpoint exclusions are always honored.
+  - Each tool's `name`, `description`, and `inputSchema` are derived from the existing `ApiDoc` (operation id, summary/description, merged request-body + `Query` + path-param schemas) — there is no second, hand-maintained schema, so the tool catalog cannot drift from the handler's typed contract.
+  - `tools/call` dispatches through the **real handler pipeline** (the same in-process path the test client uses), so `#[secured]`, authorization, tenancy, rate limits, and validation apply identically to an agent call and an HTTP call.
+  - Agent authentication reuses the existing bearer-token surface (`RequireApiToken` / `ApiTokenStore`): the `Authorization`, `Cookie`, and `X-CSRF-Token` headers presented to `/mcp` are forwarded into the dispatched call, so bearer, session (`#[secured]`), and CSRF-protected routes behave identically to a direct request.
+  - `Origin` validation (MCP Streamable-HTTP spec requirement) is enforced against the app's CORS `allowed_origins`: a browser `Origin` not in the allowlist gets `403`, while requests without an `Origin` (non-browser agents) pass — defending against DNS-rebinding without breaking agent clients.
+  - `AppBuilder::secure_mcp(layer)` gates the entire `/mcp` endpoint (catalog included) behind any tower layer, e.g. `RequireApiToken`.
+  - JSON-RPC robustness: rejects requests missing `jsonrpc: "2.0"`, empty/malformed batches, and non-object `arguments` with `-32600`/`-32602`; negotiates only supported protocol versions; enforces required `body` arguments; serializes array query fields with form/explode semantics; and reuses the framework path-segment encoder. Tool-result bodies are capped at 10 MiB. Duplicate tool names (same `operation_id`) keep the first registration with a build-time warning.
+  - HTTP method maps to MCP safety annotations: `GET` → `readOnlyHint`; `DELETE` → `destructiveHint`.
+  - Only JSON-in/JSON-out endpoints are eligible; HTML/Maud routes (no response schema) are auto-excluded with a build-time log note.
+  - `examples/todo-app` gains an `/mcp` endpoint exposing `list_json` (read) and `create_json` (explicitly-opted-in write) behind `RequireApiToken`.
+
+- **daemon:** `autumn serve` — run an app as a production (non-watch) local
+  daemon, with an optional managed local Postgres (#1119)
+  - `autumn serve` runs the compiled app in the foreground as a production
+    server (distinct from `autumn dev`: no file watching or hot reload).
+    `--release` builds an optimized binary.
+  - `autumn serve --daemon` backgrounds the server under a PID lockfile (a
+    second start is rejected with a clear message instead of double-binding);
+    `autumn serve stop | status | restart` manage its lifecycle. Graceful
+    shutdown reuses the existing lame-duck drain via `SIGTERM`.
+  - The server binds a **Unix domain socket** (new `server.unix_socket` /
+    `AUTUMN_SERVER__UNIX_SOCKET`) — never a public interface by default — and
+    the chosen address is written to a discovery file for clients. PID, socket,
+    address file, and logs live under platform dirs (XDG / `%APPDATA%`), never
+    cwd or `/etc`.
+  - `autumn new --daemon` scaffolds a model-free starter that builds with **no
+    Postgres** (drops the `db` feature and migrations) — runnable as a daemon
+    with zero external dependencies.
+  - `ManagedPostgresPoolProvider` (feature `managed-pg`) provisions and
+    supervises a local Postgres in the app's data dir through the existing
+    `with_pool_provider` seam (no query-path changes); `managed-pg-bundled`
+    embeds the Postgres binaries in the app executable. `autumn new
+    --bundled-pg` scaffolds and wires it.
+
+- **testing:** CSS-selector HTML assertions on `TestResponse` (#1147)
+  - Autumn renders server-side HTML (Maud + htmx), so the in-process test client can now assert on page *structure* by CSS selector instead of brittle substrings. New chainable methods on `TestResponse`: `assert_selector(css)`, `assert_no_selector(css)`, `assert_selector_count(css, n)`, `assert_text(css, expected)`, `assert_text_contains(css, sub)`, and `assert_attr(css, attr, expected)`.
+  - Non-asserting accessors for custom assertions: `selector_count(css) -> usize`, `selector_text(css) -> Vec<String>`, and `selector_attr(css, attr) -> Vec<Option<String>>` — each returns matches in document order.
+  - Backed by a dependency-free HTML parser and CSS-selector matcher (`tag`, `.class`, `#id`, `[attr]`/`[attr=v]`/`[attr^=v]`/`[attr$=v]`/`[attr*=v]`, compound selectors, selector lists, and descendant/child combinators). Parses fragments literally, so bare `<tr>` htmx swaps are selectable — a spec HTML5 tree builder would foster-parent and drop them.
+  - Assertions survive cosmetic template changes (whitespace, attribute order, wrapping markup) that break the equivalent `assert_body_contains` test. Failure messages print the selector, expected-vs-actual value, and a truncated outline of the parsed HTML.
+  - Purely additive: no breaking change to existing assertions; no new published dependency. See the `autumn::test` module docs and `docs/guide/testing.md` for a worked example.
+
+- **log:** Request-scoped log context that auto-tags every log line (#1169)
+  - An always-on `LogContextLayer` establishes a fresh `tokio::task_local`
+    `log::context::LogContext` for **every** HTTP request, seeded with the same
+    `request_id` used by the `x-request-id` header and error pages. It is not
+    gated behind `telemetry-otlp` and is applied inner to `RequestIdLayer` so the
+    request id is always available.
+  - The request is driven inside a `tracing` span carrying
+    `request_id`/`user_id`/`tenant_id`, so every `tracing` event emitted during
+    the request automatically correlates back to it — no manual field threading.
+  - When the request authenticates, `user_id` is added to the context
+    automatically (from both the `#[secured]` session check and the `RequireAuth`
+    middleware); when multi-tenancy resolves a tenant, `tenant_id` is added
+    automatically (from the tenancy middleware).
+  - Handler/service code can attach custom fields with
+    `autumn_web::log::context::with_log_field("order_id", id)` (re-exported from
+    the prelude). The well-known ids (`request_id`/`user_id`/`tenant_id`) ride the
+    request span and render in ordinary `tracing` output; custom fields are
+    carried in the context for **structured** consumers — the actuator log buffer
+    (#1168), the access line (#999), or any context-aware layer — rather than the
+    default stdout formatter. Reserved keys cannot be shadowed by custom fields.
+  - The context stays active while a streaming/SSE response body is produced (the
+    body is re-scoped per frame, mirroring tenancy), and synchronous work in a
+    downstream layer's `Service::call` is correlated too.
+  - Context is isolated per request (nothing leaks across requests) and a
+    `tokio::spawn`'d task does **not** inherit it unless explicitly propagated via
+    `log::context::in_current_context(..)`, which re-enters the request span too.
+  - Sensitive custom-field values are scrubbed through the existing
+    `log/filter.rs` key filter (#697), so secrets never enter the context output.
+  - Additive, non-breaking surface (minor version bump). Establishes the
+    correlating primitive consumed by the per-request access line (#999) and the
+    actuator log-view buffer (#1168).
+
+- **sharding:** `from_shard(db: &ShardedDb) -> Self` constructor on generated
+  repositories (#1273)
+  - `#[repository]` now emits `from_shard` as the standard way to build a
+    repository over a shard while preserving full request instrumentation:
+    statement timeout, slow-query threshold, and shard-tagged route metric
+    label are all carried from the `ShardedDb` context rather than reset to
+    framework defaults.
+  - The previous `with_pool` constructor is **renamed** to
+    `with_pool_untracked` to signal at the call site that request
+    observability is bypassed. Uses of `with_pool` on generated repositories
+    must be updated to `with_pool_untracked` (only the name changes; the
+    signature and semantics are identical).
+  - `ShardedDb` gains a `#[doc(hidden)]` `__autumn_repository_seed()` accessor
+    exposing the `ShardRepositorySeed` carrier struct used by generated code.
+
+- **generate:** `autumn generate tauri-mobile` — Tauri v2 **mobile** scaffold
+  (iOS/Android) that runs the Autumn Axum server **in-process** on a
+  background thread against a remote Postgres database (issue #1507,
+  Option B). Mobile sandboxes forbid sidecar processes, so the shell crate
+  builds as staticlib/cdylib, links the app crate directly, spawns the server
+  from `tauri::Builder::default().setup(...)`, health-polls `/health`, and
+  opens the webview at `http://127.0.0.1:<port>`; a small pool
+  (`AUTUMN_DATABASE__POOL_SIZE=2`) is pinned for flaky mobile networks (and
+  `AUTUMN_DATABASE__CONNECT_TIMEOUT_SECS=5`, matching the framework default,
+  is pinned explicitly). The generator also extracts the stock
+  `src/main.rs` into `src/lib.rs::serve()` (anchored; skipped with a warning
+  when customised). Docs: mobile sandboxing restrictions, flaky-network pool
+  behavior, the loopback security model, and App Store / Google Play
+  guideline compliance in
+  [docs/guide/tauri-mobile-in-process.md](docs/guide/tauri-mobile-in-process.md).
+  [no-plugin]
+
+- **db:** TLS to Postgres. The connection pool now honors `sslmode` in the
+  database URL via a rustls-backed connector: `sslmode=require` encrypts the
+  connection (libpq parity — no certificate-identity check, so self-signed
+  and private-CA servers work), and `sslmode=verify-full` additionally
+  verifies the certificate chain and hostname against the Mozilla root store
+  (plus an `sslrootcert=<PEM file>` when given). URLs without `sslmode` (or
+  with `disable`/`prefer`) keep the previous plaintext behavior unchanged.
+  Previously the pool hardcoded `NoTls`, so `sslmode=require` failed every
+  connection with "no TLS implementation configured" and cleartext was the
+  only working configuration (issue #1507). [no-plugin]
+
+- **offline-sync (new feature):** offline-first local storage plus a sync
+  engine for occasionally-connected apps such as the in-process Tauri mobile
+  shell (issue #1508). `autumn_web::sync` ships a local SQLite `SyncStore`
+  (JSON rows per collection, write-through change journal in the same
+  transaction, tombstoned deletes), a client `SyncEngine` (push pending →
+  pull versions past the cursor; at-least-once with server-side dedup,
+  exponential-backoff background task, transparent full resync that
+  preserves and replays pending changes), and a mountable server router
+  (`POST /sync/push` + `GET /sync/pull` via `AppBuilder::nest`) over
+  Postgres shadow tables with idempotent DDL (`PgSyncBackend`) or an
+  in-memory backend for tests. Conflicts are settled server-side by a
+  pluggable `ConflictResolver` (default: last-write-wins on the conflicting
+  writes' `updated_at`; exact ties break to the lexicographically greater
+  device id); resolved rows get a new version so every device converges.
+  Postgres pushes serialize under an advisory lock (in-order version
+  visibility for pulls; concurrent first-inserts of one pk engage the
+  resolver), pull sessions carry a session-start cursor so multi-page
+  catch-ups survive tombstone GC, completed catch-ups land the cursor at
+  the GC horizon and prune GC'd local tombstones, `already_applied` acks
+  return the originally assigned version, push/pull request sizes are
+  bounded server-side, dedup records are GC-able via
+  `SyncBackend::gc_applied`, and `SyncConfig::bearer_token` authenticates
+  the engine against an auth-guarded `/sync` mount. Zero new
+  dependencies — builds on the `db` and `http-client` features already in
+  the graph. [no-plugin]
+
+- **generator:** `autumn generate tauri-mobile --offline-sync` (issue #1508)
+  wires the offline-sync engine into the mobile scaffold: the shell opens a
+  `SyncStore`-backed SQLite database in the app sandbox (exported as
+  `AUTUMN_SYNC__DB_PATH`), runs a background `SyncEngine` against
+  `AUTUMN_SYNC__REMOTE_URL` (30 s interval, exponential backoff while
+  offline, plus an immediate pass on `RunEvent::Resumed` when the app
+  returns to the foreground), and the app crate gains a default
+  `offline-sync` feature and a `/sync` router mounted in the extracted
+  `serve()` — only when the app's resolved config has a database URL (e.g.
+  `AUTUMN_DATABASE__URL`), and with log-and-continue schema DDL, so the
+  same binary boots fully offline on a device (no database at all) and
+  serves sync on the server. Without the flag the emitted scaffold is
+  byte-identical to before (pinned by a golden snapshot test). Docs:
+  architecture, change tracking, tombstoning/GC, conflict resolution, and
+  an airplane-mode walkthrough in
+  [docs/guide/tauri-mobile-offline-sync.md](docs/guide/tauri-mobile-offline-sync.md).
+  [no-plugin]
+
+- **ci:** plugin freshness gate (`scripts/check-plugin-freshness.sh` +
+  `.github/workflows/plugin-freshness.yml`) — a PR that adds entries to this
+  changelog's Unreleased `Added`/`Changed` sections without touching the
+  Claude plugin (`skills/`, `agents/`, `.claude-plugin/`) fails a fast,
+  toolchain-free check; exempt individual bullets with a bracketed
+  `no-plugin` marker, or the whole PR via the same marker in the PR body or
+  the `plugin-exempt` label. The same job sanity-checks that
+  `plugin.json` parses and that every `docs/guide/*.md` path referenced from
+  the plugin exists. Run `scripts/check-plugin-freshness.sh --self-test`
+  locally.
+
+- **db:** Framework-native horizontal sharding (`[[database.shards]]`)
+  - Tenant data routes key → logical slot (fixed at 16384 slots, matching
+    Redis Cluster/Valkey — nothing to choose or outgrow; deterministic
+    FNV-1a/splitmix64 hash pinned by golden-vector tests) → physical shard
+    per an explicit `slots` map, so resharding moves whole slots in config
+    instead of rehashing keys. Each shard is a full primary/replica
+    `DatabaseTopology` with per-shard `replica_fallback`.
+  - New `autumn_web::sharding` module and prelude extractors: `ShardedDb`
+    (tenant-routed via `ShardKeyOverride` → tenancy task-local → tenant
+    extraction; derefs like `Db` with the same `tx` semantics) and `Shards`
+    (`db_for`/`read_for`/`db_on` plus a bounded concurrent `each_shard`
+    fan-out that collects per-shard results — there are no cross-shard
+    transactions). Pluggable `ShardRouter` via
+    `AppBuilder::with_shard_router`; per-shard pool decoration via
+    `DatabasePoolProvider::create_shard_topology`. `#[repository]` gains a
+    `with_pool` constructor for shard-scoped repositories.
+  - Startup auto-migrate and `autumn migrate` apply migrations control-first
+    then per shard, fail-fast with target labels; new `--shard <name>` /
+    `--control-only` flags and per-target `status`. Per-shard replica
+    migration parity gates each shard's replica reads.
+  - `/ready` and `/actuator/health` gain `db:shard:<name>` components;
+    `/actuator/metrics` gains a `database_shards` block; shard-routed
+    checkouts tag spans (`db.shard`) and route metrics (`shard=<name>`).
+  - Framework state (jobs, scheduler locks, sessions, flags) stays on the
+    unsharded control role — enforced at config validation. New
+    `examples/bookmarks-sharded` Docker Compose stack and
+    `docs/guide/sharding.md`.
+
 ### Fixed
 
 - **idempotency:** the in-memory idempotency store no longer panics on extreme
@@ -1615,6 +1979,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **cli:** `autumn doctor` now resolves deploy secret and database values under the `[deploy]` profile (#2012), and a drifted deploy live-slot marker self-heals from the live proxy at deploy-start (#2023, fixes #1938).
 - **ci:** excluded the `sqlite` backend feature from `--all-features` CI steps so Test and Coverage are no longer red (#1997), and fixed a webauthn schema-keys snapshot drift under `--all-features` (#1984, fixes #1959). [no-plugin]
 - **lint:** split long first doc paragraphs to satisfy clippy 1.97 `too_long_first_doc_paragraph` (#2025).
+- **security:** CSRF and CAPTCHA exempt-path matching now normalizes the
+  request path (resolving `.`/`..` dot-segments — including percent-encoded
+  `%2e` forms — treating percent-encoded slashes (`%2f`) as segment
+  separators, and collapsing duplicate slashes) before comparing it against
+  exemption prefixes, so a request like `POST /api/../submit` or
+  `POST /api/%2e%2e%2fsubmit` can no longer satisfy an `/api/` exemption
+  while targeting a protected route through a downstream component that
+  percent-decodes or resolves dot-segments (supersedes #1229).
+- **mail:** the SMTP password can no longer leak into startup error messages.
+  When `mail.smtp.password_env` names an environment variable whose contents
+  are not valid unicode, the raw `std::env::VarError::NotUnicode` value (which
+  carries the password itself) was formatted into the
+  `MailError::InvalidMessage` text; the error now reports a static reason
+  ("environment variable is not set" / "contains non-unicode data") alongside
+  the variable *name* only, never its value. Supersedes PR #887.
+- **circuit_breaker:** the breaker and its registry now recover from a
+  poisoned mutex (`lock().unwrap_or_else(PoisonError::into_inner)`) instead
+  of panicking on every subsequent call once a single lock holder has
+  panicked; breaker state is a self-correcting sliding window, so the
+  recovered data is safe to keep using. Supersedes #1207. [no-plugin]
+- **docs:** repaired the broken intra-doc links in the `reporting` module
+  overview (`ErrorEvent`, `ErrorReporter`, `LogReporter`, `ReportingLayer`
+  rendered as dead links on docs.rs because shorthand references don't resolve
+  when a module carries both outer and inner doc comments — they now use
+  explicit `crate::reporting::…` paths) and dropped a redundant explicit link
+  target in the `job_tracking` module docs. Supersedes the salvageable parts
+  of PR #1555.
+- **jobs:** fixed a first-initialization race in the process-global job
+  client (supersedes #1491): `init_global_job_client` /
+  `clear_global_job_client` used a get-then-set pattern on the backing
+  `OnceLock`, so two threads racing the very first install/clear could have
+  one side's `OnceLock::set` lose and be silently dropped — leaving a job
+  runtime that had just installed its client invisible to `global_job_client()`
+  (free-function `enqueue` and `#[job]` handlers would see no runtime). Both
+  functions now use `OnceLock::get_or_init` so the slot is created exactly
+  once and every install/clear lands through the `RwLock`. Both functions now
+  also recover from a poisoned lock (`PoisonError::into_inner`) instead of
+  silently skipping the write, and a loom model-check
+  (`chaos_job_client_loom`) exercises the first-init race across all
+  interleavings.
+- **doctor:** `autumn doctor`'s deploy check now fails on a malformed `previous_secrets` block, matching `autumn deploy check` — the two no longer disagree about whether a deploy config is valid (#1904).
+- **cli:** `autumn lifecycle diagram` now module-qualifies node ids so two same-named enums in different modules no longer collide into a single node in the emitted diagram (#1929).
+- **doctor:** `autumn doctor` now fails a malformed `[[database.shards]]` entry instead of silently treating it as a no-shards configuration, so a typo in a shard block is surfaced rather than passing the SQLite/single-DB path by accident (#1939).
+- **security:** CSRF token extraction from a multipart body now scans only a bounded prefix for the token field and streams the remainder rather than buffering the whole body into memory, closing a memory-exhaustion vector on large uploads; the prefix size is tunable via `security.csrf.token_scan_bytes` (#1887).
+- **web:** a multipart part with an empty filename is now treated as ordinary non-file input rather than an uploaded file, so a browser submitting an untouched `<input type=file>` (blank filename) no longer produces a spurious empty blob (fixes #1873, #1878).
+- **generate:** scaffolded create/update handlers now delete already-uploaded blobs when the handler returns early (e.g. on a validation failure) instead of orphaning them in the blob store (#1888).
+- **config:** the startup schema walk no longer aborts when it hits a `statement_timeout`; strict schema enforcement rolls out warn-first, and a new `strict_config_enforce_all` knob opts into failing on every strict finding rather than warning (#1914).
+- **security:** tenant-isolation fixes for the repository layer (#1962) — a cross-tenant `update` targeting a foreign or missing id now returns a 404 rather than a 500, and a bulk upsert silently filters out cross-tenant rows for non-versioned records instead of writing across the tenant boundary.
 
 ### Changed
 
@@ -1713,276 +2125,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **benchmarks:** bumped the puma benchmark dependency to `~> 7.2`, clearing CVE-2026-47736 / CVE-2026-47737 and moderate advisories (#2006). [no-plugin]
 - **test:** de-flaked two #1923-sweep tests — a `job_tracking` JSONB cast and a sharding fail-closed replay — surfaced by the Docker sweep (#1968). [no-plugin]
 
-### Fixed
-
-- **security:** CSRF and CAPTCHA exempt-path matching now normalizes the
-  request path (resolving `.`/`..` dot-segments — including percent-encoded
-  `%2e` forms — treating percent-encoded slashes (`%2f`) as segment
-  separators, and collapsing duplicate slashes) before comparing it against
-  exemption prefixes, so a request like `POST /api/../submit` or
-  `POST /api/%2e%2e%2fsubmit` can no longer satisfy an `/api/` exemption
-  while targeting a protected route through a downstream component that
-  percent-decodes or resolves dot-segments (supersedes #1229).
-- **mail:** the SMTP password can no longer leak into startup error messages.
-  When `mail.smtp.password_env` names an environment variable whose contents
-  are not valid unicode, the raw `std::env::VarError::NotUnicode` value (which
-  carries the password itself) was formatted into the
-  `MailError::InvalidMessage` text; the error now reports a static reason
-  ("environment variable is not set" / "contains non-unicode data") alongside
-  the variable *name* only, never its value. Supersedes PR #887.
-- **circuit_breaker:** the breaker and its registry now recover from a
-  poisoned mutex (`lock().unwrap_or_else(PoisonError::into_inner)`) instead
-  of panicking on every subsequent call once a single lock holder has
-  panicked; breaker state is a self-correcting sliding window, so the
-  recovered data is safe to keep using. Supersedes #1207. [no-plugin]
-- **docs:** repaired the broken intra-doc links in the `reporting` module
-  overview (`ErrorEvent`, `ErrorReporter`, `LogReporter`, `ReportingLayer`
-  rendered as dead links on docs.rs because shorthand references don't resolve
-  when a module carries both outer and inner doc comments — they now use
-  explicit `crate::reporting::…` paths) and dropped a redundant explicit link
-  target in the `job_tracking` module docs. Supersedes the salvageable parts
-  of PR #1555.
-- **jobs:** fixed a first-initialization race in the process-global job
-  client (supersedes #1491): `init_global_job_client` /
-  `clear_global_job_client` used a get-then-set pattern on the backing
-  `OnceLock`, so two threads racing the very first install/clear could have
-  one side's `OnceLock::set` lose and be silently dropped — leaving a job
-  runtime that had just installed its client invisible to `global_job_client()`
-  (free-function `enqueue` and `#[job]` handlers would see no runtime). Both
-  functions now use `OnceLock::get_or_init` so the slot is created exactly
-  once and every install/clear lands through the `RwLock`. Both functions now
-  also recover from a poisoned lock (`PoisonError::into_inner`) instead of
-  silently skipping the write, and a loom model-check
-  (`chaos_job_client_loom`) exercises the first-init race across all
-  interleavings.
-- **doctor:** `autumn doctor`'s deploy check now fails on a malformed `previous_secrets` block, matching `autumn deploy check` — the two no longer disagree about whether a deploy config is valid (#1904).
-- **cli:** `autumn lifecycle diagram` now module-qualifies node ids so two same-named enums in different modules no longer collide into a single node in the emitted diagram (#1929).
-- **doctor:** `autumn doctor` now fails a malformed `[[database.shards]]` entry instead of silently treating it as a no-shards configuration, so a typo in a shard block is surfaced rather than passing the SQLite/single-DB path by accident (#1939).
-- **security:** CSRF token extraction from a multipart body now scans only a bounded prefix for the token field and streams the remainder rather than buffering the whole body into memory, closing a memory-exhaustion vector on large uploads; the prefix size is tunable via `security.csrf.token_scan_bytes` (#1887).
-- **web:** a multipart part with an empty filename is now treated as ordinary non-file input rather than an uploaded file, so a browser submitting an untouched `<input type=file>` (blank filename) no longer produces a spurious empty blob (fixes #1873, #1878).
-- **generate:** scaffolded create/update handlers now delete already-uploaded blobs when the handler returns early (e.g. on a validation failure) instead of orphaning them in the blob store (#1888).
-- **config:** the startup schema walk no longer aborts when it hits a `statement_timeout`; strict schema enforcement rolls out warn-first, and a new `strict_config_enforce_all` knob opts into failing on every strict finding rather than warning (#1914).
-- **security:** tenant-isolation fixes for the repository layer (#1962) — a cross-tenant `update` targeting a foreign or missing id now returns a 404 rather than a 500, and a bulk upsert silently filters out cross-tenant rows for non-versioned records instead of writing across the tenant boundary.
-
-## [0.6.0] - 2026-06-30
-
-### Added
-
-- **ui:** reusable `card` and `stat_card` Maud widget helpers in
-  `autumn_web::widgets`, re-exported from the prelude. `card()` renders a
-  titled content panel with an optional header-action slot, footer, and
-  configurable heading level (`HeadingLevel::H1`–`H6`, default `H2`);
-  `stat_card()` renders a metric tile with label, value, and optional link.
-  Both are CSP-safe and HTML-escape caller-supplied text via Maud.
-  `CardConfig` uses a builder pattern with `const fn` and private fields
-  so the `title()` / `title_html()` escape path cannot be bypassed.
-  The admin plugin's 12 hand-rolled card blocks and dashboard stat tiles are
-  migrated to the new helpers, removing the duplication (#1122).
-
-## [0.5.0] - 2026-06-16
-
-### Added
-
-- **ci:** plugin freshness gate (`scripts/check-plugin-freshness.sh` +
-  `.github/workflows/plugin-freshness.yml`) — a PR that adds entries to this
-  changelog's Unreleased `Added`/`Changed` sections without touching the
-  Claude plugin (`skills/`, `agents/`, `.claude-plugin/`) fails a fast,
-  toolchain-free check; exempt individual bullets with a bracketed
-  `no-plugin` marker, or the whole PR via the same marker in the PR body or
-  the `plugin-exempt` label. The same job sanity-checks that
-  `plugin.json` parses and that every `docs/guide/*.md` path referenced from
-  the plugin exists. Run `scripts/check-plugin-freshness.sh --self-test`
-  locally.
-
-- **daemon:** `autumn serve` — run an app as a production (non-watch) local
-  daemon, with an optional managed local Postgres (#1119)
-  - `autumn serve` runs the compiled app in the foreground as a production
-    server (distinct from `autumn dev`: no file watching or hot reload).
-    `--release` builds an optimized binary.
-  - `autumn serve --daemon` backgrounds the server under a PID lockfile (a
-    second start is rejected with a clear message instead of double-binding);
-    `autumn serve stop | status | restart` manage its lifecycle. Graceful
-    shutdown reuses the existing lame-duck drain via `SIGTERM`.
-  - The server binds a **Unix domain socket** (new `server.unix_socket` /
-    `AUTUMN_SERVER__UNIX_SOCKET`) — never a public interface by default — and
-    the chosen address is written to a discovery file for clients. PID, socket,
-    address file, and logs live under platform dirs (XDG / `%APPDATA%`), never
-    cwd or `/etc`.
-  - `autumn new --daemon` scaffolds a model-free starter that builds with **no
-    Postgres** (drops the `db` feature and migrations) — runnable as a daemon
-    with zero external dependencies.
-  - `ManagedPostgresPoolProvider` (feature `managed-pg`) provisions and
-    supervises a local Postgres in the app's data dir through the existing
-    `with_pool_provider` seam (no query-path changes); `managed-pg-bundled`
-    embeds the Postgres binaries in the app executable. `autumn new
-    --bundled-pg` scaffolds and wires it.
-
-- **sharding:** `from_shard(db: &ShardedDb) -> Self` constructor on generated
-  repositories (#1273)
-  - `#[repository]` now emits `from_shard` as the standard way to build a
-    repository over a shard while preserving full request instrumentation:
-    statement timeout, slow-query threshold, and shard-tagged route metric
-    label are all carried from the `ShardedDb` context rather than reset to
-    framework defaults.
-  - The previous `with_pool` constructor is **renamed** to
-    `with_pool_untracked` to signal at the call site that request
-    observability is bypassed. Uses of `with_pool` on generated repositories
-    must be updated to `with_pool_untracked` (only the name changes; the
-    signature and semantics are identical).
-  - `ShardedDb` gains a `#[doc(hidden)]` `__autumn_repository_seed()` accessor
-    exposing the `ShardRepositorySeed` carrier struct used by generated code.
-
-- **middleware:** `AppBuilder::static_gate` — auth gating for SSG/ISG routes
-  via a pre-static middleware hook (#848)
-  - Cached SSG/ISG pages are served by the static-first middleware before the
-    inner router (session, auth) is reached, so framework auth layers could not
-    gate pre-rendered responses. `static_gate` registers a Tower layer that runs
-    **outermost** — outside the session layer and ahead of the static cache —
-    so it can redirect or reject a request before a cached page is served
-    (Autumn's analogue of Next.js Edge Middleware).
-  - Runs in the same outermost position in both SSG/ISG and fully-dynamic
-    modes, so gating code is portable. Has access to request headers/cookies but
-    **not** the session `Extension` (verify a signed/JWT cookie directly).
-  - Plugin pre-flight helpers `has_static_gate::<L>()` /
-    `get_static_gate_types()`, and a matching `TestApp::static_gate` for tests.
-  - Additive only; documented in `docs/guide/middleware.md`.
-- **db:** Declarative associations and eager loading for `#[model]` / `#[repository]` (#835)
-  - `#[model]` accepts struct-level `#[belongs_to(Target, fk = ...)]`,
-    `#[has_many(Target, fk = ...)]`, and `#[has_one(Target, fk = ...)]`.
-    Foreign keys are inferred by convention (`belongs_to` → `{target}_id` on
-    this model; `has_many`/`has_one` → `{source}_id` on the target) and
-    overridable with `fk = …`. The accessor/store name is derived by
-    convention and overridable with `name = …`, so multiple associations can
-    target the same model (e.g. `authored` / `approved` both → `Post`) without
-    colliding. The schema and association set live in one place — no per-pair
-    `Related` impl.
-  - Codegen emits a `{Model}Preload` spec builder (`Model::preload()`), a
-    `{Model}Associations` accessor trait implemented for `Preloaded<Model>`,
-    and a `Preloadable` impl that issues the batched queries.
-  - `#[repository]` gains `preload(records, spec)` returning
-    `Vec<Preloaded<Model>>`. It issues **at most one** `WHERE ... IN (...)`
-    statement per association per level (`belongs_to`/`has_one` keyed on the
-    parent/target id; `has_many` grouped client-side), with **no** per-row
-    fetches and **no** implicit lazy loading. Nested paths are supported, e.g.
-    `Post::preload().author().comments_with(Comment::preload().author())`.
-  - New `autumn_web::preload` module: `Preloaded<T>` (derefs to the record),
-    the type-erased `Associations` store, the typed `NotLoaded` accessor error
-    (accessing an un-preloaded association is an error, never SQL), the
-    `Preloadable` trait, and the `impl_preloadable_leaf!` macro for
-    hand-written association targets.
-  - Preload SQL runs on the **same read role** as the parent finder (the
-    repository's snapshotted `ReadRoute`); `on_primary()` pins the whole chain.
-    With `CursorPage`, preloads execute **after** the overfetch/truncate.
-  - Preloaded associations honor the target's **read scoping**, keyed off the
-    target's `#[repository]` config (not field presence): when the target
-    repository is `soft_delete`, soft-deleted rows (`deleted_at IS NOT NULL`)
-    are hidden; when it is `tenant_scoped`, rows outside the ambient
-    `CURRENT_TENANT` are hidden — mirroring the target's finders. A
-    `deleted_at`/`tenant_id` column on a model whose repository does *not* opt
-    in is left unfiltered. `repo.across_tenants().preload(...)` skips the
-    tenant predicate at every level, matching `across_tenants()` finders.
-  - `examples/reddit-clone` migrated: the front page and single-post view drop
-    their hand-written joins / per-row author lookups for `preload`. See
-    `docs/adr/0008-associations-and-eager-loading.md`.
-- **db:** Framework-native horizontal sharding (`[[database.shards]]`)
-  - Tenant data routes key → logical slot (fixed at 16384 slots, matching
-    Redis Cluster/Valkey — nothing to choose or outgrow; deterministic
-    FNV-1a/splitmix64 hash pinned by golden-vector tests) → physical shard
-    per an explicit `slots` map, so resharding moves whole slots in config
-    instead of rehashing keys. Each shard is a full primary/replica
-    `DatabaseTopology` with per-shard `replica_fallback`.
-  - New `autumn_web::sharding` module and prelude extractors: `ShardedDb`
-    (tenant-routed via `ShardKeyOverride` → tenancy task-local → tenant
-    extraction; derefs like `Db` with the same `tx` semantics) and `Shards`
-    (`db_for`/`read_for`/`db_on` plus a bounded concurrent `each_shard`
-    fan-out that collects per-shard results — there are no cross-shard
-    transactions). Pluggable `ShardRouter` via
-    `AppBuilder::with_shard_router`; per-shard pool decoration via
-    `DatabasePoolProvider::create_shard_topology`. `#[repository]` gains a
-    `with_pool` constructor for shard-scoped repositories.
-  - Startup auto-migrate and `autumn migrate` apply migrations control-first
-    then per shard, fail-fast with target labels; new `--shard <name>` /
-    `--control-only` flags and per-target `status`. Per-shard replica
-    migration parity gates each shard's replica reads.
-  - `/ready` and `/actuator/health` gain `db:shard:<name>` components;
-    `/actuator/metrics` gains a `database_shards` block; shard-routed
-    checkouts tag spans (`db.shard`) and route metrics (`shard=<name>`).
-  - Framework state (jobs, scheduler locks, sessions, flags) stays on the
-    unsharded control role — enforced at config validation. New
-    `examples/bookmarks-sharded` Docker Compose stack and
-    `docs/guide/sharding.md`.
-
-- **generate:** `autumn generate tauri-mobile` — Tauri v2 **mobile** scaffold
-  (iOS/Android) that runs the Autumn Axum server **in-process** on a
-  background thread against a remote Postgres database (issue #1507,
-  Option B). Mobile sandboxes forbid sidecar processes, so the shell crate
-  builds as staticlib/cdylib, links the app crate directly, spawns the server
-  from `tauri::Builder::default().setup(...)`, health-polls `/health`, and
-  opens the webview at `http://127.0.0.1:<port>`; a small pool
-  (`AUTUMN_DATABASE__POOL_SIZE=2`) is pinned for flaky mobile networks (and
-  `AUTUMN_DATABASE__CONNECT_TIMEOUT_SECS=5`, matching the framework default,
-  is pinned explicitly). The generator also extracts the stock
-  `src/main.rs` into `src/lib.rs::serve()` (anchored; skipped with a warning
-  when customised). Docs: mobile sandboxing restrictions, flaky-network pool
-  behavior, the loopback security model, and App Store / Google Play
-  guideline compliance in
-  [docs/guide/tauri-mobile-in-process.md](docs/guide/tauri-mobile-in-process.md).
-  [no-plugin]
-
-- **db:** TLS to Postgres. The connection pool now honors `sslmode` in the
-  database URL via a rustls-backed connector: `sslmode=require` encrypts the
-  connection (libpq parity — no certificate-identity check, so self-signed
-  and private-CA servers work), and `sslmode=verify-full` additionally
-  verifies the certificate chain and hostname against the Mozilla root store
-  (plus an `sslrootcert=<PEM file>` when given). URLs without `sslmode` (or
-  with `disable`/`prefer`) keep the previous plaintext behavior unchanged.
-  Previously the pool hardcoded `NoTls`, so `sslmode=require` failed every
-  connection with "no TLS implementation configured" and cleartext was the
-  only working configuration (issue #1507). [no-plugin]
-
-- **offline-sync (new feature):** offline-first local storage plus a sync
-  engine for occasionally-connected apps such as the in-process Tauri mobile
-  shell (issue #1508). `autumn_web::sync` ships a local SQLite `SyncStore`
-  (JSON rows per collection, write-through change journal in the same
-  transaction, tombstoned deletes), a client `SyncEngine` (push pending →
-  pull versions past the cursor; at-least-once with server-side dedup,
-  exponential-backoff background task, transparent full resync that
-  preserves and replays pending changes), and a mountable server router
-  (`POST /sync/push` + `GET /sync/pull` via `AppBuilder::nest`) over
-  Postgres shadow tables with idempotent DDL (`PgSyncBackend`) or an
-  in-memory backend for tests. Conflicts are settled server-side by a
-  pluggable `ConflictResolver` (default: last-write-wins on the conflicting
-  writes' `updated_at`; exact ties break to the lexicographically greater
-  device id); resolved rows get a new version so every device converges.
-  Postgres pushes serialize under an advisory lock (in-order version
-  visibility for pulls; concurrent first-inserts of one pk engage the
-  resolver), pull sessions carry a session-start cursor so multi-page
-  catch-ups survive tombstone GC, completed catch-ups land the cursor at
-  the GC horizon and prune GC'd local tombstones, `already_applied` acks
-  return the originally assigned version, push/pull request sizes are
-  bounded server-side, dedup records are GC-able via
-  `SyncBackend::gc_applied`, and `SyncConfig::bearer_token` authenticates
-  the engine against an auth-guarded `/sync` mount. Zero new
-  dependencies — builds on the `db` and `http-client` features already in
-  the graph. [no-plugin]
-- **generator:** `autumn generate tauri-mobile --offline-sync` (issue #1508)
-  wires the offline-sync engine into the mobile scaffold: the shell opens a
-  `SyncStore`-backed SQLite database in the app sandbox (exported as
-  `AUTUMN_SYNC__DB_PATH`), runs a background `SyncEngine` against
-  `AUTUMN_SYNC__REMOTE_URL` (30 s interval, exponential backoff while
-  offline, plus an immediate pass on `RunEvent::Resumed` when the app
-  returns to the foreground), and the app crate gains a default
-  `offline-sync` feature and a `/sync` router mounted in the extracted
-  `serve()` — only when the app's resolved config has a database URL (e.g.
-  `AUTUMN_DATABASE__URL`), and with log-and-continue schema DDL, so the
-  same binary boots fully offline on a device (no database at all) and
-  serves sync on the server. Without the flag the emitted scaffold is
-  byte-identical to before (pinned by a golden snapshot test). Docs:
-  architecture, change tracking, tombstoning/GC, conflict resolution, and
-  an airplane-mode walkthrough in
-  [docs/guide/tauri-mobile-offline-sync.md](docs/guide/tauri-mobile-offline-sync.md).
-  [no-plugin]
-
 ### Documentation
 
 - **plugin:** refresh the Claude plugin to current framework state. Adds
@@ -2025,168 +2167,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   migrated to the new helpers, removing the duplication (#1122).
 
 ## [0.5.0] - 2026-06-16
-
-### Added
-
-- **auth:** Active session management with device list and revocation in the auth starter (#819)
-  - `autumn generate auth` now persists a `{user}_sessions` row per login
-    (SHA-256 digest of the opaque session id — never the raw id — plus user id,
-    IP at login, raw + parsed User-Agent, optional device label, `created_at`,
-    `last_seen_at`), created on password login, email confirmation, TOTP verify,
-    and passkey login, and removed on logout.
-  - Generated handler APIs on the user model: `sessions()`, `revoke_session(id)`,
-    `revoke_other_sessions(current_digest)`, and `revoke_all_sessions()`, plus a
-    `require_tracked_session` gate used by every generated authenticated route.
-    The row is the source of truth: revoking it makes the device's **next**
-    request 401 (the cookie session is destroyed too), with no reliance on
-    cookie expiry. `last_seen_at` writes are throttled to at most one per
-    `[auth.sessions].last_seen_update_secs` (default 60 s) per session.
-  - New `/account/sessions` Maud + htmx page: per-session revoke buttons,
-    device labels, and a one-click "Sign out everywhere else".
-  - Credential-changing events — password reset, TOTP enrollment/disable, and
-    passkey add/remove — revoke all *other* sessions by default, configurable
-    via the new `[auth.sessions] revoke_on_credential_change` flag (default on).
-  - New `autumn_web::user_agent` module: a dependency-free heuristic
-    `parse_user_agent` (browser family / OS / device class) with a documented
-    one-line swap point for custom parsers.
-  - Generated `tests/auth_sessions.rs` covers the two-client flow (log in twice,
-    revoke from one client, the other's replayed cookie 401s) and generated
-    `docs/guide/session-management.md` documents the APIs, the privacy posture
-    for stored IP/UA (purpose limitation, retention scrubbing SQL, IP
-    truncation), and the migration path for existing auth-starter apps.
-  - Additive only: one new table in the auth-starter migration; no public API
-    removed.
-- **jobs:** Job uniqueness keys and concurrency limits for `#[job]` (#829)
-  - `#[job(unique)]` dedupes enqueues on a stable hash of the full args;
-    `unique_by = "field, …"` derives the key from selected args fields. The
-    uniqueness window is configurable: `unique_window = "running"` (default:
-    held while pending or running), `"pending"` (released when execution
-    starts), or `unique_for_ms = N` (TTL debounce from enqueue time). A
-    coalesced enqueue is a no-op `Ok(())` — N identical enqueues in a burst
-    execute exactly once.
-  - `#[job(concurrency = N)]` caps simultaneously-executing jobs of the type;
-    `concurrency_key = "field"` scopes the cap per distinct args value
-    (e.g. at most one `recalculate_account` per account). Excess jobs wait
-    for a slot rather than running or being dropped.
-  - Enforced consistently on all three backends and distributed-safe on the
-    durable ones: Postgres uses an additive schema (nullable columns + a
-    partial unique index with `ON CONFLICT DO NOTHING`) and concurrency-aware
-    claims serialized by a transaction-scoped advisory lock only when a
-    limited job is registered; Redis uses `SET NX PX` unique locks and atomic
-    Lua claim/settle scripts with a parked-jobs zset.
-  - Keys and slots are released on success, terminal failure, and worker
-    crash (visibility-timeout recovery / TTL backstop), so a dead worker
-    cannot deadlock a unique key or leak a concurrency slot. Retries keep
-    the key held but free the slot during backoff.
-  - Observability: `/actuator/jobs` adds `total_deduplicated` and
-    `blocked_on_concurrency` per job, and the job admin model gains the
-    `deduplicated` status.
-  - Additive and non-breaking: jobs without the new attributes behave
-    exactly as before; the `autumn_jobs` schema change is additive; minor
-    version bump.
-
-- **log:** Structured per-request access log, on by default (#999)
-  - Every served HTTP request now emits **exactly one** structured access-log
-    event (`tracing` target `autumn::access`, level `INFO`) at the response
-    boundary, carrying `method`, `route` (the matched low-cardinality template,
-    e.g. `/users/{id}` — never the raw path), `status`, `duration_ms`, and the
-    `request_id` that matches the `x-request-id` header and error pages.
-  - Dual placement: the **primary** layer emits inside the request
-    span/log context (correlated, request id from the request extension) and
-    marks the response; an **outermost fallback** at the router assembly
-    boundary logs only responses the primary never saw — startup 503s,
-    pre-built static (SSG/ISR) page hits, session-store outage 503s, and
-    requests to the late-mounted MCP endpoint — with the wire status and no
-    request id (those paths never run `RequestIdLayer`).
-  - Rendered by the standard subscriber, so it honors `log.format`: a readable
-    line under `pretty`, a single JSON object per line under `json`. Works with
-    **no** `telemetry-otlp` feature and no OTLP collector — operators on
-    `docker logs` / platform log drains get request-level visibility for free.
-  - Steady-state probe/asset noise is excluded by default (`/health`,
-    `/live`, `/ready`, `/startup`, `/actuator/*`, `/static/*`); the set is
-    configurable via `log.access_log_exclude` (whole-segment prefix matching)
-    or `AUTUMN_LOG__ACCESS_LOG_EXCLUDE` (comma-separated). Unmatched requests
-    log the low-cardinality `_unmatched` route label.
-  - On by default; turn off with `log.access_log = false` in `autumn.toml`
-    or `AUTUMN_LOG__ACCESS_LOG=false` — no recompile needed.
-  - The line never includes query strings, headers, or bodies, preserving the
-    log-scrubbing posture established for logs (#697) by construction.
-  - Additive `LogConfig` fields only (`access_log`, `access_log_exclude`);
-    non-breaking, minor version bump.
-
-- **log:** Request-scoped log context that auto-tags every log line (#1169)
-  - An always-on `LogContextLayer` establishes a fresh `tokio::task_local`
-    `log::context::LogContext` for **every** HTTP request, seeded with the same
-    `request_id` used by the `x-request-id` header and error pages. It is not
-    gated behind `telemetry-otlp` and is applied inner to `RequestIdLayer` so the
-    request id is always available.
-  - The request is driven inside a `tracing` span carrying
-    `request_id`/`user_id`/`tenant_id`, so every `tracing` event emitted during
-    the request automatically correlates back to it — no manual field threading.
-  - When the request authenticates, `user_id` is added to the context
-    automatically (from both the `#[secured]` session check and the `RequireAuth`
-    middleware); when multi-tenancy resolves a tenant, `tenant_id` is added
-    automatically (from the tenancy middleware).
-  - Handler/service code can attach custom fields with
-    `autumn_web::log::context::with_log_field("order_id", id)` (re-exported from
-    the prelude). The well-known ids (`request_id`/`user_id`/`tenant_id`) ride the
-    request span and render in ordinary `tracing` output; custom fields are
-    carried in the context for **structured** consumers — the actuator log buffer
-    (#1168), the access line (#999), or any context-aware layer — rather than the
-    default stdout formatter. Reserved keys cannot be shadowed by custom fields.
-  - The context stays active while a streaming/SSE response body is produced (the
-    body is re-scoped per frame, mirroring tenancy), and synchronous work in a
-    downstream layer's `Service::call` is correlated too.
-  - Context is isolated per request (nothing leaks across requests) and a
-    `tokio::spawn`'d task does **not** inherit it unless explicitly propagated via
-    `log::context::in_current_context(..)`, which re-enters the request span too.
-  - Sensitive custom-field values are scrubbed through the existing
-    `log/filter.rs` key filter (#697), so secrets never enter the context output.
-  - Additive, non-breaking surface (minor version bump). Establishes the
-    correlating primitive consumed by the per-request access line (#999) and the
-    actuator log-view buffer (#1168).
-- **mcp:** Expose typed endpoints as Model Context Protocol (MCP) tools so AI agents can call your API (#1117)
-  - New `mcp` Cargo feature (implies `openapi`). `AppBuilder::mount_mcp("/mcp")` serves a spec-compliant MCP endpoint over Streamable HTTP, handling `initialize`, `tools/list`, and `tools/call`.
-  - Endpoints opt in per-route via `#[api_doc(mcp)]`; nothing is exposed implicitly. `#[api_doc(mcp = false)]` force-excludes a route.
-  - A whole-API hatch, `AppBuilder::expose_all_as_mcp()`, auto-includes every eligible `GET`, but mutating verbs (`POST`/`PUT`/`PATCH`/`DELETE`) still require an explicit `#[api_doc(mcp)]` opt-in, and per-endpoint exclusions are always honored.
-  - Each tool's `name`, `description`, and `inputSchema` are derived from the existing `ApiDoc` (operation id, summary/description, merged request-body + `Query` + path-param schemas) — there is no second, hand-maintained schema, so the tool catalog cannot drift from the handler's typed contract.
-  - `tools/call` dispatches through the **real handler pipeline** (the same in-process path the test client uses), so `#[secured]`, authorization, tenancy, rate limits, and validation apply identically to an agent call and an HTTP call.
-  - Agent authentication reuses the existing bearer-token surface (`RequireApiToken` / `ApiTokenStore`): the `Authorization`, `Cookie`, and `X-CSRF-Token` headers presented to `/mcp` are forwarded into the dispatched call, so bearer, session (`#[secured]`), and CSRF-protected routes behave identically to a direct request.
-  - `Origin` validation (MCP Streamable-HTTP spec requirement) is enforced against the app's CORS `allowed_origins`: a browser `Origin` not in the allowlist gets `403`, while requests without an `Origin` (non-browser agents) pass — defending against DNS-rebinding without breaking agent clients.
-  - `AppBuilder::secure_mcp(layer)` gates the entire `/mcp` endpoint (catalog included) behind any tower layer, e.g. `RequireApiToken`.
-  - JSON-RPC robustness: rejects requests missing `jsonrpc: "2.0"`, empty/malformed batches, and non-object `arguments` with `-32600`/`-32602`; negotiates only supported protocol versions; enforces required `body` arguments; serializes array query fields with form/explode semantics; and reuses the framework path-segment encoder. Tool-result bodies are capped at 10 MiB. Duplicate tool names (same `operation_id`) keep the first registration with a build-time warning.
-  - HTTP method maps to MCP safety annotations: `GET` → `readOnlyHint`; `DELETE` → `destructiveHint`.
-  - Only JSON-in/JSON-out endpoints are eligible; HTML/Maud routes (no response schema) are auto-excluded with a build-time log note.
-  - `examples/todo-app` gains an `/mcp` endpoint exposing `list_json` (read) and `create_json` (explicitly-opted-in write) behind `RequireApiToken`.
-
-- **actuator:** Decouple the Prometheus scrape endpoint from sensitive mode (#857)
-  - New `actuator.prometheus` config flag (default `true`) controls
-    `/actuator/prometheus` **independently of** `actuator.sensitive`. Production
-    apps can expose Prometheus metrics for platform scraping (e.g. Fly.io
-    `[metrics]`) while keeping `sensitive = false`, so `/actuator/env`,
-    `/actuator/configprops`, `/actuator/loggers`, `/actuator/tasks`,
-    `/actuator/jobs`, and the actuator task UI stay off the public surface.
-  - Set `actuator.prometheus = false` (or `AUTUMN_ACTUATOR__PROMETHEUS=false`)
-    to remove the scrape endpoint entirely (it then returns `404`). The flag is
-    surfaced in `/actuator/configprops`.
-  - The `[actuator]` section now honors environment overrides
-    (`AUTUMN_ACTUATOR__PREFIX`, `AUTUMN_ACTUATOR__SENSITIVE`,
-    `AUTUMN_ACTUATOR__PROMETHEUS`), matching the documented
-    `AUTUMN_SECTION__FIELD` convention. Previously the actuator section was only
-    configurable via TOML.
-  - Docs: `docs/guide/deployment.md` now describes the safe Fly.io deployment
-    shape, including scraping a private/non-public metrics port, and clarifies
-    that OTLP tracing and the Prometheus scrape endpoint are separate telemetry
-    paths — enabling OTLP does not add OpenTelemetry metrics to
-    `/actuator/prometheus` without an explicit bridge/exporter.
-- **testing:** CSS-selector HTML assertions on `TestResponse` (#1147)
-  - Autumn renders server-side HTML (Maud + htmx), so the in-process test client can now assert on page *structure* by CSS selector instead of brittle substrings. New chainable methods on `TestResponse`: `assert_selector(css)`, `assert_no_selector(css)`, `assert_selector_count(css, n)`, `assert_text(css, expected)`, `assert_text_contains(css, sub)`, and `assert_attr(css, attr, expected)`.
-  - Non-asserting accessors for custom assertions: `selector_count(css) -> usize`, `selector_text(css) -> Vec<String>`, and `selector_attr(css, attr) -> Vec<Option<String>>` — each returns matches in document order.
-  - Backed by a dependency-free HTML parser and CSS-selector matcher (`tag`, `.class`, `#id`, `[attr]`/`[attr=v]`/`[attr^=v]`/`[attr$=v]`/`[attr*=v]`, compound selectors, selector lists, and descendant/child combinators). Parses fragments literally, so bare `<tr>` htmx swaps are selectable — a spec HTML5 tree builder would foster-parent and drop them.
-  - Assertions survive cosmetic template changes (whitespace, attribute order, wrapping markup) that break the equivalent `assert_body_contains` test. Failure messages print the selector, expected-vs-actual value, and a truncated outline of the parsed HTML.
-  - Purely additive: no breaking change to existing assertions; no new published dependency. See the `autumn::test` module docs and `docs/guide/testing.md` for a worked example.
-
-## [0.5.0] - 2026-06-04
 
 ### Added
 
