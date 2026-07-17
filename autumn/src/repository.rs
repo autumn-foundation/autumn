@@ -78,9 +78,9 @@ macro_rules! maybe_for_update {
     };
 }
 
-/// Compile-time backend block selector for generated `#[repository]`/`#[model]`
+/// Compile-time backend block selector for generated `#[repository]`/`#[model]` CRUD.
 ///
-/// CRUD where the two backends need *structurally different* code (not just a
+/// Used where the two backends need *structurally different* code (not just a
 /// swapped receiver), e.g. Postgres multi-row batch insert vs. the `SQLite`
 /// per-row loop, or the batched `ON CONFLICT` upsert vs. `SQLite`'s per-row
 /// upsert.
@@ -353,9 +353,9 @@ pub trait AutumnDependents {
 // resolves to the empty slice.
 impl<T: ?Sized> AutumnDependents for T {}
 
-/// Publish a batch of deferred dependent-cascade OOB *delete* broadcasts,
+/// Publish a batch of deferred dependent-cascade OOB *delete* broadcasts.
 ///
-/// accumulated during a `dependent = destroy` cascade over `broadcasts = true`
+/// Accumulated during a `dependent = destroy` cascade over `broadcasts = true`
 /// children and published **after** the parent transaction commits (#1369).
 ///
 /// Each entry is `(topic, dom_id)`; the fragment is empty and the swap is

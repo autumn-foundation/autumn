@@ -51,9 +51,21 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 /// Narrow framework migration set required by `#[repository(..., versioned = true)]`.
-#[cfg(feature = "db")]
+///
+/// Backend-forked (#1996): the Postgres DDL (`BIGSERIAL`/`JSONB`/`DEFAULT NOW()`/
+/// `ADD COLUMN IF NOT EXISTS`) is not valid `SQLite`, so the `SQLite` build embeds
+/// a parallel set (`INTEGER PRIMARY KEY`/`TEXT`/`DEFAULT CURRENT_TIMESTAMP`) under
+/// the same `20260526000000_create_version_history` version dir name, keeping
+/// `__diesel_schema_migrations` bookkeeping identical across backends.
+#[cfg(all(feature = "db", not(feature = "sqlite")))]
 pub const VERSION_HISTORY_MIGRATIONS: diesel_migrations::EmbeddedMigrations =
     diesel_migrations::embed_migrations!("version_history_migrations");
+
+/// `SQLite` variant of [`VERSION_HISTORY_MIGRATIONS`]. See that item for the
+/// backend-fork rationale.
+#[cfg(all(feature = "db", feature = "sqlite"))]
+pub const VERSION_HISTORY_MIGRATIONS: diesel_migrations::EmbeddedMigrations =
+    diesel_migrations::embed_migrations!("version_history_migrations_sqlite");
 
 /// Link-time marker emitted by generated repositories that opt into version history.
 #[cfg(feature = "db")]

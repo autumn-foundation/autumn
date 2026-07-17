@@ -27,7 +27,7 @@ internet connection.
 - **Rust 1.88.0+** with `cargo`
 - **Docker** (or Docker Desktop) — `docker --version`
 - **PostgreSQL** accessible at a connection string you control (local or remote)
-- The `autumn` CLI - `cargo install autumn-cli --version 0.5.0`
+- The `autumn` CLI - `cargo install autumn-cli --version 0.6.0`
 
 ---
 
@@ -69,14 +69,6 @@ below and are better fits in specific cases:
 > that the readiness gate and kamal-proxy target over plain HTTP, so a TLS
 > listener there breaks its health checks. See the [TLS & HTTPS guide](./tls.md)
 > for the full picture, including in-process TLS for self-run apps.
-
-> **Version.** The `autumn deploy` subcommands (`check` / `plan` / `up` /
-> `rollback`) are newer than the `autumn-cli 0.5.0` pinned under
-> [Prerequisites](#prerequisites) — that build does not include them — and they
-> are not yet part of a published release. Until the next autumn-cli release
-> ships them, install the CLI from the latest source (`cargo install autumn-cli
-> --git https://github.com/madmax983/autumn --force`) and confirm the subcommand
-> is present with `autumn deploy --help`.
 
 ### Preconditions
 
@@ -523,7 +515,7 @@ Visit [http://localhost:3000/health](http://localhost:3000/health) — a healthy
 response looks like:
 
 ```json
-{ "status": "ok", "version": "0.5.0" }
+{ "status": "ok", "version": "0.6.0" }
 ```
 
 > **Migration failure stops the rollout.** If the primary URL is wrong or the

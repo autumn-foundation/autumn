@@ -11,7 +11,7 @@ Before you start, make sure you have:
 
 - **Rust 1.88.0+** (edition 2024) — install from <https://rustup.rs> if you haven't already
 - **The Autumn CLI** — install the published CLI with
-  `cargo install autumn-cli --version 0.5.0`
+  `cargo install autumn-cli --version 0.6.0`
 - A terminal and a text editor
 
 Docker is not needed until Chapter 3 (Database Setup). For now, you only need
@@ -85,7 +85,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-autumn-web = "0.5"
+autumn-web = "0.6"
 ```
 
 This is a standard Rust project manifest. The only dependency is `autumn-web`

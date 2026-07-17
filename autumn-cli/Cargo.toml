@@ -24,22 +24,56 @@ path = "src/main.rs"
 # explaining the feature is disabled). Enabling it turns on `autumn-web`'s
 # `tls` feature, whose `autumn_web::tls::inspect_leaf` does the offline
 # certificate parsing.
-default = ["tls"]
+# Default = the Postgres CLI: `tls` (below) plus the `postgres` bundle, which
+# carries the pg-only `autumn-web` features that predate — and do not compile
+# under — the sqlite backend-flip. The DEFAULT build enables exactly the same
+# `autumn-web` feature set as before (nothing dropped); only the feature GRAPH
+# is refactored so the mutually-exclusive `sqlite` build can select a
+# sqlite-compatible set.
+default = ["tls", "postgres"]
 tls = ["autumn-web/tls"]
+# The pg-only `autumn-web` features the CLI enables that assume the Postgres
+# runtime and fail to compile under the `sqlite` backend-flip. Only `mail`
+# (its `DbSuppressionStore` is hard-typed to `Pool<AsyncPgConnection>`) is a
+# genuine breaker today; it is grouped here (rather than left unconditionally on)
+# so the `sqlite` build — which excludes the `postgres` bundle — resolves a
+# mail-free `autumn-web` set that mirrors what autumn-web's OWN sqlite CI builds.
+# The CLI's own source references NO `autumn_web::mail` symbol (only generated
+# string literals), so no source `#[cfg]` gating is needed. Kept in `default`,
+# so a normal `cargo build -p autumn-cli` is byte-for-byte identical to before.
+postgres = ["autumn-web/mail"]
 # Mirrors autumn-web's `acme` feature (issue #1608). The `autumn doctor` ACME
 # preflight checks compile in every build (they only need `std`), but enabling
 # this keeps CLI/library feature parity and turns on `autumn-web/acme` for any
 # future ACME-aware CLI tooling. Implies `tls` (ACME builds on it).
 acme = ["tls", "autumn-web/acme"]
+# SQLite backend-flip for the CLI's `autumn schema migrate` (issue #1975 slice 6,
+# on top of autumn-web's #1614 sqlite runtime lane). Non-default and MUTUALLY
+# EXCLUSIVE with the default Postgres backend: it turns on `autumn-web/sqlite`,
+# which flips autumn-web's `RuntimeConnection` type alias from Postgres to SQLite
+# for the WHOLE build graph, and pulls diesel's sqlite migration backend. Because
+# cargo feature unification is global AND the `postgres` bundle (a default
+# feature) pulls the pg-only `mail` path that does not compile under the flip,
+# the sqlite CLI MUST be built with default features OFF:
+#   `cargo build -p autumn-cli --no-default-features --features sqlite`
+# NEVER `--all-features` (co-enables the Postgres path and fails to compile), and
+# never co-built with the `postgres` bundle. Default builds target Postgres and
+# reference no SQLite symbol. (See autumn-web's `sqlite` feature for parity.)
+sqlite = ["autumn-web/sqlite", "diesel_migrations/sqlite"]
 
 [dependencies]
 autumn-web = { version = "0.6.0", path = "../autumn", default-features = false, features = [
-    "db", "htmx", "maud", "mail", "storage", "i18n", "telemetry-otlp", "redis", "cache-moka", "http-client", "reporting"
+    "db", "htmx", "maud", "storage", "i18n", "telemetry-otlp", "redis", "cache-moka", "http-client", "reporting"
 ] }
 autumn-schema-core = { path = "../autumn-schema-core" }
 base64 = "0.22"
 clap = { version = "4", features = ["derive", "env"] }
 diesel = { workspace = true }
+# File-based migration source (`FileBasedMigrations`) for `autumn schema migrate`.
+# Backend-agnostic: the pg/sqlite `MigrationSource` impls come from the `diesel`
+# backend features (both on via the workspace pin). The `sqlite` CLI feature
+# additionally enables `diesel_migrations/sqlite` for parity with the flip.
+diesel_migrations = { workspace = true }
 crossterm = "0.29"
 ctrlc = "3.5.2"
 getrandom = "0.4"
