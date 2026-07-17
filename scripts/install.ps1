@@ -34,6 +34,10 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
+# Windows PowerShell 5.1 doesn't enable TLS 1.2 by default, which breaks GitHub
+# downloads. Opt in explicitly before any network call.
+[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+
 $target = 'x86_64-pc-windows-msvc'
 $asset  = "autumn-$target.zip"
 
@@ -71,11 +75,13 @@ try {
     Copy-Item -Path $exe -Destination $dest -Force
     Write-Host "autumn-install: installed autumn -> $dest"
 
-    $pathEntries = ($env:PATH -split ';')
-    if ($pathEntries -notcontains $Dir) {
+    $pathEntries = ($env:PATH -split ';') | ForEach-Object { $_.TrimEnd('\') }
+    $normalizedDir = $Dir.TrimEnd('\')
+    if ($pathEntries -notcontains $normalizedDir) {
         Write-Host "autumn-install: note: $Dir is not on your PATH."
         Write-Host "  Add it for the current session:  `$env:PATH = `"$Dir;`$env:PATH`""
-        Write-Host "  Or persist it for your user:      setx PATH `"$Dir;`$env:PATH`""
+        Write-Host "  Or persist it for your user:"
+        Write-Host "    [Environment]::SetEnvironmentVariable('Path', [Environment]::GetEnvironmentVariable('Path', 'User') + ';$Dir', 'User')"
     }
 
     & $dest --version
