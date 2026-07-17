@@ -711,15 +711,10 @@ fn collect_state_machine_effects(item_struct: &syn::ItemStruct, scan: &mut Scan)
 /// Recognize a `#[state_machine(...)]` attribute under a bare `state_machine`
 /// path or any qualified path whose last segment is `state_machine`.
 fn is_state_machine_attr(attr: &syn::Attribute) -> bool {
-    let path = attr.path();
-    path.get_ident().map_or_else(
-        || {
-            path.segments
-                .last()
-                .is_some_and(|s| s.ident == "state_machine")
-        },
-        |ident| ident == "state_machine",
-    )
+    attr.path()
+        .segments
+        .last()
+        .is_some_and(|s| s.ident == "state_machine")
 }
 
 /// Parse the inside of a `#[state_machine(...)]` attribute, returning the bound
