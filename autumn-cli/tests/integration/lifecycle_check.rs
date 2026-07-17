@@ -857,7 +857,10 @@ mod invoices {
 fn effect_labels_do_not_bleed_across_same_named_enums_in_separate_modules() {
     // The `orders` binding must label only the `orders::State` diagram; the
     // same-named `invoices::State` (no binding) must render its `Draft ->
-    // Published` edge with no effect label.
+    // Published` edge with no effect label. Step 1 (qualified match) pins the
+    // binding to its co-located `orders::State`; the bare name `State` is
+    // ambiguous (two same-named enums), so the step-2 fallback never fires and
+    // cannot bleed the label onto `invoices::State`.
     let dir = tempfile::tempdir().unwrap();
     write(dir.path(), "src/domain.rs", SAME_NAMED_EFFECTS_FIXTURE);
 
@@ -899,6 +902,154 @@ fn effect_labels_do_not_bleed_across_same_named_enums_in_separate_modules() {
         1,
         "the effect label must appear exactly once in the mermaid document\n{mstdout}"
     );
+}
+
+/// A `#[lifecycle]` enum declared in one module (`states`) and *imported* into
+/// another (`models`) that binds it with a bare `#[state_machine(lifecycle =
+/// OrderState, effects(...))]`. Rust resolves the bare `OrderState` to
+/// `states::OrderState` via the `use`, but the binding's own module prefix would
+/// mis-qualify it to `models::OrderState` (no such lifecycle). The unique-bare-name
+/// fallback must correlate the effect to the single scanned `OrderState` diagram
+/// (issue #2029 Codex P2 — the imported-lifecycle case).
+const IMPORTED_LIFECYCLE_EFFECTS_FIXTURE: &str = r"
+mod states {
+    #[lifecycle(
+        initial = Draft,
+        terminal(Published),
+        transitions(
+            Draft -> Published,
+        )
+    )]
+    pub enum OrderState {
+        Draft,
+        Published,
+    }
+}
+
+mod models {
+    use crate::states::OrderState;
+
+    #[model]
+    pub struct Order {
+        #[state_machine(
+            lifecycle = OrderState,
+            effects(
+                Draft -> Published: on_commit = SomeJob,
+            )
+        )]
+        pub status: String,
+    }
+}
+";
+
+#[test]
+fn effect_labels_apply_to_imported_lifecycle_via_unique_bare_name() {
+    // The binding's qualified id (`models::OrderState`) is not a scanned
+    // lifecycle, so correlation falls back to the globally-unique bare enum name
+    // `OrderState` and labels the `states::OrderState` diagram.
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "src/domain.rs",
+        IMPORTED_LIFECYCLE_EFFECTS_FIXTURE,
+    );
+
+    let mermaid = run_lifecycle(dir.path(), &["diagram", "--format", "mermaid"]);
+    let mstdout = String::from_utf8_lossy(&mermaid.stdout);
+    assert!(
+        mermaid.status.success(),
+        "mermaid render should exit 0\nstdout:\n{mstdout}\nstderr:\n{}",
+        String::from_utf8_lossy(&mermaid.stderr)
+    );
+    assert_eq!(
+        mstdout.matches("on_commit: SomeJob").count(),
+        1,
+        "the imported-lifecycle effect must be correlated exactly once\n{mstdout}"
+    );
+
+    let dot = run_lifecycle(dir.path(), &["diagram", "--format", "dot"]);
+    let dstdout = String::from_utf8_lossy(&dot.stdout);
+    assert!(
+        dot.status.success(),
+        "dot render should exit 0\nstdout:\n{dstdout}\nstderr:\n{}",
+        String::from_utf8_lossy(&dot.stderr)
+    );
+    assert!(
+        dstdout.contains("[label=\"on_commit: SomeJob\"]"),
+        "the imported-lifecycle effect should be a DOT edge label\n{dstdout}"
+    );
+}
+
+/// Two `#[lifecycle]` enums that SHARE the bare name `OrderState` in different
+/// modules, plus an imported-style bare `#[state_machine(lifecycle = OrderState,
+/// effects(...))]` binding in a third module. The binding's qualified id does not
+/// name a scanned lifecycle *and* the bare name is ambiguous (two candidates), so
+/// the unique-bare-name fallback must NOT fire — the effect is dropped rather than
+/// guessed onto an arbitrary same-named enum (issue #2029 Codex P2 — safe failure).
+const AMBIGUOUS_IMPORTED_FIXTURE: &str = r"
+mod states {
+    #[lifecycle(
+        initial = Draft,
+        terminal(Published),
+        transitions(
+            Draft -> Published,
+        )
+    )]
+    pub enum OrderState {
+        Draft,
+        Published,
+    }
+}
+
+mod other {
+    #[lifecycle(
+        initial = Draft,
+        terminal(Published),
+        transitions(
+            Draft -> Published,
+        )
+    )]
+    pub enum OrderState {
+        Draft,
+        Published,
+    }
+}
+
+mod models {
+    #[model]
+    pub struct Order {
+        #[state_machine(
+            lifecycle = OrderState,
+            effects(
+                Draft -> Published: on_commit = SomeJob,
+            )
+        )]
+        pub status: String,
+    }
+}
+";
+
+#[test]
+fn effect_labels_dropped_when_bare_name_is_ambiguous_across_modules() {
+    // An ambiguous bare name (two same-named enums) means the fallback cannot
+    // pick a lifecycle, so the effect must be dropped — no diagram gets the label.
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "src/domain.rs", AMBIGUOUS_IMPORTED_FIXTURE);
+
+    for format in ["mermaid", "dot"] {
+        let output = run_lifecycle(dir.path(), &["diagram", "--format", format]);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "{format} render should exit 0\nstdout:\n{stdout}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            stdout.matches("on_commit: SomeJob").count(),
+            0,
+            "an ambiguous bare-name binding must never label a same-named enum ({format})\n{stdout}"
+        );
+    }
 }
 
 /// A plain `#[lifecycle]` enum with no `#[state_machine]` effects binding — its

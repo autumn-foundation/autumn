@@ -215,13 +215,17 @@ pub struct LifecycleDef {
 
 /// An effect declared on a `#[state_machine(lifecycle = Enum, effects(...))]`
 /// binding (issue #1973), correlated to a `#[lifecycle]` enum's diagram by that
-/// enum's module-qualified [`LifecycleDef::id`] (the `lifecycle = <Path>`
-/// resolved relative to the binding's module — see [`resolve_lifecycle_id`]).
-/// Keying by the qualified id, not the bare enum name, keeps two same-named
-/// lifecycle enums in different modules from cross-contaminating each other's
-/// effect labels. This rides in a separate structure consulted only by the
-/// diagram renderers, so the `check` command, the JSON artifact, and
-/// [`LifecycleDef::transitions`] stay byte-identical.
+/// enum's module-qualified [`LifecycleDef::id`] in a post-scan pass (see
+/// [`resolve_effect_bindings`]): the binding's `lifecycle = <Path>` is first
+/// resolved relative to the binding's module ([`resolve_lifecycle_id`]) and, if
+/// that qualified id is a scanned lifecycle, keyed by it; otherwise it falls back
+/// to a scanned lifecycle whose bare enum name is *globally unique*. Qualified
+/// matching keeps two same-named lifecycle enums in different modules from
+/// cross-contaminating each other's effect labels (their bare name is ambiguous,
+/// so the fallback never fires), while the unique-bare-name fallback rescues a
+/// model that imports its lifecycle from another module. This rides in a separate
+/// structure consulted only by the diagram renderers, so the `check` command, the
+/// JSON artifact, and [`LifecycleDef::transitions`] stay byte-identical.
 #[derive(Debug)]
 struct EffectEdge {
     from: String,
@@ -231,6 +235,42 @@ struct EffectEdge {
     /// The `on_commit = <Job>` after-commit effect (its `syn::Path`'s last
     /// segment rendered as the job name), if declared.
     on_commit: Option<String>,
+}
+
+/// A raw `#[state_machine(lifecycle = <Path>, effects(...))]` binding collected
+/// during the scan. Its `lifecycle = <Path>` is resolved to a scanned lifecycle
+/// id only in a post-pass ([`resolve_effect_bindings`]), once the *complete* set
+/// of scanned lifecycle ids is known — a single-pass resolution could not see a
+/// lifecycle declared later in the scan (nor decide whether a bare enum name is
+/// globally unique), so the correlation is deferred.
+struct RawBinding {
+    /// The inline-module context the binding is declared in (same context
+    /// [`collect_lifecycle_enum`] uses to build a [`LifecycleDef::id`]).
+    module_path: Vec<String>,
+    /// The binding's `lifecycle = <Path>`, resolved in the post-pass.
+    lifecycle_path: syn::Path,
+    /// The binding's declared `effects(...)` edges.
+    edges: Vec<EffectEdge>,
+}
+
+// `syn::Path` does not implement `Debug` without the `extra-traits` feature, so
+// `Debug` is hand-written (rendering the path as its `::`-joined segment idents)
+// to keep the `Debug`-derived [`Scan`] compiling without pulling in that feature.
+impl std::fmt::Debug for RawBinding {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let path = self
+            .lifecycle_path
+            .segments
+            .iter()
+            .map(|s| s.ident.to_string())
+            .collect::<Vec<_>>()
+            .join("::");
+        f.debug_struct("RawBinding")
+            .field("module_path", &self.module_path)
+            .field("lifecycle_path", &path)
+            .field("edges", &self.edges)
+            .finish()
+    }
 }
 
 // ── Analysis ─────────────────────────────────────────────────────────────────
@@ -478,13 +518,17 @@ struct Scan {
     lifecycles: Vec<LifecycleDef>,
     errors: Vec<String>,
     files_scanned: usize,
-    /// Transition effects collected from
-    /// `#[state_machine(lifecycle = Enum, effects(...))]` bindings (issue #1973),
-    /// keyed by the bound lifecycle enum's module-qualified [`LifecycleDef::id`]
-    /// (the `lifecycle = <Path>` resolved relative to the binding's module). A
-    /// binding whose path cannot be resolved to that id scheme is left
-    /// uncorrelated (dropped) rather than matched by bare name. Consulted only by
-    /// the diagram renderers.
+    /// Raw `#[state_machine(lifecycle = Enum, effects(...))]` bindings collected
+    /// during the scan (issue #1973), resolved into [`Self::effect_edges`] only
+    /// in a post-pass once every lifecycle id is known (see
+    /// [`resolve_effect_bindings`]).
+    raw_bindings: Vec<RawBinding>,
+    /// Transition effects keyed by the bound lifecycle enum's module-qualified
+    /// [`LifecycleDef::id`], produced by the post-scan [`resolve_effect_bindings`]
+    /// pass. A binding is keyed by its qualified id when that id is a scanned
+    /// lifecycle, else by a scanned lifecycle whose bare enum name is globally
+    /// unique, else dropped (a safe failure — missing labels, never a mismatch).
+    /// Consulted only by the diagram renderers.
     effect_edges: HashMap<String, Vec<EffectEdge>>,
 }
 
@@ -509,6 +553,14 @@ fn scan_project(root: &Path) -> std::io::Result<Scan> {
         scan_source(&src, &rel, &mut scan);
         scan.files_scanned += 1;
     }
+    // Post-pass: now that the complete set of scanned lifecycle ids is known,
+    // correlate every collected effect binding (qualified-match first, then a
+    // unique-bare-name fallback for imported lifecycles). Deferring this until
+    // the whole scan finishes lets a binding correlate to a lifecycle declared
+    // later in scan order, and lets the bare-name fallback see whether a name is
+    // globally unique.
+    scan.effect_edges =
+        resolve_effect_bindings(std::mem::take(&mut scan.raw_bindings), &scan.lifecycles);
     Ok(scan)
 }
 
@@ -699,11 +751,9 @@ fn collect_lifecycle_enum(
 ///
 /// `module_path` is the inline-module context the binding is declared in (the
 /// same context [`collect_lifecycle_enum`] uses to build a [`LifecycleDef::id`]).
-/// The binding's `lifecycle = <Path>` is resolved to that qualified-id scheme via
-/// [`resolve_lifecycle_id`], so effects are keyed by the *same* id the renderers
-/// look the lifecycle up by. A path that cannot be resolved is left uncorrelated
-/// (dropped) — a safe failure (missing labels) strictly better than the previous
-/// bare-name matching, which could label an unrelated same-named lifecycle.
+/// The binding is stashed *raw* (path + module + edges) and correlated to a
+/// scanned lifecycle only in the post-scan [`resolve_effect_bindings`] pass, when
+/// the complete set of scanned lifecycle ids is known.
 fn collect_state_machine_effects(
     item_struct: &syn::ItemStruct,
     scan: &mut Scan,
@@ -719,12 +769,71 @@ fn collect_state_machine_effects(
             if let Ok(Some((lifecycle_path, edges))) =
                 attr.parse_args_with(parse_state_machine_effects)
                 && !edges.is_empty()
-                && let Some(id) = resolve_lifecycle_id(module_path, &lifecycle_path)
             {
-                scan.effect_edges.entry(id).or_default().extend(edges);
+                scan.raw_bindings.push(RawBinding {
+                    module_path: module_path.to_vec(),
+                    lifecycle_path,
+                    edges,
+                });
             }
         }
     }
+}
+
+/// Correlate the raw effect bindings collected during the scan to scanned
+/// lifecycle ids, producing the `id -> effects` map the diagram renderers consult
+/// (issue #1973; Codex P2 on #2029). Runs as a post-pass so it can see the
+/// *complete* set of scanned lifecycles. Each binding is resolved by, in order:
+///
+/// 1. **Qualified match**: resolve the binding's `lifecycle = <Path>` relative to
+///    its own module ([`resolve_lifecycle_id`]); if that id names a scanned
+///    lifecycle, key the effects by it. This handles co-located and
+///    explicitly-pathed lifecycles and disambiguates two same-named enums in
+///    different modules (each binding pins to its co-located enum).
+/// 2. **Unique-bare-name fallback**: otherwise take the path's bare last segment;
+///    if *exactly one* scanned lifecycle has that bare enum name, key the effects
+///    by that lifecycle's id. This rescues a model that imports its lifecycle from
+///    another module (`use crate::states::OrderState; lifecycle = OrderState`),
+///    where Rust resolves the bare name to another module but the binding's own
+///    module prefix would mis-qualify it.
+/// 3. **Drop**: otherwise (qualified miss *and* the bare name is absent or
+///    ambiguous among scanned lifecycles) the binding is left uncorrelated — a
+///    safe failure (missing labels), never a guess. Crucially, two same-named
+///    enums make the bare name ambiguous, so step 2 never fires for them and the
+///    same-module isolation from step 1 is preserved.
+fn resolve_effect_bindings(
+    bindings: Vec<RawBinding>,
+    lifecycles: &[LifecycleDef],
+) -> HashMap<String, Vec<EffectEdge>> {
+    let id_set: BTreeSet<&str> = lifecycles.iter().map(|l| l.id.as_str()).collect();
+    // Bare enum name -> the ids of every scanned lifecycle with that name. A name
+    // mapping to a single id is globally unique (the fallback's precondition).
+    let mut by_bare_name: HashMap<&str, Vec<&str>> = HashMap::new();
+    for l in lifecycles {
+        by_bare_name
+            .entry(l.name.as_str())
+            .or_default()
+            .push(l.id.as_str());
+    }
+    let mut effect_edges: HashMap<String, Vec<EffectEdge>> = HashMap::new();
+    for binding in bindings {
+        // Step 1: qualified match against the complete scanned-id set.
+        let qualified = resolve_lifecycle_id(&binding.module_path, &binding.lifecycle_path)
+            .filter(|id| id_set.contains(id.as_str()));
+        let key = qualified.or_else(|| {
+            // Step 2: unique-bare-name fallback (last path segment).
+            let bare = binding.lifecycle_path.segments.last()?.ident.to_string();
+            match by_bare_name.get(bare.as_str()) {
+                Some(ids) if ids.len() == 1 => Some(ids[0].to_string()),
+                _ => None,
+            }
+        });
+        // Step 3: an unresolved binding is dropped (no labels).
+        if let Some(key) = key {
+            effect_edges.entry(key).or_default().extend(binding.edges);
+        }
+    }
+    effect_edges
 }
 
 /// Resolve a `#[state_machine(lifecycle = <Path>)]` binding's enum path to the
