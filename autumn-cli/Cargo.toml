@@ -31,12 +31,6 @@ tls = ["autumn-web/tls"]
 # this keeps CLI/library feature parity and turns on `autumn-web/acme` for any
 # future ACME-aware CLI tooling. Implies `tls` (ACME builds on it).
 acme = ["tls", "autumn-web/acme"]
-# Opt-in gate for the pam_systemd kamal-proxy control-socket regression in
-# `tests/deploy_e2e.rs` (issue #1948 item 4). It is NOT part of the default
-# Docker CI `--ignored` sweep because the socket behaviour under a live
-# pam_systemd session can only be observed against Docker; enable it to run that
-# one extra `#[ignore]`d test. No production code depends on this feature.
-deploy-e2e-pam = []
 
 [dependencies]
 autumn-web = { version = "0.6.0", path = "../autumn", default-features = false, features = [

@@ -711,18 +711,17 @@ fn deploy_e2e_full_lifecycle() {
 /// invocation in `KamalProxyController`) holds without the fixture papering over
 /// the mismatch.
 ///
-/// Feature-gated behind `deploy-e2e-pam` (NOT part of the default Docker CI
-/// `--ignored` sweep): the socket behaviour under a live `pam_systemd` session can
-/// only be observed against Docker, which this environment cannot run, so it is
-/// opt-in to avoid destabilizing CI on an unverified path. Run it with:
+/// Runs as part of the default Docker CI `--ignored` sweep (same as the sibling
+/// `deploy_e2e_full_lifecycle`): the "Run Docker-dependent tests" job executes
+/// `cargo test -p autumn-cli --test deploy_e2e -- --ignored`, which picks this up
+/// automatically. Run it locally the same way:
 /// ```text
-/// cargo test -p autumn-cli --features deploy-e2e-pam --test deploy_e2e -- --ignored --nocapture
+/// cargo test -p autumn-cli --test deploy_e2e -- --ignored --nocapture
 /// ```
 /// The real-VPS GitHub Actions job (`.github/workflows/deploy-real-vps.yml`)
 /// covers the same fidelity end-to-end on an actual VM.
-#[cfg(feature = "deploy-e2e-pam")]
 #[test]
-#[ignore = "requires Docker + ssh client; run with --features deploy-e2e-pam --ignored"]
+#[ignore = "requires Docker + ssh client; run with --ignored"]
 fn deploy_e2e_pam_systemd_control_socket() {
     let ws = Workspace::build();
 
