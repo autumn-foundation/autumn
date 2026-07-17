@@ -23,9 +23,13 @@ on:
         type: string
         default: "ubuntu-24.04"
       server_type:
+        # Single source of truth for the provisioned server type. The
+        # provisioning step below falls back to this same value for scheduled
+        # runs (which supply no inputs). Update BOTH when Hetzner retires the
+        # type: cx22 was retired, hence cpx11 (current AMD shared-vCPU, nbg1).
         description: "Hetzner server type"
         type: string
-        default: "cx22"
+        default: "cpx11"
       location:
         description: "Hetzner location"
         type: string
@@ -110,7 +114,7 @@ jobs:
           hcloud ssh-key create --name "${HCLOUD_SSH_KEY_NAME}" --public-key-from-file "${SSH_KEY}.pub"
           hcloud server create \
             --name "${HCLOUD_SERVER_NAME}" \
-            --type "${{ inputs.server_type || 'cx22' }}" \
+            --type "${{ inputs.server_type || 'cpx11' }}" \
             --image "${{ inputs.ubuntu_image || 'ubuntu-24.04' }}" \
             --location "${{ inputs.location || 'nbg1' }}" \
             --ssh-key "${HCLOUD_SSH_KEY_NAME}"
