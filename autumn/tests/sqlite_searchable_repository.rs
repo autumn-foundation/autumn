@@ -1,26 +1,31 @@
-//! `#[repository(searchable)]` full-text-search fallback on the `SQLite` runtime
-//! backend (issue #1996).
+//! `#[repository(searchable)]` full-text search on the `SQLite` runtime backend
+//! via **FTS5** (issue #1910).
 //!
 //! Postgres searchable repositories rank rows with a `tsvector` +
-//! `websearch_to_tsquery`/`ts_rank_cd` query, which has no `SQLite` equivalent.
-//! The generated codegen therefore forks (via `backend_select!`): the `SQLite`
-//! arm matches each `SEARCH_FIELDS` column with a case-insensitive
-//! `lower(col) LIKE '%term%' ESCAPE '\'` substring test, OR-ed across the fields,
-//! ordered `id DESC` (unranked — FTS5 ranking is a separate slice, #1910). This
-//! suite drives that fallback end-to-end on an in-memory `SQLite` database (no
+//! `websearch_to_tsquery`/`ts_rank_cd` query. SQLite has no `tsvector`, so the
+//! generated codegen forks (via `backend_select!`): the `SQLite` arm queries an
+//! **external-content FTS5 virtual table** (`"<table>__fts"`, tokenized with
+//! `unicode61`) joined back to the base table (so the tenant / soft-delete /
+//! owner predicates still filter the base table), `MATCH`-filtered and ranked
+//! with `bm25()` (per-column weights from the `#[searchable(weight=...)]`
+//! priorities). The user's query is run through the fail-closed
+//! `sqlite_fts5_match_query` sanitizer so no FTS5 operator survives as syntax.
+//! This suite drives that path end-to-end on an in-memory `SQLite` database (no
 //! Docker):
 //!
-//! * substring matches are found case-insensitively and non-matches excluded;
-//! * case-insensitivity is **ASCII-only** (the query is folded with
-//!   `to_ascii_lowercase()` to match `SQLite`'s ASCII-only `lower()`): ASCII
-//!   terms fold both ways, but a non-ASCII letter matches only with matching
-//!   case — full-Unicode/ICU folding is deferred to #1910;
-//! * `LIKE` metacharacters (`%`, `_`) in the query match **literally** and can
-//!   never become a match-everything wildcard;
+//! * token matches are found case-insensitively and non-matches excluded;
+//! * case-folding is **full-Unicode** now (via `unicode61`): `äpfel` matches
+//!   `Äpfel` (the old ASCII-only `lower()` limitation is gone) — the pinned
+//!   behavioral flip of #1910;
+//! * FTS5 query operators (`OR`, `col:`, `*`, …) are neutralized into literal
+//!   terms by the sanitizer, and an all-operator query returns an empty page
+//!   rather than everything (fail-closed);
+//! * `bm25()` ranking sorts a higher-priority-field (title) hit above a
+//!   lower-priority-field (body) hit;
 //! * `search_page` returns the right page + total;
 //! * **ADVERSARIAL cross-tenant isolation:** a search run under tenant B never
-//!   returns tenant A's rows even when the term matches (fail-closed tenant
-//!   isolation is inviolable);
+//!   returns tenant A's rows even when the term matches — including via an FTS5
+//!   injection attempt (fail-closed tenant isolation is inviolable);
 //! * the owner-scoped `search_page_scoped` path (#1841) never returns another
 //!   owner's rows.
 //!
@@ -37,9 +42,38 @@ use autumn_web::reexports::{diesel, diesel_async};
 use autumn_web::tenancy::with_tenant;
 
 use diesel_async::RunQueryDsl as _;
+use diesel_async::SimpleAsyncConnection as _;
 use diesel_async::pooled_connection::deadpool::Pool;
 
 type SqlitePool = Pool<RuntimeConnection>;
+
+/// The FTS5 DDL the `AddSearch` migration emits for a `(title, body)` searchable
+/// model: an external-content virtual table + the three maintenance triggers the
+/// generated `MATCH`/`bm25()` query relies on. Hand-authored here (the runtime
+/// suite hand-creates its tables rather than running the CLI migration) so it
+/// mirrors `autumn-cli`'s `add_search_up_sql_for(Sqlite, ...)` exactly. No
+/// `'rebuild'` backfill is needed — every table is created empty, then populated
+/// through `repo.save`, which fires the `AFTER INSERT` trigger.
+fn fts5_ddl(table: &str) -> String {
+    format!(
+        "CREATE VIRTUAL TABLE \"{table}__fts\" USING fts5(\"title\", \"body\", \
+             content='{table}', content_rowid='id', tokenize='unicode61'); \
+         CREATE TRIGGER \"{table}__fts_ai\" AFTER INSERT ON \"{table}\" BEGIN \
+             INSERT INTO \"{table}__fts\"(rowid, \"title\", \"body\") \
+                 VALUES (new.id, new.\"title\", new.\"body\"); \
+         END; \
+         CREATE TRIGGER \"{table}__fts_ad\" AFTER DELETE ON \"{table}\" BEGIN \
+             INSERT INTO \"{table}__fts\"(\"{table}__fts\", rowid, \"title\", \"body\") \
+                 VALUES('delete', old.id, old.\"title\", old.\"body\"); \
+         END; \
+         CREATE TRIGGER \"{table}__fts_au\" AFTER UPDATE ON \"{table}\" BEGIN \
+             INSERT INTO \"{table}__fts\"(\"{table}__fts\", rowid, \"title\", \"body\") \
+                 VALUES('delete', old.id, old.\"title\", old.\"body\"); \
+             INSERT INTO \"{table}__fts\"(rowid, \"title\", \"body\") \
+                 VALUES (new.id, new.\"title\", new.\"body\"); \
+         END;"
+    )
+}
 
 mod schema {
     autumn_web::reexports::diesel::table! {
@@ -138,8 +172,9 @@ async fn boot_pool(db_name: &str) -> SqlitePool {
 
     {
         let mut conn = pool.get().await.expect("checkout a sqlite connection");
-        // No `search_vector` column: the SQLite fallback matches the plain
-        // SEARCH_FIELDS columns directly.
+        // Base tables, plus the external-content FTS5 virtual table + triggers the
+        // generated `MATCH`/`bm25()` query joins against (the FTS objects live
+        // outside the model/schema surface, mirroring Postgres's `search_vector`).
         diesel::sql_query(
             "CREATE TABLE search_notes (\
                  id INTEGER PRIMARY KEY AUTOINCREMENT, \
@@ -150,6 +185,9 @@ async fn boot_pool(db_name: &str) -> SqlitePool {
         .execute(&mut *conn)
         .await
         .expect("create search_notes table");
+        conn.batch_execute(&fts5_ddl("search_notes"))
+            .await
+            .expect("create search_notes FTS5 objects");
         diesel::sql_query(
             "CREATE TABLE tenant_search_notes (\
                  id INTEGER PRIMARY KEY AUTOINCREMENT, \
@@ -161,6 +199,9 @@ async fn boot_pool(db_name: &str) -> SqlitePool {
         .execute(&mut *conn)
         .await
         .expect("create tenant_search_notes table");
+        conn.batch_execute(&fts5_ddl("tenant_search_notes"))
+            .await
+            .expect("create tenant_search_notes FTS5 objects");
         diesel::sql_query(
             "CREATE TABLE owner_search_notes (\
                  id INTEGER PRIMARY KEY AUTOINCREMENT, \
@@ -172,6 +213,9 @@ async fn boot_pool(db_name: &str) -> SqlitePool {
         .execute(&mut *conn)
         .await
         .expect("create owner_search_notes table");
+        conn.batch_execute(&fts5_ddl("owner_search_notes"))
+            .await
+            .expect("create owner_search_notes FTS5 objects");
     }
 
     pool
@@ -235,16 +279,15 @@ async fn search_matches_substrings_case_insensitively_on_sqlite() {
     assert!(blank.is_empty(), "blank query returns nothing: {blank:?}");
 }
 
-/// The `SQLite` search case-insensitivity is **ASCII-only** (issue #1996): the
-/// query side is folded with `to_ascii_lowercase()` to match `SQLite`'s built-in
-/// `lower()`, which folds only ASCII A–Z. So an ASCII term matches
-/// case-insensitively, and even an accented term's ASCII characters fold — but a
-/// non-ASCII letter matches only with matching case (full-Unicode/ICU folding is
-/// deferred to #1910 with FTS5 ranking). This test pins both halves so the code
-/// and the documented divergence agree.
+/// FTS5 case-folding is **full-Unicode** now (issue #1910): the `unicode61`
+/// tokenizer folds case (and diacritics) across the whole Unicode range, so the
+/// lowercase query `äpfel` matches the stored `Äpfel` — the exact case the old
+/// ASCII-only `lower()` fallback could NOT match (the pinned regression, now
+/// flipped). This test pins the flip so the code and the documented behavior
+/// agree.
 #[tokio::test]
-async fn search_case_insensitivity_is_ascii_only_on_sqlite() {
-    let pool = boot_pool("search_ascii_fold").await;
+async fn search_case_folding_is_full_unicode_on_sqlite() {
+    let pool = boot_pool("search_unicode_fold").await;
     let repo = PgSearchNoteRepository::with_pool_untracked(pool);
 
     repo.save(&NewSearchNote {
@@ -254,9 +297,7 @@ async fn search_case_insensitivity_is_ascii_only_on_sqlite() {
     .await
     .expect("save accented row");
 
-    // ── ASCII case-folding works ──
-    // A pure-ASCII term matches case-insensitively (uppercase query vs lowercase
-    // stored "apple").
+    // ── ASCII case-folding still works ──
     let ascii = repo.search("APPLE").await.expect("search APPLE");
     assert_eq!(
         ascii.len(),
@@ -264,91 +305,93 @@ async fn search_case_insensitivity_is_ascii_only_on_sqlite() {
         "ASCII term matches case-insensitively: {ascii:?}"
     );
 
-    // Even alongside a non-ASCII letter, the ASCII characters fold: query "ÄP"
-    // lowercases (ASCII-only) to "Äp", whose pattern `%Äp%` still matches the
-    // stored "Äpfel Tart" because SQLite's `lower()` leaves the non-ASCII "Ä"
-    // untouched on BOTH sides. (The old full-Unicode `to_lowercase()` folded the
-    // query's "Ä"→"ä", producing `%äp%` that never matched — the F4 bug.)
-    let mixed = repo.search("ÄP").await.expect("search ÄP");
+    // ── The #1910 flip: full-Unicode case-folding ──
+    // The lowercase non-ASCII query "äpfel" (U+00E4) now MATCHES the stored
+    // "Äpfel" (U+00C4) — `unicode61` folds the non-ASCII letter's case, so the
+    // whole-token match succeeds where the old ASCII-only `lower()` fallback
+    // produced two distinct codepoints and never matched (the old F4 limitation).
+    let folded = repo.search("äpfel").await.expect("search äpfel");
     assert_eq!(
-        mixed.len(),
+        folded.len(),
         1,
-        "ASCII 'P' folds even next to a non-ASCII letter, so 'ÄP' matches 'Äpfel': {mixed:?}"
+        "full-Unicode folding: lowercase 'äpfel' matches stored 'Äpfel' (#1910 flip): {folded:?}"
     );
 
-    // ── The ASCII-only limitation, documented ──
-    // A differently-cased non-ASCII query letter does NOT match: query "äpfel"
-    // (lowercase ä, U+00E4) folds to itself (ASCII-only), but the stored "Äpfel"
-    // keeps its uppercase "Ä" (U+00C4) through SQLite's ASCII-only `lower()`, so
-    // the two non-ASCII codepoints differ and no row matches. Full-Unicode case
-    // folding would match here; it is intentionally deferred (#1910).
-    let non_ascii = repo.search("äpfel").await.expect("search äpfel");
-    assert!(
-        non_ascii.is_empty(),
-        "non-ASCII case is NOT folded (ASCII-only limitation): 'äpfel' must not match 'Äpfel': {non_ascii:?}"
+    // And the reverse direction folds too (uppercase query vs stored title).
+    let folded_upper = repo.search("ÄPFEL").await.expect("search ÄPFEL");
+    assert_eq!(
+        folded_upper.len(),
+        1,
+        "full-Unicode folding is symmetric: 'ÄPFEL' matches stored 'Äpfel': {folded_upper:?}"
     );
 }
 
-/// LIKE metacharacters (`%`, `_`) in the query match literally — a query
-/// containing `%` can never become a match-everything wildcard.
+/// FTS5 query operators in the user's input are neutralized into literal terms
+/// by the fail-closed `sqlite_fts5_match_query` sanitizer (issue #1910), so a
+/// query can never inject FTS5 syntax, trigger a syntax error, or become a
+/// match-everything wildcard.
 #[tokio::test]
-async fn search_treats_like_metacharacters_literally_on_sqlite() {
-    let pool = boot_pool("search_metachars").await;
+async fn search_sanitizes_fts5_operators_on_sqlite() {
+    let pool = boot_pool("search_fts_ops").await;
     let repo = PgSearchNoteRepository::with_pool_untracked(pool);
 
     repo.save(&NewSearchNote {
-        title: "Sale".to_string(),
-        body: "50% off everything".to_string(),
+        title: "Alpha".to_string(),
+        body: "first note".to_string(),
     })
     .await
-    .expect("save percent row");
+    .expect("save alpha row");
     repo.save(&NewSearchNote {
-        title: "Sale".to_string(),
-        body: "50X off select items".to_string(),
+        title: "Beta".to_string(),
+        body: "second note".to_string(),
     })
     .await
-    .expect("save non-percent row");
-    repo.save(&NewSearchNote {
-        title: "Codes".to_string(),
-        body: "use a_b as the coupon".to_string(),
-    })
-    .await
-    .expect("save underscore row");
-    repo.save(&NewSearchNote {
-        title: "Codes".to_string(),
-        body: "use axb as the coupon".to_string(),
-    })
-    .await
-    .expect("save non-underscore row");
+    .expect("save beta row");
 
-    // `%` is escaped: "50%" matches only the literal-percent row, NOT "50X".
-    let pct = repo.search("50%").await.expect("search 50%");
-    assert_eq!(pct.len(), 1, "only the literal 50% row matches: {pct:?}");
+    // `OR` is a literal term, not the FTS5 OR operator. Raw FTS5 `alpha OR beta`
+    // would match BOTH rows; sanitized it is the implicit-AND of three literal
+    // phrases "alpha" AND "or" AND "beta", which no single row contains → empty.
+    let ored = repo.search("alpha OR beta").await.expect("search alpha OR beta");
     assert!(
-        pct[0].body.contains("50% off"),
-        "matched the wrong row: {pct:?}"
+        ored.is_empty(),
+        "`OR` must be a literal, not an operator (no row has all of alpha/or/beta): {ored:?}"
     );
 
-    // `_` is escaped: "a_b" matches only the literal-underscore row, NOT "axb"
-    // (an unescaped `_` would match any single char and catch "axb" too).
-    let underscore = repo.search("a_b").await.expect("search a_b");
-    assert_eq!(
-        underscore.len(),
-        1,
-        "only the literal a_b row matches, not axb: {underscore:?}"
-    );
+    // A bare `alpha` still matches its one row (the operator neutralization does
+    // not break ordinary search).
+    let alpha = repo.search("alpha").await.expect("search alpha");
+    assert_eq!(alpha.len(), 1, "plain term still matches its row: {alpha:?}");
+    assert_eq!(alpha[0].title, "Alpha");
+
+    // A `col:` column-filter operator is neutralized: "title:alpha" becomes the
+    // literal phrase, whose tokens ("title","alpha") are AND-ed — no row contains
+    // the token "title", so it matches nothing (never a targeted column search).
+    let colon = repo.search("title:alpha").await.expect("search title:alpha");
     assert!(
-        underscore[0].body.contains("a_b"),
-        "matched the wrong row: {underscore:?}"
+        colon.is_empty(),
+        "`col:` must be neutralized to a literal, matching nothing here: {colon:?}"
     );
 
-    // A bare `%` must NOT return everything (it would with an unescaped LIKE).
-    let bare_pct = repo.search("%").await.expect("search bare %");
-    assert_eq!(
-        bare_pct.len(),
-        1,
-        "a literal '%' matches only the row containing '%', never all rows: {bare_pct:?}"
+    // A `*` prefix operator is neutralized: "alph*" is a literal token "alph"
+    // (star stripped by the tokenizer), which is NOT the full token "alpha", so
+    // no prefix expansion happens and it matches nothing.
+    let prefix = repo.search("alph*").await.expect("search alph*");
+    assert!(
+        prefix.is_empty(),
+        "`*` prefix must be neutralized (no prefix expansion): {prefix:?}"
     );
+
+    // FAIL-CLOSED: an all-operator query returns an empty page, never everything.
+    let all_ops = repo.search("OR NEAR *").await.expect("search all-operators");
+    assert!(
+        all_ops.is_empty(),
+        "an all-operator query must return empty, not every row: {all_ops:?}"
+    );
+
+    // FAIL-CLOSED: a whitespace-only query yields no tokens → empty result with
+    // NO FTS query run (the sanitizer returns None).
+    let blank = repo.search("   ").await.expect("blank search");
+    assert!(blank.is_empty(), "whitespace-only query returns nothing: {blank:?}");
 }
 
 /// `search_page` returns the right page slice and total on SQLite.
@@ -401,6 +444,44 @@ async fn search_page_paginates_on_sqlite() {
         "second page holds the remaining row"
     );
     assert_eq!(page2.total_elements, 3);
+}
+
+/// bm25 ranking sanity (issue #1910): a hit in a higher-priority field (title,
+/// `#[searchable(weight = "A")]`) must rank above a hit in a lower-priority field
+/// (body, `weight = "B"`). The per-column bm25 weights are derived from those
+/// priorities, so the title match gets a more-negative (better) score and sorts
+/// first — parity with the Postgres `setweight('A' > 'B')` / `ts_rank_cd` intent.
+#[tokio::test]
+async fn search_ranks_title_above_body_on_sqlite() {
+    let pool = boot_pool("search_bm25_rank").await;
+    let repo = PgSearchNoteRepository::with_pool_untracked(pool);
+
+    // A body-only match, saved FIRST (higher id would otherwise win the id-DESC
+    // tiebreak — proving the ordering is genuinely by rank, not insertion order).
+    repo.save(&NewSearchNote {
+        title: "Gardening basics".to_string(),
+        body: "a quantum leap in tomatoes".to_string(),
+    })
+    .await
+    .expect("save body-match row");
+    // A title match, saved SECOND.
+    repo.save(&NewSearchNote {
+        title: "Quantum computing".to_string(),
+        body: "an introduction".to_string(),
+    })
+    .await
+    .expect("save title-match row");
+
+    let hits = repo.search("quantum").await.expect("search quantum");
+    assert_eq!(hits.len(), 2, "both rows match 'quantum': {hits:?}");
+    assert_eq!(
+        hits[0].title, "Quantum computing",
+        "the title (weight A) match must rank above the body (weight B) match: {hits:?}"
+    );
+    assert_eq!(
+        hits[1].title, "Gardening basics",
+        "the body-only match ranks second despite its lower id: {hits:?}"
+    );
 }
 
 /// ADVERSARIAL: fail-closed tenant isolation. A search run under tenant B must
@@ -469,6 +550,27 @@ async fn search_never_crosses_tenants_on_sqlite() {
     .await;
     assert_eq!(a_hits.len(), 1, "tenant-a sees its own row: {a_hits:?}");
     assert_eq!(a_hits[0].tenant_id, "tenant-a");
+
+    // ADVERSARIAL FTS injection: tenant B searches for a token that exists ONLY
+    // in tenant A's row ("secret", in A's body) — including an FTS5-operator
+    // injection attempt. The FTS `MATCH` genuinely matches A's row, but the
+    // `tenant_id = ?` predicate on the JOINed base table filters it out, so
+    // tenant B still sees nothing. The sanitizer additionally neutralizes the
+    // operators, so neither layer can leak A's data.
+    for probe in ["secret", "secret OR alpha", "tenant_id:tenant-a"] {
+        let leaked = with_tenant("tenant-b".to_string(), async {
+            repo.search(probe).await.expect("adversarial search under tenant-b")
+        })
+        .await;
+        assert!(
+            leaked.iter().all(|n| n.tenant_id == "tenant-b"),
+            "tenant-b must never see tenant-a rows via `{probe}`: {leaked:?}"
+        );
+        assert!(
+            leaked.is_empty(),
+            "`{probe}` matches only tenant-a data, so tenant-b sees nothing: {leaked:?}"
+        );
+    }
 }
 
 /// Owner-scoped `search_page_scoped` (#1841) never returns another owner's rows.
