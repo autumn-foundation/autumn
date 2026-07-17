@@ -91,7 +91,7 @@ jobs:
 
       - name: Install hcloud CLI
         run: |
-          ver="1.49.1"
+          ver="1.66.0"
           curl -fsSL "https://github.com/hetznercloud/cli/releases/download/v${ver}/hcloud-linux-amd64.tar.gz" \
             | sudo tar -xz -C /usr/local/bin hcloud
           hcloud version
