@@ -579,15 +579,6 @@ fn validate_cookie_token_hmac(cookie_token: &str, settings: &CsrfSettings) -> bo
     keys.verify(uuid_part.as_bytes(), sig)
 }
 
-/// Extract the `boundary` parameter from a `multipart/form-data` Content-Type value.
-fn extract_multipart_boundary(content_type: &str) -> Option<&str> {
-    content_type.split(';').find_map(|part| {
-        part.trim()
-            .strip_prefix("boundary=")
-            .map(|b| b.trim_matches('"'))
-    })
-}
-
 /// Return the byte position of the first occurrence of `needle` in `haystack`.
 fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() {
@@ -706,12 +697,24 @@ async fn verify_csrf_token(
         .and_then(|v| v.to_str().ok())
         .unwrap_or_default();
 
-    let is_urlencoded = content_type.starts_with("application/x-www-form-urlencoded");
-    let multipart_boundary = if content_type.starts_with("multipart/form-data") {
-        extract_multipart_boundary(content_type).map(str::to_owned)
-    } else {
-        None
-    };
+    // Media types are case-insensitive (RFC 9110 8.3.1) and the header may carry
+    // leading whitespace; normalize the type token for the urlencoded check.
+    let is_urlencoded = content_type
+        .trim_start()
+        .to_ascii_lowercase()
+        .starts_with("application/x-www-form-urlencoded");
+    // Parse the boundary with `multer::parse_boundary` — the exact parser
+    // `axum::extract::Multipart` uses downstream (via `mime`) — so this CSRF
+    // guard and the extractor can never disagree about the boundary, and it
+    // matches the sibling `submit_token` replay guard. A hand-rolled
+    // `split(';')` diverges on quoted values: `mime` permits a `;` inside a
+    // quoted parameter value, so `boundary="x;y"` parses to the boundary `x;y`
+    // in the real extractor while a split truncates it to `x`, so the `_csrf`
+    // field is never located and a legitimate form is wrongly rejected (403).
+    // `parse_boundary` is case-insensitive on the media type / `boundary` param
+    // NAME and preserves the boundary VALUE's case (RFC 2046); it returns `Err`
+    // for a non-multipart type, so `.ok()` yields `None`.
+    let multipart_boundary = multer::parse_boundary(content_type).ok();
     // NLL: content_type borrow ends here; req.body_mut() is safe to call below.
 
     if !is_urlencoded && multipart_boundary.is_none() {
@@ -1992,5 +1995,109 @@ mod tests {
             )));
         let resp = large.oneshot(make_request()).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // ── Case-insensitive Content-Type matching (RFC 9110 8.3.1) ───────────────
+
+    #[tokio::test]
+    async fn post_mixed_case_multipart_content_type_with_valid_token_passes() {
+        // Media types are case-insensitive (RFC 9110 8.3.1); the Multipart
+        // extractor accepts `Multipart/Form-Data` with a `Boundary=` parameter.
+        // A valid `_csrf` field in such a body must be scanned and the request
+        // ACCEPTED — a case-sensitive `starts_with("multipart/form-data")` gate
+        // wrongly rejects it (403). The weird-case boundary VALUE is identical in
+        // the header and the body delimiters, which also proves the boundary
+        // VALUE stays case-sensitive (RFC 2046) while the media type / param NAME
+        // are matched case-insensitively.
+        let token = "test-csrf-token-uuid-mixedmp";
+        let boundary = "BoUnDaRy-XyZ-123";
+        let body = multipart_body(boundary, &[("_csrf", token), ("name", "alice")]);
+        let app = Router::new()
+            .route("/upload", post(|| async { "ok" }))
+            .layer(CsrfLayer::from_config(&default_csrf_config()));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/upload")
+                    .header("Cookie", format!("autumn-csrf={token}"))
+                    .header(http::header::ACCEPT, "text/html")
+                    .header(
+                        "Content-Type",
+                        format!("Multipart/Form-Data; Boundary={boundary}"),
+                    )
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn post_mixed_case_urlencoded_content_type_with_valid_token_passes() {
+        // Media types are case-insensitive (RFC 9110 8.3.1). A urlencoded form
+        // POST carrying a valid `_csrf` field with an upper/mixed-case
+        // Content-Type (`Application/x-www-form-urlencoded`) must be ACCEPTED — a
+        // case-sensitive `starts_with("application/x-www-form-urlencoded")` gate
+        // wrongly rejects it (403), skipping body scanning entirely.
+        let token = "test-csrf-token-uuid-mixeduenc";
+        let app = Router::new()
+            .route("/submit", post(|| async { "created" }))
+            .layer(CsrfLayer::from_config(&default_csrf_config()));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/submit")
+                    .header("Cookie", format!("autumn-csrf={token}"))
+                    .header(http::header::ACCEPT, "text/html")
+                    .header("Content-Type", "Application/x-www-form-urlencoded")
+                    .body(Body::from(format!("_csrf={token}")))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn post_multipart_quoted_boundary_with_semicolon_passes() {
+        // `mime` permits a `;` inside a QUOTED boundary parameter value, so
+        // `boundary="x;y"` parses to the boundary `x;y` in the real Multipart
+        // extractor (via `multer`). A hand-rolled `split(';')` truncates it to
+        // `x`, so the `_csrf` field is never located and the request is wrongly
+        // rejected (403). Parsing with `multer::parse_boundary` — the exact
+        // parser the extractor uses — keeps the guard and the extractor in
+        // agreement, so the valid token is found and the request ACCEPTED.
+        let token = "test-csrf-token-uuid-quotedsemi";
+        let boundary = "x;y";
+        let body = multipart_body(boundary, &[("_csrf", token), ("name", "alice")]);
+        let app = Router::new()
+            .route("/upload", post(|| async { "ok" }))
+            .layer(CsrfLayer::from_config(&default_csrf_config()));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/upload")
+                    .header("Cookie", format!("autumn-csrf={token}"))
+                    .header(http::header::ACCEPT, "text/html")
+                    .header(
+                        "Content-Type",
+                        format!("multipart/form-data; boundary=\"{boundary}\""),
+                    )
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
     }
 }
