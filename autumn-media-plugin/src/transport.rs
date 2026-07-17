@@ -533,7 +533,7 @@ fn recording_url(
         return None;
     }
     let start = DateTime::<Utc>::from_naive_utc_and_offset(started_at, Utc)
-        .to_rfc3339_opts(SecondsFormat::Secs, true);
+        .to_rfc3339_opts(SecondsFormat::AutoSi, true);
     let duration = duration_seconds_param(duration_millis);
     let mut url =
         reqwest::Url::parse(&format!("{}/get", playback_base.trim_end_matches('/'))).ok()?;
@@ -861,6 +861,49 @@ mod tests {
             Some(
                 "http://public-playback.example/get?path=live%2Fsk_test&start=2026-05-14T10%3A00%3A00Z&duration=3600&format=fmp4"
             )
+        );
+    }
+
+    #[test]
+    fn recording_playback_url_preserves_subsecond_start_anchor() {
+        let config = MediaMtxConfig {
+            playback_base: "http://public-playback.example".to_owned(),
+            ..MediaMtxConfig::default()
+        };
+        let urls = MediaUrls::from_config(&config);
+        // A start anchor 250ms into the second must not be truncated away.
+        let start = chrono::NaiveDate::from_ymd_opt(2026, 5, 14)
+            .unwrap()
+            .and_hms_milli_opt(10, 0, 0, 250)
+            .unwrap();
+        let end = start + chrono::Duration::hours(1);
+        let url = urls
+            .recording_playback_url(
+                &PathBuf::from("recordings/live/sk_test"),
+                &PathBuf::from("recordings"),
+                start,
+                end,
+            )
+            .expect("playback url should build");
+        // AutoSi renders the millisecond component (percent-encoded `.` stays raw).
+        assert!(
+            url.contains("start=2026-05-14T10%3A00%3A00.250Z"),
+            "sub-second start must be preserved, got {url}"
+        );
+
+        // A whole-second start still renders cleanly with no fractional digits.
+        let whole = started_at();
+        let whole_url = urls
+            .recording_playback_url(
+                &PathBuf::from("recordings/live/sk_test"),
+                &PathBuf::from("recordings"),
+                whole,
+                whole + chrono::Duration::hours(1),
+            )
+            .expect("playback url should build");
+        assert!(
+            whole_url.contains("start=2026-05-14T10%3A00%3A00Z"),
+            "whole-second start must render without a decimal, got {whole_url}"
         );
     }
 
