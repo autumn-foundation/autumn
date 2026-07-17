@@ -1144,6 +1144,20 @@ fn diff_column(table: &str, base: &Column, want: &Column, changes: &mut Vec<Sche
 /// column. This mirrors the `DropColumn` suppression in [`diff_table`]. A composite
 /// index touching even one skipped column is suppressed whole, since the parser
 /// cannot authoritatively say it was removed.
+/// Whether two same-named indexes are equivalent for drift purposes. When either
+/// carries a raw `definition` (an expression/partial index preserved verbatim by
+/// introspection), they are compared by that canonical `pg_get_indexdef` text and
+/// `unique` — the `columns` list is only a partial, display-oriented view of such
+/// an index. Otherwise (ordinary column indexes) they compare by `columns` +
+/// `unique`, identical to the pre-`definition` behavior.
+fn indexes_equivalent(a: &Index, b: &Index) -> bool {
+    if a.definition.is_some() || b.definition.is_some() {
+        a.definition == b.definition && a.unique == b.unique
+    } else {
+        a.columns == b.columns && a.unique == b.unique
+    }
+}
+
 fn diff_indexes(
     table: &str,
     base: &Table,
@@ -1162,7 +1176,7 @@ fn diff_indexes(
                 table: table.to_owned(),
                 index: want_idx.clone(),
             }),
-            Some(base_idx) if *base_idx != want_idx => {
+            Some(base_idx) if !indexes_equivalent(base_idx, want_idx) => {
                 changes.push(SchemaChange::DropIndex {
                     table: table.to_owned(),
                     index: (*base_idx).clone(),
@@ -2829,7 +2843,17 @@ fn render_column_def(column: &Column, backend: Backend) -> String {
 }
 
 /// `CREATE [UNIQUE] INDEX {name} ON {table} ({cols});`.
+///
+/// When the index carries a raw `definition` (an expression/partial index
+/// preserved verbatim by introspection), that full `pg_get_indexdef` statement is
+/// emitted verbatim — with exactly one trailing `;` appended, since
+/// `pg_get_indexdef` output has none — instead of reconstructing a
+/// `CREATE INDEX … (columns)` form that cannot express the expression/predicate.
 fn index_sql(table: &str, index: &Index) -> String {
+    if let Some(def) = &index.definition {
+        let def = def.trim_end().trim_end_matches(';');
+        return format!("{def};");
+    }
     let unique = if index.unique { "UNIQUE " } else { "" };
     format!(
         "CREATE {unique}INDEX {} ON {table} ({});",
@@ -3161,6 +3185,7 @@ mod tests {
             name: "idx_posts_body".to_owned(),
             columns: vec!["body".to_owned()],
             unique: false,
+            definition: None,
         };
         // desired gains the index.
         let base = vec![posts_with(vec![col("body", ColumnType::Text)])];
@@ -3412,6 +3437,7 @@ mod tests {
             name: "idx_posts_status".to_owned(),
             columns: vec!["status".to_owned()],
             unique: true,
+            definition: None,
         });
         let want = parsed(
             vec![posts_with(vec![])],
@@ -3439,6 +3465,7 @@ mod tests {
             name: "idx_posts_body".to_owned(),
             columns: vec!["body".to_owned()],
             unique: false,
+            definition: None,
         };
         let mut base_table = posts_with(vec![col("body", ColumnType::Text)]);
         base_table.indexes.push(idx.clone());
@@ -3475,6 +3502,7 @@ mod tests {
             name: "idx_posts_author_status".to_owned(),
             columns: vec!["author_id".to_owned(), "status".to_owned()],
             unique: true,
+            definition: None,
         });
         // desired retains `author_id` but the enum `status` is skipped (diagnostic),
         // so the parser never sees the composite index either.
@@ -3766,6 +3794,7 @@ mod tests {
                     name: format!("idx_{}", "x".repeat(70)),
                     columns: vec!["body".to_owned()],
                     unique: false,
+                    definition: None,
                 },
             }],
         };
@@ -3789,6 +3818,7 @@ mod tests {
                     name: format!("idx_{}", "x".repeat(70)),
                     columns: vec!["body".to_owned()],
                     unique: false,
+                    definition: None,
                 },
             }],
         };
@@ -3815,6 +3845,7 @@ mod tests {
                         name: dup.clone(),
                         columns: vec!["foo".to_owned()],
                         unique: true,
+                        definition: None,
                     },
                 },
                 SchemaChange::AddIndex {
@@ -3823,6 +3854,7 @@ mod tests {
                         name: dup.clone(),
                         columns: vec!["foo_unique".to_owned()],
                         unique: false,
+                        definition: None,
                     },
                 },
             ],
@@ -3857,11 +3889,13 @@ mod tests {
                 name: dup.clone(),
                 columns: vec!["foo".to_owned()],
                 unique: true,
+                definition: None,
             },
             Index {
                 name: dup.clone(),
                 columns: vec!["foo_unique".to_owned()],
                 unique: false,
+                definition: None,
             },
         ];
         let plan = MigrationPlan {
@@ -3889,6 +3923,7 @@ mod tests {
                         name: "idx_posts_foo".to_owned(),
                         columns: vec!["foo".to_owned()],
                         unique: false,
+                        definition: None,
                     },
                 },
                 SchemaChange::AddIndex {
@@ -3897,6 +3932,7 @@ mod tests {
                         name: "idx_posts_bar".to_owned(),
                         columns: vec!["bar".to_owned()],
                         unique: false,
+                        definition: None,
                     },
                 },
             ],
@@ -3922,6 +3958,7 @@ mod tests {
                     name: "idx_posts_email_unique".to_owned(),
                     columns: vec!["email".to_owned()],
                     unique: true,
+                    definition: None,
                 },
             }],
         };
@@ -3968,6 +4005,7 @@ mod tests {
                         name: "idx_posts_email_unique".to_owned(),
                         columns: vec!["email".to_owned()],
                         unique: true,
+                        definition: None,
                     },
                 },
             ],
@@ -3988,6 +4026,7 @@ mod tests {
             name: "idx_posts_email_unique".to_owned(),
             columns: vec!["email".to_owned()],
             unique: true,
+            definition: None,
         }];
         let plan = MigrationPlan {
             backend: Backend::Postgres,
@@ -4011,6 +4050,7 @@ mod tests {
                     name: "idx_posts_email".to_owned(),
                     columns: vec!["email".to_owned()],
                     unique: false,
+                    definition: None,
                 },
             }],
         };
@@ -4481,6 +4521,7 @@ mod tests {
             name: "idx_posts_author_id".to_owned(),
             columns: vec!["author_id".to_owned()],
             unique: false,
+            definition: None,
         });
         let plan = diff_schema(&base, &parsed(vec![want_table], vec![]), DEFAULT_OPTS);
         let up = emit_up_sql(&plan).expect("emit");
@@ -4532,6 +4573,7 @@ mod tests {
                 name: "idx_posts_slug_unique".to_owned(),
                 columns: vec!["slug".to_owned()],
                 unique: true,
+                definition: None,
             },
         );
         assert_eq!(
@@ -4547,6 +4589,7 @@ mod tests {
                     name: "idx_posts_slug".to_owned(),
                     columns: vec!["slug".to_owned()],
                     unique: false,
+                    definition: None,
                 },
             }],
         };
@@ -4572,6 +4615,7 @@ mod tests {
                         name: "idx_posts_new".to_owned(),
                         columns: vec!["new".to_owned()],
                         unique: false,
+                        definition: None,
                     },
                 },
                 SchemaChange::AddColumn {
@@ -4607,11 +4651,13 @@ mod tests {
             name: "idx_posts_slug".to_owned(),
             columns: vec!["slug".to_owned()],
             unique: false,
+            definition: None,
         };
         let new = Index {
             name: "idx_posts_slug".to_owned(),
             columns: vec!["slug".to_owned()],
             unique: true,
+            definition: None,
         };
         let mut base_table = posts_with(vec![col("slug", ColumnType::Text)]);
         base_table.indexes.push(old);
@@ -4664,6 +4710,7 @@ mod tests {
                         name: "idx_posts_old".to_owned(),
                         columns: vec!["old".to_owned()],
                         unique: false,
+                        definition: None,
                     },
                 },
                 SchemaChange::AddIndex {
@@ -4672,6 +4719,7 @@ mod tests {
                         name: "idx_posts_new".to_owned(),
                         columns: vec!["new".to_owned()],
                         unique: false,
+                        definition: None,
                     },
                 },
             ],
@@ -4784,6 +4832,7 @@ mod tests {
             name: "idx_posts_body".to_owned(),
             columns: vec!["body".to_owned()],
             unique: false,
+            definition: None,
         });
         let plan = MigrationPlan {
             backend: Backend::Postgres,
@@ -4884,6 +4933,7 @@ mod tests {
                         name: "idx_posts_bio".to_owned(),
                         columns: vec!["bio".to_owned()],
                         unique: false,
+                        definition: None,
                     },
                 },
             ],
@@ -4971,6 +5021,7 @@ mod tests {
             name: "idx_posts_body".to_owned(),
             columns: vec!["body".to_owned()],
             unique: false,
+            definition: None,
         };
         let baseline = sqlite_table(
             "posts",

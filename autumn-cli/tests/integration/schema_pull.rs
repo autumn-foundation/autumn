@@ -424,6 +424,86 @@ async fn schema_pull_dry_run_reports_diff_without_writing() {
     );
 }
 
+/// Expression and partial indexes must be **preserved verbatim** by `schema pull`
+/// (via each index's `pg_get_indexdef` `definition`), never silently dropped or
+/// degraded to a plain column index (the P1 fixed here). An expression index over
+/// `lower(email)` has an `indkey` of `0` for the expression column (no matching
+/// `pg_attribute` row), and a partial index carries a `WHERE` predicate — both
+/// were lost by the prior inner-join fetch. After pulling, both index names and
+/// their definition text (`lower(email)` / the `WHERE` predicate) appear in the
+/// snapshot, and a second pull reports no drift against the just-pulled baseline.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers); run with -- --ignored"]
+async fn schema_pull_preserves_expression_and_partial_indexes() {
+    let (_container, host, port) = start_postgres().await;
+    let url = format!("postgres://postgres:{SECRET_PW}@{host}:{port}/postgres");
+    let envs = [("AUTUMN_DATABASE__URL", url.as_str())];
+
+    let (_tmp, project) = fresh_project("pull_expr_index_app");
+    let snapshot_path = project.join(".autumn/schema-snapshot.json");
+
+    // A table with an EXPRESSION index (`lower(email)`) and a PARTIAL index
+    // (`WHERE deleted_at IS NULL`), created via a raw migration so they reach the
+    // live catalog exactly as authored.
+    write_models(&project, "");
+    write_raw_migration(
+        &project,
+        "20260101000000_create_members",
+        "CREATE TABLE members (id BIGSERIAL PRIMARY KEY, email TEXT NOT NULL, deleted_at TIMESTAMP);\n\
+         CREATE INDEX members_lower_email_idx ON members (lower(email));\n\
+         CREATE INDEX members_active_email_idx ON members (email) WHERE deleted_at IS NULL;",
+        "DROP TABLE members;",
+    );
+    run_autumn_ok(&project, &["schema", "migrate"], &envs);
+
+    // Pull: both non-representable indexes must be preserved, not dropped.
+    let (out, err) = run_autumn_ok(&project, &["schema", "pull"], &envs);
+    assert_no_secret_leak(&out, &err);
+    let snap = std::fs::read_to_string(&snapshot_path).expect("pulled snapshot");
+
+    assert!(
+        snap.contains("members_lower_email_idx"),
+        "expression index preserved by name: {snap}"
+    );
+    assert!(
+        snap.contains("lower(email)"),
+        "expression index definition preserved verbatim: {snap}"
+    );
+    assert!(
+        snap.contains("members_active_email_idx"),
+        "partial index preserved by name: {snap}"
+    );
+    assert!(
+        // pg_get_indexdef renders the predicate; assert the WHERE clause survived.
+        snap.contains("WHERE") && snap.contains("deleted_at IS NULL"),
+        "partial index predicate preserved verbatim: {snap}"
+    );
+    assert!(
+        snap.contains("\"definition\""),
+        "the raw definition field is serialized for non-representable indexes: {snap}"
+    );
+
+    // A second pull round-trips clean against the just-pulled baseline: two
+    // introspected snapshots of the same DB agree, so no drift is reported.
+    let snap_before = snap;
+    let (pull2_out, pull2_err) = run_autumn_ok(&project, &["schema", "pull"], &envs);
+    assert_no_secret_leak(&pull2_out, &pull2_err);
+    let snap_after = std::fs::read_to_string(&snapshot_path).expect("snapshot after second pull");
+    assert_eq!(
+        snap_before, snap_after,
+        "a re-pull of the same database must be byte-for-byte stable (no expression/partial drift)"
+    );
+
+    // doctor agrees the database still matches the pulled baseline (no drift from
+    // the preserved expression/partial indexes).
+    let (doc_out, doc_err) = run_autumn_ok(&project, &["schema", "doctor"], &envs);
+    assert!(
+        doc_out.contains("database schema matches the snapshot baseline"),
+        "doctor reports the DB matches the snapshot with expression/partial indexes:\n{doc_out}"
+    );
+    assert_no_secret_leak(&doc_out, &doc_err);
+}
+
 /// `SQLite` introspection is a future slice: `schema pull` against a `SQLite` URL
 /// is refused loudly (no Docker needed — the refusal happens before any
 /// connection), names `SQLite`, and writes no snapshot.

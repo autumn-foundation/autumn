@@ -583,6 +583,7 @@ fn build_table(
             name: format!("idx_{table_name}_{field_name}"),
             columns: vec![field_name.clone()],
             unique: false,
+            definition: None,
         });
     }
     for field_name in &unique_index_fields {
@@ -591,6 +592,7 @@ fn build_table(
             name: format!("idx_{table_name}_{field_name}_unique"),
             columns: vec![field_name.clone()],
             unique: true,
+            definition: None,
         });
     }
 

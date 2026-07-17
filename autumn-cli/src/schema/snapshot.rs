@@ -332,11 +332,13 @@ mod tests {
             name: "idx_posts_created_at".to_owned(),
             columns: vec!["created_at".to_owned()],
             unique: false,
+            definition: None,
         });
         posts.indexes.push(Index {
             name: "idx_posts_author_id".to_owned(),
             columns: vec!["author_id".to_owned()],
             unique: false,
+            definition: None,
         });
         posts.checks.push(CheckConstraint {
             name: Some("posts_body_len".to_owned()),

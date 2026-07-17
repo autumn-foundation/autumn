@@ -40,6 +40,14 @@
 //!   single-column indexes (exact here), so this affects only hand-authored
 //!   multi-column indexes; recording them faithfully but with attnum ordering is
 //!   preferred over dropping them.
+//! - **Operator classes / collations / ordering on *simple* indexes**: a plain
+//!   column index with a non-default operator class, collation, or `ASC`/`DESC`
+//!   ordering is still recorded by its columns (matching what the model parser
+//!   emits), so those attributes are not separately normalized. Expression and
+//!   partial indexes do not share this gap — they round-trip verbatim through
+//!   [`pg_get_indexdef`](https://www.postgresql.org/docs/current/functions-info.html)
+//!   (see [`Index::definition`]), so their operator classes/collations/ordering
+//!   are preserved exactly.
 //! - **Composite / multi-column foreign keys**: only the first
 //!   referencing/referenced column pair is recorded (the IR [`ForeignKey`] is
 //!   single-column). The model parser never emits a composite FK.
@@ -172,6 +180,12 @@ struct TablePkRow {
     ord: i32,
 }
 
+/// One row per non-primary index (never one-per-column, so an expression index —
+/// whose `indkey` carries a `0` with no matching `pg_attribute` row — is never
+/// dropped). `columns` is a comma-joined list of the *resolvable* ordinary
+/// columns (the `indkey` entries `> 0`) in true key order; it is empty for an
+/// index whose keys are all expressions. `definition` is the verbatim
+/// `pg_get_indexdef` statement, preserved for expression/partial indexes.
 #[derive(QueryableByName)]
 struct IndexRow {
     #[diesel(sql_type = diesel::sql_types::Text)]
@@ -180,10 +194,18 @@ struct IndexRow {
     index_name: String,
     #[diesel(sql_type = diesel::sql_types::Bool)]
     is_unique: bool,
+    /// The full `CREATE [UNIQUE] INDEX …` statement (no trailing `;`).
     #[diesel(sql_type = diesel::sql_types::Text)]
-    column_name: String,
-    #[diesel(sql_type = diesel::sql_types::SmallInt)]
-    attnum: i16,
+    definition: String,
+    /// Whether the index has a `WHERE` predicate (`indpred IS NOT NULL`).
+    #[diesel(sql_type = diesel::sql_types::Bool)]
+    is_partial: bool,
+    /// Whether any key column is an expression (an `indkey` entry equal to `0`).
+    #[diesel(sql_type = diesel::sql_types::Bool)]
+    has_expression: bool,
+    /// Comma-joined resolvable ordinary column names, in key order (may be empty).
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    columns: String,
 }
 
 #[derive(QueryableByName)]
@@ -316,23 +338,40 @@ fn fetch_primary_keys(
 }
 
 /// Fetch every non-primary index (unique and plain) for all `tables`, grouped by
-/// table. One row per (index, column); the builder collapses them into
-/// [`Index`]es. Composite index columns are ordered by `attnum` (see the module
-/// blind-spot note).
+/// table. **One row per index** (never one-per-column), so an **expression
+/// index** — whose `indkey` contains a `0` for the expression column with no
+/// matching `pg_attribute` row — is preserved rather than dropped by an inner
+/// join that returns nothing for it. The resolvable ordinary columns are
+/// aggregated in true key order via a correlated `unnest(indkey) WITH
+/// ORDINALITY` subquery; `has_expression` flags any `0` key and `is_partial`
+/// flags an `indpred`, so the builder can classify each index as
+/// simple-representable vs. preserved-verbatim.
 fn fetch_indexes(
     conn: &mut PgConnection,
     tables: &[String],
 ) -> Result<BTreeMap<String, Vec<IndexRow>>, IntrospectError> {
+    // The `int2vector -> text -> int[]` cast chain (mirroring `fetch_primary_keys`)
+    // turns `indkey` into a subscriptable/unnestable array. The correlated
+    // subquery keeps only `> 0` (ordinary-column) keys and preserves key order
+    // via `WITH ORDINALITY`; an all-expression index yields an empty string.
     let query = format!(
         "SELECT t.relname AS table_name, ic.relname AS index_name, \
-         i.indisunique AS is_unique, a.attname AS column_name, a.attnum AS attnum \
+         i.indisunique AS is_unique, pg_get_indexdef(i.indexrelid) AS definition, \
+         (i.indpred IS NOT NULL) AS is_partial, \
+         (0 = ANY(string_to_array(i.indkey::text, ' ')::int[])) AS has_expression, \
+         COALESCE(( \
+           SELECT string_agg(a.attname, ',' ORDER BY k.ord) \
+           FROM unnest(string_to_array(i.indkey::text, ' ')::int[]) \
+                WITH ORDINALITY AS k(attnum, ord) \
+           JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.attnum \
+           WHERE k.attnum > 0 \
+         ), '') AS columns \
          FROM pg_index i \
          JOIN pg_class t ON t.oid = i.indrelid \
          JOIN pg_class ic ON ic.oid = i.indexrelid \
          JOIN pg_namespace n ON n.oid = t.relnamespace \
-         JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey) \
          WHERE n.nspname = 'public' AND NOT i.indisprimary AND t.relname IN ({}) \
-         ORDER BY t.relname, ic.relname, a.attnum",
+         ORDER BY t.relname, ic.relname",
         quoted_in_list(tables)
     );
     let rows: Vec<IndexRow> = sql_query(query)
@@ -432,36 +471,51 @@ fn build_table(
     table
 }
 
-/// Collapse per-(index, column) rows into IR [`Index`]es plus the set of columns
-/// that are covered by a **single-column unique** index (used to set the column
-/// `unique` flag, matching how the model parser represents `#[unique]`).
+/// Map one-per-index rows into IR [`Index`]es plus the set of columns covered by
+/// a **single-column simple unique** index (used to set the column `unique` flag,
+/// matching how the model parser represents `#[unique]`).
+///
+/// Each index is classified:
+/// - **simple/representable** — NOT partial AND has no expression key — is built
+///   as `Index { columns, unique, definition: None }` exactly as before, so a
+///   simple index's serialized JSON is byte-identical to prior snapshots and a
+///   single-column simple unique index still sets the owning column's `unique`
+///   flag for model-parser round-trip parity.
+/// - **expression or partial** — preserved verbatim via `definition:
+///   Some(pg_get_indexdef(...))`, never dropped. Its resolvable columns (if any)
+///   are still recorded for display, but it never sets a column `unique` flag
+///   (there is no single representable column).
 fn collapse_indexes(rows: &[IndexRow]) -> (Vec<Index>, std::collections::BTreeSet<String>) {
-    // Preserve first-seen index order while grouping columns.
-    let mut order: Vec<String> = Vec::new();
-    let mut grouped: BTreeMap<String, (bool, Vec<(i16, String)>)> = BTreeMap::new();
-    for row in rows {
-        let entry = grouped.entry(row.index_name.clone()).or_insert_with(|| {
-            order.push(row.index_name.clone());
-            (row.is_unique, Vec::new())
-        });
-        entry.0 = row.is_unique;
-        entry.1.push((row.attnum, row.column_name.clone()));
-    }
-
-    let mut indexes = Vec::with_capacity(order.len());
+    let mut indexes = Vec::with_capacity(rows.len());
     let mut unique_columns = std::collections::BTreeSet::new();
-    for name in order {
-        let (unique, mut cols) = grouped.remove(&name).expect("grouped index present");
-        cols.sort_by_key(|(attnum, _)| *attnum);
-        let columns: Vec<String> = cols.into_iter().map(|(_, c)| c).collect();
-        if unique && columns.len() == 1 {
-            unique_columns.insert(columns[0].clone());
+    for row in rows {
+        let columns: Vec<String> = row
+            .columns
+            .split(',')
+            .filter(|c| !c.is_empty())
+            .map(str::to_owned)
+            .collect();
+        let simple = !row.is_partial && !row.has_expression;
+        if simple {
+            if row.is_unique && columns.len() == 1 {
+                unique_columns.insert(columns[0].clone());
+            }
+            indexes.push(Index {
+                name: row.index_name.clone(),
+                columns,
+                unique: row.is_unique,
+                definition: None,
+            });
+        } else {
+            // Expression/partial index: preserve its canonical statement so it is
+            // never dropped and diffs by its verbatim text.
+            indexes.push(Index {
+                name: row.index_name.clone(),
+                columns,
+                unique: row.is_unique,
+                definition: Some(row.definition.clone()),
+            });
         }
-        indexes.push(Index {
-            name,
-            columns,
-            unique,
-        });
     }
     (indexes, unique_columns)
 }
@@ -613,35 +667,61 @@ mod tests {
         assert_eq!(d, Some(ColumnDefault::Sql("gen_random_uuid()".to_owned())));
     }
 
+    /// Build a one-per-index [`IndexRow`] for tests. `columns` is the comma-joined
+    /// resolvable-column string the SQL aggregation produces.
+    fn index_row(
+        index_name: &str,
+        is_unique: bool,
+        columns: &str,
+        is_partial: bool,
+        has_expression: bool,
+        definition: &str,
+    ) -> IndexRow {
+        IndexRow {
+            table_name: "t".to_owned(),
+            index_name: index_name.to_owned(),
+            is_unique,
+            definition: definition.to_owned(),
+            is_partial,
+            has_expression,
+            columns: columns.to_owned(),
+        }
+    }
+
     #[test]
     fn collapse_indexes_single_column_unique_sets_flag_and_index() {
-        let rows = vec![IndexRow {
-            table_name: "accounts".to_owned(),
-            index_name: "idx_accounts_email_unique".to_owned(),
-            is_unique: true,
-            column_name: "email".to_owned(),
-            attnum: 2,
-        }];
+        let rows = vec![index_row(
+            "idx_accounts_email_unique",
+            true,
+            "email",
+            false,
+            false,
+            "CREATE UNIQUE INDEX idx_accounts_email_unique ON public.accounts USING btree (email)",
+        )];
         let (indexes, unique_cols) = collapse_indexes(&rows);
         assert_eq!(indexes.len(), 1);
         assert_eq!(indexes[0].name, "idx_accounts_email_unique");
         assert_eq!(indexes[0].columns, vec!["email".to_owned()]);
         assert!(indexes[0].unique);
+        // A simple index keeps `definition` None so its JSON is unchanged.
+        assert_eq!(indexes[0].definition, None);
         assert!(unique_cols.contains("email"));
     }
 
     #[test]
     fn collapse_indexes_plain_index_no_unique_flag() {
-        let rows = vec![IndexRow {
-            table_name: "comments".to_owned(),
-            index_name: "idx_comments_post_id".to_owned(),
-            is_unique: false,
-            column_name: "post_id".to_owned(),
-            attnum: 2,
-        }];
+        let rows = vec![index_row(
+            "idx_comments_post_id",
+            false,
+            "post_id",
+            false,
+            false,
+            "CREATE INDEX idx_comments_post_id ON public.comments USING btree (post_id)",
+        )];
         let (indexes, unique_cols) = collapse_indexes(&rows);
         assert_eq!(indexes.len(), 1);
         assert!(!indexes[0].unique);
+        assert_eq!(indexes[0].definition, None);
         assert!(unique_cols.is_empty());
     }
 
@@ -649,22 +729,14 @@ mod tests {
     fn collapse_indexes_multi_column_unique_only_index_not_column_flag() {
         // A composite unique index records an Index but does NOT set a per-column
         // unique flag (the model IR's `unique` flag is single-column only).
-        let rows = vec![
-            IndexRow {
-                table_name: "memberships".to_owned(),
-                index_name: "idx_memberships_org_user".to_owned(),
-                is_unique: true,
-                column_name: "org_id".to_owned(),
-                attnum: 2,
-            },
-            IndexRow {
-                table_name: "memberships".to_owned(),
-                index_name: "idx_memberships_org_user".to_owned(),
-                is_unique: true,
-                column_name: "user_id".to_owned(),
-                attnum: 3,
-            },
-        ];
+        let rows = vec![index_row(
+            "idx_memberships_org_user",
+            true,
+            "org_id,user_id",
+            false,
+            false,
+            "CREATE UNIQUE INDEX idx_memberships_org_user ON public.memberships USING btree (org_id, user_id)",
+        )];
         let (indexes, unique_cols) = collapse_indexes(&rows);
         assert_eq!(indexes.len(), 1);
         assert_eq!(
@@ -672,9 +744,56 @@ mod tests {
             vec!["org_id".to_owned(), "user_id".to_owned()]
         );
         assert!(indexes[0].unique);
+        assert_eq!(indexes[0].definition, None);
         assert!(
             unique_cols.is_empty(),
             "composite unique sets no column flag"
+        );
+    }
+
+    #[test]
+    fn collapse_indexes_expression_index_preserved_not_dropped() {
+        // An expression index (indkey contains 0 → has_expression) must be
+        // preserved verbatim via `definition`, never dropped, and must not set a
+        // column `unique` flag.
+        let def = "CREATE INDEX users_lower_email_idx ON public.users USING btree (lower(email))";
+        let rows = vec![index_row(
+            "users_lower_email_idx",
+            false,
+            "", // no resolvable ordinary columns
+            false,
+            true,
+            def,
+        )];
+        let (indexes, unique_cols) = collapse_indexes(&rows);
+        assert_eq!(indexes.len(), 1, "expression index preserved, not dropped");
+        assert_eq!(indexes[0].name, "users_lower_email_idx");
+        assert!(indexes[0].columns.is_empty());
+        assert_eq!(indexes[0].definition.as_deref(), Some(def));
+        assert!(unique_cols.is_empty());
+    }
+
+    #[test]
+    fn collapse_indexes_partial_index_preserves_predicate() {
+        // A partial index over a real column keeps its `WHERE` predicate via the
+        // verbatim definition rather than degrading to a plain column index.
+        let def = "CREATE INDEX users_active_idx ON public.users USING btree (email) \
+                   WHERE (deleted_at IS NULL)";
+        let rows = vec![index_row(
+            "users_active_idx",
+            false,
+            "email",
+            true,
+            false,
+            def,
+        )];
+        let (indexes, unique_cols) = collapse_indexes(&rows);
+        assert_eq!(indexes.len(), 1);
+        assert_eq!(indexes[0].columns, vec!["email".to_owned()]);
+        assert_eq!(indexes[0].definition.as_deref(), Some(def));
+        assert!(
+            unique_cols.is_empty(),
+            "partial index sets no column unique flag"
         );
     }
 
@@ -701,13 +820,14 @@ mod tests {
             },
         ];
         let pk = vec!["id".to_owned()];
-        let indexes = vec![IndexRow {
-            table_name: "comments".to_owned(),
-            index_name: "idx_comments_post_id".to_owned(),
-            is_unique: false,
-            column_name: "post_id".to_owned(),
-            attnum: 2,
-        }];
+        let indexes = vec![index_row(
+            "idx_comments_post_id",
+            false,
+            "post_id",
+            false,
+            false,
+            "CREATE INDEX idx_comments_post_id ON public.comments USING btree (post_id)",
+        )];
         let fks = vec![ForeignKeyRow {
             table_name: "comments".to_owned(),
             column_name: "post_id".to_owned(),

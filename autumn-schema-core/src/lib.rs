@@ -531,6 +531,30 @@ pub struct Index {
     pub columns: Vec<String>,
     /// Whether the index enforces uniqueness.
     pub unique: bool,
+    /// The verbatim `CREATE [UNIQUE] INDEX …` statement for an index that
+    /// cannot be represented by plain columns alone — an expression index
+    /// (e.g. `lower(email)`) or a partial index (`WHERE …`). When `Some`, the
+    /// emitter renders this definition verbatim instead of building
+    /// `CREATE INDEX … (columns)`, and the diff compares indexes by this text
+    /// rather than by `columns`. `None` for ordinary column indexes, which keeps
+    /// their serialized JSON byte-identical to snapshots written before this
+    /// field existed (see the `#[serde(default, skip_serializing_if)]`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub definition: Option<String>,
+}
+
+impl Index {
+    /// Construct an ordinary column index (no raw `definition`), the common case
+    /// for both the model parser and simple introspected indexes.
+    #[must_use]
+    pub fn new(name: impl Into<String>, columns: Vec<String>, unique: bool) -> Self {
+        Self {
+            name: name.into(),
+            columns,
+            unique,
+            definition: None,
+        }
+    }
 }
 
 /// A `CHECK` constraint on a [`Table`] (e.g. the closed-set constraint an
@@ -1043,6 +1067,7 @@ mod tests {
             name: "posts_author_idx".to_owned(),
             columns: vec!["author_id".to_owned()],
             unique: false,
+            definition: None,
         });
         table.checks.push(CheckConstraint {
             name: Some("posts_status_check".to_owned()),
