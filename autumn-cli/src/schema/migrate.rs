@@ -1,12 +1,14 @@
-//! `autumn schema migrate` — apply the generated migrations, then advance the
-//! snapshot baseline (slice 6 of tracking issue #1975).
+//! `autumn schema migrate` — apply the generated migrations (slice 6 of tracking
+//! issue #1975).
 //!
 //! This is the *apply* half of the declarative-schema loop. `autumn schema diff
 //! --write-migration` (slice 4) authored `migrations/<ts>_<name>/{up,down}.sql`
-//! after running the destructive-change guards; this command applies whatever is
-//! pending against the configured database and then re-snapshots the declared
-//! models so the checked-in baseline advances to the state the database is now
-//! in.
+//! after running the destructive-change guards AND advanced the checked-in
+//! snapshot baseline to the generated plan's target state; this command applies
+//! whatever is pending against the configured database. It does NOT touch the
+//! snapshot — the baseline already moved at generation time, so re-snapshotting
+//! here (from possibly-newer, still-ungenerated models) could only bake un-drift
+//! into the baseline and hide it from the next `schema diff` / `doctor`.
 //!
 //! # What this command deliberately does NOT do
 //!
@@ -14,7 +16,7 @@
 //! generated migration may carry are inert SQL comments; the destructive-change
 //! refusal happened at diff time, not here. Migration files apply verbatim,
 //! exactly as `autumn migrate` applies them — this command adds only the
-//! provider-lock check and the post-apply snapshot refresh.
+//! provider-lock check. It also does not advance the snapshot (see above).
 //!
 //! # Backend handling (Postgres default; `SQLite` behind a feature)
 //!
@@ -32,13 +34,12 @@ use diesel_migrations::FileBasedMigrations;
 
 use autumn_web::migrate::{DEFAULT_LOCK_WAIT_TIMEOUT, MigrationResult};
 
-use super::parse::parse_models_path;
-use super::snapshot::{
-    SNAPSHOT_DEFAULT_PATH, SchemaSnapshot, SnapshotError, load_snapshot, write_snapshot,
-};
+use super::snapshot::{SNAPSHOT_DEFAULT_PATH, SnapshotError, load_snapshot};
 
-/// Apply pending migrations against the configured database, then refresh the
-/// checked-in schema snapshot.
+/// Apply pending migrations against the configured database.
+///
+/// The checked-in schema snapshot is NOT touched here — it already advanced at
+/// `schema diff --write-migration` (generation) time.
 ///
 /// Resolves the project root from the current directory; `profile` is the
 /// explicit `--profile` flag (else the ambient profile resolution the rest of
@@ -117,37 +118,13 @@ fn migrate_at(project_root: &Path, profile: Option<&str>) -> Result<(), String> 
     }
 
     // Apply. The destructive-change guards already ran at diff time; migration
-    // files apply verbatim (`-- autumn-safety:` lines are inert SQL comments).
+    // files apply verbatim (`-- autumn-safety:` lines are inert SQL comments). The
+    // snapshot baseline already advanced at `schema diff --write-migration` time,
+    // so nothing is re-snapshotted here.
     let result = apply_pending(backend, &url, &migrations_dir)?;
     report_applied(&result);
 
-    // SNAPSHOT REFRESH: the declarative snapshot is the diff baseline. It advances
-    // ONLY when migrations were actually applied (`should_refresh_snapshot`) — a
-    // real apply means the database moved to a new state, so the baseline follows
-    // it to that state (re-parse the models, rewrite the snapshot atomically,
-    // dialect-tagged). When nothing was applied (the DB was already up to date)
-    // there is no new state to advance to, so the snapshot is left UNTOUCHED —
-    // rewriting it from the (possibly newly-edited, still-ungenerated) models
-    // would falsely bake those edits into the baseline and hide the drift from
-    // the next `schema diff` / `doctor`. A snapshot-write failure AFTER a
-    // successful apply is a warning, not an apply failure — the migration really
-    // did apply.
-    if should_refresh_snapshot(&result) {
-        refresh_snapshot_after_apply(project_root, backend);
-    }
-
     Ok(())
-}
-
-/// Whether a completed apply should advance the checked-in snapshot baseline.
-///
-/// The invariant: the snapshot tracks the APPLIED database state, so it advances
-/// **iff** migrations were actually applied. An empty `applied` list means the DB
-/// was already up to date — there is no new applied state to snapshot, so the
-/// baseline must stay put (otherwise ungenerated model edits would be silently
-/// baked into it and never surface as drift). Pure so the decision is testable.
-const fn should_refresh_snapshot(result: &MigrationResult) -> bool {
-    !result.applied.is_empty()
 }
 
 /// Enforce the provider-lock guard against an on-disk snapshot.
@@ -257,6 +234,12 @@ enum MigrationsDir {
 /// [`MigrationsDir::HasMigrations`] when it contains at least one migration
 /// subdirectory (the diesel layout) and [`MigrationsDir::Empty`] otherwise. Pure
 /// over the filesystem so the decision is testable without a database.
+///
+/// Per-entry iteration errors are propagated, NOT swallowed: a `read_dir`
+/// iterator can yield `Err` mid-scan (an I/O failure after the directory opened
+/// cleanly). The whole iterator is consumed and ANY per-entry `Err` yields
+/// [`MigrationsDir::Unreadable`] — otherwise a mid-scan failure could be
+/// misclassified `Empty` and silently skip a required deploy.
 fn classify_migrations_dir(migrations_dir: &Path) -> MigrationsDir {
     match migrations_dir.try_exists() {
         Ok(false) => return MigrationsDir::Absent,
@@ -266,9 +249,15 @@ fn classify_migrations_dir(migrations_dir: &Path) -> MigrationsDir {
         Err(e) => return MigrationsDir::Unreadable(e),
     }
 
-    match std::fs::read_dir(migrations_dir) {
+    let entries = match std::fs::read_dir(migrations_dir) {
+        Ok(entries) => entries,
+        Err(e) => return MigrationsDir::Unreadable(e),
+    };
+    // Fully consume the iterator, surfacing any per-entry read error rather than
+    // filtering it out (which would misclassify a mid-scan failure as `Empty`).
+    match entries.collect::<Result<Vec<_>, _>>() {
         Ok(entries) => {
-            if entries.filter_map(Result::ok).any(|e| e.path().is_dir()) {
+            if entries.iter().any(|e| e.path().is_dir()) {
                 MigrationsDir::HasMigrations
             } else {
                 MigrationsDir::Empty
@@ -290,46 +279,13 @@ fn report_applied(result: &MigrationResult) {
     println!("Applied {} migration(s).", result.applied.len());
 }
 
-/// Re-parse the declared models and rewrite the snapshot at
-/// [`SNAPSHOT_DEFAULT_PATH`], tagged with `backend`. Best-effort: after a
-/// successful DB apply, a failure to refresh the snapshot is reported as a
-/// warning (never surfaced as an apply failure), and a missing models source is
-/// a benign note.
-fn refresh_snapshot_after_apply(project_root: &Path, backend: Backend) {
-    let Some(models_path) = super::existing_models_path(project_root) else {
-        eprintln!(
-            "note: no declarative models found under src/ — migrations applied, but the schema \
-             snapshot was not refreshed (nothing to snapshot)."
-        );
-        return;
-    };
-
-    let desired = match parse_models_path(&models_path, backend) {
-        Ok(parsed) => parsed,
-        Err(e) => {
-            eprintln!(
-                "warning: migrations applied, but re-parsing models to refresh the snapshot \
-                 failed: {e}"
-            );
-            return;
-        }
-    };
-
-    let snapshot = SchemaSnapshot::new(backend, desired.tables);
-    let out = project_root.join(SNAPSHOT_DEFAULT_PATH);
-    match write_snapshot(&out, &snapshot) {
-        Ok(()) => println!("refreshed schema snapshot at {}", out.display()),
-        Err(e) => eprintln!(
-            "warning: migrations applied, but refreshing the schema snapshot at {} failed: {e}",
-            out.display()
-        ),
-    }
-}
-
 #[cfg(test)]
 #[allow(clippy::needless_raw_string_hashes)]
 mod tests {
     use super::*;
+    // The provider-lock tests write a snapshot; the production apply path no
+    // longer touches the snapshot writer, so import it in the test scope only.
+    use super::super::snapshot::{SchemaSnapshot, write_snapshot};
 
     #[test]
     fn classify_absent_path_is_a_no_op() {
@@ -384,6 +340,13 @@ mod tests {
         ));
     }
 
+    // NOTE: `classify_migrations_dir` also propagates a per-entry iteration `Err`
+    // (a `read_dir` iterator yielding `Err` mid-scan) as `Unreadable`, not `Empty`.
+    // Forcing a per-entry iteration error deterministically and portably is not
+    // feasible (it needs an I/O failure to occur *after* the directory opened
+    // cleanly, which no portable filesystem primitive can inject), so it is not
+    // unit-tested here; the `collect::<Result<Vec<_>, _>>()` in the implementation
+    // is the guard, and the open-error path below covers `read_dir` failing.
     #[cfg(unix)]
     #[test]
     fn classify_unreadable_dir_is_an_error() {
@@ -409,21 +372,6 @@ mod tests {
             return;
         }
         assert!(matches!(classified, MigrationsDir::Unreadable(_)));
-    }
-
-    #[test]
-    fn should_refresh_snapshot_only_when_something_was_applied() {
-        // A real apply (non-empty `applied`) advances the baseline.
-        let applied = MigrationResult {
-            applied: vec!["20260101000000_init".to_string()],
-        };
-        assert!(should_refresh_snapshot(&applied));
-        // A no-op apply (DB already up to date) must NOT advance it — otherwise
-        // ungenerated model edits would be silently baked into the baseline.
-        let noop = MigrationResult {
-            applied: Vec::new(),
-        };
-        assert!(!should_refresh_snapshot(&noop));
     }
 
     #[test]

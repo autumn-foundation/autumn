@@ -63,7 +63,7 @@ fn write_post_model(project: &Path) {
 }
 
 #[test]
-fn schema_migrate_applies_to_a_sqlite_file_and_refreshes_snapshot() {
+fn schema_migrate_applies_to_a_sqlite_file_and_advances_snapshot_at_generation() {
     let (_tmp, project) = fresh_project("sqlite_migrate_app");
 
     // A file-backed SQLite database inside the project (NOT `:memory:` — the
@@ -71,6 +71,7 @@ fn schema_migrate_applies_to_a_sqlite_file_and_refreshes_snapshot() {
     let db_path = project.join("app.db");
     let url = format!("sqlite://{}", db_path.display());
     let envs = [("AUTUMN_DATABASE__URL", url.as_str())];
+    let snapshot_path = project.join(".autumn/schema-snapshot.json");
 
     // 1. Post model + empty baseline snapshot (Sqlite-tagged), so the diff
     //    produces a CREATE TABLE migration for SQLite.
@@ -89,7 +90,8 @@ fn schema_migrate_applies_to_a_sqlite_file_and_refreshes_snapshot() {
         &envs,
     );
 
-    // 2. Generate the SQLite migration from the diff.
+    // 2. Generate the SQLite migration from the diff. The snapshot advances HERE
+    //    (#2041), to the generated plan's target — Sqlite-tagged `posts`.
     let (diff_out, _) = run_autumn_ok(
         &project,
         &[
@@ -102,38 +104,42 @@ fn schema_migrate_applies_to_a_sqlite_file_and_refreshes_snapshot() {
         &envs,
     );
     assert!(diff_out.contains("wrote migration"), "diff: {diff_out}");
+    assert!(
+        diff_out.contains("advanced schema snapshot"),
+        "diff --write-migration reports advancing the snapshot: {diff_out}"
+    );
+    let snap_after_generation = std::fs::read_to_string(&snapshot_path).expect("snapshot");
+    assert!(
+        snap_after_generation.contains("\"backend\": \"Sqlite\""),
+        "snapshot: {snap_after_generation}"
+    );
+    assert!(
+        snap_after_generation.contains("\"name\": \"posts\""),
+        "snapshot advanced at generation: {snap_after_generation}"
+    );
 
-    // 3. Apply against the SQLite file: reports applied, refreshes snapshot,
-    //    exit 0. (No advisory lock — SQLite is single-writer, issue #1999.)
+    // 3. Apply against the SQLite file: reports applied, exit 0, and does NOT
+    //    touch the snapshot. (No advisory lock — SQLite is single-writer, #1999.)
     let (mig_out, _) = run_autumn_ok(&project, &["schema", "migrate"], &envs);
     assert!(
         mig_out.contains("Applied 1 migration(s)."),
         "migrate stdout: {mig_out}"
     );
     assert!(
-        mig_out.contains("refreshed schema snapshot"),
-        "snapshot refresh reported: {mig_out}"
+        !mig_out.contains("refreshed schema snapshot"),
+        "migrate must NOT refresh the snapshot anymore: {mig_out}"
     );
-
-    // The SQLite database file exists and the snapshot advanced to Sqlite-tagged
-    // `posts` (this is the FIRST, real apply — the refresh is anchored here).
     assert!(db_path.is_file(), "sqlite db file created");
-    let snapshot_path = project.join(".autumn/schema-snapshot.json");
     let snap_after_apply = std::fs::read_to_string(&snapshot_path).expect("snapshot");
-    assert!(
-        snap_after_apply.contains("\"backend\": \"Sqlite\""),
-        "snapshot: {snap_after_apply}"
-    );
-    assert!(
-        snap_after_apply.contains("\"name\": \"posts\""),
-        "snapshot: {snap_after_apply}"
+    assert_eq!(
+        snap_after_generation, snap_after_apply,
+        "migrate must leave the snapshot byte-for-byte unchanged"
     );
 
     // Finding 1 (#2036): introduce a NEW, ungenerated model change (add `body`)
     // WITHOUT generating/applying a migration for it. The next `schema migrate`
     // has nothing pending to apply, so it is a no-op — and MUST leave the
-    // snapshot untouched. If it re-snapshotted from the edited models, the new
-    // column would be silently baked into the baseline and never diff as drift.
+    // snapshot untouched (migrate no longer touches the snapshot at all).
     std::fs::write(
         project.join("src/models.rs"),
         "#[autumn_web::model(managed)]\npub struct Post {\n    #[id]\n    pub id: i64,\n    pub title: String,\n    pub body: Option<String>,\n}\n",
@@ -161,7 +167,7 @@ fn schema_migrate_applies_to_a_sqlite_file_and_refreshes_snapshot() {
         "the ungenerated `body` edit must NOT be baked into the baseline: {snap_after_noop}"
     );
 
-    // 5. Because the snapshot never advanced, the ungenerated edit is still
+    // 5. Because the snapshot never advanced for the ungenerated edit, it is still
     //    visible as drift: `schema diff` still generates the pending column add.
     let (diff_after, _) = run_autumn_ok(&project, &["schema", "diff"], &envs);
     assert!(
