@@ -427,8 +427,9 @@ systemd + kamal-proxy — nothing is mocked:
   harness's curl/ssh assertions while driving the real `autumn` binary; the
   Hetzner-specific provisioning is isolated in the workflow so another provider
   can be swapped in without touching the script. The in-container half of the
-  pam_systemd socket check is also available on demand via
-  `cargo test -p autumn-cli --features deploy-e2e-pam --test deploy_e2e -- --ignored`.
+  pam_systemd socket check runs as part of the standard
+  `cargo test -p autumn-cli --test deploy_e2e -- --ignored` Docker sweep (no
+  separate feature needed).
 
 ---
 
