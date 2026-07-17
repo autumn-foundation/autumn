@@ -125,7 +125,13 @@ async fn schema_migrate_applies_generated_migration_and_refreshes_snapshot() {
     // 2. Generate the migration from the diff.
     let (diff_out, _) = run_autumn_ok(
         &project,
-        &["schema", "diff", "--write-migration", "--name", "create_posts"],
+        &[
+            "schema",
+            "diff",
+            "--write-migration",
+            "--name",
+            "create_posts",
+        ],
         &envs,
     );
     assert!(diff_out.contains("wrote migration"), "diff: {diff_out}");

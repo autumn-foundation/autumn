@@ -92,7 +92,13 @@ fn schema_migrate_applies_to_a_sqlite_file_and_refreshes_snapshot() {
     // 2. Generate the SQLite migration from the diff.
     let (diff_out, _) = run_autumn_ok(
         &project,
-        &["schema", "diff", "--write-migration", "--name", "create_posts"],
+        &[
+            "schema",
+            "diff",
+            "--write-migration",
+            "--name",
+            "create_posts",
+        ],
         &envs,
     );
     assert!(diff_out.contains("wrote migration"), "diff: {diff_out}");
