@@ -507,6 +507,21 @@ path = "tests/sqlite_searchable_repository.rs"
 name = "sqlite_immediate_transaction"
 path = "tests/sqlite_immediate_transaction.rs"
 
+# SQLite `statement_timeout` fail-closed boot guard (issue #1996, item 4). SQLite
+# cannot enforce a per-statement wall-clock timeout through the async connection
+# wrapper (diesel's SqliteConnection exposes no interrupt/progress-handler hook),
+# so `db::reject_sqlite_statement_timeout` fails the boot fast — from every
+# pool-construction entry point — when a non-zero `database.statement_timeout` is
+# configured under the sqlite backend, instead of silently ignoring it. This test
+# proves the loud, typed rejection (naming the config key + SQLite) and that a
+# `None`/zero timeout still boots cleanly. Only meaningful under
+# `--features sqlite`; the file is `#![cfg(feature = "sqlite")]` so a default
+# `cargo test` compiles it to an empty (passing) binary. Run explicitly:
+# `cargo test -p autumn-web --features sqlite --test sqlite_statement_timeout_fail_closed`.
+[[test]]
+name = "sqlite_statement_timeout_fail_closed"
+path = "tests/sqlite_statement_timeout_fail_closed.rs"
+
 # SQLite `dependent(..., on_delete = destroy)` cascade proof (issue #1996, PR
 # #2021). The Destroy arm selects child ids with a hand-built SQL string that
 # used to emit a trailing `FOR UPDATE` (rejected by SQLite) — outside the

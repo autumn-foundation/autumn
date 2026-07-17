@@ -15533,10 +15533,20 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 let timeout_ms = timeout_ms.min(i32::MAX as u64);
 
                 // `SET statement_timeout` is Postgres session syntax; SQLite
-                // rejects it ("near \"SET\": syntax error"). SQLite has no
-                // per-statement timeout SQL — the pool already installs
-                // `busy_timeout` at connection setup — so the SQLite arm skips
-                // it. A true SQLite statement timeout is a later wave (#1996).
+                // rejects it ("near \"SET\": syntax error"). SQLite also cannot
+                // enforce a per-statement wall-clock timeout at all through the
+                // async connection wrapper (diesel's SqliteConnection exposes no
+                // interrupt/progress-handler hook), so this arm CANNOT honor a
+                // configured `database.statement_timeout`. Rather than silently
+                // ignore it here, autumn-web fails the boot fast whenever a
+                // non-zero `statement_timeout` is configured under the sqlite
+                // backend (`reject_sqlite_statement_timeout`, called from
+                // `create_pool` / `create_topology` / `create_shard_topology` in
+                // db.rs). That boot guard guarantees `timeout_ms` is always 0 by
+                // the time it reaches this arm, so the no-op below is correct and
+                // reachable-with-a-real-timeout never happens — not a silent gap.
+                // `busy_timeout` (installed at connection setup) still bounds lock
+                // waits; a real statement timeout is tracked by #1996/#1910.
                 ::autumn_web::backend_select! {
                     pg => {{
                         ::autumn_web::reexports::diesel::sql_query(
@@ -15554,6 +15564,9 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         })?;
                     }},
                     sqlite => {{
+                        // Unreachable with a non-zero value: the boot guard
+                        // `db::reject_sqlite_statement_timeout` fail-closes before
+                        // any pool is built when `statement_timeout` is set.
                         let _ = timeout_ms;
                     }},
                 }
@@ -19985,6 +19998,56 @@ mod tests {
                 || generated
                     .contains("__autumn_statement_timeout_ms: self.__autumn_statement_timeout_ms"),
             "sub-repo must preserve the parent statement timeout: {generated}"
+        );
+    }
+
+    /// The connection-acquire helper forks `statement_timeout` per backend
+    /// (issue #1996, item 4). The Postgres arm keeps `SET statement_timeout`
+    /// exactly; the SQLite arm is a deliberate no-op — SQLite cannot enforce a
+    /// per-statement timeout through the async connection wrapper, so autumn-web
+    /// fail-closes at boot (`db::reject_sqlite_statement_timeout`) whenever a
+    /// non-zero timeout is configured under the sqlite backend, which guarantees
+    /// `timeout_ms` is always 0 by the time it reaches the SQLite arm. This test
+    /// pins BOTH arms so a future edit cannot (a) drop the Postgres `SET`, or
+    /// (b) turn the SQLite arm into something that silently applies/misuses a
+    /// real timeout value.
+    #[test]
+    fn statement_timeout_forks_per_backend_with_sqlite_noop() {
+        let generated =
+            repository_macro(quote! { Post }, quote! { pub trait PostRepository {} }).to_string();
+
+        // The value is threaded and capped before the fork.
+        assert!(
+            generated.contains("let timeout_ms = self . __autumn_statement_timeout_ms")
+                || generated.contains("let timeout_ms = self.__autumn_statement_timeout_ms"),
+            "must read the threaded statement timeout: {generated}"
+        );
+
+        // Postgres arm: the `SET statement_timeout` session statement is emitted
+        // verbatim (Postgres behavior must be 100% unchanged).
+        assert!(
+            generated.contains("SET statement_timeout = {timeout_ms}"),
+            "pg arm must still emit `SET statement_timeout`: {generated}"
+        );
+
+        // SQLite arm: an explicit `let _ = timeout_ms ;` no-op — NOT a
+        // `SET statement_timeout`, NOT any other application of the value. The
+        // boot guard (asserted by the runtime test
+        // `sqlite_statement_timeout_fail_closed`) makes this no-op correct rather
+        // than a silent swallow of a configured guarantee.
+        let sqlite_arm_start = generated
+            .find("sqlite => { { let _ = timeout_ms ;")
+            .or_else(|| generated.find("sqlite => {{ let _ = timeout_ms ;"));
+        assert!(
+            sqlite_arm_start.is_some(),
+            "sqlite arm must be the deliberate `let _ = timeout_ms;` no-op backed by \
+             the boot guard: {generated}"
+        );
+
+        // The two arms live inside one `backend_select!` seam.
+        assert!(
+            generated.contains("backend_select ! { pg => { {"),
+            "the fork must be a backend_select! seam: {generated}"
         );
     }
 

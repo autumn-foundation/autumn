@@ -1383,6 +1383,9 @@ pub fn create_pool(config: &DatabaseConfig) -> Result<Option<Pool<RuntimeConnect
         return Ok(None);
     };
 
+    #[cfg(feature = "sqlite")]
+    reject_sqlite_statement_timeout(config.statement_timeout)?;
+
     let pool = build_pool(
         url,
         config.effective_primary_pool_size(),
@@ -1390,6 +1393,43 @@ pub fn create_pool(config: &DatabaseConfig) -> Result<Option<Pool<RuntimeConnect
     )?;
 
     Ok(Some(pool))
+}
+
+/// Reject a configured `database.statement_timeout` under the `SQLite` backend.
+///
+/// `SQLite` cannot enforce a per-statement wall-clock timeout through the async
+/// connection wrapper: diesel's `SqliteConnection` exposes no
+/// interrupt/progress-handler hook (nor the raw `sqlite3` handle) through
+/// `SyncConnectionWrapper`, so a runaway query cannot be aborted mid-flight.
+/// Rather than silently ignore a correctness guarantee we cannot honor, this
+/// fails the boot fast with an actionable message (fail-closed, issue #1996).
+///
+/// A `None` or zero timeout (the default) asks for no guarantee and boots
+/// cleanly, so ordinary `SQLite` apps are unaffected — only an operator who
+/// explicitly configured a timeout we cannot meet is stopped. This is the single
+/// choke point for every pool-construction entry point: `create_pool`,
+/// `create_topology`, and `create_shard_topology` all call it before the pool is
+/// built, so no configured timeout can reach a live `SQLite` pool. `busy_timeout`
+/// still bounds lock waits; a real per-statement timeout is tracked by
+/// #1996/#1910.
+///
+/// # Errors
+///
+/// Returns [`PoolError::UnsupportedBackend`] when `statement_timeout` is `Some`
+/// and non-zero.
+#[cfg(feature = "sqlite")]
+fn reject_sqlite_statement_timeout(statement_timeout: Option<Duration>) -> Result<(), PoolError> {
+    let Some(timeout) = statement_timeout.filter(|t| !t.is_zero()) else {
+        return Ok(());
+    };
+    Err(PoolError::UnsupportedBackend(format!(
+        "SQLite backend cannot enforce database.statement_timeout ({}ms): diesel's \
+         SqliteConnection exposes no interrupt/progress-handler hook through the async \
+         connection wrapper, so a runaway query cannot be aborted. Unset \
+         database.statement_timeout for the SQLite backend (busy_timeout already bounds \
+         lock waits), or run on Postgres. Tracking issue: #1996/#1910.",
+        timeout.as_millis()
+    )))
 }
 
 /// Reject a `SQLite` `replica_url` that cannot act as a real read replica for the
@@ -1434,6 +1474,9 @@ pub fn create_topology(config: &DatabaseConfig) -> Result<Option<DatabaseTopolog
         return Ok(None);
     };
 
+    #[cfg(feature = "sqlite")]
+    reject_sqlite_statement_timeout(config.statement_timeout)?;
+
     let primary = build_pool(
         primary_url,
         config.effective_primary_pool_size(),
@@ -1470,6 +1513,14 @@ pub fn create_shard_topology(
     shard: &crate::config::ShardConfig,
     defaults: &DatabaseConfig,
 ) -> Result<DatabaseTopology, PoolError> {
+    // A SQLite `[[database.shards]]` deployment reaches this via the ungated
+    // `sharding::create_shard_set` → `create_shard_topology` path (the
+    // transactional test-harness variant `create_shard_set_transactional` is
+    // Postgres-only), so the same fail-closed guard applies per shard. The shard
+    // inherits the `[database]` `statement_timeout`.
+    #[cfg(feature = "sqlite")]
+    reject_sqlite_statement_timeout(defaults.statement_timeout)?;
+
     let primary = build_pool(
         &shard.primary_url,
         shard.effective_primary_pool_size(defaults),
