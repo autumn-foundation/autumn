@@ -502,6 +502,36 @@ async fn schema_pull_preserves_expression_and_partial_indexes() {
         "doctor reports the DB matches the snapshot with expression/partial indexes:\n{doc_out}"
     );
     assert_no_secret_leak(&doc_out, &doc_err);
+
+    // A MODEL-side `schema diff` against the pulled snapshot must RETAIN the
+    // expression/partial indexes — the model DSL cannot express them, so their
+    // absence from the desired side is not a removal. The diff is clean (no
+    // destructive DropIndex that would clobber `lower(email)` with a plain index
+    // or strip the partial predicate).
+    write_models(
+        &project,
+        "
+#[autumn_web::model(managed)]
+pub struct Member {
+    #[id]
+    pub id: i64,
+    pub email: String,
+    pub deleted_at: Option<chrono::NaiveDateTime>,
+}
+",
+    );
+    let (mdiff_out, mdiff_err) = run_autumn_ok(&project, &["schema", "diff"], &envs);
+    assert!(
+        !mdiff_out.contains("DROP INDEX")
+            && !mdiff_out.contains("members_lower_email_idx")
+            && !mdiff_out.contains("members_active_email_idx"),
+        "a model-side `schema diff` must NOT drop the unmodellable expression/partial indexes:\n{mdiff_out}"
+    );
+    assert!(
+        mdiff_out.contains("No schema changes"),
+        "model diff against the pulled snapshot is clean (definition indexes retained):\n{mdiff_out}"
+    );
+    assert_no_secret_leak(&mdiff_out, &mdiff_err);
 }
 
 /// `SQLite` introspection is a future slice: `schema pull` against a `SQLite` URL

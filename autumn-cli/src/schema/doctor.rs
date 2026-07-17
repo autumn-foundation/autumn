@@ -362,17 +362,26 @@ impl DbSchemaDrift {
 /// the live `db_tables` introspected from the database. Pure and unit-testable —
 /// runs [`diff_schema`] in both directions (see [`DbSchemaDrift`]).
 pub fn compute_db_schema_drift(snapshot_tables: &[Table], db_tables: &[Table]) -> DbSchemaDrift {
+    // Both sides are complete introspections, so expression/partial-index
+    // definitions ARE authoritative here — a dropped/changed one is real drift and
+    // must still be reported (unlike a model diff, which retains what the DSL
+    // cannot express). This flag governs BOTH directions and also serves
+    // `pull --dry-run`, which computes drift through this function.
+    let opts = DiffOptions {
+        definitions_authoritative: true,
+        ..DiffOptions::default()
+    };
     // Forward: what pulling the DB would change in the snapshot baseline.
     let forward = diff_schema(
         snapshot_tables,
         &ParsedSchema::from_tables(db_tables.to_vec()),
-        DiffOptions::default(),
+        opts,
     );
     // Reverse: catches the dropped-default/FK/CHECK cases the forward pass misses.
     let reverse = diff_schema(
         db_tables,
         &ParsedSchema::from_tables(snapshot_tables.to_vec()),
-        DiffOptions::default(),
+        opts,
     );
     DbSchemaDrift { forward, reverse }
 }
@@ -1110,6 +1119,43 @@ mod tests {
             drift.reported_count(),
             drift.forward.changes.len(),
             "reported count prefers the non-empty forward plan"
+        );
+    }
+
+    /// A dropped expression/partial index IS real drift for the introspection
+    /// diff: `compute_db_schema_drift` runs with `definitions_authoritative: true`,
+    /// so a snapshot table carrying a `definition` index the live DB is missing
+    /// reports Drifted (proving the authoritative, bidirectional path still catches
+    /// a dropped expression index — the model-diff retention does NOT leak here).
+    #[test]
+    fn compute_db_schema_drift_catches_dropped_expression_index() {
+        use autumn_schema_core::Index;
+        let mut snapshot_table = drift_posts_table(None);
+        snapshot_table.indexes.push(Index {
+            name: "idx_posts_lower_created".to_owned(),
+            columns: vec!["created_at".to_owned()],
+            unique: false,
+            definition: Some(
+                "CREATE INDEX idx_posts_lower_created ON posts (lower(created_at::text))"
+                    .to_owned(),
+            ),
+        });
+        let snapshot = vec![snapshot_table];
+        // Live DB lacks the expression index entirely.
+        let db = vec![drift_posts_table(None)];
+        let drift = compute_db_schema_drift(&snapshot, &db);
+        assert!(
+            !drift.is_clean(),
+            "a dropped expression index must be reported as drift by the authoritative path"
+        );
+        assert!(
+            drift
+                .forward
+                .changes
+                .iter()
+                .any(|c| matches!(c, crate::schema::diff::SchemaChange::DropIndex { .. })),
+            "forward introspection pass must emit a DropIndex for the missing expression index: {:?}",
+            drift.forward.changes
         );
     }
 }

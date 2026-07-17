@@ -415,6 +415,26 @@ pub struct DiffOptions {
     /// by [`guard_plan`]. When `true`, both are permitted (the rename is treated
     /// as an independent drop+add).
     pub allow_destructive: bool,
+
+    /// Whether the DESIRED side can authoritatively express expression/partial
+    /// indexes (an [`Index`] carrying a raw `definition`).
+    ///
+    /// `false` (the **default**) is the *model diff* case (`schema diff` /
+    /// `--write-migration`, and doctor's model-vs-snapshot `compute_drift`): the
+    /// desired side is parsed from the model DSL, which can only ever produce a
+    /// plain `Index { definition: None, .. }` — it *cannot* express an
+    /// expression/partial index. A baseline index carrying a `definition` is
+    /// therefore an unmodellable/adopted construct, and [`diff_indexes`] **retains**
+    /// it (never `DropIndex`/replace) — exactly like an unmanaged/adopted table.
+    /// This retention is independent of `allow_destructive`: the declarative tool
+    /// never drops what it cannot express.
+    ///
+    /// `true` is the *introspection diff* case (doctor's
+    /// `database-schema-drift` `compute_db_schema_drift`, and `pull --dry-run`),
+    /// where BOTH sides are complete introspections, so a `definition` index IS
+    /// authoritative — a dropped/changed expression index is real drift and is
+    /// still reported (via [`indexes_equivalent`]).
+    pub definitions_authoritative: bool,
 }
 
 /// Why a computed plan is refused for emission (policy, not structure).
@@ -742,7 +762,6 @@ pub enum EmitError {
 /// pure diff does not consult it.
 #[must_use]
 pub fn diff_schema(baseline: &[Table], desired: &ParsedSchema, opts: DiffOptions) -> MigrationPlan {
-    let _ = opts;
     let backend = plan_backend(baseline, desired);
     let mut changes = Vec::new();
 
@@ -768,7 +787,7 @@ pub fn diff_schema(baseline: &[Table], desired: &ParsedSchema, opts: DiffOptions
             // Present on both sides — diff only Autumn-managed tables.
             (Some(base), Some(want)) => {
                 if want.managed {
-                    diff_table(base, want, desired, &mut changes);
+                    diff_table(base, want, desired, opts, &mut changes);
                 }
             }
             // Desired only — create it if Autumn owns it. But if the parser
@@ -1014,7 +1033,13 @@ fn column_participates_in_fk(
 
 /// Diff a table present on both sides (already known Autumn-managed on the
 /// desired side), pushing column / index / check changes.
-fn diff_table(base: &Table, want: &Table, desired: &ParsedSchema, changes: &mut Vec<SchemaChange>) {
+fn diff_table(
+    base: &Table,
+    want: &Table,
+    desired: &ParsedSchema,
+    opts: DiffOptions,
+    changes: &mut Vec<SchemaChange>,
+) {
     // A primary-key change is refused wholesale (guarded); emit only the marker
     // and skip the rest of this table's diff.
     if base.primary_key != want.primary_key {
@@ -1056,7 +1081,7 @@ fn diff_table(base: &Table, want: &Table, desired: &ParsedSchema, changes: &mut 
         }
     }
 
-    diff_indexes(&want.name, base, want, &skipped, changes);
+    diff_indexes(&want.name, base, want, &skipped, opts, changes);
     diff_checks(&want.name, base, want, changes);
 }
 
@@ -1158,11 +1183,30 @@ fn indexes_equivalent(a: &Index, b: &Index) -> bool {
     }
 }
 
+///
+/// ## Unmodellable (expression/partial) indexes
+///
+/// An [`Index`] carrying a raw `definition` (an expression or partial index,
+/// preserved verbatim by `schema pull` introspection) **cannot be produced by the
+/// model parser** — `#[indexed]`/`#[unique]` only ever yield
+/// `Index { definition: None, .. }`. So in a *model diff*
+/// (`opts.definitions_authoritative == false`) a baseline `definition` index is an
+/// adopted construct the desired side is simply unable to describe, and it is
+/// **retained** — never `DropIndex`'d or replaced — exactly like an
+/// unmanaged/adopted table. This retention is independent of `allow_destructive`:
+/// the declarative tool never drops what it cannot express. In an *introspection
+/// diff* (`opts.definitions_authoritative == true`, from
+/// [`compute_db_schema_drift`](super::doctor::compute_db_schema_drift) and
+/// `pull --dry-run`) BOTH sides are complete introspections, so a `definition`
+/// index IS authoritative and a dropped/changed one is reported as real drift via
+/// [`indexes_equivalent`]. Plain (`definition: None`) indexes are diffed
+/// identically in both modes — a model may always ADD a brand-new plain index.
 fn diff_indexes(
     table: &str,
     base: &Table,
     want: &Table,
     skipped: &BTreeSet<String>,
+    opts: DiffOptions,
     changes: &mut Vec<SchemaChange>,
 ) {
     let base_by_name: BTreeMap<&str, &Index> =
@@ -1176,29 +1220,49 @@ fn diff_indexes(
                 table: table.to_owned(),
                 index: want_idx.clone(),
             }),
-            Some(base_idx) if !indexes_equivalent(base_idx, want_idx) => {
-                changes.push(SchemaChange::DropIndex {
-                    table: table.to_owned(),
-                    index: (*base_idx).clone(),
-                });
-                changes.push(SchemaChange::AddIndex {
-                    table: table.to_owned(),
-                    index: want_idx.clone(),
-                });
+            Some(base_idx) => {
+                // A same-named pair where EITHER carries a `definition`: in a model
+                // diff the desired side cannot express the definition, so retain
+                // the baseline index (emit nothing) rather than emit a destructive
+                // DropIndex + plain replacement. In an introspection diff both
+                // sides are authoritative, so fall through to the equivalence check.
+                let involves_definition =
+                    base_idx.definition.is_some() || want_idx.definition.is_some();
+                if involves_definition && !opts.definitions_authoritative {
+                    continue;
+                }
+                if !indexes_equivalent(base_idx, want_idx) {
+                    changes.push(SchemaChange::DropIndex {
+                        table: table.to_owned(),
+                        index: (*base_idx).clone(),
+                    });
+                    changes.push(SchemaChange::AddIndex {
+                        table: table.to_owned(),
+                        index: want_idx.clone(),
+                    });
+                }
             }
-            Some(_) => {}
         }
     }
 
     for base_idx in &base.indexes {
-        if !want_by_name.contains_key(base_idx.name.as_str())
-            && !base_idx.columns.iter().any(|c| skipped.contains(c))
+        if want_by_name.contains_key(base_idx.name.as_str())
+            || base_idx.columns.iter().any(|c| skipped.contains(c))
         {
-            changes.push(SchemaChange::DropIndex {
-                table: table.to_owned(),
-                index: base_idx.clone(),
-            });
+            continue;
         }
+        // A baseline-only `definition` index has no same-named desired index, and
+        // in a model diff the desired side could not have expressed it anyway —
+        // retain it (never DropIndex), independent of `allow_destructive`. In an
+        // introspection diff it is authoritative, so a genuinely-dropped
+        // expression/partial index still drops.
+        if base_idx.definition.is_some() && !opts.definitions_authoritative {
+            continue;
+        }
+        changes.push(SchemaChange::DropIndex {
+            table: table.to_owned(),
+            index: base_idx.clone(),
+        });
     }
 }
 
@@ -3059,9 +3123,15 @@ mod tests {
 
     const DEFAULT_OPTS: DiffOptions = DiffOptions {
         allow_destructive: false,
+        definitions_authoritative: false,
     };
     const ALLOW: DiffOptions = DiffOptions {
         allow_destructive: true,
+        definitions_authoritative: false,
+    };
+    const AUTHORITATIVE: DiffOptions = DiffOptions {
+        allow_destructive: false,
+        definitions_authoritative: true,
     };
 
     // -- 13.1 structural diff ------------------------------------------------
@@ -3214,6 +3284,120 @@ mod tests {
                 table: "posts".to_owned(),
                 index: idx,
             }]
+        );
+    }
+
+    /// A `definition`-carrying (expression/partial) index that the model DSL can
+    /// never express: an expression index on `lower(email)`.
+    fn expr_index() -> Index {
+        Index {
+            name: "idx_posts_lower_body".to_owned(),
+            columns: vec!["body".to_owned()],
+            unique: false,
+            definition: Some("CREATE INDEX idx_posts_lower_body ON posts (lower(body))".to_owned()),
+        }
+    }
+
+    /// Model diff (`DEFAULT_OPTS`, `definitions_authoritative: false`): a
+    /// baseline-only `definition` index absent from the desired (model) side is
+    /// **retained** — the model DSL cannot express it, so its absence is a parser
+    /// gap, not a removal. NO `DropIndex` is emitted.
+    #[test]
+    fn model_diff_retains_baseline_only_definition_index() {
+        let mut base_table = posts_with(vec![col("body", ColumnType::Text)]);
+        base_table.indexes.push(expr_index());
+        let want = parsed(
+            vec![posts_with(vec![col("body", ColumnType::Text)])],
+            vec![],
+        );
+        let plan = diff_schema(&[base_table], &want, DEFAULT_OPTS);
+        assert!(
+            !plan
+                .changes
+                .iter()
+                .any(|c| matches!(c, SchemaChange::DropIndex { .. })),
+            "model diff must retain (not drop) an unmodellable definition index; got {:?}",
+            plan.changes
+        );
+    }
+
+    /// Retention holds even under `--allow-destructive`: the declarative tool
+    /// never drops a construct it cannot express.
+    #[test]
+    fn model_diff_retains_definition_index_even_with_allow_destructive() {
+        let mut base_table = posts_with(vec![col("body", ColumnType::Text)]);
+        base_table.indexes.push(expr_index());
+        let want = parsed(
+            vec![posts_with(vec![col("body", ColumnType::Text)])],
+            vec![],
+        );
+        let plan = diff_schema(&[base_table], &want, ALLOW);
+        assert!(
+            !plan
+                .changes
+                .iter()
+                .any(|c| matches!(c, SchemaChange::DropIndex { .. })),
+            "--allow-destructive must still retain an unmodellable definition index; got {:?}",
+            plan.changes
+        );
+    }
+
+    /// Model diff: a baseline `definition` index sharing a NAME with a desired
+    /// (model-parsed, `definition: None`) index is **retained** — no
+    /// `DropIndex`/replacement that would clobber the expression/partial index with
+    /// a plain column index.
+    #[test]
+    fn model_diff_retains_definition_index_sharing_name_with_plain_desired() {
+        // Baseline: an expression index named `idx_posts_body`.
+        let base_expr = Index {
+            name: "idx_posts_body".to_owned(),
+            columns: vec!["body".to_owned()],
+            unique: false,
+            definition: Some("CREATE INDEX idx_posts_body ON posts (lower(body))".to_owned()),
+        };
+        let mut base_table = posts_with(vec![col("body", ColumnType::Text)]);
+        base_table.indexes.push(base_expr);
+
+        // Desired (model): a plain column index of the SAME name (definition: None).
+        let mut want_table = posts_with(vec![col("body", ColumnType::Text)]);
+        want_table.indexes.push(Index {
+            name: "idx_posts_body".to_owned(),
+            columns: vec!["body".to_owned()],
+            unique: false,
+            definition: None,
+        });
+        let plan = diff_schema(
+            &[base_table],
+            &parsed(vec![want_table], vec![]),
+            DEFAULT_OPTS,
+        );
+        assert!(
+            plan.changes.is_empty(),
+            "model diff must retain the definition index and emit no drop/replace; got {:?}",
+            plan.changes
+        );
+    }
+
+    /// Introspection diff (`AUTHORITATIVE`, `definitions_authoritative: true`): a
+    /// baseline-only `definition` index absent from the desired side IS a genuine
+    /// drop and MUST emit `DropIndex` — this proves doctor's `database-schema-drift`
+    /// / `pull --dry-run` still catches a dropped expression/partial index.
+    #[test]
+    fn authoritative_diff_drops_baseline_only_definition_index() {
+        let mut base_table = posts_with(vec![col("body", ColumnType::Text)]);
+        base_table.indexes.push(expr_index());
+        let want = parsed(
+            vec![posts_with(vec![col("body", ColumnType::Text)])],
+            vec![],
+        );
+        let plan = diff_schema(&[base_table], &want, AUTHORITATIVE);
+        assert_eq!(
+            plan.changes,
+            vec![SchemaChange::DropIndex {
+                table: "posts".to_owned(),
+                index: expr_index(),
+            }],
+            "authoritative introspection diff must report a dropped definition index as drift"
         );
     }
 

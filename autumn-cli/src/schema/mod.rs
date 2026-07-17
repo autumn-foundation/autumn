@@ -652,7 +652,10 @@ fn diff_at(
     }
 
     // (e) Diff (pure) then guard (policy).
-    let opts = diff::DiffOptions { allow_destructive };
+    let opts = diff::DiffOptions {
+        allow_destructive,
+        ..Default::default()
+    };
     let plan = diff::diff_schema(&baseline.tables, &desired, opts);
     if plan.is_empty() {
         println!("No schema changes — models match the snapshot baseline.");
