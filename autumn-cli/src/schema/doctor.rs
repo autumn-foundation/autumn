@@ -136,13 +136,20 @@ pub fn run_doctor(profile: Option<&str>, json: bool) -> Result<(), String> {
 fn gather_local_facts(project_root: &Path, profile: Option<&str>) -> LocalFacts {
     let cargo_toml_present = project_root.join("Cargo.toml").is_file();
     let autumn_dir_present = project_root.join(".autumn").is_dir();
-    let detected_backend =
-        super::map_detected_backend(crate::generate::detect_backend(project_root));
-    let snapshot = probe_snapshot(project_root, detected_backend);
-    let url_backend = crate::migrate::resolve_primary_url(profile)
+
+    // Resolve the URL once for the requested `--profile`; both the URL-implied
+    // backend (dialect-vs-DB check) and the project/selected backend (provider-
+    // lock + pending-path selection) derive from this SAME profile-resolved
+    // context, so `schema doctor --profile <name>` diagnoses the profile it
+    // claims to (rather than mixing the requested profile's URL with the ambient
+    // profile's detected backend).
+    let url = crate::migrate::resolve_primary_url(profile);
+    let url_backend = url
         .as_deref()
         .and_then(autumn_web::config::DatabaseBackend::detect)
         .map(super::map_detected_backend);
+    let detected_backend = super::backend_for_url(project_root, profile, url.as_deref());
+    let snapshot = probe_snapshot(project_root, detected_backend);
 
     LocalFacts {
         cargo_toml_present,
@@ -584,6 +591,32 @@ mod tests {
         assert!(drift.detail.contains("pending model change"), "{drift:?}");
         // A WARN alone does not fail the command.
         assert!(finish(&checks).is_ok());
+    }
+
+    /// Finding 3 (#2036): the SELECTED profile's backend must flow into the
+    /// checks. When `gather_local_facts` resolves the requested profile's backend
+    /// to Sqlite (from its database URL), a Sqlite-tagged snapshot must NOT trip a
+    /// false `provider-lock` ERROR — even though the ambient project default is
+    /// Postgres (see the contrasting `snapshot_backend_mismatch_is_provider_lock_error`).
+    /// Synthesizes the post-resolution facts directly so the pure check layer is
+    /// exercised without a database.
+    #[test]
+    fn selected_profile_backend_flows_into_provider_lock() {
+        let local = LocalFacts {
+            cargo_toml_present: true,
+            autumn_dir_present: true,
+            snapshot: SnapshotState::Loaded {
+                backend: Backend::Sqlite,
+                drift: DriftState::Clean,
+            },
+            detected_backend: Backend::Sqlite,
+            url_backend: Some(Backend::Sqlite),
+        };
+        let checks = compute_checks(&local, &PendingState::NotConfigured);
+        let lock = checks.iter().find(|c| c.name == "provider-lock").unwrap();
+        assert_eq!(lock.status, Status::Ok, "{lock:?}");
+        // No ERROR overall: the selected Sqlite backend agrees with the snapshot.
+        assert!(finish(&checks).is_ok(), "checks: {checks:?}");
     }
 
     #[test]

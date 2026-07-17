@@ -172,6 +172,31 @@ const fn map_detected_backend(detected: autumn_web::config::DatabaseBackend) -> 
     }
 }
 
+/// Resolve the schema-command backend for an explicit `--profile`, from the
+/// already profile-resolved primary database `url`.
+///
+/// When a URL is configured its scheme is authoritative
+/// ([`DatabaseBackend::detect`](autumn_web::config::DatabaseBackend::detect)),
+/// so `--profile <name>` selects the apply path / provider-lock of the database
+/// it actually acts against; only when no URL is configured does it fall back to
+/// the profile-aware project default
+/// ([`crate::generate::detect_backend_for_profile`]). Shared by `schema migrate`
+/// and `schema doctor` so the two commands can never derive the backend
+/// inconsistently for the same profile. With `profile == None` the resolution is
+/// unchanged from the ambient behavior.
+fn backend_for_url(project_root: &Path, profile: Option<&str>, url: Option<&str>) -> Backend {
+    url.and_then(autumn_web::config::DatabaseBackend::detect)
+        .map_or_else(
+            || {
+                map_detected_backend(crate::generate::detect_backend_for_profile(
+                    project_root,
+                    profile,
+                ))
+            },
+            map_detected_backend,
+        )
+}
+
 /// Resolve the default models source when `--from` is omitted: the app's
 /// `src/models` directory if it exists, else the single-file `src/models.rs`
 /// layout, else a clear error telling the user to pass `--from`. Autumn supports
@@ -1000,6 +1025,29 @@ mod tests {
             ])
             .is_ok()
         );
+    }
+
+    /// Findings 2 & 3 (#2036): the schema-command backend derives from the
+    /// profile-resolved URL when one is configured (its scheme is authoritative),
+    /// and only falls back to the project default when no URL is present — so
+    /// `--profile <name>` picks the apply path / provider-lock of the database it
+    /// acts against, not the ambient project default.
+    #[test]
+    fn backend_for_url_prefers_url_scheme_over_project_default() {
+        // A tempdir with no config → the project default is Postgres.
+        let root = tempfile::tempdir().expect("tempdir");
+        // A configured SQLite URL is authoritative regardless of that default.
+        assert_eq!(
+            backend_for_url(root.path(), None, Some("sqlite://app.db")),
+            Backend::Sqlite
+        );
+        // A configured Postgres URL likewise.
+        assert_eq!(
+            backend_for_url(root.path(), None, Some("postgres://u@h/db")),
+            Backend::Postgres
+        );
+        // No URL → falls back to the profile-aware project default (Postgres here).
+        assert_eq!(backend_for_url(root.path(), None, None), Backend::Postgres);
     }
 
     #[test]

@@ -116,17 +116,60 @@ fn schema_migrate_applies_to_a_sqlite_file_and_refreshes_snapshot() {
     );
 
     // The SQLite database file exists and the snapshot advanced to Sqlite-tagged
-    // `posts`.
+    // `posts` (this is the FIRST, real apply — the refresh is anchored here).
     assert!(db_path.is_file(), "sqlite db file created");
-    let snap =
-        std::fs::read_to_string(project.join(".autumn/schema-snapshot.json")).expect("snapshot");
-    assert!(snap.contains("\"backend\": \"Sqlite\""), "snapshot: {snap}");
-    assert!(snap.contains("\"name\": \"posts\""), "snapshot: {snap}");
+    let snapshot_path = project.join(".autumn/schema-snapshot.json");
+    let snap_after_apply = std::fs::read_to_string(&snapshot_path).expect("snapshot");
+    assert!(
+        snap_after_apply.contains("\"backend\": \"Sqlite\""),
+        "snapshot: {snap_after_apply}"
+    );
+    assert!(
+        snap_after_apply.contains("\"name\": \"posts\""),
+        "snapshot: {snap_after_apply}"
+    );
 
-    // 4. A second migrate is a clean no-op.
+    // Finding 1 (#2036): introduce a NEW, ungenerated model change (add `body`)
+    // WITHOUT generating/applying a migration for it. The next `schema migrate`
+    // has nothing pending to apply, so it is a no-op — and MUST leave the
+    // snapshot untouched. If it re-snapshotted from the edited models, the new
+    // column would be silently baked into the baseline and never diff as drift.
+    std::fs::write(
+        project.join("src/models.rs"),
+        "#[autumn_web::model(managed)]\npub struct Post {\n    #[id]\n    pub id: i64,\n    pub title: String,\n    pub body: Option<String>,\n}\n",
+    )
+    .expect("edit models.rs with ungenerated drift");
+
+    // 4. A second migrate is a clean no-op — it does NOT report a snapshot
+    //    refresh and does NOT advance the on-disk snapshot.
     let (rerun_out, _) = run_autumn_ok(&project, &["schema", "migrate"], &envs);
     assert!(
         rerun_out.contains("Database already up to date."),
         "second migrate: {rerun_out}"
+    );
+    assert!(
+        !rerun_out.contains("refreshed schema snapshot"),
+        "a no-op migrate must NOT refresh the snapshot: {rerun_out}"
+    );
+    let snap_after_noop = std::fs::read_to_string(&snapshot_path).expect("snapshot");
+    assert_eq!(
+        snap_after_apply, snap_after_noop,
+        "a no-op migrate must leave the snapshot byte-for-byte unchanged"
+    );
+    assert!(
+        !snap_after_noop.contains("body"),
+        "the ungenerated `body` edit must NOT be baked into the baseline: {snap_after_noop}"
+    );
+
+    // 5. Because the snapshot never advanced, the ungenerated edit is still
+    //    visible as drift: `schema diff` still generates the pending column add.
+    let (diff_after, _) = run_autumn_ok(&project, &["schema", "diff"], &envs);
+    assert!(
+        !diff_after.contains("No schema changes"),
+        "drift must still be detected after the no-op migrate: {diff_after}"
+    );
+    assert!(
+        diff_after.contains("body"),
+        "the pending `body` column add still diffs: {diff_after}"
     );
 }

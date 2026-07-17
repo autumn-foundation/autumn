@@ -319,7 +319,26 @@ pub fn read_or_empty(path: &Path) -> String {
 /// `SQLite` (AC #4).
 #[must_use]
 pub fn detect_backend(project_root: &Path) -> autumn_web::config::DatabaseBackend {
-    let effective = crate::migrate::effective_profile(None);
+    detect_backend_for_profile(project_root, None)
+}
+
+/// Profile-aware variant of [`detect_backend`]: resolves the project's database
+/// backend for an explicit `--profile` (else the ambient profile resolution when
+/// `profile` is `None`).
+///
+/// Schema commands that honor an explicit `--profile` (`schema migrate`,
+/// `schema doctor`) must detect the backend of the SAME profile whose database
+/// URL they act against — otherwise a project whose default backend differs from
+/// the selected profile's would pick the wrong apply path / provider-lock. This
+/// resolves the effective profile through [`crate::migrate::effective_profile`]
+/// (so `profile == None` reproduces [`detect_backend`] byte-for-byte) and reuses
+/// the same profile-aware config/`.env` resolution as [`detect_backend_with`].
+#[must_use]
+pub fn detect_backend_for_profile(
+    project_root: &Path,
+    profile: Option<&str>,
+) -> autumn_web::config::DatabaseBackend {
+    let effective = crate::migrate::effective_profile(profile);
     detect_backend_with(project_root, Some(&effective), |k| std::env::var(k))
 }
 

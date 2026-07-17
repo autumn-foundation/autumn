@@ -63,12 +63,22 @@ fn migrate_at(project_root: &Path, profile: Option<&str>) -> Result<(), String> 
     crate::generate::ensure_project_root(project_root)
         .map_err(|_| crate::generate::GenerateError::NotInProject.to_string())?;
 
-    // Detected backend drives both the provider-lock check and which apply path
-    // runs. Reuses the same detection the generator and `autumn schema diff` use.
-    let backend = super::map_detected_backend(crate::generate::detect_backend(project_root));
+    // Resolve the write/primary database URL exactly as `autumn migrate` does,
+    // honoring an explicit `--profile`.
+    let url = crate::migrate::resolve_primary_url(profile);
+
+    // The migration backend is derived from the SAME profile-resolved context as
+    // the URL: when a URL is configured its scheme is authoritative, so
+    // `--profile <name>` selects the correct apply path / provider-lock even when
+    // the project's ambient/default backend differs from the selected profile's
+    // (using the ambient `detect_backend` here would pick the wrong apply impl).
+    // With no URL configured we fall back to the profile-aware project default.
+    // This backend also tags the refreshed snapshot below. With `profile == None`
+    // the resolution is byte-identical to the previous ambient detection.
+    let backend = super::backend_for_url(project_root, profile, url.as_deref());
 
     // PROVIDER-LOCK: if a snapshot exists, its dialect tag must match the
-    // detected backend before we apply anything cross-dialect. A missing
+    // resolved backend before we apply anything cross-dialect. A missing
     // snapshot is not fatal here (the DB may be pre-snapshot), but we note it.
     let snapshot_path = project_root.join(SNAPSHOT_DEFAULT_PATH);
     if !enforce_provider_lock(&snapshot_path, backend)? {
@@ -79,8 +89,8 @@ fn migrate_at(project_root: &Path, profile: Option<&str>) -> Result<(), String> 
         );
     }
 
-    // Resolve the write/primary database URL exactly as `autumn migrate` does.
-    let url = crate::migrate::resolve_primary_url(profile).ok_or_else(|| {
+    // Require the URL now that the provider-lock has been checked.
+    let url = url.ok_or_else(|| {
         "no database URL configured — set AUTUMN_DATABASE__URL or DATABASE_URL, or add a \
          [database] primary_url to autumn.toml"
             .to_string()
@@ -98,16 +108,33 @@ fn migrate_at(project_root: &Path, profile: Option<&str>) -> Result<(), String> 
     let result = apply_pending(backend, &url, &migrations_dir)?;
     report_applied(&result);
 
-    // SNAPSHOT REFRESH: the declarative snapshot is the diff baseline. After a
-    // successful apply the database matches the desired models, so the snapshot
-    // advances to that state — we re-parse the models and rewrite the snapshot
-    // (atomically). Only done when a declarative models source exists; if none
-    // is present the migrations still applied, there is just nothing to snapshot.
-    // A snapshot-write failure AFTER a successful DB apply is a warning, not an
-    // apply failure — the migration really did apply.
-    refresh_snapshot_after_apply(project_root, backend);
+    // SNAPSHOT REFRESH: the declarative snapshot is the diff baseline. It advances
+    // ONLY when migrations were actually applied (`should_refresh_snapshot`) — a
+    // real apply means the database moved to a new state, so the baseline follows
+    // it to that state (re-parse the models, rewrite the snapshot atomically,
+    // dialect-tagged). When nothing was applied (the DB was already up to date)
+    // there is no new state to advance to, so the snapshot is left UNTOUCHED —
+    // rewriting it from the (possibly newly-edited, still-ungenerated) models
+    // would falsely bake those edits into the baseline and hide the drift from
+    // the next `schema diff` / `doctor`. A snapshot-write failure AFTER a
+    // successful apply is a warning, not an apply failure — the migration really
+    // did apply.
+    if should_refresh_snapshot(&result) {
+        refresh_snapshot_after_apply(project_root, backend);
+    }
 
     Ok(())
+}
+
+/// Whether a completed apply should advance the checked-in snapshot baseline.
+///
+/// The invariant: the snapshot tracks the APPLIED database state, so it advances
+/// **iff** migrations were actually applied. An empty `applied` list means the DB
+/// was already up to date — there is no new applied state to snapshot, so the
+/// baseline must stay put (otherwise ungenerated model edits would be silently
+/// baked into it and never surface as drift). Pure so the decision is testable.
+const fn should_refresh_snapshot(result: &MigrationResult) -> bool {
+    !result.applied.is_empty()
 }
 
 /// Enforce the provider-lock guard against an on-disk snapshot.
@@ -264,6 +291,21 @@ mod tests {
         // A real migration subdir flips it to non-empty.
         std::fs::create_dir_all(migrations.join("20260101000000_init")).expect("mkdir");
         assert!(!migrations_dir_is_empty(&migrations));
+    }
+
+    #[test]
+    fn should_refresh_snapshot_only_when_something_was_applied() {
+        // A real apply (non-empty `applied`) advances the baseline.
+        let applied = MigrationResult {
+            applied: vec!["20260101000000_init".to_string()],
+        };
+        assert!(should_refresh_snapshot(&applied));
+        // A no-op apply (DB already up to date) must NOT advance it — otherwise
+        // ungenerated model edits would be silently baked into the baseline.
+        let noop = MigrationResult {
+            applied: Vec::new(),
+        };
+        assert!(!should_refresh_snapshot(&noop));
     }
 
     #[test]
