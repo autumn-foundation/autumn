@@ -3254,6 +3254,13 @@ fn emit_state_machine_on_conn(
     }
 }
 
+/// Strip a leading raw-identifier (`r#`) prefix from a state name, mirroring
+/// `lifecycle::variant_name_str` so effect-edge state strings align with the
+/// enum's already-stripped `STATE_MACHINE_TRANSITIONS` entries.
+fn strip_raw(s: &str) -> &str {
+    s.strip_prefix("r#").unwrap_or(s)
+}
+
 /// Emit the state-machine items for a `lifecycle = <Enum>` reference (#1911).
 ///
 /// The transitions constant is an alias of the referenced enum's
@@ -3291,6 +3298,27 @@ fn emit_state_machine_lifecycle(
         transition_fn,
         field_str,
     } = state_machine_names(field);
+
+    // Normalize each effect edge's `from`/`to` by stripping a leading raw-
+    // identifier prefix (issue #1973 / Codex P2 on #2027). The `#[lifecycle]`
+    // macro stores variant names in `STATE_MACHINE_TRANSITIONS` with `r#`
+    // already stripped (see `lifecycle::variant_name_str`), but the effect
+    // edges parsed at the binding site preserve it (e.g. `Draft -> r#type`).
+    // Without this alignment the const assertion below would check `"r#type"`
+    // against a table containing `"type"` (falsely rejecting a real edge) and
+    // the generated match arm would never fire (silently dropping the effect).
+    // Guard/on_commit/on are carried through unchanged.
+    let normalized_effects: Vec<StateMachineTransition> = effects
+        .iter()
+        .map(|t| StateMachineTransition {
+            from: strip_raw(&t.from).to_owned(),
+            to: strip_raw(&t.to).to_owned(),
+            guard: t.guard.clone(),
+            on_commit: t.on_commit.clone(),
+            on: t.on.clone(),
+        })
+        .collect();
+    let effects = &normalized_effects;
 
     // Per-edge effect method (issue #1973): only emitted when the binding site
     // declares one or more `effects(...)` edges. Empty `effects` returns an
@@ -9084,6 +9112,49 @@ mod tests {
         assert!(
             !generated.contains("__transition_edge_declared"),
             "a no-effects lifecycle model must emit no edge validation: {generated}"
+        );
+    }
+
+    #[test]
+    fn state_machine_lifecycle_effects_normalize_raw_identifier_edges() {
+        // Codex P2 on #2027: a lifecycle effect edge naming a raw-identifier
+        // variant (e.g. `ready -> r#type`) must be normalized to the enum's
+        // already-stripped `STATE_MACHINE_TRANSITIONS` entry (`"type"`) — the
+        // `#[lifecycle]` macro strips `r#` when building that table, but the
+        // effect edge parsed here preserves it. Both the compile-time edge
+        // assertion and the runtime effect match arm must use the stripped name
+        // so a real edge is not falsely rejected and the effect is not silently
+        // dropped.
+        let output = model_macro(
+            TokenStream::new(),
+            quote! {
+                pub struct Order {
+                    #[id]
+                    pub id: i64,
+                    #[state_machine(lifecycle = OrderState, effects(
+                        ready -> r#type: on_commit = SendTypedJob,
+                    ))]
+                    pub status: String,
+                }
+            },
+        );
+        let generated = output.to_string();
+        // The stripped name is what the enum table stores and what the codegen
+        // (const assertion, match arm, idempotency key) must emit.
+        assert!(
+            generated.contains("\"type\""),
+            "normalized effect edge must use the stripped `type` state: {generated}"
+        );
+        // The raw-identifier form must never survive into an assertion / match
+        // literal — that is exactly the mismatch the bug produced.
+        assert!(
+            !generated.contains("\"r#type\""),
+            "the raw `r#type` form must be stripped before codegen: {generated}"
+        );
+        // The per-edge validation is still emitted (now against the aligned name).
+        assert!(
+            generated.contains("__transition_edge_declared"),
+            "the normalized edge must still be validated at compile time: {generated}"
         );
     }
 
