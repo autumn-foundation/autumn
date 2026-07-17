@@ -73,7 +73,24 @@ Prefer a manual download? Grab the tarball plus its `.sha256`:
 - Latest: `https://github.com/madmax983/autumn/releases/latest/download/autumn-<target>.tar.gz`
 - Pinned: `https://github.com/madmax983/autumn/releases/download/<tag>/autumn-<target>.tar.gz`
 
-where `<target>` is one of `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`, `x86_64-apple-darwin`, or `aarch64-apple-darwin` (Linux binaries are static musl — no glibc version dependency). Binaries track tagged crate releases (e.g. `v0.6.0`); `latest` is the most recent released version — there are no rolling trunk-dev builds. Windows is a documented follow-up (see #2005); build from source there for now.
+where `<target>` is one of `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`, `x86_64-apple-darwin`, or `aarch64-apple-darwin` (Linux binaries are static musl — no glibc version dependency). Binaries track tagged crate releases (e.g. `v0.6.0`); `latest` is the most recent released version — there are no rolling trunk-dev builds.
+
+### Install a prebuilt binary (Windows)
+
+Windows ships a native `x86_64-pc-windows-msvc` build as a `.zip` (not a tarball). The POSIX `install.sh` above does not run on Windows; use the PowerShell installer instead:
+
+```powershell
+irm https://raw.githubusercontent.com/madmax983/autumn/trunk-dev/scripts/install.ps1 | iex
+```
+
+It downloads `autumn-x86_64-pc-windows-msvc.zip`, verifies its sha256 (`Get-FileHash`), extracts `autumn.exe` to `%LOCALAPPDATA%\autumn\bin`, and prints the line to add if that directory isn't on your `PATH`. Override the install dir with `-Dir`, or pin a version with `-Version vX.Y.Z`.
+
+Prefer a manual download? Grab the zip plus its `.sha256`:
+
+- Latest: `https://github.com/madmax983/autumn/releases/latest/download/autumn-x86_64-pc-windows-msvc.zip`
+- Pinned: `https://github.com/madmax983/autumn/releases/download/<tag>/autumn-x86_64-pc-windows-msvc.zip`
+
+Verify with `Get-FileHash autumn-x86_64-pc-windows-msvc.zip -Algorithm SHA256` and compare against the `.sha256` file, then extract `autumn.exe` and put it on your `PATH`.
 
 Prefer building from source? `cargo install --path autumn-cli` still works.
 
