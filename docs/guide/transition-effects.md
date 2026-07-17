@@ -78,7 +78,7 @@ Every `on_commit` effect carries a dedup key derived automatically from the edge
 {model}:{field}:{record_id}:{from_state}:{to_state}
 ```
 
-Declaring the job `#[job(unique, unique_by = "idempotency_key")]` (as above) collapses a retried or duplicated enqueue to a single run, so the same order can never send two "shipped" emails even if the transition is replayed.
+Declaring the job `#[job(unique, unique_by = "idempotency_key")]` (as above) collapses a *concurrent or retried* enqueue of the same edge to a single run **while that job is still pending or running** — the default `unique_window = "running"`. The uniqueness key is released once the job settles (success or terminal failure), so a *later* replay of the same edge (e.g. after restoring and replaying state) is accepted and can enqueue again. To dedup beyond the pending/running window — coalescing bursts even after the original completed — set a time-based window with `#[job(unique, unique_by = "idempotency_key", unique_for_ms = <ms>)]`, which holds the key for `<ms>` from enqueue time regardless of completion. (`unique_window` itself only accepts `"pending"` or `"running"`; `unique_for_ms` is mutually exclusive with it.)
 
 ---
 
