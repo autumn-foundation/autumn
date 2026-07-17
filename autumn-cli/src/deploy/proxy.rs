@@ -131,6 +131,18 @@ impl KamalProxyController {
         // health-check path carrying query params / special chars can't break out
         // of the command. The numeric timeouts need no quoting.
         //
+        // Control-socket fidelity (issue #1948 item 4): kamal-proxy resolves its
+        // control socket at `$XDG_RUNTIME_DIR/kamal-proxy.sock`, falling back to
+        // `/tmp/kamal-proxy.sock` when unset. The supervised `kamal-proxy run`
+        // systemd SERVICE has no `XDG_RUNTIME_DIR` (-> `/tmp`), but the ssh
+        // session this command runs in gets `XDG_RUNTIME_DIR=/run/user/0` from
+        // pam_systemd on a real host — a DIFFERENT path — so a naive invocation
+        // fails with "connect: no such file or directory". Prefixing with
+        // `env -u XDG_RUNTIME_DIR` pins the CLI to the same `/tmp` fallback the
+        // service used, so both agree regardless of pam_systemd — no need to
+        // disable pam_systemd on the host (the container e2e fixture used to work
+        // around this by disabling it; the real-VPS shape does not).
+        //
         // TLS (opt-in): `--host <host> --tls` sits in a STABLE position between
         // the health-check path and the timeouts. When `tls_host` is `None` the
         // segment is empty and the command is byte-for-byte the HTTP-only form.
@@ -138,7 +150,7 @@ impl KamalProxyController {
             format!("--host {host} --tls ", host = shell_quote(host))
         });
         format!(
-            "kamal-proxy deploy {service} --target {target} \
+            "env -u XDG_RUNTIME_DIR kamal-proxy deploy {service} --target {target} \
              --health-check-path {path} {tls}--deploy-timeout {deploy}s --drain-timeout {drain}s",
             service = shell_quote(service),
             target = shell_quote(target),
@@ -238,7 +250,7 @@ mod tests {
         // candidate's /ready and the deploy timeout is the readiness window.
         assert_eq!(
             cmd.shell,
-            "kamal-proxy deploy 'myapp' --target '127.0.0.1:3002' \
+            "env -u XDG_RUNTIME_DIR kamal-proxy deploy 'myapp' --target '127.0.0.1:3002' \
              --health-check-path '/ready' --deploy-timeout 60s --drain-timeout 30s",
         );
     }
@@ -277,7 +289,7 @@ mod tests {
         };
         assert_eq!(
             flip.shell,
-            "kamal-proxy deploy 'myapp' --target '127.0.0.1:3002' \
+            "env -u XDG_RUNTIME_DIR kamal-proxy deploy 'myapp' --target '127.0.0.1:3002' \
              --health-check-path '/ready' --host 'app.example.com' --tls \
              --deploy-timeout 60s --drain-timeout 30s",
         );

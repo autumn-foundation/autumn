@@ -382,6 +382,46 @@ or error messages.
   a subsequent `autumn deploy up` or `autumn deploy rollback` is the intended
   recovery.
 
+### How the deploy path is validated in CI
+
+Two layers exercise the real `autumn deploy` lifecycle over real ssh/scp +
+systemd + kamal-proxy — nothing is mocked:
+
+- **Container e2e (every CI run):** `autumn-cli/tests/deploy_e2e.rs` drives first
+  deploy, zero-downtime redeploy, on-demand rollback, and forced-failure
+  auto-rollback against a privileged systemd+sshd container. A container cannot
+  power-cycle, prep a stock host from scratch, or reproduce a real
+  pam_systemd session, so those are deferred to the real-VPS job below.
+- **Real-VPS validation (opt-in):** the
+  [`Deploy real-VPS validation`](../../.github/workflows/deploy-real-vps.yml)
+  GitHub Actions workflow provisions a throwaway Hetzner Cloud VM from a **stock
+  Ubuntu image** and runs the same lifecycle assertions plus the four
+  VM-only checks: a **real kernel reboot** (app + kamal-proxy come back serving),
+  **bare-host prep from scratch**, the **`<15 min` onboarding wall-clock metric**,
+  and **kamal-proxy control-socket fidelity under real pam_systemd**
+  (`XDG_RUNTIME_DIR=/run/user/0`). It is **manually triggered
+  (`workflow_dispatch`) or nightly only** — it **never** runs on pull requests or
+  pushes, because it costs a real VM and must never block or bill routine CI. It
+  always destroys the VM on exit (even on failure), so nothing lingers.
+
+  The only credential it needs is `HCLOUD_TOKEN`. The workflow reads it from the
+  environment (supply it however you configure Actions env — e.g. a repository
+  secret under Settings → Secrets and variables → Actions); the job's first step
+  fails with a clear message if it is unset, and no credential is ever hardcoded:
+
+  | Env var | What it is |
+  |---|---|
+  | `HCLOUD_TOKEN` | A Hetzner Cloud API token (Read & Write) from the Hetzner console → project → Security → API Tokens. Used to provision and destroy the throwaway VM. **Required.** |
+  | `AUTUMN_DEPLOY_SIGNING_SECRET` | Optional. The app signing secret (`AUTUMN_SECURITY__SIGNING_SECRET`, 64 hex chars) so the deployed app passes production preflight. Taken from the environment when provided; otherwise a throwaway secret is generated per run — the VM is destroyed on exit, so it never needs a persistent value. |
+
+  The lifecycle is a self-contained shell script
+  (`scripts/deploy-real-vps-validate.sh`) that mirrors the container
+  harness's curl/ssh assertions while driving the real `autumn` binary; the
+  Hetzner-specific provisioning is isolated in the workflow so another provider
+  can be swapped in without touching the script. The in-container half of the
+  pam_systemd socket check is also available on demand via
+  `cargo test -p autumn-cli --features deploy-e2e-pam --test deploy_e2e -- --ignored`.
+
 ---
 
 ## Step 1 — Create the project

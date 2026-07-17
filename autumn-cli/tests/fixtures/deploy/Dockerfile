@@ -36,20 +36,36 @@ RUN chmod 600 /root/.ssh/authorized_keys
 COPY kamal-proxy /usr/local/bin/kamal-proxy
 RUN chmod 755 /usr/local/bin/kamal-proxy
 
-# Keep the `kamal-proxy` control-socket path consistent between the supervised
+# kamal-proxy control-socket path fidelity between the supervised
 # `kamal-proxy run` systemd service and the `kamal-proxy deploy` commands the
 # deploy issues over ssh. kamal-proxy places its control socket at
 # `$XDG_RUNTIME_DIR/kamal-proxy.sock`, falling back to `/tmp/kamal-proxy.sock`
 # when unset. The systemd service has no `XDG_RUNTIME_DIR` (-> `/tmp`), but an ssh
 # login session gets `XDG_RUNTIME_DIR=/run/user/0` from pam_systemd (-> a
-# different path), so `deploy` would fail to reach the running proxy with
-# "connect: no such file or directory". Disabling pam_systemd for logins leaves
-# `XDG_RUNTIME_DIR` unset in ssh sessions too, so both sides agree on
-# `/tmp/kamal-proxy.sock`. (In a normal Kamal deployment kamal-proxy runs as a
-# container and the CLI shares its namespace, so this only bites the
+# different path), so a NAIVE deploy would fail to reach the running proxy with
+# "connect: no such file or directory". (In a normal Kamal deployment kamal-proxy
+# runs as a container and the CLI shares its namespace, so this only bites the
 # systemd-over-ssh shape exercised by this fixture.)
-RUN sed -i 's/^session[[:space:]].*pam_systemd\.so/# &/' \
-        /etc/pam.d/common-session /etc/pam.d/common-session-noninteractive || true
+#
+# `ENABLE_PAM_SYSTEMD` (build arg, issue #1948 item 4) selects which shape the
+# fixture reproduces:
+#   * `0` (default) — DISABLE pam_systemd for logins, so ssh sessions inherit no
+#     `XDG_RUNTIME_DIR` and both sides fall back to `/tmp/kamal-proxy.sock`. This
+#     is the historical workaround the container harness used to sidestep the
+#     mismatch.
+#   * `1` — LEAVE pam_systemd ENABLED, so ssh sessions get
+#     `XDG_RUNTIME_DIR=/run/user/0` exactly like a real host. This is the honest
+#     regression shape: it proves `autumn deploy` reaches the control socket
+#     WITHOUT the fixture papering over the mismatch (the product now pins the
+#     kamal-proxy CLI to the service's socket by unsetting `XDG_RUNTIME_DIR` on
+#     the `kamal-proxy deploy` invocations — see `KamalProxyController`).
+ARG ENABLE_PAM_SYSTEMD=0
+RUN if [ "$ENABLE_PAM_SYSTEMD" != "1" ]; then \
+        sed -i 's/^session[[:space:]].*pam_systemd\.so/# &/' \
+            /etc/pam.d/common-session /etc/pam.d/common-session-noninteractive || true; \
+    else \
+        echo "pam_systemd left ENABLED (real-host XDG_RUNTIME_DIR fidelity, issue #1948 item 4)"; \
+    fi
 
 # Start sshd on boot (systemd is PID 1 in this image).
 RUN systemctl enable ssh

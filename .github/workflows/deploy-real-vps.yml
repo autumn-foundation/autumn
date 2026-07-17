@@ -1,0 +1,154 @@
+# Real-VPS deploy validation (issue #1948, AC-7 follow-up).
+#
+# OPT-IN ONLY. This workflow provisions a throwaway cloud VM and runs the REAL
+# `autumn deploy` lifecycle against it to cover the four things the container e2e
+# harness (autumn-cli/tests/deploy_e2e.rs) structurally cannot: a real kernel
+# reboot, bare-host prep from a STOCK image, the onboarding wall-clock metric,
+# and real pam_systemd / XDG_RUNTIME_DIR control-socket fidelity.
+#
+# It NEVER runs on `pull_request` or `push`: it costs money (a real VM) and must
+# never block or bill routine CI. It runs only when a maintainer triggers it
+# (`workflow_dispatch`) or on the off-peak nightly schedule.
+#
+# Provider: Hetzner Cloud (cheapest throwaway VMs; single `hcloud` CLI + one
+# `HCLOUD_TOKEN` secret). The provider-specific steps are grouped so another
+# provider can be swapped in without touching the lifecycle script.
+name: Deploy real-VPS validation
+
+on:
+  workflow_dispatch:
+    inputs:
+      ubuntu_image:
+        description: "Stock Ubuntu image to provision (no pre-baked deploy tooling)"
+        type: string
+        default: "ubuntu-24.04"
+      server_type:
+        description: "Hetzner server type"
+        type: string
+        default: "cx22"
+      location:
+        description: "Hetzner location"
+        type: string
+        default: "nbg1"
+      kamal_proxy_version:
+        description: "kamal-proxy image tag to install during host bootstrap"
+        type: string
+        default: "latest"
+  schedule:
+    # 04:17 UTC nightly — off-peak, jittered minute to avoid the top-of-hour herd.
+    - cron: "17 4 * * *"
+
+# Never run two provisioning jobs at once (they share a per-run ssh-key name
+# derived from the run id, but overlapping runs would still race on quota/cost).
+concurrency:
+  group: deploy-real-vps
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  real-vps:
+    name: Real-VPS deploy lifecycle
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      APP_NAME: rvpsapp
+      PUBLIC_PORT: "80"
+      SSH_USER: root
+      # 15-minute onboarding success budget (issue AC-1 metric).
+      ONBOARD_BUDGET_SECS: "900"
+      # Per-run names so parallel/aborted runs never collide or leak.
+      HCLOUD_SERVER_NAME: autumn-rvps-${{ github.run_id }}-${{ github.run_attempt }}
+      HCLOUD_SSH_KEY_NAME: autumn-rvps-key-${{ github.run_id }}-${{ github.run_attempt }}
+      # Credentials are consumed from the environment (job-level indirection), not
+      # re-referenced per step. HCLOUD_TOKEN is the ONLY required one; the signing
+      # secret is optional — a later step generates one per run when it is unset.
+      HCLOUD_TOKEN: ${{ secrets.HCLOUD_TOKEN }}
+      AUTUMN_DEPLOY_SIGNING_SECRET: ${{ secrets.AUTUMN_DEPLOY_SIGNING_SECRET }}
+    steps:
+      # ── Constraint 1: fail CLEARLY and early when the ONE required credential
+      # is absent. The workflow reads `HCLOUD_TOKEN` from the environment (a repo
+      # secret, or however you configure Actions env) — nothing is hardcoded. The
+      # app signing secret is intentionally NOT required here: it is read from the
+      # environment when provided and otherwise generated per run (see below). ──
+      - name: Check required credential is present
+        run: |
+          if [ -z "${HCLOUD_TOKEN}" ]; then
+            echo "::error::Real-VPS validation reads HCLOUD_TOKEN from the environment, but it is not set."
+            printf 'Supply HCLOUD_TOKEN (Hetzner Cloud API token, Read & Write; from https://console.hetzner.cloud → project → Security → API Tokens) — e.g. as a repository secret (Settings → Secrets and variables → Actions) — then re-run.\n'
+            exit 1
+          fi
+          echo "HCLOUD_TOKEN is present."
+
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.7.8
+
+      - name: Build the autumn CLI (release)
+        run: cargo build --locked -p autumn-cli --release --bin autumn
+
+      - name: Install hcloud CLI
+        run: |
+          ver="1.49.1"
+          curl -fsSL "https://github.com/hetznercloud/cli/releases/download/v${ver}/hcloud-linux-amd64.tar.gz" \
+            | sudo tar -xz -C /usr/local/bin hcloud
+          hcloud version
+
+      - name: Generate ephemeral SSH keypair
+        run: |
+          ssh-keygen -t ed25519 -N "" -q -f "${RUNNER_TEMP}/rvps_key"
+          echo "SSH_KEY=${RUNNER_TEMP}/rvps_key" >> "${GITHUB_ENV}"
+
+      # ── Provider-specific provisioning (Hetzner Cloud). Swap this block for a
+      # different provider without touching the lifecycle script below. ────────
+      - name: Provision throwaway VM (Hetzner Cloud)
+        id: provision
+        run: |
+          set -euo pipefail
+          hcloud ssh-key create --name "${HCLOUD_SSH_KEY_NAME}" --public-key-from-file "${SSH_KEY}.pub"
+          hcloud server create \
+            --name "${HCLOUD_SERVER_NAME}" \
+            --type "${{ inputs.server_type || 'cx22' }}" \
+            --image "${{ inputs.ubuntu_image || 'ubuntu-24.04' }}" \
+            --location "${{ inputs.location || 'nbg1' }}" \
+            --ssh-key "${HCLOUD_SSH_KEY_NAME}"
+          ip="$(hcloud server ip "${HCLOUD_SERVER_NAME}")"
+          echo "Provisioned ${HCLOUD_SERVER_NAME} at ${ip}"
+          echo "TARGET_HOST=${ip}" >> "${GITHUB_ENV}"
+
+      # The app signing secret is env-provided WHEN PRESENT, per-run GENERATED
+      # when absent (a throwaway VM never needs a persistent secret). Either way
+      # the effective value is masked so it never prints, then exported as
+      # SIGNING_SECRET for the lifecycle script.
+      - name: Resolve app signing secret (env-provided or generated per run)
+        run: |
+          set -euo pipefail
+          if [ -n "${AUTUMN_DEPLOY_SIGNING_SECRET}" ]; then
+            secret="${AUTUMN_DEPLOY_SIGNING_SECRET}"
+            echo "Using AUTUMN_DEPLOY_SIGNING_SECRET from the environment."
+          else
+            secret="$(openssl rand -hex 32)"
+            echo "AUTUMN_DEPLOY_SIGNING_SECRET not set — generated a per-run signing secret."
+          fi
+          echo "::add-mask::${secret}"
+          echo "SIGNING_SECRET=${secret}" >> "${GITHUB_ENV}"
+
+      - name: Run real-VPS deploy lifecycle assertions
+        env:
+          AUTUMN_BIN: ${{ github.workspace }}/target/release/autumn
+          SSH_PORT: "22"
+          KAMAL_PROXY_VERSION: ${{ inputs.kamal_proxy_version || 'latest' }}
+        run: |
+          chmod +x scripts/deploy-real-vps-validate.sh
+          ./scripts/deploy-real-vps-validate.sh
+
+      # ── Always-cleanup: destroy the VM and deregister the ephemeral key even if
+      # any step above failed (idempotent — safe if provisioning never ran). No
+      # lingering/billing VM is ever left behind. ──────────────────────────────
+      - name: Destroy VM and deregister SSH key
+        if: always()
+        run: |
+          hcloud server delete "${HCLOUD_SERVER_NAME}" || echo "server already gone / never created"
+          hcloud ssh-key delete "${HCLOUD_SSH_KEY_NAME}" || echo "ssh-key already gone / never created"

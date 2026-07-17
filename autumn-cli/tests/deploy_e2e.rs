@@ -276,10 +276,17 @@ fn extract_kamal_proxy(dest: &Path) {
     );
 }
 
-/// Build the fixture image into a unique tag, writing the Dockerfile, the
-/// generated `authorized_keys`, and the extracted kamal-proxy into a fresh build
-/// context. Returns the image tag.
-fn build_fixture_image(ctx: &Path, pubkey: &str) -> String {
+/// Build the fixture image, writing the Dockerfile, the generated
+/// `authorized_keys`, and the extracted kamal-proxy into a fresh build context.
+/// Returns the image tag.
+///
+/// `enable_pam` selects the `ENABLE_PAM_SYSTEMD` build arg (issue #1948 item 4):
+/// `false` (default fixture shape) disables `pam_systemd` so ssh sessions inherit
+/// no `XDG_RUNTIME_DIR`; `true` leaves `pam_systemd` ENABLED so ssh sessions get
+/// `XDG_RUNTIME_DIR=/run/user/0` exactly like a real host — the honest
+/// control-socket regression shape. The two shapes get DISTINCT stable tags so
+/// they never clobber each other's cache.
+fn build_fixture_image(ctx: &Path, pubkey: &str, enable_pam: bool) -> String {
     std::fs::write(
         ctx.join("Dockerfile"),
         include_str!("fixtures/deploy/Dockerfile"),
@@ -288,13 +295,24 @@ fn build_fixture_image(ctx: &Path, pubkey: &str) -> String {
     std::fs::write(ctx.join("authorized_keys"), pubkey).expect("write authorized_keys");
     extract_kamal_proxy(&ctx.join("kamal-proxy"));
 
-    // A STABLE tag (rather than a unique one) so at most one fixture image ever
-    // exists: each run overwrites it and reuses the cached apt layers, and the
-    // end-of-test `docker rmi` keeps disk bounded even if a previous run's
-    // cleanup raced with container teardown.
-    let tag = "autumn-deploy-e2e:test".to_string();
+    // STABLE per-shape tags (rather than unique ones) so at most one fixture
+    // image per shape ever exists: each run overwrites it and reuses the cached
+    // apt layers, and the end-of-test `docker rmi` keeps disk bounded even if a
+    // previous run's cleanup raced with container teardown.
+    let tag = if enable_pam {
+        "autumn-deploy-e2e:pam".to_string()
+    } else {
+        "autumn-deploy-e2e:test".to_string()
+    };
     run_ok(
-        Command::new("docker").args(["build", "-t", &tag, &ctx.display().to_string()]),
+        Command::new("docker").args([
+            "build",
+            "--build-arg",
+            &format!("ENABLE_PAM_SYSTEMD={}", u8::from(enable_pam)),
+            "-t",
+            &tag,
+            &ctx.display().to_string(),
+        ]),
         "docker build fixture image",
     );
     tag
@@ -506,7 +524,7 @@ fn deploy_e2e_full_lifecycle() {
 
     // Build the fixture image from a fresh build context.
     let ctx = tempfile::tempdir().expect("ctx tempdir");
-    let image_tag = build_fixture_image(ctx.path(), &ws.pubkey);
+    let image_tag = build_fixture_image(ctx.path(), &ws.pubkey, false);
     let (repo, tag) = image_tag.split_once(':').unwrap();
 
     // Launch the privileged systemd container (a stand-in VPS).
@@ -671,6 +689,100 @@ fn deploy_e2e_full_lifecycle() {
     eprintln!("[e2e] all deploy AC-7 lifecycle assertions passed");
 
     // Best-effort image cleanup (the container itself is removed on drop).
+    drop(container);
+    let _ = Command::new("docker")
+        .args(["rmi", "-f", &image_tag])
+        .output();
+}
+
+/// Real-host kamal-proxy control-socket regression (issue #1948 item 4), the
+/// cheap in-container half of the deferred real-VPS validation.
+///
+/// The default fixture DISABLES `pam_systemd` to sidestep the `XDG_RUNTIME_DIR`
+/// mismatch between the supervised `kamal-proxy run` systemd service (no
+/// `XDG_RUNTIME_DIR` -> `/tmp/kamal-proxy.sock`) and the deploy's ssh sessions
+/// (`pam_systemd` sets `XDG_RUNTIME_DIR=/run/user/0` -> a different socket path).
+/// That workaround meant the container harness never actually exercised the
+/// real-host socket shape. This test builds the fixture with `pam_systemd` LEFT
+/// ENABLED (`ENABLE_PAM_SYSTEMD=1`), so the ssh sessions get
+/// `XDG_RUNTIME_DIR=/run/user/0` exactly like a real host, and asserts a first
+/// deploy STILL reaches the control socket and flips traffic — proving the
+/// product's fix (the `env -u XDG_RUNTIME_DIR` prefix on the `kamal-proxy deploy`
+/// invocation in `KamalProxyController`) holds without the fixture papering over
+/// the mismatch.
+///
+/// Feature-gated behind `deploy-e2e-pam` (NOT part of the default Docker CI
+/// `--ignored` sweep): the socket behaviour under a live `pam_systemd` session can
+/// only be observed against Docker, which this environment cannot run, so it is
+/// opt-in to avoid destabilizing CI on an unverified path. Run it with:
+/// ```text
+/// cargo test -p autumn-cli --features deploy-e2e-pam --test deploy_e2e -- --ignored --nocapture
+/// ```
+/// The real-VPS GitHub Actions job (`.github/workflows/deploy-real-vps.yml`)
+/// covers the same fidelity end-to-end on an actual VM.
+#[cfg(feature = "deploy-e2e-pam")]
+#[test]
+#[ignore = "requires Docker + ssh client; run with --features deploy-e2e-pam --ignored"]
+fn deploy_e2e_pam_systemd_control_socket() {
+    let ws = Workspace::build();
+
+    // Build the fixture with pam_systemd ENABLED (the real-host shape).
+    let ctx = tempfile::tempdir().expect("ctx tempdir");
+    let image_tag = build_fixture_image(ctx.path(), &ws.pubkey, true);
+    let (repo, tag) = image_tag.split_once(':').unwrap();
+
+    let container = GenericImage::new(repo.to_string(), tag.to_string())
+        .with_exposed_port(ContainerPort::Tcp(22))
+        .with_exposed_port(ContainerPort::Tcp(PUBLIC_PORT))
+        .with_wait_for(WaitFor::Nothing)
+        .with_privileged(true)
+        .with_cgroupns_mode(CgroupnsMode::Host)
+        .with_mount(Mount::bind_mount("/sys/fs/cgroup", "/sys/fs/cgroup"))
+        .with_mount(Mount::tmpfs_mount("/run"))
+        .with_mount(Mount::tmpfs_mount("/run/lock"))
+        .with_startup_timeout(Duration::from_secs(180))
+        .start()
+        .expect("start pam fixture container");
+
+    let ssh_port = container
+        .get_host_port_ipv4(ContainerPort::Tcp(22))
+        .expect("mapped ssh port");
+    let public_host_port = container
+        .get_host_port_ipv4(ContainerPort::Tcp(PUBLIC_PORT))
+        .expect("mapped public port");
+
+    wait_for_boot(&ws, ssh_port);
+    ws.write_config(ssh_port);
+
+    // Sanity: with pam_systemd ENABLED, an ssh session must carry
+    // `XDG_RUNTIME_DIR=/run/user/0` — i.e. we really are exercising the real-host
+    // shape, not the disabled-pam workaround.
+    let xdg = ws.ssh(ssh_port, "printf %s \"${XDG_RUNTIME_DIR:-<unset>}\"");
+    let xdg = String::from_utf8_lossy(&xdg.stdout).into_owned();
+    assert_eq!(
+        xdg.trim(),
+        "/run/user/0",
+        "pam_systemd should set XDG_RUNTIME_DIR=/run/user/0 in ssh sessions (real-host shape)"
+    );
+
+    // First deploy: the health-gated `kamal-proxy deploy` flip touches the
+    // control socket over an ssh session carrying the pam XDG_RUNTIME_DIR. If the
+    // product did not pin the CLI to the service's socket it would fail with
+    // "connect: no such file or directory"; a served v1 proves the socket was
+    // reached.
+    ws.stage_release(&ws.app_v1);
+    let out = ws.autumn_deploy(&["up"]);
+    assert!(
+        out.status.success(),
+        "first `deploy up` under pam_systemd failed (control-socket mismatch?):\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let body = wait_for_http_ok(public_host_port, "/", Duration::from_secs(30));
+    assert!(
+        body.contains("e2eapp v1"),
+        "deploy under real pam_systemd should serve v1 through kamal-proxy, got: {body:?}"
+    );
+
     drop(container);
     let _ = Command::new("docker")
         .args(["rmi", "-f", &image_tag])
