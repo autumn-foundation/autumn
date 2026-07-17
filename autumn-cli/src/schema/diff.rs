@@ -2044,7 +2044,7 @@ fn render_sqlite_rebuild(
     );
     let _ = writeln!(
         out,
-        "-- autumn-safety: this recreate copies columns and re-creates indexes only; user-defined TRIGGERS and VIEWS on the table are dropped by DROP TABLE and are NOT restored — re-create them in a manual migration."
+        "-- autumn-safety: this recreate copies columns and re-creates indexes only. DROP TABLE drops the table's TRIGGERS (not restored here); VIEWS that reference the table are not dropped and may be left dangling or block the rename — re-create triggers and repair dependent views in a manual migration."
     );
     let _ = writeln!(
         out,
@@ -4846,7 +4846,7 @@ mod tests {
 -- Transaction semantics: this migration must run inside a single transaction (diesel wraps each
 -- migration in one). NOTE: `PRAGMA foreign_keys` is a no-op inside a transaction, so the harness
 -- must ensure foreign-key enforcement is disabled around the migration.
--- autumn-safety: this recreate copies columns and re-creates indexes only; user-defined TRIGGERS and VIEWS on the table are dropped by DROP TABLE and are NOT restored — re-create them in a manual migration.
+-- autumn-safety: this recreate copies columns and re-creates indexes only. DROP TABLE drops the table's TRIGGERS (not restored here); VIEWS that reference the table are not dropped and may be left dangling or block the rename — re-create triggers and repair dependent views in a manual migration.
 -- autumn-safety: `PRAGMA foreign_key_check` below only REPORTS violation rows (it does not raise); the recreate copies existing values verbatim and introduces no new orphans, but the migration runner must inspect the pragma's output to treat any pre-existing orphan as an error.
 PRAGMA foreign_keys=OFF;
 -- preserve the AUTOINCREMENT high-water mark so IDs issued-then-deleted are never reused
@@ -4884,7 +4884,7 @@ PRAGMA foreign_keys=ON;
 -- Transaction semantics: this migration must run inside a single transaction (diesel wraps each
 -- migration in one). NOTE: `PRAGMA foreign_keys` is a no-op inside a transaction, so the harness
 -- must ensure foreign-key enforcement is disabled around the migration.
--- autumn-safety: this recreate copies columns and re-creates indexes only; user-defined TRIGGERS and VIEWS on the table are dropped by DROP TABLE and are NOT restored — re-create them in a manual migration.
+-- autumn-safety: this recreate copies columns and re-creates indexes only. DROP TABLE drops the table's TRIGGERS (not restored here); VIEWS that reference the table are not dropped and may be left dangling or block the rename — re-create triggers and repair dependent views in a manual migration.
 -- autumn-safety: `PRAGMA foreign_key_check` below only REPORTS violation rows (it does not raise); the recreate copies existing values verbatim and introduces no new orphans, but the migration runner must inspect the pragma's output to treat any pre-existing orphan as an error.
 PRAGMA foreign_keys=OFF;
 -- preserve the AUTOINCREMENT high-water mark so IDs issued-then-deleted are never reused
