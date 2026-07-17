@@ -254,6 +254,22 @@ pub enum SchemaChange {
         /// The column on `referencing_table` carrying the blocking FK.
         referencing_column: String,
     },
+
+    /// A same-named column whose logical type changed *and* which participates in
+    /// a foreign-key constraint that this engine cannot drop and recreate — either
+    /// the column is itself a referencing FK column, or another retained table has
+    /// a baseline FK targeting it. A non-emittable marker: [`guard_plan`] refuses
+    /// any plan containing it with **no override**, because Postgres rejects
+    /// `ALTER COLUMN ... TYPE` on a column bound by an FK constraint, and this
+    /// engine has no `DropForeignKey`/re-add path to clear it first. It sits on top
+    /// of the [`DiffError::NonImplicitTypeConversion`] guard, catching even the
+    /// implicit widenings (`int4`→`int8`, `float4`→`float8`) that guard allows.
+    AlterColumnTypeBlockedByFk {
+        /// The owning table name.
+        table: String,
+        /// The column whose type change is blocked by an FK constraint.
+        column: String,
+    },
 }
 
 /// Diff policy knobs.
@@ -401,6 +417,25 @@ pub enum DiffError {
         /// The column being made non-null.
         column: String,
     },
+
+    /// A column type change on a column that participates in a foreign-key
+    /// constraint (unsupported this slice, **no override** — the SQL is
+    /// unappliable, not merely lossy). Postgres rejects `ALTER COLUMN ... TYPE` on
+    /// a column bound by an FK constraint (as either the referencing column or the
+    /// referenced key), and this engine has no `DropForeignKey`/re-add path to
+    /// clear the constraint first. This applies even to the implicit widenings the
+    /// [`DiffError::NonImplicitTypeConversion`] guard would otherwise allow.
+    #[error(
+        "cannot change the type of `{table}.{column}`: it participates in a foreign-key \
+         constraint, which this engine cannot drop and recreate. Change the type via a manual \
+         migration that drops and recreates the foreign key."
+    )]
+    TypeChangeOnForeignKeyColumn {
+        /// The owning table name.
+        table: String,
+        /// The column whose type change is blocked by an FK constraint.
+        column: String,
+    },
 }
 
 /// A single destructive operation, for [`DiffError::Destructive`] inspection.
@@ -508,6 +543,7 @@ pub fn diff_schema(baseline: &[Table], desired: &ParsedSchema, opts: DiffOptions
     }
 
     detect_inbound_fk_blocks(baseline, desired, &mut changes);
+    detect_fk_type_change_blocks(baseline, desired, &mut changes);
 
     MigrationPlan { backend, changes }
 }
@@ -526,9 +562,14 @@ pub fn diff_schema(baseline: &[Table], desired: &ParsedSchema, opts: DiffOptions
 /// from `desired`, so a self-referential FK and an FK from a co-dropped table are
 /// excluded structurally on the desired side; the baseline scan excludes a
 /// referencer that is itself being dropped — either way those constraints go away
-/// with their table. Markers are deduplicated (a pre-existing FK on a retained
-/// table appears on both sides) and, via the `BTreeSet`, deterministically sorted
-/// by (dropped, referencing table, referencing column).
+/// with their table. The baseline scan additionally excludes a referencing
+/// **column** that is itself being dropped in the same plan: `up_ordered` emits
+/// every `DropColumn` (which removes the FK constraint) before every `DropTable`,
+/// so dropping `posts.user_id` *and* `users` together is valid SQL and must not be
+/// over-refused (a common combined cleanup). Markers are deduplicated (a
+/// pre-existing FK on a retained table appears on both sides) and, via the
+/// `BTreeSet`, deterministically sorted by (dropped, referencing table,
+/// referencing column).
 fn detect_inbound_fk_blocks(
     baseline: &[Table],
     desired: &ParsedSchema,
@@ -545,6 +586,21 @@ fn detect_inbound_fk_blocks(
         return;
     }
 
+    // (referencing table, referencing column) pairs being dropped in this plan.
+    // Such a column carries its FK constraint away with it — and `up_ordered`
+    // emits every `DropColumn` before every `DropTable`, so the constraint is gone
+    // before the referenced table is dropped. Excluding these avoids over-refusing
+    // a valid combined "drop the FK column and its target table" cleanup.
+    let dropped_columns: BTreeSet<(&str, &str)> = changes
+        .iter()
+        .filter_map(|c| match c {
+            SchemaChange::DropColumn { table, column } => {
+                Some((table.as_str(), column.name.as_str()))
+            }
+            _ => None,
+        })
+        .collect();
+
     // (dropped table, referencing table, referencing column); BTreeSet dedups the
     // baseline/desired overlap and keeps the emission order deterministic.
     let mut blocks: BTreeSet<(String, String, String)> = BTreeSet::new();
@@ -556,6 +612,12 @@ fn detect_inbound_fk_blocks(
             continue;
         }
         for column in &table.columns {
+            // A referencing column being dropped in this same plan takes its FK
+            // constraint with it (emitted before the DROP TABLE), so it never
+            // blocks the drop.
+            if dropped_columns.contains(&(table.name.as_str(), column.name.as_str())) {
+                continue;
+            }
             if let Some(fk) = &column.references
                 && dropped.contains(fk.table.as_str())
             {
@@ -591,6 +653,106 @@ fn detect_inbound_fk_blocks(
                 }
             }),
     );
+}
+
+/// Post-pass: for every `AlterColumnType` change, flag it when the column
+/// participates in a foreign-key constraint this engine cannot drop and recreate.
+/// Postgres rejects `ALTER COLUMN ... TYPE` on a column bound by an FK — whether
+/// the column is the **referencing** column (its own `references` is set) or the
+/// **referenced key** (another table's FK targets it) — so the bare
+/// `ALTER COLUMN ... TYPE` this engine would emit is unappliable. A non-emittable
+/// [`SchemaChange::AlterColumnTypeBlockedByFk`] marker is appended for
+/// [`guard_plan`] to refuse (no override). This composes on top of the
+/// [`DiffError::NonImplicitTypeConversion`] guard: that guard already refuses
+/// non-implicit casts, and this one additionally refuses the implicit widenings
+/// (`int4`→`int8`, `float4`→`float8`) it allows, whenever the column is FK-bound.
+///
+/// The FK scan mirrors [`detect_inbound_fk_blocks`]: baseline retained tables and
+/// managed desired tables are both scanned for a referencing column so a
+/// pre-existing or newly-declared FK constraint is seen either way. `AlterColumnType`
+/// is only produced for a both-present managed table, so the altered column's own
+/// table is always retained.
+fn detect_fk_type_change_blocks(
+    baseline: &[Table],
+    desired: &ParsedSchema,
+    changes: &mut Vec<SchemaChange>,
+) {
+    // (table, column) pairs undergoing a type change.
+    let type_changes: BTreeSet<(&str, &str)> = changes
+        .iter()
+        .filter_map(|c| match c {
+            SchemaChange::AlterColumnType { table, column, .. } => {
+                Some((table.as_str(), column.as_str()))
+            }
+            _ => None,
+        })
+        .collect();
+    if type_changes.is_empty() {
+        return;
+    }
+
+    let mut blocks: BTreeSet<(String, String)> = BTreeSet::new();
+    for &(table, column) in &type_changes {
+        if column_participates_in_fk(table, column, baseline, desired) {
+            blocks.insert((table.to_owned(), column.to_owned()));
+        }
+    }
+
+    changes.extend(
+        blocks
+            .into_iter()
+            .map(|(table, column)| SchemaChange::AlterColumnTypeBlockedByFk { table, column }),
+    );
+}
+
+/// True when `table.column` participates in a foreign-key constraint — either as
+/// the **referencing** column (it carries a `references`, baseline or desired) or
+/// as the **referenced key** (some other table's FK targets `table.column`). Both
+/// the baseline (existing constraints) and the managed desired tables (declared
+/// constraints) are scanned, so a constraint that is present in the database, or
+/// that the plan adds, both count. Used only to decide the FK-bound type-change
+/// refusal, so it is deliberately conservative.
+fn column_participates_in_fk(
+    table: &str,
+    column: &str,
+    baseline: &[Table],
+    desired: &ParsedSchema,
+) -> bool {
+    // Referencing side: the altered column itself carries an FK, in the baseline
+    // (the constraint exists in the DB) or the desired managed table.
+    let is_referencing = baseline
+        .iter()
+        .filter(|t| t.name == table)
+        .flat_map(|t| &t.columns)
+        .chain(
+            desired
+                .tables
+                .iter()
+                .filter(|t| t.managed && t.name == table)
+                .flat_map(|t| &t.columns),
+        )
+        .any(|c| c.name == column && c.references.is_some());
+    if is_referencing {
+        return true;
+    }
+
+    // Referenced side: any baseline table, or any managed desired table, whose FK
+    // targets `table.column`.
+    baseline
+        .iter()
+        .flat_map(|t| &t.columns)
+        .chain(
+            desired
+                .tables
+                .iter()
+                .filter(|t| t.managed)
+                .flat_map(|t| &t.columns),
+        )
+        .any(|c| {
+            c.references
+                .as_ref()
+                .is_some_and(|fk| fk.table == table && fk.column == column)
+        })
 }
 
 /// Diff a table present on both sides (already known Autumn-managed on the
@@ -831,43 +993,24 @@ pub fn guard_plan(plan: &MigrationPlan, opts: DiffOptions) -> Result<(), DiffErr
         return Err(err);
     }
 
+    // 4b. Column type change on an FK-bound column — no override. PG rejects
+    //     `ALTER COLUMN ... TYPE` on a column bound by a foreign key (as either the
+    //     referencing column or the referenced key), and this engine has no
+    //     drop+recreate path for the constraint. Composes on top of guard 4: it
+    //     catches even the implicit widenings that guard allows.
+    if let Some(err) = find_fk_type_change_block(plan) {
+        return Err(err);
+    }
+
     // 5. Possible rename — a single table that both dropped and added columns.
     //    Overridable, so it is only enforced when destructive changes are not
     //    allowed. Deliberately checked *before* the required-column guard below so
     //    a rename-shaped drop+add reports the more-actionable `#[renamed_from]`
-    //    guidance rather than "add a default". Grouped in a BTreeMap so the
-    //    reported table is deterministic (sorted).
-    if !opts.allow_destructive {
-        let mut per_table: BTreeMap<String, (Vec<String>, Vec<String>)> = BTreeMap::new();
-        for change in &plan.changes {
-            match change {
-                SchemaChange::DropColumn { table, column } => {
-                    per_table
-                        .entry(table.clone())
-                        .or_default()
-                        .0
-                        .push(column.name.clone());
-                }
-                SchemaChange::AddColumn { table, column } => {
-                    per_table
-                        .entry(table.clone())
-                        .or_default()
-                        .1
-                        .push(column.name.clone());
-                }
-                _ => {}
-            }
-        }
-        if let Some((table, (dropped, added))) = per_table
-            .into_iter()
-            .find(|(_, (dropped, added))| !dropped.is_empty() && !added.is_empty())
-        {
-            return Err(DiffError::PossibleRename {
-                table,
-                dropped,
-                added,
-            });
-        }
+    //    guidance rather than "add a default".
+    if !opts.allow_destructive
+        && let Some(err) = find_possible_rename(plan)
+    {
+        return Err(err);
     }
 
     // 6. Add of a required column (NOT NULL, no default) to an existing table —
@@ -958,6 +1101,55 @@ fn find_inbound_fk_block(plan: &MigrationPlan) -> Option<DiffError> {
         }),
         _ => None,
     })
+}
+
+/// The [`DiffError::TypeChangeOnForeignKeyColumn`] refusal for the first
+/// [`SchemaChange::AlterColumnTypeBlockedByFk`] marker in `plan`, if any.
+fn find_fk_type_change_block(plan: &MigrationPlan) -> Option<DiffError> {
+    plan.changes.iter().find_map(|c| match c {
+        SchemaChange::AlterColumnTypeBlockedByFk { table, column } => {
+            Some(DiffError::TypeChangeOnForeignKeyColumn {
+                table: table.clone(),
+                column: column.clone(),
+            })
+        }
+        _ => None,
+    })
+}
+
+/// The [`DiffError::PossibleRename`] refusal for the first both-present table that
+/// both dropped and added column(s) — the ambiguous drop+add that might be a
+/// rename. Grouped in a `BTreeMap` so the reported table is deterministic
+/// (sorted). The caller only consults this when `--allow-destructive` is off.
+fn find_possible_rename(plan: &MigrationPlan) -> Option<DiffError> {
+    let mut per_table: BTreeMap<String, (Vec<String>, Vec<String>)> = BTreeMap::new();
+    for change in &plan.changes {
+        match change {
+            SchemaChange::DropColumn { table, column } => {
+                per_table
+                    .entry(table.clone())
+                    .or_default()
+                    .0
+                    .push(column.name.clone());
+            }
+            SchemaChange::AddColumn { table, column } => {
+                per_table
+                    .entry(table.clone())
+                    .or_default()
+                    .1
+                    .push(column.name.clone());
+            }
+            _ => {}
+        }
+    }
+    per_table
+        .into_iter()
+        .find(|(_, (dropped, added))| !dropped.is_empty() && !added.is_empty())
+        .map(|(table, (dropped, added))| DiffError::PossibleRename {
+            table,
+            dropped,
+            added,
+        })
 }
 
 /// The [`DiffError::NonImplicitTypeConversion`] refusal for the first
@@ -1296,7 +1488,8 @@ const fn up_bucket(change: &SchemaChange) -> u8 {
         // Non-emittable markers; the guard refuses them before emission is reached.
         SchemaChange::PrimaryKeyChange { .. }
         | SchemaChange::ForeignKeyChange { .. }
-        | SchemaChange::DropTableBlockedByInboundFk { .. } => 9,
+        | SchemaChange::DropTableBlockedByInboundFk { .. }
+        | SchemaChange::AlterColumnTypeBlockedByFk { .. } => 9,
     }
 }
 
@@ -1371,7 +1564,8 @@ fn emit_change_up(change: &SchemaChange, backend: Backend) -> Result<String, Emi
         // in the command flow. Render nothing defensively rather than panicking.
         SchemaChange::PrimaryKeyChange { .. }
         | SchemaChange::ForeignKeyChange { .. }
-        | SchemaChange::DropTableBlockedByInboundFk { .. } => Ok(String::new()),
+        | SchemaChange::DropTableBlockedByInboundFk { .. }
+        | SchemaChange::AlterColumnTypeBlockedByFk { .. } => Ok(String::new()),
     }
 }
 
@@ -1452,7 +1646,8 @@ fn emit_change_down(change: &SchemaChange, backend: Backend) -> Result<String, E
         )),
         SchemaChange::PrimaryKeyChange { .. }
         | SchemaChange::ForeignKeyChange { .. }
-        | SchemaChange::DropTableBlockedByInboundFk { .. } => Ok(String::new()),
+        | SchemaChange::DropTableBlockedByInboundFk { .. }
+        | SchemaChange::AlterColumnTypeBlockedByFk { .. } => Ok(String::new()),
     }
 }
 
@@ -1704,6 +1899,11 @@ fn describe_change(change: &SchemaChange) -> String {
         } => format!(
             "! DROP TABLE {table} blocked by retained FK {referencing_table}.{referencing_column} (refused)"
         ),
+        SchemaChange::AlterColumnTypeBlockedByFk { table, column } => {
+            format!(
+                "! ALTER COLUMN {table}.{column} TYPE blocked by foreign-key constraint (refused)"
+            )
+        }
     }
 }
 
@@ -3336,6 +3536,111 @@ mod tests {
         assert!(
             up.contains("ALTER TABLE posts ALTER COLUMN views TYPE BIGINT;"),
             "emits the bare ALTER TYPE for the widening: {up}"
+        );
+    }
+
+    /// Finding S: a type change on a **referencing** FK column
+    /// (`posts.account_id` → `accounts.id`, widened `Int32` → `Int64`) is an
+    /// implicit widening the round-2 classifier ALLOWS, but PG rejects
+    /// `ALTER COLUMN ... TYPE` on a column bound by an FK. Must be refused (no
+    /// override) — the bare ALTER is unappliable.
+    #[test]
+    fn type_change_on_referencing_fk_column_is_refused() {
+        let accounts = posts_ref_table("accounts", col("name", ColumnType::Text));
+        let mut fk_base = col("account_id", ColumnType::Int32);
+        fk_base.references = Some(ForeignKey::new("accounts", "id"));
+        let base = vec![accounts.clone(), posts_with(vec![fk_base])];
+        let mut fk_want = col("account_id", ColumnType::Int64);
+        fk_want.references = Some(ForeignKey::new("accounts", "id"));
+        let want = parsed(vec![accounts, posts_with(vec![fk_want])], vec![]);
+        let plan = diff_schema(&base, &want, ALLOW);
+        let err = guard_plan(&plan, ALLOW)
+            .expect_err("type change on a referencing FK column is unappliable");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("posts.account_id") && msg.contains("foreign-key"),
+            "names the FK column and the FK reason: {msg}"
+        );
+    }
+
+    /// Finding S: a type change on a **referenced key** column (`accounts.id`
+    /// widened `Int32` → `Int64`) while a retained `posts.account_id` → `accounts`
+    /// FK survives is likewise refused — PG rejects altering the referenced key
+    /// while the inbound FK exists, and this engine cannot drop+recreate it.
+    #[test]
+    fn type_change_on_referenced_key_column_is_refused() {
+        // accounts.id: Int32 → Int64 (PK unchanged, so no PrimaryKeyChange).
+        let mut acc_id_base = col("id", ColumnType::Int32);
+        acc_id_base.primary_key = true;
+        let mut accounts_base = Table::new("accounts", Backend::Postgres);
+        accounts_base.primary_key.push("id".to_owned());
+        accounts_base.columns.push(acc_id_base);
+
+        let mut acc_id_want = col("id", ColumnType::Int64);
+        acc_id_want.primary_key = true;
+        let mut accounts_want = Table::new("accounts", Backend::Postgres);
+        accounts_want.primary_key.push("id".to_owned());
+        accounts_want.columns.push(acc_id_want);
+
+        let mut fk = col("account_id", ColumnType::Int64);
+        fk.references = Some(ForeignKey::new("accounts", "id"));
+        let posts = posts_ref_table("posts", fk);
+
+        let base = vec![accounts_base, posts.clone()];
+        let want = parsed(vec![accounts_want, posts], vec![]);
+        let plan = diff_schema(&base, &want, ALLOW);
+        let err = guard_plan(&plan, ALLOW)
+            .expect_err("type change on a referenced key column is unappliable");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("accounts.id") && msg.contains("foreign-key"),
+            "names the referenced key column and the FK reason: {msg}"
+        );
+    }
+
+    /// Finding S control: an implicit widening on a **plain** (non-FK) column
+    /// still emits the bare `ALTER COLUMN ... TYPE` — the FK guard must not
+    /// over-refuse.
+    #[test]
+    fn type_change_on_plain_column_still_allowed() {
+        let base = vec![posts_with(vec![col("views", ColumnType::Int32)])];
+        let want = parsed(
+            vec![posts_with(vec![col("views", ColumnType::Int64)])],
+            vec![],
+        );
+        let plan = diff_schema(&base, &want, DEFAULT_OPTS);
+        guard_plan(&plan, DEFAULT_OPTS).expect("plain-column widening is not FK-bound");
+        let up = emit_up_sql(&plan).expect("emit");
+        assert!(
+            up.contains("ALTER TABLE posts ALTER COLUMN views TYPE BIGINT;"),
+            "emits the bare ALTER TYPE for the plain-column widening: {up}"
+        );
+    }
+
+    /// Finding R: dropping a retained table's FK column AND its referenced table in
+    /// the SAME plan is a valid combined cleanup — `up_ordered` emits every
+    /// `DROP COLUMN` (which removes the FK constraint) before every `DROP TABLE`,
+    /// so `DROP COLUMN posts.user_id` runs before `DROP TABLE users`. The
+    /// inbound-FK guard must NOT over-refuse it under `--allow-destructive`.
+    #[test]
+    fn drop_fk_column_and_target_table_together_is_allowed_with_allow_destructive() {
+        let users = Table::new("users", Backend::Postgres);
+        let mut user_fk = col("user_id", ColumnType::Int64);
+        user_fk.references = Some(ForeignKey::new("users", "id"));
+        let baseline = vec![users, posts_with(vec![user_fk])];
+        // desired: users gone, posts.user_id dropped.
+        let desired = parsed(vec![posts_with(vec![])], vec![]);
+        let plan = diff_schema(&baseline, &desired, ALLOW);
+        guard_plan(&plan, ALLOW)
+            .expect("co-dropping the FK column and its target table is valid SQL");
+        let up = emit_up_sql(&plan).expect("emit");
+        let drop_col = up
+            .find("DROP COLUMN user_id")
+            .expect("emits DROP COLUMN user_id");
+        let drop_tbl = up.find("DROP TABLE users").expect("emits DROP TABLE users");
+        assert!(
+            drop_col < drop_tbl,
+            "DROP COLUMN posts.user_id must precede DROP TABLE users:\n{up}"
         );
     }
 
