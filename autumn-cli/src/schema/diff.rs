@@ -1953,6 +1953,20 @@ fn emit_sqlite_rebuild(
     ctx: &SchemaContext,
     leg: RebuildLeg,
 ) -> Result<String, EmitError> {
+    // The `{table}__autumn_new` staging name is not guaranteed collision-free: if a
+    // real table already carries that name, the rebuild's CREATE/RENAME would clobber
+    // it. Refuse rather than emit unappliable SQL.
+    let staging = format!("{table}__autumn_new");
+    if ctx.desired.contains_key(&staging) || ctx.baseline.contains_key(&staging) {
+        return Err(EmitError::SqliteRebuildUnsupported {
+            table: table.to_owned(),
+            kind: "table rebuild",
+            reason: format!(
+                "staging table name `{staging}` collides with an existing table; \
+                 rename the model to free that name"
+            ),
+        });
+    }
     let desired = ctx
         .desired
         .get(table)
@@ -2026,11 +2040,15 @@ fn render_sqlite_rebuild(
     );
     let _ = writeln!(
         out,
-        "-- must ensure foreign-key enforcement is disabled around the migration; `PRAGMA foreign_key_check`"
+        "-- must ensure foreign-key enforcement is disabled around the migration."
     );
     let _ = writeln!(
         out,
-        "-- below validates referential integrity after the row copy."
+        "-- autumn-safety: this recreate copies columns and re-creates indexes only; user-defined TRIGGERS and VIEWS on the table are dropped by DROP TABLE and are NOT restored — re-create them in a manual migration."
+    );
+    let _ = writeln!(
+        out,
+        "-- autumn-safety: `PRAGMA foreign_key_check` below only REPORTS violation rows (it does not raise); the recreate copies existing values verbatim and introduces no new orphans, but the migration runner must inspect the pragma's output to treat any pre-existing orphan as an error."
     );
     let _ = writeln!(out, "PRAGMA foreign_keys=OFF;");
     out.push_str(&render_create_table_body(
@@ -4798,8 +4816,9 @@ mod tests {
 -- autumn: SQLite table rebuild for `posts` — ALTER-family changes require a full table recreate.
 -- Transaction semantics: this migration must run inside a single transaction (diesel wraps each
 -- migration in one). NOTE: `PRAGMA foreign_keys` is a no-op inside a transaction, so the harness
--- must ensure foreign-key enforcement is disabled around the migration; `PRAGMA foreign_key_check`
--- below validates referential integrity after the row copy.
+-- must ensure foreign-key enforcement is disabled around the migration.
+-- autumn-safety: this recreate copies columns and re-creates indexes only; user-defined TRIGGERS and VIEWS on the table are dropped by DROP TABLE and are NOT restored — re-create them in a manual migration.
+-- autumn-safety: `PRAGMA foreign_key_check` below only REPORTS violation rows (it does not raise); the recreate copies existing values verbatim and introduces no new orphans, but the migration runner must inspect the pragma's output to treat any pre-existing orphan as an error.
 PRAGMA foreign_keys=OFF;
 CREATE TABLE posts__autumn_new (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -4826,8 +4845,9 @@ PRAGMA foreign_keys=ON;
 -- autumn: SQLite table rebuild for `posts` — ALTER-family changes require a full table recreate.
 -- Transaction semantics: this migration must run inside a single transaction (diesel wraps each
 -- migration in one). NOTE: `PRAGMA foreign_keys` is a no-op inside a transaction, so the harness
--- must ensure foreign-key enforcement is disabled around the migration; `PRAGMA foreign_key_check`
--- below validates referential integrity after the row copy.
+-- must ensure foreign-key enforcement is disabled around the migration.
+-- autumn-safety: this recreate copies columns and re-creates indexes only; user-defined TRIGGERS and VIEWS on the table are dropped by DROP TABLE and are NOT restored — re-create them in a manual migration.
+-- autumn-safety: `PRAGMA foreign_key_check` below only REPORTS violation rows (it does not raise); the recreate copies existing values verbatim and introduces no new orphans, but the migration runner must inspect the pragma's output to treat any pre-existing orphan as an error.
 PRAGMA foreign_keys=OFF;
 CREATE TABLE posts__autumn_new (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -4952,6 +4972,32 @@ PRAGMA foreign_keys=ON;
     }
 
     #[test]
+    fn sqlite_rebuild_refuses_on_staging_name_collision() {
+        // A real table already named `posts__autumn_new` would be clobbered by the
+        // rebuild's staging CREATE/RENAME, so the emitter refuses rather than emit
+        // unappliable SQL.
+        let (plan, ctx) = sqlite_rebuild_fixture();
+        let collider = sqlite_table(
+            "posts__autumn_new",
+            vec![col("body", ColumnType::Text)],
+            vec![],
+        );
+        let mut ctx = ctx;
+        ctx.desired.insert(collider.name.clone(), collider.clone());
+        ctx.baseline.insert(collider.name.clone(), collider);
+
+        let err = emit_up_sql_with_context(&plan, &ctx).unwrap_err();
+        assert!(
+            matches!(err, EmitError::SqliteRebuildUnsupported { .. }),
+            "staging-name collision is refused: {err:?}"
+        );
+        assert!(
+            err.to_string().contains("posts__autumn_new") && err.to_string().contains("collides"),
+            "the error names the colliding staging table: {err}"
+        );
+    }
+
+    #[test]
     fn sqlite_rebuild_preserves_rows_on_real_sqlite() {
         // Exercise the generated UP rebuild against a real in-memory SQLite DB
         // (diesel's `sqlite` backend is a workspace dependency), asserting the rows
@@ -4967,6 +5013,21 @@ PRAGMA foreign_keys=ON;
             views: i64,
             #[diesel(sql_type = diesel::sql_types::Text)]
             body: String,
+        }
+
+        // `PRAGMA foreign_key_check` REPORTS violation rows (child table / rowid /
+        // parent / fkid); an empty result set means no violations.
+        #[derive(QueryableByName)]
+        struct FkViolation {
+            #[diesel(sql_type = diesel::sql_types::Text, column_name = "table")]
+            _child_table: String,
+        }
+
+        // `PRAGMA integrity_check` returns a single `TEXT` row; a clean DB reports `ok`.
+        #[derive(QueryableByName)]
+        struct IntegrityRow {
+            #[diesel(sql_type = diesel::sql_types::Text, column_name = "integrity_check")]
+            status: String,
         }
 
         let mut conn = SqliteConnection::establish(":memory:").expect("open in-memory sqlite");
@@ -4995,9 +5056,23 @@ PRAGMA foreign_keys=ON;
             (2, 7, "world")
         );
 
-        // The recreated index and referential integrity are both intact.
-        conn.batch_execute("PRAGMA integrity_check;\nPRAGMA foreign_key_check;")
-            .expect("integrity + foreign-key checks are clean");
+        // `PRAGMA foreign_key_check` only REPORTS violation rows — it does not raise —
+        // so actually READ its output and assert it is empty, rather than firing it via
+        // `batch_execute`, which discards the rows and would pass even on a violation.
+        let violations: Vec<FkViolation> = diesel::sql_query("PRAGMA foreign_key_check")
+            .load(&mut conn)
+            .expect("run PRAGMA foreign_key_check");
+        assert!(
+            violations.is_empty(),
+            "foreign_key_check reported {} violation row(s)",
+            violations.len()
+        );
+
+        let integrity: Vec<IntegrityRow> = diesel::sql_query("PRAGMA integrity_check")
+            .load(&mut conn)
+            .expect("run PRAGMA integrity_check");
+        assert_eq!(integrity.len(), 1, "integrity_check returns one row");
+        assert_eq!(integrity[0].status, "ok", "integrity_check is clean");
     }
 
     #[test]
