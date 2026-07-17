@@ -33,7 +33,7 @@ for that same "ship the app, not the plumbing" shape in Rust.
 
 ```bash
 # Install the published CLI
-cargo install autumn-cli --version 0.5.0
+cargo install autumn-cli --version 0.6.0
 
 # Local development only, from an Autumn checkout:
 # cargo install --path autumn-cli
@@ -243,6 +243,7 @@ See [EXAMPLES.md](EXAMPLES.md) for the full catalog with personas, journeys, pre
 - [API Reference](https://docs.rs/autumn-web)
 - [Pre-rendering Design Notes](docs/design/hybrid-rendering.md)
 - [Stability Policy](STABILITY.md) — SemVer, MSRV, and migration commitments
+- [Transition effects](docs/guide/transition-effects.md) — per-edge `on` / `on_commit` side effects on `#[state_machine]` transitions.
 
 ## Stability
 

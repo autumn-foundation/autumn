@@ -409,3 +409,5 @@ the edges of the current slice:
   macros generate with `cargo expand`.
 - [Version History](version-history.md) — persisted transition history and audit
   trail for model-backed state.
+- [Transition effects](transition-effects.md) — per-edge `on` / `on_commit` side
+  effects on `#[state_machine]` transitions.
