@@ -1546,15 +1546,27 @@ fn truncate_pg_identifier(name: &str) -> &str {
 /// A short, deterministic 8-hex-char digest of `raw`, for collision-resistant
 /// identifier suffixing.
 ///
-/// Uses [`std::collections::hash_map::DefaultHasher`] constructed directly (never a
-/// `RandomState`), so the digest is stable across runs and processes — the up and
-/// down renderers must derive the same suffix.
+/// Uses a hand-rolled FNV-1a 64-bit hash (fully specified, dependency-free) rather
+/// than `DefaultHasher`, whose output is not guaranteed stable across Rust versions —
+/// this schema emitter must derive the same suffix on every toolchain, and the up and
+/// down renderers must agree.
 fn short_identifier_hash(raw: &str) -> String {
-    use std::hash::{Hash as _, Hasher as _};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    raw.hash(&mut hasher);
-    let digest = hasher.finish();
+    let digest = fnv1a_64(raw.as_bytes());
     format!("{digest:016x}")[..8].to_owned()
+}
+
+/// FNV-1a 64-bit hash of `bytes` (offset basis `0xcbf29ce484222325`, prime
+/// `0x100000001b3`), fully specified so the digest is deterministic everywhere.
+const fn fnv1a_64(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    let prime: u64 = 0x0000_0100_0000_01b3;
+    let mut i = 0;
+    while i < bytes.len() {
+        hash ^= bytes[i] as u64;
+        hash = hash.wrapping_mul(prime);
+        i += 1;
+    }
+    hash
 }
 
 /// A Postgres-safe (`≤ 63`-byte) identifier for `raw`.
