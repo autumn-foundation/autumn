@@ -54,6 +54,16 @@
 //! `NOT NULL`, no-default column inside a brand-new `CreateTable` is fine — the
 //! table is empty — and is not refused.
 //!
+//! Its exact sibling — turning an *existing* nullable column non-null
+//! (`SET NOT NULL`) — is refused for the same reason
+//! ([`DiffError::SetNotNullRequiresBackfill`]): Postgres validates the
+//! constraint against every existing row the instant the `ALTER COLUMN ... SET
+//! NOT NULL` runs, so it fails on any pre-existing NULL, and the offline engine
+//! has no backfill value to synthesize. The only appliable form would pair a
+//! default with a backfill, which is not expressible offline. The inverse
+//! (`DROP NOT NULL`, making a column nullable) is always safe and is emitted
+//! normally.
+//!
 //! # `SQLite` boundary
 //!
 //! Slice 4 is **pg-first**: it renders Postgres fully and the portable `SQLite`
@@ -69,7 +79,6 @@ use autumn_schema_core::{
     Backend, CheckConstraint, Column, ColumnDefault, ColumnType, IdKind, Index, Table,
 };
 
-use crate::generate::naming;
 use crate::schema::parse::ParsedSchema;
 
 /// The computed migration: an ordered list of structural changes plus the
@@ -368,6 +377,28 @@ pub enum DiffError {
         /// The table gaining the column.
         table: String,
         /// The required column name.
+        column: String,
+    },
+
+    /// A `SET NOT NULL` on an existing (previously-nullable) column (unsupported
+    /// this slice, **no override** — the SQL is unappliable on a table whose
+    /// column already holds NULLs, not merely lossy). Postgres validates the
+    /// constraint against every existing row the instant `ALTER COLUMN ... SET
+    /// NOT NULL` runs, so it fails on any pre-existing NULL; the offline diff
+    /// engine has no backfill value to synthesize. This is the exact sibling of
+    /// [`DiffError::RequiredColumnWithoutDefault`] (adding a required column) —
+    /// the only appliable form would be a simultaneous default plus a backfill,
+    /// which is not expressible offline, so the engine refuses rather than emit
+    /// an unappliable migration. The inverse [`SchemaChange::DropNotNull`]
+    /// (non-null → nullable) is always safe and is never refused.
+    #[error(
+        "cannot set `{table}.{column}` NOT NULL: existing NULL rows would fail the constraint. \
+         Backfill the column and apply the change manually, or keep it nullable (`Option<...>`)."
+    )]
+    SetNotNullRequiresBackfill {
+        /// The owning table.
+        table: String,
+        /// The column being made non-null.
         column: String,
     },
 }
@@ -726,14 +757,19 @@ fn diff_checks(table: &str, base: &Table, want: &Table, changes: &mut Vec<Schema
 }
 
 /// The set of column names the parser skipped for `table` (rule E): a
-/// [`SchemaDiagnostic`](crate::schema::parse::SchemaDiagnostic) whose model
-/// pluralizes to `table` contributes its field name. Such a baseline column is
-/// "present but unmodelled" and must not be diffed as a drop.
+/// [`SchemaDiagnostic`](crate::schema::parse::SchemaDiagnostic) whose resolved
+/// table name equals `table` contributes its field name. Such a baseline column
+/// is "present but unmodelled" and must not be diffed as a drop.
+///
+/// The match is on the diagnostic's resolved `table` (the `#[model(table =
+/// "...")]` override or the convention name), recorded at parse time — never a
+/// re-derivation of the convention name from `model`, which would miss a custom
+/// table name and let a real baseline column be diffed as a data-losing drop.
 fn skipped_columns(table: &str, desired: &ParsedSchema) -> std::collections::BTreeSet<String> {
     desired
         .diagnostics
         .iter()
-        .filter(|d| naming::pluralize(&naming::pascal_to_snake(&d.model)) == table)
+        .filter(|d| d.table == table)
         .map(|d| d.field.clone())
         .collect()
 }
@@ -853,6 +889,21 @@ pub fn guard_plan(plan: &MigrationPlan, opts: DiffOptions) -> Result<(), DiffErr
         _ => None,
     }) {
         return Err(DiffError::RequiredColumnWithoutDefault { table, column });
+    }
+
+    // 6b. `SET NOT NULL` on an existing nullable column — no override. Postgres
+    //     validates the constraint against every existing row the instant the
+    //     ALTER runs, so it fails on any pre-existing NULL; the offline engine
+    //     has no backfill value to synthesize. The exact sibling of the
+    //     required-column refusal above. It is not destructive, so it always
+    //     refuses, regardless of `--allow-destructive` (checked here, before the
+    //     `allow_destructive` short-circuit below). The inverse `DropNotNull`
+    //     (nullable-ing a column) is always safe and is never matched here.
+    if let Some((table, column)) = plan.changes.iter().find_map(|c| match c {
+        SchemaChange::SetNotNull { table, column } => Some((table.clone(), column.clone())),
+        _ => None,
+    }) {
+        return Err(DiffError::SetNotNullRequiresBackfill { table, column });
     }
 
     if opts.allow_destructive {
@@ -1700,9 +1751,10 @@ mod tests {
         }
     }
 
-    fn diag(model: &str, field: &str) -> SchemaDiagnostic {
+    fn diag(model: &str, table: &str, field: &str) -> SchemaDiagnostic {
         SchemaDiagnostic {
             model: model.to_owned(),
+            table: table.to_owned(),
             field: field.to_owned(),
             rust_type: "Unknown".to_owned(),
             message: format!("skipped {model}.{field}"),
@@ -2003,11 +2055,57 @@ mod tests {
                 variants: vec!["draft".into(), "live".into()],
             },
         )])];
-        let want = parsed(vec![posts_with(vec![])], vec![diag("Post", "status")]);
+        let want = parsed(
+            vec![posts_with(vec![])],
+            vec![diag("Post", "posts", "status")],
+        );
         let plan = diff_schema(&base, &want, DEFAULT_OPTS);
         assert!(
             plan.is_empty(),
             "rules D+E: parser-skipped column not dropped: {plan:?}"
+        );
+    }
+
+    #[test]
+    fn custom_table_name_skipped_column_not_dropped_via_diagnostic() {
+        // A managed model `#[model(table = "app_users")]` with a skipped
+        // enum/assoc field records a diagnostic whose resolved `table` is the
+        // CUSTOM name `app_users` — NOT the convention name `users`. The baseline
+        // `app_users` carries the extra unmodelled `role` column; the suppression
+        // must match on the resolved table name so the column is treated as
+        // "present but unmodelled" and NOT dropped — even under
+        // `--allow-destructive`, which would otherwise DROP the real column and
+        // its data.
+        let mut base_table = Table::new("app_users", Backend::Postgres);
+        base_table.managed = true;
+        let mut id = col("id", ColumnType::Int64);
+        id.primary_key = true;
+        base_table.columns.push(id);
+        base_table.primary_key.push("id".to_owned());
+        base_table.columns.push(col(
+            "role",
+            ColumnType::Enum {
+                variants: vec!["admin".into(), "member".into()],
+            },
+        ));
+
+        let mut desired_table = Table::new("app_users", Backend::Postgres);
+        desired_table.managed = true;
+        let mut did = col("id", ColumnType::Int64);
+        did.primary_key = true;
+        desired_table.columns.push(did);
+        desired_table.primary_key.push("id".to_owned());
+
+        // Model `User` → convention table `users`, but the resolved table is the
+        // `#[model(table = "app_users")]` override.
+        let want = parsed(vec![desired_table], vec![diag("User", "app_users", "role")]);
+
+        // Destructive-allowed: proves the suppression, not the destructive guard,
+        // is what keeps the column.
+        let plan = diff_schema(&[base_table], &want, ALLOW);
+        assert!(
+            plan.is_empty(),
+            "custom-table diagnostic must suppress the DropColumn: {plan:?}"
         );
     }
 
@@ -2018,7 +2116,7 @@ mod tests {
         let base = vec![posts_with(vec![col("legacy", ColumnType::Text)])];
         let want = parsed(
             vec![posts_with(vec![])],
-            vec![diag("Post", "something_else")],
+            vec![diag("Post", "posts", "something_else")],
         );
         let plan = diff_schema(&base, &want, DEFAULT_OPTS);
         assert_eq!(plan.changes.len(), 1);
@@ -2471,6 +2569,60 @@ mod tests {
         guard_plan(&plan, DEFAULT_OPTS).expect("CreateTable with a NOT NULL column is empty-safe");
         let up = emit_up_sql(&plan).expect("emit");
         assert!(up.contains("title TEXT NOT NULL"), "{up}");
+    }
+
+    #[test]
+    fn set_not_null_on_existing_column_is_refused() {
+        // Turning an existing nullable column non-null is unappliable on a table
+        // whose column already holds NULLs — refused, with no override (the exact
+        // sibling of the required-column refusal).
+        let plan = MigrationPlan {
+            backend: Backend::Postgres,
+            changes: vec![SchemaChange::SetNotNull {
+                table: "posts".to_owned(),
+                column: "bio".to_owned(),
+            }],
+        };
+        let err = guard_plan(&plan, DEFAULT_OPTS).unwrap_err();
+        match &err {
+            DiffError::SetNotNullRequiresBackfill { table, column } => {
+                assert_eq!(table, "posts");
+                assert_eq!(column, "bio");
+            }
+            other => panic!("expected SetNotNullRequiresBackfill, got {other:?}"),
+        }
+        assert!(
+            err.to_string().contains("cannot set `posts.bio` NOT NULL"),
+            "message: {err}"
+        );
+        // No override — --allow-destructive does not permit it (it is unappliable,
+        // not merely destructive).
+        assert!(
+            matches!(
+                guard_plan(&plan, ALLOW).unwrap_err(),
+                DiffError::SetNotNullRequiresBackfill { .. }
+            ),
+            "must refuse even with --allow-destructive"
+        );
+    }
+
+    #[test]
+    fn drop_not_null_is_allowed() {
+        // The inverse (non-null → nullable) is always appliable — emit it
+        // normally, never refuse.
+        let plan = MigrationPlan {
+            backend: Backend::Postgres,
+            changes: vec![SchemaChange::DropNotNull {
+                table: "posts".to_owned(),
+                column: "bio".to_owned(),
+            }],
+        };
+        guard_plan(&plan, DEFAULT_OPTS).expect("DROP NOT NULL is always appliable");
+        let up = emit_up_sql(&plan).expect("emit");
+        assert!(
+            up.contains("ALTER TABLE posts ALTER COLUMN bio DROP NOT NULL;"),
+            "{up}"
+        );
     }
 
     #[test]

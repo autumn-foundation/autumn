@@ -137,6 +137,13 @@ impl SchemaParseError {
 pub struct SchemaDiagnostic {
     /// The `#[model]` struct the field belongs to.
     pub model: String,
+    /// The resolved table name for the model — the `#[model(table = "...")]`
+    /// override when present, else the convention name
+    /// (`pluralize(pascal_to_snake(model))`). This is the same name recorded on
+    /// the emitted [`Table`], so a consumer can match a diagnostic to its table
+    /// without re-deriving the convention name (which would miss a custom table
+    /// name).
+    pub table: String,
     /// The field name whose type could not be resolved.
     pub field: String,
     /// The unresolved Rust type token (as written in the struct).
@@ -474,6 +481,7 @@ fn build_table(
             // record a diagnostic and skip — never fabricate a wrong mapping.
             diagnostics.push(SchemaDiagnostic {
                 model: model_name.clone(),
+                table: table_name.clone(),
                 field: raw.name.clone(),
                 rust_type: raw.rust_type.clone(),
                 message: format!(
@@ -1126,8 +1134,35 @@ mod tests {
         assert_eq!(parsed.diagnostics.len(), 1);
         let diag = &parsed.diagnostics[0];
         assert_eq!(diag.model, "Post");
+        // Convention table name recorded on the diagnostic.
+        assert_eq!(diag.table, "posts");
         assert_eq!(diag.field, "status");
         assert!(diag.rust_type.contains("PostStatus"));
+    }
+
+    #[test]
+    fn diagnostic_records_custom_table_name() {
+        // A `#[model(table = "app_users")]` model with an unresolved field must
+        // record the RESOLVED custom table name (`app_users`), not the convention
+        // name (`users`) — so a downstream consumer (the diff engine's
+        // parser-gap suppression) can match the diagnostic to the actual baseline
+        // table and never diff a present-but-unmodelled column as a drop.
+        let src = r#"
+            #[model(table = "app_users")]
+            pub struct User {
+                #[id]
+                pub id: i64,
+                pub name: String,
+                pub role: UserRole,
+            }
+        "#;
+        let parsed = parse_model_source(src, Backend::Postgres).expect("parse");
+        assert_eq!(parsed.tables[0].name, "app_users");
+        assert_eq!(parsed.diagnostics.len(), 1);
+        let diag = &parsed.diagnostics[0];
+        assert_eq!(diag.model, "User");
+        assert_eq!(diag.table, "app_users");
+        assert_eq!(diag.field, "role");
     }
 
     #[test]
