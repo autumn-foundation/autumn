@@ -1,28 +1,28 @@
 //! `#[repository]` upsert isolation + optimistic-lock proof on the `SQLite`
 //! runtime backend (issue #1996, PR #2021).
 //!
-//! Pins the two P1 fixes on the cfg-dual `__autumn_execute_upsert` SQLite arm and
+//! Pins the two P1 fixes on the cfg-dual `__autumn_execute_upsert` `SQLite` arm and
 //! the versioned `upsert_many` path:
 //!
 //! * **Bug 2 — tenant isolation (SECURITY):** the Postgres upsert's
 //!   `ON CONFLICT (id) DO UPDATE … WHERE tenant_id = $current` predicate keeps an
-//!   id owned by another tenant from being hijacked. The SQLite arm conflicts on
+//!   id owned by another tenant from being hijacked. The `SQLite` arm conflicts on
 //!   `id` only and its DO UPDATE set-clause writes `tenant_id`, so without the
 //!   SAME `WHERE tenant_id = <current>` predicate, upserting another tenant's id
 //!   would MOVE that row into the caller's tenant. This test proves the fix:
 //!   `upsert_many` under tenant B with tenant A's id leaves tenant A's row
 //!   completely untouched (no cross-tenant leak) and creates nothing under B.
-//! * **Bug 2 — optimistic lock guard:** the SQLite DO UPDATE preserves
+//! * **Bug 2 — optimistic lock guard:** the `SQLite` DO UPDATE preserves
 //!   `WHERE lock_version = excluded.lock_version`, so a stale-version upsert is
 //!   left untouched, dropped from `RETURNING`, and surfaces as a 409 Conflict —
 //!   matching Postgres exactly.
 //!
 //! Bug 1 (the versioned advisory lock `SELECT pg_advisory_xact_lock($1)` being
-//! cfg-gated to Postgres-only, so it is skipped on SQLite's single-writer engine)
+//! cfg-gated to Postgres-only, so it is skipped on `SQLite`'s single-writer engine)
 //! is pinned by the macro-expansion test
 //! `repository_macro_versioned_upsert_many_gates_advisory_lock_to_postgres_only`
 //! in `autumn-macros`. A full `versioned = true` (version-history) repository
-//! cannot run end-to-end on SQLite yet because the version-history writer emits a
+//! cannot run end-to-end on `SQLite` yet because the version-history writer emits a
 //! Postgres-only `$7::jsonb` cast — a separate unported construct outside these
 //! two P1s — so the runtime lock-conflict behaviour is proven here with the
 //! optimistic-lock (`#[lock_version]`) shape, which does not require version

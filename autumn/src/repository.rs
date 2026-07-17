@@ -65,7 +65,9 @@ macro_rules! maybe_for_update {
     };
 }
 
-/// `SQLite` arm of [`maybe_for_update!`] — the identity. See the Postgres
+/// `SQLite` arm of [`maybe_for_update!`] — the identity.
+///
+/// See the Postgres
 /// definition for the full contract; `SQLite` has no `SELECT … FOR UPDATE`, so a
 /// pessimistic-lock read degrades to a plain read.
 #[cfg(all(feature = "db", feature = "sqlite"))]
@@ -77,6 +79,7 @@ macro_rules! maybe_for_update {
 }
 
 /// Compile-time backend block selector for generated `#[repository]`/`#[model]`
+///
 /// CRUD where the two backends need *structurally different* code (not just a
 /// swapped receiver), e.g. Postgres multi-row batch insert vs. the `SQLite`
 /// per-row loop, or the batched `ON CONFLICT` upsert vs. `SQLite`'s per-row
@@ -135,8 +138,9 @@ pub enum ReadRoute {
     /// [`ReplicaFallback::FailReadiness`](crate::config::ReplicaFallback)
     /// policy forbids falling back to the primary.
     ///
-    /// Generated reads fail fast with `503 Service Unavailable` instead of
-    /// silently serving from the wrong role.
+    /// Generated reads fail
+    /// fast with `503 Service Unavailable` instead of silently serving
+    /// from the wrong role.
     Unavailable,
 }
 
@@ -349,9 +353,9 @@ pub trait AutumnDependents {
 // resolves to the empty slice.
 impl<T: ?Sized> AutumnDependents for T {}
 
-/// Publish a batch of deferred dependent-cascade OOB *delete* broadcasts.
+/// Publish a batch of deferred dependent-cascade OOB *delete* broadcasts,
 ///
-/// Accumulated during a `dependent = destroy` cascade over `broadcasts = true`
+/// accumulated during a `dependent = destroy` cascade over `broadcasts = true`
 /// children and published **after** the parent transaction commits (#1369).
 ///
 /// Each entry is `(topic, dom_id)`; the fragment is empty and the swap is
@@ -391,8 +395,9 @@ pub fn publish_deferred_dependent_broadcasts(broadcasts: Vec<(String, String)>) 
 
 /// No-op fallback when live broadcasting is not compiled in.
 ///
-/// The accumulation side only runs for `broadcasts = true` children (which
-/// require these features), so the buffer is always empty in this configuration.
+/// The accumulation
+/// side only runs for `broadcasts = true` children (which require these
+/// features), so the buffer is always empty in this configuration.
 #[cfg(not(all(feature = "ws", feature = "maud", feature = "htmx")))]
 #[doc(hidden)]
 pub fn publish_deferred_dependent_broadcasts(_broadcasts: Vec<(String, String)>) {}
@@ -519,8 +524,9 @@ pub trait M2mConnSource: Send + Sync {
     /// Acquire a primary-pool connection for an `add_*`/`remove_*`/`set_*`
     /// many-to-many mutation.
     ///
-    /// Mirrors the write-connection acquisition every other mutating generated
-    /// method uses (marks the read-your-writes pin on success).
+    /// Mirrors the write-connection acquisition every
+    /// other mutating generated method uses (marks the read-your-writes pin
+    /// on success).
     fn __autumn_m2m_write_conn(
         &self,
     ) -> impl ::std::future::Future<
