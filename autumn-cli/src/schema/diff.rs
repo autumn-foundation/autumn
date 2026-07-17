@@ -2050,7 +2050,25 @@ fn render_sqlite_rebuild(
         out,
         "-- autumn-safety: `PRAGMA foreign_key_check` below only REPORTS violation rows (it does not raise); the recreate copies existing values verbatim and introduces no new orphans, but the migration runner must inspect the pragma's output to treat any pre-existing orphan as an error."
     );
+    // Preserve the AUTOINCREMENT high-water mark only when the target shape's single
+    // PK is `BigSerial` (an `INTEGER PRIMARY KEY AUTOINCREMENT` column). Such a table
+    // has a `sqlite_sequence` row that `DROP TABLE` would discard, resetting the
+    // high-water to the max surviving id and letting a later insert reuse an id that
+    // was previously issued and deleted. Uuid / composite / non-single PK tables have
+    // no `sqlite_sequence` entry, so they emit none of these statements.
+    let preserve_seq = matches!(single_pk_column(new_shape), Some((_, IdKind::BigSerial)));
+
     let _ = writeln!(out, "PRAGMA foreign_keys=OFF;");
+    if preserve_seq {
+        let _ = writeln!(
+            out,
+            "-- preserve the AUTOINCREMENT high-water mark so IDs issued-then-deleted are never reused"
+        );
+        let _ = writeln!(
+            out,
+            "CREATE TEMP TABLE _autumn_seq_{table} AS SELECT seq FROM sqlite_sequence WHERE name = '{table}';"
+        );
+    }
     out.push_str(&render_create_table_body(
         &new_table,
         new_shape,
@@ -2064,6 +2082,17 @@ fn render_sqlite_rebuild(
     indexes.sort_by(|a, b| a.name.cmp(&b.name));
     for index in indexes {
         let _ = writeln!(out, "{}", index_sql(table, index));
+    }
+    if preserve_seq {
+        let _ = writeln!(
+            out,
+            "UPDATE sqlite_sequence SET seq = (SELECT seq FROM _autumn_seq_{table})\n    WHERE name = '{table}' AND (SELECT seq FROM _autumn_seq_{table}) IS NOT NULL;"
+        );
+        let _ = writeln!(
+            out,
+            "INSERT INTO sqlite_sequence (name, seq)\n    SELECT '{table}', (SELECT seq FROM _autumn_seq_{table})\n    WHERE (SELECT seq FROM _autumn_seq_{table}) IS NOT NULL\n      AND NOT EXISTS (SELECT 1 FROM sqlite_sequence WHERE name = '{table}');"
+        );
+        let _ = writeln!(out, "DROP TABLE _autumn_seq_{table};");
     }
     let _ = writeln!(out, "PRAGMA foreign_key_check;");
     let _ = writeln!(out, "PRAGMA foreign_keys=ON;");
@@ -4820,6 +4849,8 @@ mod tests {
 -- autumn-safety: this recreate copies columns and re-creates indexes only; user-defined TRIGGERS and VIEWS on the table are dropped by DROP TABLE and are NOT restored — re-create them in a manual migration.
 -- autumn-safety: `PRAGMA foreign_key_check` below only REPORTS violation rows (it does not raise); the recreate copies existing values verbatim and introduces no new orphans, but the migration runner must inspect the pragma's output to treat any pre-existing orphan as an error.
 PRAGMA foreign_keys=OFF;
+-- preserve the AUTOINCREMENT high-water mark so IDs issued-then-deleted are never reused
+CREATE TEMP TABLE _autumn_seq_posts AS SELECT seq FROM sqlite_sequence WHERE name = 'posts';
 CREATE TABLE posts__autumn_new (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     views INTEGER NOT NULL,
@@ -4830,6 +4861,13 @@ INSERT INTO posts__autumn_new (id, views, body)
 DROP TABLE posts;
 ALTER TABLE posts__autumn_new RENAME TO posts;
 CREATE INDEX idx_posts_body ON posts (body);
+UPDATE sqlite_sequence SET seq = (SELECT seq FROM _autumn_seq_posts)
+    WHERE name = 'posts' AND (SELECT seq FROM _autumn_seq_posts) IS NOT NULL;
+INSERT INTO sqlite_sequence (name, seq)
+    SELECT 'posts', (SELECT seq FROM _autumn_seq_posts)
+    WHERE (SELECT seq FROM _autumn_seq_posts) IS NOT NULL
+      AND NOT EXISTS (SELECT 1 FROM sqlite_sequence WHERE name = 'posts');
+DROP TABLE _autumn_seq_posts;
 PRAGMA foreign_key_check;
 PRAGMA foreign_keys=ON;
 ";
@@ -4849,6 +4887,8 @@ PRAGMA foreign_keys=ON;
 -- autumn-safety: this recreate copies columns and re-creates indexes only; user-defined TRIGGERS and VIEWS on the table are dropped by DROP TABLE and are NOT restored — re-create them in a manual migration.
 -- autumn-safety: `PRAGMA foreign_key_check` below only REPORTS violation rows (it does not raise); the recreate copies existing values verbatim and introduces no new orphans, but the migration runner must inspect the pragma's output to treat any pre-existing orphan as an error.
 PRAGMA foreign_keys=OFF;
+-- preserve the AUTOINCREMENT high-water mark so IDs issued-then-deleted are never reused
+CREATE TEMP TABLE _autumn_seq_posts AS SELECT seq FROM sqlite_sequence WHERE name = 'posts';
 CREATE TABLE posts__autumn_new (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     views INTEGER NOT NULL,
@@ -4858,6 +4898,13 @@ INSERT INTO posts__autumn_new (id, views, body)
     SELECT id, views, body FROM posts;
 DROP TABLE posts;
 ALTER TABLE posts__autumn_new RENAME TO posts;
+UPDATE sqlite_sequence SET seq = (SELECT seq FROM _autumn_seq_posts)
+    WHERE name = 'posts' AND (SELECT seq FROM _autumn_seq_posts) IS NOT NULL;
+INSERT INTO sqlite_sequence (name, seq)
+    SELECT 'posts', (SELECT seq FROM _autumn_seq_posts)
+    WHERE (SELECT seq FROM _autumn_seq_posts) IS NOT NULL
+      AND NOT EXISTS (SELECT 1 FROM sqlite_sequence WHERE name = 'posts');
+DROP TABLE _autumn_seq_posts;
 PRAGMA foreign_key_check;
 PRAGMA foreign_keys=ON;
 ";
@@ -5067,6 +5114,112 @@ PRAGMA foreign_keys=ON;
             "foreign_key_check reported {} violation row(s)",
             violations.len()
         );
+
+        let integrity: Vec<IntegrityRow> = diesel::sql_query("PRAGMA integrity_check")
+            .load(&mut conn)
+            .expect("run PRAGMA integrity_check");
+        assert_eq!(integrity.len(), 1, "integrity_check returns one row");
+        assert_eq!(integrity[0].status, "ok", "integrity_check is clean");
+    }
+
+    #[test]
+    fn sqlite_rebuild_uuid_pk_emits_no_sequence_preservation() {
+        // A table whose single PK is `Uuid` has no `sqlite_sequence` row, so the
+        // rebuild must emit none of the high-water preservation statements — those
+        // apply only to `BigSerial` (`INTEGER PRIMARY KEY AUTOINCREMENT`) PKs.
+        let uuid_table = |name: &str| -> Table {
+            let mut t = Table::new(name, Backend::Sqlite);
+            let mut id = col("id", ColumnType::Uuid);
+            id.primary_key = true;
+            t.primary_key.push("id".to_owned());
+            t.columns.push(id);
+            t.columns.push(col("body", ColumnType::Text));
+            t
+        };
+        let baseline = uuid_table("posts");
+        let desired = uuid_table("posts");
+        assert!(
+            matches!(single_pk_column(&desired), Some((_, IdKind::Uuid))),
+            "the fixture PK resolves to Uuid"
+        );
+        for leg in [RebuildLeg::Up, RebuildLeg::Down] {
+            let sql = render_sqlite_rebuild("posts", &desired, &baseline, leg);
+            assert!(
+                !sql.contains("sqlite_sequence"),
+                "no sqlite_sequence statements for a Uuid PK ({leg:?}): {sql}"
+            );
+            assert!(
+                !sql.contains("_autumn_seq_"),
+                "no high-water temp table for a Uuid PK ({leg:?}): {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn sqlite_rebuild_preserves_autoincrement_sequence() {
+        // The definitive non-reuse proof: after a table recreate, an id that was
+        // issued-then-deleted must NOT be handed out again. Seed ids 1..5, delete
+        // 2..5 (the `sqlite_sequence` high-water stays 5), apply the generated
+        // rebuild, then insert a new row and assert its id is 6 — not the reused 2.
+        use diesel::connection::SimpleConnection as _;
+        use diesel::prelude::*;
+
+        #[derive(QueryableByName)]
+        struct BigRow {
+            #[diesel(sql_type = diesel::sql_types::BigInt, column_name = "v")]
+            v: i64,
+        }
+
+        // `PRAGMA integrity_check` returns a single `TEXT` row; a clean DB reports `ok`.
+        #[derive(QueryableByName)]
+        struct IntegrityRow {
+            #[diesel(sql_type = diesel::sql_types::Text, column_name = "integrity_check")]
+            status: String,
+        }
+
+        let mut conn = SqliteConnection::establish(":memory:").expect("open in-memory sqlite");
+        conn.batch_execute(
+            "CREATE TABLE posts (\n    id INTEGER PRIMARY KEY AUTOINCREMENT,\n    \
+             views INTEGER NOT NULL,\n    body TEXT NOT NULL\n);\n\
+             INSERT INTO posts (views, body) VALUES \
+             (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd'), (5, 'e');",
+        )
+        .expect("seed five rows -> ids 1..5");
+
+        // The AUTOINCREMENT high-water is 5 after five inserts.
+        let seq: Vec<BigRow> =
+            diesel::sql_query("SELECT seq AS v FROM sqlite_sequence WHERE name = 'posts'")
+                .load(&mut conn)
+                .expect("read sqlite_sequence");
+        assert_eq!(seq.len(), 1, "sqlite_sequence has a row for posts");
+        assert_eq!(seq[0].v, 5, "high-water is 5 before the delete");
+
+        // Delete every row but id=1; the high-water in sqlite_sequence stays 5.
+        conn.batch_execute("DELETE FROM posts WHERE id > 1;")
+            .expect("delete ids 2..5");
+
+        let (plan, ctx) = sqlite_rebuild_fixture();
+        let up = emit_up_sql_with_context(&plan, &ctx).expect("emit up");
+        conn.batch_execute(&up)
+            .expect("apply the generated rebuild");
+
+        // A fresh insert must NOT reuse a deleted id: the next id is 6, not 2.
+        conn.batch_execute("INSERT INTO posts (views, body) VALUES (9, 'new');")
+            .expect("insert a new row after the rebuild");
+        let max: Vec<BigRow> = diesel::sql_query("SELECT MAX(id) AS v FROM posts")
+            .load(&mut conn)
+            .expect("max id after rebuild");
+        assert_eq!(
+            max[0].v, 6,
+            "the next id after the rebuild does not reuse a deleted id"
+        );
+
+        // The surviving id=1 row is untouched by the rebuild.
+        let survivors: Vec<BigRow> =
+            diesel::sql_query("SELECT COUNT(*) AS v FROM posts WHERE id = 1")
+                .load(&mut conn)
+                .expect("count id=1");
+        assert_eq!(survivors[0].v, 1, "the surviving id=1 row is intact");
 
         let integrity: Vec<IntegrityRow> = diesel::sql_query("PRAGMA integrity_check")
             .load(&mut conn)
