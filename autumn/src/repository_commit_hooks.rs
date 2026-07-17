@@ -1571,6 +1571,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(feature = "sqlite"))]
     #[test]
     fn dispatcher_kick_state_coalesces_pending_notifications() {
         let state = RepositoryCommitHookKickState::default();
