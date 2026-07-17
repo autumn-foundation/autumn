@@ -416,6 +416,35 @@ fn write_migration_dir(
     up: &str,
     down: &str,
 ) -> Result<std::path::PathBuf, String> {
+    write_migration_dir_with(project_root, ts, suffix, up, down, |path, contents| {
+        std::fs::write(path, contents)
+    })
+}
+
+/// Inner implementation of [`write_migration_dir`] that takes the file-write
+/// operation as a closure. Extracted so a test can deterministically force a
+/// mid-write failure (e.g. the `down.sql` write) and assert the
+/// partial-migration cleanup below; production always passes `std::fs::write`.
+///
+/// Transactional-on-failure: the leaf directory is created **exclusively** (so
+/// this call, and only this call, owns it — a pre-existing COMPLETE migration
+/// still trips the `AlreadyExists` collision guard and is never touched). Once
+/// this call has created the dir, if EITHER SQL write fails the just-created dir
+/// is best-effort removed (`remove_dir_all`, its own error ignored) and the
+/// ORIGINAL write error is returned, so a partial `migrations/<ts>_<suffix>/`
+/// containing only `up.sql` is never left behind to block a same-timestamp
+/// retry.
+fn write_migration_dir_with<W>(
+    project_root: &Path,
+    ts: &str,
+    suffix: &str,
+    up: &str,
+    down: &str,
+    write: W,
+) -> Result<std::path::PathBuf, String>
+where
+    W: Fn(&Path, &str) -> std::io::Result<()>,
+{
     let migrations_dir = project_root.join("migrations");
     let dir = migrations_dir.join(format!("{ts}_{suffix}"));
     std::fs::create_dir_all(&migrations_dir).map_err(|e| {
@@ -438,9 +467,18 @@ fn write_migration_dir(
             )
         }
     })?;
-    std::fs::write(dir.join("up.sql"), up).map_err(|e| format!("failed to write up.sql: {e}"))?;
-    std::fs::write(dir.join("down.sql"), down)
-        .map_err(|e| format!("failed to write down.sql: {e}"))?;
+    // From here on THIS call owns `dir` (exclusive `create_dir` above). If either
+    // write fails, remove the dir we just created so no partial migration is left
+    // to trip the collision guard on retry, and surface the original write error.
+    let write_both = || -> Result<(), String> {
+        write(&dir.join("up.sql"), up).map_err(|e| format!("failed to write up.sql: {e}"))?;
+        write(&dir.join("down.sql"), down).map_err(|e| format!("failed to write down.sql: {e}"))?;
+        Ok(())
+    };
+    if let Err(e) = write_both() {
+        let _ = std::fs::remove_dir_all(&dir);
+        return Err(e);
+    }
     Ok(dir)
 }
 
@@ -677,6 +715,61 @@ mod tests {
             std::fs::read_to_string(dir.join("down.sql")).expect("down.sql"),
             "DOWN-ONE",
             "first down.sql untouched"
+        );
+    }
+
+    /// Round 9 / P2: if the `up.sql` write succeeds but the `down.sql` write
+    /// fails (disk-full / I/O error), the just-created leaf directory must be
+    /// removed so no partial migration is left behind — otherwise a retry with
+    /// the same timestamp+name would hit the exclusive-create collision guard
+    /// and be wrongly refused. Injects a `write` closure that fails only on
+    /// `down.sql` to force the failure deterministically, then asserts the dir
+    /// is gone and a clean retry succeeds.
+    #[test]
+    fn write_migration_cleans_up_partial_dir_on_write_failure() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let leaf = root
+            .path()
+            .join("migrations")
+            .join("20260101120000_add_body");
+
+        let err = write_migration_dir_with(
+            root.path(),
+            "20260101120000",
+            "add_body",
+            "UP",
+            "DOWN",
+            |path, contents| {
+                if path.file_name().and_then(|n| n.to_str()) == Some("down.sql") {
+                    Err(std::io::Error::other("simulated disk full"))
+                } else {
+                    std::fs::write(path, contents)
+                }
+            },
+        )
+        .expect_err("down.sql write failure must propagate");
+        assert!(
+            err.contains("down.sql") && err.contains("simulated disk full"),
+            "original write error is surfaced: {err}"
+        );
+
+        // The partially-written dir (which had only up.sql) was cleaned up.
+        assert!(
+            !leaf.exists(),
+            "partial migration dir must be removed on write failure"
+        );
+
+        // A retry with the SAME timestamp+name now succeeds: the collision guard
+        // sees no leftover dir, so the user is not stuck needing manual cleanup.
+        let dir = write_migration_dir(root.path(), "20260101120000", "add_body", "UP", "DOWN")
+            .expect("retry after cleanup succeeds");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("up.sql")).expect("up.sql"),
+            "UP"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("down.sql")).expect("down.sql"),
+            "DOWN"
         );
     }
 
